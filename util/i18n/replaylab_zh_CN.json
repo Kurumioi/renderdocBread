@@ -124,6 +124,7 @@
     "The RDC has no embedded thumbnail": "该 RDC 不包含嵌入式缩略图",
     "The RDC opened successfully, but ReplayLab could not restore its project data:\n\n%1\n\nYou can continue using the opened capture. No failed replacement is treated as applied.": "RDC 已成功打开，但 ReplayLab 无法恢复其项目数据：\n\n%1\n\n您可以继续使用已打开的捕获文件。任何失败的替换都不会被视为已应用。",
     "The active capture changed while ReplayLab restored project data": "ReplayLab 恢复项目数据期间，活动捕获已发生变化",
+    "This qrenderdoc build cannot restore ReplayLab project data after opening an RDC": "此 qrenderdoc 构建无法在打开 RDC 后恢复 ReplayLab 项目数据",
     "The packaged ReplayLabMCP.exe is unavailable. Reinstall the complete ReplayLab bundle before using project management.": "随包提供的 ReplayLabMCP.exe 不可用。请重新安装完整的 ReplayLab 软件包，然后再使用项目管理功能。",
     "The project folder stores ReplayLab's portable parsed data and shared knowledge. RDC entries remain references to their current files and are not copied.": "项目文件夹用于保存 ReplayLab 的可移植解析数据和共享知识。RDC 条目仍引用其当前位置的文件，不会复制文件。",
     "The referenced RDC file is unavailable": "引用的 RDC 文件不可用",

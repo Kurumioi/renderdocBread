@@ -133,6 +133,7 @@ static const char *const replaylabPythonUiMessages[] =
   QT_TRANSLATE_NOOP("ReplayLabProjects", "The referenced RDC file is unavailable"),
   QT_TRANSLATE_NOOP("ReplayLabProjects", "The selected RDC is no longer the active RenderDoc capture"),
   QT_TRANSLATE_NOOP("ReplayLabProjects", "This project is its own portable sharing boundary; only the unpacked asset path is machine-specific and editable."),
+  QT_TRANSLATE_NOOP("ReplayLabProjects", "This qrenderdoc build cannot restore ReplayLab project data after opening an RDC"),
   QT_TRANSLATE_NOOP("ReplayLabProjects", "Thumbnail bytes are invalid"),
   QT_TRANSLATE_NOOP("ReplayLabProjects", "Thumbnail deferred by the per-selection preview limit (%1)."),
   QT_TRANSLATE_NOOP("ReplayLabProjects", "Thumbnail dimensions are invalid"),

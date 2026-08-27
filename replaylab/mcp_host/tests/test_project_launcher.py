@@ -254,6 +254,11 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
                 "errorId": "capture-changed-during-restore",
             }))
         self.assertEqual(
+            "This qrenderdoc build cannot restore ReplayLab project data after opening an RDC",
+            project_launcher._restore_result_error({
+                "errorId": "project-restore-client-unavailable",
+            }))
+        self.assertEqual(
             "future-restore-failure",
             project_launcher._restore_result_error({
                 "errorId": "future-restore-failure",

@@ -234,6 +234,11 @@ def _restore_result_error(value, worker_error=""):
             return QtCore.QCoreApplication.translate(
                 TRANSLATION_CONTEXT,
                 "The active capture changed while ReplayLab restored project data")
+        if error_id == "project-restore-client-unavailable":
+            return QtCore.QCoreApplication.translate(
+                TRANSLATION_CONTEXT,
+                "This qrenderdoc build cannot restore ReplayLab project data after opening "
+                "an RDC")
         if error_id:
             # Unknown future IDs are diagnostics. Do not mistake them for a
             # successful restore merely because this UI predates the mapping;

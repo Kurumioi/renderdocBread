@@ -78,6 +78,17 @@ namespace
 {
 // i18n-ignore: retired Python extension package identifier, never shown as UI text
 const char LegacyReplayLabExtensionPackage[] = "replaylab_bridge";
+const char RetiredRenderDocMCPBridgeBackupPrefix[] =
+    "renderdoc_mcp_bridge.disabled-by-replaylab-";
+const char RetiredRenderDocMCPBackupPrefix[] = "renderdoc_mcp.disabled-by-replaylab-";
+
+bool IsLegacyReplayLabExtensionPackage(const QString &package)
+{
+  const QString legacyRoot = QLatin1String(LegacyReplayLabExtensionPackage);
+  return package == legacyRoot || package.startsWith(legacyRoot + QLatin1Char('.')) ||
+         package.startsWith(QLatin1String(RetiredRenderDocMCPBridgeBackupPrefix)) ||
+         package.startsWith(QLatin1String(RetiredRenderDocMCPBackupPrefix));
+}
 }
 
 CaptureContext::CaptureContext(PersistantConfig &cfg) : m_Config(cfg)
@@ -231,6 +242,21 @@ CaptureContext::CaptureContext(PersistantConfig &cfg) : m_Config(cfg)
     if(!dir.exists())
       dir.mkpath(dir.absolutePath());
   }
+
+  // Retire saved autoload entries for both the old ReplayLab extension and timestamped backup
+  // packages. ReplayLab now has an application-owned lifetime and must never be started through
+  // the optional extension loader.
+  bool removedLegacyReplayLabAutoload = false;
+  for(int32_t i = cfg.AlwaysLoad_Extensions.count() - 1; i >= 0; --i)
+  {
+    if(IsLegacyReplayLabExtensionPackage(QString(cfg.AlwaysLoad_Extensions[i])))
+    {
+      cfg.AlwaysLoad_Extensions.erase(i);
+      removedLegacyReplayLabAutoload = true;
+    }
+  }
+  if(removedLegacyReplayLabAutoload)
+    cfg.Save();
 
   // ReplayLab is a first-party qrenderdoc integration. It is loaded from the fixed application
   // tree before optional user extensions, with no manifest scan, enable flag, or AppData fallback.
@@ -387,7 +413,7 @@ rdcarray<ExtensionMetadata> CaptureContext::GetInstalledExtensions()
         // Ignore obsolete deployed plugin copies, including ones left in a user's extension
         // directory by an older build, so they cannot appear in the manager or start a second
         // bridge instance.
-        if(package == QLatin1String(LegacyReplayLabExtensionPackage))
+        if(IsLegacyReplayLabExtensionPackage(package))
           continue;
 
         if(f.exists() && f.open(QIODevice::ReadOnly | QIODevice::Text))
@@ -532,7 +558,7 @@ bool CaptureContext::IsExtensionLoaded(rdcstr name)
 
 rdcstr CaptureContext::LoadExtension(rdcstr name)
 {
-  if(name == LegacyReplayLabExtensionPackage)
+  if(IsLegacyReplayLabExtensionPackage(QString(name)))
     return tr("ReplayLab is a built-in qrenderdoc integration and cannot be loaded as an extension.");
 
   QString ret;

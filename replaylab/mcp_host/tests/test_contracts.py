@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import hashlib
 import importlib.util
 import json
@@ -16,6 +17,50 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 
 
 class McpContractTests(unittest.TestCase):
+    def test_bridge_import_survives_optional_restore_transport_unavailable(self) -> None:
+        bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
+        fake_renderdoc = types.ModuleType("renderdoc")
+        previous_renderdoc = sys.modules.get("renderdoc")
+        previous_qrenderdoc = sys.modules.pop("qrenderdoc", None)
+        original_import = builtins.__import__
+        module_name = "renderdoc_mcp_bridge_optional_restore_contract"
+
+        def _without_urllib(name, globals=None, locals=None, fromlist=(), level=0):
+            if name in ("urllib.error", "urllib.parse", "urllib.request"):
+                raise ImportError("optional embedded network transport unavailable")
+            return original_import(name, globals, locals, fromlist, level)
+
+        sys.modules["renderdoc"] = fake_renderdoc
+        builtins.__import__ = _without_urllib
+        try:
+            spec = importlib.util.spec_from_file_location(
+                module_name,
+                bridge_path,
+                submodule_search_locations=[str(bridge_path.parent)],
+            )
+            bridge = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = bridge
+            spec.loader.exec_module(bridge)
+        finally:
+            builtins.__import__ = original_import
+            for name in list(sys.modules):
+                if name == module_name or name.startswith(module_name + "."):
+                    sys.modules.pop(name, None)
+            if previous_renderdoc is None:
+                sys.modules.pop("renderdoc", None)
+            else:
+                sys.modules["renderdoc"] = previous_renderdoc
+            if previous_qrenderdoc is not None:
+                sys.modules["qrenderdoc"] = previous_qrenderdoc
+
+        self.assertIsNone(bridge._project_restore_client_protocol)
+        self.assertIn(
+            "optional embedded network transport unavailable",
+            bridge._project_restore_client_import_error,
+        )
+        self.assertIsNotNone(bridge._shader_console_protocol)
+        self.assertIsNotNone(bridge._dxil_access_protocol)
+
     def test_bridge_stop_isolates_cleanup_failures_and_clears_native_globals(self) -> None:
         bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
         fake_renderdoc = types.ModuleType("renderdoc")

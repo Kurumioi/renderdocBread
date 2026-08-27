@@ -551,12 +551,12 @@
     </message>
     <message>
         <location line="+160"/>
-        <location line="+4066"/>
+        <location line="+4068"/>
         <source>Running</source>
         <translation>正在运行</translation>
     </message>
     <message>
-        <location line="-4061"/>
+        <location line="-4063"/>
         <source>%1 capture action(s) running</source>
         <translation>正在运行 %1 个捕获操作</translation>
     </message>
@@ -1573,12 +1573,12 @@ Device code: %1</source>
     </message>
     <message>
         <location line="+2"/>
-        <location line="+1474"/>
+        <location line="+1479"/>
         <source>Chat ready</source>
         <translation>聊天就绪</translation>
     </message>
     <message>
-        <location line="-1467"/>
+        <location line="-1472"/>
         <source>Waiting for bridge</source>
         <translation>正在等待桥接</translation>
     </message>
@@ -1590,12 +1590,12 @@ Device code: %1</source>
     <message>
         <location line="+11"/>
         <location line="+49"/>
-        <location line="+1393"/>
+        <location line="+1398"/>
         <source>Connected</source>
         <translation>已连接</translation>
     </message>
     <message>
-        <location line="-1412"/>
+        <location line="-1417"/>
         <source>Containment failed</source>
         <translation>隔离管控失败</translation>
     </message>
@@ -1671,12 +1671,12 @@ Device code: %1</source>
     </message>
     <message>
         <location line="+11"/>
-        <location line="+672"/>
+        <location line="+676"/>
         <source>Thinking...</source>
         <translation>正在思考…</translation>
     </message>
     <message>
-        <location line="-652"/>
+        <location line="-656"/>
         <source>Adjust direction is available when this conversation has an active AI request. The message remains queued.</source>
         <translation>仅当此对话存在当前 AI 请求时才能调整方向。该消息仍处于排队状态。</translation>
     </message>
@@ -1743,13 +1743,13 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>捕获已关闭；已丢弃 %1 个绑定到捕获的 AI 任务。</translation>
     </message>
     <message>
-        <location line="+81"/>
-        <location line="+327"/>
+        <location line="+83"/>
+        <location line="+330"/>
         <source>AI result contained an invalid terminal status.</source>
         <translation>AI 结果包含无效的终止状态。</translation>
     </message>
     <message>
-        <location line="-305"/>
+        <location line="-308"/>
         <source>Ignored an invalid AI task identifier.</source>
         <translation>已忽略无效的 AI 任务标识符。</translation>
     </message>
@@ -1800,18 +1800,18 @@ Additional direction from the user (re-plan and continue from the preserved cont
     </message>
     <message>
         <location line="+10"/>
-        <location line="+194"/>
+        <location line="+197"/>
         <source>Failed</source>
         <translation>失败</translation>
     </message>
     <message>
-        <location line="-194"/>
-        <location line="+166"/>
+        <location line="-197"/>
+        <location line="+169"/>
         <source>Completed</source>
         <translation>已完成</translation>
     </message>
     <message>
-        <location line="-150"/>
+        <location line="-153"/>
         <source>Strategy: %1</source>
         <translation>策略：%1</translation>
     </message>
@@ -1856,7 +1856,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>第 %1 轮：估算令牌数从 %2 降至 %3</translation>
     </message>
     <message>
-        <location line="+11"/>
+        <location line="+13"/>
         <source>%1/%2</source>
         <translation>%1/%2</translation>
     </message>
@@ -1871,7 +1871,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>此操作需要批准。</translation>
     </message>
     <message>
-        <location line="+66"/>
+        <location line="+67"/>
         <source>Waiting for input</source>
         <translation>等待输入</translation>
     </message>
@@ -4524,7 +4524,7 @@ Matrix stored </source>
 <context>
     <name>CaptureContext</name>
     <message>
-        <location filename="../Code/CaptureContext.cpp" line="+133"/>
+        <location filename="../Code/CaptureContext.cpp" line="+144"/>
         <source>Connection lost to %1</source>
         <translation>与 %1 的连接已丢失</translation>
     </message>
@@ -4627,7 +4627,7 @@ This error is not recoverable and the analysis cannot continue. The UI will be n
         <translation>报告错误</translation>
     </message>
     <message>
-        <location line="+318"/>
+        <location line="+333"/>
         <source>ReplayLab is a built-in qrenderdoc integration and cannot be loaded as an extension.</source>
         <translation>ReplayLab 是 qrenderdoc 的内置集成，无法作为扩展加载。</translation>
     </message>
@@ -18377,6 +18377,11 @@ You can continue using the opened capture. No failed replacement is treated as a
         <location line="+1"/>
         <source>This project is its own portable sharing boundary; only the unpacked asset path is machine-specific and editable.</source>
         <translation>此项目自身构成可移植共享边界；只有已解包资源目录是计算机特定配置且可编辑。</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>This qrenderdoc build cannot restore ReplayLab project data after opening an RDC</source>
+        <translation>此 qrenderdoc 构建无法在打开 RDC 后恢复 ReplayLab 项目数据</translation>
     </message>
     <message>
         <location line="+1"/>

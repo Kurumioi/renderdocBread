@@ -14,6 +14,7 @@ IPC directory: %LOCALAPPDATA%/ReplayLab/ipc-v2/instances/<instance-id>/
 """
 
 import base64
+import importlib.util
 import json
 import hashlib
 import math
@@ -79,21 +80,31 @@ except (ImportError, ValueError):
     _project_launcher_protocol = importlib.util.module_from_spec(_project_launcher_spec)
     _project_launcher_spec.loader.exec_module(_project_launcher_protocol)
 
+_project_restore_client_protocol = None
+_project_restore_client_import_error = ""
 try:
-    from . import project_restore_client as _project_restore_client_protocol
-except (ImportError, ValueError):
-    _project_restore_client_spec = importlib.util.spec_from_file_location(
-        "_replaylab_project_restore_client_protocol",
-        os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "project_restore_client.py"))
-    if (_project_restore_client_spec is None or
-            _project_restore_client_spec.loader is None):
-        raise ImportError("Unable to load the ReplayLab project restore client")
-    _project_restore_client_protocol = importlib.util.module_from_spec(
-        _project_restore_client_spec)
-    _project_restore_client_spec.loader.exec_module(
-        _project_restore_client_protocol)
+    if __package__:
+        from . import project_restore_client as _project_restore_client_protocol
+    else:
+        _project_restore_client_spec = importlib.util.spec_from_file_location(
+            "_replaylab_project_restore_client_protocol",
+            os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "project_restore_client.py"))
+        if (_project_restore_client_spec is None or
+                _project_restore_client_spec.loader is None):
+            raise ImportError("Unable to load the ReplayLab project restore client")
+        _project_restore_client_protocol = importlib.util.module_from_spec(
+            _project_restore_client_spec)
+        _project_restore_client_spec.loader.exec_module(
+            _project_restore_client_protocol)
+except (ImportError, ValueError) as exc:
+    # qrenderdoc intentionally ships a compact embedded Python runtime without
+    # socket/_socket. Project creation and management use the packaged host CLI
+    # and must remain available even when the optional post-load HTTP restore
+    # transport cannot be imported.
+    _project_restore_client_protocol = None
+    _project_restore_client_import_error = str(exc)
 
 try:
     from . import shader_console as _shader_console_protocol
@@ -12139,6 +12150,9 @@ def _register_project_launcher_ui(ctx):
     def _restore_capture_from_project(project_root, path, progress_callback):
         """Run post-load restore in the persistent Python 3.10+ Host."""
 
+        if _project_restore_client_protocol is None:
+            return {"errorId": "project-restore-client-unavailable"}
+
         expected_path = os.path.abspath(str(path or ""))
         expected_token = ("loaded", os.path.normcase(expected_path))
         session_id = str(_capture_session_id or "")
@@ -12330,6 +12344,9 @@ def start(version, ctx):
     # build additionally starts one authenticated loopback host automatically
     # for UI intents and other explicitly configured MCP clients.
     _start_replaylab_host()
+    if _project_restore_client_protocol is None:
+        print("[ReplayLab] Optional project restore transport unavailable: %s" %
+              _project_restore_client_import_error)
 
     if HAS_UI:
         try:
