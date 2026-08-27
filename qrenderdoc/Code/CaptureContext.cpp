@@ -24,9 +24,11 @@
 
 #include "CaptureContext.h"
 #include <QApplication>
+#include <QCoreApplication>
 #include <QDir>
 #include <QDirIterator>
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QFileInfo>
 #include <QFileSystemWatcher>
 #include <QLabel>
@@ -35,11 +37,14 @@
 #include <QMetaObject>
 #include <QProgressDialog>
 #include <QRegularExpression>
+#include <QSet>
 #include <QTimer>
 #include "Code/Resources.h"
+#include "Code/ReplayLab/ReplayLabIntegration.h"
 #include "Code/pyrenderdoc/PythonContext.h"
 #include "Widgets/AnnotationDisplay.h"
 #include "Windows/APIInspector.h"
+#include "Windows/AI/AIAssistant.h"
 #include "Windows/ApiMonitorWindow.h"
 #include "Windows/BufferViewer.h"
 #include "Windows/CommentView.h"
@@ -68,6 +73,12 @@
 #include "version.h"
 
 #include "pipestate.inl"
+
+namespace
+{
+// i18n-ignore: retired Python extension package identifier, never shown as UI text
+const char LegacyReplayLabExtensionPackage[] = "replaylab_bridge";
+}
 
 CaptureContext::CaptureContext(PersistantConfig &cfg) : m_Config(cfg)
 {
@@ -175,7 +186,7 @@ CaptureContext::CaptureContext(PersistantConfig &cfg) : m_Config(cfg)
         else if(CrashDialog::CaptureTooLarge(m_Config))
         {
           text = tr("<html>%1<br><br>"
-                    "Your capture is too lage to upload as a crash report so this can't be "
+                    "Your capture is too large to upload as a crash report so this can't be "
                     "automatically reported. "
                     "Please email me at <a "
                     "href=\"mailto:baldurk@baldurk.org?subject=RenderDoc%20Unrecoverable%20error\">"
@@ -221,9 +232,14 @@ CaptureContext::CaptureContext(PersistantConfig &cfg) : m_Config(cfg)
       dir.mkpath(dir.absolutePath());
   }
 
-  rdcarray<ExtensionMetadata> exts = CaptureContext::GetInstalledExtensions();
+  // ReplayLab is a first-party qrenderdoc integration. It is loaded from the fixed application
+  // tree before optional user extensions, with no manifest scan, enable flag, or AppData fallback.
+  m_ReplayLabIntegration = new ReplayLabIntegration(*this);
+  const QString replayLabError = m_ReplayLabIntegration->Initialize();
+  if(!replayLabError.isEmpty())
+    qWarning() << "Built-in ReplayLab integration is unavailable:" << replayLabError;
 
-  for(const ExtensionMetadata &e : exts)
+  for(const ExtensionMetadata &e : CaptureContext::GetInstalledExtensions())
   {
     if(cfg.AlwaysLoad_Extensions.contains(e.package))
     {
@@ -235,7 +251,44 @@ CaptureContext::CaptureContext(PersistantConfig &cfg) : m_Config(cfg)
 
 CaptureContext::~CaptureContext()
 {
+  // Stop provider processes before the Python bridge, replay thread, or qrenderdoc context goes
+  // away. The dock itself remains owned by the ToolWindowManager and is deleted with MainWindow.
+  if(m_AIAssistant)
+    m_AIAssistant->Shutdown();
+
+  // Python integrations/extensions can own Qt timers, QRunnables, MiniQt panels and capture
+  // viewers. Give each lifetime bucket a deterministic chance to quiesce while this context and
+  // MiniQtHelper are still valid.
+  if(!PythonContext::ShutdownInternalIntegrations())
+    qCritical() << "A built-in integration could not fully stop during CaptureContext shutdown";
+  PythonContext::ShutdownExtensions();
+
+  // Registered menu/context callbacks retain Python callables. Destroy those
+  // wrappers under the GIL before the interpreter is finalised.
+  PythonContext::ProcessExtensionWork([this]() {
+    for(QObject *object : m_ReplayLabIntegrationObjects)
+      delete object;
+    m_ReplayLabIntegrationObjects.clear();
+
+    for(const QList<QObject *> &objects : m_ExtensionObjects)
+      for(QObject *object : objects)
+        delete object;
+    m_ExtensionObjects.clear();
+
+    for(QObject *object : m_PendingExtensionObjects)
+      delete object;
+    m_PendingExtensionObjects.clear();
+    m_RegisteredMenuItems.clear();
+  });
+
+  // MiniQt/PySide shutdown uses deleteLater in a few paths. Drain those native
+  // objects now, not after Py_Finalize when their Python callbacks are invalid.
+  QCoreApplication::sendPostedEvents(NULL, QEvent::DeferredDelete);
   delete m_QtHelper;
+  m_QtHelper = NULL;
+  delete m_ReplayLabIntegration;
+  m_ReplayLabIntegration = NULL;
+  QCoreApplication::sendPostedEvents(NULL, QEvent::DeferredDelete);
   RENDERDOC_UnregisterMemoryRegion(this);
   delete m_Icon;
   m_Replay.CloseThread();
@@ -303,6 +356,7 @@ rdcstr CaptureContext::TempCaptureFilename(const rdcstr &appname)
 rdcarray<ExtensionMetadata> CaptureContext::GetInstalledExtensions()
 {
   rdcarray<ExtensionMetadata> ret;
+  QSet<QString> discoveredPackages;
 
   for(QString extensionFolder : PythonContext::GetApplicationExtensionsPaths())
   {
@@ -320,11 +374,21 @@ rdcarray<ExtensionMetadata> CaptureContext::GetInstalledExtensions()
                               .replace(extensionFolder, QString())
                               .replace(QLatin1Char('/'), QLatin1Char('.'));
 
-        while(package[0] == QLatin1Char('.'))
+        while(!package.isEmpty() && package[0] == QLatin1Char('.'))
           package.remove(0, 1);
 
-        while(package[package.size() - 1] == QLatin1Char('.'))
+        while(!package.isEmpty() && package[package.size() - 1] == QLatin1Char('.'))
           package.remove(package.size() - 1, 1);
+
+        if(package.isEmpty())
+          continue;
+
+        // ReplayLab has a dedicated first-party lifetime and fixed application-owned source path.
+        // Ignore obsolete deployed plugin copies, including ones left in a user's extension
+        // directory by an older build, so they cannot appear in the manager or start a second
+        // bridge instance.
+        if(package == QLatin1String(LegacyReplayLabExtensionPackage))
+          continue;
 
         if(f.exists() && f.open(QIODevice::ReadOnly | QIODevice::Text))
         {
@@ -445,6 +509,13 @@ rdcarray<ExtensionMetadata> CaptureContext::GetInstalledExtensions()
             }
           }
 
+          // Application extension roots are enumerated before per-user roots. Keep the first valid
+          // package so the same optional extension cannot appear or load twice. If the application
+          // manifest is invalid, allow a valid per-user fallback to be discovered below.
+          if(discoveredPackages.contains(package))
+            continue;
+
+          discoveredPackages.insert(package);
           ret.push_back(ext);
         }
       }
@@ -461,6 +532,9 @@ bool CaptureContext::IsExtensionLoaded(rdcstr name)
 
 rdcstr CaptureContext::LoadExtension(rdcstr name)
 {
+  if(name == LegacyReplayLabExtensionPackage)
+    return tr("ReplayLab is a built-in qrenderdoc integration and cannot be loaded as an extension.");
+
   QString ret;
 
   PythonContext::ProcessExtensionWork([this, &ret, name]() {
@@ -835,6 +909,7 @@ void CaptureContext::LoadCapture(const rdcstr &captureFile, const ReplayOptions 
   PointerTypeRegistry::Init();
 
   m_LoadInProgress = true;
+  SetLoadCaptureStage(LoadCaptureStage::OpeningReplay);
 
   if(local)
     m_Config.CrashReport_LastOpenedCapture = origFilename;
@@ -856,9 +931,10 @@ void CaptureContext::LoadCapture(const rdcstr &captureFile, const ReplayOptions 
   QElapsedTimer loadTimer;
   loadTimer.start();
 
-  ShowProgressDialog(
+  ShowProgressDialogWithStatus(
       m_MainWindow, tr("Loading Capture: %1").arg(QFileInfo(origFilename).fileName()),
-      [this]() { return !m_LoadInProgress; }, [this]() { return UpdateLoadProgress(); });
+      [this]() { return !m_LoadInProgress; }, [this]() { return UpdateLoadProgress(); },
+      [this]() { return CurrentLoadStatusText(); });
 
   if(local)
   {
@@ -943,6 +1019,30 @@ float CaptureContext::UpdateLoadProgress()
   return val;
 }
 
+QString CaptureContext::CurrentLoadStatusText() const
+{
+  const LoadCaptureStage stage =
+      LoadCaptureStage(m_LoadCaptureStage.load(std::memory_order_relaxed));
+
+  switch(stage)
+  {
+    case LoadCaptureStage::OpeningReplay:
+      return tr("Loading the RDC and reconstructing replay resources...");
+    case LoadCaptureStage::ReadingFrameMetadata: return tr("Reading frame and API metadata...");
+    case LoadCaptureStage::BuildingActionList: return tr("Building the frame event list...");
+    case LoadCaptureStage::CachingResources:
+      return tr("Caching resources, buffers, and descriptor stores...");
+    case LoadCaptureStage::ReadingTextures: return tr("Reading texture metadata...");
+    case LoadCaptureStage::ReadingPipelineState:
+      return tr("Reading the initial pipeline state...");
+    case LoadCaptureStage::ReadingEmbeddedData:
+      return tr("Reading embedded capture data and saved edits...");
+    case LoadCaptureStage::Finalising: return tr("Finalising capture initialisation...");
+  }
+
+  return tr("Loading capture...");
+}
+
 void CaptureContext::LoadCaptureThreaded(const QString &captureFile, const ReplayOptions &opts,
                                          const QString &origFilename, bool temporary, bool local)
 {
@@ -955,6 +1055,7 @@ void CaptureContext::LoadCaptureThreaded(const QString &captureFile, const Repla
 
   m_LoadProgress = 0.0f;
   m_PostloadProgress = 0.0f;
+  SetLoadCaptureStage(LoadCaptureStage::OpeningReplay);
 
   // this function call will block until the capture is either loaded, or there's some failure
   m_Replay.OpenCapture(captureFile, opts, [this](float p) { m_LoadProgress = p; });
@@ -986,6 +1087,8 @@ void CaptureContext::LoadCaptureThreaded(const QString &captureFile, const Repla
 
   // fetch initial data like actions, textures and buffers
   m_Replay.BlockInvoke([this](IReplayController *r) {
+    SetLoadCaptureStage(LoadCaptureStage::ReadingFrameMetadata);
+
     if(Config().EventBrowser_AddFake)
       r->AddFakeMarkers();
 
@@ -999,6 +1102,8 @@ void CaptureContext::LoadCaptureThreaded(const QString &captureFile, const Repla
 
     m_PostloadProgress = 0.2f;
 
+    SetLoadCaptureStage(LoadCaptureStage::BuildingActionList);
+
     m_Actions = &r->GetRootActions();
 
     m_FirstAction = &m_Actions->at(0);
@@ -1010,6 +1115,8 @@ void CaptureContext::LoadCaptureThreaded(const QString &captureFile, const Repla
       m_LastAction = &m_LastAction->children.back();
 
     m_PostloadProgress = 0.4f;
+
+    SetLoadCaptureStage(LoadCaptureStage::CachingResources);
 
     m_WinSystems = r->GetSupportedWindowSystems();
 
@@ -1078,11 +1185,15 @@ void CaptureContext::LoadCaptureThreaded(const QString &captureFile, const Repla
 
     m_PostloadProgress = 0.8f;
 
+    SetLoadCaptureStage(LoadCaptureStage::ReadingTextures);
+
     m_TextureList = r->GetTextures();
     for(TextureDescription &t : m_TextureList)
       m_Textures[t.resourceId] = &t;
 
     m_PostloadProgress = 0.9f;
+
+    SetLoadCaptureStage(LoadCaptureStage::ReadingPipelineState);
 
     m_CurD3D11PipelineState = r->GetD3D11PipelineState();
     m_CurD3D12PipelineState = r->GetD3D12PipelineState();
@@ -1121,6 +1232,8 @@ void CaptureContext::LoadCaptureThreaded(const QString &captureFile, const Repla
 
   if(access)
   {
+    SetLoadCaptureStage(LoadCaptureStage::ReadingEmbeddedData);
+
     int idx = access->FindSectionByType(SectionType::ResourceRenames);
     if(idx >= 0)
     {
@@ -1162,6 +1275,7 @@ void CaptureContext::LoadCaptureThreaded(const QString &captureFile, const Repla
     }
   }
 
+  SetLoadCaptureStage(LoadCaptureStage::Finalising);
   m_LoadInProgress = false;
   m_CaptureLoaded = true;
 }
@@ -1183,6 +1297,7 @@ void CaptureContext::CacheResources()
 
 void CaptureContext::RecompressCapture()
 {
+  const QString previousCaptureFile = m_CaptureFile;
   QString destFilename = GetCaptureFilename();
   QString tempFilename;
 
@@ -1323,6 +1438,9 @@ void CaptureContext::RecompressCapture()
     SaveChanges();
   }
 
+  if(m_AIAssistant && previousCaptureFile != m_CaptureFile)
+    m_AIAssistant->RebindCaptureFile(m_CaptureFile);
+
   // close any temporary resources
   if(tempCap)
     tempCap->Shutdown();
@@ -1346,6 +1464,7 @@ bool CaptureContext::SaveCaptureTo(const rdcstr &captureFile)
 {
   bool success = false;
   QString error;
+  const QString previousCaptureFile = m_CaptureFile;
 
   if(IsCaptureLocal())
   {
@@ -1413,6 +1532,9 @@ bool CaptureContext::SaveCaptureTo(const rdcstr &captureFile)
 
   m_Replay.ReopenCaptureFile(captureFile);
   SaveChanges();
+
+  if(m_AIAssistant && previousCaptureFile != m_CaptureFile)
+    m_AIAssistant->RebindCaptureFile(m_CaptureFile);
 
   return true;
 }
@@ -1690,6 +1812,37 @@ ResourceId CaptureContext::GetResourceReplacement(ResourceId id)
 
 void CaptureContext::RegisterReplacement(ResourceId from, ResourceId to)
 {
+  if(from == ResourceId() || to == ResourceId() || from == to)
+  {
+    qCritical() << "Refusing invalid replacement registration" << ToQStr(from)
+                << "->" << ToQStr(to);
+    return;
+  }
+
+  auto targetOwner = m_ReplacedToOrigResources.constFind(to);
+  if(targetOwner != m_ReplacedToOrigResources.constEnd() && targetOwner.value() != from)
+  {
+    // A reverse entry has exactly one owner. Do not overwrite it and make
+    // resource naming/selection disagree with the replay ResourceManager.
+    qCritical() << "Refusing replacement target already owned by"
+                << ToQStr(targetOwner.value()) << ":" << ToQStr(to);
+    return;
+  }
+
+  auto previous = m_OrigToReplacedResources.find(from);
+  if(previous != m_OrigToReplacedResources.end())
+  {
+    if(previous.value() == to)
+      return;
+
+    // Superseding one original must retire its old reverse edge before the
+    // new pair is inserted. Otherwise GetResourceName() can keep treating a
+    // freed target Shader as live UI state.
+    auto oldReverse = m_ReplacedToOrigResources.find(previous.value());
+    if(oldReverse != m_ReplacedToOrigResources.end() && oldReverse.value() == from)
+      m_ReplacedToOrigResources.erase(oldReverse);
+  }
+
   m_OrigToReplacedResources[from] = to;
   m_ReplacedToOrigResources[to] = from;
 
@@ -2434,6 +2587,29 @@ ApiMonitorWindow *CaptureContext::GetApiMonitorWindow()
   return m_ApiMonitorWindow;
 }
 
+ReplayLabIntegration &CaptureContext::ReplayLab()
+{
+  Q_ASSERT(m_ReplayLabIntegration != NULL);
+  return *m_ReplayLabIntegration;
+}
+
+void CaptureContext::ShowAIAssistant(const QString &taskId)
+{
+  m_MainWindow->showAIAssistant(taskId);
+}
+
+AIAssistant *CaptureContext::GetAIAssistant()
+{
+  if(m_AIAssistant)
+    return m_AIAssistant;
+
+  m_AIAssistant = new AIAssistant(*this, m_MainWindow);
+  m_AIAssistant->setObjectName(lit("aiAssistant"));
+  setupDockWindow(m_AIAssistant, true);
+
+  return m_AIAssistant;
+}
+
 IResourceInspector *CaptureContext::GetResourceInspector()
 {
   if(m_ResourceInspector)
@@ -2596,17 +2772,59 @@ void CaptureContext::ApplyShaderEdit(IShaderViewer *viewer, ResourceId id, Shade
 
     if(to == ResourceId())
     {
-      r->RemoveReplacement(from);
+      if(APIProps().pipelineType == GraphicsAPI::D3D12)
+      {
+        rdcstr removeError = r->RemoveTargetShaderReplacementChecked(from);
+        if(!removeError.empty())
+        {
+          // Keep the compiler diagnostic and add the transactional restore
+          // diagnostic. The UI owner must remain registered while replay still
+          // uses the previous target.
+          if(!errs.empty())
+            errs += "\n";
+          errs += removeError;
+        }
+        else
+        {
+          // this GUIInvoke call always needs to go through even if the viewer has been closed.
+          GUIInvoke::call(GetMainWindow()->Widget(),
+                          [this, from]() { UnregisterReplacement(from); });
+        }
+      }
+      else
+      {
+        r->RemoveReplacement(from);
 
-      // this GUIInvoke call always needs to go through even if the viewer has been closed.
-      GUIInvoke::call(GetMainWindow()->Widget(), [this, from]() { UnregisterReplacement(from); });
+        // this GUIInvoke call always needs to go through even if the viewer has been closed.
+        GUIInvoke::call(GetMainWindow()->Widget(),
+                        [this, from]() { UnregisterReplacement(from); });
+      }
     }
     else
     {
-      r->ReplaceResource(from, to);
+      if(APIProps().pipelineType == GraphicsAPI::D3D12)
+      {
+        rdcstr replaceError = r->ReplaceTargetShaderChecked(from, to);
+        if(!replaceError.empty())
+        {
+          if(!errs.empty())
+            errs += "\n";
+          errs += replaceError;
+          r->FreeTargetResource(to);
+        }
+        else
+        {
+          GUIInvoke::call(GetMainWindow()->Widget(),
+                          [this, from, to]() { RegisterReplacement(from, to); });
+        }
+      }
+      else
+      {
+        r->ReplaceResource(from, to);
 
-      GUIInvoke::call(GetMainWindow()->Widget(),
-                      [this, from, to]() { RegisterReplacement(from, to); });
+        GUIInvoke::call(GetMainWindow()->Widget(),
+                        [this, from, to]() { RegisterReplacement(from, to); });
+      }
     }
     if(ptr)
       GUIInvoke::call(ptr, [viewer, errs]() { viewer->ShowErrors(errs); });
@@ -2620,12 +2838,19 @@ void CaptureContext::RevertShaderEdit(IShaderViewer *viewer, ResourceId id)
   // remove the replacement on close (we could make this more sophisticated if there
   // was a place to control replaced resources/shaders).
   Replay().AsyncInvoke([this, viewer, id, ptr](IReplayController *r) {
+    rdcstr errs;
     if(IsCaptureLoaded())
-      r->RemoveReplacement(id);
-    GUIInvoke::call(GetMainWindow()->Widget(), [this, viewer, id, ptr] {
-      UnregisterReplacement(id);
+    {
+      if(APIProps().pipelineType == GraphicsAPI::D3D12)
+        errs = r->RemoveTargetShaderReplacementChecked(id);
+      else
+        r->RemoveReplacement(id);
+    }
+    GUIInvoke::call(GetMainWindow()->Widget(), [this, viewer, id, ptr, errs] {
+      if(errs.empty())
+        UnregisterReplacement(id);
       if(ptr)
-        viewer->ShowErrors(rdcstr());
+        viewer->ShowErrors(errs);
     });
   });
 }
@@ -2759,6 +2984,10 @@ QWidget *CaptureContext::CreateBuiltinWindow(const rdcstr &objectName)
   {
     return GetApiMonitorWindow()->Widget();
   }
+  else if(objectName == "aiAssistant")
+  {
+    return GetAIAssistant()->Widget();
+  }
   else if(objectName == "resourceInspector")
   {
     return GetResourceInspector()->Widget();
@@ -2799,6 +3028,8 @@ void CaptureContext::BuiltinWindowClosed(QWidget *window)
     m_PythonShell = NULL;
   else if(m_ApiMonitorWindow && m_ApiMonitorWindow->Widget() == window)
     m_ApiMonitorWindow = NULL;
+  else if(m_AIAssistant && m_AIAssistant->Widget() == window)
+    m_AIAssistant = NULL;
   else if(m_ResourceInspector && m_ResourceInspector->Widget() == window)
     m_ResourceInspector = NULL;
   else if(m_PerformanceCounterViewer && m_PerformanceCounterViewer->Widget() == window)

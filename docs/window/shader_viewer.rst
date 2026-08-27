@@ -22,6 +22,28 @@ Several different disassembly forms are possible, depending on the API and avail
 
 You can configure shader processing tools :ref:`in the settings window <shader-processing-tools-config>` which allows for various customised disassemblers such as SPIRV-Cross and spirv-dis for SPIR-V.
 
+Code editing and navigation
+---------------------------
+
+Shader source tabs provide IDE-style editing assistance. :kbd:`Ctrl-Space` opens completion,
+typing an identifier updates suggestions, and typing ``(`` or ``,`` displays parameter information.
+Structural errors and language-server diagnostics are underlined; hovering an underline displays
+its message. Press :kbd:`F12` to navigate to a definition in another source tab. Definitions in an
+external include are opened in a read-only tab so they cannot accidentally become part of the
+shader replacement.
+
+The editor maintains a local symbol index and lightweight structural diagnostics, so these features
+remain available without extra software. For compiler-aware HLSL, GLSL, or Slang results, configure
+``shader-language-server`` or ``slangd`` using the :guilabel:`Language server` setting. The
+integration uses LSP over a bounded, out-of-process connection and does not execute commands sent
+by a server.
+
+Pressing :kbd:`Ctrl-F` opens an inline search bar in the upper-right of the active source tab. Search
+results update while typing and show the current/total match count. :kbd:`Enter` or :kbd:`F3` moves
+forward, :kbd:`Shift-Enter` or :kbd:`Shift-F3` moves backward, :kbd:`Ctrl-H` expands replacement,
+and :kbd:`Escape` closes the bar. Case, whole-word, regular-expression, current-file, and all-source
+search modes are available without leaving the editor.
+
 .. figure:: ../imgs/Screenshots/ShaderDisassembly.png
 
 	The disassembly options for a Vulkan SPIR-V shader

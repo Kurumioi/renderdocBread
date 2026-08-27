@@ -1,0 +1,12440 @@
+"""
+Built-in ReplayLab integration — file IPC bridge for the packaged/external MCP host.
+
+Architecture:
+    [AI / WorkBuddy] <-stdio-> [External MCP Server] <-file IPC-> [Built-in qrenderdoc bridge]
+
+This first-party module runs inside RenderDoc's Python 3.6 environment. qrenderdoc loads it from
+its fixed application-owned integration directory; it is not discovered or managed as an
+extension.
+It polls for request.json, executes commands via pyrenderdoc API,
+and writes response.json.
+
+IPC directory: %LOCALAPPDATA%/ReplayLab/ipc-v2/instances/<instance-id>/
+"""
+
+import base64
+import json
+import hashlib
+import math
+import os
+import re
+import stat
+import subprocess
+import struct
+import sys
+import traceback
+import tempfile
+import time
+import uuid
+
+import renderdoc as rd
+
+try:
+    from . import ai_context as _ai_context_protocol
+except (ImportError, ValueError):
+    # Contract tests and RenderDoc's script runner can load this file directly
+    # instead of as a package. Load the sibling without changing sys.path.
+    import importlib.util
+    _ai_context_spec = importlib.util.spec_from_file_location(
+        "_renderdoc_ultra_ai_context_protocol",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_context.py"))
+    if _ai_context_spec is None or _ai_context_spec.loader is None:
+        raise ImportError("Unable to load the RenderDoc AI context protocol")
+    _ai_context_protocol = importlib.util.module_from_spec(_ai_context_spec)
+    _ai_context_spec.loader.exec_module(_ai_context_protocol)
+
+try:
+    from . import material_panel as _material_panel_protocol
+except (ImportError, ValueError):
+    # Keep direct script-runner/contract-test loading symmetrical with ai_context.
+    import importlib.util
+    _material_panel_spec = importlib.util.spec_from_file_location(
+        "_replaylab_material_panel_protocol",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "material_panel.py"))
+    if _material_panel_spec is None or _material_panel_spec.loader is None:
+        raise ImportError("Unable to load the ReplayLab material-panel protocol")
+    _material_panel_protocol = importlib.util.module_from_spec(_material_panel_spec)
+    _material_panel_spec.loader.exec_module(_material_panel_protocol)
+
+try:
+    from . import pass_panel as _pass_panel_protocol
+except (ImportError, ValueError):
+    _pass_panel_spec = importlib.util.spec_from_file_location(
+        "_replaylab_pass_panel_protocol",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "pass_panel.py"))
+    if _pass_panel_spec is None or _pass_panel_spec.loader is None:
+        raise ImportError("Unable to load the ReplayLab pass-panel protocol")
+    _pass_panel_protocol = importlib.util.module_from_spec(_pass_panel_spec)
+    _pass_panel_spec.loader.exec_module(_pass_panel_protocol)
+
+try:
+    from . import project_launcher as _project_launcher_protocol
+except (ImportError, ValueError):
+    _project_launcher_spec = importlib.util.spec_from_file_location(
+        "_replaylab_project_launcher_protocol",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "project_launcher.py"))
+    if _project_launcher_spec is None or _project_launcher_spec.loader is None:
+        raise ImportError("Unable to load the ReplayLab project launcher protocol")
+    _project_launcher_protocol = importlib.util.module_from_spec(_project_launcher_spec)
+    _project_launcher_spec.loader.exec_module(_project_launcher_protocol)
+
+try:
+    from . import project_restore_client as _project_restore_client_protocol
+except (ImportError, ValueError):
+    _project_restore_client_spec = importlib.util.spec_from_file_location(
+        "_replaylab_project_restore_client_protocol",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "project_restore_client.py"))
+    if (_project_restore_client_spec is None or
+            _project_restore_client_spec.loader is None):
+        raise ImportError("Unable to load the ReplayLab project restore client")
+    _project_restore_client_protocol = importlib.util.module_from_spec(
+        _project_restore_client_spec)
+    _project_restore_client_spec.loader.exec_module(
+        _project_restore_client_protocol)
+
+try:
+    from . import shader_console as _shader_console_protocol
+except (ImportError, ValueError):
+    _shader_console_spec = importlib.util.spec_from_file_location(
+        "_replaylab_shader_console_protocol",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "shader_console.py"))
+    if _shader_console_spec is None or _shader_console_spec.loader is None:
+        raise ImportError("Unable to load the ReplayLab Console protocol")
+    _shader_console_protocol = importlib.util.module_from_spec(_shader_console_spec)
+    _shader_console_spec.loader.exec_module(_shader_console_protocol)
+
+try:
+    from . import dxil_access_signature as _dxil_access_protocol
+except (ImportError, ValueError):
+    # qrenderdoc normally imports this built-in integration as a package, while contract
+    # tests and the script runner may load __init__.py directly.  Keep the
+    # strict access parser private to this exact installed integration package.
+    import importlib.util
+    _dxil_access_spec = importlib.util.spec_from_file_location(
+        "_replaylab_dxil_access_signature",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "dxil_access_signature.py"))
+    if _dxil_access_spec is None or _dxil_access_spec.loader is None:
+        raise ImportError("Unable to load the ReplayLab DXIL access parser")
+    _dxil_access_protocol = importlib.util.module_from_spec(_dxil_access_spec)
+    _dxil_access_spec.loader.exec_module(_dxil_access_protocol)
+
+try:
+    import qrenderdoc as qrd
+    from PySide2 import QtCore
+    HAS_UI = True
+except ImportError:
+    HAS_UI = False
+
+# ---- IPC paths ----
+# Each qrenderdoc process owns a private mailbox. The external ReplayLab host
+# discovers the most recently interacted-with live instance from its manifest,
+# so two qrenderdoc windows can never race to execute the same replay command.
+_replaylab_local_root = os.environ.get("LOCALAPPDATA", "").strip()
+if not _replaylab_local_root:
+    _replaylab_local_root = tempfile.gettempdir()
+IPC_ROOT = os.path.join(_replaylab_local_root, "ReplayLab", "ipc-v2")
+INSTANCE_ID = "%d-%s" % (os.getpid(), uuid.uuid4().hex)
+IPC_DIR = os.path.join(IPC_ROOT, "instances", INSTANCE_ID)
+REQ_FILE = os.path.join(IPC_DIR, "request.json")
+RESP_FILE = os.path.join(IPC_DIR, "response.json")
+READY_FILE = os.path.join(IPC_DIR, "ready")  # Signal: request is ready to read
+REQUEST_DIR = os.path.join(IPC_DIR, "requests")
+RESPONSE_DIR = os.path.join(IPC_DIR, "responses")
+PROCESSING_DIR = os.path.join(IPC_DIR, "processing")
+INSTANCE_FILE = os.path.join(IPC_DIR, "instance.json")
+PROJECT_ASSOCIATION_LEASE_FILE = os.path.join(
+    IPC_DIR, "project-association-lease.json")
+
+# ---- Global state ----
+_ctx = None
+_poller = None
+_capture_viewer = None
+_active_capture_token = None
+_capture_session_id = ""
+_ai_intent_queue = _ai_context_protocol.IntentQueue(maximum=256)
+_ai_context_generation = 0
+_ai_last_observation_id = ""
+_material_panel_ui = None
+_material_panel_controller = None
+_material_panel_callbacks = []
+_pass_panel_ui = None
+_pass_panel_callbacks = []
+_pass_panel_factory = None
+_project_launcher_ui = None
+_project_launcher_callbacks = []
+_project_thumbnail_cache = None
+_project_thumbnail_reader = None
+_project_async_executor = None
+_project_auto_activation_generation = 0
+_project_auto_activation_timer = None
+_project_preselected_capture_path = ""
+_project_preselected_open_depth = 0
+_project_startup_timer = None
+_shader_console_ui = None
+_shader_console_callbacks = []
+_event_filter_ui_callbacks = []
+_event_filter_registered = False
+_instance_started_unix_ms = int(time.time() * 1000)
+_instance_activity_unix_ms = _instance_started_unix_ms
+_replaylab_host_executable = ""
+_replaylab_host_control_process = None
+
+EVENT_FILTER_FUNCTION = "rdultra"
+EVENT_FILTER_DRAW = "draw"
+EVENT_FILTER_OUTPUT = "output"
+EVENT_FILTER_ALL = "all"
+
+SYMBOL_CATALOG_SCHEMA = "renderdoc-ultra-capture-symbols/v1"
+SYMBOL_CATALOG_VERSION = 1
+SYMBOL_ALIAS_SCHEMA = "renderdoc-ultra-aliases/v1"
+SYMBOL_ALIAS_VERSION = 1
+REPLAYLAB_RDC_PROJECT_INDEX_SCHEMA = "replaylab-rdc-project-reuse-index/v1"
+REPLAYLAB_RDC_PROJECT_INDEX_VERSION = 1
+REPLAYLAB_RDC_PROJECT_INDEX_SECTION = "replaylab/cache/project-reuse-index"
+MAX_REPLAYLAB_RDC_PROJECT_INDEX_BYTES = 16 * 1024 * 1024
+MAX_IPC_REQUEST_BYTES = 16 * 1024 * 1024
+MAX_BUFFER_DATA_BYTES = 4096
+MAX_LIGHTING_CBUFFER_BYTES = 2048
+MAX_CAPTURE_SECTION_COUNT = 16384
+BRIDGE_PROTOCOL_VERSION = 2
+BRIDGE_INTEGRATION_VERSION = "1.10.1"
+IPC_POLL_INTERVAL_MS = 33
+MAX_KNOWN_CATALOG_CAPTURE_IDS = 4096
+MAX_KNOWN_CATALOG_IDENTITY_PAIRS = 4096
+MAX_CATALOG_IDENTITY_EVENTS = 1000000
+MAX_CATALOG_IDENTITY_STAGES = 16
+MAX_CATALOG_IDENTITY_SHADERS = 1000000
+MAX_CATALOG_IDENTITY_USES = 4000000
+MAX_EVENT_SHADER_OVERRIDES = 256
+MAX_SHARED_SHADER_REPLACEMENTS = 256
+MAX_EVENT_CBUFFER_SNAPSHOTS = 256
+MAX_EVENT_CBUFFER_RELEASED_SNAPSHOTS = 256
+SHADER_CATALOG_PROGRESS_SCHEMA = "replaylab-shader-catalog-progress/v1"
+SHADER_CATALOG_PROGRESS_VERSION = 1
+MAX_SHADER_CATALOG_PROGRESS_EVENTS = 1000000
+MAX_SHADER_CATALOG_PROGRESS_BYTES = 16 * 1024
+SHADER_CATALOG_PROGRESS_INTERVAL_SECONDS = 0.05
+
+# Aliases are kept outside RenderDoc's immutable shader reflection. The active list only
+# contains aliases that passed validation (and confirmation when requested by the loader).
+_symbol_alias_overlay = {
+    "schema": SYMBOL_ALIAS_SCHEMA,
+    "schemaVersion": SYMBOL_ALIAS_VERSION,
+    "captureId": "",
+    "sourcePath": "",
+    "confirmedOnly": True,
+    "allAliases": [],
+    "aliases": [],
+}
+
+# The alias manifest is only meaningful for the exact capture catalog that was exported by this
+# bridge instance. ResourceId values are capture-local and therefore never survive this reset.
+_symbol_capture_snapshot = {
+    "captureId": "",
+    "capturePath": "",
+    "shaderKeys": set(),
+    "usesByKey": {},
+}
+_known_catalog_capture_ids = {}
+_known_catalog_identity_pairs = set()
+_symbol_resource_renames = {}
+_symbol_rename_capture_token = None
+
+# Target shaders used by event-scoped overrides are owned by the active replay
+# controller.  Never carry these ResourceIds across a capture lifecycle.
+_event_shader_overrides = {}
+_event_shader_targets = {}
+_event_shader_override_capture_token = None
+
+# Resource-scoped shader replacements preserve RenderDoc's captured sharing
+# relationship: exactly one generated target is owned for each original shader
+# ResourceId, and ReplayController.ReplaceResource makes every use of that
+# captured resource observe it.  These records are deliberately separate from
+# the opt-in event-scoped override table above so the two scopes can never be
+# mistaken for one another.
+_shared_shader_replacements = {}
+_shared_shader_orphan_targets = []
+_shared_shader_replacement_capture_token = None
+
+# Event-scoped CBuffer snapshots own immutable captured bytes plus a deterministic
+# reflected leaf allow-list.  Mutable override bytes are always reconstructed from
+# that baseline; callers can never submit an unconstrained byte buffer.
+_event_cbuffer_snapshots = {}
+_event_cbuffer_snapshot_keys = {}
+_event_cbuffer_released_snapshots = {}
+_event_cbuffer_release_serial = 0
+_event_cbuffer_capture_token = None
+
+
+def _atomic_write_bytes(path, data):
+    """Write bytes with a same-directory atomic replace (Python 3.6 compatible)."""
+    directory = os.path.dirname(os.path.abspath(path))
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    tmp_path = "%s.tmp.%d.%d" % (path, os.getpid(), int(time.time() * 1000000))
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _atomic_write_json(path, value):
+    """Write portable Unicode JSON atomically so readers never see a partial document.
+
+    IPC documents are UTF-8, and escaping non-ASCII code points additionally
+    keeps every byte on this Windows machine boundary ASCII. ``json.load``
+    reconstructs the exact Unicode string, so Chinese capture paths survive
+    even when a legacy intermediary accidentally applies an ANSI code page.
+    """
+    # Do not sort: some legacy bridge responses contain a mixture of integer and string keys,
+    # which Python 3.6 cannot compare while sorting.
+    payload = json.dumps(value, ensure_ascii=True, indent=2, default=str)
+    _atomic_write_bytes(path, payload.encode("utf-8"))
+
+
+def _read_ipc_request_json(path):
+    """Read one bounded regular-file IPC request without following a symlink."""
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("IPC request must be a regular file")
+    if before.st_size > MAX_IPC_REQUEST_BYTES:
+        raise ValueError("IPC request exceeds the maximum size")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode) or
+                not os.path.samestat(before, opened)):
+            raise ValueError("IPC request changed before it could be read")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            encoded = stream.read(MAX_IPC_REQUEST_BYTES + 1)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    if len(encoded) > MAX_IPC_REQUEST_BYTES:
+        raise ValueError("IPC request exceeds the maximum size")
+    try:
+        text = encoded.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("IPC request is not valid UTF-8")
+    return json.loads(text)
+
+
+def _shader_catalog_progress_binding(params):
+    """Resolve an optional export-progress file only from a random token."""
+    token = str(params.get("progress_token", "") or "").strip()
+    session_id = str(
+        params.get("progress_capture_session_id", "") or "").strip()
+    if not token and not session_id:
+        return None
+    if (len(token) != 32 or
+            any(character not in "0123456789abcdef" for character in token)):
+        raise ValueError("progress_token must be 32 lowercase hexadecimal characters")
+    if (len(session_id) != 32 or
+            any(character not in "0123456789abcdef" for character in session_id)):
+        raise ValueError(
+            "progress_capture_session_id must be 32 lowercase hexadecimal characters")
+    if session_id != _capture_session_id:
+        raise RuntimeError("Capture session changed before Shader catalog export")
+    instance_root = os.path.abspath(IPC_DIR)
+    path = os.path.abspath(os.path.join(
+        instance_root, "shader-catalog-progress-%s.json" % token))
+    try:
+        if os.path.commonpath((instance_root, path)) != instance_root:
+            raise ValueError("Shader catalog progress path escapes the instance IPC root")
+    except ValueError:
+        raise ValueError("Shader catalog progress path escapes the instance IPC root")
+    return {
+        "token": token,
+        "captureSessionId": session_id,
+        "path": path,
+        "lastPublishMonotonic": None,
+    }
+
+
+def _atomic_write_progress_json(path, value):
+    """Atomically replace advisory progress without a durability fsync."""
+    payload = json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"))
+    encoded = payload.encode("utf-8")
+    if len(encoded) > MAX_SHADER_CATALOG_PROGRESS_BYTES:
+        return False
+    directory = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(directory) or os.path.islink(directory):
+        return False
+    temporary = "%s.tmp.%d.%s" % (path, os.getpid(), uuid.uuid4().hex)
+    try:
+        with open(temporary, "xb") as stream:
+            stream.write(encoded)
+            stream.flush()
+        os.replace(temporary, path)
+        return True
+    finally:
+        if os.path.exists(temporary):
+            try:
+                os.remove(temporary)
+            except Exception:
+                pass
+
+
+def _publish_shader_catalog_progress(binding, event_id, current, total):
+    """Best-effort display telemetry which never changes export semantics."""
+    if binding is None:
+        return
+    try:
+        current_value = int(current)
+        total_value = int(total)
+        event_value = int(event_id)
+        if (current_value < 1 or total_value < 1 or
+                current_value > total_value or
+                total_value > MAX_SHADER_CATALOG_PROGRESS_EVENTS or
+                event_value < 0 or event_value > 0xFFFFFFFF):
+            return
+        now = time.monotonic()
+        previous = binding.get("lastPublishMonotonic")
+        if (current_value not in (1, total_value) and previous is not None and
+                now - previous < SHADER_CATALOG_PROGRESS_INTERVAL_SECONDS):
+            return
+        path = binding["path"]
+        if os.path.islink(path):
+            return
+        written = _atomic_write_progress_json(path, {
+            "schema": SHADER_CATALOG_PROGRESS_SCHEMA,
+            "schemaVersion": SHADER_CATALOG_PROGRESS_VERSION,
+            "operationToken": binding["token"],
+            "instanceId": INSTANCE_ID,
+            "captureSessionId": binding["captureSessionId"],
+            "phase": "export-shader-bindings",
+            "eventId": event_value,
+            "current": current_value,
+            "total": total_value,
+            "updatedUnixMs": int(time.time() * 1000),
+        })
+        if written:
+            binding["lastPublishMonotonic"] = now
+    except Exception:
+        # Progress is display-only. Never alter catalog contents, identity, or
+        # physical Shader/ABI gates because telemetry could not be published.
+        pass
+
+
+def _publish_instance_manifest(activity=False, stopped=False):
+    """Publish bounded discovery state without capture/shader data or secrets."""
+    global _instance_activity_unix_ms
+    now_ms = int(time.time() * 1000)
+    if activity:
+        _instance_activity_unix_ms = now_ms
+    loaded = False
+    capture_path = ""
+    try:
+        loaded = bool(_ctx and _ctx.IsCaptureLoaded())
+        if loaded:
+            capture_path = str(_ctx.GetCaptureFilename() or "")
+    except Exception:
+        loaded = False
+        capture_path = ""
+    _atomic_write_json(INSTANCE_FILE, {
+        "schema": "replaylab-bridge-instance/v1",
+        "instanceId": INSTANCE_ID,
+        "pid": os.getpid(),
+        "protocolVersion": BRIDGE_PROTOCOL_VERSION,
+        "bridgeVersion": BRIDGE_INTEGRATION_VERSION,
+        "startedUnixMs": _instance_started_unix_ms,
+        "lastActivityUnixMs": _instance_activity_unix_ms,
+        "heartbeatUnixMs": now_ms,
+        "captureLoaded": loaded,
+        # This path is local discovery metadata. It is never sent over the
+        # unauthenticated HTTP health endpoint.
+        "capturePath": capture_path,
+        "stopped": bool(stopped),
+    })
+
+
+def _find_replaylab_host():
+    """Locate only the packaged Python 3.10+ host; never use embedded 3.6."""
+    configured = os.environ.get("REPLAYLAB_MCP_HOST", "").strip()
+    candidates = []
+    if configured:
+        candidates.append(configured)
+    if HAS_UI:
+        try:
+            app_dir = str(QtCore.QCoreApplication.applicationDirPath())
+            candidates.extend([
+                os.path.join(app_dir, "replaylab", "ReplayLabMCP.unicode.exe"),
+                os.path.join(app_dir, "replaylab", "ReplayLabMCP.exe"),
+                os.path.join(app_dir, "ReplayLabMCP.unicode.exe"),
+                os.path.join(app_dir, "ReplayLabMCP.exe"),
+            ])
+        except Exception:
+            pass
+    integration_dir = os.path.dirname(os.path.abspath(__file__))
+    # The installed package is fixed at
+    # <application>/integrations/replaylab/python/renderdoc_mcp_bridge.  Derive
+    # the application directory only as a fallback for non-Qt contract hosts;
+    # qrenderdoc itself always contributes applicationDirPath() above.
+    installed_app_dir = os.path.abspath(os.path.join(
+        integration_dir, os.pardir, os.pardir, os.pardir, os.pardir))
+    candidates.extend([
+        os.path.join(installed_app_dir, "replaylab", "ReplayLabMCP.unicode.exe"),
+        os.path.join(installed_app_dir, "replaylab", "ReplayLabMCP.exe"),
+    ])
+    for candidate in candidates:
+        if os.path.isfile(candidate) and not os.path.islink(candidate):
+            return os.path.abspath(candidate)
+    return ""
+
+
+def _hidden_process_flags():
+    if os.name != "nt":
+        return 0
+    return (getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) |
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+
+
+def _start_replaylab_host():
+    """Ask the packaged singleton launcher to ensure the loopback host exists."""
+    global _replaylab_host_executable, _replaylab_host_control_process
+    executable = _find_replaylab_host()
+    _replaylab_host_executable = executable
+    if not executable:
+        print("[ReplayLab] Packaged ReplayLabMCP.exe not found; stdio clients may still "
+              "launch a separately registered host")
+        return False
+    try:
+        _replaylab_host_control_process = subprocess.Popen(
+            [executable, "ensure", "--owner-pid", str(os.getpid())],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=os.path.dirname(executable),
+            shell=False,
+            creationflags=_hidden_process_flags())
+        print("[ReplayLab] Starting/attaching packaged MCP host: %s" % executable)
+        return True
+    except Exception as exc:
+        print("[ReplayLab] Host startup error: %s" % str(exc))
+        _replaylab_host_control_process = None
+        return False
+
+
+def _release_replaylab_host_owner():
+    """Release only this qrenderdoc PID; the last live owner stops the host."""
+    global _replaylab_host_control_process
+    executable = _replaylab_host_executable
+    if not executable or not os.path.isfile(executable):
+        return
+    try:
+        process = subprocess.Popen(
+            [executable, "release", "--owner-pid", str(os.getpid())],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=os.path.dirname(executable),
+            shell=False,
+            creationflags=_hidden_process_flags())
+        try:
+            process.wait(timeout=3.0)
+        except Exception:
+            pass
+    except Exception as exc:
+        print("[ReplayLab] Host owner release error: %s" % str(exc))
+    _replaylab_host_control_process = None
+
+
+# =====================================================================
+# IPC Poller using QObject.startTimer (most reliable in RenderDoc)
+# =====================================================================
+
+if HAS_UI:
+    class CaptureLifecycleViewer(qrd.CaptureViewer):
+        """Invalidate capture-local symbol state even when the same file is reopened."""
+
+        def __init__(self):
+            super(CaptureLifecycleViewer, self).__init__()
+
+        def OnCaptureLoaded(self):
+            global _active_capture_token
+            if _material_panel_ui:
+                _material_panel_ui.capture_changed()
+            elif _material_panel_controller:
+                _material_panel_controller.forget_all()
+            if _pass_panel_ui:
+                _pass_panel_ui.capture_changed()
+            _reset_symbol_state(restore_names=False)
+            _active_capture_token = _current_capture_token()
+            _publish_instance_manifest(activity=True)
+            _schedule_project_auto_activation()
+            _publish_console_event(
+                "capture", "info", "RenderDoc 捕获已加载",
+                phase="捕获", code="captureLoaded")
+
+        def OnCaptureClosed(self):
+            global _active_capture_token
+            if _material_panel_ui:
+                _material_panel_ui.capture_changed()
+            elif _material_panel_controller:
+                _material_panel_controller.forget_all()
+            if _pass_panel_ui:
+                _pass_panel_ui.capture_changed()
+            _reset_symbol_state(restore_names=True)
+            _active_capture_token = None
+            _publish_instance_manifest(activity=True)
+            _cancel_project_auto_activation()
+            _publish_console_event(
+                "capture", "info", "RenderDoc 捕获已关闭",
+                phase="捕获", code="captureClosed")
+
+        def OnSelectedEventChanged(self, event_id):
+            _publish_instance_manifest(activity=True)
+
+        def OnEventChanged(self, event_id):
+            _publish_instance_manifest(activity=True)
+
+
+    class JsonPoller(QtCore.QObject):
+        """Polls for IPC request files using QObject built-in timer."""
+
+        def __init__(self, handler_fn, parent=None):
+            super(JsonPoller, self).__init__(parent)
+            self._handler = handler_fn
+            self._timer_id = 0
+            self._last_manifest_ms = 0
+
+        def start(self):
+            if not os.path.exists(IPC_DIR):
+                os.makedirs(IPC_DIR)
+            for directory in (REQUEST_DIR, RESPONSE_DIR, PROCESSING_DIR):
+                if not os.path.exists(directory):
+                    os.makedirs(directory)
+            # Clean stale files
+            for f in [REQ_FILE, RESP_FILE, READY_FILE]:
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+            # Keep the mailbox responsive enough for debounced material controls. Replay work is
+            # still serial and callers must coalesce rapid slider updates instead of queueing every
+            # mouse-move event.
+            self._timer_id = self.startTimer(IPC_POLL_INTERVAL_MS)
+            _publish_instance_manifest(activity=True)
+            print("[ReplayLab] Poller started (timer_id=%d, interval=%dms, dir=%s)" %
+                  (self._timer_id, IPC_POLL_INTERVAL_MS, IPC_DIR))
+
+        def stop(self):
+            if self._timer_id:
+                self.killTimer(self._timer_id)
+                self._timer_id = 0
+            print("[ReplayLab] Poller stopped")
+
+        def timerEvent(self, event):
+            """Called by Qt at the bounded IPC polling interval."""
+            now_ms = int(time.time() * 1000)
+            if now_ms - self._last_manifest_ms >= 1000:
+                _publish_instance_manifest()
+                self._last_manifest_ms = now_ms
+            # Protocol v2: each caller owns one UUID-named request/response pair. Claiming by
+            # rename is atomic, so multiple RenderDoc processes can never execute one request.
+            if self._process_queued_request():
+                return
+
+            # Protocol v1 is retained for older MCP clients.
+            # Only read when the READY signal file exists
+            if not os.path.exists(READY_FILE):
+                return
+            if not os.path.exists(REQ_FILE):
+                return
+            try:
+                # Remove ready signal first
+                os.remove(READY_FILE)
+                # Now safe to read — client has finished writing
+                request = _read_ipc_request_json(REQ_FILE)
+                os.remove(REQ_FILE)
+
+                response = self._handler(request)
+                _atomic_write_json(RESP_FILE, response)
+            except Exception as e:
+                print("[ReplayLab] Error: %s" % str(e))
+                traceback.print_exc()
+                try:
+                    if os.path.lexists(REQ_FILE):
+                        os.remove(REQ_FILE)
+                    _atomic_write_json(
+                        RESP_FILE, {"error": {"code": -1, "message": str(e)}})
+                except Exception:
+                    pass
+
+        def _process_queued_request(self):
+            try:
+                names = sorted(
+                    name for name in os.listdir(REQUEST_DIR)
+                    if name.endswith(".json") and os.path.isfile(
+                        os.path.join(REQUEST_DIR, name)))
+            except Exception:
+                return False
+            if not names:
+                return False
+
+            name = names[0]
+            request_path = os.path.join(REQUEST_DIR, name)
+            claim_name = "%s.claim.%d.%d" % (
+                name, os.getpid(), int(time.time() * 1000000))
+            claim_path = os.path.join(PROCESSING_DIR, claim_name)
+            response_path = os.path.join(RESPONSE_DIR, name)
+            try:
+                # os.replace is atomic on one filesystem. If another poller won the race the
+                # source no longer exists and this poller simply tries again on the next tick.
+                os.replace(request_path, claim_path)
+            except (FileNotFoundError, PermissionError, OSError):
+                return False
+
+            expected_id = name[:-5]
+            response = None
+            try:
+                request = _read_ipc_request_json(claim_path)
+                if not isinstance(request, dict):
+                    raise ValueError("Request root must be an object")
+                if str(request.get("id", "")) != expected_id:
+                    response = {
+                        "id": expected_id,
+                        "error": {
+                            "code": -32600,
+                            "message": "Request id does not match its mailbox filename",
+                        },
+                    }
+                else:
+                    response = self._handler(request)
+            except Exception as exc:
+                print("[ReplayLab] Queued request error: %s" % str(exc))
+                traceback.print_exc()
+                response = {
+                    "id": expected_id,
+                    "error": {"code": -1, "message": str(exc)},
+                }
+            finally:
+                try:
+                    if os.path.lexists(claim_path):
+                        os.remove(claim_path)
+                except Exception:
+                    pass
+
+            try:
+                _atomic_write_json(response_path, response)
+            except Exception as exc:
+                print("[ReplayLab] Response write error: %s" % str(exc))
+                traceback.print_exc()
+            return True
+
+
+# =====================================================================
+# Request handler — executes commands using pyrenderdoc
+# =====================================================================
+
+def _console_module_for_method(method):
+    """Classify only a registered bridge method into a fixed console module."""
+    value = str(method or "").lower()
+    if "project" in value:
+        return "project"
+    if "shader" in value:
+        return "shader"
+    if "cbuffer" in value or "material" in value or "bound_texture" in value:
+        return "material"
+    if ("pass" in value or "frame" in value or "draw" in value or
+            "counter" in value or "timing" in value):
+        return "pass"
+    if "capture" in value:
+        return "capture"
+    if ("texture" in value or "buffer" in value or "resource" in value or
+            "pixel" in value or "vertex" in value or "pipeline" in value):
+        return "replay"
+    return "bridge"
+
+
+CONSOLE_QUIET_REQUEST_METHODS = frozenset((
+    # These methods are background liveness/context/status polls. Logging two
+    # rows for every successful poll would evict useful user operations from
+    # the bounded Console. Failures are still always published below.
+    "ping",
+    "get_capture_status",
+    "get_current_renderdoc_context",
+    "claim_renderdoc_ui_intents",
+    "renew_renderdoc_ui_intent",
+    "get_renderdoc_ui_intent_status",
+    "get_shared_shader_replacements",
+    "get_event_cbuffer_override_status",
+))
+
+
+def _console_request_lifecycle_visible(method):
+    return str(method or "") not in CONSOLE_QUIET_REQUEST_METHODS
+
+
+def _publish_console_event(module, severity, message, phase="", code="",
+                           context=None):
+    """Best-effort fixed-program publisher; logging can never break replay."""
+    try:
+        _shader_console_protocol.publish_console_event(
+            module, severity, message, phase=phase, code=code,
+            context=context, process_role="qrenderdoc")
+    except Exception:
+        pass
+
+def handle_request(request):
+    """Route a request to the appropriate handler function."""
+    _synchronise_capture_lifecycle()
+    rid = request.get("id", "?")
+    method = request.get("method", "")
+    params = request.get("params", {})
+
+    if method not in METHODS:
+        _publish_console_event(
+            "bridge", "error", "未知 ReplayLab 请求：%s" % str(method),
+            phase="请求失败", code="requestRejected",
+            context={"operation": str(method or "")})
+        return {"id": rid, "error": {"code": -32601, "message": "Unknown method: %s" % method}}
+
+    module = _console_module_for_method(method)
+    lifecycle_visible = _console_request_lifecycle_visible(method)
+    if lifecycle_visible:
+        _publish_console_event(
+            module, "info", "正在执行 %s" % method, phase="请求开始",
+            code="requestStarted", context={"operation": method})
+    try:
+        result = METHODS[method](params)
+        if lifecycle_visible:
+            _publish_console_event(
+                module, "info", "%s 已完成" % method, phase="请求完成",
+                code="requestSucceeded", context={"operation": method})
+        return {"id": rid, "result": result}
+    except Exception as e:
+        traceback.print_exc()
+        _publish_console_event(
+            module, "error", "%s 失败：%s" % (method, str(e)), phase="请求失败",
+            code="requestFailed", context={"operation": method})
+        return {"id": rid, "error": {"code": -32000, "message": str(e)}}
+
+
+# ---- Helper: run on replay thread ----
+def _replay(fn):
+    """Execute fn(controller) on the replay thread, return result."""
+    result = [None]
+    error = [None]
+
+    def _invoke(ctrl):
+        try:
+            result[0] = fn(ctrl)
+        except Exception as e:
+            error[0] = e
+
+    _ctx.Replay().BlockInvoke(_invoke)
+    if error[0]:
+        raise error[0]
+    return result[0]
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _resource_id_int(value):
+    """Convert the several ResourceId/descriptor shapes exposed by RenderDoc to int."""
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except Exception:
+        pass
+    for attr in ("resource", "resourceId", "id"):
+        try:
+            nested = getattr(value, attr)
+            return int(nested)
+        except Exception:
+            pass
+    return 0
+
+
+def _resource_id_lookup(resources, wanted_id):
+    """Return RenderDoc's real ResourceId object instead of fabricating one via `.id`."""
+    wanted_id = _safe_int(wanted_id, 0)
+    if wanted_id <= 0:
+        return None
+    for resource in resources or []:
+        candidate = getattr(resource, "resourceId", resource)
+        if _resource_id_int(candidate) == wanted_id:
+            return candidate
+    return None
+
+
+def _resolve_resource_id(ctrl, wanted_id, resource_kind=None):
+    """Resolve an integer ID to an existing RenderDoc-owned ``ResourceId`` object.
+
+    ``ResourceId.id`` is read-only in the Python bindings. Constructing an empty ID and assigning
+    to it may appear to work in mocks while failing in qrenderdoc, so every bridge operation that
+    accepts an integer must resolve the object from the replay controller instead.
+    """
+    wanted_id = _safe_int(wanted_id, 0)
+    if wanted_id <= 0:
+        label = resource_kind or "resource"
+        raise ValueError("Invalid %s resource ID: %s" % (label, str(wanted_id)))
+
+    kind = str(resource_kind or "").strip().lower()
+    if kind == "texture":
+        getter_names = ("GetTextures",)
+    elif kind == "buffer":
+        getter_names = ("GetBuffers",)
+    elif kind:
+        raise ValueError("Unknown resource kind: %s" % resource_kind)
+    else:
+        getter_names = ("GetResources", "GetTextures", "GetBuffers")
+
+    for getter_name in getter_names:
+        getter = getattr(ctrl, getter_name, None)
+        if not callable(getter):
+            continue
+        try:
+            resolved = _resource_id_lookup(getter(), wanted_id)
+        except Exception:
+            resolved = None
+        if resolved is not None:
+            return resolved
+
+    label = (kind + " ") if kind else ""
+    raise ValueError("Unknown %sresource ID: %d" % (label, wanted_id))
+
+
+def _context_resource_ids():
+    if not _ctx or not hasattr(_ctx, "GetResources"):
+        return {}
+    try:
+        return {
+            _resource_id_int(getattr(resource, "resourceId", None)):
+            getattr(resource, "resourceId", None)
+            for resource in _ctx.GetResources()
+            if _resource_id_int(getattr(resource, "resourceId", None)) > 0
+        }
+    except Exception:
+        return {}
+
+
+def _current_capture_token():
+    if not _ctx:
+        return None
+    try:
+        if not _ctx.IsCaptureLoaded():
+            return None
+    except Exception:
+        return None
+    try:
+        path = str(_ctx.GetCaptureFilename() or "")
+    except Exception:
+        path = ""
+    if path:
+        path = os.path.normcase(os.path.abspath(path))
+    return ("loaded", path)
+
+
+def _forget_event_shader_overrides():
+    """Forget capture-local target IDs without touching the current controller.
+
+    This path is used after RenderDoc has switched/closed a capture, where the
+    old replay controller and its target ResourceIds are already invalid.
+    """
+    global _event_shader_overrides, _event_shader_targets
+    global _event_shader_override_capture_token
+    _event_shader_overrides = {}
+    _event_shader_targets = {}
+    _event_shader_override_capture_token = None
+
+
+def _release_event_shader_overrides():
+    """Best-effort rollback/free while the owning replay controller is alive."""
+    global _event_shader_overrides, _event_shader_targets
+    global _event_shader_override_capture_token
+    records = list(_event_shader_overrides.values())
+    targets = list(_event_shader_targets.values())
+    owner_token = _event_shader_override_capture_token
+    if not records and not targets:
+        _forget_event_shader_overrides()
+        return
+    if owner_token != _current_capture_token():
+        _forget_event_shader_overrides()
+        return
+
+    def _do(ctrl):
+        for record in records:
+            try:
+                ctrl.ClearEventShaderOverride(
+                    int(record["eventId"]), record["stageObject"])
+            except Exception:
+                pass
+        # A family target can be referenced by many event-scoped overrides.
+        # Free each target exactly once, and never pass a captured/original
+        # shader ResourceId to FreeTargetResource.
+        for target in targets:
+            try:
+                ctrl.FreeTargetResource(target["targetResource"])
+            except Exception:
+                pass
+
+    try:
+        _replay(_do)
+    except Exception:
+        pass
+    _forget_event_shader_overrides()
+
+
+def _forget_shared_shader_replacements():
+    """Forget resource-scoped target IDs after their replay has disappeared."""
+    global _shared_shader_replacements, _shared_shader_orphan_targets
+    global _shared_shader_replacement_capture_token
+    _shared_shader_replacements = {}
+    _shared_shader_orphan_targets = []
+    _shared_shader_replacement_capture_token = None
+
+
+def _shared_shader_ui_owner(original_resource):
+    """Return the UI replacement target, failing closed on an old API."""
+    is_replaced = getattr(_ctx, "IsResourceReplaced", None)
+    get_replacement = getattr(_ctx, "GetResourceReplacement", None)
+    if not callable(is_replaced) or not callable(get_replacement):
+        raise RuntimeError(
+            "This qrenderdoc context does not expose replacement ownership queries")
+    if not bool(is_replaced(original_resource)):
+        return None
+    target = get_replacement(original_resource)
+    if _resource_id_int(target) <= 0:
+        raise RuntimeError("qrenderdoc reported an invalid replacement owner")
+    return target
+
+
+def _require_shared_shader_ui_owner(original_resource, owned_record):
+    """Reject foreign/changed replacements instead of overwriting user state."""
+    current = _shared_shader_ui_owner(original_resource)
+    if owned_record is None:
+        if current is not None:
+            raise RuntimeError(
+                "The captured Shader already has a foreign RenderDoc replacement")
+        return
+    if (current is None or
+            _resource_id_int(current) != owned_record.get("targetResourceId")):
+        raise RuntimeError(
+            "The captured Shader replacement is no longer owned by this bridge")
+
+
+def _set_shared_shader_ui_owner(original_resource, target_resource):
+    """Set and then prove one CaptureContext replacement owner.
+
+    RegisterReplacement is outside the replay thread and is therefore the only
+    non-atomic edge of a shared Shader apply.  Never infer that a Python call
+    which returned (or raised) updated both of CaptureContext's forward/reverse
+    maps: query the public owner API after the operation and fail closed.
+    """
+    expected_id = (
+        _resource_id_int(target_resource)
+        if target_resource is not None else 0)
+    current = _shared_shader_ui_owner(original_resource)
+    if ((current is None and expected_id == 0) or
+            (current is not None and
+             _resource_id_int(current) == expected_id)):
+        return
+
+    unregister = getattr(_ctx, "UnregisterReplacement", None)
+    if not callable(unregister):
+        raise RuntimeError(
+            "This qrenderdoc context does not expose UnregisterReplacement")
+    if current is not None:
+        unregister(original_resource)
+
+    if expected_id:
+        register = getattr(_ctx, "RegisterReplacement", None)
+        if not callable(register):
+            raise RuntimeError(
+                "This qrenderdoc context does not expose RegisterReplacement")
+        register(original_resource, target_resource)
+
+    verified = _shared_shader_ui_owner(original_resource)
+    if expected_id == 0:
+        if verified is not None:
+            raise RuntimeError(
+                "qrenderdoc did not clear the Shader replacement owner")
+    elif (verified is None or
+          _resource_id_int(verified) != expected_id):
+        raise RuntimeError(
+            "qrenderdoc did not register the expected Shader replacement owner")
+
+
+def _release_shared_shader_replacements():
+    """Best-effort remove/unregister replacements and free generated targets."""
+    records = list(_shared_shader_replacements.values())
+    orphan_targets = list(_shared_shader_orphan_targets)
+    owner_token = _shared_shader_replacement_capture_token
+    if not records and not orphan_targets:
+        _forget_shared_shader_replacements()
+        return
+    if owner_token != _current_capture_token():
+        _forget_shared_shader_replacements()
+        return
+
+    owned_records = []
+    for record in records:
+        try:
+            _require_shared_shader_ui_owner(
+                record["originalResource"], record)
+            owned_records.append(record)
+        except Exception:
+            # A stock Shader Editor or another extension now owns this key.
+            # Never remove, unregister, or free through a foreign mapping.
+            pass
+
+    def _remove(ctrl):
+        removed = []
+        for record in owned_records:
+            try:
+                _remove_shared_shader_resource(
+                    ctrl, record.get("api", "d3d11"), record["originalResource"])
+                removed.append(record)
+            except Exception:
+                pass
+        return removed
+
+    try:
+        removed_records = list(_replay(_remove) or [])
+    except Exception:
+        removed_records = []
+    for record in removed_records:
+        try:
+            _ctx.UnregisterReplacement(record["originalResource"])
+        except Exception:
+            pass
+
+    # Free only bridge-generated target shaders. Captured originals are never
+    # inserted into either collection and are therefore never passed here.
+    targets = [record["targetResource"] for record in removed_records]
+    targets.extend(orphan_targets)
+    unique_targets = {}
+    for target in targets:
+        unique_targets[_resource_id_int(target)] = target
+
+    def _free(ctrl):
+        for target_id, target in unique_targets.items():
+            if target_id <= 0:
+                continue
+            try:
+                ctrl.FreeTargetResource(target)
+            except Exception:
+                pass
+
+    try:
+        _replay(_free)
+    except Exception:
+        pass
+    _forget_shared_shader_replacements()
+
+
+def _forget_event_cbuffer_snapshots():
+    """Forget capture-local CBuffer bytes and IDs without touching a controller."""
+    global _event_cbuffer_snapshots, _event_cbuffer_snapshot_keys
+    global _event_cbuffer_released_snapshots, _event_cbuffer_release_serial
+    global _event_cbuffer_capture_token
+    _event_cbuffer_snapshots = {}
+    _event_cbuffer_snapshot_keys = {}
+    _event_cbuffer_released_snapshots = {}
+    _event_cbuffer_release_serial = 0
+    _event_cbuffer_capture_token = None
+
+
+def _release_event_cbuffer_snapshots():
+    """Best-effort clear every configured CBuffer shadow while replay is alive."""
+    records = list(_event_cbuffer_snapshots.values())
+    owner_token = _event_cbuffer_capture_token
+    active = [record for record in records if record.get("overrideId")]
+    if not active or owner_token != _current_capture_token():
+        _forget_event_cbuffer_snapshots()
+        return
+
+    def _do(ctrl):
+        for record in active:
+            try:
+                ctrl.ClearEventCBufferOverride(
+                    int(record["eventId"]), record["stageObject"],
+                    int(record["slot"]), int(record.get("registerSpace", 0)))
+            except Exception:
+                pass
+
+    try:
+        _replay(_do)
+    except Exception:
+        pass
+    _forget_event_cbuffer_snapshots()
+
+
+def _new_symbol_alias_overlay():
+    return {
+        "schema": SYMBOL_ALIAS_SCHEMA,
+        "schemaVersion": SYMBOL_ALIAS_VERSION,
+        "captureId": "",
+        "sourcePath": "",
+        "confirmedOnly": True,
+        "allAliases": [],
+        "aliases": [],
+    }
+
+
+def _restore_symbol_resource_names_best_effort(resource_renames, capture_token):
+    """Restore captured names without allowing UI failures to break state reset."""
+    try:
+        if not resource_renames or capture_token != _current_capture_token():
+            return
+        resources = _context_resource_ids()
+        rename_items = list(resource_renames.items())
+    except Exception:
+        return
+
+    for resource_id, original in rename_items:
+        try:
+            rid = resources.get(resource_id)
+            if rid is None:
+                continue
+            name = original.get("name", "") if original.get("hadCustomName") else ""
+            _ctx.SetResourceCustomName(rid, name)
+        except Exception:
+            pass
+
+
+def _reset_symbol_overlay(restore_names=True):
+    """Drop aliases and restore names only when the original capture is still active."""
+    global _symbol_alias_overlay, _symbol_resource_renames, _symbol_rename_capture_token
+
+    new_overlay = _new_symbol_alias_overlay()
+    if restore_names:
+        _restore_symbol_resource_names_best_effort(
+            _symbol_resource_renames, _symbol_rename_capture_token)
+
+    _symbol_alias_overlay = new_overlay
+    _symbol_resource_renames = {}
+    _symbol_rename_capture_token = None
+
+
+def _reset_symbol_state(restore_names=True):
+    global _symbol_capture_snapshot, _known_catalog_capture_ids
+    global _known_catalog_identity_pairs, _capture_session_id
+    _reset_symbol_overlay(restore_names=restore_names)
+    _forget_event_shader_overrides()
+    _forget_shared_shader_replacements()
+    _forget_event_cbuffer_snapshots()
+    _symbol_capture_snapshot = {
+        "captureId": "",
+        "capturePath": "",
+        "shaderKeys": set(),
+        "usesByKey": {},
+    }
+    _known_catalog_capture_ids = {}
+    _known_catalog_identity_pairs = set()
+    try:
+        loaded = bool(_ctx and _ctx.IsCaptureLoaded())
+    except Exception:
+        loaded = False
+    _capture_session_id = uuid.uuid4().hex if loaded else ""
+    _ai_intent_queue.cancel_for_capture_change(_capture_session_id)
+
+
+def _synchronise_capture_lifecycle():
+    global _active_capture_token
+    token = _current_capture_token()
+    if _active_capture_token is None:
+        if token is not None and not _capture_session_id:
+            _reset_symbol_state(restore_names=False)
+        _active_capture_token = token
+        return
+    if token != _active_capture_token:
+        # A UI-driven capture change can happen outside the MCP open_capture method. Resource IDs
+        # from the old capture must be forgotten and must not be applied to the new one.
+        _reset_symbol_state(restore_names=True)
+        _active_capture_token = token
+
+
+def _catalog_capture_id(catalog):
+    """Compute the capture identity shared with the external deterministic matcher."""
+    shaders = []
+    for shader in catalog.get("shaders", []):
+        if not isinstance(shader, dict):
+            continue
+        shaders.append({
+            "resourceId": _safe_int(
+                shader.get("shaderResourceId", shader.get("resourceId", 0)), 0),
+            "stage": _normalise_stage_name(shader.get("stage", "")),
+            "entryPoint": str(
+                shader.get("entryPoint", shader.get("entry", "")) or ""),
+            "rawSha256": str(shader.get("rawSha256", "") or "").lower(),
+        })
+    shaders.sort(key=lambda value: (
+        value["resourceId"], value["stage"], value["entryPoint"], value["rawSha256"]))
+    identity = {
+        "capturePath": str(catalog.get("capturePath", "") or ""),
+        "api": str(catalog.get("api", "") or ""),
+        "shaders": shaders,
+    }
+    canonical = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _catalog_identity_evidence(catalog):
+    """Canonicalise the exact fixed selection, Shader set and event/use map.
+
+    This deliberately excludes names, reflection display metadata and output
+    paths.  It is paired with ``captureId``, which already binds capture
+    path/API and the complete physical Shader-key set.  The helper is kept
+    Python 3.6 compatible because it executes inside qrenderdoc.
+    """
+    if (not isinstance(catalog, dict) or
+            catalog.get("schema") != SYMBOL_CATALOG_SCHEMA or
+            catalog.get("schemaVersion") != SYMBOL_CATALOG_VERSION):
+        raise RuntimeError("Shader catalog identity evidence has an invalid schema")
+
+    selection = catalog.get("selection")
+    if (not isinstance(selection, dict) or
+            set(selection.keys()) != set(("mode", "eventIds", "stages"))):
+        raise RuntimeError("Shader catalog identity selection is invalid")
+    mode = str(selection.get("mode", "") or "")
+    if mode not in ("explicit", "all_draw_dispatch"):
+        raise RuntimeError("Shader catalog identity selection mode is invalid")
+    raw_event_ids = selection.get("eventIds")
+    raw_stages = selection.get("stages")
+    if (not isinstance(raw_event_ids, list) or
+            len(raw_event_ids) > MAX_CATALOG_IDENTITY_EVENTS or
+            not isinstance(raw_stages, list) or not raw_stages or
+            len(raw_stages) > MAX_CATALOG_IDENTITY_STAGES):
+        raise RuntimeError("Shader catalog identity selection exceeds fixed limits")
+    if mode == "explicit" and not raw_event_ids:
+        raise RuntimeError("Shader catalog explicit identity selection is empty")
+
+    event_ids = []
+    for index, value in enumerate(raw_event_ids):
+        if isinstance(value, bool):
+            raise RuntimeError(
+                "Shader catalog identity eventIds[%d] is invalid" % index)
+        try:
+            event_id = int(value)
+        except Exception:
+            raise RuntimeError(
+                "Shader catalog identity eventIds[%d] is invalid" % index)
+        if event_id < 0 or event_id in event_ids:
+            raise RuntimeError(
+                "Shader catalog identity eventIds[%d] is invalid" % index)
+        event_ids.append(event_id)
+
+    stages = []
+    for index, value in enumerate(raw_stages):
+        stage = _normalise_stage_name(value)
+        if not stage or value != stage or stage in stages:
+            raise RuntimeError(
+                "Shader catalog identity stages[%d] is invalid" % index)
+        stages.append(stage)
+
+    def _shader_identity(value, field):
+        if not isinstance(value, dict):
+            raise RuntimeError("Shader catalog %s is invalid" % field)
+        resource_a = value.get("shaderResourceId")
+        resource_b = value.get("resourceId")
+        try:
+            if (resource_a is not None and resource_b is not None and
+                    int(resource_a) != int(resource_b)):
+                raise RuntimeError(
+                    "Shader catalog %s ResourceId conflicts" % field)
+            raw_resource = resource_a if resource_a is not None else resource_b
+            if isinstance(raw_resource, bool):
+                raise ValueError("boolean ResourceId")
+            resource_id = int(raw_resource)
+        except Exception:
+            raise RuntimeError("Shader catalog %s ResourceId is invalid" % field)
+        stage = _normalise_stage_name(value.get("stage"))
+        if resource_id <= 0 or not stage:
+            raise RuntimeError("Shader catalog %s identity is invalid" % field)
+        entry_point = str(
+            value.get("entryPoint", value.get("entry", "")) or "")
+        raw_sha256 = str(value.get("rawSha256", "") or "").strip().lower()
+        if (raw_sha256 and
+                (len(raw_sha256) != 64 or
+                 any(character not in "0123456789abcdef"
+                     for character in raw_sha256))):
+            raise RuntimeError("Shader catalog %s rawSha256 is invalid" % field)
+        shader_key = "%d:%s:%s:%s" % (
+            resource_id, stage, entry_point,
+            raw_sha256 or "no-raw-bytes")
+        if value.get("shaderKey") != shader_key:
+            raise RuntimeError("Shader catalog %s shaderKey is invalid" % field)
+        return shader_key, stage
+
+    shaders = catalog.get("shaders")
+    uses = catalog.get("uses")
+    if (not isinstance(shaders, list) or
+            len(shaders) > MAX_CATALOG_IDENTITY_SHADERS or
+            not isinstance(uses, list) or
+            len(uses) > MAX_CATALOG_IDENTITY_USES):
+        raise RuntimeError("Shader catalog identity Shader/use evidence is invalid")
+    declared = set()
+    for index, shader in enumerate(shaders):
+        shader_key, unused_stage = _shader_identity(
+            shader, "shaders[%d]" % index)
+        if shader_key in declared:
+            raise RuntimeError(
+                "Shader catalog shaders[%d] is duplicated" % index)
+        declared.add(shader_key)
+
+    selected_events = set(event_ids)
+    selected_stages = set(stages)
+    use_tuples = set()
+    used = set()
+    for index, use in enumerate(uses):
+        shader_key, stage = _shader_identity(use, "uses[%d]" % index)
+        if shader_key not in declared:
+            raise RuntimeError(
+                "Shader catalog uses[%d] references an unknown Shader" % index)
+        raw_event_id = use.get("eventId")
+        if isinstance(raw_event_id, bool):
+            raise RuntimeError(
+                "Shader catalog uses[%d].eventId is invalid" % index)
+        try:
+            event_id = int(raw_event_id)
+        except Exception:
+            raise RuntimeError(
+                "Shader catalog uses[%d].eventId is invalid" % index)
+        item = (event_id, shader_key)
+        if (event_id not in selected_events or stage not in selected_stages or
+                item in use_tuples):
+            raise RuntimeError(
+                "Shader catalog uses[%d] is outside its exact selection" % index)
+        use_tuples.add(item)
+        used.add(shader_key)
+    if used != declared:
+        raise RuntimeError(
+            "Shader catalog identity does not bind every Shader to an event")
+
+    return {
+        "selection": {
+            "mode": mode,
+            "eventIds": event_ids,
+            "stages": stages,
+        },
+        "shaderKeys": sorted(declared),
+        "useTuples": [
+            [event_id, shader_key]
+            for event_id, shader_key in sorted(use_tuples)
+        ],
+    }
+
+
+def _catalog_identity_evidence_sha256(catalog):
+    evidence = _catalog_identity_evidence(catalog)
+    encoded = json.dumps(
+        evidence, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _catalog_identity_cache_projection(catalog, identity_evidence_sha256=None):
+    """Build bounded exact-identity cache state without publishing any of it."""
+    if not isinstance(catalog, dict):
+        raise RuntimeError("Shader catalog cache payload is invalid")
+    raw_capture_id = catalog.get("captureId")
+    capture_id = str(raw_capture_id or "")
+    if (not isinstance(raw_capture_id, str) or capture_id != capture_id.strip() or
+            len(capture_id) != 64 or
+            any(character not in "0123456789abcdef"
+                for character in capture_id)):
+        raise RuntimeError("Shader catalog captureId must be a lowercase SHA-256")
+    raw_capture_path = catalog.get("capturePath")
+    if not isinstance(raw_capture_path, str) or not raw_capture_path.strip():
+        raise RuntimeError("Shader catalog capturePath is required")
+    capture_path = str(raw_capture_path)
+    canonical_capture_path = os.path.normcase(os.path.abspath(capture_path))
+    computed_evidence_sha256 = _catalog_identity_evidence_sha256(catalog)
+    if (identity_evidence_sha256 is not None and
+            str(identity_evidence_sha256 or "") != computed_evidence_sha256):
+        raise RuntimeError("Shader catalog identity evidence hash is inconsistent")
+    identity_evidence_sha256 = computed_evidence_sha256
+    identity_evidence_sha256 = str(identity_evidence_sha256 or "")
+    if (len(identity_evidence_sha256) != 64 or
+            any(character not in "0123456789abcdef"
+                for character in identity_evidence_sha256)):
+        raise RuntimeError(
+            "Shader catalog identity evidence must be a lowercase SHA-256")
+
+    new_known_capture_ids = dict(_known_catalog_capture_ids)
+    if (capture_id not in new_known_capture_ids and
+            len(new_known_capture_ids) >= MAX_KNOWN_CATALOG_CAPTURE_IDS):
+        raise RuntimeError(
+            "Too many catalog identities were exported in this capture session")
+    new_known_capture_ids[capture_id] = canonical_capture_path
+    new_identity_pairs = set(_known_catalog_identity_pairs)
+    identity_pair = (capture_id, identity_evidence_sha256)
+    if (identity_pair not in new_identity_pairs and
+            len(new_identity_pairs) >= MAX_KNOWN_CATALOG_IDENTITY_PAIRS):
+        raise RuntimeError(
+            "Too many exact catalog selections were exported in this capture session")
+    new_identity_pairs.add(identity_pair)
+    return {
+        "captureId": capture_id,
+        "capturePath": capture_path,
+        "knownCaptureIds": new_known_capture_ids,
+        "knownIdentityPairs": new_identity_pairs,
+        "identityEvidenceSha256": identity_evidence_sha256,
+    }
+
+
+def _cache_catalog_identity_pair(catalog, identity_evidence_sha256=None):
+    """Publish only exact operation-authorisation facts for a restart rebind."""
+    global _known_catalog_capture_ids, _known_catalog_identity_pairs
+    projected = _catalog_identity_cache_projection(
+        catalog, identity_evidence_sha256)
+    # The exact pair is the fast-path authority, so publish it last.  A reader
+    # can observe a known captureId without the pair (safe slow path), never a
+    # newly-authorised pair without its capture-path binding.
+    _known_catalog_capture_ids = projected["knownCaptureIds"]
+    _known_catalog_identity_pairs = projected["knownIdentityPairs"]
+
+
+def _cache_symbol_catalog(catalog, identity_evidence_sha256=None):
+    """Publish an ordinary full catalog snapshot without partial mutation.
+
+    Restart rebinds use ``_cache_catalog_identity_pair`` and deliberately do
+    not replace the active symbol snapshot or alias overlay.  For an ordinary
+    user export, this helper allocates every fallible value up front and then
+    commits the full snapshot plus the exact authorisation pair.
+    """
+    global _symbol_alias_overlay, _symbol_resource_renames
+    global _symbol_rename_capture_token, _symbol_capture_snapshot
+    global _known_catalog_capture_ids, _known_catalog_identity_pairs
+
+    projected = _catalog_identity_cache_projection(
+        catalog, identity_evidence_sha256)
+    capture_id = projected["captureId"]
+    capture_path = projected["capturePath"]
+
+    raw_shaders = catalog.get("shaders")
+    raw_uses = catalog.get("uses")
+    if not isinstance(raw_shaders, list) or not isinstance(raw_uses, list):
+        raise RuntimeError("Shader catalog Shader/use records are invalid")
+
+    shader_keys = set()
+    for shader in raw_shaders:
+        if not isinstance(shader, dict):
+            raise RuntimeError("Shader catalog Shader record is invalid")
+        key = (
+            _safe_int(shader.get("shaderResourceId", shader.get("resourceId", 0)), 0),
+            _normalise_stage_name(shader.get("stage", "")),
+            str(shader.get("entryPoint", shader.get("entry", "")) or ""),
+            str(shader.get("rawSha256", "") or "").lower(),
+        )
+        shader_keys.add(key)
+
+    uses_by_key = {}
+    for use in raw_uses:
+        if not isinstance(use, dict):
+            raise RuntimeError("Shader catalog use record is invalid")
+        key = (
+            _safe_int(use.get("shaderResourceId", use.get("resourceId", 0)), 0),
+            _normalise_stage_name(use.get("stage", "")),
+            str(use.get("entryPoint", use.get("entry", "")) or ""),
+            str(use.get("rawSha256", "") or "").lower(),
+        )
+        event_id = _safe_int(use.get("eventId", 0), 0)
+        if key in shader_keys and event_id > 0:
+            uses_by_key.setdefault(key, []).append(event_id)
+
+    new_snapshot = {
+        "captureId": capture_id,
+        "capturePath": capture_path,
+        "shaderKeys": shader_keys,
+        "usesByKey": uses_by_key,
+    }
+
+    old_capture_id = str(_symbol_capture_snapshot.get("captureId", "") or "")
+    reset_overlay = bool(old_capture_id and old_capture_id != capture_id)
+    if reset_overlay:
+        new_overlay = _new_symbol_alias_overlay()
+        resource_renames = dict(_symbol_resource_renames)
+        rename_capture_token = _symbol_rename_capture_token
+
+    # No validation, hashing, path normalisation or bounded allocation follows.
+    # Publish the authorising exact pair last so concurrent readers can only
+    # observe a missing pair (safe slow path), not a partially bound new pair.
+    if reset_overlay:
+        _restore_symbol_resource_names_best_effort(
+            resource_renames, rename_capture_token)
+        _symbol_alias_overlay = new_overlay
+        _symbol_resource_renames = {}
+        _symbol_rename_capture_token = None
+    _symbol_capture_snapshot = new_snapshot
+    _known_catalog_capture_ids = projected["knownCaptureIds"]
+    _known_catalog_identity_pairs = projected["knownIdentityPairs"]
+
+
+def _revalidate_symbol_shader_keys(expected_keys):
+    """Hash current replay reflections so a stale catalog cannot authorise an alias."""
+    expected_keys = set(expected_keys)
+    if not expected_keys:
+        return set(), {}
+
+    stage_map = dict(_available_shader_stages())
+    uses_by_key = _symbol_capture_snapshot.get("usesByKey", {})
+    try:
+        original_event = _safe_int(_ctx.CurEvent(), 0)
+        restore_original_event = True
+    except Exception:
+        original_event = 0
+        restore_original_event = False
+
+    def _do(ctrl):
+        verified = set()
+        failures = {}
+        try:
+            for key in sorted(expected_keys):
+                resource_id, stage_name, entry_point, raw_sha256 = key
+                stage = stage_map.get(stage_name)
+                event_ids = uses_by_key.get(key, [])
+                if stage is None:
+                    failures[key] = "shader stage is unavailable in this RenderDoc build"
+                    continue
+                if not event_ids:
+                    failures[key] = "catalog has no event proving this shader binding"
+                    continue
+                try:
+                    ctrl.SetFrameEvent(int(event_ids[0]), True)
+                    ps = ctrl.GetPipelineState()
+                    shader_id = ps.GetShader(stage)
+                    if _resource_id_int(shader_id) != resource_id:
+                        failures[key] = "shader resource changed since catalog export"
+                        continue
+                    entries = ctrl.GetShaderEntryPoints(shader_id)
+                    selected = None
+                    for candidate in entries or []:
+                        if str(getattr(candidate, "name", "") or "") == entry_point:
+                            selected = candidate
+                            break
+                    if selected is None:
+                        failures[key] = "shader entry point changed since catalog export"
+                        continue
+                    reflection = ctrl.GetShader(_get_pipeline_obj(ps, ctrl), shader_id, selected)
+                    if not reflection:
+                        failures[key] = "shader reflection is unavailable"
+                        continue
+                    actual_entry = str(getattr(reflection, "entryPoint", "") or
+                                       getattr(selected, "name", "") or "")
+                    raw = _shader_raw_bytes(reflection)
+                    actual_sha256 = hashlib.sha256(raw).hexdigest() if raw else ""
+                    actual_key = (
+                        resource_id, stage_name, actual_entry, actual_sha256.lower())
+                    if actual_key != key:
+                        failures[key] = "shader bytes or entry point changed since catalog export"
+                        continue
+                    verified.add(key)
+                except Exception as exc:
+                    failures[key] = str(exc)
+        finally:
+            if restore_original_event:
+                try:
+                    ctrl.SetFrameEvent(original_event, True)
+                except Exception:
+                    pass
+        return verified, failures
+
+    return _replay(_do)
+
+
+def _shader_raw_bytes(refl):
+    raw = getattr(refl, "rawBytes", b"")
+    if raw is None:
+        return b""
+    if isinstance(raw, bytes):
+        return raw
+    try:
+        return bytes(raw)
+    except Exception:
+        try:
+            return bytearray(raw)
+        except Exception:
+            return b""
+
+
+def _shader_type_name(shader_type):
+    if shader_type is None:
+        return "unknown"
+    base = str(getattr(shader_type, "baseType", getattr(shader_type, "type", "unknown")))
+    rows = _safe_int(getattr(shader_type, "rows", 1), 1)
+    columns = _safe_int(getattr(shader_type, "columns", 1), 1)
+    elements = _safe_int(getattr(shader_type, "elements", 1), 1)
+    result = base
+    if rows > 1 and columns > 1:
+        result += "%dx%d" % (rows, columns)
+    elif max(rows, columns) > 1:
+        result += "%d" % max(rows, columns)
+    if elements > 1:
+        result += "[%d]" % elements
+    return result
+
+
+def _shader_type_info(shader_type):
+    if shader_type is None:
+        return {
+            "name": "", "baseType": "unknown", "rows": 0, "columns": 0,
+            "elements": 0, "arrayByteStride": 0, "matrixByteStride": 0,
+            "rowMajor": False, "flags": 0, "flagsText": "0",
+        }
+
+    flags = getattr(shader_type, "flags", 0)
+    row_major = False
+    try:
+        row_major_fn = getattr(shader_type, "RowMajor")
+        row_major = bool(row_major_fn() if callable(row_major_fn) else row_major_fn)
+    except Exception:
+        row_major = "rowmajor" in str(flags).replace("_", "").lower()
+
+    return {
+        "name": str(getattr(shader_type, "name", "")),
+        "baseType": str(getattr(shader_type, "baseType", getattr(shader_type, "type", "unknown"))),
+        "rows": _safe_int(getattr(shader_type, "rows", 1), 1),
+        "columns": _safe_int(getattr(shader_type, "columns", 1), 1),
+        "elements": _safe_int(getattr(shader_type, "elements", 1), 1),
+        "arrayByteStride": _safe_int(getattr(shader_type, "arrayByteStride", 0), 0),
+        "matrixByteStride": _safe_int(getattr(shader_type, "matrixByteStride", 0), 0),
+        "rowMajor": row_major,
+        "flags": _safe_int(flags, 0),
+        "flagsText": str(flags),
+    }
+
+
+def _shader_type_byte_size(shader_type):
+    if shader_type is None:
+        return 0
+    elements = max(_safe_int(getattr(shader_type, "elements", 1), 1), 1)
+    array_stride = _safe_int(getattr(shader_type, "arrayByteStride", 0), 0)
+    if elements > 1 and array_stride > 0:
+        return elements * array_stride
+
+    members = getattr(shader_type, "members", []) or []
+    if members:
+        end = 0
+        for member in members:
+            member_end = (_safe_int(getattr(member, "byteOffset", 0), 0) +
+                          _shader_type_byte_size(getattr(member, "type", None)))
+            end = max(end, member_end)
+        return end * elements
+
+    rows = max(_safe_int(getattr(shader_type, "rows", 1), 1), 1)
+    columns = max(_safe_int(getattr(shader_type, "columns", 1), 1), 1)
+    matrix_stride = _safe_int(getattr(shader_type, "matrixByteStride", 0), 0)
+    if rows > 1 and columns > 1 and matrix_stride > 0:
+        info = _shader_type_info(shader_type)
+        major_count = rows if info["rowMajor"] else columns
+        return matrix_stride * major_count * elements
+
+    base = str(getattr(shader_type, "baseType", "")).lower()
+    component_size = 4
+    if "double" in base or "slong" in base or "ulong" in base:
+        component_size = 8
+    elif "half" in base or "short" in base:
+        component_size = 2
+    elif "byte" in base and "byteaddress" not in base:
+        component_size = 1
+    return rows * columns * component_size * elements
+
+
+def _shader_constant_fields(constants, prefix="", parent_offset=0, depth=0):
+    """Serialise ShaderConstant trees with paths plus relative and absolute offsets."""
+    if depth > 32:
+        return []
+
+    fields = []
+    for index, constant in enumerate(constants or []):
+        name = str(getattr(constant, "name", "")) or "field%d" % index
+        path = name if not prefix else "%s.%s" % (prefix, name)
+        relative_offset = _safe_int(getattr(constant, "byteOffset", 0), 0)
+        absolute_offset = parent_offset + relative_offset
+        shader_type = getattr(constant, "type", None)
+        type_info = _shader_type_info(shader_type)
+        field = {
+            "path": path,
+            "name": name,
+            "offset": relative_offset,
+            "byteOffset": relative_offset,
+            "absoluteByteOffset": absolute_offset,
+            "relativeOffset": relative_offset,
+            "type": _shader_type_name(shader_type),
+            "baseType": type_info["baseType"],
+            "byteSize": _shader_type_byte_size(shader_type),
+            "rows": type_info["rows"],
+            "columns": type_info["columns"],
+            "elements": type_info["elements"],
+            "arrayByteStride": type_info["arrayByteStride"],
+            "matrixByteStride": type_info["matrixByteStride"],
+            "rowMajor": type_info["rowMajor"],
+            "flags": type_info["flags"],
+            "pointerTypeID": _safe_int(
+                getattr(shader_type, "pointerTypeID", 0xFFFFFFFF), 0xFFFFFFFF),
+            "typeInfo": type_info,
+        }
+
+        bit_offset = _safe_int(getattr(constant, "bitFieldOffset", 0), 0)
+        bit_size = _safe_int(getattr(constant, "bitFieldSize", 0), 0)
+        if bit_offset or bit_size:
+            field["bitFieldOffset"] = bit_offset
+            field["bitFieldSize"] = bit_size
+
+        members = getattr(shader_type, "members", []) if shader_type is not None else []
+        if members:
+            field["members"] = _shader_constant_fields(
+                members, prefix=path, parent_offset=absolute_offset, depth=depth + 1)
+        fields.append(field)
+    return fields
+
+
+def _constant_field_annotations_are_complete(fields, parent_byte_size, depth=0):
+    """Return whether a reflected CBuffer member tree is a physical layout.
+
+    Stripped DXIL commonly exposes an opaque block as one or more ``unknown``
+    placeholders.  Those placeholders describe a best-effort storage shape, not
+    source member annotations: they may have zero elements, overlap at offset 0,
+    or extend beyond ``ConstantBlock.byteSize``.  They must never be promoted to
+    ABI fields.
+    """
+    if depth > 32 or parent_byte_size < 0:
+        return False
+    if not fields:
+        return True
+
+    ranges = []
+    for field in fields:
+        byte_offset = _safe_int(field.get("byteOffset"), -1)
+        byte_size = _safe_int(field.get("byteSize"), -1)
+        rows = _safe_int(field.get("rows"), 0)
+        columns = _safe_int(field.get("columns"), 0)
+        elements = _safe_int(field.get("elements"), 0)
+        base_type = _physical_base_type(field.get("baseType"))
+        if (byte_offset < 0 or byte_size <= 0 or rows <= 0 or columns <= 0 or
+                elements <= 0 or base_type in ("", "unknown")):
+            return False
+        if byte_offset + byte_size > parent_byte_size:
+            return False
+
+        members = list(field.get("members", []) or [])
+        if members and not _constant_field_annotations_are_complete(
+                members, byte_size, depth + 1):
+            return False
+
+        bit_offset = _safe_int(field.get("bitFieldOffset"), 0)
+        bit_size = _safe_int(field.get("bitFieldSize"), 0)
+        if bit_size:
+            if bit_offset < 0 or bit_size < 0 or bit_offset + bit_size > byte_size * 8:
+                return False
+            start = byte_offset * 8 + bit_offset
+            end = start + bit_size
+        else:
+            if bit_offset:
+                return False
+            start = byte_offset * 8
+            end = (byte_offset + byte_size) * 8
+        ranges.append((start, end))
+
+    ranges.sort()
+    previous_end = -1
+    for start, end in ranges:
+        if start < previous_end:
+            return False
+        previous_end = end
+    return True
+
+
+def _constant_block_layout(cb):
+    """Preserve every usable CBuffer member without inventing opaque layout.
+
+    An empty result means the block is opaque.  Its register/space/count and
+    ``byteSize`` remain authoritative physical ABI facts.  The legacy opaque
+    downgrade is deliberately narrow: an all-``unknown``/unnamed-type tree is
+    opaque only when it is also structurally invalid (zero elements,
+    out-of-range, overlapping, etc.).  A physically complete unnamed tree is
+    retained and compared strictly.  In mixed trees, malformed anonymous
+    placeholders never erase otherwise known fields.
+    """
+    fields = _shader_constant_fields(getattr(cb, "variables", []))
+    byte_size = _safe_int(getattr(cb, "byteSize", 0), 0)
+    if not fields:
+        return fields, "opaque"
+    if _constant_field_annotations_are_complete(fields, byte_size):
+        return fields, "complete"
+    retained = []
+    for field in fields:
+        legacy_unknown = (
+            str(field.get("name", "") or "").strip().lower() == "unknown" and
+            not str((field.get("typeInfo") or {}).get("name", "") or "").strip()
+        )
+        if not _constant_field_annotations_are_complete([field], byte_size):
+            continue
+        retained.append(field)
+    retained = _drop_conflicting_legacy_unknown_fields(retained)
+    # Any discarded/contradictory annotation means the captured layout was not
+    # fully knowable. Keep usable fields for inspection, but mark the whole
+    # block apply-ineligible rather than silently treating it as ordinary
+    # envelope-only opaque data.
+    return retained, "ambiguous"
+
+
+def _constant_block_fields(cb):
+    return _constant_block_layout(cb)[0]
+
+
+def _constant_field_bit_range(field):
+    byte_offset = _safe_int(field.get("byteOffset"), -1)
+    byte_size = _safe_int(field.get("byteSize"), -1)
+    if byte_offset < 0 or byte_size <= 0:
+        return None
+    bit_offset = _safe_int(field.get("bitFieldOffset"), 0)
+    bit_size = _safe_int(field.get("bitFieldSize"), 0)
+    if bit_size:
+        return (byte_offset * 8 + bit_offset,
+                byte_offset * 8 + bit_offset + bit_size)
+    return (byte_offset * 8, (byte_offset + byte_size) * 8)
+
+
+def _drop_conflicting_legacy_unknown_fields(fields):
+    """Keep non-overlapping anonymous ranges; discard only ambiguous ones."""
+    legacy = []
+    known = []
+    for index, field in enumerate(fields):
+        is_legacy = (
+            str(field.get("name", "") or "").strip().lower() == "unknown" and
+            not str((field.get("typeInfo") or {}).get("name", "") or "").strip()
+        )
+        entry = (index, _constant_field_bit_range(field), field)
+        (legacy if is_legacy else known).append(entry)
+    dropped = set()
+    for legacy_index, legacy_range, unused_field in legacy:
+        if legacy_range is None:
+            dropped.add(legacy_index)
+            continue
+        for unused_known_index, known_range, unused_known_field in known:
+            if (known_range is not None and legacy_range[0] < known_range[1] and
+                    known_range[0] < legacy_range[1]):
+                dropped.add(legacy_index)
+                break
+    for left_position, left in enumerate(legacy):
+        left_index, left_range, left_field = left
+        if left_range is None:
+            continue
+        for right_index, right_range, right_field in legacy[left_position + 1:]:
+            if (right_range is None or left_range[0] >= right_range[1] or
+                    right_range[0] >= left_range[1]):
+                continue
+            if left_range == right_range and left_field == right_field:
+                dropped.add(right_index)
+            else:
+                dropped.add(left_index)
+                dropped.add(right_index)
+    return [field for index, field in enumerate(fields) if index not in dropped]
+
+
+def _shader_constant_type_dict(shader_type):
+    """Serialise the physical shape of a ShaderConstantType without trusting its name."""
+    info = _shader_type_info(shader_type)
+    return {
+        "name": info["name"],
+        "baseType": info["baseType"],
+        "rows": info["rows"],
+        "columns": info["columns"],
+        "elements": info["elements"],
+        "arrayByteStride": info["arrayByteStride"],
+        "matrixByteStride": info["matrixByteStride"],
+        "rowMajor": info["rowMajor"],
+        "flags": info["flags"],
+        "pointerTypeID": _safe_int(getattr(shader_type, "pointerTypeID", 0xFFFFFFFF),
+                                   0xFFFFFFFF),
+        "byteSize": _shader_type_byte_size(shader_type),
+        "members": _shader_constant_fields(
+            getattr(shader_type, "members", []) if shader_type is not None else []),
+    }
+
+
+def _bound_descriptor_info(bound):
+    """Normalise UsedDescriptor, Descriptor, and legacy bound-buffer objects."""
+    result = {"resourceId": 0, "byteOffset": 0, "byteSize": 0}
+    if bound is None:
+        return result
+
+    descriptor = getattr(bound, "descriptor", None)
+    candidates = [descriptor, bound] if descriptor is not None else [bound]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        rid = _resource_id_int(getattr(candidate, "resource", None))
+        if not rid:
+            rid = _resource_id_int(getattr(candidate, "resourceId", None))
+        if rid:
+            result["resourceId"] = rid
+        if hasattr(candidate, "byteOffset"):
+            result["byteOffset"] = _safe_int(getattr(candidate, "byteOffset", 0), 0)
+        if hasattr(candidate, "byteSize"):
+            result["byteSize"] = _safe_int(getattr(candidate, "byteSize", 0), 0)
+        if result["resourceId"]:
+            break
+    return result
+
+
+def _get_constant_block_binding(ps, stage, block_index):
+    """Resolve an exact reflected constant-block index to its current descriptor."""
+    if hasattr(ps, "GetConstantBlock"):
+        try:
+            return _bound_descriptor_info(ps.GetConstantBlock(stage, block_index, 0))
+        except Exception:
+            pass
+
+    for method_name in ("GetConstantBlocks", "GetConstantBuffers"):
+        if not hasattr(ps, method_name):
+            continue
+        try:
+            bindings = getattr(ps, method_name)(stage, False)
+            if bindings and block_index < len(bindings):
+                return _bound_descriptor_info(bindings[block_index])
+        except Exception:
+            pass
+    return {"resourceId": 0, "byteOffset": 0, "byteSize": 0}
+
+
+def _constant_block_binding_key(cb, block_index):
+    return (
+        _safe_int(getattr(cb, "fixedBindSetOrSpace", 0), 0),
+        _safe_int(getattr(cb, "fixedBindNumber", block_index), block_index),
+    )
+
+
+def _constant_block_dict(cb, block_index, binding=None, layout_evidence=None):
+    layout_fields, layout_completeness = _constant_block_layout(cb)
+    if layout_evidence is not None:
+        # This is a lower-only classification.  The evidence comes from the
+        # fixed DXC disassembly and never from display/member names.  Exact
+        # original/candidate access tuples are still required by the apply
+        # gate before fields may be ignored.
+        layout_completeness = "ambiguous"
+    block = {
+        "index": block_index,
+        "name": str(getattr(cb, "name", "")),
+        "bind": _safe_int(getattr(cb, "fixedBindNumber", block_index), block_index),
+        "space": _safe_int(getattr(cb, "fixedBindSetOrSpace", 0), 0),
+        "bindArraySize": _safe_int(getattr(cb, "bindArraySize", 1), 1),
+        "byteSize": _safe_int(getattr(cb, "byteSize", 0), 0),
+        "bufferBacked": bool(getattr(cb, "bufferBacked", True)),
+        "inlineDataBytes": bool(getattr(cb, "inlineDataBytes", False)),
+        "compileConstants": bool(getattr(cb, "compileConstants", False)),
+        "fields": layout_fields,
+        "layoutCompleteness": layout_completeness,
+    }
+    if layout_evidence is not None:
+        block["layoutEvidence"] = dict(layout_evidence)
+    if binding is not None:
+        block["binding"] = binding
+    return block
+
+
+def _signature_parameter_dict(parameter):
+    reg_channel_mask = _safe_int(getattr(parameter, "regChannelMask", 0), 0)
+    component_count = _safe_int(getattr(parameter, "compCount", 0), 0)
+    if component_count <= 0 and reg_channel_mask:
+        component_count = bin(reg_channel_mask & 0xF).count("1")
+    return {
+        "varName": str(getattr(parameter, "varName", "")),
+        "semanticName": str(getattr(parameter, "semanticName", "")),
+        "semanticIdxName": str(getattr(parameter, "semanticIdxName", "")),
+        "semanticIndex": _safe_int(getattr(parameter, "semanticIndex", 0), 0),
+        "regIndex": _safe_int(getattr(parameter, "regIndex", -1), -1),
+        "systemValue": str(getattr(parameter, "systemValue", "")),
+        "compType": str(getattr(parameter, "varType", getattr(parameter, "compType", ""))),
+        "compCount": component_count,
+        "stream": _safe_int(getattr(parameter, "stream", 0), 0),
+        "regChannelMask": reg_channel_mask,
+        "channelUsedMask": _safe_int(getattr(parameter, "channelUsedMask", 0), 0),
+        "perPrimitiveRate": bool(getattr(parameter, "perPrimitiveRate", False)),
+        "needSemanticIndex": bool(getattr(parameter, "needSemanticIndex", False)),
+    }
+
+
+def _shader_binding_dict(binding):
+    descriptor_type = str(getattr(binding, "descriptorType", ""))
+    return {
+        "name": str(getattr(binding, "name", "")),
+        "space": _safe_int(getattr(binding, "fixedBindSetOrSpace", 0), 0),
+        "bind": _safe_int(getattr(binding, "fixedBindNumber", -1), -1),
+        "arraySize": _safe_int(getattr(binding, "bindArraySize", 1), 1),
+        # resourceType is retained as a compatibility alias for older Host snapshots. The
+        # authoritative RenderDoc field is descriptorType.
+        "resourceType": descriptor_type,
+        "descriptorType": descriptor_type,
+        "textureType": str(getattr(binding, "textureType", "")),
+        "variableType": _shader_constant_type_dict(
+            getattr(binding, "variableType", None)),
+        "isTexture": bool(getattr(binding, "isTexture", False)),
+        "hasSampler": bool(getattr(binding, "hasSampler", False)),
+        "isInputAttachment": bool(getattr(binding, "isInputAttachment", False)),
+        "isReadOnly": bool(getattr(binding, "isReadOnly", False)),
+    }
+
+
+def _shader_sampler_dict(sampler):
+    return {
+        "name": str(getattr(sampler, "name", "")),
+        "space": _safe_int(getattr(sampler, "fixedBindSetOrSpace", 0), 0),
+        "bind": _safe_int(getattr(sampler, "fixedBindNumber", -1), -1),
+        "arraySize": _safe_int(getattr(sampler, "bindArraySize", 1), 1),
+    }
+
+
+def _thread_group_size(reflection):
+    value = getattr(reflection, "dispatchThreadsDimension", None)
+    if value is None:
+        return []
+    try:
+        values = [_safe_int(value[index], 0) for index in range(3)]
+        return values if any(values) else []
+    except Exception:
+        try:
+            values = list(value)
+            values = [_safe_int(item, 0) for item in values[:3]]
+            return values if any(values) else []
+        except Exception:
+            return []
+
+
+def _compiled_shader_interface(reflection, dxil_layout_evidence=None):
+    """Serialise only physical compiled-interface facts from ShaderReflection."""
+    evidence = dxil_layout_evidence or {}
+    constant_blocks = [
+        _constant_block_dict(
+            value,
+            index,
+            layout_evidence=evidence.get(
+                _constant_block_binding_key(value, index)),
+        )
+        for index, value in enumerate(getattr(reflection, "constantBlocks", []))
+    ]
+    interface = {
+        "interfaceComplete": not any(
+            block.get("layoutCompleteness") == "ambiguous"
+            for block in constant_blocks),
+        "stage": _normalise_stage_name(getattr(reflection, "stage", "")),
+        "entryPoint": str(getattr(reflection, "entryPoint", "") or ""),
+        "encoding": str(getattr(reflection, "encoding", "") or ""),
+        "inputSignature": [
+            _signature_parameter_dict(value)
+            for value in getattr(reflection, "inputSignature", [])
+        ],
+        "outputSignature": [
+            _signature_parameter_dict(value)
+            for value in getattr(reflection, "outputSignature", [])
+        ],
+        "readOnlyResources": [
+            _shader_binding_dict(value)
+            for value in getattr(reflection, "readOnlyResources", [])
+        ],
+        "readWriteResources": [
+            _shader_binding_dict(value)
+            for value in getattr(reflection, "readWriteResources", [])
+        ],
+        "samplers": [
+            _shader_sampler_dict(value)
+            for value in getattr(reflection, "samplers", [])
+        ],
+        "constantBlocks": constant_blocks,
+        "dynamicLinkageInterfaceCount": len(
+            getattr(reflection, "interfaces", []) or []),
+        "outputTopology": str(getattr(reflection, "outputTopology", "") or ""),
+        "threadGroupSize": _thread_group_size(reflection),
+    }
+    return interface
+
+
+def _physical_enum(value):
+    return (str(value or "").strip().lower().rsplit(".", 1)[-1]
+            .replace("_", "").replace(" ", ""))
+
+
+def _physical_base_type(value):
+    token = _physical_enum(value)
+    return {
+        "float32": "float",
+        "single": "float",
+        "sint": "int",
+        "signedint": "int",
+        "int32": "int",
+        "unsignedint": "uint",
+        "uint32": "uint",
+        "float16": "half",
+        "min16float": "half",
+        "float64": "double",
+    }.get(token, token)
+
+
+def _physical_sorted(values):
+    return sorted(
+        values,
+        key=lambda item: json.dumps(
+            item, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")),
+    )
+
+
+def _physical_constant_field(field):
+    """Remove reflection/debug names while retaining exact CBuffer packing."""
+    return {
+        "byteOffset": _safe_int(field.get("byteOffset"), 0),
+        "byteSize": _safe_int(field.get("byteSize"), 0),
+        "baseType": _physical_base_type(field.get("baseType")),
+        "rows": _safe_int(field.get("rows"), 0),
+        "columns": _safe_int(field.get("columns"), 0),
+        "elements": _safe_int(field.get("elements"), 0),
+        "arrayByteStride": _safe_int(field.get("arrayByteStride"), 0),
+        "matrixByteStride": _safe_int(field.get("matrixByteStride"), 0),
+        "rowMajor": bool(field.get("rowMajor", False)),
+        "flags": _safe_int(field.get("flags"), 0),
+        "pointerTypeID": _safe_int(field.get("pointerTypeID"), 0xFFFFFFFF),
+        "bitFieldOffset": _safe_int(field.get("bitFieldOffset"), 0),
+        "bitFieldSize": _safe_int(field.get("bitFieldSize"), 0),
+        "members": _physical_sorted([
+            _physical_constant_field(member)
+            for member in list(field.get("members", []) or [])
+        ]),
+    }
+
+
+def _physical_variable_type(value):
+    value = value if isinstance(value, dict) else {}
+    return {
+        "baseType": _physical_base_type(value.get("baseType")),
+        "rows": _safe_int(value.get("rows"), 0),
+        "columns": _safe_int(value.get("columns"), 0),
+        "elements": _safe_int(value.get("elements"), 0),
+        "arrayByteStride": _safe_int(value.get("arrayByteStride"), 0),
+        "matrixByteStride": _safe_int(value.get("matrixByteStride"), 0),
+        "rowMajor": bool(value.get("rowMajor", False)),
+        "flags": _safe_int(value.get("flags"), 0),
+        "pointerTypeID": _safe_int(value.get("pointerTypeID"), 0xFFFFFFFF),
+        "byteSize": _safe_int(value.get("byteSize"), 0),
+        "members": _physical_sorted([
+            _physical_constant_field(member)
+            for member in list(value.get("members", []) or [])
+        ]),
+    }
+
+
+def _physical_shader_interface(interface):
+    """Canonical compiled ABI used to prove Shader-family compatibility.
+
+    Display/debug identifiers (resource, CBuffer and local variable names) are
+    deliberately excluded. Semantic names, registers, descriptor kinds,
+    complete CBuffer packing, topology and compute group size remain physical.
+    This mirrors the Host ABI gate and lets the Bridge reject a forged ABI
+    report before configuring any replay override.
+    """
+    if not isinstance(interface, dict):
+        raise RuntimeError("Shader compiled interface is unavailable")
+
+    def _signature(item):
+        return {
+            "semanticName": str(item.get("semanticName", "") or "").lower(),
+            "semanticIdxName": str(
+                item.get("semanticIdxName", "") or "").lower(),
+            "semanticIndex": _safe_int(item.get("semanticIndex"), 0),
+            "regIndex": _safe_int(item.get("regIndex"), -1),
+            "systemValue": _physical_enum(item.get("systemValue")),
+            "compType": _physical_base_type(item.get("compType")),
+            "compCount": _safe_int(item.get("compCount"), 0),
+            "stream": _safe_int(item.get("stream"), 0),
+            "regChannelMask": _safe_int(item.get("regChannelMask"), 0),
+            # channelUsedMask is compiler data-flow analysis, not part of the
+            # declared linkage ABI. Packed DXIL may report aggregate usage for
+            # every row while a source recompile reports each row separately.
+            # Keep it in raw reflection above for audit, but do not hash or
+            # reject a replacement solely because this analysis changed.
+            "perPrimitiveRate": bool(item.get("perPrimitiveRate", False)),
+            "needSemanticIndex": bool(item.get("needSemanticIndex", False)),
+        }
+
+    def _binding(item):
+        return {
+            "space": _safe_int(item.get("space"), 0),
+            "bind": _safe_int(item.get("bind"), -1),
+            "arraySize": _safe_int(item.get("arraySize"), 0),
+            "descriptorType": _physical_enum(item.get("descriptorType")),
+            "textureType": _physical_enum(item.get("textureType")),
+            "variableType": _physical_variable_type(item.get("variableType")),
+            "isTexture": bool(item.get("isTexture", False)),
+            "hasSampler": bool(item.get("hasSampler", False)),
+            "isInputAttachment": bool(item.get("isInputAttachment", False)),
+            "isReadOnly": bool(item.get("isReadOnly", False)),
+        }
+
+    def _sampler(item):
+        return {
+            "space": _safe_int(item.get("space"), 0),
+            "bind": _safe_int(item.get("bind"), -1),
+            "arraySize": _safe_int(item.get("arraySize"), 0),
+        }
+
+    def _block(item):
+        fields = _physical_sorted([
+            _physical_constant_field(field)
+            for field in list(item.get("fields", []) or [])
+        ])
+        completeness = str(item.get("layoutCompleteness", "") or "").strip().lower()
+        if completeness not in ("complete", "partial", "opaque", "ambiguous"):
+            completeness = "complete" if fields else "opaque"
+        return {
+            "space": _safe_int(item.get("space"), 0),
+            "bind": _safe_int(item.get("bind"), -1),
+            "bindArraySize": _safe_int(item.get("bindArraySize"), 0),
+            "byteSize": _safe_int(item.get("byteSize"), 0),
+            "bufferBacked": bool(item.get("bufferBacked", False)),
+            "inlineDataBytes": bool(item.get("inlineDataBytes", False)),
+            "compileConstants": bool(item.get("compileConstants", False)),
+            "fields": fields,
+            "layoutCompleteness": completeness,
+        }
+
+    return {
+        "stage": _normalise_stage_name(interface.get("stage")),
+        "entryPoint": str(interface.get("entryPoint", "") or ""),
+        "inputSignature": _physical_sorted([
+            _signature(item)
+            for item in list(interface.get("inputSignature", []) or [])
+        ]),
+        "outputSignature": _physical_sorted([
+            _signature(item)
+            for item in list(interface.get("outputSignature", []) or [])
+        ]),
+        "readOnlyResources": _physical_sorted([
+            _binding(item)
+            for item in list(interface.get("readOnlyResources", []) or [])
+        ]),
+        "readWriteResources": _physical_sorted([
+            _binding(item)
+            for item in list(interface.get("readWriteResources", []) or [])
+        ]),
+        "samplers": _physical_sorted([
+            _sampler(item)
+            for item in list(interface.get("samplers", []) or [])
+        ]),
+        "constantBlocks": _physical_sorted([
+            _block(item)
+            for item in list(interface.get("constantBlocks", []) or [])
+        ]),
+        "threadGroupSize": [
+            _safe_int(item, 0)
+            for item in list(interface.get("threadGroupSize", []) or [])
+        ],
+        "outputTopology": _physical_enum(interface.get("outputTopology")),
+        "dynamicLinkageInterfaceCount": _safe_int(
+            interface.get("dynamicLinkageInterfaceCount"), 0),
+    }
+
+
+def _physical_shader_interface_sha256(reflection, dxil_layout_evidence=None):
+    return _canonical_json_sha256(
+        _physical_shader_interface(_compiled_shader_interface(
+            reflection, dxil_layout_evidence)))
+
+
+def _ambiguous_dxil_access_block_matches(captured, candidate,
+                                         baseline_access, candidate_access):
+    """Require exact static DXIL loads for one captured ambiguous CBuffer."""
+    if baseline_access is None or candidate_access is None:
+        return False
+    space = _safe_int(captured.get("space"), -1)
+    bind = _safe_int(captured.get("bind"), -1)
+    baseline_block = baseline_access.block(space, bind)
+    candidate_block = candidate_access.block(space, bind)
+    if baseline_block is None or candidate_block is None:
+        return False
+    if (captured.get("space") != candidate.get("space") or
+            captured.get("bind") != candidate.get("bind") or
+            captured.get("bindArraySize") != 1 or
+            candidate.get("bindArraySize") != 1 or
+            baseline_block.space != space or
+            candidate_block.space != space or
+            baseline_block.bind != bind or
+            candidate_block.bind != bind or
+            baseline_block.bind_array_size != captured.get("bindArraySize") or
+            candidate_block.bind_array_size != candidate.get("bindArraySize") or
+            baseline_block.byte_size != captured.get("byteSize") or
+            candidate_block.byte_size != candidate.get("byteSize") or
+            not baseline_block.accesses or not candidate_block.accesses):
+        return False
+    return baseline_block.physical_dict() == candidate_block.physical_dict()
+
+
+def _physical_shader_interfaces_compatible(
+        baseline_reflection, candidate_reflection,
+        baseline_dxil_access=None, candidate_dxil_access=None,
+        baseline_dxil_layout_evidence=None,
+        candidate_dxil_layout_evidence=None):
+    """Compare replay reflections without inventing an opaque CBuffer layout.
+
+    A typed captured block remains strict and recursive.  When the captured
+    block has no trustworthy member annotations, the facts RenderDoc can prove
+    are its physical binding, space, array count, storage flags and byte range.
+    Candidate member annotations are therefore ignored only for that captured
+    opaque block; ``_constant_block_fields`` has already required every retained
+    candidate range to be non-overlapping and contained by ``byteSize``.
+    """
+    baseline = _physical_shader_interface(
+        _compiled_shader_interface(
+            baseline_reflection, baseline_dxil_layout_evidence))
+    candidate = _physical_shader_interface(
+        _compiled_shader_interface(
+            candidate_reflection, candidate_dxil_layout_evidence))
+    baseline_blocks = {
+        (_safe_int(block.get("space"), 0), _safe_int(block.get("bind"), -1)): block
+        for block in baseline.get("constantBlocks", [])
+    }
+    for block in candidate.get("constantBlocks", []):
+        key = (_safe_int(block.get("space"), 0), _safe_int(block.get("bind"), -1))
+        captured = baseline_blocks.get(key)
+        if captured is None:
+            continue
+        baseline_completeness = captured.get("layoutCompleteness", "complete")
+        candidate_completeness = block.get("layoutCompleteness", "complete")
+        if baseline_completeness == "ambiguous":
+            if not _ambiguous_dxil_access_block_matches(
+                    captured, block,
+                    baseline_dxil_access, candidate_dxil_access):
+                return False
+            # This proves only the exact physical load tuples within the
+            # captured binding/size envelope.  Do not manufacture names or a
+            # source member layout; project both sides to the same explicit
+            # ambiguous state before the ordinary whole-interface comparison.
+            captured["fields"] = []
+            block["fields"] = []
+            captured["layoutCompleteness"] = "ambiguous"
+            block["layoutCompleteness"] = "ambiguous"
+        elif candidate_completeness == "ambiguous":
+            # A weaker candidate reflection can never erase a complete,
+            # partial, or opaque captured layout.
+            return False
+        if baseline_completeness == "opaque":
+            block["fields"] = []
+            block["layoutCompleteness"] = "opaque"
+        elif baseline_completeness == "partial":
+            captured_fields = captured.get("fields", [])
+            if all(field in block.get("fields", []) for field in captured_fields):
+                block["fields"] = list(captured_fields)
+                block["layoutCompleteness"] = "partial"
+    return baseline == candidate
+
+
+_DXIL_ACCESS_DISASSEMBLY_TARGET = "DXC DXIL"
+
+
+def _dxil_layout_evidence_for_all_blocks(
+        reflection, status, source_sha256=None, access_signature_sha256=None):
+    result = {}
+    for index, block in enumerate(
+            list(getattr(reflection, "constantBlocks", []) or [])):
+        key = (
+            _safe_int(getattr(block, "fixedBindSetOrSpace", 0), 0),
+            _safe_int(getattr(block, "fixedBindNumber", index), index),
+        )
+        marker = {
+            "kind": "dxc-dxil-buffer-definition",
+            "typeAnnotation": status,
+        }
+        if source_sha256:
+            marker["sourceSha256"] = source_sha256
+        if access_signature_sha256:
+            marker["accessSignatureSha256"] = access_signature_sha256
+        result[key] = marker
+    return result
+
+
+def _dxil_layout_evidence_for_reflection_ambiguity(reflection):
+    """Mark only structurally ambiguous reflected blocks without disassembling.
+
+    Host validation already derives the candidate DXIL access signature from
+    the immutable, hash-bound fixed-DXC job produced by compilation. Re-running
+    RenderDoc's textual DXIL printer here duplicated that proof on every save
+    and was substantially slower than target reflection itself. This lower-only
+    marker keeps a genuinely incomplete RenderDoc reflection fail-closed while
+    allowing complete candidate layouts to remain complete. The mutation path
+    still performs its independent live DXIL access comparison immediately
+    before replacement.
+    """
+
+    evidence = {}
+    for index, block in enumerate(
+            list(getattr(reflection, "constantBlocks", []) or [])):
+        unused_fields, completeness = _constant_block_layout(block)
+        if completeness != "ambiguous":
+            continue
+        key = _constant_block_binding_key(block, index)
+        evidence[key] = {
+            "kind": "dxc-dxil-buffer-definition",
+            "typeAnnotation": "unavailable",
+        }
+    return evidence
+
+
+def _dxil_disassembly_source(ctrl, pipeline_id, reflection):
+    """Return bytes from the one exact RenderDoc-owned DXC target."""
+    targets = list(ctrl.GetDisassemblyTargets(True) or [])
+    exact_targets = [
+        target for target in targets
+        if str(target) == _DXIL_ACCESS_DISASSEMBLY_TARGET
+    ]
+    if len(exact_targets) != 1:
+        raise RuntimeError(
+            "The replay does not expose one exact 'DXC DXIL' disassembly target")
+    source = ctrl.DisassembleShader(
+        pipeline_id, reflection, exact_targets[0])
+    if not isinstance(source, str):
+        source = str(source or "")
+    try:
+        return source.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        raise RuntimeError("DXC DXIL disassembly is not strict UTF-8")
+
+
+def _dxil_evidence_from_live_disassembly(ctrl, pipeline_id, reflection):
+    """Return exact access evidence plus lower-only layout classifications."""
+    source_bytes = _dxil_disassembly_source(ctrl, pipeline_id, reflection)
+    try:
+        access = _dxil_access_protocol.extract_dxil_cbuffer_access_signature(
+            source_bytes)
+    except _dxil_access_protocol.DxilAccessSignatureError as error:
+        raise RuntimeError(
+            "DXC DXIL CBuffer access evidence is incomplete: %s" % str(error))
+
+    try:
+        absent = set(
+            _dxil_access_protocol.extract_dxil_unannotated_cbuffer_bindings(
+                source_bytes, expected_sha256=access.source_sha256))
+    except _dxil_access_protocol.DxilAccessSignatureError:
+        # If the fixed printer's layout section cannot be reconciled with
+        # resource metadata, no reflected CBuffer is allowed to remain
+        # "complete".  Exact access tuples can still prove a later candidate;
+        # if those tuples are unavailable the ordinary gate remains closed.
+        return access, _dxil_layout_evidence_for_all_blocks(
+            reflection,
+            "unavailable",
+            source_sha256=access.source_sha256,
+            access_signature_sha256=access.signature_sha256,
+        )
+
+    evidence = {}
+    by_key = _dxil_layout_evidence_for_all_blocks(
+        reflection,
+        "absent",
+        source_sha256=access.source_sha256,
+        access_signature_sha256=access.signature_sha256,
+    )
+    reflected_sizes = {}
+    for index, block in enumerate(
+            list(getattr(reflection, "constantBlocks", []) or [])):
+        key = (
+            _safe_int(getattr(block, "fixedBindSetOrSpace", 0), 0),
+            _safe_int(getattr(block, "fixedBindNumber", index), index),
+        )
+        reflected_sizes[key] = _safe_int(getattr(block, "byteSize", 0), 0)
+    for space, bind, byte_size in absent:
+        key = (space, bind)
+        if key not in reflected_sizes or reflected_sizes[key] != byte_size:
+            raise RuntimeError(
+                "DXC DXIL CBuffer layout evidence contradicts reflection")
+        evidence[key] = by_key[key]
+    return access, evidence
+
+
+def _dxil_access_signature_from_live_disassembly(ctrl, pipeline_id, reflection):
+    """Recompute one access signature from RenderDoc-owned DXC DXIL text."""
+    access, unused_layout_evidence = _dxil_evidence_from_live_disassembly(
+        ctrl, pipeline_id, reflection)
+    return access
+
+
+def _dxil_ambiguous_interface_compatible(
+        ctrl, baseline_pipeline_id, baseline_reflection, candidate_reflection,
+        baseline_access=None, baseline_layout_evidence=None):
+    """Bridge-owned second gate for stripped DXIL CBuffer layouts."""
+    if baseline_access is None or baseline_layout_evidence is None:
+        baseline_access, baseline_layout_evidence = (
+            _dxil_evidence_from_live_disassembly(
+                ctrl, baseline_pipeline_id, baseline_reflection))
+    baseline_interface = _physical_shader_interface(
+        _compiled_shader_interface(
+            baseline_reflection, baseline_layout_evidence))
+    baseline_ambiguous = any(
+        block.get("layoutCompleteness") == "ambiguous"
+        for block in baseline_interface.get("constantBlocks", [])
+    )
+    if not baseline_ambiguous:
+        return _physical_shader_interfaces_compatible(
+            baseline_reflection, candidate_reflection,
+            baseline_dxil_layout_evidence=baseline_layout_evidence)
+    candidate_access, candidate_layout_evidence = (
+        _dxil_evidence_from_live_disassembly(
+            ctrl, rd.ResourceId(), candidate_reflection))
+    return _physical_shader_interfaces_compatible(
+        baseline_reflection, candidate_reflection,
+        baseline_dxil_access=baseline_access,
+        candidate_dxil_access=candidate_access,
+        baseline_dxil_layout_evidence=baseline_layout_evidence,
+        candidate_dxil_layout_evidence=candidate_layout_evidence)
+
+
+_SHADER_STAGE_SPECS = [
+    ("vertex", "Vertex"),
+    ("hull", "Hull"),
+    ("domain", "Domain"),
+    ("geometry", "Geometry"),
+    ("fragment", "Fragment"),
+    ("compute", "Compute"),
+    ("task", "Task"),
+    ("mesh", "Mesh"),
+    ("raygen", "RayGen"),
+    ("intersection", "Intersection"),
+    ("anyhit", "AnyHit"),
+    ("closesthit", "ClosestHit"),
+    ("miss", "Miss"),
+    ("callable", "Callable"),
+]
+
+_STAGE_ALIASES = {
+    "pixel": "fragment",
+    "ps": "fragment",
+    "fragment": "fragment",
+    "fs": "fragment",
+    "vs": "vertex",
+    "hs": "hull",
+    "tess_ctrl": "hull",
+    "ds": "domain",
+    "tess_eval": "domain",
+    "gs": "geometry",
+    "cs": "compute",
+    "as": "task",
+    "amplification": "task",
+    "ms": "mesh",
+}
+
+
+def _normalise_stage_name(stage_name):
+    value = str(stage_name or "").strip().lower().replace("shaderstage.", "")
+    return _STAGE_ALIASES.get(value, value)
+
+
+def _available_shader_stages(requested=None):
+    requested_set = None
+    if requested:
+        if isinstance(requested, str):
+            requested = [s.strip() for s in requested.split(",") if s.strip()]
+        requested_set = set(_normalise_stage_name(s) for s in requested)
+
+    result = []
+    for canonical, enum_name in _SHADER_STAGE_SPECS:
+        if requested_set is not None and canonical not in requested_set:
+            continue
+        stage = getattr(rd.ShaderStage, enum_name, None)
+        if stage is not None:
+            result.append((canonical, stage))
+    return result
+
+
+def _alias_containers(alias):
+    result = [alias]
+    for key in ("target", "shader"):
+        value = alias.get(key) if isinstance(alias, dict) else None
+        if isinstance(value, dict):
+            result.append(value)
+    return result
+
+
+def _alias_first(alias, keys, default=None):
+    for container in _alias_containers(alias):
+        for key in keys:
+            if key in container and container[key] is not None:
+                return container[key]
+    return default
+
+
+def _alias_kind(alias):
+    value = _alias_first(alias, ("kind", "bindingKind", "targetKind", "type"), "")
+    value = str(value).replace("_", "").replace("-", "").lower()
+    if value in ("shader", "shaderalias", "shadername"):
+        return "shader"
+    if not value and _alias_first(alias, ("shaderResourceId", "rawSha256"), None) is not None:
+        return "shader"
+    return value
+
+
+def _alias_display_name(alias):
+    value = _alias_first(alias, ("displayName", "alias", "name"), "")
+    if isinstance(value, dict):
+        value = value.get("displayName", value.get("name", ""))
+    return str(value or "").strip()
+
+
+def _alias_confirmed(alias):
+    """Only deterministic program evidence is trusted by this headless loader.
+
+    A future UI approval channel can add a signed approval token. Plain JSON fields such as
+    `confirmed`, `status`, or `verified` are intentionally insufficient because the MCP caller can
+    write them itself.
+    """
+    metadata = alias.get("metadata", {})
+    if not isinstance(metadata, dict) or metadata.get("programVerified") is not True:
+        return False
+    provenance = str(alias.get("provenance", "") or "").strip().lower()
+    return provenance in ("program", "rule:program", "rule:deterministic")
+
+
+def _alias_validated(alias):
+    return alias.get("verified") is True and _alias_confirmed(alias)
+
+
+def _alias_shader_key(alias):
+    resource_id = _safe_int(_alias_first(
+        alias, ("shaderResourceId", "resourceId", "captureResourceId"), 0), 0)
+    stage_value = _alias_first(alias, ("stage",), None)
+    entry_value = _alias_first(alias, ("entryPoint", "entry"), None)
+    raw_value = _alias_first(alias, ("rawSha256", "shaderSha256", "blobSha256"), None)
+    if resource_id <= 0 or stage_value is None or entry_value is None or raw_value is None:
+        return None
+    raw_sha256 = str(raw_value or "").strip().lower()
+    if len(raw_sha256) != 64 or any(c not in "0123456789abcdef" for c in raw_sha256):
+        return None
+    return (
+        resource_id,
+        _normalise_stage_name(stage_value),
+        str(entry_value or ""),
+        raw_sha256,
+    )
+
+
+def _matching_shader_aliases(resource_id, stage_name, entry_point, raw_sha256):
+    matches = []
+    stage_name = _normalise_stage_name(stage_name)
+    for alias in _symbol_alias_overlay.get("aliases", []):
+        if not isinstance(alias, dict) or _alias_kind(alias) != "shader":
+            continue
+
+        if _alias_shader_key(alias) != (
+                _safe_int(resource_id, 0), stage_name, str(entry_point or ""),
+                str(raw_sha256 or "").lower()):
+            continue
+        matches.append(alias)
+    return matches
+
+
+def _matching_binding_aliases(resource_id, stage_name, entry_point, raw_sha256,
+                               binding_kind, bind_number, register_space, byte_offset=None):
+    matches = []
+    stage_name = _normalise_stage_name(stage_name)
+    wanted_kind = str(binding_kind).replace("_", "").replace("-", "").lower()
+    for alias in _symbol_alias_overlay.get("aliases", []):
+        if not isinstance(alias, dict) or _alias_kind(alias) != wanted_kind:
+            continue
+        if _alias_shader_key(alias) != (
+                _safe_int(resource_id, 0), stage_name, str(entry_point or ""),
+                str(raw_sha256 or "").lower()):
+            continue
+        alias_bind = _safe_int(_alias_first(
+            alias, ("bindNumber", "bind", "fixedBindNumber"), -1), -1)
+        alias_space = _safe_int(_alias_first(
+            alias, ("registerSpace", "space", "fixedBindSetOrSpace"), 0), 0)
+        if alias_bind != bind_number or alias_space != register_space:
+            continue
+        if byte_offset is not None:
+            alias_offset = _alias_first(alias, ("byteOffset", "offset"), None)
+            if alias_offset is None or _safe_int(alias_offset, -1) != byte_offset:
+                continue
+        matches.append(alias)
+    return matches
+
+
+def _unique_validated_alias_display(aliases):
+    """Return one bounded deterministic display name, never a physical identifier."""
+    names = set()
+    for alias in aliases or []:
+        if not isinstance(alias, dict) or not _alias_validated(alias):
+            continue
+        display_name = _alias_display_name(alias)
+        if display_name and len(display_name) <= 512:
+            names.add(display_name)
+    if len(names) == 1:
+        return next(iter(names))
+    return ""
+
+
+def _apply_layout_aliases(fields, resource_id, stage_name, entry_point, raw_sha256,
+                          bind_number, register_space):
+    for field in fields or []:
+        absolute_offset = _safe_int(
+            field.get("absoluteByteOffset", field.get("offset", 0)), 0)
+        aliases = _matching_binding_aliases(
+            resource_id, stage_name, entry_point, raw_sha256,
+            "constantField", bind_number,
+            register_space, absolute_offset)
+        if aliases:
+            field["alias"] = aliases[0]
+            field["displayName"] = _alias_display_name(aliases[0])
+        _apply_layout_aliases(
+            field.get("members", []), resource_id, stage_name, entry_point, raw_sha256,
+            bind_number, register_space)
+    return fields
+
+
+def _copy_layout_aliases_to_values(values, fields):
+    """Copy display-only aliases to live-value nodes by reflection/runtime member order."""
+    for index, value in enumerate(values or []):
+        if index >= len(fields or []):
+            break
+        field = fields[index]
+        if "displayName" in field:
+            value["displayName"] = field["displayName"]
+            value["alias"] = field["alias"]
+        _copy_layout_aliases_to_values(
+            value.get("members", []), field.get("members", []))
+    return values
+
+
+# =====================================================================
+# Method implementations
+# =====================================================================
+
+def _ping(params):
+    return {
+        "status": "ok",
+        "server": "replaylab",
+        # Keep the legacy field for IPC v2 clients while the built-in integration name propagates.
+        "extensionVersion": BRIDGE_INTEGRATION_VERSION,
+        "integrationVersion": BRIDGE_INTEGRATION_VERSION,
+        "protocolVersion": BRIDGE_PROTOCOL_VERSION,
+        "ipc_dir": IPC_DIR,
+        "capabilities": [
+            "request-mailbox-v2",
+            "capture-symbol-catalog-v1",
+            "capture-bound-symbol-aliases-v1",
+            "shader-search-v1",
+            "resource-usage-v1",
+            "pixel-object-inspector-v1",
+            "d3d11-event-shader-override-v1",
+            "d3d11-event-cbuffer-override-v1",
+            "d3d11-event-cbuffer-clear-all-v1",
+            "current-renderdoc-context-v1",
+            "renderdoc-ui-intent-queue-v1",
+        ],
+        "schemas": {
+            "captureSymbols": SYMBOL_CATALOG_SCHEMA,
+            "symbolAliases": SYMBOL_ALIAS_SCHEMA,
+            "eventCBufferSnapshot": "renderdoc-ultra-event-cbuffer-snapshot/v1",
+            "eventCBufferOverride": "renderdoc-ultra-event-cbuffer-override/v1",
+            "eventCBufferClearAll": "renderdoc-ultra-event-cbuffer-clear-all/v1",
+            "currentContext": _ai_context_protocol.CONTEXT_SCHEMA,
+            "uiIntent": _ai_context_protocol.INTENT_SCHEMA,
+            "uiIntentBatch": _ai_context_protocol.INTENT_BATCH_SCHEMA,
+        },
+    }
+
+
+def _get_capture_status(params):
+    """Check if capture is loaded."""
+    if not _ctx.IsCaptureLoaded():
+        return {"loaded": False}
+
+    def _do(ctrl):
+        props = ctrl.GetAPIProperties()
+        fi = ctrl.GetFrameInfo()
+        raw_identity_pairs = sorted(_known_catalog_identity_pairs)
+        if len(raw_identity_pairs) > MAX_KNOWN_CATALOG_IDENTITY_PAIRS:
+            raise RuntimeError("Bridge catalog identity-pair state exceeds its bound")
+        known_identity_pairs = []
+        for capture_id, evidence_sha256 in raw_identity_pairs:
+            if (len(capture_id) != 64 or len(evidence_sha256) != 64 or
+                    any(character not in "0123456789abcdef"
+                        for character in capture_id + evidence_sha256)):
+                raise RuntimeError("Bridge catalog identity-pair state is invalid")
+            known_identity_pairs.append({
+                "captureId": capture_id,
+                "identityEvidenceSha256": evidence_sha256,
+            })
+        try:
+            capture_path = str(_ctx.GetCaptureFilename() or "")
+        except Exception:
+            capture_path = ""
+        result = {
+            "loaded": True,
+            "api": str(props.pipelineType),
+            "renderer": str(props.localRenderer),
+            "frameNumber": fi.frameNumber,
+            "capturePath": capture_path,
+            "captureSessionId": _capture_session_id,
+            "captureId": str(
+                _symbol_capture_snapshot.get("captureId", "") or ""),
+            "knownCatalogCaptureIds": sorted(_known_catalog_capture_ids.keys()),
+            "knownCatalogIdentityPairs": known_identity_pairs,
+        }
+        # Stats structure varies by RenderDoc version
+        try:
+            result["draws"] = fi.stats.recorded.draws
+            result["dispatches"] = fi.stats.recorded.dispatches
+            result["calls"] = fi.stats.recorded.calls
+        except AttributeError:
+            try:
+                result["draws"] = fi.stats.draws
+                result["dispatches"] = fi.stats.dispatches
+                result["calls"] = fi.stats.calls
+            except AttributeError:
+                result["stats_note"] = "Stats not available in this RenderDoc version"
+        return result
+    return _replay(_do)
+
+
+def _current_action_context(event_id):
+    """Serialize the action and marker ancestry visible in ICaptureContext."""
+    action = None
+    try:
+        action = _ctx.GetAction(int(event_id))
+    except Exception:
+        action = None
+    if action is None:
+        try:
+            action = _ctx.CurAction()
+        except Exception:
+            action = None
+    if action is None:
+        return None
+
+    def _item(value):
+        return {
+            "eventId": _safe_int(getattr(value, "eventId", 0), 0),
+            "actionId": _safe_int(getattr(value, "actionId", 0), 0),
+            "name": str(
+                getattr(value, "customName", "") or
+                getattr(value, "name", "") or
+                "Action %d" % _safe_int(getattr(value, "actionId", 0), 0)),
+            "flags": str(getattr(value, "flags", "") or ""),
+        }
+
+    ancestry = []
+    parent = getattr(action, "parent", None)
+    guard = 0
+    while parent is not None and guard < 128:
+        ancestry.append(_item(parent))
+        parent = getattr(parent, "parent", None)
+        guard += 1
+    ancestry.reverse()
+    result = _item(action)
+    result["markerPath"] = ancestry
+    return result
+
+
+def _current_texture_context(warnings):
+    """Read the Texture Viewer's active tab, subresource, and picked texel."""
+    try:
+        viewer = _ctx.GetTextureViewer()
+        resource = viewer.GetCurrentResource()
+        resource_id = _resource_id_int(resource)
+        if resource_id <= 0:
+            return None
+        try:
+            name = str(_ctx.GetResourceName(resource) or "")
+        except Exception:
+            name = ""
+        subresource = viewer.GetSelectedSubresource()
+        selected = {
+            "mip": _safe_int(getattr(subresource, "mip", 0), 0),
+            "slice": _safe_int(getattr(subresource, "slice", 0), 0),
+            "sample": _safe_int(getattr(subresource, "sample", 0), 0),
+        }
+        location = viewer.GetPickedLocation()
+        try:
+            x, y = location
+        except Exception:
+            x = _safe_int(getattr(location, "first", -1), -1)
+            y = _safe_int(getattr(location, "second", -1), -1)
+        picked = {"x": int(x), "y": int(y)} if int(x) >= 0 and int(y) >= 0 else None
+        return {
+            "resourceId": resource_id,
+            "name": name,
+            "subresource": selected,
+            "pickedPixel": picked,
+        }
+    except Exception as exc:
+        warnings.append("Texture Viewer context is unavailable: %s" % str(exc))
+        return None
+
+
+def _current_bound_shader_context(event_id):
+    """Return exact identities for every shader bound at the current replay EID."""
+    def _do(ctrl):
+        warnings = []
+        shaders = []
+        if event_id > 0:
+            ctrl.SetFrameEvent(int(event_id), True)
+        pipeline = ctrl.GetPipelineState()
+        pipeline_object = _get_pipeline_obj(pipeline, ctrl)
+        for stage_name, stage in _available_shader_stages():
+            try:
+                resource = pipeline.GetShader(stage)
+                resource_id = _resource_id_int(resource)
+                if resource_id <= 0:
+                    continue
+                entries = list(ctrl.GetShaderEntryPoints(resource) or [])
+                try:
+                    pipeline_entry = str(pipeline.GetShaderEntryPoint(stage) or "")
+                except Exception:
+                    pipeline_entry = ""
+                selected_entry = None
+                if pipeline_entry:
+                    for candidate in entries:
+                        if str(getattr(candidate, "name", "") or "") == pipeline_entry:
+                            selected_entry = candidate
+                            break
+                elif len(entries) == 1:
+                    selected_entry = entries[0]
+                    pipeline_entry = str(getattr(selected_entry, "name", "") or "")
+
+                raw_sha256 = ""
+                reflected_entry = pipeline_entry
+                if selected_entry is not None:
+                    reflection = ctrl.GetShader(
+                        pipeline_object, resource, selected_entry)
+                    if reflection is not None:
+                        reflected_entry = str(
+                            getattr(reflection, "entryPoint", "") or pipeline_entry)
+                        raw = _shader_raw_bytes(reflection)
+                        if raw:
+                            raw_sha256 = hashlib.sha256(raw).hexdigest()
+                if not raw_sha256:
+                    warnings.append(
+                        "%s shader exact raw bytes are unavailable" % stage_name)
+
+                display_name = ""
+                aliases = _matching_shader_aliases(
+                    resource_id, stage_name, reflected_entry, raw_sha256)
+                if len(aliases) == 1:
+                    display_name = _alias_display_name(aliases[0])
+                shaders.append({
+                    "stage": stage_name,
+                    "resourceId": resource_id,
+                    "entryPoint": reflected_entry,
+                    "rawSha256": raw_sha256,
+                    "displayName": display_name,
+                })
+            except Exception as exc:
+                warnings.append(
+                    "%s shader context is unavailable: %s" % (stage_name, str(exc)))
+        return shaders, warnings
+
+    return _replay(_do)
+
+
+def _build_current_renderdoc_context(focus_stage="", focus_source=""):
+    """Build a current UI/replay snapshot without inferring an unknown UI shader focus."""
+    global _ai_context_generation, _ai_last_observation_id
+    if not _ctx or not _ctx.IsCaptureLoaded():
+        facts = {
+            "contextGeneration": 0,
+            "capture": {"loaded": False},
+            "events": {"currentEventId": 0, "selectedEventId": 0},
+            "action": None,
+            "boundShaders": [],
+            "texture": None,
+            "warnings": [],
+        }
+    else:
+        current_event = _safe_int(_ctx.CurEvent(), 0)
+        try:
+            selected_event = _safe_int(_ctx.CurSelectedEvent(), current_event)
+        except Exception:
+            selected_event = current_event
+        warnings = []
+        try:
+            bound_shaders, shader_warnings = _current_bound_shader_context(current_event)
+            warnings.extend(shader_warnings)
+        except Exception as exc:
+            bound_shaders = []
+            warnings.append("Bound shader context is unavailable: %s" % str(exc))
+        try:
+            props = _ctx.APIProps()
+            api_name = str(getattr(props, "pipelineType", "") or "")
+        except Exception:
+            api_name = ""
+        try:
+            local = bool(_ctx.IsCaptureLocal())
+        except Exception:
+            local = False
+        try:
+            capture_path = str(_ctx.GetCaptureFilename() or "")
+        except Exception:
+            capture_path = ""
+        facts = {
+            "contextGeneration": 0,
+            "capture": {
+                "loaded": True,
+                "captureSessionId": _capture_session_id,
+                "captureId": str(_symbol_capture_snapshot.get("captureId", "") or ""),
+                "path": capture_path,
+                "api": api_name,
+                "local": local,
+            },
+            "events": {
+                "currentEventId": current_event,
+                "selectedEventId": selected_event,
+            },
+            "action": _current_action_context(current_event),
+            "boundShaders": bound_shaders,
+            "focusStage": _normalise_stage_name(focus_stage) if focus_stage else "",
+            "focusSource": str(focus_source or ""),
+            "texture": _current_texture_context(warnings),
+            "warnings": warnings,
+        }
+
+    # Compare a generation-zero canonical observation. Only genuine context changes
+    # increment the process-local generation; repeated reads are byte-identical.
+    observed = _ai_context_protocol.build_context(facts)
+    observation_id = observed["snapshotId"]
+    if observation_id != _ai_last_observation_id:
+        _ai_context_generation += 1
+        _ai_last_observation_id = observation_id
+    facts["contextGeneration"] = _ai_context_generation
+    return _ai_context_protocol.build_context(facts)
+
+
+def _get_current_renderdoc_context(params):
+    # MCP/IPC callers cannot assert an explicit UI shader selection. Explicit
+    # focus exists only in a RenderDoc stage-scoped menu callback.
+    return _build_current_renderdoc_context()
+
+
+def _claim_renderdoc_ui_intents(params):
+    return _ai_intent_queue.claim(
+        params.get("consumer_id", ""),
+        params.get("max_count", 1),
+        params.get("lease_seconds", 30))
+
+
+def _complete_renderdoc_ui_intent(params):
+    return _ai_intent_queue.complete(
+        params.get("intent_id", ""),
+        params.get("lease_token", ""),
+        params.get("outcome", ""),
+        params.get("summary", ""))
+
+
+def _renew_renderdoc_ui_intent(params):
+    return _ai_intent_queue.renew(
+        params.get("intent_id", ""),
+        params.get("lease_token", ""),
+        params.get("lease_seconds", 30))
+
+
+def _get_renderdoc_ui_intent_status(params):
+    return _ai_intent_queue.status(params.get("intent_id", ""))
+
+
+def _action_name(action):
+    return str(getattr(action, "customName", "") or
+               "Action %d" % _safe_int(getattr(action, "actionId", 0), 0))
+
+
+def _action_flags_mask(names, fallback=0):
+    action_flags = getattr(rd, "ActionFlags", None)
+    mask = 0
+    for name in names:
+        mask |= _safe_int(getattr(action_flags, name, 0), 0)
+    return mask or fallback
+
+
+def _draw_dispatch_action_mask():
+    return _action_flags_mask(
+        ("Drawcall", "Dispatch", "MeshDispatch", "DispatchRay"),
+        0x0002 | 0x0004 | 0x0008 | 0x4000)
+
+
+def _marker_action_mask():
+    return _action_flags_mask(
+        ("PushMarker", "PopMarker", "SetMarker", "CmdList", "MultiAction",
+         "PassBoundary", "CommandBufferBoundary"),
+        0x0040 | 0x0080 | 0x0020 | 0x0010 | 0x0200 | 0x2000 | 0x1000000)
+
+
+def _get_draw_calls(params):
+    """Get actions with marker-subtree filtering and an optional draw/dispatch-only view."""
+    include_children = bool(params.get("include_children", True))
+    only_actions = bool(params.get("only_actions", False))
+    marker_filter = str(params.get("marker_filter", "") or "").strip().lower()
+    event_min = _safe_int(params.get("event_id_min", 0), 0)
+    event_max = _safe_int(params.get("event_id_max", 0), 0)
+    draw_dispatch_mask = _draw_dispatch_action_mask()
+    marker_mask = _marker_action_mask()
+
+    def _flatten(actions, depth=0, marker_path=None, matched_ancestor=False):
+        marker_path = marker_path or []
+        result = []
+        for a in actions:
+            flags = _safe_int(getattr(a, "flags", 0), 0)
+            name = _action_name(a)
+            children = getattr(a, "children", None) or []
+            is_marker = bool(children) or bool(flags & marker_mask)
+            current_path = marker_path + ([name] if is_marker else [])
+            marker_matches = is_marker and marker_filter in name.lower() if marker_filter else False
+            in_matching_subtree = matched_ancestor or marker_matches
+            entry = {
+                "eventId": _safe_int(getattr(a, "eventId", 0), 0),
+                "name": name,
+                "flags": flags,
+                "numIndices": _safe_int(getattr(a, "numIndices", 0), 0),
+                "numInstances": _safe_int(getattr(a, "numInstances", 0), 0),
+                "depth": depth,
+                "markerPath": current_path if is_marker else marker_path,
+            }
+            outputs = getattr(a, "outputs", None) or []
+            if outputs:
+                entry["outputs"] = [_resource_id_int(output) for output in outputs
+                                    if _resource_id_int(output)]
+
+            passes_marker = not marker_filter or in_matching_subtree
+            passes_type = not only_actions or bool(flags & draw_dispatch_mask)
+            passes_range = ((event_min <= 0 or entry["eventId"] >= event_min) and
+                            (event_max <= 0 or entry["eventId"] <= event_max))
+            if passes_marker and passes_type and passes_range:
+                result.append(entry)
+
+            if include_children and children:
+                result.extend(_flatten(
+                    children, depth + 1, current_path, in_matching_subtree))
+        return result
+
+    def _do(ctrl):
+        filtered = _flatten(ctrl.GetRootActions())
+        return {
+            "count": len(filtered),
+            "includeChildren": include_children,
+            "onlyActions": only_actions,
+            "markerFilter": marker_filter,
+            "actions": filtered,
+        }
+
+    return _replay(_do)
+
+
+def _get_pipeline_obj(ps, ctrl):
+    """Get pipeline object ID, compatible with D3D11/D3D12/Vulkan/OpenGL."""
+    # Method 1: Universal API (newer RenderDoc versions)
+    if hasattr(ps, 'GetShaderPipelineObject'):
+        try:
+            pid = ps.GetShaderPipelineObject()
+            if pid and int(pid) != 0:
+                return pid
+        except Exception:
+            pass
+
+    # Method 2: Vulkan — pipeline from VkGraphicsPipelineState
+    try:
+        vk = ctrl.GetVulkanPipelineState()
+        if vk and hasattr(vk, 'graphics') and hasattr(vk.graphics, 'pipelineResourceId'):
+            pid = vk.graphics.pipelineResourceId
+            if pid and int(pid) != 0:
+                return pid
+        if vk and hasattr(vk, 'compute') and hasattr(vk.compute, 'pipelineResourceId'):
+            pid = vk.compute.pipelineResourceId
+            if pid and int(pid) != 0:
+                return pid
+    except Exception:
+        pass
+
+    # Method 3: D3D12 — pipeline from D3D12PipelineState
+    try:
+        d3d12 = ctrl.GetD3D12PipelineState()
+        if d3d12 and hasattr(d3d12, 'pipelineResourceId'):
+            pid = d3d12.pipelineResourceId
+            if pid and int(pid) != 0:
+                return pid
+        # D3D12 graphics/compute pipeline
+        if d3d12:
+            for attr in ['graphics', 'compute']:
+                sub = getattr(d3d12, attr, None)
+                if sub and hasattr(sub, 'pipelineResourceId'):
+                    pid = sub.pipelineResourceId
+                    if pid and int(pid) != 0:
+                        return pid
+    except Exception:
+        pass
+
+    # Method 4: D3D11 — no explicit pipeline object, use null ResourceId
+    # D3D11 doesn't have pipeline state objects; RenderDoc handles this internally
+    # GetShader/GetShaderEntryPoints still work with a null pipeline ID
+    try:
+        d3d11 = ctrl.GetD3D11PipelineState()
+        if d3d11:
+            # D3D11 is valid but has no pipeline object — return null
+            return rd.ResourceId()
+    except Exception:
+        pass
+
+    # Method 5: OpenGL — similar to D3D11, no explicit pipeline object
+    try:
+        gl = ctrl.GetOpenGLPipelineState()
+        if gl:
+            return rd.ResourceId()
+    except Exception:
+        pass
+
+    # Fallback: return a null ResourceId (works for D3D11 and some edge cases)
+    return rd.ResourceId()
+
+
+def _get_pipeline_state(params):
+    """Get pipeline state at an event."""
+    event_id = params.get("event_id")
+    if event_id is None:
+        raise ValueError("event_id required")
+
+    def _do(ctrl):
+        ctrl.SetFrameEvent(int(event_id), True)
+        ps = ctrl.GetPipelineState()
+        pipeline_id = _get_pipeline_obj(ps, ctrl)
+
+        stages = {}
+        for name, stage in _available_shader_stages(
+                ["vertex", "hull", "domain", "geometry", "fragment",
+                 "compute", "task", "mesh"]):
+            sid = ps.GetShader(stage)
+            if sid and int(sid) != 0:
+                stages[name] = {"shaderId": int(sid)}
+                entries = ctrl.GetShaderEntryPoints(sid)
+                if entries:
+                    refl = ctrl.GetShader(pipeline_id, sid, entries[0])
+                    if refl:
+                        stages[name]["entryPoint"] = entries[0].name
+                        stages[name]["textureCount"] = sum(1 for r in refl.readOnlyResources if r.isTexture)
+                        stages[name]["cbufferCount"] = len(refl.constantBlocks)
+                        stages[name]["samplerCount"] = len(refl.samplers)
+
+        targets = ps.GetOutputTargets()
+        depth = ps.GetDepthTarget()
+
+        return {
+            "shaders": stages,
+            "renderTargets": [int(t.resource) for t in targets if int(t.resource) != 0],
+            "depthTarget": int(depth.resource) if depth and int(depth.resource) != 0 else None,
+        }
+
+    return _replay(_do)
+
+
+def _get_shader_info(params):
+    """Get detailed shader info + disassembly + bound textures at an event."""
+    event_id = params.get("event_id")
+    stage_name = _normalise_stage_name(params.get("stage", "fragment"))
+    if event_id is None:
+        raise ValueError("event_id required")
+
+    stage_map = dict(_available_shader_stages([stage_name]))
+    stage = stage_map.get(stage_name)
+    if stage is None:
+        raise ValueError("unsupported shader stage: %s" % stage_name)
+
+    def _do(ctrl):
+        ctrl.SetFrameEvent(int(event_id), True)
+        ps = ctrl.GetPipelineState()
+        sid = ps.GetShader(stage)
+        if not sid or int(sid) == 0:
+            return {"error": "No shader at stage '%s'" % stage_name}
+
+        pid = _get_pipeline_obj(ps, ctrl)
+        entries = ctrl.GetShaderEntryPoints(sid)
+        if not entries:
+            return {"error": "No entry points"}
+
+        selected_entry = entries[0]
+        try:
+            pipeline_entry = str(ps.GetShaderEntryPoint(stage))
+            for candidate in entries:
+                if str(getattr(candidate, "name", "")) == pipeline_entry:
+                    selected_entry = candidate
+                    break
+        except Exception:
+            pass
+
+        refl = ctrl.GetShader(pid, sid, selected_entry)
+        if not refl:
+            return {"error": "No reflection"}
+
+        entry_point = str(getattr(refl, "entryPoint", "") or
+                          getattr(selected_entry, "name", ""))
+        raw_bytes = _shader_raw_bytes(refl)
+        raw_sha256 = hashlib.sha256(raw_bytes).hexdigest() if raw_bytes else None
+
+        result = {
+            "shaderId": int(sid),
+            "pipelineId": int(pid),
+            "stage": stage_name,
+            "entryPoint": entry_point,
+            "rawSha256": raw_sha256,
+        }
+
+        aliases = _matching_shader_aliases(
+            int(sid), stage_name, entry_point, raw_sha256)
+        if aliases:
+            result["alias"] = aliases[0]
+            result["displayName"] = _alias_display_name(aliases[0])
+            if len(aliases) > 1:
+                result["aliasCandidates"] = aliases
+
+        # Disassembly — all targets
+        targets = ctrl.GetDisassemblyTargets(True)
+        result["disassemblyTargets"] = list(targets)
+        disasm = {}
+        for t in targets:
+            try:
+                disasm[t] = ctrl.DisassembleShader(pid, refl, t)
+            except Exception as e:
+                disasm[t] = "Error: %s" % str(e)
+        result["disassembly"] = disasm
+
+        # Embedded source
+        if refl.debugInfo and hasattr(refl.debugInfo, "files") and refl.debugInfo.files:
+            result["sourceFiles"] = [
+                {"filename": f.filename, "contents": f.contents}
+                for f in refl.debugInfo.files
+            ]
+
+        # Input/output — safe attribute access for different RenderDoc versions
+        def _sig(s):
+            return {
+                "name": getattr(s, 'varName', getattr(s, 'semanticName', '')),
+                "semantic": getattr(s, 'semanticName', ''),
+                "idx": getattr(s, 'semanticIndex', 0),
+                "type": str(getattr(s, 'compType', getattr(s, 'varType', ''))),
+                "count": getattr(s, 'compCount', 0),
+            }
+
+        result["inputs"] = [_sig(s) for s in refl.inputSignature]
+        result["outputs"] = [_sig(s) for s in refl.outputSignature]
+
+        # Bound textures
+        name_lookup = {}
+        for r in ctrl.GetResources():
+            name_lookup[int(r.resourceId)] = r.name
+
+        tex_lookup = {}
+        for t in ctrl.GetTextures():
+            tex_lookup[int(t.resourceId)] = t
+
+        bound_textures = []
+        try:
+            ro_bindings = ps.GetReadOnlyResources(stage)
+        except Exception:
+            ro_bindings = None
+
+        for i, ro in enumerate(getattr(refl, 'readOnlyResources', [])):
+            if not getattr(ro, 'isTexture', False):
+                continue
+            ro_name = getattr(ro, 'name', 'tex%d' % i)
+            tex_entry = {
+                "slot": i, "name": ro_name, "bind": getattr(ro, 'fixedBindNumber', i),
+                "resourceId": 0,
+            }
+            # Resolve bound resource — compatible with D3D11/D3D12/Vulkan/GL
+            tex_entry["resourceId"] = _resolve_bound_resource(ro_bindings, i, ctrl)
+
+            rid = tex_entry["resourceId"]
+            if rid and rid in tex_lookup:
+                t = tex_lookup[rid]
+                tex_entry["texName"] = name_lookup.get(rid, "")
+                tex_entry["width"] = t.width
+                tex_entry["height"] = t.height
+                tex_entry["format"] = _fmt_str(t.format)
+                tex_entry["role"] = _infer_role(ro_name, name_lookup.get(rid, ""), _fmt_str(t.format))
+            else:
+                tex_entry["role"] = _infer_role(ro_name, "", "")
+            bound_textures.append(tex_entry)
+        result["boundTextures"] = bound_textures
+
+        # Constant buffers with values
+        cbufs = []
+        cb_list = getattr(refl, 'constantBlocks', [])
+        for idx, cb in enumerate(cb_list):
+            binding = _get_constant_block_binding(ps, stage, idx)
+            bind_number = _safe_int(getattr(cb, "fixedBindNumber", idx), idx)
+            register_space = _safe_int(getattr(cb, "fixedBindSetOrSpace", 0), 0)
+            layout_fields = _constant_block_fields(cb)
+            _apply_layout_aliases(
+                layout_fields, int(sid), stage_name, entry_point, raw_sha256,
+                bind_number, register_space)
+
+            cb_info = {
+                "name": getattr(cb, 'name', ''),
+                "size": getattr(cb, 'byteSize', 0),
+                "byteSize": getattr(cb, 'byteSize', 0),
+                "index": idx,
+                "bind": bind_number,
+                "space": register_space,
+                "bufferId": binding["resourceId"],
+                "byteOffset": binding["byteOffset"],
+                "boundByteSize": binding["byteSize"],
+                "layoutFields": layout_fields,
+            }
+            cb_aliases = _matching_binding_aliases(
+                int(sid), stage_name, entry_point, raw_sha256,
+                "constantBuffer", bind_number, register_space)
+            if cb_aliases:
+                cb_info["alias"] = cb_aliases[0]
+                cb_info["displayName"] = _alias_display_name(cb_aliases[0])
+
+            try:
+                buffer_rid = _resource_id_lookup(
+                    ctrl.GetResources(), binding["resourceId"])
+                if buffer_rid is None:
+                    buffer_rid = rd.ResourceId()
+                variables = ctrl.GetCBufferVariableContents(
+                    pid, sid, stage, entry_point, idx, buffer_rid,
+                    binding["byteOffset"], binding["byteSize"])
+                cb_info["variables"] = [_var_dict(v) for v in variables]
+            except Exception:
+                cb_info["variables"] = []
+            _copy_layout_aliases_to_values(cb_info["variables"], layout_fields)
+            cbufs.append(cb_info)
+        result["constantBuffers"] = cbufs
+
+        # Samplers
+        samplers = []
+        try:
+            smp_bound = ps.GetSamplers(stage)
+        except Exception:
+            smp_bound = None
+        for i, s in enumerate(getattr(refl, 'samplers', [])):
+            se = {"slot": i, "name": getattr(s, 'name', '')}
+            if smp_bound and i < len(smp_bound):
+                sb = smp_bound[i]
+                for attr in ['addressU', 'addressV', 'addressW', 'filter']:
+                    if hasattr(sb, attr):
+                        se[attr] = str(getattr(sb, attr))
+            samplers.append(se)
+        result["samplers"] = samplers
+
+        return result
+
+    return _replay(_do)
+
+
+def _pass_depth_state(ctrl):
+    """Return API-specific depth facts without guessing unsupported fields."""
+    candidates = []
+    try:
+        value = ctrl.GetD3D11PipelineState()
+        if value:
+            candidates.append(getattr(
+                getattr(value, "outputMerger", None), "depthStencilState", None))
+    except Exception:
+        pass
+    try:
+        value = ctrl.GetD3D12PipelineState()
+        if value:
+            candidates.append(getattr(
+                getattr(value, "outputMerger", None), "depthStencilState", None))
+    except Exception:
+        pass
+    try:
+        value = ctrl.GetVulkanPipelineState()
+        if value:
+            candidates.append(getattr(value, "depthStencil", None))
+    except Exception:
+        pass
+    try:
+        value = ctrl.GetOpenGLPipelineState()
+        if value:
+            candidates.append(getattr(value, "depthState", None))
+    except Exception:
+        pass
+    for state in candidates:
+        if state is None:
+            continue
+        enabled = getattr(
+            state, "depthEnable", getattr(state, "depthTestEnable", None))
+        writes = getattr(
+            state, "depthWrites", getattr(state, "depthWriteEnable", None))
+        if isinstance(enabled, bool) and isinstance(writes, bool):
+            return {
+                "depthTestEnabled": enabled,
+                "depthWriteEnabled": writes,
+            }
+    return {}
+
+
+def _get_pass_classification_inputs(params):
+    """Collect all action and pipeline facts in one replay-thread transaction."""
+    expected_capture_id = _require_capture_identity(
+        params.get("expected_capture_id"))
+    expected_session = _shader_override_hex(
+        params.get("expected_capture_session_id"),
+        "expected_capture_session_id", 32)
+    if not _capture_session_id or expected_session != _capture_session_id:
+        raise RuntimeError("Capture session changed before pass classification")
+    maximum = _safe_int(params.get("max_actions", 100000), -1)
+    if maximum < 1 or maximum > 100000:
+        raise ValueError("max_actions must be between 1 and 100000")
+    try:
+        original_event = _safe_int(_ctx.CurEvent(), 0)
+        restore_original_event = True
+    except Exception:
+        original_event = 0
+        restore_original_event = False
+
+    def _do(ctrl):
+        resources = {}
+        for resource in ctrl.GetResources():
+            resource_id = _resource_id_int(getattr(resource, "resourceId", None))
+            if resource_id:
+                resources[resource_id] = str(getattr(resource, "name", "") or "")
+        texture_formats = {}
+        try:
+            for texture in ctrl.GetTextures():
+                resource_id = _resource_id_int(getattr(texture, "resourceId", None))
+                if resource_id:
+                    texture_formats[resource_id] = _fmt_str(
+                        getattr(texture, "format", None))
+        except Exception:
+            pass
+
+        actions = []
+
+        def _flatten(values, depth=0, marker_path=None):
+            marker_path = marker_path or []
+            for action in values:
+                if len(actions) >= maximum:
+                    raise RuntimeError(
+                        "Pass classification action limit reached (%d)" % maximum)
+                flags = _safe_int(getattr(action, "flags", 0), 0)
+                name = _action_name(action)
+                children = getattr(action, "children", None) or []
+                is_context = bool(children) or bool(flags & _marker_action_mask())
+                current_path = marker_path + ([name] if is_context else [])
+                entry = {
+                    "eventId": _safe_int(getattr(action, "eventId", 0), 0),
+                    "name": name,
+                    "flags": flags,
+                    "numIndices": _safe_int(getattr(action, "numIndices", 0), 0),
+                    # RenderDoc uses numIndices as the vertex count for
+                    # non-indexed draws. Keep a future adapter's explicit
+                    # numVertices value when it is available.
+                    "numVertices": _safe_int(
+                        getattr(action, "numVertices",
+                                getattr(action, "numIndices", 0)), 0),
+                    "numInstances": _safe_int(getattr(action, "numInstances", 0), 0),
+                    "depth": depth,
+                    "markerPath": current_path if is_context else marker_path,
+                }
+                outputs = getattr(action, "outputs", None) or []
+                if outputs:
+                    entry["outputs"] = [
+                        _resource_id_int(output) for output in outputs
+                        if _resource_id_int(output)]
+                actions.append(entry)
+                if children:
+                    _flatten(children, depth + 1, current_path)
+
+        _flatten(ctrl.GetRootActions())
+        actionable_mask = _draw_dispatch_action_mask()
+        pipeline_states = {}
+
+        def _resource_fact(resource_id):
+            resource_id = _resource_id_int(resource_id)
+            return {
+                "resourceId": resource_id,
+                "name": resources.get(resource_id, ""),
+                "format": texture_formats.get(resource_id, ""),
+            }
+
+        def _used_resources(ps, method_name, stage):
+            method = getattr(ps, method_name, None)
+            if method is None:
+                return []
+            try:
+                used = method(stage, True)
+            except TypeError:
+                used = method(stage)
+            except Exception:
+                return []
+            result = []
+            for item in used or []:
+                descriptor = getattr(item, "descriptor", item)
+                resource_id = _resource_id_int(getattr(descriptor, "resource", None))
+                if resource_id:
+                    result.append(_resource_fact(resource_id))
+            return result
+
+        action_total = float(max(1, len(actions)))
+        try:
+            for action_index, action in enumerate(actions):
+                if not (action["flags"] & actionable_mask):
+                    continue
+                event_id = action["eventId"]
+                if event_id <= 0:
+                    continue
+                ctrl.SetFrameEvent(int(event_id), True)
+                ps = ctrl.GetPipelineState()
+                pipeline_id = _get_pipeline_obj(ps, ctrl)
+                stages = {}
+                reads = []
+                writes = []
+                for stage_name, stage in _available_shader_stages(
+                        ["vertex", "hull", "domain", "geometry", "fragment",
+                         "compute", "task", "mesh"]):
+                    shader_id = ps.GetShader(stage)
+                    if not shader_id or _resource_id_int(shader_id) == 0:
+                        continue
+                    shader = {"shaderId": _resource_id_int(shader_id)}
+                    try:
+                        entries = ctrl.GetShaderEntryPoints(shader_id)
+                        if entries:
+                            selected = entries[0]
+                            try:
+                                active_entry = str(ps.GetShaderEntryPoint(stage))
+                                for candidate in entries:
+                                    if str(getattr(candidate, "name", "")) == active_entry:
+                                        selected = candidate
+                                        break
+                            except Exception:
+                                pass
+                            shader["entryPoint"] = str(
+                                getattr(selected, "name", "") or "")
+                            reflection = ctrl.GetShader(pipeline_id, shader_id, selected)
+                            if reflection:
+                                raw = _shader_raw_bytes(reflection)
+                                if raw:
+                                    shader["rawSha256"] = hashlib.sha256(raw).hexdigest()
+                    except Exception:
+                        pass
+                    aliases = _matching_shader_aliases(
+                        shader["shaderId"], stage_name,
+                        shader.get("entryPoint", ""), shader.get("rawSha256"))
+                    if aliases:
+                        shader["displayName"] = _alias_display_name(aliases[0])
+                    stages[stage_name] = shader
+                    reads.extend(_used_resources(ps, "GetReadOnlyResources", stage))
+                    writes.extend(_used_resources(ps, "GetReadWriteResources", stage))
+
+                targets = []
+                for descriptor in ps.GetOutputTargets() or []:
+                    resource_id = _resource_id_int(getattr(descriptor, "resource", None))
+                    if resource_id:
+                        fact = _resource_fact(resource_id)
+                        targets.append(fact)
+                        writes.append(fact)
+                depth_fact = None
+                depth = ps.GetDepthTarget()
+                if depth:
+                    depth_id = _resource_id_int(getattr(depth, "resource", None))
+                    if depth_id:
+                        depth_fact = _resource_fact(depth_id)
+                        writes.append(depth_fact)
+
+                def _unique(values):
+                    result = []
+                    seen = set()
+                    for value in values:
+                        key = value.get("resourceId", 0)
+                        if key and key not in seen:
+                            seen.add(key)
+                            result.append(value)
+                    return result
+
+                blend_states = []
+                try:
+                    blend_states = list(ps.GetColorBlends() or [])
+                except Exception:
+                    pass
+                state = {
+                    "shaders": stages,
+                    "renderTargets": targets,
+                    "depthTarget": depth_fact,
+                    "readResources": _unique(reads),
+                    "writeResources": _unique(writes),
+                    "lateFrameFraction": float(action_index) / action_total,
+                }
+                if blend_states:
+                    state["blendEnabled"] = any(
+                        bool(getattr(blend, "enabled", False))
+                        for blend in blend_states)
+                state.update(_pass_depth_state(ctrl))
+                pipeline_states[str(event_id)] = state
+        finally:
+            if restore_original_event:
+                try:
+                    ctrl.SetFrameEvent(original_event, True)
+                except Exception:
+                    pass
+
+        if expected_session != _capture_session_id:
+            raise RuntimeError("Capture session changed during pass classification")
+        return {
+            "schema": "replaylab-pass-classification-inputs/v1",
+            "schemaVersion": 1,
+            "captureId": expected_capture_id,
+            "captureSessionId": expected_session,
+            "actions": actions,
+            "pipelineStates": pipeline_states,
+            "summary": {
+                "actionCount": len(actions),
+                "pipelineStateCount": len(pipeline_states),
+                "singleReplayThreadTransaction": True,
+                "truncated": False,
+            },
+        }
+
+    return _replay(_do)
+
+
+def _parse_catalog_event_ids(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [item.strip() for item in value.split(",") if item.strip()]
+    try:
+        values = list(value)
+    except Exception:
+        values = [value]
+
+    result = []
+    seen = set()
+    for item in values:
+        event_id = _safe_int(item, -1)
+        if event_id < 0:
+            raise ValueError("Invalid event id: %s" % str(item))
+        if event_id not in seen:
+            seen.add(event_id)
+            result.append(event_id)
+    return result
+
+
+def _require_capture_identity(expected_capture_id):
+    """Bind a mutating shader operation to the active exported capture."""
+    expected = str(expected_capture_id or "").strip().lower()
+    if (len(expected) != 64 or
+            any(character not in "0123456789abcdef" for character in expected)):
+        raise ValueError("expected_capture_id must be a lowercase SHA-256")
+    if not _ctx or not _ctx.IsCaptureLoaded():
+        raise RuntimeError("No capture loaded")
+    known_path = _known_catalog_capture_ids.get(expected)
+    if not known_path:
+        raise RuntimeError(
+            "The active capture has no bridge catalog identity; export the exact "
+            "event/stage catalog again before using a capture-bound operation")
+
+    token = _current_capture_token()
+    if token is None:
+        raise RuntimeError("No capture loaded")
+    if token[1] != known_path:
+        raise RuntimeError("The active capture path changed since catalog export")
+    return expected
+
+
+def _read_shader_candidate(params):
+    """Read one exact bounded candidate and verify its caller-bound digest."""
+    candidate_path = str(params.get("candidate_path", "") or "").strip()
+    if not candidate_path:
+        raise ValueError("candidate_path is required")
+    candidate_path = os.path.abspath(os.path.expanduser(candidate_path))
+    if not os.path.isfile(candidate_path):
+        raise ValueError("Candidate shader file not found: %s" % candidate_path)
+
+    expected_sha256 = str(params.get("expected_sha256", "") or "").strip().lower()
+    if (len(expected_sha256) != 64 or
+            any(c not in "0123456789abcdef" for c in expected_sha256)):
+        raise ValueError("expected_sha256 must be a 64-character lowercase SHA-256")
+
+    maximum_size = 512 * 1024 * 1024
+    if os.path.getsize(candidate_path) > maximum_size:
+        raise ValueError("Candidate shader is larger than the 512 MiB safety limit")
+    with open(candidate_path, "rb") as stream:
+        candidate_bytes = stream.read(maximum_size + 1)
+    if len(candidate_bytes) > maximum_size:
+        raise ValueError("Candidate shader is larger than the 512 MiB safety limit")
+    if not candidate_bytes:
+        raise ValueError("Candidate shader is empty")
+    actual_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError("Candidate shader bytes do not match expected_sha256")
+    return candidate_path, candidate_bytes, actual_sha256
+
+
+def _reflect_shader_candidate(params):
+    """Build and reflect one exact candidate blob without replacing any capture resource."""
+    if not _ctx or not _ctx.IsCaptureLoaded():
+        raise RuntimeError("No capture loaded")
+
+    candidate_path, candidate_bytes, actual_sha256 = _read_shader_candidate(params)
+    expected_capture_id = str(params.get("expected_capture_id", "") or "").strip()
+    if expected_capture_id:
+        expected_capture_id = _require_capture_identity(expected_capture_id)
+
+    encoding_name = str(params.get("encoding", "dxbc") or "dxbc").strip().lower()
+    if encoding_name not in ("dxbc", "dxil"):
+        raise ValueError("Candidate reflection accepts native DXBC or DXIL only")
+    encoding = getattr(rd.ShaderEncoding, encoding_name.upper(), None)
+    if encoding is None:
+        raise RuntimeError(
+            "This RenderDoc build does not expose ShaderEncoding.%s" %
+            encoding_name.upper())
+
+    requested_stage = _normalise_stage_name(params.get("stage", ""))
+    stage_map = dict(_available_shader_stages([requested_stage]))
+    stage = stage_map.get(requested_stage)
+    if stage is None:
+        raise ValueError("Unsupported shader stage: %s" % requested_stage)
+    entry_point = str(params.get("entry_point", "") or "").strip()
+    if not entry_point:
+        raise ValueError("entry_point is required")
+
+    def _do(ctrl):
+        result = {
+            "schema": "renderdoc-ultra-shader-reflection/v1",
+            "schemaVersion": 1,
+            "rawSha256": actual_sha256,
+            "byteSize": len(candidate_bytes),
+            "stage": requested_stage,
+            "entryPoint": entry_point,
+            "encoding": encoding_name,
+            "buildTargetShaderSucceeded": False,
+            "reflectionSucceeded": False,
+            "freeTargetResourceSucceeded": False,
+            "buildMessages": "",
+            "compiledInterface": None,
+        }
+        if expected_capture_id:
+            result["captureId"] = expected_capture_id
+            result["captureSessionId"] = _capture_session_id
+        target_id = None
+        try:
+            get_api = getattr(ctrl, "GetAPIProperties", None)
+            api_name = str(
+                getattr(get_api(), "pipelineType", "") if callable(get_api) else "")
+            api_token = api_name.lower().replace("graphicsapi.", "")
+            if api_token == "direct3d11":
+                api_token = "d3d11"
+            elif api_token == "direct3d12":
+                api_token = "d3d12"
+            if encoding_name == "dxil" and api_token != "d3d12":
+                result["buildMessages"] = "Native DXIL reflection requires a D3D12 replay"
+                return result
+            supported = list(ctrl.GetTargetShaderEncodings())
+            if encoding not in supported:
+                result["buildMessages"] = "%s target shaders are unsupported by this replay" % (
+                    encoding_name.upper())
+                return result
+
+            compile_flags = rd.ShaderCompileFlags()
+            target_id, messages = ctrl.BuildTargetShader(
+                entry_point, encoding, candidate_bytes, compile_flags, stage)
+            result["buildMessages"] = str(messages or "")
+            if not _resource_id_int(target_id):
+                return result
+            result["buildTargetShaderSucceeded"] = True
+
+            entries = list(ctrl.GetShaderEntryPoints(target_id) or [])
+            selected_entry = None
+            for candidate in entries:
+                if str(getattr(candidate, "name", "") or "") == entry_point:
+                    selected_entry = candidate
+                    break
+            if selected_entry is None:
+                result["buildMessages"] = (
+                    result["buildMessages"] + "\nCandidate entry point was not reflected"
+                ).strip()
+                return result
+
+            reflection = ctrl.GetShader(rd.ResourceId(), target_id, selected_entry)
+            if not reflection:
+                result["buildMessages"] = (
+                    result["buildMessages"] + "\nCandidate ShaderReflection is unavailable"
+                ).strip()
+                return result
+
+            reflected_raw = _shader_raw_bytes(reflection)
+            result["reflectedRawSha256"] = (
+                hashlib.sha256(reflected_raw).hexdigest() if reflected_raw else "")
+            result["reflectedEntryPoint"] = str(
+                getattr(reflection, "entryPoint", "") or
+                getattr(selected_entry, "name", "") or "")
+            dxil_layout_evidence = {}
+            if encoding_name == "dxil":
+                # Do not invoke the expensive replay-side textual DXIL printer
+                # during reflection. The Host separately validates the exact
+                # immutable fixed-DXC access artifact for this candidate, and
+                # shared apply still repeats a live access comparison adjacent
+                # to mutation. Only structural ambiguity visible in reflection
+                # itself needs an explicit lower-only marker here.
+                dxil_layout_evidence = (
+                    _dxil_layout_evidence_for_reflection_ambiguity(reflection))
+            result["compiledInterface"] = _compiled_shader_interface(
+                reflection, dxil_layout_evidence)
+            result["reflectionSucceeded"] = True
+            return result
+        finally:
+            if target_id is not None and _resource_id_int(target_id):
+                try:
+                    ctrl.FreeTargetResource(target_id)
+                    result["freeTargetResourceSucceeded"] = True
+                except Exception as exc:
+                    result["freeTargetResourceError"] = str(exc)
+
+    return _replay(_do)
+
+
+def _d3d11_stage_state(ctrl, stage_name):
+    state = ctrl.GetD3D11PipelineState()
+    attribute = {
+        "vertex": "vertexShader",
+        "hull": "hullShader",
+        "domain": "domainShader",
+        "geometry": "geometryShader",
+        "fragment": "pixelShader",
+        "compute": "computeShader",
+    }.get(stage_name)
+    if state is None or attribute is None:
+        return None
+    return getattr(state, attribute, None)
+
+
+def _direct3d_api_token(ctrl):
+    api_name = str(getattr(ctrl.GetAPIProperties(), "pipelineType", "") or "")
+    token = api_name.lower().replace("graphicsapi.", "")
+    if token == "direct3d11":
+        token = "d3d11"
+    elif token == "direct3d12":
+        token = "d3d12"
+    return token
+
+
+def _replace_shared_shader_resource(ctrl, api_token, original, target):
+    """Use the transactional PSO rebuild gate for D3D12 shared replacement."""
+    if api_token == "d3d12":
+        checked = getattr(ctrl, "ReplaceTargetShaderChecked", None)
+        if not callable(checked):
+            raise RuntimeError(
+                "This RenderDoc build lacks checked D3D12 Shader replacement")
+        error = str(checked(original, target) or "")
+        if error:
+            raise RuntimeError("Checked D3D12 Shader replacement failed: %s" % error)
+        return
+    if api_token != "d3d11":
+        raise RuntimeError("Shared Shader replacement supports D3D11/D3D12 only")
+    ctrl.ReplaceResource(original, target)
+
+
+def _remove_shared_shader_resource(ctrl, api_token, original):
+    if api_token == "d3d12":
+        checked = getattr(ctrl, "RemoveTargetShaderReplacementChecked", None)
+        if not callable(checked):
+            raise RuntimeError(
+                "This RenderDoc build lacks checked D3D12 Shader rollback")
+        error = str(checked(original) or "")
+        if error:
+            raise RuntimeError("Checked D3D12 Shader rollback failed: %s" % error)
+        return
+    if api_token != "d3d11":
+        raise RuntimeError("Shared Shader rollback supports D3D11/D3D12 only")
+    ctrl.RemoveReplacement(original)
+
+
+def _shader_override_hex(value, field_name, length):
+    text = str(value or "").strip().lower()
+    if len(text) != length or any(c not in "0123456789abcdef" for c in text):
+        raise ValueError("%s must be %d lowercase hexadecimal characters" %
+                         (field_name, length))
+    return text
+
+
+def _event_shader_override_for_slot(event_id, stage_name):
+    for override_id, record in list(_event_shader_overrides.items()):
+        if (record.get("eventId") == event_id and
+                record.get("stageName") == stage_name):
+            return override_id, record
+    return None, None
+
+
+def _shader_family_id(capture_session_id, stage_name, entry_point,
+                      original_resource_id, original_sha256,
+                      candidate_sha256, abi_sha256):
+    return _canonical_json_sha256({
+        "captureSessionId": capture_session_id,
+        "stage": stage_name,
+        "entryPoint": entry_point,
+        "originalResourceId": original_resource_id,
+        "originalRawSha256": original_sha256,
+        "candidateRawSha256": candidate_sha256,
+        "physicalAbiSha256": abi_sha256,
+    })
+
+
+def _shader_override_events(params):
+    raw_events = params.get("events")
+    if raw_events is None:
+        raw_events = [{
+            "event_id": params.get("event_id"),
+            "expected_original_resource_id": params.get(
+                "expected_original_resource_id"),
+            "expected_original_sha256": params.get("expected_original_sha256"),
+        }]
+    if not isinstance(raw_events, list) or not raw_events:
+        raise ValueError("events must be a non-empty array")
+    if len(raw_events) > MAX_EVENT_SHADER_OVERRIDES:
+        raise ValueError("events exceeds the event shader override limit")
+
+    result = []
+    seen = set()
+    common_sha256 = params.get("expected_original_sha256")
+    for index, value in enumerate(raw_events):
+        if not isinstance(value, dict):
+            raise ValueError("events[%d] must be an object" % index)
+        event_id = _safe_int(value.get("event_id", value.get("eventId")), 0)
+        if event_id <= 0:
+            raise ValueError("events[%d].event_id must be positive" % index)
+        if event_id in seen:
+            raise ValueError("events contains duplicate event_id %d" % event_id)
+        seen.add(event_id)
+        resource_id = _safe_int(value.get(
+            "expected_original_resource_id",
+            value.get("expectedOriginalResourceId")), 0)
+        if resource_id <= 0:
+            raise ValueError(
+                "events[%d].expected_original_resource_id must be positive" % index)
+        digest = value.get(
+            "expected_original_sha256",
+            value.get("expectedOriginalSha256", common_sha256))
+        digest = _shader_override_hex(
+            digest, "events[%d].expected_original_sha256" % index, 64)
+        result.append({
+            "eventId": event_id,
+            "expectedOriginalResourceId": resource_id,
+            "expectedOriginalSha256": digest,
+        })
+    if len(set(item["expectedOriginalSha256"] for item in result)) != 1:
+        raise ValueError(
+            "all Shader-family events must have the same original raw SHA-256")
+    if len(set(item["expectedOriginalResourceId"] for item in result)) != 1:
+        raise ValueError(
+            "all Shader-family events must preserve one captured shader ResourceId")
+    return result
+
+
+def _validate_live_shader_event(ctrl, event, stage, stage_name, entry_point,
+                                require_d3d11_state=True,
+                                owned_shared_replacement=None):
+    """Return immutable live facts for one exact captured event/stage."""
+    ctrl.SetFrameEvent(event["eventId"], True)
+    pipeline = ctrl.GetPipelineState()
+    original_id = pipeline.GetShader(stage)
+    if (_resource_id_int(original_id) !=
+            event["expectedOriginalResourceId"]):
+        raise RuntimeError(
+            "Event %d bound a different shader resource" % event["eventId"])
+
+    entries = list(ctrl.GetShaderEntryPoints(original_id) or [])
+    selected_entry = None
+    for candidate_entry in entries:
+        if str(getattr(candidate_entry, "name", "") or "") == entry_point:
+            selected_entry = candidate_entry
+            break
+    if selected_entry is None:
+        raise RuntimeError(
+            "Event %d shader entry point changed" % event["eventId"])
+    try:
+        pipeline_entry = str(pipeline.GetShaderEntryPoint(stage) or "")
+    except Exception:
+        pipeline_entry = entry_point
+    if pipeline_entry and pipeline_entry != entry_point:
+        entry_names = [
+            str(getattr(candidate, "name", "") or "")
+            for candidate in entries
+        ]
+        # Some native D3D12 pipeline snapshots expose the generic source-level
+        # placeholder ``main`` even though the DXIL container has one renamed
+        # physical entry (for example ``MainPS``).  The placeholder is not an
+        # executable identity.  Accept it only when it resolves to no container
+        # entry and the container has exactly one entry, already matched above.
+        # A real alternative/multi-entry pipeline name remains a hard failure.
+        if (pipeline_entry.lower() != "main" or
+                pipeline_entry in entry_names or len(entries) != 1):
+            raise RuntimeError(
+                "Event %d pipeline entry point changed" % event["eventId"])
+
+    pipeline_id = _get_pipeline_obj(pipeline, ctrl)
+    active_reflection = ctrl.GetShader(
+        pipeline_id, original_id, selected_entry)
+    if not active_reflection:
+        raise RuntimeError(
+            "Event %d shader reflection is unavailable" %
+            event["eventId"])
+    active_entry = str(
+        getattr(active_reflection, "entryPoint", "") or
+        getattr(selected_entry, "name", "") or "")
+    active_bytes = _shader_raw_bytes(active_reflection)
+    active_sha256 = (
+        hashlib.sha256(active_bytes).hexdigest() if active_bytes else "")
+
+    # Resource replacement is intentionally transparent to the pipeline state:
+    # GetShader(stage) still returns the canonical captured ResourceId.  On
+    # D3D12, however, GetShader(pipeline, that_id, entry) resolves through the
+    # active mapping and returns the *target* reflection.  A later live-edit
+    # revision must therefore prove two separate identities:
+    #
+    # * the live pipeline is still using the bridge-owned last-good target; and
+    # * ABI validation still uses the immutable captured-original reflection.
+    #
+    # Treating the active target bytes as the original caused every rev1 -> rev2
+    # supersede to fail before ReplaceTargetShaderChecked could run.
+    reflection = active_reflection
+    if owned_shared_replacement is not None:
+        if any((
+                owned_shared_replacement.get("expectedOriginalResourceId") !=
+                event["expectedOriginalResourceId"],
+                owned_shared_replacement.get("expectedOriginalSha256") !=
+                event["expectedOriginalSha256"],
+                owned_shared_replacement.get("stageName") != stage_name,
+                owned_shared_replacement.get("entryPoint") != entry_point)):
+            raise RuntimeError(
+                "The shared Shader owner is bound to a different captured "
+                "original identity")
+        owned_target_sha256 = owned_shared_replacement.get("candidateRawSha256")
+        allowed_active_sha256 = {owned_target_sha256}
+        # D3D11's reflection API can remain capture-original even while replay
+        # ReplaceResource is active. D3D12's checked path, which triggered this
+        # bug, resolves the active target and must prove that exact owner.
+        if require_d3d11_state:
+            allowed_active_sha256.add(event["expectedOriginalSha256"])
+        if (active_entry != entry_point or
+                active_sha256 not in allowed_active_sha256):
+            raise RuntimeError(
+                "Event %d active shared Shader target changed outside ReplayLab" %
+                event["eventId"])
+        reflection = owned_shared_replacement.get("capturedOriginalReflection")
+        if reflection is None:
+            raise RuntimeError(
+                "The captured-original Shader reflection is no longer available")
+
+    reflected_entry = str(getattr(reflection, "entryPoint", "") or entry_point)
+    original_bytes = _shader_raw_bytes(reflection)
+    original_sha256 = (
+        hashlib.sha256(original_bytes).hexdigest() if original_bytes else "")
+    if (reflected_entry != entry_point or
+            original_sha256 != event["expectedOriginalSha256"]):
+        raise RuntimeError(
+            "Event %d original shader bytes or entry point changed" %
+            event["eventId"])
+    if require_d3d11_state and list(getattr(reflection, "interfaces", []) or []):
+        raise RuntimeError(
+            "D3D11 dynamic linkage interfaces are not supported by the ABI gate")
+
+    if require_d3d11_state:
+        d3d11_stage = _d3d11_stage_state(ctrl, stage_name)
+        if d3d11_stage is None:
+            raise RuntimeError("D3D11 stage state is unavailable")
+        if (_resource_id_int(getattr(d3d11_stage, "resourceId", None)) !=
+                event["expectedOriginalResourceId"]):
+            raise RuntimeError(
+                "Event %d D3D11 stage state changed" % event["eventId"])
+        if list(getattr(d3d11_stage, "classInstances", []) or []):
+            raise RuntimeError(
+                "D3D11 dynamic shader linkage is not supported by the ABI gate")
+
+    dxil_access = (
+        owned_shared_replacement.get("capturedDxilAccessSignature")
+        if owned_shared_replacement is not None else None)
+    dxil_layout_evidence = (
+        owned_shared_replacement.get("capturedDxilLayoutEvidence")
+        if owned_shared_replacement is not None else None)
+    physical_abi_sha256 = _physical_shader_interface_sha256(reflection)
+    if _physical_enum(getattr(reflection, "encoding", "")) == "dxil":
+        # The catalog and Host ABI bind stripped DXIL using the same fixed DXC
+        # layout/access evidence. Hashing raw RenderDoc placeholder members here
+        # would produce a different identity even though the subsequent strict
+        # access comparison accepts the interface. Compute this live identity
+        # from the exact evidence once and reuse it for the candidate gate.
+        if dxil_access is None or dxil_layout_evidence is None:
+            dxil_access, dxil_layout_evidence = (
+                _dxil_evidence_from_live_disassembly(
+                    ctrl, pipeline_id, reflection))
+        physical_abi_sha256 = _physical_shader_interface_sha256(
+            reflection, dxil_layout_evidence)
+    if (owned_shared_replacement is not None and
+            physical_abi_sha256 !=
+            owned_shared_replacement.get("physicalAbiSha256")):
+        raise RuntimeError(
+            "The captured-original Shader ABI identity changed")
+
+    return {
+        "event": event,
+        "originalResource": original_id,
+        "pipelineResource": pipeline_id,
+        "reflection": reflection,
+        "physicalAbiSha256": physical_abi_sha256,
+        "dxilAccessSignature": dxil_access,
+        "dxilLayoutEvidence": dxil_layout_evidence,
+    }
+
+
+def _shader_override_response(record, superseded_id=None,
+                              superseded_target_freed=True,
+                              target_reused=False, idempotent=False):
+    target = _event_shader_targets.get(record["familyId"])
+    reference_count = len(target.get("overrideIds", set())) if target else 0
+    return {
+        "schema": "renderdoc-ultra-event-shader-override/v1",
+        "schemaVersion": 1,
+        "overrideId": record["overrideId"],
+        "captureId": record["captureId"],
+        "captureSessionId": record["captureSessionId"],
+        "workspaceId": record["workspaceId"],
+        "revision": record["revision"],
+        "eventId": record["eventId"],
+        "stage": record["stageName"],
+        "entryPoint": record["entryPoint"],
+        "originalResourceId": record["expectedOriginalResourceId"],
+        "originalRawSha256": record["expectedOriginalSha256"],
+        "candidateRawSha256": record["candidateRawSha256"],
+        "physicalAbiSha256": record["physicalAbiSha256"],
+        "shaderFamilyId": record["familyId"],
+        "targetResourceId": record["targetResourceId"],
+        "targetReferenceCount": reference_count,
+        "targetShared": reference_count > 1,
+        "targetReused": bool(target_reused),
+        "idempotent": bool(idempotent),
+        "abiRequestId": record["abiRequestId"],
+        "abiReportSha256": record["abiReportSha256"],
+        "eventScoped": True,
+        "configured": True,
+        "appliedToCurrentEvent": True,
+        "originalShaderPreserved": True,
+        "supersededOverrideId": superseded_id,
+        "supersededTargetFreed": bool(superseded_target_freed),
+    }
+
+
+def _apply_shader_candidate_overrides(params):
+    """Transactionally apply one physical Shader family to many events."""
+    global _event_shader_overrides, _event_shader_targets
+    global _event_shader_override_capture_token
+
+    capture_id = _require_capture_identity(params.get("expected_capture_id"))
+    capture_token = _current_capture_token()
+    if (_event_shader_override_capture_token is not None and
+            _event_shader_override_capture_token != capture_token):
+        _forget_event_shader_overrides()
+
+    candidate_path, candidate_bytes, candidate_sha256 = _read_shader_candidate(params)
+    if str(params.get("encoding", "dxbc") or "dxbc").strip().lower() != "dxbc":
+        raise ValueError("Only native DXBC event shader overrides are supported")
+    requested_stage = _normalise_stage_name(params.get("stage", ""))
+    stage_map = dict(_available_shader_stages([requested_stage]))
+    stage = stage_map.get(requested_stage)
+    if stage is None or requested_stage not in (
+            "vertex", "hull", "domain", "geometry", "fragment", "compute"):
+        raise ValueError("Unsupported D3D11 shader stage: %s" % requested_stage)
+    entry_point = str(params.get("entry_point", "") or "").strip()
+    if not entry_point:
+        raise ValueError("entry_point is required")
+    workspace_id = _shader_override_hex(params.get("workspace_id"), "workspace_id", 32)
+    revision = _safe_int(params.get("revision"), 0)
+    if revision <= 0:
+        raise ValueError("revision must be a positive integer")
+    request_id = _shader_override_hex(params.get("abi_request_id"), "abi_request_id", 64)
+    report_sha256 = _shader_override_hex(
+        params.get("abi_report_sha256"), "abi_report_sha256", 64)
+    events = _shader_override_events(params)
+    original_resource_id = events[0]["expectedOriginalResourceId"]
+    if original_resource_id in _shared_shader_replacements:
+        raise RuntimeError(
+            "The captured Shader already has a resource-scoped replacement; "
+            "roll it back before applying event-scoped overrides")
+
+    new_slots = 0
+    for event in events:
+        existing_id, existing = _event_shader_override_for_slot(
+            event["eventId"], requested_stage)
+        if existing is None:
+            new_slots += 1
+    if len(_event_shader_overrides) + new_slots > MAX_EVENT_SHADER_OVERRIDES:
+        raise RuntimeError(
+            "The active capture reached the %d event shader override limit" %
+            MAX_EVENT_SHADER_OVERRIDES)
+
+    encoding = getattr(rd.ShaderEncoding, "DXBC", None)
+    if encoding is None:
+        raise RuntimeError("This RenderDoc build does not expose ShaderEncoding.DXBC")
+    try:
+        original_event = _safe_int(_ctx.CurEvent(), 0)
+    except Exception:
+        original_event = 0
+
+    def _do(ctrl):
+        api_name = str(getattr(ctrl.GetAPIProperties(), "pipelineType", "") or "")
+        if api_name.lower().replace("graphicsapi.", "") not in (
+                "d3d11", "direct3d11"):
+            raise RuntimeError("Event shader overrides currently require a D3D11 capture")
+        if encoding not in list(ctrl.GetTargetShaderEncodings()):
+            raise RuntimeError("DXBC target shaders are unsupported by this replay")
+
+        live = []
+        for event in events:
+            live.append(_validate_live_shader_event(
+                ctrl, event, stage, requested_stage, entry_point))
+        abi_hashes = set(item["physicalAbiSha256"] for item in live)
+        if len(abi_hashes) != 1:
+            raise RuntimeError(
+                "Selected events do not share one physical Shader ABI")
+        abi_sha256 = next(iter(abi_hashes))
+        original_sha256 = events[0]["expectedOriginalSha256"]
+        family_id = _shader_family_id(
+            _capture_session_id, requested_stage, entry_point,
+            events[0]["expectedOriginalResourceId"], original_sha256,
+            candidate_sha256, abi_sha256)
+
+        prepared = []
+        for item in live:
+            event = item["event"]
+            existing_id, existing = _event_shader_override_for_slot(
+                event["eventId"], requested_stage)
+            exact_idempotent = bool(
+                existing is not None and
+                existing.get("familyId") == family_id and
+                existing.get("workspaceId") == workspace_id and
+                existing.get("revision") == revision and
+                existing.get("abiRequestId") == request_id and
+                existing.get("abiReportSha256") == report_sha256 and
+                existing.get("expectedOriginalResourceId") ==
+                event["expectedOriginalResourceId"])
+            prepared.append({
+                "live": item,
+                "existingId": existing_id,
+                "existing": existing,
+                "idempotent": exact_idempotent,
+                "metadataOnly": bool(
+                    existing is not None and
+                    existing.get("familyId") == family_id and
+                    not exact_idempotent),
+            })
+
+        target = _event_shader_targets.get(family_id)
+        target_id = target.get("targetResource") if target else None
+        built_target = False
+        if target is None and any(not item["idempotent"] for item in prepared):
+            target_id, messages = ctrl.BuildTargetShader(
+                entry_point, encoding, candidate_bytes,
+                rd.ShaderCompileFlags(), stage)
+            if not _resource_id_int(target_id):
+                raise RuntimeError(
+                    "BuildTargetShader failed: %s" % str(messages or ""))
+            built_target = True
+
+            target_entries = list(ctrl.GetShaderEntryPoints(target_id) or [])
+            target_entry = None
+            for candidate_entry in target_entries:
+                if str(getattr(candidate_entry, "name", "") or "") == entry_point:
+                    target_entry = candidate_entry
+                    break
+            if target_entry is None:
+                ctrl.FreeTargetResource(target_id)
+                raise RuntimeError(
+                    "The target shader has no exact requested entry point")
+            target_reflection = ctrl.GetShader(
+                rd.ResourceId(), target_id, target_entry)
+            target_raw = (
+                _shader_raw_bytes(target_reflection) if target_reflection else b"")
+            try:
+                if (not target_reflection or
+                        hashlib.sha256(target_raw).hexdigest() != candidate_sha256):
+                    raise RuntimeError(
+                        "The built target shader does not match candidate bytes")
+                if not _physical_shader_interfaces_compatible(
+                        live[0]["reflection"], target_reflection):
+                    raise RuntimeError(
+                        "The candidate physical ABI differs from the original Shader family")
+            except Exception:
+                ctrl.FreeTargetResource(target_id)
+                raise
+            target = {
+                "familyId": family_id,
+                "targetResource": target_id,
+                "targetResourceId": _resource_id_int(target_id),
+                "candidateRawSha256": candidate_sha256,
+                "physicalAbiSha256": abi_sha256,
+                "overrideIds": set(),
+            }
+        elif target is None:
+            raise RuntimeError("Shader family target bookkeeping is unavailable")
+
+        configured = []
+        failed_item = None
+        try:
+            for item in prepared:
+                if item["idempotent"] or item["metadataOnly"]:
+                    continue
+                # ReplayController requires eventId to equal its current
+                # effective event. Revalidate the exact binding immediately
+                # before the setter so validation and mutation are adjacent.
+                prior_live = item["live"]
+                live_item = _validate_live_shader_event(
+                    ctrl, prior_live["event"], stage,
+                    requested_stage, entry_point)
+                if (live_item["physicalAbiSha256"] != abi_sha256 or
+                        _resource_id_int(live_item["originalResource"]) !=
+                        _resource_id_int(prior_live["originalResource"])):
+                    raise RuntimeError(
+                        "Event %d Shader binding changed during family apply" %
+                        prior_live["event"]["eventId"])
+                item["live"] = live_item
+                failed_item = item
+                error = ctrl.SetEventShaderOverride(
+                    live_item["event"]["eventId"], stage,
+                    live_item["originalResource"], target_id)
+                if str(error or ""):
+                    raise RuntimeError(
+                        "SetEventShaderOverride failed at event %d: %s" %
+                        (live_item["event"]["eventId"], str(error or "")))
+                configured.append(item)
+                failed_item = None
+            # Validation and SetEventShaderOverride temporarily select every
+            # family event. Restore the user's prior replay selection before
+            # committing bookkeeping; a restore failure therefore enters the
+            # same transactional rollback path below.
+            if original_event > 0:
+                ctrl.SetFrameEvent(original_event, True)
+        except Exception:
+            # A setter may fail after removing the previous config. Restore the
+            # failed slot as well as every earlier slot, in reverse order.
+            restore = list(configured)
+            if failed_item is not None:
+                restore.append(failed_item)
+            restore_failures = []
+            for item in reversed(restore):
+                event_id = item["live"]["event"]["eventId"]
+                try:
+                    ctrl.ClearEventShaderOverride(event_id, stage)
+                except Exception:
+                    pass
+                previous = item.get("existing")
+                if previous is not None:
+                    try:
+                        ctrl.SetFrameEvent(event_id, True)
+                        restore_error = ctrl.SetEventShaderOverride(
+                            event_id, stage,
+                            item["live"]["originalResource"],
+                            previous["targetResource"])
+                        if str(restore_error or ""):
+                            raise RuntimeError(str(restore_error))
+                    except Exception:
+                        restore_failures.append(item)
+            for item in restore_failures:
+                old_id = item.get("existingId")
+                old = _event_shader_overrides.pop(old_id, None)
+                if old is not None:
+                    old_target = _event_shader_targets.get(old.get("familyId"))
+                    if old_target is not None:
+                        old_target["overrideIds"].discard(old_id)
+            if built_target:
+                try:
+                    ctrl.FreeTargetResource(target_id)
+                except Exception:
+                    pass
+            if original_event > 0:
+                try:
+                    ctrl.SetFrameEvent(original_event, True)
+                except Exception:
+                    pass
+            raise
+
+        if built_target:
+            _event_shader_targets[family_id] = target
+
+        committed = []
+        old_families = set()
+        for item in prepared:
+            if item["idempotent"]:
+                committed.append({
+                    "record": item["existing"],
+                    "supersededId": None,
+                    "idempotent": True,
+                    "oldFamily": None,
+                })
+                continue
+            event = item["live"]["event"]
+            override_id = uuid.uuid4().hex
+            existing_id = item.get("existingId")
+            existing = item.get("existing")
+            if existing is not None:
+                _event_shader_overrides.pop(existing_id, None)
+                old_family = existing.get("familyId")
+                old_target = _event_shader_targets.get(old_family)
+                if old_target is not None:
+                    old_target["overrideIds"].discard(existing_id)
+                    old_families.add(old_family)
+            else:
+                old_family = None
+            record = {
+                "overrideId": override_id,
+                "captureId": capture_id,
+                "captureSessionId": _capture_session_id,
+                "captureToken": capture_token,
+                "eventId": event["eventId"],
+                "stageName": requested_stage,
+                "stageObject": stage,
+                "entryPoint": entry_point,
+                "expectedOriginalResourceId": event[
+                    "expectedOriginalResourceId"],
+                "originalResource": item["live"]["originalResource"],
+                "expectedOriginalSha256": original_sha256,
+                "candidateRawSha256": candidate_sha256,
+                "candidatePath": candidate_path,
+                "targetResource": target_id,
+                "targetResourceId": _resource_id_int(target_id),
+                "familyId": family_id,
+                "physicalAbiSha256": abi_sha256,
+                "workspaceId": workspace_id,
+                "revision": revision,
+                "abiRequestId": request_id,
+                "abiReportSha256": report_sha256,
+            }
+            _event_shader_overrides[override_id] = record
+            target["overrideIds"].add(override_id)
+            committed.append({
+                "record": record,
+                "supersededId": existing_id,
+                "idempotent": False,
+                "oldFamily": old_family,
+            })
+
+        freed_families = set()
+        for old_family in old_families:
+            old_target = _event_shader_targets.get(old_family)
+            if old_target is None or old_target["overrideIds"]:
+                continue
+            try:
+                ctrl.FreeTargetResource(old_target["targetResource"])
+                _event_shader_targets.pop(old_family, None)
+                freed_families.add(old_family)
+            except Exception:
+                # Retain an unreferenced target for lifecycle cleanup rather
+                # than accidentally freeing a captured/original shader.
+                pass
+
+        responses = []
+        for item in committed:
+            old_family = item["oldFamily"]
+            responses.append(_shader_override_response(
+                item["record"],
+                superseded_id=item["supersededId"],
+                superseded_target_freed=(
+                    old_family is None or old_family == family_id or
+                    old_family in freed_families),
+                target_reused=not built_target,
+                idempotent=item["idempotent"],
+            ))
+        return {
+            "schema": "renderdoc-ultra-event-shader-override-batch/v1",
+            "schemaVersion": 1,
+            "captureId": capture_id,
+            "captureSessionId": _capture_session_id,
+            "shaderFamilyId": family_id,
+            "physicalAbiSha256": abi_sha256,
+            "candidateRawSha256": candidate_sha256,
+            "targetResourceId": target["targetResourceId"],
+            "targetReferenceCount": len(target["overrideIds"]),
+            "targetBuiltOnce": built_target,
+            "targetReused": not built_target,
+            "transactional": True,
+            "originalShadersPreserved": True,
+            "overrides": responses,
+        }
+
+    def _do_with_event_restore(ctrl):
+        try:
+            return _do(ctrl)
+        except Exception:
+            # Validation/build failures happen before the inner setter
+            # transaction. They must still restore the user's selected event.
+            if original_event > 0:
+                try:
+                    ctrl.SetFrameEvent(original_event, True)
+                except Exception:
+                    pass
+            raise
+
+    result = _replay(_do_with_event_restore)
+    _event_shader_override_capture_token = capture_token
+    return result
+
+
+def _apply_shader_candidate_override(params):
+    """Compatibility wrapper for one event, backed by the family transaction."""
+    batch = _apply_shader_candidate_overrides(params)
+    if len(batch.get("overrides", [])) != 1:
+        raise RuntimeError("Single Shader override returned an invalid batch result")
+    return batch["overrides"][0]
+
+
+def _rollback_shader_candidate_overrides(params):
+    """Transactionally clear overrides; free only unreferenced family targets."""
+    global _event_shader_overrides, _event_shader_targets
+    global _event_shader_override_capture_token
+
+    raw_ids = params.get("override_ids")
+    if raw_ids is None:
+        raw_ids = [params.get("override_id")]
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise ValueError("override_ids must be a non-empty array")
+    if len(raw_ids) > MAX_EVENT_SHADER_OVERRIDES:
+        raise ValueError("override_ids exceeds the event shader override limit")
+    override_ids = []
+    for index, value in enumerate(raw_ids):
+        override_id = _shader_override_hex(
+            value, "override_ids[%d]" % index, 32)
+        if override_id in override_ids:
+            raise ValueError("override_ids contains a duplicate token")
+        override_ids.append(override_id)
+
+    records = []
+    for override_id in override_ids:
+        record = _event_shader_overrides.get(override_id)
+        if record is None:
+            raise ValueError("Unknown or expired event shader override ID")
+        records.append(record)
+    capture_id = _require_capture_identity(params.get("expected_capture_id"))
+    current_token = _current_capture_token()
+    for record in records:
+        if (record.get("captureId") != capture_id or
+                record.get("captureToken") != current_token):
+            _forget_event_shader_overrides()
+            raise RuntimeError(
+                "The override belongs to a different capture lifecycle")
+        if record.get("familyId") not in _event_shader_targets:
+            raise RuntimeError("Shader family target bookkeeping is unavailable")
+    try:
+        original_event = _safe_int(_ctx.CurEvent(), 0)
+    except Exception:
+        original_event = 0
+
+    def _do(ctrl):
+        cleared = []
+        failed = None
+        try:
+            for record in records:
+                failed = record
+                ctrl.ClearEventShaderOverride(
+                    record["eventId"], record["stageObject"])
+                cleared.append(record)
+                failed = None
+        except Exception:
+            restore = list(cleared)
+            if failed is not None:
+                restore.append(failed)
+            restore_failures = []
+            for record in reversed(restore):
+                try:
+                    ctrl.SetFrameEvent(record["eventId"], True)
+                    restore_error = ctrl.SetEventShaderOverride(
+                        record["eventId"], record["stageObject"],
+                        record["originalResource"],
+                        record["targetResource"])
+                    if str(restore_error or ""):
+                        raise RuntimeError(str(restore_error))
+                except Exception:
+                    restore_failures.append(record)
+            for record in restore_failures:
+                override_id = record["overrideId"]
+                _event_shader_overrides.pop(override_id, None)
+                target = _event_shader_targets.get(record["familyId"])
+                if target is not None:
+                    target["overrideIds"].discard(override_id)
+            if original_event > 0:
+                try:
+                    ctrl.SetFrameEvent(original_event, True)
+                except Exception:
+                    pass
+            raise
+
+        affected_families = set()
+        for record in records:
+            override_id = record["overrideId"]
+            _event_shader_overrides.pop(override_id, None)
+            target = _event_shader_targets[record["familyId"]]
+            target["overrideIds"].discard(override_id)
+            affected_families.add(record["familyId"])
+
+        freed = set()
+        free_warnings = {}
+        for family_id in affected_families:
+            target = _event_shader_targets.get(family_id)
+            if target is None or target["overrideIds"]:
+                continue
+            try:
+                ctrl.FreeTargetResource(target["targetResource"])
+                _event_shader_targets.pop(family_id, None)
+                freed.add(family_id)
+            except Exception as exc:
+                free_warnings[family_id] = str(exc)
+
+        selection_warning = ""
+        if original_event > 0:
+            try:
+                ctrl.SetFrameEvent(original_event, True)
+            except Exception as exc:
+                selection_warning = str(exc)
+
+        results = []
+        for record in records:
+            target = _event_shader_targets.get(record["familyId"])
+            reference_count = len(target["overrideIds"]) if target else 0
+            results.append({
+                "schema": "renderdoc-ultra-event-shader-override/v1",
+                "schemaVersion": 1,
+                "overrideId": record["overrideId"],
+                "captureId": capture_id,
+                "captureSessionId": _capture_session_id,
+                "eventId": record["eventId"],
+                "stage": record["stageName"],
+                "candidateRawSha256": record["candidateRawSha256"],
+                "shaderFamilyId": record["familyId"],
+                "cleared": True,
+                "targetFreed": record["familyId"] in freed,
+                "targetReferenceCount": reference_count,
+                "originalShaderPreserved": True,
+                "clearWarning": free_warnings.get(record["familyId"], ""),
+                "selectionWarning": selection_warning,
+            })
+        return {
+            "schema": "renderdoc-ultra-event-shader-rollback-batch/v1",
+            "schemaVersion": 1,
+            "captureId": capture_id,
+            "captureSessionId": _capture_session_id,
+            "transactional": True,
+            "originalShadersPreserved": True,
+            "overrides": results,
+        }
+
+    result = _replay(_do)
+    if not _event_shader_overrides and not _event_shader_targets:
+        _event_shader_override_capture_token = None
+    return result
+
+
+def _rollback_shader_candidate_override(params):
+    """Compatibility wrapper for one family-aware transactional rollback."""
+    batch = _rollback_shader_candidate_overrides(params)
+    if len(batch.get("overrides", [])) != 1:
+        raise RuntimeError("Single Shader rollback returned an invalid batch result")
+    return batch["overrides"][0]
+
+
+def _shared_shader_replacement_response(record, idempotent=False,
+                                        metadata_only=False,
+                                        superseded_id=None,
+                                        superseded_target_freed=True):
+    result = {
+        "schema": "renderdoc-ultra-shared-shader-replacement/v1",
+        "schemaVersion": 1,
+        "replacementId": record["replacementId"],
+        "captureId": record["captureId"],
+        "captureSessionId": record["captureSessionId"],
+        "workspaceId": record["workspaceId"],
+        "revision": record["revision"],
+        "anchorEventId": record["anchorEventId"],
+        "stage": record["stageName"],
+        "entryPoint": record["entryPoint"],
+        "api": record["api"],
+        "encoding": record["encoding"],
+        "originalResourceId": record["expectedOriginalResourceId"],
+        "originalRawSha256": record["expectedOriginalSha256"],
+        "candidateRawSha256": record["candidateRawSha256"],
+        "physicalAbiSha256": record["physicalAbiSha256"],
+        "shaderFamilyId": record["familyId"],
+        "targetResourceId": record["targetResourceId"],
+        "abiRequestId": record["abiRequestId"],
+        "abiReportSha256": record["abiReportSha256"],
+        "resourceScoped": True,
+        "eventScoped": False,
+        "allOriginalResourceUsesAffected": True,
+        "configured": True,
+        "originalShaderPreserved": True,
+        "singleOwner": True,
+        "checkedDerivedPipelineRebuild": record["api"] == "d3d12",
+        "capturedRootSignaturesReused": record["api"] == "d3d12",
+        "idempotent": bool(idempotent),
+        "metadataOnly": bool(metadata_only),
+        "targetBuiltOnce": not (idempotent or metadata_only),
+        "targetReused": bool(idempotent or metadata_only),
+        "supersededReplacementId": superseded_id,
+        "supersededTargetFreed": bool(superseded_target_freed),
+    }
+    validation_mode = str(record.get("abiValidationMode", "") or "")
+    if validation_mode:
+        result.update({
+            "abiValidationMode": validation_mode,
+            "preliminaryReflectionSkipped": bool(
+                record.get("preliminaryReflectionSkipped", False)),
+            "freshPhysicalAbiValidationPerformed": bool(
+                record.get("freshPhysicalAbiValidationPerformed", False)),
+            "abiLeaseRequestId": record.get("abiLeaseRequestId"),
+            "abiLeaseReportSha256": record.get("abiLeaseReportSha256"),
+            "abiLeaseCandidateRawSha256": record.get(
+                "abiLeaseCandidateRawSha256"),
+            "abiLeaseRevision": record.get("abiLeaseRevision"),
+        })
+    return result
+
+
+def _apply_shader_candidate_shared_resource(params):
+    """Replace one captured Shader ResourceId for every use in the capture.
+
+    This is the sharing-preserving counterpart to event-scoped overrides.  It
+    owns exactly one generated target per original captured ResourceId and
+    keeps the captured/original Shader alive for the whole capture lifecycle.
+    """
+    global _shared_shader_replacements, _shared_shader_orphan_targets
+    global _shared_shader_replacement_capture_token
+
+    capture_id = _require_capture_identity(params.get("expected_capture_id"))
+    capture_token = _current_capture_token()
+    if (_shared_shader_replacement_capture_token is not None and
+            _shared_shader_replacement_capture_token != capture_token):
+        _forget_shared_shader_replacements()
+
+    candidate_path, candidate_bytes, candidate_sha256 = _read_shader_candidate(params)
+    encoding_name = str(params.get("encoding", "dxbc") or "dxbc").strip().lower()
+    if encoding_name not in ("dxbc", "dxil"):
+        raise ValueError("Shared Shader replacement accepts native DXBC/DXIL only")
+    requested_stage = _normalise_stage_name(params.get("stage", ""))
+    stage_map = dict(_available_shader_stages([requested_stage]))
+    stage = stage_map.get(requested_stage)
+    if stage is None or requested_stage not in (
+            "vertex", "hull", "domain", "geometry", "fragment", "compute",
+            "task", "mesh"):
+        raise ValueError("Unsupported D3D pipeline shader stage: %s" % requested_stage)
+    entry_point = str(params.get("entry_point", "") or "").strip()
+    if not entry_point:
+        raise ValueError("entry_point is required")
+    workspace_id = _shader_override_hex(params.get("workspace_id"), "workspace_id", 32)
+    revision = _safe_int(params.get("revision"), 0)
+    if revision <= 0:
+        raise ValueError("revision must be a positive integer")
+    request_id = _shader_override_hex(params.get("abi_request_id"), "abi_request_id", 64)
+    report_sha256 = _shader_override_hex(
+        params.get("abi_report_sha256"), "abi_report_sha256", 64)
+    abi_validation_mode = str(
+        params.get("abi_validation_mode", "") or "").strip().lower()
+    lease_request_id = request_id
+    lease_report_sha256 = report_sha256
+    lease_candidate_sha256 = candidate_sha256
+    lease_revision = revision
+    expected_physical_abi_sha256 = ""
+    if abi_validation_mode:
+        if abi_validation_mode != "inline-physical-with-initial-lease":
+            raise ValueError("Unsupported shared Shader ABI validation mode")
+        lease_request_id = _shader_override_hex(
+            params.get("abi_lease_request_id"), "abi_lease_request_id", 64)
+        lease_report_sha256 = report_sha256
+        lease_candidate_sha256 = _shader_override_hex(
+            params.get("abi_lease_candidate_sha256"),
+            "abi_lease_candidate_sha256", 64)
+        lease_revision = _safe_int(params.get("abi_lease_revision"), 0)
+        if lease_revision <= 0 or lease_revision >= revision:
+            raise ValueError(
+                "abi_lease_revision must precede the current revision")
+        expected_physical_abi_sha256 = _shader_override_hex(
+            params.get("expected_physical_abi_sha256"),
+            "expected_physical_abi_sha256", 64)
+    events = _shader_override_events(params)
+    if len(events) != 1:
+        raise ValueError("A shared Shader replacement requires one live anchor event")
+    event = events[0]
+    original_resource_id = event["expectedOriginalResourceId"]
+    if any(
+            record.get("expectedOriginalResourceId") == original_resource_id
+            for record in _event_shader_overrides.values()):
+        raise RuntimeError(
+            "The captured Shader has event-scoped overrides; roll them back "
+            "before applying a resource-scoped replacement")
+
+    encoding = getattr(rd.ShaderEncoding, encoding_name.upper(), None)
+    if encoding is None:
+        raise RuntimeError(
+            "This RenderDoc build does not expose ShaderEncoding.%s" %
+            encoding_name.upper())
+    existing = _shared_shader_replacements.get(original_resource_id)
+    if (existing is None and
+            len(_shared_shader_replacements) >= MAX_SHARED_SHADER_REPLACEMENTS):
+        raise RuntimeError(
+            "The active capture reached the %d shared Shader replacement limit" %
+            MAX_SHARED_SHADER_REPLACEMENTS)
+    if any(
+            record.get("workspaceId") == workspace_id and
+            record.get("expectedOriginalResourceId") != original_resource_id
+            for record in _shared_shader_replacements.values()):
+        raise RuntimeError(
+            "The workspace already owns a different captured Shader ResourceId")
+    if (existing is not None and
+            existing.get("workspaceId") != workspace_id):
+        raise RuntimeError(
+            "The captured Shader is owned by a different workspace; explicit "
+            "replacement handoff is not supported")
+    if abi_validation_mode:
+        if existing is None:
+            raise RuntimeError(
+                "An inline ABI lease requires an active fully validated replacement")
+        if any((
+                existing.get("abiLeaseRequestId") != lease_request_id,
+                existing.get("abiLeaseReportSha256") != lease_report_sha256,
+                existing.get("abiLeaseCandidateRawSha256") !=
+                lease_candidate_sha256,
+                existing.get("abiLeaseRevision") != lease_revision,
+                existing.get("physicalAbiSha256") !=
+                expected_physical_abi_sha256)):
+            raise RuntimeError(
+                "The inline ABI lease does not match the active replacement")
+    original_resource = (
+        existing.get("originalResource") if existing is not None else
+        _context_resource_ids().get(original_resource_id))
+    if original_resource is None:
+        raise RuntimeError(
+            "The captured Shader ResourceId is unavailable in qrenderdoc")
+    _require_shared_shader_ui_owner(original_resource, existing)
+    try:
+        original_event = _safe_int(_ctx.CurEvent(), 0)
+    except Exception:
+        original_event = 0
+
+    def _do(ctrl):
+        new_target = None
+        replacement_attempted = False
+        try:
+            api_token = _direct3d_api_token(ctrl)
+            if api_token == "d3d11":
+                if encoding_name != "dxbc" or requested_stage in ("task", "mesh"):
+                    raise RuntimeError(
+                        "D3D11 shared replacement requires DXBC and a D3D11 shader stage")
+            elif api_token == "d3d12":
+                # D3D12 accepts native DXBC and DXIL. The checked mutation below is mandatory:
+                # it prebuilds every captured PSO with its original root signature.
+                if not callable(getattr(ctrl, "ReplaceTargetShaderChecked", None)):
+                    raise RuntimeError(
+                        "This RenderDoc build lacks checked D3D12 Shader replacement")
+            else:
+                raise RuntimeError("Shared Shader replacements support D3D11/D3D12 only")
+            if encoding not in list(ctrl.GetTargetShaderEncodings()):
+                raise RuntimeError(
+                    "%s target shaders are unsupported by this replay" %
+                    encoding_name.upper())
+
+            live = _validate_live_shader_event(
+                ctrl, event, stage, requested_stage, entry_point,
+                require_d3d11_state=(api_token == "d3d11"),
+                owned_shared_replacement=existing)
+            abi_sha256 = live["physicalAbiSha256"]
+            if (abi_validation_mode and
+                    abi_sha256 != expected_physical_abi_sha256):
+                raise RuntimeError(
+                    "The live captured Shader ABI no longer matches the initial lease")
+            family_id = _shader_family_id(
+                _capture_session_id, requested_stage, entry_point,
+                original_resource_id, event["expectedOriginalSha256"],
+                candidate_sha256, abi_sha256)
+            exact = bool(
+                existing is not None and
+                existing.get("familyId") == family_id and
+                existing.get("workspaceId") == workspace_id and
+                existing.get("revision") == revision and
+                existing.get("abiRequestId") == request_id and
+                existing.get("abiReportSha256") == report_sha256)
+            metadata_only = bool(
+                existing is not None and
+                existing.get("familyId") == family_id and not exact)
+            if exact or metadata_only:
+                return {
+                    "mode": "idempotent" if exact else "metadata",
+                    "live": live,
+                    "familyId": family_id,
+                    "physicalAbiSha256": abi_sha256,
+                    "api": api_token,
+                }
+
+            new_target, messages = ctrl.BuildTargetShader(
+                entry_point, encoding, candidate_bytes,
+                rd.ShaderCompileFlags(), stage)
+            if not _resource_id_int(new_target):
+                raise RuntimeError(
+                    "BuildTargetShader failed: %s" % str(messages or ""))
+            target_entries = list(ctrl.GetShaderEntryPoints(new_target) or [])
+            target_entry = None
+            for candidate_entry in target_entries:
+                if str(getattr(candidate_entry, "name", "") or "") == entry_point:
+                    target_entry = candidate_entry
+                    break
+            if target_entry is None:
+                raise RuntimeError(
+                    "The target shader has no exact requested entry point")
+            target_reflection = ctrl.GetShader(
+                rd.ResourceId(), new_target, target_entry)
+            target_raw = (
+                _shader_raw_bytes(target_reflection) if target_reflection else b"")
+            if (not target_reflection or
+                    hashlib.sha256(target_raw).hexdigest() != candidate_sha256):
+                raise RuntimeError(
+                    "The built target shader does not match candidate bytes")
+            if encoding_name == "dxil":
+                interface_compatible = _dxil_ambiguous_interface_compatible(
+                    ctrl, live["pipelineResource"],
+                    live["reflection"], target_reflection,
+                    baseline_access=live.get("dxilAccessSignature"),
+                    baseline_layout_evidence=live.get("dxilLayoutEvidence"))
+            else:
+                interface_compatible = _physical_shader_interfaces_compatible(
+                    live["reflection"], target_reflection)
+            if not interface_compatible:
+                raise RuntimeError(
+                    "The candidate physical ABI differs from the original Shader")
+
+            # Validation and mutation are adjacent on the replay thread. The
+            # replacement key is always the captured original ResourceId.
+            replacement_attempted = True
+            _replace_shared_shader_resource(
+                ctrl, api_token, live["originalResource"], new_target)
+            return {
+                "mode": "replaced",
+                "live": live,
+                "newTarget": new_target,
+                "familyId": family_id,
+                "physicalAbiSha256": abi_sha256,
+                "api": api_token,
+            }
+        except Exception:
+            if replacement_attempted:
+                try:
+                    if existing is not None:
+                        _replace_shared_shader_resource(
+                            ctrl, existing.get("api", "d3d11"),
+                            existing["originalResource"], existing["targetResource"])
+                    else:
+                        _remove_shared_shader_resource(
+                            ctrl, api_token, live["originalResource"])
+                except Exception:
+                    pass
+            if new_target is not None and _resource_id_int(new_target):
+                try:
+                    ctrl.FreeTargetResource(new_target)
+                except Exception:
+                    pass
+            raise
+        finally:
+            if original_event > 0:
+                try:
+                    ctrl.SetFrameEvent(original_event, True)
+                except Exception:
+                    pass
+
+    outcome = _replay(_do)
+    mode = outcome["mode"]
+    live = outcome["live"]
+    if mode in ("idempotent", "metadata"):
+        if existing is None:
+            raise RuntimeError("Shared Shader replacement bookkeeping is unavailable")
+        # Even a no-op/metadata refresh proves that the GUI still points at
+        # this bridge-owned target; otherwise it could falsely claim success
+        # over a stock Shader Editor replacement.
+        _require_shared_shader_ui_owner(
+            existing["originalResource"], existing)
+        if mode == "metadata":
+            existing.update({
+                "captureId": capture_id,
+                "workspaceId": workspace_id,
+                "revision": revision,
+                "anchorEventId": event["eventId"],
+                "abiRequestId": request_id,
+                "abiReportSha256": report_sha256,
+                "candidatePath": candidate_path,
+                "abiValidationMode": (
+                    abi_validation_mode or
+                    "full-replay-report-and-inline-physical"),
+                "preliminaryReflectionSkipped": bool(abi_validation_mode),
+                "freshPhysicalAbiValidationPerformed": True,
+            })
+        _shared_shader_replacement_capture_token = capture_token
+        return _shared_shader_replacement_response(
+            existing, idempotent=(mode == "idempotent"),
+            metadata_only=(mode == "metadata"))
+
+    new_target = outcome["newTarget"]
+    original_resource = live["originalResource"]
+    replacement_id = uuid.uuid4().hex
+    record = {
+        "replacementId": replacement_id,
+        "captureId": capture_id,
+        "captureSessionId": _capture_session_id,
+        "captureToken": capture_token,
+        "workspaceId": workspace_id,
+        "revision": revision,
+        "anchorEventId": event["eventId"],
+        "stageName": requested_stage,
+        "stageObject": stage,
+        "entryPoint": entry_point,
+        "api": outcome["api"],
+        "encoding": encoding_name,
+        "expectedOriginalResourceId": original_resource_id,
+        "originalResource": original_resource,
+        "capturedOriginalReflection": live["reflection"],
+        "capturedOriginalPipelineResource": live["pipelineResource"],
+        "capturedDxilAccessSignature": live.get("dxilAccessSignature"),
+        "capturedDxilLayoutEvidence": live.get("dxilLayoutEvidence"),
+        "expectedOriginalSha256": event["expectedOriginalSha256"],
+        "candidateRawSha256": candidate_sha256,
+        "candidatePath": candidate_path,
+        "targetResource": new_target,
+        "targetResourceId": _resource_id_int(new_target),
+        "familyId": outcome["familyId"],
+        "physicalAbiSha256": outcome["physicalAbiSha256"],
+        "abiRequestId": request_id,
+        "abiReportSha256": report_sha256,
+        "abiValidationMode": (
+            abi_validation_mode or "full-replay-report-and-inline-physical"),
+        "preliminaryReflectionSkipped": bool(abi_validation_mode),
+        "freshPhysicalAbiValidationPerformed": True,
+        "abiLeaseRequestId": lease_request_id,
+        "abiLeaseReportSha256": lease_report_sha256,
+        "abiLeaseCandidateRawSha256": lease_candidate_sha256,
+        "abiLeaseRevision": lease_revision,
+        "uiSynchronized": True,
+    }
+
+    try:
+        _set_shared_shader_ui_owner(original_resource, new_target)
+    except Exception as register_exc:
+        # Keep replay and GUI replacement registries in lock-step. Restore the
+        # exact previous replay owner first, and do not free the new target
+        # until both replay and GUI have been *verified* at that old state.
+        def _restore(ctrl):
+            if existing is not None:
+                _replace_shared_shader_resource(
+                    ctrl, existing.get("api", "d3d11"),
+                    existing["originalResource"], existing["targetResource"])
+            else:
+                _remove_shared_shader_resource(ctrl, outcome["api"], original_resource)
+
+        restore_error = None
+        try:
+            _replay(_restore)
+        except Exception as exc:
+            restore_error = exc
+
+        if restore_error is None:
+            expected_ui_target = (
+                existing["targetResource"] if existing is not None else None)
+            try:
+                _set_shared_shader_ui_owner(
+                    original_resource, expected_ui_target)
+            except Exception as ui_restore_exc:
+                # The replay is back at the old state, but the UI could not be
+                # proven there. Try to converge on the known live new target;
+                # checked D3D12 replacement either succeeds wholly or keeps the
+                # previous replay owner unchanged.
+                replay_reapply_error = None
+                try:
+                    _replay(lambda ctrl: _replace_shared_shader_resource(
+                        ctrl, outcome["api"], original_resource, new_target))
+                except Exception as exc:
+                    replay_reapply_error = exc
+
+                if replay_reapply_error is None:
+                    ui_reapply_error = None
+                    try:
+                        _set_shared_shader_ui_owner(
+                            original_resource, new_target)
+                    except Exception as exc:
+                        ui_reapply_error = exc
+                    record["uiSynchronized"] = ui_reapply_error is None
+                    record["recoveryWarning"] = (
+                        "qrenderdoc registration failed: %s; restoring the old UI owner "
+                        "failed: %s%s" % (
+                            str(register_exc), str(ui_restore_exc),
+                            ("; re-registering the active target failed: %s" %
+                             str(ui_reapply_error)) if ui_reapply_error else ""))
+                    _shared_shader_replacements[original_resource_id] = record
+                    _shared_shader_replacement_capture_token = capture_token
+                    if existing is not None and record["uiSynchronized"]:
+                        try:
+                            _replay(lambda ctrl: ctrl.FreeTargetResource(
+                                existing["targetResource"]))
+                        except Exception:
+                            _shared_shader_orphan_targets.append(
+                                existing["targetResource"])
+                    raise RuntimeError(
+                        "%s. The new replay replacement remains active and tracked as %s; "
+                        "it was not freed. Retry shared-resource rollback with that ID."
+                        % (record["recoveryWarning"], replacement_id))
+
+                # Replay is still at the verified prior owner. The new target
+                # may nevertheless be referenced by a damaged UI registry, so
+                # retain it for lifecycle cleanup instead of freeing it.
+                _shared_shader_orphan_targets.append(new_target)
+                raise RuntimeError(
+                    "qrenderdoc registration failed: %s. Replay was restored, but the UI "
+                    "owner could not be restored (%s) and re-applying the new target failed "
+                    "(%s); the new target was retained, not freed."
+                    % (str(register_exc), str(ui_restore_exc),
+                       str(replay_reapply_error)))
+
+            free_error = None
+            try:
+                _replay(lambda ctrl: ctrl.FreeTargetResource(new_target))
+            except Exception as exc:
+                free_error = exc
+                _shared_shader_orphan_targets.append(new_target)
+            suffix = (
+                " The unused target could not be freed and was retained: %s" %
+                str(free_error)) if free_error else ""
+            raise RuntimeError(
+                "qrenderdoc registration failed: %s. Replay and UI were restored to their "
+                "previous owner.%s" % (str(register_exc), suffix))
+
+        # Checked restore failed, so its fail-closed contract means the new
+        # target remains the replay owner. Align the UI with that owner, retain
+        # explicit bookkeeping, and never free the live target.
+        ui_recovery_error = None
+        try:
+            _set_shared_shader_ui_owner(original_resource, new_target)
+        except Exception as exc:
+            ui_recovery_error = exc
+        record["uiSynchronized"] = ui_recovery_error is None
+        record["recoveryWarning"] = (
+            "qrenderdoc registration failed: %s; checked replay rollback failed: %s%s"
+            % (str(register_exc), str(restore_error),
+               ("; UI recovery failed: %s" % str(ui_recovery_error))
+               if ui_recovery_error else ""))
+        _shared_shader_replacements[original_resource_id] = record
+        _shared_shader_replacement_capture_token = capture_token
+        if existing is not None and record["uiSynchronized"]:
+            try:
+                _replay(lambda ctrl: ctrl.FreeTargetResource(
+                    existing["targetResource"]))
+            except Exception:
+                _shared_shader_orphan_targets.append(existing["targetResource"])
+        raise RuntimeError(
+            "%s. The new replay replacement remains active and tracked as %s; "
+            "it was not freed. Retry shared-resource rollback with that ID."
+            % (record["recoveryWarning"], replacement_id))
+
+    _shared_shader_replacements[original_resource_id] = record
+    _shared_shader_replacement_capture_token = capture_token
+
+    superseded_freed = True
+    superseded_id = existing.get("replacementId") if existing else None
+    if existing is not None:
+        try:
+            _replay(lambda ctrl: ctrl.FreeTargetResource(
+                existing["targetResource"]))
+        except Exception:
+            superseded_freed = False
+            _shared_shader_orphan_targets.append(existing["targetResource"])
+    return _shared_shader_replacement_response(
+        record, superseded_id=superseded_id,
+        superseded_target_freed=superseded_freed)
+
+
+def _rollback_shader_candidate_shared_resource(params):
+    """Remove one owned ResourceId replacement and free only its target."""
+    global _shared_shader_replacements, _shared_shader_orphan_targets
+    global _shared_shader_replacement_capture_token
+
+    replacement_id = _shader_override_hex(
+        params.get("replacement_id"), "replacement_id", 32)
+    capture_id = _require_capture_identity(params.get("expected_capture_id"))
+    workspace_id = _shader_override_hex(
+        params.get("workspace_id"), "workspace_id", 32)
+    capture_token = _current_capture_token()
+    record = None
+    for candidate in _shared_shader_replacements.values():
+        if candidate.get("replacementId") == replacement_id:
+            record = candidate
+            break
+    if record is None:
+        raise ValueError("Unknown or expired shared Shader replacement ID")
+    if any((
+            record.get("captureId") != capture_id,
+            record.get("workspaceId") != workspace_id,
+            record.get("captureToken") != capture_token,
+            _shared_shader_replacement_capture_token != capture_token)):
+        if record.get("captureToken") != capture_token:
+            _forget_shared_shader_replacements()
+        raise RuntimeError(
+            "The shared Shader replacement belongs to a different lifecycle or workspace")
+
+    original_resource = record["originalResource"]
+    target_resource = record["targetResource"]
+    _require_shared_shader_ui_owner(original_resource, record)
+    try:
+        _replay(lambda ctrl: _remove_shared_shader_resource(
+            ctrl, record.get("api", "d3d11"), original_resource))
+    except Exception:
+        try:
+            _replay(lambda ctrl: _replace_shared_shader_resource(
+                ctrl, record.get("api", "d3d11"), original_resource, target_resource))
+        except Exception:
+            pass
+        raise
+    try:
+        unregister = getattr(_ctx, "UnregisterReplacement", None)
+        if not callable(unregister):
+            raise RuntimeError(
+                "This qrenderdoc context does not expose UnregisterReplacement")
+        unregister(original_resource)
+    except Exception:
+        # Restore both registries so the caller can retry with the same token.
+        try:
+            _replay(lambda ctrl: _replace_shared_shader_resource(
+                ctrl, record.get("api", "d3d11"), original_resource, target_resource))
+        except Exception:
+            pass
+        try:
+            try:
+                _ctx.UnregisterReplacement(original_resource)
+            except Exception:
+                pass
+            _ctx.RegisterReplacement(original_resource, target_resource)
+        except Exception:
+            pass
+        raise
+
+    target_freed = True
+    free_warning = ""
+    try:
+        _replay(lambda ctrl: ctrl.FreeTargetResource(target_resource))
+    except Exception as exc:
+        target_freed = False
+        free_warning = str(exc)
+        _shared_shader_orphan_targets.append(target_resource)
+    _shared_shader_replacements.pop(record["expectedOriginalResourceId"], None)
+    if not _shared_shader_replacements and not _shared_shader_orphan_targets:
+        _shared_shader_replacement_capture_token = None
+    return {
+        "schema": "renderdoc-ultra-shared-shader-replacement/v1",
+        "schemaVersion": 1,
+        "replacementId": replacement_id,
+        "captureId": capture_id,
+        "captureSessionId": _capture_session_id,
+        "workspaceId": workspace_id,
+        "api": record.get("api", "d3d11"),
+        "encoding": record.get("encoding", "dxbc"),
+        "originalResourceId": record["expectedOriginalResourceId"],
+        "targetResourceId": record["targetResourceId"],
+        "resourceScoped": True,
+        "eventScoped": False,
+        "cleared": True,
+        "targetFreed": target_freed,
+        "originalShaderPreserved": True,
+        "freeWarning": free_warning,
+    }
+
+
+def _get_shared_shader_replacements(params):
+    """Return bounded bridge-owned replacement metadata for this lifecycle.
+
+    Candidate paths and pyrenderdoc resource objects are intentionally omitted.
+    A newly connected MCP process can therefore restore the current Shader
+    without trusting stale host memory or guessing a replacement token.
+    """
+    capture_id = _require_capture_identity(params.get("expected_capture_id"))
+    expected_session = _shader_override_hex(
+        params.get("expected_capture_session_id"),
+        "expected_capture_session_id", 32)
+    if not _capture_session_id or expected_session != _capture_session_id:
+        raise RuntimeError("Capture session changed before replacement query")
+    capture_token = _current_capture_token()
+    if (_shared_shader_replacement_capture_token is not None and
+            _shared_shader_replacement_capture_token != capture_token):
+        _forget_shared_shader_replacements()
+
+    records = []
+    for record in _shared_shader_replacements.values():
+        if any((
+                record.get("captureId") != capture_id,
+                record.get("captureSessionId") != expected_session,
+                record.get("captureToken") != capture_token)):
+            continue
+        records.append({
+            "replacementId": record["replacementId"],
+            "workspaceId": record["workspaceId"],
+            "revision": record["revision"],
+            "anchorEventId": record["anchorEventId"],
+            "stage": record["stageName"],
+            "entryPoint": record["entryPoint"],
+            "api": record["api"],
+            "encoding": record["encoding"],
+            "originalResourceId": record["expectedOriginalResourceId"],
+            "originalRawSha256": record["expectedOriginalSha256"],
+            "candidateRawSha256": record["candidateRawSha256"],
+            "targetResourceId": record["targetResourceId"],
+            "resourceScoped": True,
+            "eventScoped": False,
+            "allOriginalResourceUsesAffected": True,
+            "originalShaderPreserved": True,
+        })
+    records.sort(key=lambda item: (
+        item["originalResourceId"], item["stage"], item["replacementId"]))
+    return {
+        "schema": "renderdoc-ultra-shared-shader-replacement-list/v1",
+        "schemaVersion": 1,
+        "captureId": capture_id,
+        "captureSessionId": expected_session,
+        "replacements": records,
+        "count": len(records),
+        "originalShadersPreserved": True,
+        "replayMutation": False,
+    }
+
+
+def _event_cbuffer_snapshot_id(value):
+    return _shader_override_hex(value, "snapshot_id", 32)
+
+
+def _require_capture_session_id(value):
+    expected = _shader_override_hex(
+        value, "expected_capture_session_id", 32)
+    if not _capture_session_id or expected != _capture_session_id:
+        raise RuntimeError("The capture session changed; take a new CBuffer snapshot")
+    return expected
+
+
+def _strict_base64_bytes(value, field_name, maximum_size):
+    if not isinstance(value, str):
+        raise ValueError("%s must be a base64 string" % field_name)
+    try:
+        encoded = value.encode("ascii")
+    except Exception:
+        raise ValueError("%s must contain ASCII base64 only" % field_name)
+    # A bounded encoded length prevents a large allocation before decoding.
+    if len(encoded) > ((maximum_size + 2) // 3) * 4:
+        raise ValueError("%s exceeds the maximum decoded size" % field_name)
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except Exception:
+        raise ValueError("%s is not canonical base64" % field_name)
+    if len(decoded) > maximum_size:
+        raise ValueError("%s exceeds the maximum decoded size" % field_name)
+    if base64.b64encode(decoded) != encoded:
+        raise ValueError("%s is not canonical base64" % field_name)
+    return decoded
+
+
+def _canonical_json_sha256(value):
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _normalise_cbuffer_leaf_type(value):
+    token = str(value or "").strip().replace("_", "").replace(" ", "")
+    token = token.split(".")[-1].lower()
+    return {
+        "float": "Float",
+        "sint": "SInt",
+        "uint": "UInt",
+    }.get(token)
+
+
+def _event_cbuffer_editable_leaves(constants, valid_byte_size, block_byte_size):
+    """Build the deterministic allow-list for 32-bit scalar/vector leaf edits."""
+    leaves = []
+
+    def _visit(values, prefix, parent_offset, depth):
+        if depth > 32:
+            raise RuntimeError("CBuffer reflection nesting exceeds 32 levels")
+        for index, constant in enumerate(values or []):
+            name = str(getattr(constant, "name", "") or "field%d" % index)
+            path = name if not prefix else "%s.%s" % (prefix, name)
+            byte_offset = parent_offset + _safe_int(
+                getattr(constant, "byteOffset", 0), 0)
+            shader_type = getattr(constant, "type", None)
+            if shader_type is None:
+                continue
+
+            members = list(getattr(shader_type, "members", []) or [])
+            elements = _safe_int(getattr(shader_type, "elements", 1), 1)
+            if elements <= 0:
+                continue
+            try:
+                flags = int(getattr(shader_type, "flags", 0))
+            except Exception:
+                continue
+            # Only row-major/hex/binary/RGB display metadata is harmless for this
+            # scalar/vector editor. Packed, normalised, truncated, enum and
+            # SingleElementArray interpretations are deliberately excluded.
+            if flags & ~0x000F:
+                continue
+            pointer_type_id = _safe_int(
+                getattr(shader_type, "pointerTypeID", 0xFFFFFFFF), -2)
+            if pointer_type_id != 0xFFFFFFFF:
+                continue
+            if members:
+                # Arrays of structures need per-member/per-element offset expansion,
+                # which is deliberately outside this first fail-closed editor.
+                if elements == 1:
+                    _visit(members, path, byte_offset, depth + 1)
+                continue
+
+            if (_safe_int(getattr(constant, "bitFieldOffset", 0), 0) or
+                    _safe_int(getattr(constant, "bitFieldSize", 0), 0)):
+                continue
+            base_type = _normalise_cbuffer_leaf_type(
+                getattr(shader_type, "baseType", None))
+            if base_type is None:
+                continue
+
+            rows = _safe_int(getattr(shader_type, "rows", 1), 1)
+            columns = _safe_int(getattr(shader_type, "columns", 1), 1)
+            if rows != 1 or columns < 1 or columns > 4:
+                continue
+            components = columns
+
+            stride = _safe_int(getattr(shader_type, "arrayByteStride", 0), 0)
+            element_size = components * 4
+            is_array = elements > 1
+            if is_array:
+                # D3D11 CBuffer arrays advance by whole 16-byte registers.
+                if stride < element_size or stride % 16 != 0:
+                    continue
+            # DXBC reflection commonly reports 16 for arrayByteStride and
+            # matrixByteStride even on non-array scalar/vector variables. With
+            # rows == 1 these are register-layout metadata, not extra leaf bytes.
+            if not is_array and _shader_type_byte_size(shader_type) != element_size:
+                continue
+            reported_size = _safe_int(getattr(shader_type, "byteSize", 0), 0)
+            physical_span = ((elements - 1) * stride + element_size
+                             if is_array else element_size)
+            if reported_size > 0 and reported_size < physical_span:
+                continue
+            physical_end = byte_offset + physical_span
+            if (byte_offset < 0 or physical_end > valid_byte_size or
+                    (block_byte_size > 0 and physical_end > block_byte_size)):
+                continue
+            for array_index in range(elements):
+                leaf_path = ("%s[%d]" % (path, array_index)
+                             if is_array else path)
+                leaf_offset = byte_offset + (array_index * stride if is_array else 0)
+                leaf_end = leaf_offset + element_size
+                if (leaf_offset < 0 or leaf_end > valid_byte_size or
+                        (block_byte_size > 0 and leaf_end > block_byte_size)):
+                    continue
+                identity = {
+                    "arrayIndex": array_index if elements > 1 else 0,
+                    "baseType": base_type,
+                    "byteOffset": leaf_offset,
+                    "byteSize": element_size,
+                    "components": components,
+                    "path": leaf_path,
+                }
+                leaf = dict(identity)
+                leaf["leafId"] = hashlib.sha256(json.dumps(
+                    identity, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":")).encode("utf-8")).hexdigest()[:32]
+                leaf["displayName"] = leaf_path
+                leaf["editable"] = True
+                leaf["reason"] = ""
+                leaves.append(leaf)
+
+    _visit(constants, "", 0, 0)
+    leaves.sort(key=lambda leaf: (
+        leaf["byteOffset"], leaf["byteSize"], leaf["path"], leaf["arrayIndex"]))
+
+    seen_ids = set()
+    previous_end = -1
+    for leaf in leaves:
+        if leaf["leafId"] in seen_ids:
+            raise RuntimeError("CBuffer reflection produced a duplicate editable leaf ID")
+        seen_ids.add(leaf["leafId"])
+        if leaf["byteOffset"] < previous_end:
+            raise RuntimeError("CBuffer reflection contains overlapping editable leaves")
+        previous_end = leaf["byteOffset"] + leaf["byteSize"]
+    if len(leaves) > 16384:
+        raise RuntimeError("CBuffer reflection contains too many editable leaves")
+    return leaves
+
+
+def _event_cbuffer_layout(block, block_index, stage_name):
+    return {
+        "schema": "renderdoc-ultra-event-cbuffer-layout/v1",
+        "stage": stage_name,
+        "block": _constant_block_dict(block, block_index),
+    }
+
+
+def _event_cbuffer_live_state(ctrl, event_id, stage_name, stage, block_index):
+    """Read and validate one exact local D3D11/D3D12 reflected CBV window."""
+    props = ctrl.GetAPIProperties()
+    api_name = str(getattr(props, "pipelineType", "") or "")
+    api_token = api_name.lower().replace("graphicsapi.", "").replace("direct3d", "d3d")
+    if api_token not in ("d3d11", "d3d12"):
+        raise RuntimeError("Event CBuffer snapshots require a D3D11 or D3D12 capture")
+    if bool(getattr(props, "remoteReplay", False)):
+        raise RuntimeError("Event CBuffer snapshots require local replay")
+
+    ctrl.SetFrameEvent(event_id, True)
+
+    def _find_action(actions):
+        for action in list(actions or []):
+            if _safe_int(getattr(action, "eventId", 0), 0) == event_id:
+                return action
+            found = _find_action(getattr(action, "children", None))
+            if found is not None:
+                return found
+        return None
+
+    action = None
+    flags = 0
+    get_root_actions = getattr(ctrl, "GetRootActions", None)
+    if callable(get_root_actions):
+        action = _find_action(get_root_actions())
+        flags = _safe_int(getattr(action, "flags", 0), 0) if action is not None else 0
+        replayable_mask = _action_flags_mask(
+            ("Drawcall", "Dispatch", "MeshDispatch"), 0x0002 | 0x0004 | 0x0008)
+        if action is None or not (flags & replayable_mask):
+            raise RuntimeError(
+                "Select an actual Draw, Dispatch, or MeshDispatch EID before editing a CBuffer")
+    # Older replay-controller bindings did not expose GetRootActions. In that case the bridge
+    # still binds the snapshot to the exact current EID and the native SetEventCBufferOverride
+    # performs the authoritative Draw/Dispatch validation before any mutation.
+
+    pipeline = ctrl.GetPipelineState()
+    shader_resource = pipeline.GetShader(stage)
+    shader_resource_id = _resource_id_int(shader_resource)
+    if shader_resource_id <= 0:
+        raise RuntimeError("The requested event/stage has no bound shader")
+
+    if api_token == "d3d11":
+        d3d11_stage = _d3d11_stage_state(ctrl, stage_name)
+        if d3d11_stage is None:
+            raise RuntimeError("D3D11 stage state is unavailable")
+        if _resource_id_int(getattr(d3d11_stage, "resourceId", None)) != shader_resource_id:
+            raise RuntimeError("D3D11 stage state does not match the pipeline shader")
+        if list(getattr(d3d11_stage, "classInstances", []) or []):
+            raise RuntimeError("Dynamic shader linkage is not supported by CBuffer snapshots")
+
+    entries = list(ctrl.GetShaderEntryPoints(shader_resource) or [])
+    try:
+        pipeline_entry = str(pipeline.GetShaderEntryPoint(stage) or "")
+    except Exception:
+        pipeline_entry = ""
+    selected_entry = None
+    if pipeline_entry:
+        for entry in entries:
+            if str(getattr(entry, "name", "") or "") == pipeline_entry:
+                selected_entry = entry
+                break
+        if selected_entry is None:
+            # Some D3D12 captures expose a normalised pipeline spelling such
+            # as ``main`` while reflection retains the container's canonical
+            # export name such as ``Main``. The Shader ResourceId is already
+            # exact, so accept only one unambiguous case-insensitive match and
+            # continue with that canonical name. Multiple matches remain
+            # fail-closed because HLSL symbol spelling is otherwise
+            # case-sensitive.
+            folded = [
+                entry for entry in entries
+                if str(getattr(entry, "name", "") or "").lower() ==
+                pipeline_entry.lower()
+            ]
+            if len(folded) == 1:
+                selected_entry = folded[0]
+                pipeline_entry = str(
+                    getattr(selected_entry, "name", "") or "")
+    elif len(entries) == 1:
+        selected_entry = entries[0]
+        pipeline_entry = str(getattr(selected_entry, "name", "") or "")
+    if selected_entry is None:
+        raise RuntimeError("The event's exact shader entry point is unavailable")
+
+    reflection = ctrl.GetShader(
+        _get_pipeline_obj(pipeline, ctrl), shader_resource, selected_entry)
+    if not reflection:
+        raise RuntimeError("The event's shader reflection is unavailable")
+    if list(getattr(reflection, "interfaces", []) or []):
+        raise RuntimeError("Dynamic linkage interfaces are not supported by CBuffer snapshots")
+    reflected_entry = str(
+        getattr(reflection, "entryPoint", "") or pipeline_entry)
+    if reflected_entry != pipeline_entry:
+        raise RuntimeError("The reflected shader entry point does not match the pipeline")
+    shader_raw = _shader_raw_bytes(reflection)
+    if not shader_raw:
+        raise RuntimeError("The captured shader's exact raw bytes are unavailable")
+    shader_raw_sha256 = hashlib.sha256(shader_raw).hexdigest()
+
+    blocks = list(getattr(reflection, "constantBlocks", []) or [])
+    if block_index < 0 or block_index >= len(blocks):
+        raise ValueError("block_index is outside the reflected constant-block array")
+    block = blocks[block_index]
+    if not bool(getattr(block, "bufferBacked", True)):
+        raise RuntimeError("The reflected constant block is not buffer-backed")
+    if bool(getattr(block, "inlineDataBytes", False)):
+        raise RuntimeError("Inline constant data is not supported by the CBuffer editor")
+    if bool(getattr(block, "compileConstants", False)):
+        raise RuntimeError("Compile-time constants are not supported by the CBuffer editor")
+    register_space = _safe_int(getattr(block, "fixedBindSetOrSpace", 0), 0)
+    bind_array_size = _safe_int(getattr(block, "bindArraySize", 1), 1)
+    slot = _safe_int(getattr(block, "fixedBindNumber", -1), -1)
+    if bind_array_size != 1 or slot < 0 or slot > 0xFFFFFFFF:
+        raise RuntimeError("The reflected block is not one fixed CBuffer binding")
+    if api_token == "d3d11" and (register_space != 0 or slot >= 14):
+        raise RuntimeError("The reflected block is not one fixed D3D11 b0-b13 binding")
+
+    # GetConstantBlock takes the reflection array index.  The setter below takes
+    # the independently reflected physical bN slot; these must never be confused.
+    binding = _get_constant_block_binding(pipeline, stage, block_index)
+    buffer_resource_id = _safe_int(binding.get("resourceId"), 0)
+    if buffer_resource_id <= 0:
+        raise RuntimeError("The reflected constant block is unbound at this event")
+    byte_offset = _safe_int(binding.get("byteOffset"), -1)
+    byte_size = _safe_int(binding.get("byteSize"), -1)
+    if api_token == "d3d12":
+        try:
+            d3d12_state = ctrl.GetD3D12PipelineState()
+            root_params = list(
+                getattr(getattr(d3d12_state, "rootSignature", None),
+                        "parameters", []) or [])
+        except Exception:
+            root_params = []
+        stage_index = _safe_int(stage, -1)
+        stage_mask = (1 << stage_index) if 0 <= stage_index < 16 else 0
+        root_cbv = False
+        for root_param in root_params:
+            descriptor = getattr(root_param, "descriptor", None)
+            descriptor_type = str(getattr(descriptor, "type", "") or "").lower()
+            visibility = _safe_int(getattr(root_param, "visibility", 0), 0)
+            if (stage_mask and visibility & stage_mask and
+                    _safe_int(getattr(root_param, "reg", -1), -1) == slot and
+                    _safe_int(getattr(root_param, "space", -1), -1) == register_space and
+                    "constantbuffer" in descriptor_type.replace("_", "") and
+                    _resource_id_int(getattr(descriptor, "resource", None)) ==
+                    buffer_resource_id and
+                    _safe_int(getattr(descriptor, "byteOffset", -1), -1) == byte_offset):
+                root_cbv = True
+                break
+        if root_cbv:
+            indirect_mask = _action_flags_mask(("Indirect",), 0x080000)
+            if flags & indirect_mask:
+                raise RuntimeError(
+                    "D3D12 ExecuteIndirect root-CBV editing is excluded because the command "
+                    "signature may overwrite the root descriptor during replay")
+            reflected_size = _safe_int(getattr(block, "byteSize", 0), 0)
+            reflected_size = (reflected_size + 15) & ~15
+            if reflected_size <= 0 or reflected_size > byte_size:
+                raise RuntimeError(
+                    "The reflected D3D12 root-CBV window is empty or outside its buffer")
+            byte_size = reflected_size
+    if (byte_offset < 0 or byte_size <= 0 or byte_offset % 16 != 0 or
+            byte_size % 16 != 0 or byte_size > 64 * 1024):
+        raise RuntimeError("The live CBuffer window is invalid or unsupported")
+    if api_token == "d3d12" and byte_offset % 256:
+        raise RuntimeError("The live D3D12 CBV offset is not 256-byte aligned")
+
+    buffer_resource = None
+    buffer_length = -1
+    for description in list(ctrl.GetBuffers() or []):
+        candidate = getattr(description, "resourceId", description)
+        if _resource_id_int(candidate) == buffer_resource_id:
+            buffer_resource = candidate
+            buffer_length = _safe_int(getattr(description, "length", -1), -1)
+            break
+    if buffer_resource is None or buffer_length < 0:
+        raise RuntimeError("The bound CBuffer is absent from GetBuffers")
+    if byte_offset >= buffer_length:
+        raise RuntimeError("The bound CBuffer window starts outside the buffer")
+    valid_byte_size = min(byte_size, buffer_length - byte_offset)
+    if (valid_byte_size <= 0 or valid_byte_size > 64 * 1024 or
+            valid_byte_size % 16 != 0):
+        raise RuntimeError("The complete valid CBuffer window is not 16-byte aligned")
+
+    raw_value = ctrl.GetBufferData(buffer_resource, byte_offset, valid_byte_size)
+    try:
+        raw_bytes = bytes(raw_value)
+    except Exception:
+        raw_bytes = bytearray(raw_value)
+    raw_bytes = bytes(raw_bytes)
+    if len(raw_bytes) != valid_byte_size:
+        raise RuntimeError("GetBufferData did not return the complete valid CBuffer window")
+
+    block_byte_size = _safe_int(getattr(block, "byteSize", 0), 0)
+    layout = _event_cbuffer_layout(block, block_index, stage_name)
+    leaves = _event_cbuffer_editable_leaves(
+        getattr(block, "variables", []), valid_byte_size, block_byte_size)
+    block_path = str(getattr(block, "name", "") or "cbuffer%d" % block_index)
+    block_display_name = _unique_validated_alias_display(
+        _matching_binding_aliases(
+            shader_resource_id, stage_name, reflected_entry, shader_raw_sha256,
+            "constantBuffer", slot, register_space)) or block_path
+    for leaf in leaves:
+        display_name = _unique_validated_alias_display(
+            _matching_binding_aliases(
+                shader_resource_id, stage_name, reflected_entry, shader_raw_sha256,
+                "constantField", slot, register_space, leaf["byteOffset"]))
+        if display_name:
+            # Display-only symbol overlays must never affect path, leafId, byte
+            # range, layout digest, or the patch allow-list.
+            leaf["displayName"] = display_name
+    return {
+        "eventId": event_id,
+        "stageName": stage_name,
+        "stageObject": stage,
+        "blockIndex": block_index,
+        "constantBlockPath": block_path,
+        "constantBlockName": block_path,
+        "constantBlockDisplayName": block_display_name,
+        "slot": slot,
+        "registerSpace": register_space,
+        "api": api_token,
+        "shaderResource": shader_resource,
+        "shaderResourceId": shader_resource_id,
+        "shaderRawSha256": shader_raw_sha256,
+        "entryPoint": reflected_entry,
+        "bufferResource": buffer_resource,
+        "bufferResourceId": buffer_resource_id,
+        "bufferLength": buffer_length,
+        "byteOffset": byte_offset,
+        "byteSize": byte_size,
+        "validByteSize": valid_byte_size,
+        "rawBytes": raw_bytes,
+        "rawSha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "layoutSha256": _canonical_json_sha256(layout),
+        "fields": leaves,
+    }
+
+
+def _event_cbuffer_snapshot_response(record):
+    return {
+        "schema": "renderdoc-ultra-event-cbuffer-snapshot/v1",
+        "schemaVersion": 1,
+        "snapshotId": record["snapshotId"],
+        "captureId": record["captureId"],
+        "captureSessionId": record["captureSessionId"],
+        "api": record["api"],
+        "eventId": record["eventId"],
+        "stage": record["stageName"],
+        "blockIndex": record["blockIndex"],
+        "constantBlockPath": record["constantBlockPath"],
+        "constantBlockName": record["constantBlockName"],
+        "constantBlockDisplayName": record["constantBlockDisplayName"],
+        "slot": record["slot"],
+        "registerSpace": record["registerSpace"],
+        "shaderResourceId": record["shaderResourceId"],
+        "bufferResourceId": record["bufferResourceId"],
+        "byteOffset": record["byteOffset"],
+        "byteSize": record["byteSize"],
+        "validByteSize": record["validByteSize"],
+        "rawBase64": base64.b64encode(record["baselineBytes"]).decode("ascii"),
+        "rawSha256": record["baselineRawSha256"],
+        "layoutSha256": record["layoutSha256"],
+        "fields": list(record["fields"]),
+    }
+
+
+def _snapshot_event_cbuffer(params):
+    """Capture one immutable, reflected D3D11/D3D12 CBuffer binding window."""
+    global _event_cbuffer_capture_token
+
+    capture_id = _require_capture_identity(params.get("expected_capture_id"))
+    capture_token = _current_capture_token()
+    if (_event_cbuffer_capture_token is not None and
+            _event_cbuffer_capture_token != capture_token):
+        _forget_event_cbuffer_snapshots()
+
+    event_id = _safe_int(params.get("event_id"), 0)
+    block_index = _safe_int(params.get("block_index"), -1)
+    if event_id <= 0:
+        raise ValueError("event_id must be a positive integer")
+    if block_index < 0:
+        raise ValueError("block_index must be a non-negative reflection array index")
+    stage_name = _normalise_stage_name(params.get("stage", ""))
+    stage_map = dict(_available_shader_stages([stage_name]))
+    stage = stage_map.get(stage_name)
+    if stage is None or stage_name not in (
+            "vertex", "hull", "domain", "geometry", "fragment", "compute",
+            "task", "mesh"):
+        raise ValueError("Unsupported D3D11/D3D12 shader stage: %s" % stage_name)
+
+    try:
+        original_event = _safe_int(_ctx.CurEvent(), 0)
+    except Exception:
+        original_event = 0
+
+    def _do(ctrl):
+        try:
+            return _event_cbuffer_live_state(
+                ctrl, event_id, stage_name, stage, block_index)
+        finally:
+            if original_event > 0 and original_event != event_id:
+                ctrl.SetFrameEvent(original_event, True)
+
+    state = _replay(_do)
+    key = (event_id, stage_name, state["slot"], state["registerSpace"])
+    old_snapshot_id = _event_cbuffer_snapshot_keys.get(key)
+    if old_snapshot_id:
+        old_record = _event_cbuffer_snapshots.get(old_snapshot_id)
+        if old_record:
+            raise RuntimeError(
+                "This event/stage/slot/register-space already has a bridge-owned CBuffer snapshot; "
+                "rollback it before taking another snapshot")
+        _event_cbuffer_snapshot_keys.pop(key, None)
+    if len(_event_cbuffer_snapshots) >= MAX_EVENT_CBUFFER_SNAPSHOTS:
+        raise RuntimeError(
+            "The active capture reached the %d CBuffer snapshot limit" %
+            MAX_EVENT_CBUFFER_SNAPSHOTS)
+
+    snapshot_id = uuid.uuid4().hex
+    record = {
+        "snapshotId": snapshot_id,
+        "captureId": capture_id,
+        "captureSessionId": _capture_session_id,
+        "captureToken": capture_token,
+        "api": state["api"],
+        "eventId": event_id,
+        "stageName": stage_name,
+        "stageObject": stage,
+        "blockIndex": block_index,
+        "constantBlockPath": state["constantBlockPath"],
+        "constantBlockName": state["constantBlockName"],
+        "constantBlockDisplayName": state["constantBlockDisplayName"],
+        "slot": state["slot"],
+        "registerSpace": state["registerSpace"],
+        "shaderResourceId": state["shaderResourceId"],
+        "shaderRawSha256": state["shaderRawSha256"],
+        "entryPoint": state["entryPoint"],
+        "bufferResourceId": state["bufferResourceId"],
+        "bufferLength": state["bufferLength"],
+        "byteOffset": state["byteOffset"],
+        "byteSize": state["byteSize"],
+        "validByteSize": state["validByteSize"],
+        "baselineBytes": state["rawBytes"],
+        "baselineRawSha256": state["rawSha256"],
+        "layoutSha256": state["layoutSha256"],
+        "fields": state["fields"],
+        "fieldsById": dict((leaf["leafId"], leaf) for leaf in state["fields"]),
+        "overrideId": None,
+        "revision": 0,
+        "currentBytes": state["rawBytes"],
+        "currentRawSha256": state["rawSha256"],
+    }
+    _event_cbuffer_snapshots[snapshot_id] = record
+    _event_cbuffer_snapshot_keys[key] = snapshot_id
+    _event_cbuffer_capture_token = capture_token
+    return _event_cbuffer_snapshot_response(record)
+
+
+def _require_event_cbuffer_record(params):
+    snapshot_id = _event_cbuffer_snapshot_id(params.get("snapshot_id"))
+    record = _event_cbuffer_snapshots.get(snapshot_id)
+    if record is None:
+        raise ValueError("Unknown or expired event CBuffer snapshot ID")
+    capture_id = _require_capture_identity(params.get("expected_capture_id"))
+    capture_session_id = _require_capture_session_id(
+        params.get("expected_capture_session_id"))
+    if record.get("captureId") != capture_id:
+        raise RuntimeError("The CBuffer snapshot belongs to a different catalog identity")
+    if (record.get("captureSessionId") != capture_session_id or
+            record.get("captureToken") != _current_capture_token()):
+        _forget_event_cbuffer_snapshots()
+        raise RuntimeError("The CBuffer snapshot belongs to a different capture lifecycle")
+    return snapshot_id, record
+
+
+def _validate_event_cbuffer_patches(record, patches):
+    if not isinstance(patches, list):
+        raise ValueError("patches must be a cumulative array")
+    if len(patches) > len(record["fieldsById"]):
+        raise ValueError("patches contains more entries than editable reflected leaves")
+
+    rebuilt = bytearray(record["baselineBytes"])
+    seen = set()
+    for index, patch in enumerate(patches):
+        if not isinstance(patch, dict):
+            raise ValueError("patches[%d] must be an object" % index)
+        unknown = set(patch.keys()) - set(("leafId", "packedBase64"))
+        if unknown:
+            raise ValueError("patches[%d] contains unsupported keys" % index)
+        leaf_id = _shader_override_hex(
+            patch.get("leafId"), "patches[%d].leafId" % index, 32)
+        if leaf_id in seen:
+            raise ValueError("patches contains a duplicate leafId")
+        seen.add(leaf_id)
+        leaf = record["fieldsById"].get(leaf_id)
+        if leaf is None:
+            raise ValueError("patches references a leaf not issued by this snapshot")
+        packed = _strict_base64_bytes(
+            patch.get("packedBase64"), "patches[%d].packedBase64" % index,
+            leaf["byteSize"])
+        if len(packed) != leaf["byteSize"]:
+            raise ValueError("A packed leaf does not match its reflected byte size")
+        if leaf["baseType"] == "Float":
+            values = struct.unpack("<%df" % leaf["components"], packed)
+            if any(not math.isfinite(value) for value in values):
+                raise ValueError("Float CBuffer patches must contain only finite values")
+        start = leaf["byteOffset"]
+        rebuilt[start:start + leaf["byteSize"]] = packed
+    return bytes(rebuilt)
+
+
+def _expire_event_cbuffer_record(snapshot_id, record):
+    key = (record["eventId"], record["stageName"], record["slot"],
+           record["registerSpace"])
+    _event_cbuffer_snapshots.pop(snapshot_id, None)
+    if _event_cbuffer_snapshot_keys.get(key) == snapshot_id:
+        _event_cbuffer_snapshot_keys.pop(key, None)
+
+
+def _record_event_cbuffer_release(record):
+    """Keep a bounded capture-local tombstone for idempotent rollback/status."""
+    global _event_cbuffer_release_serial
+    _event_cbuffer_release_serial += 1
+    snapshot_id = record["snapshotId"]
+    _event_cbuffer_released_snapshots[snapshot_id] = {
+        "snapshotId": snapshot_id,
+        "overrideId": record.get("overrideId"),
+        "captureId": record["captureId"],
+        "captureSessionId": record["captureSessionId"],
+        "captureToken": record["captureToken"],
+        "api": record["api"],
+        "eventId": record["eventId"],
+        "stageName": record["stageName"],
+        "blockIndex": record["blockIndex"],
+        "slot": record["slot"],
+        "registerSpace": record["registerSpace"],
+        "revision": record["revision"],
+        "baselineRawSha256": record["baselineRawSha256"],
+        "currentRawSha256": record["currentRawSha256"],
+        "layoutSha256": record["layoutSha256"],
+        "releaseSerial": _event_cbuffer_release_serial,
+    }
+    while len(_event_cbuffer_released_snapshots) > MAX_EVENT_CBUFFER_RELEASED_SNAPSHOTS:
+        oldest_id = min(
+            _event_cbuffer_released_snapshots,
+            key=lambda value: _event_cbuffer_released_snapshots[value]["releaseSerial"])
+        _event_cbuffer_released_snapshots.pop(oldest_id, None)
+
+
+def _apply_event_cbuffer_override(params):
+    """Apply a cumulative allow-listed patch set to one immutable snapshot."""
+    snapshot_id, record = _require_event_cbuffer_record(params)
+    expected_raw_sha256 = _shader_override_hex(
+        params.get("expected_raw_sha256"), "expected_raw_sha256", 64)
+    expected_layout_sha256 = _shader_override_hex(
+        params.get("expected_layout_sha256"), "expected_layout_sha256", 64)
+    if expected_raw_sha256 != record["currentRawSha256"]:
+        raise RuntimeError("The CBuffer editor revision is stale")
+    if expected_layout_sha256 != record["layoutSha256"]:
+        raise RuntimeError("The reflected CBuffer layout digest changed")
+
+    expected_revision = _safe_int(params.get("expected_revision"), -1)
+    new_revision = _safe_int(params.get("new_revision"), -1)
+    if expected_revision != record["revision"]:
+        raise RuntimeError("The CBuffer editor revision is stale")
+    if new_revision != expected_revision + 1:
+        raise ValueError("new_revision must equal expected_revision + 1")
+
+    expected_override_id = str(params.get("expected_override_id", "") or "").strip().lower()
+    current_override_id = str(record.get("overrideId") or "")
+    if expected_override_id:
+        expected_override_id = _shader_override_hex(
+            expected_override_id, "expected_override_id", 32)
+    if expected_override_id != current_override_id:
+        raise RuntimeError("The active CBuffer override ID changed")
+
+    data = _strict_base64_bytes(
+        params.get("data_base64"), "data_base64", 64 * 1024)
+    if len(data) != record["validByteSize"]:
+        raise ValueError("data_base64 must contain the complete valid bound window")
+    data_sha256 = _shader_override_hex(
+        params.get("data_sha256"), "data_sha256", 64)
+    if hashlib.sha256(data).hexdigest() != data_sha256:
+        raise ValueError("data_base64 does not match data_sha256")
+    rebuilt = _validate_event_cbuffer_patches(record, params.get("patches"))
+    if rebuilt != data:
+        raise ValueError(
+            "data_base64 is not exactly the immutable baseline plus the cumulative patches")
+
+    old_override_id = record.get("overrideId")
+    old_data = record["currentBytes"]
+    override_id = old_override_id or uuid.uuid4().hex
+    restoration_failed = [False]
+
+    def _do(ctrl):
+        setter_called = False
+        state = _event_cbuffer_live_state(
+            ctrl, record["eventId"], record["stageName"],
+            record["stageObject"], record["blockIndex"])
+        comparisons = (
+            ("slot", state["slot"], record["slot"]),
+            ("register space", state["registerSpace"], record["registerSpace"]),
+            ("shader resource", state["shaderResourceId"], record["shaderResourceId"]),
+            ("shader bytes", state["shaderRawSha256"], record["shaderRawSha256"]),
+            ("entry point", state["entryPoint"], record["entryPoint"]),
+            ("buffer resource", state["bufferResourceId"], record["bufferResourceId"]),
+            ("buffer length", state["bufferLength"], record["bufferLength"]),
+            ("byte offset", state["byteOffset"], record["byteOffset"]),
+            ("byte size", state["byteSize"], record["byteSize"]),
+            ("valid byte size", state["validByteSize"], record["validByteSize"]),
+            ("layout", state["layoutSha256"], record["layoutSha256"]),
+            ("captured raw bytes", state["rawSha256"], record["baselineRawSha256"]),
+        )
+        for label, current, expected in comparisons:
+            if current != expected:
+                raise RuntimeError("The live CBuffer %s changed since snapshot" % label)
+        if [leaf["leafId"] for leaf in state["fields"]] != [
+                leaf["leafId"] for leaf in record["fields"]]:
+            raise RuntimeError("The editable CBuffer leaf allow-list changed since snapshot")
+
+        try:
+            setter_called = True
+            error = ctrl.SetEventCBufferOverride(
+                record["eventId"], record["stageObject"], record["slot"],
+                state["shaderResource"], state["bufferResource"],
+                record["byteOffset"], record["byteSize"], data,
+                record["registerSpace"])
+            if str(error or ""):
+                raise RuntimeError("SetEventCBufferOverride failed: %s" % str(error))
+        except Exception as apply_error:
+            if setter_called:
+                restored = False
+                try:
+                    if old_override_id:
+                        restore_error = ctrl.SetEventCBufferOverride(
+                            record["eventId"], record["stageObject"], record["slot"],
+                            state["shaderResource"], state["bufferResource"],
+                            record["byteOffset"], record["byteSize"], old_data,
+                            record["registerSpace"])
+                        restored = not str(restore_error or "")
+                    else:
+                        ctrl.ClearEventCBufferOverride(
+                            record["eventId"], record["stageObject"], record["slot"],
+                            record["registerSpace"])
+                        restored = True
+                except Exception:
+                    restored = False
+                if not restored:
+                    restoration_failed[0] = True
+                    raise RuntimeError(
+                        "%s; restoring the previous CBuffer configuration failed and "
+                        "the snapshot was expired" % str(apply_error))
+            raise
+        return True
+
+    try:
+        _replay(_do)
+    except Exception:
+        if restoration_failed[0]:
+            _expire_event_cbuffer_record(snapshot_id, record)
+        raise
+
+    record["overrideId"] = override_id
+    record["revision"] = new_revision
+    record["currentBytes"] = data
+    record["currentRawSha256"] = data_sha256
+    return {
+        "schema": "renderdoc-ultra-event-cbuffer-override/v1",
+        "schemaVersion": 1,
+        "snapshotId": snapshot_id,
+        "overrideId": override_id,
+        "captureId": record["captureId"],
+        "captureSessionId": record["captureSessionId"],
+        "api": record["api"],
+        "eventId": record["eventId"],
+        "stage": record["stageName"],
+        "blockIndex": record["blockIndex"],
+        "slot": record["slot"],
+        "registerSpace": record["registerSpace"],
+        "revision": new_revision,
+        "currentRawSha256": data_sha256,
+        "layoutSha256": record["layoutSha256"],
+        "configured": True,
+        "appliedToCurrentEvent": True,
+    }
+
+
+def _rollback_event_cbuffer_override(params):
+    """Clear one exact override and release its immutable snapshot."""
+    global _event_cbuffer_capture_token
+    snapshot_id = _event_cbuffer_snapshot_id(params.get("snapshot_id"))
+    requested_override_id = str(params.get("override_id", "") or "").strip().lower()
+    if requested_override_id:
+        requested_override_id = _shader_override_hex(
+            requested_override_id, "override_id", 32)
+
+    record = _event_cbuffer_snapshots.get(snapshot_id)
+    if record is None:
+        released = _event_cbuffer_released_snapshots.get(snapshot_id)
+        if released is None:
+            raise ValueError("Unknown or expired event CBuffer snapshot ID")
+        capture_id = _require_capture_identity(params.get("expected_capture_id"))
+        capture_session_id = _require_capture_session_id(
+            params.get("expected_capture_session_id"))
+        if released.get("captureId") != capture_id:
+            raise RuntimeError("The CBuffer snapshot belongs to a different catalog identity")
+        if (released.get("captureSessionId") != capture_session_id or
+                released.get("captureToken") != _current_capture_token()):
+            _forget_event_cbuffer_snapshots()
+            raise RuntimeError("The CBuffer snapshot belongs to a different capture lifecycle")
+        released_override_id = str(released.get("overrideId") or "")
+        if requested_override_id and requested_override_id != released_override_id:
+            raise RuntimeError("The requested CBuffer override ID was never owned by this snapshot")
+        return {
+            "schema": "renderdoc-ultra-event-cbuffer-override/v1",
+            "schemaVersion": 1,
+            "snapshotId": snapshot_id,
+            "overrideId": released.get("overrideId"),
+            "captureId": released["captureId"],
+            "captureSessionId": released["captureSessionId"],
+            "api": released["api"],
+            "eventId": released["eventId"],
+            "stage": released["stageName"],
+            "blockIndex": released["blockIndex"],
+            "slot": released["slot"],
+            "registerSpace": released["registerSpace"],
+            "revision": released["revision"],
+            "currentRawSha256": released["currentRawSha256"],
+            "cleared": False,
+            "alreadyReleased": True,
+            "snapshotReleased": True,
+            "configured": False,
+        }
+
+    # Validate the active record only after handling the bounded idempotency tombstone.
+    snapshot_id, record = _require_event_cbuffer_record(params)
+    active_override_id = str(record.get("overrideId") or "")
+    if requested_override_id and requested_override_id != active_override_id:
+        raise RuntimeError("The requested CBuffer override ID is not active")
+
+    if active_override_id:
+        def _do(ctrl):
+            ctrl.ClearEventCBufferOverride(
+                record["eventId"], record["stageObject"], record["slot"],
+                record["registerSpace"])
+        _replay(_do)
+    _record_event_cbuffer_release(record)
+    _expire_event_cbuffer_record(snapshot_id, record)
+    if not _event_cbuffer_snapshots:
+        _event_cbuffer_capture_token = None
+    return {
+        "schema": "renderdoc-ultra-event-cbuffer-override/v1",
+        "schemaVersion": 1,
+        "snapshotId": snapshot_id,
+        "overrideId": record.get("overrideId"),
+        "captureId": record["captureId"],
+        "captureSessionId": record["captureSessionId"],
+        "api": record["api"],
+        "eventId": record["eventId"],
+        "stage": record["stageName"],
+        "blockIndex": record["blockIndex"],
+        "slot": record["slot"],
+        "registerSpace": record["registerSpace"],
+        "revision": record["revision"],
+        "currentRawSha256": record["currentRawSha256"],
+        "cleared": bool(active_override_id),
+        "alreadyReleased": False,
+        "snapshotReleased": True,
+        "configured": False,
+    }
+
+
+def _get_event_cbuffer_override_status(params):
+    snapshot_id, record = _require_event_cbuffer_record(params)
+    return {
+        "schema": "renderdoc-ultra-event-cbuffer-override/v1",
+        "schemaVersion": 1,
+        "snapshotId": snapshot_id,
+        "overrideId": record.get("overrideId"),
+        "captureId": record["captureId"],
+        "captureSessionId": record["captureSessionId"],
+        "api": record["api"],
+        "eventId": record["eventId"],
+        "stage": record["stageName"],
+        "blockIndex": record["blockIndex"],
+        "slot": record["slot"],
+        "registerSpace": record["registerSpace"],
+        "revision": record["revision"],
+        "baselineRawSha256": record["baselineRawSha256"],
+        "currentRawSha256": record["currentRawSha256"],
+        "layoutSha256": record["layoutSha256"],
+        "configured": bool(record.get("overrideId")),
+    }
+
+
+def _clear_all_event_cbuffer_snapshots(params):
+    """Explicit recovery: clear every bridge-owned CBuffer shadow/snapshot."""
+    capture_id = _require_capture_identity(params.get("expected_capture_id"))
+    capture_session_id = _require_capture_session_id(
+        params.get("expected_capture_session_id"))
+    capture_token = _current_capture_token()
+    if (_event_cbuffer_capture_token is not None and
+            _event_cbuffer_capture_token != capture_token):
+        _forget_event_cbuffer_snapshots()
+        raise RuntimeError("The CBuffer snapshots belong to a different capture lifecycle")
+
+    snapshot_count = len(_event_cbuffer_snapshots)
+    override_count = sum(
+        1 for record in _event_cbuffer_snapshots.values()
+        if record.get("overrideId"))
+
+    def _do(ctrl):
+        props = ctrl.GetAPIProperties()
+        api_name = str(getattr(props, "pipelineType", "") or "")
+        api_token = api_name.lower().replace("graphicsapi.", "").replace(
+            "direct3d", "d3d")
+        if api_token not in ("d3d11", "d3d12"):
+            raise RuntimeError(
+                "Clearing event CBuffers requires a D3D11 or D3D12 capture")
+        if bool(getattr(props, "remoteReplay", False)):
+            raise RuntimeError("Clearing event CBuffers requires local replay")
+        ctrl.ClearEventCBufferOverrides()
+
+    _replay(_do)
+    _forget_event_cbuffer_snapshots()
+    return {
+        "schema": "renderdoc-ultra-event-cbuffer-clear-all/v1",
+        "schemaVersion": 1,
+        "captureId": capture_id,
+        "captureSessionId": capture_session_id,
+        "clearedOverrideCount": override_count,
+        "releasedSnapshotCount": snapshot_count,
+        "cleared": True,
+    }
+
+
+def _export_shader_catalog(params):
+    """Export an exact, versioned shader/reflection/binding snapshot for asset matching.
+
+    Request fields:
+      output_dir: required destination directory.
+      event_ids: optional list or comma-separated string. If omitted/empty, all draw/dispatch
+                 actions are visited.
+      stages: optional shader-stage list. Defaults to every stage available in this RenderDoc.
+    """
+    if not _ctx or not _ctx.IsCaptureLoaded():
+        raise RuntimeError("No capture loaded")
+
+    expected_capture_id = str(
+        params.get("expected_capture_id", "") or "").strip()
+    expected_identity_sha256 = str(
+        params.get("expected_identity_evidence_sha256", "") or "").strip()
+    if bool(expected_capture_id) != bool(expected_identity_sha256):
+        raise ValueError(
+            "expected_capture_id and expected_identity_evidence_sha256 must "
+            "be supplied together")
+    if expected_capture_id:
+        if (len(expected_capture_id) != 64 or
+                any(character not in "0123456789abcdef"
+                    for character in expected_capture_id)):
+            raise ValueError("expected_capture_id must be a lowercase SHA-256")
+        if (len(expected_identity_sha256) != 64 or
+                any(character not in "0123456789abcdef"
+                    for character in expected_identity_sha256)):
+            raise ValueError(
+                "expected_identity_evidence_sha256 must be a lowercase SHA-256")
+
+    output_dir = str(params.get("output_dir", "") or "").strip()
+    if not output_dir:
+        raise ValueError("output_dir required")
+    output_dir = os.path.abspath(os.path.expanduser(output_dir))
+    blob_dir = os.path.join(output_dir, "blobs")
+
+    requested_event_ids = _parse_catalog_event_ids(
+        params.get("event_ids", params.get("eventIds")))
+    if requested_event_ids == []:
+        requested_event_ids = None
+    stages = _available_shader_stages(params.get("stages"))
+    if not stages:
+        raise ValueError("No valid shader stages requested")
+    progress_binding = _shader_catalog_progress_binding(params)
+
+    try:
+        original_event = _safe_int(_ctx.CurEvent(), 0)
+        restore_original_event = True
+    except Exception:
+        original_event = 0
+        restore_original_event = False
+    try:
+        capture_path = str(_ctx.GetCaptureFilename())
+    except Exception:
+        capture_path = ""
+
+    def _do(ctrl):
+        action_info = {}
+
+        def _collect_actions(actions):
+            for action in actions:
+                event_id = _safe_int(getattr(action, "eventId", 0), 0)
+                action_info[event_id] = {
+                    "name": str(getattr(action, "customName", "") or
+                                "Action %d" % _safe_int(getattr(action, "actionId", 0), 0)),
+                    "flags": _safe_int(getattr(action, "flags", 0), 0),
+                }
+                children = getattr(action, "children", None)
+                if children:
+                    _collect_actions(children)
+
+        _collect_actions(ctrl.GetRootActions())
+
+        if requested_event_ids is not None:
+            event_ids = requested_event_ids
+            selection = "explicit"
+        else:
+            action_mask = 0
+            for flag_name in ("Drawcall", "Dispatch", "MeshDispatch", "DispatchRay"):
+                action_mask |= _safe_int(getattr(rd.ActionFlags, flag_name, 0), 0)
+            # Stable values from ActionFlags are a fallback for older Python bindings.
+            if not action_mask:
+                action_mask = 0x0002 | 0x0004 | 0x0008 | 0x4000
+            event_ids = [eid for eid, info in sorted(action_info.items())
+                         if info["flags"] & action_mask]
+            selection = "all_draw_dispatch"
+
+        catalog = {
+            "schema": SYMBOL_CATALOG_SCHEMA,
+            "schemaVersion": SYMBOL_CATALOG_VERSION,
+            "capturePath": capture_path,
+            "capture": {
+                "path": capture_path,
+            },
+            "selection": {
+                "mode": selection,
+                "eventIds": event_ids,
+                "stages": [name for name, unused_stage in stages],
+            },
+            "shaders": [],
+            "uses": [],
+            "errors": [],
+        }
+
+        try:
+            props = ctrl.GetAPIProperties()
+            api_name = str(getattr(props, "pipelineType", ""))
+            catalog["api"] = api_name
+            catalog["capture"]["api"] = api_name
+            catalog["capture"]["renderer"] = str(getattr(props, "localRenderer", ""))
+        except Exception as exc:
+            catalog["errors"].append({"scope": "capture", "message": str(exc)})
+        try:
+            frame_info = ctrl.GetFrameInfo()
+            catalog["capture"]["frameNumber"] = _safe_int(
+                getattr(frame_info, "frameNumber", 0), 0)
+        except Exception:
+            pass
+
+        blobs = {}
+        unique_shaders = {}
+        # These caches deliberately live only for this one replay-thread export.  RenderDoc
+        # reflection/entry-point objects must never survive a capture or replay session.  The
+        # reflection cache key includes every live input to GetShader so a pipeline, stage, or
+        # selected-entry change cannot reuse incompatible ABI/layout evidence.
+        shader_entry_points_cache = {}
+        shader_details_cache = {}
+        try:
+            for progress_current, event_id in enumerate(event_ids, 1):
+                try:
+                    ctrl.SetFrameEvent(int(event_id), True)
+                    ps = ctrl.GetPipelineState()
+                    pipeline_id = _get_pipeline_obj(ps, ctrl)
+                    pipeline_resource_id = _resource_id_int(pipeline_id)
+                except Exception as exc:
+                    catalog["errors"].append({
+                        "eventId": event_id, "scope": "pipeline", "message": str(exc)})
+                    _publish_shader_catalog_progress(
+                        progress_binding, event_id, progress_current, len(event_ids))
+                    continue
+
+                action = action_info.get(event_id, {})
+                for stage_name, stage in stages:
+                    try:
+                        shader_id = ps.GetShader(stage)
+                        shader_resource_id = _resource_id_int(shader_id)
+                        if not shader_resource_id:
+                            continue
+
+                        if shader_resource_id not in shader_entry_points_cache:
+                            shader_entry_points_cache[shader_resource_id] = tuple(
+                                ctrl.GetShaderEntryPoints(shader_id) or [])
+                        entries = shader_entry_points_cache[shader_resource_id]
+                        if not entries:
+                            catalog["errors"].append({
+                                "eventId": event_id, "stage": stage_name,
+                                "scope": "entry", "message": "No shader entry points"})
+                            continue
+
+                        selected_entry = entries[0]
+                        try:
+                            pipeline_entry = str(ps.GetShaderEntryPoint(stage))
+                            for candidate in entries:
+                                if str(getattr(candidate, "name", "")) == pipeline_entry:
+                                    selected_entry = candidate
+                                    break
+                        except Exception:
+                            pass
+
+                        selected_entry_name = str(
+                            getattr(selected_entry, "name", "") or "")
+                        details_key = (
+                            pipeline_resource_id,
+                            shader_resource_id,
+                            stage_name,
+                            selected_entry_name,
+                        )
+                        shader_details = shader_details_cache.get(details_key)
+                        if shader_details is None:
+                            reflection = ctrl.GetShader(
+                                pipeline_id, shader_id, selected_entry)
+                            if not reflection:
+                                catalog["errors"].append({
+                                    "eventId": event_id, "stage": stage_name,
+                                    "scope": "reflection",
+                                    "message": "No shader reflection"})
+                                continue
+
+                            entry_point = str(
+                                getattr(reflection, "entryPoint", "") or
+                                selected_entry_name)
+                            raw_bytes = _shader_raw_bytes(reflection)
+                            raw_sha256 = (
+                                hashlib.sha256(raw_bytes).hexdigest()
+                                if raw_bytes else None)
+                            blob_path = (
+                                "blobs/%s.bin" % raw_sha256
+                                if raw_sha256 else None)
+                            if raw_sha256 and raw_sha256 not in blobs:
+                                blobs[raw_sha256] = raw_bytes
+
+                            shader_key = "%d:%s:%s:%s" % (
+                                shader_resource_id, stage_name, entry_point,
+                                raw_sha256 or "no-raw-bytes")
+
+                            dxil_layout_evidence = {}
+                            if _physical_enum(
+                                    getattr(reflection, "encoding", "")) == "dxil":
+                                try:
+                                    unused_access, dxil_layout_evidence = (
+                                        _dxil_evidence_from_live_disassembly(
+                                            ctrl, pipeline_id, reflection))
+                                except RuntimeError as exc:
+                                    dxil_layout_evidence = (
+                                        _dxil_layout_evidence_for_all_blocks(
+                                            reflection, "unavailable"))
+                                    catalog["errors"].append({
+                                        "eventId": event_id,
+                                        "stage": stage_name,
+                                        "scope": "dxil-cbuffer-layout-evidence",
+                                        "message": str(exc),
+                                    })
+
+                            reflected_blocks = []
+                            for block_index, cb in enumerate(
+                                    getattr(reflection, "constantBlocks", [])):
+                                block_evidence = dxil_layout_evidence.get(
+                                    _constant_block_binding_key(cb, block_index))
+                                reflected_blocks.append(_constant_block_dict(
+                                    cb, block_index,
+                                    layout_evidence=block_evidence))
+
+                            shader_details = {
+                                "entryPoint": entry_point,
+                                "rawBytes": raw_bytes,
+                                "rawSha256": raw_sha256,
+                                "blobPath": blob_path,
+                                "shaderKey": shader_key,
+                                "encoding": str(getattr(
+                                    reflection, "encoding", "")),
+                                "reflectedBlocks": reflected_blocks,
+                                "inputSignature": [
+                                    _signature_parameter_dict(value)
+                                    for value in getattr(
+                                        reflection, "inputSignature", [])
+                                ],
+                                "outputSignature": [
+                                    _signature_parameter_dict(value)
+                                    for value in getattr(
+                                        reflection, "outputSignature", [])
+                                ],
+                                "readOnlyResources": [
+                                    _shader_binding_dict(value)
+                                    for value in getattr(
+                                        reflection, "readOnlyResources", [])
+                                ],
+                                "readWriteResources": [
+                                    _shader_binding_dict(value)
+                                    for value in getattr(
+                                        reflection, "readWriteResources", [])
+                                ],
+                                "samplers": [
+                                    _shader_sampler_dict(value)
+                                    for value in getattr(reflection, "samplers", [])
+                                ],
+                                "dynamicLinkageInterfaceCount": len(
+                                    getattr(reflection, "interfaces", []) or []),
+                                "outputTopology": str(
+                                    getattr(reflection, "outputTopology", "") or ""),
+                                "threadGroupSize": _thread_group_size(reflection),
+                            }
+                            shader_details_cache[details_key] = shader_details
+
+                        entry_point = shader_details["entryPoint"]
+                        raw_bytes = shader_details["rawBytes"]
+                        raw_sha256 = shader_details["rawSha256"]
+                        blob_path = shader_details["blobPath"]
+                        shader_key = shader_details["shaderKey"]
+                        reflected_blocks = shader_details["reflectedBlocks"]
+
+                        # Binding identity is event state, so it is intentionally never cached.
+                        # Reuse only the already-serialised reflection layout and attach the
+                        # exact resource/range returned for this event.
+                        bound_blocks = []
+                        for block_index, reflected_block in enumerate(reflected_blocks):
+                            binding = _get_constant_block_binding(
+                                ps, stage, block_index)
+                            bound_block = dict(reflected_block)
+                            bound_block["binding"] = binding
+                            bound_blocks.append(bound_block)
+
+                        if shader_key not in unique_shaders:
+                            shader_record = {
+                                "shaderKey": shader_key,
+                                "resourceId": shader_resource_id,
+                                "shaderResourceId": shader_resource_id,
+                                "stage": stage_name,
+                                "entry": entry_point,
+                                "entryPoint": entry_point,
+                                "encoding": shader_details["encoding"],
+                                "rawSha256": raw_sha256,
+                                "rawSize": len(raw_bytes),
+                                "blob": blob_path,
+                                "rawPath": blob_path,
+                                "constantBlocks": reflected_blocks,
+                                # Reflection is the authoritative compiled interface. Names are
+                                # retained for display but the external interface hash excludes
+                                # non-ABI resource/variable names.
+                                "interfaceComplete": not any(
+                                    block.get("layoutCompleteness") == "ambiguous"
+                                    for block in reflected_blocks),
+                                "inputSignature": [
+                                    value for value in shader_details["inputSignature"]
+                                ],
+                                "outputSignature": [
+                                    value for value in shader_details["outputSignature"]
+                                ],
+                                "readOnlyResources": [
+                                    value for value in shader_details["readOnlyResources"]
+                                ],
+                                "readWriteResources": [
+                                    value for value in shader_details["readWriteResources"]
+                                ],
+                                "samplers": [
+                                    value for value in shader_details["samplers"]
+                                ],
+                                "dynamicLinkageInterfaceCount": shader_details[
+                                    "dynamicLinkageInterfaceCount"],
+                                "outputTopology": shader_details["outputTopology"],
+                                "threadGroupSize": shader_details["threadGroupSize"],
+                            }
+                            aliases = _matching_shader_aliases(
+                                shader_resource_id, stage_name, entry_point, raw_sha256)
+                            if aliases:
+                                shader_record["alias"] = aliases[0]
+                                shader_record["displayName"] = _alias_display_name(aliases[0])
+                            unique_shaders[shader_key] = shader_record
+
+                        use_record = {
+                            "eventId": event_id,
+                            "actionName": action.get("name", ""),
+                            "actionFlags": action.get("flags", 0),
+                            "stage": stage_name,
+                            "entry": entry_point,
+                            "entryPoint": entry_point,
+                            "resourceId": shader_resource_id,
+                            "rawSha256": raw_sha256,
+                            "shaderKey": shader_key,
+                            "constantBlocks": bound_blocks,
+                        }
+                        catalog["uses"].append(use_record)
+                    except Exception as exc:
+                        catalog["errors"].append({
+                            "eventId": event_id, "stage": stage_name,
+                            "scope": "shader", "message": str(exc)})
+                _publish_shader_catalog_progress(
+                    progress_binding, event_id, progress_current, len(event_ids))
+        finally:
+            if restore_original_event:
+                try:
+                    ctrl.SetFrameEvent(original_event, True)
+                except Exception as exc:
+                    catalog["errors"].append({
+                        "eventId": original_event, "scope": "restore_event",
+                        "message": str(exc)})
+
+        catalog["shaders"] = sorted(
+            unique_shaders.values(),
+            key=lambda item: (item["resourceId"], item["stage"], item["entry"]))
+        catalog["counts"] = {
+            "events": len(event_ids),
+            "shaderUses": len(catalog["uses"]),
+            "uniqueShaders": len(catalog["shaders"]),
+            "uniqueBlobs": len(blobs),
+            "errors": len(catalog["errors"]),
+        }
+        return catalog, blobs
+
+    # There is exactly one replay-thread invocation for the full traversal. Filesystem writes are
+    # deliberately performed afterwards, outside the replay callback.
+    catalog, blobs = _replay(_do)
+    catalog["captureId"] = _catalog_capture_id(catalog)
+    identity_evidence_sha256 = _catalog_identity_evidence_sha256(catalog)
+    if expected_capture_id:
+        # A restart rebind is an atomic compare-before-publish transaction.
+        # Never let a failed expected export enter _known_catalog_capture_ids
+        # or replace _symbol_capture_snapshot: another Host request may use
+        # those process-local facts as its capture-identity fast path.
+        if catalog["captureId"] != expected_capture_id:
+            raise RuntimeError(
+                "Live Shader catalog did not match expected_capture_id")
+        if identity_evidence_sha256 != expected_identity_sha256:
+            raise RuntimeError(
+                "Live Shader catalog selection/Shader/use evidence changed")
+
+    if not os.path.exists(blob_dir):
+        os.makedirs(blob_dir)
+    for raw_sha256, raw_bytes in blobs.items():
+        blob_path = os.path.join(blob_dir, "%s.bin" % raw_sha256)
+        must_write = True
+        if os.path.isfile(blob_path):
+            try:
+                with open(blob_path, "rb") as existing:
+                    existing_hash = hashlib.sha256(existing.read()).hexdigest()
+                must_write = existing_hash != raw_sha256
+            except Exception:
+                must_write = True
+        if must_write:
+            _atomic_write_bytes(blob_path, raw_bytes)
+
+    catalog_path = os.path.join(output_dir, "shader_catalog.v1.json")
+    _atomic_write_json(catalog_path, catalog)
+    if expected_capture_id:
+        # A durable restart rebind authorises only this exact selection.  It is
+        # not a user request to replace the active symbol snapshot or aliases.
+        _cache_catalog_identity_pair(catalog, identity_evidence_sha256)
+    else:
+        _cache_symbol_catalog(catalog, identity_evidence_sha256)
+    result = {
+        "schema": SYMBOL_CATALOG_SCHEMA,
+        "schemaVersion": SYMBOL_CATALOG_VERSION,
+        "captureId": catalog["captureId"],
+        "catalogPath": catalog_path,
+        "blobDirectory": blob_dir,
+        "counts": catalog["counts"],
+    }
+    result["identityEvidenceSha256"] = identity_evidence_sha256
+    if expected_capture_id:
+        result["expectedIdentityValidatedBeforeCache"] = True
+    return result
+
+
+def _normalise_alias_records(data):
+    raw_aliases = data.get("aliases", [])
+    if not raw_aliases and isinstance(data.get("shaderAliases"), list):
+        raw_aliases = data.get("shaderAliases")
+
+    if isinstance(raw_aliases, list):
+        return [alias for alias in raw_aliases if isinstance(alias, dict)]
+
+    if isinstance(raw_aliases, dict):
+        result = []
+        for key, value in raw_aliases.items():
+            if isinstance(value, dict):
+                alias = dict(value)
+            else:
+                alias = {"displayName": str(value)}
+            if ("resourceId" not in alias and "shaderResourceId" not in alias and
+                    "rawSha256" not in alias):
+                if str(key).isdigit():
+                    alias["shaderResourceId"] = int(key)
+                elif len(str(key)) == 64:
+                    alias["rawSha256"] = str(key)
+            result.append(alias)
+        return result
+    raise ValueError("aliases must be a list or object")
+
+
+def _load_symbol_aliases(params):
+    """Load deterministic aliases bound to the exact currently exported capture/shaders."""
+    global _symbol_alias_overlay, _symbol_resource_renames, _symbol_rename_capture_token
+
+    if not _ctx or not _ctx.IsCaptureLoaded():
+        raise RuntimeError("No capture loaded")
+
+    path = str(params.get("path", "") or "").strip()
+    if not path:
+        raise ValueError("path required")
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(path):
+        raise ValueError("Alias file not found: %s" % path)
+
+    requested_confirmed_only = params.get(
+        "confirmed_only", params.get("confirmedOnly", True))
+    if isinstance(requested_confirmed_only, str):
+        requested_confirmed_only = requested_confirmed_only.strip().lower() not in (
+            "0", "false", "no", "off")
+    else:
+        requested_confirmed_only = bool(requested_confirmed_only)
+    if not requested_confirmed_only:
+        raise ValueError(
+            "confirmed_only=false is not supported; the bridge only loads deterministic aliases")
+    confirmed_only = True
+
+    if os.path.getsize(path) > 32 * 1024 * 1024:
+        raise ValueError("Alias manifest is larger than the 32 MiB safety limit")
+
+    expected_sha256 = str(params.get("expected_sha256", "") or "").strip().lower()
+    if (len(expected_sha256) != 64 or
+            any(c not in "0123456789abcdef" for c in expected_sha256)):
+        raise ValueError(
+            "expected_sha256 is required; aliases must come from the host's "
+            "verified export/apply flow")
+    with open(path, "rb") as f:
+        raw_manifest = f.read(32 * 1024 * 1024 + 1)
+    if len(raw_manifest) > 32 * 1024 * 1024:
+        raise ValueError("Alias manifest is larger than the 32 MiB safety limit")
+    actual_sha256 = hashlib.sha256(raw_manifest).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError("Alias manifest bytes do not match the host-authorized SHA-256")
+    try:
+        data = json.loads(raw_manifest.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("Alias manifest is not valid UTF-8 JSON: %s" % str(exc))
+    if not isinstance(data, dict):
+        raise ValueError("Alias manifest root must be an object")
+
+    schema = str(data.get("schema", "") or "")
+    if schema != SYMBOL_ALIAS_SCHEMA:
+        raise ValueError(
+            "Unsupported alias schema %r (required: %s)" % (schema, SYMBOL_ALIAS_SCHEMA))
+    version = data.get("schemaVersion")
+    try:
+        version = int(version)
+    except Exception:
+        raise ValueError("Invalid alias schemaVersion: %s" % str(version))
+    if version != SYMBOL_ALIAS_VERSION:
+        raise ValueError("Unsupported alias schemaVersion %d (supported: %d)" % (
+            version, SYMBOL_ALIAS_VERSION))
+
+    snapshot_capture_id = str(_symbol_capture_snapshot.get("captureId", "") or "")
+    if not snapshot_capture_id:
+        raise RuntimeError(
+            "No trusted shader catalog is active; call export_shader_catalog for this capture first")
+    manifest_capture_id = str(data.get("captureId", "") or "")
+    if not manifest_capture_id or manifest_capture_id != snapshot_capture_id:
+        raise ValueError(
+            "Alias captureId does not match the catalog exported by this RenderDoc instance")
+
+    all_aliases = _normalise_alias_records(data)
+    skipped = []
+    candidates = []
+    expected_keys = set()
+    snapshot_keys = _symbol_capture_snapshot.get("shaderKeys", set())
+    allowed_kinds = ("shader", "constantbuffer", "constantfield")
+    for index, alias in enumerate(all_aliases):
+        if not _alias_validated(alias):
+            skipped.append({
+                "index": index,
+                "reason": "alias lacks deterministic program verification",
+            })
+            continue
+        if str(alias.get("captureId", "") or "") != snapshot_capture_id:
+            skipped.append({"index": index, "reason": "alias captureId mismatch"})
+            continue
+        shader_key = _alias_shader_key(alias)
+        if shader_key is None:
+            skipped.append({
+                "index": index,
+                "reason": "alias requires resourceId, stage, entryPoint, and rawSha256",
+            })
+            continue
+        if shader_key not in snapshot_keys:
+            skipped.append({
+                "index": index,
+                "resourceId": shader_key[0],
+                "reason": "alias shader binding is absent from the active catalog",
+            })
+            continue
+        kind = _alias_kind(alias)
+        if kind not in allowed_kinds:
+            skipped.append({"index": index, "reason": "unsupported alias binding kind"})
+            continue
+        if not _alias_display_name(alias):
+            skipped.append({"index": index, "reason": "empty alias display name"})
+            continue
+        candidates.append((index, alias, shader_key, kind))
+        expected_keys.add(shader_key)
+
+    live_keys, live_failures = _revalidate_symbol_shader_keys(expected_keys)
+    live_candidates = []
+    for index, alias, shader_key, kind in candidates:
+        if shader_key not in live_keys:
+            skipped.append({
+                "index": index,
+                "resourceId": shader_key[0],
+                "reason": live_failures.get(
+                    shader_key, "shader binding failed live revalidation"),
+            })
+            continue
+        live_candidates.append((index, alias, shader_key, kind))
+
+    # Never choose a first alias when one physical target has conflicting names.
+    target_groups = {}
+    for index, alias, shader_key, kind in live_candidates:
+        target_key = [kind] + list(shader_key)
+        if kind in ("constantbuffer", "constantfield"):
+            target_key.extend([
+                _safe_int(_alias_first(
+                    alias, ("registerSpace", "space", "fixedBindSetOrSpace"), 0), 0),
+                _safe_int(_alias_first(
+                    alias, ("bindNumber", "bind", "fixedBindNumber"), -1), -1),
+            ])
+        if kind == "constantfield":
+            target_key.append(_safe_int(
+                _alias_first(alias, ("byteOffset", "offset"), -1), -1))
+        target_groups.setdefault(tuple(target_key), []).append((index, alias))
+
+    conflicts = []
+    active_aliases = []
+    for target_key, group in target_groups.items():
+        names = sorted(set(_alias_display_name(item[1]) for item in group))
+        if len(names) != 1:
+            conflicts.append({
+                "target": list(target_key),
+                "displayNames": names,
+                "indexes": [item[0] for item in group],
+            })
+            continue
+        active_aliases.extend(item[1] for item in group)
+
+    # Restore any previous overlay before installing the next capture-bound one.
+    _reset_symbol_overlay(restore_names=True)
+    _symbol_alias_overlay = {
+        "schema": SYMBOL_ALIAS_SCHEMA,
+        "schemaVersion": version,
+        "captureId": snapshot_capture_id,
+        "sourcePath": path,
+        "confirmedOnly": confirmed_only,
+        "allAliases": all_aliases,
+        "aliases": active_aliases,
+    }
+
+    rename_candidates = {}
+    for alias in active_aliases:
+        if _alias_kind(alias) != "shader":
+            continue
+        resource_id = _safe_int(_alias_first(
+            alias, ("shaderResourceId", "resourceId", "captureResourceId"), 0), 0)
+        display_name = _alias_display_name(alias)
+        rename_candidates.setdefault(resource_id, set()).add(display_name)
+
+    applied = []
+    resources = _context_resource_ids()
+    for resource_id in sorted(rename_candidates.keys()):
+        names = sorted(rename_candidates[resource_id])
+        if len(names) != 1:
+            conflicts.append({
+                "target": ["shader-resource", resource_id], "displayNames": names})
+            continue
+        rid = resources.get(resource_id)
+        if rid is None:
+            skipped.append({
+                "resourceId": resource_id,
+                "displayName": names[0],
+                "reason": "resource ID is not present in the current capture",
+            })
+            continue
+        try:
+            had_custom_name = bool(_ctx.HasResourceCustomName(rid))
+            original_name = ""
+            if had_custom_name:
+                original_name = str(_ctx.GetResourceNameUnsuffixed(rid) or "")
+            _symbol_resource_renames[resource_id] = {
+                "hadCustomName": had_custom_name,
+                "name": original_name,
+            }
+            _ctx.SetResourceCustomName(rid, names[0])
+            applied.append({"resourceId": resource_id, "displayName": names[0]})
+        except Exception as exc:
+            skipped.append({
+                "resourceId": resource_id, "displayName": names[0], "reason": str(exc)})
+    if applied:
+        _symbol_rename_capture_token = _current_capture_token()
+
+    return {
+        "schema": SYMBOL_ALIAS_SCHEMA,
+        "schemaVersion": version,
+        "captureId": snapshot_capture_id,
+        "path": path,
+        "confirmedOnly": confirmed_only,
+        "counts": {
+            "manifestAliases": len(all_aliases),
+            "deterministicAliases": len(candidates),
+            "liveBoundAliases": len(live_candidates),
+            "activeValidatedAliases": len(active_aliases),
+            "renamedShaders": len(applied),
+            "skipped": len(skipped),
+            "conflicts": len(conflicts),
+        },
+        "applied": applied,
+        "skipped": skipped,
+        "conflicts": conflicts,
+    }
+
+
+def _fmt_str(fmt):
+    """Safely convert ResourceFormat to string."""
+    if hasattr(fmt, 'name'):
+        return fmt.name
+    return str(fmt)
+
+
+def _get_textures(params):
+    """List all textures."""
+    def _do(ctrl):
+        # Build name lookup from resources
+        name_lookup = {}
+        for r in ctrl.GetResources():
+            name_lookup[int(r.resourceId)] = r.name
+
+        result = []
+        for t in ctrl.GetTextures():
+            rid = int(t.resourceId)
+            entry = {
+                "id": rid,
+                "name": name_lookup.get(rid, ""),
+                "w": t.width, "h": t.height,
+                "fmt": _fmt_str(t.format),
+                "mips": t.mips,
+                "array": t.arraysize,
+                "size": t.byteSize,
+            }
+            result.append(entry)
+        return result
+    return _replay(_do)
+
+
+def _get_buffers(params):
+    """List all buffers."""
+    def _do(ctrl):
+        name_lookup = {}
+        for r in ctrl.GetResources():
+            name_lookup[int(r.resourceId)] = r.name
+
+        return [
+            {"id": int(b.resourceId), "name": name_lookup.get(int(b.resourceId), ""), "length": b.length}
+            for b in ctrl.GetBuffers()
+        ]
+    return _replay(_do)
+
+
+def _get_resources(params):
+    """List all resources."""
+    def _do(ctrl):
+        return [
+            {"id": int(r.resourceId), "name": r.name, "type": str(r.type)}
+            for r in ctrl.GetResources()
+        ]
+    return _replay(_do)
+
+
+def _find_by_texture(params):
+    """Find draw calls using a texture name (partial match)."""
+    tex_name = params.get("texture_name", "")
+    if not tex_name:
+        raise ValueError("texture_name required")
+
+    def _do(ctrl):
+        # Find matching texture IDs
+        matching_ids = set()
+        for t in ctrl.GetTextures():
+            if tex_name.lower() in t.name.lower():
+                matching_ids.add(int(t.resourceId))
+
+        if not matching_ids:
+            return {"matches": [], "note": "No textures matching '%s'" % tex_name}
+
+        # Scan actions for usage
+        results = []
+        def scan(actions):
+            for a in actions:
+                if a.outputs:
+                    for o in a.outputs:
+                        if int(o) in matching_ids:
+                            results.append({"eventId": a.eventId, "name": a.customName or "Action"})
+                # Also check by moving to event and checking bindings (expensive, skip for now)
+                if a.children:
+                    scan(a.children)
+        scan(ctrl.GetRootActions())
+
+        return {
+            "textureIds": list(matching_ids),
+            "draws": results,
+            "note": "Found %d textures, %d draw calls" % (len(matching_ids), len(results)),
+        }
+
+    return _replay(_do)
+
+
+def _ui_resource_name(resource_id, fallback=""):
+    if not _ctx or not hasattr(_ctx, "GetResourceName"):
+        return str(fallback or "")
+    try:
+        rid = _context_resource_ids().get(_safe_int(resource_id, 0))
+        if rid is None:
+            return str(fallback or "")
+        return str(_ctx.GetResourceName(rid) or fallback or "")
+    except Exception:
+        return str(fallback or "")
+
+
+def _find_by_shader(params):
+    """Find draw/dispatch actions by shader ID, display name, capture name, or alias."""
+    shader_name = str(params.get("shader_name", "") or "").strip()
+    if not shader_name:
+        raise ValueError("shader_name required")
+
+    requested_stage = str(params.get("stage", "") or "").strip()
+    stages = _available_shader_stages([requested_stage] if requested_stage else None)
+    if requested_stage and not stages:
+        raise ValueError("Unknown shader stage: %s" % requested_stage)
+
+    try:
+        original_event = _safe_int(_ctx.CurEvent(), 0)
+        restore_original_event = True
+    except Exception:
+        original_event = 0
+        restore_original_event = False
+
+    draw_dispatch_mask = _draw_dispatch_action_mask()
+
+    def _do(ctrl):
+        action_records = []
+
+        def _collect(actions, marker_path=None):
+            marker_path = marker_path or []
+            for action in actions:
+                flags = _safe_int(getattr(action, "flags", 0), 0)
+                name = _action_name(action)
+                children = getattr(action, "children", None) or []
+                current_path = marker_path + ([name] if children else [])
+                if flags & draw_dispatch_mask:
+                    action_records.append({
+                        "eventId": _safe_int(getattr(action, "eventId", 0), 0),
+                        "actionName": name,
+                        "actionFlags": flags,
+                        "markerPath": marker_path,
+                    })
+                if children:
+                    _collect(children, current_path)
+
+        _collect(ctrl.GetRootActions())
+
+        resource_names = {}
+        try:
+            for resource in ctrl.GetResources():
+                resource_names[_resource_id_int(getattr(resource, "resourceId", None))] = str(
+                    getattr(resource, "name", ""))
+        except Exception:
+            pass
+
+        candidates = []
+        errors = []
+        reflection_cache = {}
+        try:
+            for action in action_records:
+                event_id = action["eventId"]
+                try:
+                    ctrl.SetFrameEvent(event_id, True)
+                    ps = ctrl.GetPipelineState()
+                    pipeline_id = _get_pipeline_obj(ps, ctrl)
+                except Exception as exc:
+                    errors.append({
+                        "eventId": event_id, "scope": "pipeline", "message": str(exc)})
+                    continue
+
+                for stage_name, stage in stages:
+                    try:
+                        shader_id = ps.GetShader(stage)
+                        shader_resource_id = _resource_id_int(shader_id)
+                    except Exception as exc:
+                        errors.append({
+                            "eventId": event_id, "stage": stage_name,
+                            "scope": "shader_binding", "message": str(exc)})
+                        continue
+                    if not shader_resource_id:
+                        continue
+
+                    entry_point = ""
+                    try:
+                        entry_point = str(ps.GetShaderEntryPoint(stage) or "")
+                    except Exception:
+                        pass
+                    cache_key = (
+                        _resource_id_int(pipeline_id), shader_resource_id,
+                        stage_name, entry_point)
+                    details = reflection_cache.get(cache_key)
+                    if details is None:
+                        raw_sha256 = None
+                        selected_entry = None
+                        try:
+                            entries = ctrl.GetShaderEntryPoints(shader_id)
+                            if entries:
+                                selected_entry = entries[0]
+                                for candidate in entries:
+                                    candidate_name = str(getattr(candidate, "name", ""))
+                                    candidate_stage = getattr(candidate, "stage", stage)
+                                    if ((not entry_point or candidate_name == entry_point) and
+                                            candidate_stage == stage):
+                                        selected_entry = candidate
+                                        break
+                                if not entry_point:
+                                    entry_point = str(getattr(selected_entry, "name", ""))
+                                    cache_key = (
+                                        _resource_id_int(pipeline_id), shader_resource_id,
+                                        stage_name, entry_point)
+                                reflection = ctrl.GetShader(
+                                    pipeline_id, shader_id, selected_entry)
+                                if reflection:
+                                    entry_point = str(getattr(reflection, "entryPoint", "") or
+                                                      entry_point)
+                                    raw_bytes = _shader_raw_bytes(reflection)
+                                    if raw_bytes:
+                                        raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+                        except Exception as exc:
+                            errors.append({
+                                "eventId": event_id, "stage": stage_name,
+                                "shaderResourceId": shader_resource_id,
+                                "scope": "reflection", "message": str(exc)})
+
+                        aliases = _matching_shader_aliases(
+                            shader_resource_id, stage_name, entry_point, raw_sha256)
+                        details = {
+                            "entryPoint": entry_point,
+                            "rawSha256": raw_sha256,
+                            "captureResourceName": resource_names.get(shader_resource_id, ""),
+                            "aliasNames": [_alias_display_name(alias) for alias in aliases
+                                           if _alias_display_name(alias)],
+                            "aliases": aliases,
+                        }
+                        reflection_cache[cache_key] = details
+
+                    record = dict(action)
+                    record.update({
+                        "stage": stage_name,
+                        "shaderResourceId": shader_resource_id,
+                        "resourceId": shader_resource_id,
+                        "entryPoint": details["entryPoint"],
+                        "rawSha256": details["rawSha256"],
+                        "captureResourceName": details["captureResourceName"],
+                        "aliasNames": details["aliasNames"],
+                    })
+                    if details["aliases"]:
+                        record["alias"] = details["aliases"][0]
+                    candidates.append(record)
+        finally:
+            if restore_original_event:
+                try:
+                    ctrl.SetFrameEvent(original_event, True)
+                except Exception as exc:
+                    errors.append({
+                        "eventId": original_event, "scope": "restore_event",
+                        "message": str(exc)})
+
+        return {
+            "actionsScanned": len(action_records),
+            "bindingsScanned": len(candidates),
+            "candidates": candidates,
+            "errors": errors,
+        }
+
+    scan = _replay(_do)
+    query = shader_name.lower()
+    numeric_query = int(shader_name) if shader_name.isdigit() else None
+    display_name_cache = {}
+    matches = []
+    for candidate in scan["candidates"]:
+        resource_id = candidate["shaderResourceId"]
+        if resource_id not in display_name_cache:
+            display_name_cache[resource_id] = _ui_resource_name(
+                resource_id, candidate.get("captureResourceName", ""))
+        candidate["resourceDisplayName"] = display_name_cache[resource_id]
+
+        evidence = []
+        if numeric_query is not None:
+            if numeric_query == resource_id:
+                evidence.append({
+                    "field": "shaderResourceId", "value": resource_id,
+                    "match": "exact"})
+        else:
+            resource_tokens = [str(resource_id), "ResourceId::%d" % resource_id,
+                               "ResourceId(%d)" % resource_id]
+            if any(query in token.lower() for token in resource_tokens):
+                evidence.append({
+                    "field": "shaderResourceId", "value": resource_id,
+                    "match": "case-insensitive substring"})
+
+        for field, value in (
+                ("captureResourceName", candidate.get("captureResourceName", "")),
+                ("resourceDisplayName", candidate.get("resourceDisplayName", ""))):
+            if value and query in str(value).lower():
+                evidence.append({
+                    "field": field, "value": value,
+                    "match": "case-insensitive substring"})
+        for alias_name in candidate.get("aliasNames", []):
+            if query in alias_name.lower():
+                evidence.append({
+                    "field": "alias", "value": alias_name,
+                    "match": "case-insensitive substring"})
+
+        if evidence:
+            candidate["matchEvidence"] = evidence
+            matches.append(candidate)
+
+    return {
+        "schema": "renderdoc-shader-search/v1",
+        "query": shader_name,
+        "stage": _normalise_stage_name(requested_stage) if requested_stage else "",
+        "count": len(matches),
+        "actionsScanned": scan["actionsScanned"],
+        "bindingsScanned": scan["bindingsScanned"],
+        "matches": matches,
+        "errors": scan["errors"],
+    }
+
+
+def _find_by_resource(params):
+    """Return coarse event candidates from ReplayController.GetUsage(ResourceId)."""
+    resource_id = _safe_int(params.get("resource_id"), 0)
+    if resource_id <= 0:
+        raise ValueError("resource_id required")
+
+    draw_dispatch_mask = _draw_dispatch_action_mask()
+
+    def _do(ctrl):
+        action_map = {}
+
+        def _collect(actions, marker_path=None):
+            marker_path = marker_path or []
+            for action in actions:
+                event_id = _safe_int(getattr(action, "eventId", 0), 0)
+                flags = _safe_int(getattr(action, "flags", 0), 0)
+                name = _action_name(action)
+                children = getattr(action, "children", None) or []
+                action_map[event_id] = {
+                    "actionName": name,
+                    "actionFlags": flags,
+                    "markerPath": marker_path,
+                    "isDrawDispatch": bool(flags & draw_dispatch_mask),
+                }
+                if children:
+                    _collect(children, marker_path + [name])
+
+        _collect(ctrl.GetRootActions())
+
+        capture_name = ""
+        rid = None
+        try:
+            for resource in ctrl.GetResources():
+                if _resource_id_int(getattr(resource, "resourceId", None)) == resource_id:
+                    capture_name = str(getattr(resource, "name", ""))
+                    rid = getattr(resource, "resourceId", None)
+                    break
+        except Exception:
+            pass
+
+        if rid is None:
+            raise ValueError("resource_id is not present in the current capture")
+        if not hasattr(ctrl, "GetUsage"):
+            raise RuntimeError("ReplayController.GetUsage is unavailable")
+        usages = ctrl.GetUsage(rid)
+        candidates = []
+        for usage in usages or []:
+            event_id = _safe_int(
+                getattr(usage, "eventId", getattr(usage, "eventID", 0)), 0)
+            usage_value = getattr(usage, "usage", "")
+            candidate = {
+                "eventId": event_id,
+                "usage": str(usage_value),
+                "usageValue": _safe_int(usage_value, 0),
+            }
+            candidate.update(action_map.get(event_id, {
+                "actionName": "",
+                "actionFlags": 0,
+                "markerPath": [],
+                "isDrawDispatch": False,
+            }))
+            candidates.append(candidate)
+        return {"captureResourceName": capture_name, "candidates": candidates}
+
+    result = _replay(_do)
+    display_name = _ui_resource_name(resource_id, result["captureResourceName"])
+    return {
+        "schema": "renderdoc-resource-usage/v1",
+        "resourceId": resource_id,
+        "captureResourceName": result["captureResourceName"],
+        "resourceDisplayName": display_name,
+        "count": len(result["candidates"]),
+        "coarseCandidates": True,
+        "limitations": [
+            "ReplayController.GetUsage reports resource-level event usage only.",
+            "It does not identify descriptor slot, shader stage, byte offset, or byte range.",
+        ],
+        "candidates": result["candidates"],
+    }
+
+
+def _save_texture(params):
+    """Save a texture to disk. Auto-detects CubeMap (arraysize=6) and handles appropriately.
+
+    For CubeMap textures:
+    - DDS/HDR/EXR: saves all 6 faces in a single file (native cubemap support)
+    - PNG/JPG/BMP/TGA: saves 6 individual face files ({name}_face0_posX.png, etc.)
+      OR a single cross-layout image if slice=-1
+
+    For regular 2D textures: saves normally.
+
+    Args:
+        resource_id: Texture resource ID
+        output_path: Output file path
+        mip: Mip level (default 0)
+        slice: For CubeMap: specific face (0-5), -1 for all faces. Ignored for 2D.
+    """
+    resource_id = params.get("resource_id")
+    output_path = params.get("output_path")
+    if not resource_id or not output_path:
+        raise ValueError("resource_id and output_path required")
+
+    req_slice = params.get("slice", -1)  # -1 = auto (all faces for cubemap)
+
+    def _do(ctrl):
+        # Find the actual texture info
+        target_tex = None
+        for t in ctrl.GetTextures():
+            if int(t.resourceId) == int(resource_id):
+                target_tex = t
+                break
+
+        if target_tex is None:
+            return {"error": "Texture %d not found" % int(resource_id)}
+
+        target_rid = target_tex.resourceId
+        is_cubemap = target_tex.arraysize == 6
+        mip_level = params.get("mip", 0)
+
+        ext = os.path.splitext(output_path)[1].lower()
+        fmt_map = {
+            ".png": rd.FileType.PNG, ".jpg": rd.FileType.JPG,
+            ".bmp": rd.FileType.BMP, ".tga": rd.FileType.TGA,
+            ".hdr": rd.FileType.HDR, ".exr": rd.FileType.EXR,
+            ".dds": rd.FileType.DDS,
+        }
+        dest_type = fmt_map.get(ext, rd.FileType.PNG)
+
+        # Non-CubeMap: save normally
+        if not is_cubemap:
+            save = rd.TextureSave()
+            save.resourceId = target_rid
+            save.mip = mip_level
+            save.destType = dest_type
+            ret = ctrl.SaveTexture(save, output_path)
+            if ret.code == rd.ResultCode.Succeeded:
+                return {"saved": output_path, "type": "2D"}
+            return {"error": "Save failed: %s" % str(ret)}
+
+        # CubeMap handling
+        face_names = ["posX", "negX", "posY", "negY", "posZ", "negZ"]
+        face_labels = ["+X (Right)", "-X (Left)", "+Y (Up)", "-Y (Down)", "+Z (Front)", "-Z (Back)"]
+
+        # DDS can store full cubemap natively
+        if dest_type == rd.FileType.DDS:
+            save = rd.TextureSave()
+            save.resourceId = target_rid
+            save.mip = mip_level
+            save.destType = rd.FileType.DDS
+            ret = ctrl.SaveTexture(save, output_path)
+            if ret.code == rd.ResultCode.Succeeded:
+                return {
+                    "saved": output_path,
+                    "type": "cubemap",
+                    "format": "DDS (all 6 faces)",
+                    "faces": 6,
+                    "size": "%dx%d" % (target_tex.width, target_tex.height),
+                }
+            return {"error": "Save failed: %s" % str(ret)}
+
+        # Specific face requested
+        if req_slice >= 0 and req_slice < 6:
+            save = rd.TextureSave()
+            save.resourceId = target_rid
+            save.mip = mip_level
+            save.destType = dest_type
+            # Set slice for the specific face
+            if hasattr(save, 'slice'):
+                if hasattr(save.slice, 'sliceIndex'):
+                    save.slice.sliceIndex = req_slice
+                elif hasattr(save.slice, 'cubeCruciform'):
+                    pass  # Will handle differently
+            # Try setting via sample attribute
+            if hasattr(save, 'sample'):
+                pass
+            # Direct slice setting for Vulkan/newer RenderDoc
+            if hasattr(save, 'resourceId'):
+                save.slice = rd.Subresource(mip_level, req_slice, 0)
+
+            ret = ctrl.SaveTexture(save, output_path)
+            if ret.code == rd.ResultCode.Succeeded:
+                return {
+                    "saved": output_path,
+                    "type": "cubemap_face",
+                    "face": req_slice,
+                    "faceName": face_names[req_slice],
+                    "faceLabel": face_labels[req_slice],
+                }
+            return {"error": "Save face %d failed: %s" % (req_slice, str(ret))}
+
+        # Default: export all 6 faces as individual files
+        base, base_ext = os.path.splitext(output_path)
+        saved_faces = []
+        errors = []
+
+        for face_idx in range(6):
+            face_path = "%s_face%d_%s%s" % (base, face_idx, face_names[face_idx], base_ext)
+            save = rd.TextureSave()
+            save.resourceId = target_rid
+            save.mip = mip_level
+            save.destType = dest_type
+            # Set the slice/face
+            try:
+                save.slice = rd.Subresource(mip_level, face_idx, 0)
+            except Exception:
+                # Fallback: try setting sliceIndex directly
+                if hasattr(save, 'slice') and hasattr(save.slice, 'sliceIndex'):
+                    save.slice.sliceIndex = face_idx
+
+            ret = ctrl.SaveTexture(save, face_path)
+            if hasattr(ret, 'code') and ret.code == rd.ResultCode.Succeeded:
+                saved_faces.append({
+                    "path": face_path,
+                    "face": face_idx,
+                    "name": face_names[face_idx],
+                    "label": face_labels[face_idx],
+                })
+            else:
+                errors.append("Face %d (%s): %s" % (face_idx, face_names[face_idx], str(ret)[:80]))
+
+        result = {
+            "type": "cubemap",
+            "faces": len(saved_faces),
+            "size": "%dx%d" % (target_tex.width, target_tex.height),
+            "savedFaces": saved_faces,
+        }
+        if errors:
+            result["errors"] = errors
+        if saved_faces:
+            result["saved"] = saved_faces[0]["path"]  # First face as primary
+        else:
+            result["error"] = "No faces saved successfully"
+
+        return result
+
+    return _replay(_do)
+
+
+# ---- Helpers ----
+
+def _var_dict(v):
+    d = {"name": v.name}
+    if hasattr(v, "value"):
+        val = v.value
+        if hasattr(val, "f32v"):
+            floats = list(val.f32v[:16])
+            # Trim trailing zeros for readability
+            while floats and floats[-1] == 0.0:
+                floats.pop()
+            if floats:
+                d["float"] = floats
+        if hasattr(val, "u32v"):
+            uints = list(val.u32v[:4])
+            if any(u != 0 for u in uints):
+                d["uint"] = uints
+        if hasattr(val, "s32v"):
+            sints = list(val.s32v[:4])
+            if any(s != 0 for s in sints):
+                d["int"] = sints
+    # Try direct float/int attributes (some RenderDoc versions)
+    for attr in ['fvalue', 'uvalue', 'ivalue']:
+        val = getattr(v, attr, None)
+        if val is not None:
+            try:
+                d[attr] = list(val[:4])
+            except Exception:
+                pass
+    # Include type and byte offset if available
+    if hasattr(v, 'type'):
+        try:
+            d["type"] = str(v.type)
+        except Exception:
+            pass
+    if hasattr(v, 'byteOffset'):
+        d["offset"] = v.byteOffset
+    if hasattr(v, 'rows') and hasattr(v, 'columns'):
+        d["rows"] = v.rows
+        d["columns"] = v.columns
+    if hasattr(v, "members") and v.members:
+        d["members"] = [_var_dict(m) for m in v.members]
+    return d
+
+
+def _resolve_bound_resource(bindings, index, ctrl):
+    """Resolve the actual bound resource ID from pipeline bindings.
+
+    Handles all API-specific binding structures:
+    - Vulkan: UsedDescriptor → .descriptor.resource (ResourceId)
+    - D3D11: BoundResourceArray → .resources[] → .resourceId
+    - D3D12: Similar to D3D11 but may use descriptor tables
+    - OpenGL: BoundResource → .resourceId
+
+    Args:
+        bindings: Result of ps.GetReadOnlyResources(stage)
+        index: The slot index to look up
+        ctrl: The ReplayController (for fallback descriptor access)
+    Returns:
+        int: The bound resource ID, or 0 if not found
+    """
+    if not bindings or index >= len(bindings):
+        return 0
+
+    binding = bindings[index]
+
+    try:
+        # --- Strategy 1: Vulkan UsedDescriptor → descriptor.resource ---
+        # This is the primary path for Vulkan/ANGLE captures
+        if hasattr(binding, 'descriptor'):
+            desc = binding.descriptor
+            if hasattr(desc, 'resource'):
+                rid = int(desc.resource)
+                if rid != 0:
+                    return rid
+            # Fallback: descriptor.view
+            if hasattr(desc, 'view'):
+                rid = int(desc.view)
+                if rid != 0:
+                    return rid
+
+        # --- Strategy 2: Direct .resourceId attribute (D3D11/GL style) ---
+        if hasattr(binding, 'resourceId'):
+            rid = int(binding.resourceId)
+            if rid != 0:
+                return rid
+
+        # --- Strategy 3: .resources list (BoundResourceArray — D3D11/D3D12) ---
+        if hasattr(binding, 'resources'):
+            for d in binding.resources:
+                if hasattr(d, 'resourceId'):
+                    rid = int(d.resourceId)
+                    if rid != 0:
+                        return rid
+                elif hasattr(d, 'resource'):
+                    rid = int(d.resource)
+                    if rid != 0:
+                        return rid
+
+        # --- Strategy 4: Direct .resource on binding (some RenderDoc versions) ---
+        # Note: for Vulkan UsedDescriptor, int(binding.resource) returns a pointer, not ResourceId
+        # Only try this if it looks like a real ResourceId (< 10M)
+        if hasattr(binding, 'resource'):
+            try:
+                rid = int(binding.resource)
+                if 0 < rid < 10000000:  # Reasonable ResourceId range
+                    return rid
+            except (TypeError, ValueError):
+                pass
+
+        # --- Strategy 5: D3D12 root signature / descriptor table ---
+        if hasattr(binding, 'tableIndex') or hasattr(binding, 'rootElement'):
+            if hasattr(binding, 'resource'):
+                rid = int(binding.resource)
+                if rid != 0:
+                    return rid
+
+    except Exception:
+        pass
+
+    return 0
+
+
+def _resolve_vulkan_descriptors(ctrl, ps, stage, refl):
+    """Resolve Vulkan descriptor set bindings to actual resource IDs.
+
+    Vulkan uses descriptor sets which are not always resolvable through
+    GetReadOnlyResources. This function uses GetDescriptorLocations (if available)
+    or enumerates all used descriptors to map binding points to resource IDs.
+
+    Returns dict: {binding_number: resource_id}
+    """
+    result = {}
+
+    # Method 1: Try GetDescriptorAccess on the replay controller
+    try:
+        accesses = ctrl.GetDescriptorAccess()
+        if accesses:
+            for a in accesses:
+                bind = getattr(a, 'index', getattr(a, 'binding', -1))
+                dset = getattr(a, 'descriptorSet', getattr(a, 'set', -1))
+                rid = 0
+                if hasattr(a, 'resource'):
+                    rid = int(a.resource)
+                elif hasattr(a, 'resourceId'):
+                    rid = int(a.resourceId)
+                if rid != 0 and bind >= 0:
+                    result[bind] = rid
+            if result:
+                return result
+    except Exception:
+        pass
+
+    # Method 2: Try Vulkan pipeline state descriptor sets
+    try:
+        vk_state = None
+        if hasattr(ps, 'vulkan'):
+            vk_state = ps.vulkan
+        elif hasattr(ps, 'GetVulkanPipelineState'):
+            vk_state = ps.GetVulkanPipelineState()
+
+        if vk_state and hasattr(vk_state, 'graphics') and hasattr(vk_state.graphics, 'descriptorSets'):
+            desc_sets = vk_state.graphics.descriptorSets
+            for ds in desc_sets:
+                bindings_list = getattr(ds, 'bindings', [])
+                for b in bindings_list:
+                    bind_num = getattr(b, 'binding', getattr(b, 'descriptorIndex', -1))
+                    descriptors = getattr(b, 'binds', getattr(b, 'descriptors', []))
+                    for d in descriptors:
+                        rid = 0
+                        if hasattr(d, 'resource'):
+                            rid = int(d.resource)
+                        elif hasattr(d, 'resourceId'):
+                            rid = int(d.resourceId)
+                        elif hasattr(d, 'viewResourceId'):
+                            rid = int(d.viewResourceId)
+                        elif hasattr(d, 'imageInfo'):
+                            img = d.imageInfo
+                            if hasattr(img, 'imageView'):
+                                rid = int(img.imageView)
+                        if rid != 0 and bind_num >= 0:
+                            result[bind_num] = rid
+                            break  # First valid descriptor in array
+    except Exception:
+        pass
+
+    # Method 3: Try to get resource usage to find which textures were sampled
+    if not result:
+        try:
+            textures = ctrl.GetTextures()
+            for tex in textures:
+                try:
+                    usages = ctrl.GetUsage(tex.resourceId)
+                    for u in usages:
+                        eid = getattr(u, 'eventId', getattr(u, 'eventID', 0))
+                        if eid == 0:
+                            continue
+                        # Check if this is a read in this event (fragment shader sample)
+                        usage_type = str(getattr(u, 'usage', ''))
+                        if 'read' in usage_type.lower() or 'sample' in usage_type.lower() \
+                                or 'input' in usage_type.lower() or 'fs' in usage_type.lower():
+                            rid = int(tex.resourceId)
+                            # We don't know the exact binding, use negative slot as fallback
+                            if rid not in result.values():
+                                next_slot = len(result)
+                                result[next_slot] = rid
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    return result
+
+
+_ROLE_PATTERNS = [
+    (["albedo", "diffuse", "basecolor", "base_color", "color", "maintex", "_col"], "albedo"),
+    (["normal", "nrm", "bump", "normalmap", "_n_", "_norm"], "normal"),
+    (["metallic", "metalness", "_met", "metal"], "metallic"),
+    (["rough", "roughness", "_rgh", "smoothness"], "roughness"),
+    (["ao", "occlusion", "_occ"], "ao"),
+    (["emissive", "emission", "glow"], "emissive"),
+    (["specular", "spec"], "specular"),
+    (["height", "displacement", "parallax"], "height"),
+    (["opacity", "alpha", "mask"], "opacity"),
+    (["shadow"], "shadow"),
+    (["env", "cubemap", "skybox", "reflection", "ibl"], "environment"),
+    (["lightmap", "lm_"], "lightmap"),
+    (["depth", "zbuffer"], "depth"),
+]
+
+
+def _infer_role(var_name, tex_name, tex_format):
+    combined = (var_name + " " + tex_name).lower()
+    for keywords, role in _ROLE_PATTERNS:
+        for kw in keywords:
+            if kw in combined:
+                return role
+    fmt = tex_format.lower()
+    if "bc5" in fmt:
+        return "normal"
+    if "bc6" in fmt:
+        return "environment"
+    return "unknown"
+
+
+def _get_frame_summary(params):
+    """Get frame summary stats."""
+    return _get_capture_status(params)
+
+
+def _get_draw_call_details(params):
+    """Get details of a specific draw call."""
+    event_id = params.get("event_id")
+    if event_id is None:
+        raise ValueError("event_id required")
+
+    def _do(ctrl):
+        ctrl.SetFrameEvent(int(event_id), True)
+        ps = ctrl.GetPipelineState()
+        pid = _get_pipeline_obj(ps, ctrl)
+
+        result = {"eventId": int(event_id)}
+        for name, stage in [("vertex", rd.ShaderStage.Vertex), ("fragment", rd.ShaderStage.Fragment)]:
+            sid = ps.GetShader(stage)
+            if sid and int(sid) != 0:
+                result[name + "Shader"] = int(sid)
+        targets = ps.GetOutputTargets()
+        result["renderTargets"] = [int(t.resource) for t in targets if int(t.resource) != 0]
+        depth = ps.GetDepthTarget()
+        result["depthTarget"] = int(depth.resource) if depth and int(depth.resource) != 0 else None
+        try:
+            vp = ps.GetViewport(0)
+            if vp:
+                result["viewport"] = {"x": vp.x, "y": vp.y, "w": vp.width, "h": vp.height}
+        except Exception:
+            pass
+        return result
+
+    return _replay(_do)
+
+
+def _get_texture_info(params):
+    """Get single texture info."""
+    resource_id = params.get("resource_id")
+    if resource_id is None:
+        raise ValueError("resource_id required")
+
+    def _do(ctrl):
+        name_lookup = {}
+        for r in ctrl.GetResources():
+            name_lookup[int(r.resourceId)] = r.name
+        for t in ctrl.GetTextures():
+            if int(t.resourceId) == int(resource_id):
+                return {
+                    "id": int(t.resourceId), "name": name_lookup.get(int(t.resourceId), ""),
+                    "w": t.width, "h": t.height, "d": t.depth,
+                    "fmt": _fmt_str(t.format), "mips": t.mips,
+                    "array": t.arraysize, "size": t.byteSize,
+                }
+        return {"error": "Texture not found"}
+
+    return _replay(_do)
+
+
+def _get_texture_data(params):
+    """Get texture pixel data as base64."""
+    import base64
+    resource_id = params.get("resource_id")
+    if resource_id is None:
+        raise ValueError("resource_id required")
+    mip = params.get("mip", 0)
+    slc = params.get("slice", 0)
+
+    def _do(ctrl):
+        tid = _resolve_resource_id(ctrl, resource_id, "texture")
+        sub = rd.Subresource(mip, slc, 0)
+        data = ctrl.GetTextureData(tid, sub)
+        # Preserve the legacy 10,000-character response ceiling, but truncate on a complete raw
+        # byte boundary so the base64 payload always decodes. 7,500 is divisible by three and
+        # therefore encodes to exactly 10,000 characters without padding.
+        returned = data[:7500]
+        return {
+            "resourceId": int(resource_id),
+            "length": len(data),
+            "returnedBytes": len(returned),
+            "truncated": len(returned) < len(data),
+            "encoding": "base64",
+            "base64": base64.b64encode(returned).decode("ascii"),
+        }
+
+    return _replay(_do)
+
+
+def _get_buffer_data(params):
+    """Get buffer contents."""
+    import base64
+    resource_id = params.get("resource_id")
+    if resource_id is None:
+        raise ValueError("resource_id required")
+    offset = _safe_int(params.get("offset", 0), -1)
+    requested_length = _safe_int(params.get("length", 256), 0)
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
+    if requested_length <= 0:
+        raise ValueError("length must be positive")
+    read_length = min(requested_length, MAX_BUFFER_DATA_BYTES)
+
+    def _do(ctrl):
+        bid = _resolve_resource_id(ctrl, resource_id, "buffer")
+        raw_data = ctrl.GetBufferData(bid, offset, read_length)
+        data = raw_data[:read_length]
+        base64_bytes = data
+        hex_bytes = data[:512]
+        return {
+            "resourceId": int(resource_id),
+            "offset": offset,
+            "length": len(data),
+            "returnedBytes": len(base64_bytes),
+            "truncated": (requested_length > len(data) or
+                          len(raw_data) > len(data)),
+            "encoding": "base64",
+            "base64": base64.b64encode(base64_bytes).decode("ascii"),
+            "hex": hex_bytes.hex(),
+            "hexReturnedBytes": len(hex_bytes),
+            "hexTruncated": len(hex_bytes) < len(data),
+        }
+
+    return _replay(_do)
+
+
+def _pick_pixel(params):
+    """Pick a pixel value from a texture."""
+    resource_id = params.get("resource_id")
+    x = params.get("x", 0)
+    y = params.get("y", 0)
+    if resource_id is None:
+        raise ValueError("resource_id required")
+
+    def _do(ctrl):
+        tid = _resolve_resource_id(ctrl, resource_id, "texture")
+        sub = rd.Subresource(0, 0, 0)
+        val = ctrl.PickPixel(tid, x, y, sub, rd.CompType.Typeless)
+        return {"x": x, "y": y, "r": val.floatValue[0], "g": val.floatValue[1],
+                "b": val.floatValue[2], "a": val.floatValue[3]}
+
+    return _replay(_do)
+
+
+def _fingerprint_event_outputs(params):
+    """Hash and deterministically sample every MRT/depth output at one event.
+
+    This is read-only observational evidence.  It intentionally reports both
+    a whole-subresource byte hash and a bounded pixel grid so the Host can
+    distinguish exact replay equality from tolerance-limited observations.
+    """
+    event_id = _safe_int(params.get("event_id"), 0)
+    grid_size = _safe_int(params.get("grid_size", 12), 12)
+    expected_session = str(
+        params.get("expected_capture_session_id", "") or "").strip().lower()
+    if event_id <= 0:
+        raise ValueError("event_id must be a positive integer")
+    if grid_size < 2 or grid_size > 32:
+        raise ValueError("grid_size must be between 2 and 32")
+    if (not _capture_session_id or expected_session != _capture_session_id or
+            not re.match(r"^[0-9a-f]{32}$", expected_session)):
+        raise ValueError("active capture session changed before output fingerprinting")
+    try:
+        original_event = _safe_int(_ctx.CurEvent(), 0)
+        restore_event = True
+    except Exception:
+        original_event = 0
+        restore_event = False
+
+    def _component(value):
+        number = float(value)
+        if math.isnan(number):
+            return "nan"
+        if math.isinf(number):
+            return "+inf" if number > 0 else "-inf"
+        return number
+
+    def _do(ctrl):
+        try:
+            ctrl.SetFrameEvent(event_id, True)
+            if expected_session != _capture_session_id:
+                raise RuntimeError("capture session changed during output fingerprinting")
+            pipeline = ctrl.GetPipelineState()
+            texture_by_id = {}
+            for texture in ctrl.GetTextures() or []:
+                texture_by_id[_resource_id_int(texture.resourceId)] = texture
+
+            descriptors = []
+            for index, descriptor in enumerate(pipeline.GetOutputTargets() or []):
+                resource_id = _resource_id_int(getattr(descriptor, "resource", None))
+                if resource_id:
+                    descriptors.append(("color", index, descriptor, resource_id))
+            depth = pipeline.GetDepthTarget()
+            depth_id = _resource_id_int(getattr(depth, "resource", None))
+            if depth_id:
+                descriptors.append(("depth", 0, depth, depth_id))
+
+            # ``GetTextureData`` materialises a complete subresource in the
+            # qrenderdoc process. Several large HDR MRTs can otherwise exhaust
+            # the UI process even though the caller only retains a digest.
+            # Keep exact hashing for bounded outputs and fall back to the fixed
+            # pixel grid for larger/unknown allocations.
+            full_hash_byte_limit = 32 * 1024 * 1024
+            outputs = []
+            for kind, index, descriptor, resource_id in descriptors:
+                texture = texture_by_id.get(resource_id)
+                if texture is None:
+                    raise RuntimeError("output texture description is unavailable")
+                mip = max(0, _safe_int(getattr(descriptor, "firstMip", 0), 0))
+                array_slice = max(
+                    0, _safe_int(getattr(descriptor, "firstSlice", 0), 0))
+                width = max(1, _safe_int(getattr(texture, "width", 1), 1) >> mip)
+                height = max(1, _safe_int(getattr(texture, "height", 1), 1) >> mip)
+                subresource = rd.Subresource(mip, array_slice, 0)
+                resource = getattr(descriptor, "resource", None)
+                texture_byte_size = max(
+                    0, _safe_int(getattr(texture, "byteSize", 0), 0))
+                raw_byte_size = None
+                raw_sha256 = None
+                if 0 < texture_byte_size <= full_hash_byte_limit:
+                    raw = ctrl.GetTextureData(resource, subresource)
+                    raw_byte_size = len(raw)
+                    raw_sha256 = hashlib.sha256(raw).hexdigest()
+                    del raw
+                    raw_hash_status = "hashed"
+                elif texture_byte_size > full_hash_byte_limit:
+                    raw_hash_status = "skipped-texture-too-large"
+                else:
+                    raw_hash_status = "skipped-size-unavailable"
+                coordinates = []
+                seen = set()
+                for gy in range(grid_size):
+                    y = min(height - 1, int((gy + 0.5) * height / grid_size))
+                    for gx in range(grid_size):
+                        x = min(width - 1, int((gx + 0.5) * width / grid_size))
+                        if (x, y) not in seen:
+                            seen.add((x, y))
+                            coordinates.append((x, y))
+                samples = []
+                for x, y in coordinates:
+                    value = ctrl.PickPixel(
+                        resource, x, y, subresource, rd.CompType.Typeless)
+                    samples.append({
+                        "x": x,
+                        "y": y,
+                        "value": [_component(value.floatValue[channel])
+                                  for channel in range(4)],
+                    })
+                outputs.append({
+                    "kind": kind,
+                    "index": index,
+                    "resourceId": resource_id,
+                    "mip": mip,
+                    "slice": array_slice,
+                    "width": width,
+                    "height": height,
+                    "format": _fmt_str(getattr(texture, "format", None)),
+                    "textureByteSize": texture_byte_size,
+                    "fullHashByteLimit": full_hash_byte_limit,
+                    "rawHashStatus": raw_hash_status,
+                    "rawByteSize": raw_byte_size,
+                    "rawSha256": raw_sha256,
+                    "samples": samples,
+                })
+            if expected_session != _capture_session_id:
+                raise RuntimeError("capture session changed during output fingerprinting")
+            return {
+                "schema": "replaylab-event-output-fingerprint/v1",
+                "schemaVersion": 1,
+                "captureSessionId": expected_session,
+                "eventId": event_id,
+                "gridSize": grid_size,
+                "outputs": outputs,
+                "observationalOnly": True,
+                "semanticEquivalenceVerified": False,
+            }
+        finally:
+            if restore_event:
+                try:
+                    ctrl.SetFrameEvent(original_event, True)
+                except Exception:
+                    pass
+
+    return _replay(_do)
+
+
+def _get_texture_minmax(params):
+    """Get min/max pixel values of a texture."""
+    resource_id = params.get("resource_id")
+    if resource_id is None:
+        raise ValueError("resource_id required")
+
+    def _do(ctrl):
+        tid = _resolve_resource_id(ctrl, resource_id, "texture")
+        sub = rd.Subresource(0, 0, 0)
+        mn, mx = ctrl.GetMinMax(tid, sub, rd.CompType.Typeless)
+        return {
+            "min": {"r": mn.floatValue[0], "g": mn.floatValue[1], "b": mn.floatValue[2], "a": mn.floatValue[3]},
+            "max": {"r": mx.floatValue[0], "g": mx.floatValue[1], "b": mx.floatValue[2], "a": mx.floatValue[3]},
+        }
+
+    return _replay(_do)
+
+
+def _pixel_history(params):
+    """Get pixel modification history."""
+    resource_id = params.get("resource_id")
+    x = params.get("x", 0)
+    y = params.get("y", 0)
+    if resource_id is None:
+        raise ValueError("resource_id required")
+
+    def _do(ctrl):
+        tid = _resolve_resource_id(ctrl, resource_id, "texture")
+        sub = rd.Subresource(0, 0, 0)
+        mods = ctrl.PixelHistory(tid, x, y, sub, rd.CompType.Typeless)
+        result = []
+        for m in mods:
+            entry = {"eventId": m.eventId}
+            try:
+                if m.preMod:
+                    entry["pre"] = {"r": m.preMod.col.floatValue[0], "g": m.preMod.col.floatValue[1],
+                                    "b": m.preMod.col.floatValue[2], "a": m.preMod.col.floatValue[3]}
+                if m.postMod:
+                    entry["post"] = {"r": m.postMod.col.floatValue[0], "g": m.postMod.col.floatValue[1],
+                                     "b": m.postMod.col.floatValue[2], "a": m.postMod.col.floatValue[3]}
+            except Exception:
+                pass
+            result.append(entry)
+        return result
+
+    return _replay(_do)
+
+
+PIXEL_OBJECT_INSPECTOR_SCHEMA = "renderdoc-ultra-pixel-object-inspector/v1"
+PIXEL_OBJECT_INSPECTOR_VERSION = 1
+
+
+def _pixel_optional_bool(value, name):
+    try:
+        return bool(getattr(value, name))
+    except Exception:
+        return None
+
+
+def _pixel_optional_int(value, name):
+    try:
+        return int(getattr(value, name))
+    except Exception:
+        return None
+
+
+def _pixel_channel_array(colour, name, convert):
+    try:
+        values = getattr(colour, name)
+        return [convert(values[index]) for index in range(4)]
+    except Exception:
+        return None
+
+
+def _pixel_modification_value(value):
+    """Losslessly expose the representations available on ``ModificationValue``."""
+    if value is None:
+        return {
+            "available": False, "valid": None, "floatValue": None,
+            "intValue": None, "uintValue": None, "depth": None, "stencil": None,
+        }
+
+    valid = None
+    is_valid = getattr(value, "IsValid", None)
+    if callable(is_valid):
+        try:
+            valid = bool(is_valid())
+        except Exception:
+            pass
+
+    colour = getattr(value, "col", None)
+    try:
+        depth = float(getattr(value, "depth"))
+    except Exception:
+        depth = None
+    try:
+        stencil = int(getattr(value, "stencil"))
+    except Exception:
+        stencil = None
+
+    return {
+        "available": True,
+        "valid": valid,
+        "floatValue": _pixel_channel_array(colour, "floatValue", float),
+        "intValue": _pixel_channel_array(colour, "intValue", int),
+        "uintValue": _pixel_channel_array(colour, "uintValue", int),
+        "depth": depth,
+        "stencil": stencil,
+    }
+
+
+def _pixel_action_flag(name, fallback):
+    try:
+        return _safe_int(getattr(rd.ActionFlags, name), fallback)
+    except Exception:
+        return fallback
+
+
+def _pixel_action_types(flags):
+    known = (
+        ("Clear", 0x0001),
+        ("Drawcall", 0x0002),
+        ("Dispatch", 0x0004),
+        ("MeshDispatch", 0x0008),
+        ("Present", 0x0100),
+        ("Copy", 0x0400),
+        ("Resolve", 0x0800),
+        ("GenerateMips", 0x1000),
+        ("DispatchRay", 0x4000),
+        ("BuildAccelerationStructure", 0x8000),
+    )
+    result = []
+    for name, fallback in known:
+        api_name = {
+            "GenerateMips": "GenMips",
+            "BuildAccelerationStructure": "BuildAccStruct",
+        }.get(name, name)
+        if flags & _pixel_action_flag(api_name, fallback):
+            result.append(name)
+    return result or ["Unknown"]
+
+
+def _pixel_action_map(ctrl):
+    actions_by_event = {}
+    draw_mask = _pixel_action_flag("Drawcall", 0x0002)
+    mesh_mask = _pixel_action_flag("MeshDispatch", 0x0008)
+    compute_mask = (_pixel_action_flag("Dispatch", 0x0004) |
+                    _pixel_action_flag("DispatchRay", 0x4000))
+
+    def _collect(actions, marker_path=None):
+        marker_path = marker_path or []
+        for action in actions or []:
+            flags = _safe_int(getattr(action, "flags", 0), 0)
+            children = getattr(action, "children", None) or []
+            name = _action_name(action)
+            actions_by_event[_safe_int(getattr(action, "eventId", 0), 0)] = {
+                "found": True,
+                "eventId": _safe_int(getattr(action, "eventId", 0), 0),
+                "actionId": _safe_int(getattr(action, "actionId", 0), 0),
+                "name": name,
+                "flags": flags,
+                "types": _pixel_action_types(flags),
+                "markerPath": list(marker_path),
+                "isRasterGeometry": bool(flags & (draw_mask | mesh_mask)),
+                "isComputeOrRay": bool(flags & compute_mask),
+            }
+            current_path = marker_path + ([name] if children else [])
+            if children:
+                _collect(children, current_path)
+
+    _collect(ctrl.GetRootActions())
+    return actions_by_event
+
+
+def _pixel_modification_record(modification, index, action):
+    flag_names = (
+        "directShaderWrite", "unboundPS", "sampleMasked", "backfaceCulled",
+        "depthClipped", "depthBoundsFailed", "viewClipped", "scissorClipped",
+        "shaderDiscarded", "depthTestFailed", "stencilTestFailed",
+        "predicationSkipped",
+    )
+    flags = dict((name, _pixel_optional_bool(modification, name)) for name in flag_names)
+
+    passed = None
+    passed_fn = getattr(modification, "Passed", None)
+    if callable(passed_fn):
+        try:
+            passed = bool(passed_fn())
+        except Exception:
+            pass
+    if passed is None:
+        failure_names = flag_names[2:]
+        if all(flags[name] is not None for name in failure_names):
+            passed = not any(flags[name] for name in failure_names)
+
+    failure_reasons = [name for name in flag_names[2:] if flags[name] is True]
+    direct_write = flags["directShaderWrite"]
+    is_raster_geometry = bool(
+        passed is True and action.get("isRasterGeometry") and direct_write is not True)
+
+    if direct_write is True:
+        write_classification = "potential-direct-shader-write"
+    elif passed is True:
+        write_classification = "passed-non-direct-write"
+    elif passed is False:
+        write_classification = "failed-write-attempt"
+    else:
+        write_classification = "unknown-write-attempt"
+
+    return {
+        "index": index,
+        "eventId": _pixel_optional_int(modification, "eventId"),
+        "fragIndex": _pixel_optional_int(modification, "fragIndex"),
+        "primitiveId": _pixel_optional_int(modification, "primitiveID"),
+        "pre": _pixel_modification_value(getattr(modification, "preMod", None)),
+        "shaderOut": _pixel_modification_value(
+            getattr(modification, "shaderOut", None)),
+        "post": _pixel_modification_value(getattr(modification, "postMod", None)),
+        "flags": flags,
+        "passed": passed,
+        "failureReasons": failure_reasons,
+        # Passed() means the API write attempt survived the tests RenderDoc can
+        # instrument. It does not prove that this entry materially contributed
+        # to the final pixel (for example a later opaque write can replace it),
+        # and direct shader writes are only potential writes in PixelHistory.
+        "writeClassification": write_classification,
+        "contributionConfirmed": False,
+        "isPassedRasterGeometry": is_raster_geometry,
+        "action": action,
+    }
+
+
+def _pixel_contributor_reference(record):
+    return {
+        "modificationIndex": record["index"],
+        "eventId": record["eventId"],
+        "fragIndex": record["fragIndex"],
+        "primitiveId": record["primitiveId"],
+        "passed": record["passed"],
+        "directShaderWrite": record["flags"]["directShaderWrite"],
+        "writeClassification": record["writeClassification"],
+        "contributionConfirmed": record["contributionConfirmed"],
+        "action": record["action"],
+    }
+
+
+def _inspect_pixel_object_on_replay(ctrl, texture_id, x, y, mip, array_slice, sample,
+                                    prefer_geometry, cutoff_event_id):
+    """Build the inspector result on the replay thread without inventing object identity."""
+    tid = _resolve_resource_id(ctrl, texture_id, "texture")
+    texture = None
+    for candidate in ctrl.GetTextures():
+        if _resource_id_int(getattr(candidate, "resourceId", None)) == texture_id:
+            texture = candidate
+            break
+
+    if texture is None:
+        # _resolve_resource_id normally catches this; keep the failure explicit if an unusual
+        # binding returns different lists between calls.
+        raise ValueError("Unknown texture resource ID: %d" % texture_id)
+
+    mip_count = max(_safe_int(getattr(texture, "mips", 1), 1), 1)
+    if mip >= mip_count:
+        raise ValueError("Mip %d is outside texture mip count %d" % (mip, mip_count))
+    mip_width = max(1, _safe_int(getattr(texture, "width", 1), 1) >> mip)
+    mip_height = max(1, _safe_int(getattr(texture, "height", 1), 1) >> mip)
+    if x >= mip_width or y >= mip_height:
+        raise ValueError(
+            "Pixel (%d, %d) is outside mip %d dimensions %dx%d" %
+            (x, y, mip, mip_width, mip_height))
+
+    dimension = getattr(texture, "dimension", None)
+    arraysize = getattr(texture, "arraysize", None)
+    depth = getattr(texture, "depth", None)
+    if dimension is not None and _safe_int(dimension, 0) == 3 and depth is not None:
+        slice_count = max(1, _safe_int(depth, 1) >> mip)
+    elif arraysize is not None:
+        slice_count = max(1, _safe_int(arraysize, 1))
+    else:
+        slice_count = None
+    if slice_count is not None and array_slice >= slice_count:
+        raise ValueError(
+            "Slice %d is outside mip %d slice count %d" %
+            (array_slice, mip, slice_count))
+
+    sample_count_value = getattr(
+        texture, "msSamp", getattr(texture, "sampleCount", None))
+    sample_count = (max(1, _safe_int(sample_count_value, 1))
+                    if sample_count_value is not None else None)
+    if sample_count is not None and sample >= sample_count:
+        raise ValueError(
+            "Sample %d is outside texture sample count %d" % (sample, sample_count))
+
+    subresource = rd.Subresource(mip, array_slice, sample)
+    started = time.time()
+    modifications = ctrl.PixelHistory(
+        tid, x, y, subresource, rd.CompType.Typeless)
+    elapsed_ms = int((time.time() - started) * 1000.0)
+
+    action_map = _pixel_action_map(ctrl)
+    records = []
+    for index, modification in enumerate(modifications or []):
+        event_id = _pixel_optional_int(modification, "eventId")
+        action = action_map.get(event_id, {
+            "found": False,
+            "eventId": event_id,
+            "actionId": None,
+            "name": "",
+            "flags": None,
+            "types": ["Unknown"],
+            "markerPath": [],
+            "isRasterGeometry": False,
+            "isComputeOrRay": False,
+        })
+        records.append(_pixel_modification_record(modification, index, action))
+
+    passed_records = [record for record in records if record["passed"] is True]
+    confirmed_non_direct = [
+        record for record in passed_records
+        if record["flags"]["directShaderWrite"] is not True
+    ]
+    potential_direct = [
+        record for record in records
+        if record["flags"]["directShaderWrite"] is True
+    ]
+    raster_records = [record for record in confirmed_non_direct
+                      if record["isPassedRasterGeometry"]]
+    last_recorded = records[-1] if records else None
+    last_passed_candidate = passed_records[-1] if passed_records else None
+    last_confirmed_non_direct = confirmed_non_direct[-1] if confirmed_non_direct else None
+    last_geometry = raster_records[-1] if raster_records else None
+
+    last_recorded_ref = (_pixel_contributor_reference(last_recorded)
+                         if last_recorded is not None else None)
+    last_passed_ref = (_pixel_contributor_reference(last_passed_candidate)
+                       if last_passed_candidate is not None else None)
+    last_confirmed_ref = (_pixel_contributor_reference(last_confirmed_non_direct)
+                          if last_confirmed_non_direct is not None else None)
+    last_geometry_ref = (_pixel_contributor_reference(last_geometry)
+                          if last_geometry is not None else None)
+    passed_candidates = [_pixel_contributor_reference(record) for record in passed_records]
+    direct_candidates = [_pixel_contributor_reference(record) for record in potential_direct]
+    preferred = (
+        last_geometry_ref if prefer_geometry and last_geometry_ref
+        else (last_confirmed_ref or last_passed_ref)
+    )
+    preferred_kind = None
+    if preferred is not None:
+        if prefer_geometry and last_geometry_ref:
+            preferred_kind = "LastPassedRasterGeometry"
+        elif last_confirmed_ref:
+            preferred_kind = "LastConfirmedNonDirectWrite"
+        else:
+            preferred_kind = "LastPassedWriteCandidate"
+
+    passed_candidate_confidence = (
+        "low" if last_passed_candidate is not None and
+        last_passed_candidate["flags"]["directShaderWrite"] is True
+        else ("high" if last_passed_candidate is not None else "none")
+    )
+    confirmed_writer_confidence = "high" if last_confirmed_ref else "none"
+    geometry_confidence = "high" if last_geometry_ref else "none"
+    object_confidence = "none"
+    overall_confidence = "low" if preferred_kind == "LastPassedRasterGeometry" else (
+        "low" if preferred is not None else "none")
+
+    last_action_event = max(action_map) if action_map else None
+    covers_last_action = None
+    if cutoff_event_id > 0 and last_action_event is not None:
+        covers_last_action = cutoff_event_id >= last_action_event
+
+    evidence = [
+        "PixelHistory returned %d modification attempt(s)." % len(records),
+        "%d modification(s) report Passed() == true; these are write candidates, not proof "
+        "of final material contribution." % len(passed_records),
+        "%d direct shader write(s) are potential writes only." % len(potential_direct),
+        "%d passed modification(s) have Drawcall/MeshDispatch action flags." %
+        len(raster_records),
+    ]
+    if last_passed_ref:
+        evidence.append(
+            "The final Passed() entry is retained as a write candidate, not asserted as a "
+            "confirmed final-frame writer.")
+    if last_geometry_ref:
+        evidence.append(
+            "The final passed raster action is associated with the reported primitive ID only; "
+            "PixelHistory does not expose an instance ID or asset identity.")
+
+    return {
+        "schema": PIXEL_OBJECT_INSPECTOR_SCHEMA,
+        "schemaVersion": PIXEL_OBJECT_INSPECTOR_VERSION,
+        "query": {
+            "textureId": texture_id,
+            "x": x,
+            "y": y,
+            "mip": mip,
+            "slice": array_slice,
+            "sample": sample,
+            "preferGeometry": bool(prefer_geometry),
+        },
+        "historyScope": {
+            "kind": "up-to-selected-event",
+            "cutoffEventId": cutoff_event_id,
+            "lastListedActionEventId": last_action_event,
+            "coversThroughLastListedAction": covers_last_action,
+            "isGuaranteedWholeFrame": covers_last_action is True,
+        },
+        "texture": {
+            "resourceId": texture_id,
+            "width": _safe_int(getattr(texture, "width", 0), 0),
+            "height": _safe_int(getattr(texture, "height", 0), 0),
+            "mips": mip_count,
+            "sliceCountAtMip": slice_count,
+            "sampleCount": sample_count,
+        },
+        "categories": {
+            "lastRecordedModification": last_recorded_ref,
+            "lastPassedWriteCandidate": last_passed_ref,
+            "lastConfirmedNonDirectWrite": last_confirmed_ref,
+            "lastPassedRasterGeometry": last_geometry_ref,
+            "allPassedWriteCandidates": passed_candidates,
+            "potentialDirectShaderWrites": direct_candidates,
+        },
+        "preferredSelection": {
+            "kind": preferred_kind,
+            "candidate": preferred,
+            "objectIdentity": None,
+        },
+        "modifications": records,
+        "confidence": {
+            "overallObjectSelection": overall_confidence,
+            "lastPassedWriteCandidate": passed_candidate_confidence,
+            "lastConfirmedNonDirectWrite": confirmed_writer_confidence,
+            "lastPassedRasterGeometry": geometry_confidence,
+            "objectIdentity": object_confidence,
+        },
+        "evidence": evidence,
+        "limitations": [
+            "This identifies events/fragments, not a unique engine object or asset.",
+            "PixelHistory is evaluated only through the selected cutoff event; it is not "
+            "automatically the final frame history.",
+            "PixelHistory does not expose a trustworthy instance ID; none is inferred.",
+            "Fullscreen and post-process draws use ordinary raster action flags and cannot be "
+            "distinguished reliably here.",
+            "Compute, ray, copy, clear, and direct shader writes have no raster object identity; "
+            "direct shader entries are potential writes rather than confirmed writes.",
+            "Passed() does not prove lasting final-pixel contribution. Transparency, blending, "
+            "overdraw, and later opaque writes prevent treating all passed entries as contributors.",
+        ],
+        "invocationPolicy": {
+            "interaction": "click-only",
+            "hoverSupported": False,
+            "continuousPollingSupported": False,
+            "runAsynchronouslyInUI": True,
+            "expensiveReplayOperation": True,
+            "elapsedMilliseconds": elapsed_ms,
+        },
+    }
+
+
+def _inspect_pixel_object(params):
+    """Inspect a clicked pixel and classify evidence without guessing an engine object."""
+    if not _ctx or not _ctx.IsCaptureLoaded():
+        raise RuntimeError("No capture loaded")
+
+    texture_id = _safe_int(params.get("texture_id"), 0)
+    if texture_id <= 0:
+        raise ValueError("texture_id required")
+    x = _safe_int(params.get("x"), -1)
+    y = _safe_int(params.get("y"), -1)
+    mip = _safe_int(params.get("mip", 0), -1)
+    array_slice = _safe_int(params.get("slice", 0), -1)
+    sample = _safe_int(params.get("sample", 0), -1)
+    prefer_geometry = bool(params.get("prefer_geometry", True))
+    if min(x, y, mip, array_slice, sample) < 0:
+        raise ValueError("x, y, mip, slice, and sample must be non-negative integers")
+
+    original_event = _safe_int(_ctx.CurEvent(), 0)
+
+    def _do(ctrl):
+        try:
+            result = _inspect_pixel_object_on_replay(
+                ctrl, texture_id, x, y, mip, array_slice, sample, prefer_geometry,
+                original_event)
+        finally:
+            # PixelHistory performs internal replay. Always put the user's event selection back,
+            # including event 0, and surface any restore failure instead of silently drifting.
+            ctrl.SetFrameEvent(original_event, True)
+        result["eventRestore"] = {
+            "originalEventId": original_event,
+            "restored": True,
+        }
+        return result
+
+    return _replay(_do)
+
+
+def _debug_pixel(params):
+    """Debug pixel shader execution."""
+    x = params.get("x", 0)
+    y = params.get("y", 0)
+    event_id = _safe_int(params.get("event_id", 0), 0)
+    sample = _safe_int(params.get("sample", 0), 0)
+    primitive_id = _safe_int(params.get("primitive_id", -1), -1)
+    view = _safe_int(params.get("view", 0), 0)
+    if min(_safe_int(x, -1), _safe_int(y, -1), sample, view) < 0:
+        raise ValueError("x, y, sample, and view must be non-negative integers")
+    if event_id < 0:
+        raise ValueError("event_id must be 0 (current event) or a positive event ID")
+
+    original_event = _safe_int(_ctx.CurEvent(), 0)
+
+    def _do(ctrl):
+        changed_event = event_id > 0
+        trace = None
+        try:
+            if changed_event:
+                ctrl.SetFrameEvent(event_id, True)
+            inputs = rd.DebugPixelInputs()
+            inputs.sample = sample
+            inputs.primitive = primitive_id if primitive_id >= 0 else 0xFFFFFFFF
+            inputs.view = view
+            trace = ctrl.DebugPixel(x, y, inputs)
+            if not trace or not trace.debugger:
+                return {
+                    "error": "No debug trace for this pixel",
+                    "eventId": event_id if event_id > 0 else original_event,
+                    "x": x, "y": y, "sample": sample,
+                    "primitiveId": primitive_id, "view": view,
+                }
+            states = []
+            batch = ctrl.ContinueDebug(trace.debugger)
+            while batch:
+                for state in batch:
+                    step = {"step": state.stepIndex}
+                    if state.sourceVars:
+                        step["vars"] = [
+                            {"name": variable.name, "val": str(variable.value)}
+                            for variable in state.sourceVars[:10]
+                        ]
+                    states.append(step)
+                batch = ctrl.ContinueDebug(trace.debugger)
+            return {
+                "eventId": event_id if event_id > 0 else original_event,
+                "x": x, "y": y, "sample": sample,
+                "primitiveId": primitive_id, "view": view,
+                "steps": len(states), "trace": states[:50],
+            }
+        finally:
+            if trace:
+                try:
+                    ctrl.FreeTrace(trace)
+                except Exception:
+                    pass
+            if changed_event:
+                ctrl.SetFrameEvent(original_event, True)
+
+    return _replay(_do)
+
+
+def _debug_vertex(params):
+    """Debug vertex shader execution."""
+    vertex_id = params.get("vertex_id", 0)
+    instance_id = params.get("instance_id", 0)
+
+    def _do(ctrl):
+        trace = ctrl.DebugVertex(vertex_id, instance_id, 0, 0)
+        if not trace or not trace.debugger:
+            return {"error": "No debug trace for this vertex"}
+        states = []
+        batch = ctrl.ContinueDebug(trace.debugger)
+        while batch:
+            for s in batch:
+                step = {"step": s.stepIndex}
+                if s.sourceVars:
+                    step["vars"] = [{"name": v.name, "val": str(v.value)} for v in s.sourceVars[:10]]
+                states.append(step)
+            batch = ctrl.ContinueDebug(trace.debugger)
+        ctrl.FreeTrace(trace)
+        return {"vertexId": vertex_id, "steps": len(states), "trace": states[:50]}
+
+    return _replay(_do)
+
+
+def _enumerate_counters(params):
+    """List available GPU counters."""
+    def _do(ctrl):
+        counters = ctrl.EnumerateCounters()
+        result = []
+        for c in counters:
+            desc = ctrl.DescribeCounter(c)
+            result.append({"id": int(c), "name": desc.name, "desc": desc.description, "unit": str(desc.unit)})
+        return result
+    return _replay(_do)
+
+
+def _fetch_counters(params):
+    """Fetch GPU counter values."""
+    ids = params.get("counter_ids", [])
+    if not ids:
+        raise ValueError("counter_ids required")
+
+    def _do(ctrl):
+        counters = [rd.GPUCounter(c) for c in ids]
+        results = ctrl.FetchCounters(counters)
+        return [{"eventId": r.eventId, "counter": int(r.counter), "value": r.value.d if hasattr(r.value, "d") else 0} for r in results]
+    return _replay(_do)
+
+
+def _counter_result_value(result, description):
+    result_type = str(getattr(description, "resultType", "")).lower()
+    byte_width = _safe_int(getattr(description, "resultByteWidth", 8), 8)
+    value = getattr(result, "value", None)
+    try:
+        if "float" in result_type:
+            return float(value.f if byte_width <= 4 else value.d)
+        if "uint" in result_type:
+            return int(value.u32 if byte_width <= 4 else value.u64)
+        if "sint" in result_type:
+            # CounterValue only exposes unsigned integer storage. Preserve its numeric bits rather
+            # than fabricating a signed interpretation without a documented width conversion.
+            return int(value.u32 if byte_width <= 4 else value.u64)
+    except Exception:
+        pass
+    return None
+
+
+def _get_action_timings(params):
+    """Fetch the real GPU event-duration counter or report that it is unsupported."""
+    requested_ids = set()
+    for value in params.get("event_ids", []) or []:
+        event_id = _safe_int(value, -1)
+        if event_id < 0:
+            raise ValueError("event_ids must contain non-negative integers")
+        requested_ids.add(event_id)
+    marker_filter = str(params.get("marker_filter", "") or "").strip().lower()
+
+    try:
+        original_event = _safe_int(_ctx.CurEvent(), 0)
+        restore_event = True
+    except Exception:
+        original_event = 0
+        restore_event = False
+
+    def _do(ctrl):
+        try:
+            available = list(ctrl.EnumerateCounters() or [])
+            duration_id = None
+            try:
+                standard_duration = _safe_int(rd.GPUCounter.EventGPUDuration, 1)
+            except Exception:
+                standard_duration = 1
+            descriptions = {}
+            for counter in available:
+                counter_id = _safe_int(counter, -1)
+                try:
+                    description = ctrl.DescribeCounter(counter)
+                    descriptions[counter_id] = description
+                except Exception:
+                    continue
+                if counter_id == standard_duration:
+                    duration_id = counter
+                    break
+
+            if duration_id is None:
+                for counter in available:
+                    counter_id = _safe_int(counter, -1)
+                    description = descriptions.get(counter_id)
+                    if description is None:
+                        try:
+                            description = ctrl.DescribeCounter(counter)
+                            descriptions[counter_id] = description
+                        except Exception:
+                            continue
+                    text = (str(getattr(description, "name", "")) + " " +
+                            str(getattr(description, "description", ""))).lower()
+                    if "duration" in text and "gpu" in text:
+                        duration_id = counter
+                        break
+
+            if duration_id is None:
+                return {
+                    "schema": "renderdoc-ultra-action-timings/v1",
+                    "schemaVersion": 1,
+                    "supported": False,
+                    "reason": "GPU event-duration counter is not available on this replay device.",
+                    "availableCounterIds": [_safe_int(counter, -1) for counter in available],
+                    "timings": [],
+                }
+
+            duration_key = _safe_int(duration_id, -1)
+            description = descriptions.get(duration_key)
+            if description is None:
+                description = ctrl.DescribeCounter(duration_id)
+            action_map = _pixel_action_map(ctrl)
+            try:
+                fetched = ctrl.FetchCounters([duration_id])
+            except Exception as exc:
+                return {
+                    "schema": "renderdoc-ultra-action-timings/v1",
+                    "schemaVersion": 1,
+                    "supported": False,
+                    "reason": "GPU duration counter fetch failed: %s" % str(exc),
+                    "counterId": duration_key,
+                    "timings": [],
+                }
+
+            timings = []
+            for counter_result in fetched or []:
+                event_id = _safe_int(getattr(counter_result, "eventId", 0), 0)
+                if requested_ids and event_id not in requested_ids:
+                    continue
+                action = action_map.get(event_id)
+                if marker_filter:
+                    if action is None:
+                        continue
+                    searchable = " / ".join(
+                        list(action.get("markerPath", [])) + [action.get("name", "")]
+                    ).lower()
+                    if marker_filter not in searchable:
+                        continue
+                value = _counter_result_value(counter_result, description)
+                record = {
+                    "eventId": event_id,
+                    "seconds": value,
+                    "milliseconds": value * 1000.0 if value is not None else None,
+                }
+                if action is not None:
+                    record["action"] = action
+                timings.append(record)
+
+            timings.sort(key=lambda item: item["eventId"])
+            return {
+                "schema": "renderdoc-ultra-action-timings/v1",
+                "schemaVersion": 1,
+                "supported": True,
+                "counter": {
+                    "id": duration_key,
+                    "name": str(getattr(description, "name", "")),
+                    "description": str(getattr(description, "description", "")),
+                    "unit": str(getattr(description, "unit", "")),
+                },
+                "filters": {
+                    "eventIds": sorted(requested_ids),
+                    "markerFilter": marker_filter,
+                },
+                "count": len(timings),
+                "timings": timings,
+            }
+        finally:
+            if restore_event:
+                ctrl.SetFrameEvent(original_event, True)
+
+    return _replay(_do)
+
+
+def _get_post_vs_data(params):
+    """Get post-VS mesh data."""
+    def _do(ctrl):
+        mesh = ctrl.GetPostVSData(0, 0, rd.MeshDataStage.VSOut)
+        return {"numIndices": mesh.numIndices, "topology": str(mesh.topology),
+                "indexStride": mesh.indexByteStride, "vertexStride": mesh.vertexByteStride}
+    return _replay(_do)
+
+
+def _get_debug_messages(params):
+    """Get debug/validation messages."""
+    def _do(ctrl):
+        msgs = ctrl.GetDebugMessages()
+        return [{"eventId": m.eventId, "severity": str(m.severity), "msg": m.description} for m in msgs]
+    return _replay(_do)
+
+
+def _list_captures(params):
+    """List .rdc files in a directory."""
+    directory = params.get("directory", "")
+    if not directory:
+        raise ValueError("directory required")
+    result = []
+    for f in os.listdir(directory):
+        if f.lower().endswith(".rdc"):
+            fp = os.path.join(directory, f)
+            result.append({"name": f, "path": fp, "size": os.path.getsize(fp)})
+    return result
+
+
+def _reject_duplicate_json_object(pairs):
+    """Reject duplicate keys in cache metadata read from an untrusted RDC."""
+
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("ReplayLab RDC project index contains a duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _canonical_project_index_bytes(document):
+    return json.dumps(
+        document, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _reject_project_index_json_constant(value):
+    raise ValueError(
+        "ReplayLab RDC project index contains a non-finite number: %s" % value)
+
+
+def _validated_project_index_document(value):
+    """Validate the small sealed envelope; the Host validates every record."""
+
+    if not isinstance(value, dict):
+        raise ValueError("ReplayLab RDC project index must be a JSON object")
+    if value.get("schema") != REPLAYLAB_RDC_PROJECT_INDEX_SCHEMA:
+        raise ValueError("ReplayLab RDC project index has an unsupported schema")
+    if value.get("schemaVersion") != REPLAYLAB_RDC_PROJECT_INDEX_VERSION:
+        raise ValueError("ReplayLab RDC project index has an unsupported version")
+    bindings = value.get("bindings")
+    if not isinstance(bindings, list) or len(bindings) > 4096:
+        raise ValueError("ReplayLab RDC project index bindings are invalid")
+    seal = str(value.get("sealSha256", "") or "").lower()
+    if (len(seal) != 64 or
+            any(character not in "0123456789abcdef" for character in seal)):
+        raise ValueError("ReplayLab RDC project index seal is invalid")
+    unsigned = dict(value)
+    unsigned.pop("sealSha256", None)
+    expected = hashlib.sha256(_canonical_project_index_bytes(unsigned)).hexdigest()
+    if seal != expected:
+        raise ValueError("ReplayLab RDC project index seal does not match its content")
+    return value
+
+
+def _require_project_index_capture(params):
+    if not _ctx or not _ctx.IsCaptureLoaded():
+        raise RuntimeError("No capture is loaded in RenderDoc")
+    expected_session = str(params.get("expected_capture_session_id", "") or "")
+    if expected_session and expected_session != _capture_session_id:
+        raise RuntimeError("RenderDoc capture session changed before RDC index access")
+    current_path = os.path.abspath(str(_ctx.GetCaptureFilename() or ""))
+    expected_path = str(params.get("expected_capture_path", "") or "").strip()
+    if (expected_path and
+            os.path.normcase(os.path.abspath(expected_path)) !=
+            os.path.normcase(current_path)):
+        raise RuntimeError("RenderDoc capture path changed before RDC index access")
+    if not current_path or not current_path.lower().endswith(".rdc"):
+        raise RuntimeError("The loaded capture is not a local RDC file")
+    return current_path
+
+
+def _project_index_section(access):
+    count = int(access.GetSectionCount())
+    if count < 0 or count > MAX_CAPTURE_SECTION_COUNT:
+        raise RuntimeError("The RDC section table exceeds ReplayLab's safety bound")
+    matches = []
+    for index in range(count):
+        props = access.GetSectionProperties(index)
+        if str(getattr(props, "name", "") or "") == REPLAYLAB_RDC_PROJECT_INDEX_SECTION:
+            matches.append((index, props))
+    if len(matches) > 1:
+        raise RuntimeError("The RDC contains duplicate ReplayLab project-index sections")
+    return matches[0] if matches else (None, None)
+
+
+def _read_project_index_from_access(access):
+    index, props = _project_index_section(access)
+    if index is None:
+        return {
+            "schema": "replaylab-rdc-project-index-transport/v1",
+            "schemaVersion": 1,
+            "sectionName": REPLAYLAB_RDC_PROJECT_INDEX_SECTION,
+            "present": False,
+            "document": None,
+        }
+    if int(getattr(props, "version", 0)) != REPLAYLAB_RDC_PROJECT_INDEX_VERSION:
+        raise RuntimeError("The RDC ReplayLab project-index section version is unsupported")
+    declared_size = int(getattr(props, "uncompressedSize", 0))
+    if declared_size < 0 or declared_size > MAX_REPLAYLAB_RDC_PROJECT_INDEX_BYTES:
+        raise RuntimeError("The RDC ReplayLab project index exceeds the size limit")
+    contents = bytes(access.GetSectionContents(index))
+    if not contents or len(contents) > MAX_REPLAYLAB_RDC_PROJECT_INDEX_BYTES:
+        raise RuntimeError("The RDC ReplayLab project index has an invalid size")
+    if declared_size and declared_size != len(contents):
+        raise RuntimeError("The RDC ReplayLab project-index size metadata is inconsistent")
+    try:
+        document = json.loads(
+            contents.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_object,
+            parse_constant=_reject_project_index_json_constant)
+    except (UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise RuntimeError("The RDC ReplayLab project index is not strict UTF-8 JSON: %s" % exc)
+    _validated_project_index_document(document)
+    return {
+        "schema": "replaylab-rdc-project-index-transport/v1",
+        "schemaVersion": 1,
+        "sectionName": REPLAYLAB_RDC_PROJECT_INDEX_SECTION,
+        "sectionVersion": int(getattr(props, "version", 0)),
+        "present": True,
+        "encodedSize": len(contents),
+        "encodedSha256": hashlib.sha256(contents).hexdigest(),
+        "document": document,
+    }
+
+
+def _read_rdc_project_index(params):
+    """Read the bounded ReplayLab association cache without replay traversal."""
+
+    path = _require_project_index_capture(params)
+    replay = _ctx.Replay()
+    access = replay.GetCaptureAccess()
+    if access is None:
+        raise RuntimeError("The loaded capture does not expose section access")
+    result = _read_project_index_from_access(access)
+    result.update({
+        "capturePath": path,
+        "captureSessionId": _capture_session_id,
+    })
+    return result
+
+
+def _write_rdc_project_index(params):
+    """Append/replace only ReplayLab's named custom section, then read it back."""
+
+    path = _require_project_index_capture(params)
+    document = _validated_project_index_document(params.get("document"))
+    encoded = _canonical_project_index_bytes(document)
+    if not encoded or len(encoded) > MAX_REPLAYLAB_RDC_PROJECT_INDEX_BYTES:
+        raise ValueError("ReplayLab RDC project index exceeds the size limit")
+    replay = _ctx.Replay()
+    capture_file = replay.GetCaptureFile()
+    if capture_file is None:
+        raise RuntimeError("ReplayLab can only write an index to a local capture file")
+    # Unknown + a unique name is RenderDoc's public custom-section contract.
+    props = rd.SectionProperties()
+    props.name = REPLAYLAB_RDC_PROJECT_INDEX_SECTION
+    props.type = rd.SectionType.Unknown
+    props.version = REPLAYLAB_RDC_PROJECT_INDEX_VERSION
+    props.flags = rd.SectionFlags.ZstdCompressed
+    written = capture_file.WriteSection(props, encoded)
+    ok = getattr(written, "OK", None)
+    if callable(ok) and not ok():
+        message = str(getattr(written, "message", "") or "")
+        raise RuntimeError(message or "RenderDoc could not write the ReplayLab RDC index")
+    # Treat the section as committed only after an exact read-back through the
+    # same capture handle. It remains a cache, never physical apply authority.
+    verified = _read_project_index_from_access(capture_file)
+    if (not verified.get("present") or
+            verified.get("encodedSha256") != hashlib.sha256(encoded).hexdigest() or
+            verified.get("document") != document):
+        raise RuntimeError("ReplayLab RDC project index failed post-write verification")
+    verified.update({
+        "capturePath": path,
+        "captureSessionId": _capture_session_id,
+        "written": True,
+        "physicalApplyAuthority": False,
+    })
+    return verified
+
+
+def _bind_rdc_project_shader_catalog(params):
+    """Rebind a cached workspace identity from bounded live Shader anchors.
+
+    This fast path never treats RDC metadata as apply authority. Every supplied
+    anchor is re-read from the live replay and checked by ResourceId, stage,
+    entry point, and exact captured bytecode hash. Candidate reflection and the
+    final replacement still execute their normal complete ABI gates.
+    """
+
+    global _known_catalog_capture_ids, _known_catalog_identity_pairs
+    path = _require_project_index_capture(params)
+    capture_id = str(params.get("expected_capture_id", "") or "").strip().lower()
+    evidence_sha256 = str(
+        params.get("expected_identity_evidence_sha256", "") or "").strip().lower()
+    for value, label in ((capture_id, "expected_capture_id"),
+                         (evidence_sha256, "expected_identity_evidence_sha256")):
+        if (len(value) != 64 or
+                any(character not in "0123456789abcdef" for character in value)):
+            raise ValueError("%s must be a lowercase SHA-256" % label)
+    anchors = params.get("anchors")
+    if not isinstance(anchors, list) or not anchors or len(anchors) > 256:
+        raise ValueError("anchors must contain between 1 and 256 Shader bindings")
+    stage_map = dict(_available_shader_stages())
+    clean = []
+    seen = set()
+    for index, raw in enumerate(anchors):
+        if not isinstance(raw, dict):
+            raise ValueError("Shader anchor %d must be an object" % index)
+        event_id = _safe_int(raw.get("eventId"), -1)
+        resource_id = _safe_int(raw.get("resourceId"), -1)
+        stage_name = _normalise_stage_name(raw.get("stage", ""))
+        entry_point = str(raw.get("entryPoint", "") or "")
+        raw_sha256 = str(raw.get("rawSha256", "") or "").lower()
+        if (event_id <= 0 or resource_id <= 0 or stage_name not in stage_map or
+                not entry_point or len(entry_point) > 512 or
+                len(raw_sha256) != 64 or
+                any(character not in "0123456789abcdef" for character in raw_sha256)):
+            raise ValueError("Shader anchor %d is invalid" % index)
+        key = (event_id, stage_name, resource_id, entry_point, raw_sha256)
+        if key in seen:
+            raise ValueError("Shader anchors must not contain duplicates")
+        seen.add(key)
+        clean.append({
+            "eventId": event_id,
+            "stage": stage_name,
+            "stageObject": stage_map[stage_name],
+            "resourceId": resource_id,
+            "entryPoint": entry_point,
+            "rawSha256": raw_sha256,
+        })
+
+    def _do(ctrl):
+        verified = []
+        try:
+            original_event = _safe_int(_ctx.CurEvent(), 0)
+            restore_event = True
+        except Exception:
+            original_event = 0
+            restore_event = False
+        try:
+            for anchor in clean:
+                ctrl.SetFrameEvent(anchor["eventId"], True)
+                pipeline = ctrl.GetPipelineState()
+                shader_id = pipeline.GetShader(anchor["stageObject"])
+                if _resource_id_int(shader_id) != anchor["resourceId"]:
+                    raise RuntimeError(
+                        "Cached Shader anchor event %d bound another resource" %
+                        anchor["eventId"])
+                entries = list(ctrl.GetShaderEntryPoints(shader_id) or [])
+                selected = None
+                for candidate in entries:
+                    if str(getattr(candidate, "name", "") or "") == anchor["entryPoint"]:
+                        selected = candidate
+                        break
+                if selected is None:
+                    raise RuntimeError(
+                        "Cached Shader anchor event %d changed entry point" %
+                        anchor["eventId"])
+                reflection = ctrl.GetShader(
+                    _get_pipeline_obj(pipeline, ctrl), shader_id, selected)
+                if reflection is None:
+                    raise RuntimeError(
+                        "Cached Shader anchor event %d has no reflection" %
+                        anchor["eventId"])
+                reflected_entry = str(
+                    getattr(reflection, "entryPoint", "") or
+                    getattr(selected, "name", "") or "")
+                raw_bytes = _shader_raw_bytes(reflection)
+                live_sha256 = hashlib.sha256(raw_bytes).hexdigest() if raw_bytes else ""
+                if (reflected_entry != anchor["entryPoint"] or
+                        live_sha256 != anchor["rawSha256"]):
+                    raise RuntimeError(
+                        "Cached Shader anchor event %d changed physical bytecode" %
+                        anchor["eventId"])
+                verified.append({
+                    "eventId": anchor["eventId"],
+                    "stage": anchor["stage"],
+                    "resourceId": anchor["resourceId"],
+                    "entryPoint": anchor["entryPoint"],
+                    "rawSha256": live_sha256,
+                })
+        finally:
+            if restore_event:
+                try:
+                    ctrl.SetFrameEvent(original_event, True)
+                except Exception:
+                    pass
+        return verified
+
+    verified = _replay(_do)
+    token = _current_capture_token()
+    if token is None or token[1] != os.path.normcase(os.path.abspath(path)):
+        raise RuntimeError("RenderDoc capture changed during cached Shader validation")
+    new_ids = dict(_known_catalog_capture_ids)
+    if capture_id not in new_ids and len(new_ids) >= MAX_KNOWN_CATALOG_CAPTURE_IDS:
+        raise RuntimeError("Too many cached capture identities are active")
+    new_ids[capture_id] = token[1]
+    new_pairs = set(_known_catalog_identity_pairs)
+    pair = (capture_id, evidence_sha256)
+    if pair not in new_pairs and len(new_pairs) >= MAX_KNOWN_CATALOG_IDENTITY_PAIRS:
+        raise RuntimeError("Too many cached catalog identities are active")
+    new_pairs.add(pair)
+    # Publish the exact pair last. The cached route remains a routing lease;
+    # reflect/apply functions perform the physical ABI checks immediately later.
+    _known_catalog_capture_ids = new_ids
+    _known_catalog_identity_pairs = new_pairs
+    return {
+        "schema": "replaylab-rdc-project-shader-rebind/v1",
+        "schemaVersion": 1,
+        "captureId": capture_id,
+        "captureSessionId": _capture_session_id,
+        "identityEvidenceSha256": evidence_sha256,
+        "verifiedAnchorCount": len(verified),
+        "anchors": verified,
+        "fullFrameTraversal": False,
+        "physicalApplyAuthority": False,
+    }
+
+
+_PROJECT_PRESELECTED_OPEN_TOKEN = object()
+
+
+def _capture_path_key(path):
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    return os.path.normcase(os.path.abspath(text))
+
+
+def _consume_preselected_project_capture(path):
+    """Consume the one-shot path armed by the project launcher's activation."""
+
+    global _project_preselected_capture_path
+    expected = _project_preselected_capture_path
+    if not expected:
+        return False
+    _project_preselected_capture_path = ""
+    return expected == _capture_path_key(path)
+
+
+def _open_capture(params, _project_open_token=None):
+    """Open a capture file in RenderDoc."""
+    path = params.get("capture_path", "")
+    if not path:
+        raise ValueError("capture_path required")
+    if not _ctx:
+        return {"error": "No context"}
+    global _active_capture_token, _project_preselected_capture_path
+    global _project_preselected_open_depth
+    _release_event_shader_overrides()
+    _release_shared_shader_replacements()
+    _release_event_cbuffer_snapshots()
+    _reset_symbol_state(restore_names=True)
+    # Match the bundled qrenderdoc ICaptureContext contract exactly. Reusing
+    # the configured defaults preserves the user's replay/GPU validation
+    # choices, while origFilename identifies the same local RDC.
+    project_preselected = _project_open_token is _PROJECT_PRESELECTED_OPEN_TOKEN
+    preselected_path = _capture_path_key(path) if project_preselected else ""
+    if project_preselected:
+        # project_launcher activates and fully validates the selected project
+        # before calling us. Arm the lifecycle callback so it does not launch a
+        # second registry-wide path association after this capture has loaded.
+        _project_preselected_capture_path = preselected_path
+        _project_preselected_open_depth += 1
+    try:
+        _ctx.LoadCapture(
+            path, _ctx.Config().DefaultReplayOptions, path, False, True)
+    except Exception:
+        if (_project_preselected_capture_path == preselected_path and
+                project_preselected):
+            _project_preselected_capture_path = ""
+        raise
+    finally:
+        if project_preselected:
+            _project_preselected_open_depth = max(
+                0, _project_preselected_open_depth - 1)
+    # LoadCapture reports replay failures through qrenderdoc's native dialog in
+    # some builds instead of raising back into Python.  Do not start project
+    # restoration unless the requested local capture is now the live context.
+    try:
+        loaded = bool(_ctx.IsCaptureLoaded())
+        loaded_path = os.path.abspath(str(_ctx.GetCaptureFilename() or ""))
+    except Exception:
+        loaded = False
+        loaded_path = ""
+    if (not loaded or
+            os.path.normcase(loaded_path) !=
+            os.path.normcase(os.path.abspath(path))):
+        if (_project_preselected_capture_path == preselected_path and
+                project_preselected):
+            _project_preselected_capture_path = ""
+        return {
+            "errorId": "renderdoc-open-incomplete",
+            # i18n-ignore: legacy MCP protocol diagnostic retained for clients
+            # that still detect failures through the historical error field.
+            "error": "RenderDoc did not finish opening the selected RDC",
+            "requested": os.path.abspath(path),
+        }
+    # Some qrenderdoc versions do not synchronously deliver CaptureViewer
+    # callbacks for integration-initiated loads. Establish a fresh physical
+    # session explicitly before any catalog identity can be cached.
+    _reset_symbol_state(restore_names=False)
+    _active_capture_token = _current_capture_token()
+    return {
+        "opened": loaded_path,
+        "captureSessionId": _capture_session_id,
+    }
+
+
+def _open_capture_for_preselected_project(path):
+    """Open an RDC whose owning project was explicitly activated by the UI."""
+
+    return _open_capture(
+        {"capture_path": str(path)}, _PROJECT_PRESELECTED_OPEN_TOKEN)
+
+
+def _get_bound_textures(params):
+    """Get textures bound to a shader stage with role inference."""
+    event_id = params.get("event_id")
+    stage_name = _normalise_stage_name(params.get("stage", "fragment"))
+    if event_id is None:
+        raise ValueError("event_id required")
+
+    stage_map = dict(_available_shader_stages([stage_name]))
+    stage = stage_map.get(stage_name)
+    if stage is None:
+        raise ValueError("unsupported shader stage: %s" % stage_name)
+
+    def _do(ctrl):
+        ctrl.SetFrameEvent(int(event_id), True)
+        ps = ctrl.GetPipelineState()
+        sid = ps.GetShader(stage)
+        if not sid or int(sid) == 0:
+            return []
+        pid = _get_pipeline_obj(ps, ctrl)
+        entries = ctrl.GetShaderEntryPoints(sid)
+        if not entries:
+            return []
+        refl = ctrl.GetShader(pid, sid, entries[0])
+        if not refl:
+            return []
+
+        name_lookup = {}
+        for r in ctrl.GetResources():
+            name_lookup[int(r.resourceId)] = r.name
+        tex_lookup = {}
+        for t in ctrl.GetTextures():
+            tex_lookup[int(t.resourceId)] = t
+
+        try:
+            ro_bindings = ps.GetReadOnlyResources(stage)
+        except Exception:
+            ro_bindings = None
+
+        # Pre-resolve Vulkan descriptors as fallback
+        vk_desc = {}
+        try:
+            vk_desc = _resolve_vulkan_descriptors(ctrl, ps, stage, refl)
+        except Exception:
+            pass
+
+        result = []
+        for i, ro in enumerate(getattr(refl, 'readOnlyResources', [])):
+            if not getattr(ro, 'isTexture', False):
+                continue
+            ro_name = getattr(ro, 'name', 'tex%d' % i)
+            bind_num = getattr(ro, 'fixedBindNumber', i)
+            entry = {"slot": i, "name": ro_name, "bind": bind_num, "resourceId": 0}
+            # Resolve bound resource — compatible with D3D11/D3D12/Vulkan/GL
+            entry["resourceId"] = _resolve_bound_resource(ro_bindings, i, ctrl)
+            # Fallback: try Vulkan descriptor resolution by binding number
+            if entry["resourceId"] == 0 and bind_num in vk_desc:
+                entry["resourceId"] = vk_desc[bind_num]
+            # Fallback: try by slot index
+            if entry["resourceId"] == 0 and i in vk_desc:
+                entry["resourceId"] = vk_desc[i]
+            rid = entry["resourceId"]
+            if rid and rid in tex_lookup:
+                t = tex_lookup[rid]
+                entry["texName"] = name_lookup.get(rid, "")
+                entry["width"] = t.width
+                entry["height"] = t.height
+                entry["format"] = _fmt_str(t.format)
+                entry["role"] = _infer_role(ro_name, name_lookup.get(rid, ""), _fmt_str(t.format))
+            else:
+                entry["role"] = _infer_role(ro_name, "", "")
+            result.append(entry)
+        return result
+
+    return _replay(_do)
+
+
+def _reverse_shader(params):
+    """Full shader reverse-engineering."""
+    event_id = params.get("event_id")
+    stage_name = params.get("stage", "fragment")
+    if event_id is None:
+        raise ValueError("event_id required")
+
+    # Reuse get_shader_info which already does full reverse
+    return _get_shader_info({"event_id": event_id, "stage": stage_name})
+
+
+def _lighting_cbuffer_window(binding):
+    """Return the bounded byte window represented by one CBuffer binding."""
+    offset = max(0, _safe_int(getattr(binding, "byteOffset", 0), 0))
+    byte_size = _safe_int(getattr(binding, "byteSize", 0), 0)
+    if byte_size <= 0:
+        return offset, 0
+    return offset, min(byte_size, MAX_LIGHTING_CBUFFER_BYTES)
+
+
+def _read_lighting_cbuffer_data(ctrl, resource_id, binding):
+    """Read only the bound CBuffer range used by the lighting heuristic."""
+    offset, byte_size = _lighting_cbuffer_window(binding)
+    if _resource_id_int(resource_id) <= 0 or byte_size <= 0:
+        return None, offset, byte_size
+    data = ctrl.GetBufferData(resource_id, offset, byte_size)
+    return data[:byte_size], offset, byte_size
+
+
+def _analyze_lighting(params):
+    """Analyze lighting setup from a draw call's shader and constant buffers."""
+    event_id = params.get("event_id")
+    if event_id is None:
+        raise ValueError("event_id required")
+
+    def _do(ctrl):
+        try:
+            ctrl.SetFrameEvent(int(event_id), True)
+            ps = ctrl.GetPipelineState()
+            pid = _get_pipeline_obj(ps, ctrl)
+            result = {"eventId": int(event_id)}
+        except Exception as e:
+            return {"error": "init: " + str(e)}
+
+        # 1. Get shader reflection
+        for stage_name, stage_enum in [("fragment", rd.ShaderStage.Fragment), ("vertex", rd.ShaderStage.Vertex)]:
+            try:
+                sid = ps.GetShader(stage_enum)
+                if not sid or int(sid) == 0:
+                    continue
+
+                entries = ctrl.GetShaderEntryPoints(sid)
+                if not entries:
+                    continue
+                refl = ctrl.GetShader(pid, sid, entries[0])
+                if not refl:
+                    continue
+            except Exception as e:
+                result["shaderError_%s" % stage_name] = str(e)[:200]
+                continue
+
+            # 2. Extract cbuffer variable values
+            cbuffers_info = []
+
+            # Get cbuffer bindings
+            cbufs_bound = None
+            try:
+                cbufs_bound = ps.GetConstantBuffers(stage_enum, False)
+            except Exception:
+                pass  # Vulkan: no GetConstantBuffers, use null resource fallback
+
+            for cb_idx, cb in enumerate(getattr(refl, 'constantBlocks', [])):
+                cb_name = getattr(cb, 'name', 'cbuffer%d' % cb_idx)
+                cb_info = {"name": cb_name, "index": cb_idx, "stage": stage_name}
+
+                try:
+                    buf_vars = None
+                    # Try with bound resource (8-arg version)
+                    if cbufs_bound and cb_idx < len(cbufs_bound):
+                        b = cbufs_bound[cb_idx]
+                        binding_offset, binding_size = _lighting_cbuffer_window(b)
+                        b_rid = rd.ResourceId()
+                        if hasattr(b, 'descriptor') and hasattr(b.descriptor, 'resource'):
+                            b_rid = b.descriptor.resource
+                        elif hasattr(b, 'resource'):
+                            b_rid = b.resource
+                        if binding_size > 0:
+                            try:
+                                buf_vars = ctrl.GetCBufferVariableContents(
+                                    pid, sid, stage_enum, entries[0].name,
+                                    cb_idx, b_rid, binding_offset, binding_size)
+                            except Exception:
+                                pass
+
+                    # Fallback with null resource
+                    if not buf_vars:
+                        try:
+                            null_rid = rd.ResourceId()
+                            buf_vars = ctrl.GetCBufferVariableContents(
+                                pid, sid, stage_enum, entries[0].name,
+                                cb_idx, null_rid, 0, 0)
+                        except Exception:
+                            pass
+
+                    if buf_vars:
+                        import struct as _struct_cb
+
+                        # Try to read raw buffer data for value extraction
+                        raw_data = None
+                        buf_debug = {}
+                        if cbufs_bound and cb_idx < len(cbufs_bound):
+                            b = cbufs_bound[cb_idx]
+                            b_rid = None
+                            if hasattr(b, 'descriptor') and hasattr(b.descriptor, 'resource'):
+                                b_rid = b.descriptor.resource
+                            elif hasattr(b, 'resource'):
+                                try:
+                                    if 0 < int(b.resource) < 10000000:
+                                        b_rid = b.resource
+                                except Exception:
+                                    pass
+                            if b_rid and int(b_rid) != 0:
+                                try:
+                                    raw_data, raw_offset, raw_size = \
+                                        _read_lighting_cbuffer_data(ctrl, b_rid, b)
+                                    buf_debug["rid"] = int(b_rid)
+                                    buf_debug["byteOffset"] = raw_offset
+                                    buf_debug["requestedBytes"] = raw_size
+                                    buf_debug["rawBytes"] = len(raw_data) if raw_data else 0
+                                except Exception:
+                                    pass
+
+                        # If raw buffer data available, dump all float4 values
+                        if raw_data and len(raw_data) >= 16:
+                            float4s = []
+                            for off in range(0, min(len(raw_data), 2048) - 15, 16):
+                                try:
+                                    x, y, z, w = _struct_cb.unpack_from("<ffff", raw_data, off)
+                                    float4s.append([round(x, 6), round(y, 6), round(z, 6), round(w, 6)])
+                                except Exception:
+                                    break
+                            cb_info["rawFloat4s"] = float4s
+                            cb_info["rawFloat4Count"] = len(float4s)
+
+                        cb_info["bufferDebug"] = buf_debug
+
+                        light_vars = []
+                        shadow_vars = []
+                        ambient_vars = []
+                        all_vars = []
+
+                        for v in buf_vars:
+                            vd = _var_dict(v)
+                            vname = vd.get("name", "").lower()
+
+                            # Extract values from raw buffer if _var_dict didn't get them
+                            if "float" not in vd and raw_data and hasattr(v, 'byteOffset'):
+                                off = v.byteOffset
+                                cols = getattr(v, 'columns', 0)
+                                rows = getattr(v, 'rows', 0)
+                                count = max(cols, 1) * max(rows, 1)
+                                if count > 0 and off + count * 4 <= len(raw_data):
+                                    try:
+                                        vals = list(_struct_cb.unpack_from("<%df" % count, raw_data, off))
+                                        # Trim trailing zeros
+                                        while vals and vals[-1] == 0.0:
+                                            vals.pop()
+                                        if vals:
+                                            vd["float"] = [round(x, 6) for x in vals]
+                                    except Exception:
+                                        pass
+
+                            # Also extract member values from raw buffer
+                            if "members" in vd and raw_data:
+                                for mi, m in enumerate(vd["members"]):
+                                    if "float" not in m:
+                                        mv = v.members[mi] if hasattr(v, 'members') and mi < len(v.members) else None
+                                        if mv and hasattr(mv, 'byteOffset'):
+                                            moff = mv.byteOffset
+                                            mcols = getattr(mv, 'columns', 4)
+                                            mrows = getattr(mv, 'rows', 1)
+                                            mcount = max(mcols, 1) * max(mrows, 1)
+                                            if mcount > 0 and moff + mcount * 4 <= len(raw_data):
+                                                try:
+                                                    mvals = list(_struct_cb.unpack_from("<%df" % mcount, raw_data, moff))
+                                                    while mvals and mvals[-1] == 0.0:
+                                                        mvals.pop()
+                                                    if mvals:
+                                                        m["float"] = [round(x, 6) for x in mvals]
+                                                except Exception:
+                                                    pass
+
+                            vals = vd.get("float", [])
+
+                            # Auto-classify by variable name
+                            category = None
+                            if any(k in vname for k in ['light', 'sun', 'direction', 'dir']):
+                                category = "light"
+                            elif any(k in vname for k in ['shadow', 'cascade', 'bias']):
+                                category = "shadow"
+                            elif any(k in vname for k in ['ambient', 'env', 'sh', 'ibl', 'probe', 'gi']):
+                                category = "ambient"
+                            elif any(k in vname for k in ['color', 'colour', 'intensity',
+                                                           'atten', 'range', 'radius', 'falloff']):
+                                category = "light_param"
+
+                            # Heuristic for anonymous ANGLE variables (_childN)
+                            if category is None and vname.startswith('_child'):
+                                has_members = "members" in vd
+                                member_count = len(vd.get("members", []))
+
+                                # float4[4] = likely SH coefficients or shadow matrix
+                                if member_count == 4:
+                                    category = "ambient_or_matrix"
+                                # float4[6] = likely light array (pos/color/dir/atten per light)
+                                elif member_count == 6:
+                                    category = "light_array"
+                                # float4[8] = likely shadow cascade matrix
+                                elif member_count == 8:
+                                    category = "shadow_matrix"
+                                # float4[2] = likely shadow atlas UV
+                                elif member_count == 2:
+                                    category = "shadow_param"
+                                # Scalar/vector by value heuristic
+                                elif not has_members and vals:
+                                    if len(vals) >= 3:
+                                        mag = sum(v2*v2 for v2 in vals[:3]) ** 0.5
+                                        if 0.95 < mag < 1.05:
+                                            category = "light_direction"
+                                        elif all(0 <= v2 <= 2.0 for v2 in vals[:3]) and sum(vals[:3]) > 0.01:
+                                            category = "color_or_light"
+
+                            if category:
+                                vd["_category"] = category
+                                if "light" in category:
+                                    light_vars.append(vd)
+                                elif "shadow" in category:
+                                    shadow_vars.append(vd)
+                                elif "ambient" in category:
+                                    ambient_vars.append(vd)
+
+                            all_vars.append(vd)
+
+                        cb_info["varCount"] = len(all_vars)
+                        cb_info["variables"] = all_vars[:60]
+                        if light_vars:
+                            cb_info["lightVars"] = light_vars
+                        if shadow_vars:
+                            cb_info["shadowVars"] = shadow_vars
+                        if ambient_vars:
+                            cb_info["ambientVars"] = ambient_vars
+                    else:
+                        cb_info["note"] = "no variables returned"
+                except Exception as e:
+                    cb_info["error"] = str(e)[:200]
+
+                cbuffers_info.append(cb_info)
+
+            if cbuffers_info:
+                result.setdefault("cbuffers", {})[stage_name] = cbuffers_info
+
+            # 3. Detect lighting model from shader disassembly
+            if stage_name == "fragment":
+                try:
+                    targets = ctrl.GetDisassemblyTargets(True)
+                    spirv_target = None
+                    for t in targets:
+                        if 'SPIR-V' in t:
+                            spirv_target = t
+                            break
+                    if spirv_target:
+                        code = ctrl.DisassembleShader(pid, refl, spirv_target)
+                        if code:
+                            result["lightingModel"] = _detect_lighting_model(code)
+                except Exception as e:
+                    result["lightingModelError"] = str(e)[:200]
+
+            # 4. Identify shadow maps and env maps from bound textures
+            try:
+                tex_lookup = {}
+                for t in ctrl.GetTextures():
+                    tex_lookup[int(t.resourceId)] = t
+
+                try:
+                    ro_bindings = ps.GetReadOnlyResources(stage_enum)
+                except Exception:
+                    ro_bindings = None
+
+                shadow_maps = []
+                env_maps = []
+
+                for i, ro in enumerate(getattr(refl, 'readOnlyResources', [])):
+                    if not getattr(ro, 'isTexture', False):
+                        continue
+                    ro_name = getattr(ro, 'name', 'tex%d' % i)
+                    bound_rid = _resolve_bound_resource(ro_bindings, i, ctrl)
+                    tex = tex_lookup.get(bound_rid)
+                    if not tex:
+                        continue
+
+                    fmt = _fmt_str(tex.format)
+                    is_depth = any(k in fmt.lower() for k in ['depth', 'd32', 'd24', 'd16'])
+                    is_cubemap = tex.arraysize == 6
+
+                    entry = {"slot": i, "name": ro_name, "resourceId": bound_rid,
+                             "width": tex.width, "height": tex.height, "format": fmt}
+
+                    if is_depth:
+                        entry["role"] = "shadow_map"
+                        shadow_maps.append(entry)
+                    elif is_cubemap:
+                        entry["role"] = "environment_cubemap"
+                        env_maps.append(entry)
+
+                if shadow_maps:
+                    result["shadowMaps"] = shadow_maps
+                if env_maps:
+                    result["environmentMaps"] = env_maps
+            except Exception as e:
+                result["textureAnalysisError_%s" % stage_name] = str(e)[:200]
+
+        return result
+
+    return _replay(_do)
+
+
+def _detect_lighting_model(code):
+    """Detect lighting model from shader disassembly."""
+    info = {"model": "unknown", "features": []}
+    code_lower = code.lower() if code else ""
+
+    # PBR indicators
+    if any(k in code_lower for k in ['ggx', 'brdf', 'metallic', 'roughness', 'pbr',
+                                       'cooktorrance', 'smith', 'schlick', 'beckmann']):
+        info["model"] = "PBR"
+    elif any(k in code_lower for k in ['blinnphong', 'blinn', 'phong', 'specular_power']):
+        info["model"] = "Blinn-Phong"
+    elif any(k in code_lower for k in ['lambert', 'diffuse_only']):
+        info["model"] = "Lambert"
+    elif 'inversesqrt' in code_lower and 'dot' in code_lower:
+        info["model"] = "PBR (inferred)"  # GGX uses InverseSqrt + Dot patterns
+
+    # Feature detection
+    if 'shadow' in code_lower or 'drefexplicitlod' in code_lower or 'shadowmap' in code_lower:
+        info["features"].append("shadow_mapping")
+    if any(k in code_lower for k in ['cascade', 'csm']):
+        info["features"].append("cascaded_shadow_maps")
+    if any(k in code_lower for k in ['subsurface', 'sss', 'scattering']):
+        info["features"].append("subsurface_scattering")
+    if any(k in code_lower for k in ['fresnel', 'schlick']):
+        info["features"].append("fresnel")
+    if any(k in code_lower for k in ['envmap', 'cubemap', 'reflection', 'imagesampleexplicitlod']):
+        info["features"].append("environment_reflection")
+    if 'ao' in code_lower or 'occlusion' in code_lower:
+        info["features"].append("ambient_occlusion")
+    if any(k in code_lower for k in ['emissive', 'emission', 'glow', 'bloom']):
+        info["features"].append("emissive")
+    if any(k in code_lower for k in ['normalmap', 'tangent', 'bitangent', 'tbn']):
+        info["features"].append("normal_mapping")
+
+    # Count light loop iterations (look for while/for patterns with light index)
+    if 'while' in code_lower and ('child13' in code_lower or 'child14' in code_lower or 'light' in code_lower):
+        info["features"].append("multi_light_loop")
+
+    return info
+
+
+def _parse_light_variables(buf_vars):
+    """Parse cbuffer variables and extract lighting-related values."""
+    result = {"directionalLights": [], "pointLights": [], "parameters": []}
+
+    for v in buf_vars:
+        var_data = _var_dict(v)
+        name = var_data.get("name", "")
+
+        # Try to extract float values
+        vals = None
+        if "value" in var_data:
+            val = var_data["value"]
+            if isinstance(val, (list, tuple)):
+                vals = [float(x) for x in val if isinstance(x, (int, float))]
+            elif isinstance(val, dict):
+                for k in ["f32v", "f", "x", "r"]:
+                    if k in val:
+                        v2 = val[k]
+                        if isinstance(v2, (list, tuple)):
+                            vals = [float(x) for x in v2[:4]]
+                        break
+
+        if vals:
+            var_data["floatValues"] = vals[:4]
+
+        result["parameters"].append(var_data)
+
+    return result
+
+
+def _analyze_cbuffer_lighting(cb_data, cb_name, cb_bind, stage_name):
+    """Heuristic analysis of raw cbuffer data for lighting parameters."""
+    import struct as _struct
+
+    info = {"name": cb_name, "binding": cb_bind, "stage": stage_name, "size": len(cb_data)}
+
+    # Read all float4 values
+    float4s = []
+    for off in range(0, len(cb_data) - 15, 16):
+        try:
+            x, y, z, w = _struct.unpack_from("<ffff", cb_data, off)
+            float4s.append({"offset": off, "values": [x, y, z, w]})
+        except Exception:
+            break
+
+    # Heuristic: identify potential light directions (unit vectors)
+    directions = []
+    colors = []
+    matrices = []
+
+    for f4 in float4s:
+        x, y, z, w = f4["values"]
+        mag = (x * x + y * y + z * z) ** 0.5
+
+        # Unit vector = likely direction
+        if 0.95 < mag < 1.05 and abs(w) < 0.1:
+            directions.append({"offset": f4["offset"], "direction": [round(x, 4), round(y, 4), round(z, 4)],
+                               "hint": "possible light direction"})
+
+        # RGB color (0-1 range, positive)
+        elif 0 <= x <= 5 and 0 <= y <= 5 and 0 <= z <= 5 and (x + y + z) > 0.01:
+            if x != y or y != z:  # Not a scalar
+                colors.append({"offset": f4["offset"], "color": [round(x, 4), round(y, 4), round(z, 4)],
+                                "w": round(w, 4), "hint": "possible light color"})
+
+    info["potentialDirections"] = directions[:10]
+    info["potentialColors"] = colors[:20]
+    info["totalFloat4s"] = len(float4s)
+
+    return info
+
+
+def _identify_drawcalls(params):
+    """Identify DrawCall content by rendering RT thumbnails for each action.
+
+    For each DrawCall in the specified range, captures the render target BEFORE and AFTER
+    the draw, computes a pixel diff, and saves a cropped thumbnail showing ONLY what that
+    DrawCall contributed. Also collects shader IDs, bound texture info, and vertex AABB.
+
+    Args:
+        event_id_min: Start of event range (default 0).
+        event_id_max: End of event range (default 999999).
+        output_dir: Directory to save per-DrawCall thumbnails (optional).
+        render_target: Override RT resource ID (auto-detected if omitted).
+    Returns:
+        List of DrawCall identifications with thumbnails and metadata.
+    """
+    eid_min = params.get("event_id_min", 0)
+    eid_max = params.get("event_id_max", 999999)
+    output_dir = params.get("output_dir", "")
+    rt_override = params.get("render_target", 0)
+
+    def _do(ctrl):
+        import struct as _struct
+
+        # Get all draw actions in range
+        all_actions = ctrl.GetRootActions()
+        actions = []
+
+        def _collect(act_list):
+            for a in act_list:
+                eid = a.eventId
+                if eid < eid_min or eid > eid_max:
+                    if a.children:
+                        _collect(a.children)
+                    continue
+                flags = int(a.flags)
+                # Check if it's an actual draw (has indices)
+                if a.numIndices > 0 and (flags & 0x2):  # ActionFlags.Drawcall = 0x2
+                    actions.append(a)
+                if a.children:
+                    _collect(a.children)
+
+        _collect(all_actions)
+
+        if not actions:
+            return {"error": "No draw actions found in range %d-%d" % (eid_min, eid_max)}
+
+        # Determine render target
+        rt_id = rt_override
+        if not rt_id:
+            # Use the first action's output RT
+            ctrl.SetFrameEvent(actions[0].eventId, True)
+            ps = ctrl.GetPipelineState()
+            outs = ps.GetOutputTargets()
+            if outs:
+                for o in outs:
+                    rid = 0
+                    if hasattr(o, 'resource'):
+                        rid = int(o.resource)
+                    elif hasattr(o, 'resourceId'):
+                        rid = int(o.resourceId)
+                    # Vulkan: UsedDescriptor style
+                    if rid == 0 and hasattr(o, 'descriptor'):
+                        desc = o.descriptor
+                        if hasattr(desc, 'resource'):
+                            rid = int(desc.resource)
+                    if rid != 0:
+                        rt_id = rid
+                        break
+
+        if not rt_id:
+            return {"error": "Could not determine render target"}
+
+        # Get RT dimensions
+        tex_info = None
+        for t in ctrl.GetTextures():
+            if int(t.resourceId) == rt_id:
+                tex_info = t
+                break
+
+        if not tex_info:
+            return {"error": "Render target %d not found" % rt_id}
+
+        rt_width = tex_info.width
+        rt_height = tex_info.height
+
+        # Create output directory
+        if output_dir:
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+
+        results = []
+        prev_pixels = None
+
+        # For each action, capture RT state and diff
+        for idx, action in enumerate(actions):
+            eid = action.eventId
+            entry = {
+                "eventId": eid,
+                "name": action.name if hasattr(action, 'name') else "Action",
+                "numIndices": action.numIndices,
+                "numInstances": action.numInstances,
+                "triangles": action.numIndices // 3,
+            }
+
+            # Set event to JUST BEFORE this draw (previous event)
+            if idx > 0:
+                prev_eid = actions[idx - 1].eventId
+            else:
+                # Find the event just before this action
+                prev_eid = max(1, eid - 1)
+
+            # Capture RT AFTER this draw
+            ctrl.SetFrameEvent(eid, True)
+
+            # Get shader info
+            ps = ctrl.GetPipelineState()
+            vs_id = ps.GetShader(rd.ShaderStage.Vertex)
+            fs_id = ps.GetShader(rd.ShaderStage.Fragment)
+            entry["vertexShader"] = int(vs_id) if vs_id else 0
+            entry["fragmentShader"] = int(fs_id) if fs_id else 0
+
+            # Get bound texture count and first texture info
+            pid = _get_pipeline_obj(ps, ctrl)
+            tex_bindings = []
+            try:
+                refl = None
+                if fs_id and int(fs_id) != 0:
+                    ep = ctrl.GetShaderEntryPoints(fs_id)
+                    if ep:
+                        refl = ctrl.GetShader(pid, fs_id, ep[0])
+                if refl:
+                    ro_bindings = None
+                    try:
+                        ro_bindings = ps.GetReadOnlyResources(rd.ShaderStage.Fragment)
+                    except Exception:
+                        pass
+
+                    tex_lookup = {}
+                    for t2 in ctrl.GetTextures():
+                        tex_lookup[int(t2.resourceId)] = t2
+
+                    for i, ro in enumerate(getattr(refl, 'readOnlyResources', [])):
+                        if not getattr(ro, 'isTexture', False):
+                            continue
+                        ro_name = getattr(ro, 'name', 'tex%d' % i)
+                        bound_rid = _resolve_bound_resource(ro_bindings, i, ctrl)
+                        t_info = tex_lookup.get(bound_rid)
+                        tex_bindings.append({
+                            "slot": i,
+                            "name": ro_name,
+                            "resourceId": bound_rid,
+                            "width": t_info.width if t_info else 0,
+                            "height": t_info.height if t_info else 0,
+                        })
+            except Exception:
+                pass
+
+            entry["textureCount"] = len(tex_bindings)
+            entry["textures"] = tex_bindings[:5]  # First 5 only
+
+            # Try to get vertex AABB from post-VS data
+            try:
+                mesh_out = ctrl.GetPostVSData(0, 0, rd.MeshDataStage.VSOut)
+                if mesh_out and mesh_out.numIndices > 0:
+                    vb_rid = mesh_out.vertexResourceId
+                    vb_stride = mesh_out.vertexByteStride
+                    vb_off = mesh_out.vertexByteOffset
+                    n_verts = min(mesh_out.numIndices, 5000)
+                    if vb_rid and int(vb_rid) != 0 and vb_stride >= 16:
+                        vb_data = ctrl.GetBufferData(vb_rid, vb_off, n_verts * vb_stride)
+                        if vb_data and len(vb_data) >= vb_stride:
+                            xs, ys, zs = [], [], []
+                            actual = min(n_verts, len(vb_data) // vb_stride)
+                            for vi in range(actual):
+                                base = vi * vb_stride
+                                if base + 16 <= len(vb_data):
+                                    x, y, z, w = _struct.unpack_from("<ffff", vb_data, base)
+                                    if w != 0 and abs(x) < 1e6 and abs(y) < 1e6:
+                                        # Clip space -> NDC -> screen
+                                        ndc_x = x / w
+                                        ndc_y = y / w
+                                        screen_x = (ndc_x * 0.5 + 0.5) * rt_width
+                                        screen_y = (0.5 - ndc_y * 0.5) * rt_height
+                                        xs.append(screen_x)
+                                        ys.append(screen_y)
+                                        zs.append(z / w if w != 0 else 0)
+                            if xs:
+                                entry["screenBBox"] = {
+                                    "minX": int(max(0, min(xs))),
+                                    "minY": int(max(0, min(ys))),
+                                    "maxX": int(min(rt_width, max(xs))),
+                                    "maxY": int(min(rt_height, max(ys))),
+                                    "depth": round(sum(zs) / len(zs), 4),
+                                }
+                                entry["screenCoverage"] = round(
+                                    (max(xs) - min(xs)) * (max(ys) - min(ys)) / (rt_width * rt_height) * 100, 2
+                                )
+            except Exception:
+                pass
+
+            # Save RT thumbnail if output_dir specified
+            if output_dir:
+                thumb_path = os.path.join(output_dir, "eid_%04d.png" % eid)
+                try:
+                    save = rd.TextureSave()
+                    save.resourceId = rd.ResourceId()
+                    # Set the ID value
+                    id_obj = save.resourceId
+                    # Copy from the actual texture resourceId
+                    for t3 in ctrl.GetTextures():
+                        if int(t3.resourceId) == rt_id:
+                            save.resourceId = t3.resourceId
+                            break
+                    save.mip = 0
+                    save.destType = rd.FileType.PNG
+                    ret = ctrl.SaveTexture(save, thumb_path)
+                    if hasattr(ret, 'code') and ret.code == rd.ResultCode.Succeeded:
+                        entry["thumbnail"] = thumb_path
+                    else:
+                        entry["thumbnailError"] = str(ret)[:100]
+                except Exception as e2:
+                    entry["thumbnailError"] = str(e2)[:100]
+
+            results.append(entry)
+
+        # Group by shader
+        shader_groups = {}
+        for r in results:
+            key = "%d/%d" % (r["vertexShader"], r["fragmentShader"])
+            if key not in shader_groups:
+                shader_groups[key] = []
+            shader_groups[key].append(r["eventId"])
+
+        return {
+            "renderTarget": rt_id,
+            "rtSize": "%dx%d" % (rt_width, rt_height),
+            "actionCount": len(results),
+            "shaderGroups": shader_groups,
+            "actions": results,
+        }
+
+    return _replay(_do)
+
+
+def _debug_vulkan_bindings(params):
+    """Debug tool: dump Vulkan descriptor set bindings raw structure."""
+    event_id = params.get("event_id")
+    stage_name = params.get("stage", "fragment")
+    if event_id is None:
+        raise ValueError("event_id required")
+
+    stage_map = {
+        "vertex": rd.ShaderStage.Vertex, "fragment": rd.ShaderStage.Fragment,
+        "pixel": rd.ShaderStage.Fragment, "geometry": rd.ShaderStage.Geometry,
+        "compute": rd.ShaderStage.Compute,
+        "hull": rd.ShaderStage.Hull, "domain": rd.ShaderStage.Domain,
+        "tess_ctrl": rd.ShaderStage.Hull, "tess_eval": rd.ShaderStage.Domain,
+    }
+    stage = stage_map.get(stage_name.lower(), rd.ShaderStage.Fragment)
+
+    def _introspect(obj, depth=0, max_depth=3):
+        """Recursively dump object attributes."""
+        if depth >= max_depth:
+            return str(obj)[:200]
+        if obj is None:
+            return None
+        if isinstance(obj, (int, float, str, bool)):
+            return obj
+        # Try list-like first (before int conversion)
+        try:
+            if hasattr(obj, '__len__') and hasattr(obj, '__getitem__'):
+                items = []
+                for i in range(min(len(obj), 20)):
+                    items.append(_introspect(obj[i], depth + 1, max_depth))
+                return {"_list": items, "_len": len(obj)}
+        except Exception:
+            pass
+        # For SWIG objects, dump all non-callable attributes
+        result = {"_type": type(obj).__name__}
+        attrs_found = False
+        for attr in dir(obj):
+            if attr.startswith('_'):
+                continue
+            try:
+                val = getattr(obj, attr)
+                if callable(val):
+                    continue
+                attrs_found = True
+                result[attr] = _introspect(val, depth + 1, max_depth)
+            except Exception as e:
+                result[attr] = "ERR:%s" % str(e)[:100]
+        # If no useful attrs found, try int/str fallback
+        if not attrs_found:
+            try:
+                result["_int"] = int(obj)
+            except (TypeError, ValueError):
+                pass
+            result["_str"] = str(obj)[:200]
+        return result
+
+    def _do(ctrl):
+        ctrl.SetFrameEvent(int(event_id), True)
+        ps = ctrl.GetPipelineState()
+        info = {"eventId": int(event_id), "api": str(ctrl.GetAPIProperties().pipelineType)}
+
+        # 1. GetReadOnlyResources
+        try:
+            ro = ps.GetReadOnlyResources(stage)
+            ro_dump = []
+            for i, b in enumerate(ro):
+                ro_dump.append(_introspect(b, 0, 4))
+            info["readOnlyResources"] = {"count": len(ro), "items": ro_dump[:15]}
+        except Exception as e:
+            info["readOnlyResources"] = {"error": str(e)}
+
+        # 2. GetReadWriteResources
+        try:
+            rw = ps.GetReadWriteResources(stage)
+            info["readWriteResourceCount"] = len(rw)
+        except Exception as e:
+            info["readWriteResources"] = {"error": str(e)}
+
+        # 3. Try Vulkan-specific pipeline state
+        pipe = None
+        try:
+            pipe = ps.GetVulkanPipelineState()
+            info["hasVulkanState"] = True
+        except Exception:
+            info["hasVulkanState"] = False
+
+        if pipe:
+            # Dump descriptor sets
+            try:
+                desc_sets = pipe.graphics.descriptorSets if hasattr(pipe, 'graphics') else []
+                ds_dump = []
+                for ds_idx, ds in enumerate(desc_sets):
+                    ds_info = _introspect(ds, 0, 5)
+                    ds_dump.append(ds_info)
+                info["descriptorSets"] = {"count": len(desc_sets), "sets": ds_dump[:5]}
+            except Exception as e:
+                info["descriptorSets"] = {"error": str(e)}
+
+            # Dump top-level pipe attributes
+            try:
+                pipe_attrs = {}
+                for attr in dir(pipe):
+                    if attr.startswith('_'):
+                        continue
+                    try:
+                        val = getattr(pipe, attr)
+                        if callable(val):
+                            continue
+                        pipe_attrs[attr] = type(val).__name__
+                    except Exception:
+                        pass
+                info["pipelineAttrs"] = pipe_attrs
+            except Exception:
+                pass
+
+        # 4. Try GetDescriptorAccess
+        try:
+            accesses = ctrl.GetDescriptorAccess()
+            acc_dump = []
+            for a in accesses[:20]:
+                acc_dump.append(_introspect(a, 0, 3))
+            info["descriptorAccess"] = {"count": len(accesses), "items": acc_dump}
+        except Exception as e:
+            info["descriptorAccess"] = {"error": str(e), "type": type(e).__name__}
+
+        # 5. Shader reflection readOnlyResources
+        sid = ps.GetShader(stage)
+        if sid and int(sid) != 0:
+            pid = _get_pipeline_obj(ps, ctrl)
+            entries = ctrl.GetShaderEntryPoints(sid)
+            if entries:
+                refl = ctrl.GetShader(pid, sid, entries[0])
+                if refl:
+                    ro_res = getattr(refl, 'readOnlyResources', [])
+                    refl_dump = []
+                    for i, r in enumerate(ro_res):
+                        refl_dump.append(_introspect(r, 0, 3))
+                    info["shaderReflection"] = {
+                        "readOnlyResourceCount": len(ro_res),
+                        "items": refl_dump[:15]
+                    }
+
+        return info
+
+    return _replay(_do)
+
+
+def _export_drawcall(params):
+    """Export a drawcall's shaders + textures to disk."""
+    event_id = params.get("event_id")
+    output_dir = params.get("output_dir")
+    if event_id is None or not output_dir:
+        raise ValueError("event_id and output_dir required")
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    result = {"eventId": int(event_id), "outputDir": output_dir, "files": []}
+
+    for stage_name in ["vertex", "hull", "domain", "geometry", "fragment"]:
+        try:
+            info = _get_shader_info({"event_id": event_id, "stage": stage_name})
+            if "error" in info:
+                continue
+
+            # Save disassembly
+            if "disassembly" in info:
+                for target, code in info["disassembly"].items():
+                    if code and not code.startswith("Error"):
+                        safe = target.replace(" ", "_").replace("/", "_")
+                        fp = os.path.join(output_dir, "%s_%s.txt" % (stage_name, safe))
+                        with open(fp, "w", encoding="utf-8") as f:
+                            f.write(code)
+                        result["files"].append(fp)
+
+            # Save source files
+            if "sourceFiles" in info:
+                for sf in info["sourceFiles"]:
+                    safe = sf["filename"].replace("/", "_").replace("\\", "_")
+                    fp = os.path.join(output_dir, "%s_src_%s" % (stage_name, safe))
+                    with open(fp, "w", encoding="utf-8") as f:
+                        f.write(sf["contents"])
+                    result["files"].append(fp)
+
+            # Save bound textures as PNG (with CubeMap support)
+            if "boundTextures" in info:
+                for tex in info["boundTextures"]:
+                    rid = tex.get("resourceId", 0)
+                    if not rid:
+                        continue
+                    role = tex.get("role", "unknown")
+                    safe_name = tex.get("name", "tex").replace(" ", "_")
+                    fp = os.path.join(output_dir, "%s_slot%d_%s_%s.png" % (stage_name, tex["slot"], safe_name, role))
+                    try:
+                        save_result = _save_texture({"resource_id": rid, "output_path": fp})
+                        # Handle CubeMap: multiple face files returned
+                        if isinstance(save_result, dict):
+                            if "savedFaces" in save_result:
+                                for face in save_result["savedFaces"]:
+                                    result["files"].append(face["path"])
+                            elif "saved" in save_result:
+                                result["files"].append(save_result["saved"])
+                    except Exception:
+                        pass
+        except Exception as e:
+            result.setdefault("errors", []).append("%s: %s" % (stage_name, str(e)))
+
+    # Save summary JSON
+    summary_fp = os.path.join(output_dir, "summary.json")
+    with open(summary_fp, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False, default=str)
+    result["files"].append(summary_fp)
+
+    return result
+
+
+def _export_to_unity(params):
+    """Export a draw call's mesh (OBJ), textures (PNG), and Unity material JSON.
+
+    This is the one-stop tool for bringing a RenderDoc draw call into Unity:
+    - Exports the mesh as .obj (with positions, normals, UVs, indices)
+    - Exports all bound textures as .png with role-based filenames
+    - Generates a Unity-compatible material definition JSON
+    - Generates a shader property mapping for Unity Standard/URP/Custom shaders
+    """
+    import struct as _struct
+    import base64 as _b64
+
+    event_id = params.get("event_id")
+    output_dir = params.get("output_dir")
+    mesh_name = params.get("mesh_name", "exported_mesh")
+    if event_id is None or not output_dir:
+        raise ValueError("event_id and output_dir required")
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    result = {
+        "eventId": int(event_id),
+        "outputDir": output_dir,
+        "meshFile": None,
+        "textures": [],
+        "materialFile": None,
+        "shaderInfo": None,
+        "files": [],
+    }
+
+    def _do(ctrl):
+        ctrl.SetFrameEvent(int(event_id), True)
+        ps = ctrl.GetPipelineState()
+
+        # ============================================================
+        # 1. EXPORT MESH AS OBJ
+        # ============================================================
+        mesh_data = None
+        try:
+            mesh_out = ctrl.GetPostVSData(0, 0, rd.MeshDataStage.VSOut)
+            if mesh_out and mesh_out.numIndices > 0:
+                mesh_data = _extract_mesh_obj(ctrl, ps, mesh_out, mesh_name, output_dir, event_id=event_id)
+                if mesh_data:
+                    result["meshFile"] = mesh_data["objPath"]
+                    result["files"].append(mesh_data["objPath"])
+                    if "fbxPath" in mesh_data:
+                        result["fbxFile"] = mesh_data["fbxPath"]
+                        result["files"].append(mesh_data["fbxPath"])
+                    result["meshStats"] = {
+                        "vertices": mesh_data.get("vertexCount", 0),
+                        "triangles": mesh_data.get("triangleCount", 0),
+                        "hasNormals": mesh_data.get("hasNormals", False),
+                        "hasUVs": mesh_data.get("hasUVs", False),
+                        "method": mesh_data.get("method", "unknown"),
+                    }
+        except Exception as e:
+            import traceback as _tb
+            result["meshError"] = str(e) + "\n" + _tb.format_exc()
+            print("[MCP Bridge] export_to_unity mesh error: %s" % str(e))
+            _tb.print_exc()
+
+        # ============================================================
+        # 2. COLLECT BOUND TEXTURE INFO (no file export — use save_texture / export_drawcall for that)
+        # ============================================================
+        pid = _get_pipeline_obj(ps, ctrl)
+        tex_exports = []
+
+        for stage_name, stage_enum in [("fragment", rd.ShaderStage.Fragment), ("vertex", rd.ShaderStage.Vertex)]:
+            sid = ps.GetShader(stage_enum)
+            if not sid or int(sid) == 0:
+                continue
+            entries = ctrl.GetShaderEntryPoints(sid)
+            if not entries:
+                continue
+            refl = ctrl.GetShader(pid, sid, entries[0])
+            if not refl:
+                continue
+
+            name_lookup = {}
+            for r in ctrl.GetResources():
+                name_lookup[int(r.resourceId)] = r.name
+            tex_lookup = {}
+            for t in ctrl.GetTextures():
+                tex_lookup[int(t.resourceId)] = t
+
+            try:
+                ro_bindings = ps.GetReadOnlyResources(stage_enum)
+            except Exception:
+                ro_bindings = None
+
+            for i, ro in enumerate(getattr(refl, 'readOnlyResources', [])):
+                if not getattr(ro, 'isTexture', False):
+                    continue
+                ro_name = getattr(ro, 'name', 'tex%d' % i)
+                bound_rid = _resolve_bound_resource(ro_bindings, i, ctrl)
+
+                if not bound_rid:
+                    continue
+
+                tex_info = tex_lookup.get(bound_rid, None)
+                fmt_name = _fmt_str(tex_info.format) if tex_info else "unknown"
+                role = _infer_role(ro_name, name_lookup.get(bound_rid, ""), fmt_name)
+
+                tex_entry = {
+                    "role": role,
+                    "slot": i,
+                    "stage": stage_name,
+                    "shaderVar": ro_name,
+                    "resourceId": bound_rid,
+                    "width": tex_info.width if tex_info else 0,
+                    "height": tex_info.height if tex_info else 0,
+                    "format": fmt_name,
+                    "hint": "Use save_texture(resource_id=%d, output_path=...) to export" % bound_rid,
+                }
+                tex_exports.append(tex_entry)
+
+        result["textures"] = tex_exports
+
+        # ============================================================
+        # 3. GET SHADER INFO FOR UNITY MATERIAL MAPPING
+        # ============================================================
+        shader_summary = {}
+        for stage_name, stage_enum in [("fragment", rd.ShaderStage.Fragment), ("vertex", rd.ShaderStage.Vertex)]:
+            sid = ps.GetShader(stage_enum)
+            if not sid or int(sid) == 0:
+                continue
+            shader_summary[stage_name] = {"shaderId": int(sid)}
+            entries = ctrl.GetShaderEntryPoints(sid)
+            if entries:
+                refl2 = ctrl.GetShader(pid, sid, entries[0])
+                if refl2:
+                    shader_summary[stage_name]["entryPoint"] = entries[0].name
+                    shader_summary[stage_name]["inputCount"] = len(refl2.inputSignature)
+                    shader_summary[stage_name]["outputCount"] = len(refl2.outputSignature)
+                    shader_summary[stage_name]["textureCount"] = sum(1 for r in refl2.readOnlyResources if r.isTexture)
+                    shader_summary[stage_name]["cbufferCount"] = len(refl2.constantBlocks)
+
+                    # Get cbuffer values for material parameters
+                    cbufs = []
+                    try:
+                        cbufs_bound = ps.GetConstantBuffers(stage_enum, False)
+                    except Exception:
+                        cbufs_bound = None
+
+                    for idx, cb in enumerate(refl2.constantBlocks):
+                        cb_info = {"name": getattr(cb, 'name', ''), "size": getattr(cb, 'byteSize', 0)}
+                        if cbufs_bound and idx < len(cbufs_bound):
+                            b = cbufs_bound[idx]
+                            try:
+                                vrs = ctrl.GetCBufferVariableContents(
+                                    pid, sid, stage_enum, entries[0].name,
+                                    idx, b.resource, getattr(b, 'byteOffset', 0), getattr(b, 'byteSize', 0))
+                                cb_info["variables"] = [_var_dict(v) for v in vrs]
+                            except Exception:
+                                cb_info["variables"] = []
+                        else:
+                            try:
+                                null_rid = rd.ResourceId()
+                                vrs = ctrl.GetCBufferVariableContents(pid, sid, stage_enum, entries[0].name, idx, null_rid, 0, 0)
+                                cb_info["variables"] = [_var_dict(v) for v in vrs]
+                            except Exception:
+                                cb_info["variables"] = []
+                        cbufs.append(cb_info)
+                    shader_summary[stage_name]["constantBuffers"] = cbufs
+
+        result["shaderInfo"] = shader_summary
+
+        # ============================================================
+        # 4. GENERATE UNITY MATERIAL DEFINITION JSON
+        # ============================================================
+        unity_mat = {
+            "materialName": mesh_name + "_Mat",
+            "shader": "Custom/EyePBR",  # Default, user can change
+            "renderPipeline": "auto-detect",
+            "textures": {},
+            "floats": {},
+            "colors": {},
+            "vectors": {},
+        }
+
+        # Map exported textures to Unity material properties
+        _ROLE_TO_UNITY = {
+            "albedo": {"property": "_MainTex", "urp": "_BaseMap", "hdrp": "_BaseColorMap"},
+            "normal": {"property": "_BumpMap", "urp": "_BumpMap", "hdrp": "_NormalMap"},
+            "metallic": {"property": "_MetallicGlossMap", "urp": "_MetallicGlossMap", "hdrp": "_MaskMap"},
+            "roughness": {"property": "_SpecGlossMap", "urp": "_SpecGlossMap", "hdrp": "_MaskMap"},
+            "ao": {"property": "_OcclusionMap", "urp": "_OcclusionMap", "hdrp": "_MaskMap"},
+            "emissive": {"property": "_EmissionMap", "urp": "_EmissionMap", "hdrp": "_EmissiveColorMap"},
+            "specular": {"property": "_SpecGlossMap", "urp": "_SpecGlossMap", "hdrp": "_SpecularColorMap"},
+            "height": {"property": "_ParallaxMap", "urp": "_ParallaxMap", "hdrp": "_HeightMap"},
+            "opacity": {"property": "_MainTex", "urp": "_BaseMap", "hdrp": "_BaseColorMap"},
+            "environment": {"property": "_EnvCubeMap", "urp": "_ReflectionCubeMap", "hdrp": "_ReflectionCubeMap"},
+            "shadow": {"property": "_ShadowMap", "urp": "_ShadowMap", "hdrp": "_ShadowMap"},
+            "lightmap": {"property": "_LightMap", "urp": "_LightMap", "hdrp": "_LightMap"},
+            "detail": {"property": "_DetailAlbedoMap", "urp": "_DetailAlbedoMap", "hdrp": "_DetailMap"},
+            "unknown": {"property": "_Texture_%d", "urp": "_Texture_%d", "hdrp": "_Texture_%d"},
+        }
+
+        slot_counter = 0
+        for tex in tex_exports:
+            role = tex["role"]
+            mapping = _ROLE_TO_UNITY.get(role, _ROLE_TO_UNITY["unknown"])
+            prop_name = mapping["property"]
+            if "%d" in prop_name:
+                prop_name = prop_name % slot_counter
+                slot_counter += 1
+
+            unity_mat["textures"][prop_name] = {
+                "resourceId": tex["resourceId"],
+                "role": role,
+                "originalSlot": tex["slot"],
+                "shaderVar": tex["shaderVar"],
+                "dimensions": "%dx%d" % (tex["width"], tex["height"]),
+                "urpProperty": mapping["urp"] if "%d" not in mapping["urp"] else mapping["urp"] % (slot_counter - 1),
+                "hdrpProperty": mapping["hdrp"] if "%d" not in mapping["hdrp"] else mapping["hdrp"] % (slot_counter - 1),
+            }
+
+        # Extract key material floats from cbuffer
+        if "fragment" in shader_summary and "constantBuffers" in shader_summary["fragment"]:
+            for cb in shader_summary["fragment"]["constantBuffers"]:
+                for v in cb.get("variables", []):
+                    name = v.get("name", "")
+                    floats = v.get("float", [])
+                    if not floats:
+                        continue
+                    name_lower = name.lower()
+                    if "roughness" in name_lower or "smooth" in name_lower:
+                        unity_mat["floats"]["_Smoothness"] = 1.0 - floats[0] if floats else 0.5
+                        unity_mat["floats"]["_Roughness"] = floats[0] if floats else 0.5
+                    elif "metallic" in name_lower or "metal" in name_lower:
+                        unity_mat["floats"]["_Metallic"] = floats[0] if floats else 0.0
+                    elif "color" in name_lower and len(floats) >= 3:
+                        unity_mat["colors"]["_Color"] = {"r": floats[0], "g": floats[1], "b": floats[2], "a": floats[3] if len(floats) > 3 else 1.0}
+                    elif "emissive" in name_lower and len(floats) >= 3:
+                        unity_mat["colors"]["_EmissionColor"] = {"r": floats[0], "g": floats[1], "b": floats[2], "a": floats[3] if len(floats) > 3 else 1.0}
+
+        # Save Unity material JSON
+        mat_path = os.path.join(output_dir, mesh_name + "_material.json")
+        with open(mat_path, "w", encoding="utf-8") as f:
+            json.dump(unity_mat, f, indent=2, ensure_ascii=False, default=str)
+        result["materialFile"] = mat_path
+        result["files"].append(mat_path)
+
+        # ============================================================
+        # 5. GENERATE UNITY IMPORT SCRIPT (C#)
+        # ============================================================
+        import_script = _generate_unity_import_script(mesh_name, unity_mat, tex_exports, output_dir)
+        if import_script:
+            result["importScript"] = import_script
+            result["files"].append(import_script)
+
+        # Save full summary
+        summary_path = os.path.join(output_dir, mesh_name + "_unity_export.json")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False, default=str)
+        result["files"].append(summary_path)
+
+        return result
+
+    return _replay(_do)
+
+
+def _extract_mesh_obj(ctrl, ps, mesh_out, mesh_name, output_dir, event_id=None):
+    """Extract mesh data using VBuffer + IBuffer (Model Extractor approach).
+
+    This uses the pipeline state's vertex inputs and buffers directly,
+    which is more reliable than GetPostVSData for Vulkan/ANGLE captures.
+    Falls back to PostVS if VBuffer approach fails.
+    """
+    import struct as _struct
+    import math as _math
+
+    # ============================================================
+    # Method 1: VBuffer + IBuffer + VertexInputs (from Model Extractor)
+    # ============================================================
+    vbs = ps.GetVBuffers()
+    ib = ps.GetIBuffer()
+    attrs = ps.GetVertexInputs()
+
+    # Get draw action info for index count
+    actions = ctrl.GetRootActions()
+    action = None
+    cur_eid = int(mesh_out.numIndices) if mesh_out else 0  # Will use actual action
+
+    def _find_action(actions_list, eid_target):
+        for a in actions_list:
+            if a.eventId == eid_target:
+                return a
+            if a.children:
+                found = _find_action(a.children, eid_target)
+                if found:
+                    return found
+        return None
+
+    # Try to get the action from the current event
+    try:
+        # The event was already set by caller
+        cur_event = ctrl.GetD3D11PipelineState()  # Just to trigger, won't use
+    except Exception:
+        pass
+
+    def _read_vertex_attr(attr, vbs_list, indices_list, num_components=None):
+        """Read vertex attribute data from vertex buffer (from Model Extractor)."""
+        vb_idx = attr.vertexBuffer
+        if vb_idx >= len(vbs_list):
+            return []
+
+        vb_info = vbs_list[vb_idx]
+        if vb_info.resourceId == rd.ResourceId.Null():
+            return []
+
+        try:
+            buf_data = ctrl.GetBufferData(vb_info.resourceId, 0, 0)
+        except Exception:
+            return []
+
+        fmt = attr.format
+        comp_count = num_components or fmt.compCount
+        stride = vb_info.byteStride
+
+        if stride == 0 or not buf_data:
+            return []
+
+        max_idx = max(indices_list) if indices_list else 0
+
+        comp_map = {
+            (rd.CompType.Float, 2): ('e', 2),    # float16
+            (rd.CompType.Float, 4): ('f', 4),    # float32
+            (rd.CompType.UInt, 1):  ('B', 1),
+            (rd.CompType.UInt, 2):  ('H', 2),
+            (rd.CompType.UInt, 4):  ('I', 4),
+            (rd.CompType.SInt, 1):  ('b', 1),
+            (rd.CompType.SInt, 2):  ('h', 2),
+            (rd.CompType.SInt, 4):  ('i', 4),
+            (rd.CompType.UNorm, 1): ('B', 1),
+            (rd.CompType.UNorm, 2): ('H', 2),
+            (rd.CompType.SNorm, 1): ('b', 1),
+            (rd.CompType.SNorm, 2): ('h', 2),
+        }
+
+        key = (fmt.compType, fmt.compByteWidth)
+        if key not in comp_map:
+            if fmt.compByteWidth == 2:
+                char, size = 'e', 2
+            else:
+                return []
+        else:
+            char, size = comp_map[key]
+
+        unpack_fmt = '<%d%s' % (comp_count, char)
+        is_unorm = fmt.compType == rd.CompType.UNorm
+        is_snorm = fmt.compType == rd.CompType.SNorm
+        unorm_max = float((2 ** (fmt.compByteWidth * 8)) - 1) if is_unorm else 1.0
+        snorm_max = float(2 ** (fmt.compByteWidth * 8 - 1) - 1) if is_snorm else 1.0
+
+        results = []
+        for vi in range(max_idx + 1):
+            offset = vb_info.byteOffset + attr.byteOffset + vi * stride
+            if offset + comp_count * size > len(buf_data):
+                results.append(tuple([0.0] * comp_count))
+                continue
+            try:
+                raw = _struct.unpack_from(unpack_fmt, buf_data, offset)
+                if is_unorm:
+                    vals = tuple(v / unorm_max for v in raw)
+                elif is_snorm:
+                    vals = tuple(max(-1.0, v / snorm_max) for v in raw)
+                else:
+                    vals = tuple(float(v) for v in raw)
+                cleaned = []
+                for v in vals:
+                    fv = float(v)
+                    if not _math.isfinite(fv) or abs(fv) > 1e9:
+                        cleaned.append(0.0)
+                    else:
+                        cleaned.append(fv)
+                results.append(tuple(cleaned))
+            except Exception:
+                results.append(tuple([0.0] * comp_count))
+
+        return results
+
+    mesh_extracted = False
+    positions = []
+    normals = []
+    uvs = []
+    indices = []
+    has_normals = False
+    has_uvs = False
+
+    if attrs and vbs:
+        # Identify attributes (same logic as Model Extractor)
+        pos_attr = None
+        normal_attr = None
+        uv_attr = None
+
+        for attr in attrs:
+            if getattr(attr, 'perInstance', False):
+                continue
+            name_lower = attr.name.lower()
+
+            if pos_attr is None:
+                if 'sv_position' not in name_lower and any(k in name_lower for k in ['position', 'pos']):
+                    pos_attr = attr
+            if normal_attr is None and any(k in name_lower for k in ['normal', 'norm']):
+                normal_attr = attr
+            if uv_attr is None and any(k in name_lower for k in ['texcoord', 'uv', 'tex']):
+                uv_attr = attr
+
+        # Heuristic fallback for position
+        if pos_attr is None:
+            for attr in attrs:
+                if getattr(attr, 'perInstance', False):
+                    continue
+                name_lower = attr.name.lower()
+                if any(k in name_lower for k in ['normal', 'texcoord', 'uv', 'color', 'tangent', 'sv_']):
+                    continue
+                if attr.format.compCount >= 3 and attr.format.compType == rd.CompType.Float:
+                    pos_attr = attr
+                    break
+
+        if pos_attr is not None:
+            # ---- Read indices (with indexOffset + baseVertex) ----
+            # Find the current action to get baseVertex and indexOffset
+            _cur_action = None
+            def _find_cur(al):
+                for a in al:
+                    if hasattr(a, 'eventId') and a.eventId == int(event_id):
+                        return a
+                    if a.children:
+                        f = _find_cur(a.children)
+                        if f:
+                            return f
+                return None
+            _cur_action = _find_cur(ctrl.GetRootActions())
+
+            num_indices = mesh_out.numIndices if mesh_out else 0
+            base_vertex = 0
+            if _cur_action:
+                base_vertex = getattr(_cur_action, 'baseVertex', getattr(_cur_action, 'vertexOffset', 0))
+                num_indices = _cur_action.numIndices
+
+            raw_indices = []
+            is_indexed = ib.resourceId != rd.ResourceId.Null()
+            if is_indexed:
+                try:
+                    ib_data = ctrl.GetBufferData(ib.resourceId, 0, 0)
+                    # indexOffset: number of indices to skip in the index buffer
+                    index_offset = getattr(_cur_action, 'indexOffset', 0) if _cur_action else 0
+                    idx_offset_bytes = index_offset * ib.byteStride + ib.byteOffset
+                    for i in range(num_indices):
+                        off = idx_offset_bytes + i * ib.byteStride
+                        if ib.byteStride == 2 and off + 2 <= len(ib_data):
+                            raw_indices.append(_struct.unpack_from('<H', ib_data, off)[0])
+                        elif ib.byteStride == 4 and off + 4 <= len(ib_data):
+                            raw_indices.append(_struct.unpack_from('<I', ib_data, off)[0])
+                except Exception:
+                    raw_indices = list(range(num_indices))
+                # Apply baseVertex offset
+                if base_vertex != 0:
+                    raw_indices = [idx + base_vertex for idx in raw_indices]
+            else:
+                raw_indices = list(range(base_vertex, base_vertex + num_indices))
+
+            # ---- Remap indices to compact 0-based ----
+            unique_verts = []
+            old_to_new = {}
+            for old_idx in raw_indices:
+                if old_idx not in old_to_new:
+                    old_to_new[old_idx] = len(unique_verts)
+                    unique_verts.append(old_idx)
+            indices = [old_to_new[idx] for idx in raw_indices]
+
+            if indices and unique_verts:
+                # ---- Read vertex attrs by unique_verts (precise) ----
+                def _read_attr_precise(attr, wanted_comp):
+                    """Read vertex data only for vertices in unique_verts."""
+                    vb_idx = attr.vertexBuffer
+                    if vb_idx >= len(vbs):
+                        return []
+                    vb_info = vbs[vb_idx]
+                    if vb_info.resourceId == rd.ResourceId.Null():
+                        return []
+                    try:
+                        buf_data = ctrl.GetBufferData(vb_info.resourceId, 0, 0)
+                    except Exception:
+                        return []
+                    fmt = attr.format
+                    orig_comp = fmt.compCount
+                    stride = vb_info.byteStride
+                    if stride == 0 or not buf_data:
+                        return []
+
+                    comp_map = {
+                        (rd.CompType.Float, 2): ('e', 2),
+                        (rd.CompType.Float, 4): ('f', 4),
+                        (rd.CompType.UInt, 1):  ('B', 1),
+                        (rd.CompType.UInt, 2):  ('H', 2),
+                        (rd.CompType.UInt, 4):  ('I', 4),
+                        (rd.CompType.SInt, 1):  ('b', 1),
+                        (rd.CompType.SInt, 2):  ('h', 2),
+                        (rd.CompType.SInt, 4):  ('i', 4),
+                        (rd.CompType.UNorm, 1): ('B', 1),
+                        (rd.CompType.UNorm, 2): ('H', 2),
+                        (rd.CompType.SNorm, 1): ('b', 1),
+                        (rd.CompType.SNorm, 2): ('h', 2),
+                    }
+                    key = (fmt.compType, fmt.compByteWidth)
+                    if key not in comp_map:
+                        if fmt.compByteWidth == 2:
+                            char, sz = 'e', 2
+                        else:
+                            return []
+                    else:
+                        char, sz = comp_map[key]
+
+                    # Always read original compCount to keep stride alignment correct
+                    unpack_fmt = '<%d%s' % (orig_comp, char)
+                    elem_size = orig_comp * sz
+                    is_unorm = fmt.compType == rd.CompType.UNorm
+                    is_snorm = fmt.compType == rd.CompType.SNorm
+                    unorm_max = float((2 ** (fmt.compByteWidth * 8)) - 1) if is_unorm else 1.0
+                    snorm_max = float(2 ** (fmt.compByteWidth * 8 - 1) - 1) if is_snorm else 1.0
+
+                    results = []
+                    for vi in unique_verts:
+                        offset = vb_info.byteOffset + attr.byteOffset + vi * stride
+                        if offset + elem_size > len(buf_data):
+                            results.append(tuple([0.0] * wanted_comp))
+                            continue
+                        try:
+                            raw = _struct.unpack_from(unpack_fmt, buf_data, offset)
+                            if is_unorm:
+                                vals = tuple(v / unorm_max for v in raw)
+                            elif is_snorm:
+                                vals = tuple(max(-1.0, v / snorm_max) for v in raw)
+                            else:
+                                vals = tuple(float(v) for v in raw)
+                            # Truncate to wanted components, pad with 0 if not enough
+                            cleaned = []
+                            for ci in range(wanted_comp):
+                                if ci < len(vals):
+                                    fv = float(vals[ci])
+                                    if not _math.isfinite(fv) or abs(fv) > 1e9:
+                                        cleaned.append(0.0)
+                                    else:
+                                        cleaned.append(fv)
+                                else:
+                                    cleaned.append(0.0)
+                            results.append(tuple(cleaned))
+                        except Exception:
+                            results.append(tuple([0.0] * wanted_comp))
+                    return results
+
+                # Read position (negate X for DX left-hand → right-hand coord system)
+                raw_pos = _read_attr_precise(pos_attr, 3)
+                positions = [(-p[0] if len(p) > 0 else 0.0, p[1] if len(p) > 1 else 0.0, p[2] if len(p) > 2 else 0.0) for p in raw_pos]
+
+                # Read normals (with packed-encoding detection)
+                if normal_attr:
+                    raw_norm = _read_attr_precise(normal_attr, 3)
+                    # Normalize + detect packed encoding
+                    temp_normals = []
+                    for n in raw_norm:
+                        nx = n[0] if len(n) > 0 else 0.0
+                        ny = n[1] if len(n) > 1 else 0.0
+                        nz = n[2] if len(n) > 2 else 0.0
+                        length = _math.sqrt(nx*nx + ny*ny + nz*nz)
+                        if length > 1e-8:
+                            nx, ny, nz = nx/length, ny/length, nz/length
+                        else:
+                            nx, ny, nz = 0.0, 0.0, 1.0
+                        temp_normals.append((nx, ny, nz))
+                    # Check if normals are valid (not packed/encoded data)
+                    if temp_normals:
+                        max_abs = max(max(abs(n[0]), abs(n[1]), abs(n[2])) for n in raw_norm)
+                        if max_abs > 1.5:
+                            # Packed encoding — discard, let importing tool recalculate
+                            normals = []
+                            has_normals = False
+                        else:
+                            normals = temp_normals
+                            has_normals = len(normals) == len(positions)
+
+                # Read UVs (NO flip — DX UV is already correct for Unity/FBX import)
+                if uv_attr:
+                    raw_uvs = _read_attr_precise(uv_attr, uv_attr.format.compCount)
+                    for uv in raw_uvs:
+                        u = uv[0] if len(uv) > 0 else 0.0
+                        v = uv[1] if len(uv) > 1 else 0.0
+                        uvs.append((u, v))
+                    has_uvs = len(uvs) == len(positions)
+
+                if positions:
+                    mesh_extracted = True
+
+    # ============================================================
+    # Method 2: Fallback to PostVS (original approach)
+    # ============================================================
+    if not mesh_extracted and mesh_out:
+        vb_rid = mesh_out.vertexResourceId
+        vb_offset_val = mesh_out.vertexByteOffset
+        vb_stride_val = mesh_out.vertexByteStride
+        num_verts = mesh_out.numIndices
+
+        if vb_rid and int(vb_rid) != 0 and vb_stride_val > 0 and num_verts > 0:
+            try:
+                vb_data = ctrl.GetBufferData(vb_rid, vb_offset_val, num_verts * vb_stride_val)
+            except Exception:
+                vb_data = None
+
+            if vb_data and len(vb_data) >= vb_stride_val:
+                # Detect layout from VS output signature
+                pos_off = 0
+                norm_off = -1
+                uv_off = -1
+                pid2 = _get_pipeline_obj(ps, ctrl)
+                vs_id = ps.GetShader(rd.ShaderStage.Vertex)
+                if vs_id and int(vs_id) != 0:
+                    entries = ctrl.GetShaderEntryPoints(vs_id)
+                    if entries:
+                        refl2 = ctrl.GetShader(pid2, vs_id, entries[0])
+                        if refl2 and refl2.outputSignature:
+                            byte_off = 0
+                            for sig in refl2.outputSignature:
+                                sem = getattr(sig, 'semanticName', '').upper()
+                                count = getattr(sig, 'compCount', 4)
+                                sz = count * 4
+                                if 'POSITION' in sem or 'SV_POSITION' in sem:
+                                    pos_off = byte_off
+                                elif 'NORMAL' in sem:
+                                    norm_off = byte_off
+                                elif 'TEXCOORD' in sem and uv_off < 0:
+                                    uv_off = byte_off
+                                byte_off += sz
+
+                if vb_stride_val >= 32 and norm_off < 0:
+                    norm_off = 16
+                if vb_stride_val >= 40 and uv_off < 0:
+                    uv_off = 32
+
+                actual_verts = min(num_verts, len(vb_data) // vb_stride_val)
+                for i in range(actual_verts):
+                    base = i * vb_stride_val
+                    if base + pos_off + 12 <= len(vb_data):
+                        px, py, pz = _struct.unpack_from("<fff", vb_data, base + pos_off)
+                        positions.append((px, py, pz))
+                    if norm_off >= 0 and base + norm_off + 12 <= len(vb_data):
+                        nx, ny, nz = _struct.unpack_from("<fff", vb_data, base + norm_off)
+                        normals.append((nx, ny, nz))
+                    if uv_off >= 0 and base + uv_off + 8 <= len(vb_data):
+                        u, v = _struct.unpack_from("<ff", vb_data, base + uv_off)
+                        uvs.append((u, v))
+
+                has_normals = len(normals) == len(positions)
+                has_uvs = len(uvs) == len(positions)
+
+                # Use index buffer from PostVS
+                if not indices:
+                    ib_rid2 = mesh_out.indexResourceId
+                    if ib_rid2 and int(ib_rid2) != 0:
+                        ib_off2 = mesh_out.indexByteOffset
+                        ib_stride2 = mesh_out.indexByteStride
+                        try:
+                            ib_data = ctrl.GetBufferData(ib_rid2, ib_off2, num_verts * ib_stride2)
+                            for i in range(min(num_verts, len(ib_data) // ib_stride2)):
+                                if ib_stride2 == 2:
+                                    indices.append(_struct.unpack_from("<H", ib_data, i * 2)[0])
+                                elif ib_stride2 == 4:
+                                    indices.append(_struct.unpack_from("<I", ib_data, i * 4)[0])
+                                else:
+                                    indices.append(i)
+                        except Exception:
+                            indices = list(range(num_verts))
+                    else:
+                        indices = list(range(num_verts))
+
+    if not positions:
+        return None
+
+    # ============================================================
+    # Write OBJ file
+    # ============================================================
+    obj_path = os.path.join(output_dir, mesh_name + ".obj")
+    num_faces = len(indices) // 3
+
+    with open(obj_path, 'w', encoding='utf-8') as f:
+        f.write("# Exported from ReplayLab + Model Extractor\n")
+        f.write("# Vertices: %d, Faces: %d\n\n" % (len(positions), num_faces))
+        f.write("o %s\n\n" % mesh_name)
+
+        for p in positions:
+            f.write("v %.6f %.6f %.6f\n" % (p[0], p[1], p[2]))
+        if uvs:
+            f.write("\n")
+            for uv in uvs:
+                f.write("vt %.6f %.6f\n" % (uv[0], uv[1]))
+        if normals:
+            f.write("\n")
+            for n in normals:
+                f.write("vn %.6f %.6f %.6f\n" % (n[0], n[1], n[2]))
+        f.write("\n")
+        # Reverse winding order (swap i1/i2) to match X-axis flip for correct face normals
+        for fi in range(num_faces):
+            i0 = indices[fi * 3] + 1
+            i1 = indices[fi * 3 + 1] + 1
+            i2 = indices[fi * 3 + 2] + 1
+            if has_uvs and has_normals:
+                f.write("f %d/%d/%d %d/%d/%d %d/%d/%d\n" % (i0, i0, i0, i2, i2, i2, i1, i1, i1))
+            elif has_uvs:
+                f.write("f %d/%d %d/%d %d/%d\n" % (i0, i0, i2, i2, i1, i1))
+            elif has_normals:
+                f.write("f %d//%d %d//%d %d//%d\n" % (i0, i0, i2, i2, i1, i1))
+            else:
+                f.write("f %d %d %d\n" % (i0, i2, i1))
+
+    # ============================================================
+    # Write FBX file (ASCII 7.4, Unity compatible)
+    # ============================================================
+    fbx_path = os.path.join(output_dir, mesh_name + ".fbx")
+    _write_fbx_ascii(fbx_path, mesh_name, positions, normals, uvs, indices, num_faces)
+
+    return {
+        "objPath": obj_path,
+        "fbxPath": fbx_path,
+        "vertexCount": len(positions),
+        "triangleCount": num_faces,
+        "hasNormals": has_normals,
+        "hasUVs": has_uvs,
+        "method": "VBuffer" if mesh_extracted else "PostVS",
+    }
+
+
+def _write_fbx_ascii(filepath, name, positions, normals, uvs, indices, num_faces):
+    """Write FBX 7.4 ASCII file (from Model Extractor export_fbx)."""
+    import math as _math
+
+    num_verts = len(positions)
+    has_normals = len(normals) == num_verts
+    has_uvs = len(uvs) == num_verts
+
+    if num_verts == 0 or num_faces == 0:
+        return
+
+    model_id = 1000000001
+    geom_id = 1000000002
+    material_id = 1000000003
+
+    def safe_float(v):
+        if not _math.isfinite(v) or abs(v) > 1e9:
+            return 0.0
+        return v
+
+    flat_pos = []
+    for p in positions:
+        flat_pos.extend(safe_float(v) for v in p)
+
+    # Reverse winding (swap i1/i2) to match X-axis flip
+    fbx_idx = []
+    for fi in range(num_faces):
+        i0, i1, i2 = indices[fi * 3], indices[fi * 3 + 1], indices[fi * 3 + 2]
+        fbx_idx.extend([i0, i2, -(i1 + 1)])
+
+    # Edges
+    edge_set = set()
+    edges = []
+    for fi in range(num_faces):
+        base = fi * 3
+        tri = [indices[fi * 3], indices[fi * 3 + 1], indices[fi * 3 + 2]]
+        for j in range(3):
+            v0, v1 = tri[j], tri[(j + 1) % 3]
+            ek = (min(v0, v1), max(v0, v1))
+            if ek not in edge_set:
+                edge_set.add(ek)
+                edges.append(base + j)
+
+    def fmt_fa(arr, per=6):
+        lines = []
+        for i in range(0, len(arr), per):
+            lines.append(",".join("%.6f" % v for v in arr[i:i + per]))
+        return ",\n\t\t\t\t".join(lines)
+
+    def fmt_ia(arr, per=12):
+        lines = []
+        for i in range(0, len(arr), per):
+            lines.append(",".join(str(v) for v in arr[i:i + per]))
+        return ",\n\t\t\t\t".join(lines)
+
+    norm_sec = ""
+    if has_normals:
+        fn = []
+        for fi in range(num_faces):
+            for j in range(3):
+                idx = indices[fi * 3 + j]
+                if idx < len(normals):
+                    fn.extend(safe_float(v) for v in normals[idx])
+                else:
+                    fn.extend([0.0, 0.0, 1.0])
+        norm_sec = """
+\t\tLayerElementNormal: 0 {
+\t\t\tVersion: 102
+\t\t\tName: "Normals"
+\t\t\tMappingInformationType: "ByPolygonVertex"
+\t\t\tReferenceInformationType: "Direct"
+\t\t\tNormals: *%d {
+\t\t\t\ta: %s
+\t\t\t}
+\t\t}""" % (len(fn), fmt_fa(fn))
+
+    uv_sec = ""
+    uv_idx_list = []
+    if has_uvs:
+        for fi in range(num_faces):
+            for j in range(3):
+                uv_idx_list.append(indices[fi * 3 + j])
+        flat_uv = []
+        for uv in uvs:
+            flat_uv.extend(safe_float(v) for v in uv)
+        uv_sec = """
+\t\tLayerElementUV: 0 {
+\t\t\tVersion: 101
+\t\t\tName: "UVMap"
+\t\t\tMappingInformationType: "ByPolygonVertex"
+\t\t\tReferenceInformationType: "IndexToDirect"
+\t\t\tUV: *%d {
+\t\t\t\ta: %s
+\t\t\t}
+\t\t\tUVIndex: *%d {
+\t\t\t\ta: %s
+\t\t\t}
+\t\t}""" % (len(flat_uv), fmt_fa(flat_uv), len(uv_idx_list), fmt_ia(uv_idx_list))
+
+    mat_sec = """
+\t\tLayerElementMaterial: 0 {
+\t\t\tVersion: 101
+\t\t\tName: ""
+\t\t\tMappingInformationType: "AllSame"
+\t\t\tReferenceInformationType: "IndexToDirect"
+\t\t\tMaterials: *1 {
+\t\t\t\ta: 0
+\t\t\t}
+\t\t}"""
+
+    layer_entries = ""
+    if has_normals:
+        layer_entries += """
+\t\t\tLayerElement:  {
+\t\t\t\tType: "LayerElementNormal"
+\t\t\t\tTypedIndex: 0
+\t\t\t}"""
+    if has_uvs:
+        layer_entries += """
+\t\t\tLayerElement:  {
+\t\t\t\tType: "LayerElementUV"
+\t\t\t\tTypedIndex: 0
+\t\t\t}"""
+    layer_entries += """
+\t\t\tLayerElement:  {
+\t\t\t\tType: "LayerElementMaterial"
+\t\t\t\tTypedIndex: 0
+\t\t\t}"""
+
+    now = time.gmtime()
+
+    content = """; FBX 7.4.0 project file
+; Exported by ReplayLab (Model Extractor engine)
+FBXHeaderExtension:  {
+\tFBXHeaderVersion: 1003
+\tFBXVersion: 7400
+\tCreationTimeStamp:  {
+\t\tVersion: 1000
+\t\tYear: %d
+\t\tMonth: %d
+\t\tDay: %d
+\t\tHour: %d
+\t\tMinute: %d
+\t\tSecond: %d
+\t\tMillisecond: 0
+\t}
+\tCreator: "ReplayLab v1.8"
+}
+
+GlobalSettings:  {
+\tVersion: 1000
+\tProperties70:  {
+\t\tP: "UpAxis", "int", "Integer", "",1
+\t\tP: "UpAxisSign", "int", "Integer", "",1
+\t\tP: "FrontAxis", "int", "Integer", "",2
+\t\tP: "FrontAxisSign", "int", "Integer", "",1
+\t\tP: "CoordAxis", "int", "Integer", "",0
+\t\tP: "CoordAxisSign", "int", "Integer", "",1
+\t\tP: "UnitScaleFactor", "double", "Number", "",1.0
+\t\tP: "OriginalUnitScaleFactor", "double", "Number", "",1.0
+\t}
+}
+
+Documents:  {
+\tCount: 1
+\tDocument: 100000000, "", "Scene" {
+\t\tProperties70:  {
+\t\t\tP: "SourceObject", "object", "", ""
+\t\t\tP: "ActiveAnimStackName", "KString", "", "", ""
+\t\t}
+\t\tRootNode: 0
+\t}
+}
+
+References:  {
+}
+
+Definitions:  {
+\tVersion: 100
+\tCount: 4
+\tObjectType: "GlobalSettings" {
+\t\tCount: 1
+\t}
+\tObjectType: "Model" {
+\t\tCount: 1
+\t}
+\tObjectType: "Geometry" {
+\t\tCount: 1
+\t}
+\tObjectType: "Material" {
+\t\tCount: 1
+\t}
+}
+
+Objects:  {
+\tGeometry: %d, "Geometry::%s", "Mesh" {
+\t\tVertices: *%d {
+\t\t\ta: %s
+\t\t}
+\t\tPolygonVertexIndex: *%d {
+\t\t\ta: %s
+\t\t}
+\t\tEdges: *%d {
+\t\t\ta: %s
+\t\t}
+\t\tGeometryVersion: 124%s%s%s
+\t\tLayer: 0 {
+\t\t\tVersion: 100%s
+\t\t}
+\t}
+\tModel: %d, "Model::%s", "Mesh" {
+\t\tVersion: 232
+\t\tProperties70:  {
+\t\t\tP: "RotationActive", "bool", "", "",1
+\t\t\tP: "InheritType", "enum", "", "",1
+\t\t\tP: "DefaultAttributeIndex", "int", "Integer", "",0
+\t\t\tP: "Lcl Translation", "Lcl Translation", "", "A+",0,0,0
+\t\t\tP: "Lcl Rotation", "Lcl Rotation", "", "A+",0,0,0
+\t\t\tP: "Lcl Scaling", "Lcl Scaling", "", "A+",1,1,1
+\t\t}
+\t\tShading: T
+\t\tCulling: "CullingOff"
+\t}
+\tMaterial: %d, "Material::DefaultMaterial", "" {
+\t\tVersion: 102
+\t\tShadingModel: "phong"
+\t\tMultiLayer: 0
+\t\tProperties70:  {
+\t\t\tP: "DiffuseColor", "Color", "", "A",0.8,0.8,0.8
+\t\t}
+\t}
+}
+
+Connections:  {
+\tC: "OO",%d,0
+\tC: "OO",%d,%d
+\tC: "OO",%d,%d
+}
+""" % (
+        now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min, now.tm_sec,
+        geom_id, name, num_verts * 3, fmt_fa(flat_pos),
+        len(fbx_idx), fmt_ia(fbx_idx),
+        len(edges), fmt_ia(edges),
+        norm_sec, uv_sec, mat_sec, layer_entries,
+        model_id, name,
+        material_id,
+        model_id, geom_id, model_id, material_id, model_id,
+    )
+
+    with open(filepath, 'w', encoding='ascii') as f:
+        f.write(content)
+
+
+# (Old PostVS-based mesh export code removed - replaced by VBuffer approach above)
+
+
+def _generate_unity_import_script(mesh_name, unity_mat, tex_exports, output_dir):
+    """Generate a C# editor script to auto-import the exported assets into Unity."""
+    script_path = os.path.join(output_dir, mesh_name + "_UnityImport.cs")
+
+    tex_assignments = []
+    for prop_name, tex_data in unity_mat.get("textures", {}).items():
+        tex_assignments.append(
+            '            // Slot %s (%s): use save_texture(resource_id=%s) to export, then assign here'
+            % (prop_name, tex_data.get("role", "unknown"), tex_data.get("resourceId", 0))
+        )
+
+    float_assignments = []
+    for prop_name, val in unity_mat.get("floats", {}).items():
+        float_assignments.append(
+            '            mat.SetFloat("%s", %sf);' % (prop_name, val)
+        )
+
+    color_assignments = []
+    for prop_name, col in unity_mat.get("colors", {}).items():
+        color_assignments.append(
+            '            mat.SetColor("%s", new Color(%sf, %sf, %sf, %sf));'
+            % (prop_name, col["r"], col["g"], col["b"], col["a"])
+        )
+
+    script = '''// Auto-generated Unity Import Script from ReplayLab
+// Mesh: %(mesh_name)s | Event ID: exported from RenderDoc capture
+//
+// Usage: Place this script in Assets/Editor/ and run from menu:
+//        RenderDoc > Import %(mesh_name)s
+
+#if UNITY_EDITOR
+using UnityEditor;
+using UnityEngine;
+using System.IO;
+
+public class Import_%(safe_name)s
+{
+    [MenuItem("RenderDoc/Import %(mesh_name)s")]
+    public static void Import()
+    {
+        string srcDir = EditorUtility.OpenFolderPanel("Select exported folder", "", "");
+        if (string.IsNullOrEmpty(srcDir)) return;
+
+        string destDir = "Assets/RenderDoc_Imports/%(mesh_name)s";
+        if (!Directory.Exists(destDir))
+            Directory.CreateDirectory(destDir);
+
+        // Copy files to project
+        foreach (string file in Directory.GetFiles(srcDir))
+        {
+            string ext = Path.GetExtension(file).ToLower();
+            if (ext == ".obj" || ext == ".mtl" || ext == ".png" || ext == ".json")
+            {
+                string dest = Path.Combine(destDir, Path.GetFileName(file));
+                File.Copy(file, dest, true);
+            }
+        }
+        AssetDatabase.Refresh();
+
+        // Create material
+        string texDir = destDir;
+        Material mat = new Material(Shader.Find("Standard"));
+        mat.name = "%(mesh_name)s_Mat";
+
+        // Assign textures
+%(tex_assignments)s
+
+        // Set float properties
+%(float_assignments)s
+
+        // Set color properties
+%(color_assignments)s
+
+        AssetDatabase.CreateAsset(mat, destDir + "/%(mesh_name)s_Mat.mat");
+
+        // Try to assign material to imported mesh
+        string objPath = destDir + "/%(mesh_name)s.obj";
+        GameObject prefab = AssetDatabase.LoadAssetAtPath<GameObject>(objPath);
+        if (prefab != null)
+        {
+            GameObject instance = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
+            Renderer[] renderers = instance.GetComponentsInChildren<Renderer>();
+            foreach (Renderer r in renderers)
+            {
+                r.sharedMaterial = mat;
+            }
+            Debug.Log("[ReplayLab] Imported %(mesh_name)s with " + renderers.Length + " renderers");
+        }
+
+        AssetDatabase.SaveAssets();
+        Debug.Log("[ReplayLab] Import complete: " + destDir);
+    }
+}
+#endif
+''' % {
+        "mesh_name": mesh_name,
+        "safe_name": mesh_name.replace(" ", "_").replace("-", "_"),
+        "tex_assignments": "\n".join(tex_assignments) if tex_assignments else "            // No textures to assign",
+        "float_assignments": "\n".join(float_assignments) if float_assignments else "            // No float properties",
+        "color_assignments": "\n".join(color_assignments) if color_assignments else "            // No color properties",
+    }
+
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(script)
+
+    return script_path
+
+
+def _load_pass_classification(params):
+    """Load one fixed-program pass tree into the capture-bound UI panel."""
+    global _pass_panel_ui
+    if not HAS_UI:
+        raise RuntimeError("ReplayLab Semantic Passes UI is unavailable")
+    if _pass_panel_ui is None:
+        if not callable(_pass_panel_factory):
+            raise RuntimeError("ReplayLab Semantic Passes UI is unavailable")
+        _pass_panel_ui = _pass_panel_factory()
+    expected_session = _shader_override_hex(
+        params.get("expected_capture_session_id"),
+        "expected_capture_session_id", 32)
+    if not _capture_session_id or expected_session != _capture_session_id:
+        raise RuntimeError("Capture session changed before pass-panel publication")
+    classification = params.get("classification")
+    clean = _pass_panel_protocol.validate_classification(classification)
+    capture_id = _require_capture_identity(clean["captureId"])
+    status = _pass_panel_ui.load(classification)
+    _pass_panel_ui.show()
+    return {
+        "schema": "replaylab-pass-panel-load/v1",
+        "schemaVersion": 1,
+        "captureId": capture_id,
+        "captureSessionId": _capture_session_id,
+        "panel": status,
+        "loaded": True,
+        "replayMutation": False,
+        "classificationAuthority": "FixedProgram",
+        "aiProposalAuthority": "AIProvisional",
+    }
+
+
+def _close_pass_panel(_params):
+    """Close the semantic-pass dock through the same native path as its X button."""
+    global _pass_panel_ui
+    panel = _pass_panel_ui
+    _pass_panel_ui = None
+    if panel is None:
+        return {
+            "schema": "replaylab-pass-panel-close/v1",
+            "schemaVersion": 1,
+            "closed": False,
+            "alreadyClosed": True,
+        }
+    panel.shutdown()
+    return {
+        "schema": "replaylab-pass-panel-close/v1",
+        "schemaVersion": 1,
+        "closed": True,
+        "alreadyClosed": False,
+    }
+
+
+# ---- Method table ----
+METHODS = {
+    "ping": _ping,
+    "get_capture_status": _get_capture_status,
+    "get_current_renderdoc_context": _get_current_renderdoc_context,
+    "claim_renderdoc_ui_intents": _claim_renderdoc_ui_intents,
+    "renew_renderdoc_ui_intent": _renew_renderdoc_ui_intent,
+    "complete_renderdoc_ui_intent": _complete_renderdoc_ui_intent,
+    "get_renderdoc_ui_intent_status": _get_renderdoc_ui_intent_status,
+    "get_frame_summary": _get_frame_summary,
+    "get_draw_calls": _get_draw_calls,
+    "get_draw_call_details": _get_draw_call_details,
+    "get_pipeline_state": _get_pipeline_state,
+    "get_pass_classification_inputs": _get_pass_classification_inputs,
+    "load_pass_classification": _load_pass_classification,
+    "close_pass_panel": _close_pass_panel,
+    "get_shader_info": _get_shader_info,
+    "export_shader_catalog": _export_shader_catalog,
+    "reflect_shader_candidate": _reflect_shader_candidate,
+    "apply_shader_candidate_override": _apply_shader_candidate_override,
+    "apply_shader_candidate_overrides": _apply_shader_candidate_overrides,
+    "apply_shader_candidate_shared_resource": _apply_shader_candidate_shared_resource,
+    "rollback_shader_candidate_override": _rollback_shader_candidate_override,
+    "rollback_shader_candidate_overrides": _rollback_shader_candidate_overrides,
+    "rollback_shader_candidate_shared_resource": _rollback_shader_candidate_shared_resource,
+    "get_shared_shader_replacements": _get_shared_shader_replacements,
+    "snapshot_event_cbuffer": _snapshot_event_cbuffer,
+    "apply_event_cbuffer_override": _apply_event_cbuffer_override,
+    "rollback_event_cbuffer_override": _rollback_event_cbuffer_override,
+    "get_event_cbuffer_override_status": _get_event_cbuffer_override_status,
+    "clear_all_event_cbuffer_snapshots": _clear_all_event_cbuffer_snapshots,
+    "load_symbol_aliases": _load_symbol_aliases,
+    "get_textures": _get_textures,
+    "get_buffers": _get_buffers,
+    "get_resources": _get_resources,
+    "get_texture_info": _get_texture_info,
+    "get_texture_data": _get_texture_data,
+    "get_buffer_data": _get_buffer_data,
+    "pick_pixel": _pick_pixel,
+    "fingerprint_event_outputs": _fingerprint_event_outputs,
+    "get_texture_minmax": _get_texture_minmax,
+    "pixel_history": _pixel_history,
+    "inspect_pixel_object": _inspect_pixel_object,
+    "debug_pixel": _debug_pixel,
+    "debug_vertex": _debug_vertex,
+    "enumerate_counters": _enumerate_counters,
+    "fetch_counters": _fetch_counters,
+    "get_action_timings": _get_action_timings,
+    "get_post_vs_data": _get_post_vs_data,
+    "get_debug_messages": _get_debug_messages,
+    "find_by_texture": _find_by_texture,
+    "find_by_shader": _find_by_shader,
+    "find_by_resource": _find_by_resource,
+    "save_texture": _save_texture,
+    "list_captures": _list_captures,
+    "read_rdc_project_index": _read_rdc_project_index,
+    "write_rdc_project_index": _write_rdc_project_index,
+    "bind_rdc_project_shader_catalog": _bind_rdc_project_shader_catalog,
+    "open_capture": _open_capture,
+    "get_bound_textures": _get_bound_textures,
+    "reverse_shader": _reverse_shader,
+    "export_drawcall": _export_drawcall,
+    "export_to_unity": _export_to_unity,
+    "debug_vulkan_bindings": _debug_vulkan_bindings,
+    "identify_drawcalls": _identify_drawcalls,
+    "analyze_lighting": _analyze_lighting,
+}
+
+
+def _normalise_event_filter_preset(value):
+    text = str(value or "").strip().lower().replace("_", "-")
+    aliases = {
+        "draw": EVENT_FILTER_DRAW,
+        "draw-dispatch": EVENT_FILTER_DRAW,
+        "draw/dispatch": EVENT_FILTER_DRAW,
+        "output": EVENT_FILTER_OUTPUT,
+        "output-affecting": EVENT_FILTER_OUTPUT,
+        "all": EVENT_FILTER_ALL,
+    }
+    return aliases.get(text, "")
+
+
+def _event_filter_parse(_ctx_value, _filter_name, params):
+    if _normalise_event_filter_preset(params):
+        return ""
+    return "Expected draw, output, or all"
+
+
+def _event_browser_action_flags_mask(names):
+    """Resolve Event Browser filter flags without overriding replay helpers."""
+
+    action_flags = getattr(rd, "ActionFlags", None)
+    mask = 0
+    for name in names:
+        mask |= _safe_int(getattr(action_flags, name, 0), 0)
+    return mask
+
+
+def _event_filter_matches(_ctx_value, _filter_name, params, event_id,
+                          _chunk, action, _display_name):
+    """Match only the action row, never its associated state-setting API events."""
+    preset = _normalise_event_filter_preset(params)
+    if preset == EVENT_FILTER_ALL:
+        return True
+    if not preset or action is None:
+        return False
+    if _safe_int(getattr(action, "eventId", 0), 0) != _safe_int(event_id, -1):
+        return False
+
+    if preset == EVENT_FILTER_DRAW:
+        names = ("Drawcall", "MeshDispatch", "Dispatch", "DispatchRay")
+    else:
+        # These actions either execute shaders or directly create/modify/copy GPU output. Present
+        # is retained as the frame-output boundary; marker/pass/cmd-list bookkeeping is excluded.
+        names = (
+            "Drawcall", "MeshDispatch", "Dispatch", "DispatchRay",
+            "Clear", "Copy", "Resolve", "GenMips", "BuildAccStruct", "Present",
+        )
+    return bool(_safe_int(getattr(action, "flags", 0), 0) &
+                _event_browser_action_flags_mask(names))
+
+
+def _apply_event_browser_filter_preset(ctx, preset):
+    preset = _normalise_event_filter_preset(preset)
+    if not preset:
+        raise ValueError("Unknown Event Browser filter preset")
+    browser = ctx.GetEventBrowser()
+    if preset == EVENT_FILTER_ALL:
+        # SetEmptyRegionsVisible does not invalidate the proxy itself. Set it before the text so
+        # SetCurrentFilterText performs one immediate refresh with the final hierarchy setting.
+        browser.SetEmptyRegionsVisible(True)
+        browser.SetCurrentFilterText("")
+    else:
+        # qrenderdoc's recursive proxy keeps every marker ancestor of a matching action and hides
+        # marker branches with no matching descendants. This preserves useful hierarchy without
+        # exposing the state-setting/API bookkeeping rows filtered out by the callback.
+        browser.SetEmptyRegionsVisible(False)
+        browser.SetCurrentFilterText(
+            "$%s(%s)" % (EVENT_FILTER_FUNCTION, preset))
+    try:
+        ctx.ShowEventBrowser()
+    except Exception:
+        pass
+
+
+def _register_event_browser_filter_ui(ctx):
+    """Register Unity Frame Debugger-style UI-only Event Browser presets."""
+    global _event_filter_registered, _event_filter_ui_callbacks
+    browser = ctx.GetEventBrowser()
+    if not browser.RegisterEventFilterFunction(
+            EVENT_FILTER_FUNCTION,
+            "RenderDoc Ultra presets: draw, output, or all. Matches exact action rows only.",
+            _event_filter_matches, _event_filter_parse, None):
+        raise RuntimeError("Could not register the $%s Event Browser filter" %
+                           EVENT_FILTER_FUNCTION)
+    _event_filter_registered = True
+
+    labels = (
+        ("Draw / Dispatch Only", EVENT_FILTER_DRAW),
+        ("Output-affecting", EVENT_FILTER_OUTPUT),
+        ("All", EVENT_FILTER_ALL),
+    )
+    for label, preset in labels:
+        def _select(_ctx_value, _data, selected=preset):
+            _apply_event_browser_filter_preset(_ctx_value, selected)
+
+        _event_filter_ui_callbacks.append(_select)
+        ctx.Extensions().RegisterWindowMenu(
+            qrd.WindowMenu.Tools,
+            ["ReplayLab", "Event Browser Filter", label], _select)
+        ctx.Extensions().RegisterPanelMenu(
+            qrd.PanelMenu.EventBrowser,
+            ["ReplayLab", "Filter", label], _select)
+
+
+def _unregister_event_browser_filter_ui(ctx):
+    global _event_filter_registered, _event_filter_ui_callbacks
+    if _event_filter_registered:
+        try:
+            browser = ctx.GetEventBrowser()
+            current = str(browser.GetCurrentFilterText() or "")
+            if "$%s(" % EVENT_FILTER_FUNCTION in current:
+                browser.SetEmptyRegionsVisible(True)
+                browser.SetCurrentFilterText("")
+            browser.UnregisterEventFilterFunction(EVENT_FILTER_FUNCTION)
+        except Exception as exc:
+            print("[ReplayLab] Event filter unregister error: %s" % str(exc))
+    _event_filter_registered = False
+    _event_filter_ui_callbacks = []
+
+
+def _register_material_panel_ui(ctx):
+    """Register the native BufferViewer-selection material panel.
+
+    The callback payload can only be emitted by qrenderdoc's reflected variable
+    tree. The controller then takes a fresh bridge snapshot and checks every
+    physical identity before displaying or editing the issued leaf.
+    """
+    global _material_panel_ui, _material_panel_controller, _material_panel_callbacks
+
+    _material_panel_controller = _material_panel_protocol.MaterialPanelController(
+        snapshot_fn=_snapshot_event_cbuffer,
+        apply_fn=_apply_event_cbuffer_override,
+        rollback_fn=_rollback_event_cbuffer_override,
+        context_fn=lambda: _build_current_renderdoc_context())
+
+    def _new_panel():
+        # The controller outlives each QWidget. Closing/reopening the dock must retain the exact
+        # bridge snapshot/override capability so the user can still inspect or roll it back.
+        panel = _material_panel_protocol.MiniQtMaterialPanel(
+            ctx, qrd, QtCore, _material_panel_controller, None)
+
+        def _closed(closed_panel=panel):
+            global _material_panel_ui
+            if _material_panel_ui is closed_panel:
+                _material_panel_ui = None
+
+        panel.closed_callback = _closed
+        return panel
+
+    _material_panel_ui = _new_panel()
+
+    def _ensure_panel():
+        global _material_panel_ui
+        if _material_panel_ui is None:
+            _material_panel_ui = _new_panel()
+        return _material_panel_ui
+
+    def _show(_ctx_value, _data):
+        panel = _ensure_panel()
+        panel.rebuild()
+        panel.show()
+
+    def _expose(_ctx_value, data):
+        try:
+            selection = _material_panel_protocol.native_selection_from_callback(
+                data, _resource_id_int, _normalise_stage_name)
+            _ensure_panel().expose(selection)
+        except Exception as exc:
+            ctx.Extensions().ErrorDialog(
+                "%s\n\nThe parameter was not exposed and no CBuffer bytes were changed.\n"
+                "The reason above comes from a fresh API, capture, event, binding, and "
+                "reflection check." % str(exc),
+                "ReplayLab Material Parameters")
+
+    _material_panel_callbacks.extend((_show, _expose))
+    ctx.Extensions().RegisterWindowMenu(
+        qrd.WindowMenu.Window, ["ReplayLab Material Parameters"], _show)
+    ctx.Extensions().RegisterContextMenu(
+        qrd.ContextMenu.BufferViewer_Variable,
+        ["ReplayLab", "Expose as Material Parameter"], _expose)
+
+
+def _unregister_material_panel_ui():
+    global _material_panel_ui, _material_panel_controller, _material_panel_callbacks
+    panel = _material_panel_ui
+    _material_panel_ui = None
+    if panel:
+        panel.shutdown(rollback=True)
+    elif _material_panel_controller:
+        try:
+            _material_panel_controller.rollback_all()
+        except Exception as exc:
+            print("[ReplayLab] Material controller unregister rollback error: %s" % str(exc))
+        _material_panel_controller.forget_all()
+    _material_panel_controller = None
+    _material_panel_callbacks = []
+
+
+def _register_pass_panel_ui(ctx):
+    """Register the read-only semantic EID tree populated by the MCP host."""
+    global _pass_panel_ui, _pass_panel_callbacks, _pass_panel_factory
+
+    def _set_event(event_id):
+        if not _ctx or not _ctx.IsCaptureLoaded():
+            raise RuntimeError("No capture loaded")
+        _ctx.SetEventID([], int(event_id), int(event_id))
+
+    def _new_panel():
+        # Bind the close callback to the exact panel instance. A deferred
+        # QWidget::destroyed notification from an old dock must never clear a
+        # newer replacement panel after an integration reload/reopen.
+        panel = _pass_panel_protocol.MiniQtPassPanel(
+            ctx, qrd, _set_event, None)
+
+        def _closed(closed_panel=panel):
+            global _pass_panel_ui
+            if _pass_panel_ui is closed_panel:
+                _pass_panel_ui = None
+
+        panel.closed_callback = _closed
+        return panel
+
+    _pass_panel_factory = _new_panel
+    _pass_panel_ui = _new_panel()
+
+    def _ensure_panel():
+        global _pass_panel_ui
+        if _pass_panel_ui is None:
+            _pass_panel_ui = _new_panel()
+        return _pass_panel_ui
+
+    def _show(_ctx_value, _data):
+        _ensure_panel().show()
+
+    _pass_panel_callbacks.append(_show)
+    ctx.Extensions().RegisterWindowMenu(
+        qrd.WindowMenu.Window, ["ReplayLab Semantic Passes"], _show)
+    ctx.Extensions().RegisterPanelMenu(
+        qrd.PanelMenu.EventBrowser,
+        ["ReplayLab", "Open Semantic Passes"], _show)
+
+
+def _unregister_pass_panel_ui():
+    global _pass_panel_ui, _pass_panel_callbacks, _pass_panel_factory
+    panel = _pass_panel_ui
+    _pass_panel_ui = None
+    if panel:
+        panel.shutdown()
+    _pass_panel_callbacks = []
+    _pass_panel_factory = None
+
+
+# replaylab-project-i18n-begin: all project UI in this region is extraction-gated
+def _project_launcher_process_arguments():
+    """Return qrenderdoc arguments without assuming embedded Python has argv.
+
+    qrenderdoc's isolated Python context does not guarantee ``sys.argv``. Qt is
+    the process owner and therefore the authoritative source when its
+    application object is available. Tests and non-UI imports retain the
+    ordinary Python fallback.
+    """
+    if HAS_UI:
+        try:
+            application = QtCore.QCoreApplication.instance()
+            if application is not None:
+                values = [str(value or "") for value in application.arguments()]
+                return values[1:] if values else []
+        except Exception:
+            pass
+    values = list(getattr(sys, "argv", []) or [])
+    return [str(value or "") for value in values[1:]]
+
+
+def _project_launcher_startup_allowed():
+    """Return true only for an idle, ordinary qrenderdoc GUI startup."""
+    if not HAS_UI or not getattr(_project_launcher_protocol, "HAS_QT", False):
+        return False
+    try:
+        loaded = bool(_ctx and _ctx.IsCaptureLoaded())
+        loading = bool(
+            _ctx and getattr(_ctx, "IsCaptureLoading", lambda: False)())
+    except Exception:
+        return False
+    return _project_launcher_protocol.launcher_startup_allowed(
+        _project_launcher_process_arguments(), loaded, loading, True)
+
+
+def _cancel_project_auto_activation():
+    global _project_auto_activation_generation, _project_auto_activation_timer
+    global _project_preselected_capture_path
+    _project_auto_activation_generation += 1
+    timer = _project_auto_activation_timer
+    _project_auto_activation_timer = None
+    _dispose_project_timer(timer)
+    if _project_async_executor is not None:
+        try:
+            _project_async_executor.cancel_owner("capture-auto-activation")
+        except Exception:
+            pass
+    try:
+        if os.path.isfile(PROJECT_ASSOCIATION_LEASE_FILE):
+            os.unlink(PROJECT_ASSOCIATION_LEASE_FILE)
+    except OSError:
+        pass
+    # LoadCapture closes the previous capture before delivering OnCaptureLoaded.
+    # Preserve the one-shot marker across that nested close callback, but clear
+    # it for ordinary closes and integration shutdown.
+    if _project_preselected_open_depth <= 0:
+        _project_preselected_capture_path = ""
+    _clear_project_background_status()
+
+
+def _dispose_project_timer(timer):
+    """Synchronously detach a PySide callback before interpreter shutdown."""
+    if timer is None:
+        return
+    try:
+        timer.stop()
+    except Exception:
+        pass
+    try:
+        timer.timeout.disconnect()
+    except Exception:
+        pass
+    try:
+        timer.deleteLater()
+    except Exception:
+        pass
+
+
+def _project_ui_format(translated, *arguments):
+    """Format translated project UI text without reprocessing dynamic values."""
+    values = tuple(str(value) for value in arguments)
+
+    def _replace(match):
+        index = int(match.group(1))
+        return values[index - 1] if 0 < index <= len(values) else match.group(0)
+
+    return re.sub(r"%([1-9][0-9]*)", _replace, str(translated))
+
+
+def _show_project_background_status(message, timeout_ms=0):
+    """Use qrenderdoc's status bar when available; never display a modal."""
+    if str(message or ""):
+        project_phase = (QtCore.QCoreApplication.translate(
+            "ReplayLabProjects", "Project") if HAS_UI else "")
+        _publish_console_event(
+            "project", "info", str(message), phase=project_phase,
+            code="projectStatus")
+    if not HAS_UI or not _ctx:
+        return
+    try:
+        window = _ctx.GetMainWindow().Widget()
+        status_bar = getattr(window, "statusBar", lambda: None)()
+        if status_bar is not None:
+            status_bar.showMessage(str(message), int(timeout_ms))
+    except Exception:
+        pass
+
+
+def _clear_project_background_status():
+    if not HAS_UI or not _ctx:
+        return
+    try:
+        window = _ctx.GetMainWindow().Widget()
+        status_bar = getattr(window, "statusBar", lambda: None)()
+        if status_bar is not None:
+            status_bar.clearMessage()
+    except Exception:
+        pass
+
+
+def _consume_project_association_lease(expected_token):
+    try:
+        if not os.path.isfile(PROJECT_ASSOCIATION_LEASE_FILE):
+            return
+        with open(PROJECT_ASSOCIATION_LEASE_FILE, "r", encoding="utf-8") as stream:
+            value = json.load(stream)
+        if (isinstance(value, dict) and
+                value.get("token") == str(expected_token or "")):
+            os.unlink(PROJECT_ASSOCIATION_LEASE_FILE)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _schedule_project_auto_activation():
+    """Defer exact capture-reference activation out of lifecycle callbacks."""
+    global _project_auto_activation_generation, _project_auto_activation_timer
+    if not HAS_UI or not _ctx:
+        return
+    try:
+        path = os.path.abspath(str(_ctx.GetCaptureFilename() or ""))
+    except Exception:
+        return
+    if not path or not path.lower().endswith(".rdc"):
+        return
+    if _consume_preselected_project_capture(path):
+        # The project launcher already selected and fully validated the owning
+        # project before LoadCapture.  Do not rescan every registered capture
+        # path in a second packaged-host process for the same explicit action.
+        _cancel_project_auto_activation()
+        _show_project_background_status(
+            QtCore.QCoreApplication.translate(
+                "ReplayLabProjects",
+                "ReplayLab: using the project selected for this RDC"), 5000)
+        return
+    _project_auto_activation_generation += 1
+    generation = _project_auto_activation_generation
+    lease_token = uuid.uuid4().hex
+    try:
+        _atomic_write_json(PROJECT_ASSOCIATION_LEASE_FILE, {
+            "schema": "replaylab-project-association-lease/v1",
+            "token": lease_token,
+            "active": True,
+            "capturePath": path,
+            "captureSessionId": _capture_session_id,
+            "generation": generation,
+        })
+    except Exception as exc:
+        print("[ReplayLab] Could not create capture/project association lease: %s" %
+              str(exc))
+        return
+
+    def _activate_unique():
+        if generation != _project_auto_activation_generation or not _ctx:
+            return
+        try:
+            if (not _ctx.IsCaptureLoaded() or
+                    bool(getattr(_ctx, "IsCaptureLoading", lambda: False)())):
+                return
+            current_path = os.path.abspath(str(_ctx.GetCaptureFilename() or ""))
+            if os.path.normcase(current_path) != os.path.normcase(path):
+                return
+            executable = _find_replaylab_host()
+            if not executable or _project_async_executor is None:
+                return
+            client = _project_launcher_protocol.ReplayLabProjectClient(executable)
+            _show_project_background_status(
+                QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects",
+                    "ReplayLab: matching this RDC to a registered project path…"))
+
+            def _matched(value, error):
+                if (generation != _project_auto_activation_generation or
+                        not _ctx):
+                    return
+                try:
+                    if (not _ctx.IsCaptureLoaded() or
+                            bool(getattr(_ctx, "IsCaptureLoading", lambda: False)())):
+                        return
+                    current_path = os.path.abspath(
+                        str(_ctx.GetCaptureFilename() or ""))
+                    if os.path.normcase(current_path) != os.path.normcase(path):
+                        return
+                except Exception:
+                    return
+                _consume_project_association_lease(lease_token)
+                if error:
+                    print("[ReplayLab] Capture/project association skipped: %s" % error)
+                    _show_project_background_status(
+                        _project_ui_format(QtCore.QCoreApplication.translate(
+                            "ReplayLabProjects",
+                            "ReplayLab: project association was not changed (%1)"),
+                            error),
+                        7000)
+                    return
+                project = (value or {}).get("project")
+                if (value or {}).get("activated") and isinstance(project, dict):
+                    print("[ReplayLab] Activated path-matched project '%s' for %s" %
+                          (project.get("name", ""), path))
+                    _show_project_background_status(
+                        _project_ui_format(QtCore.QCoreApplication.translate(
+                            "ReplayLabProjects",
+                            "ReplayLab: active project is %1"),
+                            project.get("name", "")), 5000)
+                else:
+                    _show_project_background_status(
+                        QtCore.QCoreApplication.translate(
+                            "ReplayLabProjects",
+                            "ReplayLab: no unique registered project path; active project "
+                            "unchanged"),
+                        5000)
+
+            _project_async_executor.cancel_owner("capture-auto-activation")
+            _project_async_executor.submit(
+                "capture-auto-activation",
+                lambda: client.match_and_activate_capture(
+                    path, PROJECT_ASSOCIATION_LEASE_FILE, lease_token),
+                _matched)
+        except Exception as exc:
+            # Capture loading succeeded independently. Project association is a
+            # best-effort metadata step and must never close or disturb it.
+            print("[ReplayLab] Capture/project association skipped: %s" % str(exc))
+
+    # Start only a bounded worker from the lifecycle callback. Use an explicitly
+    # owned timer so unregister can detach its Python closure before Py_Finalize.
+    _dispose_project_timer(_project_auto_activation_timer)
+    timer = QtCore.QTimer()
+    timer.setSingleShot(True)
+
+    def _activate_from_timer(selected_timer=timer):
+        global _project_auto_activation_timer
+        if _project_auto_activation_timer is selected_timer:
+            _project_auto_activation_timer = None
+        _dispose_project_timer(selected_timer)
+        _activate_unique()
+
+    timer.timeout.connect(_activate_from_timer)
+    _project_auto_activation_timer = timer
+    timer.start(0)
+
+
+def _register_project_launcher_ui(ctx):
+    """Register the File-menu project home and defer idle-startup display."""
+    global _project_launcher_callbacks, _project_thumbnail_cache, _project_thumbnail_reader
+    global _project_async_executor, _project_startup_timer
+    if not getattr(_project_launcher_protocol, "HAS_QT", False):
+        raise RuntimeError("PySide2 is unavailable for the ReplayLab project launcher")
+    if _project_thumbnail_cache is None:
+        _project_thumbnail_cache = _project_launcher_protocol.ThumbnailCache()
+    if _project_thumbnail_reader is None:
+        # Construct on qrenderdoc's UI thread. The reader rejects accidental
+        # cross-thread use and never calls ICaptureFile.OpenCapture().
+        _project_thumbnail_reader = _project_launcher_protocol.RenderDocThumbnailReader(rd)
+    if _project_async_executor is None:
+        _project_async_executor = _project_launcher_protocol.AsyncProjectExecutor(2)
+
+    def _closed():
+        global _project_launcher_ui
+        _project_launcher_ui = None
+
+    def _open_capture_from_project(path):
+        return _open_capture_for_preselected_project(path)
+
+    def _restore_capture_from_project(project_root, path, progress_callback):
+        """Run post-load restore in the persistent Python 3.10+ Host."""
+
+        expected_path = os.path.abspath(str(path or ""))
+        expected_token = ("loaded", os.path.normcase(expected_path))
+        session_id = str(_capture_session_id or "")
+        # This callback runs on the launcher's worker. Only inspect the plain
+        # lifecycle snapshot published by the UI-thread callbacks; never call
+        # ICaptureContext or Qt from this worker.
+        if not session_id or _active_capture_token != expected_token:
+            return {
+                "errorId": "capture-no-longer-active"
+            }
+        client = _project_restore_client_protocol.ReplayLabRestoreHostClient()
+        result = client.restore(
+            project_root, expected_path, session_id, progress_callback)
+        unchanged = bool(
+            str(_capture_session_id or "") == session_id and
+            _active_capture_token == expected_token)
+        if not unchanged:
+            return {
+                "errorId": "capture-changed-during-restore"
+            }
+        return result
+
+    def _show(_ctx_value=None, _data=None):
+        global _project_launcher_ui
+        if _project_launcher_ui is not None:
+            try:
+                if _project_launcher_ui.isVisible():
+                    _project_launcher_ui.raise_()
+                    _project_launcher_ui.activateWindow()
+                    return
+            except Exception:
+                _project_launcher_ui = None
+        executable = _find_replaylab_host()
+        if not executable:
+            ctx.Extensions().ErrorDialog(
+                QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects",
+                    "The packaged ReplayLabMCP.exe is unavailable. Reinstall the complete "
+                    "ReplayLab bundle before using project management."),
+                QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects", "ReplayLab Projects"))
+            return
+        try:
+            client = _project_launcher_protocol.ReplayLabProjectClient(executable)
+            parent = ctx.GetMainWindow().Widget()
+            _project_launcher_ui = _project_launcher_protocol.ReplayLabProjectLauncher(
+                client, _open_capture_from_project, parent, _closed,
+                _project_thumbnail_reader, _project_thumbnail_cache,
+                _project_async_executor, _restore_capture_from_project)
+            _project_launcher_ui.show()
+            _project_launcher_ui.raise_()
+            _project_launcher_ui.activateWindow()
+        except Exception as exc:
+            _project_launcher_ui = None
+            ctx.Extensions().ErrorDialog(
+                str(exc), QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects", "ReplayLab Projects"))
+
+    def _show_startup():
+        if _ctx is ctx and _project_launcher_startup_allowed():
+            _show(ctx, None)
+
+    _project_launcher_callbacks.extend((_show, _show_startup))
+    ctx.Extensions().RegisterWindowMenu(
+        qrd.WindowMenu.File, [QtCore.QCoreApplication.translate(
+            "ReplayLabProjects", "ReplayLab Projects…")], _show)
+    # Let CaptureContext.Begin process command-line capture parameters first.
+    # A direct .rdc open or a loading capture suppresses this optional home UI.
+    # This must be cancellable during fast application shutdown.
+    _dispose_project_timer(_project_startup_timer)
+    timer = QtCore.QTimer()
+    timer.setSingleShot(True)
+
+    def _show_startup_from_timer(selected_timer=timer):
+        global _project_startup_timer
+        if _project_startup_timer is selected_timer:
+            _project_startup_timer = None
+        _dispose_project_timer(selected_timer)
+        _show_startup()
+
+    timer.timeout.connect(_show_startup_from_timer)
+    _project_startup_timer = timer
+    timer.start(350)
+
+
+def _unregister_project_launcher_ui():
+    global _project_launcher_ui, _project_launcher_callbacks
+    global _project_thumbnail_cache, _project_thumbnail_reader, _project_async_executor
+    global _project_startup_timer
+    _cancel_project_auto_activation()
+    timer = _project_startup_timer
+    _project_startup_timer = None
+    _dispose_project_timer(timer)
+    launcher = _project_launcher_ui
+    _project_launcher_ui = None
+    if launcher is not None:
+        try:
+            launcher.close()
+        except Exception:
+            pass
+    _project_launcher_callbacks = []
+    if _project_thumbnail_cache is not None:
+        try:
+            _project_thumbnail_cache.clear()
+        except Exception:
+            pass
+    _project_thumbnail_cache = None
+    _project_thumbnail_reader = None
+    executor = _project_async_executor
+    if executor is not None:
+        try:
+            executor.shutdown()
+        except Exception as exc:
+            # Never silently continue into Py_Finalize with a live QRunnable.
+            print("[ReplayLab] Project executor shutdown error: %s" % str(exc))
+            raise
+        _project_async_executor = None
+
+
+# replaylab-project-i18n-end
+def _register_shader_console_ui(ctx):
+    """Register the audit-only, continuously refreshed ReplayLab Console dock."""
+    global _shader_console_callbacks
+    if not getattr(_shader_console_protocol, "HAS_QT", False):
+        raise RuntimeError("PySide2 is unavailable for ReplayLab Console")
+
+    def _closed():
+        global _shader_console_ui
+        _shader_console_ui = None
+
+    def _show(_ctx_value=None, _data=None):
+        global _shader_console_ui
+        if _shader_console_ui is None:
+            _shader_console_ui = _shader_console_protocol.ReplayLabConsolePanel(
+                ctx, qrd, closed_callback=_closed)
+        _shader_console_ui.show()
+
+    _shader_console_callbacks.append(_show)
+    ctx.Extensions().RegisterWindowMenu(
+        qrd.WindowMenu.Tools, ["ReplayLab", "Console"], _show)
+    ctx.Extensions().RegisterWindowMenu(
+        qrd.WindowMenu.Window, ["ReplayLab Console"], _show)
+    # Keep the previous Tools entry for installed workflows/bookmarks. Both
+    # callbacks open the same general console instance.
+    ctx.Extensions().RegisterWindowMenu(
+        qrd.WindowMenu.Tools, ["ReplayLab", "Shader Console"], _show)
+
+
+def _unregister_shader_console_ui():
+    global _shader_console_ui, _shader_console_callbacks
+    panel = _shader_console_ui
+    _shader_console_ui = None
+    if panel is not None:
+        try:
+            panel.shutdown()
+        except Exception as exc:
+            print("[ReplayLab] Console shutdown error: %s" % str(exc))
+    _shader_console_callbacks = []
+
+
+# =====================================================================
+# Built-in integration entry points
+# =====================================================================
+
+def start(version, ctx):
+    global _ctx, _poller, _capture_viewer, _active_capture_token
+    _ctx = ctx
+    # qrenderdoc owns the watcher IPC poller and ReplayLab Console timers. Opt out
+    # of Windows execution-speed/EcoQoS throttling so they retain their cadence
+    # when the main window is covered or in the background. This is a
+    # best-effort process-local setting and never blocks integration startup.
+    _shader_console_protocol.disable_background_power_throttling()
+    _reset_symbol_state(restore_names=False)
+    _active_capture_token = _current_capture_token()
+
+    _capture_viewer = CaptureLifecycleViewer() if HAS_UI else None
+    if _capture_viewer:
+        try:
+            ctx.AddCaptureViewer(_capture_viewer)
+        except Exception as exc:
+            print("[ReplayLab] Capture viewer error: %s" % str(exc))
+            _capture_viewer = None
+
+    _poller = JsonPoller(handle_request) if HAS_UI else None
+    if _poller:
+        _poller.start()
+
+    # The bridge remains usable with a Codex-owned stdio process. A packaged
+    # build additionally starts one authenticated loopback host automatically
+    # for UI intents and other explicitly configured MCP clients.
+    _start_replaylab_host()
+
+    if HAS_UI:
+        try:
+            _register_project_launcher_ui(ctx)
+        except Exception as e:
+            print("[ReplayLab] Project launcher error: %s" % str(e))
+        try:
+            ctx.Extensions().RegisterWindowMenu(
+                qrd.WindowMenu.Tools, ["ReplayLab", "Status"], _show_status)
+        except Exception as e:
+            print("[ReplayLab] Menu error: %s" % str(e))
+        try:
+            _register_event_browser_filter_ui(ctx)
+        except Exception as e:
+            print("[ReplayLab] Event Browser filter error: %s" % str(e))
+        try:
+            _register_material_panel_ui(ctx)
+        except Exception as e:
+            print("[ReplayLab] Material panel error: %s" % str(e))
+        try:
+            _register_pass_panel_ui(ctx)
+        except Exception as e:
+            print("[ReplayLab] Pass panel error: %s" % str(e))
+        try:
+            _register_shader_console_ui(ctx)
+        except Exception as e:
+            print("[ReplayLab] Console error: %s" % str(e))
+
+    print("[ReplayLab] Loaded (RenderDoc %s)" % version)
+    print("[ReplayLab] IPC: %s" % IPC_DIR)
+    _publish_console_event(
+        "system", "info", "ReplayLab 内置集成已加载", phase="系统",
+        code="integrationLoaded")
+
+
+def stop():
+    global _ctx, _poller, _capture_viewer, _active_capture_token
+    errors = []
+
+    def _cleanup(label, callback):
+        try:
+            callback()
+        except Exception as exc:
+            detail = "%s: %s" % (label, str(exc)[:512])
+            errors.append(detail)
+            print("[ReplayLab] Shutdown cleanup error: %s" % detail)
+
+    poller = _poller
+    _poller = None
+    if poller:
+        _cleanup("IPC poller", poller.stop)
+    _cleanup("instance manifest", lambda: _publish_instance_manifest(stopped=True))
+    _cleanup("MCP host owner", _release_replaylab_host_owner)
+    _cleanup("shader console", _unregister_shader_console_ui)
+    if _ctx:
+        _cleanup("event browser filters", lambda: _unregister_event_browser_filter_ui(_ctx))
+    _cleanup("project launcher", _unregister_project_launcher_ui)
+    _cleanup("pass panel", _unregister_pass_panel_ui)
+    _cleanup("material panel", _unregister_material_panel_ui)
+    _cleanup("event shader overrides", _release_event_shader_overrides)
+    _cleanup("shared shader replacements", _release_shared_shader_replacements)
+    _cleanup("event CBuffer snapshots", _release_event_cbuffer_snapshots)
+    _cleanup("symbol state", lambda: _reset_symbol_state(restore_names=True))
+
+    viewer = _capture_viewer
+    _capture_viewer = None
+    if viewer and _ctx:
+        _cleanup("capture viewer", lambda: _ctx.RemoveCaptureViewer(viewer))
+    _active_capture_token = None
+    _ctx = None
+    print("[ReplayLab] Unloaded")
+    if errors:
+        raise RuntimeError("ReplayLab shutdown incomplete: %s" % "; ".join(errors))
+
+
+def _show_status(ctx, data):
+    if _poller:
+        msg = "MCP bridge is RUNNING\nIPC: %s\nMethods: %s" % (IPC_DIR, ", ".join(sorted(METHODS.keys())))
+        ctx.Extensions().MessageDialog(msg, "ReplayLab")
+    else:
+        ctx.Extensions().ErrorDialog("MCP bridge is NOT running", "ReplayLab")
+
+
+def enqueue_native_intent(kind, focus_stage=""):
+    """Freeze one native qrenderdoc action and return its capability-scoped intent id."""
+    if _ctx is None:
+        raise RuntimeError("The built-in ReplayLab integration is not running")
+    context = _build_current_renderdoc_context(
+        focus_stage=focus_stage,
+        focus_source="explicit-ui-button" if focus_stage else "")
+    record = _ai_intent_queue.enqueue(kind, context)
+    return record["intentId"]
+
+
+def available_native_shader_stages():
+    """Return the currently bound stage identifiers for qrenderdoc's native menu."""
+    if _ctx is None or not _ctx.IsCaptureLoaded():
+        return ""
+
+    pipeline = _ctx.CurPipelineState()
+    result = []
+    for stage_name, stage in _available_shader_stages():
+        try:
+            if _resource_id_int(pipeline.GetShader(stage)) > 0:
+                result.append(stage_name)
+        except Exception:
+            pass
+    return ",".join(result)

@@ -40,15 +40,20 @@ FindReplace::FindReplace(QWidget *parent) : QFrame(parent), ui(new Ui::FindRepla
 
   RDLineEdit *edit = new RDLineEdit(this);
   ui->findText->setLineEdit(edit);
+  RDLineEdit *replaceEdit = new RDLineEdit(this);
+  ui->replaceText->setLineEdit(replaceEdit);
 
   ui->findText->setAutoCompletion(false);
   ui->replaceText->setAutoCompletion(false);
 
   QObject::connect(edit, &RDLineEdit::keyPress, [this](QKeyEvent *event) {
-    if(event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)
+    if(event->key() == Qt::Key_Escape)
     {
-      SearchDirection dir = m_direction;
-
+      emit closeRequested();
+    }
+    else if(event->key() == Qt::Key_F3 || event->key() == Qt::Key_Return ||
+            event->key() == Qt::Key_Enter)
+    {
       if(event->modifiers() & Qt::ShiftModifier)
         m_direction = SearchDirection::Up;
       else
@@ -56,12 +61,34 @@ FindReplace::FindReplace(QWidget *parent) : QFrame(parent), ui(new Ui::FindRepla
 
       addHistory(ui->findText);
       emit performFind();
-
-      m_direction = dir;
+    }
+  });
+  QObject::connect(replaceEdit, &RDLineEdit::keyPress, [this](QKeyEvent *event) {
+    if(event->key() == Qt::Key_Escape)
+    {
+      emit closeRequested();
+    }
+    else if(event->key() == Qt::Key_F3)
+    {
+      m_direction = event->modifiers() & Qt::ShiftModifier ? SearchDirection::Up
+                                                           : SearchDirection::Down;
+      emit performFind();
     }
   });
   QObject::connect(ui->replaceText->lineEdit(), &QLineEdit::returnPressed, this,
                    &FindReplace::on_replace_clicked);
+
+  QObject::connect(edit, &QLineEdit::textChanged, this, &FindReplace::searchChanged);
+  QObject::connect(ui->matchCase, &QToolButton::toggled, this, &FindReplace::searchChanged);
+  QObject::connect(ui->matchWord, &QToolButton::toggled, this, &FindReplace::searchChanged);
+  QObject::connect(ui->regexp, &QToolButton::toggled, this, &FindReplace::searchChanged);
+  QObject::connect(static_cast<QComboBox *>(ui->searchContext),
+                   static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged), this,
+                   &FindReplace::searchChanged);
+
+  setAttribute(Qt::WA_StyledBackground, true);
+  setObjectName(QStringLiteral("editorFindBar"));
+  setResultCount(0, 0);
 }
 
 FindReplace::~FindReplace()
@@ -119,6 +146,24 @@ QString FindReplace::replaceText()
   return ui->replaceText->currentText();
 }
 
+void FindReplace::setResultCount(int current, int total)
+{
+  if(total <= 0)
+    ui->matchCount->setText(tr("0 results"));
+  else
+    ui->matchCount->setText(tr("%1/%2").arg(qMax(1, current)).arg(total));
+}
+
+void FindReplace::setSearchError(const QString &message)
+{
+  ui->findText->lineEdit()->setToolTip(message);
+  ui->findText->lineEdit()->setStyleSheet(
+      message.isEmpty() ? QString()
+                        : QStringLiteral("QLineEdit { border: 1px solid #ff5647; }"));
+  if(!message.isEmpty())
+    ui->matchCount->setText(message);
+}
+
 void FindReplace::allowUserModeChange(bool allow)
 {
   ui->modeChangeFrame->setVisible(allow);
@@ -135,6 +180,8 @@ void FindReplace::setReplaceMode(bool replacing)
   ui->replaceMode->setChecked(replacing);
 
   setWindowTitle(replacing ? tr("Find && Replace") : tr("Find"));
+  adjustSize();
+  emit layoutChanged();
 }
 
 void FindReplace::setDirection(SearchDirection dir)
@@ -152,16 +199,12 @@ void FindReplace::keyPressEvent(QKeyEvent *event)
 {
   if(event->key() == Qt::Key_F3)
   {
-    SearchDirection dir = m_direction;
-
     if(event->modifiers() & Qt::ShiftModifier)
       m_direction = SearchDirection::Up;
     else
       m_direction = SearchDirection::Down;
 
     emit performFind();
-
-    m_direction = dir;
   }
   else
   {
@@ -229,4 +272,9 @@ void FindReplace::on_findMode_clicked()
 void FindReplace::on_replaceMode_clicked()
 {
   setReplaceMode(true);
+}
+
+void FindReplace::on_close_clicked()
+{
+  emit closeRequested();
 }

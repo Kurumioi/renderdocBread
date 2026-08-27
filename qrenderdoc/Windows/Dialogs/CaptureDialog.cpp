@@ -46,11 +46,19 @@ static QString GetDescription(const EnvironmentModification &env)
   QString ret;
 
   if(env.mod == EnvMod::Append)
-    ret = QFormatStr("Append %1 with %2 using %3").arg(env.name).arg(env.value).arg(ToQStr(env.sep));
+    ret = QCoreApplication::translate("CaptureDialog", "Append %1 with %2 using %3")
+              .arg(env.name)
+              .arg(env.value)
+              .arg(ToQDisplayStr(env.sep));
   else if(env.mod == EnvMod::Prepend)
-    ret = QFormatStr("Prepend %1 with %2 using %3").arg(env.name).arg(env.value).arg(ToQStr(env.sep));
+    ret = QCoreApplication::translate("CaptureDialog", "Prepend %1 with %2 using %3")
+              .arg(env.name)
+              .arg(env.value)
+              .arg(ToQDisplayStr(env.sep));
   else
-    ret = QFormatStr("Set %1 to %2").arg(env.name).arg(env.value);
+    ret = QCoreApplication::translate("CaptureDialog", "Set %1 to %2")
+              .arg(env.name)
+              .arg(env.value);
 
   return ret;
 }
@@ -262,8 +270,8 @@ void CaptureDialog::SetInjectMode(bool inject)
 
     fillProcessList();
 
-    ui->launch->setText(lit("Inject"));
-    this->setWindowTitle(lit("Inject into Process"));
+    ui->launch->setText(tr("Inject"));
+    this->setWindowTitle(tr("Inject into Process"));
   }
   else
   {
@@ -275,8 +283,8 @@ void CaptureDialog::SetInjectMode(bool inject)
 
     ui->globalGroup->setVisible(m_Ctx.Config().AllowGlobalHook);
 
-    ui->launch->setText(lit("Launch"));
-    this->setWindowTitle(lit("Launch Application"));
+    ui->launch->setText(tr("Launch"));
+    this->setWindowTitle(tr("Launch Application"));
   }
 }
 

@@ -1343,6 +1343,16 @@ QWidget.
 )");
   virtual void ShowErrors(const rdcstr &errors) = 0;
 
+  DOCUMENT(R"(Switch an editor-style shader viewer into a read-only explanatory representation.
+
+This is intended for disassembly, pseudocode, and ABI skeletons which are useful to inspect but are
+not executable shader source. It disables source editing and every compile/apply entry point,
+including keyboard refresh shortcuts.
+
+:param str reason: The diagnostic explaining why this representation cannot be applied.
+)");
+  virtual void SetExplanatoryMode(const rdcstr &reason) = 0;
+
   DOCUMENT(R"(Add an expression to the watch panel.
 
 :param str expression: The name of the expression to watch.

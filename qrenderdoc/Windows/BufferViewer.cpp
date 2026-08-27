@@ -60,6 +60,11 @@ struct FixedVarTag
   bool padding = false;
   bool matrix = false;
   bool rowmajor = false;
+  // This is only a UI eligibility hint. ReplayLab re-reads the exact reflection and issues an
+  // allow-listed leaf ID before it accepts a material edit.
+  bool replayLabMaterialLeaf = false;
+  VarType replayLabBaseType = VarType::Unknown;
+  uint8_t replayLabComponents = 0;
   rdcstr name;
   union
   {
@@ -69,6 +74,124 @@ struct FixedVarTag
 };
 
 Q_DECLARE_METATYPE(FixedVarTag);
+
+static bool IsReplayLabMaterialLeaf(const ShaderConstant &constant, const ShaderVariable &variable)
+{
+  if(constant.bitFieldOffset != 0 || constant.bitFieldSize != 0 || !variable.members.empty())
+    return false;
+
+  if(variable.rows != 1 || variable.columns < 1 || variable.columns > 4)
+    return false;
+
+  return constant.type.baseType == VarType::Float || constant.type.baseType == VarType::SInt ||
+         constant.type.baseType == VarType::UInt;
+}
+
+static FixedVarTag ReplayLabFixedVarTag(const ShaderConstant &constant,
+                                        const ShaderVariable &variable, uint32_t byteOffset)
+{
+  FixedVarTag tag(variable.name, byteOffset);
+  tag.replayLabMaterialLeaf = IsReplayLabMaterialLeaf(constant, variable);
+  tag.replayLabBaseType = constant.type.baseType;
+  tag.replayLabComponents = variable.columns;
+  return tag;
+}
+
+enum class ReplayLabMaterialGate
+{
+  Available,
+  UnsupportedAPI,
+  RemoteReplay,
+  NotReplayableAction,
+  ViewNotReady,
+  MissingReflection,
+  NoRuntimeBacking,
+  RootConstants,
+  IndirectRootCBV,
+  CompileConstants,
+  CustomFormat,
+  UnsupportedLeaf,
+  ShaderUnbound,
+  BufferUnbound,
+  InvalidBindingWindow,
+  UnsupportedBinding,
+};
+
+struct ReplayLabMaterialGateState
+{
+  GraphicsAPI api = GraphicsAPI::D3D11;
+  bool remoteReplay = false;
+  bool replayableAction = true;
+  bool viewReady = true;
+  bool reflectionAvailable = true;
+  bool bytesBacked = true;
+  bool inlineData = false;
+  bool rootCBV = false;
+  bool indirectAction = false;
+  bool compileConstants = false;
+  bool customFormat = false;
+  bool materialLeaf = true;
+  bool shaderBound = true;
+  bool bufferBound = true;
+  uint64_t byteOffset = 0;
+  uint64_t byteSize = 16;
+  uint32_t physicalSlot = 0;
+  uint32_t registerSpace = 0;
+  uint32_t bindArraySize = 1;
+  uint32_t arrayIndex = 0;
+};
+
+static uint64_t ReplayLabMaterialBindingByteSize(GraphicsAPI api, uint64_t reportedByteSize,
+                                                 uint32_t reflectedByteSize, bool rootCBV)
+{
+  // A D3D12 root CBV has no SizeInBytes. The generic pipeline state therefore exposes the
+  // resource remainder, which is often a large upload ring. Only reflection defines the safe,
+  // shader-visible editing window. Descriptor-table CBVs retain their explicit SizeInBytes.
+  if(api == GraphicsAPI::D3D12 && rootCBV)
+    return AlignUp(uint64_t(reflectedByteSize), 16ULL);
+  return reportedByteSize;
+}
+
+static ReplayLabMaterialGate GetReplayLabMaterialGate(const ReplayLabMaterialGateState &state)
+{
+  if(state.api != GraphicsAPI::D3D11 && state.api != GraphicsAPI::D3D12)
+    return ReplayLabMaterialGate::UnsupportedAPI;
+  if(state.remoteReplay)
+    return ReplayLabMaterialGate::RemoteReplay;
+  if(!state.replayableAction)
+    return ReplayLabMaterialGate::NotReplayableAction;
+  if(!state.viewReady)
+    return ReplayLabMaterialGate::ViewNotReady;
+  if(!state.reflectionAvailable)
+    return ReplayLabMaterialGate::MissingReflection;
+  if(!state.bytesBacked)
+    return ReplayLabMaterialGate::NoRuntimeBacking;
+  if(state.inlineData)
+    return ReplayLabMaterialGate::RootConstants;
+  if(state.api == GraphicsAPI::D3D12 && state.rootCBV && state.indirectAction)
+    return ReplayLabMaterialGate::IndirectRootCBV;
+  if(state.compileConstants)
+    return ReplayLabMaterialGate::CompileConstants;
+  if(state.customFormat)
+    return ReplayLabMaterialGate::CustomFormat;
+  if(!state.materialLeaf)
+    return ReplayLabMaterialGate::UnsupportedLeaf;
+  if(!state.shaderBound)
+    return ReplayLabMaterialGate::ShaderUnbound;
+  if(!state.bufferBound)
+    return ReplayLabMaterialGate::BufferUnbound;
+  if(state.byteSize == 0 || state.byteSize > 64 * 1024 || state.byteOffset % 16 != 0 ||
+     state.byteSize % 16 != 0)
+    return ReplayLabMaterialGate::InvalidBindingWindow;
+  if(state.bindArraySize != 1 || state.arrayIndex != 0)
+    return ReplayLabMaterialGate::UnsupportedBinding;
+  if(state.api == GraphicsAPI::D3D11 &&
+     (state.physicalSlot >= 14 || state.registerSpace != 0))
+    return ReplayLabMaterialGate::UnsupportedBinding;
+  if(state.api == GraphicsAPI::D3D12 && state.byteOffset % 256 != 0)
+    return ReplayLabMaterialGate::InvalidBindingWindow;
+  return ReplayLabMaterialGate::Available;
+}
 
 static const uint32_t MaxVisibleRows = 10000;
 
@@ -3011,6 +3134,9 @@ void BufferViewer::meshHeaderMenu(MeshDataStage stage, const QPoint &pos)
 void BufferViewer::fixedVars_contextMenu(const QPoint &pos)
 {
   RDTreeWidgetItem *item = ui->fixedVars->itemAt(pos);
+  FixedVarTag tag;
+  if(item)
+    tag = item->tag().value<FixedVarTag>();
 
   m_CurView = NULL;
   m_CurFixed = true;
@@ -3116,6 +3242,176 @@ void BufferViewer::fixedVars_contextMenu(const QPoint &pos)
                    [this, item, pos]() { ui->fixedVars->copyItem(pos, item); });
   QObject::connect(&showPadding, &QAction::triggered,
                    [this]() { ui->showPadding->setChecked(!ui->showPadding->isChecked()); });
+
+  // Stock qrenderdoc previously exposed only the whole BufferViewer panel to extensions. ReplayLab
+  // needs a variable-scoped hook so its material panel can start from a native selection instead
+  // of accepting a caller-supplied byte offset. The bridge still re-reflects and validates every
+  // value before it issues an editable leaf ID.
+  if(IsCBufferView() && item && tag.valid && !tag.padding)
+  {
+    const ShaderReflection *reflection =
+        m_Ctx.CurPipelineState().GetShaderReflection(m_CBufferSlot.stage);
+    const ConstantBlock *block = NULL;
+    if(reflection && m_CBufferSlot.slot < reflection->constantBlocks.size())
+      block = &reflection->constantBlocks[m_CBufferSlot.slot];
+
+    uint64_t materialByteSize = m_ByteSize;
+    bool materialRootCBV = false;
+    if(block != NULL && m_Ctx.APIProps().pipelineType == GraphicsAPI::D3D12)
+    {
+      const D3D12Pipe::State *d3d12 = m_Ctx.CurD3D12PipelineState();
+      if(d3d12 != NULL)
+      {
+        for(const D3D12Pipe::RootParam &param : d3d12->rootSignature.parameters)
+        {
+          if((param.visibility & MaskForStage(m_CBufferSlot.stage)) &&
+             param.reg == block->fixedBindNumber &&
+             param.space == block->fixedBindSetOrSpace &&
+             param.descriptor.type == DescriptorType::ConstantBuffer &&
+             param.descriptor.resource == m_BufferID &&
+             param.descriptor.byteOffset == m_ByteOffset)
+          {
+            // Root CBVs have no descriptor size and the generic view reports the whole resource
+            // remainder. Use exactly the reflected shader-visible block window instead.
+            materialByteSize = ReplayLabMaterialBindingByteSize(
+                GraphicsAPI::D3D12, m_ByteSize, block->byteSize, true);
+            materialRootCBV = true;
+            break;
+          }
+        }
+      }
+    }
+
+    ReplayLabMaterialGateState gateState;
+    gateState.api = m_Ctx.APIProps().pipelineType;
+    gateState.remoteReplay = m_Ctx.APIProps().remoteReplay;
+    const ActionDescription *currentAction = m_Ctx.CurAction();
+    gateState.replayableAction =
+        currentAction != NULL &&
+        bool(currentAction->flags &
+             (ActionFlags::Drawcall | ActionFlags::Dispatch | ActionFlags::MeshDispatch));
+    gateState.viewReady = m_CurCBuffer.valid;
+    gateState.reflectionAvailable = block != NULL;
+    gateState.bytesBacked = m_CurCBuffer.bytesBacked;
+    gateState.inlineData = block != NULL && block->inlineDataBytes;
+    gateState.rootCBV = materialRootCBV;
+    gateState.indirectAction =
+        currentAction != NULL && bool(currentAction->flags & ActionFlags::Indirect);
+    gateState.compileConstants = m_CurCBuffer.compileConstants;
+    gateState.customFormat = !m_Format.isEmpty();
+    gateState.materialLeaf = tag.replayLabMaterialLeaf;
+    gateState.shaderBound = m_CurCBuffer.shader != ResourceId();
+    gateState.bufferBound = m_BufferID != ResourceId();
+    gateState.byteOffset = m_ByteOffset;
+    gateState.byteSize = materialByteSize;
+    if(block)
+    {
+      gateState.physicalSlot = block->fixedBindNumber;
+      gateState.registerSpace = block->fixedBindSetOrSpace;
+      gateState.bindArraySize = block->bindArraySize;
+    }
+    gateState.arrayIndex = m_CBufferSlot.arrayIdx;
+
+    QString unavailable;
+    switch(GetReplayLabMaterialGate(gateState))
+    {
+      case ReplayLabMaterialGate::Available: break;
+      case ReplayLabMaterialGate::UnsupportedAPI:
+        unavailable =
+            tr("Current capture API is %1; event-scoped material editing supports D3D11 and "
+               "D3D12 only")
+                .arg(ToQStr(gateState.api));
+        break;
+      case ReplayLabMaterialGate::RemoteReplay:
+        unavailable = tr("Material editing requires local replay");
+        break;
+      case ReplayLabMaterialGate::NotReplayableAction:
+        unavailable = tr("Select an actual Draw, Dispatch, or MeshDispatch EID first");
+        break;
+      case ReplayLabMaterialGate::ViewNotReady:
+        unavailable = tr("The CBuffer view has not finished loading its reflected binding");
+        break;
+      case ReplayLabMaterialGate::MissingReflection:
+        unavailable = tr("The selected constant-block reflection is no longer available");
+        break;
+      case ReplayLabMaterialGate::NoRuntimeBacking:
+        unavailable =
+            tr("The selected constant block is not backed by editable runtime buffer bytes");
+        break;
+      case ReplayLabMaterialGate::RootConstants:
+        unavailable = tr("D3D12 root constants are deliberately excluded; select a CBV-backed block");
+        break;
+      case ReplayLabMaterialGate::IndirectRootCBV:
+        unavailable =
+            tr("ExecuteIndirect can overwrite a root CBV during replay; select a descriptor-table "
+               "CBV or a direct Draw/Dispatch event");
+        break;
+      case ReplayLabMaterialGate::CompileConstants:
+        unavailable = tr("Compile-time constants are not runtime CBuffer memory");
+        break;
+      case ReplayLabMaterialGate::CustomFormat:
+        unavailable = tr("Clear the custom format to select a captured reflected CBuffer leaf");
+        break;
+      case ReplayLabMaterialGate::UnsupportedLeaf:
+        unavailable =
+            tr("Only reflected 32-bit float/int/uint scalar and vector leaves are editable");
+        break;
+      case ReplayLabMaterialGate::ShaderUnbound:
+        unavailable = tr("No Shader is bound for this reflected constant block");
+        break;
+      case ReplayLabMaterialGate::BufferUnbound:
+        unavailable = tr("The selected CBuffer binding is unbound at this event");
+        break;
+      case ReplayLabMaterialGate::InvalidBindingWindow:
+        unavailable = tr("The bound CBuffer byte window is invalid or unsupported");
+        break;
+      case ReplayLabMaterialGate::UnsupportedBinding:
+        unavailable = gateState.api == GraphicsAPI::D3D11
+                          ? tr("Only one fixed D3D11 b0-b13 binding in register space 0 is editable")
+                          : tr("Only one fixed D3D12 CBV binding is editable; arrays/root constants are excluded");
+        break;
+    }
+
+    if(!unavailable.isEmpty())
+    {
+      contextMenu.addSeparator();
+      QAction *disabled = contextMenu.addAction(
+          tr("Expose as ReplayLab Material Parameter (%1)").arg(unavailable));
+      disabled->setEnabled(false);
+    }
+    else
+    {
+      ExtensionCallbackData callbackdata = {
+          {"schema", lit("renderdoc-ultra-buffer-variable-selection/v1")},
+          {"eventId", m_Ctx.CurEvent()},
+          {"stageName", ToQStr(m_CBufferSlot.stage)},
+          {"blockIndex", m_CBufferSlot.slot},
+          {"arrayIndex", m_CBufferSlot.arrayIdx},
+          {"physicalSlot", block->fixedBindNumber},
+          {"registerSpace", block->fixedBindSetOrSpace},
+          {"blockName", QString(block->name)},
+          {"entryPoint", QString(m_CurCBuffer.entryPoint)},
+          {"shaderResourceId", QVariant::fromValue(m_CurCBuffer.shader)},
+          {"bufferResourceId", QVariant::fromValue(m_BufferID)},
+          {"bufferByteOffset", qulonglong(m_ByteOffset)},
+          {"bufferByteSize", qulonglong(materialByteSize)},
+          {"fieldName", QString(tag.name)},
+          {"fieldByteOffset", tag.byteOffset},
+          {"fieldBaseType", ToQStr(tag.replayLabBaseType)},
+          {"fieldComponents", uint32_t(tag.replayLabComponents)},
+      };
+
+      const int oldActionCount = contextMenu.actions().count();
+      QAction *separator = contextMenu.addSeparator();
+      m_Ctx.Extensions().MenuDisplaying(ContextMenu::BufferViewer_Variable, &contextMenu,
+                                        callbackdata);
+      if(contextMenu.actions().count() == oldActionCount + 1)
+      {
+        contextMenu.removeAction(separator);
+        delete separator;
+      }
+    }
+  }
 
   RDDialog::show(&contextMenu, ui->fixedVars->viewport()->mapToGlobal(pos));
 }
@@ -4360,7 +4656,8 @@ void BufferViewer::UI_AddFixedVariables(RDTreeWidgetItem *root, uint32_t baseOff
       n->setIcon(1, MakeSwatchIcon(ui->fixedVars, swatchColor));
     }
 
-    n->setTag(QVariant::fromValue(FixedVarTag(v.name, baseOffset + c.byteOffset)));
+    n->setTag(QVariant::fromValue(
+        ReplayLabFixedVarTag(c, v, baseOffset + c.byteOffset)));
 
     root->addChild(n);
 
@@ -4388,7 +4685,8 @@ void BufferViewer::UI_AddFixedVariables(RDTreeWidgetItem *root, uint32_t baseOff
             TypeString(v.members[e], c),
         });
 
-        el->setTag(QVariant::fromValue(FixedVarTag(v.members[e].name, elOffset)));
+        el->setTag(QVariant::fromValue(
+            ReplayLabFixedVarTag(c, v.members[e], elOffset)));
 
         // if it's an array of structs we can recurse, just need to do the outer iteration here
         // because v.members[...].members will be the actual struct members because of the expansion
@@ -4431,7 +4729,10 @@ void BufferViewer::UI_AddFixedVariables(RDTreeWidgetItem *root, uint32_t baseOff
     // for single structs, recurse
     else if(v.type == VarType::Struct)
     {
-      UI_AddFixedVariables(n, c.byteOffset, c.type.members, v.members);
+      // Member offsets are relative to their containing struct. Preserve the full physical
+      // CBuffer offset for nested structs so extension callback identities and the displayed
+      // offset column refer to the same reflected byte.
+      UI_AddFixedVariables(n, baseOffset + c.byteOffset, c.type.members, v.members);
     }
 
     // advance by the tight scalar-packed advance, so we can detect padding
@@ -7529,3 +7830,94 @@ void BufferViewer::on_autofitCamera_clicked()
 
   INVOKE_MEMFN(RT_UpdateAndDisplay);
 }
+
+#if ENABLE_UNIT_TESTS
+
+#include "3rdparty/catch/catch.hpp"
+
+TEST_CASE("ReplayLab material gate enables only safe local D3D11/D3D12 reflected leaves",
+          "[bufferviewer][replaylab][material]")
+{
+  ReplayLabMaterialGateState state;
+  CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::Available));
+
+  SECTION("a local D3D12 CBV-backed draw is supported")
+  {
+    state.api = GraphicsAPI::D3D12;
+    state.registerSpace = 9;
+    CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::Available));
+    state.byteOffset = 16;
+    CHECK(int(GetReplayLabMaterialGate(state)) ==
+          int(ReplayLabMaterialGate::InvalidBindingWindow));
+  }
+
+  SECTION("a D3D12 root CBV uses reflection instead of the upload-ring remainder")
+  {
+    const uint64_t ringRemainder = 8ULL * 1024ULL * 1024ULL;
+    CHECK(ReplayLabMaterialBindingByteSize(GraphicsAPI::D3D12, ringRemainder, 48, true) ==
+          48);
+    CHECK(ReplayLabMaterialBindingByteSize(GraphicsAPI::D3D12, 256, 48, false) == 256);
+    CHECK(ReplayLabMaterialBindingByteSize(GraphicsAPI::D3D11, 64, 48, true) == 64);
+  }
+
+  SECTION("Present and bookkeeping EIDs explicitly request a real action")
+  {
+    state.api = GraphicsAPI::D3D12;
+    state.replayableAction = false;
+    CHECK(int(GetReplayLabMaterialGate(state)) ==
+          int(ReplayLabMaterialGate::NotReplayableAction));
+  }
+
+  SECTION("D3D12 root constants remain excluded")
+  {
+    state.api = GraphicsAPI::D3D12;
+    state.inlineData = true;
+    CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::RootConstants));
+  }
+
+  SECTION("D3D12 ExecuteIndirect root CBVs fail closed")
+  {
+    state.api = GraphicsAPI::D3D12;
+    state.rootCBV = true;
+    state.indirectAction = true;
+    CHECK(int(GetReplayLabMaterialGate(state)) ==
+          int(ReplayLabMaterialGate::IndirectRootCBV));
+    state.rootCBV = false;
+    CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::Available));
+  }
+
+  SECTION("a remote D3D11 capture is rejected independently")
+  {
+    state.remoteReplay = true;
+    CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::RemoteReplay));
+  }
+
+  SECTION("a custom UI format is not treated as captured reflection")
+  {
+    state.customFormat = true;
+    CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::CustomFormat));
+  }
+
+  SECTION("unbound or malformed runtime windows stay disabled")
+  {
+    state.bufferBound = false;
+    CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::BufferUnbound));
+    state.bufferBound = true;
+    state.byteSize = UINT64_MAX;
+    CHECK(int(GetReplayLabMaterialGate(state)) ==
+          int(ReplayLabMaterialGate::InvalidBindingWindow));
+  }
+
+  SECTION("the fixed D3D11 binding contract is enforced")
+  {
+    state.physicalSlot = 14;
+    CHECK(int(GetReplayLabMaterialGate(state)) ==
+          int(ReplayLabMaterialGate::UnsupportedBinding));
+    state.physicalSlot = 0;
+    state.registerSpace = 1;
+    CHECK(int(GetReplayLabMaterialGate(state)) ==
+          int(ReplayLabMaterialGate::UnsupportedBinding));
+  }
+}
+
+#endif    // ENABLE_UNIT_TESTS

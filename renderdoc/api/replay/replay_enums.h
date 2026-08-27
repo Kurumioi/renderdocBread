@@ -4316,6 +4316,14 @@ DOCUMENT(R"(The type of message received from or sent to an application target c
 .. data:: RequestShow
 
   The client has requested that the controller show itself (raise its window to the top).
+
+.. data:: MonitorLog
+
+  The target sent one or more API monitor log messages to the controller.
+
+.. data:: MonitorStatus
+
+  The target sent an API monitor status update to the controller.
 )");
 enum class TargetControlMessageType : uint32_t
 {

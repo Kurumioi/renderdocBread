@@ -319,7 +319,8 @@ void MakeShaderReflection(DXBC::DXBCContainer *dxbc, const ShaderEntryPoint &ent
       break;
   }
 
-  refl->debugInfo.entrySourceName = refl->entryPoint = "main";
+  const rdcstr reflectedEntry = entry.name.empty() ? "main" : entry.name;
+  refl->debugInfo.entrySourceName = refl->entryPoint = reflectedEntry;
   refl->debugInfo.debugInfoLoadingLog = dxbc->GetDebugInfoLoadingLog();
 
   if(dxbc->GetDebugInfo())

@@ -22,8 +22,14 @@
     <Filter Include="Code\pyrenderdoc">
       <UniqueIdentifier>{c2e91ed4-8c04-4fdc-accf-8fed288f2cd8}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Code\ReplayLab">
+      <UniqueIdentifier>{1f4aab45-101c-4379-9a98-09377148613e}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Windows">
       <UniqueIdentifier>{897f728c-8a11-41c3-ba6f-75815d9e06db}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Windows\AI">
+      <UniqueIdentifier>{b643e829-62f2-4aa5-a090-b6af48fe6c44}</UniqueIdentifier>
     </Filter>
     <Filter Include="Windows\Dialogs">
       <UniqueIdentifier>{06b18b38-7ec5-4195-8230-f5be6348ecfb}</UniqueIdentifier>
@@ -81,6 +87,12 @@
     </Filter>
     <Filter Include="Resources\Files">
       <UniqueIdentifier>{c6877252-7f18-4c63-a2f7-66b1913d8ada}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ReplayLab">
+      <UniqueIdentifier>{2d5870f8-c6ea-4d2c-aef4-18571ff571ba}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ReplayLab\Python">
+      <UniqueIdentifier>{f43e1b60-e1a2-4c1e-9916-3a15c1c350ab}</UniqueIdentifier>
     </Filter>
     <Filter Include="3rdparty\catch">
       <UniqueIdentifier>{3e544acc-65a0-4558-8a31-8865c030e996}</UniqueIdentifier>
@@ -158,6 +170,15 @@
     </ClCompile>
     <ClCompile Include="Code\QRDUtils.cpp">
       <Filter>Code</Filter>
+    </ClCompile>
+    <ClCompile Include="Code\CodeEditorService.cpp">
+      <Filter>Code</Filter>
+    </ClCompile>
+    <ClCompile Include="Code\TranslationManager.cpp">
+      <Filter>Code</Filter>
+    </ClCompile>
+    <ClCompile Include="Code\ReplayLab\ReplayLabIntegration.cpp">
+      <Filter>Code\ReplayLab</Filter>
     </ClCompile>
     <ClCompile Include="Code\qprocessinfo.cpp">
       <Filter>Code</Filter>
@@ -612,6 +633,21 @@
     <ClCompile Include="Windows\ApiMonitorWindow.cpp">
       <Filter>Windows</Filter>
     </ClCompile>
+    <ClCompile Include="Windows\AI\AIAssistant.cpp">
+      <Filter>Windows\AI</Filter>
+    </ClCompile>
+    <ClCompile Include="Windows\AI\AIConversationListView.cpp">
+      <Filter>Windows\AI</Filter>
+    </ClCompile>
+    <ClCompile Include="Windows\AI\AIConversationStore.cpp">
+      <Filter>Windows\AI</Filter>
+    </ClCompile>
+    <ClCompile Include="Windows\AI\AIConversationView.cpp">
+      <Filter>Windows\AI</Filter>
+    </ClCompile>
+    <ClCompile Include="Windows\AI\AIPendingChatView.cpp">
+      <Filter>Windows\AI</Filter>
+    </ClCompile>
     <ClCompile Include="Widgets\Extended\RDTextEdit.cpp">
       <Filter>Widgets\Extended</Filter>
     </ClCompile>
@@ -986,6 +1022,15 @@
     <ClInclude Include="Code\ScintillaSyntax.h">
       <Filter>Code</Filter>
     </ClInclude>
+    <ClInclude Include="Code\CodeEditorService.h">
+      <Filter>Code</Filter>
+    </ClInclude>
+    <ClInclude Include="Code\TranslationManager.h">
+      <Filter>Code</Filter>
+    </ClInclude>
+    <ClInclude Include="Code\ReplayLab\ReplayLabIntegration.h">
+      <Filter>Code\ReplayLab</Filter>
+    </ClInclude>
     <ClInclude Include="Code\Resources.h">
       <Filter>Code</Filter>
     </ClInclude>
@@ -1102,6 +1147,21 @@
     </ClInclude>
     <ClInclude Include="$(IntDir)generated\ui_ApiMonitorWindow.h">
       <Filter>Generated Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\AI\AIAssistant.h">
+      <Filter>Windows\AI</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\AI\AIConversationListView.h">
+      <Filter>Windows\AI</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\AI\AIConversationStore.h">
+      <Filter>Windows\AI</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\AI\AIConversationView.h">
+      <Filter>Windows\AI</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\AI\AIPendingChatView.h">
+      <Filter>Windows\AI</Filter>
     </ClInclude>
     <ClInclude Include="Code\precompiled.h">
       <Filter>PCH</Filter>
@@ -2053,6 +2113,23 @@
     <Image Include="Resources\draw_vertex.png">
       <Filter>Resources\Files</Filter>
     </Image>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Translations\qrenderdoc_zh_CN.ts">
+      <Filter>Resources</Filter>
+    </None>
+    <None Include="Translations\qrenderdoc_zh_CN.qm">
+      <Filter>Resources</Filter>
+    </None>
+    <None Include="Translations\qt_zh_CN.qm">
+      <Filter>Resources</Filter>
+    </None>
+    <None Include="..\replaylab\renderdoc_mcp_bridge\**\*.py">
+      <Filter>ReplayLab\Python</Filter>
+    </None>
+    <None Include="..\replaylab\renderdoc_mcp_bridge\integration.json">
+      <Filter>ReplayLab\Python</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <Natvis Include="python36.natvis" />

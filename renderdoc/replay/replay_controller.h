@@ -144,6 +144,17 @@ public:
   void FileChanged();
 
   void SetFrameEvent(uint32_t eventId, bool force);
+  rdcstr SetEventShaderOverride(uint32_t eventId, ShaderStage stage, ResourceId expectedOriginal,
+                                ResourceId replacement);
+  void ClearEventShaderOverride(uint32_t eventId, ShaderStage stage);
+  void ClearEventShaderOverrides();
+  rdcstr SetEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                 ResourceId expectedShader, ResourceId expectedBuffer,
+                                 uint64_t expectedByteOffset, uint64_t expectedByteSize,
+                                 bytebuf data, uint32_t registerSpace = 0);
+  void ClearEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                 uint32_t registerSpace = 0);
+  void ClearEventCBufferOverrides();
   void SetSelectedEventID(uint32_t selectedEventId)
   {
     m_PrevSelectedEventID = m_SelectedEventID;
@@ -183,6 +194,8 @@ public:
                                                 ShaderStage type);
   void ReplaceResource(ResourceId from, ResourceId to);
   void RemoveReplacement(ResourceId id);
+  rdcstr ReplaceTargetShaderChecked(ResourceId from, ResourceId to);
+  rdcstr RemoveTargetShaderReplacementChecked(ResourceId id);
   void FreeTargetResource(ResourceId id);
   void ClearReplayCache();
   void ReloadShaderDebugInformation();
@@ -281,6 +294,7 @@ private:
   ResultDetails m_FatalErrorResult = {ResultCode::Succeeded};
 
   uint32_t m_EventID;
+  rdcstr m_LastEventOverrideError;
   uint32_t m_SelectedEventID = 0;
   uint32_t m_PrevSelectedEventID = 0;
 

@@ -608,6 +608,9 @@
     <ClCompile Include="Code\MiniQtHelper.cpp" />
     <ClCompile Include="Code\Resources.cpp" />
     <ClCompile Include="Code\RGPInterop.cpp" />
+    <ClCompile Include="Code\ReplayLab\ReplayLabIntegration.cpp" />
+    <ClCompile Include="Code\CodeEditorService.cpp" />
+    <ClCompile Include="Code\TranslationManager.cpp" />
     <ClCompile Include="Code\ScintillaSyntax.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_RDStyle.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_RDTweakedNativeStyle.cpp" />
@@ -795,6 +798,11 @@
     <ClCompile Include="Windows\ShaderMessageViewer.cpp" />
     <ClCompile Include="Windows\PythonShell.cpp" />
     <ClCompile Include="Windows\ApiMonitorWindow.cpp" />
+    <ClCompile Include="Windows\AI\AIAssistant.cpp" />
+    <ClCompile Include="Windows\AI\AIConversationListView.cpp" />
+    <ClCompile Include="Windows\AI\AIConversationStore.cpp" />
+    <ClCompile Include="Windows\AI\AIConversationView.cpp" />
+    <ClCompile Include="Windows\AI\AIPendingChatView.cpp" />
     <ClCompile Include="Windows\PixelHistoryView.cpp" />
     <ClCompile Include="Windows\PerformanceCounterViewer.cpp" />
     <ClCompile Include="Windows\StatisticsViewer.cpp" />
@@ -998,6 +1006,11 @@
     <ClInclude Include="$(IntDir)generated\ui_ShaderMessageViewer.h" />
     <ClInclude Include="$(IntDir)generated\ui_PythonShell.h" />
     <ClInclude Include="$(IntDir)generated\ui_ApiMonitorWindow.h" />
+    <ClInclude Include="Windows\AI\AIAssistant.h" />
+    <ClInclude Include="Windows\AI\AIConversationListView.h" />
+    <ClInclude Include="Windows\AI\AIConversationStore.h" />
+    <ClInclude Include="Windows\AI\AIConversationView.h" />
+    <ClInclude Include="Windows\AI\AIPendingChatView.h" />
     <ClInclude Include="$(IntDir)generated\ui_PixelHistoryView.h" />
     <ClInclude Include="$(IntDir)generated\ui_PerformanceCounterViewer.h" />
     <ClInclude Include="$(IntDir)generated\ui_StatisticsViewer.h" />
@@ -1040,6 +1053,9 @@
       <Outputs>$(IntDir)generated\moc_%(Filename).cpp</Outputs>
     </CustomBuild>
     <ClInclude Include="Code\ReplayManager.h" />
+    <ClInclude Include="Code\ReplayLab\ReplayLabIntegration.h" />
+    <ClInclude Include="Code\CodeEditorService.h" />
+    <ClInclude Include="Code\TranslationManager.h" />
     <ClInclude Include="Code\ScintillaSyntax.h" />
     <CustomBuild Include="Widgets\BufferFormatSpecifier.h">
       <AdditionalInputs>%(Fullpath);$(QtBinDir)\moc.exe;%(AdditionalInputs)</AdditionalInputs>
@@ -1782,8 +1798,14 @@
     <None Include="Code\pyrenderdoc\pyconversion.h" />
     <None Include="Code\pyrenderdoc\pyconversion.i" />
     <None Include="Code\pyrenderdoc\cosmetics.i" />
+    <None Include="Translations\qrenderdoc_zh_CN.ts" />
+    <None Include="Translations\qrenderdoc_zh_CN.qm" />
+    <None Include="Translations\qt_zh_CN.qm" />
+    <None Include="..\replaylab\renderdoc_mcp_bridge\**\*.py"
+          Exclude="..\replaylab\renderdoc_mcp_bridge\**\__pycache__\**" />
+    <None Include="..\replaylab\renderdoc_mcp_bridge\integration.json" />
     <CustomBuild Include="Resources\resources.qrc">
-      <AdditionalInputs>Resources\resources.qrc;$(QtBinDir)\rcc.exe;%(AdditionalInputs)</AdditionalInputs>
+      <AdditionalInputs>Resources\resources.qrc;Translations\qrenderdoc_zh_CN.qm;Translations\qt_zh_CN.qm;$(QtBinDir)\rcc.exe;%(AdditionalInputs)</AdditionalInputs>
       <Command>"$(QtBinDir)\rcc.exe" -name resources Resources\resources.qrc -o "$(IntDir)generated\qrc_resources.cpp"</Command>
       <Message>RCC resources.qrc</Message>
       <Outputs>$(IntDir)generated\qrc_resources.cpp</Outputs>
@@ -2165,6 +2187,29 @@
     <Natvis Include="python36.natvis" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="DeployReplayLabIntegration" AfterTargets="Build">
+    <PropertyGroup>
+      <ReplayLabIntegrationSourceDir>$(SolutionDir)replaylab\renderdoc_mcp_bridge</ReplayLabIntegrationSourceDir>
+      <ReplayLabIntegrationOutputDir>$(OutDir)integrations\replaylab\python\renderdoc_mcp_bridge\</ReplayLabIntegrationOutputDir>
+    </PropertyGroup>
+    <ItemGroup>
+      <ReplayLabIntegrationSource Include="$(ReplayLabIntegrationSourceDir)\**\*.py;$(ReplayLabIntegrationSourceDir)\integration.json"
+                                  Exclude="$(ReplayLabIntegrationSourceDir)\**\__pycache__\**;$(ReplayLabIntegrationSourceDir)\extension.json" />
+    </ItemGroup>
+    <Error Condition="!Exists('$(ReplayLabIntegrationSourceDir)\integration.json')"
+           Text="ReplayLab integration metadata is missing: $(ReplayLabIntegrationSourceDir)\integration.json" />
+    <RemoveDir Directories="$(ReplayLabIntegrationOutputDir);$(OutDir)extensions\replaylab_bridge" />
+    <MakeDir Directories="@(ReplayLabIntegrationSource->'$(ReplayLabIntegrationOutputDir)%(RecursiveDir)')" />
+    <Copy SourceFiles="@(ReplayLabIntegrationSource)"
+          DestinationFiles="@(ReplayLabIntegrationSource->'$(ReplayLabIntegrationOutputDir)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+  <!-- Explicit release/developer deployment target. It is deliberately not attached to Build:
+       active sidecars keep their executables locked, and a normal C++ rebuild must not replace a
+       process serving an analysis session. Invoke /t:DeployReplayLabRuntime after packaging. -->
+  <Target Name="DeployReplayLabRuntime" DependsOnTargets="Build">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)replaylab\packaging\Deploy-ReplayLabRuntime.ps1&quot; -ApplicationDirectory &quot;$(OutDir).&quot;" />
+  </Target>
   <ImportGroup Label="ExtensionTargets" />
   <ItemGroup>
     <ProjectTools Include="python_sheet" />

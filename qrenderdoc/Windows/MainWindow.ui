@@ -154,6 +154,7 @@
     <addaction name="menu_Load_Layout"/>
     <addaction name="separator"/>
     <addaction name="action_Launch_Application_Window"/>
+    <addaction name="action_AI_Assistant"/>
     <addaction name="action_Python_Shell"/>
     <addaction name="action_API_Monitor"/>
     <addaction name="action_Event_Browser"/>
@@ -253,6 +254,14 @@
   <action name="action_Python_Shell">
    <property name="text">
     <string>P&amp;ython Shell</string>
+   </property>
+  </action>
+  <action name="action_AI_Assistant">
+   <property name="text">
+    <string>RenderDoc &amp;AI</string>
+   </property>
+   <property name="shortcut">
+    <string>Ctrl+Shift+A</string>
    </property>
   </action>
   <action name="action_API_Monitor">

@@ -181,7 +181,7 @@ public:
 
   // RAII helper to acquire/release GIL. Must be held while calling ANY Python C API.
   // Only used by DrainEvents (Tick thread) and OnCreateResource (device thread).
-  // D3D12 command list hooks use PushEvent() instead — no GIL needed.
+  // D3D12 command list hooks use PushEvent() instead - no GIL needed.
   struct ScopedGIL
   {
     ScopedGIL(ApiMonitor &mon) : m_Mon(mon)

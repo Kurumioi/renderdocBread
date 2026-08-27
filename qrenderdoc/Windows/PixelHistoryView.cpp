@@ -41,6 +41,8 @@ Q_DECLARE_METATYPE(EventTag);
 
 class PixelHistoryItemModel : public QAbstractItemModel
 {
+  Q_DECLARE_TR_FUNCTIONS(PixelHistoryItemModel)
+
 public:
   PixelHistoryItemModel(ICaptureContext &ctx, ResourceId tex, const TextureDisplay &display,
                         const QPalette &palette, QObject *parent)

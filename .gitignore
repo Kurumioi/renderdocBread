@@ -8,6 +8,12 @@ Development64/
 Release32/
 Release64/
 build/
+
+# Local build/dependency inspection outputs. Keep these root-anchored so similarly named source
+# directories elsewhere in the tree remain visible to Git.
+/x64/
+/qrenderdoc_3rdparty.download.zip
+/qrenderdoc_3rdparty_inspect_*/
 build-*/
 /compile_commands.json
 .cache/

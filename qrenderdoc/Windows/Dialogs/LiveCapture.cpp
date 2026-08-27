@@ -185,15 +185,16 @@ LiveCapture::LiveCapture(ICaptureContext &ctx, const QString &hostname, const QS
   {
     m_ButtonColorTimer = new QTimer(this);
     connect(m_ButtonColorTimer, &QTimer::timeout, this, [this]() {
-      // 每次改变色相（H），保持饱和度和亮度不变
-      this->m_ButtonColorHue = (this->m_ButtonColorHue + 1) % 360;    // 色相范围是 0 到 360
+      // Advance hue while keeping saturation and lightness unchanged.
+      this->m_ButtonColorHue = (this->m_ButtonColorHue + 1) % 360;    // hue range is 0..359
       QColor color;
-      color.setHsl(this->m_ButtonColorHue, 255, 128);    // 设置色相、饱和度和亮度
+      color.setHsl(this->m_ButtonColorHue, 255, 128);
 
       QColor inverseColor;
-      inverseColor.setHsl((this->m_ButtonColorHue + 180) % 360, 255, 128);    // 对比色色相 + 180
+      inverseColor.setHsl((this->m_ButtonColorHue + 180) % 360, 255, 128);
+      // i18n-ignore: Qt stylesheet program data; it contains no user-visible text.
       this->ui->triggerImmediateCapture->setStyleSheet(
-          QString(tr(R"(QPushButton {
+          lit(R"(QPushButton {
                             background: %1;
                             color: %2;
                             font-size: 18px;
@@ -210,11 +211,11 @@ LiveCapture::LiveCapture(ICaptureContext &ctx, const QString &hostname, const QS
                         }
 
                         QPushButton:pressed {
-                            background: #FF8C00; /* 按下时背景变为橙红色 */
-                            border: 2px solid #FF4500; /* 按下时边框变为更深的橙红色 */
+                            background: #FF8C00; /* orange-red while pressed */
+                            border: 2px solid #FF4500; /* darker pressed border */
                         }
 
-        )"))
+        )")
           .arg(color.name())
           .arg(inverseColor.name()));
     });
@@ -835,13 +836,17 @@ bool LiveCapture::checkAllowClose(int totalUnsavedCaptures, bool &noToAll)
     if(suppressRemoteWarning == false && !m_Connected.available() && !cap->local &&
        m_Ctx.Replay().CurrentRemote().Hostname() != rdcstr(m_Hostname))
     {
+      const QString unavailableAction =
+          res == QMessageBox::Yes
+              ? tr("Without an active replay context the capture cannot be saved.\n\n")
+              : tr("Without an active replay context the capture cannot be deleted.\n\n");
+
       QMessageBox::StandardButton res2 = RDDialog::question(
           this, tr("No active replay context"),
           tr("This capture is on remote host %1 and there is no active replay context on that "
              "host.\n")
                   .arg(m_HostFriendlyname) +
-              tr("Without an active replay context the capture cannot be %1.\n\n")
-                  .arg(tr(res == QMessageBox::Yes ? "saved" : "deleted")) +
+              unavailableAction +
               tr("Would you like to continue and discard this capture and any others, to be left "
                  "in the temporary folder on the remote machine?"),
           RDDialog::YesNoCancel);

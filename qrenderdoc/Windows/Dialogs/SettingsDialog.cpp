@@ -31,9 +31,11 @@
 #include <QToolButton>
 #include "Code/Interface/QRDInterface.h"
 #include "Code/QRDUtils.h"
+#include "Code/TranslationManager.h"
 #include "Styles/StyleData.h"
 #include "Widgets/OrderedListEditor.h"
 #include "Widgets/ReplayOptionsSelector.h"
+#include "Windows/AI/AIAssistant.h"
 #include "CaptureDialog.h"
 #include "ConfigEditor.h"
 #include "ui_SettingsDialog.h"
@@ -44,6 +46,18 @@ SettingsDialog::SettingsDialog(ICaptureContext &ctx, QWidget *parent)
   ui->setupUi(this);
 
   m_Init = true;
+
+  // Store stable, untranslated values in itemData. Display strings can evolve independently and
+  // translated labels never leak into the persisted configuration.
+  ui->UILanguage->addItem(tr("Simplified Chinese"),
+                          TranslationManager::SimplifiedChineseSetting());
+  ui->UILanguage->addItem(tr("English"), TranslationManager::EnglishSetting());
+  ui->UILanguage->addItem(tr("Follow system language"), TranslationManager::SystemSetting());
+
+  const QString configuredLanguage =
+      TranslationManager::NormalizeSetting(m_Ctx.Config().UILanguage);
+  const int languageIndex = ui->UILanguage->findData(configuredLanguage);
+  ui->UILanguage->setCurrentIndex(languageIndex >= 0 ? languageIndex : 0);
 
   m_ReplayOptions = new ReplayOptionsSelector(m_Ctx, false, this);
 
@@ -138,6 +152,19 @@ SettingsDialog::SettingsDialog(ICaptureContext &ctx, QWidget *parent)
 
   ui->tabWidget->tabBar()->setVisible(false);
 
+  // AI connections belong in qrenderdoc's standard Settings surface. CreateBuiltinWindow keeps a
+  // newly-created assistant hidden (CaptureContext::setupDockWindow(..., true)); it does not open
+  // or switch tool windows. The assistant owns session-only credentials and provider lifecycle,
+  // while this dialog owns only the page widget's lifetime.
+  QWidget *assistantWidget = m_Ctx.CreateBuiltinWindow(lit("aiAssistant"));
+  if(assistantWidget)
+  {
+    AIAssistant *assistant = static_cast<AIAssistant *>(assistantWidget);
+    QWidget *aiPage = assistant->CreateSettingsPage(ui->tabWidget);
+    aiPage->setObjectName(lit("AIConnections"));
+    ui->tabWidget->addTab(aiPage, tr("AI"));
+  }
+
   for(int i = 0; i < ui->tabWidget->count(); i++)
     ui->pages->addItem(ui->tabWidget->tabText(i));
 
@@ -186,6 +213,7 @@ SettingsDialog::SettingsDialog(ICaptureContext &ctx, QWidget *parent)
 
   ui->deleteShaderTool->setEnabled(false);
   ui->editShaderTool->setEnabled(false);
+  ui->ShaderEditor_LanguageServer->setText(m_Ctx.Config().ShaderEditor_LanguageServer);
 
   ui->ExternalTool_RadeonGPUProfiler->setText(m_Ctx.Config().ExternalTool_RadeonGPUProfiler);
 
@@ -372,6 +400,26 @@ void SettingsDialog::focusItem(QString item)
   }
 
   qCritical() << "Couldn't find" << item << "to focus on settings dialog";
+}
+
+void SettingsDialog::focusPage(QString page)
+{
+  for(int i = 0; i < ui->tabWidget->count(); i++)
+  {
+    QWidget *widget = ui->tabWidget->widget(i);
+    if(widget->objectName().compare(page, Qt::CaseInsensitive) == 0 ||
+       ui->tabWidget->tabText(i).compare(page, Qt::CaseInsensitive) == 0)
+    {
+      ui->tabWidget->setCurrentIndex(i);
+      ui->pages->setCurrentRow(i);
+      if(page.compare(lit("AI"), Qt::CaseInsensitive) == 0 ||
+         page.compare(lit("AIConnections"), Qt::CaseInsensitive) == 0)
+        resize(qMax(width(), 880), qMax(height(), 620));
+      return;
+    }
+  }
+
+  qCritical() << "Couldn't find settings page" << page;
 }
 
 void SettingsDialog::on_pages_itemSelectionChanged()
@@ -868,6 +916,13 @@ void SettingsDialog::on_ShaderViewer_FriendlyNaming_toggled(bool checked)
   RENDERDOC_SetConfigSetting("DXBC.Disassembly.FriendlyNaming")->data.basic.b = checked;
 
   RENDERDOC_SaveConfigSettings();
+}
+
+void SettingsDialog::on_ShaderEditor_LanguageServer_editingFinished()
+{
+  m_Ctx.Config().ShaderEditor_LanguageServer =
+      ui->ShaderEditor_LanguageServer->text().trimmed();
+  m_Ctx.Config().Save();
 }
 
 void SettingsDialog::addProcessor(const ShaderProcessingTool &tool)
@@ -1411,5 +1466,18 @@ void SettingsDialog::on_UIStyle_currentIndexChanged(int index)
     m_Ctx.Config().SetStyle();
   }
 
+  m_Ctx.Config().Save();
+}
+
+void SettingsDialog::on_UILanguage_currentIndexChanged(int index)
+{
+  if(m_Init || index < 0)
+    return;
+
+  const QString language = ui->UILanguage->itemData(index).toString();
+  if(language.isEmpty() || language == m_Ctx.Config().UILanguage)
+    return;
+
+  m_Ctx.Config().UILanguage = language;
   m_Ctx.Config().Save();
 }

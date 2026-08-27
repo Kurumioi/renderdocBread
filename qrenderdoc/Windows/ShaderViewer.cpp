@@ -24,6 +24,7 @@
 
 #include "ShaderViewer.h"
 #include <QComboBox>
+#include <QFile>
 #include <QFontDatabase>
 #include <QHBoxLayout>
 #include <QKeyEvent>
@@ -35,7 +36,9 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QShortcut>
+#include <QTimer>
 #include <QToolTip>
+#include "Code/CodeEditorService.h"
 #include "Code/Resources.h"
 #include "Code/ScintillaSyntax.h"
 #include "Widgets/Extended/RDLabel.h"
@@ -226,6 +229,73 @@ ShaderViewer::ShaderViewer(ICaptureContext &ctx, QWidget *parent)
 {
   ui->setupUi(this);
 
+  m_CodeEditorService = new CodeEditorService(this);
+  if(!m_Ctx.Config().ShaderEditor_LanguageServer.isEmpty())
+    m_CodeEditorService->setLanguageServerCommand(m_Ctx.Config().ShaderEditor_LanguageServer);
+  m_CodeEditorService->setStatusHandler([this](const QString &message) {
+    if(!message.isEmpty())
+      QToolTip::showText(QCursor::pos(), message, this);
+  });
+  m_CodeEditorService->setDefinitionHandler(
+      [this](const CodeEditorService::Location &location) {
+        ScintillaEdit *editor = location.editor;
+
+        // Definitions in an include which is not part of the capture are opened as a read-only
+        // source tab. This keeps navigation complete without accidentally adding the file to the
+        // shader replacement payload.
+        if(!editor && !location.fileName.isEmpty())
+        {
+          QFile sourceFile(location.fileName);
+          if(sourceFile.exists() && sourceFile.size() <= 8 * 1024 * 1024 &&
+             sourceFile.open(QIODevice::ReadOnly))
+          {
+            const QByteArray source = sourceFile.readAll();
+            const QString suffix = QFileInfo(location.fileName).suffix().toLower();
+            ShaderEncoding encoding = ShaderEncoding::GLSL;
+            if(suffix == lit("hlsl") || suffix == lit("hlsli") || suffix == lit("fx") ||
+               suffix == lit("fxh"))
+              encoding = ShaderEncoding::HLSL;
+            else if(suffix == lit("slang"))
+              encoding = ShaderEncoding::Slang;
+
+            editor = AddFileScintilla(QFileInfo(location.fileName).fileName(),
+                                      QString::fromUtf8(source), encoding);
+            ((QWidget *)editor)->setProperty("filename", location.fileName);
+            m_CodeEditorService->registerEditor(
+                editor, location.fileName,
+                encoding == ShaderEncoding::GLSL
+                    ? lit("glsl")
+                    : (encoding == ShaderEncoding::Slang ? lit("slang") : lit("hlsl")));
+          }
+        }
+
+        if(!editor)
+        {
+          QToolTip::showText(QCursor::pos(),
+                             tr("Definition: %1:%2")
+                                 .arg(location.fileName)
+                                 .arg(qMax(0, location.line) + 1),
+                             this);
+          return;
+        }
+
+        int position = location.position;
+        if(position < 0 && location.line >= 0)
+        {
+          const sptr_t start = editor->positionFromLine(location.line);
+          const sptr_t end = editor->lineEndPosition(location.line);
+          const QString lineText = QString::fromUtf8(editor->textRange(start, end));
+          position = int(start) + lineText.left(qMax(0, location.column)).toUtf8().size();
+        }
+        position = qBound(0, position, int(editor->length()));
+
+        m_FindEditor = editor;
+        ToolWindowManager::raiseToolWindow(editor);
+        editor->setSelection(position, position);
+        ensureLineScrolled(editor, editor->lineFromPosition(position));
+        editor->QWidget::setFocus(Qt::ShortcutFocusReason);
+      });
+
   ui->constants->setFont(Formatter::PreferredFont());
   ui->accessedResources->setFont(Formatter::PreferredFont());
   ui->debugVars->setFont(Formatter::PreferredFont());
@@ -237,10 +307,14 @@ ShaderViewer::ShaderViewer(ICaptureContext &ctx, QWidget *parent)
 
   // we create this up front so its state stays persistent as much as possible.
   m_FindReplace = new FindReplace(this);
+  m_FindReplace->hide();
+  m_FindTimer = new QTimer(this);
+  m_FindTimer->setSingleShot(true);
+  m_FindTimer->setInterval(75);
 
   m_FindResults = MakeEditor(lit("findresults"), QString(), SCLEX_NULL);
   m_FindResults->setReadOnly(true);
-  m_FindResults->setWindowTitle(lit("Find Results"));
+  m_FindResults->setWindowTitle(tr("Find Results"));
 
   // remove margins
   m_FindResults->setMarginWidthN(0, 0);
@@ -252,22 +326,19 @@ ShaderViewer::ShaderViewer(ICaptureContext &ctx, QWidget *parent)
   QObject::connect(m_FindReplace, &FindReplace::performReplace, this, &ShaderViewer::performReplace);
   QObject::connect(m_FindReplace, &FindReplace::performReplaceAll, this,
                    &ShaderViewer::performReplaceAll);
+  QObject::connect(m_FindReplace, &FindReplace::searchChanged, [this]() {
+    if(m_FindReplace->isVisible())
+      m_FindTimer->start();
+  });
+  QObject::connect(m_FindReplace, &FindReplace::closeRequested, this,
+                   &ShaderViewer::closeFindOverlay);
+  QObject::connect(m_FindReplace, &FindReplace::layoutChanged, this,
+                   &ShaderViewer::updateFindOverlayGeometry);
+  QObject::connect(m_FindTimer, &QTimer::timeout, this, &ShaderViewer::performIncrementalFind);
   QObject::connect(m_FindReplace, &FindReplace::keyPress, [this](QKeyEvent *e) {
     if(e->key() == Qt::Key_Escape)
-    {
-      // the find replace dialog is the only thing allowed to float. If it's in a floating area,
-      // hide it on escape
-      ToolWindowManagerArea *area = ui->docking->areaOf(m_FindReplace);
-
-      if(area && ui->docking->isFloating(m_FindReplace))
-      {
-        ui->docking->hideToolWindow(m_FindReplace);
-      }
-    }
+      closeFindOverlay();
   });
-
-  ui->docking->addToolWindow(m_FindReplace, ToolWindowManager::NoArea);
-  ui->docking->setToolWindowProperties(m_FindReplace, ToolWindowManager::HideOnClose);
 
   ui->docking->addToolWindow(m_FindResults, ToolWindowManager::NoArea);
   ui->docking->setToolWindowProperties(
@@ -482,6 +553,11 @@ void ShaderViewer::editShader(ResourceId id, ShaderStage stage, const QString &e
     QWidget *w = (QWidget *)scintilla;
     w->setProperty("filename", kv.first);
     w->setProperty("origText", kv.second);
+    m_CodeEditorService->registerEditor(
+        scintilla, kv.first,
+        shaderEncoding == ShaderEncoding::GLSL
+            ? lit("glsl")
+            : (shaderEncoding == ShaderEncoding::Slang ? lit("slang") : lit("hlsl")));
 
     if(sel == NULL)
     {
@@ -500,7 +576,8 @@ void ShaderViewer::editShader(ResourceId id, ShaderStage stage, const QString &e
     ToolWindowManager::raiseToolWindow(sel);
 
   if(m_CustomShader)
-    title.prepend(tr("Editing %1 Shader").arg(ToQStr(stage, m_Ctx.APIProps().pipelineType)));
+    title.prepend(
+        tr("Editing %1 Shader").arg(ToQDisplayStr(stage, m_Ctx.APIProps().pipelineType)));
   else
     title.prepend(tr("Editing %1").arg(m_Ctx.GetResourceNameUnsuffixed(id)));
 
@@ -513,7 +590,7 @@ void ShaderViewer::editShader(ResourceId id, ShaderStage stage, const QString &e
 
   m_Errors = MakeEditor(lit("errors"), QString(), SCLEX_NULL);
   m_Errors->setReadOnly(true);
-  m_Errors->setWindowTitle(lit("Errors"));
+  m_Errors->setWindowTitle(tr("Errors"));
 
   // remove margins
   m_Errors->setMarginWidthN(0, 0);
@@ -676,6 +753,13 @@ void ShaderViewer::debugShader(const ShaderReflection *shader, ResourceId pipeli
       QString text = f.contents;
 
       ScintillaEdit *scintilla = AddFileScintilla(name, text, m_ShaderDetails->debugInfo.encoding);
+      ((QWidget *)scintilla)->setProperty("filename", f.filename);
+      m_CodeEditorService->registerEditor(
+          scintilla, f.filename,
+          m_ShaderDetails->debugInfo.encoding == ShaderEncoding::GLSL
+              ? lit("glsl")
+              : (m_ShaderDetails->debugInfo.encoding == ShaderEncoding::Slang ? lit("slang")
+                                                                               : lit("hlsl")));
 
       if(sel == NULL)
         sel = scintilla;
@@ -1280,7 +1364,7 @@ void ShaderViewer::debugShader(const ShaderReflection *shader, ResourceId pipeli
           name = s.varName;
 
         if(multipleStreams)
-          name = QFormatStr("Stream %1 : %2").arg(s.stream).arg(name);
+          name = tr("Stream %1 : %2").arg(s.stream).arg(name);
         if(s.perPrimitiveRate)
           name += tr(" (Per-Prim)");
 
@@ -1435,7 +1519,7 @@ void ShaderViewer::UpdateBookmarkMenu(QMenu *menu, QAction *nextAction, QAction 
     }
     else if(textLine.isEmpty())
     {
-      textLine = lit("(empty)");
+      textLine = tr("(empty)");
     }
 
     QString name = QFormatStr("%1:%2 - %3").arg(filename).arg(lineNumber + 1).arg(textLine);
@@ -1480,7 +1564,7 @@ void ShaderViewer::updateWindowTitle()
                        .arg(m_Ctx.CurPipelineState().Abbrev(m_ShaderDetails->stage));
 
     if(m_Trace)
-      setWindowTitle(QFormatStr("Debugging %1 - %2").arg(shaderName).arg(m_DebugContext));
+      setWindowTitle(tr("Debugging %1 - %2").arg(shaderName).arg(m_DebugContext));
     else
       setWindowTitle(shaderName);
   }
@@ -1697,6 +1781,7 @@ ScintillaEdit *ShaderViewer::AddFileScintilla(const QString &name, const QString
 ScintillaEdit *ShaderViewer::MakeEditor(const QString &name, const QString &text, int lang)
 {
   ScintillaEdit *ret = new ScintillaEdit(this);
+  ret->installEventFilter(this);
 
   ret->setMarginLeft(4.0);
   ret->setMarginWidthN(1, 20.0);
@@ -1767,13 +1852,17 @@ void ShaderViewer::readonly_keyPressed(QKeyEvent *event)
     m_FindReplace->setReplaceMode(false);
     SetFindTextFromCurrentWord();
     on_findReplace_clicked();
+    event->accept();
   }
 
   if(event->key() == Qt::Key_F3)
   {
     if(event->modifiers() & Qt::ControlModifier)
       SetFindTextFromCurrentWord();
-    find((event->modifiers() & Qt::ShiftModifier) == 0);
+    const bool down = (event->modifiers() & Qt::ShiftModifier) == 0;
+    m_FindReplace->setDirection(down ? FindReplace::Down : FindReplace::Up);
+    find(down);
+    event->accept();
   }
 }
 
@@ -1782,7 +1871,9 @@ void ShaderViewer::editable_keyPressed(QKeyEvent *event)
   if(event->key() == Qt::Key_H && (event->modifiers() & Qt::ControlModifier))
   {
     m_FindReplace->setReplaceMode(true);
+    SetFindTextFromCurrentWord();
     on_findReplace_clicked();
+    event->accept();
   }
 }
 
@@ -3934,7 +4025,7 @@ void ShaderViewer::updateAccessedResources()
             if(accessed)
             {
               RDTreeWidgetItem *stepNode = new RDTreeWidgetItem(
-                  {tr("Step %1").arg(m_AccessedResources[i].steps[j]), lit("Access"), lit("")});
+                  {tr("Step %1").arg(m_AccessedResources[i].steps[j]), tr("Access"), QString()});
               stepNode->setTag(QVariant::fromValue(
                   AccessedResourceTag((uint32_t)m_AccessedResources[i].steps[j])));
               if(m_CurrentStateIdx == m_AccessedResources[i].steps[j])
@@ -3976,7 +4067,7 @@ void ShaderViewer::updateAccessedResources()
             if(nodeIdx == -1)
             {
               RDTreeWidgetItem *stepNode = new RDTreeWidgetItem(
-                  {tr("Step %1").arg(m_AccessedResources[i].steps[j]), lit("Access"), lit("")});
+                  {tr("Step %1").arg(m_AccessedResources[i].steps[j]), tr("Access"), QString()});
               stepNode->setTag(QVariant::fromValue(
                   AccessedResourceTag((uint32_t)m_AccessedResources[i].steps[j])));
               if(m_CurrentStateIdx == m_AccessedResources[i].steps[j])
@@ -4170,7 +4261,7 @@ void ShaderViewer::updateDebugState()
       if(varsMapped.contains(name))
         continue;
 
-      RDTreeWidgetItem *node = new RDTreeWidgetItem({name, name, lit("Constant"), QString()});
+      RDTreeWidgetItem *node = new RDTreeWidgetItem({name, name, tr("Constant"), QString()});
       node->setTag(QVariant::fromValue(VariableTag(DebugVariableType::Constant, name)));
 
       for(int j = 0; j < m_Trace->constantBlocks[i].members.count(); j++)
@@ -4182,7 +4273,7 @@ void ShaderViewer::updateDebugState()
           if(!varsMapped.contains(name))
           {
             RDTreeWidgetItem *child = new RDTreeWidgetItem(
-                {name, name, lit("Constant"), stringRep(m_Trace->constantBlocks[i].members[j])});
+                {name, name, tr("Constant"), stringRep(m_Trace->constantBlocks[i].members[j])});
             child->setTag(QVariant::fromValue(VariableTag(DebugVariableType::Constant, childname)));
             node->addChild(child);
           }
@@ -4198,7 +4289,7 @@ void ShaderViewer::updateDebugState()
             {
               rdcstr childname = name + "." + m_Trace->constantBlocks[i].members[j].members[k].name;
               RDTreeWidgetItem *child =
-                  new RDTreeWidgetItem({name, name, lit("Constant"),
+                  new RDTreeWidgetItem({name, name, tr("Constant"),
                                         stringRep(m_Trace->constantBlocks[i].members[j].members[k])});
               node->setTag(QVariant::fromValue(VariableTag(DebugVariableType::Constant, childname)));
 
@@ -4227,7 +4318,7 @@ void ShaderViewer::updateDebugState()
       if(input.rows > 0 || input.columns > 0)
       {
         RDTreeWidgetItem *node =
-            new RDTreeWidgetItem({input.name, input.name, lit("Input"), stringRep(input)});
+            new RDTreeWidgetItem({input.name, input.name, tr("Input"), stringRep(input)});
         node->setTag(QVariant::fromValue(VariableTag(DebugVariableType::Input, input.name)));
 
         ui->constants->addTopLevelItem(node);
@@ -4265,14 +4356,14 @@ void ShaderViewer::updateDebugState()
       if(res.bindArraySize == 1)
       {
         RDTreeWidgetItem *node = new RDTreeWidgetItem(
-            {res.name, ro.name, lit("Resource"), ToQStr(descriptors[0].descriptor.resource)});
+            {res.name, ro.name, tr("Resource"), ToQStr(descriptors[0].descriptor.resource)});
         node->setTag(QVariant::fromValue(VariableTag(DebugVariableType::ReadOnlyResource, ro.name)));
         ui->constants->addTopLevelItem(node);
       }
       else if(res.bindArraySize == ~0U)
       {
         RDTreeWidgetItem *node =
-            new RDTreeWidgetItem({res.name, ro.name, lit("[unbounded]"), QString()});
+            new RDTreeWidgetItem({res.name, ro.name, tr("[unbounded]"), QString()});
         node->setTag(QVariant::fromValue(VariableTag(DebugVariableType::ReadOnlyResource, ro.name)));
         ui->constants->addTopLevelItem(node);
       }
@@ -4289,7 +4380,7 @@ void ShaderViewer::updateDebugState()
           RDTreeWidgetItem *child = new RDTreeWidgetItem({
               QFormatStr("%1[%2]").arg(res.name).arg(a),
               childName,
-              lit("Resource"),
+              tr("Resource"),
               ToQStr(descriptors[a].descriptor.resource),
           });
           child->setTag(
@@ -4332,14 +4423,14 @@ void ShaderViewer::updateDebugState()
       if(res.bindArraySize == 1)
       {
         RDTreeWidgetItem *node = new RDTreeWidgetItem(
-            {res.name, rw.name, lit("Resource"), ToQStr(descriptors[0].descriptor.resource)});
+            {res.name, rw.name, tr("Resource"), ToQStr(descriptors[0].descriptor.resource)});
         node->setTag(QVariant::fromValue(VariableTag(DebugVariableType::ReadWriteResource, rw.name)));
         ui->constants->addTopLevelItem(node);
       }
       else if(res.bindArraySize == ~0U)
       {
         RDTreeWidgetItem *node =
-            new RDTreeWidgetItem({res.name, rw.name, lit("[unbounded]"), QString()});
+            new RDTreeWidgetItem({res.name, rw.name, tr("[unbounded]"), QString()});
         node->setTag(QVariant::fromValue(VariableTag(DebugVariableType::ReadWriteResource, rw.name)));
         ui->constants->addTopLevelItem(node);
       }
@@ -4356,7 +4447,7 @@ void ShaderViewer::updateDebugState()
           RDTreeWidgetItem *child = new RDTreeWidgetItem({
               QFormatStr("%1[%2]").arg(res.name).arg(a),
               childName,
-              lit("RW Resource"),
+              tr("RW Resource"),
               ToQStr(descriptors[a].descriptor.resource),
           });
           child->setTag(
@@ -4397,7 +4488,7 @@ void ShaderViewer::updateDebugState()
       if(samp.bindArraySize == 1)
       {
         RDTreeWidgetItem *node =
-            new RDTreeWidgetItem({samp.name, s.name, lit("Sampler"),
+            new RDTreeWidgetItem({samp.name, s.name, tr("Sampler"),
                                   samplerRep(samp, ~0U, descriptors[0].descriptor.resource)});
         node->setTag(QVariant::fromValue(VariableTag(DebugVariableType::Sampler, s.name)));
         ui->constants->addTopLevelItem(node);
@@ -4405,7 +4496,7 @@ void ShaderViewer::updateDebugState()
       else if(samp.bindArraySize == ~0U)
       {
         RDTreeWidgetItem *node =
-            new RDTreeWidgetItem({samp.name, s.name, lit("[unbounded]"), QString()});
+            new RDTreeWidgetItem({samp.name, s.name, tr("[unbounded]"), QString()});
         node->setTag(QVariant::fromValue(VariableTag(DebugVariableType::Sampler, s.name)));
         ui->constants->addTopLevelItem(node);
       }
@@ -4422,7 +4513,7 @@ void ShaderViewer::updateDebugState()
           RDTreeWidgetItem *child = new RDTreeWidgetItem({
               QFormatStr("%1[%2]").arg(m_ShaderDetails->samplers[i].name).arg(a),
               childName,
-              lit("Sampler"),
+              tr("Sampler"),
               samplerRep(samp, a, descriptors[a].descriptor.resource),
           });
           child->setTag(QVariant::fromValue(VariableTag(DebugVariableType::Sampler, childName)));
@@ -5053,7 +5144,7 @@ RDTreeWidgetItem *ShaderViewer::makeSourceVariableNode(const SourceVariableMappi
         if(reg == NULL)
           continue;
 
-        typeName = lit("Sampler");
+        typeName = tr("Sampler");
 
         rdcarray<UsedDescriptor> samplers = m_Ctx.CurPipelineState().GetSamplers(m_Stage);
 
@@ -5078,7 +5169,7 @@ RDTreeWidgetItem *ShaderViewer::makeSourceVariableNode(const SourceVariableMappi
           }
           else if(samp.bindArraySize == ~0U)
           {
-            typeName = lit("[unbounded]");
+            typeName = tr("[unbounded]");
             value = QString();
           }
           else
@@ -5111,7 +5202,7 @@ RDTreeWidgetItem *ShaderViewer::makeSourceVariableNode(const SourceVariableMappi
         if(reg->IsDirectAccess())
           continue;
 
-        typeName = isReadOnlyResource ? lit("Resource") : lit("RW Resource");
+        typeName = isReadOnlyResource ? tr("Resource") : tr("RW Resource");
 
         const rdcarray<UsedDescriptor> &resList =
             isReadOnlyResource ? m_ReadOnlyResources : m_ReadWriteResources;
@@ -5141,7 +5232,7 @@ RDTreeWidgetItem *ShaderViewer::makeSourceVariableNode(const SourceVariableMappi
           }
           else if(res.bindArraySize == ~0U)
           {
-            typeName = lit("[unbounded]");
+            typeName = tr("[unbounded]");
             value = QString();
           }
           else
@@ -5313,7 +5404,7 @@ RDTreeWidgetItem *ShaderViewer::makeAccessedResourceNode(const ShaderVariable &v
   {
     DescriptorCategory category = DescriptorCategory::Unknown;
     int32_t bindIdx = -1;
-    typeName = lit("Resource");
+    typeName = tr("Resource");
     if(!v.IsDirectAccess())
     {
       category = bp.category;
@@ -5333,7 +5424,7 @@ RDTreeWidgetItem *ShaderViewer::makeAccessedResourceNode(const ShaderVariable &v
   {
     DescriptorCategory category = DescriptorCategory::Unknown;
     int32_t bindIdx = -1;
-    typeName = lit("RW Resource");
+    typeName = tr("RW Resource");
     if(!v.IsDirectAccess())
     {
       category = bp.category;
@@ -5709,6 +5800,46 @@ void ShaderViewer::ShowErrors(const rdcstr &errors)
   updateEditState();
 }
 
+void ShaderViewer::SetExplanatoryMode(const rdcstr &reason)
+{
+  m_ExplanatoryMode = true;
+  m_ExplanatoryReason = reason;
+
+  // Break every mutation callback as a second line of defence. The explanatory viewer is normally
+  // created with a null ResourceId already, but neither a future caller nor an F5 shortcut should
+  // be able to route this representation into BuildTargetShader/ReplaceResource.
+  m_SaveCallback = nullptr;
+  m_RevertCallback = nullptr;
+  m_ModifyCallback = nullptr;
+
+  for(ScintillaEdit *scintilla : m_Scintillas)
+    if(scintilla)
+      scintilla->setReadOnly(true);
+
+  ui->refresh->setText(tr("Explanatory only"));
+  ui->refresh->setToolTip(
+      tr("This representation is not executable shader source and cannot be applied."));
+  ui->refresh->setEnabled(false);
+  ui->refresh->hide();
+  ui->unrefresh->hide();
+  ui->resetEdits->hide();
+  ui->snippets->hide();
+
+  ui->entryFunc->setReadOnly(true);
+  ui->entryFunc->setEnabled(false);
+  ui->encoding->setEnabled(false);
+  ui->compileTool->setEnabled(false);
+  ui->toolCommandLine->setReadOnly(true);
+  ui->toolCommandLine->setEnabled(false);
+  ui->compilationGroup->hide();
+
+  ui->editStatusLabel->setText(tr("Status: Explanatory Representation (Apply Disabled)"));
+  ui->editStatusLabel->setToolTip(reason);
+  ui->editStatusLabel->show();
+
+  ShowErrors(reason);
+}
+
 void ShaderViewer::AddWatch(const rdcstr &variable)
 {
   if(variable.isEmpty())
@@ -6046,6 +6177,20 @@ layout (binding = RD_UINT_2DMS_BINDING) uniform usampler2DMS texUInt2DMS;
 
 bool ShaderViewer::eventFilter(QObject *watched, QEvent *event)
 {
+  if(event->type() == QEvent::FocusIn)
+  {
+    ScintillaEdit *focusedEditor = qobject_cast<ScintillaEdit *>(watched);
+    if(focusedEditor)
+      m_FindEditor = focusedEditor;
+  }
+
+  if((event->type() == QEvent::Resize || event->type() == QEvent::Move ||
+      event->type() == QEvent::Show) &&
+     qobject_cast<ScintillaEdit *>(watched))
+  {
+    updateFindOverlayGeometry();
+  }
+
   if(event->type() == QEvent::ToolTip)
   {
     QHelpEvent *he = (QHelpEvent *)event;
@@ -6071,6 +6216,9 @@ bool ShaderViewer::eventFilter(QObject *watched, QEvent *event)
 
 void ShaderViewer::MarkModification()
 {
+  if(m_ExplanatoryMode)
+    return;
+
   if(m_ModifyCallback)
     m_ModifyCallback(this, false);
 
@@ -6253,18 +6401,64 @@ ShaderEncoding ShaderViewer::currentEncoding()
 
 void ShaderViewer::on_findReplace_clicked()
 {
-  if(m_FindReplace->isVisible())
-  {
-    ToolWindowManager::raiseToolWindow(m_FindReplace);
-  }
-  else
-  {
-    ui->docking->moveToolWindow(
-        m_FindReplace, ToolWindowManager::AreaReference(ToolWindowManager::NewFloatingArea));
-    ui->docking->setToolWindowProperties(m_FindReplace, ToolWindowManager::HideOnClose);
-  }
-  ui->docking->areaOf(m_FindReplace)->parentWidget()->activateWindow();
+  ScintillaEdit *focusedEditor = qobject_cast<ScintillaEdit *>(QApplication::focusWidget());
+  if(focusedEditor)
+    m_FindEditor = focusedEditor;
+  else if(!m_FindEditor || !m_FindEditor->isVisible())
+    m_FindEditor = currentScintilla();
+
+  m_FindReplace->show();
+  updateFindOverlayGeometry();
+  m_FindReplace->raise();
   m_FindReplace->takeFocus();
+  performIncrementalFind();
+}
+
+void ShaderViewer::updateFindOverlayGeometry()
+{
+  if(!m_FindReplace || !m_FindReplace->isVisible())
+    return;
+
+  QWidget *target = currentScintilla();
+  if(!target)
+    target = ui->docking;
+
+  const int margin = 8;
+  const int availableWidth = qMax(320, target->width() - margin * 2);
+  m_FindReplace->setFixedWidth(qMin(720, availableWidth));
+  m_FindReplace->adjustSize();
+
+  QPoint topLeft = target->mapTo(this, QPoint(target->width() - m_FindReplace->width() - margin,
+                                               margin));
+  topLeft.setX(qMax(margin, qMin(topLeft.x(), width() - m_FindReplace->width() - margin)));
+  topLeft.setY(qMax(margin, qMin(topLeft.y(), height() - m_FindReplace->height() - margin)));
+  m_FindReplace->move(topLeft);
+  m_FindReplace->raise();
+}
+
+void ShaderViewer::closeFindOverlay()
+{
+  if(m_FindTimer)
+    m_FindTimer->stop();
+
+  QPointer<ScintillaEdit> editor = m_FindEditor;
+  m_FindReplace->hide();
+  m_FindState = FindState();
+
+  for(ScintillaEdit *scintilla : m_Scintillas)
+  {
+    scintilla->setIndicatorCurrent(INDICATOR_FINDRESULT);
+    scintilla->indicatorClearRange(0, scintilla->length());
+  }
+
+  if(editor && !m_Scintillas.contains(editor))
+  {
+    editor->setIndicatorCurrent(INDICATOR_FINDRESULT);
+    editor->indicatorClearRange(0, editor->length());
+  }
+
+  if(editor)
+    editor->QWidget::setFocus();
 }
 
 void ShaderViewer::PopulateCompileTools()
@@ -6496,6 +6690,12 @@ bool ShaderViewer::ProcessIncludeDirectives(QString &source, const rdcstrpairs &
 
 void ShaderViewer::on_resetEdits_clicked()
 {
+  if(m_ExplanatoryMode)
+  {
+    ShowErrors(m_ExplanatoryReason);
+    return;
+  }
+
   QMessageBox::StandardButton res =
       RDDialog::question(this, tr("Are you sure?"),
                          tr("Are you sure you want to reset all edits and restore the "
@@ -6522,6 +6722,12 @@ void ShaderViewer::on_resetEdits_clicked()
 
 void ShaderViewer::on_unrefresh_clicked()
 {
+  if(m_ExplanatoryMode)
+  {
+    ShowErrors(m_ExplanatoryReason);
+    return;
+  }
+
   m_RevertCallback(&m_Ctx, this, m_EditingShader);
 
   m_Modified = true;
@@ -6532,6 +6738,14 @@ void ShaderViewer::on_unrefresh_clicked()
 
 void ShaderViewer::on_refresh_clicked()
 {
+  if(m_ExplanatoryMode)
+  {
+    // The Refresh/F5 shortcut remains registered for this window. Fail closed here as well as in
+    // the disabled toolbar so a shortcut can never compile or replace an explanatory artifact.
+    ShowErrors(m_ExplanatoryReason);
+    return;
+  }
+
   if(m_Trace)
   {
     m_Ctx.GetPipelineViewer()->SaveShaderFile(m_ShaderDetails);
@@ -6710,6 +6924,9 @@ void ShaderViewer::on_resources_sortByResource_clicked()
 
 ScintillaEdit *ShaderViewer::currentScintilla()
 {
+  if(m_FindReplace && m_FindReplace->isVisible() && m_FindEditor)
+    return m_FindEditor;
+
   ScintillaEdit *cur = qobject_cast<ScintillaEdit *>(QApplication::focusWidget());
 
   if(cur == NULL)
@@ -6729,21 +6946,171 @@ ScintillaEdit *ShaderViewer::currentScintilla()
 
 ScintillaEdit *ShaderViewer::nextScintilla(ScintillaEdit *cur)
 {
-  for(int i = 0; i < m_Scintillas.count(); i++)
-  {
-    if(m_Scintillas[i] == cur)
-    {
-      if(i + 1 < m_Scintillas.count())
-        return m_Scintillas[i + 1];
+  QList<ScintillaEdit *> editors = m_Scintillas;
+  editors.removeAll(m_DisassemblyView);
+  if(editors.isEmpty())
+    editors = m_Scintillas;
 
-      return m_Scintillas[0];
+  for(int i = 0; i < editors.count(); i++)
+  {
+    if(editors[i] == cur)
+    {
+      if(i + 1 < editors.count())
+        return editors[i + 1];
+
+      return editors[0];
     }
   }
 
-  if(!m_Scintillas.isEmpty())
-    return m_Scintillas[0];
+  if(!editors.isEmpty())
+    return editors[0];
 
   return NULL;
+}
+
+void ShaderViewer::refreshFindHighlights(bool selectMatch)
+{
+  ScintillaEdit *cur = currentScintilla();
+  if(!cur)
+  {
+    m_FindReplace->setResultCount(0, 0);
+    return;
+  }
+
+  sptr_t flags = 0;
+  if(m_FindReplace->matchCase())
+    flags |= SCFIND_MATCHCASE;
+  if(m_FindReplace->matchWord())
+    flags |= SCFIND_WHOLEWORD;
+  if(m_FindReplace->regexp())
+    flags |= SCFIND_REGEXP | SCFIND_POSIX;
+
+  // Always clear the old scope first. Otherwise switching from All Files to File (or changing the
+  // active file) leaves stale highlights behind in editors which are no longer searched.
+  QList<ScintillaEdit *> highlightedEditors = m_Scintillas;
+  if(!highlightedEditors.contains(cur))
+    highlightedEditors.push_back(cur);
+  for(ScintillaEdit *editor : highlightedEditors)
+  {
+    editor->setIndicatorCurrent(INDICATOR_FINDRESULT);
+    editor->indicatorClearRange(0, editor->length());
+  }
+
+  QList<ScintillaEdit *> editors = m_Scintillas;
+  editors.removeAll(m_DisassemblyView);
+  if(m_FindReplace->context() == FindReplace::File)
+    editors = {cur};
+
+  const QByteArray needle = m_FindReplace->findText().toUtf8();
+  const sptr_t cursor = cur->selectionStart() == cur->selectionEnd() ? cur->currentPos()
+                                                                       : cur->selectionStart();
+  int total = 0;
+  int current = 0;
+  int firstIndex = 0;
+  int candidateIndex = 0;
+  sptr_t firstPosition = -1;
+  sptr_t candidatePosition = -1;
+  ScintillaEdit *firstEditor = NULL;
+  ScintillaEdit *candidateEditor = NULL;
+  bool invalidExpression = false;
+
+  for(ScintillaEdit *editor : editors)
+  {
+    if(needle.isEmpty())
+      continue;
+
+    sptr_t start = 0;
+    const sptr_t end = editor->length();
+    editor->setStatus(SC_STATUS_OK);
+    while(start <= end)
+    {
+      QPair<int, int> result = editor->findText(flags, needle.constData(), start, end);
+      if(editor->status() == SC_STATUS_WARN_REGEX)
+      {
+        invalidExpression = true;
+        break;
+      }
+      if(result.first < 0)
+        break;
+
+      total++;
+      editor->indicatorFillRange(result.first, result.second - result.first);
+
+      if(!firstEditor)
+      {
+        firstEditor = editor;
+        firstPosition = result.first;
+        firstIndex = total;
+      }
+
+      if(editor == cur)
+      {
+        if(result.first == cur->selectionStart())
+          current = total;
+
+        if(!candidateEditor && result.first >= cursor)
+        {
+          candidateEditor = editor;
+          candidatePosition = result.first;
+          candidateIndex = total;
+        }
+      }
+
+      // Regular expressions are allowed to produce an empty match. Advance by a full Unicode
+      // character so incremental search cannot spin or land in the middle of UTF-8 text.
+      start = result.second > result.first ? result.second : editor->positionAfter(result.first);
+      if(start <= result.first)
+        break;
+    }
+  }
+
+  if(selectMatch && total > 0)
+  {
+    if(!candidateEditor)
+    {
+      candidateEditor = firstEditor;
+      candidatePosition = firstPosition;
+      candidateIndex = firstIndex;
+    }
+
+    if(candidateEditor != cur)
+      ToolWindowManager::raiseToolWindow(candidateEditor);
+
+    QPair<int, int> result = candidateEditor->findText(flags, needle.constData(), candidatePosition,
+                                                        candidateEditor->length());
+    if(result.first >= 0)
+    {
+      m_FindEditor = candidateEditor;
+      candidateEditor->setSelection(result.first, result.second);
+      ensureLineScrolled(candidateEditor, candidateEditor->lineFromPosition(result.first));
+      current = candidateIndex;
+
+      const QString findHash =
+          QFormatStr("%1%2%3")
+              .arg(m_FindReplace->findText())
+              .arg(flags)
+              .arg((int)m_FindReplace->context());
+      m_FindState.hash = findHash;
+      m_FindState.start = 0;
+      m_FindState.end = candidateEditor->length();
+      m_FindState.offset = result.second;
+      m_FindState.prevResult = result;
+      m_FindState.editor = candidateEditor;
+    }
+  }
+
+  m_FindReplace->setResultCount(current, total);
+  m_FindReplace->setSearchError(invalidExpression ? tr("Invalid expression") : QString());
+  updateFindOverlayGeometry();
+}
+
+void ShaderViewer::performIncrementalFind()
+{
+  m_FindState = FindState();
+  // Typing a new query starts a conventional forward incremental search. Shift+Enter can switch
+  // the subsequent navigation direction to previous.
+  m_FindReplace->setDirection(FindReplace::Down);
+  refreshFindHighlights(true);
 }
 
 void ShaderViewer::find(bool down)
@@ -6754,6 +7121,9 @@ void ShaderViewer::find(bool down)
     return;
 
   QString find = m_FindReplace->findText();
+  QByteArray findUtf8 = find.toUtf8();
+  if(findUtf8.isEmpty())
+    return;
 
   sptr_t flags = 0;
 
@@ -6766,62 +7136,69 @@ void ShaderViewer::find(bool down)
 
   FindReplace::SearchContext context = m_FindReplace->context();
 
-  QString findHash = QFormatStr("%1%2%3%4").arg(find).arg(flags).arg((int)context).arg(down);
+  QString findHash = QFormatStr("%1%2%3").arg(find).arg(flags).arg((int)context);
 
-  if(findHash != m_FindState.hash)
+  sptr_t origin = down ? cur->selectionEnd() : cur->selectionStart();
+  bool exhaustedZeroWidthMatch = false;
+
+  // A zero-width regular expression leaves the selection/caret at the same byte position. Move by
+  // one complete UTF-8 character before searching again so F3 cannot keep returning the same match.
+  if(m_FindState.hash == findHash && m_FindState.editor == cur &&
+     m_FindState.prevResult.first == m_FindState.prevResult.second &&
+     m_FindState.prevResult.first == origin)
   {
-    m_FindState.hash = findHash;
-    m_FindState.start = 0;
-    m_FindState.end = cur->length();
-    m_FindState.offset = cur->currentPos();
-    if(down && cur->selectionStart() == m_FindState.offset &&
-       cur->selectionEnd() - m_FindState.offset == find.length())
-      m_FindState.offset += find.length();
+    const sptr_t advanced = down ? cur->positionAfter(origin) : cur->positionBefore(origin);
+    exhaustedZeroWidthMatch = advanced == origin;
+    origin = advanced;
   }
 
-  int start = m_FindState.start + m_FindState.offset;
-  int end = m_FindState.end;
+  QPair<int, int> result =
+      exhaustedZeroWidthMatch
+          ? qMakePair(-1, -1)
+          : cur->findText(flags, findUtf8.constData(), origin, down ? cur->length() : 0);
 
-  if(!down)
-    end = m_FindState.start;
-
-  QPair<int, int> result = cur->findText(flags, find.toUtf8().data(), start, end);
-
-  m_FindState.prevResult = result;
-
-  if(result.first == -1)
+  ScintillaEdit *originEditor = cur;
+  if(result.first < 0 && context == FindReplace::AllFiles)
   {
-    sptr_t maxOffset = down ? 0 : m_FindState.end;
+    QList<ScintillaEdit *> editors = m_Scintillas;
+    editors.removeAll(m_DisassemblyView);
+    int editorIndex = editors.indexOf(cur);
 
-    // if we're at offset 0 searching down, there are no results. Same for offset max and
-    // searching up
-    if(m_FindState.offset == maxOffset)
-      return;
-
-    // otherwise, we can wrap the search around
-
-    if(context == FindReplace::AllFiles)
+    for(int step = 1; editorIndex >= 0 && step < editors.count(); ++step)
     {
-      cur = nextScintilla(cur);
-      ToolWindowManager::raiseToolWindow(cur);
-      cur->activateWindow();
-      cur->QWidget::setFocus();
+      int candidateIndex = down ? (editorIndex + step) % editors.count()
+                                : (editorIndex - step + editors.count()) % editors.count();
+      ScintillaEdit *candidate = editors[candidateIndex];
+      result = candidate->findText(flags, findUtf8.constData(), down ? 0 : candidate->length(),
+                                   down ? candidate->length() : 0);
+      if(result.first >= 0)
+      {
+        cur = candidate;
+        break;
+      }
     }
+  }
 
-    m_FindState.offset = maxOffset;
+  // Wrap within the starting file after every other source file has been checked.
+  if(result.first < 0)
+  {
+    cur = originEditor;
+    result = cur->findText(flags, findUtf8.constData(), down ? 0 : cur->length(), origin);
+  }
 
-    start = m_FindState.start + m_FindState.offset;
-    end = m_FindState.end;
+  m_FindState.hash = findHash;
+  m_FindState.start = 0;
+  m_FindState.end = cur->length();
+  m_FindState.prevResult = result;
+  m_FindState.editor = cur;
 
-    if(!down)
-      end = m_FindState.start;
+  if(result.first < 0)
+    return;
 
-    result = cur->findText(flags, find.toUtf8().data(), start, end);
-
-    m_FindState.prevResult = result;
-
-    if(result.first == -1)
-      return;
+  if(cur != originEditor)
+  {
+    m_FindEditor = cur;
+    ToolWindowManager::raiseToolWindow(cur);
   }
 
   cur->setSelection(result.first, result.second);
@@ -6837,6 +7214,7 @@ void ShaderViewer::find(bool down)
 void ShaderViewer::performFind()
 {
   find(m_FindReplace->direction() == FindReplace::Down);
+  refreshFindHighlights(false);
 }
 
 void ShaderViewer::performFindAll()
@@ -6881,6 +7259,7 @@ void ShaderViewer::performFindAll()
   m_FindState = FindState();
 
   QList<ScintillaEdit *> scintillas = m_Scintillas;
+  scintillas.removeAll(m_DisassemblyView);
 
   if(context == FindReplace::File)
     scintillas = {cur};
@@ -6898,6 +7277,7 @@ void ShaderViewer::performFindAll()
   {
     sptr_t start = 0;
     sptr_t end = s->length();
+    s->setStatus(SC_STATUS_OK);
 
     s->setIndicatorCurrent(INDICATOR_FINDRESULT);
     s->indicatorClearRange(start, end);
@@ -6907,6 +7287,12 @@ void ShaderViewer::performFindAll()
     do
     {
       result = s->findText(flags, findUtf8.data(), start, end);
+
+      if(s->status() == SC_STATUS_WARN_REGEX)
+      {
+        m_FindReplace->setSearchError(tr("Invalid expression"));
+        return;
+      }
 
       if(result.first >= 0)
       {
@@ -6919,7 +7305,9 @@ void ShaderViewer::performFindAll()
         QString lineText = QString::fromUtf8(s->textRange(lineStart, lineEnd));
 
         results += QFormatStr("  %1(%2): ").arg(s->windowTitle()).arg(line + 1, 4);
-        int startPos = results.length();
+        // Scintilla positions are UTF-8 byte offsets, while QString::length() counts UTF-16 code
+        // units. Measure the accumulated output in UTF-8 so non-ASCII source highlights align.
+        int startPos = results.toUtf8().size();
 
         results += lineText;
         results += lit("\n");
@@ -6930,10 +7318,17 @@ void ShaderViewer::performFindAll()
         m_FindAllResults.push_back({s, result.first});
       }
 
-      start = result.second;
+      if(result.first >= 0)
+      {
+        start = result.second > result.first ? result.second : s->positionAfter(result.first);
+        if(start <= result.first)
+          break;
+      }
 
     } while(result.first >= 0);
   }
+
+  m_FindReplace->setSearchError(QString());
 
   results += tr("Matching lines: %1").arg(resultList.count());
 
@@ -6992,7 +7387,7 @@ void ShaderViewer::performReplace()
 {
   ScintillaEdit *cur = currentScintilla();
 
-  if(!cur)
+  if(!cur || cur->readOnly())
     return;
 
   QString find = m_FindReplace->findText();
@@ -7012,10 +7407,12 @@ void ShaderViewer::performReplace()
   FindReplace::SearchContext context = m_FindReplace->context();
 
   bool down = m_FindReplace->direction() == FindReplace::Down;
-  QString findHash = QFormatStr("%1%2%3%4").arg(find).arg(flags).arg((int)context).arg(down);
+  QString findHash = QFormatStr("%1%2%3").arg(find).arg(flags).arg((int)context);
 
   // if we didn't have a valid previous find, just do a find and bail
-  if(findHash != m_FindState.hash)
+  if(findHash != m_FindState.hash || m_FindState.editor != cur ||
+     cur->selectionStart() != m_FindState.prevResult.first ||
+     cur->selectionEnd() != m_FindState.prevResult.second)
   {
     performFind();
     return;
@@ -7029,19 +7426,32 @@ void ShaderViewer::performReplace()
   FindState save = m_FindState;
 
   QString replaceText = m_FindReplace->replaceText();
+  QByteArray replaceUtf8 = replaceText.toUtf8();
+  const sptr_t originalLength = m_FindState.prevResult.second - m_FindState.prevResult.first;
+  sptr_t replacementLength = 0;
 
   // otherwise we have a valid previous find. Do the replace now
   // note this will invalidate the find state (as most user operations would), so we save/restore
   // the state
   if(m_FindReplace->regexp())
-    cur->replaceTargetRE(-1, replaceText.toUtf8().data());
+    replacementLength = cur->replaceTargetRE(-1, replaceUtf8.constData());
   else
-    cur->replaceTarget(-1, replaceText.toUtf8().data());
+    replacementLength = cur->replaceTarget(-1, replaceUtf8.constData());
+
+  // Continue outside the replacement itself. This is important when replacement text also matches
+  // the query, and advancing a full character additionally prevents a zero-width insertion from
+  // matching the same source boundary forever.
+  sptr_t nextPosition = down ? m_FindState.prevResult.first + replacementLength
+                             : m_FindState.prevResult.first;
+  if(originalLength == 0)
+    nextPosition = down ? cur->positionAfter(nextPosition) : cur->positionBefore(nextPosition);
+  cur->setSelection(nextPosition, nextPosition);
 
   m_FindState = save;
 
   // adjust the offset if we replaced text and it went up or down in size
-  m_FindState.offset += (replaceText.count() - find.count());
+  m_FindState.offset += replacementLength - originalLength;
+  m_FindState.end += replacementLength - originalLength;
 
   // move to the next result
   performFind();
@@ -7077,16 +7487,24 @@ void ShaderViewer::performReplaceAll()
   m_FindState = FindState();
 
   QList<ScintillaEdit *> scintillas = m_Scintillas;
+  scintillas.removeAll(m_DisassemblyView);
 
   if(context == FindReplace::File)
     scintillas = {cur};
 
   int numReplacements = 0;
+  int modifiedFiles = 0;
 
   for(ScintillaEdit *s : scintillas)
   {
+    if(s->readOnly())
+      continue;
+
+    const int replacementsBeforeFile = numReplacements;
+
     sptr_t start = 0;
     sptr_t end = s->length();
+    s->setStatus(SC_STATUS_OK);
 
     QPair<int, int> result;
 
@@ -7097,26 +7515,47 @@ void ShaderViewer::performReplaceAll()
     {
       result = s->findText(flags, findUtf8.data(), start, end);
 
+      if(s->status() == SC_STATUS_WARN_REGEX)
+      {
+        m_FindReplace->setSearchError(tr("Invalid expression"));
+        return;
+      }
+
       if(result.first >= 0)
       {
         s->setTargetRange(result.first, result.second);
 
+        const sptr_t originalLength = result.second - result.first;
+        sptr_t replacementLength = 0;
         if(m_FindReplace->regexp())
-          s->replaceTargetRE(-1, replaceUtf8.data());
+          replacementLength = s->replaceTargetRE(-1, replaceUtf8.data());
         else
-          s->replaceTarget(-1, replaceUtf8.data());
+          replacementLength = s->replaceTarget(-1, replaceUtf8.data());
 
         numReplacements++;
+
+        end += replacementLength - originalLength;
+        start = result.first + replacementLength;
+        if(originalLength == 0)
+        {
+          const sptr_t advanced = s->positionAfter(start);
+          if(advanced <= start)
+            break;
+          start = advanced;
+        }
       }
 
-      start = result.second + (replaceUtf8.count() - findUtf8.count());
-
     } while(result.first >= 0);
+
+    if(numReplacements != replacementsBeforeFile)
+      modifiedFiles++;
   }
+
+  m_FindReplace->setSearchError(QString());
 
   RDDialog::information(
       this, tr("Replace all"),
-      tr("%1 replacements made in %2 files").arg(numReplacements).arg(scintillas.count()));
+      tr("%1 replacements made in %2 files").arg(numReplacements).arg(modifiedFiles));
 }
 
 void ShaderViewer::ToggleBookmark()

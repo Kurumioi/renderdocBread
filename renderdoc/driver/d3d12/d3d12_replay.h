@@ -224,6 +224,17 @@ public:
                          rdcstr &errors);
   void ReplaceResource(ResourceId from, ResourceId to);
   void RemoveReplacement(ResourceId id);
+  rdcstr ReplaceTargetShaderChecked(ResourceId from, ResourceId to);
+  rdcstr RemoveTargetShaderReplacementChecked(ResourceId id);
+  rdcstr SetEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                 ResourceId expectedShader, ResourceId expectedBuffer,
+                                 uint64_t expectedByteOffset, uint64_t expectedByteSize,
+                                 const bytebuf &data, uint32_t registerSpace = 0);
+  void ClearEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                 uint32_t registerSpace = 0);
+  void ClearEventCBufferOverrides();
+  rdcstr ApplyEventCBufferOverrides(uint32_t eventId);
+  void RestoreEventCBufferOverrides();
   void ClearReplayCache();
   void ReloadShaderDebugInformation();
 
@@ -301,7 +312,51 @@ private:
   bool FetchShaderFeedback(uint32_t eventId);
   void ClearFeedbackCache();
 
-  void RefreshDerivedReplacements();
+  rdcstr RefreshDerivedReplacementsChecked(ResourceId requiredShader = ResourceId());
+
+  enum class EventCBufferBindingKind
+  {
+    RootCBV,
+    DescriptorTableCBV,
+  };
+
+  struct EventCBufferBinding
+  {
+    bool compute = false;
+    EventCBufferBindingKind kind = EventCBufferBindingKind::RootCBV;
+    uint32_t registerSpace = 0;
+    uint32_t rootIndex = ~0U;
+    ResourceId sourceHeap;
+    uint32_t descriptorIndex = ~0U;
+    ResourceId buffer;
+    uint64_t byteOffset = 0;
+    uint64_t byteSize = 0;
+  };
+
+  struct EventCBufferOverride
+  {
+    ResourceId expectedShader;
+    ResourceId expectedBuffer;
+    uint64_t expectedByteOffset = 0;
+    uint64_t expectedByteSize = 0;
+    bytebuf data;
+    EventCBufferBinding binding;
+    ID3D12Resource *shadow = NULL;
+  };
+
+  rdcstr ResolveEventCBufferBinding(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                    uint32_t registerSpace,
+                                    ResourceId expectedShader, ResourceId expectedBuffer,
+                                    uint64_t expectedByteOffset, uint64_t expectedByteSize,
+                                    EventCBufferBinding &binding);
+  rdcstr GetOrCreateEventCBufferShadowHeap(ResourceId sourceHeap,
+                                           ID3D12DescriptorHeap *&shadowHeap);
+  void ReleaseEventCBufferShadowHeaps();
+
+  std::map<EventCBufferOverrideKey, EventCBufferOverride> m_EventCBufferOverrides;
+  std::map<ResourceId, ID3D12DescriptorHeap *> m_EventCBufferShadowHeaps;
+  D3D12RenderState m_AppliedEventCBufferOriginalState;
+  bool m_EventCBufferStateApplied = false;
 
   void BuildShader(ShaderEncoding sourceEncoding, const bytebuf &source, const rdcstr &entry,
                    const ShaderCompileFlags &compileFlags, const rdcarray<rdcstr> &includeDirs,

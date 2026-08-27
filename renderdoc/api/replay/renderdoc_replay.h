@@ -483,6 +483,124 @@ function must be called from another thread.
 )");
   virtual void SetFrameEvent(uint32_t eventId, bool force) = 0;
 
+  DOCUMENT(R"(Configure a shader replacement that is applied only while replaying one action.
+
+The replacement is *not* installed through :meth:`ReplaceResource`. Immediately before the main
+``OnlyDraw`` replay performed by :meth:`SetFrameEvent`, RenderDoc verifies that ``expectedOriginal``
+is still bound at ``stage``, binds ``replacement``, replays the action, and then restores the
+previous shader. Capture loading, action discovery, pipeline-state inspection and unrelated replay
+operations continue to use the captured shader.
+
+This initial implementation is available only for local D3D11 replay. ``replacement`` must be a
+target shader returned by :meth:`BuildTargetShader` on this replay controller. Supplying the
+expected original shader makes the operation fail closed if the selected action or pipeline has
+changed. Configuring another replacement for the same effective event and stage replaces the old
+configuration. The effective ``eventId`` must already be current; call :meth:`SetFrameEvent` first.
+
+The caller remains responsible for validating the replacement shader's complete interface ABI
+before configuring it. An empty return string indicates success; otherwise the returned string
+describes why no override was configured. D3D11 dynamic shader linkage is not supported by this
+initial implementation: if class instances are bound at the target stage, the override fails
+closed when the action is replayed.
+
+:param int eventId: The action event ID. Event remapping is applied in the same way as
+  :meth:`SetFrameEvent`.
+:param ShaderStage stage: The D3D11 shader stage to override.
+:param ResourceId expectedOriginal: The captured shader expected to be bound at the action.
+:param ResourceId replacement: A target shader created by :meth:`BuildTargetShader`.
+:return: An empty string on success, or an error message on failure.
+:rtype: str
+)");
+  virtual rdcstr SetEventShaderOverride(uint32_t eventId, ShaderStage stage,
+                                        ResourceId expectedOriginal, ResourceId replacement) = 0;
+
+  DOCUMENT(R"(Remove the event-scoped shader override for one effective event and stage.
+
+This does not free the replacement shader. Use :meth:`FreeTargetResource` when it is no longer
+needed.
+
+:param int eventId: The action event ID. Event remapping is applied in the same way as
+  :meth:`SetFrameEvent`.
+:param ShaderStage stage: The shader stage whose override should be removed.
+)");
+  virtual void ClearEventShaderOverride(uint32_t eventId, ShaderStage stage) = 0;
+
+  DOCUMENT(R"(Remove every event-scoped shader override configured on this replay controller.
+
+This does not free any target shaders.
+)");
+  virtual void ClearEventShaderOverrides() = 0;
+
+  DOCUMENT(R"(Configure constant-buffer bytes that are bound only while replaying one D3D11 or
+D3D12 action.
+
+This is an event-scoped shadow binding, not a global buffer replacement. Immediately before the
+main ``OnlyDraw`` replay in :meth:`SetFrameEvent`, RenderDoc verifies the original shader and the
+captured constant-buffer binding, uploads ``data`` to a replay-owned constant buffer, and binds
+that shadow at ``stage`` and ``slot``. After the action, the exact original root/binding state is
+restored.
+
+The effective ``eventId`` must already be current and replay must be local. ``data`` must be
+non-empty, 16-byte aligned, and no larger than 64 KiB. D3D11 ``slot`` values are limited to b0-b13
+in register space 0. D3D12 accepts fixed CBV descriptor-table and root-CBV bindings for graphics,
+compute and mesh actions. D3D12 root constants, descriptor arrays, ray-tracing state objects, and
+ambiguous b-registers are rejected. Root-CBV overrides on ``ExecuteIndirect`` actions are also
+rejected because an indirect command-signature argument can overwrite the root descriptor during
+``OnlyDraw``; descriptor-table CBVs remain supported. D3D12 buffer offsets must be 256-byte aligned.
+
+When ``expectedBuffer`` is non-null, its canonical resource ID and the byte range described by
+``expectedByteOffset`` and ``expectedByteSize`` must exactly match the live binding. When it is
+null on D3D11, the slot must currently be unbound and both expected byte values must be zero. The
+latter form allows a D3D11 replacement shader to consume a new ReplayLab-owned constant buffer
+without changing the captured buffer globally. D3D12 requires an existing captured buffer. For a
+descriptor-table CBV, ``data`` must contain the complete descriptor window. A root CBV has no
+descriptor size, so its safe window is the reflected block byte size (16-byte rounded), not the
+remainder of a potentially much larger upload ring. Callers must copy that complete window and
+patch only desired bytes so untouched constants are preserved.
+
+D3D12 never mutates the captured resource or descriptor heap. Root CBVs are temporarily redirected
+to replay-owned upload buffers. Descriptor-table CBVs use a replay-owned full clone of the current
+shader-visible heap with only the selected descriptor changed, preserving unrelated descriptors and
+direct heap indexing. The original render state is restored after the action.
+
+Constant-buffer overrides are applied before event-scoped shader overrides. If any configured
+binding fails validation, all temporary bindings are restored and the captured draw is replayed
+without event overrides. An empty return string indicates success; otherwise the new configuration
+is removed and the returned string describes the failure.
+
+:param int eventId: The currently selected effective action event ID.
+:param ShaderStage stage: The shader stage containing the binding.
+:param int slot: The physical b-register. D3D11 accepts 0 to 13; D3D12 accepts a fixed uint32
+  b-register.
+:param ResourceId expectedShader: The canonical captured shader expected at ``stage``.
+:param ResourceId expectedBuffer: The canonical captured buffer expected at ``slot``, or null for
+  an unbound D3D11 slot.
+:param int expectedByteOffset: The expected bound-buffer byte offset.
+:param int expectedByteSize: The complete expected binding window.
+:param bytes data: The complete replacement constant-buffer contents.
+:param int registerSpace: The physical register space. This must be 0 for D3D11 and defaults to 0
+  for compatibility with older callers.
+:return: An empty string on success, or an error message on failure.
+:rtype: str
+)");
+  virtual rdcstr SetEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                         ResourceId expectedShader, ResourceId expectedBuffer,
+                                         uint64_t expectedByteOffset, uint64_t expectedByteSize,
+                                         bytebuf data, uint32_t registerSpace = 0) = 0;
+
+  DOCUMENT(R"(Remove one event-scoped D3D11 or D3D12 constant-buffer override.
+
+:param int eventId: The action event ID. Event remapping is applied as in :meth:`SetFrameEvent`.
+:param ShaderStage stage: The shader stage containing the binding.
+:param int slot: The physical b-register.
+:param int registerSpace: The physical register space. This must be 0 for D3D11 and defaults to 0.
+)");
+  virtual void ClearEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                         uint32_t registerSpace = 0) = 0;
+
+  DOCUMENT(R"(Remove every event-scoped constant-buffer override from this replay controller.)");
+  virtual void ClearEventCBufferOverrides() = 0;
+
   DOCUMENT(R"(Sets the user-selected event ID, used to distinguish between selecting a MultiAction
 parent (where effectiveEID maps to the last child) and selecting the last child directly.
 
@@ -729,6 +847,26 @@ See :meth:`BuildTargetShader`, :meth:`RemoveReplacement`.
 )");
   virtual void ReplaceResource(ResourceId original, ResourceId replacement) = 0;
 
+  DOCUMENT(R"(Replace a target shader while requiring the replay driver to prove that every
+derived pipeline can be rebuilt before changing any live replacement mapping.
+
+This is a fail-closed companion to :meth:`ReplaceResource` for shader editing. The replacement
+must have been returned by :meth:`BuildTargetShader` on this replay controller. On D3D12, all
+captured graphics/compute pipeline states which reference ``original`` are first rebuilt with
+their captured root signature and the replacement shader. Cached PSO blobs are not reused. If any
+pipeline creation fails, no shader or pipeline replacement mapping is changed.
+
+Only replay drivers which explicitly implement checked shader replacement accept this call. An
+empty return string indicates success; otherwise the returned diagnostic describes why the
+replacement was not installed.
+
+:param ResourceId original: The captured shader resource to substitute.
+:param ResourceId replacement: A target shader returned by :meth:`BuildTargetShader`.
+:return: An empty string on success, or a fail-closed diagnostic.
+:rtype: str
+)");
+  virtual rdcstr ReplaceTargetShaderChecked(ResourceId original, ResourceId replacement) = 0;
+
   DOCUMENT(R"(Clear any cached data from previous replays and ensure subsequent replays fully
 re-initialise any data, including e.g. bindless feedback, printf results or mesh output data.
 )");
@@ -745,6 +883,18 @@ See :meth:`ReplaceResource`.
 :param ResourceId id: The id of the resource that was previously being substituted.
 )");
   virtual void RemoveReplacement(ResourceId id) = 0;
+
+  DOCUMENT(R"(Remove a checked target-shader replacement transactionally.
+
+On D3D12, any remaining shader replacements are used to prebuild all affected captured pipeline
+states before the current replacement is removed. If this rebuild fails, the existing shader and
+pipeline mappings remain active.
+
+:param ResourceId id: The captured shader resource whose checked replacement should be removed.
+:return: An empty string on success, or a fail-closed diagnostic.
+:rtype: str
+)");
+  virtual rdcstr RemoveTargetShaderReplacementChecked(ResourceId id) = 0;
 
   DOCUMENT(R"(Free a previously created target shader.
 

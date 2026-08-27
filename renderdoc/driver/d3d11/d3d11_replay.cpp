@@ -74,6 +74,9 @@ D3D11Replay::~D3D11Replay()
 
 void D3D11Replay::Shutdown()
 {
+  ClearEventCBufferOverrides();
+  ClearEventShaderOverrides();
+
   for(size_t i = 0; i < m_ProxyResources.size(); i++)
     m_ProxyResources[i]->Release();
   m_ProxyResources.clear();
@@ -2672,6 +2675,625 @@ rdcarray<ShaderSourcePrefix> D3D11Replay::GetCustomShaderSourcePrefixes()
   return {
       {ShaderEncoding::HLSL, HLSL_CUSTOM_PREFIX},
   };
+}
+
+static D3D11RenderState::Shader *GetEventOverrideStage(D3D11RenderState *state, ShaderStage stage)
+{
+  switch(stage)
+  {
+    case ShaderStage::Vertex: return &state->VS;
+    case ShaderStage::Hull: return &state->HS;
+    case ShaderStage::Domain: return &state->DS;
+    case ShaderStage::Geometry: return &state->GS;
+    case ShaderStage::Pixel: return &state->PS;
+    case ShaderStage::Compute: return &state->CS;
+    default: break;
+  }
+
+  return NULL;
+}
+
+static void BindEventOverrideStage(WrappedID3D11DeviceContext *context, ShaderStage stage,
+                                   ID3D11DeviceChild *shader,
+                                   ID3D11ClassInstance *const *instances, UINT numInstances)
+{
+  switch(stage)
+  {
+    case ShaderStage::Vertex:
+      context->VSSetShader((ID3D11VertexShader *)shader, instances, numInstances);
+      break;
+    case ShaderStage::Hull:
+      context->HSSetShader((ID3D11HullShader *)shader, instances, numInstances);
+      break;
+    case ShaderStage::Domain:
+      context->DSSetShader((ID3D11DomainShader *)shader, instances, numInstances);
+      break;
+    case ShaderStage::Geometry:
+      context->GSSetShader((ID3D11GeometryShader *)shader, instances, numInstances);
+      break;
+    case ShaderStage::Pixel:
+      context->PSSetShader((ID3D11PixelShader *)shader, instances, numInstances);
+      break;
+    case ShaderStage::Compute:
+      context->CSSetShader((ID3D11ComputeShader *)shader, instances, numInstances);
+      break;
+    default: RDCERR("Unsupported D3D11 event shader override stage %s", ToStr(stage).c_str()); break;
+  }
+}
+
+static void BindEventOverrideCBuffer(WrappedID3D11DeviceContext *context, ShaderStage stage,
+                                     uint32_t slot, ID3D11Buffer *buffer, UINT firstConstant,
+                                     UINT numConstants)
+{
+  switch(stage)
+  {
+    case ShaderStage::Vertex:
+      context->VSSetConstantBuffers1(slot, 1, &buffer, &firstConstant, &numConstants);
+      break;
+    case ShaderStage::Hull:
+      context->HSSetConstantBuffers1(slot, 1, &buffer, &firstConstant, &numConstants);
+      break;
+    case ShaderStage::Domain:
+      context->DSSetConstantBuffers1(slot, 1, &buffer, &firstConstant, &numConstants);
+      break;
+    case ShaderStage::Geometry:
+      context->GSSetConstantBuffers1(slot, 1, &buffer, &firstConstant, &numConstants);
+      break;
+    case ShaderStage::Pixel:
+      context->PSSetConstantBuffers1(slot, 1, &buffer, &firstConstant, &numConstants);
+      break;
+    case ShaderStage::Compute:
+      context->CSSetConstantBuffers1(slot, 1, &buffer, &firstConstant, &numConstants);
+      break;
+    default:
+      RDCERR("Unsupported D3D11 event CBuffer override stage %s", ToStr(stage).c_str());
+      break;
+  }
+}
+
+rdcstr D3D11Replay::SetEventShaderOverride(uint32_t eventId, ShaderStage stage,
+                                           ResourceId expectedOriginal, ResourceId replacement)
+{
+  RestoreEventShaderOverrides();
+
+  if(GetEventOverrideStage(m_pImmediateContext->GetCurrentPipelineState(), stage) == NULL)
+    return StringFormat::Fmt("Shader stage %s is not supported by D3D11 event overrides",
+                             ToStr(stage).c_str());
+
+  const ActionDescription *action = m_pDevice->GetAction(eventId);
+  if(action == NULL)
+    return StringFormat::Fmt("Event %u is not a replayable action", eventId);
+
+  if(stage == ShaderStage::Compute)
+  {
+    if(!(action->flags & ActionFlags::Dispatch))
+      return StringFormat::Fmt("Event %u is not a compute dispatch", eventId);
+  }
+  else if(!(action->flags & ActionFlags::Drawcall))
+  {
+    return StringFormat::Fmt("Event %u is not a graphics draw", eventId);
+  }
+
+  D3D11ResourceManager *rm = m_pDevice->GetResourceManager();
+
+  if(rm->GetUnreplacedID(expectedOriginal) != expectedOriginal)
+    return "expectedOriginal must identify the canonical captured shader, not a replacement";
+
+  auto expectedIt = WrappedShader::m_ShaderList.find(expectedOriginal);
+  if(expectedIt == WrappedShader::m_ShaderList.end())
+    return StringFormat::Fmt("Expected original %s is not a D3D11 shader",
+                             ToStr(expectedOriginal).c_str());
+
+  ShaderStage expectedStage = expectedIt->second->GetDetails().stage;
+  if(expectedStage != stage)
+    return StringFormat::Fmt("Expected original %s is a %s shader, not %s",
+                             ToStr(expectedOriginal).c_str(), ToStr(expectedStage).c_str(),
+                             ToStr(stage).c_str());
+
+  auto replacementIt = WrappedShader::m_ShaderList.find(replacement);
+  if(replacementIt == WrappedShader::m_ShaderList.end())
+    return StringFormat::Fmt("Replacement %s is not a D3D11 shader", ToStr(replacement).c_str());
+
+  const uint32_t shaderExtSlot = expectedIt->second->GetShaderExtSlot();
+
+  // Match stock ReplaceResource behaviour. One target resource cannot safely represent original
+  // shaders using different vendor-extension UAV slots because the DXBC metadata is per shader.
+  for(auto it = m_EventShaderOverrides.begin(); it != m_EventShaderOverrides.end(); ++it)
+  {
+    if(it->second.replacementId == replacement && it->second.shaderExtSlot != shaderExtSlot)
+      return "A replacement shader cannot be shared across different vendor extension UAV slots";
+  }
+
+  replacementIt->second->SetShaderExtSlot(shaderExtSlot);
+
+  ShaderStage replacementStage = replacementIt->second->GetDetails().stage;
+  if(replacementStage != stage)
+    return StringFormat::Fmt("Replacement %s is a %s shader, not %s", ToStr(replacement).c_str(),
+                             ToStr(replacementStage).c_str(), ToStr(stage).c_str());
+
+  if(!rm->HasResource(replacement))
+    return StringFormat::Fmt("Replacement shader %s is no longer live", ToStr(replacement).c_str());
+
+  ID3D11DeviceChild *replacementObject = rm->GetResource(replacement, true);
+  if(replacementObject == NULL || GetIDForDeviceChild(replacementObject) != replacement)
+    return "Replacement shader does not resolve to the exact requested target resource";
+
+  std::pair<uint32_t, ShaderStage> key = {eventId, stage};
+  EventShaderOverride &configured = m_EventShaderOverrides[key];
+
+  if(configured.replacement != replacementObject)
+  {
+    IntAddRef(replacementObject);
+    IntRelease(configured.replacement);
+    configured.replacement = replacementObject;
+  }
+
+  configured.expectedOriginal = expectedOriginal;
+  configured.replacementId = replacement;
+  configured.shaderExtSlot = shaderExtSlot;
+
+  ClearPostVSCache();
+  return {};
+}
+
+void D3D11Replay::ClearEventShaderOverride(uint32_t eventId, ShaderStage stage)
+{
+  RestoreEventShaderOverrides();
+
+  auto it = m_EventShaderOverrides.find({eventId, stage});
+  if(it == m_EventShaderOverrides.end())
+    return;
+
+  IntRelease(it->second.replacement);
+  m_EventShaderOverrides.erase(it);
+  ClearPostVSCache();
+}
+
+void D3D11Replay::ClearEventShaderOverrides()
+{
+  RestoreEventShaderOverrides();
+
+  for(auto it = m_EventShaderOverrides.begin(); it != m_EventShaderOverrides.end(); ++it)
+    IntRelease(it->second.replacement);
+
+  m_EventShaderOverrides.clear();
+  ClearPostVSCache();
+}
+
+void D3D11Replay::ClearEventShaderOverridesForResource(ResourceId id)
+{
+  RestoreEventShaderOverrides();
+
+  bool removed = false;
+  for(auto it = m_EventShaderOverrides.begin(); it != m_EventShaderOverrides.end();)
+  {
+    if(it->second.replacementId == id)
+    {
+      IntRelease(it->second.replacement);
+      it = m_EventShaderOverrides.erase(it);
+      removed = true;
+    }
+    else
+    {
+      ++it;
+    }
+  }
+
+  if(removed)
+    ClearPostVSCache();
+}
+
+rdcstr D3D11Replay::ApplyEventShaderOverrides(uint32_t eventId)
+{
+  if(!m_AppliedEventShaderOverrides.empty())
+    return "A previous event-scoped shader override was not restored";
+
+  rdcarray<std::pair<ShaderStage, const EventShaderOverride *> > pending;
+  for(auto it = m_EventShaderOverrides.begin(); it != m_EventShaderOverrides.end(); ++it)
+  {
+    if(it->first.first == eventId)
+      pending.push_back({it->first.second, &it->second});
+  }
+
+  if(pending.empty())
+    return {};
+
+  D3D11RenderState *state = m_pImmediateContext->GetCurrentPipelineState();
+  D3D11ResourceManager *rm = m_pDevice->GetResourceManager();
+
+  // Validate every configured stage before changing any of them so a stale expected shader fails
+  // atomically instead of producing a partially overridden draw.
+  for(const std::pair<ShaderStage, const EventShaderOverride *> &item : pending)
+  {
+    D3D11RenderState::Shader *bound = GetEventOverrideStage(state, item.first);
+    if(bound == NULL)
+      return StringFormat::Fmt("Shader stage %s is not supported", ToStr(item.first).c_str());
+
+    // Dynamic linkage has additional class/interface-slot ABI which the initial override gate does
+    // not validate. Do not carry captured class instances into an independently built shader.
+    if(bound->NumInstances > 0)
+      return StringFormat::Fmt(
+          "Event %u uses %u dynamic class instances at %s; dynamic linkage overrides are not "
+          "supported",
+          eventId, bound->NumInstances, ToStr(item.first).c_str());
+
+    ResourceId current = rm->GetUnreplacedID(GetIDForDeviceChild(bound->Object));
+    if(current != item.second->expectedOriginal)
+      return StringFormat::Fmt("Expected %s at %s, but event %u currently binds %s",
+                               ToStr(item.second->expectedOriginal).c_str(),
+                               ToStr(item.first).c_str(), eventId, ToStr(current).c_str());
+
+    if(item.second->replacement == NULL ||
+       GetIDForDeviceChild(item.second->replacement) != item.second->replacementId)
+      return StringFormat::Fmt("Replacement shader %s is no longer valid",
+                               ToStr(item.second->replacementId).c_str());
+
+    auto replacementIt = WrappedShader::m_ShaderList.find(item.second->replacementId);
+    if(replacementIt == WrappedShader::m_ShaderList.end() ||
+       replacementIt->second->GetShaderExtSlot() != item.second->shaderExtSlot)
+      return StringFormat::Fmt("Replacement shader %s vendor extension slot changed",
+                               ToStr(item.second->replacementId).c_str());
+  }
+
+  m_AppliedEventShaderOverrides.reserve(pending.size());
+
+  for(const std::pair<ShaderStage, const EventShaderOverride *> &item : pending)
+  {
+    D3D11RenderState::Shader *bound = GetEventOverrideStage(state, item.first);
+
+    AppliedEventShaderOverride applied;
+    applied.stage = item.first;
+    applied.original = bound->Object;
+    applied.numInstances = bound->NumInstances;
+
+    IntAddRef(applied.original);
+    for(UINT i = 0; i < applied.numInstances; ++i)
+    {
+      applied.instances[i] = bound->Instances[i];
+      IntAddRef(applied.instances[i]);
+    }
+
+    m_AppliedEventShaderOverrides.push_back(applied);
+    BindEventOverrideStage(m_pImmediateContext, item.first, item.second->replacement,
+                           applied.instances, applied.numInstances);
+  }
+
+  return {};
+}
+
+void D3D11Replay::RestoreEventShaderOverrides()
+{
+  for(size_t i = m_AppliedEventShaderOverrides.size(); i > 0; --i)
+  {
+    AppliedEventShaderOverride &applied = m_AppliedEventShaderOverrides[i - 1];
+
+    BindEventOverrideStage(m_pImmediateContext, applied.stage, applied.original, applied.instances,
+                           applied.numInstances);
+
+    IntRelease(applied.original);
+    for(UINT inst = 0; inst < applied.numInstances; ++inst)
+      IntRelease(applied.instances[inst]);
+  }
+
+  m_AppliedEventShaderOverrides.clear();
+}
+
+rdcstr D3D11Replay::ValidateEventCBufferBinding(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                                uint32_t registerSpace,
+                                                ResourceId expectedShader,
+                                                ResourceId expectedBuffer,
+                                                uint64_t expectedByteOffset,
+                                                uint64_t expectedByteSize)
+{
+  if(registerSpace != 0)
+    return "D3D11 constant-buffer overrides require register space 0";
+
+  D3D11RenderState::Shader *bound =
+      GetEventOverrideStage(m_pImmediateContext->GetCurrentPipelineState(), stage);
+  if(bound == NULL)
+    return StringFormat::Fmt("Shader stage %s is not supported", ToStr(stage).c_str());
+
+  D3D11ResourceManager *rm = m_pDevice->GetResourceManager();
+  ResourceId currentShader = rm->GetUnreplacedID(GetIDForDeviceChild(bound->Object));
+  if(currentShader != expectedShader)
+    return StringFormat::Fmt("Expected shader %s at %s, but event %u currently binds %s",
+                             ToStr(expectedShader).c_str(), ToStr(stage).c_str(), eventId,
+                             ToStr(currentShader).c_str());
+
+  ID3D11Buffer *currentBuffer = bound->ConstantBuffers[slot];
+  ResourceId currentBufferId = rm->GetUnreplacedID(GetIDForDeviceChild(currentBuffer));
+
+  if(expectedBuffer == ResourceId())
+  {
+    if(currentBuffer != NULL)
+      return StringFormat::Fmt("Expected an unbound CBuffer at %s slot %u, but found %s",
+                               ToStr(stage).c_str(), slot, ToStr(currentBufferId).c_str());
+  }
+  else
+  {
+    if(currentBuffer == NULL || currentBufferId != expectedBuffer)
+      return StringFormat::Fmt("Expected CBuffer %s at %s slot %u, but found %s",
+                               ToStr(expectedBuffer).c_str(), ToStr(stage).c_str(), slot,
+                               ToStr(currentBufferId).c_str());
+
+    const uint64_t currentByteOffset = uint64_t(bound->CBOffsets[slot]) * 16ULL;
+    const uint64_t currentByteSize = uint64_t(bound->CBCounts[slot]) * 16ULL;
+    if(currentByteOffset != expectedByteOffset || currentByteSize != expectedByteSize)
+      return StringFormat::Fmt(
+          "Expected CBuffer byte offset/size %llu/%llu at %s slot %u, but found %llu/%llu",
+          (unsigned long long)expectedByteOffset, (unsigned long long)expectedByteSize,
+          ToStr(stage).c_str(), slot, (unsigned long long)currentByteOffset,
+          (unsigned long long)currentByteSize);
+  }
+
+  return {};
+}
+
+rdcstr D3D11Replay::SetEventCBufferOverride(
+    uint32_t eventId, ShaderStage stage, uint32_t slot, ResourceId expectedShader,
+    ResourceId expectedBuffer, uint64_t expectedByteOffset, uint64_t expectedByteSize,
+    const bytebuf &data, uint32_t registerSpace)
+{
+  RestoreEventCBufferOverrides();
+
+  if(slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+    return "D3D11 constant-buffer slot must be between 0 and 13";
+  if(registerSpace != 0)
+    return "D3D11 constant-buffer overrides require register space 0";
+
+  if(expectedShader == ResourceId())
+    return "expectedShader must be a non-null captured shader resource";
+
+  if(data.empty() || data.size() > D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16ULL ||
+     (data.size() % 16) != 0)
+    return "data must be non-empty, 16-byte aligned, and no larger than 64 KiB";
+
+  if((expectedByteOffset % 16) != 0 || (expectedByteSize % 16) != 0 ||
+     expectedByteSize > D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16ULL)
+    return "The expected offset and size must be 16-byte aligned, and size must not exceed 64 KiB";
+
+  if(expectedBuffer == ResourceId() && (expectedByteOffset != 0 || expectedByteSize != 0))
+    return "An expected unbound slot must use a zero byte offset and size";
+
+  if(GetEventOverrideStage(m_pImmediateContext->GetCurrentPipelineState(), stage) == NULL)
+    return StringFormat::Fmt("Shader stage %s is not supported by D3D11 event overrides",
+                             ToStr(stage).c_str());
+
+  const ActionDescription *action = m_pDevice->GetAction(eventId);
+  if(action == NULL)
+    return StringFormat::Fmt("Event %u is not a replayable action", eventId);
+
+  if(stage == ShaderStage::Compute)
+  {
+    if(!(action->flags & ActionFlags::Dispatch))
+      return StringFormat::Fmt("Event %u is not a compute dispatch", eventId);
+  }
+  else if(!(action->flags & ActionFlags::Drawcall))
+  {
+    return StringFormat::Fmt("Event %u is not a graphics draw", eventId);
+  }
+
+  D3D11ResourceManager *rm = m_pDevice->GetResourceManager();
+  if(rm->GetUnreplacedID(expectedShader) != expectedShader)
+    return "expectedShader must identify the canonical captured shader, not a replacement";
+  if(expectedBuffer != ResourceId() && rm->GetUnreplacedID(expectedBuffer) != expectedBuffer)
+    return "expectedBuffer must identify the canonical captured buffer, not a replacement";
+
+  auto expectedShaderIt = WrappedShader::m_ShaderList.find(expectedShader);
+  if(expectedShaderIt == WrappedShader::m_ShaderList.end())
+    return StringFormat::Fmt("Expected shader %s is not a D3D11 shader",
+                             ToStr(expectedShader).c_str());
+
+  ShaderStage expectedStage = expectedShaderIt->second->GetDetails().stage;
+  if(expectedStage != stage)
+    return StringFormat::Fmt("Expected shader %s is a %s shader, not %s",
+                             ToStr(expectedShader).c_str(), ToStr(expectedStage).c_str(),
+                             ToStr(stage).c_str());
+
+  rdcstr validation = ValidateEventCBufferBinding(eventId, stage, slot, registerSpace, expectedShader,
+                                                  expectedBuffer, expectedByteOffset,
+                                                  expectedByteSize);
+  if(!validation.empty())
+    return validation;
+
+  if(expectedBuffer != ResourceId())
+  {
+    D3D11RenderState::Shader *bound =
+        GetEventOverrideStage(m_pImmediateContext->GetCurrentPipelineState(), stage);
+    ID3D11Buffer *currentBuffer = bound->ConstantBuffers[slot];
+    D3D11_BUFFER_DESC currentDesc = {};
+    currentBuffer->GetDesc(&currentDesc);
+
+    if(expectedByteOffset > uint64_t(currentDesc.ByteWidth))
+      return StringFormat::Fmt(
+          "Expected CBuffer byte offset %llu exceeds buffer %s byte width %u",
+          (unsigned long long)expectedByteOffset, ToStr(expectedBuffer).c_str(),
+          currentDesc.ByteWidth);
+
+    const uint64_t availableBytes = uint64_t(currentDesc.ByteWidth) - expectedByteOffset;
+    const uint64_t validWindowBytes = RDCMIN(expectedByteSize, availableBytes);
+    if(data.size() != validWindowBytes)
+      return StringFormat::Fmt(
+          "data must contain the complete valid CBuffer window (%llu bytes), but contains %llu",
+          (unsigned long long)validWindowBytes, (unsigned long long)data.size());
+  }
+
+  EventCBufferOverrideKey key = {eventId, stage, slot, registerSpace};
+  auto configuredIt = m_EventCBufferOverrides.find(key);
+
+  ID3D11Buffer *shadow =
+      configuredIt == m_EventCBufferOverrides.end() ? NULL : configuredIt->second.shadow;
+  if(shadow != NULL)
+  {
+    D3D11_BUFFER_DESC desc = {};
+    shadow->GetDesc(&desc);
+    if(desc.ByteWidth != data.size())
+      shadow = NULL;
+  }
+
+  ID3D11Buffer *newShadow = NULL;
+  if(shadow == NULL)
+  {
+    D3D11_BUFFER_DESC desc = {};
+    desc.ByteWidth = (UINT)data.size();
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    HRESULT hr = m_pDevice->CreateBuffer(&desc, NULL, &newShadow);
+    if(FAILED(hr) || newShadow == NULL)
+      return StringFormat::Fmt("Failed to create the event CBuffer shadow: %s", ToStr(hr).c_str());
+  }
+
+  EventCBufferOverride &configured = m_EventCBufferOverrides[key];
+  if(newShadow != NULL)
+  {
+    SAFE_RELEASE(configured.shadow);
+    configured.shadow = newShadow;
+  }
+
+  configured.expectedShader = expectedShader;
+  configured.expectedBuffer = expectedBuffer;
+  configured.expectedByteOffset = expectedByteOffset;
+  configured.expectedByteSize = expectedByteSize;
+  configured.data = data;
+
+  ClearPostVSCache();
+  return {};
+}
+
+void D3D11Replay::ClearEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                            uint32_t registerSpace)
+{
+  RestoreEventCBufferOverrides();
+
+  EventCBufferOverrideKey key = {eventId, stage, slot, registerSpace};
+  auto it = m_EventCBufferOverrides.find(key);
+  if(it == m_EventCBufferOverrides.end())
+    return;
+
+  SAFE_RELEASE(it->second.shadow);
+  m_EventCBufferOverrides.erase(it);
+  ClearPostVSCache();
+}
+
+void D3D11Replay::ClearEventCBufferOverrides()
+{
+  RestoreEventCBufferOverrides();
+
+  for(auto it = m_EventCBufferOverrides.begin(); it != m_EventCBufferOverrides.end(); ++it)
+    SAFE_RELEASE(it->second.shadow);
+
+  m_EventCBufferOverrides.clear();
+  ClearPostVSCache();
+}
+
+rdcstr D3D11Replay::ApplyEventCBufferOverrides(uint32_t eventId)
+{
+  if(!m_AppliedEventCBufferOverrides.empty())
+    return "A previous event-scoped CBuffer override was not restored";
+
+  rdcarray<std::pair<const EventCBufferOverrideKey *, EventCBufferOverride *> > pending;
+  for(auto it = m_EventCBufferOverrides.begin(); it != m_EventCBufferOverrides.end(); ++it)
+  {
+    if(it->first.eventId == eventId)
+      pending.push_back({&it->first, &it->second});
+  }
+
+  if(pending.empty())
+    return {};
+
+  // Validate every binding against the captured pipeline before updating or binding any shadow.
+  for(const std::pair<const EventCBufferOverrideKey *, EventCBufferOverride *> &item : pending)
+  {
+    rdcstr validation = ValidateEventCBufferBinding(
+        eventId, item.first->stage, item.first->slot, item.first->registerSpace,
+        item.second->expectedShader,
+        item.second->expectedBuffer, item.second->expectedByteOffset,
+        item.second->expectedByteSize);
+    if(!validation.empty())
+      return validation;
+
+    if(item.second->shadow == NULL)
+      return "An event-scoped CBuffer shadow is no longer valid";
+
+    if(item.second->expectedBuffer != ResourceId())
+    {
+      D3D11RenderState::Shader *bound = GetEventOverrideStage(
+          m_pImmediateContext->GetCurrentPipelineState(), item.first->stage);
+      D3D11_BUFFER_DESC currentDesc = {};
+      bound->ConstantBuffers[item.first->slot]->GetDesc(&currentDesc);
+
+      if(item.second->expectedByteOffset > uint64_t(currentDesc.ByteWidth))
+        return "The expected CBuffer byte offset now exceeds the live buffer byte width";
+
+      const uint64_t availableBytes =
+          uint64_t(currentDesc.ByteWidth) - item.second->expectedByteOffset;
+      const uint64_t validWindowBytes = RDCMIN(item.second->expectedByteSize, availableBytes);
+      if(item.second->data.size() != validWindowBytes)
+        return "The event CBuffer data no longer covers the complete valid binding window";
+    }
+  }
+
+  // Upload every shadow first. A Map failure leaves the captured pipeline completely untouched.
+  for(const std::pair<const EventCBufferOverrideKey *, EventCBufferOverride *> &item : pending)
+  {
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    ID3D11Buffer *realShadow = UNWRAP(WrappedID3D11Buffer, item.second->shadow);
+    HRESULT hr = m_pImmediateContext->GetReal()->Map(realShadow, 0, D3D11_MAP_WRITE_DISCARD, 0,
+                                                     &mapped);
+    m_pDevice->CheckHRESULT(hr);
+    if(FAILED(hr))
+      return StringFormat::Fmt("Failed to update the event CBuffer shadow: %s", ToStr(hr).c_str());
+
+    if(mapped.pData == NULL)
+    {
+      m_pImmediateContext->GetReal()->Unmap(realShadow, 0);
+      return "Updating the event CBuffer shadow returned a null mapping";
+    }
+
+    memcpy(mapped.pData, item.second->data.data(), item.second->data.size());
+    m_pImmediateContext->GetReal()->Unmap(realShadow, 0);
+  }
+
+  D3D11RenderState *state = m_pImmediateContext->GetCurrentPipelineState();
+  m_AppliedEventCBufferOverrides.reserve(pending.size());
+
+  for(const std::pair<const EventCBufferOverrideKey *, EventCBufferOverride *> &item : pending)
+  {
+    D3D11RenderState::Shader *bound = GetEventOverrideStage(state, item.first->stage);
+
+    AppliedEventCBufferOverride applied;
+    applied.stage = item.first->stage;
+    applied.slot = item.first->slot;
+    applied.original = bound->ConstantBuffers[applied.slot];
+    applied.firstConstant = bound->CBOffsets[applied.slot];
+    applied.numConstants = bound->CBCounts[applied.slot];
+    IntAddRef(applied.original);
+
+    m_AppliedEventCBufferOverrides.push_back(applied);
+
+    UINT firstConstant = 0;
+    UINT numConstants = (UINT)(item.second->data.size() / 16);
+    BindEventOverrideCBuffer(m_pImmediateContext, applied.stage, applied.slot, item.second->shadow,
+                             firstConstant, numConstants);
+  }
+
+  return {};
+}
+
+void D3D11Replay::RestoreEventCBufferOverrides()
+{
+  for(size_t i = m_AppliedEventCBufferOverrides.size(); i > 0; --i)
+  {
+    AppliedEventCBufferOverride &applied = m_AppliedEventCBufferOverrides[i - 1];
+
+    BindEventOverrideCBuffer(m_pImmediateContext, applied.stage, applied.slot, applied.original,
+                             applied.firstConstant, applied.numConstants);
+    IntRelease(applied.original);
+  }
+
+  m_AppliedEventCBufferOverrides.clear();
 }
 
 void D3D11Replay::ReplaceResource(ResourceId from, ResourceId to)

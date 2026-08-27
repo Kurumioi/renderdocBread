@@ -66,6 +66,7 @@ PyTypeObject **SbkPySide2_QtWidgetsTypes = NULL;
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QThread>
 #include <QTimer>
@@ -135,6 +136,7 @@ static PyMethodDef OutputRedirector_methods[] = {
 
 PyObject *PythonContext::main_dict = NULL;
 QMap<rdcstr, PyObject *> PythonContext::extensions;
+QMap<rdcstr, PyObject *> PythonContext::internalIntegrations;
 
 static PyObject *current_global_handle = NULL;
 
@@ -215,9 +217,9 @@ void FetchException(QString &typeStr, QString &valueStr, int &finalLine, QList<Q
     }
   }
 
-  Py_DecRef(exObj);
-  Py_DecRef(valueObj);
-  Py_DecRef(tracebackObj);
+  Py_XDECREF(exObj);
+  Py_XDECREF(valueObj);
+  Py_XDECREF(tracebackObj);
 }
 
 void PythonContext::GlobalInit()
@@ -513,13 +515,31 @@ PythonContext::PythonContext(QObject *parent) : QObject(parent)
 
 PythonContext::~PythonContext()
 {
-  PyGILState_STATE gil = PyGILState_Ensure();
-  if(m_Completer)
-    Py_DecRef(m_Completer);
-  PyGILState_Release(gil);
+  if(outputTicker)
+  {
+    outputTicker->stop();
+    QObject::disconnect(outputTicker, NULL, this, NULL);
+  }
 
-  // do a final tick to gather any remaining output
-  outputTick();
+  if(initialised())
+  {
+    PyGILState_STATE gil = PyGILState_Ensure();
+    Py_XDECREF(m_Completer);
+    m_Completer = NULL;
+    PyGILState_Release(gil);
+  }
+  else
+  {
+    // Python may already be finalised when a context's redirector is released
+    // during interpreter teardown. Never re-enter a dead interpreter.
+    m_Completer = NULL;
+    context_namespace = NULL;
+  }
+
+  // Do a final tick only while the integration is live. During Py_Finalize the
+  // redirector can destroy this object after the interpreter fence is raised.
+  if(initialised())
+    outputTick();
 }
 
 bool PythonContext::CheckInterfaces(rdcstr &log)
@@ -564,10 +584,20 @@ bool PythonContext::CheckInterfaces(rdcstr &log)
 
 void PythonContext::Finish()
 {
+  if(!initialised())
+  {
+    context_namespace = NULL;
+    return;
+  }
+
   PyGILState_STATE gil = PyGILState_Ensure();
 
   // release our external handle to globals. It'll now only be ref'd from inside
-  Py_XDECREF(context_namespace);
+  // Clearing the member first is essential: its redirector dealloc can delete
+  // this PythonContext synchronously on the UI thread.
+  PyObject *context = context_namespace;
+  context_namespace = NULL;
+  Py_XDECREF(context);
 
   PyGILState_Release(gil);
 }
@@ -583,6 +613,522 @@ void PythonContext::ResumePythonThreading()
   m_SavedThread = NULL;
 }
 
+static void RemoveInsertedPythonSearchPath(PyObject *syspath, PyObject *path)
+{
+  if(!syspath || !PyList_Check(syspath) || !path)
+    return;
+
+  // Remove only the exact object inserted by LoadInternalIntegration. An equal path may have
+  // existed before the integration loaded and must remain in the caller's sys.path.
+  for(Py_ssize_t i = 0; i < PyList_Size(syspath); i++)
+  {
+    if(PyList_GetItem(syspath, i) == path)
+    {
+      PySequence_DelItem(syspath, i);
+      return;
+    }
+  }
+}
+
+static bool PythonModuleIsWithinPackage(PyObject *module, const QString &canonicalPackage,
+                                        Qt::CaseSensitivity pathCase)
+{
+  if(!module)
+    return false;
+
+  PyObject *moduleFile = PyObject_SafeGetAttrString(module, "__file__");
+  if(!moduleFile)
+  {
+    PyErr_Clear();
+    return false;
+  }
+
+  const QString canonicalFile = QFileInfo(ToQStr(moduleFile)).canonicalFilePath();
+  Py_DECREF(moduleFile);
+  return !canonicalFile.isEmpty() &&
+         canonicalFile.startsWith(canonicalPackage + QLatin1Char('/'), pathCase);
+}
+
+static bool ValidateInternalIntegrationModules(const QString &moduleName,
+                                               const QString &canonicalPackage,
+                                               Qt::CaseSensitivity pathCase)
+{
+  PyObject *modules = PyImport_GetModuleDict();    // borrowed
+  PyObject *keys = PyDict_Keys(modules);
+  if(!keys)
+  {
+    PyErr_Clear();
+    return false;
+  }
+
+  const QString childPrefix = moduleName + QLatin1Char('.');
+  bool valid = true;
+  for(Py_ssize_t i = 0; i < PyList_Size(keys); i++)
+  {
+    PyObject *key = PyList_GetItem(keys, i);    // borrowed
+    if(!PyUnicode_Check(key))
+      continue;
+
+    const QString name = ToQStr(key);
+    if(name != moduleName && !name.startsWith(childPrefix))
+      continue;
+
+    if(!PythonModuleIsWithinPackage(PyDict_GetItem(modules, key), canonicalPackage, pathCase))
+    {
+      valid = false;
+      break;
+    }
+  }
+
+  Py_DECREF(keys);
+  PyErr_Clear();
+  return valid;
+}
+
+static void RemoveFailedInternalIntegrationModules(const QString &moduleName,
+                                                   const QString &canonicalPackage,
+                                                   Qt::CaseSensitivity pathCase,
+                                                   PyObject *rootModule)
+{
+  PyObject *modules = PyImport_GetModuleDict();    // borrowed
+  PyObject *keys = PyDict_Keys(modules);
+  if(!keys)
+  {
+    PyErr_Clear();
+    return;
+  }
+
+  const QString childPrefix = moduleName + QLatin1Char('.');
+  for(Py_ssize_t i = 0; i < PyList_Size(keys); i++)
+  {
+    PyObject *key = PyList_GetItem(keys, i);    // borrowed
+    if(!PyUnicode_Check(key))
+      continue;
+
+    const QString name = ToQStr(key);
+    PyObject *candidate = PyDict_GetItem(modules, key);    // borrowed
+    const bool isRoot = name == moduleName && candidate == rootModule;
+    const bool isOwnedChild = name.startsWith(childPrefix) &&
+                              PythonModuleIsWithinPackage(candidate, canonicalPackage, pathCase);
+    if((isRoot || isOwnedChild) && PyDict_DelItem(modules, key) != 0)
+      PyErr_Clear();
+  }
+
+  Py_DECREF(keys);
+  PyErr_Clear();
+}
+
+QString PythonContext::LoadInternalIntegration(ICaptureContext &ctx, const rdcstr &integration,
+                                               const QString &packageRoot)
+{
+  if(!initialised())
+    return tr("Python is not initialised; the built-in integration was not loaded.");
+
+  if(qApp->thread() != QThread::currentThread())
+    return tr("Built-in integrations must be loaded on the UI thread.");
+
+  const QString moduleName = QString(integration);
+  // i18n-ignore: validation regex for a Python module identifier
+  static const QRegularExpression modulePattern(lit("^[A-Za-z_][A-Za-z0-9_]*$"));
+  if(!modulePattern.match(moduleName).hasMatch())
+    return tr("The built-in integration module name is invalid: %1").arg(moduleName);
+
+  const QString applicationRoot = QDir(QCoreApplication::applicationDirPath()).canonicalPath();
+  const QString canonicalRoot = QDir(packageRoot).canonicalPath();
+  const QFileInfo packageEntry(QDir(canonicalRoot).filePath(moduleName));
+  const QString canonicalPackage = QDir(packageEntry.filePath()).canonicalPath();
+  // i18n-ignore: fixed Python package entry-point filename
+  QFileInfo initFile(QDir(canonicalPackage).filePath(lit("__init__.py")));
+
+#if defined(Q_OS_WIN)
+  const Qt::CaseSensitivity pathCase = Qt::CaseInsensitive;
+#else
+  const Qt::CaseSensitivity pathCase = Qt::CaseSensitive;
+#endif
+
+  if(applicationRoot.isEmpty() || canonicalRoot.isEmpty() || canonicalPackage.isEmpty() ||
+     packageEntry.isSymLink() || !initFile.isFile() || initFile.isSymLink() ||
+     QFileInfo(canonicalPackage).dir().canonicalPath().compare(canonicalRoot, pathCase) != 0 ||
+     (canonicalRoot.compare(applicationRoot, pathCase) != 0 &&
+      !canonicalRoot.startsWith(applicationRoot + QLatin1Char('/'), pathCase)))
+  {
+    return tr("The built-in integration package is missing or outside the application directory: "
+              "%1")
+        .arg(QDir::toNativeSeparators(packageRoot));
+  }
+
+  if(internalIntegrations.contains(integration))
+    return QString();
+
+  PyGILState_STATE gil = PyGILState_Ensure();
+  QString ret;
+  PyObject *sysobj = PyDict_GetItemString(main_dict, "sys");
+  PyObject *syspath = PyObject_SafeGetAttrString(sysobj, "path");
+  PyObject *pathObject = NULL;
+  PyObject *module = NULL;
+  PyObject *startFunction = NULL;
+  PyObject *pyctx = NULL;
+  PyObject *retval = NULL;
+  PyObject *moduleFile = NULL;
+  bool startInvoked = false;
+
+  if(!syspath || !PyList_Check(syspath))
+  {
+    ret = tr("Couldn't get Python sys.path; the built-in integration was not loaded.");
+    goto cleanup;
+  }
+
+  {
+    const QByteArray rootBytes = canonicalRoot.toUtf8();
+    pathObject = PyUnicode_FromStringAndSize(rootBytes.constData(), rootBytes.size());
+  }
+  if(!pathObject || PyList_Insert(syspath, 0, pathObject) != 0)
+  {
+    ret = tr("Couldn't add the built-in integration directory to Python's search path.");
+    goto cleanup;
+  }
+
+  current_global_handle = PyObject_SafeGetAttrString(sysobj, "_renderdoc_internal");
+  if(!current_global_handle)
+  {
+    ret = tr("Couldn't access qrenderdoc's internal Python handle.");
+    goto cleanup;
+  }
+
+  module = PyImport_ImportModule(integration.c_str());
+  if(!module)
+    goto python_error;
+
+  moduleFile = PyObject_SafeGetAttrString(module, "__file__");
+  if(!moduleFile ||
+     QFileInfo(ToQStr(moduleFile)).canonicalFilePath().compare(initFile.canonicalFilePath(),
+                                                               pathCase) != 0)
+  {
+    ret = tr("Python imported the built-in integration from an unexpected location.");
+    goto cleanup;
+  }
+
+  // Relative imports are also import-cache lookups. Validate every loaded package child before
+  // start() can use it so a pre-populated sys.modules entry cannot shadow first-party code.
+  if(!ValidateInternalIntegrationModules(moduleName, canonicalPackage, pathCase))
+  {
+    ret = tr("Python imported the built-in integration from an unexpected location.");
+    goto cleanup;
+  }
+
+  if(PyModule_AddObject(module, "_renderdoc_internal", current_global_handle) != 0)
+  {
+    ret = tr("Couldn't attach qrenderdoc's internal Python handle to the built-in integration.");
+    goto cleanup;
+  }
+  current_global_handle = NULL;
+
+  startFunction = PyObject_SafeGetAttrString(module, "start");
+  if(!startFunction || !PyCallable_Check(startFunction))
+  {
+    ret = tr("The built-in integration does not provide a callable start() entry point.");
+    goto cleanup;
+  }
+
+  pyctx = PassObjectToPython((rdcstr(TypeName<ICaptureContext>()) + " *").c_str(), &ctx);
+  if(!pyctx)
+  {
+    ret = tr("Couldn't pass qrenderdoc's capture context to the built-in integration.");
+    goto cleanup;
+  }
+
+  startInvoked = true;
+  retval = PyObject_CallFunction(startFunction, "sO", MAJOR_MINOR_VERSION_STRING, pyctx);
+  if(!retval)
+    goto python_error;
+
+  if(PyModule_AddObject(module, "pyrenderdoc", pyctx) != 0)
+  {
+    ret = tr("Couldn't attach the capture context to the built-in integration.");
+    goto cleanup;
+  }
+  pyctx = NULL;
+
+  internalIntegrations[integration] = module;
+  module = NULL;
+  goto cleanup;
+
+python_error:
+  {
+    QString typeStr;
+    QString valueStr;
+    int finalLine = -1;
+    QList<QString> frames;
+    FetchException(typeStr, valueStr, finalLine, frames);
+    ret = tr("The built-in integration failed to start: %1: %2").arg(typeStr, valueStr);
+  }
+
+cleanup:
+  if(module)
+  {
+    if(startInvoked)
+    {
+      // start() may have installed capture viewers, timers, panels, or a sidecar owner before
+      // raising. Roll all of that back while the capture context and MiniQt helper are still
+      // alive. Keep the original startup error as the result; rollback failures are diagnostic
+      // only.
+      PyErr_Clear();
+      PyObject *stopFunction = PyObject_SafeGetAttrString(module, "stop");
+      if(stopFunction && PyCallable_Check(stopFunction))
+      {
+        PyObject *stopResult = PyObject_CallFunction(stopFunction, "");
+        if(!stopResult)
+        {
+          QString typeStr;
+          QString valueStr;
+          int finalLine = -1;
+          QList<QString> frames;
+          FetchException(typeStr, valueStr, finalLine, frames);
+          qCritical() << "Built-in integration" << QString(integration)
+                      << "startup rollback failed:" << typeStr << ":" << valueStr;
+        }
+        Py_XDECREF(stopResult);
+      }
+      Py_XDECREF(stopFunction);
+    }
+
+    // A failed package must not remain import-cached. Remove the exact root and only child modules
+    // whose canonical files belong to this fixed package. Unrelated same-prefix modules remain in
+    // place and will make a later retry fail the validation above instead of being executed.
+    RemoveFailedInternalIntegrationModules(moduleName, canonicalPackage, pathCase, module);
+  }
+  RemoveInsertedPythonSearchPath(syspath, pathObject);
+  Py_XDECREF(moduleFile);
+  Py_XDECREF(retval);
+  Py_XDECREF(pyctx);
+  Py_XDECREF(startFunction);
+  Py_XDECREF(module);
+  Py_XDECREF(pathObject);
+  Py_XDECREF(syspath);
+  Py_XDECREF(current_global_handle);
+  current_global_handle = NULL;
+  ProcessDecRefQueue();
+  PyErr_Clear();
+  PyGILState_Release(gil);
+  return ret;
+}
+
+QString PythonContext::InvokeInternalIntegration(const rdcstr &integration, const char *function,
+                                                 const QStringList &arguments, QString *error)
+{
+  if(error)
+    error->clear();
+  if(!initialised())
+  {
+    if(error)
+      *error = tr("Python is not initialised.");
+    return QString();
+  }
+
+  if(qApp->thread() != QThread::currentThread())
+  {
+    if(error)
+      *error = tr("Built-in integration calls must run on the UI thread.");
+    return QString();
+  }
+
+  PyGILState_STATE gil = PyGILState_Ensure();
+  QString result;
+  PyObject *module = internalIntegrations.value(integration, NULL);
+  PyObject *callable = NULL;
+  PyObject *tuple = NULL;
+  PyObject *retval = NULL;
+
+  if(!module)
+  {
+    if(error)
+      *error = tr("The built-in integration is not loaded.");
+    goto cleanup;
+  }
+
+  callable = PyObject_SafeGetAttrString(module, function);
+  if(!callable || !PyCallable_Check(callable))
+  {
+    if(error)
+      *error = tr("The built-in integration entry point is unavailable.");
+    goto cleanup;
+  }
+
+  tuple = PyTuple_New(arguments.count());
+  if(!tuple)
+    goto python_error;
+  for(int i = 0; i < arguments.count(); i++)
+  {
+    const QByteArray encoded = arguments[i].toUtf8();
+    PyObject *value = PyUnicode_FromStringAndSize(encoded.constData(), encoded.size());
+    if(!value)
+      goto python_error;
+    PyTuple_SET_ITEM(tuple, i, value);
+  }
+
+  retval = PyObject_CallObject(callable, tuple);
+  if(!retval)
+    goto python_error;
+  if(!PyUnicode_Check(retval))
+  {
+    if(error)
+      *error = tr("The built-in integration returned an invalid result.");
+    goto cleanup;
+  }
+
+  {
+    Py_ssize_t size = 0;
+    const char *utf8 = PyUnicode_AsUTF8AndSize(retval, &size);
+    if(!utf8)
+      goto python_error;
+    result = QString::fromUtf8(utf8, int(size));
+  }
+  goto cleanup;
+
+python_error:
+  {
+    QString typeStr;
+    QString valueStr;
+    int finalLine = -1;
+    QList<QString> frames;
+    FetchException(typeStr, valueStr, finalLine, frames);
+    if(error)
+      *error = tr("The built-in integration call failed: %1: %2").arg(typeStr, valueStr);
+  }
+
+cleanup:
+  Py_XDECREF(retval);
+  Py_XDECREF(tuple);
+  Py_XDECREF(callable);
+  ProcessDecRefQueue();
+  PyErr_Clear();
+  PyGILState_Release(gil);
+  return result;
+}
+
+bool PythonContext::ShutdownInternalIntegrations()
+{
+  if(!initialised() || internalIntegrations.isEmpty())
+    return true;
+
+  if(qApp->thread() != QThread::currentThread())
+  {
+    qFatal("PythonContext::ShutdownInternalIntegrations MUST be called from the UI thread");
+    return false;
+  }
+
+  PyGILState_STATE gil = PyGILState_Ensure();
+  bool allStopped = true;
+  const QList<rdcstr> names = internalIntegrations.keys();
+  for(const rdcstr &name : names)
+  {
+    PyObject *integration = internalIntegrations.value(name, NULL);
+    PyObject *stopFunction = PyObject_SafeGetAttrString(integration, "stop");
+    bool stopped = false;
+    if(stopFunction && PyCallable_Check(stopFunction))
+    {
+      PyObject *retval = PyObject_CallFunction(stopFunction, "");
+      if(!retval)
+      {
+        QString typeStr;
+        QString valueStr;
+        int finalLine = -1;
+        QList<QString> frames;
+        FetchException(typeStr, valueStr, finalLine, frames);
+        qCritical() << "Built-in integration" << QString(name) << "stop() failed:" << typeStr
+                    << ":" << valueStr;
+      }
+      else
+      {
+        stopped = true;
+      }
+      Py_XDECREF(retval);
+    }
+    else
+    {
+      qWarning() << "Built-in integration" << QString(name)
+                 << "has no callable stop() entry point";
+    }
+    Py_XDECREF(stopFunction);
+
+    if(stopped)
+    {
+      internalIntegrations.remove(name);
+      Py_XDECREF(integration);
+    }
+    else
+    {
+      // Keep the module alive so GlobalShutdown can retry after bounded worker cancellation. If
+      // it still cannot stop, the interpreter is intentionally leaked until process exit instead
+      // of finalising underneath a live Python QRunnable.
+      allStopped = false;
+    }
+  }
+
+  ProcessDecRefQueue();
+  PyErr_Clear();
+  PyGILState_Release(gil);
+  return allStopped;
+}
+
+void PythonContext::ShutdownExtensions()
+{
+  if(!initialised() || extensions.isEmpty())
+    return;
+
+  // Extension unregister callbacks manipulate qrenderdoc widgets and capture
+  // viewers, so they must run while CaptureContext and MiniQtHelper are alive.
+  if(qApp->thread() != QThread::currentThread())
+  {
+    qFatal("PythonContext::ShutdownExtensions MUST be called from the UI thread");
+    return;
+  }
+
+  PyGILState_STATE gil = PyGILState_Ensure();
+
+  const QList<rdcstr> names = extensions.keys();
+  for(const rdcstr &name : names)
+  {
+    PyObject *extension = extensions.value(name, NULL);
+    if(!extension)
+      continue;
+
+    PyObject *unregister_func = PyObject_SafeGetAttrString(extension, "unregister");
+    if(unregister_func && PyCallable_Check(unregister_func))
+    {
+      PyObject *retval = PyObject_CallFunction(unregister_func, "");
+      if(retval == NULL)
+      {
+        QString typeStr;
+        QString valueStr;
+        int finalLine = -1;
+        QList<QString> frames;
+        FetchException(typeStr, valueStr, finalLine, frames);
+        qCritical() << "Extension" << QString(name) << "unregister() failed:" << typeStr << ":"
+                    << valueStr;
+        PyErr_Clear();
+      }
+      Py_XDECREF(retval);
+    }
+    else if(unregister_func)
+    {
+      qWarning() << "Extension" << QString(name) << "has a non-callable unregister attribute";
+    }
+
+    Py_XDECREF(unregister_func);
+  }
+
+  // The map owns the new references returned by ImportModule/ReloadModule.
+  // sys.modules keeps imported modules alive until normal interpreter teardown.
+  for(PyObject *extension : extensions)
+    Py_XDECREF(extension);
+  extensions.clear();
+
+  ProcessDecRefQueue();
+  PyErr_Clear();
+  PyGILState_Release(gil);
+}
+
 void PythonContext::GlobalShutdown()
 {
   if(!initialised())
@@ -595,26 +1141,73 @@ void PythonContext::GlobalShutdown()
     return;
   }
 
-  // acquire the GIL, so we can shut down
+  // CaptureContext normally performs this while integration/extension-facing UI objects are still
+  // valid. Keep a final idempotent fallback for early-exit paths.
+  const bool internalIntegrationsStopped = ShutdownInternalIntegrations();
+  ShutdownExtensions();
+
+  if(!internalIntegrationsStopped || !internalIntegrations.isEmpty())
+  {
+    qCritical() << "Python finalisation skipped because a built-in integration still owns live "
+                   "workers";
+    return;
+  }
+
+  // Acquire the GIL and drain deferred SWIG references before raising the
+  // shutdown fence. Late Qt/PythonContext destructors see main_dict == NULL
+  // and must not re-enter Python while Py_Finalize releases module globals.
   PyGILState_Ensure();
+  ProcessDecRefQueue();
+  internalIntegrations.clear();
+  extensions.clear();
+  current_global_handle = NULL;
+  main_dict = NULL;
 
   Py_Finalize();
+}
+
+static QStringList NormaliseExtensionSearchPaths(const QStringList &candidates)
+{
+  QStringList ret;
+#if defined(Q_OS_WIN)
+  const Qt::CaseSensitivity pathCase = Qt::CaseInsensitive;
+#else
+  const Qt::CaseSensitivity pathCase = Qt::CaseSensitive;
+#endif
+
+  for(const QString &candidate : candidates)
+  {
+    const QString path = QDir::cleanPath(QDir(candidate).absolutePath());
+    bool duplicate = false;
+    for(const QString &existing : ret)
+      duplicate |= existing.compare(path, pathCase) == 0;
+    if(!duplicate)
+      ret.append(path);
+  }
+
+  return ret;
 }
 
 QStringList PythonContext::GetApplicationExtensionsPaths()
 {
   QStringList ret;
 
+  // Optional application extensions are kept for RenderDoc's public extension system. First-party
+  // integrations such as ReplayLab use LoadInternalIntegration() and never reach this search path.
+  QDir bundled(QCoreApplication::applicationDirPath());
+  if(bundled.cd(lit("extensions")) && bundled.exists())
+    ret.append(bundled.absolutePath());
+
   for(QString d : QStandardPaths::standardLocations(QStandardPaths::AppDataLocation))
   {
     QDir dir(d);
     dir.cd(lit("extensions"));
 
-    if(dir.exists())
+    if(dir.exists() && !ret.contains(dir.absolutePath()))
       ret.append(dir.absolutePath());
   }
 
-  return ret;
+  return NormaliseExtensionSearchPaths(ret);
 }
 
 void PythonContext::ProcessExtensionWork(std::function<void()> callback)
@@ -634,20 +1227,40 @@ QString PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extensi
 
   PyObject *syspath = PyObject_SafeGetAttrString(sysobj, "path");
 
-  if(!syspath)
-    qCritical() << "couldn't get sys.path";
-
-  // add extensions directories in
-  for(QString p : PythonContext::GetApplicationExtensionsPaths())
+  if(!syspath || !PyList_Check(syspath))
   {
-    QDir dir(p);
+    qCritical() << "couldn't get a list for sys.path";
+    Py_XDECREF(syspath);
+    return tr("Couldn't get a list for Python sys.path; extension was not loaded.\n");
+  }
 
-    rdcstr path = dir.absolutePath();
+  // Put the application-bundled extensions directory before the per-user
+  // directory and any interpreter paths. Remove exact duplicates first, then
+  // insert in reverse order so the ordering returned above is preserved. Keep
+  // these roots prioritised for extension submodule imports and later reloads.
+  const QStringList extensionPaths = PythonContext::GetApplicationExtensionsPaths();
+  for(int pathIndex = extensionPaths.count() - 1; pathIndex >= 0; pathIndex--)
+  {
+    QDir dir(extensionPaths[pathIndex]);
 
     if(dir.exists())
     {
-      PyObject *str = PyUnicode_FromString(path.c_str());
-      PyList_Append(syspath, str);
+      const QByteArray path = dir.absolutePath().toUtf8();
+      PyObject *str = PyUnicode_FromString(path.constData());
+      if(!str)
+      {
+        PyErr_Clear();
+        continue;
+      }
+      for(Py_ssize_t i = PyList_Size(syspath) - 1; i >= 0; i--)
+      {
+        const int equal = PyObject_RichCompareBool(PyList_GetItem(syspath, i), str, Py_EQ);
+        if(equal == 1)
+          PySequence_DelItem(syspath, i);
+        else if(equal < 0)
+          PyErr_Clear();
+      }
+      PyList_Insert(syspath, 0, str);
       Py_DecRef(str);
     }
   }
@@ -691,6 +1304,7 @@ QString PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extensi
       // discard the return value, regardless of error we don't abort the reload
       Py_XDECREF(retval);
     }
+    Py_XDECREF(unregister_func);
 
     if(reloadSuccess)
     {
@@ -752,9 +1366,19 @@ QString PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extensi
   // overwrite the value.
   if(ext)
   {
+    PyObject *previous = extensions.value(extension, NULL);
     extensions[extension] = ext;
+    // ImportModule/ReloadModule returns a new reference. The map owns exactly
+    // one such reference for each package, including when reload returns the
+    // same module pointer.
+    Py_XDECREF(previous);
 
-    PyModule_AddObject(ext, "_renderdoc_internal", current_global_handle);
+    if(PyModule_AddObject(ext, "_renderdoc_internal", current_global_handle) != 0)
+    {
+      qCritical() << "Couldn't set _renderdoc_internal in loaded extension";
+      Py_XDECREF(current_global_handle);
+    }
+    current_global_handle = NULL;
   }
 
   if(ext)
@@ -797,6 +1421,13 @@ QString PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extensi
           ret += tr("Couldn't set pyrenderdoc global in loaded module\n");
           ext = NULL;
         }
+        else
+        {
+          // PyModule_AddObject steals this new SWIG reference on success.
+          // register() may also retain the wrapper, so a second DECREF here
+          // would leave the module dictionary holding a dangling PyObject.
+          pyctx = NULL;
+        }
       }
 
       Py_XDECREF(pyctx);
@@ -807,6 +1438,7 @@ QString PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extensi
       ret += tr("register() function not found in extension\n");
       ext = NULL;
     }
+    Py_XDECREF(register_func);
   }
   else
   {
@@ -845,15 +1477,31 @@ QString PythonContext::LoadExtension(ICaptureContext &ctx, const rdcstr &extensi
     }
   }
 
-  Py_ssize_t len = PyList_Size(syspath);
-  PyList_SetSlice(syspath, len - 1, len, NULL);
-
   Py_DecRef(syspath);
 
+  Py_XDECREF(current_global_handle);
   current_global_handle = NULL;
 
   return ret;
 }
+
+#if ENABLE_UNIT_TESTS
+
+#include "3rdparty/catch/catch.hpp"
+
+TEST_CASE("Extension search paths retain bundled-first order and remove duplicates",
+          "[qrenderdoc][python][extensions]")
+{
+  QStringList candidates = {lit("C:/ReplayLab/extensions"), lit("C:/User/extensions"),
+                            lit("C:/ReplayLab/extensions")};
+  const QStringList paths = NormaliseExtensionSearchPaths(candidates);
+
+  REQUIRE(paths.count() == 2);
+  CHECK(bool(paths[0] == QDir::cleanPath(QDir(candidates[0]).absolutePath())));
+  CHECK(bool(paths[1] == QDir::cleanPath(QDir(candidates[1]).absolutePath())));
+}
+
+#endif
 
 void PythonContext::ConvertPyArgs(const ExtensionCallbackData &data,
                                   rdcarray<rdcpair<rdcstr, PyObject *>> &args)

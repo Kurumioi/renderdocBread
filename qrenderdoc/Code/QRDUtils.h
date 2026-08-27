@@ -71,6 +71,32 @@ QString ToQStr(const ShaderStage stage, const GraphicsAPI apitype);
 QString ToQStr(const AddressMode addr, const GraphicsAPI apitype);
 QString ToQStr(const ShadingRateCombiner addr, const GraphicsAPI apitype);
 
+// These helpers are deliberately restricted to enums which are presented as UI labels. ToQStr()
+// remains the stable English representation for serialisation, scripts, comparisons, API tokens,
+// resource names, and diagnostics. Add a dedicated overload here when a new enum is intentionally
+// exposed as translated UI text; do not add a generic ToQDisplayStr template.
+QString ToQDisplayStr(const ResourceUsage usage);
+QString ToQDisplayStr(const ResourceUsage usage, const GraphicsAPI apitype);
+QString ToQDisplayStr(const ShaderStage stage);
+QString ToQDisplayStr(const ShaderStage stage, const GraphicsAPI apitype);
+QString ToQDisplayStr(const ShaderStageMask stages, const GraphicsAPI apitype);
+QString ToQDisplayStr(const AddressMode addr);
+QString ToQDisplayStr(const AddressMode addr, const GraphicsAPI apitype);
+QString ToQDisplayStr(const ShadingRateCombiner combiner);
+QString ToQDisplayStr(const ShadingRateCombiner combiner, const GraphicsAPI apitype);
+QString ToQDisplayStr(const EnvSep separator);
+QString ToQDisplayStr(const DescriptorType type);
+QString ToQDisplayStr(const TextureType type);
+QString ToQDisplayStr(const FilterMode mode);
+QString ToQDisplayStr(const FilterFunction function);
+QString ToQDisplayStr(const CompareFunction function);
+QString ToQDisplayStr(const YcbcrConversion conversion);
+QString ToQDisplayStr(const YcbcrRange range);
+QString ToQDisplayStr(const ChromaSampleLocation location);
+QString ToQDisplayStr(const MessageSource source);
+QString ToQDisplayStr(const MessageSeverity severity);
+QString ToQDisplayStr(const MessageCategory category);
+
 inline QMetaType::Type GetVariantMetatype(const QVariant &v)
 {
   // this is explicitly called out by the documentation as the recommended process:
@@ -1026,6 +1052,7 @@ class QElapsedTimer;
 typedef std::function<float()> ProgressUpdateMethod;
 typedef std::function<bool()> ProgressFinishedMethod;
 typedef std::function<void()> ProgressCancelMethod;
+typedef std::function<QString()> ProgressStatusMethod;
 
 QStringList ParseArgsList(const QString &args);
 bool IsRunningAsAdmin();
@@ -1038,6 +1065,14 @@ void RevealFilenameInExternalFileBrowser(const QString &filePath);
 void ShowProgressDialog(QWidget *window, const QString &labelText, ProgressFinishedMethod finished,
                         ProgressUpdateMethod update = ProgressUpdateMethod(),
                         ProgressCancelMethod cancel = ProgressCancelMethod());
+
+// Displays the same modal progress workflow with a second, live status line below the progress
+// bar. This is a separate helper so existing ShowProgressDialog callers and behaviour remain
+// unchanged.
+void ShowProgressDialogWithStatus(
+    QWidget *window, const QString &labelText, ProgressFinishedMethod finished,
+    ProgressUpdateMethod update, ProgressStatusMethod status,
+    ProgressCancelMethod cancel = ProgressCancelMethod());
 
 void UpdateTransferProgress(qint64 xfer, qint64 total, QElapsedTimer *timer,
                             QProgressBar *progressBar, QLabel *progressLabel, QString progressText);

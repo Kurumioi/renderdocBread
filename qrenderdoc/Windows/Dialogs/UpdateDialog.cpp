@@ -167,11 +167,15 @@ void UpdateDialog::on_update_clicked()
 
     if(running > 0)
     {
+      const QString captureWarning =
+          running > 1
+              ? tr("RenderDoc is currently capturing and cannot update until these programs are "
+                   "closed:\n\n")
+              : tr("RenderDoc is currently capturing and cannot update until this program is "
+                   "closed:\n\n");
+
       RDDialog::critical(
-          this, tr("RenderDoc in use"),
-          tr("RenderDoc is currently capturing, cannot update until the program%1 closed:\n\n")
-                  .arg(running > 1 ? lit("s are") : lit(" is")) +
-              runningPrograms);
+          this, tr("RenderDoc in use"), captureWarning + runningPrograms);
       return;
     }
 

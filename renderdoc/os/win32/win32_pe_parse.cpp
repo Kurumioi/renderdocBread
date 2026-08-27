@@ -114,7 +114,7 @@ static void ParsePERva(const wchar_t* fileName)
 
   if (!insertRes.second)
   {
-    std::runtime_error("Failed to insert table");
+    throw std::runtime_error("Failed to insert table");
   }
 
   auto& rvaTable = insertRes.first->second;

@@ -47,6 +47,7 @@ public:
   ~SettingsDialog();
 
   void focusItem(QString item);
+  void focusPage(QString page);
 
 private slots:
   // automatic slots
@@ -61,6 +62,7 @@ private slots:
   void on_Font_GlobalScale_currentIndexChanged(int index);
   void Font_GlobalScale_returnPressed();
   void on_UIStyle_currentIndexChanged(int index);
+  void on_UILanguage_currentIndexChanged(int index);
   void on_tempDirectory_textEdited(const QString &temp);
   void on_saveDirectory_textEdited(const QString &save);
   void on_browseSaveCaptureDirectory_clicked();
@@ -89,6 +91,7 @@ private slots:
 
   // shader viewer
   void on_ShaderViewer_FriendlyNaming_toggled(bool checked);
+  void on_ShaderEditor_LanguageServer_editingFinished();
 
   void on_addShaderTool_clicked();
   void on_editShaderTool_clicked();

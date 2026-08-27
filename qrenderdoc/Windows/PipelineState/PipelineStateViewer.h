@@ -153,16 +153,14 @@ private:
   void ShowResourceContextMenu(RDTreeWidget *widget, const QPoint &pos, ResourceId id,
                                const rdcarray<EventUsage> &usage);
 
-  QString GenerateHLSLStub(const ShaderReflection *shaderDetails, const QString &entryFunc);
   IShaderViewer *EditShader(ResourceId id, ShaderStage shaderType, const rdcstr &entry,
                             ShaderCompileFlags compileFlags, KnownShaderTool knownTool,
                             ShaderEncoding shaderEncoding, const rdcstrpairs &files);
+  IShaderViewer *ViewShaderExplanation(ShaderStage shaderType, const rdcstr &entry,
+                                       const rdcstrpairs &files, const rdcstr &diagnostics);
   IShaderViewer *EditOriginalShaderSource(ResourceId id, const ShaderReflection *shaderDetails);
   IShaderViewer *EditDecompiledSource(const ShaderProcessingTool &tool, ResourceId id,
                                       const ShaderReflection *shaderDetails);
-
-  void MakeShaderVariablesHLSL(bool cbufferContents, const rdcarray<ShaderConstant> &vars,
-                               QString &struct_contents, QString &struct_defs);
 
   QPixmap m_TopoPixmaps[(int)Topology::PatchList + 1];
 

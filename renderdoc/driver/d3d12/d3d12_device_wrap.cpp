@@ -127,7 +127,7 @@ static RDResult DeferredPipelineCompile(ID3D12Device *device,
     if(SUCCEEDED(hr) && device2)
     {
       // Build a minimal compute pipeline stream with just CS, NodeMask, CachedPSO, Flags
-      // but NO root signature subobject — D3D12 will extract from shader bytecode
+      // but NO root signature subobject - D3D12 will extract from shader bytecode
       D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC expandedDesc(unwrappedDesc);
       D3D12_PACKED_PIPELINE_STATE_STREAM_DESC packedDesc(expandedDesc);
 

@@ -1,0 +1,168 @@
+"""Offline connection diagnostics for a ReplayLab AI profile."""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+
+from .bridge import BridgeClient
+from .mcp_tools import find_replaylab_mcp
+from .profiles import Profile
+from .process_env import (
+    agent_command_argv,
+    codex_profile_home,
+    is_packaged_windows_executable as _is_packaged_windows_executable,
+    resolve_agent_executable,
+    resolve_executable,
+)
+from .skills import SkillCatalog
+
+
+@dataclass(frozen=True, slots=True)
+class DoctorCheck:
+    name: str
+    status: str
+    detail: str
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "ok"
+
+
+def _command_path(command: str) -> str:
+    return resolve_executable(command)
+
+
+def run_doctor(
+    profile: Profile,
+    catalog: SkillCatalog,
+    *,
+    bridge: BridgeClient | None = None,
+    mcp_executable: Path | str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> list[DoctorCheck]:
+    """Run non-networked checks; no login or provider quota is consumed."""
+
+    checks: list[DoctorCheck] = []
+    version_ok = sys.version_info >= (3, 10)
+    checks.append(
+        DoctorCheck(
+            "python",
+            "ok" if version_ok else "error",
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        )
+    )
+
+    try:
+        profile.validate()
+        checks.append(DoctorCheck("profile", "ok", f"{profile.provider.title} / {profile.id}"))
+    except Exception as exc:
+        checks.append(DoctorCheck("profile", "error", str(exc)))
+
+    if profile.provider.kind == "model":
+        installed = importlib.util.find_spec("pydantic_ai") is not None
+        checks.append(
+            DoctorCheck(
+                "model-runtime",
+                "ok" if installed else "error",
+                "pydantic-ai available"
+                if installed
+                else "install replaylab-agenthost[model]",
+            )
+        )
+        try:
+            profile.resolve_api_key()
+            key_detail = (
+                "local/ADC authentication"
+                if not profile.key_env
+                else f"credential available via {profile.key_env} or the OS secure store"
+            )
+            checks.append(DoctorCheck("authentication", "ok", key_detail))
+        except Exception as exc:
+            checks.append(DoctorCheck("authentication", "error", str(exc)))
+    else:
+        argv = agent_command_argv(profile)
+        command = argv[0] if argv else ""
+        resolved = resolve_agent_executable(profile, environ=environ) if command else ""
+        packaged = bool(resolved and _is_packaged_windows_executable(resolved))
+        command_status = "error" if not resolved or packaged else "ok"
+        command_detail = resolved or f"command not found: {command}"
+        if packaged:
+            command_detail = (
+                f"{resolved} is a packaged WindowsApps executable and may reject child-process "
+                "launch; install the vendor CLI or configure an explicit launchable executable"
+            )
+        checks.append(
+            DoctorCheck(
+                "agent-command",
+                command_status,
+                command_detail,
+            )
+        )
+        if profile.provider.protocol == "codex-app-server":
+            home = codex_profile_home(profile, environ=environ)
+            checks.append(
+                DoctorCheck(
+                    "codex-mcp-registration",
+                    "ok",
+                    "runtime-managed filtered ReplayLab MCP in isolated Codex home: "
+                    + str(home),
+                )
+            )
+        if profile.provider.protocol == "acp":
+            trusted = profile.options.get("allow_unsandboxed_agent") is True
+            checks.append(
+                DoctorCheck(
+                    "acp-process-trust",
+                    "ok" if trusted else "error",
+                    "unsandboxed vendor process explicitly trusted"
+                    if trusted
+                    else "set allow_unsandboxed_agent=true only for a trusted official CLI",
+                )
+            )
+            installed = importlib.util.find_spec("acp") is not None
+            checks.append(
+                DoctorCheck(
+                    "acp-runtime",
+                    "ok" if installed else "error",
+                    "agent-client-protocol available"
+                    if installed
+                    else "install replaylab-agenthost[acp]",
+                )
+            )
+
+    try:
+        host = find_replaylab_mcp(mcp_executable)
+        checks.append(DoctorCheck("replaylab-mcp", "ok", str(host)))
+    except Exception as exc:
+        checks.append(DoctorCheck("replaylab-mcp", "error", str(exc)))
+
+    checks.append(
+        DoctorCheck(
+            "skills",
+            "ok" if catalog.skills else "error",
+            f"{len(catalog.skills)} validated skill(s)",
+        )
+    )
+
+    client = bridge or BridgeClient(timeout=1.0)
+    try:
+        instances = client.instances()
+        checks.append(
+            DoctorCheck(
+                "qrenderdoc",
+                "ok" if instances else "warning",
+                f"{len(instances)} live ReplayLab bridge instance(s)"
+                if instances
+                else "no live qrenderdoc bridge; start qrenderdoc and open a capture",
+            )
+        )
+    except Exception as exc:
+        checks.append(DoctorCheck("qrenderdoc", "warning", str(exc)))
+    return checks
+
+
+__all__ = ["DoctorCheck", "run_doctor"]

@@ -28,6 +28,7 @@
 #include <QMutexLocker>
 #include <QStandardPaths>
 #include "Code/QRDUtils.h"
+#include "Code/ScintillaSyntax.h"
 #include "Styles/StyleData.h"
 #include "QRDInterface.h"
 
@@ -450,6 +451,8 @@ bool PersistantConfig::SetStyle()
       QStyle *style = StyleData::availStyles[i].creator();
       Formatter::setPalette(style->standardPalette());
       QApplication::setStyle(style);
+      SetupFormatting();
+      RefreshSyntaxEditors();
       return true;
     }
   }

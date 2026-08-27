@@ -25,6 +25,7 @@
 #pragma once
 
 #include <QFrame>
+#include <QPointer>
 #include <QSemaphore>
 #include <QSet>
 #include <QStyledItemDelegate>
@@ -39,11 +40,13 @@ class RDTreeWidgetItem;
 struct ShaderDebugTrace;
 struct ShaderReflection;
 class ScintillaEdit;
+class CodeEditorService;
 class FindReplace;
 class QTableWidgetItem;
 class QKeyEvent;
 class QMouseEvent;
 class QComboBox;
+class QTimer;
 class QTextEdit;
 
 // from Scintilla
@@ -170,6 +173,7 @@ public:
   virtual void RunForward() override;
 
   virtual void ShowErrors(const rdcstr &errors) override;
+  virtual void SetExplanatoryMode(const rdcstr &reason) override;
 
   virtual void AddWatch(const rdcstr &variable) override;
 
@@ -207,6 +211,7 @@ private slots:
   void disassemble_typeChanged(int index);
   void watch_keyPress(QKeyEvent *event);
   void performFind();
+  void performIncrementalFind();
   void performFindAll();
   void resultsDoubleClick(int position, int line);
   void performReplace();
@@ -265,6 +270,9 @@ private:
   bool HasBookmarks();
 
   void SetFindTextFromCurrentWord();
+  void updateFindOverlayGeometry();
+  void closeFindOverlay();
+  void refreshFindHighlights(bool selectMatch);
 
   QString m_TooltipVarPath;
   int m_TooltipVarIndex = -1;
@@ -275,6 +283,8 @@ private:
   ICaptureContext &m_Ctx;
   const ShaderReflection *m_ShaderDetails = NULL;
   bool m_CustomShader = false;
+  bool m_ExplanatoryMode = false;
+  rdcstr m_ExplanatoryReason;
   ResourceId m_EditingShader;
   ShaderCompileFlags m_Flags;
   QList<ShaderEncoding> m_Encodings;
@@ -289,6 +299,7 @@ private:
   ScintillaEdit *m_Errors = NULL;
   ScintillaEdit *m_FindResults = NULL;
   QList<ScintillaEdit *> m_Scintillas;
+  CodeEditorService *m_CodeEditorService = NULL;
 
   // a map, from a source location to a list of instruction blocks with that location.
   // not every instruction with the instruction will be mapped to, only the first in each contiguous
@@ -302,6 +313,8 @@ private:
   QList<ScintillaEdit *> m_FileScintillas;
 
   FindReplace *m_FindReplace;
+  QPointer<ScintillaEdit> m_FindEditor;
+  QTimer *m_FindTimer = NULL;
 
   struct FindState
   {
@@ -317,6 +330,9 @@ private:
 
     // the last result
     QPair<int, int> prevResult;
+
+    // the editor containing the last result. Positions are only meaningful in this document.
+    QPointer<ScintillaEdit> editor;
   } m_FindState;
 
   SaveCallback m_SaveCallback;

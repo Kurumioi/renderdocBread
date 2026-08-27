@@ -35,6 +35,7 @@
 #include "Code/CaptureContext.h"
 #include "Code/QRDUtils.h"
 #include "Code/Resources.h"
+#include "Code/TranslationManager.h"
 #include "Code/pyrenderdoc/PythonContext.h"
 #include "Windows/Dialogs/CrashDialog.h"
 #include "Windows/MainWindow.h"
@@ -165,11 +166,6 @@ void sharedLogOutput(QtMsgType type, const QMessageLogContext &context, const QS
   }
 
   RENDERDOC_LogMessage(logtype, "QTRD", context.file ? context.file : rdcstr(), context.line, msg);
-}
-
-static QString tr(const char *string)
-{
-  return QApplication::translate("qrenderdoc", string);
 }
 
 void hideOption(QCommandLineOption &opt)
@@ -326,30 +322,38 @@ int main(int argc, char *argv[])
   QApplication application(argc, argv);
 
   QCommandLineParser parser;
-  parser.setApplicationDescription(tr("Qt UI for RenderDoc"));
+  parser.setApplicationDescription(QApplication::translate("qrenderdoc", "Qt UI for RenderDoc"));
   QCommandLineOption helpOption = parser.addHelpOption();
   QCommandLineOption versionOption = parser.addVersionOption();
 
   QCommandLineOption tempfile(
-      lit("tempfile"), tr("The filename to be opened is a temporary file owned by this instance."));
+      lit("tempfile"),
+      QApplication::translate(
+          "qrenderdoc", "The filename to be opened is a temporary file owned by this instance."));
   parser.addOption(tempfile);
 
   QCommandLineOption targetcontrol({lit("targetcontrol"), lit("remoteaccess")},
-                                   tr("A target control connection to open on startup."),
+                                   QApplication::translate(
+                                       "qrenderdoc",
+                                       "A target control connection to open on startup."),
                                    lit("host:port"));
   parser.addOption(targetcontrol);
 
-  QCommandLineOption replayhost(lit("replayhost"), tr("The replay host to connect to on startup."),
+  QCommandLineOption replayhost(lit("replayhost"),
+                                QApplication::translate(
+                                    "qrenderdoc", "The replay host to connect to on startup."),
                                 lit("host"));
   parser.addOption(replayhost);
 
   QCommandLineOption python({lit("python"), lit("script"), lit("py")},
-                            tr("Run a python script before opening the main UI."),
+                            QApplication::translate(
+                                "qrenderdoc", "Run a python script before opening the main UI."),
                             lit("filename.py"));
   parser.addOption(python);
 
   QCommandLineOption uiscript({lit("ui-python"), lit("ui-script"), lit("ui-py")},
-                              tr("Run a python script after opening the main UI."),
+                              QApplication::translate(
+                                  "qrenderdoc", "Run a python script after opening the main UI."),
                               lit("filename.py"));
   parser.addOption(uiscript);
 
@@ -374,7 +378,8 @@ int main(int argc, char *argv[])
   hideOption(crashReport);
   parser.addOption(crashReport);
 
-  parser.addPositionalArgument(lit("filename"), tr("The file to open."));
+  parser.addPositionalArgument(
+      lit("filename"), QApplication::translate("qrenderdoc", "The file to open."));
 
   bool parsedCommands = parser.parse(application.arguments());
 
@@ -412,8 +417,10 @@ int main(int argc, char *argv[])
 
   if(parser.isSet(updateFailed))
   {
-    RDDialog::critical(NULL, tr("Error updating"),
-                       tr("Error applying update: %1").arg(parser.value(updateFailed)));
+    RDDialog::critical(
+        NULL, QApplication::translate("qrenderdoc", "Error updating"),
+        QApplication::translate("qrenderdoc", "Error applying update: %1")
+            .arg(parser.value(updateFailed)));
   }
 
   if(parser.isSet(updateDone))
@@ -519,9 +526,16 @@ int main(int argc, char *argv[])
         dir.mkpath(configPath);
     }
 
-    QString configFilename = ConfigFilePath(lit("UI.config"));
+    const QString configFilename = ConfigFilePath(lit("UI.config"));
+    const bool configLoaded = config.Load(configFilename);
 
-    if(!config.Load(configFilename))
+    // Install the persisted language before constructing any capture UI. Keeping the manager in
+    // this scope ensures both translators outlive every translated widget and are removed before
+    // QApplication is destroyed.
+    TranslationManager translationManager(application);
+    translationManager.ApplyLanguage(config.UILanguage);
+
+    if(!configLoaded)
     {
       RDDialog::critical(
           NULL, CaptureContext::tr("Error loading config"),
@@ -546,8 +560,10 @@ int main(int argc, char *argv[])
       if(replayHostIndex < 0)
       {
         RDDialog::critical(
-            NULL, tr("Error loading remote host"),
-            tr("Remote host %1 doesn't exist. Please add it in Remote Host Manager first.")
+            NULL, QApplication::translate("qrenderdoc", "Error loading remote host"),
+            QApplication::translate(
+                "qrenderdoc",
+                "Remote host %1 doesn't exist. Please add it in Remote Host Manager first.")
                 .arg(parser.value(replayhost)));
       }
     }
@@ -583,15 +599,17 @@ int main(int argc, char *argv[])
       {
         env.waylandDisplay = (wl_display *)AccessWaylandPlatformInterface("display", NULL);
 
-        QString warning =
-            tr("Running directly on Wayland is NOT SUPPORTED and is likely to crash, hang, or "
-               "fail to render.");
+        QString warning = QApplication::translate(
+            "qrenderdoc", "Running directly on Wayland is NOT SUPPORTED and is likely to crash, "
+                          "hang, or fail to render.");
 
         qInfo() << "------ !!!! WARNING !!!! ------";
         qInfo() << warning;
         qInfo() << "------ !!!! WARNING !!!! ------";
 
-        RDDialog::critical(NULL, tr("Wayland Qt platform not supported"), warning);
+        RDDialog::critical(
+            NULL, QApplication::translate("qrenderdoc", "Wayland Qt platform not supported"),
+            warning);
       }
 #endif
       rdcarray<rdcstr> coreargs;
@@ -686,7 +704,8 @@ int main(int argc, char *argv[])
 
               if(!frames.isEmpty())
               {
-                exString += tr("Traceback (most recent call last):\n");
+                exString += QApplication::translate(
+                    "qrenderdoc", "Traceback (most recent call last):\n");
                 for(const QString &f : frames)
                   exString += QFormatStr("  %1\n").arg(f);
               }

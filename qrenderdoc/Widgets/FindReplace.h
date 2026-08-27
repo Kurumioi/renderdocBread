@@ -65,6 +65,8 @@ public:
   QString findText();
   void setReplaceText(QString text);
   QString replaceText();
+  void setResultCount(int current, int total);
+  void setSearchError(const QString &message);
 
 public slots:
   void allowUserModeChange(bool allow);
@@ -77,6 +79,9 @@ signals:
   void performFindAll();
   void performReplace();
   void performReplaceAll();
+  void searchChanged();
+  void closeRequested();
+  void layoutChanged();
   void keyPress(QKeyEvent *e);
 
 private slots:
@@ -88,6 +93,7 @@ private slots:
   void on_replaceAll_clicked();
   void on_findMode_clicked();
   void on_replaceMode_clicked();
+  void on_close_clicked();
 
 private:
   void keyPressEvent(QKeyEvent *event) override;

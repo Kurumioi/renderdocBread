@@ -171,7 +171,7 @@
           <item row="4" column="0">
            <widget class="QLabel" name="label_9">
             <property name="toolTip">
-             <string>Prefer using a monospace font instead of the default font for places where resource names, action and marker names, and similar pieces of information are displayed.&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;p&gt;By default a monospaced font will only be used for places where fixed width is important such as code and numerical data displays.</string>
+             <string>&lt;p&gt;Prefer using a monospace font instead of the default font for places where resource names, action and marker names, and similar pieces of information are displayed.&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;p&gt;By default a monospaced font will only be used for places where fixed width is important such as code and numerical data displays.&lt;/p&gt;</string>
             </property>
             <property name="text">
              <string>Prefer monospaced fonts in UI (restart required)</string>
@@ -181,7 +181,7 @@
           <item row="4" column="1">
            <widget class="QCheckBox" name="Font_PreferMonospaced">
             <property name="toolTip">
-             <string>Prefer using a monospace font instead of the default font for places where resource names, action and marker names, and similar pieces of information are displayed.&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;p&gt;By default a monospaced font will only be used for places where fixed width is important such as code and numerical data displays.</string>
+             <string>&lt;p&gt;Prefer using a monospace font instead of the default font for places where resource names, action and marker names, and similar pieces of information are displayed.&lt;/p&gt;&lt;p&gt;&lt;br/&gt;&lt;/p&gt;&lt;p&gt;By default a monospaced font will only be used for places where fixed width is important such as code and numerical data displays.&lt;/p&gt;</string>
             </property>
             <property name="text">
              <string/>
@@ -473,7 +473,30 @@ This option overrides that and will always replay locally if the local context i
             </property>
            </widget>
           </item>
+          <item row="19" column="0">
+           <widget class="QLabel" name="UILanguage_label">
+            <property name="toolTip">
+             <string>Selects the language used by the user interface. The change takes effect after restarting RenderDoc.</string>
+            </property>
+            <property name="text">
+             <string>Interface language (restart required)</string>
+            </property>
+           </widget>
+          </item>
           <item row="19" column="1">
+           <widget class="QComboBox" name="UILanguage">
+            <property name="toolTip">
+             <string>Selects the language used by the user interface. The change takes effect after restarting RenderDoc.</string>
+            </property>
+            <property name="insertPolicy">
+             <enum>QComboBox::NoInsert</enum>
+            </property>
+            <property name="sizeAdjustPolicy">
+             <enum>QComboBox::AdjustToContents</enum>
+            </property>
+           </widget>
+          </item>
+          <item row="20" column="1">
            <spacer name="verticalSpacer">
             <property name="orientation">
              <enum>Qt::Vertical</enum>
@@ -933,6 +956,29 @@ After interop is enabled you will need to reload any capture.</string>
             </property>
             <property name="text">
              <string/>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="ShaderEditor_LanguageServerLabel">
+            <property name="toolTip">
+             <string>Optional shader language-server executable. Leave empty to auto-detect shader-language-server or slangd.</string>
+            </property>
+            <property name="text">
+             <string>Language server</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QLineEdit" name="ShaderEditor_LanguageServer">
+            <property name="toolTip">
+             <string>Optional shader language-server executable. Leave empty to auto-detect shader-language-server or slangd. Local IDE features work without an external server.</string>
+            </property>
+            <property name="placeholderText">
+             <string>Auto-detect</string>
+            </property>
+            <property name="clearButtonEnabled">
+             <bool>true</bool>
             </property>
            </widget>
           </item>

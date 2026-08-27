@@ -27,6 +27,7 @@
 #include <QMutex>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QWidget>
 #include <typeinfo>
 #include "Code/QRDUtils.h"
@@ -56,8 +57,17 @@ public:
   void ResumePythonThreading();
 
   static void GlobalInit();
+  static bool ShutdownInternalIntegrations();
+  static void ShutdownExtensions();
   static void GlobalShutdown();
 
+  // Loads a first-party application-owned Python package from an exact root. Internal
+  // integrations are not discovered by the extension manager and cannot be replaced from a user
+  // extension directory.
+  static QString LoadInternalIntegration(ICaptureContext &ctx, const rdcstr &integration,
+                                         const QString &packageRoot);
+  static QString InvokeInternalIntegration(const rdcstr &integration, const char *function,
+                                           const QStringList &arguments, QString *error);
   static QStringList GetApplicationExtensionsPaths();
   static void ProcessExtensionWork(std::function<void()> callback);
   static QString LoadExtension(ICaptureContext &ctx, const rdcstr &extension);
@@ -121,6 +131,10 @@ private:
 
   // the list of extension objects, to be able to reload them
   static QMap<rdcstr, PyObject *> extensions;
+
+  // First-party modules have a separate lifetime and are never exposed through extension
+  // discovery/reload UI.
+  static QMap<rdcstr, PyObject *> internalIntegrations;
 
   static bool initialised();
 

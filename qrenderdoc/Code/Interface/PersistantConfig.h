@@ -227,12 +227,23 @@ DECLARE_REFLECTION_STRUCT(BugReport);
 #define CONFIG_SETTINGS()                                                                          \
                                                                                                    \
   DOCUMENT(                                                                                        \
-      "The style to load for the UI. Possible values include 'Native', 'RDLight', 'RDDark'. "      \
+      "The style to load for the UI. Possible values include 'Native', 'RDLight', 'RDDark', "      \
+      "'ultra'. "                                                                                  \
       "If empty, the closest of RDLight and RDDark will be chosen, based on the overall "          \
       "light-on-dark or dark-on-light theme of the application native style."                      \
       ""                                                                                           \
       ":type: str");                                                                               \
   CONFIG_SETTING_VAL(public, QString, rdcstr, UIStyle, "")                                         \
+                                                                                                   \
+  DOCUMENT(                                                                                        \
+      "The language to load for the UI. Supported stable values are 'zh_CN' for Simplified "      \
+      "Chinese, 'en' for source English, and 'system' to follow the operating-system language. "  \
+      "Changes take effect the next time qrenderdoc starts.\n"                                     \
+      "\n"                                                                                         \
+      "Defaults to 'system'."                                                                     \
+      ""                                                                                           \
+      ":type: str");                                                                               \
+  CONFIG_SETTING_VAL(public, QString, rdcstr, UILanguage, "system")                               \
                                                                                                    \
   DOCUMENT(                                                                                        \
       "The path to the last capture to be opened, which is useful as a default location for "      \
@@ -636,6 +647,16 @@ DECLARE_REFLECTION_STRUCT(BugReport);
       "\n"                                                                                         \
       ":type: List[ShaderProcessingTool]");                                                        \
   CONFIG_SETTING(public, QVariantList, rdcarray<ShaderProcessingTool>, ShaderProcessors)           \
+                                                                                                   \
+  DOCUMENT(                                                                                        \
+      "Optional executable path for the shader editor language server. An empty value searches " \
+      "the RENDERDOC_SHADER_LANGUAGE_SERVER environment variable, shader-language-server, then " \
+      "slangd. Local completion, navigation, and diagnostics remain available without it.\n"      \
+      "\n"                                                                                         \
+      "Defaults to an empty string.\n"                                                            \
+      ""                                                                                           \
+      ":type: str");                                                                               \
+  CONFIG_SETTING_VAL(public, QString, rdcstr, ShaderEditor_LanguageServer, "")                     \
                                                                                                    \
   DOCUMENT(                                                                                        \
       "``True`` if the user has selected to completely opt-out from and disable all analytics "    \

@@ -44,6 +44,7 @@
 #include "Widgets/Extended/RDMenu.h"
 #include "Widgets/ReplayOptionsSelector.h"
 #include "Windows/Dialogs/AboutDialog.h"
+#include "Windows/AI/AIAssistant.h"
 #include "Windows/ApiMonitorWindow.h"
 #include "Windows/Dialogs/CaptureDialog.h"
 #include "Windows/Dialogs/CrashDialog.h"
@@ -267,7 +268,7 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
           RDDialog::warning(
               NULL, tr("vkconfig detected - possible incompatibility"),
               tr("Configuration from 'vkconfig' tool detected.\n\n"
-                 "This program has caused problems in the past and it is \n"
+                 "This program has caused problems in the past and it is\n"
                  "strongly recommended that you disable it while using RenderDoc.\n\n"
                  "If this program is not active check the path below for any leftover files:\n\n%1")
                   .arg(vkconfigcheck.absoluteFilePath()));
@@ -563,6 +564,19 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
 
 MainWindow::~MainWindow()
 {
+  // HideOnClose tool windows have no QObject parent while hidden, so they are not reached by the
+  // direct-child cleanup below. Explicitly destroy the native AI controller to stop it becoming an
+  // orphan with a stale CaptureContext reference.
+  CaptureContext &ctx = static_cast<CaptureContext &>(m_Ctx);
+  if(ctx.HasAIAssistant())
+  {
+    QWidget *assistant = ctx.GetAIAssistant()->Widget();
+    if(ui->toolWindowManager->toolWindows().contains(assistant))
+      ui->toolWindowManager->forceCloseToolWindow(assistant);
+    else
+      delete assistant;
+  }
+
   // close the network manager thread
   m_NetManagerThread->thread()->quit();
   m_NetManagerThread->deleteLater();
@@ -2690,6 +2704,33 @@ void MainWindow::on_action_API_Monitor_triggered()
     monWin->SetTargetConnection(m_LiveCaptures.last());
 }
 
+void MainWindow::on_action_AI_Assistant_triggered()
+{
+  showAIAssistant();
+}
+
+void MainWindow::showAIAssistant(const QString &taskId)
+{
+  CaptureContext &ctx = static_cast<CaptureContext &>(m_Ctx);
+  AIAssistant *assistantWindow = ctx.GetAIAssistant();
+  QWidget *assistant = assistantWindow->Widget();
+
+  if(ui->toolWindowManager->toolWindows().contains(assistant))
+  {
+    ui->toolWindowManager->setToolWindowProperties(assistant, ToolWindowManager::HideOnClose);
+    if(ui->toolWindowManager->areaOf(assistant) == NULL)
+      ui->toolWindowManager->moveToolWindow(assistant, mainToolArea());
+    ToolWindowManager::raiseToolWindow(assistant);
+  }
+  else
+  {
+    ui->toolWindowManager->addToolWindow(assistant, mainToolArea(), ToolWindowManager::HideOnClose);
+  }
+
+  if(!taskId.isEmpty())
+    assistantWindow->NotifyIntentQueued(taskId);
+}
+
 void MainWindow::on_action_Resolve_Symbols_triggered()
 {
   ANALYTIC_SET(UIFeatures.CallstackResolve, true);
@@ -3262,6 +3303,11 @@ bool MainWindow::restoreState(QVariantMap &state)
   restoreGeometry(QByteArray::fromBase64(state[lit("mainWindowGeometry")].toByteArray()));
 
   ui->toolWindowManager->restoreState(state);
+
+  CaptureContext &ctx = static_cast<CaptureContext &>(m_Ctx);
+  if(ctx.HasAIAssistant())
+    ui->toolWindowManager->setToolWindowProperties(ctx.GetAIAssistant()->Widget(),
+                                                   ToolWindowManager::HideOnClose);
 
   return true;
 }

@@ -146,17 +146,87 @@ struct EventBrowserPersistentStorage : public CustomPersistentStorage
       if(SavedFilters.isEmpty())
         AddDefaultSavedFilters();
     }
+
+    // Version 3 changes the stock profile from all actions (which includes copies, clears,
+    // presents, marker bookkeeping, etc.) to the leaf draw/dispatch actions that are most useful
+    // when stepping a frame. Only migrate values which are the old stock expression apart from
+    // surrounding whitespace. Any other current expression or saved filter belongs to the user
+    // and is left untouched.
+    if(loadedVersion < 3)
+    {
+      const QString oldDefault = lit("$action()");
+
+      if(CurrentFilter.trimmed() == oldDefault)
+        SetDefaultCurrentFilter();
+
+      for(QPair<QString, QString> &filter : SavedFilters)
+      {
+        if(filter.first == lit("Default") && filter.second.trimmed() == oldDefault)
+        {
+          filter.first = DrawDispatchFilterName();
+          filter.second = DrawDispatchFilter();
+          break;
+        }
+      }
+
+      EnsureReplayLabSavedFilter(DrawDispatchFilterName(), DrawDispatchFilter(), 0);
+      EnsureReplayLabSavedFilter(OutputAffectingFilterName(), OutputAffectingFilter(), 1);
+      EnsureReplayLabSavedFilter(AllActionsFilterName(), AllActionsFilter(), 2);
+    }
   }
 
-  void SetDefaultCurrentFilter() { CurrentFilter = lit("$action()"); }
+  static QString DrawDispatchFilterName() { return lit("Draw / Dispatch Only"); }
+  static QString OutputAffectingFilterName() { return lit("Output-affecting"); }
+  static QString AllActionsFilterName() { return lit("All Actions"); }
+
+  static QString DrawDispatchFilter()
+  {
+    return lit("$action(flags & Drawcall|MeshDispatch|Dispatch|DispatchRay)");
+  }
+
+  static QString OutputAffectingFilter()
+  {
+    return lit("$action(flags & Drawcall|MeshDispatch|Dispatch|DispatchRay|Clear|Copy|Resolve|"
+               "GenMips|BuildAccStruct|Present)");
+  }
+
+  static QString AllActionsFilter() { return lit("$action()"); }
+
+  void SetDefaultCurrentFilter() { CurrentFilter = DrawDispatchFilter(); }
   void AddDefaultSavedFilters()
   {
-    SavedFilters.push_back(qMakePair(lit("Default"), lit("$action()")));
-    SavedFilters.push_back(qMakePair(lit("Actions and Barriers"), lit("$action() Barrier")));
-    SavedFilters.push_back(qMakePair(lit("Hide Copies & Clears"), lit("$action() -Copy -Clear")));
+    SavedFilters.push_back(qMakePair(DrawDispatchFilterName(), DrawDispatchFilter()));
+    SavedFilters.push_back(qMakePair(OutputAffectingFilterName(), OutputAffectingFilter()));
+    SavedFilters.push_back(qMakePair(AllActionsFilterName(), AllActionsFilter()));
   }
 
-  static const int LatestVersion = 2;
+  void EnsureReplayLabSavedFilter(const QString &name, const QString &expression,
+                                  int preferredIndex)
+  {
+    for(const QPair<QString, QString> &filter : SavedFilters)
+    {
+      if(filter.first.compare(name, Qt::CaseInsensitive) == 0 &&
+         filter.second.trimmed() == expression)
+        return;
+    }
+
+    // Do not overwrite an identically-named user filter. The built-in suffix makes both entries
+    // selectable while preserving the user's name, expression and ordering.
+    QString storedName = name;
+    for(const QPair<QString, QString> &filter : SavedFilters)
+    {
+      if(filter.first.compare(storedName, Qt::CaseInsensitive) == 0)
+      {
+        storedName += lit(" (Built-in)");
+        break;
+      }
+    }
+
+    preferredIndex = qBound(0, preferredIndex, SavedFilters.count());
+    SavedFilters.insert(preferredIndex, qMakePair(storedName, expression));
+  }
+
+  static const int LatestVersion = 3;
   int version;
   QString CurrentFilter;
   QList<QPair<QString, QString>> SavedFilters;
@@ -195,6 +265,9 @@ static uint32_t GetEffectiveEID(QModelIndex idx)
 
 struct EventItemModel : public QAbstractItemModel
 {
+  Q_DECLARE_TR_FUNCTIONS(EventItemModel)
+
+public:
   EventItemModel(QAbstractItemView *view, ICaptureContext &ctx) : m_View(view), m_Ctx(ctx)
   {
     UpdateDurationColumn();
@@ -1366,6 +1439,21 @@ void CacheActionFlagsLookup()
       ActionFlagsLookup[str.toLower()] = flag;
     }
 
+    // Keep this lookup complete even when the generic enum stringiser used by an older replay DLL
+    // does not yet expose newer ActionFlags. These names are part of the public filter syntax and
+    // are required by the stock draw/output presets.
+    const auto ensureFlag = [](const QString &name, ActionFlags flag) {
+      const QString key = name.toLower();
+      if(!ActionFlagsLookup.contains(key))
+      {
+        ActionFlagsList.push_back(name);
+        ActionFlagsLookup[key] = flag;
+      }
+    };
+    ensureFlag(lit("MeshDispatch"), ActionFlags::MeshDispatch);
+    ensureFlag(lit("DispatchRay"), ActionFlags::DispatchRay);
+    ensureFlag(lit("BuildAccStruct"), ActionFlags::BuildAccStruct);
+
     ActionFlagsList.sort();
   }
 }
@@ -1474,8 +1562,21 @@ struct BuiltinFilterCallbacks
 
 struct EventFilterModel : public QSortFilterProxyModel
 {
+  Q_DECLARE_TR_FUNCTIONS(EventFilterModel)
+
 public:
-  EventFilterModel(EventItemModel *model, ICaptureContext &ctx) : m_Model(model), m_Ctx(ctx)
+  EventFilterModel(EventItemModel *model, ICaptureContext &ctx) : m_Model(model), m_Ctx(&ctx)
+  {
+    InitialiseBuiltinFilters();
+  }
+
+#if ENABLE_UNIT_TESTS
+  // Parsing stock expressions has no capture dependency. This constructor lets unit tests execute
+  // the real parser and callbacks without fabricating the very large ICaptureContext interface.
+  EventFilterModel() : m_Model(NULL), m_Ctx(NULL) { InitialiseBuiltinFilters(); }
+#endif
+
+  void InitialiseBuiltinFilters()
   {
     setSourceModel(m_Model);
 
@@ -1555,7 +1656,7 @@ public:
     rdcarray<rdcstr> ret;
 
     if(cb)
-      ret = m_BuiltinFilters[filter].completer(&m_Ctx, filter, params);
+      ret = m_BuiltinFilters[filter].completer(m_Ctx, filter, params);
 
     QStringList qret;
     for(const rdcstr &s : ret)
@@ -1654,12 +1755,12 @@ protected:
       off = name.indexOf(QLatin1Char('<'), off + 1);
     }
 
-    m_VisibleCache[eid] = EvaluateFilterSet(m_Ctx, m_Filters, false, eid, chunk, action, name);
+    m_VisibleCache[eid] = EvaluateFilterSet(*m_Ctx, m_Filters, false, eid, chunk, action, name);
     return m_VisibleCache[eid] > 0;
   }
 
 private:
-  ICaptureContext &m_Ctx;
+  ICaptureContext *m_Ctx = NULL;
 
   // this caches whether a row passes or not, with 0 meaning 'uncached' and 1/-1 being true or
   // false. This means we can resize it and know that we don't pollute with bad data.
@@ -1668,7 +1769,10 @@ private:
 
   EventItemModel *m_Model = NULL;
 
-  bool m_EmptyRegionsVisible = true;
+  // Keep marker/region ancestors for hierarchy, but don't retain branches with no visible leaf
+  // actions. This makes the stock Draw / Dispatch Only profile behave like a compact frame
+  // debugger rather than a list of empty API bookkeeping regions.
+  bool m_EmptyRegionsVisible = false;
   rdcarray<EventFilter> m_Filters;
 
   IEventBrowser::EventFilterCallback MakeLiteralMatcher(QString string) const
@@ -1725,7 +1829,7 @@ private:
 
 <br />
 <table>
-<tr><td><code>$regex(/my regex.*match/i)</code></td>- passes if the specified regex matches the event name.</td></tr>
+<tr><td><code>$regex(/my regex.*match/i)</code></td><td>- passes if the specified regex matches the event name.</td></tr>
 </table>
 
 <p>
@@ -1735,9 +1839,9 @@ after the trailing /:
 </p>
 
 <table>
-<tr><td>/i</td><td>- Case insensitive match</td>
-<tr><td>/x</td><td>- Extended syntax. See regex documentation for more information</td>
-<tr><td>/u</td><td>- Use unicode properties. Character classes like \w and \d match more than ASCII</td>
+<tr><td>/i</td><td>- Case insensitive match</td></tr>
+<tr><td>/x</td><td>- Extended syntax. See regex documentation for more information</td></tr>
+<tr><td>/u</td><td>- Use unicode properties. Character classes like \w and \d match more than ASCII</td></tr>
 </table>
 )EOD",
               "EventFilterModel");
@@ -1750,7 +1854,7 @@ after the trailing /:
 
     if(parameters.size() < 2 || parameters[0] != QLatin1Char('/'))
     {
-      trace.setError(tr("Parameter to to regex() should be /regex/", "EventFilterModel"));
+      trace.setError(tr("Parameter to regex() should be /regex/", "EventFilterModel"));
       return NULL;
     }
 
@@ -1841,7 +1945,7 @@ searched for as a case-insensitive substring.
     if(idx < 0)
     {
       trace.setError(
-          tr("Parameter to to $param() should be name: value or name = value", "EventFilterModel"));
+          tr("Parameter to $param() should be name: value or name = value", "EventFilterModel"));
       return NULL;
     }
 
@@ -1851,7 +1955,7 @@ searched for as a case-insensitive substring.
     if(paramValue.isEmpty())
     {
       trace.setError(
-          tr("Parameter to to $param() should be name: value or name = value", "EventFilterModel"));
+          tr("Parameter to $param() should be name: value or name = value", "EventFilterModel"));
       return NULL;
     }
 
@@ -1898,7 +2002,7 @@ searched for as a case-insensitive substring.
 <p>
 This filter queries the annotations of an event to either exist or match simple conditions. A
 condition may be omitted, but an annotation must be specified. If no condition is given then
-the filter passes if that annotation is exists</code>.
+the filter passes if that annotation exists.
 </p>
 
 <p>
@@ -2185,7 +2289,7 @@ and vice-versa.
 
 <br />
 <table>
-<tr><td><code>$event(condition)</code></td>- passes if an event property matches a condition.</td></tr>
+<tr><td><code>$event(condition)</code></td><td>- passes if an event property matches a condition.</td></tr>
 </table>
 
 <p>
@@ -2343,6 +2447,9 @@ and these can be queried with a filter such as <code>$action(flags & Clear|Clear
 <tr><td>Clear:</td> <td>This is a clear call, clearing all or a subset of a resource.</td></tr>
 <tr><td>Drawcall:</td> <td>This is a graphics pipeline action, rasterizing polygons.</td></tr>
 <tr><td>Dispatch:</td> <td>This is a compute dispatch.</td></tr>
+<tr><td>MeshDispatch:</td> <td>This is a mesh-shader dispatch which rasterizes primitives.</td></tr>
+<tr><td>DispatchRay:</td> <td>This is a ray tracing dispatch.</td></tr>
+<tr><td>BuildAccStruct:</td> <td>This builds or copies an acceleration structure.</td></tr>
 <tr><td>CmdList:</td> <td>This is part of the book-keeping for a command list, secondary command buffer or bundle.</td></tr>
 <tr><td>SetMarker:</td> <td>This is an individual string debug marker, with no children.</td></tr>
 <tr><td>PushMarker:</td> <td>This is a push of a debug marker region, with some child actions</td></tr>
@@ -3070,7 +3177,7 @@ nesting level.
       QString errString;
 
       if(innerParser)
-        errString = innerParser(&m_Ctx, n, p);
+        errString = innerParser(m_Ctx, n, p);
 
       if(!errString.isEmpty())
       {
@@ -4623,7 +4730,7 @@ void EventBrowser::CreateFilterDialog()
 <p>
 Filters loosely follow a general search-term syntax, by default matching an event
 if any of the terms matches. E.g. a filter such as:
-<p>
+</p>
 
 <pre>  Draw Clear Copy</pre>
 
@@ -4640,7 +4747,7 @@ You can also exclude matches with - such as:
 
 <p>
 which will match as in the first example, except exclude any events that match
-<code>Depth<code>.
+<code>Depth</code>.
 </p>
 
 <p>
@@ -6124,3 +6231,147 @@ void EventBrowser::SetEmptyRegionsVisible(bool show)
 {
   m_FilterModel->SetEmptyRegionsVisible(show);
 }
+
+#if ENABLE_UNIT_TESTS
+
+#include "3rdparty/catch/catch.hpp"
+
+namespace
+{
+QVariantList SavedFilterVariant(std::initializer_list<QPair<QString, QString>> filters)
+{
+  QVariantList ret;
+  for(const QPair<QString, QString> &filter : filters)
+    ret << QVariant(QVariantList({filter.first, filter.second}));
+  return ret;
+}
+
+bool HasSavedEventFilter(const EventBrowserPersistentStorage &storage, const QString &name,
+                         const QString &expression)
+{
+  for(const QPair<QString, QString> &filter : storage.SavedFilters)
+    if(filter.first == name && filter.second == expression)
+      return true;
+  return false;
+}
+};    // namespace
+
+TEST_CASE("Event browser stock expressions parse and match real ActionFlags",
+          "[eventbrowser][filter]")
+{
+  EventFilterModel parser;
+  rdcarray<EventFilter> filters;
+
+  ParseTrace trace = parser.ParseExpressionToFilters(
+      EventBrowserPersistentStorage::DrawDispatchFilter(), filters);
+  INFO(trace.errorText.toStdString());
+  REQUIRE_FALSE(trace.hasErrors());
+  REQUIRE(filters.size() == 1);
+
+  auto matches = [&filters](ActionFlags flags) {
+    ActionDescription action;
+    action.eventId = 123;
+    action.flags = flags;
+    return filters[0].callback(NULL, rdcstr(), rdcstr(), 123, NULL, &action, rdcstr());
+  };
+
+  CHECK(matches(ActionFlags::Drawcall));
+  CHECK(matches(ActionFlags::MeshDispatch));
+  CHECK(matches(ActionFlags::Dispatch));
+  CHECK(matches(ActionFlags::DispatchRay));
+  CHECK_FALSE(matches(ActionFlags::Copy));
+  CHECK_FALSE(matches(ActionFlags::Clear));
+
+  filters.clear();
+  trace = parser.ParseExpressionToFilters(
+      EventBrowserPersistentStorage::OutputAffectingFilter(), filters);
+  INFO(trace.errorText.toStdString());
+  REQUIRE_FALSE(trace.hasErrors());
+  REQUIRE(filters.size() == 1);
+
+  CHECK(matches(ActionFlags::Drawcall));
+  CHECK(matches(ActionFlags::MeshDispatch));
+  CHECK(matches(ActionFlags::Dispatch));
+  CHECK(matches(ActionFlags::DispatchRay));
+  CHECK(matches(ActionFlags::Clear));
+  CHECK(matches(ActionFlags::Copy));
+  CHECK(matches(ActionFlags::Resolve));
+  CHECK(matches(ActionFlags::GenMips));
+  CHECK(matches(ActionFlags::BuildAccStruct));
+  CHECK(matches(ActionFlags::Present));
+  CHECK_FALSE(matches(ActionFlags::PushMarker));
+
+  filters.clear();
+  trace = parser.ParseExpressionToFilters(
+      lit("$action(flags & DefinitelyNotAnActionFlag)"), filters);
+  CHECK(trace.hasErrors());
+}
+
+TEST_CASE("Event browser has draw/dispatch-oriented stock filters", "[eventbrowser][filter]")
+{
+  EventBrowserPersistentStorage storage;
+
+  CHECK(bool(storage.CurrentFilter == EventBrowserPersistentStorage::DrawDispatchFilter()));
+  REQUIRE(storage.SavedFilters.count() == 3);
+  CHECK(bool(storage.SavedFilters[0] ==
+             qMakePair(EventBrowserPersistentStorage::DrawDispatchFilterName(),
+                       EventBrowserPersistentStorage::DrawDispatchFilter())));
+  CHECK(bool(storage.SavedFilters[1] ==
+             qMakePair(EventBrowserPersistentStorage::OutputAffectingFilterName(),
+                       EventBrowserPersistentStorage::OutputAffectingFilter())));
+  CHECK(bool(storage.SavedFilters[2] ==
+             qMakePair(EventBrowserPersistentStorage::AllActionsFilterName(),
+                       EventBrowserPersistentStorage::AllActionsFilter())));
+}
+
+TEST_CASE("Event browser migrates only the old stock action filter", "[eventbrowser][filter]")
+{
+  EventBrowserPersistentStorage storage;
+  QVariantMap oldSettings;
+  oldSettings[lit("version")] = 2;
+  oldSettings[lit("current")] = lit("$action()");
+  oldSettings[lit("filters")] =
+      SavedFilterVariant({
+          {lit("Default"), lit("$action()")},
+          {lit("Actions and Barriers"), lit("$action() Barrier")},
+          {lit("My expensive draws"), lit("$action(numIndices > 10000)")},
+      });
+
+  storage.load(oldSettings);
+
+  CHECK(bool(storage.CurrentFilter == EventBrowserPersistentStorage::DrawDispatchFilter()));
+  CHECK(HasSavedEventFilter(storage, EventBrowserPersistentStorage::DrawDispatchFilterName(),
+                            EventBrowserPersistentStorage::DrawDispatchFilter()));
+  CHECK(HasSavedEventFilter(storage, EventBrowserPersistentStorage::OutputAffectingFilterName(),
+                            EventBrowserPersistentStorage::OutputAffectingFilter()));
+  CHECK(HasSavedEventFilter(storage, EventBrowserPersistentStorage::AllActionsFilterName(),
+                            EventBrowserPersistentStorage::AllActionsFilter()));
+  CHECK(HasSavedEventFilter(storage, lit("My expensive draws"),
+                            lit("$action(numIndices > 10000)")));
+  CHECK(HasSavedEventFilter(storage, lit("Actions and Barriers"), lit("$action() Barrier")));
+}
+
+TEST_CASE("Event browser preserves custom filters during version 3 migration",
+          "[eventbrowser][filter]")
+{
+  EventBrowserPersistentStorage storage;
+  QVariantMap oldSettings;
+  oldSettings[lit("version")] = 2;
+  oldSettings[lit("current")] = lit("$action(flags & Copy)");
+  oldSettings[lit("filters")] =
+      SavedFilterVariant({
+          {lit("Draw / Dispatch Only"), lit("$action(numIndices > 42)")},
+          {lit("My copies"), lit("$action(flags & Copy)")},
+      });
+
+  storage.load(oldSettings);
+
+  CHECK(bool(storage.CurrentFilter == lit("$action(flags & Copy)")));
+  CHECK(HasSavedEventFilter(storage, lit("Draw / Dispatch Only"),
+                            lit("$action(numIndices > 42)")));
+  CHECK(HasSavedEventFilter(storage, lit("Draw / Dispatch Only (Built-in)"),
+                            EventBrowserPersistentStorage::DrawDispatchFilter()));
+  CHECK(HasSavedEventFilter(storage, lit("My copies"), lit("$action(flags & Copy)")));
+}
+
+#endif    // ENABLE_UNIT_TESTS

@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <QDebug>
 #include <QList>
 #include <QMap>
@@ -53,6 +54,8 @@ class StatisticsViewer;
 class TimelineBar;
 class PythonShell;
 class ApiMonitorWindow;
+class AIAssistant;
+class ReplayLabIntegration;
 class ResourceInspector;
 class ShaderViewer;
 class MiniQtHelper;
@@ -227,6 +230,9 @@ public:
   ITimelineBar *GetTimelineBar() override;
   IPythonShell *GetPythonShell() override;
   ApiMonitorWindow *GetApiMonitorWindow();
+  AIAssistant *GetAIAssistant();
+  ReplayLabIntegration &ReplayLab();
+  void ShowAIAssistant(const QString &taskId = QString());
   IResourceInspector *GetResourceInspector() override;
 
   bool HasEventBrowser() override { return m_EventBrowser != NULL; }
@@ -244,6 +250,7 @@ public:
   bool HasTimelineBar() override { return m_TimelineBar != NULL; }
   bool HasPythonShell() override { return m_PythonShell != NULL; }
   bool HasApiMonitorWindow() { return m_ApiMonitorWindow != NULL; }
+  bool HasAIAssistant() { return m_AIAssistant != NULL; }
   bool HasResourceInspector() override { return m_ResourceInspector != NULL; }
   void ShowEventBrowser() override;
   void ShowAPIInspector() override;
@@ -305,6 +312,8 @@ public:
   const PipeState &CurPipelineState() override { return *m_CurPipelineState; }
   PersistantConfig &Config() override { return m_Config; }
 private:
+  friend class ReplayLabIntegration;
+
   ReplayManager m_Replay;
 
   const D3D11Pipe::State *m_CurD3D11PipelineState;
@@ -346,9 +355,27 @@ private:
   void CacheResources();
   rdcstr GetResourceNameUnsuffixed(const ResourceDescription *desc) const;
 
+  enum class LoadCaptureStage : uint32_t
+  {
+    OpeningReplay = 0,
+    ReadingFrameMetadata,
+    BuildingActionList,
+    CachingResources,
+    ReadingTextures,
+    ReadingPipelineState,
+    ReadingEmbeddedData,
+    Finalising,
+  };
+
   float m_LoadProgress = 0.0f;
   float m_PostloadProgress = 0.0f;
+  std::atomic<uint32_t> m_LoadCaptureStage = {uint32_t(LoadCaptureStage::OpeningReplay)};
   float UpdateLoadProgress();
+  QString CurrentLoadStatusText() const;
+  void SetLoadCaptureStage(LoadCaptureStage stage)
+  {
+    m_LoadCaptureStage.store(uint32_t(stage), std::memory_order_relaxed);
+  }
 
   void LoadCaptureThreaded(const QString &captureFile, const ReplayOptions &opts,
                            const QString &origFilename, bool temporary, bool local);
@@ -429,12 +456,14 @@ private:
 
   QList<QObject *> m_PendingExtensionObjects;
   QMap<rdcstr, QList<QObject *>> m_ExtensionObjects;
+  QList<QObject *> m_ReplayLabIntegrationObjects;
 
   QList<QPointer<RegisteredMenuItem>> m_RegisteredMenuItems;
 
   QList<ShaderViewer *> m_ShaderEditors;
 
   MiniQtHelper *m_QtHelper = NULL;
+  ReplayLabIntegration *m_ReplayLabIntegration = NULL;
 
   QFileSystemWatcher *m_Watcher = NULL;
 
@@ -455,5 +484,6 @@ private:
   TimelineBar *m_TimelineBar = NULL;
   PythonShell *m_PythonShell = NULL;
   ApiMonitorWindow *m_ApiMonitorWindow = NULL;
+  AIAssistant *m_AIAssistant = NULL;
   ResourceInspector *m_ResourceInspector = NULL;
 };

@@ -210,9 +210,46 @@ public:
   virtual rdcarray<ShaderEncoding> GetTargetShaderEncodings() = 0;
   virtual void ReplaceResource(ResourceId from, ResourceId to) = 0;
   virtual void RemoveReplacement(ResourceId id) = 0;
+  virtual rdcstr ReplaceTargetShaderChecked(ResourceId from, ResourceId to)
+  {
+    return "Checked target-shader replacement is not supported by this replay driver";
+  }
+  virtual rdcstr RemoveTargetShaderReplacementChecked(ResourceId id)
+  {
+    return "Checked target-shader replacement is not supported by this replay driver";
+  }
   virtual void FreeTargetResource(ResourceId id) = 0;
   virtual void ClearReplayCache() = 0;
   virtual void ReloadShaderDebugInformation() = 0;
+
+  // Event-scoped shader overrides are deliberately implemented below the resource replacement
+  // layer. Unsupported drivers keep these no-op defaults, while a local driver can temporarily
+  // bind configured shaders around ReplayController's eReplay_OnlyDraw call.
+  virtual rdcstr SetEventShaderOverride(uint32_t eventId, ShaderStage stage,
+                                        ResourceId expectedOriginal, ResourceId replacement)
+  {
+    return "Event-scoped shader overrides are not supported by this replay driver";
+  }
+  virtual void ClearEventShaderOverride(uint32_t eventId, ShaderStage stage) {}
+  virtual void ClearEventShaderOverrides() {}
+  virtual void ClearEventShaderOverridesForResource(ResourceId id) {}
+  virtual rdcstr ApplyEventShaderOverrides(uint32_t eventId) { return {}; }
+  virtual void RestoreEventShaderOverrides() {}
+
+  virtual rdcstr SetEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                         ResourceId expectedShader, ResourceId expectedBuffer,
+                                         uint64_t expectedByteOffset, uint64_t expectedByteSize,
+                                         const bytebuf &data, uint32_t registerSpace = 0)
+  {
+    return "Event-scoped constant-buffer overrides are not supported by this replay driver";
+  }
+  virtual void ClearEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                         uint32_t registerSpace = 0)
+  {
+  }
+  virtual void ClearEventCBufferOverrides() {}
+  virtual rdcstr ApplyEventCBufferOverrides(uint32_t eventId) { return {}; }
+  virtual void RestoreEventCBufferOverrides() {}
 
   virtual rdcarray<GPUCounter> EnumerateCounters() = 0;
   virtual CounterDescription DescribeCounter(GPUCounter counterID) = 0;
@@ -250,6 +287,27 @@ public:
   virtual DriverInformation GetDriverInfo() = 0;
 
   virtual rdcarray<GPUDevice> GetAvailableGPUs() = 0;
+};
+
+// Event-scoped CBuffer ownership includes the register space. D3D11 accepts only space 0, while
+// D3D12 may legally bind the same b-register in several spaces at one stage.
+struct EventCBufferOverrideKey
+{
+  uint32_t eventId = 0;
+  ShaderStage stage = ShaderStage::Count;
+  uint32_t slot = 0;
+  uint32_t registerSpace = 0;
+
+  bool operator<(const EventCBufferOverrideKey &other) const
+  {
+    if(eventId != other.eventId)
+      return eventId < other.eventId;
+    if(stage != other.stage)
+      return stage < other.stage;
+    if(slot != other.slot)
+      return slot < other.slot;
+    return registerSpace < other.registerSpace;
+  }
 };
 
 class IReplayDriver : public IRemoteDriver

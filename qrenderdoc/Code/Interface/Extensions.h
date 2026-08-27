@@ -152,6 +152,14 @@ DOCUMENT(R"(Specifies the panel to add a menu item into.
 .. data:: TextureViewer_OutputThumbnail
 
   Adds the item to the context menu for output thumbnails in the :class:`TextureViewer`.
+
+.. data:: BufferViewer_Variable
+
+  Adds the item to the context menu for one reflected variable in a constant-buffer
+  :class:`BufferViewer`. Callback data is produced by qrenderdoc from the current variable model
+  and contains the event, Shader stage, reflection block index, binding window, resources, and
+  selected reflected leaf identity. Extensions must revalidate these values against live replay
+  before performing a mutation.
 )");
 enum class ContextMenu
 {
@@ -166,6 +174,7 @@ enum class ContextMenu
   TextureViewer_Thumbnail,
   TextureViewer_InputThumbnail,
   TextureViewer_OutputThumbnail,
+  BufferViewer_Variable,
 };
 
 DECLARE_REFLECTION_ENUM(ContextMenu);

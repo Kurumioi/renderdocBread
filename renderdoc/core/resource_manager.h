@@ -580,6 +580,10 @@ public:
   void AddResource(ResourceId id, WrappedResourceType res);
   bool HasResource(ResourceId id);
   WrappedResourceType GetResource(ResourceId id, bool optional = false);
+  // Resolve exactly the resource registered under ``id`` without following a
+  // replay replacement. Checked replacement code uses this to validate the
+  // canonical captured object's type/ABI independently from an active target.
+  WrappedResourceType GetResourceWithoutReplacement(ResourceId id, bool optional = false);
   void ReleaseResource(ResourceId id);
 
   // insert the chunks for the resources referenced in the frame
@@ -1876,6 +1880,27 @@ typename Configuration::WrappedResourceType ResourceManager<Configuration>::GetR
     if(it != m_ResourceMap.end())
       return it->second;
   }
+
+  return (WrappedResourceType)RecordType::NullResource;
+}
+
+template <typename Configuration>
+typename Configuration::WrappedResourceType
+ResourceManager<Configuration>::GetResourceWithoutReplacement(ResourceId id, bool optional)
+{
+  SCOPED_LOCK_OPTIONAL(m_Lock, m_Capturing);
+
+  if(id == ResourceId())
+    return (WrappedResourceType)RecordType::NullResource;
+
+#if DISABLED(RDOC_RELEASE)
+  if(!optional)
+    RDCASSERT(m_ResourceMap.find(id) != m_ResourceMap.end(), id);
+#endif
+
+  auto it = m_ResourceMap.find(id);
+  if(it != m_ResourceMap.end())
+    return it->second;
 
   return (WrappedResourceType)RecordType::NullResource;
 }

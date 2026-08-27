@@ -16,9 +16,30 @@ General options
 
 This allows you to choose what theme to use in RenderDoc. By default when first starting either the light or dark native RenderDoc theme will be selected, but you can change that or switch to any other supported theme here.
 
+The ``ultra`` theme uses Unity's neutral dark palette, 12px-equivalent UI typography, compact
+16px-20px controls, and blue selection highlights. It prefers Inter (Verdana on Windows when Inter
+is unavailable) for the UI and JetBrains Mono, Cascadia Mono, or Consolas for code. Shader code uses
+the RiderDark editor colour scheme while application panels retain the Unity palette. Explicit font
+choices in this window continue to take priority over these theme defaults.
+
 .. note::
 
   The theme won't fully apply until the next restart, although most elements will update immediately to give you a preview.
+
+---------------
+
+  | :guilabel:`Interface language (restart required)` Default: ``Follow system language``
+
+This selects the language used by qrenderdoc. ``Simplified Chinese`` and ``English`` are explicit,
+stable choices; ``Follow system language`` selects Simplified Chinese for a Chinese system locale
+and English otherwise. The selected value is applied before any main-window UI is constructed on
+the next launch. If a translation catalog is unavailable or invalid, qrenderdoc safely falls back
+to its English source strings.
+
+New Qt Designer strings and C++ ``tr()`` strings are collected by
+``util/i18n/update_translations.ps1``. The i18n CI check rejects newly-added user-visible literals
+that bypass this extraction path, so newly-developed buttons, menus, and messages automatically
+enter the translation review workflow.
 
 ---------------
 
@@ -237,6 +258,19 @@ Shader Viewer options
   | :guilabel:`Rename disassembly registers` Default: ``Enabled``
 
 This option tries to make the disassembly of shaders easier to read by substituting variable names where available in for constant register names.
+
+---------------
+
+  | :guilabel:`Language server` Default: ``Auto-detect``
+
+This optional executable adds compiler-aware completion, definition lookup, and diagnostics to the
+shader editor. Leave it empty to check ``RENDERDOC_SHADER_LANGUAGE_SERVER`` and then look for
+``shader-language-server`` or ``slangd`` on ``PATH``. The executable runs out of process over the
+Language Server Protocol and is never invoked through a shell.
+
+The editor always provides local symbol completion, :kbd:`F12` definition navigation, parameter
+tips, and structural diagnostics when no external server is installed. An external server improves
+include resolution and shader-semantic accuracy but is not required for editing or compiling.
 
 ---------------
 

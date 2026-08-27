@@ -433,6 +433,31 @@ endif()
 
 install (PROGRAMS ${CMAKE_BINARY_DIR}/bin/qrenderdoc DESTINATION bin)
 
+# qrenderdoc loads ReplayLab from an application-owned integration directory. The current packaged
+# sidecars require Windows Job Object containment, so non-Windows builds fail closed and do not
+# install an inactive Python bridge. Extension manifests and generated caches are excluded.
+if(WIN32)
+    install (DIRECTORY ${CMAKE_SOURCE_DIR}/replaylab/renderdoc_mcp_bridge/
+             DESTINATION bin/integrations/replaylab/python/renderdoc_mcp_bridge
+             FILES_MATCHING
+             PATTERN "*.py"
+             PATTERN "integration.json"
+             PATTERN "__pycache__" EXCLUDE)
+
+    # Keep runtime deployment explicit so incremental builds never overwrite an active sidecar.
+    # This target consumes the separately built, hash-manifested runtime output and fails closed on
+    # unowned/mismatched application layouts.
+    find_program(REPLAYLAB_POWERSHELL_EXECUTABLE NAMES pwsh powershell)
+    if(REPLAYLAB_POWERSHELL_EXECUTABLE)
+        add_custom_target(deploy-replaylab-runtime
+            COMMAND ${REPLAYLAB_POWERSHELL_EXECUTABLE} -NoProfile -File
+                    ${CMAKE_SOURCE_DIR}/replaylab/packaging/Deploy-ReplayLabRuntime.ps1
+                    -ApplicationDirectory ${CMAKE_BINARY_DIR}/bin
+            DEPENDS build-qrenderdoc
+            VERBATIM)
+    endif()
+endif()
+
 # Install supporting files for file associations etc
 install (FILES share/application-x-renderdoc-capture.svg DESTINATION share/icons/hicolor/scalable/mimetypes/)
 install (FILES share/renderdoc-icon-16x16.xpm DESTINATION share/pixmaps/)

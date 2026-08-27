@@ -256,6 +256,22 @@ public:
   void RemoveReplacement(ResourceId id);
   void ClearReplayCache();
   void ReloadShaderDebugInformation();
+  rdcstr SetEventShaderOverride(uint32_t eventId, ShaderStage stage, ResourceId expectedOriginal,
+                                ResourceId replacement);
+  void ClearEventShaderOverride(uint32_t eventId, ShaderStage stage);
+  void ClearEventShaderOverrides();
+  void ClearEventShaderOverridesForResource(ResourceId id);
+  rdcstr ApplyEventShaderOverrides(uint32_t eventId);
+  void RestoreEventShaderOverrides();
+  rdcstr SetEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                 ResourceId expectedShader, ResourceId expectedBuffer,
+                                 uint64_t expectedByteOffset, uint64_t expectedByteSize,
+                                 const bytebuf &data, uint32_t registerSpace = 0);
+  void ClearEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                 uint32_t registerSpace = 0);
+  void ClearEventCBufferOverrides();
+  rdcstr ApplyEventCBufferOverrides(uint32_t eventId);
+  void RestoreEventCBufferOverrides();
 
   rdcarray<GPUCounter> EnumerateCounters();
   CounterDescription DescribeCounter(GPUCounter counterID);
@@ -388,6 +404,52 @@ private:
   WrappedID3D11DeviceContext *m_pImmediateContext = NULL;
 
   rdcarray<rdcstr> m_CustomShaderIncludes;
+
+  struct EventShaderOverride
+  {
+    ResourceId expectedOriginal;
+    ResourceId replacementId;
+    ID3D11DeviceChild *replacement = NULL;
+    uint32_t shaderExtSlot = ~0U;
+  };
+
+  struct AppliedEventShaderOverride
+  {
+    ShaderStage stage = ShaderStage::Vertex;
+    ID3D11DeviceChild *original = NULL;
+    ID3D11ClassInstance *instances[D3D11_SHADER_MAX_INTERFACES] = {};
+    UINT numInstances = 0;
+  };
+
+  std::map<std::pair<uint32_t, ShaderStage>, EventShaderOverride> m_EventShaderOverrides;
+  rdcarray<AppliedEventShaderOverride> m_AppliedEventShaderOverrides;
+
+  struct EventCBufferOverride
+  {
+    ResourceId expectedShader;
+    ResourceId expectedBuffer;
+    uint64_t expectedByteOffset = 0;
+    uint64_t expectedByteSize = 0;
+    bytebuf data;
+    ID3D11Buffer *shadow = NULL;
+  };
+
+  struct AppliedEventCBufferOverride
+  {
+    ShaderStage stage = ShaderStage::Vertex;
+    uint32_t slot = 0;
+    ID3D11Buffer *original = NULL;
+    UINT firstConstant = 0;
+    UINT numConstants = 0;
+  };
+
+  rdcstr ValidateEventCBufferBinding(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                     uint32_t registerSpace,
+                                     ResourceId expectedShader, ResourceId expectedBuffer,
+                                     uint64_t expectedByteOffset, uint64_t expectedByteSize);
+
+  std::map<EventCBufferOverrideKey, EventCBufferOverride> m_EventCBufferOverrides;
+  rdcarray<AppliedEventCBufferOverride> m_AppliedEventCBufferOverrides;
 
   // used to track the real state so we can preserve it even across work done to the output windows
   struct RealState

@@ -633,7 +633,12 @@ void WrappedID3D12PipelineState::ShaderEntry::BuildReflection()
       D3Dx_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT == D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT,
       "Mismatched vertex input count");
 
-  MakeShaderReflection(m_DXBCFile, {}, m_Details);
+  ShaderEntryPoint entry;
+  const rdcarray<ShaderEntryPoint> entries = m_DXBCFile->GetEntryPoints();
+  if(entries.size() == 1)
+    entry = entries[0];
+
+  MakeShaderReflection(m_DXBCFile, entry, m_Details);
   m_Details->resourceId = GetResourceID();
 }
 

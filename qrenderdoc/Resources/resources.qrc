@@ -154,4 +154,8 @@
         <file>bookmark_blue.png</file>
         <file>bookmark_blue@2x.png</file>
     </qresource>
+    <qresource prefix="/translations">
+        <file alias="qt_zh_CN.qm">../Translations/qt_zh_CN.qm</file>
+        <file alias="qrenderdoc_zh_CN.qm">../Translations/qrenderdoc_zh_CN.qm</file>
+    </qresource>
 </RCC>

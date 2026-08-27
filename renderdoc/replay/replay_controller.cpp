@@ -83,7 +83,28 @@ void ReplayController::SetFrameEvent(uint32_t eventId, bool force)
     for(size_t i = 0; i < m_Outputs.size(); i++)
       m_Outputs[i]->SetFrameEvent(eventId);
 
+    // CBuffer shadows are installed against the captured shader first. Shader replacement is
+    // layered on top only after every CBuffer binding has passed its fail-closed validation.
+    m_LastEventOverrideError = m_pDevice->ApplyEventCBufferOverrides(eventId);
+    if(m_LastEventOverrideError.empty())
+      m_LastEventOverrideError = m_pDevice->ApplyEventShaderOverrides(eventId);
+
+    if(!m_LastEventOverrideError.empty())
+    {
+      // Apply methods validate atomically, but restore both layers here as a final rollback guard
+      // before replaying the original action.
+      m_pDevice->RestoreEventShaderOverrides();
+      m_pDevice->RestoreEventCBufferOverrides();
+      RDCERR("Event-scoped override was not applied at EID %u: %s", eventId,
+             m_LastEventOverrideError.c_str());
+    }
+
     m_pDevice->ReplayLog(eventId, eReplay_OnlyDraw);
+
+    // Always restore before checking for a fatal error, since FatalErrorCheck may swap the replay
+    // driver for a dummy implementation.
+    m_pDevice->RestoreEventShaderOverrides();
+    m_pDevice->RestoreEventCBufferOverrides();
     FatalErrorCheck();
 
     FetchPipelineState(eventId);
@@ -95,6 +116,228 @@ void ReplayController::SetFrameEvent(uint32_t eventId, bool force)
     for(size_t i = 0; i < m_Outputs.size(); i++)
       m_Outputs[i]->SetFrameEvent(eventId);
   }
+}
+
+rdcstr ReplayController::SetEventShaderOverride(uint32_t eventId, ShaderStage stage,
+                                                ResourceId expectedOriginal,
+                                                ResourceId replacement)
+{
+  CHECK_REPLAY_THREAD();
+
+  if(m_pDevice == NULL)
+    return "No replay driver is available";
+
+  if(m_pDevice->IsRemoteProxy())
+    return "Event-scoped shader overrides require a local replay driver";
+
+  if(m_APIProps.pipelineType != GraphicsAPI::D3D11)
+    return "Event-scoped shader overrides are currently supported only for D3D11 captures";
+
+  if(expectedOriginal == ResourceId() || replacement == ResourceId())
+    return "Both expectedOriginal and replacement must be non-null shader resources";
+
+  if(m_TargetResources.find(replacement) == m_TargetResources.end())
+    return "replacement was not created by BuildTargetShader on this replay controller";
+
+  auto remapIt = m_EventRemap.find(eventId);
+  if(remapIt != m_EventRemap.end())
+    eventId = remapIt->second;
+
+  if(eventId != m_EventID)
+    return "eventId must be the currently selected effective event before configuring an override";
+
+  rdcstr error =
+      m_pDevice->SetEventShaderOverride(eventId, stage, expectedOriginal, replacement);
+  FatalErrorCheck();
+
+  if(!error.empty())
+    return error;
+
+  if(eventId == m_EventID)
+  {
+    SetFrameEvent(m_EventID, true);
+
+    // Registration performs structural validation, while ApplyEventShaderOverrides validates the
+    // exact live binding after replaying WithoutDraw. Never report success if that final guard
+    // rejected the override.
+    if(!m_LastEventOverrideError.empty())
+    {
+      rdcstr applyError = m_LastEventOverrideError;
+      m_pDevice->ClearEventShaderOverride(eventId, stage);
+      SetFrameEvent(m_EventID, true);
+      return applyError;
+    }
+
+    for(size_t i = 0; i < m_Outputs.size(); i++)
+      if(m_Outputs[i]->GetType() != ReplayOutputType::Headless)
+        m_Outputs[i]->Display();
+  }
+
+  return {};
+}
+
+void ReplayController::ClearEventShaderOverride(uint32_t eventId, ShaderStage stage)
+{
+  CHECK_REPLAY_THREAD();
+
+  if(m_pDevice == NULL || m_pDevice->IsRemoteProxy() ||
+     m_APIProps.pipelineType != GraphicsAPI::D3D11)
+    return;
+
+  auto remapIt = m_EventRemap.find(eventId);
+  if(remapIt != m_EventRemap.end())
+    eventId = remapIt->second;
+
+  m_pDevice->ClearEventShaderOverride(eventId, stage);
+
+  if(eventId == m_EventID)
+  {
+    SetFrameEvent(m_EventID, true);
+
+    for(size_t i = 0; i < m_Outputs.size(); i++)
+      if(m_Outputs[i]->GetType() != ReplayOutputType::Headless)
+        m_Outputs[i]->Display();
+  }
+}
+
+void ReplayController::ClearEventShaderOverrides()
+{
+  CHECK_REPLAY_THREAD();
+
+  if(m_pDevice == NULL || m_pDevice->IsRemoteProxy() ||
+     m_APIProps.pipelineType != GraphicsAPI::D3D11)
+    return;
+
+  m_pDevice->ClearEventShaderOverrides();
+  SetFrameEvent(m_EventID, true);
+
+  for(size_t i = 0; i < m_Outputs.size(); i++)
+    if(m_Outputs[i]->GetType() != ReplayOutputType::Headless)
+      m_Outputs[i]->Display();
+}
+
+rdcstr ReplayController::SetEventCBufferOverride(
+    uint32_t eventId, ShaderStage stage, uint32_t slot, ResourceId expectedShader,
+    ResourceId expectedBuffer, uint64_t expectedByteOffset, uint64_t expectedByteSize, bytebuf data,
+    uint32_t registerSpace)
+{
+  CHECK_REPLAY_THREAD();
+
+  if(m_pDevice == NULL)
+    return "No replay driver is available";
+
+  if(m_pDevice->IsRemoteProxy())
+    return "Event-scoped constant-buffer overrides require a local replay driver";
+
+  if(m_APIProps.pipelineType != GraphicsAPI::D3D11 &&
+     m_APIProps.pipelineType != GraphicsAPI::D3D12)
+    return "Event-scoped constant-buffer overrides currently support D3D11 and D3D12 captures";
+
+  const uint32_t d3d11CBufferSlotCount = 14;
+  const uint64_t d3d11CBufferMaxByteSize = 64ULL * 1024ULL;
+
+  if(expectedShader == ResourceId())
+    return "expectedShader must be a non-null captured shader resource";
+
+  if(data.empty() || data.size() > d3d11CBufferMaxByteSize || (data.size() % 16) != 0)
+    return "data must be non-empty, 16-byte aligned, and no larger than 64 KiB";
+
+  if((expectedByteOffset % 16) != 0 || (expectedByteSize % 16) != 0 ||
+     expectedByteSize > d3d11CBufferMaxByteSize)
+    return "The expected offset and size must be 16-byte aligned, and size must not exceed 64 KiB";
+
+  if(m_APIProps.pipelineType == GraphicsAPI::D3D11)
+  {
+    if(registerSpace != 0)
+      return "D3D11 constant-buffer overrides require register space 0";
+    if(slot >= d3d11CBufferSlotCount)
+      return "D3D11 constant-buffer slot must be between 0 and 13";
+    if(expectedBuffer == ResourceId() && (expectedByteOffset != 0 || expectedByteSize != 0))
+      return "An expected unbound slot must use a zero byte offset and size";
+  }
+  else
+  {
+    if(expectedBuffer == ResourceId())
+      return "D3D12 event CBuffer overrides require a bound captured buffer";
+    if(expectedByteOffset % 256 != 0)
+      return "D3D12 CBV byte offsets must be 256-byte aligned";
+    if(expectedByteSize == 0)
+      return "D3D12 CBV byte size must be non-zero";
+  }
+
+  auto remapIt = m_EventRemap.find(eventId);
+  if(remapIt != m_EventRemap.end())
+    eventId = remapIt->second;
+
+  if(eventId != m_EventID)
+    return "eventId must be the currently selected effective event before configuring an override";
+
+  rdcstr error = m_pDevice->SetEventCBufferOverride(
+      eventId, stage, slot, expectedShader, expectedBuffer, expectedByteOffset, expectedByteSize, data,
+      registerSpace);
+  FatalErrorCheck();
+
+  if(!error.empty())
+    return error;
+
+  SetFrameEvent(m_EventID, true);
+
+  if(!m_LastEventOverrideError.empty())
+  {
+    rdcstr applyError = m_LastEventOverrideError;
+    m_pDevice->ClearEventCBufferOverride(eventId, stage, slot, registerSpace);
+    SetFrameEvent(m_EventID, true);
+    return applyError;
+  }
+
+  for(size_t i = 0; i < m_Outputs.size(); i++)
+    if(m_Outputs[i]->GetType() != ReplayOutputType::Headless)
+      m_Outputs[i]->Display();
+
+  return {};
+}
+
+void ReplayController::ClearEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
+                                                 uint32_t registerSpace)
+{
+  CHECK_REPLAY_THREAD();
+
+  if(m_pDevice == NULL || m_pDevice->IsRemoteProxy() ||
+     (m_APIProps.pipelineType != GraphicsAPI::D3D11 &&
+      m_APIProps.pipelineType != GraphicsAPI::D3D12))
+    return;
+
+  auto remapIt = m_EventRemap.find(eventId);
+  if(remapIt != m_EventRemap.end())
+    eventId = remapIt->second;
+
+  m_pDevice->ClearEventCBufferOverride(eventId, stage, slot, registerSpace);
+
+  if(eventId == m_EventID)
+  {
+    SetFrameEvent(m_EventID, true);
+
+    for(size_t i = 0; i < m_Outputs.size(); i++)
+      if(m_Outputs[i]->GetType() != ReplayOutputType::Headless)
+        m_Outputs[i]->Display();
+  }
+}
+
+void ReplayController::ClearEventCBufferOverrides()
+{
+  CHECK_REPLAY_THREAD();
+
+  if(m_pDevice == NULL || m_pDevice->IsRemoteProxy() ||
+     (m_APIProps.pipelineType != GraphicsAPI::D3D11 &&
+      m_APIProps.pipelineType != GraphicsAPI::D3D12))
+    return;
+
+  m_pDevice->ClearEventCBufferOverrides();
+  SetFrameEvent(m_EventID, true);
+
+  for(size_t i = 0; i < m_Outputs.size(); i++)
+    if(m_Outputs[i]->GetType() != ReplayOutputType::Headless)
+      m_Outputs[i]->Display();
 }
 
 const D3D11Pipe::State *ReplayController::GetD3D11PipelineState()
@@ -1949,6 +2192,10 @@ void ReplayController::Shutdown()
 
   m_CustomShaders.clear();
 
+  // Drop replay-owned buffers and internal references before target shaders are freed.
+  m_pDevice->ClearEventCBufferOverrides();
+  m_pDevice->ClearEventShaderOverrides();
+
   for(auto it = m_TargetResources.begin(); it != m_TargetResources.end(); ++it)
     m_pDevice->FreeTargetResource(*it);
 
@@ -2125,6 +2372,7 @@ void ReplayController::FreeTargetResource(ResourceId id)
 {
   CHECK_REPLAY_THREAD();
 
+  m_pDevice->ClearEventShaderOverridesForResource(id);
   m_TargetResources.erase(id);
   m_pDevice->FreeTargetResource(id);
 }
@@ -2151,6 +2399,31 @@ void ReplayController::ReplaceResource(ResourceId from, ResourceId to)
       m_Outputs[i]->Display();
 }
 
+rdcstr ReplayController::ReplaceTargetShaderChecked(ResourceId from, ResourceId to)
+{
+  CHECK_REPLAY_THREAD();
+
+  if(from == ResourceId() || to == ResourceId())
+    return "Both original and replacement shader resources must be non-null";
+
+  if(m_TargetResources.find(to) == m_TargetResources.end())
+    return "replacement was not created by BuildTargetShader on this replay controller";
+
+  rdcstr error = m_pDevice->ReplaceTargetShaderChecked(from, to);
+  FatalErrorCheck();
+
+  if(!error.empty())
+    return error;
+
+  SetFrameEvent(m_EventID, true);
+
+  for(size_t i = 0; i < m_Outputs.size(); i++)
+    if(m_Outputs[i]->GetType() != ReplayOutputType::Headless)
+      m_Outputs[i]->Display();
+
+  return {};
+}
+
 void ReplayController::RemoveReplacement(ResourceId id)
 {
   CHECK_REPLAY_THREAD();
@@ -2163,6 +2436,28 @@ void ReplayController::RemoveReplacement(ResourceId id)
   for(size_t i = 0; i < m_Outputs.size(); i++)
     if(m_Outputs[i]->GetType() != ReplayOutputType::Headless)
       m_Outputs[i]->Display();
+}
+
+rdcstr ReplayController::RemoveTargetShaderReplacementChecked(ResourceId id)
+{
+  CHECK_REPLAY_THREAD();
+
+  if(id == ResourceId())
+    return "The original shader resource must be non-null";
+
+  rdcstr error = m_pDevice->RemoveTargetShaderReplacementChecked(id);
+  FatalErrorCheck();
+
+  if(!error.empty())
+    return error;
+
+  SetFrameEvent(m_EventID, true);
+
+  for(size_t i = 0; i < m_Outputs.size(); i++)
+    if(m_Outputs[i]->GetType() != ReplayOutputType::Headless)
+      m_Outputs[i]->Display();
+
+  return {};
 }
 
 void ReplayController::ClearReplayCache()
