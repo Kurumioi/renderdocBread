@@ -27,9 +27,9 @@ workflow is:
 2. Select a complete `binary -> editable text -> binary` route from the fixed
    source-integrated provider catalog. Every executable, adapter, dependency,
    argument template and validator is SHA-256-bound. If a hop or untouched
-   baseline compile fails, the diagnostic is classified and the Companion may
+   baseline compile fails, the diagnostic is classified and AgentHost may
    choose only an untried pair listed in `candidateRoutePairs`; each attempt
-   uses a new sibling workspace. The Companion caps this recovery loop at eight
+   uses a new sibling workspace. AgentHost caps this recovery loop at eight
    attempts and cannot invent a command, executable, route ID or Apply request.
    When an existing workspace was created against older catalog/registry bytes,
    do not rewrite its manifest. `migrate_shader_workspace_toolchain` creates a
@@ -816,7 +816,7 @@ events. Failed compilation of one hash is not retried continuously; another
 content change or an explicit manual compile is required. Compiler failures
 that launched a workspace job also remain in the normal workspace manifest and
 job logs. A failure never advances the immutable revision or overwrites the
-previous successful candidate. In Companion auto-apply mode it also leaves the
+previous successful candidate. In live-edit auto-apply mode it also leaves the
 previously active RenderDoc replacement unchanged.
 
 The compile-only watcher above never validates or applies. Use the distinct,
@@ -857,9 +857,9 @@ rollback evidence. On compile failure, ABI mismatch, capture/session change or
 apply failure, that save is rejected and the previous last-good replacement
 (or captured original when none exists) remains active. Failed bytes are not
 repeatedly retried; save different content or compile explicitly. The
-process-owner Companion option `--auto-apply-compatible-saves` uses this same
-binding and gates rather than a weaker path. A capture-session switch stops the
-old monitor without applying stale work.
+process-owned live-edit session started by `start_shader_workspace_live_edit`
+uses this same binding and gates rather than a weaker path. A capture-session
+switch stops the old monitor without applying stale work.
 
 Safety and lifetime limits are fixed in the host implementation:
 

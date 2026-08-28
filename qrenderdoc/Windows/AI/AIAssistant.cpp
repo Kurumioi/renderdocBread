@@ -30,10 +30,12 @@
 #include <cstring>
 #include <QApplication>
 #include <QBrush>
+#include <QButtonGroup>
 #include <QCheckBox>
 #include <QClipboard>
 #include <QColor>
 #include <QComboBox>
+#include <QCommandLinkButton>
 #include <QCoreApplication>
 #include <QCursor>
 #include <QDateTime>
@@ -73,6 +75,7 @@
 #include <QStandardPaths>
 #include <QStyle>
 #include <QTextBrowser>
+#include <QTemporaryFile>
 #include <QTimer>
 #include <QToolButton>
 #include <QTreeWidget>
@@ -81,6 +84,7 @@
 #include <QVBoxLayout>
 #include "Code/CaptureContext.h"
 #include "Code/QRDUtils.h"
+#include "Code/Resources.h"
 #include "AIConversationListView.h"
 #include "AIConversationStore.h"
 #include "AIPendingChatView.h"
@@ -98,7 +102,9 @@ const int MaxEventLineBytes = 64 * 1024;
 const qint64 MaxEventDrainBytes = 16 * 1024 * 1024;
 const int MaxAnswerBytes = 2 * 1024 * 1024;
 const int MaxProcessOutputBytes = 8 * 1024 * 1024;
-const int MaxPromptBytes = 2 * 1024 * 1024;
+const int MaxPromptBytes = 16 * 1024 * 1024;
+const int MaxContextSnapshotBytes = 512 * 1024;
+const int MaxClarificationOtherChars = 16 * 1024;
 const int MaxDiscoveredModels = 200;
 const int MaxModelIdBytes = 512;
 const int MaxConversationStoreChars = 4 * 1024 * 1024;
@@ -106,6 +112,54 @@ const int MaxConversationMessageChars = 256 * 1024;
 const int MaxConversationMessages = 200;
 const int MaxConversationThreads = 32;
 const int MaxPendingChats = 64;
+
+bool isLowerHexIdentifier(const QString &value, int expectedLength)
+{
+  if(value.size() != expectedLength)
+    return false;
+  for(const QChar character : value)
+  {
+    const ushort code = character.unicode();
+    if(!((code >= ushort('0') && code <= ushort('9')) ||
+         (code >= ushort('a') && code <= ushort('f'))))
+      return false;
+  }
+  return true;
+}
+
+bool decodeContextSnapshot(const QByteArray &encoded, QJsonObject *snapshot = NULL)
+{
+  QJsonParseError parseError;
+  const QJsonDocument document = QJsonDocument::fromJson(encoded, &parseError);
+  const QJsonObject object = document.isObject() ? document.object() : QJsonObject();
+  // i18n-ignore: ReplayLab frozen-context protocol field names and schema identifiers.
+  const QJsonObject capture = object.value(lit("capture")).toObject();
+  const bool valid = parseError.error == QJsonParseError::NoError &&
+                     encoded.size() > 0 && encoded.size() <= MaxContextSnapshotBytes &&
+                     object.value(lit("schema")).toString() ==    // i18n-ignore: frozen-context protocol key
+                         lit("renderdoc-ultra-current-context/v1") &&    // i18n-ignore: frozen-context schema ID
+                     isLowerHexIdentifier(object.value(lit("snapshotId")).toString(), 64) &&    // i18n-ignore: frozen-context protocol key
+                     capture.value(lit("loaded")).toBool() &&    // i18n-ignore: frozen-context protocol key
+                     isLowerHexIdentifier(
+                         capture.value(lit("captureSessionId")).toString(), 32);    // i18n-ignore: frozen-context protocol key
+  if(valid && snapshot)
+    *snapshot = object;
+  return valid;
+}
+
+QJsonObject contextCandidateJSON(const QByteArray &encoded, const QString &instanceId)
+{
+  QJsonObject snapshot;
+  if(instanceId.trimmed().isEmpty() || instanceId.size() > 160 ||
+     !decodeContextSnapshot(encoded, &snapshot))
+    return QJsonObject();
+
+  QJsonObject candidate;
+  // i18n-ignore: ReplayLab clarification context-candidate wire-protocol fields.
+  candidate[lit("contextInstanceId")] = instanceId;
+  candidate[lit("snapshot")] = snapshot;    // i18n-ignore: context-candidate protocol key
+  return candidate;
+}
 
 bool normalizedTerminalStatus(const QJsonObject &object, QString &status)
 {
@@ -489,7 +543,7 @@ QString environmentValue(const char *name)
 QSet<QString> knownModelCredentialEnvironments()
 {
   // Deny known provider credentials even when the user has not configured that provider in
-  // ReplayLab. A managed subscription/ACP process must never inherit an unrelated model API key
+  // ReplayLab. A managed subscription process must never inherit an unrelated model API key
   // merely because qrenderdoc was launched from a developer shell containing it.
   static const char *const known[] = {
       "OPENAI_API_KEY",       "ANTHROPIC_API_KEY",  "GOOGLE_API_KEY",
@@ -572,6 +626,12 @@ struct ProviderCatalogTranslation
   ProviderCatalogText text;
 };
 
+struct ProviderRuntimeTranslation
+{
+  const char *messageId;
+  ProviderCatalogText text;
+};
+
 // ReplayLab's provider catalog is runtime JSON, so lupdate cannot discover it on its own. Keep an
 // exact (preset ID, field, English source) registry here: known catalog text is translated, while
 // changed or third-party text safely falls back to the backend value instead of receiving a stale
@@ -622,26 +682,7 @@ static const ProviderCatalogTranslation providerCatalogTranslations[] = {
                         "provider.custom-openai.title")},
     {"codex", "title",
      QT_TRANSLATE_NOOP3("AIAssistant", "Codex / ChatGPT subscription", "provider.codex.title")},
-    {"copilot-acp", "title",
-     QT_TRANSLATE_NOOP3("AIAssistant", "GitHub Copilot CLI (ACP)",
-                        "provider.copilot-acp.title")},
-    {"gemini-acp", "title",
-     QT_TRANSLATE_NOOP3("AIAssistant", "Gemini CLI (ACP)", "provider.gemini-acp.title")},
-    {"qwen-acp", "title",
-     QT_TRANSLATE_NOOP3("AIAssistant", "Qwen Code / Coding Plan (ACP)",
-                        "provider.qwen-acp.title")},
-    {"kimi-acp", "title",
-     QT_TRANSLATE_NOOP3("AIAssistant", "Kimi CLI (ACP)", "provider.kimi-acp.title")},
-    {"custom-acp", "title",
-     QT_TRANSLATE_NOOP3("AIAssistant", "Custom ACP agent", "provider.custom-acp.title")},
 
-    {"anthropic", "note",
-     QT_TRANSLATE_NOOP3(
-         "AIAssistant",
-         "Claude API is supported here. Claude Code does not publish an ACP server mode, so "
-         "subscription access is not presented as ACP. A future dedicated CLI connector must "
-         "also follow Anthropic's third-party authentication terms.",
-         "provider.anthropic.note")},
     {"azure-openai", "note",
      QT_TRANSLATE_NOOP3(
          "AIAssistant",
@@ -673,83 +714,100 @@ static const ProviderCatalogTranslation providerCatalogTranslations[] = {
          "AIAssistant",
          "Capabilities are unknown until probed; no feature is inferred from the name.",
          "provider.custom-openai.note")},
-    {"copilot-acp", "note",
-     QT_TRANSLATE_NOOP3(
-         "AIAssistant",
-         "Uses the official `copilot login --web-flow/--device-code` command, then tests `copilot "
-         "--acp`. The ACP handshake may expose model choices; otherwise leave the model blank to "
-         "use Copilot's default or enter an exact supported model manually.",
-         "provider.copilot-acp.note")},
-    {"gemini-acp", "note",
-     QT_TRANSLATE_NOOP3(
-         "AIAssistant",
-         "Gemini authenticates interactively before ReplayLab starts `gemini --acp`. Model "
-         "choices are used only when the ACP session exposes them; otherwise use the provider "
-         "default or enter an exact model supported by your installed CLI.",
-         "provider.gemini-acp.note")},
-    {"qwen-acp", "note",
-     QT_TRANSLATE_NOOP3(
-         "AIAssistant",
-         "Qwen OAuth was discontinued on 2026-04-15. This wizard opens `qwen` for the current "
-         "/auth Coding Plan/API-provider setup, then tests `qwen --acp`. ACP model choices are "
-         "used when exposed; otherwise use the configured default or enter an exact model.",
-         "provider.qwen-acp.note")},
-    {"kimi-acp", "note",
-     QT_TRANSLATE_NOOP3(
-         "AIAssistant",
-         "Uses the official RFC 8628 `kimi login` device-code flow, then tests `kimi acp`. "
-         "ReplayLab imports model choices exposed by the ACP session; if none are exposed, leave "
-         "the model blank for Kimi's default or enter a configured model alias.",
-         "provider.kimi-acp.note")},
-
     {"codex", "install_hint",
      QT_TRANSLATE_NOOP3("AIAssistant",
                         "Install the official Codex CLI: "
                         "https://developers.openai.com/codex/cli/",
                         "provider.codex.install_hint")},
-    {"copilot-acp", "install_hint",
-     QT_TRANSLATE_NOOP3(
-         "AIAssistant",
-         "GitHub Copilot CLI was not found. Install it with `winget install GitHub.Copilot` or "
-         "`npm install -g @github/copilot`, then restart qrenderdoc. Official guide: "
-         "https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/"
-         "install-copilot-cli",
-         "provider.copilot-acp.install_hint")},
-    {"gemini-acp", "install_hint",
-     QT_TRANSLATE_NOOP3(
-         "AIAssistant",
-         "Gemini CLI was not found. Install it with `npm install -g @google/gemini-cli`, then "
-         "restart qrenderdoc. Official guide: https://github.com/google-gemini/gemini-cli/blob/"
-         "main/docs/get-started/installation.mdx",
-         "provider.gemini-acp.install_hint")},
-    {"qwen-acp", "install_hint",
-     QT_TRANSLATE_NOOP3(
-         "AIAssistant",
-         "Qwen Code was not found. Install it with `npm install -g "
-         "@qwen-code/qwen-code@latest` (or the official Windows installer), then restart "
-         "qrenderdoc. Official guide: "
-         "https://qwenlm.github.io/qwen-code-docs/en/users/quickstart/",
-         "provider.qwen-acp.install_hint")},
-    {"kimi-acp", "install_hint",
-     QT_TRANSLATE_NOOP3(
-         "AIAssistant",
-         "Kimi Code CLI was not found. Install it with the official Windows script or `npm "
-         "install -g @moonshot-ai/kimi-code`, then restart qrenderdoc. Official guide: "
-         "https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started.html",
-         "provider.kimi-acp.install_hint")},
+};
 
-    {"gemini-acp", "subscription_instruction",
+// Subscription events are backend protocol data. Translate only stable message IDs; the raw
+// English text remains a diagnostic fallback for unknown/third-party messages.
+static const ProviderRuntimeTranslation providerRuntimeTranslations[] = {
+    {"subscription.cli-detected",
+     QT_TRANSLATE_NOOP3(
+         "AIAssistant", "%1 CLI detected; sign-in state is checked only after approval.",
+         "subscription.cli-detected")},
+    {"subscription.cli-missing",
+     QT_TRANSLATE_NOOP3("AIAssistant", "Required provider CLI was not found: %1\n%2",
+                        "subscription.cli-missing")},
+    {"subscription.waiting-for-containment",
+     QT_TRANSLATE_NOOP3(
+         "AIAssistant", "Waiting for qrenderdoc process containment before starting the provider.",
+         "subscription.waiting-for-containment")},
+    {"subscription.sign-in-started",
+     QT_TRANSLATE_NOOP3(
+         "AIAssistant", "Provider sign-in started inside the qrenderdoc process job.",
+         "subscription.sign-in-started")},
+    {"subscription.test-started",
+     QT_TRANSLATE_NOOP3(
+         "AIAssistant", "Running a bounded no-generation provider connection test.",
+         "subscription.test-started")},
+    {"subscription.browser-waiting",
+     QT_TRANSLATE_NOOP3(
+         "AIAssistant", "Waiting for %1 browser/device authorization.",
+         "subscription.browser-waiting")},
+    {"subscription.browser-complete",
+     QT_TRANSLATE_NOOP3("AIAssistant", "Complete provider authorization in the browser.",
+                        "subscription.browser-complete")},
+    {"subscription.cancelled-before-start",
+     QT_TRANSLATE_NOOP3("AIAssistant",
+                        "Subscription operation cancelled before provider startup.",
+                        "subscription.cancelled-before-start")},
+    {"subscription.start-gate-closed",
      QT_TRANSLATE_NOOP3(
          "AIAssistant",
-         "Choose Sign in with Google in the Gemini terminal, complete the browser flow, then "
-         "exit the terminal after authentication succeeds.",
-         "provider.gemini-acp.subscription_instruction")},
-    {"qwen-acp", "subscription_instruction",
+         "Subscription start gate closed before 'start'; no provider process was created.",
+         "subscription.start-gate-closed")},
+    {"subscription.custom-login-skipped",
      QT_TRANSLATE_NOOP3(
          "AIAssistant",
-         "Type /auth in the Qwen terminal, configure Alibaba ModelStudio Coding Plan or an API "
-         "provider, then exit after /doctor reports a usable configuration.",
-         "provider.qwen-acp.subscription_instruction")},
+         "Custom ACP has no guessed login command; running only the configured handshake test.",
+         "subscription.custom-login-skipped")},
+    {"subscription.acp-test-models",
+     QT_TRANSLATE_NOOP3(
+         "AIAssistant",
+         "ACP initialize/session handshake succeeded without sending a prompt; the session "
+         "exposed %1 model choice(s).",
+         "subscription.acp-test-models")},
+    {"subscription.acp-test-no-models",
+     QT_TRANSLATE_NOOP3(
+         "AIAssistant",
+         "ACP initialize/session handshake succeeded without sending a prompt. This Agent did "
+         "not expose a standard model list; leave the model unset to use its configured default, "
+         "or enter an exact model only if that CLI supports ACP model selection.",
+         "subscription.acp-test-no-models")},
+    {"subscription.acp-login-completed",
+     QT_TRANSLATE_NOOP3("AIAssistant", "%1 login command completed; testing ACP now.",
+                        "subscription.acp-login-completed")},
+    {"subscription.terminal-opened",
+     QT_TRANSLATE_NOOP3("AIAssistant",
+                        "Complete authentication in the %1 terminal, then exit it.",
+                        "subscription.terminal-opened")},
+    {"subscription.terminal-login-completed",
+     QT_TRANSLATE_NOOP3("AIAssistant", "%1 terminal exited; testing ACP now.",
+                        "subscription.terminal-login-completed")},
+    {"subscription.codex-signed-out",
+     QT_TRANSLATE_NOOP3("AIAssistant", "Codex is signed out.",
+                        "subscription.codex-signed-out")},
+    {"subscription.codex-account-ready",
+     QT_TRANSLATE_NOOP3("AIAssistant", "Codex account and model catalog are available.",
+                        "subscription.codex-account-ready")},
+    {"subscription.codex-browser-complete",
+     QT_TRANSLATE_NOOP3("AIAssistant", "Complete Codex sign-in in the browser.",
+                        "subscription.codex-browser-complete")},
+    {"subscription.codex-login-completed",
+     QT_TRANSLATE_NOOP3("AIAssistant", "Codex login completed.",
+                        "subscription.codex-login-completed")},
+    {"subscription.codex-login-failed",
+     QT_TRANSLATE_NOOP3("AIAssistant", "Codex login failed.",
+                        "subscription.codex-login-failed")},
+    {"subscription.codex-account-unauthenticated",
+     QT_TRANSLATE_NOOP3("AIAssistant", "Codex account is not authenticated.",
+                        "subscription.codex-account-unauthenticated")},
+    {"subscription.codex-sign-in-test-succeeded",
+     QT_TRANSLATE_NOOP3("AIAssistant", "Codex sign-in and model catalog test succeeded.",
+                        "subscription.codex-sign-in-test-succeeded")},
 };
 
 QString localizeProviderCatalogText(const QString &presetId, const QString &field,
@@ -774,6 +832,11 @@ QString localizeProviderCatalogField(const QJsonObject &preset, const char *fiel
   // i18n-ignore: ReplayLab provider-catalog JSON field name used only for lookup.
   const QString presetIdKey = lit("id");
   const QString fieldName = QString::fromLatin1(field);
+  // The qrenderdoc connection UI intentionally exposes model APIs and Codex subscription only.
+  // Hide catalog notes whose sole purpose was to explain why another subscription CLI is absent.
+  // i18n-ignore: provider catalog field and preset identifiers used only for filtering.
+  if(fieldName == lit("note") && preset.value(presetIdKey).toString() == lit("anthropic"))
+    return QString();
   return localizeProviderCatalogText(preset.value(presetIdKey).toString(), fieldName,
                                      preset.value(fieldName).toString());
 }
@@ -793,10 +856,57 @@ QString localizeProviderRuntimeText(const QString &presetId, const QString &sour
   return source;
 }
 
+QString localizeProviderRuntimeMessage(const QString &presetId, const QString &messageId,
+                                       const QJsonArray &arguments, const QString &fallback)
+{
+  if(!messageId.isEmpty())
+  {
+    for(const ProviderRuntimeTranslation &entry : providerRuntimeTranslations)
+    {
+      if(messageId != QLatin1String(entry.messageId))
+        continue;
+      QString result = QCoreApplication::translate("AIAssistant", entry.text.source,
+                                                   entry.text.disambiguation);
+      const int count = qMin(arguments.size(), 8);
+      for(int i = 0; i < count; ++i)
+      {
+        QString value = arguments.at(i).toVariant().toString().left(512);
+        // i18n-ignore: stable ReplayLab runtime-message protocol ID.
+        if(messageId == QLatin1String("subscription.cli-missing") && i == 1)
+          // i18n-ignore: provider-catalog field identifier used only for localized lookup.
+          value = localizeProviderCatalogText(presetId, lit("install_hint"), value);
+        result = result.arg(value);
+      }
+      return result;
+    }
+  }
+  return localizeProviderRuntimeText(presetId, fallback);
+}
+
 QString connectionDisplayName(const QJsonObject &row)
 {
   const QString title = row.value(lit("title")).toString().trimmed();
   return title.isEmpty() ? row.value(lit("id")).toString() : title;
+}
+
+bool supportedQRenderDocConnection(const QJsonObject &object)
+{
+  // i18n-ignore: ReplayLab provider/profile JSON field name.
+  QString presetId = object.value(lit("preset")).toString();
+  if(presetId.isEmpty())
+    // i18n-ignore: ReplayLab provider-catalog JSON field name.
+    presetId = object.value(lit("id")).toString();
+  // i18n-ignore: ReplayLab provider kind and preset identifiers used only for filtering.
+  const QString kind = object.value(lit("kind")).toString();
+  // i18n-ignore: ReplayLab provider protocol field and identifier used only for filtering.
+  const QString protocol = object.value(lit("protocol")).toString();
+  const QString modelKind = lit("model");    // i18n-ignore: provider kind identifier.
+  const QString agentKind = lit("agent");    // i18n-ignore: provider kind identifier.
+  const QString codexPreset = lit("codex");    // i18n-ignore: provider preset identifier.
+  const QString codexProtocol =
+      lit("codex-app-server");    // i18n-ignore: provider protocol identifier.
+  return kind == modelKind ||
+         (kind == agentKind && presetId == codexPreset && protocol == codexProtocol);
 }
 
 QString internalConnectionId()
@@ -854,10 +964,13 @@ AIAssistant::AIAssistant(CaptureContext &ctx, QWidget *parent) : QFrame(parent),
   m_Status->setMinimumWidth(110);
   connectionRow->addWidget(m_Status);
   connectionRow->addStretch(1);
-  QPushButton *connections = new QPushButton(tr("AI Settings..."), this);
-  QPushButton *doctor = new QPushButton(tr("Check"), this);
+  QToolButton *connections = new QToolButton(this);
+  connections->setAutoRaise(true);
+  connections->setFixedSize(30, 30);
+  connections->setIcon(Icons::cog());
+  connections->setToolTip(tr("AI Settings"));
+  connections->setAccessibleName(tr("AI Settings"));
   connectionRow->addWidget(connections);
-  connectionRow->addWidget(doctor);
   mainLayout->addLayout(connectionRow);
 
   m_Context = new QLabel(this);
@@ -906,6 +1019,36 @@ AIAssistant::AIAssistant(CaptureContext &ctx, QWidget *parent) : QFrame(parent),
   m_PendingChats->setDeleteHandler(
       [this](const QString &taskId) { deleteQueuedChat(taskId); });
   composerLayout->addWidget(m_PendingChats);
+
+  m_ClarificationPanel = new QFrame(composer);
+  m_ClarificationPanel->setFrameShape(QFrame::StyledPanel);
+  // i18n-ignore: QObject name is an internal stylesheet selector, not user-visible text.
+  m_ClarificationPanel->setObjectName(lit("aiClarificationPanel"));
+  m_ClarificationPanel->setStyleSheet(
+      // i18n-ignore: Qt stylesheet syntax contains no user-visible text.
+      lit("QFrame#aiClarificationPanel { border: 1px solid palette(mid); "
+          "border-radius: 6px; background: palette(alternate-base); }"));
+  QVBoxLayout *clarificationLayout = new QVBoxLayout(m_ClarificationPanel);
+  clarificationLayout->setContentsMargins(8, 7, 8, 7);
+  clarificationLayout->setSpacing(5);
+  m_ClarificationQuestion = new QLabel(m_ClarificationPanel);
+  m_ClarificationQuestion->setWordWrap(true);
+  m_ClarificationQuestion->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  clarificationLayout->addWidget(m_ClarificationQuestion);
+  m_ClarificationOptions = new QWidget(m_ClarificationPanel);
+  m_ClarificationOptionsLayout = new QVBoxLayout(m_ClarificationOptions);
+  m_ClarificationOptionsLayout->setContentsMargins(0, 0, 0, 0);
+  m_ClarificationOptionsLayout->setSpacing(3);
+  clarificationLayout->addWidget(m_ClarificationOptions);
+  QHBoxLayout *clarificationSubmitRow = new QHBoxLayout();
+  clarificationSubmitRow->setContentsMargins(0, 0, 0, 0);
+  clarificationSubmitRow->addStretch(1);
+  m_ClarificationSubmit = new QPushButton(tr("Continue"), m_ClarificationPanel);
+  m_ClarificationSubmit->setEnabled(false);
+  clarificationSubmitRow->addWidget(m_ClarificationSubmit);
+  clarificationLayout->addLayout(clarificationSubmitRow);
+  m_ClarificationPanel->setVisible(false);
+  composerLayout->addWidget(m_ClarificationPanel);
 
   AIPromptEdit *promptEdit = new AIPromptEdit(composer);
   m_Prompt = promptEdit;
@@ -964,27 +1107,33 @@ AIAssistant::AIAssistant(CaptureContext &ctx, QWidget *parent) : QFrame(parent),
   composerLayout->addLayout(sendRow);
   mainLayout->addWidget(composer);
 
-  connect(connections, &QPushButton::clicked, this, [this]() { manageConnections(); });
-  connect(doctor, &QPushButton::clicked, this, [this]() { runDoctor(); });
+  connect(connections, &QToolButton::clicked, this, [this]() { manageConnections(); });
   connect(m_ProfileCombo, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged),
           this, [this](int index) { selectProfile(index); });
   connect(m_ModelCombo, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged),
           this, [this](int index) { selectModel(index); });
   connect(explain, &QPushButton::clicked, this, [this]() {
-    queueNativeIntent(ReplayLabIntegration::Intent::ExplainCurrentEvent,
-                      tr("Explain current event"));
+    StartCaptureSkill(tr("Explain current event"),
+                      lit("renderdoc-explain-event"),    // i18n-ignore: internal Skill identifier
+                      QString(),
+                      lit("explain-current-event"));    // i18n-ignore: stable UI intent identifier
   });
   connect(pixel, &QPushButton::clicked, this, [this]() {
-    queueNativeIntent(ReplayLabIntegration::Intent::InspectPickedPixel,
-                      tr("Inspect picked pixel"));
+    StartCaptureSkill(tr("Inspect picked pixel"),
+                      lit("renderdoc-explain-event"),    // i18n-ignore: internal Skill identifier
+                      QString(),
+                      lit("inspect-picked-pixel"));    // i18n-ignore: stable UI intent identifier
   });
   connect(shader, &QPushButton::clicked, this,
           [this, shader]() { showShaderIntentMenu(shader); });
   connect(performance, &QPushButton::clicked, this, [this]() {
-    startChat(tr("Diagnose the current frame's GPU performance using capture evidence."),
-              lit("renderdoc-performance"), false);
+    StartCaptureSkill(
+        tr("Diagnose the current frame's GPU performance using capture evidence."),
+        lit("renderdoc-explain-event"));    // i18n-ignore: internal Skill identifier
   });
   connect(newConversation, &QPushButton::clicked, this, [this]() { createConversation(); });
+  connect(m_ClarificationSubmit, &QPushButton::clicked, this,
+          [this]() { submitClarification(); });
   m_ConversationList->setSelectHandler(
       [this](const QString &conversationId) { selectConversation(conversationId); });
   m_ConversationList->setPinHandler(
@@ -1003,19 +1152,9 @@ AIAssistant::AIAssistant(CaptureContext &ctx, QWidget *parent) : QFrame(parent),
   connect(m_Cancel, &QPushButton::clicked, this,
           [this]() { cancelChat(lit("cancelled"), true); });
 
-  m_SupervisorTimer = new QTimer(this);
-  m_SupervisorTimer->setInterval(1000);
-  connect(m_SupervisorTimer, &QTimer::timeout, this, [this]() { ensureWorker(); });
-  m_SupervisorTimer->start();
-
   m_EventTimer = new QTimer(this);
   m_EventTimer->setInterval(250);
   connect(m_EventTimer, &QTimer::timeout, this, [this]() { pollTaskEvents(); });
-  m_EventTimer->start();
-
-  m_WorkerStopTimer = new QTimer(this);
-  m_WorkerStopTimer->setSingleShot(true);
-  connect(m_WorkerStopTimer, &QTimer::timeout, this, [this]() { workerStopTimedOut(); });
 
   m_ConversationSaveTimer = new QTimer(this);
   m_ConversationSaveTimer->setSingleShot(true);
@@ -1056,16 +1195,12 @@ void AIAssistant::Shutdown()
   if(m_ShuttingDown)
     return;
   m_ShuttingDown = true;
-  if(m_SupervisorTimer)
-    m_SupervisorTimer->stop();
   if(m_EventTimer)
     m_EventTimer->stop();
   if(m_ConversationRenderTimer)
     m_ConversationRenderTimer->stop();
-  // CaptureContext tears down the bridge extensions immediately after this returns. Enter the
-  // async worker stop state for ordinary bookkeeping, then perform terminal bounded containment
-  // now so no process callback can race extension destruction.
-  stopWorker(false);
+  // CaptureContext tears down the bridge extensions immediately after this returns. Stop the
+  // active per-task process now so no callback can race extension destruction.
   forceStopProcessesForDestruction();
   cancelChat(QString(), false);
   saveConversations();
@@ -1095,6 +1230,9 @@ QString AIAssistant::appendUser(const QString &text, const QString &taskId, cons
   ConversationThread *thread = conversation(conversationId);
   if(!thread)
     return QString();
+  // Any accepted user turn resolves the currently displayed clarification. The prompt still
+  // travels through startChat/StartCaptureSkill so its RenderDoc context is frozen normally.
+  clearClarification(thread->id);
   AIChatMessage item;
   item.id = newMessageId();
   item.role = lit("user");
@@ -1494,6 +1632,366 @@ void AIAssistant::setTaskState(const QString &taskId, const QString &state,
   scheduleConversationSave();
 }
 
+bool AIAssistant::clarificationFromJSON(const QJsonObject &object, const QString &fallbackId,
+                                        ClarificationPrompt &clarification) const
+{
+  clarification = ClarificationPrompt();
+  if(object.isEmpty())
+    return false;
+
+  // i18n-ignore: ReplayLab clarification protocol field names and enum values.
+  const QJsonValue questionValue = object.value(lit("question"));    // i18n-ignore: clarification protocol key
+  const QJsonValue modeValue = object.value(lit("selectionMode"));    // i18n-ignore: clarification protocol key
+  const QJsonValue optionsValue = object.value(lit("options"));    // i18n-ignore: clarification protocol key
+  const QJsonValue allowOtherValue = object.value(lit("allowOther"));    // i18n-ignore: clarification protocol key
+  if(!questionValue.isString() || !modeValue.isString() || !optionsValue.isArray() ||
+     !allowOtherValue.isBool())
+    return false;
+
+  const QString question = questionValue.toString().trimmed();
+  const QString selectionMode = modeValue.toString();
+  // i18n-ignore: ReplayLab clarification selection-mode enum values.
+  if(question.isEmpty() || question.size() > 2400 ||
+     (selectionMode != lit("single") &&    // i18n-ignore: clarification protocol enum
+      selectionMode != lit("multiple")))    // i18n-ignore: clarification protocol enum
+    return false;
+
+  const QJsonArray optionRows = optionsValue.toArray();
+  if(optionRows.size() < 2 || optionRows.size() > 6)
+    return false;
+  const QRegularExpression safeId(
+      lit("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"));    // i18n-ignore: protocol ID validation regex
+  QSet<QString> optionIds;
+  QVector<ClarificationOption> options;
+  options.reserve(optionRows.size());
+  for(const QJsonValue &value : optionRows)
+  {
+    if(!value.isObject())
+      return false;
+    const QJsonObject row = value.toObject();
+    // i18n-ignore: ReplayLab clarification protocol field names.
+    if(!row.value(lit("id")).isString() || !row.value(lit("label")).isString())
+      return false;
+    const QString id = row.value(lit("id")).toString();    // i18n-ignore: clarification protocol key
+    const QString label = row.value(lit("label")).toString().simplified();    // i18n-ignore: clarification protocol key
+    const QJsonValue descriptionValue = row.value(lit("description"));    // i18n-ignore: clarification protocol key
+    if(!descriptionValue.isUndefined() && !descriptionValue.isString())
+      return false;
+    const QString description = descriptionValue.toString().trimmed();
+    if(!safeId.match(id).hasMatch() || optionIds.contains(id) || label.isEmpty() ||
+       label.size() > 240 || description.size() > 600)
+      return false;
+    optionIds.insert(id);
+    options.push_back({id, label, description});
+  }
+
+  QString id;
+  // i18n-ignore: ReplayLab clarification protocol field name.
+  const QJsonValue idValue = object.value(lit("id"));
+  if(idValue.isString())
+    id = idValue.toString();
+  else if(!idValue.isUndefined() && !idValue.isNull())
+    return false;
+  if(id.isEmpty())
+    id = lit("clarification-") + fallbackId.left(48);    // i18n-ignore: internal protocol ID prefix
+  if(!safeId.match(id).hasMatch())
+    return false;
+
+  QString submitLabel;
+  // i18n-ignore: ReplayLab clarification protocol field name.
+  const QJsonValue submitLabelValue = object.value(lit("submitLabel"));
+  if(submitLabelValue.isString())
+    submitLabel = submitLabelValue.toString().simplified();
+  else if(!submitLabelValue.isUndefined() && !submitLabelValue.isNull())
+    return false;
+  if(submitLabel.size() > 64)
+    return false;
+
+  clarification.id = id;
+  clarification.question = question;
+  clarification.selectionMode = selectionMode;
+  clarification.options = options;
+  clarification.allowOther = allowOtherValue.toBool();
+  clarification.submitLabel = submitLabel;
+
+  // Persisted native clarifications may carry the exact frozen origin. Backend events normally do
+  // not: bindClarificationOrigin() attaches the trusted active request after protocol validation.
+  // i18n-ignore: ReplayLab persisted clarification protocol field names.
+  const QJsonValue originSnapshotValue = object.value(lit("originContextSnapshot"));
+  const QJsonValue originInstanceValue =
+      object.value(lit("originContextInstanceId"));    // i18n-ignore: persisted clarification protocol key
+  if(!originSnapshotValue.isUndefined() || !originInstanceValue.isUndefined())
+  {
+    if(!originSnapshotValue.isObject() || !originInstanceValue.isString())
+      return false;
+    const QByteArray encodedOrigin =
+        QJsonDocument(originSnapshotValue.toObject()).toJson(QJsonDocument::Compact);
+    const QString originInstance = originInstanceValue.toString();
+    if(originInstance.trimmed().isEmpty() || originInstance.size() > 160 ||
+       !decodeContextSnapshot(encodedOrigin))
+      return false;
+    clarification.originContextSnapshot = encodedOrigin;
+    clarification.originContextInstanceId = originInstance;
+  }
+  return clarification.isValid();
+}
+
+QJsonObject AIAssistant::clarificationToJSON(
+    const ClarificationPrompt &clarification) const
+{
+  QJsonObject object;
+  // i18n-ignore: Persisted ReplayLab clarification protocol field names.
+  object[lit("id")] = clarification.id;    // i18n-ignore: clarification protocol key
+  object[lit("question")] = clarification.question;    // i18n-ignore: clarification protocol key
+  object[lit("selectionMode")] = clarification.selectionMode;    // i18n-ignore: clarification protocol key
+  object[lit("allowOther")] = clarification.allowOther;    // i18n-ignore: clarification protocol key
+  if(!clarification.submitLabel.isEmpty())
+    object[lit("submitLabel")] = clarification.submitLabel;    // i18n-ignore: clarification protocol key
+  QJsonArray options;
+  for(const ClarificationOption &option : clarification.options)
+  {
+    QJsonObject row;
+    row[lit("id")] = option.id;    // i18n-ignore: clarification protocol key
+    row[lit("label")] = option.label;    // i18n-ignore: clarification protocol key
+    if(!option.description.isEmpty())
+      row[lit("description")] = option.description;    // i18n-ignore: clarification protocol key
+    options.push_back(row);
+  }
+  object[lit("options")] = options;    // i18n-ignore: clarification protocol key
+  const QJsonObject origin = contextCandidateJSON(clarification.originContextSnapshot,
+                                                  clarification.originContextInstanceId);
+  if(!origin.isEmpty())
+  {
+    // i18n-ignore: Persisted ReplayLab clarification protocol field names.
+    object[lit("originContextSnapshot")] = origin.value(lit("snapshot"));
+    object[lit("originContextInstanceId")] =    // i18n-ignore: persisted clarification protocol key
+        clarification.originContextInstanceId;
+  }
+  return object;
+}
+
+void AIAssistant::bindClarificationOrigin(ClarificationPrompt &clarification,
+                                          const QString &taskId) const
+{
+  if(decodeContextSnapshot(clarification.originContextSnapshot) &&
+     !clarification.originContextInstanceId.trimmed().isEmpty())
+    return;
+  if(m_ActiveChatRequest.taskId == taskId &&
+     decodeContextSnapshot(m_ActiveChatRequest.contextSnapshot) &&
+     !m_ActiveChatRequest.contextInstanceId.trimmed().isEmpty())
+  {
+    clarification.originContextSnapshot = m_ActiveChatRequest.contextSnapshot;
+    clarification.originContextInstanceId = m_ActiveChatRequest.contextInstanceId;
+  }
+}
+
+void AIAssistant::updateClarificationUI()
+{
+  if(!m_ClarificationPanel || !m_ClarificationOptionsLayout)
+    return;
+
+  const ConversationThread *thread = conversation();
+  const ClarificationPrompt *clarification =
+      thread && thread->clarification.isValid() ? &thread->clarification : NULL;
+  const QString key = clarification ? thread->id + lit("\n") + clarification->id : QString();
+  if(clarification && key == m_VisibleClarificationKey)
+  {
+    m_ClarificationPanel->setVisible(true);
+    updateClarificationSubmitState();
+    return;
+  }
+
+  delete m_ClarificationButtonGroup;
+  m_ClarificationButtonGroup = NULL;
+  m_ClarificationButtons.clear();
+  m_ClarificationOtherEdit = NULL;
+  while(QLayoutItem *item = m_ClarificationOptionsLayout->takeAt(0))
+  {
+    delete item->widget();
+    delete item;
+  }
+  m_VisibleClarificationKey.clear();
+
+  if(!clarification)
+  {
+    m_ClarificationPanel->setVisible(false);
+    return;
+  }
+
+  m_VisibleClarificationKey = key;
+  m_ClarificationQuestion->setText(clarification->question);
+  m_ClarificationButtonGroup = new QButtonGroup(m_ClarificationPanel);
+  // i18n-ignore: ReplayLab clarification selection-mode enum value.
+  m_ClarificationButtonGroup->setExclusive(clarification->selectionMode == lit("single"));
+  const QString choiceStyle =
+      // i18n-ignore: Qt stylesheet syntax contains no user-visible text.
+      lit("QCommandLinkButton { border: 1px solid palette(mid); border-radius: 5px; "
+          "padding: 5px; text-align: left; } "
+          "QCommandLinkButton:hover { background: palette(midlight); } "
+          "QCommandLinkButton:checked { border: 2px solid palette(highlight); "
+          "background: palette(base); }");
+  for(const ClarificationOption &option : clarification->options)
+  {
+    QCommandLinkButton *choice = new QCommandLinkButton(option.label, m_ClarificationOptions);
+    choice->setDescription(option.description);
+    choice->setAccessibleName(option.label);
+    choice->setAccessibleDescription(option.description);
+    choice->setCheckable(true);
+    choice->setStyleSheet(choiceStyle);
+    // i18n-ignore: Dynamic QObject properties are internal clarification protocol state.
+    choice->setProperty("clarificationOptionId", option.id);
+    choice->setProperty("clarificationOptionLabel", option.label);
+    choice->setProperty("clarificationOther", false);
+    m_ClarificationButtonGroup->addButton(choice);
+    m_ClarificationButtons.push_back(choice);
+    m_ClarificationOptionsLayout->addWidget(choice);
+    connect(choice, &QCommandLinkButton::toggled, this,
+            [this](bool) { updateClarificationSubmitState(); });
+  }
+
+  if(clarification->allowOther)
+  {
+    QCommandLinkButton *other = new QCommandLinkButton(tr("Other"), m_ClarificationOptions);
+    other->setDescription(tr("Enter a different answer."));
+    other->setAccessibleName(tr("Other"));
+    other->setAccessibleDescription(tr("Enter a different answer."));
+    other->setCheckable(true);
+    other->setStyleSheet(choiceStyle);
+    other->setProperty("clarificationOther", true);
+    m_ClarificationButtonGroup->addButton(other);
+    m_ClarificationButtons.push_back(other);
+    m_ClarificationOptionsLayout->addWidget(other);
+    m_ClarificationOtherEdit = new QLineEdit(m_ClarificationOptions);
+    m_ClarificationOtherEdit->setPlaceholderText(tr("Enter another answer"));
+    m_ClarificationOtherEdit->setMaxLength(MaxClarificationOtherChars);
+    m_ClarificationOtherEdit->setEnabled(false);
+    m_ClarificationOptionsLayout->addWidget(m_ClarificationOtherEdit);
+    connect(other, &QCommandLinkButton::toggled, this, [this](bool checked) {
+      if(m_ClarificationOtherEdit)
+      {
+        m_ClarificationOtherEdit->setEnabled(checked);
+        if(checked)
+          m_ClarificationOtherEdit->setFocus(Qt::OtherFocusReason);
+      }
+      updateClarificationSubmitState();
+    });
+    connect(m_ClarificationOtherEdit, &QLineEdit::textChanged, this,
+            [this, other](const QString &text) {
+              if(!text.trimmed().isEmpty() && !other->isChecked())
+                other->setChecked(true);
+              updateClarificationSubmitState();
+            });
+  }
+
+  QString submitText = tr("Continue");
+  // submitLabel is a provider hint, never unrestricted UI text. Localise only the stable values
+  // known by qrenderdoc and fall back to the canonical Continue label for unknown values.
+  if(clarification->submitLabel.compare(lit("Confirm"), Qt::CaseInsensitive) == 0)    // i18n-ignore: submitLabel protocol enum
+    submitText = tr("Confirm");
+  else if(clarification->submitLabel.compare(lit("Submit"), Qt::CaseInsensitive) == 0)    // i18n-ignore: submitLabel protocol enum
+    submitText = tr("Submit");
+  m_ClarificationSubmit->setText(submitText);
+  m_ClarificationPanel->setVisible(true);
+  updateClarificationSubmitState();
+}
+
+void AIAssistant::updateClarificationSubmitState()
+{
+  if(!m_ClarificationSubmit)
+    return;
+  bool anySelected = false;
+  bool selectedOtherIsEmpty = false;
+  for(QCommandLinkButton *choice : m_ClarificationButtons)
+  {
+    if(!choice || !choice->isChecked())
+      continue;
+    anySelected = true;
+    if(choice->property("clarificationOther").toBool() &&
+       (!m_ClarificationOtherEdit || m_ClarificationOtherEdit->text().trimmed().isEmpty()))
+      selectedOtherIsEmpty = true;
+  }
+  m_ClarificationSubmit->setEnabled(anySelected && !selectedOtherIsEmpty);
+}
+
+void AIAssistant::submitClarification()
+{
+  const ConversationThread *thread = conversation();
+  if(!thread || !thread->clarification.isValid())
+    return;
+
+  QStringList selected;
+  QStringList selectedIds;
+  QString otherText;
+  for(QCommandLinkButton *choice : m_ClarificationButtons)
+  {
+    if(!choice || !choice->isChecked())
+      continue;
+    if(choice->property("clarificationOther").toBool())
+    {
+      if(m_ClarificationOtherEdit)
+        otherText = m_ClarificationOtherEdit->text().trimmed();
+    }
+    else
+    {
+      const QString optionId = choice->property("clarificationOptionId").toString();    // i18n-ignore: internal clarification property
+      const QString label = choice->property("clarificationOptionLabel").toString().simplified();
+      if(!optionId.isEmpty() && !label.isEmpty())
+      {
+        selectedIds.push_back(optionId);
+        selected.push_back(label);
+      }
+    }
+  }
+
+  QString answer;
+  // i18n-ignore: ReplayLab clarification selection-mode enum value.
+  if(thread->clarification.selectionMode == lit("single"))
+  {
+    if(!otherText.isEmpty())
+      answer = otherText;
+    else if(selected.size() == 1)
+      answer = tr("My choice: %1").arg(selected.front());
+  }
+  else
+  {
+    if(!otherText.isEmpty())
+      selected.push_back(otherText);
+    if(!selected.isEmpty())
+    {
+      QStringList rows;
+      for(const QString &item : selected)
+        rows.push_back(lit("- ") + item);
+      answer = tr("My choices:\n%1").arg(rows.join(QLatin1Char('\n')));
+    }
+  }
+  if(!answer.trimmed().isEmpty())
+  {
+    ClarificationResponse response;
+    response.clarificationId = thread->clarification.id;
+    response.optionIds = selectedIds;
+    response.otherText = otherText;
+    response.originContextSnapshot = thread->clarification.originContextSnapshot;
+    response.originContextInstanceId = thread->clarification.originContextInstanceId;
+    // Keep the readable answer in the transcript. Stable IDs and origin/current context candidates
+    // travel separately in replaylab-conversation/v2 for intent-aware resolution by AgentHost.
+    startChat(answer, QString(), true, QString(), response);
+  }
+}
+
+void AIAssistant::clearClarification(const QString &conversationId)
+{
+  ConversationThread *thread = conversation(conversationId);
+  if(!thread || !thread->clarification.isValid())
+    return;
+  thread->clarification = ClarificationPrompt();
+  if(thread->id == m_ActiveConversationId)
+  {
+    m_VisibleClarificationKey.clear();
+    updateClarificationUI();
+  }
+  scheduleConversationSave();
+}
+
 void AIAssistant::updateComposerState()
 {
   if(!m_QueueStatus)
@@ -1521,6 +2019,7 @@ void AIAssistant::updateComposerState()
   }
   if(m_Send)
     m_Send->setEnabled(true);
+  updateClarificationUI();
 }
 
 void AIAssistant::handleTranscriptLink(const QUrl &url)
@@ -1606,6 +2105,20 @@ QJsonObject AIAssistant::conversationToJSON(const ConversationThread &thread,
   object[lit("updatedUnixMs")] = QString::number(thread.updatedMs);
   object[lit("pinned")] = thread.pinned;
   object[lit("unread")] = thread.unread;
+  if(thread.clarification.isValid())
+  {
+    const QJsonObject clarificationObject = clarificationToJSON(thread.clarification);
+    // UTF-8 bytes conservatively count against the UTF-16 character budget. This keeps a
+    // persisted origin snapshot from evicting newer transcript rows beyond the store bound.
+    const int clarificationChars =
+        QJsonDocument(clarificationObject).toJson(QJsonDocument::Compact).size();
+    if(clarificationChars <= *remainingChars)
+    {
+      // i18n-ignore: Persisted ReplayLab clarification protocol field name.
+      object[lit("clarification")] = clarificationObject;
+      *remainingChars -= clarificationChars;
+    }
+  }
   QJsonArray messages;
   QVector<QJsonObject> selectedMessages;
   const int first = qMax(0, thread.messages.size() - MaxConversationMessages);
@@ -1678,6 +2191,14 @@ bool AIAssistant::conversationFromJSON(const QJsonObject &object, ConversationTh
     return false;
   if(thread.title.isEmpty())
     thread.title = tr("Conversation");
+  // i18n-ignore: Persisted ReplayLab clarification protocol field name.
+  const QJsonValue clarificationValue = object.value(lit("clarification"));
+  if(clarificationValue.isObject())
+  {
+    ClarificationPrompt clarification;
+    if(clarificationFromJSON(clarificationValue.toObject(), thread.id, clarification))
+      thread.clarification = clarification;
+  }
   const QJsonArray messages = object.value(lit("messages")).toArray();
   const int first = qMax(0, messages.size() - MaxConversationMessages);
   for(int i = first; i < messages.size(); ++i)
@@ -1985,31 +2506,6 @@ void AIAssistant::updateCaptureStatus()
   }
 }
 
-bool AIAssistant::queueNativeIntent(ReplayLabIntegration::Intent intent, const QString &prompt,
-                                    const QString &focusStage)
-{
-  if(!m_Ctx.IsCaptureLoaded())
-  {
-    appendSystem(tr("This action requires an open capture."), true);
-    return false;
-  }
-
-  QString error;
-  const QString taskId = m_Ctx.ReplayLab().QueueIntent(intent, focusStage, &error);
-  if(taskId.isEmpty())
-  {
-    appendSystem(error.isEmpty() ? tr("The built-in RenderDoc AI action could not be queued.")
-                                 : error,
-                 true);
-    return false;
-  }
-
-  m_PendingIntentPrompt = prompt;
-  NotifyIntentQueued(taskId);
-  m_PendingIntentPrompt.clear();
-  return true;
-}
-
 void AIAssistant::showShaderIntentMenu(QWidget *anchor)
 {
   if(!m_Ctx.IsCaptureLoaded())
@@ -2035,8 +2531,10 @@ void AIAssistant::showShaderIntentMenu(QWidget *anchor)
     // Stage names are protocol identifiers and intentionally remain untranslated.
     QAction *action = menu.addAction(stage);
     connect(action, &QAction::triggered, this, [this, stage]() {
-      queueNativeIntent(ReplayLabIntegration::Intent::ReverseEditSelectedShader,
-                        tr("Reverse/Edit selected shader with AI"), stage);
+      StartCaptureSkill(tr("Reverse/Edit selected shader with AI"),
+                        lit("renderdoc-shader-workbench"),    // i18n-ignore: internal Skill identifier
+                        stage,
+                        lit("reverse-edit-selected-shader"));    // i18n-ignore: stable UI intent identifier
     });
   }
 
@@ -2130,8 +2628,8 @@ void AIAssistant::configureProcess(QProcess *process, const QString &credentialP
   const QProcessEnvironment inherited = environment;
 
   // A qrenderdoc session can hold credentials for several model APIs. Give each AgentHost process
-  // only the key selected by its exact profile; managed subscription/ACP profiles receive none of
-  // these model credentials. The ACP connector applies a second allowlist to the vendor process.
+  // only the key selected by its exact profile; managed subscription profiles receive none of
+  // these model credentials. The subscription connector applies a second process allowlist.
   QSet<QString> credentialNames = knownModelCredentialEnvironments();
   for(auto it = m_ProfileKeyEnvs.cbegin(); it != m_ProfileKeyEnvs.cend(); ++it)
     if(!it.value().isEmpty())
@@ -2154,13 +2652,13 @@ void AIAssistant::configureProcess(QProcess *process, const QString &credentialP
   // (commonly CP936 on Chinese systems), while this class deliberately decodes
   // all process output with QString::fromUtf8. Force a deterministic encoding
   // so localized failures and non-ASCII capture/profile/workspace paths survive
-  // the QProcess boundary. Non-Python Codex/ACP commands safely ignore these.
+  // the QProcess boundary. Non-Python Codex commands safely ignore these.
   environment.insert(lit("PYTHONUTF8"), lit("1"));
   environment.insert(lit("PYTHONIOENCODING"), lit("utf-8:strict"));
   process->setProcessEnvironment(environment);
 #if defined(Q_OS_WIN)
   process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *args) {
-    // CREATE_NO_WINDOW. Keep provider and worker helpers invisible behind qrenderdoc.
+    // CREATE_NO_WINDOW. Keep per-task provider helpers invisible behind qrenderdoc.
     args->flags |= 0x08000000UL;
   });
 #endif
@@ -2322,7 +2820,7 @@ QByteArray AIAssistant::runCLIInputSync(const QStringList &arguments, const QByt
   if(input.size() > MaxPromptBytes)
   {
     if(error)
-      *error = tr("Command input exceeds the 2 MiB safety limit");
+      *error = tr("Command input exceeds the 16 MiB safety limit");
     return QByteArray();
   }
 
@@ -2409,11 +2907,13 @@ void AIAssistant::refreshProfiles()
     int persistedDefaultIndex = -1;
     int previousIndex = -1;
     const QJsonArray rows = document.array();
-    m_ProfileRows = rows;
     for(const QJsonValue &value : rows)
     {
       const QJsonObject row = value.toObject();
-      const QString id = row.value(lit("id")).toString();
+      if(!supportedQRenderDocConnection(row))
+        continue;
+      m_ProfileRows.append(row);
+      const QString id = row.value(lit("id")).toString();    // i18n-ignore: provider protocol key
       if(id.isEmpty())
         continue;
       const QString kind = row.value(lit("kind")).toString();
@@ -2471,10 +2971,7 @@ void AIAssistant::refreshProfiles()
   }
   m_ProfileComboLoading = false;
   refreshModelCombo();
-  // Defer startup until the caller returns to the event loop. SettingsDialog creates the hidden
-  // assistant and immediately marks its reusable AI page as configuration-busy; synchronous
-  // startup here would otherwise launch an idle worker merely by opening Settings.
-  QTimer::singleShot(0, this, [this]() { ensureWorker(); });
+  refreshConnectionStatus();
 }
 
 void AIAssistant::refreshModelCombo()
@@ -2527,7 +3024,7 @@ void AIAssistant::selectProfile(int index)
   m_ActiveModel = m_ProfileDefaultModels.value(profile);
   refreshModelCombo();
   appendSystem(tr("Active connection: %1").arg(m_ProfileCombo->itemText(index)));
-  restartWorker();
+  refreshConnectionStatus();
 }
 
 void AIAssistant::selectModel(int index)
@@ -2549,7 +3046,7 @@ void AIAssistant::selectModel(int index)
   m_ActiveModel = model;
   appendSystem(model.isEmpty() ? tr("Using the provider's default model.")
                                : tr("Model for new tasks: %1").arg(model));
-  restartWorker();
+  refreshConnectionStatus();
 }
 
 bool AIAssistant::connectionMutationAllowed(QWidget *parent) const
@@ -2567,12 +3064,12 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
   QWidget *page = new QWidget(parent);
   // The normal MainWindow Settings entry does not pass through manageConnections(). Mark the
   // shared configuration surface busy for its whole lifetime so profile edits and subscription
-  // setup cannot race worker replacement.
+  // setup cannot race active task state.
   m_ConnectionDialogOpen = true;
   connect(page, &QObject::destroyed, this, [this]() {
     m_ConnectionDialogOpen = false;
     if(!m_ShuttingDown)
-      restartWorker();
+      refreshConnectionStatus();
   });
   QVBoxLayout *root = new QVBoxLayout(page);
   root->setContentsMargins(8, 8, 8, 8);
@@ -2712,7 +3209,13 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
                                                       : presetError);
           return;
         }
-        const QJsonArray presets = presetDocument.array();
+        QJsonArray presets;
+        for(const QJsonValue &value : presetDocument.array())
+        {
+          const QJsonObject preset = value.toObject();
+          if(supportedQRenderDocConnection(preset))
+            presets.append(preset);
+        }
         const bool editing = !existing.isEmpty();
         QString existingId = existing.value(lit("id")).toString();
         bool profileExists = editing;
@@ -2727,7 +3230,10 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
         name->setPlaceholderText(tr("For example: Work OpenAI or Personal Codex"));
         QComboBox *mode = new QComboBox(&dialog);
         mode->addItem(tr("Model API"), lit("model"));
-        mode->addItem(tr("Agent Subscription (ACP / app-server)"), lit("agent"));
+        mode->addItem(QCoreApplication::translate("AIAssistant",
+                                                  "Codex / ChatGPT subscription",
+                                                  "provider.codex.title"),
+                      lit("agent"));    // i18n-ignore: provider kind stored as item data.
         QCheckBox *defaultConnection =
             new QCheckBox(tr("Make default after saving"), &dialog);
         general->addRow(tr("Connection name"), name);
@@ -2785,10 +3291,6 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
         QWidget *agentPage = new QWidget(modePages);
         QFormLayout *agentForm = new QFormLayout(agentPage);
         QComboBox *agentProvider = new QComboBox(agentPage);
-        QPlainTextEdit *agentCommand = new QPlainTextEdit(agentPage);
-        agentCommand->setMaximumHeight(72);
-        agentCommand->setPlaceholderText(
-            tr("Custom ACP only: one non-secret executable or argument per line"));
         QTextBrowser *authStatus = new QTextBrowser(agentPage);
         authStatus->setTextInteractionFlags(Qt::TextBrowserInteraction |
                                             Qt::TextSelectableByKeyboard);
@@ -2814,13 +3316,9 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
         loginButtons->addStretch(1);
         QWidget *loginWidget = new QWidget(agentPage);
         loginWidget->setLayout(loginButtons);
-        QCheckBox *trustACP = new QCheckBox(
-            tr("I trust this custom ACP command to run as a local process"), agentPage);
         QLabel *agentHint = new QLabel(agentPage);
         agentHint->setWordWrap(true);
         agentForm->addRow(tr("Provider"), agentProvider);
-        agentForm->addRow(tr("Agent command"), agentCommand);
-        agentForm->addRow(tr("Process trust"), trustACP);
         agentForm->addRow(tr("Authentication"), authStatus);
         agentForm->addRow(QString(), loginWidget);
         agentForm->addRow(QString(), agentHint);
@@ -3043,62 +3541,9 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
           else
           {
             connectSubscription->setEnabled(true);
-            const QJsonArray commandArray = preset.value(lit("command")).toArray();
-            const bool custom = selectedPresetId() == lit("custom-acp");
-            // The trust confirmation for a built-in preset applies to the exact immutable
-            // catalog command, so never display a stale legacy profile override as that command.
-            // Custom ACP remains user-owned and must preserve its edited argv during hydration.
-            if(!editing || providerSelectionChanged || !custom)
-            {
-              QStringList commandLines;
-              if(custom && editing &&
-                 existing.value(lit("preset")).toString() == currentPresetId)
-              {
-                for(const QJsonValue &part : existing.value(lit("command")).toArray())
-                  commandLines << part.toString();
-              }
-              else
-              {
-                for(const QJsonValue &part : commandArray)
-                  commandLines << part.toString();
-              }
-              agentCommand->setPlainText(commandLines.join(QLatin1Char('\n')));
-            }
-            const QString protocol = preset.value(lit("protocol")).toString();
-            const QString loginMode = preset.value(lit("subscriptionLoginMode")).toString();
-            const bool builtInACP = protocol == lit("acp") && !custom;
-            agentCommand->setReadOnly(!custom);
-            trustACP->setVisible(protocol == lit("acp"));
-            if(protocol == lit("acp"))
-            {
-              const bool previouslyTrusted =
-                  editing && existing.value(lit("preset")).toString() == selectedPresetId() &&
-                  existing.value(lit("options"))
-                      .toObject()
-                      .value(lit("allow_unsandboxed_agent"))
-                      .toBool();
-              trustACP->setText(
-                  builtInACP
-                      ? tr("Run the official %1 command shown above (required)")
-                            .arg(localizeProviderCatalogField(preset, "title"))
-                      : tr("I trust this custom ACP command to run as a local process"));
-              trustACP->setChecked(
-                  builtInACP || previouslyTrusted);
-              trustACP->setToolTip(
-                  builtInACP
-                      ? tr("This checked confirmation applies only to the read-only command from "
-                           "ReplayLab's built-in provider catalog. You may uncheck it to prevent "
-                           "the CLI from running.")
-                      : tr("Custom commands are never trusted automatically. Review every "
-                           "argument above before checking this box."));
-            }
             loginWidget->setVisible(true);
-            authFlow->setVisible(protocol == lit("codex-app-server") ||
-                                 selectedPresetId() == lit("copilot-acp"));
-            connectSubscription->setText(protocol == lit("codex-app-server")
-                                             ? tr("Connect / Sign in and Test")
-                                             : custom ? tr("Test Custom ACP")
-                                                      : tr("Connect and Test"));
+            authFlow->setVisible(true);
+            connectSubscription->setText(tr("Connect / Sign in and Test"));
             connectSubscription->setToolTip(
                 profileExists
                     ? tr("Start the provider's official authentication flow and then run a "
@@ -3111,28 +3556,10 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
               if(saveButton)
                 saveButton->setText(tr("Save and Connect"));
             }
-            fetchModels->setEnabled(editing && protocol == lit("codex-app-server"));
+            fetchModels->setEnabled(editing);
             modelHint->setText(
-                tr("ReplayLab imports model choices exposed by the provider's ACP/app-server "
-                   "handshake. If the Agent exposes no standard list, leave this empty to use "
-                   "its configured default, or add an exact model only when that CLI supports "
-                   "ACP model selection."));
-            if(custom)
-              setDiagnosticStatus(
-                  authStatus, DiagnosticLevel::Info,
-                  tr("Custom ACP has no standardized login command. ReplayLab will only test the "
-                     "configured initialize/session handshake. This command is saved in the "
-                     "profile, so never put a token or password in its arguments."));
-            else if(loginMode == lit("captured"))
-              setDiagnosticStatus(
-                  authStatus, DiagnosticLevel::Info,
-                  tr("ReplayLab will run the official provider login, open its safe authorization "
-                     "URL, show any device code, and test ACP automatically."));
-            else if(loginMode == lit("terminal"))
-              setDiagnosticStatus(
-                  authStatus, DiagnosticLevel::Info,
-                  tr("ReplayLab will open the official provider CLI in a contained terminal, wait "
-                     "for its interactive sign-in to finish, and then test ACP automatically."));
+                tr("Fetch the provider's model list, then enable only the models you want to "
+                   "switch between. You can also add an exact model or deployment name manually."));
             agentHint->setText(localizeProviderCatalogField(preset, "note"));
           }
         };
@@ -3188,12 +3615,6 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
         connect(agentProvider,
                 static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged), &dialog,
                 [&](int) { updateProvider(); });
-        connect(agentCommand, &QPlainTextEdit::textChanged, &dialog, [&]() {
-          // Trust is granted to the reviewed argv, not to the profile id. Any custom command
-          // change requires a fresh, visible confirmation before it can be saved or launched.
-          if(selectedPresetId() == lit("custom-acp"))
-            trustACP->setChecked(false);
-        });
         connect(models, &QListWidget::itemChanged, &dialog,
                 [&](QListWidgetItem *) { updateDefaultModels(); });
         connect(addModel, &QPushButton::clicked, &dialog, [&]() {
@@ -3326,15 +3747,22 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
             const QString rawMessage = value.value(lit("message")).toString(
                 data.value(lit("message")).toString(value.value(lit("installHint")).toString(
                     data.value(lit("installHint")).toString())));
-            const QString message =
-                localizeProviderRuntimeText(selectedPresetId(), rawMessage);
+            // i18n-ignore: Stable ReplayLab runtime-message protocol fields.
+            const QString messageId =
+                value.value(lit("messageId")).toString(    // i18n-ignore: ReplayLab protocol key
+                    data.value(lit("messageId")).toString());    // i18n-ignore: ReplayLab protocol key
+            QJsonArray messageArgs =
+                value.value(lit("messageArgs")).toArray();    // i18n-ignore: ReplayLab protocol key
+            if(messageArgs.isEmpty())
+              messageArgs =
+                  data.value(lit("messageArgs")).toArray();    // i18n-ignore: ReplayLab protocol key
+            const QString message = localizeProviderRuntimeMessage(
+                selectedPresetId(), messageId, messageArgs, rawMessage);
             const bool installed = value.contains(lit("installed"))
                                        ? value.value(lit("installed")).toBool()
                                        : data.value(lit("installed")).toBool(true);
-            // Generic ACP cannot safely determine account state without starting the vendor CLI,
-            // so status may deliberately report unknown. Preserve a successful connection/test
-            // from this UI session unless the backend provides an explicit positive or negative
-            // authentication result. Codex app-server can usually report the explicit state.
+            // Preserve a successful connection/test from this UI session unless the backend
+            // provides an explicit positive or negative authentication result.
             if(!installed)
               subscriptionAuthenticated = false;
             else if(value.value(lit("authenticated")).isBool())
@@ -3370,15 +3798,10 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
                                                  ? DiagnosticLevel::Success
                                                  : DiagnosticLevel::Warning,
                                 summary, state);
-            const QString protocol =
-                presetObject(selectedPresetId()).value(lit("protocol")).toString();
             connectSubscription->setText(
                 subscriptionAuthenticated
                     ? tr("Test Connection")
-                    : protocol == lit("codex-app-server")
-                          ? tr("Connect / Sign in and Test")
-                          : selectedPresetId() == lit("custom-acp") ? tr("Test Custom ACP")
-                                                                    : tr("Connect and Test"));
+                    : tr("Connect / Sign in and Test"));
           }
           else
           {
@@ -3463,7 +3886,17 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
               const QString eventPresetKey = lit("preset");
               const QString eventPreset = object.value(eventPresetKey).toString(
                   data.value(eventPresetKey).toString(selectedPresetId()));
-              const QString message = localizeProviderRuntimeText(eventPreset, rawMessage);
+              // i18n-ignore: Stable ReplayLab runtime-message protocol fields.
+              const QString messageId =
+                  object.value(lit("messageId")).toString(    // i18n-ignore: ReplayLab protocol key
+                      data.value(lit("messageId")).toString());    // i18n-ignore: ReplayLab protocol key
+              QJsonArray messageArgs =
+                  object.value(lit("messageArgs")).toArray();    // i18n-ignore: ReplayLab protocol key
+              if(messageArgs.isEmpty())
+                messageArgs =
+                    data.value(lit("messageArgs")).toArray();    // i18n-ignore: ReplayLab protocol key
+              const QString message = localizeProviderRuntimeMessage(
+                  eventPreset, messageId, messageArgs, rawMessage);
               if(!message.isEmpty())
                 setDiagnosticStatus(authStatus, DiagnosticLevel::Info, message);
               const QString url = object.value(lit("authUrl")).toString(
@@ -3702,9 +4135,8 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
                       refreshProfiles();
                     }
                   }
-                  // Codex app-server exposes an explicit model list after authentication. ACP
-                  // model choices are imported from the session configOptions handshake when the
-                  // Agent exposes them; manual entry remains available for Agents that do not.
+                  // Codex app-server exposes an explicit model list after authentication; manual
+                  // entry remains available when a particular model is not advertised.
                   if(!profileSavedDuringDialog && fetchModels->isEnabled())
                     fetchModels->click();
                 }
@@ -3798,7 +4230,6 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
           const QSignalBlocker apiProviderBlocker(apiProvider);
           const QSignalBlocker agentProviderBlocker(agentProvider);
           const QSignalBlocker baseUrlBlocker(baseUrl);
-          const QSignalBlocker commandBlocker(agentCommand);
           const QSignalBlocker modelsBlocker(models);
           const QSignalBlocker authFlowBlocker(authFlow);
 
@@ -3830,11 +4261,6 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
           azureVersion->setText(options.value(lit("api_version")).toString());
           vertexProject->setText(options.value(lit("project")).toString());
           vertexLocation->setText(options.value(lit("location")).toString());
-
-          QStringList commandLines;
-          for(const QJsonValue &part : existing.value(lit("command")).toArray())
-            commandLines << part.toString();
-          agentCommand->setPlainText(commandLines.join(QLatin1Char('\n')));
 
           QString savedAuthFlow = options.value(lit("subscription_auth_flow")).toString();
           if(savedAuthFlow.isEmpty())
@@ -3899,20 +4325,6 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
                 &dialog, tr("Azure OpenAI"),
                 tr("Legacy Azure deployment URLs require an API version. Azure v1/Foundry URLs "
                    "do not use this field."));
-            return;
-          }
-          if(mode->currentData().toString() == lit("agent") &&
-             preset.value(lit("protocol")).toString() == lit("acp") && !trustACP->isChecked())
-          {
-            const bool customACP = presetId == lit("custom-acp");
-            QMessageBox::warning(&dialog, tr("ACP trust required"),
-                                 customACP
-                                     ? tr("Review every custom command argument, then explicitly "
-                                          "check the Process trust box before this local process "
-                                          "can run.")
-                                     : tr("The built-in official CLI was disabled in Process "
-                                          "trust. Check that visible box to allow this exact "
-                                          "read-only catalog command, or cancel."));
             return;
           }
           QStringList enabledModels;
@@ -3980,33 +4392,9 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
           }
           else
           {
-            const QString protocol = preset.value(lit("protocol")).toString();
-            const bool supportsAuthFlow =
-                protocol == lit("codex-app-server") || presetId == lit("copilot-acp");
-            if(supportsAuthFlow)
-              arguments << lit("--option")
-                        << (lit("subscription_auth_flow=") +
-                            authFlow->currentData().toString());
-            if(protocol == lit("acp"))
-            {
-              arguments << lit("--option") << lit("allow_unsandboxed_agent=true");
-              if(presetId == lit("custom-acp"))
-              {
-                QJsonArray command;
-                for(const QString &line : agentCommand->toPlainText().split(QLatin1Char('\n')))
-                  if(!line.trimmed().isEmpty())
-                    command.append(line.trimmed());
-                if(command.isEmpty())
-                {
-                  QMessageBox::warning(&dialog, tr("Custom ACP"),
-                                       tr("Enter the Agent executable and arguments."));
-                  return;
-                }
-                arguments << lit("--command-json")
-                          << QString::fromUtf8(
-                                 QJsonDocument(command).toJson(QJsonDocument::Compact));
-              }
-            }
+            arguments << lit("--option")
+                      << (lit("subscription_auth_flow=") +
+                          authFlow->currentData().toString());
           }
           for(const QString &model : enabledModels)
             arguments << lit("--allowed-model") << model;
@@ -4098,7 +4486,6 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
             mode->setEnabled(false);
             apiProvider->setEnabled(false);
             agentProvider->setEnabled(false);
-            agentCommand->setEnabled(false);
             defaultConnection->setEnabled(false);
             QPushButton *saveButton = buttons->button(QDialogButtonBox::Save);
             if(saveButton)
@@ -4109,7 +4496,7 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
             startSubscriptionOperation(lit("connect"), authFlow->currentData().toString());
             return;
           }
-          restartWorker();
+          refreshConnectionStatus();
           dialog.accept();
         });
 
@@ -4178,24 +4565,6 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
                                 "forgotten.")
                                  .arg(displayName)) != QMessageBox::Yes)
       return;
-    // The long-lived worker inherits the selected managed CODEX_HOME. On Windows its Codex
-    // descendants can keep SQLite/WAL or temporary git-pack files open, so deleting the active
-    // profile before the contained process tree has stopped is both racy and predictably fails
-    // with WinError 5/32. This page already prevents new worker starts; finish the bounded stop
-    // before asking the CLI to remove the exact managed profile directory.
-    if(id == m_ActiveProfile)
-    {
-      QString workerError;
-      if(!stopWorkerForProfileMutation(&workerError))
-      {
-        QMessageBox::critical(
-            page, tr("Remove failed"),
-            workerError.isEmpty()
-                ? tr("The active AI worker could not be stopped, so the connection was kept.")
-                : workerError);
-        return;
-      }
-    }
     int exitCode = -1;
     QString error;
     int credentialExit = -1;
@@ -4220,7 +4589,7 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
     m_SessionSecrets.remove(id);
     refreshProfiles();
     reloadList(QString());
-    restartWorker();
+    refreshConnectionStatus();
   });
   connect(makeDefault, &QPushButton::clicked, page, [=]() {
     if(!connectionMutationAllowed(page))
@@ -4240,7 +4609,7 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
     m_ActiveModel = m_ProfileDefaultModels.value(id);
     refreshProfiles();
     reloadList(id);
-    restartWorker();
+    refreshConnectionStatus();
   });
   connect(check, &QPushButton::clicked, page, [=]() {
     if(!connections->currentItem())
@@ -4272,11 +4641,6 @@ void AIAssistant::manageConnections()
 {
   if(m_ConnectionDialogOpen)
     return;
-  if(!m_RunningTasks.isEmpty())
-  {
-    appendSystem(tr("Wait for active AI tasks before changing connections."), true);
-    return;
-  }
 
   m_ConnectionDialogOpen = true;
   SettingsDialog settings(m_Ctx, this);
@@ -4284,7 +4648,7 @@ void AIAssistant::manageConnections()
   RDDialog::show(&settings);
   m_ConnectionDialogOpen = false;
   refreshProfiles();
-  restartWorker();
+  refreshConnectionStatus();
 }
 
 // Kept temporarily as a source-compatible fallback for downstream forks that still invoke the
@@ -4305,306 +4669,24 @@ void AIAssistant::runDoctor()
   showConnectionDiagnostics(this, tr("AI Connection Check"), document, exitCode, error);
 }
 
-void AIAssistant::ensureWorker()
+void AIAssistant::refreshConnectionStatus()
 {
   if(m_ShuttingDown || m_ConnectionDialogOpen)
     return;
-  if(m_WorkerStopping)
-  {
-    setDiagnosticStatus(m_Status, DiagnosticLevel::Info, tr("Disconnecting..."));
-    return;
-  }
   if(m_CLIPath.isEmpty())
-  {
     m_CLIPath = findAgentCLI();
-    if(m_CLIPath.isEmpty())
-    {
-      setDiagnosticStatus(m_Status, DiagnosticLevel::Error, tr("Host missing"));
-      return;
-    }
-  }
-  if(!m_Ctx.IsCaptureLoaded())
-  {
-    if(m_ActiveProfile.isEmpty())
-      setDiagnosticStatus(m_Status, DiagnosticLevel::Warning, tr("No connection"));
-    else
-      setDiagnosticStatus(m_Status, DiagnosticLevel::Success, tr("Chat ready"));
-    stopWorker(false);
-    return;
-  }
-  const QString instance = findBridgeInstance();
-  if(instance.isEmpty())
-  {
-    setDiagnosticStatus(m_Status, DiagnosticLevel::Warning, tr("Waiting for bridge"));
-    return;
-  }
-  if(instance != m_InstanceId)
-  {
-    m_InstanceId = instance;
-    if(m_Worker)
-    {
-      stopWorker(true);
-      return;
-    }
-  }
-  if(m_ActiveProfile.isEmpty())
-  {
+  if(m_CLIPath.isEmpty())
+    setDiagnosticStatus(m_Status, DiagnosticLevel::Error, tr("Host missing"));
+  else if(m_ActiveProfile.isEmpty())
     setDiagnosticStatus(m_Status, DiagnosticLevel::Warning, tr("Add connection"));
-    stopWorker(false);
-    return;
-  }
-  if(m_Worker)
-  {
-    if(m_Worker->state() != QProcess::NotRunning)
-    {
-      if(m_Worker->state() == QProcess::Starting)
-        setDiagnosticStatus(m_Status, DiagnosticLevel::Info, tr("Connecting..."));
-      else
-        setDiagnosticStatus(m_Status, DiagnosticLevel::Success, tr("Connected"));
-    }
-    else
-      workerFinished(m_Worker);
-    return;
-  }
-  if(QDateTime::currentMSecsSinceEpoch() < m_NextWorkerStartMs)
-    return;
-
-  m_Worker = new QProcess(this);
-  QProcess *worker = m_Worker;
-  configureProcess(worker, m_ActiveProfile);
-  connect(worker, &QProcess::started, this, [this, worker]() {
-    if(worker != m_Worker)
-      return;
-    QString jobError;
-    if(!attachKillOnCloseJob(worker, m_WorkerJob, &jobError))
-    {
-      if(!jobError.isEmpty() && jobError != m_LastWorkerError)
-      {
-        m_LastWorkerError = jobError;
-        appendSystem(jobError, true);
-      }
-      // Fail closed before this worker can be trusted to claim an intent. A parent-only kill is
-      // insufficient once a provider is spawned, so an uncontained worker is never marked ready.
-      m_WorkerFailures++;
-      const int delay = qMin(30000, 1000 * (1 << qMin(m_WorkerFailures, 5)));
-      m_NextWorkerStartMs = QDateTime::currentMSecsSinceEpoch() + delay;
-      m_WorkerStopping = true;
-      m_WorkerStopPhase = 3;
-      setDiagnosticStatus(m_Status, DiagnosticLevel::Error, tr("Containment failed"));
-      worker->kill();
-      m_WorkerStopTimer->start(1000);
-      return;
-    }
-    if(worker->write("start\n") != qint64(sizeof("start\n") - 1))
-    {
-      m_LastWorkerError = tr("Could not release the contained AI worker start gate.");
-      appendSystem(m_LastWorkerError, true);
-      m_WorkerFailures++;
-      const int delay = qMin(30000, 1000 * (1 << qMin(m_WorkerFailures, 5)));
-      m_NextWorkerStartMs = QDateTime::currentMSecsSinceEpoch() + delay;
-      m_WorkerStopping = true;
-      m_WorkerStopPhase = 3;
-      closeKillOnCloseJob(m_WorkerJob);
-      worker->kill();
-      m_WorkerStopTimer->start(1000);
-      return;
-    }
-    setDiagnosticStatus(m_Status, DiagnosticLevel::Success, tr("Connected"));
-  });
-  connect(worker, &QProcess::readyReadStandardOutput, this,
-          [worker]() { worker->readAllStandardOutput(); });
-  connect(worker, &QProcess::readyReadStandardError, this, [this, worker]() {
-    const QString message =
-        QString::fromUtf8(worker->readAllStandardError().left(MaxEventLineBytes)).trimmed();
-    if(worker == m_Worker && !message.isEmpty() && message != m_LastWorkerError)
-    {
-      m_LastWorkerError = message;
-      appendSystem(message, true);
-    }
-  });
-  connect(worker,
-          static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished), this,
-          [this, worker](int, QProcess::ExitStatus) { workerFinished(worker); });
-  connect(worker, &QProcess::errorOccurred, this,
-          [this, worker](QProcess::ProcessError error) {
-            if(error == QProcess::FailedToStart && worker == m_Worker)
-              workerFinished(worker);
-          });
-  QStringList workerArguments = {lit("worker"), lit("--profile"), m_ActiveProfile,
-                                 lit("--instance-id"), m_InstanceId, lit("--poll-seconds"),
-                                 lit("0.5"), lit("--control-stdin"), lit("--start-gated")};
-  if(!m_ActiveModel.isEmpty())
-    workerArguments << lit("--model") << m_ActiveModel;
-  worker->start(m_CLIPath, workerArguments, QIODevice::ReadWrite);
-  setDiagnosticStatus(m_Status, DiagnosticLevel::Info, tr("Connecting..."));
-}
-
-void AIAssistant::restartWorker()
-{
-  if(m_ConnectionDialogOpen || !m_RunningTasks.isEmpty())
-  {
-    m_RestartWorkerPending = true;
-    return;
-  }
-  m_WorkerFailures = 0;
-  m_NextWorkerStartMs = 0;
-  m_LastWorkerError.clear();
-  if(m_Worker)
-  {
-    stopWorker(true);
-    return;
-  }
-  m_RestartWorkerPending = false;
-  ensureWorker();
-}
-
-void AIAssistant::stopWorker(bool restartAfterStop)
-{
-  m_RestartWorkerPending = restartAfterStop;
-  if(!m_Worker)
-  {
-    if(restartAfterStop && !m_ShuttingDown)
-    {
-      m_RestartWorkerPending = false;
-      QTimer::singleShot(0, this, [this]() { ensureWorker(); });
-    }
-    return;
-  }
-  if(m_Worker->state() == QProcess::NotRunning)
-  {
-    m_WorkerStopping = true;
-    workerFinished(m_Worker);
-    return;
-  }
-  if(m_WorkerStopping)
-    return;
-
-  // Keep the exact QProcess registered until its finished signal. This leaves qrenderdoc's event
-  // loop free to run JsonPoller, so AgentHost can cancel the intent and return its bridge lease.
-  m_WorkerStopping = true;
-  m_WorkerStopPhase = 1;
-  setDiagnosticStatus(m_Status, DiagnosticLevel::Info, tr("Disconnecting..."));
-  m_Worker->write("shutdown\n");
-  m_Worker->closeWriteChannel();
-  m_WorkerStopTimer->start(5000);
-}
-
-bool AIAssistant::stopWorkerForProfileMutation(QString *error)
-{
-  if(error)
-    error->clear();
-  m_RestartWorkerPending = false;
-  if(!m_Worker)
-    return true;
-
-  stopWorker(false);
-  if(m_Worker && m_Worker->state() != QProcess::NotRunning)
-    m_Worker->waitForFinished(5000);
-
-  if(m_Worker && m_Worker->state() != QProcess::NotRunning)
-  {
-    // Closing the kill-on-close Job terminates the worker and any Codex/ACP descendants that may
-    // still own files in the profile. Keep the target QProcess registered until Windows confirms
-    // its terminal state, matching the normal worker-stop containment path.
-    closeKillOnCloseJob(m_WorkerJob);
-    if(m_Worker)
-      m_Worker->kill();
-    if(m_Worker)
-      m_Worker->waitForFinished(1500);
-  }
-
-  if(m_Worker && m_Worker->state() == QProcess::NotRunning)
-    workerFinished(m_Worker);
-  if(!m_Worker)
-    return true;
-
-  if(error)
-    *error = tr("The active AI process tree did not stop within the bounded shutdown window. "
-                "The connection was not removed; close its running task and try again.");
-  return false;
-}
-
-void AIAssistant::workerStopTimedOut()
-{
-  if(!m_Worker || !m_WorkerStopping)
-    return;
-  if(m_Worker->state() == QProcess::NotRunning)
-  {
-    workerFinished(m_Worker);
-    return;
-  }
-
-  if(m_WorkerStopPhase == 1)
-  {
-    m_WorkerStopPhase = 2;
-    m_Worker->terminate();
-  }
+  else if(m_Ctx.IsCaptureLoaded() && findBridgeInstance().isEmpty())
+    setDiagnosticStatus(m_Status, DiagnosticLevel::Warning, tr("Waiting for bridge"));
   else
-  {
-    // Closing a KILL_ON_JOB_CLOSE Job terminates AgentHost and every inherited provider child.
-    // Keep retrying the top-level kill without ever starting a replacement until QProcess confirms
-    // that this exact worker has finished.
-    m_WorkerStopPhase = 3;
-    closeKillOnCloseJob(m_WorkerJob);
-    m_Worker->kill();
-  }
-  m_WorkerStopTimer->start(1000);
-}
-
-void AIAssistant::workerFinished(QProcess *process)
-{
-  if(!process)
-    return;
-  if(process != m_Worker)
-  {
-    process->deleteLater();
-    return;
-  }
-
-  const bool expected = m_WorkerStopping;
-  if(m_WorkerStopTimer)
-    m_WorkerStopTimer->stop();
-  closeKillOnCloseJob(m_WorkerJob);
-  disconnect(process, NULL, this, NULL);
-  m_Worker = NULL;
-  m_WorkerStopping = false;
-  m_WorkerStopPhase = 0;
-  process->deleteLater();
-
-  if(!expected && !m_ShuttingDown)
-  {
-    m_WorkerFailures++;
-    const int delay = qMin(30000, 1000 * (1 << qMin(m_WorkerFailures, 5)));
-    m_NextWorkerStartMs = QDateTime::currentMSecsSinceEpoch() + delay;
-    setDiagnosticStatus(m_Status, DiagnosticLevel::Error, tr("Worker stopped"));
-
-    // Capture-button intents are owned by this persistent worker. If it exits without a terminal
-    // event, leaving their cards in "running" until a lease expires makes a provider/bridge crash
-    // look like a hung UI. Direct chat has its own QProcess and is deliberately excluded here.
-    QStringList failedTasks;
-    for(const QString &taskId : m_RunningTasks)
-      if(taskId != m_ChatTaskId)
-        failedTasks.push_back(taskId);
-    for(const QString &taskId : failedTasks)
-      finishTask(taskId, lit("failed"),
-                 tr("The AI worker stopped before reporting a terminal result. Retry the task."));
-  }
-
-  const bool restart = m_RestartWorkerPending;
-  m_RestartWorkerPending = false;
-  if(restart && !m_ShuttingDown)
-  {
-    setDiagnosticStatus(m_Status, DiagnosticLevel::Info, tr("Reconnecting..."));
-    QTimer::singleShot(0, this, [this]() { ensureWorker(); });
-  }
+    setDiagnosticStatus(m_Status, DiagnosticLevel::Success, tr("Chat ready"));
 }
 
 void AIAssistant::forceStopProcessesForDestruction()
 {
-  if(m_WorkerStopTimer)
-    m_WorkerStopTimer->stop();
-  m_RestartWorkerPending = false;
-
   auto stopContainedProcess = [](QProcess *process) {
     if(!process)
       return;
@@ -4624,14 +4706,6 @@ void AIAssistant::forceStopProcessesForDestruction()
     }
   };
 
-  QProcess *worker = m_Worker;
-  m_Worker = NULL;
-  if(worker)
-  {
-    disconnect(worker, NULL, this, NULL);
-    closeKillOnCloseJob(m_WorkerJob);
-    stopContainedProcess(worker);
-  }
   QProcess *chatProcess = m_ChatProcess;
   m_ChatProcess = NULL;
   if(chatProcess)
@@ -4640,8 +4714,8 @@ void AIAssistant::forceStopProcessesForDestruction()
     closeKillOnCloseJob(m_ChatJob);
     stopContainedProcess(chatProcess);
   }
-  closeKillOnCloseJob(m_WorkerJob);
   closeKillOnCloseJob(m_ChatJob);
+  clearChatContextFile();
 }
 
 QString AIAssistant::newTaskId() const
@@ -4659,7 +4733,8 @@ QString AIAssistant::newMessageId() const
 }
 
 QString AIAssistant::conversationPrompt(const QString &prompt, const QString &conversationId,
-                                        const QStringList &excludeMessageIds) const
+                                        const QStringList &excludeMessageIds,
+                                        const ClarificationResponse &clarificationResponse) const
 {
   const ConversationThread *thread = conversation(conversationId);
   if(!thread)
@@ -4728,7 +4803,39 @@ QString AIAssistant::conversationPrompt(const QString &prompt, const QString &co
   // i18n-ignore: AgentHost wire-protocol key for bounded-history accounting
   envelope[lit("omittedMessageCount")] = history.size();
 
-  // Keep one contiguous newest-first suffix of complete messages. The 2 MiB
+  if(clarificationResponse.isValid())
+  {
+    QJsonObject response;
+    // i18n-ignore: ReplayLab structured clarification-response wire-protocol fields.
+    response[lit("schema")] = lit("replaylab-clarification-response/v1");
+    response[lit("clarificationId")] =    // i18n-ignore: clarification-response protocol key
+        clarificationResponse.clarificationId;
+    QJsonArray optionIds;
+    for(const QString &optionId : clarificationResponse.optionIds)
+      optionIds.push_back(optionId);
+    response[lit("optionIds")] = optionIds;    // i18n-ignore: clarification-response protocol key
+    response[lit("otherText")] =    // i18n-ignore: clarification-response protocol key
+        clarificationResponse.otherText;
+    envelope[lit("clarificationResponse")] = response;    // i18n-ignore: conversation protocol key
+
+    QJsonObject candidates;
+    candidates[lit("schema")] =    // i18n-ignore: context-candidate protocol key
+        lit("replaylab-context-candidates/v1");    // i18n-ignore: context-candidate schema ID
+    const QJsonObject origin =
+        contextCandidateJSON(clarificationResponse.originContextSnapshot,
+                             clarificationResponse.originContextInstanceId);
+    const QJsonObject current =
+        contextCandidateJSON(clarificationResponse.currentContextSnapshot,
+                             clarificationResponse.currentContextInstanceId);
+    if(!origin.isEmpty())
+      candidates[lit("origin")] = origin;    // i18n-ignore: context-candidate protocol key
+    if(!current.isEmpty())
+      candidates[lit("current")] = current;    // i18n-ignore: context-candidate protocol key
+    if(candidates.size() > 1)
+      envelope[lit("contextCandidates")] = candidates;    // i18n-ignore: conversation protocol key
+  }
+
+  // Keep one contiguous newest-first suffix of complete messages. The 16 MiB
   // transport gate remains authoritative; semantic token budgeting and
   // compaction happen in AgentHost for the selected model.
   for(int i = history.size() - 1; i >= 0; --i)
@@ -4753,7 +4860,62 @@ QString AIAssistant::conversationPrompt(const QString &prompt, const QString &co
   return QString::fromUtf8(QJsonDocument(envelope).toJson(QJsonDocument::Compact));
 }
 
-void AIAssistant::startChat(const QString &prompt, const QString &skill, bool includeConversation)
+bool AIAssistant::freezeChatContext(PendingChat &request, QString *error)
+{
+  request.contextSnapshot.clear();
+  request.contextInstanceId.clear();
+  if(error)
+    error->clear();
+  if(!m_Ctx.IsCaptureLoaded())
+    return true;
+
+  const QString instance = findBridgeInstance();
+  if(instance.isEmpty())
+  {
+    if(error)
+      *error = tr("The capture bridge is not ready yet.");
+    return false;
+  }
+
+  QString bridgeError;
+  const QByteArray encoded =
+      m_Ctx.ReplayLab().CurrentContextJSON(request.focusStage, &bridgeError).toUtf8();
+  if(!decodeContextSnapshot(encoded))
+  {
+    if(!bridgeError.isEmpty())
+      // i18n-ignore: developer diagnostic written only to the debug log.
+      qWarning() << "Could not freeze ReplayLab AI context:" << bridgeError;
+    if(error)
+      *error = tr("The current RenderDoc state could not be frozen for this AI request.");
+    return false;
+  }
+
+  request.contextSnapshot = encoded;
+  request.contextInstanceId = instance;
+  return true;
+}
+
+void AIAssistant::clearChatContextFile()
+{
+  if(m_ChatContextFile.isEmpty())
+    return;
+  const QString path = m_ChatContextFile;
+  m_ChatContextFile.clear();
+  if(!QFile::remove(path))
+    // i18n-ignore: developer diagnostic written only to the debug log.
+    qWarning() << "Could not remove temporary ReplayLab AI context file:" << path;
+}
+
+void AIAssistant::StartCaptureSkill(const QString &prompt, const QString &skill,
+                                    const QString &focusStage, const QString &intentKind)
+{
+  startChat(prompt, skill, false, focusStage, ClarificationResponse(), intentKind);
+}
+
+void AIAssistant::startChat(const QString &prompt, const QString &skill, bool includeConversation,
+                            const QString &focusStage,
+                            const ClarificationResponse &clarificationResponse,
+                            const QString &intentKind)
 {
   if(m_CLIPath.isEmpty())
   {
@@ -4774,7 +4936,7 @@ void AIAssistant::startChat(const QString &prompt, const QString &skill, bool in
 
   if(prompt.toUtf8().size() > MaxPromptBytes)
   {
-    appendSystem(tr("The request exceeds the 2 MiB safety limit."), true);
+    appendSystem(tr("The request exceeds the 16 MiB safety limit."), true);
     return;
   }
   if(m_ChatQueue.size() >= MaxPendingChats)
@@ -4785,16 +4947,44 @@ void AIAssistant::startChat(const QString &prompt, const QString &skill, bool in
     return;
   }
 
+  ConversationThread *thread = conversation(m_ActiveConversationId);
+  if(!thread)
+    return;
+  ClarificationResponse effectiveClarification = clarificationResponse;
+  if(!effectiveClarification.isValid() && thread->clarification.isValid())
+  {
+    // A typed reply is still a response to the visible question even when the user does not click
+    // Other first. Preserve it verbatim as otherText and let AgentHost determine whether it
+    // answers the question, changes the goal, or requires an origin/current context choice.
+    effectiveClarification.clarificationId = thread->clarification.id;
+    effectiveClarification.otherText = prompt.left(MaxClarificationOtherChars);
+    effectiveClarification.originContextSnapshot = thread->clarification.originContextSnapshot;
+    effectiveClarification.originContextInstanceId =
+        thread->clarification.originContextInstanceId;
+  }
+
   PendingChat request;
   request.taskId = newTaskId();
   request.conversationId = m_ActiveConversationId;
   request.prompt = prompt;
   request.effectivePrompt = prompt;
   request.skill = skill;
+  request.focusStage = focusStage;
+  request.intentKind = intentKind;
+  request.clarificationResponse = effectiveClarification;
   request.includeConversation = includeConversation;
-  ConversationThread *thread = conversation(request.conversationId);
-  if(!thread)
+  QString contextError;
+  if(!freezeChatContext(request, &contextError))
+  {
+    appendSystem(contextError, true);
     return;
+  }
+  if(request.clarificationResponse.isValid())
+  {
+    request.clarificationResponse.currentContextSnapshot = request.contextSnapshot;
+    request.clarificationResponse.currentContextInstanceId = request.contextInstanceId;
+  }
+  clearClarification(request.conversationId);
   thread->updatedMs = QDateTime::currentMSecsSinceEpoch();
   thread->unread = false;
   if(thread->title == tr("New conversation") || thread->title.trimmed().isEmpty())
@@ -4830,7 +5020,7 @@ void AIAssistant::startNextChat()
       return;
     }
     m_UserPrompts.remove(request.taskId);
-    m_KnownTasks.remove(request.taskId);
+    unwatchTask(request.taskId);
     m_RunningTasks.remove(request.taskId);
     m_TaskOffsets.remove(request.taskId);
     m_TaskSequences.remove(request.taskId);
@@ -4844,6 +5034,7 @@ void AIAssistant::startNextChat()
 
 void AIAssistant::launchChat(PendingChat request)
 {
+  clearChatContextFile();
   if(request.messageId.isEmpty())
     request.messageId =
         appendUser(request.prompt, request.taskId, lit("queued"), request.conversationId);
@@ -4856,7 +5047,7 @@ void AIAssistant::launchChat(PendingChat request)
   if(!chatMessage)
   {
     m_UserPrompts.remove(request.taskId);
-    m_KnownTasks.remove(request.taskId);
+    unwatchTask(request.taskId);
     m_RunningTasks.remove(request.taskId);
     m_TaskOffsets.remove(request.taskId);
     m_TaskSequences.remove(request.taskId);
@@ -4869,6 +5060,7 @@ void AIAssistant::launchChat(PendingChat request)
   }
 
   auto failBeforeStart = [this, chatMessage, request](const QString &failure) {
+    clearChatContextFile();
     chatMessage->state = lit("failed");
     chatMessage->provisionalText = failure;
     chatMessage->finishedTimestampMs = QDateTime::currentMSecsSinceEpoch();
@@ -4883,7 +5075,7 @@ void AIAssistant::launchChat(PendingChat request)
     chatMessage->activity.push_back(item);
     chatMessage->activityExpanded = false;
     m_UserPrompts.remove(request.taskId);
-    m_KnownTasks.remove(request.taskId);
+    unwatchTask(request.taskId);
     m_RunningTasks.remove(request.taskId);
     m_TaskOffsets.remove(request.taskId);
     m_TaskSequences.remove(request.taskId);
@@ -4896,16 +5088,26 @@ void AIAssistant::launchChat(PendingChat request)
     QTimer::singleShot(0, this, [this]() { startNextChat(); });
   };
 
-  QString instance = m_InstanceId;
-  if(m_Ctx.IsCaptureLoaded())
+  QString instance;
+  if(!request.contextSnapshot.isEmpty())
   {
+    if(!m_Ctx.IsCaptureLoaded())
+    {
+      failBeforeStart(tr("This action requires an open capture."));
+      return;
+    }
     instance = findBridgeInstance();
-    if(instance.isEmpty())
+    if(instance.isEmpty() || instance != request.contextInstanceId)
     {
       failBeforeStart(tr("The capture bridge is not ready yet."));
       return;
     }
     m_InstanceId = instance;
+  }
+  else if(m_Ctx.IsCaptureLoaded())
+  {
+    failBeforeStart(tr("The current RenderDoc state could not be frozen for this AI request."));
+    return;
   }
   if(!request.skill.isEmpty() && !m_Ctx.IsCaptureLoaded())
   {
@@ -4917,12 +5119,13 @@ void AIAssistant::launchChat(PendingChat request)
   excludedMessages.push_back(request.messageId);
   const QString submittedPrompt =
       request.includeConversation
-          ? conversationPrompt(request.effectivePrompt, request.conversationId, excludedMessages)
+          ? conversationPrompt(request.effectivePrompt, request.conversationId, excludedMessages,
+                               request.clarificationResponse)
           : request.effectivePrompt;
   const QByteArray promptBytes = submittedPrompt.toUtf8();
   if(promptBytes.size() > MaxPromptBytes)
   {
-    failBeforeStart(tr("The request plus conversation context exceeds the 2 MiB safety limit."));
+    failBeforeStart(tr("The request plus conversation context exceeds the 16 MiB safety limit."));
     return;
   }
   QStringList arguments = {lit("run"), lit("--profile"), m_ActiveProfile, lit("--prompt-stdin"),
@@ -4931,8 +5134,27 @@ void AIAssistant::launchChat(PendingChat request)
     arguments << lit("--model") << m_ActiveModel;
   if(!request.skill.isEmpty())
     arguments << lit("--skill") << request.skill;
-  if(m_Ctx.IsCaptureLoaded())
-    arguments << lit("--live-context") << lit("--instance-id") << instance;
+  if(!request.intentKind.isEmpty())
+    // i18n-ignore: Stable internal CLI option; never shown as UI text.
+    arguments << lit("--intent-kind") << request.intentKind;
+  if(!request.contextSnapshot.isEmpty())
+  {
+    const QString temporaryRoot =
+        QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+    QTemporaryFile contextFile(
+        QDir(temporaryRoot).filePath(lit("ReplayLabAIContext-XXXXXX.json")));    // i18n-ignore: fixed temporary filename
+    if(!contextFile.open() ||
+       contextFile.write(request.contextSnapshot) != request.contextSnapshot.size() ||
+       !contextFile.flush())
+    {
+      failBeforeStart(tr("The current RenderDoc state could not be frozen for this AI request."));
+      return;
+    }
+    m_ChatContextFile = contextFile.fileName();
+    contextFile.close();
+    contextFile.setAutoRemove(false);
+    arguments << lit("--context-file") << m_ChatContextFile << lit("--instance-id") << instance;    // i18n-ignore: CLI flags
+  }
 
   // Retain the effective request (including earlier direction adjustments) so another steer can
   // restart the same work without dropping its original objective.
@@ -4979,7 +5201,7 @@ void AIAssistant::launchChat(PendingChat request)
   }
 
   // `run --prompt-stdin` cannot launch a provider until it receives this prompt. Contain the
-  // AgentHost process first so every subsequently-created Codex/ACP/MCP child inherits the Job.
+  // AgentHost process first so every subsequently-created Codex/MCP child inherits the Job.
   QString jobError;
   if(!attachKillOnCloseJob(chatProcess, m_ChatJob, &jobError))
   {
@@ -5041,6 +5263,12 @@ void AIAssistant::adjustQueuedChat(const QString &taskId)
   request.messageId.clear();
   request.conversationId = m_ActiveChatConversationId;
   request.prompt = direction;
+  // The direction message is a new user action. Bind the restarted turn to
+  // the state frozen when that queued direction was sent, not to the older
+  // request which is being superseded.
+  request.contextSnapshot = directionRequest.contextSnapshot;
+  request.contextInstanceId = directionRequest.contextInstanceId;
+  request.clarificationResponse = directionRequest.clarificationResponse;
   if(!request.historyExcludeMessageIds.contains(m_ActiveChatMessageId))
     request.historyExcludeMessageIds.push_back(m_ActiveChatMessageId);
   QString partialWork = m_TaskTexts.value(m_ChatTaskId).trimmed();
@@ -5066,12 +5294,13 @@ void AIAssistant::adjustQueuedChat(const QString &taskId)
   const QString submittedPrompt =
       request.includeConversation
           ? conversationPrompt(request.effectivePrompt, request.conversationId,
-                               request.historyExcludeMessageIds)
+                               request.historyExcludeMessageIds,
+                               request.clarificationResponse)
           : request.effectivePrompt;
   if(direction.toUtf8().size() > MaxPromptBytes ||
      submittedPrompt.toUtf8().size() > MaxPromptBytes)
   {
-    appendSystem(tr("The adjusted request plus conversation context exceeds the 2 MiB safety "
+    appendSystem(tr("The adjusted request plus conversation context exceeds the 16 MiB safety "
                     "limit. The current request was not interrupted."),
                  true);
     return;
@@ -5105,7 +5334,7 @@ void AIAssistant::editQueuedChat(const QString &taskId)
     return;
   if(edited.toUtf8().size() > MaxPromptBytes)
   {
-    appendSystem(tr("The edited request exceeds the 2 MiB safety limit."), true);
+    appendSystem(tr("The edited request exceeds the 16 MiB safety limit."), true);
     // The inline editor owns only a draft copy. Restore the authoritative queued text when the
     // validation gate rejects that draft.
     updateComposerState();
@@ -5116,9 +5345,42 @@ void AIAssistant::editQueuedChat(const QString &taskId)
   {
     if(request.taskId != taskId)
       continue;
-    request.prompt = edited;
-    request.effectivePrompt = edited;
-    request.historyExcludeMessageIds.clear();
+    if(request.clarificationResponse.isValid() && edited.size() > MaxClarificationOtherChars)
+    {
+      appendSystem(
+          tr("The edited clarification response exceeds the 16,384-character safety limit."),
+          true);
+      updateComposerState();
+      return;
+    }
+    PendingChat updated = request;
+    updated.prompt = edited;
+    updated.effectivePrompt = edited;
+    updated.historyExcludeMessageIds.clear();
+    if(updated.clarificationResponse.isValid())
+    {
+      // Once the readable reply is edited it is no longer safe to claim that it represents the
+      // originally clicked option IDs. Preserve the clarification identity and origin candidate,
+      // but serialize the edited text as the sole free-form answer.
+      updated.clarificationResponse.optionIds.clear();
+      updated.clarificationResponse.otherText = edited;
+    }
+    QString contextError;
+    if(!freezeChatContext(updated, &contextError))
+    {
+      appendSystem(contextError, true);
+      updateComposerState();
+      return;
+    }
+    if(updated.clarificationResponse.isValid())
+    {
+      // Editing re-freezes the task at the current capture/EID. Keep the structured envelope and
+      // the --context-file snapshot on the same candidate so AgentHost cannot bind tools to stale
+      // UI state.
+      updated.clarificationResponse.currentContextSnapshot = updated.contextSnapshot;
+      updated.clarificationResponse.currentContextInstanceId = updated.contextInstanceId;
+    }
+    request = updated;
     if(ConversationThread *thread = conversation(request.conversationId))
     {
       thread->updatedMs = QDateTime::currentMSecsSinceEpoch();
@@ -5153,7 +5415,7 @@ void AIAssistant::deleteQueuedChat(const QString &taskId)
     return;
 
   m_UserPrompts.remove(taskId);
-  m_KnownTasks.remove(taskId);
+  unwatchTask(taskId);
   m_RunningTasks.remove(taskId);
   m_TaskOffsets.remove(taskId);
   m_TaskSequences.remove(taskId);
@@ -5203,6 +5465,7 @@ void AIAssistant::cancelChat(const QString &terminalState, bool continueQueue)
     }
   }
   closeKillOnCloseJob(m_ChatJob);
+  clearChatContextFile();
   m_ChatTaskId.clear();
   m_ActiveChatConversationId.clear();
   m_ActiveChatMessageId.clear();
@@ -5212,7 +5475,7 @@ void AIAssistant::cancelChat(const QString &terminalState, bool continueQueue)
   if(!taskId.isEmpty() && !m_CompletedTasks.contains(taskId))
   {
     m_CompletedTasks.insert(taskId);
-    m_KnownTasks.remove(taskId);
+    unwatchTask(taskId);
     m_RunningTasks.remove(taskId);
     const QString state = terminalState.isEmpty() ? lit("interrupted") : terminalState;
     addTaskActivity(taskId, state,
@@ -5231,7 +5494,7 @@ void AIAssistant::cancelChat(const QString &terminalState, bool continueQueue)
   refreshConversationList();
   updateComposerState();
   saveConversations();
-  ensureWorker();
+  refreshConnectionStatus();
   if(continueQueue)
     QTimer::singleShot(0, this, [this]() { startNextChat(); });
 }
@@ -5279,6 +5542,7 @@ void AIAssistant::clearCaptureTasks()
   }
 
   m_KnownTasks.clear();
+  updateEventTimer();
   m_RunningTasks.clear();
   m_TaskOffsets.clear();
   m_TaskSequences.clear();
@@ -5368,6 +5632,20 @@ void AIAssistant::finishChatResult(const QString &taskId, int exitCode)
     const QString result = resultObject.value(lit("text")).toString();
     QString terminalStatus;
     const bool validTerminal = normalizedTerminalStatus(resultObject, terminalStatus);
+    // The TaskEvent stream is authoritative. This stdout branch is only a compatibility fallback
+    // when a provider exits before qrenderdoc observes its terminal event.
+    if(validTerminal && terminalStatus == lit("needs-user-input"))    // i18n-ignore: task lifecycle state
+    {
+      ClarificationPrompt clarification;
+      // i18n-ignore: ReplayLab result JSON field name defined by the backend protocol.
+      if(clarificationFromJSON(resultObject.value(lit("clarification")).toObject(), taskId,
+                               clarification))
+      {
+        bindClarificationOrigin(clarification, taskId);
+        if(ConversationThread *thread = conversation(m_TaskConversationIds.value(taskId)))
+          thread->clarification = clarification;
+      }
+    }
     if(exitCode == 0 && !result.isEmpty() && validTerminal)
       finishTask(taskId, terminalStatus, result);
     else if(exitCode == 0 && !result.isEmpty())
@@ -5377,6 +5655,7 @@ void AIAssistant::finishChatResult(const QString &taskId, int exitCode)
       finishTask(taskId, lit("failed"),
                  QString::fromUtf8(m_ChatStderr.left(MaxEventLineBytes)).trimmed());
   }
+  clearChatContextFile();
   m_ChatTaskId.clear();
   m_ActiveChatConversationId.clear();
   m_ActiveChatMessageId.clear();
@@ -5385,7 +5664,7 @@ void AIAssistant::finishChatResult(const QString &taskId, int exitCode)
   m_ChatStderr.clear();
   updateComposerState();
   scheduleConversationSave();
-  ensureWorker();
+  refreshConnectionStatus();
   QTimer::singleShot(0, this, [this]() { startNextChat(); });
 }
 
@@ -5398,6 +5677,7 @@ void AIAssistant::watchTask(const QString &taskId, const QString &userPrompt,
     return;
   }
   m_KnownTasks.insert(taskId);
+  updateEventTimer();
   m_RunningTasks.insert(taskId);
   m_TaskOffsets[taskId] = 0;
   m_TaskSequences[taskId] = 0;
@@ -5411,21 +5691,26 @@ void AIAssistant::watchTask(const QString &taskId, const QString &userPrompt,
     m_TaskMessageIds[taskId] = messageId;
 }
 
-void AIAssistant::NotifyIntentQueued(const QString &taskId)
+void AIAssistant::unwatchTask(const QString &taskId)
 {
-  if(!safeTaskId(taskId))
-  {
-    appendSystem(tr("The AI button returned an invalid task identifier."), true);
+  m_KnownTasks.remove(taskId);
+  updateEventTimer();
+}
+
+void AIAssistant::updateEventTimer()
+{
+  if(!m_EventTimer)
     return;
+
+  if(!m_ShuttingDown && !m_KnownTasks.isEmpty())
+  {
+    if(!m_EventTimer->isActive())
+      m_EventTimer->start();
   }
-  const QString prompt = m_PendingIntentPrompt.isEmpty() ? tr("Capture-aware AI action")
-                                                         : m_PendingIntentPrompt;
-  const QString conversationId = m_ActiveConversationId;
-  const QString messageId = appendUser(prompt, taskId, lit("queued"), conversationId);
-  watchTask(taskId, prompt, conversationId, messageId);
-  addTaskActivity(taskId, lit("queued"), tr("Capture action queued"), taskId.left(12));
-  refreshConversationList();
-  ensureWorker();
+  else if(m_EventTimer->isActive())
+  {
+    m_EventTimer->stop();
+  }
 }
 
 void AIAssistant::ReportError(const QString &message)
@@ -5524,8 +5809,8 @@ void AIAssistant::consumeTaskEvent(const QString &taskId, const QByteArray &line
     eventTimestampMs = QDateTime::currentMSecsSinceEpoch();
   if(kind == lit("queued"))
   {
-    // The same bridge intent can be reclaimed after a crashed/expired worker. Discard every
-    // provisional delta from the previous attempt before accepting the new stream.
+    // A queued event starts a fresh attempt. Discard every provisional delta from the previous
+    // attempt before accepting the new stream.
     m_TaskTexts.remove(taskId);
     setTaskState(taskId, lit("queued"), false);
     QString detail = summary;
@@ -5699,7 +5984,21 @@ void AIAssistant::consumeTaskEvent(const QString &taskId, const QByteArray &line
     {
       QString terminalStatus;
       if(normalizedTerminalStatus(eventData, terminalStatus))
+      {
+        if(terminalStatus == lit("needs-user-input"))    // i18n-ignore: task lifecycle state
+        {
+          ClarificationPrompt clarification;
+          // i18n-ignore: ReplayLab task-event JSON field name defined by the backend protocol.
+          if(clarificationFromJSON(eventData.value(lit("clarification")).toObject(), taskId,
+                                   clarification))
+          {
+            bindClarificationOrigin(clarification, taskId);
+            if(ConversationThread *thread = conversation(m_TaskConversationIds.value(taskId)))
+              thread->clarification = clarification;
+          }
+        }
         finishTask(taskId, terminalStatus, summary, eventTimestampMs);
+      }
       else
         // i18n-ignore: Task lifecycle state identifier used only for control flow.
         finishTask(taskId, lit("failed"), tr("AI result contained an invalid terminal status."),
@@ -5792,7 +6091,7 @@ void AIAssistant::finishTask(const QString &taskId, const QString &kind, const Q
       thread->unread = thread->id != m_ActiveConversationId;
   }
   m_UserPrompts.remove(taskId);
-  m_KnownTasks.remove(taskId);
+  unwatchTask(taskId);
   m_RunningTasks.remove(taskId);
   m_TaskOffsets.remove(taskId);
   m_TaskSequences.remove(taskId);
@@ -5808,11 +6107,6 @@ void AIAssistant::finishTask(const QString &taskId, const QString &kind, const Q
   {
     setDiagnosticStatus(m_Status, DiagnosticLevel::Success,
                         m_Ctx.IsCaptureLoaded() ? tr("Connected") : tr("Chat ready"));
-    if(m_RestartWorkerPending && !m_ConnectionDialogOpen)
-    {
-      m_RestartWorkerPending = false;
-      restartWorker();
-    }
   }
 }
 
@@ -5826,16 +6120,14 @@ void AIAssistant::OnCaptureLoaded()
       QString::fromUtf8(captureFilename.c_str(), int(captureFilename.size()));
   updateCaptureStatus();
   m_InstanceId.clear();
-  m_NextWorkerStartMs = 0;
   loadConversations();
-  ensureWorker();
+  refreshConnectionStatus();
 }
 
 void AIAssistant::OnCaptureClosed()
 {
   if(m_ConversationSaveTimer)
     m_ConversationSaveTimer->stop();
-  stopWorker();
   clearCaptureTasks();
   // CaptureContext has already cleared its filename before this callback. The cached key keeps
   // the final interrupted/running state bound to the capture that owned it.

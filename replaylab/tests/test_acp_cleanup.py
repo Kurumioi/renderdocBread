@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_managed_agent_process_escalates_the_owned_tree_before_failing(
+    monkeypatch,
+) -> None:
+    import replaylab_agent.connectors.acp as acp_connector
+
+    release_cleanup = asyncio.Event()
+    forced_processes: list[object] = []
+    process = SimpleNamespace(pid=4242, returncode=None)
+
+    class SlowManager:
+        async def __aenter__(self):
+            return object(), process
+
+        async def __aexit__(self, *args):
+            del args
+            await release_cleanup.wait()
+            process.returncode = -9
+            return False
+
+    async def force_tree(candidate) -> bool:
+        forced_processes.append(candidate)
+        release_cleanup.set()
+        return True
+
+    monkeypatch.setattr(acp_connector, "_ACP_CLEANUP_TIMEOUT", 0.02)
+    monkeypatch.setattr(acp_connector, "_ACP_FORCE_CLEANUP_TIMEOUT", 0.5)
+    monkeypatch.setattr(acp_connector, "_force_stop_agent_process_tree", force_tree)
+
+    async with acp_connector._managed_agent_process(SlowManager(), "test ACP"):
+        pass
+
+    assert forced_processes == [process]
+    assert process.returncode == -9
+
+
+@pytest.mark.asyncio
+async def test_managed_agent_process_without_owned_pid_remains_fail_closed(
+    monkeypatch,
+) -> None:
+    import replaylab_agent.connectors.acp as acp_connector
+    from replaylab_agent.errors import LifecycleCleanupError
+
+    cleanup_cancelled = asyncio.Event()
+
+    class UnownedHangingManager:
+        async def __aenter__(self):
+            return object(), object()
+
+        async def __aexit__(self, *args):
+            del args
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_cancelled.set()
+
+    monkeypatch.setattr(acp_connector, "_ACP_CLEANUP_TIMEOUT", 0.02)
+    with pytest.raises(LifecycleCleanupError, match="cleanup was not confirmed"):
+        async with acp_connector._managed_agent_process(
+            UnownedHangingManager(), "test ACP"
+        ):
+            pass
+    await asyncio.wait_for(cleanup_cancelled.wait(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_tree_escalation_waits_for_confirmed_cleanup(
+    monkeypatch,
+) -> None:
+    import replaylab_agent.connectors.acp as acp_connector
+
+    force_started = asyncio.Event()
+    release_force = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    process = SimpleNamespace(pid=4242, returncode=None)
+
+    class SlowManager:
+        async def __aenter__(self):
+            return object(), process
+
+        async def __aexit__(self, *args):
+            del args
+            await release_cleanup.wait()
+            process.returncode = -9
+            cleanup_finished.set()
+            return False
+
+    async def force_tree(candidate) -> bool:
+        assert candidate is process
+        force_started.set()
+        await release_force.wait()
+        release_cleanup.set()
+        return True
+
+    monkeypatch.setattr(acp_connector, "_ACP_CLEANUP_TIMEOUT", 0.02)
+    monkeypatch.setattr(acp_connector, "_ACP_TREE_KILL_TIMEOUT", 0.5)
+    monkeypatch.setattr(acp_connector, "_ACP_FORCE_CLEANUP_TIMEOUT", 0.5)
+    monkeypatch.setattr(acp_connector, "_force_stop_agent_process_tree", force_tree)
+
+    async def use_manager() -> None:
+        async with acp_connector._managed_agent_process(SlowManager(), "test ACP"):
+            pass
+
+    operation = asyncio.create_task(use_manager())
+    await asyncio.wait_for(force_started.wait(), timeout=1.0)
+    operation.cancel()
+    release_force.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+    assert cleanup_finished.is_set()
+    assert process.returncode == -9
+
+
+@pytest.mark.asyncio
+async def test_connection_test_gives_replaylab_tree_escalation_the_first_deadline(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import replaylab_agent.connectors.acp as acp_connector
+
+    captured: dict[str, object] = {}
+
+    class Connection:
+        async def initialize(self, **kwargs):
+            assert kwargs == {"protocol_version": 1}
+            return {"agentInfo": {"name": "fake", "version": "1"}}
+
+        async def new_session(self, **kwargs):
+            assert kwargs == {"cwd": str(tmp_path), "mcp_servers": []}
+            return SimpleNamespace(session_id="session-1", config_options=[])
+
+    class ImmediateManager:
+        async def __aenter__(self):
+            return Connection(), SimpleNamespace(pid=4242, returncode=0)
+
+        async def __aexit__(self, *args):
+            del args
+            return False
+
+    def spawn_agent_process(client, *command, **kwargs):
+        captured["client"] = client
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return ImmediateManager()
+
+    sdk = SimpleNamespace(protocol_version=1, spawn_agent_process=spawn_agent_process)
+    monkeypatch.setattr(acp_connector, "_load_acp_sdk", lambda: sdk)
+    monkeypatch.setattr(acp_connector, "_make_client", lambda sdk, state: object())
+
+    connector = acp_connector.ACPConnector(["fake-acp"], cwd=tmp_path, timeout=5)
+    result = await connector.test_connection()
+
+    assert result["sessionId"] == "session-1"
+    assert captured["command"] == ("fake-acp",)
+    transport = captured["kwargs"]["transport_kwargs"]
+    assert transport["shutdown_timeout"] == acp_connector._ACP_TRANSPORT_SHUTDOWN_TIMEOUT
+    assert (
+        transport["shutdown_timeout"]
+        > acp_connector._ACP_CLEANUP_TIMEOUT
+        + acp_connector._ACP_TREE_KILL_TIMEOUT
+        + acp_connector._ACP_FORCE_CLEANUP_TIMEOUT
+    )

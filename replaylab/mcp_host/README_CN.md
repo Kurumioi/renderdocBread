@@ -8,6 +8,13 @@ RenderDocUltra 由原生 C++ 管理 UI 与生命周期，并从固定应用目�
 Bridge 通过源码和构建系统固定选择，直接调用 `start`/`stop`，不再经由
 `extension.json` 或用户扩展目录发现。
 
+qrenderdoc 项目 UI 只使用经过认证的 `ReplayLabInternal.exe` 高层服务。本目录负责的
+项目管理、恢复与 Shader 保存如果无法访问内部服务，会直接失败关闭，绝不回退为启动本
+可执行文件。普通 qrenderdoc 默认持有一个 `ReplayLabMCP.exe` 回环服务，供外部 Codex、
+IDE 或自动化客户端连接；设置 `REPLAYLAB_EXTERNAL_MCP_AUTOSTART=0`（也接受 `false`、
+`no`、`off`）只会关闭这项外部服务。ACP/Cursor 只为当前专员任务启动一个受过滤的 stdio
+适配器。模型 API 与 Codex dynamicTools 的内置工作直接在 AgentHost 中执行。
+
 [English](README.md) | **中文**
 
 ---
@@ -75,7 +82,7 @@ Bridge 通过源码和构建系统固定选择，直接调用 `start`/`stop`，�
 | `migrate_shader_workspace_toolchain` | 当 catalog/registry 合法升级时，以旧路线和当前源码 SHA 为 CAS，在新工作区原样保留源码并重新绑定当前工具链；不导入旧候选/ABI |
 | `try_shader_workspace_recovery_candidate` | 只按原 workspace 的哈希绑定 recovery plan 候选索引，在新的 sibling workspace 中尝试另一条已注册路线；不能提供命令、路径或 executable，失败证据不会覆盖 |
 | `decompile_shader_workspace` | 调用 workspace 绑定的反编译器，且不会覆盖已编辑源码 |
-| `get_shader_workspace_representation` | 返回可执行的路由文本（优先 HLSL/GLSL；仅当高级语言路线在静态规划时不完整，才自动选择唯一、直接、可往返的 DXBC/DXIL 汇编），否则物化 RenderDoc IR 或精确二进制回退；运行时失败可由 Companion 从固定 recovery plan 选择另一个反编译候选，但必须新建 workspace，不会在原 workspace 偷换格式/路线；SPIR-V 汇编在 workspace 工具与 validator 接通前不进入自动回退 |
+| `get_shader_workspace_representation` | 返回可执行的路由文本（优先 HLSL/GLSL；仅当高级语言路线在静态规划时不完整，才自动选择唯一、直接、可往返的 DXBC/DXIL 汇编），否则物化 RenderDoc IR 或精确二进制回退；运行时失败可由 AgentHost 专员从固定 recovery plan 选择另一个反编译候选，但必须新建 workspace，不会在原 workspace 偷换格式/路线；SPIR-V 汇编在 workspace 工具与 validator 接通前不进入自动回退 |
 | `promote_shader_workspace_explanation` | 显式提升经 Hash 复核的 `explanation/promoted.hlsl`；仍必须重新编译、ABI 校验并获得 Apply 授权 |
 | `compile_shader_workspace` | 把路由绑定的 HLSL/汇编编译为可审计候选；**不会应用到 RenderDoc** |
 | `get_shader_workspace_status` | 校验哈希并报告源码、修订和候选状态 |
@@ -182,22 +189,6 @@ catalog 修订、route binding、stage、资源 ID 与 Shader 原始哈希，避
 不会暗中切换当前 head，多修订但缺少 revision provenance 的注册会以歧义失败关闭。完整流程与边界见
 [项目级多帧复用](docs/REPLAY_PROJECTS.md)。
 
-### 🤖 外部 AI Companion
-
-使用 `pip install -e ".[companion]"` 安装，只在 sidecar 启动 shell 中设置
-`OPENAI_API_KEY`，然后运行 `renderdoc-ai-companion gui --workspace-root <目录>`。
-这个独立 Host 当前只使用 OpenAI Platform API Key；ChatGPT/Codex 订阅只能通过
-已登录 ChatGPT 的桌面版/Codex 客户端连接本地 MCP 来使用，不能直接充当该程序的凭据。
-对应边界见 OpenAI 官方的 [Codex 认证](https://learn.chatgpt.com/docs/auth) 与
-[本地 MCP/STDIO 支持](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) 文档。
-它会在每轮聊天前读取当前 RenderDoc 上下文，自动领取/续租 RenderDoc 按钮意图，并通过
-可信的自动多跳路线创建一个共享 Shader 工作区。AI 源码整理、IDE 保存监听、明确的
-`/apply-last` 与 `/rollback-last`，以及独立 opt-in 的保存后自动应用都受
-compile/ABI/live gate 约束。可选的 `--project-root`/`--project` 模式会在捕获会话变化时
-导入并生成复用计划；新建项目还必须显式给出 game/build ID，而且只允许把唯一匹配源码
-写入新工作区后重新编译/校验，绝不会由项目模式授权 Apply。详见
-[外部 AI Companion Host](docs/AI_COMPANION_HOST.md)。
-
 ### 🎯 贴图自动对应
 | 工具 | 说明 |
 |------|------|
@@ -285,22 +276,20 @@ qrenderdoc 现已提供原生 MVP：打开 Pipeline State 的 CBuffer 变量视�
 
 1. **RenderDocUltra v1.44**（内置集成声明的最低版本）
 2. 使用发行包内的 `ReplayLabMCP.exe` 时不需要另装 Python
-3. 只有源码开发或可选外部 Companion 才需要 **Python 3.10+**；文件 IPC 隔离了运行时，
+3. 只有源码开发外部 MCP 才需要 **Python 3.10+**；文件 IPC 隔离了运行时，
    因此不必与 RenderDoc 内置 Python 版本一致
 
-## 推荐安装：RenderDocUltra + Codex
+## 推荐安装：独立 RenderDoc AI 产品
 
-关闭 qrenderdoc 后，从发行包目录运行：
+发行包已经包含固定路径的内置 Bridge、`replaylab-ai.exe`、
+`ReplayLabInternal.exe` 与 `ReplayLabMCP.exe`，无需运行额外安装脚本。RenderDoc AI 只
+读取自己的 Settings、profiles 与凭据，不会读取或修改 `~/.codex/config.toml`，也不
+要求安装外部 Codex skill。项目管理、恢复与 Shader 保存走 `ReplayLabInternal.exe`；
+只有外部 Codex、IDE 或自动化客户端才需要显式连接 `ReplayLabMCP.exe stdio`。
 
-```powershell
-.\Install-ReplayLab.ps1 -RenderDocDirectory "D:\path\to\RenderDocUltra"
-```
-
-安装器会部署由 RenderDocUltra 构建系统管理的内置 Bridge 和单文件 Host，在
-`~/.codex/config.toml` 中以 `replaylab` 注册本地 stdio MCP，并安装配套
-`replaylab-debugger` skill。旧配置/同名 skill 会先创建时间戳备份。
-完成后只需重启一次 qrenderdoc 和 Codex；以后打开 RDC 时服务随 qrenderdoc 自动启动，
-最后一个 qrenderdoc 退出后自动停止。
+从源码构建或部署发行运行时时，请使用 `replaylab/packaging/` 中受测试约束的
+`Build-ReplayLabRuntime.ps1` 与 `Deploy-ReplayLabRuntime.ps1`，具体参数见该目录的
+`README.md`。
 
 若只做源码开发，再使用：
 
@@ -321,7 +310,7 @@ set RENDERDOC_MODULE_PATH=C:\Program Files\RenderDoc
 export RENDERDOC_MODULE_PATH=/usr/lib/renderdoc
 ```
 
-### 其他 MCP 客户端配置
+### 外部 MCP 客户端配置（可选）
 
 添加到 MCP 配置文件（如 `~/.workbuddy/mcp.json`）：
 

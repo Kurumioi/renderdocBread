@@ -4,12 +4,14 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from replaylab_agent.errors import (
     AuthenticationError,
+    ConfigurationError,
     ConnectorError,
     LifecycleCleanupError,
     PolicyError,
@@ -55,6 +57,209 @@ async def test_codex_app_server_lifecycle_and_skill_input(tmp_path) -> None:
     assert result.thread_id == "thread-test"
     assert result.turn_id == "turn-test"
     assert deltas == ["evidence "]
+
+
+@pytest.mark.asyncio
+async def test_codex_app_server_routes_dynamic_tools_to_the_host(tmp_path) -> None:
+    from replaylab_agent.connectors.codex_app_server import CodexAppServerConnector
+
+    calls: list[tuple[str, dict[str, object], str]] = []
+
+    async def handle(name: str, arguments: dict[str, object], call_id: str) -> object:
+        calls.append((name, arguments, call_id))
+        return {"eventId": arguments["event_id"], "inspected": True}
+
+    connector = CodexAppServerConnector(
+        [sys.executable, str(FIXTURES / "fake_codex_app_server.py"), "dynamic-tool"],
+        cwd=tmp_path,
+        expected_tools={"inspect_event"},
+        dynamic_tools=(
+            {
+                "type": "function",
+                "name": "inspect_event",
+                "description": "Inspect one event",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"event_id": {"type": "integer"}},
+                    "required": ["event_id"],
+                    "additionalProperties": False,
+                },
+            },
+        ),
+        dynamic_tool_handler=handle,
+        timeout=5,
+    )
+
+    result = await connector.run("inspect the event")
+
+    assert result.text == "dynamic evidence answer"
+    assert calls == [("inspect_event", {"event_id": 7}, "dynamic-call-1")]
+    assert not connector._transport._server_request_tasks
+
+
+def _dynamic_tool_definition() -> dict[str, object]:
+    return {
+        "type": "function",
+        "name": "inspect_event",
+        "description": "Inspect one event",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"event_id": {"type": "integer"}},
+            "required": ["event_id"],
+            "additionalProperties": False,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_codex_dynamic_tool_request_can_precede_turn_start_response(tmp_path) -> None:
+    from replaylab_agent.connectors.codex_app_server import CodexAppServerConnector
+
+    calls: list[str] = []
+
+    async def handle(name: str, arguments: dict[str, object], call_id: str) -> object:
+        calls.append(call_id)
+        return {"eventId": arguments["event_id"], "tool": name}
+
+    connector = CodexAppServerConnector(
+        [sys.executable, str(FIXTURES / "fake_codex_app_server.py"), "dynamic-tool-prestart"],
+        cwd=tmp_path,
+        expected_tools={"inspect_event"},
+        dynamic_tools=(_dynamic_tool_definition(),),
+        dynamic_tool_handler=handle,
+        timeout=5,
+    )
+
+    result = await connector.run("inspect the event")
+
+    assert result.text == "dynamic evidence answer"
+    assert calls == ["dynamic-call-1"]
+    assert not connector._transport._server_request_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode, invalid_json",
+    [("dynamic-tool-failure", False), ("dynamic-tool-invalid-json", True)],
+)
+async def test_codex_dynamic_tool_failures_use_a_normal_tool_response(
+    tmp_path, mode: str, invalid_json: bool
+) -> None:
+    from replaylab_agent.connectors.codex_app_server import CodexAppServerConnector
+
+    async def handle(name: str, arguments: dict[str, object], call_id: str) -> object:
+        del name, arguments, call_id
+        if invalid_json:
+            return {"invalid": float("nan")}
+        raise RuntimeError("private bridge failure")
+
+    connector = CodexAppServerConnector(
+        [sys.executable, str(FIXTURES / "fake_codex_app_server.py"), mode],
+        cwd=tmp_path,
+        expected_tools={"inspect_event"},
+        dynamic_tools=(_dynamic_tool_definition(),),
+        dynamic_tool_handler=handle,
+        timeout=5,
+    )
+
+    result = await connector.run("inspect the event")
+
+    assert result.text == "dynamic evidence answer"
+
+
+@pytest.mark.asyncio
+async def test_codex_close_cancels_and_joins_pending_server_request_tasks(tmp_path) -> None:
+    from replaylab_agent.connectors.codex_app_server import CodexAppServerConnector
+
+    started = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def handle(name: str, arguments: dict[str, object], call_id: str) -> object:
+        del name, arguments, call_id
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finished.set()
+
+    connector = CodexAppServerConnector(
+        [sys.executable, str(FIXTURES / "fake_codex_app_server.py"), "dynamic-tool-block"],
+        cwd=tmp_path,
+        expected_tools={"inspect_event"},
+        dynamic_tools=(_dynamic_tool_definition(),),
+        dynamic_tool_handler=handle,
+        timeout=5,
+    )
+    run_task = asyncio.create_task(connector.run("inspect the event"))
+    await asyncio.wait_for(started.wait(), timeout=3)
+
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    assert finished.is_set()
+    assert not connector._transport._server_request_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    ["dynamic-tool-wrong-turn", "dynamic-tool-wrong-type", "dynamic-tool-duplicate"],
+)
+async def test_codex_dynamic_tool_scope_and_call_ids_fail_closed(tmp_path, mode: str) -> None:
+    from replaylab_agent.connectors.codex_app_server import CodexAppServerConnector
+
+    async def handle(name: str, arguments: dict[str, object], call_id: str) -> object:
+        del name, call_id
+        return {"eventId": arguments["event_id"]}
+
+    connector = CodexAppServerConnector(
+        [sys.executable, str(FIXTURES / "fake_codex_app_server.py"), mode],
+        cwd=tmp_path,
+        expected_tools={"inspect_event"},
+        dynamic_tools=(_dynamic_tool_definition(),),
+        dynamic_tool_handler=handle,
+        timeout=5,
+    )
+
+    with pytest.raises(PolicyError, match="active turn grant|repeated"):
+        await connector.run("inspect the event")
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        {
+            "type": "namespace",
+            "name": "inspect_event",
+            "description": "bad namespace",
+            "tools": [],
+        },
+        {
+            "type": "function",
+            "name": "invalid.name",
+            "description": "bad name",
+            "inputSchema": {"type": "object"},
+        },
+        {
+            "type": "function",
+            "name": "inspect_event",
+            "description": "bad schema",
+            "inputSchema": {"type": "string"},
+        },
+    ],
+)
+def test_codex_dynamic_tool_definitions_fail_closed(tmp_path, definition) -> None:
+    from replaylab_agent.connectors.codex_app_server import CodexAppServerConnector
+
+    with pytest.raises(ConfigurationError, match="dynamic tool|function"):
+        CodexAppServerConnector(
+            [sys.executable, str(FIXTURES / "fake_codex_app_server.py")],
+            cwd=tmp_path,
+            expected_tools={"inspect_event"},
+            dynamic_tools=(definition,),
+            dynamic_tool_handler=lambda *_args: None,
+        )
 
 
 @pytest.mark.asyncio
@@ -335,8 +540,8 @@ async def test_codex_app_server_approval_is_denied(tmp_path) -> None:
     "mode, message",
     [
         ("ambient-instructions", "instruction sources"),
-        ("extra-mcp", "exactly the 'replaylab'"),
-        ("wrong-tools", "tool inventory"),
+        ("extra-mcp", "must not load MCP servers"),
+        ("wrong-tools", "must not load MCP servers"),
         ("callable-app", "Apps must be disabled"),
     ],
 )
@@ -372,11 +577,9 @@ def test_codex_process_hardening_disables_ambient_agent_features() -> None:
         'history.persistence="none"',
     ):
         assert override in rendered
-    assert "mcp_servers.replaylab.command=" in rendered
-    assert "replaylab_agent.mcp_proxy" in rendered
-    assert "mcp_servers.replaylab.required=true" in rendered
-    assert 'mcp_servers.replaylab.default_tools_approval_mode="approve"' in rendered
-    assert "REPLAYLAB_ALLOWED_TOOLS" in rendered
+    assert "mcp_servers.replaylab" not in rendered
+    assert "replaylab_agent.mcp_proxy" not in rendered
+    assert "REPLAYLAB_ALLOWED_TOOLS" not in rendered
 
 
 @pytest.mark.asyncio
@@ -494,24 +697,21 @@ async def test_acp_process_cleanup_timeout_is_a_fatal_lifecycle_error(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_acp_sdk_session_streams_text_and_injects_mcp(tmp_path) -> None:
+async def test_acp_capture_tools_use_one_task_filtered_mcp_proxy(tmp_path) -> None:
     pytest.importorskip("acp")
     from replaylab_agent.connectors.acp import ACPConnector
     from replaylab_agent.mcp_tools import find_replaylab_mcp
 
-    deltas: list[str] = []
     connector = ACPConnector(
-        [sys.executable, str(FIXTURES / "fake_acp_agent.py")],
+        [sys.executable, str(FIXTURES / "fake_acp_agent.py"), "filtered"],
         cwd=tmp_path,
         replaylab_mcp_executable=find_replaylab_mcp(),
         allowed_tools=frozenset({"get_pipeline_state"}),
         **_acp_capture_kwargs(tmp_path, "stream"),
         timeout=10,
     )
-    result = await connector.run("hello", on_delta=deltas.append)
+    result = await connector.run("hello")
     assert result.text == "ACP: hello"
-    assert result.session_id == "session-test"
-    assert deltas == ["ACP: hello"]
 
 
 @pytest.mark.asyncio
@@ -541,7 +741,10 @@ async def test_external_agent_runtime_general_chat_needs_no_capture_instance(tmp
             "managed-chat",
             "custom-acp",
             command=[sys.executable, str(FIXTURES / "fake_acp_agent.py"), "no-mcp"],
-            options={"allow_unsandboxed_agent": True},
+            options={
+                "allow_unsandboxed_agent": True,
+                "context_window_tokens": 65_536,
+            },
         )
     )
     runtime = AgentRuntime(
@@ -559,24 +762,118 @@ async def test_external_agent_runtime_general_chat_needs_no_capture_instance(tmp
     ]
     assert payloads[-2]["data"] == {"stream": "final", "reset": True}
     assert payloads[-1]["kind"] == "completed"
+    turn_workspace = tmp_path / "external-agent-workspace"
+    assert not list(turn_workspace.glob("turn-*"))
+    assert not list(turn_workspace.glob(".delete-turn-*"))
 
 
 @pytest.mark.asyncio
-async def test_acp_sdk_injects_skill_filtered_mcp_proxy(tmp_path) -> None:
+async def test_external_agent_runtime_cleans_turn_workspace_after_failure(tmp_path) -> None:
+    pytest.importorskip("acp")
+
+    store = ProfileStore(tmp_path / "profiles.json")
+    store.add(
+        Profile(
+            "managed-failure",
+            "custom-acp",
+            command=[
+                sys.executable,
+                str(FIXTURES / "fake_acp_agent.py"),
+                "refusal",
+                "no-mcp",
+            ],
+            options={
+                "allow_unsandboxed_agent": True,
+                "context_window_tokens": 65_536,
+            },
+        )
+    )
+    runtime = AgentRuntime(
+        store,
+        SkillCatalog([]).load(),
+        event_root=tmp_path / "events",
+    )
+
+    with pytest.raises(ConnectorError, match="refusal"):
+        await runtime.run(
+            "hello", profile_id="managed-failure", task_id="managed-failure"
+        )
+
+    turn_workspace = tmp_path / "external-agent-workspace"
+    assert not list(turn_workspace.glob("turn-*"))
+    assert not list(turn_workspace.glob(".delete-turn-*"))
+
+
+def test_external_agent_workspace_reaps_only_owned_stale_turns(tmp_path) -> None:
+    store = ProfileStore(tmp_path / "profiles.json")
+    runtime = AgentRuntime(
+        store,
+        SkillCatalog([]).load(),
+        event_root=tmp_path / "events",
+    )
+    root = runtime._external_agent_workspace()
+    stale = root / ("turn-" + "a" * 32)
+    fresh = root / ("turn-" + "b" * 32)
+    unrelated = root / "user-directory"
+    stale.mkdir()
+    fresh.mkdir()
+    unrelated.mkdir()
+    (stale / "audit.jsonl").write_text("old", encoding="utf-8")
+    old = time.time() - runtime._EXTERNAL_TURN_STALE_SECONDS - 60
+    os.utime(stale, (old, old))
+
+    assert runtime._external_agent_workspace() == root
+
+    assert not stale.exists()
+    assert fresh.is_dir()
+    assert unrelated.is_dir()
+    assert runtime._cleanup_external_agent_turn_workspace(fresh)
+
+
+def test_external_agent_turn_creation_cleans_after_cursor_setup_failure(
+    monkeypatch, tmp_path
+) -> None:
+    import replaylab_agent.runtime as runtime_module
+
+    store = ProfileStore(tmp_path / "profiles.json")
+    runtime = AgentRuntime(
+        store,
+        SkillCatalog([]).load(),
+        event_root=tmp_path / "events",
+    )
+    profile = Profile(
+        "cursor-cleanup",
+        "cursor-acp",
+        options={"allow_unsandboxed_agent": True},
+    )
+
+    def fail_setup(_profile):
+        raise ConfigurationError("managed Cursor setup failed")
+
+    monkeypatch.setattr(runtime_module, "ensure_cursor_profile_config", fail_setup)
+
+    with pytest.raises(ConfigurationError, match="managed Cursor setup failed"):
+        runtime._external_agent_turn_workspace(profile)
+
+    turn_workspace = tmp_path / "external-agent-workspace"
+    assert not list(turn_workspace.glob("turn-*"))
+    assert not list(turn_workspace.glob(".delete-turn-*"))
+
+
+@pytest.mark.asyncio
+async def test_acp_rejects_an_mcp_executable_without_task_tools(tmp_path) -> None:
     pytest.importorskip("acp")
     from replaylab_agent.connectors.acp import ACPConnector
     from replaylab_agent.mcp_tools import find_replaylab_mcp
 
-    connector = ACPConnector(
-        [sys.executable, str(FIXTURES / "fake_acp_agent.py"), "filtered"],
-        cwd=tmp_path,
-        replaylab_mcp_executable=find_replaylab_mcp(),
-        allowed_tools=frozenset({"get_pipeline_state"}),
-        **_acp_capture_kwargs(tmp_path, "filter"),
-        timeout=10,
-    )
-    result = await connector.run("hello")
-    assert result.text == "ACP: hello"
+    with pytest.raises(ConfigurationError, match="without any task tools"):
+        ACPConnector(
+            [sys.executable, str(FIXTURES / "fake_acp_agent.py"), "no-mcp"],
+            cwd=tmp_path,
+            replaylab_mcp_executable=find_replaylab_mcp(),
+            allowed_tools=frozenset(),
+            timeout=10,
+        )
 
 
 @pytest.mark.asyncio
@@ -586,11 +883,9 @@ async def test_acp_non_terminal_stop_reason_is_not_success(tmp_path) -> None:
     from replaylab_agent.mcp_tools import find_replaylab_mcp
 
     connector = ACPConnector(
-        [sys.executable, str(FIXTURES / "fake_acp_agent.py"), "refusal"],
+        [sys.executable, str(FIXTURES / "fake_acp_agent.py"), "refusal", "no-mcp"],
         cwd=tmp_path,
-        replaylab_mcp_executable=find_replaylab_mcp(),
-        allowed_tools=frozenset({"get_pipeline_state"}),
-        **_acp_capture_kwargs(tmp_path, "refusal"),
+        allowed_tools=frozenset(),
         timeout=10,
     )
     with pytest.raises(ConnectorError, match="refusal"):
@@ -604,11 +899,9 @@ async def test_acp_many_small_deltas_hit_cumulative_response_bound(tmp_path) -> 
     from replaylab_agent.mcp_tools import find_replaylab_mcp
 
     connector = ACPConnector(
-        [sys.executable, str(FIXTURES / "fake_acp_agent.py"), "many-deltas"],
+        [sys.executable, str(FIXTURES / "fake_acp_agent.py"), "many-deltas", "no-mcp"],
         cwd=tmp_path,
-        replaylab_mcp_executable=find_replaylab_mcp(),
-        allowed_tools=frozenset({"get_pipeline_state"}),
-        **_acp_capture_kwargs(tmp_path, "many-deltas"),
+        allowed_tools=frozenset(),
         timeout=10,
     )
     with pytest.raises(ConnectorError, match="response exceeded"):
@@ -664,3 +957,160 @@ async def test_acp_client_file_and_terminal_capabilities_fail_closed() -> None:
         await client.read_text_file("session", "C:/secret.txt")
     with pytest.raises(PolicyError, match="create a terminal"):
         await client.create_terminal("session", "powershell")
+
+
+@pytest.mark.asyncio
+async def test_cursor_acp_permission_requests_are_cancelled_without_trusting_labels(
+    tmp_path,
+) -> None:
+    pytest.importorskip("acp")
+    from acp import schema
+    from replaylab_agent.connectors.acp import (
+        _ACPClientState,
+        _load_acp_sdk,
+        _make_client,
+    )
+
+    audit = tmp_path / "permission-audit.jsonl"
+    state = _ACPClientState(
+        on_delta=None,
+        provider_id="cursor-acp",
+        session_id="session-1",
+        permission_audit_file=audit,
+    )
+    client = _make_client(_load_acp_sdk(), state)
+    response = await client.request_permission(
+        "session-1",
+        schema.ToolCallUpdate(
+            toolCallId="call-1",
+            title="Mcp(ReplayLab:get_pipeline_state)",
+            kind="other",
+            rawInput={"server": "ReplayLab", "tool": "get_pipeline_state"},
+        ),
+        [
+            schema.PermissionOption(
+                optionId="allow-always",
+                name="Allow always",
+                kind="allow_always",
+            ),
+            schema.PermissionOption(
+                optionId="reject-once",
+                name="Reject",
+                kind="reject_once",
+            ),
+        ],
+    )
+
+    payload = response.model_dump(by_alias=True) if hasattr(response, "model_dump") else response
+    assert payload["outcome"] == {"outcome": "cancelled"}
+    assert state.policy_error is None
+    assert state.cursor_permission_denials == 1
+    audit_payload = json.loads(audit.read_text(encoding="utf-8"))
+    assert audit_payload == {
+        "event": "permissionDenied",
+        "provider": "cursor-acp",
+        "sequence": 1,
+    }
+    assert "get_pipeline_state" not in audit.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_cursor_acp_permission_validation_is_bounded_and_session_bound() -> None:
+    pytest.importorskip("acp")
+    from acp import schema
+    from replaylab_agent.connectors.acp import (
+        _ACPClientState,
+        _load_acp_sdk,
+        _make_client,
+    )
+
+    state = _ACPClientState(
+        on_delta=None,
+        provider_id="cursor-acp",
+        session_id="session-1",
+    )
+    client = _make_client(_load_acp_sdk(), state)
+    tool_call = schema.ToolCallUpdate(toolCallId="call-1", title="Read", kind="read")
+    options = [
+        schema.PermissionOption(
+            optionId="reject-once", name="Reject", kind="reject_once"
+        )
+    ]
+
+    await client.request_permission("other-session", tool_call, options)
+    assert state.policy_error is not None
+    assert "session mismatch" in str(state.policy_error)
+    assert state.abort_event.is_set()
+
+    state = _ACPClientState(
+        on_delta=None,
+        provider_id="cursor-acp",
+        session_id="session-1",
+    )
+    client = _make_client(_load_acp_sdk(), state)
+    await client.request_permission("session-1", tool_call, options)
+    assert state.policy_error is None
+    await client.request_permission("session-1", tool_call, options)
+    assert state.policy_error is not None
+    assert "duplicate tool-call id" in str(state.policy_error)
+
+    state = _ACPClientState(
+        on_delta=None,
+        provider_id="cursor-acp",
+        session_id="session-1",
+    )
+    client = _make_client(_load_acp_sdk(), state)
+    for index in range(17):
+        await client.request_permission(
+            "session-1",
+            schema.ToolCallUpdate(
+                toolCallId=f"bounded-{index}", title="Denied", kind="read"
+            ),
+            options,
+        )
+    assert state.cursor_permission_denials == 17
+    assert state.policy_error is not None
+    assert "bounded permission-denial limit" in str(state.policy_error)
+    assert state.abort_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cursor_acp_known_extensions_are_noninteractive_and_unknowns_fail_closed() -> None:
+    pytest.importorskip("acp")
+    from replaylab_agent.connectors.acp import (
+        _ACPClientState,
+        _load_acp_sdk,
+        _make_client,
+    )
+
+    state = _ACPClientState(on_delta=None, provider_id="cursor-acp")
+    client = _make_client(_load_acp_sdk(), state)
+    assert await client.ext_method("cursor/ask_question", {"private": "ignored"}) == {
+        "outcome": {
+            "outcome": "skipped",
+            "reason": "ReplayLab does not provide interactive answers during this automated turn.",
+        }
+    }
+    assert await client.ext_method("cursor/create_plan", {"private": "ignored"}) == {
+        "outcome": {
+            "outcome": "rejected",
+            "reason": "ReplayLab does not approve external execution plans; continue with read-only analysis.",
+        }
+    }
+    for method in (
+        "cursor/update_todos",
+        "cursor/task",
+        "cursor/generate_image",
+    ):
+        await client.ext_notification(method, {"private": "ignored"})
+    assert state.policy_error is None
+
+    await client.ext_notification("cursor/unknown", {})
+    assert state.policy_error is not None
+    assert state.abort_event.is_set()
+
+    generic_state = _ACPClientState(on_delta=None)
+    generic_client = _make_client(_load_acp_sdk(), generic_state)
+    await generic_client.request_permission("session", {}, [])
+    assert generic_state.policy_error is not None
+    assert generic_state.abort_event.is_set()

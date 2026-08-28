@@ -21,6 +21,7 @@ from .errors import (
     ToolConfigurationError,
     ToolExecutionError,
     ToolchainRoutingError,
+    WorkspaceWatchConflictError,
     WorkspaceWatchError,
 )
 from .watcher import ShaderWorkspaceWatchManager
@@ -87,6 +88,7 @@ __all__ = [
     "ToolExecutionError",
     "ToolchainRoutingError",
     "WorkspaceWatchError",
+    "WorkspaceWatchConflictError",
     "build_candidate_reflection_request",
     "compare_shader_abi",
     "parse_shader_abi",

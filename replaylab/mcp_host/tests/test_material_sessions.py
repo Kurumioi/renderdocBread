@@ -400,6 +400,72 @@ class MaterialSessionTests(unittest.TestCase):
         self.assertEqual(second_payload[16:], baseline[16:])
         self.assertEqual(second["revision"], 2)
 
+    def test_typed_batch_update_validates_then_replays_once(self) -> None:
+        prepared = self.prepare()
+        by_path = {item["path"]: item for item in prepared["parameters"]}
+        before = len(self.bridge.apply_requests)
+
+        updated = self.manager.update_many(
+            prepared["sessionId"],
+            [
+                {
+                    "parameter": by_path["roughness"]["parameterId"],
+                    "value": 0.625,
+                },
+                {
+                    "parameter": by_path["tint"]["parameterId"],
+                    "value": [1.0, 0.5, 0.25],
+                },
+                {
+                    "parameter": by_path["mode"]["parameterId"],
+                    "value": 7,
+                },
+            ],
+        )
+
+        self.assertEqual(len(self.bridge.apply_requests), before + 1)
+        self.assertEqual(updated["operation"], "update-many")
+        self.assertEqual(updated["revision"], 1)
+        self.assertEqual(updated["updatedParameterCount"], 3)
+        self.assertEqual(
+            updated["updatedParameterIds"],
+            [
+                by_path["roughness"]["parameterId"],
+                by_path["tint"]["parameterId"],
+                by_path["mode"]["parameterId"],
+            ],
+        )
+        request = self.bridge.apply_requests[-1]
+        payload = base64.b64decode(request["data_base64"])
+        self.assertEqual(payload[:4], struct.pack("<f", 0.625))
+        self.assertEqual(payload[4:16], struct.pack("<fff", 1.0, 0.5, 0.25))
+        self.assertEqual(payload[16:20], struct.pack("<i", 7))
+        self.assertEqual(len(request["patches"]), 3)
+
+    def test_batch_update_rejects_all_items_before_replay(self) -> None:
+        prepared = self.prepare()
+        before = len(self.bridge.apply_requests)
+        with self.assertRaisesRegex(MaterialSessionError, "exactly 3"):
+            self.manager.update_many(
+                prepared["sessionId"],
+                [
+                    {"parameter": "roughness", "value": 0.5},
+                    {"parameter": "tint", "value": [1.0, 2.0]},
+                ],
+            )
+        self.assertEqual(len(self.bridge.apply_requests), before)
+        self.assertEqual(self.manager.status(prepared["sessionId"])["revision"], 0)
+
+        with self.assertRaisesRegex(MaterialSessionError, "more than once"):
+            self.manager.update_many(
+                prepared["sessionId"],
+                [
+                    {"parameter": "roughness", "value": 0.5},
+                    {"parameter": "roughness", "value": 0.75},
+                ],
+            )
+        self.assertEqual(len(self.bridge.apply_requests), before)
+
     def test_nan_overflow_wrong_type_and_wrong_shape_are_rejected_before_bridge(self) -> None:
         prepared = self.prepare()
         by_path = {item["path"]: item for item in prepared["parameters"]}
@@ -614,6 +680,7 @@ class MaterialSessionTests(unittest.TestCase):
             "list_material_sessions": [],
             "get_material_session_status": ["session_id"],
             "update_material_parameter": ["session_id", "parameter", "value"],
+            "update_material_parameters": ["session_id", "updates"],
             "rollback_material_session": ["session_id"],
             "clear_all_material_sessions": ["expected_capture_id"],
         }

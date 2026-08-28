@@ -141,7 +141,7 @@ public:
   void showTimelineBar() { on_action_Timeline_triggered(); }
   void showPythonShell() { on_action_Python_Shell_triggered(); }
   void showApiMonitorWindow() { on_action_API_Monitor_triggered(); }
-  void showAIAssistant(const QString &taskId = QString());
+  void showAIAssistant();
   void showPerformanceCounterViewer() { on_action_Counter_Viewer_triggered(); }
   void showResourceInspector() { on_action_Resource_Inspector_triggered(); }
   void showExtensionManager() { on_action_Manage_Extensions_triggered(); }
@@ -260,6 +260,10 @@ private:
   QAction *updateAction = NULL;
 
   QTimer m_MessageTick;
+  // UI-thread owned. Debug message polling is single-flight so a slow replay/remote call cannot
+  // accumulate one command every timer tick. The generation rejects results from a closed capture.
+  bool m_MessageCheckInFlight = false;
+  uint64_t m_MessageCheckGeneration = 0;
   QSemaphore m_RemoteProbeSemaphore;
   QSemaphore m_RemoteInitialProbeReady;
   LambdaThread *m_RemoteProbe;

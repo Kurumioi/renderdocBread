@@ -31,8 +31,29 @@ def _store(tmp_path: Path) -> ProfileStore:
             models=["model-a", "model-b"],
             default_model="model-a",
             command=["fake-acp"],
-            options={"allow_unsandboxed_agent": True},
+            options={
+                "allow_unsandboxed_agent": True,
+                "context_window_tokens": 65_536,
+            },
             probed_capabilities=["tools"],
+        )
+    )
+    return store
+
+
+def _store_without_tools(tmp_path: Path) -> ProfileStore:
+    store = ProfileStore(tmp_path / "profiles.json")
+    store.add(
+        Profile(
+            "managed-no-tools",
+            "custom-acp",
+            model="model-a",
+            command=["fake-acp"],
+            options={
+                "allow_unsandboxed_agent": True,
+                "context_window_tokens": 65_536,
+            },
+            probed_capabilities=[],
         )
     )
     return store
@@ -107,7 +128,7 @@ async def test_capture_aware_external_chat_uses_zero_tool_plan_then_skill_tasks(
     tmp_path,
 ) -> None:
     plan = {
-        "request_summary": "Explain event and resources",
+        "request_summary": "Inspect shader and explain event",
         "tasks": [
             {
                 "id": "task-1",
@@ -117,9 +138,9 @@ async def test_capture_aware_external_chat_uses_zero_tool_plan_then_skill_tasks(
             },
             {
                 "id": "task-2",
-                "summary": "Inspect bound resources",
-                "skill": "renderdoc-resource-analysis",
-                "depends_on": [],
+                "summary": "Inspect bound shader",
+                "skill": "renderdoc-shader-workbench",
+                "depends_on": ["task-1"],
             },
         ],
     }
@@ -150,7 +171,7 @@ async def test_capture_aware_external_chat_uses_zero_tool_plan_then_skill_tasks(
     assert all(call["model"] == "model-b" for call in runtime.calls)
     assert {call["skill"] for call in specialist_calls} == {
         "renderdoc-explain-event",
-        "renderdoc-resource-analysis",
+        "renderdoc-shader-workbench",
     }
     assert result.plan is not None
     assert all(isinstance(item, SkillResult) for item in result.skill_results)
@@ -183,6 +204,99 @@ async def test_identity_chat_with_ambient_capture_bypasses_planner_and_evidence_
     assert runtime.calls[0]["context"] == {}
     assert runtime.calls[0]["capture"] == ""
     assert runtime.calls[0]["instance"] == ""
+
+
+@pytest.mark.asyncio
+async def test_capture_snapshot_does_not_require_tools_before_direct_answer_route(
+    tmp_path,
+) -> None:
+    decision = {
+        "action": "direct_answer",
+        "goal": {"objective": "Explain SRV terminology"},
+        "reason": "This is stable graphics API terminology.",
+        "answer": "An SRV exposes a resource for shader reads.",
+        "capture_evidence_used": False,
+    }
+    runtime = _FakeExternalRuntime(
+        _store_without_tools(tmp_path),
+        SkillCatalog([SKILL_ROOT]).load(),
+        planner_answers=[json.dumps(decision)],
+        event_root=tmp_path / "events",
+    )
+
+    result = await runtime.run(
+        "What is an SRV?",
+        profile_id="managed-no-tools",
+        context={"capture": {"path": "C:/capture.rdc"}, "eventId": 9},
+        capture_path="C:/capture.rdc",
+        instance_id="qrenderdoc-1",
+        task_id="direct-with-capture",
+    )
+
+    assert result.text == "An SRV exposes a resource for shader reads."
+    assert result.workflow is not None
+    assert result.workflow.terminal_status == "completed"
+    assert result.workflow.total_tasks == 0
+    assert [call["planning"] for call in runtime.calls] == [True]
+
+
+@pytest.mark.asyncio
+async def test_structured_clarification_is_emitted_in_terminal_event(tmp_path) -> None:
+    decision = {
+        "action": "ask_user",
+        "goal": {
+            "objective": "Inspect one of two plausible render targets",
+            "ambiguities": ["The request names neither target"],
+        },
+        "reason": "The target changes the evidence query.",
+        "question": "Which render target should I inspect?",
+        "selection_mode": "single",
+        "options": [
+            {
+                "id": "current_target",
+                "label": "Current target",
+                "description": "Use the render target frozen with the current event.",
+            },
+            {
+                "id": "picked_texture",
+                "label": "Picked texture",
+                "description": "Use the texture associated with the frozen picked pixel.",
+            },
+        ],
+        "allow_other": True,
+    }
+    runtime = _FakeExternalRuntime(
+        _store_without_tools(tmp_path),
+        SkillCatalog([SKILL_ROOT]).load(),
+        planner_answers=[json.dumps(decision)],
+        event_root=tmp_path / "events",
+    )
+
+    result = await runtime.run(
+        "Inspect the target",
+        profile_id="managed-no-tools",
+        context={"capture": {"path": "C:/capture.rdc"}, "eventId": 9},
+        capture_path="C:/capture.rdc",
+        instance_id="qrenderdoc-1",
+        task_id="structured-clarification",
+    )
+
+    assert result.workflow is not None
+    assert result.workflow.terminal_status == "needs-user-input"
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events" / "structured-clarification.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    clarification = events[-1]["data"]["clarification"]
+    assert events[-1]["data"]["terminalStatus"] == "needs-user-input"
+    assert clarification["selectionMode"] == "single"
+    assert clarification["allowOther"] is True
+    assert [option["id"] for option in clarification["options"]] == [
+        "current_target",
+        "picked_texture",
+    ]
 
 
 @pytest.mark.asyncio
@@ -300,6 +414,7 @@ async def test_real_codex_adapter_planning_turn_has_verified_empty_tool_inventor
             # resolver seam above supplies the test fixture without weakening
             # that catalog-command invariant.
             command=list(fake_argv),
+            options={"context_window_tokens": 65_536},
         )
     )
     runtime = AgentRuntime(
@@ -342,7 +457,14 @@ async def test_real_codex_adapter_persists_each_public_activity_as_bounded_runni
         runtime_module, "resolved_agent_argv", lambda profile: list(fake_argv)
     )
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("codex-activity", "codex", command=list(fake_argv)))
+    store.add(
+        Profile(
+            "codex-activity",
+            "codex",
+            command=list(fake_argv),
+            options={"context_window_tokens": 65_536},
+        )
+    )
     runtime = AgentRuntime(
         store,
         SkillCatalog([]).load(),
@@ -437,7 +559,7 @@ async def test_external_planner_retries_twice_then_uses_one_safe_fallback(tmp_pa
         event_root=tmp_path / "events",
     )
     result = await runtime.run(
-        "反编译当前 shader",
+        "分析当前 shader",
         profile_id="managed",
         context={"capture": {"path": "C:/capture.rdc"}, "eventId": 9},
         capture_path="C:/capture.rdc",
@@ -493,7 +615,35 @@ async def test_external_fallback_routes_only_the_typed_current_request(tmp_path)
         instance_id="qrenderdoc-1",
     )
     assert result.plan is not None
-    assert [task.skill for task in result.plan.tasks] == ["renderdoc-performance"]
+    assert [task.skill for task in result.plan.tasks] == ["renderdoc-explain-event"]
+
+
+@pytest.mark.asyncio
+async def test_external_planner_failure_with_no_strong_domain_asks_instead_of_guessing(
+    tmp_path,
+) -> None:
+    runtime = _FakeExternalRuntime(
+        _store(tmp_path),
+        SkillCatalog([SKILL_ROOT]).load(),
+        planner_answers=["not json", "still not json"],
+        event_root=tmp_path / "events",
+    )
+
+    result = await runtime.run(
+        "Please help me understand what is going on",
+        profile_id="managed",
+        context={"capture": {"path": "C:/capture.rdc"}, "eventId": 9},
+        capture_path="C:/capture.rdc",
+        instance_id="qrenderdoc-1",
+    )
+
+    assert result.plan is None
+    assert result.workflow is not None
+    assert result.workflow.terminal_status == "needs-user-input"
+    assert result.workflow.total_tasks == 0
+    assert result.workflow.clarification is not None
+    assert len(result.workflow.clarification.options) >= 2
+    assert all(call["planning"] for call in runtime.calls)
 
 
 @pytest.mark.asyncio
@@ -509,6 +659,7 @@ async def test_model_api_plan_uses_same_skill_result_and_reviewer_contract(
             "api",
             "ollama",
             "model-a",
+            options={"context_window_tokens": 65_536},
             probed_capabilities=["tools", "json-schema"],
         )
     )
@@ -590,7 +741,10 @@ async def test_model_plan_emits_isolated_parallel_progress_and_safe_text_streams
             "api",
             "ollama",
             "model-a",
-            probed_capabilities=["tools", "json-schema"],
+            options={"context_window_tokens": 65_536},
+            # This case verifies text-provider streaming. Native structured-output
+            # selection is covered by test_specialist_contract.py.
+            probed_capabilities=["tools"],
         )
     )
     catalog = SkillCatalog([]).load()

@@ -37,6 +37,7 @@
 #include "Code/QRDUtils.h"
 #include "Code/ReplayLab/ReplayLabIntegration.h"
 #include "Code/Resources.h"
+#include "Windows/AI/AIAssistant.h"
 #include "Widgets/Extended/RDLabel.h"
 #include "Widgets/Extended/RDTreeWidget.h"
 #include "toolwindowmanager/ToolWindowManager.h"
@@ -1293,7 +1294,7 @@ static HLSLAbiSkeleton GenerateHLSLAbiSkeleton(const ShaderReflection *shaderDet
   return result;
 }
 
-static QString CompanionStageName(ShaderStage stage)
+static QString ShaderWorkspaceStageName(ShaderStage stage)
 {
   switch(stage)
   {
@@ -1319,7 +1320,7 @@ static QString CompanionStageName(ShaderStage stage)
 
 static bool HasShaderWorkspaceIntent(ICaptureContext &ctx, ShaderStage stage)
 {
-  const QString stageName = CompanionStageName(stage);
+  const QString stageName = ShaderWorkspaceStageName(stage);
   if(stageName.isEmpty())
     return false;
 
@@ -1554,41 +1555,28 @@ void PipelineStateViewer::SetupShaderEditButton(QToolButton *button, ResourceId 
         (shaderDetails->encoding == ShaderEncoding::DXBC ||
          shaderDetails->encoding == ShaderEncoding::DXIL);
     const bool supportsLiveApply = supportsD3D11Apply || supportsD3D12Apply;
-    QAction *action = new QAction(
-        supportsLiveApply ? tr("Open External Shader Workspace (ABI-validated)")
-                          : tr("Open External Shader Workspace (Explanation / Offline Candidate)"),
-        menu);
+    QAction *action = new QAction(tr("Analyze Shader with RenderDoc AI"), menu);
     action->setIcon(Icons::page_white_edit());
     if(supportsLiveApply)
       action->setToolTip(
-          tr("Queue this exact D3D11/DXBC or D3D12/DXBC-DXIL shader for the configured external "
-             "decompiler/workspace. Compilation never implies apply; exact ABI validation and "
-             "shared-resource rollback remain mandatory. D3D12 also rebuilds every affected "
-             "graphics/compute PSO before committing."));
+          tr("Analyze this exact D3D11/DXBC or D3D12/DXBC-DXIL shader with the built-in "
+             "RenderDoc AI host. Analysis is read-only; compilation and apply still require "
+             "separate native approval and exact ABI validation."));
     else
       action->setToolTip(
-          tr("Queue this exact shader for a non-empty disassembly/reconstruction workspace. The "
-             "current API/encoding has no supported live apply path; reconstructed source remains "
-             "offline until its baseline and ABI can be validated."));
+          tr("Analyze this exact shader with the built-in RenderDoc AI host. The current "
+             "API/encoding has no supported live apply path; reconstructed source remains offline "
+             "until its baseline and ABI can be validated."));
 
     QObject::connect(action, &QAction::triggered, [this, shaderDetails]() {
       CaptureContext &capture = static_cast<CaptureContext &>(m_Ctx);
-      const QString stageName = CompanionStageName(shaderDetails->stage);
-      QString error;
-      const QString taskId = capture.ReplayLab().QueueIntent(
-          ReplayLabIntegration::Intent::ReverseEditSelectedShader, stageName, &error);
-      if(!taskId.isEmpty())
-      {
-        capture.ShowAIAssistant(taskId);
-      }
-      else
-      {
-        RDDialog::critical(
-            this, tr("External Shader Workspace Unavailable"),
-            error.isEmpty() ? tr("The built-in RenderDoc AI shader action is unavailable for %1.")
-                                  .arg(stageName)
-                            : error);
-      }
+      const QString stageName = ShaderWorkspaceStageName(shaderDetails->stage);
+      AIAssistant *assistant = capture.GetAIAssistant();
+      assistant->StartCaptureSkill(tr("Reverse/Edit selected shader with AI"),
+                                   lit("renderdoc-shader-workbench"),    // i18n-ignore: internal Skill identifier
+                                   stageName,
+                                   lit("reverse-edit-selected-shader"));    // i18n-ignore: stable UI intent identifier
+      capture.ShowAIAssistant();
     });
 
     menu->addAction(action);

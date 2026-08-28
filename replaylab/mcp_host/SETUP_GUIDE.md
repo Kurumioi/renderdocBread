@@ -60,7 +60,7 @@ renderdocUltra/
 ```toml
 [project]
 name = "renderdoc-mcp"
-version = "1.10.1"
+version = "1.10.2"
 description = "ReplayLab sidecar host for RenderDocUltra's built-in AI integration, capture analysis, and shader workflows"
 requires-python = ">=3.10"
 dependencies = [
@@ -115,7 +115,7 @@ py -3.10 -m venv .venv
 ```
 Successfully built renderdoc-mcp
 Installing collected packages: renderdoc-mcp
-Successfully installed renderdoc-mcp-1.10.1
+Successfully installed renderdoc-mcp-1.10.2
 ```
 
 依赖 `mcp[cli]>=1.0.0` 及其子依赖（anyio, httpx, pydantic, starlette 等）均已满足。

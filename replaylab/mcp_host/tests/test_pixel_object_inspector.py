@@ -249,6 +249,7 @@ class PixelObjectInspectorTests(unittest.TestCase):
             "texture_id": 101,
             "x": 12,
             "y": 8,
+            "event_id": 42,
             "mip": 0,
             "slice": 0,
             "sample": 0,
@@ -259,9 +260,9 @@ class PixelObjectInspectorTests(unittest.TestCase):
             result["schema"], "renderdoc-ultra-pixel-object-inspector/v1"
         )
         self.assertIs(controller.resource_arguments[0], controller.texture_id)
-        self.assertEqual(controller.set_events, [(99, True)])
+        self.assertEqual(controller.set_events, [(42, True), (99, True)])
         self.assertEqual(result["eventRestore"], {
-            "originalEventId": 99, "restored": True,
+            "originalEventId": 99, "frozenEventId": 42, "restored": True,
         })
         self.assertEqual(len(result["modifications"]), 3)
         first = result["modifications"][0]
@@ -297,7 +298,7 @@ class PixelObjectInspectorTests(unittest.TestCase):
         self.assertIsNone(result["preferredSelection"]["objectIdentity"])
         self.assertEqual(result["confidence"]["objectIdentity"], "none")
         self.assertEqual(result["confidence"]["lastPassedWriteCandidate"], "low")
-        self.assertEqual(result["historyScope"]["cutoffEventId"], 99)
+        self.assertEqual(result["historyScope"]["cutoffEventId"], 42)
         self.assertTrue(result["historyScope"]["coversThroughLastListedAction"])
         self.assertNotIn("instanceId", json.dumps(result))
         self.assertFalse(result["invocationPolicy"]["hoverSupported"])
@@ -337,7 +338,9 @@ class PixelObjectInspectorTests(unittest.TestCase):
 
         self.bridge._pick_pixel({"resource_id": 101, "x": 0, "y": 0})
         self.bridge._get_texture_minmax({"resource_id": 101})
-        history = self.bridge._pixel_history({"resource_id": 101, "x": 0, "y": 0})
+        history = self.bridge._pixel_history({
+            "resource_id": 101, "x": 0, "y": 0, "event_id": 99,
+        })
         self.assertEqual(len(history), 3)
         self.assertTrue(all(
             argument is controller.texture_id
@@ -455,9 +458,9 @@ class PixelObjectInspectorTests(unittest.TestCase):
         self.bridge._ctx = _Context(controller)
         with self.assertRaisesRegex(ValueError, "Sample 1"):
             self.bridge._inspect_pixel_object({
-                "texture_id": 101, "x": 0, "y": 0, "sample": 1,
+                "texture_id": 101, "x": 0, "y": 0, "event_id": 42, "sample": 1,
             })
-        self.assertEqual(controller.set_events, [(99, True)])
+        self.assertEqual(controller.set_events, [(42, True), (99, True)])
 
     def test_debug_pixel_can_select_event_and_restores_it(self):
         controller = _Controller()
@@ -527,7 +530,8 @@ class PixelObjectInspectorTests(unittest.TestCase):
             argument.arg for argument in functions["inspect_pixel_object"].args.args
         ]
         self.assertEqual(inspect_args, [
-            "texture_id", "x", "y", "mip", "slice", "sample", "prefer_geometry",
+            "texture_id", "x", "y", "event_id", "mip", "slice", "sample",
+            "prefer_geometry",
         ])
         debug_args = [argument.arg for argument in functions["debug_pixel"].args.args]
         self.assertEqual(debug_args, [

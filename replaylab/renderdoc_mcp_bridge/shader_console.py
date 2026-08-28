@@ -38,6 +38,8 @@ REGISTRY_SCHEMA = "replaylab-shader-live-edit-registry/v1"
 WORKSPACE_SCHEMA = "renderdoc-ultra-shader-workspace/v1"
 WATCH_SCHEMA = "renderdoc-ultra-shader-watch/v1"
 LIVE_EDIT_SCHEMA = "replaylab-shader-live-edit/v1"
+ORGANIZATION_GATE_SCHEMA = "renderdoc-ai-shader-organization-gate/v1"
+ORGANIZATION_POLICY_VERSION = "renderdoc-ai-organize-workspace/v1"
 CONSOLE_SCHEMA = "replaylab-console/v1"
 JOURNAL_EVENT_SCHEMA = "replaylab-console-event/v1"
 
@@ -73,11 +75,13 @@ CONSOLE_CONTEXT_FIELDS = (
 )
 
 TOKEN_RE = re.compile(r"^[0-9a-f]{32,64}$")
+EXACT_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_EXTENSION_RE = re.compile(
     r"\.(?:hlsl|hlsli|fx|fxh|glsl|vert|frag|comp|geom|tesc|tese)$",
     re.IGNORECASE,
 )
+HLSL_SOURCE_EXTENSION_RE = re.compile(r"\.(?:hlsl|hlsli|fx|fxh)$", re.IGNORECASE)
 JOURNAL_FILE_RE = re.compile(
     r"^events\.(?P<role>[a-z][a-z0-9_-]{0,31})\."
     r"(?P<pid>[0-9]{1,10})\.(?P<session>[0-9a-f]{32})\."
@@ -118,6 +122,25 @@ SUPERSEDED_APPLY_FAILURE_FRAGMENTS = (
 
 class ShaderConsoleError(RuntimeError):
     pass
+
+
+class ShaderConsoleConflictError(ShaderConsoleError):
+    """The authorized source changed after the editor's expected hash."""
+
+    pass
+
+
+def _canonical_sha256(value):
+    """Match the Host registry's stable identity digest exactly."""
+    try:
+        payload = json.dumps(
+            value, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ShaderConsoleError(
+            "live-edit authorization identity is not canonical JSON: %s" %
+            _bounded(exc, 512))
+    return hashlib.sha256(payload).hexdigest()
 
 
 def default_registry_path(local_app_data=None):
@@ -469,6 +492,68 @@ def _regular_file(path, maximum, field):
     return value
 
 
+def _regular_file_in_tree(root, path, maximum, field):
+    """Accept a regular file only through ordinary directories under root."""
+    root_value = _directory(root, field + " root")
+    value = os.path.abspath(str(path))
+    if not _within(root_value, value):
+        raise ShaderConsoleError("%s escapes its fixed directory" % field)
+    current = os.path.dirname(value)
+    while not _same_path(current, root_value):
+        if not _within(root_value, current) or _is_reparse(current):
+            raise ShaderConsoleError("%s directory is redirected" % field)
+        parent = os.path.dirname(current)
+        if _same_path(parent, current):
+            raise ShaderConsoleError("%s directory is invalid" % field)
+        current = parent
+    return _regular_file(value, maximum, field)
+
+
+def _validate_windows_file_handle(kernel32, handle, filename, field):
+    """Bind a Win32 handle to the exact ordinary file named by the caller."""
+
+    class _FileTime(ctypes.Structure):
+        _fields_ = (("low", ctypes.c_uint32), ("high", ctypes.c_uint32))
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = (
+            ("attributes", ctypes.c_uint32), ("created", _FileTime),
+            ("accessed", _FileTime), ("written", _FileTime),
+            ("volumeSerial", ctypes.c_uint32), ("sizeHigh", ctypes.c_uint32),
+            ("sizeLow", ctypes.c_uint32), ("links", ctypes.c_uint32),
+            ("fileIndexHigh", ctypes.c_uint32),
+            ("fileIndexLow", ctypes.c_uint32),
+        )
+
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = (
+        ctypes.c_void_p, ctypes.POINTER(_ByHandleFileInformation))
+    get_information.restype = ctypes.c_int
+    information = _ByHandleFileInformation()
+    if not get_information(handle, ctypes.byref(information)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if information.attributes & (0x400 | 0x10):  # REPARSE_POINT | DIRECTORY
+        raise ShaderConsoleError("%s is unavailable or redirected" % field)
+
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    get_final_path.argtypes = (
+        ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32)
+    get_final_path.restype = ctypes.c_uint32
+    capacity = 32768
+    buffer = ctypes.create_unicode_buffer(capacity)
+    length = int(get_final_path(handle, buffer, capacity, 0))
+    if length <= 0 or length >= capacity:
+        raise ctypes.WinError(ctypes.get_last_error())
+    final_path = buffer.value
+    if final_path.startswith("\\\\?\\UNC\\"):
+        final_path = "\\\\" + final_path[8:]
+    elif final_path.startswith("\\\\?\\"):
+        final_path = final_path[4:]
+    if (os.path.normcase(os.path.abspath(final_path)) !=
+            os.path.normcase(os.path.abspath(filename))):
+        raise ShaderConsoleError("%s is unavailable or redirected" % field)
+
+
 def _read_file_bytes(path, maximum, field):
     """Read a bounded file without blocking an atomic Windows replacement.
 
@@ -510,10 +595,12 @@ def _read_file_bytes(path, maximum, field):
         close_handle.restype = ctypes.c_int
 
         handle = create_file(
-            filename, 0x80000000, 0x1 | 0x2 | 0x4, None, 3, 0x08000000, None)
+            filename, 0x80000000, 0x1 | 0x2 | 0x4, None, 3,
+            0x08000000 | 0x00200000, None)
         invalid = ctypes.c_void_p(-1).value
         if handle in (None, 0, invalid):
             raise ctypes.WinError(ctypes.get_last_error())
+        _validate_windows_file_handle(kernel32, handle, filename, field)
         size = ctypes.c_longlong()
         if not get_size(handle, ctypes.byref(size)):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -532,6 +619,8 @@ def _read_file_bytes(path, maximum, field):
                 break
             chunks.append(buffer.raw[:received.value])
             remaining -= received.value
+        if remaining != 0:
+            raise ShaderConsoleError("%s changed while it was read" % field)
         return b"".join(chunks)
     except ShaderConsoleError:
         raise
@@ -682,31 +771,67 @@ def _safe_relative(root, relative, field):
 
 
 def _validate_authorization(value):
-    if not isinstance(value, dict):
+    required_fields = {
+        "authorizationId", "workspacePath", "workspaceIdentity",
+        "workspaceIdentitySha256", "debounceMs", "authorizedAt",
+        "updatedAt", "lastLiveEditId",
+    }
+    if not isinstance(value, dict) or set(value) != required_fields:
         raise ShaderConsoleError("live-edit authorization entry is invalid")
     authorization_id = str(value.get("authorizationId", "") or "").lower()
     live_edit_id = str(value.get("lastLiveEditId", "") or "").lower()
-    if TOKEN_RE.fullmatch(authorization_id) is None:
+    if EXACT_TOKEN_RE.fullmatch(authorization_id) is None:
         raise ShaderConsoleError("live-edit authorization ID is invalid")
-    if live_edit_id and TOKEN_RE.fullmatch(live_edit_id) is None:
+    if live_edit_id and EXACT_TOKEN_RE.fullmatch(live_edit_id) is None:
         raise ShaderConsoleError("live-edit session ID is invalid")
+    debounce = value.get("debounceMs")
+    if (isinstance(debounce, bool) or not isinstance(debounce, int) or
+            debounce < 100 or debounce > 5000):
+        raise ShaderConsoleError("live-edit authorization debounce is invalid")
+    for field in ("authorizedAt", "updatedAt"):
+        timestamp = value.get(field)
+        if not isinstance(timestamp, str) or not timestamp or len(timestamp) > 128:
+            raise ShaderConsoleError(
+                "live-edit authorization timestamp is invalid")
     workspace_text = value.get("workspacePath")
     if not isinstance(workspace_text, str) or not os.path.isabs(workspace_text):
         raise ShaderConsoleError("authorized workspace path is invalid")
     workspace = _directory(workspace_text, "authorized workspace")
     identity = value.get("workspaceIdentity")
-    if not isinstance(identity, dict):
+    identity_fields = {
+        "workspaceId", "captureId", "capturePath", "shaderKey",
+        "shaderRawSha256", "resourceId", "stage", "entryPoint",
+    }
+    if not isinstance(identity, dict) or set(identity) != identity_fields:
         raise ShaderConsoleError("authorized workspace identity is invalid")
+    identity_sha256 = str(value.get("workspaceIdentitySha256", "") or "").lower()
+    if (SHA256_RE.fullmatch(identity_sha256) is None or
+            identity_sha256 != _canonical_sha256(identity)):
+        raise ShaderConsoleError(
+            "authorized workspace identity hash is invalid")
     workspace_id = str(identity.get("workspaceId", "") or "").lower()
     capture_id = str(identity.get("captureId", "") or "").lower()
     raw_sha256 = str(identity.get("shaderRawSha256", "") or "").lower()
-    if TOKEN_RE.fullmatch(workspace_id) is None:
+    if EXACT_TOKEN_RE.fullmatch(workspace_id) is None:
         raise ShaderConsoleError("authorized workspace ID is invalid")
     if SHA256_RE.fullmatch(capture_id) is None or SHA256_RE.fullmatch(raw_sha256) is None:
         raise ShaderConsoleError("authorized capture/shader identity is invalid")
+    capture_path = identity.get("capturePath")
+    shader_key = identity.get("shaderKey")
+    if (not isinstance(capture_path, str) or not capture_path or
+            len(capture_path) > 32768 or not isinstance(shader_key, str) or
+            not shader_key or len(shader_key) > 4096):
+        raise ShaderConsoleError(
+            "authorized capture/shader locator is invalid")
     resource_id = _positive_integer(identity.get("resourceId"), 0, 0x7FFFFFFFFFFFFFFF)
     if resource_id <= 0:
         raise ShaderConsoleError("authorized Shader ResourceId is invalid")
+    stage = str(identity.get("stage", "") or "")
+    entry_point = str(identity.get("entryPoint", "") or "")
+    if (not stage or len(stage) > 64 or not entry_point or
+            len(entry_point) > 512):
+        raise ShaderConsoleError(
+            "authorized Shader stage/entry point is invalid")
     return {
         "authorizationId": authorization_id,
         "lastLiveEditId": live_edit_id,
@@ -714,10 +839,15 @@ def _validate_authorization(value):
         "workspaceId": workspace_id,
         "captureId": capture_id,
         "shaderRawSha256": raw_sha256,
-        "stage": _bounded(identity.get("stage", ""), 64).lower(),
-        "entryPoint": _bounded(identity.get("entryPoint", ""), 4096),
+        "stage": stage.lower(),
+        "entryPoint": entry_point,
         "resourceId": resource_id,
-        "updatedAt": _bounded(value.get("updatedAt", value.get("authorizedAt", "")), 128),
+        "capturePath": capture_path,
+        "shaderKey": shader_key,
+        "workspaceIdentitySha256": identity_sha256,
+        "debounceMs": debounce,
+        "authorizedAt": value["authorizedAt"],
+        "updatedAt": value["updatedAt"],
     }
 
 
@@ -794,13 +924,255 @@ def _validate_manifest(workspace, authorization):
     )
     if any(observed != declared for observed, declared in comparisons):
         raise ShaderConsoleError("authorized shader identity no longer matches its manifest")
+    if (source.get("encoding") != "utf-8" or
+            source.get("lane") != "executable-editable" or
+            source.get("compileEligible") is not True):
+        raise ShaderConsoleError(
+            "workspace source is not an executable editable UTF-8 representation")
     source_path = _safe_relative(workspace, source.get("path"), "workspace source path")
     source_root = os.path.join(workspace, "source")
     if not _within(source_root, source_path) or SOURCE_EXTENSION_RE.search(source_path) is None:
         raise ShaderConsoleError("workspace source is outside its dedicated source directory")
-    source_path = _regular_file(source_path, MAX_SOURCE_BYTES, "workspace shader source")
+    source_path = _regular_file_in_tree(
+        source_root, source_path, MAX_SOURCE_BYTES, "workspace shader source")
     diagnostics = _manifest_compile_diagnostics(value, workspace, source_path)
     return source_path, diagnostics, manifest_path
+
+
+def _validate_organization_gate(workspace, authorization, source_path):
+    """Prove that the editor source was promoted by an organise-only review.
+
+    The durable live-edit authorization proves consent to compile and apply
+    later saves. This separate fixed gate proves that the initial HLSL exposed
+    by the code workspace is the reviewed, organised executable-editable lane
+    instead of raw decompiler output or an explanatory proposal.
+    """
+    gate_path = _safe_relative(
+        workspace, "ai/organize-code-gate.json", "shader organization gate path")
+    _regular_file_in_tree(
+        os.path.join(workspace, "ai"), gate_path, MAX_MANIFEST_BYTES,
+        "shader organization gate")
+    gate = _read_json(
+        gate_path, MAX_MANIFEST_BYTES, "shader organization gate")
+    if gate.get("schema") != ORGANIZATION_GATE_SCHEMA:
+        raise ShaderConsoleError("shader organization gate schema is invalid")
+    if (gate.get("schemaVersion") != 1 or
+            gate.get("policyVersion") != ORGANIZATION_POLICY_VERSION or
+            gate.get("requestedTransformation") != "organize-only" or
+            gate.get("decision") != "accepted-executable-editable" or
+            gate.get("codeSha256Equal") is not True or
+            gate.get("organizedSourcePromoted") is not True or
+            gate.get("baselineCompiledAndAbiValidated") is not True or
+            gate.get("organizedCompiledAndAbiValidated") is not True or
+            gate.get("safeToStartLiveEdit") is not True or
+            gate.get("replayApplied") is not False):
+        raise ShaderConsoleError(
+            "shader organization gate did not promote editable HLSL")
+    identity = (
+        str(gate.get("workspaceId", "") or "").lower(),
+        str(gate.get("captureId", "") or "").lower(),
+        str(gate.get("stage", "") or "").lower(),
+        str(gate.get("entryPoint", "") or ""),
+    )
+    expected = (
+        authorization["workspaceId"], authorization["captureId"],
+        authorization["stage"], authorization["entryPoint"])
+    binding = gate.get("finalBinding")
+    final_source_sha256 = str(gate.get("finalSourceSha256", "") or "").lower()
+    binding_fields = {
+        "complete", "sourceSha256", "revision", "candidateRawSha256",
+        "codeSha256", "abiRequestId", "abiReportSha256",
+    }
+    organization_id = str(gate.get("organizationId", "") or "").lower()
+    reviewed_at = gate.get("reviewedAt")
+    baseline_source = str(gate.get("baselineSourceSha256", "") or "").lower()
+    proposal_source = str(gate.get("proposalSourceSha256", "") or "").lower()
+    baseline_code = str(gate.get("baselineCodeSha256", "") or "").lower()
+    organized_code = str(gate.get("organizedCodeSha256", "") or "").lower()
+    final_candidate = str(gate.get("finalCandidateRawSha256", "") or "").lower()
+    final_code = str(gate.get("finalCodeSha256", "") or "").lower()
+    final_abi_request = str(gate.get("finalAbiRequestId", "") or "").lower()
+    final_abi_report = str(gate.get("finalAbiReportSha256", "") or "").lower()
+    final_revision = gate.get("finalRevision")
+    if (identity != expected or not isinstance(binding, dict) or
+            set(binding) != binding_fields or
+            binding.get("complete") is not True or
+            EXACT_TOKEN_RE.fullmatch(organization_id) is None or
+            not isinstance(reviewed_at, str) or not reviewed_at or
+            len(reviewed_at) > 128 or
+            SHA256_RE.fullmatch(final_source_sha256) is None or
+            any(SHA256_RE.fullmatch(item) is None for item in (
+                baseline_source, proposal_source, baseline_code,
+                organized_code, final_candidate, final_code,
+                final_abi_request, final_abi_report)) or
+            baseline_code != organized_code or
+            isinstance(final_revision, bool) or
+            not isinstance(final_revision, int) or final_revision <= 0 or
+            str(binding.get("sourceSha256", "") or "").lower() !=
+            final_source_sha256 or
+            binding.get("revision") != final_revision or
+            str(binding.get("candidateRawSha256", "") or "").lower() !=
+            final_candidate or
+            str(binding.get("codeSha256", "") or "").lower() != final_code or
+            str(binding.get("abiRequestId", "") or "").lower() !=
+            final_abi_request or
+            str(binding.get("abiReportSha256", "") or "").lower() !=
+            final_abi_report):
+        raise ShaderConsoleError(
+            "shader organization gate is not bound to this workspace")
+
+    declared_source = gate.get("executableEditableSourcePath")
+    if not isinstance(declared_source, str) or not declared_source:
+        raise ShaderConsoleError("shader organization gate source is missing")
+    if os.path.isabs(declared_source):
+        declared_path = os.path.abspath(declared_source)
+        if not _within(workspace, declared_path):
+            raise ShaderConsoleError(
+                "shader organization gate source escapes its workspace")
+    else:
+        declared_path = _safe_relative(
+            workspace, declared_source, "organized editable source path")
+    if not _same_path(declared_path, source_path):
+        raise ShaderConsoleError(
+            "shader organization gate points at a different source")
+    return {
+        "path": gate_path,
+        "finalSourceSha256": final_source_sha256,
+        "finalRevision": final_revision,
+        "finalCandidateRawSha256": final_candidate,
+        "finalCodeSha256": final_code,
+    }
+
+
+def _authorized_workspace(registry_path, authorization_id, workspace_id):
+    """Resolve one exact durable live-edit authorization.
+
+    The editor never accepts a path selected from the tree as authority. Every
+    open and save re-opens the fixed registry, validates its bounded schema,
+    resolves the two opaque identities, and then revalidates the workspace
+    manifest before touching source bytes.
+    """
+    path = os.path.abspath(str(registry_path or default_registry_path() or ""))
+    if not path:
+        raise ShaderConsoleError("live-edit authorization registry is unavailable")
+    registry = _read_json(path, MAX_REGISTRY_BYTES, "live-edit authorization registry")
+    if registry.get("schema") != REGISTRY_SCHEMA or registry.get("schemaVersion") != 1:
+        raise ShaderConsoleError("live-edit authorization registry schema is invalid")
+    entries = registry.get("entries")
+    if not isinstance(entries, list) or len(entries) > MAX_AUTHORIZATIONS:
+        raise ShaderConsoleError("live-edit authorization registry entries are invalid")
+
+    requested_authorization = str(authorization_id or "").lower()
+    requested_workspace = str(workspace_id or "").lower()
+    if (TOKEN_RE.fullmatch(requested_authorization) is None or
+            TOKEN_RE.fullmatch(requested_workspace) is None):
+        raise ShaderConsoleError("shader editor workspace identity is invalid")
+
+    # Select by inert scalar IDs before resolving any workspace path. An old,
+    # unrelated authorization whose workspace was deleted must not deny access
+    # to the exact requested authorization; only the selected entry gains the
+    # authority to touch disk and is then validated in full.
+    matching_raw = []
+    for raw in entries:
+        if not isinstance(raw, dict):
+            continue
+        raw_identity = raw.get("workspaceIdentity")
+        raw_authorization = str(raw.get("authorizationId", "") or "").lower()
+        raw_workspace = (str(raw_identity.get("workspaceId", "") or "").lower()
+                         if isinstance(raw_identity, dict) else "")
+        if (raw_authorization == requested_authorization and
+                raw_workspace == requested_workspace):
+            matching_raw.append(raw)
+    if len(matching_raw) != 1:
+        raise ShaderConsoleError("shader editor workspace authorization is unavailable or ambiguous")
+
+    authorization = _validate_authorization(matching_raw[0])
+    source_path, compiler_diagnostics, manifest_path = _validate_manifest(
+        authorization["workspacePath"], authorization)
+    if HLSL_SOURCE_EXTENSION_RE.search(source_path) is None:
+        raise ShaderConsoleError("authorized workspace source is not HLSL")
+    organization_gate = _validate_organization_gate(
+        authorization["workspacePath"], authorization, source_path)
+    return (authorization, source_path, compiler_diagnostics, manifest_path,
+            organization_gate)
+
+
+def _require_running_live_edit(authorization, source_path):
+    """Require the exact authorized watcher/live pair to be running."""
+    live_edit_id = str(authorization.get("lastLiveEditId", "") or "").lower()
+    if EXACT_TOKEN_RE.fullmatch(live_edit_id) is None:
+        raise ShaderConsoleError("authorized live-edit session is not running")
+    workspace = authorization["workspacePath"]
+    live_root = os.path.join(workspace, "live-edit")
+    live_path = _regular_file_in_tree(
+        live_root, os.path.join(live_root, live_edit_id + ".json"),
+        MAX_AUDIT_BYTES, "authorized shader live-edit audit")
+    live_value = _read_json(
+        live_path, MAX_AUDIT_BYTES, "authorized shader live-edit audit")
+    live = _validate_live(live_value, workspace, live_edit_id)
+    if live.get("state") != "running":
+        raise ShaderConsoleError("authorized live-edit session is not running")
+    watch_id = str(live.get("watchId", "") or "").lower()
+    watch_root = os.path.join(workspace, "watch")
+    watch_path = _regular_file_in_tree(
+        watch_root, os.path.join(watch_root, watch_id + ".json"),
+        MAX_AUDIT_BYTES, "authorized shader watcher audit")
+    watch_value = _read_json(
+        watch_path, MAX_AUDIT_BYTES, "authorized shader watcher audit")
+    watch = _validate_watch(watch_value, workspace, source_path, watch_id)
+    if watch.get("state") != "running":
+        raise ShaderConsoleError("authorized shader watcher is not running")
+    return live, watch
+
+
+def load_authorized_source_document(registry_path, authorization_id, workspace_id):
+    """Read one editable HLSL document through its durable authorization."""
+    authorization, source_path, _diagnostics, _manifest_path, gate = _authorized_workspace(
+        registry_path, authorization_id, workspace_id)
+    raw = _read_file_bytes(source_path, MAX_SOURCE_BYTES, "workspace shader source")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ShaderConsoleError("workspace shader source is not valid UTF-8: %s" %
+                                 _bounded(exc, 512))
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    if raw_sha256 != gate["finalSourceSha256"]:
+        _live, watch = _require_running_live_edit(authorization, source_path)
+        if (watch.get("initialSourceSha256") != gate["finalSourceSha256"] or
+                watch.get("observedSourceSha256") != raw_sha256):
+            raise ShaderConsoleError(
+                "workspace shader source is not in the authorized organization/edit lineage")
+    info = os.stat(source_path)
+    return {
+        "authorizationId": authorization["authorizationId"],
+        "workspaceId": authorization["workspaceId"],
+        "workspacePath": authorization["workspacePath"],
+        "sourcePath": source_path,
+        "fileName": os.path.basename(source_path),
+        "stage": authorization["stage"],
+        "entryPoint": authorization["entryPoint"],
+        "resourceId": authorization["resourceId"],
+        "text": text,
+        "rawSha256": raw_sha256,
+        "size": len(raw),
+        "modifiedNs": getattr(info, "st_mtime_ns", int(info.st_mtime * 1000000000)),
+    }
+
+
+def save_authorized_source_document(registry_path, authorization_id, workspace_id,
+                                    expected_raw_sha256, text):
+    """Reject the retired embedded-process write path.
+
+    Shader Workspace saves must cross the authenticated singleton Host and bind
+    to its in-memory live-edit/watcher job. Keeping this fail-closed symbol
+    makes older integrations receive an explicit error instead of silently
+    falling back to an unaudited direct filesystem write.
+    """
+    del registry_path, authorization_id, workspace_id, expected_raw_sha256, text
+    raise ShaderConsoleError(
+        "direct shader source saves are disabled; use the running ReplayLab Host")
+
+
 
 
 def _latest_token_json(directory, preferred=""):
@@ -890,19 +1262,32 @@ def _validate_watch(value, workspace, source_path, expected_watch_id=""):
     if value.get("schema") != WATCH_SCHEMA or value.get("schemaVersion") != 1:
         raise ShaderConsoleError("shader watcher audit schema is invalid")
     watch_id = str(value.get("watchId", "") or "").lower()
-    if TOKEN_RE.fullmatch(watch_id) is None or (
+    if EXACT_TOKEN_RE.fullmatch(watch_id) is None or (
             expected_watch_id and watch_id != expected_watch_id):
         raise ShaderConsoleError("shader watcher audit identity is invalid")
     if not _same_path(value.get("workspacePath", ""), workspace):
         raise ShaderConsoleError("shader watcher audit changed workspace")
     if not _same_path(value.get("sourcePath", ""), source_path):
         raise ShaderConsoleError("shader watcher audit changed source file")
+    initial_source_sha256 = str(
+        value.get("initialSourceSha256", "") or "").lower()
+    observed_source_sha256 = str(
+        value.get("observedSourceSha256", "") or "").lower()
+    if (SHA256_RE.fullmatch(initial_source_sha256) is None or
+            SHA256_RE.fullmatch(observed_source_sha256) is None):
+        raise ShaderConsoleError("shader watcher source lineage is invalid")
     return {
         "watchId": watch_id,
         "state": _bounded(value.get("state", ""), 32),
         "compileInProgress": value.get("compileInProgress") is True,
         "pending": value.get("pending") is True,
         "caughtUp": value.get("caughtUp") is True,
+        "initialSourceSha256": initial_source_sha256,
+        "observedSourceSha256": observed_source_sha256,
+        "lastAttemptedSourceSha256": str(
+            value.get("lastAttemptedSourceSha256", "") or "").lower(),
+        "lastCompiledSourceSha256": str(
+            value.get("lastCompiledSourceSha256", "") or "").lower(),
         "latestCandidateRevision": _positive_integer(
             value.get("latestCandidateRevision"), 0),
         "compileAttempts": _positive_integer(value.get("compileAttempts"), 0),
@@ -917,7 +1302,8 @@ def _validate_live(value, workspace, expected_live_id=""):
         raise ShaderConsoleError("shader live-edit audit schema is invalid")
     live_id = str(value.get("liveEditId", "") or "").lower()
     watch_id = str(value.get("watchId", "") or "").lower()
-    if TOKEN_RE.fullmatch(live_id) is None or TOKEN_RE.fullmatch(watch_id) is None:
+    if (EXACT_TOKEN_RE.fullmatch(live_id) is None or
+            EXACT_TOKEN_RE.fullmatch(watch_id) is None):
         raise ShaderConsoleError("shader live-edit audit identity is invalid")
     if expected_live_id and live_id != expected_live_id:
         raise ShaderConsoleError("shader live-edit audit is not the authorized session")
@@ -1448,6 +1834,17 @@ def _workspace_model(authorization):
     workspace = authorization["workspacePath"]
     source_path, compiler_diagnostics, manifest_path = _validate_manifest(
         workspace, authorization)
+    organization_gate_path = os.path.join(
+        workspace, "ai", "organize-code-gate.json")
+    editor_eligible = False
+    editor_eligibility = "non-hlsl-source"
+    if HLSL_SOURCE_EXTENSION_RE.search(source_path) is not None:
+        try:
+            _validate_organization_gate(workspace, authorization, source_path)
+            editor_eligible = True
+            editor_eligibility = "organized-executable-editable-hlsl"
+        except ShaderConsoleError:
+            editor_eligibility = "organization-gate-unavailable"
     live = None
     watch = None
     live_path = _latest_token_json(
@@ -1477,12 +1874,18 @@ def _workspace_model(authorization):
         "entryPoint": authorization["entryPoint"],
         "resourceId": authorization["resourceId"],
         "updatedAt": authorization["updatedAt"],
+        "editorEligible": editor_eligible,
+        "editorEligibility": editor_eligibility,
+        "autoApplyReady": bool(
+            isinstance(live, dict) and live.get("state") == "running" and
+            isinstance(watch, dict) and watch.get("state") == "running"),
         "watch": watch,
         "liveEdit": live,
         "entries": entries,
         "status": derive_console_status(watch=watch, live=live),
         "watchedPaths": [path for path in (
-            manifest_path,
+            source_path, manifest_path, organization_gate_path,
+            os.path.dirname(organization_gate_path),
             live_path, watch_path, os.path.dirname(live_path) if live_path else "",
             os.path.dirname(watch_path) if watch_path else "") if path],
     }
@@ -1549,39 +1952,6 @@ def load_console_snapshot(registry_path=None):
     result["entries"] = result["entries"][-MAX_CONSOLE_ENTRIES:]
     result["counts"] = console_severity_counts(result["entries"])
     return result
-
-
-def disable_background_power_throttling():
-    """Best-effort opt-out from Windows execution-speed/EcoQoS throttling.
-
-    qrenderdoc remains the process owner.  Failure, older Windows versions and
-    non-Windows hosts are intentionally non-fatal.
-    """
-    if os.name != "nt":
-        return False
-    try:
-        class ProcessPowerThrottlingState(ctypes.Structure):
-            _fields_ = (
-                ("Version", ctypes.c_ulong),
-                ("ControlMask", ctypes.c_ulong),
-                ("StateMask", ctypes.c_ulong),
-            )
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        get_current_process = kernel32.GetCurrentProcess
-        get_current_process.restype = ctypes.c_void_p
-        set_process_information = kernel32.SetProcessInformation
-        set_process_information.argtypes = (
-            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong)
-        set_process_information.restype = ctypes.c_int
-        state = ProcessPowerThrottlingState()
-        state.Version = 1  # PROCESS_POWER_THROTTLING_CURRENT_VERSION
-        state.ControlMask = 0x1  # PROCESS_POWER_THROTTLING_EXECUTION_SPEED
-        state.StateMask = 0  # explicitly disable execution-speed throttling
-        return bool(set_process_information(
-            get_current_process(), 4, ctypes.byref(state), ctypes.sizeof(state)))
-    except Exception:
-        return False
 
 
 if HAS_QT:

@@ -14,6 +14,7 @@ each call to the most recently interacted-with live qrenderdoc instance, or to
 legacy global mailbox remains a fallback during migration.
 """
 
+import contextvars
 import json
 import os
 import time
@@ -21,6 +22,7 @@ import tempfile
 import threading
 import uuid
 import logging
+from contextlib import contextmanager
 from typing import Any, Optional
 
 logger = logging.getLogger("renderdoc-mcp")
@@ -39,6 +41,34 @@ REQUEST_DIR = os.path.join(IPC_DIR, "requests")
 RESPONSE_DIR = os.path.join(IPC_DIR, "responses")
 _LEGACY_REQUEST_DIR = REQUEST_DIR
 _LEGACY_RESPONSE_DIR = RESPONSE_DIR
+_CALL_BINDING: contextvars.ContextVar[tuple[str, str] | None] = contextvars.ContextVar(
+    "replaylab_direct_tool_call_binding", default=None
+)
+
+
+@contextmanager
+def bind_direct_tool_call(instance_id: str, capture_session_id: str):
+    """Pin all nested IPC calls made by one in-process AgentHost tool.
+
+    The external MCP process continues to use its ordinary constructor/env
+    binding.  This context is only set by AgentHost's direct high-level
+    workflow dispatcher and is local to that worker thread/context.
+    """
+
+    instance = str(instance_id or "").strip()
+    session = str(capture_session_id or "").strip().lower()
+    if not instance or instance != instance_id or "\0" in instance or len(instance) > 512:
+        raise ValueError("direct ReplayLab tool requires a pinned qrenderdoc instance")
+    if session and (
+        len(session) != 32
+        or any(character not in "0123456789abcdef" for character in session)
+    ):
+        raise ValueError("direct ReplayLab tool capture session is invalid")
+    token = _CALL_BINDING.set((instance, session))
+    try:
+        yield
+    finally:
+        _CALL_BINDING.reset(token)
 
 
 class IPCClient:
@@ -136,6 +166,21 @@ class IPCClient:
         return value
 
     def _instance_mailbox(self) -> tuple[str, str] | None:
+        binding = _CALL_BINDING.get()
+        if binding is not None:
+            instance_id, _capture_session_id = binding
+            directory = os.path.join(INSTANCE_ROOT, instance_id)
+            manifest = self._manifest(directory)
+            if manifest is None:
+                raise RuntimeError(
+                    "Requested ReplayLab qrenderdoc instance is not alive: %s"
+                    % instance_id
+                )
+            return (
+                os.path.join(directory, "requests"),
+                os.path.join(directory, "responses"),
+            )
+
         candidates: list[tuple[tuple[int, int, int], str, dict]] = []
         if self._explicit_instance:
             directory = os.path.join(INSTANCE_ROOT, self.instance_id)
@@ -199,8 +244,17 @@ class IPCClient:
             return False
 
     def call(self, method: str, params: dict, timeout: Optional[float] = None) -> Any:
+        values = dict(params or {})
+        binding = _CALL_BINDING.get()
+        if binding is not None and binding[1]:
+            expected = values.get("__replaylab_expected_capture_session_id")
+            if expected not in (None, "", binding[1]):
+                raise RuntimeError(
+                    "ReplayLab direct tool attempted to change its frozen capture session"
+                )
+            values["__replaylab_expected_capture_session_id"] = binding[1]
         with self._mailbox_lock:
-            return self._call_locked(method, params, timeout)
+            return self._call_locked(method, values, timeout)
 
     def _call_locked(
         self, method: str, params: dict, timeout: Optional[float] = None

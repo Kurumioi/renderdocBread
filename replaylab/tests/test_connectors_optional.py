@@ -235,14 +235,18 @@ async def test_stdio_proxy_reads_per_turn_codex_grant_from_environment(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_all_skill_tools_exist_in_current_mcp_contract(tmp_path) -> None:
+async def test_skill_tools_use_direct_contract_and_acp_first_party_adapter(
+    tmp_path,
+) -> None:
     pytest.importorskip("mcp")
     from mcp import ClientSession
     from mcp.client.stdio import StdioServerParameters, stdio_client
 
     from replaylab_agent.mcp_tools import find_replaylab_mcp
     from replaylab_agent.process_env import host_process_environment
+    from replaylab_agent.runtime import AgentRuntime
     from replaylab_agent.skills import SkillCatalog
+    from replaylab_agent.tool_service import available_internal_tools
 
     host = find_replaylab_mcp()
     async with stdio_client(
@@ -256,8 +260,24 @@ async def test_all_skill_tools_exist_in_current_mcp_contract(tmp_path) -> None:
             await session.initialize()
             host_tools = {tool.name for tool in (await session.list_tools()).tools}
     skills = SkillCatalog([Path(__file__).resolve().parents[2] / ".agents" / "skills"]).load()
-    skill_tools = set().union(*(skill.allowed_tools for skill in skills.skills.values()))
-    assert skill_tools <= host_tools, f"missing ReplayLab MCP tools: {sorted(skill_tools - host_tools)}"
+    skill_tools: set[str] = set()
+    for skill in skills.skills.values():
+        if not skill.enabled:
+            continue
+        effective, _withheld = AgentRuntime._effective_tools(skill, None)
+        skill_tools.update(effective)
+    internal_composites = {"inspect_event", "analyze_pixel", "inspect_shader"}
+    assert internal_composites <= skill_tools
+    assert internal_composites <= set(available_internal_tools())
+    assert internal_composites <= host_tools
+    # API and Codex app-server execute every specialist contract in-process.
+    # ACP v1 has no Host dynamic-tool callback, so its task-scoped first-party
+    # MCP adapter must independently expose the same complete contract.
+    assert skill_tools <= set(available_internal_tools())
+    assert skill_tools <= host_tools, (
+        "missing first-party ReplayLab ACP adapter tools: "
+        f"{sorted(skill_tools - host_tools)}"
+    )
 
 
 @pytest.mark.asyncio

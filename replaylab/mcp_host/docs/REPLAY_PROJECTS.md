@@ -100,7 +100,7 @@ same selection lock and preserve snapshot semantics.
    compile, call `validate_shader_workspace_candidate`, and only then use an
    explicitly authorized apply tool.
 
-In the Companion, status and reuse-plan reads are available by default inside
+In AgentHost, status and reuse-plan reads are available by default inside
 the configured workspace root. Every create/import/register/save/seed operation
 is effectful and requires an exact same-turn `/allow` tool name. Shader apply
 still requires its separate same-turn validation and authorization.

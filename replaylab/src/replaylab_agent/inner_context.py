@@ -25,12 +25,10 @@ def _message_tokens(messages: Sequence[Any]) -> int:
     from pydantic_ai.messages import ModelMessagesTypeAdapter
 
     encoded = ModelMessagesTypeAdapter.dump_json(list(messages))
-    # UTF-8 byte count is a deliberately conservative provider-neutral upper
-    # bound for byte-fallback tokenizers. This inner-loop guard values safety
-    # over squeezing an unknown model's advertised window.
-    return max(
-        estimate_tokens(encoded.decode("utf-8", errors="replace")), len(encoded)
-    )
+    # Use the same conservative Latin/CJK estimate as the outer conversation.
+    # Treating every JSON byte as a token caused long-context models to compact
+    # three to four times earlier than their configured model window.
+    return estimate_tokens(encoded.decode("utf-8", errors="replace"))
 
 
 def _atomic_blocks(messages: Sequence[Any]) -> tuple[list[Any], list[list[Any]]]:
@@ -85,7 +83,7 @@ def _verified_tool_exchange(
         ToolCallPart,
         ToolReturnPart,
     )
-    from .mcp_tools import evidence_digest
+    from .tool_service import evidence_digest
 
     if (
         len(block) != 2
@@ -340,7 +338,7 @@ class SpecialistHistoryCompactor:
         from pydantic_ai.messages import ModelRequest, UserPromptPart
 
         before = _message_tokens(messages)
-        if before <= self.spec.trigger_tokens:
+        if before < self.spec.trigger_tokens:
             return messages
 
         prefix, blocks = _atomic_blocks(messages)

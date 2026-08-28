@@ -99,6 +99,7 @@ def test_api_key_environment_variable_name_is_validated() -> None:
         "PATH",
         "home",
         "CODEX_HOME",
+        "CURSOR_CONFIG_DIR",
         "LOCALAPPDATA",
         "PYTHONPATH",
         "HTTPS_PROXY",
@@ -255,6 +256,7 @@ def test_model_settings_are_mapped_instead_of_silently_ignored() -> None:
         model="model",
         options={
             "max_output_tokens": 512,
+            "context_window_tokens": 65536,
             "temperature": 0.2,
             "timeout_seconds": 30,
             "reasoning_effort": "medium",
@@ -313,19 +315,28 @@ def test_subscription_auth_flow_is_agent_only_and_bounded() -> None:
         ).validate()
 
 
-def test_renderdoc_agent_tool_capability_fails_early_and_can_be_explicitly_enabled() -> None:
+def test_renderdoc_agent_tool_capability_only_rejects_explicitly_unsupported_models() -> None:
     from replaylab_agent.runtime import AgentRuntime
 
-    for chat_only in (
+    for unprobed in (
         Profile("local", "ollama", "model"),
         Profile("openai-unconfirmed", "openai", "some-model"),
     ):
-        chat_only.validate()
-        with pytest.raises(ConfigurationError, match="explicitly confirmed tool support"):
-            AgentRuntime._require_agent_capabilities(chat_only)
-        assert "tools" not in chat_only.capabilities
-        assert "json-schema" not in chat_only.capabilities
-        assert "vision" not in chat_only.capabilities
+        unprobed.validate()
+        AgentRuntime._require_agent_capabilities(unprobed)
+        assert "tools" not in unprobed.capabilities
+        assert "json-schema" not in unprobed.capabilities
+        assert "vision" not in unprobed.capabilities
+
+    unsupported = Profile(
+        "local-chat-only",
+        "ollama",
+        "model",
+        options={"supports_tools": False},
+    )
+    unsupported.validate()
+    with pytest.raises(ConfigurationError, match="does not support tool calling"):
+        AgentRuntime._require_agent_capabilities(unsupported)
 
     enabled = Profile(
         "local-tools",

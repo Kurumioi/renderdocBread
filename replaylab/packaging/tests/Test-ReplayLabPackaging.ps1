@@ -28,19 +28,32 @@ if ($parseErrors.Count -gt 0) {
         (($parseErrors | ForEach-Object { $_.Message }) -join "; "))
 }
 
-foreach ($entryName in @("agent_host_entry.py", "mcp_host_entry.py")) {
+foreach ($entryName in @(
+    "agent_host_entry.py", "internal_host_entry.py", "mcp_host_entry.py")) {
     $entryPath = Join-Path $packagingRoot $entryName
     Assert-True (Test-Path -LiteralPath $entryPath -PathType Leaf) "Missing entry point: $entryName"
 }
 
 $source = Get-Content -LiteralPath $buildScript -Raw
+$agentEntrySource = Get-Content -LiteralPath `
+    (Join-Path $packagingRoot "agent_host_entry.py") -Raw
 Assert-True ($source.Contains('$PythonExecutable "replaylab-ai"')) `
     "Build script must name the AgentHost executable replaylab-ai."
 Assert-True ($source.Contains('$PythonExecutable "ReplayLabMCP"')) `
     "Build script must name the MCP executable ReplayLabMCP."
+Assert-True ($source.Contains('$PythonExecutable "ReplayLabInternal"')) `
+    "Build script must name the private executable ReplayLabInternal."
 $legacyManifestToken = "extension" + ".json"
 Assert-True (-not $source.Contains($legacyManifestToken)) `
     "Runtime packaging must not copy or generate a Python extension manifest."
+Assert-True ($source.Contains(
+        '& $builtAgent -I -m replaylab_agent.mcp_proxy --help')) `
+    "Build script must smoke-test the frozen AgentHost MCP proxy dispatch."
+Assert-True ($agentEntrySource.Contains(
+        '["-m", "replaylab_agent.mcp_proxy"]')) `
+    "AgentHost entry point must dispatch the task-filtered MCP proxy."
+Assert-True ($agentEntrySource.Contains('ReplayLabMCP.exe')) `
+    "Frozen AgentHost must resolve its co-packaged ReplayLabMCP executable."
 
 $validationOutput = Join-Path $replayLabRoot "output\packaging-validation-only"
 $validationWork = Join-Path $replayLabRoot "output\.packaging-validation-work"

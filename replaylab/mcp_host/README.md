@@ -11,6 +11,16 @@ first-party Python bridge from the fixed application path
 source/build integration, calls `start`/`stop` directly, and is never discovered
 through `extension.json` or a per-user extension directory.
 
+qrenderdoc's project UI uses the authenticated `ReplayLabInternal.exe`
+high-level service. The project-management, restore, and Shader-save operations
+described here fail closed if that internal service is unavailable; they never
+fall back to this executable. Ordinary qrenderdoc startup owns one
+`ReplayLabMCP.exe` loopback by default for external Codex/IDE/automation clients;
+set `REPLAYLAB_EXTERNAL_MCP_AUTOSTART=0` (`false`, `no`, and `off` are also
+accepted) to disable only that external service. ACP/Cursor starts one filtered
+stdio adapter for its current specialist task. Model API and Codex dynamicTools
+work runs directly inside AgentHost.
+
 ## Features (111 Tools)
 
 ### 📦 Capture Management
@@ -176,27 +186,6 @@ revision does not move the active head, and missing revision provenance fails
 closed once a family has multiple revisions.
 See [Multi-capture replay projects](docs/REPLAY_PROJECTS.md).
 
-### 🤖 External AI Companion
-
-Install `pip install -e ".[companion]"`, set `OPENAI_API_KEY` only in the
-sidecar shell, then run `renderdoc-ai-companion gui --workspace-root <dir>`.
-This standalone host currently uses an OpenAI Platform API key; a ChatGPT/Codex
-subscription is available only through supported ChatGPT/Codex clients
-configured to use this local MCP, not as a credential for this executable.
-See the official [Codex authentication](https://learn.chatgpt.com/docs/auth)
-and [local MCP/STDIO](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
-documentation.
-It snapshots the current RenderDoc context before each chat turn, automatically
-claims/renews RenderDoc button intents, and can prepare one shared shader
-workspace through the trusted automatic multi-hop route. Optional source
-organization, IDE save watching, explicit `/apply-last` and `/rollback-last`,
-and separately opt-in compatible-save auto-apply remain behind
-compile/ABI/live gates. Optional `--project-root`/`--project` mode imports each
-new capture session and may seed only a uniquely matched fresh workspace;
-creating a project also requires explicit game/build IDs and never authorizes
-Apply. See
-[External AI Companion Host](docs/AI_COMPANION_HOST.md).
-
 ### 🎯 Auto Texture-Shader Binding *(NEW)*
 | Tool | Description |
 |------|-------------|
@@ -284,9 +273,8 @@ objects, indirect root-CBV mutation, and remote replay remain fail-closed.
 ## Prerequisites
 
 1. **RenderDocUltra v1.44** (the built-in integration declares this minimum)
-2. **Python 3.10+** for the external MCP/Companion process; it does not need to
+2. **Python 3.10+** for source development of the external MCP process; it does not need to
    match RenderDoc's embedded Python because communication uses file IPC
-3. Optional OpenAI companion dependencies via `pip install -e ".[companion]"`
 
 ## Installation
 
@@ -307,7 +295,7 @@ set RENDERDOC_MODULE_PATH=C:\Program Files\RenderDoc
 export RENDERDOC_MODULE_PATH=/usr/lib/renderdoc
 ```
 
-### MCP Client Configuration
+### External MCP Client Configuration (optional)
 
 Add to your MCP config (e.g. `~/.workbuddy/mcp.json`):
 

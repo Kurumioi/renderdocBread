@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .errors import ConfigurationError, PolicyError
+from .policy import tool_effects
 from .skills import SkillCatalog
+
+
+WorkflowEffect = Literal["workspace", "project", "ui", "replay"]
 
 
 class PlannedTask(BaseModel):
@@ -16,6 +21,15 @@ class PlannedTask(BaseModel):
     summary: str = Field(min_length=1, max_length=500)
     skill: str = Field(min_length=1, max_length=64)
     depends_on: list[str] = Field(default_factory=list, max_length=2)
+    effects: list[WorkflowEffect] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_effects(self) -> "PlannedTask":
+        if len(self.effects) != len(set(self.effects)):
+            raise ValueError("task workflow effects must be unique")
+        if "replay" in self.effects and "workspace" not in self.effects:
+            raise ValueError("replay effect requires workspace preflight and validation")
+        return self
 
 
 class TaskPlan(BaseModel):
@@ -45,15 +59,37 @@ class TaskPlan(BaseModel):
     def can_run_parallel(self, catalog: SkillCatalog) -> bool:
         if len(self.tasks) < 2 or any(task.depends_on for task in self.tasks):
             return False
+        if any(task.effects for task in self.tasks):
+            return False
         skills = [catalog.get(task.skill) for task in self.tasks]
-        return all(skill.read_only for skill in skills) and len(
+        if any(not skill.read_only for skill in skills):
+            return False
+        return len(
             {skill.category for skill in skills}
         ) == len(skills)
 
 
 def validate_plan(plan: TaskPlan, catalog: SkillCatalog) -> TaskPlan:
     for task in plan.tasks:
-        catalog.get(task.skill)
+        skill = catalog.get(task.skill)
+        supported_effects = {
+            effect for tool in skill.allowed_tools for effect in tool_effects(tool)
+        }
+        unsupported = set(task.effects) - supported_effects
+        if unsupported:
+            raise PolicyError(
+                f"skill '{skill.name}' does not implement workflow effect(s): "
+                + ", ".join(sorted(unsupported))
+            )
+        if (
+            task.skill == "renderdoc-explain-event"
+            and "ui" in task.effects
+            and "project" not in task.effects
+        ):
+            raise PolicyError(
+                "event pass-panel publication requires the project effect because the "
+                "current Host stages the capture catalog before fixed classification"
+            )
     if len(plan.tasks) > 3:
         raise PolicyError("ReplayLab plans are limited to three bounded tasks")
     return plan
@@ -69,8 +105,15 @@ def planner_instructions(catalog: SkillCatalog) -> str:
         "You are ReplayLab's bounded request planner. Summarise the user's actual GPU "
         "debugging goal and select one to three skills from the catalog below. Use task-1, "
         "task-2, task-3 consecutively in array order. Split only when tasks are independently "
-        "useful. Dependencies may reference earlier tasks only. Never invent a skill. Planning "
-        "has no RenderDoc tools and must not claim capture observations.\n\n"
+        "useful. Dependencies may reference earlier tasks only. Never invent a skill. For each "
+        "task, set effects to semantic outcomes explicitly requested by the user: workspace for "
+        "managed source/build artifacts, project for reusable project knowledge, ui for a "
+        "published ReplayLab organization view, and replay for a validated live replacement or "
+        "rollback (replay also requires workspace for preflight/validation). Leave effects empty "
+        "for inspection/explanation. Event pass-panel publication requires both project and ui "
+        "because fixed classification first stages the capture catalog. These are workflow outcomes, "
+        "not exact tool permissions. Planning has no RenderDoc tools and must not claim capture "
+        "observations.\n\n"
         + catalog.summaries()
     )
 
@@ -125,7 +168,11 @@ def parse_external_plan(text: str, catalog: SkillCatalog) -> TaskPlan:
 
 
 def safe_fallback_plan(prompt: str, catalog: SkillCatalog) -> TaskPlan:
-    """Choose one conservative specialist after bounded planner-format failures."""
+    """Choose one specialist only for an explicit, deterministic domain request.
+
+    This is a last-resort route after bounded structured-planner retries. It must
+    never turn an unknown request into an arbitrary event/resource investigation.
+    """
 
     lowered = prompt.casefold()
     routes: tuple[tuple[tuple[str, ...], str], ...] = (
@@ -133,18 +180,33 @@ def safe_fallback_plan(prompt: str, catalog: SkillCatalog) -> TaskPlan:
             ("shader", "hlsl", "glsl", "dxil", "dxbc", "spir-v", "着色器", "反编译"),
             "renderdoc-shader-workbench",
         ),
-        (("pixel", "overdraw", "颜色", "像素", "取样"), "renderdoc-inspect-pixel"),
         (
-            ("performance", "timing", "counter", "bottleneck", "性能", "耗时", "瓶颈"),
-            "renderdoc-performance",
-        ),
-        (
-            ("material", "cbuffer", "constant buffer", "材质", "常量缓冲"),
-            "renderdoc-material-cbuffer",
-        ),
-        (
-            ("resource", "texture", "buffer", "binding", "mesh", "资源", "纹理", "绑定"),
-            "renderdoc-resource-analysis",
+            (
+                "eid",
+                "event",
+                "draw",
+                "dispatch",
+                "pipeline",
+                "pass",
+                "pixel",
+                "overdraw",
+                "performance",
+                "timing",
+                "resource",
+                "texture",
+                "buffer",
+                "binding",
+                "事件",
+                "绘制",
+                "调度",
+                "管线",
+                "像素",
+                "性能",
+                "资源",
+                "纹理",
+                "绑定",
+            ),
+            "renderdoc-explain-event",
         ),
     )
     selected = ""
@@ -157,21 +219,9 @@ def safe_fallback_plan(prompt: str, catalog: SkillCatalog) -> TaskPlan:
             selected = skill_name
             break
     if not selected:
-        for candidate in (
-            "renderdoc-explain-event",
-            "renderdoc-resource-analysis",
-        ):
-            try:
-                catalog.get(candidate)
-            except ConfigurationError:
-                continue
-            selected = candidate
-            break
-    if not selected:
-        enabled = sorted(skill.name for skill in catalog.skills.values() if skill.enabled)
-        if not enabled:
-            raise PolicyError("ReplayLab cannot construct a fallback plan without an enabled skill")
-        selected = enabled[0]
+        raise PolicyError(
+            "ReplayLab cannot safely infer a specialist from the request after planner failure"
+        )
     return validate_plan(
         TaskPlan(
             request_summary="Safely inspect the capture for the user's bounded request",
@@ -180,6 +230,7 @@ def safe_fallback_plan(prompt: str, catalog: SkillCatalog) -> TaskPlan:
                     id="task-1",
                     summary=prompt[:500].strip() or "Inspect the current capture",
                     skill=selected,
+                    effects=list(infer_workflow_effects(prompt)),
                 )
             ],
         ),
@@ -187,10 +238,119 @@ def safe_fallback_plan(prompt: str, catalog: SkillCatalog) -> TaskPlan:
     )
 
 
+def infer_workflow_effects(text: str) -> tuple[WorkflowEffect, ...]:
+    """Conservative fallback when a structured planner is unavailable.
+
+    The language model normally selects semantic effects.  This helper only
+    recognizes explicit action phrases so a planner formatting failure does not
+    turn an explanation request into a mutation, while also avoiding a brittle
+    exact-tool permission command.
+    """
+
+    value = str(text or "").casefold()
+    requested: list[WorkflowEffect] = []
+
+    def affirmed(phrase: str) -> bool:
+        start = 0
+        while True:
+            index = value.find(phrase, start)
+            if index < 0:
+                return False
+            prefix = value[max(0, index - 24) : index]
+            if not any(
+                marker in prefix
+                for marker in (
+                    "do not ",
+                    "don't ",
+                    "not ",
+                    "never ",
+                    "without ",
+                    "不要",
+                    "不需要",
+                    "无需",
+                    "禁止",
+                    "别",
+                )
+            ):
+                return True
+            start = index + len(phrase)
+    groups: tuple[tuple[WorkflowEffect, tuple[str, ...]], ...] = (
+        (
+            "workspace",
+            (
+                "decompile",
+                "reconstruct hlsl",
+                "generate hlsl",
+                "compile shader",
+                "edit shader",
+                "organize source",
+                "反编译",
+                "生成 hlsl",
+                "生成hlsl",
+                "编译着色器",
+                "编辑着色器",
+                "整理源码",
+            ),
+        ),
+        (
+            "project",
+            (
+                "project library",
+                "shared library",
+                "reuse in project",
+                "项目库",
+                "公用库",
+                "共享库",
+                "加入项目",
+                "项目复用",
+            ),
+        ),
+        (
+            "ui",
+            (
+                "rename eid",
+                "reorganize event",
+                "foldable pass",
+                "publish pass",
+                "重命名 eid",
+                "重命名eid",
+                "重新组织",
+                "折叠目录",
+                "整理目录",
+                "发布 pass",
+            ),
+        ),
+        (
+            "replay",
+            (
+                "replace shader",
+                "apply shader",
+                "live replacement",
+                "rollback shader",
+                "restore shader",
+                "替换着色器",
+                "应用着色器",
+                "编译回去",
+                "回滚着色器",
+                "恢复着色器",
+            ),
+        ),
+    )
+    for effect, phrases in groups:
+        if any(affirmed(phrase) for phrase in phrases):
+            requested.append(effect)
+    if "ui" in requested and "project" not in requested:
+        requested.insert(requested.index("ui"), "project")
+    if "replay" in requested and "workspace" not in requested:
+        requested.insert(0, "workspace")
+    return tuple(requested)
+
+
 __all__ = [
     "PlannedTask",
     "TaskPlan",
     "external_planner_prompt",
+    "infer_workflow_effects",
     "parse_external_plan",
     "planner_instructions",
     "safe_fallback_plan",

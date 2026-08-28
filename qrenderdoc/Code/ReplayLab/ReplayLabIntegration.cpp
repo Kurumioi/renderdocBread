@@ -85,39 +85,6 @@ QString ReplayLabIntegration::Initialize()
   return m_LastError;
 }
 
-QString ReplayLabIntegration::IntentId(Intent intent)
-{
-  // Protocol identifiers are intentionally not translated.
-  switch(intent)
-  {
-    case Intent::ExplainCurrentEvent:
-      return lit("explain-current-event");    // i18n-ignore: stable intent protocol identifier
-    case Intent::InspectPickedPixel:
-      return lit("inspect-picked-pixel");    // i18n-ignore: stable intent protocol identifier
-    case Intent::ReverseEditSelectedShader:
-      return lit("reverse-edit-selected-shader");    // i18n-ignore: stable intent protocol identifier
-  }
-
-  return QString();
-}
-
-QString ReplayLabIntegration::QueueIntent(Intent intent, const QString &focusStage,
-                                          QString *error) const
-{
-  if(error)
-    error->clear();
-  if(!m_Available)
-  {
-    if(error)
-      *error = m_LastError.isEmpty() ? tr("The built-in RenderDoc AI integration is unavailable.")
-                                    : m_LastError;
-    return QString();
-  }
-
-  return PythonContext::InvokeInternalIntegration(
-      IntegrationModule, "enqueue_native_intent", {IntentId(intent), focusStage}, error);
-}
-
 QStringList ReplayLabIntegration::AvailableShaderStages(QString *error) const
 {
   if(error)
@@ -133,4 +100,25 @@ QStringList ReplayLabIntegration::AvailableShaderStages(QString *error) const
   const QString stages = PythonContext::InvokeInternalIntegration(
       IntegrationModule, "available_native_shader_stages", {}, error);
   return stages.split(QLatin1Char(','), QString::SkipEmptyParts);
+}
+
+QString ReplayLabIntegration::CurrentContextJSON(QString *error) const
+{
+  return CurrentContextJSON(QString(), error);
+}
+
+QString ReplayLabIntegration::CurrentContextJSON(const QString &focusStage, QString *error) const
+{
+  if(error)
+    error->clear();
+  if(!m_Available)
+  {
+    if(error)
+      *error = m_LastError.isEmpty() ? tr("The built-in RenderDoc AI integration is unavailable.")
+                                    : m_LastError;
+    return QString();
+  }
+
+  return PythonContext::InvokeInternalIntegration(IntegrationModule, "current_native_context_json",
+                                                   {focusStage}, error);
 }

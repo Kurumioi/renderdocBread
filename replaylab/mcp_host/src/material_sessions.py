@@ -735,101 +735,159 @@ class MaterialSessionManager:
             )
         return matches[0]
 
+    def _update_many_locked(
+        self, record: _MaterialSession, updates: Any, *, operation: str
+    ) -> dict:
+        """Validate all typed leaves, then perform exactly one replay apply.
+
+        Packing every value before constructing the candidate means a bad
+        selector, type, shape, NaN, or overflow cannot partially mutate either
+        host bookkeeping or replay state. The bridge's immutable snapshot and
+        optimistic revision remain the physical rollback/concurrency boundary.
+        """
+
+        if not isinstance(updates, list) or not updates:
+            raise MaterialSessionError("updates must be a non-empty array")
+        if len(updates) > len(record.parameters):
+            raise MaterialSessionError(
+                "updates contains more entries than editable material parameters"
+            )
+
+        selected_updates: list[tuple[MaterialParameter, bytes]] = []
+        selected_ids: set[str] = set()
+        for index, update in enumerate(updates):
+            if not isinstance(update, dict) or set(update) != {"parameter", "value"}:
+                raise MaterialSessionError(
+                    "updates[%d] must contain only parameter and value" % index
+                )
+            selected = self._select_parameter(record, update.get("parameter"))
+            if selected.leaf_id in selected_ids:
+                raise MaterialSessionError(
+                    "updates contains the same material parameter more than once"
+                )
+            selected_ids.add(selected.leaf_id)
+            packed = _pack_value(
+                update.get("value"), selected.base_type, selected.components
+            )
+            selected_updates.append((selected, packed))
+
+        candidate_patches = dict(record.patches)
+        for selected, packed in selected_updates:
+            candidate_patches[selected.leaf_id] = packed
+        candidate = bytearray(record.baseline)
+        by_id = {item.leaf_id: item for item in record.parameters}
+        manifest = []
+        for leaf_id in sorted(
+            candidate_patches,
+            key=lambda token: (by_id[token].byte_offset, token),
+        ):
+            item = by_id[leaf_id]
+            item_bytes = candidate_patches[leaf_id]
+            candidate[item.byte_offset : item.byte_offset + item.byte_size] = item_bytes
+            manifest.append(
+                {
+                    "leafId": leaf_id,
+                    "packedBase64": base64.b64encode(item_bytes).decode("ascii"),
+                }
+            )
+        candidate_bytes = bytes(candidate)
+        next_revision = record.revision + 1
+        apply_params = {
+            "snapshot_id": record.snapshot_id,
+            "expected_capture_id": record.capture_id,
+            "expected_capture_session_id": record.capture_session_id,
+            # Optimistic concurrency binds this transaction to the bytes from
+            # the last accepted revision, not only to the immutable baseline.
+            "expected_raw_sha256": _sha256(record.current),
+            "expected_layout_sha256": record.layout_sha256,
+            "expected_override_id": record.override_id,
+            "expected_revision": record.revision,
+            "new_revision": next_revision,
+            "data_base64": base64.b64encode(candidate_bytes).decode("ascii"),
+            "data_sha256": _sha256(candidate_bytes),
+            "patches": manifest,
+        }
+        response: Any = None
+        try:
+            response = self._call(
+                "apply_event_cbuffer_override", apply_params, timeout=60.0
+            )
+            if not isinstance(response, dict) or any(
+                (
+                    response.get("schema") != OVERRIDE_SCHEMA,
+                    response.get("schemaVersion") != 1,
+                    response.get("snapshotId") != record.snapshot_id,
+                    response.get("captureId") != record.capture_id,
+                    response.get("captureSessionId") != record.capture_session_id,
+                    response.get("api") != record.api,
+                    response.get("eventId") != record.event_id,
+                    response.get("stage") != record.stage,
+                    response.get("slot") != record.slot,
+                    response.get("registerSpace") != record.register_space,
+                    response.get("revision") != next_revision,
+                    response.get("currentRawSha256") != _sha256(candidate_bytes),
+                    response.get("configured") is not True,
+                    response.get("appliedToCurrentEvent") is not True,
+                )
+            ):
+                raise MaterialSessionError(
+                    "RenderDoc returned a mismatched CBuffer apply result"
+                )
+            override_id = _hex(response.get("overrideId"), 32, "overrideId")
+            if record.override_id and override_id != record.override_id:
+                raise MaterialSessionError(
+                    "RenderDoc changed the active CBuffer override identity"
+                )
+        except Exception:
+            # A response that failed any contract check is untrusted, including its
+            # overrideId. Roll back by the already-issued snapshot capability only; the
+            # bridge interprets an empty override ID as "clear whatever this exact snapshot
+            # currently owns". This also handles a lost response after a successful apply.
+            self._release_snapshot_best_effort(
+                snapshot_id=record.snapshot_id,
+                override_id="",
+                capture_id=record.capture_id,
+                capture_session_id=record.capture_session_id,
+            )
+            self._sessions.pop(record.session_id, None)
+            raise
+
+        record.patches = candidate_patches
+        record.current = candidate_bytes
+        record.revision = next_revision
+        record.override_id = override_id
+        result = self._public(record, operation=operation)
+        result["updatedParameterIds"] = [
+            selected.leaf_id for selected, unused_packed in selected_updates
+        ]
+        result["updatedParameters"] = [
+            selected.path for selected, unused_packed in selected_updates
+        ]
+        result["updatedParameterCount"] = len(selected_updates)
+        return result
+
     def update(self, session_id: str, parameter: str, value: Any) -> dict:
         with self._guard:
             record = self._record(session_id)
             self._ensure_record_capture(record)
-            selected = self._select_parameter(record, parameter)
-            packed = _pack_value(value, selected.base_type, selected.components)
-
-            candidate_patches = dict(record.patches)
-            candidate_patches[selected.leaf_id] = packed
-            candidate = bytearray(record.baseline)
-            by_id = {item.leaf_id: item for item in record.parameters}
-            manifest = []
-            for leaf_id in sorted(
-                candidate_patches,
-                key=lambda token: (by_id[token].byte_offset, token),
-            ):
-                item = by_id[leaf_id]
-                item_bytes = candidate_patches[leaf_id]
-                candidate[item.byte_offset : item.byte_offset + item.byte_size] = item_bytes
-                manifest.append(
-                    {
-                        "leafId": leaf_id,
-                        "packedBase64": base64.b64encode(item_bytes).decode("ascii"),
-                    }
-                )
-            candidate_bytes = bytes(candidate)
-            next_revision = record.revision + 1
-            apply_params = {
-                "snapshot_id": record.snapshot_id,
-                "expected_capture_id": record.capture_id,
-                "expected_capture_session_id": record.capture_session_id,
-                # Optimistic concurrency binds this update to the bytes from
-                # the last accepted revision, not only to the immutable baseline.
-                "expected_raw_sha256": _sha256(record.current),
-                "expected_layout_sha256": record.layout_sha256,
-                "expected_override_id": record.override_id,
-                "expected_revision": record.revision,
-                "new_revision": next_revision,
-                "data_base64": base64.b64encode(candidate_bytes).decode("ascii"),
-                "data_sha256": _sha256(candidate_bytes),
-                "patches": manifest,
-            }
-            response: Any = None
-            try:
-                response = self._call(
-                    "apply_event_cbuffer_override", apply_params, timeout=60.0
-                )
-                if not isinstance(response, dict) or any(
-                    (
-                        response.get("schema") != OVERRIDE_SCHEMA,
-                        response.get("schemaVersion") != 1,
-                        response.get("snapshotId") != record.snapshot_id,
-                        response.get("captureId") != record.capture_id,
-                        response.get("captureSessionId") != record.capture_session_id,
-                        response.get("api") != record.api,
-                        response.get("eventId") != record.event_id,
-                        response.get("stage") != record.stage,
-                        response.get("slot") != record.slot,
-                        response.get("registerSpace") != record.register_space,
-                        response.get("revision") != next_revision,
-                        response.get("currentRawSha256") != _sha256(candidate_bytes),
-                        response.get("configured") is not True,
-                        response.get("appliedToCurrentEvent") is not True,
-                    )
-                ):
-                    raise MaterialSessionError(
-                        "RenderDoc returned a mismatched CBuffer apply result"
-                    )
-                override_id = _hex(response.get("overrideId"), 32, "overrideId")
-                if record.override_id and override_id != record.override_id:
-                    raise MaterialSessionError(
-                        "RenderDoc changed the active CBuffer override identity"
-                    )
-            except Exception:
-                # A response that failed any contract check is untrusted, including its
-                # overrideId. Roll back by the already-issued snapshot capability only; the
-                # bridge interprets an empty override ID as "clear whatever this exact snapshot
-                # currently owns". This also handles a lost response after a successful apply.
-                self._release_snapshot_best_effort(
-                    snapshot_id=record.snapshot_id,
-                    override_id="",
-                    capture_id=record.capture_id,
-                    capture_session_id=record.capture_session_id,
-                )
-                self._sessions.pop(record.session_id, None)
-                raise
-
-            record.patches = candidate_patches
-            record.current = candidate_bytes
-            record.revision = next_revision
-            record.override_id = override_id
-            result = self._public(record, operation="update")
-            result["updatedParameterId"] = selected.leaf_id
-            result["updatedParameter"] = selected.path
+            result = self._update_many_locked(
+                record,
+                [{"parameter": parameter, "value": value}],
+                operation="update",
+            )
+            result["updatedParameterId"] = result["updatedParameterIds"][0]
+            result["updatedParameter"] = result["updatedParameters"][0]
             return result
+
+    def update_many(self, session_id: str, updates: Any) -> dict:
+        """Apply a bounded set of typed leaf values as one replay transaction."""
+
+        with self._guard:
+            record = self._record(session_id)
+            self._ensure_record_capture(record)
+            return self._update_many_locked(
+                record, updates, operation="update-many"
+            )
 
     def status(self, session_id: str) -> dict:
         with self._guard:

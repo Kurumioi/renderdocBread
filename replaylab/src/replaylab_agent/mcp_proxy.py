@@ -12,13 +12,14 @@ import json
 import logging
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Sequence
 
 from . import __version__
-from .errors import ConfigurationError
-from .mcp_tools import tool_result_error, verify_live_tool_scope
-from .policy import ToolCallScope
+from .errors import ConfigurationError, PolicyError
+from .mcp_tools import evidence_digest, tool_result_error, verify_live_tool_scope
+from .policy import WORKFLOW_EFFECTS, ToolCallScope, WorkflowGuard, tool_effects
 from .process_env import host_process_environment
 
 
@@ -37,10 +38,22 @@ async def serve_filtered_proxy(
     host_env: dict[str, str] | None = None,
     scope: ToolCallScope | None = None,
     audit_file: Path | None = None,
+    requested_effects: set[str] | frozenset[str] | None = None,
 ) -> None:
     allowed = frozenset(name.strip() for name in allowed_tools if name.strip())
     if not allowed and not allow_empty:
         raise ConfigurationError("the filtered MCP proxy requires at least one allowed tool")
+    workflow_guard = WorkflowGuard(
+        (
+            requested_effects
+            if requested_effects is not None
+            else {
+                effect
+                for tool in allowed
+                for effect in tool_effects(tool)
+            }
+        )
+    )
     try:
         from mcp import ClientSession
         from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -99,34 +112,53 @@ async def serve_filtered_proxy(
             await session.initialize()
             listed = await session.list_tools()
             by_name = {tool.name: tool for tool in listed.tools}
-            missing = sorted(allowed - set(by_name))
-            if missing:
-                raise ConfigurationError(
-                    "ReplayLab MCP host is missing skill tools: " + ", ".join(missing)
-                )
+            available = frozenset(allowed & set(by_name))
             server = Server(
                 "ReplayLab Skill Filter",
                 version=__version__,
-                instructions="Only tools authorized by the active ReplayLab Agent Skill.",
+                instructions=(
+                    "Task-scoped ReplayLab tools discovered from the live first-party Host. "
+                    "A missing optional tool is omitted; requested workflow outcomes still "
+                    "require Host terminal acceptance."
+                ),
             )
 
             @server.list_tools()
             async def list_tools():
-                return [by_name[name] for name in sorted(allowed)]
+                return [by_name[name] for name in sorted(available)]
 
             @server.call_tool()
             async def call_tool(name: str, arguments: dict):
-                if name not in allowed:
-                    raise ConfigurationError(f"tool '{name}' is outside the active Skill grant")
+                if name not in available:
+                    raise ConfigurationError(
+                        f"tool '{name}' is not available in this task's live Host manifest"
+                    )
                 return await _call_upstream_tool(
                     session.call_tool,
                     name,
                     arguments,
                     scope=scope,
                     audit_file=audit_file,
+                    workflow_guard=workflow_guard,
                 )
 
-            await run_server(server)
+            try:
+                await run_server(server)
+            finally:
+                # The parent AgentHost cannot share this in-process guard with
+                # an ACP child. Emit one Host-owned terminal receipt after the
+                # client session closes so a text answer cannot hide an
+                # uncertain mutation or an incomplete requested effect.
+                terminal_error = ""
+                try:
+                    workflow_guard.validate_completion()
+                except Exception as exc:
+                    terminal_error = type(exc).__name__
+                _append_workflow_terminal(
+                    audit_file,
+                    workflow_guard,
+                    terminal_error=terminal_error,
+                )
 
 
 async def _call_upstream_tool(
@@ -136,6 +168,7 @@ async def _call_upstream_tool(
     *,
     scope: ToolCallScope | None,
     audit_file: Path | None,
+    workflow_guard: WorkflowGuard | None = None,
 ):
     """Run one filtered tool call and preserve failed-call evidence.
 
@@ -146,11 +179,17 @@ async def _call_upstream_tool(
     """
 
     failure = ""
+    tool_call_id = "acp-" + uuid.uuid4().hex
+    arguments_sha256 = evidence_digest(arguments)
+    result_sha256 = ""
     try:
         if scope is not None:
             scope.validate(name, arguments)
             await verify_live_tool_scope(call_tool, scope)
+        if workflow_guard is not None:
+            workflow_guard.check(name, arguments)
         result = await call_tool(name, arguments)
+        result_sha256 = evidence_digest(result)
         error = tool_result_error(result)
         if error:
             failure = error
@@ -159,30 +198,91 @@ async def _call_upstream_tool(
             )
         if scope is not None:
             await verify_live_tool_scope(call_tool, scope)
+        if workflow_guard is not None:
+            workflow_guard.record_result(name, arguments, result)
     except (asyncio.CancelledError, Exception) as exc:
+        if workflow_guard is not None and not isinstance(exc, PolicyError):
+            workflow_guard.record_failure(name)
         if not failure:
             detail = " ".join(str(exc).split())
             failure = type(exc).__name__ + (f": {detail}" if detail else "")
             failure = failure[:2048]
         try:
-            _append_audit(audit_file, name, "failed", failure)
+            _append_audit(
+                audit_file,
+                name,
+                "failed",
+                failure,
+                tool_call_id=tool_call_id,
+                arguments_sha256=arguments_sha256,
+                result_sha256=result_sha256 or evidence_digest(type(exc).__name__),
+            )
         except ConfigurationError:
             # The tool/scope failure is the primary error.  Do not replace it
             # with a secondary audit-write failure.
             pass
         raise
-    _append_audit(audit_file, name, "completed", "")
+    _append_audit(
+        audit_file,
+        name,
+        "completed",
+        "",
+        tool_call_id=tool_call_id,
+        arguments_sha256=arguments_sha256,
+        result_sha256=result_sha256,
+    )
     return result
 
 
-def _append_audit(path: Path | None, tool: str, status: str, error: str) -> None:
+def _append_audit(
+    path: Path | None,
+    tool: str,
+    status: str,
+    error: str,
+    *,
+    tool_call_id: str = "",
+    arguments_sha256: str = "",
+    result_sha256: str = "",
+) -> None:
+    call_id = tool_call_id or ("acp-" + uuid.uuid4().hex)
+    _append_audit_record(
+        path,
+        {
+            "tool": tool,
+            "status": status,
+            "error": error,
+            "toolCallId": call_id,
+            "argumentsSha256": arguments_sha256 or evidence_digest({}),
+            "resultSha256": result_sha256 or evidence_digest(error or status),
+        },
+    )
+
+
+def _append_workflow_terminal(
+    path: Path | None,
+    guard: WorkflowGuard,
+    *,
+    terminal_error: str,
+) -> None:
+    _append_audit_record(
+        path,
+        {
+            "event": "workflow-terminal",
+            "status": "failed" if terminal_error else "completed",
+            "requestedEffects": sorted(guard.requested_effects),
+            "completedEffects": sorted(guard.completed_effects),
+            "completedTools": list(guard.completed),
+            "mutationUncertain": guard.mutation_uncertain,
+            "replayPostconditionObserved": guard.replay_postcondition_observed,
+            "errorType": terminal_error,
+        },
+    )
+
+
+def _append_audit_record(path: Path | None, value: dict[str, object]) -> None:
     if path is None:
         return
-    record = json.dumps(
-        {"tool": tool, "status": status, "error": error},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    record = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8", newline="\n") as stream:
@@ -197,6 +297,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", required=True, type=Path)
     parser.add_argument("--host-arg", action="append", default=[])
     parser.add_argument("--allow", action="append", default=[])
+    parser.add_argument(
+        "--effect",
+        action="append",
+        default=None,
+        help="semantic workflow effect requested by the Host for this task",
+    )
     parser.add_argument(
         "--allow-env",
         default="",
@@ -276,6 +382,18 @@ def _host_args_from_args(values: Sequence[str], environment_name: str) -> tuple[
     return tuple(str(value) for value in selected)
 
 
+def _workflow_effects_from_args(values: Sequence[str]) -> frozenset[str]:
+    effects = frozenset(str(value).strip() for value in values if str(value).strip())
+    unknown = effects - WORKFLOW_EFFECTS
+    if unknown:
+        raise ConfigurationError(
+            "unknown ReplayLab workflow effect(s): " + ", ".join(sorted(unknown))
+        )
+    if "replay" in effects and "workspace" not in effects:
+        raise ConfigurationError("replay workflow effect requires workspace")
+    return effects
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     # The MCP SDK owns stdio framing, but the interpreter still chooses the
     # redirected stream encoding. Make the contract explicit for direct
@@ -291,6 +409,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.WARNING)
     try:
         allowed = _allowed_from_args(args.allow, args.allow_env)
+        requested_effects = (
+            None
+            if args.effect is None
+            else _workflow_effects_from_args(args.effect)
+        )
         host_args = _host_args_from_args(args.host_arg, args.host_args_env)
         if allowed:
             instance_id = str(args.instance_id or os.environ.get(_INSTANCE_ENV, "")).strip()
@@ -336,6 +459,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 host_env=host_env,
                 scope=scope,
                 audit_file=audit_file,
+                requested_effects=requested_effects,
             )
         )
     except (ConfigurationError, OSError) as exc:

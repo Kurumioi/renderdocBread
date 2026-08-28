@@ -23,6 +23,8 @@ from urllib.parse import urlsplit
 from ..errors import ConfigurationError, ConnectorError
 from ..process_env import (
     agent_command_argv,
+    ensure_cursor_profile_config,
+    ensure_cursor_workspace,
     external_agent_environment,
     resolve_agent_executable,
     resolve_known_vendor_executable,
@@ -64,6 +66,8 @@ class SubscriptionResult:
     account: dict[str, Any] | None = None
     message: str = ""
     terminal_opened: bool = False
+    message_id: str = ""
+    message_args: tuple[str, ...] = ()
 
 
 class _SubscriptionWorkspaceOwner:
@@ -107,8 +111,12 @@ def detect_subscription(
     installed = bool(executable)
     if installed:
         message = f"{provider.title} CLI detected; sign-in state is checked only after approval."
+        message_id = "subscription.cli-detected"
+        message_args = [provider.title]
     else:
         message = provider.install_hint or f"Required provider CLI was not found: {command}"
+        message_id = "subscription.cli-missing"
+        message_args = [command, provider.install_hint]
     return {
         "kind": "subscriptionStatus",
         "status": "installed" if installed else "missing",
@@ -116,6 +124,8 @@ def detect_subscription(
         "preset": profile.preset,
         "protocol": provider.protocol,
         "message": message,
+        "messageId": message_id,
+        "messageArgs": message_args,
         "installed": installed,
         # Detection is process-free, so account state is deliberately unknown.
         "authenticated": None,
@@ -198,6 +208,9 @@ class SubscriptionBackend:
         return fixed
 
     def _environment(self, profile: Profile) -> dict[str, str]:
+        if profile.preset == "cursor-acp":
+            ensure_cursor_profile_config(profile, environ=self.environ)
+            ensure_cursor_workspace(self.workspace)
         return external_agent_environment(profile, environ=self.environ)
 
     def _make_codex_connector(
@@ -220,6 +233,8 @@ class SubscriptionBackend:
             cwd=self.workspace,
             timeout=timeout,
             env=environment,
+            authentication_method=profile.provider.acp_auth_method,
+            provider_id=profile.preset,
         )
 
     async def test(self, cancel: asyncio.Event) -> SubscriptionResult:
@@ -241,6 +256,8 @@ class SubscriptionBackend:
                     "ACP initialize/session handshake succeeded without sending a prompt; "
                     f"the session exposed {len(models)} model choice(s)."
                 )
+                message_id = "subscription.acp-test-models"
+                message_args = (str(len(models)),)
             else:
                 message = (
                     "ACP initialize/session handshake succeeded without sending a prompt. "
@@ -248,10 +265,14 @@ class SubscriptionBackend:
                     "use its configured default, or enter an exact model only if that CLI "
                     "supports ACP model selection."
                 )
+                message_id = "subscription.acp-test-no-models"
+                message_args = ()
             return SubscriptionResult(
                 True,
                 tuple(models),
                 message=message,
+                message_id=message_id,
+                message_args=message_args,
             )
         finally:
             self.close()
@@ -279,6 +300,8 @@ class SubscriptionBackend:
                     "loginSkipped",
                     "testing",
                     "Custom ACP has no guessed login command; running only the configured handshake test.",
+                    messageId="subscription.custom-login-skipped",
+                    messageArgs=[],
                 )
             else:
                 raise ConfigurationError("this subscription preset has no supported login flow")
@@ -289,6 +312,8 @@ class SubscriptionBackend:
                 tested.account,
                 tested.message,
                 terminal_opened,
+                tested.message_id,
+                tested.message_args,
             )
         finally:
             self.close()
@@ -303,7 +328,11 @@ class SubscriptionBackend:
             account_result = await _await_or_cancel(connector.account_read(), cancel)
             account = account_result.get("account")
             if not isinstance(account, dict) or not account:
-                return SubscriptionResult(False, message="Codex is signed out.")
+                return SubscriptionResult(
+                    False,
+                    message="Codex is signed out.",
+                    message_id="subscription.codex-signed-out",
+                )
             details = await _await_or_cancel(connector.list_models(), cancel)
             models = _model_ids(details)
             return SubscriptionResult(
@@ -311,6 +340,7 @@ class SubscriptionBackend:
                 tuple(models),
                 _account_summary(account),
                 "Codex account and model catalog are available.",
+                message_id="subscription.codex-account-ready",
             )
 
     async def _connect_codex(
@@ -330,6 +360,8 @@ class SubscriptionBackend:
                     "loginStarted",
                     "waitingForUser",
                     "Complete Codex sign-in in the browser.",
+                    messageId="subscription.codex-browser-complete",
+                    messageArgs=[],
                     authUrl=str(auth_url or ""),
                     userCode=str(user_code or ""),
                     flow=flow,
@@ -352,20 +384,35 @@ class SubscriptionBackend:
                     "loginCompleted",
                     "authenticated" if success else "failed",
                     "Codex login completed." if success else "Codex login failed.",
+                    messageId=(
+                        "subscription.codex-login-completed"
+                        if success
+                        else "subscription.codex-login-failed"
+                    ),
+                    messageArgs=[],
                     authenticated=success,
                 )
                 if not success:
-                    return SubscriptionResult(False, message="Codex login failed.")
+                    return SubscriptionResult(
+                        False,
+                        message="Codex login failed.",
+                        message_id="subscription.codex-login-failed",
+                    )
                 account_result = await _await_or_cancel(connector.account_read(), cancel)
                 account = account_result.get("account")
             if not isinstance(account, dict) or not account:
-                return SubscriptionResult(False, message="Codex account is not authenticated.")
+                return SubscriptionResult(
+                    False,
+                    message="Codex account is not authenticated.",
+                    message_id="subscription.codex-account-unauthenticated",
+                )
             details = await _await_or_cancel(connector.list_models(), cancel)
             return SubscriptionResult(
                 True,
                 tuple(_model_ids(details)),
                 _account_summary(account),
                 "Codex sign-in and model catalog test succeeded.",
+                message_id="subscription.codex-sign-in-test-succeeded",
             )
 
     async def _run_captured_login(
@@ -382,12 +429,18 @@ class SubscriptionBackend:
         if not resolved:
             raise ConnectorError(profile.provider.install_hint or "provider CLI is missing")
         argv = [resolved, *login[1:]]
+        environment = self._environment(profile)
+        if profile.preset == "cursor-acp":
+            # Cursor documents this switch for embedding/headless clients. Keep
+            # the browser under qrenderdoc's visible HTTPS-link gate while the
+            # official CLI retains and validates its own subscription token.
+            environment["NO_OPEN_BROWSER"] = "1"
         kwargs: dict[str, Any] = {
             "stdin": asyncio.subprocess.DEVNULL,
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
             "cwd": str(self.workspace),
-            "env": self._environment(profile),
+            "env": environment,
             "limit": _MAX_CAPTURED_LINE_BYTES,
         }
         if os.name == "nt":
@@ -402,6 +455,8 @@ class SubscriptionBackend:
             "loginStarted",
             "waitingForUser",
             f"Waiting for {profile.provider.title} browser/device authorization.",
+            messageId="subscription.browser-waiting",
+            messageArgs=[profile.provider.title],
         )
         authorization = {"url": "", "code": ""}
 
@@ -417,6 +472,8 @@ class SubscriptionBackend:
                 "loginProgress",
                 "waitingForUser",
                 "Complete provider authorization in the browser.",
+                messageId="subscription.browser-complete",
+                messageArgs=[],
                 authUrl=authorization["url"],
                 userCode=authorization["code"],
             )
@@ -431,6 +488,8 @@ class SubscriptionBackend:
             "loginCompleted",
             "completed",
             f"{profile.provider.title} login command completed; testing ACP now.",
+            messageId="subscription.acp-login-completed",
+            messageArgs=[profile.provider.title],
             authenticated=None,
         )
 
@@ -467,6 +526,8 @@ class SubscriptionBackend:
             "waitingForUser",
             profile.provider.subscription_instruction
             or "Complete authentication in the provider terminal, then exit it.",
+            messageId="subscription.terminal-opened",
+            messageArgs=[profile.provider.title],
             terminalOpened=True,
         )
         await _wait_popen(process, cancel, timeout=self.timeout)
@@ -474,6 +535,8 @@ class SubscriptionBackend:
             "loginCompleted",
             "completed",
             f"{profile.provider.title} terminal exited; testing ACP now.",
+            messageId="subscription.terminal-login-completed",
+            messageArgs=[profile.provider.title],
             authenticated=None,
             terminalOpened=True,
         )

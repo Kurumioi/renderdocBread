@@ -106,9 +106,10 @@ def run_doctor(
             home = codex_profile_home(profile, environ=environ)
             checks.append(
                 DoctorCheck(
-                    "codex-mcp-registration",
+                    "codex-internal-tools",
                     "ok",
-                    "runtime-managed filtered ReplayLab MCP in isolated Codex home: "
+                    "app-server dynamic tools with isolated Codex home; "
+                    "no ReplayLab MCP registration is injected into CODEX_HOME: "
                     + str(home),
                 )
             )

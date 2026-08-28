@@ -38,6 +38,7 @@ class ProviderPreset:
     note: str = ""
     subscription_login: tuple[str, ...] = ()
     subscription_login_mode: SubscriptionLoginMode = "none"
+    acp_auth_method: str = ""
     subscription_instruction: str = ""
     install_hint: str = ""
 
@@ -308,6 +309,29 @@ PRESETS: tuple[ProviderPreset, ...] = (
             "GitHub Copilot CLI was not found. Install it with `winget install GitHub.Copilot` "
             "or `npm install -g @github/copilot`, then restart qrenderdoc. Official guide: "
             "https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli"
+        ),
+    ),
+    ProviderPreset(
+        "cursor-acp",
+        "Cursor CLI (ACP)",
+        "agent",
+        "acp",
+        command=("cursor-agent", "acp"),
+        auth="managed",
+        declared_capabilities=frozenset({"chat", "tools", "approvals"}),
+        subscription_login=("cursor-agent", "login"),
+        subscription_login_mode="captured",
+        acp_auth_method="cursor_login",
+        note=(
+            "Uses Cursor's official `cursor-agent` executable (also installed as `agent`). The "
+            "wizard runs the `login` browser flow for a Cursor subscription, authenticates ACP "
+            "with `cursor_login`, then tests `cursor-agent acp`. Model choices are imported when "
+            "exposed; otherwise leave the model blank for Cursor's configured default."
+        ),
+        install_hint=(
+            "Cursor CLI with ACP support was not found. Install or update the official CLI, add "
+            "the `cursor-agent` executable to PATH, then restart qrenderdoc. Official guide: "
+            "https://cursor.com/docs/cli/installation"
         ),
     ),
     ProviderPreset(

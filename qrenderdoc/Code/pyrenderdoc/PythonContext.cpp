@@ -1058,9 +1058,9 @@ bool PythonContext::ShutdownInternalIntegrations()
     }
     else
     {
-      // Keep the module alive so GlobalShutdown can retry after bounded worker cancellation. If
-      // it still cannot stop, the interpreter is intentionally leaked until process exit instead
-      // of finalising underneath a live Python QRunnable.
+      // Keep the module alive so the CaptureContext owner can retry while all native dependencies
+      // are still valid. The owner must not dismantle CaptureContext/MiniQt/replay underneath a
+      // live Python QRunnable.
       allStopped = false;
     }
   }
@@ -1144,14 +1144,17 @@ void PythonContext::GlobalShutdown()
   // CaptureContext normally performs this while integration/extension-facing UI objects are still
   // valid. Keep a final idempotent fallback for early-exit paths.
   const bool internalIntegrationsStopped = ShutdownInternalIntegrations();
-  ShutdownExtensions();
-
   if(!internalIntegrationsStopped || !internalIntegrations.isEmpty())
   {
     qCritical() << "Python finalisation skipped because a built-in integration still owns live "
                    "workers";
     return;
   }
+
+  // Do not release extension/native callback dependencies until every first-party integration
+  // has proven quiescent. CaptureContext normally performed both steps before reaching here; this
+  // remains an idempotent fallback for early-exit paths without a CaptureContext.
+  ShutdownExtensions();
 
   // Acquire the GIL and drain deferred SWIG references before raising the
   // shutdown fence. Late Qt/PythonContext destructors see main_dict == NULL

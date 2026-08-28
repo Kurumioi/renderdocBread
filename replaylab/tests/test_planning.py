@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from replaylab_agent.errors import PolicyError
 from replaylab_agent.planning import (
     PlannedTask,
     TaskPlan,
     external_planner_prompt,
+    infer_workflow_effects,
     parse_external_plan,
+    planner_instructions,
     safe_fallback_plan,
     validate_plan,
 )
@@ -35,12 +37,12 @@ def _task(task_id: str, skill: str, *, depends_on: list[str] | None = None) -> P
 
 def test_plan_accepts_only_backwards_dependencies_and_known_skills() -> None:
     plan = TaskPlan(
-        request_summary="Explain an event, then inspect its resources",
+        request_summary="Inspect a shader, then explain its event",
         tasks=[
-            _task("task-1", "renderdoc-explain-event"),
+            _task("task-1", "renderdoc-shader-workbench"),
             _task(
                 "task-2",
-                "renderdoc-resource-analysis",
+                "renderdoc-explain-event",
                 depends_on=["task-1"],
             ),
         ],
@@ -52,8 +54,8 @@ def test_plan_accepts_only_backwards_dependencies_and_known_skills() -> None:
         TaskPlan(
             request_summary="Invalid forward dependency",
             tasks=[
-                _task("task-1", "renderdoc-explain-event", depends_on=["task-2"]),
-                _task("task-2", "renderdoc-resource-analysis"),
+                _task("task-1", "renderdoc-shader-workbench", depends_on=["task-2"]),
+                _task("task-2", "renderdoc-explain-event"),
             ],
         )
 
@@ -64,9 +66,9 @@ def test_plan_is_bounded_to_three_tasks() -> None:
             request_summary="Too many tasks",
             tasks=[
                 _task("task-1", "renderdoc-explain-event"),
-                _task("task-2", "renderdoc-resource-analysis"),
-                _task("task-3", "renderdoc-performance"),
-                _task("task-1", "renderdoc-inspect-pixel"),
+                _task("task-2", "renderdoc-shader-workbench"),
+                _task("task-3", "renderdoc-explain-event"),
+                _task("task-1", "renderdoc-shader-workbench"),
             ],
         )
 
@@ -79,11 +81,11 @@ def test_plan_is_bounded_to_three_tasks() -> None:
 
 def test_parallelism_requires_independent_read_only_distinct_categories() -> None:
     catalog = _catalog()
-    safe = TaskPlan(
+    independent = TaskPlan(
         request_summary="Independent evidence collection",
         tasks=[
             _task("task-1", "renderdoc-explain-event"),
-            _task("task-2", "renderdoc-resource-analysis"),
+            _task("task-2", "renderdoc-shader-workbench"),
         ],
     )
     same_category = TaskPlan(
@@ -93,48 +95,32 @@ def test_parallelism_requires_independent_read_only_distinct_categories() -> Non
             _task("task-2", "renderdoc-explain-event"),
         ],
     )
-    duplicate_category_among_three = TaskPlan(
-        request_summary="Three tasks with one duplicate category",
-        tasks=[
-            _task("task-1", "renderdoc-explain-event"),
-            _task("task-2", "renderdoc-resource-analysis"),
-            _task("task-3", "renderdoc-explain-event"),
-        ],
-    )
-    shader_read_only = TaskPlan(
-        request_summary="Contains the read-only shader reconstruction skill",
-        tasks=[
-            _task("task-1", "renderdoc-explain-event"),
-            _task("task-2", "renderdoc-shader-workbench"),
-        ],
-    )
     dependent = TaskPlan(
         request_summary="Sequential evidence",
         tasks=[
-            _task("task-1", "renderdoc-explain-event"),
+            _task("task-1", "renderdoc-shader-workbench"),
             _task(
                 "task-2",
-                "renderdoc-resource-analysis",
+                "renderdoc-explain-event",
                 depends_on=["task-1"],
             ),
         ],
     )
 
-    assert safe.can_run_parallel(catalog)
+    assert not independent.can_run_parallel(catalog)
     assert not same_category.can_run_parallel(catalog)
-    assert not duplicate_category_among_three.can_run_parallel(catalog)
-    assert shader_read_only.can_run_parallel(catalog)
     assert not dependent.can_run_parallel(catalog)
 
-    # Preserve the generic effectful-work invariant without misclassifying the
-    # current Shader Skill, whose v1 tool grant is entirely read-only.
-    effectful_catalog = _catalog()
-    shader = effectful_catalog.skills["renderdoc-shader-workbench"]
-    effectful_catalog.skills[shader.name] = replace(
-        shader,
-        metadata={**shader.metadata, "replaylab-read-only": "false"},
-    )
-    assert not shader_read_only.can_run_parallel(effectful_catalog)
+    # The host can still prove the generic read-only/distinct-category rule on
+    # an explicitly narrowed snapshot of the two workflows.
+    from dataclasses import replace
+
+    read_only_catalog = _catalog()
+    for name, skill in tuple(read_only_catalog.skills.items()):
+        read_only_catalog.skills[name] = replace(
+            skill, metadata={**skill.metadata, "replaylab-read-only": "true"}
+        )
+    assert independent.can_run_parallel(read_only_catalog)
 
 
 def test_external_plan_parser_is_strict_and_catalog_bound() -> None:
@@ -165,8 +151,8 @@ def test_external_planner_prompt_explicitly_has_no_tools_and_one_json_schema() -
     "user_prompt, expected_skill",
     [
         ("反编译当前 shader", "renderdoc-shader-workbench"),
-        ("why is this pixel the wrong color", "renderdoc-inspect-pixel"),
-        ("find the GPU performance bottleneck", "renderdoc-performance"),
+        ("why is this pixel the wrong color", "renderdoc-explain-event"),
+        ("find the GPU performance bottleneck", "renderdoc-explain-event"),
         ("explain this EID", "renderdoc-explain-event"),
     ],
 )
@@ -174,3 +160,107 @@ def test_safe_fallback_plan_is_one_bounded_specialist(user_prompt, expected_skil
     plan = safe_fallback_plan(user_prompt, _catalog())
     assert len(plan.tasks) == 1
     assert plan.tasks[0].skill == expected_skill
+
+
+def test_safe_fallback_plan_never_selects_an_arbitrary_default_specialist() -> None:
+    with pytest.raises(PolicyError, match="cannot safely infer a specialist"):
+        safe_fallback_plan("Please help me understand what is going on", _catalog())
+
+
+def test_planned_effects_are_semantic_outcomes_with_replay_preflight() -> None:
+    task = PlannedTask(
+        id="task-1",
+        summary="Build and replace the selected shader",
+        skill="renderdoc-shader-workbench",
+        effects=["workspace", "replay"],
+    )
+    plan = TaskPlan(request_summary="Replace the shader", tasks=[task])
+
+    assert validate_plan(plan, _catalog()) is plan
+
+    with pytest.raises(ValidationError, match="workflow effects must be unique"):
+        PlannedTask(
+            id="task-1",
+            summary="Duplicate outcome",
+            skill="renderdoc-shader-workbench",
+            effects=["workspace", "workspace"],
+        )
+    with pytest.raises(ValidationError, match="replay effect requires workspace"):
+        PlannedTask(
+            id="task-1",
+            summary="Unsafe replacement",
+            skill="renderdoc-shader-workbench",
+            effects=["replay"],
+        )
+
+
+def test_plan_rejects_an_outcome_the_selected_specialist_does_not_implement() -> None:
+    plan = TaskPlan(
+        request_summary="Ask the event specialist to build a shader workspace",
+        tasks=[
+            PlannedTask(
+                id="task-1",
+                summary="Build shader source",
+                skill="renderdoc-explain-event",
+                effects=["workspace"],
+            )
+        ],
+    )
+
+    with pytest.raises(PolicyError, match="does not implement workflow effect"):
+        validate_plan(plan, _catalog())
+
+
+def test_event_ui_plan_requires_project_staging_effect() -> None:
+    plan = TaskPlan(
+        request_summary="Publish the foldable pass panel",
+        tasks=[
+            PlannedTask(
+                id="task-1",
+                summary="Publish pass organization",
+                skill="renderdoc-explain-event",
+                effects=["ui"],
+            )
+        ],
+    )
+
+    with pytest.raises(PolicyError, match="requires the project effect"):
+        validate_plan(plan, _catalog())
+
+
+@pytest.mark.parametrize(
+    ("user_request", "expected"),
+    [
+        ("解释当前 EID，不修改任何内容", ()),
+        ("Do not replace shader; explain it only", ()),
+        ("不要替换着色器，只解释算法", ()),
+        ("反编译并生成 HLSL", ("workspace",)),
+        ("replace shader", ("workspace", "replay")),
+        ("重命名 EID 并发布折叠目录", ("project", "ui")),
+        (
+            "生成 HLSL，编译回去替换着色器，再加入项目库",
+            ("workspace", "project", "replay"),
+        ),
+    ],
+)
+def test_fallback_effect_inference_requires_explicit_action_language(
+    user_request: str, expected: tuple[str, ...]
+) -> None:
+    assert infer_workflow_effects(user_request) == expected
+
+
+def test_external_plan_round_trips_effects_and_prompt_calls_them_outcomes() -> None:
+    raw = (
+        '{"request_summary":"Replace the selected shader",'
+        '"tasks":[{"id":"task-1","summary":"Validate and replace it",'
+        '"skill":"renderdoc-shader-workbench","depends_on":[],'
+        '"effects":["workspace","replay"]}]}'
+    )
+
+    plan = parse_external_plan(raw, _catalog())
+    instructions = planner_instructions(_catalog())
+
+    assert plan.tasks[0].effects == ["workspace", "replay"]
+    assert "semantic outcomes explicitly requested by the user" in instructions
+    assert "not exact tool permissions" in instructions
+    assert not plan.can_run_parallel(_catalog())

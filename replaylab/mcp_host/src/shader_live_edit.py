@@ -820,6 +820,21 @@ class _LiveEditJob:
         with self._lock:
             return self._state in {"stopped", "failed"}
 
+    def save_source(self, expected_raw_sha256: str, text: str) -> dict[str, Any]:
+        """Save through the exact running watcher owned by this live session."""
+
+        with self._lock:
+            if self._state != "running" or self._stop.is_set():
+                raise ShaderLiveEditError("shader live-edit session is not running")
+            result = self.watch_manager.save_source(
+                self.watch_id, expected_raw_sha256, text
+            )
+            if not isinstance(result, dict) or result.get("watchId") != self.watch_id:
+                raise ShaderLiveEditError(
+                    "workspace watcher returned an invalid editor save result"
+                )
+            return result
+
     def _run(self) -> None:
         try:
             with self._lock:
@@ -1717,6 +1732,70 @@ class ShaderLiveEditManager:
 
     def poll(self, live_edit_id: str) -> dict[str, Any]:
         return self._job(live_edit_id).snapshot()
+
+    def save_authorized_source(
+        self,
+        live_edit_id: str,
+        authorization_id: str,
+        workspace_id: str,
+        expected_raw_sha256: str,
+        text: str,
+    ) -> dict[str, Any]:
+        """Conditionally save while the exact durable live job remains active.
+
+        Holding the manager lock through the job/watcher CAS excludes public
+        stop, revoke, prune and shutdown from racing between authorization and
+        publication. The watcher job lock independently excludes its terminal
+        transition and owns the source transaction lease for the whole CAS.
+        """
+
+        if any(
+            not isinstance(value, str) or _TOKEN.fullmatch(value) is None
+            for value in (live_edit_id, authorization_id, workspace_id)
+        ):
+            raise ShaderLiveEditError(
+                "shader editor live/authorization/workspace identity is invalid"
+            )
+        with self._lock:
+            job = self._jobs.get(live_edit_id)
+            if job is None or job.is_terminal():
+                raise ShaderLiveEditError(
+                    "shader editor live-edit session is not running"
+                )
+            key = _workspace_key(job.workspace)
+            if self._active_by_workspace.get(key) != live_edit_id:
+                raise ShaderLiveEditError(
+                    "shader editor live-edit session is not active"
+                )
+            if self._authorization_by_live_edit.get(live_edit_id) != authorization_id:
+                raise ShaderLiveEditError(
+                    "shader editor authorization does not own this live-edit session"
+                )
+            if self._registry is None:
+                raise ShaderLiveEditError(
+                    "persistent shader editor authorization is unavailable"
+                )
+            matches = [
+                entry
+                for entry in self._registry.entries()
+                if entry["authorizationId"] == authorization_id
+                and entry.get("lastLiveEditId") == live_edit_id
+                and entry["workspaceIdentity"]["workspaceId"] == workspace_id
+                and _workspace_key(Path(entry["workspacePath"])) == key
+            ]
+            if len(matches) != 1:
+                raise ShaderLiveEditError(
+                    "shader editor authorization is unavailable or ambiguous"
+                )
+            result = job.save_source(expected_raw_sha256, text)
+            result.update(
+                {
+                    "liveEditId": live_edit_id,
+                    "authorizationId": authorization_id,
+                    "workspaceId": workspace_id,
+                }
+            )
+            return result
 
     def stop(self, live_edit_id: str) -> dict[str, Any]:
         if not isinstance(live_edit_id, str) or not _TOKEN.fullmatch(live_edit_id):

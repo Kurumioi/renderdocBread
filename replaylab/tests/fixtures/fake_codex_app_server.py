@@ -10,6 +10,8 @@ thread_start_attempts = 0
 turn_start_attempts = 0
 login_completed = False
 post_login_account_reads = 0
+pending_dynamic_tool: int | None = None
+dynamic_mode = mode.startswith("dynamic-tool")
 
 
 def send(value: dict) -> None:
@@ -17,13 +19,102 @@ def send(value: dict) -> None:
     sys.stdout.flush()
 
 
+def send_dynamic_request(
+    request_id: int = 900,
+    *,
+    turn_id: object = "turn-test",
+    call_id: object = "dynamic-call-1",
+) -> None:
+    send(
+        {
+            "id": request_id,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-test",
+                "turnId": turn_id,
+                "callId": call_id,
+                "namespace": None,
+                "tool": "inspect_event",
+                "arguments": {"event_id": 7},
+            },
+        }
+    )
+
+
+def complete_dynamic_turn() -> None:
+    send(
+        {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thread-test",
+                "turnId": "turn-test",
+                "delta": "dynamic evidence ",
+            },
+        }
+    )
+    send(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-test",
+                "turnId": "turn-test",
+                "item": {
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "dynamic evidence answer",
+                },
+            },
+        }
+    )
+    send(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-test",
+                "turn": {"id": "turn-test", "status": "completed", "error": None},
+            },
+        }
+    )
+
+
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
     request_id = message.get("id")
-    if method == "initialize":
+    if method is None and dynamic_mode and request_id in {900, 901}:
+        assert pending_dynamic_tool == request_id
+        if mode in {
+            "dynamic-tool-wrong-turn",
+            "dynamic-tool-wrong-type",
+            "dynamic-tool-duplicate",
+        } and (
+            mode in {"dynamic-tool-wrong-turn", "dynamic-tool-wrong-type"}
+            or request_id == 901
+        ):
+            assert message["error"]["code"] == -32602
+            pending_dynamic_tool = None
+            continue
+        if mode in {"dynamic-tool-failure", "dynamic-tool-invalid-json"}:
+            assert message["result"]["success"] is False
+            content = message["result"]["contentItems"]
+            assert json.loads(content[0]["text"])["error"] == "internal RenderDoc tool failed"
+        else:
+            assert message["result"]["success"] is True
+            content = message["result"]["contentItems"]
+            assert json.loads(content[0]["text"])["eventId"] == 7
+        if mode == "dynamic-tool-duplicate" and request_id == 900:
+            send_dynamic_request(901)
+            pending_dynamic_tool = 901
+            continue
+        pending_dynamic_tool = None
+        complete_dynamic_turn()
+    elif method == "initialize":
         if mode == "exit-initialize":
             raise SystemExit(17)
+        if dynamic_mode:
+            assert message["params"]["capabilities"]["experimentalApi"] is True
+        else:
+            assert "capabilities" not in message["params"]
         send({"id": request_id, "result": {"userAgent": "fake"}})
     elif method == "account/read":
         if mode in {"login-race", "login-update-first"}:
@@ -116,6 +207,13 @@ for line in sys.stdin:
         assert not mode.startswith("signed-out"), "signed-out run must fail before thread/start"
         assert message["params"]["approvalPolicy"] == "never"
         assert message["params"]["ephemeral"] is True
+        if dynamic_mode:
+            assert isinstance(message["params"].get("dynamicTools"), list)
+            assert [item["name"] for item in message["params"]["dynamicTools"]] == [
+                "inspect_event"
+            ]
+        else:
+            assert "dynamicTools" not in message["params"]
         thread_start_attempts += 1
         if mode == "kebab-sandbox" and thread_start_attempts == 1:
             assert message["params"]["sandbox"] == "readOnly"
@@ -139,20 +237,8 @@ for line in sys.stdin:
             thread["instructionSources"] = [{"path": "C:/ambient/AGENTS.md"}]
         send({"id": request_id, "result": {"thread": thread}})
     elif method == "mcpServerStatus/list":
-        entries = [
-            {
-                "name": "replaylab",
-                "serverInfo": {
-                    "name": "replaylab-skill-filter",
-                    "version": "0.1.0",
-                },
-                "tools": {"open_capture": {}} if mode == "wrong-tools" else {},
-                "resources": [],
-                "resourceTemplates": [],
-                "authStatus": "unsupported",
-            }
-        ]
-        if mode == "extra-mcp":
+        entries = []
+        if mode in {"extra-mcp", "wrong-tools"}:
             entries.append({"name": "ambient", "serverInfo": {}, "tools": {}})
         send(
             {
@@ -192,12 +278,25 @@ for line in sys.stdin:
             assert policy["access"]["type"] == "restricted"
             assert policy["access"]["includePlatformDefaults"] is False
             assert message["params"]["cwd"] in policy["access"]["readableRoots"]
+        if mode == "dynamic-tool-prestart":
+            send_dynamic_request()
+            pending_dynamic_tool = 900
         send(
             {
                 "id": request_id,
                 "result": {"turn": {"id": "turn-test", "status": "inProgress"}},
             }
         )
+        if dynamic_mode:
+            if mode != "dynamic-tool-prestart":
+                dynamic_turn_id: object = "turn-test"
+                if mode == "dynamic-tool-wrong-turn":
+                    dynamic_turn_id = "turn-other"
+                elif mode == "dynamic-tool-wrong-type":
+                    dynamic_turn_id = 7
+                send_dynamic_request(turn_id=dynamic_turn_id)
+                pending_dynamic_tool = 900
+            continue
         if mode == "invalid-jsonl":
             sys.stdout.flush()
             sys.stdout.buffer.write(b"{not-json}\n")

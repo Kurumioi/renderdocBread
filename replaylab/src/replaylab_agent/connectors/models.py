@@ -106,12 +106,17 @@ def _openai_compatible_profile(profile: Profile) -> Any:
     profiles_module = _load_module("pydantic_ai.profiles.openai", profile)
     profile_type = _symbol(profiles_module, "OpenAIModelProfile", profile)
 
-    # Unknown OpenAI-compatible servers receive conservative defaults. The
-    # connection wizard can promote each capability after a successful probe,
-    # or an advanced profile can explicitly override an individual wire quirk.
+    # Tool support is tri-state at routing time. An unprobed OpenAI-compatible
+    # model is attempted and the provider response becomes the capability
+    # evidence; only an explicit option or completed negative probe disables
+    # tools before the request. This avoids turning missing metadata into a
+    # permanent permission dead end.
+    default_tool_support = (
+        "tools" in profile.capabilities or profile.probed_capabilities is None
+    )
     return profile_type(
         supports_tools=_bool_option(
-            profile, "supports_tools", "tools" in profile.capabilities
+            profile, "supports_tools", default_tool_support
         ),
         supports_json_schema_output=_bool_option(
             profile,

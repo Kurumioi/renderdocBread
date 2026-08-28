@@ -20,17 +20,18 @@ SKILL_ROOT = Path(__file__).resolve().parents[2] / ".agents" / "skills"
 
 def _plan() -> TaskPlan:
     return TaskPlan(
-        request_summary="Inspect event and resources",
+        request_summary="Inspect shader, then explain its event",
         tasks=[
             PlannedTask(
                 id="task-1",
-                summary="Explain event",
-                skill="renderdoc-explain-event",
+                summary="Inspect shader",
+                skill="renderdoc-shader-workbench",
             ),
             PlannedTask(
                 id="task-2",
-                summary="Inspect resources",
-                skill="renderdoc-resource-analysis",
+                summary="Explain event",
+                skill="renderdoc-explain-event",
+                depends_on=["task-1"],
             ),
         ],
     )
@@ -41,25 +42,25 @@ def test_reviewer_accepts_exact_evidence_validated_result_set() -> None:
     results = [
         SkillResult(
             task_id="task-1",
-            skill="renderdoc-explain-event",
-            summary="Explain event",
-            answer="event evidence",
-            completed_tools=("get_draw_call_details", "get_pipeline_state"),
+            skill="renderdoc-shader-workbench",
+            summary="Inspect shader",
+            answer="shader evidence",
+            completed_tools=("inspect_shader",),
             evidence_validated=True,
         ),
         SkillResult(
             task_id="task-2",
-            skill="renderdoc-resource-analysis",
-            summary="Inspect resources",
-            answer="resource evidence",
-            completed_tools=("get_resources",),
+            skill="renderdoc-explain-event",
+            summary="Explain event",
+            answer="event evidence",
+            completed_tools=("inspect_event",),
             evidence_validated=True,
         ),
     ]
     synthesis = strategy.review_and_synthesize(_plan(), results)
     assert synthesis.accepted_task_ids == ("task-1", "task-2")
-    assert "## Explain event" in synthesis.answer
-    assert "resource evidence" in synthesis.answer
+    assert "## Inspect shader" in synthesis.answer
+    assert "event evidence" in synthesis.answer
     assert synthesis.evidence_validated is True
 
 
@@ -67,9 +68,9 @@ def test_reviewer_rejects_missing_or_identity_mismatched_specialist() -> None:
     strategy = BoundedSupervisorSpecialistReviewer()
     first = SkillResult(
         task_id="task-1",
-        skill="renderdoc-explain-event",
-        summary="Explain event",
-        answer="event evidence",
+        skill="renderdoc-shader-workbench",
+        summary="Inspect shader",
+        answer="shader evidence",
         evidence_validated=True,
     )
     with pytest.raises(PolicyError, match="missing specialist"):
@@ -77,8 +78,8 @@ def test_reviewer_rejects_missing_or_identity_mismatched_specialist() -> None:
 
     wrong = SkillResult(
         task_id="task-2",
-        skill="renderdoc-performance",
-        summary="Inspect resources",
+        skill="renderdoc-shader-workbench",
+        summary="Explain event",
         answer="wrong specialist",
         evidence_validated=True,
     )
@@ -89,7 +90,7 @@ def test_reviewer_rejects_missing_or_identity_mismatched_specialist() -> None:
 def test_default_strategy_parallelism_remains_host_policy_owned() -> None:
     catalog = SkillCatalog([SKILL_ROOT]).load()
     strategy = BoundedSupervisorSpecialistReviewer()
-    assert strategy.can_run_parallel(_plan(), catalog)
+    assert not strategy.can_run_parallel(_plan(), catalog)
 
 
 def test_shader_specialist_has_isolated_provider_neutral_contract() -> None:
@@ -100,7 +101,7 @@ def test_shader_specialist_has_isolated_provider_neutral_contract() -> None:
     )
 
     assert descriptor.skill == "renderdoc-shader-workbench"
-    assert descriptor.role == "shader-reconstruction-specialist"
+    assert descriptor.role == "shader-lifecycle-specialist"
     assert descriptor.context_policy == "isolated-per-task"
     assert descriptor.reasoning_hint == "high"
     assert "shader" in (descriptor.model_hint or "")
@@ -113,15 +114,42 @@ def test_shader_specialist_has_isolated_provider_neutral_contract() -> None:
         "bound_identity",
         "observed_evidence",
         "inferences",
-        "generated_reconstruction",
-        "consistency_report",
+        "generated_hlsl",
+        "algorithm_explanation",
+        "validation_report",
+        "effect_and_recovery_report",
+        "project_library_receipt",
+        "unknowns",
     }
     rendered = descriptor.render_prompt_contract()
-    assert "Both get_shader_info and reverse_shader" in rendered
+    assert "matching rollback route" in rendered
+    assert "project registration" in rendered
     lowered = rendered.lower()
     assert "codex" not in lowered
     assert "anthropic" not in lowered
     assert "gemini" not in lowered
+
+
+def test_event_specialist_has_flow_ui_and_shader_delegation_contract() -> None:
+    catalog = SkillCatalog([SKILL_ROOT]).load()
+    descriptor = BoundedSupervisorSpecialistReviewer().specialist_descriptor(
+        catalog.get("renderdoc-explain-event")
+    )
+
+    assert descriptor.role == "event-pipeline-specialist"
+    assert {field.name for field in descriptor.output_schema} == {
+        "bound_scope",
+        "event_findings",
+        "resource_flow_graph",
+        "shader_delegation_requests",
+        "ui_organization",
+        "unknowns",
+    }
+    rendered = descriptor.render_prompt_contract()
+    assert "AIProvisional" in rendered
+    assert "flow-graph edge" in rendered
+    assert "shader-specialist" in rendered
+    assert "cannot rewrite native RenderDoc Event Browser names" in rendered
 
 
 def test_runtime_rejects_descriptor_that_retargets_selected_skill(tmp_path) -> None:
@@ -158,9 +186,9 @@ def test_shader_contract_is_embedded_in_the_shared_skill_prompt(tmp_path) -> Non
         descriptor,
     )
 
-    assert "shader-reconstruction-specialist" in prompt
+    assert "shader-lifecycle-specialist" in prompt
     assert "Context policy: isolated-per-task" in prompt
-    assert "Generated reconstruction" in prompt
+    assert "Generated HLSL" in prompt
     assert "Selected skill (renderdoc-shader-workbench)" in prompt
 
 
@@ -183,8 +211,8 @@ def test_runtime_host_policy_can_prevent_strategy_from_expanding_parallelism(tmp
             ),
             PlannedTask(
                 id="task-2",
-                summary="Inspect resources",
-                skill="renderdoc-resource-analysis",
+                summary="Inspect shader",
+                skill="renderdoc-shader-workbench",
                 depends_on=["task-1"],
             ),
         ],
@@ -224,7 +252,7 @@ def test_dependency_answers_are_bounded_before_specialist_delegation() -> None:
     task = PlannedTask(
         id="task-2",
         summary="Use prerequisite evidence",
-        skill="renderdoc-resource-analysis",
+        skill="renderdoc-explain-event",
         depends_on=["task-1"],
     )
     rendered = AgentRuntime._dependency_context(

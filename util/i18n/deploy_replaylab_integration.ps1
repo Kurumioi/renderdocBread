@@ -125,7 +125,9 @@ $requiredFiles = @(
     "pass_panel.py",
     "project_launcher.py",
     "project_restore_client.py",
+    "project_shader_workspace.py",
     "shader_console.py",
+    "shader_editor_client.py",
     "integration.json"
 )
 foreach ($requiredFile in $requiredFiles)

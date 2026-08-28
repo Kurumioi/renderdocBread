@@ -15,7 +15,12 @@ $runtimeManifestName = "replaylab-runtime-manifest.json"
 $runtimeManifestSchema = "replaylab-runtime-output/v1"
 $buildSessionMarkerName = ".replaylab-build-session.json"
 $buildSessionSchema = "replaylab-pyinstaller-session/v1"
-$ownedRuntimeFiles = @("replaylab-ai.exe", "ReplayLabMCP.exe", $runtimeManifestName)
+$ownedRuntimeFiles = @(
+    "replaylab-ai.exe",
+    "ReplayLabInternal.exe",
+    "ReplayLabMCP.exe",
+    $runtimeManifestName
+)
 
 function Get-NormalizedPath {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -202,6 +207,7 @@ sys.path.insert(0, sys.argv[2])
 required = [
     "PyInstaller", "mcp", "uvicorn", "starlette", "fastmcp", "httpx",
     "pydantic", "pydantic_ai", "yaml", "langgraph", "genai_prices", "acp",
+    "src.server", "src.ipc_client",
 ]
 if sys.argv[3] == "1":
     required.append("litellm")
@@ -279,6 +285,7 @@ function Invoke-PyInstallerBuild {
         [Parameter(Mandatory = $true)][string]$DistPath,
         [Parameter(Mandatory = $true)][string]$BuildPath,
         [Parameter(Mandatory = $true)][string]$SpecPath,
+        [string[]]$AdditionalImportRoots = @(),
         [string[]]$CollectAll = @(),
         [string[]]$CollectSubmodules = @(),
         [string[]]$HiddenImports = @()
@@ -295,6 +302,9 @@ function Invoke-PyInstallerBuild {
         "--workpath", $BuildPath,
         "--specpath", $SpecPath
     )
+    foreach ($root in $AdditionalImportRoots) {
+        $arguments += @("--paths", $root)
+    }
     foreach ($module in $CollectAll) {
         $arguments += @("--collect-all", $module)
     }
@@ -345,6 +355,7 @@ $replayLabRoot = Get-NormalizedPath (Split-Path -Parent $packagingRoot)
 $agentSource = Join-Path $replayLabRoot "src"
 $mcpRoot = Join-Path $replayLabRoot "mcp_host"
 $agentEntry = Join-Path $packagingRoot "agent_host_entry.py"
+$internalEntry = Join-Path $packagingRoot "internal_host_entry.py"
 $mcpEntry = Join-Path $packagingRoot "mcp_host_entry.py"
 $protectedRoots = @(
     $agentSource,
@@ -372,8 +383,11 @@ foreach ($sourceFile in @(
     (Join-Path $replayLabRoot "pyproject.toml"),
     (Join-Path $mcpRoot "pyproject.toml"),
     (Join-Path $agentSource "replaylab_agent\cli.py"),
+    (Join-Path $mcpRoot "src\internal_host.py"),
+    (Join-Path $mcpRoot "src\internal_tool_service.py"),
     (Join-Path $mcpRoot "src\replaylab_host.py"),
     $agentEntry,
+    $internalEntry,
     $mcpEntry
 )) {
     Assert-RegularFile $sourceFile "ReplayLab runtime packaging source" | Out-Null
@@ -386,6 +400,7 @@ if ($ValidateOnly) {
         OutputDirectory = $OutputDirectory
         WorkDirectory = $WorkDirectory
         AgentEntry = $agentEntry
+        InternalEntry = $internalEntry
         McpEntry = $mcpEntry
     }
     return
@@ -422,8 +437,13 @@ try {
     $mcpDist = Join-Path $sessionRoot "mcp\dist"
     $mcpBuild = Join-Path $sessionRoot "mcp\build"
     $mcpSpec = Join-Path $sessionRoot "mcp\spec"
+    $internalDist = Join-Path $sessionRoot "internal\dist"
+    $internalBuild = Join-Path $sessionRoot "internal\build"
+    $internalSpec = Join-Path $sessionRoot "internal\spec"
     New-Item -ItemType Directory -Path `
-        $agentDist, $agentBuild, $agentSpec, $mcpDist, $mcpBuild, $mcpSpec | Out-Null
+        $agentDist, $agentBuild, $agentSpec, `
+        $internalDist, $internalBuild, $internalSpec, `
+        $mcpDist, $mcpBuild, $mcpSpec | Out-Null
 
     $agentCollectAll = @("pydantic_ai", "mcp", "genai_prices")
     if ($IncludeLiteLLM) {
@@ -431,8 +451,9 @@ try {
     }
     Invoke-PyInstallerBuild $PythonExecutable "replaylab-ai" $agentEntry $agentSource `
         $agentDist $agentBuild $agentSpec `
+        -AdditionalImportRoots @($mcpRoot) `
         -CollectAll $agentCollectAll `
-        -CollectSubmodules @("replaylab_agent", "langgraph", "acp", "fastmcp") `
+        -CollectSubmodules @("replaylab_agent", "langgraph", "acp", "fastmcp", "src") `
         -HiddenImports @("replaylab_agent.mcp_proxy", "replaylab_agent.selftest")
 
     Invoke-PyInstallerBuild $PythonExecutable "ReplayLabMCP" $mcpEntry $mcpRoot `
@@ -440,18 +461,33 @@ try {
         -CollectAll @("mcp") `
         -CollectSubmodules @("src", "uvicorn", "starlette")
 
+    Invoke-PyInstallerBuild $PythonExecutable "ReplayLabInternal" $internalEntry $mcpRoot `
+        $internalDist $internalBuild $internalSpec `
+        -CollectSubmodules @("src", "uvicorn", "starlette")
+
     $builtAgent = Assert-RegularFile (Join-Path $agentDist "replaylab-ai.exe") `
         "built AgentHost executable"
     $builtMcp = Assert-RegularFile (Join-Path $mcpDist "ReplayLabMCP.exe") `
         "built MCP Host executable"
+    $builtInternal = Assert-RegularFile `
+        (Join-Path $internalDist "ReplayLabInternal.exe") `
+        "built internal Host executable"
 
     & $builtAgent --help | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "The packaged replaylab-ai.exe failed its --help smoke test."
     }
+    & $builtAgent -I -m replaylab_agent.mcp_proxy --help | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "The packaged replaylab-ai.exe failed its frozen MCP proxy dispatch smoke test."
+    }
     & $builtMcp --help | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "The packaged ReplayLabMCP.exe failed its --help smoke test."
+    }
+    & $builtInternal --help | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "The packaged ReplayLabInternal.exe failed its --help smoke test."
     }
 
     if (-not (Test-Path -LiteralPath $OutputDirectory)) {
@@ -464,9 +500,12 @@ try {
         -Destination (Join-Path $OutputDirectory "replaylab-ai.exe") -Force
     Copy-Item -LiteralPath $builtMcp `
         -Destination (Join-Path $OutputDirectory "ReplayLabMCP.exe") -Force
+    Copy-Item -LiteralPath $builtInternal `
+        -Destination (Join-Path $OutputDirectory "ReplayLabInternal.exe") -Force
 
     $fileRecords = @()
-    foreach ($name in @("replaylab-ai.exe", "ReplayLabMCP.exe")) {
+    foreach ($name in @(
+        "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe")) {
         $path = Assert-RegularFile (Join-Path $OutputDirectory $name) `
             "packaged ReplayLab runtime file '$name'"
         $file = Get-Item -LiteralPath $path

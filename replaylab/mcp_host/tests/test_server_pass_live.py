@@ -11,6 +11,8 @@ import types
 import unittest
 from unittest import mock
 
+from src import internal_tool_service
+
 
 class _FastMCP:
     def __init__(self, *unused_args, **unused_kwargs):
@@ -381,11 +383,11 @@ class ServerLiveEditTests(unittest.TestCase):
 
     def setUp(self):
         self.manager = _LiveManager()
-        self.old_manager = self.server._SHADER_LIVE_EDIT_MANAGER
-        self.server._SHADER_LIVE_EDIT_MANAGER = self.manager
+        self.old_manager = internal_tool_service._SHADER_LIVE_EDIT_MANAGER
+        internal_tool_service._SHADER_LIVE_EDIT_MANAGER = self.manager
 
     def tearDown(self):
-        self.server._SHADER_LIVE_EDIT_MANAGER = self.old_manager
+        internal_tool_service._SHADER_LIVE_EDIT_MANAGER = self.old_manager
 
     def test_start_poll_stop_expose_shared_resource_policy(self):
         started = json.loads(

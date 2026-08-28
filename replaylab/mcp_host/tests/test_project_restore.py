@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-import time
 import types
 import unittest
 from unittest import mock
@@ -88,13 +87,14 @@ class _ReplayService:
 
 
 class _IPC:
-    def __init__(self, capture_path: Path, session_id: str, index: dict):
+    def __init__(self, capture_path: Path, session_id: str, index: dict | None):
         self.capture_path = capture_path
         self.session_id = session_id
         self.index = index
         self.calls: list[tuple[str, dict]] = []
         self.write_error: Exception | None = None
         self.bind_error: Exception | None = None
+        self.resource_index_snapshot: dict | None = None
 
     def call(self, method: str, params: dict | None = None, timeout=None):
         params = copy.deepcopy(params or {})
@@ -105,28 +105,106 @@ class _IPC:
                 "schemaVersion": 1,
                 "sectionName": "replaylab/cache/project-reuse-index",
                 "sectionVersion": 1,
-                "present": True,
+                "present": self.index is not None,
                 "encodedSize": 1,
                 "encodedSha256": "a" * 64,
                 "document": copy.deepcopy(self.index),
                 "capturePath": str(self.capture_path),
                 "captureSessionId": self.session_id,
             }
-        if method == "bind_rdc_project_shader_catalog":
+        if method == "begin_rdc_project_shader_resource_index":
             if self.bind_error is not None:
                 raise self.bind_error
-            return {
-                "schema": "replaylab-rdc-project-shader-rebind/v1",
+            api = project_restore._asset_api(params["expected_api"])
+            assets = []
+            for shader in params["expected_shaders"]:
+                asset = copy.deepcopy(shader)
+                asset.update(
+                    {
+                        "ownerResourceId": shader["resourceId"],
+                        "ownerCaptureSessionId": self.session_id,
+                        "resourceOwnershipScope": "target-capture-session",
+                        "crossCaptureResourceIdReuse": False,
+                        "api": api,
+                        "physicalAbiSha256": (
+                            "" if api == "vulkan" else "f" * 64
+                        ),
+                        "physicalAbiValidated": api != "vulkan",
+                        "requiresAnchorPreflight": True,
+                        "constantBlocksMatched": True,
+                        "interfaceMatched": True,
+                        "contentMatchMode": (
+                            "module-sha256-owner-rid-anchor-preflight"
+                            if api == "vulkan"
+                            else "api-format-interface-layout-owner-rid"
+                        ),
+                    }
+                )
+                assets.append(asset)
+            result = {
+                "schema": "replaylab-project-shader-resource-index/v1",
                 "schemaVersion": 1,
+                "capturePath": str(self.capture_path),
                 "captureId": params["expected_capture_id"],
                 "captureSessionId": self.session_id,
                 "identityEvidenceSha256": params[
                     "expected_identity_evidence_sha256"
                 ],
-                "verifiedAnchorCount": len(params["anchors"]),
-                "anchors": copy.deepcopy(params["anchors"]),
+                "matched": True,
+                "reasonId": "",
+                "requestSha256": "c" * 64,
+                "capability": {
+                    "supported": True,
+                    "api": api,
+                    "eventTraversalSupported": False,
+                    "physicalAbiFromNullPipeline": api != "vulkan",
+                    "anchorPreflightRequired": True,
+                },
+                "assets": assets,
+                "matchedShaderCount": len(assets),
+                "expectedShaderCount": len(assets),
+                "liveIdentitySha256": "e" * 64,
+                "eventTraversalCount": 0,
                 "fullFrameTraversal": False,
+                "gpuReplayMutation": False,
                 "physicalApplyAuthority": False,
+                "resourceOwnershipScope": "target-capture-session",
+                "crossCaptureResourceIdReuse": False,
+            }
+            self.resource_index_snapshot = {
+                "schema": "replaylab-project-shader-resource-index-job/v1",
+                "schemaVersion": 1,
+                "jobId": "d" * 32,
+                "status": "completed",
+                "captureSessionId": self.session_id,
+                "requestSha256": "c" * 64,
+                "idempotent": False,
+                "committed": False,
+                "result": result,
+            }
+            return copy.deepcopy(self.resource_index_snapshot)
+        if method == "poll_rdc_project_shader_resource_index":
+            if self.resource_index_snapshot is None:
+                raise AssertionError("resource-index job was not started")
+            return copy.deepcopy(self.resource_index_snapshot)
+        if method == "commit_rdc_project_shader_resource_index":
+            return {
+                "schema": "replaylab-project-shader-resource-index-lease/v1",
+                "schemaVersion": 1,
+                "jobId": params["job_id"],
+                "captureId": params["expected_capture_id"],
+                "captureSessionId": self.session_id,
+                "identityEvidenceSha256": params[
+                    "expected_identity_evidence_sha256"
+                ],
+                "liveIdentitySha256": params["live_identity_sha256"],
+                "committed": True,
+                "idempotent": False,
+                "eventTraversalCount": 0,
+                "gpuReplayMutation": False,
+                "physicalApplyAuthority": False,
+                "resourceOwnershipScope": "target-capture-session",
+                "crossCaptureResourceIdReuse": False,
             }
         if method == "write_rdc_project_index":
             if self.write_error is not None:
@@ -262,12 +340,10 @@ class ProjectRestoreTests(unittest.TestCase):
         self.capture_path.write_bytes(b"rdc")
         self.catalog_path = self.project / "captures" / "catalog.json"
         self.catalog_path.parent.mkdir(parents=True)
-        self.catalog_path.write_text("{}", encoding="utf-8")
 
         self.project_id = "1" * 32
         self.active_workspace_id = "2" * 32
         self.capture_id = "3" * 64
-        self.catalog_sha = "4" * 64
         self.knowledge_sha = "5" * 64
         self.scope_sha = "6" * 64
         self.matcher_sha = "7" * 64
@@ -275,11 +351,75 @@ class ProjectRestoreTests(unittest.TestCase):
         self.knowledge_id = "a" * 32
         self.raw_sha = "b" * 64
         self.code_sha = "c" * 64
-        self.interface_sha = "d" * 64
-        self.layout_sha = "e" * 64
         self.candidate_sha = "f" * 64
         self.source_sha = "0" * 64
         self.session_id = "9" * 32
+        constant_block = {
+            "index": 0,
+            "name": "PerMaterial",
+            "bind": 0,
+            "space": 0,
+            "bindArraySize": 1,
+            "byteSize": 16,
+            "bufferBacked": True,
+            "inlineDataBytes": False,
+            "compileConstants": False,
+            "fields": [],
+            "layoutCompleteness": "opaque",
+        }
+        shader_catalog_record = {
+            "shaderResourceId": 7,
+            "resourceId": 7,
+            "stage": "fragment",
+            "entryPoint": "main",
+            "encoding": "ShaderEncoding.DXBC",
+            "rawSha256": self.raw_sha,
+            "codeSha256": self.code_sha,
+            "interfaceComplete": True,
+            "inputSignature": [],
+            "outputSignature": [],
+            "readOnlyResources": [],
+            "readWriteResources": [],
+            "samplers": [],
+            "constantBlocks": [constant_block],
+            "threadGroupSize": [],
+            "outputTopology": "",
+            "dynamicLinkageInterfaceCount": 0,
+        }
+        self.interface_sha = project_restore.interface_hash(shader_catalog_record)
+        self.layout_sha = project_restore.layout_hash(shader_catalog_record)
+        shader_catalog_record["interfaceHash"] = self.interface_sha
+        shader_catalog_record["layoutHash"] = self.layout_sha
+        catalog = {
+            "schema": "renderdoc-ultra-capture-symbols/v1",
+            "schemaVersion": 1,
+            "api": "GraphicsAPI.D3D11",
+            "capturePath": str(self.capture_path),
+            "selection": {
+                "mode": "all_draw_dispatch",
+                "eventIds": [9],
+                "stages": ["fragment"],
+            },
+            "shaders": [shader_catalog_record],
+            "uses": [
+                {
+                    "shaderResourceId": 7,
+                    "resourceId": 7,
+                    "stage": "fragment",
+                    "entryPoint": "main",
+                    "rawSha256": self.raw_sha,
+                    "shaderKey": "7:fragment:main:%s" % self.raw_sha,
+                    "eventId": 9,
+                }
+            ],
+        }
+        self.catalog_path.write_text(
+            json.dumps(catalog, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        self.catalog_sha = project_restore.hashlib.sha256(
+            self.catalog_path.read_bytes()
+        ).hexdigest()
         self.shader_key = "7:fragment:main:%s" % self.raw_sha
         self.identity = {
             "resourceId": 7,
@@ -390,13 +530,13 @@ class ProjectRestoreTests(unittest.TestCase):
         project_restore._MATERIAL_SYNC_PARAMETERS.clear()
         self.temp.cleanup()
 
-    def _run(self, *, write_error=None, bind_error=None):
+    def _run(self, *, write_error=None, bind_error=None, index_present=True):
         host = _Host(
             self.active,
             self.workspace_status,
             self.capture_path,
             self.session_id,
-            self.index,
+            self.index if index_present else None,
             self.identity_evidence,
         )
         host.ipc.write_error = write_error
@@ -414,157 +554,7 @@ class ProjectRestoreTests(unittest.TestCase):
             )
         return result, host, replay, progress
 
-    def test_full_prepare_polls_token_bound_shader_export_progress(self) -> None:
-        events = []
-        warnings = []
-        active = {
-            "workspaceId": self.active_workspace_id,
-            "projectRoot": str(self.project),
-        }
-        prepared = {
-            "schema": "replaylab-active-capture-prepare/v1",
-            "schemaVersion": 1,
-            "capture": {
-                "captureId": self.capture_id,
-                "captureSessionId": self.session_id,
-            },
-            "project": copy.deepcopy(active),
-            "stagedCatalog": {
-                "captureId": self.capture_id,
-                "catalogSha256": self.catalog_sha,
-            },
-            "reusePlan": {
-                "schema": "renderdoc-ultra-project-reuse-plan/v1",
-                "schemaVersion": 1,
-                "captureId": self.capture_id,
-                "catalogSha256": self.catalog_sha,
-                "matches": [],
-            },
-        }
-
-        class Host:
-            cleaned = False
-            prepare_thread = ""
-            read_calls = 0
-
-            @staticmethod
-            def _shader_catalog_progress_channel(capture_session_id):
-                return {
-                    "operationToken": "d" * 32,
-                    "captureSessionId": capture_session_id,
-                }
-
-            def _prepare_active_capture_project(self, token):
-                self.prepare_thread = project_restore.threading.current_thread().name
-                self.assert_token = token
-                time.sleep(0.08)
-                return json.dumps(prepared)
-
-            def _read_shader_catalog_progress(self, channel):
-                self.read_calls += 1
-                if self.read_calls == 1:
-                    raise RuntimeError("transient atomic replace race")
-                return {
-                    "eventId": 77,
-                    "current": 3,
-                    "total": 5,
-                }
-
-            def _cleanup_shader_catalog_progress(self, channel):
-                self.cleaned = True
-
-            @staticmethod
-            def _require_same_active_project(unused_active):
-                return None
-
-        host = Host()
-        progress = project_restore._Progress("e" * 32, events.append, warnings)
-
-        unused_prepared, staged, reuse = project_restore._prepare_response(
-            host, active, self.session_id, progress
-        )
-
-        self.assertEqual(staged["captureId"], self.capture_id)
-        self.assertEqual(reuse["matches"], [])
-        self.assertEqual(host.assert_token, "d" * 32)
-        self.assertEqual(host.prepare_thread, "replaylab-shader-catalog-prepare")
-        self.assertTrue(host.cleaned)
-        self.assertGreaterEqual(host.read_calls, 2)
-        self.assertTrue(any("progress unavailable" in item for item in warnings))
-        self.assertEqual(events[-1]["phase"], "export-shader-bindings")
-        self.assertEqual((events[-1]["current"], events[-1]["total"]), (3, 5))
-        self.assertIn("EID 77", events[-1]["message"])
-
-    def test_progress_channel_setup_failure_falls_back_to_plain_prepare(self) -> None:
-        warnings = []
-        active = {
-            "workspaceId": self.active_workspace_id,
-            "projectRoot": str(self.project),
-        }
-        prepared = {
-            "schema": "replaylab-active-capture-prepare/v1",
-            "schemaVersion": 1,
-            "capture": {
-                "captureId": self.capture_id,
-                "captureSessionId": self.session_id,
-            },
-            "project": copy.deepcopy(active),
-            "stagedCatalog": {
-                "captureId": self.capture_id,
-                "catalogSha256": self.catalog_sha,
-            },
-            "reusePlan": {
-                "schema": "renderdoc-ultra-project-reuse-plan/v1",
-                "schemaVersion": 1,
-                "captureId": self.capture_id,
-                "catalogSha256": self.catalog_sha,
-                "matches": [],
-            },
-        }
-
-        class Host:
-            plain_calls = 0
-            internal_calls = 0
-
-            @staticmethod
-            def _shader_catalog_progress_channel(unused_capture_session_id):
-                raise OSError("sidecar unavailable")
-
-            def _prepare_active_capture_project(self, unused_token):
-                self.internal_calls += 1
-                raise AssertionError("token prepare must not run after setup failure")
-
-            @staticmethod
-            def _read_shader_catalog_progress(unused_channel):
-                raise AssertionError("progress must not be read")
-
-            @staticmethod
-            def _cleanup_shader_catalog_progress(unused_channel):
-                raise AssertionError("absent channel must not be cleaned")
-
-            def prepare_active_capture_project(self):
-                self.plain_calls += 1
-                return json.dumps(prepared)
-
-            @staticmethod
-            def _require_same_active_project(unused_active):
-                return None
-
-        host = Host()
-        progress = project_restore._Progress("e" * 32, None, warnings)
-
-        unused_prepared, staged, reuse = project_restore._prepare_response(
-            host, active, self.session_id, progress
-        )
-
-        self.assertEqual(staged["captureId"], self.capture_id)
-        self.assertEqual(reuse["matches"], [])
-        self.assertEqual(host.plain_calls, 1)
-        self.assertEqual(host.internal_calls, 0)
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("progress setup failed", warnings[0])
-
-    def test_exact_cache_hit_batches_anchor_and_never_prepares_full_frame(self) -> None:
+    def test_exact_cache_hit_indexes_resources_and_never_prepares_full_frame(self) -> None:
         result, host, replay, progress = self._run()
 
         self.assertTrue(result["completed"])
@@ -576,10 +566,65 @@ class ProjectRestoreTests(unittest.TestCase):
         self.assertEqual(host.apply_calls, 1)
         self.assertEqual(replay.snapshot_calls, 1)
         methods = [method for method, unused in host.ipc.calls]
-        self.assertEqual(methods.count("bind_rdc_project_shader_catalog"), 1)
+        self.assertEqual(
+            methods.count("begin_rdc_project_shader_resource_index"), 1
+        )
+        self.assertEqual(
+            methods.count("commit_rdc_project_shader_resource_index"), 1
+        )
+        self.assertNotIn("bind_rdc_project_shader_catalog", methods)
         self.assertNotIn("export_shader_catalog", methods)
+        begin = next(
+            params
+            for method, params in host.ipc.calls
+            if method == "begin_rdc_project_shader_resource_index"
+        )
+        expected = begin["expected_shaders"][0]
+        self.assertEqual(expected["encoding"], "dxbc")
+        self.assertEqual(expected["interfaceHash"], self.interface_sha)
+        self.assertEqual(expected["layoutHash"], self.layout_sha)
+        self.assertTrue(expected["interfaceComplete"])
+        self.assertEqual(
+            set(expected["constantBlocks"][0]),
+            {
+                "space",
+                "bind",
+                "index",
+                "path",
+                "byteSize",
+                "layoutSha256",
+                "abiSha256",
+            },
+        )
         self.assertNotIn("prepare", [event["phase"] for event in progress])
         self.assertTrue(all(len(event["message"].encode("utf-8")) <= 1024 for event in progress))
+
+    def test_forged_catalog_interface_hash_requires_action_without_ipc(self) -> None:
+        catalog = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+        catalog["shaders"][0]["interfaceHash"] = "d" * 64
+        self.catalog_path.write_text(
+            json.dumps(catalog, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        self.catalog_sha = project_restore.hashlib.sha256(
+            self.catalog_path.read_bytes()
+        ).hexdigest()
+        self.binding["catalogSha256"] = self.catalog_sha
+        self.index = upsert_project_binding(new_index(), self.binding)
+        self.workspace_status["capture"]["catalogSha256"] = self.catalog_sha
+        self.state["catalogSha256"] = self.catalog_sha
+
+        result, host, unused_replay, unused_progress = self._run()
+
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["outcome"], "action-required")
+        self.assertEqual(
+            result["reasonId"], "shader-resource-index-interface-mismatch"
+        )
+        self.assertEqual(host.apply_calls, 0)
+        self.assertEqual(host.prepare_calls, 0)
+        methods = [method for method, unused in host.ipc.calls]
+        self.assertEqual(methods, ["read_rdc_project_index"])
 
     def test_read_only_rdc_does_not_reverse_successful_restore(self) -> None:
         result, host, unused_replay, unused_progress = self._run(
@@ -592,7 +637,23 @@ class ProjectRestoreTests(unittest.TestCase):
         self.assertIn("read only", result["index"]["warning"])
         self.assertEqual(host.prepare_calls, 0)
 
-    def test_cached_anchors_share_one_catalog_parse_and_batch_at_256(self) -> None:
+    def test_absent_index_requires_explicit_action_and_never_prepares(self) -> None:
+        result, host, replay, progress = self._run(index_present=False)
+
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["outcome"], "action-required")
+        self.assertEqual(result["reasonId"], "catalog-index-required")
+        self.assertEqual(result["cache"]["reason"], "index-absent")
+        self.assertEqual(host.prepare_calls, 0)
+        self.assertEqual(replay.snapshot_calls, 0)
+        methods = [method for method, unused in host.ipc.calls]
+        self.assertEqual(methods, ["read_rdc_project_index"])
+        phases = [event["phase"] for event in progress]
+        self.assertIn("index-required", phases)
+        self.assertNotIn("prepare", phases)
+        self.assertNotIn("failed", phases)
+
+    def test_cached_resource_index_rejects_more_than_256_without_ipc(self) -> None:
         shader_keys = []
         validated = []
         for number in range(257):
@@ -638,24 +699,22 @@ class ProjectRestoreTests(unittest.TestCase):
             evidence,
         )
 
-        reports = project_restore._bind_workspace_anchors(
-            host,
-            self.capture_path,
-            self.session_id,
-            validated,
+        with self.assertRaises(project_restore.CatalogPreparationRequired) as raised:
+            project_restore._match_workspace_resources(
+                host,
+                self.capture_path,
+                self.session_id,
+                validated,
+            )
+
+        self.assertEqual(
+            raised.exception.reason_id, "shader-resource-index-shader-limit"
         )
+        self.assertEqual(host.scope_calls, 0)
+        self.assertEqual(host.projection_calls, 0)
+        self.assertEqual(host.ipc.calls, [])
 
-        bind_calls = [
-            params
-            for method, params in host.ipc.calls
-            if method == "bind_rdc_project_shader_catalog"
-        ]
-        self.assertEqual(host.scope_calls, 1)
-        self.assertEqual(host.projection_calls, 257)
-        self.assertEqual([len(call["anchors"]) for call in bind_calls], [256, 1])
-        self.assertEqual(len(reports), 2)
-
-    def test_failed_live_anchor_is_never_applied_and_enters_fallback(self) -> None:
+    def test_failed_live_anchor_requires_explicit_action_without_full_prepare(self) -> None:
         result, host, unused_replay, unused_progress = self._run(
             bind_error=RuntimeError("anchor changed")
         )
@@ -663,8 +722,10 @@ class ProjectRestoreTests(unittest.TestCase):
         self.assertFalse(result["completed"])
         self.assertFalse(result["cache"]["hit"])
         self.assertIn("cache-live-validation-failed", result["cache"]["reason"])
+        self.assertEqual(result["outcome"], "action-required")
+        self.assertEqual(result["reasonId"], "shader-resource-index-unavailable")
         self.assertEqual(host.apply_calls, 0)
-        self.assertEqual(host.prepare_calls, 1)
+        self.assertEqual(host.prepare_calls, 0)
 
     def test_live_edit_lease_result_runs_shader_project_sync_hook(self) -> None:
         applied = {
@@ -716,6 +777,150 @@ class ProjectRestoreTests(unittest.TestCase):
 
         self.assertEqual(result["projectSync"], sync)
         hook.assert_called_once_with("1" * 32, updated)
+
+    def test_project_material_restore_uses_one_validated_batch_update(self) -> None:
+        saved_a = "1" * 32
+        saved_b = "2" * 32
+        live_a = "3" * 32
+        live_b = "4" * 32
+        session_id = "5" * 32
+        knowledge_id = "6" * 32
+        layout_sha = "7" * 64
+        knowledge = {
+            "knowledgeId": knowledge_id,
+            "stage": "fragment",
+            "entryPoint": "main",
+            "rawSha256": self.raw_sha,
+            "codeSha256": "",
+            "interfaceComplete": True,
+            "interfaceHash": self.interface_sha,
+            "layoutHash": self.layout_sha,
+            "constantBlockPath": "PerMaterial",
+            "constantBlockLayoutSha256": layout_sha,
+            "parameters": [
+                {
+                    "parameterId": saved_a,
+                    "path": "PerMaterial.Roughness",
+                    "baseType": "Float",
+                    "components": 1,
+                    "value": 0.25,
+                },
+                {
+                    "parameterId": saved_b,
+                    "path": "PerMaterial.Tint",
+                    "baseType": "Float",
+                    "components": 3,
+                    "value": [0.1, 0.2, 0.3],
+                },
+            ],
+        }
+        identity = copy.deepcopy(self.identity)
+        binding_state = {
+            "projectId": self.project_id,
+            "captureId": self.capture_id,
+            "materials": {knowledge_id: knowledge},
+        }
+        material_record = {
+            "knowledgeId": knowledge_id,
+            "shaderResourceId": 7,
+            "stage": "fragment",
+            "path": "PerMaterial",
+            "layoutSha256": layout_sha,
+            "eventId": 9,
+            "blockIndex": 0,
+            "parameters": [
+                {"parameterId": saved_a},
+                {"parameterId": saved_b},
+            ],
+        }
+        session = {
+            "schema": "renderdoc-ultra-material-session/v1",
+            "schemaVersion": 1,
+            "sessionId": session_id,
+            "captureId": self.capture_id,
+            "captureSessionId": self.session_id,
+            "eventId": 9,
+            "stage": "fragment",
+            "shaderResourceId": 7,
+            "constantBlockIndex": 0,
+            "constantBlockPath": "PerMaterial",
+            "layoutSha256": layout_sha,
+            "parameters": [
+                {
+                    "parameterId": live_a,
+                    "path": "PerMaterial.Roughness",
+                    "baseType": "Float",
+                    "components": 1,
+                },
+                {
+                    "parameterId": live_b,
+                    "path": "PerMaterial.Tint",
+                    "baseType": "Float",
+                    "components": 3,
+                },
+            ],
+        }
+
+        class Host:
+            def __init__(self):
+                self.batch_calls = []
+                self.rollback_calls = 0
+
+            @staticmethod
+            def prepare_material_session(*unused_args):
+                return json.dumps(session)
+
+            def update_material_parameters(self, requested_session, updates):
+                self.batch_calls.append((requested_session, copy.deepcopy(updates)))
+                response = copy.deepcopy(session)
+                response.update(
+                    {
+                        "operation": "update-many",
+                        "updatedParameterIds": [live_a, live_b],
+                        "updatedParameterCount": 2,
+                        "applied": True,
+                    }
+                )
+                return json.dumps(response)
+
+            @staticmethod
+            def update_material_parameter(*unused_args):
+                raise AssertionError("project restore must not update leaves individually")
+
+            def rollback_material_session(self, unused_session_id):
+                self.rollback_calls += 1
+                return json.dumps(
+                    {
+                        "schema": "renderdoc-ultra-material-session/v1",
+                        "schemaVersion": 1,
+                    }
+                )
+
+        host = Host()
+        restored, unused_index = project_restore._restore_material(
+            host,
+            None,
+            binding_state,
+            self.active_workspace_id,
+            identity,
+            material_record,
+            self.session_id,
+        )
+
+        self.assertEqual(restored["parameterCount"], 2)
+        self.assertEqual(
+            host.batch_calls,
+            [
+                (
+                    session_id,
+                    [
+                        {"parameter": live_a, "value": 0.25},
+                        {"parameter": live_b, "value": [0.1, 0.2, 0.3]},
+                    ],
+                )
+            ],
+        )
+        self.assertEqual(host.rollback_calls, 0)
 
     def test_material_sync_accumulates_live_session_leaves_and_rdc_hint(self) -> None:
         parameter_a = "a" * 32

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import errno
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -15,6 +17,91 @@ import pytest
 from replaylab_agent.cli import _parser, _subscription_command
 from replaylab_agent.errors import ConfigurationError, ConnectorError
 from replaylab_agent.profiles import Profile, ProfileStore
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_known_subscription_message_ids_are_covered_by_qrenderdoc() -> None:
+    production_sources = [
+        REPOSITORY_ROOT / "replaylab" / "src" / "replaylab_agent" / "cli.py",
+        REPOSITORY_ROOT / "replaylab" / "src" / "replaylab_agent" / "connectors"
+        / "subscription.py",
+    ]
+    python_ids = set()
+    for path in production_sources:
+        python_ids.update(
+            re.findall(
+                r"[\"'](subscription\.[a-z0-9-]+)[\"']",
+                path.read_text(encoding="utf-8"),
+            )
+        )
+
+    assistant_source = (
+        REPOSITORY_ROOT / "qrenderdoc" / "Windows" / "AI" / "AIAssistant.cpp"
+    ).read_text(encoding="utf-8")
+    table_start = assistant_source.index(
+        "static const ProviderRuntimeTranslation providerRuntimeTranslations[]"
+    )
+    table_end = assistant_source.index("};", table_start)
+    native_ids = set(
+        re.findall(
+            r'\{"(subscription\.[a-z0-9-]+)"',
+            assistant_source[table_start:table_end],
+        )
+    )
+
+    assert python_ids
+    assert python_ids <= native_ids, sorted(python_ids - native_ids)
+
+
+def test_known_subscription_events_require_ids_except_raw_exception_diagnostics() -> None:
+    allowed_raw_exceptions = {"SubscriptionCancelled", "ReplayLabAIError"}
+    checks = [
+        (
+            REPOSITORY_ROOT / "replaylab" / "src" / "replaylab_agent" / "cli.py",
+            "backend",
+        ),
+        (
+            REPOSITORY_ROOT / "replaylab" / "src" / "replaylab_agent" / "connectors"
+            / "subscription.py",
+            "self",
+        ),
+    ]
+    violations = []
+    for path, receiver in checks:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        parents = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "event"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == receiver
+            ):
+                continue
+            if any(keyword.arg == "messageId" for keyword in node.keywords):
+                continue
+            ancestor = parents.get(node)
+            handler = None
+            while ancestor is not None:
+                if isinstance(ancestor, ast.ExceptHandler):
+                    handler = ancestor
+                    break
+                ancestor = parents.get(ancestor)
+            exception_name = (
+                handler.type.id
+                if handler is not None and isinstance(handler.type, ast.Name)
+                else ""
+            )
+            if exception_name not in allowed_raw_exceptions:
+                violations.append((str(path), node.lineno, exception_name))
+
+    assert violations == []
 
 
 class FakeSubscriptionBackend:
@@ -418,9 +505,47 @@ async def test_codex_backend_reuses_account_login_and_model_list(monkeypatch) ->
     assert result.authenticated is True
     assert result.models == ("codex-a", "codex-b")
     assert result.account == {"type": "chatgpt", "planType": "plus"}
+    assert result.message_id == "subscription.codex-sign-in-test-succeeded"
     assert events[0]["kind"] == "loginStarted"
+    assert events[0]["messageId"] == "subscription.codex-browser-complete"
     assert events[0]["authUrl"] == "https://auth.example.test/device"
     assert events[0]["userCode"] == "ABCD-EFGH"
+    assert events[1]["kind"] == "loginCompleted"
+    assert events[1]["messageId"] == "subscription.codex-login-completed"
+
+
+@pytest.mark.asyncio
+async def test_codex_signed_out_result_has_stable_runtime_message_id(monkeypatch) -> None:
+    import replaylab_agent.connectors.subscription as subscription
+
+    class SignedOutCodex:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def account_read(self):
+            return {"account": None}
+
+    monkeypatch.setattr(
+        subscription,
+        "resolve_agent_executable",
+        lambda profile, *, environ=None: "C:/trusted/codex.exe",
+    )
+    backend = subscription.SubscriptionBackend(
+        Profile("codex-main", "codex"),
+        timeout=5,
+        emit=lambda event: None,
+        environ={},
+        codex_factory=lambda profile, timeout, environment: SignedOutCodex(),
+    )
+
+    result = await backend.test(asyncio.Event())
+
+    assert result.authenticated is False
+    assert result.message == "Codex is signed out."
+    assert result.message_id == "subscription.codex-signed-out"
 
 
 def test_known_subscription_detection_uses_catalog_command_not_profile_override(
@@ -439,7 +564,33 @@ def test_known_subscription_detection_uses_catalog_command_not_profile_override(
         Profile("codex-main", "codex", command=["untrusted-override"]), environ={}
     )
     assert status["installed"] is True
+    assert status["messageId"] == "subscription.cli-detected"
+    assert status["messageArgs"] == ["Codex / ChatGPT subscription"]
     assert commands == ["codex"]
+
+
+def test_missing_subscription_preserves_localizable_official_install_hint(
+    monkeypatch,
+) -> None:
+    import replaylab_agent.connectors.subscription as subscription
+
+    monkeypatch.setattr(
+        subscription,
+        "resolve_agent_executable",
+        lambda profile, *, environ=None: "",
+    )
+    status = subscription.detect_subscription(Profile("codex-main", "codex"), environ={})
+
+    assert status["installed"] is False
+    assert status["messageId"] == "subscription.cli-missing"
+    assert status["messageArgs"][0] == "codex"
+    assert status["messageArgs"][1] == status["installHint"]
+    assert "https://developers.openai.com/codex/cli/" in status["messageArgs"][1]
+
+    assistant_source = (
+        REPOSITORY_ROOT / "qrenderdoc" / "Windows" / "AI" / "AIAssistant.cpp"
+    ).read_text(encoding="utf-8")
+    assert 'localizeProviderCatalogText(presetId, lit("install_hint"), value)' in assistant_source
 
 
 def test_subscription_backend_uses_dedicated_workspace(tmp_path, monkeypatch) -> None:
@@ -707,6 +858,91 @@ async def test_copilot_login_uses_official_flow_flag(
         backend.close()
 
 
+@pytest.mark.asyncio
+async def test_cursor_login_uses_captured_official_browser_flow(
+    tmp_path, monkeypatch
+) -> None:
+    import replaylab_agent.connectors.subscription as subscription
+
+    launch: dict[str, object] = {}
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        launch["argv"] = argv
+        launch["env"] = kwargs.get("env")
+        stdout = asyncio.StreamReader()
+        stdout.feed_data(b"Open https://cursor.com/login/test\n")
+        stdout.feed_eof()
+        stderr = asyncio.StreamReader()
+        stderr.feed_eof()
+
+        class FakeProcess:
+            pid = 12345
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+        process = FakeProcess()
+        process.stdout = stdout
+        process.stderr = stderr
+        return process
+
+    monkeypatch.setattr(
+        subscription,
+        "resolve_agent_executable",
+        lambda profile, *, environ=None: "C:/trusted/cursor-agent.exe",
+    )
+    monkeypatch.setattr(
+        subscription,
+        "resolve_known_vendor_executable",
+        lambda preset, command, *, environ=None: "C:/trusted/cursor-agent.exe",
+    )
+    monkeypatch.setattr(
+        subscription.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    events: list[dict] = []
+    backend = subscription.SubscriptionBackend(
+        Profile(
+            "cursor-main",
+            "cursor-acp",
+            options={"allow_unsandboxed_agent": True},
+        ),
+        timeout=5,
+        emit=events.append,
+        environ={
+            "LOCALAPPDATA": str(tmp_path),
+            "PATH": "",
+            "OPENAI_API_KEY": "must-not-leak",
+        },
+    )
+    try:
+        await backend._run_captured_login(
+            backend._resolved_profile(), "browser", asyncio.Event()
+        )
+
+        assert launch["argv"] == ("C:/trusted/cursor-agent.exe", "login")
+        environment = launch["env"]
+        assert isinstance(environment, dict)
+        assert environment["NO_OPEN_BROWSER"] == "1"
+        cursor_config = Path(environment["CURSOR_CONFIG_DIR"])
+        assert cursor_config == (
+            tmp_path / "ReplayLab" / "cursor" / "cursor-main"
+        ).resolve()
+        assert environment["HOME"] == str(cursor_config)
+        assert environment["USERPROFILE"] == str(cursor_config)
+        assert (cursor_config / "cli-config.json").is_file()
+        assert "OPENAI_API_KEY" not in environment
+        progress = [event for event in events if event["kind"] == "loginProgress"]
+        assert progress[-1]["authUrl"] == "https://cursor.com/login/test"
+        assert progress[-1]["messageId"] == "subscription.browser-complete"
+        started = [event for event in events if event["kind"] == "loginStarted"]
+        assert started[-1]["messageId"] == "subscription.browser-waiting"
+        completed = [event for event in events if event["kind"] == "loginCompleted"]
+        assert completed[-1]["messageId"] == "subscription.acp-login-completed"
+    finally:
+        backend.close()
+
+
 def test_device_authorization_parser_emits_only_url_and_code() -> None:
     from replaylab_agent.connectors.subscription import _authorization_fields
 
@@ -947,3 +1183,4 @@ async def test_subscription_backend_explains_missing_standard_model_list(
     assert result.authenticated is True
     assert result.models == ()
     assert "did not expose a standard model list" in result.message
+    assert result.message_id == "subscription.acp-test-no-models"

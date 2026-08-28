@@ -173,6 +173,10 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
             dialog_init.index("root.addWidget(self.status_label)"))
         self.assertIn("self._progress_timer.setInterval(25)", dialog_init)
         self.assertIn("queue.Queue(MAX_RESTORE_PROGRESS_EVENTS)", dialog_init)
+        self.assertIn('"phase": "restore-dispatch"', dialog_start)
+        self.assertLess(
+            dialog_start.index('"phase": "restore-dispatch"'),
+            dialog_start.index("self.executor.submit("))
         self.assertIn("self.executor.submit(", dialog_start)
         self.assertIn("self.publish_progress", dialog_start)
         self.assertIn("self._progress_events.put_nowait(progress)", publish_progress)
@@ -201,6 +205,28 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
         self.assertEqual(
             "Checking shared Shader hashes (7 / 12)",
             project_launcher._restore_progress_text(value))
+
+        expected_local_phases = {
+            "restore-dispatch": "Scheduling ReplayLab project recovery",
+            "client-validate": "Validating the project recovery request",
+            "host-state": "Checking the ReplayLab Host state",
+            "host-health": "Verifying the ReplayLab Host identity",
+            "restore-submit": "Starting the project recovery job",
+            "restore-queued": "Project recovery is queued",
+            "restore-running": "ReplayLab Host is running project recovery",
+            "result-validate": "Validating the project recovery result",
+            "index-required": (
+                "A full Shader index is required before project data can be restored"
+            ),
+        }
+        for phase, expected in expected_local_phases.items():
+            with self.subTest(phase=phase):
+                self.assertEqual(
+                    expected,
+                    project_launcher._restore_progress_text({
+                        "phase": phase, "message": "", "current": 0,
+                        "total": 0,
+                    }))
 
         clamped = project_launcher._normalise_restore_progress({
             "phase": "apply", "message": "Applying", "current": 20, "total": 3,
@@ -258,6 +284,32 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
             project_launcher._restore_result_error({
                 "errorId": "project-restore-client-unavailable",
             }))
+        self.assertEqual(
+            "The running ReplayLab Host does not match this qrenderdoc build. Close "
+            "qrenderdoc and Codex, deploy the matching ReplayLab runtime, then restart "
+            "qrenderdoc.",
+            project_launcher._restore_result_error({
+                "errorId": "host-runtime-incompatible",
+            }))
+        action_required = {
+            "completed": False,
+            "outcome": "action-required",
+            "reasonId": "catalog-index-required",
+        }
+        self.assertTrue(
+            project_launcher._restore_action_required(action_required)
+        )
+        self.assertEqual(
+            "", project_launcher._restore_result_error(action_required)
+        )
+        self.assertEqual(
+            "future-action",
+            project_launcher._restore_result_error({
+                "completed": False,
+                "outcome": "action-required",
+                "reasonId": "future-action",
+            }),
+        )
         self.assertEqual(
             "future-restore-failure",
             project_launcher._restore_result_error({
@@ -419,7 +471,7 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
             return _project()
 
         client = project_launcher.ReplayLabProjectClient(
-            "C:/ReplayLab/ReplayLabMCP.exe", runner=runner)
+            "C:/ReplayLab/ReplayLabInternal.exe", runner=runner)
         projects = client.list_projects()
         self.assertEqual("Example", projects[0]["name"])
         client.create_project(
@@ -472,7 +524,7 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
             }
 
         client = project_launcher.ReplayLabProjectClient(
-            "C:/ReplayLab/ReplayLabMCP.exe", runner=runner)
+            "C:/ReplayLab/ReplayLabInternal.exe", runner=runner)
         projects = client.list_projects()
         self.assertEqual(1, len(projects))
         self.assertTrue(projects[0]["unavailable"])
@@ -495,7 +547,7 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
             }
 
         client = project_launcher.ReplayLabProjectClient(
-            "C:/ReplayLab/ReplayLabMCP.exe", runner=runner)
+            "C:/ReplayLab/ReplayLabInternal.exe", runner=runner)
         project = client.list_projects()[0]
         self.assertEqual(
             "Project files are unavailable or invalid: workspace manifest is unavailable",
@@ -503,84 +555,58 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
         self.assertEqual(
             "project-validation-failed", project["unavailableReasonId"])
 
-    def test_project_client_tracks_and_forgets_host_process(self):
-        tracked = []
-        forgotten = []
-        original_track = project_launcher._track_host_process
-        original_forget = project_launcher._forget_host_process
-        original_popen = project_launcher.subprocess.Popen
+    def test_project_client_uses_internal_service_without_mcp_subprocess(self):
+        calls = []
+        original_resolve = (
+            project_launcher._internal_client_protocol.resolve_internal_executable)
+        original_client = (
+            project_launcher._internal_client_protocol.ReplayLabInternalProjectClient)
 
-        class _Process(object):
-            returncode = 0
+        class _InternalClient(object):
+            def __init__(self, executable, request_timeout_seconds):
+                calls.append(("construct", executable, request_timeout_seconds))
 
-            def communicate(self, timeout=None):
-                self.timeout = timeout
-                return b"{}", b""
+            def invoke(self, operation, parameters):
+                calls.append((operation, parameters))
+                return {
+                    "schema": "replaylab-project-list/v1",
+                    "projects": [_project()],
+                }
 
-        process = _Process()
-        project_launcher._track_host_process = tracked.append
-        project_launcher._forget_host_process = forgotten.append
-        project_launcher.subprocess.Popen = lambda *args, **kwargs: process
+        project_launcher._internal_client_protocol.resolve_internal_executable = (
+            lambda unused: "C:/ReplayLab/ReplayLabInternal.exe")
+        project_launcher._internal_client_protocol.ReplayLabInternalProjectClient = (
+            _InternalClient)
         try:
             client = project_launcher.ReplayLabProjectClient(
-                str(Path(__file__).resolve()), timeout_seconds=7)
-            self.assertEqual({}, client._run_process(["project-list"]))
+                "C:/ReplayLab/ReplayLabInternal.exe", timeout_seconds=7)
+            projects = client.list_projects()
         finally:
-            project_launcher.subprocess.Popen = original_popen
-            project_launcher._track_host_process = original_track
-            project_launcher._forget_host_process = original_forget
+            project_launcher._internal_client_protocol.resolve_internal_executable = (
+                original_resolve)
+            project_launcher._internal_client_protocol.ReplayLabInternalProjectClient = (
+                original_client)
 
-        self.assertEqual([process], tracked)
-        self.assertEqual([process], forgotten)
-        self.assertEqual(7, process.timeout)
+        self.assertEqual("Example", projects[0]["name"])
+        self.assertEqual(
+            ("construct", "C:/ReplayLab/ReplayLabInternal.exe", 7), calls[0])
+        self.assertEqual(("list-projects", {}), calls[1])
+        source = (
+            _class_method_source("ReplayLabProjectClient", "__init__") +
+            _class_method_source("ReplayLabProjectClient", "_run_internal_request"))
+        self.assertNotIn("Popen", source)
+        self.assertNotIn("project-list\"]", source)
 
-    def test_project_client_bounds_communicate_after_kill(self):
-        original_popen = project_launcher.subprocess.Popen
-
-        class _Pipe(object):
-            def __init__(self):
-                self.closed = False
-
-            def close(self):
-                self.closed = True
-
-        class _Process(object):
-            def __init__(self):
-                self.returncode = None
-                self.stdout = _Pipe()
-                self.stderr = _Pipe()
-                self.communicate_timeouts = []
-                self.wait_timeouts = []
-                self.killed = 0
-
-            def communicate(self, timeout=None):
-                self.communicate_timeouts.append(timeout)
-                raise project_launcher.subprocess.TimeoutExpired("ReplayLabMCP", timeout)
-
-            def kill(self):
-                self.killed += 1
-
-            def wait(self, timeout=None):
-                self.wait_timeouts.append(timeout)
-                raise project_launcher.subprocess.TimeoutExpired("ReplayLabMCP", timeout)
-
-        process = _Process()
-        project_launcher.subprocess.Popen = lambda *args, **kwargs: process
-        try:
-            client = project_launcher.ReplayLabProjectClient(
-                str(Path(__file__).resolve()), timeout_seconds=7)
-            with self.assertRaisesRegex(
-                    project_launcher.ProjectLauncherError,
-                    "did not stop after cancellation"):
-                client._run_process(["project-list"])
-        finally:
-            project_launcher.subprocess.Popen = original_popen
-
-        self.assertEqual([7, 5], process.communicate_timeouts)
-        self.assertEqual([1], process.wait_timeouts)
-        self.assertEqual(1, process.killed)
-        self.assertTrue(process.stdout.closed)
-        self.assertTrue(process.stderr.closed)
+    def test_internal_project_operation_rejects_unknown_or_duplicate_options(self):
+        with self.assertRaisesRegex(
+                project_launcher.ProjectLauncherError, "not allowed"):
+            project_launcher._internal_project_operation(["stdio"])
+        with self.assertRaisesRegex(
+                project_launcher.ProjectLauncherError, "duplicate"):
+            project_launcher._internal_project_operation([
+                "project-activate", "--project-root", "C:/one",
+                "--project-root", "C:/two",
+            ])
 
     def test_async_executor_shutdown_uses_only_bounded_wait(self):
         shutdown = _class_method_source("AsyncProjectExecutor", "shutdown")
@@ -589,31 +615,25 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
         self.assertNotIn("while self.pool.activeThreadCount()", shutdown)
         self.assertNotIn("waitForDone()", shutdown)
 
-    def test_shutdown_cancels_only_live_project_host_children(self):
-        class _Process(object):
-            def __init__(self, returncode):
-                self.returncode = returncode
-                self.killed = 0
+    def test_async_executor_result_timer_runs_only_while_callbacks_are_pending(self):
+        constructor = _class_method_source("AsyncProjectExecutor", "__init__")
+        submit = _class_method_source("AsyncProjectExecutor", "submit")
+        drain = _class_method_source("AsyncProjectExecutor", "_drain_results")
+        cancel = (
+            _class_method_source("AsyncProjectExecutor", "cancel_owner")
+            + _class_method_source("AsyncProjectExecutor", "cancel_all")
+        )
+        self.assertNotIn("self._result_timer.start()", constructor)
+        self.assertIn("if not self._result_timer.isActive():", submit)
+        self.assertIn("self._result_timer.start()", submit)
+        self.assertIn("if len(self.registry) == 0:", drain)
+        self.assertIn("self._result_timer.stop()", drain + cancel)
 
-            def poll(self):
-                return self.returncode
-
-            def kill(self):
-                self.killed += 1
-                self.returncode = -1
-
-        live = _Process(None)
-        finished = _Process(0)
-        with project_launcher._ACTIVE_HOST_PROCESSES_GUARD:
-            project_launcher._ACTIVE_HOST_PROCESSES.update((live, finished))
-        try:
-            project_launcher.cancel_active_host_processes()
-        finally:
-            with project_launcher._ACTIVE_HOST_PROCESSES_GUARD:
-                project_launcher._ACTIVE_HOST_PROCESSES.discard(live)
-                project_launcher._ACTIVE_HOST_PROCESSES.discard(finished)
-        self.assertEqual(1, live.killed)
-        self.assertEqual(0, finished.killed)
+    def test_shutdown_has_no_per_operation_project_process(self):
+        source = _class_method_source("ReplayLabProjectClient", "__init__")
+        self.assertNotIn("Popen", source)
+        shutdown = _class_method_source("AsyncProjectExecutor", "shutdown")
+        self.assertNotIn("cancel_active_host_processes", shutdown)
 
     def test_thumbnail_reader_uses_metadata_handle_without_opening_replay(self):
         calls = []
@@ -735,7 +755,7 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
             return value
 
         client = project_launcher.ReplayLabProjectClient(
-            "C:/ReplayLab/ReplayLabMCP.exe", runner=runner)
+            "C:/ReplayLab/ReplayLabInternal.exe", runner=runner)
         result = client.create_project("Portable", "C:/Projects/Portable")
         self.assertEqual("bound", result["state"])
         self.assertIn("--project-root", calls[0])

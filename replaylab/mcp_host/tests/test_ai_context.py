@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import ast
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import types
@@ -140,160 +141,6 @@ class CurrentContextTests(unittest.TestCase):
         snapshot = ai_context.build_context(_facts("deterministic-default"))
         self.assertEqual(snapshot["shaders"]["focused"]["stage"], "fragment")
         self.assertFalse(snapshot["shaders"]["focusIsExplicit"])
-        queue = ai_context.IntentQueue(id_factory=lambda: "intent-default")
-        with self.assertRaisesRegex(
-            ai_context.ContextProtocolError, "explicitly stage-scoped"
-        ):
-            queue.enqueue(ai_context.INTENT_REVERSE_EDIT_SHADER, snapshot)
-
-
-class _Clock(object):
-    def __init__(self):
-        self.value = 1000.0
-
-    def __call__(self):
-        return self.value
-
-
-class _Ids(object):
-    def __init__(self):
-        self.value = 0
-
-    def __call__(self):
-        self.value += 1
-        return "token-%d" % self.value
-
-
-class IntentQueueTests(unittest.TestCase):
-    def setUp(self):
-        self.clock = _Clock()
-        self.ids = _Ids()
-        self.queue = ai_context.IntentQueue(
-            maximum=4, clock=self.clock, id_factory=self.ids
-        )
-        self.context = ai_context.build_context(_facts())
-
-    def test_explicit_shader_intent_freezes_exact_shader_identity(self):
-        record = self.queue.enqueue(
-            ai_context.INTENT_REVERSE_EDIT_SHADER, self.context
-        )
-        self.context["shaders"]["focused"]["resourceId"] = 999999
-        self.assertEqual(record["origin"], "renderdoc-ui")
-        self.assertEqual(record["arguments"]["eventId"], 142)
-        self.assertEqual(record["arguments"]["stage"], "fragment")
-        self.assertEqual(record["arguments"]["shaderResourceId"], 902)
-        self.assertEqual(record["arguments"]["rawSha256"], "2" * 64)
-        self.assertTrue(
-            record["recommendedWorkflow"]["automaticExecutionAuthorized"]
-        )
-        self.assertFalse(record["recommendedWorkflow"]["advisoryOnly"])
-        self.assertTrue(
-            record["recommendedWorkflow"]["suggestedStepsAdvisory"]
-        )
-        self.assertFalse(
-            record["recommendedWorkflow"]["replayMutationAuthorized"]
-        )
-        self.assertIn(
-            "decompile-shader",
-            record["recommendedWorkflow"]["allowedOperations"],
-        )
-        self.assertIn(
-            "watch-and-compile-saves",
-            record["recommendedWorkflow"]["allowedOperations"],
-        )
-        self.assertIn(
-            "synchronise-active-project",
-            record["recommendedWorkflow"]["allowedOperations"],
-        )
-        self.assertIn(
-            "resolve-project-symbols",
-            record["recommendedWorkflow"]["allowedOperations"],
-        )
-        self.assertIn(
-            "persist-project-knowledge",
-            record["recommendedWorkflow"]["allowedOperations"],
-        )
-        self.assertEqual(
-            record["recommendedWorkflow"]["steps"][0]["tool"], "reverse_shader"
-        )
-        self.assertEqual(record["context"]["shaders"]["focused"]["resourceId"], 902)
-
-    def test_claim_is_leased_retried_and_only_live_holder_completes(self):
-        queued = self.queue.enqueue(ai_context.INTENT_EXPLAIN_EVENT, self.context)
-        first = self.queue.claim("companion-a", maximum=1, lease_seconds=5)
-        first_record = first["intents"][0]
-        self.assertEqual(first_record["intentId"], queued["intentId"])
-        self.assertEqual(first_record["attempts"], 1)
-        self.assertEqual(self.queue.claim("companion-b")["intents"], [])
-
-        self.clock.value += 6
-        second = self.queue.claim("companion-b", maximum=1, lease_seconds=30)
-        second_record = second["intents"][0]
-        self.assertEqual(second_record["attempts"], 2)
-        with self.assertRaisesRegex(ai_context.ContextProtocolError, "token does not match"):
-            self.queue.complete(
-                queued["intentId"], first_record["leaseToken"], "completed"
-            )
-
-        completed = self.queue.complete(
-            queued["intentId"],
-            second_record["leaseToken"],
-            "completed",
-            "Explained by the external companion",
-        )
-        self.assertEqual(completed["state"], "completed")
-        self.assertEqual(completed["leaseToken"], "")
-
-    def test_live_holder_can_renew_but_expired_or_wrong_token_cannot(self):
-        queued = self.queue.enqueue(ai_context.INTENT_EXPLAIN_EVENT, self.context)
-        claimed = self.queue.claim(
-            "companion-a", maximum=1, lease_seconds=5
-        )["intents"][0]
-        original_expiry = claimed["leaseExpiresAt"]
-        self.clock.value += 4
-        renewed = self.queue.renew(
-            queued["intentId"], claimed["leaseToken"], lease_seconds=30
-        )
-        self.assertGreater(renewed["leaseExpiresAt"], original_expiry)
-        with self.assertRaisesRegex(
-            ai_context.ContextProtocolError, "token does not match"
-        ):
-            self.queue.renew(queued["intentId"], "wrong-token", 30)
-        self.clock.value = renewed["leaseExpiresAt"] + 1
-        with self.assertRaisesRegex(
-            ai_context.ContextProtocolError, "does not have a live claim"
-        ):
-            self.queue.renew(
-                queued["intentId"], claimed["leaseToken"], lease_seconds=30
-            )
-
-    def test_capture_change_cancels_stale_unprocessed_intents(self):
-        queued = self.queue.enqueue(ai_context.INTENT_INSPECT_PIXEL, self.context)
-        cancelled = self.queue.cancel_for_capture_change("c" * 32)
-        self.assertEqual(cancelled, 1)
-        status = self.queue.status(queued["intentId"])
-        self.assertEqual(status["state"], "cancelled")
-        self.assertEqual(status["outcomeSummary"], "capture session changed")
-
-    def test_bounded_queue_never_drops_live_work(self):
-        queue = ai_context.IntentQueue(
-            maximum=1, clock=self.clock, id_factory=self.ids
-        )
-        queue.enqueue(ai_context.INTENT_EXPLAIN_EVENT, self.context)
-        with self.assertRaisesRegex(ai_context.ContextProtocolError, "queue is full"):
-            queue.enqueue(ai_context.INTENT_INSPECT_PIXEL, self.context)
-
-    def test_completed_tombstone_can_be_evicted_for_new_work(self):
-        queue = ai_context.IntentQueue(
-            maximum=1, clock=self.clock, id_factory=self.ids
-        )
-        old = queue.enqueue(ai_context.INTENT_EXPLAIN_EVENT, self.context)
-        claim = queue.claim("companion", lease_seconds=30)["intents"][0]
-        queue.complete(old["intentId"], claim["leaseToken"], "completed")
-        new = queue.enqueue(ai_context.INTENT_INSPECT_PIXEL, self.context)
-        self.assertNotEqual(old["intentId"], new["intentId"])
-        with self.assertRaisesRegex(ai_context.ContextProtocolError, "unknown intent"):
-            queue.status(old["intentId"])
 
 
 class SourceBoundaryTests(unittest.TestCase):
@@ -319,7 +166,7 @@ class SourceBoundaryTests(unittest.TestCase):
                 feature_version=(3, 6),
             )
 
-    def test_mcp_exposes_context_claim_renew_complete_but_not_enqueue(self):
+    def test_external_mcp_exposes_context_but_not_internal_intent_queue(self):
         server_path = REPOSITORY / "mcp_host" / "src" / "server.py"
         tree = ast.parse(server_path.read_text(encoding="utf-8"))
         tools = {
@@ -333,16 +180,62 @@ class SourceBoundaryTests(unittest.TestCase):
                 for decorator in node.decorator_list
             )
         }
+        self.assertIn("get_current_renderdoc_context", tools)
         self.assertTrue(
             {
-                "get_current_renderdoc_context",
+                "enqueue_renderdoc_ui_intent",
                 "claim_renderdoc_ui_intents",
                 "renew_renderdoc_ui_intent",
                 "complete_renderdoc_ui_intent",
                 "get_renderdoc_ui_intent_status",
-            }.issubset(tools)
+            }.isdisjoint(tools)
         )
-        self.assertNotIn("enqueue_renderdoc_ui_intent", tools)
+
+    def test_qrenderdoc_buttons_start_direct_tasks_without_external_intent_queue(self):
+        source_root = REPOSITORY.parent
+        assistant = (
+            source_root / "qrenderdoc" / "Windows" / "AI" / "AIAssistant.cpp"
+        ).read_text(encoding="utf-8")
+        integration = (
+            source_root / "qrenderdoc" / "Code" / "ReplayLab" /
+            "ReplayLabIntegration.cpp"
+        ).read_text(encoding="utf-8")
+        combined = assistant + "\n" + integration
+        for marker in (
+            "QueueIntent(",
+            "queueNativeIntent",
+            "enqueue_native_intent",
+            "claim_renderdoc_ui_intents",
+            "Codex Desktop",
+        ):
+            self.assertNotIn(marker, combined)
+        self.assertIn("StartCaptureSkill(", assistant)
+        self.assertIn('lit("codex-app-server")', assistant)
+        self.assertIn("CurrentContextJSON", integration)
+
+    def test_editing_queued_clarification_rebinds_context_and_drops_option_claims(self):
+        source_root = REPOSITORY.parent
+        assistant = (
+            source_root / "qrenderdoc" / "Windows" / "AI" / "AIAssistant.cpp"
+        ).read_text(encoding="utf-8")
+        start = assistant.index("void AIAssistant::editQueuedChat")
+        end = assistant.index("void AIAssistant::deleteQueuedChat", start)
+        edit = assistant[start:end]
+
+        self.assertIn("updated.clarificationResponse.optionIds.clear();", edit)
+        self.assertIn("updated.clarificationResponse.otherText = edited;", edit)
+        self.assertIn(
+            "updated.clarificationResponse.currentContextSnapshot = updated.contextSnapshot;",
+            edit,
+        )
+        self.assertIn(
+            "updated.clarificationResponse.currentContextInstanceId = updated.contextInstanceId;",
+            edit,
+        )
+        self.assertLess(
+            edit.index("freezeChatContext(updated"),
+            edit.index("currentContextSnapshot = updated.contextSnapshot"),
+        )
 
 
 class _ResourceId(object):
@@ -537,39 +430,25 @@ class BridgeContextContractTests(unittest.TestCase):
         self.assertEqual(clicked["shaders"]["focused"]["resourceId"], 902)
         self.assertTrue(clicked["shaders"]["focusIsExplicit"])
 
-    def test_bridge_exposes_claim_renew_complete_but_no_enqueue_rpc(self):
+    def test_bridge_exposes_context_without_legacy_intent_queue(self):
         self.assertIn("get_current_renderdoc_context", self.bridge.METHODS)
-        self.assertIn("claim_renderdoc_ui_intents", self.bridge.METHODS)
-        self.assertIn("renew_renderdoc_ui_intent", self.bridge.METHODS)
-        self.assertIn("complete_renderdoc_ui_intent", self.bridge.METHODS)
-        self.assertNotIn("enqueue_renderdoc_ui_intent", self.bridge.METHODS)
+        self.assertTrue(
+            {
+                "enqueue_renderdoc_ui_intent",
+                "claim_renderdoc_ui_intents",
+                "renew_renderdoc_ui_intent",
+                "complete_renderdoc_ui_intent",
+                "get_renderdoc_ui_intent_status",
+            }.isdisjoint(self.bridge.METHODS)
+        )
 
-    def test_native_integration_exposes_bound_stages_and_typed_intents(self):
+    def test_native_integration_exposes_bound_stages_and_direct_context(self):
         self.assertEqual(
             self.bridge.available_native_shader_stages(), "vertex,fragment"
         )
-
-        explain_id = self.bridge.enqueue_native_intent("explain-current-event")
-        explain = self.bridge._ai_intent_queue.status(explain_id)
-        self.assertEqual(explain["kind"], "explain-current-event")
-        self.assertEqual(explain["origin"], "renderdoc-ui")
-        self.assertEqual(explain["arguments"]["eventId"], 142)
-        self.assertIsNone(explain["context"]["shaders"]["focused"])
-
-        shader_id = self.bridge.enqueue_native_intent(
-            "reverse-edit-selected-shader", "fragment"
-        )
-        shader = self.bridge._ai_intent_queue.status(shader_id)
-        self.assertEqual(shader["kind"], "reverse-edit-selected-shader")
-        self.assertEqual(shader["arguments"]["stage"], "fragment")
-        self.assertEqual(shader["arguments"]["shaderResourceId"], 902)
-        self.assertTrue(shader["context"]["shaders"]["focusIsExplicit"])
-
-        pixel_id = self.bridge.enqueue_native_intent("inspect-picked-pixel")
-        pixel = self.bridge._ai_intent_queue.status(pixel_id)
-        self.assertEqual(pixel["kind"], "inspect-picked-pixel")
-        self.assertEqual(pixel["arguments"]["textureResourceId"], 444)
-        self.assertEqual(pixel["arguments"]["pixel"], {"x": 320, "y": 180})
+        context = json.loads(self.bridge.current_native_context_json("fragment"))
+        self.assertEqual(context["shaders"]["focused"]["resourceId"], 902)
+        self.assertTrue(context["shaders"]["focusIsExplicit"])
 
 
 if __name__ == "__main__":

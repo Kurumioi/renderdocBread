@@ -13,7 +13,7 @@ import inspect
 import json
 import os
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,10 +24,14 @@ from ..errors import AuthenticationError, ConfigurationError, ConnectorError, Po
 DeltaCallback = Callable[[str], Any]
 ActivityCallback = Callable[[str, float], Any]
 TimelineCallback = Callable[[Mapping[str, Any]], Any]
+DynamicToolHandler = Callable[[str, dict[str, Any], str], Awaitable[Any]]
+ServerRequestHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 _MAX_JSONL_MESSAGE_BYTES = 4 * 1024 * 1024
 MAX_EXTERNAL_RESPONSE_CHARS = 1024 * 1024
 MAX_EXTERNAL_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_NOTIFICATION_QUEUE = 256
+_MAX_SERVER_REQUEST_TASKS = 16
+_MAX_DYNAMIC_TOOL_CALLS = 1024
 _MAX_TIMELINE_ITEMS = 128
 _MAX_TIMELINE_ID_CHARS = 256
 _MAX_TIMELINE_TEXT_CHARS = 4096
@@ -62,6 +66,71 @@ _SENSITIVE_KEY_RE = re.compile(_SENSITIVE_NAME, re.IGNORECASE)
 _TOKEN_SHAPE_RE = re.compile(
     r"(?i)\b(?:sk|rk|pk|ghp|github_pat|xox[baprs])-[_A-Za-z0-9-]{8,}\b"
 )
+_DYNAMIC_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_DYNAMIC_TOOL_SPEC_KEYS = frozenset(
+    {"type", "name", "description", "inputSchema", "deferLoading"}
+)
+_TOOL_PHASE_IDLE = "idle"
+_TOOL_PHASE_STARTING = "starting"
+_TOOL_PHASE_RUNNING = "running"
+_TOOL_PHASE_CLOSING = "closing"
+
+
+def _valid_request_id(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return -(2**63) <= value < 2**63
+    return isinstance(value, str)
+
+
+def _validated_dynamic_tool_specs(
+    values: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Return a detached, JSON-safe function-only dynamic-tool inventory."""
+
+    result: list[dict[str, Any]] = []
+    for raw in values:
+        if not isinstance(raw, Mapping) or any(not isinstance(key, str) for key in raw):
+            raise ConfigurationError("Codex dynamic tool definitions must be JSON objects")
+        unexpected = set(raw) - _DYNAMIC_TOOL_SPEC_KEYS
+        if unexpected:
+            raise ConfigurationError(
+                "Codex dynamic tool definition contains unsupported fields: "
+                + ", ".join(sorted(unexpected))
+            )
+        if raw.get("type") != "function":
+            raise ConfigurationError(
+                "ReplayLab supports only top-level Codex function dynamic tools"
+            )
+        name = raw.get("name")
+        description = raw.get("description")
+        input_schema = raw.get("inputSchema")
+        if not isinstance(name, str) or _DYNAMIC_TOOL_NAME_RE.fullmatch(name) is None:
+            raise ConfigurationError("Codex dynamic tool name is invalid")
+        if not isinstance(description, str) or "\0" in description:
+            raise ConfigurationError("Codex dynamic tool description must be a string")
+        if not isinstance(input_schema, dict) or input_schema.get("type") != "object":
+            raise ConfigurationError(
+                "Codex dynamic tool inputSchema must describe an object"
+            )
+        if "deferLoading" in raw and not isinstance(raw["deferLoading"], bool):
+            raise ConfigurationError("Codex dynamic tool deferLoading must be boolean")
+        try:
+            encoded = json.dumps(
+                dict(raw),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            normalized = json.loads(encoded)
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            raise ConfigurationError("Codex dynamic tool definition is not strict JSON") from exc
+        if len(encoded.encode("utf-8")) > _MAX_JSONL_MESSAGE_BYTES:
+            raise ConfigurationError("Codex dynamic tool definition exceeds the JSONL bound")
+        result.append(normalized)
+    return tuple(result)
 
 
 def checked_response_size(text: str, chars: int = 0, encoded_bytes: int = 0) -> tuple[int, int]:
@@ -545,10 +614,12 @@ class _JsonlProcess:
         *,
         cwd: Path,
         env: Mapping[str, str] | None,
+        server_request_handler: ServerRequestHandler | None = None,
     ) -> None:
         self.command = command
         self.cwd = cwd
         self.env = dict(env) if env is not None else None
+        self.server_request_handler = server_request_handler
         self.process: asyncio.subprocess.Process | None = None
         self.notifications: asyncio.Queue[dict[str, Any] | _TransportClosed | _DeniedServerRequest] = (
             asyncio.Queue(maxsize=_MAX_NOTIFICATION_QUEUE)
@@ -558,6 +629,7 @@ class _JsonlProcess:
         self._write_lock = asyncio.Lock()
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        self._server_request_tasks: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
         if self.process is not None and self.process.returncode is None:
@@ -676,7 +748,15 @@ class _JsonlProcess:
         process = self.process
         if process is None or process.returncode is not None or process.stdin is None:
             raise ConnectorError("Codex app-server is not running")
-        encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
+        encoded = (
+            json.dumps(
+                message,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        )
         payload = encoded.encode("utf-8")
         if len(payload) > _MAX_JSONL_MESSAGE_BYTES:
             raise ConnectorError("Codex app-server request exceeds the 4 MiB JSONL bound")
@@ -717,11 +797,33 @@ class _JsonlProcess:
                     failure = ConnectorError("Codex app-server emitted a non-object JSONL message")
                     break
                 if "method" in message and "id" in message:
-                    await self._deny_server_request(message)
+                    method = message.get("method")
+                    if not isinstance(method, str) or not method or not _valid_request_id(
+                        message.get("id")
+                    ):
+                        failure = ConnectorError(
+                            "Codex app-server emitted an invalid server-request envelope"
+                        )
+                        break
+                    if len(self._server_request_tasks) >= _MAX_SERVER_REQUEST_TASKS:
+                        failure = ConnectorError(
+                            "Codex app-server exceeded the concurrent server-request bound"
+                        )
+                        break
+                    task = asyncio.create_task(
+                        self._handle_server_request(message),
+                        name="replaylab-codex-server-request",
+                    )
+                    self._server_request_tasks.add(task)
+                    task.add_done_callback(self._server_request_finished)
+                    # Let the task perform its initial policy checks before the
+                    # reader consumes a later terminal notification. It remains
+                    # independent as soon as it reaches real tool work or I/O.
+                    await asyncio.sleep(0)
                     continue
                 if "id" in message:
                     request_id = message.get("id")
-                    future = self._pending.get(request_id) if isinstance(request_id, int) else None
+                    future = self._pending.get(request_id) if type(request_id) is int else None
                     if future is not None and not future.done():
                         future.set_result(message)
                     continue
@@ -741,22 +843,100 @@ class _JsonlProcess:
             for future in tuple(self._pending.values()):
                 if not future.done():
                     future.set_exception(failure)
-            marker = _TransportClosed(failure)
-            try:
-                self.notifications.put_nowait(marker)
-            except asyncio.QueueFull:
-                # A cancelled consumer may leave the bounded queue full. Preserve termination
-                # without letting close() hang forever on a marker nobody can drain.
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    self.notifications.get_nowait()
-                with contextlib.suppress(asyncio.QueueFull):
-                    self.notifications.put_nowait(marker)
+            self._put_priority_notification(_TransportClosed(failure))
 
-    async def _deny_server_request(self, message: dict[str, Any]) -> None:
-        """Answer every server-initiated request without granting authority."""
+    def _put_priority_notification(
+        self, value: _TransportClosed | _DeniedServerRequest
+    ) -> None:
+        """Queue a terminal marker without allowing a full activity queue to hide it."""
 
-        method = str(message.get("method", ""))
+        try:
+            self.notifications.put_nowait(value)
+        except asyncio.QueueFull:
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self.notifications.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                self.notifications.put_nowait(value)
+
+    def _server_request_finished(self, task: asyncio.Task[None]) -> None:
+        self._server_request_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except (asyncio.CancelledError, Exception):
+            return
+        if error is None:
+            return
+        failure = ConnectorError(
+            "Codex app-server server-request handler failed: "
+            + _redact_timeline_text(type(error).__name__, limit=128)
+        )
+        for future in tuple(self._pending.values()):
+            if not future.done():
+                future.set_exception(failure)
+        self._put_priority_notification(_TransportClosed(failure))
+
+    async def _handle_server_request(self, message: dict[str, Any]) -> None:
+        """Handle the one host-owned tool callback and deny every other request."""
+
+        method = message.get("method")
         request_id = message.get("id")
+        if not isinstance(method, str) or not method or not _valid_request_id(request_id):
+            raise ConnectorError("Codex app-server emitted an invalid server-request envelope")
+        if method == "item/tool/call" and self.server_request_handler is not None:
+            params = message.get("params")
+            if not isinstance(params, dict):
+                denial = _DeniedServerRequest(
+                    PolicyError("Codex sent malformed dynamic tool parameters")
+                )
+                self._put_priority_notification(denial)
+                await asyncio.wait_for(
+                    self._send(
+                        {
+                            "id": request_id,
+                            "error": {
+                                "code": -32602,
+                                "message": "invalid dynamic tool request",
+                            },
+                        }
+                    ),
+                    timeout=5.0,
+                )
+                return
+            try:
+                result = await self.server_request_handler(method, params)
+            except PolicyError as exc:
+                self._put_priority_notification(_DeniedServerRequest(exc))
+                await asyncio.wait_for(
+                    self._send(
+                        {
+                            "id": request_id,
+                            "error": {"code": -32602, "message": "dynamic tool denied"},
+                        }
+                    ),
+                    timeout=5.0,
+                )
+                return
+            except Exception as exc:
+                failure = _redact_timeline_text(type(exc).__name__, limit=128)
+                result = {
+                    "success": False,
+                    "contentItems": [
+                        {
+                            "type": "inputText",
+                            "text": json.dumps(
+                                {"error": "internal RenderDoc tool failed", "type": failure},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        }
+                    ],
+                }
+            await asyncio.wait_for(
+                self._send({"id": request_id, "result": result}), timeout=5.0
+            )
+            return
         if method in {
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
@@ -780,8 +960,7 @@ class _JsonlProcess:
                     "message": "ReplayLab does not permit server-initiated interaction",
                 },
             }
-        await asyncio.wait_for(self._send(response), timeout=5.0)
-        await self.notifications.put(
+        self._put_priority_notification(
             _DeniedServerRequest(
                 PolicyError(
                     f"Codex requested '{method}', but the headless ReplayLab connector "
@@ -789,6 +968,7 @@ class _JsonlProcess:
                 )
             )
         )
+        await asyncio.wait_for(self._send(response), timeout=5.0)
 
     async def _discard_stderr(self) -> None:
         # Drain diagnostics to prevent a full pipe from blocking the process.  Do
@@ -834,6 +1014,12 @@ class _JsonlProcess:
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
+        server_request_tasks = tuple(self._server_request_tasks)
+        for task in server_request_tasks:
+            task.cancel()
+        if server_request_tasks:
+            await asyncio.gather(*server_request_tasks, return_exceptions=True)
+        self._server_request_tasks.clear()
         # asyncio.subprocess does not expose a public transport close method.
         # Closing the private BaseSubprocessTransport while the loop is alive is
         # the only reliable cleanup for Python 3.10's Windows Proactor loop.
@@ -857,6 +1043,8 @@ class CodexAppServerConnector:
         cwd: Path | str | None = None,
         readable_roots: Sequence[Path | str] | None = None,
         expected_tools: set[str] | frozenset[str] = frozenset(),
+        dynamic_tools: Sequence[Mapping[str, Any]] = (),
+        dynamic_tool_handler: DynamicToolHandler | None = None,
         timeout: float = 300.0,
         heartbeat_interval: float = 10.0,
         env: Mapping[str, str] | None = None,
@@ -880,11 +1068,30 @@ class CodexAppServerConnector:
         if self.cwd not in resolved_roots:
             resolved_roots.insert(0, self.cwd)
         self.readable_roots = tuple(resolved_roots)
-        self.expected_tools = frozenset(
-            str(value).strip() for value in expected_tools if str(value).strip()
+        if any(not isinstance(value, str) for value in expected_tools):
+            raise ConfigurationError("Codex expected tool names must be strings")
+        self.expected_tools = frozenset(value for value in expected_tools)
+        if any(
+            _DYNAMIC_TOOL_NAME_RE.fullmatch(value) is None for value in self.expected_tools
+        ):
+            raise ConfigurationError("Codex expected tool name is invalid")
+        self.dynamic_tools = _validated_dynamic_tool_specs(dynamic_tools)
+        dynamic_names = frozenset(
+            str(value.get("name", "")).strip() for value in self.dynamic_tools
         )
-        if any("\0" in value for value in self.expected_tools):
-            raise ConfigurationError("Codex expected tool names contain an invalid NUL")
+        if (
+            len(dynamic_names) != len(self.dynamic_tools)
+            or "" in dynamic_names
+            or dynamic_names != self.expected_tools
+        ):
+            raise ConfigurationError(
+                "Codex dynamic tool definitions must exactly match the active grant"
+            )
+        if dynamic_tool_handler is not None and not callable(dynamic_tool_handler):
+            raise ConfigurationError("Codex internal tool handler must be callable")
+        if self.expected_tools and dynamic_tool_handler is None:
+            raise ConfigurationError("Codex capture tools require an internal tool handler")
+        self.dynamic_tool_handler = dynamic_tool_handler
         if timeout <= 0:
             raise ConfigurationError("Codex app-server timeout must be positive")
         self.timeout = float(timeout)
@@ -893,7 +1100,17 @@ class CodexAppServerConnector:
                 "Codex app-server heartbeat interval must be between 0 and 60 seconds"
             )
         self.heartbeat_interval = float(heartbeat_interval)
-        self._transport = _JsonlProcess(self.command, cwd=self.cwd, env=env)
+        self._active_thread_id = ""
+        self._active_turn_id = ""
+        self._tool_phase = _TOOL_PHASE_IDLE
+        self._seen_dynamic_call_ids: set[str] = set()
+        self._turn_ready = asyncio.Event()
+        self._transport = _JsonlProcess(
+            self.command,
+            cwd=self.cwd,
+            env=env,
+            server_request_handler=self._handle_server_request,
+        )
         self._initialized = False
         self._run_lock = asyncio.Lock()
         # App-server releases have used two serialisations for ThreadStart's
@@ -912,21 +1129,115 @@ class CodexAppServerConnector:
         await self.close()
 
     async def close(self) -> None:
+        self._tool_phase = _TOOL_PHASE_CLOSING
+        # Wake a tool request that arrived while turn/start was still resolving.
+        # It will observe the closing phase and fail without touching RenderDoc.
+        self._turn_ready.set()
         await self._transport.close()
         self._initialized = False
+        self._active_thread_id = ""
+        self._active_turn_id = ""
+        self._seen_dynamic_call_ids.clear()
+        self._tool_phase = _TOOL_PHASE_IDLE
+        self._turn_ready.clear()
+
+    async def _handle_server_request(
+        self, method: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        if method != "item/tool/call" or self.dynamic_tool_handler is None:
+            raise PolicyError(f"Codex requested unsupported host interaction '{method}'")
+        if self._tool_phase == _TOOL_PHASE_STARTING:
+            try:
+                await asyncio.wait_for(self._turn_ready.wait(), timeout=5.0)
+            except asyncio.TimeoutError as exc:
+                raise PolicyError("Codex requested a dynamic tool before the turn was ready") from exc
+        if self._tool_phase != _TOOL_PHASE_RUNNING:
+            raise PolicyError("Codex requested a dynamic tool outside an active turn")
+        required = ("threadId", "turnId", "callId", "tool", "arguments")
+        if any(key not in params for key in required):
+            raise PolicyError("Codex dynamic tool call omitted required fields")
+        thread_id = params["threadId"]
+        turn_id = params["turnId"]
+        call_id = params["callId"]
+        tool = params["tool"]
+        namespace = params.get("namespace")
+        arguments = params["arguments"]
+        if (
+            not isinstance(thread_id, str)
+            or not isinstance(turn_id, str)
+            or not isinstance(call_id, str)
+            or not isinstance(tool, str)
+            or thread_id != self._active_thread_id
+            or turn_id != self._active_turn_id
+            or not call_id
+            or len(call_id) > 256
+            or namespace is not None
+            or tool not in self.expected_tools
+        ):
+            raise PolicyError("Codex dynamic tool call did not match the active turn grant")
+        if call_id in self._seen_dynamic_call_ids:
+            raise PolicyError("Codex repeated a dynamic tool call id")
+        if len(self._seen_dynamic_call_ids) >= _MAX_DYNAMIC_TOOL_CALLS:
+            raise PolicyError("Codex exceeded the dynamic tool-call bound")
+        self._seen_dynamic_call_ids.add(call_id)
+        if not isinstance(arguments, dict):
+            return self._dynamic_tool_failure("ToolInputError")
+        try:
+            value = await self.dynamic_tool_handler(tool, arguments, call_id)
+        except Exception as exc:
+            return self._dynamic_tool_failure(type(exc).__name__)
+        try:
+            text = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            return self._dynamic_tool_failure(type(exc).__name__)
+        if len(text) > MAX_EXTERNAL_RESPONSE_CHARS or len(text.encode("utf-8")) > 3 * 1024 * 1024:
+            return self._dynamic_tool_failure("ResultTooLarge")
+        return {
+            "success": True,
+            "contentItems": [{"type": "inputText", "text": text}],
+        }
+
+    @staticmethod
+    def _dynamic_tool_failure(error_type: str) -> dict[str, Any]:
+        failure = _redact_timeline_text(error_type, limit=128) or "ToolError"
+        return {
+            "success": False,
+            "contentItems": [
+                {
+                    "type": "inputText",
+                    "text": json.dumps(
+                        {"error": "internal RenderDoc tool failed", "type": failure},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ),
+                }
+            ],
+        }
 
     async def _initialize(self) -> None:
         if self._initialized:
             return
+        params: dict[str, Any] = {
+            "clientInfo": {
+                "name": "replaylab",
+                "title": "ReplayLab for RenderDoc",
+                "version": __version__,
+            }
+        }
+        if self.dynamic_tools:
+            # Codex app-server gates thread/start.dynamicTools behind this
+            # capability. General-help turns do not opt into the experimental API.
+            params["capabilities"] = {"experimentalApi": True}
         await self._transport.request(
             "initialize",
-            {
-                "clientInfo": {
-                    "name": "replaylab",
-                    "title": "ReplayLab for RenderDoc",
-                    "version": __version__,
-                }
-            },
+            params,
             timeout=min(self.timeout, 30.0),
         )
         await self._transport.notify("initialized", {})
@@ -1187,13 +1498,17 @@ class CodexAppServerConnector:
                     "serviceName": "replaylab",
                     "ephemeral": True,
                 }
+                if self.dynamic_tools:
+                    thread_params["dynamicTools"] = list(self.dynamic_tools)
                 if model:
                     thread_params["model"] = model
                 thread_result = await self._start_thread(thread_params)
                 thread = thread_result.get("thread")
-                thread_id = str(thread.get("id", "")) if isinstance(thread, dict) else ""
-                if not thread_id:
+                raw_thread_id = thread.get("id") if isinstance(thread, dict) else None
+                if not isinstance(raw_thread_id, str) or not raw_thread_id:
                     raise ConnectorError("Codex app-server thread/start returned no thread id")
+                thread_id = raw_thread_id
+                self._active_thread_id = thread_id
                 instruction_sources: list[Any] = []
                 if isinstance(thread, dict):
                     raw_sources = thread.get("instructionSources", [])
@@ -1240,11 +1555,26 @@ class CodexAppServerConnector:
                 }
                 if model:
                     turn_params["model"] = model
-                turn_result = await self._start_turn(turn_params)
+                self._active_turn_id = ""
+                self._seen_dynamic_call_ids.clear()
+                self._tool_phase = _TOOL_PHASE_STARTING
+                self._turn_ready.clear()
+                try:
+                    turn_result = await self._start_turn(turn_params)
+                except BaseException:
+                    self._tool_phase = _TOOL_PHASE_CLOSING
+                    self._turn_ready.set()
+                    raise
                 turn = turn_result.get("turn")
-                turn_id = str(turn.get("id", "")) if isinstance(turn, dict) else ""
-                if not turn_id:
+                raw_turn_id = turn.get("id") if isinstance(turn, dict) else None
+                if not isinstance(raw_turn_id, str) or not raw_turn_id:
+                    self._tool_phase = _TOOL_PHASE_CLOSING
+                    self._turn_ready.set()
                     raise ConnectorError("Codex app-server turn/start returned no turn id")
+                turn_id = raw_turn_id
+                self._active_turn_id = turn_id
+                self._tool_phase = _TOOL_PHASE_RUNNING
+                self._turn_ready.set()
 
                 try:
                     answer = await self._collect_turn(
@@ -1255,6 +1585,8 @@ class CodexAppServerConnector:
                         on_timeline=on_timeline,
                     )
                 except BaseException:
+                    self._tool_phase = _TOOL_PHASE_CLOSING
+                    self._turn_ready.set()
                     with contextlib.suppress(Exception):
                         await self._transport.request(
                             "turn/interrupt",
@@ -1262,6 +1594,9 @@ class CodexAppServerConnector:
                             timeout=2.0,
                         )
                     raise
+                finally:
+                    self._tool_phase = _TOOL_PHASE_CLOSING
+                    self._turn_ready.set()
                 return ExternalAgentResult(
                     text=answer,
                     backend="codex-app-server",
@@ -1374,27 +1709,10 @@ class CodexAppServerConnector:
             cursor = next_cursor
         else:
             raise ConnectorError("Codex MCP inventory exceeded the pagination safety bound")
-        if set(entries) != {"replaylab"}:
+        if entries:
             raise PolicyError(
-                "Codex tool isolation requires exactly the 'replaylab' MCP server; observed: "
-                + (", ".join(sorted(entries)) if entries else "none")
-            )
-        replaylab = entries["replaylab"]
-        server_info = replaylab.get("serverInfo")
-        tools = replaylab.get("tools")
-        if (
-            not isinstance(server_info, dict)
-            or server_info.get("name") != "replaylab-skill-filter"
-            or not isinstance(tools, dict)
-        ):
-            raise PolicyError(
-                "the 'replaylab' Codex MCP entry is not the filtered ReplayLab proxy"
-            )
-        observed_tools = frozenset(str(name) for name in tools)
-        if observed_tools != self.expected_tools:
-            raise PolicyError(
-                "Codex ReplayLab tool inventory does not match the active grant; "
-                f"expected {len(self.expected_tools)}, observed {len(observed_tools)}"
+                "Codex ReplayLab threads must not load MCP servers; observed: "
+                + ", ".join(sorted(entries))
             )
 
         installed = await self._transport.request(

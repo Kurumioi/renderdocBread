@@ -1,8 +1,8 @@
-"""Direct client for replaylab_bridge protocol v2.
+"""Direct client for the bundled qrenderdoc bridge protocol v2.
 
-The in-process Agent uses this client for queue ownership and lifecycle calls.
-LLM-visible GPU operations still go through ReplayLabMCP so its typed schemas
-remain the single public tool contract.
+The internal AgentHost uses this transport through its controlled ToolService.
+ReplayLabMCP is a separate external adapter for IDEs and other out-of-process
+clients; it is not part of the internal model-to-RenderDoc call path.
 """
 
 from __future__ import annotations
@@ -221,58 +221,3 @@ class BridgeClient:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
-
-    def claim_intents(
-        self,
-        consumer_id: str,
-        *,
-        maximum: int = 1,
-        lease_seconds: int = 120,
-        instance_id: str = "",
-    ) -> list[dict[str, Any]]:
-        value = self.call(
-            "claim_renderdoc_ui_intents",
-            {
-                "consumer_id": consumer_id,
-                "max_count": maximum,
-                "lease_seconds": lease_seconds,
-            },
-            instance_id=instance_id,
-        )
-        return list((value or {}).get("intents", []))
-
-    def renew_intent(
-        self,
-        intent: dict[str, Any],
-        lease_seconds: int = 120,
-        *,
-        instance_id: str = "",
-    ) -> dict[str, Any]:
-        return self.call(
-            "renew_renderdoc_ui_intent",
-            {
-                "intent_id": intent["intentId"],
-                "lease_token": intent["leaseToken"],
-                "lease_seconds": lease_seconds,
-            },
-            instance_id=instance_id,
-        )
-
-    def complete_intent(
-        self,
-        intent: dict[str, Any],
-        *,
-        outcome: str,
-        summary: str,
-        instance_id: str = "",
-    ) -> dict[str, Any]:
-        return self.call(
-            "complete_renderdoc_ui_intent",
-            {
-                "intent_id": intent["intentId"],
-                "lease_token": intent["leaseToken"],
-                "outcome": outcome,
-                "summary": summary[:4096],
-            },
-            instance_id=instance_id,
-        )

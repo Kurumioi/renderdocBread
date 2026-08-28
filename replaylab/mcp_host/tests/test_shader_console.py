@@ -43,6 +43,7 @@ class ShaderConsoleFixture:
         self.source.parent.mkdir(parents=True)
         (self.workspace / "watch").mkdir()
         (self.workspace / "live-edit").mkdir()
+        (self.workspace / "ai").mkdir()
         self.source.write_text("float4 MainPS() : SV_Target\n{\n  return 1;\n}\n", encoding="utf-8")
         self._write(
             self.workspace / "manifest.json",
@@ -57,7 +58,12 @@ class ShaderConsoleFixture:
                     "entryPoint": "MainPS",
                     "resourceId": 101,
                 },
-                "source": {"path": "source/shader.hlsl"},
+                "source": {
+                    "path": "source/shader.hlsl",
+                    "encoding": "utf-8",
+                    "lane": "executable-editable",
+                    "compileEligible": True,
+                },
             },
         )
         self._write(
@@ -70,10 +76,26 @@ class ShaderConsoleFixture:
                         "authorizationId": self.AUTHORIZATION_ID,
                         "lastLiveEditId": self.LIVE_ID,
                         "workspacePath": str(self.workspace.resolve()),
+                        "workspaceIdentitySha256": console._canonical_sha256(
+                            {
+                                "workspaceId": self.WORKSPACE_ID,
+                                "captureId": self.CAPTURE_ID,
+                                "capturePath": "C:/captures/test.rdc",
+                                "shaderKey": "fragment:101:MainPS",
+                                "shaderRawSha256": self.RAW_SHA256,
+                                "stage": "fragment",
+                                "entryPoint": "MainPS",
+                                "resourceId": 101,
+                            }
+                        ),
+                        "debounceMs": 100,
+                        "authorizedAt": "2026-08-25T04:00:00Z",
                         "updatedAt": "2026-08-25T04:00:00Z",
                         "workspaceIdentity": {
                             "workspaceId": self.WORKSPACE_ID,
                             "captureId": self.CAPTURE_ID,
+                            "capturePath": "C:/captures/test.rdc",
+                            "shaderKey": "fragment:101:MainPS",
                             "shaderRawSha256": self.RAW_SHA256,
                             "stage": "fragment",
                             "entryPoint": "MainPS",
@@ -83,12 +105,68 @@ class ShaderConsoleFixture:
                 ],
             },
         )
+        self._write(
+            self.workspace / "ai" / "organize-code-gate.json",
+            {
+                "schema": console.ORGANIZATION_GATE_SCHEMA,
+                "schemaVersion": 1,
+                "policyVersion": console.ORGANIZATION_POLICY_VERSION,
+                "organizationId": "1" * 32,
+                "reviewedAt": "2026-08-25T04:00:00Z",
+                "requestedTransformation": "organize-only",
+                "workspaceId": self.WORKSPACE_ID,
+                "captureId": self.CAPTURE_ID,
+                "stage": "fragment",
+                "entryPoint": "MainPS",
+                "baselineSourceSha256": console.hashlib.sha256(
+                    self.source.read_bytes()
+                ).hexdigest(),
+                "proposalSourceSha256": console.hashlib.sha256(
+                    self.source.read_bytes()
+                ).hexdigest(),
+                "baselineCodeSha256": "2" * 64,
+                "organizedCodeSha256": "2" * 64,
+                "decision": "accepted-executable-editable",
+                "codeSha256Equal": True,
+                "organizedSourcePromoted": True,
+                "baselineCompiledAndAbiValidated": True,
+                "organizedCompiledAndAbiValidated": True,
+                "safeToStartLiveEdit": True,
+                "replayApplied": False,
+                "executableEditableSourcePath": "source/shader.hlsl",
+                "finalSourceSha256": console.hashlib.sha256(
+                    self.source.read_bytes()
+                ).hexdigest(),
+                "finalBinding": {
+                    "complete": True,
+                    "sourceSha256": console.hashlib.sha256(
+                        self.source.read_bytes()
+                    ).hexdigest(),
+                    "revision": 7,
+                    "candidateRawSha256": "3" * 64,
+                    "codeSha256": "2" * 64,
+                    "abiRequestId": "4" * 64,
+                    "abiReportSha256": "5" * 64,
+                },
+                "finalRevision": 7,
+                "finalCandidateRawSha256": "3" * 64,
+                "finalCodeSha256": "2" * 64,
+                "finalAbiRequestId": "4" * 64,
+                "finalAbiReportSha256": "5" * 64,
+            },
+        )
 
     @staticmethod
     def _write(path: Path, value: dict) -> None:
         path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
 
     def write_watch(self, events=None, **changes):
+        current_sha256 = console.hashlib.sha256(self.source.read_bytes()).hexdigest()
+        gate = json.loads(
+            (self.workspace / "ai" / "organize-code-gate.json").read_text(
+                encoding="utf-8"
+            )
+        )
         value = {
             "schema": console.WATCH_SCHEMA,
             "schemaVersion": 1,
@@ -99,6 +177,10 @@ class ShaderConsoleFixture:
             "compileInProgress": False,
             "pending": False,
             "caughtUp": True,
+            "initialSourceSha256": gate["finalSourceSha256"],
+            "observedSourceSha256": current_sha256,
+            "lastAttemptedSourceSha256": current_sha256,
+            "lastCompiledSourceSha256": current_sha256,
             "latestCandidateRevision": 2,
             "compileAttempts": 1,
             "compileSuccesses": 1,
@@ -725,6 +807,131 @@ class ShaderConsoleLogicTests(unittest.TestCase):
             self.assertEqual(snapshot["workspaces"], [])
             self.assertTrue(any("identity" in error for error in snapshot["errors"]))
 
+    def test_authorized_hlsl_document_loads_only_the_organized_lane(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            opened = console.load_authorized_source_document(
+                str(fixture.registry), fixture.AUTHORIZATION_ID, fixture.WORKSPACE_ID
+            )
+            self.assertEqual(Path(opened["sourcePath"]), fixture.source.resolve())
+            self.assertEqual(opened["entryPoint"], "MainPS")
+            self.assertIn("return 1", opened["text"])
+
+    def test_embedded_process_direct_save_path_is_disabled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            before = fixture.source.read_bytes()
+            with self.assertRaisesRegex(console.ShaderConsoleError, "running ReplayLab Host"):
+                console.save_authorized_source_document(
+                    str(fixture.registry), fixture.AUTHORIZATION_ID,
+                    fixture.WORKSPACE_ID, console.hashlib.sha256(before).hexdigest(),
+                    before.decode("utf-8") + "// edit\\n",
+                )
+            self.assertEqual(fixture.source.read_bytes(), before)
+
+    def test_post_organization_source_requires_running_watcher_lineage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            fixture.source.write_text(
+                "float4 MainPS() : SV_Target { return 2; }\\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                console.ShaderConsoleError, "unavailable|not running"
+            ):
+                console.load_authorized_source_document(
+                    str(fixture.registry), fixture.AUTHORIZATION_ID,
+                    fixture.WORKSPACE_ID,
+                )
+            fixture.write_watch()
+            fixture.write_live()
+            opened = console.load_authorized_source_document(
+                str(fixture.registry), fixture.AUTHORIZATION_ID,
+                fixture.WORKSPACE_ID,
+            )
+            self.assertIn("return 2", opened["text"])
+
+    def test_unrelated_deleted_authorization_does_not_block_exact_workspace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            registry = json.loads(fixture.registry.read_text(encoding="utf-8"))
+            stale = dict(registry["entries"][0])
+            stale["authorizationId"] = "6" * 32
+            stale["workspacePath"] = str(fixture.root / "deleted-workspace")
+            stale_identity = dict(stale["workspaceIdentity"])
+            stale_identity["workspaceId"] = "7" * 32
+            stale["workspaceIdentity"] = stale_identity
+            stale["workspaceIdentitySha256"] = console._canonical_sha256(stale_identity)
+            registry["entries"].insert(0, stale)
+            fixture.registry.write_text(json.dumps(registry), encoding="utf-8")
+            opened = console.load_authorized_source_document(
+                str(fixture.registry), fixture.AUTHORIZATION_ID,
+                fixture.WORKSPACE_ID,
+            )
+            self.assertEqual(opened["workspaceId"], fixture.WORKSPACE_ID)
+
+    def test_exact_production_registry_identity_hash_is_enforced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            registry = json.loads(fixture.registry.read_text(encoding="utf-8"))
+            registry["entries"][0]["workspaceIdentitySha256"] = "0" * 64
+            fixture.registry.write_text(json.dumps(registry), encoding="utf-8")
+            with self.assertRaisesRegex(console.ShaderConsoleError, "identity hash"):
+                console.load_authorized_source_document(
+                    str(fixture.registry), fixture.AUTHORIZATION_ID,
+                    fixture.WORKSPACE_ID,
+                )
+
+
+    def test_code_workspace_rejects_non_hlsl_authorized_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            glsl_source = fixture.source.with_name("shader.glsl")
+            fixture.source.replace(glsl_source)
+            manifest_path = fixture.workspace / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["source"]["path"] = "source/shader.glsl"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(console.ShaderConsoleError, "not HLSL"):
+                console.load_authorized_source_document(
+                    str(fixture.registry), fixture.AUTHORIZATION_ID, fixture.WORKSPACE_ID
+                )
+
+    def test_code_workspace_requires_the_current_strict_organization_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            gate_path = fixture.workspace / "ai" / "organize-code-gate.json"
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            gate["safeToStartLiveEdit"] = False
+            gate["decision"] = "awaiting-proposal-review"
+            gate_path.write_text(json.dumps(gate), encoding="utf-8")
+
+            snapshot = console.load_console_snapshot(str(fixture.registry))
+            self.assertEqual(len(snapshot["workspaces"]), 1)
+            self.assertFalse(snapshot["workspaces"][0]["editorEligible"])
+            self.assertEqual(
+                snapshot["workspaces"][0]["editorEligibility"],
+                "organization-gate-unavailable",
+            )
+            with self.assertRaisesRegex(console.ShaderConsoleError, "organization gate"):
+                console.load_authorized_source_document(
+                    str(fixture.registry), fixture.AUTHORIZATION_ID,
+                    fixture.WORKSPACE_ID,
+                )
+
+    def test_code_workspace_rejects_non_executable_source_lane(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            manifest_path = fixture.workspace / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["source"]["lane"] = "explanatory-ir"
+            manifest["source"]["compileEligible"] = False
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(console.ShaderConsoleError, "executable editable"):
+                console.load_authorized_source_document(
+                    str(fixture.registry), fixture.AUTHORIZATION_ID,
+                    fixture.WORKSPACE_ID,
+                )
+
     def test_ui_projection_has_no_shell_or_process_execution_surface(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
         for forbidden in (
@@ -733,7 +940,7 @@ class ShaderConsoleLogicTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
-    def test_bridge_registers_console_and_background_throttle_opt_out(self):
+    def test_bridge_registers_console_without_forcing_process_power_policy(self):
         source = BRIDGE_PATH.read_text(encoding="utf-8")
         self.assertIn("_register_shader_console_ui(ctx)", source)
         self.assertIn("_unregister_shader_console_ui()", source)
@@ -742,10 +949,25 @@ class ShaderConsoleLogicTests(unittest.TestCase):
         self.assertIn("[\"ReplayLab Console\"]", source)
         self.assertIn("[\"ReplayLab\", \"Shader Console\"]", source)
         self.assertIn("publish_console_event", source)
-        self.assertIn(
+        self.assertNotIn(
             "_shader_console_protocol.disable_background_power_throttling()",
             source,
         )
+        self.assertNotIn("disable_background_power_throttling", MODULE_PATH.read_text(
+            encoding="utf-8"))
+
+    def test_external_ipc_poll_is_bounded_and_not_frame_rate(self):
+        source = BRIDGE_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(BRIDGE_PATH), feature_version=(3, 6))
+        assignment = next(
+            node for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "IPC_POLL_INTERVAL_MS"
+                    for target in node.targets)
+        )
+        interval = ast.literal_eval(assignment.value)
+        self.assertGreaterEqual(interval, 250)
 
     def test_bridge_quiets_fixed_background_polls_but_keeps_all_failures(self):
         source = BRIDGE_PATH.read_text(encoding="utf-8")
@@ -760,7 +982,7 @@ class ShaderConsoleLogicTests(unittest.TestCase):
         quiet = set(ast.literal_eval(assignment.value.args[0]))
         self.assertIn("ping", quiet)
         self.assertIn("get_current_renderdoc_context", quiet)
-        self.assertIn("claim_renderdoc_ui_intents", quiet)
+        self.assertNotIn("claim_renderdoc_ui_intents", quiet)
         self.assertNotIn("apply_shader_candidate_shared_resource", quiet)
         self.assertIn("if lifecycle_visible:", source)
         self.assertIn('code="requestFailed"', source)

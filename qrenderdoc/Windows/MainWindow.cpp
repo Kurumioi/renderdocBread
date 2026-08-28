@@ -1901,49 +1901,72 @@ void MainWindow::messageCheck()
       statusProgress->hide();
     }
 
-    m_Ctx.Replay().AsyncInvoke([this](IReplayController *r) {
-      rdcarray<DebugMessage> msgs;
+    // GetDebugMessages can wait on the driver or a remote server. Do not enqueue another poll until
+    // both the replay query and its UI callback have completed.
+    if(m_MessageCheckInFlight)
+      return;
 
-      bool disconnected = false;
+    m_MessageCheckInFlight = true;
+    const uint64_t generation = m_MessageCheckGeneration;
 
-      if(m_Ctx.Replay().CurrentRemote().IsValid())
-      {
-        bool wasRunning = m_Ctx.Replay().CurrentRemote().IsServerRunning();
+    // i18n-ignore: internal replay command tag used only for coalescing and diagnostics.
+    m_Ctx.Replay().AsyncInvoke(lit("mainWindowDebugMessages"),
+                               [this, generation](IReplayController *r) {
+                                 rdcarray<DebugMessage> msgs;
 
-        m_Ctx.Replay().PingRemote();
+                                 bool disconnected = false;
 
-        if(wasRunning != m_Ctx.Replay().CurrentRemote().IsServerRunning())
-        {
-          qCritical() << "Remote server disconnected";
-          disconnected = true;
-        }
+                                 if(m_Ctx.Replay().CurrentRemote().IsValid())
+                                 {
+                                   bool wasRunning =
+                                       m_Ctx.Replay().CurrentRemote().IsServerRunning();
 
-        if(!disconnected && wasRunning)
-          msgs = r->GetDebugMessages();
-      }
-      else
-      {
-        msgs = r->GetDebugMessages();
-      }
+                                   m_Ctx.Replay().PingRemote();
 
-      GUIInvoke::call(this, [this, msgs] {
-        if(m_Ctx.Replay().CurrentRemote().IsValid() &&
-           !m_Ctx.Replay().CurrentRemote().IsServerRunning())
-          contextChooser->setIcon(Icons::cross());
+                                   if(wasRunning !=
+                                      m_Ctx.Replay().CurrentRemote().IsServerRunning())
+                                   {
+                                     qCritical() << "Remote server disconnected";
+                                     disconnected = true;
+                                   }
 
-        if(!msgs.empty())
-        {
-          m_Ctx.AddMessages(msgs);
-        }
+                                   if(!disconnected && wasRunning)
+                                     msgs = r->GetDebugMessages();
+                                 }
+                                 else
+                                 {
+                                   msgs = r->GetDebugMessages();
+                                 }
 
-        if(m_Ctx.UnreadMessageCount() > 0)
-          m_messageAlternate = !m_messageAlternate;
-        else
-          m_messageAlternate = false;
+                                 GUIInvoke::call(this, [this, generation, msgs] {
+                                   // Capture close/load invalidates an outstanding poll. In
+                                   // particular, an old callback must not add messages to a new
+                                   // capture or clear the new capture's in-flight state.
+                                   if(generation != m_MessageCheckGeneration)
+                                     return;
 
-        setCaptureHasErrors(!m_Ctx.DebugMessages().empty());
-      });
-    });
+                                   m_MessageCheckInFlight = false;
+
+                                   if(!m_Ctx.IsCaptureLoaded())
+                                     return;
+
+                                   if(m_Ctx.Replay().CurrentRemote().IsValid() &&
+                                      !m_Ctx.Replay().CurrentRemote().IsServerRunning())
+                                     contextChooser->setIcon(Icons::cross());
+
+                                   if(!msgs.empty())
+                                   {
+                                     m_Ctx.AddMessages(msgs);
+                                   }
+
+                                   if(m_Ctx.UnreadMessageCount() > 0)
+                                     m_messageAlternate = !m_messageAlternate;
+                                   else
+                                     m_messageAlternate = false;
+
+                                   setCaptureHasErrors(!m_Ctx.DebugMessages().empty());
+                                 });
+                               });
   }
   else if(!m_Ctx.IsCaptureLoaded() && !m_Ctx.IsCaptureLoading())
   {
@@ -2259,6 +2282,9 @@ void MainWindow::statusDoubleClicked(QMouseEvent *event)
 
 void MainWindow::OnCaptureLoaded()
 {
+  ++m_MessageCheckGeneration;
+  m_MessageCheckInFlight = false;
+
   // at first only allow the default save for temporary captures. It should be disabled if we have
   // loaded a 'permanent' capture from disk and haven't made any changes. It will be enabled as soon
   // as any changes are made.
@@ -2325,6 +2351,9 @@ void MainWindow::OnCaptureLoaded()
 
 void MainWindow::OnCaptureClosed()
 {
+  ++m_MessageCheckGeneration;
+  m_MessageCheckInFlight = false;
+
   ui->action_Save_Capture_Inplace->setEnabled(false);
   ui->action_Save_Capture_As->setEnabled(false);
   ui->action_Close_Capture->setEnabled(false);
@@ -2709,7 +2738,7 @@ void MainWindow::on_action_AI_Assistant_triggered()
   showAIAssistant();
 }
 
-void MainWindow::showAIAssistant(const QString &taskId)
+void MainWindow::showAIAssistant()
 {
   CaptureContext &ctx = static_cast<CaptureContext &>(m_Ctx);
   AIAssistant *assistantWindow = ctx.GetAIAssistant();
@@ -2726,9 +2755,6 @@ void MainWindow::showAIAssistant(const QString &taskId)
   {
     ui->toolWindowManager->addToolWindow(assistant, mainToolArea(), ToolWindowManager::HideOnClose);
   }
-
-  if(!taskId.isEmpty())
-    assistantWindow->NotifyIntentQueued(taskId);
 }
 
 void MainWindow::on_action_Resolve_Symbols_triggered()

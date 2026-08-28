@@ -155,6 +155,17 @@ def test_workflow_receipt_is_bounded_and_excludes_specialist_answers() -> None:
     )
     workflow = SimpleNamespace(
         terminal_status="completed",
+        clarification=SimpleNamespace(
+            event_payload=lambda: {
+                "question": "Which target?",
+                "selectionMode": "single",
+                "options": [
+                    {"id": "first", "label": "First", "description": "First target."},
+                    {"id": "second", "label": "Second", "description": "Second target."},
+                ],
+                "allowOther": True,
+            }
+        ),
         strategy="adaptive-supervisor-specialists/langgraph-v2",
         supervisor_decisions=2,
         total_tasks=1,
@@ -173,6 +184,7 @@ def test_workflow_receipt_is_bounded_and_excludes_specialist_answers() -> None:
     encoded_receipt = cli._machine_json(payload["workflowReceipt"])
 
     assert payload["terminalStatus"] == "completed"
+    assert payload["clarification"]["selectionMode"] == "single"
     assert payload["workflowReceipt"]["schema"] == "replaylab-workflow-receipt/v1"
     assert payload["workflowReceipt"]["stages"][0]["sessions"][0]["released"] is True
     assert secret_answer not in encoded_receipt.decode("utf-8")

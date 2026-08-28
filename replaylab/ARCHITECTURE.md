@@ -14,10 +14,21 @@ module from that application-owned directory.
 The loader does not scan `extensions/`, read an `extension.json`, consult the user's `%APPDATA%`
 extension directory, or accept a same-named user module. `integration.json` is first-party
 version/entrypoint metadata for build and validation; it is not an extension discovery manifest.
-Native qrenderdoc code owns lifecycle, availability, AI actions, and typed intent dispatch. The
+Native qrenderdoc code owns lifecycle, availability, AI actions, and direct task dispatch. The
 Python bridge remains an in-process implementation module for capture-context freezing and bridge
-protocol v2, while AgentHost and MCP Host remain hidden sidecars so network/provider dependencies do
-not enter the qrenderdoc process.
+protocol v2, while AgentHost remains a hidden sidecar so network/provider dependencies do not enter
+the qrenderdoc process. Model API and Codex specialists execute every active Shader and
+Event/Pipeline contract through AgentHost's process-shared `InternalToolService`; this path never
+starts ReplayLabMCP. ACP/Cursor receives the same contracts through one task-filtered MCP session
+because ACP v1 has no equivalent Host dynamic-tool callback. The same executable is also the adapter
+for explicitly connected external clients; it is never exposed as an unfiltered ambient inventory.
+
+Ordinary qrenderdoc startup owns the private `ReplayLabInternal.exe` service and, by default, one
+`ReplayLabMCP.exe` loopback for external Codex/IDE clients. Internal Agent, project-restore, and
+Shader-save paths still use only the private service or AgentHost's in-process tools; they never
+fall back to the external MCP adapter. ACP/Cursor capture specialists retain an isolated task-level
+stdio MCP session. Deployments that do not expose external clients can opt out with
+`REPLAYLAB_EXTERNAL_MCP_AUTOSTART=0` (also `false`, `no`, or `off`).
 
 This boundary keeps product-facing behavior native without discarding the tested bridge protocol:
 
@@ -26,7 +37,10 @@ qrenderdoc native UI/lifecycle
   -> typed ReplayLab integration API
   -> fixed renderdoc_mcp_bridge package
   -> bridge protocol v2
-  -> pinned AgentHost / scoped MCP Host sidecars
+  -> pinned AgentHost
+       -> shared InternalToolService (model API and Codex dynamicTools)
+
+ACP / external IDE -> task-filtered ReplayLabMCP.exe -> the same first-party bridge
 ```
 
 ## Connection concepts
@@ -122,10 +136,12 @@ chat:
 
 ```text
 typed conversation + frozen environment
+  -> Host resolves clarification response and origin/current snapshot candidates
+       -> if the user's target is ambiguous, ask_user before compaction or model execution
   -> zero-tool main supervisor -> GoalSpec + initial decision
-       -> ask_user / blocked (zero specialist tasks), or first StagePlan
+       -> direct_answer / ask_user / blocked (zero specialist tasks), or first StagePlan
   -> host validates task IDs, dependencies, Skill names and budgets
-  -> isolated Skill specialist session(s), with only that Skill's tools
+  -> isolated Skill specialist session(s), with discovered tools matching that Skill and outcome
   -> deterministic evidence validator
        -> retryable: feedback to the same logical specialist context
        -> accepted: seal bounded SkillResult and release detailed child context
@@ -136,11 +152,20 @@ typed conversation + frozen environment
   -> one qrenderdoc answer and terminal TaskEvent
 ```
 
-For model APIs, ReplayLab owns both the planner and specialist model loops. For Codex/ACP, the vendor
-Agent owns each inner model/tool loop, but ReplayLab still owns the outer TaskPlan, the selected
-Skill, scoped MCP grant, scheduling, evidence admission, and final result set. Thus the two paths
-share task division and acceptance criteria without claiming that different models will produce
-identical prose.
+For model APIs, ReplayLab owns both the planner and specialist model loops. For Codex, the vendor
+Agent owns each inner model/tool loop and calls host-provided `dynamicTools`. All active high-level
+contracts are routed to the same `InternalToolService` used by model APIs. ACP v1 has no equivalent
+dynamic-tool callback, so a capture-aware ACP specialist receives one filtered
+first-party MCP server containing only that task's tools. ReplayLab still owns the same outer
+supervisor, typed context, selected Skill, semantic workflow effects, scheduling, evidence admission,
+acceptance and final result set on every transport. This is a shared quality contract, not a promise
+that different models or vendor Agent harnesses will produce identical prose.
+
+A ReplayLab child Agent is one host-accounted, isolated specialist session. It keeps its bounded
+context across acceptance retries, returns a terminal receipt, and is released only after cleanup is
+confirmed. Requests that need no capture evidence may be answered directly. The active catalog has
+only the Shader and Event/Pipeline specialists; an unmatched request is handled by the main Agent or
+clarified instead of being routed to an invented generic domain specialist.
 
 The outer workflow is `adaptive-supervisor-specialists/langgraph-v2`. LangGraph provides typed state
 transitions and the dynamic loop; Pydantic AI remains the project's model/tool-loop adapter. A stage
@@ -157,37 +182,56 @@ A legacy `TaskPlan` response is accepted by a single-stage v1 adapter so older/l
 rather than losing the existing safe path; partial legacy execution returns a blocked workflow receipt
 instead of entering the strict complete-result synthesizer.
 
-Button actions skip the planner because the user already selected an exact workflow. For example,
-**Explain Event** directly invokes `renderdoc-explain-event`; its result is accepted only after both
-draw details and pipeline state were read successfully. This is faster and more reliable than
-asking the chat model to infer what the button means.
+Button actions skip domain selection because the user already chose a workflow. **Explain Event**
+directly invokes `renderdoc-explain-event` with the bundled `inspect_event` transaction, and an
+explicit picked-pixel action uses `analyze_pixel`. **Reverse/Edit with AI** selects
+`renderdoc-shader-workbench`; it is not artificially reduced to one read call, because compile,
+project publication, replay replacement and rollback may be legitimate parts of the requested
+outcome. qrenderdoc passes a stable native action ID and frozen target to AgentHost; the Host still
+enforces the selected workflow's ordering and postconditions.
 
 ## Context windows and compaction
 
 qrenderdoc sends a versioned JSON conversation envelope with stable, non-translatable field and role
 identifiers. It contains the current request separately from ordered history, plus a conversation id
 and an omitted-history count. This removes the old translated-prefix and `USER:` delimiter ambiguity.
-The 2 MiB wire ceiling remains a transport safety gate, not a model-window estimate.
+The native prompt wire ceiling is 16 MiB and remains a transport safety gate, not a model-window
+estimate.
 
-Before a provider call, `ContextManager` resolves `ModelContextSpec` in this order:
+Structured clarification is resolved before budgeting or compaction. A selection reply carries the
+stable `clarificationId`, selected `optionIds`, and optional `otherText`. qrenderdoc preserves the
+snapshot that produced the question and freezes a new current snapshot when the answer is sent. The
+Host compares the two content-addressed candidates, chooses origin or current from the user's intent,
+and asks a single-choice follow-up when that intent is ambiguous. Candidate snapshots never become
+conversation prose; only the chosen snapshot reaches tool scope and model context.
 
-1. verified profile `context_window_tokens` and output reserve;
-2. the installed `genai-prices` model metadata;
-3. a conservative configurable fallback for unknown/self-hosted models.
+Before a provider call, `ContextManager` resolves `ModelContextSpec` for the currently selected model
+without guessing a generic window:
 
-ReplayLab reserves output, system/tool-schema space and a safety margin, then uses a high/low-water
-policy (75%/55% by default). It never summarizes the current request, frozen capture identity, Goal
-constraints, Skill contract or evidence references. Older turns are chunked into a strict
-`ContextSummary`; recent turns remain verbatim. Each new summary is merged with earlier pinned fields
-instead of replacing them, carries a source digest and `throughMessageId`, and is stored under the
-hashed conversation id for 30 days. The next one-shot AgentHost process removes only the proven
-summarized prefix. If model summarization fails, a bounded deterministic summary is used; if the
-immutable payload itself cannot fit, the request fails explicitly rather than being silently cut.
+1. a verified profile `context_window_tokens`, when configured;
+2. exact installed `genai-prices` metadata for the selected model;
+3. otherwise a configuration error requiring verified `context_window_tokens` for the unknown or
+   self-hosted model.
+
+ReplayLab first reserves output, system-instruction space, tool-schema space, and a safety margin.
+The default policy triggers when usable input reaches 100% and compacts it to about 25%. It never
+summarizes the current request, selected frozen capture identity, Goal constraints, Skill contract,
+or evidence references. Older turns are converted into bounded `MemoryFact` records and a
+`ContextSummary`; recent turns remain verbatim and therefore have the strongest short-term weight.
+Each fact carries source lineage, category, importance, creation/confirmation time, general or
+capture scope, expiry and `active`/`superseded`/`expired` state. A newer correction with the same
+semantic key explicitly supersedes the older fact, and capture-scoped facts do not silently survive
+an incompatible capture session. Ranking retains active, important and recently confirmed facts
+first rather than merely truncating the oldest text. Each summary also carries a source digest and
+`throughMessageId` and is stored under the hashed conversation id for 30 days. The next one-shot
+AgentHost process removes only the proven summarized prefix. If model summarization fails, a bounded
+deterministic summary is used; if the immutable payload itself cannot fit, the request fails
+explicitly rather than being silently cut.
 
 Official OpenAI Responses and Anthropic API profiles on their exact vendor hosts additionally use
 Pydantic AI's native automatic compaction inside longer tool loops. Other model APIs receive a
 per-specialist `ProcessHistory`
-controller. Before every model request—including requests after MCP returns—it treats each complete
+controller. Before every model request—including requests after an internal tool returns—it treats each complete
 tool-call/tool-return exchange as an atomic block, pins unknown/native message shapes, retains the
 newest live exchange, and compacts older exchanges to a host-labelled memory record. Tool facts in
 that record are admitted only when they match the specialist's host-owned call-id/name and
@@ -204,23 +248,52 @@ CLI-fallback paths, so a clarification question or partial blocked report is not
 success. CLI JSON exposes a bounded lifecycle/evidence receipt and deliberately excludes specialist
 answers and model histories.
 
-## Agent, Skill, MCP, and acceptance
+## Agent, Skill, ToolService, MCP, and acceptance
 
 - The **Agent runtime** is executable orchestration code: model/Agent adapter, planner, state,
-  budgets, tool loop, cancellation, scheduling, permissions, and stopping rules. It is not a file
+  budgets, tool loop, cancellation, scheduling, workflow effects, and stopping rules. It is not a file
   format that every model automatically recognizes.
 - A **Skill** is a versioned domain procedure loaded for one task. Its frontmatter declares category,
-  tool allow-list, read-only status, minimum successful calls, and required evidence tools; its body
-  describes the analysis procedure.
-- **MCP** is the process and capability boundary for model-selected RenderDoc reads. Native qrenderdoc
-  code still handles UI state and capture lifetime directly. The Agent never receives an
+  candidate workflow inventory, read-only/effectful shape, minimum successful calls, and required
+  evidence tools; its body describes the analysis procedure. The inventory is routing input, not a
+  permanent per-command authorization wall.
+- **InternalToolService** is the process-shared, serialized capability boundary for internal
+  model-selected RenderDoc reads. It owns the exact instance/capture scope, typed schemas, audit
+  ledger, cancellation containment, and direct high-level bridge calls. The Agent never receives an
   `ICaptureContext` pointer or unrestricted replay/file operations.
+- **ReplayLabMCP** provides the same first-party bridge contracts to ACP and explicit external
+  clients. Every Agent-facing session is filtered to the exact task inventory and rechecks the live
+  manifest before dispatch; model API and Codex internal turns do not start it.
+- The **CapabilityMatrix** is descriptive, not a static permission list. `ready` and `conditional`
+  routes are attemptable; unprobed model support and conditional sidecar availability do not become
+  self-reported permission failures. Only verified Host facts—for example an explicitly tool-less
+  model profile, no loaded capture, no pinned qrenderdoc instance, or no usable tool transport—are
+  hard blockers for a capture-dependent specialist; they do not block an unrelated direct answer.
+- The **WorkflowGuard** constrains semantic effects (`workspace`, `project`, `ui`, `replay`) and
+  observable outcomes rather than permanently enumerating every allowed call. It requires ordering,
+  machine-verifiable receipts, postconditions and recovery: for example validate the same Shader
+  workspace before applying it, bind a UI proposal to its classification ID, and roll back when a
+  replay mutation cannot be verified.
+- Effects are classified per invocation when arguments change behavior. The current
+  `classify_current_frame_passes` implementation always carries `project` because it stages the
+  capture catalog, and adds `ui` only for `publish_to_ui=true`;
+  `apply_current_frame_pass_ai_proposals` derives `project`/`ui` from its explicit persistence and
+  publication flags. Neither call can bypass the guard by being labelled globally read-only.
 - The **acceptance validator** is deterministic host code. A fluent answer cannot substitute for
   required successful tools, matching EID/resource/pixel/shader identity, or a valid terminal state.
 
-Skills are organized by evidence domain rather than by individual EID: event/pipeline, pixel,
-shader, material bindings, performance, resources, and approval-gated export. Creating an Agent per
-EID would duplicate context and increase cost without adding a distinct policy or tool boundary.
+The current catalog intentionally has only two composable Skills:
+
+- **Shader Workbench** binds exact Shader identity and evidence, reconstructs clearly labelled
+  readable HLSL, explains traced algorithms, manages generated source in a workspace/project library,
+  compiles and validates ABI/interface consistency, and can apply a requested replay replacement only
+  with a verified postcondition and usable rollback record. Generated HLSL is never called original
+  source without provenance evidence.
+- **Event/Pipeline** analyzes one EID, a pass, a range, or a frame; traces draw/dispatch inputs and
+  outputs, builds evidence-linked flow diagrams, and can publish a foldable semantic pass view. It may
+  request a bounded Shader specialist result when Shader behavior is material. The current UI tool
+  does not rewrite native Event Browser markers or captured names, and documentation must not claim
+  otherwise.
 
 ## Multi-Agent extension point
 
@@ -241,15 +314,14 @@ The interface now also returns a provider-neutral `SpecialistDescriptor` for eac
 an isolated-per-task role, dedicated system instructions, advisory model/reasoning hints, explicit
 input/output fields, and acceptance criteria. Hints never silently replace the model selected in the
 UI. Both the direct model-API adapter and Codex/ACP adapters render the same descriptor into a fresh
-specialist context; neither adapter can change the Skill identity or bypass its MCP evidence gate.
+specialist context; neither adapter can change the Skill identity or bypass its internal-tool
+evidence gate.
 
-`renderdoc-shader-workbench` is the first dedicated descriptor. Its staged flow binds shader
-identity, recovers reflection/ABI, traces disassembly and control/data flow, maps resources and stage
-interfaces, optionally generates a labelled high-level reconstruction, and finishes with consistency,
-confidence, and unknown-item checks. Captured evidence, semantic inference, and generated source are
-three different claim classes. The current path is read-only: generated source is not claimed to be
-original, compiled, round-tripped, or replay-validated. Compile/apply/rollback remains unavailable
-until qrenderdoc supplies a short-lived native capability ticket bound to the exact shader and action.
+Both `renderdoc-shader-workbench` and `renderdoc-explain-event` have dedicated descriptors. Their
+staged flows keep captured evidence, semantic inference, and generated artifacts as separate claim
+classes. Availability of an effectful step is discovered at runtime; completion is admitted by its
+workflow preconditions, receipts, postconditions and rollback evidence, not by a blanket read-only
+gate or by the model asserting that it has permission.
 
 Use a true subagent only when at least one boundary is genuinely different: another model,
 independent context, distinct tools/permissions, a separate cost budget, or transactional approval.

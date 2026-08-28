@@ -285,8 +285,20 @@ CaptureContext::~CaptureContext()
   // Python integrations/extensions can own Qt timers, QRunnables, MiniQt panels and capture
   // viewers. Give each lifetime bucket a deterministic chance to quiesce while this context and
   // MiniQtHelper are still valid.
-  if(!PythonContext::ShutdownInternalIntegrations())
-    qCritical() << "A built-in integration could not fully stop during CaptureContext shutdown";
+  bool integrationsStopped = PythonContext::ShutdownInternalIntegrations();
+  if(!integrationsStopped)
+  {
+    qCritical() << "A built-in integration did not stop on the first shutdown attempt; retrying";
+    integrationsStopped = PythonContext::ShutdownInternalIntegrations();
+  }
+  if(!integrationsStopped)
+  {
+    // Python integrations may still retain this CaptureContext, MiniQt objects, or replay work.
+    // Continuing this destructor would turn those retained references into use-after-free. This
+    // is an exit-only fail-safe after two bounded cancellation attempts, so terminate before any
+    // native dependency below is dismantled.
+    qFatal("Refusing to destroy CaptureContext while a built-in integration still owns live workers");
+  }
   PythonContext::ShutdownExtensions();
 
   // Registered menu/context callbacks retain Python callables. Destroy those
@@ -2619,9 +2631,9 @@ ReplayLabIntegration &CaptureContext::ReplayLab()
   return *m_ReplayLabIntegration;
 }
 
-void CaptureContext::ShowAIAssistant(const QString &taskId)
+void CaptureContext::ShowAIAssistant()
 {
-  m_MainWindow->showAIAssistant(taskId);
+  m_MainWindow->showAIAssistant();
 }
 
 AIAssistant *CaptureContext::GetAIAssistant()

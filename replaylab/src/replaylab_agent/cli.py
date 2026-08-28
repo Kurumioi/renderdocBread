@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import signal
@@ -17,21 +18,21 @@ from typing import Any, Sequence
 
 from .bridge import BridgeClient
 from .catalog import PRESETS, get_preset
-from .context_management import CONVERSATION_SCHEMA
+from .context_management import CONVERSATION_SCHEMA, NATIVE_PROMPT_WIRE_MAX_BYTES
 from .doctor import run_doctor
 from .errors import ReplayLabAIError
 from .mcp_tools import find_replaylab_mcp
 from .profiles import Profile, ProfileStore
 from .probe import discover_models, probe_profile
-from .process_env import remove_codex_profile_home
+from .process_env import remove_codex_profile_home, remove_cursor_profile_home
 from .runtime import AgentRuntime, default_skill_root
-from .skills import SkillCatalog
+from .skills import INTENT_SKILLS, SkillCatalog
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="replaylab-ai",
-        description="ReplayLab provider, Agent, Skill and qrenderdoc intent host",
+        description="ReplayLab provider, Agent and Skill host",
     )
     parser.add_argument("--config", type=Path, help="override profiles.json")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -232,6 +233,12 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--profile", default="")
     run.add_argument("--model", default="", help="per-run enabled-model override")
     run.add_argument("--skill", default="")
+    run.add_argument(
+        "--intent-kind",
+        choices=tuple(INTENT_SKILLS),
+        default="",
+        help="bind a direct native qrenderdoc action to its exact tool scope",
+    )
     prompt_source = run.add_mutually_exclusive_group(required=True)
     prompt_source.add_argument("--prompt")
     prompt_source.add_argument(
@@ -453,8 +460,8 @@ def _print_mcp_config(explicit: Path | None) -> None:
         "REPLAYLAB_MCP_HOST_ARGS",
     ]
     print(
-        "# Legacy/manual registration only. Managed Codex profiles inject this "
-        "filtered server per process in an isolated CODEX_HOME."
+        "# Legacy/manual registration only. Managed Agent profiles inject this "
+        "filtered server per task."
     )
     print("[mcp_servers.replaylab]")
     print("command = " + json.dumps(python, ensure_ascii=False))
@@ -555,6 +562,11 @@ def _profile_command(
             # credential.  Clear it before the profile is removed so a failure
             # cannot leave the UI claiming that authentication was forgotten.
             remove_codex_profile_home(removed_profile)
+        elif removed_profile.preset == "cursor-acp":
+            # Cursor's isolated CLI config may contain its browser-login state.
+            # Remove only ReplayLab's exact profile directory; never call the
+            # vendor logout command, which could affect a global OS credential.
+            remove_cursor_profile_home(removed_profile)
         if (
             credential_store is not None
             and credential_store.supported
@@ -660,6 +672,13 @@ def _profile_command(
             and updated.preset != "codex"
         ):
             remove_codex_profile_home(current)
+        if (
+            args.profile_command == "update"
+            and bool(getattr(args, "replace_provider", False))
+            and current.preset == "cursor-acp"
+            and updated.preset != "cursor-acp"
+        ):
+            remove_cursor_profile_home(current)
         store.profiles[updated.id] = updated
         if getattr(args, "select", False):
             store.active_profile = updated.id
@@ -708,6 +727,23 @@ def _selected_profile(store: ProfileStore, profile_id: str) -> Profile:
     return store.active()
 
 
+def _validate_frozen_context(value: dict[str, Any]) -> None:
+    """Verify content-addressed snapshots emitted by the native integration."""
+
+    if value.get("schema") != "renderdoc-ultra-current-context/v1":
+        return
+    supplied = value.get("snapshotId")
+    if not isinstance(supplied, str) or len(supplied) != 64:
+        raise ValueError("frozen context snapshot ID is invalid")
+    body = dict(value)
+    body.pop("snapshotId", None)
+    encoded = json.dumps(
+        body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if hashlib.sha256(encoded).hexdigest() != supplied.lower():
+        raise ValueError("frozen context snapshot content hash does not match")
+
+
 def _read_context(args: argparse.Namespace) -> tuple[dict[str, Any], str, str]:
     if args.context_file and args.live_context:
         raise ValueError("choose either --context-file or --live-context")
@@ -717,6 +753,7 @@ def _read_context(args: argparse.Namespace) -> tuple[dict[str, Any], str, str]:
         value = json.loads(args.context_file.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise ValueError("context file must contain one JSON object")
+        _validate_frozen_context(value)
         client = BridgeClient()
         instance = client.select_instance(args.instance_id)
         if not instance.capture_loaded:
@@ -751,6 +788,16 @@ def _read_context(args: argparse.Namespace) -> tuple[dict[str, Any], str, str]:
 
 def _result_payload(result: Any) -> dict[str, Any]:
     workflow = getattr(result, "workflow", None)
+    clarification_payload: dict[str, Any] | None = None
+    clarification = getattr(workflow, "clarification", None) if workflow else None
+    if clarification is not None:
+        event_payload = getattr(clarification, "event_payload", None)
+        if not callable(event_payload):
+            raise ValueError("workflow clarification has no machine-readable payload")
+        value = event_payload()
+        if not isinstance(value, dict):
+            raise ValueError("workflow clarification payload must be an object")
+        clarification_payload = value
     return {
         "taskId": result.task_id,
         "profile": result.profile,
@@ -761,6 +808,7 @@ def _result_payload(result: Any) -> dict[str, Any]:
             workflow.terminal_status if workflow else "completed"
         ),
         "contextCompacted": bool(getattr(result, "context_compacted", False)),
+        "clarification": clarification_payload,
         "workflowReceipt": _workflow_receipt(workflow),
     }
 
@@ -835,13 +883,17 @@ def _workflow_receipt(workflow: Any) -> dict[str, Any] | None:
 
 
 async def _run_once(args: argparse.Namespace, store: ProfileStore) -> int:
-    runtime = AgentRuntime(store, _catalog(), mcp_executable=args.mcp_host)
+    runtime = AgentRuntime(
+        store,
+        _catalog(),
+        mcp_executable=getattr(args, "mcp_host", None),
+    )
     context, instance_id, capture_path = _read_context(args)
     prompt = args.prompt
     if args.prompt_stdin:
-        raw_prompt = sys.stdin.buffer.read(2 * 1024 * 1024 + 1)
-        if len(raw_prompt) > 2 * 1024 * 1024:
-            raise ValueError("stdin prompt exceeds the 2 MiB safety limit")
+        raw_prompt = sys.stdin.buffer.read(NATIVE_PROMPT_WIRE_MAX_BYTES + 1)
+        if len(raw_prompt) > NATIVE_PROMPT_WIRE_MAX_BYTES:
+            raise ValueError("stdin prompt exceeds the 16 MiB safety limit")
         try:
             prompt = raw_prompt.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
@@ -858,6 +910,16 @@ async def _run_once(args: argparse.Namespace, store: ProfileStore) -> int:
     }
     if getattr(args, "model", ""):
         run_kwargs["model_override"] = args.model
+    intent_kind = str(getattr(args, "intent_kind", "") or "")
+    if intent_kind:
+        if not context or not instance_id:
+            raise ValueError("--intent-kind requires frozen context and --instance-id")
+        expected_skill = INTENT_SKILLS[intent_kind]
+        if args.skill != expected_skill:
+            raise ValueError(
+                f"--intent-kind {intent_kind} requires --skill {expected_skill}"
+            )
+        run_kwargs["intent"] = {"kind": intent_kind, "arguments": {}}
     result = await runtime.run(prompt, **run_kwargs)
     if args.json:
         _print_machine_json(_result_payload(result))
@@ -1003,11 +1065,6 @@ def _codex_connector(profile: Profile, *, timeout: float):
 
 async def _models_command(args: argparse.Namespace, store: ProfileStore) -> int:
     profile = _discovery_profile(args, store)
-    if profile.provider.protocol == "acp":
-        raise ValueError(
-            "ACP does not standardize pre-session model discovery; use the vendor CLI "
-            "or save known model ids in the profile"
-        )
     if profile.provider.protocol == "codex-app-server":
         if args.api_key_stdin:
             raise ValueError("Codex app-server owns authentication; do not pass an API key")
@@ -1174,7 +1231,7 @@ async def _wait_for_subscription_start_gate(
         )
         if cancel_wait in done or not done:
             raise ValueError(
-                "subscription start gate closed before 'start'; no vendor process was created"
+                "Subscription start gate closed before 'start'; no provider process was created."
             )
     finally:
         for task in (start_wait, cancel_wait):
@@ -1241,6 +1298,8 @@ async def _subscription_command(
         "waitingForStart",
         "waitingForStart",
         "Waiting for qrenderdoc process containment before starting the provider.",
+        messageId="subscription.waiting-for-containment",
+        messageArgs=[],
     )
     try:
         await _wait_for_subscription_start_gate(start, cancel, timeout=timeout)
@@ -1249,6 +1308,8 @@ async def _subscription_command(
             terminal_kind,
             "cancelled",
             str(exc),
+            messageId="subscription.start-gate-closed",
+            messageArgs=[],
             authenticated=False,
             testCompleted=False,
         )
@@ -1260,6 +1321,8 @@ async def _subscription_command(
             terminal_kind,
             "missing",
             backend.detection["message"],
+            messageId=backend.detection.get("messageId", ""),
+            messageArgs=list(backend.detection.get("messageArgs", [])),
             installed=False,
             authenticated=False,
             installHint=backend.detection.get("installHint", ""),
@@ -1272,6 +1335,8 @@ async def _subscription_command(
             terminal_kind,
             "cancelled",
             "Subscription operation cancelled before provider startup.",
+            messageId="subscription.cancelled-before-start",
+            messageArgs=[],
             authenticated=False,
             testCompleted=False,
         )
@@ -1285,12 +1350,16 @@ async def _subscription_command(
                 "connectStarted",
                 "connecting",
                 "Provider sign-in started inside the qrenderdoc process job.",
+                messageId="subscription.sign-in-started",
+                messageArgs=[],
             )
             result = await backend.connect(args.flow, cancel)
             backend.event(
                 "testCompleted",
                 "ok" if result.authenticated else "failed",
                 result.message,
+                messageId=getattr(result, "message_id", ""),
+                messageArgs=list(getattr(result, "message_args", ())),
                 authenticated=result.authenticated,
                 terminalOpened=result.terminal_opened,
                 models=list(result.models),
@@ -1301,6 +1370,8 @@ async def _subscription_command(
                 "subscriptionCompleted",
                 "connected" if result.authenticated else "failed",
                 result.message,
+                messageId=getattr(result, "message_id", ""),
+                messageArgs=list(getattr(result, "message_args", ())),
                 authenticated=result.authenticated,
                 terminalOpened=result.terminal_opened,
                 models=list(result.models),
@@ -1312,12 +1383,16 @@ async def _subscription_command(
                 "testStarted",
                 "testing",
                 "Running a bounded no-generation provider connection test.",
+                messageId="subscription.test-started",
+                messageArgs=[],
             )
             result = await backend.test(cancel)
             backend.event(
                 "testCompleted",
                 "ok" if result.authenticated else "failed",
                 result.message,
+                messageId=getattr(result, "message_id", ""),
+                messageArgs=list(getattr(result, "message_args", ())),
                 authenticated=result.authenticated,
                 terminalOpened=result.terminal_opened,
                 models=list(result.models),
@@ -1350,23 +1425,6 @@ async def _subscription_command(
 async def _auth_command(args: argparse.Namespace, store: ProfileStore) -> int:
     profile = _selected_profile(store, args.profile)
     protocol = profile.provider.protocol
-    if protocol == "acp":
-        if args.auth_command != "status":
-            raise ValueError(
-                "ACP authentication is owned by the configured local vendor Agent; "
-                "run that vendor's login command outside ReplayLab"
-            )
-        payload = {
-            "profile": profile.id,
-            "protocol": "acp",
-            "status": "managedExternally",
-            "command": profile.argv,
-        }
-        if args.json:
-            _print_machine_json(payload)
-        else:
-            print("Authentication is managed by the configured ACP vendor CLI.")
-        return 0
     if protocol != "codex-app-server":
         if args.auth_command != "status":
             raise ValueError("model APIs use the profile's session/environment API key")
@@ -1515,7 +1573,11 @@ async def _auth_command(args: argparse.Namespace, store: ProfileStore) -> int:
 
 
 async def _work_once(args: argparse.Namespace, store: ProfileStore) -> int:
-    runtime = AgentRuntime(store, _catalog(), mcp_executable=args.mcp_host)
+    runtime = AgentRuntime(
+        store,
+        _catalog(),
+        mcp_executable=getattr(args, "mcp_host", None),
+    )
     work_kwargs = {"profile_id": args.profile, "instance_id": args.instance_id}
     if getattr(args, "model", ""):
         work_kwargs["model_override"] = args.model
@@ -1588,7 +1650,11 @@ async def _worker(
         started = await _worker_operation_or_shutdown(start_event.wait(), shutdown_event)
         if started is _WORKER_SHUTDOWN:
             return 0
-    runtime = AgentRuntime(store, _catalog(), mcp_executable=args.mcp_host)
+    runtime = AgentRuntime(
+        store,
+        _catalog(),
+        mcp_executable=getattr(args, "mcp_host", None),
+    )
     idle_since = time.monotonic()
     while True:
         if shutdown_event is not None and shutdown_event.is_set():
@@ -1658,7 +1724,7 @@ def _start_worker_control_reader(
                     fail_closed()
                     return
                 if not raw_command.endswith(b"\n"):
-                    # readline returned a non-terminated fragment only because stdin reached EOF.
+                    # A non-terminated fragment means stdin reached EOF.
                     set_threadsafe(shutdown_event)
                     return
                 normalized = raw_command.strip()

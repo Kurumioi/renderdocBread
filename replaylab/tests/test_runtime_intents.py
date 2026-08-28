@@ -5,16 +5,45 @@ import hashlib
 import json
 import sys
 import threading
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import pytest
 
 from replaylab_agent.errors import ConnectorError, LifecycleCleanupError
+from replaylab_agent.context_management import PreparedPrompt
 from replaylab_agent.profiles import ProfileStore
 from replaylab_agent.runtime import AgentRunResult, AgentRuntime
 from replaylab_agent.events import TaskEventWriter
 from replaylab_agent.profiles import Profile
 from replaylab_agent.skills import SkillCatalog
+
+
+def _unknown_model_profile() -> Profile:
+    return Profile(
+        "local",
+        "ollama",
+        "test-model",
+        options={"context_window_tokens": 65_536},
+    )
+
+
+def _snapshot(session: str, event_id: int) -> dict:
+    value = {
+        "schema": "renderdoc-ultra-current-context/v1",
+        "capture": {
+            "loaded": True,
+            "captureSessionId": session,
+            "path": f"C:/captures/{session}.rdc",
+        },
+        "events": {"currentEventId": event_id},
+    }
+    value["snapshotId"] = hashlib.sha256(
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    return value
 
 
 class FakePinnedBridge:
@@ -199,7 +228,7 @@ async def test_cancellation_is_terminal_even_when_queue_ack_fails(tmp_path) -> N
 @pytest.mark.asyncio
 async def test_provider_failure_is_terminal_even_when_queue_ack_fails(tmp_path) -> None:
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("local", "ollama", "test-model"))
+    store.add(_unknown_model_profile())
     runtime = AgentRuntime(
         store,
         SkillCatalog([]).load(),
@@ -231,7 +260,7 @@ async def test_provider_failure_is_terminal_even_when_queue_ack_fails(tmp_path) 
 @pytest.mark.asyncio
 async def test_success_remains_completed_when_queue_ack_fails(tmp_path) -> None:
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("local", "ollama", "test-model"))
+    store.add(_unknown_model_profile())
     runtime = AgentRuntime(
         store,
         SkillCatalog([]).load(),
@@ -262,7 +291,7 @@ async def test_success_remains_completed_when_queue_ack_fails(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_intent_terminal_event_preserves_adaptive_blocked_status(tmp_path) -> None:
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("local", "ollama", "test-model"))
+    store.add(_unknown_model_profile())
     runtime = AgentRuntime(
         store,
         SkillCatalog([]).load(),
@@ -301,7 +330,7 @@ async def test_terminal_is_visible_and_blocked_queue_ack_has_hard_deadline(
     tmp_path, monkeypatch
 ) -> None:
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("local", "ollama", "test-model"))
+    store.add(_unknown_model_profile())
     runtime = AgentRuntime(
         store,
         SkillCatalog([]).load(),
@@ -345,7 +374,7 @@ async def test_cancellation_during_success_ack_does_not_emit_second_terminal(
     tmp_path, monkeypatch
 ) -> None:
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("local", "ollama", "test-model"))
+    store.add(_unknown_model_profile())
     runtime = AgentRuntime(
         store,
         SkillCatalog([]).load(),
@@ -391,7 +420,7 @@ async def test_claim_is_renewed_during_context_preflight(
     tmp_path, monkeypatch
 ) -> None:
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("local", "ollama", "test-model"))
+    store.add(_unknown_model_profile())
     runtime = AgentRuntime(
         store,
         SkillCatalog([]).load(),
@@ -420,7 +449,7 @@ async def test_claim_is_renewed_during_context_preflight(
 @pytest.mark.asyncio
 async def test_explicit_instance_disambiguates_multiple_loaded_qrenderdocs(tmp_path) -> None:
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("local", "ollama", "test-model"))
+    store.add(_unknown_model_profile())
     runtime = AgentRuntime(
         store,
         SkillCatalog([]).load(),
@@ -452,6 +481,7 @@ async def test_intent_worker_forwards_selected_model_override(tmp_path) -> None:
             "model-a",
             models=["model-a", "model-b"],
             default_model="model-a",
+            options={"context_window_tokens": 65_536},
         )
     )
     runtime = AgentRuntime(
@@ -500,7 +530,7 @@ def test_workflow_boolean_text_never_unlocks_mutation(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_authoritative_terminal_precedes_queue_ack_and_is_monotonic(tmp_path) -> None:
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("local", "ollama", "test-model"))
+    store.add(_unknown_model_profile())
     runtime = AgentRuntime(
         store,
         SkillCatalog([]).load(),
@@ -552,7 +582,7 @@ async def test_model_general_chat_needs_no_capture_tools_and_emits_authoritative
     tmp_path,
 ) -> None:
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("local", "ollama", "test-model"))
+    store.add(_unknown_model_profile())
     runtime = AgentRuntime(
         store,
         SkillCatalog([]).load(),
@@ -608,7 +638,7 @@ async def test_model_general_streams_only_visible_text_then_resets_with_final(
     )
 
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("local", "ollama", "test-model"))
+    store.add(_unknown_model_profile())
     runtime = AgentRuntime(
         store,
         SkillCatalog([]).load(),
@@ -669,7 +699,7 @@ async def test_model_stage_timeout_emits_failed_terminal_without_hanging(
     import replaylab_agent.connectors.models as model_connectors
 
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("local", "ollama", "test-model"))
+    store.add(_unknown_model_profile())
     runtime = AgentRuntime(
         store,
         SkillCatalog([]).load(),
@@ -725,7 +755,10 @@ async def test_external_stage_timeout_emits_failed_terminal_without_hanging(
             "managed",
             "custom-acp",
             command=[sys.executable],
-            options={"allow_unsandboxed_agent": True},
+            options={
+                "allow_unsandboxed_agent": True,
+                "context_window_tokens": 65_536,
+            },
         )
     )
     runtime = AgentRuntime(
@@ -771,6 +804,78 @@ async def test_external_stage_timeout_emits_failed_terminal_without_hanging(
 
 
 @pytest.mark.asyncio
+async def test_cursor_runtime_uses_scoped_config_and_fresh_empty_workspace(
+    tmp_path, monkeypatch
+) -> None:
+    import replaylab_agent.connectors.acp as acp_connector
+    import replaylab_agent.runtime as runtime_module
+
+    monkeypatch.setenv("LOCALAPPDATA", str((tmp_path / "local").resolve()))
+    store = ProfileStore(tmp_path / "profiles.json")
+    store.add(
+        Profile(
+            "cursor-main",
+            "cursor-acp",
+            options={
+                "allow_unsandboxed_agent": True,
+                "context_window_tokens": 65_536,
+            },
+        )
+    )
+    runtime = AgentRuntime(
+        store,
+        SkillCatalog([]).load(),
+        event_root=tmp_path / "events",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeCursorConnector:
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        async def run(self, *args, **kwargs):
+            del args, kwargs
+            workspace = Path(captured["kwargs"]["cwd"])
+            captured["workspace_entries"] = sorted(
+                path.name for path in workspace.iterdir()
+            )
+            captured["workspace_mcp"] = json.loads(
+                (workspace / ".cursor" / "mcp.json").read_text(encoding="utf-8")
+            )
+            return SimpleNamespace(text="Cursor answer")
+
+    monkeypatch.setattr(acp_connector, "ACPConnector", FakeCursorConnector)
+    monkeypatch.setattr(
+        runtime_module,
+        "resolved_agent_argv",
+        lambda _profile: [sys.executable, "cursor-acp-fixture"],
+    )
+
+    result = await runtime.run(
+        "hello",
+        profile_id="cursor-main",
+        task_id="cursor-isolation",
+    )
+
+    assert result.text == "Cursor answer"
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["provider_id"] == "cursor-acp"
+    workspace = Path(kwargs["cwd"])
+    assert workspace.name == "cursor-workspace"
+    assert captured["workspace_entries"] == [".cursor"]
+    assert captured["workspace_mcp"] == {"mcpServers": {}}
+    assert not workspace.parent.exists()
+    environment = kwargs["env"]
+    assert isinstance(environment, dict)
+    config_root = Path(environment["CURSOR_CONFIG_DIR"])
+    assert (config_root / "cli-config.json").is_file()
+    assert environment["HOME"] == str(config_root)
+    assert environment["USERPROFILE"] == str(config_root)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("provider_fails", [False, True])
 async def test_external_connector_close_uncertainty_is_fatal_even_after_provider_failure(
     tmp_path, monkeypatch, provider_fails
@@ -783,7 +888,10 @@ async def test_external_connector_close_uncertainty_is_fatal_even_after_provider
             "managed",
             "custom-acp",
             command=[sys.executable],
-            options={"allow_unsandboxed_agent": True},
+            options={
+                "allow_unsandboxed_agent": True,
+                "context_window_tokens": 65_536,
+            },
         )
     )
     runtime = AgentRuntime(
@@ -834,3 +942,124 @@ async def test_external_connector_close_uncertainty_is_fatal_even_after_provider
     ]
     assert payloads[-1]["kind"] == "failed"
     assert expected in payloads[-1]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_clarification_snapshot_asks_before_compaction(
+    tmp_path, monkeypatch
+) -> None:
+    store = ProfileStore(tmp_path / "profiles.json")
+    store.add(_unknown_model_profile())
+    runtime = AgentRuntime(
+        store,
+        SkillCatalog([]).load(),
+        event_root=tmp_path / "events",
+    )
+
+    async def must_not_prepare(*_args, **_kwargs):
+        raise AssertionError("ambiguous snapshot must not start compaction")
+
+    monkeypatch.setattr(runtime, "_prepare_context_prompt", must_not_prepare)
+    prompt = json.dumps(
+        {
+            "schema": "replaylab-conversation/v2",
+            "request": {"role": "user", "content": "继续处理"},
+            "clarificationResponse": {
+                "schema": "replaylab-clarification-response/v1",
+                "clarificationId": "clarification-1",
+                "optionIds": [],
+                "otherText": "继续处理",
+            },
+            "contextCandidates": {
+                "schema": "replaylab-context-candidates/v1",
+                "origin": {
+                    "contextInstanceId": "origin-instance",
+                    "snapshot": _snapshot("a" * 32, 7),
+                },
+                "current": {
+                    "contextInstanceId": "current-instance",
+                    "snapshot": _snapshot("b" * 32, 9),
+                },
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    result = await runtime.run(prompt, profile_id="local", task_id="snapshot-ask")
+
+    assert result.workflow is not None
+    assert result.workflow.terminal_status == "needs-user-input"
+    assert result.workflow.clarification is not None
+    assert [option.id for option in result.workflow.clarification.options] == [
+        "use_origin_snapshot",
+        "use_current_snapshot",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_selected_current_snapshot_drives_memory_before_planning(
+    tmp_path, monkeypatch
+) -> None:
+    store = ProfileStore(tmp_path / "profiles.json")
+    store.add(_unknown_model_profile())
+    runtime = AgentRuntime(
+        store,
+        SkillCatalog([]).load(),
+        event_root=tmp_path / "events",
+    )
+    origin = _snapshot("a" * 32, 7)
+    current = _snapshot("b" * 32, 9)
+
+    async def prepare(_profile, prepared_prompt, _writer, **kwargs):
+        assert "contextCandidates" not in prepared_prompt
+        assert kwargs["capture_session_id"] == "b" * 32
+        return PreparedPrompt(
+            prompt=prepared_prompt,
+            current_request="使用当前选择",
+            estimated_before=10,
+            estimated_after=10,
+            compacted=False,
+        )
+
+    async def plan(
+        _profile,
+        _prompt,
+        selected_context,
+        writer,
+        _intent,
+        _capture_path,
+        selected_instance,
+    ):
+        assert selected_context["events"]["currentEventId"] == 9
+        assert selected_instance == "current-instance"
+        return AgentRunResult(writer.task_id, "local", "test", "selected-current")
+
+    monkeypatch.setattr(runtime, "_prepare_context_prompt", prepare)
+    monkeypatch.setattr(runtime, "_run_model_plan", plan)
+    prompt = json.dumps(
+        {
+            "schema": "replaylab-conversation/v2",
+            "request": {"role": "user", "content": "使用当前选择"},
+            "clarificationResponse": {
+                "schema": "replaylab-clarification-response/v1",
+                "clarificationId": "clarification-1",
+                "optionIds": ["use_current_snapshot"],
+                "otherText": "",
+            },
+            "contextCandidates": {
+                "schema": "replaylab-context-candidates/v1",
+                "origin": {
+                    "contextInstanceId": "origin-instance",
+                    "snapshot": origin,
+                },
+                "current": {
+                    "contextInstanceId": "current-instance",
+                    "snapshot": current,
+                },
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    result = await runtime.run(prompt, profile_id="local", task_id="snapshot-current")
+    assert result.text == "selected-current"

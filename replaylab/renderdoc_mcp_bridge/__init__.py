@@ -24,6 +24,7 @@ import stat
 import subprocess
 import struct
 import sys
+import threading
 import traceback
 import tempfile
 import time
@@ -99,10 +100,9 @@ try:
         _project_restore_client_spec.loader.exec_module(
             _project_restore_client_protocol)
 except (ImportError, ValueError) as exc:
-    # qrenderdoc intentionally ships a compact embedded Python runtime without
-    # socket/_socket. Project creation and management use the packaged host CLI
-    # and must remain available even when the optional post-load HTTP restore
-    # transport cannot be imported.
+    # Keep project creation/management available if the packaged restore client
+    # itself is missing or malformed. The client deliberately uses WinHTTP and
+    # must remain importable in qrenderdoc's socket-free embedded Python.
     _project_restore_client_protocol = None
     _project_restore_client_import_error = str(exc)
 
@@ -116,6 +116,20 @@ except (ImportError, ValueError):
         raise ImportError("Unable to load the ReplayLab Console protocol")
     _shader_console_protocol = importlib.util.module_from_spec(_shader_console_spec)
     _shader_console_spec.loader.exec_module(_shader_console_protocol)
+
+try:
+    from . import project_shader_workspace as _shader_workspace_protocol
+except (ImportError, ValueError):
+    _shader_workspace_spec = importlib.util.spec_from_file_location(
+        "_replaylab_project_shader_workspace",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "project_shader_workspace.py"))
+    if _shader_workspace_spec is None or _shader_workspace_spec.loader is None:
+        raise ImportError("Unable to load the ReplayLab Shader Workspace UI")
+    _shader_workspace_protocol = importlib.util.module_from_spec(
+        _shader_workspace_spec)
+    _shader_workspace_spec.loader.exec_module(_shader_workspace_protocol)
 
 try:
     from . import dxil_access_signature as _dxil_access_protocol
@@ -167,7 +181,6 @@ _poller = None
 _capture_viewer = None
 _active_capture_token = None
 _capture_session_id = ""
-_ai_intent_queue = _ai_context_protocol.IntentQueue(maximum=256)
 _ai_context_generation = 0
 _ai_last_observation_id = ""
 _material_panel_ui = None
@@ -188,12 +201,20 @@ _project_preselected_open_depth = 0
 _project_startup_timer = None
 _shader_console_ui = None
 _shader_console_callbacks = []
+_shader_workspace_ui = None
+_shader_workspace_callbacks = []
 _event_filter_ui_callbacks = []
 _event_filter_registered = False
 _instance_started_unix_ms = int(time.time() * 1000)
 _instance_activity_unix_ms = _instance_started_unix_ms
 _replaylab_host_executable = ""
 _replaylab_host_control_process = None
+_replaylab_host_owner_active = False
+_replaylab_internal_host_executable = ""
+_replaylab_internal_control_process = None
+_replaylab_internal_owner_active = False
+_replaylab_control_processes = {}
+_replaylab_control_processes_lock = threading.RLock()
 
 EVENT_FILTER_FUNCTION = "rdultra"
 EVENT_FILTER_DRAW = "draw"
@@ -213,14 +234,34 @@ MAX_BUFFER_DATA_BYTES = 4096
 MAX_LIGHTING_CBUFFER_BYTES = 2048
 MAX_CAPTURE_SECTION_COUNT = 16384
 BRIDGE_PROTOCOL_VERSION = 2
-BRIDGE_INTEGRATION_VERSION = "1.10.1"
-IPC_POLL_INTERVAL_MS = 33
+BRIDGE_INTEGRATION_VERSION = "1.10.2"
+# This mailbox exists for explicit external MCP/IDE clients. Built-in project,
+# material, and Shader Workspace actions call the bridge's controlled
+# high-level functions directly, so they do not need a frame-rate filesystem
+# poll. A coarse 4 Hz cadence keeps external control responsive without
+# preventing an otherwise idle qrenderdoc process from settling.
+IPC_POLL_INTERVAL_MS = 250
 MAX_KNOWN_CATALOG_CAPTURE_IDS = 4096
 MAX_KNOWN_CATALOG_IDENTITY_PAIRS = 4096
 MAX_CATALOG_IDENTITY_EVENTS = 1000000
 MAX_CATALOG_IDENTITY_STAGES = 16
 MAX_CATALOG_IDENTITY_SHADERS = 1000000
 MAX_CATALOG_IDENTITY_USES = 4000000
+MAX_PROJECT_SHADER_INDEX_JOBS = 8
+MAX_PROJECT_SHADER_INDEX_RESOURCES = 65536
+MAX_PROJECT_SHADER_INDEX_EXPECTED = 256
+MAX_PROJECT_SHADER_INDEX_ENTRIES = 2048
+MAX_PROJECT_SHADER_INDEX_BLOCKS = 4096
+MAX_PROJECT_SHADER_INDEX_REFLECTION_DEPTH = 24
+MAX_PROJECT_SHADER_INDEX_REFLECTION_FIELDS = 4096
+MAX_PROJECT_SHADER_INDEX_SIGNATURES = 2048
+MAX_PROJECT_SHADER_INDEX_BINDINGS = 4096
+MAX_PROJECT_SHADER_INDEX_SAMPLERS = 2048
+MAX_PROJECT_SHADER_INDEX_REFLECTION_STRING_BYTES = 1024
+MAX_PROJECT_SHADER_INDEX_REFLECTION_TOTAL_STRING_BYTES = 1024 * 1024
+MAX_PROJECT_SHADER_INDEX_BYTES = 8 * 1024 * 1024
+PROJECT_SHADER_INDEX_JOB_TIMEOUT_SECONDS = 15.0
+PROJECT_SHADER_INDEX_JOB_TTL_SECONDS = 300.0
 MAX_EVENT_SHADER_OVERRIDES = 256
 MAX_SHARED_SHADER_REPLACEMENTS = 256
 MAX_EVENT_CBUFFER_SNAPSHOTS = 256
@@ -253,6 +294,9 @@ _symbol_capture_snapshot = {
 }
 _known_catalog_capture_ids = {}
 _known_catalog_identity_pairs = set()
+_project_shader_index_jobs = {}
+_project_shader_index_jobs_guard = threading.RLock()
+_request_event_state = threading.local()
 _symbol_resource_renames = {}
 _symbol_rename_capture_token = None
 
@@ -516,6 +560,47 @@ def _find_replaylab_host():
     return ""
 
 
+def _external_mcp_autostart_enabled():
+    """Return whether qrenderdoc should own the external-client loopback host.
+
+    ReplayLabMCP is an external-client adapter, not an internal qrenderdoc
+    dependency.  The external Codex/IDE service is enabled by default and keeps
+    qrenderdoc's owner lifecycle; an installation that does not expose external
+    clients can explicitly opt out without changing any internal Agent,
+    project-restore, or Shader-save route.
+    """
+
+    value = os.environ.get("REPLAYLAB_EXTERNAL_MCP_AUTOSTART", "")
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _find_replaylab_internal_host():
+    """Locate qrenderdoc's private high-level service executable only."""
+
+    configured = os.environ.get("REPLAYLAB_INTERNAL_HOST", "").strip()
+    candidates = []
+    if configured:
+        candidates.append(configured)
+    if HAS_UI:
+        try:
+            app_dir = str(QtCore.QCoreApplication.applicationDirPath())
+            candidates.extend([
+                os.path.join(app_dir, "replaylab", "ReplayLabInternal.exe"),
+                os.path.join(app_dir, "ReplayLabInternal.exe"),
+            ])
+        except Exception:
+            pass
+    integration_dir = os.path.dirname(os.path.abspath(__file__))
+    installed_app_dir = os.path.abspath(os.path.join(
+        integration_dir, os.pardir, os.pardir, os.pardir, os.pardir))
+    candidates.append(os.path.join(
+        installed_app_dir, "replaylab", "ReplayLabInternal.exe"))
+    for candidate in candidates:
+        if os.path.isfile(candidate) and not os.path.islink(candidate):
+            return os.path.abspath(candidate)
+    return ""
+
+
 def _hidden_process_flags():
     if os.name != "nt":
         return 0
@@ -523,9 +608,78 @@ def _hidden_process_flags():
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
 
 
+def _track_replaylab_control_process(process, label):
+    """Reap a short-lived ensure controller with a hard upper bound."""
+
+    with _replaylab_control_processes_lock:
+        _replaylab_control_processes[process] = str(label)
+
+    def _reap():
+        try:
+            try:
+                process.wait(timeout=30.0)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                try:
+                    process.wait(timeout=2.0)
+                except Exception:
+                    pass
+        finally:
+            with _replaylab_control_processes_lock:
+                _replaylab_control_processes.pop(process, None)
+
+    thread = threading.Thread(
+        target=_reap, name="ReplayLab-%s-control-reaper" % label)
+    thread.daemon = True
+    try:
+        thread.start()
+    except Exception:
+        with _replaylab_control_processes_lock:
+            _replaylab_control_processes.pop(process, None)
+        try:
+            process.kill()
+            process.wait(timeout=1.0)
+        except Exception:
+            pass
+        raise
+
+
+def _drain_replaylab_control_processes(label, timeout_seconds=5.0):
+    """Bound shutdown even if an ensure controller is waiting on a lock."""
+
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    with _replaylab_control_processes_lock:
+        processes = [
+            process for process, process_label in
+            _replaylab_control_processes.items()
+            if process_label == str(label)
+        ]
+    for process in processes:
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            try:
+                process.wait(timeout=remaining)
+            except Exception:
+                pass
+        try:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=1.0)
+        except Exception:
+            pass
+        with _replaylab_control_processes_lock:
+            _replaylab_control_processes.pop(process, None)
+
+
 def _start_replaylab_host():
     """Ask the packaged singleton launcher to ensure the loopback host exists."""
     global _replaylab_host_executable, _replaylab_host_control_process
+    global _replaylab_host_owner_active
+    if _replaylab_host_owner_active:
+        return True
     executable = _find_replaylab_host()
     _replaylab_host_executable = executable
     if not executable:
@@ -541,18 +695,55 @@ def _start_replaylab_host():
             cwd=os.path.dirname(executable),
             shell=False,
             creationflags=_hidden_process_flags())
+        _track_replaylab_control_process(
+            _replaylab_host_control_process, "mcp-ensure")
+        _replaylab_host_owner_active = True
         print("[ReplayLab] Starting/attaching packaged MCP host: %s" % executable)
         return True
     except Exception as exc:
         print("[ReplayLab] Host startup error: %s" % str(exc))
+        _replaylab_host_owner_active = False
         _replaylab_host_control_process = None
         return False
 
 
-def _release_replaylab_host_owner():
-    """Release only this qrenderdoc PID; the last live owner stops the host."""
-    global _replaylab_host_control_process
-    executable = _replaylab_host_executable
+def _start_replaylab_internal_host():
+    """Ensure qrenderdoc's private high-level service is running."""
+
+    global _replaylab_internal_host_executable
+    global _replaylab_internal_control_process
+    global _replaylab_internal_owner_active
+    if _replaylab_internal_owner_active:
+        return True
+    executable = _find_replaylab_internal_host()
+    _replaylab_internal_host_executable = executable
+    if not executable:
+        print("[ReplayLab] Packaged ReplayLabInternal.exe not found; internal "
+              "project and Shader Workspace services are unavailable")
+        return False
+    try:
+        _replaylab_internal_control_process = subprocess.Popen(
+            [executable, "ensure", "--owner-pid", str(os.getpid())],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=os.path.dirname(executable),
+            shell=False,
+            creationflags=_hidden_process_flags())
+        _track_replaylab_control_process(
+            _replaylab_internal_control_process, "internal-ensure")
+        _replaylab_internal_owner_active = True
+        print("[ReplayLab] Starting/attaching private internal host: %s" %
+              executable)
+        return True
+    except Exception as exc:
+        print("[ReplayLab] Internal host startup error: %s" % str(exc))
+        _replaylab_internal_owner_active = False
+        _replaylab_internal_control_process = None
+        return False
+
+
+def _release_packaged_owner(executable, label):
     if not executable or not os.path.isfile(executable):
         return
     try:
@@ -567,10 +758,39 @@ def _release_replaylab_host_owner():
         try:
             process.wait(timeout=3.0)
         except Exception:
-            pass
+            try:
+                process.kill()
+                process.wait(timeout=1.0)
+            except Exception:
+                pass
     except Exception as exc:
-        print("[ReplayLab] Host owner release error: %s" % str(exc))
+        print("[ReplayLab] %s owner release error: %s" % (label, str(exc)))
+
+
+def _release_replaylab_host_owner():
+    """Release only this qrenderdoc PID; the last live owner stops the host."""
+    global _replaylab_host_control_process
+    global _replaylab_host_owner_active
+    if not _replaylab_host_owner_active:
+        return
+    _replaylab_host_owner_active = False
+    _drain_replaylab_control_processes("mcp-ensure")
+    _release_packaged_owner(_replaylab_host_executable, "MCP host")
     _replaylab_host_control_process = None
+
+
+def _release_replaylab_internal_host_owner():
+    """Release qrenderdoc's private Host owner without touching MCP state."""
+
+    global _replaylab_internal_control_process
+    global _replaylab_internal_owner_active
+    if not _replaylab_internal_owner_active:
+        return
+    _replaylab_internal_owner_active = False
+    _drain_replaylab_control_processes("internal-ensure")
+    _release_packaged_owner(
+        _replaylab_internal_host_executable, "internal host")
+    _replaylab_internal_control_process = None
 
 
 # =====================================================================
@@ -595,7 +815,6 @@ if HAS_UI:
             _reset_symbol_state(restore_names=False)
             _active_capture_token = _current_capture_token()
             _publish_instance_manifest(activity=True)
-            _schedule_project_auto_activation()
             _publish_console_event(
                 "capture", "info", "RenderDoc 捕获已加载",
                 phase="捕获", code="captureLoaded")
@@ -645,9 +864,8 @@ if HAS_UI:
                         os.remove(f)
                     except Exception:
                         pass
-            # Keep the mailbox responsive enough for debounced material controls. Replay work is
-            # still serial and callers must coalesce rapid slider updates instead of queueing every
-            # mouse-move event.
+            # This mailbox is only the optional external-client adapter. Native
+            # material/project controls do not queue requests here.
             self._timer_id = self.startTimer(IPC_POLL_INTERVAL_MS)
             _publish_instance_manifest(activity=True)
             print("[ReplayLab] Poller started (timer_id=%d, interval=%dms, dir=%s)" %
@@ -789,12 +1007,34 @@ CONSOLE_QUIET_REQUEST_METHODS = frozenset((
     "ping",
     "get_capture_status",
     "get_current_renderdoc_context",
-    "claim_renderdoc_ui_intents",
-    "renew_renderdoc_ui_intent",
-    "get_renderdoc_ui_intent_status",
     "get_shared_shader_replacements",
     "get_event_cbuffer_override_status",
+    "poll_rdc_project_shader_resource_index",
 ))
+
+def _request_event_tracker():
+    return getattr(_request_event_state, "current", None)
+
+
+def _set_frame_event(ctrl, event_id, force=True):
+    """Set one replay EID and record the mutation for this synchronous request."""
+
+    tracker = _request_event_tracker()
+    if tracker is not None:
+        tracker["mutated"] = True
+        tracker["lastEventId"] = _safe_int(event_id, 0)
+        tracker["lastSetSucceeded"] = False
+    ctrl.SetFrameEvent(event_id, force)
+    if tracker is not None:
+        tracker["lastSetSucceeded"] = True
+
+
+def _restore_visible_replay_event(event_id=None):
+    if not _ctx or not _ctx.IsCaptureLoaded():
+        return
+    if event_id is None:
+        event_id = _safe_int(_ctx.CurEvent(), 0)
+    _replay(lambda ctrl: _set_frame_event(ctrl, event_id, True))
 
 
 def _console_request_lifecycle_visible(method):
@@ -831,8 +1071,31 @@ def handle_request(request):
         _publish_console_event(
             module, "info", "正在执行 %s" % method, phase="请求开始",
             code="requestStarted", context={"operation": method})
+    previous_tracker = _request_event_tracker()
+    visible_event_id = _safe_int(_ctx.CurEvent(), 0) if (
+        _ctx and _ctx.IsCaptureLoaded()) else 0
+    tracker = {
+        "captureSessionId": _capture_session_id,
+        "visibleEventId": visible_event_id,
+        "lastEventId": visible_event_id,
+        "lastSetSucceeded": True,
+        "mutated": False,
+    }
+    _request_event_state.current = tracker
     try:
-        result = METHODS[method](params)
+        expected_session = str(
+            params.get("__replaylab_expected_capture_session_id", "") or "").lower()
+        if expected_session and expected_session != _capture_session_id:
+            raise RuntimeError(
+                "The frozen capture session changed before the ReplayLab tool started")
+        try:
+            result = METHODS[method](params)
+        finally:
+            if (tracker["mutated"] and
+                    tracker["captureSessionId"] == _capture_session_id and
+                    (tracker["lastEventId"] != tracker["visibleEventId"] or
+                     not tracker["lastSetSucceeded"])):
+                _restore_visible_replay_event(tracker["visibleEventId"])
         if lifecycle_visible:
             _publish_console_event(
                 module, "info", "%s 已完成" % method, phase="请求完成",
@@ -844,6 +1107,14 @@ def handle_request(request):
             module, "error", "%s 失败：%s" % (method, str(e)), phase="请求失败",
             code="requestFailed", context={"operation": method})
         return {"id": rid, "error": {"code": -32000, "message": str(e)}}
+    finally:
+        if previous_tracker is None:
+            try:
+                del _request_event_state.current
+            except AttributeError:
+                pass
+        else:
+            _request_event_state.current = previous_tracker
 
 
 # ---- Helper: run on replay thread ----
@@ -851,12 +1122,24 @@ def _replay(fn):
     """Execute fn(controller) on the replay thread, return result."""
     result = [None]
     error = [None]
+    request_tracker = _request_event_tracker()
 
     def _invoke(ctrl):
+        previous_tracker = _request_event_tracker()
+        if request_tracker is not None:
+            _request_event_state.current = request_tracker
         try:
             result[0] = fn(ctrl)
         except Exception as e:
             error[0] = e
+        finally:
+            if previous_tracker is None:
+                try:
+                    del _request_event_state.current
+                except AttributeError:
+                    pass
+            else:
+                _request_event_state.current = previous_tracker
 
     _ctx.Replay().BlockInvoke(_invoke)
     if error[0]:
@@ -1265,12 +1548,22 @@ def _reset_symbol_state(restore_names=True):
     }
     _known_catalog_capture_ids = {}
     _known_catalog_identity_pairs = set()
+    with _project_shader_index_jobs_guard:
+        now = time.monotonic()
+        for job in _project_shader_index_jobs.values():
+            _request_project_shader_index_cancel(
+                job, now, "RenderDoc capture changed during resource indexing")
+        terminal_ids = [
+            job_id for job_id, job in _project_shader_index_jobs.items()
+            if job.get("status") in ("completed", "failed")
+        ]
+        for job_id in terminal_ids:
+            _project_shader_index_jobs.pop(job_id, None)
     try:
         loaded = bool(_ctx and _ctx.IsCaptureLoaded())
     except Exception:
         loaded = False
     _capture_session_id = uuid.uuid4().hex if loaded else ""
-    _ai_intent_queue.cancel_for_capture_change(_capture_session_id)
 
 
 def _synchronise_capture_lifecycle():
@@ -1636,7 +1929,7 @@ def _revalidate_symbol_shader_keys(expected_keys):
                     failures[key] = "catalog has no event proving this shader binding"
                     continue
                 try:
-                    ctrl.SetFrameEvent(int(event_ids[0]), True)
+                    _set_frame_event(ctrl, int(event_ids[0]), True)
                     ps = ctrl.GetPipelineState()
                     shader_id = ps.GetShader(stage)
                     if _resource_id_int(shader_id) != resource_id:
@@ -1670,7 +1963,7 @@ def _revalidate_symbol_shader_keys(expected_keys):
         finally:
             if restore_original_event:
                 try:
-                    ctrl.SetFrameEvent(original_event, True)
+                    _set_frame_event(ctrl, original_event, True)
                 except Exception:
                     pass
         return verified, failures
@@ -2860,7 +3153,6 @@ def _ping(params):
             "d3d11-event-cbuffer-override-v1",
             "d3d11-event-cbuffer-clear-all-v1",
             "current-renderdoc-context-v1",
-            "renderdoc-ui-intent-queue-v1",
         ],
         "schemas": {
             "captureSymbols": SYMBOL_CATALOG_SCHEMA,
@@ -2869,8 +3161,6 @@ def _ping(params):
             "eventCBufferOverride": "renderdoc-ultra-event-cbuffer-override/v1",
             "eventCBufferClearAll": "renderdoc-ultra-event-cbuffer-clear-all/v1",
             "currentContext": _ai_context_protocol.CONTEXT_SCHEMA,
-            "uiIntent": _ai_context_protocol.INTENT_SCHEMA,
-            "uiIntentBatch": _ai_context_protocol.INTENT_BATCH_SCHEMA,
         },
     }
 
@@ -3009,7 +3299,7 @@ def _current_bound_shader_context(event_id):
         warnings = []
         shaders = []
         if event_id > 0:
-            ctrl.SetFrameEvent(int(event_id), True)
+            _set_frame_event(ctrl, int(event_id), True)
         pipeline = ctrl.GetPipelineState()
         pipeline_object = _get_pipeline_obj(pipeline, ctrl)
         for stage_name, stage in _available_shader_stages():
@@ -3144,32 +3434,6 @@ def _get_current_renderdoc_context(params):
     # MCP/IPC callers cannot assert an explicit UI shader selection. Explicit
     # focus exists only in a RenderDoc stage-scoped menu callback.
     return _build_current_renderdoc_context()
-
-
-def _claim_renderdoc_ui_intents(params):
-    return _ai_intent_queue.claim(
-        params.get("consumer_id", ""),
-        params.get("max_count", 1),
-        params.get("lease_seconds", 30))
-
-
-def _complete_renderdoc_ui_intent(params):
-    return _ai_intent_queue.complete(
-        params.get("intent_id", ""),
-        params.get("lease_token", ""),
-        params.get("outcome", ""),
-        params.get("summary", ""))
-
-
-def _renew_renderdoc_ui_intent(params):
-    return _ai_intent_queue.renew(
-        params.get("intent_id", ""),
-        params.get("lease_token", ""),
-        params.get("lease_seconds", 30))
-
-
-def _get_renderdoc_ui_intent_status(params):
-    return _ai_intent_queue.status(params.get("intent_id", ""))
 
 
 def _action_name(action):
@@ -3324,6 +3588,38 @@ def _get_pipeline_obj(ps, ctrl):
     return rd.ResourceId()
 
 
+def _pipeline_state_on_replay(ctrl):
+    """Collect pipeline evidence from the controller's already-selected event."""
+    ps = ctrl.GetPipelineState()
+    pipeline_id = _get_pipeline_obj(ps, ctrl)
+
+    stages = {}
+    for name, stage in _available_shader_stages(
+            ["vertex", "hull", "domain", "geometry", "fragment",
+             "compute", "task", "mesh"]):
+        sid = ps.GetShader(stage)
+        if sid and int(sid) != 0:
+            stages[name] = {"shaderId": int(sid)}
+            entries = ctrl.GetShaderEntryPoints(sid)
+            if entries:
+                refl = ctrl.GetShader(pipeline_id, sid, entries[0])
+                if refl:
+                    stages[name]["entryPoint"] = entries[0].name
+                    stages[name]["textureCount"] = sum(
+                        1 for r in refl.readOnlyResources if r.isTexture)
+                    stages[name]["cbufferCount"] = len(refl.constantBlocks)
+                    stages[name]["samplerCount"] = len(refl.samplers)
+
+    targets = ps.GetOutputTargets()
+    depth = ps.GetDepthTarget()
+
+    return {
+        "shaders": stages,
+        "renderTargets": [int(t.resource) for t in targets if int(t.resource) != 0],
+        "depthTarget": int(depth.resource) if depth and int(depth.resource) != 0 else None,
+    }
+
+
 def _get_pipeline_state(params):
     """Get pipeline state at an event."""
     event_id = params.get("event_id")
@@ -3331,34 +3627,8 @@ def _get_pipeline_state(params):
         raise ValueError("event_id required")
 
     def _do(ctrl):
-        ctrl.SetFrameEvent(int(event_id), True)
-        ps = ctrl.GetPipelineState()
-        pipeline_id = _get_pipeline_obj(ps, ctrl)
-
-        stages = {}
-        for name, stage in _available_shader_stages(
-                ["vertex", "hull", "domain", "geometry", "fragment",
-                 "compute", "task", "mesh"]):
-            sid = ps.GetShader(stage)
-            if sid and int(sid) != 0:
-                stages[name] = {"shaderId": int(sid)}
-                entries = ctrl.GetShaderEntryPoints(sid)
-                if entries:
-                    refl = ctrl.GetShader(pipeline_id, sid, entries[0])
-                    if refl:
-                        stages[name]["entryPoint"] = entries[0].name
-                        stages[name]["textureCount"] = sum(1 for r in refl.readOnlyResources if r.isTexture)
-                        stages[name]["cbufferCount"] = len(refl.constantBlocks)
-                        stages[name]["samplerCount"] = len(refl.samplers)
-
-        targets = ps.GetOutputTargets()
-        depth = ps.GetDepthTarget()
-
-        return {
-            "shaders": stages,
-            "renderTargets": [int(t.resource) for t in targets if int(t.resource) != 0],
-            "depthTarget": int(depth.resource) if depth and int(depth.resource) != 0 else None,
-        }
+        _set_frame_event(ctrl, int(event_id), True)
+        return _pipeline_state_on_replay(ctrl)
 
     return _replay(_do)
 
@@ -3376,7 +3646,7 @@ def _get_shader_info(params):
         raise ValueError("unsupported shader stage: %s" % stage_name)
 
     def _do(ctrl):
-        ctrl.SetFrameEvent(int(event_id), True)
+        _set_frame_event(ctrl, int(event_id), True)
         ps = ctrl.GetPipelineState()
         sid = ps.GetShader(stage)
         if not sid or int(sid) == 0:
@@ -3713,7 +3983,7 @@ def _get_pass_classification_inputs(params):
                 event_id = action["eventId"]
                 if event_id <= 0:
                     continue
-                ctrl.SetFrameEvent(int(event_id), True)
+                _set_frame_event(ctrl, int(event_id), True)
                 ps = ctrl.GetPipelineState()
                 pipeline_id = _get_pipeline_obj(ps, ctrl)
                 stages = {}
@@ -3803,7 +4073,7 @@ def _get_pass_classification_inputs(params):
         finally:
             if restore_original_event:
                 try:
-                    ctrl.SetFrameEvent(original_event, True)
+                    _set_frame_event(ctrl, original_event, True)
                 except Exception:
                     pass
 
@@ -4164,7 +4434,7 @@ def _validate_live_shader_event(ctrl, event, stage, stage_name, entry_point,
                                 require_d3d11_state=True,
                                 owned_shared_replacement=None):
     """Return immutable live facts for one exact captured event/stage."""
-    ctrl.SetFrameEvent(event["eventId"], True)
+    _set_frame_event(ctrl, event["eventId"], True)
     pipeline = ctrl.GetPipelineState()
     original_id = pipeline.GetShader(stage)
     if (_resource_id_int(original_id) !=
@@ -4541,7 +4811,7 @@ def _apply_shader_candidate_overrides(params):
             # committing bookkeeping; a restore failure therefore enters the
             # same transactional rollback path below.
             if original_event > 0:
-                ctrl.SetFrameEvent(original_event, True)
+                _set_frame_event(ctrl, original_event, True)
         except Exception:
             # A setter may fail after removing the previous config. Restore the
             # failed slot as well as every earlier slot, in reverse order.
@@ -4558,7 +4828,7 @@ def _apply_shader_candidate_overrides(params):
                 previous = item.get("existing")
                 if previous is not None:
                     try:
-                        ctrl.SetFrameEvent(event_id, True)
+                        _set_frame_event(ctrl, event_id, True)
                         restore_error = ctrl.SetEventShaderOverride(
                             event_id, stage,
                             item["live"]["originalResource"],
@@ -4581,7 +4851,7 @@ def _apply_shader_candidate_overrides(params):
                     pass
             if original_event > 0:
                 try:
-                    ctrl.SetFrameEvent(original_event, True)
+                    _set_frame_event(ctrl, original_event, True)
                 except Exception:
                     pass
             raise
@@ -4697,7 +4967,7 @@ def _apply_shader_candidate_overrides(params):
             # transaction. They must still restore the user's selected event.
             if original_event > 0:
                 try:
-                    ctrl.SetFrameEvent(original_event, True)
+                    _set_frame_event(ctrl, original_event, True)
                 except Exception:
                     pass
             raise
@@ -4773,7 +5043,7 @@ def _rollback_shader_candidate_overrides(params):
             restore_failures = []
             for record in reversed(restore):
                 try:
-                    ctrl.SetFrameEvent(record["eventId"], True)
+                    _set_frame_event(ctrl, record["eventId"], True)
                     restore_error = ctrl.SetEventShaderOverride(
                         record["eventId"], record["stageObject"],
                         record["originalResource"],
@@ -4790,7 +5060,7 @@ def _rollback_shader_candidate_overrides(params):
                     target["overrideIds"].discard(override_id)
             if original_event > 0:
                 try:
-                    ctrl.SetFrameEvent(original_event, True)
+                    _set_frame_event(ctrl, original_event, True)
                 except Exception:
                     pass
             raise
@@ -4819,7 +5089,7 @@ def _rollback_shader_candidate_overrides(params):
         selection_warning = ""
         if original_event > 0:
             try:
-                ctrl.SetFrameEvent(original_event, True)
+                _set_frame_event(ctrl, original_event, True)
             except Exception as exc:
                 selection_warning = str(exc)
 
@@ -5169,7 +5439,7 @@ def _apply_shader_candidate_shared_resource(params):
         finally:
             if original_event > 0:
                 try:
-                    ctrl.SetFrameEvent(original_event, True)
+                    _set_frame_event(ctrl, original_event, True)
                 except Exception:
                     pass
 
@@ -5718,7 +5988,7 @@ def _event_cbuffer_live_state(ctrl, event_id, stage_name, stage, block_index):
     if bool(getattr(props, "remoteReplay", False)):
         raise RuntimeError("Event CBuffer snapshots require local replay")
 
-    ctrl.SetFrameEvent(event_id, True)
+    _set_frame_event(ctrl, event_id, True)
 
     def _find_action(actions):
         for action in list(actions or []):
@@ -6011,7 +6281,7 @@ def _snapshot_event_cbuffer(params):
                 ctrl, event_id, stage_name, stage, block_index)
         finally:
             if original_event > 0 and original_event != event_id:
-                ctrl.SetFrameEvent(original_event, True)
+                _set_frame_event(ctrl, original_event, True)
 
     state = _replay(_do)
     key = (event_id, stage_name, state["slot"], state["registerSpace"])
@@ -6577,7 +6847,7 @@ def _export_shader_catalog(params):
         try:
             for progress_current, event_id in enumerate(event_ids, 1):
                 try:
-                    ctrl.SetFrameEvent(int(event_id), True)
+                    _set_frame_event(ctrl, int(event_id), True)
                     ps = ctrl.GetPipelineState()
                     pipeline_id = _get_pipeline_obj(ps, ctrl)
                     pipeline_resource_id = _resource_id_int(pipeline_id)
@@ -6807,7 +7077,7 @@ def _export_shader_catalog(params):
         finally:
             if restore_original_event:
                 try:
-                    ctrl.SetFrameEvent(original_event, True)
+                    _set_frame_event(ctrl, original_event, True)
                 except Exception as exc:
                     catalog["errors"].append({
                         "eventId": original_event, "scope": "restore_event",
@@ -7296,7 +7566,7 @@ def _find_by_shader(params):
             for action in action_records:
                 event_id = action["eventId"]
                 try:
-                    ctrl.SetFrameEvent(event_id, True)
+                    _set_frame_event(ctrl, event_id, True)
                     ps = ctrl.GetPipelineState()
                     pipeline_id = _get_pipeline_obj(ps, ctrl)
                 except Exception as exc:
@@ -7386,7 +7656,7 @@ def _find_by_shader(params):
         finally:
             if restore_original_event:
                 try:
-                    ctrl.SetFrameEvent(original_event, True)
+                    _set_frame_event(ctrl, original_event, True)
                 except Exception as exc:
                     errors.append({
                         "eventId": original_event, "scope": "restore_event",
@@ -7942,6 +8212,31 @@ def _get_frame_summary(params):
     return _get_capture_status(params)
 
 
+def _draw_call_details_on_replay(ctrl, event_id):
+    """Collect draw evidence from the controller's already-selected event."""
+    ps = ctrl.GetPipelineState()
+    result = {"eventId": int(event_id)}
+    for name, stage in [("vertex", rd.ShaderStage.Vertex),
+                        ("fragment", rd.ShaderStage.Fragment)]:
+        sid = ps.GetShader(stage)
+        if sid and int(sid) != 0:
+            result[name + "Shader"] = int(sid)
+    targets = ps.GetOutputTargets()
+    result["renderTargets"] = [int(t.resource) for t in targets if int(t.resource) != 0]
+    depth = ps.GetDepthTarget()
+    result["depthTarget"] = (
+        int(depth.resource) if depth and int(depth.resource) != 0 else None)
+    try:
+        vp = ps.GetViewport(0)
+        if vp:
+            result["viewport"] = {
+                "x": vp.x, "y": vp.y, "w": vp.width, "h": vp.height,
+            }
+    except Exception:
+        pass
+    return result
+
+
 def _get_draw_call_details(params):
     """Get details of a specific draw call."""
     event_id = params.get("event_id")
@@ -7949,28 +8244,45 @@ def _get_draw_call_details(params):
         raise ValueError("event_id required")
 
     def _do(ctrl):
-        ctrl.SetFrameEvent(int(event_id), True)
-        ps = ctrl.GetPipelineState()
-        pid = _get_pipeline_obj(ps, ctrl)
-
-        result = {"eventId": int(event_id)}
-        for name, stage in [("vertex", rd.ShaderStage.Vertex), ("fragment", rd.ShaderStage.Fragment)]:
-            sid = ps.GetShader(stage)
-            if sid and int(sid) != 0:
-                result[name + "Shader"] = int(sid)
-        targets = ps.GetOutputTargets()
-        result["renderTargets"] = [int(t.resource) for t in targets if int(t.resource) != 0]
-        depth = ps.GetDepthTarget()
-        result["depthTarget"] = int(depth.resource) if depth and int(depth.resource) != 0 else None
-        try:
-            vp = ps.GetViewport(0)
-            if vp:
-                result["viewport"] = {"x": vp.x, "y": vp.y, "w": vp.width, "h": vp.height}
-        except Exception:
-            pass
-        return result
+        _set_frame_event(ctrl, int(event_id), True)
+        return _draw_call_details_on_replay(ctrl, event_id)
 
     return _replay(_do)
+
+
+def _inspect_event(params):
+    """Collect draw and pipeline evidence in one replay-thread transaction."""
+    event_id = params.get("event_id")
+    if event_id is None:
+        raise ValueError("event_id required")
+    event_id = int(event_id)
+
+    def _do(ctrl):
+        _set_frame_event(ctrl, event_id, True)
+        return {
+            "schema": "renderdoc-internal-inspect-event/v1",
+            "eventId": event_id,
+            "drawCall": _draw_call_details_on_replay(ctrl, event_id),
+            "pipeline": _pipeline_state_on_replay(ctrl),
+        }
+
+    return _replay(_do)
+
+
+def _texture_info_on_replay(ctrl, resource_id):
+    """Collect texture metadata without entering the replay thread again."""
+    name_lookup = {}
+    for r in ctrl.GetResources():
+        name_lookup[int(r.resourceId)] = r.name
+    for t in ctrl.GetTextures():
+        if int(t.resourceId) == int(resource_id):
+            return {
+                "id": int(t.resourceId), "name": name_lookup.get(int(t.resourceId), ""),
+                "w": t.width, "h": t.height, "d": t.depth,
+                "fmt": _fmt_str(t.format), "mips": t.mips,
+                "array": t.arraysize, "size": t.byteSize,
+            }
+    return {"error": "Texture not found"}
 
 
 def _get_texture_info(params):
@@ -7979,21 +8291,7 @@ def _get_texture_info(params):
     if resource_id is None:
         raise ValueError("resource_id required")
 
-    def _do(ctrl):
-        name_lookup = {}
-        for r in ctrl.GetResources():
-            name_lookup[int(r.resourceId)] = r.name
-        for t in ctrl.GetTextures():
-            if int(t.resourceId) == int(resource_id):
-                return {
-                    "id": int(t.resourceId), "name": name_lookup.get(int(t.resourceId), ""),
-                    "w": t.width, "h": t.height, "d": t.depth,
-                    "fmt": _fmt_str(t.format), "mips": t.mips,
-                    "array": t.arraysize, "size": t.byteSize,
-                }
-        return {"error": "Texture not found"}
-
-    return _replay(_do)
+    return _replay(lambda ctrl: _texture_info_on_replay(ctrl, resource_id))
 
 
 def _get_texture_data(params):
@@ -8115,7 +8413,7 @@ def _fingerprint_event_outputs(params):
 
     def _do(ctrl):
         try:
-            ctrl.SetFrameEvent(event_id, True)
+            _set_frame_event(ctrl, event_id, True)
             if expected_session != _capture_session_id:
                 raise RuntimeError("capture session changed during output fingerprinting")
             pipeline = ctrl.GetPipelineState()
@@ -8215,11 +8513,28 @@ def _fingerprint_event_outputs(params):
         finally:
             if restore_event:
                 try:
-                    ctrl.SetFrameEvent(original_event, True)
+                    _set_frame_event(ctrl, original_event, True)
                 except Exception:
                     pass
 
     return _replay(_do)
+
+
+def _texture_minmax_on_replay(ctrl, resource_id):
+    """Collect base-subresource min/max values without a nested replay call."""
+    tid = _resolve_resource_id(ctrl, resource_id, "texture")
+    sub = rd.Subresource(0, 0, 0)
+    mn, mx = ctrl.GetMinMax(tid, sub, rd.CompType.Typeless)
+    return {
+        "min": {
+            "r": mn.floatValue[0], "g": mn.floatValue[1],
+            "b": mn.floatValue[2], "a": mn.floatValue[3],
+        },
+        "max": {
+            "r": mx.floatValue[0], "g": mx.floatValue[1],
+            "b": mx.floatValue[2], "a": mx.floatValue[3],
+        },
+    }
 
 
 def _get_texture_minmax(params):
@@ -8228,16 +8543,7 @@ def _get_texture_minmax(params):
     if resource_id is None:
         raise ValueError("resource_id required")
 
-    def _do(ctrl):
-        tid = _resolve_resource_id(ctrl, resource_id, "texture")
-        sub = rd.Subresource(0, 0, 0)
-        mn, mx = ctrl.GetMinMax(tid, sub, rd.CompType.Typeless)
-        return {
-            "min": {"r": mn.floatValue[0], "g": mn.floatValue[1], "b": mn.floatValue[2], "a": mn.floatValue[3]},
-            "max": {"r": mx.floatValue[0], "g": mx.floatValue[1], "b": mx.floatValue[2], "a": mx.floatValue[3]},
-        }
-
-    return _replay(_do)
+    return _replay(lambda ctrl: _texture_minmax_on_replay(ctrl, resource_id))
 
 
 def _pixel_history(params):
@@ -8245,27 +8551,35 @@ def _pixel_history(params):
     resource_id = params.get("resource_id")
     x = params.get("x", 0)
     y = params.get("y", 0)
+    event_id = _safe_int(params.get("event_id"), 0)
     if resource_id is None:
         raise ValueError("resource_id required")
+    if event_id <= 0:
+        raise ValueError("event_id must be a positive integer")
+    original_event = _safe_int(_ctx.CurEvent(), 0)
 
     def _do(ctrl):
-        tid = _resolve_resource_id(ctrl, resource_id, "texture")
-        sub = rd.Subresource(0, 0, 0)
-        mods = ctrl.PixelHistory(tid, x, y, sub, rd.CompType.Typeless)
-        result = []
-        for m in mods:
-            entry = {"eventId": m.eventId}
-            try:
-                if m.preMod:
-                    entry["pre"] = {"r": m.preMod.col.floatValue[0], "g": m.preMod.col.floatValue[1],
-                                    "b": m.preMod.col.floatValue[2], "a": m.preMod.col.floatValue[3]}
-                if m.postMod:
-                    entry["post"] = {"r": m.postMod.col.floatValue[0], "g": m.postMod.col.floatValue[1],
-                                     "b": m.postMod.col.floatValue[2], "a": m.postMod.col.floatValue[3]}
-            except Exception:
-                pass
-            result.append(entry)
-        return result
+        try:
+            _set_frame_event(ctrl, event_id, True)
+            tid = _resolve_resource_id(ctrl, resource_id, "texture")
+            sub = rd.Subresource(0, 0, 0)
+            mods = ctrl.PixelHistory(tid, x, y, sub, rd.CompType.Typeless)
+            result = []
+            for m in mods:
+                entry = {"eventId": m.eventId}
+                try:
+                    if m.preMod:
+                        entry["pre"] = {"r": m.preMod.col.floatValue[0], "g": m.preMod.col.floatValue[1],
+                                        "b": m.preMod.col.floatValue[2], "a": m.preMod.col.floatValue[3]}
+                    if m.postMod:
+                        entry["post"] = {"r": m.postMod.col.floatValue[0], "g": m.postMod.col.floatValue[1],
+                                         "b": m.postMod.col.floatValue[2], "a": m.postMod.col.floatValue[3]}
+                except Exception:
+                    pass
+                result.append(entry)
+            return result
+        finally:
+            _set_frame_event(ctrl, original_event, True)
 
     return _replay(_do)
 
@@ -8695,26 +9009,80 @@ def _inspect_pixel_object(params):
     mip = _safe_int(params.get("mip", 0), -1)
     array_slice = _safe_int(params.get("slice", 0), -1)
     sample = _safe_int(params.get("sample", 0), -1)
+    event_id = _safe_int(params.get("event_id"), 0)
     prefer_geometry = bool(params.get("prefer_geometry", True))
     if min(x, y, mip, array_slice, sample) < 0:
         raise ValueError("x, y, mip, slice, and sample must be non-negative integers")
+    if event_id <= 0:
+        raise ValueError("event_id must be a positive integer")
 
     original_event = _safe_int(_ctx.CurEvent(), 0)
 
     def _do(ctrl):
         try:
+            _set_frame_event(ctrl, event_id, True)
             result = _inspect_pixel_object_on_replay(
                 ctrl, texture_id, x, y, mip, array_slice, sample, prefer_geometry,
-                original_event)
+                event_id)
         finally:
             # PixelHistory performs internal replay. Always put the user's event selection back,
             # including event 0, and surface any restore failure instead of silently drifting.
-            ctrl.SetFrameEvent(original_event, True)
+            _set_frame_event(ctrl, original_event, True)
         result["eventRestore"] = {
             "originalEventId": original_event,
+            "frozenEventId": event_id,
             "restored": True,
         }
         return result
+
+    return _replay(_do)
+
+
+def _analyze_pixel(params):
+    """Collect texture, min/max, and pixel-history evidence in one replay call."""
+    if not _ctx or not _ctx.IsCaptureLoaded():
+        raise RuntimeError("No capture loaded")
+
+    texture_id = _safe_int(params.get("texture_id"), 0)
+    if texture_id <= 0:
+        raise ValueError("texture_id required")
+    x = _safe_int(params.get("x"), -1)
+    y = _safe_int(params.get("y"), -1)
+    mip = _safe_int(params.get("mip", 0), -1)
+    array_slice = _safe_int(params.get("slice", 0), -1)
+    sample = _safe_int(params.get("sample", 0), -1)
+    event_id = _safe_int(params.get("event_id"), 0)
+    prefer_geometry = bool(params.get("prefer_geometry", True))
+    if min(x, y, mip, array_slice, sample) < 0:
+        raise ValueError("x, y, mip, slice, and sample must be non-negative integers")
+    if event_id <= 0:
+        raise ValueError("event_id must be a positive integer")
+
+    original_event = _safe_int(_ctx.CurEvent(), 0)
+
+    def _do(ctrl):
+        try:
+            _set_frame_event(ctrl, event_id, True)
+            texture = _texture_info_on_replay(ctrl, texture_id)
+            minmax = _texture_minmax_on_replay(ctrl, texture_id)
+            inspection = _inspect_pixel_object_on_replay(
+                ctrl, texture_id, x, y, mip, array_slice, sample,
+                prefer_geometry, event_id)
+        finally:
+            # PixelHistory can change replay state internally. Restore the UI's
+            # visible event before this single replay-thread transaction ends.
+            _set_frame_event(ctrl, original_event, True)
+        inspection["eventRestore"] = {
+            "originalEventId": original_event,
+            "frozenEventId": event_id,
+            "restored": True,
+        }
+        return {
+            "schema": "renderdoc-internal-analyze-pixel/v1",
+            "texture": texture,
+            "minMax": minmax,
+            "inspection": inspection,
+        }
 
     return _replay(_do)
 
@@ -8739,7 +9107,7 @@ def _debug_pixel(params):
         trace = None
         try:
             if changed_event:
-                ctrl.SetFrameEvent(event_id, True)
+                _set_frame_event(ctrl, event_id, True)
             inputs = rd.DebugPixelInputs()
             inputs.sample = sample
             inputs.primitive = primitive_id if primitive_id >= 0 else 0xFFFFFFFF
@@ -8777,7 +9145,7 @@ def _debug_pixel(params):
                 except Exception:
                     pass
             if changed_event:
-                ctrl.SetFrameEvent(original_event, True)
+                _set_frame_event(ctrl, original_event, True)
 
     return _replay(_do)
 
@@ -8973,7 +9341,7 @@ def _get_action_timings(params):
             }
         finally:
             if restore_event:
-                ctrl.SetFrameEvent(original_event, True)
+                _set_frame_event(ctrl, original_event, True)
 
     return _replay(_do)
 
@@ -9180,142 +9548,1166 @@ def _write_rdc_project_index(params):
     return verified
 
 
-def _bind_rdc_project_shader_catalog(params):
-    """Rebind a cached workspace identity from bounded live Shader anchors.
+def _project_shader_index_hex(value, length, label):
+    text = str(value or "").strip().lower()
+    if (len(text) != length or
+            any(character not in "0123456789abcdef" for character in text)):
+        raise ValueError("%s must be %d lowercase hexadecimal characters" %
+                         (label, length))
+    return text
 
-    This fast path never treats RDC metadata as apply authority. Every supplied
-    anchor is re-read from the live replay and checked by ResourceId, stage,
-    entry point, and exact captured bytecode hash. Candidate reflection and the
-    final replacement still execute their normal complete ABI gates.
-    """
+
+def _project_shader_index_api(value):
+    token = _physical_enum(value)
+    aliases = {
+        "direct3d11": "d3d11",
+        "direct3d12": "d3d12",
+        "gl": "opengl",
+        "openglcore": "opengl",
+    }
+    return aliases.get(token, token)
+
+
+def _project_shader_index_encoding(value):
+    token = _physical_enum(value).replace("-", "")
+    aliases = {
+        "directxbytecode": "dxbc",
+        "directxil": "dxil",
+        "dxilcontainer": "dxil",
+        "spv": "spirv",
+        "spirvshader": "spirv",
+        "openglspirv": "opengl-spirv",
+        "glslshader": "glsl",
+        "openglglsl": "glsl",
+    }
+    return aliases.get(token, token)
+
+
+def _project_shader_index_format_supported(api, encoding):
+    return encoding in {
+        "d3d11": {"dxbc"},
+        "d3d12": {"dxbc", "dxil"},
+        "opengl": {"glsl", "spirv", "opengl-spirv"},
+        "vulkan": {"spirv"},
+    }.get(api, set())
+
+
+def _validated_project_shader_index_request(params, capture_path):
+    capture_id = _project_shader_index_hex(
+        params.get("expected_capture_id"), 64, "expected_capture_id")
+    evidence_sha256 = _project_shader_index_hex(
+        params.get("expected_identity_evidence_sha256"), 64,
+        "expected_identity_evidence_sha256")
+    api = _project_shader_index_api(params.get("expected_api"))
+    if (not api or len(api) > 32 or
+            any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-"
+                for character in api)):
+        raise ValueError("expected_api is invalid")
+    values = params.get("expected_shaders")
+    if (not isinstance(values, list) or not values or
+            len(values) > MAX_PROJECT_SHADER_INDEX_EXPECTED):
+        raise ValueError(
+            "expected_shaders must contain between 1 and %d records" %
+            MAX_PROJECT_SHADER_INDEX_EXPECTED)
+    shaders = []
+    keys = set()
+    total_blocks = 0
+    for index, value in enumerate(values):
+        if not isinstance(value, dict) or set(value) != {
+                "resourceId", "stage", "entryPoint", "encoding", "rawSha256",
+                "interfaceHash", "layoutHash", "interfaceComplete",
+                "constantBlocks", "anchorEventId"}:
+            raise ValueError("expected_shaders[%d] fields are invalid" % index)
+        resource_id = _safe_int(value.get("resourceId"), -1)
+        stage = _normalise_stage_name(value.get("stage"))
+        entry_point = str(value.get("entryPoint", "") or "")
+        encoding = _project_shader_index_encoding(value.get("encoding"))
+        raw_sha256 = _project_shader_index_hex(
+            value.get("rawSha256"), 64,
+            "expected_shaders[%d].rawSha256" % index)
+        interface_hash = str(value.get("interfaceHash", "") or "").lower()
+        layout_hash = str(value.get("layoutHash", "") or "").lower()
+        for digest, label in (
+                (interface_hash, "interfaceHash"),
+                (layout_hash, "layoutHash")):
+            if digest:
+                _project_shader_index_hex(
+                    digest, 64, "expected_shaders[%d].%s" % (index, label))
+        interface_complete = value.get("interfaceComplete")
+        anchor_event_id = _safe_int(value.get("anchorEventId"), -1)
+        if (resource_id <= 0 or not stage or len(stage) > 32 or
+                len(entry_point.encode("utf-8")) > 512 or
+                not encoding or len(encoding) > 32 or
+                any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-"
+                    for character in encoding) or
+                not isinstance(interface_complete, bool) or anchor_event_id <= 0):
+            raise ValueError("expected_shaders[%d] identity is invalid" % index)
+        key = (resource_id, stage, entry_point, raw_sha256)
+        if key in keys:
+            raise ValueError("expected_shaders contains a duplicate Shader identity")
+        keys.add(key)
+        raw_blocks = value.get("constantBlocks")
+        if not isinstance(raw_blocks, list):
+            raise ValueError("expected_shaders[%d].constantBlocks is invalid" % index)
+        total_blocks += len(raw_blocks)
+        if total_blocks > MAX_PROJECT_SHADER_INDEX_BLOCKS:
+            raise ValueError("expected Shader constant-block identities are oversized")
+        blocks = []
+        block_keys = set()
+        for block_index, block in enumerate(raw_blocks):
+            if not isinstance(block, dict) or set(block) != {
+                    "index", "path", "space", "bind", "byteSize",
+                    "layoutSha256", "abiSha256"}:
+                raise ValueError(
+                    "expected_shaders[%d].constantBlocks[%d] fields are invalid" %
+                    (index, block_index))
+            reflected_index = _safe_int(block.get("index"), -1)
+            path = str(block.get("path", "") or "")
+            space = _safe_int(block.get("space"), -1)
+            bind = _safe_int(block.get("bind"), -1)
+            byte_size = _safe_int(block.get("byteSize"), -1)
+            layout_sha256 = _project_shader_index_hex(
+                block.get("layoutSha256"), 64,
+                "expected constant-block layoutSha256")
+            abi_sha256 = _project_shader_index_hex(
+                block.get("abiSha256"), 64,
+                "expected constant-block abiSha256")
+            block_key = (space, bind, reflected_index, path)
+            if (reflected_index < 0 or reflected_index > 65535 or
+                    space < 0 or space > 65535 or bind < 0 or bind > 65535 or
+                    byte_size <= 0 or byte_size > (1 << 32) - 1 or not path or
+                    len(path.encode("utf-8")) > 2048 or block_key in block_keys):
+                raise ValueError("expected constant-block identity is invalid")
+            block_keys.add(block_key)
+            blocks.append({
+                "index": reflected_index,
+                "path": path,
+                "space": space,
+                "bind": bind,
+                "byteSize": byte_size,
+                "layoutSha256": layout_sha256,
+                "abiSha256": abi_sha256,
+            })
+        shaders.append({
+            "resourceId": resource_id,
+            "stage": stage,
+            "entryPoint": entry_point,
+            "encoding": encoding,
+            "rawSha256": raw_sha256,
+            "interfaceHash": interface_hash,
+            "layoutHash": layout_hash,
+            "interfaceComplete": interface_complete,
+            "constantBlocks": sorted(
+                blocks, key=lambda item: (
+                    item["space"], item["bind"], item["index"], item["path"])),
+            "anchorEventId": anchor_event_id,
+        })
+    shaders.sort(key=lambda item: (
+        item["resourceId"], item["stage"], item["entryPoint"],
+        item["rawSha256"]))
+    request = {
+        "capturePath": os.path.normcase(os.path.abspath(capture_path)),
+        "captureSessionId": _capture_session_id,
+        "captureId": capture_id,
+        "identityEvidenceSha256": evidence_sha256,
+        "api": api,
+        "shaders": shaders,
+    }
+    request["requestSha256"] = hashlib.sha256(
+        _canonical_project_index_bytes(request)).hexdigest()
+    if len(_canonical_project_index_bytes(request)) > MAX_PROJECT_SHADER_INDEX_BYTES:
+        raise ValueError("expected Shader resource-index request exceeds the size limit")
+    return request
+
+
+def _project_shader_index_capability(api, supported, reason_id=""):
+    return {
+        "supported": bool(supported),
+        "api": api,
+        "mode": "shader-resource-null-pipeline-reflection",
+        "reasonId": str(reason_id or ""),
+        "fallback": "explicit-catalog-build-required",
+        "eventTraversalSupported": False,
+        "physicalAbiFromNullPipeline": bool(
+            supported and api in ("d3d11", "d3d12", "opengl")),
+        "anchorPreflightRequired": True,
+    }
+
+
+def _project_shader_index_job_snapshot(job, idempotent=False):
+    value = {
+        "schema": "replaylab-project-shader-resource-index-job/v1",
+        "schemaVersion": 1,
+        "jobId": job["jobId"],
+        "status": job["status"],
+        "captureSessionId": job["captureSessionId"],
+        "requestSha256": job["requestSha256"],
+        "idempotent": bool(idempotent),
+        "committed": job.get("committed") is True,
+        "cancellationRequested": job.get("cancelRequested") is True,
+    }
+    if job["status"] == "completed":
+        value["result"] = job["result"]
+    elif job["status"] == "failed" or job.get("cancelRequested") is True:
+        value["error"] = str(job.get("error", "") or "")[:4096]
+    return value
+
+
+def _request_project_shader_index_cancel(job, now, reason):
+    if job.get("status") not in ("queued", "running"):
+        return False
+    cancel_event = job.get("cancelEvent")
+    if cancel_event is not None:
+        cancel_event.set()
+    if job.get("cancelRequested") is not True:
+        job["cancelRequested"] = True
+        job["cancelRequestedMonotonic"] = now
+        job["error"] = str(reason or "Project Shader resource indexing cancelled")
+        job["updatedMonotonic"] = now
+    return True
+
+
+def _cleanup_project_shader_index_jobs(now):
+    for job in _project_shader_index_jobs.values():
+        if (job.get("status") in ("queued", "running") and
+                job.get("cancelRequested") is not True and
+                now - float(job.get("createdMonotonic", now)) >=
+                PROJECT_SHADER_INDEX_JOB_TIMEOUT_SECONDS):
+            was_queued = job.get("status") == "queued"
+            _request_project_shader_index_cancel(
+                job, now, "Project Shader resource indexing timed out")
+            # A request that never entered ReplayManager has no worker left to
+            # acknowledge cancellation.  Make that state terminal immediately;
+            # otherwise it remains queued forever and permanently consumes the
+            # bounded job capacity.  Running work retains its cancellation flag
+            # until its replay callback observes it and records the terminal
+            # result, so a blocked replay cannot be mistaken for released work.
+            if was_queued:
+                job["status"] = "failed"
+                job["finishedMonotonic"] = now
+    expired = [
+        job_id for job_id, job in _project_shader_index_jobs.items()
+        if (job.get("status") in ("completed", "failed") and
+            now - float(job.get("updatedMonotonic", now)) >=
+            PROJECT_SHADER_INDEX_JOB_TTL_SECONDS)
+    ]
+    for job_id in expired:
+        _project_shader_index_jobs.pop(job_id, None)
+
+
+def _project_shader_resource_type(value):
+    resource_type = getattr(value, "type", None)
+    shader_type = getattr(getattr(rd, "ResourceType", None), "Shader", None)
+    if shader_type is not None and resource_type == shader_type:
+        return True
+    return _physical_enum(resource_type) == "shader"
+
+
+class _ProjectShaderIndexLimit(RuntimeError):
+    def __init__(self, reason_id, message):
+        RuntimeError.__init__(self, message)
+        self.reason_id = reason_id
+
+
+class _ProjectShaderIndexCancelled(RuntimeError):
+    pass
+
+
+def _check_project_shader_index_cancel(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise _ProjectShaderIndexCancelled(
+            "Project Shader resource indexing cancelled")
+
+
+def _new_project_shader_reflection_budget():
+    return {
+        "fields": 0,
+        "signatures": 0,
+        "bindings": 0,
+        "samplers": 0,
+        "stringBytes": 0,
+    }
+
+
+def _project_shader_index_charge(budget, key, maximum, reason_id, label):
+    budget[key] = _safe_int(budget.get(key), 0) + 1
+    if budget[key] > maximum:
+        raise _ProjectShaderIndexLimit(
+            reason_id, "Shader reflection exceeds the %s limit" % label)
+
+
+def _project_shader_index_text(value, budget):
+    text = str(value or "")
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeError:
+        raise _ProjectShaderIndexLimit(
+            "shader-resource-index-reflection-string-limit",
+            "Shader reflection contains invalid Unicode text")
+    if size > MAX_PROJECT_SHADER_INDEX_REFLECTION_STRING_BYTES:
+        raise _ProjectShaderIndexLimit(
+            "shader-resource-index-reflection-string-limit",
+            "Shader reflection contains an oversized string")
+    budget["stringBytes"] = _safe_int(budget.get("stringBytes"), 0) + size
+    if (budget["stringBytes"] >
+            MAX_PROJECT_SHADER_INDEX_REFLECTION_TOTAL_STRING_BYTES):
+        raise _ProjectShaderIndexLimit(
+            "shader-resource-index-reflection-string-limit",
+            "Shader reflection text exceeds the aggregate size limit")
+    return text
+
+
+def _project_shader_index_sequence(values, maximum, reason_id, label):
+    result = []
+    for value in values or []:
+        if len(result) >= maximum:
+            raise _ProjectShaderIndexLimit(
+                reason_id, "Shader resource index exceeds the %s limit" % label)
+        result.append(value)
+    return result
+
+
+def _project_shader_index_constants(values, budget, depth=0):
+    if depth > MAX_PROJECT_SHADER_INDEX_REFLECTION_DEPTH:
+        raise _ProjectShaderIndexLimit(
+            "shader-resource-index-reflection-depth-limit",
+            "Shader reflection nesting exceeds the depth limit")
+    for constant in values or []:
+        _project_shader_index_charge(
+            budget, "fields", MAX_PROJECT_SHADER_INDEX_REFLECTION_FIELDS,
+            "shader-resource-index-reflection-field-limit", "field-count")
+        _project_shader_index_text(getattr(constant, "name", ""), budget)
+        shader_type = getattr(constant, "type", None)
+        if shader_type is None:
+            continue
+        for attribute in ("name", "baseType"):
+            _project_shader_index_text(
+                getattr(shader_type, attribute, ""), budget)
+        elements = _safe_int(getattr(shader_type, "elements", 1), 1)
+        if elements < 0 or elements > (1 << 20):
+            raise _ProjectShaderIndexLimit(
+                "shader-resource-index-reflection-field-limit",
+                "Shader reflection contains an invalid array element count")
+        members = getattr(shader_type, "members", []) or []
+        if members:
+            _project_shader_index_constants(members, budget, depth + 1)
+
+
+def _validate_project_shader_reflection_budget(reflection, budget):
+    """Bound reflection before any recursive serialisation or JSON hashing."""
+
+    for attribute in ("stage", "entryPoint", "encoding", "outputTopology"):
+        _project_shader_index_text(getattr(reflection, attribute, ""), budget)
+
+    blocks = []
+    for block in getattr(reflection, "constantBlocks", []) or []:
+        if len(blocks) >= MAX_PROJECT_SHADER_INDEX_BLOCKS:
+            raise _ProjectShaderIndexLimit(
+                "shader-resource-index-block-limit",
+                "Shader reflection exceeds the constant-block limit")
+        blocks.append(block)
+        _project_shader_index_text(getattr(block, "name", ""), budget)
+        _project_shader_index_constants(
+            getattr(block, "variables", []) or [], budget)
+
+    for attribute in ("inputSignature", "outputSignature"):
+        for value in getattr(reflection, attribute, []) or []:
+            _project_shader_index_charge(
+                budget, "signatures", MAX_PROJECT_SHADER_INDEX_SIGNATURES,
+                "shader-resource-index-reflection-signature-limit",
+                "signature-count")
+            for name in (
+                    "varName", "semanticName", "semanticIdxName",
+                    "systemValue", "varType", "compType"):
+                _project_shader_index_text(getattr(value, name, ""), budget)
+
+    for attribute in ("readOnlyResources", "readWriteResources"):
+        for value in getattr(reflection, attribute, []) or []:
+            _project_shader_index_charge(
+                budget, "bindings", MAX_PROJECT_SHADER_INDEX_BINDINGS,
+                "shader-resource-index-reflection-binding-limit",
+                "resource-binding-count")
+            for name in ("name", "descriptorType", "textureType"):
+                _project_shader_index_text(getattr(value, name, ""), budget)
+            variable_type = getattr(value, "variableType", None)
+            if variable_type is not None:
+                for name in ("name", "baseType"):
+                    _project_shader_index_text(
+                        getattr(variable_type, name, ""), budget)
+                _project_shader_index_constants(
+                    getattr(variable_type, "members", []) or [], budget)
+
+    for value in getattr(reflection, "samplers", []) or []:
+        _project_shader_index_charge(
+            budget, "samplers", MAX_PROJECT_SHADER_INDEX_SAMPLERS,
+            "shader-resource-index-reflection-sampler-limit",
+            "sampler-count")
+        _project_shader_index_text(getattr(value, "name", ""), budget)
+
+    for value in getattr(reflection, "interfaces", []) or []:
+        _project_shader_index_charge(
+            budget, "bindings", MAX_PROJECT_SHADER_INDEX_BINDINGS,
+            "shader-resource-index-reflection-binding-limit",
+            "interface-count")
+        _project_shader_index_text(getattr(value, "name", ""), budget)
+    return blocks
+
+
+def _project_symbol_enum_token(value):
+    return (str(value or "").strip().lower().rsplit(".", 1)[-1]
+            .replace("_", ""))
+
+
+def _project_symbol_base_type(value):
+    if isinstance(value, dict):
+        if value.get("members") or value.get("fields"):
+            return "struct"
+        value = value.get("baseType", value.get("type", ""))
+    token = str(value or "").strip().lower().rsplit(".", 1)[-1]
+    token = token.replace("_", "").replace(" ", "")
+    token = re.sub(r"\d+(x\d+)?$", "", token)
+    return {
+        "float32": "float",
+        "single": "float",
+        "sint": "int",
+        "signedint": "int",
+        "int32": "int",
+        "unsignedint": "uint",
+        "uint32": "uint",
+        "float16": "half",
+        "min16float": "half",
+        "float64": "double",
+    }.get(token, token)
+
+
+def _project_symbol_fields(values, budget=None, depth=0):
+    if budget is None:
+        budget = _new_project_shader_reflection_budget()
+    if depth > MAX_PROJECT_SHADER_INDEX_REFLECTION_DEPTH:
+        raise _ProjectShaderIndexLimit(
+            "shader-resource-index-reflection-depth-limit",
+            "Shader interface nesting exceeds the depth limit")
+    result = []
+    for field in values or []:
+        if not isinstance(field, dict):
+            continue
+        _project_shader_index_charge(
+            budget, "fields", MAX_PROJECT_SHADER_INDEX_REFLECTION_FIELDS,
+            "shader-resource-index-reflection-field-limit", "field-count")
+        for value in (
+                field.get("name", ""), field.get("path", ""),
+                field.get("type", ""), field.get("baseType", "")):
+            _project_shader_index_text(value, budget)
+        result.append({
+            "offset": _safe_int(
+                field.get("byteOffset", field.get("offset", -1)), -1),
+            "byteSize": _safe_int(field.get("byteSize", 0), 0),
+            "type": _project_symbol_base_type(field),
+            "rows": _safe_int(field.get("rows", 1), 1),
+            "columns": _safe_int(
+                field.get("columns", field.get("cols", 1)), 1),
+            "elements": _safe_int(field.get("elements", 1), 1),
+            "arrayStride": _safe_int(
+                field.get("arrayStride", field.get("arrayByteStride", 0)), 0),
+            "matrixStride": _safe_int(
+                field.get("matrixStride", field.get("matrixByteStride", 0)), 0),
+            "rowMajor": bool(field.get("rowMajor", False)),
+            "flags": _safe_int(field.get("flags", 0), 0),
+            "pointerTypeID": _safe_int(
+                field.get("pointerTypeID", 0xFFFFFFFF), 0xFFFFFFFF),
+            "bitFieldOffset": _safe_int(field.get("bitFieldOffset", 0), 0),
+            "bitFieldSize": _safe_int(field.get("bitFieldSize", 0), 0),
+            "members": _project_symbol_fields(
+                field.get("members", field.get("fields", [])),
+                budget, depth + 1),
+        })
+    return _physical_sorted(result)
+
+
+def _project_symbol_layout_material(shader, budget=None):
+    if budget is None:
+        budget = _new_project_shader_reflection_budget()
+    raw_blocks = shader.get(
+        "constantBuffers",
+        shader.get("constantBlocks", shader.get("constant_blocks", []))) or []
+    if not isinstance(raw_blocks, list):
+        return []
+    result = []
+    for block in raw_blocks:
+        if not isinstance(block, dict):
+            continue
+        _project_shader_index_text(block.get("name", ""), budget)
+        result.append({
+            "space": _safe_int(
+                block.get("space", block.get("registerSpace", 0)), 0),
+            "bind": _safe_int(
+                block.get("bind", block.get("bindNumber", -1)), -1),
+            "arraySize": _safe_int(
+                block.get("arraySize", block.get("bindArraySize", 1)), 1),
+            "size": _safe_int(block.get("byteSize", block.get("size", 0)), 0),
+            "bufferBacked": bool(block.get("bufferBacked", True)),
+            "inlineDataBytes": bool(block.get("inlineDataBytes", False)),
+            "compileConstants": bool(block.get("compileConstants", False)),
+            "fields": _project_symbol_fields(
+                block.get("fields", block.get("variables", [])), budget),
+        })
+    return _physical_sorted(result)
+
+
+def _project_symbol_signature(values, budget):
+    result = []
+    for value in values or []:
+        if not isinstance(value, dict):
+            continue
+        _project_shader_index_charge(
+            budget, "signatures", MAX_PROJECT_SHADER_INDEX_SIGNATURES,
+            "shader-resource-index-reflection-signature-limit",
+            "signature-count")
+        for text in (
+                value.get("semanticName", value.get("semantic", "")),
+                value.get("semanticIdxName", ""), value.get("systemValue", ""),
+                value.get("compType", value.get("componentType", ""))):
+            _project_shader_index_text(text, budget)
+        result.append({
+            "location": _safe_int(
+                value.get("regIndex", value.get("location", -1)), -1),
+            "semantic": str(
+                value.get("semanticName", value.get("semantic", "")) or "").lower(),
+            "semanticIndexName": str(
+                value.get("semanticIdxName", "") or "").lower(),
+            "semanticIndex": _safe_int(
+                value.get("semanticIndex", value.get("index", 0)), 0),
+            "systemValue": _project_symbol_enum_token(value.get("systemValue", "")),
+            "componentType": _project_symbol_base_type(
+                value.get("compType", value.get("componentType", ""))),
+            "componentCount": _safe_int(
+                value.get("compCount", value.get("componentCount", 0)), 0),
+            "stream": _safe_int(value.get("stream", 0), 0),
+            "registerMask": _safe_int(
+                value.get("regChannelMask", value.get("registerMask", 0)), 0),
+            "usedMask": _safe_int(
+                value.get("channelUsedMask", value.get("usedMask", 0)), 0),
+            "perPrimitiveRate": bool(value.get("perPrimitiveRate", False)),
+            "needSemanticIndex": bool(value.get("needSemanticIndex", False)),
+        })
+    return _physical_sorted(result)
+
+
+def _project_symbol_variable_type(value, budget):
+    if not isinstance(value, dict):
+        _project_shader_index_text(value, budget)
+        return {"legacyToken": _project_symbol_enum_token(value)}
+    for text in (value.get("name", ""), value.get("baseType", "")):
+        _project_shader_index_text(text, budget)
+    return {
+        "baseType": _project_symbol_base_type(value),
+        "rows": _safe_int(value.get("rows", 0), 0),
+        "columns": _safe_int(
+            value.get("columns", value.get("cols", 0)), 0),
+        "elements": _safe_int(value.get("elements", 0), 0),
+        "arrayStride": _safe_int(
+            value.get("arrayByteStride", value.get("arrayStride", 0)), 0),
+        "matrixStride": _safe_int(
+            value.get("matrixByteStride", value.get("matrixStride", 0)), 0),
+        "rowMajor": bool(value.get("rowMajor", False)),
+        "flags": _safe_int(value.get("flags", 0), 0),
+        "pointerTypeID": _safe_int(
+            value.get("pointerTypeID", 0xFFFFFFFF), 0xFFFFFFFF),
+        "byteSize": _safe_int(value.get("byteSize", 0), 0),
+        "members": _project_symbol_fields(
+            value.get("members", value.get("fields", [])), budget),
+    }
+
+
+def _project_symbol_bindings(values, budget):
+    result = []
+    for value in values or []:
+        if not isinstance(value, dict):
+            continue
+        _project_shader_index_charge(
+            budget, "bindings", MAX_PROJECT_SHADER_INDEX_BINDINGS,
+            "shader-resource-index-reflection-binding-limit",
+            "resource-binding-count")
+        for text in (
+                value.get("name", ""), value.get("descriptorType", ""),
+                value.get("resourceType", value.get("resType", "")),
+                value.get("textureType", value.get("dimension", ""))):
+            _project_shader_index_text(text, budget)
+        result.append({
+            "space": _safe_int(
+                value.get("space", value.get("fixedBindSetOrSpace", 0)), 0),
+            "bind": _safe_int(
+                value.get("bind", value.get("fixedBindNumber", -1)), -1),
+            "arraySize": _safe_int(
+                value.get("arraySize", value.get("bindArraySize", 1)), 1),
+            "descriptorType": _project_symbol_enum_token(
+                value.get("descriptorType", value.get(
+                    "resourceType", value.get("resType", "")))),
+            "textureType": _project_symbol_enum_token(
+                value.get("textureType", value.get("dimension", ""))),
+            "variableType": _project_symbol_variable_type(
+                value.get("variableType", ""), budget),
+            "isTexture": bool(value.get("isTexture", False)),
+            "hasSampler": bool(value.get("hasSampler", False)),
+            "isInputAttachment": bool(value.get("isInputAttachment", False)),
+            "isReadOnly": bool(value.get("isReadOnly", False)),
+        })
+    return _physical_sorted(result)
+
+
+def _project_symbol_samplers(values, budget):
+    result = []
+    for value in values or []:
+        if not isinstance(value, dict):
+            continue
+        _project_shader_index_charge(
+            budget, "samplers", MAX_PROJECT_SHADER_INDEX_SAMPLERS,
+            "shader-resource-index-reflection-sampler-limit",
+            "sampler-count")
+        _project_shader_index_text(value.get("name", ""), budget)
+        result.append({
+            "space": _safe_int(
+                value.get("space", value.get("fixedBindSetOrSpace", 0)), 0),
+            "bind": _safe_int(
+                value.get("bind", value.get("fixedBindNumber", -1)), -1),
+            "arraySize": _safe_int(
+                value.get("arraySize", value.get("bindArraySize", 1)), 1),
+        })
+    return _physical_sorted(result)
+
+
+def _project_symbol_hashes(shader):
+    budget = _new_project_shader_reflection_budget()
+    blocks = _project_symbol_layout_material(shader, budget)
+    layout_sha256 = (_canonical_json_sha256(blocks) if blocks else "")
+    dimensions = shader.get("threadGroupSize", []) or []
+    if not isinstance(dimensions, list):
+        dimensions = []
+    interface = {
+        "inputs": _project_symbol_signature(
+            shader.get("inputSignature", shader.get("inputs", [])), budget),
+        "outputs": _project_symbol_signature(
+            shader.get("outputSignature", shader.get("outputs", [])), budget),
+        "readOnly": _project_symbol_bindings(
+            shader.get("readOnlyResources", shader.get("resources", [])), budget),
+        "readWrite": _project_symbol_bindings(
+            shader.get("readWriteResources", []), budget),
+        "samplers": _project_symbol_samplers(shader.get("samplers", []), budget),
+        "constantBuffers": blocks,
+        "threadGroupSize": [_safe_int(value, 0) for value in dimensions],
+        "outputTopology": _project_symbol_enum_token(
+            shader.get("outputTopology", "")),
+        "dynamicLinkageInterfaceCount": _safe_int(
+            shader.get("dynamicLinkageInterfaceCount", -1), -1),
+    }
+    return _canonical_json_sha256(interface), layout_sha256
+
+
+def _project_shader_index_block(reflection_block, block_index, stage_name):
+    block = _constant_block_dict(reflection_block, block_index)
+    path = str(block.get("name", "") or "cbuffer%d" % block_index)
+    layout = _event_cbuffer_layout(reflection_block, block_index, stage_name)
+    physical_interface = _physical_shader_interface({
+        "stage": stage_name,
+        "entryPoint": "",
+        "inputSignature": [],
+        "outputSignature": [],
+        "readOnlyResources": [],
+        "readWriteResources": [],
+        "samplers": [],
+        "constantBlocks": [block],
+        "dynamicLinkageInterfaceCount": 0,
+        "outputTopology": "",
+        "threadGroupSize": [],
+    })
+    physical_blocks = physical_interface.get("constantBlocks", [])
+    return {
+        "index": block_index,
+        "path": path,
+        "space": _safe_int(block.get("space"), 0),
+        "bind": _safe_int(block.get("bind"), block_index),
+        "byteSize": _safe_int(block.get("byteSize"), 0),
+        "layoutSha256": _canonical_json_sha256(layout),
+        "abiSha256": _canonical_json_sha256(
+            physical_blocks[0] if physical_blocks else {}),
+    }
+
+
+def _build_project_shader_resource_index(ctrl, request, cancel_event=None):
+    _check_project_shader_index_cancel(cancel_event)
+    api = ""
+    try:
+        api = _project_shader_index_api(
+            getattr(ctrl.GetAPIProperties(), "pipelineType", ""))
+    except Exception:
+        api = ""
+    _check_project_shader_index_cancel(cancel_event)
+    capability = _project_shader_index_capability(api, True)
+    if api not in ("d3d11", "d3d12", "opengl", "vulkan"):
+        capability = _project_shader_index_capability(
+            api, False, "shader-resource-index-api-unsupported")
+    elif api != request["api"]:
+        capability = _project_shader_index_capability(
+            api, False, "shader-resource-index-api-mismatch")
+    elif any(not _project_shader_index_format_supported(api, item["encoding"])
+             for item in request["shaders"]):
+        capability = _project_shader_index_capability(
+            api, False, "shader-resource-index-format-unsupported")
+    base = {
+        "schema": "replaylab-project-shader-resource-index/v1",
+        "schemaVersion": 1,
+        "capturePath": request["capturePath"],
+        "captureSessionId": request["captureSessionId"],
+        "captureId": request["captureId"],
+        "identityEvidenceSha256": request["identityEvidenceSha256"],
+        "requestSha256": request["requestSha256"],
+        "capability": capability,
+        "matched": False,
+        "reasonId": capability["reasonId"],
+        "expectedShaderCount": len(request["shaders"]),
+        "matchedShaderCount": 0,
+        "scannedResourceCount": 0,
+        "shaderResourceCount": 0,
+        "inspectedEntryPointCount": 0,
+        "assets": [],
+        "diagnostics": [],
+        "eventTraversalCount": 0,
+        "fullFrameTraversal": False,
+        "gpuReplayMutation": False,
+        "physicalApplyAuthority": False,
+        "resourceOwnershipScope": "target-capture-session",
+        "crossCaptureResourceIdReuse": False,
+    }
+    if not capability["supported"]:
+        return base
+
+    try:
+        _check_project_shader_index_cancel(cancel_event)
+        resources = _project_shader_index_sequence(
+            ctrl.GetResources(), MAX_PROJECT_SHADER_INDEX_RESOURCES,
+            "shader-resource-index-resource-limit", "resource-count")
+        _check_project_shader_index_cancel(cancel_event)
+    except _ProjectShaderIndexLimit as exc:
+        base["reasonId"] = exc.reason_id
+        return base
+    base["scannedResourceCount"] = len(resources)
+    by_id = {}
+    shader_count = 0
+    duplicate_ids = set()
+    wanted_ids = set(item["resourceId"] for item in request["shaders"])
+    for description in resources:
+        _check_project_shader_index_cancel(cancel_event)
+        if not _project_shader_resource_type(description):
+            continue
+        shader_count += 1
+        resource = getattr(description, "resourceId", description)
+        resource_id = _resource_id_int(resource)
+        if resource_id not in wanted_ids:
+            continue
+        if resource_id in by_id:
+            duplicate_ids.add(resource_id)
+        by_id[resource_id] = resource
+    base["shaderResourceCount"] = shader_count
+    if duplicate_ids:
+        base["reasonId"] = "shader-resource-index-ambiguous"
+        base["diagnostics"].append({
+            "code": "duplicate-shader-resource-id",
+            "resourceIds": sorted(duplicate_ids),
+        })
+        return base
+
+    expected_by_owner = {}
+    for expected in request["shaders"]:
+        expected_by_owner.setdefault(expected["resourceId"], []).append(expected)
+
+    inspected_entries = 0
+    total_blocks = 0
+    reflection_budget = _new_project_shader_reflection_budget()
+    owner_content_index = {}
+    owner_module_index = {}
+    for resource_id, expected_values in sorted(expected_by_owner.items()):
+        _check_project_shader_index_cancel(cancel_event)
+        resource = by_id.get(resource_id)
+        if resource is None:
+            for expected in expected_values:
+                base["diagnostics"].append({
+                    "code": "shader-resource-absent",
+                    "resourceId": resource_id,
+                    "stage": expected["stage"],
+                })
+            continue
+        try:
+            _check_project_shader_index_cancel(cancel_event)
+            entries = _project_shader_index_sequence(
+                ctrl.GetShaderEntryPoints(resource),
+                MAX_PROJECT_SHADER_INDEX_ENTRIES - inspected_entries,
+                "shader-resource-index-entry-limit", "entry-point-count")
+            _check_project_shader_index_cancel(cancel_event)
+        except _ProjectShaderIndexLimit as exc:
+            base["reasonId"] = exc.reason_id
+            base["inspectedEntryPointCount"] = inspected_entries
+            return base
+        inspected_entries += len(entries)
+        wanted_modules = set(
+            (item["stage"], item["entryPoint"], item["encoding"], item["rawSha256"])
+            for item in expected_values)
+        for entry in entries:
+            _check_project_shader_index_cancel(cancel_event)
+            entry_name = str(getattr(entry, "name", "") or "")
+            if not any(item["entryPoint"] == entry_name for item in expected_values):
+                continue
+            _check_project_shader_index_cancel(cancel_event)
+            reflection = ctrl.GetShader(rd.ResourceId(), resource, entry)
+            _check_project_shader_index_cancel(cancel_event)
+            if reflection is None:
+                continue
+            stage_name = _normalise_stage_name(
+                getattr(reflection, "stage", getattr(entry, "stage", "")))
+            reflected_entry = str(
+                getattr(reflection, "entryPoint", "") or entry_name)
+            encoding = _project_shader_index_encoding(
+                getattr(reflection, "encoding", ""))
+            raw_bytes = _shader_raw_bytes(reflection)
+            raw_sha256 = hashlib.sha256(raw_bytes).hexdigest() if raw_bytes else ""
+            module_key = (stage_name, reflected_entry, encoding, raw_sha256)
+            if module_key not in wanted_modules:
+                continue
+            try:
+                reflected_blocks = _validate_project_shader_reflection_budget(
+                    reflection, reflection_budget)
+                total_blocks += len(reflected_blocks)
+                if total_blocks > MAX_PROJECT_SHADER_INDEX_BLOCKS:
+                    raise _ProjectShaderIndexLimit(
+                        "shader-resource-index-block-limit",
+                        "Shader reflection exceeds the constant-block limit")
+                dxil_layout_evidence = None
+                if encoding == "dxil":
+                    _check_project_shader_index_cancel(cancel_event)
+                    try:
+                        unused_access, dxil_layout_evidence = (
+                            _dxil_evidence_from_live_disassembly(
+                                ctrl, rd.ResourceId(), reflection))
+                    except Exception:
+                        dxil_layout_evidence = _dxil_layout_evidence_for_all_blocks(
+                            reflection, "unavailable")
+                    _check_project_shader_index_cancel(cancel_event)
+                compiled = _compiled_shader_interface(
+                    reflection, dxil_layout_evidence)
+                _check_project_shader_index_cancel(cancel_event)
+                compiled["stage"] = stage_name
+                compiled["entryPoint"] = reflected_entry
+                compiled["encoding"] = encoding
+                interface_sha256, layout_sha256 = _project_symbol_hashes(compiled)
+                interface_complete = bool(
+                    compiled.get("interfaceComplete", False))
+                blocks = []
+                for block_index, reflected_block in enumerate(reflected_blocks):
+                    _check_project_shader_index_cancel(cancel_event)
+                    blocks.append(_project_shader_index_block(
+                        reflected_block, block_index, stage_name))
+            except _ProjectShaderIndexLimit as exc:
+                base["reasonId"] = exc.reason_id
+                base["inspectedEntryPointCount"] = inspected_entries
+                base["diagnostics"].append({
+                    "code": exc.reason_id,
+                    "resourceId": resource_id,
+                    "stage": stage_name,
+                })
+                return base
+            blocks.sort(key=lambda item: (
+                item["space"], item["bind"], item["index"], item["path"]))
+            candidate = {
+                "resourceId": resource_id,
+                "ownerResourceId": resource_id,
+                "ownerCaptureSessionId": request["captureSessionId"],
+                "resourceOwnershipScope": "target-capture-session",
+                "crossCaptureResourceIdReuse": False,
+                "stage": stage_name,
+                "entryPoint": reflected_entry,
+                "api": api,
+                "encoding": encoding,
+                "rawSha256": raw_sha256,
+                "rawSize": len(raw_bytes),
+                "interfaceHash": interface_sha256,
+                "layoutHash": layout_sha256,
+                "interfaceComplete": interface_complete,
+                "interfaceEvidence": (
+                    "module-only-null-pipeline" if api == "vulkan" else
+                    "null-pipeline-reflection"),
+                "physicalAbiSha256": (
+                    "" if api == "vulkan" else
+                    _physical_shader_interface_sha256(
+                        reflection, dxil_layout_evidence)),
+                "physicalAbiValidated": api != "vulkan",
+                "constantBlocks": blocks,
+                "requiresAnchorPreflight": True,
+            }
+            content_key = (
+                api, encoding, stage_name, reflected_entry, raw_sha256,
+                interface_sha256, layout_sha256, interface_complete)
+            owner_content_index.setdefault(
+                (resource_id, content_key), []).append(candidate)
+            owner_module_index.setdefault(
+                (resource_id, module_key), []).append(candidate)
+
+    assets = []
+    for expected in request["shaders"]:
+        _check_project_shader_index_cancel(cancel_event)
+        content_key = (
+            api, expected["encoding"], expected["stage"],
+            expected["entryPoint"], expected["rawSha256"],
+            expected["interfaceHash"], expected["layoutHash"],
+            expected["interfaceComplete"])
+        module_key = (
+            expected["stage"], expected["entryPoint"],
+            expected["encoding"], expected["rawSha256"])
+        matching = list((owner_module_index if api == "vulkan" else
+                         owner_content_index).get(
+            (expected["resourceId"],
+             module_key if api == "vulkan" else content_key), []))
+        exact = []
+        for candidate in matching:
+            _check_project_shader_index_cancel(cancel_event)
+            block_match = candidate["constantBlocks"] == expected["constantBlocks"]
+            interface_match = (
+                candidate["interfaceHash"] == expected["interfaceHash"] and
+                candidate["layoutHash"] == expected["layoutHash"] and
+                candidate["interfaceComplete"] == expected["interfaceComplete"])
+            if api != "vulkan" and (not block_match or not interface_match):
+                continue
+            selected = dict(candidate)
+            selected["anchorEventId"] = expected["anchorEventId"]
+            selected["constantBlocksMatched"] = block_match
+            selected["interfaceMatched"] = interface_match
+            selected["contentMatchMode"] = (
+                "module-sha256-owner-rid-anchor-preflight" if api == "vulkan" else
+                "api-format-interface-layout-owner-rid")
+            exact.append(selected)
+        if len(exact) != 1:
+            base["diagnostics"].append({
+                "code": (
+                    "shader-identity-ambiguous" if len(exact) > 1 else
+                    "shader-identity-mismatch"),
+                "resourceId": expected["resourceId"],
+                "stage": expected["stage"],
+                "entryPoint": expected["entryPoint"],
+            })
+            continue
+        assets.append(exact[0])
+
+    base["inspectedEntryPointCount"] = inspected_entries
+    base["assets"] = sorted(assets, key=lambda item: (
+        item["resourceId"], item["stage"], item["entryPoint"],
+        item["rawSha256"]))
+    base["matchedShaderCount"] = len(base["assets"])
+    if len(base["assets"]) != len(request["shaders"]):
+        if not base["reasonId"]:
+            base["reasonId"] = "shader-resource-index-mismatch"
+        return base
+
+    _check_project_shader_index_cancel(cancel_event)
+    evidence = {
+        "api": api,
+        "shaders": [
+            {
+                "resourceId": item["resourceId"],
+                "stage": item["stage"],
+                "entryPoint": item["entryPoint"],
+                "encoding": item["encoding"],
+                "rawSha256": item["rawSha256"],
+                "interfaceHash": item["interfaceHash"],
+                "layoutHash": item["layoutHash"],
+                "interfaceComplete": item["interfaceComplete"],
+                "physicalAbiSha256": item["physicalAbiSha256"],
+                "physicalAbiValidated": item["physicalAbiValidated"],
+                "requiresAnchorPreflight": item["requiresAnchorPreflight"],
+                "constantBlocks": [
+                    {
+                        "space": block["space"],
+                        "bind": block["bind"],
+                        "index": block["index"],
+                        "path": block["path"],
+                        "byteSize": block["byteSize"],
+                        "layoutSha256": block["layoutSha256"],
+                        "abiSha256": block["abiSha256"],
+                    }
+                    for block in item["constantBlocks"]
+                ],
+            }
+            for item in base["assets"]
+        ],
+    }
+    base["liveIdentitySha256"] = hashlib.sha256(
+        _canonical_project_index_bytes(evidence)).hexdigest()
+    _check_project_shader_index_cancel(cancel_event)
+    base["matched"] = True
+    base["reasonId"] = ""
+    encoded = _canonical_project_index_bytes(base)
+    if len(encoded) > MAX_PROJECT_SHADER_INDEX_BYTES:
+        base["matched"] = False
+        base["reasonId"] = "shader-resource-index-response-limit"
+        base["assets"] = []
+        base["matchedShaderCount"] = 0
+        base.pop("liveIdentitySha256", None)
+    return base
+
+
+def _run_project_shader_resource_index_job(job_id, ctrl):
+    with _project_shader_index_jobs_guard:
+        job = _project_shader_index_jobs.get(job_id)
+        if job is None or job.get("status") != "queued":
+            return
+        job["status"] = "running"
+        job["updatedMonotonic"] = time.monotonic()
+        request = job["request"]
+        cancel_event = job["cancelEvent"]
+    try:
+        _check_project_shader_index_cancel(cancel_event)
+        if request["captureSessionId"] != _capture_session_id:
+            raise RuntimeError("RenderDoc capture changed before resource indexing")
+        result = _build_project_shader_resource_index(
+            ctrl, request, cancel_event=cancel_event)
+        _check_project_shader_index_cancel(cancel_event)
+        if request["captureSessionId"] != _capture_session_id:
+            raise RuntimeError("RenderDoc capture changed during resource indexing")
+        with _project_shader_index_jobs_guard:
+            current = _project_shader_index_jobs.get(job_id)
+            if current is not job or job.get("status") != "running":
+                return
+            _check_project_shader_index_cancel(cancel_event)
+            job["result"] = result
+            job["status"] = "completed"
+            job["updatedMonotonic"] = time.monotonic()
+            job["finishedMonotonic"] = job["updatedMonotonic"]
+    except Exception as exc:
+        with _project_shader_index_jobs_guard:
+            current = _project_shader_index_jobs.get(job_id)
+            if (current is not job or
+                    job.get("status") not in ("queued", "running")):
+                return
+            if not job.get("error"):
+                job["error"] = "%s: %s" % (type(exc).__name__, exc)
+            job["status"] = "failed"
+            job["updatedMonotonic"] = time.monotonic()
+            job["finishedMonotonic"] = job["updatedMonotonic"]
+
+
+def _begin_rdc_project_shader_resource_index(params):
+    """Queue bounded resource/reflection matching without changing replay EID."""
+
+    capture_path = _require_project_index_capture(params)
+    request = _validated_project_shader_index_request(params, capture_path)
+    now = time.monotonic()
+    with _project_shader_index_jobs_guard:
+        _cleanup_project_shader_index_jobs(now)
+        for existing in _project_shader_index_jobs.values():
+            if (existing.get("captureSessionId") == request["captureSessionId"] and
+                    existing.get("requestSha256") == request["requestSha256"]):
+                return _project_shader_index_job_snapshot(
+                    existing, idempotent=True)
+        active = sum(
+            item.get("status") in ("queued", "running")
+            for item in _project_shader_index_jobs.values())
+        if active >= MAX_PROJECT_SHADER_INDEX_JOBS:
+            raise RuntimeError("The project Shader resource-index queue is full")
+        job_id = uuid.uuid4().hex
+        job = {
+            "jobId": job_id,
+            "status": "queued",
+            "captureSessionId": request["captureSessionId"],
+            "requestSha256": request["requestSha256"],
+            "request": request,
+            "createdMonotonic": now,
+            "updatedMonotonic": now,
+            "result": None,
+            "error": "",
+            "committed": False,
+            "cancelEvent": threading.Event(),
+            "cancelRequested": False,
+        }
+        _project_shader_index_jobs[job_id] = job
+    try:
+        _ctx.Replay().AsyncInvoke(
+            lambda ctrl, token=job_id:
+            _run_project_shader_resource_index_job(token, ctrl))
+    except Exception:
+        with _project_shader_index_jobs_guard:
+            _project_shader_index_jobs.pop(job_id, None)
+        raise
+    return _project_shader_index_job_snapshot(job)
+
+
+def _poll_rdc_project_shader_resource_index(params):
+    _require_project_index_capture(params)
+    job_id = _project_shader_index_hex(params.get("job_id"), 32, "job_id")
+    with _project_shader_index_jobs_guard:
+        _cleanup_project_shader_index_jobs(time.monotonic())
+        job = _project_shader_index_jobs.get(job_id)
+        if job is None or job.get("captureSessionId") != _capture_session_id:
+            raise ValueError("Unknown or expired project Shader resource-index job")
+        return _project_shader_index_job_snapshot(job)
+
+
+def _commit_rdc_project_shader_resource_index(params):
+    """Publish a Host-validated resource identity as a session-local route lease."""
 
     global _known_catalog_capture_ids, _known_catalog_identity_pairs
-    path = _require_project_index_capture(params)
-    capture_id = str(params.get("expected_capture_id", "") or "").strip().lower()
-    evidence_sha256 = str(
-        params.get("expected_identity_evidence_sha256", "") or "").strip().lower()
-    for value, label in ((capture_id, "expected_capture_id"),
-                         (evidence_sha256, "expected_identity_evidence_sha256")):
-        if (len(value) != 64 or
-                any(character not in "0123456789abcdef" for character in value)):
-            raise ValueError("%s must be a lowercase SHA-256" % label)
-    anchors = params.get("anchors")
-    if not isinstance(anchors, list) or not anchors or len(anchors) > 256:
-        raise ValueError("anchors must contain between 1 and 256 Shader bindings")
-    stage_map = dict(_available_shader_stages())
-    clean = []
-    seen = set()
-    for index, raw in enumerate(anchors):
-        if not isinstance(raw, dict):
-            raise ValueError("Shader anchor %d must be an object" % index)
-        event_id = _safe_int(raw.get("eventId"), -1)
-        resource_id = _safe_int(raw.get("resourceId"), -1)
-        stage_name = _normalise_stage_name(raw.get("stage", ""))
-        entry_point = str(raw.get("entryPoint", "") or "")
-        raw_sha256 = str(raw.get("rawSha256", "") or "").lower()
-        if (event_id <= 0 or resource_id <= 0 or stage_name not in stage_map or
-                not entry_point or len(entry_point) > 512 or
-                len(raw_sha256) != 64 or
-                any(character not in "0123456789abcdef" for character in raw_sha256)):
-            raise ValueError("Shader anchor %d is invalid" % index)
-        key = (event_id, stage_name, resource_id, entry_point, raw_sha256)
-        if key in seen:
-            raise ValueError("Shader anchors must not contain duplicates")
-        seen.add(key)
-        clean.append({
-            "eventId": event_id,
-            "stage": stage_name,
-            "stageObject": stage_map[stage_name],
-            "resourceId": resource_id,
-            "entryPoint": entry_point,
-            "rawSha256": raw_sha256,
-        })
-
-    def _do(ctrl):
-        verified = []
-        try:
-            original_event = _safe_int(_ctx.CurEvent(), 0)
-            restore_event = True
-        except Exception:
-            original_event = 0
-            restore_event = False
-        try:
-            for anchor in clean:
-                ctrl.SetFrameEvent(anchor["eventId"], True)
-                pipeline = ctrl.GetPipelineState()
-                shader_id = pipeline.GetShader(anchor["stageObject"])
-                if _resource_id_int(shader_id) != anchor["resourceId"]:
-                    raise RuntimeError(
-                        "Cached Shader anchor event %d bound another resource" %
-                        anchor["eventId"])
-                entries = list(ctrl.GetShaderEntryPoints(shader_id) or [])
-                selected = None
-                for candidate in entries:
-                    if str(getattr(candidate, "name", "") or "") == anchor["entryPoint"]:
-                        selected = candidate
-                        break
-                if selected is None:
-                    raise RuntimeError(
-                        "Cached Shader anchor event %d changed entry point" %
-                        anchor["eventId"])
-                reflection = ctrl.GetShader(
-                    _get_pipeline_obj(pipeline, ctrl), shader_id, selected)
-                if reflection is None:
-                    raise RuntimeError(
-                        "Cached Shader anchor event %d has no reflection" %
-                        anchor["eventId"])
-                reflected_entry = str(
-                    getattr(reflection, "entryPoint", "") or
-                    getattr(selected, "name", "") or "")
-                raw_bytes = _shader_raw_bytes(reflection)
-                live_sha256 = hashlib.sha256(raw_bytes).hexdigest() if raw_bytes else ""
-                if (reflected_entry != anchor["entryPoint"] or
-                        live_sha256 != anchor["rawSha256"]):
-                    raise RuntimeError(
-                        "Cached Shader anchor event %d changed physical bytecode" %
-                        anchor["eventId"])
-                verified.append({
-                    "eventId": anchor["eventId"],
-                    "stage": anchor["stage"],
-                    "resourceId": anchor["resourceId"],
-                    "entryPoint": anchor["entryPoint"],
-                    "rawSha256": live_sha256,
-                })
-        finally:
-            if restore_event:
-                try:
-                    ctrl.SetFrameEvent(original_event, True)
-                except Exception:
-                    pass
-        return verified
-
-    verified = _replay(_do)
-    token = _current_capture_token()
-    if token is None or token[1] != os.path.normcase(os.path.abspath(path)):
-        raise RuntimeError("RenderDoc capture changed during cached Shader validation")
-    new_ids = dict(_known_catalog_capture_ids)
-    if capture_id not in new_ids and len(new_ids) >= MAX_KNOWN_CATALOG_CAPTURE_IDS:
-        raise RuntimeError("Too many cached capture identities are active")
-    new_ids[capture_id] = token[1]
-    new_pairs = set(_known_catalog_identity_pairs)
-    pair = (capture_id, evidence_sha256)
-    if pair not in new_pairs and len(new_pairs) >= MAX_KNOWN_CATALOG_IDENTITY_PAIRS:
-        raise RuntimeError("Too many cached catalog identities are active")
-    new_pairs.add(pair)
-    # Publish the exact pair last. The cached route remains a routing lease;
-    # reflect/apply functions perform the physical ABI checks immediately later.
-    _known_catalog_capture_ids = new_ids
-    _known_catalog_identity_pairs = new_pairs
+    capture_path = _require_project_index_capture(params)
+    job_id = _project_shader_index_hex(params.get("job_id"), 32, "job_id")
+    capture_id = _project_shader_index_hex(
+        params.get("expected_capture_id"), 64, "expected_capture_id")
+    evidence_sha256 = _project_shader_index_hex(
+        params.get("expected_identity_evidence_sha256"), 64,
+        "expected_identity_evidence_sha256")
+    live_sha256 = _project_shader_index_hex(
+        params.get("live_identity_sha256"), 64, "live_identity_sha256")
+    with _project_shader_index_jobs_guard:
+        _cleanup_project_shader_index_jobs(time.monotonic())
+        job = _project_shader_index_jobs.get(job_id)
+        result = job.get("result") if isinstance(job, dict) else None
+        request = job.get("request") if isinstance(job, dict) else None
+        if (not isinstance(job, dict) or job.get("status") != "completed" or
+                not isinstance(result, dict) or result.get("matched") is not True or
+                not isinstance(request, dict) or
+                job.get("captureSessionId") != _capture_session_id or
+                request.get("captureId") != capture_id or
+                request.get("identityEvidenceSha256") != evidence_sha256 or
+                result.get("liveIdentitySha256") != live_sha256):
+            raise RuntimeError(
+                "Project Shader resource-index lease is incomplete or changed")
+        already_committed = job.get("committed") is True
+        token = _current_capture_token()
+        canonical_path = os.path.normcase(os.path.abspath(capture_path))
+        if token is None or token[1] != canonical_path:
+            raise RuntimeError("RenderDoc capture changed before resource-index commit")
+        new_ids = dict(_known_catalog_capture_ids)
+        if capture_id not in new_ids and len(new_ids) >= MAX_KNOWN_CATALOG_CAPTURE_IDS:
+            raise RuntimeError("Too many cached capture identities are active")
+        new_ids[capture_id] = canonical_path
+        new_pairs = set(_known_catalog_identity_pairs)
+        pair = (capture_id, evidence_sha256)
+        if pair not in new_pairs and len(new_pairs) >= MAX_KNOWN_CATALOG_IDENTITY_PAIRS:
+            raise RuntimeError("Too many cached catalog identities are active")
+        new_pairs.add(pair)
+        _known_catalog_capture_ids = new_ids
+        _known_catalog_identity_pairs = new_pairs
+        job["committed"] = True
+        job["updatedMonotonic"] = time.monotonic()
     return {
-        "schema": "replaylab-rdc-project-shader-rebind/v1",
+        "schema": "replaylab-project-shader-resource-index-lease/v1",
         "schemaVersion": 1,
+        "jobId": job_id,
         "captureId": capture_id,
         "captureSessionId": _capture_session_id,
         "identityEvidenceSha256": evidence_sha256,
-        "verifiedAnchorCount": len(verified),
-        "anchors": verified,
-        "fullFrameTraversal": False,
+        "liveIdentitySha256": live_sha256,
+        "committed": True,
+        "idempotent": already_committed,
+        "eventTraversalCount": 0,
+        "gpuReplayMutation": False,
         "physicalApplyAuthority": False,
+        "resourceOwnershipScope": "target-capture-session",
+        "crossCaptureResourceIdReuse": False,
     }
 
 
@@ -9429,7 +10821,7 @@ def _get_bound_textures(params):
         raise ValueError("unsupported shader stage: %s" % stage_name)
 
     def _do(ctrl):
-        ctrl.SetFrameEvent(int(event_id), True)
+        _set_frame_event(ctrl, int(event_id), True)
         ps = ctrl.GetPipelineState()
         sid = ps.GetShader(stage)
         if not sid or int(sid) == 0:
@@ -9503,6 +10895,22 @@ def _reverse_shader(params):
     return _get_shader_info({"event_id": event_id, "stage": stage_name})
 
 
+def _inspect_shader(params):
+    """Return one shader reconstruction without repeating disassembly work."""
+    event_id = params.get("event_id")
+    if event_id is None:
+        raise ValueError("event_id required")
+    event_id = int(event_id)
+    stage_name = _normalise_stage_name(params.get("stage", "fragment"))
+    shader = _get_shader_info({"event_id": event_id, "stage": stage_name})
+    return {
+        "schema": "renderdoc-internal-inspect-shader/v1",
+        "eventId": event_id,
+        "stage": stage_name,
+        "shader": shader,
+    }
+
+
 def _lighting_cbuffer_window(binding):
     """Return the bounded byte window represented by one CBuffer binding."""
     offset = max(0, _safe_int(getattr(binding, "byteOffset", 0), 0))
@@ -9529,7 +10937,7 @@ def _analyze_lighting(params):
 
     def _do(ctrl):
         try:
-            ctrl.SetFrameEvent(int(event_id), True)
+            _set_frame_event(ctrl, int(event_id), True)
             ps = ctrl.GetPipelineState()
             pid = _get_pipeline_obj(ps, ctrl)
             result = {"eventId": int(event_id)}
@@ -9981,7 +11389,7 @@ def _identify_drawcalls(params):
         rt_id = rt_override
         if not rt_id:
             # Use the first action's output RT
-            ctrl.SetFrameEvent(actions[0].eventId, True)
+            _set_frame_event(ctrl, actions[0].eventId, True)
             ps = ctrl.GetPipelineState()
             outs = ps.GetOutputTargets()
             if outs:
@@ -10043,7 +11451,7 @@ def _identify_drawcalls(params):
                 prev_eid = max(1, eid - 1)
 
             # Capture RT AFTER this draw
-            ctrl.SetFrameEvent(eid, True)
+            _set_frame_event(ctrl, eid, True)
 
             # Get shader info
             ps = ctrl.GetPipelineState()
@@ -10232,7 +11640,7 @@ def _debug_vulkan_bindings(params):
         return result
 
     def _do(ctrl):
-        ctrl.SetFrameEvent(int(event_id), True)
+        _set_frame_event(ctrl, int(event_id), True)
         ps = ctrl.GetPipelineState()
         info = {"eventId": int(event_id), "api": str(ctrl.GetAPIProperties().pipelineType)}
 
@@ -10423,7 +11831,7 @@ def _export_to_unity(params):
     }
 
     def _do(ctrl):
-        ctrl.SetFrameEvent(int(event_id), True)
+        _set_frame_event(ctrl, int(event_id), True)
         ps = ctrl.GetPipelineState()
 
         # ============================================================
@@ -11547,10 +12955,9 @@ METHODS = {
     "ping": _ping,
     "get_capture_status": _get_capture_status,
     "get_current_renderdoc_context": _get_current_renderdoc_context,
-    "claim_renderdoc_ui_intents": _claim_renderdoc_ui_intents,
-    "renew_renderdoc_ui_intent": _renew_renderdoc_ui_intent,
-    "complete_renderdoc_ui_intent": _complete_renderdoc_ui_intent,
-    "get_renderdoc_ui_intent_status": _get_renderdoc_ui_intent_status,
+    "inspect_event": _inspect_event,
+    "analyze_pixel": _analyze_pixel,
+    "inspect_shader": _inspect_shader,
     "get_frame_summary": _get_frame_summary,
     "get_draw_calls": _get_draw_calls,
     "get_draw_call_details": _get_draw_call_details,
@@ -11599,7 +13006,9 @@ METHODS = {
     "list_captures": _list_captures,
     "read_rdc_project_index": _read_rdc_project_index,
     "write_rdc_project_index": _write_rdc_project_index,
-    "bind_rdc_project_shader_catalog": _bind_rdc_project_shader_catalog,
+    "begin_rdc_project_shader_resource_index": _begin_rdc_project_shader_resource_index,
+    "poll_rdc_project_shader_resource_index": _poll_rdc_project_shader_resource_index,
+    "commit_rdc_project_shader_resource_index": _commit_rdc_project_shader_resource_index,
     "open_capture": _open_capture,
     "get_bound_textures": _get_bound_textures,
     "reverse_shader": _reverse_shader,
@@ -12046,7 +13455,7 @@ def _schedule_project_auto_activation():
             current_path = os.path.abspath(str(_ctx.GetCaptureFilename() or ""))
             if os.path.normcase(current_path) != os.path.normcase(path):
                 return
-            executable = _find_replaylab_host()
+            executable = _find_replaylab_internal_host()
             if not executable or _project_async_executor is None:
                 return
             client = _project_launcher_protocol.ReplayLabProjectClient(executable)
@@ -12138,6 +13547,12 @@ def _register_project_launcher_ui(ctx):
         # cross-thread use and never calls ICaptureFile.OpenCapture().
         _project_thumbnail_reader = _project_launcher_protocol.RenderDocThumbnailReader(rd)
     if _project_async_executor is None:
+        if _project_restore_client_protocol is not None:
+            resume_restores = getattr(
+                _project_restore_client_protocol,
+                "resume_restore_generation", None)
+            if callable(resume_restores):
+                resume_restores()
         _project_async_executor = _project_launcher_protocol.AsyncProjectExecutor(2)
 
     def _closed():
@@ -12163,9 +13578,15 @@ def _register_project_launcher_ui(ctx):
             return {
                 "errorId": "capture-no-longer-active"
             }
-        client = _project_restore_client_protocol.ReplayLabRestoreHostClient()
-        result = client.restore(
-            project_root, expected_path, session_id, progress_callback)
+        client = _project_restore_client_protocol.ReplayLabRestoreHostClient(
+            internal_executable=_find_replaylab_internal_host())
+        try:
+            result = client.restore(
+                project_root, expected_path, session_id, progress_callback)
+        except _project_restore_client_protocol.ReplayLabRestoreHostIncompatible:
+            return {
+                "errorId": "host-runtime-incompatible"
+            }
         unchanged = bool(
             str(_capture_session_id or "") == session_id and
             _active_capture_token == expected_token)
@@ -12185,13 +13606,13 @@ def _register_project_launcher_ui(ctx):
                     return
             except Exception:
                 _project_launcher_ui = None
-        executable = _find_replaylab_host()
+        executable = _find_replaylab_internal_host()
         if not executable:
             ctx.Extensions().ErrorDialog(
                 QtCore.QCoreApplication.translate(
                     "ReplayLabProjects",
-                    "The packaged ReplayLabMCP.exe is unavailable. Reinstall the complete "
-                    "ReplayLab bundle before using project management."),
+                    "The packaged ReplayLabInternal.exe is unavailable. Reinstall the "
+                    "complete ReplayLab bundle before using project management."),
                 QtCore.QCoreApplication.translate(
                     "ReplayLabProjects", "ReplayLab Projects"))
             return
@@ -12242,6 +13663,12 @@ def _unregister_project_launcher_ui():
     global _project_launcher_ui, _project_launcher_callbacks
     global _project_thumbnail_cache, _project_thumbnail_reader, _project_async_executor
     global _project_startup_timer
+    restore_shutdown_generation = None
+    if _project_restore_client_protocol is not None:
+        begin_restore_shutdown = getattr(
+            _project_restore_client_protocol, "begin_restore_shutdown", None)
+        if callable(begin_restore_shutdown):
+            restore_shutdown_generation = begin_restore_shutdown()
     _cancel_project_auto_activation()
     timer = _project_startup_timer
     _project_startup_timer = None
@@ -12264,12 +13691,72 @@ def _unregister_project_launcher_ui():
     executor = _project_async_executor
     if executor is not None:
         try:
-            executor.shutdown()
+            shutdown_result = executor.shutdown()
+            if shutdown_result is not True:
+                raise RuntimeError(
+                    "ReplayLab project executor did not confirm shutdown")
+            if (restore_shutdown_generation is not None and
+                    _project_restore_client_protocol is not None):
+                wait_quiescent = getattr(
+                    _project_restore_client_protocol,
+                    "wait_restore_quiescent", None)
+                if (callable(wait_quiescent) and
+                        not wait_quiescent(restore_shutdown_generation, 0.0)):
+                    raise RuntimeError(
+                        "ReplayLab project restore workers did not quiesce")
         except Exception as exc:
             # Never silently continue into Py_Finalize with a live QRunnable.
             print("[ReplayLab] Project executor shutdown error: %s" % str(exc))
             raise
         _project_async_executor = None
+
+
+def _register_shader_workspace_ui(ctx):
+    """Register and immediately show the reviewed HLSL workspace dock."""
+    global _shader_workspace_callbacks
+    if not getattr(_shader_workspace_protocol, "HAS_QT", False):
+        raise RuntimeError("PySide2 is unavailable for ReplayLab Shader Workspace")
+
+    def _closed():
+        global _shader_workspace_ui
+        _shader_workspace_ui = None
+
+    def _show(_ctx_value=None, _data=None):
+        global _shader_workspace_ui
+        if _shader_workspace_ui is None:
+            _shader_workspace_ui = (
+                _shader_workspace_protocol.ReplayLabShaderWorkspacePanel(
+                    ctx, qrd, closed_callback=_closed,
+                    registry_path=_shader_console_protocol.default_registry_path()))
+        _shader_workspace_ui.show()
+
+    _shader_workspace_callbacks.append(_show)
+    ctx.Extensions().RegisterWindowMenu(
+        qrd.WindowMenu.Tools,
+        [QtCore.QCoreApplication.translate("ReplayLabProjects", "ReplayLab"),
+         QtCore.QCoreApplication.translate(
+             "ReplayLabProjects", "Shader Workspace")], _show)
+    ctx.Extensions().RegisterWindowMenu(
+        qrd.WindowMenu.Window,
+        [QtCore.QCoreApplication.translate(
+            "ReplayLabProjects", "Shader Workspace")], _show)
+
+    # qrenderdoc has already restored its saved main-window layout before the
+    # built-in ReplayLab integration starts, so this becomes a normal central
+    # tool dock immediately instead of requiring a View/Window menu round-trip.
+    _show()
+
+
+def _unregister_shader_workspace_ui():
+    global _shader_workspace_ui, _shader_workspace_callbacks
+    panel = _shader_workspace_ui
+    if panel is not None:
+        # shutdown() is a hard lifetime gate. It deliberately leaves the panel live when its save
+        # worker cannot yet prove quiescence, so retain this reference and propagate for retry.
+        panel.shutdown()
+        if _shader_workspace_ui is panel:
+            _shader_workspace_ui = None
+    _shader_workspace_callbacks = []
 
 
 # replaylab-project-i18n-end
@@ -12320,11 +13807,6 @@ def _unregister_shader_console_ui():
 def start(version, ctx):
     global _ctx, _poller, _capture_viewer, _active_capture_token
     _ctx = ctx
-    # qrenderdoc owns the watcher IPC poller and ReplayLab Console timers. Opt out
-    # of Windows execution-speed/EcoQoS throttling so they retain their cadence
-    # when the main window is covered or in the background. This is a
-    # best-effort process-local setting and never blocks integration startup.
-    _shader_console_protocol.disable_background_power_throttling()
     _reset_symbol_state(restore_names=False)
     _active_capture_token = _current_capture_token()
 
@@ -12340,10 +13822,13 @@ def start(version, ctx):
     if _poller:
         _poller.start()
 
-    # The bridge remains usable with a Codex-owned stdio process. A packaged
-    # build additionally starts one authenticated loopback host automatically
-    # for UI intents and other explicitly configured MCP clients.
-    _start_replaylab_host()
+    # The private Host owns qrenderdoc's bounded project/restore/save services.
+    # ReplayLabMCP is a separate external Codex/IDE adapter, owned by qrenderdoc
+    # by default. REPLAYLAB_EXTERNAL_MCP_AUTOSTART=0/false/no/off disables only
+    # this external service; it never changes internal AgentHost routing.
+    _start_replaylab_internal_host()
+    if _external_mcp_autostart_enabled():
+        _start_replaylab_host()
     if _project_restore_client_protocol is None:
         print("[ReplayLab] Optional project restore transport unavailable: %s" %
               _project_restore_client_import_error)
@@ -12374,6 +13859,10 @@ def start(version, ctx):
             _register_shader_console_ui(ctx)
         except Exception as e:
             print("[ReplayLab] Console error: %s" % str(e))
+        try:
+            _register_shader_workspace_ui(ctx)
+        except Exception as e:
+            print("[ReplayLab] Shader Workspace error: %s" % str(e))
 
     print("[ReplayLab] Loaded (RenderDoc %s)" % version)
     print("[ReplayLab] IPC: %s" % IPC_DIR)
@@ -12394,16 +13883,25 @@ def stop():
             errors.append(detail)
             print("[ReplayLab] Shutdown cleanup error: %s" % detail)
 
+    # Cancel/join project restore workers while both the persistent Host and
+    # qrenderdoc IPC bridge are still alive. Releasing either side first can
+    # strand a restore transaction during Python finalization.
+    # This is a hard teardown gate, not best-effort cleanup. If a restore
+    # QRunnable cannot prove that it has stopped, it may still need the Host,
+    # IPC bridge, and capture context below. Preserve those dependencies and
+    # propagate the failure so native shutdown can skip Python finalization.
+    _unregister_project_launcher_ui()
+    _unregister_shader_workspace_ui()
     poller = _poller
     _poller = None
     if poller:
         _cleanup("IPC poller", poller.stop)
     _cleanup("instance manifest", lambda: _publish_instance_manifest(stopped=True))
+    _cleanup("internal host owner", _release_replaylab_internal_host_owner)
     _cleanup("MCP host owner", _release_replaylab_host_owner)
     _cleanup("shader console", _unregister_shader_console_ui)
     if _ctx:
         _cleanup("event browser filters", lambda: _unregister_event_browser_filter_ui(_ctx))
-    _cleanup("project launcher", _unregister_project_launcher_ui)
     _cleanup("pass panel", _unregister_pass_panel_ui)
     _cleanup("material panel", _unregister_material_panel_ui)
     _cleanup("event shader overrides", _release_event_shader_overrides)
@@ -12430,15 +13928,15 @@ def _show_status(ctx, data):
         ctx.Extensions().ErrorDialog("MCP bridge is NOT running", "ReplayLab")
 
 
-def enqueue_native_intent(kind, focus_stage=""):
-    """Freeze one native qrenderdoc action and return its capability-scoped intent id."""
-    if _ctx is None:
-        raise RuntimeError("The built-in ReplayLab integration is not running")
-    context = _build_current_renderdoc_context(
-        focus_stage=focus_stage,
-        focus_source="explicit-ui-button" if focus_stage else "")
-    record = _ai_intent_queue.enqueue(kind, context)
-    return record["intentId"]
+def current_native_context_json(focus_stage=""):
+    """Freeze the current UI state for a queued free-form Agent request."""
+    return json.dumps(
+        _build_current_renderdoc_context(
+            focus_stage=focus_stage,
+            focus_source="explicit-native-task" if focus_stage else ""),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"))
 
 
 def available_native_shader_stages():

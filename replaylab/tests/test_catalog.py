@@ -28,6 +28,7 @@ def test_catalog_has_unique_stable_ids_and_both_connector_semantics() -> None:
         "ollama",
         "codex",
         "copilot-acp",
+        "cursor-acp",
         "gemini-acp",
         "qwen-acp",
         "kimi-acp",
@@ -48,6 +49,7 @@ def test_catalog_separates_api_key_references_from_managed_agent_commands() -> N
     assert get_preset("openai").protocol == "openai-responses"
     assert get_preset("codex").protocol == "codex-app-server"
     assert get_preset("copilot-acp").protocol == "acp"
+    assert get_preset("cursor-acp").acp_auth_method == "cursor_login"
     coding_plan = get_preset("qwen-coding-plan")
     assert coding_plan.base_url == "https://coding.dashscope.aliyuncs.com/v1"
     assert coding_plan.api_key_env == "BAILIAN_CODING_PLAN_API_KEY"
@@ -68,6 +70,12 @@ def test_catalog_exposes_configuration_and_authentication_ui_semantics() -> None
     ("preset_id", "agent_command", "login_command", "login_mode"),
     [
         ("copilot-acp", ("copilot", "--acp"), ("copilot", "login"), "captured"),
+        (
+            "cursor-acp",
+            ("cursor-agent", "acp"),
+            ("cursor-agent", "login"),
+            "captured",
+        ),
         ("gemini-acp", ("gemini", "--acp"), ("gemini",), "terminal"),
         ("qwen-acp", ("qwen", "--acp"), ("qwen",), "terminal"),
         ("kimi-acp", ("kimi", "acp"), ("kimi", "login"), "captured"),

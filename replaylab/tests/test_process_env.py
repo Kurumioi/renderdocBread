@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import stat
 import sys
@@ -18,9 +19,12 @@ from replaylab_agent.errors import ConfigurationError
 from replaylab_agent.process_env import (
     agent_command_argv,
     codex_profile_home,
+    cursor_profile_home,
+    ensure_cursor_profile_config,
     external_agent_environment,
     host_process_environment,
     remove_codex_profile_home,
+    remove_cursor_profile_home,
     resolve_agent_executable,
     resolve_known_vendor_executable,
     resolved_agent_argv,
@@ -117,6 +121,60 @@ def test_codex_bundled_one_level_version_layout_is_resolved(tmp_path, monkeypatc
         "codex",
         "app-server",
     ]
+
+
+def test_cursor_fixed_windows_install_is_resolved_and_catalog_command_is_immutable(
+    tmp_path, monkeypatch
+) -> None:
+    _windows_fallbacks(monkeypatch)
+    local = tmp_path / "local"
+    local.mkdir()
+    executable = _write_file(
+        local / "cursor-agent" / "cursor-agent.exe",
+        b"MZ" + (b"\0" * (64 * 1024 - 2)),
+    )
+    profile = Profile(
+        "cursor-main",
+        "cursor-acp",
+        command=["ignored-user-command"],
+        options={"allow_unsandboxed_agent": True},
+    )
+
+    assert resolve_agent_executable(
+        profile, environ={"PATH": "", "LOCALAPPDATA": str(local)}
+    ) == str(executable.resolve())
+    assert agent_command_argv(profile) == ["cursor-agent", "acp"]
+
+
+def test_cursor_fixed_windows_cmd_fallback_does_not_trust_npm_agent_alias(
+    tmp_path, monkeypatch
+) -> None:
+    _windows_fallbacks(monkeypatch)
+    local = tmp_path / "local"
+    local.mkdir()
+    appdata = tmp_path / "roaming"
+    appdata.mkdir()
+    official = _write_file(
+        local / "cursor-agent" / "cursor-agent.cmd", b"@echo off\r\n"
+    )
+    _write_file(appdata / "npm" / "agent.cmd", b"@echo untrusted\r\n")
+    environment = {
+        "PATH": "",
+        "LOCALAPPDATA": str(local),
+        "APPDATA": str(appdata),
+    }
+
+    assert resolve_known_vendor_executable(
+        "cursor-acp", "cursor-agent", environ=environment
+    ) == str(official.resolve())
+
+    official.unlink()
+    assert (
+        resolve_known_vendor_executable(
+            "cursor-acp", "cursor-agent", environ=environment
+        )
+        == ""
+    )
 
 
 def test_codex_fallback_rejects_nested_small_non_pe_and_reparse_files(
@@ -216,6 +274,7 @@ def test_detect_spawn_resolution_and_doctor_share_absolute_codex_path(
 
     status = detect_subscription(profile, environ=environment)
     assert status["installed"] is True
+    assert status["messageId"] == "subscription.cli-detected"
     assert resolved_agent_argv(profile, environ=environment) == [
         str(executable.resolve()),
         "app-server",
@@ -246,10 +305,11 @@ def test_detect_spawn_resolution_and_doctor_share_absolute_codex_path(
     assert command_check.status == "ok"
     assert command_check.detail == str(executable.resolve())
     registration = next(
-        check for check in checks if check.name == "codex-mcp-registration"
+        check for check in checks if check.name == "codex-internal-tools"
     )
     assert registration.status == "ok"
-    assert "runtime-managed filtered ReplayLab MCP" in registration.detail
+    assert "app-server dynamic tools" in registration.detail
+    assert "no ReplayLab MCP registration" in registration.detail
 
 
 def test_codex_environment_uses_profile_scoped_home_instead_of_global_home(
@@ -272,6 +332,111 @@ def test_codex_environment_uses_profile_scoped_home_instead_of_global_home(
     # Environment construction is side-effect free; the official Codex process
     # creates the profile home when login or app-server first needs it.
     assert not expected.exists()
+
+
+def test_cursor_environment_and_permission_config_are_profile_scoped(
+    tmp_path,
+) -> None:
+    profile = Profile(
+        "cursor-main",
+        "cursor-acp",
+        options={"allow_unsandboxed_agent": True},
+    )
+    global_config = tmp_path / "global-cursor"
+    source = {
+        "LOCALAPPDATA": str(tmp_path / "local"),
+        "CURSOR_CONFIG_DIR": str(global_config),
+        "PATH": str(tmp_path / "bin"),
+    }
+
+    environment = external_agent_environment(profile, environ=source)
+    expected = (
+        tmp_path / "local" / "ReplayLab" / "cursor" / profile.id
+    ).resolve()
+    assert environment["CURSOR_CONFIG_DIR"] == str(expected)
+    assert environment["HOME"] == str(expected)
+    assert environment["USERPROFILE"] == str(expected)
+    assert cursor_profile_home(profile, environ=source) == expected
+    assert not expected.exists()
+
+    config_path = ensure_cursor_profile_config(profile, environ=source)
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["version"] == 1
+    assert payload["approvalMode"] == "allowlist"
+    assert payload["permissions"]["allow"] == ["Mcp(ReplayLab:*)"]
+    assert payload["permissions"]["deny"] == [
+        "Shell(*)",
+        "Read(**)",
+        "Write(**)",
+        "WebFetch(*)",
+    ]
+    assert "Mcp(*:*)" not in payload["permissions"]["allow"]
+    assert json.loads(
+        (expected / ".cursor" / "mcp.json").read_text(encoding="utf-8")
+    ) == {"mcpServers": {}}
+    assert not global_config.exists()
+
+
+def test_cursor_home_removal_leaves_global_cursor_state_untouched(tmp_path) -> None:
+    profile = Profile(
+        "cursor-delete",
+        "cursor-acp",
+        options={"allow_unsandboxed_agent": True},
+    )
+    local = (tmp_path / "local").resolve()
+    global_config = tmp_path / "global-cursor"
+    global_sentinel = global_config / "auth.json"
+    global_sentinel.parent.mkdir(parents=True)
+    global_sentinel.write_text("global-must-survive", encoding="utf-8")
+    target = cursor_profile_home(profile, environ={"LOCALAPPDATA": str(local)})
+    (target / "auth.json").parent.mkdir(parents=True)
+    (target / "auth.json").write_text("profile-only", encoding="utf-8")
+
+    remove_cursor_profile_home(
+        profile,
+        environ={
+            "LOCALAPPDATA": str(local),
+            "CURSOR_CONFIG_DIR": str(global_config),
+        },
+    )
+
+    assert not target.exists()
+    assert global_sentinel.read_text(encoding="utf-8") == "global-must-survive"
+
+
+def test_cursor_config_preparation_refuses_profile_directory_link(tmp_path) -> None:
+    profile = Profile(
+        "cursor-linked",
+        "cursor-acp",
+        options={"allow_unsandboxed_agent": True},
+    )
+    local = (tmp_path / "local").resolve()
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    target = cursor_profile_home(profile, environ={"LOCALAPPDATA": str(local)})
+    target.parent.mkdir(parents=True)
+    try:
+        target.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are not available on this Windows host")
+
+    with pytest.raises(ConfigurationError, match="link/reparse point"):
+        ensure_cursor_profile_config(profile, environ={"LOCALAPPDATA": str(local)})
+    assert not (outside / "cli-config.json").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not Windows ACLs")
+def test_cursor_profile_state_uses_private_posix_modes(tmp_path) -> None:
+    profile = Profile(
+        "cursor-private",
+        "cursor-acp",
+        options={"allow_unsandboxed_agent": True},
+    )
+    config = ensure_cursor_profile_config(
+        profile, environ={"XDG_DATA_HOME": str(tmp_path.resolve())}
+    )
+    assert stat.S_IMODE(config.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
 
 
 def test_child_environments_force_utf8_and_preserve_chinese_paths(tmp_path) -> None:

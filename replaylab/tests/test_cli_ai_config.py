@@ -6,7 +6,7 @@ import pytest
 from types import SimpleNamespace
 
 from replaylab_agent.cli import _parser, _profile_command
-from replaylab_agent.process_env import codex_profile_home
+from replaylab_agent.process_env import codex_profile_home, cursor_profile_home
 from replaylab_agent.profiles import Profile, ProfileStore
 
 
@@ -222,6 +222,68 @@ def test_replacing_codex_provider_clears_profile_scoped_home(
     store.add(profile)
     store.save()
     home = codex_profile_home(profile)
+    home.mkdir(parents=True)
+    (home / "auth.json").write_text("test-only", encoding="utf-8")
+
+    args = _parser().parse_args(
+        [
+            "profile",
+            "update",
+            profile.id,
+            "--replace-provider",
+            "--preset",
+            "ollama",
+            "--allowed-model",
+            "test-model",
+            "--default-model",
+            "test-model",
+            "--json",
+        ]
+    )
+    assert _profile_command(args, store) == 0
+    assert store.profiles[profile.id].preset == "ollama"
+    assert store.profiles[profile.id].title == "Keep title"
+    assert not home.exists()
+
+
+def test_cursor_profile_remove_clears_only_profile_scoped_home(
+    tmp_path, monkeypatch
+) -> None:
+    local = (tmp_path / "local").resolve()
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    store = ProfileStore(tmp_path / "profiles.json")
+    profile = Profile(
+        "cursor-remove",
+        "cursor-acp",
+        options={"allow_unsandboxed_agent": True},
+    )
+    store.add(profile)
+    store.save()
+    home = cursor_profile_home(profile)
+    home.mkdir(parents=True)
+    (home / "auth.json").write_text("test-only", encoding="utf-8")
+
+    args = _parser().parse_args(["profile", "remove", profile.id, "--json"])
+    assert _profile_command(args, store) == 0
+    assert not home.exists()
+    assert local.is_dir()
+
+
+def test_replacing_cursor_provider_clears_profile_scoped_home(
+    tmp_path, monkeypatch
+) -> None:
+    local = (tmp_path / "local").resolve()
+    monkeypatch.setenv("LOCALAPPDATA", str(local))
+    store = ProfileStore(tmp_path / "profiles.json")
+    profile = Profile(
+        "cursor-replace",
+        "cursor-acp",
+        title="Keep title",
+        options={"allow_unsandboxed_agent": True},
+    )
+    store.add(profile)
+    store.save()
+    home = cursor_profile_home(profile)
     home.mkdir(parents=True)
     (home / "auth.json").write_text("test-only", encoding="utf-8")
 

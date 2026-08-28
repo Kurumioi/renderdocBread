@@ -139,6 +139,6 @@ class SkillCatalog:
 
 INTENT_SKILLS = {
     "explain-current-event": "renderdoc-explain-event",
-    "inspect-picked-pixel": "renderdoc-inspect-pixel",
+    "inspect-picked-pixel": "renderdoc-explain-event",
     "reverse-edit-selected-shader": "renderdoc-shader-workbench",
 }

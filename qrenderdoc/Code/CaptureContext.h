@@ -232,7 +232,7 @@ public:
   ApiMonitorWindow *GetApiMonitorWindow();
   AIAssistant *GetAIAssistant();
   ReplayLabIntegration &ReplayLab();
-  void ShowAIAssistant(const QString &taskId = QString());
+  void ShowAIAssistant();
   IResourceInspector *GetResourceInspector() override;
 
   bool HasEventBrowser() override { return m_EventBrowser != NULL; }

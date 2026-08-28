@@ -43,10 +43,14 @@ function Set-FakeRuntimeOutput {
         (Join-Path $Directory "replaylab-ai.exe"),
         [Text.Encoding]::UTF8.GetBytes("fake-agent-runtime"))
     [IO.File]::WriteAllBytes(
+        (Join-Path $Directory "ReplayLabInternal.exe"),
+        [Text.Encoding]::UTF8.GetBytes("fake-internal-runtime"))
+    [IO.File]::WriteAllBytes(
         (Join-Path $Directory "ReplayLabMCP.exe"),
         [Text.Encoding]::UTF8.GetBytes("fake-mcp-runtime"))
     $records = @()
-    foreach ($name in @("replaylab-ai.exe", "ReplayLabMCP.exe")) {
+    foreach ($name in @(
+        "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe")) {
         $path = Join-Path $Directory $name
         $item = Get-Item -LiteralPath $path
         $records += [ordered]@{
@@ -61,6 +65,7 @@ function Set-FakeRuntimeOutput {
         generatedUtc = [DateTime]::UtcNow.ToString("o")
         ownedFiles = @(
             "replaylab-ai.exe",
+            "ReplayLabInternal.exe",
             "ReplayLabMCP.exe",
             "replaylab-runtime-manifest.json"
         )
@@ -123,6 +128,7 @@ try {
         "Deployment must not place runtime payloads directly in the application directory."
     foreach ($name in @(
         "replaylab-ai.exe",
+        "ReplayLabInternal.exe",
         "ReplayLabMCP.exe",
         "replaylab-runtime-manifest.json",
         ".replaylab-runtime-deployment.json"
@@ -130,7 +136,8 @@ try {
         Assert-True (Test-Path -LiteralPath (Join-Path $targetRoot $name) -PathType Leaf) `
             "Deployment did not create $name."
     }
-    foreach ($name in @("replaylab-ai.exe", "ReplayLabMCP.exe")) {
+    foreach ($name in @(
+        "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe")) {
         $sourceHash = (Get-FileHash -LiteralPath (Join-Path $runtimeRoot $name) `
             -Algorithm SHA256).Hash
         $targetHash = (Get-FileHash -LiteralPath (Join-Path $targetRoot $name) `
@@ -179,6 +186,7 @@ try {
     Set-Content -LiteralPath (Join-Path $adoptApp "qrenderdoc.exe") -Value "fake-qrenderdoc"
     foreach ($name in @(
         "replaylab-ai.exe",
+        "ReplayLabInternal.exe",
         "ReplayLabMCP.exe",
         "replaylab-runtime-manifest.json"
     )) {
@@ -211,6 +219,7 @@ try {
         -Value "fake-qrenderdoc"
     foreach ($name in @(
         "replaylab-ai.exe",
+        "ReplayLabInternal.exe",
         "ReplayLabMCP.exe",
         "replaylab-runtime-manifest.json"
     )) {

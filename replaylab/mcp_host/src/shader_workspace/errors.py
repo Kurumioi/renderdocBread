@@ -33,3 +33,7 @@ class AbiValidationError(ShaderWorkspaceError):
 
 class WorkspaceWatchError(ShaderWorkspaceError):
     """A bounded external-editor save watcher could not be operated safely."""
+
+
+class WorkspaceWatchConflictError(WorkspaceWatchError):
+    """The tracked source no longer matches an editor's expected bytes."""

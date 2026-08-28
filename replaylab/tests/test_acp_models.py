@@ -49,6 +49,27 @@ def test_connection_models_reads_legacy_available_models_and_bounds_ids() -> Non
 
 
 @pytest.mark.asyncio
+async def test_catalogued_acp_authentication_method_is_sent_before_session_use(
+    tmp_path,
+) -> None:
+    calls: list[str] = []
+
+    class Connection:
+        async def authenticate(self, *, method_id: str):
+            calls.append(method_id)
+
+    connector = ACPConnector(
+        ["cursor-agent", "acp"],
+        cwd=tmp_path,
+        timeout=5,
+        authentication_method="cursor_login",
+    )
+    await connector._authenticate(Connection())
+
+    assert calls == ["cursor_login"]
+
+
+@pytest.mark.asyncio
 async def test_model_selection_accepts_dict_and_plural_model_option(tmp_path) -> None:
     calls: list[dict] = []
 

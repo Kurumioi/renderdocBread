@@ -38,25 +38,17 @@ class ReplayLabIntegration
   Q_DECLARE_TR_FUNCTIONS(ReplayLabIntegration)
 
 public:
-  enum class Intent
-  {
-    ExplainCurrentEvent,
-    InspectPickedPixel,
-    ReverseEditSelectedShader,
-  };
-
   explicit ReplayLabIntegration(CaptureContext &context);
 
   QString Initialize();
   bool IsAvailable() const { return m_Available; }
   QString LastError() const { return m_LastError; }
 
-  QString QueueIntent(Intent intent, const QString &focusStage, QString *error) const;
+  QString CurrentContextJSON(QString *error = NULL) const;
+  QString CurrentContextJSON(const QString &focusStage, QString *error) const;
   QStringList AvailableShaderStages(QString *error = NULL) const;
 
 private:
-  static QString IntentId(Intent intent);
-
   CaptureContext &m_Context;
   bool m_Available = false;
   QString m_LastError;

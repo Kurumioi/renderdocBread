@@ -9,10 +9,12 @@ import pytest
 from replaylab_agent.adaptive_orchestration import (
     AdaptiveSupervisorWorkflow,
     BlockedDecision,
+    ClarificationOption,
     DispatchNextStageDecision,
     FinishDecision,
     GoalSpec,
     InitialAskUserDecision,
+    InitialDirectAnswerDecision,
     InitialSupervisorProposal,
     SpecialistSession,
     StageExecution,
@@ -37,12 +39,17 @@ SKILL_ROOT = Path(__file__).resolve().parents[2] / ".agents" / "skills"
 
 
 def _result(task: PlannedTask, answer: str) -> SkillResult:
+    completed_tool = (
+        "inspect_shader"
+        if task.skill == "renderdoc-shader-workbench"
+        else "inspect_event"
+    )
     return SkillResult(
         task_id=task.id,
         skill=task.skill,
         summary=task.summary,
         answer=answer,
-        completed_tools=("get_pipeline_state",),
+        completed_tools=(completed_tool,),
         evidence_validated=True,
     )
 
@@ -85,18 +92,18 @@ async def test_langgraph_supervisor_dispatches_second_stage_then_finishes() -> N
         ],
     )
     second = TaskPlan(
-        request_summary="Inspect resources after event evidence",
+        request_summary="Inspect the bound shader after event evidence",
         tasks=[
             PlannedTask(
                 id="task-1",
-                summary="Inspect resources referenced by the event evidence",
-                skill="renderdoc-resource-analysis",
+                summary="Inspect the shader referenced by the event evidence",
+                skill="renderdoc-shader-workbench",
             )
         ],
     )
     proposal = InitialSupervisorProposal(
         goal=GoalSpec(
-            objective="Explain the event and find suspicious resources",
+            objective="Explain the event and inspect its bound shader",
             success_criteria=["Both claims use admitted evidence"],
         ),
         stage_objective="Establish event evidence",
@@ -123,8 +130,8 @@ async def test_langgraph_supervisor_dispatches_second_stage_then_finishes() -> N
     async def decide(state):
         if state["stage_index"] == 1:
             return DispatchNextStageDecision(
-                reason="Event evidence identifies resources that need a separate bounded check.",
-                stage_objective="Inspect the referenced resources",
+                reason="Event evidence identifies a shader that needs a separate bounded check.",
+                stage_objective="Inspect the referenced shader",
                 plan=second,
             )
         return FinishDecision(
@@ -210,6 +217,20 @@ async def test_initial_ask_user_finishes_without_dispatching_a_specialist() -> N
         ),
         reason="A coordinate is required before a pixel-specific inspection.",
         question="Which texture pixel should I inspect?",
+        selection_mode="single",
+        options=[
+            ClarificationOption(
+                id="picked_pixel",
+                label="Picked pixel",
+                description="Inspect the pixel currently frozen in the request snapshot.",
+            ),
+            ClarificationOption(
+                id="enter_coordinate",
+                label="Enter coordinate",
+                description="Provide a different texture coordinate to inspect.",
+            ),
+        ],
+        allow_other=True,
     )
     report = await AdaptiveSupervisorWorkflow(catalog, execute, decide).run(initial)
     assert calls == 0
@@ -217,13 +238,87 @@ async def test_initial_ask_user_finishes_without_dispatching_a_specialist() -> N
     assert report.total_tasks == 0
     assert report.terminal_status == "needs-user-input"
     assert report.final_answer == "Which texture pixel should I inspect?"
+    assert report.clarification is not None
+    clarification_payload = report.clarification.event_payload()
+    clarification_id = clarification_payload.pop("id")
+    assert clarification_id.startswith("clarification-")
+    assert len(clarification_id) == len("clarification-") + 32
+    assert all(
+        character in "0123456789abcdef"
+        for character in clarification_id[len("clarification-") :]
+    )
+    assert clarification_payload == {
+        "question": "Which texture pixel should I inspect?",
+        "selectionMode": "single",
+        "options": [
+            {
+                "id": "picked_pixel",
+                "label": "Picked pixel",
+                "description": "Inspect the pixel currently frozen in the request snapshot.",
+            },
+            {
+                "id": "enter_coordinate",
+                "label": "Enter coordinate",
+                "description": "Provide a different texture coordinate to inspect.",
+            },
+        ],
+        "allowOther": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_initial_direct_answer_finishes_without_capture_tools_or_specialists() -> None:
+    catalog = SkillCatalog([SKILL_ROOT]).load()
+
+    async def execute(*args):
+        raise AssertionError(f"unexpected specialist dispatch: {args}")
+
+    async def decide(state):
+        raise AssertionError(f"unexpected supervisor review: {state}")
+
+    initial = InitialDirectAnswerDecision(
+        goal=GoalSpec(objective="Explain what an SRV is"),
+        reason="This is stable graphics API terminology.",
+        answer="An SRV is a read-only shader resource view.",
+        capture_evidence_used=False,
+    )
+    report = await AdaptiveSupervisorWorkflow(catalog, execute, decide).run(initial)
+
+    assert report.terminal_status == "completed"
+    assert report.final_answer == "An SRV is a read-only shader resource view."
+    assert report.stages == ()
+    assert report.total_tasks == 0
+    assert report.supervisor_decisions == 1
+    assert report.clarification is None
+
+
+def test_clarification_requires_unique_stable_option_ids() -> None:
+    duplicate = ClarificationOption(
+        id="same_choice",
+        label="One",
+        description="First possible target.",
+    )
+    with pytest.raises(ValueError, match="option ids must be unique"):
+        InitialAskUserDecision(
+            goal=GoalSpec(objective="Choose a target"),
+            reason="Two targets remain plausible.",
+            question="Which target should I inspect?",
+            options=[
+                duplicate,
+                ClarificationOption(
+                    id="same_choice",
+                    label="Two",
+                    description="Second possible target.",
+                ),
+            ],
+        )
 
 
 @pytest.mark.asyncio
 async def test_partial_stage_receipts_reach_supervisor_and_cannot_finish_as_complete() -> None:
     catalog = SkillCatalog([SKILL_ROOT]).load()
     plan = TaskPlan(
-        request_summary="Inspect event and resource",
+        request_summary="Inspect event and shader",
         tasks=[
             PlannedTask(
                 id="task-1",
@@ -232,8 +327,8 @@ async def test_partial_stage_receipts_reach_supervisor_and_cannot_finish_as_comp
             ),
             PlannedTask(
                 id="task-2",
-                summary="Inspect resource",
-                skill="renderdoc-resource-analysis",
+                summary="Inspect shader",
+                skill="renderdoc-shader-workbench",
             ),
         ],
     )
@@ -254,7 +349,7 @@ async def test_partial_stage_receipts_reach_supervisor_and_cannot_finish_as_comp
                 SpecialistSession.ended(
                     stage_index,
                     "task-2",
-                    "renderdoc-resource-analysis",
+                    "renderdoc-shader-workbench",
                     status="failed",
                     reason="provider timeout after cleanup",
                 ),
@@ -292,12 +387,12 @@ async def test_failed_stage_can_replan_and_finish_after_corrective_stage_is_acce
         ],
     )
     corrective = TaskPlan(
-        request_summary="Recover with resource evidence",
+        request_summary="Recover with shader evidence",
         tasks=[
             PlannedTask(
                 id="task-1",
-                summary="Inspect the event's bound resource as corrective evidence",
-                skill="renderdoc-resource-analysis",
+                summary="Inspect the event's bound shader as corrective evidence",
+                skill="renderdoc-shader-workbench",
             )
         ],
     )
@@ -361,7 +456,7 @@ def test_supervisor_review_budget_is_shared_and_session_receipt_is_stage_bound()
     task_b = PlannedTask(
         id="task-2",
         summary="B",
-        skill="renderdoc-resource-analysis",
+        skill="renderdoc-shader-workbench",
     )
     plan = TaskPlan(request_summary="review", tasks=[task_a, task_b])
     result_a = _result(task_a, "a" * 10000)
@@ -429,17 +524,17 @@ async def test_model_runtime_uses_v2_proposal_and_main_agent_replans(
         ],
     )
     second = TaskPlan(
-        request_summary="Inspect resources next",
+        request_summary="Inspect the shader next",
         tasks=[
             PlannedTask(
                 id="task-1",
-                summary="Inspect resource evidence",
-                skill="renderdoc-resource-analysis",
+                summary="Inspect shader evidence",
+                skill="renderdoc-shader-workbench",
             )
         ],
     )
     proposal = InitialSupervisorProposal(
-        goal=GoalSpec(objective="Explain the event and related resources"),
+        goal=GoalSpec(objective="Explain the event and its bound shader"),
         stage_objective="Establish event facts",
         plan=first,
     )
@@ -460,8 +555,8 @@ async def test_model_runtime_uses_v2_proposal_and_main_agent_replans(
             if review_count == 1:
                 return SimpleNamespace(
                     output=DispatchNextStageDecision(
-                        reason="The first result points to a distinct resource question.",
-                        stage_objective="Inspect resources",
+                        reason="The first result points to a distinct shader question.",
+                        stage_objective="Inspect the bound shader",
                         plan=second,
                     )
                 )
@@ -478,6 +573,7 @@ async def test_model_runtime_uses_v2_proposal_and_main_agent_replans(
             "api",
             "ollama",
             "model-a",
+            options={"context_window_tokens": 65_536},
             probed_capabilities=["tools", "json-schema"],
         )
     )
@@ -492,7 +588,11 @@ async def test_model_runtime_uses_v2_proposal_and_main_agent_replans(
         del self, profile, prompt, context, writer, intent, kwargs
         return SimpleNamespace(
             text=f"accepted {skill.name}",
-            completed_tools=("get_pipeline_state",),
+            completed_tools=(
+                "inspect_shader"
+                if skill.name == "renderdoc-shader-workbench"
+                else "inspect_event",
+            ),
             attempts=1,
             validation_feedback=(),
             context_generation=0,
@@ -503,7 +603,7 @@ async def test_model_runtime_uses_v2_proposal_and_main_agent_replans(
     runtime._run_model_skill = MethodType(fake_skill, runtime)
     result = await runtime._run_model_plan(
         runtime._profile("api"),
-        "Explain EID 9 and related resources",
+        "Explain EID 9 and its bound shader",
         {"eventId": 9},
         TaskEventWriter(tmp_path / "events", task_id="adaptive-model"),
         None,
@@ -516,6 +616,10 @@ async def test_model_runtime_uses_v2_proposal_and_main_agent_replans(
     assert [item.task_id for item in result.skill_results] == [
         "stage-1-task-1",
         "stage-2-task-1",
+    ]
+    assert [item.completed_tools for item in result.skill_results] == [
+        ("inspect_event",),
+        ("inspect_shader",),
     ]
     assert result.synthesis is not None
     assert result.synthesis.strategy == "adaptive-supervisor-specialists/langgraph-v2"
@@ -530,7 +634,7 @@ async def test_model_runtime_returns_failed_and_dependency_blocked_receipts_to_s
 
     catalog = SkillCatalog([SKILL_ROOT]).load()
     plan = TaskPlan(
-        request_summary="Inspect event then its resource",
+        request_summary="Inspect event then its shader",
         tasks=[
             PlannedTask(
                 id="task-1",
@@ -539,14 +643,14 @@ async def test_model_runtime_returns_failed_and_dependency_blocked_receipts_to_s
             ),
             PlannedTask(
                 id="task-2",
-                summary="Inspect dependent resource",
-                skill="renderdoc-resource-analysis",
+                summary="Inspect dependent shader",
+                skill="renderdoc-shader-workbench",
                 depends_on=["task-1"],
             ),
         ],
     )
     proposal = InitialSupervisorProposal(
-        goal=GoalSpec(objective="Inspect event and dependent resource"),
+        goal=GoalSpec(objective="Inspect event and dependent shader"),
         stage_objective="Collect dependent evidence",
         plan=plan,
     )
@@ -572,6 +676,7 @@ async def test_model_runtime_returns_failed_and_dependency_blocked_receipts_to_s
             "api",
             "ollama",
             "model-a",
+            options={"context_window_tokens": 65_536},
             probed_capabilities=["tools", "json-schema"],
         )
     )
@@ -594,7 +699,7 @@ async def test_model_runtime_returns_failed_and_dependency_blocked_receipts_to_s
 
     result = await runtime._run_model_plan(
         runtime._profile("api"),
-        "Inspect EID 9 and its dependent resource",
+        "Inspect EID 9 and its dependent shader",
         {"eventId": 9},
         TaskEventWriter(tmp_path / "events", task_id="partial-model"),
         None,
@@ -646,6 +751,7 @@ async def test_legacy_model_plan_failure_returns_blocked_workflow_receipt(
             "api",
             "ollama",
             "model-a",
+            options={"context_window_tokens": 65_536},
             probed_capabilities=["tools", "json-schema"],
         )
     )
@@ -716,6 +822,7 @@ async def test_uncertain_specialist_cleanup_is_fatal_and_never_gets_released_rec
             "api",
             "ollama",
             "model-a",
+            options={"context_window_tokens": 65_536},
             probed_capabilities=["tools", "json-schema"],
         )
     )
@@ -746,7 +853,7 @@ async def test_model_specialist_keeps_history_until_host_evidence_accepts(
     tmp_path, monkeypatch
 ) -> None:
     import pydantic_ai
-    import replaylab_agent.mcp_tools as mcp_tools
+    import replaylab_agent.tool_service as tool_service
 
     catalog = SkillCatalog([SKILL_ROOT]).load()
     skill = catalog.get("renderdoc-explain-event")
@@ -756,7 +863,10 @@ async def test_model_specialist_keeps_history_until_host_evidence_accepts(
             "api",
             "ollama",
             "model-a",
-            options={"max_specialist_attempts": 2},
+            options={
+                "context_window_tokens": 65_536,
+                "max_specialist_attempts": 2,
+            },
             probed_capabilities=["tools", "json-schema"],
         )
     )
@@ -768,9 +878,9 @@ async def test_model_specialist_keeps_history_until_host_evidence_accepts(
     )
     captured = {}
 
-    def fake_toolset(allowed_tools, **kwargs):
-        del allowed_tools
-        captured["audit"] = kwargs["audit"]
+    def fake_toolset(service, invocation):
+        assert service is runtime.tool_service
+        captured["audit"] = invocation.audit
         return object()
 
     calls: list[dict] = []
@@ -789,13 +899,11 @@ async def test_model_specialist_keeps_history_until_host_evidence_accepts(
         async def run(self, prompt, **kwargs):
             calls.append({"prompt": prompt, **kwargs})
             if len(calls) == 2:
-                captured["audit"].completed.extend(
-                    ["get_draw_call_details", "get_pipeline_state"]
-                )
+                captured["audit"].completed.append("inspect_event")
             return FakeResult(f"attempt {len(calls)}")
 
     monkeypatch.setattr(pydantic_ai, "Agent", FakeAgent)
-    monkeypatch.setattr(mcp_tools, "build_mcp_toolset", fake_toolset)
+    monkeypatch.setattr(tool_service, "build_internal_toolset", fake_toolset)
     result = await runtime._run_model_skill(
         runtime._profile("api"),
         "Explain EID 9",
@@ -813,10 +921,7 @@ async def test_model_specialist_keeps_history_until_host_evidence_accepts(
     assert len(calls) == 2
     assert calls[1]["message_history"] == ["retained-specialist-history"]
     assert "Host validation feedback" in calls[1]["prompt"]
-    assert set(result.completed_tools) == {
-        "get_draw_call_details",
-        "get_pipeline_state",
-    }
+    assert set(result.completed_tools) == {"inspect_event"}
 
 
 @pytest.mark.asyncio
@@ -832,6 +937,7 @@ async def test_explicit_external_specialist_retries_as_one_logical_session(
             command=["fake-acp"],
             options={
                 "allow_unsandboxed_agent": True,
+                "context_window_tokens": 65_536,
                 "max_specialist_attempts": 2,
             },
             probed_capabilities=["tools"],
@@ -891,6 +997,8 @@ async def test_explicit_external_specialist_retries_as_one_logical_session(
     )
     assert result.text == "accepted external answer"
     assert len(calls) == 2
-    assert calls[1]["prior"] == ("get_draw_call_details",)
+    assert calls[1]["prior"] == ()
     assert "first partial answer" in calls[1]["prompt"]
     assert "same logical specialist session" in calls[1]["prompt"]
+    assert "rerun all required evidence" in calls[1]["prompt"]
+    assert "get_draw_call_details" in calls[1]["prompt"]

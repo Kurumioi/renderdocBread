@@ -10,7 +10,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from src.shader_workspace import ShaderWorkspaceWatchManager, WorkspaceWatchError
+from src.shader_workspace import (
+    ShaderWorkspaceWatchManager,
+    WorkspaceWatchConflictError,
+    WorkspaceWatchError,
+)
 from src.shader_workspace.leases import WorkspaceSourceTransactionLease
 
 
@@ -159,6 +163,95 @@ class ShaderWorkspaceWatcherTests(unittest.TestCase):
         self.assertEqual(audit["lastCompiledSourceSha256"], _sha(newest))
         stopped = manager.stop(watch_id)
         self.assertEqual(stopped["state"], "stopped")
+
+    def test_editor_save_uses_real_cas_and_schedules_the_new_source(self) -> None:
+        service = _FakeWorkspaceService(self.root)
+        manager = self._manager(service)
+        watch_id = manager.start(self.root, 100)["watchId"]
+        self._wait_for(
+            manager, watch_id, lambda result: result["state"] == "running"
+        )
+
+        replacement = "float4 main() : SV_Target { return 7; }\n"
+        saved = manager.save_source(watch_id, _sha(self.initial), replacement)
+
+        replacement_bytes = replacement.encode("utf-8")
+        replacement_sha256 = _sha(replacement_bytes)
+        self.assertEqual(replacement_bytes, self.source.read_bytes())
+        self.assertEqual(watch_id, saved["watchId"])
+        self.assertEqual(replacement_sha256, saved["rawSha256"])
+        self.assertEqual(len(replacement_bytes), saved["size"])
+        self.assertGreater(saved["modifiedNs"], 0)
+        self.assertTrue(saved["changed"])
+        self.assertTrue(saved["compileScheduled"])
+
+        compiled = self._wait_for(
+            manager,
+            watch_id,
+            lambda result: result["compileSuccesses"] == 1 and result["caughtUp"],
+        )
+        self.assertEqual([replacement_sha256], service.compile_hashes)
+        self.assertEqual(replacement_sha256, compiled["lastCompiledSourceSha256"])
+        save_events = [
+            event
+            for event in compiled["events"]
+            if event["type"] == "editorSourceSaved"
+        ]
+        self.assertEqual(1, len(save_events))
+        self.assertEqual(_sha(self.initial), save_events[0]["expectedSha256"])
+        self.assertEqual(replacement_sha256, save_events[0]["sourceSha256"])
+
+        unchanged = manager.save_source(
+            watch_id, replacement_sha256, replacement
+        )
+        self.assertFalse(unchanged["changed"])
+        self.assertFalse(unchanged["compileScheduled"])
+        manager.stop(watch_id)
+
+    def test_editor_save_rejects_stale_hash_without_overwriting_disk(self) -> None:
+        service = _FakeWorkspaceService(self.root)
+        manager = self._manager(service)
+        watch_id = manager.start(self.root, 100)["watchId"]
+        self._wait_for(
+            manager, watch_id, lambda result: result["state"] == "running"
+        )
+
+        external = b"float4 main() : SV_Target { return 8; }\n"
+        self.source.write_bytes(external)
+        with self.assertRaisesRegex(
+            WorkspaceWatchConflictError, "changed on disk"
+        ):
+            manager.save_source(
+                watch_id,
+                _sha(self.initial),
+                "float4 main() : SV_Target { return 9; }\n",
+            )
+
+        self.assertEqual(external, self.source.read_bytes())
+        self.assertFalse(
+            any(
+                event["type"] == "editorSourceSaved"
+                for event in manager.poll(watch_id)["events"]
+            )
+        )
+        manager.stop(watch_id)
+
+    def test_editor_save_is_rejected_after_watcher_stops(self) -> None:
+        service = _FakeWorkspaceService(self.root)
+        manager = self._manager(service)
+        watch_id = manager.start(self.root, 100)["watchId"]
+        self._wait_for(
+            manager, watch_id, lambda result: result["state"] == "running"
+        )
+        manager.stop(watch_id)
+
+        with self.assertRaisesRegex(WorkspaceWatchError, "not running"):
+            manager.save_source(
+                watch_id,
+                _sha(self.initial),
+                "float4 main() : SV_Target { return 10; }\n",
+            )
+        self.assertEqual(self.initial, self.source.read_bytes())
 
     def test_explanatory_lane_is_never_watchable(self) -> None:
         class _ExplanatoryService(_FakeWorkspaceService):

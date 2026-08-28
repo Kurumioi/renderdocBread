@@ -404,7 +404,7 @@ class Profile:
             ("context_recent_turns", 0, 32),
             ("context_reserved_output_tokens", 256, 1_000_000),
             ("context_target_percent", 20, 70),
-            ("context_trigger_percent", 50, 90),
+            ("context_trigger_percent", 50, 100),
             ("context_window_tokens", 4096, 4_000_000),
             ("max_specialist_attempts", 1, 3),
             ("max_supervisor_stages", 1, 6),
@@ -418,8 +418,8 @@ class Profile:
                 raise ConfigurationError(
                     f"profile option '{key}' must be an integer between {minimum} and {maximum}"
                 )
-        target = int(self.options.get("context_target_percent", 55))
-        trigger = int(self.options.get("context_trigger_percent", 75))
+        target = int(self.options.get("context_target_percent", 25))
+        trigger = int(self.options.get("context_trigger_percent", 100))
         if target >= trigger:
             raise ConfigurationError(
                 "profile option 'context_target_percent' must be smaller than "

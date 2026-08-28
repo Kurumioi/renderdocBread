@@ -1,78 +1,457 @@
-"""Bounded loopback client for ReplayLab's persistent project-restore jobs.
+"""Bounded loopback client for qrenderdoc's private ReplayLab service.
 
-This module runs in qrenderdoc's embedded Python 3.6.  It deliberately talks
-only to the singleton host state published under ReplayLab's local runtime
-directory, reconstructs the loopback URL from the validated port, and obtains
-the bearer secret from the separate owner-readable token file.
+This module runs in qrenderdoc's embedded Python 3.6.  That compact runtime
+does not ship ``_socket``, so requests use WinHTTP directly instead of
+``urllib``.  The client talks only to the singleton Host state published under
+ReplayLab's local runtime directory, reconstructs a fixed loopback request,
+disables redirects/ambient authentication before attaching the bearer secret,
+and bounds every response and wall-clock wait.
 """
 
 from __future__ import absolute_import, print_function
 
+import ctypes
 import json
 import os
 import re
+import sys
 import tempfile
+import threading
 import time
-
-try:
-    from urllib.error import HTTPError, URLError
-    from urllib.parse import quote
-    from urllib.request import Request, urlopen
-except ImportError:  # pragma: no cover - Python 3 is required by qrenderdoc.
-    raise
+import uuid
 
 
 RESTORE_JOB_SCHEMA = "replaylab-project-restore-job/v1"
 RESTORE_JOB_PATH = "/replaylab/project-restore"
+PROJECT_OPERATION_SCHEMA = "replaylab-internal-project-operation/v1"
+PROJECT_OPERATION_RESULT_SCHEMA = "replaylab-internal-project-operation-result/v1"
+PROJECT_OPERATION_PATH = "/replaylab/internal/project-operation"
+EXPECTED_HOST_VERSION = "1.10.2"
+INTERNAL_HOST_STATE_PROTOCOL_VERSION = 1
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_STATE_BYTES = 64 * 1024
+MAX_PROJECT_REQUEST_BYTES = 16 * 1024 * 1024
 MAX_TOKEN_BYTES = 1024
 MAX_PROGRESS_EVENTS = 256
 MAX_PROGRESS_COUNT = 1000000000
+MAX_RESULT_ITEMS = 65536
+MAX_HOST_HEARTBEAT_AGE_MS = 5000
+WINHTTP_CANCEL_SLICE_MS = 500
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,128}$")
 SESSION_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ReplayLabRestoreClientError(RuntimeError):
     pass
 
 
+class ReplayLabRestoreHostIncompatible(ReplayLabRestoreClientError):
+    """A fresh/live Host belongs to a different ReplayLab runtime contract."""
+
+    pass
+
+
+class ReplayLabRestoreRequestUncertain(ReplayLabRestoreClientError):
+    """The request deadline elapsed after the Host may have received it."""
+
+    pass
+
+
+_RESTORE_LIFECYCLE = threading.Condition()
+_RESTORE_GENERATION = 0
+_RESTORE_STOPPING = False
+_ACTIVE_CLIENTS = set()
+
+
+def _publish_progress(callback, phase, current=0, total=0, message=""):
+    """Publish display-only progress without affecting restore correctness."""
+
+    if callback is None:
+        return
+    try:
+        callback({
+            "phase": phase,
+            "message": message,
+            "current": current,
+            "total": total,
+        })
+    except Exception:
+        # A UI observer must never cancel or weaken a physical restore.
+        pass
+
+
+def _winhttp_request_blocking(method, path, port, headers, body,
+                              timeout_seconds, cancel_event,
+                              expected_generation):
+    """Perform one bounded request and close every handle on this same thread."""
+
+    if os.name != "nt":
+        raise ReplayLabRestoreClientError(
+            "ReplayLab project restore requires the Windows loopback Host")
+    deadline = time.monotonic() + max(
+        0.1, min(120.0, float(timeout_seconds)))
+    winhttp = ctypes.WinDLL("winhttp", use_last_error=True)
+    void_pointer = ctypes.c_void_p
+    dword = ctypes.c_uint32
+
+    winhttp.WinHttpOpen.argtypes = (
+        ctypes.c_wchar_p, dword, ctypes.c_wchar_p, ctypes.c_wchar_p, dword)
+    winhttp.WinHttpOpen.restype = void_pointer
+    winhttp.WinHttpConnect.argtypes = (
+        void_pointer, ctypes.c_wchar_p, ctypes.c_uint16, dword)
+    winhttp.WinHttpConnect.restype = void_pointer
+    winhttp.WinHttpOpenRequest.argtypes = (
+        void_pointer, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+        ctypes.c_wchar_p, void_pointer, dword)
+    winhttp.WinHttpOpenRequest.restype = void_pointer
+    winhttp.WinHttpSetTimeouts.argtypes = (
+        void_pointer, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int)
+    winhttp.WinHttpSetTimeouts.restype = ctypes.c_int
+    winhttp.WinHttpSetOption.argtypes = (
+        void_pointer, dword, void_pointer, dword)
+    winhttp.WinHttpSetOption.restype = ctypes.c_int
+    winhttp.WinHttpSendRequest.argtypes = (
+        void_pointer, ctypes.c_wchar_p, dword, void_pointer, dword, dword,
+        ctypes.c_size_t)
+    winhttp.WinHttpSendRequest.restype = ctypes.c_int
+    winhttp.WinHttpReceiveResponse.argtypes = (void_pointer, void_pointer)
+    winhttp.WinHttpReceiveResponse.restype = ctypes.c_int
+    winhttp.WinHttpQueryHeaders.argtypes = (
+        void_pointer, dword, ctypes.c_wchar_p, void_pointer,
+        ctypes.POINTER(dword), ctypes.POINTER(dword))
+    winhttp.WinHttpQueryHeaders.restype = ctypes.c_int
+    winhttp.WinHttpQueryDataAvailable.argtypes = (
+        void_pointer, ctypes.POINTER(dword))
+    winhttp.WinHttpQueryDataAvailable.restype = ctypes.c_int
+    winhttp.WinHttpReadData.argtypes = (
+        void_pointer, void_pointer, dword, ctypes.POINTER(dword))
+    winhttp.WinHttpReadData.restype = ctypes.c_int
+    winhttp.WinHttpCloseHandle.argtypes = (void_pointer,)
+    winhttp.WinHttpCloseHandle.restype = ctypes.c_int
+
+    session = connection = request = None
+    request_started = False
+
+    def check_request_state():
+        with _RESTORE_LIFECYCLE:
+            stopping = _RESTORE_STOPPING
+            generation_changed = _RESTORE_GENERATION != expected_generation
+        if cancel_event.is_set() or stopping or generation_changed:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab project restore was cancelled during shutdown")
+        if time.monotonic() >= deadline:
+            if method == "POST":
+                raise ReplayLabRestoreRequestUncertain(
+                    "ReplayLab Host request timed out")
+            raise ReplayLabRestoreClientError(
+                "ReplayLab Host request timed out")
+
+    try:
+        check_request_state()
+        # WINHTTP_ACCESS_TYPE_NO_PROXY keeps this authenticated request on the
+        # fixed 127.0.0.1 boundary even when the user has a system proxy.
+        session = winhttp.WinHttpOpen(
+            "RenderDocUltra-ReplayLab/1", 1, None, None, 0)
+        if not session:
+            raise ctypes.WinError(ctypes.get_last_error())
+        # Synchronous WinHTTP handles may only be closed by their owning thread.
+        # Short native waits plus the absolute deadline below keep shutdown
+        # cooperative and bounded without a cross-thread WinHttpCloseHandle race.
+        timeout_ms = max(100, min(
+            WINHTTP_CANCEL_SLICE_MS,
+            int(max(0.1, deadline - time.monotonic()) * 1000)))
+        if not winhttp.WinHttpSetTimeouts(
+                session, timeout_ms, timeout_ms, timeout_ms, timeout_ms):
+            raise ctypes.WinError(ctypes.get_last_error())
+        check_request_state()
+        connection = winhttp.WinHttpConnect(
+            session, "127.0.0.1", int(port), 0)
+        if not connection:
+            raise ctypes.WinError(ctypes.get_last_error())
+        check_request_state()
+        request = winhttp.WinHttpOpenRequest(
+            connection, method, path, None, None, None, 0)
+        if not request:
+            raise ctypes.WinError(ctypes.get_last_error())
+        check_request_state()
+
+        # Never forward the bearer through a redirect or let a stale process on
+        # a reused loopback port trigger ambient Negotiate/NTLM credentials.
+        disabled_features = dword(
+            0x2 | 0x4)  # WINHTTP_DISABLE_REDIRECTS | DISABLE_AUTHENTICATION
+        if not winhttp.WinHttpSetOption(
+                request, 63, ctypes.byref(disabled_features),
+                ctypes.sizeof(disabled_features)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        auto_logon_policy = dword(2)  # WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH
+        if not winhttp.WinHttpSetOption(
+                request, 77, ctypes.byref(auto_logon_policy),
+                ctypes.sizeof(auto_logon_policy)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        check_request_state()
+
+        header_text = headers or None
+        body_buffer = ctypes.create_string_buffer(body) if body else None
+        body_pointer = (ctypes.cast(body_buffer, void_pointer)
+                        if body_buffer is not None else None)
+        request_started = True
+        if not winhttp.WinHttpSendRequest(
+                request, header_text, len(headers or ""), body_pointer,
+                len(body), len(body), 0):
+            raise ctypes.WinError(ctypes.get_last_error())
+        check_request_state()
+        if not winhttp.WinHttpReceiveResponse(request, None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        check_request_state()
+
+        status = dword()
+        status_size = dword(ctypes.sizeof(status))
+        status_index = dword()
+        if not winhttp.WinHttpQueryHeaders(
+                request, 19 | 0x20000000, None, ctypes.byref(status),
+                ctypes.byref(status_size), ctypes.byref(status_index)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        check_request_state()
+
+        chunks = []
+        total = 0
+        while True:
+            check_request_state()
+            available = dword()
+            if not winhttp.WinHttpQueryDataAvailable(
+                    request, ctypes.byref(available)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            check_request_state()
+            if available.value == 0:
+                break
+            if int(available.value) > MAX_RESPONSE_BYTES - total:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab Host returned an invalid response size")
+            request_bytes = min(16 * 1024, int(available.value))
+            # Read only bytes WinHTTP has already made available. Asking for the
+            # entire remaining Content-Length lets a slow peer keep one
+            # synchronous ReadData call alive indefinitely by dripping bytes.
+            buffer = ctypes.create_string_buffer(request_bytes)
+            received = dword()
+            if not winhttp.WinHttpReadData(
+                    request, buffer, request_bytes, ctypes.byref(received)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            check_request_state()
+            if received.value == 0:
+                break
+            total += int(received.value)
+            chunks.append(buffer.raw[:received.value])
+        return int(status.value), b"".join(chunks)
+    except ReplayLabRestoreClientError:
+        raise
+    except (OSError, ValueError) as exc:
+        if cancel_event.is_set():
+            raise ReplayLabRestoreClientError(
+                "ReplayLab project restore was cancelled during shutdown")
+        if method == "POST" and request_started:
+            raise ReplayLabRestoreRequestUncertain(
+                "ReplayLab Host request outcome is uncertain: %s" % str(exc))
+        raise ReplayLabRestoreClientError(
+            "ReplayLab Host connection failed: %s" % str(exc))
+    finally:
+        for handle in (request, connection, session):
+            if handle:
+                try:
+                    winhttp.WinHttpCloseHandle(handle)
+                except Exception:
+                    pass
+
+
+def _winhttp_transport(port, token, method, path, body, timeout_seconds,
+                       cancel_event, expected_generation):
+    headers = (
+        "Authorization: Bearer %s\r\n"
+        "Accept: application/json\r\n" % token)
+    if body:
+        headers += "Content-Type: application/json; charset=utf-8\r\n"
+    return _winhttp_request_blocking(
+        method, path, port, headers, body, timeout_seconds, cancel_event,
+        expected_generation)
+
+
+def _winhttp_health_transport(port, timeout_seconds, cancel_event,
+                              expected_generation):
+    """Read the public Host identity before sending a bearer credential."""
+
+    return _winhttp_request_blocking(
+        "GET", "/health", port, "Accept: application/json\r\n", b"",
+        timeout_seconds, cancel_event, expected_generation)
+
+
+def begin_restore_shutdown():
+    """Install a sticky fence and cancel every restore registered before it."""
+
+    global _RESTORE_GENERATION, _RESTORE_STOPPING
+    with _RESTORE_LIFECYCLE:
+        if not _RESTORE_STOPPING:
+            _RESTORE_GENERATION += 1
+            _RESTORE_STOPPING = True
+        generation = _RESTORE_GENERATION
+        clients = list(_ACTIVE_CLIENTS)
+    for client in clients:
+        try:
+            client.cancel()
+        except Exception:
+            pass
+    return generation
+
+
+def cancel_active_restores():
+    """Backward-compatible name for the sticky launcher shutdown fence."""
+
+    return begin_restore_shutdown()
+
+
+def resume_restore_generation():
+    """Open a fresh lifecycle generation before constructing a new executor."""
+
+    global _RESTORE_GENERATION, _RESTORE_STOPPING
+    with _RESTORE_LIFECYCLE:
+        if _ACTIVE_CLIENTS:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab project restore workers are still active")
+        _RESTORE_GENERATION += 1
+        _RESTORE_STOPPING = False
+        return _RESTORE_GENERATION
+
+
+def wait_restore_quiescent(generation, timeout_seconds):
+    """Wait until the fenced generation owns no Python restore workers."""
+
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    with _RESTORE_LIFECYCLE:
+        if generation != _RESTORE_GENERATION or not _RESTORE_STOPPING:
+            return False
+        while _ACTIVE_CLIENTS:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            _RESTORE_LIFECYCLE.wait(remaining)
+        return True
+
+
 def runtime_root(environment=None):
-    """Resolve the exact directory used by ``replaylab_host.runtime_root``."""
+    """Resolve the private service directory, separate from ReplayLabMCP."""
 
     env = os.environ if environment is None else environment
-    configured = str(env.get("REPLAYLAB_RUNTIME_DIR", "") or "").strip()
+    configured = str(
+        env.get("REPLAYLAB_INTERNAL_RUNTIME_DIR", "") or "").strip()
     if configured:
         return os.path.abspath(os.path.expanduser(configured))
     local = str(env.get("LOCALAPPDATA", "") or "").strip()
     if local:
         return os.path.abspath(os.path.join(
-            os.path.expanduser(local), "ReplayLab", "runtime"))
+            os.path.expanduser(local), "ReplayLab", "internal-runtime"))
     getuid = getattr(os, "getuid", None)
     suffix = str(getuid() if callable(getuid) else os.getpid())
     return os.path.abspath(os.path.join(
-        tempfile.gettempdir(), "ReplayLab-" + suffix))
+        tempfile.gettempdir(), "ReplayLabInternal-" + suffix))
 
 
-def _read_bounded(path, maximum):
-    if os.path.islink(path) or not os.path.isfile(path):
-        raise ReplayLabRestoreClientError("ReplayLab host state is unavailable")
+def resolve_internal_executable(hint=None):
+    """Resolve only the first-party internal executable from fixed locations."""
+
+    candidates = []
+    supplied = str(hint or "").strip()
+    if supplied:
+        absolute = os.path.abspath(os.path.expanduser(supplied))
+        if os.path.basename(absolute).lower() == "replaylabinternal.exe":
+            candidates.append(absolute)
+        else:
+            candidates.append(os.path.join(
+                os.path.dirname(absolute), "ReplayLabInternal.exe"))
+    executable_root = os.path.dirname(os.path.abspath(sys.executable))
+    candidates.extend([
+        os.path.join(executable_root, "replaylab", "ReplayLabInternal.exe"),
+        os.path.join(executable_root, "ReplayLabInternal.exe"),
+    ])
+    seen = set()
+    for candidate in candidates:
+        normal = os.path.normcase(os.path.abspath(candidate))
+        if normal in seen:
+            continue
+        seen.add(normal)
+        if os.path.isfile(candidate) and not _is_reparse(candidate):
+            return os.path.abspath(candidate)
+    return ""
+
+
+def _is_reparse(path):
+    if os.path.islink(path):
+        return True
+    if os.name != "nt":
+        return False
     try:
-        size = int(os.path.getsize(path))
+        get_attributes = ctypes.windll.kernel32.GetFileAttributesW
+        get_attributes.argtypes = (ctypes.c_wchar_p,)
+        get_attributes.restype = ctypes.c_uint32
+        attributes = int(get_attributes(str(path)))
+        return attributes != 0xFFFFFFFF and bool(attributes & 0x400)
+    except Exception:
+        return True
+
+
+def _read_bounded(path, maximum, label):
+    value_path = os.path.abspath(str(path))
+    if _is_reparse(value_path) or not os.path.isfile(value_path):
+        raise ReplayLabRestoreClientError("%s is unavailable" % label)
+    try:
+        size = int(os.path.getsize(value_path))
     except (OSError, TypeError, ValueError):
-        raise ReplayLabRestoreClientError("ReplayLab host state is unavailable")
+        raise ReplayLabRestoreClientError("%s is unavailable" % label)
     if size <= 0 or size > maximum:
-        raise ReplayLabRestoreClientError("ReplayLab host state is invalid")
+        raise ReplayLabRestoreClientError("%s is invalid" % label)
     try:
-        with open(path, "rb") as stream:
+        with open(value_path, "rb") as stream:
             value = stream.read(maximum + 1)
     except OSError as exc:
         raise ReplayLabRestoreClientError(
-            "ReplayLab host state could not be read: %s" % str(exc))
-    if not value or len(value) > maximum:
-        raise ReplayLabRestoreClientError("ReplayLab host state is invalid")
+            "%s could not be read: %s" % (label, str(exc)))
+    if not value or len(value) != size or len(value) > maximum:
+        raise ReplayLabRestoreClientError("%s changed while it was read" % label)
     return value
+
+
+def _process_alive(pid):
+    try:
+        value = int(pid)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if value <= 0:
+        return False
+    if value == os.getpid():
+        return True
+    if os.name == "nt":
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = (
+            ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetExitCodeProcess.argtypes = (
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+        kernel32.GetExitCodeProcess.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(0x1000 | 0x00100000, False, value)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_uint32()
+            return bool(kernel32.GetExitCodeProcess(
+                handle, ctypes.byref(exit_code))) and exit_code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
+    try:  # pragma: no cover - qrenderdoc's packaged Host is Windows-only.
+        os.kill(value, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _strict_json_bytes(payload, label):
@@ -100,6 +479,52 @@ def _strict_json_bytes(payload, label):
     return value
 
 
+def _bounded_integer(value, label, minimum=0, maximum=MAX_PROGRESS_COUNT):
+    if (isinstance(value, bool) or not isinstance(value, int) or
+            value < minimum or value > maximum):
+        raise ReplayLabRestoreClientError("%s is invalid" % label)
+    return value
+
+
+def _bounded_text(value, label, maximum=4096, allow_empty=False):
+    if not isinstance(value, str):
+        raise ReplayLabRestoreClientError("%s must be text" % label)
+    text = value
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ReplayLabRestoreClientError("%s is invalid" % label)
+    if ((not text and not allow_empty) or len(encoded) > maximum or
+            any(ord(character) < 0x20 for character in text)):
+        raise ReplayLabRestoreClientError("%s is invalid" % label)
+    return text
+
+
+def _bounded_diagnostic(value, label, maximum=MAX_RESPONSE_BYTES,
+                        allow_empty=False):
+    """Validate producer diagnostics without flattening compiler output."""
+    if not isinstance(value, str):
+        raise ReplayLabRestoreClientError("%s must be text" % label)
+    text = value
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ReplayLabRestoreClientError("%s is invalid" % label)
+    if ((not text and not allow_empty) or len(encoded) > maximum or
+            any((ord(character) < 0x20 and character not in "\t\r\n") or
+                0x7F <= ord(character) < 0xA0
+                for character in text)):
+        raise ReplayLabRestoreClientError("%s is invalid" % label)
+    return text
+
+
+def _hex_text(value, pattern, label):
+    text = _bounded_text(value, label, 128).lower()
+    if pattern.fullmatch(text) is None or text != value:
+        raise ReplayLabRestoreClientError("%s is invalid" % label)
+    return text
+
+
 def _clean_path(value, label, require_rdc=False):
     if not isinstance(value, str):
         raise ReplayLabRestoreClientError("%s must be text" % label)
@@ -115,24 +540,23 @@ def _clean_path(value, label, require_rdc=False):
 def _normalise_progress(value, previous_sequence):
     if not isinstance(value, dict):
         raise ReplayLabRestoreClientError("ReplayLab restore progress is malformed")
+    if set(value) != {"sequence", "phase", "message", "current", "total"}:
+        raise ReplayLabRestoreClientError("ReplayLab restore progress is malformed")
     try:
-        sequence = int(value.get("sequence"))
-        current = int(value.get("current", 0))
-        total = int(value.get("total", 0))
-    except (TypeError, ValueError, OverflowError):
+        sequence = _bounded_integer(
+            value["sequence"], "restore progress sequence", 1, 0x7FFFFFFF)
+        current = _bounded_integer(
+            value["current"], "restore progress current")
+        total = _bounded_integer(
+            value["total"], "restore progress total")
+        phase = _bounded_text(value["phase"], "restore progress phase", 128)
+        message = _bounded_text(
+            value["message"], "restore progress message", 1024,
+            allow_empty=True)
+    except ReplayLabRestoreClientError:
         raise ReplayLabRestoreClientError("ReplayLab restore progress is malformed")
-    phase = str(value.get("phase", "") or "").strip()
-    message = str(value.get("message", "") or "").strip()
-    if (sequence <= previous_sequence or sequence > 0x7FFFFFFF or
-            current < 0 or total < 0 or
-            current > MAX_PROGRESS_COUNT or total > MAX_PROGRESS_COUNT or
-            (not phase and not message) or len(phase) > 128 or
-            len(message) > 1024 or "\x00" in phase or "\x00" in message):
+    if sequence <= previous_sequence or (total and current > total):
         raise ReplayLabRestoreClientError("ReplayLab restore progress is malformed")
-    if total:
-        current = min(current, total)
-    else:
-        current = 0
     return {
         "sequence": sequence,
         "phase": phase,
@@ -142,201 +566,829 @@ def _normalise_progress(value, previous_sequence):
     }
 
 
+def _validate_shader_items(value):
+    items = value.get("items")
+    if not isinstance(items, list) or len(items) > MAX_RESULT_ITEMS:
+        raise ReplayLabRestoreClientError(
+            "ReplayLab restore Shader summary is malformed")
+    counts = {"applied": 0, "skipped": 0, "failed": 0}
+    for item in items:
+        if not isinstance(item, dict):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore Shader item is malformed")
+        status = item.get("status")
+        source = item.get("source")
+        if status not in counts or source not in ("rdc-index", "reuse-plan"):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore Shader item is malformed")
+        if status == "applied":
+            expected = {
+                "status", "source", "workspacePath", "workspaceId",
+                "resourceId", "stage", "replacementId",
+            }
+            if source == "reuse-plan":
+                expected.add("knowledgeId")
+        elif status == "failed":
+            expected = {
+                "status", "source", "resourceId", "stage", "error",
+            }
+            expected.add("workspacePath" if source == "rdc-index" else
+                         "knowledgeId")
+        else:
+            expected = {
+                "status", "source", "resourceId", "stage", "reason",
+            }
+            if source != "reuse-plan":
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab restore Shader item is malformed")
+        if set(item) != expected:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore Shader item is malformed")
+        _bounded_integer(
+            item["resourceId"], "Shader resource ID", 1,
+            0x7FFFFFFFFFFFFFFF)
+        _bounded_text(item["stage"], "Shader stage", 32)
+        for field in ("workspaceId", "replacementId", "knowledgeId"):
+            if field in item:
+                _hex_text(item[field], JOB_ID_PATTERN, "Shader " + field)
+        if "workspacePath" in item:
+            _clean_path(item["workspacePath"], "Shader workspace path")
+        for field in ("error", "reason"):
+            if field in item:
+                _bounded_diagnostic(item[field], "Shader " + field)
+        counts[status] += 1
+    return items, counts
+
+
+def _validate_material_items(value):
+    items = value.get("items")
+    if not isinstance(items, list) or len(items) > MAX_RESULT_ITEMS:
+        raise ReplayLabRestoreClientError(
+            "ReplayLab restore material summary is malformed")
+    counts = {"restored": 0, "skipped": 0, "failed": 0}
+    restored_sessions = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore material item is malformed")
+        status = item.get("status")
+        source = item.get("source")
+        if status == "restored":
+            expected = {
+                "status", "sessionId", "knowledgeId", "eventId", "stage",
+                "blockIndex", "constantBlockPath", "parameterCount", "updates",
+            }
+            if source is not None:
+                if source != "reuse-plan":
+                    raise ReplayLabRestoreClientError(
+                        "ReplayLab restore material item is malformed")
+                expected.add("source")
+            if set(item) != expected:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab restore material item is malformed")
+            session_id = _hex_text(
+                item["sessionId"], JOB_ID_PATTERN, "material session ID")
+            restored_sessions.append(session_id)
+            _hex_text(
+                item["knowledgeId"], JOB_ID_PATTERN, "material knowledge ID")
+            _bounded_integer(
+                item["eventId"], "material event ID", 1,
+                0x7FFFFFFFFFFFFFFF)
+            _bounded_integer(
+                item["blockIndex"], "material block index", 0,
+                MAX_PROGRESS_COUNT)
+            _bounded_text(item["stage"], "material stage", 32)
+            _bounded_text(
+                item["constantBlockPath"], "material CBuffer path", 2048)
+            parameter_count = _bounded_integer(
+                item["parameterCount"], "material parameter count", 0, 256)
+            updates = item["updates"]
+            if not isinstance(updates, list) or len(updates) != parameter_count:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab restore material item is malformed")
+            for update in updates:
+                if (not isinstance(update, dict) or
+                        set(update) != {"parameterId", "liveParameterId", "path"}):
+                    raise ReplayLabRestoreClientError(
+                        "ReplayLab restore material item is malformed")
+                _hex_text(
+                    update["parameterId"], JOB_ID_PATTERN,
+                    "material parameter ID")
+                _hex_text(
+                    update["liveParameterId"], JOB_ID_PATTERN,
+                    "live material parameter ID")
+                _bounded_text(
+                    update["path"], "material parameter path", 2048)
+        elif status == "failed":
+            if source == "rdc-index":
+                expected = {
+                    "status", "source", "knowledgeId", "eventId", "stage",
+                    "error",
+                }
+            elif source == "reuse-plan":
+                expected = {
+                    "status", "source", "knowledgeId", "resourceId", "stage",
+                    "error",
+                }
+            else:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab restore material item is malformed")
+            if set(item) != expected:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab restore material item is malformed")
+            _hex_text(
+                item["knowledgeId"], JOB_ID_PATTERN, "material knowledge ID")
+            if "eventId" in item:
+                _bounded_integer(
+                    item["eventId"], "material event ID", 1,
+                    0x7FFFFFFFFFFFFFFF)
+            if "resourceId" in item:
+                _bounded_integer(
+                    item["resourceId"], "material resource ID", 1,
+                    0x7FFFFFFFFFFFFFFF)
+            _bounded_text(item["stage"], "material stage", 32)
+            _bounded_diagnostic(item["error"], "material error")
+        elif status == "skipped" and source == "reuse-plan":
+            if set(item) != {
+                    "status", "source", "resourceId", "stage", "reason"}:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab restore material item is malformed")
+            _bounded_integer(
+                item["resourceId"], "material resource ID", 1,
+                0x7FFFFFFFFFFFFFFF)
+            _bounded_text(item["stage"], "material stage", 32)
+            _bounded_diagnostic(item["reason"], "material reason")
+        else:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore material item is malformed")
+        counts[status] += 1
+    return items, counts, restored_sessions
+
+
 class ReplayLabRestoreHostClient(object):
-    """Start and poll one authenticated restore job on the persistent host."""
+    """Start and poll one restore job on the private internal service."""
 
     def __init__(self, runtime_directory=None, timeout_seconds=1800,
                  startup_timeout_seconds=15, poll_seconds=0.1,
-                 opener=None, sleep=None, monotonic=None):
+                 request_timeout_seconds=3.0, transport=None,
+                 health_transport=None, sleep=None, monotonic=None,
+                 internal_executable=None):
         self.runtime_directory = os.path.abspath(
             runtime_directory or runtime_root())
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.startup_timeout_seconds = max(
             0.1, float(startup_timeout_seconds))
         self.poll_seconds = min(1.0, max(0.01, float(poll_seconds)))
-        self.opener = opener or urlopen
-        self.sleep = sleep or time.sleep
+        # Restore endpoints only submit jobs or return bounded snapshots. Keep
+        # this below the launcher's five-second worker shutdown budget.
+        self.request_timeout_seconds = min(
+            4.0, max(0.1, float(request_timeout_seconds)))
+        self.transport = transport or _winhttp_transport
+        self.health_transport = health_transport or _winhttp_health_transport
+        self.sleep = sleep
         self.monotonic = monotonic or time.monotonic
+        self.internal_executable = resolve_internal_executable(
+            internal_executable)
+        self._cancelled = threading.Event()
+        self._restore_generation = None
+
+    def cancel(self):
+        self._cancelled.set()
+
+    def _check_cancelled(self):
+        with _RESTORE_LIFECYCLE:
+            generation_changed = (
+                self._restore_generation is not None and
+                self._restore_generation != _RESTORE_GENERATION)
+            stopping = _RESTORE_STOPPING
+        if self._cancelled.is_set() or stopping or generation_changed:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab project restore was cancelled during shutdown")
+
+    def _wait(self, seconds):
+        self._check_cancelled()
+        duration = max(0.0, float(seconds))
+        if self.sleep is None:
+            self._cancelled.wait(duration)
+        else:
+            self.sleep(duration)
+        self._check_cancelled()
 
     def _credentials(self, deadline):
-        state_path = os.path.join(self.runtime_directory, "host.json")
-        token_path = os.path.join(self.runtime_directory, "host.token")
+        state_path = os.path.join(
+            self.runtime_directory, "internal-host.json")
+        token_path = os.path.join(
+            self.runtime_directory, "internal-host.token")
         last_error = None
         while self.monotonic() < deadline:
             try:
                 state = _strict_json_bytes(
-                    _read_bounded(state_path, MAX_STATE_BYTES),
-                    "ReplayLab host state")
-                if (state.get("schema") != "replaylab-host/v1" or
-                        state.get("service") != "ReplayLab" or
-                        str(state.get("host", "") or "") != "127.0.0.1"):
+                    _read_bounded(
+                        state_path, MAX_STATE_BYTES,
+                        "ReplayLab internal Host state"),
+                    "ReplayLab internal Host state")
+                if (state.get("schema") != "replaylab-internal-host/v1" or
+                        state.get("service") != "ReplayLabInternal" or
+                        state.get("host") != "127.0.0.1"):
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab host state has an invalid identity")
+                        "ReplayLab internal Host state has an invalid identity")
                 try:
-                    port = int(state.get("port"))
-                except (TypeError, ValueError, OverflowError):
+                    port = _bounded_integer(
+                        state.get("port"), "ReplayLab Host port", 1024, 65535)
+                    heartbeat = _bounded_integer(
+                        state.get("heartbeatUnixMs"),
+                        "ReplayLab Host heartbeat", 1, 0x7FFFFFFFFFFFFFFF)
+                    pid = _bounded_integer(
+                        state.get("pid"), "ReplayLab Host process ID", 1,
+                        0x7FFFFFFF)
+                    version = _bounded_text(
+                        state.get("version"), "ReplayLab Host version", 128)
+                    endpoint = _bounded_text(
+                        state.get("endpoint"), "ReplayLab Host endpoint", 256)
+                except ReplayLabRestoreClientError:
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab host state has an invalid port")
-                if port < 1024 or port > 65535:
+                        "ReplayLab Host state is invalid")
+                heartbeat_age = int(time.time() * 1000) - heartbeat
+                if (heartbeat_age < -2000 or
+                        heartbeat_age > MAX_HOST_HEARTBEAT_AGE_MS or
+                        endpoint != (
+                            "http://127.0.0.1:%d/replaylab/internal" % port) or
+                        not _process_alive(pid)):
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab host state has an invalid port")
-                published_token = str(state.get("tokenFile", "") or "").strip()
-                if (published_token and
+                        "ReplayLab internal Host state is stale")
+                protocol_version = state.get("hostStateProtocolVersion")
+                if (version != EXPECTED_HOST_VERSION or
+                        isinstance(protocol_version, bool) or
+                        not isinstance(protocol_version, int) or
+                        protocol_version != INTERNAL_HOST_STATE_PROTOCOL_VERSION):
+                    raise ReplayLabRestoreHostIncompatible(
+                        "ReplayLab internal Host runtime is incompatible "
+                        "(expected %s protocol %d, received %s protocol %s)" %
+                        (EXPECTED_HOST_VERSION,
+                         INTERNAL_HOST_STATE_PROTOCOL_VERSION,
+                         version, str(protocol_version)))
+                try:
+                    host_instance_id = _hex_text(
+                        state.get("hostInstanceId"), JOB_ID_PATTERN,
+                        "ReplayLab Host instance ID")
+                except ReplayLabRestoreClientError:
+                    raise ReplayLabRestoreHostIncompatible(
+                        "ReplayLab internal Host runtime does not publish a valid "
+                        "instance identity")
+                published_token = state.get("tokenFile")
+                if (not isinstance(published_token, str) or
                         os.path.normcase(os.path.abspath(published_token)) !=
                         os.path.normcase(os.path.abspath(token_path))):
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab host token path is inconsistent")
-                token = _read_bounded(token_path, MAX_TOKEN_BYTES).decode(
-                    "ascii").strip()
+                        "ReplayLab internal Host token path is inconsistent")
+                token = _read_bounded(
+                    token_path, MAX_TOKEN_BYTES,
+                    "ReplayLab internal Host token").decode("ascii").strip()
                 if TOKEN_PATTERN.fullmatch(token) is None:
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab host token is invalid")
-                return port, token
+                        "ReplayLab internal Host token is invalid")
+                return port, token, pid, version, host_instance_id
+            except ReplayLabRestoreHostIncompatible:
+                # A fresh, live Host with an older or different contract cannot
+                # become compatible by waiting for another heartbeat.
+                raise
             except (ReplayLabRestoreClientError, UnicodeDecodeError) as exc:
                 last_error = exc
-                self.sleep(min(self.poll_seconds, 0.1))
+                self._check_cancelled()
+                self._wait(min(self.poll_seconds, 0.1))
         raise ReplayLabRestoreClientError(
-            "ReplayLab persistent host did not become ready: %s" %
-            str(last_error or "host state is unavailable"))
+            "ReplayLab internal Host did not become ready: %s" %
+            str(last_error or "internal Host state is unavailable"))
 
-    def _request(self, port, token, method, path, payload=None):
-        body = None
-        headers = {
-            "Authorization": "Bearer " + token,
-            "Accept": "application/json",
-        }
+    def _verify_health(self, port, pid, version, host_instance_id):
+        self._check_cancelled()
+        try:
+            status, response_body = self.health_transport(
+                int(port), min(2.0, self.request_timeout_seconds),
+                self._cancelled, self._restore_generation)
+        except ReplayLabRestoreClientError:
+            raise
+        except Exception as exc:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab internal Host health check failed: %s" % str(exc))
+        if not response_body or len(response_body) > MAX_STATE_BYTES:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab internal Host health response is invalid")
+        value = _strict_json_bytes(
+            response_body, "ReplayLab internal Host health check")
+        response_pid = value.get("pid")
+        if (isinstance(status, bool) or not isinstance(status, int) or
+                status != 200 or
+                value.get("service") != "ReplayLabInternal" or
+                value.get("transport") != "internal-http" or
+                value.get("hostInstanceId") != host_instance_id or
+                value.get("capabilities") != [
+                    "project-service", "project-restore",
+                    "shader-source-save"] or
+                isinstance(response_pid, bool) or
+                not isinstance(response_pid, int) or response_pid != pid):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab internal Host health identity is invalid")
+        protocol_version = value.get("hostStateProtocolVersion")
+        if (value.get("version") != EXPECTED_HOST_VERSION or
+                version != EXPECTED_HOST_VERSION or
+                isinstance(protocol_version, bool) or
+                not isinstance(protocol_version, int) or
+                protocol_version != INTERNAL_HOST_STATE_PROTOCOL_VERSION):
+            raise ReplayLabRestoreHostIncompatible(
+                "ReplayLab internal Host health contract is incompatible")
+
+    def _request(self, port, token, method, path, payload=None,
+                 maximum_request_bytes=MAX_STATE_BYTES):
+        self._check_cancelled()
+        body = b""
         if payload is not None:
             body = json.dumps(
                 payload, ensure_ascii=False, sort_keys=True,
                 separators=(",", ":")).encode("utf-8")
-            if len(body) > MAX_STATE_BYTES:
+            if len(body) > maximum_request_bytes:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab restore request is oversized")
-            headers["Content-Type"] = "application/json; charset=utf-8"
-        request = Request(
-            "http://127.0.0.1:%d%s" % (int(port), path),
-            data=body, headers=headers, method=method)
+                    "ReplayLab internal request is oversized")
         try:
-            response = self.opener(request, timeout=15.0)
-            try:
-                response_body = response.read(MAX_RESPONSE_BYTES + 1)
-            finally:
-                close = getattr(response, "close", None)
-                if callable(close):
-                    close()
-        except HTTPError as exc:
-            try:
-                detail = exc.read(4097).decode("utf-8", "replace")
-            except Exception:
-                detail = ""
+            status, response_body = self.transport(
+                int(port), token, method, path, body,
+                self.request_timeout_seconds, self._cancelled,
+                self._restore_generation)
+        except ReplayLabRestoreClientError:
+            raise
+        except Exception as exc:
             raise ReplayLabRestoreClientError(
-                "ReplayLab host rejected the restore request (HTTP %s): %s" %
-                (getattr(exc, "code", "error"), detail[:4096]))
-        except (URLError, OSError) as exc:
-            raise ReplayLabRestoreClientError(
-                "ReplayLab host connection failed: %s" % str(exc))
+                "ReplayLab internal Host connection failed: %s" % str(exc))
         if not response_body or len(response_body) > MAX_RESPONSE_BYTES:
             raise ReplayLabRestoreClientError(
-                "ReplayLab host returned an invalid response size")
-        return _strict_json_bytes(response_body, "ReplayLab host")
+                "ReplayLab internal Host returned an invalid response size")
+        self._check_cancelled()
+        value = _strict_json_bytes(response_body, "ReplayLab internal Host")
+        if isinstance(status, bool) or not isinstance(status, int):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab internal Host returned an invalid HTTP status")
+        allowed_statuses = (200, 202) if method == "POST" else (200,)
+        if status not in allowed_statuses:
+            error = value.get("error", "")
+            if isinstance(error, dict):
+                detail = str(error.get("message", "") or "")[:4096]
+            else:
+                detail = str(error or "")[:4096]
+            raise ReplayLabRestoreClientError(
+                "ReplayLab internal Host rejected the request (HTTP %s): %s" %
+                (status, detail))
+        return value
 
     @staticmethod
-    def _snapshot(value, expected_job_id=None):
-        if not isinstance(value, dict) or value.get("schema") != RESTORE_JOB_SCHEMA:
+    def _snapshot(value, expected_job_id=None, after_sequence=0):
+        if (not isinstance(value, dict) or
+                value.get("schema") != RESTORE_JOB_SCHEMA):
             raise ReplayLabRestoreClientError(
                 "ReplayLab host returned an invalid restore job")
-        job_id = str(value.get("jobId", "") or "").strip().lower()
-        status = str(value.get("status", "") or "").strip().lower()
-        if (JOB_ID_PATTERN.fullmatch(job_id) is None or
-                status not in ("queued", "running", "completed", "failed") or
-                (expected_job_id is not None and job_id != expected_job_id)):
+        try:
+            _bounded_integer(
+                value.get("schemaVersion"), "restore job schema version", 1, 1)
+            after = _bounded_integer(
+                after_sequence, "restore progress cursor", 0, 0x7FFFFFFF)
+            job_id = _hex_text(
+                value.get("jobId"), JOB_ID_PATTERN, "restore job ID")
+            status = _bounded_text(
+                value.get("status"), "restore job status", 16)
+            latest_sequence = _bounded_integer(
+                value.get("latestSequence"), "restore latest sequence", 0,
+                0x7FFFFFFF)
+        except ReplayLabRestoreClientError:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab host returned an invalid restore job")
+        if (status not in ("queued", "running", "completed", "failed") or
+                (expected_job_id is not None and job_id != expected_job_id) or
+                latest_sequence < after):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab host returned an invalid restore job")
+        base_fields = {
+            "schema", "schemaVersion", "jobId", "status", "latestSequence",
+            "progress", "progressTruncated",
+        }
+        expected_fields = set(base_fields)
+        if status == "completed":
+            expected_fields.add("result")
+            if not isinstance(value.get("result"), dict):
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab host returned an invalid restore job")
+        elif status == "failed":
+            expected_fields.add("error")
+            try:
+                _bounded_diagnostic(value.get("error"), "restore job error")
+            except ReplayLabRestoreClientError:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab host returned an invalid restore job")
+        if set(value) != expected_fields:
             raise ReplayLabRestoreClientError(
                 "ReplayLab host returned an invalid restore job")
         progress = value.get("progress", [])
         if not isinstance(progress, list) or len(progress) > MAX_PROGRESS_EVENTS:
             raise ReplayLabRestoreClientError(
                 "ReplayLab host returned invalid restore progress")
+        truncated = value.get("progressTruncated")
+        if not isinstance(truncated, bool):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab host returned invalid restore progress")
+        normalised = []
+        previous = after
+        for raw_event in progress:
+            event = _normalise_progress(raw_event, previous)
+            if event["sequence"] > latest_sequence:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab host returned invalid restore progress")
+            normalised.append(event)
+            previous = event["sequence"]
+        if normalised:
+            first_sequence = normalised[0]["sequence"]
+            if ((not truncated and first_sequence != after + 1) or
+                    (truncated and first_sequence <= after + 1)):
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab host returned invalid restore progress")
+        elif truncated or latest_sequence > after:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab host returned invalid restore progress")
+        return job_id, status, normalised, latest_sequence
+
+    @staticmethod
+    def _result(value, project_root, capture_path, capture_session_id):
+        if (not isinstance(value, dict) or
+                value.get("schema") != "replaylab-project-restore/v1" or
+                not isinstance(value.get("completed"), bool)):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore completed with an invalid result")
         try:
-            latest_sequence = int(value.get("latestSequence", 0))
-        except (TypeError, ValueError, OverflowError):
+            _bounded_integer(
+                value.get("schemaVersion"), "restore result schema version", 1, 1)
+            _hex_text(
+                value.get("operationId"), JOB_ID_PATTERN,
+                "restore operation ID")
+        except ReplayLabRestoreClientError:
             raise ReplayLabRestoreClientError(
-                "ReplayLab host returned invalid restore progress")
-        if (latest_sequence < 0 or latest_sequence > 0x7FFFFFFF or
-                not isinstance(value.get("progressTruncated", False), bool)):
+                "ReplayLab restore completed with an invalid result")
+        capture = value.get("capture")
+        project = value.get("project")
+        if (not isinstance(capture, dict) or not isinstance(project, dict) or
+                set(capture) != {"path", "sessionId", "captureId"} or
+                set(project) != {"root", "workspaceId", "replayProjectId"}):
             raise ReplayLabRestoreClientError(
-                "ReplayLab host returned invalid restore progress")
-        return job_id, status, progress, latest_sequence
+                "ReplayLab restore completed with an invalid result")
+        result_capture_path = _clean_path(
+            capture.get("path"), "result capture path", require_rdc=True)
+        result_project_root = _clean_path(
+            project.get("root"), "result project root")
+        if (os.path.normcase(result_capture_path) !=
+                os.path.normcase(capture_path) or
+                os.path.normcase(result_project_root) !=
+                os.path.normcase(project_root) or
+                capture.get("sessionId") != capture_session_id):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore result identity does not match the request")
+        base_fields = {
+            "schema", "schemaVersion", "operationId", "completed", "capture",
+            "project", "cache", "shaders", "materials", "index", "warnings",
+        }
+        if value["completed"] is False:
+            if value.get("outcome") == "action-required":
+                try:
+                    _bounded_text(
+                        value.get("reasonId"), "restore action-required reason", 128
+                    )
+                except ReplayLabRestoreClientError:
+                    raise ReplayLabRestoreClientError(
+                        "ReplayLab restore action-required result is invalid"
+                    )
+                if set(value) != base_fields | {"outcome", "reasonId"}:
+                    raise ReplayLabRestoreClientError(
+                        "ReplayLab restore completed with an invalid result"
+                    )
+                return value
+            try:
+                _bounded_diagnostic(value.get("error"), "restore error")
+                _bounded_text(value.get("errorType"), "restore error type", 256)
+            except ReplayLabRestoreClientError:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab restore failed without a bounded diagnostic")
+            if set(value) != base_fields | {"error", "errorType"}:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab restore completed with an invalid result")
+            return value
+        if set(value) != base_fields:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore completed with an invalid result")
+
+        try:
+            _hex_text(
+                capture.get("captureId"), SHA256_PATTERN,
+                "restore capture ID")
+            _hex_text(
+                project.get("workspaceId"), JOB_ID_PATTERN,
+                "restore workspace ID")
+            _hex_text(
+                project.get("replayProjectId"), JOB_ID_PATTERN,
+                "restore replay project ID")
+        except ReplayLabRestoreClientError:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore completed with an invalid result")
+
+        cache = value.get("cache")
+        shaders = value.get("shaders")
+        materials = value.get("materials")
+        index = value.get("index")
+        warnings = value.get("warnings")
+        if (not isinstance(cache, dict) or set(cache) != {"hit", "reason"} or
+                not isinstance(cache.get("hit"), bool) or
+                not isinstance(shaders, dict) or
+                set(shaders) != {"attempted", "applied", "skipped", "failed", "items"} or
+                not isinstance(materials, dict) or
+                set(materials) != {"attempted", "restored", "skipped", "failed",
+                                    "sessionIds", "items"} or
+                not isinstance(index, dict) or
+                set(index) != {"read", "present", "written", "warning"} or
+                not isinstance(warnings, list) or len(warnings) > MAX_RESULT_ITEMS):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore completed with an invalid result")
+        try:
+            _bounded_diagnostic(cache.get("reason"), "restore cache reason")
+            shader_counts = {
+                field: _bounded_integer(
+                    shaders.get(field), "Shader " + field, 0,
+                    MAX_PROGRESS_COUNT)
+                for field in ("attempted", "applied", "skipped", "failed")
+            }
+            material_counts = {
+                field: _bounded_integer(
+                    materials.get(field), "material " + field, 0,
+                    MAX_PROGRESS_COUNT)
+                for field in ("attempted", "restored", "skipped", "failed")
+            }
+            for warning in warnings:
+                _bounded_diagnostic(warning, "restore warning")
+        except ReplayLabRestoreClientError:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore completed with an invalid result")
+
+        shader_items, shader_statuses = _validate_shader_items(shaders)
+        material_items, material_statuses, restored_sessions = (
+            _validate_material_items(materials))
+        session_ids = materials.get("sessionIds")
+        if (not isinstance(session_ids, list) or
+                len(session_ids) != material_counts["restored"]):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore completed with an invalid result")
+        try:
+            clean_sessions = [
+                _hex_text(item, JOB_ID_PATTERN, "material session ID")
+                for item in session_ids
+            ]
+        except ReplayLabRestoreClientError:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore completed with an invalid result")
+        if (shader_counts["attempted"] !=
+                shader_counts["applied"] + shader_counts["failed"] or
+                len(shader_items) !=
+                shader_counts["attempted"] + shader_counts["skipped"] or
+                any(shader_statuses[field] != shader_counts[field]
+                    for field in ("applied", "skipped", "failed")) or
+                material_counts["attempted"] !=
+                material_counts["restored"] + material_counts["failed"] or
+                len(material_items) !=
+                material_counts["attempted"] + material_counts["skipped"] or
+                any(material_statuses[field] != material_counts[field]
+                    for field in ("restored", "skipped", "failed")) or
+                clean_sessions != restored_sessions):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore completed with an invalid result")
+
+        if (not all(isinstance(index.get(field), bool)
+                    for field in ("read", "present", "written")) or
+                (index.get("warning") is not None and
+                 not isinstance(index.get("warning"), str)) or
+                (index["present"] and not index["read"]) or
+                (index["written"] and
+                 (not index["read"] or shader_counts["applied"] <= 0 or
+                  index.get("warning") is not None)) or
+                (cache["hit"] and
+                 (cache["reason"] != "exact-project-content-binding" or
+                  shader_counts["attempted"] <= 0 or
+                  any(item.get("source") != "rdc-index"
+                      for item in shader_items)))):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab restore completed with an invalid result")
+        if index.get("warning") is not None:
+            try:
+                _bounded_diagnostic(
+                    index["warning"], "restore index warning")
+            except ReplayLabRestoreClientError:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab restore completed with an invalid result")
+        return value
 
     def restore(self, project_root, capture_path, capture_session_id,
                 progress_callback=None):
+        with _RESTORE_LIFECYCLE:
+            if _RESTORE_STOPPING:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab project restore was cancelled during shutdown")
+            self._restore_generation = _RESTORE_GENERATION
+            _ACTIVE_CLIENTS.add(self)
+        try:
+            return self._restore(
+                project_root, capture_path, capture_session_id,
+                progress_callback)
+        finally:
+            with _RESTORE_LIFECYCLE:
+                _ACTIVE_CLIENTS.discard(self)
+                _RESTORE_LIFECYCLE.notify_all()
+
+    def _restore(self, project_root, capture_path, capture_session_id,
+                 progress_callback=None):
+        if progress_callback is not None and not callable(progress_callback):
+            raise ReplayLabRestoreClientError(
+                "progress callback must be callable")
+        _publish_progress(progress_callback, "client-validate")
         project = _clean_path(project_root, "project root")
         capture = _clean_path(capture_path, "capture path", require_rdc=True)
         session = str(capture_session_id or "").strip().lower()
         if SESSION_PATTERN.fullmatch(session) is None:
             raise ReplayLabRestoreClientError(
                 "capture session ID is invalid")
-        if progress_callback is not None and not callable(progress_callback):
-            raise ReplayLabRestoreClientError(
-                "progress callback must be callable")
 
+        self._check_cancelled()
         startup_deadline = self.monotonic() + self.startup_timeout_seconds
-        port, token = self._credentials(startup_deadline)
+        _publish_progress(progress_callback, "host-state")
+        port, token, pid, version, host_instance_id = self._credentials(
+            startup_deadline)
+        _publish_progress(progress_callback, "host-health")
+        self._verify_health(port, pid, version, host_instance_id)
+        _publish_progress(progress_callback, "restore-submit")
         started = self._request(port, token, "POST", RESTORE_JOB_PATH, {
             "projectRoot": project,
             "capturePath": capture,
             "captureSessionId": session,
         })
-        job_id, unused_status, unused_progress, unused_latest = self._snapshot(
-            started)
-        del unused_status, unused_progress, unused_latest
-
+        job_id, status, events, latest_sequence = self._snapshot(
+            started, after_sequence=0)
         sequence = 0
+        for event in events:
+            sequence = event["sequence"]
+            _publish_progress(
+                progress_callback, event["phase"], event["current"],
+                event["total"], event["message"])
+        if not events:
+            if status == "queued":
+                _publish_progress(progress_callback, "restore-queued")
+            elif status == "running":
+                _publish_progress(progress_callback, "restore-running")
+        last_status = status
+        if status in ("completed", "failed") and sequence >= latest_sequence:
+            if status == "completed":
+                _publish_progress(progress_callback, "result-validate")
+                return self._result(
+                    started.get("result"), project, capture, session)
+            error = str(started.get("error", "") or "").strip()
+            raise ReplayLabRestoreClientError(
+                error[:4096] or "ReplayLab project restore failed")
+
         deadline = self.monotonic() + self.timeout_seconds
         while self.monotonic() < deadline:
+            self._check_cancelled()
+            # job_id is already a strictly validated lowercase hexadecimal
+            # token, so it is safe to place in this fixed local URL path.
             query = "%s/%s?after=%d" % (
-                RESTORE_JOB_PATH, quote(job_id, safe=""), sequence)
+                RESTORE_JOB_PATH, job_id, sequence)
             snapshot = self._request(port, token, "GET", query)
             current_job_id, status, events, latest_sequence = self._snapshot(
-                snapshot, job_id)
+                snapshot, job_id, sequence)
             del current_job_id
-            for raw_event in events:
-                event = _normalise_progress(raw_event, sequence)
+            for event in events:
                 sequence = event["sequence"]
-                if progress_callback is not None:
-                    try:
-                        progress_callback({
-                            "phase": event["phase"],
-                            "message": event["message"],
-                            "current": event["current"],
-                            "total": event["total"],
-                        })
-                    except Exception:
-                        # Progress is display-only and cannot cancel or weaken a
-                        # physical restore transaction.
-                        pass
+                _publish_progress(
+                    progress_callback, event["phase"], event["current"],
+                    event["total"], event["message"])
+            if not events and status != last_status:
+                if status == "queued":
+                    _publish_progress(progress_callback, "restore-queued")
+                elif status == "running":
+                    _publish_progress(progress_callback, "restore-running")
+            last_status = status
             # A terminal snapshot can still contain only the next page from a
             # bounded progress ring. Drain every available newer page before
             # handing the final result to the dialog.
             if status in ("completed", "failed") and sequence < latest_sequence:
                 continue
             if status == "completed":
-                result = snapshot.get("result")
-                if not isinstance(result, dict):
-                    raise ReplayLabRestoreClientError(
-                        "ReplayLab restore completed without a result")
-                return result
+                _publish_progress(progress_callback, "result-validate")
+                return self._result(
+                    snapshot.get("result"), project, capture, session)
             if status == "failed":
                 error = str(snapshot.get("error", "") or "").strip()
                 raise ReplayLabRestoreClientError(
                     error[:4096] or "ReplayLab project restore failed")
-            self.sleep(self.poll_seconds)
+            self._wait(self.poll_seconds)
         raise ReplayLabRestoreClientError(
             "ReplayLab project restore timed out")
 
 
+class ReplayLabInternalProjectClient(ReplayLabRestoreHostClient):
+    """Invoke one typed ProjectService operation over the shared Host."""
+
+    def __init__(self, internal_executable, runtime_directory=None,
+                 startup_timeout_seconds=30, request_timeout_seconds=30,
+                 transport=None, health_transport=None,
+                 monotonic=None, sleep=None):
+        # A cold one-file deployment starts an ``ensure`` controller and then
+        # the long-lived service, so two bounded extraction/verification phases
+        # can legitimately exceed 15 seconds on a freshly built Windows host.
+        ReplayLabRestoreHostClient.__init__(
+            self,
+            runtime_directory=runtime_directory,
+            timeout_seconds=max(1, request_timeout_seconds),
+            startup_timeout_seconds=startup_timeout_seconds,
+            poll_seconds=0.1,
+            request_timeout_seconds=min(4, request_timeout_seconds),
+            transport=transport,
+            health_transport=health_transport,
+            sleep=sleep,
+            monotonic=monotonic,
+            internal_executable=internal_executable,
+        )
+        # Project creation may validate/hash a bounded capture list. It runs on
+        # the launcher's cancellable worker rather than the restore submit/poll
+        # path, so retain the established finite 90-second operation budget.
+        self.request_timeout_seconds = min(
+            90.0, max(0.1, float(request_timeout_seconds)))
+
+    def invoke(self, operation, parameters, request_id=None):
+        with _RESTORE_LIFECYCLE:
+            if _RESTORE_STOPPING:
+                raise ReplayLabRestoreClientError(
+                    "ReplayLab internal project request was cancelled during shutdown")
+            self._restore_generation = _RESTORE_GENERATION
+            _ACTIVE_CLIENTS.add(self)
+        try:
+            return self._invoke(operation, parameters, request_id)
+        finally:
+            with _RESTORE_LIFECYCLE:
+                _ACTIVE_CLIENTS.discard(self)
+                _RESTORE_LIFECYCLE.notify_all()
+
+    def _invoke(self, operation, parameters, request_id=None):
+        name = str(operation or "").strip()
+        if not name or len(name.encode("utf-8")) > 64:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab internal project operation is invalid")
+        if not isinstance(parameters, dict):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab internal project parameters must be an object")
+        identity = str(request_id or uuid.uuid4().hex).strip().lower()
+        if JOB_ID_PATTERN.fullmatch(identity) is None:
+            raise ReplayLabRestoreClientError(
+                "ReplayLab internal project request ID is invalid")
+        deadline = self.monotonic() + self.startup_timeout_seconds
+        port, token, pid, version, host_instance_id = self._credentials(deadline)
+        self._verify_health(port, pid, version, host_instance_id)
+        value = self._request(
+            port,
+            token,
+            "POST",
+            PROJECT_OPERATION_PATH,
+            {
+                "schema": PROJECT_OPERATION_SCHEMA,
+                "requestId": identity,
+                "operation": name,
+                "parameters": parameters,
+            },
+            maximum_request_bytes=MAX_PROJECT_REQUEST_BYTES,
+        )
+        if (not isinstance(value, dict) or
+                value.get("schema") != PROJECT_OPERATION_RESULT_SCHEMA or
+                value.get("requestId") != identity or
+                set(value) != {"schema", "requestId", "result"} or
+                not isinstance(value.get("result"), dict)):
+            raise ReplayLabRestoreClientError(
+                "ReplayLab internal project response is invalid")
+        return value["result"]
+
+
 __all__ = [
+    "EXPECTED_HOST_VERSION",
+    "INTERNAL_HOST_STATE_PROTOCOL_VERSION",
+    "PROJECT_OPERATION_RESULT_SCHEMA",
+    "PROJECT_OPERATION_SCHEMA",
     "RESTORE_JOB_SCHEMA",
+    "ReplayLabInternalProjectClient",
     "ReplayLabRestoreClientError",
+    "ReplayLabRestoreHostIncompatible",
     "ReplayLabRestoreHostClient",
+    "ReplayLabRestoreRequestUncertain",
+    "begin_restore_shutdown",
+    "cancel_active_restores",
+    "resolve_internal_executable",
+    "resume_restore_generation",
     "runtime_root",
+    "wait_restore_quiescent",
 ]

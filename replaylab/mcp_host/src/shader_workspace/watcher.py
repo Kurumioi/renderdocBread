@@ -21,10 +21,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from .errors import WorkspaceWatchError
+from .errors import WorkspaceWatchConflictError, WorkspaceWatchError
 from .diagnostics import classify_shader_failure
 from .io import atomic_write_json, is_within
 from .leases import WorkspaceSourceLeaseError, WorkspaceSourceTransactionLease
+from .organization import (
+    MAX_SOURCE_BYTES as MAX_ORGANIZED_SOURCE_BYTES,
+    ShaderOrganizationError,
+    _source_compare_and_swap,
+)
 from .workspace import MAX_SOURCE_BYTES, ShaderWorkspaceService
 
 WATCH_SCHEMA = "renderdoc-ultra-shader-watch/v1"
@@ -213,8 +218,8 @@ def _fixed_source(root: Path, expected_source: Path) -> Path:
     return source_resolved
 
 
-def _source_hash(root: Path, expected_source: Path) -> str:
-    """Hash one stable UTF-8 source snapshot without accepting another path."""
+def _source_bytes(root: Path, expected_source: Path) -> bytes:
+    """Read one stable UTF-8 source snapshot without accepting another path."""
 
     source = _fixed_source(root, expected_source)
     before = source.stat(follow_symlinks=False)
@@ -255,7 +260,11 @@ def _source_hash(root: Path, expected_source: Path) -> str:
         ) from exc
     if "\x00" in text:
         raise WorkspaceWatchError("workspace shader source contains NUL characters")
-    return hashlib.sha256(raw).hexdigest()
+    return raw
+
+
+def _source_hash(root: Path, expected_source: Path) -> str:
+    return hashlib.sha256(_source_bytes(root, expected_source)).hexdigest()
 
 
 class _WatchJob:
@@ -285,6 +294,11 @@ class _WatchJob:
         self._lease = lease
         self._on_finished = on_finished
         self._lock = threading.RLock()
+        # Source observation/compile and Host-owned editor saves must never
+        # overlap. The transaction CAS writes in place under an exclusive
+        # handle; this separate lock keeps the compiler from observing bytes
+        # while that bounded write is in progress without blocking snapshots.
+        self._source_io_lock = threading.RLock()
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -381,6 +395,93 @@ class _WatchJob:
         with self._lock:
             return self._state in {"stopped", "failed"}
 
+    def save_source(self, expected_raw_sha256: str, text: str) -> dict:
+        """Publish one editor save while this process owns the live watch lease.
+
+        The job lock makes the running-state decision and the source CAS one
+        operation with respect to watcher stop/failure. The OS-handle CAS also
+        denies ordinary external writes/renames across its final comparison and
+        in-place write, so an expected-hash mismatch is never overwritten.
+        """
+
+        expected = str(expected_raw_sha256 or "").lower()
+        if _SHA256.fullmatch(expected) is None:
+            raise WorkspaceWatchError("editor expected source hash is invalid")
+        if not isinstance(text, str):
+            raise WorkspaceWatchError("editor source must be text")
+        if not text:
+            raise WorkspaceWatchError("editor source must not be empty")
+        if "\x00" in text:
+            raise WorkspaceWatchError("editor source contains NUL characters")
+        try:
+            replacement = text.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise WorkspaceWatchError("editor source is not valid UTF-8") from exc
+        if len(replacement) > min(MAX_SOURCE_BYTES, MAX_ORGANIZED_SOURCE_BYTES):
+            raise WorkspaceWatchError("editor source exceeds its fixed size limit")
+
+        replacement_hash = hashlib.sha256(replacement).hexdigest()
+        with self._source_io_lock:
+            with self._lock:
+                if (self._state != "running" or self._stop.is_set() or
+                        not self._lease.owned):
+                    raise WorkspaceWatchError("workspace watcher is not running")
+                before = _source_bytes(self.root, self.source_path)
+                before_hash = hashlib.sha256(before).hexdigest()
+                if before_hash != expected:
+                    raise WorkspaceWatchConflictError(
+                        "workspace shader source changed on disk; reload before saving"
+                    )
+                if before == replacement:
+                    info = self.source_path.stat(follow_symlinks=False)
+                    return {
+                        "watchId": self.watch_id,
+                        "workspacePath": str(self.root),
+                        "sourcePath": str(self.source_path),
+                        "rawSha256": replacement_hash,
+                        "size": len(replacement),
+                        "modifiedNs": info.st_mtime_ns,
+                        "changed": False,
+                        "compileScheduled": False,
+                    }
+                try:
+                    swapped = _source_compare_and_swap(
+                        self.source_path, before, replacement, "workspace HLSL"
+                    )
+                except ShaderOrganizationError as exc:
+                    raise WorkspaceWatchError(str(exc)) from exc
+                if not swapped:
+                    raise WorkspaceWatchConflictError(
+                        "workspace shader source changed on disk; reload before saving"
+                    )
+
+                previous = self._observed_hash
+                self._observed_hash = replacement_hash
+                self._stable_since = time.monotonic()
+                self._transient_retry_hash = None
+                self._transient_retry_count = 0
+                self._transient_retry_due = 0.0
+                self._pending = replacement_hash != self._last_attempted_hash
+                self._last_error = None
+                self._record_locked(
+                    "editorSourceSaved",
+                    previousSha256=previous,
+                    sourceSha256=replacement_hash,
+                    expectedSha256=expected,
+                    compileScheduled=self._pending,
+                )
+                info = self.source_path.stat(follow_symlinks=False)
+                return {
+                    "watchId": self.watch_id,
+                    "workspacePath": str(self.root),
+                    "sourcePath": str(self.source_path),
+                    "rawSha256": replacement_hash,
+                    "size": len(replacement),
+                    "modifiedNs": info.st_mtime_ns,
+                    "changed": True,
+                    "compileScheduled": self._pending,
+                }
+
     def _run(self) -> None:
         try:
             with self._lock:
@@ -425,6 +526,10 @@ class _WatchJob:
             self._on_finished(self)
 
     def _tick(self) -> None:
+        with self._source_io_lock:
+            self._tick_source_locked()
+
+    def _tick_source_locked(self) -> None:
         try:
             current_hash = _source_hash(self.root, self.source_path)
         except Exception as exc:
@@ -944,6 +1049,10 @@ class ShaderWorkspaceWatchManager:
 
     def poll(self, watch_id: str) -> dict:
         return self._job(watch_id).snapshot()
+
+    def save_source(self, watch_id: str, expected_raw_sha256: str,
+                    text: str) -> dict:
+        return self._job(watch_id).save_source(expected_raw_sha256, text)
 
     def stop(self, watch_id: str) -> dict:
         return self._job(watch_id).stop()

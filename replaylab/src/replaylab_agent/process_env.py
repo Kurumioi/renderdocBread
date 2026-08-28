@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import re
 import shutil
@@ -68,6 +69,7 @@ REPLAYLAB_CONTROL_ENV = frozenset(
 RESERVED_CREDENTIAL_ENV = SAFE_EXTERNAL_ENV | REPLAYLAB_CONTROL_ENV | frozenset(
     {
         "ALL_PROXY",
+        "CURSOR_CONFIG_DIR",
         "CURL_CA_BUNDLE",
         "DYLD_INSERT_LIBRARIES",
         "DYLD_LIBRARY_PATH",
@@ -93,18 +95,26 @@ RESERVED_CREDENTIAL_ENV = SAFE_EXTERNAL_ENV | REPLAYLAB_CONTROL_ENV | frozenset(
 _KNOWN_VENDOR_COMMANDS = {
     "codex": "codex",
     "copilot-acp": "copilot",
+    "cursor-acp": "cursor-agent",
     "gemini-acp": "gemini",
     "qwen-acp": "qwen",
     "kimi-acp": "kimi",
 }
+# These vendors publish official npm shims. Cursor instead uses its own install
+# root (``~/.local/bin`` on Unix-like systems and ``%LOCALAPPDATA%/cursor-agent``
+# on Windows), so accepting an unrelated ``%APPDATA%/npm/agent.cmd`` would widen
+# the trusted built-in command beyond Cursor's documented layout.
 _NPM_SHIMS = {
-    preset: f"{command}.cmd" for preset, command in _KNOWN_VENDOR_COMMANDS.items()
+    preset: f"{_KNOWN_VENDOR_COMMANDS[preset]}.cmd"
+    for preset in ("codex", "copilot-acp", "gemini-acp", "qwen-acp", "kimi-acp")
 }
 _CODEX_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _MAX_CODEX_BIN_ENTRIES = 64
 _MIN_CODEX_EXE_BYTES = 64 * 1024
 _MAX_CODEX_EXE_BYTES = 1024 * 1024 * 1024
 _MAX_NPM_SHIM_BYTES = 1024 * 1024
+_MIN_CURSOR_EXE_BYTES = 64 * 1024
+_MAX_CURSOR_EXE_BYTES = 1024 * 1024 * 1024
 _WINDOWS_REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _WINDOWS_TRANSIENT_DELETE_ERRORS = frozenset({5, 32, 33, 145})
 _TRANSIENT_DELETE_ERRNOS = frozenset(
@@ -156,6 +166,20 @@ def external_agent_environment(
         # while ReplayLab's Agent contract stays isolated.
         home = codex_profile_home(profile, environ=source)
         result["CODEX_HOME"] = str(home)
+    elif profile.preset == "cursor-acp":
+        # Cursor's global CLI directory can contain account state, permissions,
+        # MCP registrations and preferences.  Keep ReplayLab on a durable,
+        # profile-scoped directory and always override any inherited value.
+        home = cursor_profile_home(profile, environ=source)
+        result["CURSOR_CONFIG_DIR"] = str(home)
+        # Cursor ACP explicitly loads user-level ~/.cursor/mcp.json. Redirect
+        # both home conventions as well as cli-config.json so a ReplayLab turn
+        # cannot discover or start the user's editor MCP servers.
+        result["HOME"] = str(home)
+        result["USERPROFILE"] = str(home)
+        if home.drive:
+            result["HOMEDRIVE"] = home.drive
+            result["HOMEPATH"] = str(home)[len(home.drive) :] or "\\"
     return result
 
 
@@ -182,6 +206,171 @@ def _codex_profiles_root(source: Mapping[str, str]) -> Path:
     if not data_root.is_absolute():
         raise ConfigurationError("ReplayLab Codex home root must be absolute")
     return data_root / "ReplayLab" / "codex"
+
+
+def cursor_profile_home(
+    profile: Profile, *, environ: Mapping[str, str] | None = None
+) -> Path:
+    """Return ReplayLab's durable, profile-scoped Cursor CLI config root."""
+
+    source = os.environ if environ is None else environ
+    if profile.preset != "cursor-acp":
+        raise ConfigurationError("a managed Cursor home requires the Cursor ACP preset")
+    profile.validate()
+    root = _cursor_profiles_root(source)
+    return root / profile.id
+
+
+def _cursor_profiles_root(source: Mapping[str, str]) -> Path:
+    local = source.get("LOCALAPPDATA") or source.get("XDG_DATA_HOME")
+    if local:
+        data_root = Path(local).expanduser()
+    else:
+        data_root = Path.home() / ".local" / "share"
+    if not data_root.is_absolute():
+        raise ConfigurationError("ReplayLab Cursor home root must be absolute")
+    return data_root / "ReplayLab" / "cursor"
+
+
+_CURSOR_DENIED_PERMISSIONS = (
+    "Shell(*)",
+    "Read(**)",
+    "Write(**)",
+    "WebFetch(*)",
+)
+
+
+def _cursor_permissions() -> dict[str, list[str]]:
+    # Cursor's allow-list is the outer transport boundary, not ReplayLab's
+    # workflow policy.  The per-turn MCP proxy exposes only the selected Skill's
+    # tools and independently enforces frozen scope, requested effects,
+    # postconditions and rollback.  Allow the complete first-party namespace so
+    # a newly added or effectful specialist tool is not silently blocked by a
+    # second static list.  Ambient shell/file/web access remains denied below.
+    return {
+        "allow": ["Mcp(ReplayLab:*)"],
+        "deny": list(_CURSOR_DENIED_PERMISSIONS),
+    }
+
+
+def _write_cursor_json(path: Path, payload: Mapping[str, object]) -> None:
+    if _is_reparse_or_symlink(path):
+        raise ConfigurationError(
+            "refusing to replace managed Cursor configuration through a link/reparse point"
+        )
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+    temporary = path.parent / f".{path.name}-{uuid.uuid4().hex}.tmp"
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if os.name != "nt":
+            os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise ConfigurationError(
+            f"cannot prepare managed Cursor CLI configuration ({_delete_error_detail(exc)})"
+        ) from exc
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def ensure_cursor_profile_config(
+    profile: Profile, *, environ: Mapping[str, str] | None = None
+) -> Path:
+    """Atomically enforce ReplayLab's isolated Cursor CLI permission policy."""
+
+    source = os.environ if environ is None else environ
+    root = _cursor_profiles_root(source)
+    target = root / profile.id
+    data_value = source.get("LOCALAPPDATA") or source.get("XDG_DATA_HOME")
+    data_root = (
+        Path(data_value).expanduser()
+        if data_value
+        else Path.home() / ".local" / "share"
+    )
+    for component in (data_root / "ReplayLab", root, target):
+        if _is_reparse_or_symlink(component):
+            raise ConfigurationError(
+                f"refusing to prepare managed Cursor state through a link/reparse point: {component}"
+            )
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ConfigurationError(
+            f"cannot create managed Cursor state ({_delete_error_detail(exc)})"
+        ) from exc
+    if (
+        not target.is_dir()
+        or _is_reparse_or_symlink(target)
+        or target.resolve().parent != root.resolve()
+    ):
+        raise ConfigurationError("managed Cursor state target escaped its profile root")
+    if os.name != "nt":
+        os.chmod(target, stat.S_IRWXU)
+
+    config_path = target / "cli-config.json"
+    cursor_home = target / ".cursor"
+    if _is_reparse_or_symlink(cursor_home):
+        raise ConfigurationError(
+            "refusing to prepare managed Cursor MCP state through a link/reparse point"
+        )
+    try:
+        cursor_home.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise ConfigurationError(
+            f"cannot create managed Cursor MCP state ({_delete_error_detail(exc)})"
+        ) from exc
+    if not cursor_home.is_dir() or _is_reparse_or_symlink(cursor_home):
+        raise ConfigurationError("managed Cursor MCP state is not an unlinked directory")
+    if os.name != "nt":
+        os.chmod(cursor_home, stat.S_IRWXU)
+    payload = {
+        "version": 1,
+        "editor": {"vimMode": False},
+        "approvalMode": "allowlist",
+        "permissions": _cursor_permissions(),
+    }
+    _write_cursor_json(config_path, payload)
+    _write_cursor_json(cursor_home / "mcp.json", {"mcpServers": {}})
+    return config_path
+
+
+def ensure_cursor_workspace(workspace: Path | str) -> Path:
+    """Pin one Cursor cwd to ReplayLab-owned project policy and no file MCPs."""
+
+    root = Path(workspace)
+    if not root.is_absolute() or not root.is_dir() or _is_reparse_or_symlink(root):
+        raise ConfigurationError("Cursor workspace must be an existing unlinked directory")
+    cursor_dir = root / ".cursor"
+    if _is_reparse_or_symlink(cursor_dir):
+        raise ConfigurationError(
+            "refusing to prepare Cursor workspace through a link/reparse point"
+        )
+    try:
+        cursor_dir.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise ConfigurationError(
+            f"cannot create Cursor workspace policy ({_delete_error_detail(exc)})"
+        ) from exc
+    if not cursor_dir.is_dir() or _is_reparse_or_symlink(cursor_dir):
+        raise ConfigurationError("Cursor workspace policy is not an unlinked directory")
+    if cursor_dir.resolve().parent != root.resolve():
+        raise ConfigurationError("Cursor workspace configuration escaped its root")
+    if os.name != "nt":
+        os.chmod(cursor_dir, stat.S_IRWXU)
+    _write_cursor_json(
+        cursor_dir / "cli.json",
+        {"permissions": _cursor_permissions()},
+    )
+    _write_cursor_json(cursor_dir / "mcp.json", {"mcpServers": {}})
+    return root
 
 
 def _is_reparse_or_symlink(path: Path) -> bool:
@@ -225,7 +414,7 @@ def _retry_transient_delete(operation) -> None:
             time.sleep(_DELETE_RETRY_DELAYS[attempt])
 
 
-def _rmtree_with_windows_retries(target: Path) -> None:
+def _rmtree_with_windows_retries(target: Path, state_label: str = "Codex") -> None:
     """Delete ``target`` without following links and tolerate short locks.
 
     Python 3.8+ treats Windows junctions as leaves in ``shutil.rmtree`` and on
@@ -245,7 +434,7 @@ def _rmtree_with_windows_retries(target: Path) -> None:
             failed.relative_to(lexical_root)
         except ValueError as exc:
             raise ConfigurationError(
-                "managed Codex state deletion escaped its tombstone"
+                f"managed {state_label} state deletion escaped its tombstone"
             ) from exc
         if _is_reparse_or_symlink(failed):
             # Never chmod through a link. A transient unlink/rmdir failure is
@@ -264,7 +453,7 @@ def _rmtree_with_windows_retries(target: Path) -> None:
             return
         if _is_reparse_or_symlink(target):
             raise ConfigurationError(
-                "refusing to remove managed Codex state through a link/reparse point"
+                f"refusing to remove managed {state_label} state through a link/reparse point"
             )
         shutil.rmtree(target, onerror=make_writable_and_retry)
 
@@ -283,13 +472,48 @@ def remove_codex_profile_home(
     """
 
     source = os.environ if environ is None else environ
+    _remove_managed_profile_home(
+        profile,
+        source=source,
+        expected_preset="codex",
+        root=_codex_profiles_root(source),
+        state_label="Codex",
+    )
+
+
+def remove_cursor_profile_home(
+    profile: Profile, *, environ: Mapping[str, str] | None = None
+) -> None:
+    """Remove only ReplayLab's exact profile-scoped Cursor CLI state directory."""
+
+    source = os.environ if environ is None else environ
+    _remove_managed_profile_home(
+        profile,
+        source=source,
+        expected_preset="cursor-acp",
+        root=_cursor_profiles_root(source),
+        state_label="Cursor",
+    )
+
+
+def _remove_managed_profile_home(
+    profile: Profile,
+    *,
+    source: Mapping[str, str],
+    expected_preset: str,
+    root: Path,
+    state_label: str,
+) -> None:
     profile.validate()
-    if profile.preset != "codex":
-        raise ConfigurationError("managed Codex state can be removed only for a Codex profile")
-    root = _codex_profiles_root(source)
+    if profile.preset != expected_preset:
+        raise ConfigurationError(
+            f"managed {state_label} state can be removed only for a {state_label} profile"
+        )
     target = root / profile.id
     if target.parent != root or target.name != profile.id:
-        raise ConfigurationError("managed Codex state target escaped its profile root")
+        raise ConfigurationError(
+            f"managed {state_label} state target escaped its profile root"
+        )
 
     data_value = source.get("LOCALAPPDATA") or source.get("XDG_DATA_HOME")
     data_root = Path(data_value).expanduser() if data_value else Path.home() / ".local" / "share"
@@ -298,33 +522,37 @@ def remove_codex_profile_home(
     try:
         resolved_root.relative_to(resolved_data)
     except ValueError as exc:
-        raise ConfigurationError("managed Codex state root escaped the local data directory") from exc
+        raise ConfigurationError(
+            f"managed {state_label} state root escaped the local data directory"
+        ) from exc
 
     # Refuse any managed component that redirects traversal, even when it
     # happens to resolve back below the local data root today.
     for component in (data_root / "ReplayLab", root, target):
         if _is_reparse_or_symlink(component):
             raise ConfigurationError(
-                f"refusing to remove managed Codex state through a link/reparse point: {component}"
+                f"refusing to remove managed {state_label} state through a link/reparse point: {component}"
             )
     if not target.exists():
         return
     if not target.is_dir():
-        raise ConfigurationError("managed Codex state target is not a directory")
+        raise ConfigurationError(f"managed {state_label} state target is not a directory")
     resolved_target = target.resolve()
     if resolved_target.parent != resolved_root or resolved_target.name != profile.id:
-        raise ConfigurationError("managed Codex state target escaped its profile root")
+        raise ConfigurationError(
+            f"managed {state_label} state target escaped its profile root"
+        )
     # Detach the state directory first. This prevents a still-running vendor
-    # helper from creating new files at the active CODEX_HOME while cleanup is
-    # walking it, and makes each deletion attempt operate on a stable tree.
-    # The tombstone is a random sibling below the already-validated root; it can
-    # therefore never name the user's global ~/.codex directory.
+    # helper from creating new files in the active profile directory while
+    # cleanup is walking it, and makes each attempt operate on a stable tree.
+    # The tombstone is a random sibling below the already-validated root, so it
+    # cannot name the vendor's global state directory.
     tombstone = root / f".delete-{profile.id}-{uuid.uuid4().hex}"
     if tombstone.parent != root or tombstone.exists():
-        raise ConfigurationError("managed Codex state tombstone is invalid")
+        raise ConfigurationError(f"managed {state_label} state tombstone is invalid")
     try:
         _retry_transient_delete(lambda: target.rename(tombstone))
-        _rmtree_with_windows_retries(tombstone)
+        _rmtree_with_windows_retries(tombstone, state_label)
     except (ConfigurationError, OSError) as exc:
         # Keep the profile and its state path consistent when a genuinely
         # long-lived process still owns a handle. rmtree may have removed cache
@@ -343,14 +571,14 @@ def remove_codex_profile_home(
                 else _delete_error_detail(exc)
             )
             raise ConfigurationError(
-                "cannot remove managed Codex state and could not restore its "
+                f"cannot remove managed {state_label} state and could not restore its "
                 f"profile directory: {original_detail}; restore failed: "
                 f"{_delete_error_detail(restore_error)}"
             ) from exc
         if isinstance(exc, ConfigurationError):
             raise
         raise ConfigurationError(
-            "cannot remove managed Codex state after bounded retries; stop the current "
+            f"cannot remove managed {state_label} state after bounded retries; stop the current "
             f"AI task and retry ({_delete_error_detail(exc)})"
         ) from exc
 
@@ -582,6 +810,45 @@ def _npm_vendor_shim(preset_id: str, source: Mapping[str, str]) -> str:
         return ""
 
 
+def _installed_cursor_executable(source: Mapping[str, str]) -> str:
+    """Resolve Cursor's fixed official Windows installation root without searching."""
+
+    local = _safe_base(str(source.get("LOCALAPPDATA", "")))
+    if local is None:
+        return ""
+    root = _safe_literal_directory(local, "cursor-agent")
+    if root is None:
+        return ""
+    for filename, minimum_size, maximum_size, require_pe in (
+        ("cursor-agent.exe", _MIN_CURSOR_EXE_BYTES, _MAX_CURSOR_EXE_BYTES, True),
+        ("cursor-agent.cmd", 1, _MAX_NPM_SHIM_BYTES, False),
+    ):
+        candidate = root / filename
+        if (
+            _safe_regular_file(
+                candidate,
+                minimum_size=minimum_size,
+                maximum_size=maximum_size,
+            )
+            is None
+        ):
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            if not _is_contained_path(root, resolved):
+                continue
+            with resolved.open("rb") as stream:
+                prefix = stream.read(4096)
+            if require_pe and not prefix.startswith(b"MZ"):
+                continue
+            if not require_pe and b"\0" in prefix:
+                continue
+            return str(resolved)
+        except (OSError, ValueError):
+            continue
+    return ""
+
+
 def resolve_known_vendor_executable(
     preset_id: str,
     command: str,
@@ -599,6 +866,10 @@ def resolve_known_vendor_executable(
         return ""
     if preset_id == "codex":
         resolved = _bundled_codex_executable(source)
+        if resolved:
+            return resolved
+    if preset_id == "cursor-acp":
+        resolved = _installed_cursor_executable(source)
         if resolved:
             return resolved
     return _npm_vendor_shim(preset_id, source)
@@ -648,8 +919,12 @@ __all__ = [
     "RESERVED_CREDENTIAL_ENV",
     "agent_command_argv",
     "codex_profile_home",
+    "cursor_profile_home",
+    "ensure_cursor_profile_config",
+    "ensure_cursor_workspace",
     "external_agent_environment",
     "remove_codex_profile_home",
+    "remove_cursor_profile_home",
     "host_process_environment",
     "is_packaged_windows_executable",
     "resolve_agent_executable",

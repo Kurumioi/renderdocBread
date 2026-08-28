@@ -38,11 +38,15 @@
 #include "AIConversationView.h"
 
 class QComboBox;
+class QButtonGroup;
+class QCommandLinkButton;
 class QLabel;
+class QLineEdit;
 class QPlainTextEdit;
 class QProcess;
 class QPushButton;
 class QTimer;
+class QVBoxLayout;
 class AIConversationListView;
 class AIPendingChatView;
 class CaptureContext;
@@ -60,8 +64,10 @@ public:
 
   QWidget *Widget() { return this; }
 
-  void NotifyIntentQueued(const QString &taskId);
   void ReportError(const QString &message);
+  void StartCaptureSkill(const QString &prompt, const QString &skill,
+                         const QString &focusStage = QString(),
+                         const QString &intentKind = QString());
   // CaptureContext calls this after Save Capture As so the in-memory thread history follows the
   // permanent RDC path without modifying the RDC itself.
   void RebindCaptureFile(const QString &capturePath);
@@ -80,6 +86,52 @@ public:
   void OnEventChanged(uint32_t eventId) override;
 
 private:
+  struct ClarificationOption
+  {
+    QString id;
+    QString label;
+    QString description;
+  };
+
+  struct ClarificationPrompt
+  {
+    QString id;
+    QString question;
+    QString selectionMode;
+    QVector<ClarificationOption> options;
+    bool allowOther = false;
+    QString submitLabel;
+    // The context which produced this question remains a candidate when the user answers later.
+    // The native UI also freezes the then-current state, so AgentHost can resolve the user's
+    // intent instead of silently rebinding the follow-up to whichever EID happens to be selected.
+    QByteArray originContextSnapshot;
+    QString originContextInstanceId;
+
+    bool isValid() const
+    {
+      return !id.isEmpty() && !question.isEmpty() &&
+             (selectionMode == QLatin1String("single") ||
+              selectionMode == QLatin1String("multiple")) &&
+             options.size() >= 2 && options.size() <= 6;
+    }
+  };
+
+  struct ClarificationResponse
+  {
+    QString clarificationId;
+    QStringList optionIds;
+    QString otherText;
+    QByteArray originContextSnapshot;
+    QString originContextInstanceId;
+    QByteArray currentContextSnapshot;
+    QString currentContextInstanceId;
+
+    bool isValid() const
+    {
+      return !clarificationId.isEmpty() && (!optionIds.isEmpty() || !otherText.isEmpty());
+    }
+  };
+
   struct ConversationThread
   {
     QString id;
@@ -89,6 +141,7 @@ private:
     bool pinned = false;
     bool unread = false;
     QVector<AIChatMessage> messages;
+    ClarificationPrompt clarification;
   };
 
   struct PendingChat
@@ -99,7 +152,12 @@ private:
     QString prompt;
     QString effectivePrompt;
     QString skill;
+    QString focusStage;
+    QString intentKind;
     QStringList historyExcludeMessageIds;
+    QByteArray contextSnapshot;
+    QString contextInstanceId;
+    ClarificationResponse clarificationResponse;
     bool includeConversation = true;
   };
 
@@ -126,6 +184,14 @@ private:
                        const QString &activityId = QString());
   void setTaskState(const QString &taskId, const QString &state, bool collapseActivity);
   void updateComposerState();
+  bool clarificationFromJSON(const QJsonObject &object, const QString &fallbackId,
+                             ClarificationPrompt &clarification) const;
+  QJsonObject clarificationToJSON(const ClarificationPrompt &clarification) const;
+  void bindClarificationOrigin(ClarificationPrompt &clarification, const QString &taskId) const;
+  void updateClarificationUI();
+  void updateClarificationSubmitState();
+  void submitClarification();
+  void clearClarification(const QString &conversationId);
   void handleTranscriptLink(const QUrl &url);
 
   void loadConversations();
@@ -136,8 +202,6 @@ private:
   bool conversationFromJSON(const QJsonObject &object, ConversationThread &thread) const;
 
   void updateCaptureStatus();
-  bool queueNativeIntent(ReplayLabIntegration::Intent intent, const QString &prompt,
-                         const QString &focusStage = QString());
   void showShaderIntentMenu(QWidget *anchor);
   void clearCaptureTasks();
 
@@ -160,12 +224,7 @@ private:
   void manageConnections();
   void runDoctor();
 
-  void ensureWorker();
-  void restartWorker();
-  void stopWorker(bool restartAfterStop = false);
-  bool stopWorkerForProfileMutation(QString *error);
-  void workerStopTimedOut();
-  void workerFinished(QProcess *process);
+  void refreshConnectionStatus();
   void forceStopProcessesForDestruction();
   bool attachKillOnCloseJob(QProcess *process, void *&jobHandle, QString *error) const;
   void closeKillOnCloseJob(void *&jobHandle) const;
@@ -173,9 +232,15 @@ private:
   QString newTaskId() const;
   QString newMessageId() const;
   QString conversationPrompt(const QString &prompt, const QString &conversationId,
-                             const QStringList &excludeMessageIds = QStringList()) const;
+                             const QStringList &excludeMessageIds = QStringList(),
+                             const ClarificationResponse &clarificationResponse =
+                                 ClarificationResponse()) const;
   void startChat(const QString &prompt, const QString &skill = QString(),
-                 bool includeConversation = true);
+                 bool includeConversation = true, const QString &focusStage = QString(),
+                 const ClarificationResponse &clarificationResponse = ClarificationResponse(),
+                 const QString &intentKind = QString());
+  bool freezeChatContext(PendingChat &request, QString *error);
+  void clearChatContextFile();
   void launchChat(PendingChat request);
   void startNextChat();
   void adjustQueuedChat(const QString &taskId);
@@ -189,6 +254,8 @@ private:
   void watchTask(const QString &taskId, const QString &userPrompt = QString(),
                  const QString &conversationId = QString(),
                  const QString &messageId = QString());
+  void unwatchTask(const QString &taskId);
+  void updateEventTimer();
   void pollTaskEvents();
   qint64 pollTaskEvent(const QString &taskId, qint64 maxReadBytes, bool *atEnd = NULL);
   void consumeTaskEvent(const QString &taskId, const QByteArray &line);
@@ -205,18 +272,23 @@ private:
   QComboBox *m_ProfileCombo = NULL;
   QComboBox *m_ModelCombo = NULL;
   AIConversationView *m_Transcript = NULL;
+  QFrame *m_ClarificationPanel = NULL;
+  QLabel *m_ClarificationQuestion = NULL;
+  QWidget *m_ClarificationOptions = NULL;
+  QVBoxLayout *m_ClarificationOptionsLayout = NULL;
+  QButtonGroup *m_ClarificationButtonGroup = NULL;
+  QLineEdit *m_ClarificationOtherEdit = NULL;
+  QPushButton *m_ClarificationSubmit = NULL;
+  QVector<QCommandLinkButton *> m_ClarificationButtons;
+  QString m_VisibleClarificationKey;
   QPlainTextEdit *m_Prompt = NULL;
   QPushButton *m_Send = NULL;
   QPushButton *m_Cancel = NULL;
 
-  QTimer *m_SupervisorTimer = NULL;
   QTimer *m_EventTimer = NULL;
-  QTimer *m_WorkerStopTimer = NULL;
   QTimer *m_ConversationSaveTimer = NULL;
   QTimer *m_ConversationRenderTimer = NULL;
-  QProcess *m_Worker = NULL;
   QProcess *m_ChatProcess = NULL;
-  void *m_WorkerJob = NULL;
   void *m_ChatJob = NULL;
 
   QString m_CLIPath;
@@ -228,19 +300,13 @@ private:
   QString m_ActiveChatConversationId;
   QString m_ActiveChatMessageId;
   QString m_ChatTaskId;
+  QString m_ChatContextFile;
   QString m_CaptureConversationPath;
-  QString m_PendingIntentPrompt;
-  QString m_LastWorkerError;
   QByteArray m_ChatStdout;
   QByteArray m_ChatStderr;
   bool m_ProfileComboLoading = false;
   bool m_ConnectionDialogOpen = false;
-  bool m_RestartWorkerPending = false;
-  bool m_WorkerStopping = false;
   bool m_ShuttingDown = false;
-  int m_WorkerStopPhase = 0;
-  int m_WorkerFailures = 0;
-  qint64 m_NextWorkerStartMs = 0;
 
   // Indexed by stable connection id, not environment-variable name. This holds only explicit
   // session credentials; durable credentials remain in the OS vault and never enter this map.

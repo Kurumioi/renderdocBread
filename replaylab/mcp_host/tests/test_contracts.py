@@ -17,7 +17,59 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 
 
 class McpContractTests(unittest.TestCase):
-    def test_bridge_import_survives_optional_restore_transport_unavailable(self) -> None:
+    def test_capture_load_does_not_start_project_client_or_subprocess(self) -> None:
+        bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
+        source = bridge_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(bridge_path))
+        lifecycle = next(
+            candidate
+            for statement in tree.body
+            if isinstance(statement, ast.If)
+            for candidate in statement.body
+            if isinstance(candidate, ast.ClassDef)
+            and candidate.name == "CaptureLifecycleViewer"
+        )
+        on_capture_loaded = next(
+            node
+            for node in lifecycle.body
+            if isinstance(node, ast.FunctionDef) and node.name == "OnCaptureLoaded"
+        )
+
+        calls = {"schedule": 0, "projectClient": 0, "popen": 0}
+
+        def _record(name):
+            def _callback(*args, **kwargs):
+                del args, kwargs
+                calls[name] += 1
+            return _callback
+
+        namespace = {
+            "_active_capture_token": None,
+            "_material_panel_ui": None,
+            "_material_panel_controller": None,
+            "_pass_panel_ui": None,
+            "_reset_symbol_state": lambda restore_names: None,
+            "_current_capture_token": lambda: "capture-token",
+            "_publish_instance_manifest": lambda **kwargs: None,
+            "_publish_console_event": lambda *args, **kwargs: None,
+            "_schedule_project_auto_activation": _record("schedule"),
+            "_project_launcher_protocol": types.SimpleNamespace(
+                ReplayLabProjectClient=_record("projectClient")
+            ),
+            "subprocess": types.SimpleNamespace(Popen=_record("popen")),
+        }
+        executable = ast.Module(body=[on_capture_loaded], type_ignores=[])
+        ast.fix_missing_locations(executable)
+        exec(compile(executable, str(bridge_path), "exec"), namespace)
+
+        namespace["OnCaptureLoaded"](object())
+
+        self.assertEqual("capture-token", namespace["_active_capture_token"])
+        self.assertEqual(
+            {"schedule": 0, "projectClient": 0, "popen": 0}, calls
+        )
+
+    def test_bridge_restore_client_imports_without_embedded_network_modules(self) -> None:
         bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
         fake_renderdoc = types.ModuleType("renderdoc")
         previous_renderdoc = sys.modules.get("renderdoc")
@@ -25,13 +77,16 @@ class McpContractTests(unittest.TestCase):
         original_import = builtins.__import__
         module_name = "renderdoc_mcp_bridge_optional_restore_contract"
 
-        def _without_urllib(name, globals=None, locals=None, fromlist=(), level=0):
-            if name in ("urllib.error", "urllib.parse", "urllib.request"):
+        def _without_network_modules(
+            name, globals=None, locals=None, fromlist=(), level=0
+        ):
+            root = str(name or "").split(".", 1)[0]
+            if root in ("urllib", "http", "socket", "_socket"):
                 raise ImportError("optional embedded network transport unavailable")
             return original_import(name, globals, locals, fromlist, level)
 
         sys.modules["renderdoc"] = fake_renderdoc
-        builtins.__import__ = _without_urllib
+        builtins.__import__ = _without_network_modules
         try:
             spec = importlib.util.spec_from_file_location(
                 module_name,
@@ -53,15 +108,16 @@ class McpContractTests(unittest.TestCase):
             if previous_qrenderdoc is not None:
                 sys.modules["qrenderdoc"] = previous_qrenderdoc
 
-        self.assertIsNone(bridge._project_restore_client_protocol)
-        self.assertIn(
-            "optional embedded network transport unavailable",
-            bridge._project_restore_client_import_error,
-        )
+        self.assertIsNotNone(bridge._project_restore_client_protocol)
+        self.assertEqual("", bridge._project_restore_client_import_error)
+        self.assertTrue(hasattr(
+            bridge._project_restore_client_protocol,
+            "ReplayLabRestoreHostClient",
+        ))
         self.assertIsNotNone(bridge._shader_console_protocol)
         self.assertIsNotNone(bridge._dxil_access_protocol)
 
-    def test_bridge_stop_isolates_cleanup_failures_and_clears_native_globals(self) -> None:
+    def test_bridge_stop_hard_gates_on_project_executor_failure(self) -> None:
         bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
         fake_renderdoc = types.ModuleType("renderdoc")
         previous_renderdoc = sys.modules.get("renderdoc")
@@ -119,16 +175,101 @@ class McpContractTests(unittest.TestCase):
         bridge._release_event_cbuffer_snapshots = _record("cbuffer")
         bridge._reset_symbol_state = _record("symbols")
 
-        with self.assertRaisesRegex(RuntimeError, "shutdown incomplete"):
+        with self.assertRaisesRegex(RuntimeError, "executor failure"):
             bridge.stop()
 
-        self.assertIn("pass", calls)
-        self.assertIn("material", calls)
-        self.assertIn("viewer", calls)
-        self.assertIsNone(bridge._poller)
-        self.assertIsNone(bridge._capture_viewer)
-        self.assertIsNone(bridge._active_capture_token)
-        self.assertIsNone(bridge._ctx)
+        self.assertEqual(["project"], calls)
+        self.assertIsNotNone(bridge._poller)
+        self.assertIsNotNone(bridge._capture_viewer)
+        self.assertEqual("capture", bridge._active_capture_token)
+        self.assertIsNotNone(bridge._ctx)
+
+    def test_project_executor_requires_explicit_shutdown_confirmation(self) -> None:
+        bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
+        fake_renderdoc = types.ModuleType("renderdoc")
+        previous_renderdoc = sys.modules.get("renderdoc")
+        previous_qrenderdoc = sys.modules.pop("qrenderdoc", None)
+        module_name = "renderdoc_mcp_bridge_executor_shutdown_contract"
+        sys.modules["renderdoc"] = fake_renderdoc
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, bridge_path)
+            bridge = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = bridge
+            spec.loader.exec_module(bridge)
+        finally:
+            if previous_renderdoc is None:
+                sys.modules.pop("renderdoc", None)
+            else:
+                sys.modules["renderdoc"] = previous_renderdoc
+            if previous_qrenderdoc is not None:
+                sys.modules["qrenderdoc"] = previous_qrenderdoc
+
+        calls = []
+
+        class _Executor(object):
+            def __init__(self):
+                self.results = [False, True]
+
+            def shutdown(self):
+                calls.append("shutdown")
+                return self.results.pop(0)
+
+        bridge._project_restore_client_protocol = types.SimpleNamespace(
+            begin_restore_shutdown=lambda: calls.append("begin") or 9,
+            wait_restore_quiescent=lambda generation, timeout: (
+                calls.append(("wait", generation, timeout)) or True
+            ),
+        )
+        bridge._project_async_executor = _Executor()
+        bridge._project_launcher_ui = None
+        bridge._project_launcher_callbacks = []
+        bridge._project_thumbnail_cache = None
+        bridge._project_thumbnail_reader = None
+        bridge._project_startup_timer = None
+        bridge._cancel_project_auto_activation = lambda: None
+        executor = bridge._project_async_executor
+
+        with self.assertRaisesRegex(RuntimeError, "did not confirm shutdown"):
+            bridge._unregister_project_launcher_ui()
+        self.assertIs(bridge._project_async_executor, executor)
+
+        bridge._unregister_project_launcher_ui()
+        self.assertIsNone(bridge._project_async_executor)
+        self.assertEqual(
+            ["begin", "shutdown", "begin", "shutdown", ("wait", 9, 0.0)],
+            calls,
+        )
+
+    def test_native_shutdown_gates_context_and_extension_destruction(self) -> None:
+        capture_source = (
+            REPOSITORY.parent / "qrenderdoc" / "Code" / "CaptureContext.cpp"
+        ).read_text(encoding="utf-8")
+        destructor_start = capture_source.index("CaptureContext::~CaptureContext()")
+        destructor_end = capture_source.index(
+            "void CaptureContext::Begin", destructor_start
+        )
+        destructor = capture_source[destructor_start:destructor_end]
+        self.assertGreaterEqual(
+            destructor.count("PythonContext::ShutdownInternalIntegrations()"), 2
+        )
+        fatal = destructor.index("qFatal(")
+        extension_shutdown = destructor.index("PythonContext::ShutdownExtensions()")
+        replay_shutdown = destructor.index("m_Replay.CloseThread()")
+        self.assertLess(fatal, extension_shutdown)
+        self.assertLess(fatal, replay_shutdown)
+
+        python_source = (
+            REPOSITORY.parent
+            / "qrenderdoc"
+            / "Code"
+            / "pyrenderdoc"
+            / "PythonContext.cpp"
+        ).read_text(encoding="utf-8")
+        global_start = python_source.index("void PythonContext::GlobalShutdown()")
+        global_shutdown = python_source[global_start:]
+        failure_gate = global_shutdown.index("if(!internalIntegrationsStopped")
+        extension_shutdown = global_shutdown.index("ShutdownExtensions();")
+        self.assertLess(failure_gate, extension_shutdown)
 
     def test_bridge_atomic_json_is_ascii_wire_and_round_trips_chinese_path(self) -> None:
         bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"

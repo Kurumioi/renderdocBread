@@ -160,6 +160,18 @@ class _CatalogIPC:
         self.calls.append((method, params, timeout))
         if method == "get_current_renderdoc_context":
             return copy.deepcopy(self.context)
+        if method == "get_shader_info":
+            if int(params.get("event_id", 0)) != int(self.use["eventId"]):
+                return {"error": "No Shader is bound at the requested event"}
+            stage = str(params.get("stage", "") or "").strip().lower()
+            if stage not in {"fragment", "pixel", "ps"}:
+                return {"error": "No Shader is bound at the requested stage"}
+            return {
+                "shaderId": self.shader["resourceId"],
+                "stage": "fragment",
+                "entryPoint": self.shader["entryPoint"],
+                "rawSha256": self.shader["rawSha256"],
+            }
         if method == "export_shader_catalog":
             self.assert_full_export(params)
             output = Path(params["output_dir"])
@@ -660,6 +672,26 @@ class ActiveProjectMcpTests(unittest.TestCase):
             path_b["workspaceBindingSha256"],
         )
 
+    def test_managed_workspace_path_keeps_frozen_event_after_ui_navigation(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        self._json(self.server.prepare_active_capture_project())
+        self.ipc.context["events"] = {
+            "currentEventId": 999,
+            "selectedEventId": 999,
+        }
+        self.ipc.context["shaders"]["bound"] = []
+
+        resolved = self._json(
+            self.server.get_active_shader_workspace_path(142, "fragment")
+        )
+
+        self.assertEqual(142, resolved["eventId"])
+        self.assertEqual(902, resolved["shaderResourceId"])
+        self.assertEqual(self.ipc.shader["rawSha256"], resolved["rawSha256"])
+        self.assertFalse(
+            any(method == "get_shader_info" for method, _params, _timeout in self.ipc.calls)
+        )
+
     def test_tampered_full_catalog_binding_fails_without_subset_fallback(self):
         self._json(self.server.ensure_active_replay_project("Example Game"))
         prepared = self._json(self.server.prepare_active_capture_project())
@@ -855,7 +887,7 @@ class ActiveProjectMcpTests(unittest.TestCase):
 
         error = json.loads(self.server.get_active_shader_workspace_path(999, "fragment"))
         self.assertEqual(error["schema"], "replaylab-active-project-mcp-error/v1")
-        self.assertIn("current event", error["error"])
+        self.assertIn("frozen event Shader identity", error["error"])
         self.assertFalse(error["applied"])
 
     def test_explicit_asset_recovery_inspection_is_read_only(self):
@@ -1143,6 +1175,33 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
             seeded["destinationStatus"]["source"]["modifiedSinceDecompile"]
         )
         self.assertEqual(self.active.seeded[0], "e" * 32)
+
+    def test_promoted_organization_is_best_effort_registered_without_apply(self):
+        reviewed = {
+            "gate": {
+                "organizedSourcePromoted": True,
+                "safeToStartLiveEdit": True,
+            }
+        }
+        with mock.patch.object(
+            self.server, "_shader_workspace_service", return_value=self.workspaces
+        ):
+            synced = self.server._best_effort_project_organization_sync(
+                str(self.workspace), reviewed
+            )
+        self.assertTrue(synced["attempted"])
+        self.assertTrue(synced["succeeded"])
+        self.assertFalse(synced["result"]["applied"])
+        self.assertIsNotNone(self.active.registered)
+
+        self.active.registered = None
+        skipped = self.server._best_effort_project_organization_sync(
+            str(self.workspace),
+            {"gate": {"organizedSourcePromoted": False,
+                      "safeToStartLiveEdit": False}},
+        )
+        self.assertFalse(skipped["attempted"])
+        self.assertIsNone(self.active.registered)
 
 
 if __name__ == "__main__":

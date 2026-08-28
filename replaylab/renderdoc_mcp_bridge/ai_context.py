@@ -1,10 +1,10 @@
-"""Deterministic RenderDoc UI context and user-intent protocol.
+"""Deterministic RenderDoc UI context protocol.
 
 This module deliberately has no RenderDoc, Qt, MCP, AI SDK, network, or secret
-dependencies.  The built-in qrenderdoc integration supplies observed facts,
-and an external companion claims explicit UI intents.  Keeping this boundary
-small makes it possible to audit exactly what was selected when a user clicked
-an AI command.
+dependencies. The built-in qrenderdoc integration supplies observed facts and
+passes a frozen context directly to its first-party AgentHost. Keeping this
+boundary small makes it possible to audit exactly what was selected when a
+user clicked an AI command.
 
 The implementation is compatible with the Python 3.6 runtime embedded by the
 supported RenderDoc build.
@@ -16,25 +16,10 @@ import copy
 import hashlib
 import json
 import re
-import threading
-import time
-import uuid
 
 
 CONTEXT_SCHEMA = "renderdoc-ultra-current-context/v1"
-INTENT_SCHEMA = "renderdoc-ultra-ui-intent/v1"
-INTENT_BATCH_SCHEMA = "renderdoc-ultra-ui-intent-batch/v1"
 SCHEMA_VERSION = 1
-
-INTENT_EXPLAIN_EVENT = "explain-current-event"
-INTENT_REVERSE_EDIT_SHADER = "reverse-edit-selected-shader"
-INTENT_INSPECT_PIXEL = "inspect-picked-pixel"
-
-ALLOWED_INTENTS = (
-    INTENT_EXPLAIN_EVENT,
-    INTENT_REVERSE_EDIT_SHADER,
-    INTENT_INSPECT_PIXEL,
-)
 
 SHADER_STAGE_ORDER = (
     "vertex",
@@ -233,7 +218,9 @@ def _normalise_shaders(values, focus_stage, focus_source):
 
     focus_stage = normalise_stage(focus_stage)
     focus_source = _text(focus_source, "shader focus source", 64).strip().lower()
-    if focus_source not in ("", "explicit-ui-button", "deterministic-default"):
+    if focus_source not in (
+            "", "explicit-ui-button", "explicit-native-task",
+            "deterministic-default"):
         raise ContextProtocolError("unsupported shader focus source")
     focused = None
     if focus_stage:
@@ -247,7 +234,9 @@ def _normalise_shaders(values, focus_stage, focus_source):
         "bound": shaders,
         "focused": focused,
         "focusSource": focus_source if focused is not None else "none",
-        "focusIsExplicit": bool(focused is not None and focus_source == "explicit-ui-button"),
+        "focusIsExplicit": bool(
+            focused is not None and
+            focus_source in ("explicit-ui-button", "explicit-native-task")),
     }
 
 
@@ -368,310 +357,9 @@ def validate_context(snapshot):
     return copy.deepcopy(snapshot)
 
 
-def _intent_arguments(kind, context):
-    events = context["events"]
-    if kind == INTENT_EXPLAIN_EVENT:
-        if not context["capabilities"]["canExplainCurrentEvent"]:
-            raise ContextProtocolError("there is no current event to explain")
-        return {
-            "eventId": events["currentEventId"],
-            "selectedEventId": events["selectedEventId"],
-        }
-    if kind == INTENT_REVERSE_EDIT_SHADER:
-        shader = context["shaders"]["focused"]
-        if not context["shaders"]["focusIsExplicit"]:
-            raise ContextProtocolError(
-                "reverse/edit requires an explicitly stage-scoped RenderDoc UI command"
-            )
-        if not shader or not shader["exactRawBytesAvailable"]:
-            raise ContextProtocolError("the focused shader has no exact captured bytes")
-        return {
-            "eventId": events["currentEventId"],
-            "stage": shader["stage"],
-            "shaderResourceId": shader["resourceId"],
-            "entryPoint": shader["entryPoint"],
-            "rawSha256": shader["rawSha256"],
-        }
-    if kind == INTENT_INSPECT_PIXEL:
-        texture = context["texture"]
-        if not context["capabilities"]["canInspectPickedPixel"]:
-            raise ContextProtocolError("there is no picked texture pixel to inspect")
-        return {
-            "eventId": events["currentEventId"],
-            "textureResourceId": texture["resourceId"],
-            "subresource": copy.deepcopy(texture["subresource"]),
-            "pixel": copy.deepcopy(texture["pickedPixel"]),
-        }
-    raise ContextProtocolError("unsupported UI intent: %s" % kind)
-
-
-def _recommended_workflow(kind):
-    """Describe bounded authority granted by one explicit RenderDoc UI click.
-
-    The click authorises the operation named by the button, not an open-ended
-    model session. The Reverse/Edit button explicitly authorises a bounded
-    live-edit lease for this exact Shader identity; each saved candidate still
-    needs a fresh compile, ABI check and live-capture check before a
-    sharing-preserving replacement. Keeping the allow-list in the signed intent
-    prevents the model's own tool choice from expanding that scope.
-    """
-    if kind == INTENT_EXPLAIN_EVENT:
-        steps = [
-            {"tool": "get_draw_call_details", "argumentSource": "intent.eventId"},
-            {"tool": "get_pipeline_state", "argumentSource": "intent.eventId"},
-        ]
-        companion_configuration = []
-        allowed_operations = ["read-capture", "explain-event"]
-    elif kind == INTENT_REVERSE_EDIT_SHADER:
-        steps = [
-            {
-                "tool": "reverse_shader",
-                "argumentSource": "intent.eventId + intent.stage",
-            },
-            {
-                "tool": "prepare_shader_workspace",
-                "argumentSource": "intent identity + companion-owned configuration",
-            },
-            {
-                "tool": "start_shader_workspace_live_edit",
-                "argumentSource": "validated executable workspace",
-            },
-        ]
-        companion_configuration = [
-            "workspace_root",
-            "registered_shader_toolchain",
-            "active_replay_project",
-        ]
-        allowed_operations = [
-            "read-capture",
-            "synchronise-active-project",
-            "resolve-project-symbols",
-            "export-shader",
-            "create-workspace",
-            "decompile-shader",
-            "organise-source-with-ai",
-            "persist-project-knowledge",
-            "open-external-editor",
-            "watch-and-compile-saves",
-            "apply-compatible-shared-resource-saves",
-        ]
-    elif kind == INTENT_INSPECT_PIXEL:
-        steps = [
-            {
-                "tool": "inspect_pixel_object",
-                "argumentSource": "intent texture/subresource/pixel",
-            }
-        ]
-        companion_configuration = []
-        allowed_operations = ["read-capture", "inspect-picked-pixel"]
-    else:
-        raise ContextProtocolError("unsupported UI intent: %s" % kind)
-    return {
-        # The allow-list is an actual, bounded grant from the explicit UI
-        # click. The ordered steps remain suggestions; a companion may use a
-        # different deterministic sequence as long as every operation is in
-        # allowedOperations and the independent mutation gates still hold.
-        "advisoryOnly": False,
-        "suggestedStepsAdvisory": True,
-        "automaticExecutionAuthorized": True,
-        "authorizationSource": "explicit-renderdoc-ui-click",
-        "allowedOperations": allowed_operations,
-        "replayMutationAuthorized": False,
-        "arbitraryFileMutationAuthorized": False,
-        "requiresFreshContextValidationBeforeMutation": True,
-        "steps": steps,
-        "requiredCompanionConfiguration": companion_configuration,
-    }
-
-
-class IntentQueue(object):
-    """Bounded at-least-once queue for explicit RenderDoc UI commands.
-
-    A claim carries a random lease token.  Only the holder of the live token can
-    complete the intent; expired claims return to the queue.  The queue is
-    process-local by design and is cleared when the integration stops.
-    """
-
-    def __init__(self, maximum=256, clock=None, id_factory=None):
-        self.maximum = _integer(maximum, "maximum intent count", 1, 4096)
-        self._clock = clock or time.time
-        self._id_factory = id_factory or (lambda: uuid.uuid4().hex)
-        self._records = []
-        self._sequence = 0
-        self._lock = threading.RLock()
-
-    def _new_id(self):
-        value = _text(self._id_factory(), "generated intent ID", 128).lower()
-        if not value or any(record["intentId"] == value for record in self._records):
-            raise ContextProtocolError("generated intent ID is empty or duplicated")
-        return value
-
-    def _expire_claims(self, now):
-        for record in self._records:
-            if record["state"] == "claimed" and record["leaseExpiresAt"] <= now:
-                record["state"] = "queued"
-                record["claimedBy"] = ""
-                record["leaseToken"] = ""
-                record["leaseExpiresAt"] = 0.0
-
-    def _make_room(self):
-        while len(self._records) >= self.maximum:
-            removable = None
-            for index, record in enumerate(self._records):
-                if record["state"] in ("completed", "failed", "rejected", "cancelled"):
-                    removable = index
-                    break
-            if removable is None:
-                raise ContextProtocolError("the RenderDoc UI intent queue is full")
-            del self._records[removable]
-
-    def enqueue(self, kind, context):
-        kind = _text(kind, "intent kind", 128).strip().lower()
-        if kind not in ALLOWED_INTENTS:
-            raise ContextProtocolError("unsupported UI intent: %s" % kind)
-        context = validate_context(context)
-        arguments = _intent_arguments(kind, context)
-        with self._lock:
-            self._make_room()
-            self._sequence += 1
-            record = {
-                "schema": INTENT_SCHEMA,
-                "schemaVersion": SCHEMA_VERSION,
-                "intentId": self._new_id(),
-                "sequence": self._sequence,
-                "kind": kind,
-                "origin": "renderdoc-ui",
-                "state": "queued",
-                "contextSnapshotId": context["snapshotId"],
-                "context": context,
-                "arguments": arguments,
-                "recommendedWorkflow": _recommended_workflow(kind),
-                "attempts": 0,
-                "claimedBy": "",
-                "leaseToken": "",
-                "leaseExpiresAt": 0.0,
-                "outcomeSummary": "",
-            }
-            self._records.append(record)
-            return copy.deepcopy(record)
-
-    def claim(self, consumer_id, maximum=1, lease_seconds=30):
-        consumer_id = _text(consumer_id, "intent consumer ID", 128).strip()
-        if not consumer_id:
-            raise ContextProtocolError("intent consumer ID is required")
-        maximum = _integer(maximum, "claim count", 1, 16)
-        lease_seconds = _integer(lease_seconds, "lease seconds", 5, 300)
-        now = float(self._clock())
-        claimed = []
-        with self._lock:
-            self._expire_claims(now)
-            for record in self._records:
-                if record["state"] != "queued":
-                    continue
-                record["state"] = "claimed"
-                record["attempts"] += 1
-                record["claimedBy"] = consumer_id
-                record["leaseToken"] = self._new_id()
-                record["leaseExpiresAt"] = now + lease_seconds
-                claimed.append(copy.deepcopy(record))
-                if len(claimed) >= maximum:
-                    break
-        return {
-            "schema": INTENT_BATCH_SCHEMA,
-            "schemaVersion": SCHEMA_VERSION,
-            "consumerId": consumer_id,
-            "intents": claimed,
-        }
-
-    def complete(self, intent_id, lease_token, outcome, summary=""):
-        intent_id = _text(intent_id, "intent ID", 128).lower()
-        lease_token = _text(lease_token, "intent lease token", 128).lower()
-        outcome = _text(outcome, "intent outcome", 32).strip().lower()
-        summary = _text(summary, "intent outcome summary", 4096)
-        if outcome not in ("completed", "failed", "rejected"):
-            raise ContextProtocolError("unsupported intent outcome")
-        now = float(self._clock())
-        with self._lock:
-            self._expire_claims(now)
-            for record in self._records:
-                if record["intentId"] != intent_id:
-                    continue
-                if record["state"] != "claimed":
-                    raise ContextProtocolError("the intent does not have a live claim")
-                if record["leaseToken"] != lease_token:
-                    raise ContextProtocolError("the intent lease token does not match")
-                record["state"] = outcome
-                record["outcomeSummary"] = summary
-                record["leaseToken"] = ""
-                record["leaseExpiresAt"] = 0.0
-                return copy.deepcopy(record)
-        raise ContextProtocolError("unknown intent ID")
-
-    def renew(self, intent_id, lease_token, lease_seconds=30):
-        """Extend only the caller's still-live claim.
-
-        Long decompilation/model operations can exceed the original lease. A
-        renewal never revives an expired claim and never changes its owner or
-        token, so another consumer cannot steal or resurrect work by guessing
-        an intent ID.
-        """
-        intent_id = _text(intent_id, "intent ID", 128).lower()
-        lease_token = _text(lease_token, "intent lease token", 128).lower()
-        lease_seconds = _integer(lease_seconds, "lease seconds", 5, 300)
-        now = float(self._clock())
-        with self._lock:
-            self._expire_claims(now)
-            for record in self._records:
-                if record["intentId"] != intent_id:
-                    continue
-                if record["state"] != "claimed":
-                    raise ContextProtocolError("the intent does not have a live claim")
-                if record["leaseToken"] != lease_token:
-                    raise ContextProtocolError("the intent lease token does not match")
-                record["leaseExpiresAt"] = now + lease_seconds
-                return copy.deepcopy(record)
-        raise ContextProtocolError("unknown intent ID")
-
-    def status(self, intent_id):
-        intent_id = _text(intent_id, "intent ID", 128).lower()
-        now = float(self._clock())
-        with self._lock:
-            self._expire_claims(now)
-            for record in self._records:
-                if record["intentId"] == intent_id:
-                    return copy.deepcopy(record)
-        raise ContextProtocolError("unknown intent ID")
-
-    def cancel_for_capture_change(self, active_capture_session_id):
-        active_capture_session_id = _text(
-            active_capture_session_id, "active capture session ID", 64
-        ).lower()
-        cancelled = 0
-        with self._lock:
-            for record in self._records:
-                if record["state"] not in ("queued", "claimed"):
-                    continue
-                record_session = record["context"]["capture"]["captureSessionId"]
-                if not active_capture_session_id or record_session != active_capture_session_id:
-                    record["state"] = "cancelled"
-                    record["claimedBy"] = ""
-                    record["leaseToken"] = ""
-                    record["leaseExpiresAt"] = 0.0
-                    record["outcomeSummary"] = "capture session changed"
-                    cancelled += 1
-        return cancelled
-
-
 __all__ = [
-    "ALLOWED_INTENTS",
     "CONTEXT_SCHEMA",
     "ContextProtocolError",
-    "INTENT_BATCH_SCHEMA",
-    "INTENT_EXPLAIN_EVENT",
-    "INTENT_INSPECT_PIXEL",
-    "INTENT_REVERSE_EDIT_SHADER",
-    "INTENT_SCHEMA",
-    "IntentQueue",
     "build_context",
     "normalise_stage",
     "validate_context",

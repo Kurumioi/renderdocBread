@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
+import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -17,7 +19,7 @@ from ..errors import (
     LifecycleCleanupError,
     PolicyError,
 )
-from ..policy import ToolCallScope
+from ..policy import WORKFLOW_EFFECTS, ToolCallScope
 from .codex_app_server import (
     DeltaCallback,
     ExternalAgentResult,
@@ -25,7 +27,24 @@ from .codex_app_server import (
 )
 
 
+# Give a well-behaved Agent a short graceful window. The ACP SDK transport must
+# wait longer than ReplayLab's tree escalation, otherwise its Windows
+# ``Process.terminate()`` kills only a cmd/PowerShell launcher and can orphan the
+# real Agent. After the tree stop, keep a separate bounded window for the SDK to
+# finish its pipe and receive-task cleanup.
 _ACP_CLEANUP_TIMEOUT = 2.0
+_ACP_TREE_KILL_TIMEOUT = 5.0
+_ACP_FORCE_CLEANUP_TIMEOUT = 5.0
+_ACP_TRANSPORT_SHUTDOWN_TIMEOUT = 15.0
+_CURSOR_PROVIDER_ID = "cursor-acp"
+_MAX_CURSOR_PERMISSION_DENIALS = 16
+_CURSOR_SAFE_NOTIFICATIONS = frozenset(
+    {
+        "cursor/update_todos",
+        "cursor/task",
+        "cursor/generate_image",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -81,9 +100,85 @@ def _load_acp_sdk() -> _ACPSDK:
     )
 
 
+def _owned_agent_process(value: Any) -> Any | None:
+    if not isinstance(value, (tuple, list)) or len(value) < 2:
+        return None
+    process = value[1]
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    return process
+
+
+def _discard_cleanup_task(task: asyncio.Future[Any]) -> None:
+    task.cancel()
+
+    def consume(done: asyncio.Future[Any]) -> None:
+        with contextlib.suppress(BaseException):
+            done.exception()
+
+    task.add_done_callback(consume)
+
+
+async def _force_stop_agent_process_tree(process: Any) -> bool:
+    """Stop the exact owned Agent process tree without a shell.
+
+    ``asyncio.subprocess.Process.kill`` is only ``TerminateProcess`` on Windows.
+    Cursor's official launcher is cmd -> PowerShell -> node, so root-only
+    termination is not proof that the ACP Agent was reclaimed. Use the absolute
+    system taskkill executable for that bounded Windows escalation, then retain
+    a root-process fallback for platforms without process-tree support here.
+    """
+
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    if getattr(process, "returncode", None) is not None:
+        # A completed Windows launcher is not proof that an already detached
+        # PowerShell/node descendant exited. Without a live root PID taskkill
+        # cannot verify the tree, so retain fail-closed semantics there.
+        return os.name != "nt"
+
+    tree_stop_confirmed = os.name != "nt"
+    if os.name == "nt":
+        system_root = Path(os.environ.get("SYSTEMROOT", r"C:\Windows"))
+        taskkill = system_root / "System32" / "taskkill.exe"
+        if taskkill.is_file():
+            killer: asyncio.subprocess.Process | None = None
+            try:
+                killer = await asyncio.create_subprocess_exec(
+                    str(taskkill),
+                    "/PID",
+                    str(pid),
+                    "/T",
+                    "/F",
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                return_code = await asyncio.wait_for(
+                    killer.wait(), timeout=_ACP_TREE_KILL_TIMEOUT
+                )
+                tree_stop_confirmed = return_code == 0
+            except (OSError, asyncio.TimeoutError):
+                if killer is not None and killer.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        killer.kill()
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(killer.wait(), timeout=1.0)
+
+    if getattr(process, "returncode", None) is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+    return tree_stop_confirmed
+
+
 @contextlib.asynccontextmanager
 async def _managed_agent_process(manager: Any, label: str):
     """Preserve body failures while making an uncertain child exit fatal."""
+
+    value = await manager.__aenter__()
+    process = _owned_agent_process(value)
 
     async def close(
         exception_type: type[BaseException] | None,
@@ -100,16 +195,71 @@ async def _managed_agent_process(manager: Any, label: str):
                     asyncio.shield(cleanup_task), timeout=_ACP_CLEANUP_TIMEOUT
                 )
             except (asyncio.TimeoutError, asyncio.CancelledError) as cleanup_error:
-                cleanup_task.cancel()
-
-                def consume(task: asyncio.Future[Any]) -> None:
-                    with contextlib.suppress(BaseException):
-                        task.exception()
-
-                cleanup_task.add_done_callback(consume)
-                raise LifecycleCleanupError(
-                    f"{label} process cleanup was not confirmed within the deadline"
-                ) from cleanup_error
+                cancellation_error = (
+                    cleanup_error
+                    if isinstance(cleanup_error, asyncio.CancelledError)
+                    else None
+                )
+                if process is None:
+                    _discard_cleanup_task(cleanup_task)
+                    raise LifecycleCleanupError(
+                        f"{label} process cleanup was not confirmed within the deadline"
+                    ) from cleanup_error
+                force_task = asyncio.create_task(
+                    _force_stop_agent_process_tree(process)
+                )
+                try:
+                    tree_stop_confirmed = await asyncio.shield(force_task)
+                except asyncio.CancelledError as tree_cancelled:
+                    # Do not let a second user cancellation interrupt the exact
+                    # tree stop. Preserve it and propagate only after both the
+                    # process and SDK transport have reached a terminal state.
+                    cancellation_error = tree_cancelled
+                    try:
+                        tree_stop_confirmed = await asyncio.wait_for(
+                            asyncio.shield(force_task),
+                            timeout=_ACP_TREE_KILL_TIMEOUT + 1.0,
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError) as tree_error:
+                        _discard_cleanup_task(force_task)
+                        _discard_cleanup_task(cleanup_task)
+                        raise LifecycleCleanupError(
+                            f"{label} process tree cleanup was not confirmed"
+                        ) from tree_error
+                except Exception as tree_error:
+                    _discard_cleanup_task(cleanup_task)
+                    raise LifecycleCleanupError(
+                        f"{label} process tree cleanup failed"
+                    ) from tree_error
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(cleanup_task),
+                        timeout=_ACP_FORCE_CLEANUP_TIMEOUT,
+                    )
+                except asyncio.CancelledError as forced_cancelled:
+                    cancellation_error = forced_cancelled
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.shield(cleanup_task),
+                            timeout=_ACP_FORCE_CLEANUP_TIMEOUT,
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError) as forced_error:
+                        _discard_cleanup_task(cleanup_task)
+                        raise LifecycleCleanupError(
+                            f"{label} process cleanup was not confirmed within the deadline"
+                        ) from forced_error
+                except asyncio.TimeoutError as forced_error:
+                    _discard_cleanup_task(cleanup_task)
+                    raise LifecycleCleanupError(
+                        f"{label} process cleanup was not confirmed within the deadline"
+                    ) from forced_error
+                if os.name == "nt" and not tree_stop_confirmed:
+                    raise LifecycleCleanupError(
+                        f"{label} process tree cleanup was not confirmed"
+                    ) from cleanup_error
+                if cancellation_error is not None:
+                    raise cancellation_error
+                return result
         except LifecycleCleanupError:
             raise
         except Exception as cleanup_error:
@@ -117,7 +267,6 @@ async def _managed_agent_process(manager: Any, label: str):
                 f"{label} process cleanup failed"
             ) from cleanup_error
 
-    value = await manager.__aenter__()
     try:
         yield value
     except BaseException as primary:
@@ -143,9 +292,12 @@ class ACPConnector:
         instance_id: str = "",
         registry_path: Path | str | None = None,
         tool_scope: ToolCallScope | None = None,
+        workflow_effects: set[str] | frozenset[str] = frozenset(),
         audit_file: Path | str | None = None,
         timeout: float = 300.0,
         env: Mapping[str, str] | None = None,
+        authentication_method: str = "",
+        provider_id: str = "",
     ) -> None:
         if isinstance(command, str):
             command = (command,)
@@ -164,6 +316,10 @@ class ACPConnector:
             if replaylab_mcp_executable is not None
             else None
         )
+        if self.replaylab_mcp_executable is not None and not self.allowed_tools:
+            raise ConfigurationError(
+                "ReplayLab MCP cannot be attached without any task tools"
+            )
         if self.allowed_tools and (
             self.replaylab_mcp_executable is None
             or not self.replaylab_mcp_executable.is_file()
@@ -178,6 +334,17 @@ class ACPConnector:
         self.instance_id = str(instance_id or "").strip()
         self.registry_path = Path(registry_path).resolve() if registry_path else None
         self.tool_scope = tool_scope or ToolCallScope()
+        self.workflow_effects = frozenset(
+            str(value).strip() for value in workflow_effects if str(value).strip()
+        )
+        unknown_effects = self.workflow_effects - WORKFLOW_EFFECTS
+        if unknown_effects:
+            raise ConfigurationError(
+                "ACP workflow contains unknown effect classes: "
+                + ", ".join(sorted(unknown_effects))
+            )
+        if "replay" in self.workflow_effects and "workspace" not in self.workflow_effects:
+            raise ConfigurationError("ACP replay workflow requires the workspace effect")
         self.audit_file = Path(audit_file).resolve() if audit_file else None
         if self.allowed_tools and (
             not self.instance_id
@@ -192,7 +359,22 @@ class ACPConnector:
             raise ConfigurationError("ACP timeout must be positive")
         self.timeout = float(timeout)
         self.env = dict(env) if env is not None else None
+        self.authentication_method = str(authentication_method or "").strip()
+        if len(self.authentication_method) > 128 or "\0" in self.authentication_method:
+            raise ConfigurationError("ACP authentication method is invalid")
+        self.provider_id = str(provider_id or "").strip()
+        if len(self.provider_id) > 128 or "\0" in self.provider_id:
+            raise ConfigurationError("ACP provider id is invalid")
         self._run_lock = asyncio.Lock()
+
+    async def _authenticate(self, connection: Any) -> None:
+        if not self.authentication_method:
+            return
+        await _wait_for(
+            connection.authenticate(method_id=self.authentication_method),
+            min(self.timeout, 60.0),
+            "ACP authenticate",
+        )
 
     async def test_connection(self) -> dict[str, Any]:
         """Perform a no-prompt ACP initialize/session handshake.
@@ -205,7 +387,11 @@ class ACPConnector:
 
         async with self._run_lock:
             sdk = _load_acp_sdk()
-            state = _ACPClientState(on_delta=None)
+            state = _ACPClientState(
+                on_delta=None,
+                provider_id=self.provider_id,
+                permission_audit_file=self._permission_audit_file(),
+            )
             client = _make_client(sdk, state)
             spawn_kwargs: dict[str, Any] = {"cwd": str(self.cwd)}
             if self.env is not None:
@@ -217,6 +403,7 @@ class ACPConnector:
                     transport_kwargs={
                         "stderr": asyncio.subprocess.DEVNULL,
                         "limit": 4 * 1024 * 1024,
+                        "shutdown_timeout": _ACP_TRANSPORT_SHUTDOWN_TIMEOUT,
                     },
                     **spawn_kwargs,
                 )
@@ -229,6 +416,7 @@ class ACPConnector:
                         min(self.timeout, 30.0),
                         "ACP initialize",
                     )
+                    await self._authenticate(connection)
                     session = await _wait_for(
                         connection.new_session(cwd=str(self.cwd), mcp_servers=[]),
                         min(self.timeout, 60.0),
@@ -237,6 +425,9 @@ class ACPConnector:
                     session_id = str(getattr(session, "session_id", ""))
                     if not session_id:
                         raise ConnectorError("ACP session/new returned no session id")
+                    state.session_id = session_id
+                    if state.policy_error is not None:
+                        raise state.policy_error
                     return {
                         "sessionId": session_id,
                         "models": _connection_models(session),
@@ -274,7 +465,11 @@ class ACPConnector:
             raise ConfigurationError("ACP prompt must not be empty")
         async with self._run_lock:
             sdk = _load_acp_sdk()
-            state = _ACPClientState(on_delta=on_delta)
+            state = _ACPClientState(
+                on_delta=on_delta,
+                provider_id=self.provider_id,
+                permission_audit_file=self._permission_audit_file(),
+            )
             client = _make_client(sdk, state)
             mcp_servers = self._mcp_servers(sdk)
 
@@ -290,6 +485,7 @@ class ACPConnector:
                     transport_kwargs={
                         "stderr": asyncio.subprocess.DEVNULL,
                         "limit": 4 * 1024 * 1024,
+                        "shutdown_timeout": _ACP_TRANSPORT_SHUTDOWN_TIMEOUT,
                     },
                     **spawn_kwargs,
                 )
@@ -302,6 +498,7 @@ class ACPConnector:
                         min(self.timeout, 30.0),
                         "ACP initialize",
                     )
+                    await self._authenticate(connection)
                     session = await _wait_for(
                         connection.new_session(
                             cwd=str(self.cwd),
@@ -313,6 +510,7 @@ class ACPConnector:
                     session_id = str(getattr(session, "session_id", ""))
                     if not session_id:
                         raise ConnectorError("ACP session/new returned no session id")
+                    state.session_id = session_id
                     if model:
                         await self._select_model(connection, session, session_id, model)
                     try:
@@ -332,8 +530,10 @@ class ACPConnector:
                                 {prompt_task, abort_task}, return_when=asyncio.FIRST_COMPLETED
                             )
                             if abort_task in done:
-                                raise state.callback_error or ConnectorError(
-                                    "ACP response collection was aborted"
+                                raise (
+                                    state.callback_error
+                                    or state.policy_error
+                                    or ConnectorError("ACP response collection was aborted")
                                 )
                             prompt_response = await prompt_task
                         finally:
@@ -398,6 +598,8 @@ class ACPConnector:
             args.extend(("--host-arg", upstream_arg))
         for tool_name in sorted(self.allowed_tools):
             args.extend(("--allow", tool_name))
+        for effect in sorted(self.workflow_effects):
+            args.extend(("--effect", effect))
         args.extend(("--instance-id", self.instance_id))
         args.extend(("--registry-path", str(self.registry_path)))
         args.extend(("--scope-json", self.tool_scope.to_json()))
@@ -417,6 +619,11 @@ class ACPConnector:
                 "installed ACP SDK rejected the ReplayLab MCP stdio definition; "
                 "install a supported agent-client-protocol>=0.12,<1 release"
             ) from exc
+
+    def _permission_audit_file(self) -> Path | None:
+        if self.provider_id != _CURSOR_PROVIDER_ID or self.audit_file is None:
+            return None
+        return self.audit_file.with_name("permission-audit.jsonl")
 
     async def _select_model(
         self,
@@ -453,6 +660,11 @@ class ACPConnector:
 @dataclass(slots=True)
 class _ACPClientState:
     on_delta: DeltaCallback | None
+    provider_id: str = ""
+    session_id: str = ""
+    cursor_permission_denials: int = 0
+    cursor_permission_ids: set[str] = field(default_factory=set)
+    permission_audit_file: Path | None = None
     text_chunks: list[str] = field(default_factory=list)
     text_chars: int = 0
     text_bytes: int = 0
@@ -473,10 +685,36 @@ def _make_client(sdk: _ACPSDK, state: _ACPClientState) -> Any:
             options: list[Any],
             **kwargs: Any,
         ) -> Any:
-            del session_id, tool_call, options, kwargs
+            del kwargs
+            if state.provider_id == _CURSOR_PROVIDER_ID:
+                validation_error = _validate_cursor_permission_request(
+                    state, session_id, tool_call, options
+                )
+                if validation_error:
+                    state.policy_error = PolicyError(
+                        "Cursor ACP sent an invalid permission request; ReplayLab cancelled it "
+                        f"(fail-closed: {validation_error})"
+                    )
+                    state.abort_event.set()
+                else:
+                    state.cursor_permission_denials += 1
+                    _audit_cursor_permission_denial(state)
+                    if state.cursor_permission_denials > _MAX_CURSOR_PERMISSION_DENIALS:
+                        state.policy_error = PolicyError(
+                            "Cursor ACP exceeded the bounded permission-denial limit; "
+                            "ReplayLab cancelled the turn (fail-closed)"
+                        )
+                        state.abort_event.set()
+                # Cursor expects every permission request to receive a decision.
+                # Exact ReplayLab MCP tools are approved before the request layer
+                # by the profile-scoped Cursor allowlist; every request reaching
+                # this callback is therefore cancelled. A normal cancellation is
+                # non-fatal so Cursor can continue with a text-only answer.
+                return _permission_denied(sdk)
             state.policy_error = PolicyError(
                 "ACP agent requested extra permission; ReplayLab cancelled it (fail-closed)"
             )
+            state.abort_event.set()
             return _permission_denied(sdk)
 
         async def create_elicitation(self, *args: Any, **kwargs: Any) -> Any:
@@ -484,6 +722,7 @@ def _make_client(sdk: _ACPSDK, state: _ACPClientState) -> Any:
             state.policy_error = PolicyError(
                 "ACP agent requested interactive input; ReplayLab declined it (fail-closed)"
             )
+            state.abort_event.set()
             response_type = sdk.decline_elicitation_response_type
             if response_type is not None:
                 try:
@@ -552,10 +791,30 @@ def _make_client(sdk: _ACPSDK, state: _ACPClientState) -> Any:
 
         async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
             del params
+            if state.provider_id == _CURSOR_PROVIDER_ID:
+                if method == "cursor/ask_question":
+                    return {
+                        "outcome": {
+                            "outcome": "skipped",
+                            "reason": "ReplayLab does not provide interactive answers during this automated turn.",
+                        }
+                    }
+                if method == "cursor/create_plan":
+                    return {
+                        "outcome": {
+                            "outcome": "rejected",
+                            "reason": "ReplayLab does not approve external execution plans; continue with read-only analysis.",
+                        }
+                    }
             raise _policy_denial(state, f"invoke ACP extension method '{method}'")
 
         async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
             del params
+            if (
+                state.provider_id == _CURSOR_PROVIDER_ID
+                and method in _CURSOR_SAFE_NOTIFICATIONS
+            ):
+                return
             _record_policy_denial(state, f"send ACP extension notification '{method}'")
 
         async def session_update(
@@ -600,6 +859,7 @@ def _make_client(sdk: _ACPSDK, state: _ACPClientState) -> Any:
 def _policy_denial(state: _ACPClientState, action: str) -> PolicyError:
     error = PolicyError(f"ACP Agent attempted to {action}; ReplayLab denied it (fail-closed)")
     state.policy_error = error
+    state.abort_event.set()
     return error
 
 
@@ -607,6 +867,7 @@ def _record_policy_denial(state: _ACPClientState, action: str) -> None:
     state.policy_error = PolicyError(
         f"ACP Agent attempted to {action}; ReplayLab denied it (fail-closed)"
     )
+    state.abort_event.set()
 
 
 def _permission_denied(sdk: _ACPSDK) -> Any:
@@ -619,6 +880,75 @@ def _permission_denied(sdk: _ACPSDK) -> Any:
             pass
     # The official quickstart also permits this mapping form.
     return {"outcome": {"outcome": "cancelled"}}
+
+
+def _validate_cursor_permission_request(
+    state: _ACPClientState,
+    session_id: str,
+    tool_call: Any,
+    options: list[Any],
+) -> str:
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or len(session_id) > 256
+        or "\0" in session_id
+        or session_id != state.session_id
+    ):
+        return "session mismatch"
+    tool_call_id = str(_field(tool_call, "tool_call_id", "toolCallId") or "").strip()
+    if not tool_call_id or len(tool_call_id) > 256 or "\0" in tool_call_id:
+        return "invalid tool-call id"
+    if tool_call_id in state.cursor_permission_ids:
+        return "duplicate tool-call id"
+    if not isinstance(options, list) or not 1 <= len(options) <= 32:
+        return "invalid option count"
+    option_ids: set[str] = set()
+    for option in options:
+        option_id = str(_field(option, "option_id", "optionId") or "").strip()
+        name = str(_field(option, "name") or "").strip()
+        kind = _enum_value(_field(option, "kind")).replace("-", "_").lower()
+        if (
+            not option_id
+            or len(option_id) > 256
+            or "\0" in option_id
+            or option_id in option_ids
+            or not name
+            or len(name) > 512
+            or "\0" in name
+            or kind
+            not in {"allow_once", "allow_always", "reject_once", "reject_always"}
+        ):
+            return "invalid permission option"
+        option_ids.add(option_id)
+    state.cursor_permission_ids.add(tool_call_id)
+    return ""
+
+
+def _audit_cursor_permission_denial(state: _ACPClientState) -> None:
+    path = state.permission_audit_file
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "event": "permissionDenied",
+                        "provider": _CURSOR_PROVIDER_ID,
+                        "sequence": state.cursor_permission_denials,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+    except OSError:
+        state.policy_error = PolicyError(
+            "ReplayLab could not record the Cursor permission denial; "
+            "the turn was cancelled (fail-closed)"
+        )
+        state.abort_event.set()
 
 
 def _is_agent_message(update: Any) -> bool:

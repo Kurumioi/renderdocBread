@@ -1,4 +1,6 @@
 import asyncio
+import ast
+import hashlib
 import io
 import json
 import os
@@ -10,16 +12,21 @@ import time
 import unittest
 from unittest import mock
 
+from src import internal_tool_service
 from src import replaylab_host
 from src import replaylab_tools
-from src.shader_workspace import ToolConfigurationError
+from src.shader_workspace import (
+    ToolConfigurationError,
+    WorkspaceWatchConflictError,
+    WorkspaceWatchError,
+)
 from src.shader_workspace.adapters import d3dcompiler_adapter
 from src.shader_workspace.adapters import dxil_assembler_adapter
 from src.shader_workspace.toolchain_config import generate_official_toolchain_configs
 
 
 def _wait_restore_job(
-    registry: replaylab_host.ProjectRestoreJobRegistry,
+    registry: internal_tool_service.ProjectRestoreJobRegistry,
     job_id: str,
     timeout: float = 3.0,
 ) -> dict:
@@ -64,6 +71,41 @@ class ReplayLabHostTests(unittest.TestCase):
         }
         value.update(overrides)
         return value
+
+    @staticmethod
+    def _publish_host_identity(
+        root: Path,
+        *,
+        port: int = 49643,
+        pid: int | None = None,
+        instance_id: str = "a" * 32,
+        protocol_version: int = 2,
+        version: str = "1.10.2",
+    ) -> dict:
+        process_id = os.getpid() if pid is None else pid
+        replaylab_host._atomic_json(
+            root / "host.json",
+            {
+                "schema": "replaylab-host/v1",
+                "service": "ReplayLab",
+                "version": version,
+                "hostStateProtocolVersion": protocol_version,
+                "pid": process_id,
+                "hostInstanceId": instance_id,
+                "host": "127.0.0.1",
+                "port": port,
+                "endpoint": "http://127.0.0.1:%d/mcp" % port,
+                "heartbeatUnixMs": int(time.time() * 1000),
+            },
+        )
+        return {
+            "service": "ReplayLab",
+            "version": version,
+            "hostStateProtocolVersion": protocol_version,
+            "transport": "streamable-http",
+            "pid": process_id,
+            "hostInstanceId": instance_id,
+        }
 
     def test_background_execution_policy_is_noop_off_windows(self):
         report = replaylab_host.disable_windows_execution_speed_throttling(
@@ -275,245 +317,23 @@ class ReplayLabHostTests(unittest.TestCase):
             self.assertNotIn(first, snippet)
             self.assertNotIn("mcp_servers.renderdoc", snippet)
 
-    def test_project_cli_uses_same_process_owned_active_project_paths(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            projects = root / "projects"
-            state = root / "config" / "active.json"
-            capture = root / "frame.rdc"
-            capture.write_bytes(b"capture")
-            environment = {
-                "RENDERDOC_ULTRA_ACTIVE_PROJECT_STATE": str(state),
-                "RENDERDOC_ULTRA_PROJECTS_HOME": str(projects),
-                "LOCALAPPDATA": str(root),
-            }
-            with mock.patch.dict(os.environ, environment, clear=False):
-                output = io.StringIO()
-                with mock.patch("sys.stdout", output):
-                    self.assertEqual(
-                        0,
-                        replaylab_host.main(
-                            [
-                                "project-create",
-                                "--name",
-                                "CLI Project",
-                                "--project-root",
-                                str(root / "portable" / "cli-project"),
-                                "--game-id",
-                                "game-a",
-                                "--build-id",
-                                "build-a",
-                                "--capture",
-                                str(capture),
-                            ]
-                        ),
-                    )
-                created = json.loads(output.getvalue())
-                self.assertEqual("bound", created["state"])
-                self.assertEqual(1, created["captureLibrary"]["count"])
-
-                assets = root / "assets"
-                assets.mkdir()
-                output = io.StringIO()
-                with mock.patch("sys.stdout", output):
-                    self.assertEqual(
-                        0,
-                        replaylab_host.main(
-                            [
-                                "project-configure",
-                                "--project-root",
-                                created["projectRoot"],
-                                "--asset-root",
-                                str(assets),
-                            ]
-                        ),
-                    )
-                configured = json.loads(output.getvalue())
-                self.assertEqual(str(assets.resolve()), configured["assetRoot"])
-
-                output = io.StringIO()
-                with mock.patch("sys.stdout", output):
-                    self.assertEqual(0, replaylab_host.main(["project-list"]))
-                listed = json.loads(output.getvalue())
-                self.assertEqual(1, listed["count"])
-                self.assertTrue(listed["projects"][0]["active"])
-                self.assertEqual(
-                    replaylab_host.active_project_paths(),
-                    (state.resolve(), projects.resolve()),
-                )
-
-                output = io.StringIO()
-                with mock.patch("sys.stdout", output):
-                    self.assertEqual(
-                        0,
-                        replaylab_host.main(
-                            [
-                                "project-create", "--name", "Project Scoped CLI",
-                                "--project-root", str(root / "portable" / "scoped-project"),
-                            ]
-                        ),
-                    )
-                pending = json.loads(output.getvalue())
-                self.assertEqual("bound", pending["state"])
-                self.assertEqual("replaylab-project", pending["scope"]["gameId"])
-                lease = (
-                    root / "ReplayLab" / "ipc-v2" / "instances" /
-                    "test-instance" / "project-association-lease.json"
-                )
-                lease.parent.mkdir(parents=True)
-                lease_token = "a" * 32
-                lease.write_text(
-                    json.dumps({
-                        "schema": "replaylab-project-association-lease/v1",
-                        "token": lease_token,
-                        "active": True,
-                        "capturePath": str(capture.resolve()),
-                    }),
-                    encoding="utf-8",
-                )
-                output = io.StringIO()
-                with mock.patch("sys.stdout", output):
-                    self.assertEqual(
-                        0,
-                        replaylab_host.main([
-                            "project-match-capture",
-                            "--capture", str(capture),
-                            "--association-lease", str(lease),
-                            "--association-token", lease_token,
-                        ]),
-                    )
-                matched = json.loads(output.getvalue())
-                self.assertTrue(matched["activated"])
-                self.assertEqual(created["workspaceId"], matched["project"]["workspaceId"])
-
-                lease.unlink()
-                output = io.StringIO()
-                with mock.patch("sys.stdout", output):
-                    self.assertEqual(
-                        0,
-                        replaylab_host.main([
-                            "project-match-capture",
-                            "--capture", str(capture),
-                            "--association-lease", str(lease),
-                            "--association-token", lease_token,
-                        ]),
-                    )
-                expired = json.loads(output.getvalue())
-                self.assertFalse(expired["activated"])
-                with mock.patch("sys.stdout", io.StringIO()):
-                    self.assertEqual(
-                        0,
-                        replaylab_host.main(
-                            [
-                                "project-activate",
-                                "--project-root",
-                                created["projectRoot"],
-                            ]
-                        ),
-                    )
-                with self.assertRaisesRegex(Exception, "asset root"):
-                    replaylab_host.main(
-                        [
-                            "project-configure",
-                            "--project-root",
-                            pending["projectRoot"],
-                            "--asset-root",
-                            str(root / "missing-assets"),
-                        ]
-                    )
-                self.assertEqual(
-                    created["workspaceId"],
-                    replaylab_host.project_service().status()["workspaceId"],
-                )
-
-                capture_ref_id = created["captureLibrary"]["captures"][0]["captureRefId"]
-                output = io.StringIO()
-                with mock.patch("sys.stdout", output):
-                    self.assertEqual(
-                        0,
-                        replaylab_host.main([
-                            "project-remove-capture",
-                            "--project-root", created["projectRoot"],
-                            "--capture-ref-id", capture_ref_id,
-                        ]),
-                    )
-                removed_capture = json.loads(output.getvalue())
-                self.assertEqual(0, removed_capture["captureLibrary"]["count"])
-                self.assertTrue(capture.is_file())
-                with mock.patch("sys.stdout", io.StringIO()):
-                    self.assertEqual(
-                        0,
-                        replaylab_host.main([
-                            "project-add-capture",
-                            "--project-root", created["projectRoot"],
-                            "--capture", str(capture),
-                        ]),
-                    )
-
-                output = io.StringIO()
-                with mock.patch("sys.stdout", output):
-                    self.assertEqual(
-                        0,
-                        replaylab_host.main([
-                            "project-unregister", "--project-root", pending["projectRoot"]
-                        ]),
-                    )
-                forgotten = json.loads(output.getvalue())
-                self.assertFalse(forgotten["projectFilesDeleted"])
-                self.assertTrue(Path(pending["projectRoot"]).is_dir())
-                with mock.patch("sys.stdout", io.StringIO()):
-                    self.assertEqual(
-                        0,
-                        replaylab_host.main([
-                            "project-register", "--project-root", pending["projectRoot"]
-                        ]),
-                    )
-                output = io.StringIO()
-                with mock.patch("sys.stdout", output):
-                    self.assertEqual(
-                        0,
-                        replaylab_host.main(
-                            [
-                                "project-configure",
-                                "--project-root",
-                                pending["projectRoot"],
-                                "--clear-asset-root",
-                            ]
-                        ),
-                    )
-                bound = json.loads(output.getvalue())
-                self.assertEqual("bound", bound["state"])
-                self.assertEqual("replaylab-project", bound["scope"]["gameId"])
-                self.assertEqual(
-                    created["workspaceId"],
-                    replaylab_host.project_service().status()["workspaceId"],
-                )
-
-    def test_project_activate_cli_prints_the_single_validated_activation_result(self):
-        expected = {
-            "workspaceId": "a" * 32,
-            "projectRoot": "D:/projects/example",
-            "captureLibrary": {"count": 2},
-        }
-        service = mock.Mock()
-        service.activate.return_value = expected
-        output = io.StringIO()
-
-        with mock.patch.object(
-            replaylab_host, "project_service", return_value=service
-        ), mock.patch("sys.stdout", output):
-            self.assertEqual(
-                0,
-                replaylab_host.main([
-                    "project-activate",
-                    "--project-root",
-                    expected["projectRoot"],
-                ]),
-            )
-
-        self.assertEqual(expected, json.loads(output.getvalue()))
-        service.activate.assert_called_once_with(expected["projectRoot"])
-        service.project_status.assert_not_called()
+    def test_external_cli_rejects_private_project_commands(self):
+        parser = replaylab_host._parser()
+        for command in (
+            "project-list",
+            "project-create",
+            "project-register",
+            "project-unregister",
+            "project-activate",
+            "project-configure",
+            "project-add-capture",
+            "project-remove-capture",
+            "project-match-capture",
+        ):
+            with self.subTest(command=command), mock.patch(
+                "sys.stderr", io.StringIO()
+            ), self.assertRaises(SystemExit):
+                parser.parse_args([command])
 
     def test_owner_registry_prunes_dead_processes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -527,6 +347,169 @@ class ReplayLabHostTests(unittest.TestCase):
             self.assertFalse((root / "owners" / "111.json").exists())
             self.assertTrue(replaylab_host.release_owner(root, 222))
             self.assertFalse(replaylab_host.release_owner(root, 222))
+
+    def test_ensure_attaches_owner_only_after_state_and_health_identity_match(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            current = self._publish_host_identity(root)
+            with mock.patch.object(
+                replaylab_host, "health", return_value=current
+            ), mock.patch.object(replaylab_host, "_spawn_detached") as spawn:
+                result = replaylab_host.ensure(root, os.getpid())
+
+            spawn.assert_not_called()
+            self.assertFalse(result["started"])
+            self.assertEqual(2, result["hostStateProtocolVersion"])
+            self.assertEqual("a" * 32, result["hostInstanceId"])
+            owner = json.loads(
+                (root / "owners" / ("%d.json" % os.getpid())).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(os.getpid(), owner["pid"])
+
+    def test_ensure_rejects_incompatible_live_identity_without_new_owner(self):
+        cases = (
+            ("health protocol", {"health_protocol": 1}),
+            ("health instance", {"health_instance": "b" * 32}),
+            ("state protocol", {"state_protocol": 1}),
+        )
+        for label, overrides in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                current = self._publish_host_identity(
+                    root,
+                    protocol_version=overrides.get("state_protocol", 2),
+                )
+                current["hostStateProtocolVersion"] = overrides.get(
+                    "health_protocol", 2
+                )
+                current["hostInstanceId"] = overrides.get(
+                    "health_instance", "a" * 32
+                )
+                with mock.patch.object(
+                    replaylab_host, "health", return_value=current
+                ), mock.patch.object(replaylab_host, "_spawn_detached") as spawn:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "incompatible identity contract"
+                    ):
+                        replaylab_host.ensure(root, os.getpid())
+
+                spawn.assert_not_called()
+                self.assertFalse(
+                    (root / "owners" / ("%d.json" % os.getpid())).exists()
+                )
+
+    def test_ensure_fails_fast_on_incompatible_fresh_live_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._publish_host_identity(root, protocol_version=1)
+            with mock.patch.object(
+                replaylab_host, "health", return_value=None
+            ), mock.patch.object(replaylab_host, "_spawn_detached") as spawn:
+                with self.assertRaisesRegex(
+                    RuntimeError, "incompatible identity contract"
+                ):
+                    replaylab_host.ensure(root, os.getpid())
+
+            spawn.assert_not_called()
+            self.assertFalse(
+                (root / "owners" / ("%d.json" % os.getpid())).exists()
+            )
+
+    def test_ensure_spawns_ownerless_until_new_host_identity_is_compatible(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            current = self._publish_host_identity(root)
+            # Remove the synthetic state until the detached child is launched.
+            (root / "host.json").unlink()
+
+            def launch(command):
+                self._publish_host_identity(root)
+                self.assertNotIn("--owner-pid", command)
+
+            with mock.patch.object(
+                replaylab_host, "health", side_effect=(None, current)
+            ), mock.patch.object(
+                replaylab_host, "_spawn_detached", side_effect=launch
+            ) as spawn:
+                result = replaylab_host.ensure(root, os.getpid(), 49643)
+
+            spawn.assert_called_once()
+            self.assertTrue(result["started"])
+            self.assertEqual("a" * 32, result["hostInstanceId"])
+            self.assertTrue(
+                (root / "owners" / ("%d.json" % os.getpid())).is_file()
+            )
+
+    def test_concurrent_ensure_spawns_only_one_external_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            launches = []
+            results = []
+            errors = []
+
+            def current_health(unused_port):
+                state = replaylab_host._load_json(root / "host.json")
+                if state is None:
+                    return None
+                return {
+                    "service": "ReplayLab",
+                    "version": replaylab_host.SERVICE_VERSION,
+                    "hostStateProtocolVersion":
+                        replaylab_host.HOST_STATE_PROTOCOL_VERSION,
+                    "hostInstanceId": state["hostInstanceId"],
+                    "transport": "streamable-http",
+                    "pid": state["pid"],
+                }
+
+            def launch(command):
+                launches.append(list(command))
+                self._publish_host_identity(root)
+
+            def attach():
+                try:
+                    results.append(
+                        replaylab_host.ensure(root, os.getpid(), 49643))
+                except Exception as exc:
+                    errors.append(exc)
+
+            with mock.patch.object(
+                replaylab_host, "health", side_effect=current_health
+            ), mock.patch.object(
+                replaylab_host, "_spawn_detached", side_effect=launch
+            ):
+                workers = [threading.Thread(target=attach) for unused in range(2)]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(5)
+
+            self.assertEqual([], errors)
+            self.assertEqual(2, len(results))
+            self.assertEqual(1, len(launches))
+            self.assertEqual(1, sum(1 for value in results if value["started"]))
+
+    def test_external_host_exposes_no_qrenderdoc_private_http_routes(self):
+        source = Path(replaylab_host.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=replaylab_host.__file__)
+        serve = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_serve"
+        )
+        route_literals = {
+            node.value for node in ast.walk(serve)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.startswith("/")
+        }
+        serve_source = ast.get_source_segment(source, serve)
+        self.assertEqual({"/health"}, route_literals)
+        self.assertIn("mcp.streamable_http_app()", serve_source)
+        self.assertNotIn("resume_persistent", serve_source)
+        self.assertNotIn("/replaylab/project-restore", serve_source)
+        self.assertNotIn("/replaylab/shader-source/save", serve_source)
+        self.assertNotIn("/replaylab/internal/project-operation", serve_source)
 
     def test_state_status_never_discloses_bearer_value(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -569,20 +552,20 @@ class ReplayLabHostTests(unittest.TestCase):
                 "captureSessionId": "a" * 32,
             }
 
-            parsed = replaylab_host.parse_project_restore_request(
+            parsed = internal_tool_service.parse_project_restore_request(
                 json.dumps(request).encode("utf-8")
             )
             self.assertEqual(str(project.resolve()), parsed["projectRoot"])
             self.assertEqual(str(capture.resolve()), parsed["capturePath"])
 
             with self.assertRaisesRegex(
-                replaylab_host.ProjectRestoreRequestError, "fields"
+                internal_tool_service.ProjectRestoreRequestError, "fields"
             ):
-                replaylab_host.parse_project_restore_request(
+                internal_tool_service.parse_project_restore_request(
                     json.dumps({**request, "extra": True}).encode("utf-8")
                 )
             with self.assertRaisesRegex(
-                replaylab_host.ProjectRestoreRequestError, "duplicate JSON key"
+                internal_tool_service.ProjectRestoreRequestError, "duplicate JSON key"
             ):
                 duplicate_body = (
                     (
@@ -596,23 +579,23 @@ class ReplayLabHostTests(unittest.TestCase):
                         "a" * 32,
                     )
                 ).encode("utf-8")
-                replaylab_host.parse_project_restore_request(
+                internal_tool_service.parse_project_restore_request(
                     duplicate_body
                 )
             invalid_session = dict(request)
             invalid_session["captureSessionId"] = "A" * 32
             with self.assertRaisesRegex(
-                replaylab_host.ProjectRestoreRequestError, "lowercase hexadecimal"
+                internal_tool_service.ProjectRestoreRequestError, "lowercase hexadecimal"
             ):
-                replaylab_host.parse_project_restore_request(
+                internal_tool_service.parse_project_restore_request(
                     json.dumps(invalid_session).encode("utf-8")
                 )
             relative = dict(request)
             relative["capturePath"] = "frame.rdc"
             with self.assertRaisesRegex(
-                replaylab_host.ProjectRestoreRequestError, "absolute"
+                internal_tool_service.ProjectRestoreRequestError, "absolute"
             ):
-                replaylab_host.parse_project_restore_request(
+                internal_tool_service.parse_project_restore_request(
                     json.dumps(relative).encode("utf-8")
                 )
 
@@ -636,7 +619,7 @@ class ReplayLabHostTests(unittest.TestCase):
                 )
             return {"completed": True, "capture": {"sessionId": capture_session_id}}
 
-        registry = replaylab_host.ProjectRestoreJobRegistry(runner=runner)
+        registry = internal_tool_service.ProjectRestoreJobRegistry(runner=runner)
         try:
             request = {
                 "projectRoot": "D:/project",
@@ -646,10 +629,10 @@ class ReplayLabHostTests(unittest.TestCase):
             submitted, deduplicated = registry.submit(request)
             self.assertFalse(deduplicated)
             self.assertEqual(
-                replaylab_host.PROJECT_RESTORE_JOB_SCHEMA, submitted["schema"]
+                internal_tool_service.PROJECT_RESTORE_JOB_SCHEMA, submitted["schema"]
             )
             self.assertRegex(
-                submitted["jobId"], replaylab_host.PROJECT_RESTORE_JOB_ID_PATTERN
+                submitted["jobId"], internal_tool_service.PROJECT_RESTORE_JOB_ID_PATTERN
             )
 
             completed = _wait_restore_job(registry, submitted["jobId"])
@@ -681,7 +664,7 @@ class ReplayLabHostTests(unittest.TestCase):
             self.assertTrue(release.wait(3.0))
             return {"completed": True}
 
-        registry = replaylab_host.ProjectRestoreJobRegistry(
+        registry = internal_tool_service.ProjectRestoreJobRegistry(
             runner=runner, max_active_jobs=2
         )
         try:
@@ -721,7 +704,7 @@ class ReplayLabHostTests(unittest.TestCase):
             self.assertTrue(release.wait(3.0))
             return {"completed": True}
 
-        registry = replaylab_host.ProjectRestoreJobRegistry(
+        registry = internal_tool_service.ProjectRestoreJobRegistry(
             runner=blocking_runner, max_active_jobs=1
         )
         try:
@@ -732,7 +715,7 @@ class ReplayLabHostTests(unittest.TestCase):
             }
             first, _unused = registry.submit(request)
             self.assertTrue(started.wait(1.0))
-            with self.assertRaises(replaylab_host.ProjectRestoreCapacityError):
+            with self.assertRaises(internal_tool_service.ProjectRestoreCapacityError):
                 registry.submit({**request, "captureSessionId": "b" * 32})
             release.set()
             _wait_restore_job(registry, first["jobId"])
@@ -752,7 +735,7 @@ class ReplayLabHostTests(unittest.TestCase):
                 )
             return {"completed": True}
 
-        registry = replaylab_host.ProjectRestoreJobRegistry(
+        registry = internal_tool_service.ProjectRestoreJobRegistry(
             runner=verbose_runner,
             max_progress_events=3,
             progress_page_size=2,
@@ -774,9 +757,9 @@ class ReplayLabHostTests(unittest.TestCase):
         clock = [10.0]
 
         def failing_runner(*_args, progress_callback):
-            raise RuntimeError("x" * (replaylab_host.MAX_PROJECT_RESTORE_ERROR_BYTES * 2))
+            raise RuntimeError("x" * (internal_tool_service.MAX_PROJECT_RESTORE_ERROR_BYTES * 2))
 
-        registry = replaylab_host.ProjectRestoreJobRegistry(
+        registry = internal_tool_service.ProjectRestoreJobRegistry(
             runner=failing_runner,
             history_ttl_seconds=5.0,
             monotonic=lambda: clock[0],
@@ -792,14 +775,14 @@ class ReplayLabHostTests(unittest.TestCase):
             self.assertEqual("failed", failed["status"])
             self.assertLessEqual(
                 len(failed["error"].encode("utf-8")),
-                replaylab_host.MAX_PROJECT_RESTORE_ERROR_BYTES,
+                internal_tool_service.MAX_PROJECT_RESTORE_ERROR_BYTES,
             )
             clock[0] += 6.0
             self.assertIsNone(registry.get(submitted["jobId"]))
         finally:
             registry.shutdown()
 
-        registry = replaylab_host.ProjectRestoreJobRegistry(
+        registry = internal_tool_service.ProjectRestoreJobRegistry(
             runner=lambda *_args, progress_callback: {"completed": True},
             max_history_jobs=1,
         )
@@ -821,9 +804,9 @@ class ReplayLabHostTests(unittest.TestCase):
             registry.shutdown()
 
         with mock.patch.object(
-            replaylab_host, "MAX_PROJECT_RESTORE_RESULT_BYTES", 128
+                internal_tool_service, "MAX_PROJECT_RESTORE_RESULT_BYTES", 128
         ):
-            registry = replaylab_host.ProjectRestoreJobRegistry(
+            registry = internal_tool_service.ProjectRestoreJobRegistry(
                 runner=lambda *_args, progress_callback: {
                     "completed": True,
                     "oversized": "x" * 256,
@@ -851,39 +834,39 @@ class ReplayLabHostTests(unittest.TestCase):
                     "captureSessionId": "c" * 32,
                 }
             ).encode("utf-8")
-            registry = replaylab_host.ProjectRestoreJobRegistry(
+            registry = internal_tool_service.ProjectRestoreJobRegistry(
                 runner=lambda *_args, progress_callback: {"completed": True}
             )
             try:
                 status_code, submitted = asyncio.run(
-                    replaylab_host.project_restore_post_response(
+                    internal_tool_service.project_restore_post_response(
                         _ChunkedRequest(body, content_length=str(len(body))), registry
                     )
                 )
                 self.assertEqual(202, status_code)
                 _wait_restore_job(registry, submitted["jobId"])
-                status_code, completed = replaylab_host.project_restore_get_response(
+                status_code, completed = internal_tool_service.project_restore_get_response(
                     submitted["jobId"], "0", registry
                 )
                 self.assertEqual(200, status_code)
                 self.assertEqual("completed", completed["status"])
 
-                bad_status, bad = replaylab_host.project_restore_get_response(
+                bad_status, bad = internal_tool_service.project_restore_get_response(
                     submitted["jobId"], "-1", registry
                 )
                 self.assertEqual(400, bad_status)
                 self.assertIn("after", bad["error"])
-                missing_status, _missing = replaylab_host.project_restore_get_response(
+                missing_status, _missing = internal_tool_service.project_restore_get_response(
                     "d" * 32, "0", registry
                 )
                 self.assertEqual(404, missing_status)
 
                 oversized_status, _oversized = asyncio.run(
-                    replaylab_host.project_restore_post_response(
+                    internal_tool_service.project_restore_post_response(
                         _ChunkedRequest(
                             b"{}",
                             content_length=str(
-                                replaylab_host.MAX_PROJECT_RESTORE_REQUEST_BYTES + 1
+                                internal_tool_service.MAX_PROJECT_RESTORE_REQUEST_BYTES + 1
                             ),
                         ),
                         registry,
@@ -892,6 +875,187 @@ class ReplayLabHostTests(unittest.TestCase):
                 self.assertEqual(413, oversized_status)
             finally:
                 registry.shutdown()
+
+    def test_shader_editor_save_request_is_exact_bounded_utf8_json(self):
+        valid = {
+            "liveEditId": "a" * 32,
+            "authorizationId": "b" * 32,
+            "workspaceId": "c" * 32,
+            "expectedRawSha256": "d" * 64,
+            "text": "float4 MainPS() : SV_Target { return 1; }\n",
+        }
+
+        parsed = internal_tool_service.parse_shader_editor_save_request(
+            memoryview(json.dumps(valid).encode("utf-8"))
+        )
+        self.assertEqual(valid, parsed)
+
+        invalid_requests = [
+            (b"", 400),
+            (b"[]", 400),
+            (b"\xff", 400),
+            (b'{"value":NaN}', 400),
+            (
+                (
+                    '{"liveEditId":"%s","liveEditId":"%s",'
+                    '"authorizationId":"%s","workspaceId":"%s",'
+                    '"expectedRawSha256":"%s","text":"x"}'
+                    % ("a" * 32, "a" * 32, "b" * 32, "c" * 32, "d" * 64)
+                ).encode("utf-8"),
+                400,
+            ),
+            (
+                json.dumps({**valid, "sourcePath": "D:/untrusted/shader.hlsl"}).encode(
+                    "utf-8"
+                ),
+                400,
+            ),
+            (
+                json.dumps({**valid, "liveEditId": "A" * 32}).encode("utf-8"),
+                400,
+            ),
+            (
+                json.dumps({**valid, "expectedRawSha256": "D" * 64}).encode(
+                    "utf-8"
+                ),
+                400,
+            ),
+            (json.dumps({**valid, "text": ""}).encode("utf-8"), 400),
+            (json.dumps({**valid, "text": "x\x00y"}).encode("utf-8"), 400),
+            (
+                json.dumps(
+                    {
+                        **valid,
+                        "text": "x" * (internal_tool_service.MAX_SHADER_EDITOR_SOURCE_BYTES + 1),
+                    }
+                ).encode("utf-8"),
+                413,
+            ),
+            (
+                b"x" * (internal_tool_service.MAX_SHADER_EDITOR_SAVE_REQUEST_BYTES + 1),
+                413,
+            ),
+        ]
+        manager = mock.Mock()
+        for body, expected_status in invalid_requests:
+            with self.subTest(expected_status=expected_status, prefix=body[:32]):
+                status, result = internal_tool_service.shader_editor_save_response(
+                    body, manager
+                )
+                self.assertEqual(expected_status, status)
+                self.assertEqual({"error"}, set(result))
+        manager.save_authorized_source.assert_not_called()
+
+    def test_shader_editor_save_response_binds_manager_result_and_statuses(self):
+        request = {
+            "liveEditId": "a" * 32,
+            "authorizationId": "b" * 32,
+            "workspaceId": "c" * 32,
+            "expectedRawSha256": "d" * 64,
+            "text": "float4 MainPS() : SV_Target { return 2; }\n",
+        }
+        payload = json.dumps(request).encode("utf-8")
+        saved_sha256 = hashlib.sha256(
+            request["text"].encode("utf-8")
+        ).hexdigest()
+        manager = mock.Mock()
+        manager.save_authorized_source.return_value = {
+            "watchId": "e" * 32,
+            "rawSha256": saved_sha256,
+            "size": len(request["text"].encode("utf-8")),
+            "modifiedNs": 123456789,
+            "changed": True,
+            "compileScheduled": True,
+        }
+
+        status, response = internal_tool_service.shader_editor_save_response(
+            payload, manager
+        )
+
+        self.assertEqual(200, status)
+        manager.save_authorized_source.assert_called_once_with(
+            request["liveEditId"],
+            request["authorizationId"],
+            request["workspaceId"],
+            request["expectedRawSha256"],
+            request["text"],
+        )
+        self.assertEqual(
+            {
+                "schema",
+                "schemaVersion",
+                "liveEditId",
+                "authorizationId",
+                "workspaceId",
+                "watchId",
+                "savedRawSha256",
+                "size",
+                "modifiedNs",
+                "changed",
+                "compileScheduled",
+            },
+            set(response),
+        )
+        self.assertEqual(
+            "replaylab-shader-source-save/v1", response["schema"]
+        )
+        self.assertEqual(saved_sha256, response["savedRawSha256"])
+
+        cases = [
+            (
+                WorkspaceWatchConflictError("source changed on disk"),
+                409,
+                True,
+            ),
+            (WorkspaceWatchError("watcher is not running"), 409, False),
+            (RuntimeError("audit persistence failed"), 503, False),
+        ]
+        for error, expected_status, expected_conflict in cases:
+            with self.subTest(error=type(error).__name__):
+                rejected = mock.Mock()
+                rejected.save_authorized_source.side_effect = error
+                status, response = internal_tool_service.shader_editor_save_response(
+                    payload, rejected
+                )
+                self.assertEqual(expected_status, status)
+                self.assertIs(expected_conflict, response.get("conflict", False))
+                self.assertIn(str(error), response["error"])
+
+        invalid_result = mock.Mock()
+        invalid_result.save_authorized_source.return_value = {
+            **manager.save_authorized_source.return_value,
+            "changed": 1,
+        }
+        status, response = internal_tool_service.shader_editor_save_response(
+            payload, invalid_result
+        )
+        self.assertEqual(503, status)
+        self.assertIn("invalid result", response["error"])
+
+    def test_shader_editor_body_reader_rejects_declared_or_streamed_oversize(self):
+        with self.assertRaises(internal_tool_service.ShaderEditorSaveRequestError) as caught:
+            asyncio.run(
+                internal_tool_service._read_shader_editor_save_body(
+                    _ChunkedRequest(
+                        b"{}",
+                        content_length=str(
+                            internal_tool_service.MAX_SHADER_EDITOR_SAVE_REQUEST_BYTES + 1
+                        ),
+                    )
+                )
+            )
+        self.assertEqual(413, caught.exception.status_code)
+
+        with self.assertRaises(internal_tool_service.ShaderEditorSaveRequestError) as caught:
+            asyncio.run(
+                internal_tool_service._read_shader_editor_save_body(
+                    _ChunkedRequest(
+                        b"x"
+                        * (internal_tool_service.MAX_SHADER_EDITOR_SAVE_REQUEST_BYTES + 1)
+                    )
+                )
+            )
+        self.assertEqual(413, caught.exception.status_code)
 
     def test_bearer_gate_rejects_missing_token_and_allows_health(self):
         calls = []
@@ -921,6 +1085,11 @@ class ReplayLabHostTests(unittest.TestCase):
         self.assertEqual([], calls)
         denied_restore = asyncio.run(invoke("/replaylab/project-restore", []))
         self.assertEqual(401, denied_restore[0]["status"])
+        self.assertEqual([], calls)
+        denied_shader_save = asyncio.run(
+            invoke("/replaylab/shader-source/save", [])
+        )
+        self.assertEqual(401, denied_shader_save[0]["status"])
         self.assertEqual([], calls)
         health = asyncio.run(invoke("/health", []))
         self.assertEqual(200, health[0]["status"])

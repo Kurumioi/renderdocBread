@@ -1,10 +1,15 @@
 # ReplayLab runtime packaging
 
-`Build-ReplayLabRuntime.ps1` produces the two Python 3.10+ sidecars used by
-qrenderdoc's built-in ReplayLab integration:
+`Build-ReplayLabRuntime.ps1` produces three Python 3.10+ executables with separate
+product boundaries:
 
-- `replaylab-ai.exe` — model/provider and AgentHost process
-- `ReplayLabMCP.exe` — capture-analysis MCP host
+- `replaylab-ai.exe` — qrenderdoc's model/provider AgentHost with its shared
+  ToolService and isolated ACP/Cursor subscription transport
+- `ReplayLabInternal.exe` — qrenderdoc-owned, bearer-protected loopback service
+  exposing only bounded ProjectService and project-restore HTTP operations
+- `ReplayLabMCP.exe` — first-party bridge adapter used by ACP/Cursor task-level
+  stdio sessions and explicit external Codex/IDE/automation clients. Model API
+  and Codex dynamicTools tasks do not launch or route through this executable.
 
 The default output is `replaylab/output/replaylab/`. The qrenderdoc build owns
 deployment of the embedded Python bridge, so this runtime builder does not
@@ -20,7 +25,7 @@ $python = "D:\path\to\python.exe"
 
 Use `-IncludeLiteLLM` only when the separate `litellm` optional dependency is
 installed. Each successful output includes a versioned manifest with SHA-256
-hashes. Rebuilds replace only the three marker-owned files; an unmarked,
+hashes. Rebuilds replace only the four marker-owned files; an unmarked,
 non-empty output directory is rejected and unrelated entries are never
 recursively deleted.
 
@@ -53,11 +58,11 @@ mutation; source and target paths may not contain reparse points.
 An empty target is marked on first deployment. A non-empty target without that
 deployment marker is rejected. To adopt a legacy manual deployment, use
 `-AdoptExistingVerifiedRuntime`; adoption succeeds only when both canonical
-executables and the build manifest already match the verified runtime output
+sidecars, AgentHost, and the build manifest already match the verified runtime output
 byte-for-byte (size and SHA-256). Other files are preserved. A mismatched legacy
 directory still fails closed and must be reviewed manually.
 
-Later deployments replace only the two runtime executables, build manifest, and
+Later deployments replace only the three runtime executables, build manifest, and
 deployment marker. Any unrelated entries are preserved and are never
 recursively removed. The marker enters an `incomplete` state only after every
 new file has been staged and verified, so an interrupted commit is explicitly
@@ -65,7 +70,9 @@ owned and retryable; it changes to `complete` after final hash verification. If
 a runtime file is active or locked, deployment fails with a stop-and-retry
 message and does not terminate any process. Runtime deployment remains
 deliberately separate from the C++ build so rebuilding qrenderdoc cannot
-overwrite a sidecar serving an active analysis session.
+overwrite a sidecar serving an active analysis session. The private and MCP
+hosts use different state files, bearer tokens, ports, protocols, and routes;
+neither lifecycle command can adopt or release the other's owners.
 
 The fast checks do not run PyInstaller:
 

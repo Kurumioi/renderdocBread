@@ -1,10 +1,11 @@
-"""ReplayLab project launcher UI and packaged-host client.
+"""ReplayLab project launcher UI and private ProjectService client.
 
 The built-in qrenderdoc integration deliberately does not duplicate project
-persistence. Every create/activate/add operation is delegated to
-``ReplayLabMCP.exe``, whose ``ActiveReplayProjectService`` owns the sealed JSON
-schema and game/build boundary. This module is Python 3.6 compatible for
-qrenderdoc.
+persistence. Every create/activate/add operation uses the shared,
+qrenderdoc-owned ``ReplayLabInternal.exe`` high-level HTTP service whose
+``ActiveReplayProjectService`` owns the sealed JSON schema and game/build
+boundary. ``ReplayLabMCP.exe`` is reserved for explicit external clients.
+This module is Python 3.6 compatible for qrenderdoc.
 
 RDC files are registered as references rather than copied. Embedded capture
 thumbnails are read through ``OpenCaptureFile().OpenFile().GetThumbnail()``.
@@ -18,10 +19,10 @@ placeholder.
 from __future__ import absolute_import, print_function
 
 import json
+import importlib.util
 import os
 import queue
 import re
-import subprocess
 import threading
 import time
 import uuid
@@ -33,7 +34,6 @@ PROJECT_WORKSPACE_SCHEMA = "replaylab-project-workspace/v1"
 CAPTURE_LIBRARY_SCHEMA = "replaylab-project-capture-library/v1"
 CAPTURE_CONTENT_IDENTITY_SCHEMA = "replaylab-rdc-content-identity/v1"
 CAPTURE_PROJECT_MATCH_SCHEMA = "replaylab-capture-project-match/v1"
-MAX_HOST_OUTPUT_BYTES = 16 * 1024 * 1024
 MAX_CAPTURE_ARGUMENTS = 4096
 MAX_THUMBNAIL_EDGE = 256
 MAX_THUMBNAIL_BYTES = 4 * 1024 * 1024
@@ -61,31 +61,20 @@ def _qt_format(translated, *arguments):
     return re.sub(r"%([1-9][0-9]*)", _replace, str(translated))
 
 
-_ACTIVE_HOST_PROCESSES = set()
-_ACTIVE_HOST_PROCESSES_GUARD = threading.RLock()
-
-
-def _track_host_process(process):
-    with _ACTIVE_HOST_PROCESSES_GUARD:
-        _ACTIVE_HOST_PROCESSES.add(process)
-
-
-def _forget_host_process(process):
-    with _ACTIVE_HOST_PROCESSES_GUARD:
-        _ACTIVE_HOST_PROCESSES.discard(process)
-
-
-def cancel_active_host_processes():
-    """Cancel project CLI children so qrenderdoc can drain its Python workers."""
-    with _ACTIVE_HOST_PROCESSES_GUARD:
-        processes = list(_ACTIVE_HOST_PROCESSES)
-    for process in processes:
-        try:
-            if process.poll() is None:
-                process.kill()
-        except Exception:
-            # The worker's fixed communicate timeout remains the final bound.
-            pass
+try:
+    from . import project_restore_client as _internal_client_protocol
+except (ImportError, ValueError):
+    _internal_client_spec = importlib.util.spec_from_file_location(
+        "_replaylab_internal_service_client",
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "project_restore_client.py"))
+    if (_internal_client_spec is None or
+            _internal_client_spec.loader is None):
+        raise ImportError("Unable to load the ReplayLab internal service client")
+    _internal_client_protocol = importlib.util.module_from_spec(
+        _internal_client_spec)
+    _internal_client_spec.loader.exec_module(_internal_client_protocol)
 
 
 class ProjectLauncherError(RuntimeError):
@@ -135,12 +124,41 @@ def _normalise_restore_progress(value):
 
 def _restore_progress_text(progress):
     phase = str(progress.get("phase", "") or "")
-    if phase == "validate":
+    if phase == "restore-dispatch":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Scheduling ReplayLab project recovery")
+    elif phase == "client-validate":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Validating the project recovery request")
+    elif phase == "host-state":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Checking the ReplayLab Host state")
+    elif phase == "host-health":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Verifying the ReplayLab Host identity")
+    elif phase == "restore-submit":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Starting the project recovery job")
+    elif phase == "restore-queued":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Project recovery is queued")
+    elif phase == "restore-running":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT,
+            "ReplayLab Host is running project recovery")
+    elif phase == "result-validate":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Validating the project recovery result")
+    elif phase == "validate":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Validating active project and capture")
     elif phase == "index-read":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Reading RDC project association cache")
+    elif phase == "index-required":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT,
+            "A full Shader index is required before project data can be restored")
     elif phase == "cache-anchor":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Validating cached Shader anchors")
@@ -213,6 +231,15 @@ def _capture_open_error(value):
     return ""
 
 
+def _restore_action_required(value):
+    return bool(
+        isinstance(value, dict)
+        and value.get("completed") is False
+        and value.get("outcome") == "action-required"
+        and value.get("reasonId") == "catalog-index-required"
+    )
+
+
 def _restore_result_error(value, worker_error=""):
     if worker_error:
         return str(worker_error)[:4096]
@@ -221,6 +248,12 @@ def _restore_result_error(value, worker_error=""):
             TRANSLATION_CONTEXT,
             "ReplayLab reported that project data was not restored")
     if isinstance(value, dict):
+        if _restore_action_required(value):
+            return ""
+        if value.get("outcome") == "action-required":
+            reason_id = str(value.get("reasonId", "") or "")[:256]
+            return reason_id or QtCore.QCoreApplication.translate(
+                TRANSLATION_CONTEXT, "ReplayLab project restore failed")
         error_id = str(value.get("errorId", "") or "")
         error = value.get("error")
         if isinstance(error, dict):
@@ -239,6 +272,12 @@ def _restore_result_error(value, worker_error=""):
                 TRANSLATION_CONTEXT,
                 "This qrenderdoc build cannot restore ReplayLab project data after opening "
                 "an RDC")
+        if error_id == "host-runtime-incompatible":
+            return QtCore.QCoreApplication.translate(
+                TRANSLATION_CONTEXT,
+                "The running ReplayLab Host does not match this qrenderdoc build. Close "
+                "qrenderdoc and Codex, deploy the matching ReplayLab runtime, then restart "
+                "qrenderdoc.")
         if error_id:
             # Unknown future IDs are diagnostics. Do not mistake them for a
             # successful restore merely because this UI predates the mapping;
@@ -788,87 +827,184 @@ def validate_unavailable_project(value):
     }
 
 
+def _internal_project_operation(arguments):
+    """Convert the in-module call shape to one typed service request.
+
+    The argument list is never executed. Keeping this adapter avoids a broad
+    UI rewrite while deleting the per-operation process boundary. Unknown,
+    duplicate, or malformed switches fail before any HTTP request.
+    """
+
+    values = list(arguments or [])
+    if not values or not isinstance(values[0], str):
+        raise ProjectLauncherError("ReplayLab project operation is invalid")
+    command = values.pop(0)
+    definitions = {
+        "project-list": ({}, set()),
+        "project-create": ({
+            "--name": "name", "--project-root": "projectRoot",
+            "--asset-root": "assetRoot", "--game-id": "gameId",
+            "--build-id": "buildId", "--platform": "platform",
+            "--api-family": "apiFamily", "--capture": "captureFiles",
+        }, {"--capture"}),
+        "project-register": ({"--project-root": "projectRoot"}, set()),
+        "project-unregister": ({"--project-root": "projectRoot"}, set()),
+        "project-activate": ({"--project-root": "projectRoot"}, set()),
+        "project-configure": ({
+            "--project-root": "projectRoot", "--game-id": "gameId",
+            "--build-id": "buildId", "--platform": "platform",
+            "--api-family": "apiFamily", "--asset-root": "assetRoot",
+            "--clear-asset-root": "clearAssetRoot",
+        }, set()),
+        "project-add-capture": ({
+            "--project-root": "projectRoot", "--capture": "captureFiles",
+        }, {"--capture"}),
+        "project-remove-capture": ({
+            "--project-root": "projectRoot",
+            "--capture-ref-id": "captureRefIds",
+        }, {"--capture-ref-id"}),
+        "project-match-capture": ({
+            "--capture": "capturePath",
+            "--association-lease": "associationLease",
+            "--association-token": "associationToken",
+        }, set()),
+    }
+    selected = definitions.get(command)
+    if selected is None:
+        raise ProjectLauncherError("ReplayLab project operation is not allowed")
+    switches, repeated = selected
+    parsed = {}
+    index = 0
+    while index < len(values):
+        switch = values[index]
+        if switch not in switches:
+            raise ProjectLauncherError(
+                "ReplayLab project operation contains an invalid option")
+        field = switches[switch]
+        if switch == "--clear-asset-root":
+            if field in parsed:
+                raise ProjectLauncherError(
+                    "ReplayLab project operation contains a duplicate option")
+            parsed[field] = True
+            index += 1
+            continue
+        if index + 1 >= len(values):
+            raise ProjectLauncherError(
+                "ReplayLab project operation option has no value")
+        item = values[index + 1]
+        if switch in repeated:
+            parsed.setdefault(field, []).append(item)
+        elif field in parsed:
+            raise ProjectLauncherError(
+                "ReplayLab project operation contains a duplicate option")
+        else:
+            parsed[field] = item
+        index += 2
+
+    if command == "project-list":
+        if parsed:
+            raise ProjectLauncherError("ReplayLab project list has invalid options")
+        return "list-projects", {}
+    if command == "project-create":
+        if not {"name", "projectRoot"}.issubset(parsed):
+            raise ProjectLauncherError("ReplayLab project creation is incomplete")
+        return "create-project", {
+            "name": parsed["name"],
+            "projectRoot": parsed["projectRoot"],
+            "assetRoot": parsed.get("assetRoot", ""),
+            "captureFiles": parsed.get("captureFiles", []),
+            "gameId": parsed.get("gameId", ""),
+            "buildId": parsed.get("buildId", ""),
+            "platform": parsed.get("platform", ""),
+            "apiFamily": parsed.get("apiFamily", ""),
+        }
+    if command in (
+            "project-register", "project-unregister", "project-activate"):
+        if set(parsed) != {"projectRoot"}:
+            raise ProjectLauncherError("ReplayLab project path is incomplete")
+        operation = {
+            "project-register": "register-project",
+            "project-unregister": "unregister-project",
+            "project-activate": "activate-project",
+        }[command]
+        return operation, {"projectRoot": parsed["projectRoot"]}
+    if command == "project-configure":
+        if "projectRoot" not in parsed:
+            raise ProjectLauncherError("ReplayLab project configuration is incomplete")
+        if parsed.get("clearAssetRoot") and "assetRoot" in parsed:
+            raise ProjectLauncherError(
+                "ReplayLab project configuration has conflicting asset roots")
+        mode = "unchanged"
+        asset_root = ""
+        if parsed.get("clearAssetRoot"):
+            mode = "clear"
+        elif "assetRoot" in parsed:
+            mode = "set"
+            asset_root = parsed["assetRoot"]
+        return "configure-project", {
+            "projectRoot": parsed["projectRoot"],
+            "gameId": parsed.get("gameId", ""),
+            "buildId": parsed.get("buildId", ""),
+            "platform": parsed.get("platform", ""),
+            "apiFamily": parsed.get("apiFamily", ""),
+            "assetRootMode": mode,
+            "assetRoot": asset_root,
+        }
+    if command == "project-add-capture":
+        if "projectRoot" not in parsed or not parsed.get("captureFiles"):
+            raise ProjectLauncherError("ReplayLab capture addition is incomplete")
+        return "add-captures", {
+            "projectRoot": parsed["projectRoot"],
+            "captureFiles": parsed["captureFiles"],
+        }
+    if command == "project-remove-capture":
+        if "projectRoot" not in parsed or not parsed.get("captureRefIds"):
+            raise ProjectLauncherError("ReplayLab capture removal is incomplete")
+        return "remove-captures", {
+            "projectRoot": parsed["projectRoot"],
+            "captureRefIds": parsed["captureRefIds"],
+        }
+    if command == "project-match-capture":
+        if "capturePath" not in parsed:
+            raise ProjectLauncherError("ReplayLab capture match is incomplete")
+        return "match-capture", {
+            "capturePath": parsed["capturePath"],
+            "associationLease": parsed.get("associationLease", ""),
+            "associationToken": parsed.get("associationToken", ""),
+        }
+    raise AssertionError("unreachable project operation")
+
+
 class ReplayLabProjectClient(object):
-    """Small shell-free client for the packaged deterministic project CLI."""
+    """Typed client for the shared private ProjectService."""
 
     def __init__(self, executable, timeout_seconds=90, runner=None):
-        self.executable = os.path.abspath(_text(executable, "ReplayLab host executable"))
+        self.executable = os.path.abspath(_text(
+            executable, "ReplayLab internal host executable"))
         self.timeout_seconds = int(timeout_seconds)
-        self.runner = runner or self._run_process
+        self._internal_client = None
+        if runner is None:
+            internal_executable = (
+                _internal_client_protocol.resolve_internal_executable(
+                    self.executable))
+            if not internal_executable:
+                raise ProjectLauncherError(
+                    "Packaged ReplayLabInternal.exe is unavailable: %s" %
+                    self.executable)
+            self._internal_client = (
+                _internal_client_protocol.ReplayLabInternalProjectClient(
+                    internal_executable,
+                    request_timeout_seconds=max(1, self.timeout_seconds)))
+            self.runner = self._run_internal_request
+        else:
+            self.runner = runner
 
-    def _run_process(self, arguments):
-        if globals().get("HAS_QT", False):
-            try:
-                application = QtCore.QCoreApplication.instance()
-                if (application is not None and
-                        QtCore.QThread.currentThread() == application.thread()):
-                    raise ProjectLauncherError(
-                        "ReplayLab project host operations must not run on qrenderdoc's UI thread")
-            except ProjectLauncherError:
-                raise
-            except Exception:
-                # If thread introspection itself is unavailable, fail below via
-                # the normal fixed process contract rather than guessing.
-                pass
-        if not os.path.isfile(self.executable) or os.path.islink(self.executable):
-            raise ProjectLauncherError(
-                "Packaged ReplayLabMCP.exe is unavailable: %s" % self.executable)
-        flags = 0
-        if os.name == "nt":
-            flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) |
-                     getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
-        child_environment = os.environ.copy()
-        # ReplayLab's CLI contract is UTF-8 JSON regardless of the workstation
-        # ANSI/OEM code page. This is required for Chinese capture/asset paths.
-        child_environment["PYTHONIOENCODING"] = "utf-8"
-        process = subprocess.Popen(
-            [self.executable] + list(arguments),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=os.path.dirname(self.executable),
-            shell=False,
-            creationflags=flags,
-            env=child_environment)
-        _track_host_process(process)
+    def _run_internal_request(self, arguments):
+        operation, parameters = _internal_project_operation(arguments)
         try:
-            try:
-                stdout, stderr = process.communicate(timeout=self.timeout_seconds)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                try:
-                    stdout, stderr = process.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    # A descendant may still own an inherited pipe even after the
-                    # direct child was killed. Close our read handles so this worker
-                    # has a finite shutdown bound instead of hanging qrenderdoc.
-                    for pipe in (process.stdout, process.stderr):
-                        try:
-                            pipe.close()
-                        except Exception:
-                            pass
-                    try:
-                        process.wait(timeout=1)
-                    except Exception:
-                        pass
-                    raise ProjectLauncherError(
-                        "ReplayLab project operation did not stop after cancellation")
-                raise ProjectLauncherError("ReplayLab project operation timed out")
-        finally:
-            _forget_host_process(process)
-        if len(stdout) > MAX_HOST_OUTPUT_BYTES or len(stderr) > MAX_HOST_OUTPUT_BYTES:
-            raise ProjectLauncherError("ReplayLab project operation returned oversized output")
-        if process.returncode != 0:
-            detail = stderr.decode("utf-8", "replace").strip()
-            raise ProjectLauncherError(
-                detail[-4096:] or "ReplayLab project operation failed")
-        try:
-            value = json.loads(stdout.decode("utf-8"))
-        except Exception:
-            raise ProjectLauncherError("ReplayLab project operation returned invalid JSON")
-        if not isinstance(value, dict):
-            raise ProjectLauncherError("ReplayLab project operation returned a non-object")
-        return value
+            return self._internal_client.invoke(operation, parameters)
+        except _internal_client_protocol.ReplayLabRestoreClientError as exc:
+            raise ProjectLauncherError(str(exc))
 
     def _invoke(self, arguments):
         return self.runner(list(arguments))
@@ -1105,7 +1241,6 @@ if HAS_QT:
             self._result_timer = QtCore.QTimer(self)
             self._result_timer.setInterval(25)
             self._result_timer.timeout.connect(self._drain_results)
-            self._result_timer.start()
 
         def publish_result(self, token, value, error):
             """Publish only to Python-owned storage from a worker thread."""
@@ -1124,14 +1259,19 @@ if HAS_QT:
                     "ReplayLab project executor has been shut down")
             owner = _text(owner_token, "asynchronous owner", 128)
             token = self.registry.register(owner, callback)
+            if not self._result_timer.isActive():
+                self._result_timer.start()
             self.pool.start(_ProjectOperation(self, token, operation))
             return token
 
         def cancel_owner(self, owner_token):
             self.registry.cancel_owner(owner_token)
+            if len(self.registry) == 0:
+                self._result_timer.stop()
 
         def cancel_all(self):
             self.registry.clear()
+            self._result_timer.stop()
             try:
                 self.pool.clear()
             except Exception:
@@ -1140,10 +1280,10 @@ if HAS_QT:
         def shutdown(self, timeout_ms=5000):
             """Synchronously quiesce every Qt/Python callback before Py_Finalize.
 
-            Project operations are fixed ReplayLab CLI subprocesses with a
-            bounded timeout. Killing those children wakes ``communicate``;
-            QThreadPool's bounded wait then gives each Python QRunnable a
-            finite chance to finish and release its reference to this QObject.
+            Project operations are bounded requests to the shared internal
+            service. The generation fence drops UI callbacks immediately;
+            QThreadPool's bounded wait gives each Python QRunnable a finite
+            chance to finish and release its reference to this QObject.
             """
             if not self._shutdown:
                 self._shutdown = True
@@ -1157,7 +1297,6 @@ if HAS_QT:
                     self.pool.clear()
                 except Exception:
                     pass
-            cancel_active_host_processes()
             try:
                 finished = self.pool.waitForDone(max(1, int(timeout_ms)))
             except TypeError:
@@ -1186,8 +1325,12 @@ if HAS_QT:
                 try:
                     token, value, error = self._results.get_nowait()
                 except queue.Empty:
+                    if len(self.registry) == 0:
+                        self._result_timer.stop()
                     return
                 self._deliver(token, value, error)
+            if len(self.registry) == 0:
+                self._result_timer.stop()
 
         def _deliver(self, token, value, error):
             record = self.registry.take(token)
@@ -1245,7 +1388,7 @@ if HAS_QT:
             self.status_label = QtWidgets.QLabel(
                 QtCore.QCoreApplication.translate(
                     TRANSLATION_CONTEXT,
-                    "Waiting for ReplayLab project recovery..."))
+                    "Scheduling ReplayLab project recovery"))
             self.status_label.setObjectName("replayLabRestoreProgressStatus")
             self.status_label.setWordWrap(True)
             root.addWidget(self.status_label)
@@ -1283,6 +1426,12 @@ if HAS_QT:
             if self._started or self._finished:
                 return False
             self._started = True
+            self.publish_progress({
+                "phase": "restore-dispatch",
+                "message": "",
+                "current": 0,
+                "total": 0,
+            })
 
             def _restore():
                 return self.restore_capture(
@@ -1324,7 +1473,13 @@ if HAS_QT:
             self._finished = True
             self._progress_timer.stop()
             restore_error = _restore_result_error(value, error)
-            if restore_error:
+            if _restore_action_required(value) and not error:
+                self.progress_bar.setRange(0, 1)
+                self.progress_bar.setValue(0)
+                self.status_label.setText(QtCore.QCoreApplication.translate(
+                    TRANSLATION_CONTEXT,
+                    "Project restore skipped because the full Shader index is unavailable"))
+            elif restore_error:
                 self.progress_bar.setRange(0, 1)
                 self.progress_bar.setValue(0)
                 self.status_label.setText(QtCore.QCoreApplication.translate(

@@ -1,8 +1,9 @@
-"""ReplayLab MCP discovery and per-skill tool filtering.
+"""ReplayLab MCP discovery and per-skill filtering for ACP/external Agents.
 
-The model-facing contract stays in the existing ReplayLabMCP host.  This
-module deliberately exposes only the small allow-list declared by the active
-skill instead of handing every RenderDoc operation to the model.
+Model API and Codex dynamicTools turns execute the same contracts through the
+in-process InternalToolService. ACP v1 has no equivalent Host callback, so this
+module gives that provider exactly one task-filtered ReplayLabMCP adapter instead
+of handing it every RenderDoc operation.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from typing import Any, Literal
 
 from .errors import ConfigurationError, LifecycleCleanupError, PolicyError
 from .events import TaskEventWriter
-from .policy import ToolCallScope
+from .policy import ToolCallScope, WorkflowGuard
 from .process_env import host_process_environment
 
 
@@ -146,6 +147,7 @@ def build_mcp_toolset(
     audit: ToolAudit | None = None,
     plan_task_id: str = "",
     skill_name: str = "",
+    workflow_guard: WorkflowGuard | None = None,
 ) -> Any:
     """Build a lazy stdio MCP toolset filtered to one skill's grants."""
 
@@ -184,6 +186,8 @@ def build_mcp_toolset(
             raise PolicyError(f"tool '{name}' is outside the active skill grant")
         if scope is not None:
             scope.validate(name, tool_args)
+        if workflow_guard is not None:
+            workflow_guard.check(name, tool_args)
         if audit is not None:
             audit.started.append(name)
         tool_call_id = str(getattr(ctx, "tool_call_id", "") or "")[:256]
@@ -216,7 +220,11 @@ def build_mcp_toolset(
                 )
             if scope is not None:
                 await verify_live_tool_scope(call_tool, scope)
+            if workflow_guard is not None:
+                workflow_guard.record_result(name, tool_args, result)
         except Exception as exc:
+            if workflow_guard is not None and not isinstance(exc, PolicyError):
+                workflow_guard.record_failure(name)
             if audit is not None:
                 audit.failed.append(name)
                 audit.evidence.append(

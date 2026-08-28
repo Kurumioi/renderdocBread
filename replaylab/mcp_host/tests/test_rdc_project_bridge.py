@@ -70,9 +70,29 @@ class _Pipeline:
 
 
 class _Controller:
-    def __init__(self, raw):
+    def __init__(self, raw, *, api="D3D11", encoding="DXBC", blocks=None):
         self.raw = raw
+        self.api = api
+        self.encoding = encoding
         self.events = []
+        self.entry = types.SimpleNamespace(name="main", stage="fragment")
+        self.resource = types.SimpleNamespace(type="shader", resourceId=7)
+        self.resources = [self.resource]
+        self.reflection = types.SimpleNamespace(
+            entryPoint="main",
+            stage="fragment",
+            encoding=encoding,
+            rawBytes=self.raw,
+            inputSignature=[],
+            outputSignature=[],
+            readOnlyResources=[],
+            readWriteResources=[],
+            samplers=[],
+            constantBlocks=list(blocks or []),
+            interfaces=[],
+            outputTopology="",
+            dispatchThreadsDimension=[],
+        )
 
     def SetFrameEvent(self, event_id, force):
         self.events.append((event_id, force))
@@ -81,14 +101,33 @@ class _Controller:
     def GetPipelineState():
         return _Pipeline(7)
 
-    @staticmethod
-    def GetShaderEntryPoints(unused_resource):
+    def GetAPIProperties(self):
+        return types.SimpleNamespace(pipelineType=self.api)
+
+    def GetResources(self):
+        return list(self.resources)
+
+    def GetShaderEntryPoints(self, unused_resource):
         del unused_resource
-        return [types.SimpleNamespace(name="main")]
+        return [self.entry]
 
     def GetShader(self, unused_pipeline, unused_resource, unused_entry):
         del unused_pipeline, unused_resource, unused_entry
-        return types.SimpleNamespace(entryPoint="main", rawBytes=self.raw)
+        return self.reflection
+
+
+def _constant_block(name="PerMaterial", bind=0, space=0, byte_size=16):
+    return types.SimpleNamespace(
+        name=name,
+        fixedBindNumber=bind,
+        fixedBindSetOrSpace=space,
+        bindArraySize=1,
+        byteSize=byte_size,
+        bufferBacked=True,
+        inlineDataBytes=False,
+        compileConstants=False,
+        variables=[],
+    )
 
 
 class _Replay:
@@ -103,6 +142,9 @@ class _Replay:
         return self.access
 
     def BlockInvoke(self, callback):
+        callback(self.controller)
+
+    def AsyncInvoke(self, callback):
         callback(self.controller)
 
 
@@ -134,6 +176,8 @@ def _load_bridge():
         ZstdCompressed="zstd"
     )
     fake_renderdoc.ShaderStage = types.SimpleNamespace(Fragment="fragment")
+    fake_renderdoc.ResourceType = types.SimpleNamespace(Shader="shader")
+    fake_renderdoc.ResourceId = lambda: 0
     previous_renderdoc = sys.modules.get("renderdoc")
     previous_qrenderdoc = sys.modules.pop("qrenderdoc", None)
     sys.modules["renderdoc"] = fake_renderdoc
@@ -165,16 +209,75 @@ class ReplayLabRdcProjectBridgeTests(unittest.TestCase):
         self.capture_path = Path(self.temporary.name) / "frame.rdc"
         self.capture_path.write_bytes(b"capture")
         self.access = _CaptureAccess()
-        self.controller = _Controller(b"captured-shader")
+        self.controller = _Controller(
+            b"captured-shader", blocks=[_constant_block()]
+        )
         replay = _Replay(self.access, self.controller)
         self.bridge._ctx = _Context(self.capture_path, replay)
         self.bridge._capture_session_id = "1" * 32
         self.bridge._known_catalog_capture_ids = {}
         self.bridge._known_catalog_identity_pairs = set()
+        with self.bridge._project_shader_index_jobs_guard:
+            self.bridge._project_shader_index_jobs.clear()
 
     def tearDown(self):
+        with self.bridge._project_shader_index_jobs_guard:
+            self.bridge._project_shader_index_jobs.clear()
         self.bridge._ctx = None
         self.temporary.cleanup()
+
+    def _expected_shader(self):
+        reflection = self.controller.reflection
+        compiled = self.bridge._compiled_shader_interface(reflection)
+        compiled["stage"] = self.bridge._normalise_stage_name(reflection.stage)
+        compiled["entryPoint"] = reflection.entryPoint
+        compiled["encoding"] = self.bridge._project_shader_index_encoding(
+            reflection.encoding
+        )
+        interface_sha, layout_sha = self.bridge._project_symbol_hashes(compiled)
+        blocks = [
+            self.bridge._project_shader_index_block(
+                block, index, compiled["stage"]
+            )
+            for index, block in enumerate(reflection.constantBlocks)
+        ]
+        return {
+            "resourceId": 7,
+            "stage": compiled["stage"],
+            "entryPoint": reflection.entryPoint,
+            "encoding": compiled["encoding"],
+            "rawSha256": hashlib.sha256(reflection.rawBytes).hexdigest(),
+            "interfaceHash": interface_sha,
+            "layoutHash": layout_sha,
+            "interfaceComplete": bool(compiled["interfaceComplete"]),
+            "constantBlocks": blocks,
+            "anchorEventId": 10,
+        }
+
+    def _index_request(self, shader=None):
+        return {
+            "expected_capture_path": str(self.capture_path),
+            "expected_capture_session_id": "1" * 32,
+            "expected_capture_id": "2" * 64,
+            "expected_identity_evidence_sha256": "3" * 64,
+            "expected_api": self.controller.api,
+            "expected_shaders": [shader or self._expected_shader()],
+        }
+
+    def _begin(self, shader=None):
+        return self.bridge._begin_rdc_project_shader_resource_index(
+            self._index_request(shader)
+        )
+
+    def _commit(self, snapshot):
+        return self.bridge._commit_rdc_project_shader_resource_index({
+            "expected_capture_path": str(self.capture_path),
+            "expected_capture_session_id": "1" * 32,
+            "job_id": snapshot["jobId"],
+            "expected_capture_id": "2" * 64,
+            "expected_identity_evidence_sha256": "3" * 64,
+            "live_identity_sha256": snapshot["result"]["liveIdentitySha256"],
+        })
 
     def test_named_unknown_section_round_trips_exact_sealed_document(self):
         missing = self.bridge._read_rdc_project_index({
@@ -222,44 +325,238 @@ class ReplayLabRdcProjectBridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "strict UTF-8 JSON"):
             self.bridge._read_rdc_project_index({})
 
-    def test_cached_shader_binding_uses_targeted_live_raw_anchor_only(self):
-        raw_sha = hashlib.sha256(b"captured-shader").hexdigest()
-        capture_id = "2" * 64
-        evidence = "3" * 64
-        result = self.bridge._bind_rdc_project_shader_catalog({
-            "expected_capture_path": str(self.capture_path),
-            "expected_capture_session_id": "1" * 32,
-            "expected_capture_id": capture_id,
-            "expected_identity_evidence_sha256": evidence,
-            "anchors": [{
-                "eventId": 10,
-                "stage": "fragment",
-                "resourceId": 7,
-                "entryPoint": "main",
-                "rawSha256": raw_sha,
-            }],
-        })
+    def test_resource_index_matches_complete_content_and_never_sets_event(self):
+        snapshot = self._begin()
+
+        self.assertEqual(snapshot["status"], "completed")
+        result = snapshot["result"]
+        self.assertTrue(result["matched"])
+        self.assertEqual(result["eventTraversalCount"], 0)
         self.assertFalse(result["fullFrameTraversal"])
         self.assertFalse(result["physicalApplyAuthority"])
-        self.assertEqual([(10, True), (5, True)], self.controller.events)
-        self.assertIn((capture_id, evidence),
-                      self.bridge._known_catalog_identity_pairs)
+        self.assertEqual(result["resourceOwnershipScope"], "target-capture-session")
+        self.assertFalse(result["crossCaptureResourceIdReuse"])
+        self.assertEqual(self.controller.events, [])
+        asset = result["assets"][0]
+        self.assertEqual(asset["ownerResourceId"], 7)
+        self.assertEqual(asset["ownerCaptureSessionId"], "1" * 32)
+        self.assertTrue(asset["physicalAbiValidated"])
+        self.assertTrue(asset["constantBlocksMatched"])
+        self.assertEqual(asset["constantBlocks"], self._expected_shader()["constantBlocks"])
 
-    def test_changed_live_shader_does_not_publish_cached_catalog_identity(self):
-        with self.assertRaisesRegex(RuntimeError, "physical bytecode"):
-            self.bridge._bind_rdc_project_shader_catalog({
-                "expected_capture_session_id": "1" * 32,
-                "expected_capture_id": "4" * 64,
-                "expected_identity_evidence_sha256": "5" * 64,
-                "anchors": [{
-                    "eventId": 10,
-                    "stage": "fragment",
-                    "resourceId": 7,
-                    "entryPoint": "main",
-                    "rawSha256": hashlib.sha256(b"old-shader").hexdigest(),
-                }],
-            })
+        lease = self._commit(snapshot)
+        self.assertTrue(lease["committed"])
+        self.assertFalse(lease["physicalApplyAuthority"])
+        self.assertIn(
+            ("2" * 64, "3" * 64), self.bridge._known_catalog_identity_pairs
+        )
+        self.assertEqual(self.controller.events, [])
+
+    def test_begin_and_commit_are_idempotent(self):
+        first = self._begin()
+        second = self._begin()
+        self.assertEqual(first["jobId"], second["jobId"])
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(second["idempotent"])
+
+        first_lease = self._commit(first)
+        second_lease = self._commit(first)
+        self.assertFalse(first_lease["idempotent"])
+        self.assertTrue(second_lease["idempotent"])
+        self.assertEqual(self.controller.events, [])
+
+    def test_forged_hash_and_extra_or_missing_blocks_fail_closed(self):
+        variants = []
+        forged = self._expected_shader()
+        forged["interfaceHash"] = "4" * 64
+        variants.append(forged)
+
+        missing = self._expected_shader()
+        missing["constantBlocks"] = []
+        variants.append(missing)
+
+        extra = self._expected_shader()
+        duplicate = dict(extra["constantBlocks"][0])
+        duplicate.update({"index": 1, "path": "Unexpected", "bind": 1})
+        extra["constantBlocks"] = [extra["constantBlocks"][0], duplicate]
+        variants.append(extra)
+
+        for shader in variants:
+            with self.subTest(shader=shader):
+                with self.bridge._project_shader_index_jobs_guard:
+                    self.bridge._project_shader_index_jobs.clear()
+                snapshot = self._begin(shader)
+                self.assertEqual(snapshot["status"], "completed")
+                self.assertFalse(snapshot["result"]["matched"])
+                self.assertEqual(
+                    snapshot["result"]["reasonId"],
+                    "shader-resource-index-mismatch",
+                )
+                self.assertEqual(self.controller.events, [])
         self.assertEqual(set(), self.bridge._known_catalog_identity_pairs)
+
+    def test_glsl_is_a_supported_content_addressed_format(self):
+        self.controller.api = "OpenGL"
+        self.controller.encoding = "GLSL"
+        self.controller.reflection.encoding = "GLSL"
+
+        snapshot = self._begin()
+
+        self.assertTrue(snapshot["result"]["matched"])
+        self.assertEqual(snapshot["result"]["assets"][0]["encoding"], "glsl")
+        self.assertEqual(self.controller.events, [])
+
+    def test_vulkan_null_pipeline_proves_module_only_and_requires_preflight(self):
+        self.controller.api = "Vulkan"
+        self.controller.encoding = "SPIRV"
+        self.controller.reflection.encoding = "SPIRV"
+
+        snapshot = self._begin()
+
+        self.assertTrue(snapshot["result"]["matched"])
+        asset = snapshot["result"]["assets"][0]
+        self.assertEqual(
+            asset["contentMatchMode"],
+            "module-sha256-owner-rid-anchor-preflight",
+        )
+        self.assertFalse(asset["physicalAbiValidated"])
+        self.assertEqual(asset["physicalAbiSha256"], "")
+        self.assertTrue(asset["requiresAnchorPreflight"])
+        self.assertFalse(snapshot["result"]["physicalApplyAuthority"])
+        self.assertEqual(self.controller.events, [])
+
+    def test_same_content_under_another_rid_never_inherits_owner_authority(self):
+        expected = self._expected_shader()
+        expected["resourceId"] = 8
+        self.controller.resources = [
+            self.controller.resource,
+            types.SimpleNamespace(type="shader", resourceId=8),
+        ]
+
+        snapshot = self._begin(expected)
+
+        # The fake controller deliberately returns the same module for both RIDs;
+        # the result must still retain exactly the requested target-RDC owner.
+        self.assertTrue(snapshot["result"]["matched"])
+        asset = snapshot["result"]["assets"][0]
+        self.assertEqual(asset["resourceId"], 8)
+        self.assertEqual(asset["ownerResourceId"], 8)
+        self.assertFalse(asset["crossCaptureResourceIdReuse"])
+
+    def test_job_timeout_ttl_and_capture_change_fail_closed(self):
+        replay = self.bridge._ctx.replay
+        replay.AsyncInvoke = lambda unused_callback: None
+        queued = self._begin()
+        job = self.bridge._project_shader_index_jobs[queued["jobId"]]
+        job["createdMonotonic"] -= (
+            self.bridge.PROJECT_SHADER_INDEX_JOB_TIMEOUT_SECONDS + 1.0
+        )
+        timed_out = self.bridge._poll_rdc_project_shader_resource_index({
+            "expected_capture_path": str(self.capture_path),
+            "expected_capture_session_id": "1" * 32,
+            "job_id": queued["jobId"],
+        })
+        self.assertEqual(timed_out["status"], "failed")
+        self.assertIn("timed out", timed_out["error"])
+
+        job["updatedMonotonic"] -= (
+            self.bridge.PROJECT_SHADER_INDEX_JOB_TTL_SECONDS + 1.0
+        )
+        with self.assertRaisesRegex(ValueError, "Unknown or expired"):
+            self.bridge._poll_rdc_project_shader_resource_index({
+                "expected_capture_path": str(self.capture_path),
+                "expected_capture_session_id": "1" * 32,
+                "job_id": queued["jobId"],
+            })
+
+        with self.bridge._project_shader_index_jobs_guard:
+            self.bridge._project_shader_index_jobs.clear()
+        replay.AsyncInvoke = lambda callback: callback(self.controller)
+        completed = self._begin()
+        self.bridge._capture_session_id = "6" * 32
+        with self.assertRaisesRegex(RuntimeError, "capture session changed"):
+            self._commit(completed)
+
+    def test_request_and_reflection_budgets_fail_before_event_traversal(self):
+        expected = self._expected_shader()
+        request = self._index_request(expected)
+        request["expected_shaders"] = [
+            dict(request["expected_shaders"][0], resourceId=index + 1)
+            for index in range(self.bridge.MAX_PROJECT_SHADER_INDEX_EXPECTED + 1)
+        ]
+        with self.assertRaisesRegex(ValueError, "between 1 and"):
+            self.bridge._begin_rdc_project_shader_resource_index(request)
+
+        leaf_type = types.SimpleNamespace(
+            name="float", baseType="float", members=[], elements=1
+        )
+        child = types.SimpleNamespace(name="leaf", byteOffset=0, type=leaf_type)
+        for depth in range(
+            self.bridge.MAX_PROJECT_SHADER_INDEX_REFLECTION_DEPTH + 2
+        ):
+            nested_type = types.SimpleNamespace(
+                name="Nested%d" % depth,
+                baseType="struct",
+                members=[child],
+                elements=1,
+            )
+            child = types.SimpleNamespace(
+                name="field%d" % depth, byteOffset=0, type=nested_type
+            )
+        self.controller.reflection.constantBlocks = [
+            types.SimpleNamespace(
+                name="Deep",
+                fixedBindNumber=0,
+                fixedBindSetOrSpace=0,
+                bindArraySize=1,
+                byteSize=16,
+                bufferBacked=True,
+                inlineDataBytes=False,
+                compileConstants=False,
+                variables=[child],
+            )
+        ]
+        deep_expected = dict(expected)
+        deep_expected["constantBlocks"] = []
+        with self.bridge._project_shader_index_jobs_guard:
+            self.bridge._project_shader_index_jobs.clear()
+        snapshot = self._begin(deep_expected)
+        self.assertFalse(snapshot["result"]["matched"])
+        self.assertEqual(
+            snapshot["result"]["reasonId"],
+            "shader-resource-index-reflection-depth-limit",
+        )
+        self.assertEqual(self.controller.events, [])
+
+        self.controller.reflection.constantBlocks = [_constant_block()]
+        signature = types.SimpleNamespace(
+            varName="value",
+            semanticName="TEXCOORD",
+            semanticIdxName="TEXCOORD0",
+            semanticIndex=0,
+            regIndex=0,
+            systemValue="",
+            varType="float",
+            compType="float",
+            compCount=4,
+            stream=0,
+            regChannelMask=15,
+            channelUsedMask=15,
+            perPrimitiveRate=False,
+            needSemanticIndex=False,
+        )
+        self.controller.reflection.inputSignature = [
+            signature
+        ] * (self.bridge.MAX_PROJECT_SHADER_INDEX_SIGNATURES + 1)
+        with self.bridge._project_shader_index_jobs_guard:
+            self.bridge._project_shader_index_jobs.clear()
+        snapshot = self._begin(expected)
+        self.assertFalse(snapshot["result"]["matched"])
+        self.assertEqual(
+            snapshot["result"]["reasonId"],
+            "shader-resource-index-reflection-signature-limit",
+        )
+        self.assertEqual(self.controller.events, [])
 
 
 if __name__ == "__main__":

@@ -18,10 +18,14 @@ $runtimeManifestName = "replaylab-runtime-manifest.json"
 $runtimeManifestSchema = "replaylab-runtime-output/v1"
 $deploymentMarkerName = ".replaylab-runtime-deployment.json"
 $deploymentMarkerSchema = "replaylab-runtime-deployment/v1"
-$runtimePayloadNames = @("replaylab-ai.exe", "ReplayLabMCP.exe")
-$runtimeOwnedNames = @("replaylab-ai.exe", "ReplayLabMCP.exe", $runtimeManifestName)
+$runtimePayloadNames = @(
+    "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe")
+$runtimeOwnedNames = @(
+    "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe",
+    $runtimeManifestName)
 $deploymentOwnedNames = @(
     "replaylab-ai.exe",
+    "ReplayLabInternal.exe",
     "ReplayLabMCP.exe",
     $runtimeManifestName,
     $deploymentMarkerName

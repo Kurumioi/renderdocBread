@@ -4,7 +4,7 @@
 <context>
     <name>AIAssistant</name>
     <message>
-        <location filename="../Windows/AI/AIAssistant.cpp" line="+204"/>
+        <location filename="../Windows/AI/AIAssistant.cpp" line="+258"/>
         <source>SKIPPED</source>
         <translation>已跳过</translation>
     </message>
@@ -55,12 +55,11 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+503"/>
         <source>Check</source>
         <translation>检查</translation>
     </message>
     <message>
-        <location line="-502"/>
+        <location line="+1"/>
         <source>Detail</source>
         <translation>详细信息</translation>
     </message>
@@ -150,7 +149,7 @@
         <translation>复制全部详细信息</translation>
     </message>
     <message>
-        <location line="+117"/>
+        <location line="+123"/>
         <source>OpenAI API</source>
         <comment>provider.openai.title</comment>
         <translation>OpenAI API</translation>
@@ -277,48 +276,13 @@
     </message>
     <message>
         <location line="+3"/>
+        <location line="+2547"/>
         <source>Codex / ChatGPT subscription</source>
         <comment>provider.codex.title</comment>
         <translation>Codex / ChatGPT 订阅</translation>
     </message>
     <message>
-        <location line="+2"/>
-        <source>GitHub Copilot CLI (ACP)</source>
-        <comment>provider.copilot-acp.title</comment>
-        <translation>GitHub Copilot CLI（ACP）</translation>
-    </message>
-    <message>
-        <location line="+3"/>
-        <source>Gemini CLI (ACP)</source>
-        <comment>provider.gemini-acp.title</comment>
-        <translation>Gemini CLI（ACP）</translation>
-    </message>
-    <message>
-        <location line="+2"/>
-        <source>Qwen Code / Coding Plan (ACP)</source>
-        <comment>provider.qwen-acp.title</comment>
-        <translation>Qwen Code / Coding Plan（ACP）</translation>
-    </message>
-    <message>
-        <location line="+3"/>
-        <source>Kimi CLI (ACP)</source>
-        <comment>provider.kimi-acp.title</comment>
-        <translation>Kimi CLI（ACP）</translation>
-    </message>
-    <message>
-        <location line="+2"/>
-        <source>Custom ACP agent</source>
-        <comment>provider.custom-acp.title</comment>
-        <translation>自定义 ACP 智能体</translation>
-    </message>
-    <message>
-        <location line="+3"/>
-        <source>Claude API is supported here. Claude Code does not publish an ACP server mode, so subscription access is not presented as ACP. A future dedicated CLI connector must also follow Anthropic&apos;s third-party authentication terms.</source>
-        <comment>provider.anthropic.note</comment>
-        <translation>此处支持 Claude API。Claude Code 未提供 ACP 服务器模式，因此不会将订阅访问作为 ACP 提供。未来若实现专用 CLI 连接器，也必须遵守 Anthropic 的第三方身份验证条款。</translation>
-    </message>
-    <message>
-        <location line="+7"/>
+        <location line="-2544"/>
         <source>The profile model is the Azure deployment name. Legacy endpoints require api_version; Azure v1/Foundry endpoints must omit it.</source>
         <comment>provider.azure-openai.note</comment>
         <translation>连接配置中的模型值是 Azure 部署名称。旧版端点需要 api_version；Azure v1/Foundry 端点必须省略该参数。</translation>
@@ -355,72 +319,44 @@
     </message>
     <message>
         <location line="+5"/>
-        <source>Uses the official `copilot login --web-flow/--device-code` command, then tests `copilot --acp`. The ACP handshake may expose model choices; otherwise leave the model blank to use Copilot&apos;s default or enter an exact supported model manually.</source>
-        <comment>provider.copilot-acp.note</comment>
-        <translation>先运行官方 `copilot login --web-flow/--device-code` 命令，再测试 `copilot --acp`。ACP 握手可能会提供模型选项；否则请将模型留空以使用 Copilot 的默认模型，或手动输入确切的受支持模型。</translation>
-    </message>
-    <message>
-        <location line="+7"/>
-        <source>Gemini authenticates interactively before ReplayLab starts `gemini --acp`. Model choices are used only when the ACP session exposes them; otherwise use the provider default or enter an exact model supported by your installed CLI.</source>
-        <comment>provider.gemini-acp.note</comment>
-        <translation>在 ReplayLab 启动 `gemini --acp` 前，Gemini 会进行交互式身份验证。仅当 ACP 会话提供模型选项时才会使用这些选项；否则请使用提供商默认模型，或输入已安装 CLI 支持的确切模型。</translation>
-    </message>
-    <message>
-        <location line="+7"/>
-        <source>Qwen OAuth was discontinued on 2026-04-15. This wizard opens `qwen` for the current /auth Coding Plan/API-provider setup, then tests `qwen --acp`. ACP model choices are used when exposed; otherwise use the configured default or enter an exact model.</source>
-        <comment>provider.qwen-acp.note</comment>
-        <translation>Qwen OAuth 已于 2026-04-15 停用。此向导会打开 `qwen`，通过当前的 /auth 流程配置 Coding Plan/API 提供商，然后测试 `qwen --acp`。如果 ACP 提供模型选项，则使用这些选项；否则使用已配置的默认模型，或输入确切的模型名称。</translation>
-    </message>
-    <message>
-        <location line="+7"/>
-        <source>Uses the official RFC 8628 `kimi login` device-code flow, then tests `kimi acp`. ReplayLab imports model choices exposed by the ACP session; if none are exposed, leave the model blank for Kimi&apos;s default or enter a configured model alias.</source>
-        <comment>provider.kimi-acp.note</comment>
-        <translation>使用官方 RFC 8628 `kimi login` 设备代码流程，然后测试 `kimi acp`。ReplayLab 会导入 ACP 会话提供的模型选项；如果未提供任何选项，请将模型留空以使用 Kimi 的默认模型，或输入已配置的模型别名。</translation>
-    </message>
-    <message>
-        <location line="+8"/>
         <source>Install the official Codex CLI: https://developers.openai.com/codex/cli/</source>
         <comment>provider.codex.install_hint</comment>
         <translation>安装官方 Codex CLI：https://developers.openai.com/codex/cli/</translation>
     </message>
     <message>
-        <location line="+5"/>
-        <source>GitHub Copilot CLI was not found. Install it with `winget install GitHub.Copilot` or `npm install -g @github/copilot`, then restart qrenderdoc. Official guide: https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli</source>
-        <comment>provider.copilot-acp.install_hint</comment>
-        <translation>未找到 GitHub Copilot CLI。请使用 `winget install GitHub.Copilot` 或 `npm install -g @github/copilot` 安装，然后重启 qrenderdoc。官方指南：https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli</translation>
+        <location line="+14"/>
+        <source>Required provider CLI was not found: %1
+%2</source>
+        <comment>subscription.cli-missing</comment>
+        <translation>未找到所需的提供方 CLI：%1
+%2</translation>
+    </message>
+    <message>
+        <location line="+3"/>
+        <source>Waiting for qrenderdoc process containment before starting the provider.</source>
+        <comment>subscription.waiting-for-containment</comment>
+        <translation>正在等待 qrenderdoc 完成进程隔离，然后启动提供商。</translation>
+    </message>
+    <message>
+        <location line="+4"/>
+        <source>Provider sign-in started inside the qrenderdoc process job.</source>
+        <comment>subscription.sign-in-started</comment>
+        <translation>已在 qrenderdoc 进程作业中开始提供商登录。</translation>
+    </message>
+    <message>
+        <location line="+4"/>
+        <source>Running a bounded no-generation provider connection test.</source>
+        <comment>subscription.test-started</comment>
+        <translation>正在运行有时限且不生成内容的提供商连接测试。</translation>
     </message>
     <message>
         <location line="+8"/>
-        <source>Gemini CLI was not found. Install it with `npm install -g @google/gemini-cli`, then restart qrenderdoc. Official guide: https://github.com/google-gemini/gemini-cli/blob/main/docs/get-started/installation.mdx</source>
-        <comment>provider.gemini-acp.install_hint</comment>
-        <translation>未找到 Gemini CLI。请使用 `npm install -g @google/gemini-cli` 安装，然后重启 qrenderdoc。官方指南：https://github.com/google-gemini/gemini-cli/blob/main/docs/get-started/installation.mdx</translation>
+        <source>Complete provider authorization in the browser.</source>
+        <comment>subscription.browser-complete</comment>
+        <translation>请在浏览器中完成提供商授权。</translation>
     </message>
     <message>
-        <location line="+7"/>
-        <source>Qwen Code was not found. Install it with `npm install -g @qwen-code/qwen-code@latest` (or the official Windows installer), then restart qrenderdoc. Official guide: https://qwenlm.github.io/qwen-code-docs/en/users/quickstart/</source>
-        <comment>provider.qwen-acp.install_hint</comment>
-        <translation>未找到 Qwen Code。请使用 `npm install -g @qwen-code/qwen-code@latest` 安装（或使用官方 Windows 安装程序），然后重启 qrenderdoc。官方指南：https://qwenlm.github.io/qwen-code-docs/en/users/quickstart/</translation>
-    </message>
-    <message>
-        <location line="+8"/>
-        <source>Kimi Code CLI was not found. Install it with the official Windows script or `npm install -g @moonshot-ai/kimi-code`, then restart qrenderdoc. Official guide: https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started.html</source>
-        <comment>provider.kimi-acp.install_hint</comment>
-        <translation>未找到 Kimi Code CLI。请使用官方 Windows 脚本或 `npm install -g @moonshot-ai/kimi-code` 安装，然后重启 qrenderdoc。官方指南：https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started.html</translation>
-    </message>
-    <message>
-        <location line="+8"/>
-        <source>Choose Sign in with Google in the Gemini terminal, complete the browser flow, then exit the terminal after authentication succeeds.</source>
-        <comment>provider.gemini-acp.subscription_instruction</comment>
-        <translation>在 Gemini 终端中选择 Sign in with Google，完成浏览器流程，并在身份验证成功后退出终端。</translation>
-    </message>
-    <message>
-        <location line="+6"/>
-        <source>Type /auth in the Qwen terminal, configure Alibaba ModelStudio Coding Plan or an API provider, then exit after /doctor reports a usable configuration.</source>
-        <comment>provider.qwen-acp.subscription_instruction</comment>
-        <translation>在 Qwen 终端中输入 /auth，配置 Alibaba ModelStudio Coding Plan 或 API 提供商，然后在 /doctor 报告配置可用后退出。</translation>
-    </message>
-    <message>
-        <location line="+65"/>
+        <location line="+170"/>
         <source>RenderDoc AI</source>
         <translation>RenderDoc AI</translation>
     </message>
@@ -432,28 +368,23 @@
     <message>
         <location filename="../Windows/AI/AIAssistant.cpp" line="+33"/>
         <location line="+1"/>
-        <location line="+263"/>
+        <location line="+291"/>
         <location line="+161"/>
         <location line="+43"/>
-        <location line="+497"/>
-        <location line="+2989"/>
-        <location line="+330"/>
+        <location line="+880"/>
+        <location line="+2658"/>
+        <location line="+402"/>
         <location line="+41"/>
         <source>New conversation</source>
         <translation>新建对话</translation>
     </message>
     <message>
-        <location line="-4318"/>
+        <location line="-4470"/>
         <source>Starting...</source>
         <translation>正在启动…</translation>
     </message>
     <message>
-        <location line="+4"/>
-        <source>AI Settings...</source>
-        <translation>AI 设置…</translation>
-    </message>
-    <message>
-        <location line="+11"/>
+        <location line="+18"/>
         <source>Explain Event</source>
         <translation>解释事件</translation>
     </message>
@@ -473,7 +404,13 @@
         <translation>性能</translation>
     </message>
     <message>
-        <location line="+45"/>
+        <location line="+62"/>
+        <location line="+840"/>
+        <source>Continue</source>
+        <translation>继续</translation>
+    </message>
+    <message>
+        <location line="-827"/>
         <source>Ask RenderDoc AI... (Enter sends; Shift+Enter inserts a new line)</source>
         <translation>询问 RenderDoc AI…（Enter 发送；Shift+Enter 插入新行）</translation>
     </message>
@@ -489,12 +426,12 @@
     </message>
     <message>
         <location line="+7"/>
-        <location line="+588"/>
+        <location line="+943"/>
         <source>Stop the active chat request.</source>
         <translation>停止当前聊天请求。</translation>
     </message>
     <message>
-        <location line="-587"/>
+        <location line="-942"/>
         <source>Stop</source>
         <translation>停止</translation>
     </message>
@@ -505,22 +442,22 @@
         <translation>发送</translation>
     </message>
     <message>
-        <location line="+32"/>
+        <location line="+30"/>
         <source>Explain current event</source>
         <translation>解释当前事件</translation>
     </message>
     <message>
-        <location line="+4"/>
+        <location line="+6"/>
         <source>Inspect picked pixel</source>
         <translation>检查选取的像素</translation>
     </message>
     <message>
-        <location line="+5"/>
+        <location line="+9"/>
         <source>Diagnose the current frame&apos;s GPU performance using capture evidence.</source>
         <translation>使用捕获证据诊断当前帧的 GPU 性能。</translation>
     </message>
     <message>
-        <location line="+56"/>
+        <location line="+48"/>
         <source>AI host not found. Set REPLAYLAB_AI_CLI or install the bundled ReplayLab host.</source>
         <translation>找不到 AI 主机。请设置 REPLAYLAB_AI_CLI，或安装捆绑的 ReplayLab 主机。</translation>
     </message>
@@ -530,7 +467,7 @@
         <translation>RenderDoc AI 已嵌入此处。提供商进程仍与回放进程隔离。</translation>
     </message>
     <message>
-        <location line="+260"/>
+        <location line="+259"/>
         <source>This capture already has %1 conversations. Delete one before creating another.</source>
         <translation>此捕获已有 %1 个对话。请先删除一个再新建。</translation>
     </message>
@@ -550,13 +487,52 @@
         <translation>删除此对话及其存储的上下文？</translation>
     </message>
     <message>
-        <location line="+160"/>
-        <location line="+4068"/>
+        <location line="+373"/>
+        <location line="+2"/>
+        <source>Other</source>
+        <translation>其他</translation>
+    </message>
+    <message>
+        <location line="-1"/>
+        <location line="+2"/>
+        <source>Enter a different answer.</source>
+        <translation>输入其他答案。</translation>
+    </message>
+    <message>
+        <location line="+8"/>
+        <source>Enter another answer</source>
+        <translation>输入其他答案</translation>
+    </message>
+    <message>
+        <location line="+25"/>
+        <source>Confirm</source>
+        <translation>确认</translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>Submit</source>
+        <translation>提交</translation>
+    </message>
+    <message>
+        <location line="+61"/>
+        <source>My choice: %1</source>
+        <translation>我的选择：%1</translation>
+    </message>
+    <message>
+        <location line="+11"/>
+        <source>My choices:
+%1</source>
+        <translation>我的选择：
+%1</translation>
+    </message>
+    <message>
+        <location line="+37"/>
+        <location line="+3855"/>
         <source>Running</source>
         <translation>正在运行</translation>
     </message>
     <message>
-        <location line="-4063"/>
+        <location line="-3850"/>
         <source>%1 capture action(s) running</source>
         <translation>正在运行 %1 个捕获操作</translation>
     </message>
@@ -566,7 +542,7 @@
         <translation>%1 个已排队</translation>
     </message>
     <message>
-        <location line="+25"/>
+        <location line="+26"/>
         <source>The link is not an allowed RenderDoc navigation target.</source>
         <translation>该链接不是允许的 RenderDoc 导航目标。</translation>
     </message>
@@ -581,12 +557,12 @@
         <translation>RenderDoc 链接目标无效。</translation>
     </message>
     <message>
-        <location line="+84"/>
+        <location line="+98"/>
         <source>Conversation</source>
         <translation>对话</translation>
     </message>
     <message>
-        <location line="+63"/>
+        <location line="+71"/>
         <source>Interrupted when the capture closed</source>
         <translation>捕获关闭时已中断</translation>
     </message>
@@ -631,30 +607,25 @@
         <translation>未加载捕获 | 可使用常规聊天</translation>
     </message>
     <message>
-        <location line="+9"/>
-        <location line="+24"/>
-        <location line="+2754"/>
-        <location line="+141"/>
+        <location line="+8"/>
+        <location line="+2420"/>
+        <location line="+163"/>
+        <location line="+18"/>
         <source>This action requires an open capture.</source>
         <translation>此操作需要打开一个捕获。</translation>
     </message>
     <message>
-        <location line="-2911"/>
-        <source>The built-in RenderDoc AI action could not be queued.</source>
-        <translation>无法将内置 RenderDoc AI 操作加入队列。</translation>
-    </message>
-    <message>
-        <location line="+25"/>
+        <location line="-2592"/>
         <source>No stage-scoped shader AI actions are available for this capture.</source>
         <translation>此捕获没有可用的面向特定着色器阶段的 AI 操作。</translation>
     </message>
     <message>
-        <location line="+13"/>
+        <location line="+12"/>
         <source>Reverse/Edit selected shader with AI</source>
         <translation>使用 AI 逆向/编辑所选着色器</translation>
     </message>
     <message>
-        <location line="+140"/>
+        <location line="+143"/>
         <source>The AI host did not expose a running process for containment.</source>
         <translation>AI 主机未提供可纳入隔离管控的运行中进程。</translation>
     </message>
@@ -709,8 +680,8 @@
     </message>
     <message>
         <location line="-53"/>
-        <source>Command input exceeds the 2 MiB safety limit</source>
-        <translation>命令输入超过 2 MiB 安全限制</translation>
+        <source>Command input exceeds the 16 MiB safety limit</source>
+        <translation>命令输入超过 16 MiB 安全限制</translation>
     </message>
     <message>
         <location line="+29"/>
@@ -718,7 +689,7 @@
         <translation>无法发送受保护的命令输入</translation>
     </message>
     <message>
-        <location line="+88"/>
+        <location line="+90"/>
         <source>%1 | API</source>
         <translation>%1 | API</translation>
     </message>
@@ -733,7 +704,7 @@
         <translation>未配置连接</translation>
     </message>
     <message>
-        <location line="+23"/>
+        <location line="+20"/>
         <location line="+171"/>
         <location line="+3"/>
         <source>Provider default</source>
@@ -772,12 +743,11 @@
     </message>
     <message>
         <location line="-149"/>
-        <location line="+1716"/>
         <source>Wait for active AI tasks before changing connections.</source>
         <translation>请等待当前 AI 任务结束后再更改连接。</translation>
     </message>
     <message>
-        <location line="-1696"/>
+        <location line="+20"/>
         <source>Add model APIs or Agent subscriptions here. API connections use the same RenderDoc Agent planner, Skills and evidence checks. Managed subscriptions use the same task contract around the vendor Agent. API keys can be stored securely in Windows Credential Manager or kept only for the current qrenderdoc session.</source>
         <translation>在此添加模型 APIs 或 Agent 订阅。API 连接使用相同的 RenderDoc Agent 规划器、Skills 和证据检查。托管订阅也使用相同的任务契约来约束提供商 Agent。API 密钥可以安全地存储在 Windows 凭据管理器中，也可以仅在当前 qrenderdoc 会话中保留。</translation>
     </message>
@@ -808,12 +778,12 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+1661"/>
+        <location line="+1533"/>
         <source>Run Protocol Self-Test</source>
         <translation>运行协议自检</translation>
     </message>
     <message>
-        <location line="-1650"/>
+        <location line="-1522"/>
         <source>Connection details</source>
         <translation>连接详细信息</translation>
     </message>
@@ -835,12 +805,12 @@
     </message>
     <message>
         <location line="+3"/>
-        <location line="+73"/>
+        <location line="+79"/>
         <source>Model API</source>
         <translation>模型 API</translation>
     </message>
     <message>
-        <location line="-73"/>
+        <location line="-79"/>
         <source>Agent subscription</source>
         <translation>Agent 订阅</translation>
     </message>
@@ -870,7 +840,7 @@
         <translation>无法加载 AI 提供商。</translation>
     </message>
     <message>
-        <location line="+11"/>
+        <location line="+17"/>
         <source>Edit AI Connection</source>
         <translation>编辑 AI 连接</translation>
     </message>
@@ -885,12 +855,7 @@
         <translation>例如：工作用 OpenAI 或个人 Codex</translation>
     </message>
     <message>
-        <location line="+3"/>
-        <source>Agent Subscription (ACP / app-server)</source>
-        <translation>Agent 订阅（ACP / app-server）</translation>
-    </message>
-    <message>
-        <location line="+2"/>
+        <location line="+8"/>
         <source>Make default after saving</source>
         <translation>保存后设为默认连接</translation>
     </message>
@@ -931,12 +896,12 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+146"/>
+        <location line="+138"/>
         <source>No saved credential yet. Enter a key to save it securely.</source>
         <translation>尚无已保存的凭据。输入密钥以安全保存。</translation>
     </message>
     <message>
-        <location line="-145"/>
+        <location line="-137"/>
         <source>Forget Saved Key</source>
         <translation>删除已保存的密钥</translation>
     </message>
@@ -957,12 +922,12 @@
     </message>
     <message>
         <location line="+3"/>
-        <location line="+47"/>
+        <location line="+41"/>
         <source>Provider</source>
         <translation>提供商</translation>
     </message>
     <message>
-        <location line="-46"/>
+        <location line="-40"/>
         <source>API address</source>
         <translation>API 地址</translation>
     </message>
@@ -992,12 +957,7 @@
         <translation>Vertex 位置</translation>
     </message>
     <message>
-        <location line="+10"/>
-        <source>Custom ACP only: one non-secret executable or argument per line</source>
-        <translation>仅限自定义 ACP：每行填写一个非机密的可执行文件或参数</translation>
-    </message>
-    <message>
-        <location line="+11"/>
+        <location line="+17"/>
         <source>Save this connection, then reopen it here to sign in with the provider.</source>
         <translation>保存此连接，然后在此处重新打开，以登录提供商。</translation>
     </message>
@@ -1013,34 +973,18 @@
     </message>
     <message>
         <location line="+2"/>
-        <location line="+291"/>
-        <location line="+280"/>
+        <location line="+236"/>
+        <location line="+258"/>
         <source>Connect / Sign in and Test</source>
         <translation>连接/登录并测试</translation>
     </message>
     <message>
-        <location line="-570"/>
+        <location line="-493"/>
         <source>Cancel</source>
         <translation>取消</translation>
     </message>
     <message>
-        <location line="+9"/>
-        <location line="+266"/>
-        <source>I trust this custom ACP command to run as a local process</source>
-        <translation>我信任此自定义 ACP 命令作为本地进程运行</translation>
-    </message>
-    <message>
-        <location line="-262"/>
-        <source>Agent command</source>
-        <translation>Agent 命令</translation>
-    </message>
-    <message>
-        <location line="+1"/>
-        <source>Process trust</source>
-        <translation>进程信任</translation>
-    </message>
-    <message>
-        <location line="+1"/>
+        <location line="+11"/>
         <source>Authentication</source>
         <translation>身份验证</translation>
     </message>
@@ -1052,18 +996,19 @@
     <message>
         <location line="+3"/>
         <location line="+176"/>
+        <location line="+54"/>
         <source>Fetch the provider&apos;s model list, then enable only the models you want to switch between. You can also add an exact model or deployment name manually.</source>
         <translation>获取提供商的模型列表，然后仅启用希望在其间切换的模型。也可以手动添加精确的模型名称或部署名称。</translation>
     </message>
     <message>
-        <location line="-167"/>
-        <location line="+337"/>
-        <location line="+57"/>
+        <location line="-221"/>
+        <location line="+266"/>
+        <location line="+51"/>
         <source>Fetch Models</source>
         <translation>获取模型</translation>
     </message>
     <message>
-        <location line="-392"/>
+        <location line="-315"/>
         <source>Exact model or deployment name</source>
         <translation>精确的模型名称或部署名称</translation>
     </message>
@@ -1134,34 +1079,7 @@
         <translation>保存</translation>
     </message>
     <message>
-        <location line="+67"/>
-        <source>Run the official %1 command shown above (required)</source>
-        <translation>运行上方显示的官方 %1 命令（必需）</translation>
-    </message>
-    <message>
-        <location line="+7"/>
-        <source>This checked confirmation applies only to the read-only command from ReplayLab&apos;s built-in provider catalog. You may uncheck it to prevent the CLI from running.</source>
-        <translation>此勾选确认仅适用于 ReplayLab 内置提供商目录中的只读命令。可以取消勾选，以阻止 CLI 运行。</translation>
-    </message>
-    <message>
-        <location line="+3"/>
-        <source>Custom commands are never trusted automatically. Review every argument above before checking this box.</source>
-        <translation>自定义命令绝不会自动获得信任。勾选此框前，请审查上方的每一个参数。</translation>
-    </message>
-    <message>
-        <location line="+8"/>
-        <location line="+280"/>
-        <source>Test Custom ACP</source>
-        <translation>测试自定义 ACP</translation>
-    </message>
-    <message>
-        <location line="-279"/>
-        <location line="+280"/>
-        <source>Connect and Test</source>
-        <translation>连接并测试</translation>
-    </message>
-    <message>
-        <location line="-277"/>
+        <location line="+36"/>
         <source>Start the provider&apos;s official authentication flow and then run a no-prompt connection handshake.</source>
         <translation>启动提供商的官方身份验证流程，然后执行不发送提示词的连接握手。</translation>
     </message>
@@ -1176,27 +1094,7 @@
         <translation>保存并连接</translation>
     </message>
     <message>
-        <location line="+4"/>
-        <source>ReplayLab imports model choices exposed by the provider&apos;s ACP/app-server handshake. If the Agent exposes no standard list, leave this empty to use its configured default, or add an exact model only when that CLI supports ACP model selection.</source>
-        <translation>ReplayLab 会导入提供商通过 ACP/app-server 握手公开的模型选项。如果 Agent 未公开标准列表，请将此处留空以使用其已配置的默认值；仅当相应 CLI 支持 ACP 模型选择时，才添加精确模型。</translation>
-    </message>
-    <message>
-        <location line="+7"/>
-        <source>Custom ACP has no standardized login command. ReplayLab will only test the configured initialize/session handshake. This command is saved in the profile, so never put a token or password in its arguments.</source>
-        <translation>自定义 ACP 没有标准化登录命令。ReplayLab 只会测试已配置的 initialize/session 握手。此命令会保存在配置文件中，因此绝不要在其参数中放入令牌或密码。</translation>
-    </message>
-    <message>
-        <location line="+6"/>
-        <source>ReplayLab will run the official provider login, open its safe authorization URL, show any device code, and test ACP automatically.</source>
-        <translation>ReplayLab 将运行官方提供商登录，打开其安全授权 URL，显示提供商给出的设备代码，并自动测试 ACP。</translation>
-    </message>
-    <message>
-        <location line="+5"/>
-        <source>ReplayLab will open the official provider CLI in a contained terminal, wait for its interactive sign-in to finish, and then test ACP automatically.</source>
-        <translation>ReplayLab 将在受隔离管控的终端中打开官方提供商 CLI，等待其交互式登录完成，然后自动测试 ACP。</translation>
-    </message>
-    <message>
-        <location line="+95"/>
+        <location line="+93"/>
         <source>Fetching...</source>
         <translation>正在获取…</translation>
     </message>
@@ -1231,7 +1129,7 @@
         <translation>经过验证的登录链接已在浏览器中打开。如需复制，该链接仍显示在下方。</translation>
     </message>
     <message>
-        <location line="+45"/>
+        <location line="+52"/>
         <source>The official provider CLI is not installed. Use the provider&apos;s official installation instructions, then try again.</source>
         <translation>未安装官方提供商 CLI。请按照提供商的官方安装说明操作，然后重试。</translation>
     </message>
@@ -1253,12 +1151,12 @@ Account: %1</source>
 账户：%1</translation>
     </message>
     <message>
-        <location line="+11"/>
+        <location line="+9"/>
         <source>Test Connection</source>
         <translation>测试连接</translation>
     </message>
     <message>
-        <location line="+11"/>
+        <location line="+8"/>
         <source>Authentication status unavailable</source>
         <translation>身份验证状态不可用</translation>
     </message>
@@ -1283,7 +1181,7 @@ Account: %1</source>
         <translation>提供商设置返回了过大的事件；受隔离管控的进程已停止。</translation>
     </message>
     <message>
-        <location line="+44"/>
+        <location line="+54"/>
         <source>Complete sign-in in your browser. The verified link remains available below if you need to open or copy it again.</source>
         <translation>请在浏览器中完成登录。经过验证的链接仍显示在下方，供再次打开或复制。</translation>
     </message>
@@ -1385,7 +1283,7 @@ Device code: %1</source>
         <translation>未保存模型列表</translation>
     </message>
     <message>
-        <location line="+18"/>
+        <location line="+17"/>
         <source>Close</source>
         <translation>关闭</translation>
     </message>
@@ -1405,12 +1303,12 @@ Device code: %1</source>
         <translation>正在取消连接设置…</translation>
     </message>
     <message>
-        <location line="+36"/>
+        <location line="+35"/>
         <source>Choose Set as Default on another connection to change the default.</source>
         <translation>要更改默认连接，请在另一个连接上选择“设为默认值”。</translation>
     </message>
     <message>
-        <location line="+65"/>
+        <location line="+60"/>
         <source>AI Connection</source>
         <translation>AI 连接</translation>
     </message>
@@ -1430,22 +1328,7 @@ Device code: %1</source>
         <translation>旧版 Azure 部署 URL 需要 API 版本。Azure v1/Foundry URL 不使用此字段。</translation>
     </message>
     <message>
-        <location line="+8"/>
-        <source>ACP trust required</source>
-        <translation>需要 ACP 信任</translation>
-    </message>
-    <message>
-        <location line="+2"/>
-        <source>Review every custom command argument, then explicitly check the Process trust box before this local process can run.</source>
-        <translation>请审查每一个自定义命令参数，然后明确勾选“进程信任”框，此本地进程方可运行。</translation>
-    </message>
-    <message>
-        <location line="+3"/>
-        <source>The built-in official CLI was disabled in Process trust. Check that visible box to allow this exact read-only catalog command, or cancel.</source>
-        <translation>内置官方 CLI 已在“进程信任”中被禁用。请勾选该处可见的复选框，以允许执行这条内容完全一致的只读目录查询命令；否则请取消。</translation>
-    </message>
-    <message>
-        <location line="+15"/>
+        <location line="+14"/>
         <source>AI model required</source>
         <translation>需要 AI 模型</translation>
     </message>
@@ -1465,17 +1348,7 @@ Device code: %1</source>
         <translation>请输入新选择的提供商的密钥。绝不会跨提供商重复使用凭据。</translation>
     </message>
     <message>
-        <location line="+57"/>
-        <source>Custom ACP</source>
-        <translation>自定义 ACP</translation>
-    </message>
-    <message>
-        <location line="+1"/>
-        <source>Enter the Agent executable and arguments.</source>
-        <translation>请输入 Agent 可执行文件和参数。</translation>
-    </message>
-    <message>
-        <location line="+22"/>
+        <location line="+56"/>
         <source>Could not save AI connection</source>
         <translation>无法保存 AI 连接</translation>
     </message>
@@ -1495,14 +1368,12 @@ Device code: %1</source>
         <translation>连接已保存，但无法更新 Windows 凭据管理器。请重新打开此连接后重试，或使用仅限会话的密钥。</translation>
     </message>
     <message>
-        <location line="+27"/>
-        <location line="+255"/>
-        <location line="+78"/>
+        <location line="+26"/>
         <source>Connecting...</source>
         <translation>正在连接…</translation>
     </message>
     <message>
-        <location line="-263"/>
+        <location line="+70"/>
         <source>Remove AI Connection</source>
         <translation>移除 AI 连接</translation>
     </message>
@@ -1512,19 +1383,13 @@ Device code: %1</source>
         <translation>移除 &apos;%1&apos;？其已保存的凭据和仅限会话的凭据也会一并删除。</translation>
     </message>
     <message>
-        <location line="+15"/>
-        <location line="+16"/>
+        <location line="+13"/>
         <location line="+9"/>
         <source>Remove failed</source>
         <translation>移除失败</translation>
     </message>
     <message>
-        <location line="-23"/>
-        <source>The active AI worker could not be stopped, so the connection was kept.</source>
-        <translation>无法停止当前 AI 工作进程，因此连接已保留。</translation>
-    </message>
-    <message>
-        <location line="+16"/>
+        <location line="-7"/>
         <source>The saved credential could not be removed, so the connection was kept.</source>
         <translation>无法移除已保存的凭据，因此连接已保留。</translation>
     </message>
@@ -1535,12 +1400,12 @@ Device code: %1</source>
     </message>
     <message>
         <location line="+17"/>
-        <location line="+52"/>
+        <location line="+47"/>
         <source>AI Connection Check</source>
         <translation>AI 连接检查</translation>
     </message>
     <message>
-        <location line="-48"/>
+        <location line="-43"/>
         <source>Running Self-Test...</source>
         <translation>正在运行自检…</translation>
     </message>
@@ -1550,112 +1415,195 @@ Device code: %1</source>
         <translation>AI 协议自检</translation>
     </message>
     <message>
-        <location line="+32"/>
-        <location line="+469"/>
+        <location line="+27"/>
+        <location line="+267"/>
         <source>Add or select an AI connection first.</source>
         <translation>请先添加或选择 AI 连接。</translation>
     </message>
     <message>
-        <location line="-451"/>
-        <location line="+172"/>
-        <source>Disconnecting...</source>
-        <translation>正在断开连接…</translation>
-    </message>
-    <message>
-        <location line="-164"/>
+        <location line="-248"/>
         <source>Host missing</source>
         <translation>找不到主机</translation>
     </message>
     <message>
-        <location line="+7"/>
-        <source>No connection</source>
-        <translation>无连接</translation>
-    </message>
-    <message>
-        <location line="+2"/>
-        <location line="+1479"/>
+        <location line="+6"/>
+        <location line="+1424"/>
         <source>Chat ready</source>
         <translation>聊天就绪</translation>
     </message>
     <message>
-        <location line="-1472"/>
+        <location line="-1426"/>
         <source>Waiting for bridge</source>
         <translation>正在等待桥接</translation>
     </message>
     <message>
-        <location line="+14"/>
+        <location line="-2"/>
         <source>Add connection</source>
         <translation>添加连接</translation>
     </message>
     <message>
-        <location line="+11"/>
-        <location line="+49"/>
-        <location line="+1398"/>
+        <location line="+1428"/>
         <source>Connected</source>
         <translation>已连接</translation>
     </message>
     <message>
-        <location line="-1417"/>
-        <source>Containment failed</source>
-        <translation>隔离管控失败</translation>
+        <location line="-1220"/>
+        <location line="+220"/>
+        <location line="+41"/>
+        <source>The current RenderDoc state could not be frozen for this AI request.</source>
+        <translation>无法为此 AI 请求冻结当前 RenderDoc 状态。</translation>
     </message>
     <message>
-        <location line="+7"/>
-        <source>Could not release the contained AI worker start gate.</source>
-        <translation>无法放行受隔离管控的 AI 工作进程启动。</translation>
-    </message>
-    <message>
-        <location line="+122"/>
-        <source>The active AI process tree did not stop within the bounded shutdown window. The connection was not removed; close its running task and try again.</source>
-        <translation>当前 AI 进程树未能在限定的关闭时间窗口内停止。连接未被移除；请关闭其正在运行的任务，然后重试。</translation>
-    </message>
-    <message>
-        <location line="+57"/>
-        <source>Worker stopped</source>
-        <translation>工作进程已停止</translation>
-    </message>
-    <message>
-        <location line="+11"/>
-        <source>The AI worker stopped before reporting a terminal result. Retry the task.</source>
-        <translation>AI 工作进程在报告最终结果前停止。请重试该任务。</translation>
-    </message>
-    <message>
-        <location line="+7"/>
-        <source>Reconnecting...</source>
-        <translation>正在重新连接…</translation>
-    </message>
-    <message>
-        <location line="+163"/>
+        <location line="-228"/>
         <source>ReplayLab AI host was not found.</source>
         <translation>找不到 ReplayLab AI 主机。</translation>
     </message>
     <message>
         <location line="+17"/>
-        <source>The request exceeds the 2 MiB safety limit.</source>
-        <translation>请求超过 2 MiB 安全限制。</translation>
+        <source>The request exceeds the 16 MiB safety limit.</source>
+        <translation>请求超过 16 MiB 安全限制。</translation>
     </message>
     <message>
-        <location line="+5"/>
+        <location line="+189"/>
+        <source>The request plus conversation context exceeds the 16 MiB safety limit.</source>
+        <translation>请求与对话上下文合计超过 16 MiB 安全限制。</translation>
+    </message>
+    <message>
+        <location line="+175"/>
+        <source>The adjusted request plus conversation context exceeds the 16 MiB safety limit. The current request was not interrupted.</source>
+        <translation>调整后的请求与对话上下文合计超过 16 MiB 安全限制。当前请求未被中断。</translation>
+    </message>
+    <message>
+        <location line="+34"/>
+        <source>The edited request exceeds the 16 MiB safety limit.</source>
+        <translation>编辑后的请求超过 16 MiB 安全限制。</translation>
+    </message>
+    <message>
+        <location line="-393"/>
         <source>The pending-message queue is full. Remove a queued message before sending another.</source>
         <translation>待处理消息队列已满。请先移除一条排队消息，再发送其他消息。</translation>
     </message>
     <message>
-        <location line="+95"/>
+        <location line="+125"/>
         <source>Could not start</source>
         <translation>无法启动</translation>
     </message>
     <message>
-        <location line="+28"/>
+        <location line="-193"/>
+        <location line="+226"/>
         <source>The capture bridge is not ready yet.</source>
         <translation>捕获桥接尚未就绪。</translation>
     </message>
     <message>
-        <location line="+20"/>
-        <source>The request plus conversation context exceeds the 2 MiB safety limit.</source>
-        <translation>请求与对话上下文合计超过 2 MiB 安全限制。</translation>
+        <location line="-4372"/>
+        <source>%1 CLI detected; sign-in state is checked only after approval.</source>
+        <comment>subscription.cli-detected</comment>
+        <translation>已检测到 %1 CLI；仅在批准后检查登录状态。</translation>
     </message>
     <message>
-        <location line="+21"/>
+        <location line="+19"/>
+        <source>Waiting for %1 browser/device authorization.</source>
+        <comment>subscription.browser-waiting</comment>
+        <translation>正在等待 %1 的浏览器/设备授权。</translation>
+    </message>
+    <message>
+        <location line="+7"/>
+        <source>Subscription operation cancelled before provider startup.</source>
+        <comment>subscription.cancelled-before-start</comment>
+        <translation>订阅操作已在提供方启动前取消。</translation>
+    </message>
+    <message>
+        <location line="+4"/>
+        <source>Subscription start gate closed before &apos;start&apos;; no provider process was created.</source>
+        <comment>subscription.start-gate-closed</comment>
+        <translation>订阅启动门在收到“start”前已关闭；未创建提供方进程。</translation>
+    </message>
+    <message>
+        <location line="+5"/>
+        <source>Custom ACP has no guessed login command; running only the configured handshake test.</source>
+        <comment>subscription.custom-login-skipped</comment>
+        <translation>自定义 ACP 没有可推定的登录命令；将仅运行已配置的握手测试。</translation>
+    </message>
+    <message>
+        <location line="+5"/>
+        <source>ACP initialize/session handshake succeeded without sending a prompt; the session exposed %1 model choice(s).</source>
+        <comment>subscription.acp-test-models</comment>
+        <translation>ACP 初始化/会话握手在未发送提示词的情况下成功；该会话提供了 %1 个模型选项。</translation>
+    </message>
+    <message>
+        <location line="+6"/>
+        <source>ACP initialize/session handshake succeeded without sending a prompt. This Agent did not expose a standard model list; leave the model unset to use its configured default, or enter an exact model only if that CLI supports ACP model selection.</source>
+        <comment>subscription.acp-test-no-models</comment>
+        <translation>ACP 初始化/会话握手在未发送提示词的情况下成功。此 Agent 未提供标准模型列表；请将模型留空以使用其配置的默认值，或仅在该 CLI 支持 ACP 模型选择时输入准确的模型名称。</translation>
+    </message>
+    <message>
+        <location line="+7"/>
+        <source>%1 login command completed; testing ACP now.</source>
+        <comment>subscription.acp-login-completed</comment>
+        <translation>%1 登录命令已完成；正在测试 ACP。</translation>
+    </message>
+    <message>
+        <location line="+3"/>
+        <source>Complete authentication in the %1 terminal, then exit it.</source>
+        <comment>subscription.terminal-opened</comment>
+        <translation>请在 %1 终端中完成身份验证，然后退出该终端。</translation>
+    </message>
+    <message>
+        <location line="+4"/>
+        <source>%1 terminal exited; testing ACP now.</source>
+        <comment>subscription.terminal-login-completed</comment>
+        <translation>%1 终端已退出；正在测试 ACP。</translation>
+    </message>
+    <message>
+        <location line="+3"/>
+        <source>Codex is signed out.</source>
+        <comment>subscription.codex-signed-out</comment>
+        <translation>Codex 尚未登录。</translation>
+    </message>
+    <message>
+        <location line="+3"/>
+        <source>Codex account and model catalog are available.</source>
+        <comment>subscription.codex-account-ready</comment>
+        <translation>Codex 账户和模型目录可用。</translation>
+    </message>
+    <message>
+        <location line="+3"/>
+        <source>Complete Codex sign-in in the browser.</source>
+        <comment>subscription.codex-browser-complete</comment>
+        <translation>请在浏览器中完成 Codex 登录。</translation>
+    </message>
+    <message>
+        <location line="+3"/>
+        <source>Codex login completed.</source>
+        <comment>subscription.codex-login-completed</comment>
+        <translation>Codex 登录已完成。</translation>
+    </message>
+    <message>
+        <location line="+3"/>
+        <source>Codex login failed.</source>
+        <comment>subscription.codex-login-failed</comment>
+        <translation>Codex 登录失败。</translation>
+    </message>
+    <message>
+        <location line="+3"/>
+        <source>Codex account is not authenticated.</source>
+        <comment>subscription.codex-account-unauthenticated</comment>
+        <translation>Codex 账户尚未通过身份验证。</translation>
+    </message>
+    <message>
+        <location line="+3"/>
+        <source>Codex sign-in and model catalog test succeeded.</source>
+        <comment>subscription.codex-sign-in-test-succeeded</comment>
+        <translation>Codex 登录和模型目录测试成功。</translation>
+    </message>
+    <message>
+        <location line="+160"/>
+        <location line="+1"/>
+        <source>AI Settings</source>
+        <translation>AI 设置</translation>
+    </message>
+    <message>
+        <location line="+4196"/>
         <source>Starting Agent</source>
         <translation>正在启动 Agent</translation>
     </message>
@@ -1671,17 +1619,17 @@ Device code: %1</source>
     </message>
     <message>
         <location line="+11"/>
-        <location line="+676"/>
+        <location line="+739"/>
         <source>Thinking...</source>
         <translation>正在思考…</translation>
     </message>
     <message>
-        <location line="-656"/>
+        <location line="-719"/>
         <source>Adjust direction is available when this conversation has an active AI request. The message remains queued.</source>
         <translation>仅当此对话存在当前 AI 请求时才能调整方向。该消息仍处于排队状态。</translation>
     </message>
     <message>
-        <location line="+26"/>
+        <location line="+32"/>
         <source>
 
 Draft work completed before the interruption (preserve useful findings, but re-check them against the new direction):
@@ -1703,12 +1651,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
 </translation>
     </message>
     <message>
-        <location line="+11"/>
-        <source>The adjusted request plus conversation context exceeds the 2 MiB safety limit. The current request was not interrupted.</source>
-        <translation>调整后的请求与对话上下文合计超过 2 MiB 安全限制。当前请求未被中断。</translation>
-    </message>
-    <message>
-        <location line="+8"/>
+        <location line="+20"/>
         <source>Direction adjusted</source>
         <translation>方向已调整</translation>
     </message>
@@ -1718,12 +1661,12 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>正在保留已完成的工作、中断当前轮次，并根据队列中的补充说明重新规划。</translation>
     </message>
     <message>
-        <location line="+25"/>
-        <source>The edited request exceeds the 2 MiB safety limit.</source>
-        <translation>编辑后的请求超过 2 MiB 安全限制。</translation>
+        <location line="+39"/>
+        <source>The edited clarification response exceeds the 16,384-character safety limit.</source>
+        <translation>编辑后的补充说明回复超过 16,384 个字符的安全上限。</translation>
     </message>
     <message>
-        <location line="+111"/>
+        <location line="+131"/>
         <source>Interrupted for new direction</source>
         <translation>因新方向而中断</translation>
     </message>
@@ -1738,38 +1681,23 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>捕获关闭前，排队的消息尚未运行</translation>
     </message>
     <message>
-        <location line="+32"/>
+        <location line="+33"/>
         <source>Capture closed; discarded %1 capture-bound AI task(s).</source>
         <translation>捕获已关闭；已丢弃 %1 个绑定到捕获的 AI 任务。</translation>
     </message>
     <message>
-        <location line="+83"/>
-        <location line="+330"/>
+        <location line="+97"/>
+        <location line="+351"/>
         <source>AI result contained an invalid terminal status.</source>
         <translation>AI 结果包含无效的终止状态。</translation>
     </message>
     <message>
-        <location line="-308"/>
+        <location line="-328"/>
         <source>Ignored an invalid AI task identifier.</source>
         <translation>已忽略无效的 AI 任务标识符。</translation>
     </message>
     <message>
-        <location line="+21"/>
-        <source>The AI button returned an invalid task identifier.</source>
-        <translation>AI 按钮返回了无效的任务标识符。</translation>
-    </message>
-    <message>
-        <location line="+3"/>
-        <source>Capture-aware AI action</source>
-        <translation>捕获感知 AI 操作</translation>
-    </message>
-    <message>
-        <location line="+5"/>
-        <source>Capture action queued</source>
-        <translation>捕获操作已排队</translation>
-    </message>
-    <message>
-        <location line="+7"/>
+        <location line="+42"/>
         <source>The RenderDoc AI action failed without a message.</source>
         <translation>RenderDoc AI 操作失败，但没有错误消息。</translation>
     </message>
@@ -1800,18 +1728,18 @@ Additional direction from the user (re-plan and continue from the preserved cont
     </message>
     <message>
         <location line="+10"/>
-        <location line="+197"/>
+        <location line="+211"/>
         <source>Failed</source>
         <translation>失败</translation>
     </message>
     <message>
-        <location line="-197"/>
-        <location line="+169"/>
+        <location line="-211"/>
+        <location line="+183"/>
         <source>Completed</source>
         <translation>已完成</translation>
     </message>
     <message>
-        <location line="-153"/>
+        <location line="-167"/>
         <source>Strategy: %1</source>
         <translation>策略：%1</translation>
     </message>
@@ -1871,7 +1799,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>此操作需要批准。</translation>
     </message>
     <message>
-        <location line="+67"/>
+        <location line="+81"/>
         <source>Waiting for input</source>
         <translation>等待输入</translation>
     </message>
@@ -1988,7 +1916,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
 <context>
     <name>AIConversationView</name>
     <message>
-        <location filename="../Windows/AI/AIConversationView.cpp" line="+317"/>
+        <location filename="../Windows/AI/AIConversationView.cpp" line="+325"/>
         <source>Code</source>
         <translation>代码</translation>
     </message>
@@ -2178,17 +2106,17 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>已用时 %1</translation>
     </message>
     <message>
-        <location line="+264"/>
+        <location line="+659"/>
         <source>Conversation turns</source>
         <translation>对话轮次</translation>
     </message>
     <message>
-        <location line="+118"/>
+        <location line="+125"/>
         <source>Empty user turn</source>
         <translation>空白用户消息</translation>
     </message>
     <message>
-        <location line="+211"/>
+        <location line="+244"/>
         <source>ReplayLab (live)</source>
         <translation>ReplayLab（实时）</translation>
     </message>
@@ -4627,7 +4555,7 @@ This error is not recoverable and the analysis cannot continue. The UI will be n
         <translation>报告错误</translation>
     </message>
     <message>
-        <location line="+333"/>
+        <location line="+345"/>
         <source>ReplayLab is a built-in qrenderdoc integration and cannot be loaded as an extension.</source>
         <translation>ReplayLab 是 qrenderdoc 的内置集成，无法作为扩展加载。</translation>
     </message>
@@ -13929,26 +13857,26 @@ Close the capture or save to another location.</source>
     </message>
     <message>
         <location filename="../Windows/MainWindow.cpp" line="-452"/>
-        <location line="+1772"/>
+        <location line="+1795"/>
         <location line="+119"/>
         <location line="+13"/>
         <location line="+112"/>
-        <location line="+156"/>
+        <location line="+162"/>
         <source>Replay Context: %1</source>
         <translation>重放上下文：%1</translation>
     </message>
     <message>
-        <location line="-2172"/>
-        <location line="+1772"/>
+        <location line="-2201"/>
+        <location line="+1795"/>
         <location line="+60"/>
         <location line="+59"/>
         <location line="+125"/>
-        <location line="+156"/>
+        <location line="+162"/>
         <source>Local</source>
         <translation>本地</translation>
     </message>
     <message>
-        <location line="-2088"/>
+        <location line="-2117"/>
         <source>vkconfig detected - possible incompatibility</source>
         <translation>检测到 vkconfig——可能不兼容</translation>
     </message>
@@ -13978,13 +13906,13 @@ If this program is not active check the path below for any leftover files:
     </message>
     <message>
         <location line="+102"/>
-        <location line="+1851"/>
-        <location line="+40"/>
+        <location line="+1877"/>
+        <location line="+43"/>
         <source>Resolve Symbols</source>
         <translation>解析符号</translation>
     </message>
     <message>
-        <location line="-1877"/>
+        <location line="-1906"/>
         <source>Start Self-hosted Capture</source>
         <translation>开始自托管捕获</translation>
     </message>
@@ -14356,13 +14284,13 @@ Remove from recent list?</source>
         <translation>%1 已加载。未检测到问题。</translation>
     </message>
     <message>
-        <location line="+99"/>
-        <location line="+397"/>
+        <location line="+122"/>
+        <location line="+403"/>
         <source>Remote server disconnected. To attempt to reconnect please select it again.</source>
         <translation>远程服务器已断开连接。若要尝试重新连接，请再次选择该服务器。</translation>
     </message>
     <message>
-        <location line="-365"/>
+        <location line="-371"/>
         <source>%1 (Connected)</source>
         <translation>%1（已连接）</translation>
     </message>
@@ -14463,7 +14391,7 @@ Would you like to try to reinstall the version %2?</source>
         <translation>远程服务器未运行——未配置启动命令</translation>
     </message>
     <message>
-        <location line="+84"/>
+        <location line="+87"/>
         <source>Resolve Symbols - None in capture</source>
         <translation>解析符号——捕获中没有符号</translation>
     </message>
@@ -14837,7 +14765,7 @@ Please check your installation is not corrupted. Or if this is a custom build ch
         <translation>管线状态</translation>
     </message>
     <message>
-        <location filename="../Windows/PipelineState/PipelineStateViewer.cpp" line="+400"/>
+        <location filename="../Windows/PipelineState/PipelineStateViewer.cpp" line="+401"/>
         <source>Export pipeline state as HTML</source>
         <translation>将管线状态导出为 HTML</translation>
     </message>
@@ -14873,26 +14801,26 @@ Please check your installation is not corrupted. Or if this is a custom build ch
     </message>
     <message>
         <location line="+1"/>
-        <location line="+1570"/>
+        <location line="+1557"/>
         <source>Couldn&apos;t open path %1 for write.
 %2</source>
         <translation>无法打开路径 %1 进行写入。
 %2</translation>
     </message>
     <message>
-        <location line="-1562"/>
-        <location line="+1568"/>
+        <location line="-1549"/>
+        <location line="+1555"/>
         <source>Invalid directory</source>
         <translation>无效目录</translation>
     </message>
     <message>
-        <location line="-1567"/>
-        <location line="+1568"/>
+        <location line="-1554"/>
+        <location line="+1555"/>
         <source>Cannot find target directory to save to</source>
         <translation>找不到要保存到的目标目录</translation>
     </message>
     <message>
-        <location line="-1513"/>
+        <location line="-1500"/>
         <source>True</source>
         <translation>是</translation>
     </message>
@@ -14939,37 +14867,27 @@ Log:
         <translation>编辑源 - %1</translation>
     </message>
     <message>
-        <location line="+26"/>
-        <source>Open External Shader Workspace (ABI-validated)</source>
-        <translation>打开外部着色器工作区（ABI 验证）</translation>
+        <location line="+25"/>
+        <source>Analyze Shader with RenderDoc AI</source>
+        <translation>使用 RenderDoc AI 分析着色器</translation>
     </message>
     <message>
-        <location line="+1"/>
-        <source>Open External Shader Workspace (Explanation / Offline Candidate)</source>
-        <translation>打开外部着色器工作区（说明/离线候选）</translation>
+        <location line="+4"/>
+        <source>Analyze this exact D3D11/DXBC or D3D12/DXBC-DXIL shader with the built-in RenderDoc AI host. Analysis is read-only; compilation and apply still require separate native approval and exact ABI validation.</source>
+        <translation>使用内置 RenderDoc AI 主机分析这个确切的 D3D11/DXBC 或 D3D12/DXBC-DXIL 着色器。分析是只读的；编译和应用仍需单独的原生批准以及精确的 ABI 验证。</translation>
     </message>
     <message>
         <location line="+5"/>
-        <source>Queue this exact D3D11/DXBC or D3D12/DXBC-DXIL shader for the configured external decompiler/workspace. Compilation never implies apply; exact ABI validation and shared-resource rollback remain mandatory. D3D12 also rebuilds every affected graphics/compute PSO before committing.</source>
-        <translation>将这个精确的 D3D11/DXBC 或 D3D12/DXBC-DXIL 着色器加入队列，交由已配置的外部反编译器/工作区处理。编译绝不意味着应用；仍必须执行精确的 ABI 验证和共享资源回滚。D3D12 还会在提交前重建所有受影响的图形/计算 PSO。</translation>
+        <source>Analyze this exact shader with the built-in RenderDoc AI host. The current API/encoding has no supported live apply path; reconstructed source remains offline until its baseline and ABI can be validated.</source>
+        <translation>使用内置 RenderDoc AI 主机分析这个确切的着色器。当前 API/编码没有受支持的实时应用路径；在其基线和 ABI 得到验证前，重建的源代码仅供离线使用。</translation>
     </message>
     <message>
-        <location line="+6"/>
-        <source>Queue this exact shader for a non-empty disassembly/reconstruction workspace. The current API/encoding has no supported live apply path; reconstructed source remains offline until its baseline and ABI can be validated.</source>
-        <translation>将这个精确的着色器加入非空的反汇编/重建工作区队列。当前 API/编码没有受支持的实时应用路径；在基线和 ABI 通过验证前，重建的源代码将保持离线。</translation>
+        <location line="+8"/>
+        <source>Reverse/Edit selected shader with AI</source>
+        <translation>使用 AI 逆向/编辑所选着色器</translation>
     </message>
     <message>
-        <location line="+17"/>
-        <source>External Shader Workspace Unavailable</source>
-        <translation>外部着色器工作区不可用</translation>
-    </message>
-    <message>
-        <location line="+1"/>
-        <source>The built-in RenderDoc AI shader action is unavailable for %1.</source>
-        <translation>内置 RenderDoc AI 着色器操作不适用于 %1。</translation>
-    </message>
-    <message>
-        <location line="+18"/>
+        <location line="+19"/>
         <source>Decompile with %1</source>
         <translation>使用 %1 反编译</translation>
     </message>
@@ -15630,7 +15548,7 @@ Right click to debug an event, hide failed events, or jump to the modification&a
         <translation>内置集成调用失败：%1：%2</translation>
     </message>
     <message>
-        <location line="+238"/>
+        <location line="+241"/>
         <source>Couldn&apos;t get a list for Python sys.path; extension was not loaded.
 </source>
         <translation>无法获取 Python sys.path 列表；扩展未加载。
@@ -15914,7 +15832,7 @@ Documentation is available: https://renderdoc.org/docs/python_api/index.html</so
 <context>
     <name>QObject</name>
     <message>
-        <location filename="../Windows/PipelineState/PipelineStateViewer.cpp" line="-1239"/>
+        <location filename="../Windows/PipelineState/PipelineStateViewer.cpp" line="-1226"/>
         <source>%1 is reflected as a struct without any member layout.</source>
         <translation>%1 反射为不含任何成员布局的结构体。</translation>
     </message>
@@ -17700,8 +17618,8 @@ Please manually run: sudo &quot;%1&quot; %2</source>
         <translation>AI 运行时当前需要 Windows 进程树隔离。</translation>
     </message>
     <message>
-        <location line="+61"/>
-        <location line="+16"/>
+        <location line="+44"/>
+        <location line="+22"/>
         <source>The built-in RenderDoc AI integration is unavailable.</source>
         <translation>内置 RenderDoc AI 集成不可用。</translation>
     </message>
@@ -17759,6 +17677,11 @@ Project: %5</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>A full Shader index is required before project data can be restored</source>
+        <translation>恢复项目数据前需要先建立完整着色器索引</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Activating the project before opening this RDC…</source>
         <translation>正在激活项目，然后打开此 RDC…</translation>
     </message>
@@ -17809,8 +17732,18 @@ Project: %5</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Capture %1</source>
+        <translation>捕获 %1</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Capture unavailable</source>
         <translation>捕获文件不可用</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Checking the ReplayLab Host state</source>
+        <translation>正在检查 ReplayLab Host 状态</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -17829,8 +17762,38 @@ Project: %5</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Close an unmodified tab before opening another Shader.</source>
+        <translation>请先关闭一个未修改的标签页，再打开其他着色器。</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Close other tabs</source>
+        <translation>关闭其他标签页</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Close tab</source>
+        <translation>关闭标签页</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Compilation failed; the last good replacement remains active</source>
+        <translation>编译失败；仍保留上一个有效替换</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Compiled and applied</source>
+        <translation>已编译并应用</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Compiling shared Shaders</source>
         <translation>正在编译共享着色器</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Compiling…</source>
+        <translation>正在编译…</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -17854,6 +17817,11 @@ Project: %5</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Could not open Shader</source>
+        <translation>无法打开着色器</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Could not open capture</source>
         <translation>无法打开捕获文件</translation>
     </message>
@@ -17866,6 +17834,11 @@ Project: %5</source>
         <location line="+1"/>
         <source>Could not remove ReplayLab project</source>
         <translation>无法移除 ReplayLab 项目</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Could not save Shader</source>
+        <translation>无法保存着色器</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -17886,6 +17859,11 @@ Project: %5</source>
         <location line="+1"/>
         <source>Creating the project and adding %1 RDC reference(s)…</source>
         <translation>正在创建项目并添加 %1 个 RDC 引用…</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Discard local changes and reload %1 from disk?</source>
+        <translation>是否丢弃本地更改并从磁盘重新加载 %1？</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -17964,6 +17942,21 @@ Project: %5</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Line</source>
+        <translation>行</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Live edit is not running. Restart Reverse/Edit with AI before saving.</source>
+        <translation>实时编辑未运行。请先重新启动“用 AI 逆向/编辑”，然后再保存。</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Live edit is not running; this Shader is read-only</source>
+        <translation>实时编辑未运行；此着色器为只读</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Loaded %1 project record(s)%2</source>
         <translation>已加载 %1 条项目记录%2</translation>
     </message>
@@ -17979,6 +17972,11 @@ Project: %5</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Message</source>
+        <translation>信息</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Missing project identity</source>
         <translation>缺少项目标识</translation>
     </message>
@@ -17986,6 +17984,11 @@ Project: %5</source>
         <location line="+1"/>
         <source>Missing project path</source>
         <translation>缺少项目路径</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Modified</source>
+        <translation>已修改</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -18001,6 +18004,21 @@ Project: %5</source>
         <location line="+1"/>
         <source>No available RDC thumbnails to load for this project.</source>
         <translation>此项目没有可加载的 RDC 缩略图。</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>No changes to save</source>
+        <translation>没有需要保存的更改</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>No compilation problems</source>
+        <translation>没有编译问题</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>No editable HLSL workspaces are available. Use Reverse/Edit with AI on a supported Shader to create one.</source>
+        <translation>暂无可编辑的 HLSL 工作区。请对受支持的着色器使用“用 AI 逆向/编辑”来创建工作区。</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -18024,6 +18042,11 @@ Project: %5</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Pin tab</source>
+        <translation>固定标签页</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Platform</source>
         <translation>平台</translation>
     </message>
@@ -18036,6 +18059,11 @@ Project: %5</source>
         <location line="+1"/>
         <source>Preparing the current capture project</source>
         <translation>正在准备当前捕获项目</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Problems</source>
+        <translation>问题</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -18079,6 +18107,11 @@ Project: %5</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Project recovery is queued</source>
+        <translation>项目恢复任务已排队</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Project restore completed</source>
         <translation>项目恢复完成</translation>
     </message>
@@ -18086,6 +18119,11 @@ Project: %5</source>
         <location line="+1"/>
         <source>Project restore did not complete</source>
         <translation>项目恢复未完成</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Project restore skipped because the full Shader index is unavailable</source>
+        <translation>完整着色器索引尚不可用，已跳过项目恢复</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -18109,8 +18147,23 @@ Project: %5</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Refresh</source>
+        <translation>刷新</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Refresh Projects</source>
         <translation>刷新项目</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Reload</source>
+        <translation>重新加载</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Reload Shader</source>
+        <translation>重新加载着色器</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -18194,6 +18247,21 @@ The project folder and every local file will remain on disk.</source>
         <location line="+1"/>
         <source>RenderDoc reported that the capture was not opened</source>
         <translation>RenderDoc 报告未能打开该捕获</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Replacement failed; the last good replacement remains active</source>
+        <translation>替换失败；仍保留上一个有效替换</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>ReplayLab</source>
+        <translation>ReplayLab</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>ReplayLab Host is running project recovery</source>
+        <translation>ReplayLab Host 正在执行项目恢复</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -18287,6 +18355,46 @@ The project folder and every local file will remain on disk.</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Reviewed organized HLSL · Ctrl+S saves and automatically compiles/replaces</source>
+        <translation>已审查并整理的 HLSL · Ctrl+S 保存后自动编译并替换</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Save</source>
+        <translation>保存</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Save All</source>
+        <translation>全部保存</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Save all modified Shader tabs</source>
+        <translation>保存所有已修改的着色器标签页</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Save changes to %1 before closing?</source>
+        <translation>关闭前是否保存对 %1 的更改？</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Save the current Shader (Ctrl+S)</source>
+        <translation>保存当前着色器（Ctrl+S）</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Saved; waiting for compile and replacement…</source>
+        <translation>已保存；正在等待编译和替换…</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Scheduling ReplayLab project recovery</source>
+        <translation>正在安排 ReplayLab 项目恢复</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Scope: bound and immutable</source>
         <translation>共享边界：已绑定且不可变</translation>
     </message>
@@ -18327,6 +18435,26 @@ The project folder and every local file will remain on disk.</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Shader Workspace</source>
+        <translation>着色器工作区</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Shader compilation failed</source>
+        <translation>着色器编译失败</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Shader files</source>
+        <translation>着色器文件</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Starting the project recovery job</source>
+        <translation>正在启动项目恢复任务</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Supply both Game ID and Build ID, or leave both empty to keep this project pending.</source>
         <translation>请同时提供游戏 ID 和构建 ID，或将两者都留空以使此项目保持待定状态。</translation>
     </message>
@@ -18350,13 +18478,19 @@ You can continue using the opened capture. No failed replacement is treated as a
     </message>
     <message>
         <location line="+1"/>
+        <source>The Shader Workspace is still finishing a save. Wait for it to complete, then close the workspace again.</source>
+        <translation>着色器工作区仍在完成保存。请等待保存结束，然后再次关闭工作区。</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>The active capture changed while ReplayLab restored project data</source>
         <translation>ReplayLab 恢复项目数据期间，活动捕获已发生变化</translation>
     </message>
     <message>
         <location line="+1"/>
-        <source>The packaged ReplayLabMCP.exe is unavailable. Reinstall the complete ReplayLab bundle before using project management.</source>
-        <translation>随包提供的 ReplayLabMCP.exe 不可用。请重新安装完整的 ReplayLab 软件包，然后再使用项目管理功能。</translation>
+        <source>The packaged ReplayLabInternal.exe is unavailable. Reinstall the complete ReplayLab bundle before using project management.</source>
+        <oldsource>The packaged ReplayLabMCP.exe is unavailable. Reinstall the complete ReplayLab bundle before using project management.</oldsource>
+        <translation>随包提供的 ReplayLabInternal.exe 不可用。请重新安装完整的 ReplayLab 软件包，然后再使用项目管理功能。</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -18370,8 +18504,18 @@ You can continue using the opened capture. No failed replacement is treated as a
     </message>
     <message>
         <location line="+1"/>
+        <source>The running ReplayLab Host does not match this qrenderdoc build. Close qrenderdoc and Codex, deploy the matching ReplayLab runtime, then restart qrenderdoc.</source>
+        <translation>正在运行的 ReplayLab Host 与此 qrenderdoc 构建不匹配。请关闭 qrenderdoc 和 Codex，部署匹配的 ReplayLab 运行时，然后重新启动 qrenderdoc。</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>The selected RDC is no longer the active RenderDoc capture</source>
         <translation>所选 RDC 已不再是 RenderDoc 的活动捕获</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>The source changed on disk. Reload it before saving to avoid overwriting another edit.</source>
+        <translation>源码已在磁盘上更改。请先重新加载，以免覆盖其他编辑。</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -18415,8 +18559,23 @@ You can continue using the opened capture. No failed replacement is treated as a
     </message>
     <message>
         <location line="+1"/>
+        <source>Unknown</source>
+        <translation>未知</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Unpacked assets</source>
         <translation>已解包资源目录</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Unpin tab</source>
+        <translation>取消固定标签页</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Unsaved Shader</source>
+        <translation>未保存的着色器</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -18432,6 +18591,11 @@ You can continue using the opened capture. No failed replacement is treated as a
         <location line="+1"/>
         <source>Validating ABI and applying Shaders</source>
         <translation>正在验证 ABI 并应用着色器</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Validating ABI and applying…</source>
+        <translation>正在验证 ABI 并应用…</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -18455,8 +18619,38 @@ You can continue using the opened capture. No failed replacement is treated as a
     </message>
     <message>
         <location line="+1"/>
-        <source>Waiting for ReplayLab project recovery...</source>
-        <translation>正在等待 ReplayLab 项目恢复…</translation>
+        <source>Validating the project recovery request</source>
+        <translation>正在验证项目恢复请求</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Validating the project recovery result</source>
+        <translation>正在验证项目恢复结果</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Verifying the ReplayLab Host identity</source>
+        <translation>正在验证 ReplayLab Host 身份</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Waiting for organized HLSL workspaces</source>
+        <translation>正在等待已整理的 HLSL 工作区</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Waiting for source to stabilize…</source>
+        <translation>正在等待源码稳定…</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Watching saves</source>
+        <translation>正在监听保存</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Workspace authorization is no longer available.</source>
+        <translation>工作区授权已不可用。</translation>
     </message>
     <message>
         <location line="+1"/>

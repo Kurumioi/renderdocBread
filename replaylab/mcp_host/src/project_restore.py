@@ -1,8 +1,8 @@
 """Persistent-host orchestration for safe ReplayLab project restoration.
 
 The RDC section consumed here is only a disposable routing cache.  Every
-Shader is rebound from at least one live raw-byte anchor and then passes the
-ordinary complete replay ABI/apply transaction.  Every material value is
+Shader is first matched by a bounded, zero-EID target-capture resource index,
+then passes the ordinary single-anchor live ABI/apply transaction. Every material value is
 rebound through a new capture-local material session and an exact reflected
 block/typed-parameter check.
 
@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import threading
+import time
 from typing import Any, Callable, Mapping, Sequence
 import uuid
 
@@ -32,7 +33,8 @@ from .rdc_project_index import (
     select_project_binding,
     upsert_project_binding,
 )
-from .shader_workspace.io import is_within, read_json_object
+from .shader_workspace.io import is_within
+from .symbols.scanner import interface_hash, interface_is_complete, layout_hash
 
 
 RESTORE_SCHEMA = "replaylab-project-restore/v1"
@@ -46,6 +48,33 @@ _MAX_TRACKED_MATERIAL_SYNC_SESSIONS = 128
 _MATERIAL_SYNC_PARAMETERS: dict[str, dict[str, Any]] = {}
 _SHA256_CHARS = frozenset("0123456789abcdef")
 _HEX32_CHARS = _SHA256_CHARS
+CATALOG_INDEX_REQUIRED_REASON_ID = "catalog-index-required"
+_MAX_FAST_PROJECT_SHADERS = 256
+_MAX_FAST_PROJECT_BLOCKS = 4096
+_MAX_FAST_CATALOG_SHADERS = 65536
+_MAX_FAST_EVIDENCE_USES = 65536
+_MAX_FAST_CATALOG_BYTES = 16 * 1024 * 1024
+_MAX_FAST_REFLECTION_DEPTH = 24
+_MAX_FAST_REFLECTION_FIELDS = 4096
+_MAX_FAST_REFLECTION_SIGNATURES = 2048
+_MAX_FAST_REFLECTION_BINDINGS = 4096
+_MAX_FAST_REFLECTION_SAMPLERS = 2048
+_MAX_FAST_REFLECTION_STRING_BYTES = 1024
+_MAX_FAST_REFLECTION_TOTAL_STRING_BYTES = 1024 * 1024
+_FAST_INDEX_POLL_SECONDS = 0.025
+_FAST_INDEX_TIMEOUT_SECONDS = 15.0
+
+
+class CatalogPreparationRequired(RuntimeError):
+    """The explicit full-capture project index is not available."""
+
+    def __init__(
+        self,
+        message: str,
+        reason_id: str = CATALOG_INDEX_REQUIRED_REASON_ID,
+    ) -> None:
+        super().__init__(message)
+        self.reason_id = str(reason_id or CATALOG_INDEX_REQUIRED_REASON_ID)
 
 
 def _host_module() -> Any:
@@ -186,6 +215,41 @@ def _canonical_sha256(value: Any) -> str:
             allow_nan=False,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _asset_api(value: Any) -> str:
+    token = str(value or "").strip().lower().rsplit(".", 1)[-1]
+    token = token.replace("_", "").replace(" ", "")
+    return {
+        "direct3d11": "d3d11",
+        "direct3d12": "d3d12",
+        "gl": "opengl",
+        "openglcore": "opengl",
+    }.get(token, token)
+
+
+def _asset_encoding(value: Any) -> str:
+    token = str(value or "").strip().lower().rsplit(".", 1)[-1]
+    token = token.replace("_", "").replace(" ", "").replace("-", "")
+    return {
+        "directxbytecode": "dxbc",
+        "directxil": "dxil",
+        "dxilcontainer": "dxil",
+        "spv": "spirv",
+        "spirvshader": "spirv",
+        "openglspirv": "opengl-spirv",
+        "glslshader": "glsl",
+        "openglglsl": "glsl",
+    }.get(token, token)
+
+
+def _asset_format_supported(api: str, encoding: str) -> bool:
+    return encoding in {
+        "d3d11": {"dxbc"},
+        "d3d12": {"dxbc", "dxil"},
+        "opengl": {"glsl", "spirv", "opengl-spirv"},
+        "vulkan": {"spirv"},
+    }.get(api, set())
 
 
 def _reject_json_constant(value: str) -> None:
@@ -495,16 +559,797 @@ def _validate_workspace_record(
     return workspace, status
 
 
-def _bind_workspace_anchors(
+def _physical_enum(value: Any) -> str:
+    return (
+        str(value or "").strip().lower().rsplit(".", 1)[-1]
+        .replace("_", "")
+        .replace(" ", "")
+    )
+
+
+def _physical_base_type(value: Any) -> str:
+    token = _physical_enum(value)
+    return {
+        "float32": "float",
+        "single": "float",
+        "sint": "int",
+        "signedint": "int",
+        "int32": "int",
+        "unsignedint": "uint",
+        "uint32": "uint",
+        "float16": "half",
+        "min16float": "half",
+        "float64": "double",
+    }.get(token, token)
+
+
+def _new_fast_reflection_budget() -> dict[str, int]:
+    return {
+        "fields": 0,
+        "signatures": 0,
+        "bindings": 0,
+        "samplers": 0,
+        "stringBytes": 0,
+    }
+
+
+def _fast_reflection_charge(
+    budget: dict[str, int], key: str, maximum: int, reason_id: str, label: str
+) -> None:
+    budget[key] = int(budget.get(key, 0)) + 1
+    if budget[key] > maximum:
+        raise CatalogPreparationRequired(
+            "Shader catalog exceeds the bounded %s budget" % label, reason_id
+        )
+
+
+def _fast_reflection_text(value: Any, budget: dict[str, int]) -> str:
+    text = str(value or "")
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeError as exc:
+        raise CatalogPreparationRequired(
+            "Shader catalog contains invalid Unicode text",
+            "shader-resource-index-reflection-string-limit",
+        ) from exc
+    if size > _MAX_FAST_REFLECTION_STRING_BYTES:
+        raise CatalogPreparationRequired(
+            "Shader catalog contains an oversized reflection string",
+            "shader-resource-index-reflection-string-limit",
+        )
+    budget["stringBytes"] = int(budget.get("stringBytes", 0)) + size
+    if budget["stringBytes"] > _MAX_FAST_REFLECTION_TOTAL_STRING_BYTES:
+        raise CatalogPreparationRequired(
+            "Shader catalog reflection text exceeds the aggregate budget",
+            "shader-resource-index-reflection-string-limit",
+        )
+    return text
+
+
+def _validate_fast_reflection_fields(
+    values: Any, budget: dict[str, int], depth: int = 0
+) -> None:
+    if depth > _MAX_FAST_REFLECTION_DEPTH:
+        raise CatalogPreparationRequired(
+            "Shader catalog reflection nesting exceeds the bounded depth",
+            "shader-resource-index-reflection-depth-limit",
+        )
+    if not isinstance(values, list):
+        return
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        _fast_reflection_charge(
+            budget,
+            "fields",
+            _MAX_FAST_REFLECTION_FIELDS,
+            "shader-resource-index-reflection-field-limit",
+            "field-count",
+        )
+        for text in (
+            value.get("name", ""),
+            value.get("path", ""),
+            value.get("type", ""),
+            value.get("baseType", ""),
+        ):
+            _fast_reflection_text(text, budget)
+        elements = value.get("elements", 1)
+        if (
+            isinstance(elements, bool)
+            or not isinstance(elements, int)
+            or elements < 0
+            or elements > (1 << 20)
+        ):
+            raise CatalogPreparationRequired(
+                "Shader catalog contains an invalid array element count",
+                "shader-resource-index-reflection-field-limit",
+            )
+        _validate_fast_reflection_fields(
+            value.get("members", value.get("fields", [])), budget, depth + 1
+        )
+
+
+def _validate_fast_catalog_shader_budget(shader: Mapping[str, Any]) -> None:
+    """Reject pathological reflection before scanner hashing can recurse/expand."""
+
+    budget = _new_fast_reflection_budget()
+    for value in (
+        shader.get("stage", ""),
+        shader.get("entryPoint", shader.get("entry", "")),
+        shader.get("encoding", shader.get("binaryFormat", "")),
+        shader.get("outputTopology", ""),
+    ):
+        _fast_reflection_text(value, budget)
+
+    for key in ("inputSignature", "outputSignature"):
+        values = shader.get(key, [])
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            _fast_reflection_charge(
+                budget,
+                "signatures",
+                _MAX_FAST_REFLECTION_SIGNATURES,
+                "shader-resource-index-reflection-signature-limit",
+                "signature-count",
+            )
+            for text in (
+                value.get("varName", ""),
+                value.get("semanticName", value.get("semantic", "")),
+                value.get("semanticIdxName", ""),
+                value.get("systemValue", ""),
+                value.get("compType", value.get("componentType", "")),
+            ):
+                _fast_reflection_text(text, budget)
+
+    for key in ("readOnlyResources", "readWriteResources"):
+        values = shader.get(key, [])
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            _fast_reflection_charge(
+                budget,
+                "bindings",
+                _MAX_FAST_REFLECTION_BINDINGS,
+                "shader-resource-index-reflection-binding-limit",
+                "resource-binding-count",
+            )
+            for text in (
+                value.get("name", ""),
+                value.get("descriptorType", value.get("resourceType", "")),
+                value.get("textureType", ""),
+            ):
+                _fast_reflection_text(text, budget)
+            variable_type = value.get("variableType")
+            if isinstance(variable_type, Mapping):
+                _fast_reflection_text(variable_type.get("name", ""), budget)
+                _fast_reflection_text(variable_type.get("baseType", ""), budget)
+                _validate_fast_reflection_fields(
+                    variable_type.get("members", variable_type.get("fields", [])),
+                    budget,
+                )
+
+    samplers = shader.get("samplers", [])
+    if isinstance(samplers, list):
+        for value in samplers:
+            if not isinstance(value, Mapping):
+                continue
+            _fast_reflection_charge(
+                budget,
+                "samplers",
+                _MAX_FAST_REFLECTION_SAMPLERS,
+                "shader-resource-index-reflection-sampler-limit",
+                "sampler-count",
+            )
+            _fast_reflection_text(value.get("name", ""), budget)
+
+    blocks = shader.get("constantBlocks", shader.get("constantBuffers", []))
+    if isinstance(blocks, list):
+        if len(blocks) > _MAX_FAST_PROJECT_BLOCKS:
+            raise CatalogPreparationRequired(
+                "Shader catalog exceeds the bounded CBuffer budget",
+                "shader-resource-index-block-limit",
+            )
+        for block in blocks:
+            if not isinstance(block, Mapping):
+                continue
+            _fast_reflection_text(block.get("name", ""), budget)
+            _validate_fast_reflection_fields(
+                block.get("fields", block.get("variables", [])), budget
+            )
+
+
+def _physical_field(
+    value: Mapping[str, Any],
+    budget: dict[str, int] | None = None,
+    depth: int = 0,
+) -> dict[str, Any]:
+    if budget is None:
+        budget = _new_fast_reflection_budget()
+    if depth > _MAX_FAST_REFLECTION_DEPTH:
+        raise CatalogPreparationRequired(
+            "Shader catalog reflection nesting exceeds the bounded depth",
+            "shader-resource-index-reflection-depth-limit",
+        )
+    _fast_reflection_charge(
+        budget,
+        "fields",
+        _MAX_FAST_REFLECTION_FIELDS,
+        "shader-resource-index-reflection-field-limit",
+        "field-count",
+    )
+    return {
+        "byteOffset": int(value.get("byteOffset", value.get("offset", 0)) or 0),
+        "byteSize": int(value.get("byteSize", 0) or 0),
+        "baseType": _physical_base_type(value.get("baseType", value.get("type", ""))),
+        "rows": int(value.get("rows", 0) or 0),
+        "columns": int(value.get("columns", value.get("cols", 0)) or 0),
+        "elements": int(value.get("elements", 0) or 0),
+        "arrayByteStride": int(
+            value.get("arrayByteStride", value.get("arrayStride", 0)) or 0
+        ),
+        "matrixByteStride": int(
+            value.get("matrixByteStride", value.get("matrixStride", 0)) or 0
+        ),
+        "rowMajor": bool(value.get("rowMajor", False)),
+        "flags": int(value.get("flags", 0) or 0),
+        "pointerTypeID": int(value.get("pointerTypeID", 0xFFFFFFFF)),
+        "bitFieldOffset": int(value.get("bitFieldOffset", 0) or 0),
+        "bitFieldSize": int(value.get("bitFieldSize", 0) or 0),
+        "members": sorted(
+            [
+                _physical_field(item, budget, depth + 1)
+                for item in list(value.get("members", value.get("fields", [])) or [])
+                if isinstance(item, Mapping)
+            ],
+            key=lambda item: json.dumps(
+                item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+        ),
+    }
+
+
+def _catalog_block_projection(
+    value: Mapping[str, Any],
+    position: int,
+    stage: str,
+    budget: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    if budget is None:
+        budget = _new_fast_reflection_budget()
+    index = _integer(value.get("index", position), "constant block index")
+    name = str(value.get("name", "") or "")
+    path = name or "cbuffer%d" % index
+    space = _integer(
+        value.get("space", value.get("registerSpace", 0)), "constant block space"
+    )
+    bind = _integer(
+        value.get("bind", value.get("bindNumber", index)), "constant block bind"
+    )
+    byte_size = _integer(
+        value.get("byteSize", value.get("size", 0)),
+        "constant block byteSize",
+        1,
+    )
+    fields = list(value.get("fields", value.get("variables", [])) or [])
+    if not all(isinstance(item, Mapping) for item in fields):
+        raise RuntimeError("constant block fields are invalid")
+    completeness = str(value.get("layoutCompleteness", "") or "").strip().lower()
+    if completeness not in {"complete", "partial", "opaque", "ambiguous"}:
+        completeness = "complete" if fields else "opaque"
+    canonical_block = {
+        "index": index,
+        "name": name,
+        "bind": bind,
+        "space": space,
+        "bindArraySize": _integer(
+            value.get("bindArraySize", value.get("arraySize", 1)),
+            "constant block bindArraySize",
+            1,
+        ),
+        "byteSize": byte_size,
+        "bufferBacked": bool(value.get("bufferBacked", True)),
+        "inlineDataBytes": bool(value.get("inlineDataBytes", False)),
+        "compileConstants": bool(value.get("compileConstants", False)),
+        "fields": copy.deepcopy(fields),
+        "layoutCompleteness": completeness,
+    }
+    physical_block = {
+        "space": space,
+        "bind": bind,
+        "bindArraySize": canonical_block["bindArraySize"],
+        "byteSize": byte_size,
+        "bufferBacked": canonical_block["bufferBacked"],
+        "inlineDataBytes": canonical_block["inlineDataBytes"],
+        "compileConstants": canonical_block["compileConstants"],
+        "fields": sorted(
+            [_physical_field(item, budget) for item in fields],
+            key=lambda item: json.dumps(
+                item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+        ),
+        "layoutCompleteness": completeness,
+    }
+    return {
+        "space": space,
+        "bind": bind,
+        "index": index,
+        "path": path,
+        "byteSize": byte_size,
+        "layoutSha256": _canonical_sha256(
+            {
+                "schema": "renderdoc-ultra-event-cbuffer-layout/v1",
+                "stage": stage,
+                "block": canonical_block,
+            }
+        ),
+        "abiSha256": _canonical_sha256(physical_block),
+    }
+
+
+def _strict_fast_catalog(
+    catalog_path: str | Path, expected_sha256: str
+) -> dict[str, Any]:
+    path = Path(catalog_path).expanduser()
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("active capture catalog is unavailable")
+    before = path.stat()
+    if before.st_size <= 0:
+        raise RuntimeError("active capture catalog is empty")
+    if before.st_size > min(MAX_CAPTURE_CATALOG_BYTES, _MAX_FAST_CATALOG_BYTES):
+        raise CatalogPreparationRequired(
+            "active capture catalog exceeds the bounded resource-index budget",
+            "shader-resource-index-catalog-limit",
+        )
+    raw = path.read_bytes()
+    after = path.stat()
+    if (
+        len(raw) != before.st_size
+        or after.st_dev != before.st_dev
+        or after.st_ino != before.st_ino
+        or after.st_size != before.st_size
+        or after.st_mtime_ns != before.st_mtime_ns
+    ):
+        raise RuntimeError("active capture catalog changed while it was read")
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise RuntimeError("active capture catalog hash changed")
+    try:
+        value = json.loads(
+            raw.decode("utf-8-sig", errors="strict"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("active capture catalog is not strict UTF-8 JSON") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != "renderdoc-ultra-capture-symbols/v1"
+        or value.get("schemaVersion") != 1
+        or not isinstance(value.get("shaders"), list)
+    ):
+        raise RuntimeError("active capture catalog schema is unsupported")
+    if len(value["shaders"]) > _MAX_FAST_CATALOG_SHADERS:
+        raise CatalogPreparationRequired(
+            "active capture catalog exceeds the bounded Shader-count budget",
+            "shader-resource-index-catalog-shader-limit",
+        )
+    return value
+
+
+def _fast_catalog_shader_index(
+    catalog: Mapping[str, Any],
+) -> dict[tuple[Any, str, str, str], list[Mapping[str, Any]]]:
+    result: dict[tuple[Any, str, str, str], list[Mapping[str, Any]]] = {}
+    for item in list(catalog.get("shaders", []) or []):
+        if not isinstance(item, Mapping):
+            continue
+        key = (
+            item.get("shaderResourceId", item.get("resourceId")),
+            str(item.get("stage", "") or ""),
+            str(item.get("entryPoint", item.get("entry", "")) or ""),
+            str(item.get("rawSha256", "") or "").lower(),
+        )
+        result.setdefault(key, []).append(item)
+    return result
+
+
+def _expected_resource_shader(
+    catalog: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    api: str,
+    anchor_event_id: int,
+    shader_index: Mapping[
+        tuple[Any, str, str, str], Sequence[Mapping[str, Any]]
+    ] | None = None,
+) -> dict[str, Any]:
+    index = shader_index if shader_index is not None else _fast_catalog_shader_index(catalog)
+    key = (
+        identity.get("resourceId"),
+        str(identity.get("stage", "") or ""),
+        str(identity.get("entryPoint", "") or ""),
+        str(identity.get("rawSha256", "") or "").lower(),
+    )
+    matches = list(index.get(key, []))
+    if len(matches) != 1:
+        raise CatalogPreparationRequired(
+            "active catalog has no unique content-addressed Shader record",
+            "shader-resource-index-ambiguous" if len(matches) > 1 else
+            "shader-resource-index-mismatch",
+        )
+    shader = dict(matches[0])
+    _validate_fast_catalog_shader_budget(shader)
+    computed_interface = interface_hash(shader)
+    computed_layout = layout_hash(shader)
+    computed_complete = interface_is_complete(shader)
+    if (
+        str(shader.get("interfaceHash", "") or "") not in ("", computed_interface)
+        or str(shader.get("layoutHash", "") or "") not in ("", computed_layout)
+        or identity.get("interfaceHash", "") != computed_interface
+        or identity.get("layoutHash", "") != computed_layout
+        or (identity.get("interfaceComplete") is True) != computed_complete
+    ):
+        raise CatalogPreparationRequired(
+            "Shader interface/layout digest differs from the indexed catalog",
+            "shader-resource-index-interface-mismatch",
+        )
+    encoding = _asset_encoding(
+        shader.get("encoding", shader.get("binaryFormat", shader.get("format", "")))
+    )
+    if not encoding:
+        raise CatalogPreparationRequired(
+            "Shader format is absent from the indexed catalog",
+            "shader-resource-index-format-unsupported",
+        )
+    if not _asset_format_supported(api, encoding):
+        raise CatalogPreparationRequired(
+            "Shader format is unsupported for the active capture API",
+            "shader-resource-index-format-unsupported",
+        )
+    blocks_value = shader.get("constantBlocks", shader.get("constantBuffers", []))
+    if not isinstance(blocks_value, list):
+        raise CatalogPreparationRequired(
+            "Shader constant-block set is unavailable",
+            "shader-resource-index-interface-mismatch",
+        )
+    if len(blocks_value) > _MAX_FAST_PROJECT_BLOCKS:
+        raise CatalogPreparationRequired(
+            "Shader constant-block set exceeds the fast-index limit",
+            "shader-resource-index-block-limit",
+        )
+    projection_budget = _new_fast_reflection_budget()
+    blocks = [
+        _catalog_block_projection(
+            block, index, str(identity["stage"]), projection_budget
+        )
+        for index, block in enumerate(blocks_value)
+        if isinstance(block, Mapping)
+    ]
+    if len(blocks) != len(blocks_value):
+        raise CatalogPreparationRequired(
+            "Shader constant-block set is malformed",
+            "shader-resource-index-interface-mismatch",
+        )
+    blocks.sort(
+        key=lambda item: (
+            item["space"], item["bind"], item["index"], item["path"]
+        )
+    )
+    block_keys = [
+        (item["space"], item["bind"], item["index"], item["path"])
+        for item in blocks
+    ]
+    if len(set(block_keys)) != len(block_keys):
+        raise CatalogPreparationRequired(
+            "Shader constant-block ownership is ambiguous",
+            "shader-resource-index-ambiguous",
+        )
+    return {
+        "resourceId": _integer(identity.get("resourceId"), "Shader resourceId", 1),
+        "stage": str(identity["stage"]),
+        "entryPoint": str(identity.get("entryPoint", "") or ""),
+        "encoding": encoding,
+        "rawSha256": _hex(identity.get("rawSha256"), 64, "Shader rawSha256"),
+        "interfaceHash": computed_interface,
+        "layoutHash": computed_layout,
+        "interfaceComplete": computed_complete,
+        "constantBlocks": blocks,
+        "anchorEventId": _integer(anchor_event_id, "Shader anchorEventId", 1),
+    }
+
+
+def _resource_index_job(
+    host: Any,
+    capture_path: Path,
+    capture_session_id: str,
+    capture_id: str,
+    evidence_sha256: str,
+    api: str,
+    shaders: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    request = {
+        "expected_capture_path": str(capture_path),
+        "expected_capture_session_id": capture_session_id,
+        "expected_capture_id": capture_id,
+        "expected_identity_evidence_sha256": evidence_sha256,
+        "expected_api": api,
+        "expected_shaders": [copy.deepcopy(dict(item)) for item in shaders],
+    }
+    try:
+        snapshot = host.ipc.call(
+            "begin_rdc_project_shader_resource_index", request, timeout=10.0
+        )
+    except Exception as exc:
+        reason_id = (
+            "shader-resource-index-capture-changed"
+            if "capture changed" in str(exc).lower()
+            else "shader-resource-index-unavailable"
+        )
+        raise CatalogPreparationRequired(
+            "could not start the bounded Shader resource index: %s" % exc,
+            reason_id,
+        ) from exc
+    deadline = time.monotonic() + _FAST_INDEX_TIMEOUT_SECONDS
+    request_sha256 = ""
+    while True:
+        if (
+            not isinstance(snapshot, Mapping)
+            or snapshot.get("schema")
+            != "replaylab-project-shader-resource-index-job/v1"
+            or snapshot.get("schemaVersion") != 1
+            or snapshot.get("captureSessionId") != capture_session_id
+        ):
+            raise CatalogPreparationRequired(
+                "RenderDoc returned an invalid Shader resource-index job",
+                "shader-resource-index-invalid-response",
+            )
+        job_id = _hex(snapshot.get("jobId"), 32, "Shader resource-index jobId")
+        current_request_sha256 = _hex(
+            snapshot.get("requestSha256"), 64, "Shader resource-index requestSha256"
+        )
+        if request_sha256 and current_request_sha256 != request_sha256:
+            raise CatalogPreparationRequired(
+                "RenderDoc changed the Shader resource-index request identity",
+                "shader-resource-index-invalid-response",
+            )
+        request_sha256 = current_request_sha256
+        status = str(snapshot.get("status", "") or "")
+        if status == "completed":
+            break
+        if status == "failed":
+            error = str(snapshot.get("error", "") or "")
+            reason = (
+                "shader-resource-index-timeout"
+                if "timed out" in error.lower()
+                else "shader-resource-index-failed"
+            )
+            raise CatalogPreparationRequired(
+                "bounded Shader resource indexing failed: %s" % (error or status),
+                reason,
+            )
+        if status not in {"queued", "running"}:
+            raise CatalogPreparationRequired(
+                "RenderDoc returned an invalid Shader resource-index state",
+                "shader-resource-index-invalid-response",
+            )
+        if time.monotonic() >= deadline:
+            raise CatalogPreparationRequired(
+                "bounded Shader resource indexing timed out",
+                "shader-resource-index-timeout",
+            )
+        time.sleep(_FAST_INDEX_POLL_SECONDS)
+        try:
+            snapshot = host.ipc.call(
+                "poll_rdc_project_shader_resource_index",
+                {
+                    "expected_capture_path": str(capture_path),
+                    "expected_capture_session_id": capture_session_id,
+                    "job_id": job_id,
+                },
+                timeout=5.0,
+            )
+        except Exception as exc:
+            reason_id = (
+                "shader-resource-index-capture-changed"
+                if "capture changed" in str(exc).lower()
+                else "shader-resource-index-unavailable"
+            )
+            raise CatalogPreparationRequired(
+                "could not poll the bounded Shader resource index: %s" % exc,
+                reason_id,
+            ) from exc
+
+    result = snapshot.get("result")
+    reason_id = str(result.get("reasonId", "") or "") if isinstance(result, Mapping) else ""
+    capability = result.get("capability") if isinstance(result, Mapping) else None
+    if (
+        not isinstance(result, Mapping)
+        or result.get("schema") != "replaylab-project-shader-resource-index/v1"
+        or result.get("schemaVersion") != 1
+        or result.get("captureSessionId") != capture_session_id
+        or _path_key(result.get("capturePath", "")) != _path_key(capture_path)
+        or result.get("captureId") != capture_id
+        or result.get("identityEvidenceSha256") != evidence_sha256
+        or result.get("requestSha256") != request_sha256
+        or not isinstance(capability, Mapping)
+        or capability.get("eventTraversalSupported") is not False
+        or capability.get("anchorPreflightRequired") is not True
+        or result.get("eventTraversalCount") != 0
+        or result.get("fullFrameTraversal") is not False
+        or result.get("gpuReplayMutation") is not False
+        or result.get("physicalApplyAuthority") is not False
+        or result.get("resourceOwnershipScope") != "target-capture-session"
+        or result.get("crossCaptureResourceIdReuse") is not False
+    ):
+        raise CatalogPreparationRequired(
+            "RenderDoc returned invalid zero-EID Shader index evidence",
+            "shader-resource-index-invalid-response",
+        )
+    if result.get("matched") is not True:
+        raise CatalogPreparationRequired(
+            "bounded Shader resource index did not uniquely match the project assets",
+            reason_id or "shader-resource-index-mismatch",
+        )
+    if (
+        capability.get("supported") is not True
+        or capability.get("api") != api
+        or capability.get("physicalAbiFromNullPipeline") != (api != "vulkan")
+    ):
+        raise CatalogPreparationRequired(
+            "RenderDoc returned inconsistent Shader resource-index capability evidence",
+            "shader-resource-index-invalid-response",
+        )
+    assets = result.get("assets")
+    if (
+        not isinstance(assets, list)
+        or len(assets) != len(shaders)
+        or result.get("expectedShaderCount") != len(shaders)
+        or result.get("matchedShaderCount") != len(shaders)
+    ):
+        raise CatalogPreparationRequired(
+            "bounded Shader resource index returned an incomplete asset set",
+            "shader-resource-index-mismatch",
+        )
+    expected_by_owner = {
+        (
+            item["resourceId"], item["stage"], item["entryPoint"],
+            item["encoding"], item["rawSha256"]
+        ): item
+        for item in shaders
+    }
+    seen_owners: set[tuple[Any, ...]] = set()
+    for asset in assets:
+        if not isinstance(asset, Mapping):
+            raise CatalogPreparationRequired(
+                "bounded Shader resource index returned a malformed asset",
+                "shader-resource-index-invalid-response",
+            )
+        owner = (
+            asset.get("resourceId"), asset.get("stage"), asset.get("entryPoint"),
+            asset.get("encoding"), asset.get("rawSha256")
+        )
+        expected = expected_by_owner.get(owner)
+        if (
+            expected is None
+            or owner in seen_owners
+            or asset.get("ownerResourceId") != expected["resourceId"]
+            or asset.get("ownerCaptureSessionId") != capture_session_id
+            or asset.get("resourceOwnershipScope") != "target-capture-session"
+            or asset.get("crossCaptureResourceIdReuse") is not False
+            or asset.get("api") != api
+            or asset.get("interfaceHash") != expected["interfaceHash"]
+            or asset.get("layoutHash") != expected["layoutHash"]
+            or asset.get("interfaceComplete") != expected["interfaceComplete"]
+            or asset.get("requiresAnchorPreflight") is not True
+            or asset.get("anchorEventId") != expected["anchorEventId"]
+        ):
+            raise CatalogPreparationRequired(
+                "bounded Shader resource index changed asset ownership or ABI identity",
+                "shader-resource-index-invalid-response",
+            )
+        seen_owners.add(owner)
+        if api == "vulkan":
+            if (
+                asset.get("physicalAbiValidated") is not False
+                or asset.get("physicalAbiSha256", "") != ""
+                or asset.get("contentMatchMode")
+                != "module-sha256-owner-rid-anchor-preflight"
+            ):
+                raise CatalogPreparationRequired(
+                    "Vulkan null-pipeline reflection claimed physical ABI authority",
+                    "shader-resource-index-invalid-response",
+                )
+        elif (
+            asset.get("physicalAbiValidated") is not True
+            or not isinstance(asset.get("physicalAbiSha256"), str)
+            or len(asset.get("physicalAbiSha256")) != 64
+            or any(
+                character not in _SHA256_CHARS
+                for character in str(asset.get("physicalAbiSha256", ""))
+            )
+            or asset.get("constantBlocksMatched") is not True
+            or asset.get("interfaceMatched") is not True
+            or asset.get("contentMatchMode")
+            != "api-format-interface-layout-owner-rid"
+            or asset.get("constantBlocks") != expected["constantBlocks"]
+        ):
+            raise CatalogPreparationRequired(
+                "bounded Shader resource index did not prove the complete ABI/block set",
+                "shader-resource-index-interface-mismatch",
+            )
+    if seen_owners != set(expected_by_owner):
+        raise CatalogPreparationRequired(
+            "bounded Shader resource index omitted target-RDC ownership",
+            "shader-resource-index-mismatch",
+        )
+    live_sha256 = _hex(
+        result.get("liveIdentitySha256"), 64, "live Shader identitySha256"
+    )
+    try:
+        lease = host.ipc.call(
+            "commit_rdc_project_shader_resource_index",
+            {
+                "expected_capture_path": str(capture_path),
+                "expected_capture_session_id": capture_session_id,
+                "job_id": job_id,
+                "expected_capture_id": capture_id,
+                "expected_identity_evidence_sha256": evidence_sha256,
+                "live_identity_sha256": live_sha256,
+            },
+            timeout=10.0,
+        )
+    except Exception as exc:
+        reason_id = (
+            "shader-resource-index-capture-changed"
+            if "capture changed" in str(exc).lower()
+            else "shader-resource-index-unavailable"
+        )
+        raise CatalogPreparationRequired(
+            "could not commit the bounded Shader resource index: %s" % exc,
+            reason_id,
+        ) from exc
+    if (
+        not isinstance(lease, dict)
+        or lease.get("schema")
+        != "replaylab-project-shader-resource-index-lease/v1"
+        or lease.get("schemaVersion") != 1
+        or lease.get("jobId") != job_id
+        or lease.get("captureId") != capture_id
+        or lease.get("captureSessionId") != capture_session_id
+        or lease.get("identityEvidenceSha256") != evidence_sha256
+        or lease.get("liveIdentitySha256") != live_sha256
+        or lease.get("committed") is not True
+        or lease.get("eventTraversalCount") != 0
+        or lease.get("gpuReplayMutation") is not False
+        or lease.get("physicalApplyAuthority") is not False
+        or lease.get("resourceOwnershipScope") != "target-capture-session"
+        or lease.get("crossCaptureResourceIdReuse") is not False
+    ):
+        raise CatalogPreparationRequired(
+            "RenderDoc returned an invalid Shader resource-index lease",
+            "shader-resource-index-invalid-response",
+        )
+    return {"job": dict(snapshot), "result": dict(result), "lease": lease}
+
+
+def _match_workspace_resources(
     host: Any,
     capture_path: Path,
     capture_session_id: str,
     validated: Sequence[tuple[Mapping[str, Any], Path, dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    """Bind cached workspaces with one catalog parse and bounded IPC batches."""
+    """Match cached assets by resource bytes/format without traversing EIDs."""
 
     if not validated:
         raise RuntimeError("cached project binding has no Shader workspaces")
+    if len(validated) > _MAX_FAST_PROJECT_SHADERS:
+        raise CatalogPreparationRequired(
+            "cached project binding exceeds the fast Shader resource-index limit",
+            "shader-resource-index-shader-limit",
+        )
     groups: dict[
         tuple[str, str, str, str, str],
         list[tuple[Mapping[str, Any], dict[str, Any], dict[str, Any]]],
@@ -530,15 +1375,38 @@ def _bind_workspace_anchors(
         evidence_sha256 = host._canonical_json_sha256(
             evidence, "RDC cached workspace identity evidence"
         )
+        raw_use_tuples = evidence.get("useTuples", [])
+        if (
+            not isinstance(raw_use_tuples, list)
+            or len(raw_use_tuples) > _MAX_FAST_EVIDENCE_USES
+        ):
+            raise CatalogPreparationRequired(
+                "workspace catalog evidence exceeds the bounded use-index budget",
+                "shader-resource-index-evidence-limit",
+            )
         use_tuples = {
             (int(item[0]), str(item[1]))
-            for item in list(evidence.get("useTuples", []) or [])
+            for item in raw_use_tuples
             if isinstance(item, list)
             and len(item) == 2
             and not isinstance(item[0], bool)
             and isinstance(item[0], int)
         }
-        anchors: list[dict[str, Any]] = []
+        catalog = _strict_fast_catalog(group_key[3], group_key[4])
+        catalog_shader_index = _fast_catalog_shader_index(catalog)
+        api = _asset_api(group_key[2])
+        capture_record = catalog.get("capture")
+        catalog_api = catalog.get("api", "")
+        if not catalog_api and isinstance(capture_record, Mapping):
+            catalog_api = capture_record.get("api", "")
+        if _asset_api(catalog_api) != api:
+            raise CatalogPreparationRequired(
+                "active catalog API differs from the managed Shader workspace",
+                "shader-resource-index-api-mismatch",
+            )
+        expected_shaders: list[dict[str, Any]] = []
+        expected_owner_keys: set[tuple[Any, ...]] = set()
+        total_blocks = 0
         for record, unused_status, projection in entries:
             # The inexpensive projection proves every workspace points at the
             # same exact catalog bytes.  The one full scope parse above then
@@ -558,73 +1426,39 @@ def _bind_workspace_anchors(
                 raise RuntimeError(
                     "cached Shader anchor is absent from the exact workspace catalog"
                 )
-            anchors.append(
-                {
-                    "eventId": event_id,
-                    "resourceId": identity["resourceId"],
-                    "stage": identity["stage"],
-                    "entryPoint": identity["entryPoint"],
-                    "rawSha256": identity["rawSha256"],
-                }
+            expected = _expected_resource_shader(
+                catalog, identity, api, event_id, catalog_shader_index
             )
-
-        for offset in range(0, len(anchors), 256):
-            chunk = anchors[offset : offset + 256]
-            response = host.ipc.call(
-                "bind_rdc_project_shader_catalog",
-                {
-                    "expected_capture_path": str(capture_path),
-                    "expected_capture_session_id": capture_session_id,
-                    "expected_capture_id": group_key[0],
-                    "expected_identity_evidence_sha256": evidence_sha256,
-                    "anchors": chunk,
-                },
-                timeout=60.0,
+            owner_key = (
+                expected["resourceId"],
+                expected["stage"],
+                expected["entryPoint"],
+                expected["rawSha256"],
             )
-            returned = response.get("anchors") if isinstance(response, Mapping) else None
-            expected_keys = {
-                (
-                    item["eventId"],
-                    item["stage"],
-                    item["resourceId"],
-                    item["entryPoint"],
-                    item["rawSha256"],
+            if owner_key in expected_owner_keys:
+                raise CatalogPreparationRequired(
+                    "cached project binding repeats one target-RDC Shader owner",
+                    "shader-resource-index-ambiguous",
                 )
-                for item in chunk
-            }
-            returned_keys = (
-                {
-                    (
-                        item.get("eventId"),
-                        item.get("stage"),
-                        item.get("resourceId"),
-                        item.get("entryPoint"),
-                        item.get("rawSha256"),
-                    )
-                    for item in returned
-                    if isinstance(item, Mapping)
-                }
-                if isinstance(returned, list)
-                else set()
-            )
-            if (
-                not isinstance(response, dict)
-                or response.get("schema")
-                != "replaylab-rdc-project-shader-rebind/v1"
-                or response.get("schemaVersion") != 1
-                or response.get("captureId") != group_key[0]
-                or response.get("captureSessionId") != capture_session_id
-                or response.get("identityEvidenceSha256") != evidence_sha256
-                or response.get("verifiedAnchorCount") != len(chunk)
-                or response.get("fullFrameTraversal") is not False
-                or response.get("physicalApplyAuthority") is not False
-                or returned_keys != expected_keys
-                or len(returned or []) != len(chunk)
-            ):
-                raise RuntimeError(
-                    "RenderDoc returned invalid cached Shader-anchor evidence"
+            expected_owner_keys.add(owner_key)
+            total_blocks += len(expected["constantBlocks"])
+            if total_blocks > _MAX_FAST_PROJECT_BLOCKS:
+                raise CatalogPreparationRequired(
+                    "cached project binding exceeds the fast CBuffer index limit",
+                    "shader-resource-index-block-limit",
                 )
-            reports.append(dict(response))
+            expected_shaders.append(expected)
+        reports.append(
+            _resource_index_job(
+                host,
+                capture_path,
+                capture_session_id,
+                group_key[0],
+                evidence_sha256,
+                api,
+                expected_shaders,
+            )
+        )
     return reports
 
 
@@ -814,6 +1648,7 @@ def _restore_material(
             raise RuntimeError("RDC material parameter set differs from project knowledge")
         live_parameters = list(session["parameters"])
         updates = []
+        batch_updates = []
         for saved in knowledge_parameters:
             matches = [
                 item
@@ -831,27 +1666,12 @@ def _restore_material(
             live_parameter_id = _hex(
                 matches[0].get("parameterId"), 32, "live material parameterId"
             )
-            updated = _tool_json(
-                host.update_material_parameter(
-                    session_id, live_parameter_id, copy.deepcopy(saved.get("value"))
-                ),
-                "update material parameter",
-                schema="renderdoc-ultra-material-session/v1",
-                schema_version=1,
+            batch_updates.append(
+                {
+                    "parameter": live_parameter_id,
+                    "value": copy.deepcopy(saved.get("value")),
+                }
             )
-            if any(
-                (
-                    updated.get("operation") != "update",
-                    updated.get("sessionId") != session_id,
-                    updated.get("captureId") != binding_state.get("captureId"),
-                    updated.get("captureSessionId") != capture_session_id,
-                    updated.get("layoutSha256")
-                    != knowledge.get("constantBlockLayoutSha256"),
-                    updated.get("updatedParameterId") != live_parameter_id,
-                    updated.get("applied") is not True,
-                )
-            ):
-                raise RuntimeError("material update returned invalid replay evidence")
             updates.append(
                 {
                     "parameterId": saved["parameterId"],
@@ -859,6 +1679,28 @@ def _restore_material(
                     "path": saved["path"],
                 }
             )
+        if batch_updates:
+            updated = _tool_json(
+                host.update_material_parameters(session_id, batch_updates),
+                "update material parameters",
+                schema="renderdoc-ultra-material-session/v1",
+                schema_version=1,
+            )
+            expected_live_ids = [item["liveParameterId"] for item in updates]
+            if any(
+                (
+                    updated.get("operation") != "update-many",
+                    updated.get("sessionId") != session_id,
+                    updated.get("captureId") != binding_state.get("captureId"),
+                    updated.get("captureSessionId") != capture_session_id,
+                    updated.get("layoutSha256")
+                    != knowledge.get("constantBlockLayoutSha256"),
+                    updated.get("updatedParameterIds") != expected_live_ids,
+                    updated.get("updatedParameterCount") != len(expected_live_ids),
+                    updated.get("applied") is not True,
+                )
+            ):
+                raise RuntimeError("material batch update returned invalid replay evidence")
         _remember_material_sync_parameters(
             session_id,
             session,
@@ -904,50 +1746,6 @@ def _restore_material(
         except Exception:
             pass
         raise
-
-
-def _catalog_material_block_index(
-    catalog_path: str | Path,
-    identity: Mapping[str, Any],
-    constant_block_path: str,
-) -> int:
-    try:
-        catalog = read_json_object(
-            Path(catalog_path), MAX_CAPTURE_CATALOG_BYTES, "active capture catalog"
-        )
-    except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc
-    shaders = catalog.get("shaders") if isinstance(catalog, Mapping) else None
-    if not isinstance(shaders, list):
-        raise RuntimeError("active capture catalog omitted Shader records")
-    matches = [
-        item
-        for item in shaders
-        if isinstance(item, Mapping)
-        and item.get("shaderResourceId", item.get("resourceId"))
-        == identity.get("resourceId")
-        and item.get("stage") == identity.get("stage")
-        and item.get("entryPoint", "") == identity.get("entryPoint", "")
-        and item.get("rawSha256") == identity.get("rawSha256")
-    ]
-    if len(matches) != 1:
-        raise RuntimeError("active catalog does not select one material Shader")
-    blocks = matches[0].get("constantBlocks")
-    if not isinstance(blocks, list):
-        raise RuntimeError("active Shader catalog omitted constant blocks")
-    indices = []
-    for position, block in enumerate(blocks):
-        if not isinstance(block, Mapping):
-            continue
-        index = block.get("index", position)
-        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
-            continue
-        path = str(block.get("name", "") or "cbuffer%d" % index)
-        if path == constant_block_path:
-            indices.append(index)
-    if len(indices) != 1:
-        raise RuntimeError("material block path has no unique current block index")
-    return indices[0]
 
 
 def _write_index_best_effort(
@@ -1016,162 +1814,6 @@ def _binding_document(
     }
 
 
-def _prepare_response(
-    host: Any,
-    active: Mapping[str, Any],
-    capture_session_id: str,
-    progress: _Progress,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    prepare_internal = getattr(host, "_prepare_active_capture_project", None)
-    create_channel = getattr(host, "_shader_catalog_progress_channel", None)
-    read_progress = getattr(host, "_read_shader_catalog_progress", None)
-    cleanup_progress = getattr(host, "_cleanup_shader_catalog_progress", None)
-    raw_prepared: Any
-    if not all(
-        callable(value)
-        for value in (
-            prepare_internal,
-            create_channel,
-            read_progress,
-            cleanup_progress,
-        )
-    ):
-        raw_prepared = host.prepare_active_capture_project()
-    else:
-        channel: Mapping[str, Any] | None = None
-        completed = threading.Event()
-        outcome: dict[str, Any] = {}
-        worker: threading.Thread | None = None
-        try:
-            candidate_channel = create_channel(capture_session_id)
-            if (
-                not isinstance(candidate_channel, Mapping)
-                or candidate_channel.get("captureSessionId") != capture_session_id
-            ):
-                raise RuntimeError(
-                    "Shader catalog progress channel changed capture lifecycle"
-                )
-            operation_token = _hex(
-                candidate_channel.get("operationToken"),
-                32,
-                "Shader catalog progress operationToken",
-            )
-            channel = candidate_channel
-
-            def run_prepare() -> None:
-                try:
-                    outcome["value"] = prepare_internal(operation_token)
-                except BaseException as exc:
-                    outcome["error"] = exc
-                finally:
-                    completed.set()
-
-            worker = threading.Thread(
-                target=run_prepare,
-                name="replaylab-shader-catalog-prepare",
-                daemon=False,
-            )
-            worker.start()
-        except Exception as exc:
-            warning = "Shader catalog progress setup failed: %s: %s" % (
-                type(exc).__name__,
-                exc,
-            )
-            if warning not in progress.warnings:
-                progress.warnings.append(warning)
-            if channel is not None:
-                try:
-                    cleanup_progress(channel)
-                except Exception:
-                    # The one setup warning is sufficient; telemetry cleanup
-                    # can never override the ordinary prepare fallback.
-                    pass
-            raw_prepared = host.prepare_active_capture_project()
-        else:
-            last_current = 0
-
-            def publish_latest() -> None:
-                nonlocal last_current
-                try:
-                    observation = read_progress(channel)
-                except Exception as exc:
-                    warning = "Shader catalog progress unavailable: %s: %s" % (
-                        type(exc).__name__,
-                        exc,
-                    )
-                    if warning not in progress.warnings:
-                        progress.warnings.append(warning)
-                    return
-                if not isinstance(observation, Mapping):
-                    return
-                current = int(observation["current"])
-                total = int(observation["total"])
-                event_id = int(observation["eventId"])
-                if current <= last_current:
-                    return
-                last_current = current
-                progress.emit(
-                    "export-shader-bindings",
-                    "Exporting Shader bindings EID %d (%d/%d)"
-                    % (event_id, current, total),
-                    current=current,
-                    total=total,
-                    detail={"eventId": event_id},
-                )
-
-            try:
-                if worker is None:
-                    raise RuntimeError("Shader catalog progress worker was not created")
-                while not completed.wait(0.05):
-                    publish_latest()
-                worker.join()
-                publish_latest()
-                error = outcome.get("error")
-                if isinstance(error, BaseException):
-                    raise error
-                raw_prepared = outcome.get("value")
-            finally:
-                try:
-                    cleanup_progress(channel)
-                except Exception as exc:
-                    warning = "Shader catalog progress cleanup failed: %s: %s" % (
-                        type(exc).__name__,
-                        exc,
-                    )
-                    if warning not in progress.warnings:
-                        progress.warnings.append(warning)
-
-    prepared = _tool_json(
-        raw_prepared,
-        "prepare active capture project",
-        schema="replaylab-active-capture-prepare/v1",
-        schema_version=1,
-    )
-    capture = prepared.get("capture")
-    project = prepared.get("project")
-    staged = prepared.get("stagedCatalog")
-    reuse = prepared.get("reusePlan")
-    if (
-        not isinstance(capture, Mapping)
-        or capture.get("captureSessionId") != capture_session_id
-        or not isinstance(project, Mapping)
-        or project.get("workspaceId") != active.get("workspaceId")
-        or _path_key(project.get("projectRoot", ""))
-        != _path_key(active.get("projectRoot", ""))
-        or not isinstance(staged, Mapping)
-        or staged.get("captureId") != capture.get("captureId")
-        or not isinstance(reuse, Mapping)
-        or reuse.get("schema") != "renderdoc-ultra-project-reuse-plan/v1"
-        or reuse.get("schemaVersion") != 1
-        or reuse.get("captureId") != capture.get("captureId")
-        or reuse.get("catalogSha256") != staged.get("catalogSha256")
-        or not isinstance(reuse.get("matches"), list)
-    ):
-        raise RuntimeError("active capture preparation returned inconsistent identities")
-    host._require_same_active_project(dict(active))
-    return prepared, dict(staged), dict(reuse)
-
-
 def _restore_from_cache(
     host: Any,
     replay: ReplayProjectService,
@@ -1194,8 +1836,8 @@ def _restore_from_cache(
             raise RuntimeError("RDC index maps one managed workspace more than once")
         seen_workspaces.add(workspace_id)
         progress.emit(
-            "cache-anchor",
-            "Validating cached Shader anchor %d/%d" % (index, len(records)),
+            "cache-resource",
+            "Validating cached Shader asset %d/%d" % (index, len(records)),
             current=index,
             total=len(records),
             detail={"workspaceId": workspace_id},
@@ -1211,7 +1853,7 @@ def _restore_from_cache(
         )
         validated.append((record, workspace, status))
 
-    _bind_workspace_anchors(
+    _match_workspace_resources(
         host, capture_path, capture_session_id, validated
     )
 
@@ -1316,306 +1958,6 @@ def _restore_from_cache(
     return successful_shader_records, successful_material_records
 
 
-def _restore_from_reuse_plan(
-    host: Any,
-    replay: ReplayProjectService,
-    active_service: Any,
-    active: dict[str, Any],
-    project_root: Path,
-    capture_path: Path,
-    capture_session_id: str,
-    staged: Mapping[str, Any],
-    reuse: Mapping[str, Any],
-    binding_state: Mapping[str, Any],
-    progress: _Progress,
-    shader_summary: dict[str, Any],
-    material_summary: dict[str, Any],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    matches = list(reuse.get("matches", []) or [])
-    successful_shader_records: list[dict[str, Any]] = []
-    identities_by_key: dict[tuple[int, str], dict[str, Any]] = {}
-    route_binding_sha256 = host._active_shader_route_binding_sha256()
-    for index, match in enumerate(matches, 1):
-        shader = match.get("shader") if isinstance(match, Mapping) else None
-        if not isinstance(shader, Mapping):
-            continue
-        identity = _normal_shader_identity(shader)
-        identities_by_key[(identity["resourceId"], identity["stage"])] = identity
-        candidates = [
-            item
-            for item in list(match.get("workspaceCandidates", []) or [])
-            if isinstance(item, Mapping) and item.get("sourceSeedEligible") is True
-        ]
-        if len(candidates) != 1:
-            shader_summary["skipped"] += 1
-            shader_summary["items"].append(
-                {
-                    "status": "skipped",
-                    "source": "reuse-plan",
-                    "resourceId": identity["resourceId"],
-                    "stage": identity["stage"],
-                    "reason": (
-                        "no sourceSeedEligible candidate"
-                        if not candidates
-                        else "multiple sourceSeedEligible candidates"
-                    ),
-                }
-            )
-            continue
-        shader_summary["attempted"] += 1
-        candidate = candidates[0]
-        knowledge_id = _hex(candidate.get("knowledgeId"), 32, "workspace knowledgeId")
-        progress.emit(
-            "shader-prepare",
-            "Preparing shared Shader %d/%d" % (index, len(matches)),
-            current=index,
-            total=len(matches),
-            detail={
-                "resourceId": identity["resourceId"],
-                "stage": identity["stage"],
-                "knowledgeId": knowledge_id,
-            },
-        )
-        try:
-            knowledge = binding_state.get("workspaces", {}).get(knowledge_id)
-            if not isinstance(knowledge, Mapping):
-                raise RuntimeError("reuse plan references absent workspace knowledge")
-            if knowledge.get("sourceSha256") != candidate.get("sourceSha256"):
-                raise RuntimeError("reuse-plan source hash differs from project knowledge")
-            workspace = active_service.shader_workspace_path(
-                capture_id=binding_state["captureId"],
-                catalog_sha256=binding_state["catalogSha256"],
-                route_binding_sha256=route_binding_sha256,
-                stage=identity["stage"],
-                shader_resource_id=identity["resourceId"],
-                raw_sha256=identity["rawSha256"],
-                create=False,
-            )
-            shader_root = Path(str(active["paths"]["shaderWorkspaces"])).resolve()
-            if not is_within(shader_root, workspace.resolve()):
-                raise RuntimeError("managed Shader workspace escaped the project")
-            if not workspace.exists():
-                prepared = _tool_json(
-                    host.prepare_shader_workspace(
-                        min(identity["eventIds"]), identity["stage"], str(workspace)
-                    ),
-                    "prepare Shader workspace",
-                    schema="renderdoc-ultra-shader-workspace-mcp/v1",
-                )
-                if prepared.get("operation") != "prepare":
-                    raise RuntimeError("Shader workspace preparation returned another operation")
-            status = host._shader_workspace_service().status(str(workspace))
-            source = status.get("source") if isinstance(status, Mapping) else None
-            latest = status.get("latestCompiled") if isinstance(status, Mapping) else None
-            if (
-                not isinstance(status, dict)
-                or status.get("schema") != "renderdoc-ultra-shader-workspace-status/v1"
-                or status.get("capture", {}).get("captureId")
-                != binding_state["captureId"]
-                or status.get("capture", {}).get("catalogSha256")
-                != binding_state["catalogSha256"]
-                or status.get("shader", {}).get("resourceId")
-                != identity["resourceId"]
-                or status.get("stage") != identity["stage"]
-                or status.get("shader", {}).get("rawSha256")
-                != identity["rawSha256"]
-                or not isinstance(source, Mapping)
-            ):
-                raise RuntimeError("managed workspace does not match the reuse-plan Shader")
-            if source.get("currentSha256") != knowledge["sourceSha256"]:
-                if source.get("modifiedSinceDecompile") is not False:
-                    raise RuntimeError(
-                        "managed workspace already contains another source edit"
-                    )
-                seeded = _tool_json(
-                    host.seed_active_shader_workspace(knowledge_id, str(workspace)),
-                    "seed active Shader workspace",
-                    schema="replaylab-active-workspace-seed/v1",
-                    schema_version=1,
-                )
-                if seeded.get("result", {}).get("sourceSha256") != knowledge["sourceSha256"]:
-                    raise RuntimeError("seeded workspace source hash changed")
-                status = host._shader_workspace_service().status(str(workspace))
-                source = status.get("source")
-                latest = status.get("latestCompiled")
-            if (
-                not isinstance(source, Mapping)
-                or source.get("lane") != "executable-editable"
-                or source.get("format") != "hlsl"
-                or source.get("currentSha256") != knowledge["sourceSha256"]
-            ):
-                raise RuntimeError("shared source did not produce an executable HLSL workspace")
-            if (
-                not isinstance(latest, Mapping)
-                or latest.get("sourceSha256") != knowledge["sourceSha256"]
-            ):
-                progress.emit(
-                    "shader-compile",
-                    "Compiling shared Shader %d/%d" % (index, len(matches)),
-                    current=index,
-                    total=len(matches),
-                    detail={"workspacePath": str(workspace)},
-                )
-                compiled = _tool_json(
-                    host.compile_shader_workspace(str(workspace)),
-                    "compile Shader workspace",
-                    schema="renderdoc-ultra-shader-workspace-mcp/v1",
-                )
-                if compiled.get("operation") != "compile":
-                    raise RuntimeError("Shader compile returned another operation")
-                status = host._shader_workspace_service().status(str(workspace))
-                latest = status.get("latestCompiled")
-            if not isinstance(latest, Mapping):
-                raise RuntimeError("compiled workspace omitted its candidate")
-            progress.emit(
-                "shader-apply",
-                "Validating ABI and applying Shader %d/%d" % (index, len(matches)),
-                current=index,
-                total=len(matches),
-                detail={"workspacePath": str(workspace)},
-            )
-            applied = _apply_workspace(
-                host,
-                workspace,
-                status,
-                expected_revision=_integer(latest.get("revision"), "candidate revision", 1),
-                expected_candidate_raw_sha256=_hex(
-                    latest.get("rawSha256"), 64, "candidate rawSha256"
-                ),
-                capture_session_id=capture_session_id,
-            )
-            record = _shader_record_from_status(
-                project_root, identity, knowledge_id, workspace, status
-            )
-            successful_shader_records.append(record)
-            shader_summary["applied"] += 1
-            shader_summary["items"].append(
-                {
-                    "status": "applied",
-                    "source": "reuse-plan",
-                    "workspacePath": str(workspace),
-                    "workspaceId": status["workspaceId"],
-                    "resourceId": identity["resourceId"],
-                    "stage": identity["stage"],
-                    "knowledgeId": knowledge_id,
-                    "replacementId": applied["replacement"]["replacementId"],
-                }
-            )
-        except Exception as exc:
-            shader_summary["failed"] += 1
-            shader_summary["items"].append(
-                {
-                    "status": "failed",
-                    "source": "reuse-plan",
-                    "resourceId": identity["resourceId"],
-                    "stage": identity["stage"],
-                    "knowledgeId": knowledge_id,
-                    "error": "%s: %s" % (type(exc).__name__, exc),
-                }
-            )
-
-    successful_material_records: list[dict[str, Any]] = []
-    material_jobs: list[tuple[dict[str, Any], Mapping[str, Any]]] = []
-    for match in matches:
-        if not isinstance(match, Mapping) or not isinstance(match.get("shader"), Mapping):
-            continue
-        identity = _normal_shader_identity(match["shader"])
-        candidates = [
-            item
-            for item in list(match.get("materialCandidates", []) or [])
-            if isinstance(item, Mapping)
-        ]
-        # ReplayProjectService has already collapsed append-only history to one
-        # active head per CBuffer path. Multiple remaining candidates therefore
-        # represent distinct blocks and each gets its own fresh live session and
-        # layout/type gate.
-        seen_blocks: set[str] = set()
-        for candidate in candidates:
-            knowledge = binding_state.get("materials", {}).get(
-                str(candidate.get("knowledgeId", ""))
-            )
-            block_path = (
-                str(knowledge.get("constantBlockPath", ""))
-                if isinstance(knowledge, Mapping)
-                else str(candidate.get("constantBlockPath", ""))
-            )
-            if not block_path or block_path in seen_blocks:
-                material_summary["skipped"] += 1
-                material_summary["items"].append(
-                    {
-                        "status": "skipped",
-                        "source": "reuse-plan",
-                        "resourceId": identity["resourceId"],
-                        "stage": identity["stage"],
-                        "reason": "duplicate or invalid active CBuffer head",
-                    }
-                )
-                continue
-            seen_blocks.add(block_path)
-            material_jobs.append((identity, candidate))
-    for index, (identity, candidate) in enumerate(material_jobs, 1):
-        material_summary["attempted"] += 1
-        knowledge_id = _hex(candidate.get("knowledgeId"), 32, "material knowledgeId")
-        progress.emit(
-            "material-restore",
-            "Restoring shared CBuffer %d/%d" % (index, len(material_jobs)),
-            current=index,
-            total=len(material_jobs),
-            detail={
-                "resourceId": identity["resourceId"],
-                "stage": identity["stage"],
-                "knowledgeId": knowledge_id,
-            },
-        )
-        try:
-            knowledge = binding_state.get("materials", {}).get(knowledge_id)
-            if not isinstance(knowledge, Mapping):
-                raise RuntimeError("reuse plan references absent material knowledge")
-            block_index = _catalog_material_block_index(
-                staged["catalogPath"], identity, knowledge["constantBlockPath"]
-            )
-            seed_record = {
-                "knowledgeId": knowledge_id,
-                "shaderResourceId": identity["resourceId"],
-                "stage": identity["stage"],
-                "blockIndex": block_index,
-                "path": knowledge["constantBlockPath"],
-                "layoutSha256": knowledge["constantBlockLayoutSha256"],
-                "eventId": min(identity["eventIds"]),
-                "parameters": [
-                    {"parameterId": item["parameterId"]}
-                    for item in knowledge["parameters"]
-                ],
-            }
-            item, clean_record = _restore_material(
-                host,
-                replay,
-                binding_state,
-                str(active["workspaceId"]),
-                identity,
-                seed_record,
-                capture_session_id,
-            )
-            item["source"] = "reuse-plan"
-            material_summary["restored"] += 1
-            material_summary["sessionIds"].append(item["sessionId"])
-            material_summary["items"].append(item)
-            successful_material_records.append(clean_record)
-        except Exception as exc:
-            material_summary["failed"] += 1
-            material_summary["items"].append(
-                {
-                    "status": "failed",
-                    "source": "reuse-plan",
-                    "knowledgeId": knowledge_id,
-                    "resourceId": identity["resourceId"],
-                    "stage": identity["stage"],
-                    "error": "%s: %s" % (type(exc).__name__, exc),
-                }
-            )
-    return successful_shader_records, successful_material_records
-
-
 def restore_active_capture_project(
     project_root: str | Path,
     capture_path: str | Path,
@@ -1625,9 +1967,9 @@ def restore_active_capture_project(
     """Restore project Shader/CBuffer knowledge into the active local capture.
 
     The function is synchronous and safe to call from a persistent-host worker
-    thread.  A valid RDC cache avoids full-frame export.  A stale/missing cache
-    falls back to the existing full preparation and handles only unique fixed-
-    program candidates.
+    thread. A valid RDC cache avoids full-frame export. A stale or missing
+    cache never falls back to an implicit full-frame scan; building the complete
+    project index is a separate, explicit background operation.
     """
 
     operation_id = uuid.uuid4().hex
@@ -1691,12 +2033,12 @@ def restore_active_capture_project(
                     "replayProjectId": active["replayProject"]["projectId"],
                 }
             )
-            active_service = host._active_project_service()
             replay = ReplayProjectService(replay_path)
             index_transport: dict[str, Any] | None = None
             index_document: dict[str, Any] | None = None
             selected: dict[str, Any] | None = None
             binding_state: dict[str, Any] | None = None
+            action_reason_id = CATALOG_INDEX_REQUIRED_REASON_ID
             progress.emit("index-read", "Reading RDC project association cache")
             try:
                 index_transport, index_document = _read_rdc_index(
@@ -1734,7 +2076,7 @@ def restore_active_capture_project(
             if selected is not None and binding_state is not None:
                 progress.emit(
                     "cache-hit",
-                    "RDC cache matched; validating bounded live Shader anchors",
+                    "RDC cache matched; indexing bounded live Shader resources",
                     detail={"shaderCount": len(selected["shaders"])},
                 )
                 try:
@@ -1753,8 +2095,8 @@ def restore_active_capture_project(
                     )
                 except Exception as exc:
                     # Cache validation failed before it became apply authority.
-                    # Re-run the ordinary preparation instead of trusting a
-                    # partially validated association.
+                    # Do not trust the association and do not replace it with
+                    # an implicit full-frame preparation.
                     result["cache"] = {
                         "hit": False,
                         "reason": "cache-live-validation-failed: %s: %s"
@@ -1762,6 +2104,8 @@ def restore_active_capture_project(
                     }
                     shader_records = []
                     material_records = []
+                    if isinstance(exc, CatalogPreparationRequired):
+                        action_reason_id = exc.reason_id
                     selected = None
                     binding_state = None
             else:
@@ -1770,31 +2114,13 @@ def restore_active_capture_project(
 
             if selected is None or binding_state is None:
                 progress.emit(
-                    "prepare",
-                    "RDC cache unavailable; preparing current capture project",
+                    "index-required",
+                    "RDC cache unavailable; full Shader index must be built explicitly",
                 )
-                unused_prepared, staged, reuse = _prepare_response(
-                    host, active, live_session, progress
-                )
-                binding_state = replay.restore_knowledge_snapshot(
-                    str(staged["captureId"]), str(staged["catalogSha256"])
-                )
-                if reuse.get("projectId") != binding_state.get("projectId"):
-                    raise RuntimeError("reuse plan belongs to another replay project")
-                shader_records, material_records = _restore_from_reuse_plan(
-                    host,
-                    replay,
-                    active_service,
-                    active,
-                    project,
-                    Path(capture_path).resolve(),
-                    live_session,
-                    staged,
-                    reuse,
-                    binding_state,
-                    progress,
-                    result["shaders"],
-                    result["materials"],
+                raise CatalogPreparationRequired(
+                    "the full Shader index is unavailable; opening an RDC no longer "
+                    "starts an implicit full-frame scan",
+                    action_reason_id,
                 )
 
             result["capture"]["captureId"] = binding_state["captureId"]
@@ -1847,6 +2173,12 @@ def restore_active_capture_project(
                     "cacheHit": result["cache"]["hit"],
                 },
             )
+        except CatalogPreparationRequired as exc:
+            # This is an expected fail-closed product state, not a restore
+            # fault. Keep the transport successful and expose stable protocol
+            # values instead of leaking a Python exception class to qrenderdoc.
+            result["outcome"] = "action-required"
+            result["reasonId"] = exc.reason_id
         except Exception as exc:
             result["error"] = "%s: %s" % (type(exc).__name__, exc)
             result["errorType"] = type(exc).__name__

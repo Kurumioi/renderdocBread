@@ -1,13 +1,19 @@
 # ReplayLab RenderDoc skills
 
-These are the canonical Agent Skills for both ReplayLab AgentHost and Codex
-app-server. They organize stable ReplayLab MCP operations by user workflow,
-not one skill per low-level tool.
+These are the canonical specialist Skills for ReplayLab AgentHost and Codex
+app-server. The catalog intentionally contains only two broad, composable
+workflows:
 
-The seven catalog domains are event/pipeline, pixel/texture, shader, material
-bindings, performance, resource analysis, and disabled export/interoperability.
-`allowed-tools`
-is declarative input, while AgentHost independently intersects it with the
-authoritative read-only Host policy and enforces required evidence tools.
-Export/effectful tools remain unavailable until qrenderdoc issues a native,
-nonce-bound capability ticket; skill text is never mutation authorization.
+- `renderdoc-explain-event` owns EID, draw/dispatch, pipeline, pass-tree, and
+  frame-flow analysis.
+- `renderdoc-shader-workbench` owns shader identity, reconstruction, readable
+  HLSL, algorithm analysis, compile/ABI validation, replay replacement,
+  rollback, and project-library registration.
+
+`allowed-tools` is a discoverable workflow inventory, not a command to invoke
+every tool and not blanket mutation authority. Runtime availability is decided
+from the current Host/tool manifest. Missing optional tools should narrow the
+workflow or produce a precise follow-up instead of blocking unrelated analysis.
+Effectful steps are constrained by target identity, preflight, validation,
+postcondition, and rollback evidence. A specialist may report completion only
+for stages whose evidence and acceptance criteria actually passed.

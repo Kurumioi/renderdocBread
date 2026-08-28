@@ -312,9 +312,26 @@ void ReplayManager::CloseThread()
   if(m_Thread == NULL)
     return;
 
-  // wait for the thread to close and clean up
-  while(m_Thread->isRunning())
+  // Give normal renderer shutdown a bounded grace period. If a driver call is stuck we must not
+  // terminate the replay thread or destroy its resources underneath it, but we also must not burn a
+  // CPU core polling isRunning(). After reporting actionable state, wait in the OS instead.
+  const unsigned long shutdownGracePeriodMS = 5000;
+  if(!m_Thread->wait(shutdownGracePeriodMS))
   {
+    int queuedCommands = 0;
+    {
+      QMutexLocker lock(&m_RenderLock);
+      queuedCommands = m_RenderQueue.count();
+    }
+
+    qCritical() << "ReplayManager shutdown exceeded" << shutdownGracePeriodMS
+                << "ms; waiting for replay cleanup to complete safely. Current command:"
+                << GetCurrentProcessingTag() << "elapsed seconds:" << GetCurrentProcessingTime()
+                << "queued commands:" << queuedCommands;
+
+    // Replay/driver objects are owned by this thread. A forced termination or early return would
+    // risk use-after-free, so retain the mandatory wait without busy-spinning.
+    m_Thread->wait();
   }
 
   m_Thread->deleteLater();

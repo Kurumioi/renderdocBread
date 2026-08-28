@@ -281,6 +281,53 @@ class IPCClientTests(unittest.TestCase):
                     client._instance_mailbox()
                 self.assertEqual("45028", client.instance_id)
 
+    def test_direct_tool_binding_pins_one_instance_without_mutating_client(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            instance_root = os.path.join(temporary, "instances")
+            os.makedirs(instance_root)
+            now = int(time.time() * 1000)
+            self._write_instance(
+                instance_root, "origin", loaded=True, activity=now - 1000, pid=101
+            )
+            self._write_instance(
+                instance_root, "current", loaded=True, activity=now, pid=202
+            )
+            with mock.patch.object(
+                ipc_client, "INSTANCE_ROOT", instance_root
+            ), mock.patch.object(
+                ipc_client.IPCClient, "_process_alive", return_value=True
+            ):
+                client = ipc_client.IPCClient()
+                with ipc_client.bind_direct_tool_call("origin", "a" * 32):
+                    request_dir, _ = client._instance_mailbox()
+                    self.assertIn("origin", request_dir)
+                    self.assertEqual("", client.instance_id)
+                request_dir, _ = client._instance_mailbox()
+
+            self.assertIn("current", request_dir)
+            self.assertEqual("current", client.instance_id)
+
+    def test_direct_tool_binding_injects_and_protects_capture_session(self):
+        client = ipc_client.IPCClient()
+        with mock.patch.object(client, "_call_locked", return_value={"ok": True}) as call:
+            with ipc_client.bind_direct_tool_call("qrenderdoc-pinned", "b" * 32):
+                result = client.call("get_pipeline_state", {"event_id": 7})
+                with self.assertRaisesRegex(RuntimeError, "frozen capture session"):
+                    client.call(
+                        "get_pipeline_state",
+                        {
+                            "event_id": 7,
+                            "__replaylab_expected_capture_session_id": "c" * 32,
+                        },
+                    )
+
+        self.assertEqual({"ok": True}, result)
+        sent = call.call_args.args[1]
+        self.assertEqual(7, sent["event_id"])
+        self.assertEqual(
+            "b" * 32, sent["__replaylab_expected_capture_session_id"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

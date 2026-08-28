@@ -1,6 +1,6 @@
 [project]
 name = "renderdoc-mcp"
-version = "1.10.1"
+version = "1.10.2"
 description = "ReplayLab sidecar host for RenderDocUltra's built-in AI integration, capture analysis, and shader workflows"
 requires-python = ">=3.10"
 dependencies = [
@@ -10,11 +10,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-companion = [
-    # Responses API + async function calling. Imported only by the sidecar
-    # companion process, never by qrenderdoc or its embedded Python bridge.
-    "openai>=1.66.0,<3.0.0",
-]
 bundle = [
     # Build-only dependency. The produced ReplayLabMCP executable contains the
     # MCP runtime, so recipients do not install Python or FastMCP separately.
@@ -24,7 +19,6 @@ bundle = [
 [project.scripts]
 renderdoc-mcp = "src.server:main"
 replaylab-mcp = "src.replaylab_host:main"
-renderdoc-ai-companion = "src.companion.cli:main"
 
 [build-system]
 requires = ["hatchling"]

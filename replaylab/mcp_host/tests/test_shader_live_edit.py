@@ -43,6 +43,7 @@ class _FakeWatchManager:
         self.initial_compile_successes = initial_compile_successes
         self.start_calls: list[tuple[str, int]] = []
         self.stop_calls: list[str] = []
+        self.save_calls: list[tuple[str, str, str]] = []
         self.poll_calls = 0
         self.block_first_start = False
         self.first_start_entered = threading.Event()
@@ -100,6 +101,22 @@ class _FakeWatchManager:
             snapshot["state"] = "stopped"
             snapshot["compileInProgress"] = False
             return copy.deepcopy(snapshot)
+
+    def save_source(self, watch_id, expected_raw_sha256, text):
+        with self._lock:
+            snapshot = self._snapshots[watch_id]
+            if snapshot["state"] != "running":
+                raise RuntimeError("test watcher is not running")
+            self.save_calls.append((watch_id, expected_raw_sha256, text))
+            raw = text.encode("utf-8")
+            return {
+                "watchId": watch_id,
+                "rawSha256": hashlib.sha256(raw).hexdigest(),
+                "size": len(raw),
+                "modifiedNs": 123456789,
+                "changed": True,
+                "compileScheduled": True,
+            }
 
     def publish(
         self,
@@ -402,6 +419,82 @@ class ShaderLiveEditTests(unittest.TestCase):
         self.assertEqual(status["applySuccesses"], 1)
         self.assertTrue(status["policy"]["freshReplayAbiValidationRequired"])
         self.manager.stop(started["liveEditId"])
+
+    def test_host_save_requires_exact_running_authorization_and_workspace(self):
+        registry = Path(self.temporary.name) / "config" / "live-edit.json"
+        manager = ShaderLiveEditManager(
+            self.watch,
+            lambda _workspace, revision, raw: _compatible_result(
+                self.workspace, revision, raw
+            ),
+            poll_seconds=0.005,
+            join_seconds=0.5,
+            registry_path=registry,
+            workspace_identity=lambda _path: copy.deepcopy(self._identity()),
+        )
+        self.manager = manager
+        started = manager.start(self.workspace, 100)
+        live_edit_id = started["liveEditId"]
+        watch_id = started["watchId"]
+        _wait_until(lambda: manager.poll(live_edit_id)["state"] == "running")
+        authorization = json.loads(registry.read_text(encoding="utf-8"))[
+            "entries"
+        ][0]
+        authorization_id = authorization["authorizationId"]
+        workspace_id = authorization["workspaceIdentity"]["workspaceId"]
+        expected_sha256 = "d" * 64
+        text = "float4 MainPS() : SV_Target { return 11; }\n"
+
+        saved = manager.save_authorized_source(
+            live_edit_id,
+            authorization_id,
+            workspace_id,
+            expected_sha256,
+            text,
+        )
+
+        self.assertEqual(
+            [(watch_id, expected_sha256, text)], self.watch.save_calls
+        )
+        self.assertEqual(live_edit_id, saved["liveEditId"])
+        self.assertEqual(authorization_id, saved["authorizationId"])
+        self.assertEqual(workspace_id, saved["workspaceId"])
+        self.assertEqual(
+            hashlib.sha256(text.encode("utf-8")).hexdigest(), saved["rawSha256"]
+        )
+
+        with self.assertRaisesRegex(
+            ShaderLiveEditError, "authorization does not own"
+        ):
+            manager.save_authorized_source(
+                live_edit_id,
+                "f" * 32,
+                workspace_id,
+                expected_sha256,
+                text,
+            )
+        with self.assertRaisesRegex(
+            ShaderLiveEditError, "unavailable or ambiguous"
+        ):
+            manager.save_authorized_source(
+                live_edit_id,
+                authorization_id,
+                "f" * 32,
+                expected_sha256,
+                text,
+            )
+        self.assertEqual(1, len(self.watch.save_calls))
+
+        manager.stop(live_edit_id)
+        with self.assertRaisesRegex(ShaderLiveEditError, "not running"):
+            manager.save_authorized_source(
+                live_edit_id,
+                authorization_id,
+                workspace_id,
+                expected_sha256,
+                text,
+            )
+        self.assertEqual(1, len(self.watch.save_calls))
 
     def test_transient_winerror5_persisting_live_audit_keeps_session_running(self):
         calls = []

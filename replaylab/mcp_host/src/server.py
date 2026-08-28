@@ -11,10 +11,13 @@ import atexit, copy, hashlib, json, logging, os, re, subprocess, tempfile, threa
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Mapping
-from mcp.server.fastmcp import FastMCP
 from .active_projects import ActiveReplayProjectService
 from .console_events import emit_console_event, instrument_mcp_tool
 from .ipc_client import IPCClient, INSTANCE_ROOT
+from .internal_tool_service import (
+    shader_live_edit_manager as _shader_live_edit_manager,
+    shutdown_shader_live_edits as _shutdown_shader_live_edits,
+)
 from .material_sessions import MaterialSessionManager
 from .pass_classification import (
     CLASSIFICATION_SCHEMA,
@@ -24,7 +27,6 @@ from .pass_classification import (
     classify_passes,
 )
 from .projects import ReplayProjectService
-from .shader_live_edit import ShaderLiveEditManager
 from .shader_workspace import (
     ShaderOrganizationError,
     ShaderOrganizationManager,
@@ -54,30 +56,72 @@ from .version import SERVICE_VERSION
 logger = logging.getLogger("renderdoc-mcp")
 logging.basicConfig(level=logging.INFO, format="%(name)s | %(levelname)s | %(message)s")
 
-class _ConsoleAwareFastMCP(FastMCP):
-    """Register fixed business-tool telemetry without changing tool contracts."""
+class _DeferredFastMCP:
+    """Collect tool declarations without importing or constructing FastMCP.
+
+    The same high-level implementations serve the private Internal ToolService
+    and the optional external MCP adapter.  Importing this module for an
+    internal Shader operation must therefore remain transport-free.  The real
+    FastMCP application is created only when an external stdio/HTTP transport
+    explicitly requests ``run`` or ``streamable_http_app``.
+    """
+
+    def __init__(self) -> None:
+        self._registrations: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+        self._application: Any | None = None
+        self._guard = threading.Lock()
 
     def tool(self, *args: Any, **kwargs: Any) -> Any:
-        register = super().tool(*args, **kwargs)
+        def register(function: Any) -> Any:
+            if self._application is not None:
+                raise RuntimeError("MCP tools cannot be registered after startup")
+            self._registrations.append((function, args, dict(kwargs)))
+            return function
 
-        def register_with_console(function: Any) -> Any:
-            return register(instrument_mcp_tool(function))
+        return register
 
-        return register_with_console
+    def _build(self) -> Any:
+        with self._guard:
+            if self._application is not None:
+                return self._application
+            from mcp.server.fastmcp import FastMCP
+
+            class _ConsoleAwareFastMCP(FastMCP):
+                def tool(inner_self, *args: Any, **kwargs: Any) -> Any:
+                    register = super(_ConsoleAwareFastMCP, inner_self).tool(
+                        *args, **kwargs
+                    )
+
+                    def register_with_console(function: Any) -> Any:
+                        return register(instrument_mcp_tool(function))
+
+                    return register_with_console
+
+            application = _ConsoleAwareFastMCP(
+                "ReplayLab",
+                instructions=(
+                    "Capture-bound GPU replay analysis with Shader "
+                    "reverse-engineering, ABI validation, material sessions, "
+                    "and project symbol matching"
+                ),
+            )
+            # FastMCP otherwise advertises the installed SDK version. Keep the
+            # external initialize/serverInfo record aligned with the bundle.
+            if hasattr(application, "_mcp_server"):
+                application._mcp_server.version = SERVICE_VERSION
+            for function, args, kwargs in self._registrations:
+                application.tool(*args, **kwargs)(function)
+            self._application = application
+            return application
+
+    def streamable_http_app(self) -> Any:
+        return self._build().streamable_http_app()
+
+    def run(self, **kwargs: Any) -> Any:
+        return self._build().run(**kwargs)
 
 
-mcp = _ConsoleAwareFastMCP(
-    "ReplayLab",
-    instructions=(
-        "Capture-bound GPU replay analysis with shader reverse-engineering, "
-        "ABI validation, material sessions, and project symbol matching"
-    ),
-)
-# FastMCP otherwise advertises the installed MCP SDK version as this server's
-# application version. Keep initialize/serverInfo aligned with the bundle,
-# bridge and singleton-host state.
-if hasattr(mcp, "_mcp_server"):
-    mcp._mcp_server.version = SERVICE_VERSION
+mcp = _DeferredFastMCP()
 ipc = IPCClient(timeout=30.0)
 
 def _ok(d: Any) -> str:
@@ -108,9 +152,29 @@ def _shader_err(error: Exception, phase: str) -> str:
         default=str,
     )
 
+def _scoped_capture_session_id() -> str:
+    try:
+        scope = json.loads(os.environ.get("REPLAYLAB_TOOL_SCOPE", "") or "{}")
+    except (TypeError, ValueError):
+        return ""
+    value = str(scope.get("capture_session_id", "") or "").strip().lower()
+    if len(value) != 32 or any(character not in "0123456789abcdef" for character in value):
+        return ""
+    return value
+
+
+_SCOPED_CAPTURE_SESSION_ID = _scoped_capture_session_id()
+
+
 def _call(method: str, params: dict = None, timeout: float = None) -> str:
     try:
-        return _ok(ipc.call(method, params or {}, timeout=timeout))
+        payload = dict(params or {})
+        if _SCOPED_CAPTURE_SESSION_ID:
+            # Host-owned field, absent from every model-visible MCP schema.
+            payload["__replaylab_expected_capture_session_id"] = (
+                _SCOPED_CAPTURE_SESSION_ID
+            )
+        return _ok(ipc.call(method, payload, timeout=timeout))
     except Exception as e:
         return _err(e)
 
@@ -564,9 +628,6 @@ def _shutdown_shader_workspace_watches() -> None:
 atexit.register(_shutdown_shader_workspace_watches)
 
 
-_SHADER_LIVE_EDIT_MANAGER = None
-_SHADER_LIVE_EDIT_MANAGER_GUARD = threading.Lock()
-
 _SHADER_ORGANIZATION_MANAGER = None
 _SHADER_ORGANIZATION_MANAGER_GUARD = threading.Lock()
 
@@ -727,31 +788,6 @@ def _shader_live_edit_workspace_migration_evidence(
         workspace_path,
         expected_source_sha256=expected_source_sha256,
     )
-
-
-def _shader_live_edit_manager() -> ShaderLiveEditManager:
-    """Return the bounded manager layered on the one workspace watcher."""
-
-    global _SHADER_LIVE_EDIT_MANAGER
-    with _SHADER_LIVE_EDIT_MANAGER_GUARD:
-        if _SHADER_LIVE_EDIT_MANAGER is None:
-            _SHADER_LIVE_EDIT_MANAGER = ShaderLiveEditManager(
-                _shader_workspace_watch_manager(),
-                _shader_live_edit_apply_candidate,
-                registry_path=_SHADER_LIVE_EDIT_REGISTRY_PATH,
-                workspace_identity=_shader_live_edit_workspace_identity,
-                workspace_migration_evidence=(
-                    _shader_live_edit_workspace_migration_evidence
-                ),
-            )
-        return _SHADER_LIVE_EDIT_MANAGER
-
-
-def _shutdown_shader_live_edits() -> None:
-    with _SHADER_LIVE_EDIT_MANAGER_GUARD:
-        manager = _SHADER_LIVE_EDIT_MANAGER
-    if manager is not None:
-        manager.shutdown()
 
 
 # Registered after the low-level watcher so LIFO shutdown stops/join live-edit
@@ -1997,83 +2033,6 @@ def get_current_renderdoc_context() -> str:
     return _call("get_current_renderdoc_context")
 
 
-@mcp.tool()
-def claim_renderdoc_ui_intents(
-    consumer_id: str, max_count: int = 1, lease_seconds: int = 30
-) -> str:
-    """Lease explicit commands queued by buttons inside RenderDoc.
-
-    This is intended for an external chat/Responses companion. Each intent
-    freezes its click-time context and grants a bounded operation allow-list
-    from an explicit RenderDoc UI click. The suggested step order is advisory;
-    replay mutation and arbitrary filesystem mutation remain unauthorised.
-    There is deliberately no MCP enqueue tool, so a model cannot forge the
-    ``renderdoc-ui`` origin.
-
-    Args:
-        consumer_id: Stable identity for this external companion process.
-        max_count: Number to claim, between 1 and 16.
-        lease_seconds: Retry lease, between 5 and 300 seconds.
-    """
-    return _call(
-        "claim_renderdoc_ui_intents",
-        {
-            "consumer_id": consumer_id,
-            "max_count": max_count,
-            "lease_seconds": lease_seconds,
-        },
-    )
-
-
-@mcp.tool()
-def renew_renderdoc_ui_intent(
-    intent_id: str, lease_token: str, lease_seconds: int = 300
-) -> str:
-    """Extend a still-live RenderDoc UI intent claim.
-
-    Long deterministic decompilation and model review must renew their lease so
-    a second companion cannot claim the same button action. An expired claim is
-    never revived, and the existing random lease token must match.
-    """
-    return _call(
-        "renew_renderdoc_ui_intent",
-        {
-            "intent_id": intent_id,
-            "lease_token": lease_token,
-            "lease_seconds": lease_seconds,
-        },
-    )
-
-
-@mcp.tool()
-def complete_renderdoc_ui_intent(
-    intent_id: str, lease_token: str, outcome: str, summary: str = ""
-) -> str:
-    """Complete a live RenderDoc UI-intent lease.
-
-    Args:
-        intent_id: ID returned by claim_renderdoc_ui_intents.
-        lease_token: Live claim token returned with that intent.
-        outcome: One of completed, failed, or rejected.
-        summary: Bounded human-readable outcome for UI/companion diagnostics.
-    """
-    return _call(
-        "complete_renderdoc_ui_intent",
-        {
-            "intent_id": intent_id,
-            "lease_token": lease_token,
-            "outcome": outcome,
-            "summary": summary,
-        },
-    )
-
-
-@mcp.tool()
-def get_renderdoc_ui_intent_status(intent_id: str) -> str:
-    """Read one queued/claimed/completed RenderDoc UI intent by ID."""
-    return _call("get_renderdoc_ui_intent_status", {"intent_id": intent_id})
-
-
 # ==================== 2. CAPTURE MANAGEMENT ====================
 
 @mcp.tool()
@@ -2380,6 +2339,77 @@ def get_draw_call_details(event_id: int) -> str:
         event_id: The event ID of the draw call.
     """
     return _call("get_draw_call_details", {"event_id": event_id})
+
+
+# ==================== 3A. READ-ONLY COMPOSITES ====================
+
+@mcp.tool()
+def inspect_event(event_id: int) -> str:
+    """Inspect one exact RenderDoc event and return draw plus pipeline evidence.
+
+    This is the external-MCP counterpart of AgentHost's internal composite. It
+    delegates to the same bundled qrenderdoc bridge method so both transports
+    preserve the same capture-bound schema and error envelope.
+
+    Args:
+        event_id: Frozen positive RenderDoc event ID.
+    """
+
+    return _call("inspect_event", {"event_id": event_id}, timeout=60.0)
+
+
+@mcp.tool()
+def analyze_pixel(
+    texture_id: int,
+    x: int,
+    y: int,
+    event_id: int,
+    mip: int = 0,
+    slice: int = 0,
+    sample: int = 0,
+    prefer_geometry: bool = True,
+) -> str:
+    """Analyze one frozen texture pixel with metadata, range, and writer evidence.
+
+    Args:
+        texture_id: Frozen texture resource ID.
+        x: Pixel X coordinate.
+        y: Pixel Y coordinate.
+        event_id: Frozen positive cutoff event ID.
+        mip: Mip level.
+        slice: Array slice.
+        sample: Multisample index.
+        prefer_geometry: Prefer passed raster geometry over a direct writer.
+    """
+
+    return _call(
+        "analyze_pixel",
+        {
+            "texture_id": texture_id,
+            "x": x,
+            "y": y,
+            "event_id": event_id,
+            "mip": mip,
+            "slice": slice,
+            "sample": sample,
+            "prefer_geometry": prefer_geometry,
+        },
+        timeout=120.0,
+    )
+
+
+@mcp.tool()
+def inspect_shader(event_id: int, stage: str = "fragment") -> str:
+    """Inspect one exact bound Shader using reflection and reconstruction evidence.
+
+    Args:
+        event_id: Frozen positive RenderDoc event ID.
+        stage: Bound Shader stage identifier.
+    """
+
+    return _call(
+        "inspect_shader", {"event_id": event_id, "stage": stage}, timeout=120.0
+    )
 
 
 # ==================== 4. PIPELINE STATE ====================
@@ -2748,18 +2778,22 @@ def save_texture(resource_id: int, output_path: str, mip: int = 0, slice: int = 
 # ==================== 9. PIXEL HISTORY ====================
 
 @mcp.tool()
-def pixel_history(resource_id: int, x: int, y: int) -> str:
-    """Get pixel modifications through RenderDoc's currently selected event.
+def pixel_history(resource_id: int, x: int, y: int, event_id: int) -> str:
+    """Get pixel modifications through one explicit frozen event.
 
-    This is not automatically the whole-frame final history. Set/select the
-    intended cutoff event before calling when later actions matter.
+    This is not automatically the whole-frame final history. ``event_id`` is
+    the exact cutoff and does not depend on the user's later UI selection.
 
     Args:
         resource_id: The render target texture resource ID.
         x: Pixel X coordinate.
         y: Pixel Y coordinate.
+        event_id: Frozen positive cutoff event ID.
     """
-    return _call("pixel_history", {"resource_id": resource_id, "x": x, "y": y})
+    return _call(
+        "pixel_history",
+        {"resource_id": resource_id, "x": x, "y": y, "event_id": event_id},
+    )
 
 
 @mcp.tool()
@@ -2767,6 +2801,7 @@ def inspect_pixel_object(
     texture_id: int,
     x: int,
     y: int,
+    event_id: int,
     mip: int = 0,
     slice: int = 0,
     sample: int = 0,
@@ -2789,6 +2824,7 @@ def inspect_pixel_object(
         texture_id: Render target or depth texture resource ID.
         x: Pixel X coordinate in the selected mip.
         y: Pixel Y coordinate in the selected mip.
+        event_id: Frozen positive PixelHistory cutoff event ID.
         mip: Mip level (default 0).
         slice: Array slice (default 0).
         sample: Multisample index (default 0).
@@ -2800,6 +2836,7 @@ def inspect_pixel_object(
             "texture_id": texture_id,
             "x": x,
             "y": y,
+            "event_id": event_id,
             "mip": mip,
             "slice": slice,
             "sample": sample,
@@ -4162,6 +4199,53 @@ def begin_shader_workspace_organization(
         return _shader_err(error, "organization-begin")
 
 
+def _best_effort_project_organization_sync(
+    workspace_path: str, reviewed: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Persist a promoted, ABI-reviewed HLSL source without applying it."""
+
+    gate = reviewed.get("gate") if isinstance(reviewed, Mapping) else None
+    if (
+        not isinstance(gate, Mapping)
+        or gate.get("organizedSourcePromoted") is not True
+        or gate.get("safeToStartLiveEdit") is not True
+    ):
+        return {
+            "attempted": False,
+            "succeeded": False,
+            "reason": "organized HLSL was not promoted by the review gate",
+        }
+    try:
+        active = _active_project_service()
+        active_status = active.status()
+        with active.pin_active_project(
+            str(active_status.get("workspaceId", "") or ""),
+            str(active_status.get("projectRoot", "") or ""),
+        ):
+            _require_same_active_project(active_status)
+            workspace = _require_managed_active_workspace(
+                active_status, workspace_path
+            )
+            status = _shader_workspace_service().status(str(workspace))
+            result = active.register_workspace(status)
+            if not isinstance(result, dict) or result.get("applied") is not False:
+                raise RuntimeError(
+                    "active project workspace registration returned invalid policy evidence"
+                )
+            _require_same_active_project(active_status)
+        return {"attempted": True, "succeeded": True, "result": result}
+    except Exception as error:
+        # The organization review and its compile/ABI evidence already
+        # completed. A pending project, a non-managed workspace, or persistence
+        # fault must be visible but cannot rewrite that physical review result.
+        return {
+            "attempted": True,
+            "succeeded": False,
+            "error": str(error),
+            "type": type(error).__name__,
+        }
+
+
 @mcp.tool()
 def review_shader_workspace_organization(
     workspace_path: str, organization_id: str
@@ -4177,11 +4261,15 @@ def review_shader_workspace_organization(
     """
 
     try:
-        return _ok(
+        result = dict(
             _shader_organization_manager().review(
                 workspace_path, organization_id
             )
         )
+        result["projectSync"] = _best_effort_project_organization_sync(
+            workspace_path, result
+        )
+        return _ok(result)
     except Exception as error:
         return _shader_err(error, "organization-review")
 
@@ -5476,7 +5564,7 @@ def get_material_session_status(session_id: str) -> str:
 def _best_effort_project_material_sync(
     session_id: str, updated: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """Persist one successfully changed typed leaf after live replay accepts it."""
+    """Persist successfully changed typed leaves after live replay accepts them."""
 
     try:
         from .project_restore import (
@@ -5490,14 +5578,26 @@ def _best_effort_project_material_sync(
                 "succeeded": False,
                 "reason": "project restore owns the current persistence transaction",
             }
-        parameter_id = str(updated.get("updatedParameterId", "") or "")
-        if updated.get("operation") != "update" or not parameter_id:
+        raw_parameter_ids = updated.get("updatedParameterIds")
+        if isinstance(raw_parameter_ids, list):
+            parameter_ids = [
+                str(value or "") for value in raw_parameter_ids
+                if str(value or "")
+            ]
+        else:
+            parameter_id = str(updated.get("updatedParameterId", "") or "")
+            parameter_ids = [parameter_id] if parameter_id else []
+        if (
+            updated.get("operation") not in ("update", "update-many")
+            or not parameter_ids
+            or len(parameter_ids) != len(set(parameter_ids))
+        ):
             return {
                 "attempted": False,
                 "succeeded": False,
-                "reason": "material parameter was not updated",
+                "reason": "material parameters were not updated",
             }
-        synced = sync_active_material_session(session_id, [parameter_id])
+        synced = sync_active_material_session(session_id, parameter_ids)
         return {"attempted": True, "succeeded": True, "result": synced}
     except Exception as error:
         # As with Shader apply, project/RDC persistence is downstream. Keep the
@@ -5527,6 +5627,28 @@ def update_material_parameter(
         updated = _material_session_manager().update(
             session_id, parameter, value
         )
+        response = dict(updated)
+        response["projectSync"] = _best_effort_project_material_sync(
+            session_id, updated
+        )
+        return _ok(response)
+    except Exception as error:
+        return _err(error)
+
+
+@mcp.tool()
+def update_material_parameters(session_id: str, updates: list[dict[str, Any]]) -> str:
+    """Apply multiple typed material parameters in one replay transaction.
+
+    Each item contains only ``parameter`` (a bridge-issued ID or exact unique
+    reflected name) and ``value``. The host validates and packs the entire
+    bounded set before one cumulative CBuffer apply, so a bad item cannot
+    partially update replay state. Callers still cannot provide registers,
+    byte offsets, scalar encodings, or raw CBuffer bytes.
+    """
+
+    try:
+        updated = _material_session_manager().update_many(session_id, updates)
         response = dict(updated)
         response["projectSync"] = _best_effort_project_material_sync(
             session_id, updated
@@ -6532,38 +6654,65 @@ def _active_bound_shader(
     if isinstance(event_id, bool) or int(event_id) <= 0:
         raise ValueError("event_id must be a positive integer")
     requested_event = int(event_id)
-    events = context.get("events")
-    if not isinstance(events, dict):
-        raise RuntimeError("RenderDoc current context has no event identity")
-    try:
-        current_event = int(events.get("currentEventId", 0) or 0)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise RuntimeError("RenderDoc current event identity is invalid") from exc
-    if requested_event != current_event:
-        raise RuntimeError(
-            "event_id must equal RenderDoc's current event before resolving a Shader workspace"
-        )
     requested_stage = normalize_stage(stage)
+    if not requested_stage:
+        raise ValueError("stage is required")
+
+    # Prefer the immutable, hash-validated full-capture catalog.  It resolves
+    # the exact frozen EID even if the user has navigated to another event in
+    # qrenderdoc since the task snapshot was taken.
+    selected_binding = _active_capture_catalog_selection(
+        requested_event, requested_stage
+    )
+    if selected_binding is not None:
+        selected = selected_binding[2]
+        return {
+            "stage": selected.key.stage,
+            "resourceId": selected.key.resource_id,
+            "rawSha256": selected.key.raw_sha256,
+            "entryPoint": selected.key.entry_point,
+        }
+
+    # Reuse the already frozen context when it describes the requested event.
+    # This preserves the no-extra-replay fast path used by current-event UI
+    # actions, while a task whose frozen EID differs from the user's new UI
+    # selection falls through to the explicit event query below.
+    events = context.get("events")
+    try:
+        context_event = int(events.get("currentEventId", 0) or 0)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        context_event = 0
     shaders = context.get("shaders")
     bound = shaders.get("bound") if isinstance(shaders, dict) else None
-    if not isinstance(bound, list):
-        raise RuntimeError("RenderDoc current context has no bound Shader list")
     matches = []
-    for item in bound:
-        if not isinstance(item, dict):
-            continue
-        try:
-            item_stage = normalize_stage(item.get("stage"))
-        except Exception:
-            continue
-        if item_stage == requested_stage:
-            matches.append(item)
-    if len(matches) != 1:
-        raise RuntimeError(
-            "current event does not bind exactly one %s Shader" % requested_stage
+    if context_event == requested_event and isinstance(bound, list):
+        for item in bound:
+            if not isinstance(item, dict):
+                continue
+            try:
+                item_stage = normalize_stage(item.get("stage"))
+            except Exception:
+                continue
+            if item_stage == requested_stage:
+                matches.append(item)
+    if len(matches) == 1:
+        shader = matches[0]
+    else:
+        shader = None
+
+    # A project without a full catalog still queries the requested event
+    # explicitly.  Never reinterpret a frozen task from context.currentEventId.
+    if shader is None:
+        shader = ipc.call(
+            "get_shader_info",
+            {"event_id": requested_event, "stage": requested_stage},
+            timeout=120.0,
         )
-    shader = matches[0]
-    resource = shader.get("resourceId", shader.get("shaderResourceId"))
+    if not isinstance(shader, dict) or shader.get("error"):
+        raise RuntimeError("RenderDoc did not return the frozen event Shader identity")
+    resource = shader.get(
+        "resourceId", shader.get("shaderResourceId", shader.get("shaderId"))
+    )
     if isinstance(resource, bool):
         raise RuntimeError("bound Shader ResourceId is invalid")
     try:

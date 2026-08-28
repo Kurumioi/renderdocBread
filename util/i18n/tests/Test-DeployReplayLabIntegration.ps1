@@ -14,16 +14,20 @@ if ($parseErrors.Count -ne 0)
 }
 
 $source = Get-Content -LiteralPath $scriptPath -Raw
-foreach ($requiredFile in @(
-        "__init__.py",
-        "ai_context.py",
-        "dxil_access_signature.py",
-        "material_panel.py",
-        "pass_panel.py",
-        "project_launcher.py",
-        "project_restore_client.py",
-        "shader_console.py",
-        "integration.json"))
+$requiredFiles = @(
+    "__init__.py",
+    "ai_context.py",
+    "dxil_access_signature.py",
+    "material_panel.py",
+    "pass_panel.py",
+    "project_launcher.py",
+    "project_restore_client.py",
+    "project_shader_workspace.py",
+    "shader_console.py",
+    "shader_editor_client.py",
+    "integration.json"
+)
+foreach ($requiredFile in $requiredFiles)
 {
     if ($source -notmatch [regex]::Escape(('"' + $requiredFile + '"')))
     {
@@ -104,6 +108,41 @@ try
     if ($message -notmatch "outside the ReplayLab integration root")
     {
         throw "Sibling path did not fail the child-path boundary check: $message"
+    }
+
+    # Every canonical module is a fail-closed deployment prerequisite. This
+    # catches a source file that exists in a developer checkout but was omitted
+    # from Git and is therefore absent in a clean build checkout.
+    foreach ($missingFile in $requiredFiles)
+    {
+        $fixtureRoot = Join-Path $testRoot (
+            "missing-" + [IO.Path]::GetFileNameWithoutExtension($missingFile))
+        $fixtureSource = Join-Path $fixtureRoot "renderdoc_mcp_bridge"
+        New-Item -ItemType Directory -Force -Path $fixtureSource | Out-Null
+        foreach ($presentFile in $requiredFiles)
+        {
+            if ($presentFile -ne $missingFile)
+            {
+                [IO.File]::WriteAllText(
+                    (Join-Path $fixtureSource $presentFile), "# fixture")
+            }
+        }
+        $missingMessage = ""
+        try
+        {
+            & $scriptPath `
+                -SourceRoot $fixtureSource `
+                -TargetRoot (Join-Path $fixtureRoot "deployed") | Out-Null
+        }
+        catch
+        {
+            $missingMessage = $_.Exception.Message
+        }
+        if ($missingMessage -notmatch "Required ReplayLab integration source is missing" -or
+            $missingMessage -notmatch [regex]::Escape($missingFile))
+        {
+            throw "Missing canonical source '$missingFile' did not fail closed: $missingMessage"
+        }
     }
 }
 finally

@@ -24,22 +24,30 @@
 
 #include "AIConversationView.h"
 
+#include <QApplication>
 #include <QCoreApplication>
 #include <QCursor>
 #include <QDateTime>
+#include <QDesktopWidget>
 #include <QEvent>
+#include <QFocusEvent>
+#include <QFontMetrics>
+#include <QHideEvent>
 #include <QHBoxLayout>
+#include <QKeyEvent>
+#include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPalette>
 #include <QScrollBar>
+#include <QShowEvent>
 #include <QTextBlock>
 #include <QTextBrowser>
 #include <QTextDocument>
 #include <QTextFragment>
 #include <QTimer>
-#include <QToolTip>
 #include <QUrlQuery>
+#include <QVBoxLayout>
 #include <utility>
 
 namespace
@@ -968,26 +976,268 @@ private:
   QVector<QPair<QTextCursor, QTextCursor>> m_BubbleCursors;
 };
 
+static QColor blendedColor(const QColor &from, const QColor &to, int toPercent)
+{
+  const int boundedPercent = qBound(0, toPercent, 100);
+  const int fromPercent = 100 - boundedPercent;
+  return QColor((from.red() * fromPercent + to.red() * boundedPercent) / 100,
+                (from.green() * fromPercent + to.green() * boundedPercent) / 100,
+                (from.blue() * fromPercent + to.blue() * boundedPercent) / 100,
+                (from.alpha() * fromPercent + to.alpha() * boundedPercent) / 100);
+}
+
+static QString boundedTurnPreview(const QString &text, int maxCharacters)
+{
+  QString preview = text.simplified();
+  if(preview.size() <= maxCharacters)
+    return preview;
+
+  preview = preview.left(qMax(0, maxCharacters - 1)).trimmed();
+  if(!preview.isEmpty() && preview.at(preview.size() - 1).isHighSurrogate())
+    preview.chop(1);
+  return preview + QChar(0x2026);
+}
+
+class AITurnPreviewPopup : public QWidget
+{
+public:
+  explicit AITurnPreviewPopup(QWidget *parent = NULL)
+      : QWidget(parent, Qt::ToolTip | Qt::FramelessWindowHint)
+  {
+    setAttribute(Qt::WA_ShowWithoutActivating);
+    setAttribute(Qt::WA_TransparentForMouseEvents);
+    setAttribute(Qt::WA_TranslucentBackground);
+    setFocusPolicy(Qt::NoFocus);
+
+    QVBoxLayout *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(12, 9, 12, 10);
+    layout->setSpacing(5);
+
+    m_UserPreview = new QLabel(this);
+    m_UserPreview->setTextFormat(Qt::PlainText);
+    m_UserPreview->setWordWrap(true);
+    m_UserPreview->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+    layout->addWidget(m_UserPreview);
+
+    m_AssistantPreview = new QLabel(this);
+    m_AssistantPreview->setTextFormat(Qt::PlainText);
+    m_AssistantPreview->setWordWrap(true);
+    m_AssistantPreview->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+    layout->addWidget(m_AssistantPreview);
+
+    updatePresentation();
+    hide();
+  }
+
+  ~AITurnPreviewPopup() override
+  {
+    if(m_ApplicationEventFilterInstalled && qApp)
+      qApp->removeEventFilter(this);
+  }
+
+  void setPreview(const QString &userPreview, const QString &assistantPreview, int contentWidth,
+                  int maximumPopupWidth, int maximumPopupHeight)
+  {
+    contentWidth = qMax(1, contentWidth);
+    maximumPopupHeight = qMax(1, maximumPopupHeight);
+    m_UserPreview->setFixedWidth(contentWidth);
+    m_AssistantPreview->setFixedWidth(contentWidth);
+
+    const int verticalChrome = 24;
+    const int availableTextHeight = qMax(1, maximumPopupHeight - verticalChrome);
+    const int userLineHeight = qMax(1, QFontMetrics(m_UserPreview->font()).lineSpacing());
+    const int assistantLineHeight =
+        qMax(1, QFontMetrics(m_AssistantPreview->font()).lineSpacing());
+    int userHeight = availableTextHeight;
+    int assistantHeight = 0;
+    if(!assistantPreview.isEmpty())
+    {
+      userHeight = qMin(userLineHeight * 2, qMax(userLineHeight, availableTextHeight / 3));
+      assistantHeight = qMax(assistantLineHeight, availableTextHeight - userHeight - 5);
+    }
+
+    setLabelPreview(m_UserPreview, userPreview, userHeight);
+    setLabelPreview(m_AssistantPreview, assistantPreview, assistantHeight);
+    m_AssistantPreview->setVisible(!assistantPreview.isEmpty());
+    setMaximumSize(qMax(1, qMin(contentWidth + 24, maximumPopupWidth)), maximumPopupHeight);
+    layout()->activate();
+    adjustSize();
+  }
+
+protected:
+  bool eventFilter(QObject *watched, QEvent *event) override
+  {
+    if(isVisible() && event)
+    {
+      const bool ownerWindowDeactivated =
+          event->type() == QEvent::WindowDeactivate && parentWidget() &&
+          watched == parentWidget()->window();
+      if(event->type() == QEvent::ApplicationDeactivate ||
+         event->type() == QEvent::MouseButtonPress || event->type() == QEvent::Wheel ||
+         ownerWindowDeactivated)
+        hide();
+    }
+    return QWidget::eventFilter(watched, event);
+  }
+
+  void hideEvent(QHideEvent *event) override
+  {
+    if(m_ApplicationEventFilterInstalled && qApp)
+    {
+      qApp->removeEventFilter(this);
+      m_ApplicationEventFilterInstalled = false;
+    }
+    QWidget::hideEvent(event);
+  }
+
+  void paintEvent(QPaintEvent *) override
+  {
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    const QColor fill = palette().color(QPalette::ToolTipBase);
+    const QColor outline =
+        blendedColor(fill, palette().color(QPalette::ToolTipText), 24);
+    painter.setPen(QPen(outline, 1.0));
+    painter.setBrush(fill);
+    painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 10.0, 10.0);
+  }
+
+  void changeEvent(QEvent *event) override
+  {
+    QWidget::changeEvent(event);
+    if(event && (event->type() == QEvent::PaletteChange || event->type() == QEvent::FontChange ||
+                 event->type() == QEvent::StyleChange))
+      updatePresentation();
+  }
+
+  void showEvent(QShowEvent *event) override
+  {
+    QWidget::showEvent(event);
+    if(!m_ApplicationEventFilterInstalled && qApp)
+    {
+      qApp->installEventFilter(this);
+      m_ApplicationEventFilterInstalled = true;
+    }
+  }
+
+private:
+  static void setLabelPreview(QLabel *label, const QString &text, int maximumHeight)
+  {
+    if(!label)
+      return;
+
+    label->setMaximumHeight(qMax(1, maximumHeight));
+    label->setText(text);
+    if(text.isEmpty() || label->heightForWidth(label->width()) <= maximumHeight)
+      return;
+
+    int low = 0;
+    int high = text.size();
+    while(low < high)
+    {
+      const int candidateLength = (low + high + 1) / 2;
+      QString candidate = text.left(candidateLength).trimmed();
+      if(!candidate.isEmpty() && candidate.at(candidate.size() - 1).isHighSurrogate())
+        candidate.chop(1);
+      candidate += QChar(0x2026);
+      label->setText(candidate);
+      if(label->heightForWidth(label->width()) <= maximumHeight)
+        low = candidateLength;
+      else
+        high = candidateLength - 1;
+    }
+
+    QString fitted = text.left(low).trimmed();
+    if(!fitted.isEmpty() && fitted.at(fitted.size() - 1).isHighSurrogate())
+      fitted.chop(1);
+    label->setText(fitted + QChar(0x2026));
+  }
+
+  void updatePresentation()
+  {
+    if(!m_UserPreview || !m_AssistantPreview)
+      return;
+
+    QFont userFont = font();
+    userFont.setWeight(QFont::DemiBold);
+    m_UserPreview->setFont(userFont);
+
+    QPalette userPalette = palette();
+    userPalette.setColor(QPalette::WindowText, palette().color(QPalette::ToolTipText));
+    m_UserPreview->setPalette(userPalette);
+
+    QPalette assistantPalette = palette();
+    assistantPalette.setColor(
+        QPalette::WindowText,
+        blendedColor(palette().color(QPalette::ToolTipText),
+                     palette().color(QPalette::ToolTipBase), 28));
+    m_AssistantPreview->setPalette(assistantPalette);
+  }
+
+  QLabel *m_UserPreview = NULL;
+  QLabel *m_AssistantPreview = NULL;
+  bool m_ApplicationEventFilterInstalled = false;
+};
+
 class AITurnRailWidget : public QWidget
 {
 public:
   struct Turn
   {
     QString messageId;
-    QString preview;
+    QString userPreview;
+    QString assistantPreview;
   };
 
   explicit AITurnRailWidget(QWidget *parent = NULL) : QWidget(parent)
   {
     setFixedWidth(36);
     setMouseTracking(true);
-    setCursor(Qt::PointingHandCursor);
+    setFocusPolicy(Qt::StrongFocus);
+    m_PreviewPopup = new AITurnPreviewPopup(this);
   }
 
   void setTurns(const QVector<Turn> &turns)
   {
+    const bool wasHovering = m_Hovered >= 0;
+    QString focusedMessageId;
+    if(m_Focused >= 0 && m_Focused < m_Turns.size())
+      focusedMessageId = m_Turns[m_Focused].messageId;
     m_Turns = turns;
     m_Hovered = -1;
+    m_Focused = -1;
+    if(!focusedMessageId.isEmpty())
+    {
+      for(int i = 0; i < m_Turns.size(); ++i)
+      {
+        if(m_Turns[i].messageId == focusedMessageId)
+        {
+          m_Focused = i;
+          break;
+        }
+      }
+    }
+    if(m_Focused < 0 && hasFocus() && !m_Turns.isEmpty())
+      m_Focused = 0;
+    if(wasHovering && isVisible() && isActiveWindow() &&
+       QApplication::applicationState() == Qt::ApplicationActive)
+    {
+      const QPoint pointer = mapFromGlobal(QCursor::pos());
+      if(rect().contains(pointer))
+        m_Hovered = turnAt(pointer.y());
+    }
+
+    if(m_Hovered >= 0)
+    {
+      setCursor(Qt::PointingHandCursor);
+      showPreview(m_Hovered);
+    }
+    else
+    {
+      unsetCursor();
+      m_PreviewPopup->hide();
+    }
+    updateAccessiblePreview(hasFocus() ? m_Focused : m_Hovered);
     update();
   }
 
@@ -997,18 +1247,89 @@ public:
   }
 
 protected:
+  void focusInEvent(QFocusEvent *event) override
+  {
+    if(m_Focused < 0 && !m_Turns.isEmpty())
+      m_Focused = m_Hovered >= 0 ? m_Hovered : 0;
+    updateAccessiblePreview(m_Focused);
+    if(m_Focused >= 0)
+      showPreview(m_Focused);
+    update();
+    QWidget::focusInEvent(event);
+  }
+
+  void focusOutEvent(QFocusEvent *event) override
+  {
+    m_PreviewPopup->hide();
+    update();
+    QWidget::focusOutEvent(event);
+  }
+
+  void hideEvent(QHideEvent *event) override
+  {
+    m_PreviewPopup->hide();
+    QWidget::hideEvent(event);
+  }
+
+  void keyPressEvent(QKeyEvent *event) override
+  {
+    if(m_Turns.isEmpty())
+    {
+      QWidget::keyPressEvent(event);
+      return;
+    }
+
+    int target = qBound(0, m_Focused < 0 ? 0 : m_Focused, m_Turns.size() - 1);
+    switch(event->key())
+    {
+      case Qt::Key_Up:
+      case Qt::Key_Left: target = qMax(0, target - 1); break;
+      case Qt::Key_Down:
+      case Qt::Key_Right: target = qMin(m_Turns.size() - 1, target + 1); break;
+      case Qt::Key_Home: target = 0; break;
+      case Qt::Key_End: target = m_Turns.size() - 1; break;
+      case Qt::Key_Return:
+      case Qt::Key_Enter:
+      case Qt::Key_Space:
+        if(m_Focused >= 0 && m_Focused < m_Turns.size() && m_ActivateHandler)
+          m_ActivateHandler(m_Turns[m_Focused].messageId);
+        m_PreviewPopup->hide();
+        event->accept();
+        return;
+      case Qt::Key_Escape:
+        m_PreviewPopup->hide();
+        event->accept();
+        return;
+      default: QWidget::keyPressEvent(event); return;
+    }
+
+    m_Focused = target;
+    m_Hovered = -1;
+    unsetCursor();
+    updateAccessiblePreview(m_Focused);
+    showPreview(m_Focused);
+    update();
+    event->accept();
+  }
+
   void paintEvent(QPaintEvent *) override
   {
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing, true);
-    const QColor normal = palette().color(QPalette::Mid);
+    const QColor normal = blendedColor(palette().color(QPalette::Midlight),
+                                       palette().color(QPalette::Text), 28);
     const QColor active = palette().color(QPalette::Text);
+    const int interactionIndex =
+        m_Hovered >= 0 ? m_Hovered : (hasFocus() ? m_Focused : -1);
     for(int i = 0; i < m_Turns.size(); ++i)
     {
       const int y = turnY(i);
-      const int length = i == m_Hovered ? 24 : 10 + (i % 3) * 4;
-      QPen pen(i == m_Hovered ? active : normal, i == m_Hovered ? 2.0 : 1.2, Qt::SolidLine,
-               Qt::RoundCap);
+      const int distance = interactionIndex < 0 ? 3 : qAbs(i - interactionIndex);
+      const int length = distance == 0 ? 24 : (distance == 1 ? 20 : (distance == 2 ? 16 : 12));
+      const int activeMix = distance == 0 ? 100 : (distance == 1 ? 66 : (distance == 2 ? 34 : 0));
+      const QColor lineColor = blendedColor(normal, active, activeMix);
+      const qreal width = distance == 0 ? 2.0 : (distance == 1 ? 1.7 : 1.3);
+      QPen pen(lineColor, width, Qt::SolidLine, Qt::RoundCap);
       painter.setPen(pen);
       painter.drawLine(6, y, 6 + length, y);
     }
@@ -1018,19 +1339,32 @@ protected:
   {
     const int hovered = turnAt(event->pos().y());
     if(hovered == m_Hovered)
+    {
+      if(hovered >= 0 && !m_PreviewPopup->isVisible())
+        showPreview(hovered);
       return;
+    }
     m_Hovered = hovered;
+    updateAccessiblePreview(hasFocus() ? m_Focused : m_Hovered);
     update();
     if(m_Hovered >= 0)
-      QToolTip::showText(event->globalPos(), m_Turns[m_Hovered].preview, this);
+    {
+      setCursor(Qt::PointingHandCursor);
+      showPreview(m_Hovered);
+    }
     else
-      QToolTip::hideText();
+    {
+      unsetCursor();
+      m_PreviewPopup->hide();
+    }
   }
 
   void leaveEvent(QEvent *) override
   {
     m_Hovered = -1;
-    QToolTip::hideText();
+    updateAccessiblePreview(hasFocus() ? m_Focused : -1);
+    unsetCursor();
+    m_PreviewPopup->hide();
     update();
   }
 
@@ -1039,8 +1373,17 @@ protected:
     if(event->button() != Qt::LeftButton)
       return;
     const int selected = turnAt(event->pos().y());
-    if(selected >= 0 && m_ActivateHandler)
-      m_ActivateHandler(m_Turns[selected].messageId);
+    if(selected >= 0)
+    {
+      setFocus(Qt::MouseFocusReason);
+      m_Focused = selected;
+      updateAccessiblePreview(m_Focused);
+      update();
+      if(m_ActivateHandler)
+        m_ActivateHandler(m_Turns[selected].messageId);
+      m_PreviewPopup->hide();
+      event->accept();
+    }
   }
 
 private:
@@ -1051,22 +1394,82 @@ private:
     return qMin(12.0, qMax(1, height() - 20) / qreal(m_Turns.size() - 1));
   }
 
-  int turnY(int index) const { return qRound(10.0 + index * railStep()); }
+  qreal railTop() const
+  {
+    return (height() - qMax(0, m_Turns.size() - 1) * railStep()) / 2.0;
+  }
+
+  int turnY(int index) const { return qRound(railTop() + index * railStep()); }
 
   int turnAt(int y) const
   {
     if(m_Turns.isEmpty())
       return -1;
     if(m_Turns.size() == 1)
-      return qAbs(y - 10) <= 7 ? 0 : -1;
+      return qAbs(y - turnY(0)) <= 7 ? 0 : -1;
     const qreal step = railStep();
-    const int candidate = qBound(0, qRound((y - 10) / step), m_Turns.size() - 1);
+    const int candidate = qBound(0, qRound((y - railTop()) / step), m_Turns.size() - 1);
     return qAbs(y - turnY(candidate)) <= qMax(3, int(step / 2.0 + 1.5)) ? candidate : -1;
+  }
+
+  void updateAccessiblePreview(int index)
+  {
+    QString description;
+    if(index >= 0 && index < m_Turns.size())
+    {
+      description = m_Turns[index].userPreview;
+      if(!m_Turns[index].assistantPreview.isEmpty())
+      {
+        // i18n-ignore: Blank lines separate two already-localized/dynamic accessible paragraphs.
+        description += QLatin1String("\n\n") + m_Turns[index].assistantPreview;
+      }
+    }
+    setAccessibleDescription(description);
+  }
+
+  void showPreview(int index)
+  {
+    if(index < 0 || index >= m_Turns.size() || !isActiveWindow() ||
+       QApplication::applicationState() != Qt::ApplicationActive)
+      return;
+
+    const Turn &turn = m_Turns[index];
+    const QPoint anchor = mapToGlobal(QPoint(width() + 7, turnY(index)));
+    QRect available;
+    if(QApplication::desktop())
+      available = QApplication::desktop()->availableGeometry(anchor);
+    if(!available.isValid())
+      available = QRect(anchor - QPoint(200, 150), QSize(400, 300));
+
+    const int popupHorizontalMargin = 8;
+    const int popupVerticalMargin = 8;
+    const int popupChromeWidth = 24;
+    const int popupMaximumWidth = qMax(1, available.width() - popupHorizontalMargin * 2);
+    const int popupMaximumHeight = qMax(1, available.height() - popupVerticalMargin * 2);
+    const int contentWidth =
+        qMax(1, qMin(360, popupMaximumWidth - popupChromeWidth));
+    m_PreviewPopup->setPreview(turn.userPreview, turn.assistantPreview, contentWidth,
+                               popupMaximumWidth, popupMaximumHeight);
+
+    QPoint popupPosition(anchor.x(), anchor.y() - m_PreviewPopup->height() / 2);
+    if(popupPosition.x() + m_PreviewPopup->width() > available.right() + 1)
+      popupPosition.setX(mapToGlobal(QPoint(-7, 0)).x() - m_PreviewPopup->width());
+    popupPosition.setX(qBound(available.left(), popupPosition.x(),
+                              qMax(available.left(), available.right() + 1 -
+                                                         m_PreviewPopup->width())));
+    popupPosition.setY(qBound(available.top(), popupPosition.y(),
+                              qMax(available.top(), available.bottom() + 1 -
+                                                        m_PreviewPopup->height())));
+    m_PreviewPopup->move(popupPosition);
+    m_PreviewPopup->show();
+    m_PreviewPopup->raise();
   }
 
   QVector<Turn> m_Turns;
   std::function<void(const QString &)> m_ActivateHandler;
+  AITurnPreviewPopup *m_PreviewPopup = NULL;
   int m_Hovered = -1;
+  int m_Focused = -1;
 };
 
 AIConversationView::AIConversationView(QWidget *parent) : QWidget(parent)
@@ -1076,7 +1479,7 @@ AIConversationView::AIConversationView(QWidget *parent) : QWidget(parent)
   layout->setSpacing(0);
 
   m_TurnRail = new AITurnRailWidget(this);
-  m_TurnRail->setToolTip(
+  m_TurnRail->setAccessibleName(
       QCoreApplication::translate("AIConversationView", "Conversation turns"));
   m_TurnRail->setActivateHandler([this](const QString &messageId) { scrollToMessage(messageId); });
   layout->addWidget(m_TurnRail);
@@ -1184,6 +1587,13 @@ void AIConversationView::render(bool preserveScroll)
 
   m_MessageAnchors.clear();
   QVector<AITurnRailWidget::Turn> turns;
+  QHash<QString, QString> assistantTextByTask;
+  for(const AIChatMessage &message : m_Messages)
+  {
+    // i18n-ignore: Message role is a backend protocol identifier used only for routing.
+    if(message.role == lit("assistant") && !message.taskId.isEmpty())
+      assistantTextByTask[message.taskId] = message.text;
+  }
   for(int i = 0; i < m_Messages.size(); ++i)
   {
     const AIChatMessage &message = m_Messages[i];
@@ -1193,25 +1603,56 @@ void AIConversationView::render(bool preserveScroll)
     {
       AITurnRailWidget::Turn turn;
       turn.messageId = message.id;
-      turn.preview = message.text.simplified().left(180);
-      if(turn.preview.isEmpty())
-        turn.preview = QCoreApplication::translate("AIConversationView", "Empty user turn");
+      turn.userPreview = boundedTurnPreview(message.text, 160);
+      if(turn.userPreview.isEmpty())
+        turn.userPreview = QCoreApplication::translate("AIConversationView", "Empty user turn");
+      if(!message.taskId.isEmpty())
+      {
+        turn.assistantPreview =
+            boundedTurnPreview(assistantTextByTask.value(message.taskId), 360);
+        // Live answer text is public assistant output, not private reasoning. Keep failed and
+        // interrupted diagnostics out of the navigation preview by using this fallback only while
+        // the turn is actively running.
+        if(turn.assistantPreview.isEmpty() && isLiveState(message.state))
+          turn.assistantPreview = boundedTurnPreview(message.provisionalText, 360);
+      }
+      else
+      {
+        // Older stored conversations may predate task IDs. Only for those records, associate the
+        // first assistant response before the next user turn.
+        for(int responseIndex = i + 1; responseIndex < m_Messages.size(); ++responseIndex)
+        {
+          const AIChatMessage &response = m_Messages[responseIndex];
+          // i18n-ignore: Message roles are backend protocol identifiers used only for routing.
+          if(response.role == lit("user"))
+            break;
+          // i18n-ignore: Message role is a backend protocol identifier used only for routing.
+          if(response.role == lit("assistant"))
+          {
+            turn.assistantPreview = boundedTurnPreview(response.text, 360);
+            break;
+          }
+        }
+      }
       turns.push_back(turn);
     }
   }
   m_TurnRail->setTurns(turns);
 
   const QPalette colors = palette();
+  const bool darkTheme = colors.color(QPalette::Base).lightness() <
+                         colors.color(QPalette::Text).lightness();
   const QString base = colors.color(QPalette::Base).name();
   const QString alternate = colors.color(QPalette::AlternateBase).name();
   const QString text = colors.color(QPalette::Text).name();
   const QString muted = colors.color(QPalette::Disabled, QPalette::Text).name();
   const QString link = colors.color(QPalette::Link).name();
   const QString border = colors.color(QPalette::Mid).name();
+  const QString separator = blendedColor(colors.color(QPalette::Base),
+                                         colors.color(QPalette::Text), darkTheme ? 58 : 24)
+                                .name();
   const QString highlight = colors.color(QPalette::Highlight).name();
   const QString highlightedText = colors.color(QPalette::HighlightedText).name();
-  const bool darkTheme = colors.color(QPalette::Base).lightness() <
-                         colors.color(QPalette::Text).lightness();
   // Darcula's semantic colours are deliberately kept independent from selection/link colours.
   // The light variants preserve the same token separation without reducing contrast on a bright
   // palette.
@@ -1298,7 +1739,9 @@ void AIConversationView::render(bool preserveScroll)
       QLatin1String(";font-family:'Segoe UI Symbol','Noto Sans Symbols','Arial Unicode MS',sans-serif;") +
       QLatin1String("font-size:16px;line-height:100%;text-decoration:none;}.activity-toggle{color:") +
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
-      muted + lit(";text-decoration:none;}hr{border:0;border-top:1px solid ") + border +
+      muted + lit(";text-decoration:none;}hr{border:0;border-top:1px solid ") + separator +
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      lit(";background-color:") + separator + lit(";color:") + separator +
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
       lit(";height:1px;margin:4px 0 7px 0;}.activity-list{margin-left:9px;padding-left:11px;") +
       QLatin1String("border-left:1px solid ") + border +
