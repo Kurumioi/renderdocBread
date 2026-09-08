@@ -234,6 +234,12 @@ void PythonContext::GlobalInit()
   // for the exception signal
   qRegisterMetaType<QList<QString>>("QList<QString>");
 
+  // This only tests presence; ConfigFilePath performs Unicode path decoding and validation.
+  // i18n-ignore: Process-owner environment key controlling isolated configuration and extensions.
+  const bool isolatedConfiguration = !qgetenv("RENDERDOC_CONFIG_DIR").isEmpty();
+  if(isolatedConfiguration)
+    ConfigFilePath(QString());
+
   PyImport_AppendInittab("renderdoc", &PyInit_renderdoc);
   PyImport_AppendInittab("qrenderdoc", &PyInit_qrenderdoc);
 
@@ -265,12 +271,16 @@ void PythonContext::GlobalInit()
   config.program_name = program_name;
 
   config.use_environment = 0;
+  if(isolatedConfiguration)
+    config.user_site_directory = 0;
 
   Py_InitializeFromConfig(&config);
 #else
   Py_SetProgramName(program_name);
 
   Py_IgnoreEnvironmentFlag = 1;
+  if(isolatedConfiguration)
+    Py_NoUserSiteDirectory = 1;
 
   Py_Initialize();
 #endif
@@ -1201,12 +1211,24 @@ QStringList PythonContext::GetApplicationExtensionsPaths()
   if(bundled.cd(lit("extensions")) && bundled.exists())
     ret.append(bundled.absolutePath());
 
+  // First-party integrations retain their fixed application path. An isolated process must not
+  // discover personal extensions via QStandardPaths, even when none are configured for autoload.
+  // i18n-ignore: Process-owner environment key, not user-visible UI text.
+  if(!qgetenv("RENDERDOC_CONFIG_DIR").isEmpty())
+  {
+    // i18n-ignore: Fixed optional-extension directory underneath the isolated configuration root.
+    QDir isolated(ConfigFilePath(lit("extensions")));
+    if(isolated.exists() && !ret.contains(isolated.absolutePath()))
+      ret.append(isolated.absolutePath());
+    return NormaliseExtensionSearchPaths(ret);
+  }
+
   for(QString d : QStandardPaths::standardLocations(QStandardPaths::AppDataLocation))
   {
     QDir dir(d);
-    dir.cd(lit("extensions"));
 
-    if(dir.exists() && !ret.contains(dir.absolutePath()))
+    // i18n-ignore: Fixed extension search subdirectory, not UI text.
+    if(dir.cd(lit("extensions")) && dir.exists() && !ret.contains(dir.absolutePath()))
       ret.append(dir.absolutePath());
   }
 

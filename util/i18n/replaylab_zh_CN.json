@@ -362,6 +362,18 @@
     "Float parameters require valid numbers": "浮点参数需要有效数字",
     "Integer parameters require decimal integers": "整数参数需要十进制整数",
     "Applied revision %1 to shared buffer consumers (generation %2)": "已将修订 %1 应用于使用该共享缓冲区的事件（版本 %2）",
-    "Applied revision %1 (generation %2); preview is not confirmed": "已应用修订 %1（版本 %2），预览尚未确认"
+    "Applied revision %1 (generation %2); preview is not confirmed": "已应用修订 %1（版本 %2），预览尚未确认",
+    "Input": "输入",
+    "Output": "输出",
+    "in: %1": "输入：%1",
+    "out: %1": "输出：%1",
+    "Open Shader": "打开着色器",
+    "Jump to EID %1": "跳转到 EID %1",
+    "No event uses this Shader in the capture catalog": "捕获索引中没有使用此着色器的事件",
+    "Open the capture this Shader belongs to first": "请先打开此着色器所属的捕获",
+    "Right-click to jump to an event": "右键单击可跳转到事件",
+    "Used by %1 event(s)": "%1 个事件使用此着色器",
+    "Used by %1 event(s): %2": "%1 个事件使用此着色器：%2",
+    "… and %1 more (see tooltip)": "… 另有 %1 个事件（见提示）"
   }
 }

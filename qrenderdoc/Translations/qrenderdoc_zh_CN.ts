@@ -436,7 +436,7 @@
 <context>
     <name>AIAssistant</name>
     <message>
-        <location filename="../Windows/AI/AIAssistant.cpp" line="+903"/>
+        <location filename="../Windows/AI/AIAssistant.cpp" line="+906"/>
         <source>SKIPPED</source>
         <translation>已跳过</translation>
     </message>
@@ -928,15 +928,15 @@
         <location line="+1519"/>
         <location line="+200"/>
         <location line="+47"/>
-        <location line="+1458"/>
+        <location line="+1461"/>
         <location line="+4119"/>
         <location line="+668"/>
-        <location line="+41"/>
+        <location line="+42"/>
         <source>New conversation</source>
         <translation>新建对话</translation>
     </message>
     <message>
-        <location line="-8046"/>
+        <location line="-8050"/>
         <source>Starting...</source>
         <translation>正在启动…</translation>
     </message>
@@ -962,12 +962,12 @@
     </message>
     <message>
         <location line="+68"/>
-        <location line="+2291"/>
+        <location line="+2294"/>
         <source>Continue</source>
         <translation>继续</translation>
     </message>
     <message>
-        <location line="-2231"/>
+        <location line="-2234"/>
         <source>Ask RenderDoc AI... (Enter sends; Shift+Enter inserts a new line)</source>
         <translation>询问 RenderDoc AI…（Enter 发送；Shift+Enter 插入新行）</translation>
     </message>
@@ -983,12 +983,12 @@
     </message>
     <message>
         <location line="+14"/>
-        <location line="+2617"/>
+        <location line="+2620"/>
         <source>Stop the active chat request.</source>
         <translation>停止当前聊天请求。</translation>
     </message>
     <message>
-        <location line="-2616"/>
+        <location line="-2619"/>
         <source>Stop</source>
         <translation>停止</translation>
     </message>
@@ -1044,7 +1044,7 @@
         <translation>删除此对话及其存储的上下文？</translation>
     </message>
     <message>
-        <location line="+570"/>
+        <location line="+573"/>
         <location line="+2"/>
         <source>Other</source>
         <translation>其他</translation>
@@ -1084,12 +1084,12 @@
     </message>
     <message>
         <location line="+309"/>
-        <location line="+6055"/>
+        <location line="+6088"/>
         <source>Running</source>
         <translation>正在运行</translation>
     </message>
     <message>
-        <location line="-6043"/>
+        <location line="-6076"/>
         <source>%1 capture action(s) running</source>
         <translation>正在运行 %1 个捕获操作</translation>
     </message>
@@ -1164,8 +1164,8 @@
         <translation>未加载捕获 | 可使用常规聊天</translation>
     </message>
     <message>
-        <location line="-3184"/>
-        <location line="+3192"/>
+        <location line="-3187"/>
+        <location line="+3195"/>
         <location line="+3809"/>
         <location line="+260"/>
         <location line="+20"/>
@@ -1173,7 +1173,7 @@
         <translation>此操作需要打开一个捕获。</translation>
     </message>
     <message>
-        <location line="-8307"/>
+        <location line="-8310"/>
         <source>Tencent CodeBuddy / Hunyuan Subscription (ACP)</source>
         <comment>provider.codebuddy-acp.title</comment>
         <translation>腾讯 CodeBuddy / 混元订阅（ACP）</translation>
@@ -1309,7 +1309,7 @@
         <translation>剪贴板</translation>
     </message>
     <message>
-        <location line="+2394"/>
+        <location line="+2397"/>
         <source>No stage-scoped shader AI actions are available for this capture.</source>
         <translation>此捕获没有可用的面向特定着色器阶段的 AI 操作。</translation>
     </message>
@@ -1459,18 +1459,18 @@
         <translation>正在加载 AI 提供商...</translation>
     </message>
     <message>
-        <location line="-4304"/>
+        <location line="-4307"/>
         <source>Conversation selection</source>
         <translation>对话中选中的内容</translation>
     </message>
     <message>
         <location line="+70"/>
-        <location line="+2623"/>
+        <location line="+2626"/>
         <source>Task progress</source>
         <translation>任务进度</translation>
     </message>
     <message>
-        <location line="-2621"/>
+        <location line="-2624"/>
         <source>Show the steps and status of the active AI task.</source>
         <translation>显示当前 AI 任务的步骤和状态。</translation>
     </message>
@@ -1670,7 +1670,7 @@ Size: %2 bytes</source>
         <translation>移除附件：%1</translation>
     </message>
     <message>
-        <location line="+1181"/>
+        <location line="+1184"/>
         <source>Step %1 of %2</source>
         <translation>第 %1/%2 步</translation>
     </message>
@@ -1691,22 +1691,27 @@ Size: %2 bytes</source>
     </message>
     <message>
         <location line="+5"/>
-        <location line="+6446"/>
+        <location line="+6479"/>
         <source>failed</source>
         <translation>失败</translation>
     </message>
     <message>
-        <location line="-2"/>
+        <location line="-304"/>
+        <source>Reasoning</source>
+        <translation>推理过程</translation>
+    </message>
+    <message>
+        <location line="+302"/>
         <source>pending</source>
         <translation>待做</translation>
     </message>
     <message>
-        <location line="-6439"/>
+        <location line="-6472"/>
         <source>waiting</source>
         <translation>等待中</translation>
     </message>
     <message>
-        <location line="-3453"/>
+        <location line="-3456"/>
         <source>Uses an Anthropic API key. To use a Claude Code subscription instead, select the separate Claude Code ACP preset; it wraps the official Claude Code CLI with the Agent Client Protocol reference adapter and remains subject to Anthropic&apos;s third-party authentication and usage terms.</source>
         <comment>provider.anthropic.note</comment>
         <translation>此连接使用 Anthropic API key。若要改用 Claude Code 订阅，请选择单独的 Claude Code ACP 预设；它通过 Agent Client Protocol 参考适配器连接官方 Claude Code CLI，并仍须遵守 Anthropic 的第三方身份验证与使用条款。</translation>
@@ -1730,7 +1735,7 @@ Size: %2 bytes</source>
         <translation>在打开的终端里对官方 Claude Code CLI 完成鉴权：运行 `claude setup-token`，用拥有该 Claude 订阅的账号完成 Anthropic 登录，待其报告成功后退出终端。该终端已使用此 ReplayLab 连接的隔离 Claude profile；ReplayLab 只复用 Claude Code 已存储的官方凭据，绝不会看到你的密码或令牌。</translation>
     </message>
     <message>
-        <location line="+3273"/>
+        <location line="+3276"/>
         <source>running</source>
         <translation>正在执行</translation>
     </message>
@@ -2581,12 +2586,12 @@ Device code: %1</source>
     </message>
     <message>
         <location line="+6"/>
-        <location line="+2727"/>
+        <location line="+2760"/>
         <source>Chat ready</source>
         <translation>聊天就绪</translation>
     </message>
     <message>
-        <location line="-2729"/>
+        <location line="-2762"/>
         <source>Waiting for bridge</source>
         <translation>正在等待桥接</translation>
     </message>
@@ -2596,12 +2601,12 @@ Device code: %1</source>
         <translation>添加连接</translation>
     </message>
     <message>
-        <location line="+2731"/>
+        <location line="+2764"/>
         <source>Connected</source>
         <translation>已连接</translation>
     </message>
     <message>
-        <location line="-2340"/>
+        <location line="-2373"/>
         <location line="+157"/>
         <location line="+23"/>
         <location line="+395"/>
@@ -2654,7 +2659,7 @@ Device code: %1</source>
         <translation>捕获桥接尚未就绪。</translation>
     </message>
     <message>
-        <location line="-8542"/>
+        <location line="-8545"/>
         <source>%1 CLI detected; sign-in state is checked only after approval.</source>
         <comment>subscription.cli-detected</comment>
         <translation>已检测到 %1 CLI；仅在批准后检查登录状态。</translation>
@@ -2774,7 +2779,7 @@ Device code: %1</source>
         <translation>AI 设置</translation>
     </message>
     <message>
-        <location line="+3447"/>
+        <location line="+3450"/>
         <source>Analyze selected Shader with AI</source>
         <translation>使用 AI 分析所选着色器</translation>
     </message>
@@ -2853,12 +2858,12 @@ Device code: %1</source>
     </message>
     <message>
         <location line="+16"/>
-        <location line="+1266"/>
+        <location line="+1299"/>
         <source>Thinking...</source>
         <translation>正在思考…</translation>
     </message>
     <message>
-        <location line="-1201"/>
+        <location line="-1234"/>
         <source>Adjust direction is available when this conversation has an active AI request. The message remains queued.</source>
         <translation>仅当此对话存在当前 AI 请求时才能调整方向。该消息仍处于排队状态。</translation>
     </message>
@@ -2911,7 +2916,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>编辑后的补充说明回复超过 16,384 个字符的安全上限。</translation>
     </message>
     <message>
-        <location line="+177"/>
+        <location line="+178"/>
         <source>Interrupted for new direction</source>
         <translation>因新方向而中断</translation>
     </message>
@@ -2932,12 +2937,12 @@ Additional direction from the user (re-plan and continue from the preserved cont
     </message>
     <message>
         <location line="+110"/>
-        <location line="+708"/>
+        <location line="+740"/>
         <source>AI result contained an invalid terminal status.</source>
         <translation>AI 结果包含无效的终止状态。</translation>
     </message>
     <message>
-        <location line="-699"/>
+        <location line="-731"/>
         <source>AI task failed before a validated terminal result was received. Check the diagnostic log for technical details.</source>
         <translation>AI 任务在收到已验证的终止结果前失败。请查看诊断日志了解技术细节。</translation>
     </message>
@@ -2973,7 +2978,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>Agent 输出过大，无法在实时对话中显示。请打开智能体监视器查看完整跟踪记录。</translation>
     </message>
     <message>
-        <location line="+57"/>
+        <location line="+58"/>
         <source>Backend: %1</source>
         <translation>后端：%1</translation>
     </message>
@@ -2988,7 +2993,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>正在排队…</translation>
     </message>
     <message>
-        <location line="+57"/>
+        <location line="+88"/>
         <source>Arguments: %1</source>
         <translation>参数：%1</translation>
     </message>
@@ -3005,7 +3010,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>已完成</translation>
     </message>
     <message>
-        <location line="-465"/>
+        <location line="-496"/>
         <source>Connection: %1</source>
         <translation>连接：%1</translation>
     </message>
@@ -3020,24 +3025,25 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>第 %1 次尝试</translation>
     </message>
     <message>
-        <location line="+51"/>
+        <location line="+53"/>
         <source>Receiving reasoning...</source>
         <translation>正在接收推理内容…</translation>
     </message>
     <message>
+        <location line="+19"/>
         <source>[reasoning continues in the Agent monitor]</source>
         <translation>[后续推理内容见智能体监视器]</translation>
     </message>
     <message>
-        <location line="+14"/>
+        <location line="+24"/>
         <location line="+11"/>
         <source>Tool: %1</source>
         <translation>工具：%1</translation>
     </message>
     <message>
-        <location line="-181"/>
+        <location line="-213"/>
         <location line="+32"/>
-        <location line="+176"/>
+        <location line="+208"/>
         <source>Agent working</source>
         <translation>Agent 正在工作</translation>
     </message>
@@ -3201,7 +3207,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
 <context>
     <name>AIConversationStore</name>
     <message>
-        <location filename="../Windows/AI/AIConversationStore.cpp" line="+114"/>
+        <location filename="../Windows/AI/AIConversationStore.cpp" line="+111"/>
         <source>A capture path is required to load conversation history.</source>
         <translation>加载对话历史记录需要捕获文件路径。</translation>
     </message>
@@ -3365,6 +3371,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>推理摘要</translation>
     </message>
     <message>
+        <location line="+3"/>
         <source>Reasoning</source>
         <translation>推理过程</translation>
     </message>
@@ -3399,12 +3406,12 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>提供商</translation>
     </message>
     <message>
-        <location line="-21"/>
+        <location line="-24"/>
         <source>Main Agent</source>
         <translation>主智能体</translation>
     </message>
     <message>
-        <location line="+24"/>
+        <location line="+27"/>
         <source>Agent</source>
         <translation>智能体</translation>
     </message>
@@ -6350,7 +6357,7 @@ Open settings window to configure path?</source>
         <translation>无法从远程主机复制捕获。</translation>
     </message>
     <message>
-        <location filename="../Code/qrenderdoc.cpp" line="+541"/>
+        <location filename="../Code/qrenderdoc.cpp" line="+537"/>
         <source>Error loading config</source>
         <translation>加载配置时出错</translation>
     </message>
@@ -7208,7 +7215,7 @@ Intent 参数必须包含完整参数，例如 --es args &quot;my arguments&quot
         <translation>无法启动着色器语言服务器：%1</translation>
     </message>
     <message>
-        <location line="+395"/>
+        <location line="+402"/>
         <source>Unmatched closing &apos;%1&apos;</source>
         <translation>右侧“%1”没有匹配项</translation>
     </message>
@@ -7229,17 +7236,17 @@ Intent 参数必须包含完整参数，例如 --es args &quot;my arguments&quot
         <translation>“%1”未闭合</translation>
     </message>
     <message>
-        <location line="+662"/>
+        <location line="+715"/>
         <source>References to %1</source>
         <translation>%1 的引用</translation>
     </message>
     <message>
-        <location line="+21"/>
+        <location line="-29"/>
         <source>%1:%2  %3</source>
         <translation>%1:%2  %3</translation>
     </message>
     <message>
-        <location line="+20"/>
+        <location line="+47"/>
         <source>No references found in open documents</source>
         <translation>未在已打开的文档中找到引用</translation>
     </message>
@@ -16967,7 +16974,7 @@ Right click to debug an event, hide failed events, or jump to the modification&a
 <context>
     <name>PythonContext</name>
     <message>
-        <location filename="../Code/pyrenderdoc/PythonContext.cpp" line="+725"/>
+        <location filename="../Code/pyrenderdoc/PythonContext.cpp" line="+735"/>
         <source>Python is not initialised; the built-in integration was not loaded.</source>
         <translation>Python 尚未初始化；未加载内置集成。</translation>
     </message>
@@ -17063,7 +17070,7 @@ Right click to debug an event, hide failed events, or jump to the modification&a
         <translation>内置集成调用失败：%1：%2</translation>
     </message>
     <message>
-        <location line="+241"/>
+        <location line="+253"/>
         <source>Couldn&apos;t get a list for Python sys.path; extension was not loaded.
 </source>
         <translation>无法获取 Python sys.path 列表；扩展未加载。
@@ -20114,8 +20121,18 @@ Project: %5</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Input</source>
+        <translation>输入</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Integer parameters require decimal integers</source>
         <translation>整数参数需要十进制整数</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Jump to EID %1</source>
+        <translation>跳转到 EID %1</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -20246,6 +20263,11 @@ Project: %5</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>No event uses this Shader in the capture catalog</source>
+        <translation>捕获索引中没有使用此着色器的事件</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>No exposed parameters</source>
         <translation>尚未公开参数</translation>
     </message>
@@ -20291,6 +20313,11 @@ Project: %5</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Open Shader</source>
+        <translation>打开着色器</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Open a Pipeline State CBuffer, right-click a reflected value, then choose
 ReplayLab → Expose as Material Parameter.</source>
         <translation>打开管线状态中的 CBuffer，右键单击反射值，然后选择
@@ -20303,6 +20330,11 @@ ReplayLab → 公开为材质参数。</translation>
     </message>
     <message>
         <location line="+1"/>
+        <source>Open the capture this Shader belongs to first</source>
+        <translation>请先打开此着色器所属的捕获</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Opening the selected RDC in RenderDoc…</source>
         <translation>正在 RenderDoc 中打开所选 RDC…</translation>
     </message>
@@ -20310,6 +20342,11 @@ ReplayLab → 公开为材质参数。</translation>
         <location line="+1"/>
         <source>Out of date</source>
         <translation>已过期</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Output</source>
+        <translation>输出</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -20688,6 +20725,11 @@ The project folder and every local file will remain on disk.</source>
         <location line="+1"/>
         <source>Reviewed organized HLSL · Ctrl+S saves and automatically compiles/replaces</source>
         <translation>已审查并整理的 HLSL · Ctrl+S 保存后自动编译并替换</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Right-click to jump to an event</source>
+        <translation>右键单击可跳转到事件</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -21072,6 +21114,16 @@ The project folder and every local file will remain on disk.</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>Used by %1 event(s)</source>
+        <translation>%1 个事件使用此着色器</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Used by %1 event(s): %2</source>
+        <translation>%1 个事件使用此着色器：%2</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Utility</source>
         <translation>实用操作</translation>
     </message>
@@ -21192,6 +21244,11 @@ The project folder and every local file will remain on disk.</source>
     </message>
     <message>
         <location line="+1"/>
+        <source>in: %1</source>
+        <translation>输入：%1</translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>missing</source>
         <translation>缺失</translation>
     </message>
@@ -21199,6 +21256,11 @@ The project folder and every local file will remain on disk.</source>
         <location line="+1"/>
         <source>not configured</source>
         <translation>未配置</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>out: %1</source>
+        <translation>输出：%1</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -21219,6 +21281,11 @@ The project folder and every local file will remain on disk.</source>
         <location line="+1"/>
         <source>unspecified</source>
         <translation>未说明</translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>… and %1 more (see tooltip)</source>
+        <translation>… 另有 %1 个事件（见提示）</translation>
     </message>
 </context>
 <context>
@@ -22303,7 +22370,7 @@ Only happens if the capture is not in the recent files list.</source>
         <translation>前进（Alt+右箭头）</translation>
     </message>
     <message>
-        <location line="+347"/>
+        <location line="+377"/>
         <source>Errors: %1 · Warnings: %2</source>
         <translation>错误：%1 · 警告：%2</translation>
     </message>
@@ -28064,7 +28131,7 @@ The buffer is %3 bytes in length.
 %2 MB / %3 MB。剩余 %4（%5 %6）</translation>
     </message>
     <message>
-        <location filename="../Code/qrenderdoc.cpp" line="-217"/>
+        <location filename="../Code/qrenderdoc.cpp" line="-214"/>
         <source>Qt UI for RenderDoc</source>
         <translation>RenderDoc 的 Qt UI</translation>
     </message>
@@ -28109,7 +28176,7 @@ The buffer is %3 bytes in length.
         <translation>应用更新时出错：%1</translation>
     </message>
     <message>
-        <location line="+141"/>
+        <location line="+138"/>
         <source>Error loading remote host</source>
         <translation>加载远程主机时出错</translation>
     </message>

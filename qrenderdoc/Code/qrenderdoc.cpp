@@ -30,7 +30,6 @@
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
-#include <QStandardPaths>
 #include <QSysInfo>
 #include "Code/CaptureContext.h"
 #include "Code/QRDUtils.h"
@@ -518,13 +517,10 @@ int main(int argc, char *argv[])
   {
     PersistantConfig config;
 
-    {
-      QString configPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-      QDir dir(configPath);
-
-      if(!dir.exists())
-        dir.mkpath(configPath);
-    }
+    // ConfigFilePath validates and creates an explicit isolation root before any UI settings are
+    // loaded. Do not create the normal AppData directory when this process requested isolation.
+    const QString configPath = ConfigFilePath(QString());
+    QDir().mkpath(configPath);
 
     const QString configFilename = ConfigFilePath(lit("UI.config"));
     const bool configLoaded = config.Load(configFilename);

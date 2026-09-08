@@ -33,7 +33,7 @@
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QSaveFile>
-#include <QStandardPaths>
+#include "Code/Interface/QRDInterface.h"
 
 namespace
 {
@@ -52,11 +52,8 @@ void setError(QString *error, const QString &message)
 
 QString storageDirectory()
 {
-  const QString applicationData = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-  if(applicationData.isEmpty())
-    return QString();
-
-  return QDir(applicationData).filePath(QStringLiteral("ReplayLab/conversations"));
+  // i18n-ignore: Fixed per-application storage path, shared with the UI configuration root.
+  return ConfigFilePath(QStringLiteral("ReplayLab/conversations"));
 }
 };    // namespace
 

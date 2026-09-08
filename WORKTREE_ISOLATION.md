@@ -25,3 +25,18 @@
 已有设计在 `docs/CONTRIBUTING/Interactive-Replay.md`。历史性能实测与复盘仍位于原工程的 `output/interactive-replay-20260906/`，可只读查阅，其中暂停记录反映当时状态。新工作区是否启动功能开发，以用户在对应任务中的最新明确指令为准；本次设置没有自动启动旧测试计划。
 
 工作区快照收据保存在本 worktree 的 Git 管理目录中：`eid-source-snapshot.json`，可用 `git rev-parse --absolute-git-dir` 定位。
+
+## 2026-09-08 运行隔离进展
+
+上述“尚未实施”是建立 worktree 时的记录。性能分支现有自己的 core、Python binding、CLI 和
+`x64/Development/q_render_soco_doc.exe`，通过 `util/perf/build_eid_isolated.ps1 -IncludeGui`
+构建；全部对象、输出和第一方 bridge 均留在本工作区。
+
+GUI 测试使用 `util/perf/run_eid_isolated_gui.py` 派生全新配置、临时目录、ReplayLab IPC 与项目根，
+并核验实际运行库。`RENDERDOC_CONFIG_DIR` 同时控制原生配置与 GUI 配置/对话/扩展扫描；只双击
+exe 不会自动设置这个隔离环境。原分支 GUI 可以继续运行，测试只关闭自己启动的实例。
+
+`output/gui-isolation/probe-v12b` 的无 capture 探针和 `presentation-v12b`、`presentation-v13`
+的真实 Qt 纹理控件验收已通过，记录的原用户配置哈希未变。此次只验 GUI/bridge 隔离；
+未打包的 Shader/Agent sidecar 服务不在此验收范围。两实例仍共享物理 GPU，不能把并行测试
+的耗时当作独占 GPU 性能验收。完整命令及限制见 `util/perf/ISOLATED_REPLAY.md`。

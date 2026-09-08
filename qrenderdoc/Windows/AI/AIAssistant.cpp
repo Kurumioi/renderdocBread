@@ -12495,9 +12495,11 @@ void AIAssistant::consumeTaskEvent(const QString &taskId, const QByteArray &line
       setDiagnosticStatus(m_Status, DiagnosticLevel::Info, tr("Receiving reasoning..."));
     // i18n-ignore: ReplayLab task-event JSON field name defined by the backend protocol.
     const bool childReasoning = !eventData.value(lit("planTaskId")).toString().isEmpty();
+    // i18n-ignore: ReplayLab task-event JSON field name, not UI text.
     const QString text = event.value(lit("text")).toString();
     // i18n-ignore: Lifecycle values are stable ReplayLab task-event protocol identifiers.
     const bool finished = lifecycle == lit("completed") || lifecycle == lit("truncated") ||
+                          // i18n-ignore: Stable ReplayLab lifecycle protocol values.
                           lifecycle == lit("failed") || lifecycle == lit("cancelled");
     if(!childReasoning && (!text.isEmpty() || finished))
     {
@@ -12514,6 +12516,7 @@ void AIAssistant::consumeTaskEvent(const QString &taskId, const QByteArray &line
       if(!visible.isEmpty() || finished)
         // i18n-ignore: Activity kind is a stable ReplayLab conversation protocol identifier.
         appendTaskActivityText(taskId, lit("reasoning-raw"), tr("Reasoning"), visible,
+                               // i18n-ignore: ReplayLab task-event JSON field name.
                                eventData.value(lit("reset")).toBool(), finished, false,
                                eventTimestampMs, activityId);
       if(finished)

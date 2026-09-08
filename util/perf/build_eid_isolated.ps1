@@ -1,8 +1,11 @@
 #Requires -Version 5.1
 <# Build an isolated core, Python binding, CLI, and local offline Python host.
-   No GUI, capture, GPU replay, runtime freeze, or integration deployment. #>
+   IncludeGui additionally builds the local GUI and deploys its fixed bridge.
+   No application is launched and no ReplayLab sidecar runtime is frozen. #>
 [CmdletBinding()]
-param([ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Label = 'baseline')
+param([ValidatePattern('^[A-Za-z0-9_-]+$')][string]$Label = 'baseline',
+      [switch]$AllowForeignGui,
+      [switch]$IncludeGui)
 $ErrorActionPreference = 'Stop'
 $buildRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../..')).Path.TrimEnd('\')
 if(-not (Test-Path -LiteralPath (Join-Path $buildRoot 'WORKTREE_ISOLATION.md'))) {
@@ -37,6 +40,7 @@ $buildGuardNames = @('MSBuild.exe','q_render_soco_doc.exe','qrenderdoc.exe',
 $processSnapshot = @(Get-CimInstance Win32_Process)
 $conflicts = @($processSnapshot | Where-Object { $_.Name -in $buildGuardNames })
 $ignoredIdleWorkers = @()
+$ignoredForeignGuis = @()
 if($conflicts.Count) {
   # MSBuild leaves reusable worker processes after their build owner exits. Never
   # kill another owner's worker, and never treat an active worker as idle.
@@ -51,6 +55,26 @@ if($conflicts.Count) {
       $candidate.CommandLine -match '(?i)/nodeReuse:true\b'
     $identityStable = $candidate.CreationDate -eq $current.CreationDate -and
       $candidate.ExecutablePath -eq $current.ExecutablePath -and $candidate.CommandLine -eq $current.CommandLine
+    if($AllowForeignGui -and $identityStable -and
+       $candidate.Name -in @('q_render_soco_doc.exe','qrenderdoc.exe') -and
+       $candidate.ExecutablePath -and
+       -not $candidate.ExecutablePath.StartsWith($buildRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+      # Compilation touches only this worktree. A foreign GUI can remain open if neither its
+      # executable nor any loaded DLL belongs to our output tree. This exception never applies
+      # to other build workers or replay hosts. The replay runner separately records GPU sharing.
+      $foreignModules = @()
+      try { $foreignModules = @((Get-Process -Id $candidate.ProcessId -ErrorAction Stop).Modules) } catch {}
+      $modulesInBuild = @($foreignModules | Where-Object {
+        $_.FileName.StartsWith($buildRoot + '\', [StringComparison]::OrdinalIgnoreCase)
+      })
+      if($foreignModules.Count -gt 0 -and $modulesInBuild.Count -eq 0) {
+        $ignoredForeignGuis += @{pid=$candidate.ProcessId;path=$candidate.ExecutablePath;
+          created=$candidate.CreationDate.ToUniversalTime().ToString('o');
+          loadedModulesInspected=$foreignModules.Count;modulesInBuildRoot=0;terminated=$false}
+        Write-Output "Foreign GUI $($candidate.ProcessId) uses no isolated build modules; left running. Replay runs separately record GPU-sharing conditions."
+        continue
+      }
+    }
     $parentPresent = @($processSnapshot + $secondSnapshot | Where-Object { $_.ProcessId -eq $candidate.ParentProcessId }).Count -gt 0
     $childrenPresent = @($processSnapshot + $secondSnapshot | Where-Object { $_.ParentProcessId -eq $candidate.ProcessId -and $_.Name -ne 'conhost.exe' }).Count -gt 0
     $compilerPresent = @($processSnapshot + $secondSnapshot | Where-Object { $_.Name -in @('cl.exe','link.exe','c1.exe','c1xx.exe','c2.exe') }).Count -gt 0
@@ -88,13 +112,17 @@ $vsRoot = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools
 if(-not $msbuild -or -not $vsRoot) { throw 'MSBuild / MSVC not available.' }
 $buildSolution = $buildRoot + '\'
 function Source-Identity {
-  $paths = @(& git -C $buildRoot ls-files -- renderdoc renderdoccmd qrenderdoc/Code/pyrenderdoc util/WindowsSDKTarget.props util/WindowsSDKFix.props util/perf/eid_replay_python.cpp)
+  $paths = @(& git -C $buildRoot ls-files --cached --others --exclude-standard -- renderdoc renderdoccmd qrenderdoc/Code/pyrenderdoc util/WindowsSDKTarget.props util/WindowsSDKFix.props util/perf/eid_replay_python.cpp)
   if($LASTEXITCODE) { throw 'Cannot enumerate build source files.' }
   $paths += 'util/perf/eid_replay_python.cpp'
+  if($IncludeGui) {
+    $paths += @(& git -C $buildRoot ls-files --cached --others --exclude-standard -- qrenderdoc replaylab/renderdoc_mcp_bridge)
+    if($LASTEXITCODE) { throw 'Cannot enumerate GUI/integration source files.' }
+  }
   $result = @()
   foreach($relative in ($paths | Sort-Object -Unique)) {
     $path = Join-Path $buildRoot $relative
-    if((Test-Path -LiteralPath $path -PathType Leaf) -and $relative -match '\.(cpp|cxx|c|h|hpp|hxx|inl|i|inc|hlsl|glsl|vert|frag|comp|txt|in|cmake|vcxproj|props|rc|def|xml|json|lib|exe)$') {
+    if((Test-Path -LiteralPath $path -PathType Leaf) -and $relative -match '\.(cpp|cxx|c|h|hpp|hxx|inl|i|inc|hlsl|glsl|vert|frag|comp|txt|in|cmake|vcxproj|props|rc|def|xml|json|lib|exe|ui|qrc|ts|qm|py)$') {
       $result += @{path=$relative;sha256=(Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash}
     }
   }
@@ -104,9 +132,10 @@ $receipt = [ordered]@{
   schema='eid-isolated-build/v1';label=$Label;worktree=$buildRoot;configuration='Development';platform='x64';
   replayOptimizeDevelopment=$true;msbuild=$msbuild;solutionDir=$buildSolution;maxCpu=2;
   ignoredIdleWorkers=$ignoredIdleWorkers;
+  allowForeignGui=[bool]$AllowForeignGui;ignoredForeignGuis=$ignoredForeignGuis;
   startedUtc=[DateTime]::UtcNow.ToString('o');gitHead=(& git -C $buildRoot rev-parse HEAD);
   branch=(& git -C $buildRoot branch --show-current);sourceBefore=@(Source-Identity);steps=@();
-  success=$false;gpuReplayRun=$false;guiRun=$false
+  success=$false;gpuReplayRun=$false;guiRun=$false;guiBuilt=[bool]$IncludeGui;sidecarsFrozen=$false
 }
 $receipt | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $buildOutput "build-$Label-inputs.json") -Encoding UTF8
 $savedLocation = Get-Location
@@ -116,15 +145,17 @@ try {
   Set-Location -LiteralPath $buildRoot
   $env:TEMP = $buildTemp
   $env:TMP = $buildTemp
-  foreach($step in @(
+  $steps = @(
     @{project='renderdoc/renderdoc.vcxproj';name='core'},
     @{project='renderdoc/renderdoc_no_export.vcxproj';name='system-load'},
     @{project='qrenderdoc/Code/pyrenderdoc/pyrenderdoc_module.vcxproj';name='pyd'},
-    @{project='renderdoccmd/renderdoccmd.vcxproj';name='cmd'})) {
+    @{project='renderdoccmd/renderdoccmd.vcxproj';name='cmd'})
+  if($IncludeGui) { $steps += @{project='qrenderdoc/qrenderdoc_local.vcxproj';name='gui'} }
+  foreach($step in $steps) {
     $log = Join-Path $buildOutput "build-$Label-$($step.name).log"
     $started = [DateTime]::UtcNow
     Write-Output "Building $($step.name); log: $log"
-    & $msbuild $step.project /m:2 /nr:false /t:Build /nologo /verbosity:minimal /p:Configuration=Development /p:Platform=x64 /p:ReplayOptimizeDevelopment=true "/p:SolutionDir=$buildSolution" *> $log
+    & $msbuild $step.project /m:2 /nr:false /t:Build /nologo /verbosity:minimal /p:Configuration=Development /p:Platform=x64 /p:ReplayOptimizeDevelopment=true /p:SkipReplayLabRuntime=true "/p:SolutionDir=$buildSolution" *> $log
     $code = $LASTEXITCODE
     $receipt.steps += @{name=$step.name;project=$step.project;log=$log;exitCode=$code;elapsedSeconds=([DateTime]::UtcNow-$started).TotalSeconds}
     if($code -ne 0) { throw "Native $($step.name) failed; inspect $log" }
@@ -157,14 +188,20 @@ try {
   $receipt.sourceStable = ($beforeText -ceq $afterText)
   if(-not $receipt.sourceStable) { throw 'Build source changed during baseline compilation; rebuild using a fresh label.' }
   $receipt.binaries = @()
-  foreach($relative in @('renderdoc.dll','system_load.dll','pymodules/renderdoc.pyd','render_soco_doccmd.exe','eid_replay_python.exe','python36.dll','python36.zip','d3dcompiler_47.dll')) {
+  $binaryPaths = @('renderdoc.dll','system_load.dll','pymodules/renderdoc.pyd','render_soco_doccmd.exe','eid_replay_python.exe','python36.dll','python36.zip','d3dcompiler_47.dll')
+  if($IncludeGui) {
+    $binaryPaths += @('q_render_soco_doc.exe','Qt5Core.dll','Qt5Gui.dll','Qt5Widgets.dll',
+      'Qt5Network.dll','Qt5Svg.dll','shiboken2.dll','PySide2/pyside2.dll',
+      'PySide2/QtCore.pyd','PySide2/QtGui.pyd','PySide2/QtWidgets.pyd','qtplugins/platforms/qwindows.dll')
+  }
+  foreach($relative in $binaryPaths) {
     $info = Get-Item -LiteralPath (Join-Path $buildBin $relative)
     $receipt.binaries += @{path=$info.FullName;bytes=$info.Length;modifiedUtc=$info.LastWriteTimeUtc.ToString('o');sha256=(Get-FileHash -LiteralPath $info.FullName -Algorithm SHA256).Hash}
   }
   $receipt.success = $true
   $configurationSource = Get-Content -LiteralPath (Join-Path $buildRoot 'renderdoc/os/os_specific.cpp') -Raw
   if($configurationSource.Contains('RENDERDOC_CONFIG_DIR')) {
-    @{schema='eid-isolated-runtime/v1';buildReceipt=$receiptPath;worktree=$buildRoot;configurationOverride=$true;binaries=$receipt.binaries} |
+    @{schema='eid-isolated-runtime/v1';buildReceipt=$receiptPath;worktree=$buildRoot;configurationOverride=$true;guiBuilt=[bool]$IncludeGui;binaries=$receipt.binaries} |
       ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $buildBin 'eid-isolated-runtime.json') -Encoding UTF8
   }
 } catch {
