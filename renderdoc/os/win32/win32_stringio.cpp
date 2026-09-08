@@ -391,7 +391,7 @@ rdcstr GetHomeFolderFilename()
   return ret;
 }
 
-rdcstr GetAppFolderFilename(const rdcstr &filename)
+rdcstr GetPlatformAppFolderFilename(const rdcstr &filename)
 {
   PWSTR appDataPath = NULL;
   HRESULT hr = SHGetKnownFolderPath(
