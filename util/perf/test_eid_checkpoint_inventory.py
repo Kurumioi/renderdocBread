@@ -4,7 +4,7 @@ import unittest
 
 from eid_checkpoint_inventory import (action_metadata, boundary_set, category,
                                       choose_boundaries, marker_category, usage_kind,
-                                      usage_summary)
+                                      usage_summary, usage_window, parse_windows)
 
 
 def resource(key, size, usage, writable=False):
@@ -13,6 +13,32 @@ def resource(key, size, usage, writable=False):
 
 
 class CheckpointInventoryTests(unittest.TestCase):
+    def test_window_excludes_checkpoint_includes_target_and_clear_is_not_overwrite_proof(self):
+        result = usage_window([(10, "PS_Resource"), (15, "Clear"), (15, "PS_Resource"),
+                               (20, "PS_Resource"), (21, "CS_RWResource")], 10, 20)
+        self.assertEqual(result["usageCount"], 3)
+        self.assertEqual(result["firstUseKinds"], ["Clear", "PS_Resource"])
+        self.assertTrue(result["startsWithReportedClear"])
+        self.assertFalse(result["fullOverwriteProven"])
+        self.assertFalse(result["safeToSkipRestore"])
+        self.assertIsNone(result["byteRanges"])
+
+    def test_empty_window_and_unknown_usage_never_authorize_skip(self):
+        result = usage_window([(40, "PS_Resource")], 10, 20)
+        self.assertTrue(result["noReportedUse"])
+        self.assertFalse(result["safeToSkipRestore"])
+        unknown = usage_window([(15, "FutureUnknownUse")], 10, 20)
+        self.assertFalse(unknown["noReportedUse"])
+        self.assertEqual(unknown["unknownUsageKinds"], ["FutureUnknownUse"])
+
+    def test_window_arguments_are_bounded_and_valid(self):
+        self.assertEqual(parse_windows("0:10,5:20,0:10"), [(0, 10), (5, 20)])
+        for value in ("1:1", "-1:20", "1:2:3", "1", "x:2"):
+            with self.assertRaises(ValueError):
+                parse_windows(value)
+        with self.assertRaises(ValueError):
+            parse_windows("0:10,1:20", maximum=1)
+
     def test_usage_classifies_cpu_write_and_read_write_as_possible_write(self):
         for name in ("CPUWrite", "CS_RWResource", "Copy", "ResolveDst", "Discard", "StreamOut"):
             self.assertEqual(usage_kind(name), "potentialWrite")

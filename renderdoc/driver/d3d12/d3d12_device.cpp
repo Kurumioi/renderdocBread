@@ -2405,6 +2405,35 @@ ID3D12RootSignature *WrappedID3D12Device::CreateImplicitRootSig(
   return NULL;
 }
 
+static rdcstr ReplayInitialCopySourceCounters(const D3D12ReplayInitialCopyStats &stats)
+{
+  rdcstr counters = StringFormat::Fmt("cpuMemcpyBytes=%llu", (unsigned long long)stats.cpuMemcpyBytes);
+  const D3D12ReplayInitialSourceCopyStats *sources[] = {&stats.upload, &stats.gpuDefault, &stats.other};
+  const char *names[] = {"Upload", "Default", "Other"};
+  for(size_t i = 0; i < ARRAY_COUNT(sources); i++)
+    counters += StringFormat::Fmt(
+        " gpu%sBufferBytes=%llu gpu%sFootprintBytes=%llu gpu%sWholeCopies=%llu", names[i],
+        (unsigned long long)sources[i]->bufferBytes, names[i],
+        (unsigned long long)sources[i]->footprintBytes, names[i],
+        (unsigned long long)sources[i]->wholeCopies);
+  return counters;
+}
+
+static rdcstr ReplayInitialCopySourceTuple(const D3D12ReplayInitialCopyStats &stats)
+{
+  return StringFormat::Fmt("%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu",
+                          (unsigned long long)stats.cpuMemcpyBytes,
+                          (unsigned long long)stats.upload.bufferBytes,
+                          (unsigned long long)stats.upload.footprintBytes,
+                          (unsigned long long)stats.upload.wholeCopies,
+                          (unsigned long long)stats.gpuDefault.bufferBytes,
+                          (unsigned long long)stats.gpuDefault.footprintBytes,
+                          (unsigned long long)stats.gpuDefault.wholeCopies,
+                          (unsigned long long)stats.other.bufferBytes,
+                          (unsigned long long)stats.other.footprintBytes,
+                          (unsigned long long)stats.other.wholeCopies);
+}
+
 void WrappedID3D12Device::ApplyInitialContents(bool useCheckpointSources)
 {
   RENDERDOC_PROFILEFUNCTION();
@@ -2451,24 +2480,61 @@ void WrappedID3D12Device::ApplyInitialContents(bool useCheckpointSources)
   if(m_ReplayDirtyTiming && IsActiveReplaying(m_State))
   {
     uint64_t actual = 0, skipped = 0, whole = 0;
-    rdcstr resources;
+    D3D12ReplayInitialCopyStats sourceTotals;
+    typedef rdcpair<ResourceId, const ReplayDirtyCopyStats *> CopyEntry;
+    rdcarray<CopyEntry> details;
+    details.reserve(m_ReplayDirtyCopyStats.size());
     for(const auto &entry : m_ReplayDirtyCopyStats)
     {
       actual += entry.second.actualBytes;
       skipped += entry.second.skippedBytes;
       whole += entry.second.wholeCopies;
-      resources += StringFormat::Fmt(" %s:%llu/%llu/%llu", ToStr(entry.first).c_str(),
-                                      (unsigned long long)entry.second.actualBytes,
-                                      (unsigned long long)entry.second.skippedBytes,
-                                      (unsigned long long)entry.second.wholeCopies);
+      sourceTotals.Add(entry.second.sources);
+      details.push_back({entry.first, &entry.second});
+    }
+    // Keep the diagnostic line bounded even for captures with tens of thousands of resources.
+    // Totals cover every resource; omitted sums make truncation explicit and checkable.
+    const size_t detailCount = RDCMIN(size_t(24), details.size());
+    if(detailCount)
+      std::partial_sort(details.begin(), details.begin() + detailCount, details.end(),
+                        [](const CopyEntry &a, const CopyEntry &b) {
+                          if(a.second->actualBytes != b.second->actualBytes)
+                            return a.second->actualBytes > b.second->actualBytes;
+                          if(a.second->wholeCopies != b.second->wholeCopies)
+                            return a.second->wholeCopies > b.second->wholeCopies;
+                          if(a.second->skippedBytes != b.second->skippedBytes)
+                            return a.second->skippedBytes > b.second->skippedBytes;
+                          return a.first < b.first;
+                        });
+    uint64_t omittedActual = actual, omittedSkipped = skipped, omittedWhole = whole;
+    rdcstr resources, sourceResources;
+    for(size_t i = 0; i < detailCount; i++)
+    {
+      const ReplayDirtyCopyStats &stats = *details[i].second;
+      omittedActual -= stats.actualBytes;
+      omittedSkipped -= stats.skippedBytes;
+      omittedWhole -= stats.wholeCopies;
+      const rdcstr resource = ToStr(details[i].first);
+      resources += StringFormat::Fmt(" %s:%llu/%llu/%llu", resource.c_str(),
+                                     (unsigned long long)stats.actualBytes,
+                                     (unsigned long long)stats.skippedBytes,
+                                     (unsigned long long)stats.wholeCopies);
+      sourceResources += StringFormat::Fmt("%s%s:%s", i ? "," : "", resource.c_str(),
+                                           ReplayInitialCopySourceTuple(stats.sources).c_str());
     }
     const rdcstr line = StringFormat::Fmt(
         "api=D3D12DirtyRestore enabled=%u shadow=%u actualCopyBytes=%llu skippedStaticBytes=%llu "
         "wholeResourceCopies=%llu dirtyResources=%zu dirtyHeaps=%zu reason=%s "
+        "restoreTimingVersion=2 %s resourceDetailCount=%zu omittedResourceCount=%zu "
+        "omittedActualCopyBytes=%llu omittedSkippedStaticBytes=%llu omittedWholeResourceCopies=%llu "
+        "resourceSourceCopies=%s "
         "resourceActualSkippedWhole=%s", m_UseReplayDirtyInitialContents ? 1U : 0U,
         m_ReplayDirtyShadow ? 1U : 0U, (unsigned long long)actual, (unsigned long long)skipped,
         (unsigned long long)whole, m_ReplayDirtyResources.size(), m_ReplayDirtyHeapRanges.size(),
-        m_ReplayDirtyReason.c_str(), resources.c_str());
+        m_ReplayDirtyReason.c_str(), ReplayInitialCopySourceCounters(sourceTotals).c_str(), detailCount,
+        details.size() - detailCount, (unsigned long long)omittedActual,
+        (unsigned long long)omittedSkipped, (unsigned long long)omittedWhole,
+        sourceResources.empty() ? "none" : sourceResources.c_str(), resources.c_str());
     RDCLOG("%s", line.c_str());
     AppendReplayTimingLog(line);
   }
@@ -3000,13 +3066,36 @@ bool WrappedID3D12Device::IsReplayInitialContentsUnchanged(ResourceId resource, 
   return !m_ReplayDirtyShadow;
 }
 
+static D3D12ReplayInitialCopySource ReplayInitialCopyHeapClass(bool known, D3D12_HEAP_TYPE type)
+{
+  if(known && type == D3D12_HEAP_TYPE_UPLOAD)
+    return D3D12ReplayInitialCopySource::Upload;
+  if(known && type == D3D12_HEAP_TYPE_DEFAULT)
+    return D3D12ReplayInitialCopySource::Default;
+  return D3D12ReplayInitialCopySource::Other;
+}
+
+D3D12ReplayInitialCopySource WrappedID3D12Device::GetReplayInitialCopySource(
+    ID3D12Resource *nativeSource) const
+{
+  // The disabled path must not query the driver or create any timing storage.
+  if(!m_ReplayDirtyTiming)
+    return D3D12ReplayInitialCopySource::Other;
+  D3D12_HEAP_PROPERTIES properties = {};
+  const bool known = nativeSource && SUCCEEDED(nativeSource->GetHeapProperties(&properties, NULL));
+  return ReplayInitialCopyHeapClass(known, properties.Type);
+}
+
 void WrappedID3D12Device::RecordReplayInitialCopy(ResourceId resource, uint64_t bytes,
-                                                bool wholeResource)
+                                                D3D12ReplayInitialCopySource source,
+                                                bool footprint, bool wholeResource)
 {
   if(!m_ReplayDirtyTiming)
     return;
-  m_ReplayDirtyCopyStats[resource].actualBytes += bytes;
-  m_ReplayDirtyCopyStats[resource].wholeCopies += wholeResource ? 1 : 0;
+  ReplayDirtyCopyStats &stats = m_ReplayDirtyCopyStats[resource];
+  stats.actualBytes += wholeResource ? 0 : bytes;
+  stats.wholeCopies += wholeResource ? 1 : 0;
+  stats.sources.Record(bytes, source, footprint, wholeResource);
 }
 
 void WrappedID3D12Device::MarkCheckpointReplayWrites()
@@ -8164,6 +8253,86 @@ static void CheckpointInitialCopyRanges(
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 #include "catch/catch.hpp"
+
+TEST_CASE("D3D12 initial source accounting counts selected copies instead of cache source extents",
+          "[d3d12][replay][dirty-restore][source-copy-timing]")
+{
+  const uint64_t mb = 1024 * 1024;
+  // A multi-gigabyte source is consulted, but the previous writes and checkpoint exclusions
+  // leave only two two-megabyte ranges to copy. Cache extent counters cannot account for this.
+  rdcarray<rdcpair<uint64_t, uint64_t>> requested;
+  CheckpointInitialCopyRanges(4096 * mb, {{0, 4 * mb}, {8 * mb, 100 * mb},
+                                         {104 * mb, 4096 * mb}}, requested);
+  const auto selected = IntersectReplayDirtyRanges(requested, {{6 * mb, 102 * mb}});
+  REQUIRE(selected.size() == 2);
+  D3D12ReplayInitialCopyStats stats;
+  for(const auto &range : selected)
+    stats.Record(range.second - range.first, D3D12ReplayInitialCopySource::Upload, false, false);
+  CHECK(stats.upload.bufferBytes == 4 * mb);
+  CHECK(stats.upload.footprintBytes == 0);
+  CHECK(stats.upload.wholeCopies == 0);
+  CHECK(stats.gpuDefault.bufferBytes == 0);
+  CHECK(stats.cpuMemcpyBytes == 0);
+
+  // No selected ranges means no transfer, even though a source cache was queried.
+  const auto empty = IntersectReplayDirtyRanges(requested, {{200 * mb, 201 * mb}});
+  CHECK(empty.empty());
+  for(const auto &range : empty)
+    stats.Record(range.second - range.first, D3D12ReplayInitialCopySource::Upload, false, false);
+  CHECK(stats.upload.bufferBytes == 4 * mb);
+
+  // Texture footprints and CPU memcpy lengths use distinct units and never inherit source width.
+  stats.Record(1536, D3D12ReplayInitialCopySource::Default, true, false);
+  stats.Record(173, D3D12ReplayInitialCopySource::CPU, false, false);
+  CHECK(stats.gpuDefault.bufferBytes == 0);
+  CHECK(stats.gpuDefault.footprintBytes == 1536);
+  CHECK(stats.cpuMemcpyBytes == 173);
+
+  // Even an accidental byte estimate on a whole copy cannot masquerade as measured bytes.
+  stats.Record(4096 * mb, D3D12ReplayInitialCopySource::Other, false, true);
+  CHECK(stats.other.bufferBytes == 0);
+  CHECK(stats.other.footprintBytes == 0);
+  CHECK(stats.other.wholeCopies == 1);
+
+  D3D12ReplayInitialCopyStats totals;
+  totals.Add(stats);
+  totals.Add(stats);
+  CHECK(totals.upload.bufferBytes == 8 * mb);
+  CHECK(totals.gpuDefault.footprintBytes == 3072);
+  CHECK(totals.cpuMemcpyBytes == 346);
+  CHECK(totals.other.wholeCopies == 2);
+}
+
+TEST_CASE("D3D12 initial source accounting preserves unknown heaps and fixed diagnostic field order",
+          "[d3d12][replay][dirty-restore][source-copy-timing]")
+{
+  CHECK(uint32_t(ReplayInitialCopyHeapClass(true, D3D12_HEAP_TYPE_UPLOAD)) ==
+        uint32_t(D3D12ReplayInitialCopySource::Upload));
+  CHECK(uint32_t(ReplayInitialCopyHeapClass(true, D3D12_HEAP_TYPE_DEFAULT)) ==
+        uint32_t(D3D12ReplayInitialCopySource::Default));
+  CHECK(uint32_t(ReplayInitialCopyHeapClass(true, D3D12_HEAP_TYPE_CUSTOM)) ==
+        uint32_t(D3D12ReplayInitialCopySource::Other));
+  CHECK(uint32_t(ReplayInitialCopyHeapClass(true, D3D12_HEAP_TYPE_READBACK)) ==
+        uint32_t(D3D12ReplayInitialCopySource::Other));
+  CHECK(uint32_t(ReplayInitialCopyHeapClass(false, D3D12_HEAP_TYPE_DEFAULT)) ==
+        uint32_t(D3D12ReplayInitialCopySource::Other));
+  D3D12ReplayInitialCopyStats stats;
+  stats.Record(1, D3D12ReplayInitialCopySource::CPU, false, false);
+  stats.Record(2, D3D12ReplayInitialCopySource::Upload, false, false);
+  stats.Record(3, D3D12ReplayInitialCopySource::Upload, true, false);
+  stats.Record(0, D3D12ReplayInitialCopySource::Upload, false, true);
+  stats.Record(4, D3D12ReplayInitialCopySource::Default, false, false);
+  stats.Record(5, D3D12ReplayInitialCopySource::Default, true, false);
+  stats.Record(0, D3D12ReplayInitialCopySource::Default, false, true);
+  stats.Record(6, D3D12ReplayInitialCopySource::Other, false, false);
+  stats.Record(7, D3D12ReplayInitialCopySource::Other, true, false);
+  stats.Record(0, D3D12ReplayInitialCopySource::Other, false, true);
+  CHECK(ReplayInitialCopySourceTuple(stats) == "1/2/3/1/4/5/1/6/7/1");
+  CHECK(ReplayInitialCopySourceCounters(stats) ==
+        "cpuMemcpyBytes=1 gpuUploadBufferBytes=2 gpuUploadFootprintBytes=3 gpuUploadWholeCopies=1 "
+        "gpuDefaultBufferBytes=4 gpuDefaultFootprintBytes=5 gpuDefaultWholeCopies=1 "
+        "gpuOtherBufferBytes=6 gpuOtherFootprintBytes=7 gpuOtherWholeCopies=1");
+}
 
 TEST_CASE("D3D12 shared-buffer checkpoints progress from a prefix to missing downstream points",
           "[d3d12][replay][checkpoint-buffer-patch][checkpoints]")

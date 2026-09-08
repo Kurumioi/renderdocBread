@@ -2081,7 +2081,8 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *res, D3D12Initi
             {
               AddReplayTimingCounter(ReplayTimingCounter::InitialCPUCopyBytes,
                                      range.second - range.first);
-              m_Device->RecordReplayInitialCopy(id, range.second - range.first);
+              m_Device->RecordReplayInitialCopy(id, range.second - range.first,
+                                                 D3D12ReplayInitialCopySource::CPU);
               memcpy(dst + (size_t)range.first, src + (size_t)range.first,
                      (size_t)(range.second - range.first));
             }
@@ -2124,7 +2125,8 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *res, D3D12Initi
               AddReplayTimingCounter(ReplayTimingCounter::InitialCPUCopyBytes,
                                      uint64_t(rowsizes[i]) * numrows[i] * layouts[i].Footprint.Depth);
               m_Device->RecordReplayInitialCopy(
-                  id, uint64_t(rowsizes[i]) * numrows[i] * layouts[i].Footprint.Depth);
+                  id, uint64_t(rowsizes[i]) * numrows[i] * layouts[i].Footprint.Depth,
+                  D3D12ReplayInitialCopySource::CPU);
               byte *bufPtr = src + layouts[i].Offset;
               byte *texPtr = dst;
 
@@ -2191,6 +2193,8 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *res, D3D12Initi
 
         ID3D12Resource *nativeCopySrc =
             m_Device->GetReplay()->ResolveInitialStateCopySource(copySrc, list);
+        const D3D12ReplayInitialCopySource copySource =
+            m_Device->GetReplayInitialCopySource(nativeCopySrc);
 
         BarrierSet barriers;
 
@@ -2212,7 +2216,7 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *res, D3D12Initi
           {
             AddReplayTimingCounter(ReplayTimingCounter::InitialGPUCopyBufferBytes,
                                    range.second - range.first);
-            m_Device->RecordReplayInitialCopy(id, range.second - range.first);
+            m_Device->RecordReplayInitialCopy(id, range.second - range.first, copySource);
             Unwrap(list)->CopyBufferRegion(unwrappedCopyDst, range.first, nativeCopySrc, range.first,
                                            range.second - range.first);
           }
@@ -2223,7 +2227,7 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *res, D3D12Initi
           // MSAA texture was pre-uploaded and decoded, just copy the texture.
           // Similarly for created initial states
           AddReplayTimingCounter(ReplayTimingCounter::InitialGPUCopyWholeResources);
-          m_Device->RecordReplayInitialCopy(id, 0, true);
+          m_Device->RecordReplayInitialCopy(id, 0, copySource, false, true);
           Unwrap(list)->CopyResource(unwrappedCopyDst, nativeCopySrc);
         }
         else
@@ -2296,7 +2300,7 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *res, D3D12Initi
             // Padded upload footprint bytes, deliberately separate from logical buffer bytes and
             // whole-resource copies whose physical GPU transfer size is not known here.
             AddReplayTimingCounter(ReplayTimingCounter::InitialGPUCopyFootprintBytes, subSize);
-            m_Device->RecordReplayInitialCopy(id, subSize);
+            m_Device->RecordReplayInitialCopy(id, subSize, copySource, true);
 
             offset += subSize;
             offset = AlignUp<UINT64>(offset, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);

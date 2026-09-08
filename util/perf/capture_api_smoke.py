@@ -7,6 +7,7 @@ from __future__ import print_function
 
 import argparse
 import json
+import ntpath
 import os
 from pathlib import Path
 import signal
@@ -14,7 +15,146 @@ import sys
 import time
 import traceback
 
-import renderdoc as rd
+
+def renderdoc_module():
+    # Keep process-identity and child-environment tests CPU-only without a native binding import.
+    import renderdoc
+    return renderdoc
+
+
+def windows_image_path(path):
+    path = str(path)
+    if path.startswith("\\\\?\\"):
+        path = path[4:]
+    return ntpath.normcase(ntpath.normpath(path))
+
+
+class WindowsProcessAPI:
+    """Small typed Win32 surface; all identity and termination operations use one handle."""
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.ctypes, self.wintypes = ctypes, wintypes
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        declarations = {
+            "OpenProcess": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+            "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+            "GetProcessId": ([wintypes.HANDLE], wintypes.DWORD),
+            "QueryFullProcessImageNameW": ([wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                           ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+            "GetProcessTimes": ([wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4, wintypes.BOOL),
+            "TerminateProcess": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+            "WaitForSingleObject": ([wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD),
+            "GetExitCodeProcess": ([wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+            "GetSystemTimeAsFileTime": ([ctypes.POINTER(wintypes.FILETIME)], None),
+        }
+        for name, (arguments, result) in declarations.items():
+            function = getattr(self.kernel, name)
+            function.argtypes, function.restype = arguments, result
+
+    @staticmethod
+    def ticks(value):
+        return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+
+    def now(self):
+        value = self.wintypes.FILETIME()
+        self.kernel.GetSystemTimeAsFileTime(self.ctypes.byref(value))
+        return self.ticks(value)
+
+    def require(self, result):
+        if not result:
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        return result
+
+    def open(self, pid):
+        # QUERY_LIMITED_INFORMATION | TERMINATE | SYNCHRONIZE. No inherited handle.
+        return self.require(self.kernel.OpenProcess(0x1000 | 0x0001 | 0x00100000, False, pid))
+
+    def identity(self, handle):
+        pid = self.require(self.kernel.GetProcessId(handle))
+        capacity = self.wintypes.DWORD(32768)
+        image = self.ctypes.create_unicode_buffer(capacity.value)
+        self.require(self.kernel.QueryFullProcessImageNameW(handle, 0, image, self.ctypes.byref(capacity)))
+        times = [self.wintypes.FILETIME() for _ in range(4)]
+        self.require(self.kernel.GetProcessTimes(handle, *[self.ctypes.byref(value) for value in times]))
+        return pid, image.value, self.ticks(times[0])
+
+    def wait(self, handle, milliseconds):
+        result = self.kernel.WaitForSingleObject(handle, milliseconds)
+        if result == 0:
+            return True
+        if result == 258:
+            return False
+        raise self.ctypes.WinError(self.ctypes.get_last_error())
+
+    def terminate(self, handle):
+        self.require(self.kernel.TerminateProcess(handle, 1))
+
+    def exit_code(self, handle):
+        code = self.wintypes.DWORD()
+        self.require(self.kernel.GetExitCodeProcess(handle, self.ctypes.byref(code)))
+        return code.value
+
+    def close(self, handle):
+        self.require(self.kernel.CloseHandle(handle))
+
+
+class OwnedWindowsProcess:
+    def __init__(self, api, pid, executable, earliest, latest):
+        self.api, self.handle = api, None
+        if pid <= 0 or earliest > latest:
+            raise RuntimeError("Invalid target PID or launch time window")
+        handle = api.open(pid)
+        try:
+            observed_pid, image, created = api.identity(handle)
+            if observed_pid != pid or windows_image_path(image) != windows_image_path(executable):
+                raise RuntimeError("Target-control process identity does not match the requested demo executable")
+            if not earliest <= created <= latest:
+                raise RuntimeError("Target-control process creation time is outside this ExecuteAndInject window")
+            self.receipt = {"mode": "retained-windows-process-handle", "verified": True,
+                            "pid": observed_pid, "imagePath": image, "createdFileTime100ns": created,
+                            "launchEarliestFileTime100ns": earliest, "launchLatestFileTime100ns": latest}
+            self.handle = handle
+        except Exception:
+            api.close(handle)
+            raise
+
+    def cleanup(self):
+        if self.handle is None:
+            raise RuntimeError("Owned process handle already closed")
+        handle, self.handle = self.handle, None
+        try:
+            if self.api.wait(handle, 0):
+                action = "alreadyExited"
+            else:
+                # If exit raced the first wait, an unsuccessful terminate is accepted only when
+                # that same retained handle is now signalled. Never reopen a possibly reused PID.
+                try:
+                    self.api.terminate(handle)
+                except OSError:
+                    if not self.api.wait(handle, 0):
+                        raise
+                action = "terminatedOwnedHandle"
+            if not self.api.wait(handle, 5000):
+                raise RuntimeError("Owned demo did not exit within the cleanup wait")
+            self.receipt.update(cleanupAction=action, exitVerified=True, exitCode=self.api.exit_code(handle))
+            return self.receipt
+        finally:
+            self.api.close(handle)
+
+
+def validate_live_forward_fixture(enabled, apis, demo):
+    if enabled and (list(apis) != ["D3D12"] or demo != "D3D12_RenderTarget_Binds"):
+        raise ValueError("--live-forward-fixture requires --apis D3D12 --d3d12-demo D3D12_RenderTarget_Binds")
+
+
+def fixture_environment(rd, enabled):
+    modification = rd.EnvironmentModification()
+    modification.name = "RENDERDOC_LIVE_FORWARD_FIXTURE"
+    # Explicitly clear inherited fixture state when not requested.
+    modification.value = "1" if enabled else "0"
+    modification.mod, modification.sep = rd.EnvMod.Set, rd.EnvSep.NoSep
+    return modification
 
 
 def prepare_vulkan_layer(source_path, library_path, output):
@@ -61,7 +201,8 @@ def prepare_vulkan_layer(source_path, library_path, output):
 
 def capture_one(api, demo, output, timeout, frame, compiler_dir, layer_manifest, layer_library,
                 d3d12_demo="D3D12_Simple_Triangle", d3d11_demo="D3D11_Simple_Triangle",
-                gl_demo="GL_Simple_Triangle", vk_demo="VK_Simple_Triangle"):
+                gl_demo="GL_Simple_Triangle", vk_demo="VK_Simple_Triangle", live_forward_fixture=False):
+    rd = renderdoc_module()
     tests = {"D3D11": d3d11_demo, "OpenGL": gl_demo, "OpenGLES": gl_demo,
              "Vulkan": vk_demo, "D3D12": d3d12_demo}
     expected = {"D3D11": "D3D11", "OpenGL": "OpenGL", "OpenGLES": "OpenGLES",
@@ -69,11 +210,15 @@ def capture_one(api, demo, output, timeout, frame, compiler_dir, layer_manifest,
     entry = {"api": api, "demo": tests[api], "ok": False}
     control = None
     process_id = 0
+    owned_process = None
     started = time.monotonic()
     try:
+        validate_live_forward_fixture(live_forward_fixture, [api], tests[api])
         log_path = output / (tests[api] + ".log")
         command = '{} --width 400 --height 300 --log "{}"'.format(tests[api], log_path)
-        envmods = []
+        envmods = [fixture_environment(rd, live_forward_fixture)]
+        entry["childEnvironment"] = {"RENDERDOC_LIVE_FORWARD_FIXTURE": "1" if live_forward_fixture else "0"}
+        entry["liveForwardFixture"] = bool(live_forward_fixture)
         if api == "OpenGLES":
             modification = rd.EnvironmentModification()
             modification.name, modification.value = "RENDERDOC_SHARED_BUFFER_GLES", "1"
@@ -93,8 +238,14 @@ def capture_one(api, demo, output, timeout, frame, compiler_dir, layer_manifest,
             modification.mod, modification.sep = rd.EnvMod.Prepend, rd.EnvSep.Platform
             envmods.append(modification)
             entry["childCompilerDirectory"] = compiler_dir
+        process_api = WindowsProcessAPI() if os.name == "nt" else None
+        launch_before = process_api.now() if process_api else None
         result = rd.ExecuteAndInject(str(demo), str(demo.parent), command, envmods,
                                      str(output / tests[api]), rd.GetDefaultCaptureOptions(), False)
+        launch_after = process_api.now() if process_api else None
+        if process_api:
+            entry["launchWindow"] = {"earliestFileTime100ns": launch_before,
+                                     "latestFileTime100ns": launch_after}
         entry["injectResult"] = str(result.result)
         if result.result != rd.ResultCode.Succeeded:
             raise RuntimeError("ExecuteAndInject failed: " + str(result.result))
@@ -103,6 +254,9 @@ def capture_one(api, demo, output, timeout, frame, compiler_dir, layer_manifest,
             raise RuntimeError("Target-control connection was not created")
         process_id = control.GetPID()
         entry["pid"] = process_id
+        if process_api:
+            owned_process = OwnedWindowsProcess(process_api, process_id, str(demo), launch_before, launch_after)
+            entry["ownedProcess"] = owned_process.receipt
         control.QueueCapture(frame, 1)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -137,13 +291,30 @@ def capture_one(api, demo, output, timeout, frame, compiler_dir, layer_manifest,
         return entry
     finally:
         if control is not None:
-            control.Shutdown()
-        # Only terminate the newly injected test process whose PID target control returned.
-        if process_id > 0:
+            try:
+                control.Shutdown()
+            except Exception as error:
+                entry.setdefault("cleanupErrors", []).append("TargetControl shutdown: " + str(error))
+                entry["ok"] = False
+        if owned_process is not None:
+            try:
+                entry["ownedProcess"] = owned_process.cleanup()
+            except Exception as error:
+                entry.setdefault("cleanupErrors", []).append("Owned process cleanup: " + str(error))
+                entry["ok"] = False
+        elif os.name == "nt" and process_id > 0:
+            entry["processCleanup"] = "refused-unverified-windows-process"
+        elif os.name != "nt" and process_id > 0:
+            # Preserve the pre-existing POSIX behavior. The retained-handle ownership guarantee
+            # above is Windows-specific; never fall back to this PID operation on Windows.
             try:
                 os.kill(process_id, signal.SIGTERM)
-            except OSError:
-                pass
+                entry["processCleanup"] = "posix-target-control-pid-signal"
+            except ProcessLookupError:
+                entry["processCleanup"] = "posix-already-exited"
+            except OSError as error:
+                entry.setdefault("cleanupErrors", []).append("POSIX cleanup: " + str(error))
+                entry["ok"] = False
         entry["elapsedMs"] = round((time.monotonic() - started) * 1000, 3)
 
 
@@ -155,6 +326,8 @@ def main():
     parser.add_argument("--apis", default=os.environ.get("RENDERDOC_API_SMOKE_APIS", "D3D11,OpenGL,Vulkan"))
     parser.add_argument("--d3d12-demo", choices=("D3D12_Simple_Triangle", "D3D12_Checkpoint_Triangle", "D3D12_Checkpoint_Query", "D3D12_Shared_Buffer", "D3D12_CBuffer_Zoo", "D3D12_RenderTarget_Binds"),
                         default="D3D12_Simple_Triangle")
+    parser.add_argument("--live-forward-fixture", action="store_true",
+                        help="Enable per-frame RT clears in the D3D12_RenderTarget_Binds proof fixture")
     parser.add_argument("--d3d11-demo", choices=("D3D11_Simple_Triangle", "D3D11_Shared_Buffer", "D3D11_CBuffer_Zoo"), default="D3D11_Simple_Triangle")
     parser.add_argument("--gl-demo", choices=("GL_Simple_Triangle", "GL_Shared_Buffer", "GL_CBuffer_Zoo"), default="GL_Simple_Triangle")
     parser.add_argument("--vk-demo", choices=("VK_Simple_Triangle", "VK_Shared_Buffer", "VK_CBuffer_Zoo"), default="VK_Simple_Triangle")
@@ -172,6 +345,10 @@ def main():
         parser.error("--apis accepts D3D11,D3D12,OpenGL,OpenGLES,Vulkan")
     if "OpenGLES" in apis and args.gl_demo != "GL_Shared_Buffer":
         parser.error("OpenGLES requires GL_Shared_Buffer, which explicitly requests an ES context")
+    try:
+        validate_live_forward_fixture(args.live_forward_fixture, apis, args.d3d12_demo)
+    except ValueError as error:
+        parser.error(str(error))
     if args.frame < 1 or args.timeout <= 0:
         parser.error("Frame and timeout must be positive")
     demo = Path(args.demos).resolve()
@@ -187,7 +364,9 @@ def main():
     run_output = output / time.strftime("%Y%m%d-%H%M%S")
     run_output.mkdir(exist_ok=False)
     result = {"schema": "renderdoc-api-smoke-capture/v1", "ok": False,
-              "python": sys.version, "demo": str(demo), "captures": []}
+              "python": sys.version, "demo": str(demo), "liveForwardFixture": args.live_forward_fixture,
+              "captures": []}
+    rd = renderdoc_module()
     if not embedded_qt:
         rd.InitialiseReplay(rd.GlobalEnvironment(), [])
     try:
@@ -195,7 +374,8 @@ def main():
             result["captures"].append(capture_one(api, demo, run_output, args.timeout, args.frame,
                                                 compiler_dir, args.vulkan_layer_manifest,
                                                 args.vulkan_layer_library, args.d3d12_demo,
-                                                args.d3d11_demo, args.gl_demo, args.vk_demo))
+                                                args.d3d11_demo, args.gl_demo, args.vk_demo,
+                                                args.live_forward_fixture))
             (run_output / "capture-results.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         result["ok"] = all(entry["ok"] for entry in result["captures"])
     finally:

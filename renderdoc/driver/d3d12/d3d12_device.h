@@ -94,6 +94,66 @@ class WrappedID3D12PipelineState;
 class D3D12AccelerationStructure;
 struct D3D12ReplayCheckpointCache;
 
+// Counts recorded copies from their actual native source, not the size of an immutable source
+// considered by the residency cache. Footprints include upload padding; neither field measures
+// physical GPU bus traffic. Whole-resource copies deliberately have no estimated byte size.
+enum class D3D12ReplayInitialCopySource : uint8_t
+{
+  CPU,
+  Upload,
+  Default,
+  Other,
+};
+
+struct D3D12ReplayInitialSourceCopyStats
+{
+  uint64_t bufferBytes = 0, footprintBytes = 0, wholeCopies = 0;
+
+  void Record(uint64_t bytes, bool footprint, bool wholeResource)
+  {
+    if(wholeResource)
+      wholeCopies++;
+    else if(footprint)
+      footprintBytes += bytes;
+    else
+      bufferBytes += bytes;
+  }
+
+  void Add(const D3D12ReplayInitialSourceCopyStats &other)
+  {
+    bufferBytes += other.bufferBytes;
+    footprintBytes += other.footprintBytes;
+    wholeCopies += other.wholeCopies;
+  }
+};
+
+struct D3D12ReplayInitialCopyStats
+{
+  uint64_t cpuMemcpyBytes = 0;
+  D3D12ReplayInitialSourceCopyStats upload, gpuDefault, other;
+
+  void Record(uint64_t bytes, D3D12ReplayInitialCopySource source, bool footprint,
+              bool wholeResource)
+  {
+    if(source == D3D12ReplayInitialCopySource::CPU)
+      cpuMemcpyBytes += bytes;
+    else if(source == D3D12ReplayInitialCopySource::Upload)
+      upload.Record(bytes, footprint, wholeResource);
+    else if(source == D3D12ReplayInitialCopySource::Default)
+      gpuDefault.Record(bytes, footprint, wholeResource);
+    else
+      other.Record(bytes, footprint, wholeResource);
+  }
+
+  void Add(const D3D12ReplayInitialCopyStats &stats)
+  {
+    cpuMemcpyBytes += stats.cpuMemcpyBytes;
+    upload.Add(stats.upload);
+    gpuDefault.Add(stats.gpuDefault);
+    other.Add(stats.other);
+  }
+};
+
 class D3D12Replay;
 class D3D12TextRenderer;
 class D3D12ShaderCache;
@@ -733,6 +793,7 @@ private:
   struct ReplayDirtyCopyStats
   {
     uint64_t actualBytes = 0, skippedBytes = 0, wholeCopies = 0;
+    D3D12ReplayInitialCopyStats sources;
   };
   std::map<ResourceId, ReplayDirtyCopyStats> m_ReplayDirtyCopyStats;
   // This is an immutable, whole-frame overestimate, not the current sparse page table. Keeping
@@ -1167,7 +1228,10 @@ public:
   void MarkReplayResourceDirty(ResourceId resource, bool unboundedRootUAV = false);
   void MarkCheckpointReplayWrites();
   bool IsReplayInitialContentsUnchanged(ResourceId resource, uint64_t sourceBytes);
-  void RecordReplayInitialCopy(ResourceId resource, uint64_t bytes, bool wholeResource = false);
+  D3D12ReplayInitialCopySource GetReplayInitialCopySource(ID3D12Resource *nativeSource) const;
+  void RecordReplayInitialCopy(ResourceId resource, uint64_t bytes,
+                               D3D12ReplayInitialCopySource source, bool footprint = false,
+                               bool wholeResource = false);
   void BeginReplayDirtyRestore(bool allowed);
   void ObserveReplaySparseBind(ResourceId resource, ResourceId heap);
   void ObserveReplaySparseCopy(ResourceId destination, ResourceId source);

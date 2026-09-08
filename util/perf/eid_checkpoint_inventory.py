@@ -57,6 +57,31 @@ def usage_summary(pairs):
             "constantConsumptionSample": constants[:32]}
 
 
+def usage_window(pairs, start, end):
+    """Observed uses in (checkpoint, target]; never an authority to skip restoration."""
+    if not 0 <= start < end:
+        raise ValueError("Usage window requires 0 <= checkpoint < target")
+    pairs = sorted((int(eid), str(name).rsplit(".", 1)[-1]) for eid, name in pairs
+                   if start < int(eid) <= end)
+    first = pairs[0][0] if pairs else None
+    first_kinds = sorted({name for eid, name in pairs if eid == first})
+    result = usage_summary(pairs)
+    result.update(afterEventId=start, throughEventId=end, firstUseKinds=first_kinds,
+                  noReportedUse=not pairs, startsWithReportedClear="Clear" in first_kinds,
+                  fullOverwriteProven=False, safeToSkipRestore=False,
+                  byteRanges=None, subresourceRanges=None,
+                  conclusion="resource-wide GetUsage observation only; alias/coverage/resume proof required")
+    return result
+
+
+def parse_windows(value, maximum=16):
+    windows = sorted({tuple(int(part) for part in item.strip().split(":"))
+                      for item in value.split(",") if item.strip()})
+    if len(windows) > maximum or any(len(w) != 2 or not 0 <= w[0] < w[1] for w in windows):
+        raise ValueError("At most %d windows checkpoint:target with 0 <= checkpoint < target" % maximum)
+    return windows
+
+
 def category(entry):
     usage = entry.get("usage")
     if usage is None:
@@ -197,19 +222,30 @@ def main():
     parser.add_argument("--max-boundaries", type=int, default=8)
     parser.add_argument("--usage-limit", type=int, default=0, help="0 means every listed texture/buffer; nonzero is incomplete")
     parser.add_argument("--max-seconds", type=float, default=300)
+    parser.add_argument("--max-resources", type=int, default=100000)
+    parser.add_argument("--max-usage-entries", type=int, default=4000000,
+                        help="Stop before processing more returned resource-use records; preserve partial evidence")
+    parser.add_argument("--usage-windows", default=env("USAGE_WINDOWS"),
+                        help="Up to 16 comma-separated checkpoint:target windows; diagnostic only")
     parser.add_argument("--build-label", default=env("BUILD_LABEL", "unspecified"))
     args = parser.parse_args()
     if not args.capture or not args.output:
         parser.error("Explicit --capture and new --output are required")
     capture, output = Path(args.capture).resolve(), Path(args.output).resolve()
     explicit = sorted({int(v.strip()) for v in args.boundaries.split(",") if v.strip()})
-    if (not capture.is_file() or output.exists() or args.max_seconds <= 0 or args.usage_limit < 0
+    try:
+        windows = parse_windows(args.usage_windows)
+    except ValueError as error:
+        parser.error(str(error))
+    if (not capture.is_file() or output.exists() or not 0 < args.max_seconds <= 3600 or args.usage_limit < 0
+            or not 1 <= args.max_resources <= 100000 or not 1 <= args.max_usage_entries <= 4000000
             or len(explicit) > args.max_boundaries or any(e <= 0 for e in explicit)):
         parser.error("Capture must exist, output must be new, and limits/events must be valid")
     output.parent.mkdir(parents=True, exist_ok=True)
     report = {"schema": "renderdoc-checkpoint-inventory/v1", "ok": False,
               "capture": str(capture), "captureBytes": capture.stat().st_size,
               "buildLabel": args.build_label, "processId": os.getpid(), "samples": [],
+              "usageWindows": [{"afterEventId": start, "throughEventId": end} for start, end in windows],
               "measurement": "API logical metadata, not native GPU allocation or complete checkpoint storage",
               "limits": ["GetUsage lacks byte/subresource ranges and complete alias dependencies",
                          "reported output bindings do not establish writes to every byte",
@@ -265,6 +301,8 @@ def main():
         report["resourceTypes"] = dict(sorted(Counter(str(d.type) for d in descriptions).items()))
         textures = measure("metadata.textures", controller.GetTextures)
         buffers = measure("metadata.buffers", controller.GetBuffers)
+        if len(textures) + len(buffers) > args.max_resources:
+            raise RuntimeError("Metadata resource count exceeds configured limit")
         native_ids = {}
         for kind, objects in (("texture", textures), ("buffer", buffers)):
             for item in objects:
@@ -297,13 +335,20 @@ def main():
         boundaries = choose_boundaries(action_data, explicit, args.max_boundaries)
         report["boundarySelection"] = boundaries
         limited = entries[:args.usage_limit] if args.usage_limit else entries
-        report["usageProgress"] = {"completed": 0, "requested": len(limited), "inventoryResources": len(entries)}
+        report["usageProgress"] = {"completed": 0, "requested": len(limited), "inventoryResources": len(entries),
+                                   "returnedUsageEntries": 0}
 
         def collect_usage():
             for index, entry in enumerate(limited):
                 check_budget()
                 use = controller.GetUsage(native_ids[entry["resource"]])
-                entry["usage"] = usage_summary((int(u.eventId), str(u.usage)) for u in use)
+                report["usageProgress"]["returnedUsageEntries"] += len(use)
+                if report["usageProgress"]["returnedUsageEntries"] > args.max_usage_entries:
+                    raise RuntimeError("Returned resource-use entries exceed configured limit")
+                pairs = [(int(u.eventId), str(u.usage)) for u in use]
+                entry["usage"] = usage_summary(pairs)
+                if windows:
+                    entry["usageWindows"] = [usage_window(pairs, start, end) for start, end in windows]
                 report["usageProgress"]["completed"] = index + 1
                 if (index + 1) % 128 == 0:
                     publish()
