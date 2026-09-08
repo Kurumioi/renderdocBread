@@ -2160,7 +2160,11 @@ void D3D12DebugManager::GetBufferData(ID3D12Resource *buffer, uint64_t offset, u
   if(buffer == NULL)
     return;
 
-  m_pDevice->ReplayWorkWaitForIdle();
+  if(!m_pDevice->ReplayWorkWaitForIdle())
+  {
+    ret.clear();
+    return;
+  }
 
   D3D12_RESOURCE_DESC desc = buffer->GetDesc();
   D3D12_HEAP_PROPERTIES heapProps = {};
@@ -2251,7 +2255,11 @@ void D3D12DebugManager::GetBufferData(ID3D12Resource *buffer, uint64_t offset, u
 
     ID3D12CommandList *l = m_DebugList;
     m_pDevice->GetQueue()->ExecuteCommandLists(1, &l);
-    m_pDevice->InternalQueueWaitForIdle();
+    if(!m_pDevice->InternalQueueWaitForIdle())
+    {
+      ret.clear();
+      return;
+    }
     m_DebugAlloc->Reset();
 
     D3D12_RANGE range = {0, (size_t)chunkSize};
@@ -2291,7 +2299,11 @@ void D3D12DebugManager::GetBufferData(ID3D12Resource *buffer, uint64_t offset, u
 
   ID3D12CommandList *l = m_DebugList;
   m_pDevice->GetQueue()->ExecuteCommandLists(1, &l);
-  m_pDevice->InternalQueueWaitForIdle();
+  if(!m_pDevice->InternalQueueWaitForIdle())
+  {
+    ret.clear();
+    return;
+  }
   m_DebugAlloc->Reset();
 }
 

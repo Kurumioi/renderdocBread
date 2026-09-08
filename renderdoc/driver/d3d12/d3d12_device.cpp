@@ -132,6 +132,9 @@ struct D3D12ReplayCheckpointCache
   std::map<uint32_t, D3D12CommandData::CheckpointBoundary> selected;
   std::map<uint32_t, uint64_t> selectedBytes;
   std::map<uint32_t, D3D12ReplayCheckpoint> checkpoints;
+  // A failed completion wait cannot publish a usable checkpoint or release its submitted copy
+  // destinations. Keep the failed candidate alive for the remaining device lifetime.
+  D3D12ReplayCheckpoint unconfirmedSave;
   // Only a version actually materialised during this replay may be shared. An equal write EID
   // from a different full replay is not proof that nondeterministic GPU contents are identical.
   std::map<ResourceId, std::shared_ptr<D3D12ReplayCheckpointResource>> currentVersions;
@@ -339,13 +342,7 @@ static bool IsReplayBufferPatchCopy(D3D12Chunk chunk)
 static bool SameD3D12BufferPatchLayout(const rdcarray<ReplayBufferPatch> &previous,
                                        const rdcarray<ReplayBufferPatch> &next)
 {
-  if(next.empty() || next.size() != previous.size())
-    return false;
-  for(size_t i = 0; i < next.size(); i++)
-    if(next[i].buffer != previous[i].buffer || next[i].byteOffset != previous[i].byteOffset ||
-       next[i].data.size() != previous[i].data.size())
-      return false;
-  return true;
+  return SameReplayBufferPatchLayout(previous, next);
 }
 
 static uint32_t D3D12BufferPatchConsumerFromUsage(uint32_t first, const EventUsage &usage)
@@ -368,6 +365,7 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
   if(!error.empty())
     return error;
   std::set<ResourceId> buffers;
+  std::map<ResourceId, uint32_t> consumers;
   uint64_t bytes = 0;
   uint32_t firstConsumer = ~0U;
   for(const ReplayBufferPatch &patch : patches)
@@ -395,12 +393,12 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
         m_Queue->GetCommandData()->GetBufferPatchFirstConsumer(patch.buffer);
     // Missing complete native binding evidence cannot be repaired by the reflected usage list:
     // large descriptor ranges are intentionally omitted from that UI/analysis list.
-    firstConsumer = RDCMIN(firstConsumer, nativeConsumer == ~0U ? 0U : nativeConsumer);
+    uint32_t bufferConsumer = nativeConsumer == ~0U ? 0U : nativeConsumer;
 
     bool constants = false;
     for(const EventUsage &usage : m_Queue->GetUsage(patch.buffer))
     {
-      firstConsumer = D3D12BufferPatchConsumerFromUsage(firstConsumer, usage);
+      bufferConsumer = D3D12BufferPatchConsumerFromUsage(bufferConsumer, usage);
       if(usage.usage >= ResourceUsage::VS_Constants && usage.usage <= ResourceUsage::All_Constants)
       {
         constants = true;
@@ -450,6 +448,8 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
           return "Persistent D3D12 buffer edits cannot yet share overlapping placed allocations";
       }
     }
+    consumers[patch.buffer] = bufferConsumer;
+    firstConsumer = RDCMIN(firstConsumer, bufferConsumer);
     const D3D12InitialContents initial = GetResourceManager()->GetInitialContents(initialId);
     if((!initial.resource && !initial.srcData) || initial.sparseBinds ||
        (initial.tag != D3D12InitialContents::Copy && initial.tag != D3D12InitialContents::ForceCopy))
@@ -463,9 +463,44 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
   if(identical)
     return {};
   const bool sameLayout = SameD3D12BufferPatchLayout(m_ReplayBufferPatches, patches);
+  rdcarray<ReplayBufferPatchRange> changes;
+  const bool deltaKnown = GetReplayBufferPatchChanges(m_ReplayBufferPatches, patches, changes).empty();
+  const bool deltaEnabled =
+      Process::GetEnvVariable("RENDERDOC_REPLAY_DISABLE_BUFFER_PATCH_DELTA") != "1";
+  uint64_t changedBytes = 0;
+  std::set<ResourceId> changedBuffers;
+  uint32_t changedConsumer = ~0U;
+  for(const ReplayBufferPatchRange &change : changes)
+  {
+    changedBytes += change.byteLength;
+    changedBuffers.insert(change.buffer);
+    auto consumer = consumers.find(change.buffer);
+    changedConsumer = RDCMIN(changedConsumer, consumer == consumers.end() ? 0U : consumer->second);
+  }
+  // The full-table consumer continues to identify the immutable edit-start anchor. Only the
+  // invalidation cutoff may advance when a later parameter changes and earlier overlays do not.
+  const uint32_t affectedConsumer = sameLayout && firstConsumer > 0 && firstConsumer != ~0U &&
+                                           deltaKnown && !changes.empty() && deltaEnabled
+                                       ? changedConsumer
+                                       : firstConsumer;
 
   ID3D12Resource *upload = NULL;
   rdcarray<uint64_t> offsets;
+  const bool reuseUpload = sameLayout && m_ReplayBufferPatchUpload &&
+                          m_ReplayBufferPatchOffsets.size() == patches.size() &&
+                          Process::GetEnvVariable(
+                              "RENDERDOC_D3D12_DISABLE_BUFFER_PATCH_UPLOAD_REUSE") != "1";
+  // A fixed-layout slider does not need another GPU allocation. Drain all lists that can refer
+  // to the old payload before touching it. Allocation/layout changes retain the transactional
+  // new-object path below; this reuse does not remove or weaken the existing GPU wait.
+  if(reuseUpload)
+  {
+    if(!DeviceWaitForIdle() || HasFatalError())
+      return "D3D12 GPU completion could not be confirmed before updating persistent edit data";
+    upload = m_ReplayBufferPatchUpload;
+    upload->AddRef();
+  }
+  uint64_t uploadWrittenBytes = 0;
   if(bytes)
   {
     D3D12_HEAP_PROPERTIES properties = {};
@@ -479,9 +514,11 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
     desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    HRESULT hr = GetReal()->CreateCommittedResource(
-        &properties, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-        __uuidof(ID3D12Resource), (void **)&upload);
+    HRESULT hr = S_OK;
+    if(!reuseUpload)
+      hr = GetReal()->CreateCommittedResource(
+          &properties, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+          __uuidof(ID3D12Resource), (void **)&upload);
     void *mapped = NULL;
     const D3D12_RANGE noRead = {0, 0};
     if(SUCCEEDED(hr))
@@ -495,7 +532,11 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
     for(const ReplayBufferPatch &patch : patches)
     {
       offsets.push_back(offset);
-      memcpy((byte *)mapped + offset, patch.data.data(), patch.data.size());
+      if(!reuseUpload || !deltaKnown || changedBuffers.count(patch.buffer))
+      {
+        memcpy((byte *)mapped + offset, patch.data.data(), patch.data.size());
+        uploadWrittenBytes += patch.data.size();
+      }
       offset += patch.data.size();
     }
     const D3D12_RANGE written = {0, (SIZE_T)bytes};
@@ -503,13 +544,17 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
   }
 
   // Retire old immutable upload bytes only after all native lists that reference them complete.
-  // Validation/allocation above are side-effect free with respect to the currently accepted edit.
-  DeviceWaitForIdle();
-  if(HasFatalError())
+  // The new-object path has not changed accepted bytes; the reuse path already drained its users.
+  if((!reuseUpload && !DeviceWaitForIdle()) || HasFatalError())
   {
     SAFE_RELEASE(upload);
-    return "D3D12 device failed before the persistent edit could be installed";
+    return "D3D12 GPU completion could not be confirmed before installing persistent edit data";
   }
+  // This transaction has just drained every queue, and only mapped upload bytes since that
+  // drain. Let source retirement below use that proof without another fallible wait after the
+  // accepted patch data changes. Do not publish this flag in generic DeviceWaitForIdle: callers
+  // there can submit further raw command lists before their batch is marked as pending.
+  m_WaitedForIdleAfterReplay = true;
   for(WrappedID3D12CommandQueue *queue : m_Queues)
     if(queue)
       queue->ClearPreparedReplayCache();
@@ -543,9 +588,9 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
   m_ReplayBufferPatches = patches;
   m_ReplayBufferPatchFirstConsumer = patches.empty() ? ~0U : firstConsumer;
   m_ReplayBufferPatchFirstAffected =
-      sameLayout && !m_CheckpointDependenciesEdited && firstConsumer != ~0U &&
+      sameLayout && !m_CheckpointDependenciesEdited && affectedConsumer != ~0U &&
               Process::GetEnvVariable("RENDERDOC_D3D12_DISABLE_BUFFER_PATCH_PREFIX") != "1"
-          ? firstConsumer
+          ? affectedConsumer
           : 0;
   // Only same-layout writes cover every old overlay byte. Removing/changing ranges must rebuild
   // from the original source; values may change all later writes, so keep only earlier points.
@@ -590,10 +635,15 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
     LogD3D12Checkpoint(StringFormat::Fmt(
         "api=D3D12BufferPatch op=set ranges=%zu bytes=%llu resetBuffers=%zu firstConsumer=%u "
         "sameLayout=%u firstAffected=%u anchor=%u retainedCheckpoints=%zu "
+        "deltaKnown=%u deltaEnabled=%u changedRanges=%zu changedBytes=%llu changedBuffers=%zu "
+        "uploadReused=%u uploadWrittenBytes=%llu "
         "initialSourcesPreserved=1 frameInitialFastPath=0 consumerBoundary=submitBaseOrCopy",
         patches.size(), (unsigned long long)bytes, buffers.size(), firstConsumer,
         sameLayout ? 1U : 0U, m_ReplayBufferPatchFirstAffected, m_ReplayBufferPatchAnchorEvent,
-        m_ReplayCheckpoints ? m_ReplayCheckpoints->checkpoints.size() : 0));
+        m_ReplayCheckpoints ? m_ReplayCheckpoints->checkpoints.size() : 0,
+        deltaKnown ? 1U : 0U, deltaEnabled ? 1U : 0U, changes.size(),
+        (unsigned long long)changedBytes, changedBuffers.size(), reuseUpload ? 1U : 0U,
+        (unsigned long long)uploadWrittenBytes));
   return {};
 }
 
@@ -691,8 +741,8 @@ bool WrappedID3D12Device::ApplyCheckpointReplayBufferPatches()
       return false;
     cpu |= properties.Type == D3D12_HEAP_TYPE_UPLOAD;
   }
-  if(cpu)
-    DeviceWaitForIdle();
+  if(cpu && !DeviceWaitForIdle())
+    return false;
   if(HasFatalError())
     return false;
   const bool descriptorIndependent = m_InternalCmds.pendingcmds.empty();
@@ -740,8 +790,8 @@ bool WrappedID3D12Device::ApplyCheckpointReplayBufferPatches()
   {
     CHECK_HR(this, list->Close());
     ExecuteLists(NULL, false, descriptorIndependent);
-    if(!InstallInitialStateQueueDependencies())
-      FlushLists(true);
+    if(!InstallInitialStateQueueDependencies() && !FlushLists(true))
+      return false;
   }
   if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
     LogD3D12Checkpoint(StringFormat::Fmt(
@@ -3809,7 +3859,8 @@ bool WrappedID3D12Device::Serialise_MapDataWrite(SerialiserType &ser, ID3D12Reso
       // The serialised blob is written directly through a CPU mapping. Any earlier captured or
       // internal GPU use of this resource must be complete before the CPU can mutate it.
       ScopedReplayTimingContext timingContext(ReplayTimingContext::MapDataWrite);
-      ReplayWorkWaitForIdle();
+      if(!ReplayWorkWaitForIdle())
+        return false;
 
       HRESULT hr = Resource->Map(Subresource, &nopRange, (void **)&MappedData);
       CHECK_HR(this, hr);
@@ -3844,7 +3895,8 @@ bool WrappedID3D12Device::Serialise_MapDataWrite(SerialiserType &ser, ID3D12Reso
       // Loading can also submit work before a later direct-map chunk. Keep this path fail-closed;
       // consecutive CPU-only writes coalesce through ReplayWorkWaitForIdle().
       ScopedReplayTimingContext timingContext(ReplayTimingContext::MapDataWrite);
-      ReplayWorkWaitForIdle();
+      if(!ReplayWorkWaitForIdle())
+        return false;
 
       HRESULT hr = Resource->Map(Subresource, &nopRange, (void **)&writePtr);
       CHECK_HR(this, hr);
@@ -4148,7 +4200,8 @@ bool WrappedID3D12Device::Serialise_WriteToSubresource(SerialiserType &ser, ID3D
       // Unlike the upload-buffer path below, this mutates the live resource directly from the CPU.
       // Complete all replay work first; a later GPU-side dependency cannot repair a CPU/GPU race.
       ScopedReplayTimingContext timingContext(ReplayTimingContext::WriteToSubresource);
-      ReplayWorkWaitForIdle();
+      if(!ReplayWorkWaitForIdle())
+        return false;
 
       HRESULT hr = Resource->Map(Subresource, NULL, NULL);
       CHECK_HR(this, hr);
@@ -4543,7 +4596,8 @@ bool WrappedID3D12Device::Serialise_BeginCaptureFrame(SerialiserType &ser)
     if(ShouldUseConservativeReplaySync() || !InstallInitialStateQueueDependencies())
     {
       ScopedReplayTimingContext fallbackContext(ReplayTimingContext::InitialFallback);
-      FlushLists();
+      if(!FlushLists())
+        return false;
     }
   }
 
@@ -4614,7 +4668,8 @@ void WrappedID3D12Device::StartFrameCapture(DeviceOwnedWindow devWnd)
     initStateCurBatch = 0;
     initStateCurList = NULL;
 
-    DeviceWaitForIdle();
+    if(!DeviceWaitForIdle())
+      return;
 
     // wait until we've synced all queues to check for these
     GetResourceManager()->GetRTManager()->TickASManagement();
@@ -4632,7 +4687,8 @@ void WrappedID3D12Device::StartFrameCapture(DeviceOwnedWindow devWnd)
     initStateCurList = NULL;
 
     ExecuteLists(NULL, true);
-    FlushLists();
+    if(!FlushLists())
+      return;
 
     RDCDEBUG("Attempting capture");
     m_FrameCaptureRecord->DeleteChunks();
@@ -4763,7 +4819,8 @@ bool WrappedID3D12Device::EndFrameCapture(DeviceOwnedWindow devWnd)
 
     m_State = CaptureState::BackgroundCapturing;
 
-    DeviceWaitForIdle();
+    if(!DeviceWaitForIdle())
+      return false;
   }
 
   rdcarray<MapState> maps = GetMaps();
@@ -4843,7 +4900,8 @@ bool WrappedID3D12Device::EndFrameCapture(DeviceOwnedWindow devWnd)
       list->Close();
 
       ExecuteLists(NULL, true);
-      FlushLists();
+      if(!FlushLists())
+        return false;
 
       byte *data = NULL;
       hr = copyDst->Map(0, NULL, (void **)&data);
@@ -5132,7 +5190,8 @@ bool WrappedID3D12Device::DiscardFrameCapture(DeviceOwnedWindow devWnd)
 
     m_State = CaptureState::BackgroundCapturing;
 
-    DeviceWaitForIdle();
+    if(!DeviceWaitForIdle())
+      return false;
 
     queues = m_Queues;
 
@@ -6585,7 +6644,8 @@ void WrappedID3D12Device::DestroyInternalResources()
   SAFE_RELEASE(m_pAMDExtObject);
 
   ExecuteLists();
-  FlushLists(true);
+  if(!FlushLists(true))
+    return;
 
   SAFE_RELEASE(m_RTVHeap);
 
@@ -6616,52 +6676,94 @@ void WrappedID3D12Device::DestroyInternalResources()
   CloseHandle(m_OverlaySyncHandle);
 }
 
-void WrappedID3D12Device::DataUploadSync(ID3D12CommandQueue *targetQueue)
+bool WrappedID3D12Device::DataUploadSync(ID3D12CommandQueue *targetQueue)
 {
+  if(HasFatalError())
+    return false;
   ScopedReplayTimingContext timingContext(ReplayTimingContext::DataUploadSync);
   if(m_DataUploadPending)
   {
     // Upload lists execute on RenderDoc's internal queue. The captured queue only needs a GPU-side
     // dependency before it consumes that data; blocking this CPU thread adds pure scrub latency.
     if(targetQueue == NULL || !ReplayQueueSync(GetQueue()->GetResourceID(), targetQueue))
-      InternalQueueWaitForIdle();
+    {
+      if(!InternalQueueWaitForIdle())
+        return false;
+    }
     m_DataUploadPending = false;
     // Do not reuse a submitted command-list slot merely because the consumer has a GPU wait. The
     // pool grows for the rest of this replay epoch, and the next full-replay boundary resets the
     // cursor only after its existing device drain.
   }
+  return true;
 }
 
-void WrappedID3D12Device::InternalQueueWaitForIdle()
+bool WrappedID3D12Device::InternalQueueWaitForIdle()
 {
-  QueueWaitForIdle(GetQueue(), m_WFIFence);
+  return QueueWaitForIdle(GetQueue(), m_WFIFence);
 }
 
-void WrappedID3D12Device::QueueWaitForIdle(ID3D12CommandQueue *queue, ID3D12Fence *fence)
+static bool D3D12IdleWaitSucceeded(DWORD waitResult, HRESULT deviceStatus, uint64_t completed,
+                                  uint64_t required)
 {
-  m_WFICounter++;
+  // The event may belong to an earlier timed-out wait. Only the requested fence value proves
+  // that this submission is finished. UINT64_MAX is the device-removal sentinel, not success.
+  return waitResult == WAIT_OBJECT_0 && SUCCEEDED(deviceStatus) && required != 0 &&
+         completed != ~0ULL && completed >= required;
+}
 
+static bool D3D12GPUCompletionFailure(WrappedID3D12Device *device, const rdcstr &detail)
+{
+  // CHECK_HR may already have reported actual device removal. A timeout or a stale event is
+  // instead an internal replay failure: it provides no licence to overwrite or retire GPU data.
+  if(!device->HasFatalError())
+  {
+    RDResult result;
+    SET_ERROR_RESULT(result, ResultCode::InternalError, "D3D12 GPU completion unproven: %s",
+                     detail.c_str());
+    device->ReportFatalError(result);
+  }
+  return false;
+}
+
+bool WrappedID3D12Device::QueueWaitForIdle(ID3D12CommandQueue *queue, ID3D12Fence *fence)
+{
   if(HasFatalError())
-    return;
+    return false;
+  if(queue == NULL || fence == NULL || m_WFIHandle == NULL || m_WFICounter >= ~0ULL - 1)
+    return D3D12GPUCompletionFailure(this, "idle wait has no valid queue, fence, event or fence value");
 
-  HRESULT hr = queue->Signal(fence, m_WFICounter);
+  const uint64_t required = ++m_WFICounter;
+
+  HRESULT hr = queue->Signal(fence, required);
   CHECK_HR(this, hr);
-  RDCASSERTEQUAL(hr, S_OK);
+  if(FAILED(hr))
+    return D3D12GPUCompletionFailure(this, "queue idle signal failed: " + ToStr(hr));
 
-  fence->SetEventOnCompletion(m_WFICounter, m_WFIHandle);
+  hr = fence->SetEventOnCompletion(required, m_WFIHandle);
+  CHECK_HR(this, hr);
+  if(FAILED(hr))
+    return D3D12GPUCompletionFailure(this, "idle event registration failed: " + ToStr(hr));
 
   // wait 10s for hardware GPUs, 100s for CPU
+  DWORD waitResult = WAIT_FAILED;
   {
     ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitWait);
     if(m_Replay && m_Replay->GetDriverInfo().vendor == GPUVendor::Software)
-      WaitForSingleObject(m_WFIHandle, 100000);
+      waitResult = WaitForSingleObject(m_WFIHandle, 100000);
     else
-      WaitForSingleObject(m_WFIHandle, 10000);
+      waitResult = WaitForSingleObject(m_WFIHandle, 10000);
   }
 
   hr = m_pDevice->GetDeviceRemovedReason();
   CHECK_HR(this, hr);
-  RDCASSERTEQUAL(hr, S_OK);
+  const uint64_t completed = fence->GetCompletedValue();
+  const bool succeeded = D3D12IdleWaitSucceeded(waitResult, hr, completed, required);
+  if(!succeeded)
+    return D3D12GPUCompletionFailure(this, StringFormat::Fmt(
+        "idle wait timed out or failed validation: wait=%u completed=%llu required=%llu device=%s",
+        waitResult, (unsigned long long)completed, (unsigned long long)required, ToStr(hr).c_str()));
+  return succeeded;
 }
 
 bool WrappedID3D12Device::ReplayQueueSync(ResourceId previousQueue,
@@ -6747,14 +6849,18 @@ void WrappedID3D12Device::ReplayQueueWaitForPreviousWork(ID3D12CommandQueue *que
   }
 }
 
-void WrappedID3D12Device::ReplayWorkWaitForIdle()
+bool WrappedID3D12Device::ReplayWorkWaitForIdle()
 {
+  if(HasFatalError())
+    return false;
   if(m_WaitedForIdleAfterReplay)
-    return;
+    return true;
 
-  DeviceWaitForIdle();
+  if(!DeviceWaitForIdle())
+    return false;
 
   m_WaitedForIdleAfterReplay = true;
+  return true;
 }
 
 bool WrappedID3D12Device::ShouldUseConservativeReplaySync(bool allowLoading) const
@@ -6769,10 +6875,14 @@ bool WrappedID3D12Device::ShouldUseConservativeReplaySync(bool allowLoading) con
 
 void WrappedID3D12Device::InvalidatePreparedReplayCache()
 {
+  if(HasFatalError())
+    return;
   InvalidateLiveForward("resourceOrShaderReplacement");
   InvalidateReplayDirtyTracking("resourceOrShaderReplacement");
   m_CheckpointDependenciesEdited = true;
   InvalidateReplayCheckpoints();
+  if(HasFatalError())
+    return;
   if(m_ReplayCheckpoints)
     m_ReplayCheckpoints->editedDependencies = true;
   // Resource/PSO replacement can change descriptors even when no native list was cached. Force
@@ -6797,17 +6907,32 @@ void WrappedID3D12Device::InvalidatePreparedReplayCache()
   // Native command lists retain direct PSO/resource addresses. Do not release those references
   // until all prior submissions have completed, then rebuild lazily from the capture stream.
   ScopedReplayTimingContext timingContext(ReplayTimingContext::PreparedCacheInvalidate);
-  ReplayWorkWaitForIdle();
+  if(!ReplayWorkWaitForIdle())
+    return;
   for(WrappedID3D12CommandQueue *queue : m_Queues)
     if(queue)
       queue->ClearPreparedReplayCache();
 }
 
-void WrappedID3D12Device::DeviceWaitForIdle()
+bool WrappedID3D12Device::DeviceWaitForIdle()
 {
+  if(HasFatalError())
+    return false;
+  // Capture and structured export do not create replay queue fences. Preserve their existing
+  // empty-fence no-op; an incomplete replay fence table must never authorise memory reuse.
+  if(m_QueueFences.empty() &&
+     (m_Queues.empty() || IsCaptureMode(m_State) || IsStructuredExporting(m_State)))
+  {
+    m_ReplayDescriptorWorkPending = false;
+    return true;
+  }
+  if(m_QueueFences.size() != m_Queues.size())
+    return D3D12GPUCompletionFailure(this, "replay queue/fence table is incomplete");
   for(size_t i = 0; i < m_QueueFences.size(); i++)
-    QueueWaitForIdle(m_Queues[i], m_QueueFences[i]);
+    if(!QueueWaitForIdle(m_Queues[i], m_QueueFences[i]))
+      return false;
   m_ReplayDescriptorWorkPending = false;
+  return true;
 }
 
 ID3D12GraphicsCommandList *WrappedID3D12Device::CreateDataUploadList()
@@ -6864,8 +6989,7 @@ ID3D12GraphicsCommandList *WrappedID3D12Device::AcquireDataUploadList()
       // allocator and reuse the pool from the beginning.
       ScopedReplayTimingContext timingContext(ReplayTimingContext::DataUploadPoolReuse);
       AddReplayTimingCounter(ReplayTimingCounter::DataUploadPoolResets);
-      InternalQueueWaitForIdle();
-      if(HasFatalError())
+      if(!InternalQueueWaitForIdle() || HasFatalError())
         return NULL;
 
       HRESULT hr = m_DataUploadAlloc->Reset();
@@ -6883,6 +7007,8 @@ ID3D12GraphicsCommandList *WrappedID3D12Device::AcquireDataUploadList()
 
 ID3D12GraphicsCommandListX *WrappedID3D12Device::GetNewList()
 {
+  if(HasFatalError())
+    return NULL;
   ID3D12GraphicsCommandListX *ret = NULL;
 
   m_WaitedForIdleAfterReplay = false;
@@ -7036,14 +7162,15 @@ void WrappedID3D12Device::ExecuteLists(WrappedID3D12CommandQueue *queue, bool In
   m_InternalCmds.pendingcmds.clear();
 }
 
-void WrappedID3D12Device::FlushLists(bool forceSync)
+bool WrappedID3D12Device::FlushLists(bool forceSync)
 {
   if(HasFatalError())
-    return;
+    return false;
 
   if(!m_InternalCmds.submittedcmds.empty() || forceSync)
   {
-    QueueWaitForIdle(m_Queue, m_WFIFence);
+    if(!QueueWaitForIdle(m_Queue, m_WFIFence))
+      return false;
 
     if(!m_InternalCmds.submittedcmds.empty())
       m_InternalCmds.freecmds.append(m_InternalCmds.submittedcmds);
@@ -7052,6 +7179,7 @@ void WrappedID3D12Device::FlushLists(bool forceSync)
     if(m_InternalCmds.pendingcmds.empty())
       m_Alloc->Reset();
   }
+  return true;
 }
 
 const ActionDescription *WrappedID3D12Device::GetAction(uint32_t eventId)
@@ -7285,7 +7413,8 @@ bool WrappedID3D12Device::ProcessChunk(ReadSerialiser &ser, D3D12Chunk context)
         CloseInitialStateList();
 
         ExecuteLists(NULL, true);
-        FlushLists();
+        if(!FlushLists())
+          return false;
       }
 
       SERIALISE_CHECK_READ_ERRORS();
@@ -7643,13 +7772,17 @@ RDResult WrappedID3D12Device::ReadLogInitialisation(RDCFile *rdc, bool storeStru
 void WrappedID3D12Device::ConfigureReplayCheckpoints(
     const ReplayCheckpointConfig &config, const rdcarray<ReplayCheckpointCandidate> &candidates)
 {
+  if(HasFatalError())
+    return;
   const bool preserve = m_ReplayCheckpoints &&
       ReplayCheckpointStorageCompatible(m_ReplayCheckpoints->config, config);
   if(!preserve)
   {
-    if(m_ReplayCheckpoints && !m_ReplayCheckpoints->checkpoints.empty())
-      DeviceWaitForIdle();
+    if(m_ReplayCheckpoints && !m_ReplayCheckpoints->checkpoints.empty() && !DeviceWaitForIdle())
+      return;
     InvalidateReplayCheckpoints();
+    if(HasFatalError())
+      return;
   }
   if(!m_ReplayCheckpoints)
     m_ReplayCheckpoints = new D3D12ReplayCheckpointCache;
@@ -7700,7 +7833,8 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
       // Saved resource copies can be referenced by the last restore. Their GPU work must retire
       // before removing the final immutable source owner. Active query sources remain held by
       // the current materialised state until the next normal root reset.
-      DeviceWaitForIdle();
+      if(!DeviceWaitForIdle())
+        return false;
       cache.currentVersions.clear();
       for(auto point = cache.checkpoints.begin(); point != cache.checkpoints.end();)
       {
@@ -7715,6 +7849,7 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
       if(cache.checkpoints.empty())
         cache.stats.sharedBytes = 0;
     }
+    return true;
   };
   const auto logConfiguration = [&]() {
     if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
@@ -7755,7 +7890,8 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
   if(!config.enabled || !config.maxCheckpoints || !config.byteBudget)
   {
     cache.budget = 0;
-    retainSelectedCheckpoints();
+    if(!retainSelectedCheckpoints())
+      return;
     logConfiguration();
     return;
   }
@@ -7794,7 +7930,8 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
   }
   if(!cache.budget)
   {
-    retainSelectedCheckpoints();
+    if(!retainSelectedCheckpoints())
+      return;
     logConfiguration();
     return;
   }
@@ -8013,7 +8150,8 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
         inspectedBoundaries.size(), continuationUnsupported.size(),
         (unsigned long long)sourceChunks, details.c_str()));
   }
-  retainSelectedCheckpoints();
+  if(!retainSelectedCheckpoints())
+    return;
   logConfiguration();
 }
 
@@ -8034,14 +8172,18 @@ bool WrappedID3D12Device::IsReplayCheckpointAliasingSafe(ResourceId before, Reso
 
 void WrappedID3D12Device::InvalidateReplayCheckpoints(uint32_t firstAffectedEvent)
 {
-  if(!m_ReplayCheckpoints)
+  if(!m_ReplayCheckpoints || HasFatalError())
     return;
   D3D12ReplayCheckpointCache &cache = *m_ReplayCheckpoints;
   cache.residentVersions.InvalidateAll();
+  // Both texture/buffer copies and query sources may still be read by the last restored suffix.
+  // A preceding patch/shader transaction's completed device drain can be reused here.
+  const bool removingSources = !cache.currentVersions.empty() || !cache.activeQueries.empty() ||
+      cache.checkpoints.lower_bound(firstAffectedEvent) != cache.checkpoints.end();
+  if(removingSources && !ReplayWorkWaitForIdle())
+    return;
   if(!cache.activeQueries.empty())
   {
-    // Query source buffers can still be referenced directly by recorded/submitted suffix lists.
-    DeviceWaitForIdle();
     cache.activeQueryResolves.clear();
     cache.activeQueries.clear();
   }
@@ -8106,7 +8248,7 @@ void WrappedID3D12Device::GetReplayCheckpointQueryResult(
 void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset,
                                               uint32_t nextEvent, uint32_t nextAction)
 {
-  if(!m_ReplayCheckpoints || m_Replay->m_ReplayCheckpointBypass ||
+  if(HasFatalError() || !m_ReplayCheckpoints || m_Replay->m_ReplayCheckpointBypass ||
      m_Queue->GetCommandData()->m_ActionCallback || m_ReplayOptions.apiValidation ||
      !m_ReplayCheckpoints->config.enabled)
     return;
@@ -8400,8 +8542,7 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
   const double prepareMS = totalTimer.GetMilliseconds();
   PerformanceTimer timer;
   m_Queue->SyncLastReplayQueueToInternal();
-  DeviceWaitForIdle();
-  if(HasFatalError())
+  if(!DeviceWaitForIdle() || HasFatalError())
     return;
   // Planning is side-effect free. Retire source resources only after prior queue work completes,
   // and never evict the reusable pre-consumer anchor merely to make a downstream point fit.
@@ -8534,9 +8675,11 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
   }
   CHECK_HR(this, list->Close());
   ExecuteLists();
-  FlushLists(true);
-  if(HasFatalError())
+  if(!FlushLists(true) || HasFatalError())
+  {
+    cache.unconfirmedSave = std::move(checkpoint);
     return;
+  }
   cache.currentVersions = checkpoint.resources;
   cache.checkpoints[eventID] = std::move(checkpoint);
   cache.PublishResidentVersions(cache.checkpoints[eventID]);
@@ -8585,6 +8728,21 @@ static void CheckpointInitialCopyRanges(
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 #include "catch/catch.hpp"
+
+TEST_CASE("D3D12 upload reuse requires actual GPU fence completion", "[bufferpatch][gpu-idle]")
+{
+  CHECK(D3D12IdleWaitSucceeded(WAIT_OBJECT_0, S_OK, 7, 7));
+  CHECK(D3D12IdleWaitSucceeded(WAIT_OBJECT_0, S_OK, 8, 7));
+  // A stale event, timeout, or removed-device sentinel never authorises a write to in-flight data.
+  CHECK_FALSE(D3D12IdleWaitSucceeded(WAIT_OBJECT_0, S_OK, 6, 7));
+  CHECK_FALSE(D3D12IdleWaitSucceeded(WAIT_TIMEOUT, S_OK, 6, 7));
+  CHECK_FALSE(D3D12IdleWaitSucceeded(WAIT_TIMEOUT, S_OK, 7, 7));
+  CHECK_FALSE(D3D12IdleWaitSucceeded(WAIT_FAILED, S_OK, 7, 7));
+  CHECK_FALSE(D3D12IdleWaitSucceeded(WAIT_ABANDONED, S_OK, 7, 7));
+  CHECK_FALSE(D3D12IdleWaitSucceeded(WAIT_OBJECT_0, DXGI_ERROR_DEVICE_REMOVED, 7, 7));
+  CHECK_FALSE(D3D12IdleWaitSucceeded(WAIT_OBJECT_0, S_OK, ~0ULL, 7));
+  CHECK_FALSE(D3D12IdleWaitSucceeded(WAIT_OBJECT_0, S_OK, 0, 0));
+}
 
 TEST_CASE("D3D12 resident checkpoint copies require preserved baseline exclusions and storage",
           "[d3d12][checkpoint][resourceversions]")
@@ -9671,7 +9829,7 @@ void WrappedID3D12Device::PrepareReplayCheckpointRestore(uint32_t requestedEvent
 bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t &offset,
                                                  uint32_t &nextEvent, uint32_t &nextAction)
 {
-  if(!m_ReplayCheckpoints)
+  if(!m_ReplayCheckpoints || HasFatalError())
     return false;
   auto &cache = *m_ReplayCheckpoints;
   const auto fallback = [&](const rdcstr &reason) {
@@ -9688,11 +9846,12 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
       // BeginCaptureFrame has already put tracked states at the baseline. No checkpoint writes
       // have run on these recoverable failure paths, so complete the missing contents before
       // allowing the queue reader to replay its original stream from the beginning.
-      DeviceWaitForIdle();
+      if(!DeviceWaitForIdle())
+        return false;
       ApplyInitialContents();
       ExecuteLists();
-      FlushLists(true);
-      DeviceWaitForIdle();
+      if(!FlushLists(true) || !DeviceWaitForIdle())
+        return false;
       resetCompleted = !HasFatalError();
     }
     if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
@@ -9731,8 +9890,8 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
         overlapRestore = false;
         break;
       }
-  if(!overlapRestore)
-    DeviceWaitForIdle();
+  if(!overlapRestore && !DeviceWaitForIdle())
+    return false;
   const double preWaitEndMS = timer.GetMilliseconds();
   // Validate every fallible CPU map before writing any descriptor or resource. A failed map
   // can therefore complete a canonical initial-content reset without replaying its barriers.
@@ -9849,8 +10008,8 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
   // after these copies to every captured queue; earlier initial-state fences precede this work.
   // Retain submitted command lists/allocator until the normal replay retirement point.
   const bool asyncRestore = overlapRestore && InstallInitialStateQueueDependencies();
-  if(!asyncRestore)
-    FlushLists(true);
+  if(!asyncRestore && !FlushLists(true))
+    return false;
   const double submitWaitEndMS = timer.GetMilliseconds();
   if(HasFatalError())
     return false;
@@ -9904,6 +10063,8 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
                                     bool knownShaderFeedback, bool knownOrdinaryTarget,
                                     bool naturalReference, bool ordinaryRoot)
 {
+  if(HasFatalError())
+    return;
   PerformanceTimer liveTimer;
   const bool rootRequest = startEventID == 0 && replayType == eReplay_WithoutDraw;
   const bool eligibleRoot = IsOrdinaryLiveForwardRoot(
@@ -9977,7 +10138,8 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
     ScopedReplayTimingContext timingContext(ReplayTimingContext::ReplayReset);
     m_WFICounter++;
 
-    DeviceWaitForIdle();
+    if(!DeviceWaitForIdle())
+      return;
 
     // I'm not sure the reason for this, but the debug layer warns about being unable to resubmit
     // command lists due to the 'previous queue fence' not being ready yet, even if no fences are
@@ -9985,7 +10147,8 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
     for(size_t i = 0; i < m_Queues.size(); i++)
       CHECK_HR(this, m_Queues[i]->Signal(m_QueueFences[i], m_WFICounter));
 
-    FlushLists(true);
+    if(!FlushLists(true))
+      return;
     if(m_ReplayCheckpoints)
     {
       m_ReplayCheckpoints->activeQueryResolves.clear();
@@ -10039,8 +10202,8 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
     if(!deferInitialStateWait || !InstallInitialStateQueueDependencies())
     {
       ScopedReplayTimingContext fallbackContext(ReplayTimingContext::InitialFallback);
-      FlushLists(true);
-      DeviceWaitForIdle();
+      if(!FlushLists(true) || !DeviceWaitForIdle())
+        return;
     }
 
     // Only now have the canonical initial commands actually been submitted and made visible to
@@ -10183,9 +10346,7 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
     if(D3D12_Debug_SingleSubmitFlushing())
     {
       ScopedReplayTimingContext timingContext(ReplayTimingContext::DebugSingleSubmit);
-      FlushLists(true);
-
-      if(HasFatalError())
+      if(!FlushLists(true) || HasFatalError())
         return;
     }
   }

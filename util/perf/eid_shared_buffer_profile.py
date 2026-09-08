@@ -67,6 +67,15 @@ def unchanged_checkpoint_issues(before, after):
             if before.get(field) != after.get(field)]
 
 
+def readback_replay_issues(records):
+    """Correct bytes do not prove immediate refresh when a resource getter repaired replay state."""
+    native = {"D3D11", "D3D12", "OpenGL", "Vulkan", "ReplayDriverBoundary", "ReplayChunk"}
+    return ["Resource readback performed implicit replay: api=%s type=%s" %
+            (row.get("api"), row.get("type", "materialize")) for row in records
+            if row.get("api") in ("MaterializeEvent", "ReplayLog") or
+            (row.get("api") in native and "type" in row)]
+
+
 def fixed_checkpoint_evidence(before, after, generation):
     cutoff = after.get("sharedBufferPatchFirstAffectedEvent")
     if not isinstance(cutoff, int) or not 0 <= cutoff < (1 << 32):
@@ -412,11 +421,13 @@ def main(argv=None):
             raise RuntimeError("Replay changed the shared patch generation")
         raw, buffer_timing = recorder.measure(mode + "." + stage + ".bufferReadback",
                                              lambda: bytes(controller.GetBufferData(resource, begin, size)), event)
+        check_readback(mode + "." + stage + ".bufferReadback", buffer_timing)
         if len(raw) != size:
             raise RuntimeError("Incomplete native GetBufferData window")
         output_pixels, pixel_timing = recorder.measure(
             mode + "." + stage + ".outputReadback",
             lambda: output_witness(controller, rd, args.max_read_mib * 1024 * 1024), event)
+        check_readback(mode + "." + stage + ".outputReadback", pixel_timing)
         if output_pixels["eventId"] != event:
             raise RuntimeError("Effective EID differs from the requested EID")
         witness = {"buffer": byte_witness(raw, relative, len(data)), "output": output_pixels}
@@ -438,6 +449,12 @@ def main(argv=None):
         recorder.publish()
         return witness
 
+    def check_readback(label, timing):
+        issues = readback_replay_issues(timing["timingRecords"])
+        if issues:
+            report["issues"].extend(label + ": " + issue for issue in issues)
+            raise RuntimeError(label + ": " + "; ".join(issues))
+
     def validate_stage(mode, stage, expected=None, original=False):
         observed = {event: [] for event in events}
         for event in roundtrip(events):
@@ -458,15 +475,15 @@ def main(argv=None):
         nonlocal generation
         event = events[-1]
         fixed = {"eventId": event, "rows": [], "requireFast": args.require_fast,
-                 "meaning": "Setter wall excludes subsequent native readbacks. No SetFrameEvent occurs "
-                            "between each setter and its immediate Buffer/all-bound-output witness. "
-                            "Two force references then use the identical patch generation.",
+                 "meaning": "All fixed values are applied consecutively with immediate Buffer/all-bound-output "
+                            "witnesses before any force reference. Resource getters must not perform implicit "
+                            "replay. References later reinstall identical bytes in separately recorded generations. "
+                            "Setter wall excludes subsequent native readbacks.",
                  "warmup": "Value 1 introduces the range; value 2 may establish the prefix anchor."}
         report["fixedValues"] = fixed
         # Position only once. In particular, never repair a stale setter result with a replay before
         # reading it. Force references below cannot hide a stale immediate witness.
         visit("fixedValues", "position", event, False)
-        previous_pixels = None
         for index, value in enumerate(fixed_values):
             label = "fixedValues.value%d" % (index + 1)
             before, before_generation = status(), generation
@@ -483,8 +500,10 @@ def main(argv=None):
                 raise RuntimeError("Fixed-value setter left a stale current EID")
             raw, buffer_timing = recorder.measure(label + ".immediateBufferReadback",
                 lambda: bytes(controller.GetBufferData(resource, begin, size)), event)
+            check_readback(label + ".immediateBufferReadback", buffer_timing)
             pixels, pixel_timing = recorder.measure(label + ".immediateOutputReadback",
                 lambda: output_witness(controller, rd, args.max_read_mib * 1024 * 1024), event)
+            check_readback(label + ".immediateOutputReadback", pixel_timing)
             if pixels["eventId"] != event or int(controller.GetSharedBufferPatchGeneration()) != generation:
                 raise RuntimeError("Fixed-value immediate output has a stale EID or generation")
             if len(raw) != size:
@@ -497,12 +516,22 @@ def main(argv=None):
             report["issues"].extend(row["windowChecks"]["issues"])
             row["readbackCheckpointIssues"] = unchanged_checkpoint_issues(after, row["afterImmediateReadback"])
             report["issues"].extend(label + ".readback: " + issue for issue in row["readbackCheckpointIssues"])
+            recorder.publish()
+
+        # Preserve every immediate witness before running any independent replay. Reinstalling the
+        # same byte configuration later may advance its generation; it cannot alter the saved image.
+        previous_pixels = None
+        for index, (value, row) in enumerate(zip(fixed_values, fixed["rows"])):
+            label = "fixedValues.value%d" % (index + 1)
+            generation = change("fixedValues.referenceValue%d.install" % (index + 1),
+                                lambda: controller.SetSharedBufferPatch(resource, offset, value))
+            row["referenceGeneration"] = generation
             canonical = []
             row["forceReferenceVisits"] = []
             for _ in range(2):
                 canonical.append(visit("fixedValues", "value%d.forceReference" % (index + 1), event, True, value))
                 row["forceReferenceVisits"].append(len(report["visits"]) - 1)
-            row["comparison"] = state_comparison([witness], canonical, baseline_witness[event])
+            row["comparison"] = state_comparison([row["immediateWitness"]], canonical, baseline_witness[event])
             stable = canonical[0] == canonical[1]
             row["pixelsChangedFromPreviousValue"] = (canonical[0]["output"]["pixels"] != previous_pixels
                                                         if stable and previous_pixels is not None else None)
@@ -530,8 +559,27 @@ def main(argv=None):
         fixed["visibleValueTransitions"] = sum(row["pixelsChangedFromPreviousValue"] is True
                                                 for row in fixed["rows"])
         generation = change("fixedValues.clearAll", controller.ClearSharedBufferPatches)
+        before_clear_readback = status()
+        if int(controller.GetCurrentEventID()) != event:
+            raise RuntimeError("Fixed-value clear left a stale current EID")
+        raw, buffer_timing = recorder.measure("fixedValues.clearAll.immediateBufferReadback",
+            lambda: bytes(controller.GetBufferData(resource, begin, size)), event)
+        check_readback("fixedValues.clearAll.immediateBufferReadback", buffer_timing)
+        pixels, pixel_timing = recorder.measure("fixedValues.clearAll.immediateOutputReadback",
+            lambda: output_witness(controller, rd, args.max_read_mib * 1024 * 1024), event)
+        check_readback("fixedValues.clearAll.immediateOutputReadback", pixel_timing)
+        if (len(raw) != size or pixels["eventId"] != event or
+                int(controller.GetSharedBufferPatchGeneration()) != generation):
+            raise RuntimeError("Fixed-value clear witness has incomplete bytes or a stale EID/generation")
+        fixed["clearImmediateWitness"] = {"buffer": byte_witness(raw, relative, len(data)), "output": pixels}
+        fixed["clearReadbackCheckpointIssues"] = unchanged_checkpoint_issues(before_clear_readback, status())
+        report["issues"].extend("fixedValues.clear.readback: " + issue
+                                for issue in fixed["clearReadbackCheckpointIssues"])
         restored = [visit("fixedValues", "cleared.forceReference", event, True) for _ in range(2)]
-        fixed["clearComparison"] = state_comparison([restored[0]], restored, baseline_witness[event], True)
+        fixed["clearComparison"] = state_comparison([fixed["clearImmediateWitness"]], restored,
+                                                    baseline_witness[event], True)
+        fixed["fastVerified"] &= (fixed["clearComparison"]["status"] == "passed" and
+                                  not fixed["clearReadbackCheckpointIssues"])
         if fixed["clearComparison"]["status"] != "passed":
             report["issues"].append("fixedValues.clear: " + fixed["clearComparison"]["status"])
 

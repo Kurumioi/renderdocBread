@@ -29,6 +29,7 @@
 #include "api/replay/renderdoc_replay.h"
 #include "core/core.h"
 #include "replay/replay_driver.h"
+#include "replay/replay_resource_versions.h"
 #include "d3d11_common.h"
 #include "d3d11_renderstate.h"
 
@@ -206,7 +207,8 @@ public:
   ReplayCheckpointStats GetReplayCheckpointStats() override;
   rdcstr SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches) override;
   uint32_t GetReplayBufferPatchFirstAffectedEvent() const override { return m_BufferPatchFirstAffected; }
-  void RecordBufferPatchConsumer(ResourceId buffer, uint32_t eventId);
+  void RecordBufferPatchConsumer(ResourceId buffer, uint32_t eventId, uint64_t byteOffset = 0,
+                                 uint64_t byteLength = ~0ULL);
   bool ApplyPendingBufferPatches();
   void InvalidateBufferPatchContents() { m_BufferPatchesDirty = !m_BufferPatches.empty(); }
   bool HasBufferPatches() const { return !m_BufferPatches.empty(); }
@@ -266,6 +268,8 @@ public:
                          rdcstr &errors);
   void ReplaceResource(ResourceId from, ResourceId to);
   void RemoveReplacement(ResourceId id);
+  rdcstr ReplaceTargetShaderChecked(ResourceId from, ResourceId to) override;
+  rdcstr RemoveTargetShaderReplacementChecked(ResourceId id) override;
   void ClearReplayCache();
   void ReloadShaderDebugInformation();
   rdcstr SetEventShaderOverride(uint32_t eventId, ShaderStage stage, ResourceId expectedOriginal,
@@ -445,6 +449,9 @@ private:
   std::map<ResourceId, ID3D11Buffer *> m_BufferPatchScratch;
   bool m_BufferPatchesDirty = false;
   std::map<ResourceId, uint32_t> m_BufferPatchFirstConsumers;
+  ReplayResourceAccessIndex m_BufferPatchReadIndex;
+  std::set<ResourceId> m_BufferPatchReadRegistered;
+  uint32_t m_BufferPatchReadLastEvent = 0;
   uint32_t m_BufferPatchFirstAffected = 0;
   uint32_t m_BufferPatchAnchorEvent = 0;
 

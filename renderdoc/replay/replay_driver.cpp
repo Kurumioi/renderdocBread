@@ -506,6 +506,131 @@ rdcstr ValidateReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
   return {};
 }
 
+bool SameReplayBufferPatchLayout(const rdcarray<ReplayBufferPatch> &previous,
+                                 const rdcarray<ReplayBufferPatch> &next)
+{
+  if(next.empty() || previous.size() != next.size() ||
+     !ValidateReplayBufferPatches(previous).empty() || !ValidateReplayBufferPatches(next).empty())
+    return false;
+
+  for(size_t i = 0; i < next.size(); i++)
+    if(previous[i].buffer != next[i].buffer || previous[i].byteOffset != next[i].byteOffset ||
+       previous[i].data.size() != next[i].data.size())
+      return false;
+  return true;
+}
+
+rdcstr GetReplayBufferPatchChanges(const rdcarray<ReplayBufferPatch> &previous,
+                                   const rdcarray<ReplayBufferPatch> &next,
+                                   rdcarray<ReplayBufferPatchRange> &changes, uint32_t maxRanges)
+{
+  changes.clear();
+  rdcstr error = ValidateReplayBufferPatches(previous);
+  if(error.empty())
+    error = ValidateReplayBufferPatches(next);
+  if(!error.empty())
+    return error;
+
+  auto append = [&changes, maxRanges](ResourceId buffer, uint64_t begin, uint64_t end) {
+    // All ends originate from validated patch ranges, so subtraction and adjacency cannot overflow.
+    if(!changes.empty() && changes.back().buffer == buffer &&
+       changes.back().byteOffset + changes.back().byteLength == begin)
+    {
+      changes.back().byteLength = end - changes.back().byteOffset;
+      return true;
+    }
+    if(changes.size() >= maxRanges)
+      return false;
+    changes.push_back({buffer, begin, end - begin});
+    return true;
+  };
+
+  size_t oldIndex = 0, newIndex = 0;
+  size_t oldConsumed = 0, newConsumed = 0;
+  bool complete = true;
+  while(complete && (oldIndex < previous.size() || newIndex < next.size()))
+  {
+    const ReplayBufferPatch *old = oldIndex < previous.size() ? &previous[oldIndex] : NULL;
+    const ReplayBufferPatch *updated = newIndex < next.size() ? &next[newIndex] : NULL;
+
+    if(!updated || (old && old->buffer < updated->buffer))
+    {
+      complete = append(old->buffer, old->byteOffset + oldConsumed,
+                        old->byteOffset + old->data.size());
+      oldConsumed = old->data.size();
+    }
+    else if(!old || updated->buffer < old->buffer)
+    {
+      complete = append(updated->buffer, updated->byteOffset + newConsumed,
+                        updated->byteOffset + updated->data.size());
+      newConsumed = updated->data.size();
+    }
+    else
+    {
+      const uint64_t oldBegin = old->byteOffset + oldConsumed;
+      const uint64_t newBegin = updated->byteOffset + newConsumed;
+      const uint64_t oldEnd = old->byteOffset + old->data.size();
+      const uint64_t newEnd = updated->byteOffset + updated->data.size();
+
+      if(oldBegin < newBegin)
+      {
+        const uint64_t end = RDCMIN(oldEnd, newBegin);
+        complete = append(old->buffer, oldBegin, end);
+        oldConsumed += size_t(end - oldBegin);
+      }
+      else if(newBegin < oldBegin)
+      {
+        const uint64_t end = RDCMIN(newEnd, oldBegin);
+        complete = append(updated->buffer, newBegin, end);
+        newConsumed += size_t(end - newBegin);
+      }
+      else
+      {
+        const size_t length = size_t(RDCMIN(oldEnd, newEnd) - oldBegin);
+        const byte *oldBytes = old->data.data() + oldConsumed;
+        const byte *newBytes = updated->data.data() + newConsumed;
+
+        // Slider updates normally leave almost every byte unchanged. Avoid a per-byte walk when
+        // an entire overlapping span is equal, without interpreting floating-point representations.
+        if(memcmp(oldBytes, newBytes, length) != 0)
+        {
+          size_t pos = 0;
+          while(complete && pos < length)
+          {
+            while(pos < length && oldBytes[pos] == newBytes[pos])
+              pos++;
+            const size_t begin = pos;
+            while(pos < length && oldBytes[pos] != newBytes[pos])
+              pos++;
+            if(begin < pos)
+              complete = append(old->buffer, oldBegin + begin, oldBegin + pos);
+          }
+        }
+        oldConsumed += length;
+        newConsumed += length;
+      }
+    }
+
+    if(old && oldConsumed == old->data.size())
+    {
+      oldIndex++;
+      oldConsumed = 0;
+    }
+    if(updated && newConsumed == updated->data.size())
+    {
+      newIndex++;
+      newConsumed = 0;
+    }
+  }
+
+  if(!complete)
+  {
+    changes.clear();
+    return "Persistent buffer edit differences exceed the change-range limit";
+  }
+  return {};
+}
+
 void ApplyReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches, ResourceId buffer,
                               uint64_t byteOffset, void *data, uint64_t byteLength)
 {
@@ -2479,6 +2604,232 @@ TEST_CASE("Shared buffer edits reject invalid transactions without losing old va
   CHECK_FALSE(ValidateReplayBufferPatches(ranges).empty());
   ranges[1].byteOffset = 0;
   CHECK_FALSE(ValidateReplayBufferPatches(ranges).empty());
+}
+
+TEST_CASE("Shared buffer patch deltas isolate the changed storage and bytes",
+          "[replay][bufferpatch]")
+{
+  const ResourceId a = ResourceIDGen::GetNewUniqueID();
+  const ResourceId b = ResourceIDGen::GetNewUniqueID();
+  rdcarray<ReplayBufferPatch> previous = {
+      {a, 64, {1, 2, 3, 4}}, {a, 256, {5, 6, 7, 8, 9}}, {b, 256, {10, 11, 12, 13}}};
+  rdcarray<ReplayBufferPatch> next = previous;
+  next[1].data = {5, 60, 70, 8, 90};
+  rdcarray<ReplayBufferPatchRange> changes;
+  REQUIRE(GetReplayBufferPatchChanges(previous, next, changes).empty());
+  REQUIRE(changes.size() == 2);
+  CHECK(changes[0].buffer == a);
+  CHECK(changes[0].byteOffset == 257);
+  CHECK(changes[0].byteLength == 2);
+  CHECK(changes[1].buffer == a);
+  CHECK(changes[1].byteOffset == 260);
+  CHECK(changes[1].byteLength == 1);
+  CHECK(SameReplayBufferPatchLayout(previous, next));
+
+  // Buffer identity is part of an address: identical offsets in another buffer are unrelated.
+  next = previous;
+  next[2].data[0] = 100;
+  REQUIRE(GetReplayBufferPatchChanges(previous, next, changes).empty());
+  REQUIRE(changes.size() == 1);
+  CHECK(changes[0].buffer == b);
+  CHECK(changes[0].byteOffset == 256);
+  CHECK(changes[0].byteLength == 1);
+}
+
+TEST_CASE("Shared buffer patch deltas compare flattened values independently of edit layers",
+          "[replay][bufferpatch]")
+{
+  const ResourceId buffer = ResourceIDGen::GetNewUniqueID();
+  ReplayBufferPatchSet edits;
+  REQUIRE(edits.Set(buffer, 32, {1, 2, 3, 4, 5, 6}).empty());
+  const rdcarray<ReplayBufferPatch> original = edits.Flatten();
+  REQUIRE(edits.Set(buffer, 34, {3, 4}).empty());
+  const rdcarray<ReplayBufferPatch> partitioned = edits.Flatten();
+  REQUIRE(partitioned.size() == 3);
+  CHECK_FALSE(SameReplayBufferPatchLayout(original, partitioned));
+  rdcarray<ReplayBufferPatchRange> changes;
+  REQUIRE(GetReplayBufferPatchChanges(original, partitioned, changes).empty());
+  CHECK(changes.empty());
+  REQUIRE(GetReplayBufferPatchChanges(partitioned, original, changes).empty());
+  CHECK(changes.empty());
+
+  REQUIRE(edits.Set(buffer, 34, {3, 40}).empty());
+  const rdcarray<ReplayBufferPatch> changed = edits.Flatten();
+  REQUIRE(GetReplayBufferPatchChanges(original, changed, changes).empty());
+  REQUIRE(changes.size() == 1);
+  CHECK(changes[0].buffer == buffer);
+  CHECK(changes[0].byteOffset == 35);
+  CHECK(changes[0].byteLength == 1);
+
+  REQUIRE(edits.Remove(buffer, 34, 2));
+  REQUIRE(GetReplayBufferPatchChanges(changed, edits.Flatten(), changes).empty());
+  REQUIRE(changes.size() == 1);
+  CHECK(changes[0].byteOffset == 35);
+  CHECK(changes[0].byteLength == 1);
+}
+
+TEST_CASE("Shared buffer patch deltas retain coverage changes on resize move and undo",
+          "[replay][bufferpatch]")
+{
+  const ResourceId buffer = ResourceIDGen::GetNewUniqueID();
+  const rdcarray<ReplayBufferPatch> previous = {{buffer, 8, {1, 2, 3, 4}}};
+  rdcarray<ReplayBufferPatch> next = {{buffer, 9, {2, 3}}};
+  rdcarray<ReplayBufferPatchRange> changes;
+  REQUIRE(GetReplayBufferPatchChanges(previous, next, changes).empty());
+  REQUIRE(changes.size() == 2);
+  CHECK(changes[0].byteOffset == 8);
+  CHECK(changes[0].byteLength == 1);
+  CHECK(changes[1].byteOffset == 11);
+  CHECK(changes[1].byteLength == 1);
+  CHECK_FALSE(SameReplayBufferPatchLayout(previous, next));
+  REQUIRE(GetReplayBufferPatchChanges(next, previous, changes).empty());
+  REQUIRE(changes.size() == 2);
+  CHECK(changes[0].byteOffset == 8);
+  CHECK(changes[1].byteOffset == 11);
+
+  next = {{buffer, 10, {3, 4, 5, 6}}};
+  REQUIRE(GetReplayBufferPatchChanges(previous, next, changes).empty());
+  REQUIRE(changes.size() == 2);
+  CHECK(changes[0].byteOffset == 8);
+  CHECK(changes[0].byteLength == 2);
+  CHECK(changes[1].byteOffset == 12);
+  CHECK(changes[1].byteLength == 2);
+
+  // The unpatched original bytes are unknown: adding/removing zero-valued bytes still changes
+  // coverage, rather than assuming an absent override means zero.
+  next = {{buffer, 20, {0, 0}}};
+  REQUIRE(GetReplayBufferPatchChanges({}, next, changes).empty());
+  REQUIRE(changes.size() == 1);
+  CHECK(changes[0].byteOffset == 20);
+  CHECK(changes[0].byteLength == 2);
+  REQUIRE(GetReplayBufferPatchChanges(next, {}, changes).empty());
+  REQUIRE(changes.size() == 1);
+  CHECK(changes[0].byteOffset == 20);
+  CHECK(changes[0].byteLength == 2);
+}
+
+TEST_CASE("Shared buffer patch delta limits fail closed without partial results",
+          "[replay][bufferpatch]")
+{
+  const ResourceId buffer = ResourceIDGen::GetNewUniqueID();
+  const rdcarray<ReplayBufferPatch> previous = {{buffer, 8, {0, 0, 0, 0, 0}}};
+  rdcarray<ReplayBufferPatch> next = {{buffer, 8, {1, 0, 1, 0, 1}}};
+  rdcarray<ReplayBufferPatchRange> changes;
+  CHECK_FALSE(GetReplayBufferPatchChanges(previous, next, changes, 2).empty());
+  CHECK(changes.empty());
+  REQUIRE(GetReplayBufferPatchChanges(previous, next, changes, 3).empty());
+  REQUIRE(changes.size() == 3);
+  CHECK(changes[0].byteOffset == 8);
+  CHECK(changes[1].byteOffset == 10);
+  CHECK(changes[2].byteOffset == 12);
+
+  // The cap counts merged output ranges, not patch boundaries or individual changed bytes.
+  next = {{buffer, 8, {1, 1}}, {buffer, 10, {1, 1, 1}}};
+  REQUIRE(GetReplayBufferPatchChanges(previous, next, changes, 1).empty());
+  REQUIRE(changes.size() == 1);
+  CHECK(changes[0].byteOffset == 8);
+  CHECK(changes[0].byteLength == 5);
+  CHECK_FALSE(GetReplayBufferPatchChanges(previous, next, changes, 0).empty());
+  CHECK(changes.empty());
+  REQUIRE(GetReplayBufferPatchChanges(previous, previous, changes, 0).empty());
+  CHECK(changes.empty());
+  REQUIRE(GetReplayBufferPatchChanges({}, {}, changes, 0).empty());
+  CHECK(changes.empty());
+  CHECK_FALSE(SameReplayBufferPatchLayout({}, {}));
+}
+
+TEST_CASE("Shared buffer patch deltas reject invalid ranges before address arithmetic",
+          "[replay][bufferpatch]")
+{
+  const ResourceId buffer = ResourceIDGen::GetNewUniqueID();
+  const rdcarray<ReplayBufferPatch> valid = {{buffer, UINT64_MAX - 3, {1, 2, 3}}};
+  rdcarray<ReplayBufferPatch> changed = {{buffer, UINT64_MAX - 3, {1, 2, 30}}};
+  rdcarray<ReplayBufferPatchRange> changes;
+  REQUIRE(GetReplayBufferPatchChanges(valid, changed, changes).empty());
+  REQUIRE(changes.size() == 1);
+  CHECK(changes[0].byteOffset == UINT64_MAX - 1);
+  CHECK(changes[0].byteLength == 1);
+  REQUIRE(GetReplayBufferPatchChanges({}, valid, changes).empty());
+  REQUIRE(changes.size() == 1);
+  CHECK(changes[0].byteOffset == UINT64_MAX - 3);
+  CHECK(changes[0].byteLength == 3);
+
+  const rdcarray<ReplayBufferPatch> invalid[] = {
+      {{buffer, UINT64_MAX - 1, {1, 2}}},
+      {{ResourceId(), 0, {1}}},
+      {{buffer, 0, {}}},
+      {{buffer, 1, {1}}, {buffer, 0, {2}}},
+      {{buffer, 0, {1, 2}}, {buffer, 1, {2}}},
+  };
+  for(const rdcarray<ReplayBufferPatch> &patches : invalid)
+  {
+    changes = {{buffer, 0, 1}};
+    CHECK_FALSE(GetReplayBufferPatchChanges(valid, patches, changes).empty());
+    CHECK(changes.empty());
+    changes = {{buffer, 0, 1}};
+    CHECK_FALSE(GetReplayBufferPatchChanges(patches, valid, changes).empty());
+    CHECK(changes.empty());
+    CHECK_FALSE(SameReplayBufferPatchLayout(patches, patches));
+  }
+}
+
+TEST_CASE("Shared buffer patch deltas match an independent byte coverage oracle",
+          "[replay][bufferpatch]")
+{
+  const ResourceId buffer = ResourceIDGen::GetNewUniqueID();
+  // Enumerate all states of three bytes, each either absent, explicitly zero, or explicitly one.
+  // Alternating split/merged inputs exercise address alignment independently of the diff sweep.
+  auto patchesFor = [buffer](uint32_t encoded, bool merge) {
+    rdcarray<ReplayBufferPatch> patches;
+    for(uint64_t offset = 0; offset < 3; offset++, encoded /= 3)
+    {
+      const uint32_t state = encoded % 3;
+      if(state == 0)
+        continue;
+      if(merge && !patches.empty() &&
+         patches.back().byteOffset + patches.back().data.size() == offset)
+        patches.back().data.push_back(byte(state - 1));
+      else
+        patches.push_back({buffer, offset, {byte(state - 1)}});
+    }
+    return patches;
+  };
+
+  for(uint32_t oldState = 0; oldState < 27; oldState++)
+  {
+    for(uint32_t newState = 0; newState < 27; newState++)
+    {
+      INFO("old coverage/value state " << oldState << ", new state " << newState);
+      rdcarray<ReplayBufferPatchRange> changes;
+      REQUIRE(GetReplayBufferPatchChanges(patchesFor(oldState, oldState % 2 != 0),
+                                         patchesFor(newState, newState % 2 == 0), changes)
+                  .empty());
+      bytebuf expected = {0, 0, 0};
+      uint32_t oldDigits = oldState, newDigits = newState;
+      for(size_t offset = 0; offset < 3; offset++, oldDigits /= 3, newDigits /= 3)
+        expected[offset] = byte(oldDigits % 3 != newDigits % 3);
+
+      bytebuf actual = {0, 0, 0};
+      bool canonical = true;
+      uint64_t previousEnd = 0;
+      bool first = true;
+      for(const ReplayBufferPatchRange &range : changes)
+      {
+        if(range.buffer != buffer || range.byteLength == 0 || range.byteOffset >= 3 ||
+           range.byteLength > 3 - range.byteOffset || (!first && range.byteOffset <= previousEnd))
+        {
+          canonical = false;
+          break;
+        }
+        previousEnd = range.byteOffset + range.byteLength;
+        first = false;
+        for(uint64_t offset = range.byteOffset; offset < previousEnd; offset++)
+          actual[size_t(offset)] = 1;
+      }
+      CHECK(canonical);
+      CHECK(actual == expected);
+    }
+  }
 }
 
 TEST_CASE("Published pipeline metadata survives the next event", "[pipeline][publication]")

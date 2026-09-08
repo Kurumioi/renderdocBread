@@ -1167,9 +1167,12 @@ void WrappedID3D11DeviceContext::AddUsage(const ActionDescription &a)
     // Index every physically bound CB slot, independent of reflection. A replacement shader
     // may read a previously unused slot; Copy-source consumers above bound propagation too.
     if(IsLoading(m_State) && m_Type == D3D11_DEVICE_CONTEXT_IMMEDIATE && executesShader)
-      for(ID3D11Buffer *buffer : sh.ConstantBuffers)
-        if(buffer)
-          m_pDevice->GetReplay()->RecordBufferPatchConsumer(GetIDForDeviceChild(buffer), e);
+      for(size_t slot = 0; slot < ARRAY_COUNT(sh.ConstantBuffers); slot++)
+        if(sh.ConstantBuffers[slot])
+          m_pDevice->GetReplay()->RecordBufferPatchConsumer(
+              GetIDForDeviceChild(sh.ConstantBuffers[slot]), e,
+              m_pRealContext1 && m_SetCBuffer1 ? uint64_t(sh.CBOffsets[slot]) * 16 : 0,
+              m_pRealContext1 && m_SetCBuffer1 ? uint64_t(sh.CBCounts[slot]) * 16 : ~0ULL);
 
     // Shader objects are resources too. Record the bound shader at the same point where the
     // draw/dispatch's other resource uses are indexed, so GetUsage(shaderId) can find one

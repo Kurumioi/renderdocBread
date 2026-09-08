@@ -1005,11 +1005,13 @@ rdcstr ReplayController::CommitSharedBufferPatches(const ReplayBufferPatchSet &p
     return "No healthy replay driver is available for persistent buffer edits";
   const rdcarray<ReplayBufferPatch> next = patches.Flatten();
   const rdcarray<ReplayBufferPatch> previous = m_SharedBufferPatches.Flatten();
+  rdcarray<ReplayBufferPatchRange> changes;
+  const bool deltaKnown = GetReplayBufferPatchChanges(previous, next, changes).empty();
   bool changed = next.size() != previous.size();
   for(size_t i = 0; !changed && i < next.size(); i++)
     changed = next[i].buffer != previous[i].buffer || next[i].byteOffset != previous[i].byteOffset ||
               next[i].data != previous[i].data;
-  if(!changed)
+  if(!changed || (deltaKnown && changes.empty()))
   {
     // Hidden layers still matter to later undo, even if the current native bytes are identical.
     m_SharedBufferPatches = patches;
@@ -1055,12 +1057,16 @@ rdcstr ReplayController::CommitSharedBufferPatches(const ReplayBufferPatchSet &p
     uint64_t bytes = 0;
     for(const ReplayBufferPatch &patch : next)
       bytes += patch.data.size();
+    uint64_t changedBytes = 0;
+    for(const ReplayBufferPatchRange &change : changes)
+      changedBytes += change.byteLength;
     const rdcstr line = StringFormat::Fmt(
         "api=ReplayController op=shared_buffer_patch event=%u ranges=%zu bytes=%llu "
         "first_affected_event=%u generation=%llu backend_commit_ms=%.3f replay_ms=%.3f "
-        "display_ms=%.3f total_ms=%.3f", m_EventID, next.size(), bytes, firstAffected,
+        "display_ms=%.3f total_ms=%.3f delta_known=%u changed_ranges=%zu changed_bytes=%llu",
+        m_EventID, next.size(), bytes, firstAffected,
         m_SharedBufferPatchGeneration, commitMS, replayEndMS - commitMS,
-        totalMS - replayEndMS, totalMS);
+        totalMS - replayEndMS, totalMS, deltaKnown ? 1U : 0U, changes.size(), changedBytes);
     RDCLOG("[EIDTiming] %s", line.c_str());
     AppendReplayTimingLog(line);
   }

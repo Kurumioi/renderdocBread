@@ -179,6 +179,7 @@
     <ClCompile Include="d3d11\d3d11_simple_dispatch.cpp" />
     <ClCompile Include="d3d11\d3d11_simple_triangle.cpp" />
     <ClCompile Include="d3d11\d3d11_shared_buffer.cpp" />
+    <ClCompile Include="d3d11\d3d11_buffer_delta.cpp" />
     <ClCompile Include="d3d11\d3d11_stream_out.cpp" />
     <ClCompile Include="d3d11\d3d11_stripped_shaders.cpp" />
     <ClCompile Include="d3d11\d3d11_structured_buffer_misaligned_dirty.cpp" />

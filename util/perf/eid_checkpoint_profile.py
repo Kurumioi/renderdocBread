@@ -252,7 +252,7 @@ def main():
     import renderdoc as rd
     # Record the actually loaded modules, not only an operator-supplied build label.
     # Import here because the shared-buffer probe also reuses our comparison helpers.
-    from eid_shared_buffer_profile import build_identity
+    from eid_shared_buffer_profile import build_identity, readback_replay_issues
     report["buildIdentity"] = build_identity(rd, None)
     capture_file, controller = None, None
     extra_textures = []
@@ -350,6 +350,9 @@ def main():
         if force:
             report["issues"].extend(force_bypass_issues(before, after))
         pixels, readback = recorder.measure(phase + ".nativeOutputHash", output_witness, event)
+        # A getter must not repair a stale native output after the measured EID request.
+        report["issues"].extend(phase + ".readback: " + issue for issue in
+                                readback_replay_issues(readback["timingRecords"]))
         after_readback = status()
         if int(pixels["eventId"]) != event:
             report["issues"].append("effective controller EID differs from requested EID " + str(event))

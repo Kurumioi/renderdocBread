@@ -214,7 +214,50 @@ class FixedController(Controller):
         return self.rendered[resource.value]
 
 
+class RepairingFixedController(FixedController):
+    """A getter silently redraws stale output and emits real-format native timing evidence."""
+    def __init__(self, stage, record):
+        self.repair_stage, self.repair_record, self.repair_pending = stage, record, False
+        self.repaired = False
+        super().__init__(stale_pixels=True)
+
+    def SetSharedBufferPatch(self, resource, offset, data):
+        result = super().SetSharedBufferPatch(resource, offset, data)
+        self.repair_pending = bytes(data).hex() in FIXED_VALUES.split(",")
+        return result
+
+    def repair(self, stage):
+        if self.repair_pending and stage == self.repair_stage:
+            self.repair_pending = False
+            self.render()
+            self.repaired = True
+            self.call_trace.append(("implicitReplay", stage))
+            with self.native_log_path.open("a", encoding="utf-8") as stream:
+                stream.write("[EIDTiming] " + " ".join("%s=%s" % item
+                                                      for item in self.repair_record.items()) + "\n")
+
+    def GetBufferData(self, resource, offset, count):
+        self.repair("buffer")
+        return super().GetBufferData(resource, offset, count)
+
+    def GetTextureData(self, resource, sub):
+        self.repair("output")
+        return super().GetTextureData(resource, sub)
+
+
 class SharedBufferProfileTests(unittest.TestCase):
+    def test_raw_readback_evidence_rejects_replay_without_requiring_aggregate_timings(self):
+        records = [{"api": "MaterializeEvent"}, {"api": "ReplayLog"}]
+        records += [{"api": api, "type": kind} for api, kind in
+                    (("D3D11", "WithoutDraw"), ("D3D12", "OnlyDraw"), ("OpenGL", "Full"),
+                     ("Vulkan", "WithoutDraw"), ("ReplayDriverBoundary", "OnlyDraw"),
+                     ("ReplayChunk", "Full"))]
+        self.assertEqual(len(probe.readback_replay_issues(records)), len(records))
+        self.assertFalse(probe.readback_replay_issues([
+            {"api": "RenderTexture", "type": "display"},
+            {"api": "D3D12", "op": "GetTextureData"},
+            {"api": "D3D12BufferPatch", "op": "set", "uploadReused": 1}]))
+
     def test_ranges_have_no_api_alignment_or_64k_assumption(self):
         self.assertEqual(probe.unsigned64("0x100000001"), 4294967297)
         self.assertEqual(probe.read_window(1 << 34, (1 << 33) + 3, 7, 16),
@@ -258,7 +301,8 @@ class SharedBufferProfileTests(unittest.TestCase):
         capture_file = SimpleNamespace(OpenFile=lambda *args: 0, DriverName=lambda: "D3D12",
                                        OpenCapture=lambda *args: (0, controller), Shutdown=lambda: None)
         rd = SimpleNamespace(InitialiseReplay=lambda *args: None, ShutdownReplay=lambda: None,
-                             SetDebugLogFile=lambda *args: None, OpenCaptureFile=lambda: capture_file,
+                             SetDebugLogFile=lambda path: setattr(controller, "native_log_path", Path(path)),
+                             OpenCaptureFile=lambda: capture_file,
                              GlobalEnvironment=lambda: None, ReplayOptions=lambda: None,
                              ResultCode=SimpleNamespace(Succeeded=0), ResourceId=Resource,
                              ActionFlags=SimpleNamespace(Drawcall=1),
@@ -367,6 +411,12 @@ class SharedBufferProfileTests(unittest.TestCase):
         self.assertEqual(fixed["steadyHitUpdates"], 2)
         self.assertTrue(fixed["fastVerified"])
         self.assertEqual(fixed["rows"][0]["checkpointEvidence"]["firstAffectedEvent"], 0)
+        trace = controller.call_trace
+        first_set = trace.index(("set", fixed["rows"][0]["valueHex"]))
+        first_reference = next(i for i in range(first_set + 1, len(trace)) if trace[i][0] == "replay")
+        live_sets = [item[1] for item in trace[first_set:first_reference] if item[0] == "set"]
+        # The final entry reinstalls value 1 only after all four live witnesses were saved.
+        self.assertEqual(live_sets, FIXED_VALUES.split(",") + [FIXED_VALUES.split(",")[0]])
         for row in fixed["rows"]:
             self.assertGreater(row["generationAfter"], row["generationBefore"])
             self.assertEqual(row["comparison"]["status"], "passed")
@@ -382,9 +432,41 @@ class SharedBufferProfileTests(unittest.TestCase):
             self.assertEqual(trace[end], ("replay", 20, True))
             for reference in row["forceReferenceVisits"]:
                 visit = report["visits"][reference]
-                self.assertEqual(visit["generation"], row["generationAfter"])
+                self.assertEqual(visit["generation"], row["referenceGeneration"])
+                self.assertGreater(row["referenceGeneration"], row["generationAfter"])
                 self.assertFalse(probe.unchanged_checkpoint_issues(visit["before"], visit["afterReadback"]))
         self.assertEqual(fixed["clearComparison"]["status"], "passed")
+
+    def test_correct_pixels_from_implicit_buffer_or_texture_repair_fail_before_references(self):
+        for stage, record in (("buffer", {"api": "MaterializeEvent", "eid": 20}),
+                              ("output", {"api": "D3D12", "type": "OnlyDraw"}),
+                              ("output", {"api": "ReplayDriverBoundary", "type": "Full"}),
+                              ("buffer", {"api": "ReplayChunk", "type": "WithoutDraw"})):
+            with self.subTest(stage=stage, record=record):
+                controller = RepairingFixedController(stage, record)
+                result, report = self.run_fake_probe(controller, ("--fixed-values-hex", FIXED_VALUES))
+                self.assertEqual(result, 1)
+                self.assertTrue(controller.repaired)
+                self.assertFalse(report["ok"])
+                self.assertIn("implicit replay", report["error"])
+                self.assertEqual(len(report["fixedValues"]["rows"]), 1)
+                self.assertFalse(any(row["mode"] == "fixedValues" and row["force"]
+                                     for row in report["visits"]))
+                records = [row for sample in report["samples"] for row in sample.get("timingRecords", [])]
+                self.assertTrue(probe.readback_replay_issues(records))
+
+    def test_fixed_clear_immediate_output_cannot_hide_behind_successful_force_undo(self):
+        class StaleClearController(FixedController):
+            def ClearSharedBufferPatches(self):
+                old, rendered = self.patch, dict(self.rendered)
+                result = super().ClearSharedBufferPatches()
+                if old and old[2].hex() in FIXED_VALUES.split(","):
+                    self.rendered[self.depth.value] = rendered[self.depth.value]
+                return result
+        result, report = self.run_fake_probe(StaleClearController(), ("--fixed-values-hex", FIXED_VALUES))
+        self.assertEqual(result, 1)
+        self.assertEqual(report["fixedValues"]["clearComparison"]["status"], "failedStableCanonicalMismatch")
+        self.assertFalse(report["fixedValues"]["fastVerified"])
 
     def test_fixed_wrong_pixels_are_not_repaired_by_good_force_references(self):
         result, report = self.run_fake_probe(FixedController(stale_pixels=True), ("--fixed-values-hex", FIXED_VALUES))

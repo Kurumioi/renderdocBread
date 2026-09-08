@@ -1937,7 +1937,19 @@ RDResult D3D11Replay::ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBu
 {
   InvalidateLiveForward();
   m_LiveForwardCaptureScanned = m_LiveForwardCaptureSafe = false;
-  return m_pDevice->ReadLogInitialisation(rdc, storeStructuredBuffers);
+  m_BufferPatchFirstConsumers.clear();
+  m_BufferPatchReadIndex.Clear();
+  m_BufferPatchReadRegistered.clear();
+  m_BufferPatchReadLastEvent = 0;
+  RDResult result = m_pDevice->ReadLogInitialisation(rdc, storeStructuredBuffers);
+  // This scope proves reads of ordinary constant buffers only, not writes or output dependencies.
+  // Every physical CB view is recorded without shader reflection, and copies conservatively read
+  // the entire source. Deferred contexts and arbitrary resource replacement are not range proofs.
+  if(m_BufferPatchReadLastEvent)
+    m_BufferPatchReadIndex.FinalizeReads(1, m_BufferPatchReadLastEvent,
+                                        result == ResultCode::Succeeded && !m_Proxy &&
+                                            m_pDevice->GetNumDeferredContexts() == 0);
+  return result;
 }
 
 void D3D11Replay::ConfigureReplayCheckpoints(
@@ -2403,7 +2415,8 @@ bool D3D11Replay::RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint)
   return success;
 }
 
-void D3D11Replay::RecordBufferPatchConsumer(ResourceId buffer, uint32_t eventId)
+void D3D11Replay::RecordBufferPatchConsumer(ResourceId buffer, uint32_t eventId,
+                                           uint64_t byteOffset, uint64_t byteLength)
 {
   // D3D11 wrappers retain their captured IDs; this manager has no separate live-ID namespace.
   if(buffer == ResourceId() || eventId == 0)
@@ -2413,6 +2426,32 @@ void D3D11Replay::RecordBufferPatchConsumer(ResourceId buffer, uint32_t eventId)
     m_BufferPatchFirstConsumers[buffer] = eventId;
   else
     previous->second = RDCMIN(previous->second, eventId);
+
+  D3D11ResourceManager *manager = m_pDevice->GetResourceManager();
+  ID3D11DeviceChild *resource = manager->GetResource(buffer, true);
+  if(!resource)
+  {
+    m_BufferPatchReadIndex.RecordUnknown(eventId);
+    return;
+  }
+  if(IdentifyTypeByPtr(resource) != Resource_Buffer)
+    return;
+  D3D11_BUFFER_DESC desc = {};
+  ((ID3D11Buffer *)UnwrapResource(resource))->GetDesc(&desc);
+  if(desc.BindFlags != D3D11_BIND_CONSTANT_BUFFER)
+    return;
+  const UINT shared = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                      D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_TILED |
+                      D3D11_RESOURCE_MISC_TILE_POOL;
+  if(m_BufferPatchReadRegistered.insert(buffer).second)
+    m_BufferPatchReadIndex.Register(buffer, 0, desc.ByteWidth, (desc.MiscFlags & shared) != 0);
+  m_BufferPatchReadLastEvent = RDCMAX(m_BufferPatchReadLastEvent, eventId);
+  // SetConstantBuffers1 exposes the intersection with the physical buffer; outside reads are
+  // zero. The default copy-source call uses the whole-buffer sentinel, never a reflected range.
+  if(byteOffset < desc.ByteWidth && byteLength)
+    m_BufferPatchReadIndex.RecordRead(
+        eventId, {buffer, 0, byteOffset, RDCMIN(byteLength, uint64_t(desc.ByteWidth) - byteOffset)},
+        true);
 }
 
 rdcstr D3D11Replay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
@@ -2429,7 +2468,9 @@ rdcstr D3D11Replay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &pa
   for(const ReplayBufferPatch &patch : patches)
   {
     ID3D11DeviceChild *wrapped = manager->GetResource(patch.buffer, true);
-    if(!wrapped || IdentifyTypeByPtr(wrapped) != Resource_Buffer || manager->HasReplacement(patch.buffer))
+    if(!wrapped || IdentifyTypeByPtr(wrapped) != Resource_Buffer ||
+       manager->HasReplacement(patch.buffer) ||
+       manager->GetUnreplacedID(patch.buffer) != patch.buffer)
       return "D3D11 persistent edit requires an original unreplaced buffer";
     D3D11_BUFFER_DESC desc = {};
     ((ID3D11Buffer *)UnwrapResource(wrapped))->GetDesc(&desc);
@@ -2478,7 +2519,7 @@ rdcstr D3D11Replay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &pa
     SAFE_RELEASE(scratch.second);
   m_BufferPatchScratch.swap(nextScratch);
 
-  bool valueOnly = !patches.empty() && patches.size() == m_BufferPatches.size();
+  const bool valueOnly = SameReplayBufferPatchLayout(m_BufferPatches, patches);
   uint32_t firstConsumer = ~0U;
   for(size_t i = 0; i < patches.size(); ++i)
   {
@@ -2488,12 +2529,38 @@ rdcstr D3D11Replay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &pa
       firstConsumer = 0;
     else
       firstConsumer = RDCMIN(firstConsumer, consumer->second);
-    if(valueOnly)
-      valueOnly = patches[i].buffer == m_BufferPatches[i].buffer &&
-                  patches[i].byteOffset == m_BufferPatches[i].byteOffset &&
-                  patches[i].data.size() == m_BufferPatches[i].data.size();
   }
-  m_BufferPatchFirstAffected = valueOnly && firstConsumer != ~0U ? firstConsumer : 0;
+  rdcarray<ReplayBufferPatchRange> changes;
+  const bool deltaKnown = GetReplayBufferPatchChanges(m_BufferPatches, patches, changes).empty();
+  const bool deltaEnabled =
+      Process::GetEnvVariable("RENDERDOC_REPLAY_DISABLE_BUFFER_PATCH_DELTA") != "1";
+  std::set<ResourceId> changedBuffers;
+  uint64_t changedBytes = 0;
+  uint32_t changedConsumer = ~0U;
+  bool rangeIndexKnown = false;
+  for(const ReplayBufferPatchRange &change : changes)
+  {
+    changedBytes += change.byteLength;
+    changedBuffers.insert(change.buffer);
+    auto consumer = m_BufferPatchFirstConsumers.find(change.buffer);
+    uint32_t first = consumer == m_BufferPatchFirstConsumers.end() ? 0U : consumer->second;
+    if(valueOnly && deltaEnabled && firstConsumer > 0 && firstConsumer != ~0U)
+    {
+      const ReplayResourceReadQuery read = m_BufferPatchReadIndex.FirstRead(
+          {change.buffer, 0, change.byteOffset, change.byteLength}, 1, m_BufferPatchReadLastEvent);
+      if(read.complete && read.found)
+      {
+        first = read.eventId;
+        rangeIndexKnown = true;
+      }
+    }
+    changedConsumer = RDCMIN(changedConsumer, first);
+  }
+  const uint32_t affected = valueOnly && deltaEnabled && deltaKnown && !changes.empty() &&
+                                   firstConsumer > 0 && firstConsumer != ~0U
+                               ? changedConsumer
+                               : firstConsumer;
+  m_BufferPatchFirstAffected = valueOnly && affected != ~0U ? affected : 0;
   m_BufferPatchAnchorEvent = firstConsumer > 1 && firstConsumer != ~0U ? firstConsumer - 1 : 0;
   m_BufferPatches = patches;
   InvalidateBufferPatchContents();
@@ -2509,6 +2576,18 @@ rdcstr D3D11Replay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &pa
   else
     InvalidateReplayCheckpoints();
   ClearPostVSCache();
+  if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+  {
+    const rdcstr line = StringFormat::Fmt(
+        "api=D3D11BufferPatch op=set firstAffected=%u firstConsumer=%u anchor=%u "
+        "deltaKnown=%u deltaEnabled=%u changedRanges=%zu changedBytes=%llu changedBuffers=%zu "
+        "rangeIndexKnown=%u retainedCheckpoints=%zu",
+        m_BufferPatchFirstAffected, firstConsumer, m_BufferPatchAnchorEvent, deltaKnown ? 1U : 0U,
+        deltaEnabled ? 1U : 0U, changes.size(), (unsigned long long)changedBytes,
+        changedBuffers.size(), rangeIndexKnown ? 1U : 0U, m_Checkpoints.size());
+    RDCLOG("[EIDTiming] %s", line.c_str());
+    AppendReplayTimingLog(line);
+  }
   return {};
 }
 
@@ -2527,7 +2606,8 @@ bool D3D11Replay::ApplyPendingBufferPatches()
   for(const auto &entry : m_BufferPatchScratch)
   {
     ID3D11DeviceChild *wrapped = manager->GetResource(entry.first, true);
-    if(!wrapped || IdentifyTypeByPtr(wrapped) != Resource_Buffer || manager->HasReplacement(entry.first))
+    if(!wrapped || IdentifyTypeByPtr(wrapped) != Resource_Buffer ||
+       manager->HasReplacement(entry.first) || manager->GetUnreplacedID(entry.first) != entry.first)
     {
       success = false;
       break;
@@ -4305,6 +4385,162 @@ void D3D11Replay::RestoreEventCBufferOverrides()
   }
 
   m_AppliedEventCBufferOverrides.clear();
+}
+
+static ShaderStage D3D11NativeShaderStage(ID3D11DeviceChild *resource)
+{
+  if(!resource)
+    return ShaderStage::Count;
+  if(WrappedID3D11Shader<ID3D11VertexShader>::IsAlloc(resource))
+    return ShaderStage::Vertex;
+  if(WrappedID3D11Shader<ID3D11HullShader>::IsAlloc(resource))
+    return ShaderStage::Hull;
+  if(WrappedID3D11Shader<ID3D11DomainShader>::IsAlloc(resource))
+    return ShaderStage::Domain;
+  if(WrappedID3D11Shader<ID3D11GeometryShader>::IsAlloc(resource))
+    return ShaderStage::Geometry;
+  if(WrappedID3D11Shader<ID3D11PixelShader>::IsAlloc(resource))
+    return ShaderStage::Pixel;
+  if(WrappedID3D11Shader<ID3D11ComputeShader>::IsAlloc(resource))
+    return ShaderStage::Compute;
+  return ShaderStage::Count;
+}
+
+// BuildTargetShader creates an ordinary shader with no class linkage or SO declaration. Check
+// the captured creation call, rather than inferring absence of those structures from reflection.
+static bool D3D11CheckedShaderCreationMatches(const SDChunk &chunk, ResourceId shader,
+                                              ShaderStage stage)
+{
+  D3D11Chunk expected;
+  switch(stage)
+  {
+    case ShaderStage::Vertex: expected = D3D11Chunk::CreateVertexShader; break;
+    case ShaderStage::Hull: expected = D3D11Chunk::CreateHullShader; break;
+    case ShaderStage::Domain: expected = D3D11Chunk::CreateDomainShader; break;
+    case ShaderStage::Geometry: expected = D3D11Chunk::CreateGeometryShader; break;
+    case ShaderStage::Pixel: expected = D3D11Chunk::CreatePixelShader; break;
+    case ShaderStage::Compute: expected = D3D11Chunk::CreateComputeShader; break;
+    default: return false;
+  }
+  const SDObject *created = chunk.FindChild("pShader");
+  const SDObject *linkage = chunk.FindChild("pClassLinkage");
+  return D3D11Chunk(chunk.metadata.chunkID) == expected && created && created->IsResource() &&
+         created->AsResourceId() == shader && linkage && linkage->IsResource() &&
+         linkage->AsResourceId() == ResourceId();
+}
+
+rdcstr D3D11Replay::ReplaceTargetShaderChecked(ResourceId from, ResourceId to)
+{
+  D3D11ResourceManager *rm = m_pDevice->GetResourceManager();
+  if(from == ResourceId() || to == ResourceId() || from == to)
+    return "Checked D3D11 replacement requires distinct non-null shader resources";
+  if(m_Proxy || rm->GetUnreplacedID(from) != from || ResourceIDGen::IsReplayOnlyID(from))
+    return "The original D3D11 shader must be the canonical captured ResourceId";
+  if(!m_AppliedEventShaderOverrides.empty() || !m_AppliedEventCBufferOverrides.empty() ||
+     m_RealState.active)
+    return "Temporary D3D11 event overrides must be restored before replacing a shared shader";
+
+  auto capturedEntry = WrappedShader::m_ShaderList.find(from);
+  auto targetEntry = WrappedShader::m_ShaderList.find(to);
+  ID3D11DeviceChild *captured = rm->GetResourceWithoutReplacement(from, true);
+  ID3D11DeviceChild *target = rm->GetResourceWithoutReplacement(to, true);
+  if(capturedEntry == WrappedShader::m_ShaderList.end() ||
+     targetEntry == WrappedShader::m_ShaderList.end() || !captured || !target ||
+     GetIDForDeviceChild(captured) != from || GetIDForDeviceChild(target) != to)
+    return "The original or target D3D11 shader object is not live at its exact resource identity";
+  const ShaderStage stage = D3D11NativeShaderStage(captured);
+  if(stage == ShaderStage::Count || D3D11NativeShaderStage(target) != stage ||
+     capturedEntry->second->GetDetails().stage != stage ||
+     targetEntry->second->GetDetails().stage != stage)
+    return "The target D3D11 shader stage does not match the captured native shader stage";
+
+  const auto resource = m_ResourceIdx.find(from);
+  SDFile *file = GetStructuredFile();
+  if(resource == m_ResourceIdx.end() || resource->second >= m_Resources.size() || !file)
+    return "The captured D3D11 shader creation evidence is unavailable";
+  bool ordinaryCreation = false;
+  for(uint32_t chunkIndex : m_Resources[resource->second].initialisationChunks)
+  {
+    if(chunkIndex >= file->chunks.size() || !file->chunks[chunkIndex])
+      return "The captured D3D11 shader creation evidence is incomplete";
+    ordinaryCreation |= D3D11CheckedShaderCreationMatches(*file->chunks[chunkIndex], from, stage);
+  }
+  if(!ordinaryCreation || !capturedEntry->second->GetDetails().interfaces.empty() ||
+     !targetEntry->second->GetDetails().interfaces.empty())
+    return "Checked D3D11 replacement requires an ordinary shader without class linkage or stream "
+           "output";
+  // Vendor UAV setup affects native creation, and cannot be recreated by changing cached DXBC
+  // metadata after BuildTargetShader. Keep this transaction fail-closed for that separate route.
+  if(capturedEntry->second->GetShaderExtSlot() != ~0U ||
+     targetEntry->second->GetShaderExtSlot() != ~0U)
+    return "Checked D3D11 vendor-extension shader replacement requires native extension creation "
+           "support";
+
+  const bool hadPrevious = rm->HasReplacement(from);
+  ID3D11DeviceChild *previous = rm->GetResource(from, true);
+  if(!previous || D3D11NativeShaderStage(previous) != stage)
+    return "The active D3D11 replacement is not a live shader of the captured stage";
+  const ResourceId previousId = GetIDForDeviceChild(previous);
+  if(hadPrevious ? (previousId == from || rm->GetUnreplacedID(previousId) != from)
+                 : previousId != from)
+    return "The captured D3D11 shader has an invalid replacement ownership mapping";
+  if(rm->HasReplacement(to))
+    return "The target D3D11 shader is itself a resource replacement key";
+  if(hadPrevious && previousId == to)
+    return {};
+  if(rm->GetUnreplacedID(to) != to)
+    return "The target D3D11 shader is already owned by another replacement";
+
+  // D3D11 binds shader objects directly: there is no derived PSO to recreate. The workbench's
+  // full ABI gate remains separate; this native transaction proves identity, stage and creation
+  // structure. Do not delegate to the unchecked ReplaceResource entry point.
+  if(hadPrevious)
+    rm->RemoveReplacement(from);
+  rm->ReplaceResource(from, to);
+  if(!rm->HasReplacement(from) || rm->GetResource(from, true) != target ||
+     rm->GetUnreplacedID(to) != from)
+  {
+    rm->RemoveReplacement(from);
+    if(hadPrevious)
+      rm->ReplaceResource(from, previousId);
+    return "Installing the checked D3D11 shader mapping failed; the previous mapping was restored";
+  }
+  InvalidateReplayCheckpoints(0);
+  ClearPostVSCache();
+  return {};
+}
+
+rdcstr D3D11Replay::RemoveTargetShaderReplacementChecked(ResourceId id)
+{
+  D3D11ResourceManager *rm = m_pDevice->GetResourceManager();
+  if(id == ResourceId() || rm->GetUnreplacedID(id) != id || ResourceIDGen::IsReplayOnlyID(id))
+    return "The D3D11 shader to restore must be the canonical captured ResourceId";
+  if(!m_AppliedEventShaderOverrides.empty() || !m_AppliedEventCBufferOverrides.empty() ||
+     m_RealState.active)
+    return "Temporary D3D11 event overrides must be restored before restoring a shared shader";
+  ID3D11DeviceChild *captured = rm->GetResourceWithoutReplacement(id, true);
+  if(!captured || GetIDForDeviceChild(captured) != id ||
+     D3D11NativeShaderStage(captured) == ShaderStage::Count ||
+     WrappedShader::m_ShaderList.find(id) == WrappedShader::m_ShaderList.end())
+    return "Checked D3D11 shader restoration requires a live captured shader object";
+  if(!rm->HasReplacement(id))
+    return {};
+  ID3D11DeviceChild *previous = rm->GetResource(id, true);
+  if(!previous || D3D11NativeShaderStage(previous) != D3D11NativeShaderStage(captured))
+    return "The active D3D11 replacement is not a live shader of the captured stage";
+  const ResourceId previousId = GetIDForDeviceChild(previous);
+  if(previousId == id || rm->GetUnreplacedID(previousId) != id)
+    return "The captured D3D11 shader has an invalid replacement ownership mapping";
+
+  rm->RemoveReplacement(id);
+  if(rm->HasReplacement(id) || rm->GetResource(id, true) != captured)
+  {
+    rm->ReplaceResource(id, previousId);
+    return "Restoring the captured D3D11 shader mapping failed; the previous mapping was restored";
+  }
+  InvalidateReplayCheckpoints(0);
+  ClearPostVSCache();
+  return {};
 }
 
 void D3D11Replay::ReplaceResource(ResourceId from, ResourceId to)
@@ -6372,6 +6608,42 @@ TEST_CASE("D3D11 checkpoint versions include CPU writes and use AFTER-event boun
   CHECK(CheckpointLastWrite(writes, 9) == 9);
   CHECK(CheckpointLastWrite(writes, 18) == 17);
 }
+TEST_CASE("D3D11 checked shader replacement requires exact ordinary creation evidence",
+          "[d3d11][shader][checked-replacement]")
+{
+  const ResourceId shader = ResourceIDGen::GetNewUniqueID();
+  const ResourceId other = ResourceIDGen::GetNewUniqueID();
+  const D3D11Chunk creations[] = {D3D11Chunk::CreateVertexShader, D3D11Chunk::CreateHullShader,
+                                  D3D11Chunk::CreateDomainShader, D3D11Chunk::CreateGeometryShader,
+                                  D3D11Chunk::CreatePixelShader,  D3D11Chunk::CreateComputeShader};
+  for(size_t i = 0; i < ARRAY_COUNT(creations); i++)
+  {
+    SDChunk chunk("shader creation"_lit);
+    chunk.metadata.chunkID = uint32_t(creations[i]);
+    chunk.AddAndOwnChild(makeSDResourceId("pShader"_lit, shader));
+    SDObject *linkage = chunk.AddAndOwnChild(makeSDResourceId("pClassLinkage"_lit, ResourceId()));
+    CHECK(D3D11CheckedShaderCreationMatches(chunk, shader, ShaderStage(i)));
+    CHECK_FALSE(D3D11CheckedShaderCreationMatches(chunk, other, ShaderStage(i)));
+    CHECK_FALSE(D3D11CheckedShaderCreationMatches(chunk, shader, ShaderStage((i + 1) % 6)));
+    CHECK_FALSE(D3D11CheckedShaderCreationMatches(chunk, shader, ShaderStage::Mesh));
+    linkage->data.basic.id = other;
+    CHECK_FALSE(D3D11CheckedShaderCreationMatches(chunk, shader, ShaderStage(i)));
+    linkage->data.basic.id = ResourceId();
+    linkage->type.basetype = SDBasic::UnsignedInteger;
+    CHECK_FALSE(D3D11CheckedShaderCreationMatches(chunk, shader, ShaderStage(i)));
+  }
+  SDChunk streamOutput("stream output shader"_lit);
+  streamOutput.metadata.chunkID = uint32_t(D3D11Chunk::CreateGeometryShaderWithStreamOutput);
+  streamOutput.AddAndOwnChild(makeSDResourceId("pShader"_lit, shader));
+  streamOutput.AddAndOwnChild(makeSDResourceId("pClassLinkage"_lit, ResourceId()));
+  CHECK_FALSE(D3D11CheckedShaderCreationMatches(streamOutput, shader, ShaderStage::Geometry));
+  SDChunk missing("incomplete shader creation"_lit);
+  missing.metadata.chunkID = uint32_t(D3D11Chunk::CreatePixelShader);
+  missing.AddAndOwnChild(makeSDResourceId("pShader"_lit, shader));
+  CHECK_FALSE(D3D11CheckedShaderCreationMatches(missing, shader, ShaderStage::Pixel));
+  CHECK(D3D11NativeShaderStage(NULL) == ShaderStage::Count);
+}
+
 TEST_CASE("D3D11 event CBuffer shadows bind legal 256-byte ranges", "[d3d11][cbuffer]")
 {
   CHECK(EventCBufferShadowConstants(16) == 16);

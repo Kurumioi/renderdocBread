@@ -7350,6 +7350,49 @@ TEST_CASE("Vulkan shared edits use submitted first reads and preserve exact rang
   CHECK(VulkanReplayPatchValueCutoff({patch}, {patch}, {}, reason) == 0);
 }
 
+TEST_CASE("Vulkan value deltas retain prefixes before unchanged parameter consumers",
+          "[vulkan][bufferpatch]")
+{
+  ReplayBufferPatch early;
+  early.buffer = ResourceIDGen::GetNewUniqueID();
+  early.byteOffset = 16;
+  early.data = {1, 2, 3, 4};
+  ReplayBufferPatch late = early;
+  late.buffer = ResourceIDGen::GetNewUniqueID();
+  ReplayBufferPatch changed = late;
+  changed.data[2] = 9;
+  const rdcarray<ReplayBufferPatch> previous = {early, late};
+  const rdcarray<ReplayBufferPatch> next = {early, changed};
+  std::map<ResourceId, uint32_t> reads = {{early.buffer, 17}, {late.buffer, 103}};
+  rdcarray<ReplayBufferPatchRange> changes;
+  REQUIRE(GetReplayBufferPatchChanges(previous, next, changes).empty());
+  REQUIRE(changes.size() == 1);
+  CHECK(changes[0].byteLength == 1);
+  rdcstr reason;
+  CHECK(VulkanReplayPatchValueCutoff(previous, next, reads, reason, &changes) == 103);
+  CHECK(reason == "changedBuffersPotentialUniformAndCopyReads");
+  // The A/B control and the independently computed full-table anchor keep the original cutoff.
+  CHECK(VulkanReplayPatchValueCutoff(previous, next, reads, reason) == 17);
+  CHECK(VulkanReplayPatchValueCutoff(next, next, reads, reason) == 17);
+  // Incomplete native descriptor evidence (including inputs a replacement shader may read)
+  // keeps the old fail-closed result, even for a buffer whose overlay bytes did not change.
+  CHECK(VulkanReplayPatchValueCutoff(previous, next, {{late.buffer, 103}}, reason, &changes) == 0);
+  CHECK(VulkanReplayPatchValueCutoff(previous, next, {{early.buffer, 17}}, reason, &changes) == 0);
+  CHECK(VulkanReplayPatchValueCutoff(previous, {}, reads, reason, &changes) == 0);
+  changed.byteOffset++;
+  CHECK(VulkanReplayPatchValueCutoff(previous, {early, changed}, reads, reason, &changes) == 0);
+  CHECK_FALSE(GetReplayBufferPatchChanges(previous, next, changes, 0).empty());
+  CHECK(changes.empty());
+  CHECK(VulkanReplayPatchValueCutoff(previous, next, reads, reason) == 17);
+
+  late = early;
+  late.byteOffset = 32;
+  changed = late;
+  changed.data[0] = 9;
+  REQUIRE(GetReplayBufferPatchChanges({early, late}, {early, changed}, changes).empty());
+  CHECK(VulkanReplayPatchValueCutoff({early, late}, {early, changed}, reads, reason, &changes) == 17);
+}
+
 TEST_CASE("Vulkan live forward requires an ordinary prefix and its matching successful target",
           "[vulkan][replay][liveforward]")
 {

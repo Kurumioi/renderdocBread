@@ -145,6 +145,30 @@ struct ReplayBufferPatch
 DECLARE_REFLECTION_STRUCT(ReplayBufferPatch);
 
 rdcstr ValidateReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches);
+
+// A half-open byte range in original captured buffer storage, independent of API binding slots.
+struct ReplayBufferPatchRange
+{
+  ResourceId buffer;
+  uint64_t byteOffset = 0;
+  uint64_t byteLength = 0;
+};
+
+// Layout compatibility is intentionally false for empty or invalid configurations. It does not
+// compare values, and split/merged representations of the same coverage have different layouts.
+bool SameReplayBufferPatchLayout(const rdcarray<ReplayBufferPatch> &previous,
+                                 const rdcarray<ReplayBufferPatch> &next);
+
+// Compare validated, sorted, non-overlapping configurations by absolute byte address. An added or
+// removed override is a change even when its value might equal the unknown original captured byte.
+// Adjacent changed bytes are merged; equal bytes are excluded even across different patch layouts.
+// Invalid input or excessive fragmentation returns an error and clears changes. Callers must then
+// conservatively invalidate, not treat an empty result as proof of no changes or reject the edit.
+rdcstr GetReplayBufferPatchChanges(const rdcarray<ReplayBufferPatch> &previous,
+                                   const rdcarray<ReplayBufferPatch> &next,
+                                   rdcarray<ReplayBufferPatchRange> &changes,
+                                   uint32_t maxRanges = 4096);
+
 void ApplyReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches, ResourceId buffer,
                               uint64_t byteOffset, void *data, uint64_t byteLength);
 

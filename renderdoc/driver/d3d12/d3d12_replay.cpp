@@ -4295,8 +4295,11 @@ rdcstr D3D12Replay::SetEventCBufferOverride(
   {
     // The previous OnlyDraw submission may still reference this upload buffer. Restore() only
     // repairs CPU render state; it is not a GPU fence.
-    if(configured.shadow != NULL)
-      m_pDevice->DeviceWaitForIdle();
+    if(configured.shadow != NULL && !m_pDevice->DeviceWaitForIdle())
+    {
+      SAFE_RELEASE(newShadow);
+      return "GPU completion could not be confirmed before retiring the D3D12 event CBuffer shadow";
+    }
     SAFE_RELEASE(configured.shadow);
     configured.shadow = newShadow;
   }
@@ -4330,7 +4333,8 @@ void D3D12Replay::ClearEventCBufferOverride(uint32_t eventId, ShaderStage stage,
 
   // ExecuteLists for the preceding OnlyDraw is asynchronous. Fence before releasing either its
   // upload buffer or the cloned shader-visible heap it may still have bound.
-  m_pDevice->DeviceWaitForIdle();
+  if(!m_pDevice->DeviceWaitForIdle())
+    return;
   SAFE_RELEASE(it->second.shadow);
   m_EventCBufferOverrides.erase(it);
   ReleaseEventCBufferShadowHeaps();
@@ -4341,8 +4345,9 @@ void D3D12Replay::ClearEventCBufferOverride(uint32_t eventId, ShaderStage stage,
 void D3D12Replay::ClearEventCBufferOverrides()
 {
   RestoreEventCBufferOverrides();
-  if(!m_EventCBufferOverrides.empty() || !m_EventCBufferShadowHeaps.empty())
-    m_pDevice->DeviceWaitForIdle();
+  if((!m_EventCBufferOverrides.empty() || !m_EventCBufferShadowHeaps.empty()) &&
+     !m_pDevice->DeviceWaitForIdle())
+    return;
   for(auto it = m_EventCBufferOverrides.begin(); it != m_EventCBufferOverrides.end(); ++it)
     SAFE_RELEASE(it->second.shadow);
   m_EventCBufferOverrides.clear();
@@ -4461,7 +4466,8 @@ rdcstr D3D12Replay::ApplyEventCBufferOverrides(uint32_t eventId)
   //
   // Shadows are deliberately reused between slider revisions. The previous OnlyDraw submission
   // is asynchronous, so fence it before overwriting upload memory or cloned heap descriptors.
-  m_pDevice->DeviceWaitForIdle();
+  if(!m_pDevice->DeviceWaitForIdle())
+    return "GPU completion could not be confirmed before updating D3D12 event CBuffer shadows";
   for(const auto &item : pending)
   {
     ID3D12Resource *realShadow = Unwrap(item.second->shadow);
@@ -5099,8 +5105,20 @@ rdcstr D3D12Replay::RefreshDerivedReplacementsChecked(ResourceId requiredShader)
 
   // Nothing above changed a mapping. Commit only after every required PSO and root signature has
   // succeeded, then retire old derived PSOs after the device is idle.
-  m_pDevice->DeviceWaitForIdle();
+  if(!m_pDevice->DeviceWaitForIdle())
+  {
+    for(PendingPipeline &created : pending)
+      SAFE_RELEASE(created.replacement);
+    return "GPU completion could not be confirmed before installing replacement D3D12 pipelines";
+  }
   m_pDevice->InvalidatePreparedReplayCache();
+
+  if(m_pDevice->HasFatalError())
+  {
+    for(PendingPipeline &created : pending)
+      SAFE_RELEASE(created.replacement);
+    return "D3D12 pipeline cache retirement failed before replacement mappings could be installed";
+  }
 
   for(PendingPipeline &item : pending)
   {
@@ -5124,7 +5142,11 @@ void D3D12Replay::GetTextureData(ResourceId tex, const Subresource &sub,
   bool wasms = false;
   bool resolve = params.resolve;
 
-  m_pDevice->ReplayWorkWaitForIdle();
+  if(!m_pDevice->ReplayWorkWaitForIdle())
+  {
+    data.clear();
+    return;
+  }
 
   ID3D12Resource *resource = NULL;
 

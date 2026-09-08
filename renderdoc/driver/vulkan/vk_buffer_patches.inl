@@ -101,9 +101,10 @@ void WrappedVulkan::RecordReplayPatchSubmittedReads(const VulkanActionTreeNode &
 static uint32_t VulkanReplayPatchValueCutoff(const rdcarray<ReplayBufferPatch> &previous,
                                            const rdcarray<ReplayBufferPatch> &next,
                                            const std::map<ResourceId, uint32_t> &firstReads,
-                                           rdcstr &reason)
+                                           rdcstr &reason,
+                                           const rdcarray<ReplayBufferPatchRange> *changes = NULL)
 {
-  if(next.empty() || previous.size() != next.size())
+  if(!SameReplayBufferPatchLayout(previous, next))
   {
     reason = "patchLayoutChanged";
     return 0;
@@ -111,12 +112,6 @@ static uint32_t VulkanReplayPatchValueCutoff(const rdcarray<ReplayBufferPatch> &
   uint32_t first = ~0U;
   for(size_t i = 0; i < next.size(); ++i)
   {
-    if(previous[i].buffer != next[i].buffer || previous[i].byteOffset != next[i].byteOffset ||
-       previous[i].data.size() != next[i].data.size())
-    {
-      reason = "patchLayoutChanged";
-      return 0;
-    }
     auto use = firstReads.find(next[i].buffer);
     if(use == firstReads.end() || use->second == 0)
     {
@@ -126,6 +121,25 @@ static uint32_t VulkanReplayPatchValueCutoff(const rdcarray<ReplayBufferPatch> &
     first = RDCMIN(first, use->second);
   }
   reason = "sameRangesPotentialUniformAndCopyReads";
+  // Descriptor evidence covers all potentially bound uniform inputs, including ones unused by
+  // the original shader. Keep every full-table proof above, and narrow only to changed buffer
+  // identities: the current index cannot distinguish two byte offsets in the same buffer.
+  if(changes && !changes->empty())
+  {
+    uint32_t changedFirst = ~0U;
+    for(const ReplayBufferPatchRange &change : *changes)
+    {
+      auto use = firstReads.find(change.buffer);
+      if(use == firstReads.end() || use->second == 0)
+      {
+        reason = "missingChangedBufferConsumer";
+        return 0;
+      }
+      changedFirst = RDCMIN(changedFirst, use->second);
+    }
+    reason = "changedBuffersPotentialUniformAndCopyReads";
+    return changedFirst;
+  }
   return first;
 }
 
@@ -335,6 +349,22 @@ rdcstr WrappedVulkan::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &
       return "Vulkan persistent buffer patch upload exceeds 128 MiB";
   }
 
+  rdcarray<ReplayBufferPatch> previous;
+  for(const ReplayPatchUpload *patch : m_ReplayBufferPatches)
+    previous.push_back(patch->patch);
+  rdcarray<ReplayBufferPatchRange> changes;
+  const bool deltaKnown = GetReplayBufferPatchChanges(previous, patches, changes).empty();
+  const bool deltaEnabled =
+      Process::GetEnvVariable("RENDERDOC_REPLAY_DISABLE_BUFFER_PATCH_DELTA") != "1";
+  uint64_t changedBytes = 0;
+  std::set<ResourceId> changedBuffers;
+  if(deltaKnown)
+    for(const ReplayBufferPatchRange &change : changes)
+    {
+      changedBytes += change.byteLength;
+      changedBuffers.insert(change.buffer);
+    }
+
   rdcarray<ReplayPatchUpload *> uploads;
   for(const ReplayBufferPatch &patch : patches)
   {
@@ -372,12 +402,10 @@ rdcstr WrappedVulkan::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &
     }
     return "Vulkan replay failed while draining the previous buffer patch generation";
   }
-  rdcarray<ReplayBufferPatch> previous;
-  for(const ReplayPatchUpload *patch : m_ReplayBufferPatches)
-    previous.push_back(patch->patch);
   rdcstr cutoffReason, anchorReason;
   uint32_t cutoff = VulkanReplayPatchValueCutoff(previous, patches, m_ReplayPatchFirstReads,
-                                                cutoffReason);
+                                                cutoffReason,
+                                                deltaKnown && deltaEnabled ? &changes : NULL);
   uint32_t firstRead = VulkanReplayPatchValueCutoff(patches, patches, m_ReplayPatchFirstReads,
                                                    anchorReason);
   // The checkpoint capture envelope excludes frame descriptor mutations/secondary submissions.
@@ -403,8 +431,17 @@ rdcstr WrappedVulkan::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &
   DestroyReplayBufferPatches();
   m_ReplayBufferPatches.swap(uploads);
   m_ReplayBufferMemoryPatches.swap(memoryPatches);
-  RDCLOG("Vulkan shared buffer patch commit ranges=%zu firstAffected=%u anchor=%u reason=%s",
-         patches.size(), cutoff, anchor, cutoffReason.c_str());
+  if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+  {
+    const rdcstr line = StringFormat::Fmt(
+        "api=VulkanBufferPatch op=set ranges=%zu firstAffected=%u anchor=%u reason=%s "
+        "deltaKnown=%u deltaEnabled=%u changedRanges=%zu changedBytes=%llu changedBuffers=%zu",
+        patches.size(), cutoff, anchor, cutoffReason.c_str(), deltaKnown ? 1U : 0U,
+        deltaEnabled ? 1U : 0U, deltaKnown ? changes.size() : 0,
+        (unsigned long long)changedBytes, changedBuffers.size());
+    RDCLOG("[EIDTiming] %s", line.c_str());
+    AppendReplayTimingLog(line);
+  }
   return rdcstr();
 }
 

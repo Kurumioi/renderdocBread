@@ -1346,12 +1346,12 @@ public:
   void MarkListExecuted(ID3D12GraphicsCommandListX *list);
   void ExecuteLists(WrappedID3D12CommandQueue *queue = NULL, bool InFrameCaptureBoundary = false,
                     bool descriptorIndependent = false);
-  void FlushLists(bool forceSync = false);
+  bool FlushLists(bool forceSync = false);
 
-  void DataUploadSync(ID3D12CommandQueue *targetQueue);
+  bool DataUploadSync(ID3D12CommandQueue *targetQueue);
 
   // Sync a single queue, by submitting the fence then waiting on it
-  void QueueWaitForIdle(ID3D12CommandQueue *queue, ID3D12Fence *fence);
+  bool QueueWaitForIdle(ID3D12CommandQueue *queue, ID3D12Fence *fence);
   // Preserve RenderDoc's conservative total ordering when replay switches captured queues, but do
   // it with a GPU-side signal/wait hand-off instead of stalling the replay thread on every switch.
   bool ReplayQueueSync(ResourceId previousQueue, ID3D12CommandQueue *nextQueue);
@@ -1364,12 +1364,12 @@ public:
   void ReplayQueueWaitForPreviousWork(ID3D12CommandQueue *queue);
   // Sync to the internal queue - used to ensure any internal work has finished (e.g. FlushLists() above)
   // or generally any internal command buffers submitted to the GetQueue() main internal queue.
-  void InternalQueueWaitForIdle();
+  bool InternalQueueWaitForIdle();
   // Sync all queues - this always flushes the entire GPU
-  void DeviceWaitForIdle();
+  bool DeviceWaitForIdle();
   // Sync all queues but only once after each replay or internal work submit. used when fetching data
   // or after a replay to ensure work completes on all captured queues before doing any analysis work
-  void ReplayWorkWaitForIdle();
+  bool ReplayWorkWaitForIdle();
   void MarkReplayWorkSubmitted(bool consumesCapturedDescriptors = true)
   {
     m_WaitedForIdleAfterReplay = false;

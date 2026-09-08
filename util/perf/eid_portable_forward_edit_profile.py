@@ -4,7 +4,10 @@ Main opens only the named capture and uses the GPU. Coordinate GPU ownership bef
 Two values are first applied consecutively at one EID, with immediate native witnesses and no
 intervening SetFrameEvent. Each identical value configuration then gets navigation, real-hit
 requirements, and independent forced references at every shared draw. Undo must recover baseline.
-An optional supplied shader source uses the checked ABI transaction; no shader is fabricated.
+An optional supplied fixture shader uses the checked native replacement transaction. This proves
+native identity/pipeline acceptance, not the Shader Workbench's separate complete ABI validation.
+While that replacement remains installed, both live values and their undo are tested again against
+independent shader-only references before the replacement itself is removed.
 """
 from __future__ import print_function
 
@@ -111,6 +114,15 @@ def navigation(events):
             ("backwardDA2", a), ("AC", c), ("CD", d)]
 
 
+def readback_replay_issues(records):
+    """A correct final image is insufficient if the witness getter repaired stale replay state."""
+    native = {"D3D11", "D3D12", "OpenGL", "Vulkan", "ReplayDriverBoundary", "ReplayChunk"}
+    return ["Resource readback performed implicit replay: api=%s type=%s" %
+            (row.get("api"), row.get("type", "materialize")) for row in records
+            if row.get("api") in ("MaterializeEvent", "ReplayLog") or
+            (row.get("api") in native and "type" in row)]
+
+
 class EditProbe:
     def __init__(self, controller, rd, recorder, report, api, events, requests, resources, probes,
                  buffer, offset, window, maximum, disabled, min_hits):
@@ -140,6 +152,9 @@ class EditProbe:
             return {"buffer": byte_witness(raw, relative, 16), "output": complete_witness(
                 controller, rd, self.requests, self.resources, self.probes, self.maximum - count)}
         value, timing = self.recorder.measure(label + ".readback", witness, event)
+        implicit_replay = readback_replay_issues(timing["timingRecords"])
+        if implicit_replay:
+            raise RuntimeError("; ".join(implicit_replay))
         if (int(controller.GetCurrentEventID()) != event or value["output"]["eventId"] != event or
                 int(controller.GetSharedBufferPatchGeneration()) != self.generation):
             raise RuntimeError("Readback exposed a stale EID or changed patch generation")
@@ -208,6 +223,137 @@ class EditProbe:
         self.report["phases"].append(result)
         self.recorder.publish()
         return references
+
+
+def stable_configuration(references, events):
+    if set(references) != set(events):
+        raise RuntimeError("Every shared consumer needs its own complete configuration references")
+    baseline = {}
+    for event in events:
+        pair = references[event]
+        if (len(pair) != 2 or pair[0] != pair[1] or
+                pair[0]["output"]["eventId"] != event or not pair[0]["output"]["pixels"]):
+            raise RuntimeError("Missing or unstable complete configuration references at EID%d" % event)
+        buffer = pair[0].get("buffer", {})
+        if (buffer.get("patchBytes") != 16 or type(buffer.get("bytes")) is not int or
+                buffer["bytes"] < 16 or not isinstance(buffer.get("patchHex"), str) or
+                len(bytes.fromhex(buffer["patchHex"])) != 16):
+            raise RuntimeError("Configuration reference lacks the complete shared float4 bytes")
+        baseline[event] = pair[0]
+    return baseline
+
+
+def validate_shader_with_buffer(run, values, shader_only_references):
+    """The caller has committed a checked replacement and keeps it installed throughout this test."""
+    report = run.report
+    report["shaderWithBufferAcceptance"] = "failedOrIncomplete"
+    issue_start = len(report["issues"])
+    if len(values) != 2 or values[0] == values[1]:
+        raise RuntimeError("Shader/shared-buffer combination requires two distinct live values")
+    shader_only = stable_configuration(shader_only_references, run.events)
+    original_baseline = run.baseline
+    report["shaderWithBuffer"] = {"fixedEvent": run.events[1], "shaderOnlyBaseline": shader_only,
+                                 "phaseLabels": [], "immediatePairDifferent": False,
+                                 "patchUndoCompletedWithReplacementInstalled": False}
+    try:
+        # Compare against the replacement's own output: a shader that ignores this CBuffer must
+        # not pass merely because replacing the shader already changed the original image.
+        run.baseline = shader_only
+        immediate = [run.change("shaderWithBuffer.sliderValue%d" % (index + 1), value)
+                     for index, value in enumerate(values)]
+        different = immediate[0]["output"]["pixels"] != immediate[1]["output"]["pixels"]
+        report["shaderWithBuffer"]["immediatePairDifferent"] = different
+        if not different:
+            run.issue("shaderWithBuffer", ["Consecutive shared values did not immediately change replacement-shader output"])
+
+        # Only now may navigation and canonical references run; neither can repair an already
+        # saved stale immediate witness. Each phase also tests every shared consumer's own region.
+        for index, value in enumerate(values):
+            label = "shaderWithBuffer.value%d" % (index + 1)
+            run.change(label + ".installForReference", value)
+            references = run.phase(label, value, immediate[index])
+            stable_configuration(references, run.events)
+            report["shaderWithBuffer"]["phaseLabels"].append(label)
+        undo = run.change("shaderWithBuffer.patchUndo", None)
+        label = "shaderWithBuffer.patchUndone"
+        references = run.phase(label, None, undo, original=True)
+        restored = stable_configuration(references, run.events)
+        if restored != shader_only:
+            run.issue(label, ["Shared patch undo did not restore the saved shader-only bytes and full outputs"])
+        report["shaderWithBuffer"]["phaseLabels"].append(label)
+        report["shaderWithBuffer"]["patchUndoCompletedWithReplacementInstalled"] = True
+        if len(report["issues"]) == issue_start:
+            report["shaderWithBufferAcceptance"] = "passedReplacementShaderWithSharedBufferAndUndo"
+    finally:
+        run.baseline = original_baseline
+        run.recorder.publish()
+
+
+def shader_rejection_issues(error, before, after, expected, observed):
+    issues = []
+    if not isinstance(error, str) or not error.strip():
+        issues.append("The wrong-stage shader replacement did not return a rejection diagnostic")
+    for field in ("eventId", "sharedBufferGeneration", "shaderGeneration", "pixelShader"):
+        if field not in before or field not in after or before[field] != after[field]:
+            issues.append("Rejected shader replacement changed " + field)
+    if observed != expected:
+        issues.append("Rejected shader replacement changed the accepted shader's complete buffer/output witness")
+    return issues
+
+
+def validate_d3d11_shader_rejection(run, original_shader, shader_only_references, temporary_targets):
+    """Reject a generated CS while the accepted PS remains installed; never replay to repair it."""
+    report, controller, rd = run.report, run.controller, run.rd
+    if run.api != "D3D11":
+        report["shaderRejectionAcceptance"] = "notRequestedNotTested"
+        return
+    report["shaderRejectionAcceptance"] = "failedOrIncomplete"
+    detail = report["shaderRejection"] = {"kind": "computeTargetForCapturedPixelShader"}
+    event = run.events[1]
+    source = b"[numthreads(1, 1, 1)] void main(uint3 dispatchId : SV_DispatchThreadID) {}\n"
+    try:
+        expected = stable_configuration(shader_only_references, run.events)[event]
+        def state():
+            return {"eventId": int(controller.GetCurrentEventID()),
+                    "sharedBufferGeneration": int(controller.GetSharedBufferPatchGeneration()),
+                    "shaderGeneration": int(controller.GetShaderReplacementGeneration(event)),
+                    "pixelShader": str(controller.GetPipelineState().GetShader(rd.ShaderStage.Pixel))}
+        before = detail["before"] = state()
+        if before["eventId"] != event or before["sharedBufferGeneration"] != run.generation:
+            raise RuntimeError("Shader rejection must begin at the accepted shader-only B state")
+        before_witness, _ = run.read("shaderRejection.before", event)
+        detail["beforeWitness"] = before_witness
+        if before_witness != expected:
+            raise RuntimeError("Shader-only state differs from its complete references before rejection")
+        built, build_timing = run.recorder.measure("shaderRejection.buildCS", lambda:
+            controller.BuildTargetShader("main", rd.ShaderEncoding.HLSL, source,
+                                         rd.ShaderCompileFlags(), rd.ShaderStage.Compute))
+        target, compile_error = built
+        detail.update(sourceSha256=hashlib.sha256(source).hexdigest(),
+                      compileDiagnostics=str(compile_error), targetResource=str(target))
+        if target == rd.ResourceId.Null():
+            raise RuntimeError("Generated wrong-stage shader could not be compiled: " + str(compile_error))
+        # Do not free this resource before observing rejection. If a broken implementation did
+        # install it, the outer cleanup must first restore the original mapping or shut down.
+        temporary_targets.append(target)
+        error, timing = run.recorder.measure("shaderRejection.replaceChecked", lambda:
+            controller.ReplaceTargetShaderChecked(original_shader, target), event)
+        detail.update(diagnostic=str(error), timingRecords=timing["timingRecords"], after=state())
+        observed, readback = run.read("shaderRejection.immediate", event)
+        detail["immediateWitness"] = observed
+        issues = shader_rejection_issues(error, before, detail["after"], expected, observed)
+        issues.extend(readback_replay_issues(build_timing["timingRecords"]))
+        issues.extend(readback_replay_issues(timing["timingRecords"]))
+        issues.extend(readback_replay_issues(readback["timingRecords"]))
+        run.issue("shaderRejection", issues)
+        if issues:
+            raise RuntimeError("; ".join(issues))
+        report["shaderRejectionAcceptance"] = "passedWrongStageRejectedWithoutChangingAcceptedState"
+    except Exception as error:
+        detail["error"] = str(error)
+        raise
+    finally:
+        run.recorder.publish()
 
 
 def discover(controller, rd, report, recorder, args, maximum):
@@ -330,16 +476,19 @@ def main(argv=None):
               "environment": environment, "processId": os.getpid(), "samples": [], "visits": [],
               "mutations": [], "phases": [], "issues": [], "totalReadbackBytes": 0,
               "shaderAcceptance": "requested" if source else "notRequestedNotTested",
+              "shaderWithBufferAcceptance": "requested" if source else "notRequestedNotTested",
+              "shaderRejectionAcceptance": "notRequestedNotTested",
               "limits": ["One reflected float4 shared by four actual Pixel/Fragment draws",
                          "Complete fixed output texture set plus exact buffer window; no all-UAV guarantee",
                          "Immediate slider witnesses precede any explicit EID setter",
                          "No-hit enabled configurations fail acceptance; disabled controls require zero hits",
-                         "Shader ABI acceptance uses the native checked transaction only",
+                         "Native checked shader identity/pipeline acceptance; complete Workbench ABI validation is separate",
                          "Readback synchronization means setter wall is not UI drag or scanout latency"]}
     recorder = Recorder(report, output, output.with_suffix(".rdoc.log"), args.max_seconds)
     recorder.publish()
     rd, controller, cap, initialized = None, None, None, False
     run, target_shader, original_shader = None, None, None
+    temporary_shader_targets = []
     shader_active, patch_active = False, False
     try:
         import renderdoc as rd
@@ -355,6 +504,8 @@ def main(argv=None):
         report["captureDriver"] = str(cap.DriverName())
         if report["captureDriver"] not in BACKENDS:
             raise RuntimeError("Unsupported native edit acceptance API")
+        if source is not None and report["captureDriver"] == "D3D11":
+            report["shaderRejectionAcceptance"] = "requested"
         opened, _ = recorder.measure("capture.openReplay", lambda: cap.OpenCapture(rd.ReplayOptions(), None))
         result, controller = opened
         if result != rd.ResultCode.Succeeded or controller is None:
@@ -405,17 +556,24 @@ def main(argv=None):
             run.visit("shader.seedA", events[0])
             run.visit("shader.seedB", events[1])
             # If the wrapper raises after committing, cleanup must still try checked rollback
-            # before freeing the target resource. A returned ABI rejection committed nothing.
+            # before freeing the target resource. A returned native rejection committed nothing.
             shader_active = True
             error, timing = recorder.measure("shader.replaceChecked", lambda:
                 controller.ReplaceTargetShaderChecked(original_shader, target_shader), events[1])
             if str(error):
                 shader_active = False
-                raise RuntimeError("Shader ABI transaction rejected: " + str(error))
+                raise RuntimeError("Checked native shader transaction rejected: " + str(error))
             if any(r.get("hit") == 1 for r in timing["timingRecords"] if r.get("api") in set(BACKENDS.values())):
                 run.issue("shader.replace", ["Shader edit reused a pre-edit live cursor"])
             changed, _ = run.read("shader.immediate", events[1])
-            run.phase("shader.replaced", None, changed)
+            shader_only_references = run.phase("shader.replaced", None, changed)
+            validate_d3d11_shader_rejection(run, original_shader, shader_only_references,
+                                            temporary_shader_targets)
+            # Keep cleanup armed before the first setter: an exception may happen after native
+            # acceptance. The helper must undo the shared patch while the checked shader remains.
+            patch_active = True
+            validate_shader_with_buffer(run, values, shader_only_references)
+            patch_active = False
             run.visit("shader.undoSeedA", events[0])
             run.visit("shader.undoSeedB", events[1])
             error, timing = recorder.measure("shader.undoChecked", lambda:
@@ -452,6 +610,10 @@ def main(argv=None):
                 cleanup("cleanup.sharedUndo", controller.ClearSharedBufferPatches)
             if target_shader is not None and target_shader != rd.ResourceId.Null() and not shader_active:
                 cleanup("cleanup.shaderFree", lambda: controller.FreeTargetResource(target_shader))
+            if not shader_active:
+                for temporary_target in temporary_shader_targets:
+                    cleanup("cleanup.shaderRejectionTargetFree", lambda target=temporary_target:
+                        controller.FreeTargetResource(target))
             cleanup("cleanup.replay", controller.Shutdown)
         if cap is not None:
             cleanup("cleanup.capture", cap.Shutdown)

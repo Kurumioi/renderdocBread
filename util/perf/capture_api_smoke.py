@@ -382,7 +382,7 @@ def main():
     parser.add_argument("--checkpoint-alias-fixture", choices=("off", "clear", "read", "split"),
                         default="off", help="Committed RT clear after an unrelated alias barrier; "
                         "read and split select conservative negative cases")
-    parser.add_argument("--d3d11-demo", choices=("D3D11_Simple_Triangle", "D3D11_Shared_Buffer", "D3D11_CBuffer_Zoo"), default="D3D11_Simple_Triangle")
+    parser.add_argument("--d3d11-demo", choices=("D3D11_Simple_Triangle", "D3D11_Shared_Buffer", "D3D11_CBuffer_Zoo", "D3D11_Buffer_Delta", "D3D11_Buffer_Delta_Ranges"), default="D3D11_Simple_Triangle")
     parser.add_argument("--gl-demo", choices=("GL_Simple_Triangle", "GL_Shared_Buffer", "GL_CBuffer_Zoo"), default="GL_Simple_Triangle")
     parser.add_argument("--vk-demo", choices=("VK_Simple_Triangle", "VK_Shared_Buffer", "VK_CBuffer_Zoo"), default="VK_Simple_Triangle")
     parser.add_argument("--compiler-dir", default=os.environ.get("RENDERDOC_API_SMOKE_COMPILER_DIR", ""))

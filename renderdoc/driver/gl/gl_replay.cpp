@@ -6088,9 +6088,10 @@ void GLReplay::SetProxyBufferData(ResourceId bufid, byte *data, size_t dataSize)
 static uint32_t GLReplayPatchValueCutoff(const rdcarray<ReplayBufferPatch> &previous,
                                        const rdcarray<ReplayBufferPatch> &next,
                                        const std::map<ResourceId, uint32_t> &firstReads,
-                                       rdcstr &reason)
+                                       rdcstr &reason,
+                                       const rdcarray<ReplayBufferPatchRange> *changes = NULL)
 {
-  if(next.empty() || previous.size() != next.size())
+  if(!SameReplayBufferPatchLayout(previous, next))
   {
     reason = "patchLayoutChanged";
     return 0;
@@ -6098,12 +6099,6 @@ static uint32_t GLReplayPatchValueCutoff(const rdcarray<ReplayBufferPatch> &prev
   uint32_t first = ~0U;
   for(size_t i = 0; i < next.size(); ++i)
   {
-    if(previous[i].buffer != next[i].buffer || previous[i].byteOffset != next[i].byteOffset ||
-       previous[i].data.size() != next[i].data.size())
-    {
-      reason = "patchLayoutChanged";
-      return 0;
-    }
     auto use = firstReads.find(next[i].buffer);
     if(use == firstReads.end() || use->second == 0)
     {
@@ -6113,6 +6108,25 @@ static uint32_t GLReplayPatchValueCutoff(const rdcarray<ReplayBufferPatch> &prev
     first = RDCMIN(first, use->second);
   }
   reason = "sameRangesPotentialUniformAndCopyReads";
+  // Validate every original proof above before using a value delta. The index only describes
+  // whole buffers, so two different parameter offsets in one buffer still share its earliest
+  // potential consumer. A shader may read any bound UBO slot, independent of original reflection.
+  if(changes && !changes->empty())
+  {
+    uint32_t changedFirst = ~0U;
+    for(const ReplayBufferPatchRange &change : *changes)
+    {
+      auto use = firstReads.find(change.buffer);
+      if(use == firstReads.end() || use->second == 0)
+      {
+        reason = "missingChangedBufferConsumer";
+        return 0;
+      }
+      changedFirst = RDCMIN(changedFirst, use->second);
+    }
+    reason = "changedBuffersPotentialUniformAndCopyReads";
+    return changedFirst;
+  }
   return first;
 }
 
@@ -6193,6 +6207,20 @@ rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patch
       return "OpenGL persistent buffer patch upload exceeds 128 MiB";
   }
 
+  rdcarray<ReplayBufferPatchRange> changes;
+  const bool deltaKnown =
+      GetReplayBufferPatchChanges(m_pDriver->m_ReplayBufferPatches, patches, changes).empty();
+  const bool deltaEnabled =
+      Process::GetEnvVariable("RENDERDOC_REPLAY_DISABLE_BUFFER_PATCH_DELTA") != "1";
+  uint64_t changedBytes = 0;
+  std::set<ResourceId> changedBuffers;
+  if(deltaKnown)
+    for(const ReplayBufferPatchRange &change : changes)
+    {
+      changedBytes += change.byteLength;
+      changedBuffers.insert(change.buffer);
+    }
+
   GLuint upload = 0;
   if(!patches.empty())
   {
@@ -6223,7 +6251,8 @@ rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patch
 
   rdcstr cutoffReason;
   uint32_t cutoff = GLReplayPatchValueCutoff(m_pDriver->m_ReplayBufferPatches, patches,
-                                            m_pDriver->m_ReplayPatchFirstReads, cutoffReason);
+                                            m_pDriver->m_ReplayPatchFirstReads, cutoffReason,
+                                            deltaKnown && deltaEnabled ? &changes : NULL);
   rdcstr anchorReason;
   uint32_t firstRead = GLReplayPatchValueCutoff(patches, patches,
                                                m_pDriver->m_ReplayPatchFirstReads, anchorReason);
@@ -6257,8 +6286,17 @@ rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patch
     GL.glDeleteBuffers(1, &m_pDriver->m_ReplayPatchUpload);
   m_pDriver->m_ReplayPatchUpload = upload;
   m_pDriver->m_ReplayBufferPatches = patches;
-  RDCLOG("OpenGL shared buffer patch commit ranges=%zu firstAffected=%u anchor=%u reason=%s",
-         patches.size(), cutoff, m_ReplayPatchAnchorEvent, cutoffReason.c_str());
+  if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+  {
+    const rdcstr line = StringFormat::Fmt(
+        "api=OpenGLBufferPatch op=set ranges=%zu firstAffected=%u anchor=%u reason=%s "
+        "deltaKnown=%u deltaEnabled=%u changedRanges=%zu changedBytes=%llu changedBuffers=%zu",
+        patches.size(), cutoff, m_ReplayPatchAnchorEvent, cutoffReason.c_str(),
+        deltaKnown ? 1U : 0U, deltaEnabled ? 1U : 0U, deltaKnown ? changes.size() : 0,
+        (unsigned long long)changedBytes, changedBuffers.size());
+    RDCLOG("[EIDTiming] %s", line.c_str());
+    AppendReplayTimingLog(line);
+  }
   return rdcstr();
 }
 
@@ -6847,6 +6885,50 @@ TEST_CASE("OpenGL shared value edits preserve only a proven pre-consumer prefix"
   changed.buffer = ResourceIDGen::GetNewUniqueID();
   CHECK(GLReplayPatchValueCutoff({patch}, {changed}, reads, reason) == 0);
   CHECK(GLReplayPatchValueCutoff({patch}, {patch}, {}, reason) == 0);
+}
+
+TEST_CASE("OpenGL value deltas retain prefixes before unchanged parameter consumers",
+          "[gl][bufferpatch]")
+{
+  ReplayBufferPatch early;
+  early.buffer = ResourceIDGen::GetNewUniqueID();
+  early.byteOffset = 16;
+  early.data = {1, 2, 3, 4};
+  ReplayBufferPatch late = early;
+  late.buffer = ResourceIDGen::GetNewUniqueID();
+  ReplayBufferPatch changed = late;
+  changed.data[2] = 9;
+  const rdcarray<ReplayBufferPatch> previous = {early, late};
+  const rdcarray<ReplayBufferPatch> next = {early, changed};
+  std::map<ResourceId, uint32_t> reads = {{early.buffer, 7}, {late.buffer, 43}};
+  rdcarray<ReplayBufferPatchRange> changes;
+  REQUIRE(GetReplayBufferPatchChanges(previous, next, changes).empty());
+  REQUIRE(changes.size() == 1);
+  CHECK(changes[0].byteLength == 1);
+  rdcstr reason;
+  CHECK(GLReplayPatchValueCutoff(previous, next, reads, reason, &changes) == 43);
+  CHECK(reason == "changedBuffersPotentialUniformAndCopyReads");
+  // The A/B control omits the delta, and the full-table edit anchor always stays at 7.
+  CHECK(GLReplayPatchValueCutoff(previous, next, reads, reason) == 7);
+  CHECK(GLReplayPatchValueCutoff(next, next, reads, reason) == 7);
+  // Unknown native binding evidence cannot be repaired by a value delta. In particular a shader
+  // may consume a physically bound slot which the original reflected GetUsage omitted.
+  CHECK(GLReplayPatchValueCutoff(previous, next, {{late.buffer, 43}}, reason, &changes) == 0);
+  CHECK(GLReplayPatchValueCutoff(previous, next, {{early.buffer, 7}}, reason, &changes) == 0);
+  CHECK(GLReplayPatchValueCutoff(previous, {}, reads, reason, &changes) == 0);
+  changed.byteOffset++;
+  CHECK(GLReplayPatchValueCutoff(previous, {early, changed}, reads, reason, &changes) == 0);
+  // Exceeding the work budget still accepts the edit through the old conservative cutoff.
+  CHECK_FALSE(GetReplayBufferPatchChanges(previous, next, changes, 0).empty());
+  CHECK(changes.empty());
+  CHECK(GLReplayPatchValueCutoff(previous, next, reads, reason) == 7);
+
+  late = early;
+  late.byteOffset = 32;
+  changed = late;
+  changed.data[0] = 9;
+  REQUIRE(GetReplayBufferPatchChanges({early, late}, {early, changed}, changes).empty());
+  CHECK(GLReplayPatchValueCutoff({early, late}, {early, changed}, reads, reason, &changes) == 7);
 }
 
 TEST_CASE("OpenGL checkpoint boundary permits uploads but rejects hidden execution and lifetime",

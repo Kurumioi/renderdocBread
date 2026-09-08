@@ -207,7 +207,7 @@ class WrappedID3D12CommandQueue : public ID3D12CommandQueue1,
   D3D12CommandData m_Cmd;
 
   ResourceId m_PrevQueueId;
-  void SyncReplayQueueForSubmission(ID3D12CommandQueue *queue);
+  bool SyncReplayQueueForSubmission(ID3D12CommandQueue *queue);
 
   bool ProcessChunk(ReadSerialiser &ser, D3D12Chunk context);
 
