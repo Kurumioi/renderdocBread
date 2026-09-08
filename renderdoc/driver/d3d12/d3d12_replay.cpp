@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "d3d12_replay.h"
+#include <algorithm>
 #include "core/plugins.h"
 #include "core/settings.h"
 #include "driver/dx/official/d3dcompiler.h"
@@ -394,6 +395,59 @@ void D3D12Replay::DestroyResources()
   SAFE_DELETE(m_pNVCounters);
 }
 
+struct D3D12InitialSourceWarmupCandidate
+{
+  ResourceId source;
+  ID3D12Resource *wrappedSource = NULL;
+  uint64_t sourceBufferBytes = 0;
+  uint32_t firstObservedWrite = ~0U;
+};
+
+static bool InitialSourceWarmupWriteUsage(ResourceUsage usage)
+{
+  return (usage >= ResourceUsage::VS_RWResource && usage <= ResourceUsage::All_RWResource) ||
+         usage == ResourceUsage::CPUWrite || usage == ResourceUsage::CopyDst ||
+         usage == ResourceUsage::Copy || usage == ResourceUsage::ResolveDst ||
+         usage == ResourceUsage::Resolve || usage == ResourceUsage::Clear ||
+         usage == ResourceUsage::ColorTarget || usage == ResourceUsage::DepthStencilTarget ||
+         usage == ResourceUsage::StreamOut || usage == ResourceUsage::GenMips;
+}
+
+static void AddInitialSourceWarmupWrite(std::map<ResourceId, uint32_t> &writes, ResourceId id,
+                                       uint32_t eventId)
+{
+  if(id == ResourceId() || eventId == ~0U)
+    return;
+  auto found = writes.insert({id, eventId});
+  found.first->second = RDCMIN(found.first->second, eventId);
+}
+
+static rdcarray<D3D12InitialSourceWarmupCandidate> OrderInitialSourceWarmup(
+    const rdcarray<D3D12InitialSourceWarmupCandidate> &candidates, bool firstWrite)
+{
+  // The legacy mode preserves even duplicate source visits and their exact original order.
+  if(!firstWrite)
+    return candidates;
+  rdcarray<D3D12InitialSourceWarmupCandidate> result;
+  std::map<ResourceId, size_t> sources;
+  for(const D3D12InitialSourceWarmupCandidate &candidate : candidates)
+  {
+    auto source = sources.insert({candidate.source, result.size()});
+    if(source.second)
+      result.push_back(candidate);
+    else
+      result[source.first->second].firstObservedWrite =
+          RDCMIN(result[source.first->second].firstObservedWrite, candidate.firstObservedWrite);
+  }
+  std::sort(result.begin(), result.end(), [](const D3D12InitialSourceWarmupCandidate &a,
+                                           const D3D12InitialSourceWarmupCandidate &b) {
+    if(a.firstObservedWrite != b.firstObservedWrite)
+      return a.firstObservedWrite < b.firstObservedWrite;
+    return a.source < b.source;
+  });
+  return result;
+}
+
 RDResult D3D12Replay::ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers)
 {
   RDResult result = m_pDevice->ReadLogInitialisation(rdc, storeStructuredBuffers);
@@ -404,8 +458,29 @@ RDResult D3D12Replay::ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBu
   // upload cost while opening the capture, before the first user gesture, without replaying or
   // changing any captured resource contents. A separate timing API keeps this out of scrub stats.
   ScopedReplayTiming timing("D3D12InitialWarmup", 0, 0, eReplay_Full, true);
+  const bool firstWrite =
+      Process::GetEnvVariable("RENDERDOC_D3D12_INITIAL_SOURCE_CACHE_ORDER") == "first-write";
+  const bool logPlan = IsReplayTimingActive();
   D3D12ResourceManager *manager = m_pDevice->GetResourceManager();
-  ID3D12GraphicsCommandListX *list = NULL;
+  std::map<ResourceId, uint32_t> writes;
+  if(firstWrite || logPlan)
+  {
+    // Positive, already-loaded write-use records are only a cache-priority heuristic. Missing
+    // usages, bindless accesses, and future edited dependencies never justify skipping a restore.
+    for(const auto &resource : m_pDevice->GetQueue()->GetCommandData()->m_ResourceUses)
+      for(const EventUsage &usage : resource.second)
+        if(InitialSourceWarmupWriteUsage(usage.usage))
+          AddInitialSourceWarmupWrite(writes, resource.first, usage.eventId);
+    // A placed resource obtains its immutable source from the physical heap. Aggregate evidence
+    // to that source owner without relying on negative GetUsage(heap) results or changing aliases.
+    for(const auto &resource : m_pDevice->GetResourceList())
+    {
+      auto observed = writes.find(resource.first);
+      if(observed != writes.end() && resource.second->GetHeap())
+        AddInitialSourceWarmupWrite(writes, GetResID(resource.second->GetHeap()), observed->second);
+    }
+  }
+  rdcarray<D3D12InitialSourceWarmupCandidate> candidates;
   for(ResourceId id : manager->GetInitialContentResourceIDs())
   {
     ID3D12DeviceChild *live = manager->GetResource(id);
@@ -418,13 +493,33 @@ RDResult D3D12Replay::ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBu
        !data.resource)
       continue;
 
+    D3D12InitialSourceWarmupCandidate candidate;
+    candidate.wrappedSource = (ID3D12Resource *)data.resource;
+    candidate.source = GetResID(candidate.wrappedSource);
+    if(firstWrite || logPlan)
+    {
+      const D3D12_RESOURCE_DESC desc = Unwrap(candidate.wrappedSource)->GetDesc();
+      if(desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        candidate.sourceBufferBytes = desc.Width;
+      auto observed = writes.find(GetResID(live));
+      if(observed != writes.end())
+        candidate.firstObservedWrite = observed->second;
+    }
+    candidates.push_back(candidate);
+  }
+  const rdcarray<D3D12InitialSourceWarmupCandidate> ordered =
+      OrderInitialSourceWarmup(candidates, firstWrite);
+  const uint64_t residentBefore = m_InitialStateSourceCacheBytes;
+  ID3D12GraphicsCommandListX *list = NULL;
+  for(const D3D12InitialSourceWarmupCandidate &candidate : ordered)
+  {
     if(!list)
     {
       list = m_pDevice->GetNewList();
       if(!list)
         return m_pDevice->FatalErrorCheck();
     }
-    ResolveInitialStateCopySource((ID3D12Resource *)data.resource, list, true);
+    ResolveInitialStateCopySource(candidate.wrappedSource, list, true);
   }
 
   if(list)
@@ -436,6 +531,38 @@ RDResult D3D12Replay::ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBu
     // Keep the conservative default: there may also be loading-time debug lists pending.
     m_pDevice->ExecuteLists(NULL, true);
     m_pDevice->FlushLists(true);
+  }
+  if(logPlan)
+  {
+    // Unique source counts are comparable even though the legacy loop can visit one source twice.
+    const auto unique = OrderInitialSourceWarmup(candidates, true);
+    uint64_t bytes = 0, observedBytes = 0;
+    size_t observed = 0;
+    for(const D3D12InitialSourceWarmupCandidate &candidate : unique)
+    {
+      bytes += candidate.sourceBufferBytes;
+      if(candidate.firstObservedWrite != ~0U)
+      {
+        observed++;
+        observedBytes += candidate.sourceBufferBytes;
+      }
+    }
+    rdcstr firstSources;
+    for(size_t i = 0; i < RDCMIN(size_t(8), ordered.size()); i++)
+      firstSources += StringFormat::Fmt("%s%s:%u:%llu", i ? "," : "",
+                                         ToStr(ordered[i].source).c_str(),
+                                         ordered[i].firstObservedWrite,
+                                         (unsigned long long)ordered[i].sourceBufferBytes);
+    const rdcstr line = StringFormat::Fmt(
+        "api=D3D12InitialSourceWarmup order=%s candidates=%zu observedWriteCandidates=%zu "
+        "candidateSourceBufferBytes=%llu observedWriteSourceBufferBytes=%llu visits=%zu "
+        "residentAllocationBytesBefore=%llu residentAllocationBytesAfter=%llu "
+        "firstSources=%s fatal=%u", firstWrite ? "first-write" : "legacy", unique.size(), observed,
+        (unsigned long long)bytes, (unsigned long long)observedBytes, ordered.size(),
+        (unsigned long long)residentBefore, (unsigned long long)m_InitialStateSourceCacheBytes,
+        firstSources.empty() ? "none" : firstSources.c_str(), m_pDevice->HasFatalError() ? 1U : 0U);
+    RDCLOG("%s", line.c_str());
+    AppendReplayTimingLog(line);
   }
   return m_pDevice->FatalErrorCheck();
 }
@@ -4456,6 +4583,76 @@ void D3D12Replay::RestoreEventCBufferOverrides()
 #if ENABLED(ENABLE_UNIT_TESTS)
 
 #include "3rdparty/catch/catch.hpp"
+
+TEST_CASE("D3D12 first-write source warmup is opt-in and never removes unknown sources",
+          "[d3d12][replay][initial-source-warmup]")
+{
+  const ResourceId late = ResourceIDGen::GetNewUniqueID();
+  const ResourceId early = ResourceIDGen::GetNewUniqueID();
+  const ResourceId unknown = ResourceIDGen::GetNewUniqueID();
+  D3D12InitialSourceWarmupCandidate a, b, c, duplicate;
+  a.source = late;
+  a.firstObservedWrite = 300;
+  a.sourceBufferBytes = 100;
+  b.source = early;
+  b.firstObservedWrite = 40;
+  b.sourceBufferBytes = 200;
+  c.source = unknown;
+  c.sourceBufferBytes = 300;
+  duplicate = a;
+  duplicate.firstObservedWrite = 5;
+  const rdcarray<D3D12InitialSourceWarmupCandidate> input = {a, c, b, duplicate};
+  const auto legacy = OrderInitialSourceWarmup(input, false);
+  REQUIRE(legacy.size() == 4);
+  for(size_t i = 0; i < input.size(); i++)
+  {
+    CHECK(legacy[i].source == input[i].source);
+    CHECK(legacy[i].firstObservedWrite == input[i].firstObservedWrite);
+  }
+  const auto ordered = OrderInitialSourceWarmup(input, true);
+  REQUIRE(ordered.size() == 3);
+  CHECK(ordered[0].source == late);
+  CHECK(ordered[0].firstObservedWrite == 5);
+  CHECK(ordered[0].sourceBufferBytes == 100);
+  CHECK(ordered[1].source == early);
+  CHECK(ordered[2].source == unknown);
+  CHECK(ordered[2].firstObservedWrite == ~0U);
+  // Sorting the private plan cannot alter the shared initial-content application sequence.
+  CHECK(input[0].firstObservedWrite == 300);
+  CHECK(input[1].source == unknown);
+}
+
+TEST_CASE("D3D12 source warmup uses only positive write-use evidence and deterministic ties",
+          "[d3d12][replay][initial-source-warmup]")
+{
+  CHECK(InitialSourceWarmupWriteUsage(ResourceUsage::CPUWrite));
+  CHECK(InitialSourceWarmupWriteUsage(ResourceUsage::Clear));
+  CHECK(InitialSourceWarmupWriteUsage(ResourceUsage::CS_RWResource));
+  CHECK(InitialSourceWarmupWriteUsage(ResourceUsage::CopyDst));
+  CHECK_FALSE(InitialSourceWarmupWriteUsage(ResourceUsage::CopySrc));
+  CHECK_FALSE(InitialSourceWarmupWriteUsage(ResourceUsage::PS_Resource));
+  CHECK_FALSE(InitialSourceWarmupWriteUsage(ResourceUsage::PS_Constants));
+  CHECK_FALSE(InitialSourceWarmupWriteUsage(ResourceUsage::Unused));
+  CHECK_FALSE(InitialSourceWarmupWriteUsage(ResourceUsage::Discard));
+  std::map<ResourceId, uint32_t> writes;
+  const ResourceId heap = ResourceIDGen::GetNewUniqueID();
+  AddInitialSourceWarmupWrite(writes, heap, 80);
+  AddInitialSourceWarmupWrite(writes, heap, 20);
+  AddInitialSourceWarmupWrite(writes, heap, 120);
+  AddInitialSourceWarmupWrite(writes, ResourceId(), 1);
+  REQUIRE(writes.size() == 1);
+  CHECK(writes[heap] == 20);
+  D3D12InitialSourceWarmupCandidate a, b;
+  a.source = ResourceIDGen::GetNewUniqueID();
+  b.source = ResourceIDGen::GetNewUniqueID();
+  a.firstObservedWrite = b.firstObservedWrite = 20;
+  const auto forward = OrderInitialSourceWarmup({a, b}, true);
+  const auto reverse = OrderInitialSourceWarmup({b, a}, true);
+  REQUIRE(forward.size() == 2);
+  REQUIRE(reverse.size() == 2);
+  CHECK(forward[0].source == reverse[0].source);
+  CHECK(forward[1].source == reverse[1].source);
+}
 
 TEST_CASE("ReplayLab D3D12 root CBV window is reflection-bounded",
           "[d3d12][replaylab][material]")
