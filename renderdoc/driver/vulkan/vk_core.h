@@ -1204,7 +1204,8 @@ private:
   bool CheckReplayCheckpointResourceReplacements();
   bool ReplayCheckpointCandidateSelected(uint32_t eventId, ReplayCheckpointKind kind) const;
   bool ReplayCheckpointIsPatchAnchor(uint32_t eventId, ReplayCheckpointKind kind) const;
-  bool CheckReplayCheckpointInterval(const ReplayCheckpoint &checkpoint, uint32_t target);
+  bool CheckReplayCheckpointInterval(const ReplayCheckpoint &checkpoint, uint32_t target,
+                                     rdcstr *reason = NULL);
   uint32_t RestoreReplayCheckpoint(uint32_t endEventID, ReplayLogType replayType);
   void SaveReplayCheckpoint(uint32_t endEventID, ReplayLogType replayType,
                             ReplayCheckpointKind kind = ReplayCheckpointKind::PartialCommand);
@@ -1212,6 +1213,22 @@ private:
   bool ReplayCheckpointIsProtected(const ReplayCheckpoint &checkpoint,
                                     const ReplayCheckpoint &building) const;
   bool CopyReplayCheckpointResources(ReplayCheckpoint &checkpoint, bool restore);
+  // One actual ordinary replay cursor. It owns no snapshots and is consumed on each request.
+  struct LiveForwardState
+  {
+    bool valid = false;
+    uint32_t eventId = 0, beginEvent = 0, pendingTarget = 0, subpass = 0;
+    uint64_t generation = 0, pendingGeneration = 0, completedGeneration = 0;
+    ResourceId commandBuffer, pushCommandBuffer, renderPass;
+    bool renderPassActive = false;
+    rdcstr reason = "noOrdinaryTarget";
+  } m_LiveForward;
+  void InvalidateLiveForward(const char *reason);
+  bool CanReplayLiveForward(uint32_t target, rdcstr &reason);
+  void CompleteLiveForwardTarget(uint32_t eventId);
+  void FinishLiveForwardRequest(uint32_t eventId, bool ordinaryRoot, bool ordinaryTarget,
+                                bool succeeded);
+
   // immutable creation data
   VulkanCreationInfo m_CreationInfo;
 
@@ -1522,7 +1539,8 @@ public:
   }
   void Shutdown();
   void ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType,
-                 bool allowCheckpoints = false);
+                 bool allowCheckpoints = false, bool ordinaryRoot = false,
+                 bool ordinaryTarget = false);
   void ReplayDraw(VkCommandBuffer cmd, const ActionDescription &action);
   RDResult ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
 

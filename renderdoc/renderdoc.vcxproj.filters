@@ -201,6 +201,9 @@
     <ClInclude Include="replay\replay_driver.h">
       <Filter>Replay</Filter>
     </ClInclude>
+    <ClInclude Include="replay\replay_resource_versions.h">
+      <Filter>Replay</Filter>
+    </ClInclude>
     <ClInclude Include="replay\replay_controller.h">
       <Filter>Replay</Filter>
     </ClInclude>
@@ -759,6 +762,9 @@
       <Filter>Replay</Filter>
     </ClCompile>
     <ClCompile Include="replay\replay_driver.cpp">
+      <Filter>Replay</Filter>
+    </ClCompile>
+    <ClCompile Include="replay\replay_resource_versions.cpp">
       <Filter>Replay</Filter>
     </ClCompile>
     <ClCompile Include="core\precompiled.cpp">

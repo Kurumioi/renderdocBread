@@ -32,6 +32,33 @@
 #include "replay_controller.h"
 #include "replay_timing.h"
 
+void ReplayHistoryDisplaySource::Clear()
+{
+  active = false;
+}
+
+void ReplayHistoryDisplaySource::Publish(uint32_t event, const TextureDisplay &source,
+                                         uint64_t mutationGeneration,
+                                         rdcpair<int32_t, int32_t> renderedDimensions,
+                                         bool succeeded)
+{
+  active = succeeded;
+  if(!active)
+    return;
+  eventId = event;
+  display = source;
+  generation = mutationGeneration;
+  dimensions = renderedDimensions;
+}
+
+bool ReplayHistoryDisplaySource::NeedsReplay(bool dirty,
+                                              rdcpair<int32_t, int32_t> currentDimensions,
+                                              uint64_t mutationGeneration) const
+{
+  return active && (dirty || !(dimensions == currentDimensions) ||
+                    generation != mutationGeneration);
+}
+
 static uint64_t GetHandle(WindowingData window)
 {
 #if ENABLED(RDOC_LINUX)
@@ -177,6 +204,7 @@ void ReplayOutput::SetTextureDisplay(const TextureDisplay &o)
     return;
 
   m_HistorySnapshotActive = false;
+  m_HistoryReplaySource.Clear();
   SetTextureDisplayInternal(o, false);
 }
 
@@ -748,6 +776,16 @@ void ReplayOutput::DisplayContext()
   if(m_PixelContext.outputID == 0)
     return;
 
+  if(m_HistoryReplaySource.active && !(m_ContextX < 0.0f && m_ContextY < 0.0f))
+  {
+    // The normal configuration was restored after the historical draw. Picking a new context
+    // location must evaluate the selected historical source too. DisplayTextureAtEvent clears
+    // this route while it draws, preventing recursion, and restores the controller event after.
+    const ReplayHistoryDisplaySource source = m_HistoryReplaySource;
+    DisplayTextureAtEvent(source.eventId, source.display);
+    return;
+  }
+
   m_pDevice->BindOutputWindow(m_PixelContext.outputID, false);
   m_pController->FatalErrorCheck();
 
@@ -907,7 +945,17 @@ void ReplayOutput::Display()
 
   m_pController->FatalErrorCheck();
 
-  if(m_MainOutput.dirty)
+  if(m_HistoryReplaySource.NeedsReplay(
+         m_MainOutput.dirty, {m_Width, m_Height},
+         m_pController->GetShaderReplacementGeneration(0)))
+  {
+    // Resize/expose and edits must not redraw the saved live-event configuration into a history
+    // tab. Retain only the requested event/configuration and rerender it through analysis replay.
+    // The existing presented output can still be flipped when no content or canvas changed.
+    const ReplayHistoryDisplaySource source = m_HistoryReplaySource;
+    DisplayTextureAtEvent(source.eventId, source.display);
+  }
+  else if(m_MainOutput.dirty)
   {
     m_MainOutput.dirty = false;
 
@@ -1477,6 +1525,7 @@ void ReplayOutput::DisplayTextureAtEvent(uint32_t eventId, const TextureDisplay 
   // Publish a new persistent identity only after the snapshot path succeeds below. A slow
   // overlay/custom/YUV fallback must not leave a stale historical source attached to Display().
   m_HistorySnapshotActive = false;
+  m_HistoryReplaySource.Clear();
 
   const uint32_t savedEventID = m_EventID;
   const TextureDisplay savedDisplay = m_RenderData.texDisplay;
@@ -1574,6 +1623,11 @@ void ReplayOutput::DisplayTextureAtEvent(uint32_t eventId, const TextureDisplay 
   // active. The next ordinary SetTextureDisplay consumes this flag and forces event-derived
   // resources to be rebuilt before the persistent current-event output is shown again.
   m_TransientTextureEventDisplay = true;
+  // Preserve the source, not a screenshot: the next resize, context refresh or mutation redraws
+  // this exact historical request and then restores the controller's current event again.
+  m_HistoryReplaySource.Publish(
+      eventId, config, m_pController->GetShaderReplacementGeneration(0), {m_Width, m_Height},
+      m_pController->GetFatalErrorStatus().code == ResultCode::Succeeded);
   m_pController->ReapRetiredEventTextureSnapshots();
   logTiming();
 }
@@ -1811,3 +1865,75 @@ void ReplayOutput::DisplayMesh()
   m_pDevice->RenderMesh(m_EventID, secondaryDraws, mesh);
   m_pController->FatalErrorCheck();
 }
+
+#if ENABLED(ENABLE_UNIT_TESTS)
+
+#include "catch/catch.hpp"
+
+TEST_CASE("Historical fallback redraws its source after canvas or mutation changes",
+          "[replay][history][presentation]")
+{
+  ReplayHistoryDisplaySource source;
+  TextureDisplay historical;
+  historical.resourceId = ResourceIDGen::GetNewUniqueID();
+  historical.customShaderId = ResourceIDGen::GetNewUniqueID();
+  historical.subresource = {2, 3, 1};
+  historical.typeCast = CompType::UInt;
+  historical.overlay = DebugOverlay::Drawcall;
+  historical.decodeYUV = true;
+  historical.rangeMin = 0.125f;
+  historical.rangeMax = 0.875f;
+  source.Publish(42, historical, 7, {674, 722}, true);
+  REQUIRE(source.active);
+  CHECK_FALSE(source.NeedsReplay(false, {674, 722}, 7));
+
+  // Reproduce the tab's native resize: current output state was restored after drawing EID 42,
+  // so the larger canvas must replay EID 42, not redraw that restored current configuration.
+  CHECK(source.NeedsReplay(false, {674, 957}, 7));
+  CHECK(source.NeedsReplay(true, {674, 722}, 7));
+  CHECK(source.NeedsReplay(false, {674, 722}, 8));
+  CHECK(source.eventId == 42);
+  CHECK((source.display.resourceId == historical.resourceId));
+  CHECK((source.display.customShaderId == historical.customShaderId));
+  CHECK((source.display.subresource == historical.subresource));
+  CHECK((source.display.typeCast == CompType::UInt));
+  CHECK((source.display.overlay == DebugOverlay::Drawcall));
+  CHECK(source.display.decodeYUV);
+  CHECK(source.display.rangeMin == 0.125f);
+  CHECK(source.display.rangeMax == 0.875f);
+
+  // Source identity is copied at request completion, not borrowed from changing viewer controls.
+  historical.resourceId = ResourceId();
+  historical.rangeMax = 1.0f;
+  CHECK((source.display.resourceId != ResourceId()));
+  CHECK(source.display.rangeMax == 0.875f);
+  const TextureDisplay redraw = source.display;
+  source.Publish(source.eventId, redraw, 8, {674, 957}, true);
+  CHECK_FALSE(source.NeedsReplay(false, {674, 957}, 8));
+  CHECK(source.eventId == 42);
+}
+
+TEST_CASE("Live binding and failed historical draws cannot retain a fallback route",
+          "[replay][history][presentation]")
+{
+  ReplayHistoryDisplaySource source;
+  TextureDisplay historical;
+  historical.resourceId = ResourceIDGen::GetNewUniqueID();
+  source.Publish(42, historical, 7, {128, 72}, true);
+  source.Clear();
+  CHECK_FALSE(source.active);
+  CHECK_FALSE(source.NeedsReplay(true, {640, 480}, 8));
+
+  // Re-entering another historical source publishes that source, never the previous tab's EID.
+  const ResourceId nextResource = ResourceIDGen::GetNewUniqueID();
+  historical.resourceId = nextResource;
+  source.Publish(84, historical, 8, {640, 480}, true);
+  CHECK(source.active);
+  CHECK(source.eventId == 84);
+  CHECK((source.display.resourceId == nextResource));
+  source.Publish(100, historical, 9, {640, 480}, false);
+  CHECK_FALSE(source.active);
+  CHECK_FALSE(source.NeedsReplay(true, {640, 480}, 10));
+}
+
+#endif

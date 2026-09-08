@@ -3600,6 +3600,12 @@ bool WrappedOpenGL::Serialise_BeginCaptureFrame(SerialiserType &ser)
         TrackReplayPatchBinding(binding.res, eGL_SHADER_STORAGE_BUFFER);
       for(const auto &binding : state.AtomicCounter)
         TrackReplayPatchBinding(binding.res, eGL_ATOMIC_COUNTER_BUFFER);
+      // Initial image bindings can be written without a glBindImageTexture in the frame. Keep
+      // the same potential-write evidence as bindings encountered while loading frame chunks.
+      for(const auto &binding : state.Images)
+        if(binding.res.name)
+          m_Textures[GetResourceManager()->GetResID(binding.res)].creationFlags |=
+              TextureCategory::ShaderReadWrite;
       for(const auto &binding : state.TransformFeedback)
         TrackReplayPatchBinding(binding.res, eGL_TRANSFORM_FEEDBACK_BUFFER);
       TrackReplayPatchBinding(state.BufferBindings[GLRenderState::eBufIdx_Pixel_Pack],
@@ -6455,8 +6461,14 @@ const GLDrawParams &WrappedOpenGL::GetDrawParameters(uint32_t eventId)
   return m_DrawcallParams[eventId];
 }
 
-void WrappedOpenGL::ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType)
+void WrappedOpenGL::ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType,
+                               bool liveCursorManaged)
 {
+  // Shader debugging, overlays, counters and pixel history call this internal entry directly.
+  // Their replay cannot inherit or publish an ordinary navigation cursor.
+  if(!liveCursorManaged)
+    m_Replay->InvalidateLiveForward();
+  m_LastReplaySucceeded = false;
   bool partial = true;
 
   if(startEventID == 0 && (replayType == eReplay_WithoutDraw || replayType == eReplay_Full))
@@ -6504,6 +6516,10 @@ void WrappedOpenGL::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
       RDCFATAL("Unexpected replay type");
   }
 
+  m_LastReplaySucceeded = status.code == ResultCode::Succeeded &&
+                          FatalErrorCheck() == ResultCode::Succeeded;
+  if(!m_LastReplaySucceeded)
+    m_Replay->InvalidateLiveForward();
   RDCASSERTEQUAL(status.code, ResultCode::Succeeded);
 
   // make sure to end any unbalanced replay events if we stopped in the middle of a frame

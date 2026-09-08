@@ -26,6 +26,7 @@
 #pragma once
 
 #include <memory>
+#include <set>
 #include <unordered_map>
 #include "api/replay/renderdoc_replay.h"
 #include "core/core.h"
@@ -40,6 +41,25 @@ struct GLCounterContext;
 class NVGLCounters;
 struct GLCheckpointBufferVersion;
 struct GLResource;
+
+// Ordinary replay provenance, independent of texture-display caches and checkpoint allocations.
+// Only the matching unmodified target may publish a prefix completed by WithoutDraw.
+struct GLLiveForwardCursor
+{
+  uint32_t event = 0;
+  uint32_t pendingTarget = 0;
+  void Invalidate() { event = pendingTarget = 0; }
+  bool CanAdvance(uint32_t target) const { return event != 0 && target > event; }
+  void Arm(uint32_t target) { event = 0; pendingTarget = target; }
+  bool Complete(uint32_t target, bool success)
+  {
+    const bool publish = success && target != 0 && pendingTarget == target;
+    Invalidate();
+    if(publish)
+      event = target;
+    return publish;
+  }
+};
 
 struct GLPostVSData
 {
@@ -392,6 +412,13 @@ public:
 
 private:
   friend class WrappedOpenGL;
+  void InvalidateLiveForward() { m_LiveForward.Invalidate(); }
+  bool PrepareLiveForward();
+  bool LiveForwardEndpoint(uint32_t eventId) const;
+  GLLiveForwardCursor m_LiveForward;
+  bool m_LiveForwardScanned = false;
+  bool m_LiveForwardCaptureSafe = false;
+  rdcstr m_LiveForwardReason;
   void TrackCheckpointBufferWrites(GLChunk chunk);
   void ResetCheckpointBufferLineage();
   void InvalidateCheckpointBufferVersion(const GLResource &buffer);
@@ -399,6 +426,7 @@ private:
   uint32_t m_ReplayPatchAnchorEvent = 0;
   struct ReplayCheckpoint;
   bool PrepareReplayCheckpoints();
+  void PrepareCheckpointStaticResources(bool completeContentEvidence);
   bool SaveReplayCheckpoint(uint32_t eventId);
   bool RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint);
   void ApplyCheckpointBindings(ReplayCheckpoint &checkpoint);
@@ -411,6 +439,9 @@ private:
   std::map<uint32_t, std::unique_ptr<ReplayCheckpoint>> m_Checkpoints;
   // Weak references never keep an evicted GPU allocation outside the checkpoint byte budget.
   std::map<ResourceId, std::weak_ptr<GLCheckpointBufferVersion>> m_CheckpointBufferVersions;
+  // Original live contents proven unchanged for the complete captured frame. Object/sampler
+  // state still belongs to each checkpoint. Unknown calls and aliases invalidate this proof.
+  std::set<ResourceId> m_CheckpointStaticResources;
   uint64_t m_CheckpointUseSerial = 0;
   bool m_CheckpointPrepared = false;
   bool m_CheckpointPreparingFailed = false;

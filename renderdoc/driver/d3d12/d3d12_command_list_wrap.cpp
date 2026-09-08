@@ -30,6 +30,7 @@
 #include "d3d12_command_queue.h"
 #include "d3d12_debug.h"
 #include "d3d12_replay.h"
+#include "d3d12_replay_clear.h"
 #include "d3d12_api_monitor.h"
 
 RDOC_EXTERN_CONFIG(bool, D3D12_Debug_RT_Auditing);
@@ -384,6 +385,7 @@ bool WrappedID3D12GraphicsCommandList::Serialise_Reset(SerialiserType &ser,
         m_Cmd->m_BakedCmdListInfo[BakedCommandList].preparedReplayEnd = 0;
         m_Cmd->m_BakedCmdListInfo[BakedCommandList].checkpointQueries.clear();
         m_Cmd->m_BakedCmdListInfo[BakedCommandList].checkpointBarriers.clear();
+        m_Cmd->m_BakedCmdListInfo[BakedCommandList].replayClearUnsafeBarriers.clear();
         m_Cmd->m_BakedCmdListInfo[BakedCommandList].checkpointChunks.clear();
 
         // reset state
@@ -516,6 +518,13 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ResourceBarrier(
       for(UINT i = 0; i < NumBarriers; i++)
       {
         const D3D12_RESOURCE_BARRIER &barrier = pBarriers[i];
+        if(!BakedCmdListInfo::IsReplayClearBarrierReadFree(barrier.Type, barrier.Flags))
+        {
+          BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
+          if(info.replayClearUnsafeBarriers.empty() ||
+             info.replayClearUnsafeBarriers.back() != info.curEventID)
+            info.replayClearUnsafeBarriers.push_back(info.curEventID);
+        }
         if(barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING ||
            (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
             barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE && barrier.Transition.pResource))
@@ -4948,6 +4957,27 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ClearDepthStencilView(
             Subresource(GetMipForDsv(descriptor->GetDSV()), GetSliceForDsv(descriptor->GetDSV()));
         m_Cmd->AddAction(action);
 
+        if(IsLoading(m_State))
+        {
+          BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
+          BakedCmdListInfo::ReplayClearOp clear;
+          clear.resource = descriptor->GetResResourceId();
+          clear.relativeEvent = info.curEventID;
+          clear.unconditional = info.state.predication.buffer == ResourceId();
+          WrappedID3D12Resource *resource =
+              GetResourceManager()->GetResAs<WrappedID3D12Resource>(clear.resource);
+          if(resource)
+          {
+            const D3D12_RESOURCE_DESC resourceDesc = resource->GetReal()->GetDesc();
+            D3D12_FEATURE_DATA_FORMAT_INFO formatInfo = {resourceDesc.Format};
+            if(SUCCEEDED(m_pDevice->GetReal()->CheckFeatureSupport(
+                   D3D12_FEATURE_FORMAT_INFO, &formatInfo, sizeof(formatInfo))))
+              clear.fullResource = D3D12ReplayFullDSVClear(resourceDesc, descriptor->GetDSV(),
+                                                           ClearFlags, NumRects, formatInfo.PlaneCount);
+          }
+          info.replayClearOps.push_back(clear);
+        }
+
         D3D12ActionTreeNode &actionNode = m_Cmd->GetActionStack().back()->children.back();
 
         actionNode.resourceUsage.push_back(
@@ -5048,6 +5078,27 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ClearRenderTargetView(
         action.copyDestinationSubresource =
             Subresource(GetMipForRtv(descriptor->GetRTV()), GetSliceForRtv(descriptor->GetRTV()));
         m_Cmd->AddAction(action);
+
+        if(IsLoading(m_State))
+        {
+          BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
+          BakedCmdListInfo::ReplayClearOp clear;
+          clear.resource = descriptor->GetResResourceId();
+          clear.relativeEvent = info.curEventID;
+          clear.unconditional = info.state.predication.buffer == ResourceId();
+          WrappedID3D12Resource *resource =
+              GetResourceManager()->GetResAs<WrappedID3D12Resource>(clear.resource);
+          if(resource)
+          {
+            const D3D12_RESOURCE_DESC resourceDesc = resource->GetReal()->GetDesc();
+            D3D12_FEATURE_DATA_FORMAT_INFO formatInfo = {resourceDesc.Format};
+            if(SUCCEEDED(m_pDevice->GetReal()->CheckFeatureSupport(
+                   D3D12_FEATURE_FORMAT_INFO, &formatInfo, sizeof(formatInfo))))
+              clear.fullResource = D3D12ReplayFullRTVClear(resourceDesc, descriptor->GetRTV(),
+                                                           NumRects, formatInfo.PlaneCount);
+          }
+          info.replayClearOps.push_back(clear);
+        }
 
         D3D12ActionTreeNode &actionNode = m_Cmd->GetActionStack().back()->children.back();
 
@@ -5357,6 +5408,24 @@ bool WrappedID3D12GraphicsCommandList::Serialise_DiscardResource(SerialiserType 
 
         actionNode.resourceUsage.push_back(make_rdcpair(
             GetResID(pResource), EventUsage(actionNode.action.eventId, ResourceUsage::Discard)));
+
+        if(IsLoading(m_State))
+        {
+          BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
+          BakedCmdListInfo::ReplayClearOp clear;
+          clear.resource = GetResID(pResource);
+          clear.relativeEvent = info.curEventID;
+          clear.unconditional = info.state.predication.buffer == ResourceId();
+          if(pResource)
+          {
+            const D3D12_RESOURCE_DESC desc = pResource->GetDesc();
+            clear.fullResource = D3D12ReplayFullDiscardPattern(
+                desc, pRegion,
+                m_pDevice->GetReplayOptions().optimisation != ReplayOptimisationLevel::Fastest,
+                GetNumSubresources(m_pDevice, &desc));
+          }
+          info.replayClearOps.push_back(clear);
+        }
       }
     }
   }

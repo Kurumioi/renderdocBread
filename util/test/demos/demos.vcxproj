@@ -199,8 +199,10 @@
     <ClCompile Include="d3d12\d3d12_buffer_truncation.cpp" />
     <ClCompile Include="d3d12\d3d12_cbuffer_zoo.cpp" />
     <ClCompile Include="d3d12\d3d12_checkpoint_triangle.cpp" />
+    <ClCompile Include="d3d12\d3d12_sparse_initial_residency.cpp" />
     <ClCompile Include="d3d12\d3d12_checkpoint_query.cpp" />
     <ClCompile Include="d3d12\d3d12_shared_buffer.cpp" />
+    <ClCompile Include="d3d12\d3d12_uav_declarations.cpp" />
     <ClCompile Include="d3d12\d3d12_compute_only.cpp" />
     <ClCompile Include="d3d12\d3d12_descriptor_indexing.cpp" />
     <ClCompile Include="d3d12\d3d12_discard_zoo.cpp" />

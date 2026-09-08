@@ -6,7 +6,7 @@ import unittest
 
 from eid_checkpoint_profile import (compare_event, force_bypass_issues, glsl_fragment_fixture, output_subresources,
                                     parse_events, parse_status, selected_event_evidence, shader_encoding_names,
-                                    status_issues)
+                                    status_issues, resolve_extra_textures)
 
 
 def status(**changes):
@@ -18,6 +18,26 @@ def status(**changes):
 
 
 class CheckpointProfileTests(unittest.TestCase):
+    def test_explicit_extra_textures_cover_whole_resource_and_reject_ambiguity(self):
+        resource = SimpleNamespace(name="unbound witness", resourceId=71)
+        texture = SimpleNamespace(resourceId=71, width=8, height=4, depth=1,
+                                  mips=2, arraysize=3, msSamp=2)
+        selected = resolve_extra_textures(["unbound witness"], [resource], [texture])
+        self.assertEqual(selected, [("unbound witness", texture)])
+        full = SimpleNamespace(firstMip=0, numMips=texture.mips, firstSlice=0,
+                               numSlices=texture.arraysize)
+        self.assertEqual(len(output_subresources(selected[0][1], full)), 12)
+        for names, resources, textures in ((["missing"], [resource], [texture]),
+                                           (["unbound witness"], [resource, resource], [texture]),
+                                           (["unbound witness"], [resource], []),
+                                           (["unbound witness"] * 2, [resource], [texture]),
+                                           ([""], [resource], [texture])):
+            with self.assertRaises(ValueError):
+                resolve_extra_textures(names, resources, textures)
+        texture.mips = 0
+        with self.assertRaises(ValueError):
+            resolve_extra_textures(["unbound witness"], [resource], [texture])
+
     def test_native_integer_encoding_list_uses_loaded_api_values(self):
         # Simulate the native list<int> result, with enum values deliberately not assumed in code.
         api = SimpleNamespace(GLSL=12, OpenGLSPIRV=27, HLSL=31, SPIRV=40)

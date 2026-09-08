@@ -6263,6 +6263,8 @@ void VulkanReplay::InitPostVSBuffers(uint32_t eventId, VulkanRenderState state)
   if(m_PostVS.Data.find(eventId) != m_PostVS.Data.end())
     return;
 
+  m_pDriver->InvalidateLiveForward("postVSCapture");
+
   // we handle out-of-memory errors while processing postvs, don't treat it as a fatal error
   ScopedOOMHandleVk oom(m_pDriver);
 

@@ -220,6 +220,7 @@ void Program::ParseConstant(ValueList &values, const LLVMBC::BlockOrRecord &cons
   else if(IS_KNOWN(constant.id, ConstantsRecord::EVAL_CAST))
   {
     Constant *c = values.nextValue<Constant>();
+    m_ReplayParseComplete &= constant.ops[0] <= 12;
     c->op = DecodeCast(constant.ops[0]);
     c->type = m_CurParseType;
     c->setInner(values.getOrCreatePlaceholder((size_t)constant.ops[2]));
@@ -229,6 +230,7 @@ void Program::ParseConstant(ValueList &values, const LLVMBC::BlockOrRecord &cons
   {
     Constant *c = values.nextValue<Constant>();
     c->type = m_CurParseType;
+    m_ReplayParseComplete &= constant.ops[0] <= 12;
     c->op = DecodeBinOp(c->type, constant.ops[0]);
     rdcarray<Value *> members;
     members.push_back(values.getOrCreatePlaceholder((size_t)constant.ops[1]));
@@ -272,6 +274,7 @@ void Program::ParseConstant(ValueList &values, const LLVMBC::BlockOrRecord &cons
       }
       else
       {
+        m_ReplayParseComplete = false;
         RDCERR("Unexpected type %d encountered in GEP", c->type->type);
       }
     }
@@ -330,6 +333,7 @@ void Program::ParseConstant(ValueList &values, const LLVMBC::BlockOrRecord &cons
   }
   else
   {
+    m_ReplayParseComplete = false;
     RDCERR("Unknown record ID %u encountered in constants block", constant.id);
   }
 }
@@ -354,6 +358,8 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
 
   // we should have consumed all bits, only one top-level block
   RDCASSERT(reader.AtEndOfStream());
+  m_ReplayParseComplete &= root.IsBlock() && KnownBlock(root.id) == KnownBlock::MODULE_BLOCK &&
+                           reader.AtEndOfStream() && !reader.HasError();
 
   m_Type = DXBC::ShaderType(header->ProgramType);
   m_Major = (header->ProgramVersion & 0xf0) >> 4;
@@ -384,6 +390,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
       {
         if(rootchild.ops[0] != 1)
         {
+          m_ReplayParseComplete = false;
           RDCERR("Unsupported LLVM bitcode version %u", rootchild.ops[0]);
           break;
         }
@@ -540,6 +547,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
       }
       else
       {
+        m_ReplayParseComplete = false;
         RDCERR("Unknown record ID %u encountered at module scope", rootchild.id);
       }
     }
@@ -555,12 +563,14 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
         {
           if(attrgroup.IsBlock())
           {
+            m_ReplayParseComplete = false;
             RDCERR("Unexpected subblock in PARAMATTR_GROUP_BLOCK");
             continue;
           }
 
           if(!IS_KNOWN(attrgroup.id, ParamAttrGroupRecord::ENTRY))
           {
+            m_ReplayParseComplete = false;
             RDCERR("Unexpected attribute group record ID %u", attrgroup.id);
             continue;
           }
@@ -591,7 +601,10 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                   case Attribute::StackAlignment: group->stackAlign = param; break;
                   case Attribute::Dereferenceable: group->derefBytes = param; break;
                   case Attribute::DereferenceableOrNull: group->derefOrNullBytes = param; break;
-                  default: RDCERR("Unexpected attribute %llu with parameter", attr);
+                  default:
+                    m_ReplayParseComplete = false;
+                    RDCERR("Unexpected attribute %llu with parameter", attr);
+                    break;
                 }
                 i += 2;
                 break;
@@ -630,12 +643,14 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
         {
           if(paramattr.IsBlock())
           {
+            m_ReplayParseComplete = false;
             RDCERR("Unexpected subblock in PARAMATTR_BLOCK");
             continue;
           }
 
           if(!IS_KNOWN(paramattr.id, ParamAttrRecord::ENTRY))
           {
+            m_ReplayParseComplete = false;
             RDCERR("Unexpected attribute record ID %u", paramattr.id);
             continue;
           }
@@ -662,6 +677,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
             }
             else
             {
+              m_ReplayParseComplete = false;
               RDCERR("Attribute refers to out of bounds group %llu", g);
             }
           }
@@ -683,6 +699,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
         {
           if(typ.IsBlock())
           {
+            m_ReplayParseComplete = false;
             RDCERR("Unexpected subblock in TYPE_BLOCK");
             continue;
           }
@@ -848,6 +865,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
           }
           else
           {
+            m_ReplayParseComplete = false;
             RDCERR("Unknown record ID %u encountered in type block", typ.id);
           }
         }
@@ -862,6 +880,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
         {
           if(constant.IsBlock())
           {
+            m_ReplayParseComplete = false;
             RDCERR("Unexpected subblock in CONSTANTS_BLOCK");
             continue;
           }
@@ -875,12 +894,14 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
         {
           if(symtab.IsBlock())
           {
+            m_ReplayParseComplete = false;
             RDCERR("Unexpected subblock in VALUE_SYMTAB_BLOCK");
             continue;
           }
 
           if(!IS_KNOWN(symtab.id, ValueSymtabRecord::ENTRY))
           {
+            m_ReplayParseComplete = false;
             RDCERR("Unexpected symbol table record ID %u", symtab.id);
             continue;
           }
@@ -900,6 +921,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
           }
           else
           {
+            m_ReplayParseComplete = false;
             RDCERR("Value %zu referenced out of bounds", vidx);
           }
         }
@@ -913,6 +935,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
 
           if(metaRecord.IsBlock())
           {
+            m_ReplayParseComplete = false;
             RDCERR("Unexpected subblock in METADATA_BLOCK");
             continue;
           }
@@ -968,6 +991,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               bool parsed = ParseDebugMetaRecord(metadata, metaRecord, *meta);
               if(!parsed)
               {
+                m_ReplayParseComplete = false;
                 RDCERR("unhandled metadata type %u", metaRecord.id);
               }
             }
@@ -976,6 +1000,11 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
       }
       else if(IS_KNOWN(rootchild.id, KnownBlock::FUNCTION_BLOCK))
       {
+        if(functionDecls.empty())
+        {
+          m_ReplayParseComplete = false;
+          continue;
+        }
         Function *f = m_Functions[functionDecls[0]];
         functionDecls.erase(0);
 
@@ -1012,6 +1041,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               {
                 if(constant.IsBlock())
                 {
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected subblock in CONSTANTS_BLOCK");
                   continue;
                 }
@@ -1029,6 +1059,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               {
                 if(metaRecord.IsBlock())
                 {
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected subblock in function METADATA_BLOCK");
                   continue;
                 }
@@ -1043,6 +1074,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                 }
                 else
                 {
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected record %u in function METADATA_BLOCK", metaRecord.id);
                 }
 
@@ -1055,6 +1087,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               {
                 if(symtab.IsBlock())
                 {
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected subblock in function VALUE_SYMTAB_BLOCK");
                   continue;
                 }
@@ -1065,6 +1098,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
 
                   if(idx >= values.curValueIndex())
                   {
+                    m_ReplayParseComplete = false;
                     RDCERR("Out of bounds symbol index %zu (%s) in function symbol table", idx,
                            symtab.getString(1).c_str());
                     continue;
@@ -1094,6 +1128,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                 }
                 else
                 {
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected function symbol table record ID %u", symtab.id);
                   continue;
                 }
@@ -1105,12 +1140,14 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               {
                 if(meta.IsBlock())
                 {
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected subblock in METADATA_ATTACHMENT");
                   continue;
                 }
 
                 if(!IS_KNOWN(meta.id, MetaDataRecord::ATTACHMENT))
                 {
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected record %u in METADATA_ATTACHMENT", meta.id);
                   continue;
                 }
@@ -1138,6 +1175,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               {
                 if(uselist.IsBlock())
                 {
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected subblock in USELIST_BLOCK");
                   continue;
                 }
@@ -1154,6 +1192,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                 }
                 else
                 {
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected record %u in USELIST_BLOCK", uselist.id);
                   continue;
                 }
@@ -1161,6 +1200,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
             }
             else
             {
+              m_ReplayParseComplete = false;
               RDCERR("Unexpected subblock %u in FUNCTION_BLOCK", funcChild.id);
               continue;
             }
@@ -1231,6 +1271,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
 
               if(!funcCall)
               {
+                m_ReplayParseComplete = false;
                 RDCERR("Unexpected symbol type called in INST_CALL");
                 continue;
               }
@@ -1289,6 +1330,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               inst->type = op.getType();
 
               uint64_t opcode = op.get<uint64_t>();
+              m_ReplayParseComplete &= opcode <= 12;
               inst->op = DecodeCast(opcode);
 
               f->instructions.push_back(inst);
@@ -1338,7 +1380,9 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               inst->type = inst->args.back()->type;
               inst->args.push_back(op.getSymbol(false));
 
-              inst->op = DecodeBinOp(inst->type, op.get<uint64_t>());
+              const uint64_t opcode = op.get<uint64_t>();
+              m_ReplayParseComplete &= opcode <= 12;
+              inst->op = DecodeBinOp(inst->type, opcode);
 
               if(op.remaining() > 0)
               {
@@ -1465,6 +1509,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                 }
                 else
                 {
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected type %d encountered in GEP", inst->type->type);
                 }
               }
@@ -1569,6 +1614,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
 
                 default:
                   inst->op = Operation::FOrdFalse;
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected comparison %llu", opcode);
                   break;
               }
@@ -1679,6 +1725,8 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                 inst->args.push_back(f->blocks[defaultDest]);
                 f->blocks[defaultDest]->preds.insert(0, f->blocks[curBlock]);
 
+                m_ReplayParseComplete = false;
+
                 RDCERR("Unsupported switch instruction version");
               }
               else
@@ -1772,6 +1820,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                 case 5: inst->opFlags() |= InstructionFlags::SuccessAcquireRelease; break;
                 case 6: inst->opFlags() |= InstructionFlags::SuccessSequentiallyConsistent; break;
                 default:
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected success ordering %llu", opcode);
                   inst->opFlags() |= InstructionFlags::SuccessSequentiallyConsistent;
                   break;
@@ -1783,7 +1832,10 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               {
                 case 0: inst->opFlags() |= InstructionFlags::SingleThread; break;
                 case 1: break;
-                default: RDCERR("Unexpected synchronisation scope %llu", opcode); break;
+                default:
+                  m_ReplayParseComplete = false;
+                  RDCERR("Unexpected synchronisation scope %llu", opcode);
+                  break;
               }
 
               f->instructions.push_back(inst);
@@ -1820,6 +1872,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                 case 5: inst->opFlags() |= InstructionFlags::SuccessAcquireRelease; break;
                 case 6: inst->opFlags() |= InstructionFlags::SuccessSequentiallyConsistent; break;
                 default:
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected success ordering %llu", opcode);
                   inst->opFlags() |= InstructionFlags::SuccessSequentiallyConsistent;
                   break;
@@ -1831,7 +1884,10 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               {
                 case 0: inst->opFlags() |= InstructionFlags::SingleThread; break;
                 case 1: break;
-                default: RDCERR("Unexpected synchronisation scope %llu", opcode); break;
+                default:
+                  m_ReplayParseComplete = false;
+                  RDCERR("Unexpected synchronisation scope %llu", opcode);
+                  break;
               }
 
               f->instructions.push_back(inst);
@@ -1866,6 +1922,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                 case 9: inst->op = Operation::AtomicUMax; break;
                 case 10: inst->op = Operation::AtomicUMin; break;
                 default:
+                  m_ReplayParseComplete = false;
                   RDCERR("Unhandled atomicrmw op %llu", opcode);
                   inst->op = Operation::AtomicExchange;
                   break;
@@ -1886,6 +1943,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                 case 5: inst->opFlags() |= InstructionFlags::SuccessAcquireRelease; break;
                 case 6: inst->opFlags() |= InstructionFlags::SuccessSequentiallyConsistent; break;
                 default:
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected success ordering %llu", opcode);
                   inst->opFlags() |= InstructionFlags::SuccessSequentiallyConsistent;
                   break;
@@ -1897,7 +1955,10 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               {
                 case 0: inst->opFlags() |= InstructionFlags::SingleThread; break;
                 case 1: break;
-                default: RDCERR("Unexpected synchronisation scope %llu", opcode); break;
+                default:
+                  m_ReplayParseComplete = false;
+                  RDCERR("Unexpected synchronisation scope %llu", opcode);
+                  break;
               }
 
               f->instructions.push_back(inst);
@@ -1960,6 +2021,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                 case 5: inst->opFlags() |= InstructionFlags::SuccessAcquireRelease; break;
                 case 6: inst->opFlags() |= InstructionFlags::SuccessSequentiallyConsistent; break;
                 default:
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected success ordering %llu", opcode);
                   inst->opFlags() |= InstructionFlags::SuccessSequentiallyConsistent;
                   break;
@@ -1971,7 +2033,10 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               {
                 case 0: inst->opFlags() |= InstructionFlags::SingleThread; break;
                 case 1: break;
-                default: RDCERR("Unexpected synchronisation scope %llu", opcode); break;
+                default:
+                  m_ReplayParseComplete = false;
+                  RDCERR("Unexpected synchronisation scope %llu", opcode);
+                  break;
               }
 
               // failure ordering
@@ -1986,6 +2051,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                 case 5: inst->opFlags() |= InstructionFlags::FailureAcquireRelease; break;
                 case 6: inst->opFlags() |= InstructionFlags::FailureSequentiallyConsistent; break;
                 default:
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected failure ordering %llu", opcode);
                   inst->opFlags() |= InstructionFlags::FailureSequentiallyConsistent;
                   break;
@@ -2017,6 +2083,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                 case 5: inst->opFlags() |= InstructionFlags::SuccessAcquireRelease; break;
                 case 6: inst->opFlags() |= InstructionFlags::SuccessSequentiallyConsistent; break;
                 default:
+                  m_ReplayParseComplete = false;
                   RDCERR("Unexpected success ordering %llu", opcode);
                   inst->opFlags() |= InstructionFlags::SuccessSequentiallyConsistent;
                   break;
@@ -2028,7 +2095,10 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
               {
                 case 0: inst->opFlags() |= InstructionFlags::SingleThread; break;
                 case 1: break;
-                default: RDCERR("Unexpected synchronisation scope %llu", opcode); break;
+                default:
+                  m_ReplayParseComplete = false;
+                  RDCERR("Unexpected synchronisation scope %llu", opcode);
+                  break;
               }
 
               f->instructions.push_back(inst);
@@ -2139,6 +2209,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
             else if(op.type == FunctionRecord::INST_VAARG)
             {
               // don't expect vararg instructions
+              m_ReplayParseComplete = false;
               RDCERR("Unexpected vararg instruction %u in DXIL", op.type);
             }
             else if(op.type == FunctionRecord::INST_LANDINGPAD ||
@@ -2146,10 +2217,12 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
                     op.type == FunctionRecord::INST_INVOKE || op.type == FunctionRecord::INST_RESUME)
             {
               // don't expect exception handling instructions
+              m_ReplayParseComplete = false;
               RDCERR("Unexpected exception handling instruction %u in DXIL", op.type);
             }
             else
             {
+              m_ReplayParseComplete = false;
               RDCERR("Unexpected record in FUNCTION_BLOCK");
               continue;
             }
@@ -2157,6 +2230,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
         }
 
         RDCASSERT(curBlock == f->blocks.size());
+        m_ReplayParseComplete &= curBlock == f->blocks.size();
 
         curBlock = 0;
         for(size_t i = 0; i < f->instructions.size(); i++)
@@ -2185,6 +2259,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
       }
       else
       {
+        m_ReplayParseComplete = false;
         RDCERR("Unknown block ID %u encountered at module scope", rootchild.id);
       }
     }
@@ -2202,6 +2277,7 @@ Program::Program(const byte *bytes, size_t length) : alloc(32 * 1024)
   }
 
   RDCASSERT(functionDecls.empty());
+  m_ReplayParseComplete &= functionDecls.empty();
 }
 
 rdcstr Program::GetValueSymtabString(Value *v)

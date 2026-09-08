@@ -1574,9 +1574,10 @@ RDResult WrappedID3D11Device::ReadLogInitialisation(RDCFile *rdc, bool storeStru
   return ResultCode::Succeeded;
 }
 
-void WrappedID3D11Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
+bool WrappedID3D11Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
                                     ReplayLogType replayType)
 {
+  ++m_ReplayExecutionSerial;
   bool partial = true;
 
   if(startEventID == 0 && (replayType == eReplay_WithoutDraw || replayType == eReplay_Full))
@@ -1629,6 +1630,7 @@ void WrappedID3D11Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
   if(m_pDevice->GetDeviceRemovedReason() != S_OK)
     SET_ERROR_RESULT(m_FatalError, ResultCode::DeviceLost, "Device lost during replay: %s",
                      ToStr(m_pDevice->GetDeviceRemovedReason()).c_str());
+  return result == ResultCode::Succeeded && !HasFatalError();
 }
 
 void WrappedID3D11Device::NewSwapchainBuffer(IUnknown *backbuffer)

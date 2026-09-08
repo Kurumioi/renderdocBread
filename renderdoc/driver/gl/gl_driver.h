@@ -709,7 +709,9 @@ public:
   bool IsUnsafeDraw(uint32_t eventId) { return m_UnsafeDraws.find(eventId) != m_UnsafeDraws.end(); }
   // replay interface
   void Initialise(GLInitParams &params, uint64_t sectionVersion, const ReplayOptions &opts);
-  void ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType);
+  void ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType,
+                 bool liveCursorManaged = false);
+  bool m_LastReplaySucceeded = false;
   RDResult ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
 
   GLuint GetFakeVAO0() { return m_Global_VAO0; }

@@ -3080,6 +3080,7 @@ bool ReplayController::FatalErrorCheck()
 
       m_Outputs[i]->m_pDevice = m_pDevice;
       m_Outputs[i]->m_HistorySnapshotActive = false;
+      m_Outputs[i]->m_HistoryReplaySource.Clear();
       if(staleSnapshotIds.find(m_Outputs[i]->m_RenderData.texDisplay.resourceId) !=
          staleSnapshotIds.end())
       {

@@ -148,6 +148,31 @@ def validate_live_forward_fixture(enabled, apis, demo):
         raise ValueError("--live-forward-fixture requires --apis D3D12 --d3d12-demo D3D12_RenderTarget_Binds")
 
 
+def validate_clear_fixture(enabled, apis, demo):
+    if enabled and (list(apis) != ["D3D12"] or demo != "D3D12_Checkpoint_Triangle"):
+        raise ValueError("--checkpoint-clear-fixture requires --apis D3D12 --d3d12-demo D3D12_Checkpoint_Triangle")
+
+
+def validate_alias_fixture(mode, apis, demo, clear_fixture=False):
+    if mode not in ("off", "clear", "read", "split"):
+        raise ValueError("Unknown checkpoint alias fixture mode")
+    if mode != "off":
+        if list(apis) != ["D3D12"] or demo != "D3D12_Checkpoint_Triangle":
+            raise ValueError("--checkpoint-alias-fixture requires --apis D3D12 "
+                             "--d3d12-demo D3D12_Checkpoint_Triangle")
+        if clear_fixture:
+            raise ValueError("--checkpoint-alias-fixture and --checkpoint-clear-fixture are mutually exclusive")
+
+
+def alias_fixture_environment(rd, mode):
+    modification = rd.EnvironmentModification()
+    modification.name = "RENDERDOC_CHECKPOINT_ALIAS_FIXTURE"
+    # Disable inherited variants unless the current invocation explicitly selects one.
+    modification.value = mode
+    modification.mod, modification.sep = rd.EnvMod.Set, rd.EnvSep.NoSep
+    return modification
+
+
 def fixture_environment(rd, enabled):
     modification = rd.EnvironmentModification()
     modification.name = "RENDERDOC_LIVE_FORWARD_FIXTURE"
@@ -201,7 +226,9 @@ def prepare_vulkan_layer(source_path, library_path, output):
 
 def capture_one(api, demo, output, timeout, frame, compiler_dir, layer_manifest, layer_library,
                 d3d12_demo="D3D12_Simple_Triangle", d3d11_demo="D3D11_Simple_Triangle",
-                gl_demo="GL_Simple_Triangle", vk_demo="VK_Simple_Triangle", live_forward_fixture=False):
+                gl_demo="GL_Simple_Triangle", vk_demo="VK_Simple_Triangle", live_forward_fixture=False,
+                portable_forward_fixture=False, checkpoint_clear_fixture=False,
+                checkpoint_alias_fixture="off"):
     rd = renderdoc_module()
     tests = {"D3D11": d3d11_demo, "OpenGL": gl_demo, "OpenGLES": gl_demo,
              "Vulkan": vk_demo, "D3D12": d3d12_demo}
@@ -214,11 +241,31 @@ def capture_one(api, demo, output, timeout, frame, compiler_dir, layer_manifest,
     started = time.monotonic()
     try:
         validate_live_forward_fixture(live_forward_fixture, [api], tests[api])
+        validate_clear_fixture(checkpoint_clear_fixture, [api], tests[api])
+        validate_alias_fixture(checkpoint_alias_fixture, [api], tests[api], checkpoint_clear_fixture)
         log_path = output / (tests[api] + ".log")
         command = '{} --width 400 --height 300 --log "{}"'.format(tests[api], log_path)
         envmods = [fixture_environment(rd, live_forward_fixture)]
+        portable = rd.EnvironmentModification()
+        portable.name = "RENDERDOC_PORTABLE_FORWARD_FIXTURE"
+        portable.value = "1" if portable_forward_fixture else "0"
+        portable.mod, portable.sep = rd.EnvMod.Set, rd.EnvSep.NoSep
+        envmods.append(portable)
+        clear_fixture = rd.EnvironmentModification()
+        clear_fixture.name = "RENDERDOC_CHECKPOINT_CLEAR_FIXTURE"
+        clear_fixture.value = "1" if checkpoint_clear_fixture else "0"
+        clear_fixture.mod, clear_fixture.sep = rd.EnvMod.Set, rd.EnvSep.NoSep
+        envmods.append(clear_fixture)
+        alias_fixture = alias_fixture_environment(rd, checkpoint_alias_fixture)
+        envmods.append(alias_fixture)
         entry["childEnvironment"] = {"RENDERDOC_LIVE_FORWARD_FIXTURE": "1" if live_forward_fixture else "0"}
         entry["liveForwardFixture"] = bool(live_forward_fixture)
+        entry["childEnvironment"][portable.name] = portable.value
+        entry["portableForwardFixture"] = bool(portable_forward_fixture)
+        entry["childEnvironment"][clear_fixture.name] = clear_fixture.value
+        entry["checkpointClearFixture"] = bool(checkpoint_clear_fixture)
+        entry["childEnvironment"][alias_fixture.name] = alias_fixture.value
+        entry["checkpointAliasFixture"] = checkpoint_alias_fixture
         if api == "OpenGLES":
             modification = rd.EnvironmentModification()
             modification.name, modification.value = "RENDERDOC_SHARED_BUFFER_GLES", "1"
@@ -324,10 +371,17 @@ def main():
     parser.add_argument("--demos", default=os.environ.get("RENDERDOC_API_SMOKE_DEMOS", str(repo / "util/test/demos_x64.exe")))
     parser.add_argument("--output", default=os.environ.get("RENDERDOC_API_SMOKE_OUTPUT", str(repo / "output/eid-api-smoke")))
     parser.add_argument("--apis", default=os.environ.get("RENDERDOC_API_SMOKE_APIS", "D3D11,OpenGL,Vulkan"))
-    parser.add_argument("--d3d12-demo", choices=("D3D12_Simple_Triangle", "D3D12_Checkpoint_Triangle", "D3D12_Checkpoint_Query", "D3D12_Shared_Buffer", "D3D12_CBuffer_Zoo", "D3D12_RenderTarget_Binds"),
+    parser.add_argument("--d3d12-demo", choices=("D3D12_Simple_Triangle", "D3D12_Checkpoint_Triangle", "D3D12_Checkpoint_Query", "D3D12_Shared_Buffer", "D3D12_CBuffer_Zoo", "D3D12_RenderTarget_Binds", "D3D12_UAV_Declarations", "D3D12_Sparse_Initial_Residency"),
                         default="D3D12_Simple_Triangle")
     parser.add_argument("--live-forward-fixture", action="store_true",
                         help="Enable per-frame RT clears in the D3D12_RenderTarget_Binds proof fixture")
+    parser.add_argument("--portable-forward-fixture", action="store_true",
+                        help="Request the four-region single-pass VK_Shared_Buffer proof fixture")
+    parser.add_argument("--checkpoint-clear-fixture", action="store_true",
+                        help="Fully clear each closed submission in D3D12_Checkpoint_Triangle")
+    parser.add_argument("--checkpoint-alias-fixture", choices=("off", "clear", "read", "split"),
+                        default="off", help="Committed RT clear after an unrelated alias barrier; "
+                        "read and split select conservative negative cases")
     parser.add_argument("--d3d11-demo", choices=("D3D11_Simple_Triangle", "D3D11_Shared_Buffer", "D3D11_CBuffer_Zoo"), default="D3D11_Simple_Triangle")
     parser.add_argument("--gl-demo", choices=("GL_Simple_Triangle", "GL_Shared_Buffer", "GL_CBuffer_Zoo"), default="GL_Simple_Triangle")
     parser.add_argument("--vk-demo", choices=("VK_Simple_Triangle", "VK_Shared_Buffer", "VK_CBuffer_Zoo"), default="VK_Simple_Triangle")
@@ -345,8 +399,13 @@ def main():
         parser.error("--apis accepts D3D11,D3D12,OpenGL,OpenGLES,Vulkan")
     if "OpenGLES" in apis and args.gl_demo != "GL_Shared_Buffer":
         parser.error("OpenGLES requires GL_Shared_Buffer, which explicitly requests an ES context")
+    if args.portable_forward_fixture and (apis != ["Vulkan"] or args.vk_demo != "VK_Shared_Buffer"):
+        parser.error("--portable-forward-fixture requires --apis Vulkan --vk-demo VK_Shared_Buffer")
     try:
         validate_live_forward_fixture(args.live_forward_fixture, apis, args.d3d12_demo)
+        validate_clear_fixture(args.checkpoint_clear_fixture, apis, args.d3d12_demo)
+        validate_alias_fixture(args.checkpoint_alias_fixture, apis, args.d3d12_demo,
+                               args.checkpoint_clear_fixture)
     except ValueError as error:
         parser.error(str(error))
     if args.frame < 1 or args.timeout <= 0:
@@ -375,7 +434,9 @@ def main():
                                                 compiler_dir, args.vulkan_layer_manifest,
                                                 args.vulkan_layer_library, args.d3d12_demo,
                                                 args.d3d11_demo, args.gl_demo, args.vk_demo,
-                                                args.live_forward_fixture))
+                                                args.live_forward_fixture, args.portable_forward_fixture,
+                                                args.checkpoint_clear_fixture,
+                                                args.checkpoint_alias_fixture))
             (run_output / "capture-results.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         result["ok"] = all(entry["ok"] for entry in result["captures"])
     finally:

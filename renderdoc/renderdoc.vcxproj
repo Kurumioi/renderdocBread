@@ -257,6 +257,7 @@
     <ClInclude Include="replay\common\var_dispatch_helpers.h" />
     <ClInclude Include="replay\dummy_driver.h" />
     <ClInclude Include="replay\replay_driver.h" />
+    <ClInclude Include="replay\replay_resource_versions.h" />
     <ClInclude Include="replay\replay_controller.h" />
     <ClInclude Include="serialise\lz4io.h" />
     <ClInclude Include="serialise\rdcfile.h" />
@@ -661,6 +662,7 @@
     <ClCompile Include="replay\dummy_driver.cpp" />
     <ClCompile Include="replay\entry_points.cpp" />
     <ClCompile Include="replay\replay_driver.cpp" />
+    <ClCompile Include="replay\replay_resource_versions.cpp" />
     <ClCompile Include="replay\replay_output.cpp" />
     <ClCompile Include="replay\replay_controller.cpp" />
     <ClCompile Include="serialise\codecs\chrome_json_codec.cpp" />

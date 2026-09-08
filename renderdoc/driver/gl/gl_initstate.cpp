@@ -194,8 +194,12 @@ void WrappedOpenGL::TextureData::GetCompressedImageDataGLES(int mip, GLenum targ
   }
 }
 
-void GLResourceManager::ContextPrepare_InitialState(GLResource res, GLInitialContents *checkpoint)
+void GLResourceManager::ContextPrepare_InitialState(GLResource res, GLInitialContents *checkpoint,
+                                                  bool copyContents)
 {
+  // Content sharing is a checkpoint-only decision backed by a capture-wide write proof. Normal
+  // capture initial-state creation must always retain the original bytes.
+  copyContents = copyContents || checkpoint == NULL;
   GLInitialContents initContents;
 
   initContents.type = res.Namespace;
@@ -263,7 +267,7 @@ void GLResourceManager::ContextPrepare_InitialState(GLResource res, GLInitialCon
   }
   else if(res.Namespace == eResTexture)
   {
-    PrepareTextureInitialContents(id, res, checkpoint);
+    PrepareTextureInitialContents(id, res, checkpoint, copyContents);
     return;
   }
   else if(res.Namespace == eResFramebuffer)
@@ -609,7 +613,8 @@ bool GLResourceManager::Prepare_InitialState(GLResource res)
 }
 
 void GLResourceManager::PrepareTextureInitialContents(ResourceId id, GLResource res,
-                                                       GLInitialContents *checkpoint)
+                                                       GLInitialContents *checkpoint,
+                                                       bool copyContents)
 {
   WrappedOpenGL::TextureData &details = m_Driver->m_Textures[id];
 
@@ -736,7 +741,7 @@ void GLResourceManager::PrepareTextureInitialContents(ResourceId id, GLResource 
     // we only copy contents for non-views
     GLuint tex = 0;
 
-    if(!details.view)
+    if(!details.view && (copyContents || checkpoint == NULL))
     {
       {
         GLuint oldtex = 0;

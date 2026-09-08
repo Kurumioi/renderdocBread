@@ -93,6 +93,7 @@ class WrappedID3D12Resource;
 class WrappedID3D12PipelineState;
 class D3D12AccelerationStructure;
 struct D3D12ReplayCheckpointCache;
+struct D3D12DescriptorRestoreRange;
 
 // Counts recorded copies from their actual native source, not the size of an immutable source
 // considered by the residency cache. Footprints include upload padding; neither field measures
@@ -151,6 +152,71 @@ struct D3D12ReplayInitialCopyStats
     upload.Add(stats.upload);
     gpuDefault.Add(stats.gpuDefault);
     other.Add(stats.other);
+  }
+};
+
+// A canonical sparse initial-state transaction, not a snapshot of an arbitrary EID. A published
+// seed is consumed only while the complete physical component has had no intervening writes or
+// mapping changes. Failed/second resets cannot publish a partially recorded seed.
+struct D3D12ReplaySparseInitialBaseline
+{
+  uint64_t generation = 1, pendingGeneration = 0;
+  uint64_t recordedBytes = 0, residentBytes = 0;
+  std::map<ResourceId, uint64_t> recordedResourceBytes, residentResourceBytes;
+  bool resident = false, pending = false, retained = false;
+  rdcstr reason = "noSubmittedBaseline";
+
+  void Invalidate(const char *why)
+  {
+    generation++;
+    resident = pending = retained = false;
+    recordedBytes = residentBytes = 0;
+    recordedResourceBytes.clear();
+    residentResourceBytes.clear();
+    reason = why;
+  }
+
+  bool Begin(bool eligible, bool recordingAllowed, bool firstReset, bool reuseAllowed, bool dirty)
+  {
+    retained = eligible && recordingAllowed && firstReset && reuseAllowed && !dirty && resident;
+    pending = false;
+    if(retained)
+      return true;
+    const rdcstr previousReason = reason;
+    Invalidate(dirty ? "componentDirty" : previousReason.c_str());
+    pending = eligible && recordingAllowed && firstReset;
+    pendingGeneration = generation;
+    return false;
+  }
+
+  void Record(ResourceId resource, uint64_t bytes)
+  {
+    if(!pending)
+      return;
+    if(bytes > ~0ULL - recordedBytes)
+      Invalidate("initialCopyByteOverflow");
+    else
+    {
+      recordedBytes += bytes;
+      recordedResourceBytes[resource] += bytes;
+    }
+  }
+
+  bool Submit(bool succeeded)
+  {
+    if(!pending)
+      return false;
+    if(!succeeded || pendingGeneration != generation || recordedBytes == 0)
+    {
+      Invalidate("initialSubmissionFailedOrEmpty");
+      return false;
+    }
+    resident = true;
+    residentBytes = recordedBytes;
+    residentResourceBytes = recordedResourceBytes;
+    pending = false;
+    reason = "submittedInitialContents";
+    return true;
   }
 };
 
@@ -804,6 +870,7 @@ private:
   {
     std::set<ResourceId> resources;
     std::map<ResourceId, uint64_t> heaps;
+    D3D12ReplaySparseInitialBaseline baseline;
   };
   rdcarray<ReplaySparseDirtyComponent> m_ReplaySparseComponents;
   std::map<ResourceId, size_t> m_ReplaySparseComponentIndex;
@@ -811,6 +878,7 @@ private:
   bool m_ReplaySparseGraphBuilt = false;
   bool m_ReplaySparseGraphComplete = false;
   bool m_ReplaySparseDirtyEnabled = true;
+  bool m_ReplaySparseInitialResidencyEnabled = false;
   rdcstr m_ReplaySparseGraphReason;
   struct LiveForwardState
   {
@@ -822,7 +890,10 @@ private:
     rdcstr reason = "noOrdinaryTarget";
   } m_LiveForward;
   void BuildReplaySparseDirtyGraph();
-  bool MarkReplaySparseComponentDirty(ResourceId resource);
+  bool MarkReplaySparseComponentDirty(ResourceId resource, const char *reason = "resourceWrite");
+  void PrepareReplaySparseInitialBaselines(bool firstReset);
+  void CompleteReplaySparseInitialBaselines();
+  void InvalidateReplaySparseInitialBaselines(const char *reason);
   void PrepareReplaySparseInitialWrites();
   rdcarray<ReplayBufferPatch> m_ReplayBufferPatches;
   rdcarray<uint64_t> m_ReplayBufferPatchOffsets;
@@ -1122,6 +1193,7 @@ public:
     else
     {
       m_FatalError = error;
+      InvalidateReplaySparseInitialBaselines("fatalError");
     }
   }
   RDResult FatalErrorCheck() { return m_FatalError; }
@@ -1227,7 +1299,10 @@ public:
   bool IsReplayDirtyTrackingValid() const { return m_ReplayDirtyValid; }
   void MarkReplayResourceDirty(ResourceId resource, bool unboundedRootUAV = false);
   void MarkCheckpointReplayWrites();
+  bool HasReplayCheckpointDependencyEdits() const { return m_CheckpointDependenciesEdited; }
+  void MarkReplayFullOverwriteSubmitted(ResourceId resource);
   bool IsReplayInitialContentsUnchanged(ResourceId resource, uint64_t sourceBytes);
+  bool UseReplaySparseInitialBaseline(ResourceId resource);
   D3D12ReplayInitialCopySource GetReplayInitialCopySource(ID3D12Resource *nativeSource) const;
   void RecordReplayInitialCopy(ResourceId resource, uint64_t bytes,
                                D3D12ReplayInitialCopySource source, bool footprint = false,
@@ -1257,6 +1332,10 @@ public:
 
   void ApplyInitialContents(bool useCheckpointSources = false);
   bool UsesCheckpointInitialContents(ResourceId resource);
+  void GetCheckpointInitialDescriptorRanges(
+      ResourceId heap, ResourceId initial, uint32_t count,
+      rdcarray<D3D12DescriptorRestoreRange> &copies,
+      rdcarray<D3D12DescriptorRestoreRange> &deferred);
   void GetCheckpointInitialCopyRanges(ResourceId heap, uint64_t byteCount,
                                       rdcarray<rdcpair<uint64_t, uint64_t>> &ranges);
 

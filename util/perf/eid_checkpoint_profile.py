@@ -13,6 +13,7 @@ from pathlib import Path
 import struct
 import sys
 import traceback
+from types import SimpleNamespace
 
 from eid_history_profile import Recorder, integer_list, resource_number
 
@@ -132,6 +133,26 @@ def output_subresources(texture, binding):
     return result
 
 
+def resolve_extra_textures(names, resources, textures):
+    """Resolve explicit whole-resource witnesses once; ambiguous/missing names cannot be skipped."""
+    if len(names) > 16 or len(set(names)) != len(names) or any(not name for name in names):
+        raise ValueError("Provide at most sixteen distinct nonempty extra texture names")
+    result = []
+    for name in names:
+        named = [r for r in resources if str(r.name) == name]
+        if len(named) != 1:
+            raise ValueError("Extra texture name is missing or ambiguous: " + name)
+        matches = [t for t in textures if t.resourceId == named[0].resourceId]
+        if len(matches) != 1:
+            raise ValueError("Extra resource is not exactly one captured texture: " + name)
+        texture = matches[0]
+        if any(int(getattr(texture, key)) < 1 for key in
+               ("width", "height", "depth", "mips", "arraysize")):
+            raise ValueError("Extra texture has invalid native dimensions: " + name)
+        result.append((name, texture))
+    return result
+
+
 def selected_event_evidence(controller, events):
     """Read existing structured metadata only; do not infer an API EID from its nearest draw."""
     structured = controller.GetStructuredFile()
@@ -178,7 +199,11 @@ def main():
     parser.add_argument("--budget-mib", type=int, default=0, help="0 selects automatic capture-size budget")
     parser.add_argument("--max-checkpoints", type=int, default=0)
     parser.add_argument("--max-read-mib", type=int, default=512)
+    parser.add_argument("--extra-texture", action="append", default=[],
+                        help="Also validate every subresource of this exact named texture at each EID")
     parser.add_argument("--min-hits", type=int, default=1)
+    parser.add_argument("--min-full-clear-restores", type=int, default=0,
+                        help="Require actual checkpoint restores that omit a proven full-clear resource")
     parser.add_argument("--steady-rounds", type=int, default=0,
                         help="Additional alternating normal visits with checkpoints enabled and disabled")
     parser.add_argument("--verify-reconfigure", action="store_true",
@@ -194,7 +219,8 @@ def main():
         parser.error(str(error))
     if (not args.capture or not args.output or args.budget_mib < 0 or
             not 0 <= args.max_checkpoints <= 64 or args.max_read_mib <= 0 or
-            args.min_hits < 0 or args.max_seconds <= 0 or not 0 <= args.steady_rounds <= 32):
+            args.min_hits < 0 or args.min_full_clear_restores < 0 or args.max_seconds <= 0 or
+            not 0 <= args.steady_rounds <= 32):
         parser.error("Capture/output and valid positive limits are required")
     capture, output = Path(args.capture).resolve(), Path(args.output).resolve()
     if not capture.is_file() or output.exists():
@@ -203,6 +229,17 @@ def main():
     report = {"schema": "renderdoc-checkpoint-profile/v1", "ok": False, "samples": [],
               "capture": str(capture), "captureBytes": capture.stat().st_size, "events": events,
               "buildLabel": args.build_label, "processId": os.getpid(), "visits": [],
+              "replayEnvironment": {name: os.environ.get(name) for name in (
+                  "RENDERDOC_D3D12_DISABLE_ACTIVE_WRITE_STAGES",
+                  "RENDERDOC_D3D12_ENABLE_UAV_DECLARATION_RANGES",
+                  "RENDERDOC_D3D12_ENABLE_SPARSE_INITIAL_RESIDENCY",
+                  "RENDERDOC_D3D12_DISABLE_CHECKPOINT_RESIDENT_REUSE",
+                  "RENDERDOC_D3D12_DISABLE_CHECKPOINT_INITIAL_SOURCES",
+                  "RENDERDOC_D3D12_ENABLE_CHECKPOINT_DESCRIPTOR_OVERLAY",
+                  "RENDERDOC_D3D12_CHECKPOINT_FULL_CLEAR_PREFIX",
+                  "RENDERDOC_D3D12_CHECKPOINT_FAIL_AFTER_INITIAL",
+                  "RENDERDOC_D3D12_INITIAL_SOURCE_CACHE_ORDER",
+                  "RENDERDOC_GL_DISABLE_STATIC_CHECKPOINT_SHARING")},
               "configuration": vars(args), "issues": [], "eventComparisons": [],
               "coverage": "Full native pixels of every bound color/depth output view (all view mips, "
                           "array slices and samples; whole volume for 3D), plus pipeline binding witness. "
@@ -218,6 +255,7 @@ def main():
     from eid_shared_buffer_profile import build_identity
     report["buildIdentity"] = build_identity(rd, None)
     capture_file, controller = None, None
+    extra_textures = []
     rd.InitialiseReplay(rd.GlobalEnvironment(), [])
 
     def status():
@@ -266,6 +304,23 @@ def main():
                     continue
                 unique.add(key)
                 # Conservative allocation budget; GetTextureData may expose padded/native planes.
+                mip = sub[0]
+                estimated += max(1, int(texture.width) >> mip) * max(1, int(texture.height) >> mip) * max(1, int(texture.depth) >> mip) * 16
+                requests.append((key, texture.resourceId, sub))
+        if extra_textures:
+            witness["extraTextures"] = []
+        for name, texture in extra_textures:
+            witness["extraTextures"].append({"name": name, "resource": str(texture.resourceId),
+                                               "format": texture.format.Name(),
+                                               "mips": int(texture.mips), "slices": int(texture.arraysize),
+                                               "samples": int(texture.msSamp)})
+            whole = SimpleNamespace(firstMip=0, numMips=int(texture.mips), firstSlice=0,
+                                    numSlices=int(texture.arraysize))
+            for sub in output_subresources(texture, whole):
+                key = (str(texture.resourceId),) + sub
+                if key in unique:
+                    continue
+                unique.add(key)
                 mip = sub[0]
                 estimated += max(1, int(texture.width) >> mip) * max(1, int(texture.height) >> mip) * max(1, int(texture.depth) >> mip) * 16
                 requests.append((key, texture.resourceId, sub))
@@ -454,6 +509,10 @@ def main():
         result, controller = opened
         if result != rd.ResultCode.Succeeded or controller is None:
             raise RuntimeError("OpenCapture failed: " + str(result))
+        extra_textures = resolve_extra_textures(args.extra_texture, controller.GetResources(),
+                                                controller.GetTextures())
+        report["extraTextureResources"] = [{"name": name, "resource": str(texture.resourceId)}
+                                             for name, texture in extra_textures]
         report["selectedEventEvidence"], _ = recorder.measure(
             "capture.selectedEventEvidence", lambda: selected_event_evidence(controller, events))
         if any(row["status"] != "exactAPIEvent" for row in report["selectedEventEvidence"]):
@@ -484,6 +543,12 @@ def main():
         report["observedHits"] = report["checkpointPhaseStatus"]["hits"] - start_hits
         if report["observedHits"] < args.min_hits:
             report["issues"].append("required checkpoint hits were not observed")
+        report["fullClearRestoreCount"] = sum(
+            1 for sample in report["samples"] for row in sample.get("timingRecords", [])
+            if row.get("api") == "D3D12Checkpoint" and row.get("op") == "restore"
+            and row.get("fullClearInitialCopiesDeferred", 0) > 0)
+        if report["fullClearRestoreCount"] < args.min_full_clear_restores:
+            report["issues"].append("required native full-clear copy omissions were not observed")
         for event in events:
             canonical = [visit("canonical", event, True)["witness"] for _ in range(2)]
             observed = [v["witness"] for v in report["visits"] if v["eventId"] == event and not v["force"]]

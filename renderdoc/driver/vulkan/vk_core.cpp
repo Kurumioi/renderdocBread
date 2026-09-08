@@ -49,6 +49,7 @@ RDOC_DEBUG_CONFIG(bool, Vulkan_Debug_SingleSubmitFlushing, false,
                   "the source of problems.");
 
 #include "vk_checkpoint.inl"
+#include "vk_live_forward.inl"
 #include "vk_buffer_patches.inl"
 
 uint64_t VkInitParams::GetSerialiseSize()
@@ -4190,6 +4191,7 @@ RDResult WrappedVulkan::ContextReplayLog(CaptureState readType, uint32_t startEv
 
 void WrappedVulkan::ApplyInitialContents()
 {
+  InvalidateLiveForward("initialContentsRestore");
   RENDERDOC_PROFILEFUNCTION();
   if(HasFatalError())
     return;
@@ -5139,12 +5141,67 @@ VkResourceRecord *WrappedVulkan::RegisterSurface(WindowingSystem system, void *h
 }
 
 void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType,
-                              bool allowCheckpoints)
+                              bool allowCheckpoints, bool ordinaryRoot, bool ordinaryTarget)
 {
+  PerformanceTimer liveTimer;
+  const bool ordinaryPrefix = VulkanLiveForwardOrdinaryRoot(
+      startEventID, replayType, ordinaryRoot, m_Replay->m_ReplayCheckpointBypass,
+      m_Replay->m_ReplayCheckpointNaturalReference, m_ActionCallback != NULL);
+  ordinaryTarget &= replayType == eReplay_OnlyDraw && !m_ActionCallback;
+  const uint32_t previousLiveEvent = m_LiveForward.eventId;
+  const bool liveEnabled = Process::GetEnvVariable("RENDERDOC_VULKAN_ENABLE_LIVE_FORWARD") != "0";
+  rdcstr liveReason = m_LiveForward.reason;
+  bool liveForward = false;
+  if(ordinaryPrefix)
+  {
+    if(liveEnabled)
+      liveForward = CanReplayLiveForward(endEventID, liveReason);
+    else
+      liveReason = "disabled";
+    // Consume the previous cursor before doing any work. Only the completed target can publish.
+    m_LiveForward.valid = false;
+    m_LiveForward.pendingTarget = 0;
+  }
+  else if(!ordinaryTarget)
+  {
+    InvalidateLiveForward("forceOrAnalysisReplay");
+  }
+  bool liveRequestSucceeded = false;
+  struct FinishLiveRequest
+  {
+    WrappedVulkan *driver;
+    uint32_t eventId, previous;
+    bool ordinaryRoot, ordinaryTarget, enabled, hit;
+    bool &succeeded;
+    const rdcstr &reason;
+    PerformanceTimer &timer;
+    ~FinishLiveRequest()
+    {
+      driver->FinishLiveForwardRequest(eventId, ordinaryRoot, ordinaryTarget, succeeded);
+      if(ordinaryRoot && Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+        LogVulkanCheckpoint(StringFormat::Fmt(
+            "api=VulkanLiveForward from=%u target=%u enabled=%u hit=%u reason=%s "
+            "initialRestoreSkipped=%u replayedEvents=%u succeeded=%u total_ms=%.3f",
+            previous, eventId, enabled ? 1U : 0U, hit ? 1U : 0U, reason.c_str(), hit ? 1U : 0U,
+            hit ? eventId - previous - 1 : 0, succeeded ? 1U : 0U, timer.GetMilliseconds()));
+    }
+  } finishLiveRequest = {this, endEventID, previousLiveEvent, ordinaryPrefix, ordinaryTarget,
+                         liveEnabled, liveForward, liveRequestSucceeded, liveReason, liveTimer};
   bool partial = true;
   const bool wholePrefix = startEventID == 0 &&
       (replayType == eReplay_WithoutDraw || replayType == eReplay_Full);
-  const bool checkpointRequest = allowCheckpoints && wholePrefix;
+  const bool checkpointRequest = allowCheckpoints && wholePrefix && !liveForward;
+  if(liveForward)
+  {
+    startEventID = previousLiveEvent + 1;
+    // Adjacent targets need no prefix commands; OnlyDraw will execute exactly the new event.
+    if(startEventID == endEventID)
+    {
+      m_State = CaptureState::ActiveReplaying;
+      liveRequestSucceeded = !HasFatalError();
+      return;
+    }
+  }
   if(checkpointRequest && !m_Replay->m_ReplayCheckpointBypass &&
      m_CheckpointConfig.enabled && m_CheckpointCaptureSafe && !m_ActionCallback &&
      m_CheckpointConfig.maxCheckpoints && m_CheckpointConfig.byteBudget &&
@@ -5209,6 +5266,7 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
       if(!m_CheckpointFileOrderReplay && resume == target + 1)
       {
         m_State = CaptureState::ActiveReplaying;
+        liveRequestSucceeded = !HasFatalError();
         return;
       }
     }
@@ -5384,12 +5442,14 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
     }
 
     RDCASSERTEQUAL(status.code, ResultCode::Succeeded);
+    liveRequestSucceeded = status.code == ResultCode::Succeeded;
 
     if(m_CheckpointFileOrderReplay && status.code != ResultCode::Succeeded)
       m_CheckpointFileOrderFailed = true;
 
     if(m_CheckpointFileOrderFailed || m_CheckpointFileOrderRestore)
     {
+      liveRequestSucceeded = false;
       // An incomplete/failed deferred restore cannot be displayed as the target. Retire those
       // points and replay canonically; a fatal device error remains fatal instead of being hidden.
       m_CheckpointFileOrderRestore = NULL;
@@ -5405,7 +5465,7 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
 
     if(m_OutsideCmdBuffer != VK_NULL_HANDLE)
     {
-      if((replayType == eReplay_OnlyDraw || checkpointResume) &&
+      if((replayType == eReplay_OnlyDraw || checkpointResume || liveForward) &&
          (m_LastCmdBufferID != ResourceId()))
         UpdateImageStates(m_BakedCmdBufferInfo[m_LastCmdBufferID].imageStates);
 
@@ -5431,7 +5491,9 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
       // whether or not a render pass was active.
       m_Partial.partialStack = cacheNodes;
 
-      ObjDisp(cmd)->EndCommandBuffer(Unwrap(cmd));
+      vkr = ObjDisp(cmd)->EndCommandBuffer(Unwrap(cmd));
+      CHECK_VKR(this, vkr);
+      liveRequestSucceeded &= vkr == VK_SUCCESS;
 
       AddPendingCommandBuffer(cmd);
 
@@ -7061,6 +7123,7 @@ void WrappedVulkan::UpdateImageStates(const rdcflatmap<ResourceId, ImageState> &
 
 void WrappedVulkan::ReplayDraw(VkCommandBuffer cmd, const ActionDescription &action)
 {
+  InvalidateLiveForward("analysisReplayDraw");
   // if this isn't a multidraw (or it's the first action in a multidraw, it's fairly easy
   if(action.drawIndex == 0)
   {
@@ -7285,6 +7348,125 @@ TEST_CASE("Vulkan shared edits use submitted first reads and preserve exact rang
   changed.buffer = ResourceIDGen::GetNewUniqueID();
   CHECK(VulkanReplayPatchValueCutoff({patch}, {changed}, reads, reason) == 0);
   CHECK(VulkanReplayPatchValueCutoff({patch}, {patch}, {}, reason) == 0);
+}
+
+TEST_CASE("Vulkan live forward requires an ordinary prefix and its matching successful target",
+          "[vulkan][replay][liveforward]")
+{
+  CHECK(VulkanLiveForwardOrdinaryRoot(0, eReplay_WithoutDraw, true, false, false, false));
+  CHECK_FALSE(VulkanLiveForwardOrdinaryRoot(0, eReplay_WithoutDraw, true, true, false, false));
+  CHECK_FALSE(VulkanLiveForwardOrdinaryRoot(0, eReplay_WithoutDraw, true, false, true, false));
+  CHECK_FALSE(VulkanLiveForwardOrdinaryRoot(0, eReplay_WithoutDraw, true, false, false, true));
+  CHECK_FALSE(VulkanLiveForwardOrdinaryRoot(0, eReplay_WithoutDraw, false, false, false, false));
+  CHECK_FALSE(VulkanLiveForwardOrdinaryRoot(0, eReplay_Full, true, false, false, false));
+  CHECK_FALSE(VulkanLiveForwardOrdinaryRoot(0, eReplay_OnlyDraw, true, false, false, false));
+  CHECK_FALSE(VulkanLiveForwardOrdinaryRoot(30, eReplay_WithoutDraw, true, false, false, false));
+
+  // Root 30 followed by target 30 can publish. A failed replay, feedback execution, edit, or
+  // another target between the two steps must not publish a cursor for bytes it did not draw.
+  CHECK(VulkanLiveForwardCanPublish(30, 30, 2, 2, true));
+  CHECK_FALSE(VulkanLiveForwardCanPublish(30, 30, 2, 2, false));
+  CHECK_FALSE(VulkanLiveForwardCanPublish(31, 30, 2, 2, true));
+  CHECK_FALSE(VulkanLiveForwardCanPublish(30, 0, 2, 2, true));
+  CHECK_FALSE(VulkanLiveForwardCanPublish(30, 30, 3, 2, true));
+  CHECK_FALSE(VulkanLiveForwardCanPublish(0, 0, 2, 2, true));
+}
+
+TEST_CASE("Vulkan live forward distinguishes command buffer submissions and reverse requests",
+          "[vulkan][replay][liveforward]")
+{
+  const ResourceId primary = ResourceIDGen::GetNewUniqueID();
+  const ResourceId secondary = ResourceIDGen::GetNewUniqueID();
+  CHECK(VulkanLiveForwardSameCursor(primary, 20, primary, 20, 30, 31));
+  CHECK(VulkanLiveForwardSameCursor(primary, 20, primary, 20, 30, 50));
+  CHECK_FALSE(VulkanLiveForwardSameCursor(primary, 20, primary, 20, 30, 30));
+  CHECK_FALSE(VulkanLiveForwardSameCursor(primary, 20, primary, 20, 30, 10));
+  CHECK_FALSE(VulkanLiveForwardSameCursor(primary, 20, primary, 20, 0, 30));
+  CHECK_FALSE(VulkanLiveForwardSameCursor(primary, 20, primary, 120, 30, 150));
+  CHECK_FALSE(VulkanLiveForwardSameCursor(primary, 20, secondary, 20, 30, 50));
+  CHECK_FALSE(VulkanLiveForwardSameCursor(ResourceId(), 20, ResourceId(), 20, 30, 50));
+}
+
+TEST_CASE("Vulkan same-pass intervals replay inserted labels but reject region and event gaps",
+          "[vulkan][replay][liveforward][checkpoint]")
+{
+  // Exact interval from the four-region native fixture: viewport, inserted label, draw. All
+  // three intermediate draws must remain executable when resuming from draw 17 to draw 26.
+  rdcarray<VulkanChunk> chunks = {VulkanChunk::vkCmdSetViewport,
+                                VulkanChunk::vkCmdInsertDebugUtilsLabelEXT,
+                                VulkanChunk::vkCmdDraw,
+                                VulkanChunk::vkCmdSetViewport,
+                                VulkanChunk::vkCmdDebugMarkerInsertEXT,
+                                VulkanChunk::vkCmdDraw,
+                                VulkanChunk::vkCmdSetViewport,
+                                VulkanChunk::vkCmdInsertDebugUtilsLabelEXT,
+                                VulkanChunk::vkCmdDraw};
+  rdcarray<APIEvent> events;
+  events.resize(chunks.size());
+  for(uint32_t i = 0; i < events.size(); i++)
+  {
+    events[i].eventId = 18 + i;
+    events[i].chunkIndex = i;
+  }
+  rdcstr reason;
+  auto check = [&](uint32_t target) {
+    return VulkanCheckpointCommandInterval(
+        17, target, chunks.size(),
+        [&](uint32_t event) -> const APIEvent & { return events[event - 18]; },
+        [&](uint32_t chunk) { return chunks[chunk]; }, &reason);
+  };
+  CHECK(check(20));
+  CHECK(check(23));
+  CHECK(check(26));
+
+  const VulkanChunk rejected[] = {
+      VulkanChunk::vkCmdBeginDebugUtilsLabelEXT, VulkanChunk::vkCmdEndDebugUtilsLabelEXT,
+      VulkanChunk::vkCmdDebugMarkerBeginEXT, VulkanChunk::vkCmdDebugMarkerEndEXT,
+      VulkanChunk::vkCmdBeginRenderPass, VulkanChunk::vkCmdNextSubpass,
+      VulkanChunk::vkCmdEndRenderPass, VulkanChunk::vkCmdBeginRendering,
+      VulkanChunk::vkCmdEndRendering, VulkanChunk::vkCmdDrawIndirect,
+      VulkanChunk::vkCmdExecuteCommands, VulkanChunk::vkQueueSubmit};
+  for(VulkanChunk chunk : rejected)
+  {
+    chunks[1] = chunk;
+    CHECK_FALSE(check(26));
+    CHECK(reason.contains("blockingEID=19"));
+    CHECK(reason.contains(ToStr(chunk)));
+  }
+  chunks[1] = VulkanChunk::vkCmdInsertDebugUtilsLabelEXT;
+  // A synthetic/skipped EID rounded to the next API event is not an exact label and must fail.
+  events[1].eventId = 20;
+  CHECK_FALSE(check(26));
+  CHECK(reason.contains("blockingEID=19 blockingReason=missingExactAPIEvent"));
+  events[1].eventId = 19;
+  events[1].chunkIndex = (uint32_t)chunks.size();
+  CHECK_FALSE(check(26));
+  CHECK(reason.contains("blockingEID=19 blockingReason=missingExactAPIEvent"));
+  events[1].chunkIndex = 1;
+  CHECK(check(26));
+}
+
+TEST_CASE("Vulkan live forward resumes completed shared edits only within their generation",
+          "[vulkan][replay][liveforward][bufferpatch]")
+{
+  CHECK(VulkanLiveForwardPatchGenerationSafe(4, 4, false, false));
+  CHECK(VulkanLiveForwardPatchGenerationSafe(4, 4, true, true));
+  CHECK_FALSE(VulkanLiveForwardPatchGenerationSafe(4, 4, true, false));
+  CHECK_FALSE(VulkanLiveForwardPatchGenerationSafe(4, 5, true, true));
+  CHECK_FALSE(VulkanLiveForwardPatchGenerationSafe(4, 5, false, true));
+
+  // Committing value B invalidates value A. An unmatched or failed OnlyDraw cannot certify B.
+  // A matching completed ordinary B replay publishes a cursor eligible for subsequent EIDs.
+  uint64_t completed = 4, current = 5;
+  CHECK_FALSE(VulkanLiveForwardPatchGenerationSafe(completed, current, true, true));
+  CHECK_FALSE(VulkanLiveForwardCanPublish(20, 17, current, current, true));
+  CHECK_FALSE(VulkanLiveForwardCanPublish(17, 17, current, current, false));
+  REQUIRE(VulkanLiveForwardCanPublish(17, 17, current, current, true));
+  completed = current;
+  CHECK(VulkanLiveForwardPatchGenerationSafe(completed, current, true, true));
+  // Clearing patches changes resource contents too; it cannot retain a patched cursor.
+  ++current;
+  CHECK_FALSE(VulkanLiveForwardPatchGenerationSafe(completed, current, false, true));
 }
 
 TEST_CASE("Vulkan checkpoint file-order replay restores only at a completed submission boundary",

@@ -35,6 +35,7 @@
 #include "driver/ihv/nv/nv_gl_counters.h"
 #include "maths/matrix.h"
 #include "replay/dummy_driver.h"
+#include "replay/replay_resource_versions.h"
 #include "replay/replay_timing.h"
 #include "serialise/rdcfile.h"
 #include "strings/string_utils.h"
@@ -378,6 +379,26 @@ std::shared_ptr<GLCheckpointBufferVersion> GLCheckpointReusableBufferVersion(
     version.reset();
   return version;
 }
+
+bool GLCheckpointContentEvidenceComplete(GLChunk chunk)
+{
+  // Shader execution writes only exposed attachment/storage bindings. All such bindings are
+  // excluded below, including unused bindings a replacement shader could start accessing.
+  const GLCheckpointBufferEffect effect = GLCheckpointClassifyBufferEffect(chunk);
+  return effect == GLCheckpointBufferEffect::StateOnly ||
+         effect == GLCheckpointBufferEffect::ShaderExecution;
+}
+
+bool GLCheckpointShareOriginalContents(bool completeEvidence, bool potentialWrite,
+                                       bool aliasUncertain, bool edited)
+{
+  if(!completeEvidence || potentialWrite || aliasUncertain || edited)
+    return false;
+  // An original static resource keeps the same native contents through every canonical replay.
+  // This identity is per resource; it is not inferred from matching EIDs or texture pixels.
+  const ReplayResourceVersion original = {1, 0};
+  return PlanReplayResourceRestore(original, original, 0, {}) == ReplayResourceRestoreAction::Keep;
+}
 }
 
 // A replay checkpoint owns complete live resource contents and object state. The capture's
@@ -394,6 +415,7 @@ struct GLReplay::ReplayCheckpoint
     uint64_t bytes = 0;
     uint32_t width = 0, height = 0;
     bool renderbuffer = false;
+    bool sharedContents = false;
     GLint activeProgram = 0;
   };
   ~ReplayCheckpoint()
@@ -414,6 +436,8 @@ struct GLReplay::ReplayCheckpoint
   }
   uint32_t eventId = 0;
   uint64_t lastUsed = 0, bytes = 0;
+  uint64_t staticBytes = 0;
+  uint32_t staticResources = 0;
   GLRenderState state;
   Topology topology = Topology::Unknown;
   uint32_t indexWidth = 0;
@@ -509,8 +533,12 @@ void GLReplay::ConfigureReplayCheckpoints(
 
 void GLReplay::InvalidateReplayCheckpoints(uint32_t firstAffectedEvent)
 {
+  InvalidateLiveForward();
   MakeCurrentReplayContext(&m_ReplayCtx);
   ResetCheckpointBufferLineage();
+  // Value-only edits can retain a pre-consumer prefix, but every subsequent save must classify
+  // the new edit table again. Set/clear and shader/resource replacement use this same reset.
+  m_CheckpointStaticResources.clear();
   for(auto it = m_Checkpoints.begin(); it != m_Checkpoints.end();)
   {
     if(firstAffectedEvent && it->first < firstAffectedEvent)
@@ -537,18 +565,22 @@ void GLReplay::UpdateCheckpointAccounting()
 uint64_t GLReplay::CheckpointStorageBytes(const ReplayCheckpoint *building, uint64_t &sharedBytes) const
 {
   GLCheckpointBufferAccounting buffers;
-  uint64_t bytes = 0;
+  uint64_t bytes = 0, staticBytes = 0;
   const auto account = [&](const ReplayCheckpoint &checkpoint) {
     bytes += checkpoint.bytes;
     for(const ReplayCheckpoint::Resource &resource : checkpoint.resources)
+    {
       if(resource.bufferVersion)
         buffers.Add(resource.bufferVersion.get());
+      if(resource.sharedContents)
+        staticBytes += resource.bytes;
+    }
   };
   for(const auto &entry : m_Checkpoints)
     account(*entry.second);
   if(building)
     account(*building);
-  sharedBytes = buffers.shared;
+  sharedBytes = buffers.shared + staticBytes;
   return bytes + buffers.allocated;
 }
 
@@ -587,6 +619,7 @@ bool GLReplay::PrepareReplayCheckpoints()
   if(!file)
     return reject("OpenGL checkpoint safety scan requires structured capture chunks");
   bool frame = false;
+  bool completeContentEvidence = true;
   uint32_t contextChanges = 0;
   for(const SDChunk *chunk : file->chunks)
   {
@@ -608,6 +641,9 @@ bool GLReplay::PrepareReplayCheckpoints()
       return reject("OpenGL checkpoint cannot resume an implicit context/thread switch");
     if(GLCheckpointUnsupportedFrameCall(name))
       return reject("OpenGL checkpoint frame contains unsupported mutable/hidden state: " + name);
+    if(chunk->metadata.chunkID >= (uint32_t)SystemChunk::FirstDriverChunk &&
+       !GLCheckpointContentEvidenceComplete(type))
+      completeContentEvidence = false;
   }
   if(!frame)
     return reject("OpenGL checkpoint safety scan could not locate the frame boundary");
@@ -633,9 +669,76 @@ bool GLReplay::PrepareReplayCheckpoints()
         (tex.curType == eGL_TEXTURE_CUBE_MAP && VendorCheck[VendorCheck_AMD_copy_compressed_cubemaps])))
       return reject("OpenGL compressed checkpoint resource needs an unsupported driver copy workaround");
   }
+  PrepareCheckpointStaticResources(completeContentEvidence &&
+      Process::GetEnvVariable("RENDERDOC_GL_DISABLE_STATIC_CHECKPOINT_SHARING") != "1");
   m_CheckpointPrepared = true;
   m_CheckpointStats.reason.clear();
   return true;
+}
+
+void GLReplay::PrepareCheckpointStaticResources(bool completeContentEvidence)
+{
+  m_CheckpointStaticResources.clear();
+  if(!completeContentEvidence)
+    return;
+  GLResourceManager *manager = m_pDriver->GetResourceManager();
+  std::set<ResourceId> attachedTextures, aliasedBuffers, editedBuffers;
+  bool textureAliases = false, missingInitialAttachments = false;
+  for(const ReplayBufferPatch &patch : m_pDriver->m_ReplayBufferPatches)
+    editedBuffers.insert(patch.buffer);
+  for(const auto &entry : m_pDriver->m_Textures)
+  {
+    textureAliases |= entry.second.view;
+    if(entry.second.curType == eGL_TEXTURE_BUFFER)
+    {
+      const GLResource buffer = manager->GetInitialContents(entry.first).tex.texBuffer;
+      if(buffer.name)
+        aliasedBuffers.insert(manager->GetID(buffer));
+    }
+  }
+  // An FBO may be established before CaptureBegin and only rebound in the captured frame.
+  // Its initial attachments must not become static merely because no attachment call appears.
+  for(const ResourceDescription &description : m_Resources)
+  {
+    const GLResource live = manager->GetResource(description.resourceId, true);
+    if(live.Namespace == eResFramebuffer)
+    {
+      const GLInitialContents initial = manager->GetInitialContents(description.resourceId);
+      if(initial.fbo.valid)
+        for(const FramebufferAttachmentData &attachment : initial.fbo.Attachments)
+          if(attachment.obj.name)
+            attachedTextures.insert(manager->GetID(attachment.obj));
+      if(!initial.fbo.valid)
+        missingInitialAttachments = true;
+    }
+  }
+  for(const ResourceDescription &description : m_Resources)
+  {
+    const GLResource live = manager->GetResource(description.resourceId, true);
+    const ResourceId id = manager->GetID(live);
+    if(live.Namespace == eResBuffer)
+    {
+      auto info = m_pDriver->m_Buffers.find(id);
+      if(info != m_pDriver->m_Buffers.end() &&
+         GLCheckpointShareOriginalContents(true,
+             info->second.replayPatchUnsafe ||
+                 bool(info->second.creationFlags & BufferCategory::ReadWrite),
+             aliasedBuffers.count(id) != 0, editedBuffers.count(description.resourceId) != 0))
+        m_CheckpointStaticResources.insert(id);
+    }
+    else if(live.Namespace == eResTexture)
+    {
+      auto info = m_pDriver->m_Textures.find(id);
+      if(info != m_pDriver->m_Textures.end() &&
+         GLCheckpointShareOriginalContents(true,
+             bool(info->second.creationFlags & (TextureCategory::ColorTarget |
+                 TextureCategory::DepthTarget | TextureCategory::ShaderReadWrite |
+                 TextureCategory::SwapBuffer)) || attachedTextures.count(id) != 0,
+             textureAliases || missingInitialAttachments ||
+                 info->second.curType == eGL_TEXTURE_BUFFER, false))
+        m_CheckpointStaticResources.insert(id);
+    }
+  }
 }
 
 bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
@@ -686,6 +789,7 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
     ReplayCheckpoint::Resource resource;
     resource.id = id;
     resource.live = live;
+    resource.sharedContents = m_CheckpointStaticResources.count(manager->GetID(live)) != 0;
     checkpoint->resources.push_back(resource);
   };
   for(const ResourceDescription &description : m_Resources)
@@ -713,8 +817,9 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
     m_CheckpointStats.reason = reason;
     return false;
   };
-  // Preflight before GPU allocations. Only a buffer version established by this execution's
-  // successful restore/save and untouched since then can be shared. Textures remain full copies.
+  // Preflight before GPU allocations. Proven static contents need no copy. Mutable buffer
+  // versions can be shared only along this execution's successful restore/save lineage;
+  // mutable textures remain full copies.
   for(ReplayCheckpoint::Resource &res : checkpoint->resources)
   {
     if(res.live.Namespace == eResBuffer)
@@ -726,13 +831,16 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
       if(mapped || size < 0 || uint64_t(size) > 0xffffffffULL)
         return reject("OpenGL checkpoint contains a mapped or oversized buffer");
       res.bytes = RDCMAX(uint64_t(4), uint64_t(size));
-      auto version = m_CheckpointBufferVersions.find(manager->GetID(res.live));
-      if(version != m_CheckpointBufferVersions.end())
-        res.bufferVersion = GLCheckpointReusableBufferVersion(version->second, res.bytes);
-      if(!res.bufferVersion)
+      if(!res.sharedContents)
       {
-        res.bufferVersion = std::make_shared<GLCheckpointBufferVersion>();
-        res.bufferVersion->bytes = res.bytes;
+        auto version = m_CheckpointBufferVersions.find(manager->GetID(res.live));
+        if(version != m_CheckpointBufferVersions.end())
+          res.bufferVersion = GLCheckpointReusableBufferVersion(version->second, res.bytes);
+        if(!res.bufferVersion)
+        {
+          res.bufferVersion = std::make_shared<GLCheckpointBufferVersion>();
+          res.bufferVersion->bytes = res.bytes;
+        }
       }
     }
     else if(res.live.Namespace == eResTexture || res.live.Namespace == eResRenderbuffer)
@@ -845,7 +953,13 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
         }
       }
     }
-    checkpoint->bytes += sizeof(ReplayCheckpoint::Resource) + (res.bufferVersion ? 0 : res.bytes);
+    if(res.sharedContents)
+    {
+      ++checkpoint->staticResources;
+      checkpoint->staticBytes += res.bytes;
+    }
+    checkpoint->bytes += sizeof(ReplayCheckpoint::Resource) +
+                         (res.bufferVersion || res.sharedContents ? 0 : res.bytes);
     if(checkpoint->bytes > m_CheckpointConfig.byteBudget)
       return reject("OpenGL checkpoint working set exceeds its byte budget");
   }
@@ -872,6 +986,8 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
   const double checkpointPrepareMS = checkpointTiming ? checkpointTimer.GetMilliseconds() : 0.0;
   for(ReplayCheckpoint::Resource &res : checkpoint->resources)
   {
+    if(res.sharedContents && res.live.Namespace == eResBuffer)
+      continue;
     if(res.bufferVersion)
     {
       if(!res.bufferVersion->initial.resource.name)
@@ -899,7 +1015,7 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
     }
     else if(res.live.Namespace != eResProgram)
     {
-      manager->ContextPrepare_InitialState(res.live, &res.initial);
+      manager->ContextPrepare_InitialState(res.live, &res.initial, !res.sharedContents);
     }
     if(GL.glGetError() != eGL_NONE)
       return reject("OpenGL checkpoint resource copy or state capture failed");
@@ -913,6 +1029,8 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
     if(res.bufferVersion)
       m_CheckpointBufferVersions[manager->GetID(res.live)] = res.bufferVersion;
   checkpoint->lastUsed = ++m_CheckpointUseSerial;
+  const uint32_t staticResources = checkpoint->staticResources;
+  const uint64_t staticBytes = checkpoint->staticBytes;
   m_Checkpoints[eventId] = std::move(checkpoint);
   m_CheckpointStats.builds++;
   m_CheckpointStats.lastSaveEvent = eventId;
@@ -923,10 +1041,12 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
     const double totalMS = checkpointTimer.GetMilliseconds();
     const rdcstr line = StringFormat::Fmt(
         "api=OpenGLCheckpoint op=save event=%u attempt=successful prepare_ms=%.3f resource_copy_ms=%.3f "
-        "bind_finalize_ms=%.3f total_ms=%.3f allocatedBytes=%llu sharedBytes=%llu", eventId,
+        "bind_finalize_ms=%.3f total_ms=%.3f allocatedBytes=%llu sharedBytes=%llu "
+        "sharedStaticResources=%u sharedStaticBytes=%llu", eventId,
         checkpointPrepareMS, checkpointCopyMS - checkpointPrepareMS, totalMS - checkpointCopyMS,
         totalMS, (unsigned long long)m_CheckpointStats.allocatedBytes,
-        (unsigned long long)m_CheckpointStats.sharedBytes);
+        (unsigned long long)m_CheckpointStats.sharedBytes, staticResources,
+        (unsigned long long)staticBytes);
     RDCLOG("[EIDTiming] %s", line.c_str());
     AppendReplayTimingLog(line);
   }
@@ -964,6 +1084,8 @@ bool GLReplay::RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint)
     GL.glMemoryBarrier(GLbitfield(eGL_ALL_BARRIER_BITS));
   for(ReplayCheckpoint::Resource &res : checkpoint.resources)
   {
+    if(res.sharedContents && res.live.Namespace == eResBuffer)
+      continue;
     if(res.renderbuffer)
       GL.glCopyImageSubData(res.initial.resource.name, eGL_RENDERBUFFER, 0, 0, 0, 0,
                             res.live.name, eGL_RENDERBUFFER, 0, 0, 0, 0,
@@ -1011,9 +1133,10 @@ bool GLReplay::RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint)
     const double totalMS = checkpointTimer.GetMilliseconds();
     const rdcstr line = StringFormat::Fmt(
         "api=OpenGLCheckpoint op=restore event=%u success=%u validate_ms=%.3f resource_restore_ms=%.3f "
-        "bind_finalize_ms=%.3f total_ms=%.3f", checkpoint.eventId, success ? 1U : 0U,
+        "bind_finalize_ms=%.3f total_ms=%.3f sharedStaticResources=%u sharedStaticBytes=%llu",
+        checkpoint.eventId, success ? 1U : 0U,
         checkpointValidateMS, checkpointCopyMS - checkpointValidateMS, totalMS - checkpointCopyMS,
-        totalMS);
+        totalMS, checkpoint.staticResources, (unsigned long long)checkpoint.staticBytes);
     RDCLOG("[EIDTiming] %s", line.c_str());
     AppendReplayTimingLog(line);
   }
@@ -1043,6 +1166,7 @@ GLReplay::GLReplay(WrappedOpenGL *d)
 
 void GLReplay::Shutdown()
 {
+  InvalidateLiveForward();
   MakeCurrentReplayContext(&m_ReplayCtx);
   ResetCheckpointBufferLineage();
   if(m_pDriver->m_ReplayPatchUpload)
@@ -1097,13 +1221,376 @@ IReplayDriver *GLReplay::MakeDummyDriver()
 
 RDResult GLReplay::ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers)
 {
+  InvalidateLiveForward();
+  m_LiveForwardScanned = m_LiveForwardCaptureSafe = false;
+  m_LiveForwardReason.clear();
   MakeCurrentReplayContext(&m_ReplayCtx);
   return m_pDriver->ReadLogInitialisation(rdc, storeStructuredBuffers);
+}
+
+namespace
+{
+bool GLLiveForwardOrdinaryRoot(ReplayLogType replayType, bool bypass, bool naturalReference)
+{
+  return replayType == eReplay_WithoutDraw && !bypass && !naturalReference;
+}
+
+bool GLLiveForwardCallSupported(GLChunk type)
+{
+  // The indexed call must leave all execution state resident. Query/conditional/transform
+  // feedback scopes are specifically forbidden: ContextReplayLog closes them at every stop.
+  // Object creation, storage replacement, context changes and future commands fail closed.
+  if(GLCheckpointClassifyBufferEffect(type) != GLCheckpointBufferEffect::Unknown ||
+     type == GLChunk::glIndirectSubCommand)
+    return true;
+  // These calls update fixed-storage contents or native object/binding state. They replay in
+  // full against resident resources. Keep this list separate from checkpoint static sharing:
+  // a texture subimage or framebuffer copy is emphatically NOT immutable-content evidence.
+  switch(type)
+  {
+    case GLChunk::glVertexAttribPointer:
+    case GLChunk::glVertexAttribPointerARB:
+    case GLChunk::glVertexArrayVertexAttribOffsetEXT:
+    case GLChunk::glVertexAttribIPointer:
+    case GLChunk::glVertexAttribIPointerEXT:
+    case GLChunk::glVertexArrayVertexAttribIOffsetEXT:
+    case GLChunk::glVertexAttribLPointer:
+    case GLChunk::glVertexAttribLPointerEXT:
+    case GLChunk::glVertexArrayVertexAttribLOffsetEXT:
+    case GLChunk::glVertexAttribBinding:
+    case GLChunk::glVertexArrayAttribBinding:
+    case GLChunk::glVertexArrayVertexAttribBindingEXT:
+    case GLChunk::glVertexAttribFormat:
+    case GLChunk::glVertexArrayAttribFormat:
+    case GLChunk::glVertexArrayVertexAttribFormatEXT:
+    case GLChunk::glVertexAttribIFormat:
+    case GLChunk::glVertexArrayAttribIFormat:
+    case GLChunk::glVertexArrayVertexAttribIFormatEXT:
+    case GLChunk::glVertexAttribLFormat:
+    case GLChunk::glVertexArrayAttribLFormat:
+    case GLChunk::glVertexArrayVertexAttribLFormatEXT:
+    case GLChunk::glVertexAttribDivisor:
+    case GLChunk::glVertexAttribDivisorARB:
+    case GLChunk::glVertexArrayVertexAttribDivisorEXT:
+    case GLChunk::glEnableVertexAttribArray:
+    case GLChunk::glEnableVertexAttribArrayARB:
+    case GLChunk::glEnableVertexArrayAttrib:
+    case GLChunk::glEnableVertexArrayAttribEXT:
+    case GLChunk::glDisableVertexAttribArray:
+    case GLChunk::glDisableVertexAttribArrayARB:
+    case GLChunk::glDisableVertexArrayAttrib:
+    case GLChunk::glDisableVertexArrayAttribEXT:
+    case GLChunk::glVertexBindingDivisor:
+    case GLChunk::glVertexArrayBindingDivisor:
+    case GLChunk::glVertexArrayVertexBindingDivisorEXT:
+    case GLChunk::glVertexAttrib1d:
+    case GLChunk::glVertexAttrib1dARB:
+    case GLChunk::glVertexAttrib1dv:
+    case GLChunk::glVertexAttrib1dvARB:
+    case GLChunk::glVertexAttrib1f:
+    case GLChunk::glVertexAttrib1fARB:
+    case GLChunk::glVertexAttrib1fv:
+    case GLChunk::glVertexAttrib1fvARB:
+    case GLChunk::glVertexAttrib1s:
+    case GLChunk::glVertexAttrib1sARB:
+    case GLChunk::glVertexAttrib1sv:
+    case GLChunk::glVertexAttrib1svARB:
+    case GLChunk::glVertexAttrib2d:
+    case GLChunk::glVertexAttrib2dARB:
+    case GLChunk::glVertexAttrib2dv:
+    case GLChunk::glVertexAttrib2dvARB:
+    case GLChunk::glVertexAttrib2f:
+    case GLChunk::glVertexAttrib2fARB:
+    case GLChunk::glVertexAttrib2fv:
+    case GLChunk::glVertexAttrib2fvARB:
+    case GLChunk::glVertexAttrib2s:
+    case GLChunk::glVertexAttrib2sARB:
+    case GLChunk::glVertexAttrib2sv:
+    case GLChunk::glVertexAttrib2svARB:
+    case GLChunk::glVertexAttrib3d:
+    case GLChunk::glVertexAttrib3dARB:
+    case GLChunk::glVertexAttrib3dv:
+    case GLChunk::glVertexAttrib3dvARB:
+    case GLChunk::glVertexAttrib3f:
+    case GLChunk::glVertexAttrib3fARB:
+    case GLChunk::glVertexAttrib3fv:
+    case GLChunk::glVertexAttrib3fvARB:
+    case GLChunk::glVertexAttrib3s:
+    case GLChunk::glVertexAttrib3sARB:
+    case GLChunk::glVertexAttrib3sv:
+    case GLChunk::glVertexAttrib3svARB:
+    case GLChunk::glVertexAttrib4d:
+    case GLChunk::glVertexAttrib4dARB:
+    case GLChunk::glVertexAttrib4dv:
+    case GLChunk::glVertexAttrib4dvARB:
+    case GLChunk::glVertexAttrib4f:
+    case GLChunk::glVertexAttrib4fARB:
+    case GLChunk::glVertexAttrib4fv:
+    case GLChunk::glVertexAttrib4fvARB:
+    case GLChunk::glVertexAttrib4s:
+    case GLChunk::glVertexAttrib4sARB:
+    case GLChunk::glVertexAttrib4sv:
+    case GLChunk::glVertexAttrib4svARB:
+    case GLChunk::glVertexAttribI1i:
+    case GLChunk::glVertexAttribI1iEXT:
+    case GLChunk::glVertexAttribI1iv:
+    case GLChunk::glVertexAttribI1ivEXT:
+    case GLChunk::glVertexAttribI1ui:
+    case GLChunk::glVertexAttribI1uiEXT:
+    case GLChunk::glVertexAttribI1uiv:
+    case GLChunk::glVertexAttribI1uivEXT:
+    case GLChunk::glVertexAttribI2i:
+    case GLChunk::glVertexAttribI2iEXT:
+    case GLChunk::glVertexAttribI2iv:
+    case GLChunk::glVertexAttribI2ivEXT:
+    case GLChunk::glVertexAttribI2ui:
+    case GLChunk::glVertexAttribI2uiEXT:
+    case GLChunk::glVertexAttribI2uiv:
+    case GLChunk::glVertexAttribI2uivEXT:
+    case GLChunk::glVertexAttribI3i:
+    case GLChunk::glVertexAttribI3iEXT:
+    case GLChunk::glVertexAttribI3iv:
+    case GLChunk::glVertexAttribI3ivEXT:
+    case GLChunk::glVertexAttribI3ui:
+    case GLChunk::glVertexAttribI3uiEXT:
+    case GLChunk::glVertexAttribI3uiv:
+    case GLChunk::glVertexAttribI3uivEXT:
+    case GLChunk::glVertexAttribI4i:
+    case GLChunk::glVertexAttribI4iEXT:
+    case GLChunk::glVertexAttribI4iv:
+    case GLChunk::glVertexAttribI4ivEXT:
+    case GLChunk::glVertexAttribI4ui:
+    case GLChunk::glVertexAttribI4uiEXT:
+    case GLChunk::glVertexAttribI4uiv:
+    case GLChunk::glVertexAttribI4uivEXT:
+    case GLChunk::glVertexAttribL1d:
+    case GLChunk::glVertexAttribL1dEXT:
+    case GLChunk::glVertexAttribL1dv:
+    case GLChunk::glVertexAttribL1dvEXT:
+    case GLChunk::glVertexAttribL2d:
+    case GLChunk::glVertexAttribL2dEXT:
+    case GLChunk::glVertexAttribL2dv:
+    case GLChunk::glVertexAttribL2dvEXT:
+    case GLChunk::glVertexAttribL3d:
+    case GLChunk::glVertexAttribL3dEXT:
+    case GLChunk::glVertexAttribL3dv:
+    case GLChunk::glVertexAttribL3dvEXT:
+    case GLChunk::glVertexAttribL4d:
+    case GLChunk::glVertexAttribL4dEXT:
+    case GLChunk::glVertexAttribL4dv:
+    case GLChunk::glVertexAttribL4dvEXT:
+    case GLChunk::glClearBufferData:
+    case GLChunk::glClearNamedBufferData:
+    case GLChunk::glClearNamedBufferDataEXT:
+    case GLChunk::glClearBufferSubData:
+    case GLChunk::glClearNamedBufferSubData:
+    case GLChunk::glClearNamedBufferSubDataEXT:
+    case GLChunk::glClearTexImage:
+    case GLChunk::glClearTexSubImage:
+    case GLChunk::glFramebufferTexture:
+    case GLChunk::glFramebufferTextureOES:
+    case GLChunk::glFramebufferTextureARB:
+    case GLChunk::glFramebufferTextureEXT:
+    case GLChunk::glNamedFramebufferTexture:
+    case GLChunk::glNamedFramebufferTextureEXT:
+    case GLChunk::glFramebufferTexture1D:
+    case GLChunk::glFramebufferTexture1DEXT:
+    case GLChunk::glNamedFramebufferTexture1DEXT:
+    case GLChunk::glFramebufferTexture2D:
+    case GLChunk::glFramebufferTexture2DEXT:
+    case GLChunk::glNamedFramebufferTexture2DEXT:
+    case GLChunk::glFramebufferTexture3D:
+    case GLChunk::glFramebufferTexture3DEXT:
+    case GLChunk::glFramebufferTexture3DOES:
+    case GLChunk::glNamedFramebufferTexture3DEXT:
+    case GLChunk::glFramebufferRenderbuffer:
+    case GLChunk::glFramebufferRenderbufferEXT:
+    case GLChunk::glNamedFramebufferRenderbuffer:
+    case GLChunk::glNamedFramebufferRenderbufferEXT:
+    case GLChunk::glFramebufferTextureLayer:
+    case GLChunk::glFramebufferTextureLayerARB:
+    case GLChunk::glFramebufferTextureLayerEXT:
+    case GLChunk::glNamedFramebufferTextureLayer:
+    case GLChunk::glNamedFramebufferTextureLayerEXT:
+    case GLChunk::glBlitFramebuffer:
+    case GLChunk::glBlitFramebufferEXT:
+    case GLChunk::glDepthRangeIndexed:
+    case GLChunk::glDepthRangeArrayv:
+    case GLChunk::glSampleMaski:
+    case GLChunk::glViewportIndexedf:
+    case GLChunk::glViewportIndexedfv:
+    case GLChunk::glViewportArrayv:
+    case GLChunk::glScissorIndexed:
+    case GLChunk::glScissorIndexedv:
+    case GLChunk::glScissorArrayv:
+    case GLChunk::glCopyImageSubDataEXT:
+    case GLChunk::glCopyImageSubDataOES:
+    case GLChunk::glCopyImageSubData:
+    case GLChunk::glCopyTexSubImage1D:
+    case GLChunk::glCopyTextureSubImage1D:
+    case GLChunk::glCopyTextureSubImage1DEXT:
+    case GLChunk::glCopyTexSubImage2D:
+    case GLChunk::glCopyTextureSubImage2D:
+    case GLChunk::glCopyTextureSubImage2DEXT:
+    case GLChunk::glCopyTexSubImage3D:
+    case GLChunk::glCopyTexSubImage3DOES:
+    case GLChunk::glCopyTextureSubImage3D:
+    case GLChunk::glCopyTextureSubImage3DEXT:
+    case GLChunk::glPixelStoref:
+    case GLChunk::glPixelStorei:
+    case GLChunk::glTexSubImage1D:
+    case GLChunk::glTextureSubImage1D:
+    case GLChunk::glTextureSubImage1DEXT:
+    case GLChunk::glTexSubImage2D:
+    case GLChunk::glTextureSubImage2D:
+    case GLChunk::glTextureSubImage2DEXT:
+    case GLChunk::glTexSubImage3D:
+    case GLChunk::glTexSubImage3DOES:
+    case GLChunk::glTextureSubImage3D:
+    case GLChunk::glTextureSubImage3DEXT:
+    case GLChunk::glCompressedTexSubImage1D:
+    case GLChunk::glCompressedTexSubImage1DARB:
+    case GLChunk::glCompressedTextureSubImage1D:
+    case GLChunk::glCompressedTextureSubImage1DEXT:
+    case GLChunk::glCompressedTexSubImage2D:
+    case GLChunk::glCompressedTexSubImage2DARB:
+    case GLChunk::glCompressedTextureSubImage2D:
+    case GLChunk::glCompressedTextureSubImage2DEXT:
+    case GLChunk::glCompressedTexSubImage3D:
+    case GLChunk::glCompressedTexSubImage3DARB:
+    case GLChunk::glCompressedTexSubImage3DOES:
+    case GLChunk::glCompressedTextureSubImage3D:
+    case GLChunk::glCompressedTextureSubImage3DEXT:
+      return true;
+    default: return false;
+  }
+}
+
+bool GLLiveForwardTerminalPresent(const SDFile &file, size_t index)
+{
+  // A present is excluded only when it is the final driver chunk immediately before the
+  // terminating CaptureEnd. The live cursor cannot select a Present action, so this suffix
+  // is never part of the continued interval. A mid-frame swap still rejects the capture.
+  if(index >= file.chunks.size() || file.chunks.size() - index != 2 ||
+     file.chunks[index + 1]->metadata.chunkID != uint32_t(SystemChunk::CaptureEnd))
+    return false;
+  switch(GLChunk(file.chunks[index]->metadata.chunkID))
+  {
+    case GLChunk::SwapBuffers:
+    case GLChunk::wglSwapBuffers:
+    case GLChunk::glXSwapBuffers:
+    case GLChunk::CGLFlushDrawable:
+    case GLChunk::eglSwapBuffers:
+    case GLChunk::eglPostSubBufferNV:
+    case GLChunk::eglSwapBuffersWithDamageEXT:
+    case GLChunk::eglSwapBuffersWithDamageKHR: return true;
+    default: return false;
+  }
+}
+
+bool GLLiveForwardEventBoundary(const rdcarray<APIEvent> &events, uint32_t eventId)
+{
+  if(eventId == 0 || uint64_t(eventId) + 1 >= events.size() ||
+     events[eventId].eventId != eventId || events[eventId + 1].eventId != eventId + 1 ||
+     events[eventId + 1].fileOffset <= events[eventId].fileOffset)
+    return false;
+  if(eventId > 1 && (events[eventId - 1].eventId != eventId - 1 ||
+                    events[eventId - 1].fileOffset >= events[eventId].fileOffset))
+    return false;
+  return true;
+}
+}
+
+bool GLReplay::PrepareLiveForward()
+{
+  if(m_LiveForwardScanned)
+    return m_LiveForwardCaptureSafe;
+  m_LiveForwardScanned = true;
+  m_LiveForwardCaptureSafe = false;
+  const auto reject = [this](const rdcstr &reason) {
+    m_LiveForwardReason = reason;
+    return false;
+  };
+  if(m_Proxy || m_pDriver->m_ReplayOptions.apiValidation)
+    return reject("proxyOrValidation");
+  SDFile *file = GetStructuredFile();
+  if(!file)
+    return reject("missingStructuredFrame");
+  bool frame = false, executedCall = false;
+  uint32_t setups = 0;
+  for(size_t index = 0; index < file->chunks.size(); ++index)
+  {
+    const SDChunk *chunk = file->chunks[index];
+    if(chunk->metadata.chunkID == uint32_t(SystemChunk::CaptureBegin))
+    {
+      frame = true;
+      continue;
+    }
+    if(!frame || chunk->metadata.chunkID < uint32_t(SystemChunk::FirstDriverChunk))
+      continue;
+    const GLChunk type = GLChunk(chunk->metadata.chunkID);
+    if(GLLiveForwardTerminalPresent(*file, index))
+      continue;
+    if(type == GLChunk::MakeContextCurrent || type == GLChunk::ContextConfiguration)
+    {
+      if(executedCall || ++setups > 1)
+        return reject("captureContextSwitch");
+      continue;
+    }
+    if(!GLLiveForwardCallSupported(type))
+      return reject("unsupportedFrameCall:" + rdcstr(m_pDriver->GetChunkName(chunk->metadata.chunkID)));
+    executedCall = true;
+  }
+  if(!frame || !executedCall)
+    return reject("emptyOrMissingFrame");
+  // These objects can carry a scope already active in the capture-begin state; checking only
+  // calls after CaptureBegin would miss that state even when the replay tail already closed it.
+  GLResourceManager *manager = m_pDriver->GetResourceManager();
+  for(const ResourceDescription &description : m_Resources)
+  {
+    const GLResource resource = manager->GetResource(description.resourceId, true);
+    if(resource.Namespace == eResQuery || resource.Namespace == eResFeedback ||
+       resource.Namespace == eResSync || resource.Namespace == eResExternalMemory ||
+       resource.Namespace == eResExternalSemaphore)
+      return reject("queryFeedbackOrExternalObject");
+  }
+  m_LiveForwardCaptureSafe = true;
+  m_LiveForwardReason.clear();
+  return true;
+}
+
+bool GLReplay::LiveForwardEndpoint(uint32_t eventId) const
+{
+  if(!GLLiveForwardEventBoundary(m_pDriver->m_Events, eventId))
+    return false;
+  const ActionDescription *action = m_pDriver->GetAction(eventId);
+  return action && bool(action->flags & (ActionFlags::Drawcall | ActionFlags::Dispatch |
+                                         ActionFlags::Clear)) &&
+         !(action->flags & ActionFlags::MultiAction) && action->children.empty();
 }
 
 void GLReplay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
 {
   MakeCurrentReplayContext(&m_ReplayCtx);
+  PerformanceTimer liveTimer;
+  static const bool liveEnabled =
+      Process::GetEnvVariable("RENDERDOC_GL_ENABLE_LIVE_FORWARD") != "0";
+  const uint32_t previousEvent = m_LiveForward.event;
+  const bool ordinaryRoot =
+      GLLiveForwardOrdinaryRoot(replayType, m_ReplayCheckpointBypass,
+                               m_ReplayCheckpointNaturalReference) &&
+      !m_pDriver->m_FetchCounters && !m_pDriver->m_ActiveFeedback &&
+      !m_pDriver->m_WasActiveFeedback && !m_pDriver->m_ActiveConditional;
+  const bool pendingTarget = replayType == eReplay_OnlyDraw &&
+                             m_LiveForward.pendingTarget == endEventID &&
+                             !m_pDriver->m_FetchCounters;
+  const bool safeEndpoint = liveEnabled && (ordinaryRoot || pendingTarget) &&
+                            PrepareLiveForward() && LiveForwardEndpoint(endEventID);
+  const bool liveForward = ordinaryRoot && safeEndpoint &&
+                           m_LiveForward.CanAdvance(endEventID);
+  // Any other entry (including force/analysis) consumes the old provenance. A successful
+  // ordinary root arms a new target only after its complete prefix has actually executed.
+  InvalidateLiveForward();
   // No version proof survives a separate replay/analysis/OnlyDraw call. A successful checkpoint
   // restore below establishes a fresh lineage; scoped reset also covers errors and early returns.
   ResetCheckpointBufferLineage();
@@ -1112,9 +1599,9 @@ void GLReplay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
     std::map<ResourceId, std::weak_ptr<GLCheckpointBufferVersion>> &versions;
     ~ResetLineage() { versions.clear(); }
   } resetLineage = {m_CheckpointBufferVersions};
-  uint32_t startEvent = 0;
+  uint32_t startEvent = liveForward ? previousEvent + 1 : 0;
   const uint32_t finalEvent = replayType == eReplay_WithoutDraw ? RDCMAX(1U, endEventID) - 1 : endEventID;
-  if(!m_ReplayCheckpointBypass && m_CheckpointStats.enabled && finalEvent > 0 &&
+  if(!liveForward && !m_ReplayCheckpointBypass && m_CheckpointStats.enabled && finalEvent > 0 &&
      (replayType == eReplay_Full || replayType == eReplay_WithoutDraw) &&
      !m_pDriver->m_FetchCounters && PrepareReplayCheckpoints())
   {
@@ -1160,15 +1647,43 @@ void GLReplay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
       saveEvent = 0;
     if(saveEvent)
     {
-      m_pDriver->ReplayLog(startEvent, saveEvent, eReplay_Full);
-      if(FatalErrorCheck() != ResultCode::Succeeded)
+      m_pDriver->ReplayLog(startEvent, saveEvent, eReplay_Full, true);
+      if(!m_pDriver->m_LastReplaySucceeded || FatalErrorCheck() != ResultCode::Succeeded)
         return;
       SaveReplayCheckpoint(saveEvent);
       startEvent = saveEvent + 1;
     }
   }
+  bool replaySucceeded = true;
   if(startEvent == 0 || startEvent <= finalEvent || replayType == eReplay_OnlyDraw)
-    m_pDriver->ReplayLog(startEvent, endEventID, replayType);
+  {
+    m_pDriver->ReplayLog(startEvent, endEventID, replayType, true);
+    replaySucceeded = m_pDriver->m_LastReplaySucceeded;
+  }
+  replaySucceeded &= FatalErrorCheck() == ResultCode::Succeeded;
+  if(ordinaryRoot && safeEndpoint && replaySucceeded)
+    m_LiveForward.Arm(endEventID);
+  else if(pendingTarget && safeEndpoint)
+  {
+    m_LiveForward.Arm(endEventID);
+    m_LiveForward.Complete(endEventID, replaySucceeded);
+  }
+  if(replayType == eReplay_WithoutDraw && Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+  {
+    const rdcstr reason = !liveEnabled ? "disabled" : !ordinaryRoot ? "forceOrAnalysis" :
+                         !m_LiveForwardCaptureSafe ? m_LiveForwardReason :
+                         !safeEndpoint ? "sharedChunkOrUnsupportedEndpoint" :
+                         !previousEvent ? "noPublishedCursor" :
+                         endEventID <= previousEvent ? "notForward" : "residentPrefix";
+    const rdcstr line = StringFormat::Fmt(
+        "api=GLLiveForward from=%u target=%u enabled=%u hit=%u initialRestoreSkipped=%u "
+        "replayedFirst=%u replayedLast=%u succeeded=%u total_ms=%.3f reason=%s",
+        previousEvent, endEventID, liveEnabled ? 1U : 0U, liveForward ? 1U : 0U,
+        liveForward ? 1U : 0U, startEvent, finalEvent, replaySucceeded ? 1U : 0U,
+        liveTimer.GetMilliseconds(), reason.c_str());
+    RDCLOG("[EIDTiming] %s", line.c_str());
+    AppendReplayTimingLog(line);
+  }
 
   // clear array cache
   for(size_t i = 0; i < ARRAY_COUNT(m_GetTexturePrevData); i++)
@@ -4814,6 +5329,7 @@ void GLReplay::BuildTargetShader(ShaderEncoding sourceEncoding, const bytebuf &s
 
 void GLReplay::ReplaceResource(ResourceId from, ResourceId to)
 {
+  InvalidateLiveForward();
   MakeCurrentReplayContext(&m_ReplayCtx);
   ResetCheckpointBufferLineage();
   m_pDriver->ReplaceResource(from, to);
@@ -4822,6 +5338,7 @@ void GLReplay::ReplaceResource(ResourceId from, ResourceId to)
 
 void GLReplay::RemoveReplacement(ResourceId id)
 {
+  InvalidateLiveForward();
   MakeCurrentReplayContext(&m_ReplayCtx);
   ResetCheckpointBufferLineage();
   m_pDriver->RemoveReplacement(id);
@@ -4830,6 +5347,7 @@ void GLReplay::RemoveReplacement(ResourceId id)
 
 rdcstr GLReplay::ReplaceTargetShaderChecked(ResourceId from, ResourceId to)
 {
+  InvalidateLiveForward();
   MakeCurrentReplayContext(&m_ReplayCtx);
   ResetCheckpointBufferLineage();
   rdcstr error = m_pDriver->ReplaceTargetShaderChecked(from, to);
@@ -5208,6 +5726,7 @@ void GLReplay::FreeTextureSnapshots(const rdcarray<ResourceId> &snapshots)
 void GLReplay::SetProxyTextureData(ResourceId texid, const Subresource &sub, byte *data,
                                    size_t dataSize)
 {
+  InvalidateLiveForward();
   WrappedOpenGL &drv = *m_pDriver;
 
   GLuint tex = m_pDriver->GetResourceManager()->GetResource(texid).name;
@@ -5560,6 +6079,7 @@ ResourceId GLReplay::CreateProxyBuffer(const BufferDescription &templateBuf)
 
 void GLReplay::SetProxyBufferData(ResourceId bufid, byte *data, size_t dataSize)
 {
+  InvalidateLiveForward();
   GLuint buf = m_pDriver->GetResourceManager()->GetResource(bufid).name;
 
   m_pDriver->glNamedBufferSubDataEXT(buf, 0, dataSize, data);
@@ -5598,6 +6118,7 @@ static uint32_t GLReplayPatchValueCutoff(const rdcarray<ReplayBufferPatch> &prev
 
 rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
 {
+  InvalidateLiveForward();
   rdcstr error = ValidateReplayBufferPatches(patches);
   if(!error.empty())
     return error;
@@ -6046,6 +6567,130 @@ static DriverRegistration GLDriverRegistration(RDCDriver::OpenGL, &GL_CreateRepl
 #if ENABLED(ENABLE_UNIT_TESTS)
 #include "catch/catch.hpp"
 
+TEST_CASE("OpenGL live forward publishes only a successful matching ordinary target",
+          "[gl][replay][live-forward]")
+{
+  // Reference sampling must replay from its requested root even if a caller supplies the
+  // reference flag independently of bypass. OnlyDraw publication needs an ordinary root seed.
+  CHECK(GLLiveForwardOrdinaryRoot(eReplay_WithoutDraw, false, false));
+  CHECK_FALSE(GLLiveForwardOrdinaryRoot(eReplay_WithoutDraw, true, false));
+  CHECK_FALSE(GLLiveForwardOrdinaryRoot(eReplay_WithoutDraw, false, true));
+  CHECK_FALSE(GLLiveForwardOrdinaryRoot(eReplay_WithoutDraw, true, true));
+  CHECK_FALSE(GLLiveForwardOrdinaryRoot(eReplay_OnlyDraw, false, false));
+  CHECK_FALSE(GLLiveForwardOrdinaryRoot(eReplay_Full, false, false));
+  GLLiveForwardCursor cursor;
+  CHECK_FALSE(cursor.CanAdvance(20));
+  CHECK_FALSE(cursor.Complete(10, true));
+  cursor.Arm(10);
+  CHECK_FALSE(cursor.CanAdvance(20));
+  CHECK_FALSE(cursor.Complete(11, true));
+  CHECK(cursor.event == 0);
+  cursor.Arm(10);
+  CHECK_FALSE(cursor.Complete(10, false));
+  CHECK_FALSE(cursor.CanAdvance(20));
+  cursor.Arm(10);
+  CHECK(cursor.Complete(10, true));
+  CHECK(cursor.CanAdvance(11));
+  CHECK(cursor.CanAdvance(20));
+  CHECK_FALSE(cursor.CanAdvance(10));
+  CHECK_FALSE(cursor.CanAdvance(9));
+
+  // Force and direct driver analysis consume pending provenance before their OnlyDraw. An
+  // identical numerical target must not republish a cursor after that reset or an edit.
+  cursor.Arm(20);
+  cursor.Invalidate();
+  CHECK_FALSE(cursor.Complete(20, true));
+  CHECK_FALSE(cursor.CanAdvance(30));
+  cursor.Arm(30);
+  CHECK(cursor.Complete(30, true));
+  cursor.Invalidate();
+  CHECK_FALSE(cursor.CanAdvance(31));
+  CHECK_FALSE(cursor.Complete(30, true));
+}
+
+TEST_CASE("OpenGL and GLES live forward exclude only a proven terminal present suffix",
+          "[gl][replay][live-forward]")
+{
+  SDFile file;
+  auto append = [&file](uint32_t type) {
+    SDChunk *chunk = new SDChunk("live-present"_lit);
+    chunk->metadata.chunkID = type;
+    file.chunks.push_back(chunk);
+  };
+  append(uint32_t(SystemChunk::CaptureBegin));
+  append(uint32_t(GLChunk::glDrawArrays));
+  append(uint32_t(GLChunk::SwapBuffers));
+  append(uint32_t(SystemChunk::CaptureEnd));
+  for(GLChunk present : {GLChunk::SwapBuffers, GLChunk::wglSwapBuffers,
+                         GLChunk::glXSwapBuffers, GLChunk::CGLFlushDrawable,
+                         GLChunk::eglSwapBuffers, GLChunk::eglPostSubBufferNV,
+                         GLChunk::eglSwapBuffersWithDamageEXT,
+                         GLChunk::eglSwapBuffersWithDamageKHR})
+  {
+    file.chunks[2]->metadata.chunkID = uint32_t(present);
+    CHECK(GLLiveForwardTerminalPresent(file, 2));
+    CHECK_FALSE(GLLiveForwardCallSupported(present));
+  }
+  CHECK_FALSE(GLLiveForwardTerminalPresent(file, 1));
+  CHECK_FALSE(GLLiveForwardTerminalPresent(file, 3));
+  CHECK_FALSE(GLLiveForwardTerminalPresent(file, 4));
+  // A swap followed by more drawing, context changes or unknown commands remains unsupported.
+  for(GLChunk after : {GLChunk::glDrawArrays, GLChunk::MakeContextCurrent,
+                       GLChunk::ImplicitThreadSwitch, GLChunk(~0U)})
+  {
+    file.chunks[3]->metadata.chunkID = uint32_t(after);
+    CHECK_FALSE(GLLiveForwardTerminalPresent(file, 2));
+  }
+  file.chunks[3]->metadata.chunkID = uint32_t(SystemChunk::CaptureEnd);
+  append(uint32_t(GLChunk::glDrawArrays));
+  CHECK_FALSE(GLLiveForwardTerminalPresent(file, 2));
+}
+
+TEST_CASE("OpenGL live forward cannot start or finish within a shared multi-draw chunk",
+          "[gl][replay][live-forward]")
+{
+  rdcarray<APIEvent> events;
+  events.resize(8);
+  for(uint32_t i = 1; i < events.size(); i++)
+  {
+    events[i].eventId = i;
+    events[i].fileOffset = i * 10;
+  }
+  CHECK(GLLiveForwardEventBoundary(events, 1));
+  CHECK(GLLiveForwardEventBoundary(events, 4));
+  CHECK_FALSE(GLLiveForwardEventBoundary(events, 0));
+  CHECK_FALSE(GLLiveForwardEventBoundary(events, 7));
+  events[3].fileOffset = events[4].fileOffset = events[5].fileOffset;
+  CHECK_FALSE(GLLiveForwardEventBoundary(events, 3));
+  CHECK_FALSE(GLLiveForwardEventBoundary(events, 4));
+  CHECK_FALSE(GLLiveForwardEventBoundary(events, 5));
+  CHECK(GLLiveForwardEventBoundary(events, 6));
+  events[7].eventId = 0;
+  CHECK_FALSE(GLLiveForwardEventBoundary(events, 6));
+}
+
+TEST_CASE("OpenGL and GLES live forward reject hidden execution context and future commands",
+          "[gl][replay][live-forward]")
+{
+  for(GLChunk chunk : {GLChunk::glDrawArrays, GLChunk::glDrawElements,
+                       GLChunk::glDispatchCompute, GLChunk::glMultiDrawArrays,
+                       GLChunk::glUniform1f, GLChunk::glBindBufferBase,
+                       GLChunk::glClear, GLChunk::glMemoryBarrier,
+                       GLChunk::glNamedBufferSubData, GLChunk::glTexSubImage2D,
+                       GLChunk::glCopyImageSubData, GLChunk::glClearBufferSubData,
+                       GLChunk::glFramebufferTextureLayer, GLChunk::glVertexAttribPointer,
+                       GLChunk::glVertexAttribIFormat})
+    CHECK(GLLiveForwardCallSupported(chunk));
+  for(GLChunk chunk : {GLChunk::glBeginQuery, GLChunk::glEndQuery,
+                       GLChunk::glBeginConditionalRender, GLChunk::glEndConditionalRender,
+                       GLChunk::glBeginTransformFeedback, GLChunk::glEndTransformFeedback,
+                       GLChunk::glFenceSync, GLChunk::glWaitSync,
+                       GLChunk::MakeContextCurrent, GLChunk::ImplicitThreadSwitch,
+                       GLChunk::ContextConfiguration, GLChunk::glNamedBufferStorage,
+                       GLChunk::glTextureView, GLChunk(~0U)})
+    CHECK_FALSE(GLLiveForwardCallSupported(chunk));
+}
+
 TEST_CASE("OpenGL checkpoint buffer sharing fails closed for unknown and hidden writes",
           "[gl][checkpoint][sharing]")
 {
@@ -6222,6 +6867,29 @@ TEST_CASE("OpenGL checkpoint boundary permits uploads but rejects hidden executi
   CHECK(GLCheckpointUnsupportedFrameCall("glGetQueryBufferObjectuiv"));
   CHECK(GLCheckpointUnsupportedFrameCall("glLinkProgram"));
   CHECK(GLCheckpointUnsupportedFrameCall("glFramebufferTexture2DMultisampleEXT"));
+}
+
+TEST_CASE("OpenGL static checkpoint sharing requires complete frame content evidence",
+          "[gl][checkpoint][resourceversions]")
+{
+  CHECK(GLCheckpointContentEvidenceComplete(GLChunk::glDrawArrays));
+  CHECK(GLCheckpointContentEvidenceComplete(GLChunk::glDispatchCompute));
+  CHECK(GLCheckpointContentEvidenceComplete(GLChunk::glBindFramebuffer));
+  CHECK(GLCheckpointContentEvidenceComplete(GLChunk::glClear));
+  // Legal checkpoint commands can still invalidate the stronger static-content proof. Missing
+  // per-resource usage is not permission to share after an upload, copy, mip build or unknown call.
+  CHECK_FALSE(GLCheckpointContentEvidenceComplete(GLChunk::glNamedBufferSubDataEXT));
+  CHECK_FALSE(GLCheckpointContentEvidenceComplete(GLChunk::glCopyBufferSubData));
+  CHECK_FALSE(GLCheckpointContentEvidenceComplete(GLChunk::glTextureSubImage2DEXT));
+  CHECK_FALSE(GLCheckpointContentEvidenceComplete(GLChunk::glGenerateMipmap));
+  CHECK_FALSE(GLCheckpointContentEvidenceComplete(GLChunk(0xffffffffU)));
+
+  CHECK(GLCheckpointShareOriginalContents(true, false, false, false));
+  CHECK_FALSE(GLCheckpointShareOriginalContents(false, false, false, false));
+  CHECK_FALSE(GLCheckpointShareOriginalContents(true, true, false, false));
+  CHECK_FALSE(GLCheckpointShareOriginalContents(true, false, true, false));
+  CHECK_FALSE(GLCheckpointShareOriginalContents(true, false, false, true));
+  CHECK_FALSE(GLCheckpointShareOriginalContents(true, true, true, true));
 }
 TEST_CASE("OpenGL checkpoints reject actual object slots beyond their saved state", "[gl][checkpoint]")
 {

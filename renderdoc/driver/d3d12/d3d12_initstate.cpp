@@ -1963,6 +1963,11 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *res, D3D12Initi
 
     ResourceId id = GetResID(res);
 
+    // A separate, transaction-wide proof covers this reserved texture and every backing heap.
+    // Keep the generic sparseBinds exclusion below: it is not an individual-resource proof.
+    if(IsActiveReplaying(m_State) && m_Device->UseReplaySparseInitialBaseline(id))
+      return;
+
     // A validated checkpoint supplies the complete final contents of this ordinary resource.
     // Keep sparse mappings and descriptor baselines on their normal paths; resource barriers are
     // restored separately by BeginCaptureFrame before the checkpoint copy is recorded.

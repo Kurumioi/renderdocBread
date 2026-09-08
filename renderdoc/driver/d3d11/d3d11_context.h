@@ -366,6 +366,8 @@ public:
   void ClearMaps();
 
   uint32_t GetEventID() { return m_CurEventID; }
+  const rdcarray<APIEvent> &GetReplayEvents() const { return m_Events; }
+  bool HasOpenReplayMaps() const { return !m_OpenMaps.empty(); }
   void RestoreCheckpointEvent(uint32_t eventId)
   {
     m_CurEventID = eventId;

@@ -210,6 +210,7 @@ public:
   bool ApplyPendingBufferPatches();
   void InvalidateBufferPatchContents() { m_BufferPatchesDirty = !m_BufferPatches.empty(); }
   bool HasBufferPatches() const { return !m_BufferPatches.empty(); }
+  void InvalidateLiveForward();
   SDFile *GetStructuredFile();
 
   rdcarray<uint32_t> GetPassEvents(uint32_t eventId);
@@ -494,6 +495,14 @@ private:
 
   std::map<EventCBufferOverrideKey, EventCBufferOverride> m_EventCBufferOverrides;
   rdcarray<AppliedEventCBufferOverride> m_AppliedEventCBufferOverrides;
+  struct LiveForwardCursor
+  {
+    bool valid = false;
+    uint32_t eventId = 0, pendingTarget = 0;
+    uint64_t deviceSerial = 0, pendingDeviceSerial = 0;
+  } m_LiveForward;
+  bool m_LiveForwardCaptureScanned = false, m_LiveForwardCaptureSafe = false;
+  bool IsLiveForwardContextSafe();
 
   // used to track the real state so we can preserve it even across work done to the output windows
   struct RealState

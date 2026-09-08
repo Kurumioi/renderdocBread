@@ -26,7 +26,11 @@
 #include "core/settings.h"
 #include "driver/dxgi/dxgi_common.h"
 #include "driver/ihv/amd/official/DXExt/AmdExtD3DCommandListMarkerApi.h"
+#include "driver/shaders/dxbc/dxbc_bytecode.h"
+#include "driver/shaders/dxil/dxil_bytecode.h"
+#include "driver/shaders/dxil/dxil_common.h"
 #include "d3d12_command_list.h"
+#include "d3d12_replay_clear.h"
 #include "d3d12_command_queue.h"
 #include "replay/replay_timing.h"
 
@@ -1241,6 +1245,7 @@ RDResult WrappedID3D12CommandQueue::ReplayLog(CaptureState readType, uint32_t st
 
   if(IsLoading(m_State))
   {
+    m_Cmd.m_ReplaySubmissionQueues.clear();
     m_pDevice->ApplyInitialContents();
 
     m_pDevice->ExecuteLists();
@@ -2088,6 +2093,15 @@ void BakedCmdListInfo::ShiftForRemoved(uint32_t shiftActionID, uint32_t shiftEID
     for(CheckpointBarrierOp &barrier : checkpointBarriers)
       if(barrier.relativeEvent >= firstFollowingEvent)
         barrier.relativeEvent -= shiftEID;
+    for(uint32_t &event : replayClearUnsafeBarriers)
+      if(event >= firstFollowingEvent)
+        event -= shiftEID;
+    for(ReplayClearOp &clear : replayClearOps)
+      if(clear.relativeEvent >= firstFollowingEvent)
+        clear.relativeEvent -= shiftEID;
+    for(ReplayTextureReadOp &read : replayTextureReadOps)
+      if(read.relativeEvent >= firstFollowingEvent)
+        read.relativeEvent -= shiftEID;
     for(auto &write : replayWriteFirstEvents)
       if(write.second >= firstFollowingEvent)
         write.second -= shiftEID;
@@ -2095,6 +2109,9 @@ void BakedCmdListInfo::ShiftForRemoved(uint32_t shiftActionID, uint32_t shiftEID
       if(write.second >= firstFollowingEvent)
         write.second -= shiftEID;
     for(auto &write : replayUAVFirstEvents)
+      if(write.second >= firstFollowingEvent)
+        write.second -= shiftEID;
+    for(auto &write : replayDeclaredUAVFirstEvents)
       if(write.second >= firstFollowingEvent)
         write.second -= shiftEID;
     if(replayFirstUnknownWriteEvent != ~0U && replayFirstUnknownWriteEvent >= firstFollowingEvent)
@@ -3080,6 +3097,14 @@ TEST_CASE("D3D12 checkpoint metadata follows final indirect event counts",
   BakedCmdListInfo::CheckpointBarrierOp barrier;
   barrier.relativeEvent = 8;
   info.checkpointBarriers.push_back(barrier);
+  info.replayClearUnsafeBarriers = {2, 8};
+  info.replayClearOps.push_back({baked, 10, true, true});
+  BakedCmdListInfo::ReplayTextureReadOp beforeIndirect, afterIndirect;
+  beforeIndirect.relativeEvent = 2;
+  afterIndirect.relativeEvent = 10;
+  afterIndirect.directResources.push_back(baked);
+  afterIndirect.descriptorRanges.push_back({baked, 4, 8});
+  info.replayTextureReadOps = {beforeIndirect, afterIndirect};
   info.ShiftForRemoved(3, 3, 2);
   CHECK(info.eventCount == 9);
   CHECK(action.children[2].action.eventId == 3);
@@ -3091,6 +3116,15 @@ TEST_CASE("D3D12 checkpoint metadata follows final indirect event counts",
   CHECK(info.checkpointQueries[0].relativeEvent == 1);
   CHECK(info.checkpointQueries[1].relativeEvent == 4);
   CHECK(info.checkpointBarriers[0].relativeEvent == 5);
+  REQUIRE(info.replayClearUnsafeBarriers.size() == 2);
+  CHECK(info.replayClearUnsafeBarriers[0] == 2);
+  CHECK(info.replayClearUnsafeBarriers[1] == 5);
+  CHECK(info.replayClearOps[0].relativeEvent == 7);
+  REQUIRE(info.replayTextureReadOps.size() == 2);
+  CHECK(info.replayTextureReadOps[0].relativeEvent == 2);
+  CHECK(info.replayTextureReadOps[1].relativeEvent == 7);
+  CHECK(info.replayTextureReadOps[1].directResources[0] == baked);
+  CHECK(info.replayTextureReadOps[1].descriptorRanges[0].first == 4);
   info.action = NULL;
 }
 
@@ -3520,7 +3554,7 @@ static void RecordUnknownReplayWrite(BakedCmdListInfo &info, uint32_t relativeEv
 
 static bool AddReplayUAVRange(BakedCmdListInfo &info, ResourceId heap, uint32_t heapCount,
                              uint64_t base, uint64_t offset, uint32_t requestedCount,
-                             uint32_t relativeEvent = 0)
+                             uint32_t relativeEvent = 0, bool includeDeclared = true)
 {
   if(base > heapCount || offset > heapCount - base)
     return false;
@@ -3530,9 +3564,14 @@ static bool AddReplayUAVRange(BakedCmdListInfo &info, ResourceId heap, uint32_t 
   if(count > remaining)
     return false;
   if(count)
+  {
+    const BakedCmdListInfo::ReplayUAVRange range = {heap, uint32_t(first), uint32_t(count)};
     RecordReplayWriteStart(info.replayUAVRanges, info.replayUAVFirstEvents,
-                           BakedCmdListInfo::ReplayUAVRange{heap, uint32_t(first), uint32_t(count)},
-                           relativeEvent);
+                           range, relativeEvent);
+    if(includeDeclared)
+      RecordReplayWriteStart(info.replayDeclaredUAVRanges, info.replayDeclaredUAVFirstEvents,
+                             range, relativeEvent);
+  }
   return true;
 }
 
@@ -3562,54 +3601,643 @@ static bool HasKnownReplayIndirectWrites(const D3D12CommandSignature &signature)
   return true;
 }
 
+struct ReplayWriteBindingStages
+{
+  bool graphics, compute;
+};
+
+static bool UseReplayActiveWriteStages()
+{
+  // The loading index is fixed for this native process. A/B runs set the opt-out before opening
+  // the capture; do not allocate/read environment strings for every draw or dispatch.
+  static const bool enabled =
+      Process::GetEnvVariable("RENDERDOC_D3D12_DISABLE_ACTIVE_WRITE_STAGES") != "1";
+  return enabled;
+}
+
+static ReplayWriteBindingStages ReplayWriteStages(D3D12Chunk chunk,
+                                                   const D3D12CommandSignature *signature = NULL)
+{
+  if(chunk == D3D12Chunk::List_DrawInstanced || chunk == D3D12Chunk::List_DrawIndexedInstanced ||
+     chunk == D3D12Chunk::List_DispatchMesh)
+    return {true, false};
+  if(chunk == D3D12Chunk::List_Dispatch)
+    return {false, true};
+  if(chunk != D3D12Chunk::List_ExecuteIndirect || !signature || signature->raytraced ||
+     signature->arguments.empty())
+    return {true, true};
+  ReplayWriteBindingStages stages = {false, false};
+  for(const D3D12_INDIRECT_ARGUMENT_DESC &argument : signature->arguments)
+  {
+    switch(argument.Type)
+    {
+      case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH: stages.graphics = true; break;
+      case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: stages.compute = true; break;
+      case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+      case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: break;
+      default: return {true, true};
+    }
+  }
+  return stages.graphics || stages.compute ? stages : ReplayWriteBindingStages{true, true};
+}
+
+static bool ReplayUAVDeclarationBindingsKnown(D3D12Chunk chunk,
+                                               const D3D12CommandSignature *signature = NULL)
+{
+  if(chunk == D3D12Chunk::List_DrawInstanced || chunk == D3D12Chunk::List_DrawIndexedInstanced ||
+     chunk == D3D12Chunk::List_Dispatch || chunk == D3D12Chunk::List_DispatchMesh)
+    return true;
+  if(chunk != D3D12Chunk::List_ExecuteIndirect || !signature ||
+     !HasKnownReplayIndirectWrites(*signature))
+    return false;
+  uint32_t terminals = 0;
+  bool graphics = false;
+  for(size_t i = 0; i < signature->arguments.size(); i++)
+  {
+    const D3D12_INDIRECT_ARGUMENT_TYPE type = signature->arguments[i].Type;
+    const bool terminal = type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW ||
+                          type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED ||
+                          type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH ||
+                          type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+    if(terminal)
+    {
+      terminals++;
+      graphics = type != D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+      if(i + 1 != signature->arguments.size())
+        return false;
+    }
+  }
+  // A legal indirect signature has one final operation. Its arguments cannot change the PSO,
+  // root-signature object or descriptor tables. CBV/SRV/VB/IB addresses and root constants may
+  // change reads/branches/array indices; retaining every declared UAV array element covers them.
+  // Generated root UAV addresses, rays and unknown argument kinds were rejected above.
+  return terminals == 1 && graphics == signature->graphics;
+}
+
+static const uint32_t ReplayTextureReadMetadataLimit = 1024 * 1024;
+
+static bool AddReplayTextureReadRange(BakedCmdListInfo::ReplayTextureReadOp &read,
+                                      ResourceId heap, uint32_t heapCount, uint64_t base,
+                                      uint64_t offset, uint32_t requestedCount)
+{
+  if(heap == ResourceId() || base > heapCount || offset > heapCount - base)
+    return false;
+  const uint64_t first = base + offset;
+  const uint64_t remaining = heapCount - first;
+  const uint64_t count = requestedCount == UINT_MAX ? remaining : requestedCount;
+  if(count > remaining || read.descriptorRanges.size() >= ReplayTextureReadMetadataLimit)
+    return false;
+  if(count)
+    read.descriptorRanges.push_back({heap, uint32_t(first), uint32_t(count)});
+  return true;
+}
+
+static void StoreReplayTextureRead(BakedCmdListInfo &info,
+                                   BakedCmdListInfo::ReplayTextureReadOp &&read)
+{
+  if(!info.replayTextureReadsComplete)
+    return;
+  const uint64_t entries = 1 + read.directResources.size() + read.descriptorRanges.size();
+  if(info.replayTextureReadEntries > ReplayTextureReadMetadataLimit ||
+     entries > ReplayTextureReadMetadataLimit - info.replayTextureReadEntries)
+  {
+    info.replayTextureReadsComplete = false;
+    info.replayTextureReadOps.clear();
+    info.replayTextureReadEntries = 0;
+    return;
+  }
+  info.replayTextureReadEntries += uint32_t(entries);
+  info.replayTextureReadOps.push_back(std::move(read));
+}
+
+template <typename DescriptorQuery>
+static bool ReplayTextureReadMayReference(const BakedCmdListInfo::ReplayTextureReadOp &read,
+                                          ResourceId target, DescriptorQuery descriptorQuery)
+{
+  if(read.unknown || target == ResourceId() || read.directResources.contains(target))
+    return true;
+  for(const auto &range : read.descriptorRanges)
+    if(descriptorQuery(range, target))
+      return true;
+  return false;
+}
+
+static bool UseReplayUAVDeclarations()
+{
+  static const bool enabled =
+      Process::GetEnvVariable("RENDERDOC_D3D12_ENABLE_UAV_DECLARATION_RANGES") == "1";
+  return enabled;
+}
+
+using ReplayShaderUAVBinding = D3D12CommandData::ReplayShaderUAVBinding;
+using ReplayPSOUAVProof = D3D12CommandData::ReplayPSOUAVProof;
+
+static bool ReplayFiniteUAVBinding(uint32_t first, uint32_t count)
+{
+  return count != 0 && count != UINT_MAX && uint64_t(first) + count <= uint64_t(UINT_MAX) + 1;
+}
+
+// Validate the complete executable token walk before accepting declaration absence. An empty
+// reflection object alone also represents a failed parser, and is never a negative write proof.
+static bool ReplayDXBCTokenDeclarations(const rdcarray<uint32_t> &tokens, uint32_t &uavCount)
+{
+  uavCount = 0;
+  if(tokens.size() < 3 || tokens[1] != tokens.size())
+    return false;
+  for(size_t offset = 2; offset < tokens.size();)
+  {
+    const uint32_t opcode = tokens[offset] & 0x7ff;
+    if(opcode >= DXBCBytecode::NUM_REAL_OPCODES || opcode == DXBCBytecode::OPCODE_RESERVED0 ||
+       opcode == DXBCBytecode::OPCODE_RESERVED1 || opcode == DXBCBytecode::OPCODE_RESERVED2 ||
+       opcode == DXBCBytecode::OPCODE_RESERVED3 ||
+       opcode == DXBCBytecode::OPCODE_DCL_INTERFACE ||
+       opcode == DXBCBytecode::OPCODE_DCL_FUNCTION_BODY ||
+       opcode == DXBCBytecode::OPCODE_DCL_FUNCTION_TABLE)
+      return false;
+    uint32_t length = (tokens[offset] >> 24) & 0x7f;
+    if(opcode == DXBCBytecode::OPCODE_CUSTOMDATA)
+    {
+      if(offset + 1 >= tokens.size())
+        return false;
+      length = tokens[offset + 1];
+      if(length < 2)
+        return false;
+    }
+    if(!length || length > tokens.size() - offset)
+      return false;
+    if(opcode == DXBCBytecode::OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW ||
+       opcode == DXBCBytecode::OPCODE_DCL_UNORDERED_ACCESS_VIEW_STRUCTURED ||
+       opcode == DXBCBytecode::OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED)
+      uavCount++;
+    offset += length;
+  }
+  return true;
+}
+
+static bool ReplayDXILMetadataUint(const DXIL::Metadata *metadata, uint32_t &value)
+{
+  uint64_t wide = 0;
+  if(!metadata || !metadata->isConstant || !metadata->value ||
+     !DXIL::getival(metadata->value, wide) || wide > UINT_MAX)
+    return false;
+  value = uint32_t(wide);
+  return true;
+}
+
+struct ReplayOriginalExecutable
+{
+  const byte *bytes = NULL;
+  size_t length = 0;
+  uint32_t fourcc = 0;
+  uint64_t featureFlags = 0;
+  bool featureInfoPresent = false;
+};
+
+static bool ReplaySM66FeatureInfoKnown(const ReplayOriginalExecutable &original)
+{
+  const uint64_t heapFlags = uint64_t(DXBC::GlobalShaderFlags::ResourceDescriptorHeapIndexing) |
+                             uint64_t(DXBC::GlobalShaderFlags::SamplerDescriptorHeapIndexing) |
+                             uint64_t(DXBC::GlobalShaderFlags::AtomicInt64OnHeapResource);
+  return original.featureInfoPresent && !(original.featureFlags & heapFlags);
+}
+
+static uint32_t ReplayShaderWord(const byte *bytes, size_t offset)
+{
+  uint32_t value;
+  memcpy(&value, bytes + offset, sizeof(value));
+  return value;
+}
+
+// This takes GetDesc's original PSO input only. DXBCContainer is intentionally not involved:
+// its debug search/ILDB selection may substitute a different program, even without a HASH.
+static bool ReplayFindOriginalExecutable(const byte *bytes, size_t length,
+                                         ReplayOriginalExecutable &executable)
+{
+  executable = {};
+  if(!bytes || length < 32 || length > UINT_MAX ||
+     ReplayShaderWord(bytes, 0) != DXBC::FOURCC_DXBC || ReplayShaderWord(bytes, 20) != 1 ||
+     ReplayShaderWord(bytes, 24) != length)
+    return false;
+  const uint32_t count = ReplayShaderWord(bytes, 28);
+  if(!count || count > (length - 32) / 4)
+    return false;
+  const size_t tableEnd = 32 + size_t(count) * 4;
+  rdcarray<rdcpair<size_t, size_t>> occupied;
+  for(uint32_t i = 0; i < count; i++)
+  {
+    const size_t offset = ReplayShaderWord(bytes, 32 + size_t(i) * 4);
+    if(offset < tableEnd || (offset & 3) || offset > length || length - offset < 8)
+      return false;
+    const uint32_t fourcc = ReplayShaderWord(bytes, offset);
+    const size_t payloadLength = ReplayShaderWord(bytes, offset + 4);
+    if(payloadLength > length - offset - 8)
+      return false;
+    const size_t end = offset + 8 + payloadLength;
+    for(const auto &previous : occupied)
+      if(offset < previous.second && previous.first < end)
+        return false;
+    occupied.push_back({offset, end});
+    if(fourcc == DXBC::FOURCC_SHEX || fourcc == DXBC::FOURCC_SHDR ||
+       fourcc == DXBC::FOURCC_DXIL)
+    {
+      // Reject ambiguous duplicates rather than duplicating the runtime's precedence rules.
+      if(executable.bytes || !payloadLength)
+        return false;
+      executable.bytes = bytes + offset + 8;
+      executable.length = payloadLength;
+      executable.fourcc = fourcc;
+    }
+    if(fourcc == DXBC::FOURCC_SFI0)
+    {
+      if(executable.featureInfoPresent || payloadLength != sizeof(uint64_t))
+        return false;
+      executable.featureInfoPresent = true;
+      executable.featureFlags = uint64_t(ReplayShaderWord(bytes, offset + 8)) |
+                                (uint64_t(ReplayShaderWord(bytes, offset + 12)) << 32);
+    }
+  }
+  return executable.bytes != NULL;
+}
+
+static const char *ReplayOriginalUAVDeclarations(const byte *bytes, size_t length,
+                                                ShaderStage stage,
+                                                rdcarray<ReplayShaderUAVBinding> &bindings)
+{
+  ReplayOriginalExecutable original;
+  if(!ReplayFindOriginalExecutable(bytes, length, original))
+    return "missingOrAmbiguousOriginalExecutable";
+  rdcarray<ReplayShaderUAVBinding> declared;
+  if(original.fourcc == DXBC::FOURCC_SHDR || original.fourcc == DXBC::FOURCC_SHEX)
+  {
+    if(original.length % sizeof(uint32_t) != 0)
+      return "unalignedOriginalDXBCTokens";
+    DXBCBytecode::Program program(original.bytes, original.length);
+    uint32_t declarations = 0;
+    if(program.GetMajorVersion() != 5 || program.GetMinorVersion() > 1 ||
+       uint32_t(program.GetShaderType()) > uint32_t(DXBC::ShaderType::Compute) ||
+       DXBC::GetShaderStage(program.GetShaderType()) != stage ||
+       !ReplayDXBCTokenDeclarations(program.GetTokens(), declarations))
+      return "unsupportedDXBCTokens";
+    DXBC::Reflection *executable = program.GuessReflection();
+    if(!executable)
+      return "missingDXBCDeclarations";
+    const bool complete = executable->UAVs.size() == declarations;
+    for(const DXBC::ShaderInputBind &binding : executable->UAVs)
+      declared.push_back({stage, binding.space, binding.reg, binding.bindCount});
+    delete executable;
+    if(!complete)
+      return "incompleteDXBCDeclarations";
+  }
+  else if(original.fourcc == DXBC::FOURCC_DXIL)
+  {
+    if(!DXIL::Program::Valid(original.bytes, original.length))
+      return "invalidOriginalDXILProgram";
+    DXIL::Program dxilProgram(original.bytes, original.length);
+    if(dxilProgram.GetMajorVersion() == 6 && dxilProgram.GetMinorVersion() == 6)
+    {
+      // Flags are from the same original container as the executable, never an external debug
+      // blob. They are an additional veto; the complete call/handle-origin proof is still required.
+      if(!ReplaySM66FeatureInfoKnown(original))
+        return "sm66MissingOrHeapFeatureInfo";
+      rdcarray<DXIL::ReplayRootBinding> rootBindings;
+      const char *reason = dxilProgram.GetReplayFiniteRootBindings(rootBindings);
+      if(reason)
+        return reason;
+      for(const DXIL::ReplayRootBinding &binding : rootBindings)
+        if(binding.resourceClass == DXIL::ResourceClass::UAV)
+          declared.push_back({stage, binding.space, binding.first, binding.count});
+      if(DXBC::GetShaderStage(dxilProgram.GetShaderType()) != stage)
+        return "sm66PipelineStageMismatch";
+    }
+    else
+    {
+      // Preserve the existing SM6.0-6.5 eligibility and metadata checks. SM6.7+ remains unsupported.
+      if(dxilProgram.GetMajorVersion() != 6 || dxilProgram.GetMinorVersion() > 5 ||
+         uint32_t(dxilProgram.GetShaderType()) > uint32_t(DXBC::ShaderType::Compute) ||
+         DXBC::GetShaderStage(dxilProgram.GetShaderType()) != stage ||
+         !dxilProgram.GetDebugStatus().empty() || dxilProgram.GetDirectHeapAcessCount() != 0)
+        return "unsupportedDXILModelOrOperation";
+      const DXIL::Metadata *entries = dxilProgram.GetMetadataByName("dx.entryPoints");
+      if(!entries || entries->children.size() != 1 || !entries->children[0] ||
+         entries->children[0]->children.size() < 5 || !entries->children[0]->children[0])
+        return "incompleteDXILEntryPoint";
+      const DXIL::Metadata *resources = entries->children[0]->children[3];
+      const DXIL::Metadata *global = dxilProgram.GetMetadataByName("dx.resources");
+      if((resources && (!global || global->children.size() != 1 ||
+                        global->children[0] != resources || resources->children.size() != 4)) ||
+         (!resources && global && (global->children.size() != 1 || global->children[0])))
+        return "incompleteDXILResources";
+      const DXIL::Metadata *uavs = resources ? resources->children[1] : NULL;
+      if(uavs)
+        for(const DXIL::Metadata *uav : uavs->children)
+        {
+          ReplayShaderUAVBinding binding;
+          binding.stage = stage;
+          if(!uav || uav->children.size() <= size_t(DXIL::ResField::UAVTags) ||
+             !ReplayDXILMetadataUint(uav->children[size_t(DXIL::ResField::Space)], binding.space) ||
+             !ReplayDXILMetadataUint(uav->children[size_t(DXIL::ResField::RegBase)], binding.first) ||
+             !ReplayDXILMetadataUint(uav->children[size_t(DXIL::ResField::RegCount)], binding.count))
+            return "incompleteDXILUAVDeclaration";
+          declared.push_back(binding);
+        }
+    }
+  }
+  else
+  {
+    return "missingExecutableProgram";
+  }
+
+  for(const ReplayShaderUAVBinding &binding : declared)
+    if(!ReplayFiniteUAVBinding(binding.first, binding.count))
+      return "unboundedOrInvalidDeclaration";
+  bindings.append(declared);
+  return NULL;
+}
+
+static bool ReplayUAVReflectionMatches(const ShaderReflection &reflection, ShaderStage stage,
+                                        const rdcarray<ReplayShaderUAVBinding> &declared)
+{
+  if(reflection.stage != stage || reflection.readWriteResources.size() != declared.size())
+    return false;
+  for(const ShaderResource &resource : reflection.readWriteResources)
+  {
+    bool matched = false;
+    for(const ReplayShaderUAVBinding &binding : declared)
+      matched |= binding.space == resource.fixedBindSetOrSpace &&
+                 binding.first == resource.fixedBindNumber && binding.count == resource.bindArraySize;
+    if(!matched)
+      return false;
+  }
+  return true;
+}
+
+static const char *ReplayShaderUAVDeclarations(WrappedID3D12Shader *shader, ShaderStage stage,
+                                              rdcarray<ReplayShaderUAVBinding> &bindings)
+{
+  uint32_t vendorSlot = ~0U, vendorSpace = ~0U;
+  shader->GetShaderExtSlot(vendorSlot, vendorSpace);
+  if(vendorSlot != ~0U || vendorSpace != ~0U)
+    return "vendorExtension";
+  const D3D12_SHADER_BYTECODE original = shader->GetDesc();
+  rdcarray<ReplayShaderUAVBinding> declared;
+  const char *reason = ReplayOriginalUAVDeclarations((const byte *)original.pShaderBytecode,
+                                                     original.BytecodeLength, stage, declared);
+  if(reason)
+    return reason;
+  // Reflection is an additional veto only, never the source of a negative write proof. A debug
+  // blob with missing/different UAVs cannot shrink the original executable's declaration set.
+  if(!ReplayUAVReflectionMatches(shader->GetDetails(), stage, declared))
+    return "reflectionDeclarationMismatch";
+  bindings.append(declared);
+  return NULL;
+}
+
+const D3D12CommandData::ReplayPSOUAVProof &D3D12CommandData::GetReplayPSOUAVProof(ResourceId pipeline)
+{
+  auto found = m_ReplayPSOUAVProofs.find(pipeline);
+  if(found != m_ReplayPSOUAVProofs.end())
+    return found->second;
+  ReplayPSOUAVProof &proof = m_ReplayPSOUAVProofs[pipeline];
+  D3D12ResourceManager *rm = m_pDevice ? m_pDevice->GetResourceManager() : NULL;
+  WrappedID3D12PipelineState *pipe =
+      rm && pipeline != ResourceId() ? rm->GetResAs<WrappedID3D12PipelineState>(pipeline) : NULL;
+  if(!pipe || rm->HasReplacement(pipeline))
+    proof.reason = "missingOrReplacedPipeline";
+  else
+  {
+    WrappedID3D12Shader *shaders[NumShaderStages] = {};
+    proof.graphics = pipe->IsGraphics();
+    if(pipe->IsCompute())
+      shaders[uint32_t(ShaderStage::Compute)] = pipe->CS();
+    else if(pipe->IsGraphics())
+    {
+      shaders[uint32_t(ShaderStage::Vertex)] = pipe->VS();
+      shaders[uint32_t(ShaderStage::Hull)] = pipe->HS();
+      shaders[uint32_t(ShaderStage::Domain)] = pipe->DS();
+      shaders[uint32_t(ShaderStage::Geometry)] = pipe->GS();
+      shaders[uint32_t(ShaderStage::Pixel)] = pipe->PS();
+      shaders[uint32_t(ShaderStage::Amplification)] = pipe->AS();
+      shaders[uint32_t(ShaderStage::Mesh)] = pipe->MS();
+    }
+    proof.reason = "missingShader";
+    bool any = false;
+    for(uint32_t stage = 0; stage < NumShaderStages; stage++)
+    {
+      if(!shaders[stage])
+        continue;
+      any = true;
+      const ResourceId shaderID = shaders[stage]->GetResourceID();
+      if(rm->HasReplacement(shaderID))
+      {
+        proof.reason = "replacedShader";
+        break;
+      }
+      // Raw executable parsing is deliberately independent of the debug container cache. Reuse
+      // this immutable result across PSOs sharing one shader instead of parsing it per PSO.
+      const rdcpair<ResourceId, ShaderStage> key = {shaderID, ShaderStage(stage)};
+      auto cached = m_ReplayShaderUAVProofs.find(key);
+      if(cached == m_ReplayShaderUAVProofs.end())
+      {
+        ReplayPSOUAVProof &shaderProof = m_ReplayShaderUAVProofs[key];
+        shaderProof.reason = ReplayShaderUAVDeclarations(shaders[stage], ShaderStage(stage),
+                                                         shaderProof.bindings);
+        shaderProof.complete = shaderProof.reason == NULL;
+        cached = m_ReplayShaderUAVProofs.find(key);
+      }
+      proof.reason = cached->second.reason;
+      if(proof.reason)
+        break;
+      proof.bindings.append(cached->second.bindings);
+    }
+    proof.complete = any && proof.reason == NULL;
+    if(proof.complete)
+      proof.reason = "completeExecutableDeclarations";
+  }
+  // Proofs are built while loading, before prepared-replay timing is enabled. The cache lookup
+  // above still makes this exactly one diagnostic per PSO, including loading-time fallbacks.
+  if(m_PreparedTimingEnabled || Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+  {
+    const rdcstr line = StringFormat::Fmt(
+        "api=D3D12UAVDeclarationPSO pipeline=%s complete=%u graphics=%u ranges=%zu reason=%s",
+        ToStr(pipeline).c_str(), proof.complete ? 1U : 0U, proof.graphics ? 1U : 0U,
+        proof.bindings.size(), proof.reason);
+    RDCLOG("%s", line.c_str());
+    AppendReplayTimingLog(line);
+  }
+  return proof;
+}
+
+static bool ReplayUAVVisibilityMatches(D3D12_SHADER_VISIBILITY visibility, ShaderStage stage)
+{
+  if(visibility == D3D12_SHADER_VISIBILITY_ALL)
+    return true;
+  switch(stage)
+  {
+    case ShaderStage::Vertex: return visibility == D3D12_SHADER_VISIBILITY_VERTEX;
+    case ShaderStage::Hull: return visibility == D3D12_SHADER_VISIBILITY_HULL;
+    case ShaderStage::Domain: return visibility == D3D12_SHADER_VISIBILITY_DOMAIN;
+    case ShaderStage::Geometry: return visibility == D3D12_SHADER_VISIBILITY_GEOMETRY;
+    case ShaderStage::Pixel: return visibility == D3D12_SHADER_VISIBILITY_PIXEL;
+    case ShaderStage::Amplification: return visibility == D3D12_SHADER_VISIBILITY_AMPLIFICATION;
+    case ShaderStage::Mesh: return visibility == D3D12_SHADER_VISIBILITY_MESH;
+    default: return false;
+  }
+}
+
+// Output offsets are relative to this one UAV range, not the whole descriptor table. Keep every
+// element of a declared array: constants, branches and dynamic array indices do not narrow it.
+static bool ReplayUAVTableDeclarationRanges(const ReplayPSOUAVProof *proof, bool graphics,
+                                            bool bindingsKnown, D3D12_ROOT_SIGNATURE_FLAGS flags,
+                                            D3D12_SHADER_VISIBILITY visibility,
+                                            const D3D12_DESCRIPTOR_RANGE1 &range,
+                                            rdcarray<rdcpair<uint32_t, uint32_t>> &selected)
+{
+  selected.clear();
+  if(!proof || !proof->complete || proof->graphics != graphics || !bindingsKnown ||
+     (flags & (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+               D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED)) ||
+     uint32_t(visibility) > uint32_t(D3D12_SHADER_VISIBILITY_MESH) ||
+     range.RangeType != D3D12_DESCRIPTOR_RANGE_TYPE_UAV ||
+     !ReplayFiniteUAVBinding(range.BaseShaderRegister, range.NumDescriptors))
+    return false;
+  const uint64_t end = uint64_t(range.BaseShaderRegister) + range.NumDescriptors;
+  for(const ReplayShaderUAVBinding &binding : proof->bindings)
+  {
+    if(!ReplayFiniteUAVBinding(binding.first, binding.count))
+      return false;
+    if(binding.space != range.RegisterSpace || !ReplayUAVVisibilityMatches(visibility, binding.stage))
+      continue;
+    const uint64_t first = RDCMAX(uint64_t(range.BaseShaderRegister), uint64_t(binding.first));
+    const uint64_t last = RDCMIN(end, uint64_t(binding.first) + binding.count);
+    if(first < last)
+      selected.push_back({uint32_t(first - range.BaseShaderRegister), uint32_t(last - first)});
+  }
+  std::sort(selected.begin(), selected.end());
+  for(size_t i = 1; i < selected.size();)
+  {
+    const uint64_t previousEnd = uint64_t(selected[i - 1].first) + selected[i - 1].second;
+    if(selected[i].first <= previousEnd)
+    {
+      selected[i - 1].second = uint32_t(
+          RDCMAX(previousEnd, uint64_t(selected[i].first) + selected[i].second) - selected[i - 1].first);
+      selected.erase(i);
+    }
+    else
+      i++;
+  }
+  return true;
+}
+
 void D3D12CommandData::ObserveReplayWriteBindings(BakedCmdListInfo &info,
                                                 const D3D12RenderState &state,
-                                                uint32_t relativeEvent)
+                                                uint32_t relativeEvent, bool graphics, bool compute,
+                                                bool declarationBindingsKnown)
 {
-  for(ResourceId target : state.GetRTVIDs())
-    if(target != ResourceId())
-      RecordReplayWriteStart(info.replayWrites, info.replayWriteFirstEvents, target, relativeEvent);
-  if(state.GetDSVID() != ResourceId())
-    RecordReplayWriteStart(info.replayWrites, info.replayWriteFirstEvents, state.GetDSVID(),
-                           relativeEvent);
-  for(const auto &output : state.streamouts)
+  BakedCmdListInfo::ReplayTextureReadOp textureRead;
+  textureRead.relativeEvent = relativeEvent;
+  textureRead.unknown = !graphics && !compute;
+  const bool declarationsEnabled = UseReplayUAVDeclarations();
+  const ReplayPSOUAVProof *declarations =
+      declarationsEnabled && graphics != compute && declarationBindingsKnown
+          ? &GetReplayPSOUAVProof(state.pipe) : NULL;
+  // Draw and dispatch bindings coexist in D3D12 state. Only the selected pipeline executes;
+  // stale graphics outputs on a dispatch, or stale compute UAVs on a draw, do not write bytes.
+  if(graphics)
   {
-    if(output.buf != ResourceId())
-      RecordReplayWriteStart(info.replayWrites, info.replayWriteFirstEvents, output.buf, relativeEvent);
-    if(output.countbuf != ResourceId())
-      RecordReplayWriteStart(info.replayWrites, info.replayWriteFirstEvents, output.countbuf,
+    for(ResourceId target : state.GetRTVIDs())
+      if(target != ResourceId())
+      {
+        textureRead.directResources.push_back(target);
+        RecordReplayWriteStart(info.replayWrites, info.replayWriteFirstEvents, target, relativeEvent);
+      }
+    if(state.GetDSVID() != ResourceId())
+    {
+      textureRead.directResources.push_back(state.GetDSVID());
+      RecordReplayWriteStart(info.replayWrites, info.replayWriteFirstEvents, state.GetDSVID(),
                              relativeEvent);
+    }
+    if(state.shadingRateImage != ResourceId())
+      textureRead.directResources.push_back(state.shadingRateImage);
+    for(const auto &output : state.streamouts)
+    {
+      if(output.buf != ResourceId())
+        RecordReplayWriteStart(info.replayWrites, info.replayWriteFirstEvents, output.buf, relativeEvent);
+      if(output.countbuf != ResourceId())
+        RecordReplayWriteStart(info.replayWrites, info.replayWriteFirstEvents, output.countbuf,
+                               relativeEvent);
+    }
   }
 
   for(const auto *root : {&state.graphics, &state.compute})
   {
-    if(root->rootsig == ResourceId())
+    if((root == &state.graphics && !graphics) || (root == &state.compute && !compute))
       continue;
+    if(root->rootsig == ResourceId())
+    {
+      textureRead.unknown = true;
+      continue;
+    }
     WrappedID3D12RootSignature *signature =
-        m_pDevice->GetResourceManager()->GetResAs<WrappedID3D12RootSignature>(root->rootsig);
+        m_pDevice ? m_pDevice->GetResourceManager()->GetResAs<WrappedID3D12RootSignature>(
+                        root->rootsig) : NULL;
     if(!signature)
     {
+      textureRead.unknown = true;
       info.replayUnknownWrites = true;
       continue;
     }
     if(signature->sig.Flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED)
     {
+      bool resourceHeap = false;
       for(ResourceId heapID : state.heaps)
       {
         WrappedID3D12DescriptorHeap *heap =
             m_pDevice->GetResourceManager()->GetResAs<WrappedID3D12DescriptorHeap>(heapID);
         if(!heap)
+        {
+          textureRead.unknown = true;
           info.replayUnknownWrites = true;
+        }
         else if(heap->GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-          RecordReplayWriteStart(info.replayUAVRanges, info.replayUAVFirstEvents,
-                                 BakedCmdListInfo::ReplayUAVRange{heapID, 0, heap->GetNumDescriptors()},
-                                 relativeEvent);
+        {
+          resourceHeap = true;
+          textureRead.unknown |= !AddReplayTextureReadRange(
+              textureRead, heapID, heap->GetNumDescriptors(), 0, 0, UINT_MAX);
+          AddReplayUAVRange(info, heapID, heap->GetNumDescriptors(), 0, 0, UINT_MAX,
+                            relativeEvent, declarationsEnabled);
+          if(declarationsEnabled)
+          {
+            info.replayUAVDeclarationFallbacks++;
+            info.replayUAVSlotsBefore += heap->GetNumDescriptors();
+            info.replayUAVSlotsAfter += heap->GetNumDescriptors();
+          }
+        }
       }
+      textureRead.unknown |= !resourceHeap;
     }
-    for(size_t i = 0; i < signature->sig.Parameters.size() && i < root->sigelems.size(); i++)
+    for(size_t i = 0; i < signature->sig.Parameters.size(); i++)
     {
       const auto &parameter = signature->sig.Parameters[i];
+      bool textureTable = false;
+      if(parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+        for(const D3D12_DESCRIPTOR_RANGE1 &range : parameter.ranges)
+          textureTable |= range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
+                          range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+      if(i >= root->sigelems.size())
+      {
+        textureRead.unknown |= textureTable;
+        continue;
+      }
       const auto &element = root->sigelems[i];
+      if(textureTable && (element.type != eRootTable || !state.heaps.contains(element.id)))
+        textureRead.unknown = true;
       if(parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV && element.type == eRootUAV)
       {
         if(element.id != ResourceId())
@@ -3623,9 +4251,12 @@ void D3D12CommandData::ObserveReplayWriteBindings(BakedCmdListInfo &info,
             m_pDevice->GetResourceManager()->GetResAs<WrappedID3D12DescriptorHeap>(element.id);
         if(!heap)
         {
+          textureRead.unknown |= textureTable;
           info.replayUnknownWrites = true;
           continue;
         }
+        if(textureTable && heap->GetDesc().Type != D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+          textureRead.unknown = true;
         uint64_t previousEnd = 0;
         for(const D3D12_DESCRIPTOR_RANGE1 &range : parameter.ranges)
         {
@@ -3637,15 +4268,56 @@ void D3D12CommandData::ObserveReplayWriteBindings(BakedCmdListInfo &info,
                                          ? heap->GetNumDescriptors() - element.offset - offset : 0;
           const uint64_t count = range.NumDescriptors == UINT_MAX ? remaining : range.NumDescriptors;
           previousEnd = offset + count;
+          if(range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV ||
+             range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV)
+            textureRead.unknown |= !AddReplayTextureReadRange(
+                textureRead, element.id, heap->GetNumDescriptors(), element.offset, offset,
+                range.NumDescriptors);
           if(range.RangeType != D3D12_DESCRIPTOR_RANGE_TYPE_UAV)
             continue;
+          rdcarray<rdcpair<uint32_t, uint32_t>> selected;
+          const bool narrowed =
+              ReplayUAVTableDeclarationRanges(declarations, root == &state.graphics,
+                                               declarationBindingsKnown,
+                                               signature->sig.Flags, parameter.ShaderVisibility,
+                                               range, selected) &&
+              heap->GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+              state.heaps.contains(element.id);
           if(!AddReplayUAVRange(info, element.id, heap->GetNumDescriptors(), element.offset,
-                                offset, range.NumDescriptors, relativeEvent))
+                                offset, range.NumDescriptors, relativeEvent,
+                                declarationsEnabled && !narrowed))
+          {
             info.replayUnknownWrites = true;
+            continue;
+          }
+          if(declarationsEnabled)
+          {
+            info.replayUAVSlotsBefore += count;
+            if(narrowed)
+            {
+              info.replayUAVDeclarationHits++;
+              for(const auto &subrange : selected)
+              {
+                // The full table range passed native heap bounds checks above. Register
+                // intersection offsets are bounded by that range, including explicit/APPEND.
+                const BakedCmdListInfo::ReplayUAVRange declared = {
+                    element.id, uint32_t(element.offset + offset + subrange.first), subrange.second};
+                RecordReplayWriteStart(info.replayDeclaredUAVRanges,
+                                       info.replayDeclaredUAVFirstEvents, declared, relativeEvent);
+                info.replayUAVSlotsAfter += subrange.second;
+              }
+            }
+            else
+            {
+              info.replayUAVDeclarationFallbacks++;
+              info.replayUAVSlotsAfter += count;
+            }
+          }
         }
       }
     }
   }
+  StoreReplayTextureRead(info, std::move(textureRead));
 }
 
 static void GatherReplayActionWrites(const D3D12ActionTreeNode &node, BakedCmdListInfo &info)
@@ -3702,6 +4374,7 @@ void D3D12CommandData::BuildReplayWriteTracking()
           info.replayWriteFirstEvents.size() == info.replayWrites.size() &&
           info.replayRootUAVFirstEvents.size() == info.replayRootUAVWrites.size() &&
           info.replayUAVFirstEvents.size() == info.replayUAVRanges.size() &&
+          info.replayDeclaredUAVFirstEvents.size() == info.replayDeclaredUAVRanges.size() &&
           (!info.replayUnknownWrites || info.replayFirstUnknownWriteEvent != ~0U);
     }
   }
@@ -3748,6 +4421,11 @@ static bool IsReplayWriteInPrefix(const std::map<Key, uint32_t> &firstEvents, co
   // BuildReplayWriteTracking checks index completeness. If a later path ever adds an unindexed
   // union member, retaining it is the safe direction and keeps the old dirty upper bound.
   return first == firstEvents.end() || first->second <= cutoff.last;
+}
+
+static bool ReplayUseDeclaredUAVIndex(bool enabled, bool edited, bool completeIndex)
+{
+  return enabled && !edited && completeIndex;
 }
 
 void D3D12CommandData::MarkReplaySubmittedWrites(ResourceId baked, uint32_t baseEvent,
@@ -3801,9 +4479,15 @@ void D3D12CommandData::MarkReplaySubmittedWrites(ResourceId baked, uint32_t base
     else
       skippedRootUAVs++;
   std::set<ResourceId> descriptors;
-  for(const auto &range : info.replayUAVRanges)
+  const bool declaredUAVs = ReplayUseDeclaredUAVIndex(
+      UseReplayUAVDeclarations(), m_pDevice->HasReplayCheckpointDependencyEdits(),
+      info.replayWriteEventsKnown);
+  const auto &uavRanges = declaredUAVs ? info.replayDeclaredUAVRanges : info.replayUAVRanges;
+  const auto &uavFirstEvents =
+      declaredUAVs ? info.replayDeclaredUAVFirstEvents : info.replayUAVFirstEvents;
+  for(const auto &range : uavRanges)
   {
-    if(!IsReplayWriteInPrefix(info.replayUAVFirstEvents, range, cutoff))
+    if(!IsReplayWriteInPrefix(uavFirstEvents, range, cutoff))
     {
       skippedRanges++;
       continue;
@@ -3828,11 +4512,16 @@ void D3D12CommandData::MarkReplaySubmittedWrites(ResourceId baked, uint32_t base
   {
     const rdcstr line = StringFormat::Fmt(
         "api=D3D12DirtyWriteCutoff baked=%s base=%u requestedEnd=%u localLast=%u enabled=%u "
-        "indexed=%u skippedResources=%u skippedRootUAVs=%u skippedRanges=%u "
+        "indexed=%u activeWriteStages=%u skippedResources=%u skippedRootUAVs=%u skippedRanges=%u "
+        "declaredUAVs=%u declarationHits=%u declarationFallbacks=%u uavSlotsBefore=%llu "
+        "uavSlotsAfter=%llu "
         "firstUnknown=%u futureUnknown=%u proofValid=%u fallback=%s",
         ToStr(baked).c_str(), baseEvent, lastEvent, cutoff.last,
-        m_ReplayWriteCutoffEnabled ? 1U : 0U, cutoff.indexed ? 1U : 0U, skippedResources,
-        skippedRootUAVs, skippedRanges, info.replayFirstUnknownWriteEvent,
+        m_ReplayWriteCutoffEnabled ? 1U : 0U, cutoff.indexed ? 1U : 0U,
+        UseReplayActiveWriteStages() ? 1U : 0U, skippedResources, skippedRootUAVs, skippedRanges,
+        declaredUAVs ? 1U : 0U, info.replayUAVDeclarationHits, info.replayUAVDeclarationFallbacks,
+        (unsigned long long)info.replayUAVSlotsBefore, (unsigned long long)info.replayUAVSlotsAfter,
+        info.replayFirstUnknownWriteEvent,
         info.replayUnknownWrites && !cutoff.unknown ? 1U : 0U,
         m_pDevice->IsReplayDirtyTrackingValid() ? 1U : 0U, cutoff.fallback);
     RDCLOG("%s", line.c_str());
@@ -3854,6 +4543,23 @@ static uint32_t ReplayChunkFirstWriteEvent(const BakedCmdListInfo &info, D3D12Ch
   return info.curEventID ? info.curEventID - 1 : 0;
 }
 
+void D3D12CommandData::MarkReplaySubmittedOverwrites(ResourceId baked, uint32_t baseEvent,
+                                                     uint32_t lastEvent)
+{
+  const auto found = m_BakedCmdListInfo.find(baked);
+  const auto executions = m_Partial[Primary].cmdListExecs.find(baked);
+  if(!m_pDevice || found == m_BakedCmdListInfo.end() ||
+     executions == m_Partial[Primary].cmdListExecs.end() ||
+     !executions->second.contains(baseEvent) || lastEvent < baseEvent)
+    return;
+  const BakedCmdListInfo &info = found->second;
+  for(const auto &clear : info.replayClearOps)
+    if(clear.unconditional && clear.fullResource && clear.relativeEvent < info.eventCount &&
+       uint64_t(baseEvent) + clear.relativeEvent >= m_FirstEventID &&
+       uint64_t(baseEvent) + clear.relativeEvent <= lastEvent)
+      m_pDevice->MarkReplayFullOverwriteSubmitted(clear.resource);
+}
+
 void D3D12CommandData::ObserveCheckpointChunk(D3D12Chunk chunk, uint64_t chunkEndOffset)
 {
   if(m_LastCmdListID != ResourceId())
@@ -3861,12 +4567,20 @@ void D3D12CommandData::ObserveCheckpointChunk(D3D12Chunk chunk, uint64_t chunkEn
     BakedCmdListInfo &info = m_BakedCmdListInfo[m_LastCmdListID];
     if(chunk == D3D12Chunk::List_Reset)
     {
+      info.replayClearOps.clear();
+      info.replayTextureReadOps.clear();
+      info.replayTextureReadEntries = 0;
+      info.replayTextureReadsComplete = true;
       info.replayWrites.clear();
       info.replayRootUAVWrites.clear();
       info.replayUAVRanges.clear();
       info.replayWriteFirstEvents.clear();
       info.replayRootUAVFirstEvents.clear();
       info.replayUAVFirstEvents.clear();
+      info.replayDeclaredUAVRanges.clear();
+      info.replayDeclaredUAVFirstEvents.clear();
+      info.replayUAVSlotsBefore = info.replayUAVSlotsAfter = 0;
+      info.replayUAVDeclarationHits = info.replayUAVDeclarationFallbacks = 0;
       info.replayFirstUnknownWriteEvent = ~0U;
       info.replayWritesKnown = info.replayWriteEventsKnown = info.replayUnknownWrites = false;
     }
@@ -3884,8 +4598,18 @@ void D3D12CommandData::ObserveCheckpointChunk(D3D12Chunk chunk, uint64_t chunkEn
       case D3D12Chunk::List_Dispatch:
       case D3D12Chunk::List_DispatchMesh:
       case D3D12Chunk::List_ExecuteIndirect:
-        ObserveReplayWriteBindings(info, info.state, firstWriteEvent);
+      {
+        const D3D12CommandSignature *signature = NULL;
+        if(chunk == D3D12Chunk::List_ExecuteIndirect && !info.executeEvents.empty() &&
+           info.executeEvents.back().sig)
+          signature = &info.executeEvents.back().sig->sig;
+        const ReplayWriteBindingStages stages = UseReplayActiveWriteStages()
+                                                     ? ReplayWriteStages(chunk, signature)
+                                                     : ReplayWriteBindingStages{true, true};
+        ObserveReplayWriteBindings(info, info.state, firstWriteEvent, stages.graphics,
+                                    stages.compute, ReplayUAVDeclarationBindingsKnown(chunk, signature));
         break;
+      }
       case D3D12Chunk::List_BeginRenderPass:
       case D3D12Chunk::List_EndRenderPass:
       case D3D12Chunk::List_WriteBufferImmediate:
@@ -3982,6 +4706,1296 @@ void D3D12CommandData::ObserveCheckpointChunk(D3D12Chunk chunk, uint64_t chunkEn
     default: break;
   }
 }
+
+// Deliberately a texture-read-free whitelist, not the replay/continuation whitelist. Copy, query
+// resolves, render-pass operations and future API commands stop discovery even if replay supports
+// them. No shader reflection or absent GetUsage entry can establish that an operation is harmless.
+static bool IsReplayClearPrefixState(D3D12Chunk chunk)
+{
+  switch(chunk)
+  {
+    case D3D12Chunk::List_Close:
+    case D3D12Chunk::List_Reset:
+    case D3D12Chunk::List_ClearState:
+    case D3D12Chunk::List_IASetPrimitiveTopology:
+    case D3D12Chunk::List_IASetIndexBuffer:
+    case D3D12Chunk::List_IASetVertexBuffers:
+    case D3D12Chunk::List_SOSetTargets:
+    case D3D12Chunk::List_RSSetViewports:
+    case D3D12Chunk::List_RSSetScissorRects:
+    case D3D12Chunk::List_SetPipelineState:
+    case D3D12Chunk::List_SetDescriptorHeaps:
+    case D3D12Chunk::List_OMSetRenderTargets:
+    case D3D12Chunk::List_OMSetStencilRef:
+    case D3D12Chunk::List_OMSetBlendFactor:
+    case D3D12Chunk::List_SetGraphicsRootDescriptorTable:
+    case D3D12Chunk::List_SetGraphicsRootSignature:
+    case D3D12Chunk::List_SetGraphicsRoot32BitConstant:
+    case D3D12Chunk::List_SetGraphicsRoot32BitConstants:
+    case D3D12Chunk::List_SetGraphicsRootConstantBufferView:
+    case D3D12Chunk::List_SetGraphicsRootShaderResourceView:
+    case D3D12Chunk::List_SetGraphicsRootUnorderedAccessView:
+    case D3D12Chunk::List_SetComputeRootDescriptorTable:
+    case D3D12Chunk::List_SetComputeRootSignature:
+    case D3D12Chunk::List_SetComputeRoot32BitConstant:
+    case D3D12Chunk::List_SetComputeRoot32BitConstants:
+    case D3D12Chunk::List_SetComputeRootConstantBufferView:
+    case D3D12Chunk::List_SetComputeRootShaderResourceView:
+    case D3D12Chunk::List_SetComputeRootUnorderedAccessView:
+    case D3D12Chunk::List_SetPredication:
+    case D3D12Chunk::List_OMSetDepthBounds:
+    case D3D12Chunk::List_SetSamplePositions:
+    case D3D12Chunk::List_SetViewInstanceMask:
+    case D3D12Chunk::List_RSSetShadingRate:
+    case D3D12Chunk::List_RSSetShadingRateImage:
+    case D3D12Chunk::List_OMSetFrontAndBackStencilRef:
+    case D3D12Chunk::List_RSSetDepthBias:
+    case D3D12Chunk::List_IASetIndexBufferStripCutValue:
+    // These change hidden query-heap state, not texture contents. They still execute normally;
+    // draws remain subject to the complete per-resource read proof, and ResolveQueryData stops
+    // discovery. This does not make any query/checkpoint continuation newly eligible.
+    case D3D12Chunk::List_BeginQuery:
+    case D3D12Chunk::List_EndQuery:
+    case D3D12Chunk::PushMarker:
+    case D3D12Chunk::SetMarker:
+    case D3D12Chunk::PopMarker:
+    case D3D12Chunk::SetCommandAnnotation: return true;
+    default: return false;
+  }
+}
+
+bool BakedCmdListInfo::IsReplayClearBarrierReadFree(D3D12_RESOURCE_BARRIER_TYPE type,
+                                                  D3D12_RESOURCE_BARRIER_FLAGS flags)
+{
+  // This classifies logical texture-content reads only. The original barrier still executes.
+  // An alias barrier concerns placed/reserved storage, excluded by the caller's committed set.
+  // Do not broaden split-transition, unknown-type, or unknown-flag handling along with it.
+  return flags == D3D12_RESOURCE_BARRIER_FLAG_NONE &&
+         (type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION ||
+          type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING ||
+          type == D3D12_RESOURCE_BARRIER_TYPE_UAV);
+}
+
+static bool ObserveReplayClearPrefix(D3D12Chunk chunk, bool unsafeBarrier,
+                                     const BakedCmdListInfo::ReplayClearOp *clear,
+                                     const std::set<ResourceId> &eligibleTextures,
+                                     std::set<ResourceId> &overwritten)
+{
+  if(chunk == D3D12Chunk::List_ResourceBarrier)
+    return !unsafeBarrier;
+  if(chunk == D3D12Chunk::List_ClearRenderTargetView ||
+     chunk == D3D12Chunk::List_ClearDepthStencilView || chunk == D3D12Chunk::List_DiscardResource)
+  {
+    // A predicate itself may consume a resource. Partial unconditional clears do not read old
+    // content and can precede a later full clear, but cannot authorize a skipped resource copy.
+    if(!clear || !clear->unconditional || clear->resource == ResourceId())
+      return false;
+    if(clear->fullResource && eligibleTextures.count(clear->resource))
+      overwritten.insert(clear->resource);
+    return true;
+  }
+  return IsReplayClearPrefixState(chunk);
+}
+
+std::set<ResourceId> D3D12CommandData::GetReplayFullClearPrefix(
+    uint32_t checkpointEvent, uint32_t throughEvent,
+    const std::set<ResourceId> &eligibleTextures) const
+{
+  std::set<ResourceId> overwritten;
+  struct Diagnostic
+  {
+    bool enabled;
+    uint32_t checkpoint, target;
+    size_t queues;
+    size_t candidates = 0, approved = 0, readOps = 0, unknownReads = 0, blockedCandidates = 0;
+    size_t eligibleResources = 0, aliasBarrierEventsPassed = 0, aliasBarriersPassed = 0;
+    size_t barrierStops = 0;
+    uint32_t firstBlock = 0, stopEvent = 0;
+    uint32_t stopChunkID = 0;
+    rdcstr stopChunkName = "none";
+    const char *firstReason = "none", *stopReason = "complete";
+    void Block(uint32_t event, const char *reason)
+    {
+      if(firstBlock == 0)
+      {
+        firstBlock = event;
+        firstReason = reason;
+      }
+    }
+    void Stop(uint32_t event, const char *reason)
+    {
+      Block(event, reason);
+      stopEvent = event;
+      stopReason = reason;
+    }
+    ~Diagnostic()
+    {
+      if(enabled)
+      {
+        const rdcstr line = StringFormat::Fmt(
+            "api=D3D12ClearProof checkpoint=%u target=%u queues=%zu candidates=%zu approved=%zu "
+            "readOps=%zu unknownReads=%zu blockedCandidates=%zu firstBlockingEID=%u "
+            "firstReason=%s stopEID=%u stopReason=%s stopChunkID=%u stopChunk=%s "
+            "eligibleResources=%zu aliasBarrierEventsPassed=%zu aliasBarriersPassed=%zu "
+            "barrierStops=%zu",
+            checkpoint, target, queues, candidates, approved, readOps, unknownReads,
+            blockedCandidates, firstBlock, firstReason, stopEvent, stopReason,
+            stopChunkID, stopChunkName.c_str(), eligibleResources, aliasBarrierEventsPassed,
+            aliasBarriersPassed, barrierStops);
+        RDCLOG("%s", line.c_str());
+        AppendReplayTimingLog(line);
+      }
+    }
+  } diagnostic = {Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1", checkpointEvent,
+                   throughEvent, 0};
+  diagnostic.eligibleResources = eligibleTextures.size();
+  if(eligibleTextures.empty())
+  {
+    diagnostic.Stop(checkpointEvent, "noEligibleCommittedTexture");
+    return overwritten;
+  }
+  if(!checkpointEvent || checkpointEvent >= throughEvent || !m_CheckpointUnsupported.empty() ||
+     !m_StructuredFile || throughEvent >= m_Events.size())
+  {
+    diagnostic.Stop(checkpointEvent, "invalidRangeOrUnsupportedCapture");
+    return overwritten;
+  }
+  bool boundaryFound = false;
+  for(const CheckpointBoundary &boundary : m_CheckpointBoundaries)
+    if(boundary.eventId == checkpointEvent && boundary.nextEvent == checkpointEvent + 1)
+      boundaryFound = true;
+  if(!boundaryFound)
+  {
+    diagnostic.Stop(checkpointEvent, "checkpointBoundaryMissing");
+    return overwritten;
+  }
+
+  struct Occurrence
+  {
+    uint32_t base, end;
+    const BakedCmdListInfo *info;
+  };
+  rdcarray<Occurrence> occurrences;
+  std::map<uint32_t, const BakedCmdListInfo::ReplayClearOp *> clears;
+  std::map<uint32_t, const BakedCmdListInfo::ReplayTextureReadOp *> reads;
+  std::set<ResourceId> candidates, readBeforeClear;
+  std::set<ResourceId> participatingQueues;
+  std::set<uint32_t> unsafeBarriers;
+  std::map<uint32_t, size_t> aliasBarriers;
+  for(const auto &entry : m_Partial[Primary].cmdListExecs)
+  {
+    const auto found = m_BakedCmdListInfo.find(entry.first);
+    if(found == m_BakedCmdListInfo.end())
+    {
+      diagnostic.Stop(checkpointEvent, "submittedListMetadataMissing");
+      return {};
+    }
+    const BakedCmdListInfo &info = found->second;
+    for(uint32_t base : entry.second)
+    {
+      const uint64_t end = uint64_t(base) + info.eventCount;
+      if(base > throughEvent || end <= checkpointEvent)
+        continue;
+      if(base <= checkpointEvent || end > ~0U || !info.eventCount ||
+         info.type != D3D12_COMMAND_LIST_TYPE_DIRECT || !info.checkpointBegin ||
+         !info.checkpointEnd || info.checkpointChunks.empty())
+      {
+        diagnostic.Stop(base, "overlappingOrUnsupportedPrimary");
+        return {};
+      }
+      const auto queue = m_ReplaySubmissionQueues.find(base);
+      if(queue == m_ReplaySubmissionQueues.end() || queue->second == ResourceId())
+      {
+        diagnostic.Stop(base, "submittedQueueIdentityMissing");
+        return {};
+      }
+      participatingQueues.insert(queue->second);
+      diagnostic.queues = participatingQueues.size();
+      // Restore drains the preceding work before publishing checkpoint contents. A single
+      // participating queue orders this suffix; unrelated queues created elsewhere in the
+      // frame do not invalidate that proof. Multi-queue suffixes still need a finer proof.
+      if(participatingQueues.size() != 1)
+      {
+        diagnostic.Stop(base, "multipleParticipatingQueues");
+        return {};
+      }
+      occurrences.push_back({base, uint32_t(end), &info});
+      for(const auto &clear : info.replayClearOps)
+      {
+        if(clear.relativeEvent >= info.eventCount)
+        {
+          diagnostic.Stop(base, "clearOutsideList");
+          return {};
+        }
+        const uint32_t event = base + clear.relativeEvent;
+        if(!clears.insert({event, &clear}).second)
+        {
+          diagnostic.Stop(event, "duplicateClearEID");
+          return {};
+        }
+        if(event > checkpointEvent && event <= throughEvent && clear.unconditional &&
+           clear.fullResource && eligibleTextures.count(clear.resource))
+          candidates.insert(clear.resource);
+      }
+      if(info.replayTextureReadsComplete)
+        for(const auto &read : info.replayTextureReadOps)
+        {
+          if(read.relativeEvent >= info.eventCount ||
+             !reads.insert({base + read.relativeEvent, &read}).second)
+          {
+            diagnostic.Stop(base, "invalidOrDuplicateReadEID");
+            return {};
+          }
+        }
+      for(const auto &barrier : info.checkpointBarriers)
+      {
+        if(barrier.relativeEvent >= info.eventCount)
+        {
+          diagnostic.Stop(base, "barrierOutsideList");
+          return {};
+        }
+        if(!BakedCmdListInfo::IsReplayClearBarrierReadFree(barrier.type, barrier.flags))
+          unsafeBarriers.insert(base + barrier.relativeEvent);
+        else if(barrier.type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING)
+          aliasBarriers[base + barrier.relativeEvent]++;
+      }
+      for(uint32_t event : info.replayClearUnsafeBarriers)
+      {
+        if(event >= info.eventCount)
+        {
+          diagnostic.Stop(base, "unsafeBarrierOutsideList");
+          return {};
+        }
+        unsafeBarriers.insert(base + event);
+      }
+    }
+  }
+  diagnostic.candidates = candidates.size();
+  if(candidates.empty())
+  {
+    diagnostic.Stop(checkpointEvent, "noFullClearCandidate");
+    return {};
+  }
+  std::sort(occurrences.begin(), occurrences.end(),
+            [](const Occurrence &a, const Occurrence &b) { return a.base < b.base; });
+  for(size_t i = 1; i < occurrences.size(); i++)
+    if(occurrences[i].base < occurrences[i - 1].end)
+    {
+      diagnostic.Stop(occurrences[i].base, "overlappingPrimaryOccurrences");
+      return {};
+    }
+  // Nested execution cannot be represented by these primary intervals. It is already rejected
+  // for normal checkpoint continuation; repeat that invariant for this standalone proof query.
+  for(const auto &entry : m_Partial[Secondary].cmdListExecs)
+    for(uint32_t base : entry.second)
+      if(base > checkpointEvent && base <= throughEvent)
+      {
+        diagnostic.Stop(base, "secondaryExecution");
+        return {};
+      }
+
+  size_t occurrence = 0;
+  for(uint32_t eid = checkpointEvent + 1; eid <= throughEvent; eid++)
+  {
+    const APIEvent &event = m_Events[eid];
+    if(event.eventId != eid || event.chunkIndex >= m_StructuredFile->chunks.size())
+    {
+      diagnostic.Stop(eid, "missingExactEvent");
+      break;
+    }
+    const D3D12Chunk chunk =
+        D3D12Chunk(m_StructuredFile->chunks[event.chunkIndex]->metadata.chunkID);
+    while(occurrence < occurrences.size() && eid >= occurrences[occurrence].end)
+      occurrence++;
+    const bool inPrimary = occurrence < occurrences.size() &&
+                           eid >= occurrences[occurrence].base;
+    if(!inPrimary)
+    {
+      // The loading index inserts synthetic Reset/Close boundaries for submitted lists. Queue
+      // waits/signals carry no resource bytes; all other root work fails closed.
+      if(chunk == D3D12Chunk::Queue_ExecuteCommandLists || chunk == D3D12Chunk::Queue_Wait ||
+         chunk == D3D12Chunk::Queue_Signal || chunk == D3D12Chunk::List_Reset ||
+         chunk == D3D12Chunk::List_Close || chunk == D3D12Chunk::PushMarker ||
+         chunk == D3D12Chunk::PopMarker || chunk == D3D12Chunk::SetMarker)
+        continue;
+      diagnostic.Stop(eid, "rootCommandDependency");
+      break;
+    }
+    const BakedCmdListInfo &info = *occurrences[occurrence].info;
+    auto recorded = std::lower_bound(
+        info.checkpointChunks.begin(), info.checkpointChunks.end(), event.fileOffset,
+        [](const BakedCmdListInfo::CheckpointRecordingChunk &item, uint64_t offset) {
+          return item.offset < offset;
+        });
+    if(recorded == info.checkpointChunks.end() || recorded->offset != event.fileOffset ||
+       recorded->type != chunk)
+    {
+      diagnostic.Stop(eid, "recordingIdentityMismatch");
+      break;
+    }
+    if(chunk == D3D12Chunk::List_DrawInstanced || chunk == D3D12Chunk::List_DrawIndexedInstanced ||
+       chunk == D3D12Chunk::List_Dispatch || chunk == D3D12Chunk::List_DispatchMesh)
+    {
+      diagnostic.readOps++;
+      const auto read = reads.find(eid);
+      // Metadata omission never means an empty binding set. Keep any already-proven clears,
+      // but stop before considering a later clear when this executed action is unaccounted for.
+      if(read == reads.end() || read->second->unknown)
+      {
+        diagnostic.unknownReads++;
+        diagnostic.Stop(eid, read == reads.end() ? "missingReadBindings" : "unknownReadBindings");
+        break;
+      }
+      for(ResourceId candidate : candidates)
+      {
+        if(overwritten.count(candidate) || readBeforeClear.count(candidate))
+          continue;
+        const bool mayRead = ReplayTextureReadMayReference(
+            *read->second, candidate,
+            [this](const BakedCmdListInfo::ReplayUAVRange &range, ResourceId resource) {
+              WrappedID3D12DescriptorHeap *heap = m_pDevice
+                  ? m_pDevice->GetResourceManager()->GetResAs<WrappedID3D12DescriptorHeap>(range.heap)
+                  : NULL;
+              return !heap || m_pDevice->GetResourceManager()->HasReplacement(range.heap) ||
+                     heap->ReplayRangeMayReference(resource, range.first, range.count);
+            });
+        if(mayRead)
+        {
+          readBeforeClear.insert(candidate);
+          diagnostic.blockedCandidates++;
+          diagnostic.Block(eid, "candidateMayBeReadBeforeClear");
+        }
+      }
+      continue;
+    }
+    const auto clear = clears.find(eid);
+    if(!ObserveReplayClearPrefix(chunk, unsafeBarriers.count(eid) != 0,
+                                 clear == clears.end() ? NULL : clear->second,
+                                 eligibleTextures, overwritten))
+    {
+      if(chunk == D3D12Chunk::List_ResourceBarrier)
+        diagnostic.barrierStops++;
+      diagnostic.Stop(eid, unsafeBarriers.count(eid) ? "splitOrUnknownBarrier" :
+          clear != clears.end() ? "predicatedOrUnknownClear" : "globalCommandDependency");
+      diagnostic.stopChunkID = uint32_t(chunk);
+      diagnostic.stopChunkName = ToStr(chunk);
+      break;
+    }
+    if(chunk == D3D12Chunk::List_ResourceBarrier)
+    {
+      const auto aliases = aliasBarriers.find(eid);
+      if(aliases != aliasBarriers.end())
+      {
+        diagnostic.aliasBarrierEventsPassed++;
+        diagnostic.aliasBarriersPassed += aliases->second;
+      }
+    }
+    if(clear != clears.end() && readBeforeClear.count(clear->second->resource))
+      overwritten.erase(clear->second->resource);
+  }
+  diagnostic.approved = overwritten.size();
+  return overwritten;
+}
+
+#if ENABLED(ENABLE_UNIT_TESTS)
+TEST_CASE("D3D12 discard coverage comes from an executed full pattern fill",
+          "[d3d12][replay][clear-prefix]")
+{
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+  desc.Width = 640;
+  desc.Height = 360;
+  desc.DepthOrArraySize = 128;
+  desc.MipLevels = 2;
+  desc.SampleDesc.Count = 1;
+  desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  CHECK(D3D12ReplayFullDiscardPattern(desc, NULL, true, 2));
+  CHECK_FALSE(D3D12ReplayFullDiscardPattern(desc, NULL, false, 2));
+  CHECK_FALSE(D3D12ReplayFullDiscardPattern(desc, NULL, true, 0));
+  D3D12_DISCARD_REGION region = {};
+  region.NumSubresources = 2;
+  CHECK(D3D12ReplayFullDiscardPattern(desc, &region, true, 2));
+  region.NumSubresources = 1;
+  CHECK_FALSE(D3D12ReplayFullDiscardPattern(desc, &region, true, 2));
+  region.NumSubresources = 2;
+  region.FirstSubresource = 1;
+  CHECK_FALSE(D3D12ReplayFullDiscardPattern(desc, &region, true, 2));
+  region.FirstSubresource = 0;
+  region.NumRects = 1;
+  CHECK_FALSE(D3D12ReplayFullDiscardPattern(desc, &region, true, 2));
+  desc.SampleDesc.Count = 4;
+  CHECK_FALSE(D3D12ReplayFullDiscardPattern(desc, NULL, true, 2));
+  desc.SampleDesc.Count = 1;
+  desc.Format = DXGI_FORMAT_BC7_UNORM;
+  CHECK_FALSE(D3D12ReplayFullDiscardPattern(desc, NULL, true, 2));
+  desc.Format = DXGI_FORMAT_R32_FLOAT;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  CHECK_FALSE(D3D12ReplayFullDiscardPattern(desc, NULL, true, 2));
+}
+
+TEST_CASE("D3D12 exact clear coverage requires every resource slice mip and plane",
+          "[d3d12][replay][clear-prefix]")
+{
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = desc.Height = 64;
+  desc.DepthOrArraySize = desc.MipLevels = 1;
+  desc.SampleDesc.Count = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  D3D12_RENDER_TARGET_VIEW_DESC rtv = {};
+  rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+  CHECK(D3D12ReplayFullRTVClear(desc, rtv, 0, 1));
+  CHECK_FALSE(D3D12ReplayFullRTVClear(desc, rtv, 1, 1));
+  CHECK_FALSE(D3D12ReplayFullRTVClear(desc, rtv, 0, 2));
+  desc.MipLevels = 2;
+  CHECK_FALSE(D3D12ReplayFullRTVClear(desc, rtv, 0, 1));
+  desc.MipLevels = 1;
+  desc.DepthOrArraySize = 4;
+  CHECK_FALSE(D3D12ReplayFullRTVClear(desc, rtv, 0, 1));
+  rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+  rtv.Texture2DArray.ArraySize = 4;
+  CHECK(D3D12ReplayFullRTVClear(desc, rtv, 0, 1));
+  rtv.Texture2DArray.FirstArraySlice = 1;
+  CHECK_FALSE(D3D12ReplayFullRTVClear(desc, rtv, 0, 1));
+  rtv = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+  desc.DepthOrArraySize = 128;
+  rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+  rtv.Texture3D.WSize = 128;
+  CHECK(D3D12ReplayFullRTVClear(desc, rtv, 0, 1));
+  rtv.Texture3D.WSize = 1;
+  CHECK_FALSE(D3D12ReplayFullRTVClear(desc, rtv, 0, 1));
+  rtv.Texture3D.WSize = ~0U;
+  CHECK(D3D12ReplayFullRTVClear(desc, rtv, 0, 1));
+
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.DepthOrArraySize = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {};
+  dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+  const D3D12_CLEAR_FLAGS both = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+  CHECK(D3D12ReplayFullDSVClear(desc, dsv, D3D12_CLEAR_FLAG_DEPTH, 0, 1));
+  CHECK_FALSE(D3D12ReplayFullDSVClear(desc, dsv, D3D12_CLEAR_FLAG_DEPTH, 0, 2));
+  CHECK_FALSE(D3D12ReplayFullDSVClear(desc, dsv, D3D12_CLEAR_FLAG_STENCIL, 0, 2));
+  CHECK(D3D12ReplayFullDSVClear(desc, dsv, both, 0, 2));
+  CHECK_FALSE(D3D12ReplayFullDSVClear(desc, dsv, both, 1, 2));
+  dsv.Flags = D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+  CHECK_FALSE(D3D12ReplayFullDSVClear(desc, dsv, both, 0, 2));
+  dsv.Flags = D3D12_DSV_FLAG_NONE;
+  desc.SampleDesc.Count = 4;
+  CHECK_FALSE(D3D12ReplayFullDSVClear(desc, dsv, both, 0, 2));
+  dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
+  CHECK(D3D12ReplayFullDSVClear(desc, dsv, both, 0, 2));
+}
+
+TEST_CASE("D3D12 content barrier classification accepts only known nonsplit barriers",
+          "[d3d12][replay][clear-prefix]")
+{
+  for(D3D12_RESOURCE_BARRIER_TYPE type : {D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                                         D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                                         D3D12_RESOURCE_BARRIER_TYPE_UAV})
+  {
+    CHECK(BakedCmdListInfo::IsReplayClearBarrierReadFree(type, D3D12_RESOURCE_BARRIER_FLAG_NONE));
+    for(D3D12_RESOURCE_BARRIER_FLAGS flags : {
+            D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY, D3D12_RESOURCE_BARRIER_FLAG_END_ONLY,
+            D3D12_RESOURCE_BARRIER_FLAGS(D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY |
+                                          D3D12_RESOURCE_BARRIER_FLAG_END_ONLY),
+            D3D12_RESOURCE_BARRIER_FLAGS(~0U)})
+      CHECK_FALSE(BakedCmdListInfo::IsReplayClearBarrierReadFree(type, flags));
+  }
+  CHECK_FALSE(BakedCmdListInfo::IsReplayClearBarrierReadFree(
+      D3D12_RESOURCE_BARRIER_TYPE(~0U), D3D12_RESOURCE_BARRIER_FLAG_NONE));
+}
+
+TEST_CASE("D3D12 clear prefix ends before reads unknown commands and unsafe barriers",
+          "[d3d12][replay][clear-prefix]")
+{
+  const ResourceId resource = ResourceIDGen::GetNewUniqueID();
+  BakedCmdListInfo::ReplayClearOp clear = {resource, 5, true, true};
+  std::set<ResourceId> result;
+  CHECK(ObserveReplayClearPrefix(D3D12Chunk::List_SetComputeRootConstantBufferView,
+                                 false, NULL, {resource}, result));
+  CHECK(ObserveReplayClearPrefix(D3D12Chunk::List_ResourceBarrier, false, NULL, {resource}, result));
+  CHECK(ObserveReplayClearPrefix(D3D12Chunk::List_ClearRenderTargetView, false, &clear,
+                                 {resource}, result));
+  CHECK(result.count(resource) == 1);
+  for(D3D12Chunk chunk : {D3D12Chunk::List_DrawInstanced, D3D12Chunk::List_Dispatch,
+                          D3D12Chunk::List_CopyResource, D3D12Chunk::List_ResolveSubresource,
+                          D3D12Chunk::List_ExecuteIndirect, D3D12Chunk::List_ExecuteBundle,
+                          D3D12Chunk::List_DiscardResource, D3D12Chunk::List_BeginRenderPass,
+                          D3D12Chunk::List_BuildRaytracingAccelerationStructure,
+                          D3D12Chunk(~0U)})
+    CHECK_FALSE(ObserveReplayClearPrefix(chunk, false, NULL, {resource}, result));
+  CHECK_FALSE(ObserveReplayClearPrefix(D3D12Chunk::List_ResourceBarrier, true, NULL,
+                                       {resource}, result));
+  result.clear();
+  clear.unconditional = false;
+  CHECK_FALSE(ObserveReplayClearPrefix(D3D12Chunk::List_ClearRenderTargetView, false, &clear,
+                                 {resource}, result));
+  clear.unconditional = true;
+  clear.fullResource = false;
+  CHECK(ObserveReplayClearPrefix(D3D12Chunk::List_ClearDepthStencilView, false, &clear,
+                                 {resource}, result));
+  CHECK(result.empty());
+  clear.fullResource = true;
+  CHECK(ObserveReplayClearPrefix(D3D12Chunk::List_ClearRenderTargetView, false, &clear, {}, result));
+  CHECK(result.empty());
+}
+
+TEST_CASE("D3D12 full clears are rebased to actual submissions and exclude OnlyDraw target",
+          "[d3d12][replay][clear-prefix]")
+{
+  SDFile file;
+  D3D12CommandData command;
+  command.m_StructuredFile = &file;
+  const ResourceId baked = ResourceIDGen::GetNewUniqueID();
+  const ResourceId resource = ResourceIDGen::GetNewUniqueID();
+  BakedCmdListInfo &info = command.m_BakedCmdListInfo[baked];
+  info.type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  info.eventCount = 5;
+  info.checkpointBegin = 100;
+  info.checkpointEnd = 160;
+  info.replayClearOps.push_back({resource, 2, true, true});
+  command.m_Partial[D3D12CommandData::Primary].cmdListExecs[baked] = {12, 32};
+  const ResourceId queue = ResourceIDGen::GetNewUniqueID();
+  command.m_ReplaySubmissionQueues = {{12, queue}, {32, queue}};
+  command.m_CheckpointBoundaries.push_back({10, 11, 0, 50});
+  command.m_CheckpointBoundaries.push_back({30, 31, 0, 60});
+  command.m_Events.resize(37);
+  const D3D12Chunk chunks[] = {D3D12Chunk::List_Reset, D3D12Chunk::List_SetPipelineState,
+                              D3D12Chunk::List_ResourceBarrier,
+                              D3D12Chunk::List_ClearRenderTargetView,
+                              D3D12Chunk::List_DrawInstanced, D3D12Chunk::List_Close};
+  for(uint32_t i = 0; i < 6; i++)
+  {
+    SDChunk *chunk = new SDChunk("clear-proof"_lit);
+    chunk->metadata.chunkID = uint32_t(chunks[i]);
+    file.chunks.push_back(chunk);
+    for(uint32_t first : {11U, 31U})
+    {
+      APIEvent event;
+      event.eventId = first + i;
+      event.chunkIndex = i;
+      event.fileOffset = 100 + i * 10;
+      command.m_Events[event.eventId] = event;
+    }
+    info.checkpointChunks.push_back({baked, 100 + i * 10, 110 + i * 10, i, chunks[i]});
+  }
+  // A real submission checkpoint names its synthetic Close at base + eventCount. The
+  // preceding list must be excluded before requiring a suffix occurrence to start after it.
+  const ResourceId previous = ResourceIDGen::GetNewUniqueID();
+  BakedCmdListInfo &prefix = command.m_BakedCmdListInfo[previous];
+  prefix.type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  prefix.eventCount = 7;
+  command.m_Partial[D3D12CommandData::Primary].cmdListExecs[previous] = {3};
+  CHECK(command.GetReplayFullClearPrefix(10, 14, {resource}).count(resource) == 1);
+  CHECK(command.GetReplayFullClearPrefix(10, 13, {resource}).empty());
+  CHECK(command.GetReplayFullClearPrefix(10, 14, {resource}).count(resource) == 1);
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {resource}).count(resource) == 1);
+  CHECK(command.GetReplayFullClearPrefix(30, 34, {resource}).count(resource) == 1);
+  CHECK(command.GetReplayFullClearPrefix(29, 34, {resource}).empty());
+  command.m_ReplaySubmissionQueues[32] = ResourceIDGen::GetNewUniqueID();
+  CHECK(command.GetReplayFullClearPrefix(10, 34, {resource}).empty());
+  CHECK(command.GetReplayFullClearPrefix(30, 34, {resource}).count(resource) == 1);
+  command.m_ReplaySubmissionQueues[32] = queue;
+  command.m_ReplaySubmissionQueues.erase(12);
+  CHECK(command.GetReplayFullClearPrefix(10, 14, {resource}).empty());
+  command.m_ReplaySubmissionQueues[12] = ResourceId();
+  CHECK(command.GetReplayFullClearPrefix(10, 14, {resource}).empty());
+  command.m_ReplaySubmissionQueues[12] = queue;
+  BakedCmdListInfo::CheckpointBarrierOp alias;
+  alias.relativeEvent = 1;
+  alias.type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+  info.checkpointBarriers.push_back(alias);
+  // NULL/NULL is a wildcard over placed/reserved storage. The caller's independent committed
+  // texture is unaffected, while an omitted or different eligible set authorizes nothing.
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {resource}).count(resource) == 1);
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {}).empty());
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {baked}).empty());
+  info.checkpointBarriers[0].before = baked;
+  info.checkpointBarriers[0].after = previous;
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {resource}).count(resource) == 1);
+  // Every member of the same ResourceBarrier call contributes. An alias does not erase a
+  // split/unsupported operation, regardless of array order or which resource it names.
+  BakedCmdListInfo::CheckpointBarrierOp split;
+  split.relativeEvent = alias.relativeEvent;
+  split.before = baked;
+  split.flags = D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY;
+  info.checkpointBarriers.push_back(split);
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {resource}).empty());
+  std::swap(info.checkpointBarriers[0], info.checkpointBarriers[1]);
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {resource}).empty());
+  info.checkpointBarriers = {alias};
+  info.checkpointBarriers[0].flags = D3D12_RESOURCE_BARRIER_FLAG_END_ONLY;
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {resource}).empty());
+  info.checkpointBarriers = {alias};
+  // Loading separately records unsafe native union types/flags that the legacy checkpoint
+  // barrier index does not describe, including a filtered NULL split transition.
+  info.replayClearUnsafeBarriers = {alias.relativeEvent};
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {resource}).empty());
+  info.replayClearUnsafeBarriers = {info.eventCount};
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {resource}).empty());
+  info.replayClearUnsafeBarriers.clear();
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {resource}).count(resource) == 1);
+  info.checkpointBarriers.clear();
+  info.replayClearOps[0].unconditional = false;
+  CHECK(command.GetReplayFullClearPrefix(30, 34, {resource}).empty());
+  info.replayClearOps[0].unconditional = true;
+  command.m_Events[33].fileOffset++;
+  CHECK(command.GetReplayFullClearPrefix(30, 34, {resource}).empty());
+  command.m_StructuredFile = NULL;
+}
+
+TEST_CASE("D3D12 texture read proof includes complete descriptor ranges and unknown bindings",
+          "[d3d12][replay][clear-prefix]")
+{
+  const ResourceId heap = ResourceIDGen::GetNewUniqueID();
+  const ResourceId direct = ResourceIDGen::GetNewUniqueID();
+  const ResourceId historical = ResourceIDGen::GetNewUniqueID();
+  const ResourceId unrelated = ResourceIDGen::GetNewUniqueID();
+  BakedCmdListInfo::ReplayTextureReadOp read;
+  read.directResources.push_back(direct);
+  REQUIRE(AddReplayTextureReadRange(read, heap, 20, 4, 2, 3));
+  REQUIRE(read.descriptorRanges.size() == 1);
+  CHECK(read.descriptorRanges[0].first == 6);
+  CHECK(read.descriptorRanges[0].count == 3);
+  uint32_t queried = 0;
+  const auto history = [&](const BakedCmdListInfo::ReplayUAVRange &range, ResourceId target) {
+    queried++;
+    return range.heap == heap && range.first <= 7 && range.first + range.count > 7 &&
+           target == historical;
+  };
+  CHECK(ReplayTextureReadMayReference(read, direct, history));
+  CHECK(queried == 0);
+  CHECK(ReplayTextureReadMayReference(read, historical, history));
+  CHECK_FALSE(ReplayTextureReadMayReference(read, unrelated, history));
+  read.unknown = true;
+  CHECK(ReplayTextureReadMayReference(read, unrelated, history));
+  read.unknown = false;
+  CHECK(ReplayTextureReadMayReference(read, unrelated,
+        [](const BakedCmdListInfo::ReplayUAVRange &, ResourceId) { return true; }));
+
+  BakedCmdListInfo::ReplayTextureReadOp unbounded;
+  REQUIRE(AddReplayTextureReadRange(unbounded, heap, 20, 4, 2, UINT_MAX));
+  CHECK(unbounded.descriptorRanges[0].first == 6);
+  CHECK(unbounded.descriptorRanges[0].count == 14);
+  CHECK_FALSE(AddReplayTextureReadRange(unbounded, heap, 20, UINT64_MAX, 0, 1));
+  CHECK_FALSE(AddReplayTextureReadRange(unbounded, heap, 20, 4, UINT64_MAX, 1));
+  CHECK_FALSE(AddReplayTextureReadRange(unbounded, heap, 20, 4, 2, 15));
+  CHECK_FALSE(AddReplayTextureReadRange(unbounded, ResourceId(), 20, 0, 0, 1));
+
+  BakedCmdListInfo bounded;
+  bounded.replayTextureReadEntries = ReplayTextureReadMetadataLimit - 1;
+  StoreReplayTextureRead(bounded, {});
+  CHECK(bounded.replayTextureReadsComplete);
+  REQUIRE(bounded.replayTextureReadOps.size() == 1);
+  StoreReplayTextureRead(bounded, {});
+  CHECK_FALSE(bounded.replayTextureReadsComplete);
+  CHECK(bounded.replayTextureReadOps.empty());
+  StoreReplayTextureRead(bounded, {});
+  CHECK(bounded.replayTextureReadOps.empty());
+}
+
+TEST_CASE("D3D12 full clears can follow unrelated shader work but never an earlier resource read",
+          "[d3d12][replay][clear-prefix]")
+{
+  SDFile file;
+  D3D12CommandData command;
+  command.m_StructuredFile = &file;
+  const ResourceId baked = ResourceIDGen::GetNewUniqueID();
+  const ResourceId a = ResourceIDGen::GetNewUniqueID();
+  const ResourceId b = ResourceIDGen::GetNewUniqueID();
+  const ResourceId c = ResourceIDGen::GetNewUniqueID();
+  BakedCmdListInfo &info = command.m_BakedCmdListInfo[baked];
+  info.type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  info.eventCount = 7;
+  info.checkpointBegin = 100;
+  info.checkpointEnd = 190;
+  info.replayClearOps = {{a, 1, true, true}, {c, 3, true, true}, {b, 4, true, true},
+                         {a, 6, true, true}};
+  BakedCmdListInfo::ReplayTextureReadOp draw, dispatch, laterDraw;
+  draw.relativeEvent = 0;
+  draw.directResources = {a};
+  dispatch.relativeEvent = 2;
+  dispatch.directResources = {b};
+  laterDraw.relativeEvent = 5;
+  laterDraw.directResources = {c};
+  info.replayTextureReadOps = {draw, dispatch, laterDraw};
+  command.m_Partial[D3D12CommandData::Primary].cmdListExecs[baked] = {12};
+  command.m_ReplaySubmissionQueues[12] = ResourceIDGen::GetNewUniqueID();
+  command.m_CheckpointBoundaries.push_back({10, 11, 0, 50});
+  const D3D12Chunk chunks[] = {D3D12Chunk::List_Reset, D3D12Chunk::List_DrawInstanced,
+                              D3D12Chunk::List_ClearRenderTargetView, D3D12Chunk::List_Dispatch,
+                              D3D12Chunk::List_ClearDepthStencilView,
+                              D3D12Chunk::List_ClearRenderTargetView,
+                              D3D12Chunk::List_DrawIndexedInstanced,
+                              D3D12Chunk::List_ClearRenderTargetView, D3D12Chunk::List_Close};
+  command.m_Events.resize(20);
+  for(uint32_t i = 0; i < ARRAY_COUNT(chunks); i++)
+  {
+    SDChunk *chunk = new SDChunk("per-resource-clear-proof"_lit);
+    chunk->metadata.chunkID = uint32_t(chunks[i]);
+    file.chunks.push_back(chunk);
+    APIEvent event;
+    event.eventId = 11 + i;
+    event.chunkIndex = i;
+    event.fileOffset = 100 + i * 10;
+    command.m_Events[event.eventId] = event;
+    info.checkpointChunks.push_back({baked, event.fileOffset, event.fileOffset + 10, i, chunks[i]});
+  }
+  CHECK(command.GetReplayFullClearPrefix(10, 14, {a, b, c}).empty());
+  CHECK((command.GetReplayFullClearPrefix(10, 15, {a, b, c}) == std::set<ResourceId>({c})));
+  CHECK((command.GetReplayFullClearPrefix(10, 18, {a, b, c}) == std::set<ResourceId>({c})));
+  // Binding C before its clear removes only C; an unrelated A clear is still eligible if A was
+  // not consumed. Reading C after its clear does not revoke the already-established proof.
+  info.replayTextureReadOps[0].directResources = {c};
+  CHECK((command.GetReplayFullClearPrefix(10, 18, {a, b, c}) == std::set<ResourceId>({a})));
+  info.replayTextureReadOps[0].directResources = {a};
+  info.replayTextureReadOps[1].unknown = true;
+  CHECK(command.GetReplayFullClearPrefix(10, 18, {a, b, c}).empty());
+  info.replayTextureReadOps[1].unknown = false;
+  info.replayTextureReadsComplete = false;
+  CHECK(command.GetReplayFullClearPrefix(10, 18, {a, b, c}).empty());
+  info.replayTextureReadsComplete = true;
+  info.replayTextureReadOps[1].relativeEvent++;
+  CHECK(command.GetReplayFullClearPrefix(10, 18, {a, b, c}).empty());
+  info.replayTextureReadOps[1].relativeEvent--;
+  // A copy's source and destination dependency is not represented by shader bindings.
+  file.chunks[3]->metadata.chunkID = uint32_t(D3D12Chunk::List_CopyResource);
+  info.checkpointChunks[3].type = D3D12Chunk::List_CopyResource;
+  CHECK(command.GetReplayFullClearPrefix(10, 18, {a, b, c}).empty());
+  command.m_StructuredFile = NULL;
+}
+
+TEST_CASE("D3D12 texture overwrite proof crosses query boundaries but preserves draw reads",
+          "[d3d12][replay][clear-prefix]")
+{
+  SDFile file;
+  D3D12CommandData command;
+  command.m_StructuredFile = &file;
+  const ResourceId baked = ResourceIDGen::GetNewUniqueID();
+  const ResourceId texture = ResourceIDGen::GetNewUniqueID();
+  const ResourceId unrelated = ResourceIDGen::GetNewUniqueID();
+  BakedCmdListInfo &info = command.m_BakedCmdListInfo[baked];
+  info.type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  info.eventCount = 4;
+  info.checkpointBegin = 100;
+  info.checkpointEnd = 160;
+  info.replayClearOps.push_back({texture, 3, true, true});
+  command.m_Partial[D3D12CommandData::Primary].cmdListExecs[baked] = {12};
+  command.m_ReplaySubmissionQueues[12] = ResourceIDGen::GetNewUniqueID();
+  command.m_CheckpointBoundaries.push_back({10, 11, 0, 50});
+  const D3D12Chunk chunks[] = {D3D12Chunk::List_Reset, D3D12Chunk::List_BeginQuery,
+                              D3D12Chunk::List_SetPipelineState, D3D12Chunk::List_EndQuery,
+                              D3D12Chunk::List_ClearRenderTargetView, D3D12Chunk::List_Close};
+  command.m_Events.resize(17);
+  for(uint32_t i = 0; i < ARRAY_COUNT(chunks); i++)
+  {
+    SDChunk *chunk = new SDChunk("query-clear-proof"_lit);
+    chunk->metadata.chunkID = uint32_t(chunks[i]);
+    file.chunks.push_back(chunk);
+    APIEvent event;
+    event.eventId = 11 + i;
+    event.chunkIndex = i;
+    event.fileOffset = 100 + i * 10;
+    command.m_Events[event.eventId] = event;
+    info.checkpointChunks.push_back({baked, event.fileOffset, event.fileOffset + 10, i, chunks[i]});
+  }
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {texture}).count(texture) == 1);
+  CHECK(command.GetReplayFullClearPrefix(10, 14, {texture}).empty());
+  BakedCmdListInfo::ReplayTextureReadOp draw;
+  draw.relativeEvent = 1;
+  draw.directResources = {texture};
+  info.replayTextureReadOps = {draw};
+  file.chunks[2]->metadata.chunkID = uint32_t(D3D12Chunk::List_DrawInstanced);
+  info.checkpointChunks[2].type = D3D12Chunk::List_DrawInstanced;
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {texture}).empty());
+  info.replayTextureReadOps[0].directResources = {unrelated};
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {texture}).count(texture) == 1);
+  info.replayTextureReadOps[0].unknown = true;
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {texture}).empty());
+  info.replayTextureReadOps[0].unknown = false;
+  for(D3D12Chunk blocker : {D3D12Chunk::List_ResolveQueryData, D3D12Chunk::List_CopyResource,
+                             D3D12Chunk::List_SetProgram})
+  {
+    file.chunks[3]->metadata.chunkID = uint32_t(blocker);
+    info.checkpointChunks[3].type = blocker;
+    CHECK(command.GetReplayFullClearPrefix(10, 15, {texture}).empty());
+  }
+  file.chunks[3]->metadata.chunkID = uint32_t(D3D12Chunk::List_ResourceBarrier);
+  info.checkpointChunks[3].type = D3D12Chunk::List_ResourceBarrier;
+  BakedCmdListInfo::CheckpointBarrierOp barrier;
+  barrier.relativeEvent = 2;
+  barrier.type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+  info.checkpointBarriers.push_back(barrier);
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {texture}).count(texture) == 1);
+  // The alias does not reset prior reads: this earlier draw observes the old texture, so its
+  // later full clear cannot justify dropping the checkpoint/initial content copy.
+  info.replayTextureReadOps[0].directResources = {texture};
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {texture}).empty());
+  info.replayTextureReadOps[0].directResources = {unrelated};
+  CHECK(command.GetReplayFullClearPrefix(10, 15, {texture}).count(texture) == 1);
+  command.m_StructuredFile = NULL;
+}
+
+TEST_CASE("D3D12 executable UAV bounds preserve spaces visibility and entire arrays",
+          "[d3d12][replay][uav-declarations]")
+{
+  ReplayPSOUAVProof proof;
+  proof.complete = proof.graphics = true;
+  proof.bindings = {{ShaderStage::Pixel, 7, 4, 3}, {ShaderStage::Pixel, 7, 6, 4},
+                    {ShaderStage::Vertex, 7, 20, 2}, {ShaderStage::Pixel, 8, 12, 1}};
+  D3D12_DESCRIPTOR_RANGE1 range = {};
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  range.BaseShaderRegister = 2;
+  range.RegisterSpace = 7;
+  range.NumDescriptors = 32;
+  rdcarray<rdcpair<uint32_t, uint32_t>> selected;
+  REQUIRE(ReplayUAVTableDeclarationRanges(&proof, true, true, D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                                          D3D12_SHADER_VISIBILITY_PIXEL, range, selected));
+  REQUIRE(selected.size() == 1);
+  CHECK(selected[0].first == 2);
+  CHECK(selected[0].second == 6);
+  REQUIRE(ReplayUAVTableDeclarationRanges(&proof, true, true, D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                                          D3D12_SHADER_VISIBILITY_ALL, range, selected));
+  REQUIRE(selected.size() == 2);
+  CHECK(selected[1].first == 18);
+  CHECK(selected[1].second == 2);
+  range.RegisterSpace = 8;
+  REQUIRE(ReplayUAVTableDeclarationRanges(&proof, true, true, D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                                          D3D12_SHADER_VISIBILITY_PIXEL, range, selected));
+  REQUIRE(selected.size() == 1);
+  CHECK(selected[0].first == 10);
+  CHECK(selected[0].second == 1);
+  range.RegisterSpace = 99;
+  CHECK(ReplayUAVTableDeclarationRanges(&proof, true, true, D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                                        D3D12_SHADER_VISIBILITY_ALL, range, selected));
+  CHECK(selected.empty());
+  proof.graphics = false;
+  proof.bindings = {{ShaderStage::Compute, 7, 4, 8}};
+  range.RegisterSpace = 7;
+  range.BaseShaderRegister = 8;
+  range.NumDescriptors = 16;
+  REQUIRE(ReplayUAVTableDeclarationRanges(&proof, false, true, D3D12_ROOT_SIGNATURE_FLAG_NONE,
+                                          D3D12_SHADER_VISIBILITY_ALL, range, selected));
+  REQUIRE(selected.size() == 1);
+  CHECK(selected[0].first == 0);
+  CHECK(selected[0].second == 4);
+  CHECK_FALSE(ReplayUAVVisibilityMatches(D3D12_SHADER_VISIBILITY_PIXEL, ShaderStage::Compute));
+  CHECK(ReplayUAVVisibilityMatches(D3D12_SHADER_VISIBILITY_MESH, ShaderStage::Mesh));
+}
+
+TEST_CASE("D3D12 unproved UAV access always keeps the original range",
+          "[d3d12][replay][uav-declarations]")
+{
+  ReplayPSOUAVProof proof;
+  proof.complete = true;
+  proof.bindings = {{ShaderStage::Compute, 0, 0, 1}};
+  D3D12_DESCRIPTOR_RANGE1 range = {};
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  range.NumDescriptors = 64;
+  rdcarray<rdcpair<uint32_t, uint32_t>> selected;
+  const auto select = [&](const ReplayPSOUAVProof *p, bool graphics, bool direct,
+                          D3D12_ROOT_SIGNATURE_FLAGS flags) {
+    return ReplayUAVTableDeclarationRanges(p, graphics, direct, flags,
+                                            D3D12_SHADER_VISIBILITY_ALL, range, selected);
+  };
+  CHECK_FALSE(select(NULL, false, true, D3D12_ROOT_SIGNATURE_FLAG_NONE));
+  proof.complete = false;
+  CHECK_FALSE(select(&proof, false, true, D3D12_ROOT_SIGNATURE_FLAG_NONE));
+  proof.complete = true;
+  CHECK_FALSE(select(&proof, true, true, D3D12_ROOT_SIGNATURE_FLAG_NONE));
+  CHECK_FALSE(select(&proof, false, false, D3D12_ROOT_SIGNATURE_FLAG_NONE));
+  CHECK_FALSE(select(&proof, false, true,
+                     D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED));
+  CHECK_FALSE(select(&proof, false, true,
+                     D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED));
+  range.NumDescriptors = UINT_MAX;
+  CHECK_FALSE(select(&proof, false, true, D3D12_ROOT_SIGNATURE_FLAG_NONE));
+  range.NumDescriptors = 64;
+  proof.bindings[0].count = UINT_MAX;
+  CHECK_FALSE(select(&proof, false, true, D3D12_ROOT_SIGNATURE_FLAG_NONE));
+  proof.bindings[0].count = 1;
+  range.BaseShaderRegister = UINT_MAX - 2;
+  CHECK_FALSE(select(&proof, false, true, D3D12_ROOT_SIGNATURE_FLAG_NONE));
+  range.BaseShaderRegister = 0;
+  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  CHECK_FALSE(select(&proof, false, true, D3D12_ROOT_SIGNATURE_FLAG_NONE));
+  CHECK_FALSE(ReplayFiniteUAVBinding(0, 0));
+  CHECK_FALSE(ReplayFiniteUAVBinding(0, UINT_MAX));
+  CHECK(ReplayFiniteUAVBinding(UINT_MAX, 1));
+  CHECK_FALSE(ReplayFiniteUAVBinding(UINT_MAX, 2));
+
+  CHECK(ReplayUseDeclaredUAVIndex(true, false, true));
+  CHECK_FALSE(ReplayUseDeclaredUAVIndex(false, false, true));
+  CHECK_FALSE(ReplayUseDeclaredUAVIndex(true, true, true));
+  CHECK_FALSE(ReplayUseDeclaredUAVIndex(true, false, false));
+}
+
+TEST_CASE("D3D12 indirect UAV declaration proof requires one known final operation",
+          "[d3d12][replay][uav-declarations]")
+{
+  CHECK(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_DrawInstanced));
+  CHECK(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_DrawIndexedInstanced));
+  CHECK(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_Dispatch));
+  CHECK(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_DispatchMesh));
+  CHECK_FALSE(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect));
+  CHECK_FALSE(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_SetPipelineState));
+  for(D3D12_INDIRECT_ARGUMENT_TYPE terminal : {D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                                               D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
+                                               D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                                               D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH})
+  {
+    D3D12CommandSignature signature;
+    signature.graphics = terminal != D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    D3D12_INDIRECT_ARGUMENT_DESC argument = {};
+    // Generated CBV/SRV addresses and values can influence every array element, but cannot
+    // introduce an undeclared UAV register or change its descriptor-table base.
+    for(D3D12_INDIRECT_ARGUMENT_TYPE state : {D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                                              D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW,
+                                              D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW})
+    {
+      argument.Type = state;
+      signature.arguments.push_back(argument);
+    }
+    argument.Type = terminal;
+    signature.arguments.push_back(argument);
+    REQUIRE(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect, &signature));
+    ReplayPSOUAVProof proof;
+    proof.complete = true;
+    proof.graphics = signature.graphics;
+    proof.bindings = {{signature.graphics ? ShaderStage::Pixel : ShaderStage::Compute, 7, 4, 8}};
+    D3D12_DESCRIPTOR_RANGE1 range = {};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    range.BaseShaderRegister = 2;
+    range.RegisterSpace = 7;
+    range.NumDescriptors = 64;
+    rdcarray<rdcpair<uint32_t, uint32_t>> selected;
+    REQUIRE(ReplayUAVTableDeclarationRanges(
+        &proof, signature.graphics,
+        ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect, &signature),
+        D3D12_ROOT_SIGNATURE_FLAG_NONE, D3D12_SHADER_VISIBILITY_ALL, range, selected));
+    REQUIRE(selected.size() == 1);
+    CHECK(selected[0].first == 2);
+    CHECK(selected[0].second == 8);
+    signature.raytraced = true;
+    CHECK_FALSE(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect, &signature));
+    signature.raytraced = false;
+    signature.graphics = !signature.graphics;
+    CHECK_FALSE(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect, &signature));
+    signature.graphics = !signature.graphics;
+    signature.arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW;
+    CHECK_FALSE(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect, &signature));
+    signature.arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE(~0U);
+    CHECK_FALSE(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect, &signature));
+    signature.arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    signature.arguments.push_back(argument);
+    CHECK_FALSE(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect, &signature));
+    signature.arguments.back().Type = terminal == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH
+                                         ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW
+                                         : D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    CHECK_FALSE(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect, &signature));
+    signature.arguments.back().Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+    CHECK_FALSE(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect, &signature));
+    signature.arguments.clear();
+    CHECK_FALSE(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect, &signature));
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW;
+    signature.arguments.push_back(argument);
+    CHECK_FALSE(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect, &signature));
+  }
+  D3D12CommandSignature indexed;
+  for(D3D12_INDIRECT_ARGUMENT_TYPE type : {D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW,
+                                           D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW,
+                                           D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED})
+  {
+    D3D12_INDIRECT_ARGUMENT_DESC argument = {};
+    argument.Type = type;
+    indexed.arguments.push_back(argument);
+  }
+  CHECK(ReplayUAVDeclarationBindingsKnown(D3D12Chunk::List_ExecuteIndirect, &indexed));
+}
+
+TEST_CASE("D3D12 declaration proof requires a complete executable token stream",
+          "[d3d12][replay][uav-declarations]")
+{
+  uint32_t declarations = ~0U;
+  rdcarray<uint32_t> tokens = {0x50050, 3, (1U << 24) | DXBCBytecode::OPCODE_RET};
+  CHECK(ReplayDXBCTokenDeclarations(tokens, declarations));
+  CHECK(declarations == 0);
+  tokens[1] = 4;
+  CHECK_FALSE(ReplayDXBCTokenDeclarations(tokens, declarations));
+  tokens[1] = 3;
+  tokens[2] = DXBCBytecode::OPCODE_RET;
+  CHECK_FALSE(ReplayDXBCTokenDeclarations(tokens, declarations));
+  tokens[2] = (2U << 24) | DXBCBytecode::OPCODE_RET;
+  CHECK_FALSE(ReplayDXBCTokenDeclarations(tokens, declarations));
+  for(uint32_t opcode : {uint32_t(DXBCBytecode::OPCODE_RESERVED0),
+                         uint32_t(DXBCBytecode::OPCODE_DCL_INTERFACE),
+                         uint32_t(DXBCBytecode::NUM_REAL_OPCODES), 0x7ffU})
+  {
+    tokens[2] = (1U << 24) | opcode;
+    CHECK_FALSE(ReplayDXBCTokenDeclarations(tokens, declarations));
+  }
+  // This token walker verifies framing/count, not operand contents. The native caller then
+  // requires the actual decoder's UAV declaration count and exact reflected binding ranges.
+  tokens = {0x50050, 6, (2U << 24) | DXBCBytecode::OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW,
+             0, (1U << 24) | DXBCBytecode::OPCODE_RET,
+             (1U << 24) | DXBCBytecode::OPCODE_RET};
+  CHECK(ReplayDXBCTokenDeclarations(tokens, declarations));
+  CHECK(declarations == 1);
+  tokens = {0x50050, 5, DXBCBytecode::OPCODE_CUSTOMDATA, 2,
+             (1U << 24) | DXBCBytecode::OPCODE_RET};
+  CHECK(ReplayDXBCTokenDeclarations(tokens, declarations));
+  tokens[3] = 0;
+  CHECK_FALSE(ReplayDXBCTokenDeclarations(tokens, declarations));
+  tokens[3] = 20;
+  CHECK_FALSE(ReplayDXBCTokenDeclarations(tokens, declarations));
+  uint32_t value = 0;
+  CHECK_FALSE(ReplayDXILMetadataUint(NULL, value));
+  DXIL::Metadata metadata;
+  CHECK_FALSE(ReplayDXILMetadataUint(&metadata, value));
+}
+
+static bytebuf ReplayUAVTestContainer(
+    const rdcarray<rdcpair<uint32_t, rdcarray<uint32_t>>> &chunks)
+{
+  rdcarray<uint32_t> words;
+  words.resize(8 + chunks.size());
+  words[0] = DXBC::FOURCC_DXBC;
+  words[5] = 1;
+  words[7] = uint32_t(chunks.size());
+  for(size_t i = 0; i < chunks.size(); i++)
+  {
+    words[8 + i] = uint32_t(words.byteSize());
+    words.push_back(chunks[i].first);
+    words.push_back(uint32_t(chunks[i].second.byteSize()));
+    words.append(chunks[i].second);
+  }
+  words[6] = uint32_t(words.byteSize());
+  bytebuf bytes;
+  bytes.assign((const byte *)words.data(), words.byteSize());
+  return bytes;
+}
+
+TEST_CASE("D3D12 UAV proofs read original executable bytes despite conflicting debug programs",
+          "[d3d12][replay][uav-declarations]")
+{
+  // Actual CS 5.0 dcl_uav_raw u3; ret. The unrelated debug program declares no UAVs. This
+  // container intentionally has no HASH: neither external debug matching nor ILDB is trusted.
+  const rdcarray<uint32_t> executable = {
+      0x50050, 6, (3U << 24) | DXBCBytecode::OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW,
+      (1U << 20) | (uint32_t(DXBCBytecode::TYPE_UNORDERED_ACCESS_VIEW) << 12), 3,
+      (1U << 24) | DXBCBytecode::OPCODE_RET};
+  const rdcarray<uint32_t> debug = {0x50050, 3, (1U << 24) | DXBCBytecode::OPCODE_RET};
+  for(bool debugFirst : {false, true})
+  {
+    rdcarray<rdcpair<uint32_t, rdcarray<uint32_t>>> chunks = {
+        {DXBC::FOURCC_SHDR, executable}, {DXBC::FOURCC_ILDB, debug}};
+    if(debugFirst)
+      std::swap(chunks[0], chunks[1]);
+    bytebuf bytes = ReplayUAVTestContainer(chunks);
+    ReplayOriginalExecutable selected;
+    REQUIRE(ReplayFindOriginalExecutable(bytes.data(), bytes.size(), selected));
+    CHECK(selected.fourcc == DXBC::FOURCC_SHDR);
+    REQUIRE(selected.length == executable.byteSize());
+    CHECK(memcmp(selected.bytes, executable.data(), executable.byteSize()) == 0);
+    rdcarray<ReplayShaderUAVBinding> declared;
+    REQUIRE(ReplayOriginalUAVDeclarations(bytes.data(), bytes.size(), ShaderStage::Compute,
+                                           declared) == NULL);
+    REQUIRE(declared.size() == 1);
+    CHECK(declared[0].first == 3);
+    CHECK(declared[0].count == 1);
+    CHECK(declared[0].space == 0);
+    ShaderReflection debugReflection;
+    debugReflection.stage = ShaderStage::Compute;
+    CHECK_FALSE(ReplayUAVReflectionMatches(debugReflection, ShaderStage::Compute, declared));
+    debugReflection.readWriteResources.resize(1);
+    debugReflection.readWriteResources[0].fixedBindNumber = 3;
+    debugReflection.readWriteResources[0].fixedBindSetOrSpace = 0;
+    debugReflection.readWriteResources[0].bindArraySize = 1;
+    CHECK(ReplayUAVReflectionMatches(debugReflection, ShaderStage::Compute, declared));
+    debugReflection.readWriteResources[0].fixedBindNumber = 2;
+    CHECK_FALSE(ReplayUAVReflectionMatches(debugReflection, ShaderStage::Compute, declared));
+  }
+  ReplayOriginalExecutable selected;
+  bytebuf bytes = ReplayUAVTestContainer({{DXBC::FOURCC_ILDB, executable}});
+  CHECK_FALSE(ReplayFindOriginalExecutable(bytes.data(), bytes.size(), selected));
+  bytes = ReplayUAVTestContainer({{DXBC::FOURCC_SHDR, executable}, {DXBC::FOURCC_SHEX, debug}});
+  CHECK_FALSE(ReplayFindOriginalExecutable(bytes.data(), bytes.size(), selected));
+  bytes = ReplayUAVTestContainer({{DXBC::FOURCC_DXIL, executable}, {DXBC::FOURCC_SHDR, debug}});
+  CHECK_FALSE(ReplayFindOriginalExecutable(bytes.data(), bytes.size(), selected));
+  bytes = ReplayUAVTestContainer({{DXBC::FOURCC_SHDR, executable}, {DXBC::FOURCC_SHDR, executable}});
+  CHECK_FALSE(ReplayFindOriginalExecutable(bytes.data(), bytes.size(), selected));
+  bytes = ReplayUAVTestContainer({{DXBC::FOURCC_SHDR, executable}});
+  CHECK_FALSE(ReplayFindOriginalExecutable(bytes.data(), bytes.size() - 1, selected));
+  CHECK_FALSE(ReplayFindOriginalExecutable(NULL, 0, selected));
+  const uint32_t insideHeader = 4;
+  memcpy(bytes.data() + 32, &insideHeader, sizeof(insideHeader));
+  CHECK_FALSE(ReplayFindOriginalExecutable(bytes.data(), bytes.size(), selected));
+}
+
+TEST_CASE("D3D12 SM6.6 proof requires unique original feature flags without heap addressing",
+          "[d3d12][replay][uav-declarations]")
+{
+  // This exercises the original-container selector and production veto, independently of the
+  // IR proof. In particular an adjacent debug program cannot supply missing feature flags.
+  const rdcarray<uint32_t> executable = {0x60066};
+  ReplayOriginalExecutable selected;
+  for(bool flagsFirst : {false, true})
+  {
+    rdcarray<rdcpair<uint32_t, rdcarray<uint32_t>>> chunks = {
+        {DXBC::FOURCC_DXIL, executable}, {DXBC::FOURCC_SFI0, {0, 0}}};
+    if(flagsFirst)
+      std::swap(chunks[0], chunks[1]);
+    bytebuf bytes = ReplayUAVTestContainer(chunks);
+    REQUIRE(ReplayFindOriginalExecutable(bytes.data(), bytes.size(), selected));
+    CHECK(ReplaySM66FeatureInfoKnown(selected));
+    CHECK(selected.featureFlags == 0);
+    CHECK(selected.fourcc == DXBC::FOURCC_DXIL);
+  }
+  for(DXBC::GlobalShaderFlags flag : {DXBC::GlobalShaderFlags::ResourceDescriptorHeapIndexing,
+                                     DXBC::GlobalShaderFlags::SamplerDescriptorHeapIndexing,
+                                     DXBC::GlobalShaderFlags::AtomicInt64OnHeapResource})
+  {
+    const uint64_t bits = uint64_t(flag);
+    bytebuf bytes = ReplayUAVTestContainer(
+        {{DXBC::FOURCC_DXIL, executable},
+         {DXBC::FOURCC_SFI0, {uint32_t(bits), uint32_t(bits >> 32)}}});
+    REQUIRE(ReplayFindOriginalExecutable(bytes.data(), bytes.size(), selected));
+    CHECK(selected.featureFlags == bits);
+    CHECK_FALSE(ReplaySM66FeatureInfoKnown(selected));
+  }
+  bytebuf bytes = ReplayUAVTestContainer(
+      {{DXBC::FOURCC_DXIL, executable}, {DXBC::FOURCC_ILDB, {0, 0}}});
+  REQUIRE(ReplayFindOriginalExecutable(bytes.data(), bytes.size(), selected));
+  CHECK_FALSE(ReplaySM66FeatureInfoKnown(selected));
+  bytes = ReplayUAVTestContainer({{DXBC::FOURCC_DXIL, executable}, {DXBC::FOURCC_SFI0, {0}}});
+  CHECK_FALSE(ReplayFindOriginalExecutable(bytes.data(), bytes.size(), selected));
+  bytes = ReplayUAVTestContainer({{DXBC::FOURCC_DXIL, executable},
+                                  {DXBC::FOURCC_SFI0, {0, 0}},
+                                  {DXBC::FOURCC_SFI0, {0, 0}}});
+  CHECK_FALSE(ReplayFindOriginalExecutable(bytes.data(), bytes.size(), selected));
+}
+
+TEST_CASE("D3D12 original shader model 5.1 declarations preserve register arrays and spaces",
+          "[d3d12][replay][uav-declarations]")
+{
+  // CS 5.1 dcl_uav_raw U0[4:6], space7; ret. Identifier 0 differs from register base 4.
+  rdcarray<uint32_t> tokens = {
+      0x50051, 9, (6U << 24) | DXBCBytecode::OPCODE_DCL_UNORDERED_ACCESS_VIEW_RAW,
+      (3U << 20) | (uint32_t(DXBCBytecode::TYPE_UNORDERED_ACCESS_VIEW) << 12), 0, 4, 6, 7,
+      (1U << 24) | DXBCBytecode::OPCODE_RET};
+  bytebuf bytes = ReplayUAVTestContainer({{DXBC::FOURCC_SHEX, tokens}});
+  rdcarray<ReplayShaderUAVBinding> declared;
+  REQUIRE(ReplayOriginalUAVDeclarations(bytes.data(), bytes.size(), ShaderStage::Compute,
+                                         declared) == NULL);
+  REQUIRE(declared.size() == 1);
+  CHECK(declared[0].first == 4);
+  CHECK(declared[0].count == 3);
+  CHECK(declared[0].space == 7);
+  declared.clear();
+  CHECK(ReplayOriginalUAVDeclarations(bytes.data(), bytes.size(), ShaderStage::Pixel,
+                                       declared) != NULL);
+  CHECK(declared.empty());
+  tokens[6] = UINT_MAX;
+  bytes = ReplayUAVTestContainer({{DXBC::FOURCC_SHEX, tokens}});
+  CHECK(ReplayOriginalUAVDeclarations(bytes.data(), bytes.size(), ShaderStage::Compute,
+                                       declared) != NULL);
+  CHECK(declared.empty());
+  // A DXIL chunk must itself contain a valid executable; an adjacent ILDB cannot repair it.
+  bytes = ReplayUAVTestContainer({{DXBC::FOURCC_DXIL, {0, 0, 0}},
+                                   {DXBC::FOURCC_ILDB, tokens}});
+  CHECK(ReplayOriginalUAVDeclarations(bytes.data(), bytes.size(), ShaderStage::Compute,
+                                       declared) != NULL);
+}
+
+TEST_CASE("D3D12 original UAV range remains available after edits and EID rebasing",
+          "[d3d12][replay][uav-declarations]")
+{
+  const ResourceId heap = ResourceIDGen::GetNewUniqueID();
+  BakedCmdListInfo info;
+  REQUIRE(AddReplayUAVRange(info, heap, 512, 100, 32, 64, 20, false));
+  CHECK(info.replayDeclaredUAVRanges.empty());
+  const BakedCmdListInfo::ReplayUAVRange declared = {heap, 134, 3};
+  RecordReplayWriteStart(info.replayDeclaredUAVRanges, info.replayDeclaredUAVFirstEvents,
+                         declared, 20);
+  REQUIRE(info.replayUAVRanges.size() == 1);
+  CHECK(info.replayUAVRanges.begin()->first == 132);
+  CHECK(info.replayUAVRanges.begin()->count == 64);
+  info.action = new D3D12ActionTreeNode();
+  info.action->children.resize(1);
+  info.action->children[0].action.eventId = 10;
+  info.eventCount = 40;
+  info.actionCount = 5;
+  info.ShiftForRemoved(3, 3, 0);
+  CHECK(info.replayUAVFirstEvents.begin()->second == 17);
+  CHECK(info.replayDeclaredUAVFirstEvents.at(declared) == 17);
+  ReplayWriteCutoff cutoff;
+  cutoff.indexed = true;
+  cutoff.last = 16;
+  CHECK_FALSE(IsReplayWriteInPrefix(info.replayDeclaredUAVFirstEvents, declared, cutoff));
+  cutoff.last = 17;
+  CHECK(IsReplayWriteInPrefix(info.replayDeclaredUAVFirstEvents, declared, cutoff));
+  // A later unproved action contributes its full range to the alternate union too.
+  REQUIRE(AddReplayUAVRange(info, heap, 512, 100, 32, 64, 30));
+  CHECK(info.replayDeclaredUAVRanges.size() == 2);
+  CHECK(info.replayUAVFirstEvents.begin()->second == 17);
+}
+
+TEST_CASE("D3D12 writes use only the executed graphics or compute pipeline bindings",
+          "[d3d12][replay][write-stages]")
+{
+  for(D3D12Chunk chunk : {D3D12Chunk::List_DrawInstanced, D3D12Chunk::List_DrawIndexedInstanced,
+                          D3D12Chunk::List_DispatchMesh})
+  {
+    CHECK(ReplayWriteStages(chunk).graphics);
+    CHECK_FALSE(ReplayWriteStages(chunk).compute);
+  }
+  CHECK_FALSE(ReplayWriteStages(D3D12Chunk::List_Dispatch).graphics);
+  CHECK(ReplayWriteStages(D3D12Chunk::List_Dispatch).compute);
+  CHECK(ReplayWriteStages(D3D12Chunk::List_ExecuteIndirect).graphics);
+  CHECK(ReplayWriteStages(D3D12Chunk::List_ExecuteIndirect).compute);
+  D3D12CommandSignature signature;
+  D3D12_INDIRECT_ARGUMENT_DESC argument = {};
+  argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+  signature.arguments.push_back(argument);
+  CHECK_FALSE(ReplayWriteStages(D3D12Chunk::List_ExecuteIndirect, &signature).graphics);
+  CHECK(ReplayWriteStages(D3D12Chunk::List_ExecuteIndirect, &signature).compute);
+  argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+  signature.arguments.push_back(argument);
+  CHECK(ReplayWriteStages(D3D12Chunk::List_ExecuteIndirect, &signature).graphics);
+  CHECK(ReplayWriteStages(D3D12Chunk::List_ExecuteIndirect, &signature).compute);
+  signature.arguments.erase(0);
+  CHECK(ReplayWriteStages(D3D12Chunk::List_ExecuteIndirect, &signature).graphics);
+  CHECK_FALSE(ReplayWriteStages(D3D12Chunk::List_ExecuteIndirect, &signature).compute);
+  signature.raytraced = true;
+  CHECK(ReplayWriteStages(D3D12Chunk::List_ExecuteIndirect, &signature).compute);
+  signature.raytraced = false;
+  signature.arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE(~0U);
+  CHECK(ReplayWriteStages(D3D12Chunk::List_ExecuteIndirect, &signature).graphics);
+  CHECK(ReplayWriteStages(D3D12Chunk::List_ExecuteIndirect, &signature).compute);
+
+  // A dispatch must not pick up still-bound stream-output buffers from an earlier draw.
+  D3D12CommandData command;
+  D3D12RenderState state;
+  state.streamouts.resize(1);
+  state.streamouts[0].buf = ResourceIDGen::GetNewUniqueID();
+  state.streamouts[0].countbuf = ResourceIDGen::GetNewUniqueID();
+  state.shadingRateImage = ResourceIDGen::GetNewUniqueID();
+  BakedCmdListInfo compute, graphics;
+  command.ObserveReplayWriteBindings(compute, state, 5, false, true);
+  CHECK(compute.replayWrites.empty());
+  command.ObserveReplayWriteBindings(graphics, state, 6, true, false);
+  CHECK(graphics.replayWrites.count(state.streamouts[0].buf) == 1);
+  CHECK(graphics.replayWrites.count(state.streamouts[0].countbuf) == 1);
+  REQUIRE(compute.replayTextureReadOps.size() == 1);
+  REQUIRE(graphics.replayTextureReadOps.size() == 1);
+  CHECK(compute.replayTextureReadOps[0].directResources.empty());
+  CHECK(graphics.replayTextureReadOps[0].directResources.contains(state.shadingRateImage));
+  CHECK(compute.replayTextureReadOps[0].unknown);
+  CHECK(graphics.replayTextureReadOps[0].unknown);
+}
+#endif
 
 uint32_t D3D12CommandData::GetBufferPatchFirstConsumer(ResourceId buffer) const
 {

@@ -35,6 +35,24 @@
 
 struct ReplayController;
 
+// Routing identity for historical displays that cannot bind a persistent snapshot (custom
+// shader/overlay/YUV or unsupported texture topology). This owns no image or captured resource.
+// A dirty output must replay this source instead of rendering the restored live configuration.
+struct ReplayHistoryDisplaySource
+{
+  bool active = false;
+  uint32_t eventId = 0;
+  uint64_t generation = 0;
+  TextureDisplay display;
+  rdcpair<int32_t, int32_t> dimensions = {0, 0};
+
+  void Clear();
+  void Publish(uint32_t event, const TextureDisplay &source, uint64_t mutationGeneration,
+               rdcpair<int32_t, int32_t> renderedDimensions, bool succeeded);
+  bool NeedsReplay(bool dirty, rdcpair<int32_t, int32_t> currentDimensions,
+                   uint64_t mutationGeneration) const;
+};
+
 struct ReplayOutput : public IReplayOutput
 {
 public:
@@ -101,6 +119,7 @@ private:
   uint32_t m_HistorySnapshotEventID = 0;
   uint64_t m_HistorySnapshotGeneration = 0;
   TextureDisplay m_HistorySnapshotSource;
+  ReplayHistoryDisplaySource m_HistoryReplaySource;
   IReplayDriver *m_pDevice;
 
   struct OutputPair

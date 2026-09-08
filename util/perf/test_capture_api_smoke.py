@@ -108,6 +108,38 @@ class CaptureOwnershipTests(unittest.TestCase):
             self.assertEqual(change.value, expected)
             self.assertEqual(change.mod, rd.EnvMod.Set)
 
+    def test_clear_fixture_requires_exact_api_and_demo(self):
+        smoke.validate_clear_fixture(True, ["D3D12"], "D3D12_Checkpoint_Triangle")
+        for apis, demo in ((["Vulkan"], "D3D12_Checkpoint_Triangle"),
+                           (["D3D12", "D3D11"], "D3D12_Checkpoint_Triangle"),
+                           (["D3D12"], "D3D12_Simple_Triangle")):
+            with self.assertRaises(ValueError):
+                smoke.validate_clear_fixture(True, apis, demo)
+            smoke.validate_clear_fixture(False, apis, demo)
+
+    def test_alias_variants_require_exact_demo_and_exclude_old_clear_mode(self):
+        for mode in ("clear", "read", "split"):
+            smoke.validate_alias_fixture(mode, ["D3D12"], "D3D12_Checkpoint_Triangle")
+            for apis, demo in ((["Vulkan"], "D3D12_Checkpoint_Triangle"),
+                               (["D3D12", "D3D11"], "D3D12_Checkpoint_Triangle"),
+                               (["D3D12"], "D3D12_Simple_Triangle")):
+                with self.assertRaises(ValueError):
+                    smoke.validate_alias_fixture(mode, apis, demo)
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                smoke.validate_alias_fixture(mode, ["D3D12"], "D3D12_Checkpoint_Triangle", True)
+        smoke.validate_alias_fixture("off", ["Vulkan"], "VK_Simple_Triangle")
+        with self.assertRaisesRegex(ValueError, "Unknown"):
+            smoke.validate_alias_fixture("unexpected", ["D3D12"], "D3D12_Checkpoint_Triangle")
+
+    def test_alias_environment_selects_variant_and_clears_inherited_variant(self):
+        rd = fake_renderdoc()
+        for mode in ("off", "clear", "read", "split"):
+            change = smoke.alias_fixture_environment(rd, mode)
+            self.assertEqual(change.name, "RENDERDOC_CHECKPOINT_ALIAS_FIXTURE")
+            self.assertEqual(change.value, mode)
+            self.assertEqual(change.mod, rd.EnvMod.Set)
+            self.assertEqual(change.sep, rd.EnvSep.NoSep)
+
     @unittest.skipUnless(smoke.os.name == "nt", "Windows capture orchestration branch")
     def test_capture_error_and_control_shutdown_error_still_clean_owned_handle(self):
         from unittest.mock import MagicMock
@@ -120,17 +152,28 @@ class CaptureOwnershipTests(unittest.TestCase):
         control.QueueCapture.side_effect = RuntimeError("stop before any capture")
         control.Shutdown.side_effect = RuntimeError("control failed")
         rd.CreateTargetControl = lambda *args: control
-        api = ProcessAPI()
-        with patch.object(smoke, "renderdoc_module", return_value=rd), \
-                patch.object(smoke, "WindowsProcessAPI", return_value=api), \
-                patch.object(smoke.os, "kill") as pid_kill:
-            result = smoke.capture_one("D3D12", Path(DEMO), Path("output"), 1, 5, "", "", "",
-                                       d3d12_demo="D3D12_RenderTarget_Binds", live_forward_fixture=True)
-        self.assertFalse(result["ok"])
-        self.assertTrue(result["ownedProcess"]["exitVerified"])
-        self.assertEqual(result["childEnvironment"]["RENDERDOC_LIVE_FORWARD_FIXTURE"], "1")
-        self.assertEqual(api.terminated, ["retained-handle-for-original-process"])
-        pid_kill.assert_not_called()
+        for demo, live, alias in (("D3D12_RenderTarget_Binds", True, "off"),
+                                  ("D3D12_Checkpoint_Triangle", False, "clear"),
+                                  ("D3D12_Checkpoint_Triangle", False, "read"),
+                                  ("D3D12_Checkpoint_Triangle", False, "split")):
+            with self.subTest(demo=demo, alias=alias):
+                api = ProcessAPI()
+                with patch.object(smoke, "renderdoc_module", return_value=rd), \
+                        patch.object(smoke, "WindowsProcessAPI", return_value=api), \
+                        patch.object(smoke.os, "kill") as pid_kill:
+                    result = smoke.capture_one("D3D12", Path(DEMO), Path("output"), 1, 5, "", "", "",
+                                               d3d12_demo=demo, live_forward_fixture=live,
+                                               checkpoint_alias_fixture=alias)
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["ownedProcess"]["exitVerified"])
+                self.assertEqual(result["childEnvironment"]["RENDERDOC_LIVE_FORWARD_FIXTURE"],
+                                 "1" if live else "0")
+                self.assertEqual(result["checkpointAliasFixture"], alias)
+                self.assertEqual(result["childEnvironment"]["RENDERDOC_CHECKPOINT_ALIAS_FIXTURE"], alias)
+                sent = {entry.name: entry.value for entry in rd.ExecuteAndInject.call_args.args[3]}
+                self.assertEqual(sent["RENDERDOC_CHECKPOINT_ALIAS_FIXTURE"], alias)
+                self.assertEqual(api.terminated, ["retained-handle-for-original-process"])
+                pid_kill.assert_not_called()
 
 
 if __name__ == "__main__":

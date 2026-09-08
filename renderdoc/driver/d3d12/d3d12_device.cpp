@@ -37,6 +37,7 @@
 #include "jpeg-compressor/jpge.h"
 #include "maths/formatpacking.h"
 #include "replay/replay_timing.h"
+#include "replay/replay_resource_versions.h"
 #include "serialise/rdcfile.h"
 #include "strings/string_utils.h"
 #include "d3d12_command_list.h"
@@ -64,6 +65,12 @@ RDOC_CONFIG(uint32_t, D3D12_Hack_MaxDeviceVersion, 0,
 
 WRAPPED_POOL_INST(WrappedID3D12Device);
 
+static bool D3D12MayRetainCheckpointContents(bool initialSources, bool writeProof,
+                                            bool independentStorage, bool exactVersion)
+{
+  return initialSources && writeProof && independentStorage && exactVersion;
+}
+
 Threading::CriticalSection WrappedID3D12Device::m_DeviceWrappersLock;
 std::map<ID3D12Device *, WrappedID3D12Device *> WrappedID3D12Device::m_DeviceWrappers;
 
@@ -74,6 +81,7 @@ struct D3D12ReplayCheckpointResource
   bytebuf cpu;
   uint64_t bytes = 0;
   uint32_t version = 0;
+  ReplayResourceVersion contentVersion;
   ~D3D12ReplayCheckpointResource() { SAFE_RELEASE(gpu); }
 };
 
@@ -127,6 +135,26 @@ struct D3D12ReplayCheckpointCache
   // Only a version actually materialised during this replay may be shared. An equal write EID
   // from a different full replay is not proof that nondeterministic GPU contents are identical.
   std::map<ResourceId, std::shared_ptr<D3D12ReplayCheckpointResource>> currentVersions;
+  // Content identity survives an EID request, unlike the per-replay snapshot sharing map. Only
+  // actual checkpoint copies establish a known identity; potential writes invalidate it.
+  ReplayResourceVersions residentVersions;
+  std::map<ResourceId, uint64_t> residentExtents;
+  uint64_t contentSerial = 0;
+  bool markingRestoredContents = false;
+  // Initial contents intentionally omitted for a proved full clear. This debt is carried into
+  // the ordinary dirty set even if a decode/submission aborts before executing that clear.
+  std::set<ResourceId> deferredInitialResources;
+  ReplayResourceRange ResidentRange(ResourceId id) const
+  {
+    auto found = residentExtents.find(id);
+    return {id, 0, 0, found == residentExtents.end() ? 0 : found->second};
+  }
+  void PublishResidentVersions(const D3D12ReplayCheckpoint &checkpoint)
+  {
+    for(const auto &entry : checkpoint.resources)
+      if(!deferredInitialResources.count(entry.first))
+        residentVersions.MarkResident(ResidentRange(entry.first), entry.second->contentVersion);
+  }
   // These references also keep unwrapped query-copy sources alive until submitted work is idle.
   std::map<D3D12CheckpointQuerySlot, D3D12ReplayCheckpointQuery> activeQueries;
   std::set<D3D12CheckpointQueryResolve> activeQueryResolves;
@@ -150,6 +178,11 @@ struct D3D12ReplayCheckpointCache
     // Half-open byte intervals belonging to independent placed buffers. Heap padding and every
     // other resource retain their original initial source.
     std::map<ResourceId, rdcarray<rdcpair<uint64_t, uint64_t>>> heapExclusions;
+    std::set<ResourceId> retainedResources;
+    std::set<ResourceId> fullClearResources;
+    std::map<ResourceId, rdcarray<D3D12DescriptorRestoreRange>> descriptorExclusions;
+    uint64_t retainedBytes = 0;
+    uint64_t fullClearBytes = 0;
     bool skippedInitialContents = false;
     uint64_t skippedResourceBytes = 0, skippedHeapBytes = 0;
     uint32_t skippedResources = 0;
@@ -701,6 +734,7 @@ bool WrappedID3D12Device::ApplyCheckpointReplayBufferPatches()
     // The saved version is immutable and still contains the preceding edit's values. It must
     // not be shared as the current buffer version when a later point is built in this replay.
     cache.currentVersions.erase(id);
+    cache.residentVersions.Invalidate(cache.ResidentRange(id));
   }
   if(list)
   {
@@ -2438,17 +2472,30 @@ void WrappedID3D12Device::ApplyInitialContents(bool useCheckpointSources)
 {
   RENDERDOC_PROFILEFUNCTION();
 
+  // A prepared retention decision is valid only for this reset. Other resident identities are
+  // discarded before any initial writes, including the canonical retry after checkpoint failure.
+  if(m_ReplayCheckpoints)
+  {
+    m_ReplayCheckpoints->residentVersions.InvalidateAll();
+    m_ReplayCheckpoints->deferredInitialResources.clear();
+  }
+
   initStateCurBatch = 0;
   initStateCurList = NULL;
 
   // Only the first reset of a normal root replay may use the previous submission proof. A
   // checkpoint failure's second ApplyInitialContents must always complete the canonical baseline.
-  if(!m_ReplayDirtyResetRequested)
+  const bool firstReset = m_ReplayDirtyResetRequested;
+  if(!firstReset)
     m_UseReplayDirtyInitialContents = false;
   m_ReplayDirtyResetRequested = false;
   m_ReplayDirtyCopyStats.clear();
   m_ReplayDirtyApplyingInitial = true;
   m_ReplayDirtyInitialFailed = false;
+
+  // Decide before the canonical sparse copies mark their own physical components dirty. The
+  // retained set is fixed for this one transaction; a fallback reset must not inherit it.
+  PrepareReplaySparseInitialBaselines(firstReset);
 
   // A sparse texture's own initial copy writes physical heap pages, even when no captured action
   // wrote it. Select every affected alias before visiting any initial-content entry so the
@@ -2456,6 +2503,16 @@ void WrappedID3D12Device::ApplyInitialContents(bool useCheckpointSources)
   PrepareReplaySparseInitialWrites();
 
   m_UseCheckpointInitialSources = useCheckpointSources;
+  if(!m_UseCheckpointInitialSources && m_ReplayCheckpoints)
+  {
+    // With initial-source substitution disabled, the baseline overwrites these same working
+    // resources. A previous match with the checkpoint cannot survive that write.
+    m_ReplayCheckpoints->restorePlan.retainedResources.clear();
+    m_ReplayCheckpoints->restorePlan.retainedBytes = 0;
+    m_ReplayCheckpoints->restorePlan.fullClearResources.clear();
+    m_ReplayCheckpoints->restorePlan.fullClearBytes = 0;
+    m_ReplayCheckpoints->restorePlan.descriptorExclusions.clear();
+  }
   GetResourceManager()->ApplyInitialContents();
   ApplyInitialReplayBufferPatches();
   m_UseCheckpointInitialSources = false;
@@ -2471,7 +2528,10 @@ void WrappedID3D12Device::ApplyInitialContents(bool useCheckpointSources)
     D3D12MarkerRegion::End(initStateCurList);
     const HRESULT closeResult = initStateCurList->Close();
     if(FAILED(closeResult))
+    {
       InvalidateReplayDirtyTracking("initialListCloseFailed");
+      CHECK_HR(this, closeResult);
+    }
   }
 
   initStateCurBatch = 0;
@@ -2507,7 +2567,7 @@ void WrappedID3D12Device::ApplyInitialContents(bool useCheckpointSources)
                           return a.first < b.first;
                         });
     uint64_t omittedActual = actual, omittedSkipped = skipped, omittedWhole = whole;
-    rdcstr resources, sourceResources;
+    rdcstr resources, sourceResources, storageResources;
     for(size_t i = 0; i < detailCount; i++)
     {
       const ReplayDirtyCopyStats &stats = *details[i].second;
@@ -2521,25 +2581,39 @@ void WrappedID3D12Device::ApplyInitialContents(bool useCheckpointSources)
                                      (unsigned long long)stats.wholeCopies);
       sourceResources += StringFormat::Fmt("%s%s:%s", i ? "," : "", resource.c_str(),
                                            ReplayInitialCopySourceTuple(stats.sources).c_str());
+      const auto live = GetResourceList().find(details[i].first);
+      if(live != GetResourceList().end())
+      {
+        const D3D12_RESOURCE_DESC desc = live->second->GetReal()->GetDesc();
+        storageResources += StringFormat::Fmt(
+            "%s%s:%s:%llu:%u:%u", storageResources.empty() ? "" : ",", resource.c_str(),
+            ToStr(GetResID(live->second->GetHeap())).c_str(),
+            (unsigned long long)live->second->GetHeapOffset(), uint32_t(desc.Flags),
+            IsReadOnlyResource(details[i].first) ? 1U : 0U);
+      }
     }
     const rdcstr line = StringFormat::Fmt(
         "api=D3D12DirtyRestore enabled=%u shadow=%u actualCopyBytes=%llu skippedStaticBytes=%llu "
         "wholeResourceCopies=%llu dirtyResources=%zu dirtyHeaps=%zu reason=%s "
         "restoreTimingVersion=2 %s resourceDetailCount=%zu omittedResourceCount=%zu "
         "omittedActualCopyBytes=%llu omittedSkippedStaticBytes=%llu omittedWholeResourceCopies=%llu "
-        "resourceSourceCopies=%s "
+        "resourceSourceCopies=%s resourceHeapOffsetFlagsReadOnly=%s "
         "resourceActualSkippedWhole=%s", m_UseReplayDirtyInitialContents ? 1U : 0U,
         m_ReplayDirtyShadow ? 1U : 0U, (unsigned long long)actual, (unsigned long long)skipped,
         (unsigned long long)whole, m_ReplayDirtyResources.size(), m_ReplayDirtyHeapRanges.size(),
         m_ReplayDirtyReason.c_str(), ReplayInitialCopySourceCounters(sourceTotals).c_str(), detailCount,
         details.size() - detailCount, (unsigned long long)omittedActual,
         (unsigned long long)omittedSkipped, (unsigned long long)omittedWhole,
-        sourceResources.empty() ? "none" : sourceResources.c_str(), resources.c_str());
+        sourceResources.empty() ? "none" : sourceResources.c_str(),
+        storageResources.empty() ? "none" : storageResources.c_str(), resources.c_str());
     RDCLOG("%s", line.c_str());
     AppendReplayTimingLog(line);
   }
   m_UseReplayDirtyInitialContents = false;
   m_ReplayDirtyResources.clear();
+  if(m_ReplayCheckpoints)
+    m_ReplayDirtyResources.insert(m_ReplayCheckpoints->deferredInitialResources.begin(),
+                                 m_ReplayCheckpoints->deferredInitialResources.end());
   m_ReplayDirtyHeapRanges.clear();
   m_ReplaySparseDirtyComponents.clear();
   m_ReplayDirtyApplyingInitial = false;
@@ -2786,13 +2860,188 @@ void WrappedID3D12Device::BuildReplaySparseDirtyGraph()
   }
 }
 
-bool WrappedID3D12Device::MarkReplaySparseComponentDirty(ResourceId resource)
+void WrappedID3D12Device::InvalidateReplaySparseInitialBaselines(const char *reason)
+{
+  for(auto &component : m_ReplaySparseComponents)
+    component.baseline.Invalidate(reason);
+}
+
+static bool ReplaySparseInitialSubresourcesComplete(const rdcarray<uint32_t> &included,
+                                                   uint32_t expected)
+{
+  if(expected == 0 || included.empty())
+    return false;
+  if(included.size() == 1 && included[0] == ~0U)
+    return true;
+  // Non-MSAA sparse captures deliberately retain an explicit list, even when every subresource
+  // was mapped and copied. Require exact complete coverage, not merely the right list length.
+  if(included.size() != expected)
+    return false;
+  for(uint32_t sub = 0; sub < expected; sub++)
+    if(included[sub] != sub)
+      return false;
+  return true;
+}
+
+void WrappedID3D12Device::PrepareReplaySparseInitialBaselines(bool firstReset)
+{
+  m_ReplaySparseInitialResidencyEnabled =
+      Process::GetEnvVariable("RENDERDOC_D3D12_ENABLE_SPARSE_INITIAL_RESIDENCY") == "1";
+  const bool recordingAllowed = m_ReplaySparseInitialResidencyEnabled &&
+      IsActiveReplaying(m_State) && m_ReplayDirtyRecordingAllowed &&
+      m_ReplaySparseDirtyEnabled && m_ReplaySparseGraphComplete && !m_ReplayDirtyShadow &&
+      !HasFatalError() && (!m_ReplayCheckpoints || !m_ReplayCheckpoints->restorePlan.eventId);
+
+  for(size_t index = 0; index < m_ReplaySparseComponents.size(); index++)
+  {
+    auto &component = m_ReplaySparseComponents[index];
+    const ResourceId resource = component.resources.size() == 1
+                                    ? *component.resources.begin() : ResourceId();
+    const char *eligibility = "eligible";
+    uint32_t expectedSubresources = 0, includedSubresources = 0, firstSubresource = ~0U;
+    // Limit this first opt-in path to one reserved texture with no placed aliases. A known full
+    // serialized Copy source lets the real recorded footprint byte count certify the seed.
+    if(!m_ReplaySparseGraphComplete)
+      eligibility = "incompleteSparseGraph";
+    else if(resource == ResourceId() || !m_SparseResources.count(resource))
+      eligibility = "multipleReservedOrPlacedAliases";
+    else if(component.heaps.empty())
+      eligibility = "noPhysicalHeaps";
+    else
+    {
+      auto found = GetResourceList().find(resource);
+      const D3D12InitialContents initial = GetResourceManager()->GetInitialContents(resource);
+      if(found == GetResourceList().end() || GetResourceManager()->HasReplacement(resource) ||
+         found->second->GetHeap() || IsReadOnlyResource(resource))
+        eligibility = "missingReplacedOrReadOnlyResource";
+      else
+      {
+        const D3D12_RESOURCE_DESC desc = found->second->GetReal()->GetDesc();
+        D3D12_FEATURE_DATA_FORMAT_INFO format = {};
+        format.Format = desc.Format;
+        const HRESULT formatResult =
+            CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &format, sizeof(format));
+        const uint64_t subresources = uint64_t(desc.MipLevels) * format.PlaneCount *
+            (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize);
+        if(SUCCEEDED(formatResult) && format.PlaneCount > 0 && subresources <= ~0U &&
+           (GetCaptureVersion() >= 0x6 || format.PlaneCount == 1))
+          expectedSubresources = uint32_t(subresources);
+        includedSubresources = uint32_t(initial.subresources.size());
+        if(!initial.subresources.empty())
+          firstSubresource = initial.subresources[0];
+        if(desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || desc.SampleDesc.Count != 1 ||
+           initial.resourceType != Resource_Resource || initial.tag != D3D12InitialContents::Copy ||
+           !initial.sparseBinds || !initial.resource || initial.srcData ||
+           ((ID3D12Resource *)initial.resource)->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+           !ReplaySparseInitialSubresourcesComplete(initial.subresources, expectedSubresources))
+          eligibility = "initialTextureCopyNotComplete";
+      }
+      for(const auto &heap : component.heaps)
+      {
+        const D3D12InitialContents initialHeap = GetResourceManager()->GetInitialContents(heap.first);
+        if(!GetResourceManager()->HasResource(heap.first) ||
+           GetResourceManager()->HasReplacement(heap.first) ||
+           (initialHeap.resourceType != Resource_Unknown &&
+            (initialHeap.resourceType != Resource_Heap ||
+             initialHeap.tag != D3D12InitialContents::Copy || initialHeap.sparseBinds ||
+             (!initialHeap.resource && !initialHeap.srcData))))
+          eligibility = "unknownPhysicalHeapInitialContents";
+      }
+    }
+    bool dirty = m_ReplaySparseDirtyComponents.count(index) != 0;
+    for(ResourceId member : component.resources)
+      dirty |= m_ReplayDirtyResources.count(member) != 0 ||
+               m_ReplayDirtyHeapRanges.count(member) != 0;
+    for(const auto &heap : component.heaps)
+      dirty |= m_ReplayDirtyResources.count(heap.first) != 0 ||
+               m_ReplayDirtyHeapRanges.count(heap.first) != 0;
+    const bool eligible = strcmp(eligibility, "eligible") == 0;
+    const rdcstr previousReason = component.baseline.reason;
+    const bool retained = component.baseline.Begin(eligible, recordingAllowed, firstReset,
+                                                   m_UseReplayDirtyInitialContents, dirty);
+    if(m_ReplayDirtyTiming && IsActiveReplaying(m_State))
+    {
+      const rdcstr line = StringFormat::Fmt(
+          "api=D3D12SparseInitial op=prepare enabled=%u component=%zu resource=%s "
+          "eligible=%u firstReset=%u recordingAllowed=%u preInitialDirty=%u retained=%u "
+          "residentCopyBytes=%llu generation=%llu expectedSubresources=%u "
+          "includedSubresources=%u firstSubresource=%u reason=%s previousReason=%s",
+          m_ReplaySparseInitialResidencyEnabled ? 1U : 0U, index, ToStr(resource).c_str(),
+          eligible ? 1U : 0U, firstReset ? 1U : 0U, recordingAllowed ? 1U : 0U,
+          dirty ? 1U : 0U, retained ? 1U : 0U,
+          (unsigned long long)component.baseline.residentBytes,
+          (unsigned long long)component.baseline.generation,
+          expectedSubresources, includedSubresources, firstSubresource,
+          !eligible ? eligibility : !m_ReplaySparseInitialResidencyEnabled ? "disabled" :
+              !firstReset ? "secondCanonicalReset" : !recordingAllowed ? "untrackedOrCheckpointReset" :
+              dirty ? "componentDirty" : retained ? "residentInitialContents" : "needsSubmittedBaseline",
+          previousReason.c_str());
+      RDCLOG("%s", line.c_str());
+      AppendReplayTimingLog(line);
+    }
+  }
+}
+
+void WrappedID3D12Device::CompleteReplaySparseInitialBaselines()
+{
+  const bool succeeded = m_ReplayDirtyValid && !m_ReplayDirtyInitialFailed && !HasFatalError();
+  for(size_t index = 0; index < m_ReplaySparseComponents.size(); index++)
+  {
+    auto &baseline = m_ReplaySparseComponents[index].baseline;
+    const bool pending = baseline.pending;
+    const uint64_t bytes = baseline.recordedBytes;
+    const bool published = baseline.Submit(succeeded);
+    if(pending && m_ReplayDirtyTiming)
+    {
+      const rdcstr line = StringFormat::Fmt(
+          "api=D3D12SparseInitial op=submit component=%zu published=%u recordedCopyBytes=%llu "
+          "generation=%llu reason=%s", index, published ? 1U : 0U,
+          (unsigned long long)bytes, (unsigned long long)baseline.generation, baseline.reason.c_str());
+      RDCLOG("%s", line.c_str());
+      AppendReplayTimingLog(line);
+    }
+  }
+}
+
+bool WrappedID3D12Device::UseReplaySparseInitialBaseline(ResourceId resource)
+{
+  const auto found = m_ReplaySparseComponentIndex.find(resource);
+  if(!m_ReplayDirtyApplyingInitial || !m_UseReplayDirtyInitialContents ||
+     !m_ReplaySparseInitialResidencyEnabled || found == m_ReplaySparseComponentIndex.end())
+    return false;
+  const auto &component = m_ReplaySparseComponents[found->second];
+  if(!component.baseline.retained || !component.baseline.resident || HasFatalError())
+    return false;
+  // Includes any backing-heap initial content entry. Skipping only the sparse texture while
+  // subsequently copying its physical heap would destroy the very baseline being retained.
+  if(m_ReplayDirtyTiming)
+  {
+    const auto copy = component.baseline.residentResourceBytes.find(resource);
+    const uint64_t bytes = copy == component.baseline.residentResourceBytes.end() ? 0 : copy->second;
+    // Count each initial entry's actual previously recorded copies, rather than assigning the
+    // component heap allocation size to every alias or estimating physical GPU bus traffic.
+    m_ReplayDirtyCopyStats[resource].skippedBytes += bytes;
+    const rdcstr line = StringFormat::Fmt(
+        "api=D3D12SparseInitial op=retain component=%zu resource=%s avoidedRecordedCopyBytes=%llu "
+        "generation=%llu reason=unchangedSubmittedComponent", found->second, ToStr(resource).c_str(),
+        (unsigned long long)bytes, (unsigned long long)component.baseline.generation);
+    RDCLOG("%s", line.c_str());
+    AppendReplayTimingLog(line);
+  }
+  return true;
+}
+
+bool WrappedID3D12Device::MarkReplaySparseComponentDirty(ResourceId resource, const char *reason)
 {
   if(!m_ReplaySparseDirtyEnabled || !m_ReplaySparseGraphComplete)
     return false;
   auto found = m_ReplaySparseComponentIndex.find(resource);
   if(found == m_ReplaySparseComponentIndex.end())
     return false;
+  // PrepareReplaySparseInitialWrites deliberately widens the restoration selection itself. It
+  // must not masquerade as a submitted captured write and cancel the seed being recorded.
+  if(!m_ReplayDirtyApplyingInitial)
+    m_ReplaySparseComponents[found->second].baseline.Invalidate(reason);
   if(!m_ReplaySparseDirtyComponents.insert(found->second).second)
     return true;
   const auto &component = m_ReplaySparseComponents[found->second];
@@ -2815,6 +3064,10 @@ void WrappedID3D12Device::PrepareReplaySparseInitialWrites()
   }
   for(ResourceId id : m_SparseResources)
   {
+    const auto component = m_ReplaySparseComponentIndex.find(id);
+    if(component != m_ReplaySparseComponentIndex.end() &&
+       m_ReplaySparseComponents[component->second].baseline.retained)
+      continue;
     const D3D12InitialContents initial = GetResourceManager()->GetInitialContents(id);
     if(ReplaySparseInitialWritesMemory(IsReadOnlyResource(id), initial.tag))
       if(!MarkReplaySparseComponentDirty(id))
@@ -2843,7 +3096,7 @@ void WrappedID3D12Device::ObserveReplaySparseBind(ResourceId resource, ResourceI
       m_ReplaySparseGraphReason = "uncapturedSparseMapping";
       InvalidateReplayDirtyTracking("sparseQueueMapping");
     }
-    else if(!MarkReplaySparseComponentDirty(resource))
+    else if(!MarkReplaySparseComponentDirty(resource, "tileMapping"))
       InvalidateReplayDirtyTracking("sparseQueueMapping");
   }
 }
@@ -2865,7 +3118,7 @@ void WrappedID3D12Device::ObserveReplaySparseCopy(ResourceId destination, Resour
       m_ReplaySparseGraphReason = "uncapturedSparseMappingCopy";
       InvalidateReplayDirtyTracking("sparseQueueMapping");
     }
-    else if(!MarkReplaySparseComponentDirty(destination))
+    else if(!MarkReplaySparseComponentDirty(destination, "tileMappingCopy"))
       InvalidateReplayDirtyTracking("sparseQueueMapping");
   }
 }
@@ -2888,6 +3141,13 @@ void WrappedID3D12Device::BeginReplayDirtyRestore(bool allowed)
 
 void WrappedID3D12Device::InvalidateReplayDirtyTracking(const char *reason)
 {
+  InvalidateReplaySparseInitialBaselines(reason);
+  if(m_ReplayCheckpoints)
+  {
+    m_ReplayCheckpoints->residentVersions.InvalidateAll();
+    m_ReplayCheckpoints->restorePlan.retainedResources.clear();
+    m_ReplayCheckpoints->restorePlan.retainedBytes = 0;
+  }
   m_ReplayDirtyValid = false;
   m_UseReplayDirtyInitialContents = false;
   if(m_ReplayDirtyApplyingInitial)
@@ -2958,10 +3218,19 @@ void WrappedID3D12Device::MarkReplayResourceDirty(ResourceId id, bool unboundedR
 {
   if(!IsActiveReplaying(m_State) || id == ResourceId() || ResourceIDGen::IsReplayOnlyID(id))
     return;
+  if(unboundedRootUAV)
+    InvalidateReplaySparseInitialBaselines("unboundedRootUAV");
   if(m_LiveForward.valid)
     InvalidateLiveForward("resourceWriteOutsideReplay");
   m_ModResources.insert(id);
   m_ReplayDirtyResources.insert(id);
+  if(m_ReplayCheckpoints && !m_ReplayCheckpoints->markingRestoredContents)
+  {
+    if(unboundedRootUAV || GetResourceList().find(id) == GetResourceList().end())
+      m_ReplayCheckpoints->residentVersions.InvalidateAll();
+    else
+      m_ReplayCheckpoints->residentVersions.Invalidate(m_ReplayCheckpoints->ResidentRange(id));
+  }
   const auto resource = GetResourceList().find(id);
   if(resource == GetResourceList().end())
   {
@@ -3090,6 +3359,18 @@ void WrappedID3D12Device::RecordReplayInitialCopy(ResourceId resource, uint64_t 
                                                 D3D12ReplayInitialCopySource source,
                                                 bool footprint, bool wholeResource)
 {
+  if(m_ReplaySparseInitialResidencyEnabled && m_ReplayDirtyApplyingInitial)
+  {
+    const auto component = m_ReplaySparseComponentIndex.find(resource);
+    if(component != m_ReplaySparseComponentIndex.end())
+    {
+      auto &baseline = m_ReplaySparseComponents[component->second].baseline;
+      if(wholeResource)
+        baseline.Invalidate("unmeasuredInitialWholeResourceCopy");
+      else
+        baseline.Record(resource, bytes);
+    }
+  }
   if(!m_ReplayDirtyTiming)
     return;
   ReplayDirtyCopyStats &stats = m_ReplayDirtyCopyStats[resource];
@@ -3100,9 +3381,37 @@ void WrappedID3D12Device::RecordReplayInitialCopy(ResourceId resource, uint64_t 
 
 void WrappedID3D12Device::MarkCheckpointReplayWrites()
 {
+  InvalidateReplaySparseInitialBaselines("checkpointContents");
   if(m_ReplayCheckpoints)
+  {
+    m_ReplayCheckpoints->markingRestoredContents = true;
     for(const auto &resource : m_ReplayCheckpoints->currentVersions)
       MarkReplayResourceDirty(resource.first);
+    m_ReplayCheckpoints->markingRestoredContents = false;
+  }
+}
+
+void WrappedID3D12Device::MarkReplayFullOverwriteSubmitted(ResourceId id)
+{
+  if(!m_ReplayCheckpoints || HasFatalError() || !IsActiveReplaying(m_State))
+    return;
+  auto &cache = *m_ReplayCheckpoints;
+  if(!cache.deferredInitialResources.erase(id))
+    return;
+  // The full overwrite is now ordered on the real replay queue. It supersedes the old initial
+  // bytes; later writes in this submission may change its contents again, so publish a fresh
+  // identity rather than reusing the initial/checkpoint identity. Save still waits for the queue.
+  cache.residentVersions.MarkResident(cache.ResidentRange(id),
+                                     {++cache.contentSerial, cache.residentVersions.EditGeneration()});
+  m_ReplayDirtyResources.insert(id);
+  if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+  {
+    const rdcstr line = StringFormat::Fmt(
+        "api=D3D12OverwriteMaterialize resource=%s pending=%zu", ToStr(id).c_str(),
+        cache.deferredInitialResources.size());
+    RDCLOG("%s", line.c_str());
+    AppendReplayTimingLog(line);
+  }
 }
 
 void WrappedID3D12Device::AddCaptureSubmission()
@@ -6584,7 +6893,13 @@ ID3D12GraphicsCommandListX *WrappedID3D12Device::GetNewList()
     ret = m_InternalCmds.freecmds.back();
     m_InternalCmds.freecmds.pop_back();
 
-    ret->Reset(m_Alloc, NULL);
+    const HRESULT resetResult = ret->Reset(m_Alloc, NULL);
+    if(FAILED(resetResult))
+    {
+      // A reused list that did not reset cannot certify any subsequently recorded initial data.
+      InvalidateReplayDirtyTracking("internalCommandListResetFailed");
+      CHECK_HR(this, resetResult);
+    }
   }
   else
   {
@@ -6657,7 +6972,14 @@ void WrappedID3D12Device::CloseInitialStateList()
 {
   ScopedReplayTimingSection timing(ReplayTimingSection::InitialListClose);
   D3D12MarkerRegion::End(initStateCurList);
-  initStateCurList->Close();
+  const HRESULT closeResult = initStateCurList->Close();
+  if(FAILED(closeResult))
+  {
+    // Intermediate batches contribute to the same initial-state residency transaction as the
+    // final batch. A failure in any of them must discard the entire pending baseline.
+    InvalidateReplayDirtyTracking("initialListCloseFailed");
+    CHECK_HR(this, closeResult);
+  }
   initStateCurList = NULL;
   initStateCurBatch = 0;
 }
@@ -7715,6 +8037,7 @@ void WrappedID3D12Device::InvalidateReplayCheckpoints(uint32_t firstAffectedEven
   if(!m_ReplayCheckpoints)
     return;
   D3D12ReplayCheckpointCache &cache = *m_ReplayCheckpoints;
+  cache.residentVersions.InvalidateAll();
   if(!cache.activeQueries.empty())
   {
     // Query source buffers can still be referenced directly by recorded/submitted suffix lists.
@@ -7788,7 +8111,9 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
      !m_ReplayCheckpoints->config.enabled)
     return;
   auto &cache = *m_ReplayCheckpoints;
-  if(cache.savedThisReplay)
+  // A new checkpoint must not snapshot intentionally unmaterialised initial bytes. Subsequent
+  // requests can build it after a canonical reset; existing checkpoints remain usable now.
+  if(cache.savedThisReplay || !cache.deferredInitialResources.empty())
     return;
   const uint32_t saveBefore = m_Queue->GetCommandData()->m_LastEventID;
   uint32_t firstConsumer = 0;
@@ -8089,7 +8414,13 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
     auto saved = std::make_shared<D3D12ReplayCheckpointResource>();
     saved->id = GetResID(item.resource);
     saved->version = item.version;
+    saved->contentVersion = {++cache.contentSerial, cache.residentVersions.EditGeneration()};
     saved->bytes = item.bytes;
+    const D3D12_RESOURCE_DESC residentDesc = item.resource->GetReal()->GetDesc();
+    const uint64_t extent = residentDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                                ? residentDesc.Width : 1;
+    cache.residentExtents[saved->id] = extent;
+    cache.residentVersions.Register(saved->id, 0, extent);
     if(item.cpu)
     {
       const uint64_t width = item.resource->GetReal()->GetDesc().Width;
@@ -8208,6 +8539,7 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
     return;
   cache.currentVersions = checkpoint.resources;
   cache.checkpoints[eventID] = std::move(checkpoint);
+  cache.PublishResidentVersions(cache.checkpoints[eventID]);
   cache.stats.builds++;
   cache.stats.lastSaveEvent = eventID;
   cache.savedThisReplay = true;
@@ -8253,6 +8585,18 @@ static void CheckpointInitialCopyRanges(
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 #include "catch/catch.hpp"
+
+TEST_CASE("D3D12 resident checkpoint copies require preserved baseline exclusions and storage",
+          "[d3d12][checkpoint][resourceversions]")
+{
+  CHECK(D3D12MayRetainCheckpointContents(true, true, true, true));
+  // Disabling the initial-source optimisation restores baseline bytes over the old checkpoint.
+  CHECK_FALSE(D3D12MayRetainCheckpointContents(false, true, true, true));
+  // Failed/analysis replay and writes through sparse aliases both invalidate reuse evidence.
+  CHECK_FALSE(D3D12MayRetainCheckpointContents(true, false, true, true));
+  CHECK_FALSE(D3D12MayRetainCheckpointContents(true, true, false, true));
+  CHECK_FALSE(D3D12MayRetainCheckpointContents(true, true, true, false));
+}
 
 TEST_CASE("D3D12 initial source accounting counts selected copies instead of cache source extents",
           "[d3d12][replay][dirty-restore][source-copy-timing]")
@@ -8510,6 +8854,124 @@ TEST_CASE("D3D12 live forward requires an ordinary root and the matching success
   CHECK_FALSE(CanPublishLiveForwardTarget(29385, 29385, 8, 7, false));
   CHECK_FALSE(CanPublishLiveForwardTarget(29385, 29385, 7, 7, true));
   CHECK_FALSE(CanPublishLiveForwardTarget(0, 0, 7, 7, false));
+}
+
+TEST_CASE("D3D12 sparse initial residency publishes only submitted complete transactions",
+          "[d3d12][replay][dirty-restore][sparse-resident]")
+{
+  const ResourceId texture = ResourceIDGen::GetNewUniqueID();
+  const ResourceId heap = ResourceIDGen::GetNewUniqueID();
+  D3D12ReplaySparseInitialBaseline baseline;
+
+  // Cold loading and metadata alone are never a resident seed. Recording a copy also does not
+  // publish it until its submission and queue dependency have actually succeeded.
+  CHECK_FALSE(baseline.Begin(true, true, true, false, false));
+  baseline.Record(texture, 128);
+  baseline.Record(texture, 128);
+  baseline.Record(heap, 64);
+  CHECK_FALSE(baseline.resident);
+  REQUIRE(baseline.Submit(true));
+  CHECK(baseline.residentBytes == 320);
+  CHECK(baseline.residentResourceBytes[texture] == 256);
+  CHECK(baseline.residentResourceBytes[heap] == 64);
+  REQUIRE(baseline.Begin(true, true, true, true, false));
+  CHECK(baseline.retained);
+  CHECK_FALSE(baseline.pending);
+  CHECK_FALSE(baseline.Submit(true));    // a retained transaction creates no second copy seed
+  CHECK(baseline.residentBytes == 320);
+
+  // A write changes the entire component. After canonical restoration a new baseline may be
+  // published, and its byte accounting replaces rather than accumulates the previous restore.
+  baseline.Invalidate("resourceWrite");
+  CHECK_FALSE(baseline.Begin(true, true, true, true, true));
+  baseline.Record(texture, 256);
+  REQUIRE(baseline.Submit(true));
+  CHECK(baseline.residentBytes == 256);
+  CHECK(baseline.residentResourceBytes.count(heap) == 0);
+  REQUIRE(baseline.Begin(true, true, true, true, false));
+  // The pre-Prepare dirty set is an independent safety check, even if a future caller omitted
+  // the earlier eager invalidation hook for that known component write.
+  CHECK_FALSE(baseline.Begin(true, true, true, true, true));
+  CHECK_FALSE(baseline.resident);
+  CHECK_FALSE(baseline.retained);
+}
+
+TEST_CASE("D3D12 sparse initial residency cancels stale mapping and analysis submissions",
+          "[d3d12][replay][dirty-restore][sparse-resident]")
+{
+  const ResourceId texture = ResourceIDGen::GetNewUniqueID();
+  D3D12ReplaySparseInitialBaseline baseline;
+  REQUIRE_FALSE(baseline.Begin(true, true, true, false, false));
+  baseline.Record(texture, 256);
+  const uint64_t recordedGeneration = baseline.generation;
+  // Even a mapping call to an already known heap cancels the transaction. A delayed completion
+  // cannot publish the old contents after UpdateTileMappings or CopyTileMappings.
+  baseline.Invalidate("tileMapping");
+  CHECK(baseline.generation != recordedGeneration);
+  CHECK_FALSE(baseline.Submit(true));
+  CHECK_FALSE(baseline.resident);
+  REQUIRE_FALSE(baseline.Begin(true, true, true, true, true));
+  baseline.Record(texture, 256);
+  REQUIRE(baseline.Submit(true));
+  baseline.Invalidate("tileMappingCopy");
+  CHECK_FALSE(baseline.Begin(true, true, true, true, false));
+  baseline.Record(texture, 256);
+  REQUIRE(baseline.Submit(true));
+  // Global analysis/edit invalidation must also discard an already published seed.
+  baseline.Invalidate("analysisOrMutation");
+  CHECK_FALSE(baseline.Begin(true, false, true, true, false));
+  baseline.Record(texture, 256);
+  CHECK_FALSE(baseline.Submit(true));
+  CHECK_FALSE(baseline.resident);
+}
+
+TEST_CASE("D3D12 sparse explicit initial lists require every subresource exactly once",
+          "[d3d12][replay][dirty-restore][sparse-resident]")
+{
+  CHECK(ReplaySparseInitialSubresourcesComplete({0}, 1));
+  CHECK(ReplaySparseInitialSubresourcesComplete({0, 1}, 2));
+  CHECK(ReplaySparseInitialSubresourcesComplete({0, 1, 2, 3}, 4));
+  CHECK(ReplaySparseInitialSubresourcesComplete({~0U}, 4));
+  CHECK_FALSE(ReplaySparseInitialSubresourcesComplete({}, 1));
+  CHECK_FALSE(ReplaySparseInitialSubresourcesComplete({~0U}, 0));
+  CHECK_FALSE(ReplaySparseInitialSubresourcesComplete({0}, 2));
+  CHECK_FALSE(ReplaySparseInitialSubresourcesComplete({1}, 1));
+  CHECK_FALSE(ReplaySparseInitialSubresourcesComplete({0, 0}, 2));
+  CHECK_FALSE(ReplaySparseInitialSubresourcesComplete({1, 0}, 2));
+  CHECK_FALSE(ReplaySparseInitialSubresourcesComplete({0, 2}, 2));
+  CHECK_FALSE(ReplaySparseInitialSubresourcesComplete({~0U, 1}, 2));
+}
+
+TEST_CASE("D3D12 sparse initial residency rejects failed and second fallback baselines",
+          "[d3d12][replay][dirty-restore][sparse-resident]")
+{
+  const ResourceId texture = ResourceIDGen::GetNewUniqueID();
+  D3D12ReplaySparseInitialBaseline baseline;
+  REQUIRE_FALSE(baseline.Begin(true, true, true, false, false));
+  CHECK_FALSE(baseline.Submit(true));    // a skipped/empty initial pass did not copy the contents
+  REQUIRE_FALSE(baseline.Begin(true, true, true, false, false));
+  baseline.Record(texture, 256);
+  CHECK_FALSE(baseline.Submit(false));   // failed Close/Execute/dependency/fatal path
+  CHECK_FALSE(baseline.resident);
+
+  REQUIRE_FALSE(baseline.Begin(true, true, true, false, false));
+  baseline.Record(texture, 256);
+  REQUIRE(baseline.Submit(true));
+  REQUIRE(baseline.Begin(true, true, true, true, false));
+  // A checkpoint fallback invokes ApplyInitialContents a second time without a fresh root
+  // reset request. Neither the previous retained set nor new copy recording may become a seed.
+  CHECK_FALSE(baseline.Begin(true, true, false, true, false));
+  CHECK_FALSE(baseline.retained);
+  CHECK_FALSE(baseline.pending);
+  baseline.Record(texture, 256);
+  CHECK_FALSE(baseline.Submit(true));
+  CHECK_FALSE(baseline.resident);
+
+  REQUIRE_FALSE(baseline.Begin(true, true, true, false, false));
+  baseline.Record(texture, ~0ULL);
+  baseline.Record(texture, 1);
+  CHECK_FALSE(baseline.Submit(true));    // accounting overflow cannot certify a complete seed
+  CHECK_FALSE(baseline.resident);
 }
 
 TEST_CASE("D3D12 sparse dirty closure retains old pools and propagates copied mappings",
@@ -8774,6 +9236,35 @@ TEST_CASE("D3D12 checkpoint initial sources cover each heap byte exactly once",
 }
 #endif
 
+void WrappedID3D12Device::GetCheckpointInitialDescriptorRanges(
+    ResourceId heap, ResourceId initial, uint32_t count,
+    rdcarray<D3D12DescriptorRestoreRange> &copies,
+    rdcarray<D3D12DescriptorRestoreRange> &deferred)
+{
+  deferred.clear();
+  if(!m_UseCheckpointInitialSources || !m_ReplayCheckpoints ||
+     Process::GetEnvVariable("RENDERDOC_D3D12_ENABLE_CHECKPOINT_DESCRIPTOR_OVERLAY") != "1")
+    return;
+  auto &cache = *m_ReplayCheckpoints;
+  auto point = cache.checkpoints.find(cache.restorePlan.eventId);
+  if(point == cache.checkpoints.end())
+    return;
+  auto saved = point->second.heaps.find(heap);
+  if(saved == point->second.heaps.end() || initial == ResourceId() ||
+     saved->second->baseline != initial || saved->second->descriptorCount != count ||
+     saved->second->ranges.empty())
+    return;
+  rdcarray<D3D12DescriptorRestoreRange> filtered;
+  if(!D3D12SubtractDescriptorRanges(count, copies, saved->second->ranges, filtered))
+    return;
+  // The checkpoint's complete delta blocks are applied after initial contents. Avoid first
+  // resetting those same blocks, preserving native descriptors already equal to the checkpoint.
+  copies.swap(filtered);
+  deferred = saved->second->ranges;
+  cache.restorePlan.descriptorExclusions[heap] = deferred;
+  cache.restorePlan.skippedInitialContents = true;
+}
+
 bool WrappedID3D12Device::UsesCheckpointInitialContents(ResourceId resource)
 {
   if(!m_UseCheckpointInitialSources || !m_ReplayCheckpoints)
@@ -8782,6 +9273,17 @@ bool WrappedID3D12Device::UsesCheckpointInitialContents(ResourceId resource)
   auto point = cache.checkpoints.find(cache.restorePlan.eventId);
   if(point == cache.checkpoints.end())
     return false;
+  if(cache.restorePlan.fullClearResources.count(resource))
+  {
+    cache.restorePlan.skippedInitialContents = true;
+    cache.deferredInitialResources.insert(resource);
+    cache.residentExtents[resource] = 1;    // complete texture as one independently restored unit
+    cache.residentVersions.Register(resource, 0, 1);
+    const ReplayResourceAccessProof proof = {ReplayResourceFirstAccess::FullOverwrite, true, false};
+    // All-ones is reserved for the shared capture initial texture version, independent of EID.
+    cache.residentVersions.Plan(cache.ResidentRange(resource), {~0ULL, 0}, proof);
+    return true;
+  }
   auto version = point->second.resources.find(resource);
   if(version == point->second.resources.end())
     return false;
@@ -8883,7 +9385,16 @@ bool WrappedID3D12Device::ValidateReplayCheckpointRestore(uint32_t eventID, bool
       rdcarray<D3D12DescriptorRestoreRange> dirty;
       if(initialRestored)
       {
-        if(!destination->GetCheckpointDescriptorRanges(baseline, dirty) || !dirty.empty())
+        bool restored = destination->GetCheckpointDescriptorRanges(baseline, dirty);
+        auto excluded = m_ReplayCheckpoints->restorePlan.descriptorExclusions.find(heap.first);
+        if(restored && excluded != m_ReplayCheckpoints->restorePlan.descriptorExclusions.end())
+        {
+          rdcarray<D3D12DescriptorRestoreRange> remaining;
+          restored = D3D12SubtractDescriptorRanges(destination->GetNumDescriptors(), dirty,
+                                                   excluded->second, remaining);
+          dirty.swap(remaining);
+        }
+        if(!restored || !dirty.empty())
         {
           reason = "Checkpoint descriptor baseline is not fully restored";
           return false;
@@ -9039,6 +9550,10 @@ void WrappedID3D12Device::PrepareReplayCheckpointRestore(uint32_t requestedEvent
     return;
   }
   uint64_t resourceBytes = 0;
+  const bool retainResident = m_UseReplayDirtyInitialContents &&
+      Process::GetEnvVariable("RENDERDOC_D3D12_DISABLE_CHECKPOINT_RESIDENT_REUSE") != "1";
+  const bool initialSourcesEnabled =
+      Process::GetEnvVariable("RENDERDOC_D3D12_DISABLE_CHECKPOINT_INITIAL_SOURCES") != "1";
   for(const auto &entry : checkpoint.resources)
   {
     WrappedID3D12Resource *resource = GetResourceList().find(entry.first)->second;
@@ -9052,6 +9567,20 @@ void WrappedID3D12Device::PrepareReplayCheckpointRestore(uint32_t requestedEvent
       return;
     }
     resourceBytes += entry.second->bytes;
+    // This plan only retains exact immutable snapshot identities. It makes no assumption from
+    // absent GetUsage entries, and all normal initial/checkpoint barriers still execute.
+    const bool independentStorage = !m_ReplaySparseComponentIndex.count(entry.first) &&
+        (!resource->GetHeap() ||
+         !m_ReplaySparseComponentIndex.count(GetResID(resource->GetHeap())));
+    if(D3D12MayRetainCheckpointContents(initialSourcesEnabled, retainResident,
+                                       independentStorage,
+                                       cache.residentVersions.IsResident(
+                                           cache.ResidentRange(entry.first),
+                                           entry.second->contentVersion)))
+    {
+      plan.retainedResources.insert(entry.first);
+      plan.retainedBytes += entry.second->bytes;
+    }
     if(resource->GetHeap())
     {
       const ResourceId heapId = GetResID(resource->GetHeap());
@@ -9088,6 +9617,42 @@ void WrappedID3D12Device::PrepareReplayCheckpointRestore(uint32_t requestedEvent
     }
   }
   uint64_t heapRanges = 0;
+  // Narrow positive proof: a complete unconditional clear executes before any possible read.
+  // This does not implement general absent-usage deferral or alias-heap snapshotting.
+  if(m_UseReplayDirtyInitialContents && !m_CheckpointDependenciesEdited &&
+     m_ReplayBufferPatches.empty() &&
+     Process::GetEnvVariable("RENDERDOC_D3D12_CHECKPOINT_FULL_CLEAR_PREFIX") == "1")
+  {
+    // Filter native storage before the content query. Only these independent textures may
+    // cross an alias barrier in that query; placed/sparse resources still use full restoration.
+    std::set<ResourceId> eligibleTextures;
+    for(const auto &resource : GetResourceList())
+    {
+      const ResourceId id = resource.first;
+      if(resource.second->GetHeap() ||
+         IsSparseResource(id) || m_ReplaySparseComponentIndex.count(id) ||
+         GetResourceManager()->HasReplacement(id) ||
+         resource.second->IsAccelerationStructureResource())
+        continue;
+      const D3D12_RESOURCE_DESC desc = resource.second->GetReal()->GetDesc();
+      if(desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        continue;
+      const D3D12InitialContents initial = GetResourceManager()->GetInitialContents(id);
+      if(initial.resourceType != Resource_Resource || initial.sparseBinds ||
+         (initial.tag != D3D12InitialContents::Copy && initial.tag != D3D12InitialContents::ForceCopy))
+        continue;
+      eligibleTextures.insert(id);
+    }
+    for(ResourceId id : m_Queue->GetCommandData()->GetReplayFullClearPrefix(
+            checkpoint.eventId, endEventID, eligibleTextures))
+    {
+      plan.fullClearResources.insert(id);
+      const D3D12_RESOURCE_DESC desc = GetResourceList().find(id)->second->GetReal()->GetDesc();
+      const uint64_t bytes = GetReal()->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+      if(bytes != ~0ULL)
+        plan.fullClearBytes += bytes;
+    }
+  }
   for(auto &heap : plan.heapExclusions)
   {
     std::sort(heap.second.begin(), heap.second.end());
@@ -9185,7 +9750,7 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
   };
   for(const auto &entry : checkpoint.resources)
   {
-    if(entry.second->gpu)
+    if(entry.second->gpu || cache.restorePlan.retainedResources.count(entry.first))
       continue;
     ID3D12Resource *resource = GetResourceList().find(entry.first)->second->GetReal();
     void *mapped = NULL;
@@ -9244,7 +9809,8 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
   const double cpuRestoreEndMS = timer.GetMilliseconds();
   for(const auto &entry : checkpoint.resources)
   {
-    if(!entry.second->gpu)
+    if(!entry.second->gpu || cache.restorePlan.retainedResources.count(entry.first) ||
+       cache.restorePlan.fullClearResources.count(entry.first))
       continue;
     WrappedID3D12Resource *resource = GetResourceList().find(entry.first)->second;
     BarrierSet barriers;
@@ -9296,17 +9862,28 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
   nextAction = checkpoint.nextAction;
   cache.currentVersions = checkpoint.resources;
   cache.activeQueries = checkpoint.queries;
+  cache.PublishResidentVersions(checkpoint);
+  for(ResourceId id : cache.deferredInitialResources)
+    cache.currentVersions.erase(id);
   cache.activeQueryResolves = checkpoint.queryResolves;
   cache.stats.hits++;
   cache.stats.lastResumeEvent = checkpoint.eventId;
   cache.stats.reason.clear();
   if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+  {
+    uint64_t overlaySlots = 0;
+    for(const auto &heap : cache.restorePlan.descriptorExclusions)
+      for(const auto &range : heap.second)
+        overlaySlots += range.count;
     LogD3D12Checkpoint(StringFormat::Fmt(
         "api=D3D12Checkpoint op=restore event=%u target=%u prefixSkipped=1 total_ms=%.3f "
         "asyncRestore=%u preWait_ms=%.3f validate_ms=%.3f descriptors_ms=%.3f cpuRestore_ms=%.3f "
         "copyRecord_ms=%.3f submitWait_ms=%.3f descriptorBytes=%llu descriptorChanges=%llu cpuBytes=%llu "
         "initialResourceCopiesSkipped=%u initialResourceAllocationBytesSkipped=%llu "
-        "initialHeapBytesSkipped=%llu restoredQuerySlots=%zu querySavedResolves=%zu",
+        "initialHeapBytesSkipped=%llu restoredQuerySlots=%zu querySavedResolves=%zu "
+        "residentCopiesSkipped=%zu residentAllocationBytesSkipped=%llu "
+        "fullClearInitialCopiesDeferred=%zu fullClearAllocationBytes=%llu "
+        "initialDescriptorOverlaySlots=%llu",
         checkpoint.eventId, endEventID, timer.GetMilliseconds(), asyncRestore ? 1U : 0U, preWaitEndMS,
         validateEndMS - preWaitEndMS, descriptorEndMS - validateEndMS,
         cpuRestoreEndMS - descriptorEndMS, copyRecordEndMS - cpuRestoreEndMS,
@@ -9314,7 +9891,10 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
         (unsigned long long)descriptorChanges, (unsigned long long)cpuBytes,
         cache.restorePlan.skippedResources, (unsigned long long)cache.restorePlan.skippedResourceBytes,
         (unsigned long long)cache.restorePlan.skippedHeapBytes, checkpoint.queries.size(),
-        checkpoint.queryResolves.size()));
+        checkpoint.queryResolves.size(), cache.restorePlan.retainedResources.size(),
+        (unsigned long long)cache.restorePlan.retainedBytes, cache.deferredInitialResources.size(),
+        (unsigned long long)cache.restorePlan.fullClearBytes, (unsigned long long)overlaySlots));
+  }
   cache.restorePlan = {};
   return true;
 }
@@ -9463,6 +10043,10 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
       DeviceWaitForIdle();
     }
 
+    // Only now have the canonical initial commands actually been submitted and made visible to
+    // every following replay queue. Subsequent captured writes/mappings invalidate these seeds.
+    CompleteReplaySparseInitialBaselines();
+
     // clear any previous ray dispatch references
     D3D12CommandData &cmd = *m_Queue->GetCommandData();
 
@@ -9564,6 +10148,7 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
     {
       replaySucceeded = false;
       InvalidateLiveForward("replayFailed");
+      InvalidateReplayDirtyTracking("replayFailed");
     }
 
     if(cmd.m_OutsideCmdList != NULL)
@@ -9634,7 +10219,10 @@ void WrappedID3D12Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
   }
 
   if(!list)
+  {
     InvalidateLiveForward("replayFinishListMissing");
+    InvalidateReplaySparseInitialBaselines("replayFinishListMissing");
+  }
   if(eligibleRoot && list && !HasFatalError() &&
      replaySucceeded)
   {

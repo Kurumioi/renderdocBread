@@ -231,6 +231,7 @@ void WrappedVulkan::DestroyReplayCheckpoint(ReplayCheckpoint *checkpoint)
 
 void WrappedVulkan::InvalidateReplayCheckpoints(uint32_t firstAffectedEvent)
 {
+  InvalidateLiveForward("checkpointOrResourceEditInvalidated");
   if(firstAffectedEvent == 0)
     m_ReplayPatchAnchorAttempted = false;
   bool drained = false;
@@ -278,14 +279,63 @@ ReplayCheckpointStats WrappedVulkan::GetReplayCheckpointStats()
   return ret;
 }
 
-bool WrappedVulkan::CheckReplayCheckpointInterval(const ReplayCheckpoint &checkpoint,
-                                                 uint32_t target)
+static bool VulkanCheckpointCommandKeepsPass(VulkanChunk chunk)
 {
+  // These two commands insert one label without changing marker nesting, rendering state or
+  // resource contents. Their replay handlers preserve the exact API event. Region begin/end
+  // labels still need separate marker-stack handling and remain excluded below.
+  if(chunk == VulkanChunk::vkCmdInsertDebugUtilsLabelEXT ||
+     chunk == VulkanChunk::vkCmdDebugMarkerInsertEXT)
+    return true;
+
+  const rdcstr name = ToStr(chunk);
+  return name.find("vkCmd") == 0 && name.find("RenderPass") < 0 &&
+         name.find("Rendering") < 0 && name.find("NextSubpass") < 0 &&
+         name.find("Indirect") < 0 && name.find("ExecuteCommands") < 0 &&
+         name.find("Debug") < 0 && name.find("Marker") < 0;
+}
+
+template <typename EventAt, typename ChunkAt>
+static bool VulkanCheckpointCommandInterval(uint32_t from, uint32_t target, size_t chunkCount,
+                                            EventAt eventAt, ChunkAt chunkAt, rdcstr *reason)
+{
+  // The caller has established a single primary submission and a supported capture. Require
+  // every EID, including inserted labels, to map to its own captured command. GetEvent otherwise
+  // rounds missing/synthetic events forward, which cannot prove an exact replay interval.
+  for(uint64_t event = uint64_t(from) + 1; event <= target; ++event)
+  {
+    const APIEvent &ev = eventAt((uint32_t)event);
+    if(ev.eventId != event || ev.chunkIndex >= chunkCount)
+    {
+      if(reason)
+        *reason = StringFormat::Fmt(
+            "unsupportedCommandInterval blockingEID=%u blockingReason=missingExactAPIEvent",
+            (uint32_t)event);
+      return false;
+    }
+    const VulkanChunk chunk = chunkAt(ev.chunkIndex);
+    if(!VulkanCheckpointCommandKeepsPass(chunk))
+    {
+      if(reason)
+        *reason = StringFormat::Fmt(
+            "unsupportedCommandInterval blockingEID=%u blockingChunk=%s", (uint32_t)event,
+            ToStr(chunk).c_str());
+      return false;
+    }
+  }
+  return true;
+}
+
+bool WrappedVulkan::CheckReplayCheckpointInterval(const ReplayCheckpoint &checkpoint,
+                                                 uint32_t target, rdcstr *reason)
+{
+  if(reason)
+    *reason = "unsupportedCommandInterval blockingReason=invalidPrimaryCursor";
   if(checkpoint.kind != ReplayCheckpointKind::PartialCommand)
     return m_CheckpointSubmissionCaptureSafe && target >= checkpoint.eventId &&
            (checkpoint.kind == ReplayCheckpointKind::FrameInitial ||
             m_CheckpointSubmissionEnds.count(checkpoint.eventId) != 0);
-  if(checkpoint.partialStack.size() != 1 || target < checkpoint.eventId)
+  if(checkpoint.partialStack.size() != 1 || target < checkpoint.eventId || !m_StructuredFile)
     return false;
   const CommandBufferNode &node = checkpoint.partialStack[0];
   auto baked = m_BakedCmdBufferInfo.find(node.cmdId);
@@ -297,20 +347,13 @@ bool WrappedVulkan::CheckReplayCheckpointInterval(const ReplayCheckpoint &checkp
 
   // The existing outside-command-buffer path restores a LOAD renderpass, but its subpass and
   // end-pass bookkeeping is for a single item. Stay within the saved pass (or outside any pass).
-  // Exact API-event identity also excludes synthetic indirect subcommands and skipped markers.
-  for(uint32_t event = checkpoint.eventId + 1; event <= target; ++event)
-  {
-    const APIEvent &ev = GetEvent(event);
-    if(ev.eventId != event || ev.chunkIndex >= m_StructuredFile->chunks.size())
-      return false;
-    const rdcstr name = ToStr((VulkanChunk)m_StructuredFile->chunks[ev.chunkIndex]->metadata.chunkID);
-    if(name.find("vkCmd") != 0 || name.find("RenderPass") >= 0 ||
-       name.find("Rendering") >= 0 || name.find("NextSubpass") >= 0 ||
-       name.find("Indirect") >= 0 || name.find("ExecuteCommands") >= 0 ||
-       name.find("Debug") >= 0 || name.find("Marker") >= 0)
-      return false;
-  }
-  return true;
+  return VulkanCheckpointCommandInterval(
+      checkpoint.eventId, target, m_StructuredFile->chunks.size(),
+      [this](uint32_t event) -> const APIEvent & { return GetEvent(event); },
+      [this](uint32_t chunk) {
+        return (VulkanChunk)m_StructuredFile->chunks[chunk]->metadata.chunkID;
+      },
+      reason);
 }
 
 uint32_t WrappedVulkan::RestoreReplayCheckpoint(uint32_t endEventID, ReplayLogType replayType)

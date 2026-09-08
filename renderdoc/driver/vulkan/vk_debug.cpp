@@ -3779,6 +3779,7 @@ void VulkanReplay::PrepareStateForPatchedShader(
 bool VulkanReplay::RunFeedbackAction(VkDeviceSize bufferSize, const ActionDescription *action,
                                      VulkanRenderState &modifiedstate)
 {
+  m_pDriver->InvalidateLiveForward("shaderFeedbackAction");
   VkResult vkr = VK_SUCCESS;
   VkDevice dev = m_Device;
   VkCommandBuffer cmd = m_pDriver->GetNextCmd();

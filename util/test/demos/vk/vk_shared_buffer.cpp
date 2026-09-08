@@ -88,6 +88,47 @@ void main() { color = tint; }
 
     while(Running())
     {
+      // A separately requested proof fixture keeps all four draws in one native pass. Each draw
+      // changes a distinct screen region, so omitting an intermediate draw changes final pixels.
+      // The normal fixture below retains its captured uploads and separate submissions.
+      if(GetEnvVar("RENDERDOC_PORTABLE_FORWARD_FIXTURE") == "1")
+      {
+        VkCommandBuffer cmd = GetCommandBuffer();
+        CHECK_VKR(vkBeginCommandBuffer(cmd, vkh::CommandBufferBeginInfo()));
+        VkImage image = StartUsingBackbuffer(cmd, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                            VK_IMAGE_LAYOUT_GENERAL);
+        vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL,
+                            vkh::ClearColorValue(0.03f, 0.04f, 0.05f, 1.0f), 1,
+                            vkh::ImageSubresourceRange());
+        vkh::cmdPipelineBarrier(cmd,
+            {vkh::ImageMemoryBarrier(VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, image)}, {}, {},
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        vkCmdBeginRenderPass(cmd,
+            vkh::RenderPassBeginInfo(mainWindow->rp, mainWindow->GetFB(), mainWindow->scissor),
+            VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        vkh::cmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, {set}, {});
+        vkh::cmdBindVertexBuffers(cmd, 0, {vb.buffer}, {0});
+        vkCmdSetScissor(cmd, 0, 1, &mainWindow->scissor);
+        for(uint32_t region = 0; region < 4; region++)
+        {
+          VkViewport viewport = mainWindow->viewport;
+          viewport.width /= 4.0f;
+          viewport.x += region * viewport.width;
+          vkCmdSetViewport(cmd, 0, 1, &viewport);
+          setMarker(cmd, "Live forward region " + std::to_string(region));
+          vkCmdDraw(cmd, 3, 1, 0, 0);
+        }
+        vkCmdEndRenderPass(cmd);
+        FinishUsingBackbuffer(cmd, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        CHECK_VKR(vkEndCommandBuffer(cmd));
+        Submit(0, 1, {cmd});
+        CHECK_VKR(vkQueueWaitIdle(queue));
+        Present();
+        continue;
+      }
       VkImage swapimg = VK_NULL_HANDLE;
       for(uint32_t region = 0; region < 4; region++)
       {

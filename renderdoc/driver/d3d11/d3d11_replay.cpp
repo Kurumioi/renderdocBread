@@ -134,6 +134,153 @@ uint32_t CheckpointLastWrite(const rdcarray<uint32_t> &writes, uint32_t eventId)
       last = RDCMAX(last, write);
   return last;
 }
+
+bool D3D11LiveForwardAction(D3D11Chunk chunk)
+{
+  return chunk == D3D11Chunk::Draw || chunk == D3D11Chunk::DrawIndexed ||
+         chunk == D3D11Chunk::DrawInstanced || chunk == D3D11Chunk::DrawIndexedInstanced ||
+         chunk == D3D11Chunk::Dispatch;
+}
+
+bool D3D11LiveForwardChunk(D3D11Chunk chunk)
+{
+  switch(chunk)
+  {
+    case D3D11Chunk::IASetInputLayout:
+    case D3D11Chunk::IASetVertexBuffers:
+    case D3D11Chunk::IASetIndexBuffer:
+    case D3D11Chunk::IASetPrimitiveTopology:
+    case D3D11Chunk::VSSetConstantBuffers:
+    case D3D11Chunk::VSSetConstantBuffers1:
+    case D3D11Chunk::VSSetShaderResources:
+    case D3D11Chunk::VSSetSamplers:
+    case D3D11Chunk::VSSetShader:
+    case D3D11Chunk::HSSetConstantBuffers:
+    case D3D11Chunk::HSSetConstantBuffers1:
+    case D3D11Chunk::HSSetShaderResources:
+    case D3D11Chunk::HSSetSamplers:
+    case D3D11Chunk::HSSetShader:
+    case D3D11Chunk::DSSetConstantBuffers:
+    case D3D11Chunk::DSSetConstantBuffers1:
+    case D3D11Chunk::DSSetShaderResources:
+    case D3D11Chunk::DSSetSamplers:
+    case D3D11Chunk::DSSetShader:
+    case D3D11Chunk::GSSetConstantBuffers:
+    case D3D11Chunk::GSSetConstantBuffers1:
+    case D3D11Chunk::GSSetShaderResources:
+    case D3D11Chunk::GSSetSamplers:
+    case D3D11Chunk::GSSetShader:
+    case D3D11Chunk::PSSetConstantBuffers:
+    case D3D11Chunk::PSSetConstantBuffers1:
+    case D3D11Chunk::PSSetShaderResources:
+    case D3D11Chunk::PSSetSamplers:
+    case D3D11Chunk::PSSetShader:
+    case D3D11Chunk::CSSetConstantBuffers:
+    case D3D11Chunk::CSSetConstantBuffers1:
+    case D3D11Chunk::CSSetShaderResources:
+    case D3D11Chunk::CSSetSamplers:
+    case D3D11Chunk::CSSetShader:
+    case D3D11Chunk::CSSetUnorderedAccessViews:
+    case D3D11Chunk::RSSetViewports:
+    case D3D11Chunk::RSSetScissorRects:
+    case D3D11Chunk::RSSetState:
+    case D3D11Chunk::OMSetRenderTargets:
+    case D3D11Chunk::OMSetRenderTargetsAndUnorderedAccessViews:
+    case D3D11Chunk::OMSetBlendState:
+    case D3D11Chunk::OMSetDepthStencilState:
+    case D3D11Chunk::CopyResource:
+    case D3D11Chunk::CopySubresourceRegion:
+    case D3D11Chunk::CopySubresourceRegion1:
+    case D3D11Chunk::CopyStructureCount:
+    case D3D11Chunk::ResolveSubresource:
+    case D3D11Chunk::UpdateSubresource:
+    case D3D11Chunk::UpdateSubresource1:
+    case D3D11Chunk::GenerateMips:
+    case D3D11Chunk::ClearDepthStencilView:
+    case D3D11Chunk::ClearRenderTargetView:
+    case D3D11Chunk::ClearUnorderedAccessViewUint:
+    case D3D11Chunk::ClearUnorderedAccessViewFloat:
+    case D3D11Chunk::ClearView:
+    case D3D11Chunk::ClearState:
+    case D3D11Chunk::SetResourceMinLOD:
+    case D3D11Chunk::PushMarker:
+    case D3D11Chunk::PopMarker:
+    case D3D11Chunk::SetMarker:
+    case D3D11Chunk::SetCommandAnnotation: return true;
+    default: return D3D11LiveForwardAction(chunk);
+  }
+}
+
+bool D3D11LiveForwardInterval(const rdcarray<APIEvent> &events, const SDFile &file,
+                              uint32_t from, uint32_t target, rdcstr &reason)
+{
+  if(!from || target <= from || target >= events.size() || events[from].eventId != from ||
+     events[target].eventId != target || events[target].chunkIndex >= file.chunks.size() ||
+     events[from].chunkIndex >= events[target].chunkIndex)
+  {
+    reason = "nonForwardOrMissingEvent";
+    return false;
+  }
+  if(!D3D11LiveForwardAction(D3D11Chunk(file.chunks[events[from].chunkIndex]->metadata.chunkID)) ||
+     !D3D11LiveForwardAction(D3D11Chunk(file.chunks[events[target].chunkIndex]->metadata.chunkID)))
+  {
+    reason = "nonDirectDrawOrDispatchTarget";
+    return false;
+  }
+  uint32_t eid = from + 1;
+  uint64_t previousOffset = events[from].fileOffset;
+  for(uint32_t chunkIndex = events[from].chunkIndex + 1;
+      chunkIndex <= events[target].chunkIndex; ++chunkIndex)
+  {
+    const D3D11Chunk type = D3D11Chunk(file.chunks[chunkIndex]->metadata.chunkID);
+    if(!D3D11LiveForwardChunk(type))
+    {
+      reason = "unsupportedIntervalChunk:" + ToStr(type);
+      return false;
+    }
+    if(type == D3D11Chunk::SetCommandAnnotation)
+      continue;
+    if(eid > target || events[eid].eventId != eid || events[eid].chunkIndex != chunkIndex ||
+       events[eid].fileOffset <= previousOffset)
+    {
+      reason = "nonLinearEventChunkMapping";
+      return false;
+    }
+    previousOffset = events[eid].fileOffset;
+    ++eid;
+  }
+  reason = "linearImmediateContextRange";
+  return eid == target + 1;
+}
+
+bool D3D11LiveForwardCanPublish(uint32_t target, uint32_t pending, uint64_t serial,
+                               uint64_t pendingSerial, bool success, bool ordinary)
+{
+  return ordinary && success && target != 0 && target == pending && serial == pendingSerial;
+}
+
+bool D3D11LiveForwardCaptureChunkSafe(D3D11Chunk chunk)
+{
+  switch(chunk)
+  {
+    case D3D11Chunk::Begin:
+    case D3D11Chunk::End:
+    case D3D11Chunk::CreateQuery:
+    case D3D11Chunk::CreateQuery1:
+    case D3D11Chunk::CreatePredicate:
+    case D3D11Chunk::CreateCounter:
+    case D3D11Chunk::SOSetTargets:
+    case D3D11Chunk::DrawAuto:
+    case D3D11Chunk::SetPredication:
+    case D3D11Chunk::ExecuteCommandList:
+    case D3D11Chunk::FinishCommandList:
+    case D3D11Chunk::PostExecuteCommandList:
+    case D3D11Chunk::PostFinishCommandListSet:
+    case D3D11Chunk::SwapDeviceContextState:
+    case D3D11Chunk::SetShaderExtUAV: return false;
+    default: return true;
+  }
+}
 }
 
 D3D11Replay::D3D11Replay(WrappedID3D11Device *d)
@@ -1788,12 +1935,15 @@ rdcarray<DescriptorLogicalLocation> D3D11Replay::GetDescriptorLocations(
 
 RDResult D3D11Replay::ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers)
 {
+  InvalidateLiveForward();
+  m_LiveForwardCaptureScanned = m_LiveForwardCaptureSafe = false;
   return m_pDevice->ReadLogInitialisation(rdc, storeStructuredBuffers);
 }
 
 void D3D11Replay::ConfigureReplayCheckpoints(
     const ReplayCheckpointConfig &config, const rdcarray<ReplayCheckpointCandidate> &candidates)
 {
+  InvalidateLiveForward();
   if(m_CheckpointStats.enabled && ReplayCheckpointStorageCompatible(m_CheckpointConfig, config))
   {
     for(auto it = m_Checkpoints.begin(); it != m_Checkpoints.end();)
@@ -1828,6 +1978,7 @@ void D3D11Replay::ConfigureReplayCheckpoints(
 
 void D3D11Replay::InvalidateReplayCheckpoints(uint32_t firstAffectedEvent)
 {
+  InvalidateLiveForward();
   (void)firstAffectedEvent;
   // A replacement shader can start writing a binding that the captured shader never used.
   // Recorded GetUsage/last-write indices no longer prove immutability, even after rescanning.
@@ -2404,17 +2555,72 @@ bool D3D11Replay::ApplyPendingBufferPatches()
   return success;
 }
 
+void D3D11Replay::InvalidateLiveForward()
+{
+  m_LiveForward = {};
+}
+
+bool D3D11Replay::IsLiveForwardContextSafe()
+{
+  if(m_Proxy || m_pDevice->GetNumDeferredContexts() || m_pDevice->HasFatalError() ||
+     m_pDevice->GetReplayOptions().apiValidation || m_pImmediateContext->HasOpenReplayMaps())
+    return false;
+  const D3D11RenderState *state = m_pImmediateContext->GetCurrentPipelineState();
+  if(!state || state->Predicate)
+    return false;
+  for(ID3D11Buffer *buffer : state->SO.Buffers)
+    if(buffer)
+      return false;
+  if(!m_LiveForwardCaptureScanned)
+  {
+    m_LiveForwardCaptureScanned = true;
+    SDFile *file = GetStructuredFile();
+    if(!file)
+      return false;
+    // Queries, deferred streams and stream-output counters have hidden state. Do not publish
+    // a seed for these captures even when the next small interval has no explicit query call.
+    for(const SDChunk *chunk : file->chunks)
+      if(!D3D11LiveForwardCaptureChunkSafe(D3D11Chunk(chunk->metadata.chunkID)))
+        return false;
+    m_LiveForwardCaptureSafe = true;
+  }
+  return m_LiveForwardCaptureSafe;
+}
+
 void D3D11Replay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
 {
+  PerformanceTimer liveTimer;
+  const bool enabled = Process::GetEnvVariable("RENDERDOC_D3D11_ENABLE_LIVE_FORWARD") != "0";
+  const bool unmodified = !m_RealState.active && m_EventShaderOverrides.empty() &&
+                          m_AppliedEventShaderOverrides.empty() && m_EventCBufferOverrides.empty() &&
+                          m_AppliedEventCBufferOverrides.empty();
+  const bool ordinaryRoot = enabled && replayType == eReplay_WithoutDraw &&
+                            !m_ReplayCheckpointBypass && !m_ReplayCheckpointNaturalReference &&
+                            unmodified && IsLiveForwardContextSafe();
+  const uint64_t entrySerial = m_pDevice->GetReplayExecutionSerial();
+  const LiveForwardCursor previous = m_LiveForward;
+  // Consume before executing any command. Force/analysis and failed attempts cannot leave a
+  // half-updated cursor available; native analysis callers also change entrySerial.
+  InvalidateLiveForward();
+  rdcstr liveReason = enabled ? "noOrdinaryCursor" : "disabled";
+  bool liveForward = false;
+  SDFile *structured = GetStructuredFile();
+  if(ordinaryRoot && previous.valid && previous.deviceSerial == entrySerial && structured)
+    liveForward = D3D11LiveForwardInterval(m_pImmediateContext->GetReplayEvents(), *structured,
+                                           previous.eventId, endEventID, liveReason);
+  else if(previous.valid && previous.deviceSerial != entrySerial)
+    liveReason = "interveningNativeReplay";
+  else if(enabled && !ordinaryRoot)
+    liveReason = "bypassOrUnsafeContext";
   // A fresh replay, including force/bypass and OnlyDraw, cannot inherit version provenance.
   m_CheckpointCurrentEvent = 0;
   const bool checkpointReplay = !m_ReplayCheckpointBypass && m_CheckpointStats.enabled &&
       (replayType == eReplay_Full || replayType == eReplay_WithoutDraw) &&
       !m_RealState.active && m_AppliedEventShaderOverrides.empty() &&
       m_AppliedEventCBufferOverrides.empty() && PrepareCheckpointResources();
-  uint32_t startEvent = 0;
+  uint32_t startEvent = liveForward ? previous.eventId + 1 : 0;
   const uint32_t finalEvent = replayType == eReplay_WithoutDraw ? RDCMAX(1U, endEventID) - 1 : endEventID;
-  if(checkpointReplay && finalEvent > 0)
+  if(!liveForward && checkpointReplay && finalEvent > 0)
   {
     auto best = m_Checkpoints.upper_bound(finalEvent);
     if(best != m_Checkpoints.begin())
@@ -2456,19 +2662,57 @@ void D3D11Replay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
       saveEvent = 0;
     if(saveEvent > 0)
     {
-      m_pDevice->ReplayLog(startEvent, saveEvent, eReplay_Full);
-      if(m_pDevice->HasFatalError())
+      if(!m_pDevice->ReplayLog(startEvent, saveEvent, eReplay_Full))
         return;
       SaveReplayCheckpoint(saveEvent);
       startEvent = saveEvent + 1;
     }
   }
+  bool success = true;
   if(startEvent == 0 || startEvent <= finalEvent || replayType == eReplay_OnlyDraw)
-    m_pDevice->ReplayLog(startEvent, endEventID, replayType);
+    success = m_pDevice->ReplayLog(startEvent, endEventID, replayType);
   // Save/restore is exclusively on complete prefix states. OnlyDraw may use a temporary edited
   // shader/CBuffer and therefore never creates a reusable suffix checkpoint.
   if(replayType == eReplay_WithoutDraw || replayType == eReplay_Full)
     m_RenderStateOM = m_pDevice->GetImmediateContext()->GetCurrentPipelineState()->OM;
+
+  const bool safeResult = success && !m_pDevice->HasFatalError();
+  if(ordinaryRoot && safeResult && IsLiveForwardContextSafe())
+  {
+    const rdcarray<APIEvent> &events = m_pImmediateContext->GetReplayEvents();
+    if(structured && endEventID < events.size() && events[endEventID].eventId == endEventID &&
+       events[endEventID].chunkIndex < structured->chunks.size() &&
+       D3D11LiveForwardAction(D3D11Chunk(
+           structured->chunks[events[endEventID].chunkIndex]->metadata.chunkID)))
+    {
+      m_LiveForward.pendingTarget = endEventID;
+      m_LiveForward.pendingDeviceSerial = m_pDevice->GetReplayExecutionSerial();
+    }
+  }
+  // The controller deliberately bypasses checkpoints for every OnlyDraw. Publication instead
+  // requires its preceding ordinary root and unchanged native execution serial.
+  else if(D3D11LiveForwardCanPublish(endEventID, previous.pendingTarget, entrySerial,
+                                    previous.pendingDeviceSerial, safeResult,
+                                    enabled && unmodified && replayType == eReplay_OnlyDraw) &&
+          IsLiveForwardContextSafe())
+  {
+    m_LiveForward.valid = true;
+    m_LiveForward.eventId = endEventID;
+    m_LiveForward.deviceSerial = m_pDevice->GetReplayExecutionSerial();
+  }
+  if(replayType == eReplay_WithoutDraw && Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+  {
+    const rdcstr line = StringFormat::Fmt(
+        "api=D3D11LiveForward from=%u target=%u enabled=%u hit=%u initialRestoreSkipped=%u "
+        "replayedEvents=%u range=%u-%u success=%u reason=%s total_ms=%.3f",
+        previous.eventId, endEventID, enabled ? 1U : 0U, liveForward && safeResult ? 1U : 0U,
+        liveForward && safeResult ? 1U : 0U,
+        liveForward ? endEventID - previous.eventId - 1 : 0,
+        liveForward ? previous.eventId + 1 : 0, finalEvent, safeResult ? 1U : 0U,
+        liveReason.c_str(), liveTimer.GetMilliseconds());
+    RDCLOG("[EIDTiming] %s", line.c_str());
+    AppendReplayTimingLog(line);
+  }
 }
 
 SDFile *D3D11Replay::GetStructuredFile()
@@ -6027,6 +6271,87 @@ static StructuredProcessRegistration D3D11ProcessRegistration(RDCDriver::D3D11,
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 #include "catch/catch.hpp"
+
+TEST_CASE("D3D11 live forward validates the exact immediate-context interval",
+          "[d3d11][replay][live-forward]")
+{
+  SDFile file;
+  rdcarray<APIEvent> events;
+  events.resize(6);
+  const D3D11Chunk types[] = {D3D11Chunk::Draw, D3D11Chunk::OMSetRenderTargets,
+                              D3D11Chunk::DrawIndexed, D3D11Chunk::CopyResource,
+                              D3D11Chunk::Dispatch};
+  for(uint32_t i = 0; i < 5; ++i)
+  {
+    SDChunk *chunk = new SDChunk("forward-interval"_lit);
+    chunk->metadata.chunkID = uint32_t(types[i]);
+    file.chunks.push_back(chunk);
+    events[i + 1].eventId = i + 1;
+    events[i + 1].chunkIndex = i;
+    events[i + 1].fileOffset = 100 + i * 32;
+  }
+  rdcstr reason;
+  CHECK(D3D11LiveForwardInterval(events, file, 1, 3, reason));
+  CHECK(D3D11LiveForwardInterval(events, file, 1, 5, reason));
+  CHECK(D3D11LiveForwardInterval(events, file, 3, 5, reason));
+  CHECK_FALSE(D3D11LiveForwardInterval(events, file, 5, 3, reason));
+  CHECK_FALSE(D3D11LiveForwardInterval(events, file, 3, 3, reason));
+  CHECK_FALSE(D3D11LiveForwardInterval(events, file, 0, 3, reason));
+  CHECK_FALSE(D3D11LiveForwardInterval(events, file, 1, 6, reason));
+  CHECK_FALSE(D3D11LiveForwardInterval(events, file, 1, 2, reason));
+  CHECK_FALSE(D3D11LiveForwardInterval(events, file, 2, 5, reason));
+
+  for(D3D11Chunk type : {D3D11Chunk::Map, D3D11Chunk::Unmap, D3D11Chunk::Begin,
+                         D3D11Chunk::End, D3D11Chunk::ExecuteCommandList,
+                         D3D11Chunk::DrawInstancedIndirect, D3D11Chunk::DispatchIndirect,
+                         D3D11Chunk::SetPredication, D3D11Chunk::CreateBuffer,
+                         D3D11Chunk(0xffffffffU)})
+  {
+    file.chunks[3]->metadata.chunkID = uint32_t(type);
+    CHECK_FALSE(D3D11LiveForwardInterval(events, file, 1, 5, reason));
+  }
+  file.chunks[3]->metadata.chunkID = uint32_t(D3D11Chunk::CopyResource);
+  events[4].eventId = 0;
+  CHECK_FALSE(D3D11LiveForwardInterval(events, file, 1, 5, reason));
+  events[4].eventId = 4;
+  events[4].fileOffset = events[3].fileOffset;
+  CHECK_FALSE(D3D11LiveForwardInterval(events, file, 1, 5, reason));
+  events[4].fileOffset = 196;
+  events[4].chunkIndex = 2;
+  CHECK_FALSE(D3D11LiveForwardInterval(events, file, 1, 5, reason));
+  events[4].chunkIndex = 3;
+
+  // Annotations are physical chunks but have no event ID; every executable chunk still maps
+  // exactly once. Omitting an executable chunk from the event table must fail closed.
+  SDChunk *annotation = new SDChunk("annotation"_lit);
+  annotation->metadata.chunkID = uint32_t(D3D11Chunk::SetCommandAnnotation);
+  file.chunks.insert(1, annotation);
+  for(uint32_t eid = 2; eid <= 5; ++eid)
+    ++events[eid].chunkIndex;
+  CHECK(D3D11LiveForwardInterval(events, file, 1, 5, reason));
+  annotation->metadata.chunkID = uint32_t(D3D11Chunk::CopyResource);
+  CHECK_FALSE(D3D11LiveForwardInterval(events, file, 1, 5, reason));
+}
+
+TEST_CASE("D3D11 live forward publishes only the matching successful ordinary target",
+          "[d3d11][replay][live-forward]")
+{
+  CHECK(D3D11LiveForwardCanPublish(75, 75, 34, 34, true, true));
+  CHECK_FALSE(D3D11LiveForwardCanPublish(75, 75, 35, 34, true, true));
+  CHECK_FALSE(D3D11LiveForwardCanPublish(76, 75, 34, 34, true, true));
+  CHECK_FALSE(D3D11LiveForwardCanPublish(75, 0, 34, 34, true, true));
+  CHECK_FALSE(D3D11LiveForwardCanPublish(0, 0, 34, 34, true, true));
+  CHECK_FALSE(D3D11LiveForwardCanPublish(75, 75, 34, 34, false, true));
+  CHECK_FALSE(D3D11LiveForwardCanPublish(75, 75, 34, 34, true, false));
+  CHECK(D3D11LiveForwardCaptureChunkSafe(D3D11Chunk::Draw));
+  CHECK(D3D11LiveForwardCaptureChunkSafe(D3D11Chunk::UpdateSubresource));
+  for(D3D11Chunk chunk : {D3D11Chunk::Begin, D3D11Chunk::End,
+                          D3D11Chunk::CreateQuery, D3D11Chunk::CreatePredicate,
+                          D3D11Chunk::SOSetTargets, D3D11Chunk::DrawAuto,
+                          D3D11Chunk::SetShaderExtUAV, D3D11Chunk::SwapDeviceContextState,
+                          D3D11Chunk::ExecuteCommandList})
+    CHECK_FALSE(D3D11LiveForwardCaptureChunkSafe(chunk));
+}
 
 TEST_CASE("D3D11 checkpoint versions include CPU writes and use AFTER-event boundaries",
           "[d3d11][checkpoint]")

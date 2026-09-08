@@ -657,6 +657,7 @@ bool WrappedID3D12CommandQueue::Serialise_ExecuteCommandLists(SerialiserType &se
 
         // only primary command lists can be submitted
         m_Cmd.m_Partial[D3D12CommandData::Primary].cmdListExecs[cmd].push_back(m_Cmd.m_RootEventID);
+        m_Cmd.m_ReplaySubmissionQueues[m_Cmd.m_RootEventID] = GetResID(pQueue);
 
         // pull in any remaining events on the command buffer that weren't added to an action
         for(size_t e = 0; e < cmdListInfo.curEvents.size(); e++)
@@ -744,6 +745,7 @@ bool WrappedID3D12CommandQueue::Serialise_ExecuteCommandLists(SerialiserType &se
         uint32_t eid = startEID;
 
         rdcarray<ID3D12CommandList *> rerecordedCmds;
+        rdcarray<rdcpair<ResourceId, uint32_t>> submittedOccurrences;
 
         for(uint32_t c = 0; c < NumCommandLists; c++)
         {
@@ -768,6 +770,7 @@ bool WrappedID3D12CommandQueue::Serialise_ExecuteCommandLists(SerialiserType &se
                      ToStr(cmdId).c_str(), ToStr(rerecord).c_str(), eid, end, m_Cmd.m_LastEventID);
 #endif
             rerecordedCmds.push_back(Unwrap(cmd));
+            submittedOccurrences.push_back({cmdId, eid});
 
             // Use this submission's base: an earlier complete occurrence of the same baked list
             // must retain its full writes even when the selected occurrence is partial. Resolve
@@ -804,6 +807,9 @@ bool WrappedID3D12CommandQueue::Serialise_ExecuteCommandLists(SerialiserType &se
         {
           real->ExecuteCommandLists((UINT)rerecordedCmds.size(), &rerecordedCmds[0]);
         }
+        for(const auto &occurrence : submittedOccurrences)
+          m_Cmd.MarkReplaySubmittedOverwrites(occurrence.first, occurrence.second,
+                                             m_Cmd.m_LastEventID);
       }
     }
   }

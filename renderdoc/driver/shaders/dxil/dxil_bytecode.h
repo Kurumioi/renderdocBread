@@ -1613,6 +1613,14 @@ struct EntryPointInterface
   rdcarray<ResourceBase> samplers;
 };
 
+// A complete, finite binding declared by an original executable. This is independent of
+// debugger resource-use discovery and never represents a selected dynamic array element.
+struct ReplayRootBinding
+{
+  ResourceClass resourceClass = ResourceClass::Invalid;
+  uint32_t space = 0, first = 0, count = 0;
+};
+
 struct ResourceReference
 {
   ResourceReference(const rdcstr &handleStr, const EntryPointInterface::ResourceBase &resBase,
@@ -1697,6 +1705,9 @@ public:
 
   const Metadata *GetMetadataByName(const rdcstr &name) const;
   uint32_t GetDirectHeapAcessCount() const { return m_directHeapAccessCount; }
+  // SM6.6 only. NULL means every resource handle has a proven finite root-binding origin.
+  // Otherwise returns a static diagnostic and leaves bindings empty. Does not mutate the IR.
+  const char *GetReplayFiniteRootBindings(rdcarray<ReplayRootBinding> &bindings) const;
 
   static char GetDXILIdentifier(const bool dxcStyle) { return dxcStyle ? '%' : '_'; }
 protected:
@@ -1770,6 +1781,9 @@ protected:
   rdcarray<rdcstr> m_Sections;
   rdcarray<rdcpair<uint64_t, rdcstr>> m_Comdats;
   uint32_t m_directHeapAccessCount = 0;
+  // Replay's finite binding proof must not treat a skipped/unknown parser record as absence
+  // of resource access. This veto does not change the normal parser or debugger behaviour.
+  bool m_ReplayParseComplete = true;
 
   rdcarray<rdcstr> m_Kinds;
 

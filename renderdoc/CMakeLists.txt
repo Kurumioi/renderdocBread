@@ -196,6 +196,8 @@ set(sources
     replay/entry_points.cpp
     replay/replay_driver.cpp
     replay/replay_driver.h
+    replay/replay_resource_versions.cpp
+    replay/replay_resource_versions.h
     replay/replay_output.cpp
     replay/replay_controller.cpp
     replay/replay_controller.h

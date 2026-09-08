@@ -320,6 +320,22 @@ struct BakedCmdListInfo
     D3D12_RESOURCE_STATES stateAfter = D3D12_RESOURCE_STATE_COMMON;
   };
   rdcarray<CheckpointBarrierOp> checkpointBarriers;
+  // Content-only proof: unsafe flags/types may not enter checkpointBarriers (e.g. an unknown
+  // barrier type or a filtered NULL transition). Keep their event identity without reading the
+  // native barrier union. This does not change checkpoint or continuation eligibility.
+  rdcarray<uint32_t> replayClearUnsafeBarriers;
+  static bool IsReplayClearBarrierReadFree(D3D12_RESOURCE_BARRIER_TYPE type,
+                                          D3D12_RESOURCE_BARRIER_FLAGS flags);
+  struct ReplayClearOp
+  {
+    ResourceId resource;
+    uint32_t relativeEvent = 0;
+    bool unconditional = false;
+    bool fullResource = false;
+  };
+  // Exact consumed RTV/DSV coverage from loading, independent of coarse EventUsage::Clear.
+  // A partial or predicated clear stays in the index so it cannot masquerade as read-free work.
+  rdcarray<ReplayClearOp> replayClearOps;
   struct CheckpointRecordingChunk
   {
     ResourceId baked;
@@ -356,6 +372,19 @@ struct BakedCmdListInfo
       return count < other.count;
     }
   };
+  struct ReplayTextureReadOp
+  {
+    uint32_t relativeEvent = 0;
+    bool unknown = false;
+    // RTV/DSV blending/depth tests and the shading-rate image can read independent textures.
+    rdcarray<ResourceId> directResources;
+    // Entire declared SRV/UAV table ranges. Descriptor history, not final heap contents or shader
+    // reflection, proves whether a candidate texture could have been referenced at execution.
+    rdcarray<ReplayUAVRange> descriptorRanges;
+  };
+  rdcarray<ReplayTextureReadOp> replayTextureReadOps;
+  uint32_t replayTextureReadEntries = 0;
+  bool replayTextureReadsComplete = true;
   // Loading records potential writes, never actual dirtiness. Shader-visible descriptors are
   // retained as locations and resolved against the live heap only when a list is submitted.
   std::set<ResourceId> replayWrites;
@@ -367,6 +396,12 @@ struct BakedCmdListInfo
   std::map<ResourceId, uint32_t> replayWriteFirstEvents;
   std::map<ResourceId, uint32_t> replayRootUAVFirstEvents;
   std::map<ReplayUAVRange, uint32_t> replayUAVFirstEvents;
+  // Optional executable-declaration upper bound. Keep the original root-signature union above
+  // intact: loading declarations cannot describe a later replacement shader.
+  std::set<ReplayUAVRange> replayDeclaredUAVRanges;
+  std::map<ReplayUAVRange, uint32_t> replayDeclaredUAVFirstEvents;
+  uint64_t replayUAVSlotsBefore = 0, replayUAVSlotsAfter = 0;
+  uint32_t replayUAVDeclarationHits = 0, replayUAVDeclarationFallbacks = 0;
   uint32_t replayFirstUnknownWriteEvent = ~0U;
   bool replayWriteEventsKnown = false;
   bool replayWritesKnown = false;
@@ -475,6 +510,12 @@ struct D3D12CommandData
     // if a render pass is active when we early-close a list, we need to end it
     bool renderPassActive;
   } m_Partial[ePartialNum];
+
+  // Loading-time identity of each actual primary submission occurrence. Queue creation alone
+  // does not imply concurrent work in a particular checkpoint continuation.
+  std::map<uint32_t, ResourceId> m_ReplaySubmissionQueues;
+
+  void MarkReplaySubmittedOverwrites(ResourceId baked, uint32_t baseEvent, uint32_t lastEvent);
 
   // if we're replaying just a single action or a particular command
   // list subsection of command events, we don't go through the
@@ -614,8 +655,32 @@ struct D3D12CommandData
                                 uint32_t targetEvent, rdcstr &reason) const;
   bool HasResolvedLiveForwardState() const;
   uint32_t GetBufferPatchFirstConsumer(ResourceId buffer) const;
+  // Content proof only: full clear before the first possible resource read in executed EID
+  // order. throughEvent is the actual WithoutDraw end, not its following OnlyDraw target.
+  // The caller supplies only independent committed textures, after rejecting buffers,
+  // alias/sparse storage, edits and resource replacements. No other resource can be returned.
+  // Pure alias barriers cannot expose their old bytes; split/unknown barriers still stop proof.
+  // Root GPU addresses are buffer-only.
+  std::set<ResourceId> GetReplayFullClearPrefix(uint32_t checkpointEvent,
+                                               uint32_t throughEvent,
+                                               const std::set<ResourceId> &eligibleTextures) const;
   void ObserveReplayWriteBindings(BakedCmdListInfo &info, const D3D12RenderState &state,
-                                  uint32_t relativeEvent);
+                                  uint32_t relativeEvent, bool graphics = true,
+                                  bool compute = true, bool declarationBindingsKnown = true);
+  struct ReplayShaderUAVBinding
+  {
+    ShaderStage stage = ShaderStage::Count;
+    uint32_t space = 0, first = 0, count = 0;
+  };
+  struct ReplayPSOUAVProof
+  {
+    bool complete = false, graphics = false;
+    const char *reason = "unvalidated";
+    rdcarray<ReplayShaderUAVBinding> bindings;
+  };
+  const ReplayPSOUAVProof &GetReplayPSOUAVProof(ResourceId pipeline);
+  std::map<ResourceId, ReplayPSOUAVProof> m_ReplayPSOUAVProofs;
+  std::map<rdcpair<ResourceId, ShaderStage>, ReplayPSOUAVProof> m_ReplayShaderUAVProofs;
   void BuildReplayWriteTracking();
   void MarkReplaySubmittedWrites(ResourceId baked, uint32_t baseEvent = ~0U,
                                   uint32_t lastEvent = ~0U);

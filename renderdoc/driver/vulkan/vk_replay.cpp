@@ -230,13 +230,23 @@ RDResult VulkanReplay::ReadLogInitialisation(RDCFile *rdc, bool storeStructuredB
 
 void VulkanReplay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
 {
+  const bool ordinaryRoot = replayType == eReplay_WithoutDraw && !m_ReplayCheckpointBypass &&
+                            !m_ReplayCheckpointNaturalReference && !m_pDriver->m_ActionCallback;
+  // The controller bypasses checkpoints around an ordinary OnlyDraw too. The pending root
+  // identity, not that bypass flag, distinguishes it from an unrelated target-only operation.
+  const bool ordinaryTarget = replayType == eReplay_OnlyDraw && !m_pDriver->m_ActionCallback;
   if(replayType == eReplay_OnlyDraw)
   {
     bool replayed = FetchShaderFeedback(endEventID);
     if(replayed)
+    {
+      // Instrumented replay does not establish a normal command cursor. A later visit can use
+      // the cached feedback and publish after the original OnlyDraw completes.
+      m_pDriver->InvalidateLiveForward("shaderFeedbackTarget");
       return;
+    }
   }
-  m_pDriver->ReplayLog(0, endEventID, replayType, true);
+  m_pDriver->ReplayLog(0, endEventID, replayType, true, ordinaryRoot, ordinaryTarget);
 }
 
 rdcstr VulkanReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
