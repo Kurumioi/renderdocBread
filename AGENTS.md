@@ -1,5 +1,7 @@
 # RenderDoc Ultra development rules
 
+> **EID isolation worktree:** Read [`WORKTREE_ISOLATION.md`](./WORKTREE_ISOLATION.md) before building, deploying, or running this checkout. All mutations and build output for this branch must remain in this worktree; the original checkout is a separate active development workspace.
+
 > **Read BOTH this file and [`CLAUDE.md`](./CLAUDE.md) before making changes — together they are one unified rule set.** OpenAI Codex and other agents read `AGENTS.md`; Claude Code reads `CLAUDE.md`; each points at the other so neither agent misses a rule. They are complementary, not duplicates: **`AGENTS.md`** (this file) is canonical for the UI/ReplayLab **localization (i18n) rules** below; **`CLAUDE.md`** is canonical for project structure, the build/release pipeline, upstream sync, and pitfalls. If a rule's home is the other file, follow it there and keep the two in sync.
 
 ## Tooling
