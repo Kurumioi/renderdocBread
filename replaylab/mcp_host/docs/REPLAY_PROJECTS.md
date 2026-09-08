@@ -41,6 +41,78 @@ not wait for an unrelated full-file hash. Older version-2 content identities
 remain readable but are no longer used for project association. Zero or
 multiple path matches leave the current project alone.
 
+### Automatic restore acceleration
+
+Automatic restore runs on the Host worker and its progress window is non-modal.
+An RDC that already has an exact `project-reuse-index` association validates
+only the Shader resources named by that association; it does not build the
+whole unique-resource inventory first. The bounded verifier re-reads those
+target ResourceIds in the current capture session and checks raw bytes, the
+seven-field stable key, reflection/layout/ABI and CBuffer block hashes before
+alias restoration or Shader apply. An unchanged association is not written
+back to the RDC again. Only a version-3 association with a complete desired
+head and complete realized-receipt coverage can enter this exact path. Valid
+version-1/version-2 associations are migrated as incomplete routing hints and
+fall back to the inventory path until a successful restore refreshes them.
+
+When the association is missing or stale, the first complete unique-resource
+scan publishes a disposable project-side cache at
+`derived/shader-resource-inventories/<capture-path-sha256>.json`. The sidecar is
+bound to the project scope, normalized RDC path, file observation, inventory
+algorithm and matching policy; it uses canonical JSON, a content seal, bounded
+size and atomic replacement. A later open uses it only to select the small set
+of resources that can match the project's per-identity `activeHeads` index,
+then runs the same fresh target-session verifier and re-plans from the verified
+subset. The legacy `activeKnowledge` serial remains audit/order metadata.
+Publishing newer reviewed HLSL therefore takes effect lazily for the same or
+another already inventoried RDC without batch-rewriting historical
+RDCs. When an older RDC is opened and restored successfully, it refreshes its
+own association to the current head.
+
+The sidecar never stores replay handles, replacement IDs, session authority or
+raw bytecode, and cached ResourceIds/EIDs never cross capture boundaries. A
+missing, stale, malformed, over-budget or mismatching cache falls back to a
+fresh complete inventory. Replay work intentionally remains one bounded job:
+multiple restoration threads would still serialize through RenderDoc's replay
+controller and would add state contention without reducing GPU replay time.
+
+Project knowledge is the one-way authority for automatic restore. Portable
+Shader, CBuffer-layout, alias and material records are append-only and selected
+through a per-identity active head. Each head has a monotonic generation and a
+content hash; project publication uses compare-and-swap against the generation
+that the editor or restore transaction originally read. Re-observing the
+already-current artifact is genuinely idempotent and does not advance the head.
+An older RDC can therefore contribute a new, hash-bound observation, but it
+cannot reactivate historical HLSL, aliases or material data over a newer head.
+An intentional revert is a separate explicit publication against the current
+head generation.
+
+The RDC association separates the desired project head from a realized-apply
+snapshot. Its semantic head hashes the exact referenced knowledge IDs,
+content-addressed artifact references, and Shader/material head projections
+used by that capture. The legacy project-wide `activeKnowledgeRevision` is
+outer-sealed audit metadata and is deliberately excluded from the semantic
+`headSha256`, so an unrelated publication cannot invalidate this RDC. A
+realized receipt records which desired artifact was successfully validated and
+either applied or adopted from an exact live replacement in the same capture
+session. It is routing evidence only: it never contains reusable capture
+session, replacement, operation or rollback authority. A new ReplayController
+must always create a fresh replacement after the bounded identity/ABI check;
+within the same capture session, an exact live replacement can instead be
+adopted without another mutation. In both cases the fast path avoids global
+matching and compilation.
+
+Timestamps such as `registeredAt`, `observedAt` and `appliedAt` are audit and UI
+metadata only. They never select a head, invalidate an otherwise identical
+binding or decide whether an RDC may update the project. This avoids clock skew,
+copied capture timestamps and backup restores turning stale data into authority.
+
+CBuffer persistence is deliberately split. Stable block layout and verified
+display aliases are keyed by Shader identity plus block path/layout/ABI hashes.
+Event-scoped numeric values remain explicit material-session data and require a
+fresh EID, binding, type and layout validation; opening an RDC never applies old
+numeric bytes merely because a layout identifier matches.
+
 The machine-local sealed project registry stores portable roots outside the
 default projects home. Its first load migrates existing valid default projects
 once; after that, it is authoritative, so forgetting a record does not make the
@@ -64,8 +136,12 @@ same selection lock and preserve snapshot semantics.
 - Raw matches use physically read shader bytes. A code-hash match is accepted
   only when stage, entry point, complete interface hash and CBuffer layout hash
   also match.
-- Old workspace manifests, compiled candidates, ABI reports, replay handles,
-  replacement IDs, material snapshots and capture-session IDs are never reused.
+- Old workspace manifests, ABI reports, replay handles, replacement IDs,
+  material sessions and capture-session IDs are never reused as authority. A
+  content-addressed compiled candidate may skip recompilation only when its
+  source, compiler binding, target profile and bytes still match the active
+  project head; the target capture/session is then freshly rebound and its
+  replay ABI is validated before apply.
 - Seeding writes only `source/shader.hlsl` in a freshly validated, unedited
   destination workspace. It does not compile or apply anything. Normal compile,
   fresh replay reflection/ABI validation and live capture checks remain required.
@@ -88,10 +164,16 @@ same selection lock and preserve snapshot semantics.
 2. Export the current frame's strict shader catalog with
    `export_capture_symbol_catalog`, then call
    `import_replay_project_capture(project_path, catalog_path)`.
-3. After decompiling/editing a validated workspace, call
-   `register_replay_project_workspace`. If available, register a verified alias
-   export with `register_replay_project_alias_table`. Save only explicitly
-   selected live parameters with `save_replay_project_material_knowledge`.
+3. For executable HLSL, complete and accept the transactional organisation
+   review, compile the promoted source, and freshly validate that current
+   candidate against the replay ABI. Only then call
+   `register_replay_project_workspace`. Registration rechecks the HMAC-sealed
+   organisation gate, current source/revision/candidate hashes, and exact ABI
+   request/report before publishing the HLSL and compiled artifact into the
+   project library; source-only, provisional, stale, or explanation-only
+   workspaces fail closed. If available, register a verified alias export with
+   `register_replay_project_alias_table`. Save only explicitly selected live
+   parameters with `save_replay_project_material_knowledge`.
 4. For another frame of the same build, export/import its catalog. Import returns
    the same result as `get_replay_project_reuse_plan`: matches grouped per live
    shader, with their exact match mode and remaining validation requirements.

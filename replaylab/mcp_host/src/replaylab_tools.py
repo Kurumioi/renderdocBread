@@ -8,6 +8,7 @@ The resulting files remain hash-pinned by ``toolchain_config``.
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -112,6 +113,17 @@ def discover(executable_dir: Path, environment: Mapping[str, str]) -> dict[str, 
     # the exact side-by-side dependency can also be pinned by the generator.
     if renodx_decompiler is None or renodx_dxcompiler is None:
         renodx_decompiler = None
+    dxil_spirv = _regular(tools / "dxil-spirv.exe")
+    dxil_spirv_dependency = _regular(tools / "dxil-spirv-c-shared.dll")
+    # The current upstream Windows CMake build links the CLI against this
+    # side-by-side shared library. Do not register a provider that will die at
+    # process start with STATUS_DLL_NOT_FOUND. A deliberately static custom
+    # build can still be supplied through an explicit process-owner registry.
+    if os.name == "nt" and (
+        dxil_spirv is None or dxil_spirv_dependency is None
+    ):
+        dxil_spirv = None
+        dxil_spirv_dependency = None
     return {
         "dxc": _discover_direct(executable_dir, environment, "dxc.exe", "dxc"),
         "fxc": _discover_direct(executable_dir, environment, "fxc.exe", "fxc"),
@@ -119,13 +131,19 @@ def discover(executable_dir: Path, environment: Mapping[str, str]) -> dict[str, 
         # The in-process compiler is trusted only when explicitly packaged.
         "d3dcompiler": _regular(tools / "d3dcompiler_47.dll"),
         "spirv_cross": _regular(tools / "spirv-cross.exe"),
-        "glslang": _regular(tools / "glslangValidator.exe"),
+        # Khronos renamed the standalone executable to glslang in 12.3.0.
+        # Accept both fixed bundled names; never search PATH for either.
+        "glslang": (
+            _regular(tools / "glslangValidator.exe")
+            or _regular(tools / "glslang.exe")
+        ),
         "spirv_dis": _regular(tools / "spirv-dis.exe"),
         "spirv_as": _regular(tools / "spirv-as.exe"),
         "spirv_val": _regular(tools / "spirv-val.exe"),
         "hlsl_decompiler": community_executable,
         "hlsl_decompiler_dependency": community_dependency,
-        "dxil_spirv": _regular(tools / "dxil-spirv.exe"),
+        "dxil_spirv": dxil_spirv,
+        "dxil_spirv_dependency": dxil_spirv_dependency,
         "renodx_decompiler": renodx_decompiler,
     }
 
@@ -256,28 +274,44 @@ def _commit_managed_generation(
         raise
 
 
-def _generation_kwargs(found: Mapping[str, Path | None]) -> dict[str, Any]:
+def _generation_kwargs(
+    found: Mapping[str, Path | None], adapter_host: Path | None = None
+) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         key: value
         for key, value in found.items()
-        if key != "hlsl_decompiler_dependency"
+        if key not in {"hlsl_decompiler_dependency", "dxil_spirv_dependency"}
     }
     dependency = found.get("hlsl_decompiler_dependency")
     if found.get("hlsl_decompiler") is not None and dependency is not None:
         kwargs["extra_fixed_files"] = {"hlsl-decompiler": [dependency]}
-    # A packaged host dispatches the fixed adapters internally. A normal
-    # Python install uses the separately hash-pinned adapter scripts.
-    kwargs["adapter_host"] = Path(sys.executable) if getattr(sys, "frozen", False) else None
+    dxil_spirv_dependency = found.get("dxil_spirv_dependency")
+    if found.get("dxil_spirv") is not None and dxil_spirv_dependency is not None:
+        kwargs.setdefault("extra_fixed_files", {})["dxil-spirv"] = [
+            dxil_spirv_dependency
+        ]
+    # All entry points use the independently built shader runner. Neither the
+    # calling Host executable nor unrelated Host code is compiler identity.
+    kwargs["adapter_host"] = adapter_host
     # Vulkan environment is deliberately explicit. Bundled SPIR-V tools
     # default to Vulkan 1.2 for this distribution, never from capture data.
     kwargs["spirv_target_env"] = "vulkan1.2" if (
         found["glslang"] or found["spirv_val"]
     ) else None
+    # OpenGL and Vulkan SPIR-V share the same physical word stream, but they
+    # are different capture-derived semantic environments. Enable the
+    # separately-labelled OpenGL routes whenever a fixed SPIR-V provider is
+    # present; individual routes are still emitted only for the exact tools
+    # that were discovered and hash-pinned.
+    kwargs["enable_opengl_spirv"] = any(
+        found.get(name) is not None
+        for name in ("spirv_cross", "glslang", "spirv_dis", "spirv_as", "spirv_val")
+    )
     return kwargs
 
 
 def _stage_generation(
-    config: Path, found: Mapping[str, Path | None]
+    config: Path, found: Mapping[str, Path | None], adapter_host: Path | None = None
 ) -> tuple[bytes, bytes, dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix=".shader-config-stage-", dir=str(config)) as raw:
         staging = Path(raw)
@@ -287,7 +321,7 @@ def _stage_generation(
             staged_tool,
             staged_route,
             overwrite=False,
-            **_generation_kwargs(found),
+            **_generation_kwargs(found, adapter_host),
         )
         return staged_tool.read_bytes(), staged_route.read_bytes(), generated
 
@@ -480,6 +514,81 @@ def _managed_configs_relocation_evidence(
     return result
 
 
+def _automatic_config_directory(
+    root: Path, executable_dir: Path, adapter_host: Path | None
+) -> Path:
+    """Keep automatic discovery local to its installation and adapter owner.
+
+    The old shared default pair may be a hand-maintained user configuration.
+    Preserve that choice unless the exact dual-hash ownership record proves
+    that ReplayLab generated both files. Proven legacy managed files are left
+    untouched for existing consumers, while new discovery uses its own scope.
+    """
+
+    legacy_tools = root / "shader-tools.v1.json"
+    legacy_routes = root / "shader-toolchains.v1.json"
+    if any(path.exists() or path.is_symlink() for path in (legacy_tools, legacy_routes)):
+        evidence = _managed_config_evidence(
+            root / "shader-toolchain-status.json", legacy_tools, legacy_routes
+        )
+        if not evidence["managed"]:
+            return root
+    owner = (
+        ["bundle"]
+        if adapter_host is not None
+        else [
+            "source",
+            os.path.normcase(str(Path(sys.executable).resolve())),
+            os.path.normcase(str(Path(__file__).resolve().parent)),
+        ]
+    )
+    identity = [os.path.normcase(str(executable_dir)), *owner]
+    key = hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return root / "shader-toolchains" / key
+
+
+@contextmanager
+def _configuration_lock(config: Path):
+    """Serialize startup ownership checks and dual-file commits per scope."""
+
+    lock_path = config / ".shader-toolchain-config.lock"
+    if lock_path.is_symlink():
+        raise RuntimeError("Shader configuration lock must not be a symlink")
+    with lock_path.open("a+b") as stream:
+        # Windows byte-range locks require one byte, even in a new lock file.
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+        deadline = time.monotonic() + 60.0
+        while True:
+            stream.seek(0)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Timed out waiting for shader configuration startup lock")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def configure_environment(
     executable_dir: Path | None = None,
     environment: dict[str, str] | None = None,
@@ -504,8 +613,31 @@ def configure_environment(
         if executable_dir is not None
         else Path(sys.executable).resolve().parent
     )
-    config = _config_root(env)
+    # A source diagnostic explicitly targeting a packaged installation also
+    # uses that installation's fixed adapter. Frozen entry points must never
+    # silently fall back to another executable or to temporary Python files.
+    adapter_host = _regular(base / "ReplayLabShaderTools.exe")
+    if adapter_host is None and (
+        getattr(sys, "frozen", False) or _regular(base / "ReplayLabMCP.exe") is not None
+    ):
+        raise RuntimeError(
+            "The packaged shader runner is missing: %s; deploy the complete runtime before using shader tools"
+            % (base / "ReplayLabShaderTools.exe")
+        )
+    config = _automatic_config_directory(_config_root(env), base, adapter_host)
+    # Keep capture-only startup usable if discovery fails, but make later
+    # shader operations resolve this intended scope instead of silently using
+    # a different installation's legacy global pair after a lock/write error.
+    env[TOOLS_ENV] = str(config / "shader-tools.v1.json")
+    env[ROUTES_ENV] = str(config / "shader-toolchains.v1.json")
     config.mkdir(parents=True, exist_ok=True)
+    with _configuration_lock(config):
+        return _configure_automatic_environment(base, config, adapter_host, env)
+
+
+def _configure_automatic_environment(
+    base: Path, config: Path, adapter_host: Path | None, env: dict[str, str]
+) -> dict[str, Any]:
     tool_path = config / "shader-tools.v1.json"
     route_path = config / "shader-toolchains.v1.json"
     status_path = config / "shader-toolchain-status.json"
@@ -517,6 +649,7 @@ def configure_environment(
         "schema": DISCOVERY_SCHEMA,
         "generatedUnixMs": int(time.time() * 1000),
         "executableDirectory": str(base),
+        "adapterHost": str(adapter_host) if adapter_host is not None else None,
         "toolConfigPath": str(tool_path),
         "routeConfigPath": str(route_path),
         "tools": {key: (str(value) if value else None) for key, value in found.items()},
@@ -529,7 +662,8 @@ def configure_environment(
             "Community/SPIR-V tools are enabled only when bundled under ReplayLab/tools or supplied through an explicit process-owner registry.",
             "The GPL community HLSL decompiler is enabled only when its compliant distribution is present under tools/community-hlsl-decompiler.",
             "The community RenoDX Shader Model 6 decompiler is enabled only for the fixed ReplayLab/tools/decomp.exe path with a side-by-side dxcompiler.dll; both files are SHA-256 pinned and no executable is obtained from PATH or an asset tree.",
-            "Launching a byte-identical copy from another installation path preserves the existing managed catalog while every previously pinned file remains integrity-valid; missing bytes or any command/capability change uses the normal fail-closed refresh and explicit workspace migration path.",
+            "Automatic registries are isolated by installation directory and adapter owner; bundled entry points use the independently built ReplayLabShaderTools.exe. Host-only upgrades do not change shader tool identity. Explicit or user-modified default configurations are preserved.",
+            "Within one installation, path-only provider relocation preserves the existing managed catalog while every pinned file remains integrity-valid; missing bytes or changed selected commands/capabilities require explicit workspace migration.",
         ],
     }
     tool_present = tool_path.exists() or tool_path.is_symlink()
@@ -558,7 +692,7 @@ def configure_environment(
             )
             atomic_write_json(status_path, report)
         else:
-            staged_tool, staged_route, generated = _stage_generation(config, found)
+            staged_tool, staged_route, generated = _stage_generation(config, found, adapter_host)
             staged_tool_hash = hashlib.sha256(staged_tool).hexdigest()
             staged_route_hash = hashlib.sha256(staged_route).hexdigest()
             current = evidence["record"]
@@ -622,7 +756,7 @@ def configure_environment(
         report["error"] = "Only one ReplayLab shader config exists; refusing to overwrite it"
         atomic_write_json(status_path, report)
     elif any(found.values()):
-        staged_tool, staged_route, generated = _stage_generation(config, found)
+        staged_tool, staged_route, generated = _stage_generation(config, found, adapter_host)
         report.update(generated)
         report["binaryPathsWereDiscovered"] = any(found.values())
         report["toolConfigPath"] = str(tool_path)

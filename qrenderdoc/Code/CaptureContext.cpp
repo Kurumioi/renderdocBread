@@ -26,6 +26,7 @@
 #include <QApplication>
 #include <QCoreApplication>
 #include <QDir>
+#include <QFile>
 #include <QDirIterator>
 #include <QElapsedTimer>
 #include <QEvent>
@@ -39,17 +40,21 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QTimer>
+#include <memory>
 #include "Code/Resources.h"
 #include "Code/ReplayLab/ReplayLabIntegration.h"
+#include "Code/CodeEditorService.h"
 #include "Code/pyrenderdoc/PythonContext.h"
 #include "Widgets/AnnotationDisplay.h"
 #include "Windows/APIInspector.h"
 #include "Windows/AI/AIAssistant.h"
 #include "Windows/ApiMonitorWindow.h"
 #include "Windows/BufferViewer.h"
+#include "Windows/BookmarksView.h"
 #include "Windows/CommentView.h"
 #include "Windows/DebugMessageView.h"
 #include "Windows/DescriptorViewer.h"
+#include "Widgets/ShaderCodeEditor.h"
 #include "Windows/Dialogs/CaptureDialog.h"
 #include "Windows/Dialogs/CrashDialog.h"
 #include "Windows/Dialogs/LiveCapture.h"
@@ -74,21 +79,40 @@
 
 #include "pipestate.inl"
 
-namespace
+CaptureContext::PublishedPipelineState::PublishedPipelineState(IReplayController *controller)
 {
-// i18n-ignore: retired Python extension package identifier, never shown as UI text
-const char LegacyReplayLabExtensionPackage[] = "replaylab_bridge";
-const char RetiredRenderDocMCPBridgeBackupPrefix[] =
-    "renderdoc_mcp_bridge.disabled-by-replaylab-";
-const char RetiredRenderDocMCPBackupPrefix[] = "renderdoc_mcp.disabled-by-replaylab-";
+  // Read and copy only on the replay thread, after SavePipelineState has finished. The driver is
+  // free to rebuild its arrays and bindings during the next replay without changing this value.
+  if(const D3D11Pipe::State *state = controller->GetD3D11PipelineState())
+    d3d11.reset(new D3D11Pipe::State(*state));
+  if(const D3D12Pipe::State *state = controller->GetD3D12PipelineState())
+    d3d12.reset(new D3D12Pipe::State(*state));
+  if(const GLPipe::State *state = controller->GetGLPipelineState())
+    gl.reset(new GLPipe::State(*state));
+  if(const VKPipe::State *state = controller->GetVulkanPipelineState())
+    vulkan.reset(new VKPipe::State(*state));
 
-bool IsLegacyReplayLabExtensionPackage(const QString &package)
-{
-  const QString legacyRoot = QLatin1String(LegacyReplayLabExtensionPackage);
-  return package == legacyRoot || package.startsWith(legacyRoot + QLatin1Char('.')) ||
-         package.startsWith(QLatin1String(RetiredRenderDocMCPBridgeBackupPrefix)) ||
-         package.startsWith(QLatin1String(RetiredRenderDocMCPBackupPrefix));
+  pipeline.CopyStateAndRebind(controller->GetPipelineState(), d3d11.get(), d3d12.get(), gl.get(),
+                              vulkan.get());
 }
+
+void CaptureContext::PublishPipelineState(std::shared_ptr<const PublishedPipelineState> state)
+{
+  // Publishing is a GUI operation. The EID and these pointers are updated in the same callback,
+  // so all viewers continue to see the previous completed event while the next replay is running.
+  m_PublishedPipelineState = std::move(state);
+  m_CurD3D11PipelineState = m_PublishedPipelineState ? m_PublishedPipelineState->d3d11.get() : NULL;
+  m_CurD3D12PipelineState = m_PublishedPipelineState ? m_PublishedPipelineState->d3d12.get() : NULL;
+  m_CurGLPipelineState = m_PublishedPipelineState ? m_PublishedPipelineState->gl.get() : NULL;
+  m_CurVulkanPipelineState = m_PublishedPipelineState ? m_PublishedPipelineState->vulkan.get() : NULL;
+  m_CurPipelineState = m_PublishedPipelineState ? &m_PublishedPipelineState->pipeline
+                                              : &m_DummyPipelineState;
+
+  // i18n-ignore: diagnostic QObject property for validating publication boundaries, never shown.
+  m_MainWindow->setProperty("pipelinePublicationSerial",
+                           m_PublishedPipelineState
+                               ? QVariant::fromValue<qulonglong>(++m_PipelinePublicationSerial)
+                               : QVariant());
 }
 
 CaptureContext::CaptureContext(PersistantConfig &cfg) : m_Config(cfg)
@@ -243,21 +267,6 @@ CaptureContext::CaptureContext(PersistantConfig &cfg) : m_Config(cfg)
       dir.mkpath(dir.absolutePath());
   }
 
-  // Retire saved autoload entries for both the old ReplayLab extension and timestamped backup
-  // packages. ReplayLab now has an application-owned lifetime and must never be started through
-  // the optional extension loader.
-  bool removedLegacyReplayLabAutoload = false;
-  for(int32_t i = cfg.AlwaysLoad_Extensions.count() - 1; i >= 0; --i)
-  {
-    if(IsLegacyReplayLabExtensionPackage(QString(cfg.AlwaysLoad_Extensions[i])))
-    {
-      cfg.AlwaysLoad_Extensions.erase(i);
-      removedLegacyReplayLabAutoload = true;
-    }
-  }
-  if(removedLegacyReplayLabAutoload)
-    cfg.Save();
-
   // ReplayLab is a first-party qrenderdoc integration. It is loaded from the fixed application
   // tree before optional user extensions, with no manifest scan, enable flag, or AppData fallback.
   m_ReplayLabIntegration = new ReplayLabIntegration(*this);
@@ -304,6 +313,22 @@ CaptureContext::~CaptureContext()
   // Registered menu/context callbacks retain Python callables. Destroy those
   // wrappers under the GIL before the interpreter is finalised.
   PythonContext::ProcessExtensionWork([this]() {
+    // ShaderCodeEditor callbacks can retain Python workspace controllers. Release the native
+    // editor and those callbacks while the interpreter/GIL are still available. Invalidate the
+    // borrowed QWidget wrappers before the authoritative native cleanup.
+    while(!m_ShaderCodeEditors.isEmpty())
+    {
+      ShaderCodeEditor *editor = m_ShaderCodeEditors.takeLast();
+      if(editor)
+      {
+        editor->ClearCallbacks();
+        PythonContext::InvalidateNativeQtObject(editor);
+        delete editor;
+      }
+    }
+    delete m_ShaderCodeEditorService;
+    m_ShaderCodeEditorService = NULL;
+
     for(QObject *object : m_ReplayLabIntegrationObjects)
       delete object;
     m_ReplayLabIntegrationObjects.clear();
@@ -419,13 +444,6 @@ rdcarray<ExtensionMetadata> CaptureContext::GetInstalledExtensions()
           package.remove(package.size() - 1, 1);
 
         if(package.isEmpty())
-          continue;
-
-        // ReplayLab has a dedicated first-party lifetime and fixed application-owned source path.
-        // Ignore obsolete deployed plugin copies, including ones left in a user's extension
-        // directory by an older build, so they cannot appear in the manager or start a second
-        // bridge instance.
-        if(IsLegacyReplayLabExtensionPackage(package))
           continue;
 
         if(f.exists() && f.open(QIODevice::ReadOnly | QIODevice::Text))
@@ -570,9 +588,6 @@ bool CaptureContext::IsExtensionLoaded(rdcstr name)
 
 rdcstr CaptureContext::LoadExtension(rdcstr name)
 {
-  if(IsLegacyReplayLabExtensionPackage(QString(name)))
-    return tr("ReplayLab is a built-in qrenderdoc integration and cannot be loaded as an extension.");
-
   QString ret;
 
   PythonContext::ProcessExtensionWork([this, &ret, name]() {
@@ -627,7 +642,8 @@ void CaptureContext::RegisterWindowMenu(WindowMenu base, const rdcarray<rdcstr> 
     return;
   }
 
-  QMenu *menu = m_MainWindow->GetBaseMenu(base, submenus[0]);
+  const bool showExtensionIcon = !m_RegisteringFirstPartyIntegration;
+  QMenu *menu = m_MainWindow->GetBaseMenu(base, submenus[0], showExtensionIcon);
 
   if(!menu)
   {
@@ -642,11 +658,11 @@ void CaptureContext::RegisterWindowMenu(WindowMenu base, const rdcarray<rdcstr> 
   {
     rdcarray<rdcstr> items = submenus;
     items.erase(0);
-    AddSortedMenuItem(menu, false, items, slotcallback);
+    AddSortedMenuItem(menu, false, showExtensionIcon, items, slotcallback);
   }
   else
   {
-    AddSortedMenuItem(menu, false, submenus, slotcallback);
+    AddSortedMenuItem(menu, false, showExtensionIcon, submenus, slotcallback);
   }
 }
 
@@ -663,6 +679,7 @@ void CaptureContext::RegisterPanelMenu(PanelMenu base, const rdcarray<rdcstr> &s
   item->panel = base;
   item->submenus = submenus;
   item->callback = callback;
+  item->showExtensionIcon = !m_RegisteringFirstPartyIntegration;
   m_RegisteredMenuItems.push_back(item);
   m_PendingExtensionObjects.push_back(item);
 }
@@ -680,6 +697,7 @@ void CaptureContext::RegisterContextMenu(ContextMenu base, const rdcarray<rdcstr
   item->context = base;
   item->submenus = submenus;
   item->callback = callback;
+  item->showExtensionIcon = !m_RegisteringFirstPartyIntegration;
   m_RegisteredMenuItems.push_back(item);
   m_PendingExtensionObjects.push_back(item);
 }
@@ -707,15 +725,16 @@ void CaptureContext::MenuDisplaying(ContextMenu contextMenu, QMenu *menu,
   {
     if(item->context == contextMenu || item->context == contextMenuAlt)
     {
-      AddSortedMenuItem(menu, true, item->submenus, [this, item, data]() {
-        rdcarray<rdcpair<rdcstr, PyObject *>> args;
+      AddSortedMenuItem(menu, true, item->showExtensionIcon, item->submenus,
+                        [this, item, data]() {
+                          rdcarray<rdcpair<rdcstr, PyObject *>> args;
 
-        PythonContext::ConvertPyArgs(data, args);
+                          PythonContext::ConvertPyArgs(data, args);
 
-        item->callback(this, args);
+                          item->callback(this, args);
 
-        PythonContext::FreePyArgs(args);
-      });
+                          PythonContext::FreePyArgs(args);
+                        });
     }
   }
 }
@@ -727,7 +746,8 @@ void CaptureContext::MenuDisplaying(PanelMenu panelMenu, QMenu *menu, QWidget *e
   {
     if(item->panel == panelMenu)
     {
-      AddSortedMenuItem(menu, false, item->submenus, [this, item, data]() {
+      AddSortedMenuItem(menu, false, item->showExtensionIcon, item->submenus,
+                        [this, item, data]() {
         rdcarray<rdcpair<rdcstr, PyObject *>> args;
 
         PythonContext::ConvertPyArgs(data, args);
@@ -788,7 +808,8 @@ rdcstr CaptureContext::SaveFileName(const rdcstr &caption, const rdcstr &dir, co
   return RDDialog::getSaveFileName(m_MainWindow, caption, dir, filter);
 }
 
-void CaptureContext::AddSortedMenuItem(QMenu *menu, bool rootMenu, const rdcarray<rdcstr> &items,
+void CaptureContext::AddSortedMenuItem(QMenu *menu, bool rootMenu, bool showExtensionIcon,
+                                       const rdcarray<rdcstr> &items,
                                        std::function<void()> callback)
 {
   QAction *beforeAction = NULL;
@@ -879,7 +900,7 @@ void CaptureContext::AddSortedMenuItem(QMenu *menu, bool rootMenu, const rdcarra
     else
       menu->addMenu(submenu);
 
-    if(addIcon)
+    if(addIcon && showExtensionIcon)
       submenu->setIcon(Icons::plugin());
 
     addIcon = false;
@@ -914,7 +935,7 @@ void CaptureContext::AddSortedMenuItem(QMenu *menu, bool rootMenu, const rdcarra
   else
     menu->addAction(action);
 
-  if(addIcon)
+  if(addIcon && showExtensionIcon)
     action->setIcon(Icons::plugin());
 
   m_PendingExtensionObjects.push_back(action);
@@ -979,10 +1000,26 @@ void CaptureContext::LoadCapture(const rdcstr &captureFile, const ReplayOptions 
     m_Watcher = new QFileSystemWatcher({captureFile}, GetMainWindow()->Widget());
 
     QObject::connect(m_Watcher, &QFileSystemWatcher::fileChanged, [this]() {
-      Replay().AsyncInvoke([this](IReplayController *r) {
+      ++m_IdleCheckpointGeneration;
+      const uint32_t selectedEventId = m_SelectedEventID;
+      const uint32_t eventId = m_EventID;
+      const uint64_t epoch = m_ScrubEpoch.load();
+      Replay().AsyncInvoke([this, selectedEventId, eventId, epoch](IReplayController *r) {
+        if(epoch != m_ScrubEpoch.load())
+          return;
         r->FileChanged();
-        r->SetFrameEvent(m_EventID, true);
-        GUIInvoke::call(GetMainWindow()->Widget(), [this]() { RefreshUIStatus({}, true, true); });
+        r->SetSelectedEventID(selectedEventId);
+        r->SetFrameEvent(eventId, true);
+        const std::shared_ptr<const PublishedPipelineState> pipeline =
+            std::make_shared<PublishedPipelineState>(r);
+        GUIInvoke::call(GetMainWindow()->Widget(), [this, selectedEventId, eventId, epoch, pipeline]() {
+          if(epoch != m_ScrubEpoch.load() || !IsCaptureLoaded() || m_EventID != eventId ||
+             m_SelectedEventID != selectedEventId)
+            return;
+          PublishPipelineState(pipeline);
+          RefreshUIStatus({}, true, true);
+          ScheduleIdleCheckpointMaintenance();
+        });
       });
     });
   }
@@ -1124,7 +1161,8 @@ void CaptureContext::LoadCaptureThreaded(const QString &captureFile, const Repla
   m_FirstAction = m_LastAction = NULL;
 
   // fetch initial data like actions, textures and buffers
-  m_Replay.BlockInvoke([this](IReplayController *r) {
+  std::shared_ptr<const PublishedPipelineState> initialPipeline;
+  m_Replay.BlockInvoke([this, &initialPipeline](IReplayController *r) {
     SetLoadCaptureStage(LoadCaptureStage::ReadingFrameMetadata);
 
     if(Config().EventBrowser_AddFake)
@@ -1233,16 +1271,16 @@ void CaptureContext::LoadCaptureThreaded(const QString &captureFile, const Repla
 
     SetLoadCaptureStage(LoadCaptureStage::ReadingPipelineState);
 
-    m_CurD3D11PipelineState = r->GetD3D11PipelineState();
-    m_CurD3D12PipelineState = r->GetD3D12PipelineState();
-    m_CurGLPipelineState = r->GetGLPipelineState();
-    m_CurVulkanPipelineState = r->GetVulkanPipelineState();
-    m_CurPipelineState = &r->GetPipelineState();
+    initialPipeline = std::make_shared<PublishedPipelineState>(r);
 
     m_UnreadMessageCount = 0;
     AddMessages(m_FrameInfo.debugMessages);
 
     m_PostloadProgress = 1.0f;
+  });
+
+  GUIInvoke::blockcall(m_MainWindow, [this, initialPipeline]() {
+    PublishPipelineState(initialPipeline);
   });
 
   if(m_FrameInfo.containsAnnotations)
@@ -1582,6 +1620,13 @@ void CaptureContext::CloseCapture()
   if(!m_CaptureLoaded)
     return;
 
+  // Cancel any in-progress interactive scrub so a stale settle can't fire against a closed capture.
+  m_Scrubbing = false;
+  m_ScrubCommitPending = false;
+  m_ScrubInFlight = false;
+  m_ScrubEpoch++;
+  m_ScrubGeneration++;
+
   delete m_Watcher;
   m_Watcher = NULL;
 
@@ -1613,11 +1658,7 @@ void CaptureContext::CloseCapture()
   m_Actions = &m_EmptyActions;
   m_FirstAction = m_LastAction = NULL;
 
-  m_CurD3D11PipelineState = NULL;
-  m_CurD3D12PipelineState = NULL;
-  m_CurGLPipelineState = NULL;
-  m_CurVulkanPipelineState = NULL;
-  m_CurPipelineState = &m_DummyPipelineState;
+  PublishPipelineState({});
 
   m_StructuredFile = &m_DummySDFile;
 
@@ -1625,6 +1666,10 @@ void CaptureContext::CloseCapture()
   m_UnreadMessageCount = 0;
 
   m_CaptureLoaded = false;
+
+  // Detach completions before calling clients. Reentrant publication requests now see the
+  // capture as closed, and replay-queue disposal cannot leave a client waiting indefinitely.
+  m_ReplayStatusPublications.Cancel();
 
   rdcarray<ICaptureViewer *> capviewers(m_CaptureViewers);
 
@@ -1759,6 +1804,7 @@ void CaptureContext::SetEventID(const rdcarray<ICaptureViewer *> &exclude, uint3
                                 uint32_t eventId, bool force)
 {
   RENDERDOC_PROFILEFUNCTION();
+  ++m_IdleCheckpointGeneration;
 
   if(!IsCaptureLoaded())
     return;
@@ -1769,46 +1815,478 @@ void CaptureContext::SetEventID(const rdcarray<ICaptureViewer *> &exclude, uint3
     return;
   }
 
+  // A normal event selection supersedes any queued scrub/commit callback. The replay-queue FIFO
+  // still preserves command correctness; this generation prevents the older asynchronous GUI
+  // completion from publishing its event and pipeline state afterwards.
+  m_Scrubbing = false;
+  m_ScrubCommitPending = false;
+  m_ScrubInFlight = false;
+  m_ScrubEpoch++;
+  m_ScrubGeneration++;
+
   uint32_t prevSelectedEventID = m_SelectedEventID;
-  m_SelectedEventID = selectedEventID;
   uint32_t prevEventID = m_EventID;
-  m_EventID = eventId;
 
-  bool done = false;
+  const uint64_t epoch = m_ScrubEpoch.load();
+  std::atomic<bool> done = {false};
+  std::shared_ptr<const PublishedPipelineState> pipeline;
 
-  QString tag = lit("replaySetEvent");
+  // Only a real selected/effective EID transition is user-context activity.
+  // Forced refreshes intentionally replay the same EID after internal viewer,
+  // settings, or replacement maintenance; giving those callbacks the user tag
+  // would make ReplayLab discard every otherwise-valid background result.
+  QString tag = (prevSelectedEventID != selectedEventID || prevEventID != eventId)
+                    // i18n-ignore: internal replay callback tag, never shown to the user.
+                    ? lit("replaySetEvent")
+                    // i18n-ignore: internal replay callback tag, never shown to the user.
+                    : lit("replayRefreshEvent");
 
-  // we can't return until the event is selected, but a blocking invoke on the UI thread can cause
-  // the UI to stall. We ideally want to have at least an interactive UI and a progress bar.
-  m_Replay.AsyncInvoke(tag, [this, eventId, force, &done](IReplayController *r) {
-    r->SetSelectedEventID(m_SelectedEventID);
-    r->SetFrameEvent(eventId, force);
-    m_CurD3D11PipelineState = r->GetD3D11PipelineState();
-    m_CurD3D12PipelineState = r->GetD3D12PipelineState();
-    m_CurGLPipelineState = r->GetGLPipelineState();
-    m_CurVulkanPipelineState = r->GetVulkanPipelineState();
-    m_CurPipelineState = &r->GetPipelineState();
+  m_Replay.AsyncInvoke(
+      tag, [this, selectedEventID, eventId, force, &done, &pipeline](IReplayController *r) {
+        r->SetSelectedEventID(selectedEventID);
+        r->SetFrameEvent(eventId, force);
+        pipeline = std::make_shared<PublishedPipelineState>(r);
 
-    done = true;
-  });
+        done.store(true, std::memory_order_release);
+      });
 
   // wait a short while before displaying the progress dialog (which won't show if we're already
   // done by the time we reach it).
   // Keep waiting if the current tag is a set event, we don't want to be popping up progress bars
   // when the user is browsing the frame if it's going slow. If that's the case we'll just block the
   // UI thread. Instead only pop up the progress bar if some other large task is blocking.
-  for(int i = 0; !done && (i < 100 || m_Replay.GetCurrentProcessingTag().isEmpty() ||
-                           m_Replay.GetCurrentProcessingTag() == tag);
+  for(int i = 0; !done.load(std::memory_order_acquire) &&
+                 (i < 100 || m_Replay.GetCurrentProcessingTag().isEmpty() ||
+                  m_Replay.GetCurrentProcessingTag() == tag);
       i++)
     QThread::msleep(5);
 
   ShowProgressDialog(m_MainWindow->Widget(), tr("Please wait, working..."),
-                     [&done]() { return done; });
+                     [&done]() { return done.load(std::memory_order_acquire); });
+
+  if(epoch != m_ScrubEpoch.load() || !IsCaptureLoaded())
+    return;
+
+  m_SelectedEventID = selectedEventID;
+  m_EventID = eventId;
+  PublishPipelineState(std::move(pipeline));
 
   bool updateSelectedEvent = force || prevSelectedEventID != selectedEventID;
   bool updateEvent = force || prevEventID != eventId;
 
   RefreshUIStatus(exclude, updateSelectedEvent, updateEvent);
+  ScheduleIdleCheckpointMaintenance();
+}
+
+uint64_t CaptureContext::ReplayStatusPublications::Begin(std::function<void(bool)> completed)
+{
+  const uint64_t request = ++serial;
+  QMap<uint64_t, std::function<void(bool)>> superseded;
+  superseded.swap(pending);
+  pending.insert(request, std::move(completed));
+  for(const std::function<void(bool)> &callback : superseded)
+    if(callback)
+      callback(false);
+  return request;
+}
+
+bool CaptureContext::ReplayStatusPublications::Current(uint64_t request) const
+{
+  return request == serial && pending.contains(request);
+}
+
+void CaptureContext::ReplayStatusPublications::Complete(uint64_t request, bool published)
+{
+  auto it = pending.find(request);
+  if(it == pending.end())
+    return;
+  std::function<void(bool)> completed = std::move(it.value());
+  pending.erase(it);
+  if(completed)
+    completed(published);
+}
+
+void CaptureContext::ReplayStatusPublications::Cancel()
+{
+  ++serial;
+  QMap<uint64_t, std::function<void(bool)>> cancelled;
+  cancelled.swap(pending);
+  for(const std::function<void(bool)> &callback : cancelled)
+    if(callback)
+      callback(false);
+}
+
+#if ENABLE_UNIT_TESTS
+
+#include "3rdparty/catch/catch.hpp"
+
+struct CaptureContextPublicationTestAccess
+{
+  static void CheckCallbacks()
+  {
+    CaptureContext::ReplayStatusPublications publications;
+    QList<bool> first, second, third;
+    SECTION("Superseding a same-event request rejects late publication and completes once")
+    {
+      const uint64_t a = publications.Begin([&](bool result) { first.push_back(result); });
+      const uint64_t b = publications.Begin([&](bool result) { second.push_back(result); });
+      CHECK_FALSE(publications.Current(a));
+      CHECK(publications.Current(b));
+      publications.Complete(a, true);
+      REQUIRE(first.size() == 1);
+      CHECK_FALSE(first[0]);
+      publications.Complete(b, true);
+      publications.Complete(b, false);
+      REQUIRE(second.size() == 1);
+      CHECK(second[0]);
+      CHECK_FALSE(publications.Current(b));
+    }
+    SECTION("A cancellation callback can supersede the new request reentrantly")
+    {
+      uint64_t newest = 0;
+      publications.Begin([&](bool result) {
+        first.push_back(result);
+        newest = publications.Begin([&](bool accepted) { third.push_back(accepted); });
+      });
+      const uint64_t superseded =
+          publications.Begin([&](bool result) { second.push_back(result); });
+      CHECK_FALSE(publications.Current(superseded));
+      CHECK(publications.Current(newest));
+      REQUIRE(first.size() == 1);
+      REQUIRE(second.size() == 1);
+      CHECK_FALSE(first[0]);
+      CHECK_FALSE(second[0]);
+      publications.Complete(newest, true);
+      REQUIRE(third.size() == 1);
+      CHECK(third[0]);
+    }
+    SECTION("Close resolves disposed replay work and rejects a reentrant closed-capture request")
+    {
+      bool loaded = true;
+      const uint64_t request = publications.Begin([&](bool result) {
+        first.push_back(result);
+        const uint64_t reentrant =
+            publications.Begin([&](bool accepted) { second.push_back(accepted); });
+        if(!loaded)
+          publications.Complete(reentrant, false);
+      });
+      // CloseCapture changes loaded before detaching/completing callbacks. The replay queue can
+      // then discard its callback entirely; alternatively its late GUI delivery is harmless.
+      loaded = false;
+      publications.Cancel();
+      CHECK_FALSE(publications.Current(request));
+      publications.Complete(request, true);
+      publications.Cancel();
+      REQUIRE(first.size() == 1);
+      REQUIRE(second.size() == 1);
+      CHECK_FALSE(first[0]);
+      CHECK_FALSE(second[0]);
+      CHECK(publications.pending.isEmpty());
+    }
+    SECTION("Completion detaches before invoking a client that requests another publication")
+    {
+      uint64_t request = 0, next = 0;
+      request = publications.Begin([&](bool result) {
+        first.push_back(result);
+        publications.Complete(request, false);
+        next = publications.Begin([&](bool accepted) { second.push_back(accepted); });
+      });
+      publications.Complete(request, true);
+      REQUIRE(first.size() == 1);
+      CHECK(first[0]);
+      CHECK(publications.Current(next));
+      publications.Cancel();
+      REQUIRE(second.size() == 1);
+      CHECK_FALSE(second[0]);
+    }
+    SECTION("A publication without an observer still has a cancellable identity")
+    {
+      const uint64_t request = publications.Begin({});
+      CHECK(publications.Current(request));
+      publications.Cancel();
+      CHECK_FALSE(publications.Current(request));
+      publications.Complete(request, true);
+      CHECK(publications.pending.isEmpty());
+    }
+  }
+};
+
+TEST_CASE("Replay publication completion survives supersession and capture close",
+          "[capture-context][publication][checkpoints]")
+{
+  CaptureContextPublicationTestAccess::CheckCallbacks();
+}
+
+#endif
+
+void CaptureContext::RefreshReplayStatus(uint32_t expectedEventId,
+                                          uint64_t expectedBufferGeneration,
+                                          std::function<void(bool)> completed)
+{
+  ++m_IdleCheckpointGeneration;
+  const uint64_t request = m_ReplayStatusPublications.Begin(std::move(completed));
+  const uint64_t epoch = m_ScrubEpoch.load();
+  if(!m_ReplayStatusPublications.Current(request) || !IsCaptureLoaded() ||
+     CurEvent() != expectedEventId)
+  {
+    m_ReplayStatusPublications.Complete(request, false);
+    return;
+  }
+
+  // The setter already rebuilt this event. Snapshot the owned pipeline without SetFrameEvent,
+  // and keep the editing queue in flight until every viewer has consumed this publication.
+  m_Replay.AsyncInvoke(
+      [this, epoch, expectedEventId, expectedBufferGeneration, request](IReplayController *r) {
+        std::shared_ptr<const PublishedPipelineState> pipeline;
+        if(epoch == m_ScrubEpoch.load() && r->GetCurrentEventID() == expectedEventId &&
+           r->GetSharedBufferPatchGeneration() == expectedBufferGeneration)
+          pipeline = std::make_shared<PublishedPipelineState>(r);
+
+        GUIInvoke::call(m_MainWindow, [this, epoch, expectedEventId, expectedBufferGeneration,
+                                      request, pipeline]() {
+          if(!m_ReplayStatusPublications.Current(request) || !pipeline ||
+             epoch != m_ScrubEpoch.load() || !IsCaptureLoaded() ||
+             CurEvent() != expectedEventId)
+          {
+            m_ReplayStatusPublications.Complete(request, false);
+            return;
+          }
+
+          PublishPipelineState(pipeline);
+          const uint64_t serial = m_PipelinePublicationSerial;
+          RefreshUIStatus({}, true, true);
+          m_Replay.AsyncInvoke(
+              [this, epoch, serial, expectedEventId, expectedBufferGeneration,
+               request](IReplayController *r) {
+                const bool valid = r->GetCurrentEventID() == expectedEventId &&
+                                   r->GetSharedBufferPatchGeneration() == expectedBufferGeneration;
+                GUIInvoke::call(m_MainWindow,
+                                [this, epoch, serial, expectedEventId, request, valid]() {
+                                  const bool published = m_ReplayStatusPublications.Current(request) &&
+                                                         valid && epoch == m_ScrubEpoch.load() &&
+                                                         IsCaptureLoaded() &&
+                                                         CurEvent() == expectedEventId &&
+                                                         serial == m_PipelinePublicationSerial;
+                                  if(published)
+                                    ScheduleIdleCheckpointMaintenance();
+                                  m_ReplayStatusPublications.Complete(request, published);
+                                });
+              });
+        });
+      });
+}
+
+void CaptureContext::ScrubToEvent(uint32_t eventId)
+{
+  ScrubToSelectedEvent(eventId, eventId);
+}
+
+void CaptureContext::ScrubToSelectedEvent(uint32_t selectedEventId, uint32_t eventId)
+{
+  ++m_IdleCheckpointGeneration;
+  if(!IsCaptureLoaded() || !m_LastAction)
+    return;
+
+  eventId = qMin(eventId, m_LastAction->eventId);
+  selectedEventId = qMin(selectedEventId, m_LastAction->eventId);
+
+  // Repeated pointer samples within one event are not new navigation. Edits use RefreshStatus /
+  // forced SetEventID and therefore still replay even when the selected event does not change.
+  if(m_Scrubbing && m_ScrubSelectedEventID == selectedEventId && m_ScrubEventID == eventId)
+    return;
+  if(!m_Scrubbing && !m_ScrubCommitPending && m_SelectedEventID == selectedEventId &&
+     m_EventID == eventId)
+    return;
+
+  const bool startingScrub = !m_Scrubbing;
+  m_Scrubbing = true;
+  m_ScrubCommitPending = true;
+  m_ScrubSelectedEventID = selectedEventId;
+  m_ScrubEventID = eventId;
+  ++m_ScrubGeneration;
+
+  if(startingScrub)
+  {
+    // This is only an input notification for cancelling background history work. Display and
+    // pipeline state are published together through the normal OnEventChanged path below.
+    rdcarray<ICaptureViewer *> capviewers(m_CaptureViewers);
+    for(ICaptureViewer *viewer : capviewers)
+      if(viewer && m_CaptureViewers.contains(viewer))
+        viewer->OnScrubEvent(eventId);
+  }
+
+  QueueScrubReplay();
+}
+
+void CaptureContext::QueueScrubReplay()
+{
+  if(m_ScrubInFlight || !m_ScrubCommitPending || !IsCaptureLoaded())
+    return;
+
+  m_ScrubInFlight = true;
+  const uint32_t selectedEventId = m_ScrubSelectedEventID;
+  const uint32_t eventId = m_ScrubEventID;
+  const uint64_t generation = m_ScrubGeneration.load();
+  const uint64_t epoch = m_ScrubEpoch.load();
+  static const bool eidTiming = qEnvironmentVariableIntValue("RENDERDOC_EID_TIMING") == 1;
+  QElapsedTimer enqueueTimer;
+  if(eidTiming)
+    enqueueTimer.start();
+
+  m_Replay.AsyncInvoke(lit("replayInteractiveEvent"),    // i18n-ignore: Internal replay-queue tag.
+                       [this, selectedEventId, eventId, generation, epoch,
+                        enqueueTimer](IReplayController *r) {
+    if(epoch != m_ScrubEpoch.load())
+      return;
+
+    // Even if more input arrived while this callback was queued, finish and publish this frame.
+    // The single in-flight cycle bounds obsolete work to one event and guarantees progress while
+    // the mouse moves continuously; only the subsequent pending target is replaced by new input.
+
+    const qint64 waitNS = eidTiming ? enqueueTimer.nsecsElapsed() : 0;
+    QElapsedTimer replayTimer;
+    if(eidTiming)
+      replayTimer.start();
+
+    r->SetSelectedEventID(selectedEventId);
+    r->ScrubFrameEvent(eventId);
+    r->CommitScrubFrameEvent(eventId);
+    const std::shared_ptr<const PublishedPipelineState> pipeline =
+        std::make_shared<PublishedPipelineState>(r);
+    const qint64 replayNS = eidTiming ? replayTimer.nsecsElapsed() : 0;
+
+    // Do not wait for this closure on the replay thread. Some OnEventChanged handlers issue
+    // BlockInvoke calls, so waiting here would deadlock the GUI and the replay thread.
+    GUIInvoke::call(m_MainWindow, [this, selectedEventId, eventId, generation, epoch, pipeline,
+                                  waitNS, replayNS]() {
+      if(epoch != m_ScrubEpoch.load() || !IsCaptureLoaded())
+        return;
+
+      m_SelectedEventID = selectedEventId;
+      m_EventID = eventId;
+      PublishPipelineState(pipeline);
+
+      QElapsedTimer panelTimer;
+      if(eidTiming)
+        panelTimer.start();
+      RefreshUIStatus({}, true, true);
+      const qint64 panelNS = eidTiming ? panelTimer.nsecsElapsed() : 0;
+      if(epoch != m_ScrubEpoch.load() || !IsCaptureLoaded())
+        return;
+
+      // OnEventChanged has now queued texture binding, display, thumbnails, and panel reads for
+      // this event. Drain those callbacks before another scrub can change the physical resources.
+      // Their GUI deliveries precede this completion too. Late paint/analysis callbacks also
+      // validate their expected EID before using the controller.
+      m_Replay.AsyncInvoke(
+          lit("replayInteractiveCommit"),    // i18n-ignore: Internal replay-queue tag.
+          [this, selectedEventId, eventId, generation, epoch, waitNS, replayNS, panelNS,
+           panelTimer](IReplayController *) {
+            GUIInvoke::call(m_MainWindow, [this, selectedEventId, eventId, generation, epoch, waitNS,
+                                          replayNS, panelNS, panelTimer]() {
+              if(epoch != m_ScrubEpoch.load() || !IsCaptureLoaded())
+                return;
+
+              const qint64 displayNS = eidTiming ? panelTimer.nsecsElapsed() - panelNS : 0;
+              if(eidTiming)
+              {
+                LogEIDTiming(QString::asprintf(
+                    "preview EID %u: queueWait %.2fms, replay %.2fms, generation %llu, state %s",
+                    (unsigned)eventId, waitNS / 1.0e6, replayNS / 1.0e6,
+                    (unsigned long long)generation, m_Scrubbing ? "dragging" : "released"));
+                LogEIDTiming(QString::asprintf(
+                    "scrub EID %u: queueWait %.2fms, replay %.2fms, scrubPanels %.2fms, generation %llu, displayAndReads %.2fms",
+                    (unsigned)eventId, waitNS / 1.0e6, replayNS / 1.0e6, panelNS / 1.0e6,
+                    (unsigned long long)generation, displayNS / 1.0e6));
+                if(!m_Scrubbing)
+                  LogEIDTiming(QString::asprintf(
+                      "commit EID %u: queueWait %.2fms, replay/pipeline %.2fms, panels %.2fms, generation %llu, displayAndReads %.2fms",
+                      (unsigned)eventId, waitNS / 1.0e6, replayNS / 1.0e6, panelNS / 1.0e6,
+                      (unsigned long long)generation, displayNS / 1.0e6));
+              }
+
+              m_ScrubInFlight = false;
+              m_ScrubCommitPending = generation != m_ScrubGeneration.load();
+              QueueScrubReplay();
+              if(!m_Scrubbing && !m_ScrubCommitPending)
+                ScheduleIdleCheckpointMaintenance();
+            });
+          });
+    });
+  });
+}
+
+void CaptureContext::EndScrub()
+{
+  // Every completed drag step already publishes full pipeline and panel state. Releasing only
+  // ends input; the last requested step continues asynchronously without a second replay.
+  m_Scrubbing = false;
+  if(!m_ScrubInFlight && !m_ScrubCommitPending)
+    ScheduleIdleCheckpointMaintenance();
+}
+
+void CaptureContext::ScheduleIdleCheckpointMaintenance()
+{
+  const uint64_t request = ++m_IdleCheckpointGeneration;
+  if(!IsCaptureLoaded() || m_Scrubbing || m_ScrubCommitPending || m_ScrubInFlight)
+    return;
+
+  const uint64_t epoch = m_ScrubEpoch.load();
+  const uint32_t eventId = m_EventID;
+  // Capture both mutation versions after the current publication's viewer requests. A timer
+  // must never silently adopt a newer edit merely because it targets the same EID.
+  m_Replay.AsyncInvoke([this, request, epoch, eventId](IReplayController *r) {
+    if(request != m_IdleCheckpointGeneration.load() || epoch != m_ScrubEpoch.load() ||
+       r->GetCurrentEventID() != eventId)
+      return;
+    const uint64_t mutation = r->GetShaderReplacementGeneration(eventId);
+    const uint64_t buffer = r->GetSharedBufferPatchGeneration();
+    GUIInvoke::call(m_MainWindow, [this, request, epoch, eventId, mutation, buffer]() {
+      if(request != m_IdleCheckpointGeneration.load() || epoch != m_ScrubEpoch.load() ||
+         !IsCaptureLoaded() || m_EventID != eventId)
+        return;
+      QTimer::singleShot(750, m_MainWindow, [this, request, epoch, eventId, mutation, buffer]() {
+        if(request != m_IdleCheckpointGeneration.load() || epoch != m_ScrubEpoch.load() ||
+           !IsCaptureLoaded() || m_EventID != eventId || m_Scrubbing || m_ScrubInFlight)
+          return;
+        m_Replay.AsyncInvoke(
+            // i18n-ignore: internal low-priority replay queue tag, not a UI label.
+            lit("ReplayLab.background.checkpoints"),
+            [this, request, epoch, eventId, mutation, buffer](IReplayController *r) {
+              if(request != m_IdleCheckpointGeneration.load() || epoch != m_ScrubEpoch.load() ||
+                 m_Replay.HasPendingNonBackgroundInvoke())
+                return;
+              // The controller rechecks event, mutation and buffer generations and admits at
+              // most one useful replay. It restores this same event before returning and does
+              // not publish another image or rebuild the visible pipeline snapshot.
+              const rdcstr receipt = r->RunIdleCheckpointMaintenance(eventId, mutation, buffer);
+              if(qEnvironmentVariableIntValue("RENDERDOC_EID_TIMING") == 1)
+                GUIInvoke::call(m_MainWindow, [this, receipt]() {
+                  LogEIDTiming(QString::fromUtf8(receipt.c_str()));
+                });
+            });
+      });
+    });
+  });
+}
+
+void CaptureContext::LogEIDTiming(const QString &line)
+{
+  // Append EID-switch timing to <exe dir>/eid_timing.log (RENDERDOC_EID_TIMING=1). The exe dir is
+  // inside the repo checkout, so it is easy to inspect. Also mirrored to qInfo / the diag log.
+  qInfo("[EIDTiming] %s", qUtf8Printable(line));
+  static QFile *logFile = NULL;
+  if(logFile == NULL)
+  {
+    // i18n-ignore: diagnostic log filename, not user-visible UI text
+    logFile = new QFile(QDir(qApp->applicationDirPath()).filePath(lit("eid_timing.log")));
+    logFile->open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text);
+  }
+  if(logFile && logFile->isOpen())
+  {
+    logFile->write((line + lit("\n")).toUtf8());
+    logFile->flush();
+  }
 }
 
 void CaptureContext::ConnectToRemoteServer(RemoteHost host)
@@ -1886,7 +2364,11 @@ void CaptureContext::RegisterReplacement(ResourceId from, ResourceId to)
 
   CacheResources();
 
-  RefreshUIStatus({}, true, true);
+  // A replacement may have rebuilt the controller's pipeline. Publish its owned current value
+  // before notifying viewers instead of relying on the old controller-pointer alias to update.
+  SetEventID({}, m_SelectedEventID, m_EventID, false);
+  if(IsCaptureLoaded())
+    RefreshUIStatus({}, true, true);
 }
 
 void CaptureContext::UnregisterReplacement(ResourceId id)
@@ -1900,18 +2382,25 @@ void CaptureContext::UnregisterReplacement(ResourceId id)
 
   CacheResources();
 
-  RefreshUIStatus({}, true, true);
+  SetEventID({}, m_SelectedEventID, m_EventID, false);
+  if(IsCaptureLoaded())
+    RefreshUIStatus({}, true, true);
 }
 
 void CaptureContext::RefreshUIStatus(const rdcarray<ICaptureViewer *> &exclude,
                                      bool updateSelectedEvent, bool updateEvent)
 {
+  const uint64_t refreshEpoch = m_ScrubEpoch.load();
+  // Keep this publication alive if a viewer synchronously publishes another event. The epoch
+  // checks below then stop the old notification pass without invalidating that viewer's locals.
+  const std::shared_ptr<const PublishedPipelineState> publication = m_PublishedPipelineState;
+  const PipeState &pipeline = publication ? publication->pipeline : m_DummyPipelineState;
   // cache and assign pointer type IDs for any known pointer types in current shaders
   for(ShaderStage stage :
       {ShaderStage::Vertex, ShaderStage::Hull, ShaderStage::Domain, ShaderStage::Geometry,
        ShaderStage::Pixel, ShaderStage::Compute, ShaderStage::Task, ShaderStage::Mesh})
   {
-    const ShaderReflection *refl = m_CurPipelineState->GetShaderReflection(stage);
+    const ShaderReflection *refl = pipeline.GetShaderReflection(stage);
     if(refl)
       PointerTypeRegistry::CacheShader(refl);
   }
@@ -1925,8 +2414,14 @@ void CaptureContext::RefreshUIStatus(const rdcarray<ICaptureViewer *> &exclude,
 
     if(updateSelectedEvent)
       viewer->OnSelectedEventChanged(m_SelectedEventID);
-    if(updateEvent)
+    // Extension viewers may navigate, close the capture, or unregister themselves synchronously.
+    // Do not continue delivering this publication after such a context change.
+    if(refreshEpoch != m_ScrubEpoch.load() || !IsCaptureLoaded())
+      return;
+    if(updateEvent && m_CaptureViewers.contains(viewer))
       viewer->OnEventChanged(m_EventID);
+    if(refreshEpoch != m_ScrubEpoch.load() || !IsCaptureLoaded())
+      return;
   }
 }
 
@@ -1968,6 +2463,9 @@ void CaptureContext::SetNotes(const rdcstr &key, const rdcstr &contents)
 
 void CaptureContext::SetBookmark(const EventBookmark &mark)
 {
+  if(mark.eventId == 0)
+    return;
+
   ANALYTIC_SET(UIFeatures.Bookmarks, true);
 
   int index = m_Bookmarks.indexOf(mark);
@@ -1986,16 +2484,76 @@ void CaptureContext::SetBookmark(const EventBookmark &mark)
 
   SetModification(CaptureModifications::Bookmarks);
 
-  RefreshUIStatus({}, true, true);
+  NotifyBookmarksChanged();
 }
 
 void CaptureContext::RemoveBookmark(uint32_t EID)
 {
-  m_Bookmarks.removeOne(EventBookmark(EID));
+  rdcarray<uint32_t> EIDs;
+  EIDs.push_back(EID);
+  RemoveBookmarks(EIDs);
+}
+
+void CaptureContext::RemoveBookmarks(const rdcarray<uint32_t> &EIDs)
+{
+  const int previousCount = m_Bookmarks.count();
+  for(uint32_t EID : EIDs)
+    m_Bookmarks.removeOne(EventBookmark(EID));
+
+  if(previousCount == m_Bookmarks.count())
+    return;
 
   SetModification(CaptureModifications::Bookmarks);
 
-  RefreshUIStatus({}, true, true);
+  NotifyBookmarksChanged();
+}
+
+void CaptureContext::SetBookmarkOrder(const rdcarray<uint32_t> &EIDs)
+{
+  if(EIDs.count() != m_Bookmarks.count())
+    return;
+
+  QList<EventBookmark> orderedBookmarks;
+  QSet<uint32_t> seen;
+  bool changed = false;
+
+  for(int i = 0; i < EIDs.count(); ++i)
+  {
+    const uint32_t EID = EIDs[i];
+    if(seen.contains(EID))
+      return;
+    seen.insert(EID);
+
+    const int bookmarkIndex = m_Bookmarks.indexOf(EventBookmark(EID));
+    if(bookmarkIndex < 0)
+      return;
+
+    orderedBookmarks.push_back(m_Bookmarks[bookmarkIndex]);
+    changed |= bookmarkIndex != i;
+  }
+
+  if(!changed)
+    return;
+
+  m_Bookmarks = orderedBookmarks;
+  SetModification(CaptureModifications::Bookmarks);
+  NotifyBookmarksChanged();
+}
+
+void CaptureContext::NotifyBookmarksChanged()
+{
+  if(m_BookmarkRefreshPending)
+    return;
+
+  m_BookmarkRefreshPending = true;
+  QTimer::singleShot(0, m_MainWindow, [this]() {
+    m_BookmarkRefreshPending = false;
+
+    if(m_EventBrowser)
+      m_EventBrowser->BookmarksChanged();
+    if(m_BookmarksView)
+      m_BookmarksView->BookmarksChanged();
+  });
 }
 
 void CaptureContext::DelayedCallback(uint32_t milliseconds, std::function<void()> callback)
@@ -2446,6 +3004,19 @@ IEventBrowser *CaptureContext::GetEventBrowser()
   return m_EventBrowser;
 }
 
+BookmarksView *CaptureContext::GetBookmarksView()
+{
+  if(m_BookmarksView)
+    return m_BookmarksView;
+
+  m_BookmarksView = new BookmarksView(*this, m_MainWindow);
+  // i18n-ignore: stable dock object name used only for layout persistence.
+  m_BookmarksView->setObjectName(lit("bookmarksView"));
+  setupDockWindow(m_BookmarksView, true);
+
+  return m_BookmarksView;
+}
+
 IAPIInspector *CaptureContext::GetAPIInspector()
 {
   if(m_APIInspector)
@@ -2634,6 +3205,13 @@ ReplayLabIntegration &CaptureContext::ReplayLab()
 void CaptureContext::ShowAIAssistant()
 {
   m_MainWindow->showAIAssistant();
+}
+
+void CaptureContext::AddTextToAIAssistant(const rdcstr &title, const rdcstr &text,
+                                           const rdcstr &source, const rdcstr &contextJSON)
+{
+  GetAIAssistant()->AddTextAttachment(title, text, source, true, contextJSON);
+  ShowAIAssistant();
 }
 
 AIAssistant *CaptureContext::GetAIAssistant()
@@ -2978,6 +3556,10 @@ QWidget *CaptureContext::CreateBuiltinWindow(const rdcstr &objectName)
   {
     return GetEventBrowser()->Widget();
   }
+  else if(objectName == "bookmarksView")
+  {
+    return GetBookmarksView();
+  }
   else if(objectName == "pipelineViewer")
   {
     return GetPipelineViewer()->Widget();
@@ -3042,6 +3624,8 @@ void CaptureContext::BuiltinWindowClosed(QWidget *window)
 {
   if(m_EventBrowser && m_EventBrowser->Widget() == window)
     m_EventBrowser = NULL;
+  else if(m_BookmarksView && m_BookmarksView == window)
+    m_BookmarksView = NULL;
   else if(m_TextureViewer && m_TextureViewer->Widget() == window)
     m_TextureViewer = NULL;
   else if(m_CaptureDialog && m_CaptureDialog->Widget() == window)
@@ -3174,6 +3758,101 @@ void CaptureContext::AddDockWindow(QWidget *newWindow, DockReference ref, QWidge
   ToolWindowManager::AreaReference areaRef((ToolWindowManager::AreaReferenceType)ref,
                                            manager->areaOf(refWindow), percentage);
   manager->addToolWindow(newWindow, areaRef);
+}
+
+IShaderCodeEditor *CaptureContext::CreateShaderCodeEditor(QWidget *parent)
+{
+  if(!m_ShaderCodeEditorService)
+  {
+    m_ShaderCodeEditorService = new CodeEditorService(m_MainWindow);
+    m_ShaderCodeEditorService->setDiagnosticsHandler(
+        [this](ScintillaEdit *source, const QList<CodeEditorService::Diagnostic> &diagnostics) {
+          int errors = 0, warnings = 0, firstLine = 1;
+          QStringList messages;
+          for(const CodeEditorService::Diagnostic &diagnostic : diagnostics)
+          {
+            if(diagnostic.severity == CodeEditorService::DiagnosticSeverity::Error)
+              errors++;
+            else if(diagnostic.severity == CodeEditorService::DiagnosticSeverity::Warning)
+              warnings++;
+            else
+              continue;
+            if(messages.isEmpty())
+              firstLine = diagnostic.line + 1;
+            if(messages.size() < 12)
+              messages.push_back(diagnostic.message);
+          }
+          for(ShaderCodeEditor *editor : m_ShaderCodeEditors)
+            if(editor && editor->Editor() == source)
+              editor->SetDiagnosticSummary(errors, warnings, messages.join(QLatin1Char('\n')), firstLine);
+        });
+    if(!Config().ShaderEditor_LanguageServer.isEmpty())
+      m_ShaderCodeEditorService->setLanguageServerCommand(Config().ShaderEditor_LanguageServer);
+    m_ShaderCodeEditorService->setDefinitionHandler(
+        [this](const CodeEditorService::Location &location) {
+          if(location.editor)
+          {
+            for(ShaderCodeEditor *editor : m_ShaderCodeEditors)
+            {
+              if(editor && editor->Editor() == location.editor)
+              {
+                // Let the workspace select the owning tab before moving a cursor
+                // in an editor that may currently be hidden in its stack.
+                if(!location.fileName.isEmpty())
+                  editor->OpenDefinition(location.fileName, location.line, location.column);
+                editor->GoToPosition(location.position);
+                return;
+              }
+            }
+          }
+
+          ShaderCodeEditor *active = NULL;
+          QWidget *focus = QApplication::focusWidget();
+          for(ShaderCodeEditor *editor : m_ShaderCodeEditors)
+          {
+            if(editor && focus && (focus == editor || editor->isAncestorOf(focus)))
+            {
+              active = editor;
+              break;
+            }
+          }
+          if(!active && !m_ShaderCodeEditors.isEmpty())
+            active = m_ShaderCodeEditors.front();
+          if(active && !location.fileName.isEmpty())
+            active->OpenDefinition(location.fileName, location.line, location.column);
+        });
+    m_ShaderCodeEditorService->setStatusHandler([this](const QString &message) {
+      QWidget *focus = QApplication::focusWidget();
+      for(ShaderCodeEditor *editor : m_ShaderCodeEditors)
+      {
+        if(editor && (!focus || focus == editor || editor->isAncestorOf(focus)))
+        {
+          editor->SetStatusMessage(message);
+          if(focus)
+            break;
+        }
+      }
+    });
+  }
+
+  ShaderCodeEditor *editor =
+      new ShaderCodeEditor(m_ShaderCodeEditorService, parent ? parent : m_MainWindow);
+  m_ShaderCodeEditors.push_back(editor);
+  QObject::connect(editor, &QObject::destroyed, m_MainWindow,
+                   [this, editor](QObject *) { m_ShaderCodeEditors.removeAll(editor); });
+  return editor;
+}
+
+void CaptureContext::DestroyShaderCodeEditor(IShaderCodeEditor *editor)
+{
+  ShaderCodeEditor *nativeEditor = dynamic_cast<ShaderCodeEditor *>(editor);
+  if(!nativeEditor || !m_ShaderCodeEditors.contains(nativeEditor))
+    return;
+
+  nativeEditor->ClearCallbacks();
+  m_ShaderCodeEditors.removeAll(nativeEditor);
+  PythonContext::InvalidateNativeQtObject(nativeEditor);
+  delete nativeEditor;
 }
 
 void CaptureContext::EmbedDependentFiles()

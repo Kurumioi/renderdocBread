@@ -23,10 +23,15 @@
  ******************************************************************************/
 
 #include "ShaderViewer.h"
+#include <climits>
 #include <QComboBox>
+#include <QCryptographicHash>
 #include <QFile>
 #include <QFontDatabase>
 #include <QHBoxLayout>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QKeyEvent>
 #include <QListWidget>
 #include <QMenu>
@@ -37,6 +42,7 @@
 #include <QSet>
 #include <QShortcut>
 #include <QTimer>
+#include <QToolButton>
 #include <QToolTip>
 #include "Code/CodeEditorService.h"
 #include "Code/Resources.h"
@@ -229,6 +235,26 @@ ShaderViewer::ShaderViewer(ICaptureContext &ctx, QWidget *parent)
 {
   ui->setupUi(this);
 
+  m_AddToChatButton = new QToolButton(this);
+  m_AddToChatButton->setAutoRaise(false);
+  m_AddToChatButton->setIcon(Icons::text_add());
+  m_AddToChatButton->setText(tr("Add to chat"));
+  m_AddToChatButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+  m_AddToChatButton->setFocusPolicy(Qt::NoFocus);
+  m_AddToChatButton->setCursor(Qt::PointingHandCursor);
+  m_AddToChatButton->setAttribute(Qt::WA_ShowWithoutActivating);
+  // i18n-ignore: Qt stylesheet implementation; the visible button text is translated above.
+  m_AddToChatButton->setStyleSheet(lit(
+      "QToolButton { background: palette(base); color: palette(text); "
+      "border: 1px solid palette(mid); border-radius: 13px; padding: 4px 10px; } "
+      "QToolButton:hover { background: palette(midlight); }"));
+  m_AddToChatButton->hide();
+  QObject::connect(m_AddToChatButton, &QToolButton::clicked, this, [this]() {
+    const TextAttachmentSelection selection = m_TextAttachmentSelection;
+    m_AddToChatButton->hide();
+    addTextAttachmentToChat(selection);
+  });
+
   m_CodeEditorService = new CodeEditorService(this);
   if(!m_Ctx.Config().ShaderEditor_LanguageServer.isEmpty())
     m_CodeEditorService->setLanguageServerCommand(m_Ctx.Config().ShaderEditor_LanguageServer);
@@ -261,6 +287,7 @@ ShaderViewer::ShaderViewer(ICaptureContext &ctx, QWidget *parent)
             editor = AddFileScintilla(QFileInfo(location.fileName).fileName(),
                                       QString::fromUtf8(source), encoding);
             ((QWidget *)editor)->setProperty("filename", location.fileName);
+            ((QWidget *)editor)->setProperty("shaderNavigationOnly", true);
             m_CodeEditorService->registerEditor(
                 editor, location.fileName,
                 encoding == ShaderEncoding::GLSL
@@ -355,6 +382,7 @@ ShaderViewer::ShaderViewer(ICaptureContext &ctx, QWidget *parent)
 
     QObject::connect(m_DisassemblyView, &ScintillaEdit::keyPressed, this,
                      &ShaderViewer::readonly_keyPressed);
+    registerTextAttachmentEditor(m_DisassemblyView);
 
     m_Scintillas.push_back(m_DisassemblyView);
 
@@ -1760,6 +1788,8 @@ ScintillaEdit *ShaderViewer::AddFileScintilla(const QString &name, const QString
   scintilla->setWindowTitle(name);
   ((QWidget *)scintilla)->setProperty("name", name);
 
+  registerTextAttachmentEditor(scintilla);
+
   QObject::connect(scintilla, &ScintillaEdit::keyPressed, this, &ShaderViewer::readonly_keyPressed);
 
   ToolWindowManager::AreaReference ref(ToolWindowManager::EmptySpace);
@@ -1845,6 +1875,281 @@ void ShaderViewer::SetTextAndUpdateMargin0(ScintillaEdit *sc, const QString &tex
   sc->setMarginWidthN(0, int(width));
 }
 
+void ShaderViewer::registerTextAttachmentEditor(ScintillaEdit *editor)
+{
+  if(!editor)
+    return;
+
+  QObject::connect(editor, &ScintillaEdit::buttonPressed, this,
+                   [this, editor](QMouseEvent *event) {
+                     if(event->button() == Qt::LeftButton)
+                     {
+                       m_TextAttachmentSelecting = true;
+                       if(m_TextAttachmentEditor == editor)
+                         m_AddToChatButton->hide();
+                     }
+                   });
+  QObject::connect(editor, &ScintillaEdit::buttonReleased, this,
+                   [this, editor](QMouseEvent *event) {
+                     if(event->button() == Qt::LeftButton)
+                     {
+                       m_TextAttachmentSelecting = false;
+                       updateTextAttachmentSelection(editor);
+                     }
+                   });
+  QObject::connect(editor, &ScintillaEdit::updateUi, this,
+                   [this, editor]() { updateTextAttachmentSelection(editor); });
+  QObject::connect(editor, &ScintillaEdit::horizontalScrolled, this,
+                   [this, editor](int) {
+                     if(m_TextAttachmentEditor == editor)
+                       updateTextAttachmentButtonGeometry();
+                   });
+  QObject::connect(editor, &ScintillaEdit::verticalScrolled, this, [this, editor](int) {
+    if(m_TextAttachmentEditor == editor)
+      updateTextAttachmentButtonGeometry();
+  });
+}
+
+ShaderViewer::TextAttachmentSelection ShaderViewer::captureTextAttachmentSelection(
+    ScintillaEdit *editor) const
+{
+  TextAttachmentSelection selection;
+  if(!editor || editor->selectionEmpty())
+    return selection;
+
+  sptr_t start = editor->selectionStart();
+  sptr_t end = editor->selectionEnd();
+  if(end < start)
+    qSwap(start, end);
+
+  selection.start = start;
+  selection.end = end;
+
+  selection.text = QString::fromUtf8(editor->getSelText());
+  if(selection.text.isEmpty())
+    return TextAttachmentSelection();
+
+  const sptr_t finalCharacter = end > start ? editor->positionBefore(end) : end;
+  const int firstLine = int(editor->lineFromPosition(start)) + 1;
+  const int lastLine = int(editor->lineFromPosition(finalCharacter)) + 1;
+  const int firstColumn = int(editor->column(start)) + 1;
+  const int lastColumn = int(editor->column(finalCharacter)) + 1;
+
+  QString sourceName;
+  QString displayName;
+  QString originKind;
+  if(editor == m_DisassemblyView)
+  {
+    sourceName = tr("Disassembly");
+    displayName = sourceName;
+    originKind = lit("shader-disassembly-selection");    // i18n-ignore: attachment context ID
+    selection.source =
+        tr("Shader disassembly, lines %1-%2").arg(firstLine).arg(lastLine);
+  }
+  else
+  {
+    sourceName = editor->QWidget::property("filename").toString();
+    if(sourceName.isEmpty())
+      sourceName = editor->QWidget::property("name").toString();
+    if(sourceName.isEmpty())
+      sourceName = editor->windowTitle();
+
+    displayName = QFileInfo(sourceName).fileName();
+    originKind = lit("shader-source-selection");    // i18n-ignore: attachment context ID
+    selection.source =
+        tr("Shader source %1, lines %2-%3").arg(displayName).arg(firstLine).arg(lastLine);
+  }
+
+  selection.title = tr("Shader selection: %1").arg(displayName);
+
+  // i18n-ignore: Everything below is the versioned attachment context wire protocol. User-visible
+  // source names remain data, while field names, schema IDs, relation kinds, and panel IDs must be
+  // stable across UI languages.
+  QJsonObject context;
+  // i18n-ignore: Stable attachment context schema field and version ID.
+  context[lit("schema")] = lit("replaylab-attachment-context/v1");
+
+  QJsonObject origin;
+  origin[lit("kind")] = originKind;    // i18n-ignore: attachment context field
+  // i18n-ignore: Stable attachment context field and panel ID.
+  origin[lit("panel")] = lit("shader-viewer");
+  // Keep machine-local absolute paths out of provider-visible context. sourceId remains stable for
+  // Host-side correlation, while sourceName is a human-readable leaf name only.
+  origin[lit("sourceName")] = displayName;    // i18n-ignore: attachment context field
+  QJsonObject range;
+  range[lit("lineStart")] = firstLine;    // i18n-ignore: attachment context field
+  range[lit("columnStart")] = firstColumn;    // i18n-ignore: attachment context field
+  range[lit("lineEnd")] = lastLine;    // i18n-ignore: attachment context field
+  range[lit("columnEnd")] = lastColumn;    // i18n-ignore: attachment context field
+  origin[lit("range")] = range;    // i18n-ignore: attachment context field
+
+  ResourceId shaderId = m_EditingShader;
+  if(m_ShaderDetails)
+    shaderId = m_ShaderDetails->resourceId;
+  const QString shaderIdText = ToQStr(shaderId);
+  const QByteArray sourceIdentity =
+      (originKind + lit("\n") + shaderIdText + lit("\n") + sourceName).toUtf8();
+  // i18n-ignore: Stable attachment context field and opaque source-ID prefix.
+  origin[lit("sourceId")] = lit("shader-source-") +
+      QString::fromLatin1(
+          QCryptographicHash::hash(sourceIdentity, QCryptographicHash::Sha256).toHex());
+  context[lit("origin")] = origin;    // i18n-ignore: attachment context field
+
+  if(m_Ctx.IsCaptureLoaded())
+  {
+    QJsonObject capture;
+    capture[lit("eventId")] = int(m_Ctx.CurEvent());    // i18n-ignore: attachment context field
+    capture[lit("selectedEventId")] =
+        int(m_Ctx.CurSelectedEvent());    // i18n-ignore: attachment context field
+    context[lit("capture")] = capture;    // i18n-ignore: attachment context field
+  }
+
+  QJsonObject shader;
+  shader[lit("stage")] = ToQStr(m_Stage);    // i18n-ignore: attachment context field
+  if(shaderId != ResourceId())
+    shader[lit("resourceId")] = shaderIdText;    // i18n-ignore: attachment context field
+  const QString entryPoint =
+      m_ShaderDetails ? QString(m_ShaderDetails->entryPoint) : ui->entryFunc->text();
+  if(!entryPoint.isEmpty())
+    shader[lit("entryPoint")] = entryPoint;    // i18n-ignore: attachment context field
+  if(m_ShaderDetails && !m_ShaderDetails->rawBytes.empty() &&
+     m_ShaderDetails->rawBytes.size() <= size_t(INT_MAX))
+  {
+    const QByteArray rawBytes(
+        reinterpret_cast<const char *>(m_ShaderDetails->rawBytes.data()),
+        int(m_ShaderDetails->rawBytes.size()));
+    // i18n-ignore: Stable attachment context field for raw Shader identity.
+    shader[lit("rawSha256")] = QString::fromLatin1(
+        QCryptographicHash::hash(rawBytes, QCryptographicHash::Sha256).toHex());
+  }
+  context[lit("shader")] = shader;    // i18n-ignore: attachment context field
+
+  // A relation is only emitted when the current host pipeline proves that this exact shader is
+  // bound at the selected stage. It is still an association hint: AgentHost must re-resolve it
+  // against the frozen capture before using it as evidence or tool authority.
+  if(m_Ctx.IsCaptureLoaded() && shaderId != ResourceId() &&
+     m_Ctx.CurPipelineState().GetShader(m_Stage) == shaderId)
+  {
+    ResourceId pipelineId = m_Pipeline;
+    if(pipelineId == ResourceId())
+    {
+      pipelineId = m_Stage == ShaderStage::Compute
+                       ? m_Ctx.CurPipelineState().GetComputePipelineObject()
+                       : m_Ctx.CurPipelineState().GetGraphicsPipelineObject();
+    }
+    const QString pipelineIdText = ToQStr(pipelineId);
+    const QString relationIdentity =
+        QFormatStr("%1\n%2\n%3\n%4")
+            .arg(m_Ctx.CurEvent())
+            .arg(shaderIdText)
+            .arg(ToQStr(m_Stage))
+            .arg(pipelineIdText);
+    QJsonObject relation;
+    // i18n-ignore: Stable attachment relation field and opaque relation-ID prefix.
+    relation[lit("id")] = lit("shader-binding-") +
+        QString::fromLatin1(QCryptographicHash::hash(relationIdentity.toUtf8(),
+                                                     QCryptographicHash::Sha256)
+                               .toHex());
+    // i18n-ignore: Stable attachment relation field and relation-kind ID.
+    relation[lit("kind")] = lit("bound-at-event");
+    relation[lit("targetId")] = pipelineIdText;    // i18n-ignore: attachment relation field
+    relation[lit("usage")] =
+        QString(m_Ctx.CurPipelineState().Abbrev(m_Stage));    // i18n-ignore: relation API stage ID
+    context[lit("relations")] = QJsonArray({relation});    // i18n-ignore: context relation field
+  }
+
+  selection.contextJSON = QString::fromUtf8(QJsonDocument(context).toJson(QJsonDocument::Compact));
+  return selection;
+}
+
+void ShaderViewer::updateTextAttachmentSelection(ScintillaEdit *editor)
+{
+  if(m_TextAttachmentSelecting)
+  {
+    m_AddToChatButton->hide();
+    return;
+  }
+
+  sptr_t start = editor->selectionStart();
+  sptr_t end = editor->selectionEnd();
+  if(end < start)
+    qSwap(start, end);
+  if(m_TextAttachmentEditor == editor && m_TextAttachmentSelection.isValid() &&
+     m_TextAttachmentSelection.start == start && m_TextAttachmentSelection.end == end)
+  {
+    updateTextAttachmentButtonGeometry();
+    return;
+  }
+
+  const TextAttachmentSelection selection = captureTextAttachmentSelection(editor);
+  if(!selection.isValid() || !editor->isVisible())
+  {
+    if(m_TextAttachmentEditor == editor)
+    {
+      m_TextAttachmentEditor.clear();
+      m_TextAttachmentSelection = TextAttachmentSelection();
+      m_AddToChatButton->hide();
+    }
+    return;
+  }
+
+  m_TextAttachmentEditor = editor;
+  m_TextAttachmentSelection = selection;
+  updateTextAttachmentButtonGeometry();
+}
+
+void ShaderViewer::updateTextAttachmentButtonGeometry()
+{
+  ScintillaEdit *editor = m_TextAttachmentEditor;
+  if(!m_AddToChatButton || !editor || !editor->isVisible() ||
+     !m_TextAttachmentSelection.isValid() || m_ContextActive)
+  {
+    if(m_AddToChatButton)
+      m_AddToChatButton->hide();
+    return;
+  }
+
+  QWidget *viewport = editor->viewport();
+  const sptr_t caret = editor->currentPos();
+  const int line = int(editor->lineFromPosition(caret));
+  const QPoint caretPoint(int(editor->pointXFromPosition(caret)),
+                          int(editor->pointYFromPosition(caret)));
+
+  if(caretPoint.y() < 0 || caretPoint.y() >= viewport->height())
+  {
+    m_AddToChatButton->hide();
+    return;
+  }
+
+  m_AddToChatButton->adjustSize();
+  const QRect viewportRect(viewport->mapTo(this, QPoint(0, 0)), viewport->size());
+  int x = viewportRect.left() + caretPoint.x() + 6;
+  int y = viewportRect.top() + caretPoint.y() + int(editor->textHeight(line)) + 4;
+
+  if(y + m_AddToChatButton->height() > viewportRect.bottom() - 4)
+    y = viewportRect.top() + caretPoint.y() - m_AddToChatButton->height() - 4;
+
+  const int maxX = qMax(viewportRect.left() + 4,
+                        viewportRect.right() - m_AddToChatButton->width() - 4);
+  const int maxY = qMax(viewportRect.top() + 4,
+                        viewportRect.bottom() - m_AddToChatButton->height() - 4);
+  x = qBound(viewportRect.left() + 4, x, maxX);
+  y = qBound(viewportRect.top() + 4, y, maxY);
+
+  m_AddToChatButton->move(x, y);
+  m_AddToChatButton->show();
+  m_AddToChatButton->raise();
+}
+
+void ShaderViewer::addTextAttachmentToChat(const TextAttachmentSelection &selection)
+{
+  if(!selection.isValid())
+    return;
+
+  m_Ctx.AddTextToAIAssistant(selection.title, selection.text, selection.source,
+                             selection.contextJSON);
+}
+
 void ShaderViewer::readonly_keyPressed(QKeyEvent *event)
 {
   if(event->key() == Qt::Key_F && (event->modifiers() & Qt::ControlModifier))
@@ -1880,9 +2185,11 @@ void ShaderViewer::editable_keyPressed(QKeyEvent *event)
 void ShaderViewer::debug_contextMenu(const QPoint &pos)
 {
   m_ContextActive = true;
+  m_AddToChatButton->hide();
   hideVariableTooltip();
 
   ScintillaEdit *edit = qobject_cast<ScintillaEdit *>(QObject::sender());
+  const TextAttachmentSelection textAttachment = captureTextAttachmentSelection(edit);
 
   bool isDisasm = (edit == m_DisassemblyView);
 
@@ -1988,6 +2295,14 @@ void ShaderViewer::debug_contextMenu(const QPoint &pos)
   contextMenu.addAction(&watchExpr);
   contextMenu.addSeparator();
 
+  QAction addToChat(tr("Add to chat"), this);
+  addToChat.setEnabled(textAttachment.isValid());
+  QObject::connect(&addToChat, &QAction::triggered, this,
+                   [this, textAttachment]() { addTextAttachmentToChat(textAttachment); });
+
+  contextMenu.addAction(&addToChat);
+  contextMenu.addSeparator();
+
   QAction copyText(tr("Copy"), this);
   QAction selectAll(tr("Select All"), this);
 
@@ -2004,6 +2319,7 @@ void ShaderViewer::debug_contextMenu(const QPoint &pos)
   RDDialog::show(&contextMenu, edit->viewport()->mapToGlobal(pos));
 
   m_ContextActive = false;
+  updateTextAttachmentSelection(edit);
 }
 
 void ShaderViewer::variables_contextMenu(const QPoint &pos)
@@ -3935,12 +4251,12 @@ void ShaderViewer::updateEditState()
     if(m_Ctx.IsResourceReplaced(m_EditingShader))
     {
       statusString = tr("Status: Edited Shader Active");
-      statusTooltip = tr("The replay currently has the original shader active");
+      statusTooltip = tr("The replay currently has an edited version of the shader active");
     }
     else
     {
       statusString = tr("Status: Original Shader Active");
-      statusTooltip = tr("The replay currently has an edited version of the shader active");
+      statusTooltip = tr("The replay currently has the original shader active");
 
       // if we expected it to be saved something went wrong
       if(m_Saved)
@@ -5867,7 +6183,7 @@ rdcstrpairs ShaderViewer::GetCurrentFileContents()
   for(ScintillaEdit *s : m_Scintillas)
   {
     // don't include the disassembly view
-    if(m_DisassemblyView == s)
+    if(m_DisassemblyView == s || ((QWidget *)s)->property("shaderNavigationOnly").toBool())
       continue;
 
     QWidget *w = (QWidget *)s;
@@ -6181,7 +6497,11 @@ bool ShaderViewer::eventFilter(QObject *watched, QEvent *event)
   {
     ScintillaEdit *focusedEditor = qobject_cast<ScintillaEdit *>(watched);
     if(focusedEditor)
+    {
       m_FindEditor = focusedEditor;
+      if(m_Scintillas.contains(focusedEditor))
+        updateTextAttachmentSelection(focusedEditor);
+    }
   }
 
   if((event->type() == QEvent::Resize || event->type() == QEvent::Move ||
@@ -6189,7 +6509,16 @@ bool ShaderViewer::eventFilter(QObject *watched, QEvent *event)
      qobject_cast<ScintillaEdit *>(watched))
   {
     updateFindOverlayGeometry();
+
+    ScintillaEdit *editor = qobject_cast<ScintillaEdit *>(watched);
+    if(m_Scintillas.contains(editor) && !editor->selectionEmpty())
+      updateTextAttachmentSelection(editor);
+    else if(m_TextAttachmentEditor == editor)
+      updateTextAttachmentButtonGeometry();
   }
+
+  if(event->type() == QEvent::Hide && m_TextAttachmentEditor == watched)
+    m_AddToChatButton->hide();
 
   if(event->type() == QEvent::ToolTip)
   {
@@ -6708,6 +7037,8 @@ void ShaderViewer::on_resetEdits_clicked()
   for(ScintillaEdit *s : m_Scintillas)
   {
     QWidget *w = (QWidget *)s;
+    if(w->property("shaderNavigationOnly").toBool())
+      continue;
     s->selectAll();
     s->replaceSel(w->property("origText").toString().toUtf8().data());
   }
@@ -6767,6 +7098,8 @@ void ShaderViewer::on_refresh_clicked()
     for(ScintillaEdit *s : m_Scintillas)
     {
       QWidget *w = (QWidget *)s;
+      if(w->property("shaderNavigationOnly").toBool())
+        continue;
       files.push_back(
           {w->property("filename").toString(), QString::fromUtf8(s->getText(s->textLength() + 1))});
     }

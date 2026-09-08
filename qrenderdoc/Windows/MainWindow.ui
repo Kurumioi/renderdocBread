@@ -160,6 +160,7 @@
     <addaction name="action_Event_Browser"/>
     <addaction name="action_Texture_Viewer"/>
     <addaction name="action_Pipeline_State"/>
+    <addaction name="action_Bookmarks"/>
     <addaction name="action_API_Inspector"/>
     <addaction name="action_Annotation_Viewer"/>
     <addaction name="action_Mesh_Output"/>
@@ -282,6 +283,11 @@
   <action name="action_Pipeline_State">
    <property name="text">
     <string>&amp;Pipeline State</string>
+   </property>
+  </action>
+  <action name="action_Bookmarks">
+   <property name="text">
+    <string>&amp;Bookmarks</string>
    </property>
   </action>
   <action name="action_API_Inspector">

@@ -1606,7 +1606,11 @@ bool D3D12Replay::FetchShaderFeedback(uint32_t eventId)
   {
     D3D12StatCallback cb(m_pDevice, m_BindlessFeedback.PipeStatsHeap, annotatedSig, &modComSig);
 
-    m_pDevice->ReplayLog(0, eventId, eReplay_OnlyDraw);
+    // This private callback preserves every original captured write and adds only feedback/query
+    // scratch. Track the original complete-list write superset; other analysis callbacks remain
+    // conservative. This scope can preserve an existing proof but cannot create one after a
+    // forced root replay. Event-scoped CBuffer overrides never enter this scope.
+    m_pDevice->ReplayLog(0, eventId, eReplay_OnlyDraw, false, m_KnownOrdinaryTargetFeedback);
 
     ID3D12GraphicsCommandList *list = m_pDevice->GetNewList();
     if(!list)

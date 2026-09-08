@@ -136,7 +136,7 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
         self.assertIn("self.activateWindow()", open_capture)
         self.assertIn("self._set_busy(False)", open_capture)
 
-    def test_post_load_restore_progress_is_separate_bounded_and_ui_polled(self):
+    def test_post_load_restore_progress_uses_the_status_bar_and_is_ui_polled(self):
         launcher_init = _class_method_source(
             "ReplayLabProjectLauncher", "__init__")
         open_capture = _class_method_source(
@@ -145,16 +145,24 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
             "ReplayLabProjectLauncher", "_start_capture_restore")
         restore_finished = _class_method_source(
             "ReplayLabProjectLauncher", "_capture_restore_finished")
-        dialog_init = _class_method_source(
-            "ReplayLabRestoreProgressDialog", "__init__")
-        dialog_start = _class_method_source(
-            "ReplayLabRestoreProgressDialog", "start")
+        task_init = _class_method_source(
+            "ReplayLabRestoreStatusTask", "__init__")
+        install_status = _class_method_source(
+            "ReplayLabRestoreStatusTask", "_install_status_widget")
+        remove_status = _class_method_source(
+            "ReplayLabRestoreStatusTask", "_remove_status_widget")
+        task_start = _class_method_source(
+            "ReplayLabRestoreStatusTask", "start")
         publish_progress = _class_method_source(
-            "ReplayLabRestoreProgressDialog", "publish_progress")
+            "ReplayLabRestoreStatusTask", "publish_progress")
         drain_progress = _class_method_source(
-            "ReplayLabRestoreProgressDialog", "_drain_progress")
+            "ReplayLabRestoreStatusTask", "_drain_progress")
+        terminal_failure = _class_method_source(
+            "ReplayLabRestoreStatusTask", "_show_terminal_failure")
         abandon_restore = _class_method_source(
-            "ReplayLabRestoreProgressDialog", "abandon")
+            "ReplayLabRestoreStatusTask", "abandon")
+        abandon_capture = _class_method_source(
+            "ReplayLabProjectLauncher", "abandon_capture_restore")
         launcher_finished = _class_method_source(
             "ReplayLabProjectLauncher", "_dialog_finished")
 
@@ -165,31 +173,50 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
             open_capture.index("self._start_capture_restore(project_root, path)"))
         self.assertIn("if self.restore_capture is None", open_capture)
         self.assertIn("open_error = _capture_open_error(opened)", open_capture)
-        self.assertIn("ReplayLabRestoreProgressDialog(", start_restore)
-        self.assertIn("dialog.start()", start_restore)
+        self.assertIn('getattr(parent, "statusBar"', start_restore)
+        self.assertIn('find_child(', start_restore)
+        self.assertIn('QtWidgets.QStatusBar, "statusBar"', start_restore)
+        self.assertIn("ReplayLabRestoreStatusTask(", start_restore)
+        self.assertIn("task.start()", start_restore)
+        self.assertNotIn(".show()", start_restore)
+        self.assertNotIn(".raise_()", start_restore)
+        self.assertNotIn(".activateWindow()", start_restore)
 
+        self.assertIn("QtCore.QObject.__init__(self, parent)", task_init)
+        self.assertIn("self._progress_timer.setInterval(25)", task_init)
+        self.assertIn("queue.Queue(MAX_RESTORE_PROGRESS_EVENTS)", task_init)
+        self.assertIn("QtWidgets.QLabel(widget)", install_status)
+        self.assertIn("QtCore.Qt.PlainText", install_status)
+        self.assertIn("QtWidgets.QSizePolicy.Ignored", install_status)
+        self.assertIn("QtWidgets.QProgressBar(widget)", install_status)
+        self.assertIn("add_widget(widget, 1)", install_status)
+        self.assertNotIn(".showMessage(", install_status)
+        self.assertIn("remove_widget(widget)", remove_status)
+        self.assertIn("widget.deleteLater()", remove_status)
+        self.assertIn('"phase": "restore-dispatch"', task_start)
         self.assertLess(
-            dialog_init.index("root.addWidget(self.progress_bar)"),
-            dialog_init.index("root.addWidget(self.status_label)"))
-        self.assertIn("self._progress_timer.setInterval(25)", dialog_init)
-        self.assertIn("queue.Queue(MAX_RESTORE_PROGRESS_EVENTS)", dialog_init)
-        self.assertIn('"phase": "restore-dispatch"', dialog_start)
-        self.assertLess(
-            dialog_start.index('"phase": "restore-dispatch"'),
-            dialog_start.index("self.executor.submit("))
-        self.assertIn("self.executor.submit(", dialog_start)
-        self.assertIn("self.publish_progress", dialog_start)
+            task_start.index('"phase": "restore-dispatch"'),
+            task_start.index("self.executor.submit("))
+        self.assertIn("self.executor.submit(", task_start)
+        self.assertIn("self.publish_progress", task_start)
         self.assertIn("self._progress_events.put_nowait(progress)", publish_progress)
         self.assertIn("self._progress_events.get_nowait()", drain_progress)
         self.assertIn("latest[\"current\"]", drain_progress)
-        self.assertIn("_restore_progress_text(latest)", drain_progress)
+        self.assertIn("_restore_status_text(latest)", drain_progress)
+        self.assertIn('getattr(self.status_bar, "showMessage"', terminal_failure)
+        self.assertIn("show_message(text, 30000)", terminal_failure)
+        self.assertNotIn("QMessageBox", terminal_failure)
         self.assertIn("self._progress_timer.stop()", abandon_restore)
+        self.assertIn("self._remove_status_widget()", abandon_restore)
         self.assertIn("self.deleteLater()", abandon_restore)
-        self.assertIn("restore_dialog.abandon()", launcher_finished)
+        self.assertIn("restore_task.abandon()", abandon_capture)
+        self.assertIn("self.async_executor.cancel_owner", abandon_capture)
+        self.assertIn("self.close()", abandon_capture)
+        self.assertIn("restore_task.abandon()", launcher_finished)
 
-        self.assertIn("QtWidgets.QMessageBox.warning(", restore_finished)
-        self.assertIn("The RDC opened successfully", restore_finished)
-        self.assertIn("You can continue using the opened capture", restore_finished)
+        self.assertNotIn("QtWidgets.QMessageBox", restore_finished)
+        self.assertNotIn("exec_", restore_finished)
+        self.assertIn("Background project restore failed", restore_finished)
         self.assertIn("self.close()", restore_finished)
 
     def test_restore_progress_contract_is_bounded_and_formats_counts(self):
@@ -206,6 +233,23 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
             "Checking shared Shader hashes (7 / 12)",
             project_launcher._restore_progress_text(value))
 
+        item_value = project_launcher._normalise_restore_progress({
+            "phase": "export-shader-bindings",
+            "message": "",
+            "current": 3,
+            "total": 9,
+            "item": "EID 418",
+        })
+        self.assertEqual("EID 418", item_value["item"])
+        self.assertEqual(
+            "Exporting Shader bindings (3 / 9) · Current item: EID 418",
+            project_launcher._restore_progress_text(item_value))
+        self.assertEqual(
+            "ReplayLab project recovery: Exporting Shader bindings "
+            "(3 / 9) · Current item: EID 418",
+            project_launcher._restore_status_text(item_value))
+        self.assertNotIn("\n", project_launcher._restore_status_text(item_value))
+
         expected_local_phases = {
             "restore-dispatch": "Scheduling ReplayLab project recovery",
             "client-validate": "Validating the project recovery request",
@@ -216,8 +260,11 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
             "restore-running": "ReplayLab Host is running project recovery",
             "result-validate": "Validating the project recovery result",
             "index-required": (
-                "A full Shader index is required before project data can be restored"
+                "A unique Shader resource index is required before project data can be restored"
             ),
+            "resource-inventory": "Indexing unique Shader resources",
+            "resource-match": "Matching exact project Shader artifacts",
+            "resource-anchor": "Validating one representative EID per Shader",
         }
         for phase, expected in expected_local_phases.items():
             with self.subTest(phase=phase):
@@ -239,6 +286,12 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
                 project_launcher.ProjectLauncherError, "counts"):
             project_launcher._normalise_restore_progress({
                 "phase": "hash", "message": "Checking", "current": -1, "total": 2,
+            })
+        with self.assertRaisesRegex(
+                project_launcher.ProjectLauncherError, "text"):
+            project_launcher._normalise_restore_progress({
+                "phase": "hash", "message": "Checking", "current": 1,
+                "total": 2, "item": "x" * 1025,
             })
 
     def test_explicit_open_and_restore_failures_are_distinguished(self):

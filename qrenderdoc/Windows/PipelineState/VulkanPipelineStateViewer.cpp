@@ -124,14 +124,11 @@ Q_DECLARE_METATYPE(VulkanBufferTag);
 
 struct VulkanTextureTag
 {
-  VulkanTextureTag() { compType = CompType::Typeless; }
-  VulkanTextureTag(ResourceId id, CompType ty)
+  VulkanTextureTag() = default;
+  VulkanTextureTag(const Descriptor &desc) : descriptor(desc)
   {
-    ID = id;
-    compType = ty;
   }
-  ResourceId ID;
-  CompType compType;
+  Descriptor descriptor;
 };
 
 Q_DECLARE_METATYPE(VulkanTextureTag);
@@ -606,7 +603,7 @@ ResourceId VulkanPipelineStateViewer::GetResource(RDTreeWidgetItem *item)
   else if(tag.canConvert<VulkanTextureTag>())
   {
     VulkanTextureTag texTag = tag.value<VulkanTextureTag>();
-    return texTag.ID;
+    return texTag.descriptor.resource;
   }
   else if(tag.canConvert<VulkanBufferTag>())
   {
@@ -636,6 +633,35 @@ ResourceId VulkanPipelineStateViewer::GetResource(RDTreeWidgetItem *item)
   }
 
   return ResourceId();
+}
+
+bool VulkanPipelineStateViewer::GetTextureHistoryDetails(RDTreeWidgetItem *item,
+                                                         Subresource &subresource,
+                                                         CompType &typeCast)
+{
+  subresource = Subresource();
+
+  ResourceId resource = GetResource(item);
+  TextureDescription *tex = m_Ctx.GetTexture(resource);
+  if(tex == NULL)
+    return false;
+
+  typeCast = tex->format.compType;
+
+  QVariant tag = item->tag();
+  if(tag.canConvert<VulkanTextureTag>())
+  {
+    const Descriptor &descriptor = tag.value<VulkanTextureTag>().descriptor;
+    if(descriptor.resource == resource)
+    {
+      subresource.mip = descriptor.firstMip;
+      subresource.slice = descriptor.firstSlice;
+      typeCast = descriptor.format.compType;
+    }
+  }
+
+  subresource.sample = tex->msSamp > 1 ? TextureDisplay::ResolveSamples : 0;
+  return true;
 }
 
 void VulkanPipelineStateViewer::on_showUnused_toggled(bool checked)
@@ -1318,7 +1344,7 @@ void VulkanPipelineStateViewer::addResourceRow(const ShaderResource *shaderRes,
         restype = tex->type;
         samples = tex->msSamp;
 
-        tag = QVariant::fromValue(VulkanTextureTag(descriptor.resource, descriptor.format.compType));
+        tag = QVariant::fromValue(VulkanTextureTag(descriptor));
       }
 
       // if not a texture, it must be a buffer
@@ -2982,7 +3008,7 @@ void VulkanPipelineStateViewer::setState()
               {slotname, resName, typeName, dimensions, format, samples, QString()});
 
           if(tex)
-            node->setTag(QVariant::fromValue(VulkanTextureTag(p.resource, p.format.compType)));
+            node->setTag(QVariant::fromValue(VulkanTextureTag(p)));
 
           if(p.resource == ResourceId())
             setEmptyRow(node);
@@ -3218,7 +3244,7 @@ void VulkanPipelineStateViewer::resource_itemActivated(RDTreeWidgetItem *item, i
   {
     VulkanTextureTag vtex = tag.value<VulkanTextureTag>();
 
-    TextureDescription *tex = m_Ctx.GetTexture(vtex.ID);
+    TextureDescription *tex = m_Ctx.GetTexture(vtex.descriptor.resource);
 
     if(tex)
     {
@@ -3234,7 +3260,7 @@ void VulkanPipelineStateViewer::resource_itemActivated(RDTreeWidgetItem *item, i
         if(!m_Ctx.HasTextureViewer())
           m_Ctx.ShowTextureViewer();
         ITextureViewer *viewer = m_Ctx.GetTextureViewer();
-        viewer->ViewTexture(tex->resourceId, vtex.compType, true);
+        viewer->ViewTexture(tex->resourceId, vtex.descriptor.format.compType, true);
       }
 
       return;

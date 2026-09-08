@@ -106,6 +106,10 @@ public:
   static PyObject *QWidgetToPy(QWidget *widget) { return QtObjectToPython("QWidget", widget); }
   static QWidget *QWidgetFromPy(PyObject *widget);
 
+  // Call on the UI thread before deleting an application-owned QObject exposed to PySide.
+  // This does not delete the native object or invalidate its parent widget.
+  static void InvalidateNativeQtObject(QObject *object);
+
   QStringList completionOptions(QString base);
 
   void abort() { m_Abort = true; }

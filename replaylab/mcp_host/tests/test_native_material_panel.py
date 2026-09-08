@@ -24,6 +24,10 @@ def _load_module():
 
 
 panel = _load_module()
+UI_PATH = MODULE_PATH.with_name("project_material_panel.py")
+_ui_spec = importlib.util.spec_from_file_location("replaylab_material_ui", UI_PATH)
+panel_ui = importlib.util.module_from_spec(_ui_spec)
+_ui_spec.loader.exec_module(panel_ui)
 
 
 def _leaf(path: str, base_type: str, components: int, offset: int) -> dict:
@@ -177,17 +181,52 @@ class NativeSelectionTests(unittest.TestCase):
             callback, resources.get, lambda value: {"Pixel": "fragment"}.get(value, value))
         self.assertEqual(value, _selection())
 
+        native_pairs = list(callback.items())
+        self.assertEqual(panel.native_selection_from_callback(
+            native_pairs, resources.get, lambda value: "fragment"), value)
+        for malformed in (native_pairs + [("eventId", 99)], native_pairs + [("eventId",)],
+                          native_pairs + [(3, "not a native string key")]):
+            with self.assertRaises(panel.MaterialPanelError):
+                panel.native_selection_from_callback(malformed, resources.get, lambda value: "fragment")
+
         callback["arrayIndex"] = 1
-        with self.assertRaises(panel.MaterialPanelError):
-            panel.native_selection_from_callback(
-                callback, resources.get, lambda value: "fragment")
+        self.assertEqual(panel.native_selection_from_callback(
+            callback, resources.get, lambda value: "fragment")["arrayIndex"], 1)
 
     def test_python_36_parser_accepts_embedded_panel(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
         ast.parse(source, filename=str(MODULE_PATH), feature_version=(3, 6))
+        ast.parse(UI_PATH.read_text(encoding="utf-8"), feature_version=(3, 6))
 
 
 class MaterialPanelControllerTests(unittest.TestCase):
+    def test_shared_window_and_leaf_beyond_64k_preserve_neighbor_bytes(self):
+        bridge = _Bridge()
+        size, base, offset = 128 * 1024, 256 * 1024 + 4, 96 * 1024
+        bridge.api = "GraphicsAPI.Vulkan"
+        bridge.raw = bytearray(b"\x5a" * size)
+        struct.pack_into("<f", bridge.raw, offset, 0.5)
+        bridge.fields = [_leaf("roughness", "Float", 1, offset)]
+        original_snapshot = bridge.snapshot
+
+        def snapshot(params):
+            result = original_snapshot(params)
+            result.update(byteOffset=base, byteSize=size, validByteSize=size)
+            return result
+
+        model = panel.MaterialPanelController(snapshot, bridge.apply, bridge.rollback, bridge.context)
+        state = model.expose(_selection(bufferByteOffset=base, bufferByteSize=size,
+                                        fieldByteOffset=offset))
+        model.update(state["sessionId"], state["parameters"][0]["parameterId"], 0.25)
+        updated = base64.b64decode(bridge.apply_calls[-1]["data_base64"])
+        self.assertEqual(updated[:offset], bytes(bridge.raw[:offset]))
+        self.assertEqual(updated[offset:offset + 4], struct.pack("<f", 0.25))
+        self.assertEqual(updated[offset + 4:], bytes(bridge.raw[offset + 4:]))
+        self.assertEqual(state["parameters"][0]["bindingByteOffset"], base)
+        self.assertEqual(state["parameters"][0]["byteOffset"], offset)
+        with self.assertRaises(panel.MaterialPanelError):
+            model.expose(_selection(bufferByteSize=panel.MAX_SHARED_CBUFFER_BYTES + 1))
+
     def setUp(self):
         self.bridge = _Bridge()
         self.controller = panel.MaterialPanelController(
@@ -201,6 +240,7 @@ class MaterialPanelControllerTests(unittest.TestCase):
             {
                 "event_id": 41,
                 "block_index": 0,
+                "array_index": 0,
                 "stage": "fragment",
                 "expected_capture_id": CAPTURE_ID,
             },
@@ -211,7 +251,7 @@ class MaterialPanelControllerTests(unittest.TestCase):
         self.assertEqual(parameter["displayName"], "RealRoughness")
         self.assertEqual(parameter["value"], [0.5])
         self.assertIn("EID 41", parameter["physicalIdentity"])
-        self.assertIn("PS b2 space0", parameter["physicalIdentity"])
+        self.assertIn("PS binding2 space0", parameter["physicalIdentity"])
         self.assertIn("field +0x0", parameter["physicalIdentity"])
         self.assertIn("buffer +0x40", parameter["physicalIdentity"])
 
@@ -248,15 +288,16 @@ class MaterialPanelControllerTests(unittest.TestCase):
         self.assertEqual(len(self.bridge.rollback_calls), 1)
         self.assertEqual(self.controller.list_status(), [])
 
-    def test_type_and_event_guards_fail_before_bridge_apply(self):
+    def test_type_guard_and_shared_edit_after_event_navigation(self):
         status = self.controller.expose(_selection())
         parameter_id = status["parameters"][0]["parameterId"]
         with self.assertRaises(panel.MaterialPanelError):
             self.controller.update_text(status["sessionId"], parameter_id, "nan")
         self.bridge.current_event = 42
-        with self.assertRaisesRegex(panel.MaterialPanelError, "Select EID 41"):
-            self.controller.update_text(status["sessionId"], parameter_id, "1")
-        self.assertEqual(self.bridge.apply_calls, [])
+        result = self.controller.update_text(status["sessionId"], parameter_id, "1")
+        self.assertEqual(result["scope"], "shared-buffer-range")
+        self.assertEqual(result["parameters"][0]["absoluteByteOffset"], 64)
+        self.assertEqual(len(self.bridge.apply_calls), 1)
 
     def test_rollback_releases_snapshot_and_forgets_parameter(self):
         status = self.controller.expose(_selection())
@@ -273,21 +314,16 @@ class MaterialPanelControllerTests(unittest.TestCase):
             self.controller.expose(_selection())
         self.assertEqual(self.bridge.snapshot_calls, [])
 
-    def test_non_d3d11_and_remote_replay_fail_with_distinct_reasons(self):
-        self.bridge.api = "GraphicsAPI.Vulkan"
-        with self.assertRaisesRegex(
-                panel.MaterialPanelError,
-                "Current capture API is GraphicsAPI.Vulkan.*supports D3D11 and D3D12 only"):
-            self.controller.expose(_selection())
-        self.assertEqual(self.bridge.snapshot_calls, [])
-
-        self.bridge.api = "GraphicsAPI.D3D12"
-        self.bridge.local = False
-        with self.assertRaisesRegex(
-                panel.MaterialPanelError,
-                "capture is using remote replay.*requires local replay"):
-            self.controller.expose(_selection())
-        self.assertEqual(self.bridge.snapshot_calls, [])
+    def test_four_api_and_remote_scope_defer_native_capability_to_setter(self):
+        for api in ("D3D11", "D3D12", "Vulkan", "OpenGL"):
+            bridge = _Bridge()
+            bridge.api = "GraphicsAPI." + api
+            bridge.local = False
+            controller = panel.MaterialPanelController(
+                bridge.snapshot, bridge.apply, bridge.rollback, bridge.context)
+            status = controller.expose(_selection())
+            self.assertEqual(status["api"], api)
+            self.assertEqual(status["scope"], "shared-buffer-range")
 
     def test_local_d3d12_material_session_is_supported(self):
         self.bridge.api = "GraphicsAPI.D3D12"
@@ -348,7 +384,11 @@ class _LifecycleController:
         self.trace.append("forget")
 
     def list_status(self):
-        return [{}] if self.active else []
+        return [{"sessionId": "a" * 32}] if self.active else []
+
+    def submit_rollback(self, _session_id, complete, _owner):
+        self.rollback_all()
+        complete({}, None)
 
     def update_text(self, *_args):
         self.update_calls += 1
@@ -415,8 +455,10 @@ class MaterialPanelCloseLifecycleTests(unittest.TestCase):
             "QRD", (),
             {"DockReference": type("DockReference", (), {
                 "MainToolArea": 0, "RightOf": 1})})
-        qt_core = type("QtCore", (), {"QTimer": object})
-        value = panel.MiniQtMaterialPanel(
+        qt_core = type("QtCore", (), {"QTimer": object,
+            "QCoreApplication": type("Application", (), {
+                "translate": staticmethod(lambda _context, source: source)})})
+        value = panel_ui.MiniQtMaterialPanel(
             _LifecycleContext(helper), qrd, qt_core, controller,
             lambda: closed.append(True))
         return value, helper, controller, trace, closed
@@ -440,7 +482,7 @@ class MaterialPanelCloseLifecycleTests(unittest.TestCase):
         self.assertEqual(closed, [True])
 
         # Registration reuses the persistent controller when it creates the replacement dock.
-        reopened = panel.MiniQtMaterialPanel(
+        reopened = panel_ui.MiniQtMaterialPanel(
             context, qrd, qt_core, controller, None)
         self.assertEqual(len(reopened.controller.list_status()), 1)
         reopened._rollback_all_clicked(None, None, "")

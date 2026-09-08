@@ -45,6 +45,16 @@ from .organization import (
     ShaderOrganizationError,
     ShaderOrganizationManager,
 )
+from .flow_graph import (
+    FLOW_GRAPH_SCHEMA,
+    FLOW_GRAPH_VERSION,
+    MODULE_DESCRIPTIONS_SCHEMA,
+    MODULE_DESCRIPTIONS_VERSION,
+    ShaderFlowGraphError,
+    build_shader_flow_graph,
+    load_workspace_flow_graph_status,
+    validate_shader_flow_graph,
+)
 from .adapters.dxil_access_signature import (
     DXIL_CBUFFER_ACCESS_SCHEMA,
     DxilAccessSignatureError,
@@ -79,6 +89,11 @@ __all__ = [
     "ORGANIZATION_GATE_SCHEMA",
     "ORGANIZATION_POLICY_VERSION",
     "ORGANIZATION_SESSION_SCHEMA",
+    "FLOW_GRAPH_SCHEMA",
+    "FLOW_GRAPH_VERSION",
+    "MODULE_DESCRIPTIONS_SCHEMA",
+    "MODULE_DESCRIPTIONS_VERSION",
+    "ShaderFlowGraphError",
     "DXIL_CBUFFER_ACCESS_SCHEMA",
     "DxilAccessSignatureError",
     "DxilCBufferAccess",
@@ -100,6 +115,9 @@ __all__ = [
     "extract_target_profile",
     "validate_target_profile",
     "classify_shader_failure",
+    "build_shader_flow_graph",
+    "load_workspace_flow_graph_status",
+    "validate_shader_flow_graph",
     "extract_dxil_cbuffer_access_signature",
     "extract_dxil_unannotated_cbuffer_bindings",
 ]

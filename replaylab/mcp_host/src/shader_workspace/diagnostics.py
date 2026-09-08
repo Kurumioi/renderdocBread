@@ -149,7 +149,12 @@ def classify_shader_failure(
     organization_phase = str(phase or "").startswith("organization-")
     category = "unknown"
     retryable = False
-    actions: list[str] = ["preserve-evidence", "request-ai-explanation"]
+    # Unknown is a recoverable classification boundary, not permission to
+    # replace an execution goal with an explanation-only response. The Agent
+    # may inspect the bounded diagnostic and choose another registered route,
+    # while the Host continues to forbid inventing executables or replaying an
+    # unchanged failed call.
+    actions: list[str] = ["preserve-evidence", "request-ai-diagnostic-review"]
     ai_may_author_source = False
 
     if isinstance(error, ManifestValidationError) and _contains(
@@ -219,8 +224,161 @@ def classify_shader_failure(
             "keep-live-edit-blocked",
         ]
         ai_may_author_source = True
-    elif isinstance(error, ToolConfigurationError) or _contains(
-        message, r"integrity", r"sha-?256", r"fixed file", r"registry.*changed"
+    elif (
+        str(phase or "").startswith("workspace-prepare")
+        and not isinstance(error, ToolExecutionError)
+        and _contains(
+            message,
+            r"workspace_path is not the active project's deterministic path",
+            r"deterministic shader workspace escaped the active project",
+            r"existing workspace is outside the active project workspace root",
+        )
+    ):
+        category = "workspace-path-policy-violation"
+        actions = [
+            "preserve-evidence",
+            "keep-workspace-write-blocked",
+            "resolve-active-managed-workspace-path",
+        ]
+    elif (
+        str(phase or "").startswith("workspace-prepare")
+        and not isinstance(error, ToolExecutionError)
+        and _contains(
+            message,
+            r"\[errno 2\].*no such file or directory.*[\\/]blobs[\\/].*\.tmp",
+            r"filename or extension is too long.*[\\/]blobs[\\/]",
+            r"path too long.*[\\/]blobs[\\/]",
+        )
+    ):
+        # A catalog export can reach the embedded Python/Win32 MAX_PATH ABI
+        # before a decompiler or compiler is launched.  This is a recoverable
+        # workspace-placement failure: keep the exact Shader binding, ask the
+        # Host for its compact managed path, and retry without user input.
+        category = "workspace-path-conflict"
+        retryable = True
+        actions = [
+            "preserve-evidence",
+            "resolve-active-managed-workspace-path",
+            "use-new-isolated-workspace",
+        ]
+    elif (
+        str(phase or "").startswith("workspace-prepare")
+        and not isinstance(error, ToolExecutionError)
+        and _contains(message, r"workspace (?:path )?already exists")
+    ):
+        category = "workspace-path-conflict"
+        retryable = True
+        actions = [
+            "preserve-evidence",
+            "resolve-active-managed-workspace-path",
+            "use-new-isolated-workspace",
+        ]
+    elif (
+        str(phase or "").startswith("workspace-prepare")
+        and not isinstance(error, ToolExecutionError)
+        and _contains(
+            message,
+            r"renderdoc bridge returned an invalid catalog result",
+            r"renderdoc bridge did not return catalogpath",
+        )
+    ):
+        category = "capture-catalog-export-failed"
+        retryable = True
+        actions = [
+            "preserve-evidence",
+            "re-export-capture-catalog",
+            "retry-same-bound-shader",
+        ]
+    elif (
+        str(phase or "").startswith("workspace-prepare")
+        and not isinstance(error, ToolExecutionError)
+        and _contains(
+            message,
+            r"selected shader resourceid does not match",
+            r"selected shader entry point does not match",
+            r"selected shader bytes do not match",
+            r"selected shader catalog does not match",
+            r"selected shader lifecycle does not match",
+            r"active full-catalog binding (?:disappeared|changed)",
+            r"existing workspace does not match the exact selected shader",
+        )
+    ):
+        category = "capture-or-shader-identity-conflict"
+        actions = [
+            "preserve-evidence",
+            "rebind-exact-capture-and-shader",
+            "prepare-new-identity-bound-workspace",
+        ]
+    elif _contains(
+        message,
+        r"ray.*(?:state.?object|shader.?group|sbt)",
+        r"(?:state.?object|shader.?group|sbt).*ray",
+        r"library.*(?:export|association|state.?object)",
+    ):
+        category = "ray-library-replacement-unavailable"
+        actions = [
+            "preserve-evidence",
+            "preserve-compiled-source-or-ir",
+            "keep-apply-blocked",
+            "require-complete-export-state-object-sbt-transaction",
+        ]
+    elif not isinstance(error, ToolExecutionError) and _contains(
+        message,
+        r"capture session changed",
+        r"capture identity",
+        r"active capture.*(?:changed|different|match)",
+        r"shader identity.*(?:changed|different|match)",
+    ):
+        category = "capture-or-shader-identity-conflict"
+        actions = [
+            "preserve-evidence",
+            "keep-last-good-replacement",
+            "rebind-exact-capture-and-shader",
+            "require-new-save-after-rebind",
+        ]
+    elif not isinstance(error, ToolExecutionError) and _contains(
+        message,
+        r"foreign renderdoc replacement",
+        r"replacement.*(?:different workspace|no longer owned)",
+        r"captured shader is owned by",
+    ):
+        category = "replacement-ownership-conflict"
+        actions = [
+            "preserve-evidence",
+            "inspect-active-replacement-owner",
+            "keep-apply-blocked",
+            "use-owner-specific-rollback",
+        ]
+    elif not isinstance(error, ToolExecutionError) and _contains(
+        message,
+        r"checked .* shader replacement failed",
+        r"derived.*pipeline.*(?:failed|failure|rejected)",
+        r"(?:pipeline|program).*rebuild.*(?:failed|failure|rejected)",
+        r"program.*link.*(?:failed|failure|rejected)",
+    ):
+        category = "backend-replacement-rejected"
+        actions = [
+            "preserve-evidence",
+            "keep-last-good-replacement",
+            "inspect-backend-rebuild-diagnostic",
+            "repair-source-within-captured-abi",
+            "require-new-compiled-save",
+        ]
+        ai_may_author_source = True
+    elif not isinstance(error, ToolExecutionError) and _contains(
+        message, r"root signature", r"rootsignature"
+    ):
+        category = "root-signature-contract"
+        actions = [
+            "preserve-evidence",
+            "reuse-captured-pipeline-root-signature",
+            "keep-apply-blocked",
+        ]
+    elif isinstance(error, ToolConfigurationError) or (
+        not isinstance(error, ToolExecutionError)
+        and _contains(
+            message, r"integrity", r"sha-?256", r"fixed file", r"registry.*changed"
+        )
     ):
         category = "tool-integrity-or-configuration"
         actions = ["preserve-evidence", "repair-process-owned-tool-registration"]
@@ -243,6 +401,17 @@ def classify_shader_failure(
                 "keep-apply-blocked",
             ]
             ai_may_author_source = True
+    elif isinstance(error, ToolExecutionError) and _contains(
+        message, r"baseline compile probe failed"
+    ):
+        category = "baseline-compile-probe-failed"
+        retryable = True
+        actions = [
+            "preserve-evidence",
+            "try-same-decompiler-with-registered-alternate-compiler",
+            "try-registered-alternate-route-pair",
+            "keep-apply-blocked",
+        ]
     elif isinstance(error, ToolExecutionError):
         if _contains(message, r"timed out"):
             category = "tool-timeout"
@@ -307,6 +476,17 @@ def classify_shader_failure(
             "mayAuthorizeApply": False,
         },
     }
+    if ai_may_author_source and "repair-source-within-captured-abi" in actions:
+        # The concrete Host channel for that action: an Agent submits the
+        # complete repaired HLSL and the Host keeps it only after a fresh
+        # compile plus replay ABI validation.
+        result["sourceRepairTool"] = "repair_shader_workspace_source_abi"
+        result["autonomousNext"] = (
+            "read the current source and baseline.compiledInterface / "
+            "lastAbiAttempt.comparison from get_shader_workspace_status, author "
+            "the ABI-preserving fix, submit it with repair_shader_workspace_source_abi, "
+            "then continue with begin_shader_workspace_organization"
+        )
     cause = _direct_cause(error)
     if cause is not None:
         cause_diagnostic = classify_shader_failure(
@@ -326,3 +506,92 @@ def classify_shader_failure(
         ):
             result["aiPolicy"]["mayAuthorProvisionalSource"] = False
     return result
+
+
+# ---------------------------------------------------------------------------
+# Shared compiler-diagnostic parsing
+#
+# Both the live workspace watcher (post-save compile) and the interactive
+# compile-check path (unsaved-buffer live diagnostics) turn raw DXC/FXC
+# stderr text into line/column-anchored records for the editor.  Keeping the
+# regexes and the parser here — in the low-level diagnostics module — lets
+# workspace.py reuse them without importing watcher.py (which would form an
+# import cycle, since watcher.py imports ShaderWorkspaceService from
+# workspace.py).
+# ---------------------------------------------------------------------------
+
+# DXC/FXC emit either "file:line:col: severity: message" (clang-style) or
+# "file(line,col): severity: message" (MSVC-style).  Match both shapes.
+_COMPILER_COLON_DIAGNOSTIC = re.compile(
+    r"^(?P<file>.+?):(?P<line>\d+):(?P<column>\d+):\s*"
+    r"(?P<severity>fatal\s+error|error|warning|note)\s*:?[ \t]*"
+    r"(?P<message>.*)$",
+    flags=re.IGNORECASE,
+)
+_COMPILER_PAREN_DIAGNOSTIC = re.compile(
+    r"^(?P<file>.+?)\((?P<line>\d+)(?:\s*,\s*(?P<column>\d+))?\)\s*:"
+    r"\s*(?P<severity>fatal\s+error|error|warning|note)\b\s*:?[ \t]*"
+    r"(?P<message>.*)$",
+    flags=re.IGNORECASE,
+)
+
+
+def parse_compiler_diagnostics(
+    text: str,
+    input_name: str,
+    max_diagnostics: int = 128,
+) -> list[dict[str, Any]]:
+    """Parse DXC/FXC stderr into de-duplicated line/column diagnostic records.
+
+    ``input_name`` is the basename the compiler saw for the source being
+    checked (e.g. ``input.hlsl``); any diagnostic whose file component equals
+    that name is reported with its original 1-based line/column so the editor
+    can anchor a squiggle.  Diagnostics referring to *other* files (system
+    headers, includes) keep their reported file but are still surfaced.
+
+    The parser never raises: unparseable lines are ignored, and an empty list
+    means "nothing actionable was recognised" — the caller decides whether that
+    is a clean compile or an opaque failure.
+    """
+
+    diagnostics: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = _COMPILER_COLON_DIAGNOSTIC.match(line)
+        if match is None:
+            match = _COMPILER_PAREN_DIAGNOSTIC.match(line)
+        if match is None:
+            continue
+        file_value = match.group("file").strip().strip('"')
+        severity = match.group("severity").lower().replace("fatal error", "error")
+        # "note" lines annotate a prior error; keep them as hints so the editor
+        # can show the follow-up context without escalating severity.
+        if severity == "note":
+            severity = "hint"
+        message = _bounded_message(match.group("message"))
+        try:
+            line_number = int(match.group("line"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            column_number = int(match.group("column") or 1)
+        except (TypeError, ValueError):
+            column_number = 1
+        record = {
+            "file": file_value,
+            "line": line_number,
+            "column": column_number,
+            "severity": severity,
+            "message": message,
+        }
+        key = (file_value, line_number, column_number, severity, message)
+        if key in seen:
+            continue
+        seen.add(key)
+        diagnostics.append(record)
+        if len(diagnostics) >= max_diagnostics:
+            break
+    return diagnostics

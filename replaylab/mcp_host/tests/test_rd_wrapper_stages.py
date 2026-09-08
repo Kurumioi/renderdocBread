@@ -22,6 +22,9 @@ class RenderDocStageResolutionTests(unittest.TestCase):
         self.assertIs(session._shader_stage("amplification"), stage.Task)
         self.assertIs(session._shader_stage("ms"), stage.Mesh)
         self.assertIs(session._shader_stage("raygen"), stage.RayGen)
+        self.assertIs(session._shader_stage("ray generation"), stage.RayGen)
+        self.assertEqual(session._shader_stage_name("amplification"), "task")
+        self.assertEqual(session._shader_stage_name("raygeneration"), "raygen")
         self.assertIs(session._shader_stage("closesthit"), stage.ClosestHit)
         with self.assertRaisesRegex(ValueError, "unsupported shader stage"):
             session._shader_stage("not-a-stage")

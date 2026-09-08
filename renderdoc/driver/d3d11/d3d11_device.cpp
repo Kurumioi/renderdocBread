@@ -30,6 +30,7 @@
 #include "driver/dxgi/dxgi_wrapped.h"
 #include "jpeg-compressor/jpge.h"
 #include "maths/formatpacking.h"
+#include "replay/replay_timing.h"
 #include "serialise/rdcfile.h"
 #include "strings/string_utils.h"
 #include "d3d11_context.h"
@@ -1584,10 +1585,13 @@ void WrappedID3D11Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
     partial = false;
   }
 
+  ScopedReplayTiming replayTiming("D3D11", startEventID, endEventID, replayType, partial);
+
   if(!partial)
   {
     RENDERDOC_PROFILEREGION("ApplyInitialContents");
     D3D11MarkerRegion apply("!!!!RenderDoc Internal: ApplyInitialContents");
+    ScopedReplayTimingSection timing(ReplayTimingSection::ApplyInitial);
     GetResourceManager()->ApplyInitialContents();
   }
 
@@ -1600,15 +1604,19 @@ void WrappedID3D11Device::ReplayLog(uint32_t startEventID, uint32_t endEventID,
 
   RDResult result = ResultCode::Succeeded;
 
-  if(replayType == eReplay_Full)
-    result = m_pImmediateContext->ReplayLog(m_State, startEventID, endEventID, partial);
-  else if(replayType == eReplay_WithoutDraw)
-    result =
-        m_pImmediateContext->ReplayLog(m_State, startEventID, RDCMAX(1U, endEventID) - 1, partial);
-  else if(replayType == eReplay_OnlyDraw)
-    result = m_pImmediateContext->ReplayLog(m_State, endEventID, endEventID, partial);
-  else
-    RDCFATAL("Unexpected replay type");
+  {
+    ScopedReplayTimingSection timing(ReplayTimingSection::ContextReplay);
+
+    if(replayType == eReplay_Full)
+      result = m_pImmediateContext->ReplayLog(m_State, startEventID, endEventID, partial);
+    else if(replayType == eReplay_WithoutDraw)
+      result =
+          m_pImmediateContext->ReplayLog(m_State, startEventID, RDCMAX(1U, endEventID) - 1, partial);
+    else if(replayType == eReplay_OnlyDraw)
+      result = m_pImmediateContext->ReplayLog(m_State, endEventID, endEventID, partial);
+    else
+      RDCFATAL("Unexpected replay type");
+  }
 
   RDCASSERTEQUAL(result.code, ResultCode::Succeeded);
 

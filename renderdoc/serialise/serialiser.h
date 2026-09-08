@@ -143,6 +143,14 @@ public:
   void *GetUserData() { return m_pUserData; }
   void SetUserData(void *userData) { m_pUserData = userData; }
   void SetStringDatabase(std::set<rdcstr> *db) { m_ExtStringDB = db; }
+  // Optional replay profiling boundary. Capture serialisers compile the read-only notification
+  // away; normal replay pays one null-pointer check at the existing checked-parameter boundary.
+  void SetParameterReadCallback(void (*callback)()) { m_ParameterReadCallback = callback; }
+  void NotifyParametersRead()
+  {
+    if(IsReading() && m_ParameterReadCallback)
+      m_ParameterReadCallback();
+  }
   // jumps to the byte after the current chunk, can be called any time after BeginChunk
   void SkipCurrentChunk();
 
@@ -1677,6 +1685,7 @@ private:
   }
 
   ChunkLookup m_ChunkLookup = NULL;
+  void (*m_ParameterReadCallback)() = NULL;
   FileIO::LogFileHandle *m_DebugDumpLog = NULL;
 };
 
@@ -2253,4 +2262,5 @@ struct ScopedDeserialiseArray<SerialiserType, byte *>
   {                                                                         \
     RDCERR("Serialisation failed in '%s'.", ser.GetCurChunkName().c_str()); \
     return false;                                                           \
-  }
+  }                                                                         \
+  ser.NotifyParametersRead();

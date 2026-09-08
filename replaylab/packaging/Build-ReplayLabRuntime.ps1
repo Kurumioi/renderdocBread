@@ -3,7 +3,6 @@ param(
     [string]$PythonExecutable = "",
     [string]$OutputDirectory = "",
     [string]$WorkDirectory = "",
-    [switch]$IncludeLiteLLM,
     [switch]$KeepBuildWork,
     [switch]$ValidateOnly
 )
@@ -19,8 +18,31 @@ $ownedRuntimeFiles = @(
     "replaylab-ai.exe",
     "ReplayLabInternal.exe",
     "ReplayLabMCP.exe",
+    "ReplayLabShaderTools.exe",
     $runtimeManifestName
 )
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+    $stream = [IO.File]::Open(
+        [IO.Path]::GetFullPath($LiteralPath),
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            return [BitConverter]::ToString(
+                $algorithm.ComputeHash($stream)).Replace("-", "").ToLowerInvariant()
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
 
 function Get-NormalizedPath {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -193,45 +215,52 @@ function Get-BuildProbe {
     param(
         [Parameter(Mandatory = $true)][string]$Python,
         [Parameter(Mandatory = $true)][string]$AgentSource,
-        [Parameter(Mandatory = $true)][string]$McpSource,
-        [switch]$WithLiteLLM
+        [Parameter(Mandatory = $true)][string]$McpSource
     )
     $probeCode = @'
 import importlib.util
 import json
+from pathlib import Path
 import struct
 import sys
 
 sys.path.insert(0, sys.argv[1])
 sys.path.insert(0, sys.argv[2])
 required = [
-    "PyInstaller", "mcp", "uvicorn", "starlette", "fastmcp", "httpx",
-    "pydantic", "pydantic_ai", "yaml", "langgraph", "genai_prices", "acp",
-    "src.server", "src.ipc_client",
+    'PyInstaller', 'mcp', 'uvicorn', 'starlette', 'httpx', 'pydantic',
+    'yaml', 'langgraph', 'genai_prices', 'acp', 'deepagents', 'langchain',
+    'langchain_core', 'langchain_openai', 'langchain_anthropic',
+    'langchain_google_genai', 'langchain_google_vertexai',
+    'src.server', 'src.ipc_client',
 ]
-if sys.argv[3] == "1":
-    required.append("litellm")
 missing = [name for name in required if importlib.util.find_spec(name) is None]
-pyinstaller_version = ""
-if "PyInstaller" not in missing:
+from replaylab_agent.runtime_dependencies import verify_deepagents_version
+deepagents_version = verify_deepagents_version(Path(sys.argv[1]).parent / 'pyproject.toml')
+# API profiles always use deepagents, so every supported provider adapter is
+# part of the frozen runtime rather than an opportunistic optional bundle.
+deep_modules = [
+    'deepagents', 'langchain', 'langchain_core', 'langchain_openai',
+    'langchain_anthropic', 'langchain_google_genai',
+    'langchain_google_vertexai',
+]
+pyinstaller_version = None
+if 'PyInstaller' not in missing:
     import PyInstaller
     pyinstaller_version = PyInstaller.__version__
 from replaylab_agent import __version__ as agent_version
 from src.version import SERVICE_VERSION as mcp_version
 print(json.dumps({
-    "python": list(sys.version_info[:3]),
-    "pointerBits": struct.calcsize("P") * 8,
-    "pyinstaller": pyinstaller_version,
-    "agentVersion": agent_version,
-    "mcpVersion": mcp_version,
-    "missing": missing,
+    'python': list(sys.version_info[:3]),
+    'pointerBits': struct.calcsize('P') * 8,
+    'pyinstaller': pyinstaller_version,
+    'agentVersion': agent_version,
+    'mcpVersion': mcp_version,
+    'missing': missing,
+    'deepModules': deep_modules,
+    'deepagentsVersion': deepagents_version,
 }))
 '@
-    $liteFlag = "0"
-    if ($WithLiteLLM) {
-        $liteFlag = "1"
-    }
-    $probeOutput = & $Python -c $probeCode $AgentSource $McpSource $liteFlag
+    $probeOutput = & $Python -c $probeCode $AgentSource $McpSource
     if ($LASTEXITCODE -ne 0) {
         throw "Python build-environment probe failed."
     }
@@ -247,12 +276,11 @@ function Assert-BuildProbe {
     param(
         [Parameter(Mandatory = $true)][object]$Probe,
         [Parameter(Mandatory = $true)][string]$ReplayLabRoot,
-        [Parameter(Mandatory = $true)][string]$McpRoot,
-        [switch]$WithLiteLLM
+        [Parameter(Mandatory = $true)][string]$McpRoot
     )
     $version = @($Probe.python)
-    if ($version.Count -lt 2 -or [int]$version[0] -ne 3 -or [int]$version[1] -lt 10) {
-        throw "ReplayLab runtime packaging requires Python 3.10 or newer."
+    if ($version.Count -lt 2 -or [int]$version[0] -ne 3 -or [int]$version[1] -lt 12) {
+        throw "ReplayLab runtime packaging requires Python 3.12 or newer."
     }
     if ([int]$Probe.pointerBits -ne 64) {
         throw "ReplayLab Windows runtime packaging requires a 64-bit Python interpreter."
@@ -260,9 +288,6 @@ function Assert-BuildProbe {
     $missing = @($Probe.missing)
     if ($missing.Count -gt 0) {
         $agentInstall = "${ReplayLabRoot}[all]"
-        if ($WithLiteLLM) {
-            $agentInstall = "${ReplayLabRoot}[all,litellm]"
-        }
         $mcpInstall = "${McpRoot}[bundle]"
         throw ("Runtime build dependencies are missing: {0}. Install them with: `"{1}`" -m pip install -e `"{2}`" -e `"{3}`"" -f `
             ($missing -join ", "), $PythonExecutable, $agentInstall, $mcpInstall)
@@ -288,7 +313,9 @@ function Invoke-PyInstallerBuild {
         [string[]]$AdditionalImportRoots = @(),
         [string[]]$CollectAll = @(),
         [string[]]$CollectSubmodules = @(),
-        [string[]]$HiddenImports = @()
+        [string[]]$HiddenImports = @(),
+        [string[]]$AddData = @(),
+        [string[]]$CopyMetadata = @()
     )
     $arguments = @(
         "-m", "PyInstaller",
@@ -313,6 +340,12 @@ function Invoke-PyInstallerBuild {
     }
     foreach ($module in $HiddenImports) {
         $arguments += @("--hidden-import", $module)
+    }
+    foreach ($entry in $AddData) {
+        $arguments += @("--add-data", $entry)
+    }
+    foreach ($distribution in $CopyMetadata) {
+        $arguments += @("--copy-metadata", $distribution)
     }
     $arguments += $EntryPoint
 
@@ -352,11 +385,18 @@ function Remove-ControlledBuildSession {
 
 $packagingRoot = Get-NormalizedPath $PSScriptRoot
 $replayLabRoot = Get-NormalizedPath (Split-Path -Parent $packagingRoot)
+$repositoryRoot = Get-NormalizedPath (Split-Path -Parent $replayLabRoot)
+$skillRoot = Join-Path $repositoryRoot ".agents\skills"
 $agentSource = Join-Path $replayLabRoot "src"
 $mcpRoot = Join-Path $replayLabRoot "mcp_host"
 $agentEntry = Join-Path $packagingRoot "agent_host_entry.py"
 $internalEntry = Join-Path $packagingRoot "internal_host_entry.py"
 $mcpEntry = Join-Path $packagingRoot "mcp_host_entry.py"
+$shaderToolsEntry = Join-Path $packagingRoot "shader_tools_entry.py"
+$shaderToolsBuilder = Join-Path $packagingRoot "build_shader_tools.py"
+$frozenMcpRouteProbe = Join-Path $packagingRoot "probe_frozen_mcp_route.py"
+$frozenHostLifetimeProbe = Join-Path $packagingRoot "tests\Test-FrozenHostLifetime.ps1"
+$continuationDriverSource = Join-Path $mcpRoot "src\unpacked_asset_jobs.py"
 $protectedRoots = @(
     $agentSource,
     $mcpRoot,
@@ -385,10 +425,34 @@ foreach ($sourceFile in @(
     (Join-Path $agentSource "replaylab_agent\cli.py"),
     (Join-Path $mcpRoot "src\internal_host.py"),
     (Join-Path $mcpRoot "src\internal_tool_service.py"),
+    (Join-Path $mcpRoot "src\event_flow_artifacts.py"),
+    (Join-Path $mcpRoot "src\event_flow_diagram.py"),
+    (Join-Path $mcpRoot "src\asset_catalog.py"),
+    (Join-Path $mcpRoot "src\resource_export.py"),
+    $continuationDriverSource,
     (Join-Path $mcpRoot "src\replaylab_host.py"),
     $agentEntry,
     $internalEntry,
-    $mcpEntry
+    $mcpEntry,
+    $shaderToolsEntry,
+    $shaderToolsBuilder,
+    $frozenMcpRouteProbe,
+    $frozenHostLifetimeProbe,
+    (Join-Path $skillRoot "renderdoc-explain-event\SKILL.md"),
+    (Join-Path $skillRoot "renderdoc-explain-event\references\visual-evidence.md"),
+    (Join-Path $skillRoot "renderdoc-explain-event\references\workflow-acceptance.md"),
+    (Join-Path $skillRoot "renderdoc-shader-workbench\SKILL.md"),
+    (Join-Path $skillRoot "renderdoc-resource-export\SKILL.md"),
+    (Join-Path $skillRoot "renderdoc-resource-export\references\source-evidence.md"),
+    (Join-Path $skillRoot "renderdoc-resource-export\references\target-profiles.md"),
+    (Join-Path $skillRoot "renderdoc-resource-export\references\package-and-validation.md"),
+    (Join-Path $skillRoot "renderdoc-resource-export\references\workflow-acceptance.md"),
+    (Join-Path $skillRoot "renderdoc-unpacked-asset-intelligence\SKILL.md"),
+    (Join-Path $skillRoot "renderdoc-unpacked-asset-intelligence\references\inventory-and-relationships.md"),
+    (Join-Path $skillRoot "renderdoc-unpacked-asset-intelligence\references\report-semantics.md"),
+    (Join-Path $skillRoot "renderdoc-unpacked-asset-intelligence\references\uex-blender-delivery.md"),
+    (Join-Path $skillRoot "renderdoc-unpacked-asset-intelligence\references\workflow-acceptance.md"),
+    (Join-Path $skillRoot "replaylab-core\SKILL.md")
 )) {
     Assert-RegularFile $sourceFile "ReplayLab runtime packaging source" | Out-Null
 }
@@ -402,6 +466,7 @@ if ($ValidateOnly) {
         AgentEntry = $agentEntry
         InternalEntry = $internalEntry
         McpEntry = $mcpEntry
+        ShaderToolsEntry = $shaderToolsEntry
     }
     return
 }
@@ -413,8 +478,8 @@ if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
     $PythonExecutable = Join-Path $replayLabRoot ".venv\Scripts\python.exe"
 }
 $PythonExecutable = Resolve-PythonExecutable $PythonExecutable
-$probe = Get-BuildProbe $PythonExecutable $agentSource $mcpRoot -WithLiteLLM:$IncludeLiteLLM
-Assert-BuildProbe $probe $replayLabRoot $mcpRoot -WithLiteLLM:$IncludeLiteLLM
+$probe = Get-BuildProbe $PythonExecutable $agentSource $mcpRoot
+Assert-BuildProbe $probe $replayLabRoot $mcpRoot
 
 $sessionId = [Guid]::NewGuid().ToString("N")
 $sessionRoot = Join-Path $WorkDirectory ("session-" + $sessionId)
@@ -445,21 +510,108 @@ try {
         $internalDist, $internalBuild, $internalSpec, `
         $mcpDist, $mcpBuild, $mcpSpec | Out-Null
 
-    $agentCollectAll = @("pydantic_ai", "mcp", "genai_prices")
-    if ($IncludeLiteLLM) {
-        $agentCollectAll += "litellm"
+    # The runner owns only its static adapter closure. Its builder hashes all
+    # source/interpreter/freezer inputs and reuses the complete EXE unchanged
+    # when unrelated Host/Agent/UI code is rebuilt.
+    $shaderToolsWork = Join-Path $sessionRoot "shader-tools"
+    $builtShaderTools = Join-Path $shaderToolsWork "result\ReplayLabShaderTools.exe"
+    $shaderToolsCache = Join-Path $WorkDirectory "shader-tools-cache"
+    $shaderToolsBuildOutput = & $PythonExecutable -I $shaderToolsBuilder `
+        --source-root $mcpRoot --entry $shaderToolsEntry `
+        --cache-root $shaderToolsCache --work-root $shaderToolsWork `
+        --output $builtShaderTools
+    if ($LASTEXITCODE -ne 0) {
+        throw "Independent ReplayLabShaderTools build/cache verification failed."
     }
+    $shaderToolsBuild = (($shaderToolsBuildOutput | Out-String) | ConvertFrom-Json)
+    $builtShaderTools = Assert-RegularFile $builtShaderTools "built shader tool runner"
+    if ([string]$shaderToolsBuild.schema -cne "replaylab-shader-tools-cache/v1" -or
+        [string]$shaderToolsBuild.executableSha256 -cne (Get-Sha256Hex $builtShaderTools)) {
+        throw "Independent shader tool builder returned inconsistent artifact evidence."
+    }
+    & $builtShaderTools --help | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "The packaged ReplayLabShaderTools.exe failed its --help smoke test."
+    }
+    foreach ($adapterCommand in @(
+        "adapter-hlsl", "adapter-dxbc-assembly", "adapter-d3dcompile",
+        "adapter-dxil-assemble", "adapter-spirv-cross", "adapter-renodx")) {
+        & $builtShaderTools $adapterCommand --help | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "The independent shader adapter '$adapterCommand' failed its --help smoke test."
+        }
+    }
+    foreach ($hostDist in @($agentDist, $mcpDist, $internalDist)) {
+        Copy-Item -LiteralPath $builtShaderTools `
+            -Destination (Join-Path $hostDist "ReplayLabShaderTools.exe")
+    }
+
+    # Model API profiles always use deepagents, and subscription profiles use
+    # ACP/Codex directly. These are product dependencies, not optional extras.
+    # LangChain resolves provider adapters dynamically, so collect every
+    # supported adapter and preserve its distribution metadata explicitly.
+    $deepModules = @($probe.deepModules)
+    $agentCollectAll = @("mcp", "genai_prices") + $deepModules
+    $agentCopyMetadata = @(
+        "genai-prices",
+        "mcp",
+        "agent-client-protocol",
+        "deepagents",
+        "langchain",
+        "langchain-core",
+        "langchain-openai",
+        "langchain-anthropic",
+        "langchain-google-genai",
+        "langchain-google-vertexai",
+        "langgraph",
+        "langgraph-checkpoint",
+        "langgraph-prebuilt",
+        "pydantic"
+    )
+    Write-Host ("ReplayLab: bundling the required agent runtime (" + ($deepModules -join ", ") + ")")
+    $agentSkillData = @(
+        ((Join-Path $skillRoot "renderdoc-explain-event") +
+            ":.agents/skills/renderdoc-explain-event")
+        ((Join-Path $skillRoot "renderdoc-shader-workbench") +
+            ":.agents/skills/renderdoc-shader-workbench")
+        ((Join-Path $skillRoot "renderdoc-resource-export") +
+            ":.agents/skills/renderdoc-resource-export")
+        ((Join-Path $skillRoot "renderdoc-unpacked-asset-intelligence") +
+            ":.agents/skills/renderdoc-unpacked-asset-intelligence")
+        # Mandatory standard for API main/children and all native Agent turns.
+        ((Join-Path $skillRoot "replaylab-core") +
+            ":.agents/skills/replaylab-core")
+    )
+    $mcpProviderData = @(
+        ($continuationDriverSource + ":replaylab_helpers")
+    )
+    $agentData = @($agentSkillData) + @($mcpProviderData)
+    $agentData += ((Join-Path $replayLabRoot "pyproject.toml") + ":replaylab_agent")
     Invoke-PyInstallerBuild $PythonExecutable "replaylab-ai" $agentEntry $agentSource `
         $agentDist $agentBuild $agentSpec `
         -AdditionalImportRoots @($mcpRoot) `
         -CollectAll $agentCollectAll `
-        -CollectSubmodules @("replaylab_agent", "langgraph", "acp", "fastmcp", "src") `
-        -HiddenImports @("replaylab_agent.mcp_proxy", "replaylab_agent.selftest")
+        -CollectSubmodules @("replaylab_agent", "langgraph", "acp", "src") `
+        -HiddenImports @(
+            "replaylab_agent.mcp_proxy",
+            "replaylab_agent.selftest",
+            "anyio",
+            "anyio.streams.text",
+            "httpx",
+            "mcp.types",
+            "mcp.client.stdio",
+            "mcp.shared.message",
+            "deepagents",
+            "langchain_core.tools"
+        ) `
+        -AddData @($agentData) `
+        -CopyMetadata $agentCopyMetadata
 
     Invoke-PyInstallerBuild $PythonExecutable "ReplayLabMCP" $mcpEntry $mcpRoot `
         $mcpDist $mcpBuild $mcpSpec `
         -CollectAll @("mcp") `
-        -CollectSubmodules @("src", "uvicorn", "starlette")
+        -CollectSubmodules @("src", "uvicorn", "starlette") `
+        -AddData @($mcpProviderData)
 
     Invoke-PyInstallerBuild $PythonExecutable "ReplayLabInternal" $internalEntry $mcpRoot `
         $internalDist $internalBuild $internalSpec `
@@ -481,13 +633,113 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "The packaged replaylab-ai.exe failed its frozen MCP proxy dispatch smoke test."
     }
+    & $builtAgent -I -m replaylab_agent.selftest --external-mcp-import-smoke | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw ("The packaged replaylab-ai.exe failed its external MCP import smoke test " +
+            "with diagnostic exit code $LASTEXITCODE.")
+    }
     & $builtMcp --help | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "The packaged ReplayLabMCP.exe failed its --help smoke test."
     }
+    & $PythonExecutable $frozenMcpRouteProbe --agent $builtAgent `
+        --host $builtMcp --timeout 60 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "The packaged AgentHost -> MCP filter -> ReplayLabMCP route failed its handshake/catalog smoke test."
+    }
     & $builtInternal --help | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "The packaged ReplayLabInternal.exe failed its --help smoke test."
+    }
+    & $frozenHostLifetimeProbe -InternalHost $builtInternal -McpHost $builtMcp `
+        -OutputDirectory (Join-Path $sessionRoot "detached-host-lifetime") | Out-Null
+
+    $smokeProfilePath = Join-Path $sessionRoot "agent-smoke-profiles.json"
+    $smokeProfileJson = [ordered]@{
+        schema = "replaylab-ai-profiles/v2"
+        activeProfile = "packaging-smoke"
+        profiles = @(
+            [ordered]@{
+                id = "packaging-smoke"
+                preset = "custom-acp"
+                model = "gpt-5.6-sol"
+                models = @("gpt-5.6-sol")
+                default_model = "gpt-5.6-sol"
+                command = @($builtAgent, "--help")
+                options = [ordered]@{ allow_unsandboxed_agent = $true }
+            }
+            [ordered]@{
+                id = "packaging-cursor-smoke"
+                preset = "cursor-acp"
+                model = "composer-2.5[fast=true]"
+                models = @("composer-2.5[fast=true]")
+                default_model = "composer-2.5[fast=true]"
+                options = [ordered]@{ allow_unsandboxed_agent = $true }
+            }
+        )
+    } | ConvertTo-Json -Depth 6
+    [IO.File]::WriteAllText(
+        $smokeProfilePath,
+        $smokeProfileJson + [Environment]::NewLine,
+        [Text.UTF8Encoding]::new($false))
+    $doctorOutput = & $builtAgent --config $smokeProfilePath doctor `
+        --profile "packaging-smoke" --mcp-host $builtMcp --json
+    if ($LASTEXITCODE -ne 0) {
+        throw "The packaged replaylab-ai.exe failed its frozen catalog/Skill doctor smoke test."
+    }
+    try {
+        $parsedDoctorChecks = (($doctorOutput | Out-String) | ConvertFrom-Json)
+        $doctorChecks = @($parsedDoctorChecks.GetEnumerator())
+    }
+    catch {
+        throw "The packaged replaylab-ai.exe doctor smoke test returned invalid JSON."
+    }
+    $skillCheck = @($doctorChecks | Where-Object { $_.name -eq "skills" })
+    $expectedSkillDetail = "$($agentSkillData.Count) validated skill(s)"
+    if ($skillCheck.Count -ne 1 -or [string]$skillCheck[0].status -ne "ok" -or
+        [string]$skillCheck[0].detail -ne $expectedSkillDetail) {
+        $observedSkillCheck = $skillCheck | ConvertTo-Json -Depth 4 -Compress
+        throw ("The packaged replaylab-ai.exe did not load exactly all " +
+            "$($agentSkillData.Count) bundled ReplayLab Skills. " +
+            "Observed: $observedSkillCheck")
+    }
+    $contextCheck = @($doctorChecks | Where-Object { $_.name -eq "model-context" })
+    if ($contextCheck.Count -ne 1 -or [string]$contextCheck[0].status -ne "ok" -or
+        [string]$contextCheck[0].detail -notmatch '^1050000 tokens') {
+        throw "The packaged replaylab-ai.exe could not resolve the verified GPT-5.6 Sol context window."
+    }
+
+    # Cursor's catalog command is immutable, so give doctor a real, disposable
+    # executable under that audited name. The smoke does not launch it.
+    $cursorAgentSmoke = Join-Path $sessionRoot "cursor-agent.exe"
+    Copy-Item -LiteralPath $builtAgent -Destination $cursorAgentSmoke
+    $originalProcessPath = [Environment]::GetEnvironmentVariable("PATH", "Process")
+    try {
+        $env:PATH = $sessionRoot + [IO.Path]::PathSeparator + $originalProcessPath
+        $cursorDoctorOutput = & $builtAgent --config $smokeProfilePath doctor `
+            --profile "packaging-cursor-smoke" --mcp-host $builtMcp --json
+        $cursorDoctorExitCode = $LASTEXITCODE
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable("PATH", $originalProcessPath, "Process")
+    }
+    if ($cursorDoctorExitCode -ne 0) {
+        throw "The packaged replaylab-ai.exe failed its frozen Cursor catalog doctor smoke test."
+    }
+    try {
+        $parsedCursorDoctorChecks = (
+            ($cursorDoctorOutput | Out-String) | ConvertFrom-Json)
+        $cursorDoctorChecks = @($parsedCursorDoctorChecks.GetEnumerator())
+    }
+    catch {
+        throw "The packaged replaylab-ai.exe Cursor doctor smoke test returned invalid JSON."
+    }
+    $cursorContextCheck = @(
+        $cursorDoctorChecks | Where-Object { $_.name -eq "model-context" })
+    if ($cursorContextCheck.Count -ne 1 -or
+        [string]$cursorContextCheck[0].status -ne "ok" -or
+        [string]$cursorContextCheck[0].detail -ne "200000 tokens (model-catalog)") {
+        throw "The packaged replaylab-ai.exe could not resolve the verified Cursor Composer context window."
     }
 
     if (-not (Test-Path -LiteralPath $OutputDirectory)) {
@@ -502,17 +754,22 @@ try {
         -Destination (Join-Path $OutputDirectory "ReplayLabMCP.exe") -Force
     Copy-Item -LiteralPath $builtInternal `
         -Destination (Join-Path $OutputDirectory "ReplayLabInternal.exe") -Force
+    Copy-Item -LiteralPath $builtShaderTools `
+        -Destination (Join-Path $OutputDirectory "ReplayLabShaderTools.exe") -Force
 
     $fileRecords = @()
     foreach ($name in @(
-        "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe")) {
+        "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe",
+        "ReplayLabShaderTools.exe")) {
         $path = Assert-RegularFile (Join-Path $OutputDirectory $name) `
             "packaged ReplayLab runtime file '$name'"
         $file = Get-Item -LiteralPath $path
         $fileRecords += [ordered]@{
             path = $name
             size = [int64]$file.Length
-            sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            # Avoid a dependency on Get-FileHash: some MSBuild post-build
+            # PowerShell hosts do not expose the Utility module.
+            sha256 = Get-Sha256Hex $path
         }
     }
     $manifest = [ordered]@{
@@ -521,6 +778,8 @@ try {
         generatedUtc = [DateTime]::UtcNow.ToString("o")
         python = (@($probe.python) -join ".")
         pyinstaller = [string]$probe.pyinstaller
+        dependencies = @{ deepagents = [string]$probe.deepagentsVersion }
+        shaderTools = $shaderToolsBuild
         ownedFiles = $ownedRuntimeFiles
         files = $fileRecords
     }

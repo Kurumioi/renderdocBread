@@ -57,6 +57,28 @@ _STAGE_ALIASES = {
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SESSION_RE = re.compile(r"^[0-9a-f]{32}$")
 
+_CLASSIC_GRAPHICS_STAGES = (
+    "vertex",
+    "hull",
+    "domain",
+    "geometry",
+    "fragment",
+)
+_MESH_GRAPHICS_STAGES = ("task", "mesh", "fragment")
+_COMPUTE_STAGES = ("compute",)
+_RAY_TRACING_STAGES = (
+    "raygen",
+    "intersection",
+    "anyhit",
+    "closesthit",
+    "miss",
+    "callable",
+)
+_DRAW_ACTION_MASK = 0x0002
+_DISPATCH_ACTION_MASK = 0x0004
+_MESH_DISPATCH_ACTION_MASK = 0x0008
+_RAY_DISPATCH_ACTION_MASK = 0x4000
+
 
 class ContextProtocolError(ValueError):
     """Raised when observed UI facts do not satisfy the public protocol."""
@@ -83,6 +105,16 @@ def _integer(value, label, minimum=0, maximum=0xFFFFFFFFFFFFFFFF):
     return value
 
 
+def _resource_id(value, label, minimum=0):
+    """Return an exact decimal ResourceId safe for every JSON consumer.
+
+    Qt 5 stores JSON numbers as IEEE-754 doubles, which cannot represent all
+    RenderDoc 64-bit ResourceIds.  ResourceIds are opaque identities rather
+    than quantities, so the wire protocol carries them as decimal strings.
+    """
+    return str(_integer(value, label, minimum))
+
+
 def normalise_stage(value):
     value = _text(value, "shader stage", 64).strip().lower()
     value = value.replace("shaderstage.", "")
@@ -90,6 +122,82 @@ def normalise_stage(value):
     if value and value not in SHADER_STAGE_ORDER:
         raise ContextProtocolError("unsupported shader stage: %s" % value)
     return value
+
+
+def _action_flag_names(action):
+    if not isinstance(action, dict):
+        return set()
+    flags = _text(action.get("flags", ""), "action flags", 1024)
+    return set(
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_]*", flags)
+    )
+
+
+def _action_flag_mask(action):
+    if not isinstance(action, dict):
+        return 0
+    value = action.get("flags", "")
+    if isinstance(value, bool):
+        return 0
+    try:
+        if isinstance(value, int):
+            return value
+        text = str(value).strip().lower()
+        if re.match(r"^(?:0x[0-9a-f]+|[0-9]+)$", text):
+            return int(text, 0)
+    except Exception:
+        pass
+    return 0
+
+
+def compatible_shader_stages(action):
+    """Return only stages that can execute for the exact current action.
+
+    RenderDoc can retain independent graphics and compute pipeline bindings at
+    the same replay point.  ``PipelineState.GetShader`` therefore answers which
+    resources are resident in those state buckets, not by itself which shaders
+    execute for a Draw/Dispatch/MeshDispatch/DispatchRay action.  Action flags
+    are the fixed-program discriminator.  Unknown and non-work actions fail
+    closed so stale state cannot become a positive "current Shader" candidate.
+    """
+
+    if not isinstance(action, dict):
+        return ()
+    # The bridge calls this helper on the exact result of
+    # ``_current_action_context(current_event)`` before canonicalisation adds
+    # ``matchesCurrentEvent``. Protocol callers do carry that field and must
+    # fail closed when it disproves the current-EID relationship.
+    if (
+        "matchesCurrentEvent" in action
+        and action.get("matchesCurrentEvent") is not True
+    ):
+        return ()
+    names = _action_flag_names(action)
+    mask = _action_flag_mask(action)
+    families = (
+        (
+            bool("dispatchray" in names or mask & _RAY_DISPATCH_ACTION_MASK),
+            _RAY_TRACING_STAGES,
+        ),
+        (
+            bool("meshdispatch" in names or mask & _MESH_DISPATCH_ACTION_MASK),
+            _MESH_GRAPHICS_STAGES,
+        ),
+        (
+            bool("dispatch" in names or mask & _DISPATCH_ACTION_MASK),
+            _COMPUTE_STAGES,
+        ),
+        (
+            bool("drawcall" in names or mask & _DRAW_ACTION_MASK),
+            _CLASSIC_GRAPHICS_STAGES,
+        ),
+    )
+    matched = tuple(stages for present, stages in families if present)
+    # Mutually exclusive action families describe different executing shader
+    # domains. A malformed combined flag cannot safely select one by priority;
+    # fail closed so no stale graphics/compute bucket becomes a UI choice.
+    return matched[0] if len(matched) == 1 else ()
 
 
 def _canonical_bytes(value):
@@ -176,7 +284,7 @@ def _normalise_shader(value):
     stage = normalise_stage(value.get("stage", ""))
     if not stage:
         raise ContextProtocolError("shader stage is required")
-    resource_id = _integer(
+    resource_id = _resource_id(
         value.get("resourceId", value.get("shaderResourceId", 0)),
         "shader resource ID",
         1,
@@ -194,12 +302,18 @@ def _normalise_shader(value):
     }
 
 
-def _normalise_shaders(values, focus_stage, focus_source):
+def _normalise_shaders(values, focus_stage, focus_source, action):
     if values is None:
         values = []
     if not isinstance(values, list) or len(values) > len(SHADER_STAGE_ORDER):
         raise ContextProtocolError("bound shaders must be a bounded list")
-    shaders = [_normalise_shader(value) for value in values]
+    compatible = compatible_shader_stages(action)
+    compatible_set = set(compatible)
+    shaders = [
+        shader
+        for shader in (_normalise_shader(value) for value in values)
+        if shader["stage"] in compatible_set
+    ]
     shaders.sort(
         key=lambda shader: (
             SHADER_STAGE_ORDER.index(shader["stage"]),
@@ -232,6 +346,8 @@ def _normalise_shaders(values, focus_stage, focus_source):
         focus_source = ""
     return {
         "bound": shaders,
+        "compatibleStages": list(compatible),
+        "compatibilitySource": "current-action-flags",
         "focused": focused,
         "focusSource": focus_source if focused is not None else "none",
         "focusIsExplicit": bool(
@@ -244,18 +360,18 @@ def _normalise_texture(value):
     if value is None:
         return {
             "available": False,
-            "resourceId": 0,
+            "resourceId": "0",
             "name": "",
             "subresource": None,
             "pickedPixel": None,
         }
     if not isinstance(value, dict):
         raise ContextProtocolError("texture context must be an object")
-    resource_id = _integer(value.get("resourceId", 0), "texture resource ID")
-    if resource_id == 0:
+    resource_id = _resource_id(value.get("resourceId", 0), "texture resource ID")
+    if resource_id == "0":
         return {
             "available": False,
-            "resourceId": 0,
+            "resourceId": "0",
             "name": "",
             "subresource": None,
             "pickedPixel": None,
@@ -296,6 +412,7 @@ def build_context(facts):
         facts.get("boundShaders", []),
         facts.get("focusStage", ""),
         facts.get("focusSource", ""),
+        action,
     )
     texture = _normalise_texture(facts.get("texture"))
     warnings = facts.get("warnings", [])
@@ -361,6 +478,7 @@ __all__ = [
     "CONTEXT_SCHEMA",
     "ContextProtocolError",
     "build_context",
+    "compatible_shader_stages",
     "normalise_stage",
     "validate_context",
 ]

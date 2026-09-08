@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from .errors import ToolConfigurationError
+from .errors import ToolConfigurationError, ToolExecutionError
 from .io import atomic_write_json, read_json_object
 
 TOOLS_SCHEMA = "renderdoc-ultra-shader-tools/v1"
@@ -35,6 +35,7 @@ PLACEHOLDERS = frozenset(
         "workspace_dir",
         "stage",
         "entry_point",
+        "captured_entry_point",
         "revision",
         "capture_id",
         "raw_sha256",
@@ -65,6 +66,53 @@ _INLINE_CODE_FLAGS = {
     "py": {"-c", "-m"},
     "py.exe": {"-c", "-m"},
 }
+_HIGH_LEVEL_SOURCE_SUFFIXES = (
+    ".hlsl",
+    ".glsl",
+    ".essl",
+    ".slang",
+    ".wgsl",
+    ".metal",
+)
+_UNTRACKED_PREPROCESSOR_DEPENDENCY = re.compile(
+    r"(?im)^[ \t]*#[ \t]*(?:include(?:_next)?|line)\b"
+)
+_UNTRACKED_SLANG_IMPORT = re.compile(r"(?im)^[ \t]*import\s+[A-Za-z_]\w*")
+
+
+def _reject_untracked_compile_dependencies(raw_input: str) -> None:
+    """Reject source dependencies absent from the immutable compile receipt.
+
+    The current workspace contract hashes one source snapshot, compiler, fixed
+    adapter files, and outputs.  Until an include/module graph is itself
+    project-owned and content-addressed, allowing a compiler to resolve files
+    outside that receipt would make shared candidates non-reproducible.
+    """
+
+    input_path = Path(str(raw_input or ""))
+    if not input_path.name.casefold().endswith(_HIGH_LEVEL_SOURCE_SUFFIXES):
+        return
+    if input_path.is_symlink() or not input_path.is_file():
+        raise ToolExecutionError(
+            "compile input must be a regular non-symlink source snapshot"
+        )
+    size = input_path.stat().st_size
+    if size <= 0 or size > 64 * 1024 * 1024:
+        raise ToolExecutionError("compile source size is invalid")
+    try:
+        text = input_path.read_text(encoding="utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ToolExecutionError("compile source must be strict UTF-8") from exc
+    if _UNTRACKED_PREPROCESSOR_DEPENDENCY.search(text):
+        raise ToolExecutionError(
+            "compile source contains #include/#line without a hash-bound dependency graph"
+        )
+    if input_path.name.casefold().endswith(".slang") and _UNTRACKED_SLANG_IMPORT.search(
+        text
+    ):
+        raise ToolExecutionError(
+            "Slang import is unavailable until module dependencies are hash-bound"
+        )
 
 
 def _inline_code_flags(host_name: str) -> set[str]:
@@ -102,14 +150,25 @@ class ToolOperation:
     config_digest: str
 
     def expand(self, values: Mapping[str, str]) -> list[str]:
-        missing_values = PLACEHOLDERS.difference(values)
+        # ``captured_entry_point`` was added after the original registry
+        # contract so a SPIR-V module's physical entry can be kept separate
+        # from the capture-visible HLSL name.  Old/custom operations which do
+        # not use that distinction remain deterministic: their captured name
+        # is exactly their already supplied entry point.  First-party routes
+        # pass both values explicitly.
+        expanded_values = dict(values)
+        if "captured_entry_point" not in expanded_values:
+            entry_point = expanded_values.get("entry_point")
+            if entry_point is not None:
+                expanded_values["captured_entry_point"] = entry_point
+        missing_values = PLACEHOLDERS.difference(expanded_values)
         if missing_values:
             raise ToolConfigurationError(
                 "internal placeholder values are missing: %s"
                 % ", ".join(sorted(missing_values))
             )
         return [str(self.executable)] + [
-            argument.format_map(values) for argument in self.arguments
+            argument.format_map(expanded_values) for argument in self.arguments
         ]
 
     def fixed_file_hashes_dict(self) -> dict[str, str]:
@@ -671,6 +730,9 @@ def run_operation(
     job_dir: Path,
 ) -> ProcessResult:
     """Run one fixed command with no shell and binary stdout/stderr logs."""
+
+    if operation.operation == "compile":
+        _reject_untracked_compile_dependencies(values.get("input", ""))
 
     # The workspace may stage immutable input snapshots before launch. The
     # process metadata/log files themselves must still be new for this job.

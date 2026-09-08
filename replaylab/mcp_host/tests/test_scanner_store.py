@@ -15,6 +15,7 @@ from src.symbols.scanner import (
     interface_hash,
     interface_is_complete,
     layout_hash,
+    normalize_stage,
     scan_asset_root,
 )
 from src.symbols.store import SCHEMA_VERSION, SymbolStore
@@ -77,6 +78,11 @@ def _make_dxbc(code: bytes = b"compiled instructions") -> bytes:
 
 
 class ScannerHardeningTests(unittest.TestCase):
+    def test_stage_aliases_use_project_canonical_names(self) -> None:
+        self.assertEqual(normalize_stage("amplification"), "task")
+        self.assertEqual(normalize_stage("raygeneration"), "raygen")
+        self.assertEqual(normalize_stage("ray generation"), "raygen")
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.base = Path(self.temporary.name)

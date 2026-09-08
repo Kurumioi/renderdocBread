@@ -29,6 +29,7 @@
 #include "core/settings.h"
 #include "driver/shaders/spirv/spirv_compile.h"
 #include "jpeg-compressor/jpge.h"
+#include "replay/replay_timing.h"
 #include "serialise/rdcfile.h"
 #include "strings/string_utils.h"
 #include "gl_replay.h"
@@ -1787,6 +1788,88 @@ void WrappedOpenGL::RemoveReplacement(ResourceId id)
   }
 }
 
+rdcstr WrappedOpenGL::ReplaceTargetShaderChecked(ResourceId from, ResourceId to)
+{
+  GLResourceManager *rm = GetResourceManager();
+
+  if(from == ResourceId() || to == ResourceId() || from == to)
+    return "Checked OpenGL replacement requires distinct non-null shader resources";
+  if(rm->GetUnreplacedID(from) != from)
+    return "The original OpenGL shader must be the canonical captured ResourceId";
+  if(!rm->HasResource(from) || !rm->HasResource(to))
+    return "The original or target OpenGL shader is no longer live";
+
+  GLResource original = rm->GetResourceWithoutReplacement(from, true);
+  GLResource target = rm->GetResourceWithoutReplacement(to, true);
+  if(original.Namespace != eResShader || target.Namespace != eResShader)
+    return "Checked OpenGL replacement currently requires shader-backed resources; "
+           "glCreateShaderProgramv programs are fail-closed";
+  auto originalShader = m_Shaders.find(from);
+  auto targetShader = m_Shaders.find(to);
+  if(originalShader == m_Shaders.end() || targetShader == m_Shaders.end())
+    return "The captured or target OpenGL shader metadata is unavailable";
+  if(originalShader->second.type != targetShader->second.type)
+    return "The replacement OpenGL shader stage differs from the captured stage";
+
+  const bool hadPrevious = rm->HasReplacement(from);
+  ResourceId previousId;
+  if(hadPrevious)
+  {
+    GLResource previous = rm->GetResource(from, true);
+    previousId = rm->GetResID(previous);
+    if(previousId == ResourceId() || previousId == from || rm->GetUnreplacedID(previousId) != from)
+      return "The captured OpenGL shader has an invalid or multiply-owned replacement target";
+    if(previousId == to)
+      return {};
+  }
+  if(rm->GetUnreplacedID(to) != to || rm->HasReplacement(to))
+    return "The target OpenGL shader is already owned by another replacement";
+
+  if(hadPrevious)
+    rm->RemoveReplacement(from);
+  rm->ReplaceResource(from, to);
+
+  rdcstr error = RefreshDerivedReplacementsChecked(from);
+  if(!error.empty())
+  {
+    rm->RemoveReplacement(from);
+    if(hadPrevious)
+      rm->ReplaceResource(from, previousId);
+    return error;
+  }
+
+  return {};
+}
+
+rdcstr WrappedOpenGL::RemoveTargetShaderReplacementChecked(ResourceId id)
+{
+  GLResourceManager *rm = GetResourceManager();
+
+  if(id == ResourceId() || rm->GetUnreplacedID(id) != id)
+    return "The OpenGL shader to restore must be a canonical captured ResourceId";
+  if(!rm->HasReplacement(id))
+    return {};
+
+  GLResource original = rm->GetResourceWithoutReplacement(id, true);
+  if(original.Namespace != eResShader || m_Shaders.find(id) == m_Shaders.end())
+    return "Checked OpenGL rollback currently requires a shader-backed captured resource";
+
+  GLResource previous = rm->GetResource(id, true);
+  ResourceId previousId = rm->GetResID(previous);
+  if(previousId == ResourceId() || previousId == id || rm->GetUnreplacedID(previousId) != id)
+    return "The captured OpenGL shader has an invalid replacement target";
+
+  rm->RemoveReplacement(id);
+  rdcstr error = RefreshDerivedReplacementsChecked(id);
+  if(!error.empty())
+  {
+    rm->ReplaceResource(id, previousId);
+    return error;
+  }
+
+  return {};
+}
+
 void WrappedOpenGL::FreeTargetResource(ResourceId id)
 {
   if(GetResourceManager()->HasResource(id))
@@ -1952,8 +2035,8 @@ void WrappedOpenGL::RefreshDerivedReplacements()
 
     ResourceId origsrcid = pipesrcid;
 
-    // only look at programs from the capture, no replay-time programs.
-    if(origsrcid == pipesrcid)
+    // only look at pipelines from the capture, no replay-time pipelines.
+    if(ResourceIDGen::IsReplayOnlyID(pipesrcid))
       continue;
 
     // if this pipeline has a replacement, remove it and delete the pipeline generated for it
@@ -2002,6 +2085,339 @@ void WrappedOpenGL::RefreshDerivedReplacements()
     glDeleteProgramPipelines(1, &prog);
 
   deletequeue.clear();
+}
+
+rdcstr WrappedOpenGL::RefreshDerivedReplacementsChecked(ResourceId requiredShader)
+{
+  GLResourceManager *rm = GetResourceManager();
+
+  struct PendingProgram
+  {
+    ResourceId original;
+    GLuint previous = 0;
+    GLuint replacement = 0;
+    bool hadPrevious = false;
+  };
+  struct PendingPipeline
+  {
+    ResourceId original;
+    GLuint previous = 0;
+    GLuint replacement = 0;
+    bool hadPrevious = false;
+  };
+
+  rdcarray<PendingProgram> pendingPrograms;
+  rdcarray<PendingPipeline> pendingPipelines;
+  auto discardPending = [&]() {
+    for(PendingPipeline &item : pendingPipelines)
+      if(item.replacement != 0)
+        glDeleteProgramPipelines(1, &item.replacement);
+    for(PendingProgram &item : pendingPrograms)
+      if(item.replacement != 0)
+        glDeleteProgram(item.replacement);
+    pendingPipelines.clear();
+    pendingPrograms.clear();
+  };
+  auto programLog = [&](GLuint program) {
+    GLint length = 0;
+    glGetProgramiv(program, eGL_INFO_LOG_LENGTH, &length);
+    if(length <= 0)
+      return rdcstr();
+    char *buffer = new char[length + 1];
+    GLsizei written = 0;
+    glGetProgramInfoLog(program, length, &written, buffer);
+    buffer[RDCMIN((GLint)written, length)] = 0;
+    rdcstr result(buffer);
+    delete[] buffer;
+    return result;
+  };
+  auto pipelineLog = [&](GLuint pipeline) {
+    GLint length = 0;
+    glGetProgramPipelineiv(pipeline, eGL_INFO_LOG_LENGTH, &length);
+    if(length <= 0)
+      return rdcstr();
+    char *buffer = new char[length + 1];
+    GLsizei written = 0;
+    glGetProgramPipelineInfoLog(pipeline, length, &written, buffer);
+    buffer[RDCMIN((GLint)written, length)] = 0;
+    rdcstr result(buffer);
+    delete[] buffer;
+    return result;
+  };
+
+  rdcarray<ResourceId> capturedPrograms;
+  for(const auto &it : m_Programs)
+    if(!ResourceIDGen::IsReplayOnlyID(it.first))
+      capturedPrograms.push_back(it.first);
+
+  uint32_t requiredUses = 0;
+  for(ResourceId progsrcid : capturedPrograms)
+  {
+    auto programIt = m_Programs.find(progsrcid);
+    if(programIt == m_Programs.end())
+    {
+      discardPending();
+      return StringFormat::Fmt("Captured OpenGL program %s disappeared during checked rebuild",
+                               ToStr(progsrcid).c_str());
+    }
+    const ProgramData &progdata = programIt->second;
+
+    bool usesRequiredShader = false;
+    bool usesReplacedShader = false;
+    for(size_t stageIndex = 0; stageIndex < NumShaderStages; stageIndex++)
+    {
+      ResourceId shaderId = progdata.stageShaders[stageIndex];
+      usesRequiredShader |= shaderId == requiredShader;
+      usesReplacedShader |= shaderId != ResourceId() && rm->HasReplacement(shaderId);
+    }
+    if(usesRequiredShader)
+      requiredUses++;
+
+    if(progdata.shaderProgramUnlinkable)
+    {
+      if(usesRequiredShader)
+      {
+        discardPending();
+        return StringFormat::Fmt(
+            "OpenGL shader %s is owned by glCreateShaderProgramv program %s; "
+            "checked SPIR-V relinking is unavailable",
+            ToStr(requiredShader).c_str(), ToStr(progsrcid).c_str());
+      }
+      continue;
+    }
+
+    PendingProgram item;
+    item.original = progsrcid;
+    item.hadPrevious = rm->HasReplacement(progsrcid);
+    if(item.hadPrevious)
+    {
+      GLResource previous = rm->GetResource(progsrcid, true);
+      ResourceId previousId = rm->GetResID(previous);
+      if(previous.Namespace != eResProgram || previousId == progsrcid ||
+         rm->GetUnreplacedID(previousId) != progsrcid)
+      {
+        discardPending();
+        return StringFormat::Fmt(
+            "Captured OpenGL program %s has an invalid or multiply-owned replacement",
+            ToStr(progsrcid).c_str());
+      }
+      item.previous = previous.name;
+    }
+
+    if(!usesReplacedShader)
+    {
+      if(item.hadPrevious)
+        pendingPrograms.push_back(item);
+      continue;
+    }
+
+    GLResource originalProgram = rm->GetResourceWithoutReplacement(progsrcid, true);
+    if(originalProgram.Namespace != eResProgram)
+    {
+      discardPending();
+      return StringFormat::Fmt("Captured OpenGL program %s is no longer available",
+                               ToStr(progsrcid).c_str());
+    }
+    GLuint progsrc = originalProgram.name;
+    GLuint progdst = glCreateProgram();
+    item.replacement = progdst;
+    ResourceId progdstid = rm->GetResID(ProgramRes(GetCtx(), progdst));
+
+    for(size_t stageIndex = 0; stageIndex < NumShaderStages; stageIndex++)
+    {
+      ResourceId shaderId = progdata.stageShaders[stageIndex];
+      if(shaderId == ResourceId())
+        continue;
+      GLResource shader = rm->GetResource(shaderId, true);
+      if(shader.Namespace != eResShader)
+      {
+        glDeleteProgram(progdst);
+        discardPending();
+        return StringFormat::Fmt("OpenGL program %s resolved a missing replacement shader",
+                                 ToStr(progsrcid).c_str());
+      }
+      glAttachShader(progdst, shader.name);
+    }
+
+    GLint separable = 0;
+    glGetProgramiv(progsrc, eGL_PROGRAM_SEPARABLE, &separable);
+    if(separable)
+      glProgramParameteri(progdst, eGL_PROGRAM_SEPARABLE, GL_TRUE);
+
+    ResourceId vertexShader = progdata.stageShaders[0];
+    ResourceId fragmentShader = progdata.stageShaders[4];
+    if(vertexShader != ResourceId())
+      CopyProgramAttribBindings(progsrc, progdst, GetShader(vertexShader).GetReflection());
+    if(fragmentShader != ResourceId())
+      CopyProgramFragDataBindings(progsrc, progdst, GetShader(fragmentShader).GetReflection());
+
+    glLinkProgram(progdst);
+    GLint linked = 0;
+    glGetProgramiv(progdst, eGL_LINK_STATUS, &linked);
+    if(linked == 0)
+    {
+      rdcstr log = programLog(progdst);
+      glDeleteProgram(progdst);
+      discardPending();
+      return StringFormat::Fmt("Rebuilding OpenGL program %s failed to link: %s",
+                               ToStr(progsrcid).c_str(), log.c_str());
+    }
+
+    PerStageReflections dstStages;
+    FillReflectionArray(progdstid, dstStages);
+    PerStageReflections sourceStages;
+    FillReflectionArray(progsrcid, sourceStages);
+    std::map<GLint, GLint> translate;
+    CopyProgramUniforms(sourceStages, progsrc, dstStages, progdst, &translate);
+    m_Programs[progdstid].locationTranslate = m_Programs[progsrcid].locationTranslate;
+    for(auto location = m_Programs[progdstid].locationTranslate.begin();
+        location != m_Programs[progdstid].locationTranslate.end(); ++location)
+    {
+      auto translated = translate.find(location->second);
+      location->second = translated != translate.end() ? translated->second : -1;
+    }
+
+    pendingPrograms.push_back(item);
+  }
+
+  if(requiredShader != ResourceId() && requiredUses == 0)
+  {
+    discardPending();
+    return "The captured OpenGL shader is not referenced by a captured program";
+  }
+
+  std::map<ResourceId, GLuint> desiredPrograms;
+  for(const PendingProgram &item : pendingPrograms)
+    desiredPrograms[item.original] = item.replacement;
+
+  rdcarray<ResourceId> capturedPipelines;
+  for(const auto &it : m_Pipelines)
+    if(!ResourceIDGen::IsReplayOnlyID(it.first))
+      capturedPipelines.push_back(it.first);
+
+  for(ResourceId pipesrcid : capturedPipelines)
+  {
+    auto pipelineIt = m_Pipelines.find(pipesrcid);
+    if(pipelineIt == m_Pipelines.end())
+    {
+      discardPending();
+      return StringFormat::Fmt("Captured OpenGL pipeline %s disappeared during checked rebuild",
+                               ToStr(pipesrcid).c_str());
+    }
+    const PipelineData &pipedata = pipelineIt->second;
+
+    PendingPipeline item;
+    item.original = pipesrcid;
+    item.hadPrevious = rm->HasReplacement(pipesrcid);
+    if(item.hadPrevious)
+    {
+      GLResource previous = rm->GetResource(pipesrcid, true);
+      ResourceId previousId = rm->GetResID(previous);
+      if(previous.Namespace != eResProgramPipe || previousId == pipesrcid ||
+         rm->GetUnreplacedID(previousId) != pipesrcid)
+      {
+        discardPending();
+        return StringFormat::Fmt(
+            "Captured OpenGL pipeline %s has an invalid or multiply-owned replacement",
+            ToStr(pipesrcid).c_str());
+      }
+      item.previous = previous.name;
+    }
+
+    bool usesReplacedProgram = false;
+    for(size_t stageIndex = 0; stageIndex < NumShaderStages; stageIndex++)
+    {
+      ResourceId programId = pipedata.stagePrograms[stageIndex];
+      if(programId == ResourceId())
+        continue;
+      auto pending = desiredPrograms.find(programId);
+      if(pending != desiredPrograms.end())
+        usesReplacedProgram |= pending->second != 0;
+      else
+        usesReplacedProgram |= rm->HasReplacement(programId);
+    }
+
+    if(!usesReplacedProgram)
+    {
+      if(item.hadPrevious)
+        pendingPipelines.push_back(item);
+      continue;
+    }
+
+    GLuint pipedst = 0;
+    glGenProgramPipelines(1, &pipedst);
+    item.replacement = pipedst;
+    for(size_t stageIndex = 0; stageIndex < NumShaderStages; stageIndex++)
+    {
+      ResourceId programId = pipedata.stagePrograms[stageIndex];
+      if(programId == ResourceId())
+        continue;
+
+      GLuint programName = 0;
+      auto pending = desiredPrograms.find(programId);
+      if(pending != desiredPrograms.end())
+      {
+        if(pending->second != 0)
+          programName = pending->second;
+        else
+          programName = rm->GetResourceWithoutReplacement(programId, true).name;
+      }
+      else
+      {
+        programName = rm->GetResource(programId, true).name;
+      }
+      if(programName == 0)
+      {
+        glDeleteProgramPipelines(1, &pipedst);
+        discardPending();
+        return StringFormat::Fmt("OpenGL pipeline %s resolved a missing program",
+                                 ToStr(pipesrcid).c_str());
+      }
+      glUseProgramStages(pipedst, ShaderBit(stageIndex), programName);
+    }
+
+    glValidateProgramPipeline(pipedst);
+    GLint valid = 0;
+    glGetProgramPipelineiv(pipedst, eGL_VALIDATE_STATUS, &valid);
+    if(valid == 0)
+    {
+      rdcstr log = pipelineLog(pipedst);
+      glDeleteProgramPipelines(1, &pipedst);
+      discardPending();
+      return StringFormat::Fmt("Rebuilding OpenGL program pipeline %s failed validation: %s",
+                               ToStr(pipesrcid).c_str(), log.c_str());
+    }
+
+    pendingPipelines.push_back(item);
+  }
+
+  // No derived mapping changes until every program has linked and every program pipeline has
+  // validated. Commit as one replay-thread transaction, then retire the previous derived objects.
+  for(PendingProgram &item : pendingPrograms)
+  {
+    if(item.hadPrevious)
+      rm->RemoveReplacement(item.original);
+    if(item.replacement != 0)
+      rm->ReplaceResource(item.original,
+                          rm->GetResID(ProgramRes(GetCtx(), item.replacement)));
+  }
+  for(PendingPipeline &item : pendingPipelines)
+  {
+    if(item.hadPrevious)
+      rm->RemoveReplacement(item.original);
+    if(item.replacement != 0)
+      rm->ReplaceResource(item.original,
+                          rm->GetResID(ProgramPipeRes(GetCtx(), item.replacement)));
+  }
+
+  for(PendingPipeline &item : pendingPipelines)
+    if(item.previous != 0)
+      glDeleteProgramPipelines(1, &item.previous);
+  for(PendingProgram &item : pendingPrograms)
+    if(item.previous != 0)
+      glDeleteProgram(item.previous);
+
+  return {};
 }
 
 void WrappedOpenGL::SwapBuffers(WindowingSystem winSystem, void *windowHandle)
@@ -3175,6 +3591,22 @@ bool WrappedOpenGL::Serialise_BeginCaptureFrame(SerialiserType &ser)
     savedDebugMessages.swap(m_DebugMessages);
 
     state.ApplyState(this);
+
+    if(IsLoading(m_State))
+    {
+      for(const auto &binding : state.UniformBinding)
+        TrackReplayPatchBinding(binding.res, eGL_UNIFORM_BUFFER);
+      for(const auto &binding : state.ShaderStorage)
+        TrackReplayPatchBinding(binding.res, eGL_SHADER_STORAGE_BUFFER);
+      for(const auto &binding : state.AtomicCounter)
+        TrackReplayPatchBinding(binding.res, eGL_ATOMIC_COUNTER_BUFFER);
+      for(const auto &binding : state.TransformFeedback)
+        TrackReplayPatchBinding(binding.res, eGL_TRANSFORM_FEEDBACK_BUFFER);
+      TrackReplayPatchBinding(state.BufferBindings[GLRenderState::eBufIdx_Pixel_Pack],
+                              eGL_PIXEL_PACK_BUFFER);
+      TrackReplayPatchBinding(state.BufferBindings[GLRenderState::eBufIdx_Pixel_Unpack],
+                              eGL_PIXEL_UNPACK_BUFFER);
+    }
 
     // restore saved messages - which implicitly discards any generated while applying state
     savedDebugMessages.swap(m_DebugMessages);
@@ -5225,9 +5657,16 @@ bool WrappedOpenGL::ProcessChunk(ReadSerialiser &ser, GLChunk chunk)
 RDResult WrappedOpenGL::ContextReplayLog(CaptureState readType, uint32_t startEventID,
                                          uint32_t endEventID, bool partial)
 {
+  ScopedReplayTimingSection replaySetup(ReplayTimingSection::ReplaySetup);
   m_FrameReader->SetOffset(0);
 
   ReadSerialiser ser(m_FrameReader, Ownership::Nothing);
+
+  if(IsReplayTimingActive())
+  {
+    ser.SetParameterReadCallback(&NotifyReplayTimingParametersDecoded);
+    SetReplayTimingChunkNameLookup(&GetChunkName);
+  }
 
   ser.SetStringDatabase(&m_StringDB);
   ser.SetUserData(GetResourceManager());
@@ -5310,9 +5749,11 @@ RDResult WrappedOpenGL::ContextReplayLog(CaptureState readType, uint32_t startEv
   }
 
   uint64_t startOffset = ser.GetReader()->GetOffset();
+  replaySetup.End();
 
   for(;;)
   {
+    ScopedReplayTimingSection loopTiming(ReplayTimingSection::ReplayBookkeeping);
     if(IsActiveReplaying(m_State) && m_CurEventID > endEventID)
     {
       // we can just break out if we've done all the events desired.
@@ -5321,16 +5762,29 @@ RDResult WrappedOpenGL::ContextReplayLog(CaptureState readType, uint32_t startEv
 
     m_CurChunkOffset = ser.GetReader()->GetOffset();
 
-    GLChunk chunktype = ser.ReadChunk<GLChunk>();
+    GLChunk chunktype;
+    {
+      ScopedReplayTimingSection framing(ReplayTimingSection::ChunkFraming);
+      chunktype = ser.ReadChunk<GLChunk>();
+    }
 
     if(ser.GetReader()->IsErrored())
       return RDResult(ResultCode::APIDataCorrupted, ser.GetError().message);
 
     m_ChunkMetadata = ser.ChunkMetadata();
 
-    bool success = ContextProcessChunk(ser, chunktype);
+    bool success;
+    {
+      ScopedReplayTimingChunk chunkTiming((uint32_t)chunktype);
+      success = ContextProcessChunk(ser, chunktype);
+    }
 
-    ser.EndChunk();
+    {
+      ScopedReplayTimingSection framing(ReplayTimingSection::ChunkFraming);
+      ser.EndChunk();
+    }
+    AddReplayTimingCounter(ReplayTimingCounter::ChunkBytes,
+                           ser.GetReader()->GetOffset() - m_CurChunkOffset);
 
     if(ser.GetReader()->IsErrored())
       return RDResult(ResultCode::APIDataCorrupted, ser.GetError().message);
@@ -5340,9 +5794,10 @@ RDResult WrappedOpenGL::ContextReplayLog(CaptureState readType, uint32_t startEv
     if(!success)
       return m_FailedReplayResult;
 
-    RenderDoc::Inst().SetProgress(
-        LoadProgress::FrameEventsRead,
-        float(m_CurChunkOffset - startOffset) / float(ser.GetReader()->GetSize()));
+    if(IsLoading(m_State) || IsStructuredExporting(m_State))
+      RenderDoc::Inst().SetProgress(
+          LoadProgress::FrameEventsRead,
+          float(m_CurChunkOffset - startOffset) / float(ser.GetReader()->GetSize()));
 
     if((SystemChunk)chunktype == SystemChunk::CaptureEnd || ser.GetReader()->AtEnd())
       break;
@@ -5354,6 +5809,7 @@ RDResult WrappedOpenGL::ContextReplayLog(CaptureState readType, uint32_t startEv
       m_CurEventID++;
   }
 
+  ScopedReplayTimingSection replayTail(ReplayTimingSection::ReplayBookkeeping);
   // swap the structure back now that we've accumulated the frame as well.
   if(IsLoading(m_State) || IsStructuredExporting(m_State))
     ser.GetStructuredFile().Swap(*prevFile);
@@ -5417,14 +5873,115 @@ RDResult WrappedOpenGL::ContextReplayLog(CaptureState readType, uint32_t startEv
   return ResultCode::Succeeded;
 }
 
+void WrappedOpenGL::TrackReplayPatchBinding(GLResource buffer, GLenum target)
+{
+  if(buffer.name == 0)
+    return;
+  BufferData &info = m_Buffers[GetResourceManager()->GetResID(buffer)];
+  info.creationFlags |= MakeBufferCategory(target);
+  if(GLReplayPatchBindingCanWrite(target))
+    info.replayPatchUnsafe = true;
+  if(target == eGL_PIXEL_UNPACK_BUFFER)
+    info.replayPatchNonUniformInput = true;
+}
+
+void WrappedOpenGL::TrackReplayCheckpointBufferWrite(const GLResource &buffer)
+{
+  if(IsActiveReplaying(m_State))
+    m_Replay->InvalidateCheckpointBufferVersion(buffer);
+}
+
+void WrappedOpenGL::ApplyReplayBufferPatches()
+{
+  if(m_ReplayBufferPatches.empty())
+    return;
+  GLint read = 0, write = 0;
+  GL.glGetIntegerv(eGL_COPY_READ_BUFFER_BINDING, &read);
+  GL.glGetIntegerv(eGL_COPY_WRITE_BUFFER_BINDING, &write);
+  GL.glBindBuffer(eGL_COPY_READ_BUFFER, m_ReplayPatchUpload);
+  uint64_t sourceOffset = 0;
+  for(const ReplayBufferPatch &patch : m_ReplayBufferPatches)
+  {
+    GLResource buffer = GetResourceManager()->GetResource(patch.buffer);
+    // A retained checkpoint can contain an older parameter generation. Even an identical
+    // re-overlay is conservatively a write: never share its old bytes into a later checkpoint.
+    m_Replay->InvalidateCheckpointBufferVersion(buffer);
+    GL.glBindBuffer(eGL_COPY_WRITE_BUFFER, buffer.name);
+    GL.glCopyBufferSubData(eGL_COPY_READ_BUFFER, eGL_COPY_WRITE_BUFFER, (GLintptr)sourceOffset,
+                           (GLintptr)patch.byteOffset, (GLsizeiptr)patch.data.size());
+    sourceOffset += patch.data.size();
+  }
+  GL.glBindBuffer(eGL_COPY_READ_BUFFER, read);
+  GL.glBindBuffer(eGL_COPY_WRITE_BUFFER, write);
+}
+
 bool WrappedOpenGL::ContextProcessChunk(ReadSerialiser &ser, GLChunk chunk)
 {
   m_AddedAction = false;
 
+  if(IsActiveReplaying(m_State))
+    m_Replay->TrackCheckpointBufferWrites(chunk);
   bool success = ProcessChunk(ser, chunk);
 
   if(!success)
     return false;
+
+  // Captured CPU updates and native copies/clears may overwrite an edited interval. Restore the
+  // persistent user bytes in command order, before any subsequent consumer, including other EIDs.
+  if(IsActiveReplaying(m_State) && !m_ReplayBufferPatches.empty())
+  {
+    switch(chunk)
+    {
+      case GLChunk::glBufferStorage:
+      case GLChunk::glBufferStorageEXT:
+      case GLChunk::glNamedBufferStorage:
+      case GLChunk::glNamedBufferStorageEXT:
+      case GLChunk::glBufferData:
+      case GLChunk::glBufferDataARB:
+      case GLChunk::glNamedBufferData:
+      case GLChunk::glNamedBufferDataEXT:
+      case GLChunk::glBufferSubData:
+      case GLChunk::glBufferSubDataARB:
+      case GLChunk::glNamedBufferSubData:
+      case GLChunk::glNamedBufferSubDataEXT:
+      case GLChunk::glCopyBufferSubData:
+      case GLChunk::glCopyNamedBufferSubData:
+      case GLChunk::glNamedCopyBufferSubDataEXT:
+      case GLChunk::glUnmapBuffer:
+      case GLChunk::glUnmapBufferARB:
+      case GLChunk::glUnmapBufferOES:
+      case GLChunk::glUnmapNamedBuffer:
+      case GLChunk::glUnmapNamedBufferEXT:
+      case GLChunk::CoherentMapWrite:
+      case GLChunk::glFlushMappedBufferRange:
+      case GLChunk::glFlushMappedBufferRangeEXT:
+      case GLChunk::glFlushMappedNamedBufferRange:
+      case GLChunk::glFlushMappedNamedBufferRangeEXT:
+      case GLChunk::glClearBufferData:
+      case GLChunk::glClearNamedBufferData:
+      case GLChunk::glClearNamedBufferDataEXT:
+      case GLChunk::glClearBufferSubData:
+      case GLChunk::glClearNamedBufferSubData:
+      case GLChunk::glClearNamedBufferSubDataEXT:
+      case GLChunk::glInvalidateBufferData:
+      case GLChunk::glInvalidateBufferSubData:
+      case GLChunk::glGetQueryObjecti64v:
+      case GLChunk::glGetQueryObjecti64vEXT:
+      case GLChunk::glGetQueryBufferObjecti64v:
+      case GLChunk::glGetQueryObjectiv:
+      case GLChunk::glGetQueryObjectivARB:
+      case GLChunk::glGetQueryObjectivEXT:
+      case GLChunk::glGetQueryBufferObjectiv:
+      case GLChunk::glGetQueryObjectui64v:
+      case GLChunk::glGetQueryObjectui64vEXT:
+      case GLChunk::glGetQueryBufferObjectui64v:
+      case GLChunk::glGetQueryObjectuiv:
+      case GLChunk::glGetQueryObjectuivARB:
+      case GLChunk::glGetQueryObjectuivEXT:
+      case GLChunk::glGetQueryBufferObjectuiv: ApplyReplayBufferPatches(); break;
+      default: break;
+    }
+  }
 
   if(IsLoading(m_State))
   {
@@ -5469,6 +6026,13 @@ bool WrappedOpenGL::ContextProcessChunk(ReadSerialiser &ser, GLChunk chunk)
 
 void WrappedOpenGL::AddUsage(const ActionDescription &a)
 {
+  // Copy sources are consumers too: their descendants may be read long before this buffer is
+  // bound as a UBO. This action carries the actual frame EID, independently of shader reflection.
+  if(a.copySource != ResourceId() && m_Buffers.find(a.copySource) != m_Buffers.end())
+  {
+    uint32_t &first = m_ReplayPatchFirstReads[a.copySource];
+    first = first ? RDCMIN(first, a.eventId) : a.eventId;
+  }
   ActionFlags DrawDispatchMask = ActionFlags::Drawcall | ActionFlags::Dispatch;
   if(!(a.flags & DrawDispatchMask))
     return;
@@ -5478,6 +6042,27 @@ void WrappedOpenGL::AddUsage(const ActionDescription &a)
   ContextPair &ctx = GetCtx();
 
   uint32_t e = a.eventId;
+
+  // Enumerate all native UBO slots, including bindings unused by the captured shader. A shader
+  // replacement can consume those slots; GetUsage's reflected used-block list is insufficient.
+  GLint uniformBindings = 0;
+  GL.glGetIntegerv(eGL_MAX_UNIFORM_BUFFER_BINDINGS, &uniformBindings);
+  if(!GL.glGetIntegeri_v || uniformBindings <= 0 || uniformBindings > 65536)
+    m_ReplayPatchReadEvidenceError = "uniformBindingEnumerationUnavailable";
+  else
+    for(GLint slot = 0; slot < uniformBindings; ++slot)
+    {
+      GLuint buffer = 0;
+      GL.glGetIntegeri_v(eGL_UNIFORM_BUFFER_BINDING, (GLuint)slot, (GLint *)&buffer);
+      if(buffer)
+      {
+        const GLResource resource = BufferRes(ctx, buffer);
+        const ResourceId id = rm->GetResID(resource);
+        TrackReplayPatchBinding(resource, eGL_UNIFORM_BUFFER);
+        uint32_t &first = m_ReplayPatchFirstReads[id];
+        first = first ? RDCMIN(first, e) : e;
+      }
+    }
 
   //////////////////////////////
   // Input
@@ -5512,6 +6097,7 @@ void WrappedOpenGL::AddUsage(const ActionDescription &a)
     rs.FetchState(this);
 
     const ShaderReflection *refl[NumShaderStages] = {NULL};
+    ResourceId stageShaders[NumShaderStages] = {};
     GLuint progForStage[NumShaderStages] = {};
 
     GLuint curProg = 0;
@@ -5536,6 +6122,7 @@ void WrappedOpenGL::AddUsage(const ActionDescription &a)
           {
             curProg = rm->GetResource(pipeDetails.stagePrograms[i]).name;
 
+            stageShaders[i] = pipeDetails.stageShaders[i];
             refl[i] = GetShader(pipeDetails.stageShaders[i]).GetReflection();
             progForStage[i] = curProg;
           }
@@ -5551,6 +6138,7 @@ void WrappedOpenGL::AddUsage(const ActionDescription &a)
       {
         if(progDetails.stageShaders[i] != ResourceId())
         {
+          stageShaders[i] = progDetails.stageShaders[i];
           refl[i] = GetShader(progDetails.stageShaders[i]).GetReflection();
           progForStage[i] = curProg;
         }
@@ -5562,6 +6150,16 @@ void WrappedOpenGL::AddUsage(const ActionDescription &a)
       EventUsage cb = EventUsage(e, CBUsage(i));
       EventUsage ro = EventUsage(e, ResUsage(i));
       EventUsage rw = EventUsage(e, RWResUsage(i));
+
+      if(stageShaders[i] != ResourceId())
+      {
+        rdcarray<EventUsage> &uses = m_ResourceUses[stageShaders[i]];
+
+        // Shader usage is a representative-EID index, not a frame-wide use list. Shader objects
+        // are stage-specific in GL, so the first positive event is the only record required.
+        if(e > 0 && uses.empty())
+          uses.push_back(EventUsage(e, ResourceUsage::Shader));
+      }
 
       if(refl[i])
       {
@@ -5867,11 +6465,17 @@ void WrappedOpenGL::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
     partial = false;
   }
 
+  ScopedReplayTiming replayTiming("OpenGL", startEventID, endEventID, replayType, partial);
+
   if(!partial)
   {
+    m_Replay->ResetCheckpointBufferLineage();
     RENDERDOC_PROFILEREGION("ApplyInitialContents");
     GLMarkerRegion apply("!!!!RenderDoc Internal: ApplyInitialContents");
-    GetResourceManager()->ApplyInitialContents();
+    {
+      ScopedReplayTimingSection timing(ReplayTimingSection::ApplyInitial);
+      GetResourceManager()->ApplyInitialContents();
+    }
 
     m_WasActiveFeedback = false;
   }
@@ -5881,18 +6485,24 @@ void WrappedOpenGL::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
   GLMarkerRegion::Set(StringFormat::Fmt("!!!!RenderDoc Internal:  Replay %d (%d): %u->%u",
                                         (int)replayType, (int)partial, startEventID, endEventID));
 
+  ApplyReplayBufferPatches();
+
   m_ReplayEventCount = 0;
 
   RDResult status = ResultCode::Succeeded;
 
-  if(replayType == eReplay_Full)
-    status = ContextReplayLog(m_State, startEventID, endEventID, partial);
-  else if(replayType == eReplay_WithoutDraw)
-    status = ContextReplayLog(m_State, startEventID, RDCMAX(1U, endEventID) - 1, partial);
-  else if(replayType == eReplay_OnlyDraw)
-    status = ContextReplayLog(m_State, endEventID, endEventID, partial);
-  else
-    RDCFATAL("Unexpected replay type");
+  {
+    ScopedReplayTimingSection timing(ReplayTimingSection::ContextReplay);
+
+    if(replayType == eReplay_Full)
+      status = ContextReplayLog(m_State, startEventID, endEventID, partial);
+    else if(replayType == eReplay_WithoutDraw)
+      status = ContextReplayLog(m_State, startEventID, RDCMAX(1U, endEventID) - 1, partial);
+    else if(replayType == eReplay_OnlyDraw)
+      status = ContextReplayLog(m_State, endEventID, endEventID, partial);
+    else
+      RDCFATAL("Unexpected replay type");
+  }
 
   RDCASSERTEQUAL(status.code, ResultCode::Succeeded);
 

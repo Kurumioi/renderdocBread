@@ -194,7 +194,7 @@ void WrappedOpenGL::TextureData::GetCompressedImageDataGLES(int mip, GLenum targ
   }
 }
 
-void GLResourceManager::ContextPrepare_InitialState(GLResource res)
+void GLResourceManager::ContextPrepare_InitialState(GLResource res, GLInitialContents *checkpoint)
 {
   GLInitialContents initContents;
 
@@ -228,8 +228,11 @@ void GLResourceManager::ContextPrepare_InitialState(GLResource res)
 
     // workaround for some drivers - mapping/unmapping here seems to help avoid problems mapping
     // later.
-    GL.glMapNamedBufferEXT(buf, eGL_READ_ONLY);
-    GL.glUnmapNamedBufferEXT(buf);
+    if(!checkpoint)
+    {
+      GL.glMapNamedBufferEXT(buf, eGL_READ_ONLY);
+      GL.glUnmapNamedBufferEXT(buf);
+    }
 
     // restore old bindings
     GL.glBindBuffer(eGL_COPY_READ_BUFFER, oldbuf1);
@@ -260,7 +263,7 @@ void GLResourceManager::ContextPrepare_InitialState(GLResource res)
   }
   else if(res.Namespace == eResTexture)
   {
-    PrepareTextureInitialContents(id, res);
+    PrepareTextureInitialContents(id, res, checkpoint);
     return;
   }
   else if(res.Namespace == eResFramebuffer)
@@ -330,7 +333,7 @@ void GLResourceManager::ContextPrepare_InitialState(GLResource res)
       a.layered = (layered != 0);
       a.obj = (type == eGL_RENDERBUFFER) ? RenderbufferRes(ctx, object) : TextureRes(ctx, object);
 
-      if(type != eGL_RENDERBUFFER)
+      if(type != eGL_RENDERBUFFER && object)
       {
         WrappedOpenGL::TextureData &details = m_Driver->m_Textures[GetID(a.obj)];
 
@@ -547,7 +550,10 @@ void GLResourceManager::ContextPrepare_InitialState(GLResource res)
     RDCERR("Unexpected type of resource requiring initial state");
   }
 
-  SetInitialContents(id, initContents);
+  if(checkpoint)
+    *checkpoint = initContents;
+  else
+    SetInitialContents(id, initContents);
 }
 
 bool GLResourceManager::Prepare_InitialState(GLResource res)
@@ -602,7 +608,8 @@ bool GLResourceManager::Prepare_InitialState(GLResource res)
   return true;
 }
 
-void GLResourceManager::PrepareTextureInitialContents(ResourceId id, GLResource res)
+void GLResourceManager::PrepareTextureInitialContents(ResourceId id, GLResource res,
+                                                       GLInitialContents *checkpoint)
 {
   WrappedOpenGL::TextureData &details = m_Driver->m_Textures[id];
 
@@ -909,8 +916,12 @@ void GLResourceManager::PrepareTextureInitialContents(ResourceId id, GLResource 
         }
       }
 
-      GL.glFlush();
-      GL.glFinish();
+      // Checkpoints stay in the same replay command stream; GPU ordering is sufficient.
+      if(!checkpoint)
+      {
+        GL.glFlush();
+        GL.glFinish();
+      }
 
       if(avoidCopySubImage)
       {
@@ -973,7 +984,10 @@ void GLResourceManager::PrepareTextureInitialContents(ResourceId id, GLResource 
                                        (GLint *)&state.texBufSize);
   }
 
-  SetInitialContents(id, initContents);
+  if(checkpoint)
+    *checkpoint = initContents;
+  else
+    SetInitialContents(id, initContents);
 }
 
 uint64_t GLResourceManager::GetSize_InitialState(ResourceId resid, const GLInitialContents &initial)

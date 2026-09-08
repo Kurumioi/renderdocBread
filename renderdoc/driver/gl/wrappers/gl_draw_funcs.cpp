@@ -25,6 +25,7 @@
 
 #include "../gl_driver.h"
 #include "common/common.h"
+#include "replay/replay_timing.h"
 #include "strings/string_utils.h"
 
 void WrappedOpenGL::BindIndirectBuffer(GLsizeiptr bufLength)
@@ -4888,6 +4889,7 @@ bool WrappedOpenGL::Serialise_glFlush(SerialiserType &ser)
 {
   if(IsReplayingAndReading())
   {
+    ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitSubmit);
     GL.glFlush();
 
     if(IsLoading(m_State))
@@ -4926,6 +4928,7 @@ bool WrappedOpenGL::Serialise_glFinish(SerialiserType &ser)
 {
   if(IsReplayingAndReading())
   {
+    ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitWait);
     GL.glFinish();
 
     if(IsLoading(m_State))

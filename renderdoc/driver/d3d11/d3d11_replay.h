@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include <memory>
 #include "api/replay/renderdoc_replay.h"
 #include "core/core.h"
 #include "replay/replay_driver.h"
@@ -199,6 +200,16 @@ public:
 
   RDResult ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
   void ReplayLog(uint32_t endEventID, ReplayLogType replayType);
+  void ConfigureReplayCheckpoints(const ReplayCheckpointConfig &config,
+                                  const rdcarray<ReplayCheckpointCandidate> &candidates) override;
+  void InvalidateReplayCheckpoints(uint32_t firstAffectedEvent = 0) override;
+  ReplayCheckpointStats GetReplayCheckpointStats() override;
+  rdcstr SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches) override;
+  uint32_t GetReplayBufferPatchFirstAffectedEvent() const override { return m_BufferPatchFirstAffected; }
+  void RecordBufferPatchConsumer(ResourceId buffer, uint32_t eventId);
+  bool ApplyPendingBufferPatches();
+  void InvalidateBufferPatchContents() { m_BufferPatchesDirty = !m_BufferPatches.empty(); }
+  bool HasBufferPatches() const { return !m_BufferPatches.empty(); }
   SDFile *GetStructuredFile();
 
   rdcarray<uint32_t> GetPassEvents(uint32_t eventId);
@@ -278,7 +289,13 @@ public:
   rdcarray<CounterResult> FetchCounters(const rdcarray<GPUCounter> &counters);
 
   ResourceId CreateProxyTexture(const TextureDescription &templateTex);
+  ResourceId CreateProxyTextureSnapshot(const TextureDescription &templateTex);
+  bool SupportsProxyTextureSnapshots() { return true; }
   void SetProxyTextureData(ResourceId texid, const Subresource &sub, byte *data, size_t dataSize);
+  ResourceId CreateTextureSnapshot(ResourceId source, const Subresource &sourceSub,
+                                   CompType typeCast, Subresource &snapshotSub);
+  void FreeTextureSnapshot(ResourceId snapshot);
+  void FreeTextureSnapshots(const rdcarray<ResourceId> &snapshots);
   bool IsTextureSupported(const TextureDescription &tex);
   bool NeedRemapForFetch(const ResourceFormat &format);
 
@@ -367,6 +384,7 @@ private:
   }
 
   rdcarray<ID3D11Resource *> m_ProxyResources;
+  rdcarray<ResourceId> m_TextureSnapshots;
   std::map<ResourceId, TextureDescription> m_ProxyResourceOrigInfo;
 
   struct OutputWindow
@@ -402,6 +420,32 @@ private:
 
   WrappedID3D11Device *m_pDevice = NULL;
   WrappedID3D11DeviceContext *m_pImmediateContext = NULL;
+
+  struct ReplayCheckpoint;
+  struct CheckpointResource;
+  struct CheckpointVersion;
+  bool PrepareCheckpointResources();
+  bool SaveReplayCheckpoint(uint32_t eventId);
+  bool RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint);
+  void UpdateCheckpointAccounting();
+  void EvictOldestCheckpoint();
+  ReplayCheckpointConfig m_CheckpointConfig;
+  ReplayCheckpointStats m_CheckpointStats;
+  rdcarray<ReplayCheckpointCandidate> m_CheckpointCandidates;
+  rdcarray<CheckpointResource> m_CheckpointResources;
+  std::map<uint32_t, std::unique_ptr<ReplayCheckpoint>> m_Checkpoints;
+  uint64_t m_CheckpointUseSerial = 0;
+  uint32_t m_CheckpointCurrentEvent = 0;
+  bool m_CheckpointPrepared = false;
+  bool m_CheckpointPreparingFailed = false;
+  // After editing, recorded usage is no longer proof that a replacement shader cannot write.
+  bool m_CheckpointConservativeWrites = false;
+  rdcarray<ReplayBufferPatch> m_BufferPatches;
+  std::map<ResourceId, ID3D11Buffer *> m_BufferPatchScratch;
+  bool m_BufferPatchesDirty = false;
+  std::map<ResourceId, uint32_t> m_BufferPatchFirstConsumers;
+  uint32_t m_BufferPatchFirstAffected = 0;
+  uint32_t m_BufferPatchAnchorEvent = 0;
 
   rdcarray<rdcstr> m_CustomShaderIncludes;
 

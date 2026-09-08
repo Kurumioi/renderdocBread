@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from contextlib import asynccontextmanager
 
@@ -7,7 +8,12 @@ import httpx
 import pytest
 
 from replaylab_agent.errors import AuthenticationError, ConnectorError
-from replaylab_agent.probe import _openai_endpoint_candidates, discover_models, probe_profile
+from replaylab_agent.probe import (
+    _openai_endpoint_candidates,
+    _probe_agent_launch,
+    discover_models,
+    probe_profile,
+)
 from replaylab_agent.profiles import Profile
 
 
@@ -61,6 +67,61 @@ async def test_external_agent_probe_launches_without_prompting() -> None:
 
 
 @pytest.mark.asyncio
+async def test_external_agent_probe_discards_unread_output_and_reaps_process(
+    monkeypatch,
+) -> None:
+    created: dict[str, object] = {}
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.closed = False
+            self.waited = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            self.waited = True
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.returncode = 0
+            self.stdin = FakeStdin()
+            self.wait_calls = 0
+
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            return self.returncode
+
+    process = FakeProcess()
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        created["argv"] = argv
+        created["kwargs"] = kwargs
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    profile = Profile(
+        "agent-stdio",
+        "custom-acp",
+        command=[sys.executable],
+        options={"allow_unsandboxed_agent": True},
+    )
+
+    await _probe_agent_launch(profile, [sys.executable, "--version"], timeout=0.001)
+
+    assert created["argv"] == (sys.executable, "--version")
+    kwargs = created["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["stdin"] == asyncio.subprocess.PIPE
+    assert kwargs["stdout"] == asyncio.subprocess.DEVNULL
+    assert kwargs["stderr"] == asyncio.subprocess.DEVNULL
+    assert process.stdin.closed is True
+    assert process.stdin.waited is True
+    assert process.wait_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_external_acp_probe_requires_explicit_process_trust() -> None:
     from replaylab_agent.errors import ConfigurationError
 
@@ -71,11 +132,13 @@ async def test_external_acp_probe_requires_explicit_process_trust() -> None:
 
 
 def test_gemini_probe_keeps_key_out_of_url_query() -> None:
-    from replaylab_agent.probe import _model_list_request
+    from replaylab_agent.probe import _model_list_requests
 
-    url, headers, params = _model_list_request(
+    requests = _model_list_requests(
         Profile("gemini-test", "gemini", "gemini-test"), "secret-key"
     )
+    assert len(requests) == 1
+    _, url, headers, params = requests[0]
     assert url.endswith("/v1beta/models")
     assert headers == {"x-goog-api-key": "secret-key"}
     assert params == {}

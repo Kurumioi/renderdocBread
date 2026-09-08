@@ -25,6 +25,7 @@
 #pragma once
 
 #include <QFrame>
+#include <atomic>
 #include "renderdoc_replay.h"
 
 namespace Ui
@@ -52,11 +53,13 @@ public:
 signals:
   void clicked(QMouseEvent *e);
   void doubleClicked(QMouseEvent *e);
+  void resourceLinkActivated();
   void resized(ResourcePreview *prev);
 
 public:
   void setSlotName(const QString &n);
   void setResourceName(const QString &n);
+  void setResourceLinkEnabled(bool enabled, const QString &toolTip = QString());
 
   void clickEvent(QMouseEvent *e);
   void doubleClickEvent(QMouseEvent *e);
@@ -64,10 +67,15 @@ public:
   WindowingData GetWidgetWindowingData();
   QSize GetThumbSize();
   void UpdateThumb(QSize s, const bytebuf &imgData);
+  void ClearThumb();
+  uint64_t BeginThumbRequest() { return ++m_ThumbRequestSerial; }
+  bool IsCurrentThumbRequest(uint64_t serial) const { return m_ThumbRequestSerial == serial; }
 
   void setActive(bool b)
   {
     m_Active = b;
+    if(!b)
+      ClearThumb();
     // we unconditionally hide the preview, the thumbnail strip will show it
     hide();
   }
@@ -83,6 +91,8 @@ private:
 
   RDLabel *m_ManualThumbnail = NULL;
 
-  bool m_Active;
+  std::atomic<uint64_t> m_ThumbRequestSerial = {0};
+  bool m_Active = false;
   bool m_Selected = false;
+  bool m_ResourceLinkEnabled = false;
 };

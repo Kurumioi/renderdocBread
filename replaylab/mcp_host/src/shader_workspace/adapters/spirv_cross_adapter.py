@@ -27,6 +27,12 @@ _STAGE_TO_SPIRV_CROSS = {
     "compute": "comp",
     "task": "task",
     "mesh": "mesh",
+    "raygen": "rgen",
+    "intersection": "rint",
+    "anyhit": "rahit",
+    "closesthit": "rchit",
+    "miss": "rmiss",
+    "callable": "rcall",
 }
 _STAGE_TO_PROFILE_PREFIX = {
     "vertex": "vs",
@@ -59,6 +65,7 @@ def derive_spirv_cross_arguments(
     output: str,
     mode: str,
     entry_point: str,
+    captured_entry_point: str = "",
     stage: str,
     target_api: str,
     target_profile: str = "",
@@ -73,18 +80,17 @@ def derive_spirv_cross_arguments(
     if not entry or len(entry) > 512 or "\x00" in entry:
         raise ValueError("entry point must be a bounded non-empty string")
     api = _normalise_api(target_api)
-    arguments = [
-        str(source),
-        "--entry",
-        entry,
-        "--stage",
-        spirv_stage,
-    ]
+    captured_entry = str(captured_entry_point or entry).strip()
+    if not captured_entry or len(captured_entry) > 512 or "\x00" in captured_entry:
+        raise ValueError("captured entry point must be a bounded non-empty string")
+    arguments = [str(source)]
     if mode == "hlsl":
         if api not in {"d3d11", "d3d12"}:
             raise ValueError("HLSL reconstruction requires a physical Direct3D API")
         if not _HLSL_IDENTIFIER_RE.fullmatch(entry):
-            raise ValueError("HLSL entry point is not a source identifier")
+            raise ValueError("physical HLSL entry point is not a source identifier")
+        if not _HLSL_IDENTIFIER_RE.fullmatch(captured_entry):
+            raise ValueError("captured HLSL entry point is not a source identifier")
         profile = str(target_profile).strip().casefold()
         match = _PROFILE_RE.fullmatch(profile)
         if match is None:
@@ -104,6 +110,14 @@ def derive_spirv_cross_arguments(
         shader_model = str(major * 10 + minor)
         arguments.extend(
             [
+                # SPIRV-Cross applies --rename-entry-point before resolving
+                # --entry. Select the mechanically renamed output name here;
+                # ``entry`` remains the independently parsed physical module
+                # entry and is still the rename source below.
+                "--entry",
+                captured_entry,
+                "--stage",
+                spirv_stage,
                 "--hlsl",
                 "--shader-model",
                 shader_model,
@@ -111,7 +125,7 @@ def derive_spirv_cross_arguments(
                 # physical entry name instead of silently changing it to main.
                 "--rename-entry-point",
                 entry,
-                entry,
+                captured_entry,
                 spirv_stage,
             ]
         )
@@ -120,7 +134,9 @@ def derive_spirv_cross_arguments(
             raise ValueError("Vulkan GLSL reconstruction requires physical Vulkan API")
         if str(target_profile).strip():
             raise ValueError("Vulkan GLSL reconstruction must not invent a DirectX profile")
-        arguments.append("--vulkan-semantics")
+        arguments.extend(
+            ["--entry", entry, "--stage", spirv_stage, "--vulkan-semantics"]
+        )
     elif mode == "opengl-glsl":
         if api != "opengl":
             raise ValueError("OpenGL GLSL reconstruction requires physical OpenGL API")
@@ -130,6 +146,7 @@ def derive_spirv_cross_arguments(
         # configures a distinct SPIRV-Cross tool for OpenGL-flavoured SPIR-V.
         # The capture encoding is the authority because the SPIR-V header alone
         # cannot identify the consumer environment.
+        arguments.extend(["--entry", entry, "--stage", spirv_stage])
     else:
         raise ValueError("unsupported SPIRV-Cross adapter mode")
     arguments.extend(["--output", str(output)])
@@ -157,6 +174,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--mode", choices=("hlsl", "vulkan-glsl", "opengl-glsl"), required=True
     )
     parser.add_argument("--entry", required=True)
+    # Optional only for backwards compatibility with previously generated
+    # registries.  The current first-party registry always supplies it; when
+    # absent, derive_spirv_cross_arguments deterministically preserves the
+    # physical entry name instead of guessing another capture-visible name.
+    parser.add_argument("--captured-entry", default="")
     parser.add_argument("--stage", required=True)
     parser.add_argument("--target-api", required=True)
     parser.add_argument("--target-profile", default="")
@@ -180,6 +202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output=str(output),
         mode=parsed.mode,
         entry_point=parsed.entry,
+        captured_entry_point=parsed.captured_entry,
         stage=parsed.stage,
         target_api=parsed.target_api,
         target_profile=parsed.target_profile,

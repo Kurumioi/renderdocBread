@@ -56,7 +56,17 @@ _GLSLANG_STAGE_ARGUMENTS = {
     "compute": "comp",
     "task": "task",
     "mesh": "mesh",
+    "raygen": "rgen",
+    "intersection": "rint",
+    "anyhit": "rahit",
+    "closesthit": "rchit",
+    "miss": "rmiss",
+    "callable": "rcall",
 }
+_OPENGL_GLSLANG_STAGES = frozenset(
+    {"vertex", "hull", "domain", "geometry", "fragment", "compute"}
+)
+_SPIRV_TOOLS_OPENGL_TARGET_ENV = "opengl4.5"
 _VULKAN_TARGET_ENVS = frozenset(
     {
         "vulkan1.0",
@@ -408,6 +418,8 @@ def generate_official_toolchain_configs(
             "{output}",
             "--entry",
             "{entry_point}",
+            "--captured-entry",
+            "{captured_entry_point}",
             "--stage",
             "{stage}",
             "--target-api",
@@ -466,7 +478,7 @@ def generate_official_toolchain_configs(
                     "{input}",
                 ],
             )
-            if enable_opengl_spirv:
+            if enable_opengl_spirv and stage in _OPENGL_GLSLANG_STAGES:
                 add(
                     "glslang-%s-opengl" % stage,
                     "glslang",
@@ -507,7 +519,7 @@ def generate_official_toolchain_configs(
             "spirv-tools-val-opengl",
             "spirv-val",
             "validate",
-            ["--target-env", "opengl", "{input}"],
+            ["--target-env", _SPIRV_TOOLS_OPENGL_TARGET_ENV, "{input}"],
         )
     add(
         "dxil-spirv-transform",
@@ -518,8 +530,6 @@ def generate_official_toolchain_configs(
             "--output",
             "{output}",
             "--validate",
-            "--entry",
-            "{entry_point}",
         ],
     )
     if binaries["renodx-decompiler"] is not None:
@@ -661,6 +671,14 @@ def generate_official_toolchain_configs(
         "compute",
     ]
     dxil_stages = legacy_stages + ["task", "mesh"]
+    vulkan_stages = dxil_stages + [
+        "raygen",
+        "intersection",
+        "anyhit",
+        "closesthit",
+        "miss",
+        "callable",
+    ]
     if binaries["d3dcompiler"] is not None:
         routes.append(
             route_record(
@@ -740,7 +758,7 @@ def generate_official_toolchain_configs(
                 source_url=DXC_SOURCE,
                 license_name=DXC_LICENSE,
                 caveats=[
-                    "The profile is read from DxilProgramHeader.ProgramVersion; library/ray multi-export programs fail closed."
+                    "The profile is read from DxilProgramHeader.ProgramVersion; this high-level HLSL route is intentionally not registered for Library/Ray exports."
                 ],
             )
         )
@@ -759,7 +777,8 @@ def generate_official_toolchain_configs(
                 source_url=DXC_SOURCE,
                 license_name=DXC_LICENSE,
                 caveats=[
-                    "Read-only explanatory DXIL/LLVM text; this route does not claim that edited dump text can be reassembled, signed, or validated as a replay replacement."
+                    "DXIL/LLVM text is executable-editable only when paired with the pinned official IDxcAssembler route and the untouched round-trip probe passes; otherwise it remains explanatory only.",
+                    "A successful assembly still does not sign, validate ABI compatibility, or authorize replay replacement."
                 ],
             )
         )
@@ -829,7 +848,7 @@ def generate_official_toolchain_configs(
                     ],
                 )
             )
-            if enable_opengl_spirv:
+            if enable_opengl_spirv and stage in _OPENGL_GLSLANG_STAGES:
                 routes.append(
                     route_record(
                         registry,
@@ -964,8 +983,8 @@ def generate_official_toolchain_configs(
                     caveats=[
                         "Community DirectX-to-Vulkan translation, not source recovery; descriptor/root-signature remapping may be required.",
                         format_caveat,
-                        "The exact hash-pinned executable must run successfully, emit validated SPIR-V, and pass the untouched HLSL reverse-compile probe before editable source is published.",
-                        "Successful SPIR-V validation and reverse compilation still do not prove equivalence to the DirectX pipeline.",
+                        "The exact hash-pinned executable must run successfully, emit one structurally recognized SPIR-V module, and pass the untouched HLSL reverse-compile probe before editable source is published.",
+                        "Structural SPIR-V recognition and reverse compilation do not prove equivalence to the DirectX pipeline; only a separately bound spirv-val route may claim SPIR-V validation.",
                         "The argument order is taken from upstream dxil_spirv.cpp print_help/parser; the exact local executable is SHA-256 pinned."
                     ],
                 )
@@ -999,7 +1018,7 @@ def generate_official_toolchain_configs(
                     operation="decompile",
                     input_format="opengl-spirv",
                     output_format="glsl",
-                    stages=dxil_stages,
+                    stages=legacy_stages,
                     fidelity="reconstructed-source",
                     priority=100,
                     implementation="Khronos SPIRV-Cross",
@@ -1018,7 +1037,7 @@ def generate_official_toolchain_configs(
                 operation="decompile",
                 input_format="spirv",
                 output_format="glsl",
-                stages=dxil_stages,
+                stages=vulkan_stages,
                 fidelity="reconstructed-source",
                 priority=100,
                 implementation="Khronos SPIRV-Cross",
@@ -1100,7 +1119,7 @@ def generate_official_toolchain_configs(
                     source_url=SPIRV_TOOLS_SOURCE,
                     license_name="Apache-2.0",
                     caveats=[
-                        "Assembly success is not OpenGL-environment validation; run spirv-val --target-env opengl separately."
+                        "Assembly success is not OpenGL-environment validation; run spirv-val --target-env opengl4.5 separately."
                     ],
                 )
             )
@@ -1137,7 +1156,7 @@ def generate_official_toolchain_configs(
                     source_url=SPIRV_TOOLS_SOURCE,
                     license_name="Apache-2.0",
                     caveats=[
-                        "The trusted operation fixes --target-env=opengl; validator success does not prove OpenGL program-interface or replay compatibility."
+                        "The trusted operation fixes --target-env=opengl4.5, the newest OpenGL environment exposed by SPIRV-Tools; validator success does not prove OpenGL program-interface or replay compatibility."
                     ],
                 )
             )

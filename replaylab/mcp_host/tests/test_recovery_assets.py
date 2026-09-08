@@ -33,6 +33,37 @@ def _make_dxbc(code: bytes = b"compiled instructions") -> bytes:
     )
 
 
+def _make_dxil_library() -> bytes:
+    bitcode = b"BC\xc0\xdefixed-library-bitcode"
+    unpadded_size = 24 + len(bitcode)
+    padded_size = (unpadded_size + 3) & ~3
+    program = (
+        struct.pack(
+            "<6I",
+            0x00060063,  # ProgramType Library, Shader Model 6.3.
+            padded_size // 4,
+            0x4C495844,
+            0x00000100,
+            16,
+            len(bitcode),
+        )
+        + bitcode
+        + b"\x00" * (padded_size - unpadded_size)
+    )
+    chunk = b"DXIL" + struct.pack("<I", len(program)) + program
+    offset = 36
+    total_size = offset + len(chunk)
+    return (
+        b"DXBC"
+        + b"\x00" * 16
+        + struct.pack("<I", 1)
+        + struct.pack("<I", total_size)
+        + struct.pack("<I", 1)
+        + struct.pack("<I", offset)
+        + chunk
+    )
+
+
 def _spirv_string_words(value: str) -> list[int]:
     encoded = value.encode("utf-8") + b"\x00"
     encoded += b"\x00" * (-len(encoded) % 4)
@@ -92,6 +123,8 @@ def test_discovers_common_sources_and_validated_binaries_stably(tmp_path: Path) 
 
     dxbc = _make_dxbc()
     (tmp_path / "shader-cache.bin").write_bytes(b"prefix" + dxbc + b"suffix")
+    dxil_library = _make_dxil_library()
+    (tmp_path / "ray-library.dxil").write_bytes(dxil_library)
     spirv = _make_spirv()
     (tmp_path / "main.spv").write_bytes(spirv)
     (tmp_path / "default.metallib").write_bytes(b"MTLB" + b"\x00" * 28)
@@ -139,6 +172,11 @@ def test_discovers_common_sources_and_validated_binaries_stably(tmp_path: Path) 
     assert d3d["shaderFacts"]["stage"] == "fragment"
     assert d3d["shaderFacts"]["profile"] == "ps_5_0"
     assert d3d["fingerprints"]["rawSha256"] == hashlib.sha256(dxbc).hexdigest()
+
+    library = _by_path(first, "ray-library.dxil")[0]
+    assert library["format"] == "dxil"
+    assert library["shaderFacts"]["stage"] == "library"
+    assert library["shaderFacts"]["profile"] == "lib_6_3"
 
     spv = _by_path(first, "main.spv")[0]
     assert spv["format"] == "spir-v"

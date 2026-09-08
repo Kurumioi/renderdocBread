@@ -34,7 +34,7 @@ def _configure_process() -> None:
                 pass
 
     # A frozen AgentHost cannot derive the installed runtime directory from a
-    # source-tree __file__.  ACP specialists spawn their task-filtered proxy
+    # source-tree __file__.  Vendor-native Agents spawn their task-filtered proxy
     # through sys.executable, and the parent runtime resolves the upstream MCP
     # host before that spawn.  Pin both paths to this exact co-packaged bundle
     # while preserving an explicit operator/qrenderdoc override.
@@ -69,6 +69,43 @@ def _dispatch(argv: Sequence[str]) -> int:
     return main(selected)
 
 
+def _write_safe_bootstrap_failure() -> None:
+    """Write only a stable public failure if frozen import/dispatch fails."""
+
+    message = (
+        "replaylab-ai: error[agent-host-bootstrap-failure]: "
+        "The local AI Host could not start. "
+        "Check RenderDoc's diagnostic log for technical details.\n"
+    ).encode("utf-8")
+    try:
+        binary = getattr(sys.stderr, "buffer", None)
+        if binary is not None:
+            binary.write(message)
+            binary.flush()
+        else:
+            sys.stderr.write(message.decode("utf-8"))
+            sys.stderr.flush()
+    except Exception:
+        # Never let a broken diagnostic stream reopen PyInstaller's default
+        # unhandled-exception/traceback path.
+        pass
+
+
+def _entry_main(argv: Sequence[str]) -> int:
+    try:
+        _configure_process()
+        return _dispatch(argv)
+    except SystemExit as exc:
+        if type(exc.code) is int:
+            return exc.code
+        _write_safe_bootstrap_failure()
+        return 2
+    except KeyboardInterrupt:
+        return 130
+    except BaseException:
+        _write_safe_bootstrap_failure()
+        return 2
+
+
 if __name__ == "__main__":
-    _configure_process()
-    raise SystemExit(_dispatch(sys.argv[1:]))
+    raise SystemExit(_entry_main(sys.argv[1:]))

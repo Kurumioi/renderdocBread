@@ -2699,10 +2699,18 @@ void RDStyle::drawControl(ControlElement control, const QStyleOption *opt, QPain
 
     if(m_Scheme == Ultra)
     {
+      // i18n-ignore: internal QObject property identifier, never shown to the user.
+      const bool brightSelectedTabs =
+          widget && widget->property("_renderdoc_ultra_bright_selected_tabs").toBool();
+
       if(opt->state & State_Selected)
-        p->fillPath(path, UltraColors::color(UltraColors::TabBackgroundSelected));
+        p->fillPath(path, UltraColors::color(brightSelectedTabs
+                                                ? UltraColors::WindowBackground
+                                                : UltraColors::TabBackgroundSelected));
       else if(opt->state & State_MouseOver)
-        p->fillPath(path, UltraColors::color(UltraColors::TabBackgroundHover));
+        p->fillPath(path, UltraColors::color(brightSelectedTabs
+                                                ? UltraColors::HeaderBackgroundHover
+                                                : UltraColors::TabBackgroundHover));
       else
         p->fillPath(path, UltraColors::color(UltraColors::TabBackground));
     }

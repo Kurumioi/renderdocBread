@@ -36,6 +36,56 @@ class _ProjectService:
 
 
 class ReplayLabInternalHostTests(unittest.TestCase):
+    def test_detached_frozen_service_owns_extraction_environment(self):
+        for frozen in (False, True):
+            with self.subTest(frozen=frozen), mock.patch.object(
+                    internal_host.sys, "frozen", frozen, create=True), mock.patch.dict(
+                    os.environ, {"PYINSTALLER_RESET_ENVIRONMENT": "0",
+                                 "_PYI_PARENT_PROCESS_LEVEL": "1",
+                                 "REPLAYLAB_INTERNAL_RUNTIME_DIR": "D:/runtime-test"}), mock.patch.object(
+                    internal_host.subprocess, "Popen") as launch:
+                original = dict(os.environ)
+                command = [str(Path(sys.executable).resolve()), "serve"]
+                internal_host._spawn_detached(command)
+                args, options = launch.call_args
+                self.assertEqual((command,), args)
+                expected = dict(original)
+                if frozen:
+                    expected["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+                self.assertEqual(expected, options["env"])
+                self.assertEqual(original, dict(os.environ))
+                self.assertIsNot(options["env"], os.environ)
+                self.assertFalse(options["shell"])
+                self.assertTrue(options["close_fds"])
+                self.assertEqual(str(Path(sys.executable).resolve().parent), options["cwd"])
+                for stream in ("stdin", "stdout", "stderr"):
+                    self.assertEqual(subprocess.DEVNULL, options[stream])
+                if os.name == "nt":
+                    self.assertEqual(subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                                     | subprocess.CREATE_NO_WINDOW, options["creationflags"])
+
+    def test_loopback_health_explicitly_bypasses_ambient_proxies(self):
+        self.assertEqual({}, internal_host._LOOPBACK_PROXY_HANDLER.proxies)
+
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({
+            "service": internal_host.SERVICE_NAME,
+        }).encode("utf-8")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HTTP_PROXY": "http://proxy.invalid:8080",
+                "HTTPS_PROXY": "http://proxy.invalid:8080",
+            },
+        ), mock.patch.object(
+            internal_host._LOOPBACK_OPENER, "open", return_value=response
+        ) as opened:
+            value = internal_host.health(49743)
+
+        self.assertEqual(internal_host.SERVICE_NAME, value["service"])
+        request = opened.call_args.args[0]
+        self.assertEqual("http://127.0.0.1:49743/health", request.full_url)
+
     def test_internal_lifecycle_is_disjoint_from_external_mcp_lifecycle(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -150,6 +200,31 @@ class ReplayLabInternalHostTests(unittest.TestCase):
         self.assertNotIn("from .server import _shader_live_edit_manager", source)
         self.assertIn("This is intentionally a plain Router", source)
 
+    def test_restore_delete_route_is_inside_the_bearer_protected_router(self):
+        source = Path(internal_host.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        delete_routes = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            if not isinstance(function, ast.Name) or function.id != "Route":
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            methods = next(
+                (keyword.value for keyword in node.keywords if keyword.arg == "methods"),
+                None,
+            )
+            if (
+                node.args[0].value == "/replaylab/project-restore/{job_id}"
+                and isinstance(methods, ast.List)
+                and [item.value for item in methods.elts] == ["DELETE"]
+            ):
+                delete_routes.append(node)
+        self.assertEqual(1, len(delete_routes))
+        self.assertIn("protected = BearerAuthApp(app, token)", source)
+
     def test_import_is_transport_and_external_host_free(self):
         package_root = Path(internal_host.__file__).resolve().parents[1]
         environment = dict(os.environ)
@@ -221,7 +296,7 @@ class ReplayLabInternalHostTests(unittest.TestCase):
             self.assertEqual("external-http", proxy.streamable_http_app())
         self.assertEqual(1, len(created))
         self.assertEqual(1, len(created[0][2].tools))
-        self.assertEqual("1.10.2", created[0][2]._mcp_server.version)
+        self.assertEqual("1.13.0", created[0][2]._mcp_server.version)
 
     def test_internal_routes_are_exactly_the_bounded_high_level_surface(self):
         source = Path(internal_host.__file__).read_text(encoding="utf-8")
@@ -243,6 +318,9 @@ class ReplayLabInternalHostTests(unittest.TestCase):
                 "/replaylab/project-restore",
                 "/replaylab/project-restore/{job_id}",
                 "/replaylab/shader-source/save",
+                "/replaylab/shader-source/check",
+                "/replaylab/shader-live-edit",
+                "/replaylab/asset-index",
             },
             routes,
         )

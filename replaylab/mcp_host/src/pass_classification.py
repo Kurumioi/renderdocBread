@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -31,6 +32,12 @@ KNOWLEDGE_VERSION = 1
 
 MAX_ACTIONS = 100_000
 MAX_PROPOSALS = 100_000
+MAX_RESOURCE_FLOW_EDGES = 20_000
+MAX_ACTION_IO_RESOURCES = 256
+MAX_DRAW_STATE_STAGES = 16
+MAX_SAMPLER_BINDINGS_PER_STAGE = 64
+DEFAULT_FOLDED_GROUP_SIZE = 32
+MAX_TREE_GROUP_LABEL = 512
 MAX_PROJECT_BYTES = 64 * 1024 * 1024
 MAX_KNOWLEDGE_BYTES = 16 * 1024 * 1024
 MAX_TEXT = 4096
@@ -252,6 +259,20 @@ def _marker_names(value: Any) -> list[str]:
     return result
 
 
+def _marker_event_path(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in value[:128]:
+        if not isinstance(item, Mapping):
+            continue
+        event_id = _safe_int(item.get("eventId", item.get("event_id")), 0)
+        name = _bounded_text(item.get("name", item.get("label", "")), "marker event name")
+        if event_id > 0 or name:
+            result.append({"eventId": max(0, event_id), "name": name})
+    return result
+
+
 def _normal_search_text(value: str) -> tuple[str, str, frozenset[str]]:
     # Preserve word boundaries for short tokens such as UI/CSM, while also
     # supporting common concatenated marker names such as ShadowDepths.
@@ -352,6 +373,7 @@ def _normalise_actions(raw: Any) -> tuple[list[dict[str, Any]], int]:
     def walk(
         values: Sequence[Any],
         inherited_markers: Sequence[str] = (),
+        inherited_marker_events: Sequence[Mapping[str, Any]] = (),
         parent_event_id: int | None = None,
     ) -> None:
         for raw_action in values:
@@ -372,13 +394,27 @@ def _normalise_actions(raw: Any) -> tuple[list[dict[str, Any]], int]:
             marker_path = _marker_names(action.get("markerPath")) or list(
                 inherited_markers
             )
+            marker_events = _marker_event_path(action.get("markerEventPath")) or [
+                dict(item) for item in inherited_marker_events
+            ]
+            explicit_parent = _safe_int(
+                action.get("parentEventId", action.get("parent_event_id")), 0
+            )
+            resolved_parent = (
+                parent_event_id if parent_event_id is not None else explicit_parent
+            )
             action.update(
                 {
                     "eventId": event_id,
                     "name": name or f"Action {event_id}",
                     "markerPath": marker_path,
+                    "markerEventPath": marker_events,
                     "_hasChildren": bool(children),
-                    "_parentEventId": parent_event_id,
+                    "_parentEventId": max(0, _safe_int(resolved_parent, 0)),
+                    "_executionIndex": max(
+                        0,
+                        _safe_int(action.get("executionIndex"), len(flattened)),
+                    ),
                 }
             )
             action.pop("children", None)
@@ -387,7 +423,11 @@ def _normalise_actions(raw: Any) -> tuple[list[dict[str, Any]], int]:
                 child_markers = marker_path
                 if not child_markers or child_markers[-1] != action["name"]:
                     child_markers = [*child_markers, action["name"]]
-                walk(children, child_markers, event_id)
+                child_marker_events = marker_events
+                marker_identity = {"eventId": event_id, "name": action["name"]}
+                if not child_marker_events or child_marker_events[-1] != marker_identity:
+                    child_marker_events = [*child_marker_events, marker_identity]
+                walk(children, child_markers, child_marker_events, event_id)
 
     walk(raw)
 
@@ -422,11 +462,29 @@ def _normalise_actions(raw: Any) -> tuple[list[dict[str, Any]], int]:
         )
         if not selected.get("markerPath") and other.get("markerPath"):
             selected["markerPath"] = list(other["markerPath"])
+        if not selected.get("markerEventPath") and other.get("markerEventPath"):
+            selected["markerEventPath"] = [
+                dict(item) for item in other["markerEventPath"]
+            ]
+        if not _safe_int(selected.get("_parentEventId"), 0):
+            selected["_parentEventId"] = _safe_int(
+                other.get("_parentEventId"), 0
+            )
+        selected["_executionIndex"] = min(
+            _safe_int(selected.get("_executionIndex"), event_id),
+            _safe_int(other.get("_executionIndex"), event_id),
+        )
         selected["_deduplicatedCopies"] = (
             _safe_int(selected.get("_deduplicatedCopies"), 0) + 1
         )
         by_event[event_id] = selected
-    result = sorted([*by_event.values(), *zero_event], key=lambda item: item["eventId"])
+    result = sorted(
+        [*by_event.values(), *zero_event],
+        key=lambda item: (
+            _safe_int(item.get("_executionIndex"), 0),
+            item["eventId"],
+        ),
+    )
     return result, duplicates
 
 
@@ -529,7 +587,7 @@ def _resource_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, (list, tuple)):
         return []
     result: list[dict[str, Any]] = []
-    for item in value[:4096]:
+    for item in value[:MAX_ACTION_IO_RESOURCES]:
         if isinstance(item, Mapping):
             resource = _safe_int(
                 item.get("resourceId", item.get("resource", item.get("id"))), 0
@@ -541,11 +599,158 @@ def _resource_list(value: Any) -> list[dict[str, Any]]:
                 ),
                 "format": _bounded_text(item.get("format", ""), "resource format"),
             }
+            for field in ("access", "stage", "role", "certainty"):
+                text = _bounded_text(item.get(field, ""), f"resource {field}")
+                if text:
+                    entry[field] = text
+            for field in (
+                "sampleCount",
+                "slot",
+                "byteOffset",
+                "byteSize",
+                "firstMip",
+                "numMips",
+                "firstSlice",
+                "numSlices",
+            ):
+                number = _safe_int(item.get(field), -1)
+                if number >= 0:
+                    entry[field] = number
+            if "byteStride" in item:
+                stride = item.get("byteStride")
+                if stride is None:
+                    entry["byteStride"] = None
+                else:
+                    number = _safe_int(stride, -1)
+                    if 0 <= number <= 0xFFFFFFFFFFFFFFFF:
+                        entry["byteStride"] = number
+            roles = item.get("roles")
+            if isinstance(roles, (list, tuple)):
+                clean_roles: list[str] = []
+                for role in roles[:16]:
+                    text = _bounded_text(role, "resource role")
+                    if text and text not in clean_roles:
+                        clean_roles.append(text)
+                if clean_roles:
+                    entry["roles"] = clean_roles
+            subresource = item.get("subresource")
+            if isinstance(subresource, Mapping):
+                clean_subresource = {}
+                for field in ("mip", "slice", "sample", "plane"):
+                    number = _safe_int(subresource.get(field), -1)
+                    if number >= 0:
+                        clean_subresource[field] = number
+                if clean_subresource:
+                    entry["subresource"] = clean_subresource
         else:
             entry = {"resourceId": _safe_int(item, 0), "name": "", "format": ""}
         if entry["resourceId"] or entry["name"] or entry["format"]:
             result.append(entry)
     return result
+
+
+def _unique_resources(
+    *values: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for collection in values:
+        for raw in collection:
+            item = dict(raw)
+            key = (
+                _safe_int(item.get("resourceId"), 0),
+                str(item.get("access", "")),
+                str(item.get("stage", "")),
+                *(
+                    _safe_int(item.get(field), -1)
+                    for field in (
+                        "byteOffset", "byteSize", "firstMip", "numMips",
+                        "firstSlice", "numSlices",
+                    )
+                ),
+                json.dumps(
+                    item.get("subresource", {}),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def _resource_access(
+    values: Sequence[Mapping[str, Any]], access: str
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for value in values:
+        item = dict(value)
+        item.setdefault("access", access)
+        result.append(item)
+    return result
+
+
+def _utility_destination_outputs(
+    copy_destinations: Sequence[Mapping[str, Any]],
+    depth_destinations: Sequence[Mapping[str, Any]],
+    action_outputs: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Coalesce utility aliases without losing their fixed-program roles.
+
+    RenderDoc commonly exposes a Copy/Resolve destination both through the
+    dedicated ``copyDestination`` field and through ``action.outputs``.  Those
+    fields describe one physical write, not two independent writers.  Prefer
+    the dedicated access while retaining every exposed role for inspection.
+    """
+
+    result: list[dict[str, Any]] = []
+
+    def add(raw: Mapping[str, Any], access: str) -> None:
+        item = dict(raw)
+        item["access"] = access
+        item_range = _resource_range(item)
+        resource_id = _safe_int(item.get("resourceId"), 0)
+        matches = [
+            existing
+            for existing in result
+            if _safe_int(existing.get("resourceId"), 0) == resource_id
+            and (
+                _resource_range(existing) == item_range
+                or not _resource_range(existing)
+                or not item_range
+            )
+        ]
+        if matches:
+            for existing in matches:
+                roles = list(existing.get("roles", []))
+                if access not in roles:
+                    roles.append(access)
+                existing["roles"] = roles
+                for field in ("name", "format"):
+                    if not existing.get(field) and item.get(field):
+                        existing[field] = item[field]
+            return
+        item["roles"] = [access]
+        result.append(item)
+
+    for destination in copy_destinations:
+        add(destination, "copy-destination")
+    for destination in depth_destinations:
+        add(destination, "action-depth-output")
+    for destination in action_outputs:
+        add(destination, "action-output")
+    return result
+
+
+def _bounded_resource_direction(
+    values: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    unique = _unique_resources(values)
+    if len(unique) <= MAX_ACTION_IO_RESOURCES:
+        return unique, 0
+    return unique[:MAX_ACTION_IO_RESOURCES], len(unique) - MAX_ACTION_IO_RESOURCES
 
 
 def _mapping_path(value: Mapping[str, Any], *paths: tuple[str, ...]) -> Any:
@@ -594,6 +799,20 @@ def _pipeline_bool(pipeline: Mapping[str, Any], name: str) -> bool | None:
             ("depthState", "writeEnabled"),
             ("depthStencilState", "depthWrite"),
         ),
+        "depthReadOnly": (("depthReadOnly",),),
+        "frontCCW": (("frontCCW",),),
+        "stencilTestEnabled": (("stencilTestEnabled",),),
+        "stencilReadOnly": (("stencilReadOnly",),),
+        "stencilWritePossible": (("stencilWritePossible",),),
+        "stencilStateResolved": (("stencilStateResolved",),),
+        "colorWriteMasksResolved": (("colorWriteMasksResolved",),),
+        "attachmentSubresourcesResolved": (
+            ("attachmentSubresourcesResolved",),
+        ),
+        "rasterStateResolved": (("rasterStateResolved",),),
+        "vertexBufferBindingsResolved": (("vertexBufferBindingsResolved",),),
+        "vertexInputUsageResolved": (("vertexInputUsageResolved",),),
+        "indexBufferBindingResolved": (("indexBufferBindingResolved",),),
     }
     direct = _optional_bool(_mapping_path(pipeline, *paths[name]))
     if direct is not None:
@@ -615,13 +834,472 @@ def _pipeline_bool(pipeline: Mapping[str, Any], name: str) -> bool | None:
     return None
 
 
+def _finite_number(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _compact_numeric_mapping(
+    value: Any, fields: Sequence[str]
+) -> dict[str, int | float]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, int | float] = {}
+    for field in fields:
+        number = _finite_number(value.get(field))
+        if number is not None:
+            result[field] = number
+    return result
+
+
+def _compact_color_target_states(value: Any) -> list[dict[str, Any]]:
+    """Project bridge blend facts without admitting inconsistent channel masks."""
+
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[dict[str, Any]] = []
+    seen_slots: set[int] = set()
+    for raw in value[:MAX_ACTION_IO_RESOURCES]:
+        if not isinstance(raw, Mapping):
+            continue
+        slot = _safe_int(raw.get("slot"), -1)
+        if (
+            slot < 0
+            or slot >= MAX_ACTION_IO_RESOURCES
+            or slot in seen_slots
+        ):
+            continue
+
+        projected: dict[str, Any] = {"slot": slot}
+        invalid = False
+        for field in ("blendEnabled", "logicOperationEnabled"):
+            if field not in raw:
+                continue
+            raw_state = raw.get(field)
+            if raw_state is None:
+                projected[field] = None
+                continue
+            state = _optional_bool(raw_state)
+            if state is None:
+                invalid = True
+                break
+            projected[field] = state
+        if invalid:
+            continue
+
+        write_mask: int | None = None
+        if "writeMask" in raw:
+            raw_mask = raw.get("writeMask")
+            if raw_mask is None:
+                projected["writeMask"] = None
+            else:
+                write_mask = _safe_int(raw_mask, -2)
+                if write_mask < -1 or write_mask > 0xF:
+                    continue
+                projected["writeMask"] = write_mask
+        if "writeChannels" in raw:
+            raw_channels = raw.get("writeChannels")
+            if raw_channels is None:
+                if write_mask is not None:
+                    continue
+                projected["writeChannels"] = None
+            else:
+                expected_channels = (
+                    ""
+                    if write_mask == -1
+                    else "".join(
+                        channel
+                        for bit, channel in
+                        ((1, "R"), (2, "G"), (4, "B"), (8, "A"))
+                        if write_mask is not None and write_mask & bit
+                    )
+                )
+                if (not isinstance(raw_channels, str) or
+                        write_mask is None or raw_channels != expected_channels):
+                    continue
+                projected["writeChannels"] = raw_channels
+
+        for field in ("colorBlend", "alphaBlend"):
+            if field not in raw:
+                continue
+            raw_equation = raw.get(field)
+            if raw_equation is None:
+                projected[field] = None
+                continue
+            if not isinstance(raw_equation, Mapping):
+                invalid = True
+                break
+            equation: dict[str, str | None] = {}
+            for component in ("sourceFactor", "destinationFactor", "operation"):
+                if component not in raw_equation:
+                    continue
+                raw_text = raw_equation.get(component)
+                equation[component] = (
+                    None
+                    if raw_text is None
+                    else _bounded_text(
+                        raw_text, f"color target {field} {component}")
+                )
+            projected[field] = equation
+        if invalid:
+            continue
+        if "logicOperation" in raw:
+            raw_operation = raw.get("logicOperation")
+            projected["logicOperation"] = (
+                None
+                if raw_operation is None
+                else _bounded_text(raw_operation, "color target logic operation")
+            )
+        seen_slots.add(slot)
+        result.append(projected)
+    return sorted(result, key=lambda item: item["slot"])
+
+
+def _compact_vertex_layout(value: Any) -> tuple[list[dict[str, Any]], int]:
+    if not isinstance(value, (list, tuple)):
+        return [], 0
+    result: list[dict[str, Any]] = []
+    for raw in value[:MAX_ACTION_IO_RESOURCES]:
+        if not isinstance(raw, Mapping):
+            continue
+        index = _safe_int(raw.get("index"), -1)
+        if index < 0 or index > 0x7FFFFFFF:
+            continue
+        entry: dict[str, Any] = {"index": index}
+        for field in ("name", "format"):
+            if field not in raw:
+                continue
+            raw_text = raw.get(field)
+            entry[field] = (
+                None
+                if raw_text is None
+                else _bounded_text(raw_text, f"vertex layout {field}")
+            )
+        for field in ("vertexBuffer", "byteOffset", "instanceRate"):
+            if field not in raw:
+                continue
+            raw_number = raw.get(field)
+            if raw_number is None:
+                entry[field] = None
+                continue
+            number = _safe_int(raw_number, -1)
+            if 0 <= number <= 0xFFFFFFFFFFFFFFFF:
+                entry[field] = number
+        for field in ("perInstance", "genericEnabled", "used"):
+            if field not in raw:
+                continue
+            raw_state = raw.get(field)
+            if raw_state is None:
+                entry[field] = None
+                continue
+            state = _optional_bool(raw_state)
+            if state is not None:
+                entry[field] = state
+        result.append(entry)
+    return result, max(0, len(value) - MAX_ACTION_IO_RESOURCES)
+
+
+def _compact_stencil_face(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for field in (
+        "function",
+        "failOperation",
+        "depthFailOperation",
+        "passOperation",
+    ):
+        text = _bounded_text(value.get(field, ""), f"stencil face {field}")
+        if text:
+            result[field] = text
+    for field in ("reference", "compareMask", "writeMask"):
+        number = _safe_int(value.get(field), -1)
+        if 0 <= number <= 0xFFFFFFFF:
+            result[field] = number
+    return result
+
+
+def _compact_sampler_binding(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    direct_access = _optional_bool(value.get("directAccess"))
+    runtime_access_proven = _optional_bool(value.get("runtimeAccessProven"))
+    if direct_access is None or runtime_access_proven is not False:
+        return {}
+    result["directAccess"] = direct_access
+    result["runtimeAccessProven"] = False
+    for field in (
+        "arrayElement",
+        "descriptorStoreId",
+        "descriptorByteOffset",
+        "descriptorByteSize",
+        "samplerResourceId",
+    ):
+        number = _safe_int(value.get(field), -1)
+        if 0 <= number <= 0xFFFFFFFFFFFFFFFF:
+            result[field] = number
+    binding_index = _safe_int(value.get("bindingIndex"), -1)
+    if direct_access:
+        if "bindingIndex" in value:
+            return {}
+    elif 0 <= binding_index <= 0xFFFE:
+        result["bindingIndex"] = binding_index
+    else:
+        return {}
+    for field in (
+        "type",
+        "filter",
+        "addressU",
+        "addressV",
+        "addressW",
+        "compareFunction",
+        "accessEvidence",
+    ):
+        text = _bounded_text(value.get(field, ""), f"sampler binding {field}")
+        if text:
+            result[field] = text
+    for field in ("creationTimeConstant", "staticallyUnused"):
+        state = _optional_bool(value.get(field))
+        if state is not None:
+            result[field] = state
+    for field in ("maxAnisotropy", "minLOD", "maxLOD", "mipBias"):
+        number = _finite_number(value.get(field))
+        if number is not None:
+            result[field] = number
+    return result
+
+
+def _compact_workload(action: Mapping[str, Any]) -> dict[str, Any]:
+    workload = action.get("workload")
+    result: dict[str, Any] = {}
+    if isinstance(workload, Mapping):
+        for field in (
+            "indexCount",
+            "vertexCount",
+            "instanceCount",
+            "groupCountX",
+            "groupCountY",
+            "groupCountZ",
+            "threadCountX",
+            "threadCountY",
+            "threadCountZ",
+            "rayWidth",
+            "rayHeight",
+            "rayDepth",
+            "indexOffset",
+            "vertexOffset",
+            "instanceOffset",
+            "baseVertex",
+        ):
+            number = _safe_int(workload.get(field), -1)
+            if number >= 0:
+                result[field] = number
+        if "drawIndex" in workload:
+            raw_draw_index = workload.get("drawIndex")
+            if raw_draw_index is None:
+                result["drawIndex"] = None
+            else:
+                draw_index = _safe_int(raw_draw_index, -1)
+                if 0 <= draw_index <= 0xFFFFFFFF:
+                    result["drawIndex"] = draw_index
+        if "dispatchBase" in workload:
+            raw_dispatch_base = workload.get("dispatchBase")
+            if raw_dispatch_base is None:
+                result["dispatchBase"] = None
+            elif (isinstance(raw_dispatch_base, (list, tuple)) and
+                    len(raw_dispatch_base) == 3):
+                dispatch_base = [
+                    _safe_int(component, -1)
+                    for component in raw_dispatch_base
+                ]
+                if all(0 <= component <= 0xFFFFFFFF
+                       for component in dispatch_base):
+                    result["dispatchBase"] = dispatch_base
+    result.setdefault("indexCount", _safe_int(action.get("numIndices"), 0))
+    result.setdefault(
+        "vertexCount",
+        _safe_int(action.get("numVertices", action.get("vertexCount")), 0),
+    )
+    result.setdefault("instanceCount", _safe_int(action.get("numInstances"), 0))
+    if _is_indirect(action):
+        result["indirectArgumentsResolved"] = False
+    return result
+
+
+def _compact_draw_state(pipeline: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    topology = _bounded_text(pipeline.get("topology", ""), "pipeline topology")
+    if topology:
+        result["topology"] = topology
+    viewport = _compact_numeric_mapping(
+        pipeline.get("viewport"),
+        ("x", "y", "width", "height", "minDepth", "maxDepth"),
+    )
+    if viewport:
+        result["viewport"] = viewport
+    scissor = _compact_numeric_mapping(
+        pipeline.get("scissor"), ("x", "y", "width", "height")
+    )
+    if scissor:
+        result["scissor"] = scissor
+    if "sampleCount" in pipeline:
+        raw_sample_count = pipeline.get("sampleCount")
+        if raw_sample_count is None:
+            result["sampleCount"] = None
+        else:
+            sample_count = _safe_int(raw_sample_count, -1)
+            if 0 <= sample_count <= 0xFFFFFFFF:
+                result["sampleCount"] = sample_count
+    for field in ("cullMode", "fillMode", "depthFunction"):
+        text = _bounded_text(pipeline.get(field, ""), f"pipeline {field}")
+        if text:
+            result[field] = text
+    for field in (
+        "blendEnabled",
+        "depthTestEnabled",
+        "depthWriteEnabled",
+        "depthReadOnly",
+        "frontCCW",
+        "stencilTestEnabled",
+        "stencilReadOnly",
+        "stencilWritePossible",
+        "stencilStateResolved",
+        "colorWriteMasksResolved",
+        "attachmentSubresourcesResolved",
+        "rasterStateResolved",
+        "vertexBufferBindingsResolved",
+        "vertexInputUsageResolved",
+        "indexBufferBindingResolved",
+    ):
+        state = _pipeline_bool(pipeline, field)
+        if state is not None:
+            result[field] = state
+    for field in (
+        "sampleCountResolved",
+        "depthStateResolved",
+        "stencilWriteOperationsCanWrite",
+        "rasterizerDiscardEnabled",
+        "rasterOutputApplicable",
+        "pipelineStateApplicable",
+    ):
+        if field not in pipeline:
+            continue
+        raw_state = pipeline.get(field)
+        if raw_state is None:
+            result[field] = None
+            continue
+        state = _optional_bool(raw_state)
+        if state is not None:
+            result[field] = state
+    if "rasterOutputSuppressionReason" in pipeline:
+        raw_reason = pipeline.get("rasterOutputSuppressionReason")
+        result["rasterOutputSuppressionReason"] = (
+            None
+            if raw_reason is None
+            else _bounded_text(raw_reason, "raster output suppression reason")
+        )
+    if "rasterizedStream" in pipeline:
+        raw_stream = pipeline.get("rasterizedStream")
+        if raw_stream is None:
+            result["rasterizedStream"] = None
+        else:
+            stream = _safe_int(raw_stream, -(0x80000001))
+            if -0x80000000 <= stream <= 0x7FFFFFFF:
+                result["rasterizedStream"] = stream
+    if "indexStride" in pipeline:
+        raw_stride = pipeline.get("indexStride")
+        if raw_stride is None:
+            result["indexStride"] = None
+        else:
+            stride = _safe_int(raw_stride, -1)
+            if 0 <= stride <= 0xFFFFFFFFFFFFFFFF:
+                result["indexStride"] = stride
+    if "vertexLayout" in pipeline:
+        vertex_layout, locally_omitted = _compact_vertex_layout(
+            pipeline.get("vertexLayout")
+        )
+        result["vertexLayout"] = vertex_layout
+        source_omitted = _safe_int(
+            pipeline.get("vertexLayoutOmittedCount"), 0
+        )
+        omitted = max(0, source_omitted) + locally_omitted
+        if omitted:
+            result["vertexLayoutOmittedCount"] = min(
+                omitted, 0xFFFFFFFFFFFFFFFF
+            )
+    elif "vertexLayoutOmittedCount" in pipeline:
+        omitted = _safe_int(pipeline.get("vertexLayoutOmittedCount"), -1)
+        if 0 <= omitted <= 0x7FFFFFFF:
+            result["vertexLayoutOmittedCount"] = omitted
+    color_target_states = _compact_color_target_states(
+        pipeline.get("colorTargetStates")
+    )
+    if color_target_states or "colorTargetStates" in pipeline:
+        result["colorTargetStates"] = color_target_states
+    for field in ("stencilFront", "stencilBack"):
+        face = _compact_stencil_face(pipeline.get(field))
+        if face:
+            result[field] = face
+    sampler_state = pipeline.get("samplers")
+    if isinstance(sampler_state, Mapping):
+        samplers: dict[str, dict[str, Any]] = {}
+        for raw_stage, raw_counts in list(sampler_state.items())[
+            :MAX_DRAW_STATE_STAGES
+        ]:
+            if not isinstance(raw_counts, Mapping):
+                continue
+            stage_name = _bounded_text(raw_stage, "sampler stage")
+            if not stage_name:
+                continue
+            counts: dict[str, Any] = {}
+            for field in ("declaredCount", "boundCount"):
+                count = _safe_int(raw_counts.get(field), -1)
+                if count >= 0:
+                    counts[field] = count
+            bindings_resolved = _optional_bool(raw_counts.get("bindingsResolved"))
+            if bindings_resolved is not None:
+                counts["bindingsResolved"] = bindings_resolved
+            raw_bindings = raw_counts.get("bindings")
+            bindings: list[dict[str, Any]] = []
+            if isinstance(raw_bindings, (list, tuple)):
+                for raw_binding in raw_bindings[:MAX_SAMPLER_BINDINGS_PER_STAGE]:
+                    binding = _compact_sampler_binding(raw_binding)
+                    if binding:
+                        bindings.append(binding)
+                if bindings:
+                    counts["bindings"] = bindings
+                omitted = max(
+                    _safe_int(raw_counts.get("bindingOmittedCount"), 0),
+                    len(raw_bindings) - MAX_SAMPLER_BINDINGS_PER_STAGE,
+                )
+            else:
+                omitted = _safe_int(raw_counts.get("bindingOmittedCount"), 0)
+            if omitted > 0:
+                counts["bindingOmittedCount"] = omitted
+            if counts:
+                samplers[stage_name] = counts
+        if samplers:
+            result["samplers"] = samplers
+    return result
+
+
 def _action_feature(
     action: Mapping[str, Any],
     pipeline: Mapping[str, Any],
     catalog_uses: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    render_targets = _resource_list(
-        pipeline.get("renderTargets", action.get("outputs", []))
+    action_kind = _action_kind(action)
+    render_targets = _resource_list(pipeline.get("renderTargets", []))
+    color_write_targets = _resource_list(
+        pipeline.get("colorWriteTargets", [])
+    )
+    action_outputs = _resource_list(action.get("outputs", []))
+    action_depth_outputs = _resource_list(
+        [action.get("depthOutput")] if action.get("depthOutput") else []
     )
     depth_raw = pipeline.get("depthTarget")
     if isinstance(depth_raw, Mapping) or depth_raw:
@@ -629,12 +1307,191 @@ def _action_feature(
     else:
         depth = []
 
-    read_resources = _resource_list(
-        pipeline.get("readResources", pipeline.get("reads", []))
+    blend_enabled = _pipeline_bool(pipeline, "blendEnabled")
+    depth_test_enabled = _pipeline_bool(pipeline, "depthTestEnabled")
+    depth_write_enabled = _pipeline_bool(pipeline, "depthWriteEnabled")
+    raster_output_state_present = "rasterOutputApplicable" in pipeline
+    raster_output_applicable = (
+        _optional_bool(pipeline.get("rasterOutputApplicable"))
+        if raster_output_state_present
+        else True
     )
-    write_resources = _resource_list(
-        pipeline.get("writeResources", pipeline.get("writes", render_targets))
+    raster_output_definite = raster_output_applicable is True
+    raster_output_may_apply = raster_output_applicable is not False
+
+    copy_sources = _resource_list(
+        [action.get("copySource")]
+        if action.get("copySource")
+        else pipeline.get("copySources", [])
     )
+    copy_destinations = _resource_list(
+        [action.get("copyDestination")]
+        if action.get("copyDestination")
+        else pipeline.get("copyDestinations", [])
+    )
+    possible_outputs = _resource_list(pipeline.get("possibleOutputs", []))
+    blend_read_targets = _resource_list(
+        pipeline.get("blendReadTargets", [])
+    )
+    action_flags = _safe_int(action.get("flags"), 0)
+    present_inputs: list[dict[str, Any]] = []
+    utility_has_dedicated_outputs = action_kind == "utility" and bool(action_flags & (
+        FLAG_CLEAR | FLAG_COPY | FLAG_RESOLVE | FLAG_GEN_MIPS
+    ))
+    if utility_has_dedicated_outputs:
+        action_definite_outputs = _utility_destination_outputs(
+            copy_destinations,
+            action_depth_outputs,
+            action_outputs,
+        )
+    elif action_kind == "utility" and action_flags & FLAG_PRESENT:
+        action_definite_outputs = []
+        present_inputs = _resource_access(action_outputs, "present-source")
+    else:
+        action_definite_outputs = []
+        if raster_output_may_apply:
+            possible_outputs = _unique_resources(
+                possible_outputs,
+                _resource_access(action_outputs, "bound-output-possible"),
+            )
+        if action_kind == "graphics" and action_depth_outputs:
+            if (raster_output_definite and depth_test_enabled is True and
+                    depth_write_enabled is True):
+                action_definite_outputs = _resource_access(
+                    action_depth_outputs, "depth-target"
+                )
+            elif raster_output_may_apply and (
+                depth_test_enabled is not False
+                and depth_write_enabled is not False
+            ):
+                depth_candidates = _resource_access(
+                    action_depth_outputs, "depth-target-possible"
+                )
+                if not raster_output_definite:
+                    for candidate in depth_candidates:
+                        candidate["certainty"] = "unknown-rasterizer-discard"
+                possible_outputs = _unique_resources(
+                    possible_outputs, depth_candidates
+                )
+    read_resources = _unique_resources(
+        _resource_access(
+            _resource_list(pipeline.get("readResources", pipeline.get("reads", []))),
+            "read",
+        ),
+        _resource_access(copy_sources, "copy-source"),
+        present_inputs,
+        _resource_access(blend_read_targets, "blend-destination"),
+        (
+            _resource_access(depth, "depth-test")
+            if depth_test_enabled is True
+            else []
+        ),
+    )
+    pipeline_write_resources = _resource_access(
+        _resource_list(
+            pipeline.get("writeResources", pipeline.get("writes", []))
+        ),
+        "write",
+    )
+    if raster_output_state_present and not raster_output_definite:
+        retained_writes: list[dict[str, Any]] = []
+        for resource in pipeline_write_resources:
+            access = str(resource.get("access", ""))
+            if access not in ("color-target", "depth-target"):
+                retained_writes.append(resource)
+                continue
+            if raster_output_may_apply:
+                candidate = dict(resource)
+                candidate["access"] = (
+                    "color-target-possible"
+                    if access == "color-target"
+                    else "depth-target-possible"
+                )
+                candidate["certainty"] = "unknown-rasterizer-discard"
+                possible_outputs = _unique_resources(
+                    possible_outputs, [candidate]
+                )
+        pipeline_write_resources = retained_writes
+    definite_color_targets = (
+        _resource_access(color_write_targets, "color-target")
+        if raster_output_definite else []
+    )
+    if raster_output_may_apply and not raster_output_definite:
+        possible_color_targets = _resource_access(
+            color_write_targets, "color-target-possible"
+        )
+        for candidate in possible_color_targets:
+            candidate["certainty"] = "unknown-rasterizer-discard"
+        possible_outputs = _unique_resources(
+            possible_outputs, possible_color_targets
+        )
+    write_resources = _unique_resources(
+        pipeline_write_resources,
+        (
+            []
+            if utility_has_dedicated_outputs
+            else _resource_access(copy_destinations, "copy-destination")
+        ),
+        action_definite_outputs,
+        definite_color_targets,
+        (
+            _resource_access(depth, "depth-target")
+            if (raster_output_definite and depth_test_enabled is True and
+                depth_write_enabled is True)
+            else []
+        ),
+    )
+    if (
+        raster_output_may_apply
+        and
+        depth_test_enabled is not False
+        and depth_write_enabled is not False
+        and not (
+            raster_output_definite
+            and depth_test_enabled is True
+            and depth_write_enabled is True
+        )
+        and depth
+    ):
+        possible_outputs = _unique_resources(
+            possible_outputs,
+            [
+                {
+                    **dict(item),
+                    "access": "depth-target-possible",
+                    "certainty": (
+                        "unknown-rasterizer-discard"
+                        if not raster_output_definite else "unknown"
+                    ),
+                }
+                for item in depth
+            ],
+        )
+    if (
+        (depth_test_enabled is False or depth_write_enabled is False)
+        and depth
+    ):
+        depth_ids = {
+            _safe_int(item.get("resourceId"), 0) for item in depth
+        }
+        write_resources = [
+            item
+            for item in write_resources
+            if not (
+                _safe_int(item.get("resourceId"), 0) in depth_ids
+                and str(item.get("access", "")) in ("write", "depth-target")
+            )
+        ]
+    read_resources, locally_omitted_inputs = _bounded_resource_direction(
+        read_resources
+    )
+    write_resources, locally_omitted_outputs = _bounded_resource_direction(
+        write_resources
+    )
+    possible_outputs, locally_omitted_possible = _bounded_resource_direction(
+        possible_outputs
+    )
+    locally_omitted_outputs += locally_omitted_possible
 
     shaders: list[dict[str, Any]] = []
     pipeline_shaders = pipeline.get("shaders", {})
@@ -642,17 +1499,28 @@ def _action_feature(
         for stage, value in pipeline_shaders.items():
             if not isinstance(value, Mapping):
                 continue
-            shaders.append(
-                {
-                    "stage": str(stage).strip().lower(),
-                    "resourceId": _safe_int(
-                        value.get("shaderId", value.get("resourceId")), 0
-                    ),
-                    "rawSha256": _sha(value.get("rawSha256")),
-                    "codeSha256": _sha(value.get("codeSha256")),
-                    "name": _shader_display_name(value),
-                }
-            )
+            shader = {
+                "stage": str(stage).strip().lower(),
+                "resourceId": _safe_int(
+                    value.get("shaderId", value.get("resourceId")), 0
+                ),
+                "rawSha256": _sha(value.get("rawSha256")),
+                "codeSha256": _sha(value.get("codeSha256")),
+                "entryPoint": _bounded_text(
+                    value.get("entryPoint", value.get("entry", "")),
+                    "shader entry point",
+                ),
+                "name": _shader_display_name(value),
+            }
+            for count_field in (
+                "constantBufferCount",
+                "samplerCount",
+                "boundSamplerCount",
+            ):
+                count = _safe_int(value.get(count_field), -1)
+                if count >= 0:
+                    shader[count_field] = count
+            shaders.append(shader)
     for use in catalog_uses:
         stage = str(use.get("stage", "") or "").strip().lower()
         resource = _safe_int(use.get("resourceId", use.get("shaderResourceId")), 0)
@@ -675,6 +1543,10 @@ def _action_feature(
                 "resourceId": resource,
                 "rawSha256": raw,
                 "codeSha256": _sha(use.get("codeSha256")),
+                "entryPoint": _bounded_text(
+                    use.get("entryPoint", use.get("entry", "")),
+                    "shader entry point",
+                ),
                 "name": _shader_display_name(use),
             }
             shaders.append(match)
@@ -687,14 +1559,30 @@ def _action_feature(
             display = _shader_display_name(use)
             if display:
                 match["name"] = display
+            entry_point = _bounded_text(
+                use.get("entryPoint", use.get("entry", "")),
+                "shader entry point",
+            )
+            if entry_point:
+                match["entryPoint"] = entry_point
 
-    unique_shaders: dict[tuple[str, int, str], dict[str, Any]] = {}
+    unique_shaders: dict[tuple[str, int, str, str], dict[str, Any]] = {}
     for shader in shaders:
-        key = (shader["stage"], shader["resourceId"], shader["rawSha256"])
+        key = (
+            shader["stage"],
+            shader["resourceId"],
+            shader["rawSha256"],
+            shader.get("entryPoint", ""),
+        )
         unique_shaders[key] = shader
     shaders = sorted(
         unique_shaders.values(),
-        key=lambda item: (item["stage"], item["resourceId"], item["rawSha256"]),
+        key=lambda item: (
+            item["stage"],
+            item["resourceId"],
+            item["rawSha256"],
+            item.get("entryPoint", ""),
+        ),
     )
 
     num_indices = _safe_int(action.get("numIndices"), 0)
@@ -709,9 +1597,14 @@ def _action_feature(
 
     return {
         "eventId": action["eventId"],
-        "actionKind": _action_kind(action),
+        "actionKind": action_kind,
         "name": action["name"],
         "markerPath": list(action.get("markerPath", [])),
+        "markerEventPath": [
+            dict(item) for item in action.get("markerEventPath", [])
+        ],
+        "parentEventId": _safe_int(action.get("_parentEventId"), 0),
+        "executionIndex": _safe_int(action.get("_executionIndex"), 0),
         "flags": _safe_int(action.get("flags"), 0),
         "indirect": _is_indirect(action),
         "indirectContainerName": _indirect_container_name(action),
@@ -719,21 +1612,43 @@ def _action_feature(
         "depthTargets": depth,
         "readResources": read_resources,
         "writeResources": write_resources,
-        "blendEnabled": _pipeline_bool(pipeline, "blendEnabled"),
-        "depthTestEnabled": _pipeline_bool(pipeline, "depthTestEnabled"),
-        "depthWriteEnabled": _pipeline_bool(pipeline, "depthWriteEnabled"),
+        "possibleOutputs": possible_outputs,
+        "blendEnabled": blend_enabled,
+        "depthTestEnabled": depth_test_enabled,
+        "depthWriteEnabled": depth_write_enabled,
         "fullscreen": fullscreen,
         "fullscreenExplicit": explicit_fullscreen is not None,
         "shaders": shaders,
         "numIndices": num_indices,
         "numVertices": num_vertices,
+        "workload": _compact_workload(action),
+        "workloadKnown": bool(
+            isinstance(action.get("workload"), Mapping)
+            or any(
+                field in action
+                for field in ("numIndices", "numVertices", "numInstances")
+            )
+        ),
+        "drawState": _compact_draw_state(pipeline),
+        "inputOmittedCount": max(
+            0, _safe_int(pipeline.get("inputOmittedCount"), 0)
+        ) + locally_omitted_inputs,
+        "outputOmittedCount": max(
+            0, _safe_int(pipeline.get("outputOmittedCount"), 0)
+        )
+        + max(0, _safe_int(action.get("outputOmittedCount"), 0))
+        + locally_omitted_outputs,
         "lateFrameFraction": pipeline.get("lateFrameFraction"),
     }
 
 
 def _pass_fingerprint(feature: Mapping[str, Any]) -> str:
     shaders = [
-        {"stage": item["stage"], "rawSha256": item["rawSha256"]}
+        {
+            "stage": item["stage"],
+            "rawSha256": item["rawSha256"],
+            "entryPoint": item.get("entryPoint", ""),
+        }
         for item in feature.get("shaders", [])
         if item.get("rawSha256")
     ]
@@ -744,16 +1659,16 @@ def _pass_fingerprint(feature: Mapping[str, Any]) -> str:
         "shaders": shaders,
         "renderTargetCount": len(feature.get("renderTargets", [])),
         "hasDepthTarget": bool(feature.get("depthTargets")),
-        "targetFormats": sorted(
+        "targetFormats": [
             item["format"]
             for item in feature.get("renderTargets", [])
             if item.get("format")
-        ),
-        "depthFormats": sorted(
+        ],
+        "depthFormats": [
             item["format"]
             for item in feature.get("depthTargets", [])
             if item.get("format")
-        ),
+        ],
         "blendEnabled": feature.get("blendEnabled"),
         "depthTestEnabled": feature.get("depthTestEnabled"),
         "depthWriteEnabled": feature.get("depthWriteEnabled"),
@@ -761,6 +1676,8 @@ def _pass_fingerprint(feature: Mapping[str, Any]) -> str:
         # without pretending that two numeric IDs match across frames.
         "readResourceCount": len(feature.get("readResources", [])),
         "writeResourceCount": len(feature.get("writeResources", [])),
+        "topology": feature.get("drawState", {}).get("topology", ""),
+        "sampleCount": feature.get("drawState", {}).get("sampleCount"),
     }
     return _canonical_sha256(payload)
 
@@ -1207,17 +2124,79 @@ def _classify_feature(
     limitations: list[str] = []
     if feature.get("indirect"):
         limitations.append(
-            "Indirect arguments are GPU-authored; the container is folded, but every concrete child action remains inspectable."
+            "Indirect arguments are GPU-authored and were not resolved; concrete child actions remain inspectable, but workload remains unknown."
+        )
+    if has_depth and depth_write is None:
+        limitations.append(
+            "Depth-write enablement was unavailable; the bound depth target is retained only as a possible output."
+        )
+    input_omitted_count = max(
+        0, _safe_int(feature.get("inputOmittedCount"), 0)
+    )
+    output_omitted_count = max(
+        0, _safe_int(feature.get("outputOmittedCount"), 0)
+    )
+    if input_omitted_count or output_omitted_count:
+        limitations.append(
+            "Per-action resource evidence was bounded; omitted input/output counts are reported explicitly."
         )
     if category not in ("Compute", "Utility") and confidence != "confirmed":
         limitations.append(
             "Pass semantics are inferred from fixed evidence, not engine-authored annotations."
         )
 
+    inputs = _unique_resources(feature.get("readResources", []))
+    outputs = _unique_resources(feature.get("writeResources", []))
+    possible_outputs = _unique_resources(feature.get("possibleOutputs", []))
+    issued_action = kind in ("graphics", "compute", "utility")
+    workload = dict(feature.get("workload", {}))
+    non_zero_workload: bool | None
+    if feature.get("indirect"):
+        non_zero_workload = None
+    elif (
+        _safe_int(feature.get("flags"), 0) & FLAG_MESH_DISPATCH
+        and all(
+            field in workload
+            for field in ("groupCountX", "groupCountY", "groupCountZ")
+        )
+    ):
+        non_zero_workload = all(
+            _safe_int(workload.get(field), 0) > 0
+            for field in ("groupCountX", "groupCountY", "groupCountZ")
+        )
+    elif _safe_int(feature.get("flags"), 0) & FLAG_MESH_DISPATCH:
+        non_zero_workload = None
+    elif kind == "graphics" and feature.get("workloadKnown"):
+        primitive_count = max(
+            _safe_int(workload.get("indexCount"), 0),
+            _safe_int(workload.get("vertexCount"), 0),
+        )
+        instance_count = _safe_int(workload.get("instanceCount"), 0)
+        non_zero_workload = primitive_count > 0 and instance_count > 0
+    elif kind == "compute" and all(
+        field in workload for field in ("groupCountX", "groupCountY", "groupCountZ")
+    ):
+        non_zero_workload = all(
+            _safe_int(workload.get(field), 0) > 0
+            for field in ("groupCountX", "groupCountY", "groupCountZ")
+        )
+    elif kind == "utility":
+        non_zero_workload = True
+    else:
+        non_zero_workload = None
+    output_candidate = non_zero_workload is not False and bool(
+        outputs or possible_outputs
+    )
+
     result = {
         "eventId": feature["eventId"],
         "name": feature["name"],
         "markerPath": list(feature.get("markerPath", [])),
+        "markerEventPath": [
+            dict(item) for item in feature.get("markerEventPath", [])
+        ],
+        "parentEventId": _safe_int(feature.get("parentEventId"), 0),
+        "executionIndex": _safe_int(feature.get("executionIndex"), 0),
         "category": category,
         "subcategory": _subcategory(category, combined_text, feature),
         "confidence": confidence,
@@ -1235,6 +2214,37 @@ def _classify_feature(
         "indirectContainerName": feature.get("indirectContainerName", ""),
         "passFingerprint": fingerprint,
         "shaders": [dict(item) for item in feature.get("shaders", [])],
+        "inputs": inputs,
+        "outputs": outputs,
+        "possibleOutputs": possible_outputs,
+        "inputOmittedCount": input_omitted_count,
+        "outputOmittedCount": output_omitted_count,
+        "workload": workload,
+        "drawState": dict(feature.get("drawState", {})),
+        "actualWorkState": (
+            "output-affecting-candidate"
+            if output_candidate
+            else "not-established"
+        ),
+        "participation": {
+            "issuedAction": issued_action,
+            "nonZeroWorkload": non_zero_workload,
+            "indirectArgumentsResolved": (
+                False if feature.get("indirect") else None
+            ),
+            "outputAffectingCandidate": output_candidate,
+            "observedContributor": False,
+            "contributorObservation": (
+                "not-tested; no pixel history, resource diff, or contribution counter was run"
+            ),
+            "basis": (
+                "action-flags-and-bound-output"
+                if output_candidate
+                else "action-flags-only"
+                if issued_action
+                else "no-executable-action-evidence"
+            ),
+        },
         "targets": {
             "renderTargets": [dict(item) for item in feature.get("renderTargets", [])],
             "depthTargets": [dict(item) for item in feature.get("depthTargets", [])],
@@ -1245,6 +2255,7 @@ def _classify_feature(
             "depthWriteEnabled": depth_write,
             "readResourceCount": len(feature.get("readResources", [])),
             "writeResourceCount": len(feature.get("writeResources", [])),
+            "possibleOutputCount": len(feature.get("possibleOutputs", [])),
             "fullscreen": bool(feature.get("fullscreen")),
         },
         "limitations": limitations,
@@ -1261,6 +2272,11 @@ def _container_record(action: Mapping[str, Any]) -> dict[str, Any]:
         "name": action["name"],
         "label": name,
         "markerPath": list(action.get("markerPath", [])),
+        "markerEventPath": [
+            dict(item) for item in action.get("markerEventPath", [])
+        ],
+        "parentEventId": _safe_int(action.get("_parentEventId"), 0),
+        "executionIndex": _safe_int(action.get("_executionIndex"), 0),
         "category": "Utility",
         "subcategory": "IndirectContainer",
         "confidence": "confirmed",
@@ -1277,6 +2293,19 @@ def _container_record(action: Mapping[str, Any]) -> dict[str, Any]:
         ],
         "containerOnly": True,
         "indirect": True,
+        "actualWorkState": "not-established",
+        "participation": {
+            "issuedAction": False,
+            "nonZeroWorkload": None,
+            "outputAffectingCandidate": False,
+            "observedContributor": False,
+            "containerOnly": True,
+            "contributorObservation": (
+                "not-tested; the container owns no concrete draw/dispatch workload"
+            ),
+            "concreteChildrenOwnWork": True,
+            "indirectArgumentsResolved": False,
+        },
     }
 
 
@@ -1285,23 +2314,82 @@ def _tree_id(*parts: Any) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()[:20]
 
 
+def _marker_breadcrumb(marker_path: Sequence[Any]) -> str:
+    parts = [str(value) for value in marker_path if str(value)]
+    joined = " / ".join(parts)
+    if len(joined) <= MAX_TREE_GROUP_LABEL:
+        return joined
+    # Keep both the owning marker and the leaf marker visible. The complete
+    # captured path remains in markerPath/markerEventPath and in the identity.
+    prefix = joined[: MAX_TREE_GROUP_LABEL // 2 - 3].rstrip()
+    suffix = joined[-(MAX_TREE_GROUP_LABEL // 2 - 4) :].lstrip()
+    return "%s … %s" % (prefix, suffix)
+
+
+def _semantic_group_identity(item: Mapping[str, Any]) -> tuple[str, str, str]:
+    marker_path = list(item.get("markerPath", []))
+    marker_events = [
+        dict(value)
+        for value in item.get("markerEventPath", [])
+        if isinstance(value, Mapping)
+    ]
+    if item.get("indirect"):
+        group_kind = "indirect-container"
+        parent_event_id = _safe_int(item.get("parentEventId"), 0)
+        indirect_label = str(
+            item.get("indirectContainerName") or "ExecuteIndirect"
+        )
+        group_label = (
+            _marker_breadcrumb(marker_path)
+            if marker_path
+            else indirect_label[:MAX_TREE_GROUP_LABEL]
+        )
+        identity = {
+            "kind": group_kind,
+            "parentEventId": parent_event_id,
+            "standaloneEventId": (
+                0 if parent_event_id else _safe_int(item.get("eventId"), 0)
+            ),
+            "markerEvents": marker_events,
+            "markerPath": marker_path,
+            "label": group_label,
+        }
+    elif marker_path:
+        group_kind = "marker"
+        group_label = _marker_breadcrumb(marker_path)
+        identity = {
+            "kind": group_kind,
+            "markerEvents": marker_events,
+            "markerPath": marker_path,
+        }
+    else:
+        group_kind = "ungrouped"
+        group_label = "Ungrouped"
+        identity = {"kind": group_kind}
+    return group_kind, group_label, _canonical_sha256(identity)
+
+
 def _build_tree(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[str, dict[str, dict[tuple[str, str], list[Mapping[str, Any]]]]] = (
-        defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    )
-    for item in items:
-        marker_path = item.get("markerPath", [])
-        if item.get("indirect"):
-            group_kind = "indirect-container"
-            group_label = str(item.get("indirectContainerName") or "ExecuteIndirect")
-        elif marker_path:
-            group_kind = "marker"
-            group_label = str(marker_path[-1])
-        else:
-            group_kind = "ungrouped"
-            group_label = "Ungrouped"
+    grouped: dict[
+        str,
+        dict[str, dict[tuple[str, str, str, int], list[Mapping[str, Any]]]],
+    ] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    previous_identity: tuple[str, str, str] | None = None
+    occurrence = 0
+    for item in sorted(
+        items,
+        key=lambda value: (
+            _safe_int(value.get("executionIndex"), 0),
+            _safe_int(value.get("eventId"), 0),
+        ),
+    ):
+        group_kind, group_label, identity = _semantic_group_identity(item)
+        current_identity = (group_kind, group_label, identity)
+        if current_identity != previous_identity:
+            occurrence += 1
+            previous_identity = current_identity
         grouped[str(item["category"])][str(item["subcategory"])][
-            (group_kind, group_label)
+            (group_kind, group_label, identity, occurrence)
         ].append(item)
 
     tree: list[dict[str, Any]] = []
@@ -1324,8 +2412,15 @@ def _build_tree(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                 "children": [],
             }
             groups = grouped[category][subcategory]
-            for (group_kind, group_label), group_items in sorted(
-                groups.items(), key=lambda pair: (pair[0][0], pair[0][1].lower())
+            for (group_kind, group_label, identity, group_occurrence), group_items in sorted(
+                groups.items(),
+                key=lambda pair: min(
+                    (
+                        _safe_int(value.get("executionIndex"), 0),
+                        _safe_int(value.get("eventId"), 0),
+                    )
+                    for value in pair[1]
+                ),
             ):
                 leaves = [
                     {
@@ -1336,11 +2431,22 @@ def _build_tree(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                         "confidence": item["confidence"],
                         "indirect": item.get("indirect", False),
                     }
-                    for item in sorted(group_items, key=lambda value: value["eventId"])
+                    for item in sorted(
+                        group_items,
+                        key=lambda value: (
+                            _safe_int(value.get("executionIndex"), 0),
+                            value["eventId"],
+                        ),
+                    )
                 ]
                 group_node = {
                     "id": _tree_id(
-                        "group", category, subcategory, group_kind, group_label
+                        "group",
+                        category,
+                        subcategory,
+                        group_kind,
+                        identity,
+                        group_occurrence,
                     ),
                     "nodeType": "container"
                     if group_kind == "indirect-container"
@@ -1348,7 +2454,11 @@ def _build_tree(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                     "groupKind": group_kind,
                     "label": group_label,
                     "count": len(leaves),
-                    "foldByDefault": group_kind == "indirect-container",
+                    "foldByDefault": (
+                        group_kind == "indirect-container"
+                        or category in ("Utility", "Unknown")
+                        or len(leaves) >= DEFAULT_FOLDED_GROUP_SIZE
+                    ),
                     "children": leaves,
                 }
                 subcategory_node["children"].append(group_node)
@@ -1357,6 +2467,602 @@ def _build_tree(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
             category_node["count"] += subcategory_node["count"]
         tree.append(category_node)
     return tree
+
+
+def _resource_range(value: Mapping[str, Any]) -> dict[str, Any]:
+    result = {}
+    for field in (
+        "byteOffset", "byteSize", "firstMip", "numMips",
+        "firstSlice", "numSlices",
+    ):
+        number = _safe_int(value.get(field), -1)
+        if number >= 0:
+            result[field] = number
+    if isinstance(value.get("subresource"), Mapping):
+        result["subresource"] = dict(value["subresource"])
+    return result
+
+
+def _resource_range_token(value: Mapping[str, Any]) -> str:
+    return json.dumps(
+        _resource_range(value), sort_keys=True, separators=(",", ":")
+    )
+
+
+def _resource_range_overlap(
+    producer: Mapping[str, Any], consumer: Mapping[str, Any]
+) -> str:
+    producer_subresource = producer.get("subresource")
+    consumer_subresource = consumer.get("subresource")
+    if isinstance(producer_subresource, Mapping) and isinstance(
+        consumer_subresource, Mapping
+    ):
+        fields = ("mip", "slice", "sample", "plane")
+        producer_fields = {
+            field for field in fields if field in producer_subresource
+        }
+        consumer_fields = {
+            field for field in fields if field in consumer_subresource
+        }
+        for field in producer_fields & consumer_fields:
+            if _safe_int(producer_subresource[field], -1) != _safe_int(
+                consumer_subresource[field], -1
+            ):
+                return "disjoint"
+        # An exact subresource handoff is established only when both sides
+        # describe the same complete coordinate set. A partial coordinate is
+        # useful evidence, but cannot prove compatible mip/slice/sample use.
+        producer_complete = _complete_subresource(producer)
+        consumer_complete = _complete_subresource(consumer)
+        if producer_complete is not None and consumer_complete is not None:
+            return (
+                "overlap"
+                if producer_complete == consumer_complete
+                else "disjoint"
+            )
+
+    producer_size = _safe_int(producer.get("byteSize"), 0)
+    consumer_size = _safe_int(consumer.get("byteSize"), 0)
+    if producer_size > 0 and consumer_size > 0:
+        producer_start = _safe_int(producer.get("byteOffset"), 0)
+        consumer_start = _safe_int(consumer.get("byteOffset"), 0)
+        if (
+            producer_start + producer_size <= consumer_start
+            or consumer_start + consumer_size <= producer_start
+        ):
+            return "disjoint"
+        return "overlap"
+
+    if all(
+        _safe_int(value.get(field), -1) >= (1 if field.startswith("num") else 0)
+        for value in (producer, consumer)
+        for field in ("firstMip", "numMips", "firstSlice", "numSlices")
+    ):
+        producer_mip = _safe_int(producer.get("firstMip"), 0)
+        consumer_mip = _safe_int(consumer.get("firstMip"), 0)
+        producer_slice = _safe_int(producer.get("firstSlice"), 0)
+        consumer_slice = _safe_int(consumer.get("firstSlice"), 0)
+        mip_overlap = not (
+            producer_mip + _safe_int(producer.get("numMips"), 0)
+            <= consumer_mip
+            or consumer_mip + _safe_int(consumer.get("numMips"), 0)
+            <= producer_mip
+        )
+        slice_overlap = not (
+            producer_slice + _safe_int(producer.get("numSlices"), 0)
+            <= consumer_slice
+            or consumer_slice + _safe_int(consumer.get("numSlices"), 0)
+            <= producer_slice
+        )
+        return "overlap" if mip_overlap and slice_overlap else "disjoint"
+    return "unknown"
+
+
+def _complete_subresource(value: Mapping[str, Any]) -> tuple[int, int, int, int] | None:
+    subresource = value.get("subresource")
+    fields = ("mip", "slice", "sample", "plane")
+    if not isinstance(subresource, Mapping) or not all(
+        field in subresource for field in fields
+    ):
+        return None
+    coordinates = tuple(_safe_int(subresource.get(field), -1) for field in fields)
+    if any(coordinate < 0 for coordinate in coordinates):
+        return None
+    return coordinates
+
+
+def _byte_interval(value: Mapping[str, Any]) -> tuple[int, int] | None:
+    byte_offset = _safe_int(value.get("byteOffset"), -1)
+    byte_size = _safe_int(value.get("byteSize"), 0)
+    if byte_offset < 0 or byte_size <= 0:
+        return None
+    return byte_offset, byte_offset + byte_size
+
+
+def _texture_rectangle(
+    value: Mapping[str, Any],
+) -> tuple[int, int, int, int] | None:
+    first_mip = _safe_int(value.get("firstMip"), -1)
+    num_mips = _safe_int(value.get("numMips"), 0)
+    first_slice = _safe_int(value.get("firstSlice"), -1)
+    num_slices = _safe_int(value.get("numSlices"), 0)
+    if first_mip < 0 or num_mips <= 0 or first_slice < 0 or num_slices <= 0:
+        return None
+    return (
+        first_mip,
+        first_mip + num_mips,
+        first_slice,
+        first_slice + num_slices,
+    )
+
+
+def _with_byte_interval(
+    value: Mapping[str, Any], start: int, end: int
+) -> dict[str, Any]:
+    result = dict(value)
+    result["byteOffset"] = start
+    result["byteSize"] = end - start
+    return result
+
+
+def _with_texture_rectangle(
+    value: Mapping[str, Any],
+    first_mip: int,
+    mip_end: int,
+    first_slice: int,
+    slice_end: int,
+) -> dict[str, Any]:
+    result = dict(value)
+    result["firstMip"] = first_mip
+    result["numMips"] = mip_end - first_mip
+    result["firstSlice"] = first_slice
+    result["numSlices"] = slice_end - first_slice
+    return result
+
+
+def _subtract_terminal_write(
+    older: Mapping[str, Any], newer: Mapping[str, Any]
+) -> tuple[str, list[dict[str, Any]]]:
+    """Subtract a later known write range from an older terminal candidate.
+
+    The status is ``disjoint``, ``covered``, ``partial``, or ``unknown``.
+    Unknown never discards either writer.
+    """
+
+    older_subresource = older.get("subresource")
+    newer_subresource = newer.get("subresource")
+    if isinstance(older_subresource, Mapping) or isinstance(
+        newer_subresource, Mapping
+    ):
+        if not (
+            isinstance(older_subresource, Mapping)
+            and isinstance(newer_subresource, Mapping)
+        ):
+            return "unknown", [dict(older)]
+        common_fields = set(older_subresource) & set(newer_subresource) & {
+            "mip", "slice", "sample", "plane"
+        }
+        if any(
+            _safe_int(older_subresource.get(field), -1)
+            != _safe_int(newer_subresource.get(field), -1)
+            for field in common_fields
+        ):
+            return "disjoint", [dict(older)]
+        older_complete = _complete_subresource(older)
+        newer_complete = _complete_subresource(newer)
+        if older_complete is not None and older_complete == newer_complete:
+            return "covered", []
+        return "unknown", [dict(older)]
+
+    older_bytes = _byte_interval(older)
+    newer_bytes = _byte_interval(newer)
+    if older_bytes is not None or newer_bytes is not None:
+        if older_bytes is None or newer_bytes is None:
+            return "unknown", [dict(older)]
+        older_start, older_end = older_bytes
+        newer_start, newer_end = newer_bytes
+        if older_end <= newer_start or newer_end <= older_start:
+            return "disjoint", [dict(older)]
+        residuals = []
+        if older_start < newer_start:
+            residuals.append(
+                _with_byte_interval(older, older_start, min(older_end, newer_start))
+            )
+        if newer_end < older_end:
+            residuals.append(
+                _with_byte_interval(older, max(older_start, newer_end), older_end)
+            )
+        return ("partial", residuals) if residuals else ("covered", [])
+
+    older_rectangle = _texture_rectangle(older)
+    newer_rectangle = _texture_rectangle(newer)
+    if older_rectangle is not None or newer_rectangle is not None:
+        if older_rectangle is None or newer_rectangle is None:
+            return "unknown", [dict(older)]
+        om0, om1, os0, os1 = older_rectangle
+        nm0, nm1, ns0, ns1 = newer_rectangle
+        im0, im1 = max(om0, nm0), min(om1, nm1)
+        is0, is1 = max(os0, ns0), min(os1, ns1)
+        if im0 >= im1 or is0 >= is1:
+            return "disjoint", [dict(older)]
+        residuals = []
+        if om0 < im0:
+            residuals.append(_with_texture_rectangle(older, om0, im0, os0, os1))
+        if im1 < om1:
+            residuals.append(_with_texture_rectangle(older, im1, om1, os0, os1))
+        if os0 < is0:
+            residuals.append(_with_texture_rectangle(older, im0, im1, os0, is0))
+        if is1 < os1:
+            residuals.append(_with_texture_rectangle(older, im0, im1, is1, os1))
+        return ("partial", residuals) if residuals else ("covered", [])
+
+    return "unknown", [dict(older)]
+
+
+def _terminal_writer_fragments(
+    history: Sequence[tuple[int, Mapping[str, Any], bool]],
+) -> tuple[list[dict[str, Any]], bool]:
+    fragments: list[dict[str, Any]] = []
+    truncated = False
+    for event_id, resource, possible in history:
+        retained: list[dict[str, Any]] = []
+        new_uncertain = False
+        new_range_uncertain = False
+        if possible:
+            # A possible write cannot erase an earlier terminal writer: either
+            # may own the final contents.  It only makes overlapping/unknown
+            # fragments candidates until a later definite write supersedes
+            # them.
+            for fragment in fragments:
+                relation, unused_residuals = _subtract_terminal_write(
+                    fragment["resource"], resource
+                )
+                del unused_residuals
+                retained_fragment = dict(fragment)
+                if relation != "disjoint":
+                    retained_fragment["uncertain"] = True
+                    retained_fragment["possibleOverwrite"] = True
+                    if relation == "unknown":
+                        retained_fragment["rangeUncertain"] = True
+                retained.append(retained_fragment)
+            retained.append(
+                {
+                    "eventId": event_id,
+                    "resource": dict(resource),
+                    "uncertain": True,
+                    "possible": True,
+                    "rangeUncertain": False,
+                }
+            )
+            fragments = retained
+            if len(fragments) > MAX_RESOURCE_FLOW_EDGES:
+                truncated = True
+                fragments = fragments[-MAX_RESOURCE_FLOW_EDGES:]
+            continue
+        for fragment in fragments:
+            relation, residuals = _subtract_terminal_write(
+                fragment["resource"], resource
+            )
+            if relation == "unknown":
+                uncertain_fragment = dict(fragment)
+                uncertain_fragment["uncertain"] = True
+                uncertain_fragment["rangeUncertain"] = True
+                retained.append(uncertain_fragment)
+                new_uncertain = True
+                new_range_uncertain = True
+                continue
+            for residual in residuals:
+                retained.append(
+                    {
+                        "eventId": fragment["eventId"],
+                        "resource": residual,
+                        "uncertain": bool(fragment.get("uncertain", False)),
+                        "possible": bool(fragment.get("possible", False)),
+                        "rangeUncertain": bool(
+                            fragment.get("rangeUncertain", False)
+                        ),
+                        "possibleOverwrite": bool(
+                            fragment.get("possibleOverwrite", False)
+                        ),
+                    }
+                )
+        retained.append(
+            {
+                "eventId": event_id,
+                "resource": dict(resource),
+                "uncertain": new_uncertain,
+                "possible": False,
+                "rangeUncertain": new_range_uncertain,
+            }
+        )
+        if len(retained) > MAX_RESOURCE_FLOW_EDGES:
+            truncated = True
+            # Always retain the newest writer; older residuals are the bounded
+            # portion that can be omitted safely with an explicit receipt.
+            retained = retained[-MAX_RESOURCE_FLOW_EDGES:]
+        fragments = retained
+    return fragments, truncated
+
+
+def _build_resource_flow(
+    items: Sequence[Mapping[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    bool,
+]:
+    writer_history: dict[
+        int, list[tuple[int, Mapping[str, Any], bool]]
+    ] = defaultdict(list)
+    edges: list[dict[str, Any]] = []
+    external_inputs: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    seen_external: set[tuple[Any, ...]] = set()
+    truncated = False
+    ordered = sorted(
+        items,
+        key=lambda value: (
+            _safe_int(value.get("executionIndex"), 0),
+            _safe_int(value.get("eventId"), 0),
+        ),
+    )
+    for item in ordered:
+        event_id = _safe_int(item.get("eventId"), 0)
+        for resource in item.get("inputs", []):
+            if not isinstance(resource, Mapping):
+                continue
+            resource_id = _safe_int(resource.get("resourceId"), 0)
+            consumer_access = _bounded_text(
+                resource.get("access", "read"), "consumer resource access"
+            )
+            consumer_stage = _bounded_text(
+                resource.get("stage", ""), "consumer resource stage"
+            )
+            consumer_range = _resource_range(resource)
+            consumer_range_token = _resource_range_token(resource)
+            candidates: list[
+                tuple[tuple[int, Mapping[str, Any], bool], str, bool]
+            ] = []
+            definite_writer_found = False
+            intervening_uncertainty = False
+            if resource_id:
+                # A later write to one mip/slice/range must not hide an older
+                # compatible producer for a different subresource. Possible
+                # writes and unknown ranges cannot become barriers: retain
+                # every plausible producer until a definite overlapping write
+                # establishes where the pre-read contents must originate.
+                for candidate in reversed(writer_history.get(resource_id, [])):
+                    candidate_overlap = _resource_range_overlap(
+                        candidate[1], resource
+                    )
+                    if candidate_overlap == "disjoint":
+                        continue
+                    candidates.append(
+                        (candidate, candidate_overlap, intervening_uncertainty)
+                    )
+                    if not candidate[2]:
+                        definite_writer_found = True
+                        if candidate_overlap == "overlap":
+                            break
+                    intervening_uncertainty = True
+
+            # Emit candidates in execution order so the graph remains stable
+            # even when more than one writer can feed the same read.
+            for writer, overlap, has_intervening_uncertainty in reversed(candidates):
+                if writer[0] == event_id:
+                    continue
+                producer_access = _bounded_text(
+                    writer[1].get("access", "write"),
+                    "producer resource access",
+                )
+                producer_stage = _bounded_text(
+                    writer[1].get("stage", ""), "producer resource stage"
+                )
+                producer_range = _resource_range(writer[1])
+                producer_range_token = _resource_range_token(writer[1])
+                key = (
+                    writer[0],
+                    event_id,
+                    resource_id,
+                    producer_access,
+                    producer_stage,
+                    consumer_access,
+                    consumer_stage,
+                    producer_range_token,
+                    consumer_range_token,
+                    writer[2],
+                )
+                if key in seen:
+                    continue
+                if len(edges) >= MAX_RESOURCE_FLOW_EDGES:
+                    truncated = True
+                    continue
+                seen.add(key)
+                resource_name = _bounded_text(
+                    resource.get("name", writer[1].get("name", "")),
+                    "resource flow name",
+                )
+                edge_is_candidate = bool(
+                    writer[2]
+                    or overlap != "overlap"
+                    or has_intervening_uncertainty
+                )
+                edge = {
+                    "producerEid": writer[0],
+                    "consumerEid": event_id,
+                    "resourceId": resource_id,
+                    "handoff": "write-to-read",
+                    "producerAccess": producer_access,
+                    "consumerAccess": consumer_access,
+                    "producerWriteCertainty": (
+                        "possible" if writer[2] else "definite"
+                    ),
+                    "subresourceOverlap": overlap,
+                    "authority": (
+                        "FixedProgramCandidate"
+                        if edge_is_candidate
+                        else "FixedProgram"
+                    ),
+                }
+                if has_intervening_uncertainty:
+                    edge["interveningWriteUncertain"] = True
+                if producer_stage:
+                    edge["producerStage"] = producer_stage
+                if consumer_stage:
+                    edge["consumerStage"] = consumer_stage
+                if producer_range:
+                    edge["producerRange"] = producer_range
+                if consumer_range:
+                    edge["consumerRange"] = consumer_range
+                if resource_name:
+                    edge["resourceName"] = resource_name
+                edges.append(edge)
+
+            # With no compatible definite writer, possible writes leave the
+            # pre-frame resource as another valid candidate source.
+            if not definite_writer_found:
+                boundary_key = (
+                    event_id,
+                    resource_id,
+                    consumer_access,
+                    consumer_stage,
+                    consumer_range_token,
+                )
+                if resource_id and boundary_key not in seen_external:
+                    seen_external.add(boundary_key)
+                    if len(external_inputs) >= MAX_RESOURCE_FLOW_EDGES:
+                        truncated = True
+                    else:
+                        boundary = {
+                            "consumerEid": event_id,
+                            "resourceId": resource_id,
+                            "access": consumer_access,
+                            "authority": (
+                                "FixedProgramCandidate"
+                                if candidates
+                                else "FixedProgram"
+                            ),
+                        }
+                        if consumer_stage:
+                            boundary["stage"] = consumer_stage
+                        if consumer_range:
+                            boundary["consumerRange"] = consumer_range
+                        resource_name = _bounded_text(
+                            resource.get("name", ""),
+                            "external input resource name",
+                        )
+                        if resource_name:
+                            boundary["resourceName"] = resource_name
+                        external_inputs.append(boundary)
+        definite_ranges: set[tuple[int, str, str, str]] = set()
+        for resource in item.get("outputs", []):
+            if not isinstance(resource, Mapping):
+                continue
+            resource_id = _safe_int(resource.get("resourceId"), 0)
+            if resource_id:
+                writer = (event_id, resource, False)
+                writer_history[resource_id].append(writer)
+                definite_ranges.add(
+                    (
+                        resource_id,
+                        _resource_range_token(resource),
+                        str(resource.get("access", "")),
+                        str(resource.get("stage", "")),
+                    )
+                )
+        for resource in item.get("possibleOutputs", []):
+            if not isinstance(resource, Mapping):
+                continue
+            resource_id = _safe_int(resource.get("resourceId"), 0)
+            if not resource_id:
+                continue
+            writer_identity = (
+                resource_id,
+                _resource_range_token(resource),
+                str(resource.get("access", "")),
+                str(resource.get("stage", "")),
+            )
+            if writer_identity in definite_ranges:
+                continue
+            writer_history[resource_id].append((event_id, resource, True))
+    terminal_candidates: list[
+        tuple[int, int, Mapping[str, Any], bool, bool, bool, bool]
+    ] = []
+    for resource_id, history in sorted(writer_history.items()):
+        fragments, fragments_truncated = _terminal_writer_fragments(history)
+        truncated = truncated or fragments_truncated
+        for fragment in fragments:
+            terminal_candidates.append(
+                (
+                    _safe_int(fragment.get("eventId"), 0),
+                    resource_id,
+                    fragment.get("resource", {}),
+                    bool(fragment.get("uncertain", False)),
+                    bool(fragment.get("possible", False)),
+                    bool(fragment.get("rangeUncertain", False)),
+                    bool(fragment.get("possibleOverwrite", False)),
+                )
+            )
+    terminal_candidates.sort(
+        key=lambda value: (
+            value[0],
+            value[1],
+            json.dumps(
+                _resource_range(value[2]),
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            str(value[2].get("access", "")),
+            str(value[2].get("stage", "")),
+            value[4],
+        )
+    )
+    terminal_outputs: list[dict[str, Any]] = []
+    for (
+        event_id,
+        resource_id,
+        resource,
+        uncertain,
+        possible,
+        range_uncertain,
+        possible_overwrite,
+    ) in terminal_candidates:
+        if len(terminal_outputs) >= MAX_RESOURCE_FLOW_EDGES:
+            truncated = True
+            break
+        terminal = {
+            "producerEid": event_id,
+            "resourceId": resource_id,
+            "access": _bounded_text(
+                resource.get("access", "write"), "terminal resource access"
+            ),
+            "writeCertainty": "possible" if possible else "definite",
+            "authority": (
+                "FixedProgramCandidate"
+                if uncertain or possible
+                else "FixedProgram"
+            ),
+        }
+        resource_range = _resource_range(resource)
+        if resource_range:
+            terminal["range"] = resource_range
+        if range_uncertain:
+            terminal["rangeRelationship"] = "unknown"
+        if possible_overwrite:
+            terminal["possibleOverwrite"] = True
+        stage = _bounded_text(
+            resource.get("stage", ""), "terminal resource stage"
+        )
+        if stage:
+            terminal["stage"] = stage
+        name = _bounded_text(
+            resource.get("name", ""), "terminal output resource name"
+        )
+        if name:
+            terminal["resourceName"] = name
+        terminal_outputs.append(terminal)
+    return edges, external_inputs, terminal_outputs, truncated
 
 
 def apply_ai_semantic_proposals(
@@ -1423,6 +3129,35 @@ def apply_ai_semantic_proposals(
     return result
 
 
+def _compact_resource_metadata_receipt(value: Any) -> dict[str, Any]:
+    """Project only the fixed, bounded bridge metadata-budget receipt."""
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for field in (
+        "sourceRecordCount",
+        "retainedEntryCount",
+        "omittedSourceRecordCount",
+        "recordLimit",
+    ):
+        if field not in value:
+            continue
+        number = _safe_int(value.get(field), -1)
+        if 0 <= number <= 0x7FFFFFFF:
+            result[field] = number
+    for field in ("byteBudget", "budgetedBytes"):
+        if field not in value:
+            continue
+        number = _safe_int(value.get(field), -1)
+        if 0 <= number <= 0xFFFFFFFFFFFFFFFF:
+            result[field] = number
+    if "truncated" in value:
+        truncated = _optional_bool(value.get("truncated"))
+        if truncated is not None:
+            result["truncated"] = truncated
+    return result
+
+
 def classify_passes(
     actions: Any,
     *,
@@ -1443,6 +3178,10 @@ def classify_passes(
     capture_digest = _sha(capture_id)
     if capture_id and not capture_digest:
         raise PassClassificationError("capture_id must be a lowercase SHA-256")
+    input_summary = actions.get("summary", {}) if isinstance(actions, Mapping) else {}
+    input_truncated = bool(
+        isinstance(input_summary, Mapping) and input_summary.get("truncated") is True
+    )
     normalised, duplicate_count = _normalise_actions(actions)
     pipelines = _event_index(pipeline_states)
     uses_by_event, _ = _catalog_index(shader_catalog)
@@ -1451,7 +3190,20 @@ def classify_passes(
     items: list[dict[str, Any]] = []
     containers: list[dict[str, Any]] = []
     omitted: list[dict[str, Any]] = []
-    for action in normalised:
+    for execution_index, action in enumerate(normalised):
+        action["_executionIndex"] = _safe_int(
+            action.get("_executionIndex"), execution_index
+        )
+        if _safe_int(action.get("eventId"), 0) <= 0:
+            omitted.append(
+                {
+                    "eventId": 0,
+                    "name": action["name"],
+                    "reason": "non-positive-event-context",
+                    "executionIndex": action["_executionIndex"],
+                }
+            )
+            continue
         kind = _action_kind(action)
         is_indirect_container = kind == "container" or (
             action.get("_hasChildren")
@@ -1467,6 +3219,7 @@ def classify_passes(
                     "eventId": action["eventId"],
                     "name": action["name"],
                     "reason": "marker-used-as-tree-context",
+                    "executionIndex": action["_executionIndex"],
                 }
             )
             continue
@@ -1477,6 +3230,72 @@ def classify_passes(
         )
         items.append(_classify_feature(feature, project_records))
 
+    timeline_items = sorted(
+        items,
+        key=lambda value: (
+            _safe_int(value.get("executionIndex"), 0),
+            _safe_int(value.get("eventId"), 0),
+        ),
+    )
+    execution_timeline = [
+        action["eventId"]
+        for action in sorted(
+            normalised,
+            key=lambda value: (
+                _safe_int(value.get("_executionIndex"), 0),
+                _safe_int(value.get("eventId"), 0),
+            ),
+        )
+        if _safe_int(action.get("eventId"), 0) > 0
+    ]
+    (
+        resource_flow,
+        external_inputs,
+        terminal_outputs,
+        resource_flow_truncated,
+    ) = _build_resource_flow(timeline_items)
+    source_omitted = max(
+        0,
+        _safe_int(
+            input_summary.get(
+                "omittedActionCountLowerBound",
+                input_summary.get("omittedActionCount", 0),
+            )
+            if isinstance(input_summary, Mapping)
+            else 0,
+            0,
+        ),
+    )
+    source_reasons = []
+    if isinstance(input_summary, Mapping):
+        raw_reasons = input_summary.get("truncationReasons", [])
+        if isinstance(raw_reasons, (list, tuple)):
+            source_reasons = [
+                _bounded_text(value, "truncation reason")
+                for value in raw_reasons[:16]
+                if value
+            ]
+    input_resource_omitted = sum(
+        max(0, _safe_int(item.get("inputOmittedCount"), 0)) for item in items
+    )
+    output_resource_omitted = sum(
+        max(0, _safe_int(item.get("outputOmittedCount"), 0)) for item in items
+    )
+    resource_metadata_receipt = _compact_resource_metadata_receipt(
+        input_summary.get("resourceMetadata")
+        if isinstance(input_summary, Mapping)
+        else None
+    )
+    source_resource_facts_truncated = bool(
+        isinstance(input_summary, Mapping)
+        and input_summary.get("resourceFactsTruncated") is True
+    )
+    resource_facts_truncated = bool(
+        input_resource_omitted
+        or output_resource_omitted
+        or source_resource_facts_truncated
+        or resource_metadata_receipt.get("truncated") is True
+    )
     result: dict[str, Any] = {
         "schema": CLASSIFICATION_SCHEMA,
         "schemaVersion": CLASSIFICATION_VERSION,
@@ -1493,6 +3312,42 @@ def classify_passes(
             "markerContextCount": len(omitted),
             "duplicateCount": duplicate_count,
             "categoryCounts": dict(Counter(item["category"] for item in items)),
+            "actualWorkCounts": dict(
+                Counter(item["actualWorkState"] for item in items)
+            ),
+            "executionTimeline": execution_timeline,
+            "actionExecutionTimeline": [
+                item["eventId"]
+                for item in timeline_items
+                if item.get("actionKind") in ("graphics", "compute", "utility")
+            ],
+            "resourceFlowEdges": resource_flow,
+            "externalInputs": external_inputs,
+            "terminalOutputs": terminal_outputs,
+            "resourceFlowTruncated": resource_flow_truncated,
+            "resourceFlowSubresourcesResolved": False,
+            "sourceTruncated": input_truncated,
+            "truncated": input_truncated,
+            "omittedActionCountLowerBound": source_omitted,
+            "truncationReasons": source_reasons,
+            "requestedMaxActions": (
+                _safe_int(input_summary.get("requestedMaxActions"), len(normalised))
+                if isinstance(input_summary, Mapping)
+                else len(normalised)
+            ),
+            "serializedBudgetBytes": (
+                _safe_int(input_summary.get("serializedBudgetBytes"), 0)
+                if isinstance(input_summary, Mapping)
+                else 0
+            ),
+            "sourceSerializedBytes": (
+                _safe_int(input_summary.get("serializedBytes"), 0)
+                if isinstance(input_summary, Mapping)
+                else 0
+            ),
+            "inputResourceOmittedCount": input_resource_omitted,
+            "outputResourceOmittedCount": output_resource_omitted,
+            "resourceFactsTruncated": resource_facts_truncated,
         },
         "policy": {
             "classificationAuthority": "FixedProgram",
@@ -1505,6 +3360,8 @@ def classify_passes(
             "concreteIndirectChildrenRemainVisible": True,
         },
     }
+    if resource_metadata_receipt:
+        result["summary"]["resourceMetadata"] = resource_metadata_receipt
     return apply_ai_semantic_proposals(result, ai_proposals)
 
 
@@ -1812,6 +3669,14 @@ class PassKnowledgeStore:
         ):
             raise PassClassificationError(
                 "classification must come from classify_passes"
+            )
+        summary = classification.get("summary")
+        if isinstance(summary, Mapping) and (
+            summary.get("sourceTruncated") is True
+            or summary.get("truncated") is True
+        ):
+            raise PassClassificationError(
+                "truncated pass classification cannot become project knowledge"
             )
         digest = _sha(capture_id or classification.get("captureId"))
         if not digest:

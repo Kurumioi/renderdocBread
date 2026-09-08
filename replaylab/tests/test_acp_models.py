@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from replaylab_agent.acp_session import ACPMainAgentSession
 from replaylab_agent.connectors.acp import ACPConnector, _connection_models
 
 
@@ -70,6 +71,26 @@ async def test_catalogued_acp_authentication_method_is_sent_before_session_use(
 
 
 @pytest.mark.asyncio
+async def test_cursor_preauth_does_not_reenter_blocking_acp_login(tmp_path) -> None:
+    calls: list[str] = []
+
+    class Connection:
+        async def authenticate(self, *, method_id: str):
+            calls.append(method_id)
+
+    connector = ACPConnector(
+        ["cursor-agent", "acp"],
+        cwd=tmp_path,
+        timeout=5,
+        authentication_method="cursor_login",
+        provider_id="cursor-acp",
+    )
+    await connector._authenticate(Connection())
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_model_selection_accepts_dict_and_plural_model_option(tmp_path) -> None:
     calls: list[dict] = []
 
@@ -77,8 +98,10 @@ async def test_model_selection_accepts_dict_and_plural_model_option(tmp_path) ->
         async def set_config_option(self, **kwargs):
             calls.append(kwargs)
 
-    connector = ACPConnector(["agent"], cwd=tmp_path, timeout=5)
-    await connector._select_model(
+    session = ACPMainAgentSession(
+        command=["agent"], cwd=tmp_path, env=None, allowed_tools=frozenset(), timeout=5
+    )
+    await session._select_model(
         Connection(),
         {
             "configOptions": [

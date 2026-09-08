@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import sys
@@ -127,6 +128,32 @@ def ambiguous_interface() -> dict:
 
 
 class DxilAccessSignatureTests(unittest.TestCase):
+    def test_bounded_umin_add_indices_match_bridge_and_reject_overflow(self) -> None:
+        source = REAL_SHAPE_DXIL.replace(
+            b"  %22 = call", b"  %bounded = call i32 @dx.op.binary.i32(i32 40, i32 %21, i32 2)\n"
+            b"  %index = add i32 %bounded, 44\n  %22 = call"
+        ).replace(b"%dx.types.Handle %17, i32 44)", b"%dx.types.Handle %17, i32 %index)")
+        result = extract_dxil_cbuffer_access_signature(source)
+        self.assertEqual([716, 732, 748, 3280], [x.byte_offset for x in result.block(0, 1).accesses])
+        bridge_path = Path(__file__).parents[2] / "renderdoc_mcp_bridge" / "dxil_access_signature.py"
+        spec = importlib.util.spec_from_file_location("bridge_bounded_access", bridge_path)
+        bridge = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bridge)
+        self.assertEqual(result.to_dict(), bridge.extract_dxil_cbuffer_access_signature(source).to_dict())
+        variants = [
+            source.replace(b"i32 %21, i32 2)", b"i32 %21, i32 4096)"),
+            source.replace(b"%bounded, 44", b"%bounded, 4294967295"),
+            source.replace(b"add i32 %bounded, 44", b"add nsw i32 %bounded, 2147483647"),
+            source.replace(b"add i32 %bounded", b"sub i32 %bounded"),
+            source.replace(b"i32 40, i32 %21", b"i32 39, i32 %21"),
+        ]
+        for invalid in variants:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(DxilAccessSignatureError):
+                    extract_dxil_cbuffer_access_signature(invalid)
+                with self.assertRaises(bridge.DxilAccessSignatureError):
+                    bridge.extract_dxil_cbuffer_access_signature(invalid)
+
     def test_legacy_signature_tracks_only_extracted_lanes(self) -> None:
         signature = extract_dxil_cbuffer_access_signature(REAL_SHAPE_DXIL)
         b0 = signature.block(0, 0)
@@ -698,8 +725,15 @@ if mode == "disassemble":
 elif mode == "assemble":
     shutil.copyfile(Path(sys.argv[4]), Path(sys.argv[3]))
 elif mode in {"dxil-to-spirv", "hlsl-to-spirv"}:
+    name = b"main\0"
+    name += b"\0" * (-len(name) % 4)
+    name_words = struct.unpack("<%dI" % (len(name) // 4), name)
+    op_entry = [((3 + len(name_words)) << 16) | 15, 4, 1, *name_words]
     Path(sys.argv[3]).write_bytes(
-        struct.pack("<5I", 0x07230203, 0x00010000, 0, 1, 0)
+        struct.pack(
+            "<%dI" % (5 + len(op_entry)),
+            0x07230203, 0x00010000, 0, 2, 0, *op_entry,
+        )
     )
 elif mode == "spirv-to-hlsl":
     Path(sys.argv[3]).write_text(
@@ -861,6 +895,9 @@ class DxilAccessWorkspaceEvidenceTests(unittest.TestCase):
                 input_format="hlsl",
                 output_format="spirv",
                 stages=["fragment"],
+                # The fixture uses SPIR-V only as a D3D12-bound intermediate
+                # before the fixed SPIR-V -> DXIL transform.
+                target_apis=["d3d12"],
                 fidelity="native-compile",
                 priority=10,
                 implementation="fixed test HLSL compiler",

@@ -176,9 +176,9 @@ async def probe_profile(profile: Profile, *, timeout: float = 15.0) -> ProbeRepo
         # Azure deployment enumeration uses a separate management-plane auth
         # contract, while Vertex model discovery relies on ADC and project IAM.
         # Constructing these providers is the safe no-generation validation.
-        from .connectors.models import build_model
+        from .connectors.langchain_models import build_chat_model
 
-        build_model(profile)
+        build_chat_model(profile)
         return ProbeReport(
             profile.id,
             provider.title,
@@ -340,15 +340,6 @@ async def discover_models(
     )
 
 
-def _model_list_request(
-    profile: Profile, key: str
-) -> tuple[str, dict[str, str], dict[str, str]]:
-    """Backward-compatible first model-list request helper."""
-
-    _, url, headers, params = _model_list_requests(profile, key)[0]
-    return url, headers, params
-
-
 def _model_list_requests(
     profile: Profile, key: str
 ) -> list[tuple[str, str, dict[str, str], dict[str, str]]]:
@@ -425,8 +416,8 @@ async def _probe_agent_launch(
         process = await asyncio.create_subprocess_exec(
             *resolved_argv,
             stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
             env=external_agent_environment(profile),
         )
         # App-server/ACP processes normally stay alive waiting for protocol input.
@@ -448,13 +439,14 @@ async def _probe_agent_launch(
             if process.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
                     process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    with contextlib.suppress(ProcessLookupError):
-                        process.kill()
-                    with contextlib.suppress(Exception):
-                        await asyncio.wait_for(process.wait(), timeout=2.0)
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                # Once killed, always reap the process. In particular, do not
+                # leave Windows Proactor transports for event-loop shutdown.
+                await process.wait()
 
 
 __all__ = ["ProbeReport", "discover_models", "probe_profile"]

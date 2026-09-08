@@ -48,7 +48,7 @@ class _Transport:
 
 
 class _HealthTransport:
-    def __init__(self, pid=None, version="1.10.2", status=200,
+    def __init__(self, pid=None, version="1.13.0", status=200,
                  protocol_version=1, host_instance_id=HOST_INSTANCE_ID):
         self.pid = os.getpid() if pid is None else pid
         self.version = version
@@ -69,7 +69,7 @@ class _HealthTransport:
                 "hostInstanceId": self.host_instance_id,
                 "capabilities": [
                     "project-service", "project-restore",
-                    "shader-source-save"],
+                    "shader-source-save", "shader-live-edit", "asset-index"],
             },
             separators=(",", ":"),
         ).encode("utf-8")
@@ -104,7 +104,7 @@ class ReplayLabShaderSaveClientTests(unittest.TestCase):
                 {
                     "schema": "replaylab-internal-host/v1",
                     "service": "ReplayLabInternal",
-                    "version": "1.10.2",
+                    "version": "1.13.0",
                     "hostStateProtocolVersion": 1,
                     "host": "127.0.0.1",
                     "port": 49643,

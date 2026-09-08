@@ -43,6 +43,25 @@ public:
   // disallow copy of this object
   PipeState(const PipeState &) = delete;
 
+#if !defined(SWIG)
+  // C++ publication helper: copy common descriptor metadata while rebinding the API view to
+  // caller-owned state copies. The pointed-to states must outlive this PipeState. Shader
+  // reflection remains shared immutable capture metadata, as in the API-specific state copies.
+  void CopyStateAndRebind(const PipeState &source, const D3D11Pipe::State *d3d11,
+                          const D3D12Pipe::State *d3d12, const GLPipe::State *gl,
+                          const VKPipe::State *vulkan)
+  {
+    m_PipelineType = source.m_PipelineType;
+    m_D3D11 = source.m_D3D11 ? d3d11 : NULL;
+    m_D3D12 = source.m_D3D12 ? d3d12 : NULL;
+    m_GL = source.m_GL ? gl : NULL;
+    m_Vulkan = source.m_Vulkan ? vulkan : NULL;
+    m_Access = source.m_Access;
+    m_Descriptors = source.m_Descriptors;
+    m_SamplerDescriptors = source.m_SamplerDescriptors;
+  }
+#endif
+
 #if defined(RENDERDOC_EXPORTS)
   // we initialise this internally only
   void SetState(const D3D11Pipe::State *d3d11)

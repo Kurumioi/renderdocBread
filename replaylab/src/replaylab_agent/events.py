@@ -9,12 +9,14 @@ import threading
 import time
 import uuid
 import re
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 TASK_EVENT_SCHEMA = "replaylab-ai-task-event/v1"
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_DELIVERY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _TAIL_READ_BYTES = 64 * 1024
 _MAX_LAST_EVENT_BYTES = 16 * 1024 * 1024
 _ARTIFACT_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -27,6 +29,8 @@ TaskEventKind = Literal[
     "planning",
     "running",
     "message-delta",
+    "agent-message-delta",
+    "reasoning-delta",
     "tool-started",
     "tool-completed",
     "approval-required",
@@ -65,6 +69,10 @@ def _prune_stale_task_events(root: Path, *, now: float | None = None) -> None:
                 continue
             if entry.stat().st_mtime < cutoff:
                 entry.unlink()
+                for suffix in (".report.json", ".report-state.json"):
+                    sidecar = root / f"{entry.stem}{suffix}"
+                    if sidecar.is_file() and not sidecar.is_symlink():
+                        sidecar.unlink()
         except OSError:
             # Retention must never make an AI request fail. A later task will
             # retry deletion after transient sharing/permission errors clear.
@@ -83,11 +91,13 @@ class TaskEvent:
     text: str = ""
     tool: str = ""
     data: dict[str, Any] = field(default_factory=dict)
+    delivery_id: str = ""
     schema: str = TASK_EVENT_SCHEMA
 
     def to_wire(self) -> dict[str, Any]:
         value = asdict(self)
-        return {
+        delivery_id = value.pop("delivery_id")
+        wire = {
             "schema": value.pop("schema"),
             "taskId": value.pop("task_id"),
             "kind": value.pop("kind"),
@@ -95,6 +105,39 @@ class TaskEvent:
             "timestampUnixMs": value.pop("timestamp_ms"),
             **value,
         }
+        if delivery_id:
+            wire["deliveryId"] = delivery_id
+        return wire
+
+
+@contextmanager
+def _exclusive_path_lock(path: Path) -> Iterator[None]:
+    """Serialize append/projector decisions across processes on one task file."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:  # pragma: no cover - Windows is the packaged ReplayLab target
+            import fcntl
+
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 class TaskEventWriter:
@@ -113,37 +156,111 @@ class TaskEventWriter:
     def path(self) -> Path:
         return self.root / f"{self.task_id}.jsonl"
 
-    def emit(self, kind: TaskEventKind, **values: Any) -> TaskEvent:
+    def emit(
+        self,
+        kind: TaskEventKind,
+        *,
+        delivery_id: str = "",
+        **values: Any,
+    ) -> TaskEvent:
+        delivery_id = str(delivery_id or "")
+        if delivery_id and not _DELIVERY_ID_RE.fullmatch(delivery_id):
+            raise ValueError("delivery_id contains unsafe characters")
         with self._lock:
-            self._sequence += 1
-            if "data" in values:
-                values["data"] = _redact(values["data"])
-            event = TaskEvent(
-                task_id=self.task_id,
-                kind=kind,
-                sequence=self._sequence,
-                timestamp_ms=int(time.time() * 1000),
-                **values,
-            )
-            self.root.mkdir(parents=True, exist_ok=True)
-            encoded = json.dumps(
-                event.to_wire(), ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8", errors="backslashreplace")
-            with self.path.open("a+b") as stream:
-                stream.seek(0, os.SEEK_END)
-                end = stream.tell()
-                separator = b""
-                if end:
-                    stream.seek(-1, os.SEEK_END)
-                    if stream.read(1) != b"\n":
-                        # A killed writer may leave an incomplete JSON object at EOF. Keep
-                        # that fragment on its own corrupt line so this event remains a
-                        # parseable JSONL record and future writers can resume its sequence.
-                        # This also completes a lone CR into a CRLF boundary.
-                        separator = b"\n"
-                stream.write(separator + encoded + b"\n")
-                stream.flush()
-            return event
+            with _exclusive_path_lock(self.path.with_suffix(".jsonl.lock")):
+                if delivery_id:
+                    existing = self._event_for_delivery_id(delivery_id)
+                    if existing is not None:
+                        self._sequence = max(self._sequence, existing.sequence)
+                        return existing
+                self._sequence = max(self._sequence, self._last_sequence()) + 1
+                if "data" in values:
+                    values["data"] = _redact(values["data"])
+                event = TaskEvent(
+                    task_id=self.task_id,
+                    kind=kind,
+                    sequence=self._sequence,
+                    timestamp_ms=int(time.time() * 1000),
+                    delivery_id=delivery_id,
+                    **values,
+                )
+                self.root.mkdir(parents=True, exist_ok=True)
+                encoded = json.dumps(
+                    event.to_wire(), ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8", errors="backslashreplace")
+                with self.path.open("a+b") as stream:
+                    stream.seek(0, os.SEEK_END)
+                    end = stream.tell()
+                    separator = b""
+                    if end:
+                        stream.seek(-1, os.SEEK_END)
+                        if stream.read(1) != b"\n":
+                            # A killed writer may leave an incomplete JSON object at EOF. Keep
+                            # that fragment on its own corrupt line so this event remains a
+                            # parseable JSONL record and future writers can resume its sequence.
+                            # This also completes a lone CR into a CRLF boundary.
+                            separator = b"\n"
+                    stream.write(separator + encoded + b"\n")
+                    stream.flush()
+                    # Outbox acknowledgement happens only after emit returns. Make
+                    # that return a durable sink boundary, not merely a Python-buffer
+                    # flush that can be lost while SQLite has already persisted ACK.
+                    if delivery_id:
+                        os.fsync(stream.fileno())
+                return event
+
+    def _event_for_delivery_id(self, delivery_id: str) -> TaskEvent | None:
+        if not self.path.is_file():
+            return None
+        needle = json.dumps(delivery_id, separators=(",", ":")).encode("ascii")
+        matched: dict[str, Any] | None = None
+        try:
+            with self.path.open("rb") as stream:
+                for raw_line in stream:
+                    if needle not in raw_line:
+                        continue
+                    try:
+                        value = json.loads(raw_line)
+                    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if (
+                        isinstance(value, dict)
+                        and value.get("schema") == TASK_EVENT_SCHEMA
+                        and value.get("taskId") == self.task_id
+                        and value.get("deliveryId") == delivery_id
+                    ):
+                        matched = value
+                        break
+        except OSError:
+            return None
+        if matched is None:
+            return None
+        sequence = matched.get("sequence")
+        timestamp = matched.get("timestampUnixMs")
+        kind = matched.get("kind")
+        if (
+            not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or sequence < 1
+            or not isinstance(timestamp, int)
+            or isinstance(timestamp, bool)
+            or not isinstance(kind, str)
+        ):
+            return None
+        data = matched.get("data", {})
+        return TaskEvent(
+            task_id=self.task_id,
+            kind=kind,  # type: ignore[arg-type]
+            sequence=sequence,
+            timestamp_ms=timestamp,
+            backend=str(matched.get("backend", "")),
+            profile=str(matched.get("profile", "")),
+            summary=str(matched.get("summary", "")),
+            text=str(matched.get("text", "")),
+            tool=str(matched.get("tool", "")),
+            data=data if isinstance(data, dict) else {},
+            delivery_id=delivery_id,
+        )
 
     def _last_sequence(self) -> int:
         if not self.path.is_file():

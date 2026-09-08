@@ -5,9 +5,6 @@ from __future__ import annotations
 import os
 import sys
 
-from src.internal_host import main
-
-
 def _configure_process() -> None:
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     os.environ.setdefault("PYTHONUTF8", "1")
@@ -18,8 +15,17 @@ def _configure_process() -> None:
                 reconfigure(encoding="utf-8", errors="strict")
             except (AttributeError, OSError, ValueError):
                 pass
+    # The singleton also owns compilation after editor saves. Resolve the
+    # same installation-scoped registry as MCP before importing its server.
+    from src.replaylab_host import _prepare_shader_tools
+    _prepare_shader_tools()
+
+
+def main(argv=None) -> int:
+    _configure_process()
+    from src.internal_host import main as run
+    return run(argv)
 
 
 if __name__ == "__main__":
-    _configure_process()
     raise SystemExit(main())

@@ -51,6 +51,28 @@ SAFE_EXTERNAL_ENV = frozenset(
     }
 )
 
+# Fixed local provider and managed-state locations are admitted only to
+# ReplayLabMCP.  They are
+# deliberately excluded from ``SAFE_EXTERNAL_ENV`` so vendor Agent subprocesses
+# do not inherit a profiles-database path or executable/tooling layout merely
+# because the Host needs it.  Values are paths, never AES material; provider
+# code remains responsible for returning only redacted fingerprints.
+MCP_HOST_PROVIDER_ENV = frozenset(
+    {
+        "RENDERDOC_ULTRA_UNPACKED_ASSET_JOB_ROOT",
+        "RENDERDOC_ULTRA_RESOURCE_EXPORT_ROOT",
+        "RENDERDOC_ULTRA_UEX",
+        "RENDERDOC_ULTRA_UEX_PROFILES",
+        "RENDERDOC_ULTRA_BLENDER",
+        "RENDERDOC_ULTRA_GLTF_VALIDATOR",
+        "RENDERDOC_ULTRA_UNITY_VALIDATOR",
+        "RENDERDOC_ULTRA_UEX_BLENDER_WRAPPER",
+        "RENDERDOC_ULTRA_UEX_BLENDER_CONTINUATION_DRIVER",
+        "RENDERDOC_ULTRA_UEFORMAT_ADDON",
+        "RENDERDOC_ULTRA_UEX_PYTHON",
+    }
+)
+
 # A model credential must never reuse an execution-, filesystem-, trust-, or ReplayLab-control
 # variable. qrenderdoc injects the selected API-key value into AgentHost's environment; accepting
 # one of these names could turn a secret into PATH/HOME/CODEX_HOME or propagate it to a supposedly
@@ -66,27 +88,40 @@ REPLAYLAB_CONTROL_ENV = frozenset(
         "REPLAYLAB_TOOL_SCOPE",
     }
 )
-RESERVED_CREDENTIAL_ENV = SAFE_EXTERNAL_ENV | REPLAYLAB_CONTROL_ENV | frozenset(
-    {
-        "ALL_PROXY",
-        "CURSOR_CONFIG_DIR",
-        "CURL_CA_BUNDLE",
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "LD_LIBRARY_PATH",
-        "LD_PRELOAD",
-        "NO_PROXY",
-        "PYTHONHOME",
-        "PYTHONINSPECT",
-        "PYTHONPATH",
-        "PYTHONSTARTUP",
-        "QT_PLUGIN_PATH",
-        "QT_QPA_PLATFORM_PLUGIN_PATH",
-        "REQUESTS_CA_BUNDLE",
-        "VIRTUAL_ENV",
-    }
+RESERVED_CREDENTIAL_ENV = (
+    SAFE_EXTERNAL_ENV
+    | MCP_HOST_PROVIDER_ENV
+    | REPLAYLAB_CONTROL_ENV
+    | frozenset(
+        {
+            "CLAUDE_CONFIG_DIR",
+            "ALL_PROXY",
+            "CODEBUDDY_CONFIG_DIR",
+            "COPILOT_HOME",
+            "CURSOR_CONFIG_DIR",
+            "CURL_CA_BUNDLE",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "GEMINI_CLI_HOME",
+            "GEMINI_CLI_TRUST_WORKSPACE",
+            "KIMI_CODE_HOME",
+            "KIMI_DISABLE_TELEMETRY",
+            "LD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "NO_PROXY",
+            "PYTHONHOME",
+            "PYTHONINSPECT",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "QT_PLUGIN_PATH",
+            "QT_QPA_PLATFORM_PLUGIN_PATH",
+            "QWEN_CODE_FORCE_ENCRYPTED_FILE_STORAGE",
+            "REQUESTS_CA_BUNDLE",
+            "VIRTUAL_ENV",
+        }
+    )
 )
 
 # Only these audited catalog presets receive installation-layout fallbacks.  A
@@ -99,6 +134,8 @@ _KNOWN_VENDOR_COMMANDS = {
     "gemini-acp": "gemini",
     "qwen-acp": "qwen",
     "kimi-acp": "kimi",
+    "codebuddy-acp": "codebuddy",
+    "claude-code-acp": "claude-agent-acp",
 }
 # These vendors publish official npm shims. Cursor instead uses its own install
 # root (``~/.local/bin`` on Unix-like systems and ``%LOCALAPPDATA%/cursor-agent``
@@ -106,7 +143,15 @@ _KNOWN_VENDOR_COMMANDS = {
 # the trusted built-in command beyond Cursor's documented layout.
 _NPM_SHIMS = {
     preset: f"{_KNOWN_VENDOR_COMMANDS[preset]}.cmd"
-    for preset in ("codex", "copilot-acp", "gemini-acp", "qwen-acp", "kimi-acp")
+    for preset in (
+        "codex",
+        "copilot-acp",
+        "gemini-acp",
+        "qwen-acp",
+        "kimi-acp",
+        "codebuddy-acp",
+        "claude-code-acp",
+    )
 }
 _CODEX_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _MAX_CODEX_BIN_ENTRIES = 64
@@ -180,7 +225,105 @@ def external_agent_environment(
         if home.drive:
             result["HOMEDRIVE"] = home.drive
             result["HOMEPATH"] = str(home)[len(home.drive) :] or "\\"
+    elif profile.preset == "codebuddy-acp":
+        # CodeBuddy officially supports a relocatable configuration root. Keep
+        # subscription/account state durable for this ReplayLab connection while
+        # excluding the user's ambient settings, hooks, rules, agents and plugins.
+        result["CODEBUDDY_CONFIG_DIR"] = str(codebuddy_profile_home(profile, environ=source))
+    elif profile.preset == "copilot-acp":
+        # Copilot documents COPILOT_HOME as the root for login, settings,
+        # permissions and session state.  A ReplayLab connection therefore
+        # never imports the user's ordinary ~/.copilot approvals or MCP state.
+        result["COPILOT_HOME"] = str(managed_vendor_profile_home(profile, environ=source))
+    elif profile.preset == "gemini-acp":
+        # GEMINI_CLI_HOME relocates Gemini CLI's durable account/configuration
+        # state. Redirect the OS-home conventions as well so generic
+        # ~/.agents instructions cannot leak into this isolated Agent turn.
+        home = managed_vendor_profile_home(profile, environ=source)
+        result["GEMINI_CLI_HOME"] = str(home)
+        result["GEMINI_CLI_TRUST_WORKSPACE"] = "true"
+        _redirect_process_home(result, home)
+    elif profile.preset == "qwen-acp":
+        # Qwen Code stores state below ~/.qwen and currently publishes no
+        # separate data-root override. The managed OS home isolates account,
+        # MCP, Skills, instruction and trust files together.
+        home = managed_vendor_profile_home(profile, environ=source)
+        _redirect_process_home(result, home)
+        result["QWEN_CODE_FORCE_ENCRYPTED_FILE_STORAGE"] = "true"
+    elif profile.preset == "kimi-acp":
+        # KIMI_CODE_HOME relocates login credentials, configuration, plugins,
+        # Skills and sessions. The extra HOME redirect also excludes Kimi's
+        # documented cross-tool ~/.agents instruction/agent directories.
+        home = managed_vendor_profile_home(profile, environ=source)
+        result["KIMI_CODE_HOME"] = str(home)
+        result["KIMI_DISABLE_TELEMETRY"] = "1"
+        _redirect_process_home(result, home)
+    elif profile.preset == "claude-code-acp":
+        # The Claude Code ACP adapter takes the model from the environment, so it is
+        # selected out-of-band through the Claude Code CLI's ANTHROPIC_MODEL
+        # variable (it takes precedence over ~/.claude/settings.json and works
+        # with a Pro/Max subscription). Driving it from the profile lets the model
+        # be chosen in ReplayLab's UI with no terminal; an unset model falls back
+        # to Claude Code's own configured default. Accepts a full model id
+        # (claude-sonnet-5) or an alias (opus, sonnet). The value is trimmed and
+        # lower-cased so stray spaces or capitalization from manual entry do not
+        # break it (Claude model ids and aliases are lower-case).
+        normalized_model = profile.model.strip().lower()
+        if normalized_model:
+            result["ANTHROPIC_MODEL"] = normalized_model
+        result["CLAUDE_CONFIG_DIR"] = str(
+            managed_vendor_profile_home(profile, environ=source)
+        )
     return result
+
+
+_MANAGED_VENDOR_STATE_DIRS = {
+    "copilot-acp": "copilot",
+    "gemini-acp": "gemini",
+    "qwen-acp": "qwen",
+    "kimi-acp": "kimi",
+    "claude-code-acp": "claude",
+}
+_MANAGED_VENDOR_STATE_LABELS = {
+    "copilot-acp": "Copilot",
+    "gemini-acp": "Gemini",
+    "qwen-acp": "Qwen",
+    "kimi-acp": "Kimi",
+    "claude-code-acp": "Claude",
+}
+
+
+def _redirect_process_home(environment: dict[str, str], home: Path) -> None:
+    """Point both POSIX and Windows home conventions at one managed root."""
+
+    environment["HOME"] = str(home)
+    environment["USERPROFILE"] = str(home)
+    if home.drive:
+        environment["HOMEDRIVE"] = home.drive
+        environment["HOMEPATH"] = str(home)[len(home.drive) :] or "\\"
+
+
+def managed_vendor_profile_home(
+    profile: Profile, *, environ: Mapping[str, str] | None = None
+) -> Path:
+    """Return the durable ReplayLab-owned state root for a non-legacy ACP vendor."""
+
+    source = os.environ if environ is None else environ
+    directory = _MANAGED_VENDOR_STATE_DIRS.get(profile.preset)
+    if directory is None:
+        raise ConfigurationError(
+            "a managed vendor home requires a supported ACP subscription preset"
+        )
+    profile.validate()
+    return (_managed_vendor_profiles_root(source, directory) / profile.id).resolve()
+
+
+def _managed_vendor_profiles_root(source: Mapping[str, str], directory: str) -> Path:
+    local = source.get("LOCALAPPDATA") or source.get("XDG_DATA_HOME")
+    data_root = Path(local).expanduser() if local else Path.home() / ".local" / "share"
+    if not data_root.is_absolute():
+        raise ConfigurationError("ReplayLab managed vendor state root must be absolute")
+    return data_root / "ReplayLab" / directory
 
 
 def codex_profile_home(
@@ -232,6 +375,31 @@ def _cursor_profiles_root(source: Mapping[str, str]) -> Path:
     return data_root / "ReplayLab" / "cursor"
 
 
+def codebuddy_profile_home(
+    profile: Profile, *, environ: Mapping[str, str] | None = None
+) -> Path:
+    """Return ReplayLab's durable, profile-scoped CodeBuddy state root."""
+
+    source = os.environ if environ is None else environ
+    if profile.preset != "codebuddy-acp":
+        raise ConfigurationError(
+            "a managed CodeBuddy home requires the CodeBuddy ACP preset"
+        )
+    profile.validate()
+    return _codebuddy_profiles_root(source) / profile.id
+
+
+def _codebuddy_profiles_root(source: Mapping[str, str]) -> Path:
+    local = source.get("LOCALAPPDATA") or source.get("XDG_DATA_HOME")
+    if local:
+        data_root = Path(local).expanduser()
+    else:
+        data_root = Path.home() / ".local" / "share"
+    if not data_root.is_absolute():
+        raise ConfigurationError("ReplayLab CodeBuddy home root must be absolute")
+    return data_root / "ReplayLab" / "codebuddy"
+
+
 _CURSOR_DENIED_PERMISSIONS = (
     "Shell(*)",
     "Read(**)",
@@ -242,10 +410,10 @@ _CURSOR_DENIED_PERMISSIONS = (
 
 def _cursor_permissions() -> dict[str, list[str]]:
     # Cursor's allow-list is the outer transport boundary, not ReplayLab's
-    # workflow policy.  The per-turn MCP proxy exposes only the selected Skill's
-    # tools and independently enforces frozen scope, requested effects,
+    # workflow policy.  The per-turn MCP proxy exposes only the task's
+    # Host-admitted live tools and independently enforces frozen scope, requested effects,
     # postconditions and rollback.  Allow the complete first-party namespace so
-    # a newly added or effectful specialist tool is not silently blocked by a
+    # a newly added or effectful child-Agent tool is not silently blocked by a
     # second static list.  Ambient shell/file/web access remains denied below.
     return {
         "allow": ["Mcp(ReplayLab:*)"],
@@ -496,6 +664,42 @@ def remove_cursor_profile_home(
     )
 
 
+def remove_codebuddy_profile_home(
+    profile: Profile, *, environ: Mapping[str, str] | None = None
+) -> None:
+    """Remove only ReplayLab's exact profile-scoped CodeBuddy state directory."""
+
+    source = os.environ if environ is None else environ
+    _remove_managed_profile_home(
+        profile,
+        source=source,
+        expected_preset="codebuddy-acp",
+        root=_codebuddy_profiles_root(source),
+        state_label="CodeBuddy",
+    )
+
+
+def remove_managed_vendor_profile_home(
+    profile: Profile, *, environ: Mapping[str, str] | None = None
+) -> None:
+    """Remove one exact ReplayLab-owned ACP vendor state directory."""
+
+    source = os.environ if environ is None else environ
+    directory = _MANAGED_VENDOR_STATE_DIRS.get(profile.preset)
+    label = _MANAGED_VENDOR_STATE_LABELS.get(profile.preset)
+    if directory is None or label is None:
+        raise ConfigurationError(
+            "managed vendor state can be removed only for a supported ACP subscription profile"
+        )
+    _remove_managed_profile_home(
+        profile,
+        source=source,
+        expected_preset=profile.preset,
+        root=_managed_vendor_profiles_root(source, directory),
+        state_label=label,
+    )
+
+
 def _remove_managed_profile_home(
     profile: Profile,
     *,
@@ -591,13 +795,16 @@ def host_process_environment(
     """Build a credential-free environment for ReplayLabMCP itself.
 
     In particular, model-provider API keys and unrelated Agent credentials are
-    never inherited by the MCP host.  The caller explicitly adds only the
-    qrenderdoc instance binding and the isolated live-edit registry path.
+    never inherited by the MCP host.  The fixed local provider/managed-state
+    variables are Host-only; the caller may additionally add qrenderdoc
+    instance bindings and isolated managed-state paths.
     """
 
     source = os.environ if environ is None else environ
     result = {
-        key: value for key, value in source.items() if key.upper() in SAFE_EXTERNAL_ENV
+        key: value
+        for key, value in source.items()
+        if key.upper() in SAFE_EXTERNAL_ENV | MCP_HOST_PROVIDER_ENV
     }
     if extra:
         result.update({str(key): str(value) for key, value in extra.items()})
@@ -619,9 +826,18 @@ def resolve_executable(
         return ""
     extensions = [""]
     if os.name == "nt" and not expanded.suffix:
-        extensions.extend(
-            item.lower() for item in source.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";")
-        )
+        # Windows installs of npm-published CLIs drop both a bare POSIX shim (a
+        # shell script with no extension) and a real launcher (``.cmd``/``.exe``)
+        # of the same name into the same PATH directory. CreateProcess rejects
+        # the bare shim with "[WinError 193] %1 is not a valid Win32 application",
+        # so try the PATHEXT launchers first and keep the empty extension only as
+        # a last resort. This mirrors how cmd.exe itself resolves a bare command.
+        pathext = [
+            item.lower()
+            for item in source.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";")
+            if item
+        ]
+        extensions = pathext + [""]
     for directory in source.get("PATH", "").split(os.pathsep):
         if not directory:
             continue
@@ -915,16 +1131,21 @@ def resolved_agent_argv(
 
 __all__ = [
     "SAFE_EXTERNAL_ENV",
+    "MCP_HOST_PROVIDER_ENV",
     "REPLAYLAB_CONTROL_ENV",
     "RESERVED_CREDENTIAL_ENV",
     "agent_command_argv",
+    "codebuddy_profile_home",
     "codex_profile_home",
     "cursor_profile_home",
     "ensure_cursor_profile_config",
     "ensure_cursor_workspace",
     "external_agent_environment",
+    "managed_vendor_profile_home",
     "remove_codex_profile_home",
+    "remove_codebuddy_profile_home",
     "remove_cursor_profile_home",
+    "remove_managed_vendor_profile_home",
     "host_process_environment",
     "is_packaged_windows_executable",
     "resolve_agent_executable",

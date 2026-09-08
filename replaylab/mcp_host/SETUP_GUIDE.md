@@ -60,7 +60,7 @@ renderdocUltra/
 ```toml
 [project]
 name = "renderdoc-mcp"
-version = "1.10.2"
+version = "1.13.0"
 description = "ReplayLab sidecar host for RenderDocUltra's built-in AI integration, capture analysis, and shader workflows"
 requires-python = ">=3.10"
 dependencies = [
@@ -115,7 +115,7 @@ py -3.10 -m venv .venv
 ```
 Successfully built renderdoc-mcp
 Installing collected packages: renderdoc-mcp
-Successfully installed renderdoc-mcp-1.10.2
+Successfully installed renderdoc-mcp-1.13.0
 ```
 
 依赖 `mcp[cli]>=1.0.0` 及其子依赖（anyio, httpx, pydantic, starlette 等）均已满足。
@@ -128,7 +128,7 @@ Successfully installed renderdoc-mcp-1.10.2
 
 **输出确认**：
 ```
-OK: 89 tools
+OK: 141 tools
 close_capture
 debug_pixel
 debug_vertex
@@ -209,7 +209,7 @@ switch_capture
 
 ---
 
-## 四、已注册工具一览（当前源码 89 个）
+## 四、已注册工具一览（当前源码 141 个）
 
 ### 截帧管理（6 个）
 | 工具 | 功能 |
@@ -270,11 +270,18 @@ switch_capture
 |------|------|
 | `get_cbuffer_contents` | 读取 CBuffer 实时运行值 |
 
-### 一键导出（2 个）
+### 受管资源导出（6 个）
 | 工具 | 功能 |
 |------|------|
-| `export_drawcall` | 导出 DrawCall 全部信息到文件夹 |
-| `export_to_unity` | 🆕 导出 Unity 可用资源：Mesh(.obj + .fbx) + 纹理绑定信息 + 材质JSON + C#导入脚本（含 DX→右手坐标系自动转换、索引重映射、压缩法线检测） |
+| `get_resource_export_capabilities` | 查询 glTF/Unity URP/Blender/FBX 与校验器能力 |
+| `inspect_resource_export` | 只读检查精确 EID/instance/view |
+| `prepare_resource_export` | 写入 Host 受管、哈希绑定的 capture bundle |
+| `finalize_resource_export` | 按类型化 transfer spec 原子发布目标包 |
+| `get_resource_export_status` | 查看同一 operation 的阶段和收据 |
+| `validate_resource_export` | 验证 containment、哈希、网格、目标导入/编译状态 |
+
+旧 `export_drawcall` / `export_to_unity` 仅保留兼容性，不能作为资源导出专员的
+完成路径；它们没有完整顶点流、texture view/sampler、显式坐标和目标校验合同。
 
 ### 智能识别（1 个）
 | 工具 | 功能 |

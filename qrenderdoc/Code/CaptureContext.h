@@ -25,10 +25,12 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <QDebug>
 #include <QList>
 #include <QMap>
 #include <QMessageBox>
+#include <QTimer>
 #include <QString>
 #include <QtWidgets/QWidget>
 #include "Interface/QRDInterface.h"
@@ -40,6 +42,7 @@
 
 class MainWindow;
 class EventBrowser;
+class BookmarksView;
 class APIInspector;
 class AnnotationDisplay;
 class PipelineStateViewer;
@@ -58,6 +61,8 @@ class AIAssistant;
 class ReplayLabIntegration;
 class ResourceInspector;
 class ShaderViewer;
+class ShaderCodeEditor;
+class CodeEditorService;
 class MiniQtHelper;
 
 class QFileSystemWatcher;
@@ -124,8 +129,14 @@ public:
   void ExportCapture(const CaptureFileFormat &fmt, const rdcstr &exportfile) override;
   void SetEventID(const rdcarray<ICaptureViewer *> &exclude, uint32_t selectedEventID,
                   uint32_t eventId, bool force = false) override;
+  void ScrubToEvent(uint32_t eventId) override;
+  void ScrubToSelectedEvent(uint32_t selectedEventId, uint32_t eventId) override;
+  void EndScrub() override;
+  bool IsScrubbing() override { return m_Scrubbing; }
   void SetRemoteHost(int hostIndex);
   void RefreshStatus() override { SetEventID({}, m_SelectedEventID, m_EventID, true); }
+  void RefreshReplayStatus(uint32_t expectedEventId, uint64_t expectedBufferGeneration,
+                           std::function<void(bool)> completed) override;
   bool IsResourceReplaced(ResourceId id) override;
   ResourceId GetResourceReplacement(ResourceId id) override;
   void RegisterReplacement(ResourceId from, ResourceId to) override;
@@ -209,6 +220,8 @@ public:
   rdcarray<EventBookmark> GetBookmarks() override { return m_Bookmarks; }
   void SetBookmark(const EventBookmark &mark) override;
   void RemoveBookmark(uint32_t EID) override;
+  void RemoveBookmarks(const rdcarray<uint32_t> &EIDs);
+  void SetBookmarkOrder(const rdcarray<uint32_t> &EIDs);
   void EmbedDependentFiles() override;
   void RemoveDependentFiles() override;
 
@@ -216,6 +229,7 @@ public:
 
   IMainWindow *GetMainWindow() override;
   IEventBrowser *GetEventBrowser() override;
+  BookmarksView *GetBookmarksView();
   IAPIInspector *GetAPIInspector() override;
   IAnnotationViewer *GetAnnotationViewer() override;
   ITextureViewer *GetTextureViewer() override;
@@ -232,10 +246,13 @@ public:
   ApiMonitorWindow *GetApiMonitorWindow();
   AIAssistant *GetAIAssistant();
   ReplayLabIntegration &ReplayLab();
+  void AddTextToAIAssistant(const rdcstr &title, const rdcstr &text,
+                            const rdcstr &source, const rdcstr &contextJSON = {}) override;
   void ShowAIAssistant();
   IResourceInspector *GetResourceInspector() override;
 
   bool HasEventBrowser() override { return m_EventBrowser != NULL; }
+  bool HasBookmarksView() { return m_BookmarksView != NULL; }
   bool HasAPIInspector() override { return m_APIInspector != NULL; }
   bool HasAnnotationViewer() override { return m_AnnotationViewer != NULL; }
   bool HasTextureViewer() override { return m_TextureViewer != NULL; }
@@ -304,6 +321,8 @@ public:
   void RaiseDockWindow(QWidget *dockWindow) override;
   void AddDockWindow(QWidget *newWindow, DockReference ref, QWidget *refWindow,
                      float percentage = 0.5f) override;
+  IShaderCodeEditor *CreateShaderCodeEditor(QWidget *parent = NULL) override;
+  void DestroyShaderCodeEditor(IShaderCodeEditor *editor) override;
 
   const D3D11Pipe::State *CurD3D11PipelineState() override { return m_CurD3D11PipelineState; }
   const D3D12Pipe::State *CurD3D12PipelineState() override { return m_CurD3D12PipelineState; }
@@ -315,6 +334,22 @@ private:
   friend class ReplayLabIntegration;
 
   ReplayManager m_Replay;
+
+  struct PublishedPipelineState
+  {
+    explicit PublishedPipelineState(IReplayController *controller);
+
+    std::unique_ptr<D3D11Pipe::State> d3d11;
+    std::unique_ptr<D3D12Pipe::State> d3d12;
+    std::unique_ptr<GLPipe::State> gl;
+    std::unique_ptr<VKPipe::State> vulkan;
+    PipeState pipeline;
+  };
+  void PublishPipelineState(std::shared_ptr<const PublishedPipelineState> state);
+  // Exactly one current publication, plus the in-flight worker's next value. These own metadata
+  // only; no render target image or historical EID state is retained.
+  std::shared_ptr<const PublishedPipelineState> m_PublishedPipelineState;
+  uint64_t m_PipelinePublicationSerial = 0;
 
   const D3D11Pipe::State *m_CurD3D11PipelineState;
   const D3D12Pipe::State *m_CurD3D12PipelineState;
@@ -345,6 +380,7 @@ private:
 
   bool SaveBookmarks();
   void LoadBookmarks(const QString &data);
+  void NotifyBookmarksChanged();
 
   bool SaveNotes();
   void LoadNotes(const QString &data);
@@ -380,12 +416,45 @@ private:
   void LoadCaptureThreaded(const QString &captureFile, const ReplayOptions &opts,
                            const QString &origFilename, bool temporary, bool local);
 
-  void AddSortedMenuItem(QMenu *menu, bool rootMenu, const rdcarray<rdcstr> &items,
-                         std::function<void()> callback);
+  void AddSortedMenuItem(QMenu *menu, bool rootMenu, bool showExtensionIcon,
+                         const rdcarray<rdcstr> &items, std::function<void()> callback);
   void CleanMenu(QAction *action);
 
   uint32_t m_SelectedEventID = 0;
   uint32_t m_EventID = 0;
+
+  // GUI-thread owned. Replay callbacks retain request IDs, never the client completion itself.
+  // Closing or superseding a publication can therefore complete it even if its replay work is
+  // discarded, and a late delivery cannot publish or call a client twice.
+  struct ReplayStatusPublications
+  {
+    uint64_t serial = 0;
+    QMap<uint64_t, std::function<void(bool)>> pending;
+    uint64_t Begin(std::function<void(bool)> completed);
+    bool Current(uint64_t request) const;
+    void Complete(uint64_t request, bool published);
+    void Cancel();
+  } m_ReplayStatusPublications;
+#if ENABLE_UNIT_TESTS
+  friend struct CaptureContextPublicationTestAccess;
+#endif
+
+  // One real replay/pipeline/panel cycle runs at a time. New mouse positions replace the pending
+  // target, but cannot suppress a completed frame: continuous input must still update every panel.
+  bool m_Scrubbing = false;
+  bool m_ScrubCommitPending = false;
+  bool m_ScrubInFlight = false;
+  uint32_t m_ScrubSelectedEventID = 0;
+  uint32_t m_ScrubEventID = 0;
+  std::atomic<uint64_t> m_ScrubGeneration = {0};
+  // Unlike request generations, this changes only when normal navigation or close cancels a cycle.
+  std::atomic<uint64_t> m_ScrubEpoch = {0};
+  void QueueScrubReplay();
+  // One quiet-period request, cancelled by input/capture/publication changes. GPU replay itself
+  // remains an atomic work unit; background queue priority does not imply GPU preemption.
+  std::atomic<uint64_t> m_IdleCheckpointGeneration = {0};
+  void ScheduleIdleCheckpointMaintenance();
+  void LogEIDTiming(const QString &line);
 
   const ActionDescription *GetAction(const rdcarray<ActionDescription> &actions, uint32_t eventId)
   {
@@ -428,6 +497,7 @@ private:
   rdcarray<ResourceDescription> m_ResourceList;
 
   QList<EventBookmark> m_Bookmarks;
+  bool m_BookmarkRefreshPending = false;
 
   QMap<QString, QString> m_Notes;
 
@@ -457,6 +527,7 @@ private:
   QList<QObject *> m_PendingExtensionObjects;
   QMap<rdcstr, QList<QObject *>> m_ExtensionObjects;
   QList<QObject *> m_ReplayLabIntegrationObjects;
+  bool m_RegisteringFirstPartyIntegration = false;
 
   QList<QPointer<RegisteredMenuItem>> m_RegisteredMenuItems;
 
@@ -464,12 +535,15 @@ private:
 
   MiniQtHelper *m_QtHelper = NULL;
   ReplayLabIntegration *m_ReplayLabIntegration = NULL;
+  CodeEditorService *m_ShaderCodeEditorService = NULL;
+  QList<ShaderCodeEditor *> m_ShaderCodeEditors;
 
   QFileSystemWatcher *m_Watcher = NULL;
 
   // Windows
   MainWindow *m_MainWindow = NULL;
   EventBrowser *m_EventBrowser = NULL;
+  BookmarksView *m_BookmarksView = NULL;
   APIInspector *m_APIInspector = NULL;
   AnnotationDisplay *m_AnnotationViewer = NULL;
   TextureViewer *m_TextureViewer = NULL;

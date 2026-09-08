@@ -11,8 +11,10 @@ The result is not promised to be the game's original source. Only the
 `executable-editable` lane can be compiled or save-watched. A compile proves
 only that the route emitted one structurally valid executable of the captured
 format/profile. A fresh replay reflection proves only ABI compatibility. Live
-replacement is a further, separate capability currently limited to local
-D3D11/native DXBC and D3D12/native DXBC or DXIL.
+replacement is a further, separate capability for local D3D11/native DXBC,
+D3D12/native DXBC or DXIL, Vulkan/native SPIR-V, and OpenGL/native OpenGL SPIR-V
+on conventional graphics/compute stages. Ray/Library replacement remains a
+separate fail-closed boundary.
 
 ## End-to-end user workflow
 
@@ -27,31 +29,72 @@ workflow is:
 2. Select a complete `binary -> editable text -> binary` route from the fixed
    source-integrated provider catalog. Every executable, adapter, dependency,
    argument template and validator is SHA-256-bound. If a hop or untouched
-   baseline compile fails, the diagnostic is classified and AgentHost may
-   choose only an untried pair listed in `candidateRoutePairs`; each attempt
-   uses a new sibling workspace. AgentHost caps this recovery loop at eight
-   attempts and cannot invent a command, executable, route ID or Apply request.
+   baseline compile fails, the diagnostic is classified and the server itself
+   executes each untried opaque pair listed in `candidateRoutePairs`; every attempt
+   uses a new sibling workspace. The fixed plan caps this recovery frontier at eight
+   attempts and neither server nor Agent can invent a command, executable, route ID
+   or Apply request. No second model/tool turn is required to start an alternate.
+   `try_shader_workspace_recovery_candidate` already runs the selected decompile
+   and untouched-source baseline compile probe in that sibling. On success it
+   returns `reconstructionReceipt`, bound to the exact source/target workspaces,
+   capture/raw identity, route hashes, candidate indices, and published source
+   representation. AgentHost accepts this as the `workspace-reconstruct` step
+   only through the exact Host audit record and then reads the representation;
+   it does not call `decompile_shader_workspace` a second time. An ordinary MCP
+   success with `execution.succeeded=false` records the attempted pair with
+   `reconstructionReceipt=null`; it is recoverable evidence, not an invalid success
+   receipt and not permission to repeat the same process.
+   If every registered decompiler fails but a fixed compiler route exists,
+   preparation publishes RenderDoc native IR (or the exact captured binary view),
+   `explanation/promoted.<format>`, and a hash-bound provisional reconstruction
+   receipt. The Agent may construct reviewed source there, but it must still promote
+   the exact hash, compile through the bound route, and pass fresh replay ABI checks.
    When an existing workspace was created against older catalog/registry bytes,
    do not rewrite its manifest. `migrate_shader_workspace_toolchain` creates a
    new workspace, preserves the exact current source bytes, rebinds the same
    route shape to the current process-owned catalog, and starts again at
    revision zero. Old revisions and candidates stay isolated in the archive.
-3. If an unpacked `assetRoot` is configured, the bounded scanner ranks possible
-   Shader source, includes, caches and symbol manifests. It never executes
-   asset files or follows symlinks. Names/source previews help the AI explain
-   the program, but only program-verified blob/code/interface/layout matches may
-   seed physical aliases or cross-capture knowledge. `AIProvisional` evidence
-   remains review-only.
+3. If an unpacked `assetRoot` is configured and the project catalog has already
+   been prepared, `query_active_shader_asset_evidence(event_id, stage, top_k)`
+   reads only the active project's hash-bound full catalog and managed symbol
+   database. It correlates the exact captured Shader with bounded source/binary,
+   reflection and CBuffer evidence without accepting a path, scanning, compiling,
+   submitting a match or applying an alias. Names/source previews help the AI
+   explain the program, but only program-verified blob/code/interface/layout
+   matches may seed physical aliases or cross-capture knowledge. `AIProvisional`
+   evidence remains review-only.
 4. For executable HLSL, call `begin_shader_workspace_organization`, let AI edit
    only the returned proposal/analysis/Mermaid files, then call
    `review_shader_workspace_organization`. The fixed review transaction is
    described below. GLSL and instruction assembly remain directly editable,
    but are not fed to the HLSL organiser.
-5. Start `start_shader_workspace_live_edit`. A stable source save is debounced,
+   These are Host artifact contracts, not an AgentHost workflow state machine.
+   Prefer available compilable native source or a directly successful fixed
+   tool route; bytecode alone does not imply ABI repair. Reuse the current
+   compile/ABI evidence and repair only an actual failure. Register accepted
+   or soft-accepted baseline results with `register_active_project_workspace`.
+   Registration saves knowledge and shows the panel but may leave it read-only.
+   Complete default editable delivery with a checked
+   `apply_shader_workspace_shared_resource`, then a persistent
+   `start_shader_workspace_live_edit`; read back the canonical editable source
+   and durable session. A short-lived Agent-owned watcher is not sufficient.
+   Registration verifies the workspace's immutable catalog against the live
+   Shader/event uses and instance/session/path/API. The UI symbol catalog ID
+   may be empty or belong to a different export selection of the same RDC;
+   it is not substituted for this exact workspace evidence. If the active
+   project has not imported that catalog revision, registration imports the
+   existing, verified workspace catalog under the source transaction after
+   both publication gates agree. It does not export a new full frame or infer
+   permission from an empty UI ID.
+5. For the normal editable/save/compile/replace request, start the live session
+   above; explain-only and explicit export-only requests skip apply/watch.
+   A stable source save is debounced,
    compiled to an immutable revision, freshly ABI-validated, rebound to the
    current capture/session and original Shader, and then applied through the
-   shared-resource D3D11/D3D12 path. A newer pending save prevents an older
-   revision from being applied.
+   checked shared-resource path for the capture API. A newer pending save
+   prevents an older revision from being applied. Ray/Library workspaces may
+   still compile source/IR, but cannot start auto-apply while their complete
+   export/state-object/shader-group/SBT transaction is unavailable.
    The explicit authorisation is stored with the exact workspace/capture/shader
    identity and is resumed by the singleton Host after a Host restart. Use
    `list_shader_workspace_live_edits` to inspect active, authorised and failed
@@ -87,6 +130,14 @@ workflow is:
    original Shader ResourceId/raw hash, stage and entry point are unchanged.
    Repeat this explicit operation for each edge of a multi-version migration;
    no directory scan or guessed successor can inherit consent.
+
+   `start_shader_workspace_live_edit` is an explicit persistent auto-apply
+   authorization path. The user's editable/save/compile/replace request permits
+   this delivery step within the task's effect ceiling; choosing an AI
+   connection or Skill alone does not grant it. Explain-only and export-only
+   requests do not start it. Compile-only monitoring has its own bounded watch
+   tool; replay Apply retains its compile/validate/apply transaction and rollback
+   evidence.
 6. A compile, ABI, capture or apply failure leaves the previous
    `lastGoodReplacement` active. Stop the session or use its rollback metadata
    to restore the captured original. Stopping monitoring does not silently
@@ -224,8 +275,9 @@ after `Popen`; this leaves a very small pre-attachment race and is not an OS
 sandbox guarantee. POSIX uses a separate process group.
 
 Available argument placeholders are fixed: `{input}`, `{output}`, `{baseline}`,
-`{job_dir}`, `{workspace_dir}`, `{stage}`, `{entry_point}`, `{revision}`,
-`{capture_id}`, `{raw_sha256}`, `{target_profile}`, and `{target_api}`.
+`{job_dir}`, `{workspace_dir}`, `{stage}`, `{entry_point}`,
+`{captured_entry_point}`, `{revision}`, `{capture_id}`, `{raw_sha256}`,
+`{target_profile}`, and `{target_api}`.
 
 For format detection, deterministic auto-routing, official/community adapter
 generation, SPIR-V validation, and round-trip diagnostics, see
@@ -283,9 +335,21 @@ or catalog path.
 | D3D11 DXBC | Reconstructed HLSL to native DXBC; an explicitly registered DXBC instruction-assembly route may also be used | HLSL only | Supported for native DXBC. Default apply preserves one captured Shader ResourceId across all uses; event/family overrides remain D3D11-only |
 | D3D12 DXBC | Reconstructed HLSL or registered instruction text back to native DXBC | HLSL only | Supported through the checked D3D12 shared-resource transaction |
 | D3D12 DXIL | Direct community DXIL-to-HLSL reconstruction or a configured DXIL -> SPIR-V -> HLSL bridge, then exact-profile DXC output; registered DXIL/LLVM assembly may be assembled separately | HLSL only | Supported for native DXIL through the checked D3D12 shared-resource transaction |
-| Vulkan SPIR-V | A configured SPIRV-Cross -> GLSL and glslang -> SPIR-V route, or explicit SPIR-V assembly, with an explicit Vulkan target environment and validator | No; edit GLSL/assembly directly | Not implemented; workspace output is blocked from replay Apply |
-| OpenGL SPIR-V | The analogous OpenGL GLSL/assembly route, kept distinct from Vulkan despite identical binary magic | No; edit GLSL/assembly directly | Not implemented; workspace output is blocked from replay Apply |
-| Other engine caches, Metal libraries and vendor ISA | Evidence-only until a fixed provider declares its input/output formats, stage/API rules, hashes, licence and validator | No implicit HLSL conversion | Not implemented |
+| Vulkan SPIR-V | A configured SPIRV-Cross -> GLSL and glslang -> SPIR-V route, or automatic direct SPIR-V assembly only after a unique bound Vulkan `spirv-val` passes the baseline and untouched round-trip probes | No; edit GLSL/assembly directly | Supported for conventional graphics/compute/task/mesh only when the module has one exact entry/stage and checked rebuilding of every affected pipeline succeeds; incomplete graphics-pipeline-library and Ray paths fail closed |
+| OpenGL SPIR-V | The analogous OpenGL GLSL route or validator-gated native assembly, kept distinct from Vulkan despite identical binary magic | No; edit GLSL/assembly directly | Supported for legacy graphics/compute with `GL_ARB_gl_spirv` and checked relink/revalidation of every affected program/pipeline; `glCreateShaderProgramv` ownership fails closed |
+| Vulkan Ray SPIR-V | SPIRV-Cross -> GLSL plus glslang ray-stage compile, or validator-gated SPIR-V assembly | No; edit GLSL/assembly directly | Source/IR round trip can be ready; replay Apply remains blocked until exact export, shader-group, pipeline/state-object, ABI and SBT records are one rollback-capable transaction |
+| DXIL Ray/Library | DXC native DXIL/LLVM text plus official `IDxcAssembler` when both pinned operations pass | No; native IR is not HLSL | Native-IR round trip can be ready with exact `lib_6_x` container identity and a separately bound export name/stage; automatic high-level HLSL recovery and replay Apply remain blocked without complete export/state-object associations |
+| ESSL, MSL, WGSL, Slang, other engine caches, Metal libraries and vendor ISA | Recognized vocabulary or evidence-only until a fixed provider declares real input/output formats, stage/API rules, hashes, licence and validator | No implicit HLSL conversion | Not implemented; recognition/detection is not an end-to-end route |
+
+The toolchain diagnostic axes are deliberately non-cumulative: recognized,
+analyzable, explanatory, editable, compilable, externally validated,
+replay-ABI-validated and replay-replaceable are separate facts. A row can be
+recognized and explanatory while remaining non-editable; compilation can pass
+while external validation and replay ABI remain false. Toolchain diagnostics
+never execute a validator, validate replay ABI or authorize replacement. Ray
+and Library rows may now be editable/compilable when a real source/IR round trip
+is ready, while `replayStageSupported=false` and `replayUnsupportedReason`
+retain the exact state-object/shader-group/SBT/export boundary.
 
 "Supported" in the middle column means that a configured local route can be
 executed and its untouched reverse-compile probe can pass. It does not promise
@@ -313,24 +377,50 @@ prepare_shader_workspace(
 
 Leaving both tool IDs and `editable_format` empty is the recommended path: the
 server first prefers HLSL/GLSL, then selects a unique, direct, hash-verified
-DXIL/DXBC native-IR round trip when the preferred high-level lane has no
-complete route. The recovery diagnostics retain both the preferred failure and
-the selected fallback. This cross-format choice is currently a static planning
-fallback: if a complete high-level route was selected but its decompiler or
-baseline compile later fails at runtime, recovery does not automatically switch
-that workspace to native IR. It reports the fixed diagnostic and retains the
-selected format for listed same-format recovery or an explicitly requested new
-workspace. SPIR-V assembly is excluded from automatic native-IR fallback until
-its tools and validator are executed inside the workspace compile path; it
-remains explicit meanwhile. An older integration may still pass both
+DXIL/DXBC native-IR round trip—or a validator-gated Vulkan/OpenGL SPIR-V
+assembly round trip—when the preferred high-level lane has no complete route.
+The recovery diagnostics retain both the preferred failure and the selected
+fallback. Cross-format choice remains a static planning decision: runtime
+failure never silently changes the requested editable format. Instead,
+`prepare_shader_workspace` automatically executes the finite hash-bound
+same-format alternate route pairs in isolated sibling workspaces. When that
+frontier is exhausted and a compiler is available, it publishes a review-only
+provisional source path bound to the native representation so the Agent can
+construct source and continue through promotion, compilation and replay ABI
+validation. SPIR-V assembly becomes an automatic native-IR fallback only when
+its direct disassembler, direct assembler and exactly one fixed `spirv-val`
+capability are integrity-valid. Selection alone is not publication: the
+workspace must run the bound validator on the captured baseline and the
+untouched disassemble/assemble output before writing the editable source, then
+validate the baseline and output again for every edited candidate compile. Any
+missing, ambiguous, changed or failing validator leaves the source/revision
+unpublished. An older integration may still pass both
 `decompiler_tool_id` and `compiler_tool_id` to request its registered direct
 single-hop workflow.
 
 An explicit `editable_format="hlsl"` keeps the HLSL recovery/AI-construction
 lane and never silently changes language. Explicit `dxbc-asm` or `dxil-asm`
-forces the corresponding instruction lane. Native-IR output is stored as
-`source/shader.dxbc.asm` or `source/shader.dxil.ll`; the AI may review it but
-the HLSL organiser is disabled.
+forces the corresponding instruction lane. Explicit `spirv-asm` and
+`opengl-spirv-asm` do **not** bypass the validator gate: every native SPIR-V
+source or compile lane requires the same unique, integrity-valid `spirv-val`
+binding. Native-IR output is stored as `source/shader.dxbc.asm` or
+`source/shader.dxil.ll`; the AI may review it but the HLSL organiser is
+disabled. SPIR-V native output uses `source/shader.spvasm` or
+`source/shader.opengl.spvasm`.
+
+New routed workspaces use route-plan v2. In addition to every route hop, its
+mandatory native-SPIR-V validator binding contains the validator capability,
+operation/config digest, executable SHA-256 and fixed-file hashes. Successful
+validator jobs retain the exact input artifact path, input byte size and hash,
+physical format detection, job-local copied input, stdout/stderr paths and
+hashes, exit status and complete immutable binding. `status`, compile and
+candidate validation re-read those files and hashes; changing a validator input
+or log invalidates the provenance. Route-plan v1 remains readable for status
+and historical evidence, but a native SPIR-V v1 plan cannot publish editable
+source, promote source, compile, or import a compiled candidate. It has no
+validator binding and is never upgraded in place or treated as evidence that
+the strict SPIR-V gate ran; a new v2 workspace must be created instead. Deleting
+`validators` from v2 and recomputing `planSha256` is rejected.
 
 If the event/stage resolves to zero or multiple shaders, preparation stops. It
 does not guess.
@@ -373,6 +463,31 @@ WGSL, Slang, MSL, ShaderLab/ShaderGraph and SPIR-V text, plus embedded
 DXBC/DXIL/SPIR-V/Metal library candidates. It limits file count, per-file and
 total bytes, candidate count and source-preview bytes, and never executes a
 script/compiler from the asset tree.
+
+After preparation, prefer
+`query_active_shader_asset_evidence(event_id, stage, top_k)` for capture-bound
+analysis. The query accepts no filesystem or database path, opens only
+`shared/dictionaries/assets/symbols-v3.sqlite3` in SQLite read-only/query-only
+mode, verifies the current active-project/full-catalog binding and freezes the
+capture/session/EID/stage/resource/entry/raw-hash/catalog identity. Missing
+configuration, catalog or database returns `ready=false` plus
+`requiredAction=prepare_active_capture_project`; it is a recoverable state, not
+permission to fabricate a match or an instruction to mutate the project. For
+read-only analysis, record `reasonCode` as the skipped reason and continue with
+capture evidence. Call `prepare_active_capture_project` only when both project
+and UI effects are already authorized and asset correlation is required by an
+acceptance criterion. The response separates `observed` relations
+from `inferred` hints and persists no new relation by itself.
+`candidateCount=0` proves only that the bounded query found no match in the
+frozen catalog/database snapshot; it neither proves nor disproves a concrete
+Shader/asset relationship.
+
+The current symbol schema has Shader, capture, match, alias and CBuffer evidence,
+but no typed material entity or authoritative material-to-Shader/include graph.
+Material-like path or metadata tokens are therefore only bounded inferred hints;
+`materialEvidence.observedEntities` remains empty. Future material providers must emit a
+trusted, versioned, hash-bound schema before those edges can be treated as
+observed project knowledge.
 
 Evidence levels deliberately remain distinct:
 
@@ -425,11 +540,13 @@ history entry. Before replay reflection, the response reports:
     "supportedByTheseTools": true,
     "supportedByThisOperation": false,
     "supportedCaptureScope": {
-      "apis": ["D3D11", "D3D12"],
-      "containerKinds": ["DXBC", "DXIL"],
+      "apis": ["D3D11", "D3D12", "Vulkan", "OpenGL"],
+      "containerKinds": ["DXBC", "DXIL", "SPIRV", "OPENGL-SPIRV"],
       "combinations": [
         {"api": "D3D11", "containerKinds": ["DXBC"]},
-        {"api": "D3D12", "containerKinds": ["DXBC", "DXIL"]}
+        {"api": "D3D12", "containerKinds": ["DXBC", "DXIL"]},
+        {"api": "Vulkan", "containerKinds": ["SPIRV"]},
+        {"api": "OpenGL", "containerKinds": ["OPENGL-SPIRV"]}
       ]
     },
     "candidateScopeStatus": "not-evaluated",
@@ -440,9 +557,10 @@ history entry. Before replay reflection, the response reports:
 
 `supportedByTheseTools` is retained as a host-capability flag. It is not a
 claim about the current candidate. `candidateScopeStatus` can become
-`supported-after-fresh-gates` only for D3D11 plus native DXBC or D3D12 plus
-native DXBC/DXIL; other combinations are `unsupported`, and unresolved status
-is `not-evaluated`. Explicit live ABI/event gates still run during apply.
+`supported-after-fresh-gates` only for D3D11/native DXBC,
+D3D12/native DXBC or DXIL, Vulkan/native SPIR-V, or OpenGL/native OpenGL SPIR-V;
+other combinations are `unsupported`, and unresolved status is `not-evaluated`.
+Fresh replay ABI, live-event, stage, and backend gates still run during apply.
 
 ### Transactional AI source organisation
 
@@ -457,8 +575,9 @@ begin_shader_workspace_organization(
 ```
 
 `begin` takes the shared source-transaction lease, preserves the byte-for-byte
-decompiler output, snapshots the current editable source, compiles it with the
-bound route and performs fresh replay ABI validation. When an EventId is
+decompiler output and snapshots the current editable source. It reuses valid
+Host compile/ABI evidence bound to these exact bytes; otherwise it compiles
+with the fixed route and validates the current candidate. When an EventId is
 provided, the immutable semantic context also contains the capture/session,
 bound textures and pipeline evidence; it includes the current
 `reconstructionFidelity` record. The call returns fixed paths under one
@@ -468,6 +587,7 @@ organisation session:
 organized-proposal.hlsl   # the only HLSL file AI may change
 analysis.md               # inferred algorithm/resource meaning, labelled as such
 flowchart.mmd              # bounded Mermaid without click/URL/HTML/init directives
+module-descriptions.json  # bounded AI descriptions keyed only by discovered function name
 semantic-context.json     # fixed evidence, not an AI-editable authority
 ```
 
@@ -490,35 +610,188 @@ review_shader_workspace_organization(
 )
 ```
 
-`review` obtains the same lease used by watchers, rereads all bindings, and
-recompiles/freshly ABI-validates the untouched baseline immediately before
-testing the proposal. It performs a source compare-and-swap, compiles and
-freshly ABI-validates the proposal, and promotes it only when its executable
-`codeSha256` exactly equals that authoritative same-route baseline. The final
+`review` obtains the same lease used by watchers, rereads all bindings and
+reuses the current validated baseline when still fresh. It performs a source
+compare-and-swap and compiles/ABI-validates the proposal when needed. Promotion
+uses the cheapest sufficient check:
+
+- `exact-code`: candidate executable code bytes match the reconstructed baseline.
+- `rename-only`: the fixed token checker proves only declared names, comments
+  and whitespace changed. DXIL names may change its code hash.
+- `observational-pass`: for other AI restructuring, the Host temporarily runs
+  both candidates from the same captured event inputs, measures output with
+  fixed absolute/relative floating-point tolerances, stricter depth tolerances
+  and exact integer comparison, then restores replay state. This is bounded
+  output evidence, never proof for all inputs.
+
+Substantial proposals should be reviewed in a few complete-function or meaningful
+computation-stage batches; small edits are combined, not reviewed every few
+lines. There is no model-authored test-vector loop. Unsupported sampling is not
+a pass. Current numerical support is deliberately bounded; read the returned
+scope, counts, tolerances and unsupported diagnostics rather than extrapolating
+to unmeasured outputs or other stages.
+
+The comparator reads complete bound color/depth output data in one replay
+callback, using the RTV/DSV view format when the underlying texture is typeless.
+It supports single-sample, single-layer 2D views with a 32 MiB per-resource and
+64 MiB total budget. Enum names are normalized, including the valid
+`ResourceFormatType.Regular = 0`; the bound output `Descriptor.numSlices`
+determines the layer count. Unsupported outputs reject rather than silently
+reducing the measured region.
+
+Float tolerances are absolute `1e-4` plus relative `1e-3`; half-float color has
+an absolute floor of `1/1024`, depth uses absolute `1e-6`, normalized color
+allows one storage quantization step, and integers are exact. Every component
+must pass; NaN/Inf are rejected and an average cannot hide isolated failures.
+For `comparisonKind=numeric-components`, `comparedComponents` counts decoded
+values. An unsupported packed format can pass only by identical storage bytes:
+`comparisonKind=byte-exact` then counts bytes in the same legacy field. A
+changed packed format is unsupported. Top-level `sampleCount` sums these
+counts and must not be described as a pixel count or uniformly numeric samples.
+
+An unsupported observation returns `accepted=false`, `sampleCount=0` and a
+reason only after the callback confirms restoration of the previous replay
+mapping. A restoration failure remains an RPC error; it cannot report
+`replayRestored=true`. If `BuildTargetShader` deduplicates the baseline bytes to
+the captured original ResourceId, observation runs the original pipeline
+directly instead of trying to replace a Shader with itself.
+
+Publication checks the process-sealed decision, source bindings, declared
+rename proof or complete Host observation. Editable JSON alone grants no
+authority. Neither source nor executable hash equality is a universal gate;
+hashes still identify which exact files and candidates each check covered. The final
 gate binds workspace/capture/stage/entry, source SHA-256, revision, candidate
 raw/code SHA-256 and fresh ABI request/report hashes. The completed session and
 supporting evidence are committed before `ai/organize-code-gate.json` can say
 `safeToStartLiveEdit=true`.
 
-If executable code differs, the proposal is retained as
-`organized-provisional.hlsl`, the baseline source is restored and recompiled/
-ABI-validated, and live edit stays blocked. A compiler/ABI/concurrency failure
-also restores the baseline when that can be done without overwriting newer
-editor bytes. Organisation never applies a Shader. Exact proposal/baseline
-code equality proves only that the readability rewrite preserved the
-reconstructed baseline produced by that route; it does not prove that the
-reconstructed baseline equals the captured executable or the original source.
+The same review also publishes `ai/flow-graph.json` using schema
+`replaylab-shader-flow-graph/v1`. Function locations and caller-to-callee edges
+are parsed deterministically from the final source that actually remains in the
+workspace; AI can only fill the bounded descriptions for function names already
+present in the begin template. The graph is bound to workspace ID, source
+SHA-256, revision, stage and entry point, and is navigation-only: it is not
+physical evidence and grants no compile, ABI or Apply authority. The Shader
+Workspace displays this graph beside the editor, retains per-Shader node
+positions, and marks it out of date after later source edits instead of treating
+old relationships as current.
 
-For a deliberately code-changing readability rewrite (for example replacing a
-recognised scalar idiom with `lerp`, grouping channels, or introducing a helper
-whose optimisation changes DXIL), exact-code organisation intentionally remains
-provisional. With explicit user intent, the AI may instead run the normal
-one-shot source edit -> compile -> fresh ABI -> apply transaction and compare
-the exact event outputs before and after with `fingerprint_event_outputs`.
-Exact subresource hashes are strongest; bounded pixel-grid comparisons are only
-observational evidence and must report their scope/tolerance. They do not turn
-`semanticEquivalenceVerified` true and they do not cover unobserved inputs,
-other events, undefined behaviour, derivatives, races or temporal state.
+For a project-publication or full-lifecycle route, the explicit generic compile
+and replay-ABI preflight runs before `begin`/`review`. The review above is the
+final source/candidate transaction: after it accepts, the route may apply that
+exact candidate and may call `register_active_project_workspace`, but it must
+not call `compile_shader_workspace` in between. Registration reparses the
+organization gate and requires its `finalRevision` to equal the manifest's
+current `latest` revision; any intervening editor change or compile therefore
+blocks publication. Apply and registration also revalidate the sealed hashes
+and ABI evidence independently.
+
+When no review path passes, the proposal remains `organized-provisional.hlsl`
+and the source is restored to the compiled, ABI-validated baseline. An ordinary
+rejection leaves the same session open for correction and review. At the bounded
+round limit, `softAccepted` / `soft-accepted-baseline` publishes that usable
+baseline with explanatory documents; its sealed final binding identifies the
+baseline, not the rejected proposal. It can be registered and edited. Opening a
+new session to evade the exhausted budget is not permitted.
+
+A compiler/ABI/concurrency failure restores the baseline only when it can do
+so without overwriting newer editor bytes. Temporary numerical comparison
+requires the `workspace + replay` effects and must restore replay state; it
+does not authorize permanent replacement. Registration opens the editor and
+requires `project + ui`. Every review path leaves
+`semanticEquivalenceVerified=false`: none proves that all possible inputs
+match the captured executable or recovers the original source.
+
+`rename_shader_workspace_symbols` also uses the existing external CBuffer alias
+store for inferred block/member names. The captured block's original top-level
+names/offsets determine its layout key; a generated HLSL layout key can point
+to an entirely different file. The new Host identity path retains raw reflection,
+matches blocks by bind/space and maps only unique equal-width leaf regions.
+Unknown/overlapping fields remain unmapped; a confirmed block alias can still
+be stored. User aliases take priority. Actual display on the captured CBuffer
+must be verified separately from a successful file write. Display aliases do
+not change original reflection or resource bindings.
+
+Ordinary user editing is a separate operation: new source and compiled code
+hashes are expected. A save compares the editor's last observed hash with the
+current disk bytes to avoid overwriting a newer edit, then compiles the new
+source into a new revision. Apply requires that revision's current source,
+candidate, capture identity and fresh ABI evidence; it does not require the
+edited executable to equal the untouched reconstruction. An old organization
+review or ABI receipt cannot authorize different edited bytes.
+
+After a successful user edit is actually applied, explicit replacement
+registration has its own current-source/candidate/ABI readback path for project
+synchronization. It does not require the old
+AI organization verdict or treat the user's new computation as a rejected
+readability change. It excludes stale analysis and flow-chart artifacts.
+Ordinary temporary saves do not automatically overwrite the project's shared
+head. The first organized HLSL and its explanatory artifacts are saved by the
+reviewed-workspace registration path.
+Matching shaders in another RDC may reuse project HLSL; each target capture
+still needs a new exact binding and compatible current candidate before apply.
+
+The September 5 recovery of `6.rdc`, EID 11329, `fragment/MainPS` passed fresh
+replay ABI and a captured-original versus recompiled-candidate observation.
+The 1920x1080 `R16G16B16A16_FLOAT` target had 8,294,400 numeric components,
+maximum absolute error `6.103515625e-05`, and zero failed components. The
+`D32S8` target's 16,588,800 stored bytes were identical. Replay was restored;
+the observation took about 37.4 seconds and does not prove all-input semantic
+equivalence. The later organized source used the `exact-code` fast path and
+its canonical HLSL, analysis and generated flow graph were registered in the
+active project.
+
+The existing external alias store accepted six original-layout block aliases:
+`cbuffer0..5` map to `GlobalsCB`, `ViewCB`, `ToonMainLightCB`,
+`CartoonBasePassCB`, `MaterialCollection0CB`, and `MaterialCB`. Each returned
+`capturedIdentityMatched=true` and `blockAliasWritten=true`; ambiguous members
+were not mapped. These are AI display aliases with user precedence, not changes
+to reflection or a claim that stripped member names were recovered. Store
+write evidence does not establish the original CBuffer viewer's visual state.
+
+An independent process then used the deployed editor's actual
+`/replaylab/shader-source/save` client to change output Alpha from `0.0f` to
+`0.125f`. Both the edit and restoration returned HTTP 200, scheduled compile,
+passed apply at revisions 3 and 4, and restored the original source bytes.
+The native workspace readback independently showed `documentKind=live-edit`,
+the canonical source path and `readOnly=false`; the project-library document
+remained a separate read-only entry. The UI hash difference was traced to
+mixed line endings: the original has 3,190 CRLF endings and 35 lone LF endings;
+the actual `_document_source_text` save projection makes them all CRLF. Its
+233,304-byte result exactly matches both recorded UI hashes, with every line's
+content unchanged. `ShaderCodeEditor::GetText()` reads the full UTF-8 buffer;
+there is no fixed-length truncation or unresolved content mismatch. The raw
+save/restore evidence remains the real HTTP receipts and canonical file-byte
+readback. The separate `ui-editable-normalization.json` records the matching
+projection. Evidence is under repository
+`output/shader-workflow-20260905/`, particularly `final-recovery-observation.json`,
+`register_active_project_workspace.json`, `rename_shader_workspace_symbols.json`,
+`live-save-summary.json`, the two `live-save-*-http-response.json` files and
+`ui-editable.json`.
+
+Final Development deployment and editable delivery are complete.
+`final-deployment.json` verifies all three frozen executables against build
+outputs and five changed Bridge modules against repository source; the Bridge
+deployment updated 16 files. The deployment guard checks processes belonging
+to the target application directory, so an unrelated original RenderDoc under
+`Program Files` and its loaded capture remain unaffected. The restarted
+Development application loaded `6.rdc` and delivered the final workspace at
+`D:\Study\抓帧\ReplayLab Project\workspaces\shaders\v2\recovery-11329-20260905-ready`.
+
+`final-delivery-check.json` records workspace ID
+`64939d93b3f6454e9e11c21277b91909`, revision 2, fresh ABI validation,
+`applied=true`, and `liveState=running`. The canonical document is editable and
+its text matches the actual newline projection; the project's saved HLSL
+matches the canonical raw bytes. The flow graph was regenerated and published
+for this revision (`flowGraphCurrent=true`), with the analysis and generated
+Mermaid paths read back. A separate caller's unchanged-source save succeeded
+on the final internal Host with `changed=false/compileScheduled=false`.
+The live session remains running for the user. This completes this capture's
+recovery, organization, compile/apply, project publication and editing flow.
+The earlier `...-final` functional-edit/restore evidence is kept separate from
+this `...-ready` delivery. An additional restart-resume test of the new ready
+session and actual reuse in a different RDC were not performed in this run;
+cross-capture apply still requires the existing exact rebind and fresh ABI.
 
 ## Deterministic replay ABI gate
 
@@ -586,7 +859,15 @@ An exact match writes an immutable `revisions/<n>/abi-report.json`, changes only
 that candidate to `replay-reflection-abi-compatible`, and reports
 `replayAbiValidated=true`. The report is hash-bound in the manifest and is fully
 reparsed and recomputed on every later status/compile operation. ABI mismatch
-returns bounded field-level differences and leaves the candidate pending.
+returns bounded field-level differences and persists an immutable rejection
+report under that revision. `get_shader_workspace_status` returns
+`abiValidationStatus="incompatible"` and `lastAbiAttempt` with the comparison
+and report binding. The candidate remains unauthorized; a fresh rejection
+also revokes any older cached compatible result for those same bytes. Its
+internal `abiGate` remains pending, which is an authorization state and must
+not override the persisted diagnostic. Editing the source changes the
+diagnostic to `source-changed`; a newly compiled revision does not inherit
+the old failure. Repeated identical differences retain the first report.
 Revalidating an already-compatible revision still requires a fresh bridge
 reflection but idempotently retains the first audit report.
 
@@ -620,11 +901,12 @@ the candidate can be called with the same signatures, bindings and layouts—it
 does not say its instructions calculate the same values.
 
 The ABI gate itself does not install a replacement, does not change `lastGood`,
-and does not by itself authorize an apply. It accepts native DXBC for D3D11 and
-native DXBC/DXIL for D3D12. D3D11 dynamic-linkage interfaces, Vulkan/OpenGL,
-ray libraries and remote replay remain fail-closed. D3D12 shared-resource apply
-adds the checked all-affected-PSO transaction described below; this does not
-authorize root-signature, descriptor or CBuffer mutation.
+and does not by itself authorize an apply. It accepts native DXBC for D3D11,
+native DXBC/DXIL for D3D12, native SPIR-V for Vulkan, and native OpenGL SPIR-V
+for OpenGL. D3D11 dynamic-linkage interfaces, Ray/Library stages and remote
+replay remain fail-closed. D3D12/Vulkan/OpenGL shared-resource apply adds the
+checked all-affected-derived-pipeline transaction described below; this does
+not authorize root-signature, descriptor or CBuffer mutation.
 
 ## Default shared-resource apply and rollback
 
@@ -643,17 +925,30 @@ Distinct original ResourceIds are never merged merely because their bytes are
 equal, and a foreign/stock Editor replacement is never silently taken over.
 
 For D3D11, the target must be native DXBC. For D3D12, it may be native DXBC or
-DXIL and must use the checked transaction: before committing the replacement
-mapping, RenderDoc rebuilds and validates every affected graphics/compute PSO
-with that PSO's captured root signature. If any PSO cannot be rebuilt, no new
-mapping is committed and the generated target is released. This path reuses,
-but does not modify or synthesize, captured root signatures and descriptors.
+DXIL. Vulkan requires native SPIR-V and OpenGL requires native OpenGL SPIR-V.
+D3D12, Vulkan, and OpenGL use checked transactions: before committing the
+replacement mapping, RenderDoc builds and validates every affected
+graphics/compute PSO, Vulkan pipeline/shader object, or OpenGL program/program
+pipeline. If any derived object fails, no new mapping is committed and the new
+target is released. D3D12 reuses, but does not modify or synthesize, each
+captured root signature. Vulkan multi-entry modules, incomplete graphics
+pipeline libraries and Ray stages fail closed. OpenGL requires
+`GL_ARB_gl_spirv` and rejects `glCreateShaderProgramv` targets whose resource
+identity cannot yet be replaced transactionally.
 
 The successful response contains a `replacementId`. Roll it back with
 `rollback_shader_workspace_shared_resource`; rollback removes the replay and UI
 mapping and frees only the generated target. The captured original Shader is
 retained throughout. Event/family overrides described next are a separate,
 D3D11-only isolation tool, not the default shared edit scope.
+
+Shared-resource apply has replay effect only and never writes project state.
+When project persistence is explicitly authorized, a full-lifecycle route next
+calls `register_active_project_shader_replacement` with the exact successful
+revision, candidate SHA-256, and `replacementId`. That separate project-effect
+receipt commits reviewed workspace knowledge and the restart/restore binding;
+an inactive/read-only project fails that step without changing the already
+reported replay apply result.
 
 ## Event-scoped D3D11 apply and rollback
 
@@ -852,12 +1147,18 @@ the shared-resource apply transaction. The Host rechecks the binding just
 before mutation. Therefore a save arriving after revision N but before N+1
 finishes cannot cause N to be applied against newer source.
 
+This save-to-replay path covers conventional D3D11/D3D12, Vulkan, and OpenGL
+graphics/compute stages admitted by their backend gates. Ray/Library saves can
+still produce immutable compiled revisions, but are rejected before replay
+mutation until the required export/state-object/shader-group/SBT transaction is
+implemented.
+
 On success, status records `activeReplacement`, `lastGoodReplacement` and
 rollback evidence. On compile failure, ABI mismatch, capture/session change or
 apply failure, that save is rejected and the previous last-good replacement
 (or captured original when none exists) remains active. Failed bytes are not
 repeatedly retried; save different content or compile explicitly. The
-process-owned live-edit session started by `start_shader_workspace_live_edit`
+singleton-owned live-edit session started by `start_shader_workspace_live_edit`
 uses this same binding and gates rather than a weaker path. A capture-session
 switch stops the old monitor without applying stale work.
 
@@ -879,7 +1180,7 @@ Safety and lifetime limits are fixed in the host implementation:
 - the same fail-closed cross-process operation lock and trusted compiler
   binding used by manual compilation;
 - daemon worker threads that are signalled and given one bounded join window on
-  MCP server shutdown;
+  their owning Host's shutdown;
 - stopping never cancels an already running external compiler halfway through;
   it lets that attempt finish but schedules no later attempt.
 
@@ -891,6 +1192,24 @@ closed. JSON audit files and immutable revisions remain on disk. This
 implementation uses bounded content polling rather than an editor plugin or
 native filesystem notification API, so no IDE is granted a separate command
 execution channel.
+
+All five public live-edit operations (start/list/poll/stop/migrate) now forward
+through the private, purpose-built `/replaylab/shader-live-edit` endpoint to
+the same `ReplayLabInternal` manager that handles editor source saves. Ordinary
+Agent/MCP processes no longer resume or own persistent live-edit sessions.
+This fixes a split-process failure where start succeeded in an Agent process
+but a later editor save reached an internal manager that did not know its ID.
+The endpoint has a closed operation schema, authenticated fixed loopback
+transport, Host identity/generation checks, and exact caller instance/session/
+capture-path binding. Apply worker threads explicitly re-enter the stored
+binding rather than assuming the HTTP thread's ContextVar is inherited.
+
+Startup identity discovery reads the workspace and exact live instance
+manifest; it makes no synchronous qrenderdoc RPC while qrenderdoc may itself
+be waiting for internal-Host health. Fresh ABI/apply still verifies the live
+capture before mutation. Starting this singleton session and saving its
+canonical source use one manager and one workspace lease, even when the
+requesting Agent exits between the two operations.
 
 Resume itself neither requires qrender to have finished loading the capture
 nor replays the last compiled revision. Catalog rebinding is lazy at the fresh
@@ -939,8 +1258,10 @@ Shader understanding and executable editing are separate trust lanes:
   instruction-assembly paths above. Assembly is executable instruction
   text—not recovered high-level source—and still requires its captured-format
   checks and any available validator. AI organisation remains HLSL-only;
-  GLSL/assembly may be edited directly in an IDE. Only supported D3D candidates
-  can then enter fresh replay-reflection ABI validation and Apply.
+  GLSL/assembly may be edited directly in an IDE. Only candidates inside the
+  server-advertised checked combinations—D3D11/DXBC, D3D12/DXBC or DXIL,
+  Vulkan/SPIR-V, and OpenGL/OpenGL-SPIR-V—can then enter fresh replay-reflection
+  ABI validation and Apply, still subject to their stage and backend gates.
 - `explanatory-ir` stores RenderDoc-produced native disassembly, embedded
   source, or reviewed pseudocode below `explanation/`. AI may rename, comment,
   and reorganize this evidence for human understanding, but it may never send
@@ -981,7 +1302,10 @@ Implemented now:
   revalidates capture ID/path/API, full ShaderKey, baseline bytes and raw/code
   fingerprints; missing or rewritten provenance fails closed;
 - safe external decompile/edit/compile workspace lifecycle;
-- host-owned tool registry and MCP orchestration;
+- host-owned tool registry and task-scoped MCP service;
+- read-only active-project Shader asset correlation with exact catalog/database
+  binding, observed-versus-inferred relations, and non-mutating `ready=false`
+  fallback;
 - format/API/stage-aware DXBC, DXIL and Vulkan/OpenGL SPIR-V route planning,
   finite hash-bound route-pair recovery and non-empty evidence fallback;
 - proposal-only AI HLSL organisation with authoritative baseline/proposal
@@ -999,11 +1323,12 @@ Implemented now:
 - capture-bound output fingerprints for exact MRT/depth hashes plus a bounded
   deterministic pixel grid; this is observational comparison evidence, not a
   semantic proof or automatic Apply authorisation;
-- complete captured-interface persistence plus replay-reflected D3D11/DXBC and
-  D3D12/DXBC|DXIL ABI comparison with immutable validation reports;
-- default sharing-preserving D3D11/DXBC and checked D3D12/DXBC|DXIL resource
-  replacement, including transactional rebuild of every affected D3D12
-  graphics/compute PSO with its captured root signature;
+- complete captured-interface persistence plus replay-reflected D3D11/DXBC,
+  D3D12/DXBC|DXIL, Vulkan/SPIR-V and OpenGL/OpenGL-SPIR-V ABI comparison with
+  immutable validation reports;
+- default sharing-preserving D3D11/DXBC plus checked D3D12/DXBC|DXIL,
+  Vulkan/SPIR-V and OpenGL/OpenGL-SPIR-V resource replacement, including
+  transactional rebuild of every affected derived graphics/compute object;
 - capture-bound, event-scoped D3D11/DXBC Shader apply with target ownership,
   immediate replay refresh, supersede cleanup and explicit rollback;
 - durable revisions, logs, locks, and status reporting.
@@ -1013,8 +1338,8 @@ Not implemented by these tools:
 - a native Visual Studio/Rider plugin or OS filesystem-notification backend;
 - a proof that AI restructuring, ABI-compatible output or community-decompiled
   HLSL is semantically identical to the captured program;
-- Vulkan/OpenGL/SPIR-V live replacement, Metal/proprietary-cache providers,
-  ray-library replacement, remote replay, or universal vendor-ISA assembly;
+- Metal/proprietary-cache providers, Ray/Library state-object/SBT replacement,
+  remote replay, or universal vendor-ISA assembly;
 - semantic sliders/colour pickers or a new custom CBuffer binding. Event-scoped
   shadow-CBuffer/material sessions are implemented separately for local D3D11
   and bounded local D3D12 Root/descriptor-table CBVs. D3D12 root constants,

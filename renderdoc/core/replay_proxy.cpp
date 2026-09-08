@@ -29,6 +29,275 @@
 #include "replay/dummy_driver.h"
 #include "serialise/lz4io.h"
 
+namespace
+{
+// The outer packet is deliberately a single extension point. Future control operations change
+// this envelope version, not the ordinal layout of the existing replay proxy packets.
+static const uint64_t ReplayControlMaxPayload = 64ULL * 1024 * 1024;
+static const uint64_t ReplayControlMaxPatchBytes = 32ULL * 1024 * 1024;
+static const uint64_t ReplayControlOperations =
+    (1ULL << (uint32_t(ReplayControlOperation::BufferPatches) + 1)) - 1;
+
+template <typename SerialiserType>
+bool ControlBytes(SerialiserType &ser, bytebuf &bytes, uint64_t limit, bool memoryPayload)
+{
+  uint64_t size = bytes.size();
+  ser.Serialise("size"_lit, size);
+  if(ser.IsErrored() || size > limit)
+    return false;
+  if(ser.IsReading())
+  {
+    StreamReader *reader = ser.GetReader();
+    if(memoryPayload &&
+       (reader->GetOffset() > reader->GetSize() || size > reader->GetSize() - reader->GetOffset()))
+      return false;
+    bytes.resize(size_t(size));
+    return size == 0 || reader->Read(bytes.data(), size);
+  }
+  return size == 0 || ser.GetWriter()->Write(bytes.data(), size);
+}
+
+template <typename SerialiserType>
+bool ControlString(SerialiserType &ser, rdcstr &str, bool memoryPayload = true)
+{
+  bytebuf bytes;
+  if(ser.IsWriting())
+    bytes.assign((const byte *)str.c_str(), str.size());
+  if(!ControlBytes(ser, bytes, 4096, memoryPayload))
+    return false;
+  if(ser.IsReading())
+    str = bytes.empty() ? rdcstr() : rdcstr((const char *)bytes.data(), bytes.size());
+  return true;
+}
+
+static bytebuf ControlPayload(WriteSerialiser &ser)
+{
+  bytebuf ret;
+  ret.assign(ser.GetWriter()->GetData(), size_t(ser.GetWriter()->GetOffset()));
+  return ret;
+}
+
+static bool ControlPayloadFinished(ReadSerialiser &ser)
+{
+  return !ser.IsErrored() && ser.GetReader()->GetOffset() == ser.GetReader()->GetSize();
+}
+
+template <typename SerialiserType>
+bool ControlConfig(SerialiserType &ser, ReplayCheckpointConfig &config,
+                   rdcarray<ReplayCheckpointCandidate> &candidates)
+{
+  if(ser.IsWriting() && candidates.size() > 4096)
+    return false;
+  ser.Serialise("enabled"_lit, config.enabled);
+  ser.Serialise("byteBudget"_lit, config.byteBudget);
+  ser.Serialise("maxCheckpoints"_lit, config.maxCheckpoints);
+  ser.Serialise("minEventGap"_lit, config.minEventGap);
+  uint32_t count = uint32_t(candidates.size());
+  ser.Serialise("count"_lit, count);
+  if(ser.IsErrored() || count > 4096 || config.maxCheckpoints > 64)
+    return false;
+  if(ser.IsReading())
+    candidates.resize(count);
+  for(ReplayCheckpointCandidate &candidate : candidates)
+  {
+    ser.Serialise("eventId"_lit, candidate.eventId);
+    ser.Serialise("moduleId"_lit, candidate.moduleId);
+    ser.Serialise("priority"_lit, candidate.priority);
+    ser.Serialise("estimatedWritableBytes"_lit, candidate.estimatedWritableBytes);
+  }
+  return !ser.IsErrored();
+}
+
+template <typename SerialiserType>
+bool ControlStats(SerialiserType &ser, ReplayCheckpointStats &stats)
+{
+  if(ser.IsWriting() && stats.events.size() > 64)
+    return false;
+  ser.Serialise("supported"_lit, stats.supported);
+  ser.Serialise("enabled"_lit, stats.enabled);
+  ser.Serialise("hasInitialCheckpoint"_lit, stats.hasInitialCheckpoint);
+  ser.Serialise("checkpointCount"_lit, stats.checkpointCount);
+  ser.Serialise("allocatedBytes"_lit, stats.allocatedBytes);
+  ser.Serialise("sharedBytes"_lit, stats.sharedBytes);
+  ser.Serialise("builds"_lit, stats.builds);
+  ser.Serialise("hits"_lit, stats.hits);
+  ser.Serialise("misses"_lit, stats.misses);
+  ser.Serialise("invalidations"_lit, stats.invalidations);
+  ser.Serialise("rejected"_lit, stats.rejected);
+  ser.Serialise("lastResumeEvent"_lit, stats.lastResumeEvent);
+  ser.Serialise("lastSaveEvent"_lit, stats.lastSaveEvent);
+  uint32_t count = uint32_t(stats.events.size());
+  ser.Serialise("count"_lit, count);
+  if(ser.IsErrored() || count > 64)
+    return false;
+  if(ser.IsReading())
+    stats.events.resize(count);
+  for(uint32_t &eventId : stats.events)
+    ser.Serialise("eventId"_lit, eventId);
+  return ControlString(ser, stats.reason) && !ser.IsErrored();
+}
+
+template <typename SerialiserType>
+bool ControlPatches(SerialiserType &ser, rdcarray<ReplayBufferPatch> &patches)
+{
+  if(ser.IsWriting() && patches.size() > 512)
+    return false;
+  uint32_t count = uint32_t(patches.size());
+  ser.Serialise("count"_lit, count);
+  if(ser.IsErrored() || count > 512)
+    return false;
+  if(ser.IsReading())
+    patches.resize(count);
+  uint64_t remaining = ReplayControlMaxPatchBytes;
+  for(ReplayBufferPatch &patch : patches)
+  {
+    ser.Serialise("buffer"_lit, patch.buffer);
+    ser.Serialise("byteOffset"_lit, patch.byteOffset);
+    if(!ControlBytes(ser, patch.data, remaining, true))
+      return false;
+    remaining -= patch.data.size();
+  }
+  return !ser.IsErrored() && ValidateReplayBufferPatches(patches).empty();
+}
+
+// Decode and validate the whole operation before invoking the driver. In particular, no prefix of
+// a malformed patch array can become active remotely. This template also permits CPU-only tests.
+template <typename Driver>
+rdcstr DispatchReplayControl(Driver *driver, uint32_t version, uint32_t operation,
+                            const bytebuf &request, bytebuf &response)
+{
+  response.clear();
+  if(version != ReplayControlProtocolRevision)
+    return "replayControlProtocolVersionMismatch";
+  if(request.size() > ReplayControlMaxPayload)
+    return "replayControlPayloadTooLarge";
+  if(operation > uint32_t(ReplayControlOperation::BufferPatches))
+    return "replayControlOperationUnsupported";
+
+  ReadSerialiser input(new StreamReader(request), Ownership::Stream);
+  WriteSerialiser output(new StreamWriter(1024), Ownership::Stream);
+  ReplayControlOperation op = ReplayControlOperation(operation);
+  if(op == ReplayControlOperation::Capabilities)
+  {
+    if(!request.empty())
+      return "replayControlUnexpectedPayload";
+    uint32_t driverVersion = driver->GetReplayControlVersion();
+    uint64_t operations = driverVersion == 1 ? ReplayControlOperations : 1;
+    output.Serialise("version"_lit, driverVersion);
+    output.Serialise("operations"_lit, operations);
+  }
+  else
+  {
+    if(driver->GetReplayControlVersion() != 1)
+      return "replayControlDriverUnsupported";
+    if(op == ReplayControlOperation::ConfigureCheckpoints)
+    {
+      ReplayCheckpointConfig config;
+      rdcarray<ReplayCheckpointCandidate> candidates;
+      if(!ControlConfig(input, config, candidates) || !ControlPayloadFinished(input))
+        return "replayControlInvalidCheckpointConfig";
+      driver->ConfigureReplayCheckpoints(config, candidates);
+    }
+    else if(op == ReplayControlOperation::CheckpointStats)
+    {
+      if(!request.empty())
+        return "replayControlUnexpectedPayload";
+      ReplayCheckpointStats stats = driver->GetReplayCheckpointStats();
+      if(!ControlStats(output, stats))
+        return "replayControlInvalidCheckpointStats";
+    }
+    else if(op == ReplayControlOperation::InvalidateCheckpoints)
+    {
+      uint32_t firstAffectedEvent = 0;
+      input.Serialise("firstAffectedEvent"_lit, firstAffectedEvent);
+      if(!ControlPayloadFinished(input))
+        return "replayControlInvalidInvalidation";
+      driver->InvalidateReplayCheckpoints(firstAffectedEvent);
+    }
+    else if(op == ReplayControlOperation::BufferPatches)
+    {
+      rdcarray<ReplayBufferPatch> patches;
+      if(!ControlPatches(input, patches) || !ControlPayloadFinished(input))
+        return "replayControlInvalidBufferPatches";
+      rdcstr error = driver->SetReplayBufferPatches(patches);
+      if(!error.empty())
+        return error;
+      // A successful atomic replacement changes the replay input generation. Backends validate
+      // before committing; only then may dependent native replay caches be invalidated.
+      driver->ClearReplayCache();
+      uint32_t firstAffected = driver->GetReplayBufferPatchFirstAffectedEvent();
+      output.Serialise("firstAffectedEvent"_lit, firstAffected);
+    }
+  }
+  response = ControlPayload(output);
+  return rdcstr();
+}
+
+// Revision 5 adds the foreground prefix-only save restriction. Unknown bits and combinations must
+// fail before driver invocation, rather than silently making a forced replay into a reference.
+template <typename SerialiserType>
+bool ControlRequestFlags(SerialiserType &ser, ReplayProxyPacket packet, bool &bypass,
+                         bool &naturalReference, bool &prefixOnly)
+{
+  const uint32_t bypassBit = 1, naturalReferenceBit = 2, prefixOnlyBit = 4;
+  uint32_t flags = (bypass ? bypassBit : 0) | (naturalReference ? naturalReferenceBit : 0) |
+                   (prefixOnly ? prefixOnlyBit : 0);
+  const auto valid = [&]() {
+    return (flags & ~(bypassBit | naturalReferenceBit | prefixOnlyBit)) == 0 &&
+           (!(flags & naturalReferenceBit) ||
+            ((flags & bypassBit) && packet == eReplayProxy_ReplayLog)) &&
+           (!(flags & prefixOnlyBit) ||
+            (!(flags & (bypassBit | naturalReferenceBit)) && packet == eReplayProxy_ReplayLog));
+  };
+  if(ser.IsWriting() && !valid())
+    return false;
+  ser.Serialise("replayRequestFlags"_lit, flags);
+  if(ser.IsErrored() || !valid())
+    return false;
+  bypass = (flags & bypassBit) != 0;
+  naturalReference = (flags & naturalReferenceBit) != 0;
+  prefixOnly = (flags & prefixOnlyBit) != 0;
+  return true;
+}
+
+template <typename Driver>
+struct ScopedRemoteCheckpointBypass
+{
+  Driver *driver;
+  bool previous = false;
+  bool previousNaturalReference = false;
+  bool previousPrefixOnly = false;
+  ScopedRemoteCheckpointBypass(Driver *d, bool requested, bool naturalReference = false,
+                               bool prefixOnly = false) : driver(d)
+  {
+    if(driver)
+    {
+      previous = driver->ExchangeReplayCheckpointBypass(requested);
+      previousNaturalReference =
+          driver->ExchangeReplayCheckpointNaturalReference(naturalReference);
+      previousPrefixOnly = driver->ExchangeReplayCheckpointPrefixOnly(prefixOnly);
+      if(previous && !requested)
+        driver->ExchangeReplayCheckpointBypass(true);
+      // A nested request may not weaken an outer force/analysis guard. Non-ReplayLog requests
+      // always enter with naturalReference=false, even within an automatic reference scope.
+      driver->ExchangeReplayCheckpointNaturalReference(
+          requested && naturalReference && (!previous || previousNaturalReference));
+      driver->ExchangeReplayCheckpointPrefixOnly(
+          !requested && !previous && (prefixOnly || previousPrefixOnly));
+    }
+  }
+  ~ScopedRemoteCheckpointBypass()
+  {
+    if(driver)
+    {
+      driver->ExchangeReplayCheckpointBypass(previous);
+      driver->ExchangeReplayCheckpointNaturalReference(previousNaturalReference);
+      driver->ExchangeReplayCheckpointPrefixOnly(previousPrefixOnly);
+    }
+  }
+};
+};    // namespace
+
 template <>
 rdcstr DoStringise(const ReplayProxyPacket &el)
 {
@@ -38,6 +307,7 @@ rdcstr DoStringise(const ReplayProxyPacket &el)
     STRINGISE_ENUM_NAMED(eReplayProxy_RemoteExecutionFinished, "RemoteExecutionFinished");
 
     STRINGISE_ENUM_NAMED(eReplayProxy_ReplayLog, "ReplayLog");
+    STRINGISE_ENUM_NAMED(eReplayProxy_ReplayControl, "ReplayControl");
 
     STRINGISE_ENUM_NAMED(eReplayProxy_CacheBufferData, "CacheBufferData");
     STRINGISE_ENUM_NAMED(eReplayProxy_CacheTextureData, "CacheTextureData");
@@ -118,10 +388,23 @@ rdcstr DoStringise(const ReplayProxyPacket &el)
 // begins the set of parameters. Note that we only begin a chunk when writing (sending a request to
 // the remote server), since on reading the chunk has already been begun to read the type to
 // dispatch to the correct function.
-#define BEGIN_PARAMS()             \
-  ParamSerialiser &ser = paramser; \
-  if(ser.IsWriting())              \
-    ser.BeginChunk(packet, 0);
+#define BEGIN_PARAMS()                                                                    \
+  ParamSerialiser &ser = paramser;                                                        \
+  if(ser.IsWriting())                                                                     \
+    ser.BeginChunk(packet, 0);                                                            \
+  bool checkpointBypass = m_ReplayCheckpointBypass;                                        \
+  bool naturalReference = packet == eReplayProxy_ReplayLog &&                              \
+                          m_ReplayCheckpointNaturalReference;                            \
+  bool prefixOnly = packet == eReplayProxy_ReplayLog && !checkpointBypass &&               \
+                    m_ReplayCheckpointPrefixOnly;                                        \
+  if(!ControlRequestFlags(ser, packet, checkpointBypass, naturalReference, prefixOnly))      \
+    m_IsErrored = true;                                                                   \
+  else if(ser.IsReading())                                                                \
+  {                                                                                      \
+    m_RequestCheckpointBypass = checkpointBypass;                                          \
+    m_RequestCheckpointNaturalReference = naturalReference;                               \
+    m_RequestCheckpointPrefixOnly = prefixOnly;                                           \
+  }
 
 // end the set of parameters, and that chunk.
 #define END_PARAMS()                                \
@@ -179,7 +462,10 @@ rdcstr DoStringise(const ReplayProxyPacket &el)
 struct RemoteExecution
 {
   ReplayProxy *m_Proxy;
+  ScopedRemoteCheckpointBypass<IRemoteDriver> m_Bypass;
   RemoteExecution(ReplayProxy *proxy)
+      : m_Bypass(proxy->m_IsErrored ? NULL : proxy->m_Remote, proxy->m_RequestCheckpointBypass,
+                 proxy->m_RequestCheckpointNaturalReference, proxy->m_RequestCheckpointPrefixOnly)
   {
     m_Proxy = proxy;
     m_Proxy->BeginRemoteExecution();
@@ -251,6 +537,7 @@ ReplayProxy::ReplayProxy(ReadSerialiser &reader, WriteSerialiser &writer, IRepla
 
   ReplayProxy::GetAPIProperties();
   ReplayProxy::FetchStructuredFile();
+  QueryReplayControlCapabilities();
 }
 
 ReplayProxy::~ReplayProxy()
@@ -277,6 +564,175 @@ ReplayProxy::~ReplayProxy()
 }
 
 #pragma region Proxied Functions
+
+template <typename ParamSerialiser, typename ReturnSerialiser>
+rdcstr ReplayProxy::Proxied_ReplayControl(ParamSerialiser &paramser, ReturnSerialiser &retser,
+                                        uint32_t operation, const bytebuf &request, bytebuf &response)
+{
+  const ReplayProxyPacket expectedPacket = eReplayProxy_ReplayControl;
+  ReplayProxyPacket packet = eReplayProxy_ReplayControl;
+  uint32_t version = ReplayControlProtocolRevision;
+  bytebuf wireRequest = request;
+  rdcstr error;
+  {
+    BEGIN_PARAMS();
+    ser.Serialise("version"_lit, version);
+    ser.Serialise("operation"_lit, operation);
+    // Do not allocate a remotely supplied unbounded bytebuf. An invalid outer length makes the
+    // connection unusable: close it instead of trying to skip attacker-selected amounts of data.
+    if(!ControlBytes(ser, wireRequest, ReplayControlMaxPayload, false))
+    {
+      m_IsErrored = true;
+      return "replayControlInvalidEnvelope";
+    }
+    END_PARAMS();
+  }
+  {
+    REMOTE_EXECUTION();
+    if(paramser.IsReading() && !paramser.IsErrored() && !m_IsErrored)
+      error = DispatchReplayControl(m_Remote, version, operation, wireRequest, response);
+  }
+  {
+    RDResult fatalStatus = ResultCode::Succeeded;
+    if(m_RemoteServer)
+      fatalStatus = m_Remote->FatalErrorCheck();
+    ReturnSerialiser &ser = retser;
+    PACKET_HEADER(packet);
+    if(!ControlString(ser, error, false) ||
+       !ControlBytes(ser, response, ReplayControlMaxPayload, false))
+    {
+      m_IsErrored = true;
+      return "replayControlInvalidResponseEnvelope";
+    }
+    ser.Serialise("fatalStatus"_lit, fatalStatus);
+    ser.Serialise("packet"_lit, packet);
+    ser.EndChunk();
+    if(fatalStatus != ResultCode::Succeeded && m_FatalError == ResultCode::Succeeded)
+      m_FatalError = fatalStatus;
+    if(CheckError(packet, expectedPacket))
+      return "replayControlTransportFailed";
+  }
+  return error;
+}
+
+rdcstr ReplayProxy::ReplayControl(uint32_t operation, const bytebuf &request, bytebuf &response)
+{
+  PROXY_FUNCTION(ReplayControl, operation, request, response);
+}
+
+rdcstr ReplayProxy::ReplayControlRequest(ReplayControlOperation operation, const bytebuf &request,
+                                       bytebuf &response)
+{
+  response.clear();
+  if(m_IsErrored || m_Reader.IsErrored() || m_Writer.IsErrored())
+    return "replayControlTransportFailed";
+  if(operation != ReplayControlOperation::Capabilities &&
+     (m_RemoteControlVersion != 1 ||
+      (m_RemoteControlOperations & (1ULL << uint32_t(operation))) == 0))
+    return "replayControlDriverUnsupported";
+  return ReplayControl(uint32_t(operation), request, response);
+}
+
+void ReplayProxy::QueryReplayControlCapabilities()
+{
+  bytebuf response;
+  m_CheckpointControlError =
+      ReplayControlRequest(ReplayControlOperation::Capabilities, bytebuf(), response);
+  if(m_CheckpointControlError.empty())
+  {
+    ReadSerialiser ser(new StreamReader(response), Ownership::Stream);
+    ser.Serialise("version"_lit, m_RemoteControlVersion);
+    ser.Serialise("operations"_lit, m_RemoteControlOperations);
+    if(!ControlPayloadFinished(ser))
+    {
+      m_RemoteControlVersion = 0;
+      m_RemoteControlOperations = 0;
+      m_CheckpointControlError = "replayControlInvalidCapabilities";
+    }
+    else if(m_RemoteControlVersion != 1)
+      m_CheckpointControlError = "replayControlDriverUnsupported";
+  }
+  if(!m_CheckpointControlError.empty())
+    RDCWARN("Remote replay control unavailable: %s", m_CheckpointControlError.c_str());
+}
+
+void ReplayProxy::ConfigureReplayCheckpoints(
+    const ReplayCheckpointConfig &config, const rdcarray<ReplayCheckpointCandidate> &candidates)
+{
+  ReplayCheckpointConfig wireConfig = config;
+  rdcarray<ReplayCheckpointCandidate> wireCandidates = candidates;
+  WriteSerialiser ser(new StreamWriter(1024), Ownership::Stream);
+  bytebuf response;
+  if(!ControlConfig(ser, wireConfig, wireCandidates))
+    m_CheckpointControlError = "replayControlInvalidCheckpointConfig";
+  else
+    m_CheckpointControlError = ReplayControlRequest(
+        ReplayControlOperation::ConfigureCheckpoints, ControlPayload(ser), response);
+  if(!m_CheckpointControlError.empty())
+    RDCWARN("Remote checkpoint configuration failed: %s", m_CheckpointControlError.c_str());
+}
+
+void ReplayProxy::InvalidateReplayCheckpoints(uint32_t firstAffectedEvent)
+{
+  WriteSerialiser ser(new StreamWriter(1024), Ownership::Stream);
+  ser.Serialise("firstAffectedEvent"_lit, firstAffectedEvent);
+  bytebuf response;
+  rdcstr error = ReplayControlRequest(ReplayControlOperation::InvalidateCheckpoints,
+                                    ControlPayload(ser), response);
+  if(!error.empty())
+  {
+    m_CheckpointControlError = error;
+    RDCWARN("Remote checkpoint invalidation failed: %s", error.c_str());
+  }
+}
+
+ReplayCheckpointStats ReplayProxy::GetReplayCheckpointStats()
+{
+  ReplayCheckpointStats stats;
+  bytebuf response;
+  rdcstr error = ReplayControlRequest(ReplayControlOperation::CheckpointStats, bytebuf(), response);
+  if(error.empty())
+  {
+    ReadSerialiser ser(new StreamReader(response), Ownership::Stream);
+    if(!ControlStats(ser, stats) || !ControlPayloadFinished(ser))
+    {
+      stats = ReplayCheckpointStats();
+      error = "replayControlInvalidCheckpointStats";
+    }
+  }
+  if(!error.empty())
+    stats.reason = error;
+  else if(!m_CheckpointControlError.empty())
+    stats.reason = m_CheckpointControlError;
+  return stats;
+}
+
+rdcstr ReplayProxy::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
+{
+  rdcstr error = ValidateReplayBufferPatches(patches);
+  if(!error.empty())
+    return error;
+  rdcarray<ReplayBufferPatch> wirePatches = patches;
+  WriteSerialiser ser(new StreamWriter(1024), Ownership::Stream);
+  if(!ControlPatches(ser, wirePatches))
+    return "replayControlInvalidBufferPatches";
+  bytebuf response;
+  error = ReplayControlRequest(ReplayControlOperation::BufferPatches, ControlPayload(ser), response);
+  if(error.empty())
+  {
+    ReadSerialiser result(new StreamReader(response), Ownership::Stream);
+    uint32_t firstAffected = 0;
+    result.Serialise("firstAffectedEvent"_lit, firstAffected);
+    if(!ControlPayloadFinished(result))
+      return "replayControlInvalidBufferPatchResult";
+    m_BufferPatchFirstAffected = firstAffected;
+    // Invalidate the client validity sets only. The byte baselines used by the delta transport
+    // must remain paired on both ends; clearing just the client would corrupt the next update.
+    m_TextureProxyCache.clear();
+    m_BufferProxyCache.clear();
+  }
+  return error;
+}
 
 template <typename ParamSerialiser, typename ReturnSerialiser>
 bool ReplayProxy::Proxied_NeedRemapForFetch(ParamSerialiser &paramser, ReturnSerialiser &retser,
@@ -1269,10 +1725,13 @@ rdcstr ReplayProxy::Proxied_DisassembleShader(ParamSerialiser &paramser, ReturnS
     END_PARAMS();
   }
 
-  if(paramser.IsReading() && !paramser.IsErrored() && !m_IsErrored)
   {
-    refl = m_Remote->GetShader(pipeline, Shader, EntryPoint);
-    ret = m_Remote->DisassembleShader(pipeline, refl, target);
+    REMOTE_EXECUTION();
+    if(paramser.IsReading() && !paramser.IsErrored() && !m_IsErrored)
+    {
+      refl = m_Remote->GetShader(pipeline, Shader, EntryPoint);
+      ret = m_Remote->DisassembleShader(pipeline, refl, target);
+    }
   }
 
   SERIALISE_RETURN(ret);
@@ -3092,6 +3551,12 @@ bool ReplayProxy::Tick(int type)
 
   switch(packet)
   {
+    case eReplayProxy_ReplayControl:
+    {
+      bytebuf response;
+      ReplayControl(0, bytebuf(), response);
+      break;
+    }
     case eReplayProxy_CacheBufferData: CacheBufferData(ResourceId()); break;
     case eReplayProxy_CacheTextureData:
       CacheTextureData(ResourceId(), Subresource(), GetTextureDataParams());
@@ -3200,3 +3665,373 @@ bool ReplayProxy::Tick(int type)
 
   return true;
 }
+
+#if ENABLED(ENABLE_UNIT_TESTS)
+#include "catch/catch.hpp"
+
+namespace
+{
+struct ReplayControlTestDriver
+{
+  uint32_t version = 1;
+  bool bypass = false;
+  bool naturalReference = false;
+  bool prefixOnly = false;
+  bool rejectPatch = false;
+  uint32_t configurations = 0, invalidations = 0, clears = 0, patchCalls = 0;
+  uint32_t firstInvalidation = ~0U;
+  uint32_t bufferPatchFirstAffected = 0;
+  ReplayCheckpointConfig config;
+  rdcarray<ReplayCheckpointCandidate> candidates;
+  ReplayCheckpointStats stats;
+  rdcarray<ReplayBufferPatch> patches;
+
+  uint32_t GetReplayControlVersion() const { return version; }
+  bool ExchangeReplayCheckpointBypass(bool value)
+  {
+    bool old = bypass;
+    bypass = value;
+    return old;
+  }
+  bool ExchangeReplayCheckpointNaturalReference(bool value)
+  {
+    bool old = naturalReference;
+    naturalReference = value;
+    return old;
+  }
+  bool ExchangeReplayCheckpointPrefixOnly(bool value)
+  {
+    bool old = prefixOnly;
+    prefixOnly = value;
+    return old;
+  }
+  void ConfigureReplayCheckpoints(const ReplayCheckpointConfig &c,
+                                  const rdcarray<ReplayCheckpointCandidate> &p)
+  {
+    ++configurations;
+    config = c;
+    candidates = p;
+  }
+  ReplayCheckpointStats GetReplayCheckpointStats() { return stats; }
+  void InvalidateReplayCheckpoints(uint32_t first)
+  {
+    ++invalidations;
+    firstInvalidation = first;
+  }
+  void ClearReplayCache() { ++clears; }
+  uint32_t GetReplayBufferPatchFirstAffectedEvent() const { return bufferPatchFirstAffected; }
+  rdcstr SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &p)
+  {
+    ++patchCalls;
+    if(rejectPatch)
+      return "testBackendRejectedPatch";
+    patches = p;
+    return rdcstr();
+  }
+};
+};    // namespace
+
+TEST_CASE("Remote replay control validates version and complete payloads",
+          "[replay][proxy][checkpoint][checkpoints]")
+{
+  ReplayControlTestDriver driver;
+  bytebuf response;
+  auto dispatch = [&](ReplayControlOperation op, const bytebuf &request) {
+    return DispatchReplayControl(&driver, ReplayControlProtocolRevision, uint32_t(op), request,
+                                 response);
+  };
+
+  REQUIRE(dispatch(ReplayControlOperation::Capabilities, bytebuf()).empty());
+  {
+    ReadSerialiser ser(new StreamReader(response), Ownership::Stream);
+    uint32_t version = 0;
+    uint64_t operations = 0;
+    ser.Serialise("version"_lit, version);
+    ser.Serialise("operations"_lit, operations);
+    CHECK(version == 1);
+    CHECK(operations == ReplayControlOperations);
+    CHECK(ControlPayloadFinished(ser));
+  }
+  CHECK(ReplayControlHandshakeVersion(1043) != 1043);
+  CHECK((ReplayControlHandshakeVersion(1043) & 0xffffU) == 1043);
+  CHECK(((ReplayControlHandshakeVersion(1043) >> 16) & 0x7fffU) ==
+        ReplayControlProtocolRevision);
+  CHECK(ReplayControlProtocolRevision == 5);
+  CHECK(ReplayControlHandshakeVersion(1043) != (0x80000000U | (3U << 16) | 1043));
+  CHECK_FALSE(DispatchReplayControl(&driver, 3, 0, bytebuf(), response).empty());
+  CHECK_FALSE(DispatchReplayControl(&driver, 4, 0, bytebuf(), response).empty());
+  CHECK_FALSE(DispatchReplayControl(&driver, ReplayControlProtocolRevision + 1, 1, bytebuf(), response)
+                  .empty());
+  CHECK_FALSE(DispatchReplayControl(&driver, ReplayControlProtocolRevision, 999, bytebuf(), response)
+                  .empty());
+  CHECK(response.empty());
+
+  ReplayCheckpointConfig config;
+  config.byteBudget = (1ULL << 40) + 17;
+  config.maxCheckpoints = 7;
+  ReplayCheckpointCandidate candidate;
+  candidate.eventId = 300;
+  candidate.moduleId = 11;
+  candidate.priority = 23;
+  candidate.estimatedWritableBytes = (1ULL << 39) + 19;
+  rdcarray<ReplayCheckpointCandidate> candidates = {candidate};
+  WriteSerialiser writer(new StreamWriter(1024), Ownership::Stream);
+  REQUIRE(ControlConfig(writer, config, candidates));
+  bytebuf request = ControlPayload(writer);
+  REQUIRE(dispatch(ReplayControlOperation::ConfigureCheckpoints, request).empty());
+  CHECK(driver.configurations == 1);
+  CHECK(driver.config.byteBudget == config.byteBudget);
+  REQUIRE(driver.candidates.size() == 1);
+  CHECK(driver.candidates[0].estimatedWritableBytes == candidate.estimatedWritableBytes);
+  CHECK(driver.candidates[0].moduleId == 11);
+  request.push_back(0);
+  CHECK_FALSE(dispatch(ReplayControlOperation::ConfigureCheckpoints, request).empty());
+  CHECK(driver.configurations == 1);
+  driver.version = 0;
+  CHECK_FALSE(dispatch(ReplayControlOperation::ConfigureCheckpoints, ControlPayload(writer)).empty());
+  CHECK(driver.configurations == 1);
+  driver.version = 1;
+
+  driver.stats.supported = driver.stats.enabled = true;
+  driver.stats.hasInitialCheckpoint = true;
+  driver.stats.checkpointCount = 2;
+  driver.stats.allocatedBytes = (1ULL << 39) + 77;
+  driver.stats.sharedBytes = (1ULL << 40) + 91;
+  driver.stats.hits = (1ULL << 33) + 3;
+  driver.stats.events = {0, 31};
+  driver.stats.reason = "testNativeReason";
+  REQUIRE(dispatch(ReplayControlOperation::CheckpointStats, bytebuf()).empty());
+  ReplayCheckpointStats stats;
+  ReadSerialiser reader(new StreamReader(response), Ownership::Stream);
+  REQUIRE(ControlStats(reader, stats));
+  CHECK(ControlPayloadFinished(reader));
+  CHECK(stats.supported);
+  CHECK(stats.enabled);
+  CHECK(stats.hasInitialCheckpoint);
+  CHECK(stats.allocatedBytes == driver.stats.allocatedBytes);
+  CHECK(stats.sharedBytes == driver.stats.sharedBytes);
+  CHECK(stats.hits == driver.stats.hits);
+  CHECK(stats.events == driver.stats.events);
+  CHECK(stats.reason == driver.stats.reason);
+
+  WriteSerialiser invalidation(new StreamWriter(1024), Ownership::Stream);
+  uint32_t first = 103;
+  invalidation.Serialise("firstAffectedEvent"_lit, first);
+  REQUIRE(dispatch(ReplayControlOperation::InvalidateCheckpoints, ControlPayload(invalidation)).empty());
+  CHECK(driver.firstInvalidation == 103);
+}
+
+TEST_CASE("Remote buffer patch replacement is bounded and atomic", "[replay][proxy][checkpoint]")
+{
+  ReplayControlTestDriver driver;
+  bytebuf response;
+  auto dispatch = [&](const bytebuf &request) {
+    return DispatchReplayControl(&driver, ReplayControlProtocolRevision,
+                                 uint32_t(ReplayControlOperation::BufferPatches), request, response);
+  };
+  ReplayBufferPatch patch;
+  patch.buffer = ResourceIDGen::GetNewUniqueID();
+  patch.byteOffset = (1ULL << 33) + 8;
+  patch.data = {1, 3, 5, 7};
+  rdcarray<ReplayBufferPatch> patches = {patch};
+  WriteSerialiser writer(new StreamWriter(1024), Ownership::Stream);
+  REQUIRE(ControlPatches(writer, patches));
+  const bytebuf valid = ControlPayload(writer);
+  REQUIRE(dispatch(valid).empty());
+  REQUIRE(driver.patches.size() == 1);
+  CHECK(driver.patches[0].buffer == patch.buffer);
+  CHECK(driver.patches[0].byteOffset == patch.byteOffset);
+  CHECK(driver.patches[0].data == patch.data);
+  CHECK(driver.clears == 1);
+  CHECK(driver.invalidations == 0);
+  ReadSerialiser patchResult(new StreamReader(response), Ownership::Stream);
+  uint32_t firstAffected = ~0U;
+  patchResult.Serialise("firstAffectedEvent"_lit, firstAffected);
+  CHECK(ControlPayloadFinished(patchResult));
+  CHECK(firstAffected == 0);
+
+  bytebuf trailing = valid;
+  trailing.push_back(9);
+  CHECK_FALSE(dispatch(trailing).empty());
+  bytebuf truncated = valid;
+  truncated.pop_back();
+  CHECK_FALSE(dispatch(truncated).empty());
+  CHECK(driver.patchCalls == 1);
+  CHECK(driver.patches[0].data == patch.data);
+
+  // Both individually valid patches overlap. The full set must be rejected before native calls.
+  patches.push_back(patch);
+  patches[1].byteOffset += 2;
+  WriteSerialiser overlap(new StreamWriter(1024), Ownership::Stream);
+  CHECK_FALSE(ControlPatches(overlap, patches));
+  CHECK_FALSE(dispatch(ControlPayload(overlap)).empty());
+  CHECK(driver.patchCalls == 1);
+
+  WriteSerialiser oversized(new StreamWriter(1024), Ownership::Stream);
+  uint32_t count = 513;
+  oversized.Serialise("count"_lit, count);
+  CHECK_FALSE(dispatch(ControlPayload(oversized)).empty());
+  CHECK(driver.patchCalls == 1);
+  WriteSerialiser sizeOnly(new StreamWriter(1024), Ownership::Stream);
+  uint64_t size = ReplayControlMaxPayload + 1;
+  sizeOnly.Serialise("size"_lit, size);
+  ReadSerialiser sizeReader(new StreamReader(ControlPayload(sizeOnly)), Ownership::Stream);
+  bytebuf bounded;
+  CHECK_FALSE(ControlBytes(sizeReader, bounded, ReplayControlMaxPayload, true));
+  CHECK(bounded.empty());
+
+  driver.rejectPatch = true;
+  CHECK(dispatch(valid) == "testBackendRejectedPatch");
+  CHECK(driver.clears == 1);
+  CHECK(driver.invalidations == 0);
+  CHECK(driver.patches[0].data == patch.data);
+  driver.rejectPatch = false;
+  patches.clear();
+  WriteSerialiser empty(new StreamWriter(1024), Ownership::Stream);
+  REQUIRE(ControlPatches(empty, patches));
+  REQUIRE(dispatch(ControlPayload(empty)).empty());
+  CHECK(driver.patches.empty());
+  CHECK(driver.clears == 2);
+
+  // A certified prefix cutoff must cross the remote boundary without an unconditional
+  // secondary invalidation in the transport destroying the driver's retained checkpoints.
+  driver.bufferPatchFirstAffected = 8193;
+  REQUIRE(dispatch(valid).empty());
+  ReadSerialiser cutoffResult(new StreamReader(response), Ownership::Stream);
+  cutoffResult.Serialise("firstAffectedEvent"_lit, firstAffected);
+  CHECK(ControlPayloadFinished(cutoffResult));
+  CHECK(firstAffected == 8193);
+  CHECK(driver.invalidations == 0);
+}
+
+TEST_CASE("Remote replay request modes round-trip and reject invalid flags",
+          "[replay][proxy][checkpoint][checkpoints]")
+{
+  for(uint32_t mode = 0; mode < 8; mode++)
+  {
+    const bool legal = mode == 0 || mode == 1 || mode == 3 || mode == 4;
+    bool bypass = (mode & 1) != 0, reference = (mode & 2) != 0, prefix = (mode & 4) != 0;
+    WriteSerialiser writer(new StreamWriter(1024), Ownership::Stream);
+    CHECK(ControlRequestFlags(writer, eReplayProxy_ReplayLog, bypass, reference, prefix) == legal);
+    if(!legal)
+      continue;
+    const bytebuf payload = ControlPayload(writer);
+    ReadSerialiser reader(new StreamReader(payload), Ownership::Stream);
+    bool decodedBypass = false, decodedReference = false, decodedPrefix = false;
+    REQUIRE(ControlRequestFlags(reader, eReplayProxy_ReplayLog, decodedBypass, decodedReference,
+                                 decodedPrefix));
+    CHECK(ControlPayloadFinished(reader));
+    CHECK(decodedBypass == bypass);
+    CHECK(decodedReference == reference);
+    CHECK(decodedPrefix == prefix);
+    ReplayControlTestDriver driver;
+    {
+      ScopedRemoteCheckpointBypass<ReplayControlTestDriver> scope(&driver, decodedBypass,
+                                                                 decodedReference, decodedPrefix);
+      CHECK(driver.bypass == bypass);
+      CHECK(driver.naturalReference == reference);
+      CHECK(driver.prefixOnly == prefix);
+    }
+    CHECK_FALSE(driver.bypass);
+    CHECK_FALSE(driver.naturalReference);
+    CHECK_FALSE(driver.prefixOnly);
+  }
+
+  for(uint32_t flags : {2U, 5U, 6U, 7U, 8U, ~0U})
+  {
+    WriteSerialiser writer(new StreamWriter(1024), Ownership::Stream);
+    writer.Serialise("replayRequestFlags"_lit, flags);
+    const bytebuf payload = ControlPayload(writer);
+    ReadSerialiser reader(new StreamReader(payload), Ownership::Stream);
+    bool bypass = false, reference = false, prefix = false;
+    CHECK_FALSE(ControlRequestFlags(reader, eReplayProxy_ReplayLog, bypass, reference, prefix));
+    CHECK_FALSE(bypass);
+    CHECK_FALSE(reference);    // malformed payloads never partially update the request mode
+    CHECK_FALSE(prefix);
+  }
+  for(uint32_t flags : {3U, 4U})
+  {
+    WriteSerialiser writer(new StreamWriter(1024), Ownership::Stream);
+    writer.Serialise("replayRequestFlags"_lit, flags);
+    const bytebuf payload = ControlPayload(writer);
+    ReadSerialiser reader(new StreamReader(payload), Ownership::Stream);
+    bool bypass = false, reference = false, prefix = false;
+    CHECK_FALSE(ControlRequestFlags(reader, eReplayProxy_RenderOverlay, bypass, reference, prefix));
+    CHECK_FALSE(bypass);
+    CHECK_FALSE(reference);
+    CHECK_FALSE(prefix);
+  }
+  {
+    const bytebuf empty;
+    ReadSerialiser reader(new StreamReader(empty), Ownership::Stream);
+    bool bypass = false, reference = false, prefix = false;
+    CHECK_FALSE(ControlRequestFlags(reader, eReplayProxy_ReplayLog, bypass, reference, prefix));
+  }
+}
+
+TEST_CASE("Remote checkpoint bypass is request scoped and preserves outer guards",
+          "[replay][proxy][checkpoint][checkpoints]")
+{
+  ReplayControlTestDriver driver;
+  {
+    ScopedRemoteCheckpointBypass<ReplayControlTestDriver> edit(&driver, false, false, true);
+    CHECK(driver.prefixOnly);
+    {
+      ScopedRemoteCheckpointBypass<ReplayControlTestDriver> forced(&driver, true);
+      CHECK(driver.bypass);
+      CHECK_FALSE(driver.prefixOnly);
+    }
+    CHECK(driver.prefixOnly);
+    CHECK_FALSE(driver.bypass);
+  }
+  CHECK_FALSE(driver.prefixOnly);
+  {
+    ScopedRemoteCheckpointBypass<ReplayControlTestDriver> outer(&driver, true);
+    CHECK(driver.bypass);
+    {
+      ScopedRemoteCheckpointBypass<ReplayControlTestDriver> inner(&driver, false);
+      CHECK(driver.bypass);
+    }
+    CHECK(driver.bypass);
+  }
+  CHECK_FALSE(driver.bypass);
+
+  {
+    ScopedRemoteCheckpointBypass<ReplayControlTestDriver> reference(&driver, true, true);
+    CHECK(driver.bypass);
+    CHECK(driver.naturalReference);
+    {
+      ScopedRemoteCheckpointBypass<ReplayControlTestDriver> analysis(&driver, true, false);
+      CHECK(driver.bypass);
+      CHECK_FALSE(driver.naturalReference);
+      {
+        ScopedRemoteCheckpointBypass<ReplayControlTestDriver> nestedReference(&driver, true, true);
+        CHECK(driver.bypass);
+        CHECK_FALSE(driver.naturalReference);    // an outer forced replay cannot be weakened
+      }
+      CHECK_FALSE(driver.naturalReference);
+    }
+    CHECK(driver.naturalReference);
+    {
+      ScopedRemoteCheckpointBypass<ReplayControlTestDriver> nonReplayPacket(&driver, false, false);
+      CHECK(driver.bypass);
+      CHECK_FALSE(driver.naturalReference);
+    }
+    CHECK(driver.naturalReference);
+  }
+  CHECK_FALSE(driver.bypass);
+  CHECK_FALSE(driver.naturalReference);
+  driver.bypass = true;
+  {
+    ScopedRemoteCheckpointBypass<ReplayControlTestDriver> request(&driver, false);
+    CHECK(driver.bypass);
+  }
+  CHECK(driver.bypass);
+  driver.bypass = false;
+  {
+    ScopedRemoteCheckpointBypass<ReplayControlTestDriver> request(&driver, false);
+    CHECK_FALSE(driver.bypass);
+  }
+  CHECK_FALSE(driver.bypass);
+}
+#endif

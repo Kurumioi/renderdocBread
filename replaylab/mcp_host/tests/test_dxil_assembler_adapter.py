@@ -13,6 +13,7 @@ import uuid
 from unittest import mock
 
 from src.shader_workspace.adapters import dxil_assembler_adapter as adapter
+from src.shader_workspace.profiles import extract_target_profile
 
 
 def make_dxil_container(program: bytes = b"program") -> bytes:
@@ -168,12 +169,17 @@ class DxilAssemblerAdapterTests(unittest.TestCase):
             adapter._validate_dxil_container(bytes(truncated))
 
     @unittest.skipUnless(os.name == "nt", "IDxcAssembler smoke requires Windows")
-    def test_real_bundled_dxc_round_trip_when_explicitly_enabled(self):
+    def test_real_dxc_round_trip_when_explicitly_enabled(self):
         if os.environ.get("REPLAYLAB_RUN_DXC_ASSEMBLER_SMOKE") != "1":
             self.skipTest("set REPLAYLAB_RUN_DXC_ASSEMBLER_SMOKE=1 for native smoke")
         repository = Path(__file__).resolve().parents[2]
+        configured_tools = str(
+            os.environ.get("REPLAYLAB_DXC_SMOKE_DIR", "") or ""
+        ).strip()
         tools = (
-            repository
+            Path(configured_tools).expanduser().resolve()
+            if configured_tools
+            else repository
             / "distribution"
             / "ReplayLab"
             / "replaylab"
@@ -182,7 +188,7 @@ class DxilAssemblerAdapterTests(unittest.TestCase):
         dxc = tools / "dxc.exe"
         dll = tools / "dxcompiler.dll"
         if not dxc.is_file() or not dll.is_file():
-            self.skipTest("bundled DXC runtime is unavailable")
+            self.skipTest("explicit DXC runtime is unavailable")
 
         hlsl = self.root / "native.hlsl"
         baseline = self.root / "native.dxil"
@@ -228,6 +234,62 @@ class DxilAssemblerAdapterTests(unittest.TestCase):
         ]
         self.assertEqual(0, adapter.main(arguments))
         adapter._validate_dxil_container(rebuilt.read_bytes())
+
+        ray_hlsl = self.root / "native-ray-library.hlsl"
+        ray_baseline = self.root / "native-ray-library.dxil"
+        ray_assembly = self.root / "native-ray-library.ll"
+        ray_rebuilt = self.root / "native-ray-library.rebuilt.dxil"
+        ray_rebuilt_assembly = self.root / "native-ray-library.rebuilt.ll"
+        ray_hlsl.write_text(
+            "struct Payload { float4 color; };\n"
+            '[shader("raygeneration")]\n'
+            "void RayMain() { }\n"
+            '[shader("miss")]\n'
+            "void MissMain(inout Payload payload)\n"
+            "{ payload.color = float4(1, 0, 0, 1); }\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [str(dxc), "-T", "lib_6_3", "-Fo", str(ray_baseline), str(ray_hlsl)],
+            cwd=str(tools),
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        subprocess.run(
+            [str(dxc), "-dumpbin", "-Fc", str(ray_assembly), str(ray_baseline)],
+            cwd=str(tools),
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        ray_arguments = list(arguments)
+        ray_arguments[ray_arguments.index("--input") + 1] = str(ray_assembly)
+        ray_arguments[ray_arguments.index("--output") + 1] = str(ray_rebuilt)
+        self.assertEqual(0, adapter.main(ray_arguments))
+        adapter._validate_dxil_container(ray_rebuilt.read_bytes())
+        subprocess.run(
+            [
+                str(dxc),
+                "-dumpbin",
+                "-Fc",
+                str(ray_rebuilt_assembly),
+                str(ray_rebuilt),
+            ],
+            cwd=str(tools),
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        for path in (ray_baseline, ray_rebuilt):
+            profile = extract_target_profile(path.read_bytes(), "raygen")
+            self.assertEqual("lib_6_3", profile.profile)
+            self.assertEqual("library", profile.stage)
+        baseline_ir = ray_assembly.read_text(encoding="utf-8")
+        rebuilt_ir = ray_rebuilt_assembly.read_text(encoding="utf-8")
+        for export_name in ("RayMain", "MissMain"):
+            self.assertIn(export_name, baseline_ir)
+            self.assertIn(export_name, rebuilt_ir)
 
 
 if __name__ == "__main__":

@@ -1768,7 +1768,10 @@ struct ShaderEntryPoint
 
 :type: ShaderStage
 )");
-  ShaderStage stage;
+  // Some container metadata (notably malformed or older DXIL library
+  // metadata) can omit the entry-point stage tag. Keep that state explicit
+  // instead of exposing an uninitialised enum value to replay clients.
+  ShaderStage stage = ShaderStage::Count;
 };
 
 DECLARE_REFLECTION_STRUCT(ShaderEntryPoint);
@@ -2013,7 +2016,9 @@ struct ShaderReflection
 
 :type: ShaderStage
 )");
-  ShaderStage stage;
+  // Reflection producers normally set this field. Count is the explicit
+  // unknown sentinel for incomplete or forward-version metadata.
+  ShaderStage stage = ShaderStage::Count;
 
   DOCUMENT(R"(The embedded debugging information.
 

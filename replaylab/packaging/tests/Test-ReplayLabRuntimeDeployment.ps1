@@ -48,9 +48,13 @@ function Set-FakeRuntimeOutput {
     [IO.File]::WriteAllBytes(
         (Join-Path $Directory "ReplayLabMCP.exe"),
         [Text.Encoding]::UTF8.GetBytes("fake-mcp-runtime"))
+    [IO.File]::WriteAllBytes(
+        (Join-Path $Directory "ReplayLabShaderTools.exe"),
+        [Text.Encoding]::UTF8.GetBytes("fake-independent-shader-tools"))
     $records = @()
     foreach ($name in @(
-        "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe")) {
+        "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe",
+        "ReplayLabShaderTools.exe")) {
         $path = Join-Path $Directory $name
         $item = Get-Item -LiteralPath $path
         $records += [ordered]@{
@@ -67,6 +71,7 @@ function Set-FakeRuntimeOutput {
             "replaylab-ai.exe",
             "ReplayLabInternal.exe",
             "ReplayLabMCP.exe",
+            "ReplayLabShaderTools.exe",
             "replaylab-runtime-manifest.json"
         )
         files = $records
@@ -117,6 +122,60 @@ try {
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $appRoot "replaylab"))) `
         "ValidateOnly must not create the ReplayLab target."
 
+    $liveApp = Join-Path $resolvedTestRoot "live-application"
+    New-Item -ItemType Directory -Path $liveApp | Out-Null
+    $liveExecutable = Join-Path $liveApp "q_render_soco_doc.exe"
+    Copy-Item -LiteralPath (Join-Path ([Environment]::SystemDirectory) "ping.exe") `
+        -Destination $liveExecutable
+    $liveProcess = Start-Process -FilePath $liveExecutable `
+        -ArgumentList @("-n", "120", "127.0.0.1") -WindowStyle Hidden -PassThru
+    try {
+        $processDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        $observedPath = ""
+        while ([DateTime]::UtcNow -lt $processDeadline) {
+            $observed = Get-CimInstance -ClassName Win32_Process `
+                -Filter "ProcessId = $($liveProcess.Id)" -ErrorAction SilentlyContinue
+            $observedPath = [string]$observed.ExecutablePath
+            if (-not [string]::IsNullOrWhiteSpace($observedPath)) {
+                break
+            }
+            Start-Sleep -Milliseconds 50
+        }
+        Assert-True (-not [string]::IsNullOrWhiteSpace($observedPath)) `
+            "The controlled qrenderdoc-name process was not observable."
+        Assert-True (([IO.Path]::GetFullPath($observedPath)) -eq `
+            ([IO.Path]::GetFullPath($liveExecutable))) `
+            "The controlled qrenderdoc-name process did not run from the test application."
+
+        $liveValidation = & $deployScript -ApplicationDirectory $liveApp `
+            -RuntimeOutputDirectory $runtimeRoot -ValidateOnly
+        Assert-True ($liveValidation.Status -eq "valid") `
+            "ValidateOnly must remain read-only when the target qrenderdoc is running."
+        Assert-Throws {
+            & $deployScript -ApplicationDirectory $liveApp `
+                -RuntimeOutputDirectory $runtimeRoot | Out-Null
+        } 'qrenderdoc is running from the target application directory|No target files were changed' `
+            "Deployment must fail before mutation when the target qrenderdoc is running."
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $liveApp "replaylab"))) `
+            "A running target qrenderdoc must be detected before creating the target."
+
+        $otherApp = Join-Path $resolvedTestRoot "other-application"
+        New-Item -ItemType Directory -Path $otherApp | Out-Null
+        Set-Content -LiteralPath (Join-Path $otherApp "qrenderdoc.exe") `
+            -Value "fake-qrenderdoc"
+        $otherDeployment = & $deployScript -ApplicationDirectory $otherApp `
+            -RuntimeOutputDirectory $runtimeRoot
+        Assert-True ($otherDeployment.Status -eq "deployed") `
+            "A same-named process from another directory must not block deployment."
+    }
+    finally {
+        if (-not $liveProcess.HasExited) {
+            Stop-Process -Id $liveProcess.Id -Force -ErrorAction SilentlyContinue
+            $liveProcess.WaitForExit(5000) | Out-Null
+        }
+        $liveProcess.Dispose()
+    }
+
     $deployment = & $deployScript -ApplicationDirectory $appRoot `
         -RuntimeOutputDirectory $runtimeRoot
     Assert-True ($deployment.Status -eq "deployed") "Deployment did not report success."
@@ -130,6 +189,7 @@ try {
         "replaylab-ai.exe",
         "ReplayLabInternal.exe",
         "ReplayLabMCP.exe",
+        "ReplayLabShaderTools.exe",
         "replaylab-runtime-manifest.json",
         ".replaylab-runtime-deployment.json"
     )) {
@@ -137,7 +197,8 @@ try {
             "Deployment did not create $name."
     }
     foreach ($name in @(
-        "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe")) {
+        "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe",
+        "ReplayLabShaderTools.exe")) {
         $sourceHash = (Get-FileHash -LiteralPath (Join-Path $runtimeRoot $name) `
             -Algorithm SHA256).Hash
         $targetHash = (Get-FileHash -LiteralPath (Join-Path $targetRoot $name) `
@@ -153,6 +214,38 @@ try {
         "A marker-owned redeployment must preserve unrelated files."
 
     $markerPath = Join-Path $targetRoot ".replaylab-runtime-deployment.json"
+    $modernMarker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+    $legacyMarker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+    $legacyMarker.ownedFiles = @($legacyMarker.ownedFiles | Where-Object {
+        $_ -cne "ReplayLabShaderTools.exe"
+    })
+    $legacyMarker | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $markerPath -Encoding UTF8
+    Assert-Throws {
+        & $deployScript -ApplicationDirectory $appRoot `
+            -RuntimeOutputDirectory $runtimeRoot -ValidateOnly | Out-Null
+    } 'does not own the existing ReplayLabShaderTools.exe' `
+        "An old deployment marker must not adopt an existing unowned shader runner."
+    Remove-Item -LiteralPath (Join-Path $targetRoot "ReplayLabShaderTools.exe") -Force
+    $oldManifestPath = Join-Path $targetRoot "replaylab-runtime-manifest.json"
+    $oldManifest = Get-Content -LiteralPath $oldManifestPath -Raw | ConvertFrom-Json
+    $oldManifest.ownedFiles = @($oldManifest.ownedFiles | Where-Object {
+        $_ -cne "ReplayLabShaderTools.exe"
+    })
+    $oldManifest.files = @($oldManifest.files | Where-Object {
+        $_.path -cne "ReplayLabShaderTools.exe"
+    })
+    $oldManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $oldManifestPath -Encoding UTF8
+    $legacyMarker.sourceManifestSha256 = (
+        Get-FileHash -LiteralPath $oldManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $legacyMarker | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $markerPath -Encoding UTF8
+    & $deployScript -ApplicationDirectory $appRoot `
+        -RuntimeOutputDirectory $runtimeRoot | Out-Null
+    $upgradedMarker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+    Assert-True (@($upgradedMarker.ownedFiles) -ccontains "ReplayLabShaderTools.exe") `
+        "A known three-executable deployment must upgrade its canonical ownership marker."
+    Assert-True (Test-Path -LiteralPath (Join-Path $targetRoot "ReplayLabShaderTools.exe") -PathType Leaf) `
+        "A known three-executable deployment must gain the verified independent shader runner."
+
     $interruptedMarker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
     $interruptedMarker.state = "incomplete"
     $interruptedMarker | ConvertTo-Json -Depth 4 | Set-Content `
@@ -188,6 +281,7 @@ try {
         "replaylab-ai.exe",
         "ReplayLabInternal.exe",
         "ReplayLabMCP.exe",
+        "ReplayLabShaderTools.exe",
         "replaylab-runtime-manifest.json"
     )) {
         Copy-Item -LiteralPath (Join-Path $runtimeRoot $name) `
@@ -221,6 +315,7 @@ try {
         "replaylab-ai.exe",
         "ReplayLabInternal.exe",
         "ReplayLabMCP.exe",
+        "ReplayLabShaderTools.exe",
         "replaylab-runtime-manifest.json"
     )) {
         Copy-Item -LiteralPath (Join-Path $runtimeRoot $name) `
@@ -250,6 +345,17 @@ try {
         "A payload that differs from its manifest must be rejected."
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $cleanApp "replaylab"))) `
         "Source validation failure must happen before target creation."
+
+    $tamperedShaderRoot = Join-Path $resolvedTestRoot "tampered-shader-runtime"
+    Set-FakeRuntimeOutput $tamperedShaderRoot
+    Add-Content -LiteralPath (Join-Path $tamperedShaderRoot "ReplayLabShaderTools.exe") -Value "tampered"
+    Assert-Throws {
+        & $deployScript -ApplicationDirectory $cleanApp `
+            -RuntimeOutputDirectory $tamperedShaderRoot | Out-Null
+    } 'size does not match|SHA-256 does not match' `
+        "The fourth shader runner must be verified as strictly as the Host payloads."
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $cleanApp "replaylab"))) `
+        "Shader runner verification failure must precede target creation."
 
     $unsafeNamesRoot = Join-Path $resolvedTestRoot "unsafe-owned-names-runtime"
     Set-FakeRuntimeOutput $unsafeNamesRoot

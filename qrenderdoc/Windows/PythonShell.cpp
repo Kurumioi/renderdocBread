@@ -600,7 +600,26 @@ struct CaptureContextInvoker : ObjectForwarder<ICaptureContext>
   {
     InvokeVoidFunction(&ICaptureContext::SetEventID, exclude, selectedEventID, eventId, force);
   }
+  virtual void ScrubToEvent(uint32_t eventId) override
+  {
+    InvokeVoidFunction(&ICaptureContext::ScrubToEvent, eventId);
+  }
+  virtual void ScrubToSelectedEvent(uint32_t selectedEventId, uint32_t eventId) override
+  {
+    InvokeVoidFunction(&ICaptureContext::ScrubToSelectedEvent, selectedEventId, eventId);
+  }
+  virtual void EndScrub() override { InvokeVoidFunction(&ICaptureContext::EndScrub); }
+  virtual bool IsScrubbing() override
+  {
+    return InvokeRetFunction<bool>(&ICaptureContext::IsScrubbing);
+  }
   virtual void RefreshStatus() override { InvokeVoidFunction(&ICaptureContext::RefreshStatus); }
+  void RefreshReplayStatus(uint32_t expectedEventId, uint64_t expectedBufferGeneration,
+                           std::function<void(bool)> completed) override
+  {
+    InvokeVoidFunction(&ICaptureContext::RefreshReplayStatus, expectedEventId,
+                       expectedBufferGeneration, completed);
+  }
   virtual bool IsResourceReplaced(ResourceId id) override
   {
     return InvokeRetFunction<bool>(&ICaptureContext::IsResourceReplaced, id);

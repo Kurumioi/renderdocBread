@@ -22,21 +22,95 @@ def _utc_now() -> str:
 
 
 class SymbolStore:
-    def __init__(self, database_path: str | Path):
-        self.path = Path(database_path).expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+    def __init__(self, database_path: str | Path, *, read_only: bool = False):
+        self.read_only = bool(read_only)
+        raw_path = Path(database_path).expanduser()
+        if self.read_only and raw_path.is_symlink():
+            raise RuntimeError(
+                "Read-only symbol database must not be a symbolic link: %s"
+                % raw_path
+            )
+        self.path = raw_path.resolve()
+        if self.read_only:
+            if not self.path.is_file():
+                raise RuntimeError(
+                    "Read-only symbol database is unavailable: %s" % self.path
+                )
+            self._validate_read_only_schema()
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._initialize()
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(str(self.path))
+        if self.read_only:
+            connection = sqlite3.connect(
+                self.path.as_uri() + "?mode=ro",
+                uri=True,
+            )
+        else:
+            connection = sqlite3.connect(str(self.path))
         connection.row_factory = sqlite3.Row
+        if self.read_only:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("PRAGMA temp_store = MEMORY")
         connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
-            connection.commit()
+            if not self.read_only:
+                connection.commit()
         finally:
             connection.close()
+
+    def _validate_read_only_schema(self) -> None:
+        """Validate a prepared v3 database without creating or migrating it."""
+
+        required_tables = {
+            "metadata",
+            "asset_scans",
+            "asset_shaders",
+            "capture_catalogs",
+            "capture_shaders",
+            "symbol_matches",
+            "aliases",
+            "symbol_rules",
+        }
+        with self.connection() as db:
+            table_names = {
+                str(row["name"])
+                for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+                if not str(row["name"]).startswith("sqlite_")
+            }
+            if not required_tables.issubset(table_names):
+                raise RuntimeError(
+                    "Read-only symbol database is not a complete v%d database"
+                    % SCHEMA_VERSION
+                )
+            existing = db.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()
+            if existing is None:
+                raise RuntimeError(
+                    "Read-only symbol database has no schema version"
+                )
+            try:
+                existing_version = int(existing["value"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Invalid symbol database schema version: %r"
+                    % existing["value"]
+                ) from exc
+            if existing_version != SCHEMA_VERSION:
+                direction = (
+                    "older" if existing_version < SCHEMA_VERSION else "newer"
+                )
+                raise RuntimeError(
+                    "Symbol database schema %d is %s than supported schema %d. "
+                    "Use a compatible prepared project database."
+                    % (existing_version, direction, SCHEMA_VERSION)
+                )
 
     def _initialize(self) -> None:
         with self.connection() as db:

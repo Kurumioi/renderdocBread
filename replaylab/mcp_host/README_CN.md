@@ -12,14 +12,15 @@ qrenderdoc 项目 UI 只使用经过认证的 `ReplayLabInternal.exe` 高层服�
 项目管理、恢复与 Shader 保存如果无法访问内部服务，会直接失败关闭，绝不回退为启动本
 可执行文件。普通 qrenderdoc 默认持有一个 `ReplayLabMCP.exe` 回环服务，供外部 Codex、
 IDE 或自动化客户端连接；设置 `REPLAYLAB_EXTERNAL_MCP_AUTOSTART=0`（也接受 `false`、
-`no`、`off`）只会关闭这项外部服务。ACP/Cursor 只为当前专员任务启动一个受过滤的 stdio
-适配器。模型 API 与 Codex dynamicTools 的内置工作直接在 AgentHost 中执行。
+`no`、`off`）只会关闭这项外部服务。ACP/Cursor 只为当前任务启动一个受过滤的 stdio
+适配器。所有带捕获的 AgentHost 工作（包括 deepagents 子 Agent、ACP 和 Codex
+app-server）都通过受过滤的任务级 MCP 路由调用同一个 Host。
 
 [English](README.md) | **中文**
 
 ---
 
-## 功能概览（111 个工具）
+## 功能概览（141 个工具）
 
 ### 📦 截帧管理
 | 工具 | 说明 |
@@ -55,6 +56,15 @@ IDE 或自动化客户端连接；设置 `REPLAYLAB_EXTERNAL_MCP_AUTOSTART=0`（
 | 工具 | 说明 |
 |------|------|
 | `get_pipeline_state` | 查看当前绑定的着色器、渲染目标、深度目标、视口 |
+| `analyze_current_frame_flow` | 有界的整帧时间线、工作量、物理 I/O、参与状态、绘制状态和确定资源交接清单 |
+| `capture_event_texture_evidence` | 将 exact EID 的一个 RTV 合成/单通道视图或 raw DSV 深度视图导出为 Host 管理且带哈希的 PNG/manifest；调用方不能指定路径 |
+| `render_current_frame_flow_diagram` | 从 Host 帧证据绘制固定风格的资源流、实际参与阶段或 Pass/GBuffer SVG；调用方不能提交图数据或样式 |
+
+两个 Event 可视化工具均属于可逆的 `workspace` 操作。纹理证据每次只导出一个
+视图，绑定精确 mip/slice/sample、受固定预算约束，并在结束前恢复原可见 EID；DSV
+只显示 raw depth，不冒充线性深度。流程图只使用 Host 当前帧事实和固定
+`evidence-neutral-v1` 风格，截帧文本不能注入 CSS、链接、HTML、Mermaid 指令或输出
+路径。GBuffer 卡片只陈述物理附件，通道语义仍需经过验证的 Shader 证据。
 
 ### 💎 着色器基础检查
 | 工具 | 说明 |
@@ -77,12 +87,12 @@ IDE 或自动化客户端连接；设置 `REPLAYLAB_EXTERNAL_MCP_AUTOSTART=0`（
 | `plan_shader_recovery` | 将失败分类为检测、反编译、编译、ABI 等固定阶段，并只返回哈希绑定的未尝试路线配对供 AI 选择 |
 | `run_shader_toolchain_round_trip_smoke` | 用固定路线、物理解析出的精确 profile、格式检查与验证器执行 smoke，不应用到 RenderDoc |
 | `get_current_shader_representation` | 为 RenderDoc 能反射的任意 Shader API 生成非空、Hash 绑定的当前事件解释产物；解释/二进制 lane 永远不可编译或应用 |
-| `prepare_shader_workspace` | 导出单个事件/阶段，要求唯一物理 shader，然后创建 workspace 并调用宿主登记的反编译器 |
+| `prepare_shader_workspace` | 导出单个事件/阶段，要求唯一物理 Shader，执行首选登记路线并自动遍历有限、Hash 绑定的备用路线；若所有反编译器失败但存在编译器，则从原生证据发布 provisional 重建入口 |
 | `create_shader_workspace` | 从已有 catalog 和精确 `shaderKey` 创建 workspace |
 | `migrate_shader_workspace_toolchain` | 当 catalog/registry 合法升级时，以旧路线和当前源码 SHA 为 CAS，在新工作区原样保留源码并重新绑定当前工具链；不导入旧候选/ABI |
 | `try_shader_workspace_recovery_candidate` | 只按原 workspace 的哈希绑定 recovery plan 候选索引，在新的 sibling workspace 中尝试另一条已注册路线；不能提供命令、路径或 executable，失败证据不会覆盖 |
 | `decompile_shader_workspace` | 调用 workspace 绑定的反编译器，且不会覆盖已编辑源码 |
-| `get_shader_workspace_representation` | 返回可执行的路由文本（优先 HLSL/GLSL；仅当高级语言路线在静态规划时不完整，才自动选择唯一、直接、可往返的 DXBC/DXIL 汇编），否则物化 RenderDoc IR 或精确二进制回退；运行时失败可由 AgentHost 专员从固定 recovery plan 选择另一个反编译候选，但必须新建 workspace，不会在原 workspace 偷换格式/路线；SPIR-V 汇编在 workspace 工具与 validator 接通前不进入自动回退 |
+| `get_shader_workspace_representation` | 返回可执行路由文本，否则物化 RenderDoc IR 或精确二进制回退；不会再次运行已记录失败的路线，也不会静默改变用户请求的可编辑格式 |
 | `promote_shader_workspace_explanation` | 显式提升经 Hash 复核的 `explanation/promoted.hlsl`；仍必须重新编译、ABI 校验并获得 Apply 授权 |
 | `compile_shader_workspace` | 把路由绑定的 HLSL/汇编编译为可审计候选；**不会应用到 RenderDoc** |
 | `get_shader_workspace_status` | 校验哈希并报告源码、修订和候选状态 |
@@ -126,9 +136,11 @@ Shader Model 6 DXIL 可优先使用本地源码构建并哈希固定的 RenoDX `
 可读 HLSL；社区 `HLSL-Decompiler` 的 DXIL 路线本质上是
 `dxil-spirv -> SPIRV-Cross`，只作为独立候选后备，不能因为输出可编译就宣称算法一致。
 若没有完整 DXIL→HLSL 往返，而 DXC dump 与官方 `IDxcAssembler` 都通过哈希校验，程序会
-采用 `shader.dxil.ll` 可执行 IR 通道。已选反编译路线在运行时失败时，AI 只能从程序生成、
-哈希绑定的 recovery candidate 索引中选择；每个替代工具都在新的 workspace 中尝试并保留
-失败证据，不能提供命令或在原 workspace 中偷换路线。所有候选仍保持
+采用 `shader.dxil.ll` 可执行 IR 通道。已选反编译路线在运行时失败时，程序会自动按顺序
+执行 Hash 绑定的有限 recovery candidate 路线对；每个替代工具都在新的 workspace 中只尝试
+一次并保留失败证据，不能提供命令或在原 workspace 中偷换路线。所有固定反编译路线均失败
+但仍有编译路线时，会基于 RenderDoc 原生 IR/精确二进制发布 provisional 源码入口，供 Agent
+重建后进行 Hash 提升、编译和新鲜 replay ABI 校验，而不是直接结束任务。所有候选仍保持
 `semanticEquivalenceVerified=false`，直到另有足够的语义证据。SPIR-V 汇编要等 workspace
 实际接通固定工具与 validator 后才会进入自动 native-IR 回退。
 
@@ -219,11 +231,42 @@ qrenderdoc 现已提供原生 MVP：打开 Pipeline State 的 CBuffer 变量视�
 目前不是带语义范围的滑条或颜色选择器。D3D12 root constants、ray state object 与
 `ExecuteIndirect` Root CBV 会失败关闭；remote replay 也不支持。
 
-### 📤 一键 DrawCall 导出
+### 📤 受管资源导出
 | 工具 | 说明 |
 |------|------|
-| `export_drawcall` | 一键导出一个绘制调用的**全部信息**：着色器代码（所有反汇编格式 + 源码）、所有绑定贴图存为 PNG（以槽位和角色命名）、常量缓冲区值、管线状态 |
-| `export_to_unity` | 🆕 **一键导出 Unity 可用资源**：Mesh 导出为 .obj + .fbx（含正确坐标系转换、法线/UV）、纹理绑定信息（用 `save_texture` 单独导出）、生成 Unity 材质定义 JSON、生成 C# 编辑器一键导入脚本 |
+| `get_resource_export_capabilities` | 报告固定 glTF、Unity URP、Blender、可选 FBX 与校验器能力，不会临时安装工具 |
+| `inspect_resource_export` | 无写入地检查一个精确 EID/instance/view |
+| `prepare_resource_export` | 在进程自有目录中快照完整网格输入、贴图、采样器、CBuffer 与 Shader 证据 |
+| `finalize_resource_export` | 执行类型化迁移规格，原子发布 glTF、目标适配器和证据旁车 |
+| `get_resource_export_status` | 查看稳定 operation 及其哈希 |
+| `validate_resource_export` | 复核路径约束、文件哈希、网格/包结构和可用目标校验 |
+
+`export_drawcall`、`export_to_unity` 与调用方路径版 `save_texture` 仍是 legacy
+诊断工具，不会授予资源导出专员；它们不能保留全部顶点输入、精确 texture
+view/sampler/CBuffer 证据、显式坐标策略、原子发布和目标验收。详见
+[资源导出工具链](../docs/RESOURCE_EXPORT_TOOLCHAIN.md)。
+
+### 🧭 解包资产知识、UEX 报告与 Blender 交付
+| 工具 | 说明 |
+|------|------|
+| `get_unpacked_asset_index_capabilities` | 报告固定的通用/UEX 感知解析、身份、关系和扫描上限 |
+| `get_active_unpacked_asset_index_status` | 不扫描目录，只读取项目自有资产目录快照 |
+| `index_active_unpacked_assets` | 对活动项目已配置根执行原子全量/增量索引；调用方不能传数据库路径 |
+| `query_active_unpacked_assets` | 有界查询资产身份、哈希、格式、元数据及已验证/未解析关系 |
+| `resolve_active_unpacked_asset` | 对目录中选中的资产重新哈希并返回绑定快照版本的交付回执 |
+| `get_unpacked_asset_provider_capabilities` | 报告注册的 UEX、profiles、包装器、Blender、UEFormat 指纹和能力缺口 |
+| `get_unpacked_asset_provider_decisions` | 从已提交 UEX 库读取有界、去敏的 profile 名和 Host 拥有的 Strong/完整/截断 Inventory 决策 |
+| `query_unpacked_asset_inventory_assets` | 从精确 Inventory 有界查询安全资产身份与已验证导出包路径 |
+| `start_unpacked_asset_report` | 用 Host 规范化并暂存的 v1 分组规格与 Host 验证的 Strong、完整、未截断 Inventory 启动 UEX 报告 |
+| `start_unpacked_asset_blender_export` | 将有界的精确 cooked SkeletalMesh 集合导出为 UEX Bundle 和可选 Blender 装配 |
+| `continue_unpacked_asset_blender_export` | 绑定一个终态 partial 回执，保留已验证父 Bundle，仅重试失败/未开始项，再合并装配并验证；不接受调用方旧路径 |
+| `get_unpacked_asset_job_status` | 轮询幂等报告/导出作业并验证终态产物 |
+
+资产目录持久化在活动项目的共享资产字典中，明确区分确定性关系、启发式候选与未解析引用。
+报告必须通过 HTML/JSON/CSV/manifest 四件套及精确哈希验收；Blender 交付必须验证
+`USkeletalMesh` 身份、LOD0、材质/贴图文件、`.uemodel` 或显式 GLB 路由、装配绑定和
+验证回执。UEX/Blender 路径、profiles、秘密与输出根均由进程所有者配置，模型不可传入。
+详见[解包资产知识专员](../docs/UNPACKED_ASSET_INTELLIGENCE.md)。
 
 ### 🔍 智能识别
 | 工具 | 说明 |
@@ -458,7 +501,7 @@ replaylab/
     ├── README_CN.md            # 中文文档（本文件）
     └── src/
         ├── __init__.py
-        ├── server.py           # MCP 工具定义（111 个工具，基于 FastMCP）
+        ├── server.py           # MCP 工具定义（141 个工具，基于 FastMCP）
         ├── rd_wrapper.py       # RenderDoc API 封装层（本地直连备用方案）
         └── ipc_client.py       # 文件 IPC 客户端
 
@@ -471,7 +514,7 @@ replaylab/
 [AI/IDE] ←stdio/HTTP→ [ReplayLab 边车 (Python 3.10+)] ←文件IPC→ [qrenderdoc 内置集成]
 ```
 
-- **`server.py`** — 注册 111 个 MCP 工具，通过 stdio 与 AI 客户端通信
+- **`server.py`** — 注册 141 个 MCP 工具，通过 stdio 与 AI 客户端通信
 - **`ipc_client.py`** — 文件 IPC 桥接 Python 3.10+ 与 RenderDoc 内置 Python 3.6
 - **`rd_wrapper.py`** — RenderDoc API 直连封装（备用方案）
 - **内置 Bridge** — 在 RenderDoc 内部采集 UI 上下文/按钮意图，并通过 IPC 执行有界 replay 调用

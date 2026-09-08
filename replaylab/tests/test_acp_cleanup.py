@@ -7,6 +7,69 @@ import pytest
 
 
 @pytest.mark.asyncio
+async def test_managed_agent_process_closes_windows_pipe_transport_before_return(
+    monkeypatch,
+) -> None:
+    import replaylab_agent.connectors.acp as acp_connector
+
+    events: list[str] = []
+    monkeypatch.setattr(acp_connector, "_ACP_FINAL_PIPE_DRAIN_TIMEOUT", 0.01)
+
+    class Stdin:
+        def close(self) -> None:
+            events.append("stdin.close")
+
+        async def wait_closed(self) -> None:
+            events.append("stdin.wait_closed")
+
+    class Transport:
+        def close(self) -> None:
+            events.append("transport.close")
+
+    class Process:
+        pid = 4242
+        returncode = 0
+        stdin = Stdin()
+        _transport = Transport()
+
+        async def wait(self) -> int:
+            events.append("process.wait")
+            return self.returncode
+
+        async def communicate(self):
+            events.append("process.communicate.start")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                events.append("process.communicate.cancelled")
+
+    process = Process()
+
+    class Manager:
+        async def __aenter__(self):
+            return object(), process
+
+        async def __aexit__(self, *args):
+            del args
+            events.append("manager.exit")
+            return False
+
+    async with acp_connector._managed_agent_process(Manager(), "test ACP"):
+        events.append("body")
+
+    assert events == [
+        "body",
+        "manager.exit",
+        "stdin.close",
+        "stdin.wait_closed",
+        "process.wait",
+        "process.communicate.start",
+        "process.communicate.cancelled",
+        "transport.close",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_managed_agent_process_escalates_the_owned_tree_before_failing(
     monkeypatch,
 ) -> None:

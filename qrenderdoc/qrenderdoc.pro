@@ -96,7 +96,7 @@ win32 {
 		}
 	}
 
-	LIBS += user32.lib
+	LIBS += user32.lib shell32.lib ole32.lib gdi32.lib windowscodecs.lib
 
 	# Link against the core library
 	LIBS += $$DESTDIR/renderdoc.lib
@@ -171,7 +171,9 @@ SOURCES += Code/qrenderdoc.cpp \
     Code/ReplayManager.cpp \
     Code/CaptureContext.cpp \
     Code/ReplayLab/ReplayLabIntegration.cpp \
+    Code/ReplayLab/ReplayLabCBufferAliases.cpp \
     Code/CodeEditorService.cpp \
+    Widgets/ShaderCodeEditor.cpp \
     Code/TranslationManager.cpp \
     Code/ScintillaSyntax.cpp \
     Code/QRDUtils.cpp \
@@ -193,6 +195,7 @@ SOURCES += Code/qrenderdoc.cpp \
     Windows/Dialogs/UpdateDialog.cpp \
     Windows/MainWindow.cpp \
     Windows/EventBrowser.cpp \
+    Windows/BookmarksView.cpp \
     Windows/TextureViewer.cpp \
     Windows/ShaderViewer.cpp \
     Windows/ShaderMessageViewer.cpp \
@@ -243,6 +246,7 @@ SOURCES += Code/qrenderdoc.cpp \
     Windows/Dialogs/RemoteManager.cpp \
     Windows/Dialogs/ExtensionManager.cpp \
     Windows/PixelHistoryView.cpp \
+    Windows/RenderTargetHistoryView.cpp \
     Widgets/PipelineFlowChart.cpp \
     Windows/Dialogs/EnvironmentEditor.cpp \
     Widgets/FindReplace.cpp \
@@ -250,6 +254,9 @@ SOURCES += Code/qrenderdoc.cpp \
     Windows/Dialogs/TipsDialog.cpp \
     Windows/Dialogs/ConfigEditor.cpp \
     Windows/AI/AIAssistant.cpp \
+    Windows/AI/AIFileThumbnail.cpp \
+    Windows/AI/AIAgentMonitorWindow.cpp \
+    Windows/AI/AIAgentTraceStore.cpp \
     Windows/AI/AIConversationListView.cpp \
     Windows/AI/AIConversationStore.cpp \
     Windows/AI/AIConversationView.cpp \
@@ -268,7 +275,9 @@ HEADERS += Code/CaptureContext.h \
     Code/qprocessinfo.h \
     Code/ReplayManager.h \
     Code/ReplayLab/ReplayLabIntegration.h \
+    Code/ReplayLab/ReplayLabCBufferAliases.h \
     Code/CodeEditorService.h \
+    Widgets/ShaderCodeEditor.h \
     Code/TranslationManager.h \
     Code/ScintillaSyntax.h \
     Code/QRDUtils.h \
@@ -291,6 +300,7 @@ HEADERS += Code/CaptureContext.h \
     Windows/Dialogs/UpdateDialog.h \
     Windows/MainWindow.h \
     Windows/EventBrowser.h \
+    Windows/BookmarksView.h \
     Windows/TextureViewer.h \
     Windows/ShaderViewer.h \
     Windows/ShaderMessageViewer.h \
@@ -341,6 +351,7 @@ HEADERS += Code/CaptureContext.h \
     Windows/Dialogs/RemoteManager.h \
     Windows/Dialogs/ExtensionManager.h \
     Windows/PixelHistoryView.h \
+    Windows/RenderTargetHistoryView.h \
     Widgets/PipelineFlowChart.h \
     Windows/Dialogs/EnvironmentEditor.h \
     Widgets/FindReplace.h \
@@ -357,6 +368,9 @@ HEADERS += Code/CaptureContext.h \
     Windows/Dialogs/CameraControlsDialog.h \
     Windows/Dialogs/ProjectionGuessDialog.h \
     Windows/AI/AIAssistant.h \
+    Windows/AI/AIFileThumbnail.h \
+    Windows/AI/AIAgentMonitorWindow.h \
+    Windows/AI/AIAgentTraceStore.h \
     Windows/AI/AIConversationListView.h \
     Windows/AI/AIConversationStore.h \
     Windows/AI/AIConversationView.h \

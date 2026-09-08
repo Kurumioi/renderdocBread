@@ -13,6 +13,7 @@ remain usable without Qt so they can be contract-tested independently.
 
 from __future__ import print_function
 
+from contextlib import contextmanager
 import ctypes
 import hashlib
 import json
@@ -42,6 +43,28 @@ ORGANIZATION_GATE_SCHEMA = "renderdoc-ai-shader-organization-gate/v1"
 ORGANIZATION_POLICY_VERSION = "renderdoc-ai-organize-workspace/v1"
 CONSOLE_SCHEMA = "replaylab-console/v1"
 JOURNAL_EVENT_SCHEMA = "replaylab-console-event/v1"
+ACTIVE_PROJECT_SELECTION_SCHEMA = "replaylab-active-project-selection/v1"
+ACTIVE_PROJECT_WORKSPACE_SCHEMA = "replaylab-project-workspace/v1"
+ACTIVE_PROJECT_REGISTRY_SCHEMA = "replaylab-project-registry/v1"
+REPLAY_PROJECT_SCHEMA = "renderdoc-ultra-replay-project/v1"
+PROJECT_SHADER_LIBRARY_SCHEMA = "replaylab-project-shader-library/v1"
+COMPILED_CANDIDATE_SCHEMA = "renderdoc-ultra-project-compiled-candidate/v1"
+SHADER_FLOW_GRAPH_SCHEMA = "replaylab-shader-flow-graph/v1"
+SHADER_FLOW_GRAPH_VERSION = 1
+SHARED_DICTIONARY_SCHEMA = "replaylab-shared-dictionary/v1"
+SHARED_DICTIONARY_VERSION = 1
+
+ACTIVE_PROJECT_STATE_ENV = "RENDERDOC_ULTRA_ACTIVE_PROJECT_STATE"
+ACTIVE_PROJECT_LAYOUT = {
+    "metadataDirectory": ".replaylab",
+    "workspaceManifest": ".replaylab/workspace.json",
+    "replayProject": ".replaylab/replay-project",
+    "captureCatalogs": "captures/catalogs",
+    "shaderWorkspaces": "workspaces/shaders",
+    "sharedDictionaries": "shared/dictionaries",
+    "sharedExplanatory": "shared/dictionaries/explanatory",
+    "sharedIndex": "shared/dictionaries/index.json",
+}
 
 MAX_REGISTRY_BYTES = 1024 * 1024
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
@@ -63,6 +86,16 @@ MAX_JOURNAL_RETENTION_BYTES = 32 * 1024 * 1024
 MAX_JOURNAL_DIRECTORY_ENTRIES = 512
 JOURNAL_RETENTION_CHECK_INTERVAL = 128
 JOURNAL_RETENTION_MIN_INTERVAL_SECONDS = 60.0
+MAX_PROJECT_MANIFEST_BYTES = 64 * 1024 * 1024
+MAX_PROJECT_KNOWLEDGE = 4096
+MAX_PROJECT_CAPTURES = 256
+MAX_PROJECT_ACTIVE_HEADS = 65536
+MAX_PROJECT_EXPLANATORY_RECORDS = 4096
+MAX_PROJECT_COMPILED_CANDIDATE_BYTES = 64 * 1024 * 1024
+MAX_PROJECT_INVENTORY_OBSERVATIONS = 4096
+MAX_SHADER_FLOW_GRAPH_BYTES = 1024 * 1024
+MAX_SHADER_FLOW_GRAPH_NODES = 256
+MAX_SHADER_FLOW_GRAPH_EDGES = 1024
 
 CONSOLE_SEVERITIES = ("info", "warning", "error")
 CONSOLE_MODULES = (
@@ -71,12 +104,15 @@ CONSOLE_MODULES = (
 )
 CONSOLE_CONTEXT_FIELDS = (
     "operation", "captureId", "captureSessionId", "eventId", "resourceId",
-    "stage", "passId", "projectId", "workspaceId",
+    "stage", "passId", "projectId", "workspaceId", "jobId", "failureCode",
+    "diagnostics",
 )
 
 TOKEN_RE = re.compile(r"^[0-9a-f]{32,64}$")
 EXACT_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+FLOW_GRAPH_NODE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+HLSL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SOURCE_EXTENSION_RE = re.compile(
     r"\.(?:hlsl|hlsli|fx|fxh|glsl|vert|frag|comp|geom|tesc|tese)$",
     re.IGNORECASE,
@@ -130,8 +166,44 @@ class ShaderConsoleConflictError(ShaderConsoleError):
     pass
 
 
+class ShaderConsoleReadCancelled(RuntimeError):
+    """A background read lost its owner; never convert it into invalid data."""
+
+
+_console_read_scope = threading.local()
+
+
+def _check_console_read_cancelled():
+    for event in getattr(_console_read_scope, "events", ()):
+        if event.is_set():
+            # i18n-ignore: private worker cancellation, discarded before UI delivery.
+            raise ShaderConsoleReadCancelled("Shader console read was cancelled")
+
+
+@contextmanager
+def cancellable_console_reads(stop_event):
+    """Cancel bounded file/validation work without altering its trust checks.
+
+    The scope is worker-local and nestable.  It cannot interrupt a single OS
+    read, but stops before the next file, read chunk, or validation iteration.
+    Save/Host operations do not enter this read-only cancellation scope.
+    """
+    previous = getattr(_console_read_scope, "events", ())
+    _console_read_scope.events = previous + (stop_event,)
+    try:
+        _check_console_read_cancelled()
+        yield
+        _check_console_read_cancelled()
+    finally:
+        if previous:
+            _console_read_scope.events = previous
+        else:
+            del _console_read_scope.events
+
+
 def _canonical_sha256(value):
     """Match the Host registry's stable identity digest exactly."""
+    _check_console_read_cancelled()
     try:
         payload = json.dumps(
             value, ensure_ascii=False, sort_keys=True,
@@ -149,6 +221,23 @@ def default_registry_path(local_app_data=None):
         return ""
     return os.path.abspath(os.path.join(
         root, "ReplayLab", "config", "shader-live-edit-authorizations.v1.json"))
+
+
+def default_active_project_selection_path(local_app_data=None, environment=None):
+    """Return the process-owned active-project selection path used by the Host."""
+    env = os.environ if environment is None else environment
+    configured = str(env.get(ACTIVE_PROJECT_STATE_ENV, "") or "").strip()
+    if configured:
+        return os.path.abspath(os.path.expanduser(configured))
+    root = str(local_app_data or env.get("LOCALAPPDATA", "") or "").strip()
+    if root:
+        data_root = os.path.expanduser(root)
+    else:
+        xdg = str(env.get("XDG_DATA_HOME", "") or "").strip()
+        data_root = (os.path.expanduser(xdg) if xdg else
+                     os.path.join(os.path.expanduser("~"), ".local", "share"))
+    return os.path.abspath(os.path.join(
+        data_root, "ReplayLab", "config", "active-project.json"))
 
 
 def default_console_journal_directory(local_app_data=None):
@@ -197,7 +286,10 @@ def _console_context(value):
         item = value[key]
         if isinstance(item, bool) or not isinstance(item, (str, int, float)):
             raise ShaderConsoleError("console event context field is invalid")
-        clean[key] = _bounded(item, 1024)
+        # _bounded appends an ellipsis after its content limit. Use 1021 so
+        # every accepted context scalar, including non-authoritative failure
+        # diagnostics, remains at or below the documented 1024-character cap.
+        clean[key] = _bounded(item, 1021)
     return clean
 
 
@@ -483,6 +575,7 @@ def _within(root, path):
 
 
 def _regular_file(path, maximum, field):
+    _check_console_read_cancelled()
     value = os.path.abspath(str(path))
     if not os.path.isfile(value) or _is_reparse(value):
         raise ShaderConsoleError("%s is unavailable or redirected" % field)
@@ -494,6 +587,7 @@ def _regular_file(path, maximum, field):
 
 def _regular_file_in_tree(root, path, maximum, field):
     """Accept a regular file only through ordinary directories under root."""
+    _check_console_read_cancelled()
     root_value = _directory(root, field + " root")
     value = os.path.abspath(str(path))
     if not _within(root_value, value):
@@ -609,6 +703,7 @@ def _read_file_bytes(path, maximum, field):
         remaining = int(size.value)
         chunks = []
         while remaining > 0:
+            _check_console_read_cancelled()
             request = min(remaining, 64 * 1024)
             buffer = ctypes.create_string_buffer(request)
             received = ctypes.c_uint32()
@@ -714,6 +809,7 @@ def _read_file_tail_bytes(path, maximum, tail_maximum, field):
         remaining = size - read_start
         chunks = []
         while remaining > 0:
+            _check_console_read_cancelled()
             request = min(remaining, 64 * 1024)
             buffer = ctypes.create_string_buffer(request)
             received = ctypes.c_uint32()
@@ -740,6 +836,7 @@ def _read_file_tail_bytes(path, maximum, tail_maximum, field):
 
 
 def _directory(path, field):
+    _check_console_read_cancelled()
     value = os.path.abspath(str(path))
     if not os.path.isdir(value) or _is_reparse(value):
         raise ShaderConsoleError("%s is unavailable or redirected" % field)
@@ -749,6 +846,7 @@ def _directory(path, field):
 def _read_json(path, maximum, field):
     try:
         raw = _read_file_bytes(path, maximum, field)
+        _check_console_read_cancelled()
         value = json.loads(raw.decode("utf-8", errors="strict"))
     except ShaderConsoleError:
         raise
@@ -768,6 +866,1736 @@ def _safe_relative(root, relative, field):
     if not _within(root, candidate):
         raise ShaderConsoleError("%s escapes its workspace" % field)
     return candidate
+
+
+def _project_canonical_sha256(value, omitted_field=""):
+    _check_console_read_cancelled()
+    material = dict(value) if isinstance(value, dict) else value
+    if omitted_field and isinstance(material, dict):
+        material.pop(omitted_field, None)
+    try:
+        payload = json.dumps(
+            material, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise ShaderConsoleError(
+            "project document is not canonical JSON: %s" % _bounded(exc, 512))
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _project_text(value, field, maximum=4096, allow_empty=False,
+                  single_line=False):
+    if not isinstance(value, str):
+        raise ShaderConsoleError("%s must be text" % field)
+    clean = value.strip()
+    if ((not clean and not allow_empty) or len(clean) > maximum or
+            "\x00" in clean or (single_line and ("\r" in clean or "\n" in clean))):
+        raise ShaderConsoleError("%s has invalid content" % field)
+    return clean
+
+
+def _project_sha256(value, field, allow_empty=False):
+    clean = str(value or "").strip().lower()
+    if not clean and allow_empty:
+        return ""
+    if SHA256_RE.fullmatch(clean) is None:
+        raise ShaderConsoleError("%s must be a lowercase SHA-256" % field)
+    return clean
+
+
+def _project_token(value, field):
+    clean = str(value or "").strip().lower()
+    if EXACT_TOKEN_RE.fullmatch(clean) is None:
+        raise ShaderConsoleError("%s must be 32 lowercase hexadecimal characters" % field)
+    return clean
+
+
+def _project_positive(value, field):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ShaderConsoleError("%s must be a positive integer" % field)
+    return value
+
+
+def _project_nonnegative(value, field):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ShaderConsoleError("%s must be a non-negative integer" % field)
+    return value
+
+
+def _verify_project_seal(value, hash_field, field):
+    digest = _project_sha256(value.get(hash_field), field + "." + hash_field)
+    if digest != _project_canonical_sha256(value, hash_field):
+        raise ShaderConsoleError("%s seal is invalid" % field)
+    return digest
+
+
+def _read_project_json(path, maximum, field, root=""):
+    filename = os.path.abspath(str(path))
+    if root:
+        _regular_file_in_tree(root, filename, maximum, field)
+    raw = _read_file_bytes(filename, maximum, field)
+    _check_console_read_cancelled()
+    try:
+        value = json.loads(raw.decode("utf-8", errors="strict"))
+    except (UnicodeError, ValueError, TypeError) as exc:
+        raise ShaderConsoleError("%s is invalid: %s" % (field, _bounded(exc, 512)))
+    if not isinstance(value, dict):
+        raise ShaderConsoleError("%s must contain one JSON object" % field)
+    return value, hashlib.sha256(raw).hexdigest()
+
+
+def _project_relative_path(root, relative, field, expected=""):
+    clean = _project_text(relative, field, 4096)
+    if (clean != relative or "\\" in clean or clean.startswith("/") or
+            re.match(r"^[A-Za-z]:", clean)):
+        raise ShaderConsoleError("%s must be a canonical project-relative path" % field)
+    parts = clean.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ShaderConsoleError("%s must be a canonical project-relative path" % field)
+    if expected and clean != expected:
+        raise ShaderConsoleError("%s is not content-addressed" % field)
+    root_value = _directory(root, field + " root")
+    candidate = os.path.abspath(os.path.join(root_value, *parts))
+    if not _within(root_value, candidate):
+        raise ShaderConsoleError("%s escapes its project" % field)
+    current = root_value
+    for part in parts[:-1]:
+        current = os.path.join(current, part)
+        if not os.path.isdir(current) or _is_reparse(current):
+            raise ShaderConsoleError("%s directory is unavailable or redirected" % field)
+    return candidate
+
+
+def _project_api_family(value, field, allow_empty=True):
+    clean = _project_text(value, field, 64, allow_empty=allow_empty,
+                          single_line=True)
+    normal = re.sub(r"[^a-z0-9]+", "", clean.lower())
+    normal = {
+        "direct3d11": "d3d11", "directx11": "d3d11",
+        "direct3d12": "d3d12", "directx12": "d3d12",
+    }.get(normal, normal)
+    if clean != normal:
+        raise ShaderConsoleError("%s is not canonical" % field)
+    return clean
+
+
+def _project_identity_api_family(value):
+    clean = re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+    clean = {
+        "direct3d11": "d3d11", "directx11": "d3d11",
+        "direct3d12": "d3d12", "directx12": "d3d12",
+        "opengl": "opengl", "vulkan": "vulkan", "metal": "metal",
+    }.get(clean, clean)
+    if not clean or len(clean) > 64:
+        raise ShaderConsoleError("project Shader API family is invalid")
+    return clean
+
+
+def _project_shader_encoding(value):
+    clean = re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+    encoding = {
+        "dxbc": "DXBC",
+        "dxil": "DXIL",
+        "spirv": "SPIR-V",
+        "openglspirv": "OpenGL-SPIR-V",
+        "glsl": "GLSL",
+        "metallib": "METALLIB",
+    }.get(clean)
+    if encoding is None:
+        raise ShaderConsoleError(
+            "project Shader encoding is unsupported or not canonicalizable")
+    return encoding
+
+
+def _project_stable_shader_encoding(value):
+    return {
+        "DXBC": "dxbc",
+        "DXIL": "dxil",
+        "SPIR-V": "spirv",
+        "OpenGL-SPIR-V": "opengl-spirv",
+        "GLSL": "glsl",
+        "METALLIB": "metallib",
+    }[_project_shader_encoding(value)]
+
+
+def _project_normalized_stage(value):
+    clean = re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+    stage = {
+        "vs": "vertex", "vertex": "vertex",
+        "hs": "hull", "hull": "hull", "tesscontrol": "hull",
+        "ds": "domain", "domain": "domain", "tesseval": "domain",
+        "gs": "geometry", "geometry": "geometry",
+        "ps": "fragment", "pixel": "fragment", "fs": "fragment",
+        "fragment": "fragment",
+        "cs": "compute", "compute": "compute",
+        "as": "task", "amplification": "task",
+        "task": "task", "ms": "mesh", "mesh": "mesh",
+        "raygen": "raygen", "raygeneration": "raygen",
+        "intersection": "intersection",
+        "anyhit": "anyhit", "closesthit": "closesthit", "miss": "miss",
+        "callable": "callable",
+    }.get(clean)
+    if stage is None:
+        raise ShaderConsoleError(
+            "project Shader stage is unsupported or not canonicalizable")
+    return stage
+
+
+def _project_stable_shader_identity_sha256(identity):
+    material = dict(identity)
+    material["encoding"] = _project_stable_shader_encoding(
+        identity.get("encoding"))
+    return _project_canonical_sha256(material)
+
+
+def _project_compiler_binding_identity(value):
+    fields = {
+        "schema", "schemaVersion", "targetProfile", "routePlanSha256",
+        "hops", "executionAuthority", "evidenceOnly", "bindingSha256",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ShaderConsoleError("project compiler binding fields are invalid")
+    if (value.get("schema") !=
+            "renderdoc-ultra-shader-compiler-binding/v1" or
+            value.get("schemaVersion") != 1 or
+            value.get("executionAuthority") is not False or
+            value.get("evidenceOnly") is not True or
+            not isinstance(value.get("targetProfile"), dict)):
+        raise ShaderConsoleError("project compiler binding policy is invalid")
+    route_plan = value.get("routePlanSha256")
+    if route_plan is not None:
+        route_plan = _project_sha256(
+            route_plan, "compilerBinding.routePlanSha256")
+    raw_hops = value.get("hops")
+    if (not isinstance(raw_hops, list) or not raw_hops or
+            len(raw_hops) > 4):
+        raise ShaderConsoleError("project compiler binding hops are invalid")
+    hops = []
+    for index, raw_hop in enumerate(raw_hops):
+        label = "compilerBinding.hops[%d]" % index
+        if not isinstance(raw_hop, dict) or set(raw_hop) != {
+                "hop", "routeId", "inputFormat", "outputFormat", "toolId",
+                "operation", "toolConfigDigest", "executableSha256",
+                "fixedFileHashes", "argumentTemplate", "placeholders"}:
+            raise ShaderConsoleError("%s fields are invalid" % label)
+        fixed_hashes = raw_hop.get("fixedFileHashes")
+        arguments = raw_hop.get("argumentTemplate")
+        placeholders = raw_hop.get("placeholders")
+        if (not isinstance(fixed_hashes, dict) or len(fixed_hashes) > 64 or
+                not isinstance(arguments, list) or len(arguments) > 128 or
+                not isinstance(placeholders, list) or
+                len(placeholders) > 32):
+            raise ShaderConsoleError("%s compiler metadata is invalid" % label)
+        clean_fixed = {}
+        for path, digest in fixed_hashes.items():
+            clean_path = _project_text(
+                path, label + ".fixedFilePath", 4096)
+            if clean_path in clean_fixed:
+                raise ShaderConsoleError(
+                    "project compiler fixed file path is duplicated")
+            clean_fixed[clean_path] = _project_sha256(
+                digest, label + ".fixedFileSha256")
+        clean_arguments = [
+            _project_text(argument, label + ".argumentTemplate", 8192)
+            for argument in arguments
+        ]
+        clean_placeholders = [
+            _project_text(placeholder, label + ".placeholder", 128)
+            for placeholder in placeholders
+        ]
+        if len(set(clean_placeholders)) != len(clean_placeholders):
+            raise ShaderConsoleError(
+                "project compiler placeholders are duplicated")
+        hop = {
+            "hop": _project_positive(raw_hop.get("hop"), label + ".hop"),
+            "routeId": _project_text(
+                raw_hop.get("routeId"), label + ".routeId", 256),
+            "inputFormat": _project_text(
+                raw_hop.get("inputFormat"), label + ".inputFormat", 64),
+            "outputFormat": _project_text(
+                raw_hop.get("outputFormat"), label + ".outputFormat", 64),
+            "toolId": _project_text(
+                raw_hop.get("toolId"), label + ".toolId", 128),
+            "operation": _project_text(
+                raw_hop.get("operation"), label + ".operation", 64),
+            "toolConfigDigest": _project_sha256(
+                raw_hop.get("toolConfigDigest"),
+                label + ".toolConfigDigest"),
+            "executableSha256": _project_sha256(
+                raw_hop.get("executableSha256"),
+                label + ".executableSha256"),
+            "fixedFileHashes": clean_fixed,
+            "argumentTemplate": clean_arguments,
+            "placeholders": clean_placeholders,
+        }
+        if hop["hop"] != index + 1:
+            raise ShaderConsoleError("project compiler hop order is invalid")
+        hops.append(hop)
+    result = {
+        "schema": "renderdoc-ultra-shader-compiler-binding/v1",
+        "schemaVersion": 1,
+        "targetProfile": dict(value["targetProfile"]),
+        "routePlanSha256": route_plan,
+        "hops": hops,
+        "executionAuthority": False,
+        "evidenceOnly": True,
+    }
+    digest = _project_canonical_sha256(result)
+    if (_project_sha256(value.get("bindingSha256"),
+                        "compilerBinding.bindingSha256") != digest):
+        raise ShaderConsoleError("project compiler binding hash mismatch")
+    result["bindingSha256"] = digest
+    if dict(value) != result:
+        raise ShaderConsoleError("project compiler binding is not canonical")
+    return result
+
+
+def _project_assembly_disassembly_identity(value):
+    if not isinstance(value, dict):
+        raise ShaderConsoleError("project assembly/disassembly artifact is invalid")
+    allowed = {
+        "kind", "role", "format", "path", "artifactPath", "sha256",
+        "byteSize", "routePlanSha256", "toolId", "toolConfigDigest",
+        "executableSha256", "inputFormat", "inputRawSha256", "routeId",
+        "operation", "physicalEvidence", "displayEvidenceOnly",
+        "editableSource", "applyAuthorization",
+    }
+    if (set(value) - allowed or
+            not {"kind", "role", "format", "sha256", "byteSize"}.issubset(
+                set(value))):
+        raise ShaderConsoleError(
+            "project assembly/disassembly artifact fields are invalid")
+    kind = value.get("kind")
+    role = value.get("role")
+    artifact_format = value.get("format")
+    if role not in ("baseline", "candidate"):
+        raise ShaderConsoleError(
+            "project assembly/disassembly artifact policy is invalid")
+    common = {
+        "role": role,
+        "sha256": _project_sha256(value.get("sha256"), "disassembly.sha256"),
+        "byteSize": _project_positive(
+            value.get("byteSize"), "disassembly.byteSize"),
+        "routePlanSha256": _project_sha256(
+            value.get("routePlanSha256"), "disassembly.routePlanSha256"),
+        "toolId": _project_text(
+            value.get("toolId"), "disassembly.toolId", 128),
+        "toolConfigDigest": _project_sha256(
+            value.get("toolConfigDigest"), "disassembly.toolConfigDigest"),
+        "executableSha256": _project_sha256(
+            value.get("executableSha256"), "disassembly.executableSha256"),
+        "physicalEvidence": True,
+        "editableSource": False,
+        "applyAuthorization": False,
+    }
+    if kind == "dxil-disassembly":
+        forbidden = {
+            "inputFormat", "inputRawSha256", "routeId", "operation",
+            "displayEvidenceOnly",
+        }
+        if (artifact_format != "dxil-asm" or
+                value.get("physicalEvidence") is not True or
+                value.get("editableSource") is not False or
+                value.get("applyAuthorization") is not False or
+                set(value) & forbidden):
+            raise ShaderConsoleError(
+                "project assembly/disassembly artifact policy is invalid")
+        result = {"kind": "dxil-disassembly"}
+        result.update(common)
+        result["format"] = "dxil-asm"
+        return result
+    expected_inputs = {
+        "dxbc-asm": "dxbc",
+        "spirv-asm": "spirv",
+        "opengl-spirv-asm": "opengl-spirv",
+    }
+    if (kind != "native-disassembly" or
+            artifact_format not in expected_inputs or
+            value.get("inputFormat") != expected_inputs.get(artifact_format) or
+            value.get("operation") != "decompile" or
+            value.get("physicalEvidence") is not True or
+            value.get("displayEvidenceOnly") is not True or
+            value.get("editableSource") is not False or
+            value.get("applyAuthorization") is not False):
+        raise ShaderConsoleError(
+            "project assembly/disassembly artifact policy is invalid")
+    result = {"kind": "native-disassembly"}
+    result.update(common)
+    result.update({
+        "format": artifact_format,
+        "inputFormat": expected_inputs[artifact_format],
+        "inputRawSha256": _project_sha256(
+            value.get("inputRawSha256"), "disassembly.inputRawSha256"),
+        "routeId": _project_text(
+            value.get("routeId"), "disassembly.routeId", 256),
+        "operation": "decompile",
+        "displayEvidenceOnly": True,
+    })
+    return result
+
+
+def _project_assembly_disassembly_relative(identity):
+    suffix = {
+        "dxil-asm": ".dxil-asm",
+        "dxbc-asm": ".dxbc-asm",
+        "spirv-asm": ".spvasm",
+        "opengl-spirv-asm": ".opengl.spvasm",
+    }.get(identity.get("format"))
+    if suffix is None:
+        raise ShaderConsoleError(
+            "project assembly/disassembly artifact format is invalid")
+    return "knowledge/workspaces/disassembly/%s%s" % (
+        identity["sha256"], suffix)
+
+
+def _validate_project_disassembly_artifact(root, value):
+    identity = _project_assembly_disassembly_identity(value)
+    if "path" in value or "artifactPath" not in value:
+        raise ShaderConsoleError(
+            "project disassembly artifact provenance is invalid")
+    expected = _project_assembly_disassembly_relative(identity)
+    artifact_path = _project_relative_path(
+        root, value.get("artifactPath"), "project disassembly artifact path",
+        expected)
+    canonical_record = dict(identity)
+    canonical_record["artifactPath"] = expected
+    if dict(value) != canonical_record:
+        raise ShaderConsoleError(
+            "project disassembly artifact is not canonical")
+    _regular_file_in_tree(
+        root, artifact_path, MAX_SOURCE_BYTES, "project disassembly artifact")
+    raw = _read_file_bytes(
+        artifact_path, MAX_SOURCE_BYTES, "project disassembly artifact")
+    if (not raw or len(raw) != identity["byteSize"] or
+            hashlib.sha256(raw).hexdigest() != identity["sha256"]):
+        raise ShaderConsoleError(
+            "project disassembly artifact size or hash mismatch")
+    try:
+        info = os.lstat(artifact_path)
+    except OSError as exc:
+        raise ShaderConsoleError(
+            "project disassembly artifact metadata is unavailable: %s" %
+            _bounded(exc, 512))
+    if (not stat.S_ISREG(info.st_mode) or _is_reparse(artifact_path) or
+            int(info.st_size) != len(raw)):
+        raise ShaderConsoleError(
+            "project disassembly artifact changed while it was read")
+    return identity, artifact_path
+
+
+def _project_inventory_origin_identity(value):
+    fields = {
+        "schema", "schemaVersion", "api", "encoding", "rawSha256",
+        "stage", "entryPoint", "abiHash", "layoutHash", "stableKeySha256",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ShaderConsoleError("project inventory origin fields are invalid")
+    if (value.get("schema") !=
+            "renderdoc-ultra-project-shader-inventory-origin/v1" or
+            value.get("schemaVersion") != 1):
+        raise ShaderConsoleError("project inventory origin schema is invalid")
+    identity = {
+        "api": _project_identity_api_family(value.get("api")),
+        "encoding": _project_shader_encoding(value.get("encoding")),
+        "rawSha256": _project_sha256(
+            value.get("rawSha256"), "inventoryOrigin.rawSha256"),
+        "stage": _project_normalized_stage(value.get("stage")),
+        "entryPoint": _project_text(
+            value.get("entryPoint"), "inventoryOrigin.entryPoint", 512,
+            allow_empty=True),
+        "abiHash": _project_sha256(
+            value.get("abiHash"), "inventoryOrigin.abiHash", True),
+        "layoutHash": _project_sha256(
+            value.get("layoutHash"), "inventoryOrigin.layoutHash", True),
+    }
+    stable = _project_stable_shader_identity_sha256(identity)
+    if (_project_sha256(value.get("stableKeySha256"),
+                        "inventoryOrigin.stableKeySha256") != stable):
+        raise ShaderConsoleError("project inventory origin stable key mismatch")
+    result = {
+        "schema": "renderdoc-ultra-project-shader-inventory-origin/v1",
+        "schemaVersion": 1,
+    }
+    result.update(identity)
+    result["stableKeySha256"] = stable
+    if dict(value) != result:
+        raise ShaderConsoleError("project inventory origin is not canonical")
+    return result
+
+
+def _project_inventory_observation(value):
+    fields = {
+        "schema", "schemaVersion", "captureId", "inventorySha256",
+        "stableKeySha256", "targetResourceId", "anchorEventId",
+        "constantBlocksSha256", "workspaceManifestSha256", "sourceSha256",
+        "compiledCandidateSha256", "applyAuthorization",
+        "crossCaptureResourceIdReuse", "observedAt", "receiptSha256",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ShaderConsoleError(
+            "project inventory observation fields are invalid")
+    if (value.get("schema") !=
+            "renderdoc-ultra-project-shader-inventory-observation/v1" or
+            value.get("schemaVersion") != 1 or
+            value.get("applyAuthorization") is not False or
+            value.get("crossCaptureResourceIdReuse") is not False):
+        raise ShaderConsoleError(
+            "project inventory observation policy is invalid")
+    anchor = value.get("anchorEventId")
+    material = {
+        "schema": "renderdoc-ultra-project-shader-inventory-observation/v1",
+        "schemaVersion": 1,
+        "captureId": _project_sha256(
+            value.get("captureId"), "inventoryObservation.captureId"),
+        "inventorySha256": _project_sha256(
+            value.get("inventorySha256"),
+            "inventoryObservation.inventorySha256"),
+        "stableKeySha256": _project_sha256(
+            value.get("stableKeySha256"),
+            "inventoryObservation.stableKeySha256"),
+        "targetResourceId": _project_positive(
+            value.get("targetResourceId"),
+            "inventoryObservation.targetResourceId"),
+        "anchorEventId": (
+            None if anchor is None else _project_positive(
+                anchor, "inventoryObservation.anchorEventId")),
+        "constantBlocksSha256": _project_sha256(
+            value.get("constantBlocksSha256"),
+            "inventoryObservation.constantBlocksSha256"),
+        "workspaceManifestSha256": _project_sha256(
+            value.get("workspaceManifestSha256"),
+            "inventoryObservation.workspaceManifestSha256"),
+        "sourceSha256": _project_sha256(
+            value.get("sourceSha256"), "inventoryObservation.sourceSha256"),
+        "compiledCandidateSha256": _project_sha256(
+            value.get("compiledCandidateSha256"),
+            "inventoryObservation.compiledCandidateSha256", True),
+        "applyAuthorization": False,
+        "crossCaptureResourceIdReuse": False,
+    }
+    observed_at = _project_text(
+        value.get("observedAt"), "inventoryObservation.observedAt", 128)
+    receipt = _project_canonical_sha256(material)
+    if (_project_sha256(value.get("receiptSha256"),
+                        "inventoryObservation.receiptSha256") != receipt):
+        raise ShaderConsoleError("project inventory observation hash mismatch")
+    result = dict(material)
+    result.update({"observedAt": observed_at, "receiptSha256": receipt})
+    if dict(value) != result:
+        raise ShaderConsoleError(
+            "project inventory observation is not canonical")
+    return result
+
+
+def _validate_project_registry(selection_path, workspace_id, project_root):
+    registry_path = os.path.join(os.path.dirname(selection_path), "project-registry.json")
+    value, file_sha256 = _read_project_json(
+        registry_path, MAX_REGISTRY_BYTES, "active project registry",
+        os.path.dirname(selection_path))
+    if set(value) != {
+            "schema", "schemaVersion", "projects", "updatedAt",
+            "registrySha256"}:
+        raise ShaderConsoleError("active project registry fields are invalid")
+    if (value.get("schema") != ACTIVE_PROJECT_REGISTRY_SCHEMA or
+            value.get("schemaVersion") != 1):
+        raise ShaderConsoleError("active project registry schema is invalid")
+    registry_sha256 = _verify_project_seal(
+        value, "registrySha256", "active project registry")
+    projects = value.get("projects")
+    if not isinstance(projects, list) or len(projects) > MAX_PROJECT_KNOWLEDGE:
+        raise ShaderConsoleError("active project registry entries are invalid")
+    matches = []
+    roots = set()
+    workspace_ids = set()
+    for record in projects:
+        if not isinstance(record, dict) or set(record) != {
+                "workspaceId", "projectRoot", "name", "registeredAt"}:
+            raise ShaderConsoleError("active project registry entry is invalid")
+        token = _project_token(record.get("workspaceId"),
+                               "registered workspaceId")
+        root_text = _project_text(
+            record.get("projectRoot"), "registered projectRoot", 4096)
+        if not os.path.isabs(root_text):
+            raise ShaderConsoleError("registered projectRoot must be absolute")
+        root_key = os.path.normcase(os.path.abspath(root_text))
+        if root_key in roots or token in workspace_ids:
+            raise ShaderConsoleError("active project registry contains a duplicate")
+        roots.add(root_key)
+        workspace_ids.add(token)
+        _project_text(record.get("name"), "registered project name", 256)
+        _project_text(record.get("registeredAt"), "project registration time", 128)
+        if (_same_path(root_text, project_root) and token == workspace_id):
+            matches.append(record)
+    if len(matches) != 1:
+        raise ShaderConsoleError(
+            "active project selection is not bound by the project registry")
+    return {
+        "path": registry_path,
+        "fileSha256": file_sha256,
+        "registrySha256": registry_sha256,
+    }
+
+
+def _validate_active_project_selection(selection_path):
+    parent = _directory(os.path.dirname(selection_path),
+                        "active project selection directory")
+    value, file_sha256 = _read_project_json(
+        selection_path, MAX_REGISTRY_BYTES, "active project selection", parent)
+    if set(value) != {
+            "schema", "schemaVersion", "workspaceId", "projectRoot",
+            "selectedAt", "selectionSha256"}:
+        raise ShaderConsoleError("active project selection fields are invalid")
+    if (value.get("schema") != ACTIVE_PROJECT_SELECTION_SCHEMA or
+            value.get("schemaVersion") != 1):
+        raise ShaderConsoleError("active project selection schema is invalid")
+    selection_sha256 = _verify_project_seal(
+        value, "selectionSha256", "active project selection")
+    workspace_id = _project_token(value.get("workspaceId"),
+                                  "active project workspaceId")
+    project_text = _project_text(value.get("projectRoot"), "active projectRoot", 4096)
+    if not os.path.isabs(project_text):
+        raise ShaderConsoleError("active projectRoot must be absolute")
+    if _is_reparse(project_text):
+        raise ShaderConsoleError("active projectRoot is redirected")
+    project_root = _directory(project_text, "active projectRoot")
+    if _same_path(project_root, os.path.abspath(os.path.join(project_root, os.pardir))):
+        raise ShaderConsoleError("active projectRoot must not be a filesystem root")
+    _project_text(value.get("selectedAt"), "active project selection time", 128)
+    registry = _validate_project_registry(
+        selection_path, workspace_id, project_root)
+    return {
+        "path": selection_path,
+        "fileSha256": file_sha256,
+        "selectionSha256": selection_sha256,
+        "workspaceId": workspace_id,
+        "projectRoot": project_root,
+        "registry": registry,
+    }
+
+
+def _validate_active_project_workspace(binding):
+    root = binding["projectRoot"]
+    manifest_path = _project_relative_path(
+        root, ACTIVE_PROJECT_LAYOUT["workspaceManifest"],
+        "project workspace manifest path")
+    value, file_sha256 = _read_project_json(
+        manifest_path, MAX_REGISTRY_BYTES, "project workspace manifest", root)
+    if set(value) != {
+            "schema", "schemaVersion", "workspaceId", "name", "state",
+            "scope", "assetRoot", "layout", "createdAt", "updatedAt",
+            "configSha256"}:
+        raise ShaderConsoleError("project workspace manifest fields are invalid")
+    if (value.get("schema") != ACTIVE_PROJECT_WORKSPACE_SCHEMA or
+            value.get("schemaVersion") != 1):
+        raise ShaderConsoleError("project workspace manifest schema is invalid")
+    config_sha256 = _verify_project_seal(
+        value, "configSha256", "project workspace manifest")
+    if _project_token(value.get("workspaceId"), "project workspaceId") != binding[
+            "workspaceId"]:
+        raise ShaderConsoleError(
+            "active selection does not match the project workspace")
+    name = _project_text(value.get("name"), "project workspace name", 256,
+                         allow_empty=True, single_line=True)
+    state = value.get("state")
+    if state not in ("pending-scope", "bound"):
+        raise ShaderConsoleError("project workspace state is invalid")
+    scope = value.get("scope")
+    if not isinstance(scope, dict) or set(scope) != {
+            "gameId", "buildId", "platform", "apiFamily"}:
+        raise ShaderConsoleError("project workspace scope is invalid")
+    game = _project_text(scope.get("gameId"), "scope.gameId", 256,
+                         allow_empty=True, single_line=True)
+    build = _project_text(scope.get("buildId"), "scope.buildId", 256,
+                          allow_empty=True, single_line=True)
+    _project_text(scope.get("platform"), "scope.platform", 128,
+                  allow_empty=True, single_line=True)
+    _project_api_family(scope.get("apiFamily"), "scope.apiFamily", True)
+    if state == "pending-scope" and any(scope.values()):
+        raise ShaderConsoleError("pending project carries a partial scope")
+    if state == "bound" and (not game or not build):
+        raise ShaderConsoleError("bound project has incomplete scope")
+    if value.get("layout") != ACTIVE_PROJECT_LAYOUT:
+        raise ShaderConsoleError("project workspace layout is invalid")
+    for key in (
+            "metadataDirectory", "captureCatalogs", "shaderWorkspaces",
+            "sharedDictionaries", "sharedExplanatory"):
+        path = _project_relative_path(
+            root, ACTIVE_PROJECT_LAYOUT[key], "project layout.%s" % key)
+        _directory(path, "project layout.%s" % key)
+    asset_root = _project_text(value.get("assetRoot"), "project assetRoot", 4096,
+                               allow_empty=True)
+    if asset_root and (not os.path.isabs(asset_root) or
+                       _within(root, asset_root) or _same_path(root, asset_root)):
+        raise ShaderConsoleError("project assetRoot has an unsafe boundary")
+    _project_text(value.get("createdAt"), "project creation time", 128)
+    _project_text(value.get("updatedAt"), "project update time", 128)
+    return {
+        "path": manifest_path,
+        "fileSha256": file_sha256,
+        "configSha256": config_sha256,
+        "name": name,
+        "state": state,
+        "scope": dict(scope),
+    }
+
+
+def _project_compiled_candidate_identity(value):
+    required = {
+        "schema", "schemaVersion", "rawSha256", "codeSha256", "byteSize",
+        "kind", "sourceSha256", "sourceRevision", "targetProfile",
+        "originBaselineAbiSha256", "originCandidateAbiSha256",
+        "originAbiReportSha256", "originRequestId", "validationScope",
+        "semanticEquivalenceVerified",
+    }
+    if (not isinstance(value, dict) or
+            not required.issubset(set(value)) or
+            set(value) - required - {"artifactPath"}):
+        raise ShaderConsoleError("project compiled candidate fields are invalid")
+    if (value.get("schema") != COMPILED_CANDIDATE_SCHEMA or
+            value.get("schemaVersion") != 1 or
+            value.get("validationScope") != "replay-reflection-abi-compatible" or
+            value.get("semanticEquivalenceVerified") is not False):
+        raise ShaderConsoleError("project compiled candidate policy is invalid")
+    profile = value.get("targetProfile")
+    if not isinstance(profile, dict):
+        raise ShaderConsoleError("project compiled candidate targetProfile is invalid")
+    identity = {
+        "schema": COMPILED_CANDIDATE_SCHEMA,
+        "schemaVersion": 1,
+        "rawSha256": _project_sha256(
+            value.get("rawSha256"), "compiledCandidate.rawSha256"),
+        "codeSha256": _project_sha256(
+            value.get("codeSha256"), "compiledCandidate.codeSha256"),
+        "byteSize": _project_positive(
+            value.get("byteSize"), "compiledCandidate.byteSize"),
+        "kind": _project_text(value.get("kind"), "compiledCandidate.kind", 64,
+                              single_line=True),
+        "sourceSha256": _project_sha256(
+            value.get("sourceSha256"), "compiledCandidate.sourceSha256"),
+        "sourceRevision": _project_positive(
+            value.get("sourceRevision"), "compiledCandidate.sourceRevision"),
+        "targetProfile": dict(profile),
+        "originBaselineAbiSha256": _project_sha256(
+            value.get("originBaselineAbiSha256"),
+            "compiledCandidate.originBaselineAbiSha256"),
+        "originCandidateAbiSha256": _project_sha256(
+            value.get("originCandidateAbiSha256"),
+            "compiledCandidate.originCandidateAbiSha256"),
+        "originAbiReportSha256": _project_sha256(
+            value.get("originAbiReportSha256"),
+            "compiledCandidate.originAbiReportSha256"),
+        "originRequestId": _project_text(
+            value.get("originRequestId"), "compiledCandidate.originRequestId", 256),
+        "validationScope": "replay-reflection-abi-compatible",
+        "semanticEquivalenceVerified": False,
+    }
+    return identity
+
+
+def _validate_project_compiled_candidate(root, value, record):
+    identity = _project_compiled_candidate_identity(value)
+    if "artifactPath" not in value:
+        raise ShaderConsoleError(
+            "project compiled candidate artifact provenance is invalid")
+    if (identity["sourceSha256"] != record["sourceSha256"] or
+            identity["targetProfile"] != record["targetProfile"] or
+            identity["originBaselineAbiSha256"] != record["baselineAbiSha256"]):
+        raise ShaderConsoleError("project compiled candidate binding is invalid")
+    expected = "knowledge/workspaces/binaries/%s.bin" % identity["rawSha256"]
+    artifact_path = _project_relative_path(
+        root, value.get("artifactPath"), "project compiled candidate artifact path",
+        expected)
+    canonical_record = dict(identity)
+    canonical_record["artifactPath"] = expected
+    if dict(value) != canonical_record:
+        raise ShaderConsoleError(
+            "project compiled candidate is not canonical")
+    _regular_file_in_tree(
+        root, artifact_path, MAX_PROJECT_COMPILED_CANDIDATE_BYTES,
+        "project compiled candidate artifact")
+    raw = _read_file_bytes(
+        artifact_path, MAX_PROJECT_COMPILED_CANDIDATE_BYTES,
+        "project compiled candidate artifact")
+    if (not raw or len(raw) != identity["byteSize"] or
+            hashlib.sha256(raw).hexdigest() != identity["rawSha256"]):
+        raise ShaderConsoleError(
+            "project compiled candidate artifact size or hash mismatch")
+    try:
+        info = os.lstat(artifact_path)
+    except OSError as exc:
+        raise ShaderConsoleError(
+            "project compiled candidate artifact metadata is unavailable: %s" %
+            _bounded(exc, 512))
+    if (not stat.S_ISREG(info.st_mode) or _is_reparse(artifact_path) or
+            int(info.st_size) != len(raw)):
+        raise ShaderConsoleError(
+            "project compiled candidate artifact changed while it was read")
+    return identity, artifact_path
+
+
+def _project_inventory_workspace_artifact_identity(value):
+    if not isinstance(value, dict):
+        raise ShaderConsoleError("project inventory workspace artifact is invalid")
+    origin = _project_inventory_origin_identity(value.get("inventoryOrigin"))
+    profile = value.get("targetProfile")
+    if not isinstance(profile, dict):
+        raise ShaderConsoleError(
+            "project inventory workspace targetProfile is invalid")
+    physical = {
+        "stage": _project_normalized_stage(value.get("stage")),
+        "entryPoint": _project_text(
+            value.get("entryPoint"), "inventoryWorkspace.entryPoint", 512,
+            allow_empty=True),
+        "rawSha256": _project_sha256(
+            value.get("rawSha256"), "inventoryWorkspace.rawSha256"),
+        "codeSha256": _project_sha256(
+            value.get("codeSha256"), "inventoryWorkspace.codeSha256", True),
+        "layoutHash": _project_sha256(
+            value.get("layoutHash"), "inventoryWorkspace.layoutHash", True),
+        "interfaceHash": _project_sha256(
+            value.get("interfaceHash"), "inventoryWorkspace.interfaceHash", True),
+        "interfaceComplete": value.get("interfaceComplete") is True,
+        "baselineAbiSha256": _project_sha256(
+            value.get("baselineAbiSha256"),
+            "inventoryWorkspace.baselineAbiSha256", True),
+    }
+    identity = {
+        "schema": "renderdoc-ultra-project-shader-artifact-identity/v1",
+        "schemaVersion": 1,
+        "stableShader": origin,
+        "physicalIdentity": physical,
+        "targetProfile": dict(profile),
+        "sourceSha256": _project_sha256(
+            value.get("sourceSha256"), "inventoryWorkspace.sourceSha256"),
+    }
+    if (physical["stage"] != origin["stage"] or
+            physical["entryPoint"] != origin["entryPoint"] or
+            physical["rawSha256"] != origin["rawSha256"] or
+            physical["layoutHash"] != origin["layoutHash"] or
+            physical["baselineAbiSha256"] != origin["abiHash"]):
+        raise ShaderConsoleError(
+            "project inventory workspace physical identity differs from its "
+            "stable Shader")
+    compiler = value.get("compilerBinding")
+    if compiler is not None:
+        clean_compiler = _project_compiler_binding_identity(compiler)
+        if clean_compiler["targetProfile"] != identity["targetProfile"]:
+            raise ShaderConsoleError(
+                "project inventory compiler binding target profile differs")
+        identity["compilerBinding"] = clean_compiler
+    disassembly = value.get("assemblyDisassemblyArtifacts", [])
+    if not isinstance(disassembly, list) or len(disassembly) > 2:
+        raise ShaderConsoleError(
+            "project inventory assembly/disassembly artifacts are invalid")
+    if disassembly:
+        clean_disassembly = [
+            _project_assembly_disassembly_identity(item)
+            for item in disassembly
+        ]
+        roles = [item["role"] for item in clean_disassembly]
+        if len(set(roles)) != len(roles):
+            raise ShaderConsoleError(
+                "project inventory disassembly role is duplicated")
+        if any(
+                item["kind"] == "native-disassembly" and
+                (item["role"] != "baseline" or
+                 item["inputRawSha256"] != physical["rawSha256"])
+                for item in clean_disassembly):
+            raise ShaderConsoleError(
+                "project inventory native disassembly physical binding mismatch")
+        identity["assemblyDisassemblyArtifacts"] = clean_disassembly
+    compiled = value.get("compiledCandidate")
+    if compiled is not None:
+        clean_compiled = _project_compiled_candidate_identity(compiled)
+        if (clean_compiled["sourceSha256"] != identity["sourceSha256"] or
+                clean_compiled["targetProfile"] != identity["targetProfile"] or
+                clean_compiled["originBaselineAbiSha256"] !=
+                physical["baselineAbiSha256"]):
+            raise ShaderConsoleError(
+                "project inventory compiled candidate binding mismatch")
+        identity["compiledArtifact"] = {
+            "schema": clean_compiled["schema"],
+            "schemaVersion": clean_compiled["schemaVersion"],
+            "rawSha256": clean_compiled["rawSha256"],
+            "codeSha256": clean_compiled["codeSha256"],
+            "byteSize": clean_compiled["byteSize"],
+            "kind": clean_compiled["kind"],
+            "sourceSha256": clean_compiled["sourceSha256"],
+            "targetProfile": clean_compiled["targetProfile"],
+            "originBaselineAbiSha256": clean_compiled[
+                "originBaselineAbiSha256"],
+            "originCandidateAbiSha256": clean_compiled[
+                "originCandidateAbiSha256"],
+            "validationScope": clean_compiled["validationScope"],
+            "semanticEquivalenceVerified": clean_compiled[
+                "semanticEquivalenceVerified"],
+        }
+    return identity
+
+
+def _project_capture_revision(captures, capture_id, catalog_sha256):
+    matches = [item for item in captures if (
+        isinstance(item, dict) and item.get("captureId") == capture_id)]
+    if len(matches) != 1:
+        raise ShaderConsoleError("project workspace capture provenance is unavailable")
+    capture = matches[0]
+    revisions = capture.get("catalogRevisions")
+    if revisions is None:
+        if capture.get("catalogSha256") != catalog_sha256:
+            raise ShaderConsoleError("project workspace catalog provenance is unavailable")
+        revision = capture
+    else:
+        if not isinstance(revisions, list) or not revisions:
+            raise ShaderConsoleError("project capture revisions are invalid")
+        selected = [item for item in revisions if (
+            isinstance(item, dict) and item.get("catalogSha256") == catalog_sha256)]
+        if len(selected) != 1:
+            raise ShaderConsoleError("project workspace catalog provenance is unavailable")
+        revision = selected[0]
+    shaders = revision.get("shaders")
+    if not isinstance(shaders, list) or len(shaders) > 65536:
+        raise ShaderConsoleError("project capture shaders are invalid")
+    return shaders
+
+
+def _validate_project_workspace_record(root, captures, record, activation_revision):
+    required = {
+        "workspaceId", "captureId", "originCatalogSha256", "stage",
+        "entryPoint", "rawSha256", "codeSha256", "layoutHash",
+        "interfaceHash", "interfaceComplete", "baselineAbiSha256",
+        "targetProfile", "sourceSha256", "analysisSha256", "knowledgeId",
+        "sourcePath", "sourceOriginPath", "workspacePath",
+        "workspaceManifestSha256", "registeredAt",
+    }
+    optional = {
+        "originResourceId", "compiledCandidate", "analysisPath",
+        "analysisKind", "analysisPolicy", "compilerBinding",
+        "assemblyDisassemblyArtifacts", "inventoryOrigin",
+        "inventoryObservations",
+    }
+    if (not isinstance(record, dict) or not required.issubset(set(record)) or
+            set(record) - required - optional):
+        raise ShaderConsoleError("project workspace knowledge fields are invalid")
+    knowledge_id = _project_token(record.get("knowledgeId"),
+                                  "project workspace knowledgeId")
+    clean = {
+        "workspaceId": _project_token(record.get("workspaceId"),
+                                      "project source workspaceId"),
+        "captureId": _project_sha256(record.get("captureId"),
+                                     "project source captureId"),
+        "originCatalogSha256": _project_sha256(
+            record.get("originCatalogSha256"), "project source originCatalogSha256"),
+        "stage": _project_text(record.get("stage"), "project source stage", 64,
+                               single_line=True).lower(),
+        "entryPoint": _project_text(
+            record.get("entryPoint"), "project source entryPoint", 512,
+            allow_empty=True, single_line=True),
+        "rawSha256": _project_sha256(record.get("rawSha256"),
+                                     "project source rawSha256"),
+        "codeSha256": _project_sha256(record.get("codeSha256"),
+                                      "project source codeSha256", True),
+        "layoutHash": _project_sha256(record.get("layoutHash"),
+                                      "project source layoutHash", True),
+        "interfaceHash": _project_sha256(record.get("interfaceHash"),
+                                         "project source interfaceHash", True),
+        "baselineAbiSha256": _project_sha256(
+            record.get("baselineAbiSha256"), "project source baselineAbiSha256", True),
+        "sourceSha256": _project_sha256(record.get("sourceSha256"),
+                                        "project source sourceSha256"),
+        "analysisSha256": _project_sha256(record.get("analysisSha256"),
+                                          "project source analysisSha256", True),
+    }
+    origin_resource_id_persisted = "originResourceId" in record
+    if origin_resource_id_persisted:
+        clean["originResourceId"] = _project_positive(
+            record.get("originResourceId"),
+            "project source originResourceId")
+    if not isinstance(record.get("interfaceComplete"), bool):
+        raise ShaderConsoleError("project source interfaceComplete is invalid")
+    clean["interfaceComplete"] = record["interfaceComplete"]
+    profile = record.get("targetProfile")
+    if not isinstance(profile, dict):
+        raise ShaderConsoleError("project source targetProfile is invalid")
+    clean["targetProfile"] = dict(profile)
+
+    workspace_manifest_sha256 = _project_sha256(
+        record.get("workspaceManifestSha256"),
+        "project source workspaceManifestSha256")
+    compiler_identity = None
+    if "compilerBinding" in record:
+        compiler_identity = _project_compiler_binding_identity(
+            record.get("compilerBinding"))
+        if compiler_identity["targetProfile"] != clean["targetProfile"]:
+            raise ShaderConsoleError(
+                "project compiler binding target profile differs")
+
+    raw_disassembly = record.get("assemblyDisassemblyArtifacts", [])
+    if (not isinstance(raw_disassembly, list) or len(raw_disassembly) > 2 or
+            ("assemblyDisassemblyArtifacts" in record and
+             not raw_disassembly)):
+        raise ShaderConsoleError(
+            "project assembly/disassembly artifacts are invalid")
+    disassembly_identities = []
+    disassembly_artifact_paths = []
+    disassembly_roles = set()
+    for artifact in raw_disassembly:
+        artifact_identity, artifact_path = (
+            _validate_project_disassembly_artifact(root, artifact))
+        if artifact_identity["role"] in disassembly_roles:
+            raise ShaderConsoleError("project disassembly role is duplicated")
+        if (artifact_identity["kind"] == "native-disassembly" and
+                (artifact_identity["role"] != "baseline" or
+                 artifact_identity["inputRawSha256"] != clean["rawSha256"])):
+            raise ShaderConsoleError(
+                "project native disassembly physical binding mismatch")
+        disassembly_roles.add(artifact_identity["role"])
+        disassembly_identities.append(artifact_identity)
+        disassembly_artifact_paths.append(artifact_path)
+
+    compiled = record.get("compiledCandidate")
+    compiled_identity = None
+    compiled_artifact_path = ""
+    if compiled is not None:
+        compiled_identity, compiled_artifact_path = (
+            _validate_project_compiled_candidate(root, compiled, clean))
+
+    inventory_origin = None
+    inventory_observations = []
+    if "inventoryOrigin" in record:
+        if origin_resource_id_persisted:
+            raise ShaderConsoleError(
+                "project inventory workspace must not claim originResourceId")
+        inventory_origin = _project_inventory_origin_identity(
+            record.get("inventoryOrigin"))
+        if (inventory_origin["rawSha256"] != clean["rawSha256"] or
+                inventory_origin["stage"] != clean["stage"] or
+                inventory_origin["entryPoint"] != clean["entryPoint"] or
+                inventory_origin["abiHash"] != clean["baselineAbiSha256"] or
+                inventory_origin["layoutHash"] != clean["layoutHash"]):
+            raise ShaderConsoleError(
+                "project inventory origin differs from project knowledge")
+        raw_observations = record.get("inventoryObservations")
+        if (not isinstance(raw_observations, list) or
+                not raw_observations or
+                len(raw_observations) > MAX_PROJECT_INVENTORY_OBSERVATIONS):
+            raise ShaderConsoleError(
+                "project inventory observations are invalid or oversized")
+        seen_receipts = set()
+        expected_compiled_sha256 = (
+            compiled_identity["rawSha256"]
+            if compiled_identity is not None else "")
+        for raw_observation in raw_observations:
+            observation = _project_inventory_observation(raw_observation)
+            if observation["receiptSha256"] in seen_receipts:
+                raise ShaderConsoleError(
+                    "project inventory observation receipt is duplicated")
+            if (observation["stableKeySha256"] !=
+                    inventory_origin["stableKeySha256"] or
+                    observation["sourceSha256"] != clean["sourceSha256"] or
+                    observation["compiledCandidateSha256"] !=
+                    expected_compiled_sha256):
+                raise ShaderConsoleError(
+                    "project inventory observation differs from its artifact")
+            seen_receipts.add(observation["receiptSha256"])
+            inventory_observations.append(observation)
+        first_observation = inventory_observations[0]
+        if (first_observation["captureId"] != clean["captureId"] or
+                first_observation["inventorySha256"] !=
+                clean["originCatalogSha256"] or
+                first_observation["workspaceManifestSha256"] !=
+                workspace_manifest_sha256):
+            raise ShaderConsoleError(
+                "project first inventory observation differs from publication "
+                "provenance")
+    elif "inventoryObservations" in record:
+        raise ShaderConsoleError(
+            "project inventory observations have no inventory origin")
+
+    identity = dict(clean)
+    if inventory_origin is not None:
+        identity["inventoryOrigin"] = inventory_origin
+    if compiler_identity is not None:
+        identity["compilerBinding"] = compiler_identity
+    if disassembly_identities:
+        identity["assemblyDisassemblyArtifacts"] = disassembly_identities
+    if compiled_identity is not None:
+        identity["compiledCandidate"] = compiled_identity
+    expected_identity = (
+        _project_inventory_workspace_artifact_identity(identity)
+        if inventory_origin is not None else identity)
+    if _project_canonical_sha256(expected_identity)[:32] != knowledge_id:
+        raise ShaderConsoleError("project workspace knowledgeId is invalid")
+    expected_relative = "knowledge/workspaces/%s.hlsl" % knowledge_id
+    source_path = _project_relative_path(
+        root, record.get("sourcePath"), "project HLSL source path", expected_relative)
+    _regular_file_in_tree(root, source_path, MAX_SOURCE_BYTES, "project HLSL source")
+    raw = _read_file_bytes(source_path, MAX_SOURCE_BYTES, "project HLSL source")
+    if not raw or hashlib.sha256(raw).hexdigest() != clean["sourceSha256"]:
+        raise ShaderConsoleError("project HLSL source hash mismatch")
+    try:
+        source_text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ShaderConsoleError(
+            "project HLSL source is not valid UTF-8: %s" % _bounded(exc, 512))
+    if "\x00" in source_text:
+        raise ShaderConsoleError("project HLSL source contains NUL characters")
+    _project_text(record.get("sourceOriginPath"), "project source origin path", 4096)
+    _project_text(record.get("workspacePath"), "project source workspace path", 4096)
+    registered_at = _project_text(
+        record.get("registeredAt"), "project source registration time", 128)
+    if clean["analysisSha256"]:
+        if {"analysisPath", "analysisKind", "analysisPolicy"} - set(record):
+            raise ShaderConsoleError("project source analysis provenance is incomplete")
+        expected_analysis = "knowledge/workspaces/%s.analysis.md" % clean[
+            "analysisSha256"]
+        analysis_path = _project_relative_path(
+            root, record.get("analysisPath"), "project source analysis path",
+            expected_analysis)
+        if (record.get("analysisKind") != "ai-explanatory-text" or
+                record.get("analysisPolicy") != {
+                    "physicalEvidence": False, "applyAuthorization": False,
+                    "reviewRequired": True}):
+            raise ShaderConsoleError("project source analysis policy is invalid")
+        _regular_file_in_tree(
+            root, analysis_path, MAX_SOURCE_BYTES, "project source analysis")
+        analysis_raw = _read_file_bytes(
+            analysis_path, MAX_SOURCE_BYTES, "project source analysis")
+        if hashlib.sha256(analysis_raw).hexdigest() != clean["analysisSha256"]:
+            raise ShaderConsoleError("project source analysis hash mismatch")
+    elif set(record) & {"analysisPath", "analysisKind", "analysisPolicy"}:
+        raise ShaderConsoleError("project source has unbound analysis provenance")
+
+    if inventory_origin is not None:
+        selected_resource_id = inventory_observations[0]["targetResourceId"]
+    else:
+        shaders = _project_capture_revision(
+            captures, clean["captureId"], clean["originCatalogSha256"])
+        matches = []
+        for shader in shaders:
+            if (not isinstance(shader, dict) or
+                    shader.get("stage") != clean["stage"] or
+                    str(shader.get("entryPoint", "") or "") !=
+                    clean["entryPoint"] or
+                    shader.get("rawSha256") != clean["rawSha256"]):
+                continue
+            candidate_resource_id = _project_positive(
+                shader.get("resourceId"), "project capture Shader resourceId")
+            if (not origin_resource_id_persisted or
+                    candidate_resource_id == clean["originResourceId"]):
+                matches.append((shader, candidate_resource_id))
+        if len(matches) != 1:
+            raise ShaderConsoleError(
+                "project source does not uniquely select one imported Shader")
+        shader, selected_resource_id = matches[0]
+        if (shader.get("codeSha256", "") != clean["codeSha256"] or
+                shader.get("layoutHash", "") != clean["layoutHash"] or
+                shader.get("interfaceHash", "") != clean["interfaceHash"] or
+                (shader.get("interfaceComplete") is True) !=
+                clean["interfaceComplete"]):
+            raise ShaderConsoleError(
+                "project source physical identity is inconsistent")
+    try:
+        info = os.lstat(source_path)
+    except OSError as exc:
+        raise ShaderConsoleError(
+            "project HLSL source metadata is unavailable: %s" % _bounded(exc, 512))
+    if (not stat.S_ISREG(info.st_mode) or _is_reparse(source_path) or
+            int(info.st_size) != len(raw)):
+        raise ShaderConsoleError("project HLSL source changed while it was read")
+    document_id = _project_canonical_sha256({
+        "projectWorkspaceId": activation_revision["projectWorkspaceId"],
+        "projectId": activation_revision["projectId"],
+        "knowledgeId": knowledge_id,
+    })[:32]
+    return {
+        "documentId": document_id,
+        "documentKind": "project-library",
+        "readOnly": True,
+        "projectWorkspaceId": activation_revision["projectWorkspaceId"],
+        "projectId": activation_revision["projectId"],
+        "knowledgeId": knowledge_id,
+        "activationRevision": activation_revision["activationRevision"],
+        "sourcePath": source_path,
+        "sourceRelativePath": expected_relative,
+        "fileName": os.path.basename(source_path),
+        "stage": clean["stage"],
+        "entryPoint": clean["entryPoint"],
+        "captureId": clean["captureId"],
+        "originResourceId": selected_resource_id,
+        "originResourceIdPersisted": origin_resource_id_persisted,
+        "inventoryBacked": inventory_origin is not None,
+        "inventoryOrigin": (
+            dict(inventory_origin) if inventory_origin is not None else None),
+        "inventoryObservationCount": len(inventory_observations),
+        "rawShaderSha256": clean["rawSha256"],
+        "sourceSha256": clean["sourceSha256"],
+        "originWorkspaceId": clean["workspaceId"],
+        "baselineAbiSha256": clean["baselineAbiSha256"],
+        "targetProfile": clean["targetProfile"],
+        "analysisSha256": clean["analysisSha256"],
+        "compilerBinding": (
+            dict(compiler_identity) if compiler_identity is not None else None),
+        "assemblyDisassemblyArtifacts": [
+            dict(item) for item in disassembly_identities],
+        "assemblyDisassemblyArtifactPaths": disassembly_artifact_paths,
+        "compiledCandidate": (
+            dict(compiled_identity) if compiled_identity is not None else None),
+        "compiledCandidateAvailable": compiled_identity is not None,
+        "compiledCandidateValidationScope": (
+            compiled_identity["validationScope"]
+            if compiled_identity is not None else ""),
+        "compiledCandidateArtifactPath": compiled_artifact_path,
+        "registeredAt": registered_at,
+        "size": len(raw),
+        "modifiedNs": getattr(info, "st_mtime_ns", int(info.st_mtime * 1000000000)),
+    }
+
+
+def _validate_project_shader_flow_graphs_strict(binding, documents):
+    """Load content-addressed project graphs and rebind navigation targets."""
+
+    root = binding["projectRoot"]
+    index_path = _project_relative_path(
+        root, ACTIVE_PROJECT_LAYOUT["sharedIndex"],
+        "shared dictionary index path",
+        ACTIVE_PROJECT_LAYOUT["sharedIndex"])
+    index, index_file_sha256 = _read_project_json(
+        index_path, MAX_REGISTRY_BYTES, "shared dictionary index", root)
+    if set(index) != {
+            "schema", "schemaVersion", "workspaceId", "explanatory",
+            "updatedAt", "indexSha256"}:
+        raise ShaderConsoleError("shared dictionary index fields are invalid")
+    if (index.get("schema") != SHARED_DICTIONARY_SCHEMA or
+            index.get("schemaVersion") != SHARED_DICTIONARY_VERSION or
+            _project_token(index.get("workspaceId"),
+                           "shared dictionary workspaceId") !=
+            binding["workspaceId"]):
+        raise ShaderConsoleError("shared dictionary identity is invalid")
+    _verify_project_seal(index, "indexSha256", "shared dictionary index")
+    _project_text(index.get("updatedAt"), "shared dictionary update time", 128,
+                  single_line=True)
+    records = index.get("explanatory")
+    if (not isinstance(records, list) or
+            len(records) > MAX_PROJECT_EXPLANATORY_RECORDS):
+        raise ShaderConsoleError(
+            "shared explanatory index is invalid or oversized")
+
+    documents_by_knowledge = dict(
+        (str(document.get("knowledgeId", "")), document)
+        for document in documents)
+    selected = {}
+    invalid = {}
+    watched_paths = [index_path]
+    identities = set()
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {
+                "knowledgeId", "kind", "artifactPath", "artifactSha256",
+                "registeredAt", "policy"}:
+            raise ShaderConsoleError("shared explanatory record is invalid")
+        knowledge_id = _project_token(
+            record.get("knowledgeId"), "shared explanatory knowledgeId")
+        kind = _project_text(
+            record.get("kind"), "shared explanatory kind", 64,
+            single_line=True)
+        if kind not in ("mermaid-flowchart", "shader-flow-graph"):
+            raise ShaderConsoleError("unsupported shared explanatory kind")
+        artifact_sha256 = _project_sha256(
+            record.get("artifactSha256"),
+            "shared explanatory artifactSha256")
+        identity = (knowledge_id, kind, artifact_sha256)
+        if identity in identities:
+            raise ShaderConsoleError("shared explanatory record is duplicated")
+        identities.add(identity)
+        if record.get("policy") != {
+                "explanatoryOnly": True,
+                "physicalEvidence": False,
+                "applyAuthorization": False,
+                "aiProvisionalAutoApply": False}:
+            raise ShaderConsoleError("shared explanatory policy is invalid")
+        _project_text(
+            record.get("registeredAt"),
+            "shared explanatory registration time", 128,
+            single_line=True)
+        if kind != "shader-flow-graph":
+            continue
+        document = documents_by_knowledge.get(knowledge_id)
+        if document is None:
+            continue
+        artifact_path = ""
+        try:
+            expected_relative = "%s/%s.flow-graph.json" % (
+                ACTIVE_PROJECT_LAYOUT["sharedExplanatory"],
+                artifact_sha256)
+            artifact_path = _project_relative_path(
+                root, record.get("artifactPath"),
+                "shared explanatory artifact path", expected_relative)
+            watched_paths.append(artifact_path)
+            artifact_bytes = _read_file_bytes(
+                artifact_path, MAX_SHADER_FLOW_GRAPH_BYTES,
+                "shared explanatory artifact")
+            if hashlib.sha256(artifact_bytes).hexdigest() != artifact_sha256:
+                raise ShaderConsoleError(
+                    "shared explanatory artifact hash mismatch")
+            graph = json.loads(artifact_bytes.decode("utf-8", errors="strict"))
+            graph = _validate_shader_flow_graph_value(
+                graph,
+                expected_source_sha256=str(
+                    document.get("sourceSha256", "")),
+                expected_stage=str(document.get("stage", "")),
+                expected_entry_point=document.get("entryPoint"),
+            )
+        except (ShaderConsoleError, OSError, UnicodeError,
+                ValueError, TypeError) as exc:
+            selected.pop(knowledge_id, None)
+            invalid[knowledge_id] = {
+                "available": False,
+                "status": "invalid",
+                "artifactPath": artifact_path,
+                "error": _bounded(exc, 1024),
+            }
+            continue
+
+        # The published graph retains its original graphId/provenance, while
+        # every click target is projected onto this exact immutable document.
+        projected_nodes = []
+        for original in graph["nodes"]:
+            node = dict(original)
+            location = dict(original["source"])
+            location.update({
+                "workspaceId": document["documentId"],
+                "documentId": document["documentId"],
+                "path": document["sourceRelativePath"],
+            })
+            node["source"] = location
+            projected_nodes.append(node)
+        projection = dict(graph)
+        projection.update({
+            "nodes": projected_nodes,
+            "available": True,
+            "status": "current",
+            "stale": False,
+            "artifactPath": artifact_path,
+            "artifactSha256": artifact_sha256,
+            "navigationDocumentId": document["documentId"],
+        })
+        selected[knowledge_id] = projection
+        invalid.pop(knowledge_id, None)
+
+    for document in documents:
+        knowledge_id = str(document.get("knowledgeId", ""))
+        graph = selected.get(knowledge_id)
+        document["flowGraph"] = graph
+        document["flowGraphStatus"] = (
+            {
+                "available": True,
+                "status": "current",
+                "artifactPath": str(graph.get("artifactPath", "")),
+            }
+            if graph is not None else
+            invalid.get(knowledge_id, {
+                "available": False,
+                "status": "unavailable",
+                "artifactPath": "",
+            }))
+    return {
+        "indexPath": index_path,
+        "indexFileSha256": index_file_sha256,
+        "watchedPaths": watched_paths,
+    }
+
+
+def _validate_project_shader_flow_graphs(binding, documents):
+    """Keep optional navigation metadata from denying reviewed HLSL access."""
+
+    try:
+        return _validate_project_shader_flow_graphs_strict(binding, documents)
+    except (ShaderConsoleError, OSError) as exc:
+        error = _bounded(exc, 1024)
+        for document in documents:
+            document["flowGraph"] = None
+            document["flowGraphStatus"] = {
+                "available": False,
+                "status": "invalid",
+                "artifactPath": "",
+                "error": error,
+            }
+        # The fixed index path remains useful to the file watcher, but an
+        # invalid index never becomes a consistency authority for HLSL.
+        index_path = os.path.join(
+            binding["projectRoot"],
+            *ACTIVE_PROJECT_LAYOUT["sharedIndex"].split("/"))
+        watched = []
+        if (os.path.isfile(index_path) and not _is_reparse(index_path) and
+                _within(binding["projectRoot"], index_path)):
+            watched.append(index_path)
+        return {
+            "indexPath": "",
+            "indexFileSha256": "",
+            "watchedPaths": watched,
+            "error": error,
+        }
+
+
+def _validate_replay_project(binding, workspace):
+    project_root = _project_relative_path(
+        binding["projectRoot"], ACTIVE_PROJECT_LAYOUT["replayProject"],
+        "replay project root")
+    project_root = _directory(project_root, "replay project root")
+    manifest_path = os.path.join(project_root, "project.json")
+    manifest, manifest_file_sha256 = _read_project_json(
+        manifest_path, MAX_PROJECT_MANIFEST_BYTES, "replay project manifest",
+        project_root)
+    expected = {
+        "schema", "schemaVersion", "projectId", "name", "scope",
+        "createdAt", "updatedAt", "captures", "knowledge", "activeKnowledge",
+        "activeHeads",
+    }
+    legacy_active_expected = set(expected) - {"activeHeads"}
+    legacy_expected = legacy_active_expected - {"activeKnowledge"}
+    if set(manifest) not in (
+            expected, legacy_active_expected, legacy_expected):
+        raise ShaderConsoleError("replay project manifest fields are invalid")
+    if (manifest.get("schema") != REPLAY_PROJECT_SCHEMA or
+            manifest.get("schemaVersion") != 1):
+        raise ShaderConsoleError("replay project manifest schema is invalid")
+    project_id = _project_token(manifest.get("projectId"), "replay projectId")
+    project_name = _project_text(
+        manifest.get("name"), "replay project name", 256,
+        allow_empty=True, single_line=True)
+    scope = manifest.get("scope")
+    if not isinstance(scope, dict) or set(scope) != {
+            "gameId", "buildId", "platform", "apiFamily"}:
+        raise ShaderConsoleError("replay project scope is invalid")
+    _project_text(scope.get("gameId"), "replay scope.gameId", 256,
+                  single_line=True)
+    _project_text(scope.get("buildId"), "replay scope.buildId", 256,
+                  single_line=True)
+    _project_text(scope.get("platform"), "replay scope.platform", 128,
+                  allow_empty=True, single_line=True)
+    _project_api_family(scope.get("apiFamily"), "replay scope.apiFamily", True)
+    captures = manifest.get("captures")
+    if not isinstance(captures, list) or len(captures) > MAX_PROJECT_CAPTURES:
+        raise ShaderConsoleError("replay project captures are invalid")
+    capture_ids = set()
+    for capture in captures:
+        _check_console_read_cancelled()
+        if not isinstance(capture, dict):
+            raise ShaderConsoleError("replay project capture record is invalid")
+        capture_id = _project_sha256(
+            capture.get("captureId"), "replay project captureId")
+        if capture_id in capture_ids:
+            raise ShaderConsoleError("replay project contains duplicate captures")
+        capture_ids.add(capture_id)
+    knowledge = manifest.get("knowledge")
+    if not isinstance(knowledge, dict) or set(knowledge) != {
+            "workspaces", "aliases", "materials"}:
+        raise ShaderConsoleError("replay project knowledge index is invalid")
+    for kind in ("workspaces", "aliases", "materials"):
+        records = knowledge.get(kind)
+        if not isinstance(records, list) or len(records) > MAX_PROJECT_KNOWLEDGE:
+            raise ShaderConsoleError("replay project %s knowledge is invalid" % kind)
+    workspace_ids = []
+    for record in knowledge["workspaces"]:
+        _check_console_read_cancelled()
+        if not isinstance(record, dict):
+            raise ShaderConsoleError("project workspace knowledge record is invalid")
+        workspace_ids.append(_project_token(
+            record.get("knowledgeId"), "project workspace knowledgeId"))
+    if len(set(workspace_ids)) != len(workspace_ids):
+        raise ShaderConsoleError("project workspace knowledgeId is duplicated")
+    material_ids = []
+    for record in knowledge["materials"]:
+        _check_console_read_cancelled()
+        if not isinstance(record, dict):
+            raise ShaderConsoleError("project material knowledge record is invalid")
+        material_ids.append(_project_token(
+            record.get("knowledgeId"), "project material knowledgeId"))
+    if len(set(material_ids)) != len(material_ids):
+        raise ShaderConsoleError("project material knowledgeId is duplicated")
+    alias_ids = []
+    for record in knowledge["aliases"]:
+        _check_console_read_cancelled()
+        if not isinstance(record, dict):
+            raise ShaderConsoleError("project alias knowledge record is invalid")
+        alias_ids.append(_project_token(
+            record.get("knowledgeId"), "project alias knowledgeId"))
+    if len(set(alias_ids)) != len(alias_ids):
+        raise ShaderConsoleError("project alias knowledgeId is duplicated")
+    active = manifest.get("activeKnowledge")
+    if active is None:
+        active = {"revision": 0, "workspaces": {}, "materials": {}}
+        for kind, ids in (("workspaces", workspace_ids),
+                          ("materials", material_ids)):
+            for token in ids:
+                active["revision"] += 1
+                active[kind][token] = active["revision"]
+    if not isinstance(active, dict) or set(active) != {
+            "revision", "workspaces", "materials"}:
+        raise ShaderConsoleError("replay project activeKnowledge is invalid")
+    revision = _project_nonnegative(active.get("revision"),
+                                    "activeKnowledge.revision")
+    serials = set()
+    for kind, ids in (("workspaces", workspace_ids), ("materials", material_ids)):
+        activations = active.get(kind)
+        if not isinstance(activations, dict) or set(activations) != set(ids):
+            raise ShaderConsoleError("replay project activeKnowledge is incomplete")
+        for token, serial in activations.items():
+            _project_token(token, "active knowledgeId")
+            serial = _project_positive(serial, "active knowledge revision")
+            if serial > revision or serial in serials:
+                raise ShaderConsoleError("active knowledge revision is invalid")
+            serials.add(serial)
+    if revision != (max(serials) if serials else 0):
+        raise ShaderConsoleError("active knowledge revision is inconsistent")
+    active_heads = manifest.get("activeHeads")
+    if active_heads is not None:
+        if (not isinstance(active_heads, dict) or
+                set(active_heads) != {"workspaces", "materials", "aliases"}):
+            raise ShaderConsoleError("replay project activeHeads is invalid")
+        known_ids = {
+            "workspaces": set(workspace_ids),
+            "materials": set(material_ids),
+            "aliases": set(alias_ids),
+        }
+        for kind in ("workspaces", "materials", "aliases"):
+            heads = active_heads.get(kind)
+            if (not isinstance(heads, dict) or
+                    len(heads) > (MAX_PROJECT_ACTIVE_HEADS
+                                  if kind == "aliases"
+                                  else MAX_PROJECT_KNOWLEDGE)):
+                raise ShaderConsoleError(
+                    "replay project activeHeads is invalid")
+            if known_ids[kind] and not heads:
+                raise ShaderConsoleError(
+                    "replay project activeHeads is incomplete")
+            for head_key, head in heads.items():
+                _project_sha256(head_key, "project active head key")
+                if (not isinstance(head, dict) or set(head) != {
+                        "generation", "knowledgeId", "publishedAt"}):
+                    raise ShaderConsoleError(
+                        "replay project active head is invalid")
+                _project_positive(
+                    head.get("generation"), "project active head generation")
+                knowledge_id = _project_token(
+                    head.get("knowledgeId"),
+                    "project active head knowledgeId")
+                if knowledge_id not in known_ids[kind]:
+                    raise ShaderConsoleError(
+                        "replay project active head is absent")
+                _project_text(
+                    head.get("publishedAt"),
+                    "project active head publishedAt", 128,
+                    single_line=True)
+    documents = []
+    document_ids = set()
+    for record in knowledge["workspaces"]:
+        _check_console_read_cancelled()
+        knowledge_id = record["knowledgeId"]
+        document = _validate_project_workspace_record(
+            project_root, captures, record, {
+                "projectWorkspaceId": binding["workspaceId"],
+                "projectId": project_id,
+                "activationRevision": active["workspaces"][knowledge_id],
+            })
+        if document["documentId"] in document_ids:
+            raise ShaderConsoleError("project Shader document identity is duplicated")
+        document_ids.add(document["documentId"])
+        documents.append(document)
+    documents.sort(key=lambda item: (
+        item.get("activationRevision", 0), item.get("registeredAt", ""),
+        item.get("knowledgeId", "")), reverse=True)
+    graph_index = _validate_project_shader_flow_graphs(binding, documents)
+    return {
+        "projectRoot": project_root,
+        "manifestPath": manifest_path,
+        "manifestFileSha256": manifest_file_sha256,
+        "projectId": project_id,
+        "projectName": project_name,
+        "documents": documents,
+        "sharedIndexPath": graph_index["indexPath"],
+        "sharedIndexFileSha256": graph_index["indexFileSha256"],
+        "flowGraphWatchedPaths": graph_index["watchedPaths"],
+    }
+
+
+def _require_project_library_binding_unchanged(binding, workspace, replay):
+    current_selection = _validate_active_project_selection(binding["path"])
+    if any((
+            current_selection["fileSha256"] != binding["fileSha256"],
+            current_selection["selectionSha256"] != binding["selectionSha256"],
+            current_selection["workspaceId"] != binding["workspaceId"],
+            not _same_path(current_selection["projectRoot"], binding["projectRoot"]),
+            current_selection["registry"]["fileSha256"] !=
+            binding["registry"]["fileSha256"],
+            current_selection["registry"]["registrySha256"] !=
+            binding["registry"]["registrySha256"],
+    )):
+        raise ShaderConsoleError("active project changed while its Shader library was read")
+    current_workspace = _validate_active_project_workspace(current_selection)
+    if (current_workspace["fileSha256"] != workspace["fileSha256"] or
+            current_workspace["configSha256"] != workspace["configSha256"]):
+        raise ShaderConsoleError("project workspace changed while its Shader library was read")
+    _unused, manifest_file_sha256 = _read_project_json(
+        replay["manifestPath"], MAX_PROJECT_MANIFEST_BYTES,
+        "replay project manifest", replay["projectRoot"])
+    if manifest_file_sha256 != replay["manifestFileSha256"]:
+        raise ShaderConsoleError("replay project changed while its Shader library was read")
+    if replay.get("sharedIndexPath"):
+        _unused, shared_index_file_sha256 = _read_project_json(
+            replay["sharedIndexPath"], MAX_REGISTRY_BYTES,
+            "shared dictionary index", binding["projectRoot"])
+        if shared_index_file_sha256 != replay.get("sharedIndexFileSha256"):
+            raise ShaderConsoleError(
+                "shared dictionary changed while its Shader library was read")
+
+
+def _load_project_shader_library(selection_path):
+    binding = _validate_active_project_selection(selection_path)
+    workspace = _validate_active_project_workspace(binding)
+    result = {
+        "schema": PROJECT_SHADER_LIBRARY_SCHEMA,
+        "schemaVersion": 1,
+        "selectionPath": binding["path"],
+        "projectWorkspaceId": binding["workspaceId"],
+        "projectRoot": binding["projectRoot"],
+        "workspaceName": workspace["name"],
+        "state": workspace["state"],
+        "scope": workspace["scope"],
+        "projectId": "",
+        "projectName": "",
+        "available": False,
+        "documents": [],
+        "errors": [],
+        "watchedPaths": [
+            binding["path"], os.path.dirname(binding["path"]),
+            binding["registry"]["path"], workspace["path"],
+            binding["projectRoot"],
+        ],
+    }
+    if workspace["state"] != "bound":
+        _require_project_library_binding_unchanged(binding, workspace, {
+            "manifestPath": workspace["path"],
+            "projectRoot": binding["projectRoot"],
+            "manifestFileSha256": workspace["fileSha256"],
+        })
+        return result
+    replay = _validate_replay_project(binding, workspace)
+    _require_project_library_binding_unchanged(binding, workspace, replay)
+    result.update({
+        "projectId": replay["projectId"],
+        "projectName": replay["projectName"],
+        "available": True,
+        "documents": replay["documents"],
+    })
+    result["watchedPaths"].extend([
+        replay["projectRoot"], replay["manifestPath"],
+        os.path.join(replay["projectRoot"], "knowledge", "workspaces"),
+    ])
+    result["watchedPaths"].extend(replay.get("flowGraphWatchedPaths", []))
+    result["watchedPaths"].extend(
+        item["sourcePath"] for item in replay["documents"])
+    result["watchedPaths"].extend(
+        item["compiledCandidateArtifactPath"]
+        for item in replay["documents"]
+        if item.get("compiledCandidateArtifactPath"))
+    for document in replay["documents"]:
+        result["watchedPaths"].extend(
+            document.get("assemblyDisassemblyArtifactPaths", []))
+    return result
+
+
+def load_project_shader_library_snapshot(selection_path=None):
+    """Project active-selection reader for immutable, shared HLSL knowledge."""
+    path = os.path.abspath(str(
+        selection_path or default_active_project_selection_path() or ""))
+    result = {
+        "schema": PROJECT_SHADER_LIBRARY_SCHEMA,
+        "schemaVersion": 1,
+        "selectionPath": path,
+        "available": False,
+        "projectWorkspaceId": "",
+        "projectRoot": "",
+        "workspaceName": "",
+        "state": "",
+        "scope": {},
+        "projectId": "",
+        "projectName": "",
+        "documents": [],
+        "errors": [],
+        "watchedPaths": [path] if path else [],
+    }
+    if not path or not os.path.exists(path):
+        parent = os.path.dirname(path) if path else ""
+        if parent and os.path.isdir(parent) and not _is_reparse(parent):
+            result["watchedPaths"].append(parent)
+        return result
+    try:
+        result = _load_project_shader_library(path)
+    except ShaderConsoleError as exc:
+        result["errors"].append(_bounded(exc, 1024))
+    unique = []
+    known = set()
+    for item in result.get("watchedPaths", []):
+        key = _normal_path(item) if item else ""
+        if key and key not in known and os.path.exists(item):
+            known.add(key)
+            unique.append(item)
+    result["watchedPaths"] = unique
+    return result
+
+
+def load_project_shader_source_document(selection_path, project_workspace_id,
+                                        project_id, knowledge_id,
+                                        expected_source_sha256):
+    """Read one immutable project HLSL document through the active selection."""
+    path = os.path.abspath(str(
+        selection_path or default_active_project_selection_path() or ""))
+    requested_workspace = _project_token(
+        project_workspace_id, "requested project workspaceId")
+    requested_project = _project_token(project_id, "requested replay projectId")
+    requested_knowledge = _project_token(
+        knowledge_id, "requested project knowledgeId")
+    expected_sha256 = _project_sha256(
+        expected_source_sha256, "expected project sourceSha256")
+    library = _load_project_shader_library(path)
+    if (library.get("projectWorkspaceId") != requested_workspace or
+            library.get("projectId") != requested_project):
+        raise ShaderConsoleError("active project does not match the requested document")
+    matches = [item for item in library.get("documents", []) if (
+        item.get("knowledgeId") == requested_knowledge and
+        item.get("sourceSha256") == expected_sha256)]
+    if len(matches) != 1:
+        raise ShaderConsoleError("project Shader document is unavailable or ambiguous")
+    document = matches[0]
+    raw = _read_file_bytes(
+        document["sourcePath"], MAX_SOURCE_BYTES, "project HLSL source")
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    if not raw or raw_sha256 != expected_sha256:
+        raise ShaderConsoleError("project HLSL source hash mismatch")
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ShaderConsoleError(
+            "project HLSL source is not valid UTF-8: %s" % _bounded(exc, 512))
+    if "\x00" in text:
+        raise ShaderConsoleError("project HLSL source contains NUL characters")
+    # A second full protocol read after the source handle closes proves that
+    # selection/config/manifest authority did not cross projects mid-open.
+    confirmed = _load_project_shader_library(path)
+    confirmed_matches = [item for item in confirmed.get("documents", []) if (
+        item.get("knowledgeId") == requested_knowledge and
+        item.get("sourceSha256") == raw_sha256)]
+    if (confirmed.get("projectWorkspaceId") != requested_workspace or
+            confirmed.get("projectId") != requested_project or
+            len(confirmed_matches) != 1):
+        raise ShaderConsoleError("active project changed while its HLSL was read")
+    opened = dict(confirmed_matches[0])
+    opened.update({
+        "text": text,
+        "rawSha256": raw_sha256,
+        "size": len(raw),
+    })
+    return opened
 
 
 def _validate_authorization(value):
@@ -939,6 +2767,212 @@ def _validate_manifest(workspace, authorization):
     return source_path, diagnostics, manifest_path
 
 
+def _validate_organization_review_evidence(workspace, source_path, gate, soft_publish):
+    """Check the durable Host review record used by the editor projection.
+
+    The Host owns token/rename proof, numeric replay and its session HMAC.
+    This reader does not rerun or manufacture those proofs and grants no
+    compile/apply authority. The separate live-edit authorization and Host
+    save path remain mandatory. Immutable review sources are checked here;
+    later user edits need not equal the initially accepted source bytes.
+    """
+    verdict = gate.get("verdict")
+    if (not isinstance(verdict, dict)
+            or verdict.get("schema") != "replaylab-review-verdict/v1"
+            or verdict.get("accepted") is not (not soft_publish)
+            or verdict.get("softAccepted") is not soft_publish
+            or verdict.get("level") != gate.get("equivalenceLevel")
+            or type(verdict.get("round")) is not int
+            or type(verdict.get("maxRounds")) is not int
+            or not 1 <= verdict["round"] <= verdict["maxRounds"] <= 10
+            or type(verdict.get("roundsLeft")) is not int
+            or verdict["roundsLeft"] != verdict["maxRounds"] - verdict["round"]
+            or verdict.get("budgetExhausted") is not (verdict["round"] >= verdict["maxRounds"])
+            or (soft_publish and verdict.get("budgetExhausted") is not True)
+            or not isinstance(verdict.get("reasons"), list)
+            or any(not isinstance(item, dict) or item.get("severity") != "warning"
+                   for item in verdict["reasons"])):
+        raise ShaderConsoleError("shader organization Host verdict is inconsistent")
+
+    organization_id = gate["organizationId"]
+    session_dir = _safe_relative(
+        workspace, "ai/organization-sessions/" + organization_id,
+        "shader organization session path")
+
+    def session_json(name):
+        path = os.path.join(session_dir, name)
+        _regular_file_in_tree(workspace, path, MAX_MANIFEST_BYTES,
+                              "shader organization session artifact")
+        return _read_json(path, MAX_MANIFEST_BYTES, "shader organization session artifact")
+
+    session = session_json("session.json")
+    session_gate = session_json("gate.json")
+    if (session_gate != gate
+            or session.get("schema") != "renderdoc-ai-shader-organization-session/v1"
+            or session.get("schemaVersion") != 1
+            or session.get("policyVersion") != ORGANIZATION_POLICY_VERSION
+            or session.get("state") != "completed"
+            or not _same_path(session.get("workspacePath", ""), workspace)
+            or not _same_path(_safe_relative(workspace, session.get("sourcePath", ""),
+                                            "organization source path"), source_path)
+            or session.get("completedAt") != gate.get("reviewedAt")):
+        raise ShaderConsoleError("shader organization completed Host session is inconsistent")
+    for key in (
+            "organizationId", "workspaceId", "captureId", "stage", "entryPoint",
+            "baselineSourceSha256", "proposalSourceSha256", "baselineCodeSha256",
+            "organizedCodeSha256", "codeSha256Equal", "equivalenceLevel",
+            "observation", "renameMap", "softPublishAllowed", "verdict", "decision",
+            "organizedSourcePromoted", "finalBinding", "flowGraphId", "flowGraphSha256"):
+        if session.get(key) != gate.get(key):
+            raise ShaderConsoleError("shader organization gate differs from its Host session")
+
+    for name, key, digest_key in (
+            ("baseline-source.hlsl", "baselineSourcePath", "baselineSourceSha256"),
+            ("organized-proposal.hlsl", "proposalSourcePath", "proposalSourceSha256")):
+        path = os.path.join(session_dir, name)
+        declared = _safe_relative(workspace, session.get(key, ""), "organization artifact path")
+        if not _same_path(declared, path):
+            raise ShaderConsoleError("shader organization source artifact path is inconsistent")
+        _regular_file_in_tree(workspace, path, MAX_SOURCE_BYTES, "organization source artifact")
+        data = _read_file_bytes(path, MAX_SOURCE_BYTES, "organization source artifact")
+        if hashlib.sha256(data).hexdigest() != gate[digest_key]:
+            raise ShaderConsoleError("shader organization source artifact bytes changed")
+        if key == "proposalSourcePath":
+            proposal = gate.get(key)
+            if not isinstance(proposal, str) or not proposal:
+                raise ShaderConsoleError("shader organization proposal path is invalid")
+            if not os.path.isabs(proposal):
+                proposal = _safe_relative(workspace, proposal, "organization proposal path")
+            if not _same_path(proposal, path):
+                raise ShaderConsoleError("shader organization proposal path is inconsistent")
+
+    level = gate["equivalenceLevel"]
+    observation = gate.get("observation")
+    renames = gate.get("renameMap")
+    if (not isinstance(renames, dict) or len(renames) > 4096
+            or any(not isinstance(old, str) or not isinstance(new, str)
+                   or HLSL_IDENTIFIER_RE.fullmatch(old) is None
+                   or HLSL_IDENTIFIER_RE.fullmatch(new) is None
+                   for old, new in renames.items())):
+        raise ShaderConsoleError("shader organization rename evidence is invalid")
+    if level in ("exact-code", "rename-only") and observation is not None:
+        raise ShaderConsoleError("static organization proof contains inconsistent observation")
+    if level == "observational-pass":
+        if (not isinstance(observation, dict)
+                or observation.get("schema") != "renderdoc-ai-shader-organization-observation/v1"
+                or observation.get("scope") != "captured-event-output"
+                or observation.get("accepted") is not True
+                or observation.get("replayRestored") is not True
+                or observation.get("semanticEquivalenceVerified") is not False
+                or type(observation.get("sampleCount")) is not int
+                or observation["sampleCount"] < 1
+                or not isinstance(observation.get("metrics"), dict)
+                or not isinstance(observation.get("tolerances"), dict)):
+            raise ShaderConsoleError("shader organization Host output observation is invalid")
+        for observation_key, gate_key in (
+                ("baselineSourceSha256", "baselineSourceSha256"),
+                ("candidateSourceSha256", "proposalSourceSha256"),
+                ("baselineCandidateRawSha256", "baselineReviewCandidateRawSha256"),
+                ("candidateRawSha256", "finalCandidateRawSha256")):
+            value = observation.get(observation_key)
+            if (not isinstance(value, str) or SHA256_RE.fullmatch(value) is None
+                    or value != gate.get(gate_key)):
+                raise ShaderConsoleError("shader organization observation candidate binding changed")
+
+
+def _validate_project_source_gate(workspace, authorization, source_path):
+    """Resolve imported source provenance through the existing project reader.
+
+    This permits editing a reused source; it never grants compilation or
+    replacement. Those effects still use the current workspace's live service.
+    The original project graph remains immutable and its navigation is only
+    projected onto the new document in memory.
+    """
+    manifest_path = os.path.join(workspace, "manifest.json")
+    manifest = _read_json(manifest_path, MAX_MANIFEST_BYTES, "shader workspace manifest")
+    source = manifest.get("source") or {}
+    receipt = source.get("projectSource")
+    if not isinstance(receipt, dict):
+        raise ShaderConsoleError("workspace has no imported project source")
+    unsigned = dict(receipt)
+    digest = unsigned.pop("receiptSha256", None)
+    baseline = manifest.get("baseline") or {}
+    if (receipt.get("schema") != "replaylab-verified-project-shader-source/v1" or
+            digest != _canonical_sha256(unsigned) or
+            manifest.get("workspaceId") != authorization["workspaceId"] or
+            receipt.get("originalRawSha256") != authorization["shaderRawSha256"] or
+            receipt.get("baselineAbiSha256") != baseline.get("abiSha256") or
+            receipt.get("stage") != authorization["stage"] or
+            receipt.get("entryPoint") != authorization["entryPoint"] or
+            receipt.get("sourceSha256") != source.get("sha256") or
+            receipt.get("sourceEntryPoint") != source.get("entryPoint") or
+            receipt.get("targetProfile") != manifest.get("targetProfile") or
+            receipt.get("applied") is not False or
+            receipt.get("requiresCompile") is not True or
+            receipt.get("requiresLiveAbiRevalidation") is not True or
+            receipt.get("semanticEquivalenceVerified") is not False):
+        raise ShaderConsoleError("imported project source binding changed")
+    source_sha = _project_sha256(receipt.get("sourceSha256"), "imported project source hash")
+    input_relative = "source-inputs/project-%s.hlsl" % source_sha
+    input_path = _safe_relative(workspace, input_relative, "imported project input")
+    if receipt.get("inputPath") != input_relative:
+        raise ShaderConsoleError("imported project input path changed")
+    _regular_file_in_tree(workspace, input_path, MAX_SOURCE_BYTES, "imported project input")
+    if hashlib.sha256(_read_file_bytes(input_path, MAX_SOURCE_BYTES, "imported project input")).hexdigest() != source_sha:
+        raise ShaderConsoleError("imported project input bytes changed")
+    library = _load_project_shader_library(default_active_project_selection_path())
+    if (library.get("projectId") != receipt.get("projectId") or
+            not _same_path(os.path.join(library["projectRoot"],
+                                       *ACTIVE_PROJECT_LAYOUT["replayProject"].split("/")),
+                           receipt.get("projectPath", ""))):
+        raise ShaderConsoleError("imported source belongs to another project")
+    managed_root = os.path.join(library["projectRoot"],
+                               *ACTIVE_PROJECT_LAYOUT["shaderWorkspaces"].split("/"))
+    if not _within(managed_root, workspace):
+        raise ShaderConsoleError("imported source is outside the active project's Shader Workspace")
+    documents = [item for item in library.get("documents", [])
+                 if item.get("knowledgeId") == receipt.get("knowledgeId")]
+    if len(documents) != 1:
+        raise ShaderConsoleError("imported project knowledge is unavailable or ambiguous")
+    document = documents[0]
+    for document_key, receipt_key in (
+            ("sourceSha256", "sourceSha256"), ("rawShaderSha256", "originalRawSha256"),
+            ("baselineAbiSha256", "baselineAbiSha256"), ("stage", "stage"),
+            ("entryPoint", "entryPoint"), ("targetProfile", "targetProfile"),
+            ("originWorkspaceId", "originWorkspaceId"), ("analysisSha256", "analysisSha256")):
+        if document.get(document_key) != receipt.get(receipt_key):
+            raise ShaderConsoleError("imported source differs from its project knowledge")
+    projection = None
+    graph = document.get("flowGraph")
+    if isinstance(graph, dict):
+        nodes = []
+        for original in graph["nodes"]:
+            node = dict(original)
+            location = dict(original["source"])
+            location.update({"workspaceId": authorization["workspaceId"],
+                             "documentId": authorization["workspaceId"],
+                             "path": source["path"]})
+            node["source"] = location
+            nodes.append(node)
+        projection = dict(graph)
+        projection.update({"nodes": nodes, "navigationDocumentId": authorization["workspaceId"]})
+    return {
+        "kind": "verified-project-source", "path": manifest_path,
+        "finalSourceSha256": source_sha,
+        "projectFlowGraph": projection,
+        "projectFlowGraphStatus": document.get("flowGraphStatus"),
+        "watchedPaths": library.get("watchedPaths", []) + [input_path],
+    }
+
+
+def _validate_editable_source_gate(workspace, authorization, source_path):
+    manifest = _read_json(os.path.join(workspace, "manifest.json"),
+                          MAX_MANIFEST_BYTES, "shader workspace manifest")
+    if isinstance((manifest.get("source") or {}).get("projectSource"), dict):
+        return _validate_project_source_gate(workspace, authorization, source_path)
+    return _validate_organization_gate(workspace, authorization, source_path)
+
+
 def _validate_organization_gate(workspace, authorization, source_path):
     """Prove that the editor source was promoted by an organise-only review.
 
@@ -956,14 +2990,18 @@ def _validate_organization_gate(workspace, authorization, source_path):
         gate_path, MAX_MANIFEST_BYTES, "shader organization gate")
     if gate.get("schema") != ORGANIZATION_GATE_SCHEMA:
         raise ShaderConsoleError("shader organization gate schema is invalid")
+    soft_publish = gate.get("decision") == "soft-accepted-baseline"
     if (gate.get("schemaVersion") != 1 or
             gate.get("policyVersion") != ORGANIZATION_POLICY_VERSION or
             gate.get("requestedTransformation") != "organize-only" or
-            gate.get("decision") != "accepted-executable-editable" or
-            gate.get("codeSha256Equal") is not True or
-            gate.get("organizedSourcePromoted") is not True or
+            gate.get("decision") not in (
+                "accepted-executable-editable", "soft-accepted-baseline") or
+            gate.get("organizedSourcePromoted") is not (not soft_publish) or
+            gate.get("softPublishAllowed") is not soft_publish or
             gate.get("baselineCompiledAndAbiValidated") is not True or
             gate.get("organizedCompiledAndAbiValidated") is not True or
+            gate.get("rawRecoveryCompiledAndAbiValidated") is not soft_publish or
+            gate.get("semanticEquivalenceVerified") is not False or
             gate.get("safeToStartLiveEdit") is not True or
             gate.get("replayApplied") is not False):
         raise ShaderConsoleError(
@@ -994,6 +3032,11 @@ def _validate_organization_gate(workspace, authorization, source_path):
     final_abi_request = str(gate.get("finalAbiRequestId", "") or "").lower()
     final_abi_report = str(gate.get("finalAbiReportSha256", "") or "").lower()
     final_revision = gate.get("finalRevision")
+    flow_graph_id = str(gate.get("flowGraphId", "") or "").lower()
+    flow_graph_sha256 = str(gate.get("flowGraphSha256", "") or "").lower()
+    flow_graph_artifact = gate.get("flowGraphArtifactPath", "")
+    graph_binding_present = bool(
+        flow_graph_id or flow_graph_sha256 or flow_graph_artifact)
     if (identity != expected or not isinstance(binding, dict) or
             set(binding) != binding_fields or
             binding.get("complete") is not True or
@@ -1005,7 +3048,6 @@ def _validate_organization_gate(workspace, authorization, source_path):
                 baseline_source, proposal_source, baseline_code,
                 organized_code, final_candidate, final_code,
                 final_abi_request, final_abi_report)) or
-            baseline_code != organized_code or
             isinstance(final_revision, bool) or
             not isinstance(final_revision, int) or final_revision <= 0 or
             str(binding.get("sourceSha256", "") or "").lower() !=
@@ -1020,6 +3062,41 @@ def _validate_organization_gate(workspace, authorization, source_path):
             final_abi_report):
         raise ShaderConsoleError(
             "shader organization gate is not bound to this workspace")
+
+    level = gate.get("equivalenceLevel")
+    code_equal = baseline_code == organized_code
+    if (gate.get("codeSha256Equal") is not code_equal
+            or level not in ("exact-code", "rename-only", "observational-pass", "rejected")
+            or (level == "exact-code") is not code_equal
+            or (level == "rejected") is not soft_publish
+            or final_source_sha256 != (baseline_source if soft_publish else proposal_source)
+            or final_code != (baseline_code if soft_publish else organized_code)):
+        raise ShaderConsoleError("shader organization equivalence evidence is inconsistent")
+    _validate_organization_review_evidence(workspace, source_path, gate, soft_publish)
+
+    # Older reviewed workspaces legitimately have no structured graph.  A
+    # newer gate must, however, bind all graph identity fields together; a
+    # partial binding is never treated as optional metadata.
+    if graph_binding_present:
+        if (EXACT_TOKEN_RE.fullmatch(flow_graph_id) is None or
+                SHA256_RE.fullmatch(flow_graph_sha256) is None or
+                not isinstance(flow_graph_artifact, str) or
+                not flow_graph_artifact):
+            raise ShaderConsoleError(
+                "shader organization gate flow graph binding is invalid")
+        if os.path.isabs(flow_graph_artifact):
+            declared_graph_path = os.path.abspath(flow_graph_artifact)
+            if not _within(workspace, declared_graph_path):
+                raise ShaderConsoleError(
+                    "shader organization gate flow graph escapes its workspace")
+        else:
+            declared_graph_path = _safe_relative(
+                workspace, flow_graph_artifact,
+                "organized Shader flow graph path")
+        expected_graph_path = os.path.join(workspace, "ai", "flow-graph.json")
+        if not _same_path(declared_graph_path, expected_graph_path):
+            raise ShaderConsoleError(
+                "shader organization gate points at a different flow graph")
 
     declared_source = gate.get("executableEditableSourcePath")
     if not isinstance(declared_source, str) or not declared_source:
@@ -1041,7 +3118,295 @@ def _validate_organization_gate(workspace, authorization, source_path):
         "finalRevision": final_revision,
         "finalCandidateRawSha256": final_candidate,
         "finalCodeSha256": final_code,
+        "flowGraphId": flow_graph_id,
+        "flowGraphSha256": flow_graph_sha256,
+        "flowGraphArtifactPath": (
+            declared_graph_path if graph_binding_present else ""),
     }
+
+
+def _normalized_shader_flow_path(value, field):
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        raise ShaderConsoleError("%s is invalid" % field)
+    normalized = value.replace("\\", "/")
+    parts = normalized.split("/")
+    if (normalized.startswith("/") or
+            re.match(r"^[A-Za-z]:", normalized) is not None or
+            any(part in ("", ".", "..") for part in parts)):
+        raise ShaderConsoleError("%s is not workspace-relative" % field)
+    return normalized
+
+
+def _validate_shader_flow_graph_value(
+        graph, expected_workspace_id="", expected_source_sha256="",
+        expected_source_revision=None, expected_source_path="",
+        expected_stage="", expected_entry_point=None):
+    """Strictly validate a navigation graph without granting file authority."""
+
+    expected_fields = {
+        "schema", "schemaVersion", "graphId", "workspaceId", "stage",
+        "entryPoint", "sourcePath", "sourceSha256", "sourceRevision",
+        "generatedAt", "origin", "nodes", "edges", "limits", "truncated",
+        "policy",
+    }
+    if not isinstance(graph, dict):
+        raise ShaderConsoleError("Shader flow graph fields are invalid")
+    algorithm = graph.get("graphKind") == "algorithm-dataflow"
+    if algorithm:
+        expected_fields.update(("graphKind", "layoutDirection"))
+    if set(graph) != expected_fields:
+        raise ShaderConsoleError("Shader flow graph fields are invalid")
+    if algorithm and graph.get("layoutDirection") != "TD":
+        raise ShaderConsoleError("Shader algorithm graph must use top-down data flow")
+    if (graph.get("schema") != SHADER_FLOW_GRAPH_SCHEMA or
+            graph.get("schemaVersion") != SHADER_FLOW_GRAPH_VERSION):
+        raise ShaderConsoleError("Shader flow graph schema is invalid")
+
+    graph_id = str(graph.get("graphId", "") or "").lower()
+    workspace_id = str(graph.get("workspaceId", "") or "").lower()
+    source_sha256 = str(graph.get("sourceSha256", "") or "").lower()
+    source_revision = graph.get("sourceRevision")
+    generated_at = graph.get("generatedAt")
+    if (EXACT_TOKEN_RE.fullmatch(graph_id) is None or
+            EXACT_TOKEN_RE.fullmatch(workspace_id) is None or
+            SHA256_RE.fullmatch(source_sha256) is None or
+            isinstance(source_revision, bool) or
+            not isinstance(source_revision, int) or source_revision <= 0 or
+            not isinstance(graph.get("stage"), str) or
+            not graph.get("stage") or len(graph.get("stage")) > 64 or
+            not isinstance(graph.get("entryPoint"), str) or
+            len(graph.get("entryPoint")) > 512 or
+            graph.get("origin") not in (
+                "organized-proposal", "recovered-baseline") or
+            not isinstance(generated_at, str) or not generated_at or
+            len(generated_at) > 128 or
+            any(ord(character) < 32 for character in generated_at)):
+        raise ShaderConsoleError(
+            "Shader flow graph identity or source binding is invalid")
+    graph_source_path = _normalized_shader_flow_path(
+        graph.get("sourcePath"), "Shader flow graph source path")
+    if (expected_workspace_id and workspace_id != expected_workspace_id):
+        raise ShaderConsoleError(
+            "Shader flow graph belongs to a different workspace")
+    if (expected_source_sha256 and
+            source_sha256 != expected_source_sha256):
+        raise ShaderConsoleError(
+            "Shader flow graph belongs to different source bytes")
+    if (expected_source_revision is not None and
+            source_revision != expected_source_revision):
+        raise ShaderConsoleError(
+            "Shader flow graph belongs to a different source revision")
+    if (expected_source_path and graph_source_path !=
+            _normalized_shader_flow_path(
+                expected_source_path, "expected Shader flow graph source path")):
+        raise ShaderConsoleError(
+            "Shader flow graph belongs to a different source path")
+    if expected_stage and graph.get("stage") != expected_stage:
+        raise ShaderConsoleError(
+            "Shader flow graph belongs to a different Shader stage")
+    if (expected_entry_point is not None and
+            graph.get("entryPoint") != expected_entry_point):
+        raise ShaderConsoleError(
+            "Shader flow graph belongs to a different entry point")
+    if graph.get("limits") != {
+            "maxNodes": MAX_SHADER_FLOW_GRAPH_NODES,
+            "maxEdges": MAX_SHADER_FLOW_GRAPH_EDGES}:
+        raise ShaderConsoleError("Shader flow graph limits are invalid")
+    expected_policy = {
+            "navigationOnly": True,
+            "physicalEvidence": False,
+            "compileAuthorization": False,
+            "applyAuthorization": False,
+            "callEdgesDerivedFromFinalSource": True,
+            "descriptionsMayBeAiAuthored": True}
+    if algorithm:
+        expected_policy.update({
+            "callEdgesDerivedFromFinalSource": False,
+            "computationRangesBoundToFinalSource": True,
+            "dataEdgesAreLexicallyBound": True,
+        })
+    if graph.get("policy") != expected_policy:
+        raise ShaderConsoleError("Shader flow graph policy is invalid")
+
+    truncated = graph.get("truncated")
+    if (not isinstance(truncated, dict) or set(truncated) != {
+            "nodes", "edges", "omittedNodes", "omittedEdges"} or
+            type(truncated.get("nodes")) is not bool or
+            type(truncated.get("edges")) is not bool):
+        raise ShaderConsoleError(
+            "Shader flow graph truncation metadata is invalid")
+    for field in ("omittedNodes", "omittedEdges"):
+        count = truncated.get(field)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ShaderConsoleError(
+                "Shader flow graph truncation metadata is invalid")
+
+    nodes = graph.get("nodes")
+    edges = graph.get("edges")
+    if (not isinstance(nodes, list) or
+            len(nodes) > MAX_SHADER_FLOW_GRAPH_NODES or
+            not isinstance(edges, list) or
+            len(edges) > MAX_SHADER_FLOW_GRAPH_EDGES):
+        raise ShaderConsoleError(
+            "Shader flow graph nodes or edges are invalid or oversized")
+    node_ids = set()
+    for node in nodes:
+        node_fields = {"id", "name", "label", "kind", "description", "source"}
+        if algorithm:
+            node_fields.update(("sourceRange", "reads", "writes", "inferred"))
+        if not isinstance(node, dict) or set(node) != node_fields:
+            raise ShaderConsoleError("Shader flow graph node fields are invalid")
+        node_id = str(node.get("id", "") or "")
+        name = str(node.get("name", "") or "")
+        label = node.get("label")
+        description = node.get("description")
+        location = node.get("source")
+        if (FLOW_GRAPH_NODE_ID_RE.fullmatch(node_id) is None or
+                HLSL_IDENTIFIER_RE.fullmatch(name) is None or
+                len(name) > 256 or
+                not isinstance(label, str) or not label.strip() or len(label) > 256 or
+                any(ord(character) < 32 for character in label) or
+                (not algorithm and label != name) or
+                node.get("kind") not in (
+                    ("computation",) if algorithm else ("entry-point", "function")) or
+                node_id in node_ids or
+                not isinstance(description, str) or not description or
+                len(description) > 512 or
+                any(ord(character) < 32 for character in description) or
+                not isinstance(location, dict) or set(location) != {
+                    "workspaceId", "documentId", "path", "line", "column"}):
+            raise ShaderConsoleError("Shader flow graph node identity is invalid")
+        node_ids.add(node_id)
+        if (location.get("workspaceId") != workspace_id or
+                location.get("documentId") != workspace_id or
+                _normalized_shader_flow_path(
+                    location.get("path"),
+                    "Shader flow graph node path") != graph_source_path):
+            raise ShaderConsoleError(
+                "Shader flow graph node source is outside this workspace")
+        for field in ("line", "column"):
+            position = location.get(field)
+            if (isinstance(position, bool) or not isinstance(position, int) or
+                    position <= 0 or position > 10000000):
+                raise ShaderConsoleError(
+                    "Shader flow graph node source location is invalid")
+        if algorithm:
+            span = node.get("sourceRange")
+            if (not isinstance(span, dict) or set(span) != {"startLine", "endLine"}
+                    or type(span.get("startLine")) is not int
+                    or type(span.get("endLine")) is not int
+                    or not 1 <= span["startLine"] <= location["line"] <= span["endLine"] <= 10000000
+                    or node.get("inferred") is not True):
+                raise ShaderConsoleError("Shader computation source range is invalid")
+            for key in ("reads", "writes"):
+                values = node.get(key)
+                if (not isinstance(values, list) or len(values) > 32
+                        or any(not isinstance(value, str) or not value.strip() or len(value) > 72
+                               or any(ord(character) < 32 for character in value)
+                               for value in values)):
+                    raise ShaderConsoleError("Shader computation values are invalid")
+
+    edge_ids = set()
+    for edge in edges:
+        edge_fields = {"source", "target", "kind"}
+        if (not isinstance(edge, dict) or not edge_fields.issubset(edge)
+                or set(edge) - edge_fields - ({"values"} if algorithm else set())):
+            raise ShaderConsoleError("Shader flow graph edge fields are invalid")
+        identity = (str(edge.get("source", "") or ""),
+                    str(edge.get("target", "") or ""))
+        if (edge.get("kind") not in (("data", "control") if algorithm else ("calls",)) or
+                identity[0] not in node_ids or identity[1] not in node_ids or
+                identity in edge_ids):
+            raise ShaderConsoleError("Shader flow graph edge identity is invalid")
+        edge_ids.add(identity)
+        if "values" in edge:
+            values = edge["values"]
+            if (edge["kind"] != "data" or not isinstance(values, list)
+                    or not 1 <= len(values) <= 32
+                    or any(not isinstance(value, str) or not value.strip() or len(value) > 72
+                           or any(ord(character) < 32 for character in value)
+                           for value in values)):
+                raise ShaderConsoleError("Shader data edge values are invalid")
+
+    material = dict(graph)
+    material.pop("graphId", None)
+    material.pop("generatedAt", None)
+    if _canonical_sha256(material)[:32] != graph_id:
+        raise ShaderConsoleError(
+            "Shader flow graph identity does not match its contents")
+    return graph
+
+
+def _validate_shader_flow_graph(workspace, authorization, source_path, gate):
+    """Validate inert navigation metadata against the organized source gate."""
+
+    graph_path = _safe_relative(
+        workspace, "ai/flow-graph.json", "Shader flow graph path")
+    _regular_file_in_tree(
+        os.path.join(workspace, "ai"), graph_path,
+        MAX_SHADER_FLOW_GRAPH_BYTES, "Shader flow graph")
+    graph_bytes = _read_file_bytes(
+        graph_path, MAX_SHADER_FLOW_GRAPH_BYTES, "Shader flow graph")
+    try:
+        graph = json.loads(graph_bytes.decode("utf-8", errors="strict"))
+    except (UnicodeError, ValueError, TypeError) as exc:
+        raise ShaderConsoleError(
+            "Shader flow graph is invalid: %s" % _bounded(exc, 512))
+    if not isinstance(graph, dict):
+        raise ShaderConsoleError(
+            "Shader flow graph must contain one JSON object")
+    expected_relative = os.path.relpath(
+        source_path, workspace).replace("\\", "/")
+    if expected_relative.startswith("../") or expected_relative == "..":
+        raise ShaderConsoleError("Shader flow graph source escapes its workspace")
+    graph = _validate_shader_flow_graph_value(
+        graph,
+        expected_workspace_id=authorization["workspaceId"],
+        expected_source_sha256=gate["finalSourceSha256"],
+        expected_source_revision=gate["finalRevision"],
+        expected_source_path=expected_relative,
+        expected_stage=authorization["stage"],
+        expected_entry_point=authorization["entryPoint"],
+    )
+    if (not gate.get("flowGraphId") or
+            graph["graphId"] != gate.get("flowGraphId") or
+            hashlib.sha256(graph_bytes).hexdigest() !=
+            gate.get("flowGraphSha256") or
+            not _same_path(graph_path, gate.get("flowGraphArtifactPath"))):
+        raise ShaderConsoleError(
+            "Shader flow graph is not bound to its organization gate")
+    return graph, graph_path
+
+
+def _load_workspace_flow_graph(workspace, authorization, source_path, gate):
+    """Load an optional graph without making it editor/apply authority."""
+
+    if gate.get("kind") == "verified-project-source":
+        return gate.get("projectFlowGraph"), gate.get("projectFlowGraphStatus") or {
+            "available": False, "status": "unavailable", "artifactPath": ""}
+    graph_path = os.path.join(workspace, "ai", "flow-graph.json")
+    if not os.path.exists(graph_path) and not os.path.islink(graph_path):
+        return None, {
+            "available": False, "status": "unavailable", "artifactPath": graph_path}
+    try:
+        graph, graph_path = _validate_shader_flow_graph(
+            workspace, authorization, source_path, gate)
+        projection = dict(graph)
+        projection.update({
+            "available": True,
+            "status": "current",
+            "stale": False,
+            "artifactPath": graph_path,
+        })
+        return projection, {
+            "available": True, "status": "current", "artifactPath": graph_path}
+    except (ShaderConsoleError, OSError) as exc:
+        return None, {
+            "available": False,
+            "status": "invalid",
+            "artifactPath": graph_path,
+            "error": _bounded(exc, 1024),
+        }
 
 
 def _authorized_workspace(registry_path, authorization_id, workspace_id):
@@ -1091,10 +3456,52 @@ def _authorized_workspace(registry_path, authorization_id, workspace_id):
         authorization["workspacePath"], authorization)
     if HLSL_SOURCE_EXTENSION_RE.search(source_path) is None:
         raise ShaderConsoleError("authorized workspace source is not HLSL")
-    organization_gate = _validate_organization_gate(
+    organization_gate = _validate_editable_source_gate(
         authorization["workspacePath"], authorization, source_path)
     return (authorization, source_path, compiler_diagnostics, manifest_path,
             organization_gate)
+
+
+def normalize_capture_binding(value):
+    """Normalize a current UI capture scope; absence never selects old data."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+            "instanceId", "captureSessionId", "capturePath"}:
+        raise ShaderConsoleError("shader workspace capture binding is invalid")
+    instance = value.get("instanceId")
+    session = value.get("captureSessionId")
+    path = value.get("capturePath")
+    if (not isinstance(instance, str) or
+            re.fullmatch(r"[A-Za-z0-9_.-]{1,512}", instance) is None or
+            instance in (".", "..") or not isinstance(session, str) or
+            EXACT_TOKEN_RE.fullmatch(session) is None or
+            not isinstance(path, str) or not path or len(path) > 32768 or
+            "\x00" in path or not os.path.isabs(path)):
+        raise ShaderConsoleError("shader workspace capture binding is invalid")
+    return {"instanceId": instance, "captureSessionId": session,
+            "capturePath": _normal_path(path)}
+
+
+def _authorized_capture_live(authorization, capture_binding):
+    binding = normalize_capture_binding(capture_binding)
+    if binding is None or not _same_path(
+            authorization["capturePath"], binding["capturePath"]):
+        raise ShaderConsoleError("shader workspace does not belong to the current capture")
+    live_id = authorization["lastLiveEditId"]
+    if EXACT_TOKEN_RE.fullmatch(live_id) is None:
+        raise ShaderConsoleError("shader workspace has no current live-edit session")
+    workspace = authorization["workspacePath"]
+    live_root = os.path.join(workspace, "live-edit")
+    path = _regular_file_in_tree(
+        live_root, os.path.join(live_root, live_id + ".json"),
+        MAX_AUDIT_BYTES, "authorized shader live-edit audit")
+    live = _validate_live(
+        _read_json(path, MAX_AUDIT_BYTES, "authorized shader live-edit audit"),
+        workspace, live_id)
+    if live.get("captureBinding") != binding:
+        raise ShaderConsoleError("shader workspace belongs to another capture session")
+    return live
 
 
 def _require_running_live_edit(authorization, source_path):
@@ -1125,10 +3532,15 @@ def _require_running_live_edit(authorization, source_path):
     return live, watch
 
 
-def load_authorized_source_document(registry_path, authorization_id, workspace_id):
-    """Read one editable HLSL document through its durable authorization."""
+def load_authorized_source_document(registry_path, authorization_id, workspace_id,
+                                    capture_binding=None):
+    """Read one HLSL document bound to this GUI capture, without granting writes."""
+    binding = normalize_capture_binding(capture_binding)
+    if binding is None:
+        raise ShaderConsoleError("shader workspace requires a current capture")
     authorization, source_path, _diagnostics, _manifest_path, gate = _authorized_workspace(
         registry_path, authorization_id, workspace_id)
+    live = _authorized_capture_live(authorization, binding)
     raw = _read_file_bytes(source_path, MAX_SOURCE_BYTES, "workspace shader source")
     try:
         text = raw.decode("utf-8")
@@ -1138,12 +3550,22 @@ def load_authorized_source_document(registry_path, authorization_id, workspace_i
     raw_sha256 = hashlib.sha256(raw).hexdigest()
     if raw_sha256 != gate["finalSourceSha256"]:
         _live, watch = _require_running_live_edit(authorization, source_path)
-        if (watch.get("initialSourceSha256") != gate["finalSourceSha256"] or
-                watch.get("observedSourceSha256") != raw_sha256):
+        # A restarted authorised watcher begins at the user's latest source,
+        # which may already differ from the delivered asset. The running
+        # Host-owned watch must observe these exact bytes; its initial hash
+        # need not equal the original AI/project version on every restart.
+        if watch.get("observedSourceSha256") != raw_sha256:
             raise ShaderConsoleError(
                 "workspace shader source is not in the authorized organization/edit lineage")
     info = os.stat(source_path)
+    confirmed_live = _authorized_capture_live(authorization, binding)
+    if (confirmed_live["liveEditId"] != live["liveEditId"] or
+            confirmed_live["watchId"] != live["watchId"]):
+        raise ShaderConsoleError("shader workspace session changed while its source was read")
     return {
+        "captureBinding": binding,
+        "liveEditId": live["liveEditId"],
+        "watchId": live["watchId"],
         "authorizationId": authorization["authorizationId"],
         "workspaceId": authorization["workspaceId"],
         "workspacePath": authorization["workspacePath"],
@@ -1314,6 +3736,7 @@ def _validate_live(value, workspace, expected_live_id=""):
     if isinstance(active, dict):
         active_revision = _positive_integer(active.get("revision"), 0)
     return {
+        "captureBinding": normalize_capture_binding(value.get("captureBinding")),
         "liveEditId": live_id,
         "watchId": watch_id,
         "state": _bounded(value.get("state", ""), 32),
@@ -1830,29 +4253,44 @@ def derive_console_status(watch=None, live=None):
             "busy": False, "severity": "info"}
 
 
-def _workspace_model(authorization):
+def _workspace_model(authorization, capture_binding=None):
     workspace = authorization["workspacePath"]
-    source_path, compiler_diagnostics, manifest_path = _validate_manifest(
-        workspace, authorization)
-    organization_gate_path = os.path.join(
-        workspace, "ai", "organize-code-gate.json")
-    editor_eligible = False
-    editor_eligibility = "non-hlsl-source"
-    if HLSL_SOURCE_EXTENSION_RE.search(source_path) is not None:
-        try:
-            _validate_organization_gate(workspace, authorization, source_path)
-            editor_eligible = True
-            editor_eligibility = "organized-executable-editable-hlsl"
-        except ShaderConsoleError:
-            editor_eligibility = "organization-gate-unavailable"
     live = None
-    watch = None
     live_path = _latest_token_json(
         os.path.join(workspace, "live-edit"), authorization["lastLiveEditId"])
     if live_path:
         live_value = _read_json(live_path, MAX_AUDIT_BYTES, "shader live-edit audit")
-        live = _validate_live(
-            live_value, workspace, authorization["lastLiveEditId"])
+        live = _validate_live(live_value, workspace, authorization["lastLiveEditId"])
+    if capture_binding is not None and (
+            not authorization["lastLiveEditId"] or live is None or
+            live.get("captureBinding") != capture_binding):
+        return None
+    source_path, compiler_diagnostics, manifest_path = _validate_manifest(
+        workspace, authorization)
+    organization_gate_path = os.path.join(
+        workspace, "ai", "organize-code-gate.json")
+    flow_graph_path = os.path.join(workspace, "ai", "flow-graph.json")
+    editor_eligible = False
+    editor_eligibility = "non-hlsl-source"
+    organization_gate = None
+    if HLSL_SOURCE_EXTENSION_RE.search(source_path) is not None:
+        try:
+            organization_gate = _validate_editable_source_gate(
+                workspace, authorization, source_path)
+            editor_eligible = True
+            editor_eligibility = "organized-executable-editable-hlsl"
+        except ShaderConsoleError:
+            editor_eligibility = "organization-gate-unavailable"
+    flow_graph = None
+    flow_graph_status = {
+        "available": False,
+        "status": "unavailable",
+        "artifactPath": flow_graph_path,
+    }
+    if organization_gate is not None:
+        flow_graph, flow_graph_status = _load_workspace_flow_graph(
+            workspace, authorization, source_path, organization_gate)
+    watch = None
     watch_id = live.get("watchId", "") if isinstance(live, dict) else ""
     watch_path = _latest_token_json(os.path.join(workspace, "watch"), watch_id)
     if watch_path:
@@ -1870,12 +4308,18 @@ def _workspace_model(authorization):
         "workspacePath": workspace,
         "sourcePath": source_path,
         "captureId": authorization["captureId"],
+        "capturePath": authorization["capturePath"],
+        "captureBinding": live.get("captureBinding") if live is not None else None,
+        "shaderRawSha256": authorization["shaderRawSha256"],
         "stage": authorization["stage"],
         "entryPoint": authorization["entryPoint"],
         "resourceId": authorization["resourceId"],
         "updatedAt": authorization["updatedAt"],
+        "authorizedAt": authorization["authorizedAt"],
         "editorEligible": editor_eligible,
         "editorEligibility": editor_eligibility,
+        "flowGraph": flow_graph,
+        "flowGraphStatus": flow_graph_status,
         "autoApplyReady": bool(
             isinstance(live, dict) and live.get("state") == "running" and
             isinstance(watch, dict) and watch.get("state") == "running"),
@@ -1886,13 +4330,16 @@ def _workspace_model(authorization):
         "watchedPaths": [path for path in (
             source_path, manifest_path, organization_gate_path,
             os.path.dirname(organization_gate_path),
+            flow_graph_path,
             live_path, watch_path, os.path.dirname(live_path) if live_path else "",
-            os.path.dirname(watch_path) if watch_path else "") if path],
+            os.path.dirname(watch_path) if watch_path else "") if path] +
+            (organization_gate or {}).get("watchedPaths", []),
     }
 
 
-def load_console_snapshot(registry_path=None):
-    """Load the fixed journal plus authorised shader workspace projections."""
+def load_console_snapshot(registry_path=None, capture_binding=None):
+    """Load the journal and sources belonging to one exact current capture."""
+    _check_console_read_cancelled()
     path = os.path.abspath(str(registry_path or default_registry_path() or ""))
     generic = _load_generic_console_entries()
     result = {
@@ -1902,8 +4349,18 @@ def load_console_snapshot(registry_path=None):
         "workspaces": [],
         "entries": list(generic["entries"]),
         "errors": list(generic["errors"]),
-        "watchedPaths": list(generic["watchedPaths"]),
+        "watchedPaths": list(generic["watchedPaths"]) + [path, os.path.dirname(path)],
+        "captureBinding": None,
     }
+    try:
+        binding = normalize_capture_binding(capture_binding)
+    except ShaderConsoleError as exc:
+        binding = None
+        result["errors"].append(_bounded(exc, 1024))
+    result["captureBinding"] = binding
+    if binding is None:
+        result["counts"] = console_severity_counts(result["entries"])
+        return result
     if not path or not os.path.isfile(path):
         _append_snapshot_error_entries(result)
         result["counts"] = console_severity_counts(result["entries"])
@@ -1917,19 +4374,43 @@ def load_console_snapshot(registry_path=None):
             raise ShaderConsoleError("live-edit authorization registry entries are invalid")
         seen = set()
         for raw in entries:
+            _check_console_read_cancelled()
             try:
+                # Filter inert capture locators before touching unrelated old
+                # workspaces. Deleted history must not contaminate this UI.
+                identity = raw.get("workspaceIdentity") if isinstance(raw, dict) else None
+                if (not isinstance(identity, dict) or not _same_path(
+                        identity.get("capturePath", ""), binding["capturePath"])):
+                    continue
                 authorization = _validate_authorization(raw)
                 key = _normal_path(authorization["workspacePath"])
                 if key in seen:
                     raise ShaderConsoleError("duplicate authorized shader workspace")
                 seen.add(key)
-                result["workspaces"].append(_workspace_model(authorization))
+                model = _workspace_model(authorization, binding)
+                if model is not None and model.get("captureBinding") == binding:
+                    result["workspaces"].append(model)
             except ShaderConsoleError as exc:
                 result["errors"].append(_bounded(exc, 1024))
         result["workspaces"].sort(
-            key=lambda item: (item.get("updatedAt", ""), item["workspacePath"]),
+            key=lambda item: (item.get("autoApplyReady") is True,
+                              item.get("authorizedAt", ""),
+                              item.get("updatedAt", ""), item["workspacePath"]),
             reverse=True)
-        result["watchedPaths"] = [path, os.path.dirname(path)]
+        # Every model has already matched this exact GUI capture session. A
+        # full-frame and a bounded catalog can give the same physical Shader
+        # different captureIds; those catalog IDs must not duplicate the file.
+        # Keep separate ResourceIds even when their executable bytes are equal.
+        current = []
+        physical_keys = set()
+        for model in result["workspaces"]:
+            physical = (model["resourceId"], model["stage"],
+                        model["entryPoint"], model["shaderRawSha256"])
+            if physical not in physical_keys:
+                physical_keys.add(physical)
+                current.append(model)
+        result["workspaces"] = current
+        result["watchedPaths"] = list(generic["watchedPaths"]) + [path, os.path.dirname(path)]
         for workspace in result["workspaces"]:
             result["watchedPaths"].extend(workspace.get("watchedPaths", []))
             result["entries"].extend(workspace.get("entries", []))
@@ -2004,7 +4485,9 @@ if HAS_QT:
         POLL_INTERVAL_MS = 100
         FILESYSTEM_COALESCE_MS = 20
 
-        def __init__(self, ctx, qrd_module, registry_path=None, closed_callback=None):
+        def __init__(self, ctx, qrd_module, registry_path=None, closed_callback=None,
+                     capture_binding_provider=None):
+            self.capture_binding_provider = capture_binding_provider
             self.ctx = ctx
             self.qrd = qrd_module
             self.registry_path = registry_path or default_registry_path()
@@ -2208,13 +4691,34 @@ if HAS_QT:
             if directories:
                 self.file_watcher.addPaths(directories)
 
+        def _current_capture_binding(self):
+            try:
+                value = self.capture_binding_provider() if callable(
+                    self.capture_binding_provider) else None
+                return normalize_capture_binding(value)
+            except ShaderConsoleError:
+                return None
+
+        def capture_changed(self, binding=None):
+            if not self._alive:
+                return
+            for dialog in list(self._source_dialogs):
+                dialog.close()
+            self._source_dialogs = []
+            self._last_disk_signature = None
+            self.refresh(True)
+
         def refresh(self, force=False):
             if not self._alive:
                 return
             before = self._disk_signature()
-            if not force and before == self._last_disk_signature:
+            binding = self._current_capture_binding()
+            if (not force and before == self._last_disk_signature and
+                    (self._snapshot or {}).get("captureBinding") == binding):
                 return
-            snapshot = load_console_snapshot(self.registry_path)
+            snapshot = load_console_snapshot(self.registry_path, capture_binding=binding)
+            if binding != self._current_capture_binding():
+                return
             previous_key = self._selected_workspace_key
             self._snapshot = snapshot
             self.workspace_combo.blockSignals(True)
@@ -2385,8 +4889,10 @@ if HAS_QT:
             if not isinstance(entry, dict):
                 return
             workspace = self._workspace_for_entry(entry)
+            binding = self._current_capture_binding()
             if (not workspace or not entry.get("sourceFile") or
-                    not entry.get("line")):
+                    not entry.get("line") or binding is None or
+                    workspace.get("captureBinding") != binding):
                 return
             source_path = entry["sourceFile"]
             # Re-check the fixed authorization boundary at click time. Compiler
@@ -2399,9 +4905,16 @@ if HAS_QT:
                     "源码路径已改变或离开授权工作区，已拒绝打开。")
                 return
             try:
+                _authorized_capture_live(dict(
+                    workspace, lastLiveEditId=(workspace.get("liveEdit") or {}).get(
+                        "liveEditId", "")), binding)
                 dialog = SourceLocationDialog(
                     source_path, entry.get("line") or 1,
                     entry.get("column") or 1, self.top)
+                if binding != self._current_capture_binding():
+                    dialog.close()
+                    dialog.deleteLater()
+                    return
                 dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
                 dialog.destroyed.connect(
                     lambda _object=None, selected=dialog: self._forget_dialog(selected))

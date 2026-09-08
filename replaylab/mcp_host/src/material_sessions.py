@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import hashlib
 import json
 import math
@@ -25,6 +26,7 @@ OVERRIDE_SCHEMA = "renderdoc-ultra-event-cbuffer-override/v1"
 MATERIAL_SCHEMA = "renderdoc-ultra-material-session/v1"
 CLEAR_ALL_SCHEMA = "renderdoc-ultra-event-cbuffer-clear-all/v1"
 MAX_MATERIAL_SESSIONS = 128
+MAX_MATERIAL_ROLLBACK_TOMBSTONES = 128
 MAX_EDITABLE_PARAMETERS = 4096
 MAX_CBUFFER_BYTES = 64 * 1024
 
@@ -250,6 +252,16 @@ class _MaterialSession:
     patches: dict[str, bytes] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _MaterialRollbackTombstone:
+    """Bound proof that one host material session was already restored."""
+
+    session_id: str
+    capture_id: str
+    capture_session_id: str
+    receipt: dict
+
+
 class MaterialSessionManager:
     """Own bounded, in-memory material sessions for one MCP server process."""
 
@@ -257,11 +269,19 @@ class MaterialSessionManager:
         self,
         bridge_call: Callable[..., Any],
         maximum_sessions: int = MAX_MATERIAL_SESSIONS,
+        maximum_rollback_tombstones: int = MAX_MATERIAL_ROLLBACK_TOMBSTONES,
     ) -> None:
         self._bridge_call = bridge_call
         self._maximum_sessions = maximum_sessions
+        self._maximum_rollback_tombstones = _strict_int(
+            maximum_rollback_tombstones,
+            "maximum_rollback_tombstones",
+            1,
+        )
         self._sessions: dict[str, _MaterialSession] = {}
+        self._rollback_tombstones: dict[str, _MaterialRollbackTombstone] = {}
         self._capture_session_id = ""
+        self._capture_catalog_id = ""
         self._guard = threading.RLock()
 
     def _call(self, method: str, params: dict, timeout: float = 60.0) -> Any:
@@ -300,12 +320,32 @@ class MaterialSessionManager:
         response = self._call("get_capture_status", {}, timeout=30.0)
         if not isinstance(response, dict) or response.get("loaded") is not True:
             self._sessions.clear()
+            self._rollback_tombstones.clear()
             self._capture_session_id = ""
+            self._capture_catalog_id = ""
             raise MaterialSessionError("No capture is loaded in RenderDoc")
         session_id = _hex(response.get("captureSessionId"), 32, "captureSessionId")
-        if self._capture_session_id and session_id != self._capture_session_id:
+        reported_capture_id = str(response.get("captureId", "") or "").strip().lower()
+        if reported_capture_id:
+            reported_capture_id = _hex(
+                reported_capture_id, 64, "active captureId"
+            )
+        lifecycle_changed = bool(
+            self._capture_session_id
+            and (
+                session_id != self._capture_session_id
+                or (
+                    self._capture_catalog_id
+                    and reported_capture_id
+                    and reported_capture_id != self._capture_catalog_id
+                )
+            )
+        )
+        if lifecycle_changed:
             self._sessions.clear()
+            self._rollback_tombstones.clear()
         self._capture_session_id = session_id
+        self._capture_catalog_id = reported_capture_id
         return response
 
     @staticmethod
@@ -624,6 +664,7 @@ class MaterialSessionManager:
             "schemaVersion": 1,
             "operation": operation,
             "sessionId": record.session_id,
+            "snapshotId": record.snapshot_id,
             "captureId": record.capture_id,
             "captureSessionId": record.capture_session_id,
             "api": record.api,
@@ -664,10 +705,137 @@ class MaterialSessionManager:
             raise MaterialSessionError("Unknown or expired material session ID")
         return record
 
+    def _active_capture_id(self, live: dict) -> str:
+        """Resolve the one active catalog identity, never merely a known one."""
+
+        return self._capture_id(live, "")
+
+    def _ensure_capture_binding(
+        self, *, capture_id: str, capture_session_id: str
+    ) -> None:
+        live = self._live_capture()
+        if capture_session_id != self._capture_session_id:
+            raise MaterialSessionError(
+                "Material session belongs to an expired capture lifecycle"
+            )
+        if self._active_capture_id(live) != capture_id:
+            self._sessions.clear()
+            self._rollback_tombstones.clear()
+            raise MaterialSessionError(
+                "Material session belongs to a different capture catalog identity"
+            )
+
     def _ensure_record_capture(self, record: _MaterialSession) -> None:
-        self._live_capture()
-        if record.capture_session_id != self._capture_session_id:
-            raise MaterialSessionError("Material session belongs to an expired capture lifecycle")
+        self._ensure_capture_binding(
+            capture_id=record.capture_id,
+            capture_session_id=record.capture_session_id,
+        )
+
+    @staticmethod
+    def _validate_rollback_response(
+        record: _MaterialSession, response: Any
+    ) -> bool:
+        """Validate the complete bridge rollback identity and return idempotency."""
+
+        already_released = (
+            response.get("alreadyReleased") if isinstance(response, dict) else None
+        )
+        expected_override = record.override_id or None
+        expected_cleared = bool(record.override_id) and already_released is False
+        if not isinstance(response, dict) or any(
+            (
+                response.get("schema") != OVERRIDE_SCHEMA,
+                response.get("schemaVersion") != 1,
+                response.get("snapshotId") != record.snapshot_id,
+                response.get("overrideId") != expected_override,
+                response.get("captureId") != record.capture_id,
+                response.get("captureSessionId") != record.capture_session_id,
+                response.get("api") != record.api,
+                response.get("eventId") != record.event_id,
+                response.get("stage") != record.stage,
+                response.get("blockIndex") != record.block_index,
+                response.get("slot") != record.slot,
+                response.get("registerSpace") != record.register_space,
+                response.get("revision") != record.revision,
+                response.get("currentRawSha256") != _sha256(record.current),
+                type(already_released) is not bool,
+                response.get("cleared") is not expected_cleared,
+                response.get("snapshotReleased") is not True,
+                response.get("configured") is not False,
+            )
+        ):
+            raise MaterialSessionError(
+                "RenderDoc returned a mismatched CBuffer rollback result"
+            )
+        return already_released
+
+    @staticmethod
+    def _rollback_receipt(
+        record: _MaterialSession,
+        *,
+        proof: dict,
+        restored_by: str,
+        already_restored: bool,
+        idempotent_rollback: bool,
+    ) -> dict:
+        result = {
+            "schema": MATERIAL_SCHEMA,
+            "schemaVersion": 1,
+            "operation": "rollback",
+            "sessionId": record.session_id,
+            "captureId": record.capture_id,
+            "captureSessionId": record.capture_session_id,
+            "eventId": record.event_id,
+            "stage": record.stage,
+            "slot": record.slot,
+            "registerSpace": record.register_space,
+            "applied": False,
+            "snapshotReleased": True,
+            "restoredBy": restored_by,
+            "alreadyRestored": already_restored,
+            "idempotentRollback": idempotent_rollback,
+        }
+        if restored_by == "rollback":
+            result["override"] = copy.deepcopy(proof)
+        elif restored_by == "clearAll":
+            result["clearAll"] = copy.deepcopy(proof)
+        else:  # Defensive: receipts must never advertise an unknown proof kind.
+            raise MaterialSessionError("Unknown material restoration proof kind")
+        return result
+
+    def _remember_rollback(
+        self, record: _MaterialSession, receipt: dict
+    ) -> None:
+        token = record.session_id
+        self._rollback_tombstones.pop(token, None)
+        self._rollback_tombstones[token] = _MaterialRollbackTombstone(
+            session_id=token,
+            capture_id=record.capture_id,
+            capture_session_id=record.capture_session_id,
+            receipt=copy.deepcopy(receipt),
+        )
+        while (
+            len(self._rollback_tombstones)
+            > self._maximum_rollback_tombstones
+        ):
+            oldest = next(iter(self._rollback_tombstones))
+            self._rollback_tombstones.pop(oldest, None)
+
+    def _repeat_rollback(self, tombstone: _MaterialRollbackTombstone) -> dict:
+        self._ensure_capture_binding(
+            capture_id=tombstone.capture_id,
+            capture_session_id=tombstone.capture_session_id,
+        )
+        # _ensure_capture_binding may expire every local capability on a capture
+        # transition. Re-fetch before returning any old proof.
+        current = self._rollback_tombstones.get(tombstone.session_id)
+        if current is not tombstone:
+            raise MaterialSessionError("Unknown or expired material session ID")
+        result = copy.deepcopy(tombstone.receipt)
+        result["alreadyRestored"] = True
+        result["idempotentRollback"] = True
+        return result
+
 
     def _verify_bridge_status(self, record: _MaterialSession) -> None:
         """Require bridge bookkeeping to agree with the host's claimed state."""
@@ -919,7 +1087,15 @@ class MaterialSessionManager:
 
     def rollback(self, session_id: str) -> dict:
         with self._guard:
-            record = self._record(session_id)
+            token = _hex(session_id, 32, "session_id")
+            record = self._sessions.get(token)
+            if record is None:
+                tombstone = self._rollback_tombstones.get(token)
+                if tombstone is None:
+                    raise MaterialSessionError(
+                        "Unknown or expired material session ID"
+                    )
+                return self._repeat_rollback(tombstone)
             self._ensure_record_capture(record)
             try:
                 response = self._call(
@@ -932,47 +1108,25 @@ class MaterialSessionManager:
                     },
                     timeout=60.0,
                 )
-                if not isinstance(response, dict) or any(
-                    (
-                        response.get("schema") != OVERRIDE_SCHEMA,
-                        response.get("schemaVersion") != 1,
-                        response.get("snapshotId") != record.snapshot_id,
-                        response.get("captureId") != record.capture_id,
-                        response.get("captureSessionId") != record.capture_session_id,
-                        response.get("snapshotReleased") is not True,
-                        bool(record.override_id) and response.get("cleared") is not True,
-                    )
-                ):
-                    raise MaterialSessionError(
-                        "RenderDoc returned a mismatched CBuffer rollback result"
-                    )
-            except Exception:
-                # The response may have been lost after the clear. Retry once by
-                # immutable snapshot identity, then stop advertising local state.
-                self._release_snapshot_best_effort(
-                    snapshot_id=record.snapshot_id,
-                    override_id=record.override_id,
-                    capture_id=record.capture_id,
-                    capture_session_id=record.capture_session_id,
+                already_released = self._validate_rollback_response(
+                    record, response
                 )
-                self._sessions.pop(record.session_id, None)
+            except Exception:
+                # Retain the exact host capability. If the bridge completed the
+                # release but its response was lost, the next exact call reaches
+                # the bridge's capture-bound snapshot tombstone. We never turn an
+                # unverified best-effort retry into a success receipt.
                 raise
+            receipt = self._rollback_receipt(
+                record,
+                proof=response,
+                restored_by="rollback",
+                already_restored=already_released,
+                idempotent_rollback=already_released,
+            )
+            self._remember_rollback(record, receipt)
             self._sessions.pop(record.session_id, None)
-            return {
-                "schema": MATERIAL_SCHEMA,
-                "schemaVersion": 1,
-                "operation": "rollback",
-                "sessionId": record.session_id,
-                "captureId": record.capture_id,
-                "captureSessionId": record.capture_session_id,
-                "eventId": record.event_id,
-                "stage": record.stage,
-                "slot": record.slot,
-                "registerSpace": record.register_space,
-                "override": response,
-                "applied": False,
-                "snapshotReleased": True,
-            }
+            return receipt
 
     def clear_all(self, expected_capture_id: str = "") -> dict:
         """Explicitly recover all bridge/host material state for this capture."""
@@ -980,6 +1134,26 @@ class MaterialSessionManager:
         with self._guard:
             live = self._live_capture()
             capture_id = self._capture_id(live, expected_capture_id)
+            active_capture_id = self._active_capture_id(live)
+            if active_capture_id != capture_id:
+                raise MaterialSessionError(
+                    "Requested material recovery identity is not the active capture"
+                )
+            related_records = sorted(
+                (
+                    record
+                    for record in self._sessions.values()
+                    if record.capture_id == capture_id
+                    and record.capture_session_id == self._capture_session_id
+                ),
+                key=lambda record: record.session_id,
+            )
+            already_restored_ids = sorted(
+                tombstone.session_id
+                for tombstone in self._rollback_tombstones.values()
+                if tombstone.capture_id == capture_id
+                and tombstone.capture_session_id == self._capture_session_id
+            )
             try:
                 response = self._call(
                     "clear_all_event_cbuffer_snapshots",
@@ -1016,6 +1190,16 @@ class MaterialSessionManager:
                 # keep advertising process-local handles after this recovery call.
                 self._sessions.clear()
                 raise
+            restored_ids = [record.session_id for record in related_records]
+            for record in related_records:
+                receipt = self._rollback_receipt(
+                    record,
+                    proof=response,
+                    restored_by="clearAll",
+                    already_restored=True,
+                    idempotent_rollback=True,
+                )
+                self._remember_rollback(record, receipt)
             self._sessions.clear()
             return {
                 "schema": MATERIAL_SCHEMA,
@@ -1023,8 +1207,13 @@ class MaterialSessionManager:
                 "operation": "clearAll",
                 "captureId": capture_id,
                 "captureSessionId": self._capture_session_id,
+                "clearAll": copy.deepcopy(response),
                 "clearedOverrideCount": cleared_count,
                 "releasedSnapshotCount": released_count,
+                "restoredSessionCount": len(restored_ids),
+                "restoredSessionIds": restored_ids,
+                "alreadyRestoredSessionCount": len(already_restored_ids),
+                "alreadyRestoredSessionIds": already_restored_ids,
                 "cleared": True,
             }
 
@@ -1033,7 +1222,9 @@ class MaterialSessionManager:
 
         with self._guard:
             self._sessions.clear()
+            self._rollback_tombstones.clear()
             self._capture_session_id = ""
+            self._capture_catalog_id = ""
 
     def shutdown(self) -> None:
         """Best-effort rollback of every session owned by this host process."""
@@ -1055,4 +1246,6 @@ class MaterialSessionManager:
                 except Exception:
                     pass
             self._sessions.clear()
+            self._rollback_tombstones.clear()
             self._capture_session_id = ""
+            self._capture_catalog_id = ""

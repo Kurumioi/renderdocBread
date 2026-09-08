@@ -6,9 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from replaylab_agent.planning import PlannedTask, TaskPlan
+from replaylab_agent.agent_contracts import RunResult
 from replaylab_agent.profiles import Profile, ProfileStore
-from replaylab_agent.runtime import AgentRuntime
 
 
 class _BinaryStdout:
@@ -21,174 +20,107 @@ class _BinaryStderr:
         self.buffer = BytesIO()
 
 
-def _result(text: str, *, plan=None, workflow=None):
-    return SimpleNamespace(
-        task_id="task-json",
-        profile="local",
-        executor="RenderDoc Agent",
-        text=text,
-        plan=plan,
-        workflow=workflow,
-    )
+def _run_args(**changes):
+    values = {
+        "mcp_host": None,
+        "context_file": None,
+        "live_context": False,
+        "instance_id": "",
+        "prompt": "解释事件",
+        "prompt_stdin": False,
+        "profile": "local",
+        "model": "",
+        "skill": "",
+        "intent_kind": "",
+        "task_id": "task-json",
+        "cancel_file": None,
+        "engine_config": None,
+        "json": True,
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
 
 
 @pytest.mark.asyncio
-async def test_run_json_is_one_compact_utf8_record(monkeypatch, tmp_path) -> None:
+async def test_run_json_is_compact_utf8_and_model_uses_deepagents(
+    monkeypatch, tmp_path
+) -> None:
     import replaylab_agent.cli as cli
 
     store = ProfileStore(tmp_path / "profiles.json")
     store.add(Profile("local", "ollama", "test-model"))
+    seen = []
 
-    class FakeRuntime:
+    class FakeDeepEngine:
         def __init__(self, *args, **kwargs) -> None:
-            pass
+            seen.append((args, kwargs))
 
-        async def run(self, prompt, **kwargs):
-            assert prompt == "解释事件"
-            return _result("中文回答 ✓")
+        async def run(self, request):
+            assert request.prompt == "解释事件"
+            return RunResult(
+                task_id=request.task_id,
+                profile_id=request.profile.id,
+                executor="deepagents",
+                text="中文回答 ✓",
+                terminal_status="completed",
+            )
+
+    class ForbiddenNativeEngine:
+        def __init__(self, *args, **kwargs) -> None:  # pragma: no cover
+            raise AssertionError("model profiles must not use a vendor-native loop")
 
     output = _BinaryStdout()
-    monkeypatch.setattr(cli, "AgentRuntime", FakeRuntime)
+    monkeypatch.setattr(cli, "DeepAgentsEngine", FakeDeepEngine)
+    monkeypatch.setattr(cli, "NativeAgentEngine", ForbiddenNativeEngine)
     monkeypatch.setattr(cli.sys, "stdout", output)
-    args = SimpleNamespace(
-        mcp_host=None,
-        context_file=None,
-        live_context=False,
-        instance_id="",
-        prompt="解释事件",
-        prompt_stdin=False,
-        profile="local",
-        skill="",
-        task_id="task-json",
-        json=True,
-    )
 
-    assert await cli._run_once(args, store) == 0
+    assert await cli._run_once(_run_args(), store) == 0
     encoded = output.buffer.getvalue()
+    assert len(seen) == 1
     assert encoded.endswith(b"\n")
     assert encoded.count(b"\n") == 1
-    assert b'\n  "' not in encoded
     assert json.loads(encoded.decode("utf-8"))["text"] == "中文回答 ✓"
 
 
 @pytest.mark.asyncio
-async def test_work_once_json_is_one_compact_utf8_record(monkeypatch, tmp_path) -> None:
+async def test_subscription_profile_uses_only_vendor_native_engine(
+    monkeypatch, tmp_path
+) -> None:
     import replaylab_agent.cli as cli
 
     store = ProfileStore(tmp_path / "profiles.json")
-    store.add(Profile("local", "ollama", "test-model"))
+    store.add(Profile("subscription", "codex"))
 
-    class FakeRuntime:
+    class ForbiddenDeepEngine:
+        def __init__(self, *args, **kwargs) -> None:  # pragma: no cover
+            raise AssertionError("subscription profiles must not use deepagents")
+
+    class FakeNativeEngine:
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def process_one_intent(self, **kwargs):
-            assert kwargs == {"profile_id": "local", "instance_id": "instance-a"}
-            return _result("任务完成")
+        async def run(self, request):
+            return RunResult(
+                task_id=request.task_id,
+                profile_id=request.profile.id,
+                executor="Codex",
+                text="done",
+                terminal_status="completed",
+                core="vendor-native-agent/v1",
+            )
 
     output = _BinaryStdout()
-    monkeypatch.setattr(cli, "AgentRuntime", FakeRuntime)
+    monkeypatch.setattr(cli, "DeepAgentsEngine", ForbiddenDeepEngine)
+    monkeypatch.setattr(cli, "NativeAgentEngine", FakeNativeEngine)
     monkeypatch.setattr(cli.sys, "stdout", output)
-    args = SimpleNamespace(
-        mcp_host=None,
-        profile="local",
-        instance_id="instance-a",
-        json=True,
+
+    result = await cli._run_once(
+        _run_args(profile="subscription", prompt="inspect"), store
     )
-
-    assert await cli._work_once(args, store) == 0
-    encoded = output.buffer.getvalue()
-    assert encoded.endswith(b"\n")
-    assert encoded.count(b"\n") == 1
-    assert b'\n  "' not in encoded
-    assert json.loads(encoded.decode("utf-8"))["text"] == "任务完成"
-
-
-def test_compact_result_envelope_fits_eight_mib_for_legal_worst_case_text() -> None:
-    import replaylab_agent.cli as cli
-
-    # JSON uses six ASCII bytes for each embedded NUL ("\\u0000"), making this a worse
-    # machine-envelope case than a 4-byte UTF-8 code point at the same one-million-char limit.
-    text = "\0" * AgentRuntime._EVENT_TEXT_MAX_CHARS
-    assert AgentRuntime._validated_result_text(text, "test response") == text
-    plan = TaskPlan(
-        request_summary="\0" * 800,
-        tasks=[
-            PlannedTask(
-                id=f"task-{index}",
-                summary="\0" * 500,
-                skill="s" * 64,
-            )
-            for index in range(1, 4)
-        ],
-    )
-
-    encoded = cli._machine_json(cli._result_payload(_result(text, plan=plan))) + b"\n"
-
-    assert len(encoded) > 4 * 1024 * 1024
-    assert len(encoded) < 8 * 1024 * 1024
-    assert json.loads(encoded)["text"] == text
-
-
-def test_workflow_receipt_is_bounded_and_excludes_specialist_answers() -> None:
-    import replaylab_agent.cli as cli
-
-    secret_answer = "specialist answer must not be duplicated" * 1000
-    result = SimpleNamespace(
-        task_id="task-1",
-        skill="renderdoc-explain-event",
-        summary="Explain the event",
-        answer=secret_answer,
-        completed_tools=("get_pipeline_state", "get_draw_call_details"),
-        evidence_validated=True,
-    )
-    session = SimpleNamespace(
-        task_id="task-1",
-        agent_id="specialist-0123456789abcdef",
-        skill="renderdoc-explain-event",
-        status="accepted",
-        attempts=2,
-        validation_feedback=("corrected evidence",),
-        failure_reason="",
-        context_generation=1,
-        released=True,
-    )
-    workflow = SimpleNamespace(
-        terminal_status="completed",
-        clarification=SimpleNamespace(
-            event_payload=lambda: {
-                "question": "Which target?",
-                "selectionMode": "single",
-                "options": [
-                    {"id": "first", "label": "First", "description": "First target."},
-                    {"id": "second", "label": "Second", "description": "Second target."},
-                ],
-                "allowOther": True,
-            }
-        ),
-        strategy="adaptive-supervisor-specialists/langgraph-v2",
-        supervisor_decisions=2,
-        total_tasks=1,
-        goal=SimpleNamespace(objective="Explain the selected event"),
-        stages=(
-            SimpleNamespace(
-                stage_id="stage-1",
-                objective="Establish event evidence",
-                results=(result,),
-                sessions=(session,),
-            ),
-        ),
-    )
-
-    payload = cli._result_payload(_result("final answer", workflow=workflow))
-    encoded_receipt = cli._machine_json(payload["workflowReceipt"])
-
-    assert payload["terminalStatus"] == "completed"
-    assert payload["clarification"]["selectionMode"] == "single"
-    assert payload["workflowReceipt"]["schema"] == "replaylab-workflow-receipt/v1"
-    assert payload["workflowReceipt"]["stages"][0]["sessions"][0]["released"] is True
-    assert secret_answer not in encoded_receipt.decode("utf-8")
-    assert len(encoded_receipt) <= 256 * 1024
+    payload = json.loads(output.buffer.getvalue())
+    assert result == 0
+    assert payload["engine"] == "vendor-native-agent/v1"
+    assert payload["children"] == []
 
 
 def test_terminal_error_is_exact_bounded_utf8_even_under_chinese_locale(
@@ -202,9 +134,7 @@ def test_terminal_error_is_exact_bounded_utf8_even_under_chinese_locale(
 
     cli._print_utf8_error(detail)
 
-    encoded = output.buffer.getvalue()
-    assert encoded == (detail + "\n").encode("utf-8")
-    assert encoded.decode("utf-8").endswith("白银之城\\4.rdc\n")
+    assert output.buffer.getvalue() == (detail + "\n").encode("utf-8")
 
 
 def test_terminal_error_text_only_fallback_preserves_chinese(monkeypatch) -> None:
@@ -217,7 +147,48 @@ def test_terminal_error_text_only_fallback_preserves_chinese(monkeypatch) -> Non
     assert output.getvalue() == "连接失败：中文路径\n"
 
 
-def test_machine_json_preserves_chinese_and_survives_malformed_provider_unicode() -> None:
+def test_cli_main_converts_unexpected_run_failure_to_safe_terminal_category(
+    monkeypatch, tmp_path
+) -> None:
+    import replaylab_agent.cli as cli
+
+    output = _BinaryStderr()
+    secret = "sk-cli-secret-value"
+
+    async def fail_run(*_args, **_kwargs):
+        raise NameError(f"private failure token={secret}")
+
+    monkeypatch.setattr(cli.sys, "stderr", output)
+    monkeypatch.setattr(cli, "_load_store", lambda _path: object())
+    monkeypatch.setattr(cli, "_run_once", fail_run)
+
+    result = cli.main(
+        ["--config", str(tmp_path / "profiles.json"), "run", "--prompt", "private"]
+    )
+
+    terminal = output.buffer.getvalue().decode("utf-8")
+    assert result == 2
+    assert "error[internal-host-failure]" in terminal
+    assert secret not in terminal
+    assert "NameError" not in terminal
+
+
+def test_cli_rejected_argument_does_not_echo_secret_argv(monkeypatch) -> None:
+    import replaylab_agent.cli as cli
+
+    output = StringIO()
+    secret_argument = "--api-key=sk-argv-secret-value"
+    monkeypatch.setattr(cli.sys, "stderr", output)
+
+    result = cli.main(["run", "--prompt", "hello", secret_argument])
+
+    assert result == 2
+    terminal = output.getvalue()
+    assert "error[invalid-command-line]" in terminal
+    assert secret_argument not in terminal
+
+
+def test_machine_json_preserves_chinese_and_malformed_provider_unicode() -> None:
     import replaylab_agent.cli as cli
 
     encoded = cli._machine_json(

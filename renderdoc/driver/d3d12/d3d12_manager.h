@@ -390,6 +390,9 @@ public:
   void Create(D3D12_DESCRIPTOR_HEAP_TYPE heapType, WrappedID3D12Device *dev,
               D3D12_CPU_DESCRIPTOR_HANDLE handle);
   void CopyFrom(const D3D12Descriptor &src);
+  // Compare the complete stored payload, ignoring only the destination heap and index retained by
+  // CopyFrom. This does not prove that resource replacement/native-address fixups are unchanged.
+  bool ContentsEqual(const D3D12Descriptor &src) const;
   void GetRefIDs(ResourceId &id, ResourceId &id2, FrameRefType &ref);
 
   WrappedID3D12DescriptorHeap *GetHeap() const { return data.samp.heap; }
@@ -685,6 +688,15 @@ struct SparseBinds
   SparseBinds(int);
 
   void Apply(WrappedID3D12Device *device, ID3D12Resource *resource);
+
+  // Immutable initial mapping summary. NULL and reused tiles need no special handling when the
+  // caller deliberately tracks whole physical heaps rather than individual virtual tiles.
+  void GetReferencedHeaps(std::set<ResourceId> &heaps) const
+  {
+    for(const Bind &bind : binds)
+      if(bind.heap != ResourceId())
+        heaps.insert(bind.heap);
+  }
 
 private:
   bool null = false;
@@ -1447,6 +1459,9 @@ struct D3D12ResourceManagerConfiguration
 class D3D12ResourceManager : public ResourceManager<D3D12ResourceManagerConfiguration>
 {
 public:
+  // Includes backing heaps as well as ordinary resources, unlike the public texture/buffer lists.
+  rdcarray<ResourceId> GetInitialContentResourceIDs() { return InitialContentResources(); }
+
   D3D12ResourceManager(CaptureState &state, WrappedID3D12Device *dev)
       : ResourceManager(state), m_Device(dev), m_GPUBufferAllocator(dev)
   {

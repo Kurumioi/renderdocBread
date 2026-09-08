@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib
+import importlib.util
 import json
 from pathlib import Path
 import sys
@@ -57,11 +58,19 @@ class _PassIPC:
     def call(self, method, params=None, timeout=None):
         params = copy.deepcopy(params or {})
         self.calls.append((method, params, timeout))
-        if method == "get_pass_classification_inputs":
+        if method in (
+            "get_pass_classification_inputs", "get_current_frame_flow_inputs"
+        ):
             return {
-                "schema": "replaylab-pass-classification-inputs/v1",
+                "schema": (
+                    "replaylab-current-frame-flow-inputs/v1"
+                    if method == "get_current_frame_flow_inputs"
+                    else "replaylab-pass-classification-inputs/v1"
+                ),
                 "schemaVersion": 1,
-                "captureId": self.capture_id,
+                "captureId": str(
+                    params.get("expected_capture_id", self.capture_id)
+                ),
                 "captureSessionId": self.session_id,
                 "actions": [
                     {
@@ -108,6 +117,9 @@ class _PassIPC:
                 "schemaVersion": 1,
                 "captureId": classification["captureId"],
                 "captureSessionId": self.session_id,
+                "captureBindingMode": params.get(
+                    "capture_binding_mode", "project-catalog"
+                ),
                 "panel": {"visible": True},
                 "loaded": True,
                 "replayMutation": False,
@@ -238,25 +250,44 @@ class ServerPassClassificationTests(unittest.TestCase):
         self.server._PASS_CLASSIFICATION_CACHE.clear()
         self.temporary.cleanup()
 
-    def _fixed(self):
-        result = json.loads(self.server.classify_current_frame_passes())
+    def _fixed(self, **arguments):
+        result = json.loads(
+            self.server.classify_current_frame_passes(**arguments)
+        )
         self.assertNotIn("error", result, result)
         return result
 
-    def test_fixed_classification_is_capture_bound_persisted_and_published(self):
+    def test_fixed_classification_defaults_to_display_only_without_project_write(self):
         result = self._fixed()
         self.assertEqual(result["operation"], "classify-fixed")
-        self.assertEqual(result["classification"]["captureId"], self.capture_id)
+        display_capture_id = self.server._display_session_capture_id(
+            self.session_id
+        )
+        self.assertEqual(result["classification"]["captureId"], display_capture_id)
         self.assertEqual(result["classification"]["summary"]["actionCount"], 1)
         self.assertEqual(len(result["classificationId"]), 32)
-        self.assertTrue(result["projectKnowledge"]["persisted"])
+        self.assertEqual(result["captureBindingMode"], "display-session")
+        self.assertEqual(result["effectMode"], "display-only")
+        self.assertFalse(result["projectKnowledge"]["projectPrepared"])
+        self.assertFalse(result["projectKnowledge"]["persistRequested"])
+        self.assertFalse(result["projectKnowledge"]["persisted"])
         self.assertTrue(result["panel"]["published"])
-        self.assertEqual(len(_PassStore.instances), 1)
-        self.assertEqual(_PassStore.instances[0].saved[0][1], self.capture_id)
-        inputs_call = next(
-            item for item in self.ipc.calls if item[0] == "get_pass_classification_inputs"
+        self.assertEqual(result["panel"]["publicationMode"], "display-only")
+        self.assertEqual(len(_PassStore.instances), 0)
+        self.server.prepare_active_capture_project.assert_not_called()
+        self.assertFalse(
+            any(
+                item[0] == "get_pass_classification_inputs"
+                for item in self.ipc.calls
+            )
         )
-        self.assertEqual(inputs_call[1]["expected_capture_id"], self.capture_id)
+        inputs_call = next(
+            item for item in self.ipc.calls
+            if item[0] == "get_current_frame_flow_inputs"
+        )
+        self.assertEqual(
+            inputs_call[1]["expected_capture_id"], display_capture_id
+        )
         self.assertEqual(
             inputs_call[1]["expected_capture_session_id"], self.session_id
         )
@@ -266,13 +297,246 @@ class ServerPassClassificationTests(unittest.TestCase):
         self.assertEqual(
             panel_call[1]["expected_capture_session_id"], self.session_id
         )
+        self.assertEqual(
+            panel_call[1]["capture_binding_mode"], "display-session"
+        )
+        self.assertEqual(panel_call[1]["classification"]["summary"], {
+            "sourceTruncated": False,
+            "omittedActionCountLowerBound": 0,
+            "truncationReasons": [],
+            "effectiveMaxActions": self.server.MAX_PASS_PANEL_ACTIONS,
+        })
+
+    def test_explicit_persistence_prepares_project_and_reports_project_publication(self):
+        result = self._fixed(persist_project=True)
+        self.assertEqual(result["captureId"], self.capture_id)
+        self.assertEqual(result["captureBindingMode"], "project-catalog")
+        self.assertEqual(result["effectMode"], "project-persisted")
+        self.assertTrue(result["projectKnowledge"]["projectPrepared"])
+        self.assertTrue(result["projectKnowledge"]["persistRequested"])
+        self.assertTrue(result["projectKnowledge"]["persisted"])
+        self.assertEqual(result["panel"]["publicationMode"], "project-persisted")
+        self.assertEqual(len(_PassStore.instances), 1)
+        self.assertEqual(_PassStore.instances[0].saved[0][1], self.capture_id)
+        self.server.prepare_active_capture_project.assert_called_once_with()
+        self.assertTrue(any(
+            item[0] == "get_pass_classification_inputs"
+            for item in self.ipc.calls
+        ))
+
+    def test_readonly_frame_flow_uses_one_composite_without_project_or_ui(self):
+        with mock.patch.object(
+            self.server,
+            "prepare_active_capture_project",
+            side_effect=AssertionError("read-only flow must not prepare a project"),
+        ):
+            result = json.loads(self.server.analyze_current_frame_flow())
+        self.assertNotIn("error", result, result)
+        self.assertEqual("analyze-current-frame-flow", result["operation"])
+        self.assertFalse(result["applied"])
+        self.assertTrue(result["policy"]["readOnly"])
+        self.assertEqual([10], result["flow"]["summary"]["executionTimeline"])
+        item = result["flow"]["items"][0]
+        self.assertIn("workload", item)
+        self.assertIn("inputs", item)
+        self.assertIn("outputs", item)
+        self.assertIn("drawState", item)
+        self.assertIn("participation", item)
+        flow_call = next(
+            value for value in self.ipc.calls
+            if value[0] == "get_current_frame_flow_inputs"
+        )
+        self.assertEqual(8000, flow_call[1]["max_actions"])
+        self.assertFalse(any(
+            value[0] == "load_pass_classification" for value in self.ipc.calls
+        ))
+
+    def test_panel_projection_accepts_the_2500_action_ui_boundary(self):
+        actions = [
+            {
+                "eventId": event_id,
+                "name": "DrawIndirect",
+                "flags": 0x080002,
+            }
+            for event_id in range(1, self.server.MAX_PASS_PANEL_ACTIONS + 1)
+        ]
+        rich = self.server.classify_passes(
+            actions, capture_id=self.capture_id
+        )
+        compact = self.server._pass_panel_classification_view(rich)
+        panel_path = (
+            Path(__file__).resolve().parents[2]
+            / "renderdoc_mcp_bridge"
+            / "project_pass_panel.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "replaylab_pass_panel_ui_boundary", panel_path
+        )
+        panel_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(panel_module)
+        validated = panel_module.validate_classification(compact)
+        self.assertEqual(
+            self.server.MAX_PASS_PANEL_ACTIONS,
+            len(validated["items"]),
+        )
+
+    def test_frame_flow_result_byte_gate_truncates_with_an_exact_receipt(self):
+        actions = [
+            {
+                "eventId": event_id,
+                "name": "BasePass Opaque %04d" % event_id,
+                "flags": 0x0002,
+                "numVertices": 3,
+                "numInstances": 1,
+            }
+            for event_id in range(1, 201)
+        ]
+        states = {
+            str(action["eventId"]): {
+                "colorWriteTargets": [
+                    {
+                        "resourceId": action["eventId"] + 1000,
+                        "name": "SceneColor-%04d" % action["eventId"],
+                        "format": "R16G16B16A16_FLOAT",
+                    }
+                ],
+                "depthTestEnabled": False,
+                "depthWriteEnabled": False,
+            }
+            for action in actions
+        }
+        flow_inputs = {
+            "schema": "replaylab-current-frame-flow-inputs/v1",
+            "schemaVersion": 1,
+            "captureId": self.capture_id,
+            "captureSessionId": self.session_id,
+            "actions": actions,
+            "pipelineStates": states,
+            "summary": {
+                "actionCount": len(actions),
+                "pipelineStateCount": len(states),
+                "singleReplayThreadTransaction": True,
+                "truncated": False,
+                "omittedActionCountLowerBound": 0,
+            },
+        }
+        flow_ipc = mock.Mock()
+        flow_ipc.call.return_value = flow_inputs
+        self.server.ipc = flow_ipc
+        byte_budget = 64 * 1024
+        with mock.patch.object(
+            self.server, "MAX_FRAME_FLOW_RESULT_BYTES", byte_budget
+        ):
+            encoded = self.server.analyze_current_frame_flow(max_actions=200)
+        result = json.loads(encoded)
+        self.assertNotIn("error", result, result)
+        self.assertLessEqual(len(encoded.encode("utf-8")), byte_budget)
+        self.assertTrue(result["transport"]["truncated"])
+        self.assertGreater(
+            result["transport"]["omittedActionCountLowerBound"], 0
+        )
+        self.assertEqual(
+            len(encoded.encode("utf-8")),
+            result["transport"]["serializedUtf8Bytes"],
+        )
+        self.assertEqual(
+            len(encoded.encode("utf-8")),
+            result["flow"]["summary"]["resultSerializedBytes"],
+        )
+
+    def test_agent_facing_pass_receipts_fit_the_smallest_connector_envelope(self):
+        # Codex app-server rejects dynamic-tool responses above one Mi-character.
+        # The Host must reserve space for JSON escaping and protocol framing.
+        self.assertLess(self.server.MAX_AGENT_TOOL_RESULT_BYTES, 1024 * 1024)
+        self.assertEqual(
+            self.server.MAX_FRAME_FLOW_RESULT_BYTES,
+            self.server.MAX_AGENT_TOOL_RESULT_BYTES,
+        )
+        self.assertEqual(
+            self.server.MAX_PASS_TOOL_RESULT_BYTES,
+            self.server.MAX_AGENT_TOOL_RESULT_BYTES,
+        )
+
+    def test_pass_tool_projection_is_bounded_and_self_measured(self):
+        classification = self.server.classify_passes(
+            [{"eventId": 1, "name": "Draw", "flags": 2}],
+            capture_id=self.capture_id,
+        )
+        classification["items"][0]["evidence"] = ["x" * 500_000]
+        response = {
+            "operation": "classification-test",
+            "classification": classification,
+        }
+        byte_budget = 64 * 1024
+        with mock.patch.object(
+            self.server, "MAX_PASS_TOOL_RESULT_BYTES", byte_budget
+        ):
+            encoded = self.server._bounded_pass_tool_json(response)
+        result = json.loads(encoded)
+        self.assertTrue(result["transport"]["projected"])
+        self.assertLessEqual(len(encoded.encode("utf-8")), byte_budget)
+        self.assertEqual(
+            len(encoded.encode("utf-8")),
+            result["transport"]["serializedUtf8Bytes"],
+        )
+
+    def test_pass_tool_projection_truncates_compact_items_and_tree(self):
+        classification = self.server.classify_passes(
+            [
+                {
+                    "eventId": event_id,
+                    "name": "Long compact action %04d %s"
+                    % (event_id, "x" * 480),
+                    "flags": 2,
+                }
+                for event_id in range(1, 2501)
+            ],
+            capture_id=self.capture_id,
+        )
+        response = {
+            "operation": "classification-test",
+            "classification": classification,
+        }
+        byte_budget = self.server.MAX_AGENT_TOOL_RESULT_BYTES
+        with mock.patch.object(
+            self.server, "MAX_PASS_TOOL_RESULT_BYTES", byte_budget
+        ):
+            encoded = self.server._bounded_pass_tool_json(response)
+        result = json.loads(encoded)
+        transport = result["transport"]
+        compact = result["classification"]
+        self.assertTrue(transport["projected"])
+        self.assertTrue(transport["truncated"])
+        self.assertTrue(transport["itemsTruncated"])
+        self.assertGreater(transport["omittedItemCount"], 0)
+        self.assertEqual(len(compact["items"]), transport["returnedItemCount"])
+        self.assertEqual(2500, transport["sourceItemCount"])
+        self.assertLessEqual(len(encoded.encode("utf-8")), byte_budget)
+        self.assertEqual(
+            len(encoded.encode("utf-8")), transport["serializedUtf8Bytes"]
+        )
+        retained = {item["eventId"] for item in compact["items"]}
+
+        def tree_events(nodes):
+            result = set()
+            for node in nodes:
+                if node.get("nodeType") == "action":
+                    result.add(node["eventId"])
+                result.update(tree_events(node.get("children", [])))
+            return result
+
+        self.assertEqual(retained, tree_events(compact["tree"]))
+        self.assertIn(
+            "host-result-byte-budget",
+            compact["summary"]["truncationReasons"],
+        )
 
     def test_ai_overlay_uses_only_current_server_cached_fixed_result(self):
         fixed = self._fixed()
         result = json.loads(
             self.server.apply_current_frame_pass_ai_proposals(
                 fixed["classificationId"],
-                self.capture_id,
+                fixed["captureId"],
                 self.session_id,
                 [
                     {
@@ -295,16 +559,152 @@ class ServerPassClassificationTests(unittest.TestCase):
             result["fixedClassificationSha256"],
             fixed["fixedClassificationSha256"],
         )
-        self.assertEqual(len(_PassStore.instances), 2)
-        self.assertEqual(_PassStore.instances[-1].saved[-1][0]["items"][0]["category"],
-                         fixed["classification"]["items"][0]["category"])
+        self.assertEqual(result["captureBindingMode"], "display-session")
+        self.assertEqual(result["effectMode"], "display-only")
+        self.assertFalse(result["projectKnowledge"]["persistRequested"])
+        self.assertFalse(result["projectKnowledge"]["persisted"])
+        self.assertEqual(result["panel"]["publicationMode"], "display-only")
+        self.assertEqual(len(_PassStore.instances), 0)
+
+    def test_display_only_overlay_cannot_upgrade_itself_to_project_persistence(self):
+        fixed = self._fixed()
+        panel_call_count = sum(
+            1 for method, unused_params, unused_timeout in self.ipc.calls
+            if method == "load_pass_classification"
+        )
+
+        result = json.loads(
+            self.server.apply_current_frame_pass_ai_proposals(
+                fixed["classificationId"],
+                fixed["captureId"],
+                self.session_id,
+                [{"eventId": 10, "category": "BasePass"}],
+                persist_project=True,
+            )
+        )
+
+        self.assertIn("display-only", result["error"])
+        self.assertIn("persist_project=true", result["error"])
+        self.assertEqual(len(_PassStore.instances), 0)
+        self.assertEqual(
+            panel_call_count,
+            sum(
+                1 for method, unused_params, unused_timeout in self.ipc.calls
+                if method == "load_pass_classification"
+            ),
+        )
+
+    def test_ai_overlay_never_persists_a_truncated_fixed_result(self):
+        fixed = self._fixed(persist_project=True)
+        record = self.server._PASS_CLASSIFICATION_CACHE[
+            fixed["classificationId"]
+        ]
+        record["classification"]["summary"]["sourceTruncated"] = True
+        record["classification"]["summary"]["truncated"] = True
+        record["fixedSha256"] = self.server._canonical_json_sha256(
+            self.server._fixed_pass_classification_view(
+                record["classification"]
+            ),
+            "test truncated fixed classification",
+        )
+        store_count = len(_PassStore.instances)
+
+        result = json.loads(
+            self.server.apply_current_frame_pass_ai_proposals(
+                fixed["classificationId"],
+                fixed["captureId"],
+                self.session_id,
+                [{"eventId": 10, "category": "BasePass"}],
+                persist_project=True,
+            )
+        )
+
+        self.assertNotIn("error", result, result)
+        self.assertFalse(result["projectKnowledge"]["persisted"])
+        self.assertIn("truncated", result["projectKnowledge"]["reason"])
+        self.assertEqual(store_count, len(_PassStore.instances))
+
+    def test_ai_overlay_rejects_panel_unsafe_text_before_persist_or_publish(self):
+        fixed = self._fixed()
+        store_count = len(_PassStore.instances)
+        panel_call_count = sum(
+            1 for method, unused_params, unused_timeout in self.ipc.calls
+            if method == "load_pass_classification"
+        )
+
+        result = json.loads(
+            self.server.apply_current_frame_pass_ai_proposals(
+                fixed["classificationId"],
+                fixed["captureId"],
+                self.session_id,
+                [{"eventId": 10, "displayLabel": "x" * 513}],
+            )
+        )
+
+        self.assertIn("panel-safe text limit", result["error"])
+        self.assertEqual(store_count, len(_PassStore.instances))
+        self.assertEqual(
+            panel_call_count,
+            sum(
+                1 for method, unused_params, unused_timeout in self.ipc.calls
+                if method == "load_pass_classification"
+            ),
+        )
+
+    def test_ai_overlay_text_policy_allows_html_and_rationale_lf(self):
+        fixed = self._fixed()
+        result = json.loads(
+            self.server.apply_current_frame_pass_ai_proposals(
+                fixed["classificationId"],
+                fixed["captureId"],
+                self.session_id,
+                [{
+                    "eventId": 10,
+                    "displayLabel": "<b>literal label</b>",
+                    "rationale": "line one\nline two",
+                }],
+                publish_to_ui=False,
+                persist_project=False,
+            )
+        )
+        self.assertNotIn("error", result, result)
+        proposal = result["classification"]["items"][0]["semanticProposal"]
+        self.assertEqual(proposal["displayLabel"], "<b>literal label</b>")
+        self.assertEqual(proposal["rationale"], "line one\nline two")
+
+    def test_ai_overlay_rejects_label_lf_and_bidi_override_before_side_effects(self):
+        fixed = self._fixed()
+        store_count = len(_PassStore.instances)
+        panel_call_count = sum(
+            1 for method, unused_params, unused_timeout in self.ipc.calls
+            if method == "load_pass_classification"
+        )
+        for unsafe in ("line one\nline two", "safe\u202ereversed"):
+            with self.subTest(unsafe=repr(unsafe)):
+                result = json.loads(
+                    self.server.apply_current_frame_pass_ai_proposals(
+                        fixed["classificationId"],
+                        fixed["captureId"],
+                        self.session_id,
+                        [{"eventId": 10, "displayLabel": unsafe}],
+                    )
+                )
+                self.assertIn("forbidden", result["error"])
+        self.assertEqual(store_count, len(_PassStore.instances))
+        self.assertEqual(
+            panel_call_count,
+            sum(
+                1 for method, unused_params, unused_timeout in self.ipc.calls
+                if method == "load_pass_classification"
+            ),
+        )
 
     def test_ai_overlay_rejects_physical_fields_and_changed_session(self):
         fixed = self._fixed()
         forbidden = json.loads(
             self.server.apply_current_frame_pass_ai_proposals(
                 fixed["classificationId"],
-                self.capture_id,
+                fixed["captureId"],
                 self.session_id,
                 [{"eventId": 10, "category": "BasePass", "byteOffset": 16}],
             )
@@ -314,7 +714,7 @@ class ServerPassClassificationTests(unittest.TestCase):
         stale = json.loads(
             self.server.apply_current_frame_pass_ai_proposals(
                 fixed["classificationId"],
-                self.capture_id,
+                fixed["captureId"],
                 self.session_id,
                 [{"eventId": 10, "category": "BasePass"}],
             )
@@ -383,11 +783,15 @@ class ServerLiveEditTests(unittest.TestCase):
 
     def setUp(self):
         self.manager = _LiveManager()
-        self.old_manager = internal_tool_service._SHADER_LIVE_EDIT_MANAGER
-        internal_tool_service._SHADER_LIVE_EDIT_MANAGER = self.manager
+        def remote(operation, parameters):
+            if operation == "migrate":
+                return self.manager.migrate_authorization(parameters["source_workspace_path"], parameters["workspace_path"], parameters["expected_source_sha256"])
+            return getattr(self.manager, operation)(**parameters)
+        self.remote = mock.patch.object(self.server, "_shader_live_edit_remote", side_effect=remote)
+        self.remote.start()
 
     def tearDown(self):
-        internal_tool_service._SHADER_LIVE_EDIT_MANAGER = self.old_manager
+        self.remote.stop()
 
     def test_start_poll_stop_expose_shared_resource_policy(self):
         started = json.loads(
@@ -567,6 +971,8 @@ class ServerLiveEditTests(unittest.TestCase):
                     "schema": "renderdoc-ultra-shared-shader-replacement/v1",
                     "schemaVersion": 1,
                     "replacementId": new_replacement,
+                    "operationId": params["operation_id"],
+                    "operationCreatedReplacement": True,
                     "captureId": capture_id,
                     "captureSessionId": session_id,
                     "workspaceId": workspace_id,
@@ -592,6 +998,7 @@ class ServerLiveEditTests(unittest.TestCase):
                     "singleOwner": True,
                     "checkedDerivedPipelineRebuild": True,
                     "capturedRootSignaturesReused": True,
+                    "postApplyAnchorVerified": False,
                     "idempotent": False,
                     "metadataOnly": False,
                     "targetBuiltOnce": True,
@@ -617,6 +1024,7 @@ class ServerLiveEditTests(unittest.TestCase):
             "workspacePath": workspace,
             "revision": 3,
             "stage": "fragment",
+            "anchorEventId": 321,
             "originalResourceId": 77,
             "candidateRawSha256": "4" * 64,
             "abiLeaseRequestId": lease_request,
@@ -643,16 +1051,11 @@ class ServerLiveEditTests(unittest.TestCase):
                 self.server, "_ensure_workspace_capture_catalog_identity",
                 return_value={"captureSessionId": session_id},
             ), mock.patch.object(
-                self.server, "list_exact_shader_family_uses", return_value=[321]
-            ), mock.patch.object(
                 self.server,
-                "_shader_family_event_bindings",
-                return_value=[{
-                    "eventId": 321,
-                    "originalResourceId": 77,
-                    "originalRawSha256": baseline_hash,
-                    "physicalAbiSha256": baseline_abi,
-                }],
+                "list_exact_shader_family_uses",
+                side_effect=AssertionError(
+                    "a live ABI lease must reuse its frozen representative EID"
+                ),
             ), mock.patch.object(
                 self.server, "ipc", bridge
             ), mock.patch.object(
@@ -703,6 +1106,9 @@ class ServerRestoreCurrentShaderTests(unittest.TestCase):
         self.candidate_raw = "4" * 64
         self.workspace_id = "5" * 32
         self.replacement_id = "6" * 32
+        self.operation_id = "7" * 32
+        self.physical_abi = "8" * 64
+        self.family_id = "9" * 64
         self.context = {
             "schema": "renderdoc-ultra-current-context/v1",
             "schemaVersion": 1,
@@ -746,12 +1152,20 @@ class ServerRestoreCurrentShaderTests(unittest.TestCase):
                     "workspacePath": str(self.workspace),
                     "workspaceId": self.workspace_id,
                     "revision": 3,
-                    "capture": {"captureId": self.capture_id},
+                    "capture": {
+                        "captureId": self.capture_id,
+                        "api": "D3D11",
+                    },
                     "shader": {
                         "stage": "fragment",
                         "resourceId": 77,
                         "entryPoint": "main",
                         "rawSha256": self.original_raw,
+                    },
+                    "targetProfile": {"containerFormat": "dxbc"},
+                    "baseline": {
+                        "rawSha256": self.original_raw,
+                        "abiSha256": self.physical_abi,
                     },
                 }
 
@@ -760,6 +1174,7 @@ class ServerRestoreCurrentShaderTests(unittest.TestCase):
         self.replacements = [
             {
                 "replacementId": self.replacement_id,
+                "operationId": self.operation_id,
                 "workspaceId": self.workspace_id,
                 "revision": 2,
                 "anchorEventId": 22,
@@ -770,6 +1185,8 @@ class ServerRestoreCurrentShaderTests(unittest.TestCase):
                 "originalResourceId": 77,
                 "originalRawSha256": self.original_raw,
                 "candidateRawSha256": self.candidate_raw,
+                "physicalAbiSha256": self.physical_abi,
+                "shaderFamilyId": self.family_id,
                 "targetResourceId": 88,
                 "resourceScoped": True,
                 "eventScoped": False,
@@ -781,20 +1198,97 @@ class ServerRestoreCurrentShaderTests(unittest.TestCase):
         class IPC:
             def __init__(inner):
                 inner.calls = []
+                inner.epoch = 1
 
             def call(inner, method, params=None, timeout=None):
                 inner.calls.append((method, copy.deepcopy(params or {}), timeout))
-                if method != "get_shared_shader_replacements":
+                if method == "get_shared_shader_replacements":
+                    return {
+                        "schema": "renderdoc-ultra-shared-shader-replacement-list/v1",
+                        "schemaVersion": 1,
+                        "captureId": self.capture_id,
+                        "captureSessionId": self.session_id,
+                        "replacements": copy.deepcopy(self.replacements),
+                        "count": len(self.replacements),
+                        "mutationEpoch": inner.epoch,
+                        "originalShadersPreserved": True,
+                        "replayMutation": False,
+                    }
+                if method != "restore_shader_candidate_shared_resource_exact":
                     raise AssertionError(method)
-                return {
-                    "schema": "renderdoc-ultra-shared-shader-replacement-list/v1",
+                matching = [
+                    item
+                    for item in self.replacements
+                    if item["originalResourceId"]
+                    == params["expected_original_resource_id"]
+                ]
+                base = {
+                    "schema": "renderdoc-ultra-exact-shared-shader-restore/v1",
                     "schemaVersion": 1,
                     "captureId": self.capture_id,
                     "captureSessionId": self.session_id,
-                    "replacements": copy.deepcopy(self.replacements),
-                    "count": len(self.replacements),
-                    "originalShadersPreserved": True,
-                    "replayMutation": False,
+                    "workspaceId": self.workspace_id,
+                    "eventId": params["expected_event_id"],
+                    "stage": params["stage"],
+                    "entryPoint": params["entry_point"],
+                    "api": "d3d11",
+                    "encoding": "dxbc",
+                    "originalResourceId": params["expected_original_resource_id"],
+                    "originalRawSha256": params["expected_original_sha256"],
+                    "physicalAbiSha256": self.physical_abi,
+                    "linearized": True,
+                    "stateAtLinearizationVerified": True,
+                    "originalShaderPreserved": True,
+                    "restored": True,
+                    "activeReplacementCountForResource": 0,
+                }
+                if not matching:
+                    return {
+                        **base,
+                        "state": "absent",
+                        "alreadyRestored": True,
+                        "mutationEpoch": inner.epoch,
+                        "rollback": None,
+                    }
+                if len(matching) != 1:
+                    raise RuntimeError("replacement owner conflict")
+                item = matching[0]
+                if item["operationId"] != params.get("expected_operation_id"):
+                    raise RuntimeError("replacement operation conflict")
+                self.replacements.remove(item)
+                inner.epoch += 1
+                rollback = {
+                    "schema": "renderdoc-ultra-shared-shader-replacement/v1",
+                    "schemaVersion": 1,
+                    "replacementId": item["replacementId"],
+                    "operationId": item["operationId"],
+                    "captureId": self.capture_id,
+                    "captureSessionId": self.session_id,
+                    "workspaceId": item["workspaceId"],
+                    "stage": item["stage"],
+                    "entryPoint": item["entryPoint"],
+                    "api": item["api"],
+                    "encoding": item["encoding"],
+                    "originalResourceId": item["originalResourceId"],
+                    "originalRawSha256": item["originalRawSha256"],
+                    "candidateRawSha256": item["candidateRawSha256"],
+                    "physicalAbiSha256": item["physicalAbiSha256"],
+                    "shaderFamilyId": item["shaderFamilyId"],
+                    "targetResourceId": item["targetResourceId"],
+                    "resourceScoped": True,
+                    "eventScoped": False,
+                    "cleared": True,
+                    "targetFreed": True,
+                    "originalShaderPreserved": True,
+                    "alreadyRestored": False,
+                    "idempotentRollback": False,
+                }
+                return {
+                    **base,
+                    "state": "rolled-back",
+                    "alreadyRestored": False,
+                    "mutationEpoch": inner.epoch,
+                    "rollback": rollback,
                 }
 
         self.ipc = IPC()
@@ -802,22 +1296,6 @@ class ServerRestoreCurrentShaderTests(unittest.TestCase):
         self.old_active = self.server._ACTIVE_PROJECT_SERVICE
         self.server.ipc = self.ipc
         self.server._ACTIVE_PROJECT_SERVICE = self.active
-        rollback = {
-            "schema": "renderdoc-ultra-shader-shared-resource-apply-mcp/v1",
-            "operation": "rollback-shared-resource",
-            "workspaceId": self.workspace_id,
-            "captureId": self.capture_id,
-            "replacement": {
-                "replacementId": self.replacement_id,
-                "captureId": self.capture_id,
-                "captureSessionId": self.session_id,
-                "workspaceId": self.workspace_id,
-                "originalResourceId": 77,
-                "cleared": True,
-                "originalShaderPreserved": True,
-            },
-            "applied": False,
-        }
         self.patches = [
             mock.patch.object(
                 self.server,
@@ -828,11 +1306,6 @@ class ServerRestoreCurrentShaderTests(unittest.TestCase):
                 self.server,
                 "_shader_workspace_service",
                 return_value=self.workspaces,
-            ),
-            mock.patch.object(
-                self.server,
-                "rollback_shader_workspace_shared_resource",
-                return_value=json.dumps(rollback),
             ),
         ]
         for patch in self.patches:
@@ -845,12 +1318,31 @@ class ServerRestoreCurrentShaderTests(unittest.TestCase):
         self.server._ACTIVE_PROJECT_SERVICE = self.old_active
         self.temporary.cleanup()
 
+    def _restore(self, stage="fragment", **overrides):
+        arguments = {
+            "expected_event_id": 22,
+            "expected_resource_id": 77,
+            "expected_entry_point": "main",
+            "expected_raw_sha256": self.original_raw,
+            "expected_capture_id": self.capture_id,
+            "expected_capture_session_id": self.session_id,
+            "expected_workspace_path": str(self.workspace),
+            "expected_workspace_id": self.workspace_id,
+            "expected_operation_id": self.operation_id,
+            "stage": stage,
+        }
+        arguments.update(overrides)
+        return json.loads(self.server.restore_current_shader(**arguments))
+
     def test_restore_uses_bridge_metadata_and_deterministic_workspace(self):
-        result = json.loads(self.server.restore_current_shader("pixel"))
+        result = self._restore("pixel")
         self.assertNotIn("error", result, result)
         self.assertTrue(result["restored"])
         self.assertTrue(result["applied"])
         self.assertEqual(result["replacementId"], self.replacement_id)
+        self.assertEqual(result["api"], "d3d11")
+        self.assertEqual(result["encoding"], "dxbc")
+        self.assertEqual(result["physicalAbiSha256"], self.physical_abi)
         self.assertFalse(result["policy"]["hostMemoryRequired"])
         query = self.ipc.calls[0]
         self.assertEqual(query[1]["expected_capture_id"], self.capture_id)
@@ -858,18 +1350,95 @@ class ServerRestoreCurrentShaderTests(unittest.TestCase):
             query[1]["expected_capture_session_id"], self.session_id
         )
 
-    def test_no_current_replacement_is_an_explicit_noop(self):
+    def test_no_current_replacement_returns_strict_already_restored_receipt(self):
         self.replacements.clear()
-        result = json.loads(self.server.restore_current_shader())
-        self.assertFalse(result["restored"])
+        self.context["shaders"]["bound"][0]["rawSha256"] = self.original_raw
+        result = self._restore()
+        self.assertTrue(result["restored"])
+        self.assertTrue(result["alreadyRestored"])
         self.assertFalse(result["applied"])
-        self.assertIn("no bridge-owned", result["reason"])
+        self.assertTrue(result["stateAtLinearizationVerified"])
+        self.assertTrue(result["noActiveReplacementForTargetAtLinearization"])
+        self.assertEqual(result["replacementQueryCount"], 0)
+        self.assertEqual(result["matchingReplacementCount"], 0)
+        self.assertEqual(result["workspaceId"], self.workspace_id)
+        self.assertEqual(result["api"], "d3d11")
+        self.assertEqual(result["encoding"], "dxbc")
+        self.assertEqual(result["physicalAbiSha256"], self.physical_abi)
+        self.assertIn("already", result["reason"])
+
+    def test_unrelated_replacement_count_is_reported_without_claiming_a_global_empty_list(self):
+        self.replacements[0]["originalResourceId"] = 99
+        self.context["shaders"]["bound"][0]["rawSha256"] = self.original_raw
+        result = self._restore()
+        self.assertNotIn("error", result, result)
+        self.assertTrue(result["alreadyRestored"])
+        self.assertEqual(result["replacementQueryCount"], 1)
+        self.assertEqual(result["matchingReplacementCount"], 0)
+        self.assertTrue(result["noActiveReplacementForTargetAtLinearization"])
+
+    def test_same_resource_replacement_with_mismatched_identity_is_not_already_restored(self):
+        self.replacements[0]["stage"] = "vertex"
+        self.context["shaders"]["bound"][0]["rawSha256"] = self.original_raw
+        result = self._restore()
+        self.assertFalse(result["restored"])
+        self.assertIn("owns the frozen Shader ResourceId", result["error"])
+
+    def test_replacement_created_during_absence_verification_blocks_noop_success(self):
+        original_call = self.ipc.call
+        self.replacements.clear()
+        self.context["shaders"]["bound"][0]["rawSha256"] = self.original_raw
+        calls = 0
+
+        def racing_call(method, params=None, timeout=None):
+            nonlocal calls
+            result = original_call(method, params, timeout)
+            if method == "get_shared_shader_replacements":
+                calls += 1
+                if calls == 1:
+                    self.replacements.append(
+                        {
+                            "replacementId": self.replacement_id,
+                            "operationId": "a" * 32,
+                            "workspaceId": self.workspace_id,
+                            "revision": 2,
+                            "anchorEventId": 22,
+                            "stage": "fragment",
+                            "entryPoint": "main",
+                            "api": "d3d11",
+                            "encoding": "dxbc",
+                            "originalResourceId": 77,
+                            "originalRawSha256": self.original_raw,
+                            "candidateRawSha256": self.candidate_raw,
+                            "physicalAbiSha256": self.physical_abi,
+                            "shaderFamilyId": self.family_id,
+                            "targetResourceId": 88,
+                            "resourceScoped": True,
+                            "eventScoped": False,
+                            "allOriginalResourceUsesAffected": True,
+                            "originalShaderPreserved": True,
+                        }
+                    )
+            return result
+
+        self.ipc.call = racing_call
+        result = self._restore()
+        self.assertFalse(result["restored"])
+        self.assertIn("operation conflict", result["error"])
 
     def test_workspace_identity_mismatch_blocks_rollback(self):
         self.replacements[0]["workspaceId"] = "7" * 32
-        result = json.loads(self.server.restore_current_shader())
+        result = self._restore()
         self.assertFalse(result["restored"])
         self.assertIn("does not match", result["error"])
+
+    def test_navigation_change_cannot_redirect_frozen_shader_restore(self):
+        self.context["events"]["currentEventId"] = 23
+        self.context["shaders"]["bound"][0]["resourceId"] = 99
+        result = self._restore()
+        self.assertFalse(result["restored"])
+        self.assertIn("current event changed", result["error"])
+        self.assertEqual(self.ipc.calls, [])
 
 
 class ServerOutputFingerprintTests(unittest.TestCase):

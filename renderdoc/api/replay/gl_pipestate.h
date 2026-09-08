@@ -768,9 +768,14 @@ DOCUMENT("The full current OpenGL pipeline state.");
 struct State
 {
 #if !defined(RENDERDOC_EXPORTS)
-  // disallow creation/copy of this object externally
+  // External tools obtain states from the replay controller. Native clients can copy a returned
+  // value to keep published UI metadata stable while the controller fetches the next event.
   State() = delete;
+#if defined(SWIG)
   State(const State &) = delete;
+#else
+  State(const State &) = default;
+#endif
 #endif
 
   DOCUMENT(R"(The vertex input stage.

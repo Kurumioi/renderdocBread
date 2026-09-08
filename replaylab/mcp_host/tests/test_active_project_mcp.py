@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import sqlite3
 import struct
 import sys
 import tempfile
@@ -16,6 +17,7 @@ import types
 import unittest
 from unittest import mock
 
+from src import asset_catalog as asset_catalog_module
 from src.active_projects import ActiveReplayProjectService
 from src.symbols.dxbc import fingerprint_bytes
 from src.symbols.matcher import capture_identity
@@ -88,6 +90,7 @@ def _interface() -> dict:
 
 class _CatalogIPC:
     def __init__(self, root: Path):
+        self.instance_id = "123-" + "b" * 32
         self.root = root
         self.blob = _dxbc()
         fingerprint = fingerprint_bytes(self.blob)
@@ -158,6 +161,12 @@ class _CatalogIPC:
     def call(self, method: str, params: dict | None = None, timeout=None):
         params = dict(params or {})
         self.calls.append((method, params, timeout))
+        if method == "begin_export_shader_catalog":
+            # Most tests exercise the legacy bridge compatibility path. The
+            # Host may fall back only for this explicit JSON-RPC response.
+            raise RuntimeError(
+                "Bridge error [-32601]: Unknown method: begin_export_shader_catalog"
+            )
         if method == "get_current_renderdoc_context":
             return copy.deepcopy(self.context)
         if method == "get_shader_info":
@@ -173,7 +182,7 @@ class _CatalogIPC:
                 "rawSha256": self.shader["rawSha256"],
             }
         if method == "export_shader_catalog":
-            self.assert_full_export(params)
+            self.assert_export_scope(params)
             output = Path(params["output_dir"])
             (output / "blobs").mkdir(parents=True, exist_ok=True)
             raw_path = output / self.shader["rawPath"]
@@ -189,6 +198,11 @@ class _CatalogIPC:
                 "platform": "windows-x64",
                 "shaders": [dict(self.shader)],
                 "uses": [dict(self.use)],
+                "selection": {
+                    "mode": "explicit" if params["event_ids"] else "all_draw_dispatch",
+                    "eventIds": params["event_ids"] or [self.use["eventId"]],
+                    "stages": params.get("stages", ["fragment"]),
+                },
                 "exportDiagnostics": {
                     "reflectionRevision": self.export_revision
                 },
@@ -199,6 +213,7 @@ class _CatalogIPC:
                 "schema": value["schema"],
                 "schemaVersion": 1,
                 "captureId": self.capture_id,
+                "captureSessionId": self.context["capture"]["captureSessionId"],
                 "catalogPath": str(path),
             }
         if method == "load_symbol_aliases":
@@ -212,9 +227,12 @@ class _CatalogIPC:
             }
         raise AssertionError("unexpected IPC method %s" % method)
 
-    def assert_full_export(self, params: dict) -> None:
-        if params.get("event_ids") != []:
-            raise AssertionError("active capture preparation must export the full frame")
+    def assert_export_scope(self, params: dict) -> None:
+        if params.get("event_ids") == []:
+            return
+        if (params.get("event_ids") != [self.use["eventId"]]
+                or params.get("stages") != ["fragment"]):
+            raise AssertionError("Shader preparation must export exactly one event/stage")
 
 
 class _FakeSymbolService:
@@ -377,6 +395,20 @@ class ActiveProjectMcpTests(unittest.TestCase):
             "configure_active_project_asset_root",
             "activate_active_replay_project",
             "prepare_active_capture_project",
+            "query_active_shader_asset_evidence",
+            "get_unpacked_asset_index_capabilities",
+            "get_active_unpacked_asset_index_status",
+            "index_active_unpacked_assets",
+            "query_active_unpacked_assets",
+            "resolve_active_unpacked_asset",
+            "get_unpacked_asset_provider_capabilities",
+            "get_unpacked_asset_provider_decisions",
+            "query_unpacked_asset_inventory_assets",
+            "start_unpacked_asset_report",
+            "start_unpacked_asset_blender_export",
+            "continue_unpacked_asset_blender_export",
+            "get_unpacked_asset_job_status",
+            "run_resource_export_target_validation",
             "get_active_shader_workspace_path",
             "register_active_project_workspace",
             "get_active_project_future_frame_plan",
@@ -386,6 +418,10 @@ class ActiveProjectMcpTests(unittest.TestCase):
             parameters = inspect.signature(getattr(self.server, name)).parameters
             self.assertNotIn("projects_home", parameters)
             self.assertNotIn("state_path", parameters)
+            if name != "configure_active_project_asset_root":
+                self.assertNotIn("asset_root", parameters)
+                self.assertNotIn("database_path", parameters)
+                self.assertNotIn("output_path", parameters)
         self.assertEqual(
             list(
                 inspect.signature(
@@ -394,6 +430,834 @@ class ActiveProjectMcpTests(unittest.TestCase):
             ),
             [],
         )
+
+        self.assertEqual(
+            list(
+                inspect.signature(
+                    self.server.query_active_shader_asset_evidence
+                ).parameters
+            ),
+            ["event_id", "stage", "top_k"],
+        )
+        blender_parameters = inspect.signature(
+            self.server.start_unpacked_asset_blender_export
+        ).parameters
+        self.assertIs(blender_parameters["inventory_id"].default, inspect.Parameter.empty)
+        self.assertIs(
+            blender_parameters["expected_inventory_decision_sha256"].default,
+            inspect.Parameter.empty,
+        )
+        self.assertEqual(
+            list(
+                inspect.signature(
+                    self.server.continue_unpacked_asset_blender_export
+                ).parameters
+            ),
+            [
+                "operation_id",
+                "parent_operation_id",
+                "expected_parent_request_sha256",
+                "expected_parent_result_sha256",
+            ],
+        )
+
+    def test_resource_export_target_validation_accepts_only_operation_nonce(self):
+        manager = mock.Mock()
+        manager.run_target_validation.return_value = {
+            "schema": "replaylab-resource-export-target-validation-run/v1",
+            "schemaVersion": 1,
+            "operationId": "a" * 32,
+            "targetValidationComplete": False,
+        }
+        with mock.patch.object(self.server, "_RESOURCE_EXPORT_MANAGER", manager):
+            result = json.loads(
+                self.server.run_resource_export_target_validation("a" * 32)
+            )
+        self.assertNotIn("error", result, result)
+        manager.run_target_validation.assert_called_once_with("a" * 32)
+        self.assertEqual(result["operationId"], "a" * 32)
+        self.assertEqual(
+            list(
+                inspect.signature(
+                    self.server.run_resource_export_target_validation
+                ).parameters
+            ),
+            ["operation_id"],
+        )
+
+    def test_uex_decision_discovery_tools_use_host_owned_provider_inputs(self):
+        calls = []
+
+        class FakeJobs:
+            def capabilities(inner_self):
+                return {"schema": "providers", "routes": {}}
+
+            def discover_uex_decisions(
+                inner_self, *, profile="", inventory_limit=20
+            ):
+                calls.append(("discover", profile, inventory_limit))
+                return {
+                    "schema": "renderdoc-ultra-uex-decision-discovery/v1",
+                    "available": True,
+                    "status": "ready",
+                    "profiles": [{"profile": "Demo", "inventories": []}],
+                }
+
+            def query_uex_inventory_assets(inner_self, **kwargs):
+                calls.append(("query", kwargs))
+                return {
+                    "schema": "renderdoc-ultra-uex-inventory-assets/v1",
+                    "profile": kwargs["profile"],
+                    "items": [],
+                }
+
+        with mock.patch.object(
+            self.server, "_UNPACKED_ASSET_JOB_MANAGER", FakeJobs()
+        ):
+            capabilities = json.loads(
+                self.server.get_unpacked_asset_provider_capabilities()
+            )
+            decisions = json.loads(
+                self.server.get_unpacked_asset_provider_decisions("Demo", 7)
+            )
+            query = json.loads(
+                self.server.query_unpacked_asset_inventory_assets(
+                    "Demo", 41, "SkeletalMesh", "Hero", 3, 9
+                )
+            )
+
+        self.assertFalse(capabilities["applied"])
+        self.assertEqual(
+            capabilities["decisionDiscovery"]["profiles"][0]["profile"], "Demo"
+        )
+        self.assertFalse(decisions["applied"])
+        self.assertFalse(query["applied"])
+        self.assertEqual(calls[0], ("discover", "", 20))
+        self.assertEqual(calls[1], ("discover", "Demo", 7))
+        self.assertEqual(
+            calls[2],
+            (
+                "query",
+                {
+                    "profile": "Demo",
+                    "inventory_id": 41,
+                    "kind": "SkeletalMesh",
+                    "search": "Hero",
+                    "offset": 3,
+                    "limit": 9,
+                },
+            ),
+        )
+
+    def test_active_unpacked_asset_catalog_is_path_free_persistent_and_hash_bound(self):
+        self._bound_with_assets()
+        assets = Path(self.service.status()["assetRoot"])
+        (assets / "hero.obj").write_text(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
+            encoding="utf-8",
+        )
+
+        before = json.loads(self.server.get_active_unpacked_asset_index_status())
+        self.assertFalse(before["ready"])
+        self.assertEqual(before["requiredAction"], "index_active_unpacked_assets")
+
+        indexed = json.loads(self.server.index_active_unpacked_assets())
+        self.assertNotIn("error", indexed, indexed)
+        self.assertTrue(indexed["applied"])
+        self.assertEqual(indexed["buildId"], "build-1")
+        self.assertGreaterEqual(indexed["assetCount"], 2)
+
+        query = self._json(
+            self.server.query_active_unpacked_assets(
+                text="hero", kinds=["mesh"], limit=10
+            )
+        )
+        self.assertEqual(query["catalogSha256"], indexed["catalogSha256"])
+        self.assertEqual(query["count"], 1)
+        selected = query["assets"][0]
+        delivery = self._json(
+            self.server.resolve_active_unpacked_asset(
+                selected["assetId"], query["catalogSha256"]
+            )
+        )
+        self.assertTrue(delivery["verified"])
+        self.assertEqual(delivery["relativePath"], "hero.obj")
+        self.assertTrue(Path(delivery["absolutePath"]).is_file())
+
+        stale = json.loads(
+            self.server.resolve_active_unpacked_asset(
+                selected["assetId"], "0" * 64
+            )
+        )
+        self.assertIn("error", stale)
+        self.assertIn("changed", stale["error"])
+
+    def test_unpacked_asset_report_requires_catalog_bound_strong_inventory_evidence(self):
+        self._bound_with_assets()
+        assets = Path(self.service.status()["assetRoot"])
+        (assets / "inventory-selection.json").write_text(
+            json.dumps(
+                {
+                    "schema": "uex.inventory-selection.v1",
+                    "inventory": {
+                        "inventoryId": 41,
+                        "profile": "example",
+                        "discoveryConfidence": "Strong",
+                        "complete": True,
+                        "truncated": False,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        (assets / "asset-report-spec.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "name": "Example",
+                    "characterPathRules": [
+                        {
+                            "name": "project-character-layout",
+                            "regex": (
+                                r"^(?<category>[^/]+)/(?<character>[^/]+)/"
+                                r"(?<variant>[^/]+)/(?<state>[^/]+)/(?<component>[^/]+)"
+                            ),
+                        }
+                    ],
+                    "scene": {"scopeGlobs": ["Game/Content/**"]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        indexed = json.loads(self.server.index_active_unpacked_assets())
+        query = json.loads(
+            self.server.query_active_unpacked_assets(kinds=["metadata"], limit=20)
+        )
+        identities = {item["name"]: item["assetId"] for item in query["assets"]}
+
+        calls = []
+
+        class FakeJobs:
+            def start_report(inner_self, **kwargs):
+                calls.append(kwargs)
+                return {"schema": "renderdoc-ultra-unpacked-asset-job/v1", "status": "running"}
+
+        with mock.patch.object(
+            self.server, "_UNPACKED_ASSET_JOB_MANAGER", FakeJobs()
+        ):
+            result = json.loads(
+                self.server.start_unpacked_asset_report(
+                    "a" * 32,
+                    "example",
+                    41,
+                    identities["inventory-selection.json"],
+                    identities["asset-report-spec.json"],
+                    indexed["catalogSha256"],
+                )
+            )
+        self.assertNotIn("error", result, result)
+        self.assertTrue(result["applied"])
+        self.assertEqual(calls[0]["inventory_id"], 41)
+        self.assertEqual(
+            calls[0]["inventory_evidence_asset_id"],
+            identities["inventory-selection.json"],
+        )
+        self.assertRegex(calls[0]["inventory_evidence_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(calls[0]["spec_asset_id"], identities["asset-report-spec.json"])
+        self.assertIsNone(calls[0]["spec_path"])
+        self.assertEqual(calls[0]["report_spec"]["name"], "Example")
+        self.assertRegex(calls[0]["project_binding_sha256"], r"^[0-9a-f]{64}$")
+
+        (assets / "inventory-selection.json").write_text(
+            json.dumps(
+                {
+                    "inventory": {
+                        "inventoryId": 41,
+                        "discoveryConfidence": "Moderate",
+                        "complete": True,
+                        "truncated": False,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        stale = json.loads(
+            self.server.start_unpacked_asset_report(
+                "b" * 32,
+                "example",
+                41,
+                identities["inventory-selection.json"],
+                identities["asset-report-spec.json"],
+                indexed["catalogSha256"],
+            )
+        )
+        self.assertIn("error", stale)
+        self.assertIn("changed", stale["error"])
+        self.assertEqual(len(calls), 1)
+        refreshed = json.loads(self.server.index_active_unpacked_assets())
+        refreshed_query = json.loads(
+            self.server.query_active_unpacked_assets(kinds=["metadata"], limit=20)
+        )
+        refreshed_identities = {
+            item["name"]: item["assetId"] for item in refreshed_query["assets"]
+        }
+        with mock.patch.object(
+            self.server, "_UNPACKED_ASSET_JOB_MANAGER", FakeJobs()
+        ):
+            weak = json.loads(
+                self.server.start_unpacked_asset_report(
+                    "c" * 32,
+                    "example",
+                    41,
+                    refreshed_identities["inventory-selection.json"],
+                    refreshed_identities["asset-report-spec.json"],
+                    refreshed["catalogSha256"],
+                )
+            )
+        self.assertIn("error", weak)
+        self.assertIn("not Strong", weak["error"])
+        self.assertEqual(len(calls), 1)
+
+    def test_unpacked_asset_report_accepts_bounded_inline_spec_without_catalog(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        self._json(
+            self.server.configure_active_replay_project(
+                "example-game",
+                "build-1",
+                "windows-x64",
+                "d3d11",
+            )
+        )
+        spec = {
+            "version": 1,
+            "name": "Project Rules",
+            "characterPathRules": [
+                {
+                    "name": "project-character-layout",
+                    "regex": (
+                        r"^(?<category>[^/]+)/(?<character>[^/]+)/"
+                        r"(?<variant>[^/]+)/(?<state>[^/]+)/(?<component>[^/]+)"
+                    ),
+                }
+            ],
+            "scene": {"scopeGlobs": ["Project/Content/**"]},
+        }
+        calls = []
+
+        class FakeJobs:
+            def start_report(inner_self, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "schema": "renderdoc-ultra-unpacked-asset-job/v1",
+                    "status": "running",
+                    "request": {"specSource": "inline-managed-v1"},
+                }
+
+        with mock.patch.object(
+            self.server, "_UNPACKED_ASSET_JOB_MANAGER", FakeJobs()
+        ):
+            result = json.loads(
+                self.server.start_unpacked_asset_report(
+                    "d" * 32,
+                    "example",
+                    41,
+                    report_spec=spec,
+                )
+            )
+            missing = json.loads(
+                self.server.start_unpacked_asset_report(
+                    "e" * 32,
+                    "example",
+                    41,
+                    report_spec={
+                        "version": 1,
+                        "name": "Missing rules",
+                        "characterPathRules": [],
+                        "scene": {"scopeGlobs": []},
+                    },
+                )
+            )
+
+        self.assertNotIn("error", result, result)
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["project"]["catalogSha256"], "")
+        self.assertRegex(result["project"]["bindingSha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(calls[0]["inventory_evidence_asset_id"], "")
+        self.assertEqual(calls[0]["inventory_evidence_sha256"], "")
+        self.assertEqual(calls[0]["spec_asset_id"], "")
+        self.assertEqual(calls[0]["catalog_sha256"], "")
+        self.assertEqual(calls[0]["report_spec"]["name"], "Project Rules")
+        self.assertRegex(calls[0]["project_binding_sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn("error", missing)
+        self.assertIn("characterPathRules", missing["error"])
+        self.assertEqual(len(calls), 1)
+
+    def test_unpacked_asset_blender_export_forwards_required_inventory_binding(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        self._json(
+            self.server.configure_active_replay_project(
+                "example-game", "build-1", "windows-x64", "d3d11"
+            )
+        )
+        calls = []
+
+        class FakeJobs:
+            def start_blender_export(inner_self, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "schema": "renderdoc-ultra-unpacked-asset-job/v1",
+                    "status": "running",
+                    "request": {
+                        "inventoryId": kwargs["inventory_id"],
+                        "inventoryDecisionSha256": kwargs[
+                            "expected_inventory_decision_sha256"
+                        ],
+                    },
+                }
+
+        with mock.patch.object(
+            self.server, "_UNPACKED_ASSET_JOB_MANAGER", FakeJobs()
+        ):
+            result = json.loads(
+                self.server.start_unpacked_asset_blender_export(
+                    "a" * 32,
+                    "Demo",
+                    42,
+                    "f" * 64,
+                    ["Project/Hero/SK_Hero"],
+                    prefer_uemodel=False,
+                    export_only=True,
+                )
+            )
+
+        self.assertNotIn("error", result, result)
+        self.assertTrue(result["applied"])
+        self.assertEqual(calls[0]["inventory_id"], 42)
+        self.assertEqual(
+            calls[0]["expected_inventory_decision_sha256"], "f" * 64
+        )
+        self.assertEqual(calls[0]["virtual_assets"], ["Project/Hero/SK_Hero"])
+
+    def test_unpacked_asset_blender_continuation_forwards_only_parent_hashes(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        self._json(
+            self.server.configure_active_replay_project(
+                "example-game", "build-1", "windows-x64", "d3d11"
+            )
+        )
+        calls = []
+
+        class FakeJobs:
+            def start_blender_continuation(inner_self, **kwargs):
+                calls.append(kwargs)
+                return {
+                    "schema": "renderdoc-ultra-unpacked-asset-job/v1",
+                    "status": "running",
+                    "operationId": kwargs["operation_id"],
+                }
+
+        with mock.patch.object(
+            self.server, "_UNPACKED_ASSET_JOB_MANAGER", FakeJobs()
+        ):
+            result = json.loads(
+                self.server.continue_unpacked_asset_blender_export(
+                    "b" * 32,
+                    "a" * 32,
+                    "c" * 64,
+                    "d" * 64,
+                )
+            )
+        self.assertNotIn("error", result, result)
+        self.assertTrue(result["applied"])
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "operation_id": "b" * 32,
+                    "parent_operation_id": "a" * 32,
+                    "expected_parent_request_sha256": "c" * 64,
+                    "expected_parent_result_sha256": "d" * 64,
+                }
+            ],
+        )
+
+    def test_unpacked_asset_incremental_reuse_preserves_and_deduplicates_relationships(self):
+        self._bound_with_assets()
+        assets = Path(self.service.status()["assetRoot"])
+        (assets / "shaders").mkdir()
+        (assets / "shared").mkdir()
+        (assets / "shared" / "common.hlsli").write_text(
+            "float4 helper();\n", encoding="utf-8"
+        )
+        (assets / "shaders" / "main.hlsl").write_text(
+            '#include "../shared/common.hlsli"\n'
+            '#include "../shared/common.hlsli"\n'
+            "float4 main() : SV_Target { return helper(); }\n",
+            encoding="utf-8",
+        )
+
+        first = json.loads(self.server.index_active_unpacked_assets("full"))
+        self.assertNotIn("error", first, first)
+        first_query = self._json(
+            self.server.query_active_unpacked_assets(
+                text="shaders/main.hlsl", kinds=["shader"]
+            )
+        )
+        relations = first_query["assets"][0]["relationships"]
+        self.assertEqual(len(relations), 1)
+        self.assertEqual(relations[0]["targetPath"], "shared/common.hlsli")
+        self.assertTrue(relations[0]["verified"])
+        self.assertEqual(relations[0]["derivationClass"], "deterministic-derived")
+        self.assertEqual(relations[0]["evidence"]["observationCount"], 2)
+
+        second = json.loads(self.server.index_active_unpacked_assets("incremental"))
+        self.assertNotIn("error", second, second)
+        self.assertEqual(second["catalogSha256"], first["catalogSha256"])
+        second_query = self._json(
+            self.server.query_active_unpacked_assets(
+                text="shaders/main.hlsl", kinds=["shader"]
+            )
+        )
+        self.assertEqual(
+            second_query["assets"][0]["relationships"], relations
+        )
+
+    def test_unpacked_asset_query_rejects_sqlite_content_not_bound_by_catalog_hash(self):
+        self._bound_with_assets()
+        indexed = json.loads(self.server.index_active_unpacked_assets())
+        self.assertNotIn("error", indexed, indexed)
+        database = sqlite3.connect(indexed["databasePath"])
+        try:
+            database.execute("UPDATE assets SET kind='other' WHERE kind='shader'")
+            database.commit()
+        finally:
+            database.close()
+
+        rejected = json.loads(self.server.query_active_unpacked_assets())
+        self.assertFalse(rejected["applied"])
+        self.assertIn("error", rejected)
+        self.assertIn("embedded manifest hash", rejected["error"])
+
+    def test_unpacked_asset_reference_bound_is_explicit_and_not_a_complete_claim(self):
+        self._bound_with_assets()
+        assets = Path(self.service.status()["assetRoot"])
+        (assets / "many.hlsl").write_text(
+            "".join('#include "missing-%03d.hlsli"\n' % index for index in range(300)),
+            encoding="utf-8",
+        )
+
+        indexed = json.loads(self.server.index_active_unpacked_assets())
+        self.assertNotIn("error", indexed, indexed)
+        self.assertEqual(indexed["diagnostics"]["referenceTruncatedAssets"], 1)
+        self.assertTrue(indexed["coverage"]["complete"])
+        self.assertFalse(indexed["coverage"]["truncated"])
+        query = self._json(
+            self.server.query_active_unpacked_assets(text="many.hlsl")
+        )
+        selected = query["assets"][0]
+        self.assertEqual(selected["metadata"]["referenceCountObserved"], 300)
+        self.assertEqual(selected["metadata"]["referenceCountIndexed"], 256)
+        self.assertTrue(selected["metadata"]["referencesTruncated"])
+        self.assertEqual(len(selected["relationships"]), 256)
+
+    def test_unpacked_asset_file_limit_is_truthful_and_keeps_previous_catalog(self):
+        self._bound_with_assets()
+        first = json.loads(self.server.index_active_unpacked_assets(max_files=1))
+        self.assertNotIn("error", first, first)
+        assets = Path(self.service.status()["assetRoot"])
+        (assets / "second.hlsl").write_text("float4 second();\n", encoding="utf-8")
+
+        bounded = json.loads(self.server.index_active_unpacked_assets(max_files=1))
+        self.assertIn("error", bounded)
+        self.assertFalse(bounded["applied"])
+        self.assertFalse(bounded["catalogReplaced"])
+        self.assertFalse(bounded["coverage"]["complete"])
+        self.assertTrue(bounded["coverage"]["truncated"])
+        status = json.loads(self.server.get_active_unpacked_asset_index_status())
+        self.assertTrue(status["ready"])
+        self.assertEqual(status["catalogSha256"], first["catalogSha256"])
+
+    def test_unpacked_asset_scan_does_not_follow_redirected_entries(self):
+        self._bound_with_assets()
+        assets = Path(self.service.status()["assetRoot"])
+        outside = self.root / "outside-secret.hlsl"
+        outside.write_text("float4 secret();\n", encoding="utf-8")
+        redirected = assets / "redirected-secret.hlsl"
+        try:
+            redirected.symlink_to(outside)
+        except OSError as error:
+            self.skipTest("symbolic links are unavailable: %s" % error)
+
+        indexed = json.loads(self.server.index_active_unpacked_assets())
+        self.assertNotIn("error", indexed, indexed)
+        self.assertGreaterEqual(indexed["diagnostics"]["skippedSymlinks"], 1)
+        query = self._json(
+            self.server.query_active_unpacked_assets(text="redirected-secret")
+        )
+        self.assertEqual(query["count"], 0)
+
+    def test_unpacked_asset_rejects_windows_reparse_attribute(self):
+        fake_status = types.SimpleNamespace(st_file_attributes=0x0400)
+        with mock.patch.object(Path, "lstat", return_value=fake_status), mock.patch.object(
+            Path, "is_symlink", return_value=False
+        ):
+            self.assertTrue(asset_catalog_module._is_redirected(Path("redirected")))
+
+    def test_active_shader_asset_evidence_not_ready_is_non_blocking_and_read_only(self):
+        ensured = self._json(
+            self.server.ensure_active_replay_project("Example Game")
+        )
+        missing_root = self._json(
+            self.server.query_active_shader_asset_evidence(142, "fragment")
+        )
+        self.assertFalse(missing_root["ready"])
+        self.assertEqual(
+            missing_root["requiredAction"], "prepare_active_capture_project"
+        )
+        self.assertEqual(missing_root["reasonCode"], "asset-root-not-configured")
+        self.assertIn(
+            "configure_active_project_asset_root",
+            missing_root["prerequisites"],
+        )
+        self.assertTrue(missing_root["policy"]["readOnlyDatabase"])
+
+        self._json(
+            self.server.configure_active_replay_project(
+                "example-game", "build-1", "windows-x64", "d3d11"
+            )
+        )
+        assets = self.root / "not-yet-prepared-assets"
+        assets.mkdir()
+        self._json(self.server.configure_active_project_asset_root(str(assets)))
+        asset_dictionary = (
+            Path(ensured["project"]["paths"]["sharedDictionaries"]) / "assets"
+        )
+        self.assertFalse(asset_dictionary.exists())
+
+        unprepared = self._json(
+            self.server.query_active_shader_asset_evidence(142, "pixel")
+        )
+
+        self.assertFalse(unprepared["ready"])
+        self.assertEqual(unprepared["reasonCode"], "full-catalog-not-prepared")
+        self.assertEqual(
+            unprepared["requiredAction"], "prepare_active_capture_project"
+        )
+        self.assertFalse(asset_dictionary.exists())
+        self.assertFalse(unprepared["policy"]["assetScanTriggered"])
+        self.assertFalse(unprepared["policy"]["compilerInvoked"])
+        self.assertFalse(unprepared["policy"]["aliasMutation"])
+
+    def test_active_shader_asset_evidence_requires_prepared_managed_database(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        self._json(
+            self.server.configure_active_replay_project(
+                "example-game", "build-1", "windows-x64", "d3d11"
+            )
+        )
+        self._json(self.server.prepare_active_capture_project())
+        assets = self.root / "configured-after-prepare"
+        assets.mkdir()
+        self._json(self.server.configure_active_project_asset_root(str(assets)))
+        assets_dictionary = (
+            Path(self.service.status()["paths"]["sharedDictionaries"]) / "assets"
+        )
+        self.assertFalse(assets_dictionary.exists())
+
+        result = self._json(
+            self.server.query_active_shader_asset_evidence(142, "fragment")
+        )
+
+        self.assertFalse(result["ready"])
+        self.assertEqual(
+            result["reasonCode"], "managed-symbol-database-unavailable"
+        )
+        self.assertEqual(
+            result["requiredAction"], "prepare_active_capture_project"
+        )
+        self.assertFalse(assets_dictionary.exists())
+
+    def test_active_shader_asset_evidence_binds_identity_and_labels_relations(self):
+        self._bound_with_assets()
+        assets = Path(self.service.status()["assetRoot"])
+        constant_buffer = {
+            "name": "cb0",
+            "space": 0,
+            "bind": 0,
+            "arraySize": 1,
+            "byteSize": 16,
+            "bufferBacked": True,
+            "inlineDataBytes": False,
+            "compileConstants": False,
+            "fields": [
+                {
+                    "name": "_child0",
+                    "byteOffset": 0,
+                    "byteSize": 16,
+                    "type": "float4",
+                    "rows": 1,
+                    "columns": 4,
+                    "bitFieldOffset": 0,
+                    "bitFieldSize": 0,
+                }
+            ],
+        }
+        self.ipc.shader["constantBuffers"] = [copy.deepcopy(constant_buffer)]
+        self.ipc.use["constantBlocks"] = [copy.deepcopy(constant_buffer)]
+        fingerprint = fingerprint_bytes(self.ipc.blob)
+        self.assertIsNotNone(fingerprint)
+        (assets / "HeroMaterial.bin").write_bytes(self.ipc.blob)
+        # Keep physical ownership ambiguous so project preparation records the
+        # candidates but does not create/apply a verified display alias. This
+        # test is exclusively about the later read-only evidence query.
+        (assets / "HeroMaterialCopy.bin").write_bytes(self.ipc.blob)
+        (assets / "HeroMaterial.hlsl").write_text(
+            "float4 main() : SV_Target { return 1; }\n", encoding="utf-8"
+        )
+        asset_interface = _interface()
+        asset_interface["constantBuffers"] = [
+            {
+                **copy.deepcopy(constant_buffer),
+                "name": "PerMaterial",
+                "fields": [
+                    {
+                        **copy.deepcopy(constant_buffer["fields"][0]),
+                        "name": "BaseColor",
+                    }
+                ],
+            }
+        ]
+        (assets / "symbols.json").write_text(
+            json.dumps(
+                {
+                    "schema": "renderdoc-ultra-symbols/v1",
+                    "shaders": [
+                        {
+                            "name": "HeroMaterial",
+                            "path": "Game/Shaders/HeroMaterial.shader",
+                            "stage": "pixel",
+                            "entryPoint": "main",
+                            "blobPath": "HeroMaterial.bin",
+                            "rawSha256": fingerprint.raw_sha256,
+                            "codeSha256": fingerprint.code_sha256,
+                            "materialName": "HeroSurface",
+                            **asset_interface,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        prepared = self._json(self.server.prepare_active_capture_project())
+        database = (
+            Path(prepared["project"]["paths"]["sharedDictionaries"])
+            / "assets"
+            / "symbols-v3.sqlite3"
+        )
+        self.assertTrue(database.is_file())
+        before = database.stat()
+        exports_before = len(
+            [call for call in self.ipc.calls if call[0] == "export_shader_catalog"]
+        )
+        alias_loads_before = len(
+            [call for call in self.ipc.calls if call[0] == "load_symbol_aliases"]
+        )
+
+        with mock.patch.object(
+            self.server.SymbolService,
+            "scan",
+            side_effect=AssertionError("read-only query must not scan assets"),
+        ):
+            result = self._json(
+                self.server.query_active_shader_asset_evidence(
+                    142, "pixel", top_k=10
+                )
+            )
+
+        after = database.stat()
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["boundIdentity"]["captureId"], self.ipc.capture_id)
+        self.assertEqual(result["boundIdentity"]["eventId"], 142)
+        self.assertEqual(result["boundIdentity"]["stage"], "fragment")
+        self.assertEqual(result["boundIdentity"]["shaderResourceId"], 902)
+        self.assertEqual(
+            result["boundIdentity"]["rawSha256"], self.ipc.shader["rawSha256"]
+        )
+        self.assertEqual(
+            result["boundIdentity"]["catalogSha256"],
+            prepared["stagedCatalog"]["catalogSha256"],
+        )
+        self.assertRegex(
+            result["boundIdentity"]["catalogBindingSha256"], r"^[0-9a-f]{64}$"
+        )
+        relation = result["relationView"]
+        self.assertEqual(
+            relation["captureShader"]["cbufferEvidence"]["evidenceClass"],
+            "observed",
+        )
+        self.assertEqual(
+            relation["captureShader"]["cbufferEvidence"]["blocks"][0]["name"],
+            "cb0",
+        )
+        self.assertGreater(relation["candidateCount"], 0)
+        manifest_relation = next(
+            candidate
+            for candidate in relation["assetCandidates"]
+            if candidate["assetRecord"]["displayName"] == "HeroMaterial"
+        )
+        self.assertEqual(
+            manifest_relation["assetRecord"]["evidenceClass"], "observed"
+        )
+        self.assertEqual(
+            manifest_relation["cbufferEvidence"]["asset"]["evidenceClass"],
+            "inferred",
+        )
+        self.assertEqual(
+            manifest_relation["cbufferEvidence"]["asset"]["blocks"][0]["name"],
+            "PerMaterial",
+        )
+        self.assertTrue(manifest_relation["relatedTextEvidence"])
+        self.assertTrue(
+            all(
+                item["evidenceClass"] == "inferred"
+                for item in manifest_relation["relatedTextEvidence"]
+            )
+        )
+        self.assertEqual(
+            manifest_relation["materialEvidence"]["observedEntities"], []
+        )
+        self.assertFalse(
+            manifest_relation["materialEvidence"]["materialEntitySynthesized"]
+        )
+        self.assertTrue(
+            manifest_relation["materialEvidence"]["inferredHints"]
+        )
+        self.assertTrue(result["policy"]["readOnlyDatabase"])
+        self.assertFalse(result["policy"]["assetScanTriggered"])
+        self.assertFalse(result["policy"]["compilerInvoked"])
+        self.assertFalse(result["policy"]["aliasMutation"])
+        self.assertEqual(
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns),
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns),
+        )
+        self.assertEqual(
+            len([call for call in self.ipc.calls if call[0] == "export_shader_catalog"]),
+            exports_before,
+        )
+        self.assertEqual(
+            len([call for call in self.ipc.calls if call[0] == "load_symbol_aliases"]),
+            alias_loads_before,
+        )
+
+    def test_active_shader_asset_evidence_rejects_unbounded_top_k(self):
+        for value in (0, 11, True):
+            with self.subTest(top_k=value):
+                result = json.loads(
+                    self.server.query_active_shader_asset_evidence(
+                        142, "fragment", top_k=value
+                    )
+                )
+                self.assertIn("error", result)
 
     def test_pending_project_stages_full_capture_and_blocks_physical_reuse(self):
         ensured = self._json(self.server.ensure_active_replay_project("Example Game"))
@@ -438,6 +1302,341 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self.assertEqual(export["progress_token"], token)
         self.assertEqual(export["progress_capture_session_id"], "a" * 32)
         self.assertNotIn("progress_path", export)
+
+    def test_internal_prepare_forwards_live_progress_on_a_sidecar_thread(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        instances = self.root / "ipc-v2" / "instances"
+        instance = instances / ("123-%s" % ("b" * 32))
+        requests = instance / "requests"
+        responses = instance / "responses"
+        requests.mkdir(parents=True)
+        responses.mkdir()
+        self.ipc._instance_mailbox = lambda: (str(requests), str(responses))
+        token = "d" * 32
+        progress_path = instance / (
+            "shader-catalog-progress-%s.json" % token
+        )
+        callback_seen = threading.Event()
+        callback_threads = []
+        observations = []
+        export_threads = []
+        caller_thread = threading.get_ident()
+        original_call = self.ipc.call
+
+        def publish(current, event_id, updated_ms):
+            value = {
+                "schema": self.server.SHADER_CATALOG_PROGRESS_SCHEMA,
+                "schemaVersion": 1,
+                "operationToken": token,
+                "instanceId": instance.name,
+                "captureSessionId": "a" * 32,
+                "phase": "export-shader-bindings",
+                "eventId": event_id,
+                "current": current,
+                "total": 2,
+                "updatedUnixMs": updated_ms,
+            }
+            temporary = progress_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(value), encoding="utf-8")
+            os.replace(temporary, progress_path)
+
+        def call_with_progress(method, params=None, timeout=None):
+            if method != "export_shader_catalog":
+                return original_call(method, params, timeout)
+            export_threads.append(threading.get_ident())
+            publish(1, 101, 1001)
+            if not callback_seen.wait(timeout=2.0):
+                raise AssertionError("progress was not forwarded during export")
+            result = original_call(method, params, timeout)
+            publish(2, 202, 1002)
+            return result
+
+        def receive(observation):
+            callback_threads.append(threading.get_ident())
+            observations.append(observation)
+            if observation.get("schema") == self.server.SHADER_CATALOG_PROGRESS_SCHEMA:
+                callback_seen.set()
+
+        with mock.patch.object(
+            self.server, "INSTANCE_ROOT", str(instances)
+        ), mock.patch.object(
+            self.server,
+            "SHADER_CATALOG_PROGRESS_POLL_SECONDS",
+            0.005,
+        ), mock.patch.object(
+            self.ipc, "call", side_effect=call_with_progress
+        ):
+            prepared = self._json(
+                self.server._prepare_active_capture_project_with_progress(
+                    token, receive
+                )
+            )
+
+        self.assertEqual(prepared["capture"]["captureSessionId"], "a" * 32)
+        self.assertEqual(export_threads, [caller_thread])
+        export_observations = [
+            item
+            for item in observations
+            if item.get("schema") == self.server.SHADER_CATALOG_PROGRESS_SCHEMA
+        ]
+        self.assertTrue(export_observations)
+        self.assertEqual(
+            [item["current"] for item in export_observations], [1, 2]
+        )
+        self.assertTrue(
+            all(
+                set(item)
+                == {
+                    "schema",
+                    "schemaVersion",
+                    "operationToken",
+                    "instanceId",
+                    "captureSessionId",
+                    "phase",
+                    "eventId",
+                    "current",
+                    "total",
+                    "updatedUnixMs",
+                }
+                for item in export_observations
+            )
+        )
+        self.assertFalse(progress_path.exists())
+
+    def test_progress_callback_failure_does_not_change_prepare_or_cleanup(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        instances = self.root / "ipc-v2" / "instances"
+        instance = instances / ("456-%s" % ("c" * 32))
+        requests = instance / "requests"
+        responses = instance / "responses"
+        requests.mkdir(parents=True)
+        responses.mkdir()
+        self.ipc._instance_mailbox = lambda: (str(requests), str(responses))
+        token = "e" * 32
+        progress_path = instance / (
+            "shader-catalog-progress-%s.json" % token
+        )
+        original_call = self.ipc.call
+        callback_calls = []
+
+        def call_with_final_progress(method, params=None, timeout=None):
+            result = original_call(method, params, timeout)
+            if method == "export_shader_catalog":
+                value = {
+                    "schema": self.server.SHADER_CATALOG_PROGRESS_SCHEMA,
+                    "schemaVersion": 1,
+                    "operationToken": token,
+                    "instanceId": instance.name,
+                    "captureSessionId": "a" * 32,
+                    "phase": "export-shader-bindings",
+                    "eventId": 202,
+                    "current": 1,
+                    "total": 1,
+                    "updatedUnixMs": 2001,
+                }
+                progress_path.write_text(json.dumps(value), encoding="utf-8")
+            return result
+
+        def broken_callback(observation):
+            callback_calls.append(observation)
+            raise RuntimeError("display stopped")
+
+        with mock.patch.object(
+            self.server, "INSTANCE_ROOT", str(instances)
+        ), mock.patch.object(
+            self.server,
+            "SHADER_CATALOG_PROGRESS_POLL_SECONDS",
+            10.0,
+        ), mock.patch.object(
+            self.ipc, "call", side_effect=call_with_final_progress
+        ), mock.patch.object(self.server.logger, "warning") as warning:
+            prepared = self._json(
+                self.server._prepare_active_capture_project_with_progress(
+                    token, broken_callback
+                )
+            )
+
+        self.assertEqual(prepared["capture"]["captureId"], self.ipc.capture_id)
+        self.assertEqual(len(callback_calls), 1)
+        self.assertEqual(callback_calls[0]["current"], 1)
+        self.assertTrue(warning.called)
+        self.assertFalse(progress_path.exists())
+
+    def test_unavailable_progress_channel_falls_back_to_physical_prepare(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        observations = []
+
+        with mock.patch.object(self.server.logger, "warning") as warning:
+            prepared = self._json(
+                self.server._prepare_active_capture_project_with_progress(
+                    "f" * 32, observations.append
+                )
+            )
+
+        self.assertEqual(prepared["capture"]["captureId"], self.ipc.capture_id)
+        self.assertEqual(
+            observations[0]["phase"], "prepare-export-start"
+        )
+        self.assertEqual(observations[-1]["phase"], "prepare-complete")
+        self.assertTrue(
+            all(
+                item["schema"]
+                == self.server.ACTIVE_CAPTURE_PREPARE_PROGRESS_SCHEMA
+                for item in observations
+            )
+        )
+        self.assertTrue(warning.called)
+        export = next(
+            params
+            for method, params, unused_timeout in self.ipc.calls
+            if method == "export_shader_catalog"
+        )
+        self.assertNotIn("progress_token", export)
+        self.assertNotIn("progress_capture_session_id", export)
+
+    def test_prepare_prefers_responsive_export_job_and_forwards_poll_progress(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        original_call = self.ipc.call
+        job_id = "9" * 32
+        begin_params = {}
+        poll_count = [0]
+        observations = []
+        async_methods = []
+
+        def snapshot(status, current, total, event_id, **extra):
+            return {
+                "schema": self.server.SHADER_CATALOG_EXPORT_JOB_SCHEMA,
+                "schemaVersion": 1,
+                "jobId": job_id,
+                "status": status,
+                "captureSessionId": "a" * 32,
+                "cancellationRequested": False,
+                "current": current,
+                "total": total,
+                "eventId": event_id,
+                **extra,
+            }
+
+        def async_call(method, params=None, timeout=None):
+            async_methods.append(method)
+            if method == "begin_export_shader_catalog":
+                begin_params.update(dict(params or {}))
+                return snapshot("queued", 0, 0, 0)
+            if method == "poll_export_shader_catalog":
+                self.assertEqual(params, {"job_id": job_id})
+                poll_count[0] += 1
+                if poll_count[0] == 1:
+                    return snapshot("running", 1, 2, 101)
+                return snapshot("completed", 2, 2, 202)
+            if method == "consume_export_shader_catalog":
+                self.assertEqual(params, {"job_id": job_id})
+                result = original_call(
+                    "export_shader_catalog", begin_params, timeout
+                )
+                # The helper call only materializes deterministic catalog test
+                # bytes; it is not a Host legacy fallback request.
+                self.ipc.calls.pop()
+                return snapshot("completed", 2, 2, 202, result=result)
+            if method == "cancel_export_shader_catalog":
+                self.fail("completed export job must not be cancelled")
+            return original_call(method, params, timeout)
+
+        with mock.patch.object(
+            self.ipc, "call", side_effect=async_call
+        ), mock.patch.object(
+            self.server, "SHADER_CATALOG_EXPORT_JOB_POLL_SECONDS", 0.0
+        ):
+            prepared = self._json(
+                self.server._prepare_active_capture_project(
+                    progress_callback=observations.append
+                )
+            )
+
+        self.assertEqual(prepared["capture"]["captureId"], self.ipc.capture_id)
+        self.assertEqual(begin_params["event_ids"], [])
+        self.assertIn("begin_export_shader_catalog", async_methods)
+        self.assertIn("poll_export_shader_catalog", async_methods)
+        self.assertIn("consume_export_shader_catalog", async_methods)
+        self.assertNotIn("export_shader_catalog", async_methods)
+        export_progress = [
+            item
+            for item in observations
+            if item["phase"] == "export-shader-bindings"
+        ]
+        self.assertEqual(
+            [(item["current"], item["total"], item["item"])
+             for item in export_progress],
+            [(1, 2, "EID 101"), (2, 2, "EID 202")],
+        )
+        self.assertEqual(observations[-1]["phase"], "prepare-complete")
+
+    def test_async_export_cancel_checkpoint_requests_bridge_cancel(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        original_call = self.ipc.call
+        job_id = "8" * 32
+        methods = []
+        checkpoints = []
+
+        class RestoreCancelled(RuntimeError):
+            pass
+
+        def snapshot(status, *, error=None):
+            value = {
+                "schema": self.server.SHADER_CATALOG_EXPORT_JOB_SCHEMA,
+                "schemaVersion": 1,
+                "jobId": job_id,
+                "status": status,
+                "captureSessionId": "a" * 32,
+                "cancellationRequested": status == "cancelled",
+                "current": 0,
+                "total": 0,
+                "eventId": 0,
+            }
+            if error is not None:
+                value["error"] = error
+            return value
+
+        def async_call(method, params=None, timeout=None):
+            methods.append(method)
+            if method == "begin_export_shader_catalog":
+                return snapshot("running")
+            if method == "cancel_export_shader_catalog":
+                return snapshot("cancelled", error="cancelled by test")
+            return original_call(method, params, timeout)
+
+        def checkpoint(phase):
+            checkpoints.append(phase)
+            if phase == "during asynchronous full-frame Shader catalog export":
+                raise RestoreCancelled("stop export")
+
+        with mock.patch.object(self.ipc, "call", side_effect=async_call):
+            with self.assertRaisesRegex(RestoreCancelled, "stop export"):
+                self.server._prepare_active_capture_project(
+                    progress_callback=lambda unused: None,
+                    control_checkpoint=checkpoint,
+                )
+
+        self.assertIn("begin_export_shader_catalog", methods)
+        self.assertIn("cancel_export_shader_catalog", methods)
+        self.assertNotIn("export_shader_catalog", methods)
+
+    def test_async_export_transport_failure_never_duplicates_legacy_export(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        original_call = self.ipc.call
+        methods = []
+
+        def failed_begin(method, params=None, timeout=None):
+            methods.append(method)
+            if method == "begin_export_shader_catalog":
+                raise RuntimeError("bridge response was lost after begin")
+            return original_call(method, params, timeout)
+
+        with mock.patch.object(self.ipc, "call", side_effect=failed_begin):
+            result = json.loads(self.server._prepare_active_capture_project())
+
+        self.assertIn("error", result)
+        self.assertIn("begin_export_shader_catalog", methods)
+        self.assertNotIn("export_shader_catalog", methods)
 
     def test_progress_sidecar_reader_binds_instance_token_and_capture_session(self):
         instances = self.root / "ipc-v2" / "instances"
@@ -509,6 +1708,209 @@ class ActiveProjectMcpTests(unittest.TestCase):
         )
         self.assertNotIn("error", path_result, path_result)
         self.assertEqual(path_result["captureId"], self.ipc.capture_id)
+
+    def test_empty_ui_id_bootstraps_one_shader_and_reuses_exact_partial_catalog(self):
+        self.ipc.context["capture"]["captureId"] = ""
+        first = self._json(self.server.get_active_shader_workspace_path(142, "pixel"))
+        self.assertEqual(first["captureId"], self.ipc.capture_id)
+        self.assertEqual(first["catalogScope"], "event-stage")
+        self.assertFalse(first["fullFrame"])
+        self.assertEqual(first["coveredEventIds"], [142])
+        self.assertEqual(first["coveredStages"], ["fragment"])
+        self.assertTrue(first["projectReuse"]["blocked"])
+        self.assertFalse(Path(first["workspacePath"]).exists())
+        again = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+        self.assertEqual(first["workspacePath"], again["workspacePath"])
+        exports = [args for method, args, unused in self.ipc.calls if method == "export_shader_catalog"]
+        self.assertEqual(len(exports), 1)
+        self.assertEqual(exports[0]["event_ids"], [142])
+        self.assertEqual(exports[0]["stages"], ["fragment"])
+        self.assertNotIn("get_shader_info", [item[0] for item in self.ipc.calls])
+        self.assertIsNone(self.server._active_capture_catalog_selection(999, "fragment"))
+        self.assertIsNone(self.server._active_capture_catalog_selection(142, "vertex"))
+        status = self._json(self.server.get_active_capture_catalog_binding_status())
+        self.assertFalse(status["fullFrame"])
+        self.assertEqual(status["coveredEventIds"], [142])
+        catalog = json.loads(Path(status["catalogPath"]).read_text(encoding="utf-8"))
+        self.assertEqual(catalog["selection"]["mode"], "explicit")
+
+    def test_partial_bootstrap_imports_only_its_scope_and_future_plan_is_partial(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        self._json(self.server.configure_active_replay_project("example-game", "build-1", "windows-x64", "d3d11"))
+        self.ipc.context["capture"]["captureId"] = ""
+        result = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+        self.assertFalse(result["projectReuse"]["blocked"])
+        self.assertEqual(self.service.replay_service().status()["captureCount"], 1)
+        future = self._json(self.server.get_active_project_future_frame_plan())
+        self.assertFalse(future["fullFrame"])
+        self.assertEqual(future["plan"]["coveredEventIds"], [142])
+        self.assertFalse(future["plan"]["fullFrame"])
+        self.assertFalse(future["applied"])
+        self.ipc.use["eventId"] = 143
+        self.ipc.context["events"] = {"currentEventId": 143, "selectedEventId": 143}
+        changed = self._json(self.server.get_active_shader_workspace_path(143, "fragment"))
+        self.assertEqual(changed["coveredEventIds"], [143])
+        self.assertNotEqual(changed["catalogSha256"], result["catalogSha256"])
+        self.assertIsNone(self.server._active_capture_catalog_selection(142, "fragment"))
+        full = self._json(self.server.prepare_active_capture_project())
+        self.assertTrue(full["captureExport"]["fullFrame"])
+        self.assertTrue(self._json(self.server.get_active_capture_catalog_binding_status())["fullFrame"])
+
+    def test_frozen_inventory_anchor_bootstraps_from_present_without_event_lookup(self):
+        self.ipc.context["capture"]["captureId"] = ""
+        self.ipc.context["events"] = {"currentEventId": 66327, "selectedEventId": 66327}
+        self.ipc.context["shaders"]["bound"] = []
+        before = copy.deepcopy(self.ipc.context)
+        missing = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
+        self.assertIn("frozen event Shader identity", missing["error"])
+        self.assertNotIn("export_shader_catalog", [item[0] for item in self.ipc.calls])
+        result = self._json(self.server.get_active_shader_workspace_path(
+            142, "fragment", expected_resource_id=902,
+            expected_entry_point="main", expected_raw_sha256=self.ipc.shader["rawSha256"],
+            expected_capture_session_id="a" * 32,
+        ))
+        self.assertEqual(result["eventId"], 142)
+        self.assertEqual(result["coveredEventIds"], [142])
+        self.assertEqual(self.ipc.context, before)
+        self.assertNotIn("get_shader_info", [item[0] for item in self.ipc.calls])
+        exports = [item[1] for item in self.ipc.calls if item[0] == "export_shader_catalog"]
+        self.assertEqual(len(exports), 1)
+        self.assertEqual(exports[0]["event_ids"], [142])
+        self.assertEqual(exports[0]["stages"], ["fragment"])
+
+    def test_frozen_inventory_anchor_requires_complete_tuple_and_physical_match(self):
+        self.ipc.context["capture"]["captureId"] = ""
+        self.ipc.context["events"] = {"currentEventId": 66327, "selectedEventId": 66327}
+        self.ipc.context["shaders"]["bound"] = []
+        expected = dict(expected_resource_id=902, expected_entry_point="main",
+                        expected_raw_sha256=self.ipc.shader["rawSha256"],
+                        expected_capture_session_id="a" * 32)
+        for missing in expected:
+            with self.subTest(missing=missing):
+                args = dict(expected)
+                del args[missing]
+                error = json.loads(self.server.get_active_shader_workspace_path(142, "fragment", **args))
+                self.assertIn("all four", error["error"])
+        self.assertFalse(self.ipc.calls)
+        for field, wrong in (("expected_resource_id", 903), ("expected_raw_sha256", "d" * 64),
+                             ("expected_entry_point", ""), ("expected_capture_session_id", "c" * 32)):
+            with self.subTest(field=field):
+                error = json.loads(self.server.get_active_shader_workspace_path(
+                    142, "fragment", **{**expected, field: wrong}))
+                self.assertIn("error", error)
+                self.assertFalse(self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS)
+                self.assertEqual(list(Path(self.service.status()["paths"]["captureCatalogs"]).iterdir()), [])
+        self.assertEqual(self.ipc.context["events"]["currentEventId"], 66327)
+
+    def test_partial_bootstrap_rejects_capture_event_or_shader_changes_before_import(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        before = copy.deepcopy(self.ipc.context)
+        cases = (
+            ("path", lambda: self.ipc.context["capture"].update(path="D:/captures/other.rdc")),
+            ("session", lambda: self.ipc.context["capture"].update(captureSessionId="c" * 32)),
+            ("event", lambda: self.ipc.context["events"].update(currentEventId=143)),
+            ("shader", lambda: self.ipc.context["shaders"]["bound"][0].update(resourceId=903)),
+            ("bytes", lambda: self.ipc.context["shaders"]["bound"][0].update(rawSha256="d" * 64)),
+        )
+        original = self.ipc.call
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                self.ipc.context = copy.deepcopy(before)
+                self.ipc.context["capture"]["captureId"] = ""
+                def changed(method, params=None, timeout=None):
+                    value = original(method, params, timeout)
+                    if method == "export_shader_catalog":
+                        mutate()
+                    return value
+                with mock.patch.object(self.ipc, "call", side_effect=changed):
+                    result = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
+                self.assertIn("error", result)
+                self.assertFalse(self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS)
+                self.assertEqual(list(Path(self.service.status()["paths"]["captureCatalogs"]).iterdir()), [])
+
+    def test_partial_plan_keeps_its_exact_revision_when_another_revision_is_imported(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        self.ipc.context["capture"]["captureId"] = ""
+        staged = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+        self._json(self.server.configure_active_replay_project("example-game", "build-1", "windows-x64", "d3d11"))
+        imported = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+        self.assertEqual(imported["catalogSha256"], staged["catalogSha256"])
+        export_count = len([item for item in self.ipc.calls if item[0] == "export_shader_catalog"])
+        self.assertEqual(export_count, 1)
+        full = self.ipc.call("export_shader_catalog", {"output_dir": str(self.root / "other-revision"), "event_ids": []})
+        changed = self.service.import_capture(full["catalogPath"])
+        self.assertNotEqual(changed["stagedCatalog"]["catalogSha256"], staged["catalogSha256"])
+        plan = self._json(self.server.get_active_project_future_frame_plan())
+        self.assertEqual(plan["plan"]["reusePlan"]["catalogSha256"], staged["catalogSha256"])
+        self.assertFalse(plan["fullFrame"])
+        self.assertEqual(plan["coveredEventIds"], [142])
+
+    def test_partial_catalog_is_not_full_asset_scan_evidence(self):
+        self._bound_with_assets()
+        self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+        result = json.loads(self.server.query_active_shader_asset_evidence(142, "fragment"))
+        self.assertFalse(result["ready"])
+        self.assertIn("full-catalog-not-prepared", json.dumps(result))
+
+    def test_current_shader_reuse_projection_omits_unrelated_frame_matches(self):
+        shader = {key: self.ipc.shader[key] for key in ("resourceId", "stage", "entryPoint", "rawSha256")}
+        item = {"shader": {**shader, "eventIds": list(range(1, 1000))},
+                "workspaceCandidates": [{"knowledgeId": "c" * 32, "sourceSeedEligible": True}]}
+        other = copy.deepcopy(item)
+        other["shader"]["resourceId"] += 1
+        source = {"reusePlan": {"matches": [item, other], "matchedShaderCount": 2,
+                                "preparationSteps": [item, other]},
+                  "preparationSteps": [item, other]}
+        result = self.server._current_shader_reuse_projection(source, shader, 142)
+        self.assertEqual(result["reusePlan"]["matchedShaderCount"], 1)
+        self.assertEqual(len(result["preparationSteps"]), 1)
+        projected = result["reusePlan"]["matches"][0]["shader"]
+        self.assertEqual(projected["eventIds"], [142])
+        self.assertEqual(projected["catalogUseCount"], 999)
+        self.assertEqual(source["reusePlan"]["matchedShaderCount"], 2)
+
+    def test_partial_bootstrap_rejects_extra_scope_and_wrong_exported_identity(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        original = self.ipc.call
+        def wrong(method, params=None, timeout=None):
+            value = original(method, params, timeout)
+            if method == "export_shader_catalog":
+                path = Path(value["catalogPath"])
+                catalog = json.loads(path.read_text(encoding="utf-8"))
+                catalog["selection"]["eventIds"].append(999)
+                path.write_text(json.dumps(catalog), encoding="utf-8")
+            return value
+        with mock.patch.object(self.ipc, "call", side_effect=wrong):
+            result = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
+        self.assertIn("exactly the requested Shader", result["error"])
+        self.assertFalse(self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS)
+        self.assertEqual(list(Path(self.service.status()["paths"]["captureCatalogs"]).iterdir()), [])
+
+    def test_partial_bootstrap_rejects_wrong_receipt_bytes_and_restore_failure(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        original = self.ipc.call
+        for kind in ("capture", "session", "bytes", "restore"):
+            with self.subTest(kind=kind):
+                def corrupt(method, params=None, timeout=None):
+                    value = original(method, params, timeout)
+                    if method == "export_shader_catalog":
+                        path = Path(value["catalogPath"])
+                        if kind == "capture":
+                            value["captureId"] = "0" * 64
+                        elif kind == "session":
+                            value["captureSessionId"] = "c" * 32
+                        elif kind == "bytes":
+                            (path.parent / self.ipc.shader["rawPath"]).write_bytes(_dxbc(b"wrong bytes"))
+                        else:
+                            catalog = json.loads(path.read_text(encoding="utf-8"))
+                            catalog["errors"] = [{"scope": "restore_event", "message": "restore failed"}]
+                            path.write_text(json.dumps(catalog), encoding="utf-8")
+                    return value
+                with mock.patch.object(self.ipc, "call", side_effect=corrupt):
+                    result = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
+                self.assertIn("error", result)
+                self.assertFalse(self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS)
+                self.assertEqual(list(Path(self.service.status()["paths"]["captureCatalogs"]).iterdir()), [])
 
     def test_bound_symbol_resolution_keeps_canonical_id_when_live_id_stays_empty(self):
         self._bound_with_assets()
@@ -890,6 +2292,24 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self.assertIn("frozen event Shader identity", error["error"])
         self.assertFalse(error["applied"])
 
+    def test_decimal_context_resource_id_returns_integer_at_mcp_boundaries(self):
+        resource_id = 1000000000000000627
+        self.ipc.context["shaders"]["bound"][0]["resourceId"] = str(resource_id)
+
+        active = self.server._active_bound_shader(
+            self.ipc.context, 142, "fragment"
+        )
+        recovery = self.server._active_asset_recovery_report(
+            {"candidates": []}, self.ipc.context, str(self.root)
+        )
+
+        self.assertIs(type(active["resourceId"]), int)
+        self.assertEqual(active["resourceId"], resource_id)
+        self.assertIs(type(recovery["boundShaders"][0]["shaderResourceId"]), int)
+        self.assertEqual(
+            recovery["boundShaders"][0]["shaderResourceId"], resource_id
+        )
+
     def test_explicit_asset_recovery_inspection_is_read_only(self):
         assets = self.root / "shader-assets"
         assets.mkdir()
@@ -1074,7 +2494,77 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.workspace = self.root / "projects" / "p" / "workspaces" / "shaders" / "w"
         self.workspace.mkdir(parents=True)
+        source_path = self.workspace / "source" / "shader.hlsl"
+        source_path.parent.mkdir()
+        source_path.write_text("float4 main() : SV_Target { return 1; }\n", encoding="utf-8")
+        manifest_path = self.workspace / "manifest.json"
+        manifest_path.write_text('{"schema":"test-workspace"}\n', encoding="utf-8")
+        self.source_path = source_path.resolve()
+        self.manifest_path = manifest_path.resolve()
+        self.source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        self.manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        candidate_path = self.workspace / "build" / "candidate.dxbc"
+        candidate_path.parent.mkdir()
+        candidate_path.write_bytes(b"DXBC\x01\x02\x03\x04")
+        self.candidate_path = candidate_path.resolve()
+        self.candidate_sha256 = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+        self.code_sha256 = "2" * 64
+        self.baseline_abi_sha256 = "5" * 64
+        self.candidate_abi_sha256 = "6" * 64
+        self.abi_request_id = "8" * 64
+        self.abi_report_sha256 = "9" * 64
         self.capture_id = "c" * 64
+        gate_path = self.workspace / "ai" / "organize-code-gate.json"
+        gate_path.parent.mkdir()
+        gate_path.write_text(
+            json.dumps(
+                {
+                    "schema": "renderdoc-ai-shader-organization-gate/v1",
+                    "schemaVersion": 1,
+                    "policyVersion": "renderdoc-ai-organize-workspace/v1",
+                    "organizationId": "7" * 32,
+                    "reviewedAt": "2026-08-28T00:00:00Z",
+                    "requestedTransformation": "organize-only",
+                    "workspaceId": "a" * 32,
+                    "captureId": self.capture_id,
+                    "stage": "fragment",
+                    "entryPoint": "main",
+                    "baselineSourceSha256": self.source_sha256,
+                    "proposalSourceSha256": self.source_sha256,
+                    "baselineCodeSha256": self.code_sha256,
+                    "organizedCodeSha256": self.code_sha256,
+                    "codeSha256Equal": True,
+                    "equivalenceLevel": "exact-code",
+                    "decision": "accepted-executable-editable",
+                    "organizedSourcePromoted": True,
+                    "executableEditableSourcePath": str(self.source_path),
+                    "baselineCompiledAndAbiValidated": True,
+                    "organizedCompiledAndAbiValidated": True,
+                    "rawRecoveryCompiledAndAbiValidated": False,
+                    "semanticEquivalenceVerified": False,
+                    "replayApplied": False,
+                    "safeToStartLiveEdit": True,
+                    "finalBinding": {
+                        "complete": True,
+                        "sourceSha256": self.source_sha256,
+                        "revision": 1,
+                        "candidateRawSha256": self.candidate_sha256,
+                        "codeSha256": self.code_sha256,
+                        "abiRequestId": self.abi_request_id,
+                        "abiReportSha256": self.abi_report_sha256,
+                    },
+                    "finalSourceSha256": self.source_sha256,
+                    "finalRevision": 1,
+                    "finalCandidateRawSha256": self.candidate_sha256,
+                    "finalCodeSha256": self.code_sha256,
+                    "finalAbiRequestId": self.abi_request_id,
+                    "finalAbiReportSha256": self.abi_report_sha256,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        self.gate_path = gate_path.resolve()
         self.context = {
             "schema": "renderdoc-ultra-current-context/v1",
             "schemaVersion": 1,
@@ -1102,6 +2592,7 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
             def __init__(inner):
                 inner.registered = None
                 inner.seeded = None
+                inner.published = None
 
             def status(inner):
                 return {
@@ -1117,11 +2608,95 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
 
             def register_workspace(inner, status):
                 inner.registered = status
-                return {"knowledge": {"knowledgeId": "e" * 32}, "applied": False}
+                latest = status["latestCompiled"]
+                abi_gate = latest["abiGate"]
+                compiled = {
+                    "schema": "renderdoc-ultra-project-compiled-candidate/v1",
+                    "schemaVersion": 1,
+                    "rawSha256": latest["rawSha256"],
+                    "codeSha256": latest["codeSha256"],
+                    "byteSize": latest["byteSize"],
+                    "kind": latest["kind"],
+                    "sourceSha256": status["source"]["currentSha256"],
+                    "sourceRevision": status["revision"],
+                    "targetProfile": status["targetProfile"],
+                    "originBaselineAbiSha256": abi_gate["baselineAbiSha256"],
+                    "originCandidateAbiSha256": abi_gate["candidateAbiSha256"],
+                    "originAbiReportSha256": abi_gate["reportSha256"],
+                    "originRequestId": abi_gate["requestId"],
+                    "validationScope": "replay-reflection-abi-compatible",
+                    "semanticEquivalenceVerified": False,
+                    "artifactPath": (
+                        "knowledge/workspaces/binaries/%s.bin"
+                        % latest["rawSha256"]
+                    ),
+                }
+                material = {
+                    "workspaceId": status["workspaceId"],
+                    "captureId": status["capture"]["captureId"],
+                    "originCatalogSha256": "1" * 64,
+                    "originResourceId": status["shader"]["resourceId"],
+                    "stage": status["stage"],
+                    "entryPoint": status["entryPoint"],
+                    "rawSha256": status["baseline"]["rawSha256"],
+                    "codeSha256": self.code_sha256,
+                    "layoutHash": "3" * 64,
+                    "interfaceHash": "4" * 64,
+                    "interfaceComplete": True,
+                    "baselineAbiSha256": "5" * 64,
+                    "targetProfile": status["targetProfile"],
+                    "sourceSha256": status["source"]["currentSha256"],
+                    "analysisSha256": "",
+                    "compiledCandidate": {
+                        key: value
+                        for key, value in compiled.items()
+                        if key != "artifactPath"
+                    },
+                }
+                knowledge_id = hashlib.sha256(
+                    json.dumps(
+                        material,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode("utf-8")
+                ).hexdigest()[:32]
+                knowledge = {
+                    **material,
+                    "compiledCandidate": compiled,
+                    "knowledgeId": knowledge_id,
+                    "sourcePath": "knowledge/workspaces/%s.hlsl"
+                    % knowledge_id,
+                    "sourceOriginPath": status["source"]["path"],
+                    "workspacePath": status["workspacePath"],
+                    "workspaceManifestSha256": self.manifest_sha256,
+                    "registeredAt": "2026-08-28T00:00:00Z",
+                }
+                inner.published = knowledge
+                return {
+                    "knowledge": knowledge,
+                    "idempotent": False,
+                    "flowchartArtifacts": [],
+                    "policy": {
+                        "flowchartExplanatoryOnly": True,
+                        "physicalEvidence": False,
+                        "applyAuthorization": False,
+                    },
+                    "applied": False,
+                }
+
+            def get_workspace_knowledge(inner, knowledge_id):
+                if (
+                    not isinstance(inner.published, dict)
+                    or inner.published.get("knowledgeId") != knowledge_id
+                ):
+                    raise RuntimeError("published workspace is unavailable")
+                return copy.deepcopy(inner.published)
 
             def seed_workspace(inner, knowledge_id, status):
                 inner.seeded = (knowledge_id, status)
-                return {"sourceSha256": "f" * 64, "applied": False}
+                return {"sourceSha256": self.source_sha256, "applied": False}
 
         class Workspaces:
             def __init__(inner):
@@ -1133,23 +2708,101 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
                 return {
                     "schema": "renderdoc-ultra-shader-workspace-status/v1",
                     "workspacePath": workspace_path,
-                    "capture": {"captureId": self.capture_id},
+                    "manifestPath": str(self.manifest_path),
+                    "workspaceId": "a" * 32,
+                    "capture": {
+                        "captureId": self.capture_id,
+                        "capturePath": "D:/captures/frame.rdc",
+                        "api": "D3D11",
+                    },
+                    "shader": {
+                        "resourceId": 77,
+                        "stage": "fragment",
+                        "entryPoint": "main",
+                    },
+                    "stage": "fragment",
+                    "entryPoint": "main",
+                    "baseline": {"rawSha256": "b" * 64},
+                    "revision": 1,
+                    "targetProfile": {
+                        "profile": "ps_5_0",
+                        "containerFormat": "dxbc",
+                    },
                     "source": {
-                        "currentSha256": "f" * 64,
+                        "present": True,
+                        "path": str(self.source_path),
+                        "format": "hlsl",
+                        "lane": "executable-editable",
+                        "compileEligible": True,
+                        "currentSha256": self.source_sha256,
                         "modifiedSinceDecompile": modified,
                     },
+                    "latestCompiled": {
+                        "rawSha256": self.candidate_sha256,
+                        "codeSha256": self.code_sha256,
+                        "byteSize": self.candidate_path.stat().st_size,
+                        "kind": "dxbc",
+                        "sourceSha256": self.source_sha256,
+                        "revision": 1,
+                        "candidateBlobPath": str(self.candidate_path),
+                        "replayAbiValidated": True,
+                        "abiCompatible": True,
+                        "requiresReplayAbiValidation": False,
+                        "validationScope": "replay-reflection-abi-compatible",
+                        "semanticEquivalenceVerified": False,
+                        "abiGate": {
+                            "status": "compatible",
+                            "baselineAbiSha256": self.baseline_abi_sha256,
+                            "candidateAbiSha256": self.candidate_abi_sha256,
+                            "requestId": self.abi_request_id,
+                            "reportSha256": self.abi_report_sha256,
+                        },
+                    },
+                    "replayAbiValidated": True,
+                    "abiCompatible": True,
                 }
+
+        class Organization:
+            def validate_publication_gate(inner, workspace_path, status=None):
+                del status
+                if Path(workspace_path).resolve() != self.workspace.resolve():
+                    raise RuntimeError("organization publication workspace differs")
+                if not self.gate_path.is_file():
+                    raise RuntimeError("organization publication gate is missing")
+                return json.loads(self.gate_path.read_text(encoding="utf-8"))
 
         self.active = Active()
         self.workspaces = Workspaces()
+        self.organization = Organization()
         self.old_service = self.server._ACTIVE_PROJECT_SERVICE
+        self.old_organization = self.server._SHADER_ORGANIZATION_MANAGER
         self.old_ipc = self.server.ipc
         self.server._ACTIVE_PROJECT_SERVICE = self.active
+        self.server._SHADER_ORGANIZATION_MANAGER = self.organization
         self.server.ipc = IPC()
         self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS.clear()
+        # Exact catalog byte/use checks are covered by the workspace rebind
+        # tests; these wrappers exercise publication against its live witness.
+        self.catalog_binding_patch = mock.patch.object(
+            self.server,
+            "_ensure_workspace_capture_catalog_identity",
+            return_value={
+                "workspaceId": "a" * 32,
+                "captureId": self.capture_id,
+                "captureSessionId": "d" * 32,
+            },
+        )
+        self.catalog_binding = self.catalog_binding_patch.start()
+        self.addCleanup(self.catalog_binding_patch.stop)
+        self.project_capture_patch = mock.patch.object(
+            self.server, "_ensure_active_workspace_project_capture"
+        )
+        self.project_capture = self.project_capture_patch.start()
+        self.addCleanup(self.project_capture_patch.stop)
 
     def tearDown(self):
         self.server._ACTIVE_PROJECT_SERVICE = self.old_service
+        self.server._SHADER_ORGANIZATION_MANAGER = self.old_organization
         self.server.ipc = self.old_ipc
         self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS.clear()
         self.temporary.cleanup()
@@ -1176,31 +2829,281 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
         )
         self.assertEqual(self.active.seeded[0], "e" * 32)
 
-    def test_promoted_organization_is_best_effort_registered_without_apply(self):
+    def test_registration_uses_exact_workspace_catalog_with_empty_ui_capture_id(self):
+        self.context["capture"]["captureId"] = ""
+        with mock.patch.object(
+            self.server, "_shader_workspace_service", return_value=self.workspaces
+        ):
+            result = json.loads(self.server.register_active_project_workspace(str(self.workspace)))
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["captureId"], self.capture_id)
+        self.assertEqual(result["captureSessionId"], "d" * 32)
+        self.assertIsNotNone(self.active.registered)
+        self.catalog_binding.assert_called_once()
+        self.assertEqual(self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS, {})
+
+    def test_registration_rejects_wrong_live_path_before_publication(self):
+        self.context["capture"].update(captureId="", path="D:/captures/different.rdc")
+        with mock.patch.object(
+            self.server, "_shader_workspace_service", return_value=self.workspaces
+        ):
+            result = json.loads(self.server.register_active_project_workspace(str(self.workspace)))
+        self.assertIn("does not match this workspace", result["error"])
+        self.assertIsNone(self.active.registered)
+
+    def test_organization_review_never_registers_until_explicit_project_tool(self):
         reviewed = {
+            "schema": "renderdoc-ai-shader-organization-review/v1",
+            "schemaVersion": 1,
+            "workspacePath": str(self.workspace),
+            "organizationId": "f" * 32,
             "gate": {
                 "organizedSourcePromoted": True,
                 "safeToStartLiveEdit": True,
             }
         }
+        reviewer = mock.Mock()
+        reviewer.review.return_value = copy.deepcopy(reviewed)
+        with mock.patch.object(
+            self.server, "_shader_organization_manager", return_value=reviewer
+        ):
+            result = json.loads(
+                self.server.review_shader_workspace_organization(
+                    str(self.workspace), "f" * 32
+                )
+            )
+        self.assertNotIn("projectSync", result)
+        self.assertIsNone(self.active.registered)
+
         with mock.patch.object(
             self.server, "_shader_workspace_service", return_value=self.workspaces
         ):
-            synced = self.server._best_effort_project_organization_sync(
-                str(self.workspace), reviewed
+            registered = json.loads(
+                self.server.register_active_project_workspace(str(self.workspace))
             )
-        self.assertTrue(synced["attempted"])
-        self.assertTrue(synced["succeeded"])
-        self.assertFalse(synced["result"]["applied"])
+        self.assertNotIn("error", registered)
+        self.assertFalse(registered["applied"])
         self.assertIsNotNone(self.active.registered)
 
-        self.active.registered = None
-        skipped = self.server._best_effort_project_organization_sync(
-            str(self.workspace),
-            {"gate": {"organizedSourcePromoted": False,
-                      "safeToStartLiveEdit": False}},
+    def test_registration_preserves_reviewed_rename_only_with_changed_code_hash(self):
+        gate = json.loads(self.gate_path.read_text(encoding="utf-8"))
+        gate.update(
+            baselineCodeSha256="3" * 64,
+            codeSha256Equal=False,
+            equivalenceLevel="rename-only",
         )
-        self.assertFalse(skipped["attempted"])
+        self.gate_path.write_text(json.dumps(gate), encoding="utf-8")
+        # This wrapper fixture represents an already trusted review. The
+        # organization tests exercise the sealed source/rename proof itself.
+        with mock.patch.object(
+            self.server, "_shader_workspace_service", return_value=self.workspaces
+        ):
+            result = json.loads(
+                self.server.register_active_project_workspace(str(self.workspace))
+            )
+        self.assertNotIn("error", result, result)
+        self.assertIsNotNone(self.active.registered)
+        self.assertFalse(result["applied"])
+
+    def test_registration_rejects_inconsistent_equivalence_before_write(self):
+        original = json.loads(self.gate_path.read_text(encoding="utf-8"))
+        for changes in (
+            {"baselineCodeSha256": "3" * 64},
+            {"codeSha256Equal": False, "equivalenceLevel": "rename-only"},
+            {"equivalenceLevel": "rename-only"},
+            {"equivalenceLevel": "rejected"},
+        ):
+            with self.subTest(changes=changes):
+                self.gate_path.write_text(
+                    json.dumps({**original, **changes}), encoding="utf-8"
+                )
+                with mock.patch.object(
+                    self.server, "_shader_workspace_service", return_value=self.workspaces
+                ):
+                    result = json.loads(
+                        self.server.register_active_project_workspace(str(self.workspace))
+                    )
+                self.assertIn("error", result)
+                self.assertIsNone(self.active.registered)
+
+    def test_registration_accepts_trusted_observational_pass(self):
+        gate = json.loads(self.gate_path.read_text(encoding="utf-8"))
+        gate.update(baselineCodeSha256="3" * 64, codeSha256Equal=False,
+                    equivalenceLevel="observational-pass")
+        self.gate_path.write_text(json.dumps(gate), encoding="utf-8")
+        with mock.patch.object(self.server, "_shader_workspace_service", return_value=self.workspaces):
+            result = json.loads(self.server.register_active_project_workspace(str(self.workspace)))
+        self.assertNotIn("error", result, result)
+        self.assertIsNotNone(self.active.registered)
+
+    def test_registration_accepts_trusted_soft_baseline_binding(self):
+        gate = json.loads(self.gate_path.read_text(encoding="utf-8"))
+        gate.update(decision="soft-accepted-baseline", softPublishAllowed=True,
+                    organizedSourcePromoted=False, rawRecoveryCompiledAndAbiValidated=True,
+                    codeSha256Equal=False, equivalenceLevel="rejected",
+                    baselineSourceSha256=gate["finalSourceSha256"],
+                    proposalSourceSha256="4" * 64, organizedCodeSha256="3" * 64)
+        self.gate_path.write_text(json.dumps(gate), encoding="utf-8")
+        with mock.patch.object(self.server, "_shader_workspace_service", return_value=self.workspaces):
+            result = json.loads(self.server.register_active_project_workspace(str(self.workspace)))
+        self.assertNotIn("error", result, result)
+        self.assertIsNotNone(self.active.registered)
+
+    def test_registration_rejects_missing_shared_artifact_provenance(self):
+        original = self.active.register_workspace
+
+        def incomplete(status):
+            result = original(status)
+            result["knowledge"].pop("workspaceManifestSha256")
+            return result
+
+        self.active.register_workspace = incomplete
+        with mock.patch.object(
+            self.server, "_shader_workspace_service", return_value=self.workspaces
+        ):
+            result = json.loads(
+                self.server.register_active_project_workspace(str(self.workspace))
+            )
+        self.assertEqual(result["schema"], "replaylab-active-project-mcp-error/v1")
+        self.assertIn("exact workspace", result["error"])
+        self.assertFalse(result["applied"])
+
+    def test_registration_requires_exact_persisted_readback(self):
+        original = self.active.get_workspace_knowledge
+
+        def tampered(knowledge_id):
+            record = original(knowledge_id)
+            record["sourceSha256"] = "0" * 64
+            return record
+
+        self.active.get_workspace_knowledge = tampered
+        with mock.patch.object(
+            self.server, "_shader_workspace_service", return_value=self.workspaces
+        ):
+            result = json.loads(
+                self.server.register_active_project_workspace(str(self.workspace))
+            )
+        self.assertEqual(result["schema"], "replaylab-active-project-mcp-error/v1")
+        self.assertIn("read back exactly", result["error"])
+        self.assertFalse(result["applied"])
+
+    def test_registration_rejects_missing_organization_gate_before_write(self):
+        self.gate_path.unlink()
+        with mock.patch.object(
+            self.server, "_shader_workspace_service", return_value=self.workspaces
+        ):
+            result = json.loads(
+                self.server.register_active_project_workspace(str(self.workspace))
+            )
+        self.assertEqual(result["schema"], "replaylab-active-project-mcp-error/v1")
+        self.assertIn("publication gate", result["error"])
+        self.assertIsNone(self.active.registered)
+        self.project_capture.assert_not_called()
+
+    def test_registration_rejects_source_change_during_capture_import(self):
+        def change_source(unused_project, unused_status, unused_context):
+            self.source_path.write_text("float4 main() : SV_Target { return 2; }\n", encoding="utf-8")
+
+        self.project_capture.side_effect = change_source
+        with mock.patch.object(
+            self.server, "_shader_workspace_service", return_value=self.workspaces
+        ):
+            result = json.loads(self.server.register_active_project_workspace(str(self.workspace)))
+        self.assertIn("error", result)
+        self.assertIsNone(self.active.registered)
+
+    def test_reviewed_workspace_imports_exact_capture_into_empty_real_project(self):
+        self.project_capture_patch.stop()
+        project = ActiveReplayProjectService(
+            self.root / "real-config" / "active.json", self.root / "real-projects"
+        )
+        project.create_project(name="Reviewed", game_id="example-game", build_id="build-1",
+                               platform="windows-x64", api_family="d3d11")
+        fixture = _CatalogIPC(self.root)
+        exported = fixture.call("export_shader_catalog", {
+            "output_dir": str(self.root / "exact-catalog"), "event_ids": []
+        })
+        catalog_path = Path(exported["catalogPath"])
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        catalog["selection"] = {"mode": "explicit", "eventIds": [142], "stages": ["fragment"]}
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+        status = self.workspaces.status(str(self.workspace))
+        status["capture"].update(
+            captureId=fixture.capture_id, catalogPath=str(catalog_path),
+            catalogSha256=hashlib.sha256(catalog_path.read_bytes()).hexdigest(),
+        )
+        status["shader"].update(resourceId=902, shaderKey=fixture.shader["shaderKey"],
+                                 rawSha256=fixture.shader["rawSha256"])
+        status["baseline"].update(rawSha256=fixture.shader["rawSha256"],
+                                   codeSha256=fixture.shader["codeSha256"],
+                                   abiSha256=self.baseline_abi_sha256)
+        latest = status["latestCompiled"]
+        latest.update(blobPath="build/candidate.dxbc", sourcePath="source/shader.hlsl")
+        report = self.workspace / "build" / "abi.json"
+        report.write_text("{}", encoding="utf-8")
+        latest["abiGate"].update(reportPath="build/abi.json",
+                                reportSha256=hashlib.sha256(report.read_bytes()).hexdigest())
+        persisted = copy.deepcopy(latest)
+        persisted.pop("candidateBlobPath")
+        self.manifest_path.write_text(json.dumps({"revision": 1, "latestCompiled": persisted}), encoding="utf-8")
+        gate = json.loads(self.gate_path.read_text(encoding="utf-8"))
+        gate["captureId"] = fixture.capture_id
+        gate["finalAbiReportSha256"] = latest["abiGate"]["reportSha256"]
+        gate["finalBinding"]["abiReportSha256"] = latest["abiGate"]["reportSha256"]
+        self.gate_path.write_text(json.dumps(gate), encoding="utf-8")
+        self.context["capture"]["captureId"] = ""
+        context = self.server._canonical_active_capture_context(self.context, fixture.capture_id)
+        workspaces = mock.Mock()
+        workspaces.status.side_effect = lambda unused_path: copy.deepcopy(status)
+        publish = lambda: self.server._register_reviewed_workspace_with_readback(
+            project, workspaces, str(self.workspace),
+            before_publish=lambda reviewed: self.server._ensure_active_workspace_project_capture(
+                project, reviewed, context
+            ),
+        )
+        self.assertEqual(project.replay_service().status()["captureCount"], 0)
+        with mock.patch.object(project, "import_capture", wraps=project.import_capture) as importer:
+            gate_bytes = self.gate_path.read_bytes()
+            self.gate_path.unlink()
+            with self.assertRaisesRegex(RuntimeError, "publication gate"):
+                publish()
+            self.gate_path.write_bytes(gate_bytes)
+            catalog_bytes = catalog_path.read_bytes()
+            catalog_path.write_bytes(catalog_bytes + b"\n")
+            with self.assertRaisesRegex(RuntimeError, "catalog hash changed"):
+                publish()
+            catalog_path.write_bytes(catalog_bytes)
+            self.context["capture"]["captureSessionId"] = "f" * 32
+            with self.assertRaisesRegex(RuntimeError, "capture/session changed"):
+                publish()
+            self.context["capture"]["captureSessionId"] = "d" * 32
+            self.assertEqual(project.replay_service().status()["captureCount"], 0)
+            importer.assert_not_called()
+            result = publish()
+            self.assertEqual(project.replay_service().status()["captureCount"], 1)
+            self.assertEqual(project.replay_service().status()["knowledgeCounts"]["workspaces"], 1)
+            self.assertEqual(result["knowledge"]["captureId"], fixture.capture_id)
+            published_source = project.replay_service().root / result["knowledge"]["sourcePath"]
+            self.assertEqual(published_source.read_bytes(), self.source_path.read_bytes())
+            publish()
+            self.assertEqual(importer.call_count, 1)
+            self.assertEqual(importer.call_args.kwargs, {
+                "expected_capture_id": fixture.capture_id,
+                "expected_capture_path": "D:/captures/frame.rdc", "expected_api": "D3D11",
+            })
+
+    def test_registration_rejects_stale_compiled_gate_before_write(self):
+        gate = json.loads(self.gate_path.read_text(encoding="utf-8"))
+        gate["finalBinding"]["candidateRawSha256"] = "0" * 64
+        self.gate_path.write_text(json.dumps(gate), encoding="utf-8")
+        with mock.patch.object(
+            self.server, "_shader_workspace_service", return_value=self.workspaces
+        ):
+            result = json.loads(
+                self.server.register_active_project_workspace(str(self.workspace))
+            )
+        self.assertEqual(result["schema"], "replaylab-active-project-mcp-error/v1")
+        self.assertIn("stale", result["error"])
         self.assertIsNone(self.active.registered)
 
 

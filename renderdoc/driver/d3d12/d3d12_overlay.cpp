@@ -868,6 +868,7 @@ RenderOutputSubresource D3D12Replay::GetRenderOutputSubresource(ResourceId id)
 ResourceId D3D12Replay::RenderOverlay(ResourceId texid, FloatVector clearCol, DebugOverlay overlay,
                                       uint32_t eventId, const rdcarray<uint32_t> &passEvents)
 {
+  m_pDevice->InvalidateLiveForward("overlayAnalysis");
   ID3D12Resource *resource = NULL;
 
   {

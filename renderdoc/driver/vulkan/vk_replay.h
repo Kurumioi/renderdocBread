@@ -371,6 +371,10 @@ public:
 
   RDResult ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
   void ReplayLog(uint32_t endEventID, ReplayLogType replayType);
+  void ConfigureReplayCheckpoints(const ReplayCheckpointConfig &config,
+                                 const rdcarray<ReplayCheckpointCandidate> &candidates) override;
+  void InvalidateReplayCheckpoints(uint32_t firstAffectedEvent = 0) override;
+  ReplayCheckpointStats GetReplayCheckpointStats() override;
   SDFile *GetStructuredFile();
 
   rdcarray<uint32_t> GetPassEvents(uint32_t eventId);
@@ -421,6 +425,8 @@ public:
 
   void ReplaceResource(ResourceId from, ResourceId to);
   void RemoveReplacement(ResourceId id);
+  rdcstr ReplaceTargetShaderChecked(ResourceId from, ResourceId to);
+  rdcstr RemoveTargetShaderReplacementChecked(ResourceId id);
   void ClearReplayCache();
   void ReloadShaderDebugInformation();
 
@@ -477,11 +483,17 @@ public:
 
   ResourceId CreateProxyTexture(const TextureDescription &templateTex);
   void SetProxyTextureData(ResourceId texid, const Subresource &sub, byte *data, size_t dataSize);
+  ResourceId CreateTextureSnapshot(ResourceId source, const Subresource &sourceSub,
+                                   CompType typeCast, Subresource &snapshotSub);
+  void FreeTextureSnapshot(ResourceId snapshot);
+  void FreeTextureSnapshots(const rdcarray<ResourceId> &snapshots);
   bool IsTextureSupported(const TextureDescription &tex);
   bool NeedRemapForFetch(const ResourceFormat &format);
 
   ResourceId CreateProxyBuffer(const BufferDescription &templateBuf);
   void SetProxyBufferData(ResourceId bufid, byte *data, size_t dataSize);
+  rdcstr SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches) override;
+  uint32_t GetReplayBufferPatchFirstAffectedEvent() const override;
 
   RenderOutputSubresource GetRenderOutputSubresource(ResourceId id);
   bool IsRenderOutput(ResourceId id) { return GetRenderOutputSubresource(id).mip != ~0U; }
@@ -505,7 +517,16 @@ public:
   bool Depth3DSupported() { return m_TexRender.DummyImages[3][2] != VK_NULL_HANDLE; }
   bool DepthCubeSupported() { return m_TexRender.DepthCubesSupported; }
 private:
+  struct TextureSnapshot
+  {
+    ResourceId id;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+  };
+  rdcarray<TextureSnapshot> m_TextureSnapshots;
+
   bool FetchShaderFeedback(uint32_t eventId);
+  void DestroyTextureSnapshotViews(ResourceId snapshot);
   void ClearFeedbackCache();
 
   void FillDescriptor(Descriptor &dstel, const DescriptorSetSlot &srcel);
@@ -517,6 +538,7 @@ private:
   void ClearPostVSCache();
 
   void RefreshDerivedReplacements();
+  rdcstr RefreshDerivedReplacementsChecked(ResourceId requiredShader = ResourceId());
   void ModifyReplacementIfShaderEXT(ResourceId from, ResourceId &to);
 
   bool RenderTextureInternal(TextureDisplay cfg, const ImageState &imageState,

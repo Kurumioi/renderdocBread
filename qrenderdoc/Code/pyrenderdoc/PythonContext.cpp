@@ -1818,6 +1818,31 @@ QStringList PythonContext::completionOptions(QString base)
   return ret;
 }
 
+void PythonContext::InvalidateNativeQtObject(QObject *object)
+{
+#if PYSIDE2_ENABLED
+  if(!object || !initialised() || !Py_IsInitialized())
+    return;
+
+  // Native widgets created outside PySide have no generated wrapper destructor to notify
+  // Shiboken. Their borrowed QWidget wrapper can gain ownership when removed from a Python
+  // container. Revoke that ownership and invalidate the wrapper before native deletion, so
+  // releasing the final Python reference cannot destruct the same QObject a second time.
+  PyGILState_STATE gil = PyGILState_Ensure();
+  SbkObject *wrapper = Shiboken::BindingManager::instance().retrieveWrapper(object);
+  if(wrapper)
+  {
+    // Removing the PySide parent relationship may release its last retained reference.
+    Py_INCREF(reinterpret_cast<PyObject *>(wrapper));
+    Shiboken::Object::releaseOwnership(wrapper);
+    Shiboken::Object::invalidate(wrapper);
+    Shiboken::Object::removeParent(wrapper, false);
+    Py_DECREF(reinterpret_cast<PyObject *>(wrapper));
+  }
+  PyGILState_Release(gil);
+#endif
+}
+
 PyObject *PythonContext::QtObjectToPython(const char *typeName, QObject *object)
 {
 #if PYSIDE2_ENABLED

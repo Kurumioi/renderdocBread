@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-MODULE_PATH = REPOSITORY / "renderdoc_mcp_bridge" / "pass_panel.py"
+MODULE_PATH = REPOSITORY / "renderdoc_mcp_bridge" / "project_pass_panel.py"
 CAPTURE_A = "a" * 64
 CAPTURE_B = "b" * 64
 
@@ -90,6 +90,13 @@ def _classification(capture_id=CAPTURE_A, *, proposal=False, indirect=False):
             "writeResourceCount": 1,
             "fullscreen": True,
         },
+        "actualWorkState": "output-affecting-candidate",
+        "participation": {
+            "issuedAction": True,
+            "nonZeroWorkload": True,
+            "outputAffectingCandidate": True,
+            "observedContributor": False,
+        },
         "limitations": ["Pass semantics are inferred."],
     }
     if proposal:
@@ -145,6 +152,10 @@ def _classification(capture_id=CAPTURE_A, *, proposal=False, indirect=False):
             "markerContextCount": 0,
             "duplicateCount": 0,
             "categoryCounts": {category: 1},
+            "sourceTruncated": False,
+            "omittedActionCountLowerBound": 0,
+            "truncationReasons": [],
+            "effectiveMaxActions": 2500,
         },
         "policy": {
             "classificationAuthority": "FixedProgram",
@@ -169,6 +180,11 @@ class _Widget:
         self.destroyed = False
         self.enabled = True
         self.checked = False
+        self.properties = {}
+
+    def setProperty(self, name, value):
+        self.properties[str(name)] = value
+        return True
 
     def click(self):
         if self.callback:
@@ -291,7 +307,7 @@ class PassPanelValidationTests(unittest.TestCase):
         self.assertEqual(clean["nodeCount"], 4)
         self.assertEqual(set(clean["items"][41]), {
             "eventId", "name", "category", "subcategory", "confidence",
-            "semanticProposal"
+            "actualWorkState", "participation", "semanticProposal"
         })
         self.assertNotIn("shaders", clean["items"][41])
         self.assertNotIn("targets", clean["items"][41])
@@ -342,6 +358,21 @@ class PassPanelValidationTests(unittest.TestCase):
         with self.assertRaises(panel_module.PassPanelError):
             panel_module.validate_classification(wrong_count)
 
+    def test_actual_work_state_must_match_fixed_participation(self):
+        value = _classification()
+        value["items"][0]["actualWorkState"] = "observed-contributor"
+        with self.assertRaisesRegex(
+            panel_module.PassPanelError, "disagrees with participation"
+        ):
+            panel_module.validate_classification(value)
+
+        missing = _classification()
+        del missing["items"][0]["participation"]
+        with self.assertRaisesRegex(
+            panel_module.PassPanelError, "participation must be an object"
+        ):
+            panel_module.validate_classification(missing)
+
     def test_node_and_text_limits_are_enforced(self):
         with self.assertRaisesRegex(panel_module.PassPanelError, "node limit"):
             panel_module.validate_classification(_classification(), maximum_nodes=3)
@@ -349,6 +380,27 @@ class PassPanelValidationTests(unittest.TestCase):
         value["items"][0]["name"] = "x" * (panel_module.MAX_LABEL + 1)
         with self.assertRaises(panel_module.PassPanelError):
             panel_module.validate_classification(value)
+
+    def test_dynamic_text_policy_allows_html_and_rationale_lf_but_rejects_controls(self):
+        html = _classification(proposal=True)
+        html["items"][0]["semanticProposal"]["displayLabel"] = "<b>literal</b>"
+        html["items"][0]["semanticProposal"]["rationale"] = "line one\nline two"
+        clean = panel_module.validate_classification(html)
+        self.assertEqual(
+            clean["items"][41]["semanticProposal"]["displayLabel"],
+            "<b>literal</b>",
+        )
+        self.assertEqual(
+            clean["items"][41]["semanticProposal"]["rationale"],
+            "line one\nline two",
+        )
+
+        for payload in ("line one\nline two", "unsafe\u202elabel"):
+            with self.subTest(payload=repr(payload)):
+                value = _classification(proposal=True)
+                value["items"][0]["semanticProposal"]["displayLabel"] = payload
+                with self.assertRaises(panel_module.PassPanelError):
+                    panel_module.validate_classification(value)
 
 
 class MiniQtPassPanelTests(unittest.TestCase):
@@ -371,7 +423,7 @@ class MiniQtPassPanelTests(unittest.TestCase):
         self.assertEqual(status["provisionalOverlayCount"], 0)
         groups = [widget for widget in self.context.mini.widgets if widget.kind == "group"]
         self.assertEqual([widget.text for widget in groups[-3:]], [
-            "Post (1)", "ToneMap (1)", "PostProcess (1)"
+            "Post (1)", "Tone Map (1)", "PostProcess (1)"
         ])
         self.assertTrue(all(widget.collapsible for widget in groups[-3:]))
         button = self.panel._event_buttons[41]
@@ -379,13 +431,57 @@ class MiniQtPassPanelTests(unittest.TestCase):
         button.click()
         self.assertEqual(self.selected, [41])
         self.assertEqual(self.context.mini.GetWidgetText(self.panel.status_label),
-                         "Selected EID 41")
+                         "Selected EID 41.")
+        labels = [
+            widget for widget in self.context.mini.widgets
+            if widget.kind == "label"
+        ]
+        self.assertTrue(labels)
+        self.assertTrue(all(
+            widget.properties.get("textFormat") == panel_module.QtCore.Qt.PlainText
+            for widget in labels
+        ))
+
+    def test_truncated_source_warning_and_status_preserve_bounded_receipt(self):
+        value = _classification()
+        value["summary"].update({
+            "sourceTruncated": True,
+            "omittedActionCountLowerBound": 17,
+            "truncationReasons": ["action-limit", "driver-diagnostic"],
+            "effectiveMaxActions": 2500,
+        })
+        status = self.panel.load(value)
+        self.assertTrue(status["sourceTruncated"])
+        self.assertEqual(status["omittedActionCountLowerBound"], 17)
+        self.assertEqual(
+            status["truncationReasons"], ["action-limit", "driver-diagnostic"])
+        self.assertEqual(status["effectiveMaxActions"], 2500)
+        self.assertIn("at least 17 action(s) were omitted", self.panel.warning_label.text)
+        self.assertIn("action limit", self.panel.warning_label.text)
+        # Unknown backend diagnostics remain raw instead of becoming a
+        # translation lookup key.
+        self.assertIn("driver-diagnostic", self.panel.warning_label.text)
+
+    def test_html_ai_label_is_plain_text(self):
+        value = _classification(proposal=True)
+        value["items"][0]["semanticProposal"]["displayLabel"] = "<b>literal</b>"
+        self.panel.load(value)
+        proposal = next(
+            widget for widget in self.context.mini.widgets
+            if widget.kind == "label" and "AIProvisional:" in widget.text
+        )
+        self.assertEqual(proposal.text, "AIProvisional: <b>literal</b>")
+        self.assertEqual(
+            proposal.properties.get("textFormat"),
+            panel_module.QtCore.Qt.PlainText,
+        )
 
     def test_indirect_and_ai_provisional_are_visually_separate(self):
         self.panel.load(_classification(proposal=True, indirect=True))
         texts = [widget.text for widget in self.context.mini.widgets]
         self.assertIn("ExecuteIndirect · ExecuteIndirect(1) (1)", texts)
-        self.assertIn("Fixed: probable", texts)
+        self.assertIn("Fixed: Probable", texts)
+        self.assertIn("Work: Output-affecting candidate", texts)
         self.assertIn("AIProvisional: Candidate final tone mapping", texts)
         self.assertTrue(self.panel._event_buttons[41].text.startswith("Indirect EID 41"))
         groups = [widget for widget in self.context.mini.widgets if widget.kind == "group"]

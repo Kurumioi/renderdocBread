@@ -269,6 +269,107 @@ class ShaderWorkspaceWatcherTests(unittest.TestCase):
             manager.start(self.root, 100)
         self.assertEqual(service.compile_hashes, [])
 
+    def test_stale_toolchain_reports_refresh_before_and_after_source_lease(self) -> None:
+        diagnostic = "workspace route catalog differs from the process-owned path"
+        for after_lease in (False, True):
+            for persistent in (False, True):
+                with self.subTest(after_lease=after_lease, persistent=persistent):
+                    service = _FakeWorkspaceService(self.root)
+                    original_status = service.status
+                    calls = []
+
+                    def stale_status(workspace_path):
+                        status = original_status(workspace_path)
+                        calls.append(status)
+                        if not after_lease or len(calls) == 2:
+                            status["representation"]["compileEligible"] = False
+                            status["toolchainStatus"] = "refresh-required"
+                            status["toolchainDiagnostic"] = diagnostic
+                        return status
+
+                    service.status = stale_status
+                    manager = self._manager(service)
+                    start = manager.start_persistent if persistent else manager.start
+                    with self.assertRaises(WorkspaceWatchError) as caught:
+                        start(self.root, 100)
+                    message = str(caught.exception)
+                    self.assertIn("requires a toolchain refresh", message)
+                    self.assertIn(diagnostic, message)
+                    self.assertIn("migrate_shader_workspace_toolchain(in_place=true)", message)
+                    self.assertIn("get_shader_workspace_status.requiredAction", message)
+                    self.assertNotIn("requires the executable-editable", message)
+                    self.assertEqual(len(calls), 2 if after_lease else 1)
+                    self.assertFalse((self.root / ".workspace-watch.lock").exists())
+                    self.assertEqual(manager._jobs, {})
+                    self.assertEqual(service.compile_hashes, [])
+                    self.assertEqual(self.source.read_bytes(), self.initial)
+
+    def test_toolchain_refresh_diagnostic_is_bounded_without_copying_action_payload(self) -> None:
+        service = _FakeWorkspaceService(self.root)
+        status = service.status(self.root)
+        status["representation"]["compileEligible"] = False
+        status["toolchainStatus"] = "refresh-required"
+        status["toolchainDiagnostic"] = "changed tool: " + "x" * 10000
+        status["requiredAction"] = {"tool": "never-execute-this-action", "payload": "y" * 10000}
+        service.status = lambda _path: status
+        manager = self._manager(service)
+        with self.assertRaises(WorkspaceWatchError) as caught:
+            manager.start(self.root, 100)
+        message = str(caught.exception)
+        self.assertLess(len(message), 1400)
+        self.assertIn("changed tool: ", message)
+        self.assertIn("[truncated]", message)
+        self.assertIn("migrate_shader_workspace_toolchain(in_place=true)", message)
+        self.assertNotIn("never-execute-this-action", message)
+        self.assertNotIn("yyyy", message)
+        self.assertEqual(service.compile_hashes, [])
+        self.assertFalse((self.root / ".workspace-watch.lock").exists())
+
+    def test_refresh_flag_never_masks_missing_source_wrong_lane_or_changed_identity(self) -> None:
+        for after_lease in (False, True):
+            faults = ["missing-source", "source-lane", "representation-lane", "no-stale-status"]
+            if after_lease:
+                faults.append("workspace-identity")
+            for fault in faults:
+                with self.subTest(after_lease=after_lease, fault=fault):
+                    service = _FakeWorkspaceService(self.root)
+                    original_status = service.status
+                    calls = []
+
+                    def invalid_status(workspace_path):
+                        status = original_status(workspace_path)
+                        calls.append(status)
+                        if not after_lease or len(calls) == 2:
+                            status["representation"]["compileEligible"] = False
+                            status["toolchainStatus"] = "refresh-required"
+                            status["toolchainDiagnostic"] = "must not mask the source error"
+                            if fault == "missing-source":
+                                status["source"]["present"] = False
+                            elif fault == "source-lane":
+                                status["source"]["lane"] = "explanatory-ir"
+                            elif fault == "representation-lane":
+                                status["representation"]["lane"] = "explanatory-ir"
+                            elif fault == "workspace-identity":
+                                status["workspacePath"] = str(self.root / "different-workspace")
+                            else:
+                                status.pop("toolchainStatus")
+                        return status
+
+                    service.status = invalid_status
+                    manager = self._manager(service)
+                    expected = (
+                        "workspace identity/lane changed" if after_lease else
+                        "tracked decompiled source" if fault == "missing-source" else
+                        "requires the executable-editable shader lane")
+                    with self.assertRaisesRegex(WorkspaceWatchError, expected) as caught:
+                        manager.start(self.root, 100)
+                    self.assertNotIn("toolchain refresh", str(caught.exception))
+                    self.assertNotIn("must not mask", str(caught.exception))
+                    self.assertEqual(manager._jobs, {})
+                    self.assertEqual(service.compile_hashes, [])
+                    self.assertFalse((self.root / ".workspace-watch.lock").exists())
+                    self.assertEqual(self.source.read_bytes(), self.initial)
+
     def test_compile_failure_is_audited_and_new_hash_can_recover(self) -> None:
         service = _FakeWorkspaceService(self.root, fail_first=True)
         manager = self._manager(service)
@@ -657,6 +758,36 @@ class ShaderWorkspaceWatcherTests(unittest.TestCase):
             json.loads(archive.read_text(encoding="utf-8")), old_payload
         )
         self.assertTrue(current.release())
+
+    def test_explicit_migration_takeover_archives_exact_legacy_lease(self) -> None:
+        legacy = WorkspaceSourceTransactionLease(self.root)
+        legacy.acquire()
+        lease_path = self.root / ".workspace-watch.lock"
+        legacy_payload = lease_path.read_bytes()
+        legacy_token = legacy_payload.decode("ascii").strip()
+
+        current = WorkspaceSourceTransactionLease(
+            self.root,
+            owner_instance_id="2" * 32,
+            recover_orphaned=True,
+            recover_legacy=True,
+        )
+        current.acquire()
+        archive = self.root / "watch" / (
+            "orphaned-legacy-lease-%s.lock" % legacy_token
+        )
+        self.assertEqual(archive.read_bytes(), legacy_payload)
+        new_payload = json.loads(lease_path.read_text(encoding="utf-8"))
+        self.assertEqual(new_payload["ownerInstanceId"], "2" * 32)
+        self.assertTrue(current.release())
+
+    def test_legacy_takeover_requires_process_owner_and_explicit_recovery(self) -> None:
+        with self.assertRaisesRegex(Exception, "legacy lease recovery"):
+            WorkspaceSourceTransactionLease(
+                self.root,
+                owner_instance_id="2" * 32,
+                recover_legacy=True,
+            )
 
     def test_persistent_host_resume_never_steals_same_generation_lease(self) -> None:
         previous = WorkspaceSourceTransactionLease(

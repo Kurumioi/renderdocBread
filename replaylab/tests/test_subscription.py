@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from replaylab_agent.cli import _parser, _subscription_command
+from replaylab_agent.catalog import get_preset
 from replaylab_agent.errors import ConfigurationError, ConnectorError
 from replaylab_agent.profiles import Profile, ProfileStore
 
@@ -53,6 +54,86 @@ def test_known_subscription_message_ids_are_covered_by_qrenderdoc() -> None:
 
     assert python_ids
     assert python_ids <= native_ids, sorted(python_ids - native_ids)
+
+
+def test_qrenderdoc_exposes_agent_catalog_and_preserves_acp_save_contract() -> None:
+    from replaylab_agent.catalog import PRESETS
+
+    assistant_source = (
+        REPOSITORY_ROOT / "qrenderdoc" / "Windows" / "AI" / "AIAssistant.cpp"
+    ).read_text(encoding="utf-8")
+    filter_start = assistant_source.index("bool supportedQRenderDocConnection(")
+    filter_end = assistant_source.index("QString internalConnectionId()", filter_start)
+    filter_source = assistant_source[filter_start:filter_end]
+    translation_start = assistant_source.index(
+        "static const ProviderCatalogTranslation providerCatalogTranslations[]"
+    )
+    translation_end = assistant_source.index("};", translation_start)
+    translation_source = assistant_source[translation_start:translation_end]
+    entry_pattern = re.compile(
+        r'\{"(?P<preset>[^"]+)",\s*"(?P<field>[^"]+)",\s*'
+        r'QT_TRANSLATE_NOOP3\(\s*"AIAssistant",\s*'
+        r'(?P<source>(?:"(?:\\.|[^"\\])*"\s*)+),\s*'
+        r'"(?P<disambiguation>[^"]+)"\)\},',
+        re.DOTALL,
+    )
+    translated_catalog = {}
+    for match in entry_pattern.finditer(translation_source):
+        translated_catalog[(match.group("preset"), match.group("field"))] = "".join(
+            ast.literal_eval(token)
+            for token in re.findall(r'"(?:\\.|[^"\\])*"', match.group("source"))
+        )
+
+    assert 'const QString acpProtocol = lit("acp")' in filter_source
+    assert "protocol == acpProtocol" in filter_source
+    for preset in (item for item in PRESETS if item.kind == "agent"):
+        assert f'{{"{preset.id}", "title"' in translation_source
+    for preset in PRESETS:
+        for field in ("title", "note", "install_hint", "subscription_instruction"):
+            source = getattr(preset, field)
+            if source:
+                assert translated_catalog[(preset.id, field)] == source
+
+    assert 'tr("Agent Subscription (ACP / app-server)")' in assistant_source
+    assert "QPlainTextEdit *agentCommand" in assistant_source
+    assert "QCheckBox *trustACP" in assistant_source
+    assert 'preset.value(lit("subscriptionLoginMode"))' in assistant_source
+    assert "connectSubscription->setEnabled(!editing || savedProviderSelected)" in assistant_source
+    assert "if(!selectedProviderMatchesEditingProfile())" in assistant_source
+    assert "state->presetId = selectedPresetId()" in assistant_source
+    assert "agentProvider->setEnabled(false)" in assistant_source
+    assert "modelsBox->setEnabled(false)" in assistant_source
+    assert "profileExists && selectedProviderMatchesEditingProfile()" in assistant_source
+    assert "if(index < 0 && selectedProviderMatchesEditingProfile())" in assistant_source
+    assert 'QLatin1String("subscription.terminal-opened")' in assistant_source
+    assert 'lit("subscription_instruction"), fallback, &matched' in assistant_source
+    assert 'lit("allow_unsandboxed_agent=true")' in assistant_source
+    assert 'arguments << lit("--command-json")' in assistant_source
+    assert 'arguments << lit("--command-json") << lit("[]")' in assistant_source
+    assert "exact non-editable command" in assistant_source
+    assert "read-only command" not in assistant_source
+
+    editor_start = assistant_source.index(
+        "std::function<void(const QJsonObject &)> editConnection"
+    )
+    dialog_start = assistant_source.index("QDialog dialog(page);", editor_start)
+    assert "runCLISync(" not in assistant_source[editor_start:dialog_start]
+
+    credential_start = assistant_source.index(
+        "auto refreshCredentialStatus = [&]() {", dialog_start
+    )
+    credential_end = assistant_source.index(
+        "auto deleteStoredCredential", credential_start
+    )
+    credential_source = assistant_source[credential_start:credential_end]
+    assert "runCLISync(" not in credential_source
+    assert "(*profileCommandRunner)(" in credential_source
+
+    auth_start = assistant_source.index("auto updateAuthStatus = [&]() {", dialog_start)
+    auth_end = assistant_source.index("connect(agentProvider,", auth_start)
+    auth_source = assistant_source[auth_start:auth_end]
+    assert "runCLISync(" not in auth_source
+    assert "(*profileCommandRunner)(" in auth_source
 
 
 def test_known_subscription_events_require_ids_except_raw_exception_diagnostics() -> None:
@@ -166,11 +247,12 @@ def _store(tmp_path, profile=None):
 def test_subscription_parser_requires_gate_and_preserves_codex_flow() -> None:
     parser = _parser()
     status = parser.parse_args(
-        ["subscription", "status", "--profile", "codex-main", "--json"]
+        ["profile", "subscription", "status", "--profile", "codex-main", "--json"]
     )
     assert status.subscription_command == "status"
     connect = parser.parse_args(
         [
+            "profile",
             "subscription",
             "connect",
             "--profile",
@@ -185,11 +267,11 @@ def test_subscription_parser_requires_gate_and_preserves_codex_flow() -> None:
     assert connect.start_gated is True
     with pytest.raises(SystemExit):
         parser.parse_args(
-            ["subscription", "connect", "--profile", "codex-main", "--json"]
+            ["profile", "subscription", "connect", "--profile", "codex-main", "--json"]
         )
     with pytest.raises(SystemExit):
         parser.parse_args(
-            ["subscription", "test", "--profile", "codex-main", "--json"]
+            ["profile", "subscription", "test", "--profile", "codex-main", "--json"]
         )
 
 
@@ -220,7 +302,7 @@ async def test_subscription_status_only_detects_and_never_constructs_backend(
         },
     )
     args = _parser().parse_args(
-        ["subscription", "status", "--profile", "codex-main", "--json"]
+        ["profile", "subscription", "status", "--profile", "codex-main", "--json"]
     )
 
     def forbidden_backend(*args, **kwargs):
@@ -241,11 +323,10 @@ async def test_gate_cancel_is_structured_and_never_calls_vendor(tmp_path, monkey
     created: list[FakeSubscriptionBackend] = []
     monkeypatch.setattr(cli, "_print_machine_json", emitted.append)
 
-    def cancel_gate(loop, start, cancel, *, start_gated):
-        assert start_gated is True
+    def cancel_gate(loop, start, cancel):
         loop.call_soon(cancel.set)
 
-    monkeypatch.setattr(cli, "_start_login_control_reader", cancel_gate)
+    monkeypatch.setattr(cli, "_start_subscription_control_reader", cancel_gate)
 
     def factory(profile, *, timeout, emit):
         backend = FakeSubscriptionBackend(profile, timeout=timeout, emit=emit)
@@ -254,6 +335,7 @@ async def test_gate_cancel_is_structured_and_never_calls_vendor(tmp_path, monkey
 
     args = _parser().parse_args(
         [
+            "profile",
             "subscription",
             "connect",
             "--profile",
@@ -279,11 +361,10 @@ async def test_connect_and_test_emit_stable_terminal_events(tmp_path, monkeypatc
     backends: list[FakeSubscriptionBackend] = []
     monkeypatch.setattr(cli, "_print_machine_json", emitted.append)
 
-    def start_gate(loop, start, cancel, *, start_gated):
-        assert start_gated is True
+    def start_gate(loop, start, cancel):
         loop.call_soon(start.set)
 
-    monkeypatch.setattr(cli, "_start_login_control_reader", start_gate)
+    monkeypatch.setattr(cli, "_start_subscription_control_reader", start_gate)
 
     def factory(profile, *, timeout, emit):
         backend = FakeSubscriptionBackend(profile, timeout=timeout, emit=emit)
@@ -292,6 +373,7 @@ async def test_connect_and_test_emit_stable_terminal_events(tmp_path, monkeypatc
 
     connect = _parser().parse_args(
         [
+            "profile",
             "subscription",
             "connect",
             "--profile",
@@ -317,6 +399,7 @@ async def test_connect_and_test_emit_stable_terminal_events(tmp_path, monkeypatc
     emitted.clear()
     test = _parser().parse_args(
         [
+            "profile",
             "subscription",
             "test",
             "--profile",
@@ -348,8 +431,8 @@ async def test_first_codex_browser_login_reaches_both_terminal_events(
     monkeypatch.setattr(cli, "_print_machine_json", emitted.append)
     monkeypatch.setattr(
         cli,
-        "_start_login_control_reader",
-        lambda loop, start, cancel, *, start_gated: loop.call_soon(start.set),
+        "_start_subscription_control_reader",
+        lambda loop, start, cancel: loop.call_soon(start.set),
     )
     monkeypatch.setattr(
         subscription,
@@ -377,6 +460,7 @@ async def test_first_codex_browser_login_reaches_both_terminal_events(
 
     args = _parser().parse_args(
         [
+            "profile",
             "subscription",
             "connect",
             "--profile",
@@ -416,8 +500,8 @@ async def test_missing_cli_returns_structured_completion_after_gate(
     monkeypatch.setattr(cli, "_print_machine_json", emitted.append)
     monkeypatch.setattr(
         cli,
-        "_start_login_control_reader",
-        lambda loop, start, cancel, *, start_gated: loop.call_soon(start.set),
+        "_start_subscription_control_reader",
+        lambda loop, start, cancel: loop.call_soon(start.set),
     )
 
     def factory(profile, *, timeout, emit):
@@ -427,6 +511,7 @@ async def test_missing_cli_returns_structured_completion_after_gate(
 
     args = _parser().parse_args(
         [
+            "profile",
             "subscription",
             "test",
             "--profile",
@@ -956,7 +1041,7 @@ def test_device_authorization_parser_emits_only_url_and_code() -> None:
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows console flags are platform-specific")
 @pytest.mark.asyncio
-@pytest.mark.parametrize("preset", ["gemini-acp", "qwen-acp"])
+@pytest.mark.parametrize("preset", ["gemini-acp", "qwen-acp", "codebuddy-acp"])
 async def test_terminal_login_uses_catalog_command_and_contained_workspace(
     preset, tmp_path, monkeypatch
 ) -> None:
@@ -1005,11 +1090,81 @@ async def test_terminal_login_uses_catalog_command_and_contained_workspace(
             backend._resolved_profile(), asyncio.Event()
         )
         argv, kwargs = launches[0]
-        assert argv == [f"C:/trusted/{preset.removesuffix('-acp')}.cmd"]
+        assert argv == [
+            f"C:/trusted/{preset.removesuffix('-acp')}.cmd",
+            *get_preset(preset).subscription_login[1:],
+        ]
         assert kwargs["cwd"] == str(backend.workspace)
         assert kwargs["creationflags"] & subprocess.CREATE_NEW_CONSOLE
         assert kwargs["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP
         assert "OPENAI_API_KEY" not in kwargs["env"]
+        if preset == "codebuddy-acp":
+            assert kwargs["env"]["CODEBUDDY_CONFIG_DIR"] == str(
+                (tmp_path / "ReplayLab" / "codebuddy" / preset).resolve()
+            )
+    finally:
+        backend.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows console flags are platform-specific")
+@pytest.mark.asyncio
+async def test_claude_login_and_acp_share_the_profile_scoped_state_root(
+    tmp_path, monkeypatch
+) -> None:
+    import replaylab_agent.connectors.subscription as subscription
+
+    launches: list[tuple[list[str], dict]] = []
+
+    class FakeProcess:
+        pid = 12345
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+    def fake_popen(argv, **kwargs):
+        launches.append((list(argv), dict(kwargs)))
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        subscription,
+        "resolve_agent_executable",
+        lambda profile, *, environ=None: "C:/trusted/claude-agent-acp.cmd",
+    )
+    monkeypatch.setattr(
+        subscription,
+        "resolve_known_vendor_executable",
+        lambda preset, command, *, environ=None: "C:/trusted/claude.cmd",
+    )
+    backend = subscription.SubscriptionBackend(
+        Profile(
+            "claude-main",
+            "claude-code-acp",
+            options={"allow_unsandboxed_agent": True},
+        ),
+        timeout=5,
+        emit=lambda event: None,
+        environ={
+            "LOCALAPPDATA": str(tmp_path),
+            "PATH": "C:/trusted",
+            "CLAUDE_CONFIG_DIR": str(tmp_path / "global-claude"),
+            "OPENAI_API_KEY": "must-not-leak",
+        },
+        popen_factory=fake_popen,
+    )
+    try:
+        await backend._run_terminal_login(
+            backend._resolved_profile(), asyncio.Event()
+        )
+        argv, kwargs = launches[0]
+        expected = (tmp_path / "ReplayLab" / "claude" / "claude-main").resolve()
+        assert argv == ["C:/trusted/claude.cmd", "setup-token"]
+        assert kwargs["env"]["CLAUDE_CONFIG_DIR"] == str(expected)
+        assert kwargs["env"]["CLAUDE_CONFIG_DIR"] != str(tmp_path / "global-claude")
+        assert "OPENAI_API_KEY" not in kwargs["env"]
+        assert (backend.workspace / ".claude" / "settings.json").is_file()
     finally:
         backend.close()
 

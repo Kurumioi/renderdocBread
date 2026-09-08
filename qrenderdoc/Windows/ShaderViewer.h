@@ -48,6 +48,7 @@ class QMouseEvent;
 class QComboBox;
 class QTimer;
 class QTextEdit;
+class QToolButton;
 
 // from Scintilla
 typedef intptr_t sptr_t;
@@ -274,6 +275,27 @@ private:
   void closeFindOverlay();
   void refreshFindHighlights(bool selectMatch);
 
+  struct TextAttachmentSelection
+  {
+    QString title;
+    QString text;
+    QString source;
+    // Compact replaylab-attachment-context/v1 JSON produced by this first-party viewer. It carries
+    // stable capture/shader identifiers separately from the selected code, which remains untrusted
+    // reference material.
+    QString contextJSON;
+    sptr_t start = -1;
+    sptr_t end = -1;
+
+    bool isValid() const { return !text.isEmpty(); }
+  };
+
+  void registerTextAttachmentEditor(ScintillaEdit *editor);
+  TextAttachmentSelection captureTextAttachmentSelection(ScintillaEdit *editor) const;
+  void updateTextAttachmentSelection(ScintillaEdit *editor);
+  void updateTextAttachmentButtonGeometry();
+  void addTextAttachmentToChat(const TextAttachmentSelection &selection);
+
   QString m_TooltipVarPath;
   int m_TooltipVarIndex = -1;
   int m_TooltipMember = -1;
@@ -300,6 +322,10 @@ private:
   ScintillaEdit *m_FindResults = NULL;
   QList<ScintillaEdit *> m_Scintillas;
   CodeEditorService *m_CodeEditorService = NULL;
+  QToolButton *m_AddToChatButton = NULL;
+  QPointer<ScintillaEdit> m_TextAttachmentEditor;
+  TextAttachmentSelection m_TextAttachmentSelection;
+  bool m_TextAttachmentSelecting = false;
 
   // a map, from a source location to a list of instruction blocks with that location.
   // not every instruction with the instruction will be mapped to, only the first in each contiguous

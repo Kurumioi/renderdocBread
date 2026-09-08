@@ -106,6 +106,85 @@ function Get-ReplayLabIntegrationSourceFiles {
     return @($files | Sort-Object RelativePath)
 }
 
+function Remove-ReplayLabStaleTargetEntries {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][array]$SourceFiles
+    )
+    $safeRoot = Assert-ReplayLabNoReparseComponents $Root (
+        "ReplayLab integration deployment target")
+    $expected = @{}
+    foreach ($sourceFile in $SourceFiles)
+    {
+        $expected[$sourceFile.RelativePath.ToLowerInvariant()] = $true
+    }
+
+    foreach ($targetFile in Get-ChildItem -LiteralPath $safeRoot -File -Recurse -Force)
+    {
+        $relativePath = Get-ReplayLabRelativePath $safeRoot $targetFile.FullName
+        if ($expected.ContainsKey($relativePath.ToLowerInvariant()))
+        {
+            continue
+        }
+        $stalePath = Assert-ReplayLabChildPath $safeRoot $targetFile.FullName
+        Assert-ReplayLabNoReparseComponents $stalePath (
+            "stale ReplayLab integration file '$relativePath'") | Out-Null
+        Remove-Item -LiteralPath $stalePath -Force
+    }
+
+    $targetDirectories = @(Get-ChildItem -LiteralPath $safeRoot -Directory -Recurse -Force |
+        Sort-Object { $_.FullName.Length } -Descending)
+    foreach ($targetDirectory in $targetDirectories)
+    {
+        $relativePath = Get-ReplayLabRelativePath $safeRoot $targetDirectory.FullName
+        $safeDirectory = Assert-ReplayLabChildPath $safeRoot $targetDirectory.FullName
+        Assert-ReplayLabNoReparseComponents $safeDirectory (
+            "ReplayLab integration deployment directory '$relativePath'") | Out-Null
+        if (@(Get-ChildItem -LiteralPath $safeDirectory -Force).Count -eq 0)
+        {
+            Remove-Item -LiteralPath $safeDirectory -Force
+        }
+    }
+}
+
+function Assert-ReplayLabIntegrationTargetStopped {
+    param([Parameter(Mandatory = $true)][string]$TargetRoot)
+
+    $target = [IO.Path]::GetFullPath($TargetRoot).TrimEnd('\', '/')
+    $suffix = '\integrations\replaylab\python\renderdoc_mcp_bridge'
+    if (-not $target.EndsWith($suffix, [StringComparison]::OrdinalIgnoreCase))
+    {
+        throw "Cannot determine the qrenderdoc application directory from the fixed integration target: $target"
+    }
+    $applicationRoot = $target.Substring(0, $target.Length - $suffix.Length)
+    Assert-ReplayLabNoReparseComponents $target "ReplayLab integration deployment target" | Out-Null
+    $running = @(Get-Process -ErrorAction Stop | Where-Object {
+        $_.ProcessName -in @("qrenderdoc", "q_render_soco_doc")
+    })
+    foreach ($candidate in $running)
+    {
+        try
+        {
+            $executablePath = [string]$candidate.Path
+            if ([string]::IsNullOrWhiteSpace($executablePath) -or
+                -not [IO.Path]::IsPathRooted($executablePath))
+            {
+                throw "The process executable path is unavailable."
+            }
+            $processDirectory = [IO.Path]::GetDirectoryName(
+                [IO.Path]::GetFullPath($executablePath)).TrimEnd('\', '/')
+        }
+        catch
+        {
+            throw "Cannot determine the application directory of running qrenderdoc PID $($candidate.Id). No target files were changed."
+        }
+        if ($processDirectory.Equals($applicationRoot, [StringComparison]::OrdinalIgnoreCase))
+        {
+            throw "Close qrenderdoc running from the target application directory before deploying its built-in ReplayLab integration. PID: $($candidate.Id); path: $executablePath. No target files were changed."
+        }
+    }
+}
+
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "../..")).Path
 if ([string]::IsNullOrWhiteSpace($SourceRoot))
 {
@@ -120,14 +199,17 @@ if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container))
 $requiredFiles = @(
     "__init__.py",
     "ai_context.py",
+    "cbuffer_alias_identity.py",
     "dxil_access_signature.py",
     "material_panel.py",
-    "pass_panel.py",
+    "project_pass_panel.py",
     "project_launcher.py",
     "project_restore_client.py",
+    "project_shader_flow_graph.py",
     "project_shader_workspace.py",
     "shader_console.py",
     "shader_editor_client.py",
+    "shader_validation.py",
     "integration.json"
 )
 foreach ($requiredFile in $requiredFiles)
@@ -137,14 +219,6 @@ foreach ($requiredFile in $requiredFiles)
     {
         throw "Required ReplayLab integration source is missing: $requiredPath"
     }
-}
-
-$running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.ProcessName -in @("qrenderdoc", "q_render_soco_doc")
-})
-if ($running.Count -gt 0)
-{
-    throw "Close qrenderdoc before deploying its built-in ReplayLab integration. Running PID(s): $($running.Id -join ', ')"
 }
 
 $sourceFiles = @(Get-ReplayLabIntegrationSourceFiles $SourceRoot)
@@ -159,9 +233,21 @@ if ([string]::IsNullOrWhiteSpace($TargetRoot))
         "x64/{0}/integrations/replaylab/python/renderdoc_mcp_bridge" -f $Configuration)
 }
 $target = [System.IO.Path]::GetFullPath($TargetRoot)
+$sourceBoundary = $SourceRoot.TrimEnd('\')
+$targetBoundary = $target.TrimEnd('\')
+$sourcePrefix = $sourceBoundary + '\'
+$targetPrefix = $targetBoundary + '\'
+if ($sourceBoundary.Equals($targetBoundary, [StringComparison]::OrdinalIgnoreCase) -or
+    $sourceBoundary.StartsWith($targetPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+    $targetBoundary.StartsWith($sourcePrefix, [StringComparison]::OrdinalIgnoreCase))
+{
+    throw "ReplayLab integration source and deployment target must be distinct, non-nested directories."
+}
 
+Assert-ReplayLabIntegrationTargetStopped $target
 New-Item -ItemType Directory -Path $target -Force | Out-Null
 Assert-ReplayLabNoReparseComponents $target "ReplayLab integration deployment target" | Out-Null
+Remove-ReplayLabStaleTargetEntries $target $sourceFiles
 foreach ($sourceFile in $sourceFiles)
 {
     $deployed = Assert-ReplayLabChildPath $target (

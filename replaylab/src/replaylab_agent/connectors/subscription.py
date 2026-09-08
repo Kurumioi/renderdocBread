@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .. import native_vendor
 from ..errors import ConfigurationError, ConnectorError
 from ..process_env import (
     agent_command_argv,
@@ -211,6 +212,7 @@ class SubscriptionBackend:
         if profile.preset == "cursor-acp":
             ensure_cursor_profile_config(profile, environ=self.environ)
             ensure_cursor_workspace(self.workspace)
+        native_vendor.prepare_workspace(profile, self.workspace)
         return external_agent_environment(profile, environ=self.environ)
 
     def _make_codex_connector(
@@ -229,7 +231,11 @@ class SubscriptionBackend:
         profile: Profile, timeout: float, environment: Mapping[str, str]
     ) -> ACPConnector:
         return ACPConnector(
-            profile.argv,
+            native_vendor.runtime_argv(
+                profile,
+                profile.argv,
+                self.workspace,
+            ),
             cwd=self.workspace,
             timeout=timeout,
             env=environment,

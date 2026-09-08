@@ -28,6 +28,8 @@
 #include "driver/ihv/amd/official/DXExt/AmdExtD3D.h"
 #include "driver/ihv/amd/official/DXExt/AmdExtD3DCommandListMarkerApi.h"
 #include "driver/ihv/nv/nv_aftermath.h"
+#include "os/os_specific.h"
+#include "replay/replay_timing.h"
 #include "d3d12_command_list.h"
 #include "d3d12_command_queue.h"
 #include "d3d12_replay.h"
@@ -1459,6 +1461,75 @@ HRESULT WrappedID3D12Device::CreateRootSignature(UINT nodeMask, const void *pBlo
   return ret;
 }
 
+static bool ReplayDescriptorNoopEnabled(WrappedID3D12Device *device)
+{
+  // Isolate this optimisation for same-DLL comparisons without changing other replay sync rules.
+  static const bool disabled =
+      Process::GetEnvVariable("RENDERDOC_D3D12_DISABLE_DESCRIPTOR_NOOP") == "1";
+  return !disabled && !device->ShouldUseConservativeReplaySync();
+}
+
+static bool ReplayDescriptorReferenceIsStable(D3D12ResourceManager *rm, ResourceId id)
+{
+  if(id == ResourceId())
+    return true;
+
+  // Captured D3D12 wrappers retain their captured ID. Check both directions: a descriptor can
+  // contain either the original ID or a replacement's ID after a wrapped Create* call.
+  if(rm->HasReplacement(id) || rm->GetUnreplacedID(id) != id)
+    return false;
+
+  ID3D12DeviceChild *resource = rm->GetResourceWithoutReplacement(id, true);
+  return resource != NULL && GetResID(resource) == id;
+}
+
+static bool CanSkipReplayDescriptorUpdate(D3D12ResourceManager *rm, const D3D12Descriptor &dst,
+                                        const D3D12Descriptor &src)
+{
+  if(!dst.ContentsEqual(src))
+    return false;
+
+  const D3D12DescriptorType type = src.GetType();
+  // GPU addresses can be remapped independently of the stored descriptor. In particular AS
+  // locations have replay fixups, and CBuffer overrides use temporary native buffer addresses.
+  if(type == D3D12DescriptorType::Undefined || type == D3D12DescriptorType::CBV ||
+     (type == D3D12DescriptorType::SRV &&
+      src.GetSRV().ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE))
+    return false;
+
+  if(!ReplayDescriptorReferenceIsStable(rm, dst.GetHeapResourceId()) ||
+     (src.GetHeap() && !ReplayDescriptorReferenceIsStable(rm, src.GetHeapResourceId())))
+    return false;
+
+  if(type == D3D12DescriptorType::Sampler)
+    return true;
+  if(type != D3D12DescriptorType::SRV && type != D3D12DescriptorType::UAV &&
+     type != D3D12DescriptorType::RTV && type != D3D12DescriptorType::DSV)
+    return false;
+
+  return ReplayDescriptorReferenceIsStable(rm, src.GetResResourceId()) &&
+         (type != D3D12DescriptorType::UAV ||
+          ReplayDescriptorReferenceIsStable(rm, src.GetCounterResourceId()));
+}
+
+// Test and execute each copy before inspecting the next source. A previous CPU destination may
+// become a later source in the same serialised batch, including a shader-visible destination.
+template <typename SkipCopy, typename ApplyCopy, typename FinishCopy>
+static bool ReplayDescriptorCopiesInOrder(const rdcarray<DynamicDescriptorCopy> &copies,
+                                         SkipCopy skipCopy, ApplyCopy applyCopy, FinishCopy finishCopy)
+{
+  for(const DynamicDescriptorCopy &copy : copies)
+  {
+    if(skipCopy(copy))
+      AddReplayTimingCounter(ReplayTimingCounter::DescriptorCopiesSkipped);
+    else if(!applyCopy(copy))
+      return false;
+
+    finishCopy(copy);
+  }
+  return true;
+}
+
 template <typename SerialiserType>
 bool WrappedID3D12Device::Serialise_DynamicDescriptorWrite(SerialiserType &ser,
                                                            const DynamicDescriptorWrite *write)
@@ -1474,6 +1545,28 @@ bool WrappedID3D12Device::Serialise_DynamicDescriptorWrite(SerialiserType &ser,
 
     if(handle)
     {
+      if(ReplayDescriptorNoopEnabled(this) &&
+         CanSkipReplayDescriptorUpdate(GetResourceManager(), *handle, desc))
+      {
+        AddReplayTimingCounter(ReplayTimingCounter::DescriptorWritesSkipped);
+        // Preserve captured mutation metadata even though the live contents were not changed.
+        handle->GetHeap()->MarkMutableIndex(handle->GetHeapIndex());
+        return true;
+      }
+
+      // Shader-visible descriptors can still be consumed by submitted work. Captured CPU waits
+      // are not serialised, so complete prior replay work before replacing their live contents.
+      // RTV/DSV and other CPU-only descriptors are consumed while recording command lists.
+      if((handle->GetHeap()->GetDesc().Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+         ReplayDescriptorMutationNeedsWait())
+      {
+        ScopedReplayTimingContext timingContext(ReplayTimingContext::DescriptorWrite);
+        AddReplayTimingCounter(ReplayTimingCounter::DescriptorWriteWaits);
+        ReplayWorkWaitForIdle();
+        if(HasFatalError())
+          return false;
+      }
+
       // safe to pass an invalid heap type to Create() as these descriptors will by definition not
       // be undefined
       RDCASSERT(desc.GetType() != D3D12DescriptorType::Undefined);
@@ -1535,6 +1628,8 @@ void WrappedID3D12Device::CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_V
   }
 
   GetWrapped(DestDescriptor)->Init(pDesc);
+  GetWrapped(DestDescriptor)->GetHeap()->MarkReplayDirtyRange(
+      GetWrapped(DestDescriptor)->GetHeapIndex(), 1);
 }
 
 void WrappedID3D12Device::CreateShaderResourceView(ID3D12Resource *pResource,
@@ -1576,6 +1671,8 @@ void WrappedID3D12Device::CreateShaderResourceView(ID3D12Resource *pResource,
   }
 
   GetWrapped(DestDescriptor)->Init(pResource, pDesc);
+  GetWrapped(DestDescriptor)->GetHeap()->MarkReplayDirtyRange(
+      GetWrapped(DestDescriptor)->GetHeapIndex(), 1);
 
   if(IsReplayMode(m_State) && pDesc)
   {
@@ -1628,6 +1725,8 @@ void WrappedID3D12Device::CreateUnorderedAccessView(ID3D12Resource *pResource,
   }
 
   GetWrapped(DestDescriptor)->Init(pResource, pCounterResource, pDesc);
+  GetWrapped(DestDescriptor)->GetHeap()->MarkReplayDirtyRange(
+      GetWrapped(DestDescriptor)->GetHeapIndex(), 1);
 }
 
 void WrappedID3D12Device::CreateRenderTargetView(ID3D12Resource *pResource,
@@ -1669,6 +1768,8 @@ void WrappedID3D12Device::CreateRenderTargetView(ID3D12Resource *pResource,
   }
 
   GetWrapped(DestDescriptor)->Init(pResource, pDesc);
+  GetWrapped(DestDescriptor)->GetHeap()->MarkReplayDirtyRange(
+      GetWrapped(DestDescriptor)->GetHeapIndex(), 1);
 }
 
 void WrappedID3D12Device::CreateDepthStencilView(ID3D12Resource *pResource,
@@ -1705,6 +1806,8 @@ void WrappedID3D12Device::CreateDepthStencilView(ID3D12Resource *pResource,
   }
 
   GetWrapped(DestDescriptor)->Init(pResource, pDesc);
+  GetWrapped(DestDescriptor)->GetHeap()->MarkReplayDirtyRange(
+      GetWrapped(DestDescriptor)->GetHeapIndex(), 1);
 }
 
 void WrappedID3D12Device::CreateSampler(const D3D12_SAMPLER_DESC *pDesc,
@@ -1737,6 +1840,8 @@ void WrappedID3D12Device::CreateSampler(const D3D12_SAMPLER_DESC *pDesc,
   }
 
   GetWrapped(DestDescriptor)->Init(pDesc);
+  GetWrapped(DestDescriptor)->GetHeap()->MarkReplayDirtyRange(
+      GetWrapped(DestDescriptor)->GetHeapIndex(), 1);
 }
 
 template <typename SerialiserType>
@@ -2139,12 +2244,52 @@ bool WrappedID3D12Device::Serialise_DynamicDescriptorCopies(
 
   if(IsReplayingAndReading())
   {
-    // not optimal, but simple for now. Do a wrapped copy so that internal tracking is also updated
-    for(const DynamicDescriptorCopy &copy : DescriptorCopies)
+    const bool preserveOriginal = !ReplayDescriptorNoopEnabled(this);
+
+    // Keep the original disabled/validation/debug/conservative path and its pre-batch drain.
+    if(preserveOriginal)
     {
-      CopyDescriptorsSimple(1, *copy.dst, *copy.src, copy.type);
-      copy.dst->GetHeap()->MarkMutableIndex(copy.dst->GetHeapIndex());
+      for(const DynamicDescriptorCopy &copy : DescriptorCopies)
+      {
+        if((copy.dst->GetHeap()->GetDesc().Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+           ReplayDescriptorMutationNeedsWait())
+        {
+          ScopedReplayTimingContext timingContext(ReplayTimingContext::DescriptorCopy);
+          AddReplayTimingCounter(ReplayTimingCounter::DescriptorCopyWaits);
+          ReplayWorkWaitForIdle();
+          if(HasFatalError())
+            return false;
+          break;
+        }
+      }
     }
+
+    return ReplayDescriptorCopiesInOrder(
+        DescriptorCopies,
+        [this, preserveOriginal](const DynamicDescriptorCopy &copy) {
+          return !preserveOriginal &&
+                 CanSkipReplayDescriptorUpdate(GetResourceManager(), *copy.dst, *copy.src);
+        },
+        [this, preserveOriginal](const DynamicDescriptorCopy &copy) {
+          // Only a changed shader-visible destination requires waiting for prior consumers.
+          // Do not update its CPU mirror until after the wait succeeds.
+          if(!preserveOriginal &&
+             (copy.dst->GetHeap()->GetDesc().Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
+             ReplayDescriptorMutationNeedsWait())
+          {
+            ScopedReplayTimingContext timingContext(ReplayTimingContext::DescriptorCopy);
+            AddReplayTimingCounter(ReplayTimingCounter::DescriptorCopyWaits);
+            ReplayWorkWaitForIdle();
+            if(HasFatalError())
+              return false;
+          }
+
+          CopyDescriptorsSimple(1, *copy.dst, *copy.src, copy.type);
+          return true;
+        },
+        [](const DynamicDescriptorCopy &copy) {
+          copy.dst->GetHeap()->MarkMutableIndex(copy.dst->GetHeapIndex());
+        });
   }
 
   return true;
@@ -2171,6 +2316,13 @@ void WrappedID3D12Device::CopyDescriptors(
   SERIALISE_TIME_CALL(m_pDevice->CopyDescriptors(
       NumDestDescriptorRanges, dstStarts, pDestDescriptorRangeSizes, NumSrcDescriptorRanges,
       srcStarts, pSrcDescriptorRangeSizes, DescriptorHeapsType));
+
+  for(UINT i = 0; i < NumDestDescriptorRanges; i++)
+  {
+    D3D12Descriptor *first = GetWrapped(pDestDescriptorRangeStarts[i]);
+    first->GetHeap()->MarkReplayDirtyRange(
+        first->GetHeapIndex(), pDestDescriptorRangeSizes ? pDestDescriptorRangeSizes[i] : 1);
+  }
 
   UINT srcRange = 0, dstRange = 0;
   UINT srcIdx = 0, dstIdx = 0;
@@ -2344,6 +2496,7 @@ void WrappedID3D12Device::CopyDescriptorsSimple(UINT NumDescriptors,
 
   for(UINT i = 0; i < NumDescriptors; i++)
     dst[i].CopyFrom(src[i]);
+  dst->GetHeap()->MarkReplayDirtyRange(dst->GetHeapIndex(), NumDescriptors);
 }
 
 HRESULT WrappedID3D12Device::OpenSharedHandleByName(LPCWSTR Name, DWORD Access, HANDLE *pNTHandle)
@@ -2680,6 +2833,144 @@ INSTANTIATE_FUNCTION_SERIALISED(void, WrappedID3D12Device, DynamicDescriptorCopi
 #if ENABLED(ENABLE_UNIT_TESTS)
 
 #include "catch/catch.hpp"
+
+TEST_CASE("D3D12 descriptor equality retains every payload byte", "[d3d12][descriptor][replay]")
+{
+  D3D12Descriptor source;
+  memset(&source, 0, sizeof(source));
+  source.Setup((WrappedID3D12DescriptorHeap *)0x10000, 7);
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Texture2D.MipLevels = 1;
+  source.Init(NULL, &srv);
+
+  D3D12Descriptor destination;
+  destination.Setup((WrappedID3D12DescriptorHeap *)0x20000, 19);
+  destination.CopyFrom(source);
+  CHECK(destination.ContentsEqual(source));
+  CHECK((destination.GetHeap() == (WrappedID3D12DescriptorHeap *)0x20000));
+  CHECK(destination.GetHeapIndex() == 19);
+
+  // Resource IDs, UAV counter storage, view parameters, union tails and floating-point bit
+  // patterns must all participate. Only the heap pointer and index may be ignored.
+  for(size_t offset = sizeof(WrappedID3D12DescriptorHeap *) + sizeof(uint32_t);
+      offset < sizeof(D3D12Descriptor); offset++)
+  {
+    CAPTURE(offset);
+    D3D12Descriptor changed;
+    memcpy(&changed, &source, sizeof(changed));
+    ((byte *)&changed)[offset] ^= 1;
+    CHECK_FALSE(destination.ContentsEqual(changed));
+  }
+
+  D3D12Descriptor undefined;
+  CHECK_FALSE(undefined.ContentsEqual(undefined));
+
+  // Equality alone cannot authorise a native-address descriptor. These guards must reject before
+  // consulting the manager, so no GPU/device is needed to exercise them.
+  D3D12_CONSTANT_BUFFER_VIEW_DESC cbv = {};
+  cbv.BufferLocation = 0x1000;
+  cbv.SizeInBytes = 256;
+  source.Init(&cbv);
+  CHECK_FALSE(CanSkipReplayDescriptorUpdate(NULL, source, source));
+  srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+  srv.RaytracingAccelerationStructure.Location = 0x2000;
+  source.Init(NULL, &srv);
+  CHECK_FALSE(CanSkipReplayDescriptorUpdate(NULL, source, source));
+}
+
+TEST_CASE("D3D12 descriptor batches observe preceding copies", "[d3d12][descriptor][replay]")
+{
+  D3D12Descriptor source, cpu, shaderVisible;
+  memset(&source, 0, sizeof(source));
+  D3D12_SAMPLER_DESC sampler = {};
+  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  sampler.MaxLOD = 2.0f;
+  source.Init(&sampler);
+  memcpy(&cpu, &source, sizeof(cpu));
+  memcpy(&shaderVisible, &source, sizeof(shaderVisible));
+  sampler.MaxLOD = 1.0f;
+  cpu.Init(&sampler);
+  shaderVisible.Init(&sampler);
+
+  rdcarray<DynamicDescriptorCopy> copies;
+  copies.push_back(DynamicDescriptorCopy(&cpu, &source, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
+  copies.push_back(DynamicDescriptorCopy(&shaderVisible, &cpu, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
+  copies.push_back(DynamicDescriptorCopy(&shaderVisible, &source, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
+  uint32_t nativeCopies = 0, waits = 0, skipped = 0, mutableMarks = 0;
+  bool pendingConsumer = true;
+
+  REQUIRE(ReplayDescriptorCopiesInOrder(
+      copies,
+      [&](const DynamicDescriptorCopy &copy) {
+        bool equal = copy.dst->ContentsEqual(*copy.src);
+        skipped += equal ? 1 : 0;
+        return equal;
+      },
+      [&](const DynamicDescriptorCopy &copy) {
+        if(copy.dst == &shaderVisible && pendingConsumer)
+        {
+          // The preceding CPU copy must already be visible when deciding whether to drain.
+          CHECK(cpu.ContentsEqual(source));
+          waits++;
+          pendingConsumer = false;
+        }
+        nativeCopies++;
+        copy.dst->CopyFrom(*copy.src);
+        return true;
+      },
+      [&](const DynamicDescriptorCopy &) { mutableMarks++; }));
+
+  CHECK(nativeCopies == 2);
+  CHECK(waits == 1);
+  CHECK(skipped == 1);
+  CHECK(mutableMarks == 3);
+  CHECK(shaderVisible.ContentsEqual(source));
+
+  SECTION("A wholly unchanged batch does not consume the pending wait")
+  {
+    nativeCopies = waits = skipped = mutableMarks = 0;
+    pendingConsumer = true;
+    REQUIRE(ReplayDescriptorCopiesInOrder(
+        copies, [&](const DynamicDescriptorCopy &copy) { return copy.dst->ContentsEqual(*copy.src); },
+        [&](const DynamicDescriptorCopy &) {
+          nativeCopies++;
+          pendingConsumer = false;
+          return true;
+        },
+        [&](const DynamicDescriptorCopy &) { mutableMarks++; }));
+    CHECK(nativeCopies == 0);
+    CHECK(pendingConsumer);
+    CHECK(mutableMarks == 3);
+  }
+
+  SECTION("A failed wait stops before updating CPU state or inspecting later copies")
+  {
+    cpu.Init(&sampler);
+    shaderVisible.Init(&sampler);
+    uint32_t inspected = 0;
+    mutableMarks = 0;
+    REQUIRE_FALSE(ReplayDescriptorCopiesInOrder(
+        copies,
+        [&](const DynamicDescriptorCopy &copy) {
+          inspected++;
+          return copy.dst->ContentsEqual(*copy.src);
+        },
+        [&](const DynamicDescriptorCopy &copy) {
+          if(copy.dst == &shaderVisible)
+            return false;
+          copy.dst->CopyFrom(*copy.src);
+          return true;
+        },
+        [&](const DynamicDescriptorCopy &) { mutableMarks++; }));
+    CHECK(inspected == 2);
+    CHECK(mutableMarks == 1);
+    CHECK(cpu.ContentsEqual(source));
+    CHECK_FALSE(shaderVisible.ContentsEqual(source));
+  }
+}
 
 // ensure that we don't have to pay attention to the GUID requested and can return our
 // WrappedID3D12Resource anywhere and know it satisfies all possibilities

@@ -35,6 +35,7 @@
 #include <QProgressBar>
 #include <QProgressDialog>
 #include <QShortcut>
+#include <QTabBar>
 #include <QToolButton>
 #include <QToolTip>
 #include "Code/QRDUtils.h"
@@ -46,6 +47,7 @@
 #include "Windows/Dialogs/AboutDialog.h"
 #include "Windows/AI/AIAssistant.h"
 #include "Windows/ApiMonitorWindow.h"
+#include "Windows/BookmarksView.h"
 #include "Windows/Dialogs/CaptureDialog.h"
 #include "Windows/Dialogs/CrashDialog.h"
 #include "Windows/Dialogs/ExtensionManager.h"
@@ -55,6 +57,7 @@
 #include "Windows/Dialogs/SuggestRemoteDialog.h"
 #include "Windows/Dialogs/TipsDialog.h"
 #include "Windows/Dialogs/UpdateDialog.h"
+#include "toolwindowmanager/ToolWindowManagerArea.h"
 #include "ui_MainWindow.h"
 #include "version.h"
 
@@ -1622,7 +1625,7 @@ void MainWindow::LiveCaptureClosed(LiveCapture *live)
   m_LiveCaptures.removeOne(live);
 }
 
-QMenu *MainWindow::GetBaseMenu(WindowMenu base, rdcstr name)
+QMenu *MainWindow::GetBaseMenu(WindowMenu base, rdcstr name, bool showExtensionIcon)
 {
   switch(base)
   {
@@ -1648,7 +1651,8 @@ QMenu *MainWindow::GetBaseMenu(WindowMenu base, rdcstr name)
 
   // no existing menu, add a new one
   QMenu *menu = new QMenu(name, this);
-  menu->setIcon(Icons::plugin());
+  if(showExtensionIcon)
+    menu->setIcon(Icons::plugin());
   ui->menuBar->insertMenu(ui->menu_Help->menuAction(), menu);
   return menu;
 }
@@ -1720,6 +1724,7 @@ void MainWindow::BringToFront()
 
 void MainWindow::LoadInitialLayout()
 {
+  CaptureContext &ctx = static_cast<CaptureContext &>(m_Ctx);
   bool loaded = LoadLayout(0);
 
   // create default layout if layout failed to load
@@ -1754,12 +1759,20 @@ void MainWindow::LoadInitialLayout()
         capDialog, ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
                                                     ui->toolWindowManager->areaOf(textureViewer)));
 
+    QWidget *bookmarksView = ctx.GetBookmarksView();
+
+    ui->toolWindowManager->addToolWindow(
+        bookmarksView,
+        ToolWindowManager::AreaReference(ToolWindowManager::BottomOf,
+                                         ui->toolWindowManager->areaOf(eventBrowser), 0.3f));
+
     QWidget *apiInspector = m_Ctx.GetAPIInspector()->Widget();
 
     ui->toolWindowManager->addToolWindow(
         apiInspector,
-        ToolWindowManager::AreaReference(ToolWindowManager::BottomOf,
-                                         ui->toolWindowManager->areaOf(eventBrowser), 0.3f));
+        ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
+                                         ui->toolWindowManager->areaOf(bookmarksView)));
+    ToolWindowManager::raiseToolWindow(bookmarksView);
 
     QWidget *timelineBar = m_Ctx.GetTimelineBar()->Widget();
 
@@ -2554,8 +2567,53 @@ void MainWindow::on_action_Mesh_Output_triggered()
     ui->toolWindowManager->addToolWindow(meshPreview, mainToolArea());
 }
 
+void MainWindow::on_action_Bookmarks_triggered()
+{
+  CaptureContext &ctx = static_cast<CaptureContext &>(m_Ctx);
+  QWidget *bookmarksView = ctx.GetBookmarksView();
+
+  if(ui->toolWindowManager->toolWindows().contains(bookmarksView))
+  {
+    ToolWindowManager::raiseToolWindow(bookmarksView);
+    return;
+  }
+
+  QWidget *reference = NULL;
+  if(m_Ctx.HasAPIInspector() &&
+     ui->toolWindowManager->toolWindows().contains(m_Ctx.GetAPIInspector()->Widget()))
+    reference = m_Ctx.GetAPIInspector()->Widget();
+  else if(m_Ctx.HasAnnotationViewer() &&
+          ui->toolWindowManager->toolWindows().contains(m_Ctx.GetAnnotationViewer()->Widget()))
+    reference = m_Ctx.GetAnnotationViewer()->Widget();
+
+  if(reference)
+  {
+    ToolWindowManagerArea *area = ui->toolWindowManager->areaOf(reference);
+    ui->toolWindowManager->addToolWindow(
+        bookmarksView, ToolWindowManager::AreaReference(ToolWindowManager::AddTo, area));
+    area = ui->toolWindowManager->areaOf(bookmarksView);
+    area->tabBar()->moveTab(area->indexOf(bookmarksView), area->indexOf(reference));
+  }
+  else if(m_Ctx.HasEventBrowser() &&
+          ui->toolWindowManager->toolWindows().contains(m_Ctx.GetEventBrowser()->Widget()))
+  {
+    ui->toolWindowManager->addToolWindow(
+        bookmarksView,
+        ToolWindowManager::AreaReference(
+            ToolWindowManager::BottomOf,
+            ui->toolWindowManager->areaOf(m_Ctx.GetEventBrowser()->Widget())));
+  }
+  else
+  {
+    ui->toolWindowManager->addToolWindow(bookmarksView, leftToolArea());
+  }
+
+  ToolWindowManager::raiseToolWindow(bookmarksView);
+}
+
 void MainWindow::on_action_API_Inspector_triggered()
 {
+  CaptureContext &ctx = static_cast<CaptureContext &>(m_Ctx);
   QWidget *apiInspector = m_Ctx.GetAPIInspector()->Widget();
 
   if(ui->toolWindowManager->toolWindows().contains(apiInspector))
@@ -2564,7 +2622,14 @@ void MainWindow::on_action_API_Inspector_triggered()
   }
   else
   {
-    if(m_Ctx.HasEventBrowser() &&
+    if(ctx.HasBookmarksView() &&
+       ui->toolWindowManager->toolWindows().contains(ctx.GetBookmarksView()))
+    {
+      ToolWindowManager::AreaReference ref(
+          ToolWindowManager::AddTo, ui->toolWindowManager->areaOf(ctx.GetBookmarksView()));
+      ui->toolWindowManager->addToolWindow(apiInspector, ref);
+    }
+    else if(m_Ctx.HasEventBrowser() &&
        ui->toolWindowManager->toolWindows().contains(m_Ctx.GetEventBrowser()->Widget()))
     {
       ToolWindowManager::AreaReference ref(
@@ -2581,6 +2646,7 @@ void MainWindow::on_action_API_Inspector_triggered()
 
 void MainWindow::on_action_Annotation_Viewer_triggered()
 {
+  CaptureContext &ctx = static_cast<CaptureContext &>(m_Ctx);
   QWidget *annotViewer = m_Ctx.GetAnnotationViewer()->Widget();
 
   if(ui->toolWindowManager->toolWindows().contains(annotViewer))
@@ -2594,6 +2660,13 @@ void MainWindow::on_action_Annotation_Viewer_triggered()
     {
       ToolWindowManager::AreaReference ref(
           ToolWindowManager::AddTo, ui->toolWindowManager->areaOf(m_Ctx.GetAPIInspector()->Widget()));
+      ui->toolWindowManager->addToolWindow(annotViewer, ref);
+    }
+    else if(ctx.HasBookmarksView() &&
+            ui->toolWindowManager->toolWindows().contains(ctx.GetBookmarksView()))
+    {
+      ToolWindowManager::AreaReference ref(
+          ToolWindowManager::AddTo, ui->toolWindowManager->areaOf(ctx.GetBookmarksView()));
       ui->toolWindowManager->addToolWindow(annotViewer, ref);
     }
     else if(m_Ctx.HasEventBrowser() &&
@@ -3320,6 +3393,8 @@ QVariantMap MainWindow::saveState()
   QVariantMap state = ui->toolWindowManager->saveState();
 
   state[lit("mainWindowGeometry")] = QString::fromLatin1(saveGeometry().toBase64());
+  // i18n-ignore: internal layout migration key, never shown to the user.
+  state[lit("bookmarksViewLayoutVersion")] = 1;
 
   return state;
 }
@@ -3380,6 +3455,13 @@ bool MainWindow::LoadLayout(int layout)
           ui->toolWindowManager->forceCloseToolWindow(toolWindow);
         }
       }
+
+      // Add Bookmarks once when upgrading an existing default layout. The feature version is
+      // persisted so a user who later closes the window keeps that choice on the next launch.
+      // i18n-ignore: internal layout migration key, never shown to the user.
+      if(layout == 0 && state[lit("bookmarksViewLayoutVersion")].toInt() < 1)
+        on_action_Bookmarks_triggered();
+
       return true;
     }
     return false;

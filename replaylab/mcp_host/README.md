@@ -18,10 +18,11 @@ fall back to this executable. Ordinary qrenderdoc startup owns one
 `ReplayLabMCP.exe` loopback by default for external Codex/IDE/automation clients;
 set `REPLAYLAB_EXTERNAL_MCP_AUTOSTART=0` (`false`, `no`, and `off` are also
 accepted) to disable only that external service. ACP/Cursor starts one filtered
-stdio adapter for its current specialist task. Model API and Codex dynamicTools
-work runs directly inside AgentHost.
+stdio adapter for its current task. Capture-bound AgentHost work—including
+deepagents children, ACP, and Codex app-server—uses a filtered task-scoped MCP
+route to this same Host.
 
-## Features (111 Tools)
+## Features (141 Tools)
 
 ### 📦 Capture Management
 | Tool | Description |
@@ -57,6 +58,17 @@ work runs directly inside AgentHost.
 | Tool | Description |
 |------|-------------|
 | `get_pipeline_state` | Bound shaders, render targets, depth target, viewport |
+| `analyze_current_frame_flow` | Bounded chronological frame inventory with workload, physical I/O, participation, state and definite resource handoffs |
+| `capture_event_texture_evidence` | Export one exact EID-bound RTV combined/channel view or raw DSV depth view to a Host-managed hashed PNG/manifest; no caller path |
+| `render_current_frame_flow_diagram` | Render a fixed-style Host-derived resource, participating-stage, or pass/GBuffer SVG; no caller graph or styling |
+
+The two Event visual tools are reversible `workspace` operations. Texture
+evidence is display-derived, one view per call, fixed-budget, exact
+mip/slice/sample, and restores the original visible EID. Raw DSV output is not
+linearized depth. Diagram facts come only from the current-frame Host flow and
+use the fixed `evidence-neutral-v1` style; capture text cannot inject CSS,
+links, HTML, Mermaid directives, or output paths. GBuffer cards report physical
+attachments only; channel semantics still require validated Shader evidence.
 
 ### 💎 Shader Inspection
 | Tool | Description |
@@ -79,10 +91,10 @@ work runs directly inside AgentHost.
 | `plan_shader_recovery` | Classify a failure by fixed detect/decompile/compile/ABI phase and expose only hash-bound untried route pairs for AI selection |
 | `run_shader_toolchain_round_trip_smoke` | Execute the fixed route, exact physical target profile, format checks, and configured validators without applying to RenderDoc |
 | `get_current_shader_representation` | Persist a non-empty, hash-bound current-event explanation for any Shader API RenderDoc can reflect; explanatory/binary lanes can never compile or apply |
-| `prepare_shader_workspace` | Export one event/stage, require a unique physical shader, create a workspace, and run a host-registered decompiler |
+| `prepare_shader_workspace` | Export one event/stage, require a unique physical Shader, run the preferred registered route, automatically traverse its finite hash-bound alternate frontier, and publish a provisional reconstruction scaffold from native evidence if all decompilers fail but a compiler exists |
 | `create_shader_workspace` | Create a workspace from an existing catalog and exact `shaderKey` |
 | `decompile_shader_workspace` | Run the workspace-bound decompiler once without overwriting edited source |
-| `get_shader_workspace_representation` | Return executable routed text (prefer HLSL/GLSL; select a unique direct DXBC/DXIL native-IR round trip only when that high-level lane is statically incomplete), otherwise materialize RenderDoc IR or an exact binary fallback instead of a blank editor; runtime failure does not yet switch formats, and SPIR-V assembly stays outside automatic fallback until workspace tool/validator integration |
+| `get_shader_workspace_representation` | Return executable routed text, otherwise materialize RenderDoc IR or an exact binary fallback instead of a blank editor; it never repeats a route already recorded as failed or silently changes the requested editable format |
 | `promote_shader_workspace_explanation` | Explicitly promote a hash-reviewed `explanation/promoted.hlsl`; still requires compile, ABI validation, and apply authorization |
 | `compile_shader_workspace` | Compile/assemble the route-bound edited text to an auditable candidate; **never applies it to RenderDoc** |
 | `get_shader_workspace_status` | Validate hashes and report source/revision/candidate state |
@@ -128,10 +140,13 @@ ABI exemption.
 
 With no explicit editable format, automatic cross-format fallback occurs only
 when the preferred high-level route is statically incomplete during planning.
-If that selected route later fails during decompilation or baseline compilation,
-the current recovery plan remains in the same format; it does not automatically
-create a native-IR workspace. SPIR-V assembly is likewise excluded from
-automatic fallback until its pinned workspace tools and validator are executed.
+If a selected route later fails during decompilation or its untouched baseline
+compile probe, preparation automatically tries each listed same-format route
+pair once in an isolated sibling workspace. Exhausting that frontier does not
+end a compiler-capable task: RenderDoc/native binary evidence and a hash-bound
+provisional source scaffold are published for Agent reconstruction. Promotion,
+compilation and fresh replay ABI validation remain mandatory. SPIR-V assembly
+is eligible only after its pinned workspace tools and validator execute.
 
 A CBuffer appearing in the reflection UI proves that a binding, total size, or
 some display fields are visible; it does not prove complete physical member
@@ -219,11 +234,47 @@ exact event, and provides per-CBuffer/all-session rollback. Semantic sliders and
 colour pickers are not implemented yet. D3D12 root constants, ray state
 objects, indirect root-CBV mutation, and remote replay remain fail-closed.
 
-### 📤 One-Shot DrawCall Export *(NEW)*
+### 📤 Managed Resource Export
 | Tool | Description |
 |------|-------------|
-| `export_drawcall` | Export **everything** about a draw call: shaders (all disassembly formats + source), all bound textures as PNG (named by role), cbuffer values, pipeline state |
-| `export_to_unity` | 🆕 **Export Unity-ready assets**: mesh as .obj + .fbx (with correct coordinate system conversion, normals/UVs), texture binding info (use `save_texture` to export textures), Unity material JSON, C# editor import script |
+| `get_resource_export_capabilities` | Report fixed glTF, Unity URP, Blender, optional FBX, and validator capabilities without installing tools |
+| `inspect_resource_export` | Inspect one exact EID/instance/view without writing files |
+| `prepare_resource_export` | Snapshot complete mesh inputs, textures, samplers, CBuffers, and Shader evidence below the process-owned export root |
+| `finalize_resource_export` | Apply a typed transfer specification and atomically publish glTF plus target adapters and evidence sidecars |
+| `get_resource_export_status` | Read one stable operation and its hashes |
+| `validate_resource_export` | Revalidate containment, file hashes, mesh/package structure, and available target checks |
+
+`export_drawcall`, `export_to_unity`, and caller-path `save_texture` remain legacy
+diagnostic conveniences. They are not part of the managed resource-export route:
+they do not preserve every vertex input, exact texture view/sampler/CBuffer evidence,
+explicit basis policy, atomic publication, or target validation. See
+[Resource export toolchain](../docs/RESOURCE_EXPORT_TOOLCHAIN.md).
+
+### 🧭 Unpacked Asset Intelligence and UEX Delivery
+| Tool | Description |
+|------|-------------|
+| `get_unpacked_asset_index_capabilities` | Report fixed generic/UEX-aware parsers, identity, relationship, and scan limits |
+| `get_active_unpacked_asset_index_status` | Read the project-owned catalog revision without walking the asset tree |
+| `index_active_unpacked_assets` | Atomically build or incrementally refresh the configured active-project asset catalog; no caller root/database path |
+| `query_active_unpacked_assets` | Run bounded typed queries over identities, hashes, formats, metadata, and verified/unresolved relationships |
+| `resolve_active_unpacked_asset` | Re-hash one catalog-selected asset and issue a revision-bound delivery receipt |
+| `get_unpacked_asset_provider_capabilities` | Report registered UEX, profile database, wrapper, Blender, and UEFormat fingerprints and route gaps |
+| `get_unpacked_asset_provider_decisions` | Read bounded, redacted profile names and Host-owned Strong/complete/truncated Inventory decisions from committed UEX stores |
+| `query_unpacked_asset_inventory_assets` | Query bounded safe asset identities and validated export package paths from one exact UEX Inventory |
+| `start_unpacked_asset_report` | Start a managed UEX report from a canonical staged v1 grouping spec and a Host-verified Strong/complete/non-truncated Inventory |
+| `start_unpacked_asset_blender_export` | Export a bounded exact cooked SkeletalMesh set to verified UEX bundles and an optional Blender assembly |
+| `continue_unpacked_asset_blender_export` | Bind one terminal partial receipt, retain verified parent bundles, retry only failed/open assets, then assemble and validate the combined set without caller paths |
+| `get_unpacked_asset_job_status` | Poll one idempotent report/export job and validate its terminal artifacts |
+
+The catalog persists under the active project's shared asset dictionary and
+separates deterministic relations, heuristic candidates, and unresolved
+references. Report completion requires the HTML/JSON/CSV/manifest four-file
+contract with exact hashes. Blender completion requires exact `USkeletalMesh`
+identity, LOD0, material/texture files, a coherent `.uemodel` or explicit GLB
+route, assembly binding, and a passing validation receipt. Provider paths,
+profiles, secrets, output roots, and executables are process-owner configuration;
+model-visible tools cannot supply them. See
+[Unpacked asset intelligence](../docs/UNPACKED_ASSET_INTELLIGENCE.md).
 
 ### 🔍 Smart Identification
 | Tool | Description |
@@ -396,7 +447,7 @@ from shader variable names and texture formats:
 ```
 [AI / IDE] ←stdio/HTTP→ [ReplayLab sidecar] ←file IPC→ [qrenderdoc built-in integration]
                            Python 3.10+                     native C++ lifecycle +
-                          111 MCP tools                     embedded Python bridge
+                          141 MCP tools                     embedded Python bridge
                            ipc_client.py                    pyrenderdoc API
 ```
 
@@ -411,7 +462,7 @@ replaylab/
     ├── README_CN.md            # Chinese docs
     └── src/
         ├── __init__.py
-        ├── server.py           # MCP tool definitions (111 tools, FastMCP)
+        ├── server.py           # MCP tool definitions (141 tools, FastMCP)
         ├── rd_wrapper.py       # RenderDoc API wrapper (local mode, backup)
         └── ipc_client.py       # File IPC client for RenderDoc bridge
 
@@ -419,7 +470,7 @@ Build output:
   <qrenderdoc-app>/integrations/replaylab/python/renderdoc_mcp_bridge/
 ```
 
-- **`server.py`** — Registers 111 MCP tools, communicates via stdio with AI clients
+- **`server.py`** — Registers 141 MCP tools, communicates via stdio with AI clients
 - **`ipc_client.py`** — File-based IPC to bridge Python 3.10+ ↔ RenderDoc's Python 3.6
 - **`rd_wrapper.py`** — Direct RenderDoc API wrapper (backup, for same-Python scenarios)
 - **Built-in bridge** — Runs inside RenderDoc, captures UI context/intents, and executes bounded GPU replay calls via IPC

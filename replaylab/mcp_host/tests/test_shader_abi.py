@@ -788,6 +788,17 @@ class CandidateReflectionContractTests(unittest.TestCase):
     def test_request_is_bound_and_response_can_prove_exact_abi(self) -> None:
         self.assertEqual(self.request["method"], "reflect_shader_candidate")
         self.assertEqual(self.request["params"]["encoding"], "dxbc")
+        self.assertEqual(
+            set(self.request["params"]),
+            {
+                "candidate_path",
+                "expected_sha256",
+                "stage",
+                "entry_point",
+                "encoding",
+                "target_profile",
+            },
+        )
         response = reflection_response(
             complete_interface(), self.raw_hash, len(self.blob)
         )
@@ -843,7 +854,7 @@ class CandidateReflectionContractTests(unittest.TestCase):
         self.assertFalse(comparison.compatible)
         self.assertTrue(comparison.differences)
 
-    def test_request_rejects_changed_file_and_non_d3d11_scope(self) -> None:
+    def test_request_rejects_changed_file_and_wrong_api_encoding_pair(self) -> None:
         self.path.write_bytes(b"changed")
         with self.assertRaisesRegex(AbiValidationError, "byte size changed"):
             build_candidate_reflection_request(
@@ -860,7 +871,7 @@ class CandidateReflectionContractTests(unittest.TestCase):
                 baseline_abi_sha256=self.baseline.sha256,
                 target_profile="ps_5_0",
             )
-        with self.assertRaisesRegex(AbiValidationError, "D3D11/D3D12"):
+        with self.assertRaisesRegex(AbiValidationError, "Vulkan.*native SPIR-V"):
             build_candidate_reflection_request(
                 workspace_id="workspace-1",
                 capture_id="c" * 64,
@@ -874,6 +885,46 @@ class CandidateReflectionContractTests(unittest.TestCase):
                 entry_point="main",
                 baseline_abi_sha256=self.baseline.sha256,
                 target_profile="ps_5_0",
+            )
+
+    def test_vulkan_and_opengl_spirv_requests_preserve_environment(self) -> None:
+        for api, kind, profile in (
+            ("GraphicsAPI.Vulkan", "SPIRV", "spirv"),
+            ("GraphicsAPI.OpenGL", "OPENGL-SPIRV", "opengl-spirv"),
+        ):
+            with self.subTest(api=api):
+                request = build_candidate_reflection_request(
+                    workspace_id="workspace-spirv",
+                    capture_id="e" * 64,
+                    api=api,
+                    candidate_path=self.path,
+                    candidate_sha256=self.raw_hash,
+                    candidate_byte_size=len(self.blob),
+                    candidate_kind=kind,
+                    revision=3,
+                    stage="compute",
+                    entry_point="main",
+                    baseline_abi_sha256=self.baseline.sha256,
+                    target_profile=profile,
+                )
+                self.assertEqual(request["binding"]["api"], api.split(".")[-1].lower())
+                self.assertEqual(request["binding"]["encoding"], kind.lower())
+                self.assertEqual(request["binding"]["targetProfile"], profile)
+
+        with self.assertRaisesRegex(AbiValidationError, "capture-bound SPIR-V"):
+            build_candidate_reflection_request(
+                workspace_id="workspace-spirv",
+                capture_id="e" * 64,
+                api="Vulkan",
+                candidate_path=self.path,
+                candidate_sha256=self.raw_hash,
+                candidate_byte_size=len(self.blob),
+                candidate_kind="SPIRV",
+                revision=3,
+                stage="compute",
+                entry_point="main",
+                baseline_abi_sha256=self.baseline.sha256,
+                target_profile="opengl-spirv",
             )
 
     def test_d3d12_dxil_request_is_explicitly_scoped(self) -> None:
@@ -952,7 +1003,35 @@ class ShaderWorkspaceAbiGateTests(unittest.TestCase):
         self.assertTrue(second["alreadyPersisted"])
         self.assertEqual(second["abiReportSha256"], validated["abiReportSha256"])
 
-    def test_workspace_mismatch_stays_pending(self) -> None:
+    def test_compatible_candidate_does_not_validate_edited_source(self) -> None:
+        service, workspace, _, compiled, interface = self._compiled_workspace("abi-success-edit")
+        service.validate_candidate_reflection(
+            workspace, reflection_response(
+                interface, compiled["rawSha256"], Path(compiled["candidateBlobPath"]).stat().st_size
+            )
+        )
+        status = service.status(workspace)
+        self.assertEqual(status["abiValidationStatus"], "compatible")
+        source = Path(status["source"]["path"])
+        source.write_text(source.read_text(encoding="utf-8") + "\n// edited\n", encoding="utf-8")
+
+        edited = service.status(workspace)
+        self.assertEqual(edited["abiValidationStatus"], "source-changed")
+        self.assertFalse(edited["representation"]["abiCompatible"])
+        self.assertIsNone(edited["lastAbiAttempt"])
+        # Existing candidate-level fields retain their documented meaning.
+        self.assertTrue(edited["abiCompatible"])
+        self.assertTrue(edited["replayAbiValidated"])
+        self.assertEqual(edited["latestCompiled"]["abiGate"]["status"], "compatible")
+
+        service.compile(workspace)
+        recompiled = service.status(workspace)
+        self.assertEqual(recompiled["abiValidationStatus"], "pending-replay-reflection")
+        self.assertFalse(recompiled["abiCompatible"])
+        self.assertFalse(recompiled["representation"]["abiCompatible"])
+        self.assertTrue(recompiled["requiresReplayAbiValidation"])
+
+    def test_workspace_mismatch_is_persisted_without_authorizing_candidate(self) -> None:
         service, workspace, unused_created, compiled, interface = (
             self._compiled_workspace("workspace-abi-mismatch")
         )
@@ -965,6 +1044,7 @@ class ShaderWorkspaceAbiGateTests(unittest.TestCase):
         self.assertFalse(result["compatible"])
         self.assertTrue(result["requiresReplayAbiValidation"])
         self.assertFalse(result["replayAbiValidated"])
+        self.assertTrue(Path(result["abiReportPath"]).is_file())
 
         status = service.status(workspace)
         self.assertTrue(status["requiresReplayAbiValidation"])
@@ -973,6 +1053,98 @@ class ShaderWorkspaceAbiGateTests(unittest.TestCase):
             status["latestCompiled"]["abiGate"]["status"],
             "pending-replay-reflection",
         )
+        self.assertFalse(status["abiCompatible"])
+        self.assertEqual(status["abiValidationStatus"], "incompatible")
+        attempt = status["lastAbiAttempt"]
+        self.assertTrue(attempt["appliesToCurrentSource"])
+        self.assertEqual(attempt["comparison"]["differences"], result["differences"])
+        self.assertEqual(attempt["sourceSha256"], compiled["sourceSha256"])
+        self.assertEqual(attempt["candidateRawSha256"], compiled["rawSha256"])
+        self.assertEqual(status["lastGood"]["revision"], 0)
+        self.assertFalse(status["applied"])
+
+        before = Path(result["abiReportPath"]).read_bytes()
+        repeated = service.validate_candidate_reflection(workspace, response)
+        self.assertTrue(repeated["alreadyPersisted"])
+        self.assertEqual(before, Path(repeated["abiReportPath"]).read_bytes())
+        varied_response = copy.deepcopy(response)
+        varied_response["buildMessages"] = "A fresh replay reflection attempt"
+        repeated = service.validate_candidate_reflection(workspace, varied_response)
+        self.assertTrue(repeated["alreadyPersisted"])
+        self.assertEqual(repeated["abiReportPath"], result["abiReportPath"])
+        self.assertEqual(service.status(workspace)["historyCount"], status["historyCount"])
+
+        # Saving changes invalidates the diagnostic for the editor, while its
+        # immutable evidence still describes the previous compiled candidate.
+        source = Path(status["source"]["path"])
+        source.write_text(source.read_text(encoding="utf-8") + "\n// edited\n", encoding="utf-8")
+        edited_status = service.status(workspace)
+        self.assertEqual(edited_status["abiValidationStatus"], "source-changed")
+        self.assertFalse(edited_status["lastAbiAttempt"]["appliesToCurrentSource"])
+        recompiled = service.compile(workspace)
+        # The fixture compiler emits equal bytes: revision/source binding,
+        # rather than bytecode equality, determines diagnostic freshness.
+        self.assertEqual(recompiled["rawSha256"], compiled["rawSha256"])
+        new_status = service.status(workspace)
+        self.assertIsNone(new_status["lastAbiAttempt"])
+        self.assertEqual(new_status["abiValidationStatus"], "pending-replay-reflection")
+        self.assertFalse(new_status["abiCompatible"])
+        self.assertEqual(before, Path(result["abiReportPath"]).read_bytes())
+
+    def test_successful_revalidation_clears_rejected_attempt(self) -> None:
+        service, workspace, _, compiled, interface = self._compiled_workspace("abi-retry")
+        changed = copy.deepcopy(interface)
+        changed["constantBlocks"][0]["fields"][0]["rowMajor"] = True
+        size = Path(compiled["candidateBlobPath"]).stat().st_size
+        failed = service.validate_candidate_reflection(
+            workspace, reflection_response(changed, compiled["rawSha256"], size)
+        )
+        service.validate_candidate_reflection(
+            workspace, reflection_response(interface, compiled["rawSha256"], size)
+        )
+        status = service.status(workspace)
+        self.assertIsNone(status["lastAbiAttempt"])
+        self.assertEqual(status["abiValidationStatus"], "compatible")
+        self.assertTrue(status["abiCompatible"])
+        self.assertTrue(Path(failed["abiReportPath"]).is_file())
+
+        success_report = Path(status["latestCompiled"]["abiGate"]["reportPath"])
+        success_report = Path(workspace) / success_report
+        success_bytes = success_report.read_bytes()
+        service.validate_candidate_reflection(
+            workspace, reflection_response(changed, compiled["rawSha256"], size)
+        )
+        rejected_status = service.status(workspace)
+        self.assertEqual(rejected_status["abiValidationStatus"], "incompatible")
+        self.assertFalse(rejected_status["abiCompatible"])
+        self.assertFalse(rejected_status["replayAbiValidated"])
+        self.assertTrue(rejected_status["requiresReplayAbiValidation"])
+        self.assertEqual(success_bytes, success_report.read_bytes())
+        service.validate_candidate_reflection(
+            workspace, reflection_response(interface, compiled["rawSha256"], size)
+        )
+        self.assertTrue(service.status(workspace)["abiCompatible"])
+        self.assertEqual(success_bytes, success_report.read_bytes())
+
+    def test_rejected_abi_report_comparison_is_revalidated(self) -> None:
+        service, workspace, _, compiled, interface = self._compiled_workspace("abi-reject-tamper")
+        changed = copy.deepcopy(interface)
+        changed["constantBlocks"][0]["fields"][0]["rowMajor"] = True
+        result = service.validate_candidate_reflection(
+            workspace, reflection_response(
+                changed, compiled["rawSha256"], Path(compiled["candidateBlobPath"]).stat().st_size
+            )
+        )
+        report_path = Path(result["abiReportPath"])
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["comparison"]["compatible"] = True
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        manifest_path = Path(workspace) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["lastAbiAttempt"]["reportSha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaisesRegex(ManifestValidationError, "recorded comparison"):
+            service.status(workspace)
 
     def test_workspace_report_tampering_is_rejected(self) -> None:
         service, workspace, unused_created, compiled, interface = (

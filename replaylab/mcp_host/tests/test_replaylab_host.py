@@ -3,6 +3,7 @@ import ast
 import hashlib
 import io
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import sys
@@ -16,6 +17,7 @@ from src import internal_tool_service
 from src import replaylab_host
 from src import replaylab_tools
 from src.shader_workspace import (
+    ToolchainCatalog,
     ToolConfigurationError,
     WorkspaceWatchConflictError,
     WorkspaceWatchError,
@@ -39,6 +41,36 @@ def _wait_restore_job(
     raise AssertionError("project restore job did not finish")
 
 
+def _configure_shader_tools_in_process(
+    host, config, started, finished, results, generation_started=None, release_generation=None
+):
+    """Spawn-safe worker; only fixture bytes are discovered, never executed."""
+    try:
+        started.set()
+        if generation_started is None:
+            report = replaylab_tools.configure_environment(
+                Path(host), {"REPLAYLAB_CONFIG_DIR": config}
+            )
+        else:
+            real_stage = replaylab_tools._stage_generation
+
+            def held_stage(*args, **kwargs):
+                generation_started.set()
+                if not release_generation.wait(10):
+                    raise RuntimeError("test did not release startup generation")
+                return real_stage(*args, **kwargs)
+
+            with mock.patch.object(replaylab_tools, "_stage_generation", side_effect=held_stage):
+                report = replaylab_tools.configure_environment(
+                    Path(host), {"REPLAYLAB_CONFIG_DIR": config}
+                )
+        results.put({"report": report})
+    except BaseException as exc:
+        results.put({"error": "%s: %s" % (type(exc).__name__, exc)})
+    finally:
+        finished.set()
+
+
 class _ChunkedRequest:
     def __init__(self, body: bytes, *, content_length: str | None = None):
         self._body = body
@@ -53,6 +85,35 @@ class _ChunkedRequest:
 
 
 class ReplayLabHostTests(unittest.TestCase):
+    def test_detached_frozen_service_owns_extraction_environment(self):
+        for frozen in (False, True):
+            with self.subTest(frozen=frozen), mock.patch.object(
+                    replaylab_host.sys, "frozen", frozen, create=True), mock.patch.dict(
+                    os.environ, {"PYINSTALLER_RESET_ENVIRONMENT": "0",
+                                 "_PYI_PARENT_PROCESS_LEVEL": "1",
+                                 "REPLAYLAB_TOOLS_CONFIG": "D:/tools-test.json"}), mock.patch.object(
+                    replaylab_host.subprocess, "Popen") as launch:
+                original = dict(os.environ)
+                command = [str(Path(sys.executable).resolve()), "serve"]
+                replaylab_host._spawn_detached(command)
+                args, options = launch.call_args
+                self.assertEqual((command,), args)
+                expected = dict(original)
+                if frozen:
+                    expected["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+                self.assertEqual(expected, options["env"])
+                self.assertEqual(original, dict(os.environ))
+                self.assertIsNot(options["env"], os.environ)
+                self.assertFalse(options["shell"])
+                self.assertTrue(options["close_fds"])
+                self.assertEqual(str(Path(sys.executable).resolve().parent), options["cwd"])
+                for stream in ("stdin", "stdout", "stderr"):
+                    self.assertEqual(replaylab_host.subprocess.DEVNULL, options[stream])
+                if os.name == "nt":
+                    self.assertEqual(replaylab_host.subprocess.DETACHED_PROCESS
+                                     | replaylab_host.subprocess.CREATE_NEW_PROCESS_GROUP
+                                     | replaylab_host.subprocess.CREATE_NO_WINDOW, options["creationflags"])
+
     @staticmethod
     def _discovered(**overrides):
         value = {
@@ -67,6 +128,7 @@ class ReplayLabHostTests(unittest.TestCase):
             "hlsl_decompiler": None,
             "hlsl_decompiler_dependency": None,
             "dxil_spirv": None,
+            "dxil_spirv_dependency": None,
             "renodx_decompiler": None,
         }
         value.update(overrides)
@@ -80,7 +142,7 @@ class ReplayLabHostTests(unittest.TestCase):
         pid: int | None = None,
         instance_id: str = "a" * 32,
         protocol_version: int = 2,
-        version: str = "1.10.2",
+        version: str = "1.13.0",
     ) -> dict:
         process_id = os.getpid() if pid is None else pid
         replaylab_host._atomic_json(
@@ -214,6 +276,61 @@ class ReplayLabHostTests(unittest.TestCase):
             )
             self.assertIsNone(found["d3dcompiler"])
 
+    def test_glslang_discovery_accepts_current_and_legacy_bundled_names_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable_dir = root / "host"
+            tools = executable_dir / "tools"
+            tools.mkdir(parents=True)
+            current = tools / "glslang.exe"
+            current.write_bytes(b"current Khronos standalone name")
+            found = replaylab_tools.discover(executable_dir, {})
+            self.assertEqual(current.resolve(), found["glslang"])
+
+            legacy = tools / "glslangValidator.exe"
+            legacy.write_bytes(b"legacy Khronos standalone name")
+            found = replaylab_tools.discover(executable_dir, {})
+            self.assertEqual(legacy.resolve(), found["glslang"])
+
+            current.unlink()
+            legacy.unlink()
+            outside = root / "glslang.exe"
+            outside.write_bytes(b"untrusted outside tool")
+            found = replaylab_tools.discover(
+                executable_dir, {"PATH": str(root)}
+            )
+            self.assertIsNone(found["glslang"])
+
+    def test_startup_discovery_enables_distinct_opengl_spirv_routes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable_dir = root / "host"
+            tools = executable_dir / "tools"
+            tools.mkdir(parents=True)
+            for name in (
+                "glslang.exe",
+                "spirv-cross.exe",
+                "spirv-dis.exe",
+                "spirv-as.exe",
+                "spirv-val.exe",
+            ):
+                (tools / name).write_bytes(("fixed " + name).encode("ascii"))
+
+            found = replaylab_tools.discover(executable_dir, {})
+            kwargs = replaylab_tools._generation_kwargs(found)
+            self.assertTrue(kwargs["enable_opengl_spirv"])
+            tool_path = root / "tools.json"
+            route_path = root / "routes.json"
+            generate_official_toolchain_configs(tool_path, route_path, **kwargs)
+            routes = json.loads(route_path.read_text(encoding="utf-8"))
+            route_ids = {item["routeId"] for item in routes["routes"]}
+            validator_ids = {item["validatorId"] for item in routes["validators"]}
+            self.assertIn("spirv-cross-opengl-spirv-glsl", route_ids)
+            self.assertIn("glslang-glsl-opengl-spirv-fragment", route_ids)
+            self.assertIn("spirv-tools-disassemble-opengl", route_ids)
+            self.assertIn("spirv-tools-assemble-opengl", route_ids)
+            self.assertIn("spirv-tools-validate-opengl", validator_ids)
+
     def test_community_decompiler_requires_and_pins_colocated_d3dcompiler46(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -303,6 +420,41 @@ class ReplayLabHostTests(unittest.TestCase):
             dependency.unlink()
             removed = replaylab_tools.discover(executable_dir, {})
             self.assertIsNone(removed["renodx_decompiler"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows shared dependency convention")
+    def test_dxil_spirv_requires_and_pins_colocated_shared_library(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable_dir = root / "host"
+            tools = executable_dir / "tools"
+            tools.mkdir(parents=True)
+            executable = tools / "dxil-spirv.exe"
+            dependency = tools / "dxil-spirv-c-shared.dll"
+            executable.write_bytes(b"community dxil-spirv CLI")
+
+            missing = replaylab_tools.discover(executable_dir, {})
+            self.assertIsNone(missing["dxil_spirv"])
+            self.assertIsNone(missing["dxil_spirv_dependency"])
+
+            dependency.write_bytes(b"side-by-side dxil-spirv C ABI")
+            found = replaylab_tools.discover(executable_dir, {})
+            self.assertEqual(executable.resolve(), found["dxil_spirv"])
+            self.assertEqual(dependency.resolve(), found["dxil_spirv_dependency"])
+            kwargs = replaylab_tools._generation_kwargs(found)
+            self.assertNotIn("dxil_spirv_dependency", kwargs)
+            self.assertEqual(
+                [dependency.resolve()],
+                kwargs["extra_fixed_files"]["dxil-spirv"],
+            )
+            tool_path = root / "dxil-spirv-tools.json"
+            route_path = root / "dxil-spirv-routes.json"
+            generate_official_toolchain_configs(tool_path, route_path, **kwargs)
+            registry = json.loads(tool_path.read_text(encoding="utf-8"))
+            fixed = registry["tools"]["dxil-spirv-transform"]["fixedFileHashes"]
+            self.assertEqual(
+                replaylab_tools._sha256_file(dependency),
+                fixed[str(dependency.resolve())],
+            )
 
     def test_token_is_random_persistent_and_never_in_codex_stdio_config(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -641,7 +793,7 @@ class ReplayLabHostTests(unittest.TestCase):
             self.assertEqual([1, 2], [item["sequence"] for item in completed["progress"]])
             self.assertTrue(completed["result"]["completed"])
             self.assertEqual(
-                {"sequence", "phase", "message", "current", "total"},
+                {"sequence", "phase", "message", "item", "current", "total"},
                 set(completed["progress"][0]),
             )
             after_first = registry.get(submitted["jobId"], after=1)
@@ -649,6 +801,54 @@ class ReplayLabHostTests(unittest.TestCase):
             self.assertEqual([2], [item["sequence"] for item in after_first["progress"]])
             self.assertEqual(
                 [("D:/project", "D:/capture.rdc", "a" * 32)], calls
+            )
+        finally:
+            registry.shutdown()
+
+    def test_project_restore_registry_serializes_and_deduplicates_progress(self):
+        def runner(
+            project_root, capture_path, capture_session_id, *, progress_callback
+        ):
+            del project_root, capture_path, capture_session_id
+            event = {
+                "phase": "export-shader-bindings",
+                "message": "Exporting Shader bindings",
+                "item": "EID 42",
+                "current": 1,
+                "total": 2,
+            }
+            workers = [
+                threading.Thread(target=progress_callback, args=(dict(event),))
+                for unused_index in range(16)
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+            progress_callback(
+                {
+                    **event,
+                    "item": "EID 84",
+                    "current": 2,
+                }
+            )
+            return {"completed": True}
+
+        registry = internal_tool_service.ProjectRestoreJobRegistry(runner=runner)
+        try:
+            submitted, unused_deduplicated = registry.submit(
+                {
+                    "projectRoot": "D:/project",
+                    "capturePath": "D:/capture.rdc",
+                    "captureSessionId": "f" * 32,
+                }
+            )
+            completed = _wait_restore_job(registry, submitted["jobId"])
+            self.assertEqual("completed", completed["status"])
+            self.assertEqual(2, completed["latestSequence"])
+            self.assertEqual(
+                ["EID 42", "EID 84"],
+                [event["item"] for event in completed["progress"]],
             )
         finally:
             registry.shutdown()
@@ -785,6 +985,7 @@ class ReplayLabHostTests(unittest.TestCase):
         registry = internal_tool_service.ProjectRestoreJobRegistry(
             runner=lambda *_args, progress_callback: {"completed": True},
             max_history_jobs=1,
+            monotonic=lambda: clock[0],
         )
         try:
             first_request = {
@@ -819,6 +1020,225 @@ class ReplayLabHostTests(unittest.TestCase):
                 self.assertIn("byte limit", failed["error"])
             finally:
                 registry.shutdown()
+
+    def test_project_restore_registry_passes_controls_and_enforces_deadline(self):
+        clock = [100.0]
+        observed = {}
+
+        def runner(
+            project_root,
+            capture_path,
+            capture_session_id,
+            *,
+            progress_callback,
+            cancel_event,
+            deadline_monotonic,
+        ):
+            del project_root, capture_path, capture_session_id, progress_callback
+            observed["cancelEvent"] = cancel_event
+            observed["deadline"] = deadline_monotonic
+            clock[0] = deadline_monotonic
+            return {"completed": False}
+
+        registry = internal_tool_service.ProjectRestoreJobRegistry(
+            runner=runner,
+            deadline_seconds=5.0,
+            monotonic=lambda: clock[0],
+        )
+        try:
+            submitted, _unused = registry.submit(
+                {
+                    "projectRoot": "D:/project",
+                    "capturePath": "D:/capture.rdc",
+                    "captureSessionId": "a" * 32,
+                }
+            )
+            failed = _wait_restore_job(registry, submitted["jobId"])
+            self.assertEqual("failed", failed["status"])
+            self.assertEqual(
+                internal_tool_service.PROJECT_RESTORE_DEADLINE_ERROR,
+                failed["error"],
+            )
+            self.assertIsInstance(observed["cancelEvent"], threading.Event)
+            self.assertEqual(105.0, observed["deadline"])
+        finally:
+            registry.shutdown()
+
+    def test_project_restore_delete_cancels_queued_job_without_running_it(self):
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def runner(*_args, progress_callback):
+            del progress_callback
+            session_id = _args[2]
+            calls.append(session_id)
+            if session_id == "a" * 32:
+                started.set()
+                self.assertTrue(release.wait(3.0))
+            return {"completed": True}
+
+        registry = internal_tool_service.ProjectRestoreJobRegistry(
+            runner=runner, max_active_jobs=2
+        )
+        try:
+            request = {
+                "projectRoot": "D:/project",
+                "capturePath": "D:/capture.rdc",
+                "captureSessionId": "a" * 32,
+            }
+            first, _unused = registry.submit(request)
+            self.assertTrue(started.wait(1.0))
+            queued, _unused = registry.submit(
+                {**request, "captureSessionId": "b" * 32}
+            )
+            status_code, cancelled = (
+                internal_tool_service.project_restore_delete_response(
+                    queued["jobId"], registry
+                )
+            )
+            self.assertEqual(200, status_code)
+            self.assertEqual("failed", cancelled["status"])
+            self.assertEqual(
+                internal_tool_service.PROJECT_RESTORE_CANCELLED_ERROR,
+                cancelled["error"],
+            )
+            release.set()
+            self.assertEqual(
+                "completed", _wait_restore_job(registry, first["jobId"])["status"]
+            )
+            time.sleep(0.02)
+            self.assertEqual(["a" * 32], calls)
+        finally:
+            release.set()
+            registry.shutdown()
+
+    def test_project_restore_delete_requests_running_cooperative_cancel(self):
+        started = threading.Event()
+
+        def runner(
+            *_args,
+            progress_callback,
+            cancel_event,
+            deadline_monotonic,
+        ):
+            del progress_callback, deadline_monotonic
+            started.set()
+            self.assertTrue(cancel_event.wait(3.0))
+            return {"completed": False}
+
+        registry = internal_tool_service.ProjectRestoreJobRegistry(runner=runner)
+        try:
+            submitted, _unused = registry.submit(
+                {
+                    "projectRoot": "D:/project",
+                    "capturePath": "D:/capture.rdc",
+                    "captureSessionId": "c" * 32,
+                }
+            )
+            self.assertTrue(started.wait(1.0))
+            status_code, running = (
+                internal_tool_service.project_restore_delete_response(
+                    submitted["jobId"], registry
+                )
+            )
+            self.assertEqual(202, status_code)
+            self.assertEqual("running", running["status"])
+            failed = _wait_restore_job(registry, submitted["jobId"])
+            self.assertEqual("failed", failed["status"])
+            self.assertEqual(
+                internal_tool_service.PROJECT_RESTORE_CANCELLED_ERROR,
+                failed["error"],
+            )
+        finally:
+            registry.shutdown()
+
+    def test_project_restore_cancel_does_not_hide_rollback_failure(self):
+        started = threading.Event()
+
+        class RestoreRollbackFailed(RuntimeError):
+            pass
+
+        def runner(
+            *_args,
+            progress_callback,
+            cancel_event,
+            deadline_monotonic,
+        ):
+            del progress_callback, deadline_monotonic
+            started.set()
+            self.assertTrue(cancel_event.wait(3.0))
+            raise RestoreRollbackFailed("live Shader rollback failed")
+
+        registry = internal_tool_service.ProjectRestoreJobRegistry(runner=runner)
+        try:
+            submitted, _unused = registry.submit(
+                {
+                    "projectRoot": "D:/project",
+                    "capturePath": "D:/capture.rdc",
+                    "captureSessionId": "e" * 32,
+                }
+            )
+            self.assertTrue(started.wait(1.0))
+            status_code, unused_snapshot = (
+                internal_tool_service.project_restore_delete_response(
+                    submitted["jobId"], registry
+                )
+            )
+            self.assertEqual(202, status_code)
+            failed = _wait_restore_job(registry, submitted["jobId"])
+            self.assertEqual("failed", failed["status"])
+            self.assertIn("RestoreRollbackFailed", failed["error"])
+            self.assertIn("live Shader rollback failed", failed["error"])
+            self.assertNotEqual(
+                internal_tool_service.PROJECT_RESTORE_CANCELLED_ERROR,
+                failed["error"],
+            )
+        finally:
+            registry.shutdown()
+
+    def test_project_restore_commit_wins_delete_racing_after_runner_return(self):
+        returned = threading.Event()
+        release_serialization = threading.Event()
+        original_bound = internal_tool_service._bounded_restore_json_object
+
+        def block_after_return(value, label, maximum_bytes):
+            clean = original_bound(value, label, maximum_bytes)
+            returned.set()
+            self.assertTrue(release_serialization.wait(3.0))
+            return clean
+
+        registry = internal_tool_service.ProjectRestoreJobRegistry(
+            runner=lambda *_args, progress_callback: {"completed": True}
+        )
+        try:
+            with mock.patch.object(
+                internal_tool_service,
+                "_bounded_restore_json_object",
+                side_effect=block_after_return,
+            ):
+                submitted, _unused = registry.submit(
+                    {
+                        "projectRoot": "D:/project",
+                        "capturePath": "D:/capture.rdc",
+                        "captureSessionId": "d" * 32,
+                    }
+                )
+                self.assertTrue(returned.wait(1.0))
+                status_code, snapshot = (
+                    internal_tool_service.project_restore_delete_response(
+                        submitted["jobId"], registry
+                    )
+                )
+                self.assertEqual(202, status_code)
+                self.assertEqual("running", snapshot["status"])
+                release_serialization.set()
+                terminal = _wait_restore_job(registry, submitted["jobId"])
+                self.assertEqual("completed", terminal["status"])
+                self.assertTrue(terminal["result"]["completed"])
+        finally:
+            release_serialization.set()
+            registry.shutdown()
 
     def test_project_restore_endpoint_helpers_return_bounded_snapshots(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1321,6 +1741,459 @@ class ReplayLabHostTests(unittest.TestCase):
                 managed["routeConfigSha256"],
             )
 
+    def test_legacy_mcp_adapter_pair_upgrades_to_runner_only_with_managed_ownership(self):
+        for ownership in ("managed", "explicit", "unowned", "user-modified"):
+            with self.subTest(ownership=ownership), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                host = root / "Release"
+                host.mkdir()
+                mcp = host / "ReplayLabMCP.exe"
+                runner = host / "ReplayLabShaderTools.exe"
+                dll = host / "d3dcompiler_47.dll"
+                mcp.write_bytes(b"old monolithic Host containing adapters and report modules")
+                runner.write_bytes(b"new independent fixed shader adapter runner")
+                dll.write_bytes(b"unchanged compiler DLL")
+                config = root / "config"
+                old_scope = replaylab_tools._automatic_config_directory(config, host.resolve(), mcp)
+                self.assertEqual(
+                    old_scope,
+                    replaylab_tools._automatic_config_directory(config, host.resolve(), runner),
+                )
+                old_scope.mkdir(parents=True)
+                tools = old_scope / "shader-tools.v1.json"
+                routes = old_scope / "shader-toolchains.v1.json"
+                status = old_scope / "shader-toolchain-status.json"
+                generate_official_toolchain_configs(
+                    tools, routes, d3dcompiler=dll, adapter_host=mcp
+                )
+                old_pair = (tools.read_bytes(), routes.read_bytes())
+                old_operation = ToolchainCatalog(tools, routes).registry.operation(
+                    "d3dcompiler47-exact-profile", "compile"
+                )
+                self.assertEqual(mcp.resolve(), old_operation.executable)
+                self.assertEqual(replaylab_tools._sha256_file(mcp), old_operation.executable_sha256)
+                if ownership != "unowned":
+                    old_report = {
+                        "schema": replaylab_tools.DISCOVERY_SCHEMA,
+                        "source": "startup-discovery", "generated": True,
+                        "managedConfig": {
+                            "schema": replaylab_tools.MANAGED_CONFIG_SCHEMA,
+                            "owner": "ReplayLab", "toolConfigPath": str(tools.resolve()),
+                            "routeConfigPath": str(routes.resolve()),
+                            "toolConfigSha256": hashlib.sha256(old_pair[0]).hexdigest(),
+                            "routeConfigSha256": hashlib.sha256(old_pair[1]).hexdigest(),
+                        },
+                    }
+                    replaylab_tools._commit_managed_generation(
+                        tools, routes, status, old_pair[0], old_pair[1], old_report
+                    )
+                    self.assertTrue(replaylab_tools._managed_config_evidence(status, tools, routes)["managed"])
+                if ownership == "user-modified":
+                    tools.write_bytes(tools.read_bytes() + b"\n")
+                preserved = (tools.read_bytes(), routes.read_bytes())
+                environment = {"REPLAYLAB_CONFIG_DIR": str(config)}
+                if ownership == "explicit":
+                    environment.update({replaylab_tools.TOOLS_ENV: str(tools),
+                                        replaylab_tools.ROUTES_ENV: str(routes)})
+                with mock.patch.object(
+                    replaylab_tools, "discover", return_value=self._discovered(d3dcompiler=dll)
+                ) as discover:
+                    report = replaylab_tools.configure_environment(host, environment)
+                self.assertEqual(tools.resolve(), Path(report["toolConfigPath"]).resolve())
+                self.assertEqual(routes.resolve(), Path(report["routeConfigPath"]).resolve())
+                if ownership == "managed":
+                    self.assertEqual("startup-refresh", report["source"])
+                    self.assertTrue(report["generated"])
+                    self.assertFalse(report["relocationEvidence"]["equivalent"])
+                    current = ToolchainCatalog(tools, routes).registry.operation(
+                        "d3dcompiler47-exact-profile", "compile"
+                    )
+                    self.assertEqual(runner.resolve(), current.executable)
+                    self.assertEqual(replaylab_tools._sha256_file(runner), current.executable_sha256)
+                    self.assertNotEqual(old_operation.executable_sha256, current.executable_sha256)
+                    self.assertNotEqual(old_operation.config_digest, current.config_digest)
+                    self.assertEqual(old_operation.fixed_file_hashes, current.fixed_file_hashes)
+                    self.assertEqual(old_operation.arguments, current.arguments)
+                    self.assertTrue(replaylab_tools._managed_config_evidence(status, tools, routes)["managed"])
+                else:
+                    self.assertFalse(report["generated"])
+                    self.assertEqual(preserved, (tools.read_bytes(), routes.read_bytes()))
+                    self.assertEqual("process-owner" if ownership == "explicit" else
+                                     "existing-unmanaged-config", report["source"])
+                    if ownership == "explicit":
+                        discover.assert_not_called()
+
+    def test_identical_host_restart_preserves_exact_config_bytes_and_operations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / "Release"
+            host.mkdir()
+            fxc = host / "fxc.exe"
+            fxc.write_bytes(b"unchanged-fxc")
+            config = root / "config"
+            with mock.patch.object(
+                replaylab_tools, "discover", return_value=self._discovered(fxc=fxc)
+            ):
+                first = replaylab_tools.configure_environment(
+                    host, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                )
+                pair = tuple(
+                    Path(first[name]) for name in ("toolConfigPath", "routeConfigPath")
+                )
+                original = tuple(path.read_bytes() for path in pair)
+                operations = ToolchainCatalog(*pair).registry.operations()
+                restarted = replaylab_tools.configure_environment(
+                    host, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                )
+
+            self.assertEqual("existing-managed-config", restarted["source"])
+            self.assertFalse(restarted["generated"])
+            self.assertEqual(first["managedConfig"], restarted["managedConfig"])
+            self.assertEqual(original, tuple(path.read_bytes() for path in pair))
+            self.assertEqual(operations, ToolchainCatalog(*pair).registry.operations())
+
+    def test_concurrent_process_startup_waits_for_complete_managed_config_pair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / "Release"
+            (host / "tools").mkdir(parents=True)
+            (host / "tools" / "fxc.exe").write_bytes(b"fixture-fxc-never-executed")
+            context = multiprocessing.get_context("spawn")
+            started = [context.Event(), context.Event()]
+            finished = [context.Event(), context.Event()]
+            generation_started = context.Event()
+            release_generation = context.Event()
+            results = context.Queue()
+            processes = [
+                context.Process(
+                    target=_configure_shader_tools_in_process,
+                    args=(
+                        str(host), str(root / "config"), started[index], finished[index],
+                        results, generation_started if index == 0 else None,
+                        release_generation if index == 0 else None,
+                    ),
+                )
+                for index in range(2)
+            ]
+            try:
+                processes[0].start()
+                self.assertTrue(generation_started.wait(10), "first process did not reach generation")
+                processes[1].start()
+                self.assertTrue(started[1].wait(10), "second process did not start")
+                # The first process holds the real cross-process lock while
+                # generation is paused. The second must not return a partial
+                # pair, mistake it for user data, or perform its own commit.
+                self.assertFalse(finished[1].wait(0.25))
+                release_generation.set()
+                reports = [results.get(timeout=10) for unused in processes]
+                for process in processes:
+                    process.join(10)
+                    self.assertEqual(0, process.exitcode)
+                for result in reports:
+                    self.assertNotIn("error", result)
+                values = [result["report"] for result in reports]
+                self.assertEqual(
+                    {"startup-discovery", "existing-managed-config"},
+                    {value["source"] for value in values},
+                )
+                self.assertEqual(values[0]["managedConfig"], values[1]["managedConfig"])
+                pair = tuple(
+                    Path(values[0][key]) for key in ("toolConfigPath", "routeConfigPath")
+                )
+                ToolchainCatalog(*pair)
+                self.assertEqual(
+                    hashlib.sha256(pair[0].read_bytes()).hexdigest(),
+                    values[0]["managedConfig"]["toolConfigSha256"],
+                )
+                self.assertEqual(
+                    hashlib.sha256(pair[1].read_bytes()).hexdigest(),
+                    values[0]["managedConfig"]["routeConfigSha256"],
+                )
+            finally:
+                release_generation.set()
+                for process in processes:
+                    if process.pid is not None:
+                        process.join(2)
+                        if process.is_alive():
+                            process.terminate()
+                            process.join(2)
+                results.close()
+                results.join_thread()
+
+    def test_development_and_release_keep_separate_managed_registries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "shared-config"
+            reports = {}
+            snapshots = {}
+            for name in ("Development", "Release"):
+                host = root / name
+                host.mkdir()
+                fxc = host / "fxc.exe"
+                fxc.write_bytes((name + "-fxc").encode("ascii"))
+                with mock.patch.object(
+                    replaylab_tools, "discover", return_value=self._discovered(fxc=fxc)
+                ):
+                    report = replaylab_tools.configure_environment(
+                        host, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                    )
+                pair = tuple(
+                    Path(report[key]) for key in ("toolConfigPath", "routeConfigPath")
+                )
+                reports[name] = report
+                snapshots[name] = (pair, tuple(path.read_bytes() for path in pair))
+
+            self.assertNotEqual(
+                reports["Development"]["toolConfigPath"],
+                reports["Release"]["toolConfigPath"],
+            )
+            self.assertNotEqual(
+                reports["Development"]["routeConfigPath"],
+                reports["Release"]["routeConfigPath"],
+            )
+            # Each launch must leave both the running sibling's files and its
+            # own workspace-pinned bytes untouched, even across repeated swaps.
+            for name in ("Development", "Release", "Development"):
+                host = root / name
+                with mock.patch.object(
+                    replaylab_tools,
+                    "discover",
+                    return_value=self._discovered(fxc=host / "fxc.exe"),
+                ):
+                    restarted = replaylab_tools.configure_environment(
+                        host, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                    )
+                self.assertEqual(reports[name]["managedConfig"], restarted["managedConfig"])
+                self.assertFalse(restarted["generated"])
+                for sibling, (pair, original) in snapshots.items():
+                    self.assertEqual(original, tuple(path.read_bytes() for path in pair))
+                    operation = ToolchainCatalog(*pair).registry.operation(
+                        "fxc-exact-profile", "compile"
+                    )
+                    self.assertEqual((root / sibling / "fxc.exe").resolve(), operation.executable)
+
+    def test_packaged_host_entry_points_use_one_canonical_adapter_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / "Release" / "ReplayLab"
+            host.mkdir(parents=True)
+            names = ("ReplayLabMCP.exe", "ReplayLabInternal.exe", "replaylab-ai.exe")
+            (host / "ReplayLabShaderTools.exe").write_bytes(b"independent-shader-runner")
+            for name in names:
+                (host / name).write_bytes(name.encode("ascii"))
+            dll = host / "d3dcompiler_47.dll"
+            dll.write_bytes(b"fixed-compiler-dll")
+            config = root / "config"
+            first = None
+            original = None
+            for name in names:
+                with mock.patch.object(replaylab_tools.sys, "frozen", True, create=True), mock.patch.object(
+                    replaylab_tools.sys, "executable", str(host / name)
+                ), mock.patch.object(
+                    replaylab_tools, "discover", return_value=self._discovered(d3dcompiler=dll)
+                ):
+                    report = replaylab_tools.configure_environment(
+                        host, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                    )
+                pair = tuple(
+                    Path(report[key]) for key in ("toolConfigPath", "routeConfigPath")
+                )
+                operation = ToolchainCatalog(*pair).registry.operation(
+                    "d3dcompiler47-exact-profile", "compile"
+                )
+                self.assertEqual((host / "ReplayLabShaderTools.exe").resolve(), operation.executable)
+                if first is None:
+                    first = report
+                    original = tuple(path.read_bytes() for path in pair)
+                else:
+                    self.assertEqual(first["managedConfig"], report["managedConfig"])
+                    self.assertEqual(original, tuple(path.read_bytes() for path in pair))
+                    self.assertFalse(report["generated"])
+
+    def test_source_and_frozen_launches_share_the_available_bundled_adapter(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / "Release" / "ReplayLab"
+            host.mkdir(parents=True)
+            packaged_host = host / "ReplayLabShaderTools.exe"
+            packaged_host.write_bytes(b"packaged-mcp")
+            dll = host / "d3dcompiler_47.dll"
+            dll.write_bytes(b"fixed-compiler-dll")
+            config = root / "config"
+            found = self._discovered(d3dcompiler=dll)
+            with mock.patch.object(replaylab_tools, "discover", return_value=found):
+                source = replaylab_tools.configure_environment(
+                    host, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                )
+                source_pair = tuple(
+                    Path(source[key]) for key in ("toolConfigPath", "routeConfigPath")
+                )
+                source_bytes = tuple(path.read_bytes() for path in source_pair)
+                with mock.patch.object(replaylab_tools.sys, "frozen", True, create=True), mock.patch.object(
+                    replaylab_tools.sys, "executable", str(packaged_host)
+                ):
+                    frozen = replaylab_tools.configure_environment(
+                        host, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                    )
+                restarted = replaylab_tools.configure_environment(
+                    host, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                )
+
+            self.assertEqual(source["managedConfig"], frozen["managedConfig"])
+            self.assertEqual(source["managedConfig"], restarted["managedConfig"])
+            self.assertEqual(source_bytes, tuple(path.read_bytes() for path in source_pair))
+            source_operation = ToolchainCatalog(*source_pair).registry.operation(
+                "d3dcompiler47-exact-profile", "compile"
+            )
+            frozen_operation = ToolchainCatalog(
+                frozen["toolConfigPath"], frozen["routeConfigPath"]
+            ).registry.operation("d3dcompiler47-exact-profile", "compile")
+            self.assertEqual(packaged_host.resolve(), source_operation.executable)
+            self.assertEqual(packaged_host.resolve(), frozen_operation.executable)
+            self.assertFalse(frozen["generated"])
+            self.assertFalse(restarted["generated"])
+
+    def test_host_only_upgrade_preserves_shader_runner_operation_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / "ReplayLab"
+            host.mkdir()
+            runner = host / "ReplayLabShaderTools.exe"
+            runner.write_bytes(b"fixed-adapter-closure")
+            mcp = host / "ReplayLabMCP.exe"
+            mcp.write_bytes(b"host-report-version-one")
+            dll = host / "d3dcompiler_47.dll"
+            dll.write_bytes(b"fixed-compiler-dll")
+            env = {"REPLAYLAB_CONFIG_DIR": str(root / "config")}
+            with mock.patch.object(replaylab_tools, "discover", return_value=self._discovered(d3dcompiler=dll)):
+                first = replaylab_tools.configure_environment(host, dict(env))
+                pair = [Path(first[key]) for key in ("toolConfigPath", "routeConfigPath")]
+                old_bytes = [path.read_bytes() for path in pair]
+                old_operation = ToolchainCatalog(*pair).registry.operation("d3dcompiler47-exact-profile", "compile")
+                mcp.write_bytes(b"host-report-version-two-unrelated-to-shaders")
+                (host / "ReplayLabInternal.exe").write_bytes(b"new-internal-host")
+                current = replaylab_tools.configure_environment(host, dict(env))
+                operation = ToolchainCatalog(*pair).registry.operation("d3dcompiler47-exact-profile", "compile")
+                self.assertFalse(current["generated"])
+                self.assertEqual(old_bytes, [path.read_bytes() for path in pair])
+                self.assertEqual(old_operation.config_digest, operation.config_digest)
+                self.assertEqual(runner.resolve(), operation.executable)
+                self.assertEqual(replaylab_tools._sha256_file(runner), operation.executable_sha256)
+                runner.write_bytes(b"changed-adapter-implementation")
+                changed = replaylab_tools.configure_environment(host, dict(env))
+                refreshed = ToolchainCatalog(*pair).registry.operation("d3dcompiler47-exact-profile", "compile")
+                self.assertTrue(changed["generated"])
+                self.assertNotEqual(old_operation.config_digest, refreshed.config_digest)
+                self.assertNotEqual(old_operation.executable_sha256, refreshed.executable_sha256)
+
+    def test_source_diagnostic_does_not_fall_back_to_mcp_without_shader_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "ReplayLabMCP.exe").write_bytes(b"old-full-host")
+            with mock.patch.object(replaylab_tools, "generate_official_toolchain_configs") as generate:
+                with self.assertRaisesRegex(RuntimeError, "ReplayLabShaderTools"):
+                    replaylab_tools.configure_environment(root, {"REPLAYLAB_CONFIG_DIR": str(root / "config")})
+                generate.assert_not_called()
+
+    def test_installing_bundled_host_preserves_existing_source_adapter_registry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / "Release" / "ReplayLab"
+            host.mkdir(parents=True)
+            dll = host / "d3dcompiler_47.dll"
+            dll.write_bytes(b"fixed-compiler-dll")
+            config = root / "config"
+            with mock.patch.object(
+                replaylab_tools, "discover", return_value=self._discovered(d3dcompiler=dll)
+            ):
+                source = replaylab_tools.configure_environment(
+                    host, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                )
+                source_pair = tuple(
+                    Path(source[key]) for key in ("toolConfigPath", "routeConfigPath")
+                )
+                source_bytes = tuple(path.read_bytes() for path in source_pair)
+                packaged_host = host / "ReplayLabShaderTools.exe"
+                packaged_host.write_bytes(b"newly-installed-mcp")
+                with mock.patch.object(replaylab_tools.sys, "frozen", True, create=True), mock.patch.object(
+                    replaylab_tools.sys, "executable", str(packaged_host)
+                ):
+                    frozen = replaylab_tools.configure_environment(
+                        host, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                    )
+                python_launch = replaylab_tools.configure_environment(
+                    host, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                )
+
+            self.assertNotEqual(source["toolConfigPath"], frozen["toolConfigPath"])
+            self.assertNotEqual(source["routeConfigPath"], frozen["routeConfigPath"])
+            self.assertEqual(frozen["managedConfig"], python_launch["managedConfig"])
+            self.assertEqual(source_bytes, tuple(path.read_bytes() for path in source_pair))
+            self.assertEqual(
+                Path(sys.executable).resolve(),
+                ToolchainCatalog(*source_pair).registry.operation(
+                    "d3dcompiler47-exact-profile", "compile"
+                ).executable,
+            )
+            self.assertFalse(python_launch["generated"])
+
+    def test_frozen_host_without_canonical_adapter_fails_before_config_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            internal = root / "ReplayLabInternal.exe"
+            internal.write_bytes(b"internal-host")
+            dll = root / "d3dcompiler_47.dll"
+            dll.write_bytes(b"fixed-compiler-dll")
+            with mock.patch.object(replaylab_tools.sys, "frozen", True, create=True), mock.patch.object(
+                replaylab_tools.sys, "executable", str(internal)
+            ), mock.patch.object(
+                replaylab_tools, "discover", return_value=self._discovered(d3dcompiler=dll)
+            ), mock.patch.object(replaylab_tools, "generate_official_toolchain_configs") as generate:
+                with self.assertRaisesRegex((RuntimeError, ToolConfigurationError), "ReplayLabShaderTools"):
+                    replaylab_tools.configure_environment(
+                        root, {"REPLAYLAB_CONFIG_DIR": str(root / "config")}
+                    )
+                generate.assert_not_called()
+
+    def test_legacy_managed_pair_is_preserved_when_install_scoped_config_is_created(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / "Release"
+            host.mkdir()
+            fxc = host / "fxc.exe"
+            fxc.write_bytes(b"packaged-fxc")
+            config = root / "config"
+            config.mkdir()
+            tool_path = config / "shader-tools.v1.json"
+            route_path = config / "shader-toolchains.v1.json"
+            generate_official_toolchain_configs(tool_path, route_path, fxc=fxc)
+            previous = (tool_path.read_bytes(), route_path.read_bytes())
+            replaylab_tools.atomic_write_json(
+                config / "shader-toolchain-status.json",
+                {
+                    "schema": replaylab_tools.DISCOVERY_SCHEMA,
+                    "executableDirectory": str(host.resolve()),
+                    "managedConfig": {
+                        "schema": replaylab_tools.MANAGED_CONFIG_SCHEMA,
+                        "owner": "ReplayLab",
+                        "toolConfigPath": str(tool_path.resolve()),
+                        "routeConfigPath": str(route_path.resolve()),
+                        "toolConfigSha256": hashlib.sha256(previous[0]).hexdigest(),
+                        "routeConfigSha256": hashlib.sha256(previous[1]).hexdigest(),
+                    },
+                },
+            )
+            with mock.patch.object(
+                replaylab_tools, "discover", return_value=self._discovered(fxc=fxc)
+            ):
+                report = replaylab_tools.configure_environment(
+                    host, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                )
+            self.assertNotEqual(tool_path.resolve(), Path(report["toolConfigPath"]).resolve())
+            self.assertNotEqual(route_path.resolve(), Path(report["routeConfigPath"]).resolve())
+            self.assertEqual(previous, (tool_path.read_bytes(), route_path.read_bytes()))
+            ToolchainCatalog(report["toolConfigPath"], report["routeConfigPath"])
+
     def test_managed_config_preserves_exact_catalog_for_byte_identical_relocation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1338,11 +2211,14 @@ class ReplayLabHostTests(unittest.TestCase):
                 return_value=self._discovered(fxc=portable),
             ):
                 first = replaylab_tools.configure_environment(
-                    portable.parent, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                    root, {"REPLAYLAB_CONFIG_DIR": str(config)}
                 )
+            pair = tuple(
+                Path(first[key]) for key in ("toolConfigPath", "routeConfigPath")
+            )
             original_pair = (
-                (config / "shader-tools.v1.json").read_bytes(),
-                (config / "shader-toolchains.v1.json").read_bytes(),
+                pair[0].read_bytes(),
+                pair[1].read_bytes(),
             )
 
             with mock.patch.object(
@@ -1351,7 +2227,7 @@ class ReplayLabHostTests(unittest.TestCase):
                 return_value=self._discovered(fxc=installed),
             ):
                 relocated = replaylab_tools.configure_environment(
-                    installed.parent, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                    root, {"REPLAYLAB_CONFIG_DIR": str(config)}
                 )
 
             self.assertEqual(
@@ -1365,8 +2241,8 @@ class ReplayLabHostTests(unittest.TestCase):
             self.assertEqual(
                 original_pair,
                 (
-                    (config / "shader-tools.v1.json").read_bytes(),
-                    (config / "shader-toolchains.v1.json").read_bytes(),
+                    pair[0].read_bytes(),
+                    pair[1].read_bytes(),
                 ),
             )
             registry = json.loads(original_pair[0].decode("utf-8"))
@@ -1392,7 +2268,7 @@ class ReplayLabHostTests(unittest.TestCase):
                 return_value=self._discovered(fxc=portable),
             ):
                 replaylab_tools.configure_environment(
-                    portable.parent, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                    root, {"REPLAYLAB_CONFIG_DIR": str(config)}
                 )
             portable.unlink()
 
@@ -1402,14 +2278,14 @@ class ReplayLabHostTests(unittest.TestCase):
                 return_value=self._discovered(fxc=installed),
             ):
                 refreshed = replaylab_tools.configure_environment(
-                    installed.parent, {"REPLAYLAB_CONFIG_DIR": str(config)}
+                    root, {"REPLAYLAB_CONFIG_DIR": str(config)}
                 )
 
             self.assertEqual("startup-refresh", refreshed["source"])
             self.assertTrue(refreshed["generated"])
             self.assertFalse(refreshed["relocationEvidence"]["equivalent"])
             registry = json.loads(
-                (config / "shader-tools.v1.json").read_text(encoding="utf-8")
+                Path(refreshed["toolConfigPath"]).read_text(encoding="utf-8")
             )
             self.assertEqual(
                 str(installed.resolve()),
@@ -1451,7 +2327,7 @@ class ReplayLabHostTests(unittest.TestCase):
             self.assertNotEqual(
                 first_tool_hash, refreshed["managedConfig"]["toolConfigSha256"]
             )
-            registry = json.loads((config / "shader-tools.v1.json").read_text("utf-8"))
+            registry = json.loads(Path(refreshed["toolConfigPath"]).read_text("utf-8"))
             fixed_paths = {
                 path
                 for record in registry["tools"].values()
@@ -1484,7 +2360,7 @@ class ReplayLabHostTests(unittest.TestCase):
                 old_registry_hash, refreshed["managedConfig"]["toolConfigSha256"]
             )
             self.assertEqual(
-                replaylab_tools._sha256_file(config / "shader-tools.v1.json"),
+                replaylab_tools._sha256_file(Path(refreshed["toolConfigPath"])),
                 refreshed["managedConfig"]["toolConfigSha256"],
             )
 
@@ -1498,10 +2374,10 @@ class ReplayLabHostTests(unittest.TestCase):
             config = root / "config"
             found = self._discovered(fxc=fxc)
             with mock.patch.object(replaylab_tools, "discover", return_value=found):
-                replaylab_tools.configure_environment(
+                initial = replaylab_tools.configure_environment(
                     host, {"REPLAYLAB_CONFIG_DIR": str(config)}
                 )
-            tool_path = config / "shader-tools.v1.json"
+            tool_path = Path(initial["toolConfigPath"])
             tool_path.write_bytes(tool_path.read_bytes() + b"\n")
             modified = tool_path.read_bytes()
             fxc.write_bytes(b"fxc-v2")
@@ -1583,13 +2459,14 @@ class ReplayLabHostTests(unittest.TestCase):
             fxc.write_bytes(b"fxc-v1")
             found = self._discovered(fxc=fxc)
             with mock.patch.object(replaylab_tools, "discover", return_value=found):
-                replaylab_tools.configure_environment(
+                initial = replaylab_tools.configure_environment(
                     host, {"REPLAYLAB_CONFIG_DIR": str(config)}
                 )
+            tool_path = Path(initial["toolConfigPath"])
             paths = (
-                config / "shader-tools.v1.json",
-                config / "shader-toolchains.v1.json",
-                config / "shader-toolchain-status.json",
+                tool_path,
+                Path(initial["routeConfigPath"]),
+                tool_path.parent / "shader-toolchain-status.json",
             )
             previous = tuple(path.read_bytes() for path in paths)
             fxc.write_bytes(b"fxc-v2")
@@ -1622,13 +2499,14 @@ class ReplayLabHostTests(unittest.TestCase):
             fxc.write_bytes(b"fxc-v1")
             found = self._discovered(fxc=fxc)
             with mock.patch.object(replaylab_tools, "discover", return_value=found):
-                replaylab_tools.configure_environment(
+                initial = replaylab_tools.configure_environment(
                     host, {"REPLAYLAB_CONFIG_DIR": str(config)}
                 )
+            tool_path = Path(initial["toolConfigPath"])
             paths = (
-                config / "shader-tools.v1.json",
-                config / "shader-toolchains.v1.json",
-                config / "shader-toolchain-status.json",
+                tool_path,
+                Path(initial["routeConfigPath"]),
+                tool_path.parent / "shader-toolchain-status.json",
             )
             previous = tuple(path.read_bytes() for path in paths)
             fxc.write_bytes(b"fxc-v2")
@@ -1653,13 +2531,14 @@ class ReplayLabHostTests(unittest.TestCase):
             fxc.write_bytes(b"fxc-v1")
             found = self._discovered(fxc=fxc)
             with mock.patch.object(replaylab_tools, "discover", return_value=found):
-                replaylab_tools.configure_environment(
+                initial = replaylab_tools.configure_environment(
                     host, {"REPLAYLAB_CONFIG_DIR": str(config)}
                 )
+            tool_path = Path(initial["toolConfigPath"])
             paths = (
-                config / "shader-tools.v1.json",
-                config / "shader-toolchains.v1.json",
-                config / "shader-toolchain-status.json",
+                tool_path,
+                Path(initial["routeConfigPath"]),
+                tool_path.parent / "shader-toolchain-status.json",
             )
             previous = tuple(path.read_bytes() for path in paths)
             fxc.write_bytes(b"fxc-v2")

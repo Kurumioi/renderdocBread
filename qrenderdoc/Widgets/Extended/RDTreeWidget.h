@@ -258,8 +258,18 @@ public:
 
   typedef std::function<bool(int, Qt::SortOrder, const RDTreeWidgetItem *, const RDTreeWidgetItem *)>
       ComparisonFunction;
+  typedef std::function<bool(ResourceId, RDTreeWidgetItem *, int)> ResourceLinkHandler;
 
   void setSortComparison(ComparisonFunction comparison) { m_SortComparison = comparison; }
+  void setResourceLinkHandler(ResourceLinkHandler handler) { m_ResourceLinkHandler = handler; }
+  bool tryHandleResourceLink(ResourceId id, const QPoint &pos) const
+  {
+    QModelIndex idx = indexAt(pos);
+    if(!m_ResourceLinkHandler || !idx.isValid())
+      return false;
+
+    return m_ResourceLinkHandler(id, itemForIndex(idx), idx.column());
+  }
   void setColumns(const QStringList &columns);
   const QStringList &getHeaders() const { return m_headers; }
   QString headerText(int column) const { return m_headers[column]; }
@@ -319,6 +329,7 @@ private:
   QStringList m_headers;
 
   ComparisonFunction m_SortComparison;
+  ResourceLinkHandler m_ResourceLinkHandler;
 
   bool m_queueUpdates = false;
 

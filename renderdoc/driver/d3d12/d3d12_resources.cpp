@@ -23,8 +23,10 @@
  ******************************************************************************/
 
 #include "d3d12_resources.h"
+#include <algorithm>
 #include "driver/shaders/dxbc/dxbc_reflect.h"
 #include "driver/shaders/dxil/dxil_metadata.h"
+#include "replay/replay_timing.h"
 #include "d3d12_command_list.h"
 #include "d3d12_command_queue.h"
 #include "d3d12_rootsig.h"
@@ -529,6 +531,308 @@ void WrappedID3D12DescriptorHeap::MarkMutableIndex(uint32_t index)
 
   mutableDescriptorBitmask[index / 64] |= (1ULL << (index % 64));
 }
+
+void D3D12DescriptorRestoreTracker::Reset(uint32_t descriptorCount)
+{
+  m_DescriptorCount = descriptorCount;
+  m_DirtyBlocks.clear();
+  // One bit represents 64 descriptors, so each mask word covers 4096 descriptors.
+  m_DirtyBlockMask.resize(size_t((uint64_t(descriptorCount) + 4095) / 4096));
+  if(!m_DirtyBlockMask.empty())
+    RDCEraseMem(m_DirtyBlockMask.data(), m_DirtyBlockMask.byteSize());
+}
+
+void D3D12DescriptorRestoreTracker::MarkRange(uint32_t first, uint32_t count)
+{
+  if(first >= m_DescriptorCount || count == 0)
+    return;
+
+  // Clamp before adding so a malformed count cannot wrap the end index.
+  const uint32_t last = first + RDCMIN(count, m_DescriptorCount - first) - 1;
+  for(uint32_t block = first / 64; block <= last / 64; block++)
+  {
+    const uint64_t bit = 1ULL << (block % 64);
+    uint64_t &mask = m_DirtyBlockMask[block / 64];
+    if((mask & bit) == 0)
+    {
+      mask |= bit;
+      m_DirtyBlocks.push_back(block);
+    }
+  }
+}
+
+void D3D12DescriptorRestoreTracker::GetRanges(rdcarray<D3D12DescriptorRestoreRange> &ranges)
+{
+  ranges.clear();
+  if(m_DirtyBlocks.empty())
+    return;
+
+  std::sort(m_DirtyBlocks.begin(), m_DirtyBlocks.end());
+  for(uint32_t block : m_DirtyBlocks)
+  {
+    const uint32_t first = block * 64;
+    const uint32_t count = RDCMIN(64U, m_DescriptorCount - first);
+    if(!ranges.empty() && ranges.back().first + ranges.back().count == first)
+      ranges.back().count += count;
+    else
+      ranges.push_back({first, count});
+  }
+}
+
+void D3D12DescriptorRestoreTracker::ClearDirty()
+{
+  for(uint32_t block : m_DirtyBlocks)
+    m_DirtyBlockMask[block / 64] &= ~(1ULL << (block % 64));
+  m_DirtyBlocks.clear();
+}
+
+void WrappedID3D12DescriptorHeap::MarkReplayDirtyRange(uint32_t first, uint32_t count)
+{
+  if(m_ReplayUAVIndexReady)
+    UpdateReplayUAVIndex(first, count);
+
+  if(m_InitialDescriptorSource == NULL || m_RestoringInitialDescriptors)
+    return;
+
+  m_InitialDescriptorDirty.MarkRange(first, count);
+}
+
+void D3D12ReplayUAVIndex::EraseRange(uint32_t first, uint32_t count)
+{
+  auto begin = m_Descriptors.lower_bound(first);
+  auto end = uint64_t(first) + count > UINT_MAX ? m_Descriptors.end()
+                                               : m_Descriptors.lower_bound(first + count);
+  m_Descriptors.erase(begin, end);
+}
+
+void D3D12ReplayUAVIndex::Set(uint32_t index, ResourceId resource, ResourceId counter)
+{
+  m_Descriptors[index] = {resource, counter};
+}
+
+void D3D12ReplayUAVIndex::Gather(uint32_t first, uint32_t count,
+                              std::set<ResourceId> &resources) const
+{
+  const uint64_t end = uint64_t(first) + count;
+  for(auto it = m_Descriptors.lower_bound(first);
+      it != m_Descriptors.end() && it->first < end; ++it)
+  {
+    if(it->second.first != ResourceId())
+      resources.insert(it->second.first);
+    if(it->second.second != ResourceId())
+      resources.insert(it->second.second);
+  }
+}
+
+void WrappedID3D12DescriptorHeap::UpdateReplayUAVIndex(uint32_t first, uint32_t count)
+{
+  if(first >= numDescriptors)
+    return;
+  count = RDCMIN(count, numDescriptors - first);
+  m_ReplayUAVDescriptors.EraseRange(first, count);
+  for(uint32_t i = first; i < first + count; i++)
+  {
+    if(descriptors[i].GetType() == D3D12DescriptorType::UAV)
+      m_ReplayUAVDescriptors.Set(i, descriptors[i].GetResResourceId(),
+                                descriptors[i].GetCounterResourceId());
+  }
+}
+
+bool WrappedID3D12DescriptorHeap::GatherReplayUAVResources(uint32_t first, uint32_t count,
+                                                         std::set<ResourceId> &resources)
+{
+  if(first > numDescriptors || count > numDescriptors - first)
+    return false;
+  if(!m_ReplayUAVIndexReady)
+  {
+    UpdateReplayUAVIndex(0, numDescriptors);
+    m_ReplayUAVIndexReady = true;
+  }
+  m_ReplayUAVDescriptors.Gather(first, count, resources);
+  return true;
+}
+
+void WrappedID3D12DescriptorHeap::InvalidateInitialDescriptorRestore()
+{
+  // Called before resource/shader binding replacements can change the replay. The next reset
+  // deliberately takes the complete baseline path even when no captured descriptor write ran.
+  m_InitialDescriptorSource = NULL;
+  m_InitialDescriptorDirty.ClearDirty();
+  SAFE_DELETE_ARRAY(cachedDescriptors);
+}
+
+bool WrappedID3D12DescriptorHeap::GetCheckpointDescriptorRanges(
+    ResourceId &baseline, rdcarray<D3D12DescriptorRestoreRange> &ranges)
+{
+  baseline = ResourceId();
+  ranges.clear();
+  if(!m_InitialDescriptorSource || m_RestoringInitialDescriptors || m_pDevice->HasFatalError() ||
+     m_InitialDescriptorSource->GetNumDescriptors() != numDescriptors)
+    return false;
+
+  baseline = GetResID(m_InitialDescriptorSource);
+  m_InitialDescriptorDirty.GetRanges(ranges);
+  return true;
+}
+
+void WrappedID3D12DescriptorHeap::RestoreInitialDescriptors(WrappedID3D12DescriptorHeap *source,
+                                                            bool forceFullRestore)
+{
+  if(source == NULL || m_pDevice->HasFatalError())
+    return;
+
+  const uint32_t count = source->GetNumDescriptors();
+  bool fullRestore = forceFullRestore || count <= 1024 || m_InitialDescriptorSource != source;
+  rdcarray<D3D12DescriptorRestoreRange> ranges;
+  if(!fullRestore)
+  {
+    m_InitialDescriptorDirty.GetRanges(ranges);
+    // Highly fragmented heaps are cheaper to restore in one copy than thousands of tiny calls.
+    fullRestore = ranges.size() > 1024;
+  }
+  if(fullRestore)
+  {
+    ranges.clear();
+    if(count)
+      ranges.push_back({0, count});
+    AddReplayTimingCounter(ReplayTimingCounter::InitialDescriptorFullRestores);
+  }
+
+  uint64_t copied = 0;
+  m_RestoringInitialDescriptors = true;
+  for(const D3D12DescriptorRestoreRange &range : ranges)
+  {
+    // Wrapped copies update both native descriptors and RenderDoc's CPU metadata. The hook in
+    // CopyDescriptorsSimple must not mark this initial-state copy as a new replay mutation.
+    m_pDevice->CopyDescriptorsSimple(range.count, descriptors[range.first],
+                                    source->GetDescriptors()[range.first], source->GetDesc().Type);
+    copied += range.count;
+  }
+  m_RestoringInitialDescriptors = false;
+  AddReplayTimingCounter(ReplayTimingCounter::InitialDescriptors, copied);
+  AddReplayTimingCounter(ReplayTimingCounter::InitialDescriptorsSkipped, count - copied);
+  AddReplayTimingCounter(ReplayTimingCounter::InitialDescriptorRanges, ranges.size());
+
+  if(m_pDevice->HasFatalError())
+  {
+    InvalidateInitialDescriptorRestore();
+    return;
+  }
+
+  if(fullRestore)
+    m_InitialDescriptorDirty.Reset(count > 1024 ? count : 0);
+  else
+    m_InitialDescriptorDirty.ClearDirty();
+  // Small heaps keep the simpler complete-copy path and need no dirty tracking allocation.
+  m_InitialDescriptorSource = count > 1024 ? source : NULL;
+}
+
+#if ENABLED(ENABLE_UNIT_TESTS)
+
+#include "catch/catch.hpp"
+
+TEST_CASE("D3D12 submitted UAV ranges include counters and follow descriptor overwrites",
+          "[d3d12][replay][dirty-restore]")
+{
+  D3D12ReplayUAVIndex index;
+  const ResourceId first = ResourceIDGen::GetNewUniqueID();
+  const ResourceId counter = ResourceIDGen::GetNewUniqueID();
+  const ResourceId replacement = ResourceIDGen::GetNewUniqueID();
+  index.Set(5, first, ResourceId());
+  index.Set(1000001, first, counter);
+  index.Set(2000000, replacement, ResourceId());
+  std::set<ResourceId> writes;
+  index.Gather(1000, 1500000, writes);
+  CHECK(writes.size() == 2);
+  CHECK(writes.count(first) == 1);
+  CHECK(writes.count(counter) == 1);
+  CHECK(writes.count(replacement) == 0);
+
+  // A CopyDescriptors/native Create can replace the same location between two submissions.
+  index.EraseRange(1000000, 64);
+  index.Set(1000001, replacement, ResourceId());
+  writes.clear();
+  index.Gather(1000001, 1, writes);
+  CHECK(writes.size() == 1);
+  CHECK(writes.count(replacement) == 1);
+  CHECK(writes.count(counter) == 0);
+
+  // Restoring that block to a non-UAV baseline removes the preceding destination/counter.
+  index.EraseRange(1000000, 64);
+  writes.clear();
+  index.Gather(1000001, 1, writes);
+  CHECK(writes.empty());
+  index.Set(UINT_MAX, counter, ResourceId());
+  index.EraseRange(UINT_MAX, 1);
+  index.Gather(UINT_MAX, 1, writes);
+  CHECK(writes.empty());
+  index.Gather(0, 6, writes);
+  CHECK(writes.count(first) == 1);
+}
+
+TEST_CASE("D3D12 descriptor restore coalesces dirty blocks and clamps the heap tail",
+          "[d3d12][replay][descriptor-restore]")
+{
+  D3D12DescriptorRestoreTracker tracker;
+  rdcarray<D3D12DescriptorRestoreRange> ranges;
+  tracker.Reset(130);
+  tracker.GetRanges(ranges);
+  CHECK(ranges.empty());
+
+  tracker.MarkRange(63, 2);
+  tracker.MarkRange(63, 2);
+  tracker.GetRanges(ranges);
+  REQUIRE(ranges.size() == 1);
+  CHECK(ranges[0].first == 0);
+  CHECK(ranges[0].count == 128);
+
+  tracker.MarkRange(128, ~0U);
+  tracker.GetRanges(ranges);
+  REQUIRE(ranges.size() == 1);
+  CHECK(ranges[0].first == 0);
+  CHECK(ranges[0].count == 130);
+
+  tracker.ClearDirty();
+  tracker.MarkRange(129, 1);
+  tracker.GetRanges(ranges);
+  REQUIRE(ranges.size() == 1);
+  CHECK(ranges[0].first == 128);
+  CHECK(ranges[0].count == 2);
+}
+
+TEST_CASE("D3D12 descriptor restore tracks sparse writes across mask words",
+          "[d3d12][replay][descriptor-restore]")
+{
+  D3D12DescriptorRestoreTracker tracker;
+  rdcarray<D3D12DescriptorRestoreRange> ranges;
+  tracker.Reset(8193);
+  tracker.MarkRange(8192, 1);
+  tracker.MarkRange(0, 1);
+  tracker.MarkRange(4096, 1);
+  tracker.MarkRange(8193, 100);
+  tracker.MarkRange(100, 0);
+  tracker.GetRanges(ranges);
+  REQUIRE(ranges.size() == 3);
+  CHECK(ranges[0].first == 0);
+  CHECK(ranges[0].count == 64);
+  CHECK(ranges[1].first == 4096);
+  CHECK(ranges[1].count == 64);
+  CHECK(ranges[2].first == 8192);
+  CHECK(ranges[2].count == 1);
+
+  tracker.ClearDirty();
+  tracker.MarkRange(4096, 1);
+  tracker.GetRanges(ranges);
+  REQUIRE(ranges.size() == 1);
+  CHECK(ranges[0].first == 4096);
+
+  tracker.Reset(0);
+  tracker.MarkRange(0, ~0U);
+  tracker.GetRanges(ranges);
+  CHECK(ranges.empty());
+}
+
+#endif    // ENABLED(ENABLE_UNIT_TESTS)
 
 bool WrappedID3D12DescriptorHeap::HasValidDescriptorCache(uint32_t index)
 {
@@ -1766,27 +2070,82 @@ void WrappedID3D12QueryHeap::SaveValidQueries(ID3D12GraphicsCommandList *unwrapp
   }
 }
 
+static UINT QueryResolveRunEnd(const rdcarray<D3D12_QUERY_TYPE> &valid, UINT start, UINT end)
+{
+  UINT next = start + 1;
+  while(next < end && valid[next] == valid[start])
+    next++;
+  return next;
+}
+
+bool WrappedID3D12QueryHeap::CanCheckpointQuery(UINT index, D3D12_QUERY_TYPE type) const
+{
+  if(index >= m_Valid.size() || m_Valid[index] != type)
+    return false;
+  // Saved results are resolved on the internal DIRECT queue. Copy-queue timestamps, video
+  // queries and newer query types require their own compatible queue/feature handling.
+  switch(m_Type)
+  {
+    case D3D12_QUERY_HEAP_TYPE_TIMESTAMP: return type == D3D12_QUERY_TYPE_TIMESTAMP;
+    case D3D12_QUERY_HEAP_TYPE_OCCLUSION:
+      return type == D3D12_QUERY_TYPE_OCCLUSION || type == D3D12_QUERY_TYPE_BINARY_OCCLUSION;
+    case D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS:
+      return type == D3D12_QUERY_TYPE_PIPELINE_STATISTICS;
+    case D3D12_QUERY_HEAP_TYPE_SO_STATISTICS:
+      return type >= D3D12_QUERY_TYPE_SO_STATISTICS_STREAM0 &&
+             type <= D3D12_QUERY_TYPE_SO_STATISTICS_STREAM3;
+    default: return false;
+  }
+}
+
 void WrappedID3D12QueryHeap::ResolveValidQueryData(ID3D12GraphicsCommandList *list,
                                                    D3D12_QUERY_TYPE Type, UINT StartIndex,
                                                    UINT NumQueries, ID3D12Resource *destBuf,
-                                                   UINT64 destOffs)
+                                                   UINT64 destOffs, ResourceId baked,
+                                                   uint32_t relativeEvent)
 {
   UINT64 stride = GetResolveDataSize();
 
+  if(StartIndex > m_Valid.size() || NumQueries > m_Valid.size() - StartIndex)
+  {
+    RDCERR("Query resolve range %u + %u exceeds heap size %zu", StartIndex, NumQueries,
+           m_Valid.size());
+    return;
+  }
+
   // find contiguous ranges, for sensible applications there should only be a few ranges rather than scattered queries.
+  UINT runEnd = StartIndex;
   for(UINT i = StartIndex, end = StartIndex + NumQueries; i < end;)
   {
     // doesn't matter if the query is valid or not we will still need to resolve it
     UINT start = i;
 
-    for(; i < m_Valid.size(); i++)
-      if(m_Valid[i] != m_Valid[start])
+    // Coalesce only within this request. Extending to the end of a same-type heap would resolve
+    // additional native queries and overwrite bytes past the application's destination range.
+    ID3D12Resource *saved = NULL;
+    UINT64 savedOffset = 0;
+    m_pDevice->GetReplayCheckpointQueryResult(baked, relativeEvent, GetResourceID(), start,
+                                             saved, savedOffset);
+    if(start == runEnd)
+      runEnd = QueryResolveRunEnd(m_Valid, start, end);
+    i = start + 1;
+    for(; i < runEnd; i++)
+    {
+      ID3D12Resource *next = NULL;
+      UINT64 nextOffset = 0;
+      m_pDevice->GetReplayCheckpointQueryResult(baked, relativeEvent, GetResourceID(), i,
+                                               next, nextOffset);
+      if(next != saved || (saved && nextOffset != savedOffset + stride * (i - start)))
         break;
+    }
 
     UINT num = i - start;
 
     // if the query range is valid, resolve it normally
-    if(m_Valid[start] != InvalidQueryType)
+    if(saved)
+      Unwrap(list)->CopyBufferRegion(Unwrap(destBuf), destOffs + stride * (start - StartIndex),
+                                     saved, savedOffset, stride * num);
+    else if(m_Valid[start] != InvalidQueryType)
       Unwrap(list)->ResolveQueryData(GetReal(), m_Valid[start], start, num, Unwrap(destBuf),
                                      destOffs + stride * (start - StartIndex));
     else if(m_SavedResults)
@@ -1794,3 +2153,18 @@ void WrappedID3D12QueryHeap::ResolveValidQueryData(ID3D12GraphicsCommandList *li
                                      Unwrap(m_SavedResults), stride * start, stride * num);
   }
 }
+
+#if ENABLED(ENABLE_UNIT_TESTS)
+TEST_CASE("D3D12 query resolve runs stay within the requested destination range",
+          "[d3d12][replay][checkpoint]")
+{
+  rdcarray<D3D12_QUERY_TYPE> valid = {
+      D3D12_QUERY_TYPE_OCCLUSION, D3D12_QUERY_TYPE_OCCLUSION, D3D12_QUERY_TYPE_OCCLUSION,
+      D3D12_QUERY_TYPE_BINARY_OCCLUSION, D3D12_QUERY_TYPE_BINARY_OCCLUSION};
+  CHECK(QueryResolveRunEnd(valid, 0, 1) == 1);
+  CHECK(QueryResolveRunEnd(valid, 1, 2) == 2);
+  CHECK(QueryResolveRunEnd(valid, 0, 5) == 3);
+  CHECK(QueryResolveRunEnd(valid, 3, 4) == 4);
+  CHECK(QueryResolveRunEnd(valid, 3, 5) == 5);
+}
+#endif

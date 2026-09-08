@@ -25,6 +25,7 @@
 
 #include "d3d11_context.h"
 #include "driver/dx/official/dxgi1_3.h"
+#include "replay/replay_timing.h"
 #include "strings/string_utils.h"
 #include "tinyfiledialogs/tinyfiledialogs.h"
 #include "d3d11_debug.h"
@@ -5737,6 +5738,7 @@ bool WrappedID3D11DeviceContext::Serialise_Flush(SerialiserType &ser)
 {
   if(IsReplayingAndReading())
   {
+    ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitSubmit);
     m_pRealContext->Flush();
   }
 

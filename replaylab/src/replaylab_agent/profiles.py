@@ -16,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 from .catalog import ProviderPreset, get_preset
 from .credential_store import normalize_api_credential
 from .errors import AuthenticationError, ConfigurationError
-from .process_env import RESERVED_CREDENTIAL_ENV
+from .process_env import MCP_HOST_PROVIDER_ENV, RESERVED_CREDENTIAL_ENV
 
 PROFILE_SCHEMA = "replaylab-ai-profiles/v2"
 LEGACY_PROFILE_SCHEMAS = frozenset({"replaylab-ai-profiles/v1"})
@@ -50,35 +50,22 @@ _ALLOWED_OPTION_KEYS = frozenset(
         "api_version",
         "allow_unsandboxed_agent",
         "document_input",
+        "image_input",
         "location",
-        "max_completion_tokens",
         "max_output_tokens",
-        "multiple_system_messages",
-        "planner_timeout_seconds",
         "project",
         "reasoning_effort",
-        "request_limit",
-        "specialist_timeout_seconds",
-        "chat_timeout_seconds",
-        "context_compaction_calls",
-        "context_compaction_timeout_seconds",
         "context_fallback_window_tokens",
         "context_recent_turns",
         "context_reserved_output_tokens",
         "context_target_percent",
         "context_trigger_percent",
         "context_window_tokens",
-        "max_specialist_attempts",
-        "max_supervisor_stages",
-        "max_total_tasks",
-        "strict_tools",
+        "stream_thinking",
         "subscription_auth_flow",
-        "supports_json_schema_output",
-        "supports_tools",
         "temperature",
+        "thinking_budget_tokens",
         "timeout_seconds",
-        "tool_choice_required",
-        "tool_calls_limit",
     }
 )
 
@@ -112,7 +99,7 @@ def is_loopback_endpoint(endpoint: str) -> bool:
 
 
 def _command_argument_may_contain_secret(argument: str) -> bool:
-    """Reject common raw-secret carriers before a custom Agent argv is persisted.
+    """Reject common raw-secret carriers before an Agent argv is persisted.
 
     Custom ACP commands are intentionally argv arrays rather than shell text,
     but arbitrary vendors use many credential flag spellings.  Inspect option
@@ -202,6 +189,11 @@ class Profile:
     agent_env: list[str] = field(default_factory=list)
     options: dict[str, Any] = field(default_factory=dict)
     probed_capabilities: list[str] | None = None
+    # Exact, user/provider-verified context windows keyed by complete model id.
+    # This formal field keeps the legacy scalar ``options.context_window_tokens``
+    # compatible while allowing one profile to enable models with different
+    # windows without applying one model's limit to every selection.
+    model_context_windows: dict[str, int] = field(default_factory=dict)
 
     def validate(self) -> None:
         string_fields = {
@@ -280,6 +272,42 @@ class Profile:
             or any(not isinstance(value, str) for value in self.probed_capabilities)
         ):
             raise ConfigurationError("probed_capabilities must be null or an array of strings")
+        if not isinstance(self.model_context_windows, dict):
+            raise ConfigurationError("model_context_windows must be an object")
+        if len(self.model_context_windows) > 200:
+            raise ConfigurationError(
+                "model_context_windows may contain at most 200 entries"
+            )
+        cleaned_context_windows: dict[str, int] = {}
+        for raw_model_id, raw_window in self.model_context_windows.items():
+            if not isinstance(raw_model_id, str):
+                raise ConfigurationError(
+                    "model_context_windows keys must be model-id strings"
+                )
+            model_id = raw_model_id.strip()
+            if (
+                not model_id
+                or len(model_id) > 512
+                or any(character in model_id for character in ("\0", "\r", "\n"))
+            ):
+                raise ConfigurationError(
+                    "model_context_windows keys must be non-empty single-line model ids "
+                    "of at most 512 characters"
+                )
+            if (
+                not isinstance(raw_window, int)
+                or isinstance(raw_window, bool)
+                or not 4096 <= raw_window <= 4_000_000
+            ):
+                raise ConfigurationError(
+                    "model_context_windows values must be integers between 4096 and 4000000"
+                )
+            if model_id in cleaned_context_windows:
+                raise ConfigurationError(
+                    "model_context_windows model ids must be unique after trimming"
+                )
+            cleaned_context_windows[model_id] = raw_window
+        self.model_context_windows = cleaned_context_windows
         if not _ID_RE.fullmatch(self.id):
             raise ConfigurationError(
                 "profile id must contain only lowercase letters, numbers, '.', '_' or '-'"
@@ -312,6 +340,10 @@ class Profile:
             raise ConfigurationError("agent_env names must be unique")
         if any(not _ENV_RE.fullmatch(name) for name in self.agent_env):
             raise ConfigurationError("agent_env entries must be valid environment variable names")
+        if any(name.upper() in MCP_HOST_PROVIDER_ENV for name in self.agent_env):
+            raise ConfigurationError(
+                "agent_env must not expose ReplayLab MCP provider configuration"
+            )
         if preset.kind != "agent" and self.agent_env:
             raise ConfigurationError("agent_env is only valid for external Agent profiles")
         if self.endpoint:
@@ -331,8 +363,20 @@ class Profile:
                 raise ConfigurationError(
                     "base_url must not contain credentials, query parameters, or fragments"
                 )
-        for argument in self.argv:
-            if not argument or "\0" in argument:
+        profile_argv = self.argv
+        trusted_catalog_argv = (
+            bool(preset.command)
+            and len(profile_argv) == len(preset.command)
+            and tuple(profile_argv[1:]) == preset.command[1:]
+        )
+        for index, argument in enumerate(profile_argv):
+            # Empty non-executable argv entries are valid and are required by a
+            # small number of audited vendor flags (for example CodeBuddy's
+            # documented ``--tools ""``). Custom commands keep the previous
+            # non-empty rule; only the exact built-in catalog argv may use one.
+            if "\0" in argument or (
+                not argument and (index == 0 or not trusted_catalog_argv)
+            ):
                 raise ConfigurationError("external Agent command contains an invalid argument")
             if _command_argument_may_contain_secret(argument):
                 raise ConfigurationError(
@@ -361,12 +405,8 @@ class Profile:
         boolean_options = {
             "allow_unsandboxed_agent",
             "document_input",
-            "max_completion_tokens",
-            "multiple_system_messages",
-            "strict_tools",
-            "supports_json_schema_output",
-            "supports_tools",
-            "tool_choice_required",
+            "image_input",
+            "stream_thinking",
         }
         for key in boolean_options & self.options.keys():
             if not isinstance(self.options[key], bool):
@@ -392,23 +432,14 @@ class Profile:
                 "profile option 'subscription_auth_flow' must be 'browser' or 'device'"
             )
         for key, minimum, maximum in (
-            ("request_limit", 1, 20),
-            ("tool_calls_limit", 1, 40),
             ("max_output_tokens", 1, 1_000_000),
-            ("planner_timeout_seconds", 15, 300),
-            ("specialist_timeout_seconds", 30, 1800),
-            ("chat_timeout_seconds", 15, 300),
-            ("context_compaction_calls", 1, 12),
-            ("context_compaction_timeout_seconds", 5, 120),
             ("context_fallback_window_tokens", 4096, 4_000_000),
             ("context_recent_turns", 0, 32),
             ("context_reserved_output_tokens", 256, 1_000_000),
             ("context_target_percent", 20, 70),
             ("context_trigger_percent", 50, 100),
             ("context_window_tokens", 4096, 4_000_000),
-            ("max_specialist_attempts", 1, 3),
-            ("max_supervisor_stages", 1, 6),
-            ("max_total_tasks", 1, 12),
+            ("thinking_budget_tokens", 0, 128_000),
         ):
             if key in self.options and (
                 not isinstance(self.options[key], int)
@@ -477,28 +508,8 @@ class Profile:
     def capabilities(self) -> frozenset[str]:
         if self.probed_capabilities is not None:
             capabilities = set(self.probed_capabilities)
-        elif self.provider.kind == "agent":
-            # A managed Agent protocol is itself the tool-capable product
-            # contract.  Model API presets, by contrast, cover many concrete
-            # models whose capabilities differ, so their catalog declarations
-            # must never silently authorize model-dependent features.
-            capabilities = set(self.provider.declared_capabilities)
         else:
-            capabilities = set(self.provider.declared_capabilities) - {
-                "tools",
-                "json-schema",
-                "vision",
-            }
-        for option, capability in (
-            ("supports_tools", "tools"),
-            ("supports_json_schema_output", "json-schema"),
-        ):
-            if option not in self.options:
-                continue
-            if self.options[option] is True:
-                capabilities.add(capability)
-            else:
-                capabilities.discard(capability)
+            capabilities = set(self.provider.declared_capabilities)
         return frozenset(capabilities)
 
     def resolve_api_key(self, environ: dict[str, str] | None = None) -> str:

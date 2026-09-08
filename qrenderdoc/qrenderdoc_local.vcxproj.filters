@@ -126,6 +126,9 @@
     <ClCompile Include="Windows\EventBrowser.cpp">
       <Filter>Windows</Filter>
     </ClCompile>
+    <ClCompile Include="Windows\BookmarksView.cpp">
+      <Filter>Windows</Filter>
+    </ClCompile>
     <ClCompile Include="Widgets\ResourcePreview.cpp">
       <Filter>Widgets</Filter>
     </ClCompile>
@@ -180,6 +183,9 @@
     <ClCompile Include="Code\ReplayLab\ReplayLabIntegration.cpp">
       <Filter>Code\ReplayLab</Filter>
     </ClCompile>
+    <ClCompile Include="Code\ReplayLab\ReplayLabCBufferAliases.cpp">
+      <Filter>Code\ReplayLab</Filter>
+    </ClCompile>
     <ClCompile Include="Code\qprocessinfo.cpp">
       <Filter>Code</Filter>
     </ClCompile>
@@ -211,6 +217,9 @@
       <Filter>Widgets\Extended</Filter>
     </ClCompile>
     <ClCompile Include="Widgets\BufferFormatSpecifier.cpp">
+      <Filter>Widgets</Filter>
+    </ClCompile>
+    <ClCompile Include="Widgets\ShaderCodeEditor.cpp">
       <Filter>Widgets</Filter>
     </ClCompile>
     <ClCompile Include="Windows\BufferViewer.cpp">
@@ -411,6 +420,9 @@
     <ClCompile Include="Windows\PixelHistoryView.cpp">
       <Filter>Windows</Filter>
     </ClCompile>
+    <ClCompile Include="Windows\RenderTargetHistoryView.cpp">
+      <Filter>Windows</Filter>
+    </ClCompile>
     <ClCompile Include="Widgets\Extended\RDTreeView.cpp">
       <Filter>Widgets\Extended</Filter>
     </ClCompile>
@@ -594,6 +606,9 @@
     <ClCompile Include="$(IntDir)generated\moc_FindReplace.cpp">
       <Filter>Generated Files</Filter>
     </ClCompile>
+    <ClCompile Include="$(IntDir)generated\moc_ShaderCodeEditor.cpp">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
     <ClCompile Include="$(IntDir)generated\moc_RDSplitter.cpp">
       <Filter>Generated Files</Filter>
     </ClCompile>
@@ -634,6 +649,15 @@
       <Filter>Windows</Filter>
     </ClCompile>
     <ClCompile Include="Windows\AI\AIAssistant.cpp">
+      <Filter>Windows\AI</Filter>
+    </ClCompile>
+    <ClCompile Include="Windows\AI\AIFileThumbnail.cpp">
+      <Filter>Windows\AI</Filter>
+    </ClCompile>
+    <ClCompile Include="Windows\AI\AIAgentMonitorWindow.cpp">
+      <Filter>Windows\AI</Filter>
+    </ClCompile>
+    <ClCompile Include="Windows\AI\AIAgentTraceStore.cpp">
       <Filter>Windows\AI</Filter>
     </ClCompile>
     <ClCompile Include="Windows\AI\AIConversationListView.cpp">
@@ -1031,6 +1055,9 @@
     <ClInclude Include="Code\ReplayLab\ReplayLabIntegration.h">
       <Filter>Code\ReplayLab</Filter>
     </ClInclude>
+    <ClInclude Include="Code\ReplayLab\ReplayLabCBufferAliases.h">
+      <Filter>Code\ReplayLab</Filter>
+    </ClInclude>
     <ClInclude Include="Code\Resources.h">
       <Filter>Code</Filter>
     </ClInclude>
@@ -1151,6 +1178,15 @@
     <ClInclude Include="Windows\AI\AIAssistant.h">
       <Filter>Windows\AI</Filter>
     </ClInclude>
+    <ClInclude Include="Windows\AI\AIFileThumbnail.h">
+      <Filter>Windows\AI</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\AI\AIAgentMonitorWindow.h">
+      <Filter>Windows\AI</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\AI\AIAgentTraceStore.h">
+      <Filter>Windows\AI</Filter>
+    </ClInclude>
     <ClInclude Include="Windows\AI\AIConversationListView.h">
       <Filter>Windows\AI</Filter>
     </ClInclude>
@@ -1162,6 +1198,12 @@
     </ClInclude>
     <ClInclude Include="Windows\AI\AIPendingChatView.h">
       <Filter>Windows\AI</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\BookmarksView.h">
+      <Filter>Windows</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\RenderTargetHistoryView.h">
+      <Filter>Windows</Filter>
     </ClInclude>
     <ClInclude Include="Code\precompiled.h">
       <Filter>PCH</Filter>
@@ -1533,6 +1575,9 @@
       <Filter>Widgets</Filter>
     </CustomBuild>
     <CustomBuild Include="Widgets\FindReplace.h">
+      <Filter>Widgets</Filter>
+    </CustomBuild>
+    <CustomBuild Include="Widgets\ShaderCodeEditor.h">
       <Filter>Widgets</Filter>
     </CustomBuild>
     <CustomBuild Include="Widgets\Extended\RDSplitter.h">

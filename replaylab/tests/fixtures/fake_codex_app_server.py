@@ -6,12 +6,9 @@ import time
 
 
 mode = sys.argv[1] if len(sys.argv) > 1 else "success"
-thread_start_attempts = 0
-turn_start_attempts = 0
 login_completed = False
 post_login_account_reads = 0
-pending_dynamic_tool: int | None = None
-dynamic_mode = mode.startswith("dynamic-tool")
+mcp_status_reads = 0
 
 
 def send(value: dict) -> None:
@@ -19,102 +16,95 @@ def send(value: dict) -> None:
     sys.stdout.flush()
 
 
-def send_dynamic_request(
-    request_id: int = 900,
-    *,
-    turn_id: object = "turn-test",
-    call_id: object = "dynamic-call-1",
-) -> None:
-    send(
-        {
-            "id": request_id,
-            "method": "item/tool/call",
-            "params": {
-                "threadId": "thread-test",
-                "turnId": turn_id,
-                "callId": call_id,
-                "namespace": None,
-                "tool": "inspect_event",
-                "arguments": {"event_id": 7},
-            },
+def mcp_status(name: str, *, runtime_status: str, with_tools: bool) -> dict:
+    tools = {}
+    if with_tools:
+        tools["inspect_event"] = {
+            "name": "inspect_event",
+            "description": "Inspect one event",
+            "inputSchema": {"type": "object"},
         }
-    )
-
-
-def complete_dynamic_turn() -> None:
-    send(
-        {
-            "method": "item/agentMessage/delta",
-            "params": {
-                "threadId": "thread-test",
-                "turnId": "turn-test",
-                "delta": "dynamic evidence ",
-            },
+    return {
+        "authStatus": "unsupported",
+        "name": name,
+        "pluginId": None,
+        "resourceTemplates": [],
+        "resources": [],
+        "runtimeStatus": runtime_status,
+        "serverInfo": {
+            "name": name,
+            "version": "test",
+            "description": None,
+            "icons": None,
+            "title": None,
+            "websiteUrl": None,
         }
-    )
-    send(
-        {
-            "method": "item/completed",
-            "params": {
-                "threadId": "thread-test",
-                "turnId": "turn-test",
-                "item": {
-                    "type": "agentMessage",
-                    "phase": "final_answer",
-                    "text": "dynamic evidence answer",
-                },
-            },
-        }
-    )
-    send(
-        {
-            "method": "turn/completed",
-            "params": {
-                "threadId": "thread-test",
-                "turn": {"id": "turn-test", "status": "completed", "error": None},
-            },
-        }
-    )
+        if runtime_status == "connected"
+        else None,
+        "tools": tools,
+    }
 
 
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get("method")
     request_id = message.get("id")
-    if method is None and dynamic_mode and request_id in {900, 901}:
-        assert pending_dynamic_tool == request_id
-        if mode in {
-            "dynamic-tool-wrong-turn",
-            "dynamic-tool-wrong-type",
-            "dynamic-tool-duplicate",
-        } and (
-            mode in {"dynamic-tool-wrong-turn", "dynamic-tool-wrong-type"}
-            or request_id == 901
-        ):
-            assert message["error"]["code"] == -32602
-            pending_dynamic_tool = None
-            continue
-        if mode in {"dynamic-tool-failure", "dynamic-tool-invalid-json"}:
-            assert message["result"]["success"] is False
-            content = message["result"]["contentItems"]
-            assert json.loads(content[0]["text"])["error"] == "internal RenderDoc tool failed"
-        else:
-            assert message["result"]["success"] is True
-            content = message["result"]["contentItems"]
-            assert json.loads(content[0]["text"])["eventId"] == 7
-        if mode == "dynamic-tool-duplicate" and request_id == 900:
-            send_dynamic_request(901)
-            pending_dynamic_tool = 901
-            continue
-        pending_dynamic_tool = None
-        complete_dynamic_turn()
+    if method is None and mode == "approval" and request_id == 900:
+        assert message["result"] == {"decision": "decline"}
+        send(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-test",
+                    "turnId": "turn-test",
+                    "delta": "continued with admitted tools",
+                },
+            }
+        )
+        send(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-test",
+                    "turnId": "turn-test",
+                    "item": {
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "continued with admitted tools",
+                    },
+                },
+            }
+        )
+        send(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-test",
+                    "turn": {
+                        "id": "turn-test",
+                        "status": "completed",
+                        "error": None,
+                    },
+                },
+            }
+        )
     elif method == "initialize":
         if mode == "exit-initialize":
             raise SystemExit(17)
-        if dynamic_mode:
-            assert message["params"]["capabilities"]["experimentalApi"] is True
-        else:
-            assert "capabilities" not in message["params"]
+        # ReplayLab's current permission contract always uses
+        # runtimeWorkspaceRoots, which is experimental-gated by app-server.
+        assert message["params"]["capabilities"]["experimentalApi"] is True
+        if mode == "legacy-initialize-protocol":
+            send(
+                {
+                    "id": request_id,
+                    "error": {
+                        "code": -32600,
+                        "message": "Invalid request: unknown field capabilities.experimentalApi",
+                    },
+                }
+            )
+            continue
         send({"id": request_id, "result": {"userAgent": "fake"}})
     elif method == "account/read":
         if mode in {"login-race", "login-update-first"}:
@@ -203,43 +193,96 @@ for line in sys.stdin:
         )
     elif method == "account/logout":
         send({"id": request_id, "result": {}})
-    elif method == "thread/start":
-        assert not mode.startswith("signed-out"), "signed-out run must fail before thread/start"
-        assert message["params"]["approvalPolicy"] == "never"
-        assert message["params"]["ephemeral"] is True
-        if dynamic_mode:
-            assert isinstance(message["params"].get("dynamicTools"), list)
-            assert [item["name"] for item in message["params"]["dynamicTools"]] == [
-                "inspect_event"
-            ]
-        else:
-            assert "dynamicTools" not in message["params"]
-        thread_start_attempts += 1
-        if mode == "kebab-sandbox" and thread_start_attempts == 1:
-            assert message["params"]["sandbox"] == "readOnly"
+    elif method == "permissionProfile/list":
+        assert message["params"]["cwd"]
+        assert message["params"]["limit"] == 100
+        if mode == "legacy-permission-protocol":
             send(
                 {
                     "id": request_id,
                     "error": {
-                        "code": -32600,
-                        "message": (
-                            "Invalid request: unknown variant `readOnly`, expected one of "
-                            "`read-only`, `workspace-write`, `danger-full-access`"
-                        ),
+                        "code": -32601,
+                        "message": "Method not found: permissionProfile/list",
                     },
                 }
             )
             continue
-        expected_sandbox = "read-only" if mode == "kebab-sandbox" else "readOnly"
-        assert message["params"]["sandbox"] == expected_sandbox
+        allowed = mode != "read-only-profile-unavailable"
+        send(
+            {
+                "id": request_id,
+                "result": {
+                    "data": [
+                        {"id": ":read-only", "allowed": allowed},
+                        {"id": ":workspace", "allowed": True},
+                    ],
+                    "nextCursor": None,
+                },
+            }
+        )
+    elif method == "thread/start":
+        assert not mode.startswith("signed-out"), "signed-out run must fail before thread/start"
+        assert message["params"]["approvalPolicy"] == "never"
+        assert message["params"]["ephemeral"] is True
+        assert message["params"]["permissions"] == ":read-only"
+        assert message["params"]["runtimeWorkspaceRoots"] == [message["params"]["cwd"]]
+        assert "sandbox" not in message["params"]
+        assert "dynamicTools" not in message["params"]
         thread = {"id": "thread-test"}
         if mode == "ambient-instructions":
             thread["instructionSources"] = [{"path": "C:/ambient/AGENTS.md"}]
-        send({"id": request_id, "result": {"thread": thread}})
+        active_profile = (
+            {"id": ":workspace", "extends": None}
+            if mode == "unverified-read-scope"
+            else {"id": ":read-only", "extends": None}
+        )
+        roots = list(message["params"]["runtimeWorkspaceRoots"])
+        if mode == "unverified-read-scope":
+            roots.append("C:/ambient")
+        send(
+            {
+                "id": request_id,
+                "result": {
+                    "thread": thread,
+                    "activePermissionProfile": active_profile,
+                    "runtimeWorkspaceRoots": roots,
+                    "sandbox": {"type": "readOnly", "networkAccess": False},
+                    "approvalPolicy": "never",
+                },
+            }
+        )
     elif method == "mcpServerStatus/list":
+        mcp_status_reads += 1
         entries = []
         if mode in {"extra-mcp", "wrong-tools"}:
-            entries.append({"name": "ambient", "serverInfo": {}, "tools": {}})
+            entries.append(
+                mcp_status("ambient", runtime_status="connected", with_tools=True)
+            )
+        elif mode == "native-mcp":
+            entries.append(
+                mcp_status("ReplayLab", runtime_status="connected", with_tools=True)
+            )
+        elif mode == "starting-mcp":
+            connected = mcp_status_reads >= 3
+            entries.append(
+                mcp_status(
+                    "ReplayLab",
+                    runtime_status="connected" if connected else "starting",
+                    with_tools=connected,
+                )
+            )
+        elif mode == "stuck-starting-mcp":
+            entries.append(
+                mcp_status("ReplayLab", runtime_status="starting", with_tools=False)
+            )
+        elif mode == "failed-mcp":
+            entries.append(
+                mcp_status("ReplayLab", runtime_status="failed", with_tools=False)
+            )
+        elif mode == "empty-mcp-tools":
+            entries.append(
+                mcp_status("ReplayLab", runtime_status="connected", with_tools=False)
+            )
         send(
             {
                 "id": request_id,
@@ -253,49 +296,31 @@ for line in sys.stdin:
         apps = [{"id": "ambient-app", "callable": True}] if mode == "callable-app" else []
         send({"id": request_id, "result": {"apps": apps}})
     elif method == "turn/start":
-        turn_start_attempts += 1
-        policy = message["params"]["sandboxPolicy"]
-        assert policy["type"] == "readOnly"
-        if mode == "modern-turn-sandbox" and turn_start_attempts == 1:
-            assert policy["access"]["type"] == "restricted"
-            send(
-                {
-                    "id": request_id,
-                    "error": {
-                        "code": -32600,
-                        "message": (
-                            "Invalid request: readOnly.access is no longer supported; "
-                            "use permissionProfile for restricted reads"
-                        ),
-                    },
-                }
-            )
-            continue
-        if mode == "modern-turn-sandbox":
-            assert "access" not in policy
-            assert policy["networkAccess"] is False
-        else:
-            assert policy["access"]["type"] == "restricted"
-            assert policy["access"]["includePlatformDefaults"] is False
-            assert message["params"]["cwd"] in policy["access"]["readableRoots"]
-        if mode == "dynamic-tool-prestart":
-            send_dynamic_request()
-            pending_dynamic_tool = 900
+        if mode == "starting-mcp":
+            assert mcp_status_reads >= 3, "turn started before ReplayLab MCP was ready"
+        assert message["params"]["permissions"] == ":read-only"
+        assert message["params"]["runtimeWorkspaceRoots"] == [message["params"]["cwd"]]
+        assert "sandboxPolicy" not in message["params"]
         send(
             {
                 "id": request_id,
                 "result": {"turn": {"id": "turn-test", "status": "inProgress"}},
             }
         )
-        if dynamic_mode:
-            if mode != "dynamic-tool-prestart":
-                dynamic_turn_id: object = "turn-test"
-                if mode == "dynamic-tool-wrong-turn":
-                    dynamic_turn_id = "turn-other"
-                elif mode == "dynamic-tool-wrong-type":
-                    dynamic_turn_id = 7
-                send_dynamic_request(turn_id=dynamic_turn_id)
-                pending_dynamic_tool = 900
+        if mode == "unexpected-host-tool":
+            send(
+                {
+                    "id": 900,
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": "thread-test",
+                        "turnId": "turn-test",
+                        "callId": "removed-direct-tool-channel",
+                        "tool": "inspect_event",
+                        "arguments": {"event_id": 7},
+                    },
+                }
+            )
             continue
         if mode == "invalid-jsonl":
             sys.stdout.flush()

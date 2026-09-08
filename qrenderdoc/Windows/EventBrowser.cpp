@@ -36,6 +36,7 @@
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
 #include <QScrollBar>
+#include <QScopedValueRollback>
 #include <QShortcut>
 #include <QSignalBlocker>
 #include <QSortFilterProxyModel>
@@ -3941,6 +3942,11 @@ EventBrowser::EventBrowser(ICaptureContext &ctx, QWidget *parent)
   connect(m_FilterTimeout, &QTimer::timeout, this, &EventBrowser::filter_apply);
 
   QObject::connect(ui->events, &RDTreeView::keyPress, this, &EventBrowser::events_keyPress);
+
+  // Intercept held arrow keys before the tree processes them, so that events_currentChanged (fired
+  // by the tree's own navigation, which runs after this filter) can issue a scrub instead of a
+  // blocking SetEventID. Installed on the tree view itself; key events arrive here while it focuses.
+  ui->events->installEventFilter(this);
   QObject::connect(ui->events->selectionModel(), &QItemSelectionModel::currentChanged, this,
                    &EventBrowser::events_currentChanged);
   ui->find->setChecked(false);
@@ -4195,6 +4201,8 @@ void EventBrowser::OnCaptureLoaded()
 
 void EventBrowser::OnCaptureClosed()
 {
+  m_ArrowScrubKeys.clear();
+
   clearBookmarks();
 
   on_HideFind();
@@ -4221,13 +4229,40 @@ void EventBrowser::OnCaptureClosed()
 
 void EventBrowser::OnEventChanged(uint32_t eventId)
 {
-  if(!SelectEvent(m_Ctx.CurSelectedEvent()))
+  // Publishing a completed replay can move the row behind a newer pending drag target. Its
+  // selection signal must not turn that publication into new navigation or end a held gesture.
+  QScopedValueRollback<bool> updating(m_UpdatingReplaySelection, true);
+  // While arrow keys are held the selected row is also Qt's cursor for the next key repeat.
+  // Keep that pending input position; the model's current-event marker follows completed replay.
+  if(m_ArrowScrubKeys.isEmpty() && !SelectEvent(m_Ctx.CurSelectedEvent()))
     ui->events->setCurrentIndex(QModelIndex());
-  repopulateBookmarks();
   highlightBookmarks();
 
   m_Model->RefreshCache();
   m_Breadcrumbs->OnEventChanged(eventId);
+}
+
+void EventBrowser::BookmarksChanged()
+{
+  repopulateBookmarks();
+  highlightBookmarks();
+}
+
+void EventBrowser::JumpToEID(uint32_t EID)
+{
+  if(SelectEvent(EID))
+    return;
+
+  ui->events->setCurrentIndex(QModelIndex());
+
+  // A bookmark can refer to a valid EID hidden by the current filter. It still needs to update the
+  // capture even though there is no proxy-model row to select in the Event Browser.
+  QModelIndex sourceIndex = m_Model->GetIndexForEID(EID);
+  if(sourceIndex.isValid())
+  {
+    m_Ctx.ScrubToSelectedEvent(GetSelectedEID(sourceIndex), GetEffectiveEID(sourceIndex));
+    m_Ctx.EndScrub();
+  }
 }
 
 void EventBrowser::on_find_toggled(bool checked)
@@ -4244,6 +4279,8 @@ void EventBrowser::on_bookmark_clicked()
   if(idx.isValid())
   {
     EventBookmark mark(GetSelectedEID(idx));
+    if(mark.eventId == 0)
+      return;
 
     if(m_Ctx.GetBookmarks().contains(mark))
       m_Ctx.RemoveBookmark(mark.eventId);
@@ -4273,10 +4310,24 @@ void EventBrowser::events_currentChanged(const QModelIndex &current, const QMode
   uint32_t selectedEID = GetSelectedEID(current);
   uint32_t effectiveEID = GetEffectiveEID(current);
 
-  if(selectedEID == m_Ctx.CurSelectedEvent() && effectiveEID == m_Ctx.CurEvent())
-    return;
-
-  m_Ctx.SetEventID({this}, selectedEID, effectiveEID);
+  if(m_UpdatingReplaySelection)
+  {
+    // Only update the event decorations below; CaptureContext already owns this selection.
+  }
+  else if(!m_ArrowScrubKeys.isEmpty())
+  {
+    // Every completed held-arrow replay refreshes the pipeline and panels asynchronously.
+    m_Ctx.ScrubToSelectedEvent(selectedEID, effectiveEID);
+  }
+  else
+  {
+    // A discrete mouse click, step button, bookmark, or search result is still pure navigation.
+    // Run the same real replay and panel update as held-arrow input.
+    // CaptureContext owns deduplication: the committed EID can still match this row while a
+    // different event's asynchronous commit is pending (a quick A -> B -> A sequence).
+    m_Ctx.ScrubToSelectedEvent(selectedEID, effectiveEID);
+    m_Ctx.EndScrub();
+  }
 
   m_Model->RefreshCache();
   m_Breadcrumbs->OnEventChanged(effectiveEID);
@@ -4322,8 +4373,20 @@ void EventBrowser::FindNext(bool forward)
 
   m_Model->SetFindText(ui->findEvent->text());
 
+  // The tree selection advances immediately, while an asynchronous scrub commit publishes
+  // CaptureContext's EID later. Start from the optimistic selection so repeated F3 presses cannot
+  // keep finding the same row while that commit is pending.
+  QModelIndex findStart = ui->events->currentIndex();
+  if(findStart.isValid())
+  {
+    findStart = findStart.sibling(findStart.row(), COL_NAME);
+    findStart = m_FilterModel->mapToSource(findStart);
+  }
+  if(!findStart.isValid())
+    findStart = m_Model->GetCurrentEID();
+
   // get the first result in this direction
-  QModelIndex firstResult = m_Model->Find(forward, m_Model->GetCurrentEID());
+  QModelIndex firstResult = m_Model->Find(forward, findStart);
 
   bool forceNone = false;
 
@@ -5449,13 +5512,23 @@ void EventBrowser::on_stepNext_clicked()
   if(!m_Ctx.IsCaptureLoaded() || !ui->stepNext->isEnabled())
     return;
 
-  const ActionDescription *action = m_Ctx.CurAction();
+  // Selection moves synchronously, but CurAction changes only after the asynchronous scrub commit.
+  // Use the model's action for the optimistic row so rapid step input advances from each click.
+  const QModelIndex current = ui->events->currentIndex();
+  const ActionDescription *action = current.isValid()
+                                        ? (const ActionDescription *)current
+                                              .data(ROLE_GROUPED_ACTION)
+                                              .toULongLong()
+                                        : m_Ctx.CurAction();
+
+  if(action && action->IsFakeMarker())
+    action = &action->children.back();
 
   if(action)
     action = action->next;
 
   // special case for the first 'virtual' action at EID 0
-  if(m_Ctx.CurEvent() == 0)
+  if(current.isValid() ? GetEffectiveEID(current) == 0 : m_Ctx.CurEvent() == 0)
     action = m_Ctx.GetFirstAction();
 
   while(action)
@@ -5475,7 +5548,16 @@ void EventBrowser::on_stepPrev_clicked()
   if(!m_Ctx.IsCaptureLoaded() || !ui->stepPrev->isEnabled())
     return;
 
-  const ActionDescription *action = m_Ctx.CurAction();
+  // See on_stepNext_clicked: the UI row is the pending navigation target while commit is queued.
+  const QModelIndex current = ui->events->currentIndex();
+  const ActionDescription *action = current.isValid()
+                                        ? (const ActionDescription *)current
+                                              .data(ROLE_GROUPED_ACTION)
+                                              .toULongLong()
+                                        : m_Ctx.CurAction();
+
+  if(action && action->IsFakeMarker())
+    action = &action->children.back();
 
   if(action)
     action = action->previous;
@@ -5700,6 +5782,51 @@ void EventBrowser::setPersistData(const QVariant &persistData)
   }
 }
 
+bool EventBrowser::eventFilter(QObject *watched, QEvent *event)
+{
+  if(watched == ui->events && m_Ctx.IsCaptureLoaded())
+  {
+    if(event->type() == QEvent::KeyPress)
+    {
+      QKeyEvent *ke = (QKeyEvent *)event;
+      const int k = ke->key();
+      if(k == Qt::Key_Up || k == Qt::Key_Down || k == Qt::Key_Left || k == Qt::Key_Right ||
+         k == Qt::Key_PageUp || k == Qt::Key_PageDown)
+      {
+        // The filter runs before the tree changes selection, so mark the very first key press as
+        // interactive. A short tap therefore follows the same non-blocking path as key repeat.
+        m_ArrowScrubKeys.insert(k);
+      }
+    }
+    else if(event->type() == QEvent::KeyRelease)
+    {
+      QKeyEvent *ke = (QKeyEvent *)event;
+      const int k = ke->key();
+      const bool navigationKey = k == Qt::Key_Up || k == Qt::Key_Down || k == Qt::Key_Left ||
+                                 k == Qt::Key_Right || k == Qt::Key_PageUp ||
+                                 k == Qt::Key_PageDown;
+      // Auto-repeat can synthesize release/press pairs. Settle only when every physically held
+      // navigation key has received its final release; unrelated key releases must not commit.
+      if(navigationKey && !ke->isAutoRepeat())
+      {
+        m_ArrowScrubKeys.remove(k);
+        if(m_ArrowScrubKeys.isEmpty() && m_Ctx.IsScrubbing())
+          m_Ctx.EndScrub();
+      }
+    }
+    else if(event->type() == QEvent::FocusOut || event->type() == QEvent::WindowDeactivate)
+    {
+      // Alt-tab/window deactivation can consume the physical KeyRelease. Never leave later mouse
+      // selections stuck on the scrub-only path; commit the last requested event before clearing.
+      m_ArrowScrubKeys.clear();
+      if(m_Ctx.IsScrubbing())
+        m_Ctx.EndScrub();
+    }
+  }
+
+  return QFrame::eventFilter(watched, event);
+}
+
 void EventBrowser::events_keyPress(QKeyEvent *event)
 {
   if(!m_Ctx.IsCaptureLoaded())
@@ -5734,7 +5861,8 @@ void EventBrowser::events_keyPress(QKeyEvent *event)
 
 void EventBrowser::events_contextMenu(const QPoint &pos)
 {
-  QModelIndex index = ui->events->indexAt(pos);
+  const bool headerMenu = QObject::sender() == ui->events->header();
+  QModelIndex index = headerMenu ? QModelIndex() : ui->events->indexAt(pos);
 
   QMenu contextMenu(this);
 
@@ -5757,7 +5885,8 @@ void EventBrowser::events_contextMenu(const QPoint &pos)
 
   expandAll.setEnabled(index.isValid() && ui->events->model()->rowCount(index) > 0);
   collapseAll.setEnabled(expandAll.isEnabled());
-  toggleBookmark.setEnabled(m_Ctx.IsCaptureLoaded());
+  const uint32_t contextEID = index.isValid() ? GetSelectedEID(index) : 0;
+  toggleBookmark.setEnabled(m_Ctx.IsCaptureLoaded() && contextEID != 0);
 
   QObject::connect(&expandAll, &QAction::triggered,
                    [this, index]() { ui->events->expandAll(index); });
@@ -5765,7 +5894,13 @@ void EventBrowser::events_contextMenu(const QPoint &pos)
   QObject::connect(&collapseAll, &QAction::triggered,
                    [this, index]() { ui->events->collapseAll(index); });
 
-  QObject::connect(&toggleBookmark, &QAction::triggered, this, &EventBrowser::on_bookmark_clicked);
+  QObject::connect(&toggleBookmark, &QAction::triggered, [this, contextEID]() {
+    EventBookmark mark(contextEID);
+    if(m_Ctx.GetBookmarks().contains(mark))
+      m_Ctx.RemoveBookmark(mark.eventId);
+    else
+      m_Ctx.SetBookmark(mark);
+  });
 
   QObject::connect(&selectCols, &QAction::triggered, this, &EventBrowser::on_colSelect_clicked);
 
@@ -5782,7 +5917,8 @@ void EventBrowser::events_contextMenu(const QPoint &pos)
   m_Ctx.Extensions().MenuDisplaying(ContextMenu::EventBrowser_Event, &contextMenu,
                                     {{"eventId", m_Ctx.CurEvent()}});
 
-  RDDialog::show(&contextMenu, ui->events->viewport()->mapToGlobal(pos));
+  QWidget *menuSource = headerMenu ? (QWidget *)ui->events->header() : ui->events->viewport();
+  RDDialog::show(&contextMenu, menuSource->mapToGlobal(pos));
 }
 
 static QString GetBookmarkDisplayText(const EventBookmark &bookmark)
@@ -5804,46 +5940,29 @@ void EventBrowser::repopulateBookmarks()
 {
   const rdcarray<EventBookmark> bookmarks = m_Ctx.GetBookmarks();
 
-  // add any bookmark markers that we don't have
+  clearBookmarks();
+
   for(const EventBookmark &mark : bookmarks)
   {
-    if(!m_BookmarkButtons.contains(mark.eventId))
-    {
-      uint32_t EID = mark.eventId;
+    const uint32_t EID = mark.eventId;
+    QRClickToolButton *but = new QRClickToolButton(this);
 
-      QRClickToolButton *but = new QRClickToolButton(this);
-
-      but->setText(GetBookmarkDisplayText(mark));
-      but->setCheckable(true);
-      but->setAutoRaise(true);
-      but->setProperty("eid", EID);
-      QObject::connect(but, &QRClickToolButton::clicked, [this, but, EID]() {
-        but->setChecked(true);
-        if(!SelectEvent(EID))
-          ui->events->setCurrentIndex(QModelIndex());
-        highlightBookmarks();
-      });
-      QObject::connect(but, &QRClickToolButton::rightClicked,
-                       [this, but, EID]() { bookmarkContextMenu(but, EID); });
-
-      m_BookmarkButtons[EID] = but;
-
+    but->setText(GetBookmarkDisplayText(mark));
+    but->setCheckable(true);
+    but->setAutoRaise(true);
+    but->setProperty("eid", EID);
+    QObject::connect(but, &QRClickToolButton::clicked, [this, but, EID]() {
+      but->setChecked(true);
+      JumpToEID(EID);
       highlightBookmarks();
+    });
+    QObject::connect(but, &QRClickToolButton::rightClicked,
+                     [this, EID]() { bookmarkContextMenu(EID); });
 
-      m_BookmarkStripLayout->removeItem(m_BookmarkSpacer);
-      m_BookmarkStripLayout->addWidget(but);
-      m_BookmarkStripLayout->addItem(m_BookmarkSpacer);
-    }
-  }
-
-  // remove any bookmark markers we shouldn't have
-  for(uint32_t EID : m_BookmarkButtons.keys())
-  {
-    if(!bookmarks.contains(EventBookmark(EID)))
-    {
-      delete m_BookmarkButtons[EID];
-      m_BookmarkButtons.remove(EID);
-    }
+    m_BookmarkButtons[EID] = but;
+    m_BookmarkStripLayout->removeItem(m_BookmarkSpacer);
+    m_BookmarkStripLayout->addWidget(but);
+    m_BookmarkStripLayout->addItem(m_BookmarkSpacer);
   }
 
   ui->bookmarkStrip->setVisible(!bookmarks.isEmpty());
@@ -5858,8 +5977,7 @@ void EventBrowser::jumpToBookmark(int idx)
     return;
 
   // don't exclude ourselves, so we're updated as normal
-  if(!SelectEvent(bookmarks[idx].eventId))
-    ui->events->setCurrentIndex(QModelIndex());
+  JumpToEID(bookmarks[idx].eventId);
 }
 
 void EventBrowser::highlightBookmarks()
@@ -5873,7 +5991,7 @@ void EventBrowser::highlightBookmarks()
   }
 }
 
-void EventBrowser::bookmarkContextMenu(QRClickToolButton *button, uint32_t EID)
+void EventBrowser::bookmarkContextMenu(uint32_t EID)
 {
   QMenu contextMenu(this);
 
@@ -5886,12 +6004,10 @@ void EventBrowser::bookmarkContextMenu(QRClickToolButton *button, uint32_t EID)
   contextMenu.addAction(&renameBookmark);
   contextMenu.addAction(&deleteBookmark);
 
-  QObject::connect(&deleteBookmark, &QAction::triggered, [this, EID]() {
-    m_Ctx.RemoveBookmark(EID);
-    repopulateBookmarks();
-  });
+  QObject::connect(&deleteBookmark, &QAction::triggered,
+                   [this, EID]() { m_Ctx.RemoveBookmark(EID); });
 
-  QObject::connect(&renameBookmark, &QAction::triggered, [this, button, EID]() {
+  QObject::connect(&renameBookmark, &QAction::triggered, [this, EID]() {
     EventBookmark editedBookmark;
     for(const EventBookmark &bookmark : m_Ctx.GetBookmarks())
     {
@@ -5905,14 +6021,12 @@ void EventBrowser::bookmarkContextMenu(QRClickToolButton *button, uint32_t EID)
     if(editedBookmark.eventId == EID)
     {
       bool ok;
-      editedBookmark.text =
-          QInputDialog::getText(this, lit("Rename"), lit("New name:"), QLineEdit::Normal,
-                                GetBookmarkDisplayText(editedBookmark), &ok);
+      editedBookmark.text = QInputDialog::getText(this, tr("Rename Bookmark"), tr("Name:"),
+                                                  QLineEdit::Normal,
+                                                  (QString)editedBookmark.text, &ok)
+                                .trimmed();
       if(ok)
-      {
-        button->setText(GetBookmarkDisplayText(editedBookmark));
         m_Ctx.SetBookmark(editedBookmark);
-      }
     }
   });
 
@@ -6125,11 +6239,13 @@ void EventBrowser::location_keyPress(QKeyEvent *e)
       uint32_t selectedEID = GetSelectedEID(idx);
       uint32_t effectiveEID = GetEffectiveEID(idx);
 
-      m_Ctx.SetEventID({}, selectedEID, effectiveEID);
+      m_Ctx.ScrubToSelectedEvent(selectedEID, effectiveEID);
+      m_Ctx.EndScrub();
     }
     else
     {
-      m_Ctx.SetEventID({}, 0, 0);
+      m_Ctx.ScrubToSelectedEvent(0, 0);
+      m_Ctx.EndScrub();
     }
   }
 }

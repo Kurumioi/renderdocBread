@@ -3027,6 +3027,12 @@ Note that a resource may be used for more than one thing in one event, see :clas
 
   The resource is written from the CPU, either directly as mapped memory or indirectly via a
   synchronous update.
+
+.. data:: Shader
+
+  The resource is a Shader bound for a draw or dispatch. Shader usage is represented by at most
+  one event per Shader resource, suitable for locating a representative pipeline state without
+  enumerating every event that binds it.
 )");
 enum class ResourceUsage : uint32_t
 {
@@ -3090,6 +3096,8 @@ enum class ResourceUsage : uint32_t
   Barrier,
 
   CPUWrite,
+
+  Shader,
 };
 
 DECLARE_REFLECTION_ENUM(ResourceUsage);

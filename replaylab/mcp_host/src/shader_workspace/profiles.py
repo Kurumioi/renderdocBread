@@ -33,15 +33,29 @@ _KIND_TO_STAGE_PREFIX = {
     5: ("compute", "cs"),
 }
 _DXIL_EXTRA_KIND_TO_STAGE_PREFIX = {
+    # DXIL libraries compile with a lib_* target.  A library container can
+    # expose one or more ray-tracing entry points whose physical stages live in
+    # dx.entryPoints/RDAT rather than in this container-level ProgramType.
+    6: ("library", "lib"),
+    7: ("raygen", "lib"),
+    8: ("intersection", "lib"),
+    9: ("anyhit", "lib"),
+    10: ("closesthit", "lib"),
+    11: ("miss", "lib"),
+    12: ("callable", "lib"),
     13: ("mesh", "ms"),
     14: ("task", "as"),
 }
+_DXIL_LIBRARY_EXPORT_STAGES = frozenset(
+    {"raygen", "intersection", "anyhit", "closesthit", "miss", "callable"}
+)
 _PREFIX_TO_STAGE = {
     prefix: stage
     for stage, prefix in tuple(_KIND_TO_STAGE_PREFIX.values())
     + tuple(_DXIL_EXTRA_KIND_TO_STAGE_PREFIX.values())
+    if prefix != "lib"
 }
-_PROFILE_RE = re.compile(r"^(ps|vs|gs|hs|ds|cs|ms|as)_(\d+)_(\d+)$")
+_PROFILE_RE = re.compile(r"^(ps|vs|gs|hs|ds|cs|ms|as|lib)_(\d+)_(\d+)$")
 
 # ``DxilProgramHeader`` is two uint32 values followed by a
 # ``DxilBitcodeHeader`` containing four uint32 values. BitcodeOffset is relative
@@ -106,12 +120,6 @@ def extract_target_profile(data: bytes, expected_stage: str | None = None) -> Ta
         mapping.update(_DXIL_EXTRA_KIND_TO_STAGE_PREFIX)
         if major < 6:
             raise ToolchainRoutingError("DXIL program version does not declare Shader Model 6+")
-        # Library and ray-tracing kinds (6..12) require library/export handling,
-        # not a guessed single-entry target profile.
-        if kind in range(6, 13):
-            raise ToolchainRoutingError(
-                "DXIL library/ray profile requires explicit multi-entry/export handling"
-            )
     else:
         if major not in {4, 5} or (major == 4 and minor not in {0, 1}) or (
             major == 5 and minor not in {0, 1}
@@ -122,11 +130,23 @@ def extract_target_profile(data: bytes, expected_stage: str | None = None) -> Ta
     if kind not in mapping:
         raise ToolchainRoutingError("unsupported executable shader kind %d" % kind)
     stage, prefix = mapping[kind]
-    if expected_stage is not None and normalize_stage(expected_stage) != stage:
-        raise ToolchainRoutingError(
-            "compiled target stage %s contradicts expected stage %s"
-            % (stage, normalize_stage(expected_stage))
+    if expected_stage is not None:
+        normalized_expected_stage = normalize_stage(expected_stage)
+        # A lib_* container declares ProgramType Library even when the selected
+        # capture entry is a RayGen/Miss/Hit/Callable export.  The export stage
+        # is independently bound by the capture shader key and fresh
+        # reflection; it cannot be inferred from ProgramVersion.  Accept that
+        # exact container/export relationship without relabelling the physical
+        # ProgramType as the caller's requested stage.
+        library_export = (
+            stage == "library"
+            and normalized_expected_stage in _DXIL_LIBRARY_EXPORT_STAGES
         )
+        if normalized_expected_stage != stage and not library_export:
+            raise ToolchainRoutingError(
+                "compiled target stage %s contradicts expected stage %s"
+                % (stage, normalized_expected_stage)
+            )
     return TargetProfile(
         profile="%s_%d_%d" % (prefix, major, minor),
         container_format=container.kind.lower(),
@@ -245,10 +265,18 @@ def validate_target_profile(profile: str, expected_stage: str) -> str:
     if match is None:
         raise ToolchainRoutingError("target profile must be an exact stage_major_minor profile")
     prefix = match.group(1)
+    normalized_expected_stage = normalize_stage(expected_stage)
+    if prefix == "lib":
+        if normalized_expected_stage not in {"library", *_DXIL_LIBRARY_EXPORT_STAGES}:
+            raise ToolchainRoutingError(
+                "target profile stage library contradicts expected stage %s"
+                % normalized_expected_stage
+            )
+        return value
     stage = _PREFIX_TO_STAGE[prefix]
-    if stage != normalize_stage(expected_stage):
+    if stage != normalized_expected_stage:
         raise ToolchainRoutingError(
             "target profile stage %s contradicts expected stage %s"
-            % (stage, normalize_stage(expected_stage))
+            % (stage, normalized_expected_stage)
         )
     return value

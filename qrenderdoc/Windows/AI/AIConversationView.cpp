@@ -24,34 +24,187 @@
 
 #include "AIConversationView.h"
 
+#include <QAbstractSlider>
+#include <QAction>
 #include <QApplication>
+#include <QBuffer>
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QCursor>
 #include <QDateTime>
 #include <QDesktopWidget>
+#include <QDir>
 #include <QEvent>
+#include <QFile>
+#include <QFileInfo>
 #include <QFocusEvent>
 #include <QFontMetrics>
+#include <QGridLayout>
 #include <QHideEvent>
 #include <QHBoxLayout>
+#include <QImage>
+#include <QImageReader>
 #include <QKeyEvent>
+#include <QKeySequence>
 #include <QLabel>
 #include <QMouseEvent>
+#include <QMenu>
 #include <QPainter>
 #include <QPalette>
 #include <QScrollBar>
+#include <QSet>
 #include <QShowEvent>
 #include <QTextBlock>
+#include <QTextBoundaryFinder>
 #include <QTextBrowser>
 #include <QTextDocument>
 #include <QTextFragment>
 #include <QTimer>
+#include <QToolButton>
 #include <QUrlQuery>
 #include <QVBoxLayout>
+#include <QWheelEvent>
 #include <utility>
+#include "Code/Resources.h"
+#include "AIFileThumbnail.h"
 
 namespace
 {
+const int ViewportAnchorContextChars = 192;
+const int ViewportAnchorCompleteBlockChars = 512;
+const int LiveTextRevealIntervalMs = 4;
+
+QString liveTextKey(const AIChatMessage &message, const AIActivityItem &activity)
+{
+  // i18n-ignore: Unit separators are internal live-stream identity delimiters.
+  return message.id + QChar(0x1f) + activity.kind + QChar(0x1f) + activity.id + QChar(0x1f) +
+         QString::number(activity.timestampMs);
+}
+
+QString liveTextAnchor(const QString &key)
+{
+  // i18n-ignore: Generated anchor prefix is an internal transcript identifier.
+  return lit("replaylab-live-text-") +
+         QString::fromLatin1(QCryptographicHash::hash(key.toUtf8(), QCryptographicHash::Sha256)
+                                 .toHex());
+}
+
+int nextGraphemeBoundary(const QString &text, int position)
+{
+  if(position < 0 || position >= text.size())
+    return text.size();
+  QTextBoundaryFinder finder(QTextBoundaryFinder::Grapheme, text);
+  finder.setPosition(position);
+  const int next = finder.toNextBoundary();
+  return next > position ? next : qMin(position + 1, text.size());
+}
+
+bool sameAttachment(const AIChatAttachment &left, const AIChatAttachment &right)
+{
+  return left.id == right.id && left.kind == right.kind && left.title == right.title &&
+         left.mediaType == right.mediaType && left.source == right.source &&
+         left.encoding == right.encoding && left.content == right.content &&
+         left.context == right.context && left.originalBytes == right.originalBytes &&
+         left.modifiedUnixMs == right.modifiedUnixMs && left.truncated == right.truncated;
+}
+
+bool canKeepTranscriptDocument(const QVector<AIChatMessage> &current,
+                               const QVector<AIChatMessage> &incoming)
+{
+  if(current.size() != incoming.size())
+    return false;
+
+  for(int messageIndex = 0; messageIndex < current.size(); ++messageIndex)
+  {
+    const AIChatMessage &oldMessage = current[messageIndex];
+    const AIChatMessage &newMessage = incoming[messageIndex];
+    if(oldMessage.id != newMessage.id || oldMessage.role != newMessage.role ||
+       oldMessage.text != newMessage.text || oldMessage.state != newMessage.state ||
+       oldMessage.taskId != newMessage.taskId ||
+       oldMessage.provisionalText != newMessage.provisionalText ||
+       oldMessage.timestampMs != newMessage.timestampMs ||
+       oldMessage.finishedTimestampMs != newMessage.finishedTimestampMs ||
+       oldMessage.activityExpanded != newMessage.activityExpanded ||
+       oldMessage.attachments.size() != newMessage.attachments.size() ||
+       oldMessage.activity.size() != newMessage.activity.size())
+      return false;
+
+    for(int attachmentIndex = 0; attachmentIndex < oldMessage.attachments.size(); ++attachmentIndex)
+      if(!sameAttachment(oldMessage.attachments[attachmentIndex],
+                         newMessage.attachments[attachmentIndex]))
+        return false;
+
+    for(int activityIndex = 0; activityIndex < oldMessage.activity.size(); ++activityIndex)
+    {
+      const AIActivityItem &oldActivity = oldMessage.activity[activityIndex];
+      const AIActivityItem &newActivity = newMessage.activity[activityIndex];
+      if(oldActivity.id != newActivity.id || oldActivity.kind != newActivity.kind ||
+         oldActivity.title != newActivity.title ||
+         oldActivity.timestampMs != newActivity.timestampMs ||
+         oldActivity.finishedTimestampMs != newActivity.finishedTimestampMs ||
+         oldActivity.completed != newActivity.completed || oldActivity.error != newActivity.error ||
+         oldActivity.liveText != newActivity.liveText ||
+         oldActivity.exactText != newActivity.exactText ||
+         oldActivity.liveTextRevision != newActivity.liveTextRevision)
+        return false;
+
+      if(oldActivity.liveText)
+      {
+        // A same-revision prefix extension changes only the live target. Its existing document
+        // cursor can reveal the suffix without replacing QTextDocument, preserving selections and
+        // the user's viewport.
+        if(!newActivity.detail.startsWith(oldActivity.detail))
+          return false;
+      }
+      else if(oldActivity.detail != newActivity.detail)
+      {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+struct MessageDocumentAnchor
+{
+  QString messageId;
+  int position = 0;
+};
+
+QVector<MessageDocumentAnchor> messageDocumentAnchors(
+    QTextDocument *document, const QHash<QString, QString> &messageAnchors)
+{
+  QVector<MessageDocumentAnchor> positions;
+  if(!document || messageAnchors.isEmpty())
+    return positions;
+
+  QHash<QString, QString> messageIdByAnchor;
+  for(auto it = messageAnchors.constBegin(); it != messageAnchors.constEnd(); ++it)
+    messageIdByAnchor[it.value()] = it.key();
+
+  for(QTextBlock block = document->begin(); block.isValid(); block = block.next())
+  {
+    for(QTextBlock::iterator it = block.begin(); !it.atEnd(); ++it)
+    {
+      const QTextFragment fragment = it.fragment();
+      if(!fragment.isValid())
+        continue;
+      const QStringList names = fragment.charFormat().anchorNames();
+      for(const QString &name : names)
+      {
+        const auto found = messageIdByAnchor.constFind(name);
+        if(found == messageIdByAnchor.constEnd())
+          continue;
+        MessageDocumentAnchor position;
+        position.messageId = found.value();
+        position.position = fragment.position();
+        positions.push_back(position);
+      }
+    }
+  }
+  return positions;
+}
+
 bool allowedLink(const QUrl &url)
 {
   if(!url.isValid())
@@ -455,6 +608,9 @@ QString activityState(const AIActivityItem &activity)
   // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
   if(activity.kind == lit("blocked"))
     return QCoreApplication::translate("AIConversationView", "blocked");
+  // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
+  if(activity.kind == lit("partial"))
+    return QCoreApplication::translate("AIConversationView", "completed with limitations");
   if(activity.error)
     return QCoreApplication::translate("AIConversationView", "failed");
   if(activity.completed)
@@ -495,6 +651,9 @@ QString messageStateLabel(const QString &state)
   if(state == lit("completed"))
     return QCoreApplication::translate("AIConversationView", "completed");
   // i18n-ignore: Conversation state is an internal lifecycle identifier used only for lookup.
+  if(state == lit("partial"))
+    return QCoreApplication::translate("AIConversationView", "completed with limitations");
+  // i18n-ignore: Conversation state is an internal lifecycle identifier used only for lookup.
   if(state == lit("needs-user-input"))
     return QCoreApplication::translate("AIConversationView", "waiting for input");
   // i18n-ignore: Conversation state is an internal lifecycle identifier used only for lookup.
@@ -506,9 +665,7 @@ QString messageStateLabel(const QString &state)
 bool isLiveState(const QString &state)
 {
   // i18n-ignore: Conversation states are internal lifecycle identifiers used only for control flow.
-  return state == lit("queued") || state == lit("running") || state == lit("planning") ||
-         // i18n-ignore: Conversation state is an internal lifecycle identifier used only for control flow.
-         state == lit("finalizing");
+  return state == lit("queued") || state == lit("running") || state == lit("finalizing");
 }
 
 QString elapsedText(qint64 elapsedMs)
@@ -535,12 +692,15 @@ QString activityKindLabel(const QString &kind)
   // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
   if(kind == lit("tool"))
     return QCoreApplication::translate("AIConversationView", "Tool");
-  // i18n-ignore: Activity kinds are backend protocol identifiers used only for label selection.
-  if(kind == lit("planner") || kind == lit("plan"))
-    return QCoreApplication::translate("AIConversationView", "Plan");
+  // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
+  if(kind == lit("main"))
+    return QCoreApplication::translate("AIConversationView", "Main Agent");
   // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
   if(kind == lit("reasoning"))
     return QCoreApplication::translate("AIConversationView", "Reasoning summary");
+  // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
+  if(kind == lit("reasoning-raw"))
+    return QCoreApplication::translate("AIConversationView", "Reasoning");
   // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
   if(kind == lit("commandExecution"))
     return QCoreApplication::translate("AIConversationView", "Command");
@@ -559,11 +719,8 @@ QString activityKindLabel(const QString &kind)
   // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
   if(kind == lit("providerStatus"))
     return QCoreApplication::translate("AIConversationView", "Provider");
-  // i18n-ignore: Activity kind and prefix are backend protocol identifiers used for label selection.
-  if(kind == lit("reviewer") || kind.startsWith(lit("reviewer-")))
-    return QCoreApplication::translate("AIConversationView", "Review");
   // i18n-ignore: Activity kind prefix is a backend protocol identifier used for label selection.
-  if(kind.startsWith(lit("specialist-")))
+  if(kind.startsWith(lit("child-")))
     return QCoreApplication::translate("AIConversationView", "Agent");
   // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
   if(kind == lit("approval"))
@@ -577,6 +734,9 @@ QString activityKindLabel(const QString &kind)
   // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
   if(kind == lit("completed"))
     return QCoreApplication::translate("AIConversationView", "Completed");
+  // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
+  if(kind == lit("partial"))
+    return QCoreApplication::translate("AIConversationView", "Completed with limitations");
   // i18n-ignore: Activity kinds are backend protocol identifiers used only for label selection.
   if(kind == lit("steered") || kind == lit("superseded"))
     return QCoreApplication::translate("AIConversationView", "Direction");
@@ -736,13 +896,12 @@ QString renderActivityDetail(QString detail, bool codeStyle)
   if(lines.isEmpty())
     return QString();
 
-  const int maxLines = codeStyle ? 10 : 7;
-  const int maxLineCharacters = codeStyle ? 280 : 360;
-  const int visibleLineCount = qMin(lines.size(), maxLines);
-  bool truncated = lines.size() > maxLines;
-
   if(codeStyle)
   {
+    const int maxLines = 10;
+    const int maxLineCharacters = 280;
+    const int visibleLineCount = qMin(lines.size(), maxLines);
+    bool truncated = lines.size() > maxLines;
     // Use a small table instead of CSS overflow/max-height: those properties are not reliably
     // honoured by Qt 5.9's QTextDocument. Capping rows gives tool output a predictable footprint.
     // i18n-ignore: Structural transcript HTML contains no user-visible prose.
@@ -779,24 +938,35 @@ QString renderActivityDetail(QString detail, bool codeStyle)
   }
 
   QStringList visibleLines;
-  visibleLines.reserve(visibleLineCount);
-  for(int lineIndex = 0; lineIndex < visibleLineCount; ++lineIndex)
-  {
-    QString line = lines[lineIndex];
-    if(line.size() > maxLineCharacters)
-    {
-      line = line.left(maxLineCharacters) + QChar(0x2026);
-      truncated = true;
-    }
+  visibleLines.reserve(lines.size());
+  for(const QString &line : lines)
     visibleLines.push_back(line.toHtmlEscaped());
-  }
   QString html = visibleLines.join(QLatin1String("<br/>"));
-  if(truncated)
-    html += QLatin1String("<br/>&hellip;");
   return QLatin1String("<div class=\"activity-detail\">") + html + QLatin1String("</div>");
 }
 
-QString renderActivityGroup(const AIChatMessage &message, qint64 finishedMs, qint64 nowMs)
+QString renderLiveActivityDetail(const AIChatMessage &message, const AIActivityItem &activity,
+                                 QHash<QString, QString> *liveTextAnchors)
+{
+  const QString key = liveTextKey(message, activity);
+  const QString anchor = liveTextAnchor(key);
+  if(liveTextAnchors)
+    liveTextAnchors->insert(key, anchor);
+  const int visibleChars = activity.visibleDetailChars < 0
+                               ? activity.detail.size()
+                               : qBound(0, activity.visibleDetailChars, activity.detail.size());
+  const QString visible = activity.detail.left(visibleChars);
+  // QTextCursor inserts later graphemes as plain text immediately before this named tail anchor.
+  // Escaping the initial prefix preserves the exact stream without interpreting JSON, Markdown,
+  // links, HTML, or code fences.
+  // i18n-ignore: Structural transcript HTML and zero-width marker contain no user-visible prose.
+  return lit("<div class=\"activity-detail activity-live-text\">") + visible.toHtmlEscaped() +
+         lit("<span class=\"activity-live-tail\" id=\"") + anchor.toHtmlEscaped() +    // i18n-ignore: structural transcript HTML
+         lit("\">&#8203;</span></div>");    // i18n-ignore: structural transcript HTML and zero-width marker
+}
+
+QString renderActivityGroup(const AIChatMessage &message, qint64 finishedMs, qint64 nowMs,
+                            QHash<QString, QString> *liveTextAnchors)
 {
   if(message.activity.isEmpty())
     return QString();
@@ -878,7 +1048,11 @@ QString renderActivityGroup(const AIChatMessage &message, qint64 finishedMs, qin
         html += lit(" &middot; ") + itemDuration.toHtmlEscaped();
       // i18n-ignore: Structural transcript HTML contains no user-visible prose.
       html += lit("</span></div>");
-      if(!activity.detail.trimmed().isEmpty())
+      if(activity.liveText)
+      {
+        html += renderLiveActivityDetail(message, activity, liveTextAnchors);
+      }
+      else if(!activity.detail.trimmed().isEmpty())
       {
         // Activity detail is already an explicit public event summary. This view never requests or
         // renders private model reasoning; reasoning summaries stay plain text, while bounded tool
@@ -895,6 +1069,230 @@ QString renderActivityGroup(const AIChatMessage &message, qint64 finishedMs, qin
   // i18n-ignore: Structural transcript HTML contains no user-visible prose.
   html += lit("</div>");
   return html;
+}
+
+const qint64 ConversationImageMaxBytes = 8LL * 1024LL * 1024LL;
+const int ConversationImageMaxDimension = 16384;
+const qint64 ConversationImageMaxPixels = 64LL * 1024LL * 1024LL;
+
+QString conversationImageMediaTypeEssence(const QString &mediaType)
+{
+  return mediaType.section(QLatin1Char(';'), 0, 0).trimmed().toLower();
+}
+
+QString conversationRasterMediaTypeForFormat(const QByteArray &format)
+{
+  const QByteArray normalized = format.toLower();
+  static const QSet<QByteArray> supportedFormats = []() {
+    QSet<QByteArray> result;
+    for(const QByteArray &candidate : QImageReader::supportedImageFormats())
+      result.insert(candidate.toLower());
+    return result;
+  }();
+  if(!supportedFormats.contains(normalized))
+    return QString();
+
+  // A document/vector reader can load referenced resources. Reject these codecs before asking the
+  // reader for dimensions so persisted untrusted content never enters that decoding path.
+  if(normalized == "svg" || normalized == "svgz" || normalized == "pdf" ||
+     normalized == "eps" || normalized == "ps")    // i18n-ignore: image codec identifiers
+    return QString();
+  if(normalized == "png")    // i18n-ignore: Qt image codec identifier
+    return lit("image/png");    // i18n-ignore: MIME type
+  if(normalized == "jpg" || normalized == "jpeg")    // i18n-ignore: Qt codec identifiers
+    return lit("image/jpeg");    // i18n-ignore: MIME type
+  if(normalized == "gif")    // i18n-ignore: Qt image codec identifier
+    return lit("image/gif");    // i18n-ignore: MIME type
+  if(normalized == "webp")    // i18n-ignore: Qt image codec identifier
+    return lit("image/webp");    // i18n-ignore: MIME type
+  if(normalized == "bmp")    // i18n-ignore: Qt image codec identifier
+    return lit("image/bmp");    // i18n-ignore: MIME type
+  if(normalized == "ico" || normalized == "cur")    // i18n-ignore: codec identifiers
+    return lit("image/x-icon");    // i18n-ignore: MIME type
+  if(normalized == "tif" || normalized == "tiff")    // i18n-ignore: codec identifiers
+    return lit("image/tiff");    // i18n-ignore: MIME type
+  if(normalized == "tga")    // i18n-ignore: Qt image codec identifier
+    return lit("image/x-tga");    // i18n-ignore: MIME type
+  if(normalized == "pbm")    // i18n-ignore: Qt image codec identifier
+    return lit("image/x-portable-bitmap");    // i18n-ignore: MIME type
+  if(normalized == "pgm")    // i18n-ignore: Qt image codec identifier
+    return lit("image/x-portable-graymap");    // i18n-ignore: MIME type
+  if(normalized == "ppm")    // i18n-ignore: Qt image codec identifier
+    return lit("image/x-portable-pixmap");    // i18n-ignore: MIME type
+  if(normalized == "xbm")    // i18n-ignore: Qt image codec identifier
+    return lit("image/x-xbitmap");    // i18n-ignore: MIME type
+  if(normalized == "xpm")    // i18n-ignore: Qt image codec identifier
+    return lit("image/x-xpixmap");    // i18n-ignore: MIME type
+  if(normalized == "jp2" || normalized == "j2k" ||
+     normalized == "jpx")    // i18n-ignore: codec identifiers
+    return lit("image/jp2");    // i18n-ignore: MIME type
+  if(normalized == "mng")    // i18n-ignore: Qt image codec identifier
+    return lit("image/x-mng");    // i18n-ignore: MIME type
+  if(normalized == "wbmp")    // i18n-ignore: Qt image codec identifier
+    return lit("image/vnd.wap.wbmp");    // i18n-ignore: MIME type
+  if(normalized == "avif")    // i18n-ignore: Qt image codec identifier
+    return lit("image/avif");    // i18n-ignore: MIME type
+  if(normalized == "heic")    // i18n-ignore: Qt image codec identifier
+    return lit("image/heic");    // i18n-ignore: MIME type
+  if(normalized == "heif")    // i18n-ignore: Qt image codec identifier
+    return lit("image/heif");    // i18n-ignore: MIME type
+
+  // A dynamically installed Qt raster codec remains usable without a fixed source-code list.
+  // i18n-ignore: Constructed MIME type is attachment metadata, not visible prose.
+  return lit("image/x-") + QString::fromLatin1(normalized);
+}
+
+bool conversationDecodedRasterImageIsSafe(const QImage &image)
+{
+  return !image.isNull() && image.width() > 0 && image.height() > 0 &&
+         image.width() <= ConversationImageMaxDimension &&
+         image.height() <= ConversationImageMaxDimension &&
+         qint64(image.width()) * qint64(image.height()) <= ConversationImageMaxPixels;
+}
+
+bool conversationImageBytes(const AIChatAttachment &attachment, QByteArray *bytes)
+{
+  if(bytes)
+    bytes->clear();
+
+  // Only immutable payloads already embedded in the conversation are eligible. A persisted path
+  // reference is metadata, not permission to reopen a historical local file while rendering.
+  if(attachment.kind != QLatin1String("image") && attachment.kind != QLatin1String("file"))
+    return false;
+  if(attachment.encoding != QLatin1String("base64") || attachment.content.isEmpty() ||
+     attachment.content.size() > ((ConversationImageMaxBytes + 2) / 3) * 4)
+    return false;
+  const QByteArray encoded = attachment.content.toLatin1();
+  if(QString::fromLatin1(encoded) != attachment.content)
+    return false;
+  const QByteArray decoded = QByteArray::fromBase64(encoded);
+  if(decoded.isEmpty() || decoded.size() > ConversationImageMaxBytes ||
+     decoded.toBase64() != encoded)
+    return false;
+  if(bytes)
+    *bytes = decoded;
+  return true;
+}
+
+bool conversationAttachmentIsImage(const AIChatAttachment &attachment)
+{
+  if(attachment.kind == QLatin1String("image"))
+    return true;
+  return attachment.kind == QLatin1String("file") &&
+         conversationImageMediaTypeEssence(attachment.mediaType).startsWith(
+             QLatin1String("image/"));
+}
+
+QImage conversationImageThumbnail(const AIChatAttachment &attachment, const QSize &bounds)
+{
+  const QString mediaType = conversationImageMediaTypeEssence(attachment.mediaType);
+  if(!bounds.isValid() || bounds.width() <= 0 || bounds.height() <= 0 ||
+     !conversationAttachmentIsImage(attachment) ||
+     !mediaType.startsWith(QLatin1String("image/")))
+    return QImage();
+
+  QByteArray bytes;
+  if(!conversationImageBytes(attachment, &bytes))
+    return QImage();
+  QBuffer buffer;
+  buffer.setData(bytes);
+  if(!buffer.open(QIODevice::ReadOnly))
+    return QImage();
+  QImageReader reader(&buffer);
+  reader.setDecideFormatFromContent(true);
+  reader.setAutoTransform(true);
+  const QString detectedMediaType = conversationRasterMediaTypeForFormat(reader.format());
+  if(!detectedMediaType.isEmpty() && detectedMediaType == mediaType && reader.canRead())
+  {
+    const QSize size = reader.size();
+    if(size.isValid() && size.width() > 0 && size.height() > 0 &&
+       size.width() <= ConversationImageMaxDimension &&
+       size.height() <= ConversationImageMaxDimension &&
+       qint64(size.width()) * qint64(size.height()) <= ConversationImageMaxPixels)
+    {
+      const QSize thumbnailSize = size.scaled(bounds, Qt::KeepAspectRatio);
+      if(thumbnailSize.width() > 0 && thumbnailSize.height() > 0)
+      {
+        reader.setScaledSize(thumbnailSize);
+        const QImage image = reader.read();
+        if(conversationDecodedRasterImageIsSafe(image))
+          return image;
+      }
+    }
+  }
+
+  // Non-provider-native raster attachments can use an installed Windows imaging codec. Only the
+  // immutable embedded bytes are decoded; persisted file-ref paths are never reopened here.
+  if(attachment.kind == QLatin1String("file"))
+  {
+    const QImage image = AIFileThumbnail::decodeRasterData(
+                             bytes, bounds, ConversationImageMaxBytes)
+                             .image;
+    if(conversationDecodedRasterImageIsSafe(image))
+      return image;
+  }
+  return QImage();
+}
+
+QString renderMessageAttachments(const QVector<AIChatAttachment> &attachments,
+                                 QTextDocument *document)
+{
+  if(attachments.isEmpty())
+    return QString();
+
+  // i18n-ignore: Structural transcript HTML and the paperclip entity contain no prose.
+  QString html = lit("<div class=\"message-attachments\">");
+  for(const AIChatAttachment &attachment : attachments)
+  {
+    QString title = attachment.title.simplified().left(160);
+    if(title.isEmpty())
+      title = QCoreApplication::translate("AIConversationView", "Attachment");
+    QString label;
+    QString icon;
+    bool renderedThumbnail = false;
+    if(conversationAttachmentIsImage(attachment))
+    {
+      label = QCoreApplication::translate("AIConversationView", "Image: %1").arg(title);
+      // i18n-ignore: Structural transcript HTML and the framed-picture entity contain no prose.
+      icon = lit("&#128444;&nbsp;");
+
+      const QImage image = conversationImageThumbnail(attachment, QSize(160, 120));
+      if(document && !image.isNull())
+      {
+        // i18n-ignore: Attachment resource URL is an internal document key, not visible prose.
+        const QUrl resourceUrl(lit("replaylab-attachment://") +
+                               QString::fromLatin1(QUrl::toPercentEncoding(attachment.id)));
+        document->addResource(QTextDocument::ImageResource, resourceUrl, image);
+        const QString escapedLabel = label.toHtmlEscaped();
+        // i18n-ignore: Structural transcript HTML contains no user-visible prose.
+        html += lit("<img src=\"") + resourceUrl.toString(QUrl::FullyEncoded).toHtmlEscaped() +
+                // i18n-ignore: Structural transcript HTML dimensions contain no prose.
+                lit("\" width=\"160\" height=\"120\" title=\"") + escapedLabel +
+                lit("\" alt=\"") + escapedLabel +    // i18n-ignore: structural transcript HTML
+                lit("\"/> ");    // i18n-ignore: structural transcript HTML
+        renderedThumbnail = true;
+      }
+    }
+    else if(attachment.kind == QLatin1String("file") ||
+            attachment.kind == QLatin1String("file-ref"))
+    {
+      label = QCoreApplication::translate("AIConversationView", "File: %1").arg(title);
+      // i18n-ignore: Structural transcript HTML and the paperclip entity contain no prose.
+      icon = lit("&#128206;&nbsp;");
+    }
+    else
+    {
+      label = QCoreApplication::translate("AIConversationView", "Text: %1").arg(title);
+      // i18n-ignore: Structural transcript HTML and the page entity contain no prose.
+      icon = lit("&#128196;&nbsp;");
+    }
+    if(!renderedThumbnail)
+      // i18n-ignore: Structural transcript HTML contains no prose.
+      html += lit("<span class=\"message-attachment\">") + icon + label.toHtmlEscaped() +
+              lit("</span>");    // i18n-ignore: structural transcript HTML
+  }
+  // i18n-ignore: Structural transcript HTML contains no user-visible prose.
+  return html + lit("</div>");
 }
 }    // namespace
 
@@ -1484,25 +1882,241 @@ AIConversationView::AIConversationView(QWidget *parent) : QWidget(parent)
   m_TurnRail->setActivateHandler([this](const QString &messageId) { scrollToMessage(messageId); });
   layout->addWidget(m_TurnRail);
 
-  m_Browser = new AIRoundedTextBrowser(this);
+  QWidget *browserContainer = new QWidget(this);
+  QGridLayout *browserLayout = new QGridLayout(browserContainer);
+  browserLayout->setContentsMargins(0, 0, 0, 0);
+  browserLayout->setSpacing(0);
+
+  m_Browser = new AIRoundedTextBrowser(browserContainer);
   m_Browser->setFrameShape(QFrame::NoFrame);
   m_Browser->setOpenLinks(false);
   m_Browser->setOpenExternalLinks(false);
   m_Browser->setReadOnly(true);
-  m_Browser->setTextInteractionFlags(Qt::TextBrowserInteraction);
+  m_Browser->setTextInteractionFlags(Qt::TextBrowserInteraction |
+                                     Qt::TextSelectableByKeyboard);
+  m_Browser->setFocusPolicy(Qt::StrongFocus);
+  m_Browser->setContextMenuPolicy(Qt::CustomContextMenu);
   connect(m_Browser, &QTextBrowser::anchorClicked, this,
           [this](const QUrl &url) { activateLink(url); });
-  layout->addWidget(m_Browser, 1);
+  connect(m_Browser, &QTextBrowser::customContextMenuRequested, this,
+          [this](const QPoint &position) {
+            QMenu *menu = m_Browser->createStandardContextMenu();
+            if(m_SelectionAttachmentHandler && m_Browser->textCursor().hasSelection())
+            {
+              menu->addSeparator();
+              QAction *add = menu->addAction(
+                  QCoreApplication::translate("AIConversationView", "Add to chat"));
+              connect(add, &QAction::triggered, this,
+                      [this]() { addSelectedTextToAttachment(); });
+            }
+            menu->exec(m_Browser->viewport()->mapToGlobal(position));
+            delete menu;
+          });
+  browserLayout->addWidget(m_Browser, 0, 0);
 
-  m_ElapsedTimer = new QTimer(this);
-  m_ElapsedTimer->setInterval(1000);
-  m_ElapsedTimer->setTimerType(Qt::CoarseTimer);
-  connect(m_ElapsedTimer, &QTimer::timeout, this, [this]() { render(); });
+  m_SelectionAction = new QToolButton(m_Browser->viewport());
+  m_SelectionAction->setAutoRaise(false);
+  m_SelectionAction->setFocusPolicy(Qt::NoFocus);
+  m_SelectionAction->setIcon(Icons::text_add());
+  m_SelectionAction->setText(
+      QCoreApplication::translate("AIConversationView", "Add to chat"));
+  m_SelectionAction->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+  m_SelectionAction->setCursor(Qt::PointingHandCursor);
+  m_SelectionAction->setAccessibleName(
+      QCoreApplication::translate("AIConversationView", "Add selected text to chat"));
+  // i18n-ignore: The stylesheet contains no user-visible prose.
+  m_SelectionAction->setStyleSheet(lit(
+      "QToolButton { border: 1px solid palette(mid); border-radius: 14px; "
+      "background: palette(base); padding: 4px 10px; } "
+      "QToolButton:hover { background: palette(midlight); }"));
+  m_SelectionAction->hide();
+  connect(m_Browser, &QTextBrowser::selectionChanged, this,
+          [this]() {
+            if(m_Browser && m_Browser->textCursor().hasSelection())
+            {
+              if(!m_AdjustingScroll)
+                ++m_UserInteractionGeneration;
+              detachFromTail();
+            }
+            QTimer::singleShot(0, this, [this]() {
+              updateSelectionAction();
+              flushDeferredRender();
+            });
+          });
+  connect(m_SelectionAction, &QToolButton::clicked, this,
+          [this]() { addSelectedTextToAttachment(); });
+
+  m_ScrollToLatest = new QToolButton(browserContainer);
+  m_ScrollToLatest->setArrowType(Qt::DownArrow);
+  m_ScrollToLatest->setAutoRaise(false);
+  m_ScrollToLatest->setFixedSize(34, 34);
+  m_ScrollToLatest->setToolTip(
+      QCoreApplication::translate("AIConversationView", "Jump to latest message"));
+  m_ScrollToLatest->setAccessibleName(
+      QCoreApplication::translate("AIConversationView", "Jump to latest message"));
+  // i18n-ignore: The stylesheet contains no user-visible prose.
+  m_ScrollToLatest->setStyleSheet(lit(
+      "QToolButton { border: 1px solid palette(mid); border-radius: 17px; "
+      "background: palette(base); } QToolButton:hover { background: palette(midlight); }"));
+  browserLayout->addWidget(m_ScrollToLatest, 0, 0, Qt::AlignHCenter | Qt::AlignBottom);
+  m_ScrollToLatest->hide();
+  connect(m_ScrollToLatest, &QToolButton::clicked, this, [this]() { scrollToLatest(); });
+
+  QScrollBar *scroll = m_Browser->verticalScrollBar();
+  // valueChanged is also emitted when QTextDocument's lazy layout changes and clamps the scroll
+  // range. Treat only slider actions and input events as user intent so a layout pass cannot
+  // silently re-enable tail following while the user is reading earlier content.
+  connect(scroll, &QAbstractSlider::actionTriggered, this, [this](int action) {
+    ++m_UserInteractionGeneration;
+    if(action == QAbstractSlider::SliderSingleStepSub ||
+       action == QAbstractSlider::SliderPageStepSub ||
+       action == QAbstractSlider::SliderToMinimum)
+      detachFromTail();
+    scheduleUserScrollUpdate();
+  });
+  connect(scroll, &QAbstractSlider::sliderMoved, this,
+          [this, scroll](int value) {
+            ++m_UserInteractionGeneration;
+            if(value < scroll->maximum() - 2)
+              detachFromTail();
+            scheduleUserScrollUpdate();
+          });
+  connect(scroll, &QAbstractSlider::sliderReleased, this,
+          [this]() { scheduleUserScrollUpdate(); });
+  connect(scroll, &QScrollBar::rangeChanged, this, [this](int, int) {
+    if(m_AdjustingScroll)
+      return;
+    if(m_FollowTail)
+      scrollToLatest();
+    else
+    {
+      scheduleViewportAnchorRestore();
+      updateTailControl();
+    }
+  });
+  m_Browser->installEventFilter(this);
+  m_Browser->viewport()->installEventFilter(this);
+  scroll->installEventFilter(this);
+
+  layout->addWidget(browserContainer, 1);
+
+  m_LiveTextTimer = new QTimer(this);
+  m_LiveTextTimer->setInterval(LiveTextRevealIntervalMs);
+  m_LiveTextTimer->setTimerType(Qt::PreciseTimer);
+  connect(m_LiveTextTimer, &QTimer::timeout, this, [this]() { advanceLiveText(); });
 }
 
 void AIConversationView::setMessages(const QVector<AIChatMessage> &messages)
 {
+  QHash<QString, QString> oldLiveTargets;
+  QHash<QString, quint64> oldLiveRevisions;
+  QHash<QString, int> oldLiveVisible;
+  for(const AIChatMessage &message : m_Messages)
+  {
+    for(const AIActivityItem &activity : message.activity)
+    {
+      if(!activity.liveText)
+        continue;
+      const QString key = liveTextKey(message, activity);
+      oldLiveTargets.insert(key, activity.detail);
+      oldLiveRevisions.insert(key, activity.liveTextRevision);
+      oldLiveVisible.insert(key, activity.visibleDetailChars);
+    }
+  }
+
+  bool hadLive = false;
+  for(const AIChatMessage &message : m_Messages)
+    hadLive |= isLiveState(message.state) && message.timestampMs > 0;
+  const QString oldConversationKey =
+      m_Messages.isEmpty() ? QString() : m_Messages.constFirst().id;
+  const QString newConversationKey = messages.isEmpty() ? QString() : messages.constFirst().id;
+  const bool conversationChanged = oldConversationKey != newConversationKey;
+  const bool keepDocument =
+      !conversationChanged && canKeepTranscriptDocument(m_Messages, messages);
+  if(conversationChanged)
+  {
+    ++m_UserInteractionGeneration;
+    m_FollowTail = true;
+    m_PreservedScrollValue = 0;
+    clearViewportAnchor();
+    m_RenderPendingWhileDetached = false;
+    m_RenderPendingForSelection = false;
+    updateTailControl();
+  }
   m_Messages = messages;
+  for(AIChatMessage &message : m_Messages)
+  {
+    for(AIActivityItem &activity : message.activity)
+    {
+      if(!activity.liveText)
+        continue;
+      const QString key = liveTextKey(message, activity);
+      if(conversationChanged)
+      {
+        // Switching conversations materializes existing history immediately. Later extensions to
+        // the same live stream still resume at one grapheme per timer tick.
+        activity.visibleDetailChars = -1;
+        continue;
+      }
+
+      const auto oldTarget = oldLiveTargets.constFind(key);
+      if(oldTarget == oldLiveTargets.constEnd() ||
+         oldLiveRevisions.value(key) != activity.liveTextRevision ||
+         !activity.detail.startsWith(oldTarget.value()))
+      {
+        activity.visibleDetailChars = activity.detail.isEmpty() ? -1 : 0;
+        continue;
+      }
+
+      const int previousVisible = oldLiveVisible.value(key, -1) < 0
+                                      ? oldTarget.value().size()
+                                      : oldLiveVisible.value(key);
+      activity.visibleDetailChars = qMin(previousVisible, activity.detail.size());
+      if(activity.visibleDetailChars >= activity.detail.size())
+        activity.visibleDetailChars = -1;
+    }
+  }
+
+  const bool selectionActive =
+      !conversationChanged &&
+      (m_SelectingText || (m_Browser && m_Browser->textCursor().hasSelection()));
+  if(selectionActive && !keepDocument)
+    m_RenderPendingForSelection = true;
+  if(selectionActive && m_RenderPendingForSelection)
+  {
+    // A reset/new row/terminal state needs a structural render, but replacing QTextDocument while
+    // text is selected makes copying impossible. Freeze the reveal target and render the latest
+    // model once the selection is cleared.
+    if(m_LiveTextTimer)
+      m_LiveTextTimer->stop();
+    updateTailControl();
+    return;
+  }
+  const bool flushSelectionRender = m_RenderPendingForSelection;
+  if(flushSelectionRender)
+    m_RenderPendingForSelection = false;
+
+  if(keepDocument && !flushSelectionRender)
+  {
+    // The rich-text structure is unchanged. Replacing it here would discard the user's selection
+    // and reset the scrollbar even though only a live target gained a suffix.
+    updateLiveTextTimer();
+    updateTailControl();
+    return;
+  }
+
+  bool hasLive = false;
+  for(const AIChatMessage &message : m_Messages)
+    hasLive |= isLiveState(message.state) && message.timestampMs > 0;
+  if(!conversationChanged && !m_FollowTail && !hadLive && !hasLive)
+  {
+    // Static history can remain materialized while the user reads it. A live update, including the
+    // live-to-terminal transition, always renders through the viewport-anchor preservation path.
+    m_RenderPendingWhileDetached = true;
+    updateTailControl();
+    updateLiveTextTimer();
+    return;
+  }
   render();
 }
 
@@ -1511,12 +2125,142 @@ void AIConversationView::clear()
   ++m_RenderGeneration;
   m_Messages.clear();
   m_MessageAnchors.clear();
+  m_LiveTextAnchors.clear();
+  m_LiveTextCursors.clear();
+  m_FollowTail = true;
+  m_AdjustingScroll = false;
+  m_SelectingText = false;
+  ++m_UserInteractionGeneration;
+  m_PreservedScrollValue = 0;
+  clearViewportAnchor();
+  m_RenderPendingWhileDetached = false;
+  m_RenderPendingForSelection = false;
   if(m_TurnRail)
     m_TurnRail->setTurns(QVector<AITurnRailWidget::Turn>());
   if(m_Browser)
     m_Browser->clear();
-  if(m_ElapsedTimer)
-    m_ElapsedTimer->stop();
+  if(m_SelectionAction)
+    m_SelectionAction->hide();
+  updateTailControl();
+  if(m_LiveTextTimer)
+    m_LiveTextTimer->stop();
+}
+
+void AIConversationView::updateLiveTextTimer()
+{
+  bool pending = false;
+  for(const AIChatMessage &message : m_Messages)
+  {
+    for(const AIActivityItem &activity : message.activity)
+    {
+      if(activity.liveText && activity.visibleDetailChars >= 0 &&
+         activity.visibleDetailChars < activity.detail.size())
+      {
+        pending = true;
+        break;
+      }
+    }
+    if(pending)
+      break;
+  }
+
+  if(!m_LiveTextTimer)
+    return;
+  if(pending && !m_LiveTextTimer->isActive())
+    m_LiveTextTimer->start();
+  else if(!pending && m_LiveTextTimer->isActive())
+    m_LiveTextTimer->stop();
+}
+
+void AIConversationView::advanceLiveText()
+{
+  bool needsRender = false;
+  for(AIChatMessage &message : m_Messages)
+  {
+    for(AIActivityItem &activity : message.activity)
+    {
+      if(!activity.liveText || activity.visibleDetailChars < 0 ||
+         activity.visibleDetailChars >= activity.detail.size())
+        continue;
+
+      const int next = nextGraphemeBoundary(activity.detail, activity.visibleDetailChars);
+      const QString grapheme =
+          activity.detail.mid(activity.visibleDetailChars, next - activity.visibleDetailChars);
+      const QString key = liveTextKey(message, activity);
+      auto cursor = m_LiveTextCursors.find(key);
+      if(cursor != m_LiveTextCursors.end())
+      {
+        cursor.value().cursor.insertText(grapheme, cursor.value().format);
+      }
+      else if(message.activityExpanded)
+      {
+        // A structural render may have replaced the QTextDocument between timer ticks. Rebuild its
+        // stable tail cursor before advancing this visible stream.
+        needsRender = true;
+        continue;
+      }
+
+      activity.visibleDetailChars = next;
+      if(activity.visibleDetailChars >= activity.detail.size())
+        activity.visibleDetailChars = -1;
+    }
+  }
+
+  if(needsRender)
+  {
+    const bool selectionActive =
+        m_SelectingText || (m_Browser && m_Browser->textCursor().hasSelection());
+    if(selectionActive)
+    {
+      m_RenderPendingForSelection = true;
+      if(m_LiveTextTimer)
+        m_LiveTextTimer->stop();
+    }
+    else
+    {
+      render();
+    }
+  }
+  else
+    updateLiveTextTimer();
+}
+
+void AIConversationView::rebuildLiveTextCursors()
+{
+  m_LiveTextCursors.clear();
+  if(!m_Browser || !m_Browser->document() || m_LiveTextAnchors.isEmpty())
+    return;
+
+  QHash<QString, QString> keyByAnchor;
+  for(auto it = m_LiveTextAnchors.constBegin(); it != m_LiveTextAnchors.constEnd(); ++it)
+    keyByAnchor.insert(it.value(), it.key());
+
+  QTextDocument *document = m_Browser->document();
+  for(QTextBlock block = document->begin(); block.isValid(); block = block.next())
+  {
+    for(QTextBlock::iterator it = block.begin(); !it.atEnd(); ++it)
+    {
+      const QTextFragment fragment = it.fragment();
+      if(!fragment.isValid())
+        continue;
+      for(const QString &name : fragment.charFormat().anchorNames())
+      {
+        const auto key = keyByAnchor.constFind(name);
+        if(key == keyByAnchor.constEnd())
+          continue;
+        LiveTextCursor target;
+        target.cursor = QTextCursor(document);
+        target.cursor.setPosition(fragment.position());
+        target.format = fragment.charFormat();
+        target.format.setAnchor(false);
+        target.format.setAnchorHref(QString());
+        target.format.setAnchorNames(QStringList());
+        target.format.setForeground(palette().brush(QPalette::Disabled, QPalette::Text));
+        target.format.setFontUnderline(false);
+        m_LiveTextCursors.insert(key.value(), target);
+      }
+    }
+  }
 }
 
 void AIConversationView::scrollToMessage(const QString &messageId)
@@ -1525,7 +2269,282 @@ void AIConversationView::scrollToMessage(const QString &messageId)
     return;
   const QString anchor = m_MessageAnchors.value(messageId);
   if(!anchor.isEmpty())
+  {
     m_Browser->scrollToAnchor(anchor);
+    updateFollowTailFromUser();
+  }
+}
+
+void AIConversationView::scrollToLatest()
+{
+  QScrollBar *bar = m_Browser ? m_Browser->verticalScrollBar() : NULL;
+  m_FollowTail = true;
+  clearViewportAnchor();
+  if(m_RenderPendingForSelection)
+  {
+    m_RenderPendingForSelection = false;
+    updateTailControl();
+    render(false);
+    return;
+  }
+  if(m_RenderPendingWhileDetached)
+  {
+    updateTailControl();
+    render();
+    return;
+  }
+  if(bar)
+  {
+    const bool wasAdjusting = m_AdjustingScroll;
+    m_AdjustingScroll = true;
+    bar->setValue(bar->maximum());
+    m_AdjustingScroll = wasAdjusting;
+  }
+  updateTailControl();
+}
+
+void AIConversationView::detachFromTail()
+{
+  if(!m_FollowTail)
+    return;
+  QScrollBar *bar = m_Browser ? m_Browser->verticalScrollBar() : NULL;
+  m_FollowTail = false;
+  if(bar)
+    m_PreservedScrollValue = bar->value();
+  captureViewportAnchor();
+  updateTailControl();
+}
+
+void AIConversationView::updateTailControl()
+{
+  if(!m_ScrollToLatest)
+    return;
+  QScrollBar *bar = m_Browser ? m_Browser->verticalScrollBar() : NULL;
+  const bool canScroll = bar && bar->maximum() > bar->minimum();
+  m_ScrollToLatest->setVisible(!m_FollowTail && (canScroll || m_RenderPendingWhileDetached));
+  if(m_ScrollToLatest->isVisible())
+    m_ScrollToLatest->raise();
+}
+
+void AIConversationView::scheduleUserScrollUpdate()
+{
+  if(m_UserScrollUpdatePending)
+    return;
+  m_UserScrollUpdatePending = true;
+  QTimer::singleShot(0, this, [this]() {
+    m_UserScrollUpdatePending = false;
+    updateFollowTailFromUser();
+  });
+}
+
+void AIConversationView::updateFollowTailFromUser()
+{
+  if(m_AdjustingScroll)
+    return;
+  QScrollBar *bar = m_Browser ? m_Browser->verticalScrollBar() : NULL;
+  if(!bar)
+    return;
+
+  m_FollowTail = bar->maximum() - bar->value() <= 2;
+  if(m_FollowTail)
+  {
+    clearViewportAnchor();
+    if(m_RenderPendingWhileDetached)
+    {
+      updateTailControl();
+      render();
+      return;
+    }
+  }
+  else
+  {
+    m_PreservedScrollValue = bar->value();
+    captureViewportAnchor();
+  }
+  updateTailControl();
+}
+
+void AIConversationView::clearViewportAnchor()
+{
+  m_ViewportAnchor = ViewportAnchor();
+}
+
+void AIConversationView::captureViewportAnchor()
+{
+  if(m_FollowTail || !m_Browser || !m_Browser->document())
+    return;
+
+  QScrollBar *bar = m_Browser->verticalScrollBar();
+  if(bar)
+    m_PreservedScrollValue = bar->value();
+
+  // Sample the horizontal centre so right-aligned user bubbles do not resolve to the empty table
+  // cell on their left.
+  const int anchorX = qMax(1, m_Browser->viewport()->width() / 2);
+  QTextCursor cursor = m_Browser->cursorForPosition(QPoint(anchorX, 1));
+  const QTextBlock block = cursor.block();
+  if(!block.isValid())
+  {
+    clearViewportAnchor();
+    return;
+  }
+
+  ViewportAnchor anchor;
+  anchor.valid = true;
+  anchor.cursorInBlock = qBound(0, cursor.position() - block.position(), block.length() - 1);
+  anchor.viewportY = m_Browser->cursorRect(cursor).top();
+
+  const QString blockText = block.text();
+  anchor.blockTextIsComplete = blockText.size() <= ViewportAnchorCompleteBlockChars;
+  if(anchor.blockTextIsComplete)
+    anchor.blockText = blockText;
+
+  const int maximumContextStart = qMax(0, blockText.size() - ViewportAnchorContextChars);
+  const int contextStart =
+      qBound(0, anchor.cursorInBlock - ViewportAnchorContextChars / 2, maximumContextStart);
+  anchor.context = blockText.mid(contextStart, ViewportAnchorContextChars);
+  anchor.contextCursorOffset = anchor.cursorInBlock - contextStart;
+
+  const QVector<MessageDocumentAnchor> positions =
+      messageDocumentAnchors(m_Browser->document(), m_MessageAnchors);
+  int messageStart = 0;
+  for(const MessageDocumentAnchor &position : positions)
+  {
+    if(position.position > cursor.position())
+      break;
+    anchor.messageId = position.messageId;
+    messageStart = position.position;
+  }
+  const QTextBlock messageStartBlock = m_Browser->document()->findBlock(messageStart);
+  anchor.relativeBlock =
+      qMax(0, block.blockNumber() - (messageStartBlock.isValid() ? messageStartBlock.blockNumber() : 0));
+  m_ViewportAnchor = anchor;
+}
+
+void AIConversationView::scheduleViewportAnchorRestore()
+{
+  if(m_FollowTail || m_ViewportAnchorRestorePending)
+    return;
+  m_ViewportAnchorRestorePending = true;
+  const int renderGeneration = m_RenderGeneration;
+  const quint64 userInteractionGeneration = m_UserInteractionGeneration;
+  QTimer::singleShot(0, this, [this, renderGeneration, userInteractionGeneration]() {
+    m_ViewportAnchorRestorePending = false;
+    if(renderGeneration == m_RenderGeneration &&
+       userInteractionGeneration == m_UserInteractionGeneration && !m_FollowTail)
+      restoreViewportAnchor();
+  });
+}
+
+void AIConversationView::restoreViewportAnchor()
+{
+  if(m_FollowTail || !m_Browser || !m_Browser->document())
+    return;
+  QScrollBar *bar = m_Browser->verticalScrollBar();
+  if(!bar)
+    return;
+
+  if(!m_ViewportAnchor.valid)
+  {
+    const bool wasAdjusting = m_AdjustingScroll;
+    m_AdjustingScroll = true;
+    bar->setValue(qMin(m_PreservedScrollValue, bar->maximum()));
+    m_AdjustingScroll = wasAdjusting;
+    updateTailControl();
+    return;
+  }
+
+  QTextDocument *document = m_Browser->document();
+  const QVector<MessageDocumentAnchor> positions =
+      messageDocumentAnchors(document, m_MessageAnchors);
+  int scopeStart = 0;
+  int scopeEnd = document->characterCount();
+  if(!m_ViewportAnchor.messageId.isEmpty())
+  {
+    for(int i = 0; i < positions.size(); ++i)
+    {
+      if(positions[i].messageId != m_ViewportAnchor.messageId)
+        continue;
+      scopeStart = positions[i].position;
+      if(i + 1 < positions.size())
+        scopeEnd = positions[i + 1].position;
+      break;
+    }
+  }
+
+  QTextBlock scopeFirstBlock = document->findBlock(scopeStart);
+  if(!scopeFirstBlock.isValid())
+    scopeFirstBlock = document->begin();
+  const int expectedBlockNumber = scopeFirstBlock.blockNumber() + m_ViewportAnchor.relativeBlock;
+
+  QTextBlock bestBlock;
+  int bestCursorInBlock = 0;
+  int bestRank = 3;
+  int bestDistance = 0x7fffffff;
+  QTextBlock fallbackBlock;
+  for(QTextBlock block = scopeFirstBlock; block.isValid() && block.position() < scopeEnd;
+      block = block.next())
+  {
+    const int distance = qAbs(block.blockNumber() - expectedBlockNumber);
+    if(!fallbackBlock.isValid() || distance <
+                                     qAbs(fallbackBlock.blockNumber() - expectedBlockNumber))
+      fallbackBlock = block;
+
+    const QString text = block.text();
+    int rank = 3;
+    int cursorInBlock = qMin(m_ViewportAnchor.cursorInBlock, text.size());
+    if(m_ViewportAnchor.blockTextIsComplete && text == m_ViewportAnchor.blockText)
+    {
+      rank = 0;
+    }
+    else if(!m_ViewportAnchor.context.isEmpty())
+    {
+      int match = text.indexOf(m_ViewportAnchor.context);
+      if(match >= 0)
+      {
+        int closestMatch = match;
+        while(match >= 0)
+        {
+          if(qAbs(match + m_ViewportAnchor.contextCursorOffset -
+                  m_ViewportAnchor.cursorInBlock) <
+             qAbs(closestMatch + m_ViewportAnchor.contextCursorOffset -
+                  m_ViewportAnchor.cursorInBlock))
+            closestMatch = match;
+          match = text.indexOf(m_ViewportAnchor.context, match + 1);
+        }
+        cursorInBlock = closestMatch + m_ViewportAnchor.contextCursorOffset;
+        rank = 1;
+      }
+    }
+
+    if(rank < bestRank || (rank == bestRank && distance < bestDistance))
+    {
+      bestRank = rank;
+      bestDistance = distance;
+      bestBlock = block;
+      bestCursorInBlock = cursorInBlock;
+    }
+  }
+
+  if(!bestBlock.isValid() || bestRank >= 3)
+  {
+    bestBlock = fallbackBlock;
+    if(bestBlock.isValid())
+      bestCursorInBlock = qMin(m_ViewportAnchor.cursorInBlock, bestBlock.text().size());
+  }
+  if(!bestBlock.isValid())
+    return;
+
+  QTextCursor cursor(document);
+  cursor.setPosition(bestBlock.position() + bestCursorInBlock);
+  const bool wasAdjusting = m_AdjustingScroll;
+  m_AdjustingScroll = true;
+  const int cursorViewportY = m_Browser->cursorRect(cursor).top();
+  const int target = bar->value() + cursorViewportY - m_ViewportAnchor.viewportY;
+  bar->setValue(qBound(bar->minimum(), target, bar->maximum()));
+  m_PreservedScrollValue = bar->value();
+  m_AdjustingScroll = wasAdjusting;
+  updateTailControl();
 }
 
 void AIConversationView::setLinkHandler(std::function<void(const QUrl &)> handler)
@@ -1539,12 +2558,176 @@ void AIConversationView::setActivityToggleHandler(
   m_ActivityToggleHandler = std::move(handler);
 }
 
+void AIConversationView::setSelectionAttachmentHandler(
+    std::function<void(const QString &text)> handler)
+{
+  m_SelectionAttachmentHandler = std::move(handler);
+  updateSelectionAction();
+}
+
+void AIConversationView::addSelectedTextToAttachment()
+{
+  if(!m_Browser || !m_SelectionAttachmentHandler)
+    return;
+  QString text = m_Browser->textCursor().selectedText();
+  text.replace(QChar::ParagraphSeparator, QLatin1Char('\n'));
+  text.replace(QChar::LineSeparator, QLatin1Char('\n'));
+  text.remove(QChar(0x200b));
+  if(!text.trimmed().isEmpty())
+    m_SelectionAttachmentHandler(text);
+  if(m_SelectionAction)
+    m_SelectionAction->hide();
+}
+
+void AIConversationView::flushDeferredRender()
+{
+  if(!m_RenderPendingForSelection || m_SelectingText || !m_Browser ||
+     m_Browser->textCursor().hasSelection())
+    return;
+  m_RenderPendingForSelection = false;
+  render();
+}
+
+void AIConversationView::updateSelectionAction()
+{
+  if(!m_Browser || !m_SelectionAction || !m_SelectionAttachmentHandler)
+  {
+    if(m_SelectionAction)
+      m_SelectionAction->hide();
+    return;
+  }
+
+  QTextCursor cursor = m_Browser->textCursor();
+  if(!cursor.hasSelection() || cursor.selectedText().trimmed().isEmpty())
+  {
+    m_SelectionAction->hide();
+    return;
+  }
+
+  cursor.setPosition(cursor.selectionEnd());
+  const QRect caret = m_Browser->cursorRect(cursor);
+  m_SelectionAction->adjustSize();
+  const QSize buttonSize = m_SelectionAction->size();
+  const QRect available = m_Browser->viewport()->rect().adjusted(4, 4, -4, -4);
+  int x = caret.right() - buttonSize.width();
+  int y = caret.bottom() + 6;
+  if(y + buttonSize.height() > available.bottom())
+    y = caret.top() - buttonSize.height() - 6;
+  x = qBound(available.left(), x,
+             qMax(available.left(), available.right() - buttonSize.width() + 1));
+  y = qBound(available.top(), y,
+             qMax(available.top(), available.bottom() - buttonSize.height() + 1));
+  m_SelectionAction->move(x, y);
+  m_SelectionAction->show();
+  m_SelectionAction->raise();
+}
+
 void AIConversationView::changeEvent(QEvent *event)
 {
   QWidget::changeEvent(event);
   if(event && (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange) &&
      !m_Messages.isEmpty())
-    render();
+  {
+    const bool selectionActive =
+        m_SelectingText || (m_Browser && m_Browser->textCursor().hasSelection());
+    if(selectionActive)
+    {
+      m_RenderPendingForSelection = true;
+      if(m_LiveTextTimer)
+        m_LiveTextTimer->stop();
+    }
+    else
+    {
+      render();
+    }
+  }
+}
+
+bool AIConversationView::eventFilter(QObject *watched, QEvent *event)
+{
+  if(event && m_Browser &&
+     (watched == m_Browser || watched == m_Browser->viewport() ||
+      watched == m_Browser->verticalScrollBar()))
+  {
+    if(event->type() == QEvent::ShortcutOverride)
+    {
+      QKeyEvent *key = static_cast<QKeyEvent *>(event);
+      if(key->matches(QKeySequence::Copy) && m_Browser->textCursor().hasSelection())
+      {
+        event->accept();
+        return true;
+      }
+    }
+    bool userScrollInput = event->type() == QEvent::Wheel || event->type() == QEvent::Scroll;
+    bool detachInput = event->type() == QEvent::Scroll;
+    if(event->type() == QEvent::Wheel)
+    {
+      const QWheelEvent *wheel = static_cast<QWheelEvent *>(event);
+      const int verticalDelta =
+          wheel->angleDelta().y() != 0 ? wheel->angleDelta().y() : wheel->pixelDelta().y();
+      detachInput = verticalDelta > 0;
+    }
+    if(event->type() == QEvent::KeyPress)
+    {
+      const QKeyEvent *key = static_cast<QKeyEvent *>(event);
+      if(key->matches(QKeySequence::Copy) && m_Browser->textCursor().hasSelection())
+      {
+        m_Browser->copy();
+        return true;
+      }
+      switch(key->key())
+      {
+        case Qt::Key_Down:
+        case Qt::Key_PageDown:
+        case Qt::Key_End:
+        case Qt::Key_Space:
+          userScrollInput = true;
+          detachInput = (key->modifiers() & Qt::ShiftModifier) != 0;
+          break;
+        case Qt::Key_Up:
+        case Qt::Key_PageUp:
+        case Qt::Key_Home:
+          userScrollInput = true;
+          detachInput = true;
+          break;
+        default: break;
+      }
+    }
+    if(watched == m_Browser->viewport() && event->type() == QEvent::MouseButtonPress &&
+       static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton)
+    {
+      ++m_UserInteractionGeneration;
+      m_SelectingText = true;
+      detachInput = true;
+    }
+    if(userScrollInput)
+      ++m_UserInteractionGeneration;
+    if(detachInput)
+      detachFromTail();
+    if(userScrollInput)
+    {
+      scheduleUserScrollUpdate();
+      if(m_SelectionAction)
+        m_SelectionAction->hide();
+      QTimer::singleShot(0, this, [this]() { updateSelectionAction(); });
+    }
+    if(event->type() == QEvent::MouseButtonRelease && m_SelectingText)
+    {
+      m_SelectingText = false;
+      QTimer::singleShot(0, this, [this]() {
+        updateSelectionAction();
+        flushDeferredRender();
+        if(m_Browser && !m_Browser->textCursor().hasSelection())
+          scheduleUserScrollUpdate();
+      });
+    }
+    else if(event->type() == QEvent::FocusOut && m_SelectionAction)
+    {
+      m_SelectingText = false;
+      m_SelectionAction->hide();
+    }
+  }
+  return QWidget::eventFilter(watched, event);
 }
 
 void AIConversationView::activateLink(const QUrl &url)
@@ -1581,11 +2764,22 @@ void AIConversationView::render(bool preserveScroll)
 {
   if(!m_Browser || !m_TurnRail)
     return;
-  QScrollBar *scroll = m_Browser->verticalScrollBar();
-  const int oldValue = scroll ? scroll->value() : 0;
-  const bool followTail = !preserveScroll || !scroll || scroll->maximum() - oldValue <= 8;
+  m_RenderPendingWhileDetached = false;
+  m_RenderPendingForSelection = false;
+  if(!preserveScroll)
+  {
+    m_FollowTail = true;
+    clearViewportAnchor();
+  }
+  else if(!m_FollowTail)
+  {
+    // Capture the first visible text cursor before setHtml replaces the document. Its text context
+    // and viewport offset survive content inserted above the user's reading position.
+    captureViewportAnchor();
+  }
 
   m_MessageAnchors.clear();
+  m_LiveTextAnchors.clear();
   QVector<AITurnRailWidget::Turn> turns;
   QHash<QString, QString> assistantTextByTask;
   for(const AIChatMessage &message : m_Messages)
@@ -1675,16 +2869,9 @@ void AIConversationView::render(bool preserveScroll)
       assistantFinishedByTask[message.taskId] = message.timestampMs;
   }
 
-  bool hasLiveElapsed = false;
-  for(const AIChatMessage &message : m_Messages)
-    hasLiveElapsed |= isLiveState(message.state) && message.timestampMs > 0;
-  if(m_ElapsedTimer)
-  {
-    if(hasLiveElapsed && !m_ElapsedTimer->isActive())
-      m_ElapsedTimer->start();
-    else if(!hasLiveElapsed && m_ElapsedTimer->isActive())
-      m_ElapsedTimer->stop();
-  }
+  // Elapsed labels update whenever lifecycle structure changes. A clock-only refresh must never
+  // replace the complete QTextDocument: doing so destroys selections and competes with scroll
+  // anchoring even when no conversation text changed.
   const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
 
   // i18n-ignore: Structural transcript HTML contains no user-visible prose.
@@ -1724,7 +2911,7 @@ void AIConversationView::render(bool preserveScroll)
       QLatin1String(";}.source-comment{color:") + syntaxComment +
       QLatin1String(";font-style:italic;}.source-number{color:") + syntaxNumber +
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
-      lit(";}.bubble-marker{font-size:1px;}.user-bubble{padding:7px 10px;}.assistant{") +
+      lit(";}.bubble-marker,.message-marker{font-size:1px;}.user-bubble{padding:7px 10px;}.assistant{") +
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
       lit("margin:7px 4px 6px 4px;") + lit("padding:0;background:") + base + lit(";}.system{color:") +
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
@@ -1755,7 +2942,11 @@ void AIConversationView::render(bool preserveScroll)
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
       lit(";font-size:small;}.activity-detail{color:") + muted +
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
-      lit(";margin:3px 0 0 0;line-height:145%;}.activity-code{font-family:'Cascadia Code',") +
+      lit(";margin:3px 0 0 0;line-height:145%;}.activity-live-text{white-space:pre-wrap;") +
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      lit("}.activity-live-tail{color:") + muted +
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      lit(";text-decoration:none;}.activity-code{font-family:'Cascadia Code',") +
       QLatin1String("'Cascadia Mono',Consolas,'SFMono-Regular',monospace;font-size:9pt;") +
       QLatin1String("line-height:125%;background:") + alternate +
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
@@ -1786,7 +2977,10 @@ void AIConversationView::render(bool preserveScroll)
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
       lit("padding-left:8px;border-left:2px solid ") + highlight +
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
-      lit(";}blockquote{border-left:3px solid ") + border +
+      lit(";}.message-attachments{margin:1px 0 6px 0;}.message-attachment{") +
+      lit("display:inline-block;border:1px solid ") + border + lit(";background:") + alternate +    // i18n-ignore: transcript CSS declarations
+      lit(";border-radius:12px;padding:2px 7px;margin:0 5px 3px 0;color:") + muted +    // i18n-ignore: transcript CSS declarations
+      lit(";}blockquote{border-left:3px solid ") + border +    // i18n-ignore: transcript CSS declarations
       // i18n-ignore: Transcript CSS declarations and closing HTML contain no user-visible text.
       lit(";padding-left:8px;margin:2px 0 2px 4px;}</style></head><body>");
 
@@ -1795,7 +2989,7 @@ void AIConversationView::render(bool preserveScroll)
   {
     const AIChatMessage &message = m_Messages[messageIndex];
     const QString anchor = m_MessageAnchors.value(message.id);
-    html += lit("<a name=\"") + anchor.toHtmlEscaped() + lit("\"></a>");
+    // i18n-ignore: Message role is a backend protocol identifier used only for routing.
     if(message.role == lit("user"))
     {
       // i18n-ignore: Generated anchor prefix is an internal transcript navigation identifier.
@@ -1808,7 +3002,13 @@ void AIConversationView::render(bool preserveScroll)
               // i18n-ignore: Structural transcript HTML contains no user-visible prose.
               lit("<tr><td width=\"29%\"></td><td width=\"71%\" class=\"user-bubble\">") +
               // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
-              lit("<a class=\"bubble-marker\" name=\"") + bubbleStart + lit("\">&#8203;</a>");
+              lit("<a class=\"message-marker\" name=\"") + anchor.toHtmlEscaped() +
+              // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
+              lit("\">&#8203;</a>") +
+              // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
+              lit("<a class=\"bubble-marker\" name=\"") + bubbleStart +
+              // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
+              lit("\">&#8203;</a>");
       // i18n-ignore: Conversation state is an internal lifecycle identifier used only for control flow.
       if(!message.state.isEmpty() && message.state != lit("completed"))
         // i18n-ignore: Structural transcript HTML contains no user-visible prose.
@@ -1816,7 +3016,10 @@ void AIConversationView::render(bool preserveScroll)
                 // i18n-ignore: Structural transcript HTML contains no user-visible prose.
                 lit("</div>");
       // i18n-ignore: Structural transcript HTML contains no user-visible prose.
-      html += safeMarkdown(message.text) + lit("<a class=\"bubble-marker\" name=\"") + bubbleEnd +
+      html += renderMessageAttachments(message.attachments, m_Browser->document()) +
+              safeMarkdown(message.text) +
+              // i18n-ignore: Structural transcript HTML contains no user-visible prose.
+              lit("<a class=\"bubble-marker\" name=\"") + bubbleEnd +
               // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
               lit("\">&#8203;</a></td></tr></table>");
 
@@ -1825,16 +3028,33 @@ void AIConversationView::render(bool preserveScroll)
         const qint64 finishedMs = message.finishedTimestampMs > 0
                                       ? message.finishedTimestampMs
                                       : assistantFinishedByTask.value(message.taskId, 0);
-        html += renderActivityGroup(message, finishedMs, nowMs);
+        html += renderActivityGroup(message, finishedMs, nowMs, &m_LiveTextAnchors);
       }
     }
+    // i18n-ignore: Message role is a backend protocol identifier used only for routing.
     else if(message.role == lit("assistant"))
     {
-      html += lit("<div class=\"assistant\">") + safeMarkdown(message.text) + lit("</div>");
+      // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
+      html += lit("<div class=\"assistant\"><a class=\"message-marker\" name=\"") +
+              anchor.toHtmlEscaped() +
+              // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
+              lit("\">&#8203;</a>") +
+              renderMessageAttachments(message.attachments, m_Browser->document()) +
+              safeMarkdown(message.text) +
+              // i18n-ignore: Structural transcript HTML contains no user-visible prose.
+              lit("</div>");
     }
     else
     {
-      html += lit("<div class=\"system\">") + safeMarkdown(message.text) + lit("</div>");
+      // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
+      html += lit("<div class=\"system\"><a class=\"message-marker\" name=\"") +
+              anchor.toHtmlEscaped() +
+              // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
+              lit("\">&#8203;</a>") +
+              renderMessageAttachments(message.attachments, m_Browser->document()) +
+              safeMarkdown(message.text) +
+              // i18n-ignore: Structural transcript HTML contains no user-visible prose.
+              lit("</div>");
     }
 
     // i18n-ignore: Message roles are backend protocol identifiers used only for routing.
@@ -1843,7 +3063,7 @@ void AIConversationView::render(bool preserveScroll)
       const qint64 finishedMs = message.finishedTimestampMs > 0
                                     ? message.finishedTimestampMs
                                     : assistantFinishedByTask.value(message.taskId, 0);
-      html += renderActivityGroup(message, finishedMs, nowMs);
+      html += renderActivityGroup(message, finishedMs, nowMs, &m_LiveTextAnchors);
     }
 
     if(!message.provisionalText.isEmpty())
@@ -1865,14 +3085,28 @@ void AIConversationView::render(bool preserveScroll)
   html += lit("</body></html>");
 
   const int generation = ++m_RenderGeneration;
+  const quint64 userInteractionGeneration = m_UserInteractionGeneration;
+  m_AdjustingScroll = true;
   m_Browser->setHtml(html);
+  rebuildLiveTextCursors();
+  updateLiveTextTimer();
   static_cast<AIRoundedTextBrowser *>(m_Browser)->setBubbleAnchors(bubbleAnchors);
-  QTimer::singleShot(0, this, [this, generation, followTail, oldValue]() {
+  QTimer::singleShot(0, this, [this, generation, userInteractionGeneration]() {
     if(generation != m_RenderGeneration)
       return;
-    QScrollBar *bar = m_Browser ? m_Browser->verticalScrollBar() : NULL;
-    if(!bar)
+    if(userInteractionGeneration != m_UserInteractionGeneration)
+    {
+      m_AdjustingScroll = false;
+      updateTailControl();
       return;
-    bar->setValue(followTail ? bar->maximum() : qMin(oldValue, bar->maximum()));
+    }
+    if(m_FollowTail)
+      scrollToLatest();
+    else
+      restoreViewportAnchor();
+    // Keep lazy QTextDocument range changes inside the same protected layout turn. A later render
+    // owns its own generation and will release this flag from its corresponding callback.
+    m_AdjustingScroll = false;
+    updateTailControl();
   });
 }

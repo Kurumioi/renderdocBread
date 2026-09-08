@@ -75,9 +75,12 @@ class SymbolService:
     this class re-runs the deterministic validator before storing that choice.
     """
 
-    def __init__(self, database_path: str | Path):
+    def __init__(
+        self, database_path: str | Path, *, read_only: bool = False
+    ):
         self.database_path = Path(database_path).expanduser().resolve()
-        self.store = SymbolStore(self.database_path)
+        self.read_only = bool(read_only)
+        self.store = SymbolStore(self.database_path, read_only=self.read_only)
 
     @classmethod
     def for_asset_root(
@@ -432,6 +435,9 @@ class SymbolService:
             "entryPoint": entry_point,
             "assetShaderId": int(asset_shader_id),
             "status": status,
+            "proposalAuthority": "AIProvisional",
+            "programVerified": False,
+            "activated": False,
             "committed": False,
             "aliasCount": 0,
             "requiresTrustedUIApproval": True,

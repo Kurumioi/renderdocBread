@@ -24,6 +24,8 @@
  ******************************************************************************/
 
 #include "d3d11_replay.h"
+#include <set>
+#include "common/timing.h"
 #include "core/settings.h"
 #include "driver/dx/official/d3dcompiler.h"
 #include "driver/ihv/amd/amd_counters.h"
@@ -35,6 +37,7 @@
 #include "maths/formatpacking.h"
 #include "maths/matrix.h"
 #include "replay/dummy_driver.h"
+#include "replay/replay_timing.h"
 #include "serialise/rdcfile.h"
 #include "strings/string_utils.h"
 #include "d3d11_context.h"
@@ -51,6 +54,87 @@ RDOC_CONFIG(bool, D3D11_HardwareCounters, true,
             "Enable support for IHV-specific hardware counters on D3D11.");
 
 static const char *DXBCDisassemblyTarget = "DXBC";
+
+struct D3D11Replay::CheckpointResource
+{
+  ResourceId id;
+  ID3D11Resource *live = NULL;    // Borrowed from the capture resource manager.
+  D3D11_RESOURCE_DIMENSION dimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+  D3D11_BUFFER_DESC buffer = {};
+  D3D11_TEXTURE1D_DESC tex1 = {};
+  D3D11_TEXTURE2D_DESC tex2 = {};
+  D3D11_TEXTURE3D_DESC tex3 = {};
+  uint64_t bytes = 0;
+  bool mutableContents = false;
+  bool minLOD = false;
+  rdcarray<uint32_t> writes;
+};
+
+struct D3D11Replay::CheckpointVersion
+{
+  ResourceId id;
+  ID3D11Resource *live = NULL;
+  ID3D11Resource *copy = NULL;
+  uint64_t bytes = 0;
+  uint32_t lastWrite = 0;
+  ~CheckpointVersion()
+  {
+    SAFE_RELEASE(copy);
+    SAFE_RELEASE(live);
+  }
+};
+
+struct D3D11Replay::ReplayCheckpoint
+{
+  ReplayCheckpoint(const D3D11RenderState &pipeline) : state(pipeline) {}
+  struct Resource
+  {
+    std::shared_ptr<CheckpointVersion> version;
+    ResourceId id;
+    ID3D11Resource *live = NULL;
+    float minLOD = 0.0f;
+    bool restoreMinLOD = false;
+  };
+  struct Counter
+  {
+    ResourceId id;
+    ID3D11UnorderedAccessView *view = NULL;
+    uint32_t value = 0;
+  };
+  ~ReplayCheckpoint()
+  {
+    for(Counter &counter : counters)
+      SAFE_RELEASE(counter.view);
+  }
+  uint32_t eventId = 0;
+  uint64_t lastUsed = 0;
+  D3D11RenderState state;
+  rdcarray<Resource> resources;
+  rdcarray<Counter> counters;
+};
+
+namespace
+{
+bool CheckpointWritesResource(ResourceUsage usage)
+{
+  return (usage >= ResourceUsage::VS_RWResource && usage <= ResourceUsage::All_RWResource) ||
+         usage == ResourceUsage::StreamOut || usage == ResourceUsage::ColorTarget ||
+         usage == ResourceUsage::DepthStencilTarget || usage == ResourceUsage::Clear ||
+         usage == ResourceUsage::Discard || usage == ResourceUsage::GenMips ||
+         usage == ResourceUsage::Resolve || usage == ResourceUsage::ResolveDst ||
+         usage == ResourceUsage::Copy || usage == ResourceUsage::CopyDst ||
+         usage == ResourceUsage::CPUWrite;
+}
+
+uint32_t CheckpointLastWrite(const rdcarray<uint32_t> &writes, uint32_t eventId)
+{
+  uint32_t last = 0;
+  for(uint32_t write : writes)
+    if(write <= eventId)
+      last = RDCMAX(last, write);
+  return last;
+}
+}
 
 D3D11Replay::D3D11Replay(WrappedID3D11Device *d)
 {
@@ -74,12 +158,19 @@ D3D11Replay::~D3D11Replay()
 
 void D3D11Replay::Shutdown()
 {
+  for(auto &scratch : m_BufferPatchScratch)
+    SAFE_RELEASE(scratch.second);
+  m_BufferPatchScratch.clear();
+  m_BufferPatches.clear();
+  m_Checkpoints.clear();
+  m_CheckpointResources.clear();
   ClearEventCBufferOverrides();
   ClearEventShaderOverrides();
 
   for(size_t i = 0; i < m_ProxyResources.size(); i++)
     m_ProxyResources[i]->Release();
   m_ProxyResources.clear();
+  m_TextureSnapshots.clear();
 
   m_RealState.state.Clear();
 
@@ -379,7 +470,8 @@ rdcarray<EventUsage> D3D11Replay::GetUsage(ResourceId id)
   if(WrappedID3D11Buffer::m_BufferList.find(id) == WrappedID3D11Buffer::m_BufferList.end() &&
      WrappedID3D11Texture1D::m_TextureList.find(id) == WrappedID3D11Texture1D::m_TextureList.end() &&
      WrappedID3D11Texture2D1::m_TextureList.find(id) == WrappedID3D11Texture2D1::m_TextureList.end() &&
-     WrappedID3D11Texture3D1::m_TextureList.find(id) == WrappedID3D11Texture3D1::m_TextureList.end())
+     WrappedID3D11Texture3D1::m_TextureList.find(id) == WrappedID3D11Texture3D1::m_TextureList.end() &&
+     WrappedShader::m_ShaderList.find(id) == WrappedShader::m_ShaderList.end())
   {
     return {EventUsage(0, ResourceUsage::Unused)};
   }
@@ -1699,17 +1791,684 @@ RDResult D3D11Replay::ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBu
   return m_pDevice->ReadLogInitialisation(rdc, storeStructuredBuffers);
 }
 
+void D3D11Replay::ConfigureReplayCheckpoints(
+    const ReplayCheckpointConfig &config, const rdcarray<ReplayCheckpointCandidate> &candidates)
+{
+  if(m_CheckpointStats.enabled && ReplayCheckpointStorageCompatible(m_CheckpointConfig, config))
+  {
+    for(auto it = m_Checkpoints.begin(); it != m_Checkpoints.end();)
+      if(it->first == m_BufferPatchAnchorEvent ||
+         ReplayCheckpointCandidateContains(candidates, it->first))
+        ++it;
+      else
+        it = m_Checkpoints.erase(it);
+    m_CheckpointConfig = config;
+    m_CheckpointCandidates = candidates;
+    std::sort(m_CheckpointCandidates.begin(), m_CheckpointCandidates.end(),
+              [](const ReplayCheckpointCandidate &a, const ReplayCheckpointCandidate &b) {
+                return a.eventId < b.eventId;
+              });
+    UpdateCheckpointAccounting();
+    return;
+  }
+  m_Checkpoints.clear();
+  m_CheckpointResources.clear();
+  m_CheckpointConfig = config;
+  m_CheckpointCandidates = candidates;
+  std::sort(m_CheckpointCandidates.begin(), m_CheckpointCandidates.end(),
+            [](const ReplayCheckpointCandidate &a, const ReplayCheckpointCandidate &b) {
+              return a.eventId < b.eventId;
+            });
+  m_CheckpointStats = {};
+  m_CheckpointStats.supported = true;
+  m_CheckpointStats.enabled = config.enabled && config.byteBudget > 0 && config.maxCheckpoints > 0;
+  m_CheckpointPrepared = false;
+  m_CheckpointPreparingFailed = false;
+}
+
+void D3D11Replay::InvalidateReplayCheckpoints(uint32_t firstAffectedEvent)
+{
+  (void)firstAffectedEvent;
+  // A replacement shader can start writing a binding that the captured shader never used.
+  // Recorded GetUsage/last-write indices no longer prove immutability, even after rescanning.
+  // Drop all saved prefixes and stop version reuse until the capture is reloaded.
+  m_Checkpoints.clear();
+  m_CheckpointStats.invalidations++;
+  m_CheckpointConservativeWrites = true;
+  m_CheckpointPrepared = false;
+  m_CheckpointPreparingFailed = false;
+  m_CheckpointResources.clear();
+  UpdateCheckpointAccounting();
+}
+
+void D3D11Replay::UpdateCheckpointAccounting()
+{
+  std::set<const CheckpointVersion *> versions;
+  m_CheckpointStats.events.clear();
+  m_CheckpointStats.allocatedBytes = 0;
+  m_CheckpointStats.sharedBytes = 0;
+  uint64_t logical = 0;
+  for(const auto &entry : m_Checkpoints)
+  {
+    const ReplayCheckpoint &checkpoint = *entry.second;
+    m_CheckpointStats.events.push_back(checkpoint.eventId);
+    m_CheckpointStats.allocatedBytes += sizeof(ReplayCheckpoint) +
+        checkpoint.resources.size() * sizeof(ReplayCheckpoint::Resource) +
+        checkpoint.counters.size() * sizeof(ReplayCheckpoint::Counter);
+    for(const ReplayCheckpoint::Resource &resource : checkpoint.resources)
+      if(resource.version)
+      {
+        logical += resource.version->bytes;
+        if(versions.insert(resource.version.get()).second)
+          m_CheckpointStats.allocatedBytes += resource.version->bytes;
+      }
+  }
+  uint64_t uniqueBytes = 0;
+  for(const CheckpointVersion *version : versions)
+    uniqueBytes += version->bytes;
+  m_CheckpointStats.sharedBytes = logical - uniqueBytes;
+  for(const CheckpointResource &resource : m_CheckpointResources)
+    if(!resource.mutableContents)
+      m_CheckpointStats.sharedBytes += resource.bytes;
+  m_CheckpointStats.checkpointCount = (uint32_t)m_Checkpoints.size();
+}
+
+ReplayCheckpointStats D3D11Replay::GetReplayCheckpointStats()
+{
+  UpdateCheckpointAccounting();
+  return m_CheckpointStats;
+}
+
+void D3D11Replay::EvictOldestCheckpoint()
+{
+  auto oldest = m_Checkpoints.end();
+  for(auto it = m_Checkpoints.begin(); it != m_Checkpoints.end(); ++it)
+  {
+    if(it->first == m_BufferPatchAnchorEvent && m_Checkpoints.size() > 1)
+      continue;
+    if(oldest == m_Checkpoints.end() || it->second->lastUsed < oldest->second->lastUsed)
+      oldest = it;
+  }
+  if(oldest != m_Checkpoints.end())
+    m_Checkpoints.erase(oldest);
+  UpdateCheckpointAccounting();
+}
+
+bool D3D11Replay::PrepareCheckpointResources()
+{
+  if(m_CheckpointPrepared || m_CheckpointPreparingFailed)
+    return m_CheckpointPrepared;
+  auto reject = [this](const rdcstr &reason) {
+    m_CheckpointStats.reason = reason;
+    m_CheckpointStats.rejected++;
+    m_CheckpointPreparingFailed = true;
+    m_CheckpointResources.clear();
+    return false;
+  };
+  if(m_Proxy || m_pDevice->GetFeatureLevel() < D3D_FEATURE_LEVEL_10_1)
+    return reject("D3D11 checkpoints require a local feature-level 10.1+ replay");
+  if(m_pDevice->GetNumDeferredContexts() != 0)
+    return reject("D3D11 deferred-context checkpoint state is not yet restorable");
+  SDFile *file = GetStructuredFile();
+  if(!file)
+    return reject("D3D11 checkpoint safety scan requires structured capture chunks");
+  for(const SDChunk *chunk : file->chunks)
+  {
+    const D3D11Chunk type = D3D11Chunk(chunk->metadata.chunkID);
+    if(type == D3D11Chunk::SOSetTargets || type == D3D11Chunk::DrawAuto ||
+       type == D3D11Chunk::ExecuteCommandList || type == D3D11Chunk::FinishCommandList ||
+       type == D3D11Chunk::SwapDeviceContextState || type == D3D11Chunk::SetShaderExtUAV)
+      return reject("D3D11 capture contains stream-output, deferred/context-swap or vendor extension state");
+  }
+  D3D11ResourceManager *manager = m_pDevice->GetResourceManager();
+  for(const ResourceDescription &description : m_Resources)
+  {
+    ID3D11DeviceChild *wrapped = manager->GetResource(description.resourceId, true);
+    if(!wrapped)
+      continue;
+    const D3D11ResourceType type = IdentifyTypeByPtr(wrapped);
+    // Ordinary queries/counters are not reissued by D3D11 replay. Predicate queries are reissued,
+    // however, so their begin/end state and result would need a separate restorable mechanism.
+    if(type == Resource_Predicate)
+      return reject("D3D11 predicate query results are not yet checkpointable");
+    if(type != Resource_Buffer && type != Resource_Texture1D && type != Resource_Texture2D &&
+       type != Resource_Texture3D)
+      continue;
+    CheckpointResource resource;
+    resource.id = description.resourceId;
+    resource.live = (ID3D11Resource *)UnwrapResource(wrapped);
+    resource.live->GetType(&resource.dimension);
+    D3D11_USAGE usage = D3D11_USAGE_DEFAULT;
+    UINT misc = 0;
+    if(type == Resource_Buffer)
+    {
+      ((ID3D11Buffer *)resource.live)->GetDesc(&resource.buffer);
+      usage = resource.buffer.Usage;
+      misc = resource.buffer.MiscFlags;
+      resource.bytes = resource.buffer.ByteWidth;
+    }
+    else if(type == Resource_Texture1D)
+    {
+      ((ID3D11Texture1D *)resource.live)->GetDesc(&resource.tex1);
+      usage = resource.tex1.Usage;
+      misc = resource.tex1.MiscFlags;
+      for(UINT mip = 0; mip < resource.tex1.MipLevels; mip++)
+        resource.bytes += uint64_t(GetByteSize(resource.tex1.Width, 1, 1, resource.tex1.Format, mip)) *
+                          resource.tex1.ArraySize;
+    }
+    else if(type == Resource_Texture2D)
+    {
+      ((ID3D11Texture2D *)resource.live)->GetDesc(&resource.tex2);
+      usage = resource.tex2.Usage;
+      misc = resource.tex2.MiscFlags;
+      for(UINT mip = 0; mip < resource.tex2.MipLevels; mip++)
+        resource.bytes += uint64_t(GetByteSize(resource.tex2.Width, resource.tex2.Height, 1,
+                                              resource.tex2.Format, mip)) *
+                          resource.tex2.ArraySize * resource.tex2.SampleDesc.Count;
+    }
+    else
+    {
+      ((ID3D11Texture3D *)resource.live)->GetDesc(&resource.tex3);
+      usage = resource.tex3.Usage;
+      misc = resource.tex3.MiscFlags;
+      for(UINT mip = 0; mip < resource.tex3.MipLevels; mip++)
+        resource.bytes += GetByteSize(resource.tex3.Width, resource.tex3.Height, resource.tex3.Depth,
+                                       resource.tex3.Format, mip);
+    }
+    const UINT unsupported = D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TILE_POOL |
+                             D3D11_RESOURCE_MISC_HW_PROTECTED | D3D11_RESOURCE_MISC_RESTRICTED_CONTENT |
+                             D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                             D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    if(misc & unsupported)
+      return reject("D3D11 tiled, shared or protected resource contents are not checkpointable");
+    resource.minLOD = (misc & D3D11_RESOURCE_MISC_RESOURCE_CLAMP) != 0;
+    for(const EventUsage &event : GetUsage(resource.id))
+      if(CheckpointWritesResource(event.usage))
+        resource.writes.push_back(event.eventId);
+    resource.mutableContents = usage != D3D11_USAGE_IMMUTABLE &&
+                               (m_CheckpointConservativeWrites || !resource.writes.empty());
+    if(resource.bytes == 0 && resource.mutableContents)
+      return reject("D3D11 checkpoint resource has no reliable byte-size estimate");
+    m_CheckpointResources.push_back(resource);
+  }
+  m_CheckpointPrepared = true;
+  m_CheckpointStats.reason.clear();
+  UpdateCheckpointAccounting();
+  return true;
+}
+
+bool D3D11Replay::SaveReplayCheckpoint(uint32_t eventId)
+{
+  if(m_ReplayCheckpointPrefixOnly && !m_BufferPatches.empty() &&
+     (m_BufferPatchAnchorEvent == 0 || eventId != m_BufferPatchAnchorEvent))
+    return false;
+  if(m_ReplayCheckpointBypass || !m_CheckpointStats.enabled || m_RealState.active ||
+     !m_AppliedEventShaderOverrides.empty() || !m_AppliedEventCBufferOverrides.empty() ||
+     !PrepareCheckpointResources() || m_Checkpoints.find(eventId) != m_Checkpoints.end())
+    return false;
+  const bool checkpointTiming = Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1";
+  PerformanceTimer checkpointTimer;
+  while(m_Checkpoints.size() >= m_CheckpointConfig.maxCheckpoints)
+    EvictOldestCheckpoint();
+  std::unique_ptr<ReplayCheckpoint> checkpoint(
+      new ReplayCheckpoint(*m_pImmediateContext->GetCurrentPipelineState()));
+  checkpoint->eventId = eventId;
+  uint64_t required = sizeof(ReplayCheckpoint) +
+                      m_CheckpointResources.size() * sizeof(ReplayCheckpoint::Resource);
+  for(const CheckpointResource &source : m_CheckpointResources)
+  {
+    ReplayCheckpoint::Resource resource;
+    resource.id = source.id;
+    resource.live = source.live;
+    resource.restoreMinLOD = source.minLOD;
+    if(source.minLOD)
+      resource.minLOD = m_pImmediateContext->GetReal()->GetResourceMinLOD(source.live);
+    if(source.mutableContents)
+    {
+      const uint32_t lastWrite = CheckpointLastWrite(source.writes, eventId);
+      // Only the checkpoint actually restored in this replay is a proven content version.
+      // Re-executing the same write EID from the frame head does not prove byte identity.
+      auto restored = m_Checkpoints.find(m_CheckpointCurrentEvent);
+      if(!m_CheckpointConservativeWrites && restored != m_Checkpoints.end())
+      {
+        for(const ReplayCheckpoint::Resource &older : restored->second->resources)
+          if(older.version && older.id == source.id && older.version->lastWrite == lastWrite &&
+             older.version->live == source.live)
+          {
+            resource.version = older.version;
+            break;
+          }
+      }
+      if(!resource.version)
+        required += source.bytes;
+    }
+    checkpoint->resources.push_back(resource);
+  }
+  D3D11ResourceManager *manager = m_pDevice->GetResourceManager();
+  for(const ResourceDescription &description : m_Resources)
+  {
+    ID3D11DeviceChild *wrapped = manager->GetResource(description.resourceId, true);
+    if(!wrapped || IdentifyTypeByPtr(wrapped) != Resource_UnorderedAccessView)
+      continue;
+    ID3D11UnorderedAccessView *view = (ID3D11UnorderedAccessView *)UnwrapResource(wrapped);
+    D3D11_UNORDERED_ACCESS_VIEW_DESC desc = {};
+    view->GetDesc(&desc);
+    if(desc.ViewDimension == D3D11_UAV_DIMENSION_BUFFER &&
+       (desc.Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_COUNTER | D3D11_BUFFER_UAV_FLAG_APPEND)))
+    {
+      ReplayCheckpoint::Counter counter;
+      counter.id = description.resourceId;
+      counter.view = view;
+      view->AddRef();
+      checkpoint->counters.push_back(counter);
+    }
+  }
+  required += checkpoint->counters.size() * sizeof(ReplayCheckpoint::Counter);
+  if(!checkpoint->counters.empty())
+    required += RDCMAX(16ULL, uint64_t(checkpoint->counters.size()) * sizeof(uint32_t));
+  UpdateCheckpointAccounting();
+  if(required > m_CheckpointConfig.byteBudget ||
+     m_CheckpointStats.allocatedBytes > m_CheckpointConfig.byteBudget - required)
+  {
+    checkpoint.reset();
+    if(!m_Checkpoints.empty())
+    {
+      EvictOldestCheckpoint();
+      return SaveReplayCheckpoint(eventId);
+    }
+    m_CheckpointStats.rejected++;
+    m_CheckpointStats.reason = "D3D11 writable checkpoint working set exceeds its byte budget";
+    return false;
+  }
+  ID3D11Device *device = m_pDevice->GetReal();
+  ID3D11DeviceContext *context = m_pImmediateContext->GetReal();
+  for(size_t i = 0; i < m_CheckpointResources.size(); i++)
+  {
+    const CheckpointResource &source = m_CheckpointResources[i];
+    ReplayCheckpoint::Resource &resource = checkpoint->resources[i];
+    if(!source.mutableContents || resource.version)
+      continue;
+    std::shared_ptr<CheckpointVersion> version = std::make_shared<CheckpointVersion>();
+    version->id = source.id;
+    version->live = source.live;
+    version->live->AddRef();
+    version->bytes = source.bytes;
+    version->lastWrite = CheckpointLastWrite(source.writes, eventId);
+    HRESULT hr = E_FAIL;
+    if(source.dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+    {
+      D3D11_BUFFER_DESC desc = source.buffer;
+      desc.Usage = D3D11_USAGE_DEFAULT;
+      desc.CPUAccessFlags = desc.BindFlags = desc.MiscFlags = desc.StructureByteStride = 0;
+      ID3D11Buffer *copy = NULL;
+      hr = device->CreateBuffer(&desc, NULL, &copy);
+      version->copy = copy;
+    }
+    else if(source.dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D)
+    {
+      D3D11_TEXTURE1D_DESC desc = source.tex1;
+      desc.Usage = D3D11_USAGE_DEFAULT;
+      desc.CPUAccessFlags = desc.MiscFlags = 0;
+      desc.BindFlags &= D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL;
+      ID3D11Texture1D *copy = NULL;
+      hr = device->CreateTexture1D(&desc, NULL, &copy);
+      version->copy = copy;
+    }
+    else if(source.dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+    {
+      D3D11_TEXTURE2D_DESC desc = source.tex2;
+      desc.Usage = D3D11_USAGE_DEFAULT;
+      desc.CPUAccessFlags = desc.MiscFlags = 0;
+      desc.BindFlags &= D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL;
+      ID3D11Texture2D *copy = NULL;
+      hr = device->CreateTexture2D(&desc, NULL, &copy);
+      version->copy = copy;
+    }
+    else if(source.dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D)
+    {
+      D3D11_TEXTURE3D_DESC desc = source.tex3;
+      desc.Usage = D3D11_USAGE_DEFAULT;
+      desc.CPUAccessFlags = desc.MiscFlags = 0;
+      desc.BindFlags &= D3D11_BIND_RENDER_TARGET;
+      ID3D11Texture3D *copy = NULL;
+      hr = device->CreateTexture3D(&desc, NULL, &copy);
+      version->copy = copy;
+    }
+    if(FAILED(hr) || !version->copy)
+    {
+      m_CheckpointStats.rejected++;
+      m_CheckpointStats.reason = "D3D11 checkpoint resource allocation failed: " + ToStr(hr);
+      return false;
+    }
+    context->CopyResource(version->copy, source.live);
+    resource.version = version;
+  }
+  const double checkpointResourcesMS = checkpointTiming ? checkpointTimer.GetMilliseconds() : 0.0;
+  if(!checkpoint->counters.empty())
+  {
+    D3D11_BUFFER_DESC desc = {};
+    desc.ByteWidth = RDCMAX(16U, (UINT)checkpoint->counters.size() * 4U);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Buffer *readback = NULL;
+    HRESULT hr = device->CreateBuffer(&desc, NULL, &readback);
+    if(SUCCEEDED(hr) && !readback)
+      hr = E_FAIL;
+    if(SUCCEEDED(hr) && readback)
+    {
+      for(size_t i = 0; i < checkpoint->counters.size(); i++)
+        context->CopyStructureCount(readback, (UINT)i * 4U, checkpoint->counters[i].view);
+      D3D11_MAPPED_SUBRESOURCE map = {};
+      hr = context->Map(readback, 0, D3D11_MAP_READ, 0, &map);
+      if(SUCCEEDED(hr))
+      {
+        for(size_t i = 0; i < checkpoint->counters.size(); i++)
+          checkpoint->counters[i].value = ((const uint32_t *)map.pData)[i];
+        context->Unmap(readback, 0);
+      }
+    }
+    SAFE_RELEASE(readback);
+    if(FAILED(hr))
+    {
+      m_CheckpointStats.rejected++;
+      m_CheckpointStats.reason = "D3D11 checkpoint UAV counter readback failed: " + ToStr(hr);
+      return false;
+    }
+  }
+  if(device->GetDeviceRemovedReason() != S_OK)
+    return false;
+  const double checkpointCountersMS = checkpointTiming ? checkpointTimer.GetMilliseconds() : 0.0;
+  checkpoint->lastUsed = ++m_CheckpointUseSerial;
+  m_Checkpoints[eventId] = std::move(checkpoint);
+  m_CheckpointCurrentEvent = eventId;
+  m_CheckpointStats.builds++;
+  m_CheckpointStats.lastSaveEvent = eventId;
+  m_CheckpointStats.reason.clear();
+  UpdateCheckpointAccounting();
+  if(checkpointTiming)
+  {
+    const double totalMS = checkpointTimer.GetMilliseconds();
+    const rdcstr line = StringFormat::Fmt(
+        "api=D3D11Checkpoint op=save event=%u attempt=successful resource_prepare_copy_ms=%.3f "
+        "counter_readback_ms=%.3f finalize_ms=%.3f total_ms=%.3f allocatedBytes=%llu sharedBytes=%llu",
+        eventId, checkpointResourcesMS, checkpointCountersMS - checkpointResourcesMS,
+        totalMS - checkpointCountersMS, totalMS, (unsigned long long)m_CheckpointStats.allocatedBytes,
+        (unsigned long long)m_CheckpointStats.sharedBytes);
+    RDCLOG("[EIDTiming] %s", line.c_str());
+    AppendReplayTimingLog(line);
+  }
+  return true;
+}
+
+bool D3D11Replay::RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint)
+{
+  if(m_ReplayCheckpointBypass || m_RealState.active ||
+     !m_AppliedEventShaderOverrides.empty() || !m_AppliedEventCBufferOverrides.empty())
+    return false;
+  const bool checkpointTiming = Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1";
+  PerformanceTimer checkpointTimer;
+  D3D11ResourceManager *manager = m_pDevice->GetResourceManager();
+  // Validate every identity before modifying any live resource. Resource replacements have a
+  // shared invalidation hook as well, but a stale pointer must never silently copy to a new object.
+  for(const ReplayCheckpoint::Resource &resource : checkpoint.resources)
+    if(UnwrapResource(manager->GetResource(resource.id, true)) != resource.live)
+      return false;
+  for(const ReplayCheckpoint::Counter &counter : checkpoint.counters)
+    if(UnwrapResource(manager->GetResource(counter.id, true)) != counter.view)
+      return false;
+  const double checkpointValidateMS = checkpointTiming ? checkpointTimer.GetMilliseconds() : 0.0;
+  ID3D11DeviceContext *context = m_pImmediateContext->GetReal();
+  m_pImmediateContext->ClearState();
+  for(const ReplayCheckpoint::Resource &resource : checkpoint.resources)
+  {
+    if(resource.version)
+      context->CopyResource(resource.live, resource.version->copy);
+    if(resource.restoreMinLOD)
+      context->SetResourceMinLOD(resource.live, resource.minLOD);
+  }
+  for(const ReplayCheckpoint::Counter &counter : checkpoint.counters)
+  {
+    const UINT count = counter.value;
+    context->CSSetUnorderedAccessViews(0, 1, &counter.view, &count);
+  }
+  const double checkpointCopyMS = checkpointTiming ? checkpointTimer.GetMilliseconds() : 0.0;
+  checkpoint.state.ApplyState(m_pImmediateContext);
+  m_pImmediateContext->RestoreCheckpointEvent(checkpoint.eventId);
+  m_RenderStateOM = checkpoint.state.OM;
+  m_CheckpointCurrentEvent = checkpoint.eventId;
+  checkpoint.lastUsed = ++m_CheckpointUseSerial;
+  const bool success = m_pDevice->GetReal()->GetDeviceRemovedReason() == S_OK;
+  if(checkpointTiming)
+  {
+    const double totalMS = checkpointTimer.GetMilliseconds();
+    const rdcstr line = StringFormat::Fmt(
+        "api=D3D11Checkpoint op=restore event=%u success=%u validate_ms=%.3f resource_restore_ms=%.3f "
+        "bind_finalize_ms=%.3f total_ms=%.3f", checkpoint.eventId, success ? 1U : 0U,
+        checkpointValidateMS, checkpointCopyMS - checkpointValidateMS, totalMS - checkpointCopyMS,
+        totalMS);
+    RDCLOG("[EIDTiming] %s", line.c_str());
+    AppendReplayTimingLog(line);
+  }
+  return success;
+}
+
+void D3D11Replay::RecordBufferPatchConsumer(ResourceId buffer, uint32_t eventId)
+{
+  // D3D11 wrappers retain their captured IDs; this manager has no separate live-ID namespace.
+  if(buffer == ResourceId() || eventId == 0)
+    return;
+  auto previous = m_BufferPatchFirstConsumers.find(buffer);
+  if(previous == m_BufferPatchFirstConsumers.end())
+    m_BufferPatchFirstConsumers[buffer] = eventId;
+  else
+    previous->second = RDCMIN(previous->second, eventId);
+}
+
+rdcstr D3D11Replay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
+{
+  rdcstr error = ValidateReplayBufferPatches(patches);
+  if(!error.empty())
+    return error;
+  if(!patches.empty() && (m_Proxy || m_pDevice->GetNumDeferredContexts() != 0))
+    return "D3D11 persistent buffer edits require replay without deferred contexts";
+
+  D3D11ResourceManager *manager = m_pDevice->GetResourceManager();
+  std::map<ResourceId, D3D11_BUFFER_DESC> descriptions;
+  uint64_t scratchBytes = 0;
+  for(const ReplayBufferPatch &patch : patches)
+  {
+    ID3D11DeviceChild *wrapped = manager->GetResource(patch.buffer, true);
+    if(!wrapped || IdentifyTypeByPtr(wrapped) != Resource_Buffer || manager->HasReplacement(patch.buffer))
+      return "D3D11 persistent edit requires an original unreplaced buffer";
+    D3D11_BUFFER_DESC desc = {};
+    ((ID3D11Buffer *)UnwrapResource(wrapped))->GetDesc(&desc);
+    if(patch.byteOffset > desc.ByteWidth || patch.data.size() > desc.ByteWidth - patch.byteOffset)
+      return "D3D11 persistent edit is outside the buffer";
+    if(desc.BindFlags & (D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_STREAM_OUTPUT))
+      return "D3D11 shader-writable and stream-output buffers require additional edit dependencies";
+    const UINT unsupported = D3D11_RESOURCE_MISC_TILED | D3D11_RESOURCE_MISC_TILE_POOL |
+                             D3D11_RESOURCE_MISC_HW_PROTECTED | D3D11_RESOURCE_MISC_RESTRICTED_CONTENT |
+                             D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                             D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    if((desc.MiscFlags & unsupported) || desc.Usage == D3D11_USAGE_IMMUTABLE ||
+       manager->GetInitialContents(patch.buffer).resource == NULL)
+      return "D3D11 buffer lacks a restorable ordinary initial-content source";
+    if(descriptions.find(patch.buffer) == descriptions.end())
+      scratchBytes += desc.ByteWidth;
+    if(scratchBytes > 256ULL * 1024 * 1024)
+      return "D3D11 persistent buffer edit scratch storage exceeds 256 MiB";
+    descriptions[patch.buffer] = desc;
+  }
+
+  std::map<ResourceId, ID3D11Buffer *> nextScratch;
+  for(const auto &description : descriptions)
+  {
+    auto existing = m_BufferPatchScratch.find(description.first);
+    if(existing != m_BufferPatchScratch.end())
+    {
+      existing->second->AddRef();
+      nextScratch[description.first] = existing->second;
+      continue;
+    }
+    D3D11_BUFFER_DESC desc = {};
+    desc.ByteWidth = description.second.ByteWidth;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    ID3D11Buffer *scratch = NULL;
+    HRESULT hr = m_pDevice->GetReal()->CreateBuffer(&desc, NULL, &scratch);
+    if(FAILED(hr) || !scratch)
+    {
+      for(auto &entry : nextScratch)
+        SAFE_RELEASE(entry.second);
+      return StringFormat::Fmt("Could not allocate D3D11 buffer edit scratch: %s", ToStr(hr).c_str());
+    }
+    nextScratch[description.first] = scratch;
+  }
+  for(auto &scratch : m_BufferPatchScratch)
+    SAFE_RELEASE(scratch.second);
+  m_BufferPatchScratch.swap(nextScratch);
+
+  bool valueOnly = !patches.empty() && patches.size() == m_BufferPatches.size();
+  uint32_t firstConsumer = ~0U;
+  for(size_t i = 0; i < patches.size(); ++i)
+  {
+    auto consumer = m_BufferPatchFirstConsumers.find(patches[i].buffer);
+    if(consumer == m_BufferPatchFirstConsumers.end() ||
+       descriptions[patches[i].buffer].BindFlags != D3D11_BIND_CONSTANT_BUFFER)
+      firstConsumer = 0;
+    else
+      firstConsumer = RDCMIN(firstConsumer, consumer->second);
+    if(valueOnly)
+      valueOnly = patches[i].buffer == m_BufferPatches[i].buffer &&
+                  patches[i].byteOffset == m_BufferPatches[i].byteOffset &&
+                  patches[i].data.size() == m_BufferPatches[i].data.size();
+  }
+  m_BufferPatchFirstAffected = valueOnly && firstConsumer != ~0U ? firstConsumer : 0;
+  m_BufferPatchAnchorEvent = firstConsumer > 1 && firstConsumer != ~0U ? firstConsumer - 1 : 0;
+  m_BufferPatches = patches;
+  InvalidateBufferPatchContents();
+  if(m_BufferPatchFirstAffected)
+  {
+    // Same byte ranges fully cover every old overlay byte. Complete prefixes before the first
+    // possible consumer have unchanged outputs, and applying the new overlay repairs their CBs.
+    m_Checkpoints.erase(m_Checkpoints.lower_bound(m_BufferPatchFirstAffected), m_Checkpoints.end());
+    m_CheckpointStats.invalidations++;
+    m_CheckpointCurrentEvent = 0;
+    UpdateCheckpointAccounting();
+  }
+  else
+    InvalidateReplayCheckpoints();
+  ClearPostVSCache();
+  return {};
+}
+
+bool D3D11Replay::ApplyPendingBufferPatches()
+{
+  if(!m_BufferPatchesDirty)
+    return true;
+  D3D11ResourceManager *manager = m_pDevice->GetResourceManager();
+  ID3D11DeviceContext *context = m_pImmediateContext->GetReal();
+  // Internal copies must not inherit captured conditional rendering.
+  ID3D11Predicate *predicate = NULL;
+  BOOL predicateValue = FALSE;
+  context->GetPredication(&predicate, &predicateValue);
+  context->SetPredication(NULL, FALSE);
+  bool success = true;
+  for(const auto &entry : m_BufferPatchScratch)
+  {
+    ID3D11DeviceChild *wrapped = manager->GetResource(entry.first, true);
+    if(!wrapped || IdentifyTypeByPtr(wrapped) != Resource_Buffer || manager->HasReplacement(entry.first))
+    {
+      success = false;
+      break;
+    }
+    ID3D11Buffer *target = (ID3D11Buffer *)UnwrapResource(wrapped);
+    // UpdateSubresource cannot partially update a constant buffer. Patch an ordinary DEFAULT
+    // scratch buffer and copy the complete contents back, preserving every unedited byte on GPU.
+    context->CopyResource(entry.second, target);
+    for(const ReplayBufferPatch &patch : m_BufferPatches)
+    {
+      if(patch.buffer != entry.first)
+        continue;
+      D3D11_BOX box = {(UINT)patch.byteOffset, 0, 0,
+                      (UINT)(patch.byteOffset + patch.data.size()), 1, 1};
+      context->UpdateSubresource(entry.second, 0, &box, patch.data.data(), 0, 0);
+    }
+    context->CopyResource(target, entry.second);
+  }
+  context->SetPredication(predicate, predicateValue);
+  SAFE_RELEASE(predicate);
+  if(success)
+    m_BufferPatchesDirty = false;
+  else
+    RDCERR("A persistent D3D11 buffer edit lost its validated native resource");
+  return success;
+}
+
 void D3D11Replay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
 {
-  m_pDevice->ReplayLog(0, endEventID, replayType);
-
-  // if this is a fresh replay from start, update the render state with the bindings at this event
-  if(replayType == eReplay_WithoutDraw || replayType == eReplay_Full)
+  // A fresh replay, including force/bypass and OnlyDraw, cannot inherit version provenance.
+  m_CheckpointCurrentEvent = 0;
+  const bool checkpointReplay = !m_ReplayCheckpointBypass && m_CheckpointStats.enabled &&
+      (replayType == eReplay_Full || replayType == eReplay_WithoutDraw) &&
+      !m_RealState.active && m_AppliedEventShaderOverrides.empty() &&
+      m_AppliedEventCBufferOverrides.empty() && PrepareCheckpointResources();
+  uint32_t startEvent = 0;
+  const uint32_t finalEvent = replayType == eReplay_WithoutDraw ? RDCMAX(1U, endEventID) - 1 : endEventID;
+  if(checkpointReplay && finalEvent > 0)
   {
-    D3D11RenderState *rs = m_pDevice->GetImmediateContext()->GetCurrentPipelineState();
-
-    m_RenderStateOM = rs->OM;
+    auto best = m_Checkpoints.upper_bound(finalEvent);
+    if(best != m_Checkpoints.begin())
+    {
+      --best;
+      if(RestoreReplayCheckpoint(*best->second))
+      {
+        startEvent = best->first + 1;
+        m_CheckpointStats.hits++;
+        m_CheckpointStats.lastResumeEvent = best->first;
+      }
+      else
+      {
+        InvalidateReplayCheckpoints();
+      }
+    }
+    if(startEvent == 0)
+      m_CheckpointStats.misses++;
+    uint32_t saveEvent = 0;
+    for(const ReplayCheckpointCandidate &candidate : m_CheckpointCandidates)
+    {
+      if(candidate.eventId == 0 || candidate.eventId > finalEvent)
+        continue;
+      if(candidate.eventId >= startEvent &&
+         (startEvent == 0 || candidate.eventId - (startEvent - 1) >= m_CheckpointConfig.minEventGap) &&
+         m_Checkpoints.find(candidate.eventId) == m_Checkpoints.end())
+        saveEvent = candidate.eventId;
+    }
+    // Keep one complete edit-start state instead of repeatedly replacing it with a late
+    // checkpoint whose outputs depend on the edited value. Budget failure remains a fallback.
+    if(m_BufferPatchAnchorEvent >= startEvent && m_BufferPatchAnchorEvent > 0 &&
+       m_BufferPatchAnchorEvent <= finalEvent &&
+       m_Checkpoints.find(m_BufferPatchAnchorEvent) == m_Checkpoints.end())
+      saveEvent = m_BufferPatchAnchorEvent;
+    // A live parameter edit must not pay to recreate its invalidated downstream outputs.
+    // Ordinary navigation and idle maintenance may build those points under the same policy.
+    if(m_ReplayCheckpointPrefixOnly && !m_BufferPatches.empty() &&
+       saveEvent != m_BufferPatchAnchorEvent)
+      saveEvent = 0;
+    if(saveEvent > 0)
+    {
+      m_pDevice->ReplayLog(startEvent, saveEvent, eReplay_Full);
+      if(m_pDevice->HasFatalError())
+        return;
+      SaveReplayCheckpoint(saveEvent);
+      startEvent = saveEvent + 1;
+    }
   }
+  if(startEvent == 0 || startEvent <= finalEvent || replayType == eReplay_OnlyDraw)
+    m_pDevice->ReplayLog(startEvent, endEventID, replayType);
+  // Save/restore is exclusively on complete prefix states. OnlyDraw may use a temporary edited
+  // shader/CBuffer and therefore never creates a reusable suffix checkpoint.
+  if(replayType == eReplay_WithoutDraw || replayType == eReplay_Full)
+    m_RenderStateOM = m_pDevice->GetImmediateContext()->GetCurrentPipelineState()->OM;
 }
 
 SDFile *D3D11Replay::GetStructuredFile()
@@ -2721,6 +3480,14 @@ static void BindEventOverrideStage(WrappedID3D11DeviceContext *context, ShaderSt
   }
 }
 
+static UINT EventCBufferShadowConstants(uint64_t byteSize)
+{
+  // D3D11.1 range binding counts are in 16-byte constants, but must be aligned to 16
+  // constants (256 bytes). The range may exceed the physical shadow allocation: reads beyond
+  // that allocation return zero. Keep the shadow itself equal to the validated original bytes.
+  return AlignUp(UINT(byteSize / 16), 16U);
+}
+
 static void BindEventOverrideCBuffer(WrappedID3D11DeviceContext *context, ShaderStage stage,
                                      uint32_t slot, ID3D11Buffer *buffer, UINT firstConstant,
                                      UINT numConstants)
@@ -3274,7 +4041,7 @@ rdcstr D3D11Replay::ApplyEventCBufferOverrides(uint32_t eventId)
     m_AppliedEventCBufferOverrides.push_back(applied);
 
     UINT firstConstant = 0;
-    UINT numConstants = (UINT)(item.second->data.size() / 16);
+    UINT numConstants = EventCBufferShadowConstants(item.second->data.size());
     BindEventOverrideCBuffer(m_pImmediateContext, applied.stage, applied.slot, item.second->shadow,
                              firstConstant, numConstants);
   }
@@ -4417,6 +5184,153 @@ ResourceId D3D11Replay::CreateProxyTexture(const TextureDescription &templateTex
   return ret;
 }
 
+ResourceId D3D11Replay::CreateProxyTextureSnapshot(const TextureDescription &templateTex)
+{
+  ResourceId snapshot = CreateProxyTexture(templateTex);
+  if(snapshot != ResourceId())
+    m_TextureSnapshots.push_back(snapshot);
+  return snapshot;
+}
+
+ResourceId D3D11Replay::CreateTextureSnapshot(ResourceId source, const Subresource &sourceSub,
+                                              CompType typeCast, Subresource &snapshotSub)
+{
+  (void)typeCast;
+
+  TextureDescription snapshotDesc = GetTexture(source);
+  if(snapshotDesc.resourceId == ResourceId() || snapshotDesc.width == 0 || snapshotDesc.height == 0)
+    return ResourceId();
+
+  ID3D11Resource *sourceReal = NULL;
+  UINT sourceSubresource = 0;
+  snapshotSub = Subresource();
+
+  auto tex1D = WrappedID3D11Texture1D::m_TextureList.find(source);
+  auto tex2D = WrappedID3D11Texture2D1::m_TextureList.find(source);
+  auto tex3D = WrappedID3D11Texture3D1::m_TextureList.find(source);
+
+  if(tex1D != WrappedID3D11Texture1D::m_TextureList.end())
+  {
+    D3D11_TEXTURE1D_DESC desc = {};
+    tex1D->second.m_Texture->GetDesc(&desc);
+    if(desc.MiscFlags & D3D11_RESOURCE_MISC_TILED)
+      return ResourceId();
+    const UINT mips = RDCMAX(1U, desc.MipLevels);
+    const UINT mip = RDCMIN(sourceSub.mip, mips - 1);
+    const UINT slice = RDCMIN(sourceSub.slice, desc.ArraySize - 1);
+    sourceSubresource = D3D11CalcSubresource(mip, slice, mips);
+    sourceReal = ((WrappedID3D11Texture1D *)tex1D->second.m_Texture)->GetReal();
+    snapshotDesc.width = RDCMAX(1U, desc.Width >> mip);
+    snapshotDesc.height = snapshotDesc.depth = 1;
+    snapshotDesc.arraysize = snapshotDesc.mips = 1;
+    snapshotDesc.cubemap = false;
+    snapshotDesc.type = TextureType::Texture1D;
+  }
+  else if(tex2D != WrappedID3D11Texture2D1::m_TextureList.end())
+  {
+    D3D11_TEXTURE2D_DESC desc = {};
+    tex2D->second.m_Texture->GetDesc(&desc);
+    // A selected MSAA sample is not a copyable D3D11 subresource. Keep it on the existing
+    // readback/resolve fallback instead of silently snapshotting all samples.
+    if(desc.SampleDesc.Count > 1 || (desc.MiscFlags & D3D11_RESOURCE_MISC_TILED))
+      return ResourceId();
+    const UINT mips = RDCMAX(1U, desc.MipLevels);
+    const UINT mip = RDCMIN(sourceSub.mip, mips - 1);
+    const UINT slice = RDCMIN(sourceSub.slice, desc.ArraySize - 1);
+    sourceSubresource = D3D11CalcSubresource(mip, slice, mips);
+    sourceReal = ((WrappedID3D11Texture2D1 *)tex2D->second.m_Texture)->GetReal();
+    snapshotDesc.width = RDCMAX(1U, desc.Width >> mip);
+    snapshotDesc.height = RDCMAX(1U, desc.Height >> mip);
+    snapshotDesc.depth = 1;
+    snapshotDesc.arraysize = snapshotDesc.mips = 1;
+    snapshotDesc.cubemap = false;
+    snapshotDesc.type = TextureType::Texture2D;
+  }
+  else if(tex3D != WrappedID3D11Texture3D1::m_TextureList.end())
+  {
+    D3D11_TEXTURE3D_DESC desc = {};
+    tex3D->second.m_Texture->GetDesc(&desc);
+    if(desc.MiscFlags & D3D11_RESOURCE_MISC_TILED)
+      return ResourceId();
+    const UINT mips = RDCMAX(1U, desc.MipLevels);
+    const UINT mip = RDCMIN(sourceSub.mip, mips - 1);
+    sourceSubresource = mip;
+    sourceReal = ((WrappedID3D11Texture3D1 *)tex3D->second.m_Texture)->GetReal();
+    snapshotDesc.width = RDCMAX(1U, desc.Width >> mip);
+    snapshotDesc.height = RDCMAX(1U, desc.Height >> mip);
+    snapshotDesc.depth = RDCMAX(1U, desc.Depth >> mip);
+    snapshotDesc.arraysize = snapshotDesc.mips = 1;
+    snapshotDesc.cubemap = false;
+    snapshotDesc.type = TextureType::Texture3D;
+    snapshotSub.slice = RDCMIN(sourceSub.slice, snapshotDesc.depth - 1);
+  }
+  else
+  {
+    return ResourceId();
+  }
+
+  ResourceId snapshot = CreateProxyTextureSnapshot(snapshotDesc);
+  if(snapshot == ResourceId())
+    return ResourceId();
+
+  ID3D11Resource *snapshotReal = NULL;
+  auto dst1D = WrappedID3D11Texture1D::m_TextureList.find(snapshot);
+  auto dst2D = WrappedID3D11Texture2D1::m_TextureList.find(snapshot);
+  auto dst3D = WrappedID3D11Texture3D1::m_TextureList.find(snapshot);
+  if(dst1D != WrappedID3D11Texture1D::m_TextureList.end())
+    snapshotReal = ((WrappedID3D11Texture1D *)dst1D->second.m_Texture)->GetReal();
+  else if(dst2D != WrappedID3D11Texture2D1::m_TextureList.end())
+    snapshotReal = ((WrappedID3D11Texture2D1 *)dst2D->second.m_Texture)->GetReal();
+  else if(dst3D != WrappedID3D11Texture3D1::m_TextureList.end())
+    snapshotReal = ((WrappedID3D11Texture3D1 *)dst3D->second.m_Texture)->GetReal();
+
+  if(snapshotReal == NULL)
+  {
+    FreeTextureSnapshot(snapshot);
+    return ResourceId();
+  }
+
+  // The destination contains exactly one mip/array subresource. Depth/stencil resources use the
+  // whole-subresource copy required by D3D11.
+  m_pImmediateContext->GetReal()->CopySubresourceRegion(snapshotReal, 0, 0, 0, 0, sourceReal,
+                                                        sourceSubresource, NULL);
+  return snapshot;
+}
+
+void D3D11Replay::FreeTextureSnapshot(ResourceId snapshot)
+{
+  rdcarray<ResourceId> snapshots;
+  snapshots.push_back(snapshot);
+  FreeTextureSnapshots(snapshots);
+}
+
+void D3D11Replay::FreeTextureSnapshots(const rdcarray<ResourceId> &snapshots)
+{
+  for(ResourceId snapshot : snapshots)
+  {
+    for(size_t snapshotIndex = 0; snapshotIndex < m_TextureSnapshots.size(); snapshotIndex++)
+    {
+      if(m_TextureSnapshots[snapshotIndex] != snapshot)
+        continue;
+
+      for(size_t resourceIndex = 0; resourceIndex < m_ProxyResources.size(); resourceIndex++)
+      {
+        if(GetIDForDeviceChild(m_ProxyResources[resourceIndex]) == snapshot)
+        {
+          ID3D11Resource *resource = m_ProxyResources[resourceIndex];
+          m_ProxyResources.erase(resourceIndex);
+          resource->Release();
+          break;
+        }
+      }
+
+      m_ProxyResourceOrigInfo.erase(snapshot);
+      m_TextureSnapshots.erase(snapshotIndex);
+      break;
+    }
+  }
+}
+
 void D3D11Replay::SetProxyTextureData(ResourceId texid, const Subresource &sub, byte *data,
                                       size_t dataSize)
 {
@@ -5110,3 +6024,42 @@ RDResult D3D11_ProcessStructured(RDCFile *rdc, SDFile &output)
 
 static StructuredProcessRegistration D3D11ProcessRegistration(RDCDriver::D3D11,
                                                               &D3D11_ProcessStructured);
+
+#if ENABLED(ENABLE_UNIT_TESTS)
+#include "catch/catch.hpp"
+
+TEST_CASE("D3D11 checkpoint versions include CPU writes and use AFTER-event boundaries",
+          "[d3d11][checkpoint]")
+{
+  CHECK(CheckpointWritesResource(ResourceUsage::CPUWrite));
+  CHECK(CheckpointWritesResource(ResourceUsage::CopyDst));
+  CHECK(CheckpointWritesResource(ResourceUsage::ResolveDst));
+  CHECK(CheckpointWritesResource(ResourceUsage::CS_RWResource));
+  CHECK(CheckpointWritesResource(ResourceUsage::ColorTarget));
+  CHECK(CheckpointWritesResource(ResourceUsage::Discard));
+  CHECK_FALSE(CheckpointWritesResource(ResourceUsage::CopySrc));
+  CHECK_FALSE(CheckpointWritesResource(ResourceUsage::VS_Constants));
+  CHECK_FALSE(CheckpointWritesResource(ResourceUsage::PS_Resource));
+  const rdcarray<uint32_t> writes = {9, 3, 17};
+  CHECK(CheckpointLastWrite(writes, 2) == 0);
+  CHECK(CheckpointLastWrite(writes, 3) == 3);
+  CHECK(CheckpointLastWrite(writes, 8) == 3);
+  CHECK(CheckpointLastWrite(writes, 9) == 9);
+  CHECK(CheckpointLastWrite(writes, 18) == 17);
+}
+TEST_CASE("D3D11 event CBuffer shadows bind legal 256-byte ranges", "[d3d11][cbuffer]")
+{
+  CHECK(EventCBufferShadowConstants(16) == 16);
+  CHECK(EventCBufferShadowConstants(256) == 16);
+  CHECK(EventCBufferShadowConstants(272) == 32);
+  CHECK(EventCBufferShadowConstants(64 * 1024) == 4096);
+  for(uint64_t bytes : {16ULL, 256ULL, 272ULL, 64ULL * 1024ULL})
+  {
+    const uint64_t constants = EventCBufferShadowConstants(bytes);
+    CHECK(constants % 16 == 0);
+    CHECK(constants * 16 >= bytes);
+    CHECK(constants * 16 - bytes < 256);
+  }
+}
+
+#endif

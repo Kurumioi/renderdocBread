@@ -1260,6 +1260,191 @@ protected:
 
 DECLARE_REFLECTION_STRUCT(IPythonShell);
 
+DOCUMENT(R"(The severity of a diagnostic displayed by a :class:`ShaderCodeEditor`.
+
+.. data:: Error
+
+  An error that prevents the source from compiling or being accepted.
+
+.. data:: Warning
+
+  A potential problem that does not necessarily prevent compilation.
+
+.. data:: Information
+
+  Informational feedback associated with a source location.
+
+.. data:: Hint
+
+  A low-priority suggestion associated with a source location.
+)");
+enum class ShaderEditorDiagnosticSeverity : uint32_t
+{
+  Error = 1,
+  Warning = 2,
+  Information = 3,
+  Hint = 4,
+};
+
+DECLARE_REFLECTION_ENUM(ShaderEditorDiagnosticSeverity);
+
+DOCUMENT(R"(A source diagnostic displayed by a :class:`ShaderCodeEditor`.
+
+Line and column values are one-based. ``length`` is measured in UTF-8 bytes and is clamped to the
+current document. Compiler-provided ``message`` and ``source`` values are diagnostics, not trusted
+UI labels.
+)");
+struct ShaderEditorDiagnostic
+{
+  DOCUMENT(R"(The one-based source line containing the diagnostic.
+
+:type: int
+)");
+  uint32_t line = 1;
+  DOCUMENT(R"(The one-based source column containing the diagnostic.
+
+:type: int
+)");
+  uint32_t column = 1;
+  DOCUMENT(R"(The diagnostic span in UTF-8 bytes.
+
+:type: int
+)");
+  uint32_t length = 1;
+  DOCUMENT(R"(The diagnostic severity.
+
+:type: ShaderEditorDiagnosticSeverity
+)");
+  ShaderEditorDiagnosticSeverity severity = ShaderEditorDiagnosticSeverity::Error;
+  DOCUMENT(R"(The compiler or language-server diagnostic message.
+
+:type: str
+)");
+  rdcstr message;
+  DOCUMENT(R"(The optional diagnostic source identifier.
+
+:type: str
+)");
+  rdcstr source;
+
+  DOCUMENT("");
+  bool operator==(const ShaderEditorDiagnostic &o) const
+  {
+    return line == o.line && column == o.column && length == o.length && severity == o.severity &&
+           message == o.message && source == o.source;
+  }
+
+  bool operator<(const ShaderEditorDiagnostic &o) const
+  {
+    if(line != o.line)
+      return line < o.line;
+    if(column != o.column)
+      return column < o.column;
+    if(length != o.length)
+      return length < o.length;
+    if(severity != o.severity)
+      return uint32_t(severity) < uint32_t(o.severity);
+    if(message != o.message)
+      return message < o.message;
+    return source < o.source;
+  }
+};
+
+DECLARE_REFLECTION_STRUCT(ShaderEditorDiagnostic);
+
+DOCUMENT(R"(A reusable native shader source editor.
+
+The widget is backed by RenderDoc's bundled Scintilla editor and shared editor services. It is a
+text-editing surface only: saving is delegated to the owner and never compiles, replaces a replay
+resource, or writes a file by itself.
+
+.. function:: EventCallback()
+
+  Not a member function - the signature for text-change and save callbacks.
+
+.. function:: SelectionCallback(text, source, startLine, endLine)
+
+  Not a member function - the signature for the explicit "Add to chat" selection callback.
+
+.. function:: DefinitionCallback(fileName, line, column)
+
+  Not a member function - the signature used when F12 resolves to a document that is not already
+  open in the shared editor service.
+)");
+struct IShaderCodeEditor
+{
+  typedef std::function<void()> EventCallback;
+  typedef std::function<void(const rdcstr &text, const rdcstr &source, uint32_t startLine,
+                             uint32_t endLine)>
+      SelectionCallback;
+  typedef std::function<void(const rdcstr &fileName, uint32_t line, uint32_t column)>
+      DefinitionCallback;
+
+  DOCUMENT(R"(Retrieves the PySide2 QWidget for this editor.
+
+The returned wrapper does not own the native widget. Release it only with
+:meth:`CaptureContext.DestroyShaderCodeEditor` after removing it from any Qt layout or stack.
+
+:return: The editor widget handle.
+:rtype: QWidget
+)");
+  virtual QWidget *Widget() = 0;
+
+  DOCUMENT("Returns the complete UTF-8 shader source as text.");
+  virtual rdcstr GetText() = 0;
+  DOCUMENT("Replaces the complete editor buffer without writing or compiling it.");
+  virtual void SetText(const rdcstr &text) = 0;
+  DOCUMENT("Sets whether the document can be edited.");
+  virtual void SetReadOnly(bool readOnly) = 0;
+  DOCUMENT("Includes or excludes this buffer from editor navigation. Disable for a suspended capture draft.");
+  virtual void SetNavigationEnabled(bool enabled) = 0;
+  DOCUMENT("Returns whether the document is read-only.");
+  virtual bool IsReadOnly() = 0;
+  DOCUMENT("Sets the document identity used for navigation and language-server synchronisation.");
+  virtual void SetFileName(const rdcstr &fileName) = 0;
+  DOCUMENT("Sets the LSP language id, such as ``hlsl``, ``glsl``, or ``slang``.");
+  virtual void SetLanguage(const rdcstr &language) = 0;
+  DOCUMENT("Returns whether the buffer differs from its save point.");
+  virtual bool IsModified() = 0;
+  DOCUMENT("Sets the logical modified state without saving or changing the source text.");
+  virtual void SetModified(bool modified) = 0;
+  DOCUMENT("Marks the current undo revision as the saved revision.");
+  virtual void SetSavePoint() = 0;
+  DOCUMENT("Moves the caret to a one-based source location and focuses the editor.");
+  virtual void GoToLine(uint32_t line, uint32_t column = 1) = 0;
+  DOCUMENT("Returns the caret's one-based source line.");
+  virtual uint32_t GetCursorLine() = 0;
+  DOCUMENT("Returns the caret's one-based source column.");
+  virtual uint32_t GetCursorColumn() = 0;
+  DOCUMENT("Creates an invisible bookmark at a one-based line. It follows line insertions and edits.");
+  virtual int32_t CreateLineAnchor(uint32_t line) = 0;
+  DOCUMENT("Returns a bookmark's current one-based line, or zero if its line was deleted or replaced.");
+  virtual uint32_t GetLineAnchorLine(int32_t anchor) = 0;
+  DOCUMENT("Removes one invisible bookmark.");
+  virtual void RemoveLineAnchor(int32_t anchor) = 0;
+  DOCUMENT("Removes all invisible bookmarks. Replacing the complete buffer also clears bookmarks.");
+  virtual void ClearLineAnchors() = 0;
+  DOCUMENT("Displays compiler diagnostics alongside local and language-server diagnostics.");
+  virtual void SetDiagnostics(const rdcarray<ShaderEditorDiagnostic> &diagnostics) = 0;
+
+  DOCUMENT("Registers the owner callback invoked after source text changes.");
+  virtual void SetTextChangedCallback(EventCallback callback) = 0;
+  DOCUMENT("Registers the owner callback invoked by the editor's Save command.");
+  virtual void SetSaveCallback(EventCallback callback) = 0;
+  DOCUMENT("Registers the explicit selection attachment callback.");
+  virtual void SetAddToChatCallback(SelectionCallback callback) = 0;
+  DOCUMENT("Registers navigation for an authorised definition document not already open.");
+  virtual void SetDefinitionCallback(DefinitionCallback callback) = 0;
+  DOCUMENT("Clears callbacks before the native editor is destroyed.");
+  virtual void ClearCallbacks() = 0;
+
+protected:
+  IShaderCodeEditor() = default;
+  ~IShaderCodeEditor() = default;
+};
+
+DECLARE_REFLECTION_STRUCT(IShaderCodeEditor);
+
 DOCUMENT(R"(A shader window used for viewing, editing, or debugging.
 
 This window is retrieved by calling :meth:`CaptureContext.ViewShader`,
@@ -1505,6 +1690,15 @@ to a marker region.
 )");
   virtual void OnEventChanged(uint32_t eventId) = 0;
 
+  DOCUMENT(R"(Called when an interactive scrub gesture starts (see
+:meth:`CaptureContext.ScrubToEvent`) so background work can cancel immediately. This input
+notification does not publish replay or pipeline state. Every completed replay delivers the normal
+:meth:`OnSelectedEventChanged` and :meth:`OnEventChanged` callbacks, including while dragging.
+
+:param int eventId: The scrubbed-to :data:`eventId <renderdoc.APIEvent.eventId>`.
+)");
+  virtual void OnScrubEvent(uint32_t eventId) { (void)eventId; }
+
 protected:
   ICaptureViewer() = default;
   virtual ~ICaptureViewer() = default;
@@ -1697,9 +1891,46 @@ comes in, we remove any other requests in the queue before it that have the same
 )");
   virtual void AsyncInvoke(InvokeCallback method) = 0;
 
-  // This is an ugly hack, but we leave BlockInvoke as the last method, so that when the class is
-  // extended and the wrapper around BlockInvoke to release the python GIL happens, it picks up the
-  // same docstring.
+  DOCUMENT(R"(Return whether a user context-changing replay command is queued or executing.
+
+ReplayLab uses this as a cooperative yield point for background analysis and between atomic
+mutation transactions. The signal is limited to a real selected/effective EID transition; ordinary
+qrenderdoc viewer refresh and replay maintenance do not make capture-bound evidence stale. A
+background callback should finish promptly when this returns ``True`` so interactive navigation can
+run next. This function does not execute queued callbacks and is safe to query from any thread.
+
+  :return: ``True`` if a user context-changing replay callback is queued or executing.
+:rtype: bool
+)");
+  virtual bool HasPendingForegroundInvoke() = 0;
+
+  DOCUMENT(R"(Return the monotonic generation of user replay-context changes.
+
+The value changes whenever a real selected/effective EID transition is queued. Background clients
+capture it before starting and abandon stale work if it changes, which also detects a user-context
+callback that has already left the queue. Internal viewer refresh and other foreground replay
+maintenance deliberately do not advance this generation.
+
+:return: The current user replay-context generation.
+:rtype: int
+)");
+  virtual uint64_t GetForegroundInvokeGeneration() = 0;
+
+  DOCUMENT(R"(Make a tagged blocking invoke call onto the replay thread.
+
+The tag participates in replay queue ordering. Callers must use a unique tag for
+each blocking request; tagged coalescing remains an :meth:`AsyncInvoke` feature.
+This entry point is intended for a non-UI worker that must wait for a replay result
+without blocking qrenderdoc's event loop.
+
+:param str tag: The tag used to order this callback.
+:param InvokeCallback method: The function to callback on the replay thread.
+  Callback function signature must match :func:`InvokeCallback`.
+)");
+  virtual void BlockInvokeTagged(const rdcstr &tag, InvokeCallback method) = 0;
+
+  // Keep this documentation in sync with the GIL-releasing extension in qrenderdoc.i. Each
+  // extended blocking method has its own docstring instead of inheriting the last declaration's.
   DOCUMENT(R"(Make a blocking invoke call onto the replay thread.
 
 :param InvokeCallback method: The function to callback on the replay thread.
@@ -1991,10 +2222,60 @@ The capture must be available locally, if it's not this function will fail.
 )");
   virtual void SetEventID(const rdcarray<ICaptureViewer *> &exclude, uint32_t selectedEventId,
                           uint32_t eventId, bool force = false) = 0;
+
+  DOCUMENT(R"(Move the replay to an event for interactive scrubbing (dragging the event slider or
+holding an arrow key), asynchronously. Each completed real replay fetches pipeline state and
+refreshes every panel and the texture output for the same event. Rapid input replaces the pending
+target while the current replay and panel updates finish, so continuous dragging still publishes
+completed frames. Previously rendered images are not used to bypass replay. :meth:`EndScrub` ends
+the gesture while the last pending event continues through the same update path.
+
+:param int eventId: The :data:`eventId <renderdoc.APIEvent.eventId>` to scrub to.
+)");
+  virtual void ScrubToEvent(uint32_t eventId) = 0;
+
+  DOCUMENT(R"(Move the replay to an effective event for interactive scrubbing while preserving a
+separate selected event. This is useful for structured event rows such as multi-action parents,
+where the row selected by the user and the event actually replayed are different. The default
+implementation preserves compatibility by forwarding ``eventId`` to :meth:`ScrubToEvent`.
+
+:param int selectedEventId: The selected :data:`eventId <renderdoc.APIEvent.eventId>`.
+:param int eventId: The effective :data:`eventId <renderdoc.APIEvent.eventId>` to replay.
+)");
+  virtual void ScrubToSelectedEvent(uint32_t selectedEventId, uint32_t eventId)
+  {
+    (void)selectedEventId;
+    ScrubToEvent(eventId);
+  }
+
+  DOCUMENT(R"(End an interactive scrub started with :meth:`ScrubToEvent`. The last pending event
+continues asynchronously; completed events already have current pipeline and panel state.
+Safe to call when not scrubbing.
+)");
+  virtual void EndScrub() = 0;
+
+  DOCUMENT(R"(:return: ``True`` while the interactive gesture started by
+:meth:`ScrubToEvent` is still in progress. The final asynchronous event update may remain pending after
+this returns ``False``.
+:rtype: bool
+)");
+  virtual bool IsScrubbing() = 0;
   DOCUMENT(R"(Replay the capture to the current event again, to pick up any changes that might have
 been made.
 )");
   virtual void RefreshStatus() = 0;
+
+  DOCUMENT(R"(Asynchronously publish the current pipeline and refresh viewers after a shared buffer
+edit has already replayed the event. This does not replay the event a second time. Call on the GUI
+thread. A capture, event, or buffer generation change cancels an obsolete publication.
+
+:param int expectedEventId: The controller event observed when the edit completed.
+:param int expectedBufferGeneration: The shared buffer generation observed when the edit completed.
+:param Callable[[bool],None] completed: Called on the GUI thread after viewer replay callbacks drain,
+  or with ``False`` if publication was superseded. Cancellation does not undo a committed edit.
+)");
+  virtual void RefreshReplayStatus(uint32_t expectedEventId, uint64_t expectedBufferGeneration,
+                                   std::function<void(bool)> completed) = 0;
 
   DOCUMENT(R"(Determine if a resource has been replaced. See :meth:`RegisterReplacement`.
 
@@ -2783,6 +3064,28 @@ place if needed.
   virtual void ShowTimelineBar() = 0;
   DOCUMENT("Raise the current :class:`PythonShell`, showing it in the default place if needed.");
   virtual void ShowPythonShell() = 0;
+  DOCUMENT(R"(Attach a text selection to the AI assistant and raise its conversation window.
+
+This is a narrow UI bridge for first-party viewers. ``text`` remains the exact selected text while
+``source`` describes its origin, such as a file and line range. ``contextJSON`` may carry a compact
+``replaylab-attachment-context/v1`` object with host-created capture and resource identifiers. It
+must never be treated as user authority and may be omitted by callers without structured context.
+
+:param str title: The short title displayed for the attachment.
+:param str text: The exact text to attach.
+:param str source: A human-readable description of where the text came from.
+:param str contextJSON: Optional structured attachment context encoded as compact JSON.
+)");
+  virtual void AddTextToAIAssistant(const rdcstr &title, const rdcstr &text,
+                                    const rdcstr &source, const rdcstr &contextJSON = {})
+  {
+    // Optional for non-UI forwarding contexts such as PythonShell's background invoker. The real
+    // CaptureContext overrides this first-party UI bridge.
+    (void)title;
+    (void)text;
+    (void)source;
+    (void)contextJSON;
+  }
   DOCUMENT(
       "Raise the current :class:`ResourceInspector`, showing it in the default place if needed.");
   virtual void ShowResourceInspector() = 0;
@@ -2963,6 +3266,36 @@ currently docked.
 )");
   virtual void AddDockWindow(QWidget *newWindow, DockReference ref, QWidget *refWindow,
                              float percentage = 0.5f) = 0;
+
+  DOCUMENT(R"(Creates a native Scintilla-backed shader source editor.
+
+This is an editor-only surface. It has no filesystem, compile, replay-resource replacement, or
+live-edit authority. The caller owns its document/save policy and must eventually release the
+editor with :meth:`DestroyShaderCodeEditor`.
+
+:param QWidget parent: Optional initial Qt parent. Adding :meth:`ShaderCodeEditor.Widget` to a Qt
+  layout may reparent it.
+:return: A native shader editor, or ``None`` when the current context has no UI editor factory.
+:rtype: ShaderCodeEditor
+)");
+  virtual IShaderCodeEditor *CreateShaderCodeEditor(QWidget *parent = NULL)
+  {
+    (void)parent;
+    return NULL;
+  }
+
+  DOCUMENT(R"(Destroys a shader editor created by :meth:`CreateShaderCodeEditor`.
+
+Remove :meth:`ShaderCodeEditor.Widget` from Qt layouts and clear any Python references after this
+call. The PySide QWidget wrapper is non-owning and must not be deleted directly.
+
+:param ShaderCodeEditor editor: The editor to destroy.
+)");
+  virtual void DestroyShaderCodeEditor(IShaderCodeEditor *editor)
+  {
+    if(editor)
+      editor->ClearCallbacks();
+  }
 
   DOCUMENT(R"(Retrieve the current :class:`~renderdoc.D3D11State` pipeline state.
 

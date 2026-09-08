@@ -1,5 +1,7 @@
 # RenderDoc Ultra development rules
 
+> **Read BOTH this file and [`CLAUDE.md`](./CLAUDE.md) before making changes — together they are one unified rule set.** OpenAI Codex and other agents read `AGENTS.md`; Claude Code reads `CLAUDE.md`; each points at the other so neither agent misses a rule. They are complementary, not duplicates: **`AGENTS.md`** (this file) is canonical for the UI/ReplayLab **localization (i18n) rules** below; **`CLAUDE.md`** is canonical for project structure, the build/release pipeline, upstream sync, and pitfalls. If a rule's home is the other file, follow it there and keep the two in sync.
+
 ## Tooling
 
 - Prefer command-line, API, MCP, and background workflows. Avoid controlling desktop applications unless no reliable non-interactive path exists.

@@ -124,10 +124,11 @@ public:
 
   void RemoveRecentCapture(const QString &filename);
 
-  QMenu *GetBaseMenu(WindowMenu base, rdcstr name);
+  QMenu *GetBaseMenu(WindowMenu base, rdcstr name, bool showExtensionIcon = true);
   QList<QAction *> GetMenuActions();
 
   void showEventBrowser() { on_action_Event_Browser_triggered(); }
+  void showBookmarks() { on_action_Bookmarks_triggered(); }
   void showAPIInspector() { on_action_API_Inspector_triggered(); }
   void showAnnotationViewer() { on_action_Annotation_Viewer_triggered(); }
   void showMeshPreview() { on_action_Mesh_Output_triggered(); }
@@ -158,6 +159,7 @@ private slots:
   void on_action_Save_Capture_As_triggered();
   void on_action_Close_Capture_triggered();
   void on_action_Mesh_Output_triggered();
+  void on_action_Bookmarks_triggered();
   void on_action_API_Inspector_triggered();
   void on_action_Annotation_Viewer_triggered();
   void on_action_Event_Browser_triggered();

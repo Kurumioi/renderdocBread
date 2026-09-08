@@ -28,6 +28,7 @@
 #include <QMutex>
 #include "Code/Interface/QRDInterface.h"
 #include "Code/QRDUtils.h"
+#include "Code/ReplayLab/ReplayLabCBufferAliases.h"
 #include "Windows/Dialogs/ProjectionGuessDialog.h"
 
 namespace Ui
@@ -119,6 +120,9 @@ public:
 
   QVariant persistData();
   void setPersistData(const QVariant &persistData);
+
+protected:
+  void showEvent(QShowEvent *event) override;
 
 private slots:
   // automatic slots
@@ -215,8 +219,12 @@ private:
                           const rdcarray<ShaderConstant> &consts, BufferData *buffer);
   void UI_AddFixedVariables(RDTreeWidgetItem *root, uint32_t baseOffset,
                             const rdcarray<ShaderConstant> &consts,
-                            const rdcarray<ShaderVariable> &vars);
+                            const rdcarray<ShaderVariable> &vars,
+                            const QString &parentPath = QString());
   void UI_RemoveOffsets(RDTreeWidgetItem *root);
+  void UI_LoadCBufferAliases();
+  void editCBufferAlias(const QString &path, const QString &original, qint64 offset, bool remove);
+  void editCBufferBlockAlias(bool remove);
   void UI_FixedAddMatrixRows(RDTreeWidgetItem *n, const ShaderConstant &c, const ShaderVariable &v);
 
   void exportCSV(QTextStream &ts, const QString &prefix, RDTreeWidgetItem *item);
@@ -250,6 +258,10 @@ private:
   } m_CBufferSlot = {ShaderStage::Count, 0, 0};
 
   CBufferData m_CurCBuffer;
+
+  // ReplayLab: per-user display names for the reflected constants shown in the CBuffer view,
+  // keyed by the constant block's layout. Reloaded on every refresh.
+  ReplayLabCBufferAliases m_CBufferAliases;
 
   static QList<BufferViewer *> m_CBufferViews;
 
@@ -296,6 +308,8 @@ private:
   QPoint m_Scroll[(int)MeshDataStage::Count];
 
   int m_Sequence = 0;
+  uint32_t m_DeferredEventID = 0;
+  bool m_HasDeferredEvent = false;
 
   RDTableView *m_CurView = NULL;
   bool m_CurFixed = false;

@@ -207,6 +207,7 @@ class WrappedID3D12CommandQueue : public ID3D12CommandQueue1,
   D3D12CommandData m_Cmd;
 
   ResourceId m_PrevQueueId;
+  void SyncReplayQueueForSubmission(ID3D12CommandQueue *queue);
 
   bool ProcessChunk(ReadSerialiser &ser, D3D12Chunk context);
 
@@ -229,6 +230,10 @@ public:
   const APIEvent &GetEvent(uint32_t eventId);
   uint32_t GetMaxEID() { return m_Cmd.m_Events.back().eventId; }
   void ClearAfterCapture();
+  // Order the last captured replay queue before RenderDoc's internal queue without waiting on the
+  // CPU. This is needed before internal barriers, texture snapshots and debug rendering consume
+  // the replay result.
+  void SyncLastReplayQueueToInternal();
 
   bool IsSparseUpdatedResource(ResourceId id) const
   {
@@ -242,9 +247,12 @@ public:
                                     RENDERDOC_AnnotationType valueType, uint32_t valueVectorWidth,
                                     RENDERDOC_AnnotationValue value);
 
-  RDResult ReplayLog(CaptureState readType, uint32_t startEventID, uint32_t endEventID, bool partial);
+  RDResult ReplayLog(CaptureState readType, uint32_t startEventID, uint32_t endEventID, bool partial,
+                     bool allowPreparedReplay = false, bool allowCheckpoints = false);
   void SetFrameReader(StreamReader *reader) { m_FrameReader = reader; }
   D3D12CommandData *GetCommandData() { return &m_Cmd; }
+  bool HasPreparedReplayCache() const { return m_Cmd.HasPreparedReplayCache(); }
+  void ClearPreparedReplayCache() { m_Cmd.ClearPreparedReplayCache(); }
   const rdcarray<EventUsage> &GetUsage(ResourceId id) { return m_Cmd.m_ResourceUses[id]; }
   // interface for DXGI
   virtual IUnknown *GetRealIUnknown() { return GetReal(); }
@@ -390,7 +398,8 @@ public:
 
   virtual void ExecuteCommandListsInternal(UINT NumCommandLists,
                                            ID3D12CommandList *const *ppCommandLists,
-                                           bool InFrameCaptureBoundary, bool SkipRealExecute);
+                                           bool InFrameCaptureBoundary, bool SkipRealExecute,
+                                           bool descriptorIndependent = false);
 
   IMPLEMENT_FUNCTION_SERIALISED(virtual void STDMETHODCALLTYPE, SetMarker, UINT Metadata,
                                 const void *pData, UINT Size);

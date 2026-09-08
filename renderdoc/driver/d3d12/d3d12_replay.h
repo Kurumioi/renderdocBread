@@ -103,6 +103,12 @@ class D3D12Replay : public IReplayDriver
 public:
   D3D12Replay(WrappedID3D12Device *d);
 
+  // Immutable capture initial bytes can be reused across every event and shader/CBuffer edit.
+  // Returns a native copy source; allocation/budget failures retain the original upload source.
+  ID3D12Resource *ResolveInitialStateCopySource(ID3D12Resource *wrappedSource,
+                                               ID3D12GraphicsCommandListX *wrappedList,
+                                               bool allowLoading = false);
+
   D3D12DevConfiguration *GetDevConfiguration() { return m_DevConfig; }
   void SetDevConfiguration(D3D12DevConfiguration *config) { m_DevConfig = config; }
 
@@ -165,6 +171,12 @@ public:
 
   RDResult ReadLogInitialisation(RDCFile *rdc, bool readStructuredBuffers);
   void ReplayLog(uint32_t endEventID, ReplayLogType replayType);
+  void ConfigureReplayCheckpoints(const ReplayCheckpointConfig &config,
+                                 const rdcarray<ReplayCheckpointCandidate> &candidates);
+  void InvalidateReplayCheckpoints(uint32_t firstAffectedEvent = 0);
+  ReplayCheckpointStats GetReplayCheckpointStats();
+  rdcstr SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches) override;
+  uint32_t GetReplayBufferPatchFirstAffectedEvent() const override;
   SDFile *GetStructuredFile();
 
   rdcarray<uint32_t> GetPassEvents(uint32_t eventId);
@@ -243,7 +255,13 @@ public:
   rdcarray<CounterResult> FetchCounters(const rdcarray<GPUCounter> &counters);
 
   ResourceId CreateProxyTexture(const TextureDescription &templateTex);
+  ResourceId CreateProxyTextureSnapshot(const TextureDescription &templateTex);
+  bool SupportsProxyTextureSnapshots() { return true; }
   void SetProxyTextureData(ResourceId texid, const Subresource &sub, byte *data, size_t dataSize);
+  ResourceId CreateTextureSnapshot(ResourceId source, const Subresource &sourceSub,
+                                   CompType typeCast, Subresource &snapshotSub);
+  void FreeTextureSnapshot(ResourceId snapshot);
+  void FreeTextureSnapshots(const rdcarray<ResourceId> &snapshots);
   bool IsTextureSupported(const TextureDescription &tex);
   bool NeedRemapForFetch(const ResourceFormat &format);
 
@@ -357,13 +375,17 @@ private:
   std::map<ResourceId, ID3D12DescriptorHeap *> m_EventCBufferShadowHeaps;
   D3D12RenderState m_AppliedEventCBufferOriginalState;
   bool m_EventCBufferStateApplied = false;
+  // Set only around the ordinary driver's unmodified final-target feedback invocation. A
+  // pipeline query or arbitrary internal analysis must not inherit this dirty-write whitelist.
+  bool m_KnownOrdinaryTargetFeedback = false;
 
   void BuildShader(ShaderEncoding sourceEncoding, const bytebuf &source, const rdcstr &entry,
                    const ShaderCompileFlags &compileFlags, const rdcarray<rdcstr> &includeDirs,
                    ShaderStage type, ResourceId &id, rdcstr &errors);
 
   bool RenderTextureInternal(D3D12_CPU_DESCRIPTOR_HANDLE rtv, TextureDisplay cfg,
-                             TexDisplayFlags flags);
+                             TexDisplayFlags flags, bool deferPresentFlush = false);
+  void DrainTextureDisplaySubmit();
 
   void SetOutputDimensions(int w, int h)
   {
@@ -484,6 +506,7 @@ private:
   bool m_Proxy, m_D3D12On7;
 
   rdcarray<ID3D12Resource *> m_ProxyResources;
+  rdcarray<ResourceId> m_TextureSnapshots;
 
   struct OutputWindow
   {
@@ -511,6 +534,9 @@ private:
   float m_OutputWidth = 1.0f;
   float m_OutputHeight = 1.0f;
   D3D12_VIEWPORT m_OutputViewport;
+  // Normal texture presentation submits its draw and lets FlipOutputWindow retire the draw and
+  // copy together. Before another draw overwrites shared descriptors/constants, this is drained.
+  bool m_TextureDisplaySubmitPending = false;
 
   rdcarray<uint64_t> m_OutputWindowIDs;
   rdcarray<uint64_t> m_DSVIDs;
@@ -639,6 +665,10 @@ private:
   D3D12DevConfiguration *m_DevConfig = NULL;
 
   IDXGIFactory1 *m_pFactory = NULL;
+  IDXGIAdapter3 *m_InitialStateCacheAdapter = NULL;
+  bool m_InitialStateCacheAdapterChecked = false;
+  std::map<ResourceId, ID3D12Resource *> m_InitialStateSourceCache;
+  uint64_t m_InitialStateSourceCacheBytes = 0;
   HMODULE m_D3D12Lib = NULL;
 
   AMDCounters *m_pAMDCounters = NULL;

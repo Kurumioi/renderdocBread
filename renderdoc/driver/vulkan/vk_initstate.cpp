@@ -2387,6 +2387,13 @@ void WrappedVulkan::Apply_InitialState(WrappedVkRes *res, VkInitialContents &ini
       return;
     }
 
+    // Clearing/replacing an edit must restore bytes even when the captured allocation was read-only
+    // and InitReq would normally skip it. The source remains the immutable capture initial state.
+    // Validation excludes image/linear aliases for patched allocations.
+    if(m_ReplayPatchRestoreMemory.find(orig) != m_ReplayPatchRestoreMemory.end())
+      resetReq.update(0, dstBufSize, eInitReq_Copy,
+                      [](InitReqType x, InitReqType y) -> InitReqType { return RDCMAX(x, y); });
+
     if(resetReq.size() == 1 && resetReq.begin()->value() == eInitReq_None)
     {
       RDCDEBUG("Apply_InitialState (Mem %s): skipped", ToStr(orig).c_str());

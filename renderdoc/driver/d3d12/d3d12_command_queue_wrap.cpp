@@ -24,6 +24,7 @@
 
 #include "d3d12_command_queue.h"
 #include "core/settings.h"
+#include "replay/replay_timing.h"
 #include "d3d12_command_list.h"
 #include "d3d12_replay.h"
 #include "d3d12_resources.h"
@@ -59,6 +60,12 @@ bool WrappedID3D12CommandQueue::Serialise_UpdateTileMappings(
     if(IsLoading(m_State))
       m_SparseBindResources.insert(GetResID(pResource));
 
+    m_pDevice->ObserveReplaySparseBind(GetResID(pResource), GetResID(pHeap));
+
+    // Sparse mappings have historically been replayed on this internal primary queue, regardless
+    // of the queue captured in pQueue. Track the queue that actually receives the operation.
+    SyncReplayQueueForSubmission(this);
+
     // don't replay with NO_HAZARD
     m_pReal->UpdateTileMappings(Unwrap(pResource), NumResourceRegions,
                                 pResourceRegionStartCoordinates, pResourceRegionSizes,
@@ -76,6 +83,7 @@ void STDMETHODCALLTYPE WrappedID3D12CommandQueue::UpdateTileMappings(
     const D3D12_TILE_RANGE_FLAGS *pRangeFlags, const UINT *pHeapRangeStartOffsets,
     const UINT *pRangeTileCounts, D3D12_TILE_MAPPING_FLAGS Flags)
 {
+  m_pDevice->ObserveReplaySparseBind(GetResID(pResource), GetResID(pHeap));
   SERIALISE_TIME_CALL(m_pReal->UpdateTileMappings(
       Unwrap(pResource), NumResourceRegions, pResourceRegionStartCoordinates, pResourceRegionSizes,
       Unwrap(pHeap), NumRanges, pRangeFlags, pHeapRangeStartOffsets, pRangeTileCounts, Flags));
@@ -357,6 +365,11 @@ bool WrappedID3D12CommandQueue::Serialise_CopyTileMappings(
     if(IsLoading(m_State))
       m_SparseBindResources.insert(GetResID(pDstResource));
 
+    m_pDevice->ObserveReplaySparseCopy(GetResID(pDstResource), GetResID(pSrcResource));
+
+    // Match UpdateTileMappings: the actual replay operation is submitted on this internal queue.
+    SyncReplayQueueForSubmission(this);
+
     // don't replay with NO_HAZARD
     m_pReal->CopyTileMappings(Unwrap(pDstResource), &DstRegionStartCoordinate, Unwrap(pSrcResource),
                               &SrcRegionStartCoordinate, &RegionSize,
@@ -371,6 +384,7 @@ void STDMETHODCALLTYPE WrappedID3D12CommandQueue::CopyTileMappings(
     ID3D12Resource *pSrcResource, const D3D12_TILED_RESOURCE_COORDINATE *pSrcRegionStartCoordinate,
     const D3D12_TILE_REGION_SIZE *pRegionSize, D3D12_TILE_MAPPING_FLAGS Flags)
 {
+  m_pDevice->ObserveReplaySparseCopy(GetResID(pDstResource), GetResID(pSrcResource));
   SERIALISE_TIME_CALL(m_pReal->CopyTileMappings(Unwrap(pDstResource), pDstRegionStartCoordinate,
                                                 Unwrap(pSrcResource), pSrcRegionStartCoordinate,
                                                 pRegionSize, Flags));
@@ -471,17 +485,11 @@ bool WrappedID3D12CommandQueue::Serialise_ExecuteCommandLists(SerialiserType &se
   {
     ID3D12CommandQueue *real = Unwrap(pQueue);
 
-    m_pDevice->DataUploadSync();
-
-    if(m_PrevQueueId != GetResID(pQueue))
-    {
-      RDCDEBUG("Previous queue execution was on queue %s, now executing %s, syncing GPU",
-               ToStr(m_PrevQueueId).c_str(), ToStr(GetResID(pQueue)).c_str());
-      if(m_PrevQueueId != ResourceId())
-        m_pDevice->DeviceWaitForIdle();
-
-      m_PrevQueueId = GetResID(pQueue);
-    }
+    SyncReplayQueueForSubmission(pQueue);
+    // This is a captured command-list submission. Unlike queue fences or internal upload copies,
+    // these lists can retain shader-visible descriptor references until the device completes.
+    if(NumCommandLists > 0)
+      m_pDevice->MarkReplayWorkSubmitted();
 
     if(IsLoading(m_State))
     {
@@ -665,7 +673,9 @@ bool WrappedID3D12CommandQueue::Serialise_ExecuteCommandLists(SerialiserType &se
         {
           EventUsage u = it->second;
           u.eventId += m_Cmd.m_RootEventID;
-          m_Cmd.m_ResourceUses[it->first].push_back(u);
+          rdcarray<EventUsage> &uses = m_Cmd.m_ResourceUses[it->first];
+          if(u.usage != ResourceUsage::Shader || uses.empty())
+            uses.push_back(u);
         }
 
         m_Cmd.m_RootEventID += cmdListInfo.eventCount;
@@ -751,13 +761,18 @@ bool WrappedID3D12CommandQueue::Serialise_ExecuteCommandLists(SerialiserType &se
 
           if(eid <= m_Cmd.m_LastEventID)
           {
-            ID3D12CommandList *cmd = m_Cmd.RerecordCmdList(cmdId);
+            ID3D12CommandList *cmd = m_Cmd.RerecordCmdListForSubmission(cmdId, eid);
             ResourceId rerecord = GetResID(cmd);
 #if ENABLED(VERBOSE_PARTIAL_REPLAY)
             RDCDEBUG("Queue submit re-recorded replay of %s, using %s (%u -> %u <= %u)",
                      ToStr(cmdId).c_str(), ToStr(rerecord).c_str(), eid, end, m_Cmd.m_LastEventID);
 #endif
             rerecordedCmds.push_back(Unwrap(cmd));
+
+            // Use this submission's base: an earlier complete occurrence of the same baked list
+            // must retain its full writes even when the selected occurrence is partial. Resolve
+            // shader-visible heap locations now, after captured descriptor mutations.
+            m_Cmd.MarkReplaySubmittedWrites(cmdId, eid, m_Cmd.m_LastEventID);
 
             m_pDevice->ApplyBarriers(m_Cmd.m_BakedCmdListInfo[rerecord].barriers);
           }
@@ -796,6 +811,52 @@ bool WrappedID3D12CommandQueue::Serialise_ExecuteCommandLists(SerialiserType &se
   return true;
 }
 
+void WrappedID3D12CommandQueue::SyncReplayQueueForSubmission(ID3D12CommandQueue *queue)
+{
+  ScopedReplayTimingContext timingContext(ReplayTimingContext::QueueTransition);
+  if(queue == NULL)
+  {
+    // A valid captured submission always has a queue. Fail closed if deserialisation produced an
+    // invalid one, rather than allowing prior GPU work and a later CPU/resource operation to race.
+    m_pDevice->DeviceWaitForIdle();
+    m_PrevQueueId = ResourceId();
+    return;
+  }
+
+  // Persistent captured CPU writes are copied on RenderDoc's internal queue. Ensure those copies
+  // are visible before any kind of captured queue submission, not only ExecuteCommandLists.
+  m_pDevice->DataUploadSync(queue);
+
+  const ResourceId nextQueueId = GetResID(queue);
+  if(m_PrevQueueId != nextQueueId)
+  {
+    RDCDEBUG("Previous queue execution was on queue %s, now executing %s, syncing GPU",
+             ToStr(m_PrevQueueId).c_str(), ToStr(nextQueueId).c_str());
+
+    if(m_PrevQueueId != ResourceId() &&
+       !m_pDevice->ReplayQueueSync(m_PrevQueueId, queue))
+      m_pDevice->DeviceWaitForIdle();
+
+    m_PrevQueueId = nextQueueId;
+  }
+
+  m_pDevice->MarkReplayWorkSubmitted(false);
+}
+
+void WrappedID3D12CommandQueue::SyncLastReplayQueueToInternal()
+{
+  ScopedReplayTimingContext timingContext(ReplayTimingContext::QueueTransition);
+  if(m_PrevQueueId == GetResourceID())
+    return;
+
+  if(m_PrevQueueId != ResourceId() && !m_pDevice->ReplayQueueSync(m_PrevQueueId, this))
+    m_pDevice->DeviceWaitForIdle();
+
+  // ReplayQueueSync either installed a GPU wait or the fallback completed every queue, so future
+  // work can extend the dependency chain from the internal queue.
+  m_PrevQueueId = GetResourceID();
+}
+
 ID3D12Fence *WrappedID3D12CommandQueue::GetCallbackFence()
 {
   // if we don't have a fence for this queue tracking, create it now
@@ -821,7 +882,8 @@ void WrappedID3D12CommandQueue::ExecuteCommandLists(UINT NumCommandLists,
 void WrappedID3D12CommandQueue::ExecuteCommandListsInternal(UINT NumCommandLists,
                                                             ID3D12CommandList *const *ppCommandLists,
                                                             bool InFrameCaptureBoundary,
-                                                            bool SkipRealExecute)
+                                                            bool SkipRealExecute,
+                                                            bool descriptorIndependent)
 {
   ID3D12CommandList **unwrapped = m_pDevice->GetTempArray<ID3D12CommandList *>(NumCommandLists);
   for(UINT i = 0; i < NumCommandLists; i++)
@@ -838,7 +900,12 @@ void WrappedID3D12CommandQueue::ExecuteCommandListsInternal(UINT NumCommandLists
 
   if(!SkipRealExecute)
   {
-    SERIALISE_TIME_CALL(m_pReal->ExecuteCommandLists(NumCommandLists, unwrapped));
+    {
+      ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitSubmit);
+      SERIALISE_TIME_CALL(m_pReal->ExecuteCommandLists(NumCommandLists, unwrapped));
+    }
+
+    m_pDevice->MarkReplayWorkSubmitted(!descriptorIndependent);
 
     rdcarray<std::function<bool()>> pendingCallbacks;
 
@@ -1402,8 +1469,22 @@ bool WrappedID3D12CommandQueue::Serialise_Signal(SerialiserType &ser, ID3D12Fenc
 
   if(IsReplayingAndReading() && pFence)
   {
-    m_pReal->Signal(Unwrap(pFence), Value);
-    m_pDevice->DeviceWaitForIdle();
+    // Keep the captured signal visible to replayed fence queries. A Signal is GPU work, not an
+    // application-side CPU wait. Mapped-data writes and shader-visible descriptor writes wait at
+    // their actual mutation boundary, so intervening GPU-only work can remain queued here.
+    // Capture loading and validation retain the original conservative completion point.
+    ScopedReplayTimingContext timingContext(ReplayTimingContext::QueueSignal);
+    SyncReplayQueueForSubmission(pQueue);
+    Unwrap(pQueue)->Signal(Unwrap(pFence), Value);
+    if(m_pDevice->ShouldUseConservativeReplaySync())
+    {
+      AddReplayTimingCounter(ReplayTimingCounter::QueueSignalsConservative);
+      m_pDevice->ReplayWorkWaitForIdle();
+    }
+    else
+    {
+      AddReplayTimingCounter(ReplayTimingCounter::QueueSignalsDeferred);
+    }
   }
 
   return true;
@@ -1441,7 +1522,11 @@ bool WrappedID3D12CommandQueue::Serialise_Wait(SerialiserType &ser, ID3D12Fence 
 
   if(IsReplayingAndReading() && pFence)
   {
-    m_pDevice->DeviceWaitForIdle();
+    // Captured fence values can already be complete from an earlier replay of this static frame,
+    // so waiting on the literal value would not reproduce this iteration's dependency. Preserve
+    // the old fail-safe ordering with fresh internal fence values entirely on the GPU instead.
+    SyncReplayQueueForSubmission(pQueue);
+    m_pDevice->ReplayQueueWaitForPreviousWork(pQueue);
   }
 
   return true;

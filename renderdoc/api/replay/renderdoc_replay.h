@@ -374,6 +374,23 @@ Should only be called for mesh outputs.
 )");
   virtual rdcpair<uint32_t, uint32_t> PickVertex(uint32_t x, uint32_t y) = 0;
 
+  // Keep this analysis-only output addition at the end of IReplayOutput's public vtable so older
+  // binary consumers retain their existing method slots.
+  DOCUMENT(R"(Render a texture output from the resource state immediately after a different event,
+without changing the replay controller's selected/current event.
+
+For presentation-only configurations, the output retains a replay-owned static snapshot so the
+main output, pixel context, resizing, and later presentation changes remain independent of another
+frame replay. Event-derived overlays and custom display shaders use a transient high-fidelity path
+instead. Other thumbnails attached to the output are not refreshed. This is intended for embedded
+event-history views that need the normal texture display controls while keeping global event
+selection unchanged.
+
+:param int eventId: The event whose post-action resource state should be displayed.
+:param TextureDisplay config: The texture display configuration to render.
+)");
+  virtual void DisplayTextureAtEvent(uint32_t eventId, const TextureDisplay &config) = 0;
+
   static const uint32_t NoResult = ~0U;
 
 protected:
@@ -482,6 +499,70 @@ function must be called from another thread.
   already current. This can be useful if external factors might cause the replay to vary.
 )");
   virtual void SetFrameEvent(uint32_t eventId, bool force) = 0;
+
+  DOCUMENT(R"(Returns the logical event currently selected on this replay controller.
+
+Interactive scrubbing publishes this event after replaying its resources. Read-only analysis can
+temporarily move the replay device elsewhere; operations requiring live captured resources restore
+the selected event as needed.
+
+:return: The current effective event ID.
+:rtype: int
+)");
+  virtual uint32_t GetCurrentEventID() = 0;
+
+  DOCUMENT(R"(Configure bounded replay-state checkpoints for this capture.
+
+Checkpoints save resumable resource and device state, not rendered images. The controller proposes
+module boundaries from the capture's action/output structure; the backend validates safe positions.
+Unsupported states fall back to normal replay. Immutable source data may be shared between points.
+Disabling releases checkpoints. A forced :meth:`SetFrameEvent` bypasses checkpoints without
+discarding them, allowing an independent full-replay reference for validation.
+
+:param bool enabled: Enable automatic checkpoint construction and reuse.
+:param int byteBudget: Total checkpoint storage budget in bytes; zero chooses a capture-size budget.
+:param int maxCheckpoints: Maximum retained checkpoints; zero selects the automatic limit.
+)");
+  virtual void ConfigureReplayCheckpoints(bool enabled, uint64_t byteBudget = 0,
+                                           uint32_t maxCheckpoints = 0) = 0;
+
+  DOCUMENT(R"(Return checkpoint configuration, candidate boundaries and backend counters as JSON.
+
+The diagnostic schema is ``renderdoc-replay-checkpoints/v1``. A supported backend may still reject
+particular captures or boundaries; inspect its reason, build and hit counters. Reported allocation
+bytes cover the backend's checkpoint storage, not all replay resources or total process memory.
+
+:return: A JSON diagnostic object for the current replay driver.
+:rtype: str
+)");
+  virtual rdcstr GetReplayCheckpointStatus() = 0;
+
+  DOCUMENT(R"(Attempt one idle checkpoint-maintenance replay of the current effective event.
+
+This is optional maintenance for an idle replay thread. It only admits missing checkpoints already
+shown useful by automatic foreground measurements, or candidates explicitly enabled by the caller.
+Same-layout buffer value edits keep this admission history while invalidating native downstream
+versions. Global shader, buffer-layout and clear operations discard it; automatic maintenance then
+waits for new foreground cost evidence instead of assuming an old performance benefit survives.
+The expected event and both mutation generations must still match. The current event, cached pipeline
+state, output bindings and presented images are not republished or replaced by this operation.
+
+At most one normal current-event replay work unit is performed. It may build multiple native points
+on a backend with several safe boundaries. This call is synchronous and cannot preempt an executing
+native replay or GPU submission. A scheduler must give foreground work priority, cancel stale queued
+callbacks, and must not treat a time estimate as a hard execution deadline. Repeated calls for the
+same event, generations and checkpoint configuration do not repeat performed maintenance.
+
+:param int expectedEventId: Effective event returned by :meth:`GetCurrentEventID`.
+:param int expectedMutationGeneration: :meth:`GetShaderReplacementGeneration` for that event.
+:param int expectedBufferGeneration: :meth:`GetSharedBufferPatchGeneration` for the capture.
+:return: JSON receipt with schema ``renderdoc-replay-checkpoint-maintenance/v1``, performed/reason,
+         actual event/generations, checkpoint build/hit deltas and measured wall times.
+:rtype: str
+)");
+  virtual rdcstr RunIdleCheckpointMaintenance(uint32_t expectedEventId,
+                                             uint64_t expectedMutationGeneration,
+                                             uint64_t expectedBufferGeneration) = 0;
 
   DOCUMENT(R"(Configure a shader replacement that is applied only while replaying one action.
 
@@ -600,6 +681,47 @@ is removed and the returned string describes the failure.
 
   DOCUMENT(R"(Remove every event-scoped constant-buffer override from this replay controller.)");
   virtual void ClearEventCBufferOverrides() = 0;
+
+  DOCUMENT(R"(Persistently edit a byte range of a captured buffer for all replayed consumers.
+
+The identity is the captured buffer and absolute byte range, not the currently selected event or
+shader binding. Add a binding's base offset to a reflected member offset before calling. Original
+initial contents are preserved. Supported drivers reapply active edits after captured writes, and
+clearing an edit restores ordinary replay. This is separate from event-scoped temporary overrides.
+Overlapping edits use the most recently set range; clearing it reveals any earlier overlapping edit.
+Driver limitations are returned explicitly. An accepted change refreshes the current event.
+
+:param ResourceId buffer: The original captured buffer resource.
+:param int byteOffset: Absolute byte offset in that buffer.
+:param bytes data: New bytes for this exact range.
+:return: Empty on success, otherwise a diagnostic. A rejected configuration preserves prior edits.
+:rtype: str
+)");
+  virtual rdcstr SetSharedBufferPatch(ResourceId buffer, uint64_t byteOffset, bytebuf data) = 0;
+
+  DOCUMENT(R"(Remove the persistent edit identified by exactly this buffer, offset and length.
+
+:param ResourceId buffer: The original captured buffer resource.
+:param int byteOffset: Absolute byte offset used when setting the edit.
+:param int byteLength: Byte length used when setting the edit.
+:return: Empty on success, otherwise a diagnostic.
+:rtype: str
+)");
+  virtual rdcstr ClearSharedBufferPatch(ResourceId buffer, uint64_t byteOffset, uint64_t byteLength) = 0;
+
+  DOCUMENT(R"(Remove every persistent buffer edit and refresh the selected event.
+
+:return: Empty on success, otherwise a diagnostic.
+:rtype: str
+)");
+  virtual rdcstr ClearSharedBufferPatches() = 0;
+
+  DOCUMENT(R"(Return the generation of the accepted persistent buffer edit configuration.
+
+:return: Zero before the first edit, then a monotonically increasing generation.
+:rtype: int
+)");
+  virtual uint64_t GetSharedBufferPatchGeneration() = 0;
 
   DOCUMENT(R"(Sets the user-selected event ID, used to distinguish between selecting a MultiAction
 parent (where effectiveEID maps to the last child) and selecting the last child directly.
@@ -1278,6 +1400,98 @@ texture to something compatible with the target file format.
 :rtype: bytes
 )");
   virtual bytebuf GetTextureData(ResourceId tex, const Subresource &sub) = 0;
+
+  // Keep these analysis-only controller additions at the end of IReplayController's public vtable
+  // so older binary consumers retain their existing method slots.
+  DOCUMENT(R"(Temporarily replay the captured commands up to and including the given event without
+changing the controller's selected/current event, cached pipeline state, or any existing replay
+outputs.
+
+This is intended for short, serialised analysis operations that read a resource immediately after
+the call. The replay device is left at ``eventId``; callers must call
+:meth:`RestoreFrameEventAfterAnalysis` before returning control to unrelated replay work. Active
+event-scoped shader and constant-buffer overrides are applied identically to :meth:`SetFrameEvent`.
+
+:param int eventId: The :data:`eventId <APIEvent.eventId>` to replay to temporarily.
+)");
+  virtual void ReplayFrameEventForAnalysis(uint32_t eventId) = 0;
+
+  DOCUMENT(R"(Restore the replay device to the controller's effective current event after one or
+more calls to :meth:`ReplayFrameEventForAnalysis`.
+
+This does not change the selected/current event, cached pipeline state, or replay outputs.
+)");
+  virtual void RestoreFrameEventAfterAnalysis() = 0;
+
+  DOCUMENT(R"(Return the render-output mutation generation that can affect an event-history image.
+
+The method retains its historical shader-specific name for API compatibility. Passing ``0``
+returns the latest serial for any output-affecting replacement. Passing an event ID returns the
+latest global mutation serial or the latest event-scoped mutation serial for that effective event,
+whichever is newer. Global shader, texture, buffer, and other resource replacements invalidate all
+events. Event-scoped shader and constant-buffer replacements invalidate their effective event. The
+value changes for replacement install, supersede, removal, and rollback, but not for unrelated
+replay or UI activity.
+
+Callers can compare the ``0`` value first to avoid checking individual events when render output
+has not been mutated. If it differs, compare each cached event's value to invalidate only affected
+event-scoped entries; global replacements conservatively invalidate every event.
+
+:param int eventId: ``0`` for the overall mutation serial, otherwise the event to query.
+:return: The current render-output mutation generation.
+:rtype: int
+)");
+  virtual uint64_t GetShaderReplacementGeneration(uint32_t eventId) = 0;
+
+  DOCUMENT(R"(Resolve a texture at an earlier event into a persistent replay-owned snapshot.
+
+The first call for an event, source texture, subresource, and type cast replays that event and
+captures the selected subresource. Later calls return the same snapshot without replaying until a
+shader, constant-buffer, or resource replacement can change its rendered contents. The returned
+display preserves presentation controls from ``source`` but refers to a replay-owned snapshot.
+Native snapshots can preserve the source format and topology; the portable fallback is a
+single-mip, single-slice RGBA32 texture.
+
+This helper is intended for presentation-only history operations such as display, pixel picking,
+histograms and range fitting. Event-derived overlays, YUV decoding, and custom display shaders are
+not resolved by this helper.
+
+:param int eventId: The :data:`eventId <APIEvent.eventId>` to capture.
+:param TextureDisplay source: The source texture and selected subresource.
+:param TextureDisplay snapshot: The display configuration rewritten to refer to the snapshot.
+:return: ``True`` if ``snapshot`` can be used without temporarily replaying ``eventId``.
+:rtype: bool
+)");
+  virtual bool ResolveEventTextureSnapshot(uint32_t eventId, const TextureDisplay &source,
+                                           TextureDisplay &snapshot) = 0;
+
+  DOCUMENT(R"(Replay an event for interactive scrubbing (dragging the event slider or holding an
+arrow key).
+
+This executes the canonical replay sequence on the actual replay device, including event-scoped
+shader and constant-buffer overrides. It does not use cached event images or present output windows.
+Pipeline-state fetching is completed by :meth:`CommitScrubFrameEvent`.
+
+Call :meth:`CommitScrubFrameEvent` after each completed scrub replay, update viewer resource bindings
+from the resulting pipeline state, then display the outputs. This keeps the image and panels at the
+same actual event throughout interaction without first presenting the previous event's bindings.
+
+:param int eventId: The :data:`eventId <APIEvent.eventId>` to move to. Event remapping is applied
+  as in :meth:`SetFrameEvent`.
+)");
+  virtual void ScrubFrameEvent(uint32_t eventId) = 0;
+
+  DOCUMENT(R"(Publish pipeline state for a completed interactive scrub replay.
+
+If the actual device still contains the requested scrub event, this fetches its current pipeline
+state without repeating the replay. If another operation invalidated that state, or no scrub replay
+was issued, this first replays the requested event. It never publishes a cached pipeline state from a
+previous visit. Output windows are presented by the caller after updating their resource bindings.
+
+:param int eventId: The :data:`eventId <APIEvent.eventId>` to commit. Event remapping is applied as
+  in :meth:`SetFrameEvent`.
+)");
+  virtual void CommitScrubFrameEvent(uint32_t eventId) = 0;
 
   static const uint32_t NoPreference = ~0U;
 

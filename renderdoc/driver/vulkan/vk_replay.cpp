@@ -80,7 +80,34 @@ VulkanResourceManager *VulkanReplay::GetResourceManager()
 
 void VulkanReplay::Shutdown()
 {
+  m_pDriver->InvalidateReplayCheckpoints();
+  if(!m_pDriver->m_ReplayBufferPatches.empty())
+  {
+    m_pDriver->SubmitCmds();
+    m_pDriver->FlushQ();
+    m_pDriver->DestroyReplayBufferPatches();
+  }
   SAFE_DELETE(m_RGP);
+
+  if(!m_TextureSnapshots.empty())
+  {
+    // Snapshot copies are submitted asynchronously. Drain them once at teardown before releasing
+    // their replay-owned image memory; ordinary display never waits on the CPU.
+    m_pDriver->SubmitCmds();
+    m_pDriver->FlushQ();
+    for(TextureSnapshot &snapshot : m_TextureSnapshots)
+    {
+      DestroyTextureSnapshotViews(snapshot.id);
+      if(snapshot.image != VK_NULL_HANDLE)
+      {
+        m_pDriver->EraseImageState(snapshot.id);
+        m_pDriver->vkDestroyImage(m_pDriver->GetDev(), snapshot.image, NULL);
+      }
+      if(snapshot.memory != VK_NULL_HANDLE)
+        m_pDriver->vkFreeMemory(m_pDriver->GetDev(), snapshot.memory, NULL);
+    }
+    m_TextureSnapshots.clear();
+  }
 
   m_pDriver->Shutdown();
   delete m_pDriver;
@@ -209,7 +236,33 @@ void VulkanReplay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
     if(replayed)
       return;
   }
-  m_pDriver->ReplayLog(0, endEventID, replayType);
+  m_pDriver->ReplayLog(0, endEventID, replayType, true);
+}
+
+rdcstr VulkanReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
+{
+  return m_pDriver->SetReplayBufferPatches(patches);
+}
+
+uint32_t VulkanReplay::GetReplayBufferPatchFirstAffectedEvent() const
+{
+  return m_pDriver->m_ReplayPatchFirstAffectedEvent;
+}
+
+void VulkanReplay::ConfigureReplayCheckpoints(
+    const ReplayCheckpointConfig &config, const rdcarray<ReplayCheckpointCandidate> &candidates)
+{
+  m_pDriver->ConfigureReplayCheckpoints(config, candidates);
+}
+
+void VulkanReplay::InvalidateReplayCheckpoints(uint32_t firstAffectedEvent)
+{
+  m_pDriver->InvalidateReplayCheckpoints(firstAffectedEvent);
+}
+
+ReplayCheckpointStats VulkanReplay::GetReplayCheckpointStats()
+{
+  return m_pDriver->GetReplayCheckpointStats();
 }
 
 SDFile *VulkanReplay::GetStructuredFile()
@@ -4035,7 +4088,9 @@ bool VulkanReplay::GetHistogram(ResourceId texid, const Subresource &sub, CompTy
 rdcarray<EventUsage> VulkanReplay::GetUsage(ResourceId id)
 {
   if(m_pDriver->m_CreationInfo.m_Image.find(id) == m_pDriver->m_CreationInfo.m_Image.end() &&
-     m_pDriver->m_CreationInfo.m_Buffer.find(id) == m_pDriver->m_CreationInfo.m_Buffer.end())
+     m_pDriver->m_CreationInfo.m_Buffer.find(id) == m_pDriver->m_CreationInfo.m_Buffer.end() &&
+     m_pDriver->m_CreationInfo.m_ShaderModule.find(id) ==
+         m_pDriver->m_CreationInfo.m_ShaderModule.end())
   {
     return {EventUsage(0, ResourceUsage::Unused)};
   }
@@ -5253,6 +5308,139 @@ void VulkanReplay::RemoveReplacement(ResourceId id)
   }
 }
 
+static rdcstr ValidateVulkanShaderReplacementModule(
+    const VulkanCreationInfo::ShaderModule &original,
+    const VulkanCreationInfo::ShaderModule &replacement)
+{
+  const rdcarray<ShaderEntryPoint> originalEntries = original.spirv.EntryPoints();
+  const rdcarray<ShaderEntryPoint> replacementEntries = replacement.spirv.EntryPoints();
+
+  // A resource-scoped replacement must prove every executable identity carried by the module.
+  // Until the ABI gate can validate each entry independently, accept only a single-entry module.
+  // This also prevents a conventional graphics/compute edit from silently changing a Ray/SBT use.
+  if(originalEntries.size() != 1 || replacementEntries.size() != 1)
+    return "Checked Vulkan replacement currently requires single-entry SPIR-V modules";
+
+  if(originalEntries[0].stage >= ShaderStage::RayGen ||
+     replacementEntries[0].stage >= ShaderStage::RayGen)
+    return "Vulkan Ray/SBT shaders require a dedicated ray-pipeline replacement transaction";
+
+  if(originalEntries[0].stage != replacementEntries[0].stage ||
+     originalEntries[0].name != replacementEntries[0].name)
+    return StringFormat::Fmt(
+        "Replacement SPIR-V entry %s/%s does not match captured entry %s/%s",
+        replacementEntries[0].name.c_str(), ToStr(replacementEntries[0].stage).c_str(),
+        originalEntries[0].name.c_str(), ToStr(originalEntries[0].stage).c_str());
+
+  return {};
+}
+
+rdcstr VulkanReplay::ReplaceTargetShaderChecked(ResourceId from, ResourceId to)
+{
+  VulkanResourceManager *rm = m_pDriver->GetResourceManager();
+
+  if(from == ResourceId() || to == ResourceId() || from == to)
+    return "Checked Vulkan replacement requires distinct non-null shader resources";
+  if(rm->GetUnreplacedID(from) != from)
+    return "The original Vulkan shader must be the canonical captured ResourceId";
+  if(!rm->HasResource(from) || !rm->HasResource(to))
+    return "The original or target Vulkan shader is no longer live";
+
+  auto originalModule = m_pDriver->m_CreationInfo.m_ShaderModule.find(from);
+  auto targetModule = m_pDriver->m_CreationInfo.m_ShaderModule.find(to);
+  if(originalModule == m_pDriver->m_CreationInfo.m_ShaderModule.end() ||
+     targetModule == m_pDriver->m_CreationInfo.m_ShaderModule.end())
+    return "Checked Vulkan replacement requires captured and target SPIR-V modules";
+
+  rdcstr identityError =
+      ValidateVulkanShaderReplacementModule(originalModule->second, targetModule->second);
+  if(!identityError.empty())
+    return identityError;
+
+  const bool hadPrevious = rm->HasReplacement(from);
+  ResourceId previousId;
+  if(hadPrevious)
+  {
+    WrappedVkRes *previous = rm->GetResource(from, true);
+    previousId = rm->GetID(previous);
+    if(previousId == ResourceId() || previousId == from || rm->GetUnreplacedID(previousId) != from)
+      return "The captured Vulkan shader has an invalid or multiply-owned replacement target";
+    if(previousId == to)
+      return {};
+  }
+  if(rm->GetUnreplacedID(to) != to || rm->HasReplacement(to))
+    return "The target Vulkan shader is already owned by another replacement";
+
+  // Shader objects are bound directly and have no derived VkPipeline to rebuild. Convert the
+  // target module to a matching VkShaderEXT before changing the mapping.
+  ResourceId replacementId = to;
+  const bool shaderObject =
+      m_pDriver->m_CreationInfo.m_ShaderObject.find(from) !=
+      m_pDriver->m_CreationInfo.m_ShaderObject.end();
+  if(shaderObject)
+  {
+    ModifyReplacementIfShaderEXT(from, replacementId);
+    if(replacementId == ResourceId() || !rm->HasResource(replacementId))
+      return "Creating the checked Vulkan shader-object replacement failed";
+  }
+
+  if(hadPrevious)
+    rm->RemoveReplacement(from);
+  rm->ReplaceResource(from, replacementId);
+
+  rdcstr error;
+  if(!shaderObject)
+    error = RefreshDerivedReplacementsChecked(from);
+  if(!error.empty())
+  {
+    rm->RemoveReplacement(from);
+    if(hadPrevious)
+      rm->ReplaceResource(from, previousId);
+    return error;
+  }
+
+  ClearPostVSCache();
+  ClearFeedbackCache();
+  return {};
+}
+
+rdcstr VulkanReplay::RemoveTargetShaderReplacementChecked(ResourceId id)
+{
+  VulkanResourceManager *rm = m_pDriver->GetResourceManager();
+
+  if(id == ResourceId() || rm->GetUnreplacedID(id) != id)
+    return "The Vulkan shader to restore must be a canonical captured ResourceId";
+  if(!rm->HasReplacement(id))
+    return {};
+
+  auto originalModule = m_pDriver->m_CreationInfo.m_ShaderModule.find(id);
+  if(originalModule == m_pDriver->m_CreationInfo.m_ShaderModule.end())
+    return "Checked Vulkan rollback requires a captured SPIR-V module";
+
+  WrappedVkRes *previous = rm->GetResource(id, true);
+  ResourceId previousId = rm->GetID(previous);
+  if(previousId == ResourceId() || previousId == id || rm->GetUnreplacedID(previousId) != id)
+    return "The captured Vulkan shader has an invalid replacement target";
+
+  const bool shaderObject =
+      m_pDriver->m_CreationInfo.m_ShaderObject.find(id) !=
+      m_pDriver->m_CreationInfo.m_ShaderObject.end();
+
+  rm->RemoveReplacement(id);
+  rdcstr error;
+  if(!shaderObject)
+    error = RefreshDerivedReplacementsChecked(id);
+  if(!error.empty())
+  {
+    rm->ReplaceResource(id, previousId);
+    return error;
+  }
+
+  ClearPostVSCache();
+  ClearFeedbackCache();
+  return {};
+}
+
 void VulkanReplay::RefreshDerivedReplacements()
 {
   VkDevice dev = m_pDriver->GetDev();
@@ -5435,6 +5623,241 @@ void VulkanReplay::RefreshDerivedReplacements()
     m_pDriver->vkDestroyPipeline(dev, pipe, NULL);
 }
 
+rdcstr VulkanReplay::RefreshDerivedReplacementsChecked(ResourceId requiredShader)
+{
+  VkDevice dev = m_pDriver->GetDev();
+  VulkanResourceManager *rm = m_pDriver->GetResourceManager();
+
+  struct PendingPipeline
+  {
+    ResourceId original;
+    VkPipeline previous = VK_NULL_HANDLE;
+    VkPipeline replacement = VK_NULL_HANDLE;
+    bool hadPrevious = false;
+  };
+
+  rdcarray<PendingPipeline> pending;
+  auto discardPending = [&]() {
+    for(PendingPipeline &item : pending)
+      if(item.replacement != VK_NULL_HANDLE)
+        m_pDriver->vkDestroyPipeline(dev, item.replacement, NULL);
+    pending.clear();
+  };
+
+  // Pipeline creation registers replay-only objects. Copy the captured IDs first so insertion into
+  // the creation-info map cannot invalidate this transaction's traversal.
+  rdcarray<ResourceId> capturedPipelines;
+  for(const auto &it : m_pDriver->m_CreationInfo.m_Pipeline)
+    if(!ResourceIDGen::IsReplayOnlyID(it.first))
+      capturedPipelines.push_back(it.first);
+
+  uint32_t requiredUses = 0;
+  for(ResourceId pipesrcid : capturedPipelines)
+  {
+    auto creationIt = m_pDriver->m_CreationInfo.m_Pipeline.find(pipesrcid);
+    if(creationIt == m_pDriver->m_CreationInfo.m_Pipeline.end())
+    {
+      discardPending();
+      return StringFormat::Fmt("Captured Vulkan pipeline %s disappeared during checked rebuild",
+                               ToStr(pipesrcid).c_str());
+    }
+
+    const VulkanCreationInfo::Pipeline &pipeInfo = creationIt->second;
+    bool usesRequiredShader = false;
+    bool usesReplacedShader = false;
+    for(size_t stageIndex = 0; stageIndex < ARRAY_COUNT(pipeInfo.shaders); stageIndex++)
+    {
+      ResourceId shaderId = pipeInfo.shaders[stageIndex].module;
+      usesRequiredShader |= shaderId == requiredShader;
+      usesReplacedShader |= shaderId != ResourceId() && rm->HasReplacement(shaderId);
+    }
+
+    if(usesRequiredShader)
+      requiredUses++;
+
+    if(pipeInfo.graphicsPipe)
+    {
+      const VkGraphicsPipelineLibraryFlagsEXT complete =
+          VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT |
+          VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
+          VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT |
+          VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
+      if((pipeInfo.availStages & complete) != complete)
+      {
+        if(usesRequiredShader)
+        {
+          discardPending();
+          return StringFormat::Fmt(
+              "Vulkan shader %s is referenced by incomplete graphics pipeline library %s",
+              ToStr(requiredShader).c_str(), ToStr(pipesrcid).c_str());
+        }
+        continue;
+      }
+    }
+    else if(pipeInfo.shaders[5].module == ResourceId())
+    {
+      // Ray pipelines are not reconstructible through MakeComputePipelineInfo. A single-entry
+      // ray module is rejected before this helper, and any unrelated ray pipeline is left intact.
+      continue;
+    }
+
+    PendingPipeline item;
+    item.original = pipesrcid;
+    item.hadPrevious = rm->HasReplacement(pipesrcid);
+    if(item.hadPrevious)
+    {
+      item.previous = rm->GetHandle<VkPipeline>(pipesrcid);
+      ResourceId previousId = GetResID(item.previous);
+      if(previousId == ResourceId() || previousId == pipesrcid ||
+         rm->GetUnreplacedID(previousId) != pipesrcid)
+      {
+        discardPending();
+        return StringFormat::Fmt(
+            "Captured Vulkan pipeline %s has an invalid or multiply-owned replacement",
+            ToStr(pipesrcid).c_str());
+      }
+    }
+
+    if(!usesReplacedShader)
+    {
+      if(item.hadPrevious)
+        pending.push_back(item);
+      continue;
+    }
+
+    if(pipeInfo.graphicsPipe)
+    {
+      VkGraphicsPipelineCreateInfo createInfo;
+      m_pDriver->GetShaderCache()->MakeGraphicsPipelineInfo(createInfo, pipesrcid);
+
+      for(uint32_t stageIndex = 0; stageIndex < createInfo.stageCount; stageIndex++)
+      {
+        VkPipelineShaderStageCreateInfo &stage =
+            (VkPipelineShaderStageCreateInfo &)createInfo.pStages[stageIndex];
+        ResourceId shaderId = pipeInfo.shaders[StageIndex(stage.stage)].module;
+        stage.module = rm->GetHandle<VkShaderModule>(shaderId);
+        if(stage.module == VK_NULL_HANDLE)
+        {
+          discardPending();
+          return StringFormat::Fmt("Vulkan pipeline %s resolved a missing replacement module",
+                                   ToStr(pipesrcid).c_str());
+        }
+
+        if(rm->HasReplacement(shaderId))
+        {
+          ResourceId targetId = GetResID(stage.module);
+          auto targetModule = m_pDriver->m_CreationInfo.m_ShaderModule.find(targetId);
+          if(targetModule == m_pDriver->m_CreationInfo.m_ShaderModule.end() ||
+             !targetModule->second.spirv.EntryPoints().contains(
+                 {stage.pName, ShaderStage(StageIndex(stage.stage))}))
+          {
+            discardPending();
+            return StringFormat::Fmt(
+                "Vulkan pipeline %s cannot resolve exact replacement entry %s/%s",
+                ToStr(pipesrcid).c_str(), stage.pName,
+                ToStr(ShaderStage(StageIndex(stage.stage))).c_str());
+          }
+        }
+      }
+
+      if(m_pDriver->GetExtensions(NULL).ext_KHR_pipeline_executable_properties)
+      {
+        uint64_t flags = GetPipelineCreateFlags(&createInfo);
+        flags |= (VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
+                  VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
+        SetPipelineCreateFlags(&createInfo, flags);
+      }
+
+      VkResult vkr = m_pDriver->vkCreateGraphicsPipelines(
+          dev, VK_NULL_HANDLE, 1, &createInfo, NULL, &item.replacement);
+      if(vkr != VK_SUCCESS || item.replacement == VK_NULL_HANDLE)
+      {
+        if(item.replacement != VK_NULL_HANDLE)
+          m_pDriver->vkDestroyPipeline(dev, item.replacement, NULL);
+        discardPending();
+        return StringFormat::Fmt("Rebuilding Vulkan graphics pipeline %s failed: %s",
+                                 ToStr(pipesrcid).c_str(), ToStr(vkr).c_str());
+      }
+    }
+    else
+    {
+      VkComputePipelineCreateInfo createInfo;
+      m_pDriver->GetShaderCache()->MakeComputePipelineInfo(createInfo, pipesrcid);
+      ResourceId shaderId = pipeInfo.shaders[5].module;
+      createInfo.stage.module = rm->GetHandle<VkShaderModule>(shaderId);
+      if(createInfo.stage.module == VK_NULL_HANDLE)
+      {
+        discardPending();
+        return StringFormat::Fmt("Vulkan compute pipeline %s resolved a missing module",
+                                 ToStr(pipesrcid).c_str());
+      }
+      if(rm->HasReplacement(shaderId))
+      {
+        ResourceId targetId = GetResID(createInfo.stage.module);
+        auto targetModule = m_pDriver->m_CreationInfo.m_ShaderModule.find(targetId);
+        if(targetModule == m_pDriver->m_CreationInfo.m_ShaderModule.end() ||
+           !targetModule->second.spirv.EntryPoints().contains(
+               {createInfo.stage.pName, ShaderStage::Compute}))
+        {
+          discardPending();
+          return StringFormat::Fmt(
+              "Vulkan compute pipeline %s cannot resolve exact replacement entry %s",
+              ToStr(pipesrcid).c_str(), createInfo.stage.pName);
+        }
+      }
+
+      if(m_pDriver->GetExtensions(NULL).ext_KHR_pipeline_executable_properties)
+      {
+        uint64_t flags = GetPipelineCreateFlags(&createInfo);
+        flags |= (VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR |
+                  VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR);
+        SetPipelineCreateFlags(&createInfo, flags);
+      }
+
+      VkResult vkr = m_pDriver->vkCreateComputePipelines(
+          dev, VK_NULL_HANDLE, 1, &createInfo, NULL, &item.replacement);
+      if(vkr != VK_SUCCESS || item.replacement == VK_NULL_HANDLE)
+      {
+        if(item.replacement != VK_NULL_HANDLE)
+          m_pDriver->vkDestroyPipeline(dev, item.replacement, NULL);
+        discardPending();
+        return StringFormat::Fmt("Rebuilding Vulkan compute pipeline %s failed: %s",
+                                 ToStr(pipesrcid).c_str(), ToStr(vkr).c_str());
+      }
+    }
+
+    pending.push_back(item);
+  }
+
+  if(requiredShader != ResourceId() && requiredUses == 0)
+  {
+    discardPending();
+    return "The captured Vulkan shader is not referenced by a captured graphics/compute pipeline";
+  }
+
+  VkResult idle = m_pDriver->vkDeviceWaitIdle(dev);
+  if(idle != VK_SUCCESS)
+  {
+    discardPending();
+    return StringFormat::Fmt("Waiting for Vulkan pipeline replacement safety failed: %s",
+                             ToStr(idle).c_str());
+  }
+
+  for(PendingPipeline &item : pending)
+  {
+    if(item.hadPrevious)
+      rm->RemoveReplacement(item.original);
+    if(item.replacement != VK_NULL_HANDLE)
+      rm->ReplaceResource(item.original, GetResID(item.replacement));
+  }
+
+  for(PendingPipeline &item : pending)
+    if(item.previous != VK_NULL_HANDLE)
+      m_pDriver->vkDestroyPipeline(dev, item.previous, NULL);
+
+  return {};
+}
+
 void VulkanReplay::ModifyReplacementIfShaderEXT(ResourceId from, ResourceId &to)
 {
   // identify whether the original resource is a shader object
@@ -5498,6 +5921,318 @@ ResourceId VulkanReplay::CreateProxyTexture(const TextureDescription &templateTe
 {
   VULKANNOTIMP("CreateProxyTexture");
   return ResourceId();
+}
+
+ResourceId VulkanReplay::CreateTextureSnapshot(ResourceId source, const Subresource &sourceSub,
+                                               CompType typeCast, Subresource &snapshotSub)
+{
+  VulkanResourceManager *resourceManager = m_pDriver->GetResourceManager();
+  const VkImage sourceImage = resourceManager->GetHandle<VkImage>(source);
+  if(sourceImage == VK_NULL_HANDLE)
+    return ResourceId();
+
+  // GetHandle follows ResourceManager replacements, just like normal Vulkan texture display.
+  // Metadata, tracked layout, and the copied handle must all use that same resolved identity; using
+  // original metadata with a replacement handle can produce invalid subresources/barriers.
+  const ResourceId resolvedSource = GetResID(sourceImage);
+  auto infoIt = m_pDriver->m_CreationInfo.m_Image.find(resolvedSource);
+  if(infoIt == m_pDriver->m_CreationInfo.m_Image.end())
+    return ResourceId();
+
+  const VulkanCreationInfo::Image &sourceInfo = infoIt->second;
+  if(sourceInfo.samples != VK_SAMPLE_COUNT_1_BIT || sourceInfo.linear || sourceInfo.external ||
+     sourceInfo.sparse || sourceInfo.mipLevels == 0 || sourceInfo.arrayLayers == 0)
+    return ResourceId();
+
+  const VkImageAspectFlags aspects = FormatImageAspects(sourceInfo.format);
+  if(aspects & (VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT |
+                VK_IMAGE_ASPECT_PLANE_2_BIT))
+    return ResourceId();
+
+  {
+    LockedConstImageStateRef sourceState = m_pDriver->FindConstImageState(resolvedSource);
+    if(!sourceState || !sourceState->isMemoryBound)
+      return ResourceId();
+  }
+
+  const uint32_t mip = RDCMIN(sourceSub.mip, sourceInfo.mipLevels - 1);
+  const bool is3D = sourceInfo.type == VK_IMAGE_TYPE_3D;
+  const uint32_t sourceLayer = is3D ? 0 : RDCMIN(sourceSub.slice, sourceInfo.arrayLayers - 1);
+  const VkFormat castFormat = GetViewCastedFormat(sourceInfo.format, typeCast);
+  const bool mutableFormat = castFormat != sourceInfo.format;
+  if(mutableFormat &&
+     (IsDepthOrStencilFormat(sourceInfo.format) || IsDepthOrStencilFormat(castFormat) ||
+      IsYUVFormat(sourceInfo.format) || IsYUVFormat(castFormat) ||
+      GetByteSize(1, 1, 1, sourceInfo.format, 0) != GetByteSize(1, 1, 1, castFormat, 0)))
+    return ResourceId();
+
+  VkImageCreateInfo createInfo = {
+      VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      NULL,
+      m_pDriver->DefaultImageCreateFlags() |
+          (mutableFormat ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0),
+      sourceInfo.type,
+      sourceInfo.format,
+      {RDCMAX(1U, sourceInfo.extent.width >> mip),
+       RDCMAX(1U, sourceInfo.extent.height >> mip),
+       is3D ? RDCMAX(1U, sourceInfo.extent.depth >> mip) : 1U},
+      1,
+      1,
+      VK_SAMPLE_COUNT_1_BIT,
+      VK_IMAGE_TILING_OPTIMAL,
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+          VK_IMAGE_USAGE_SAMPLED_BIT,
+      VK_SHARING_MODE_EXCLUSIVE,
+      0,
+      NULL,
+      VK_IMAGE_LAYOUT_UNDEFINED,
+  };
+
+  VkImage snapshotImage = VK_NULL_HANDLE;
+  VkResult vkr =
+      m_pDriver->vkCreateImage(m_pDriver->GetDev(), &createInfo, NULL, &snapshotImage);
+  CHECK_VKR(m_pDriver, vkr);
+  if(vkr != VK_SUCCESS || snapshotImage == VK_NULL_HANDLE)
+    return ResourceId();
+  const ResourceId snapshotId = GetResID(snapshotImage);
+
+  VkMemoryRequirements requirements = {};
+  m_pDriver->vkGetImageMemoryRequirements(m_pDriver->GetDev(), snapshotImage, &requirements);
+
+  VkMemoryAllocateInfo allocInfo = {
+      VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      NULL,
+      requirements.size,
+      m_pDriver->GetGPULocalMemoryIndex(requirements.memoryTypeBits),
+  };
+
+  VkDeviceMemory snapshotMemory = VK_NULL_HANDLE;
+  vkr = m_pDriver->vkAllocateMemory(m_pDriver->GetDev(), &allocInfo, NULL, &snapshotMemory);
+  CHECK_VKR(m_pDriver, vkr);
+  if(vkr != VK_SUCCESS || snapshotMemory == VK_NULL_HANDLE)
+  {
+    m_pDriver->EraseImageState(snapshotId);
+    m_pDriver->vkDestroyImage(m_pDriver->GetDev(), snapshotImage, NULL);
+    m_pDriver->m_CreationInfo.m_Image.erase(snapshotId);
+    return ResourceId();
+  }
+
+  vkr = m_pDriver->vkBindImageMemory(m_pDriver->GetDev(), snapshotImage, snapshotMemory, 0);
+  CHECK_VKR(m_pDriver, vkr);
+  if(vkr != VK_SUCCESS)
+  {
+    m_pDriver->EraseImageState(snapshotId);
+    m_pDriver->vkDestroyImage(m_pDriver->GetDev(), snapshotImage, NULL);
+    m_pDriver->vkFreeMemory(m_pDriver->GetDev(), snapshotMemory, NULL);
+    m_pDriver->m_CreationInfo.m_Image.erase(snapshotId);
+    return ResourceId();
+  }
+
+  if(mutableFormat)
+  {
+    VkImageViewCreateInfo testViewInfo = {
+        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        NULL,
+        0,
+        Unwrap(snapshotImage),
+        sourceInfo.type == VK_IMAGE_TYPE_1D
+            ? VK_IMAGE_VIEW_TYPE_1D_ARRAY
+            : (sourceInfo.type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D
+                                                   : VK_IMAGE_VIEW_TYPE_2D_ARRAY),
+        castFormat,
+        {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+    };
+    VkImageView testView = VK_NULL_HANDLE;
+    vkr = ObjDisp(m_pDriver->GetDev())
+              ->CreateImageView(Unwrap(m_pDriver->GetDev()), &testViewInfo, NULL, &testView);
+    if(vkr != VK_SUCCESS || testView == VK_NULL_HANDLE)
+    {
+      m_pDriver->EraseImageState(snapshotId);
+      m_pDriver->vkDestroyImage(m_pDriver->GetDev(), snapshotImage, NULL);
+      m_pDriver->vkFreeMemory(m_pDriver->GetDev(), snapshotMemory, NULL);
+      m_pDriver->m_CreationInfo.m_Image.erase(snapshotId);
+      return ResourceId();
+    }
+    ObjDisp(m_pDriver->GetDev())
+        ->DestroyImageView(Unwrap(m_pDriver->GetDev()), testView, NULL);
+  }
+
+  // Register ownership before recording. The failure path below drops the state locks, resets the
+  // unsubmitted command buffer, and then removes this entry before destroying the image.
+  m_TextureSnapshots.push_back({snapshotId, snapshotImage, snapshotMemory});
+  ImageBarrierSequence sourceCleanup;
+  VkCommandBuffer snapshotCmd = VK_NULL_HANDLE;
+  const bool recorded = [&]() {
+    LockedConstImageStateRef sourceState = m_pDriver->FindConstImageState(resolvedSource);
+    LockedImageStateRef snapshotState = m_pDriver->FindImageState(snapshotId);
+    if(!sourceState || !sourceState->isMemoryBound || !snapshotState ||
+       !snapshotState->isMemoryBound)
+      return false;
+
+    snapshotCmd = m_pDriver->GetNextCmd();
+    if(snapshotCmd == VK_NULL_HANDLE)
+    {
+      m_pDriver->RemovePendingCommandBuffer(snapshotCmd);
+      return false;
+    }
+
+    const VkDevDispatchTable *vt = ObjDisp(m_pDriver->GetDev());
+    VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL,
+                                          VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    vkr = vt->BeginCommandBuffer(Unwrap(snapshotCmd), &beginInfo);
+    CHECK_VKR(m_pDriver, vkr);
+    if(vkr != VK_SUCCESS)
+      return false;
+
+    ImageBarrierSequence sourceSetup;
+    sourceState->TempTransition(m_pDriver->m_QueueFamilyIdx, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_ACCESS_TRANSFER_READ_BIT, sourceSetup, sourceCleanup,
+                                m_pDriver->GetImageTransitionInfo());
+    m_pDriver->InlineSetupImageBarriers(snapshotCmd, sourceSetup);
+    m_pDriver->SubmitAndFlushImageStateBarriers(sourceSetup);
+
+    snapshotState->InlineTransition(snapshotCmd, m_pDriver->m_QueueFamilyIdx,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                                    m_pDriver->GetImageTransitionInfo());
+
+    rdcarray<VkImageCopy> regions;
+    for(auto aspectIt = ImageAspectFlagIter::begin(aspects);
+        aspectIt != ImageAspectFlagIter::end(); ++aspectIt)
+    {
+      const VkImageAspectFlags aspect = (VkImageAspectFlags)*aspectIt;
+      VkImageCopy region = {
+          {aspect, mip, sourceLayer, 1},
+          {0, 0, 0},
+          {aspect, 0, 0, 1},
+          {0, 0, 0},
+          createInfo.extent,
+      };
+      regions.push_back(region);
+    }
+
+    vt->CmdCopyImage(Unwrap(snapshotCmd), Unwrap(sourceImage),
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, Unwrap(snapshotImage),
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (uint32_t)regions.size(),
+                     regions.data());
+
+    const VkImageLayout readyLayout =
+        aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+            ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    snapshotState->InlineTransition(snapshotCmd, m_pDriver->m_QueueFamilyIdx, readyLayout,
+                                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                    m_pDriver->GetImageTransitionInfo());
+    m_pDriver->InlineCleanupImageBarriers(snapshotCmd, sourceCleanup);
+
+    vkr = vt->EndCommandBuffer(Unwrap(snapshotCmd));
+    CHECK_VKR(m_pDriver, vkr);
+    return vkr == VK_SUCCESS;
+  }();
+
+  if(!recorded)
+  {
+    if(snapshotCmd != VK_NULL_HANDLE)
+    {
+      ObjDisp(snapshotCmd)->ResetCommandBuffer(Unwrap(snapshotCmd), 0);
+      m_pDriver->RemovePendingCommandBuffer(snapshotCmd);
+      m_pDriver->AddFreeCommandBuffer(snapshotCmd);
+    }
+    for(size_t snapshotIndex = 0; snapshotIndex < m_TextureSnapshots.size(); snapshotIndex++)
+    {
+      if(m_TextureSnapshots[snapshotIndex].id == snapshotId)
+      {
+        m_TextureSnapshots.erase(snapshotIndex);
+        break;
+      }
+    }
+    DestroyTextureSnapshotViews(snapshotId);
+    m_pDriver->EraseImageState(snapshotId);
+    m_pDriver->vkDestroyImage(m_pDriver->GetDev(), snapshotImage, NULL);
+    m_pDriver->vkFreeMemory(m_pDriver->GetDev(), snapshotMemory, NULL);
+    m_pDriver->m_CreationInfo.m_Image.erase(snapshotId);
+    return ResourceId();
+  }
+
+  m_pDriver->SubmitCmds();
+  if(!sourceCleanup.empty())
+  {
+    m_pDriver->FlushQ();
+    m_pDriver->SubmitAndFlushImageStateBarriers(sourceCleanup);
+  }
+
+  NameVulkanObject(snapshotImage, "RenderDoc GPU event texture snapshot");
+
+  snapshotSub = Subresource();
+  if(is3D)
+    snapshotSub.slice = RDCMIN(sourceSub.slice, createInfo.extent.depth - 1);
+  return snapshotId;
+}
+
+void VulkanReplay::FreeTextureSnapshot(ResourceId snapshot)
+{
+  rdcarray<ResourceId> snapshots;
+  snapshots.push_back(snapshot);
+  FreeTextureSnapshots(snapshots);
+}
+
+void VulkanReplay::DestroyTextureSnapshotViews(ResourceId snapshot)
+{
+  auto viewIt = m_TexRender.TextureViews.find(snapshot);
+  if(viewIt == m_TexRender.TextureViews.end())
+    return;
+
+  for(VkImageView &view : viewIt->second.views)
+  {
+    if(view != VK_NULL_HANDLE)
+      m_pDriver->vkDestroyImageView(m_pDriver->GetDev(), view, NULL);
+    view = VK_NULL_HANDLE;
+  }
+  m_TexRender.TextureViews.erase(viewIt);
+}
+
+void VulkanReplay::FreeTextureSnapshots(const rdcarray<ResourceId> &snapshots)
+{
+  bool ownedSnapshot = false;
+  for(ResourceId snapshot : snapshots)
+  {
+    for(const TextureSnapshot &owned : m_TextureSnapshots)
+      ownedSnapshot |= owned.id == snapshot;
+    if(ownedSnapshot)
+      break;
+  }
+
+  if(!ownedSnapshot)
+    return;
+
+  // Submit any display commands that still reference the images, then wait once before explicit
+  // Vulkan destruction of the whole LRU batch.
+  m_pDriver->SubmitCmds();
+  m_pDriver->FlushQ();
+
+  for(ResourceId snapshot : snapshots)
+  {
+    for(size_t snapshotIndex = 0; snapshotIndex < m_TextureSnapshots.size(); snapshotIndex++)
+    {
+      if(m_TextureSnapshots[snapshotIndex].id != snapshot)
+        continue;
+
+      TextureSnapshot owned = m_TextureSnapshots[snapshotIndex];
+      m_TextureSnapshots.erase(snapshotIndex);
+      DestroyTextureSnapshotViews(snapshot);
+      if(owned.image != VK_NULL_HANDLE)
+      {
+        m_pDriver->EraseImageState(snapshot);
+        m_pDriver->vkDestroyImage(m_pDriver->GetDev(), owned.image, NULL);
+      }
+      if(owned.memory != VK_NULL_HANDLE)
+        m_pDriver->vkFreeMemory(m_pDriver->GetDev(), owned.memory, NULL);
+      m_pDriver->m_CreationInfo.m_Image.erase(snapshot);
+      break;
+    }
+  }
 }
 
 void VulkanReplay::SetProxyTextureData(ResourceId texid, const Subresource &sub, byte *data,

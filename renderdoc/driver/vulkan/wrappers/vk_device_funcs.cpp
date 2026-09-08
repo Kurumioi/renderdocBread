@@ -31,6 +31,7 @@
 #include "api/replay/version.h"
 #include "core/settings.h"
 #include "driver/ihv/nv/nv_aftermath.h"
+#include "replay/replay_timing.h"
 #include "strings/string_utils.h"
 
 RDOC_CONFIG(
@@ -5425,6 +5426,7 @@ bool WrappedVulkan::Serialise_vkDeviceWaitIdle(SerialiserType &ser, VkDevice dev
 
   if(IsReplayingAndReading())
   {
+    ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitWait);
     ObjDisp(device)->DeviceWaitIdle(Unwrap(device));
   }
 

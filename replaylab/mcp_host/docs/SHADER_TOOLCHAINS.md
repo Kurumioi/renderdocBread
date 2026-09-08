@@ -5,6 +5,28 @@ container, exact stage, requested editable language, and target graphics API.
 It does not download binaries, search `PATH`, or accept commands from MCP/AI
 requests.
 
+Packaged adapters run in the independent `ReplayLabShaderTools.exe`, not in
+the MCP/Agent/Internal Host. Its build cache binds the adapter import closure,
+runner entry point, Python runtime and PyInstaller/build dependencies by their
+actual bytes. An unrelated Host rebuild reuses the same verified runner bytes.
+Every launch still checks the runner, selected compiler/decompiler, required
+DLLs, fixed files and command arguments. Explicit operator-owned configurations
+are not rewritten. Automatic configurations keep their installation scope when
+upgrading from the historical MCP adapter; that real runner change invalidates
+old compile evidence rather than pretending the executables are identical.
+
+Saved source remains readable when a selected tool changes or the historical
+decompiler disappears. Status reports `toolchainStatus="refresh-required"`
+with exact source/route guards and no candidate authority. Use
+`migrate_shader_workspace_toolchain(..., in_place=true)` with the same source
+and target workspace path to preserve the document and user edits, archive old
+provenance, and bind the current compile route. The original compile route IDs,
+formats and target profile remain fixed; old compiled/ABI evidence is revoked.
+Compile and validate for the current capture before replacing again. This
+operation does not copy a workspace, run AI review, or apply a replacement.
+The existing default copy migration remains available for an explicit archive
+and successor workflow. Neither path rewrites a user's source bytes.
+
 ## Non-negotiable limit
 
 No compiler or decompiler can guarantee recovery of the original HLSL/GLSL
@@ -29,6 +51,34 @@ compiled. The required evidence chain is:
 The round-trip smoke report explicitly keeps
 `semanticEquivalenceVerified=false` and `replayAbiValidated=false`.
 
+## Responsibility boundary
+
+The task supplies a Shader goal, immutable scope and effect ceiling; neither an
+AI profile nor a Skill grants a compiler or replay mutation. The Host exposes a
+bounded catalog and effect-free observation surface. The active Agent—either a
+deepagents Skill child or a vendor-native single Agent—chooses an evidence-bound
+high-level route and performs bounded technical recovery. Fixed toolchain code
+resolves that choice only to registered, SHA-256-pinned operations and rejects
+ambiguous, unavailable or identity-incompatible providers. Model route choice
+therefore never becomes an arbitrary command or permission channel.
+
+AgentHost representation contracts keep the workflow order format-aware. A
+normal executable-editable route compiles only after exact representation
+readback and does not require HLSL organization, so GLSL and validated native
+DXBC/DXIL/Vulkan/OpenGL SPIR-V instruction text can reach their own assembler,
+validator, and replay-ABI gates. Organized compile/replace is a separate
+HLSL-only route. Project publication remains reviewed-HLSL-only. ESSL, MSL,
+WGSL, and Slang stay recognition/evidence rows until a Host capability plan has
+real forward/reverse providers and validators; their names never grant an
+executable lane.
+
+Read-only choices can finish immediately. Workspace, project/UI publication and
+replay replacement are admitted only by their individual MCP tools after fresh
+scope, identity, effect, hash and ABI checks. Route diagnostics never grant a
+later mutation, and ordinary capability failures cannot be relabelled to escape
+those tool boundaries. A material user choice is returned through the engine's
+normal clarification contract rather than a toolchain-owned workflow checkpoint.
+
 ## Two deliberately separate lanes
 
 - The **explanation lane** is one-way and must always remain useful even when
@@ -42,33 +92,60 @@ The round-trip smoke report explicitly keeps
   falls back to a complete native-IR round trip only when the preferred
   high-level route is statically incomplete during planning, before asking AI
   to construct missing source. If a selected decompiler fails at runtime, the
-  program publishes a finite, hash-bound recovery plan. AI may select only an
-  opaque candidate index; the server creates a fresh isolated workspace for
-  that fixed route, preserves the failed workspace, and never accepts a tool
-  path, command, argument vector, or environment from AI. The
+  program executes the finite, hash-bound alternate route-pair frontier itself.
+  Each opaque candidate index creates a fresh isolated workspace, preserves the
+  failed workspace, and never accepts a tool path, command, argument vector, or
+  environment from AI. Explicit candidate selection remains available for an
+  audited resume, but is not required for normal recovery. If the fixed frontier
+  is exhausted, a compiler-backed provisional reconstruction scaffold is
+  published from native evidence; it remains non-executable until hash-bound
+  promotion and still requires compilation and fresh replay ABI validation. The
   automatic native-IR set includes a hash-pinned 3DMigoto DXBC assembly round
   trip and the
-  official DXC `IDxcAssembler` DXIL/LLVM-text-to-container path. It still needs
-  format validation plus fresh, API-specific RenderDoc reflection/ABI and live
-  identity gates. No route record and no AI response can authorize apply by
-  itself. SPIR-V assembly remains outside automatic fallback until the workspace
-  path executes its pinned tools and validator; it may only be requested
-  explicitly meanwhile.
+  official DXC `IDxcAssembler` DXIL/LLVM-text-to-container path. Vulkan and
+  OpenGL SPIR-V assembly are also eligible only when one deterministic,
+  integrity-valid catalog capability explicitly identifies `spirv-val` for the
+  captured semantic format. The workspace v2 route plan binds that validator's
+  capability, operation digest, executable hash and fixed-file hashes. It then
+  actually validates the captured baseline, the untouched disassemble/assemble
+  probe, and every compiled candidate before publishing an executable-editable
+  source or revision. A missing, ambiguous, changed or failing validator closes
+  both automatic and explicitly requested native SPIR-V lanes. A legacy v1
+  native-SPIR-V plan remains readable as historical evidence but cannot
+  decompile-publish, promote, compile or import a candidate. These checks still
+  need fresh, API-specific RenderDoc reflection/ABI and live identity gates
+  where those backends exist. No route record, validator success or AI response
+  can authorize apply by itself.
 
-This means “all recognised formats are explainable” is a realistic goal;
-“every explanatory listing is safely editable/applicable” is not.
+This means every successfully bound/reflected Shader can retain non-empty
+evidence, but a recognized format token is not by itself analyzable or
+explainable, and an explanatory listing is not automatically editable or
+applicable.
 
-The default resource-wide replay replacement supports local D3D11/native DXBC
-and D3D12/native DXBC or DXIL. D3D11 still rejects dynamic linkage. D3D12 must
-use the checked transaction that rebuilds every affected graphics/compute PSO
-with its captured root signature before committing the mapping; any failed PSO
-aborts the replacement. Event/family Shader overrides remain D3D11-only.
-The separate material-session path supports only existing local D3D12
-CBV-backed Root/descriptor-table bindings; it does not authorize root-signature
-changes, root constants, ray state objects or indirect Root-CBV mutation.
-Vulkan descriptor/push-constant/specialization contracts, OpenGL
-program-link contracts, ray-library exports/shader-table references and remote
-replay remain unsupported; format recognition alone never widens an apply gate.
+The diagnostic capability matrix distinguishes mere forward/reverse edge
+existence from automatic editability. `automaticRoundTripReady` and `editable`
+are true only when each direction has one uniquely selectable best trusted
+route (and, for native SPIR-V, one uniquely selectable strict validator).
+Equal-score route choices are reported as ambiguous and fail closed.
+
+The default resource-wide replay replacement supports local D3D11/native DXBC,
+D3D12/native DXBC or DXIL, Vulkan/native SPIR-V, and OpenGL/native OpenGL SPIR-V
+for conventional graphics/compute stages. D3D11 still rejects dynamic linkage.
+D3D12, Vulkan, and OpenGL use checked transactions that prebuild every affected
+derived pipeline/program before committing the mapping; any failure aborts the
+replacement. D3D12 reuses each captured root signature. Vulkan additionally
+requires one exact entry/stage in the replacement module and rejects incomplete
+graphics-pipeline-library and Ray paths. OpenGL requires `GL_ARB_gl_spirv` and
+rejects `glCreateShaderProgramv` ownership until a target-ID-preserving checked
+transaction exists. Event/family Shader overrides remain D3D11-only.
+The separate material-session path supports event-scoped local D3D11 constant-
+buffer bindings and bounded local D3D12 CBV-backed Root/descriptor-table
+bindings; it does not authorize root-signature changes, root constants, ray
+state objects or indirect Root-CBV mutation.
+Vulkan descriptor/push-constant/specialization and OpenGL program-link contracts
+must match fresh reflection and backend validation. Ray/library
+exports/shader-groups/SBT associations and remote replay remain unsupported;
+format recognition or source compilation never widens that apply gate.
 
 ## Managed startup catalog stability
 
@@ -115,13 +192,44 @@ corresponding route is unavailable, not downloaded on demand.
 | DXIL | locally source-built RenoDX `decomp.exe` → HLSL | DXC → DXIL | Preferred SM6 reconstructed-source route when packaged. The adapter binds the exact captured entry/signature and rejects unresolved row packing. Names and source structure are not original; untouched compilation, full ABI, exact DXIL CBuffer access, and replay gates remain mandatory |
 | DXIL | DXC `-dumpbin` → DXIL/LLVM text | official DXC `IDxcAssembler::AssembleToContainer` → DXIL | Automatic native-IR fallback when no DXIL→HLSL round trip exists and the assembler adapter is locally packaged; it does not recover HLSL, and every candidate still requires exact profile/container checks plus fresh RenderDoc ABI and driver acceptance |
 | DXIL | dxil-spirv → SPIR-V → SPIRV-Cross HLSL | DXC → DXIL | Community translation fallback, not an algorithm-equivalence guarantee. Descriptor/resource/indexing semantics may change across the DirectX→Vulkan→HLSL bridge; exact `DxilProgramHeader.ProgramVersion`, untouched compilation, full ABI/access checks, and checked D3D12 all-affected-PSO rebuild are required |
-| SPIR-V | SPIRV-Cross → GLSL | glslang → SPIR-V | Reconstructed Vulkan GLSL; exact entry/stage; explicit trusted Vulkan target environment required |
+| SPIR-V | SPIRV-Cross → GLSL | glslang → SPIR-V | Reconstructed Vulkan GLSL; exact entry/stage; explicit trusted Vulkan target environment required. glslang ray suffixes are registered for Vulkan Ray stages; this proves a source round trip only, not SBT/state-object replacement |
 | SPIR-V | SPIRV-Cross → HLSL | DXC → SPIR-V | Listed diagnostically, but automatic round-trip fails closed because an exact HLSL target profile cannot be physically derived from SPIR-V |
-| SPIR-V | `spirv-dis` → SPIR-V assembly | `spirv-as` → SPIR-V | IR editing rather than high-level recovery; assembly is not validation |
+| SPIR-V | `spirv-dis` → SPIR-V assembly | `spirv-as` → SPIR-V | IR editing rather than high-level recovery; automatic fallback additionally requires one pinned Vulkan-environment `spirv-val`, successful baseline and untouched round-trip probes, and validation of every candidate |
 | OpenGLSPIRV | SPIRV-Cross without Vulkan semantics → GLSL | glslang `-G --target-env opengl` → OpenGLSPIRV | Capture encoding is required; binary magic alone cannot distinguish it from Vulkan SPIR-V |
-| OpenGLSPIRV | `spirv-dis` → OpenGLSPIRVAsm | `spirv-as` → OpenGLSPIRV | Physically shared syntax, logically separate route; validate with `spirv-val --target-env opengl` |
+| OpenGLSPIRV | `spirv-dis` → OpenGLSPIRVAsm | `spirv-as` → OpenGLSPIRV | Physically shared syntax, logically separate route; automatic fallback requires the separately bound `spirv-val --target-env opengl` capability and the same baseline/round-trip/candidate probes |
 | HLSL | source | pinned `D3DCompiler_47` adapter/FXC for DXBC; DXC for DXIL | Native compile, but interface/ABI still depends on the fixed compiler policy and exact target profile |
 | GLSL | source | glslang | Separate `-V` Vulkan and `-G` OpenGL SPIR-V candidates; never cross the environments implicitly |
+| DXIL Ray/Library | DXC `-dumpbin` → DXIL/LLVM text | official DXC `IDxcAssembler::AssembleToContainer` → DXIL | Native-IR round trip may be editable when both pinned operations pass. The container profile is recovered exactly as `lib_6_x`; the selected export name/stage remains a separate capture/reflection identity. No automatic high-level HLSL recovery is claimed, and replay replacement remains blocked without complete export/state-object/SBT identity |
+
+## Capability axes and non-routes
+
+`diagnostic_matrix` reports separate capability axes; none is an alias for the
+next one:
+
+| Axis | Exact meaning |
+| --- | --- |
+| `recognized` | The router accepts the format identifier. This may be vocabulary or conservative text detection only. |
+| `analyzable` | Text can be inspected, or an integrity-valid provider can consume the format. It is not proof of an algorithmic explanation. |
+| `explanatory` | A ready forward route can emit review evidence. It may be one-way and non-executable. |
+| `editable` | A reverse route and every strict static prerequisite exist. Runtime baseline/compiler/validator probes must still pass before the workspace publishes the editable lane. |
+| `compilable` | A ready route can emit a binary artifact. This says nothing about external validation, replay ABI or semantic equivalence. |
+| `externalValidatorReady` | A hash-pinned validator is configured and integrity-valid. Diagnostics do not execute it; workspace provenance records the executions separately. |
+| `replayAbiValidated` | Always false in toolchain diagnostics. Only fresh capture-bound replay reflection can set this fact. |
+| `replayReplaceable` | Always false in toolchain diagnostics. Replacement is a separate API/backend transaction. |
+| `workspaceStageSupported` | The stage may participate in a registered source/IR round trip. This remains true for Ray/Library; actual editability still depends on unique ready routes and validators. |
+| `replayStageSupported` | Whether this stage class is admitted to the ordinary replay replacement transaction. It is false for Ray/Library even when source/IR round trip is ready. |
+| `replayUnsupportedReason` | The exact stage-level replay boundary, kept separate from route-level `unsupportedReason`. |
+
+DXBC, DXIL, Vulkan SPIR-V and OpenGL SPIR-V have physical binary adapters.
+HLSL and GLSL have generated compiler routes when the corresponding fixed tools
+are installed. ESSL, MSL, WGSL and Slang are recognized format vocabulary (and
+some have conservative text markers), but the generated catalog does not claim
+end-to-end decompile/compile routes for them. A custom provider must declare and
+pin an actual edge before any such row becomes ready. Ray stages can report a
+real Vulkan GLSL/SPIR-V round trip, and Ray/Library DXIL can report a native-IR
+round trip, when those exact providers are ready. Diagnostics still report
+`replayStageSupported=false` and a separate replay reason because per-export,
+state-object/shader-group/SBT replacement is not implemented.
 
 DXC provides DXIL disassembly (`IDxcCompiler3::Disassemble` / `dxc -dumpbin`),
 not a general DXIL-to-HLSL decompiler. ReplayLab can separately register the
@@ -150,9 +258,16 @@ The workspace and round-trip runner never substitute a fixed `ps_5_0`,
   padded end agrees with both other size declarations. Truncated, overlapping,
   overflow-like, extra whole-DWORD trailing data, and contradictory headers
   fail closed.
-- Stage and profile are cross-checked against the capture stage.
-- DXIL library/ray kinds require multi-entry/export handling and currently fail
-  closed instead of being miscompiled as one entry point.
+- Stage and profile are cross-checked against the capture stage. For a DXIL
+  `Library` container, `ProgramType` proves only the physical `lib_6_x`
+  profile; a selected RayGen/Miss/Hit/Callable export stage comes from the
+  capture shader key and must agree again with fresh candidate reflection. The
+  container is never relabelled as a single-entry program.
+- DXIL library/ray kinds have an exact `lib_6_x` profile, but no automatic
+  high-level HLSL recovery/compile route is registered for them. A separately
+  registered DXIL native-IR round trip can edit and reassemble the complete
+  module without inventing a source entry target, but still cannot authorize
+  replay apply.
 
 The exact value is stored in `manifest.json.targetProfile`, re-derived whenever
 the workspace is loaded, and supplied to a compiler only through the read-only
@@ -172,10 +287,15 @@ Every output still has to pass container/profile checks and the full replay ABI
 gate before it can be applied.
 
 SPIRV-Cross is never invoked directly by a generated registry. Its bundled,
-hash-pinned adapter receives the workspace's physical entry point, stage,
-target profile, and capture API. It always supplies `--entry` and `--stage`;
-for HLSL it derives `--shader-model` from the exact profile (for example,
-`ps_6_7` becomes `67`) and explicitly preserves the selected entry name.
+hash-pinned adapter receives both the independently parsed physical SPIR-V
+entry and the capture-visible entry, plus stage, target profile, and capture
+API. The DirectX-to-SPIR-V producer is not given the capture-visible name as an
+unverified physical selector. After translation, the route parses every
+`OpEntryPoint`: an exact requested match is used, otherwise exactly one entry
+for the captured stage may be selected; missing or multiple stage matches fail
+closed. For HLSL, SPIRV-Cross then mechanically renames that physical entry to
+the capture-visible name, supplies `--entry`/`--stage`, and derives
+`--shader-model` from the exact profile (for example, `ps_6_7` becomes `67`).
 Missing facts, a profile/stage contradiction, a non-DirectX HLSL target, or an
 unrepresentable profile fail before SPIRV-Cross starts. This prevents its
 upstream defaults (first module entry point and HLSL Shader Model 3.0) from
@@ -293,7 +413,14 @@ report = catalog.round_trip_smoke(
 `select_round_trip_for_file` returns `why`, full capabilities, source URLs,
 licenses, caveats, exact target profile, and both route/tool ID sequences. If
 two equally ranked route combinations exist, it rejects auto-selection. An
-advanced caller can inspect `matching_routes` and choose an explicit route ID.
+advanced trusted caller can inspect `matching_routes` and choose an explicit
+route ID. Task-scoped Agents do not receive that unrestricted internal route-ID
+surface; they can select only the high-level catalog candidate and opaque,
+Host-listed recovery alternatives.
+
+Unpacked-project Shader/material-like/CBuffer evidence may improve explanation,
+names and provenance, but it never changes executable-route eligibility or
+authorizes a compiler, validator, ABI claim or replay replacement.
 
 The same operations are exposed through three bounded MCP tools:
 

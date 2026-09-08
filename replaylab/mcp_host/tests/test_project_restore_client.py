@@ -1,4 +1,6 @@
 import ast
+import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -39,6 +41,31 @@ def _job(status, progress=None, **extra):
     return value
 
 
+def _desired_head(active_revision=7, **extra):
+    semantic = {
+        "knowledgeContentSha256": "5" * 64,
+        "knowledgeIdsSha256": "6" * 64,
+        "artifactRefsSha256": "7" * 64,
+        "referencedHeadsSha256": "8" * 64,
+        "complete": True,
+    }
+    value = {
+        "activeKnowledgeRevision": active_revision,
+        **semantic,
+        "headSha256": hashlib.sha256(
+            json.dumps(
+                semantic,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    value.update(extra)
+    return value
+
+
 def _restore_result(project="D:/project", capture="D:/capture.rdc",
                     session="f" * 32, completed=True, **extra):
     value = {
@@ -46,6 +73,8 @@ def _restore_result(project="D:/project", capture="D:/capture.rdc",
         "schemaVersion": 1,
         "operationId": "1" * 32,
         "completed": completed,
+        "restoreMode": "full-inventory" if completed else "unresolved",
+        "desiredHead": None,
         "capture": {
             "path": os.path.abspath(capture),
             "sessionId": session,
@@ -57,6 +86,9 @@ def _restore_result(project="D:/project", capture="D:/capture.rdc",
             "replayProjectId": "4" * 32,
         },
         "cache": {"hit": False, "reason": "index-absent"},
+        "inventoryCache": {
+            "hit": False, "written": False, "reason": "not-read",
+        },
         "shaders": {
             "attempted": 0, "applied": 0, "skipped": 0, "failed": 0,
             "items": [],
@@ -68,6 +100,15 @@ def _restore_result(project="D:/project", capture="D:/capture.rdc",
         "index": {
             "read": True, "present": False, "written": False,
             "warning": None,
+        },
+        "realizedReceipts": {
+            "loadedFromIndex": 0,
+            "validatedForRouting": 0,
+            "produced": 0,
+            "adoptedCurrentSession": 0,
+            "mutationsCreated": 0,
+            "idempotentApplyResponses": 0,
+            "persisted": 0,
         },
         "warnings": [],
     }
@@ -84,7 +125,10 @@ class _Transport:
                  cancel_event, generation):
         self.calls.append((
             port, token, method, path, body, timeout, cancel_event, generation))
-        status, value = self.replies.pop(0)
+        reply = self.replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        status, value = reply
         payload = (
             value
             if isinstance(value, bytes)
@@ -116,15 +160,68 @@ class _HealthTransport:
                 "pid": self.pid,
                 "hostInstanceId": self.host_instance_id,
                 "hostStateProtocolVersion": self.protocol_version,
+                # A newer Host advertises additional route families; clients
+                # require the ones they use and ignore the rest.
                 "capabilities": [
                     "project-service", "project-restore",
-                    "shader-source-save"],
+                    "shader-source-save", "shader-live-edit", "asset-index"],
             },
             separators=(",", ":"),
         ).encode("utf-8")
 
 
 class ReplayLabRestoreHostClientTests(unittest.TestCase):
+    def test_target_lookup_completion_preserves_partial_scope_and_rejects_false_coverage(self):
+        value = _restore_result(restoreMode="project-target-inventory", inventoryScope="target-raw-sha256",
+            fullFrame=False, targetLookup={"targetRawSha256s": ["a" * 64],
+                "observedTargetRawSha256s": [], "unobservedTargetRawSha256s": ["a" * 64],
+                "targetInventoryComplete": True, "rawIdentitySearchComplete": True})
+        check = lambda candidate: client_module.ReplayLabRestoreHostClient._result(
+            candidate, os.path.abspath("D:/project"), os.path.abspath("D:/capture.rdc"), "f" * 32)
+        self.assertFalse(check(value)["fullFrame"])
+        variants = []
+        for field in ("targetInventoryComplete", "rawIdentitySearchComplete"):
+            bad = copy.deepcopy(value); bad["targetLookup"][field] = False; variants.append(bad)
+        bad = copy.deepcopy(value); bad["fullFrame"] = True; variants.append(bad)
+        bad = copy.deepcopy(value); bad["targetLookup"]["unobservedTargetRawSha256s"] = []; variants.append(bad)
+        bad = copy.deepcopy(value); bad["targetLookup"]["targetRawSha256s"] *= 2; variants.append(bad)
+        bad = copy.deepcopy(value); bad["inventoryCache"]["written"] = True; variants.append(bad)
+        bad = copy.deepcopy(value); bad["targetLookup"]["unknownAuthority"] = True; variants.append(bad)
+        for bad in variants:
+            with self.subTest(bad=bad):
+                with self.assertRaises(client_module.ReplayLabRestoreClientError): check(bad)
+
+    def test_editor_receipt_requires_one_applied_workspace_and_exact_capture(self):
+        value = _restore_result()
+        workspace = os.path.abspath("D:/project/workspace")
+        value["shaders"].update(attempted=1, applied=1, items=[{
+            "status": "applied", "source": "reuse-plan", "workspacePath": workspace,
+            "workspaceId": "9" * 32, "resourceId": 7, "stage": "fragment",
+            "replacementId": "a" * 32, "knowledgeId": "b" * 32, "idempotentlyAdopted": False}])
+        value["realizedReceipts"].update(produced=1, mutationsCreated=1)
+        value["editing"] = {"attempted": 1, "enabled": 1, "failed": 0, "items": [{
+            "workspaceId": "9" * 32, "workspacePath": workspace, "status": "enabled",
+            "liveEditId": "c" * 32, "watchId": "d" * 32,
+            "captureBinding": {"instanceId": "1-current", "capturePath": os.path.abspath("D:/capture.rdc"),
+                               "captureSessionId": "f" * 32}}]}
+        check = lambda candidate: client_module.ReplayLabRestoreHostClient._result(
+            candidate, os.path.abspath("D:/project"), os.path.abspath("D:/capture.rdc"), "f" * 32)
+        self.assertEqual(check(value)["editing"]["enabled"], 1)
+        for mutation in ("session", "workspace", "count", "unknown", "uncommitted"):
+            bad = copy.deepcopy(value)
+            if mutation == "session": bad["editing"]["items"][0]["captureBinding"]["captureSessionId"] = "e" * 32
+            elif mutation == "workspace": bad["editing"]["items"][0]["workspaceId"] = "e" * 32
+            elif mutation == "count": bad["editing"]["enabled"] = 0
+            elif mutation == "unknown": bad["editing"]["arbitraryCommand"] = "ignored"
+            else: bad["completed"] = False
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(client_module.ReplayLabRestoreClientError): check(bad)
+        failed = copy.deepcopy(value)
+        failed["editing"].update(enabled=0, failed=1, items=[{
+            "workspaceId": "9" * 32, "workspacePath": workspace, "status": "failed", "error": "Editor unavailable"}])
+        self.assertTrue(check(failed)["completed"])
+        self.assertEqual(check(failed)["shaders"]["applied"], 1)
+
     def setUp(self):
         self.restore_generation = client_module.resume_restore_generation()
 
@@ -190,6 +287,35 @@ class ReplayLabRestoreHostClientTests(unittest.TestCase):
         self.assertIn("WINHTTP_CANCEL_SLICE_MS", source)
         self.assertNotIn("ReplayLabProjectRestoreHTTP", source)
         self.assertNotIn("_ACTIVE_REQUEST_THREAD", source)
+
+    def test_progress_item_is_bounded_forward_compatible_and_optional(self):
+        event = client_module._normalise_progress({
+            "sequence": 1,
+            "phase": "export-shader-bindings",
+            "message": "Exporting Shader bindings",
+            "current": 7,
+            "total": 12,
+            "item": "EID 418",
+        }, 0)
+        self.assertEqual("EID 418", event["item"])
+        legacy = client_module._normalise_progress({
+            "sequence": 2,
+            "phase": "prepare",
+            "message": "",
+            "current": 0,
+            "total": 0,
+        }, 1)
+        self.assertEqual("", legacy["item"])
+        with self.assertRaisesRegex(
+                client_module.ReplayLabRestoreClientError, "malformed"):
+            client_module._normalise_progress({
+                "sequence": 3,
+                "phase": "prepare",
+                "message": "",
+                "current": 0,
+                "total": 0,
+                "item": "x" * 1025,
+            }, 2)
 
     def test_restore_starts_authenticated_job_and_streams_ordered_progress(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -365,9 +491,11 @@ class ReplayLabRestoreHostClientTests(unittest.TestCase):
             workspace.mkdir(parents=True)
             result = _restore_result(
                 str(project), str(capture), "8" * 32)
+            result["restoreMode"] = "exact-rdc-head"
+            result["desiredHead"] = _desired_head()
             result["cache"] = {
                 "hit": True,
-                "reason": "exact-project-content-binding",
+                "reason": "exact-desired-project-head",
             }
             result["shaders"] = {
                 "attempted": 1,
@@ -382,6 +510,7 @@ class ReplayLabRestoreHostClientTests(unittest.TestCase):
                     "resourceId": 7,
                     "stage": "fragment",
                     "replacementId": "a" * 32,
+                    "idempotentlyAdopted": True,
                 }],
             }
             result["index"] = {
@@ -389,6 +518,15 @@ class ReplayLabRestoreHostClientTests(unittest.TestCase):
                 "present": True,
                 "written": True,
                 "warning": None,
+            }
+            result["realizedReceipts"] = {
+                "loadedFromIndex": 1,
+                "validatedForRouting": 1,
+                "produced": 1,
+                "adoptedCurrentSession": 1,
+                "mutationsCreated": 0,
+                "idempotentApplyResponses": 0,
+                "persisted": 1,
             }
             client, _transport, _health = self._client(
                 runtime,
@@ -401,6 +539,145 @@ class ReplayLabRestoreHostClientTests(unittest.TestCase):
 
             self.assertTrue(restored["completed"])
             self.assertEqual(1, restored["shaders"]["applied"])
+
+    def test_empty_project_fast_path_result_is_strictly_validated(self):
+        result = _restore_result()
+        result["restoreMode"] = "no-project-knowledge"
+        result["capture"]["captureId"] = None
+        result["cache"] = {
+            "hit": False,
+            "reason": "project-has-no-restorable-knowledge",
+        }
+        result["inventoryCache"] = {
+            "hit": False,
+            "written": False,
+            "reason": "not-required-for-empty-project",
+        }
+        result["index"] = {
+            "read": False,
+            "present": False,
+            "written": False,
+            "warning": None,
+        }
+
+        accepted = client_module.ReplayLabRestoreHostClient._result(
+            result, "D:/project", "D:/capture.rdc", "f" * 32)
+
+        self.assertEqual("no-project-knowledge", accepted["restoreMode"])
+        self.assertIsNone(accepted["capture"]["captureId"])
+
+        invalid = json.loads(json.dumps(result))
+        invalid["index"]["read"] = True
+        with self.assertRaisesRegex(
+                client_module.ReplayLabRestoreClientError, "invalid result"):
+            client_module.ReplayLabRestoreHostClient._result(
+                invalid, "D:/project", "D:/capture.rdc", "f" * 32)
+
+        invalid = json.loads(json.dumps(result))
+        invalid["capture"]["captureId"] = "2" * 64
+        with self.assertRaisesRegex(
+                client_module.ReplayLabRestoreClientError, "invalid result"):
+            client_module.ReplayLabRestoreHostClient._result(
+                invalid, "D:/project", "D:/capture.rdc", "f" * 32)
+
+    def test_new_restore_head_and_receipt_fields_fail_closed(self):
+        base = _restore_result()
+        base["desiredHead"] = _desired_head(active_revision=11)
+        accepted = client_module.ReplayLabRestoreHostClient._result(
+            base, "D:/project", "D:/capture.rdc", "f" * 32)
+        self.assertEqual(11, accepted["desiredHead"]["activeKnowledgeRevision"])
+
+        invalid_results = []
+
+        invalid = _restore_result()
+        invalid["restoreMode"] = "background-fast-path"
+        invalid_results.append(invalid)
+
+        invalid = _restore_result()
+        invalid["desiredHead"] = _desired_head(headSha256="0" * 64)
+        invalid_results.append(invalid)
+
+        invalid = _restore_result()
+        invalid["desiredHead"] = _desired_head(active_revision=True)
+        invalid_results.append(invalid)
+
+        invalid = _restore_result()
+        invalid["desiredHead"] = _desired_head()
+        invalid["desiredHead"]["unexpected"] = False
+        invalid_results.append(invalid)
+
+        invalid = _restore_result()
+        invalid["inventoryCache"] = {
+            "hit": True,
+            "written": False,
+            "reason": "fresh-target-validation",
+        }
+        invalid_results.append(invalid)
+
+        invalid = _restore_result()
+        invalid["realizedReceipts"]["produced"] = 1
+        invalid_results.append(invalid)
+
+        invalid = _restore_result()
+        invalid["realizedReceipts"]["unexpected"] = 0
+        invalid_results.append(invalid)
+
+        for index, invalid in enumerate(invalid_results):
+            with self.subTest(index=index), self.assertRaisesRegex(
+                    client_module.ReplayLabRestoreClientError,
+                    "invalid result"):
+                client_module.ReplayLabRestoreHostClient._result(
+                    invalid, "D:/project", "D:/capture.rdc", "f" * 32)
+
+    def test_cache_hit_requires_new_semantic_head_reason_and_receipt_evidence(self):
+        result = _restore_result()
+        result["restoreMode"] = "exact-rdc-head"
+        result["desiredHead"] = _desired_head()
+        result["cache"] = {
+            "hit": True,
+            "reason": "exact-project-content-binding",
+        }
+        result["shaders"] = {
+            "attempted": 1,
+            "applied": 1,
+            "skipped": 0,
+            "failed": 0,
+            "items": [{
+                "status": "applied",
+                "source": "rdc-index",
+                "workspacePath": "D:/project/shader-workspace",
+                "workspaceId": "9" * 32,
+                "resourceId": 7,
+                "stage": "fragment",
+                "replacementId": "a" * 32,
+                "idempotentlyAdopted": True,
+            }],
+        }
+        result["realizedReceipts"] = {
+            "loadedFromIndex": 1,
+            "validatedForRouting": 1,
+            "produced": 1,
+            "adoptedCurrentSession": 1,
+            "mutationsCreated": 0,
+            "idempotentApplyResponses": 0,
+            "persisted": 0,
+        }
+
+        with self.assertRaisesRegex(
+                client_module.ReplayLabRestoreClientError, "invalid result"):
+            client_module.ReplayLabRestoreHostClient._result(
+                result, "D:/project", "D:/capture.rdc", "f" * 32)
+
+        result["cache"]["reason"] = "exact-desired-project-head"
+        accepted = client_module.ReplayLabRestoreHostClient._result(
+            result, "D:/project", "D:/capture.rdc", "f" * 32)
+        self.assertTrue(accepted["cache"]["hit"])
+
+        result["shaders"]["items"][0]["idempotentlyAdopted"] = False
+        with self.assertRaisesRegex(
+                client_module.ReplayLabRestoreClientError, "invalid result"):
+            client_module.ReplayLabRestoreHostClient._result(
+                result, "D:/project", "D:/capture.rdc", "f" * 32)
 
     def test_completed_job_preserves_bounded_business_failure_result(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -582,7 +859,29 @@ class ReplayLabRestoreHostClientTests(unittest.TestCase):
                 str(executable), transport=_Transport([]),
                 health_transport=_HealthTransport())
 
-            self.assertEqual(30.0, client.startup_timeout_seconds)
+            self.assertEqual(60.0, client.startup_timeout_seconds)
+
+    def test_restore_client_allows_packaged_cold_start(self):
+        client = client_module.ReplayLabRestoreHostClient(
+            transport=_Transport([]), health_transport=_HealthTransport())
+
+        self.assertEqual(60.0, client.startup_timeout_seconds)
+
+    def test_default_restore_timeout_exceeds_host_deadline_and_cleanup(self):
+        client = client_module.ReplayLabRestoreHostClient(
+            transport=_Transport([]), health_transport=_HealthTransport()
+        )
+
+        self.assertEqual(
+            client_module.DEFAULT_PROJECT_RESTORE_CLIENT_TIMEOUT_SECONDS,
+            client.timeout_seconds,
+        )
+        self.assertGreater(
+            client.timeout_seconds,
+            client_module.PROJECT_RESTORE_DEADLINE_SECONDS
+            + client_module.PROJECT_RESTORE_MAX_INFLIGHT_SECONDS
+            + client_module.PROJECT_RESTORE_CLEANUP_GRACE_SECONDS,
+        )
 
     def test_internal_project_request_owns_the_current_lifecycle_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -824,6 +1123,203 @@ class ReplayLabRestoreHostClientTests(unittest.TestCase):
             self.assertFalse(worker.is_alive())
             self.assertEqual(1, len(outcome))
             self.assertIn("cancelled", str(outcome[0]))
+
+    def test_client_timeout_best_effort_deletes_current_job(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self._runtime(temporary)
+            ticks = iter([0.0, 0.0, 0.0, 0.0, 2.0])
+            transport = _Transport([
+                (202, _job("queued")),
+                (200, _job("running")),
+                (202, {"cancelled": True}),
+            ])
+            client = client_module.ReplayLabRestoreHostClient(
+                str(runtime), timeout_seconds=1.0,
+                startup_timeout_seconds=0.1,
+                transport=transport, health_transport=_HealthTransport(),
+                monotonic=lambda: next(ticks), sleep=lambda unused: None,
+            )
+
+            with self.assertRaisesRegex(
+                client_module.ReplayLabRestoreClientError,
+                "project restore timed out",
+            ):
+                client.restore("D:/project", "D:/capture.rdc", "8" * 32)
+
+            self.assertEqual(
+                ["POST", "GET", "DELETE"],
+                [call[2] for call in transport.calls],
+            )
+            self.assertEqual(
+                "%s/%s" % (client_module.RESTORE_JOB_PATH, "a" * 32),
+                transport.calls[-1][3],
+            )
+            self.assertFalse(transport.calls[-1][6].is_set())
+            self.assertIsNone(transport.calls[-1][7])
+
+    @staticmethod
+    def _native_timeout(path, method="GET", code=12002):
+        original = OSError("native transport diagnostic")
+        original.winerror = code
+        return client_module.ReplayLabRestoreTransportError(original, method, path)
+
+    def test_known_job_native_timeout_rechecks_same_job_and_cursor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self._runtime(temporary)
+            query = "%s/%s?after=1" % (client_module.RESTORE_JOB_PATH, "a" * 32)
+            client, transport, unused_health = self._client(runtime, [
+                (202, _job("running", [{"sequence": 1, "phase": "shader-compile",
+                    "message": "Compiling", "current": 1, "total": 1}])),
+                self._native_timeout(query),
+                (200, _job("completed", result=_restore_result(), latestSequence=1)),
+            ])
+            result = client.restore("D:/project", "D:/capture.rdc", "f" * 32)
+            self.assertTrue(result["completed"])
+            self.assertEqual(["POST", "GET", "GET"], [call[2] for call in transport.calls])
+            self.assertEqual([query, query], [call[3] for call in transport.calls[1:]])
+            self.assertEqual(transport.calls[1][0:2], transport.calls[2][0:2])
+
+    def test_only_exact_job_native_timeout_is_retryable(self):
+        query = "%s/%s?after=0" % (client_module.RESTORE_JOB_PATH, "a" * 32)
+        errors = [
+            self._native_timeout(query, code=12029),
+            self._native_timeout(query, method="POST"),
+            self._native_timeout(query + "0"),
+            client_module.ReplayLabRestoreClientError("WinError 12002"),
+        ]
+        for error in errors:
+            with self.subTest(error=type(error).__name__, facts=vars(error)):
+                with tempfile.TemporaryDirectory() as temporary:
+                    client, transport, unused = self._client(self._runtime(temporary), [
+                        (202, _job("running")), error,
+                    ])
+                    with self.assertRaises(client_module.ReplayLabRestoreClientError) as caught:
+                        client.restore("D:/project", "D:/capture.rdc", "f" * 32)
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual(["POST", "GET"], [call[2] for call in transport.calls])
+        with tempfile.TemporaryDirectory() as temporary:
+            uncertain = client_module.ReplayLabRestoreRequestUncertain("POST timed out")
+            client, transport, unused = self._client(self._runtime(temporary), [uncertain])
+            with self.assertRaises(client_module.ReplayLabRestoreRequestUncertain):
+                client.restore("D:/project", "D:/capture.rdc", "f" * 32)
+            self.assertEqual(["POST"], [call[2] for call in transport.calls])
+
+    def test_known_job_timeout_retry_stops_on_cancel_or_total_deadline(self):
+        query = "%s/%s?after=0" % (client_module.RESTORE_JOB_PATH, "a" * 32)
+        for cancel in (True, False):
+            with self.subTest(cancel=cancel), tempfile.TemporaryDirectory() as temporary:
+                client, transport, unused = self._client(self._runtime(temporary), [
+                    (202, _job("running")), self._native_timeout(query),
+                    (202, {"cancelled": True}),
+                ])
+                clock = [0.0]
+                client.monotonic = lambda: clock[0]
+                client.timeout_seconds = 1.0
+                def wait(unused):
+                    if cancel:
+                        client.cancel()
+                    else:
+                        clock[0] = 2.0
+                client.sleep = wait
+                with self.assertRaisesRegex(client_module.ReplayLabRestoreClientError,
+                                            "cancelled" if cancel else "project restore timed out"):
+                    client.restore("D:/project", "D:/capture.rdc", "f" * 32)
+                self.assertEqual(["POST", "GET", "DELETE"], [call[2] for call in transport.calls])
+
+    @unittest.skipUnless(os.name == "nt", "WinHTTP is Windows-only")
+    def test_real_winhttp_receive_timeout_preserves_native_code_and_request(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(2)
+        port = listener.getsockname()[1]
+        stopped = threading.Event()
+        def serve():
+            try:
+                connection, unused = listener.accept()
+                with connection:
+                    connection.recv(4096)
+                    connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                                       b"Connection: close\r\n\r\n")
+                    # WinHTTP may round its short receive timeout to a whole
+                    # second. Keep the peer open past that native boundary.
+                    time.sleep(5.0)
+            finally:
+                listener.close()
+                stopped.set()
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+        with self.assertRaises(client_module.ReplayLabRestoreTransportError) as caught:
+            client_module._winhttp_request_blocking(
+                "GET", "/owned-job", port, "", b"", 10.0,
+                threading.Event(), self.restore_generation)
+        self.assertEqual(12002, caught.exception.winerror)
+        self.assertEqual("GET", caught.exception.method)
+        self.assertEqual("/owned-job", caught.exception.path)
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        self.assertTrue(stopped.wait(6))
+
+    def test_client_cancel_best_effort_deletes_current_job(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self._runtime(temporary)
+            transport = _Transport([
+                (202, _job("queued")),
+                (200, _job("running")),
+                (200, {"cancelled": True}),
+            ])
+            client = client_module.ReplayLabRestoreHostClient(
+                str(runtime), transport=transport,
+                health_transport=_HealthTransport(),
+            )
+            client.sleep = lambda unused: client.cancel()
+
+            with self.assertRaisesRegex(
+                client_module.ReplayLabRestoreClientError, "cancelled"
+            ):
+                client.restore("D:/project", "D:/capture.rdc", "9" * 32)
+
+            self.assertEqual(
+                ["POST", "GET", "DELETE"],
+                [call[2] for call in transport.calls],
+            )
+            self.assertFalse(transport.calls[-1][6].is_set())
+            self.assertIsNone(transport.calls[-1][7])
+
+    def test_delete_failure_does_not_mask_original_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = self._runtime(temporary)
+            ticks = iter([0.0, 0.0, 0.0, 0.0, 2.0])
+
+            class DeleteFailingTransport(_Transport):
+                def __call__(self, port, token, method, path, body, timeout,
+                             cancel_event, generation):
+                    if method == "DELETE":
+                        self.calls.append((
+                            port, token, method, path, body, timeout,
+                            cancel_event, generation))
+                        raise RuntimeError("cleanup transport failed")
+                    return _Transport.__call__(
+                        self, port, token, method, path, body, timeout,
+                        cancel_event, generation)
+
+            transport = DeleteFailingTransport([
+                (202, _job("queued")),
+                (200, _job("running")),
+            ])
+            client = client_module.ReplayLabRestoreHostClient(
+                str(runtime), timeout_seconds=1.0,
+                startup_timeout_seconds=0.1,
+                transport=transport, health_transport=_HealthTransport(),
+                monotonic=lambda: next(ticks), sleep=lambda unused: None,
+            )
+
+            with self.assertRaisesRegex(
+                client_module.ReplayLabRestoreClientError,
+                "project restore timed out",
+            ):
+                client.restore("D:/project", "D:/capture.rdc", "a" * 32)
+
+            self.assertEqual("DELETE", transport.calls[-1][2])
 
     def test_shutdown_fence_rejects_late_restore_before_any_transport(self):
         with tempfile.TemporaryDirectory() as temporary:

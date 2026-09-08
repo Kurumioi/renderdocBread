@@ -1,4 +1,4 @@
-"""ReplayLab native material-panel model and MiniQt presentation.
+"""ReplayLab native material-panel model for shared CBuffer field edits.
 
 The C++ BufferViewer supplies a selection from its current reflected variable
 model.  This module never accepts a byte offset from an MCP/model caller: the
@@ -7,7 +7,7 @@ and subsequent edits use only the leaf ID issued by that snapshot.
 
 The controller is deliberately independent from RenderDoc and Qt so its physical
 identity, packing, cumulative-patch, revision, and rollback rules can be tested
-with fixed data.  ``MiniQtMaterialPanel`` is the small qrenderdoc UI wrapper.
+with fixed data. The localized MiniQt UI lives in ``project_material_panel.py``.
 
 Python 3.6 compatibility is required by the bundled qrenderdoc runtime.
 """
@@ -19,16 +19,39 @@ import collections
 import hashlib
 import math
 import struct
+import importlib.util
+import os
+
+try:
+    from .material_edit_queue import MaterialEditQueue
+except (ImportError, ValueError):
+    _queue_spec = importlib.util.spec_from_file_location(
+        "_replaylab_material_edit_queue", os.path.join(os.path.dirname(__file__), "material_edit_queue.py"))
+    _queue_module = importlib.util.module_from_spec(_queue_spec)
+    _queue_spec.loader.exec_module(_queue_module)
+    MaterialEditQueue = _queue_module.MaterialEditQueue
+
+try:
+    from .shared_cbuffer import MAX_SHARED_CBUFFER_BYTES
+except (ImportError, ValueError):
+    _shared_spec = importlib.util.spec_from_file_location(
+        "_replaylab_shared_cbuffer_limits", os.path.join(os.path.dirname(__file__), "shared_cbuffer.py"))
+    _shared_module = importlib.util.module_from_spec(_shared_spec)
+    _shared_spec.loader.exec_module(_shared_module)
+    MAX_SHARED_CBUFFER_BYTES = _shared_module.MAX_SHARED_CBUFFER_BYTES
 
 
 SELECTION_SCHEMA = "renderdoc-ultra-buffer-variable-selection/v1"
-SNAPSHOT_SCHEMA = "renderdoc-ultra-event-cbuffer-snapshot/v1"
-OVERRIDE_SCHEMA = "renderdoc-ultra-event-cbuffer-override/v1"
+SNAPSHOT_SCHEMA = "renderdoc-ultra-shared-cbuffer-snapshot/v1"
+OVERRIDE_SCHEMA = "renderdoc-ultra-shared-cbuffer-edit/v1"
 _SHA256_CHARS = set("0123456789abcdef")
 
 
 class MaterialPanelError(RuntimeError):
-    pass
+    def __init__(self, message, parameter=None):
+        super(MaterialPanelError, self).__init__(message)
+        self.message_id = message if message.startswith("material-value-") else ""
+        self.parameter = parameter
 
 
 def _integer(value, label, minimum=0, maximum=0xFFFFFFFFFFFFFFFF):
@@ -83,6 +106,17 @@ def native_selection_from_callback(data, resource_id_int, normalise_stage):
     ``normalise_stage`` are supplied by the bridge, so RenderDoc wrapper objects
     are canonicalised by the same fixed code as every replay mutation.
     """
+    # The native callback ABI is rdcarray<rdcpair<rdcstr, PyObject *>>. The bundled
+    # SWIG converter delivers a list of pairs; some extension runtimes provide a
+    # dict. Accept both without silently dropping duplicate identity fields.
+    if isinstance(data, (list, tuple)):
+        converted = {}
+        for item in data:
+            if (not isinstance(item, (list, tuple)) or len(item) != 2 or
+                    not isinstance(item[0], str) or item[0] in converted):
+                raise MaterialPanelError("The BufferViewer callback has ambiguous identity fields")
+            converted[item[0]] = item[1]
+        data = converted
     if not isinstance(data, dict):
         raise MaterialPanelError("The BufferViewer callback did not provide an identity object")
     if str(data.get("schema", "")) != SELECTION_SCHEMA:
@@ -102,7 +136,7 @@ def native_selection_from_callback(data, resource_id_int, normalise_stage):
         "eventId": _integer(data.get("eventId"), "event ID", 1, 0xFFFFFFFF),
         "stage": stage,
         "blockIndex": _integer(data.get("blockIndex"), "reflection block index", 0, 16383),
-        "arrayIndex": _integer(data.get("arrayIndex"), "binding array index", 0, 0),
+        "arrayIndex": _integer(data.get("arrayIndex"), "binding array index", 0, 0xFFFFFFFF),
         "physicalSlot": _integer(data.get("physicalSlot"), "CBuffer slot", 0, 0xFFFFFFFF),
         "registerSpace": _integer(data.get("registerSpace"), "register space", 0, 0xFFFFFFFF),
         "blockName": _text(data.get("blockName"), "constant-block name"),
@@ -112,15 +146,13 @@ def native_selection_from_callback(data, resource_id_int, normalise_stage):
         "bufferByteOffset": _integer(
             data.get("bufferByteOffset"), "bound buffer byte offset", 0, 0xFFFFFFFFFFFFFFFF),
         "bufferByteSize": _integer(
-            data.get("bufferByteSize"), "bound buffer byte size", 16, 64 * 1024),
+            data.get("bufferByteSize"), "bound buffer byte size", 4, MAX_SHARED_CBUFFER_BYTES),
         "fieldName": _text(data.get("fieldName"), "reflected field name"),
         "fieldByteOffset": _integer(
-            data.get("fieldByteOffset"), "reflected field byte offset", 0, 64 * 1024 - 4),
+            data.get("fieldByteOffset"), "reflected field byte offset", 0, MAX_SHARED_CBUFFER_BYTES - 4),
         "fieldBaseType": _canonical_base_type(data.get("fieldBaseType")),
         "fieldComponents": _integer(data.get("fieldComponents"), "field components", 1, 4),
     }
-    if result["bufferByteOffset"] % 16 or result["bufferByteSize"] % 16:
-        raise MaterialPanelError("The native CBuffer window is not 16-byte aligned")
     if result["fieldByteOffset"] + result["fieldComponents"] * 4 > result["bufferByteSize"]:
         raise MaterialPanelError("The selected reflected field lies outside its bound window")
     return result
@@ -199,19 +231,22 @@ def _pack_values(leaf, value):
 def parse_parameter_text(text, base_type, components):
     pieces = [piece.strip() for piece in str(text or "").split(",")]
     if len(pieces) != components or any(piece == "" for piece in pieces):
-        raise MaterialPanelError("请输入 %d 个以逗号分隔的分量" % components)
+        raise MaterialPanelError("material-value-component-count", components)
     if base_type == "Float":
         try:
             return [float(piece) for piece in pieces]
         except Exception:
-            raise MaterialPanelError("浮点参数需要有效数字")
+            raise MaterialPanelError("material-value-float-required")
     try:
         return [int(piece, 10) for piece in pieces]
     except Exception:
-        raise MaterialPanelError("整数参数需要十进制整数")
+        raise MaterialPanelError("material-value-integer-required")
 
 
-def _stage_abbreviation(stage):
+def _stage_abbreviation(stage, api="D3D11"):
+    if api in ("OpenGL", "Vulkan"):
+        return {"vertex": "VTX", "hull": "TCS", "domain": "TES", "geometry": "GS",
+                "fragment": "FS", "compute": "CS", "task": "TS", "mesh": "MS"}.get(stage, stage.upper())
     return {
         "vertex": "VS", "hull": "HS", "domain": "DS", "geometry": "GS",
         "fragment": "PS", "compute": "CS", "task": "AS", "mesh": "MS",
@@ -225,15 +260,17 @@ def _context_api_token(value):
 
 
 class MaterialPanelController(object):
-    """Own UI-selected, event-scoped local D3D11/D3D12 material sessions."""
+    """Own UI-selected reflected field edits shared by every buffer consumer."""
 
-    def __init__(self, snapshot_fn, apply_fn, rollback_fn, context_fn):
+    def __init__(self, snapshot_fn, apply_fn, rollback_fn, context_fn, apply_async_fn=None):
         self._snapshot = snapshot_fn
         self._apply = apply_fn
         self._rollback = rollback_fn
         self._context = context_fn
         self._sessions = collections.OrderedDict()
         self._physical_keys = {}
+        self._apply_async = apply_async_fn
+        self.edit_queue = MaterialEditQueue(self._dispatch_edit)
 
     def _current_context(self):
         value = self._context()
@@ -248,13 +285,9 @@ class MaterialPanelController(object):
             raise MaterialPanelError(
                 "The capture API is unavailable; ReplayLab material editing cannot be enabled "
                 "safely")
-        if api_token not in ("d3d11", "d3d12"):
+        if api_token not in ("d3d11", "d3d12", "opengl", "vulkan"):
             raise MaterialPanelError(
-                "Current capture API is %s; event-scoped material editing currently supports "
-                "D3D11 and D3D12 only" % api_name)
-        if capture.get("local") is not True:
-            raise MaterialPanelError(
-                "This capture is using remote replay; material editing requires local replay")
+                "Current capture API does not support shared CBuffer editing: %s" % api_name)
         if not str(capture.get("captureId", "") or ""):
             raise MaterialPanelError(
                 "The capture has no ReplayLab catalog identity yet; run the project's initial "
@@ -266,7 +299,8 @@ class MaterialPanelController(object):
             "captureId": capture_id,
             "captureSessionId": capture_session_id,
             "eventId": _integer(events.get("currentEventId"), "current event ID", 1),
-            "api": "D3D12" if api_token == "d3d12" else "D3D11",
+            "api": {"d3d11": "D3D11", "d3d12": "D3D12", "opengl": "OpenGL",
+                    "vulkan": "Vulkan"}[api_token],
         }
 
     @staticmethod
@@ -278,7 +312,8 @@ class MaterialPanelController(object):
             "path": _text(value.get("path"), "CBuffer field path"),
             "displayName": _text(
                 value.get("displayName", value.get("path")), "CBuffer display name"),
-            "byteOffset": _integer(value.get("byteOffset"), "field byte offset", 0, 64 * 1024),
+            "byteOffset": _integer(value.get("byteOffset"), "field byte offset", 0,
+                                   MAX_SHARED_CBUFFER_BYTES - 4),
             "byteSize": _integer(value.get("byteSize"), "field byte size", 4, 16),
             "baseType": _canonical_base_type(value.get("baseType")),
             "components": _integer(value.get("components"), "field components", 1, 4),
@@ -309,9 +344,7 @@ class MaterialPanelController(object):
             raise MaterialPanelError("The BufferViewer selection is stale; select the draw again")
 
         physical_key = (
-            current["captureSessionId"], selection["eventId"], selection["stage"],
-            selection["physicalSlot"], selection["registerSpace"],
-            selection["shaderResourceId"],
+            current["captureSessionId"],
             selection["bufferResourceId"], selection["bufferByteOffset"],
             selection["bufferByteSize"],
         )
@@ -322,6 +355,7 @@ class MaterialPanelController(object):
             snapshot = self._snapshot({
                 "event_id": selection["eventId"],
                 "block_index": selection["blockIndex"],
+                "array_index": selection["arrayIndex"],
                 "stage": selection["stage"],
                 "expected_capture_id": current["captureId"],
             })
@@ -339,6 +373,8 @@ class MaterialPanelController(object):
                     ("stage", str(snapshot.get("stage", "")), selection["stage"]),
                     ("blockIndex", _integer(snapshot.get("blockIndex"),
                                             "snapshot block index"), selection["blockIndex"]),
+                    ("arrayIndex", _integer(snapshot.get("arrayIndex", 0),
+                                            "snapshot binding array index"), selection["arrayIndex"]),
                     ("slot", _integer(snapshot.get("slot"), "snapshot slot", 0, 0xFFFFFFFF),
                      selection["physicalSlot"]),
                     ("registerSpace", _integer(snapshot.get("registerSpace", 0),
@@ -354,7 +390,7 @@ class MaterialPanelController(object):
                                             "snapshot byte offset"),
                      selection["bufferByteOffset"]),
                     ("byteSize", _integer(snapshot.get("byteSize"),
-                                          "snapshot byte size", 16, 64 * 1024),
+                                          "snapshot byte size", 4, MAX_SHARED_CBUFFER_BYTES),
                      selection["bufferByteSize"]),
                 )
                 for label, observed, expected in checks:
@@ -363,7 +399,8 @@ class MaterialPanelController(object):
                             "The live CBuffer %s no longer matches the native selection" % label)
 
                 valid_size = _integer(
-                    snapshot.get("validByteSize"), "valid CBuffer byte size", 16, 64 * 1024)
+                    snapshot.get("validByteSize"), "valid CBuffer byte size", 4,
+                    MAX_SHARED_CBUFFER_BYTES)
                 baseline = _decode_raw_base64(snapshot.get("rawBase64"), valid_size)
                 raw_sha = _sha256(snapshot.get("rawSha256"), "snapshot raw hash")
                 if hashlib.sha256(baseline).hexdigest() != raw_sha:
@@ -413,8 +450,6 @@ class MaterialPanelController(object):
                 raise
             self._sessions[session_id] = session
             self._physical_keys[physical_key] = session_id
-        elif session["blockIndex"] != selection["blockIndex"]:
-            raise MaterialPanelError("The physical CBuffer slot resolves to a different block")
 
         candidates = []
         for field in session["fieldsById"].values():
@@ -442,7 +477,7 @@ class MaterialPanelController(object):
             data[start:start + leaf["byteSize"]] = packed
         return bytes(data)
 
-    def update(self, session_id, parameter_id, value):
+    def prepare_update(self, session_id, parameter_id, value):
         session_id = _hex(session_id, "material session ID", 32)
         parameter_id = _hex(parameter_id, "material parameter ID", 32)
         session = self._sessions.get(session_id)
@@ -452,9 +487,6 @@ class MaterialPanelController(object):
         if (current["captureSessionId"] != session["captureSessionId"] or
                 current["captureId"] != session["captureId"]):
             raise MaterialPanelError("The material session belongs to an expired capture")
-        if current["eventId"] != session["eventId"]:
-            raise MaterialPanelError(
-                "Select EID %d before editing this event-scoped material" % session["eventId"])
         if parameter_id not in session["exposed"]:
             raise MaterialPanelError("The parameter was not exposed by a native UI selection")
         leaf = session["fieldsById"].get(parameter_id)
@@ -474,7 +506,7 @@ class MaterialPanelController(object):
                 "packedBase64": base64.b64encode(leaf_packed).decode("ascii"),
             })
 
-        response = self._apply({
+        params = {
             "snapshot_id": session["snapshotId"],
             "expected_capture_id": session["captureId"],
             "expected_capture_session_id": session["captureSessionId"],
@@ -486,7 +518,17 @@ class MaterialPanelController(object):
             "data_base64": base64.b64encode(rebuilt).decode("ascii"),
             "data_sha256": data_sha,
             "patches": patch_values,
-        })
+        }
+        return {"session": session, "params": params, "patches": patches, "dataSha": data_sha}
+
+    def accept_update(self, prepared, response):
+        session = prepared["session"]
+        session_id = session["sessionId"]
+        if self._sessions.get(session_id) is not session:
+            raise MaterialPanelError("The material session belongs to an expired capture")
+        data_sha = prepared["dataSha"]
+        if session["revision"] != prepared["params"]["expected_revision"]:
+            raise MaterialPanelError("The material editor revision changed during replay")
         if not isinstance(response, dict) or response.get("schema") != OVERRIDE_SCHEMA:
             raise MaterialPanelError("ReplayLab returned an invalid CBuffer override response")
         if (_hex(response.get("snapshotId"), "override snapshot ID", 32) !=
@@ -496,11 +538,62 @@ class MaterialPanelController(object):
                 not response.get("configured") or not response.get("appliedToCurrentEvent")):
             raise MaterialPanelError("CBuffer override response failed its identity check")
 
-        session["patches"] = patches
+        session["patches"] = prepared["patches"]
         session["currentRawSha256"] = data_sha
         session["revision"] += 1
         session["overrideId"] = _hex(response.get("overrideId"), "override ID", 32)
+        session["generation"] = response.get("generation", 0)
+        session["previewPublished"] = bool(response.get("previewPublished", False))
+        session["replayedEventId"] = response.get("replayedEventId")
         return self.status(session_id)
+
+    def update(self, session_id, parameter_id, value):
+        if self.edit_queue.busy:
+            raise MaterialPanelError("A material edit is already queued")
+        prepared = self.prepare_update(session_id, parameter_id, value)
+        return self.accept_update(prepared, self._apply(prepared["params"]))
+
+    def submit_text(self, session_id, parameter_id, text, complete, owner):
+        self.edit_queue.submit(("edit", session_id, parameter_id),
+            {"kind": "edit", "sessionId": session_id, "parameterId": parameter_id,
+             "text": str(text)}, complete, owner)
+
+    def submit_rollback(self, session_id, complete, owner):
+        self.edit_queue.remove_pending(lambda job: job["sessionId"] == session_id)
+        self.edit_queue.submit(("clear", session_id),
+            {"kind": "clear", "sessionId": session_id}, complete, owner)
+
+    def _dispatch_edit(self, job, cancel, complete):
+        if self._apply_async is None:
+            raise MaterialPanelError("Asynchronous material replay is unavailable")
+        session = self._sessions.get(job["sessionId"])
+        if session is None:
+            raise MaterialPanelError("Unknown or expired material-panel session")
+        clear = job["kind"] == "clear"
+        if clear:
+            params = self._rollback_params(session)
+            prepared = None
+        else:
+            leaf = session["fieldsById"].get(job["parameterId"])
+            if leaf is None:
+                raise MaterialPanelError("Unknown material parameter")
+            value = parse_parameter_text(job["text"], leaf["baseType"], leaf["components"])
+            prepared = self.prepare_update(job["sessionId"], job["parameterId"], value)
+            params = prepared["params"]
+
+        def finished(response, error):
+            status = None
+            if error is None:
+                try:
+                    # A closed dock must still retain genuinely committed versions
+                    # in the surviving controller. A new capture expires the session.
+                    if self._sessions.get(job["sessionId"]) is session:
+                        status = self.accept_rollback(session, response) if clear else self.accept_update(prepared, response)
+                except Exception as exc:
+                    error = exc
+            complete(status, error)
+
+        self._apply_async(params, clear, cancel, finished)
 
     def update_text(self, session_id, parameter_id, text):
         session = self._sessions.get(session_id)
@@ -515,9 +608,9 @@ class MaterialPanelController(object):
         leaf = session["fieldsById"][leaf_id]
         current = self._rebuilt_bytes(session, session["patches"])
         absolute_offset = session["byteOffset"] + leaf["byteOffset"]
-        physical = ("EID %d · %s b%d space%d · block[%d] · window +0x%X · "
+        physical = ("EID %d · %s binding%d space%d · block[%d] · window +0x%X · "
                     "field +0x%X (buffer +0x%X) · shader %d · buffer %d" % (
-                        session["eventId"], _stage_abbreviation(session["stage"]),
+                        session["eventId"], _stage_abbreviation(session["stage"], session["api"]),
                         session["slot"], session["registerSpace"], session["blockIndex"],
                         session["byteOffset"],
                         leaf["byteOffset"], absolute_offset, session["shaderResourceId"],
@@ -530,6 +623,9 @@ class MaterialPanelController(object):
             "components": leaf["components"],
             "byteOffset": leaf["byteOffset"],
             "byteSize": leaf["byteSize"],
+            "bufferResourceId": session["bufferResourceId"],
+            "bindingByteOffset": session["byteOffset"],
+            "absoluteByteOffset": absolute_offset,
             "value": _leaf_values(current, leaf),
             "physicalIdentity": physical,
         }
@@ -558,7 +654,10 @@ class MaterialPanelController(object):
             "revision": session["revision"],
             "overrideId": session["overrideId"],
             "configured": bool(session["overrideId"]),
-            "scope": "exact-event",
+            "scope": "shared-buffer-range",
+            "generation": session.get("generation", 0),
+            "previewPublished": session.get("previewPublished", False),
+            "replayedEventId": session.get("replayedEventId"),
             "api": session["api"],
             "parameters": [self._parameter_public(session, leaf_id)
                            for leaf_id in session["exposed"]],
@@ -572,12 +671,23 @@ class MaterialPanelController(object):
         session = self._sessions.get(session_id)
         if session is None:
             raise MaterialPanelError("Unknown or expired material-panel session")
-        response = self._rollback({
+        if self.edit_queue.busy:
+            raise MaterialPanelError("A material edit is already queued")
+        return self.accept_rollback(session, self._rollback(self._rollback_params(session)))
+
+    @staticmethod
+    def _rollback_params(session):
+        return {
             "snapshot_id": session["snapshotId"],
             "override_id": session["overrideId"],
             "expected_capture_id": session["captureId"],
             "expected_capture_session_id": session["captureSessionId"],
-        })
+        }
+
+    def accept_rollback(self, session, response):
+        session_id = session["sessionId"]
+        if self._sessions.get(session_id) is not session:
+            raise MaterialPanelError("The material session belongs to an expired capture")
         if not isinstance(response, dict) or response.get("schema") != OVERRIDE_SCHEMA:
             raise MaterialPanelError("ReplayLab returned an invalid rollback response")
         if not response.get("snapshotReleased"):
@@ -600,337 +710,6 @@ class MaterialPanelController(object):
 
     def forget_all(self):
         """Forget UI state after the bridge has invalidated the capture lifecycle."""
+        self.edit_queue.reset()
         self._sessions.clear()
         self._physical_keys.clear()
-
-
-class MiniQtMaterialPanel(object):
-    """A portable dock panel using qrenderdoc's MiniQt helper only."""
-
-    def __init__(self, ctx, qrd_module, qt_core, controller, closed_callback=None):
-        self.ctx = ctx
-        self.qrd = qrd_module
-        self.qt_core = qt_core
-        self.controller = controller
-        self.closed_callback = closed_callback
-        self.mqt = ctx.Extensions().GetMiniQtHelper()
-        self.top = self.mqt.CreateToplevelWidget(
-            "ReplayLab Material Parameters", self._closed)
-        self.root = self.mqt.CreateVerticalContainer()
-        self.mqt.AddWidget(self.top, self.root)
-        self.capability = self.mqt.CreateLabel()
-        self.mqt.SetWidgetText(
-            self.capability,
-            "Local D3D11/D3D12 · exact-event scope · reflected float/int/uint scalar/vec1-4")
-        self.mqt.AddWidget(self.root, self.capability)
-        self.content = self.mqt.CreateVerticalContainer()
-        self.mqt.AddWidget(self.root, self.content)
-        self.status_label = self.mqt.CreateLabel()
-        self.mqt.SetWidgetText(self.status_label, "No exposed parameters")
-        self.mqt.AddWidget(self.root, self.status_label)
-        self.rollback_all_button = self.mqt.CreateButton(self._rollback_all_clicked)
-        self.mqt.SetWidgetText(self.rollback_all_button, "Rollback all material overrides")
-        self.mqt.AddWidget(self.root, self.rollback_all_button)
-        self._docked = False
-        self._building = False
-        self._generation = {}
-        self._row_status = {}
-        self._dynamic_roots = []
-        self._alive = True
-        self._callback_epoch = 0
-        self._closed_notified = False
-        self._pending_timers = []
-
-    def _retire_timer(self, timer):
-        try:
-            self._pending_timers.remove(timer)
-        except ValueError:
-            pass
-        try:
-            timer.stop()
-        except Exception:
-            pass
-        try:
-            timer.timeout.disconnect()
-        except Exception:
-            pass
-        try:
-            timer.deleteLater()
-        except Exception:
-            pass
-
-    def _cancel_pending_timers(self):
-        # QTimer.singleShot retains an opaque Python callback that cannot be
-        # cancelled.  Owning each debounce timer explicitly lets shutdown drop
-        # every callback before qrenderdoc tears down PySide/Python 3.6.
-        for timer in list(self._pending_timers):
-            self._retire_timer(timer)
-        self._pending_timers = []
-
-    def _schedule_debounced(self, callback, delay_ms):
-        timer = self.qt_core.QTimer()
-        timer.setSingleShot(True)
-
-        def _fired(selected_timer=timer, selected_callback=callback):
-            self._retire_timer(selected_timer)
-            selected_callback()
-
-        timer.timeout.connect(_fired)
-        self._pending_timers.append(timer)
-        timer.start(int(delay_ms))
-
-    def _closed(self, _ctx, _widget, _text):
-        # This callback runs from QWidget destruction. Never enter replay or MiniQt here: doing so
-        # re-enters Qt while its object tree is being torn down and can crash qrenderdoc. Explicit
-        # rollback remains available in the panel and shutdown() performs it before destruction.
-        if self.top is None and self._closed_notified:
-            return
-        self._cancel_pending_timers()
-        self._alive = False
-        self._callback_epoch += 1
-        self._generation.clear()
-        self._row_status.clear()
-        self._dynamic_roots = []
-        self._docked = False
-        callback = None
-        if self.closed_callback and not self._closed_notified:
-            self._closed_notified = True
-            callback = self.closed_callback
-        # Release borrowed native handles before interpreter finalization.  In
-        # particular an undocked panel has no ToolWindowManager owner, so its
-        # QWidget would otherwise survive until Qt/Python shutdown ordering is
-        # already unsafe.
-        self.closed_callback = None
-        self.top = None
-        self.root = None
-        self.capability = None
-        self.content = None
-        self.status_label = None
-        self.rollback_all_button = None
-        self.ctx = None
-        self.qrd = None
-        self.qt_core = None
-        self.mqt = None
-        self.controller = None
-        if callback:
-            callback()
-
-    def _require_alive(self):
-        if not self._alive or self.top is None:
-            raise MaterialPanelError("The material panel has already been closed")
-
-    def show(self):
-        self._require_alive()
-        if not self._docked:
-            ref = None
-            dock_ref = self.qrd.DockReference.MainToolArea
-            try:
-                if self.ctx.HasPipelineViewer():
-                    ref = self.ctx.GetPipelineViewer().Widget()
-                    dock_ref = self.qrd.DockReference.RightOf
-            except Exception:
-                ref = None
-                dock_ref = self.qrd.DockReference.MainToolArea
-            self.ctx.AddDockWindow(self.top, dock_ref, ref, 0.30)
-            self._docked = True
-        self.ctx.RaiseDockWindow(self.top)
-
-    @staticmethod
-    def _format_value(parameter):
-        if parameter["baseType"] == "Float":
-            return ", ".join("%.9g" % value for value in parameter["value"])
-        return ", ".join(str(value) for value in parameter["value"])
-
-    def _set_status(self, text):
-        self.mqt.SetWidgetText(self.status_label, str(text))
-
-    def expose(self, selection):
-        self._require_alive()
-        status = self.controller.expose(selection)
-        self.rebuild()
-        self.show()
-        self._set_status(
-            "Exposed %d parameter(s) at EID %d; valid edits replay immediately" %
-            (len(status["parameters"]), status["eventId"]))
-        return status
-
-    def _destroy_dynamic(self):
-        self.mqt.ClearContainedWidgets(self.content)
-        for widget in self._dynamic_roots:
-            try:
-                self.mqt.DestroyWidget(widget)
-            except Exception:
-                pass
-        self._dynamic_roots = []
-        self._row_status = {}
-
-    def rebuild(self):
-        self._require_alive()
-        self._building = True
-        try:
-            self._destroy_dynamic()
-            statuses = self.controller.list_status()
-            self.mqt.SetWidgetEnabled(self.rollback_all_button, bool(statuses))
-            if not statuses:
-                empty = self.mqt.CreateLabel()
-                self.mqt.SetWidgetText(
-                    empty,
-                    "Open a Pipeline State CBuffer, right-click a reflected value, then choose\n"
-                    "ReplayLab → Expose as Material Parameter.")
-                self.mqt.AddWidget(self.content, empty)
-                self._dynamic_roots.append(empty)
-                self._set_status(
-                    "No active material session; controls remain disabled until a native "
-                    "D3D11/D3D12 CBuffer leaf is exposed")
-            for session in statuses:
-                group = self.mqt.CreateGroupBox(True)
-                title = "%s — EID %d %s b%d space%d (block[%d])" % (
-                    session["constantBlockDisplayName"] or session["constantBlockPath"],
-                    session["eventId"], _stage_abbreviation(session["stage"]),
-                    session["slot"], session["registerSpace"], session["blockIndex"])
-                self.mqt.SetWidgetText(group, title)
-                body = self.mqt.CreateVerticalContainer()
-                self.mqt.AddWidget(group, body)
-                self.mqt.AddWidget(self.content, group)
-                self._dynamic_roots.append(group)
-
-                for parameter in session["parameters"]:
-                    label = self.mqt.CreateLabel()
-                    self.mqt.SetWidgetText(
-                        label, "%s [%s%d]\n%s" % (
-                            parameter["displayName"], parameter["baseType"],
-                            parameter["components"], parameter["physicalIdentity"]))
-                    self.mqt.AddWidget(body, label)
-
-                    row = self.mqt.CreateHorizontalContainer()
-                    session_id = session["sessionId"]
-                    parameter_id = parameter["parameterId"]
-
-                    def _changed(_ctx, widget, _text_value,
-                                 sid=session_id, pid=parameter_id):
-                        if self._building or not self._alive:
-                            return
-                        key = (sid, pid)
-                        generation = self._generation.get(key, 0) + 1
-                        self._generation[key] = generation
-                        callback_epoch = self._callback_epoch
-
-                        def _apply_debounced(expected=generation, selected_key=key,
-                                             selected_widget=widget,
-                                             expected_epoch=callback_epoch):
-                            if (not self._alive or self.top is None or
-                                    self._callback_epoch != expected_epoch or
-                                    self._generation.get(selected_key) != expected):
-                                return
-                            self._apply_widget_text(
-                                selected_key[0], selected_key[1], selected_widget)
-
-                        self._schedule_debounced(_apply_debounced, 180)
-
-                    textbox = self.mqt.CreateTextBox(True, _changed)
-                    self.mqt.SetWidgetText(textbox, self._format_value(parameter))
-                    self.mqt.AddWidget(row, textbox)
-
-                    def _apply_clicked(_ctx, _widget, _text_value,
-                                       sid=session_id, pid=parameter_id,
-                                       selected_widget=textbox):
-                        if not self._alive or self.top is None:
-                            return
-                        self._apply_widget_text(sid, pid, selected_widget)
-
-                    apply_button = self.mqt.CreateButton(_apply_clicked)
-                    self.mqt.SetWidgetText(apply_button, "Apply")
-                    self.mqt.AddWidget(row, apply_button)
-                    self.mqt.AddWidget(body, row)
-
-                    row_status = self.mqt.CreateLabel()
-                    self.mqt.SetWidgetText(row_status, "Captured baseline")
-                    self.mqt.AddWidget(body, row_status)
-                    self._row_status[(session_id, parameter_id)] = row_status
-
-                def _rollback_clicked(_ctx, _widget, _text_value,
-                                      sid=session["sessionId"]):
-                    if not self._alive or self.top is None:
-                        return
-                    try:
-                        self.controller.rollback(sid)
-                        self.rebuild()
-                        self._set_status("Rolled back and released material session %s" % sid)
-                    except Exception as exc:
-                        self._set_status("Rollback failed: %s" % str(exc))
-
-                rollback = self.mqt.CreateButton(_rollback_clicked)
-                self.mqt.SetWidgetText(rollback, "Rollback this CBuffer")
-                self.mqt.AddWidget(body, rollback)
-        finally:
-            self._building = False
-
-    def _apply_widget_text(self, session_id, parameter_id, widget):
-        if not self._alive or self.top is None:
-            return
-        try:
-            text = self.mqt.GetWidgetText(widget)
-            status = self.controller.update_text(session_id, parameter_id, text)
-            message = "Applied revision %d; EID %d replayed" % (
-                status["revision"], status["eventId"])
-            label = self._row_status.get((session_id, parameter_id))
-            if label:
-                self.mqt.SetWidgetText(label, message)
-            self._set_status(message)
-        except Exception as exc:
-            label = self._row_status.get((session_id, parameter_id))
-            message = "Not applied: %s" % str(exc)
-            if label:
-                self.mqt.SetWidgetText(label, message)
-            self._set_status(message)
-
-    def _rollback_all_clicked(self, _ctx, _widget, _text):
-        if not self._alive or self.top is None:
-            return
-        try:
-            count = len(self.controller.list_status())
-            self.controller.rollback_all()
-            self.rebuild()
-            self._set_status("Rolled back %d material session(s)" % count)
-        except Exception as exc:
-            self._set_status("Rollback failed: %s" % str(exc))
-
-    def capture_changed(self):
-        self.controller.forget_all()
-        if self._alive and self._docked:
-            self.rebuild()
-            self._set_status("Capture changed; all material-panel identities expired")
-
-    def shutdown(self, rollback=True):
-        if not self._alive and self.top is None:
-            if self.controller is not None:
-                self.controller.forget_all()
-            return
-        controller = self.controller
-        top = self.top
-        mqt = self.mqt
-        was_docked = self._docked
-        self._cancel_pending_timers()
-        if rollback and controller is not None:
-            try:
-                controller.rollback_all()
-            except Exception as exc:
-                print("[ReplayLab] Material panel shutdown rollback error: %s" % str(exc))
-        if controller is not None:
-            controller.forget_all()
-        self._alive = False
-        self._callback_epoch += 1
-        self._generation.clear()
-        try:
-            if top is not None and mqt is not None:
-                if was_docked:
-                    mqt.CloseToplevelWidget(top)
-                else:
-                    # The panel is constructed eagerly but may never be docked.
-                    # MiniQt CloseToplevelWidget cannot delete that orphan.
-                    mqt.DestroyWidget(top)
-        except Exception:
-            pass
-        # DestroyWidget is deferred for the undocked case. Detach borrowed
-        # handles synchronously and let the native callback become a no-op.
-        self._closed(None, top, "")

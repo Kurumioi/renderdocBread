@@ -1,5 +1,7 @@
 # RenderDoc Custom Fork — AI Reference
 
+> **Read BOTH this file and [`AGENTS.md`](./AGENTS.md) before making changes — together they are one unified rule set.** Claude Code reads `CLAUDE.md`; OpenAI Codex and other agents read `AGENTS.md`; each points at the other so neither agent misses a rule. They are complementary, not duplicates: **`CLAUDE.md`** is canonical for project structure, the build/release pipeline, upstream sync, and pitfalls; **`AGENTS.md`** is canonical for the UI/ReplayLab **localization (i18n) rules**. If a rule's home is the other file, follow it there and keep the two in sync.
+
 This is a custom fork of [RenderDoc](https://github.com/baldurk/renderdoc) with feature-hiding modifications. The upstream remote is `upstream` (baldurk/renderdoc), our fork is `origin` (crossous/renderdoc).
 
 ## Project Structure Overview
@@ -229,3 +231,21 @@ Upstream added new .cpp/.h files to `renderdoc.vcxproj` that are missing from `r
 
 ### Binary `.rc` file conflicts during rebase
 The `.rc` files (e.g. `qrenderdoc.rc`, `renderdoccmd.rc`) may be UTF-16LE binary. Git can't merge them. **Fix:** take the upstream version and re-apply the name changes (e.g. `"RenderDoc"` → `"RenderSocoDocWOW"`) using python byte-level replacement or manual editing.
+
+---
+
+## Development replay profiling
+
+For interactive D3D11, D3D12, OpenGL and Vulkan replay performance testing in `Development`, pass
+`/p:ReplayOptimizeDevelopment=true`, or use `build-dev.ps1 -SkipRuntime -OptimizeReplay`.
+This optimizes each graphics driver project, including its precompiled header, while retaining
+Development diagnostics and PDB symbols. The shared core keeps its normal flags, and the default
+Development build remains `/Od`. Always record this flag when comparing EID timing.
+Use `/m:2` and an explicit `SolutionDir` as usual. Profiling and A/B controls are documented in
+`util/perf/README.md`.
+
+## Internationalization (i18n)
+
+**The full i18n / localization rules live in [`AGENTS.md`](./AGENTS.md)** ("UI localization" and "ReplayLab built-in Python integration localization") plus `util/i18n/README.md` and `qrenderdoc/Translations/glossary.zh_CN.yaml`. **Read them before adding or changing any user-facing string** — every UI string must be `tr()`-wrapped/registered and translated, or it renders in English (and `build_translations.ps1 -RequireComplete` fails).
+
+One build-adjacent reminder that bites when adding AI providers: ReplayLab provider-catalog text (`title` / `note` / `install_hint` / `subscription_instruction` from `replaylab/src/replaylab_agent/catalog.py`) is runtime JSON that `lupdate` cannot see, so each string must be registered with its **exact English source** in `providerCatalogTranslations[]` in `qrenderdoc/Windows/AI/AIAssistant.cpp`. Changing the Python English without updating that table's source silently falls back to English. Also prefer building UI result text from a stable status in C++ with `tr()` over displaying raw backend English (see AGENTS.md rule on backend/runtime data).

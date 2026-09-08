@@ -59,7 +59,7 @@ _MAX_CANDIDATE_PAYLOAD_JSON_BYTES = 6 * 1024 * 1024
 _MAX_REPORT_JSON_BYTES = 8 * 1024 * 1024
 _READ_CHUNK_BYTES = 1024 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-_D3D_PROFILE_RE = re.compile(r"^(?:ps|vs|gs|hs|ds|cs|as|ms)_\d+_\d+$")
+_D3D_PROFILE_RE = re.compile(r"^(?:ps|vs|gs|hs|ds|cs|as|ms|lib)_\d+_\d+$")
 
 
 # Values are (language, role, extension stage hint).  These are classifications
@@ -127,6 +127,13 @@ _D3D_KIND_TO_STAGE_PREFIX = {
 }
 
 _DXIL_EXTRA_KIND_TO_STAGE_PREFIX = {
+    6: ("library", "lib"),
+    7: ("raygen", "lib"),
+    8: ("intersection", "lib"),
+    9: ("anyhit", "lib"),
+    10: ("closesthit", "lib"),
+    11: ("miss", "lib"),
+    12: ("callable", "lib"),
     13: ("mesh", "ms"),
     14: ("task", "as"),
 }
@@ -816,7 +823,7 @@ def _d3d_profile_from_container(
     if kind not in mapping:
         return "", ""
     if chunk.fourcc == "DXIL":
-        if major < 6 or kind in range(6, 13):
+        if major < 6:
             return "", ""
     elif (
         major not in {4, 5}
@@ -1109,7 +1116,9 @@ def _binary_candidates(
                 "binary",
             )
             candidate["fingerprints"]["rawSha256"] = file_sha256
-            candidate["factSources"]["rawSha256"] = "validated whole-file SPIR-V"
+            candidate["factSources"]["rawSha256"] = (
+                "structurally parsed whole-file SPIR-V"
+            )
             entries = spirv["entryPoints"]
             if len(entries) == 1 and entries[0]["stage"] != "unknown":
                 candidate["shaderFacts"]["stage"] = entries[0]["stage"]

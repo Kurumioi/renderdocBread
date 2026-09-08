@@ -44,6 +44,10 @@ _STAGE_ALIASES = {
     "as": "task",
     "amplification": "task",
     "ms": "mesh",
+    "raygeneration": "raygen",
+    "ray generation": "raygen",
+    "ray-generation": "raygen",
+    "ray_generation": "raygen",
     "tess_ctrl": "hull",
     "tess_eval": "domain",
 }

@@ -9,36 +9,50 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import os
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+import shutil
+import sys
+import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .. import __version__
-from ..errors import AuthenticationError, ConfigurationError, ConnectorError, PolicyError
+from ..conversation import (
+    MAX_CONVERSATION_ATTACHMENT_TOTAL_BINARY_BYTES,
+    MAX_CONVERSATION_ATTACHMENTS_PER_TURN,
+    ProviderBinaryAttachment,
+    ProviderPathAttachment,
+)
+from ..errors import (
+    AuthenticationError,
+    ConfigurationError,
+    ConnectorError,
+    LifecycleCleanupError,
+    PolicyError,
+    ProviderCapabilityError,
+)
 
 DeltaCallback = Callable[[str], Any]
 ActivityCallback = Callable[[str, float], Any]
 TimelineCallback = Callable[[Mapping[str, Any]], Any]
-DynamicToolHandler = Callable[[str, dict[str, Any], str], Awaitable[Any]]
-ServerRequestHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+ReasoningCallback = Callable[[Mapping[str, Any]], Any]
+AssistantMessageCallback = Callable[[Mapping[str, Any]], Any]
 _MAX_JSONL_MESSAGE_BYTES = 4 * 1024 * 1024
 MAX_EXTERNAL_RESPONSE_CHARS = 1024 * 1024
 MAX_EXTERNAL_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_NOTIFICATION_QUEUE = 256
 _MAX_SERVER_REQUEST_TASKS = 16
-_MAX_DYNAMIC_TOOL_CALLS = 1024
+_MCP_STARTUP_TIMEOUT_SECONDS = 60.0
+_MCP_STARTUP_POLL_SECONDS = 0.25
 _MAX_TIMELINE_ITEMS = 128
 _MAX_TIMELINE_ID_CHARS = 256
 _MAX_TIMELINE_TEXT_CHARS = 4096
-_MAX_COMMAND_CHARS = 2048
-_MAX_COMMAND_OUTPUT_CHARS = 8192
-_MAX_COMMAND_OUTPUT_RAW_CHARS = 16 * 1024
-_MAX_VISIBLE_COMMAND_OUTPUT_CHARS = 1200
 _MAX_REASONING_SUMMARY_CHARS = 8192
 _MAX_PLAN_CHARS = 8192
 _MAX_PLAN_STEPS = 32
@@ -66,14 +80,20 @@ _SENSITIVE_KEY_RE = re.compile(_SENSITIVE_NAME, re.IGNORECASE)
 _TOKEN_SHAPE_RE = re.compile(
     r"(?i)\b(?:sk|rk|pk|ghp|github_pat|xox[baprs])-[_A-Za-z0-9-]{8,}\b"
 )
-_DYNAMIC_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_DYNAMIC_TOOL_SPEC_KEYS = frozenset(
-    {"type", "name", "description", "inputSchema", "deferLoading"}
+_READ_ONLY_PERMISSION_PROFILE = ":read-only"
+_PERMISSION_PROFILE_CAPABILITY = "codex-app-server.permission-profiles-v2"
+_PERMISSION_PROTOCOL_UNSUPPORTED = (
+    "codex-app-server.permission-profile-contract-unsupported"
 )
-_TOOL_PHASE_IDLE = "idle"
-_TOOL_PHASE_STARTING = "starting"
-_TOOL_PHASE_RUNNING = "running"
-_TOOL_PHASE_CLOSING = "closing"
+_READ_ONLY_PROFILE_UNAVAILABLE = "codex-app-server.read-only-profile-unavailable"
+_READ_SCOPE_UNVERIFIED = "codex-app-server.read-scope-unverified"
+_ATTACHMENT_ROOT_RE = re.compile(r"^\.replaylab-attachments-[0-9a-f]{32}$")
+_IMAGE_SUFFIXES = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
 
 
 def _valid_request_id(value: Any) -> bool:
@@ -82,55 +102,6 @@ def _valid_request_id(value: Any) -> bool:
     if isinstance(value, int):
         return -(2**63) <= value < 2**63
     return isinstance(value, str)
-
-
-def _validated_dynamic_tool_specs(
-    values: Sequence[Mapping[str, Any]],
-) -> tuple[dict[str, Any], ...]:
-    """Return a detached, JSON-safe function-only dynamic-tool inventory."""
-
-    result: list[dict[str, Any]] = []
-    for raw in values:
-        if not isinstance(raw, Mapping) or any(not isinstance(key, str) for key in raw):
-            raise ConfigurationError("Codex dynamic tool definitions must be JSON objects")
-        unexpected = set(raw) - _DYNAMIC_TOOL_SPEC_KEYS
-        if unexpected:
-            raise ConfigurationError(
-                "Codex dynamic tool definition contains unsupported fields: "
-                + ", ".join(sorted(unexpected))
-            )
-        if raw.get("type") != "function":
-            raise ConfigurationError(
-                "ReplayLab supports only top-level Codex function dynamic tools"
-            )
-        name = raw.get("name")
-        description = raw.get("description")
-        input_schema = raw.get("inputSchema")
-        if not isinstance(name, str) or _DYNAMIC_TOOL_NAME_RE.fullmatch(name) is None:
-            raise ConfigurationError("Codex dynamic tool name is invalid")
-        if not isinstance(description, str) or "\0" in description:
-            raise ConfigurationError("Codex dynamic tool description must be a string")
-        if not isinstance(input_schema, dict) or input_schema.get("type") != "object":
-            raise ConfigurationError(
-                "Codex dynamic tool inputSchema must describe an object"
-            )
-        if "deferLoading" in raw and not isinstance(raw["deferLoading"], bool):
-            raise ConfigurationError("Codex dynamic tool deferLoading must be boolean")
-        try:
-            encoded = json.dumps(
-                dict(raw),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
-            normalized = json.loads(encoded)
-        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
-            raise ConfigurationError("Codex dynamic tool definition is not strict JSON") from exc
-        if len(encoded.encode("utf-8")) > _MAX_JSONL_MESSAGE_BYTES:
-            raise ConfigurationError("Codex dynamic tool definition exceeds the JSONL bound")
-        result.append(normalized)
-    return tuple(result)
 
 
 def checked_response_size(text: str, chars: int = 0, encoded_bytes: int = 0) -> tuple[int, int]:
@@ -211,70 +182,21 @@ def _safe_structured_detail(value: Any) -> str:
     return _redact_timeline_text(rendered, limit=_MAX_STRUCTURED_DETAIL_CHARS)
 
 
-def _compact_structured_detail(value: Any) -> str:
-    """Render provider arguments as a short, readable parameter list.
+def _argument_names(value: Any) -> tuple[str, ...]:
+    """Return bounded top-level MCP argument names without inspecting values."""
 
-    The activity timeline is an audit summary, not a JSON inspector.  Preserve
-    useful top-level scalar values while representing nested payloads by shape
-    so a large RenderDoc tool result cannot dominate the conversation.
-    """
-
-    def scalar(item: Any) -> str:
-        if item is None:
-            return "null"
-        if isinstance(item, bool):
-            return "true" if item else "false"
-        if isinstance(item, (int, float)):
-            return str(item)
-        if isinstance(item, str):
-            return _redact_timeline_text(item, limit=180).replace("\n", " ")
-        if isinstance(item, Mapping):
-            names = [
-                _redact_timeline_text(key, limit=48)
-                for key in list(item.keys())[:6]
-            ]
-            suffix = ", …" if len(item) > 6 else ""
-            return "{" + ", ".join(names) + suffix + "}"
-        if isinstance(item, Sequence) and not isinstance(item, (bytes, bytearray)):
-            return f"[{len(item)} items]"
-        return _redact_timeline_text(item, limit=180).replace("\n", " ")
-
-    if isinstance(value, Mapping):
-        lines: list[str] = []
-        for index, (raw_key, raw_value) in enumerate(value.items()):
-            if index >= 12:
-                lines.append("… additional parameters hidden")
-                break
-            key = _redact_timeline_text(raw_key, limit=96)
-            rendered = "[REDACTED]" if _SENSITIVE_KEY_RE.search(key) else scalar(raw_value)
-            lines.append(f"{key}: {rendered}")
-        return _redact_timeline_text("\n".join(lines), limit=1200)
-    return _redact_timeline_text(scalar(value), limit=1200)
-
-
-def _compact_result_detail(value: Any) -> str:
-    """Describe an MCP result without embedding its potentially huge payload."""
-
-    if isinstance(value, Mapping):
-        status = value.get("status")
-        ok = value.get("ok")
-        if isinstance(status, str) and status.strip():
-            return "status: " + _redact_timeline_text(status, limit=96)
-        if isinstance(ok, bool):
-            return "status: " + ("ok" if ok else "failed")
-        fields = [
-            _redact_timeline_text(key, limit=48)
-            for key in list(value.keys())[:8]
-            if not _SENSITIVE_KEY_RE.search(str(key))
-        ]
-        if fields:
-            return "fields: " + ", ".join(fields)
-        return "structured result received"
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return f"{len(value)} result item(s) received"
-    if value is None:
-        return "completed without a result payload"
-    return _redact_timeline_text(value, limit=240).replace("\n", " ")
+    if not isinstance(value, Mapping):
+        return ()
+    names: list[str] = []
+    for raw_name in value:
+        if len(names) >= 16:
+            break
+        if not isinstance(raw_name, str):
+            continue
+        name = _redact_timeline_text(raw_name, limit=96).strip()
+        if name:
+            names.append(name)
+    return tuple(sorted(set(names), key=str.casefold))
 
 
 def _normalise_activity_status(value: Any, lifecycle: str) -> str:
@@ -290,24 +212,6 @@ def _normalise_activity_status(value: Any, lifecycle: str) -> str:
 
 def _item_id(value: Any) -> str:
     return _redact_timeline_text(value, limit=_MAX_TIMELINE_ID_CHARS)
-
-
-def _command_text(value: Any) -> str:
-    if isinstance(value, str):
-        rendered = value
-    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
-        parts: list[str] = []
-        size = 0
-        for part in value:
-            text = str(part)
-            parts.append(text[: max(0, _MAX_COMMAND_CHARS - size)])
-            size += len(text) + 1
-            if size >= _MAX_COMMAND_CHARS:
-                break
-        rendered = " ".join(parts)
-    else:
-        rendered = ""
-    return _redact_timeline_text(rendered, limit=_MAX_COMMAND_CHARS)
 
 
 def _summary_text(value: Any) -> str:
@@ -333,14 +237,56 @@ def _summary_text(value: Any) -> str:
     return "\n".join(parts)
 
 
+def _reasoning_content_parts(value: Any) -> tuple[tuple[int, str], ...]:
+    """Extract protocol-defined plaintext parts without serialising provider objects."""
+
+    if isinstance(value, str):
+        return ((0, value),)
+    if not isinstance(value, Sequence) or isinstance(value, (bytes, bytearray)):
+        return ()
+    parts: list[tuple[int, str]] = []
+    for index, part in enumerate(value):
+        if index >= 256:
+            break
+        if isinstance(part, str):
+            parts.append((index, part))
+        elif isinstance(part, Mapping):
+            part_type = part.get("type")
+            text = part.get("text")
+            if part_type in {"reasoning_text", "summary_text", "text", None} and isinstance(
+                text, str
+            ):
+                parts.append((index, text))
+    return tuple(parts)
+
+
+def _opaque_reasoning_metadata(item: Mapping[str, Any]) -> tuple[int, str]:
+    """Describe an opaque reasoning blob without retaining or exposing its contents."""
+
+    for name in ("encrypted_content", "encryptedContent", "signature"):
+        value = item.get(name)
+        if isinstance(value, str) and value:
+            encoded = value.encode("utf-8", errors="backslashreplace")
+            return len(encoded), hashlib.sha256(encoded).hexdigest()
+    return 0, ""
+
+
 @dataclass(slots=True)
 class _TimelineState:
     reasoning: dict[str, str] = field(default_factory=dict)
-    commands: dict[str, str] = field(default_factory=dict)
-    command_cwds: dict[str, str] = field(default_factory=dict)
-    command_output: dict[str, str] = field(default_factory=dict)
-    command_output_truncated: set[str] = field(default_factory=set)
+    reasoning_streams: dict[tuple[str, int], str] = field(default_factory=dict)
+    raw_reasoning: dict[tuple[str, int], str] = field(default_factory=dict)
+    opaque_reasoning: dict[str, tuple[int, str]] = field(default_factory=dict)
+    raw_reasoning_deltas: set[tuple[str, int]] = field(default_factory=set)
+    raw_reasoning_emitted: set[tuple[str, int]] = field(default_factory=set)
+    summary_reasoning_emitted: set[tuple[str, int]] = field(default_factory=set)
+    reasoning_items_seen: set[str] = field(default_factory=set)
+    reasoning_items_completed: set[str] = field(default_factory=set)
+    reasoning_observed: bool = False
     plans: dict[str, str] = field(default_factory=dict)
+    agent_message_phases: dict[str, str] = field(default_factory=dict)
+    commentary: dict[str, str] = field(default_factory=dict)
+    commentary_emitted: set[str] = field(default_factory=set)
 
     def put(self, target: dict[str, str], item_id: str, value: str) -> None:
         if item_id in target or len(target) < _MAX_TIMELINE_ITEMS:
@@ -354,6 +300,41 @@ class _TimelineState:
         if remaining:
             current += delta[:remaining]
             target[item_id] = current
+        return current
+
+    def remember_reasoning_item(self, item_id: str) -> bool:
+        self.reasoning_observed = True
+        if item_id in self.reasoning_items_seen:
+            return True
+        if len(self.reasoning_items_seen) >= _MAX_TIMELINE_ITEMS:
+            return False
+        self.reasoning_items_seen.add(item_id)
+        return True
+
+    def remember_reasoning_key(
+        self, target: set[tuple[str, int]], key: tuple[str, int]
+    ) -> bool:
+        if key in target:
+            return True
+        if len(target) >= _MAX_TIMELINE_ITEMS:
+            return False
+        target.add(key)
+        return True
+
+    def append_reasoning(
+        self,
+        target: dict[tuple[str, int], str],
+        key: tuple[str, int],
+        delta: str,
+        limit: int,
+    ) -> str:
+        if key not in target and len(target) >= _MAX_TIMELINE_ITEMS:
+            return ""
+        current = target.get(key, "")
+        remaining = max(0, limit - len(current))
+        if remaining:
+            current += delta[:remaining]
+            target[key] = current
         return current
 
 
@@ -399,6 +380,7 @@ def _item_timeline_event(
 
     kind = _redact_timeline_text(item.get("type"), limit=64)
     if kind not in {
+        "agentMessage",
         "commandExecution",
         "mcpToolCall",
         "plan",
@@ -417,43 +399,48 @@ def _item_timeline_event(
     status = _normalise_activity_status(item.get("status"), lifecycle)
     duration_ms = item.get("durationMs")
 
+    if kind == "agentMessage":
+        phase = item.get("phase")
+        if phase not in {"commentary", "final_answer"}:
+            return None
+        state.put(state.agent_message_phases, activity_id, phase)
+        if phase != "commentary":
+            return None
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            state.put(
+                state.commentary,
+                activity_id,
+                _redact_timeline_text(text, limit=_MAX_TIMELINE_TEXT_CHARS),
+            )
+        else:
+            text = state.commentary.get(activity_id, "")
+        event = _timeline_event(
+            activity_id=activity_id,
+            kind="progressNote",
+            title=(
+                "Progress update"
+                if lifecycle != "completed"
+                else "Progress update completed"
+            ),
+            detail=str(text or ""),
+            status=status,
+            lifecycle=lifecycle,
+            elapsed=elapsed,
+            duration_ms=duration_ms,
+        )
+        event["publicDetail"] = event["activityDetail"]
+        return event
+
     if kind == "commandExecution":
-        command = _command_text(item.get("command"))
-        cwd = _redact_timeline_text(item.get("cwd"), limit=1024)
-        if command:
-            state.put(state.commands, activity_id, command)
-        else:
-            command = state.commands.get(activity_id, "")
-        if cwd:
-            state.put(state.command_cwds, activity_id, cwd)
-        else:
-            cwd = state.command_cwds.get(activity_id, "")
-        output = ""
-        if lifecycle == "completed":
-            output = _redact_timeline_text(
-                item.get("aggregatedOutput", ""), limit=_MAX_VISIBLE_COMMAND_OUTPUT_CHARS
-            )
-        if not output:
-            output = _redact_timeline_text(
-                state.command_output.get(activity_id, ""),
-                limit=_MAX_VISIBLE_COMMAND_OUTPUT_CHARS,
-            )
         details = []
-        if command:
-            details.append(f"Command: {command}")
-        if cwd:
-            details.append(f"Working directory: {cwd}")
-        if output:
-            details.append(f"Output:\n{output}")
         exit_code = item.get("exitCode")
         if isinstance(exit_code, int) and not isinstance(exit_code, bool):
             details.append(f"Exit code: {exit_code}")
         title = "Running command" if lifecycle != "completed" else "Command completed"
         if status == "failed":
             title = "Command failed"
-        if command:
-            title += f": {command[:120]}"
-        return _timeline_event(
+        event = _timeline_event(
             activity_id=activity_id,
             kind=kind,
             title=title,
@@ -463,36 +450,34 @@ def _item_timeline_event(
             elapsed=elapsed,
             duration_ms=duration_ms,
         )
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            event["exitCode"] = exit_code
+        return event
 
     if kind == "mcpToolCall":
         server = _redact_timeline_text(item.get("server"), limit=128)
         tool = _redact_timeline_text(item.get("tool"), limit=256)
         target = ".".join(part for part in (server, tool) if part) or "MCP tool"
-        details = []
-        if "arguments" in item:
-            arguments = _compact_structured_detail(item.get("arguments"))
-            if arguments:
-                details.append(f"Parameters:\n{arguments}")
-        if lifecycle == "completed" and "result" in item:
-            details.append(f"Result:\n{_compact_result_detail(item.get('result'))}")
+        argument_names = _argument_names(item.get("arguments"))
+        detail = "Arguments: " + ", ".join(argument_names) if argument_names else ""
         if lifecycle == "completed" and item.get("error") is not None:
-            details.append(
-                "Error: "
-                + _redact_timeline_text(item.get("error"), limit=_MAX_STRUCTURED_DETAIL_CHARS)
-            )
+            status = "failed"
         title = f"Calling {target}" if lifecycle != "completed" else f"Called {target}"
         if status == "failed":
             title = f"Call failed: {target}"
-        return _timeline_event(
+        event = _timeline_event(
             activity_id=activity_id,
             kind=kind,
             title=title,
-            detail="\n".join(details),
+            detail=detail,
             status=status,
             lifecycle=lifecycle,
             elapsed=elapsed,
             duration_ms=duration_ms,
         )
+        event["activityTarget"] = target
+        event["argumentNames"] = list(argument_names)
+        return event
 
     if kind == "plan":
         text = _redact_timeline_text(item.get("text"), limit=_MAX_PLAN_CHARS)
@@ -546,12 +531,10 @@ def _item_timeline_event(
         )
 
     if kind == "imageView":
-        path = _redact_timeline_text(item.get("path"), limit=2048)
         return _timeline_event(
             activity_id=activity_id,
             kind=kind,
             title="Viewing image" if lifecycle != "completed" else "Viewed image",
-            detail=path,
             status=status,
             lifecycle=lifecycle,
             elapsed=elapsed,
@@ -614,12 +597,10 @@ class _JsonlProcess:
         *,
         cwd: Path,
         env: Mapping[str, str] | None,
-        server_request_handler: ServerRequestHandler | None = None,
     ) -> None:
         self.command = command
         self.cwd = cwd
         self.env = dict(env) if env is not None else None
-        self.server_request_handler = server_request_handler
         self.process: asyncio.subprocess.Process | None = None
         self.notifications: asyncio.Queue[dict[str, Any] | _TransportClosed | _DeniedServerRequest] = (
             asyncio.Queue(maxsize=_MAX_NOTIFICATION_QUEUE)
@@ -649,10 +630,9 @@ class _JsonlProcess:
                 limit=_MAX_JSONL_MESSAGE_BYTES + 1,
             )
         except (FileNotFoundError, OSError) as exc:
-            rendered = " ".join(self.command)
             raise ConnectorError(
-                f"cannot start Codex app-server ({rendered}): {exc}; "
-                "configure an explicit Codex executable/command"
+                "cannot start Codex app-server; verify the configured executable and "
+                "connection settings"
             ) from exc
         if self.process.stdin is None or self.process.stdout is None:
             await self.close()
@@ -878,65 +858,12 @@ class _JsonlProcess:
         self._put_priority_notification(_TransportClosed(failure))
 
     async def _handle_server_request(self, message: dict[str, Any]) -> None:
-        """Handle the one host-owned tool callback and deny every other request."""
+        """Decline approval/elicitation and reject every other Host callback."""
 
         method = message.get("method")
         request_id = message.get("id")
         if not isinstance(method, str) or not method or not _valid_request_id(request_id):
             raise ConnectorError("Codex app-server emitted an invalid server-request envelope")
-        if method == "item/tool/call" and self.server_request_handler is not None:
-            params = message.get("params")
-            if not isinstance(params, dict):
-                denial = _DeniedServerRequest(
-                    PolicyError("Codex sent malformed dynamic tool parameters")
-                )
-                self._put_priority_notification(denial)
-                await asyncio.wait_for(
-                    self._send(
-                        {
-                            "id": request_id,
-                            "error": {
-                                "code": -32602,
-                                "message": "invalid dynamic tool request",
-                            },
-                        }
-                    ),
-                    timeout=5.0,
-                )
-                return
-            try:
-                result = await self.server_request_handler(method, params)
-            except PolicyError as exc:
-                self._put_priority_notification(_DeniedServerRequest(exc))
-                await asyncio.wait_for(
-                    self._send(
-                        {
-                            "id": request_id,
-                            "error": {"code": -32602, "message": "dynamic tool denied"},
-                        }
-                    ),
-                    timeout=5.0,
-                )
-                return
-            except Exception as exc:
-                failure = _redact_timeline_text(type(exc).__name__, limit=128)
-                result = {
-                    "success": False,
-                    "contentItems": [
-                        {
-                            "type": "inputText",
-                            "text": json.dumps(
-                                {"error": "internal RenderDoc tool failed", "type": failure},
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            ),
-                        }
-                    ],
-                }
-            await asyncio.wait_for(
-                self._send({"id": request_id, "result": result}), timeout=5.0
-            )
-            return
         if method in {
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
@@ -953,6 +880,13 @@ class _JsonlProcess:
                 "result": {"action": "decline", "content": None},
             }
         else:
+            self._put_priority_notification(
+                _DeniedServerRequest(
+                    PolicyError(
+                        f"Codex requested unsupported host interaction '{method}'"
+                    )
+                )
+            )
             response = {
                 "id": request_id,
                 "error": {
@@ -960,14 +894,10 @@ class _JsonlProcess:
                     "message": "ReplayLab does not permit server-initiated interaction",
                 },
             }
-        self._put_priority_notification(
-            _DeniedServerRequest(
-                PolicyError(
-                    f"Codex requested '{method}', but the headless ReplayLab connector "
-                    "denied it (fail-closed)"
-                )
-            )
-        )
+        # A well-formed ambient command/file/permission/elicitation request is
+        # answered with an explicit decline. The provider can continue through
+        # its task-scoped ReplayLab MCP. Any other Host callback is a fatal
+        # isolation violation and is also queued above.
         await asyncio.wait_for(self._send(response), timeout=5.0)
 
     async def _discard_stderr(self) -> None:
@@ -1042,9 +972,7 @@ class CodexAppServerConnector:
         *,
         cwd: Path | str | None = None,
         readable_roots: Sequence[Path | str] | None = None,
-        expected_tools: set[str] | frozenset[str] = frozenset(),
-        dynamic_tools: Sequence[Mapping[str, Any]] = (),
-        dynamic_tool_handler: DynamicToolHandler | None = None,
+        expected_mcp_servers: set[str] | frozenset[str] = frozenset(),
         timeout: float = 300.0,
         heartbeat_interval: float = 10.0,
         env: Mapping[str, str] | None = None,
@@ -1060,38 +988,39 @@ class CodexAppServerConnector:
         roots = readable_roots if readable_roots is not None else (self.cwd,)
         resolved_roots: list[Path] = []
         for root in roots:
-            resolved = Path(root).resolve()
-            if not resolved.is_dir():
-                raise ConfigurationError(f"Codex readable root does not exist: {resolved}")
+            raw_root = Path(root)
+            try:
+                resolved = raw_root.resolve(strict=True)
+                details = raw_root.lstat()
+            except OSError as exc:
+                raise ConfigurationError(
+                    f"Codex readable root does not exist: {raw_root}"
+                ) from exc
+            # A file is allowed only for an exact current-turn path reference;
+            # accepting arbitrary files here would accidentally widen the
+            # provider's workspace.  Canonical identity and link/reparse checks
+            # remain enforced by ProviderPathAttachment before run().
+            is_reparse = bool(getattr(details, "st_file_attributes", 0) & 0x400)
+            if (
+                os.path.normcase(os.path.normpath(str(raw_root)))
+                != os.path.normcase(os.path.normpath(str(resolved)))
+                or raw_root.is_symlink()
+                or is_reparse
+                or not (resolved.is_dir() or resolved.is_file())
+            ):
+                raise ConfigurationError(
+                    f"Codex readable root must be a canonical directory or exact file: {raw_root}"
+                )
             if resolved not in resolved_roots:
                 resolved_roots.append(resolved)
         if self.cwd not in resolved_roots:
             resolved_roots.insert(0, self.cwd)
         self.readable_roots = tuple(resolved_roots)
-        if any(not isinstance(value, str) for value in expected_tools):
-            raise ConfigurationError("Codex expected tool names must be strings")
-        self.expected_tools = frozenset(value for value in expected_tools)
-        if any(
-            _DYNAMIC_TOOL_NAME_RE.fullmatch(value) is None for value in self.expected_tools
-        ):
-            raise ConfigurationError("Codex expected tool name is invalid")
-        self.dynamic_tools = _validated_dynamic_tool_specs(dynamic_tools)
-        dynamic_names = frozenset(
-            str(value.get("name", "")).strip() for value in self.dynamic_tools
+        if any(not isinstance(value, str) or not value.strip() for value in expected_mcp_servers):
+            raise ConfigurationError("Codex expected MCP server names must be non-empty strings")
+        self.expected_mcp_servers = frozenset(
+            value.strip().lower() for value in expected_mcp_servers
         )
-        if (
-            len(dynamic_names) != len(self.dynamic_tools)
-            or "" in dynamic_names
-            or dynamic_names != self.expected_tools
-        ):
-            raise ConfigurationError(
-                "Codex dynamic tool definitions must exactly match the active grant"
-            )
-        if dynamic_tool_handler is not None and not callable(dynamic_tool_handler):
-            raise ConfigurationError("Codex internal tool handler must be callable")
-        if self.expected_tools and dynamic_tool_handler is None:
-            raise ConfigurationError("Codex capture tools require an internal tool handler")
-        self.dynamic_tool_handler = dynamic_tool_handler
         if timeout <= 0:
             raise ConfigurationError("Codex app-server timeout must be positive")
         self.timeout = float(timeout)
@@ -1100,25 +1029,13 @@ class CodexAppServerConnector:
                 "Codex app-server heartbeat interval must be between 0 and 60 seconds"
             )
         self.heartbeat_interval = float(heartbeat_interval)
-        self._active_thread_id = ""
-        self._active_turn_id = ""
-        self._tool_phase = _TOOL_PHASE_IDLE
-        self._seen_dynamic_call_ids: set[str] = set()
-        self._turn_ready = asyncio.Event()
         self._transport = _JsonlProcess(
             self.command,
             cwd=self.cwd,
             env=env,
-            server_request_handler=self._handle_server_request,
         )
         self._initialized = False
         self._run_lock = asyncio.Lock()
-        # App-server releases have used two serialisations for ThreadStart's
-        # SandboxMode. Prefer the established camelCase value and negotiate the
-        # newer kebab-case value only after the server explicitly identifies
-        # that exact enum mismatch.
-        self._thread_sandbox_mode = "readOnly"
-        self._turn_restricted_access = True
 
     async def __aenter__(self) -> CodexAppServerConnector:
         # Construction and context entry are deliberately lazy; run() starts the
@@ -1129,97 +1046,111 @@ class CodexAppServerConnector:
         await self.close()
 
     async def close(self) -> None:
-        self._tool_phase = _TOOL_PHASE_CLOSING
-        # Wake a tool request that arrived while turn/start was still resolving.
-        # It will observe the closing phase and fail without touching RenderDoc.
-        self._turn_ready.set()
         await self._transport.close()
         self._initialized = False
-        self._active_thread_id = ""
-        self._active_turn_id = ""
-        self._seen_dynamic_call_ids.clear()
-        self._tool_phase = _TOOL_PHASE_IDLE
-        self._turn_ready.clear()
 
-    async def _handle_server_request(
-        self, method: str, params: dict[str, Any]
-    ) -> dict[str, Any]:
-        if method != "item/tool/call" or self.dynamic_tool_handler is None:
-            raise PolicyError(f"Codex requested unsupported host interaction '{method}'")
-        if self._tool_phase == _TOOL_PHASE_STARTING:
-            try:
-                await asyncio.wait_for(self._turn_ready.wait(), timeout=5.0)
-            except asyncio.TimeoutError as exc:
-                raise PolicyError("Codex requested a dynamic tool before the turn was ready") from exc
-        if self._tool_phase != _TOOL_PHASE_RUNNING:
-            raise PolicyError("Codex requested a dynamic tool outside an active turn")
-        required = ("threadId", "turnId", "callId", "tool", "arguments")
-        if any(key not in params for key in required):
-            raise PolicyError("Codex dynamic tool call omitted required fields")
-        thread_id = params["threadId"]
-        turn_id = params["turnId"]
-        call_id = params["callId"]
-        tool = params["tool"]
-        namespace = params.get("namespace")
-        arguments = params["arguments"]
-        if (
-            not isinstance(thread_id, str)
-            or not isinstance(turn_id, str)
-            or not isinstance(call_id, str)
-            or not isinstance(tool, str)
-            or thread_id != self._active_thread_id
-            or turn_id != self._active_turn_id
-            or not call_id
-            or len(call_id) > 256
-            or namespace is not None
-            or tool not in self.expected_tools
+    def _materialize_attachment_inputs(
+        self, attachments: Sequence[ProviderBinaryAttachment]
+    ) -> tuple[Path | None, list[dict[str, Any]]]:
+        """Write validated bytes below one generated, turn-local directory."""
+
+        values = tuple(attachments)
+        if not values:
+            return None, []
+        if len(values) > MAX_CONVERSATION_ATTACHMENTS_PER_TURN:
+            raise ConfigurationError("Codex attachment count exceeds the per-turn limit")
+        if sum(len(attachment.data) for attachment in values) > (
+            MAX_CONVERSATION_ATTACHMENT_TOTAL_BINARY_BYTES
         ):
-            raise PolicyError("Codex dynamic tool call did not match the active turn grant")
-        if call_id in self._seen_dynamic_call_ids:
-            raise PolicyError("Codex repeated a dynamic tool call id")
-        if len(self._seen_dynamic_call_ids) >= _MAX_DYNAMIC_TOOL_CALLS:
-            raise PolicyError("Codex exceeded the dynamic tool-call bound")
-        self._seen_dynamic_call_ids.add(call_id)
-        if not isinstance(arguments, dict):
-            return self._dynamic_tool_failure("ToolInputError")
+            raise ConfigurationError("Codex attachments exceed the 8 MiB per-turn limit")
+        root = self.cwd / f".replaylab-attachments-{uuid.uuid4().hex}"
+        if root.parent != self.cwd or root.exists():
+            raise ConfigurationError("Codex attachment workspace identity is invalid")
         try:
-            value = await self.dynamic_tool_handler(tool, arguments, call_id)
-        except Exception as exc:
-            return self._dynamic_tool_failure(type(exc).__name__)
-        try:
-            text = json.dumps(
-                value,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
-        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
-            return self._dynamic_tool_failure(type(exc).__name__)
-        if len(text) > MAX_EXTERNAL_RESPONSE_CHARS or len(text.encode("utf-8")) > 3 * 1024 * 1024:
-            return self._dynamic_tool_failure("ResultTooLarge")
-        return {
-            "success": True,
-            "contentItems": [{"type": "inputText", "text": text}],
-        }
+            root.mkdir(mode=0o700)
+            inputs: list[dict[str, Any]] = []
+            for index, attachment in enumerate(values):
+                suffix = _IMAGE_SUFFIXES.get(attachment.media_type, ".bin")
+                path = root / f"{index:02d}-{attachment.id[:64]}{suffix}"
+                if path.parent != root or path.exists():
+                    raise ConfigurationError("Codex attachment path is invalid")
+                with path.open("xb") as stream:
+                    stream.write(attachment.data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                # Windows maps a missing write bit to the read-only file
+                # attribute, which prevents shutil.rmtree from removing the
+                # generated turn directory. The directory is already private
+                # and random; retain the stricter mode where POSIX permissions
+                # have their intended meaning.
+                if os.name != "nt":
+                    with contextlib.suppress(OSError):
+                        path.chmod(0o400)
+                if attachment.kind == "image":
+                    inputs.append({"type": "localImage", "path": str(path)})
+                else:
+                    inputs.append(
+                        {
+                            "type": "mention",
+                            "name": attachment.title,
+                            "path": str(path),
+                        }
+                    )
+            return root, inputs
+        except BaseException:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(root)
+            raise
 
     @staticmethod
-    def _dynamic_tool_failure(error_type: str) -> dict[str, Any]:
-        failure = _redact_timeline_text(error_type, limit=128) or "ToolError"
-        return {
-            "success": False,
-            "contentItems": [
+    def _path_attachment_inputs(
+        attachments: Sequence[ProviderPathAttachment],
+    ) -> list[dict[str, Any]]:
+        """Expose current-turn files as exact Codex mentions, never as prompt text.
+
+        A path reference is Host-admitted and revalidated immediately before it
+        crosses the provider boundary.  The provider receives the original
+        canonical file path only in the typed mention input; ACP and model
+        adapters intentionally never call this path.
+        """
+
+        inputs: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        if len(tuple(attachments)) > MAX_CONVERSATION_ATTACHMENTS_PER_TURN:
+            raise ConfigurationError("Codex path attachment count exceeds the per-turn limit")
+        for attachment in tuple(attachments):
+            if attachment.id in seen:
+                continue
+            attachment.revalidate()
+            seen.add(attachment.id)
+            inputs.append(
                 {
-                    "type": "inputText",
-                    "text": json.dumps(
-                        {"error": "internal RenderDoc tool failed", "type": failure},
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    ),
+                    "type": "mention",
+                    "name": attachment.title,
+                    "path": str(attachment.path),
                 }
-            ],
-        }
+            )
+        return inputs
+
+    def _cleanup_attachment_root(self, root: Path | None) -> bool:
+        if root is None:
+            return True
+        path = Path(root)
+        if (
+            not path.is_absolute()
+            or path.parent != self.cwd
+            or _ATTACHMENT_ROOT_RE.fullmatch(path.name) is None
+        ):
+            return False
+        if not path.exists():
+            return True
+        if path.is_symlink() or not path.is_dir():
+            return False
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            return False
+        return not path.exists()
 
     async def _initialize(self) -> None:
         if self._initialized:
@@ -1231,15 +1162,23 @@ class CodexAppServerConnector:
                 "version": __version__,
             }
         }
-        if self.dynamic_tools:
-            # Codex app-server gates thread/start.dynamicTools behind this
-            # capability. General-help turns do not opt into the experimental API.
-            params["capabilities"] = {"experimentalApi": True}
-        await self._transport.request(
-            "initialize",
-            params,
-            timeout=min(self.timeout, 30.0),
-        )
+        # Current app-server gates ``runtimeWorkspaceRoots`` behind the
+        # experimental capability. ReplayLab always supplies and verifies those
+        # roots, including capture-free turns without a ReplayLab MCP server.
+        params["capabilities"] = {"experimentalApi": True}
+        try:
+            await self._transport.request(
+                "initialize",
+                params,
+                timeout=min(self.timeout, 30.0),
+            )
+        except _AppServerRequestError as exc:
+            if self._is_permission_protocol_incompatibility(exc):
+                raise self._permission_capability_error(
+                    "The configured Codex app-server cannot negotiate runtime workspace roots.",
+                    error_code=_PERMISSION_PROTOCOL_UNSUPPORTED,
+                ) from exc
+            raise
         await self._transport.notify("initialized", {})
         self._initialized = True
 
@@ -1471,14 +1410,24 @@ class CodexAppServerConnector:
         prompt: str,
         *,
         model: str | None = None,
+        attachments: Sequence[ProviderBinaryAttachment] = (),
+        path_attachments: Sequence[ProviderPathAttachment] = (),
         skill_name: str | None = None,
         skill_path: Path | str | None = None,
         on_delta: DeltaCallback | None = None,
         on_activity: ActivityCallback | None = None,
         on_timeline: TimelineCallback | None = None,
+        on_reasoning: ReasoningCallback | None = None,
+        on_assistant_message: AssistantMessageCallback | None = None,
     ) -> ExternalAgentResult:
         if not prompt.strip():
             raise ConfigurationError("Codex prompt must not be empty")
+        if len(tuple(attachments)) + len(tuple(path_attachments)) > MAX_CONVERSATION_ATTACHMENTS_PER_TURN:
+            raise ConfigurationError("Codex attachment count exceeds the per-turn limit")
+        attachment_ids = [item.id for item in (*tuple(attachments), *tuple(path_attachments))]
+        if len(attachment_ids) != len(set(attachment_ids)):
+            raise ConfigurationError("Codex attachment ids must be unique")
+        attachment_root: Path | None = None
         async with self._run_lock:
             try:
                 await self._initialize()
@@ -1492,23 +1441,25 @@ class CodexAppServerConnector:
                         "This RenderDoc Codex profile is not signed in. Open Settings > AI, "
                         "edit the connection, then select Connect / Sign in."
                     )
+                await self._require_read_only_permission_profile()
+                runtime_roots = self._runtime_workspace_roots()
                 thread_params: dict[str, Any] = {
                     "cwd": str(self.cwd),
                     "approvalPolicy": "never",
                     "serviceName": "replaylab",
                     "ephemeral": True,
+                    "permissions": _READ_ONLY_PERMISSION_PROFILE,
+                    "runtimeWorkspaceRoots": runtime_roots,
                 }
-                if self.dynamic_tools:
-                    thread_params["dynamicTools"] = list(self.dynamic_tools)
                 if model:
                     thread_params["model"] = model
                 thread_result = await self._start_thread(thread_params)
+                self._verify_thread_read_scope(thread_result, runtime_roots)
                 thread = thread_result.get("thread")
                 raw_thread_id = thread.get("id") if isinstance(thread, dict) else None
                 if not isinstance(raw_thread_id, str) or not raw_thread_id:
                     raise ConnectorError("Codex app-server thread/start returned no thread id")
                 thread_id = raw_thread_id
-                self._active_thread_id = thread_id
                 instruction_sources: list[Any] = []
                 if isinstance(thread, dict):
                     raw_sources = thread.get("instructionSources", [])
@@ -1532,7 +1483,14 @@ class CodexAppServerConnector:
                 await self._verify_tool_isolation(thread_id)
 
                 text = prompt
-                inputs: list[dict[str, Any]] = []
+                attachment_root, attachment_inputs = self._materialize_attachment_inputs(
+                    attachments
+                )
+                inputs: list[dict[str, Any]] = [
+                    {"type": "text", "text": text},
+                    *attachment_inputs,
+                    *self._path_attachment_inputs(path_attachments),
+                ]
                 if skill_name or skill_path:
                     if not skill_name or not skill_path:
                         raise ConfigurationError("Codex skill invocation requires both name and path")
@@ -1542,39 +1500,59 @@ class CodexAppServerConnector:
                     marker = f"${skill_name}"
                     if not text.lstrip().startswith(marker):
                         text = f"{marker} {text}"
+                        inputs[0] = {"type": "text", "text": text}
                     inputs.append(
                         {"type": "skill", "name": skill_name, "path": str(resolved_skill)}
                     )
-                inputs.insert(0, {"type": "text", "text": text})
                 turn_params: dict[str, Any] = {
                     "threadId": thread_id,
                     "input": inputs,
                     "cwd": str(self.cwd),
                     "approvalPolicy": "never",
-                    "sandboxPolicy": self._turn_sandbox_policy(),
+                    # Repeat the already-verified built-in profile and exact roots
+                    # so a turn cannot inherit a later ambient configuration
+                    # change. ``permissions`` and ``sandboxPolicy`` are mutually
+                    # exclusive in the current protocol.
+                    "permissions": _READ_ONLY_PERMISSION_PROFILE,
+                    "runtimeWorkspaceRoots": runtime_roots,
+                    # Request the most useful public fallback when the selected
+                    # model does not expose plaintext reasoning content.
+                    "summary": "detailed",
                 }
                 if model:
                     turn_params["model"] = model
-                self._active_turn_id = ""
-                self._seen_dynamic_call_ids.clear()
-                self._tool_phase = _TOOL_PHASE_STARTING
-                self._turn_ready.clear()
-                try:
-                    turn_result = await self._start_turn(turn_params)
-                except BaseException:
-                    self._tool_phase = _TOOL_PHASE_CLOSING
-                    self._turn_ready.set()
-                    raise
+                turn_result = await self._start_turn(turn_params)
                 turn = turn_result.get("turn")
                 raw_turn_id = turn.get("id") if isinstance(turn, dict) else None
                 if not isinstance(raw_turn_id, str) or not raw_turn_id:
-                    self._tool_phase = _TOOL_PHASE_CLOSING
-                    self._turn_ready.set()
                     raise ConnectorError("Codex app-server turn/start returned no turn id")
                 turn_id = raw_turn_id
-                self._active_turn_id = turn_id
-                self._tool_phase = _TOOL_PHASE_RUNNING
-                self._turn_ready.set()
+
+                active_reasoning: dict[str, dict[str, Any]] = {}
+
+                async def tracked_reasoning(event: Mapping[str, Any]) -> None:
+                    reasoning_id = event.get("reasoningId")
+                    key = reasoning_id if isinstance(reasoning_id, str) else ""
+                    lifecycle = str(event.get("lifecycle", "")).casefold()
+                    if key and lifecycle not in {
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "canceled",
+                        "truncated",
+                        "unavailable",
+                    }:
+                        active_reasoning[key] = dict(event)
+                    await _emit_reasoning(on_reasoning, event)
+                    if key and lifecycle in {
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "canceled",
+                        "truncated",
+                        "unavailable",
+                    }:
+                        active_reasoning.pop(key, None)
 
                 try:
                     answer = await self._collect_turn(
@@ -1583,10 +1561,31 @@ class CodexAppServerConnector:
                         on_delta=on_delta,
                         on_activity=on_activity,
                         on_timeline=on_timeline,
+                        on_reasoning=tracked_reasoning if on_reasoning is not None else None,
+                        on_assistant_message=on_assistant_message,
                     )
-                except BaseException:
-                    self._tool_phase = _TOOL_PHASE_CLOSING
-                    self._turn_ready.set()
+                    # A path can be replaced while Codex is producing its
+                    # answer.  Revalidate after the terminal provider event as
+                    # well as before constructing the mention; otherwise a
+                    # result could be accepted for bytes different from the
+                    # Host-admitted identity.
+                    for attachment in tuple(path_attachments):
+                        attachment.revalidate()
+                except BaseException as exc:
+                    terminal_lifecycle = (
+                        "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+                    )
+                    for active in tuple(active_reasoning.values()):
+                        terminal = dict(active)
+                        terminal.update(
+                            {
+                                "text": "",
+                                "reset": False,
+                                "lifecycle": terminal_lifecycle,
+                            }
+                        )
+                        with contextlib.suppress(Exception):
+                            await _emit_reasoning(on_reasoning, terminal)
                     with contextlib.suppress(Exception):
                         await self._transport.request(
                             "turn/interrupt",
@@ -1594,9 +1593,6 @@ class CodexAppServerConnector:
                             timeout=2.0,
                         )
                     raise
-                finally:
-                    self._tool_phase = _TOOL_PHASE_CLOSING
-                    self._turn_ready.set()
                 return ExternalAgentResult(
                     text=answer,
                     backend="codex-app-server",
@@ -1607,80 +1603,206 @@ class CodexAppServerConnector:
             finally:
                 # Runtime creates a connector per request. Closing here prevents
                 # orphaned app-server processes while preserving lazy startup.
-                await self.close()
+                try:
+                    await self.close()
+                finally:
+                    # Attachment bytes have their own lifecycle: a transport-close
+                    # failure must not skip deletion in direct connector callers.
+                    cleanup_ok = self._cleanup_attachment_root(attachment_root)
+                    if not cleanup_ok and sys.exc_info()[0] is None:
+                        raise LifecycleCleanupError(
+                            "Codex attachment workspace cleanup failed"
+                        )
 
     async def _start_thread(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Start one thread with a single exact SandboxMode dialect fallback."""
+        """Start one thread under the current verifiable permission contract."""
 
-        request_params = dict(params)
-        request_params["sandbox"] = self._thread_sandbox_mode
         try:
             return await self._transport.request(
-                "thread/start", request_params, timeout=min(self.timeout, 60.0)
+                "thread/start", dict(params), timeout=min(self.timeout, 60.0)
             )
         except _AppServerRequestError as exc:
-            message = exc.server_message.casefold()
-            dialect_mismatch = (
-                exc.method == "thread/start"
-                and exc.code == -32600
-                and self._thread_sandbox_mode == "readOnly"
-                and "unknown variant" in message
-                and "readonly" in message
-                and "read-only" in message
-            )
-            if not dialect_mismatch:
-                raise
-        self._thread_sandbox_mode = "read-only"
-        request_params["sandbox"] = self._thread_sandbox_mode
-        return await self._transport.request(
-            "thread/start", request_params, timeout=min(self.timeout, 60.0)
-        )
-
-    def _turn_sandbox_policy(self) -> dict[str, Any]:
-        policy: dict[str, Any] = {"type": "readOnly"}
-        if self._turn_restricted_access:
-            policy["access"] = {
-                "type": "restricted",
-                "includePlatformDefaults": False,
-                "readableRoots": [str(root) for root in self.readable_roots],
-            }
-        else:
-            # Newer app-server builds removed the legacy restricted-access
-            # extension while retaining the documented readOnly policy.
-            policy["networkAccess"] = False
-        return policy
+            if self._is_permission_protocol_incompatibility(exc):
+                raise self._permission_capability_error(
+                    "The configured Codex app-server does not support ReplayLab's "
+                    "scoped read-only permission contract.",
+                    error_code=_PERMISSION_PROTOCOL_UNSUPPORTED,
+                ) from exc
+            raise
 
     async def _start_turn(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Start one turn with a single exact legacy-access fallback."""
+        """Start one turn without weakening its verified permission profile."""
 
         try:
             return await self._transport.request(
                 "turn/start", params, timeout=min(self.timeout, 60.0)
             )
         except _AppServerRequestError as exc:
-            message = exc.server_message.casefold()
-            access_removed = (
-                exc.method == "turn/start"
-                and exc.code == -32600
-                and self._turn_restricted_access
-                and "readonly.access is no longer supported" in message
-                and "permissionprofile" in message
-            )
-            if not access_removed:
-                raise
-        self._turn_restricted_access = False
-        retry_params = dict(params)
-        retry_params["sandboxPolicy"] = self._turn_sandbox_policy()
-        return await self._transport.request(
-            "turn/start", retry_params, timeout=min(self.timeout, 60.0)
+            if self._is_permission_protocol_incompatibility(exc):
+                raise self._permission_capability_error(
+                    "The configured Codex app-server does not support ReplayLab's "
+                    "scoped read-only permission contract.",
+                    error_code=_PERMISSION_PROTOCOL_UNSUPPORTED,
+                ) from exc
+            raise
+
+    def _runtime_workspace_roots(self) -> list[str]:
+        """Return the exact canonical roots admitted by the Host for this run."""
+
+        return [str(root) for root in self.readable_roots]
+
+    @staticmethod
+    def _runtime_root_key(value: Any) -> str | None:
+        if not isinstance(value, str) or not value or "\0" in value:
+            return None
+        path = Path(value)
+        if not path.is_absolute():
+            return None
+        return os.path.normcase(os.path.normpath(str(path)))
+
+    @staticmethod
+    def _permission_capability_error(
+        message: str, *, error_code: str
+    ) -> ProviderCapabilityError:
+        return ProviderCapabilityError(
+            message,
+            error_code=error_code,
+            capability=_PERMISSION_PROFILE_CAPABILITY,
         )
 
-    async def _verify_tool_isolation(self, thread_id: str) -> None:
-        """Fail closed if user-global MCP servers or Apps leak into this thread."""
+    @staticmethod
+    def _is_permission_protocol_incompatibility(exc: _AppServerRequestError) -> bool:
+        message = exc.server_message.casefold()
+        if exc.method == "initialize" and exc.code in {-32600, -32602}:
+            return "experimentalapi" in message or "capabilities" in message
+        if exc.method == "permissionProfile/list" and exc.code in {-32601, -32600, -32602}:
+            return True
+        if exc.method not in {"thread/start", "turn/start"} or exc.code not in {
+            -32600,
+            -32602,
+        }:
+            return False
+        fields = (
+            "permissions",
+            "permissionprofile",
+            "permission profile",
+            "runtimeworkspaceroots",
+            "runtime workspace roots",
+            "experimentalapi",
+            "readonly.access",
+        )
+        return any(field in message for field in fields)
 
+    async def _require_read_only_permission_profile(self) -> None:
+        """Require the built-in read-only profile before starting any thread."""
+
+        cursor: str | None = None
+        seen_ids: set[str] = set()
+        selected_allowed: bool | None = None
+        for _page in range(100):
+            params: dict[str, Any] = {"cwd": str(self.cwd), "limit": 100}
+            if cursor is not None:
+                params["cursor"] = cursor
+            try:
+                result = await self._transport.request(
+                    "permissionProfile/list", params, timeout=min(self.timeout, 30.0)
+                )
+            except _AppServerRequestError as exc:
+                if self._is_permission_protocol_incompatibility(exc):
+                    raise self._permission_capability_error(
+                        "The configured Codex app-server cannot enumerate permission profiles.",
+                        error_code=_PERMISSION_PROTOCOL_UNSUPPORTED,
+                    ) from exc
+                raise
+            data = result.get("data")
+            if not isinstance(data, list):
+                raise ConnectorError(
+                    "Codex permission profile inventory returned an invalid data array"
+                )
+            for item in data:
+                if (
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("id"), str)
+                    or not isinstance(item.get("allowed"), bool)
+                ):
+                    raise ConnectorError(
+                        "Codex permission profile inventory contained an invalid entry"
+                    )
+                profile_id = item["id"]
+                if not profile_id or profile_id in seen_ids:
+                    raise ConnectorError(
+                        "Codex permission profile inventory contained a duplicate/empty id"
+                    )
+                seen_ids.add(profile_id)
+                if profile_id == _READ_ONLY_PERMISSION_PROFILE:
+                    selected_allowed = item["allowed"]
+            next_cursor = result.get("nextCursor")
+            if next_cursor is None:
+                break
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor == cursor:
+                raise ConnectorError(
+                    "Codex permission profile inventory returned an invalid cursor"
+                )
+            cursor = next_cursor
+        else:
+            raise ConnectorError(
+                "Codex permission profile inventory exceeded the pagination safety bound"
+            )
+        if selected_allowed is not True:
+            raise self._permission_capability_error(
+                "The built-in Codex read-only permission profile is unavailable.",
+                error_code=_READ_ONLY_PROFILE_UNAVAILABLE,
+            )
+
+    def _verify_thread_read_scope(
+        self, result: Mapping[str, Any], expected_roots: Sequence[str]
+    ) -> None:
+        """Verify that app-server applied the exact requested profile and roots."""
+
+        active = result.get("activePermissionProfile")
+        roots = result.get("runtimeWorkspaceRoots")
+        sandbox = result.get("sandbox")
+        expected_keys = tuple(self._runtime_root_key(root) for root in expected_roots)
+        actual_keys = (
+            tuple(self._runtime_root_key(root) for root in roots)
+            if isinstance(roots, list)
+            else ()
+        )
+        verified = all(
+            (
+                isinstance(active, dict),
+                isinstance(active, dict)
+                and active.get("id") == _READ_ONLY_PERMISSION_PROFILE,
+                isinstance(active, dict) and active.get("extends") is None,
+                bool(expected_keys) and None not in expected_keys,
+                actual_keys == expected_keys,
+                isinstance(sandbox, dict),
+                isinstance(sandbox, dict) and sandbox.get("type") == "readOnly",
+                isinstance(sandbox, dict)
+                and sandbox.get("networkAccess", False) is False,
+                result.get("approvalPolicy") == "never",
+            )
+        )
+        if not verified:
+            raise self._permission_capability_error(
+                "Codex app-server did not verify ReplayLab's exact read-only roots.",
+                error_code=_READ_SCOPE_UNVERIFIED,
+            )
+
+    async def _list_thread_mcp_servers(
+        self, thread_id: str, *, deadline: float
+    ) -> dict[str, dict[str, Any]]:
+        """Read one complete, bounded MCP inventory for a loaded thread."""
+
+        loop = asyncio.get_running_loop()
         cursor: str | None = None
         entries: dict[str, dict[str, Any]] = {}
         for _page in range(100):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise ConnectorError(
+                    "Codex app-server timed out while reading task-scoped MCP status"
+                )
             params: dict[str, Any] = {
                 "threadId": thread_id,
                 "limit": 100,
@@ -1689,7 +1811,7 @@ class CodexAppServerConnector:
             if cursor is not None:
                 params["cursor"] = cursor
             result = await self._transport.request(
-                "mcpServerStatus/list", params, timeout=min(self.timeout, 60.0)
+                "mcpServerStatus/list", params, timeout=min(remaining, 60.0)
             )
             data = result.get("data")
             if not isinstance(data, list):
@@ -1709,11 +1831,105 @@ class CodexAppServerConnector:
             cursor = next_cursor
         else:
             raise ConnectorError("Codex MCP inventory exceeded the pagination safety bound")
-        if entries:
-            raise PolicyError(
-                "Codex ReplayLab threads must not load MCP servers; observed: "
-                + ", ".join(sorted(entries))
-            )
+
+        return entries
+
+    async def _verify_tool_isolation(self, thread_id: str) -> None:
+        """Wait for exactly the task MCP set, then reject ambient tools and Apps."""
+
+        loop = asyncio.get_running_loop()
+        startup_timeout = min(self.timeout, _MCP_STARTUP_TIMEOUT_SECONDS)
+        deadline = loop.time() + startup_timeout
+        waiting = [
+            f"{name} (missing)" for name in sorted(self.expected_mcp_servers)
+        ]
+        while True:
+            try:
+                entries = await self._list_thread_mcp_servers(
+                    thread_id, deadline=deadline
+                )
+            except ConnectorError as exc:
+                rendered_error = str(exc).casefold()
+                if "timed out" in rendered_error and (
+                    "mcpserverstatus/list" in rendered_error
+                    or "task-scoped mcp status" in rendered_error
+                ):
+                    raise ConnectorError(
+                        "Codex app-server timed out waiting for the task-scoped MCP "
+                        "server(s): "
+                        + ", ".join(waiting)
+                    ) from exc
+                raise
+            actual_servers = frozenset(entries)
+            unexpected = actual_servers - self.expected_mcp_servers
+            if unexpected:
+                if not self.expected_mcp_servers:
+                    raise PolicyError(
+                        "Codex ReplayLab threads must not load MCP servers; observed: "
+                        + ", ".join(sorted(entries))
+                    )
+                raise PolicyError(
+                    "Codex ReplayLab thread loaded an MCP server outside its task scope; "
+                    "expected "
+                    + ", ".join(sorted(self.expected_mcp_servers))
+                    + "; observed "
+                    + ", ".join(sorted(entries))
+                )
+
+            waiting = [
+                f"{name} (missing)"
+                for name in sorted(self.expected_mcp_servers - actual_servers)
+            ]
+            terminal: list[str] = []
+            for name in sorted(self.expected_mcp_servers & actual_servers):
+                entry = entries[name]
+                runtime_status = entry.get("runtimeStatus")
+                tools = entry.get("tools")
+                if runtime_status == "connected":
+                    if not isinstance(tools, dict):
+                        raise ConnectorError(
+                            "Codex MCP inventory returned an invalid tool inventory for " + name
+                        )
+                    if not tools:
+                        raise ConnectorError(
+                            "Codex app-server did not initialize the task-scoped MCP "
+                            f"server(s): {name} (empty tool inventory)"
+                        )
+                    continue
+                if runtime_status in {
+                    "authenticationRequired",
+                    "failed",
+                    "cancelled",
+                    "disabled",
+                }:
+                    terminal.append(f"{name} (runtimeStatus={runtime_status})")
+                    continue
+                if runtime_status is None:
+                    waiting.append(f"{name} (runtimeStatus=unknown)")
+                    continue
+                if runtime_status in {"notStarted", "starting"}:
+                    waiting.append(f"{name} (runtimeStatus={runtime_status})")
+                    continue
+                raise ConnectorError(
+                    "Codex MCP inventory returned an unknown runtime status for "
+                    f"{name}: {runtime_status!r}"
+                )
+
+            if terminal:
+                raise ConnectorError(
+                    "Codex app-server did not initialize the task-scoped MCP server(s): "
+                    + ", ".join(terminal)
+                )
+            if not waiting:
+                break
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise ConnectorError(
+                    "Codex app-server timed out waiting for the task-scoped MCP server(s): "
+                    + ", ".join(waiting)
+                )
+            await asyncio.sleep(min(_MCP_STARTUP_POLL_SECONDS, remaining))
 
         installed = await self._transport.request(
             "app/installed",
@@ -1742,6 +1958,8 @@ class CodexAppServerConnector:
         on_delta: DeltaCallback | None,
         on_activity: ActivityCallback | None,
         on_timeline: TimelineCallback | None,
+        on_reasoning: ReasoningCallback | None = None,
+        on_assistant_message: AssistantMessageCallback | None = None,
     ) -> str:
         loop = asyncio.get_running_loop()
         started = loop.time()
@@ -1749,10 +1967,218 @@ class CodexAppServerConnector:
         streamed: list[str] = []
         streamed_chars = 0
         streamed_bytes = 0
-        last_message = ""
         final_message = ""
         last_provider_notice = ""
         timeline_state = _TimelineState()
+
+        async def emit_reasoning_event(
+            *,
+            item_id: str,
+            channel: str,
+            index: int = 0,
+            text: str = "",
+            reset: bool = False,
+            lifecycle: str = "updated",
+            availability: str = "available",
+            opaque_present: bool = False,
+            opaque_bytes: int = 0,
+            opaque_sha256: str = "",
+        ) -> None:
+            event: dict[str, Any] = {
+                "source": "codex-app-server",
+                "channel": channel,
+                "itemId": item_id,
+                # JSON tuple encoding is unambiguous even when provider item ids
+                # contain separators such as colons.
+                "reasoningId": json.dumps(
+                    [item_id, channel, index], ensure_ascii=False, separators=(",", ":")
+                ),
+                "contentIndex": index if channel == "raw" else 0,
+                "summaryIndex": index if channel == "summary" else 0,
+                "contentFormat": "text/plain",
+                "text": text,
+                "reset": bool(reset),
+                "lifecycle": lifecycle,
+                "availability": availability,
+                "threadId": _item_id(thread_id),
+                "turnId": _item_id(turn_id),
+            }
+            if opaque_present:
+                # Provider ciphertext/signatures are continuity material, not
+                # readable chain-of-thought. Keep only bounded metadata so they
+                # cannot be rendered, logged as prose, or replayed into prompts.
+                event["opaquePresent"] = True
+                event["opaqueBytes"] = max(0, int(opaque_bytes))
+                if opaque_sha256:
+                    event["opaqueSha256"] = opaque_sha256
+            await _emit_reasoning(on_reasoning, event)
+
+        async def emit_commentary_event(
+            *, item_id: str, text: str, reset: bool, lifecycle: str
+        ) -> None:
+            if on_assistant_message is None or not item_id or not text:
+                return
+            # Only provider-declared commentary is admitted to this private local-observability
+            # callback. Redact common credentials before the text becomes a durable TaskEvent.
+            safe_text = _redact_timeline_text(text, limit=_MAX_TIMELINE_TEXT_CHARS)
+            if not safe_text:
+                return
+            await _emit_assistant_message(
+                on_assistant_message,
+                {
+                    "source": "codex-app-server",
+                    "channel": "message",
+                    "phase": "commentary",
+                    "itemId": item_id,
+                    "text": safe_text,
+                    "reset": bool(reset),
+                    "lifecycle": lifecycle,
+                    "threadId": _item_id(thread_id),
+                    "turnId": _item_id(turn_id),
+                },
+            )
+
+        async def emit_reasoning_item(
+            item: Mapping[str, Any], lifecycle: str
+        ) -> None:
+            item_id = _item_id(item.get("id"))
+            if not item_id or item.get("type") != "reasoning":
+                return
+            tracked_item = timeline_state.remember_reasoning_item(item_id)
+            if lifecycle == "completed" and tracked_item:
+                timeline_state.reasoning_items_completed.add(item_id)
+
+            raw_parts = _reasoning_content_parts(item.get("content"))
+            raw_keys: list[tuple[str, int]] = []
+            for index, value in raw_parts:
+                key = (item_id, index)
+                raw_keys.append(key)
+                previous = timeline_state.raw_reasoning.get(key, "")
+                already_emitted = key in timeline_state.raw_reasoning_emitted
+                # A completed item is authoritative. If a provider omitted,
+                # truncated, or transformed streamed deltas, reset to the exact
+                # final snapshot instead of leaving a stale reconstruction.
+                reset = not already_emitted or previous != value
+                delta = value if reset else ""
+                if key in timeline_state.raw_reasoning or len(
+                    timeline_state.raw_reasoning
+                ) < _MAX_TIMELINE_ITEMS:
+                    timeline_state.raw_reasoning[key] = value
+                tracked_key = timeline_state.remember_reasoning_key(
+                    timeline_state.raw_reasoning_emitted, key
+                )
+                await emit_reasoning_event(
+                    item_id=item_id,
+                    channel="raw",
+                    index=index,
+                    text=delta,
+                    reset=reset,
+                    lifecycle=lifecycle if tracked_key else "truncated",
+                    availability="available" if tracked_key else "state-limit",
+                )
+
+            emitted_keys = tuple(sorted(
+                key
+                for key in timeline_state.raw_reasoning_emitted
+                if key[0] == item_id
+            ))
+            if lifecycle == "completed":
+                # Some app-server versions stream deltas but omit ``content``
+                # from the completed item. Explicitly close every such stream.
+                for _, index in emitted_keys:
+                    if (item_id, index) not in raw_keys:
+                        await emit_reasoning_event(
+                            item_id=item_id,
+                            channel="raw",
+                            index=index,
+                            lifecycle="completed",
+                        )
+
+            opaque_bytes, opaque_sha256 = _opaque_reasoning_metadata(item)
+            if opaque_bytes:
+                opaque_metadata = (opaque_bytes, opaque_sha256)
+                previous_opaque = timeline_state.opaque_reasoning.get(item_id)
+                if item_id in timeline_state.opaque_reasoning or len(
+                    timeline_state.opaque_reasoning
+                ) < _MAX_TIMELINE_ITEMS:
+                    timeline_state.opaque_reasoning[item_id] = opaque_metadata
+                await emit_reasoning_event(
+                    item_id=item_id,
+                    channel="opaque",
+                    text="",
+                    reset=opaque_metadata != previous_opaque,
+                    lifecycle=lifecycle,
+                    availability="encrypted-only",
+                    opaque_present=True,
+                    opaque_bytes=opaque_bytes,
+                    opaque_sha256=opaque_sha256,
+                )
+            if lifecycle == "completed" and not raw_keys and not emitted_keys:
+                await emit_reasoning_event(
+                    item_id=item_id,
+                    channel="raw",
+                    lifecycle=lifecycle,
+                    availability="encrypted-only" if opaque_bytes else "not-emitted",
+                )
+
+            summary_parts = _reasoning_content_parts(item.get("summary"))
+            summary_keys: list[tuple[str, int]] = []
+            for index, value in summary_parts:
+                key = (item_id, index)
+                summary_keys.append(key)
+                previous = timeline_state.reasoning_streams.get(key, "")
+                already_emitted = key in timeline_state.summary_reasoning_emitted
+                reset = not already_emitted or previous != value
+                if key in timeline_state.reasoning_streams or len(
+                    timeline_state.reasoning_streams
+                ) < _MAX_TIMELINE_ITEMS:
+                    timeline_state.reasoning_streams[key] = value
+                tracked_key = timeline_state.remember_reasoning_key(
+                    timeline_state.summary_reasoning_emitted, key
+                )
+                await emit_reasoning_event(
+                    item_id=item_id,
+                    channel="summary",
+                    index=index,
+                    text=value if reset else "",
+                    reset=reset,
+                    lifecycle=lifecycle if tracked_key else "truncated",
+                    availability=(
+                        "available"
+                        if value and tracked_key
+                        else "state-limit" if not tracked_key else "not-emitted"
+                    ),
+                )
+            if lifecycle == "completed":
+                emitted_summary_keys = tuple(sorted(
+                    key
+                    for key in timeline_state.summary_reasoning_emitted
+                    if key[0] == item_id
+                ))
+                for _, index in emitted_summary_keys:
+                    if (item_id, index) not in summary_keys:
+                        await emit_reasoning_event(
+                            item_id=item_id,
+                            channel="summary",
+                            index=index,
+                            lifecycle="completed",
+                        )
+            if (
+                lifecycle == "started"
+                and not raw_parts
+                and not opaque_bytes
+                and not summary_parts
+            ):
+                # An empty reasoning item still proves that the provider began
+                # a reasoning phase. Surface that liveness immediately instead
+                # of leaving the monitor indistinguishable from a stalled turn.
+                await emit_reasoning_event(
+                    item_id=item_id,
+                    channel="raw",
+                    lifecycle="started",
+                    availability="pending",
+                )
+
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -1807,11 +2233,35 @@ class CodexAppServerConnector:
 
             elapsed = loop.time() - started
 
-            # Raw chain-of-thought is deliberately outside ReplayLab's UI and
-            # persistence contract.  Do not even pass it through the generic
-            # sanitizers: only the documented public summary stream below is
-            # eligible for display.
             if method == "item/reasoning/textDelta":
+                item_id = _item_id(params.get("itemId"))
+                delta = params.get("delta")
+                raw_index = params.get("contentIndex", 0)
+                if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+                    raw_index = 0
+                raw_index = max(0, min(raw_index, 255))
+                if item_id and isinstance(delta, str) and delta:
+                    timeline_state.remember_reasoning_item(item_id)
+                    key = (item_id, raw_index)
+                    tracked = timeline_state.remember_reasoning_key(
+                        timeline_state.raw_reasoning_deltas, key
+                    ) and timeline_state.remember_reasoning_key(
+                        timeline_state.raw_reasoning_emitted, key
+                    )
+                    timeline_state.append_reasoning(
+                        timeline_state.raw_reasoning,
+                        key,
+                        delta,
+                        MAX_EXTERNAL_RESPONSE_CHARS,
+                    )
+                    await emit_reasoning_event(
+                        item_id=item_id,
+                        channel="raw",
+                        index=raw_index,
+                        text=delta,
+                        lifecycle="updated" if tracked else "truncated",
+                        availability="available" if tracked else "state-limit",
+                    )
                 continue
 
             if method == "turn/plan/updated":
@@ -1850,10 +2300,54 @@ class CodexAppServerConnector:
                     )
                 continue
 
+            if method == "item/reasoning/summaryPartAdded":
+                item_id = _item_id(params.get("itemId"))
+                summary_index = params.get("summaryIndex", 0)
+                if isinstance(summary_index, bool) or not isinstance(summary_index, int):
+                    summary_index = 0
+                summary_index = max(0, min(summary_index, 255))
+                if item_id:
+                    timeline_state.remember_reasoning_item(item_id)
+                    key = (item_id, summary_index)
+                    tracked = timeline_state.remember_reasoning_key(
+                        timeline_state.summary_reasoning_emitted, key
+                    )
+                    await emit_reasoning_event(
+                        item_id=item_id,
+                        channel="summary",
+                        index=summary_index,
+                        lifecycle="started" if tracked else "truncated",
+                        availability="available" if tracked else "state-limit",
+                    )
+                continue
+
             if method == "item/reasoning/summaryTextDelta":
                 item_id = _item_id(params.get("itemId"))
                 delta = params.get("delta")
+                summary_index = params.get("summaryIndex", 0)
+                if isinstance(summary_index, bool) or not isinstance(summary_index, int):
+                    summary_index = 0
+                summary_index = max(0, min(summary_index, 255))
                 if item_id and isinstance(delta, str) and delta:
+                    timeline_state.remember_reasoning_item(item_id)
+                    key = (item_id, summary_index)
+                    tracked = timeline_state.remember_reasoning_key(
+                        timeline_state.summary_reasoning_emitted, key
+                    )
+                    timeline_state.append_reasoning(
+                        timeline_state.reasoning_streams,
+                        key,
+                        delta,
+                        _MAX_REASONING_SUMMARY_CHARS,
+                    )
+                    await emit_reasoning_event(
+                        item_id=item_id,
+                        channel="summary",
+                        index=summary_index,
+                        text=delta,
+                        lifecycle="updated" if tracked else "truncated",
+                        availability="available" if tracked else "state-limit",
+                    )
                     summary = timeline_state.append(
                         timeline_state.reasoning,
                         item_id,
@@ -1902,55 +2396,16 @@ class CodexAppServerConnector:
                 continue
 
             if method == "item/commandExecution/outputDelta":
-                item_id = _item_id(params.get("itemId"))
-                delta = params.get("delta")
-                if item_id and isinstance(delta, str) and delta:
-                    prior = timeline_state.command_output.get(item_id, "")
-                    output = timeline_state.append(
-                        timeline_state.command_output,
-                        item_id,
-                        delta,
-                        _MAX_COMMAND_OUTPUT_RAW_CHARS,
-                    )
-                    if len(prior) + len(delta) > _MAX_COMMAND_OUTPUT_RAW_CHARS:
-                        timeline_state.command_output_truncated.add(item_id)
-                    if output:
-                        detail = _redact_timeline_text(
-                            output, limit=_MAX_VISIBLE_COMMAND_OUTPUT_CHARS
-                        )
-                        if (
-                            item_id in timeline_state.command_output_truncated
-                            and "[truncated]" not in detail
-                        ):
-                            detail = (
-                                detail[: max(0, _MAX_VISIBLE_COMMAND_OUTPUT_CHARS - 14)]
-                                + "… [truncated]"
-                            )
-                        detail_parts: list[str] = []
-                        command = timeline_state.commands.get(item_id, "")
-                        cwd = timeline_state.command_cwds.get(item_id, "")
-                        if command:
-                            detail_parts.append(f"Command: {command}")
-                        if cwd:
-                            detail_parts.append(f"Working directory: {cwd}")
-                        detail_parts.append(f"Output:\n{detail}")
-                        await _emit_timeline(
-                            on_timeline,
-                            _timeline_event(
-                                activity_id=item_id,
-                                kind="commandExecution",
-                                title="Command output",
-                                detail="\n".join(detail_parts),
-                                status="running",
-                                lifecycle="updated",
-                                elapsed=elapsed,
-                            ),
-                        )
+                # Command text, working directory, and stdout/stderr are private
+                # execution details. The lifecycle item still exposes the action
+                # category, completion status, and bounded exit code.
                 continue
 
             if method == "item/started":
                 item = params.get("item")
                 if isinstance(item, Mapping):
+                    if item.get("type") == "reasoning":
+                        await emit_reasoning_item(item, "started")
                     timeline = _item_timeline_event(
                         item,
                         lifecycle="started",
@@ -1959,6 +2414,17 @@ class CodexAppServerConnector:
                     )
                     if timeline is not None:
                         await _emit_timeline(on_timeline, timeline)
+                    if item.get("type") == "agentMessage" and item.get("phase") == "commentary":
+                        item_id = _item_id(item.get("id"))
+                        candidate = item.get("text")
+                        if item_id and isinstance(candidate, str) and candidate:
+                            await emit_commentary_event(
+                                item_id=item_id,
+                                text=candidate,
+                                reset=True,
+                                lifecycle="started",
+                            )
+                            timeline_state.commentary_emitted.add(item_id)
                 continue
 
             if method == "item/agentMessage/delta":
@@ -1967,12 +2433,65 @@ class CodexAppServerConnector:
                     streamed_chars, streamed_bytes = checked_response_size(
                         delta, streamed_chars, streamed_bytes
                     )
-                    streamed.append(delta)
-                    await _emit_delta(on_delta, delta)
+                    item_id = _item_id(params.get("itemId"))
+                    raw_phase = params.get("phase")
+                    if raw_phase in {"commentary", "final_answer"} and item_id:
+                        phase = raw_phase
+                        timeline_state.put(timeline_state.agent_message_phases, item_id, phase)
+                    elif raw_phase is None and item_id:
+                        phase = timeline_state.agent_message_phases.get(item_id, "")
+                    else:
+                        # An explicit unrecognised phase must not inherit a prior
+                        # public phase for the same item id.
+                        phase = ""
+                    if phase == "commentary" and item_id:
+                        commentary = timeline_state.append(
+                            timeline_state.commentary,
+                            item_id,
+                            delta,
+                            _MAX_TIMELINE_TEXT_CHARS,
+                        )
+                        if commentary:
+                            progress = _timeline_event(
+                                activity_id=item_id,
+                                kind="progressNote",
+                                title="Progress update",
+                                detail=_redact_timeline_text(
+                                    commentary, limit=_MAX_TIMELINE_TEXT_CHARS
+                                ),
+                                status="running",
+                                lifecycle="updated",
+                                elapsed=elapsed,
+                            )
+                            progress["publicDetail"] = progress["activityDetail"]
+                            await _emit_timeline(on_timeline, progress)
+                        await emit_commentary_event(
+                            item_id=item_id,
+                            text=delta,
+                            reset=False,
+                            lifecycle="updated",
+                        )
+                        if on_assistant_message is not None:
+                            timeline_state.commentary_emitted.add(item_id)
+                    elif phase == "final_answer":
+                        streamed.append(delta)
+                        await _emit_delta(on_delta, delta)
+                    # Unknown phases remain outside both the public timeline and
+                    # answer stream. Their size still counts against the provider
+                    # response bound above.
                 continue
             if method == "item/completed":
                 item = params.get("item")
                 if isinstance(item, Mapping):
+                    completed_item_id = _item_id(item.get("id"))
+                    previous_commentary = timeline_state.commentary.get(
+                        completed_item_id, ""
+                    )
+                    commentary_was_emitted = (
+                        completed_item_id in timeline_state.commentary_emitted
+                    )
+                    if item.get("type") == "reasoning":
+                        await emit_reasoning_item(item, "completed")
                     timeline = _item_timeline_event(
                         item,
                         lifecycle="completed",
@@ -1985,20 +2504,45 @@ class CodexAppServerConnector:
                         candidate = item.get("text")
                         if isinstance(candidate, str):
                             checked_response_size(candidate)
-                            last_message = candidate
-                            # A completed agentMessage is authoritative over streamed fragments.
-                            # Drop the fallback accumulator so a provider cannot retain two copies.
-                            streamed.clear()
-                            if item.get("phase") == "final_answer":
+                            if item.get("phase") == "commentary" and completed_item_id:
+                                safe_candidate = _redact_timeline_text(
+                                    candidate, limit=_MAX_TIMELINE_TEXT_CHARS
+                                )
+                                safe_previous = _redact_timeline_text(
+                                    previous_commentary,
+                                    limit=_MAX_TIMELINE_TEXT_CHARS,
+                                )
+                                if safe_candidate and (
+                                    not commentary_was_emitted
+                                    or (
+                                        len(candidate) <= _MAX_TIMELINE_TEXT_CHARS
+                                        and safe_candidate != safe_previous
+                                    )
+                                ):
+                                    await emit_commentary_event(
+                                        item_id=completed_item_id,
+                                        text=candidate,
+                                        reset=True,
+                                        lifecycle="completed",
+                                    )
+                            elif item.get("phase") == "final_answer":
                                 final_message = candidate
-                    completed_item_id = _item_id(item.get("id"))
+                                # A completed final answer is authoritative over
+                                # streamed fragments. Commentary and unknown phases
+                                # never become fallback answer text.
+                                streamed.clear()
                     if completed_item_id:
                         timeline_state.reasoning.pop(completed_item_id, None)
-                        timeline_state.commands.pop(completed_item_id, None)
-                        timeline_state.command_cwds.pop(completed_item_id, None)
-                        timeline_state.command_output.pop(completed_item_id, None)
-                        timeline_state.command_output_truncated.discard(completed_item_id)
+                        for key in tuple(timeline_state.reasoning_streams):
+                            if key[0] == completed_item_id:
+                                timeline_state.reasoning_streams.pop(key, None)
+                        for key in tuple(timeline_state.raw_reasoning):
+                            if key[0] == completed_item_id:
+                                timeline_state.raw_reasoning.pop(key, None)
                         timeline_state.plans.pop(completed_item_id, None)
+                        timeline_state.agent_message_phases.pop(completed_item_id, None)
+                        timeline_state.commentary.pop(completed_item_id, None)
+                        timeline_state.commentary_emitted.discard(completed_item_id)
                 continue
             if method != "turn/completed":
                 continue
@@ -2016,7 +2560,59 @@ class CodexAppServerConnector:
                 else:
                     message = status or "failed"
                 raise ConnectorError(f"Codex turn did not complete: {message}")
-            return final_message or last_message or "".join(streamed)
+            if not timeline_state.reasoning_observed:
+                await emit_reasoning_event(
+                    item_id=_item_id(turn_id) or "turn",
+                    channel="raw",
+                    lifecycle="unavailable",
+                    availability="not-emitted",
+                )
+            else:
+                for item_id in sorted(
+                    timeline_state.reasoning_items_seen
+                    - timeline_state.reasoning_items_completed
+                ):
+                    raw_keys = sorted(
+                        key
+                        for key in timeline_state.raw_reasoning_emitted
+                        if key[0] == item_id
+                    )
+                    summary_keys = sorted(
+                        key
+                        for key in timeline_state.summary_reasoning_emitted
+                        if key[0] == item_id
+                    )
+                    if raw_keys:
+                        for _, index in raw_keys:
+                            await emit_reasoning_event(
+                                item_id=item_id,
+                                channel="raw",
+                                index=index,
+                                lifecycle="completed",
+                            )
+                    else:
+                        opaque_bytes, opaque_sha256 = timeline_state.opaque_reasoning.get(
+                            item_id, (0, "")
+                        )
+                        await emit_reasoning_event(
+                            item_id=item_id,
+                            channel="raw",
+                            lifecycle="unavailable",
+                            availability=(
+                                "encrypted-only" if opaque_bytes else "not-emitted"
+                            ),
+                            opaque_present=bool(opaque_bytes),
+                            opaque_bytes=opaque_bytes,
+                            opaque_sha256=opaque_sha256,
+                        )
+                    for _, index in summary_keys:
+                        await emit_reasoning_event(
+                            item_id=item_id,
+                            channel="summary",
+                            index=index,
+                            lifecycle="completed",
+                        )
+            return final_message or "".join(streamed)
 
 
 async def _emit_delta(callback: DeltaCallback | None, text: str) -> None:
@@ -2044,6 +2640,30 @@ async def _emit_timeline(
         return
     # Give callbacks their own shallow object so they cannot mutate connector
     # state retained for later deltas or authoritative completion items.
+    result = callback(dict(event))
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _emit_reasoning(
+    callback: ReasoningCallback | None, event: Mapping[str, Any]
+) -> None:
+    if callback is None:
+        return
+    # Raw reasoning is an explicit, separate local-observability channel. It
+    # must never be folded into the public activity timeline or answer stream.
+    result = callback(dict(event))
+    if inspect.isawaitable(result):
+        await result
+
+
+async def _emit_assistant_message(
+    callback: AssistantMessageCallback | None, event: Mapping[str, Any]
+) -> None:
+    if callback is None:
+        return
+    # This callback carries only a bounded, redacted, provider-declared commentary message. It is
+    # separate from final-answer deltas, reasoning, tool data, and the public progress timeline.
     result = callback(dict(event))
     if inspect.isawaitable(result):
         await result

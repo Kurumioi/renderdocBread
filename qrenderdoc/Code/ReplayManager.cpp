@@ -29,6 +29,29 @@
 #include "CaptureContext.h"
 #include "QRDUtils.h"
 
+namespace
+{
+// i18n-ignore: non-user-facing ReplayLab replay-queue tag prefix.
+const QString replayLabBackgroundTagPrefix = lit("ReplayLab.background.");
+// i18n-ignore: non-user-facing CaptureContext tag for a real selected/effective EID change.
+const QString userReplayContextTag = lit("replaySetEvent");
+// i18n-ignore: non-user-facing CaptureContext tag for coalesced interactive scrub previews.
+const QString interactiveReplayContextTag = lit("replayInteractiveEvent");
+// i18n-ignore: non-user-facing CaptureContext tag for coalesced interactive scrub commits.
+const QString interactiveReplayCommitTag = lit("replayInteractiveCommit");
+
+bool IsReplayLabBackgroundInvoke(const QString &tag)
+{
+  return tag.startsWith(replayLabBackgroundTagPrefix);
+}
+
+bool IsUserReplayContextInvoke(const QString &tag)
+{
+  return tag == userReplayContextTag || tag == interactiveReplayContextTag ||
+         tag == interactiveReplayCommitTag;
+}
+}    // namespace
+
 ReplayManager::ReplayManager()
 {
   m_Running = false;
@@ -252,29 +275,15 @@ void ReplayManager::AsyncInvoke(const rdcstr &tag, ReplayManager::InvokeCallback
   QString qtag;
 
   if(!tag.empty())
-  {
     qtag = tag;
-
-    QMutexLocker autolock(&m_RenderLock);
-    for(int i = 0; i < m_RenderQueue.count();)
-    {
-      if(m_RenderQueue[i]->tag == qtag)
-      {
-        InvokeHandle *cmd = m_RenderQueue.takeAt(i);
-        if(cmd->selfdelete)
-          delete cmd;
-      }
-      else
-      {
-        i++;
-      }
-    }
-  }
 
   InvokeHandle *cmd = new InvokeHandle(m, qtag);
   cmd->selfdelete = true;
 
-  PushInvoke(cmd);
+  // Remove the old tagged request and insert this one under the same lock. Without this atomic
+  // replacement, two producer threads can both finish their removal pass and then enqueue stale
+  // work after the newer request.
+  PushInvoke(cmd, !qtag.isEmpty());
 }
 
 void ReplayManager::AsyncInvoke(ReplayManager::InvokeCallback m)
@@ -283,6 +292,51 @@ void ReplayManager::AsyncInvoke(ReplayManager::InvokeCallback m)
   cmd->selfdelete = true;
 
   PushInvoke(cmd);
+}
+
+bool ReplayManager::HasPendingForegroundInvoke()
+{
+  QMutexLocker autolock(&m_RenderLock);
+
+  if(m_UserReplayContextInFlight)
+    return true;
+
+  for(InvokeHandle *cmd : m_RenderQueue)
+  {
+    // Ordinary qrenderdoc viewer/maintenance work is foreground for queue
+    // ordering, but it does not make capture-bound evidence stale. Only a
+    // pending selected/effective EID transition is a user-context preemption.
+    if(cmd != NULL && IsUserReplayContextInvoke(cmd->tag))
+      return true;
+  }
+
+  return false;
+}
+
+uint64_t ReplayManager::GetForegroundInvokeGeneration()
+{
+  QMutexLocker autolock(&m_RenderLock);
+  return m_ForegroundInvokeGeneration;
+}
+
+bool ReplayManager::HasPendingNonBackgroundInvoke()
+{
+  QMutexLocker autolock(&m_RenderLock);
+  for(InvokeHandle *cmd : m_RenderQueue)
+    if(cmd && !IsReplayLabBackgroundInvoke(cmd->tag))
+      return true;
+  return false;
+}
+
+void ReplayManager::BlockInvokeTagged(const rdcstr &tag, ReplayManager::InvokeCallback m)
+{
+  InvokeHandle *cmd = new InvokeHandle(m, tag);
+
+  PushInvoke(cmd);
+
+  cmd->processed.acquire();
+
+  delete cmd;
 }
 
 void ReplayManager::BlockInvoke(ReplayManager::InvokeCallback m)
@@ -438,20 +492,75 @@ ExecuteResult ReplayManager::ExecuteAndInject(const rdcstr &exe, const rdcstr &w
   return ret;
 }
 
-void ReplayManager::PushInvoke(ReplayManager::InvokeHandle *cmd)
+void ReplayManager::PushInvoke(ReplayManager::InvokeHandle *cmd, bool coalesceTag)
 {
-  if(m_Thread == NULL || !m_Thread->isRunning() || !m_Running)
+  QQueue<InvokeHandle *> superseded;
+  bool accepted = false;
+
+  {
+    QMutexLocker autolock(&m_RenderLock);
+
+    // CloseThread publishes m_Running=false before the replay thread drains its queue. Testing it
+    // under the queue lock prevents a producer from inserting after that drain and either leaking
+    // an async handle or leaving a blocking caller asleep forever.
+    if(m_Running.load(std::memory_order_acquire))
+    {
+      if(coalesceTag && !cmd->tag.isEmpty())
+      {
+        for(int i = 0; i < m_RenderQueue.count();)
+        {
+          if(m_RenderQueue[i]->tag == cmd->tag)
+            superseded.enqueue(m_RenderQueue.takeAt(i));
+          else
+            i++;
+        }
+      }
+
+      // ReplayLab work normally runs as short background replay-thread slices or
+      // bounded atomic transactions. All normal qrenderdoc work remains ahead of
+      // that background lane, including the submit-time context-freeze barrier.
+      // Only CaptureContext's real selected/effective EID transition advances the
+      // stale-result generation; viewer refresh and other maintenance invokes are
+      // queue activity, not user context changes. FIFO ordering is preserved
+      // independently within both classes.
+      if(IsReplayLabBackgroundInvoke(cmd->tag))
+      {
+        m_RenderQueue.enqueue(cmd);
+      }
+      else
+      {
+        if(IsUserReplayContextInvoke(cmd->tag))
+          m_ForegroundInvokeGeneration++;
+        int insertionIndex = 0;
+        while(insertionIndex < m_RenderQueue.count() &&
+              !IsReplayLabBackgroundInvoke(m_RenderQueue[insertionIndex]->tag))
+          insertionIndex++;
+
+        m_RenderQueue.insert(insertionIndex, cmd);
+      }
+      accepted = true;
+      m_RenderCondition.wakeAll();
+    }
+  }
+
+  // Retiring a std::function may destroy captures that call back into this manager, and releasing
+  // a blocking handle wakes arbitrary caller code. Do both only after dropping m_RenderLock.
+  while(!superseded.isEmpty())
+  {
+    InvokeHandle *old = superseded.dequeue();
+    if(old->selfdelete)
+      delete old;
+    else
+      old->processed.release();
+  }
+
+  if(!accepted)
   {
     if(cmd->selfdelete)
       delete cmd;
     else
       cmd->processed.release();
-    return;
   }
-
-  QMutexLocker autolock(&m_RenderLock);
-  m_RenderQueue.enqueue(cmd);
-  m_RenderCondition.wakeAll();
 }
 
 void ReplayManager::run(int proxyRenderer, const QString &capturefile, const ReplayOptions &opts,
@@ -500,7 +609,11 @@ void ReplayManager::run(int proxyRenderer, const QString &capturefile, const Rep
         m_RenderCondition.wait(&m_RenderLock, 10);
 
       if(!m_RenderQueue.isEmpty())
+      {
         cmd = m_RenderQueue.dequeue();
+        m_UserReplayContextInFlight = IsUserReplayContextInvoke(cmd->tag);
+        m_ExecutingInvokeGeneration.fetch_add(1, std::memory_order_acq_rel);
+      }
     }
 
     if(cmd == NULL)
@@ -530,6 +643,11 @@ void ReplayManager::run(int proxyRenderer, const QString &capturefile, const Rep
       }
     }
 
+    {
+      QMutexLocker autolock(&m_RenderLock);
+      m_UserReplayContextInFlight = false;
+    }
+
     // if it's a throwaway command, delete it
     if(cmd->selfdelete)
       delete cmd;
@@ -543,6 +661,7 @@ void ReplayManager::run(int proxyRenderer, const QString &capturefile, const Rep
 
     {
       QMutexLocker autolock(&m_RenderLock);
+      m_UserReplayContextInFlight = false;
       m_RenderQueue.swap(queue);
     }
 

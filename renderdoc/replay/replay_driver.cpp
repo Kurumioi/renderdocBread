@@ -28,8 +28,423 @@
 #include "compressonator/CMP_Core.h"
 #include "maths/formatpacking.h"
 #include "maths/half_convert.h"
+#include "replay_timing.h"
 #include "serialise/serialiser.h"
 #include "strings/string_utils.h"
+#include "common/threading.h"
+#include "common/timing.h"
+#include "os/os_specific.h"
+
+struct ReplayTimingData
+{
+  struct Chunk
+  {
+    uint64_t ticks[5] = {};    // decode, execute, unclassified, wait, submit (last two overlap)
+    uint64_t selfTicks[3] = {};
+    uint32_t calls = 0;
+    uint32_t decoded = 0;
+    uint64_t TotalTicks() const { return ticks[0] + ticks[1] + ticks[2]; }
+    void Add(const Chunk &other)
+    {
+      calls += other.calls;
+      decoded += other.decoded;
+      for(size_t i = 0; i < ARRAY_COUNT(ticks); i++)
+        ticks[i] += other.ticks[i];
+      for(size_t i = 0; i < ARRAY_COUNT(selfTicks); i++)
+        selfTicks[i] += other.selfTicks[i];
+    }
+  };
+  struct Section
+  {
+    uint64_t ticks = 0;
+    uint64_t selfTicks = 0;
+    uint32_t calls = 0;
+    uint32_t depth = 0;
+  };
+  struct Wait
+  {
+    uint64_t ticks = 0;
+    uint32_t calls = 0;
+  };
+
+  Section sections[(size_t)ReplayTimingSection::Count] = {};
+  Wait waits[(size_t)ReplayTimingContext::Count] = {};
+  uint64_t counters[(size_t)ReplayTimingCounter::Count] = {};
+  ScopedReplayTimingSection *activeSection = NULL;
+  ReplayTimingContext context = ReplayTimingContext::Unspecified;
+  std::map<uint32_t, Chunk> chunks;
+  rdcstr (*chunkNameLookup)(uint32_t) = NULL;
+
+  void BeginSection(ReplayTimingSection section) { sections[(size_t)section].depth++; }
+  void EndSection(ReplayTimingSection sectionID, uint64_t ticks, uint64_t childTicks,
+                  ReplayTimingContext waitContext)
+  {
+    Section &section = sections[(size_t)sectionID];
+    section.selfTicks += ticks > childTicks ? ticks - childTicks : 0;
+
+    // Only the outermost instance contributes inclusive time and calls. Self time is disjoint even
+    // when a helper re-enters the same section through another nested section.
+    if(--section.depth == 0)
+    {
+      section.ticks += ticks;
+      section.calls++;
+      if(sectionID == ReplayTimingSection::ExplicitWait)
+      {
+        waits[(size_t)waitContext].ticks += ticks;
+        waits[(size_t)waitContext].calls++;
+      }
+    }
+  }
+};
+
+namespace
+{
+thread_local ScopedReplayTiming *activeReplayTiming = NULL;
+thread_local ScopedReplayTimingChunk *activeReplayChunk = NULL;
+const ReplayTimingSection chunkSections[] = {
+    ReplayTimingSection::ChunkDecode, ReplayTimingSection::ChunkExecute,
+    ReplayTimingSection::ChunkUnclassified, ReplayTimingSection::ExplicitWait,
+    ReplayTimingSection::ExplicitSubmit,
+};
+
+bool ReplayTimingEnabled()
+{
+  static const bool enabled = Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1";
+  return enabled;
+}
+
+const char *ReplayTypeName(ReplayLogType replayType)
+{
+  switch(replayType)
+  {
+    case eReplay_Full: return "Full";
+    case eReplay_WithoutDraw: return "WithoutDraw";
+    case eReplay_OnlyDraw: return "OnlyDraw";
+    default: break;
+  }
+
+  return "Unknown";
+}
+
+double ReplayTicksToMS(uint64_t ticks)
+{
+  return double(ticks) / Timing::GetTickFrequency();
+}
+
+const char *sectionNames[] = {
+    "applyInitial", "contextReplay", "explicitWait", "explicitSubmit", "initialDescriptors",
+    "initialCPUCopy", "initialGPUCopy", "initialSparseBinds", "initialAccelerationStructures",
+    "initialBarriers", "initialResidency", "initialListClose", "resetAllocators",
+    "replaySetup", "replayBookkeeping", "chunkFraming", "chunkDecode", "chunkExecute",
+    "chunkUnclassified", "replayMetadata",
+};
+const char *contextNames[] = {
+    "unspecified", "replayReset", "initialRestore", "initialFallback", "contextReplay",
+    "replayFinish", "queueSignal", "dataUploadSync", "dataUploadPoolReuse", "mapDataWrite",
+    "writeToSubresource", "preparedCacheInvalidate", "debugSingleSubmit", "descriptorWrite",
+    "descriptorCopy", "queueTransition",
+};
+const char *counterNames[] = {
+    "initialResources", "initialDescriptorHeaps", "initialDescriptors", "initialDescriptorRanges",
+    "initialDescriptorFullRestores", "initialDescriptorsSkipped", "initialBuffers",
+    "initialTextures", "initialHeaps", "initialReadOnlySkipped", "initialAccelerationStructures",
+    "initialAccelerationStructuresSkipped", "initialCPUCopyResources", "initialCPUCopyBytes",
+    "initialGPUCopyResources", "initialGPUCopyBufferBytes", "initialGPUCopyFootprintBytes",
+    "initialGPUCopyWholeResources", "initialUploadCacheHits", "initialUploadCacheBytes",
+    "initialUploadCachePromotedBytes", "initialUploadCacheFallbackBytes", "initialSparseResources", "initialBarriers",
+    "initialCommandLists", "internalListsCreated", "internalListsReused", "internalListsSubmitted",
+    "dataUploadListsCreated", "dataUploadPoolResets", "queueSignalsDeferred",
+    "queueSignalsConservative", "descriptorWriteWaits", "descriptorCopyWaits",
+    "descriptorWritesSkipped", "descriptorCopiesSkipped",
+    "chunksProcessed", "chunkBytes", "chunkDecodeBoundaries", "chunkDecodeBoundaryMissing",
+};
+static_assert(ARRAY_COUNT(sectionNames) == (size_t)ReplayTimingSection::Count,
+              "Every timing section must have a stable log key");
+static_assert(ARRAY_COUNT(contextNames) == (size_t)ReplayTimingContext::Count,
+              "Every wait context must have a stable log key");
+static_assert(ARRAY_COUNT(counterNames) == (size_t)ReplayTimingCounter::Count,
+              "Every timing counter must have a stable log key");
+
+void AppendReplayTiming(const rdcstr &line)
+{
+  static Threading::CriticalSection lock;
+  SCOPED_LOCK(lock);
+
+  rdcstr executable;
+  FileIO::GetExecutableFilename(executable);
+  const rdcstr filename = get_dirname(executable) + "/eid_timing_driver.log";
+
+  // The normal update-mode CRT open denies concurrent readers on Windows. A live timing reader
+  // could therefore make an event's records disappear (or the write-mode fallback truncate the
+  // file). The platform logging API uses append-only writes with reader sharing on both platforms.
+  FileIO::LogFileHandle *file = FileIO::logfile_open(filename);
+  const rdcstr record = line + "\n";
+  FileIO::logfile_append(file, record.c_str(), record.size());
+  FileIO::logfile_close(file, {});
+}
+};    // namespace
+
+void AppendReplayTimingLog(const rdcstr &line)
+{
+  if(ReplayTimingEnabled())
+    AppendReplayTiming(line);
+}
+
+bool IsReplayTimingActive()
+{
+  return activeReplayTiming != NULL;
+}
+
+void AddReplayTimingCounter(ReplayTimingCounter counter, uint64_t value)
+{
+  if(activeReplayTiming != NULL)
+    activeReplayTiming->m_Data->counters[(size_t)counter] += value;
+}
+
+void SetReplayTimingChunkNameLookup(rdcstr (*lookup)(uint32_t))
+{
+  if(activeReplayTiming)
+    activeReplayTiming->m_Data->chunkNameLookup = lookup;
+}
+
+void NotifyReplayTimingParametersDecoded()
+{
+  if(activeReplayChunk)
+    activeReplayChunk->ParametersDecoded();
+}
+
+ScopedReplayTiming::ScopedReplayTiming(const char *driver, uint32_t startEventID,
+                                       uint32_t endEventID, ReplayLogType replayType, bool partial)
+    : m_Driver(driver),
+      m_StartEventID(startEventID),
+      m_EndEventID(endEventID),
+      m_ReplayType(replayType),
+      m_Partial(partial)
+{
+  if(ReplayTimingEnabled())
+  {
+    m_Data = new ReplayTimingData;
+    m_StartTick = Timing::GetTick();
+    m_Previous = activeReplayTiming;
+    activeReplayTiming = this;
+  }
+}
+
+ScopedReplayTiming::~ScopedReplayTiming()
+{
+  if(m_Data == NULL)
+    return;
+
+  const uint64_t totalTicks = Timing::GetTick() - m_StartTick;
+  activeReplayTiming = m_Previous;
+  uint32_t replayDepth = 0;
+  for(const ScopedReplayTiming *parent = m_Previous; parent; parent = parent->m_Previous)
+    ++replayDepth;
+
+  rdcstr line = StringFormat::Fmt(
+      "api=%s range=%u->%u type=%s partial=%u total_ms=%.3f applyInitial_ms=%.3f "
+      "contextReplay_ms=%.3f explicitWait_ms=%.3f explicitSubmit_ms=%.3f",
+      m_Driver, m_StartEventID, m_EndEventID, ReplayTypeName(m_ReplayType), m_Partial ? 1U : 0U,
+      ReplayTicksToMS(totalTicks),
+      ReplayTicksToMS(m_Data->sections[(size_t)ReplayTimingSection::ApplyInitial].ticks),
+      ReplayTicksToMS(m_Data->sections[(size_t)ReplayTimingSection::ContextReplay].ticks),
+      ReplayTicksToMS(m_Data->sections[(size_t)ReplayTimingSection::ExplicitWait].ticks),
+      ReplayTicksToMS(m_Data->sections[(size_t)ReplayTimingSection::ExplicitSubmit].ticks));
+
+  line += StringFormat::Fmt(" timing_version=2 chunk_timing_version=1 replay_depth=%u", replayDepth);
+  uint64_t sectionSelfTicks = 0;
+  for(size_t i = 0; i < (size_t)ReplayTimingSection::Count; i++)
+  {
+    const ReplayTimingData::Section &section = m_Data->sections[i];
+    sectionSelfTicks += section.selfTicks;
+    if(section.calls)
+      line += StringFormat::Fmt(" section.%s_ms=%.3f section.%s_self_ms=%.3f section.%s_calls=%u",
+                                sectionNames[i], ReplayTicksToMS(section.ticks), sectionNames[i],
+                                ReplayTicksToMS(section.selfTicks), sectionNames[i], section.calls);
+  }
+  line += StringFormat::Fmt(" unscoped_ms=%.3f",
+                            ReplayTicksToMS(totalTicks > sectionSelfTicks
+                                                ? totalTicks - sectionSelfTicks
+                                                : 0));
+  for(size_t i = 0; i < (size_t)ReplayTimingContext::Count; i++)
+  {
+    const ReplayTimingData::Wait &wait = m_Data->waits[i];
+    if(wait.calls)
+      line += StringFormat::Fmt(" wait.%s_ms=%.3f wait.%s_calls=%u", contextNames[i],
+                                ReplayTicksToMS(wait.ticks), contextNames[i], wait.calls);
+  }
+  for(size_t i = 0; i < (size_t)ReplayTimingCounter::Count; i++)
+  {
+    if(m_Data->counters[i])
+      line += StringFormat::Fmt(" count.%s=%llu", counterNames[i], m_Data->counters[i]);
+  }
+
+  RDCLOG("[EIDTiming] %s", line.c_str());
+  AppendReplayTimingLog(line);
+
+  // At most 12 named types and one remainder record. Sorting/formatting and file I/O happen after
+  // the measured ReplayLog, with no per-chunk string construction or log writes.
+  rdcarray<uint32_t> chunkIDs;
+  for(const auto &entry : m_Data->chunks)
+    chunkIDs.push_back(entry.first);
+  std::sort(chunkIDs.begin(), chunkIDs.end(), [this](uint32_t a, uint32_t b) {
+    return m_Data->chunks[a].TotalTicks() > m_Data->chunks[b].TotalTicks();
+  });
+  ReplayTimingData::Chunk remainder;
+  auto logChunk = [this, replayDepth](uint32_t id, const ReplayTimingData::Chunk &chunk, const char *name) {
+    rdcstr record = StringFormat::Fmt(
+        "api=ReplayChunk driver=%s range=%u->%u type=%s chunkId=%u chunk=%s calls=%u "
+        "decodeBoundaries=%u decode_ms=%.3f execute_ms=%.3f unclassified_ms=%.3f "
+        "decode_self_ms=%.3f execute_self_ms=%.3f unclassified_self_ms=%.3f "
+        "wait_ms=%.3f submit_ms=%.3f total_ms=%.3f replay_depth=%u",
+        m_Driver, m_StartEventID, m_EndEventID, ReplayTypeName(m_ReplayType), id, name,
+        chunk.calls, chunk.decoded, ReplayTicksToMS(chunk.ticks[0]),
+        ReplayTicksToMS(chunk.ticks[1]), ReplayTicksToMS(chunk.ticks[2]),
+        ReplayTicksToMS(chunk.selfTicks[0]), ReplayTicksToMS(chunk.selfTicks[1]),
+        ReplayTicksToMS(chunk.selfTicks[2]),
+        ReplayTicksToMS(chunk.ticks[3]), ReplayTicksToMS(chunk.ticks[4]),
+        ReplayTicksToMS(chunk.TotalTicks()), replayDepth);
+    RDCLOG("[EIDTiming] %s", record.c_str());
+    AppendReplayTimingLog(record);
+  };
+  for(size_t i = 0; i < chunkIDs.size(); i++)
+  {
+    const uint32_t id = chunkIDs[i];
+    if(i < 12)
+    {
+      const rdcstr name = m_Data->chunkNameLookup ? m_Data->chunkNameLookup(id) : "unknown";
+      logChunk(id, m_Data->chunks[id], name.c_str());
+    }
+    else
+      remainder.Add(m_Data->chunks[id]);
+  }
+  if(remainder.calls)
+    logChunk(~0U, remainder, "other");
+  delete m_Data;
+}
+
+ScopedReplayTimingSection::ScopedReplayTimingSection(ReplayTimingSection section, bool start)
+    : m_Section(section)
+{
+  if(start)
+    Begin();
+}
+
+void ScopedReplayTimingSection::Begin()
+{
+  RDCASSERT(m_Replay == NULL);
+  m_Replay = activeReplayTiming;
+  if(m_Replay != NULL)
+  {
+    ReplayTimingData &data = *m_Replay->m_Data;
+    m_Context = data.context;
+    m_Parent = data.activeSection;
+    m_ChildTicks = 0;
+    data.activeSection = this;
+    data.BeginSection(m_Section);
+    m_StartTick = Timing::GetTick();
+  }
+}
+
+ScopedReplayTimingSection::~ScopedReplayTimingSection()
+{
+  End();
+}
+
+void ScopedReplayTimingSection::End()
+{
+  if(m_Replay == NULL)
+    return;
+
+  const uint64_t ticks = Timing::GetTick() - m_StartTick;
+  ReplayTimingData &data = *m_Replay->m_Data;
+  data.activeSection = m_Parent;
+  if(m_Parent != NULL)
+    m_Parent->m_ChildTicks += ticks;
+  data.EndSection(m_Section, ticks, m_ChildTicks, m_Context);
+  m_Replay = NULL;
+}
+
+void ScopedReplayTimingSection::Reclassify(ReplayTimingSection section)
+{
+  if(m_Replay == NULL || section == m_Section)
+    return;
+  ReplayTimingData &data = *m_Replay->m_Data;
+  // Only chunk scopes use this operation, before ending their parameter-read interval.
+  RDCASSERT(data.sections[(size_t)m_Section].depth > 0);
+  data.sections[(size_t)m_Section].depth--;
+  data.sections[(size_t)section].depth++;
+  m_Section = section;
+}
+
+ScopedReplayTimingChunk::ScopedReplayTimingChunk(uint32_t chunkID)
+    : m_ChunkID(chunkID),
+      m_Replay(activeReplayTiming),
+      m_Decode(ReplayTimingSection::ChunkUnclassified, false),
+      m_Execute(ReplayTimingSection::ChunkExecute, false)
+{
+  if(m_Replay == NULL)
+    return;
+  m_Previous = activeReplayChunk;
+  activeReplayChunk = this;
+  for(size_t i = 0; i < ARRAY_COUNT(chunkSections); i++)
+    m_SectionTicks[i] = m_Replay->m_Data->sections[(size_t)chunkSections[i]].ticks;
+  for(size_t i = 0; i < ARRAY_COUNT(m_SectionSelfTicks); i++)
+    m_SectionSelfTicks[i] = m_Replay->m_Data->sections[(size_t)chunkSections[i]].selfTicks;
+  m_Decode.Begin();
+}
+
+void ScopedReplayTimingChunk::ParametersDecoded()
+{
+  // Nested helpers may check again. Only the first checked boundary divides this chunk, and a
+  // callback in another nested ReplayLog cannot reclassify its parent's outstanding chunk.
+  if(m_Replay == NULL || m_Replay != activeReplayTiming || m_Decoded)
+    return;
+  // A serialisation helper may have its own outstanding timed section. Do not pop that helper's
+  // stack from a callback; leave such unusual routes unclassified instead of corrupting nesting.
+  if(m_Replay->m_Data->activeSection != &m_Decode)
+    return;
+  m_Decoded = true;
+  m_Decode.Reclassify(ReplayTimingSection::ChunkDecode);
+  m_Decode.End();
+  m_Execute.Begin();
+}
+
+ScopedReplayTimingChunk::~ScopedReplayTimingChunk()
+{
+  if(m_Replay == NULL)
+    return;
+  m_Execute.End();
+  m_Decode.End();
+  activeReplayChunk = m_Previous;
+  ReplayTimingData::Chunk &chunk = m_Replay->m_Data->chunks[m_ChunkID];
+  chunk.calls++;
+  chunk.decoded += m_Decoded ? 1U : 0U;
+  for(size_t i = 0; i < ARRAY_COUNT(chunkSections); i++)
+    chunk.ticks[i] += m_Replay->m_Data->sections[(size_t)chunkSections[i]].ticks - m_SectionTicks[i];
+  for(size_t i = 0; i < ARRAY_COUNT(m_SectionSelfTicks); i++)
+    chunk.selfTicks[i] +=
+        m_Replay->m_Data->sections[(size_t)chunkSections[i]].selfTicks - m_SectionSelfTicks[i];
+  AddReplayTimingCounter(ReplayTimingCounter::ChunksProcessed);
+  AddReplayTimingCounter(m_Decoded ? ReplayTimingCounter::ChunkDecodeBoundaries
+                                 : ReplayTimingCounter::ChunkDecodeBoundaryMissing);
+}
+
+ScopedReplayTimingContext::ScopedReplayTimingContext(ReplayTimingContext context)
+    : m_Replay(activeReplayTiming)
+{
+  if(m_Replay != NULL)
+  {
+    m_Previous = m_Replay->m_Data->context;
+    m_Replay->m_Data->context = context;
+  }
+}
+
+ScopedReplayTimingContext::~ScopedReplayTimingContext()
+{
+  if(m_Replay != NULL)
+    m_Replay->m_Data->context = m_Previous;
+}
 
 template <>
 rdcstr DoStringise(const RemapTexture &el)
@@ -57,6 +472,137 @@ void DoSerialise(SerialiserType &ser, GetTextureDataParams &el)
 }
 
 INSTANTIATE_SERIALISE_TYPE(GetTextureDataParams);
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, ReplayBufferPatch &el)
+{
+  SERIALISE_MEMBER(buffer);
+  SERIALISE_MEMBER(byteOffset);
+  SERIALISE_MEMBER(data);
+}
+
+INSTANTIATE_SERIALISE_TYPE(ReplayBufferPatch);
+
+rdcstr ValidateReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
+{
+  if(patches.size() > 512)
+    return "Persistent buffer edits exceed the 512-range limit";
+  uint64_t bytes = 0;
+  const ReplayBufferPatch *previous = NULL;
+  for(const ReplayBufferPatch &patch : patches)
+  {
+    if(patch.buffer == ResourceId() || patch.data.empty() ||
+       patch.byteOffset > UINT64_MAX - patch.data.size())
+      return "Persistent buffer edit has an invalid resource or byte range";
+    if(patch.data.size() > 32ULL * 1024 * 1024 - bytes)
+      return "Persistent buffer edits exceed the 32 MiB payload limit";
+    bytes += patch.data.size();
+    if(previous && (patch.buffer < previous->buffer ||
+                    (patch.buffer == previous->buffer &&
+                     patch.byteOffset < previous->byteOffset + previous->data.size())))
+      return "Persistent buffer edit ranges must be sorted and non-overlapping";
+    previous = &patch;
+  }
+  return {};
+}
+
+void ApplyReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches, ResourceId buffer,
+                              uint64_t byteOffset, void *data, uint64_t byteLength)
+{
+  if(!data || byteLength == 0 || byteOffset > UINT64_MAX - byteLength)
+    return;
+  for(const ReplayBufferPatch &patch : patches)
+  {
+    if(patch.buffer != buffer)
+      continue;
+    const uint64_t begin = RDCMAX(byteOffset, patch.byteOffset);
+    const uint64_t end = RDCMIN(byteOffset + byteLength, patch.byteOffset + patch.data.size());
+    if(begin < end)
+      memcpy((byte *)data + size_t(begin - byteOffset),
+             patch.data.data() + size_t(begin - patch.byteOffset), size_t(end - begin));
+  }
+}
+
+rdcstr ReplayBufferPatchSet::Set(ResourceId buffer, uint64_t byteOffset, const bytebuf &data)
+{
+  ReplayBufferPatch patch;
+  patch.buffer = buffer;
+  patch.byteOffset = byteOffset;
+  patch.data = data;
+  rdcstr error = ValidateReplayBufferPatches({patch});
+  if(!error.empty())
+    return error;
+
+  uint64_t bytes = data.size();
+  size_t count = 1;
+  for(const ReplayBufferPatch &layer : m_Layers)
+  {
+    if(layer.buffer == buffer && layer.byteOffset == byteOffset && layer.data.size() == data.size())
+      continue;
+    bytes += layer.data.size();
+    count++;
+  }
+  if(count > 256 || bytes > 32ULL * 1024 * 1024)
+    return "Persistent buffer edits exceed the edit-count or payload budget";
+
+  Remove(buffer, byteOffset, data.size());
+  m_Layers.push_back(patch);
+  return {};
+}
+
+bool ReplayBufferPatchSet::Remove(ResourceId buffer, uint64_t byteOffset, uint64_t byteLength)
+{
+  for(size_t i = 0; i < m_Layers.size(); i++)
+  {
+    const ReplayBufferPatch &layer = m_Layers[i];
+    if(layer.buffer == buffer && layer.byteOffset == byteOffset && layer.data.size() == byteLength)
+    {
+      m_Layers.erase(i);
+      return true;
+    }
+  }
+  return false;
+}
+
+rdcarray<ReplayBufferPatch> ReplayBufferPatchSet::Flatten() const
+{
+  rdcarray<ReplayBufferPatch> result;
+  for(const ReplayBufferPatch &layer : m_Layers)
+  {
+    rdcarray<ReplayBufferPatch> next;
+    const uint64_t layerEnd = layer.byteOffset + layer.data.size();
+    for(const ReplayBufferPatch &old : result)
+    {
+      const uint64_t oldEnd = old.byteOffset + old.data.size();
+      if(old.buffer != layer.buffer || oldEnd <= layer.byteOffset || old.byteOffset >= layerEnd)
+      {
+        next.push_back(old);
+        continue;
+      }
+      if(old.byteOffset < layer.byteOffset)
+      {
+        ReplayBufferPatch prefix = old;
+        prefix.data.resize(size_t(layer.byteOffset - old.byteOffset));
+        next.push_back(prefix);
+      }
+      if(oldEnd > layerEnd)
+      {
+        ReplayBufferPatch suffix;
+        suffix.buffer = old.buffer;
+        suffix.byteOffset = layerEnd;
+        suffix.data.resize(size_t(oldEnd - layerEnd));
+        memcpy(suffix.data.data(), old.data.data() + size_t(layerEnd - old.byteOffset), suffix.data.size());
+        next.push_back(suffix);
+      }
+    }
+    next.push_back(layer);
+    std::sort(next.begin(), next.end(), [](const ReplayBufferPatch &a, const ReplayBufferPatch &b) {
+      return a.buffer < b.buffer || (a.buffer == b.buffer && a.byteOffset < b.byteOffset);
+    });
+    result.swap(next);
+  }
+  return result;
+}
 
 static bool PreviousNextExcludedMarker(ActionDescription *action)
 {
@@ -1864,7 +2410,283 @@ void DeriveNearFar(Vec4f pos, Vec4f pos0, float &nearp, float &farp, bool &found
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 
+#include "api/replay/pipestate.h"
 #include "catch/catch.hpp"
+
+TEST_CASE("Checkpoint policy changes preserve versions only inside compatible storage limits",
+          "[replay][checkpoint]")
+{
+  ReplayCheckpointConfig previous;
+  ReplayCheckpointConfig next = previous;
+  CHECK(ReplayCheckpointStorageCompatible(previous, next));
+  next.maxCheckpoints++;
+  CHECK(ReplayCheckpointStorageCompatible(previous, next));
+  next.maxCheckpoints = previous.maxCheckpoints - 1;
+  CHECK_FALSE(ReplayCheckpointStorageCompatible(previous, next));
+  next = previous;
+  next.byteBudget /= 2;
+  CHECK_FALSE(ReplayCheckpointStorageCompatible(previous, next));
+  next = previous;
+  next.enabled = false;
+  CHECK_FALSE(ReplayCheckpointStorageCompatible(previous, next));
+  next = previous;
+  next.minEventGap++;
+  CHECK_FALSE(ReplayCheckpointStorageCompatible(previous, next));
+}
+
+TEST_CASE("Shared buffer edits preserve range identity and overlapping undo", "[replay][bufferpatch]")
+{
+  ResourceId a = ResourceIDGen::GetNewUniqueID();
+  ResourceId b = ResourceIDGen::GetNewUniqueID();
+  ReplayBufferPatchSet edits;
+  REQUIRE(edits.Set(a, 4, {1, 2, 3, 4, 5, 6}).empty());
+  REQUIRE(edits.Set(a, 6, {10, 11}).empty());
+  REQUIRE(edits.Set(b, 6, {20, 21}).empty());
+  rdcarray<ReplayBufferPatch> ranges = edits.Flatten();
+  REQUIRE(ValidateReplayBufferPatches(ranges).empty());
+  bytebuf bytes = {90, 90, 90, 90, 90, 90, 90, 90};
+  ApplyReplayBufferPatches(ranges, a, 3, bytes.data(), bytes.size());
+  CHECK(bytes == bytebuf({90, 1, 2, 10, 11, 5, 6, 90}));
+  REQUIRE(edits.Remove(a, 6, 2));
+  bytes = {90, 90, 90, 90, 90, 90, 90, 90};
+  ApplyReplayBufferPatches(edits.Flatten(), a, 3, bytes.data(), bytes.size());
+  CHECK(bytes == bytebuf({90, 1, 2, 3, 4, 5, 6, 90}));
+  CHECK_FALSE(edits.Remove(a, 6, 1));
+  REQUIRE(edits.Set(a, 4, {31, 32, 33, 34, 35, 36}).empty());
+  bytebuf clipped = {0, 0};
+  ApplyReplayBufferPatches(edits.Flatten(), a, 7, clipped.data(), clipped.size());
+  CHECK(clipped == bytebuf({34, 35}));
+  ApplyReplayBufferPatches(edits.Flatten(), b, 6, clipped.data(), clipped.size());
+  CHECK(clipped == bytebuf({20, 21}));
+  edits.Clear();
+  CHECK(edits.Empty());
+  CHECK(edits.Flatten().empty());
+}
+
+TEST_CASE("Shared buffer edits reject invalid transactions without losing old values", "[replay][bufferpatch]")
+{
+  ResourceId id = ResourceIDGen::GetNewUniqueID();
+  ReplayBufferPatchSet edits;
+  REQUIRE(edits.Set(id, 65537, {1, 2, 3, 4}).empty());
+  CHECK_FALSE(edits.Set(id, UINT64_MAX, {1, 2}).empty());
+  CHECK_FALSE(edits.Set(ResourceId(), 0, {1}).empty());
+  CHECK_FALSE(edits.Set(id, 0, {}).empty());
+  auto ranges = edits.Flatten();
+  REQUIRE(ranges.size() == 1);
+  CHECK(ranges[0].byteOffset == 65537);
+  CHECK(ranges[0].data == bytebuf({1, 2, 3, 4}));
+  ranges.push_back(ranges[0]);
+  CHECK_FALSE(ValidateReplayBufferPatches(ranges).empty());
+  ranges[1].byteOffset = 0;
+  CHECK_FALSE(ValidateReplayBufferPatches(ranges).empty());
+}
+
+TEST_CASE("Published pipeline metadata survives the next event", "[pipeline][publication]")
+{
+  const ResourceId shader = ResourceIDGen::GetNewUniqueID();
+  const ResourceId texture = ResourceIDGen::GetNewUniqueID();
+  const ResourceId sampler = ResourceIDGen::GetNewUniqueID();
+  const GraphicsAPI apis[] = {GraphicsAPI::D3D11, GraphicsAPI::D3D12, GraphicsAPI::OpenGL,
+                              GraphicsAPI::Vulkan};
+
+  for(GraphicsAPI api : apis)
+  {
+    INFO("API " << ToStr(api));
+    D3D11Pipe::State live11;
+    D3D12Pipe::State live12;
+    GLPipe::State liveGL;
+    VKPipe::State liveVK;
+    PipeState source;
+    ResourceId *liveShader = NULL;
+    Topology *liveTopology = NULL;
+    rdcarray<Descriptor> *liveTargets = NULL;
+
+    if(api == GraphicsAPI::D3D11)
+    {
+      source.SetState(&live11);
+      liveShader = &live11.vertexShader.resourceId;
+      liveTopology = &live11.inputAssembly.topology;
+      liveTargets = &live11.outputMerger.renderTargets;
+    }
+    else if(api == GraphicsAPI::D3D12)
+    {
+      source.SetState(&live12);
+      liveShader = &live12.vertexShader.resourceId;
+      liveTopology = &live12.inputAssembly.topology;
+      liveTargets = &live12.outputMerger.renderTargets;
+    }
+    else if(api == GraphicsAPI::OpenGL)
+    {
+      source.SetState(&liveGL);
+      liveShader = &liveGL.vertexShader.shaderResourceId;
+      liveTopology = &liveGL.vertexInput.topology;
+      liveTargets = &liveGL.framebuffer.drawFBO.colorAttachments;
+      liveGL.framebuffer.drawFBO.drawBuffers = {0};
+    }
+    else
+    {
+      source.SetState(&liveVK);
+      liveShader = &liveVK.vertexShader.resourceId;
+      liveTopology = &liveVK.inputAssembly.topology;
+      liveTargets = &liveVK.currentPass.framebuffer.attachments;
+      liveVK.currentPass.renderpass.colorAttachments = {0};
+    }
+    *liveShader = shader;
+    *liveTopology = Topology::TriangleList;
+    liveTargets->resize(1);
+    (*liveTargets)[0].resource = texture;
+
+    rdcarray<DescriptorAccess> access;
+    rdcarray<Descriptor> descriptors;
+    rdcarray<SamplerDescriptor> samplers;
+    access.resize(2);
+    descriptors.resize(2);
+    samplers.resize(2);
+    access[0].stage = access[1].stage = ShaderStage::Vertex;
+    access[0].type = DescriptorType::Image;
+    access[0].index = 3;
+    access[1].type = DescriptorType::Sampler;
+    access[1].index = 5;
+    descriptors[0].resource = texture;
+    samplers[1].object = sampler;
+    samplers[1].minLOD = 2.0f;
+    source.SetDescriptorAccess(std::move(access), std::move(descriptors), std::move(samplers));
+
+    // The publication owns the API state, while immutable shader reflection may remain shared.
+    D3D11Pipe::State owned11 = live11;
+    D3D12Pipe::State owned12 = live12;
+    GLPipe::State ownedGL = liveGL;
+    VKPipe::State ownedVK = liveVK;
+    PipeState published;
+    published.CopyStateAndRebind(source, &owned11, &owned12, &ownedGL, &ownedVK);
+
+    // Simulate the replay thread overwriting its objects and common metadata for the next event.
+    *liveShader = ResourceId();
+    *liveTopology = Topology::LineList;
+    liveTargets->clear();
+    liveGL.framebuffer.drawFBO.drawBuffers.clear();
+    liveVK.currentPass.renderpass.colorAttachments.clear();
+    source.SetDescriptorAccess({}, {}, {});
+    source.SetState((const D3D11Pipe::State *)NULL);
+
+    CHECK(published.IsCaptureD3D11() == (api == GraphicsAPI::D3D11));
+    CHECK(published.IsCaptureD3D12() == (api == GraphicsAPI::D3D12));
+    CHECK(published.IsCaptureGL() == (api == GraphicsAPI::OpenGL));
+    CHECK(published.IsCaptureVK() == (api == GraphicsAPI::Vulkan));
+    CHECK(published.GetShader(ShaderStage::Vertex) == shader);
+    CHECK(published.GetPrimitiveTopology() == Topology::TriangleList);
+    rdcarray<Descriptor> targets = published.GetOutputTargets();
+    REQUIRE(targets.size() == 1);
+    CHECK(targets[0].resource == texture);
+    REQUIRE(published.GetDescriptorAccess().size() == 2);
+    CHECK(published.GetDescriptorAccess()[0].index == 3);
+    rdcarray<UsedDescriptor> images = published.GetReadOnlyResources(ShaderStage::Vertex);
+    REQUIRE(images.size() == 1);
+    CHECK(images[0].descriptor.resource == texture);
+    rdcarray<UsedDescriptor> publishedSamplers = published.GetSamplers(ShaderStage::Vertex);
+    REQUIRE(publishedSamplers.size() == 1);
+    CHECK(publishedSamplers[0].access.index == 5);
+    CHECK(publishedSamplers[0].sampler.object == sampler);
+    CHECK(publishedSamplers[0].sampler.minLOD == 2.0f);
+  }
+}
+
+TEST_CASE("Replay timing excludes nested sections without double counting", "[replay][timing]")
+{
+  ReplayTimingData data;
+  const ReplayTimingContext context = ReplayTimingContext::QueueSignal;
+  const ReplayTimingSection replay = ReplayTimingSection::ContextReplay;
+  const ReplayTimingSection wait = ReplayTimingSection::ExplicitWait;
+
+  // Replay spans [0, 100], waits span [10, 70] and [30, 40]. The inner wait must not be
+  // added to the already enclosing wait's inclusive time or call count.
+  data.BeginSection(replay);
+  data.BeginSection(wait);
+  data.BeginSection(wait);
+  data.EndSection(wait, 10, 0, context);
+  data.EndSection(wait, 60, 10, context);
+  data.EndSection(replay, 100, 60, context);
+  CHECK(data.sections[(size_t)replay].ticks == 100);
+  CHECK(data.sections[(size_t)replay].selfTicks == 40);
+  CHECK(data.sections[(size_t)wait].ticks == 60);
+  CHECK(data.sections[(size_t)wait].selfTicks == 60);
+  CHECK(data.sections[(size_t)wait].calls == 1);
+  CHECK(data.waits[(size_t)context].ticks == 60);
+  CHECK(data.waits[(size_t)context].calls == 1);
+
+  // A second disjoint wait should accumulate normally.
+  data.BeginSection(wait);
+  data.EndSection(wait, 20, 0, ReplayTimingContext::MapDataWrite);
+  CHECK(data.sections[(size_t)wait].ticks == 80);
+  CHECK(data.sections[(size_t)wait].selfTicks == 80);
+  CHECK(data.sections[(size_t)wait].calls == 2);
+  CHECK(data.waits[(size_t)ReplayTimingContext::MapDataWrite].ticks == 20);
+}
+
+TEST_CASE("Replay timing handles re-entry through a different section", "[replay][timing]")
+{
+  ReplayTimingData data;
+  const ReplayTimingSection a = ReplayTimingSection::ApplyInitial;
+  const ReplayTimingSection b = ReplayTimingSection::InitialGPUCopy;
+  const ReplayTimingContext context = ReplayTimingContext::InitialRestore;
+  data.BeginSection(a);
+  data.BeginSection(b);
+  data.BeginSection(a);
+  data.EndSection(a, 3, 0, context);
+  data.EndSection(b, 5, 3, context);
+  data.EndSection(a, 10, 5, context);
+  CHECK(data.sections[(size_t)a].ticks == 10);
+  CHECK(data.sections[(size_t)a].selfTicks == 8);
+  CHECK(data.sections[(size_t)b].ticks == 5);
+  CHECK(data.sections[(size_t)b].selfTicks == 2);
+  CHECK(data.sections[(size_t)a].calls == 1);
+  CHECK(data.sections[(size_t)a].depth == 0);
+  CHECK(data.sections[(size_t)b].depth == 0);
+}
+
+TEST_CASE("Serialiser parameter boundary callback is read-only and opt-in", "[replay][timing]")
+{
+  static uint32_t callbacks = 0;
+  callbacks = 0;
+  auto notify = []() { callbacks++; };
+  StreamReader reader(StreamReader::DummyStream);
+  ReadSerialiser read(&reader, Ownership::Nothing);
+  read.NotifyParametersRead();
+  CHECK(callbacks == 0);
+  read.SetParameterReadCallback(notify);
+  read.NotifyParametersRead();
+  CHECK(callbacks == 1);
+  read.SetParameterReadCallback(NULL);
+  read.NotifyParametersRead();
+  CHECK(callbacks == 1);
+
+  StreamWriter writer(64);
+  WriteSerialiser write(&writer, Ownership::Nothing);
+  write.SetParameterReadCallback(notify);
+  write.NotifyParametersRead();
+  CHECK(callbacks == 1);
+}
+
+TEST_CASE("Replay chunk summary keeps waits overlapping and unknown routes explicit", "[replay][timing]")
+{
+  ReplayTimingData::Chunk decoded;
+  decoded.calls = decoded.decoded = 1;
+  decoded.ticks[0] = 20;
+  decoded.ticks[1] = 80;
+  decoded.ticks[3] = 50;
+  decoded.ticks[4] = 5;
+  ReplayTimingData::Chunk unclassified;
+  unclassified.calls = 1;
+  unclassified.ticks[2] = 30;
+  ReplayTimingData::Chunk remainder;
+  remainder.Add(decoded);
+  remainder.Add(unclassified);
+  CHECK(remainder.TotalTicks() == 130);    // wait and submit are not added twice
+  CHECK(remainder.calls == 2);
+  CHECK(remainder.decoded == 1);
+  CHECK(remainder.ticks[2] == 30);
+  CHECK(remainder.ticks[3] == 50);
+}
 
 TEST_CASE("Check PreprocessLineDirectives", "[preprocess]")
 {

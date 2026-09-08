@@ -34,21 +34,38 @@ MAX_CAPTURE_REVISION_COUNT = 4096
 MAX_SHADER_COUNT = 65536
 MAX_KNOWLEDGE_COUNT = 4096
 MAX_SOURCE_BYTES = 16 * 1024 * 1024
+MAX_COMPILED_CANDIDATE_BYTES = 512 * 1024 * 1024
+MAX_ABI_REPORT_BYTES = 16 * 1024 * 1024
 MAX_ANALYSIS_BYTES = 1024 * 1024
 MAX_ALIAS_BYTES = 64 * 1024 * 1024
 MAX_CAPTURE_CATALOG_BYTES = 256 * 1024 * 1024
 MAX_CAPTURE_SHADER_BYTES = 512 * 1024 * 1024
 MAX_ALIASES = 65536
 MAX_MATERIAL_PARAMETERS = 256
+MAX_INVENTORY_OBSERVATIONS = 4096
 MAX_REUSE_CACHE_BYTES = 256 * 1024 * 1024
 MAX_ACTIVE_KNOWLEDGE_REVISION = (1 << 63) - 1
 REUSE_CACHE_SCHEMA = "renderdoc-ultra-project-reuse-cache/v1"
 REUSE_CACHE_VERSION = 1
-REUSE_MATCH_POLICY = "raw-exact-or-code-interface-layout-exact-v1"
+REUSE_MATCH_POLICY = "raw-exact-or-code-interface-layout-exact-v2-known-api-source-preparation"
 REUSE_MATCH_POLICY_SHA256 = hashlib.sha256(REUSE_MATCH_POLICY.encode("utf-8")).hexdigest()
 RESTORE_KNOWLEDGE_SCOPE_SCHEMA = (
     "renderdoc-ultra-project-referenced-knowledge/v1"
 )
+ACTIVE_HEAD_RECEIPT_SCHEMA = "renderdoc-ultra-project-active-head/v1"
+ACTIVE_HEAD_RECEIPT_VERSION = 1
+COMPILED_CANDIDATE_SCHEMA = "renderdoc-ultra-project-compiled-candidate/v1"
+COMPILED_CANDIDATE_VERSION = 1
+SHADER_INVENTORY_SCHEMA = "renderdoc-ultra-project-shader-inventory/v1"
+SHADER_INVENTORY_VERSION = 1
+SHADER_INVENTORY_REUSE_SCHEMA = (
+    "renderdoc-ultra-project-shader-inventory-reuse/v1"
+)
+SHADER_INVENTORY_REUSE_VERSION = 1
+SHADER_INVENTORY_BINDING_SCHEMA = (
+    "renderdoc-ultra-project-shader-inventory-binding/v1"
+)
+SHADER_INVENTORY_BINDING_VERSION = 1
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 HEX32_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -101,6 +118,28 @@ def _positive(value: Any, field: str) -> int:
     return result
 
 
+def _canonical_positive(value: Any, field: str) -> int:
+    """Validate an integer stored inside a canonical persisted identity."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ReplayProjectError("%s must be a positive integer" % field)
+    return value
+
+
+def _nonnegative(value: Any, field: str) -> int:
+    if isinstance(value, bool):
+        raise ReplayProjectError("%s must be a non-negative integer" % field)
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ReplayProjectError(
+            "%s must be a non-negative integer" % field
+        ) from exc
+    if result < 0:
+        raise ReplayProjectError("%s must be a non-negative integer" % field)
+    return result
+
+
 def _text(value: Any, field: str, maximum: int = 4096, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise ReplayProjectError("%s must be a string" % field)
@@ -119,6 +158,624 @@ def _canonical_sha256(value: Any) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _compiled_candidate_identity(value: Any) -> dict[str, Any]:
+    """Validate the immutable, source-bound identity of a published binary.
+
+    The project keeps the origin ABI receipt only as publication provenance.
+    It is deliberately not an apply lease and contains no capture-local
+    replacement/session identity.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ReplayProjectError("workspace compiled candidate is invalid")
+    allowed = {
+        "schema",
+        "schemaVersion",
+        "rawSha256",
+        "codeSha256",
+        "byteSize",
+        "kind",
+        "sourceSha256",
+        "sourceRevision",
+        "targetProfile",
+        "originBaselineAbiSha256",
+        "originCandidateAbiSha256",
+        "originAbiReportSha256",
+        "originRequestId",
+        "validationScope",
+        "semanticEquivalenceVerified",
+        "artifactPath",
+    }
+    if set(value) - allowed:
+        raise ReplayProjectError("workspace compiled candidate has unsupported fields")
+    if (
+        value.get("schema") != COMPILED_CANDIDATE_SCHEMA
+        or value.get("schemaVersion") != COMPILED_CANDIDATE_VERSION
+    ):
+        raise ReplayProjectError("workspace compiled candidate schema/version is invalid")
+    profile = value.get("targetProfile")
+    if not isinstance(profile, Mapping):
+        raise ReplayProjectError("workspace compiled candidate targetProfile is invalid")
+    if value.get("validationScope") != "replay-reflection-abi-compatible":
+        raise ReplayProjectError("workspace compiled candidate lacks full ABI validation")
+    if value.get("semanticEquivalenceVerified") is not False:
+        raise ReplayProjectError(
+            "workspace compiled candidate semantic-equivalence policy is invalid"
+        )
+    return {
+        "schema": COMPILED_CANDIDATE_SCHEMA,
+        "schemaVersion": COMPILED_CANDIDATE_VERSION,
+        "rawSha256": _sha(
+            value.get("rawSha256"), "compiledCandidate.rawSha256"
+        ),
+        "codeSha256": _sha(
+            value.get("codeSha256"), "compiledCandidate.codeSha256"
+        ),
+        "byteSize": _positive(
+            value.get("byteSize"), "compiledCandidate.byteSize"
+        ),
+        "kind": _text(
+            str(value.get("kind", "")), "compiledCandidate.kind", 64
+        ),
+        "sourceSha256": _sha(
+            value.get("sourceSha256"), "compiledCandidate.sourceSha256"
+        ),
+        "sourceRevision": _positive(
+            value.get("sourceRevision"), "compiledCandidate.sourceRevision"
+        ),
+        "targetProfile": copy.deepcopy(dict(profile)),
+        "originBaselineAbiSha256": _sha(
+            value.get("originBaselineAbiSha256"),
+            "compiledCandidate.originBaselineAbiSha256",
+        ),
+        "originCandidateAbiSha256": _sha(
+            value.get("originCandidateAbiSha256"),
+            "compiledCandidate.originCandidateAbiSha256",
+        ),
+        "originAbiReportSha256": _sha(
+            value.get("originAbiReportSha256"),
+            "compiledCandidate.originAbiReportSha256",
+        ),
+        "originRequestId": _text(
+            str(value.get("originRequestId", "")),
+            "compiledCandidate.originRequestId",
+            256,
+        ),
+        "validationScope": "replay-reflection-abi-compatible",
+        "semanticEquivalenceVerified": False,
+    }
+
+
+def _compiler_binding_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema",
+        "schemaVersion",
+        "targetProfile",
+        "routePlanSha256",
+        "hops",
+        "executionAuthority",
+        "evidenceOnly",
+        "bindingSha256",
+    }:
+        raise ReplayProjectError("workspace compiler binding fields are invalid")
+    if (
+        value.get("schema") != "renderdoc-ultra-shader-compiler-binding/v1"
+        or value.get("schemaVersion") != 1
+        or value.get("executionAuthority") is not False
+        or value.get("evidenceOnly") is not True
+        or not isinstance(value.get("targetProfile"), Mapping)
+    ):
+        raise ReplayProjectError("workspace compiler binding policy is invalid")
+    route_plan_value = value.get("routePlanSha256")
+    route_plan_sha256 = (
+        None
+        if route_plan_value is None
+        else _sha(route_plan_value, "compilerBinding.routePlanSha256")
+    )
+    raw_hops = value.get("hops")
+    if not isinstance(raw_hops, list) or not raw_hops or len(raw_hops) > 4:
+        raise ReplayProjectError("workspace compiler binding hops are invalid")
+    hops: list[dict[str, Any]] = []
+    for index, raw_hop in enumerate(raw_hops):
+        label = "compilerBinding.hops[%d]" % index
+        if not isinstance(raw_hop, Mapping) or set(raw_hop) != {
+            "hop",
+            "routeId",
+            "inputFormat",
+            "outputFormat",
+            "toolId",
+            "operation",
+            "toolConfigDigest",
+            "executableSha256",
+            "fixedFileHashes",
+            "argumentTemplate",
+            "placeholders",
+        }:
+            raise ReplayProjectError("%s fields are invalid" % label)
+        fixed_hashes = raw_hop.get("fixedFileHashes")
+        arguments = raw_hop.get("argumentTemplate")
+        placeholders = raw_hop.get("placeholders")
+        if (
+            not isinstance(fixed_hashes, Mapping)
+            or len(fixed_hashes) > 64
+            or not isinstance(arguments, list)
+            or len(arguments) > 128
+            or not isinstance(placeholders, list)
+            or len(placeholders) > 32
+        ):
+            raise ReplayProjectError("%s compiler metadata is invalid" % label)
+        clean_fixed: dict[str, str] = {}
+        for path, digest in fixed_hashes.items():
+            clean_fixed[_text(path, label + ".fixedFilePath", 4096)] = _sha(
+                digest, label + ".fixedFileSha256"
+            )
+        clean_arguments = [
+            _text(argument, label + ".argumentTemplate", 8192)
+            for argument in arguments
+        ]
+        clean_placeholders = [
+            _text(placeholder, label + ".placeholder", 128)
+            for placeholder in placeholders
+        ]
+        if len(set(clean_placeholders)) != len(clean_placeholders):
+            raise ReplayProjectError("workspace compiler placeholders are duplicated")
+        hops.append(
+            {
+                "hop": _positive(raw_hop.get("hop"), label + ".hop"),
+                "routeId": _text(raw_hop.get("routeId"), label + ".routeId", 256),
+                "inputFormat": _text(
+                    raw_hop.get("inputFormat"), label + ".inputFormat", 64
+                ),
+                "outputFormat": _text(
+                    raw_hop.get("outputFormat"), label + ".outputFormat", 64
+                ),
+                "toolId": _text(raw_hop.get("toolId"), label + ".toolId", 128),
+                "operation": _text(
+                    raw_hop.get("operation"), label + ".operation", 64
+                ),
+                "toolConfigDigest": _sha(
+                    raw_hop.get("toolConfigDigest"),
+                    label + ".toolConfigDigest",
+                ),
+                "executableSha256": _sha(
+                    raw_hop.get("executableSha256"),
+                    label + ".executableSha256",
+                ),
+                "fixedFileHashes": clean_fixed,
+                "argumentTemplate": clean_arguments,
+                "placeholders": clean_placeholders,
+            }
+        )
+        if hops[-1]["hop"] != index + 1:
+            raise ReplayProjectError("workspace compiler hop order is invalid")
+    result: dict[str, Any] = {
+        "schema": "renderdoc-ultra-shader-compiler-binding/v1",
+        "schemaVersion": 1,
+        "targetProfile": copy.deepcopy(dict(value["targetProfile"])),
+        "routePlanSha256": route_plan_sha256,
+        "hops": hops,
+        "executionAuthority": False,
+        "evidenceOnly": True,
+    }
+    if _sha(
+        value.get("bindingSha256"), "compilerBinding.bindingSha256"
+    ) != _canonical_sha256(result):
+        raise ReplayProjectError("workspace compiler binding hash mismatch")
+    result["bindingSha256"] = _canonical_sha256(result)
+    return result
+
+
+def _assembly_disassembly_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ReplayProjectError("assembly/disassembly artifact is invalid")
+    allowed = {
+        "kind",
+        "role",
+        "format",
+        "path",
+        "artifactPath",
+        "sha256",
+        "byteSize",
+        "routePlanSha256",
+        "toolId",
+        "toolConfigDigest",
+        "executableSha256",
+        "inputFormat",
+        "inputRawSha256",
+        "routeId",
+        "operation",
+        "physicalEvidence",
+        "displayEvidenceOnly",
+        "editableSource",
+        "applyAuthorization",
+    }
+    if set(value) - allowed or not {"kind", "role", "format", "sha256", "byteSize"}.issubset(value):
+        raise ReplayProjectError("assembly/disassembly artifact fields are invalid")
+    kind = value.get("kind")
+    role = value.get("role")
+    artifact_format = value.get("format")
+    if role not in {"baseline", "candidate"}:
+        raise ReplayProjectError("assembly/disassembly artifact policy is invalid")
+    common = {
+        "role": role,
+        "sha256": _sha(value.get("sha256"), "disassembly.sha256"),
+        "byteSize": _positive(value.get("byteSize"), "disassembly.byteSize"),
+        "routePlanSha256": _sha(
+            value.get("routePlanSha256"), "disassembly.routePlanSha256"
+        ),
+        "toolId": _text(value.get("toolId"), "disassembly.toolId", 128),
+        "toolConfigDigest": _sha(
+            value.get("toolConfigDigest"), "disassembly.toolConfigDigest"
+        ),
+        "executableSha256": _sha(
+            value.get("executableSha256"), "disassembly.executableSha256"
+        ),
+        "physicalEvidence": True,
+        "editableSource": False,
+        "applyAuthorization": False,
+    }
+    if kind == "dxil-disassembly":
+        if (
+            artifact_format != "dxil-asm"
+            or value.get("physicalEvidence") is not True
+            or value.get("editableSource") is not False
+            or value.get("applyAuthorization") is not False
+            or any(
+                field in value
+                for field in (
+                    "inputFormat",
+                    "inputRawSha256",
+                    "routeId",
+                    "operation",
+                    "displayEvidenceOnly",
+                )
+            )
+        ):
+            raise ReplayProjectError(
+                "assembly/disassembly artifact policy is invalid"
+            )
+        return {
+            "kind": "dxil-disassembly",
+            **common,
+            "format": "dxil-asm",
+        }
+    expected_inputs = {
+        "dxbc-asm": "dxbc",
+        "spirv-asm": "spirv",
+        "opengl-spirv-asm": "opengl-spirv",
+    }
+    if (
+        kind != "native-disassembly"
+        or artifact_format not in expected_inputs
+        or value.get("inputFormat") != expected_inputs.get(artifact_format)
+        or value.get("operation") != "decompile"
+        or value.get("physicalEvidence") is not True
+        or value.get("displayEvidenceOnly") is not True
+        or value.get("editableSource") is not False
+        or value.get("applyAuthorization") is not False
+    ):
+        raise ReplayProjectError("assembly/disassembly artifact policy is invalid")
+    return {
+        "kind": "native-disassembly",
+        **common,
+        "format": artifact_format,
+        "inputFormat": expected_inputs[artifact_format],
+        "inputRawSha256": _sha(
+            value.get("inputRawSha256"), "disassembly.inputRawSha256"
+        ),
+        "routeId": _text(value.get("routeId"), "disassembly.routeId", 256),
+        "operation": "decompile",
+        "displayEvidenceOnly": True,
+    }
+
+
+def _assembly_disassembly_relative(identity: Mapping[str, Any]) -> str:
+    suffixes = {
+        "dxil-asm": ".dxil-asm",
+        "dxbc-asm": ".dxbc-asm",
+        "spirv-asm": ".spvasm",
+        "opengl-spirv-asm": ".opengl.spvasm",
+    }
+    suffix = suffixes.get(identity.get("format"))
+    if suffix is None:
+        raise ReplayProjectError("assembly/disassembly artifact format is invalid")
+    return "knowledge/workspaces/disassembly/%s%s" % (
+        identity["sha256"],
+        suffix,
+    )
+
+
+def _inventory_origin_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema",
+        "schemaVersion",
+        "api",
+        "encoding",
+        "rawSha256",
+        "stage",
+        "entryPoint",
+        "abiHash",
+        "layoutHash",
+        "stableKeySha256",
+    }:
+        raise ReplayProjectError("workspace inventory origin fields are invalid")
+    if (
+        value.get("schema")
+        != "renderdoc-ultra-project-shader-inventory-origin/v1"
+        or value.get("schemaVersion") != 1
+    ):
+        raise ReplayProjectError("workspace inventory origin schema is invalid")
+    identity = {
+        "api": _api_family(value.get("api")),
+        "encoding": _shader_encoding(value.get("encoding")),
+        "rawSha256": _sha(
+            value.get("rawSha256"), "workspace.inventoryOrigin.rawSha256"
+        ),
+        "stage": _normalised_stage(value.get("stage")),
+        "entryPoint": _text(
+            value.get("entryPoint"),
+            "workspace.inventoryOrigin.entryPoint",
+            512,
+            allow_empty=True,
+        ),
+        "abiHash": _sha(
+            value.get("abiHash"),
+            "workspace.inventoryOrigin.abiHash",
+            allow_empty=True,
+        ),
+        "layoutHash": _sha(
+            value.get("layoutHash"),
+            "workspace.inventoryOrigin.layoutHash",
+            allow_empty=True,
+        ),
+    }
+    if _stable_shader_encoding(identity["encoding"]) not in (
+        _SHADER_ENCODINGS_BY_API.get(identity["api"], ())
+    ):
+        raise ReplayProjectError(
+            "workspace inventory origin API/encoding pair is unsupported"
+        )
+    stable = _stable_shader_identity_sha256(identity)
+    if _sha(
+        value.get("stableKeySha256"),
+        "workspace.inventoryOrigin.stableKeySha256",
+    ) != stable:
+        raise ReplayProjectError("workspace inventory origin stable key mismatch")
+    return {
+        "schema": "renderdoc-ultra-project-shader-inventory-origin/v1",
+        "schemaVersion": 1,
+        **identity,
+        "stableKeySha256": stable,
+    }
+
+
+def _inventory_observation(value: Any) -> dict[str, Any]:
+    required = {
+        "schema",
+        "schemaVersion",
+        "captureId",
+        "inventorySha256",
+        "stableKeySha256",
+        "targetResourceId",
+        "anchorEventId",
+        "constantBlocksSha256",
+        "workspaceManifestSha256",
+        "sourceSha256",
+        "compiledCandidateSha256",
+        "applyAuthorization",
+        "crossCaptureResourceIdReuse",
+        "observedAt",
+        "receiptSha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise ReplayProjectError("workspace inventory observation fields are invalid")
+    if (
+        value.get("schema")
+        != "renderdoc-ultra-project-shader-inventory-observation/v1"
+        or value.get("schemaVersion") != 1
+        or value.get("applyAuthorization") is not False
+        or value.get("crossCaptureResourceIdReuse") is not False
+    ):
+        raise ReplayProjectError("workspace inventory observation policy is invalid")
+    material = {
+        "schema": "renderdoc-ultra-project-shader-inventory-observation/v1",
+        "schemaVersion": 1,
+        "captureId": _sha(value.get("captureId"), "inventoryObservation.captureId"),
+        "inventorySha256": _sha(
+            value.get("inventorySha256"),
+            "inventoryObservation.inventorySha256",
+        ),
+        "stableKeySha256": _sha(
+            value.get("stableKeySha256"),
+            "inventoryObservation.stableKeySha256",
+        ),
+        "targetResourceId": _positive(
+            value.get("targetResourceId"),
+            "inventoryObservation.targetResourceId",
+        ),
+        "anchorEventId": (
+            None
+            if value.get("anchorEventId") is None
+            else _positive(
+                value.get("anchorEventId"),
+                "inventoryObservation.anchorEventId",
+            )
+        ),
+        "constantBlocksSha256": _sha(
+            value.get("constantBlocksSha256"),
+            "inventoryObservation.constantBlocksSha256",
+        ),
+        "workspaceManifestSha256": _sha(
+            value.get("workspaceManifestSha256"),
+            "inventoryObservation.workspaceManifestSha256",
+        ),
+        "sourceSha256": _sha(
+            value.get("sourceSha256"), "inventoryObservation.sourceSha256"
+        ),
+        "compiledCandidateSha256": _sha(
+            value.get("compiledCandidateSha256"),
+            "inventoryObservation.compiledCandidateSha256",
+            allow_empty=True,
+        ),
+        "applyAuthorization": False,
+        "crossCaptureResourceIdReuse": False,
+    }
+    observed_at = _text(
+        value.get("observedAt"), "inventoryObservation.observedAt", 128
+    )
+    receipt_sha256 = _canonical_sha256(material)
+    if _sha(
+        value.get("receiptSha256"), "inventoryObservation.receiptSha256"
+    ) != receipt_sha256:
+        raise ReplayProjectError("workspace inventory observation hash mismatch")
+    return {
+        **material,
+        "observedAt": observed_at,
+        "receiptSha256": receipt_sha256,
+    }
+
+
+def _inventory_workspace_artifact_identity(value: Any) -> dict[str, Any]:
+    """Return the capture-independent identity of inventory-published work.
+
+    Inventory capture/resource/anchor values are validation receipts, not the
+    identity of portable HLSL or compiled representations.  In particular,
+    source revision numbers and ABI request/report IDs describe how a binary
+    was validated in one temporary workspace; they do not change the binary,
+    compiler configuration, or physical Shader ABI which may be reused.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ReplayProjectError("inventory workspace artifact is invalid")
+    origin = _inventory_origin_identity(value.get("inventoryOrigin"))
+    profile = value.get("targetProfile")
+    if not isinstance(profile, Mapping):
+        raise ReplayProjectError("inventory workspace targetProfile is invalid")
+    identity: dict[str, Any] = {
+        "schema": "renderdoc-ultra-project-shader-artifact-identity/v1",
+        "schemaVersion": 1,
+        "stableShader": origin,
+        "physicalIdentity": {
+            "stage": _normalised_stage(value.get("stage")),
+            "entryPoint": _text(
+                value.get("entryPoint"),
+                "inventoryWorkspace.entryPoint",
+                512,
+                allow_empty=True,
+            ),
+            "rawSha256": _sha(
+                value.get("rawSha256"), "inventoryWorkspace.rawSha256"
+            ),
+            "codeSha256": _sha(
+                value.get("codeSha256"),
+                "inventoryWorkspace.codeSha256",
+                allow_empty=True,
+            ),
+            "layoutHash": _sha(
+                value.get("layoutHash"),
+                "inventoryWorkspace.layoutHash",
+                allow_empty=True,
+            ),
+            "interfaceHash": _sha(
+                value.get("interfaceHash"),
+                "inventoryWorkspace.interfaceHash",
+                allow_empty=True,
+            ),
+            "interfaceComplete": value.get("interfaceComplete") is True,
+            "baselineAbiSha256": _sha(
+                value.get("baselineAbiSha256"),
+                "inventoryWorkspace.baselineAbiSha256",
+                allow_empty=True,
+            ),
+        },
+        "targetProfile": copy.deepcopy(dict(profile)),
+        "sourceSha256": _sha(
+            value.get("sourceSha256"), "inventoryWorkspace.sourceSha256"
+        ),
+    }
+    physical = identity["physicalIdentity"]
+    if any(
+        (
+            physical["stage"] != origin["stage"],
+            physical["entryPoint"] != origin["entryPoint"],
+            physical["rawSha256"] != origin["rawSha256"],
+            physical["layoutHash"] != origin["layoutHash"],
+            physical["baselineAbiSha256"] != origin["abiHash"],
+        )
+    ):
+        raise ReplayProjectError(
+            "inventory workspace physical identity differs from its stable Shader"
+        )
+    compiler_binding = value.get("compilerBinding")
+    if compiler_binding is not None:
+        clean_compiler = _compiler_binding_identity(compiler_binding)
+        if clean_compiler["targetProfile"] != identity["targetProfile"]:
+            raise ReplayProjectError(
+                "inventory workspace compiler binding target profile differs"
+            )
+        identity["compilerBinding"] = clean_compiler
+    disassembly = value.get("assemblyDisassemblyArtifacts", [])
+    if not isinstance(disassembly, list) or len(disassembly) > 2:
+        raise ReplayProjectError(
+            "inventory workspace assembly/disassembly artifacts are invalid"
+        )
+    if disassembly:
+        clean_disassembly = [
+            _assembly_disassembly_identity(item) for item in disassembly
+        ]
+        if len({item["role"] for item in clean_disassembly}) != len(
+            clean_disassembly
+        ):
+            raise ReplayProjectError(
+                "inventory workspace disassembly role is duplicated"
+            )
+        if any(
+            item["kind"] == "native-disassembly"
+            and (
+                item["role"] != "baseline"
+                or item["inputRawSha256"] != physical["rawSha256"]
+            )
+            for item in clean_disassembly
+        ):
+            raise ReplayProjectError(
+                "inventory workspace native disassembly physical binding mismatch"
+            )
+        identity["assemblyDisassemblyArtifacts"] = clean_disassembly
+    compiled = value.get("compiledCandidate")
+    if compiled is not None:
+        clean_compiled = _compiled_candidate_identity(compiled)
+        if (
+            clean_compiled["sourceSha256"] != identity["sourceSha256"]
+            or clean_compiled["targetProfile"] != identity["targetProfile"]
+            or clean_compiled["originBaselineAbiSha256"]
+            != physical["baselineAbiSha256"]
+        ):
+            raise ReplayProjectError(
+                "inventory workspace compiled candidate binding mismatch"
+            )
+        identity["compiledArtifact"] = {
+            "schema": clean_compiled["schema"],
+            "schemaVersion": clean_compiled["schemaVersion"],
+            "rawSha256": clean_compiled["rawSha256"],
+            "codeSha256": clean_compiled["codeSha256"],
+            "byteSize": clean_compiled["byteSize"],
+            "kind": clean_compiled["kind"],
+            "sourceSha256": clean_compiled["sourceSha256"],
+            "targetProfile": clean_compiled["targetProfile"],
+            "originBaselineAbiSha256": clean_compiled[
+                "originBaselineAbiSha256"
+            ],
+            "originCandidateAbiSha256": clean_compiled[
+                "originCandidateAbiSha256"
+            ],
+            "validationScope": clean_compiled["validationScope"],
+            "semanticEquivalenceVerified": clean_compiled[
+                "semanticEquivalenceVerified"
+            ],
+        }
+    return identity
 
 
 def _normal_path(value: str | Path) -> Path:
@@ -142,6 +799,484 @@ def _api_family(value: Any, allow_empty: bool = False) -> str:
     if not result or len(result) > 64:
         raise ReplayProjectError("api_family is invalid")
     return result
+
+
+def _reuse_api_family(value: Any) -> str:
+    """Canonical API spelling for derived reuse matching, not stored v1 heads.
+
+    Older capture catalogs stored RenderDoc enum names and their immutable head
+    keys include that spelling. Keep those historical hashes readable, and map
+    only known enum values when comparing/exporting current physical identities.
+    """
+    spelling = str(value or "").strip().lower()
+    return {
+        "graphicsapi.d3d11": "d3d11",
+        "graphicsapid3d11": "d3d11",
+        "graphicsapi.d3d12": "d3d12",
+        "graphicsapid3d12": "d3d12",
+        "graphicsapi.opengl": "opengl",
+        "graphicsapiopengl": "opengl",
+        "graphicsapi.vulkan": "vulkan",
+        "graphicsapivulkan": "vulkan",
+    }.get(spelling, _api_family(value))
+
+
+_SHADER_ENCODINGS_BY_API = {
+    "d3d11": frozenset(("dxbc",)),
+    "d3d12": frozenset(("dxbc", "dxil")),
+    "opengl": frozenset(("glsl", "spirv", "opengl-spirv")),
+    "vulkan": frozenset(("spirv",)),
+}
+
+
+def _shader_protocol_encoding(value: Any) -> str:
+    """Canonicalise Bridge enum/alias spellings to a stable protocol token."""
+
+    token = str(value or "").strip().lower().rsplit(".", 1)[-1]
+    token = re.sub(r"[^a-z0-9]+", "", token)
+    aliases = {
+        "dxbc": "dxbc",
+        "directxbytecode": "dxbc",
+        "dxil": "dxil",
+        "directxil": "dxil",
+        "dxilcontainer": "dxil",
+        "spirv": "spirv",
+        "spv": "spirv",
+        "spirvshader": "spirv",
+        "openglspirv": "opengl-spirv",
+        "glsl": "glsl",
+        "glslshader": "glsl",
+        "openglglsl": "glsl",
+        "metallib": "metallib",
+    }
+    result = aliases.get(token)
+    if result is None:
+        raise ReplayProjectError("shader encoding is unsupported or not canonicalizable")
+    return result
+
+
+def _shader_encoding(value: Any) -> str:
+    return {
+        "dxbc": "DXBC",
+        "dxil": "DXIL",
+        "spirv": "SPIR-V",
+        "opengl-spirv": "OpenGL-SPIR-V",
+        "glsl": "GLSL",
+        "metallib": "METALLIB",
+    }[_shader_protocol_encoding(value)]
+
+
+def _stable_shader_encoding(value: Any) -> str:
+    """Return the lowercase protocol token used inside the seven-field key.
+
+    Project manifests retain the established display spelling (for example
+    ``DXBC``), but Bridge/Host stable keys use lowercase protocol tokens.  A
+    display-only spelling difference must never produce a different physical
+    Shader identity.
+    """
+
+    return _shader_protocol_encoding(value)
+
+
+def _stable_shader_identity_sha256(identity: Mapping[str, Any]) -> str:
+    material = dict(identity)
+    material["encoding"] = _stable_shader_encoding(identity.get("encoding"))
+    return _canonical_sha256(material)
+
+
+def _normalised_stage(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+    aliases = {
+        "vs": "vertex",
+        "vertex": "vertex",
+        "hs": "hull",
+        "hull": "hull",
+        "tesscontrol": "hull",
+        "ds": "domain",
+        "domain": "domain",
+        "tesseval": "domain",
+        "gs": "geometry",
+        "geometry": "geometry",
+        "ps": "fragment",
+        "pixel": "fragment",
+        "fs": "fragment",
+        "fragment": "fragment",
+        "cs": "compute",
+        "compute": "compute",
+        "as": "task",
+        "amplification": "task",
+        "task": "task",
+        "ms": "mesh",
+        "mesh": "mesh",
+        "raygen": "raygen",
+        "raygeneration": "raygen",
+        "intersection": "intersection",
+        "anyhit": "anyhit",
+        "closesthit": "closesthit",
+        "miss": "miss",
+        "callable": "callable",
+    }
+    result = aliases.get(text)
+    if result is None:
+        raise ReplayProjectError("shader stage is unsupported or not canonicalizable")
+    return result
+
+
+def _normalise_shader_inventory(value: Any) -> dict[str, Any]:
+    """Validate the bridge-independent, content-bound live Shader inventory.
+
+    Aggregate digests are always recomputed here.  The inventory deliberately
+    contains no capture session, old replacement handle, or apply authority.
+    ``captureId`` identifies the set of stable Shader keys, while
+    ``inventorySha256``/``catalogSha256`` bind the current ResourceIds,
+    representative EIDs, and CBuffer attachments used by this restore.
+    """
+
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema",
+        "schemaVersion",
+        "capture",
+        "shaders",
+    }:
+        raise ReplayProjectError("shader inventory fields are invalid")
+    if (
+        value.get("schema") != SHADER_INVENTORY_SCHEMA
+        or value.get("schemaVersion") != SHADER_INVENTORY_VERSION
+    ):
+        raise ReplayProjectError("shader inventory schema/version is invalid")
+    raw_capture = value.get("capture")
+    if not isinstance(raw_capture, Mapping) or set(raw_capture) != {
+        "captureId",
+        "catalogSha256",
+        "inventorySha256",
+        "api",
+    }:
+        raise ReplayProjectError("shader inventory capture binding is invalid")
+    api = _api_family(raw_capture.get("api"))
+    raw_shaders = value.get("shaders")
+    if (
+        not isinstance(raw_shaders, list)
+        or not raw_shaders
+        or len(raw_shaders) > MAX_SHADER_COUNT
+    ):
+        raise ReplayProjectError("shader inventory shaders are invalid or oversized")
+
+    shaders: list[dict[str, Any]] = []
+    seen_targets: set[tuple[int, str]] = set()
+    resource_anchors: dict[int, int | None] = {}
+    for shader_index, raw_shader in enumerate(raw_shaders):
+        label = "shader inventory shaders[%d]" % shader_index
+        required_shader_fields = {
+            "resourceId",
+            "api",
+            "encoding",
+            "rawSha256",
+            "stage",
+            "entryPoint",
+            "abiHash",
+            "layoutHash",
+            "interfaceHash",
+            "interfaceComplete",
+            "stableKeySha256",
+            "anchorEventId",
+            "constantBlocks",
+        }
+        if not isinstance(raw_shader, Mapping) or set(raw_shader) != required_shader_fields:
+            raise ReplayProjectError("%s fields are invalid" % label)
+        resource_id = _positive(raw_shader.get("resourceId"), label + ".resourceId")
+        shader_api = _api_family(raw_shader.get("api"))
+        if shader_api != api:
+            raise ReplayProjectError("shader inventory Shader API differs from capture API")
+        encoding = _shader_encoding(raw_shader.get("encoding"))
+        protocol_encoding = _stable_shader_encoding(encoding)
+        if protocol_encoding not in _SHADER_ENCODINGS_BY_API.get(shader_api, ()):
+            raise ReplayProjectError(
+                "shader inventory API/encoding pair is unsupported"
+            )
+        raw_sha256 = _sha(raw_shader.get("rawSha256"), label + ".rawSha256")
+        stage = _normalised_stage(raw_shader.get("stage"))
+        entry_point = _text(
+            raw_shader.get("entryPoint"),
+            label + ".entryPoint",
+            512,
+            allow_empty=True,
+        )
+        abi_hash = _sha(
+            raw_shader.get("abiHash"), label + ".abiHash", allow_empty=True
+        )
+        layout_hash = _sha(
+            raw_shader.get("layoutHash"),
+            label + ".layoutHash",
+            allow_empty=True,
+        )
+        interface_hash = _sha(
+            raw_shader.get("interfaceHash"),
+            label + ".interfaceHash",
+            allow_empty=True,
+        )
+        if not isinstance(raw_shader.get("interfaceComplete"), bool):
+            raise ReplayProjectError("%s.interfaceComplete must be a boolean" % label)
+        interface_complete = raw_shader["interfaceComplete"]
+        if interface_complete and (not abi_hash or not interface_hash):
+            raise ReplayProjectError(
+                "%s complete interface lacks ABI/interface identity" % label
+            )
+        anchor_value = raw_shader.get("anchorEventId")
+        anchor_event_id = (
+            None
+            if anchor_value is None
+            else _positive(anchor_value, label + ".anchorEventId")
+        )
+        raw_blocks = raw_shader.get("constantBlocks")
+        if not isinstance(raw_blocks, list) or len(raw_blocks) > MAX_MATERIAL_PARAMETERS:
+            raise ReplayProjectError("%s.constantBlocks is invalid or oversized" % label)
+        blocks: list[dict[str, Any]] = []
+        block_keys: set[tuple[int, str, int, int]] = set()
+        for block_index, raw_block in enumerate(raw_blocks):
+            block_label = "%s.constantBlocks[%d]" % (label, block_index)
+            if not isinstance(raw_block, Mapping) or set(raw_block) != {
+                "index",
+                "path",
+                "name",
+                "space",
+                "bind",
+                "byteSize",
+                "layoutSha256",
+                "abiSha256",
+                "fields",
+            }:
+                raise ReplayProjectError("%s fields are invalid" % block_label)
+            raw_fields = raw_block.get("fields")
+            if not isinstance(raw_fields, list) or len(raw_fields) > MAX_ALIASES:
+                raise ReplayProjectError(
+                    "%s.fields is invalid or oversized" % block_label
+                )
+            fields: list[dict[str, Any]] = []
+            field_paths: set[str] = set()
+            for field_index, raw_field in enumerate(raw_fields):
+                field_label = "%s.fields[%d]" % (block_label, field_index)
+                if not isinstance(raw_field, Mapping) or set(raw_field) != {
+                    "canonicalPath",
+                    "name",
+                    "absoluteByteOffset",
+                    "byteSize",
+                    "baseType",
+                    "rows",
+                    "columns",
+                    "elements",
+                    "arrayByteStride",
+                    "matrixByteStride",
+                    "rowMajor",
+                    "flags",
+                    "pointerTypeID",
+                    "bitFieldOffset",
+                    "bitFieldSize",
+                }:
+                    raise ReplayProjectError("%s fields are invalid" % field_label)
+                if not isinstance(raw_field.get("rowMajor"), bool):
+                    raise ReplayProjectError("%s.rowMajor must be a boolean" % field_label)
+                field = {
+                    "canonicalPath": _text(
+                        raw_field.get("canonicalPath"),
+                        field_label + ".canonicalPath",
+                        2048,
+                    ),
+                    "name": _text(
+                        raw_field.get("name"), field_label + ".name", 1024
+                    ),
+                    "absoluteByteOffset": _nonnegative(
+                        raw_field.get("absoluteByteOffset"),
+                        field_label + ".absoluteByteOffset",
+                    ),
+                    "byteSize": _positive(
+                        raw_field.get("byteSize"), field_label + ".byteSize"
+                    ),
+                    "baseType": _text(
+                        raw_field.get("baseType"),
+                        field_label + ".baseType",
+                        64,
+                    ),
+                    "rows": _nonnegative(
+                        raw_field.get("rows"), field_label + ".rows"
+                    ),
+                    "columns": _nonnegative(
+                        raw_field.get("columns"), field_label + ".columns"
+                    ),
+                    "elements": _nonnegative(
+                        raw_field.get("elements"), field_label + ".elements"
+                    ),
+                    "arrayByteStride": _nonnegative(
+                        raw_field.get("arrayByteStride"),
+                        field_label + ".arrayByteStride",
+                    ),
+                    "matrixByteStride": _nonnegative(
+                        raw_field.get("matrixByteStride"),
+                        field_label + ".matrixByteStride",
+                    ),
+                    "rowMajor": raw_field["rowMajor"],
+                    "flags": _nonnegative(
+                        raw_field.get("flags"), field_label + ".flags"
+                    ),
+                    "pointerTypeID": _nonnegative(
+                        raw_field.get("pointerTypeID"),
+                        field_label + ".pointerTypeID",
+                    ),
+                    "bitFieldOffset": _nonnegative(
+                        raw_field.get("bitFieldOffset"),
+                        field_label + ".bitFieldOffset",
+                    ),
+                    "bitFieldSize": _nonnegative(
+                        raw_field.get("bitFieldSize"),
+                        field_label + ".bitFieldSize",
+                    ),
+                }
+                if field["canonicalPath"] in field_paths:
+                    raise ReplayProjectError(
+                        "shader inventory CBuffer canonicalPath is duplicated"
+                    )
+                field_paths.add(field["canonicalPath"])
+                fields.append(field)
+            fields.sort(
+                key=lambda item: (
+                    item["absoluteByteOffset"],
+                    item["canonicalPath"],
+                    item["name"],
+                    item["byteSize"],
+                    item["baseType"],
+                    item["rows"],
+                    item["columns"],
+                    item["elements"],
+                    item["arrayByteStride"],
+                    item["matrixByteStride"],
+                    item["rowMajor"],
+                    item["flags"],
+                    item["pointerTypeID"],
+                    item["bitFieldOffset"],
+                    item["bitFieldSize"],
+                )
+            )
+            block = {
+                "index": _nonnegative(raw_block.get("index"), block_label + ".index"),
+                "path": _text(raw_block.get("path"), block_label + ".path", 2048),
+                "name": _text(raw_block.get("name"), block_label + ".name", 1024),
+                "space": _nonnegative(raw_block.get("space"), block_label + ".space"),
+                "bind": _nonnegative(raw_block.get("bind"), block_label + ".bind"),
+                "byteSize": _positive(raw_block.get("byteSize"), block_label + ".byteSize"),
+                "layoutSha256": _sha(
+                    raw_block.get("layoutSha256"), block_label + ".layoutSha256"
+                ),
+                "abiSha256": _sha(
+                    raw_block.get("abiSha256"), block_label + ".abiSha256"
+                ),
+                "fields": fields,
+            }
+            if any(
+                field["absoluteByteOffset"] + field["byteSize"]
+                > block["byteSize"]
+                for field in fields
+            ):
+                raise ReplayProjectError(
+                    "shader inventory CBuffer field exceeds block byteSize"
+                )
+            block_key = (
+                block["index"],
+                block["path"],
+                block["space"],
+                block["bind"],
+            )
+            if block_key in block_keys:
+                raise ReplayProjectError("shader inventory constant block is duplicated")
+            block_keys.add(block_key)
+            blocks.append(block)
+        blocks.sort(
+            key=lambda item: (
+                item["index"], item["path"], item["space"], item["bind"]
+            )
+        )
+        stable_identity = {
+            "api": api,
+            "encoding": encoding,
+            "rawSha256": raw_sha256,
+            "stage": stage,
+            "entryPoint": entry_point,
+            "abiHash": abi_hash,
+            "layoutHash": layout_hash,
+        }
+        stable_key_sha256 = _stable_shader_identity_sha256(stable_identity)
+        if _sha(
+            raw_shader.get("stableKeySha256"), label + ".stableKeySha256"
+        ) != stable_key_sha256:
+            raise ReplayProjectError("shader inventory stableKeySha256 mismatch")
+        target_key = (resource_id, stable_key_sha256)
+        if target_key in seen_targets:
+            raise ReplayProjectError(
+                "shader inventory resource/entry identity is duplicated"
+            )
+        seen_targets.add(target_key)
+        if (
+            resource_id in resource_anchors
+            and resource_anchors[resource_id] != anchor_event_id
+        ):
+            raise ReplayProjectError(
+                "shader inventory resource has conflicting representative EIDs"
+            )
+        resource_anchors[resource_id] = anchor_event_id
+        shaders.append(
+            {
+                "resourceId": resource_id,
+                **stable_identity,
+                "interfaceHash": interface_hash,
+                "interfaceComplete": interface_complete,
+                "stableKeySha256": stable_key_sha256,
+                "anchorEventId": anchor_event_id,
+                "constantBlocks": blocks,
+            }
+        )
+
+    shaders.sort(
+        key=lambda item: (
+            item["resourceId"],
+            item["stage"],
+            item["entryPoint"],
+            item["rawSha256"],
+        )
+    )
+    stable_key_set = sorted({item["stableKeySha256"] for item in shaders})
+    capture_id = _canonical_sha256(stable_key_set)
+    inventory_material = {
+        "api": api,
+        "shaders": [
+            {
+                "resourceId": item["resourceId"],
+                "stableKeySha256": item["stableKeySha256"],
+                "anchorEventId": item["anchorEventId"],
+                "constantBlocks": item["constantBlocks"],
+            }
+            for item in shaders
+        ],
+    }
+    inventory_sha256 = _canonical_sha256(inventory_material)
+    if _sha(raw_capture.get("captureId"), "shader inventory captureId") != capture_id:
+        raise ReplayProjectError("shader inventory captureId mismatch")
+    declared_inventory = _sha(
+        raw_capture.get("inventorySha256"), "shader inventory inventorySha256"
+    )
+    declared_catalog = _sha(
+        raw_capture.get("catalogSha256"), "shader inventory catalogSha256"
+    )
+    if declared_inventory != inventory_sha256 or declared_catalog != inventory_sha256:
+        raise ReplayProjectError("shader inventory aggregate hash mismatch")
+    return {
+        "schema": SHADER_INVENTORY_SCHEMA,
+        "schemaVersion": SHADER_INVENTORY_VERSION,
+        "capture": {
+            "captureId": capture_id,
+            "catalogSha256": inventory_sha256,
+            "inventorySha256": inventory_sha256,
+            "api": api,
+        },
+        "shaders": shaders,
+    }
 
 
 def _thread_lock(root: Path) -> threading.RLock:
@@ -391,6 +1526,11 @@ class ReplayProjectService:
                 "workspaces": {},
                 "materials": {},
             },
+            "activeHeads": {
+                "workspaces": {},
+                "materials": {},
+                "aliases": {},
+            },
         }
         try:
             (staging / "captures" / "catalogs").mkdir(parents=True)
@@ -498,6 +1638,592 @@ class ReplayProjectService:
         return active
 
     @classmethod
+    def _head_shader_identity(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        baseline_abi: bool = False,
+        manifest: Mapping[str, Any] | None = None,
+        provenance: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return only physical Shader fields used to partition active heads."""
+
+        inventory_origin = value.get("inventoryOrigin")
+        if inventory_origin is not None:
+            origin = _inventory_origin_identity(inventory_origin)
+            api = origin["api"]
+            encoding = origin["encoding"]
+            abi_hash = origin["abiHash"]
+        else:
+            api_value = str(value.get("api", "") or "")
+            encoding_value = str(value.get("encoding", "") or "")
+            api = _api_family(api_value) if api_value else ""
+            encoding = _shader_encoding(encoding_value) if encoding_value else ""
+            abi_hash = ""
+            origin_record = provenance if provenance is not None else value
+            if (not api or not encoding) and manifest is not None:
+                capture_id = _sha(
+                    origin_record.get("captureId"), "head.captureId"
+                )
+                catalog_sha256 = _sha(
+                    origin_record.get("originCatalogSha256"),
+                    "head.originCatalogSha256",
+                )
+                captures = manifest.get("captures")
+                if not isinstance(captures, list):
+                    raise ReplayProjectError("project captures are invalid")
+                capture_matches = [
+                    capture
+                    for capture in captures
+                    if isinstance(capture, Mapping)
+                    and capture.get("captureId") == capture_id
+                ]
+                if len(capture_matches) != 1:
+                    raise ReplayProjectError(
+                        "active head origin capture is absent or ambiguous"
+                    )
+                capture = capture_matches[0]
+                revisions = capture.get("catalogRevisions")
+                if isinstance(revisions, list):
+                    revision_matches = [
+                        revision
+                        for revision in revisions
+                        if isinstance(revision, Mapping)
+                        and revision.get("catalogSha256") == catalog_sha256
+                    ]
+                    if len(revision_matches) != 1:
+                        raise ReplayProjectError(
+                            "active head origin catalog revision is absent"
+                        )
+                    shaders = revision_matches[0].get("shaders")
+                else:
+                    if capture.get("catalogSha256") != catalog_sha256:
+                        raise ReplayProjectError(
+                            "active head origin catalog revision is absent"
+                        )
+                    shaders = capture.get("shaders")
+                if not isinstance(shaders, list):
+                    raise ReplayProjectError(
+                        "active head origin Shader index is invalid"
+                    )
+                stage = _normalised_stage(value.get("stage"))
+                entry_point = _text(
+                    str(value.get("entryPoint", "") or ""),
+                    "head.entryPoint",
+                    512,
+                    allow_empty=True,
+                )
+                raw_sha256 = _sha(
+                    value.get("rawSha256"), "head.rawSha256"
+                )
+                resource_id = origin_record.get("originResourceId")
+                shader_matches = [
+                    shader
+                    for shader in shaders
+                    if isinstance(shader, Mapping)
+                    and _normalised_stage(shader.get("stage")) == stage
+                    and str(shader.get("entryPoint", "") or "") == entry_point
+                    and shader.get("rawSha256") == raw_sha256
+                    and (
+                        resource_id is None
+                        or shader.get("resourceId") == resource_id
+                    )
+                ]
+                encodings = {
+                    _shader_encoding(shader.get("encoding"))
+                    for shader in shader_matches
+                }
+                if not shader_matches or len(encodings) != 1:
+                    raise ReplayProjectError(
+                        "active head origin Shader encoding is absent or ambiguous"
+                    )
+                api = _api_family(capture.get("api"))
+                encoding = next(iter(encodings))
+                abi_values = {
+                    _sha(
+                        shader.get("abiHash"),
+                        "head.abiHash",
+                        allow_empty=True,
+                    )
+                    for shader in shader_matches
+                }
+                if len(abi_values) == 1:
+                    abi_hash = next(iter(abi_values))
+            if not api or not encoding:
+                raise ReplayProjectError(
+                    "active head physical API/encoding identity is unavailable"
+                )
+        identity = {
+            "api": api,
+            "encoding": encoding,
+            "stage": _normalised_stage(value.get("stage")),
+            "entryPoint": _text(
+                str(value.get("entryPoint", "") or ""),
+                "head.entryPoint",
+                512,
+                allow_empty=True,
+            ),
+            "rawSha256": _sha(value.get("rawSha256"), "head.rawSha256"),
+            "codeSha256": _sha(
+                value.get("codeSha256"), "head.codeSha256", allow_empty=True
+            ),
+            "layoutHash": _sha(
+                value.get("layoutHash"), "head.layoutHash", allow_empty=True
+            ),
+            "interfaceHash": _sha(
+                value.get("interfaceHash"),
+                "head.interfaceHash",
+                allow_empty=True,
+            ),
+            "interfaceComplete": value.get("interfaceComplete") is True,
+            "abiHash": (
+                _sha(
+                    value.get("baselineAbiSha256"),
+                    "head.baselineAbiSha256",
+                    allow_empty=True,
+                )
+                if baseline_abi
+                else abi_hash
+            ),
+        }
+        return identity
+
+    @classmethod
+    def _workspace_head_key(
+        cls,
+        record: Mapping[str, Any],
+        manifest: Mapping[str, Any] | None = None,
+    ) -> str:
+        profile = record.get("targetProfile")
+        if not isinstance(profile, Mapping):
+            raise ReplayProjectError("workspace head targetProfile is invalid")
+        physical_identity = cls._head_shader_identity(
+            record, baseline_abi=True, manifest=manifest
+        )
+        return _canonical_sha256(
+            {
+                "schema": "renderdoc-ultra-project-workspace-head-key/v1",
+                "physicalIdentity": physical_identity,
+                "physicalIdentitySha256": _canonical_sha256(
+                    physical_identity
+                ),
+                "stableKeySha256": _stable_shader_identity_sha256(
+                    {
+                        key: physical_identity[key]
+                        for key in (
+                            "api",
+                            "encoding",
+                            "rawSha256",
+                            "stage",
+                            "entryPoint",
+                            "abiHash",
+                            "layoutHash",
+                        )
+                    }
+                ),
+                "targetProfile": copy.deepcopy(dict(profile)),
+                "sourceLane": "hlsl",
+            }
+        )
+
+    @classmethod
+    def _material_head_key(
+        cls,
+        record: Mapping[str, Any],
+        manifest: Mapping[str, Any] | None = None,
+    ) -> str:
+        physical_identity = cls._head_shader_identity(
+            record, manifest=manifest
+        )
+        return _canonical_sha256(
+            {
+                "schema": "renderdoc-ultra-project-material-head-key/v1",
+                "physicalIdentity": physical_identity,
+                "stableKeySha256": _stable_shader_identity_sha256(
+                    {
+                        key: physical_identity[key]
+                        for key in (
+                            "api",
+                            "encoding",
+                            "rawSha256",
+                            "stage",
+                            "entryPoint",
+                            "abiHash",
+                            "layoutHash",
+                        )
+                    }
+                ),
+                "constantBlockPath": _text(
+                    str(record.get("constantBlockPath", "")),
+                    "material head constantBlockPath",
+                    2048,
+                ),
+                "constantBlockLayoutSha256": _sha(
+                    record.get("constantBlockLayoutSha256"),
+                    "material head constantBlockLayoutSha256",
+                ),
+                "layer": "values",
+            }
+        )
+
+    @classmethod
+    def _alias_head_key(
+        cls,
+        group: Mapping[str, Any],
+        manifest: Mapping[str, Any] | None = None,
+        provenance: Mapping[str, Any] | None = None,
+    ) -> str:
+        # Alias names are deliberately absent. One verified alias publication
+        # supersedes another for the same physical Shader/group layout without
+        # conflating it with material values or HLSL source authority.
+        physical_identity = cls._head_shader_identity(
+            group, manifest=manifest, provenance=provenance
+        )
+        return _canonical_sha256(
+            {
+                "schema": "renderdoc-ultra-project-alias-head-key/v1",
+                "physicalIdentity": physical_identity,
+                "stableKeySha256": _stable_shader_identity_sha256(
+                    {
+                        key: physical_identity[key]
+                        for key in (
+                            "api",
+                            "encoding",
+                            "rawSha256",
+                            "stage",
+                            "entryPoint",
+                            "abiHash",
+                            "layoutHash",
+                        )
+                    }
+                ),
+                "groupLayout": {
+                    "layoutHash": _sha(
+                        group.get("layoutHash"),
+                        "alias head layoutHash",
+                        allow_empty=True,
+                    ),
+                    "interfaceHash": _sha(
+                        group.get("interfaceHash"),
+                        "alias head interfaceHash",
+                        allow_empty=True,
+                    ),
+                    "interfaceComplete": group.get("interfaceComplete") is True,
+                },
+                "layer": "display-aliases",
+            }
+        )
+
+    @classmethod
+    def _knowledge_head_members(
+        cls, manifest: Mapping[str, Any]
+    ) -> dict[str, dict[str, list[dict[str, Any]]]]:
+        knowledge = manifest.get("knowledge")
+        if not isinstance(knowledge, Mapping):
+            raise ReplayProjectError("project knowledge index is invalid")
+        result: dict[str, dict[str, list[dict[str, Any]]]] = {
+            "workspaces": {},
+            "materials": {},
+            "aliases": {},
+        }
+        for kind, key_builder in (
+            ("workspaces", cls._workspace_head_key),
+            ("materials", cls._material_head_key),
+        ):
+            records = knowledge.get(kind)
+            if not isinstance(records, list):
+                raise ReplayProjectError("project %s knowledge is invalid" % kind)
+            for ordinal, record in enumerate(records):
+                if not isinstance(record, Mapping):
+                    raise ReplayProjectError(
+                        "project %s knowledge record is invalid" % kind
+                    )
+                knowledge_id = str(record.get("knowledgeId", "") or "")
+                if not HEX32_RE.fullmatch(knowledge_id):
+                    raise ReplayProjectError("project knowledgeId is invalid")
+                head_key = key_builder(record, manifest)
+                result[kind].setdefault(head_key, []).append(
+                    {
+                        "knowledgeId": knowledge_id,
+                        "ordinal": (ordinal, 0),
+                        "publishedAt": str(
+                            record.get("registeredAt")
+                            or manifest.get("updatedAt")
+                            or manifest.get("createdAt")
+                            or "1970-01-01T00:00:00Z"
+                        ),
+                    }
+                )
+
+        aliases = knowledge.get("aliases")
+        if not isinstance(aliases, list):
+            raise ReplayProjectError("project aliases knowledge is invalid")
+        for record_ordinal, record in enumerate(aliases):
+            if not isinstance(record, Mapping):
+                raise ReplayProjectError("project alias knowledge record is invalid")
+            knowledge_id = str(record.get("knowledgeId", "") or "")
+            if not HEX32_RE.fullmatch(knowledge_id):
+                raise ReplayProjectError("project alias knowledgeId is invalid")
+            groups = record.get("groups")
+            if not isinstance(groups, list):
+                raise ReplayProjectError("project alias knowledge groups are invalid")
+            seen_record_heads: set[str] = set()
+            for group_ordinal, group in enumerate(groups):
+                if not isinstance(group, Mapping):
+                    raise ReplayProjectError("project alias knowledge group is invalid")
+                head_key = cls._alias_head_key(
+                    group, manifest=manifest, provenance=record
+                )
+                if head_key in seen_record_heads:
+                    raise ReplayProjectError(
+                        "alias knowledge contains duplicate physical head groups"
+                    )
+                seen_record_heads.add(head_key)
+                result["aliases"].setdefault(head_key, []).append(
+                    {
+                        "knowledgeId": knowledge_id,
+                        "ordinal": (record_ordinal, group_ordinal),
+                        "groupIndex": group_ordinal,
+                        "publishedAt": str(
+                            record.get("registeredAt")
+                            or manifest.get("updatedAt")
+                            or manifest.get("createdAt")
+                            or "1970-01-01T00:00:00Z"
+                        ),
+                    }
+                )
+        return result
+
+    @classmethod
+    def _active_heads_state(cls, manifest: dict[str, Any]) -> dict[str, Any]:
+        """Validate or migrate the per-identity authoritative head index."""
+
+        members = cls._knowledge_head_members(manifest)
+        if "activeHeads" not in manifest:
+            legacy = cls._active_knowledge_state(manifest)
+            derived: dict[str, dict[str, dict[str, Any]]] = {
+                "workspaces": {},
+                "materials": {},
+                "aliases": {},
+            }
+            for kind in ("workspaces", "materials", "aliases"):
+                for head_key, candidates in members[kind].items():
+                    if kind == "aliases":
+                        selected = max(candidates, key=lambda item: item["ordinal"])
+                    else:
+                        selected = max(
+                            candidates,
+                            key=lambda item: (
+                                legacy[kind][item["knowledgeId"]],
+                                item["ordinal"],
+                            ),
+                        )
+                    derived[kind][head_key] = {
+                        "generation": max(
+                            1,
+                            len(
+                                {
+                                    item["knowledgeId"]
+                                    for item in candidates
+                                }
+                            ),
+                        ),
+                        "knowledgeId": selected["knowledgeId"],
+                        "publishedAt": _text(
+                            selected["publishedAt"],
+                            "active head publishedAt",
+                            128,
+                        ),
+                    }
+            manifest["activeHeads"] = derived
+            return derived
+
+        active_heads = manifest.get("activeHeads")
+        if not isinstance(active_heads, dict) or set(active_heads) != {
+            "workspaces",
+            "materials",
+            "aliases",
+        }:
+            raise ReplayProjectError("project activeHeads index is invalid")
+        for kind in ("workspaces", "materials", "aliases"):
+            heads = active_heads.get(kind)
+            if not isinstance(heads, dict) or set(heads) != set(members[kind]):
+                raise ReplayProjectError(
+                    "project activeHeads %s index is incomplete" % kind
+                )
+            for head_key, head in heads.items():
+                if not SHA256_RE.fullmatch(str(head_key)):
+                    raise ReplayProjectError("project active head key is invalid")
+                if not isinstance(head, dict) or set(head) != {
+                    "generation",
+                    "knowledgeId",
+                    "publishedAt",
+                }:
+                    raise ReplayProjectError("project active head record is invalid")
+                generation = head.get("generation")
+                knowledge_id = str(head.get("knowledgeId", "") or "")
+                if (
+                    isinstance(generation, bool)
+                    or not isinstance(generation, int)
+                    or generation <= 0
+                    or generation > MAX_ACTIVE_KNOWLEDGE_REVISION
+                    or not HEX32_RE.fullmatch(knowledge_id)
+                    or knowledge_id
+                    not in {
+                        item["knowledgeId"] for item in members[kind][head_key]
+                    }
+                ):
+                    raise ReplayProjectError("project active head binding is invalid")
+                _text(head.get("publishedAt"), "active head publishedAt", 128)
+        return active_heads
+
+    @staticmethod
+    def _expected_head_token(
+        expected: Mapping[str, Any] | None, head_key: str
+    ) -> dict[str, Any] | None:
+        if expected is None:
+            return None
+        if not isinstance(expected, Mapping):
+            raise ReplayProjectError("expected_head must be a head receipt")
+        expected_key = str(expected.get("headKey", "") or "")
+        generation = expected.get("generation")
+        knowledge_id = str(expected.get("knowledgeId", "") or "")
+        if (
+            expected_key != head_key
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation <= 0
+            or generation > MAX_ACTIVE_KNOWLEDGE_REVISION
+            or not HEX32_RE.fullmatch(knowledge_id)
+        ):
+            raise ReplayProjectError("expected_head receipt is invalid")
+        return {
+            "headKey": head_key,
+            "generation": generation,
+            "knowledgeId": knowledge_id,
+        }
+
+    @classmethod
+    def _expected_heads_for_keys(
+        cls,
+        expected: Mapping[str, Any] | None,
+        head_keys: Sequence[str],
+    ) -> dict[str, Mapping[str, Any] | None]:
+        ordered_keys = tuple(sorted(set(head_keys)))
+        if len(ordered_keys) != len(head_keys):
+            raise ReplayProjectError("publication contains duplicate head keys")
+        if expected is None:
+            return {head_key: None for head_key in ordered_keys}
+        if not isinstance(expected, Mapping):
+            raise ReplayProjectError("expected_head must be a head receipt")
+        if "headKey" in expected:
+            if len(ordered_keys) != 1:
+                raise ReplayProjectError(
+                    "multi-head publication requires expected_head.heads"
+                )
+            head_key = ordered_keys[0]
+            return {head_key: cls._expected_head_token(expected, head_key)}
+        raw_heads = expected.get("heads")
+        if not isinstance(raw_heads, list) or len(raw_heads) != len(ordered_keys):
+            raise ReplayProjectError("expected_head.heads is invalid")
+        result: dict[str, Mapping[str, Any] | None] = {}
+        for item in raw_heads:
+            if not isinstance(item, Mapping):
+                raise ReplayProjectError("expected_head.heads is invalid")
+            head_key = str(item.get("headKey", "") or "")
+            if head_key in result or head_key not in ordered_keys:
+                raise ReplayProjectError("expected_head.heads is invalid")
+            result[head_key] = cls._expected_head_token(item, head_key)
+        if set(result) != set(ordered_keys):
+            raise ReplayProjectError("expected_head.heads is incomplete")
+        return result
+
+    @classmethod
+    def _plan_head_publication(
+        cls,
+        manifest: dict[str, Any],
+        kind: str,
+        head_key: str,
+        knowledge_id: str,
+        *,
+        record_preexisting: bool,
+        expected_head: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if kind not in {"workspaces", "materials", "aliases"}:
+            raise ReplayProjectError("active head kind is invalid")
+        if not SHA256_RE.fullmatch(str(head_key)) or not HEX32_RE.fullmatch(
+            str(knowledge_id)
+        ):
+            raise ReplayProjectError("active head publication identity is invalid")
+        heads = cls._active_heads_state(manifest)[kind]
+        current = heads.get(head_key)
+        expected = cls._expected_head_token(expected_head, head_key)
+        if expected is not None:
+            current_token = (
+                {
+                    "headKey": head_key,
+                    "generation": current["generation"],
+                    "knowledgeId": current["knowledgeId"],
+                }
+                if current is not None
+                else None
+            )
+            if current_token != expected:
+                raise ReplayProjectError(
+                    "active head compare-and-swap conflict"
+                )
+        if current is not None and current["knowledgeId"] == knowledge_id:
+            return {
+                "headKey": head_key,
+                **copy.deepcopy(dict(current)),
+                "changed": False,
+            }
+        if record_preexisting and expected is None:
+            raise ReplayProjectError(
+                "historical knowledge cannot replace the active head without expected_head"
+            )
+        generation = 1 if current is None else current["generation"] + 1
+        if generation > MAX_ACTIVE_KNOWLEDGE_REVISION:
+            raise ReplayProjectError("active head generation is exhausted")
+        return {
+            "headKey": head_key,
+            "generation": generation,
+            "knowledgeId": knowledge_id,
+            "publishedAt": _utc_now(),
+            "changed": True,
+        }
+
+    @classmethod
+    def _apply_head_publication(
+        cls, manifest: dict[str, Any], kind: str, receipt: Mapping[str, Any]
+    ) -> None:
+        if receipt.get("changed") is not True:
+            return
+        active_heads = manifest.get("activeHeads")
+        if not isinstance(active_heads, dict) or not isinstance(
+            active_heads.get(kind), dict
+        ):
+            raise ReplayProjectError("project activeHeads index is invalid")
+        active_heads[kind][receipt["headKey"]] = {
+            "generation": receipt["generation"],
+            "knowledgeId": receipt["knowledgeId"],
+            "publishedAt": receipt["publishedAt"],
+        }
+
+    @staticmethod
+    def _head_receipt(kind: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "schema": ACTIVE_HEAD_RECEIPT_SCHEMA,
+            "schemaVersion": ACTIVE_HEAD_RECEIPT_VERSION,
+            "kind": kind,
+            "headKey": receipt["headKey"],
+            "generation": receipt["generation"],
+            "knowledgeId": receipt["knowledgeId"],
+            "publishedAt": receipt["publishedAt"],
+            "changed": receipt.get("changed") is True,
+        }
+
+    @classmethod
     def _activate_knowledge(
         cls, manifest: dict[str, Any], kind: str, knowledge_id: str
     ) -> int:
@@ -532,13 +2258,50 @@ class ReplayProjectService:
         cls._active_knowledge_state(manifest)
         return revision
 
-    def _load(self) -> dict[str, Any]:
+    def _load(
+        self,
+        *,
+        alias_artifact_cache: dict[str, bytes] | None = None,
+        alias_artifact_knowledge_ids: set[str] | None = None,
+        alias_artifact_cache_max_bytes: int = MAX_ALIAS_BYTES,
+        persist_migrations: bool = False,
+    ) -> dict[str, Any]:
+        """Load and validate one project manifest snapshot.
+
+        Alias materialization may request the already-validated bytes for a
+        bounded set of alias knowledge records.  This avoids reading the same
+        immutable artifact again while constructing a cross-RDC restore
+        batch.  Ordinary callers use the historical no-argument path.
+        """
+
+        requested_alias_artifacts = set(alias_artifact_knowledge_ids or ())
+        if alias_artifact_cache is not None:
+            if not isinstance(alias_artifact_cache, dict):
+                raise ReplayProjectError("alias artifact cache must be a dictionary")
+            if alias_artifact_cache:
+                raise ReplayProjectError("alias artifact cache must start empty")
+            if len(requested_alias_artifacts) > MAX_KNOWLEDGE_COUNT:
+                raise ReplayProjectError(
+                    "alias artifact cache request exceeds the knowledge limit"
+                )
+            if (
+                isinstance(alias_artifact_cache_max_bytes, bool)
+                or not isinstance(alias_artifact_cache_max_bytes, int)
+                or alias_artifact_cache_max_bytes <= 0
+                or alias_artifact_cache_max_bytes > MAX_ALIAS_BYTES
+            ):
+                raise ReplayProjectError("alias artifact cache byte limit is invalid")
+        cached_alias_artifacts: dict[tuple[str, str], bytes] = {}
+        cached_alias_artifact_bytes = 0
         if self.root.is_symlink() or not self.root.is_dir():
             raise ReplayProjectError("project path must be a regular directory")
         try:
             manifest = read_json_object(self.manifest_path, MAX_PROJECT_BYTES, "project manifest")
         except ValueError as exc:
             raise ReplayProjectError(str(exc)) from exc
+        migration_required = (
+            "activeKnowledge" not in manifest or "activeHeads" not in manifest
+        )
         if manifest.get("schema") != PROJECT_SCHEMA or manifest.get("schemaVersion") != PROJECT_VERSION:
             raise ReplayProjectError("unsupported project manifest schema/version")
         if not HEX32_RE.fullmatch(str(manifest.get("projectId", ""))):
@@ -708,10 +2471,105 @@ class ReplayProjectService:
         # Missing state is the sole legacy-v1 migration path. It is derived in
         # memory here and atomically persisted by the next locked mutation.
         self._active_knowledge_state(manifest)
+        self._active_heads_state(manifest)
         for record in knowledge["workspaces"]:
             artifact = self._artifact(record.get("sourcePath"), "workspace source")
             if _sha256_bytes(_file_bytes(artifact, MAX_SOURCE_BYTES, "workspace source")) != _sha(record.get("sourceSha256"), "sourceSha256"):
                 raise ReplayProjectError("project workspace source hash mismatch")
+            compiler_binding = record.get("compilerBinding")
+            if compiler_binding is not None:
+                clean_compiler_binding = _compiler_binding_identity(
+                    compiler_binding
+                )
+                if clean_compiler_binding["targetProfile"] != record.get(
+                    "targetProfile"
+                ):
+                    raise ReplayProjectError(
+                        "project compiler binding target profile differs"
+                    )
+            compiled_candidate = record.get("compiledCandidate")
+            if compiled_candidate is not None:
+                identity = _compiled_candidate_identity(compiled_candidate)
+                if (
+                    identity["sourceSha256"] != record.get("sourceSha256")
+                    or identity["targetProfile"] != record.get("targetProfile")
+                    or identity["originBaselineAbiSha256"]
+                    != record.get("baselineAbiSha256")
+                ):
+                    raise ReplayProjectError(
+                        "project compiled candidate knowledge binding mismatch"
+                    )
+                expected_relative = (
+                    "knowledge/workspaces/binaries/%s.bin"
+                    % identity["rawSha256"]
+                )
+                if compiled_candidate.get("artifactPath") != expected_relative:
+                    raise ReplayProjectError(
+                        "project compiled candidate is not content-addressed"
+                    )
+                compiled_artifact = self._artifact(
+                    expected_relative, "workspace compiled candidate"
+                )
+                compiled_bytes = _file_bytes(
+                    compiled_artifact,
+                    MAX_COMPILED_CANDIDATE_BYTES,
+                    "workspace compiled candidate",
+                )
+                if (
+                    len(compiled_bytes) != identity["byteSize"]
+                    or _sha256_bytes(compiled_bytes) != identity["rawSha256"]
+                ):
+                    raise ReplayProjectError(
+                        "project compiled candidate content/hash mismatch"
+                    )
+            disassembly_artifacts = record.get(
+                "assemblyDisassemblyArtifacts", []
+            )
+            if (
+                not isinstance(disassembly_artifacts, list)
+                or len(disassembly_artifacts) > 2
+            ):
+                raise ReplayProjectError(
+                    "project assembly/disassembly artifacts are invalid"
+                )
+            seen_disassembly_roles: set[str] = set()
+            for disassembly in disassembly_artifacts:
+                identity = _assembly_disassembly_identity(disassembly)
+                if identity["role"] in seen_disassembly_roles:
+                    raise ReplayProjectError(
+                        "project disassembly role is duplicated"
+                    )
+                if (
+                    identity["kind"] == "native-disassembly"
+                    and (
+                        identity["role"] != "baseline"
+                        or identity["inputRawSha256"]
+                        != _sha(record.get("rawSha256"), "workspace.rawSha256")
+                    )
+                ):
+                    raise ReplayProjectError(
+                        "project native disassembly physical binding mismatch"
+                    )
+                expected_relative = _assembly_disassembly_relative(identity)
+                if disassembly.get("artifactPath") != expected_relative:
+                    raise ReplayProjectError(
+                        "project disassembly artifact is not content-addressed"
+                    )
+                disassembly_bytes = _file_bytes(
+                    self._artifact(
+                        expected_relative, "workspace disassembly artifact"
+                    ),
+                    MAX_SOURCE_BYTES,
+                    "workspace disassembly artifact",
+                )
+                if (
+                    len(disassembly_bytes) != identity["byteSize"]
+                    or _sha256_bytes(disassembly_bytes) != identity["sha256"]
+                ):
+                    raise ReplayProjectError(
+                        "project disassembly artifact content/hash mismatch"
+                    )
+                seen_disassembly_roles.add(identity["role"])
             analysis_path = record.get("analysisPath")
             if analysis_path is not None:
                 analysis = self._artifact(analysis_path, "workspace analysis")
@@ -719,10 +2577,56 @@ class ReplayProjectService:
                     _file_bytes(analysis, MAX_ANALYSIS_BYTES, "workspace analysis")
                 ) != _sha(record.get("analysisSha256"), "analysisSha256"):
                     raise ReplayProjectError("project workspace analysis hash mismatch")
+            # The knowledgeId is the immutable metadata/content binding. This
+            # also preserves the historical v1 identity when compiledCandidate
+            # is absent and extends it only for newly published binary records.
+            self._workspace_knowledge_from_manifest(
+                manifest,
+                str(record.get("knowledgeId", "")),
+                record=record,
+                source_artifact_verified=True,
+            )
         for record in knowledge["aliases"]:
             artifact = self._artifact(record.get("artifactPath"), "alias artifact")
-            if _sha256_bytes(_file_bytes(artifact, MAX_ALIAS_BYTES, "alias artifact")) != _sha(record.get("artifactSha256"), "artifactSha256"):
+            artifact_sha256 = _sha(
+                record.get("artifactSha256"), "artifactSha256"
+            )
+            knowledge_id = str(record.get("knowledgeId", "") or "")
+            should_cache = (
+                alias_artifact_cache is not None
+                and knowledge_id in requested_alias_artifacts
+            )
+            cache_key = (str(artifact), artifact_sha256)
+            raw = cached_alias_artifacts.get(cache_key) if should_cache else None
+            if raw is None:
+                raw = _file_bytes(artifact, MAX_ALIAS_BYTES, "alias artifact")
+                if should_cache:
+                    if (
+                        cached_alias_artifact_bytes + len(raw)
+                        > alias_artifact_cache_max_bytes
+                    ):
+                        raise ReplayProjectError(
+                            "alias materialization artifact snapshot exceeds the byte limit"
+                        )
+                    cached_alias_artifact_bytes += len(raw)
+                    cached_alias_artifacts[cache_key] = raw
+            if _sha256_bytes(raw) != artifact_sha256:
                 raise ReplayProjectError("project alias artifact hash mismatch")
+            if should_cache:
+                existing = alias_artifact_cache.get(knowledge_id)
+                if existing is not None and existing != raw:
+                    raise ReplayProjectError(
+                        "alias knowledgeId resolves to conflicting artifact bytes"
+                    )
+                alias_artifact_cache[knowledge_id] = raw
+        for record in knowledge["materials"]:
+            self._material_knowledge_from_manifest(
+                manifest,
+                str(record.get("knowledgeId", "")),
+                record=record,
+            )
+        if persist_migrations and migration_required:
+            self._write(manifest)
         return manifest
 
     def _artifact(self, relative: Any, label: str) -> Path:
@@ -799,11 +2703,13 @@ class ReplayProjectService:
 
     def _write(self, manifest: dict[str, Any]) -> None:
         self._active_knowledge_state(manifest)
+        self._active_heads_state(manifest)
         manifest["updatedAt"] = _utc_now()
         atomic_write_json(self.manifest_path, manifest)
 
     def status(self) -> dict[str, Any]:
-        manifest = self._load()
+        with _thread_lock(self.root), _project_lock(self.root):
+            manifest = self._load(persist_migrations=True)
         knowledge = manifest["knowledge"]
         return {
             "schema": PROJECT_SCHEMA,
@@ -859,7 +2765,8 @@ class ReplayProjectService:
             if not scope["platform"] and catalog_platform:
                 scope["platform"] = _text(catalog_platform, "catalog.platform", 128)
             capture_api = _api_family(catalog.get("api"))
-            if scope["apiFamily"] and capture_api != scope["apiFamily"]:
+            if (scope["apiFamily"] and
+                    _reuse_api_family(capture_api) != _reuse_api_family(scope["apiFamily"])):
                 raise ReplayProjectError("capture API conflicts with project scope")
             if not scope["apiFamily"]:
                 scope["apiFamily"] = capture_api
@@ -1187,7 +3094,241 @@ class ReplayProjectService:
             raise ReplayProjectError("knowledge does not select one imported capture shader")
         return matches[0]
 
-    def register_workspace(self, status: Mapping[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _validated_compiled_candidate(
+        status: Mapping[str, Any],
+        *,
+        source_bytes: bytes,
+        workspace_root: Path,
+        manifest_bytes: bytes,
+        baseline: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], bytes] | None:
+        """Extract only a fully ABI-validated, current-source binary.
+
+        Pending/container-only candidates remain valid workspace state but are
+        intentionally not published to the project.  A fully validated binary
+        compiled from an older editable-source snapshot is likewise omitted so
+        the current HLSL can still be registered.  Any status which claims
+        completed validation is checked against its on-disk manifest, compiled
+        source revision, candidate bytes, and immutable ABI receipt before that
+        stale/current decision is made.
+        """
+
+        latest = status.get("latestCompiled")
+        if latest is None:
+            if (
+                status.get("replayAbiValidated") is True
+                or status.get("abiCompatible") is True
+            ):
+                raise ReplayProjectError(
+                    "workspace claims ABI validation without a compiled candidate"
+                )
+            return None
+        if not isinstance(latest, Mapping):
+            raise ReplayProjectError("workspace latestCompiled is invalid")
+        if latest.get("replayAbiValidated") is not True:
+            if any(
+                (
+                    status.get("replayAbiValidated") is True,
+                    status.get("abiCompatible") is True,
+                    latest.get("abiCompatible") is True,
+                    latest.get("validationScope")
+                    == "replay-reflection-abi-compatible",
+                )
+            ):
+                raise ReplayProjectError(
+                    "workspace compiled candidate ABI validation state is inconsistent"
+                )
+            return None
+        if any(
+            (
+                status.get("replayAbiValidated") is not True,
+                status.get("abiCompatible") is not True,
+                latest.get("abiCompatible") is not True,
+                latest.get("requiresReplayAbiValidation") is not False,
+                latest.get("validationScope")
+                != "replay-reflection-abi-compatible",
+                latest.get("semanticEquivalenceVerified") is not False,
+            )
+        ):
+            raise ReplayProjectError(
+                "workspace compiled candidate lacks complete ABI validation"
+            )
+
+        revision = _positive(status.get("revision"), "workspace.revision")
+        if latest.get("revision") != revision:
+            raise ReplayProjectError(
+                "workspace compiled candidate revision is not current"
+            )
+        source_sha256 = _sha256_bytes(source_bytes)
+        candidate_source_sha256 = _sha(
+            latest.get("sourceSha256"),
+            "workspace.latestCompiled.sourceSha256",
+        )
+
+        try:
+            workspace_manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReplayProjectError("workspace manifest is not valid UTF-8 JSON") from exc
+        if not isinstance(workspace_manifest, Mapping):
+            raise ReplayProjectError("workspace manifest must be a JSON object")
+        persisted_latest = workspace_manifest.get("latestCompiled")
+        projected_latest = dict(latest)
+        projected_latest.pop("candidateBlobPath", None)
+        projected_latest.pop("applied", None)
+        if (
+            workspace_manifest.get("revision") != revision
+            or persisted_latest != projected_latest
+        ):
+            raise ReplayProjectError(
+                "workspace compiled candidate differs from its validated manifest"
+            )
+
+        relative_blob = _text(
+            str(latest.get("blobPath", "")),
+            "workspace.latestCompiled.blobPath",
+            4096,
+        )
+        declared_blob_path = _normal_path(
+            str(latest.get("candidateBlobPath", ""))
+        )
+        expected_blob_path = (workspace_root / relative_blob).resolve()
+        if (
+            declared_blob_path != expected_blob_path
+            or not is_within(workspace_root, expected_blob_path)
+        ):
+            raise ReplayProjectError(
+                "workspace compiled candidate path escapes its workspace"
+            )
+        compiled = _file_bytes(
+            expected_blob_path,
+            MAX_COMPILED_CANDIDATE_BYTES,
+            "workspace compiled candidate",
+        )
+        compiled_sha256 = _sha256_bytes(compiled)
+        if (
+            _sha(
+                latest.get("rawSha256"),
+                "workspace.latestCompiled.rawSha256",
+            )
+            != compiled_sha256
+            or _positive(
+                latest.get("byteSize"), "workspace.latestCompiled.byteSize"
+            )
+            != len(compiled)
+        ):
+            raise ReplayProjectError(
+                "workspace compiled candidate content/hash binding is invalid"
+            )
+
+        relative_revision_source = _text(
+            str(latest.get("sourcePath", "")),
+            "workspace.latestCompiled.sourcePath",
+            4096,
+        )
+        revision_source = (workspace_root / relative_revision_source).resolve()
+        if not is_within(workspace_root, revision_source):
+            raise ReplayProjectError(
+                "workspace compiled candidate source revision escapes its workspace"
+            )
+        revision_source_bytes = _file_bytes(
+            revision_source,
+            MAX_SOURCE_BYTES,
+            "workspace compiled candidate source revision",
+        )
+        if _sha256_bytes(revision_source_bytes) != candidate_source_sha256:
+            raise ReplayProjectError(
+                "workspace compiled candidate source revision changed"
+            )
+
+        abi_gate = latest.get("abiGate")
+        if not isinstance(abi_gate, Mapping) or abi_gate.get("status") != "compatible":
+            raise ReplayProjectError(
+                "workspace compiled candidate ABI gate is not compatible"
+            )
+        baseline_abi_sha256 = _sha(
+            abi_gate.get("baselineAbiSha256"),
+            "workspace.latestCompiled.abiGate.baselineAbiSha256",
+        )
+        if baseline_abi_sha256 != _sha(
+            baseline.get("abiSha256"), "workspace.baseline.abiSha256"
+        ):
+            raise ReplayProjectError(
+                "workspace compiled candidate baseline ABI binding differs"
+            )
+        candidate_abi_sha256 = _sha(
+            abi_gate.get("candidateAbiSha256"),
+            "workspace.latestCompiled.abiGate.candidateAbiSha256",
+        )
+        report_sha256 = _sha(
+            abi_gate.get("reportSha256"),
+            "workspace.latestCompiled.abiGate.reportSha256",
+        )
+        request_id = _text(
+            str(abi_gate.get("requestId", "")),
+            "workspace.latestCompiled.abiGate.requestId",
+            256,
+        )
+        relative_report = _text(
+            str(abi_gate.get("reportPath", "")),
+            "workspace.latestCompiled.abiGate.reportPath",
+            4096,
+        )
+        report_path = (workspace_root / relative_report).resolve()
+        if not is_within(workspace_root, report_path):
+            raise ReplayProjectError("workspace ABI report escapes its workspace")
+        if _sha256_bytes(
+            _file_bytes(report_path, MAX_ABI_REPORT_BYTES, "workspace ABI report")
+        ) != report_sha256:
+            raise ReplayProjectError("workspace ABI report hash mismatch")
+
+        profile = status.get("targetProfile")
+        if not isinstance(profile, Mapping):
+            raise ReplayProjectError(
+                "workspace compiled candidate targetProfile is invalid"
+            )
+        # Editing HLSL does not rewrite or invalidate the immutable compiled
+        # revision.  Preserve that audit history in the workspace, but do not
+        # let an older binary block publication of the newer project source or
+        # masquerade as a current-source reuse candidate.
+        if candidate_source_sha256 != source_sha256:
+            return None
+        identity = _compiled_candidate_identity(
+            {
+                "schema": COMPILED_CANDIDATE_SCHEMA,
+                "schemaVersion": COMPILED_CANDIDATE_VERSION,
+                "rawSha256": compiled_sha256,
+                "codeSha256": _sha(
+                    latest.get("codeSha256"),
+                    "workspace.latestCompiled.codeSha256",
+                ),
+                "byteSize": len(compiled),
+                "kind": _text(
+                    str(latest.get("kind", "")),
+                    "workspace.latestCompiled.kind",
+                    64,
+                ),
+                "sourceSha256": source_sha256,
+                "sourceRevision": revision,
+                "targetProfile": copy.deepcopy(dict(profile)),
+                "originBaselineAbiSha256": baseline_abi_sha256,
+                "originCandidateAbiSha256": candidate_abi_sha256,
+                "originAbiReportSha256": report_sha256,
+                "originRequestId": request_id,
+                "validationScope": "replay-reflection-abi-compatible",
+                "semanticEquivalenceVerified": False,
+            }
+        )
+        return identity, compiled
+
+    def register_workspace(
+        self,
+        status: Mapping[str, Any],
+        expected_head: Mapping[str, Any] | None = None,
+        *,
+        include_analysis: bool = True,
+        require_current_candidate: bool = False,
+    ) -> dict[str, Any]:
         if not isinstance(status, Mapping) or status.get("schema") != "renderdoc-ultra-shader-workspace-status/v1":
             raise ReplayProjectError("workspace status must come from strict workspace validation")
         source = status.get("source")
@@ -1215,7 +3356,7 @@ class ReplayProjectService:
         analysis_path = workspace_root / "ai" / "analysis.md"
         analysis_bytes: bytes | None = None
         analysis_sha256 = ""
-        if analysis_path.exists() or analysis_path.is_symlink():
+        if include_analysis and (analysis_path.exists() or analysis_path.is_symlink()):
             if not is_within(workspace_root, analysis_path.resolve()):
                 raise ReplayProjectError("workspace analysis escapes its workspace")
             analysis_bytes = _file_bytes(
@@ -1238,6 +3379,76 @@ class ReplayProjectService:
         entry = _text(str(status.get("entryPoint", "") or ""), "workspace.entryPoint", 512, True)
         resource_id = _positive(shader_status.get("resourceId"), "workspace.resourceId")
         raw = _sha(baseline.get("rawSha256"), "workspace.rawSha256")
+        compiler_binding = (
+            _compiler_binding_identity(status.get("compilerBinding"))
+            if status.get("compilerBinding") is not None
+            else None
+        )
+        if (
+            compiler_binding is not None
+            and compiler_binding["targetProfile"] != status.get("targetProfile")
+        ):
+            raise ReplayProjectError(
+                "workspace compiler binding target profile differs"
+            )
+        raw_disassembly = status.get("assemblyDisassemblyArtifacts", [])
+        if not isinstance(raw_disassembly, list) or len(raw_disassembly) > 2:
+            raise ReplayProjectError(
+                "workspace assembly/disassembly artifacts are invalid"
+            )
+        prepared_disassembly: list[tuple[dict[str, Any], bytes]] = []
+        seen_disassembly_roles: set[str] = set()
+        for raw_artifact in raw_disassembly:
+            identity = _assembly_disassembly_identity(raw_artifact)
+            if identity["role"] in seen_disassembly_roles:
+                raise ReplayProjectError(
+                    "workspace has duplicate disassembly evidence roles"
+                )
+            if (
+                identity["kind"] == "native-disassembly"
+                and (
+                    identity["role"] != "baseline"
+                    or identity["inputRawSha256"] != raw
+                )
+            ):
+                raise ReplayProjectError(
+                    "workspace native disassembly physical binding mismatch"
+                )
+            unresolved_path = Path(
+                str(raw_artifact.get("path", ""))
+            ).expanduser()
+            if unresolved_path.is_symlink():
+                raise ReplayProjectError(
+                    "workspace disassembly artifact must not be a symlink"
+                )
+            path = unresolved_path.resolve()
+            payload = _file_bytes(
+                path, MAX_SOURCE_BYTES, "workspace disassembly artifact"
+            )
+            if (
+                len(payload) != identity["byteSize"]
+                or _sha256_bytes(payload) != identity["sha256"]
+            ):
+                raise ReplayProjectError(
+                    "workspace disassembly artifact content/hash mismatch"
+                )
+            prepared_disassembly.append((identity, payload))
+            seen_disassembly_roles.add(identity["role"])
+        prepared_compiled = self._validated_compiled_candidate(
+            status,
+            source_bytes=source_bytes,
+            workspace_root=workspace_root,
+            manifest_bytes=manifest_bytes,
+            baseline=baseline,
+        )
+        if require_current_candidate and (
+            prepared_compiled is None
+            or source.get("currentSha256") != _sha256_bytes(source_bytes)
+        ):
+            raise ReplayProjectError(
+                "applied workspace publication requires the current source and "
+                "its ABI-validated compiled candidate"
+            )
         with _thread_lock(self.root), _project_lock(self.root):
             manifest = self._load()
             capture = self._capture_for_provenance(
@@ -1248,6 +3459,7 @@ class ReplayProjectService:
                 "workspaceId": _text(str(status.get("workspaceId", "")), "workspaceId", 64),
                 "captureId": capture_id,
                 "originCatalogSha256": capture["catalogSha256"],
+                "originResourceId": resource_id,
                 "stage": stage,
                 "entryPoint": entry,
                 "rawSha256": raw,
@@ -1260,7 +3472,17 @@ class ReplayProjectService:
                 "sourceSha256": _sha256_bytes(source_bytes),
                 "analysisSha256": analysis_sha256,
             }
+            if compiler_binding is not None:
+                material["compilerBinding"] = compiler_binding
+            if prepared_disassembly:
+                material["assemblyDisassemblyArtifacts"] = [
+                    identity for identity, unused_payload in prepared_disassembly
+                ]
+            if prepared_compiled is not None:
+                compiled_identity, unused_compiled_bytes = prepared_compiled
+                material["compiledCandidate"] = compiled_identity
             knowledge_id = _canonical_sha256(material)[:32]
+            head_key = self._workspace_head_key(material, manifest)
             relative = "knowledge/workspaces/%s.hlsl" % knowledge_id
             destination = self._artifact(relative, "workspace knowledge path")
             analysis_relative = (
@@ -1269,15 +3491,76 @@ class ReplayProjectService:
                 else ""
             )
             existing = next((item for item in manifest["knowledge"]["workspaces"] if item["knowledgeId"] == knowledge_id), None)
+            head_publication = self._plan_head_publication(
+                manifest,
+                "workspaces",
+                head_key,
+                knowledge_id,
+                record_preexisting=existing is not None,
+                expected_head=expected_head,
+            )
             if existing is not None:
                 if _sha256_bytes(_file_bytes(destination, MAX_SOURCE_BYTES, "workspace source")) != material["sourceSha256"]:
                     raise ReplayProjectError("existing workspace knowledge artifact changed")
-                self._activate_knowledge(manifest, "workspaces", knowledge_id)
-                self._write(manifest)
-                return {"knowledge": existing, "idempotent": True, "applied": False}
+                if head_publication["changed"]:
+                    self._activate_knowledge(manifest, "workspaces", knowledge_id)
+                    self._apply_head_publication(
+                        manifest, "workspaces", head_publication
+                    )
+                    self._write(manifest)
+                head_receipt = self._head_receipt(
+                    "workspaces", head_publication
+                )
+                return {
+                    "knowledge": existing,
+                    "idempotent": not head_publication["changed"],
+                    "applied": False,
+                    "head": {
+                        key: head_receipt[key]
+                        for key in (
+                            "headKey",
+                            "generation",
+                            "knowledgeId",
+                            "publishedAt",
+                        )
+                    },
+                    "headReceipt": head_receipt,
+                    "headChanged": head_publication["changed"],
+                }
             if len(manifest["knowledge"]["workspaces"]) >= MAX_KNOWLEDGE_COUNT:
                 raise ReplayProjectError("workspace knowledge limit reached")
             atomic_write_bytes(destination, source_bytes)
+            compiled_record: dict[str, Any] | None = None
+            if prepared_compiled is not None:
+                compiled_identity, compiled_bytes = prepared_compiled
+                binary_root = self.root / "knowledge" / "workspaces" / "binaries"
+                binary_root.mkdir(parents=True, exist_ok=True)
+                if binary_root.is_symlink() or not binary_root.is_dir():
+                    raise ReplayProjectError(
+                        "project compiled-candidate directory is redirected"
+                    )
+                compiled_relative = (
+                    "knowledge/workspaces/binaries/%s.bin"
+                    % compiled_identity["rawSha256"]
+                )
+                compiled_destination = self._artifact(
+                    compiled_relative, "workspace compiled candidate path"
+                )
+                if compiled_destination.exists() or compiled_destination.is_symlink():
+                    if compiled_destination.is_symlink() or _file_bytes(
+                        compiled_destination,
+                        MAX_COMPILED_CANDIDATE_BYTES,
+                        "project compiled candidate",
+                    ) != compiled_bytes:
+                        raise ReplayProjectError(
+                            "existing content-addressed compiled candidate changed"
+                        )
+                else:
+                    atomic_write_bytes(compiled_destination, compiled_bytes)
+                compiled_record = {
+                    **compiled_identity,
+                    "artifactPath": compiled_relative,
+                }
             if analysis_bytes is not None:
                 analysis_destination = self._artifact(
                     analysis_relative, "workspace analysis knowledge path"
@@ -1295,7 +3578,46 @@ class ReplayProjectService:
                         )
                 else:
                     atomic_write_bytes(analysis_destination, analysis_bytes)
+            disassembly_records: list[dict[str, Any]] = []
+            for identity, payload in prepared_disassembly:
+                disassembly_relative = _assembly_disassembly_relative(identity)
+                disassembly_destination = self._artifact(
+                    disassembly_relative, "workspace disassembly knowledge path"
+                )
+                disassembly_destination.parent.mkdir(parents=True, exist_ok=True)
+                if (
+                    disassembly_destination.parent.is_symlink()
+                    or not disassembly_destination.parent.is_dir()
+                ):
+                    raise ReplayProjectError(
+                        "project disassembly directory is redirected"
+                    )
+                if (
+                    disassembly_destination.exists()
+                    or disassembly_destination.is_symlink()
+                ):
+                    if (
+                        disassembly_destination.is_symlink()
+                        or _file_bytes(
+                            disassembly_destination,
+                            MAX_SOURCE_BYTES,
+                            "project disassembly artifact",
+                        )
+                        != payload
+                    ):
+                        raise ReplayProjectError(
+                            "existing content-addressed disassembly changed"
+                        )
+                else:
+                    atomic_write_bytes(disassembly_destination, payload)
+                disassembly_records.append(
+                    {**identity, "artifactPath": disassembly_relative}
+                )
             record = dict(material)
+            if compiled_record is not None:
+                record["compiledCandidate"] = compiled_record
+            if disassembly_records:
+                record["assemblyDisassemblyArtifacts"] = disassembly_records
             record.update({
                 "knowledgeId": knowledge_id,
                 "sourcePath": relative,
@@ -1318,10 +3640,547 @@ class ReplayProjectService:
                 )
             manifest["knowledge"]["workspaces"].append(record)
             self._activate_knowledge(manifest, "workspaces", knowledge_id)
+            self._apply_head_publication(
+                manifest, "workspaces", head_publication
+            )
             self._write(manifest)
-            return {"knowledge": record, "idempotent": False, "applied": False}
+            head_receipt = self._head_receipt("workspaces", head_publication)
+            return {
+                "knowledge": record,
+                "idempotent": False,
+                "applied": False,
+                "head": {
+                    key: head_receipt[key]
+                    for key in (
+                        "headKey",
+                        "generation",
+                        "knowledgeId",
+                        "publishedAt",
+                    )
+                },
+                "headReceipt": head_receipt,
+                "headChanged": True,
+            }
 
-    def register_alias_table(self, alias_table_path: str | Path) -> dict[str, Any]:
+    def register_workspace_from_inventory(
+        self,
+        status: Mapping[str, Any],
+        target_shader: Mapping[str, Any],
+        inventory: Mapping[str, Any],
+        expected_binding: Mapping[str, Any] | None = None,
+        expected_head: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Publish current HLSL/binary evidence without importing a target catalog."""
+
+        normalized = _normalise_shader_inventory(inventory)
+        exact_targets = [
+            shader
+            for shader in normalized["shaders"]
+            if isinstance(target_shader, Mapping) and dict(target_shader) == shader
+        ]
+        if len(exact_targets) != 1:
+            raise ReplayProjectError(
+                "target Shader is not one exact normalized inventory record"
+            )
+        target = exact_targets[0]
+        if (
+            not isinstance(status, Mapping)
+            or status.get("schema")
+            != "renderdoc-ultra-shader-workspace-status/v1"
+        ):
+            raise ReplayProjectError(
+                "workspace status must come from strict workspace validation"
+            )
+        source = status.get("source")
+        capture_status = status.get("capture")
+        shader_status = status.get("shader")
+        baseline = status.get("baseline")
+        if not all(
+            isinstance(value, Mapping)
+            for value in (source, capture_status, shader_status, baseline)
+        ):
+            raise ReplayProjectError("workspace status provenance is incomplete")
+        if (
+            source.get("present") is not True
+            or source.get("lane") != "executable-editable"
+            or source.get("format") != "hlsl"
+        ):
+            raise ReplayProjectError(
+                "inventory workspace registration requires executable-editable HLSL"
+            )
+        if (
+            _positive(shader_status.get("resourceId"), "workspace.resourceId")
+            != target["resourceId"]
+            or _normalised_stage(status.get("stage")) != target["stage"]
+            or _text(
+                str(status.get("entryPoint", "") or ""),
+                "workspace.entryPoint",
+                512,
+                allow_empty=True,
+            )
+            != target["entryPoint"]
+            or _sha(baseline.get("rawSha256"), "workspace.rawSha256")
+            != target["rawSha256"]
+            or _sha(
+                baseline.get("abiSha256"),
+                "workspace.abiSha256",
+                allow_empty=True,
+            )
+            != target["abiHash"]
+            or _shader_encoding(baseline.get("kind")) != target["encoding"]
+        ):
+            raise ReplayProjectError(
+                "workspace physical Shader identity differs from inventory"
+            )
+        if not target["interfaceComplete"] or not target["abiHash"]:
+            raise ReplayProjectError(
+                "inventory workspace registration requires a complete physical ABI"
+            )
+        capture_api = str(capture_status.get("api", "") or "")
+        if capture_api and _reuse_api_family(capture_api) != _reuse_api_family(target["api"]):
+            raise ReplayProjectError("workspace capture API differs from inventory")
+        source_path = _normal_path(str(source.get("path", "")))
+        source_bytes = _file_bytes(
+            source_path, MAX_SOURCE_BYTES, "workspace source"
+        )
+        if _sha(
+            source.get("currentSha256"), "workspace.source.currentSha256"
+        ) != _sha256_bytes(source_bytes):
+            raise ReplayProjectError(
+                "workspace source changed after strict status validation"
+            )
+        workspace_root = _normal_path(str(status.get("workspacePath", "")))
+        if not is_within(workspace_root, source_path):
+            raise ReplayProjectError("workspace source escapes its workspace")
+        analysis_path = workspace_root / "ai" / "analysis.md"
+        analysis_bytes: bytes | None = None
+        analysis_sha256 = ""
+        if analysis_path.exists() or analysis_path.is_symlink():
+            if not is_within(workspace_root, analysis_path.resolve()):
+                raise ReplayProjectError("workspace analysis escapes its workspace")
+            analysis_bytes = _file_bytes(
+                analysis_path, MAX_ANALYSIS_BYTES, "workspace ai/analysis.md"
+            )
+            try:
+                analysis_text = analysis_bytes.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise ReplayProjectError(
+                    "workspace analysis must be UTF-8 text"
+                ) from exc
+            if "\x00" in analysis_text:
+                raise ReplayProjectError("workspace analysis contains NUL characters")
+            analysis_sha256 = _sha256_bytes(analysis_bytes)
+        manifest_path = _normal_path(str(status.get("manifestPath", "")))
+        manifest_bytes = _file_bytes(
+            manifest_path, MAX_PROJECT_BYTES, "workspace manifest"
+        )
+        workspace_manifest_sha256 = _sha256_bytes(manifest_bytes)
+        compiler_binding = (
+            _compiler_binding_identity(status.get("compilerBinding"))
+            if status.get("compilerBinding") is not None
+            else None
+        )
+        if (
+            compiler_binding is not None
+            and compiler_binding["targetProfile"] != status.get("targetProfile")
+        ):
+            raise ReplayProjectError(
+                "workspace compiler binding target profile differs"
+            )
+        raw_disassembly = status.get("assemblyDisassemblyArtifacts", [])
+        if not isinstance(raw_disassembly, list) or len(raw_disassembly) > 2:
+            raise ReplayProjectError(
+                "workspace assembly/disassembly artifacts are invalid"
+            )
+        prepared_disassembly: list[tuple[dict[str, Any], bytes]] = []
+        seen_roles: set[str] = set()
+        for raw_artifact in raw_disassembly:
+            identity = _assembly_disassembly_identity(raw_artifact)
+            if identity["role"] in seen_roles:
+                raise ReplayProjectError(
+                    "workspace has duplicate disassembly evidence roles"
+                )
+            if (
+                identity["kind"] == "native-disassembly"
+                and (
+                    identity["role"] != "baseline"
+                    or identity["inputRawSha256"] != target["rawSha256"]
+                )
+            ):
+                raise ReplayProjectError(
+                    "workspace native disassembly physical binding mismatch"
+                )
+            unresolved_path = Path(
+                str(raw_artifact.get("path", ""))
+            ).expanduser()
+            if unresolved_path.is_symlink():
+                raise ReplayProjectError(
+                    "workspace disassembly artifact must not be a symlink"
+                )
+            payload = _file_bytes(
+                unresolved_path.resolve(),
+                MAX_SOURCE_BYTES,
+                "workspace disassembly artifact",
+            )
+            if (
+                len(payload) != identity["byteSize"]
+                or _sha256_bytes(payload) != identity["sha256"]
+            ):
+                raise ReplayProjectError(
+                    "workspace disassembly artifact content/hash mismatch"
+                )
+            prepared_disassembly.append((identity, payload))
+            seen_roles.add(identity["role"])
+        prepared_compiled = self._validated_compiled_candidate(
+            status,
+            source_bytes=source_bytes,
+            workspace_root=workspace_root,
+            manifest_bytes=manifest_bytes,
+            baseline=baseline,
+        )
+
+        with _thread_lock(self.root), _project_lock(self.root):
+            manifest = self._load()
+            before_snapshot = self._reuse_snapshot_for_normalized_inventory(
+                manifest, normalized
+            )
+            if expected_binding is not None and (
+                not isinstance(expected_binding, Mapping)
+                or dict(expected_binding) != before_snapshot["binding"]
+            ):
+                raise ReplayProjectError(
+                    "shader inventory project binding is stale or changed"
+                )
+            inventory_origin = {
+                "schema": "renderdoc-ultra-project-shader-inventory-origin/v1",
+                "schemaVersion": 1,
+                **{
+                    key: target[key]
+                    for key in (
+                        "api",
+                        "encoding",
+                        "rawSha256",
+                        "stage",
+                        "entryPoint",
+                        "abiHash",
+                        "layoutHash",
+                        "stableKeySha256",
+                    )
+                },
+            }
+            material: dict[str, Any] = {
+                "workspaceId": _text(
+                    str(status.get("workspaceId", "")), "workspaceId", 64
+                ),
+                "captureId": normalized["capture"]["captureId"],
+                "originCatalogSha256": normalized["capture"]["inventorySha256"],
+                "stage": target["stage"],
+                "entryPoint": target["entryPoint"],
+                "rawSha256": target["rawSha256"],
+                "codeSha256": _sha(
+                    baseline.get("codeSha256"),
+                    "workspace.codeSha256",
+                    allow_empty=True,
+                ),
+                "layoutHash": target["layoutHash"],
+                "interfaceHash": target["interfaceHash"],
+                "interfaceComplete": target["interfaceComplete"],
+                "baselineAbiSha256": target["abiHash"],
+                "targetProfile": copy.deepcopy(status.get("targetProfile")),
+                "sourceSha256": _sha256_bytes(source_bytes),
+                "analysisSha256": analysis_sha256,
+                "inventoryOrigin": inventory_origin,
+            }
+            if compiler_binding is not None:
+                material["compilerBinding"] = compiler_binding
+            if prepared_disassembly:
+                material["assemblyDisassemblyArtifacts"] = [
+                    identity for identity, unused_payload in prepared_disassembly
+                ]
+            if prepared_compiled is not None:
+                compiled_identity, unused_compiled = prepared_compiled
+                material["compiledCandidate"] = compiled_identity
+            knowledge_id = _canonical_sha256(
+                _inventory_workspace_artifact_identity(material)
+            )[:32]
+            observation_material = {
+                "schema": "renderdoc-ultra-project-shader-inventory-observation/v1",
+                "schemaVersion": 1,
+                "captureId": normalized["capture"]["captureId"],
+                "inventorySha256": normalized["capture"]["inventorySha256"],
+                "stableKeySha256": target["stableKeySha256"],
+                "targetResourceId": target["resourceId"],
+                "anchorEventId": target["anchorEventId"],
+                "constantBlocksSha256": _canonical_sha256(
+                    target["constantBlocks"]
+                ),
+                "workspaceManifestSha256": workspace_manifest_sha256,
+                "sourceSha256": material["sourceSha256"],
+                "compiledCandidateSha256": (
+                    material["compiledCandidate"]["rawSha256"]
+                    if "compiledCandidate" in material
+                    else ""
+                ),
+                "applyAuthorization": False,
+                "crossCaptureResourceIdReuse": False,
+            }
+            observation = _inventory_observation(
+                {
+                    **observation_material,
+                    "observedAt": _utc_now(),
+                    "receiptSha256": _canonical_sha256(observation_material),
+                }
+            )
+            source_relative = "knowledge/workspaces/%s.hlsl" % knowledge_id
+            destination = self._artifact(
+                source_relative, "workspace knowledge path"
+            )
+            existing = next(
+                (
+                    item
+                    for item in manifest["knowledge"]["workspaces"]
+                    if item.get("knowledgeId") == knowledge_id
+                ),
+                None,
+            )
+            head_key = self._workspace_head_key(material, manifest)
+            current_head = self._active_heads_state(manifest)[
+                "workspaces"
+            ].get(head_key)
+            derived_expected_head = expected_head
+            if expected_binding is not None and derived_expected_head is None:
+                derived_expected_head = (
+                    {
+                        "headKey": head_key,
+                        "generation": current_head["generation"],
+                        "knowledgeId": current_head["knowledgeId"],
+                    }
+                    if current_head is not None
+                    else None
+                )
+            head_publication = self._plan_head_publication(
+                manifest,
+                "workspaces",
+                head_key,
+                knowledge_id,
+                record_preexisting=existing is not None,
+                expected_head=derived_expected_head,
+            )
+            if head_publication["changed"] and expected_binding is None:
+                raise ReplayProjectError(
+                    "inventory workspace head publication requires expected_binding"
+                )
+            if existing is not None:
+                if _sha256_bytes(
+                    _file_bytes(destination, MAX_SOURCE_BYTES, "workspace source")
+                ) != material["sourceSha256"]:
+                    raise ReplayProjectError(
+                        "existing workspace knowledge artifact changed"
+                    )
+                observations = existing.get("inventoryObservations")
+                if (
+                    not isinstance(observations, list)
+                    or len(observations) > MAX_INVENTORY_OBSERVATIONS
+                ):
+                    raise ReplayProjectError(
+                        "workspace inventory observations are invalid or oversized"
+                    )
+                receipts = {
+                    _inventory_observation(item)["receiptSha256"]
+                    for item in observations
+                }
+                observation_recorded = observation["receiptSha256"] not in receipts
+                if observation_recorded:
+                    if len(observations) >= MAX_INVENTORY_OBSERVATIONS:
+                        raise ReplayProjectError(
+                            "workspace inventory observation limit reached"
+                        )
+                    observations.append(observation)
+                if head_publication["changed"]:
+                    self._activate_knowledge(
+                        manifest, "workspaces", knowledge_id
+                    )
+                    self._apply_head_publication(
+                        manifest, "workspaces", head_publication
+                    )
+                if observation_recorded or head_publication["changed"]:
+                    self._write(manifest)
+                after_snapshot = self._reuse_snapshot_for_normalized_inventory(
+                    manifest, normalized
+                )
+                head_receipt = self._head_receipt(
+                    "workspaces", head_publication
+                )
+                return {
+                    "knowledge": copy.deepcopy(existing),
+                    "idempotent": not head_publication["changed"],
+                    "applied": False,
+                    "observationRecorded": observation_recorded,
+                    "observation": copy.deepcopy(observation),
+                    "binding": after_snapshot["binding"],
+                    "snapshotSha256": after_snapshot["snapshotSha256"],
+                    "head": {
+                        key: head_receipt[key]
+                        for key in (
+                            "headKey",
+                            "generation",
+                            "knowledgeId",
+                            "publishedAt",
+                        )
+                    },
+                    "headReceipt": head_receipt,
+                    "headChanged": head_publication["changed"],
+                    "headCasDerivedFromBinding": expected_binding is not None,
+                }
+            if len(manifest["knowledge"]["workspaces"]) >= MAX_KNOWLEDGE_COUNT:
+                raise ReplayProjectError("workspace knowledge limit reached")
+            atomic_write_bytes(destination, source_bytes)
+            compiled_record: dict[str, Any] | None = None
+            if prepared_compiled is not None:
+                compiled_identity, compiled_bytes = prepared_compiled
+                binary_root = self.root / "knowledge" / "workspaces" / "binaries"
+                binary_root.mkdir(parents=True, exist_ok=True)
+                if binary_root.is_symlink() or not binary_root.is_dir():
+                    raise ReplayProjectError(
+                        "project compiled-candidate directory is redirected"
+                    )
+                compiled_relative = (
+                    "knowledge/workspaces/binaries/%s.bin"
+                    % compiled_identity["rawSha256"]
+                )
+                compiled_destination = self._artifact(
+                    compiled_relative, "workspace compiled candidate path"
+                )
+                if (
+                    compiled_destination.exists()
+                    or compiled_destination.is_symlink()
+                ):
+                    if (
+                        compiled_destination.is_symlink()
+                        or _file_bytes(
+                            compiled_destination,
+                            MAX_COMPILED_CANDIDATE_BYTES,
+                            "project compiled candidate",
+                        )
+                        != compiled_bytes
+                    ):
+                        raise ReplayProjectError(
+                            "existing content-addressed compiled candidate changed"
+                        )
+                else:
+                    atomic_write_bytes(compiled_destination, compiled_bytes)
+                compiled_record = {
+                    **compiled_identity,
+                    "artifactPath": compiled_relative,
+                }
+            if analysis_bytes is not None:
+                analysis_relative = (
+                    "knowledge/workspaces/%s.analysis.md" % analysis_sha256
+                )
+                analysis_destination = self._artifact(
+                    analysis_relative, "workspace analysis knowledge path"
+                )
+                if analysis_destination.exists():
+                    if _sha256_bytes(
+                        _file_bytes(
+                            analysis_destination,
+                            MAX_ANALYSIS_BYTES,
+                            "workspace analysis",
+                        )
+                    ) != analysis_sha256:
+                        raise ReplayProjectError(
+                            "existing content-addressed analysis changed"
+                        )
+                else:
+                    atomic_write_bytes(analysis_destination, analysis_bytes)
+            disassembly_records: list[dict[str, Any]] = []
+            for identity, payload in prepared_disassembly:
+                relative = _assembly_disassembly_relative(identity)
+                artifact = self._artifact(
+                    relative, "workspace disassembly knowledge path"
+                )
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                if artifact.parent.is_symlink() or not artifact.parent.is_dir():
+                    raise ReplayProjectError(
+                        "project disassembly directory is redirected"
+                    )
+                if artifact.exists() or artifact.is_symlink():
+                    if artifact.is_symlink() or _file_bytes(
+                        artifact,
+                        MAX_SOURCE_BYTES,
+                        "project disassembly artifact",
+                    ) != payload:
+                        raise ReplayProjectError(
+                            "existing content-addressed disassembly changed"
+                        )
+                else:
+                    atomic_write_bytes(artifact, payload)
+                disassembly_records.append({**identity, "artifactPath": relative})
+            record = dict(material)
+            if compiled_record is not None:
+                record["compiledCandidate"] = compiled_record
+            if disassembly_records:
+                record["assemblyDisassemblyArtifacts"] = disassembly_records
+            record.update(
+                {
+                    "knowledgeId": knowledge_id,
+                    "inventoryObservations": [observation],
+                    "sourcePath": source_relative,
+                    "sourceOriginPath": str(source_path),
+                    "workspacePath": str(workspace_root),
+                    "workspaceManifestSha256": workspace_manifest_sha256,
+                    "registeredAt": _utc_now(),
+                }
+            )
+            if analysis_bytes is not None:
+                record.update(
+                    {
+                        "analysisPath": analysis_relative,
+                        "analysisKind": "ai-explanatory-text",
+                        "analysisPolicy": {
+                            "physicalEvidence": False,
+                            "applyAuthorization": False,
+                            "reviewRequired": True,
+                        },
+                    }
+                )
+            manifest["knowledge"]["workspaces"].append(record)
+            self._activate_knowledge(manifest, "workspaces", knowledge_id)
+            self._apply_head_publication(
+                manifest, "workspaces", head_publication
+            )
+            self._write(manifest)
+            after_snapshot = self._reuse_snapshot_for_normalized_inventory(
+                manifest, normalized
+            )
+            head_receipt = self._head_receipt("workspaces", head_publication)
+            return {
+                "knowledge": copy.deepcopy(record),
+                "idempotent": False,
+                "applied": False,
+                "observationRecorded": True,
+                "observation": copy.deepcopy(observation),
+                "binding": after_snapshot["binding"],
+                "snapshotSha256": after_snapshot["snapshotSha256"],
+                "head": {
+                    key: head_receipt[key]
+                    for key in (
+                        "headKey",
+                        "generation",
+                        "knowledgeId",
+                        "publishedAt",
+                    )
+                },
+                "headReceipt": head_receipt,
+                "headChanged": True,
+                "headCasDerivedFromBinding": True,
+            }
+
+    def register_alias_table(
+        self,
+        alias_table_path: str | Path,
+        expected_head: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         source = _normal_path(alias_table_path)
         raw = _file_bytes(source, MAX_ALIAS_BYTES, "alias table")
         try:
@@ -1390,8 +4249,65 @@ class ReplayProjectService:
             relative = "knowledge/aliases/%s.json" % knowledge_id
             destination = self._artifact(relative, "alias knowledge path")
             existing = next((item for item in manifest["knowledge"]["aliases"] if item["knowledgeId"] == knowledge_id), None)
+            alias_provenance = {
+                "captureId": capture_id,
+                "originCatalogSha256": capture["catalogSha256"],
+            }
+            head_keys = [
+                self._alias_head_key(
+                    group, manifest=manifest, provenance=alias_provenance
+                )
+                for group in group_values
+            ]
+            expected_heads = self._expected_heads_for_keys(
+                expected_head, head_keys
+            )
+            head_publications = [
+                self._plan_head_publication(
+                    manifest,
+                    "aliases",
+                    head_key,
+                    knowledge_id,
+                    record_preexisting=existing is not None,
+                    expected_head=expected_heads[head_key],
+                )
+                for head_key in head_keys
+            ]
             if existing is not None:
-                return {"knowledge": existing, "idempotent": True, "applied": False}
+                changed = any(item["changed"] for item in head_publications)
+                if changed:
+                    for publication in head_publications:
+                        self._apply_head_publication(
+                            manifest, "aliases", publication
+                        )
+                    self._write(manifest)
+                head_receipts = [
+                    self._head_receipt("aliases", item)
+                    for item in head_publications
+                ]
+                result = {
+                    "knowledge": existing,
+                    "idempotent": not changed,
+                    "applied": False,
+                    "heads": [
+                        {
+                            key: receipt[key]
+                            for key in (
+                                "headKey",
+                                "generation",
+                                "knowledgeId",
+                                "publishedAt",
+                            )
+                        }
+                        for receipt in head_receipts
+                    ],
+                    "headReceipts": head_receipts,
+                    "headChanged": changed,
+                }
+                if len(head_receipts) == 1:
+                    result["head"] = result["heads"][0]
+                    result["headReceipt"] = head_receipts[0]
+                return result
             if len(manifest["knowledge"]["aliases"]) >= MAX_KNOWLEDGE_COUNT:
                 raise ReplayProjectError("alias knowledge limit reached")
             atomic_write_bytes(destination, raw)
@@ -1406,8 +4322,38 @@ class ReplayProjectService:
                 "registeredAt": _utc_now(),
             }
             manifest["knowledge"]["aliases"].append(record)
+            for publication in head_publications:
+                self._apply_head_publication(
+                    manifest, "aliases", publication
+                )
             self._write(manifest)
-            return {"knowledge": record, "idempotent": False, "applied": False}
+            head_receipts = [
+                self._head_receipt("aliases", item)
+                for item in head_publications
+            ]
+            result = {
+                "knowledge": record,
+                "idempotent": False,
+                "applied": False,
+                "heads": [
+                    {
+                        key: receipt[key]
+                        for key in (
+                            "headKey",
+                            "generation",
+                            "knowledgeId",
+                            "publishedAt",
+                        )
+                    }
+                    for receipt in head_receipts
+                ],
+                "headReceipts": head_receipts,
+                "headChanged": bool(head_receipts),
+            }
+            if len(head_receipts) == 1:
+                result["head"] = result["heads"][0]
+                result["headReceipt"] = head_receipts[0]
+            return result
 
     @staticmethod
     def _live_material_parameters(session: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1499,7 +4445,12 @@ class ReplayProjectService:
             )
         return parameters
 
-    def save_material_knowledge(self, session: Mapping[str, Any], parameter_ids: Sequence[str]) -> dict[str, Any]:
+    def save_material_knowledge(
+        self,
+        session: Mapping[str, Any],
+        parameter_ids: Sequence[str],
+        expected_head: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(session, Mapping) or session.get("schema") != "renderdoc-ultra-material-session/v1":
             raise ReplayProjectError("material status must come from a live material session")
         requested = [str(value or "").strip().lower() for value in parameter_ids]
@@ -1535,31 +4486,34 @@ class ReplayProjectService:
             block_layout_sha256 = _sha(
                 session.get("layoutSha256"), "material.layoutSha256"
             )
-            active = self._active_knowledge_state(manifest)
-            head_candidates: list[tuple[int, str]] = []
-            for raw_record in manifest["knowledge"]["materials"]:
-                if (
-                    isinstance(raw_record, Mapping)
-                    and raw_record.get("constantBlockPath") == block_path
-                    and raw_record.get("constantBlockLayoutSha256")
-                    == block_layout_sha256
-                    and _match_mode(raw_record, shader)
-                ):
-                    token = str(raw_record.get("knowledgeId", "") or "")
-                    serial = active["materials"].get(token)
-                    if not isinstance(serial, int):
-                        raise ReplayProjectError(
-                            "material active-head activation is invalid"
-                        )
-                    head_candidates.append((serial, token))
+            material_head_identity = {
+                "captureId": capture_id,
+                "originCatalogSha256": capture["catalogSha256"],
+                "originResourceId": resource,
+                "stage": shader["stage"],
+                "entryPoint": shader.get("entryPoint", ""),
+                "rawSha256": shader.get("rawSha256", ""),
+                "codeSha256": shader.get("codeSha256", ""),
+                "layoutHash": shader.get("layoutHash", ""),
+                "interfaceHash": shader.get("interfaceHash", ""),
+                "interfaceComplete": shader.get("interfaceComplete") is True,
+                "constantBlockPath": block_path,
+                "constantBlockLayoutSha256": block_layout_sha256,
+            }
+            head_key = self._material_head_key(
+                material_head_identity, manifest
+            )
+            current_head = self._active_heads_state(manifest)["materials"].get(
+                head_key
+            )
 
             live_by_typed = {
                 (item["path"], item["baseType"], item["components"]): item
                 for item in live_parameters
             }
             merged: dict[tuple[str, str, int], dict[str, Any]] = {}
-            if head_candidates:
-                unused_serial, head_id = max(head_candidates)
+            if current_head is not None:
+                head_id = current_head["knowledgeId"]
                 head = self._material_knowledge_from_manifest(manifest, head_id)
                 for saved in head["parameters"]:
                     typed = (
@@ -1597,6 +4551,7 @@ class ReplayProjectService:
             material = {
                 "captureId": capture_id,
                 "originCatalogSha256": capture["catalogSha256"],
+                "originResourceId": resource,
                 "stage": shader["stage"],
                 "entryPoint": shader.get("entryPoint", ""),
                 "rawSha256": shader.get("rawSha256", ""),
@@ -1610,18 +4565,65 @@ class ReplayProjectService:
             }
             knowledge_id = _canonical_sha256(material)[:32]
             existing = next((item for item in manifest["knowledge"]["materials"] if item["knowledgeId"] == knowledge_id), None)
+            head_publication = self._plan_head_publication(
+                manifest,
+                "materials",
+                head_key,
+                knowledge_id,
+                record_preexisting=existing is not None,
+                expected_head=expected_head,
+            )
             if existing is not None:
-                self._activate_knowledge(manifest, "materials", knowledge_id)
-                self._write(manifest)
-                return {"knowledge": existing, "idempotent": True, "applied": False}
+                if head_publication["changed"]:
+                    self._activate_knowledge(manifest, "materials", knowledge_id)
+                    self._apply_head_publication(
+                        manifest, "materials", head_publication
+                    )
+                    self._write(manifest)
+                head_receipt = self._head_receipt("materials", head_publication)
+                return {
+                    "knowledge": existing,
+                    "idempotent": not head_publication["changed"],
+                    "applied": False,
+                    "head": {
+                        key: head_receipt[key]
+                        for key in (
+                            "headKey",
+                            "generation",
+                            "knowledgeId",
+                            "publishedAt",
+                        )
+                    },
+                    "headReceipt": head_receipt,
+                    "headChanged": head_publication["changed"],
+                }
             if len(manifest["knowledge"]["materials"]) >= MAX_KNOWLEDGE_COUNT:
                 raise ReplayProjectError("material knowledge limit reached")
             record = dict(material)
             record.update({"knowledgeId": knowledge_id, "registeredAt": _utc_now()})
             manifest["knowledge"]["materials"].append(record)
             self._activate_knowledge(manifest, "materials", knowledge_id)
+            self._apply_head_publication(
+                manifest, "materials", head_publication
+            )
             self._write(manifest)
-            return {"knowledge": record, "idempotent": False, "applied": False}
+            head_receipt = self._head_receipt("materials", head_publication)
+            return {
+                "knowledge": record,
+                "idempotent": False,
+                "applied": False,
+                "head": {
+                    key: head_receipt[key]
+                    for key in (
+                        "headKey",
+                        "generation",
+                        "knowledgeId",
+                        "publishedAt",
+                    )
+                },
+                "headReceipt": head_receipt,
+                "headChanged": True,
+            }
 
     def restore_binding_state(
         self, capture_id: str, catalog_sha256: str
@@ -1633,13 +4635,14 @@ class ReplayProjectService:
         embedded RDC index cannot supply or relax any of them.
         """
 
-        manifest = self._load()
-        capture = self._capture(manifest, capture_id, catalog_sha256)
-        state = self._reuse_knowledge_state(manifest)
-        restore_scope = self._capture_referenced_knowledge_scope(capture, state)
-        binding = self._reuse_cache_binding(
-            manifest, capture, restore_scope["knowledgeContentSha256"]
-        )
+        with _thread_lock(self.root), _project_lock(self.root):
+            manifest = self._load(persist_migrations=True)
+            capture = self._capture(manifest, capture_id, catalog_sha256)
+            state = self._reuse_knowledge_state(manifest)
+            restore_scope = self._capture_referenced_knowledge_scope(capture, state)
+            binding = self._reuse_cache_binding(
+                manifest, capture, restore_scope["knowledgeContentSha256"]
+            )
         return {
             "projectId": binding["projectId"],
             "projectPath": str(self.root),
@@ -1690,6 +4693,14 @@ class ReplayProjectService:
         origin_catalog_sha256 = _sha(
             record.get("originCatalogSha256"), "workspace.originCatalogSha256"
         )
+        origin_resource_id = (
+            _canonical_positive(
+                record.get("originResourceId"),
+                "workspace.originResourceId",
+            )
+            if "originResourceId" in record
+            else None
+        )
         stage = _text(str(record.get("stage", "")), "workspace.stage", 64)
         entry_point = _text(
             str(record.get("entryPoint", "") or ""),
@@ -1723,29 +4734,139 @@ class ReplayProjectService:
             "workspace.analysisSha256",
             allow_empty=True,
         )
-        if provenance_index is None:
+        compiled_candidate = record.get("compiledCandidate")
+        compiled_identity: dict[str, Any] | None = None
+        if compiled_candidate is not None:
+            compiled_identity = _compiled_candidate_identity(compiled_candidate)
+            if (
+                compiled_identity["sourceSha256"] != source_sha256
+                or compiled_identity["targetProfile"]
+                != record.get("targetProfile")
+                or compiled_identity["originBaselineAbiSha256"]
+                != baseline_abi_sha256
+            ):
+                raise ReplayProjectError(
+                    "workspace compiled candidate knowledge binding mismatch"
+                )
+            expected_compiled_relative = (
+                "knowledge/workspaces/binaries/%s.bin"
+                % compiled_identity["rawSha256"]
+            )
+            if compiled_candidate.get("artifactPath") != expected_compiled_relative:
+                raise ReplayProjectError(
+                    "workspace compiled candidate is not content-addressed"
+                )
+            compiled_bytes = _file_bytes(
+                self._artifact(
+                    expected_compiled_relative, "workspace compiled candidate"
+                ),
+                MAX_COMPILED_CANDIDATE_BYTES,
+                "workspace compiled candidate",
+            )
+            if (
+                len(compiled_bytes) != compiled_identity["byteSize"]
+                or _sha256_bytes(compiled_bytes)
+                != compiled_identity["rawSha256"]
+            ):
+                raise ReplayProjectError(
+                    "workspace compiled candidate content/hash mismatch"
+                )
+        inventory_origin = record.get("inventoryOrigin")
+        inventory_observations: list[dict[str, Any]] = []
+        if inventory_origin is not None:
+            if origin_resource_id is not None:
+                raise ReplayProjectError(
+                    "inventory workspace must not claim a capture-local originResourceId"
+                )
+            origin = _inventory_origin_identity(inventory_origin)
+            if any(
+                (
+                    origin["rawSha256"] != raw_sha256,
+                    origin["stage"] != stage,
+                    origin["entryPoint"] != entry_point,
+                    origin["abiHash"] != baseline_abi_sha256,
+                    origin["layoutHash"] != layout_hash,
+                )
+            ):
+                raise ReplayProjectError(
+                    "workspace inventory origin differs from project knowledge"
+                )
+            raw_observations = record.get("inventoryObservations")
+            if (
+                not isinstance(raw_observations, list)
+                or not raw_observations
+                or len(raw_observations) > MAX_INVENTORY_OBSERVATIONS
+            ):
+                raise ReplayProjectError(
+                    "workspace inventory observations are invalid or oversized"
+                )
+            seen_receipts: set[str] = set()
+            expected_compiled_sha256 = (
+                compiled_identity["rawSha256"]
+                if compiled_identity is not None
+                else ""
+            )
+            for raw_observation in raw_observations:
+                observation = _inventory_observation(raw_observation)
+                if dict(raw_observation) != observation:
+                    raise ReplayProjectError(
+                        "workspace inventory observation is not canonical"
+                    )
+                if observation["receiptSha256"] in seen_receipts:
+                    raise ReplayProjectError(
+                        "workspace inventory observation receipt is duplicated"
+                    )
+                if (
+                    observation["stableKeySha256"]
+                    != origin["stableKeySha256"]
+                    or observation["sourceSha256"] != source_sha256
+                    or observation["compiledCandidateSha256"]
+                    != expected_compiled_sha256
+                ):
+                    raise ReplayProjectError(
+                        "workspace inventory observation differs from its artifact"
+                    )
+                seen_receipts.add(observation["receiptSha256"])
+                inventory_observations.append(observation)
+            if (
+                inventory_observations[0]["captureId"] != capture_id
+                or inventory_observations[0]["inventorySha256"]
+                != origin_catalog_sha256
+                or inventory_observations[0]["workspaceManifestSha256"]
+                != _sha(
+                    record.get("workspaceManifestSha256"),
+                    "workspace.workspaceManifestSha256",
+                )
+            ):
+                raise ReplayProjectError(
+                    "workspace first inventory observation differs from publication provenance"
+                )
+            shader = {
+                "codeSha256": code_sha256,
+                "layoutHash": layout_hash,
+                "interfaceHash": interface_hash,
+                "interfaceComplete": interface_complete,
+            }
+        elif provenance_index is None:
             capture = self._capture_for_provenance(
                 manifest, capture_id, origin_catalog_sha256
             )
-            shader = self._capture_shader(
-                capture,
-                resource_id=_positive(
-                    next(
-                        (
-                            item.get("resourceId")
-                            for item in capture["shaders"]
-                            if item.get("stage") == stage
-                            and item.get("entryPoint", "") == entry_point
-                            and item.get("rawSha256") == raw_sha256
-                        ),
-                        0,
-                    ),
-                    "workspace shader resourceId",
-                ),
-                stage=stage,
-                entry_point=entry_point,
-                raw_sha256=raw_sha256,
-            )
+            shader_matches = [
+                item
+                for item in capture["shaders"]
+                if item.get("stage") == stage
+                and item.get("entryPoint", "") == entry_point
+                and item.get("rawSha256") == raw_sha256
+                and (
+                    origin_resource_id is None
+                    or item.get("resourceId") == origin_resource_id
+                )
+            ]
+            if len(shader_matches) != 1:
+                raise ReplayProjectError(
+                    "workspace knowledge does not select one imported Shader"
+                )
+            shader = shader_matches[0]
         else:
             provenance = provenance_index.get(
                 (capture_id, origin_catalog_sha256)
@@ -1757,12 +4878,19 @@ class ReplayProjectService:
                 if isinstance(provenance, Mapping)
                 else []
             )
-            if not shader_matches or not isinstance(shader_matches[0], Mapping):
-                raise ReplayProjectError(
-                    "workspace knowledge does not select an imported Shader"
+            shader_matches = [
+                item
+                for item in shader_matches
+                if isinstance(item, Mapping)
+                and (
+                    origin_resource_id is None
+                    or item.get("resourceId") == origin_resource_id
                 )
-            # Workspace identity is resource-agnostic. This retains the existing
-            # behaviour for physically identical shaders bound at several slots.
+            ]
+            if len(shader_matches) != 1:
+                raise ReplayProjectError(
+                    "workspace knowledge does not select one imported Shader"
+                )
             shader = shader_matches[0]
         if any(
             (
@@ -1801,7 +4929,54 @@ class ReplayProjectService:
             "sourceSha256": source_sha256,
             "analysisSha256": analysis_sha256,
         }
-        if _canonical_sha256(identity)[:32] != token:
+        if origin_resource_id is not None:
+            identity["originResourceId"] = origin_resource_id
+        if inventory_origin is not None:
+            identity["inventoryOrigin"] = _inventory_origin_identity(
+                inventory_origin
+            )
+        compiler_binding = record.get("compilerBinding")
+        if compiler_binding is not None:
+            clean_compiler_binding = _compiler_binding_identity(
+                compiler_binding
+            )
+            if clean_compiler_binding["targetProfile"] != record.get(
+                "targetProfile"
+            ):
+                raise ReplayProjectError(
+                    "workspace compiler binding target profile differs"
+                )
+            identity["compilerBinding"] = clean_compiler_binding
+        disassembly_artifacts = record.get("assemblyDisassemblyArtifacts", [])
+        if disassembly_artifacts:
+            if not isinstance(disassembly_artifacts, list):
+                raise ReplayProjectError(
+                    "workspace assembly/disassembly artifacts are invalid"
+                )
+            clean_disassembly = [
+                _assembly_disassembly_identity(item)
+                for item in disassembly_artifacts
+            ]
+            if any(
+                item["kind"] == "native-disassembly"
+                and (
+                    item["role"] != "baseline"
+                    or item["inputRawSha256"] != raw_sha256
+                )
+                for item in clean_disassembly
+            ):
+                raise ReplayProjectError(
+                    "workspace native disassembly physical binding mismatch"
+                )
+            identity["assemblyDisassemblyArtifacts"] = clean_disassembly
+        if compiled_identity is not None:
+            identity["compiledCandidate"] = compiled_identity
+        expected_knowledge_id = (
+            _canonical_sha256(_inventory_workspace_artifact_identity(identity))[:32]
+            if inventory_origin is not None
+            else _canonical_sha256(identity)[:32]
+        )
+        if expected_knowledge_id != token:
             raise ReplayProjectError("workspace knowledgeId does not match its contents")
         return copy.deepcopy(dict(record))
 
@@ -1809,6 +4984,88 @@ class ReplayProjectService:
         """Read one content-bound HLSL knowledge record with full provenance."""
 
         return self._workspace_knowledge_from_manifest(self._load(), knowledge_id)
+
+    def restorable_shader_raw_hashes(self) -> list[str]:
+        """Return original executable identities of current project heads only."""
+        with _thread_lock(self.root), _project_lock(self.root):
+            state = self._reuse_knowledge_state(self._load())
+            values = {
+                entry["matcher"]["rawSha256"]
+                for index in state["indexes"].values()
+                for entries in index["raw"].values()
+                for entry in entries
+            }
+            return sorted(_sha(value, "restorable original Shader hash") for value in values)
+
+    def prepare_workspace_source(
+        self, knowledge_id: str, destination_status: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Read a verified project source for a fresh physical workspace.
+
+        No decompiler output is required. The destination must already bind
+        real captured bytes and their ABI; compilation and live ABI validation
+        are separate and no old replay authorization is imported.
+        """
+        if (not isinstance(destination_status, Mapping)
+                or destination_status.get("schema") != "renderdoc-ultra-shader-workspace-status/v1"):
+            raise ReplayProjectError("destination workspace status is invalid")
+        baseline = destination_status.get("baseline")
+        shader = destination_status.get("shader")
+        capture = destination_status.get("capture")
+        source = destination_status.get("source")
+        if not all(isinstance(item, Mapping) for item in (baseline, shader, capture, source)):
+            raise ReplayProjectError("destination workspace physical provenance is incomplete")
+        if source.get("present") is not False:
+            raise ReplayProjectError("direct project source import requires an empty destination source")
+        with _thread_lock(self.root), _project_lock(self.root):
+            manifest = self._load()
+            knowledge = self._workspace_knowledge_from_manifest(manifest, knowledge_id)
+            head_key = self._workspace_head_key(knowledge, manifest)
+            if self._active_heads_state(manifest)["workspaces"][head_key]["knowledgeId"] != knowledge_id:
+                raise ReplayProjectError("project source is no longer the active knowledge head")
+            if (knowledge.get("rawSha256") != baseline.get("rawSha256")
+                    or shader.get("rawSha256") != baseline.get("rawSha256")
+                    or knowledge.get("stage") != destination_status.get("stage")
+                    or knowledge.get("entryPoint", "") != destination_status.get("entryPoint", "")
+                    or knowledge.get("targetProfile") != destination_status.get("targetProfile")
+                    or not knowledge.get("baselineAbiSha256")
+                    or knowledge.get("baselineAbiSha256") != baseline.get("abiSha256")):
+                raise ReplayProjectError("project source differs from the current original Shader/profile/physical ABI")
+            physical = self._head_shader_identity(knowledge, baseline_abi=True, manifest=manifest)
+            if (_reuse_api_family(capture.get("api")) != _reuse_api_family(physical["api"])
+                    or _shader_encoding(baseline.get("kind")) != _shader_encoding(physical["encoding"])):
+                raise ReplayProjectError("project source capture API/encoding differs from the destination")
+            payload = _file_bytes(self._artifact(knowledge["sourcePath"], "project source"), MAX_SOURCE_BYTES, "project source")
+            if _sha256_bytes(payload) != knowledge["sourceSha256"]:
+                raise ReplayProjectError("project source bytes changed")
+            text = payload.decode("utf-8", errors="strict")
+            if not text.strip() or "\x00" in text:
+                raise ReplayProjectError("project source must be nonempty UTF-8 HLSL")
+            # Existing knowledge records retain the captured entry name. The
+            # fixed SPIR-V round trip may emit main instead; bind only an
+            # actual uniquely declared function, never an invented entry.
+            from .shader_workspace.flow_graph import _function_records
+            names = [item["name"] for item in _function_records(text)]
+            entry = str(knowledge.get("entryPoint", ""))
+            if names.count(entry) != 1:
+                if names.count("main") != 1:
+                    raise ReplayProjectError("project source has no unique captured/main compile entry")
+                entry = "main"
+            return {
+                "schema": "replaylab-verified-project-shader-source/v1",
+                "projectId": manifest["projectId"], "projectPath": str(self.root),
+                "knowledgeId": knowledge_id, "sourceSha256": knowledge["sourceSha256"],
+                "sourceText": text, "sourceEntryPoint": entry,
+                "originalRawSha256": baseline["rawSha256"],
+                "baselineAbiSha256": baseline["abiSha256"],
+                "stage": destination_status["stage"], "entryPoint": destination_status["entryPoint"],
+                "targetProfile": copy.deepcopy(destination_status["targetProfile"]),
+                "originWorkspacePath": knowledge.get("workspacePath"),
+                "originWorkspaceId": knowledge["workspaceId"],
+                "analysisSha256": knowledge.get("analysisSha256", ""),
+                "applied": False, "requiresCompile": True, "requiresLiveAbiRevalidation": True,
+                "semanticEquivalenceVerified": False,
+            }
 
     def _material_knowledge_from_manifest(
         self,
@@ -1844,6 +5101,14 @@ class ReplayProjectService:
         capture_id = _sha(record.get("captureId"), "material.captureId")
         origin_catalog_sha256 = _sha(
             record.get("originCatalogSha256"), "material.originCatalogSha256"
+        )
+        origin_resource_id = (
+            _canonical_positive(
+                record.get("originResourceId"),
+                "material.originResourceId",
+            )
+            if "originResourceId" in record
+            else None
         )
         stage = _text(str(record.get("stage", "")), "material.stage", 64)
         entry_point = _text(
@@ -1988,11 +5253,17 @@ class ReplayProjectService:
                 if isinstance(provenance, Mapping)
                 else []
             )
-        if len(matching_shaders) != 1:
+        exact_shaders = [
+            shader
+            for shader in matching_shaders
+            if origin_resource_id is None
+            or shader.get("resourceId") == origin_resource_id
+        ]
+        if len(exact_shaders) != 1:
             raise ReplayProjectError(
                 "material knowledge does not select one imported Shader"
             )
-        shader = matching_shaders[0]
+        shader = exact_shaders[0]
         if any(
             (
                 shader.get("codeSha256", "") != code_sha256,
@@ -2018,6 +5289,8 @@ class ReplayProjectService:
             "constantBlockLayoutSha256": block_layout_sha256,
             "parameters": parameters,
         }
+        if origin_resource_id is not None:
+            identity["originResourceId"] = origin_resource_id
         if _canonical_sha256(identity)[:32] != token:
             raise ReplayProjectError("material knowledgeId does not match its contents")
         _text(record.get("registeredAt"), "material.registeredAt", 128)
@@ -2087,10 +5360,24 @@ class ReplayProjectService:
         stays linear without weakening source/provenance/ABI checks.
         """
 
-        manifest = self._load()
-        capture = self._capture(manifest, capture_id, catalog_sha256)
-        state = self._reuse_knowledge_state(manifest)
-        restore_scope = self._capture_referenced_knowledge_scope(capture, state)
+        with _thread_lock(self.root), _project_lock(self.root):
+            manifest = self._load(persist_migrations=True)
+            capture = self._capture(manifest, capture_id, catalog_sha256)
+            state = self._reuse_knowledge_state(manifest)
+            restore_scope = self._capture_referenced_knowledge_scope(capture, state)
+            return self._restore_knowledge_snapshot_from_manifest(
+                manifest, capture, state, restore_scope
+            )
+
+    def _restore_knowledge_snapshot_from_manifest(
+        self,
+        manifest: Mapping[str, Any],
+        capture: Mapping[str, Any],
+        state: Mapping[str, Any],
+        restore_scope: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Materialize one hash-verified snapshot from a single manifest read."""
+
         binding = self._reuse_cache_binding(
             manifest, capture, restore_scope["knowledgeContentSha256"]
         )
@@ -2178,6 +5465,34 @@ class ReplayProjectService:
         )
         return raw_key, code_key
 
+    @staticmethod
+    def _semantic_knowledge_record(
+        kind: str, record: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Project semantic bytes, excluding local/audit-only observations."""
+
+        result = copy.deepcopy(dict(record))
+        result.pop("registeredAt", None)
+        if kind == "workspaces":
+            for field in (
+                "inventoryObservations",
+                "sourceOriginPath",
+                "workspacePath",
+                "workspaceManifestSha256",
+            ):
+                result.pop(field, None)
+        return result
+
+    @staticmethod
+    def _semantic_head(
+        head_key: str, head: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "headKey": head_key,
+            "generation": head["generation"],
+            "knowledgeId": head["knowledgeId"],
+        }
+
     def _reuse_knowledge_state(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
         """Build linear-time lookup tables over the exact manifest knowledge revision."""
 
@@ -2185,13 +5500,10 @@ class ReplayProjectService:
         if not isinstance(manifest, dict):
             raise ReplayProjectError("project manifest must be a JSON object")
         active = self._active_knowledge_state(manifest)
+        active_heads = self._active_heads_state(manifest)
+        head_members = self._knowledge_head_members(manifest)
         state: dict[str, Any] = {
-            # Derived reuse-plan caches are global to the project. Activation
-            # changes must invalidate them even when immutable record bytes do
-            # not change (for example A -> B -> historical A).
-            "knowledgeContentSha256": _canonical_sha256(
-                {"knowledge": knowledge, "activeKnowledge": active}
-            ),
+            "knowledgeContentSha256": "",
             "indexes": {
                 kind: {"raw": {}, "code": {}}
                 for kind in ("workspaces", "aliases", "materials")
@@ -2202,6 +5514,12 @@ class ReplayProjectService:
             "activation": {
                 "workspaces": dict(active["workspaces"]),
                 "materials": dict(active["materials"]),
+            },
+            "activeHeads": copy.deepcopy(active_heads),
+            "headBindings": {
+                "workspaces": {},
+                "materials": {},
+                "aliases": {},
             },
             "ordinals": {
                 "workspaces": {},
@@ -2221,6 +5539,7 @@ class ReplayProjectService:
             ordinal: tuple[int, int],
             matcher: Mapping[str, Any],
             reference: Mapping[str, Any],
+            physical_identity: Mapping[str, Any],
         ) -> None:
             raw_key, code_key = self._reuse_index_keys(matcher)
             entry = {
@@ -2228,6 +5547,8 @@ class ReplayProjectService:
                 "ordinal": ordinal,
                 "matcher": matcher,
                 "reference": dict(reference),
+                "api": physical_identity["api"],
+                "encoding": physical_identity["encoding"],
             }
             if raw_key is not None:
                 state["indexes"][kind]["raw"].setdefault(raw_key, []).append(entry)
@@ -2242,13 +5563,26 @@ class ReplayProjectService:
                 raise ReplayProjectError("workspace knowledgeId is duplicated")
             state["workspaces"][key] = workspace
             state["ordinals"]["workspaces"][key] = (index, 0)
-            index_entry(
-                "workspaces",
-                "workspace:%s" % key,
-                (index, 0),
-                workspace,
-                {"knowledgeId": key},
-            )
+            head_key = self._workspace_head_key(workspace, manifest)
+            head = active_heads["workspaces"][head_key]
+            if head["knowledgeId"] == key:
+                physical_identity = self._head_shader_identity(
+                    workspace, baseline_abi=True, manifest=manifest
+                )
+                state["headBindings"]["workspaces"][key] = {
+                    **self._semantic_head(head_key, head),
+                    "historyCount": len(head_members["workspaces"][head_key]),
+                    "api": physical_identity["api"],
+                    "encoding": physical_identity["encoding"],
+                }
+                index_entry(
+                    "workspaces",
+                    "workspace:%s" % key,
+                    (index, 0),
+                    workspace,
+                    {"knowledgeId": key},
+                    physical_identity,
+                )
 
         for alias_index, alias_set in enumerate(knowledge["aliases"]):
             if not isinstance(alias_set, Mapping):
@@ -2264,13 +5598,30 @@ class ReplayProjectService:
                 if group_key in state["aliases"]:
                     raise ReplayProjectError("alias knowledge group is duplicated")
                 state["aliases"][group_key] = (alias_set, group)
-                index_entry(
-                    "aliases",
-                    "alias:%s:%d" % (key, group_index),
-                    (alias_index, group_index),
-                    group,
-                    {"knowledgeId": key, "groupIndex": group_index},
+                head_key = self._alias_head_key(
+                    group, manifest=manifest, provenance=alias_set
                 )
+                head = active_heads["aliases"][head_key]
+                if head["knowledgeId"] == key:
+                    physical_identity = self._head_shader_identity(
+                        group, manifest=manifest, provenance=alias_set
+                    )
+                    state["headBindings"]["aliases"][group_key] = {
+                        **self._semantic_head(head_key, head),
+                        "historyCount": len(
+                            head_members["aliases"][head_key]
+                        ),
+                        "api": physical_identity["api"],
+                        "encoding": physical_identity["encoding"],
+                    }
+                    index_entry(
+                        "aliases",
+                        "alias:%s:%d" % (key, group_index),
+                        (alias_index, group_index),
+                        group,
+                        {"knowledgeId": key, "groupIndex": group_index},
+                        physical_identity,
+                    )
 
         for index, material in enumerate(knowledge["materials"]):
             if not isinstance(material, Mapping):
@@ -2280,13 +5631,83 @@ class ReplayProjectService:
                 raise ReplayProjectError("material knowledgeId is duplicated")
             state["materials"][key] = material
             state["ordinals"]["materials"][key] = (index, 0)
-            index_entry(
-                "materials",
-                "material:%s" % key,
-                (index, 0),
-                material,
-                {"knowledgeId": key},
-            )
+            head_key = self._material_head_key(material, manifest)
+            head = active_heads["materials"][head_key]
+            if head["knowledgeId"] == key:
+                physical_identity = self._head_shader_identity(
+                    material, manifest=manifest
+                )
+                state["headBindings"]["materials"][key] = {
+                    **self._semantic_head(head_key, head),
+                    "historyCount": len(head_members["materials"][head_key]),
+                    "api": physical_identity["api"],
+                    "encoding": physical_identity["encoding"],
+                }
+                index_entry(
+                    "materials",
+                    "material:%s" % key,
+                    (index, 0),
+                    material,
+                    {"knowledgeId": key},
+                    physical_identity,
+                )
+
+        global_semantics = {
+            "schema": "renderdoc-ultra-project-active-head-semantics/v1",
+            "workspaces": [
+                {
+                    "head": {
+                        key: value
+                        for key, value in state["headBindings"][
+                            "workspaces"
+                        ][knowledge_id].items()
+                        if key in {"headKey", "generation", "knowledgeId"}
+                    },
+                    "knowledge": self._semantic_knowledge_record(
+                        "workspaces", state["workspaces"][knowledge_id]
+                    ),
+                }
+                for knowledge_id in sorted(
+                    state["headBindings"]["workspaces"]
+                )
+            ],
+            "materials": [
+                {
+                    "head": {
+                        key: value
+                        for key, value in state["headBindings"][
+                            "materials"
+                        ][knowledge_id].items()
+                        if key in {"headKey", "generation", "knowledgeId"}
+                    },
+                    "knowledge": self._semantic_knowledge_record(
+                        "materials", state["materials"][knowledge_id]
+                    ),
+                }
+                for knowledge_id in sorted(
+                    state["headBindings"]["materials"]
+                )
+            ],
+            "aliases": [
+                {
+                    "head": {
+                        field: value
+                        for field, value in state["headBindings"][
+                            "aliases"
+                        ][key].items()
+                        if field in {"headKey", "generation", "knowledgeId"}
+                    },
+                    "knowledgeId": key[0],
+                    "groupIndex": key[1],
+                    "group": copy.deepcopy(dict(state["aliases"][key][1])),
+                    "artifactSha256": state["aliases"][key][0][
+                        "artifactSha256"
+                    ],
+                }
+                for key in sorted(state["headBindings"]["aliases"])
+            ],
+        }
+        state["knowledgeContentSha256"] = _canonical_sha256(global_semantics)
         return state
 
     @staticmethod
@@ -2299,8 +5720,26 @@ class ReplayProjectService:
             candidates.extend(index["raw"].get(raw_key, []))
         if code_key is not None:
             candidates.extend(index["code"].get(code_key, []))
+        target_api_value = str(
+            shader.get("_projectApi", shader.get("api", "")) or ""
+        )
+        target_encoding_value = str(shader.get("encoding", "") or "")
+        target_api = _reuse_api_family(target_api_value) if target_api_value else ""
+        target_encoding = (
+            _shader_encoding(target_encoding_value)
+            if target_encoding_value
+            else ""
+        )
         unique: dict[str, Mapping[str, Any]] = {}
         for candidate in candidates:
+            if (
+                (target_api and _reuse_api_family(candidate.get("api")) != target_api)
+                or (
+                    target_encoding
+                    and candidate.get("encoding") != target_encoding
+                )
+            ):
+                continue
             unique.setdefault(str(candidate["token"]), candidate)
         result: list[tuple[dict[str, Any], str]] = []
         for candidate in sorted(unique.values(), key=lambda item: item["ordinal"]):
@@ -2316,22 +5755,26 @@ class ReplayProjectService:
     ) -> list[dict[str, Any]]:
         mappings: list[dict[str, Any]] = []
         for shader in capture["shaders"]:
+            target_shader = {
+                **dict(shader),
+                "_projectApi": capture.get("api", ""),
+            }
             workspace_refs = [
                 {**reference, "matchMode": mode}
                 for reference, mode in self._indexed_reuse_matches(
-                    state["indexes"]["workspaces"], shader
+                    state["indexes"]["workspaces"], target_shader
                 )
             ]
             alias_refs = [
                 {**reference, "matchMode": mode}
                 for reference, mode in self._indexed_reuse_matches(
-                    state["indexes"]["aliases"], shader
+                    state["indexes"]["aliases"], target_shader
                 )
             ]
             material_refs = [
                 {**reference, "matchMode": mode}
                 for reference, mode in self._indexed_reuse_matches(
-                    state["indexes"]["materials"], shader
+                    state["indexes"]["materials"], target_shader
                 )
             ]
             if workspace_refs or alias_refs or material_refs:
@@ -2351,6 +5794,18 @@ class ReplayProjectService:
         """Bind an RDC only to exact knowledge referenced by this capture."""
 
         mappings = self._build_reuse_mappings(capture, state)
+        return self._referenced_knowledge_scope_from_mappings(
+            capture, state, mappings
+        )
+
+    def _referenced_knowledge_scope_from_mappings(
+        self,
+        capture: Mapping[str, Any],
+        state: Mapping[str, Any],
+        mappings: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Hash exactly the already-authorized mapping set for one target."""
+
         workspace_ids: set[str] = set()
         material_ids: set[str] = set()
         alias_keys: set[tuple[str, int]] = set()
@@ -2444,33 +5899,66 @@ class ReplayProjectService:
             ),
             "matcherPolicySha256": REUSE_MATCH_POLICY_SHA256,
             "workspaces": [
-                copy.deepcopy(dict(state["workspaces"][knowledge_id]))
+                self._semantic_knowledge_record(
+                    "workspaces", state["workspaces"][knowledge_id]
+                )
                 for knowledge_id in ordered_workspace_ids
             ],
             "aliases": aliases,
             "materials": [
-                copy.deepcopy(dict(state["materials"][knowledge_id]))
+                self._semantic_knowledge_record(
+                    "materials", state["materials"][knowledge_id]
+                )
                 for knowledge_id in ordered_material_ids
             ],
-            # Scope the activation authority to records physically reusable by
-            # this capture. Unrelated project edits remain cache-stable, while
-            # reactivating an existing referenced record invalidates the RDC
-            # hint even though immutable history is unchanged.
-            "activeKnowledge": {
-                "workspaces": {
-                    knowledge_id: state["activation"]["workspaces"][knowledge_id]
+            # Bind only the referenced authoritative heads. publishedAt,
+            # registeredAt, inventory observations, the legacy global serial,
+            # inactive history, and unrelated heads are audit/routing data and
+            # cannot perturb this semantic restore digest.
+            "activeHeads": {
+                "workspaces": [
+                    {
+                        key: value
+                        for key, value in state["headBindings"][
+                            "workspaces"
+                        ][knowledge_id].items()
+                        if key in {"headKey", "generation", "knowledgeId"}
+                    }
                     for knowledge_id in ordered_workspace_ids
-                },
-                "materials": {
-                    knowledge_id: state["activation"]["materials"][knowledge_id]
+                ],
+                "materials": [
+                    {
+                        key: value
+                        for key, value in state["headBindings"][
+                            "materials"
+                        ][knowledge_id].items()
+                        if key in {"headKey", "generation", "knowledgeId"}
+                    }
                     for knowledge_id in ordered_material_ids
-                },
+                ],
+                "aliases": [
+                    {
+                        key: value
+                        for key, value in state["headBindings"]["aliases"][
+                            (knowledge_id, group_index)
+                        ].items()
+                        if key in {"headKey", "generation", "knowledgeId"}
+                    }
+                    for knowledge_id, group_index in sorted(alias_keys)
+                ],
             },
         }
         return {
             "knowledgeContentSha256": _canonical_sha256(digest_document),
             "workspaceIds": ordered_workspace_ids,
             "materialIds": ordered_material_ids,
+            "aliasRefs": tuple(
+                {
+                    "knowledgeId": knowledge_id,
+                    "groupIndex": group_index,
+                }
+                for knowledge_id, group_index in sorted(alias_keys)
+            ),
         }
 
     def _reuse_plan_from_mappings(
@@ -2542,11 +6030,74 @@ class ReplayProjectService:
                         "reuse cache workspace reference failed exact matching"
                     )
                 seed_eligible = bool(workspace.get("baselineAbiSha256"))
+                binary_candidate = workspace.get("compiledCandidate")
+                compiler_binding = workspace.get("compilerBinding")
+                compiler_binding_identity = (
+                    _compiler_binding_identity(compiler_binding)
+                    if compiler_binding is not None
+                    else None
+                )
+                binary_identity: dict[str, Any] | None = None
+                binary_plan: dict[str, Any] | None = None
+                if (
+                    binary_candidate is not None
+                    and compiler_binding_identity is not None
+                ):
+                    binary_identity = _compiled_candidate_identity(binary_candidate)
+                    binary_artifact = self._artifact(
+                        binary_candidate.get("artifactPath"),
+                        "workspace compiled candidate",
+                    )
+                    binary_bytes = _file_bytes(
+                        binary_artifact,
+                        MAX_COMPILED_CANDIDATE_BYTES,
+                        "workspace compiled candidate",
+                    )
+                    if (
+                        len(binary_bytes) != binary_identity["byteSize"]
+                        or _sha256_bytes(binary_bytes)
+                        != binary_identity["rawSha256"]
+                    ):
+                        raise ReplayProjectError(
+                            "workspace compiled candidate changed during reuse planning"
+                        )
+                    binary_plan = {
+                        "schema": binary_identity["schema"],
+                        "schemaVersion": binary_identity["schemaVersion"],
+                        "artifactPath": str(binary_artifact),
+                        "sha256": binary_identity["rawSha256"],
+                        "codeSha256": binary_identity["codeSha256"],
+                        "byteSize": binary_identity["byteSize"],
+                        "kind": binary_identity["kind"],
+                        "sourceSha256": binary_identity["sourceSha256"],
+                        "sourceRevision": binary_identity["sourceRevision"],
+                        "targetProfile": copy.deepcopy(
+                            binary_identity["targetProfile"]
+                        ),
+                        "compilerBindingSha256": compiler_binding_identity[
+                            "bindingSha256"
+                        ],
+                        "candidateOnly": True,
+                        "contentAddressed": True,
+                        "integrityVerified": True,
+                        "originValidationEvidenceOnly": True,
+                        "applyAuthorization": False,
+                        "freshCaptureRebindRequired": True,
+                        "freshLiveAbiRevalidationRequired": True,
+                        "oldReplacementIdReused": False,
+                        "oldCaptureAbiAuthorityReused": False,
+                    }
                 candidate = {
                     "knowledgeId": knowledge_id,
                     "matchMode": mode,
                     "sourceSha256": workspace["sourceSha256"],
                     "sourceSeedEligible": seed_eligible,
+                    "binaryCandidateEligible": bool(
+                        seed_eligible and binary_plan is not None
+                    ),
+                    "binaryCandidate": (
+                        binary_plan if seed_eligible else None
+                    ),
                     "analysisCandidate": (
                         {
                             "path": str(
@@ -2568,12 +6119,22 @@ class ReplayProjectService:
                     candidate["blockedReason"] = (
                         "origin workspace has no complete captured baseline ABI"
                     )
-                activation = state["activation"]["workspaces"].get(knowledge_id)
-                if not isinstance(activation, int) or activation <= 0:
-                    raise ReplayProjectError(
-                        "workspace knowledge activation is invalid"
+                elif (
+                    binary_candidate is not None
+                    and compiler_binding_identity is None
+                ):
+                    candidate["binaryBlockedReason"] = (
+                        "origin compiled candidate has no verified compiler/flags binding"
                     )
-                workspace_candidates.append((activation, candidate))
+                head = state["headBindings"]["workspaces"].get(knowledge_id)
+                if not isinstance(head, Mapping):
+                    raise ReplayProjectError(
+                        "workspace knowledge is not an active head"
+                    )
+                candidate["supersededCandidateCount"] = (
+                    head["historyCount"] - 1
+                )
+                workspace_candidates.append((head["generation"], candidate))
 
             if workspace_candidates:
                 # Knowledge remains append-only, but automatic restore consumes
@@ -2590,14 +6151,13 @@ class ReplayProjectService:
                     key=lambda entry: (entry[0], entry[1]["knowledgeId"]),
                 )
                 active_workspace["activeCandidate"] = True
-                active_workspace["supersededCandidateCount"] = (
-                    len(workspace_candidates) - 1
-                )
                 item["workspaceCandidates"] = [active_workspace]
 
             alias_refs = raw_mapping["aliases"]
             if not isinstance(alias_refs, list) or len(alias_refs) > MAX_ALIASES:
                 raise ReplayProjectError("reuse cache alias references are invalid")
+            from .project_alias_rebind import alias_candidate_binding_sha256
+
             seen_alias: set[tuple[str, int]] = set()
             for reference in alias_refs:
                 if not isinstance(reference, Mapping) or set(reference) != {
@@ -2624,14 +6184,32 @@ class ReplayProjectService:
                 aliases = group.get("aliases")
                 if not isinstance(aliases, list) or len(aliases) > MAX_ALIASES:
                     raise ReplayProjectError("alias knowledge bindings are invalid")
-                item["aliasCandidates"].append(
-                    {
-                        "knowledgeId": knowledge_id,
-                        "matchMode": mode,
-                        "aliasCount": len(aliases),
-                        "candidateOnly": True,
-                    }
+                if not isinstance(
+                    state["headBindings"]["aliases"].get(alias_key), Mapping
+                ):
+                    raise ReplayProjectError("alias knowledge is not an active head")
+                # Bind the candidate to this exact project/catalog/target
+                # Shader.  The materializer re-computes this seal from
+                # hash-verified project artifacts; it is an integrity check,
+                # not an authorization to mutate live replay state.
+                candidate = {
+                    "knowledgeId": knowledge_id,
+                    "groupIndex": group_index,
+                    "matchMode": mode,
+                    "aliasCount": len(aliases),
+                    "candidateOnly": True,
+                }
+                candidate["bindingSha256"] = alias_candidate_binding_sha256(
+                    project_id=manifest["projectId"],
+                    capture_id=capture["captureId"],
+                    catalog_sha256=capture["catalogSha256"],
+                    target_shader=shader,
+                    knowledge_id=knowledge_id,
+                    group_index=group_index,
+                    match_mode=mode,
+                    alias_count=len(aliases),
                 )
+                item["aliasCandidates"].append(candidate)
 
             material_refs = raw_mapping["materials"]
             if not isinstance(material_refs, list) or len(material_refs) > MAX_KNOWLEDGE_COUNT:
@@ -2662,12 +6240,12 @@ class ReplayProjectService:
                     "material constantBlockPath",
                     2048,
                 )
-                activation = state["activation"]["materials"].get(knowledge_id)
-                if not isinstance(activation, int) or activation <= 0:
-                    raise ReplayProjectError("material knowledge activation is invalid")
+                head = state["headBindings"]["materials"].get(knowledge_id)
+                if not isinstance(head, Mapping):
+                    raise ReplayProjectError("material knowledge is not an active head")
                 material_candidates.setdefault(block_path, []).append(
                     (
-                        activation,
+                        head["generation"],
                         {
                             "knowledgeId": knowledge_id,
                             "matchMode": mode,
@@ -2677,6 +6255,7 @@ class ReplayProjectService:
                                 "constantBlockLayoutSha256"
                             ],
                             "materialLayoutLiveRevalidationRequired": True,
+                            "supersededCandidateCount": head["historyCount"] - 1,
                         },
                     )
                 )
@@ -2687,7 +6266,6 @@ class ReplayProjectService:
                     key=lambda entry: (entry[0], entry[1]["knowledgeId"]),
                 )
                 active_material["activeCandidate"] = True
-                active_material["supersededCandidateCount"] = len(history) - 1
                 item["materialCandidates"].append(active_material)
             results.append(item)
 
@@ -2708,8 +6286,16 @@ class ReplayProjectService:
                 "oldMaterialSessionReused": False,
                 "autoApplyAuthorized": False,
                 "compileRequiredAfterSourceSeed": True,
+                "verifiedBinaryCandidateMaySkipCompile": True,
+                "binaryCandidateRequiresFreshCaptureRebind": True,
+                "binaryCandidateRequiresFreshLiveAbiRevalidation": True,
+                "oldCompiledCandidateAbiAuthorityReused": False,
+                "oldReplacementIdReused": False,
                 "liveAbiRevalidationRequiredBeforeShaderApply": True,
                 "liveMaterialLayoutRevalidationRequired": True,
+                "aliasCandidateDirectLoadAuthorized": False,
+                "aliasCandidateMaterializationRequired": True,
+                "materializedDisplayAliasAutoLoadAuthorized": True,
                 "appendOnlyKnowledgeHistoryPreserved": True,
                 "newestValidActiveHeadOnly": True,
             },
@@ -2867,10 +6453,716 @@ class ReplayProjectService:
     def reuse_plan(
         self, capture_id: str, catalog_sha256: str = ""
     ) -> dict[str, Any]:
-        manifest = self._load()
-        return self._reuse_plan(
+        with _thread_lock(self.root), _project_lock(self.root):
+            manifest = self._load(persist_migrations=True)
+            return self._reuse_plan(
+                manifest,
+                self._capture(manifest, capture_id, catalog_sha256),
+            )
+
+    @staticmethod
+    def _capture_from_shader_inventory(
+        inventory: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        capture = inventory["capture"]
+        return {
+            "captureId": capture["captureId"],
+            "catalogSha256": capture["inventorySha256"],
+            "api": capture["api"],
+            "inventoryOnly": True,
+            "shaders": [
+                {
+                    "resourceId": shader["resourceId"],
+                    "stage": shader["stage"],
+                    "entryPoint": shader["entryPoint"],
+                    "rawSha256": shader["rawSha256"],
+                    # The normalized inventory intentionally carries no fuzzy
+                    # executable-only key. Project code reuse is raw-container
+                    # exact and then stable-key exact.
+                    "codeSha256": "",
+                    "interfaceHash": shader["interfaceHash"],
+                    "layoutHash": shader["layoutHash"],
+                    "interfaceComplete": shader["interfaceComplete"],
+                    "api": shader["api"],
+                    "encoding": shader["encoding"],
+                    "abiHash": shader["abiHash"],
+                    "stableKeySha256": shader["stableKeySha256"],
+                    "anchorEventId": shader["anchorEventId"],
+                    "constantBlocks": copy.deepcopy(shader["constantBlocks"]),
+                }
+                for shader in inventory["shaders"]
+            ],
+        }
+
+    @staticmethod
+    def _workspace_inventory_stable_identity(
+        record: Mapping[str, Any],
+        provenance_index: Mapping[tuple[str, str], Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        inventory_origin = record.get("inventoryOrigin")
+        if inventory_origin is not None:
+            origin = _inventory_origin_identity(inventory_origin)
+            if any(
+                (
+                    origin["rawSha256"] != record.get("rawSha256"),
+                    origin["stage"] != record.get("stage"),
+                    origin["entryPoint"] != record.get("entryPoint", ""),
+                    origin["abiHash"] != record.get("baselineAbiSha256", ""),
+                    origin["layoutHash"] != record.get("layoutHash", ""),
+                )
+            ):
+                raise ReplayProjectError(
+                    "workspace inventory origin differs from knowledge identity"
+                )
+            identity = {
+                key: origin[key]
+                for key in (
+                    "api",
+                    "encoding",
+                    "rawSha256",
+                    "stage",
+                    "entryPoint",
+                    "abiHash",
+                    "layoutHash",
+                )
+            }
+            identity["api"] = _reuse_api_family(identity["api"])
+            return {**identity, "stableKeySha256": _stable_shader_identity_sha256(identity)}
+        provenance = provenance_index.get(
+            (
+                _sha(record.get("captureId"), "workspace.captureId"),
+                _sha(
+                    record.get("originCatalogSha256"),
+                    "workspace.originCatalogSha256",
+                ),
+            )
+        )
+        candidates = (
+            provenance.get("shaders", {}).get(
+                (
+                    _text(str(record.get("stage", "")), "workspace.stage", 64),
+                    _text(
+                        str(record.get("entryPoint", "") or ""),
+                        "workspace.entryPoint",
+                        512,
+                        allow_empty=True,
+                    ),
+                    _sha(record.get("rawSha256"), "workspace.rawSha256"),
+                ),
+                [],
+            )
+            if isinstance(provenance, Mapping)
+            else []
+        )
+        if not candidates:
+            raise ReplayProjectError(
+                "workspace inventory identity has no exact origin Shader"
+            )
+        identities: dict[str, dict[str, Any]] = {}
+        origin_capture = provenance.get("capture")
+        if not isinstance(origin_capture, Mapping):
+            raise ReplayProjectError("workspace inventory origin capture is invalid")
+        for shader in candidates:
+            if not isinstance(shader, Mapping):
+                raise ReplayProjectError("workspace inventory origin Shader is invalid")
+            identity = {
+                "api": _reuse_api_family(origin_capture.get("api")),
+                "encoding": _shader_encoding(shader.get("encoding")),
+                "rawSha256": _sha(
+                    record.get("rawSha256"), "workspace.rawSha256"
+                ),
+                "stage": _normalised_stage(record.get("stage")),
+                "entryPoint": _text(
+                    str(record.get("entryPoint", "") or ""),
+                    "workspace.entryPoint",
+                    512,
+                    allow_empty=True,
+                ),
+                "abiHash": _sha(
+                    record.get("baselineAbiSha256"),
+                    "workspace.baselineAbiSha256",
+                    allow_empty=True,
+                ),
+                "layoutHash": _sha(
+                    record.get("layoutHash"),
+                    "workspace.layoutHash",
+                    allow_empty=True,
+                ),
+            }
+            identities[_stable_shader_identity_sha256(identity)] = identity
+        if len(identities) != 1:
+            raise ReplayProjectError(
+                "workspace origin Shaders have ambiguous stable identities"
+            )
+        identity = next(iter(identities.values()))
+        return {
+            **identity,
+            "stableKeySha256": _stable_shader_identity_sha256(identity),
+        }
+
+    def _inventory_reuse_mappings(
+        self,
+        manifest: Mapping[str, Any],
+        capture: Mapping[str, Any],
+        inventory: Mapping[str, Any],
+        state: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        mappings = self._build_reuse_mappings(capture, state)
+        def inventory_target_key(shader: Mapping[str, Any]) -> tuple[Any, ...]:
+            return (
+                shader.get("resourceId"),
+                shader.get("stage"),
+                shader.get("entryPoint", ""),
+                shader.get("rawSha256", ""),
+                shader.get("interfaceHash", ""),
+                shader.get("layoutHash", ""),
+            )
+
+        inventory_by_target: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+        for shader in inventory["shaders"]:
+            key = inventory_target_key(shader)
+            if key in inventory_by_target:
+                raise ReplayProjectError(
+                    "inventory contains an ambiguous resource/entry target"
+                )
+            inventory_by_target[key] = shader
+        provenance_index = self._restore_provenance_index(manifest)
+        filtered: list[dict[str, Any]] = []
+        for raw_mapping in mappings:
+            mapping = copy.deepcopy(dict(raw_mapping))
+            target = inventory_by_target.get(inventory_target_key(mapping["shader"]))
+            if target is None:
+                raise ReplayProjectError(
+                    "inventory reuse mapping selected an absent target Shader"
+                )
+            workspace_refs: list[dict[str, Any]] = []
+            for reference in mapping["workspaces"]:
+                record = state["workspaces"].get(reference.get("knowledgeId"))
+                if not isinstance(record, Mapping):
+                    raise ReplayProjectError(
+                        "inventory reuse mapping references absent workspace knowledge"
+                    )
+                # No code-only/fuzzy executable matching is permitted here.
+                # A reusable binary/source must bind to the exact normalized
+                # stable key, including API, encoding, ABI and layout.
+                origin_identity = self._workspace_inventory_stable_identity(
+                    record, provenance_index
+                )
+                if (
+                    reference.get("matchMode") == "raw-exact"
+                    and origin_identity["stableKeySha256"]
+                    == target["stableKeySha256"]
+                ):
+                    workspace_refs.append(dict(reference))
+            mapping["workspaces"] = workspace_refs
+            # Resource inventories are not event/value snapshots. Persisted
+            # material values stay on the explicit EID/live-session path.
+            mapping["materials"] = []
+            if workspace_refs or mapping["aliases"] or raw_mapping["workspaces"]:
+                # Preserve a known exact raw/API/encoding target even when its
+                # ABI/layout differs. An empty candidate list reports a skip;
+                # it never grants source or executable reuse eligibility.
+                filtered.append(mapping)
+        return filtered
+
+    def _inventory_knowledge_snapshot(
+        self,
+        manifest: Mapping[str, Any],
+        capture: Mapping[str, Any],
+        inventory: Mapping[str, Any],
+        state: Mapping[str, Any],
+        restore_scope: Mapping[str, Any],
+        plan: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        provenance_index = self._restore_provenance_index(manifest)
+        workspaces: dict[str, dict[str, Any]] = {}
+        aliases: list[dict[str, Any]] = []
+        materials: dict[str, dict[str, Any]] = {}
+        artifact_refs: list[dict[str, Any]] = []
+
+        alias_refs_by_workspace: dict[str, set[tuple[str, int]]] = {}
+        binary_knowledge_ids: set[str] = set()
+        for match in plan["matches"]:
+            refs = {
+                (str(item["knowledgeId"]), int(item["groupIndex"]))
+                for item in match["aliasCandidates"]
+            }
+            for candidate in match["workspaceCandidates"]:
+                if candidate.get("binaryCandidateEligible") is True:
+                    binary_knowledge_ids.add(str(candidate["knowledgeId"]))
+                alias_refs_by_workspace.setdefault(
+                    str(candidate["knowledgeId"]), set()
+                ).update(refs)
+
+        for knowledge_id in restore_scope["workspaceIds"]:
+            record = self._workspace_knowledge_from_manifest(
+                manifest,
+                knowledge_id,
+                record=state["workspaces"][knowledge_id],
+                source_artifact_verified=True,
+                provenance_index=provenance_index,
+            )
+            source_path = self._artifact(record["sourcePath"], "workspace source")
+            source_bytes = _file_bytes(
+                source_path, MAX_SOURCE_BYTES, "workspace source"
+            )
+            stable_identity = self._workspace_inventory_stable_identity(
+                record, provenance_index
+            )
+            source_ref = {
+                "kind": "verified-hlsl",
+                "knowledgeId": knowledge_id,
+                "artifactPath": str(source_path),
+                "sha256": record["sourceSha256"],
+                "byteSize": len(source_bytes),
+            }
+            artifact_refs.append(source_ref)
+            compiled_plan: dict[str, Any] | None = None
+            compiler_binding = record.get("compilerBinding")
+            compiler_binding_identity = (
+                _compiler_binding_identity(compiler_binding)
+                if compiler_binding is not None
+                else None
+            )
+            if (
+                knowledge_id in binary_knowledge_ids
+                and record.get("compiledCandidate") is not None
+                and compiler_binding_identity is not None
+            ):
+                compiled = _compiled_candidate_identity(
+                    record["compiledCandidate"]
+                )
+                compiled_path = self._artifact(
+                    record["compiledCandidate"]["artifactPath"],
+                    "workspace compiled candidate",
+                )
+                compiled_bytes = _file_bytes(
+                    compiled_path,
+                    MAX_COMPILED_CANDIDATE_BYTES,
+                    "workspace compiled candidate",
+                )
+                compiled_plan = {
+                    "schema": compiled["schema"],
+                    "schemaVersion": compiled["schemaVersion"],
+                    "artifactPath": str(compiled_path),
+                    "sha256": compiled["rawSha256"],
+                    "codeSha256": compiled["codeSha256"],
+                    "byteSize": compiled["byteSize"],
+                    "kind": compiled["kind"],
+                    "sourceSha256": compiled["sourceSha256"],
+                    "sourceRevision": compiled["sourceRevision"],
+                    "targetProfile": copy.deepcopy(compiled["targetProfile"]),
+                    "compilerBindingSha256": compiler_binding_identity[
+                        "bindingSha256"
+                    ],
+                    "candidateOnly": True,
+                    "contentAddressed": True,
+                    "integrityVerified": True,
+                    "originValidationEvidenceOnly": True,
+                    "applyAuthorization": False,
+                    "freshCaptureRebindRequired": True,
+                    "freshLiveAbiRevalidationRequired": True,
+                    "oldReplacementIdReused": False,
+                    "oldCaptureAbiAuthorityReused": False,
+                }
+                artifact_refs.append(
+                    {
+                        "kind": "verified-compiled-candidate",
+                        "knowledgeId": knowledge_id,
+                        "artifactPath": str(compiled_path),
+                        "sha256": compiled["rawSha256"],
+                        "byteSize": len(compiled_bytes),
+                    }
+                )
+            analysis_ref = None
+            if record.get("analysisPath"):
+                analysis_path = self._artifact(
+                    record["analysisPath"], "workspace analysis"
+                )
+                analysis_bytes = _file_bytes(
+                    analysis_path, MAX_ANALYSIS_BYTES, "workspace analysis"
+                )
+                analysis_ref = {
+                    "kind": "explanatory-analysis",
+                    "knowledgeId": knowledge_id,
+                    "artifactPath": str(analysis_path),
+                    "sha256": record["analysisSha256"],
+                    "byteSize": len(analysis_bytes),
+                    "physicalEvidence": False,
+                    "applyAuthorization": False,
+                }
+                artifact_refs.append(analysis_ref)
+            portable_disassembly: list[dict[str, Any]] = []
+            for raw_disassembly in record.get(
+                "assemblyDisassemblyArtifacts", []
+            ):
+                disassembly = _assembly_disassembly_identity(raw_disassembly)
+                disassembly_path = self._artifact(
+                    raw_disassembly["artifactPath"],
+                    "workspace disassembly artifact",
+                )
+                disassembly_bytes = _file_bytes(
+                    disassembly_path,
+                    MAX_SOURCE_BYTES,
+                    "workspace disassembly artifact",
+                )
+                disassembly_ref = {
+                    "kind": "verified-%s" % disassembly["kind"],
+                    "knowledgeId": knowledge_id,
+                    "artifactPath": str(disassembly_path),
+                    "sha256": disassembly["sha256"],
+                    "byteSize": len(disassembly_bytes),
+                }
+                artifact_refs.append(disassembly_ref)
+                portable_disassembly.append(
+                    {**disassembly, "artifactPath": str(disassembly_path)}
+                )
+            workspaces[knowledge_id] = {
+                "schema": "renderdoc-ultra-project-shader-artifact/v1",
+                "schemaVersion": 1,
+                "knowledgeId": knowledge_id,
+                "source": source_ref,
+                "targetProfile": copy.deepcopy(record["targetProfile"]),
+                "physicalIdentity": stable_identity,
+                "interfaceHash": record["interfaceHash"],
+                "interfaceComplete": record["interfaceComplete"] is True,
+                "compiledCandidate": compiled_plan,
+                "compilerBinding": copy.deepcopy(
+                    record.get("compilerBinding")
+                ),
+                "assemblyDisassemblyArtifacts": portable_disassembly,
+                "analysis": analysis_ref,
+                "cbufferAliasRefs": [
+                    {"knowledgeId": alias_id, "groupIndex": group_index}
+                    for alias_id, group_index in sorted(
+                        alias_refs_by_workspace.get(knowledge_id, set())
+                    )
+                ],
+                "originResourceIdReused": False,
+                "originReplacementHandleReused": False,
+                "originSessionAuthorityReused": False,
+            }
+
+        for alias_ref in restore_scope.get("aliasRefs", ()):
+            key = (alias_ref["knowledgeId"], alias_ref["groupIndex"])
+            alias_set, group = state["aliases"][key]
+            alias_path = self._artifact(
+                alias_set["artifactPath"], "alias artifact"
+            )
+            alias_bytes = _file_bytes(alias_path, MAX_ALIAS_BYTES, "alias artifact")
+            artifact_ref = {
+                "kind": "verified-cbuffer-alias-table",
+                "knowledgeId": key[0],
+                "artifactPath": str(alias_path),
+                "sha256": alias_set["artifactSha256"],
+                "byteSize": len(alias_bytes),
+            }
+            if artifact_ref not in artifact_refs:
+                artifact_refs.append(artifact_ref)
+            aliases.append(
+                {
+                    "knowledgeId": key[0],
+                    "groupIndex": key[1],
+                    "group": copy.deepcopy(dict(group)),
+                    "artifact": artifact_ref,
+                    "displayAliasesOnly": True,
+                    "directLoadAuthorized": False,
+                    "targetReflectionMaterializationRequired": True,
+                }
+            )
+
+        for knowledge_id in restore_scope["materialIds"]:
+            materials[knowledge_id] = self._material_knowledge_from_manifest(
+                manifest,
+                knowledge_id,
+                record=state["materials"][knowledge_id],
+                provenance_index=provenance_index,
+            )
+
+        artifact_refs.sort(
+            key=lambda item: (
+                item["kind"], item["knowledgeId"], item["sha256"]
+            )
+        )
+        knowledge_ids = {
+            "workspaces": list(restore_scope["workspaceIds"]),
+            "aliases": [copy.deepcopy(dict(item)) for item in restore_scope.get("aliasRefs", ())],
+            "materials": list(restore_scope["materialIds"]),
+        }
+        scope_sha256 = _canonical_sha256(manifest["scope"])
+        binding: dict[str, Any] = {
+            "schema": SHADER_INVENTORY_BINDING_SCHEMA,
+            "schemaVersion": SHADER_INVENTORY_BINDING_VERSION,
+            "projectId": manifest["projectId"],
+            "scopeSha256": scope_sha256,
+            "captureId": capture["captureId"],
+            "catalogSha256": capture["catalogSha256"],
+            "inventorySha256": inventory["capture"]["inventorySha256"],
+            "knowledgeContentSha256": restore_scope["knowledgeContentSha256"],
+            "matcherPolicySha256": REUSE_MATCH_POLICY_SHA256,
+            "activeKnowledgeRevision": self._active_knowledge_state(manifest)[
+                "revision"
+            ],
+            "knowledgeIds": knowledge_ids,
+            "knowledgeIdsSha256": _canonical_sha256(knowledge_ids),
+            "artifactRefs": artifact_refs,
+            "artifactRefsSha256": _canonical_sha256(artifact_refs),
+        }
+        binding["bindingSha256"] = _canonical_sha256(binding)
+        knowledge = {
+            "workspaces": workspaces,
+            "aliases": aliases,
+            "materials": materials,
+        }
+        snapshot_material = {
+            "binding": binding,
+            "knowledge": knowledge,
+        }
+        return {
+            "binding": binding,
+            "knowledge": knowledge,
+            "snapshotSha256": _canonical_sha256(snapshot_material),
+        }
+
+    def _reuse_snapshot_for_normalized_inventory(
+        self,
+        manifest: Mapping[str, Any],
+        inventory: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        capture = self._capture_from_shader_inventory(inventory)
+        state = self._reuse_knowledge_state(manifest)
+        mappings = self._inventory_reuse_mappings(
+            manifest, capture, inventory, state
+        )
+        plan = self._reuse_plan_from_mappings(
+            manifest, capture, state, mappings
+        )
+        for match in plan["matches"]:
+            if (not match["workspaceCandidates"] and
+                    self._indexed_reuse_matches(state["indexes"]["workspaces"], match["shader"])):
+                match["sourcePreparationBlockedReason"] = "project-shader-stable-identity-mismatch"
+            anchor_available = match["shader"].get("anchorEventId") is not None
+            match["targetStableKeySha256"] = match["shader"][
+                "stableKeySha256"
+            ]
+            match["targetAnchorAvailable"] = anchor_available
+            for candidate in match["workspaceCandidates"]:
+                origin = state["workspaces"][candidate["knowledgeId"]]
+                source_preparation_only = (
+                    origin.get("interfaceComplete") is not True
+                    or match["shader"].get("interfaceComplete") is not True
+                )
+                candidate["sourcePreparationOnly"] = source_preparation_only
+                if source_preparation_only:
+                    # Exact raw/API/encoding/ABI/layout identifies a source
+                    # input. Incomplete interface evidence cannot route an old
+                    # binary; a new workspace must compile and validate live.
+                    candidate["binaryCandidateEligible"] = False
+                    candidate["binaryCandidate"] = None
+                    candidate["binaryBlockedReason"] = "fresh compile required for incomplete interface evidence"
+                candidate["targetAnchorAvailable"] = anchor_available
+                candidate["targetAnchorRequiredBeforeExecutableApply"] = True
+                candidate["binaryExecutableAutoApplyEligible"] = False
+        plan["inventory"] = copy.deepcopy(inventory["capture"])
+        plan["policy"].update(
+            {
+                "inventoryOnly": True,
+                "fuzzyExecutableMatchAllowed": False,
+                "stableKeyExactRequiredForSourceOrBinary": True,
+                "rawExactSourcePreparationAllowed": True,
+                "stableKeyExactRequiredForBinary": True,
+                "targetAnchorRequiredBeforeExecutableApply": True,
+                "binaryExecutableAutoApplyAuthorized": False,
+                "inventoryMaterialValueReuseAllowed": False,
+            }
+        )
+        restore_scope = self._referenced_knowledge_scope_from_mappings(
+            capture, state, mappings
+        )
+        snapshot = self._inventory_knowledge_snapshot(
             manifest,
-            self._capture(manifest, capture_id, catalog_sha256),
+            capture,
+            inventory,
+            state,
+            restore_scope,
+            plan,
+        )
+        return {
+            "schema": SHADER_INVENTORY_REUSE_SCHEMA,
+            "schemaVersion": SHADER_INVENTORY_REUSE_VERSION,
+            "projectId": manifest["projectId"],
+            "projectPath": str(self.root),
+            "inventory": copy.deepcopy(inventory),
+            "reusePlan": plan,
+            **snapshot,
+        }
+
+    def reuse_snapshot_for_shader_inventory(
+        self, inventory: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Match and snapshot project knowledge without importing an EID catalog."""
+
+        normalized = _normalise_shader_inventory(inventory)
+        with _thread_lock(self.root), _project_lock(self.root):
+            manifest = self._load(persist_migrations=True)
+            return self._reuse_snapshot_for_normalized_inventory(
+                manifest, normalized
+            )
+
+    def reuse_plan_for_shader_inventory(
+        self, inventory: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Return the plan half of one strict inventory snapshot."""
+
+        return self.reuse_snapshot_for_shader_inventory(inventory)["reusePlan"]
+
+    def restore_knowledge_snapshot_for_shader_inventory(
+        self,
+        inventory: Mapping[str, Any],
+        matched_knowledge_ids: Mapping[str, Any] | None = None,
+        expected_binding: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Revalidate a live-inventory snapshot and optional RDC cache binding."""
+
+        result = self.reuse_snapshot_for_shader_inventory(inventory)
+        binding = result["binding"]
+        if matched_knowledge_ids is not None:
+            if (
+                not isinstance(matched_knowledge_ids, Mapping)
+                or dict(matched_knowledge_ids) != binding["knowledgeIds"]
+            ):
+                raise ReplayProjectError(
+                    "shader inventory matched knowledge IDs changed"
+                )
+        if expected_binding is not None:
+            if not isinstance(expected_binding, Mapping) or dict(expected_binding) != binding:
+                raise ReplayProjectError(
+                    "shader inventory project binding is stale or changed"
+                )
+        return result
+
+    def validate_shader_inventory_snapshot(
+        self,
+        inventory: Mapping[str, Any],
+        binding: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Hash-verify an RDC cache hint against the current project revision."""
+
+        if not isinstance(binding, Mapping) or set(binding) != {
+            "schema",
+            "schemaVersion",
+            "projectId",
+            "scopeSha256",
+            "captureId",
+            "catalogSha256",
+            "inventorySha256",
+            "knowledgeContentSha256",
+            "matcherPolicySha256",
+            "activeKnowledgeRevision",
+            "knowledgeIds",
+            "knowledgeIdsSha256",
+            "artifactRefs",
+            "artifactRefsSha256",
+            "bindingSha256",
+        }:
+            raise ReplayProjectError("shader inventory binding fields are invalid")
+        unsigned = dict(binding)
+        declared_binding_sha256 = _sha(
+            unsigned.pop("bindingSha256"), "shader inventory bindingSha256"
+        )
+        if (
+            binding.get("schema") != SHADER_INVENTORY_BINDING_SCHEMA
+            or binding.get("schemaVersion") != SHADER_INVENTORY_BINDING_VERSION
+            or _canonical_sha256(unsigned) != declared_binding_sha256
+        ):
+            raise ReplayProjectError("shader inventory binding seal is invalid")
+        return self.restore_knowledge_snapshot_for_shader_inventory(
+            inventory,
+            binding.get("knowledgeIds"),
+            binding,
+        )
+
+    def materialize_alias_candidates(
+        self,
+        project_id: str,
+        capture_id: str,
+        catalog_sha256: str,
+        target_shader: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Rebind project display aliases to one exact target catalog Shader.
+
+        The returned ``jsonBytes`` are ready to be atomically written and
+        passed to qrenderdoc's ``load_symbol_aliases`` with the returned
+        ``sha256``.  This method never applies aliases or reuses source capture
+        ResourceIds, sessions, replacements, or raw CBuffer values.
+        """
+
+        from .project_alias_rebind import materialize_alias_candidates
+
+        return materialize_alias_candidates(
+            self,
+            project_id,
+            capture_id,
+            catalog_sha256,
+            target_shader,
+            candidates,
+        )
+
+    def materialize_alias_batch(
+        self,
+        project_id: str,
+        capture_id: str,
+        catalog_sha256: str,
+        targets: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Rebind all aliases for one restore from one project snapshot."""
+
+        from .project_alias_rebind import materialize_alias_batch
+
+        return materialize_alias_batch(
+            self,
+            project_id,
+            capture_id,
+            catalog_sha256,
+            targets,
+        )
+
+    def materialize_alias_batch_from_inventory(
+        self,
+        project_id: str,
+        inventory: Mapping[str, Any],
+        expected_binding: Mapping[str, Any],
+        targets: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Rebind display aliases using only strict live inventory reflection."""
+
+        from .project_alias_rebind import materialize_alias_batch_from_inventory
+
+        return materialize_alias_batch_from_inventory(
+            self,
+            project_id,
+            inventory,
+            expected_binding,
+            targets,
+        )
+
+    def materialize_alias_candidate(
+        self,
+        project_id: str,
+        capture_id: str,
+        catalog_sha256: str,
+        target_shader: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Compatibility wrapper for a single unambiguous alias candidate."""
+
+        return self.materialize_alias_candidates(
+            project_id,
+            capture_id,
+            catalog_sha256,
+            target_shader,
+            [candidate],
         )
 
     def seed_workspace(self, knowledge_id: str, destination_status: Mapping[str, Any]) -> dict[str, Any]:
@@ -2901,7 +7193,7 @@ class ReplayProjectService:
             capture_status
         )
         with _thread_lock(self.root), _project_lock(self.root):
-            manifest = self._load()
+            manifest = self._load(persist_migrations=True)
             records = [item for item in manifest["knowledge"]["workspaces"] if item["knowledgeId"] == token]
             if len(records) != 1:
                 raise ReplayProjectError("unknown project workspace knowledge ID")
@@ -2967,4 +7259,197 @@ class ReplayProjectService:
                 "compiled": False,
                 "requiresCompile": True,
                 "requiresLiveAbiRevalidation": True,
+            }
+
+    def seed_workspace_from_inventory(
+        self,
+        knowledge_id: str,
+        destination_status: Mapping[str, Any],
+        target_shader: Mapping[str, Any],
+        inventory: Mapping[str, Any],
+        expected_binding: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Seed only verified HLSL using a fresh resource inventory.
+
+        This path intentionally does not require the target RDC to be imported
+        as a full one-EID catalog.  The current target ResourceId, profile,
+        baseline ABI, container kind and stable key are all revalidated before
+        the source file is replaced.  No binary is applied here.
+        """
+
+        token = str(knowledge_id or "").strip().lower()
+        if not HEX32_RE.fullmatch(token):
+            raise ReplayProjectError(
+                "knowledge_id must be 32 lowercase hexadecimal characters"
+            )
+        normalized = _normalise_shader_inventory(inventory)
+        if not isinstance(target_shader, Mapping):
+            raise ReplayProjectError("target inventory Shader is invalid")
+        exact_targets = [
+            shader
+            for shader in normalized["shaders"]
+            if dict(target_shader) == shader
+        ]
+        if len(exact_targets) != 1:
+            raise ReplayProjectError(
+                "target Shader is not one exact normalized inventory record"
+            )
+        target = exact_targets[0]
+        if (
+            not isinstance(destination_status, Mapping)
+            or destination_status.get("schema")
+            != "renderdoc-ultra-shader-workspace-status/v1"
+        ):
+            raise ReplayProjectError("destination workspace status is invalid")
+        source_status = destination_status.get("source")
+        baseline = destination_status.get("baseline")
+        capture_status = destination_status.get("capture")
+        shader_status = destination_status.get("shader")
+        if not all(
+            isinstance(value, Mapping)
+            for value in (source_status, baseline, capture_status, shader_status)
+        ):
+            raise ReplayProjectError("destination workspace provenance is incomplete")
+        if (
+            source_status.get("present") is not True
+            or source_status.get("modifiedSinceDecompile") is not False
+            or source_status.get("lane") != "executable-editable"
+            or source_status.get("format") != "hlsl"
+        ):
+            raise ReplayProjectError(
+                "destination must contain unmodified executable-editable HLSL"
+            )
+        if _positive(
+            shader_status.get("resourceId"), "destination.resourceId"
+        ) != target["resourceId"]:
+            raise ReplayProjectError(
+                "destination uses a different fresh target ResourceId"
+            )
+        if (
+            _normalised_stage(destination_status.get("stage")) != target["stage"]
+            or _text(
+                str(destination_status.get("entryPoint", "") or ""),
+                "destination.entryPoint",
+                512,
+                allow_empty=True,
+            )
+            != target["entryPoint"]
+            or _sha(baseline.get("rawSha256"), "destination.rawSha256")
+            != target["rawSha256"]
+            or _sha(
+                baseline.get("abiSha256"),
+                "destination.abiSha256",
+                allow_empty=True,
+            )
+            != target["abiHash"]
+            or _shader_encoding(baseline.get("kind")) != target["encoding"]
+        ):
+            raise ReplayProjectError(
+                "destination physical Shader identity differs from inventory"
+            )
+        capture_api = str(capture_status.get("api", "") or "")
+        if capture_api and _reuse_api_family(capture_api) != _reuse_api_family(target["api"]):
+            raise ReplayProjectError("destination capture API differs from inventory")
+
+        with _thread_lock(self.root), _project_lock(self.root):
+            manifest = self._load(persist_migrations=True)
+            snapshot = self._reuse_snapshot_for_normalized_inventory(
+                manifest, normalized
+            )
+            if expected_binding is not None and (
+                not isinstance(expected_binding, Mapping)
+                or dict(expected_binding) != snapshot["binding"]
+            ):
+                raise ReplayProjectError(
+                    "shader inventory project binding is stale or changed"
+                )
+            if token not in snapshot["binding"]["knowledgeIds"]["workspaces"]:
+                raise ReplayProjectError(
+                    "workspace knowledge is not matched by this inventory"
+                )
+            records = [
+                item
+                for item in manifest["knowledge"]["workspaces"]
+                if item.get("knowledgeId") == token
+            ]
+            if len(records) != 1:
+                raise ReplayProjectError("unknown project workspace knowledge ID")
+            knowledge = records[0]
+            provenance_index = self._restore_provenance_index(manifest)
+            origin_identity = self._workspace_inventory_stable_identity(
+                knowledge, provenance_index
+            )
+            if origin_identity["stableKeySha256"] != target["stableKeySha256"]:
+                raise ReplayProjectError(
+                    "project knowledge stable key differs from target Shader"
+                )
+            if (
+                knowledge.get("targetProfile")
+                != destination_status.get("targetProfile")
+                or not knowledge.get("baselineAbiSha256")
+                or knowledge.get("baselineAbiSha256") != target["abiHash"]
+            ):
+                raise ReplayProjectError(
+                    "destination target profile/ABI differs from project knowledge"
+                )
+            project_source = self._artifact(
+                knowledge["sourcePath"], "workspace source"
+            )
+            source_bytes = _file_bytes(
+                project_source, MAX_SOURCE_BYTES, "workspace source"
+            )
+            destination = _normal_path(str(source_status.get("path", "")))
+            workspace_root = _normal_path(
+                str(destination_status.get("workspacePath", ""))
+            )
+            if (
+                destination.is_symlink()
+                or not destination.is_file()
+                or not is_within(workspace_root, destination)
+            ):
+                raise ReplayProjectError(
+                    "destination source path is redirected or escapes its workspace"
+                )
+            expected_destination_hash = _sha(
+                source_status.get("currentSha256"),
+                "destination.source.currentSha256",
+            )
+            with _workspace_seed_lock(workspace_root):
+                if _sha256_bytes(
+                    _file_bytes(
+                        destination, MAX_SOURCE_BYTES, "destination source"
+                    )
+                ) != expected_destination_hash:
+                    raise ReplayProjectError(
+                        "destination source changed after workspace validation"
+                    )
+                atomic_write_bytes(destination, source_bytes)
+                if _sha256_bytes(
+                    _file_bytes(destination, MAX_SOURCE_BYTES, "seeded source")
+                ) != knowledge["sourceSha256"]:
+                    raise ReplayProjectError("seeded workspace source hash mismatch")
+            return {
+                "schema": "renderdoc-ultra-project-workspace-inventory-seed/v1",
+                "schemaVersion": 1,
+                "projectId": manifest["projectId"],
+                "captureId": normalized["capture"]["captureId"],
+                "catalogSha256": normalized["capture"]["inventorySha256"],
+                "knowledgeId": token,
+                "targetResourceId": target["resourceId"],
+                "targetStableKeySha256": target["stableKeySha256"],
+                "workspacePath": str(workspace_root),
+                "sourcePath": str(destination),
+                "sourceSha256": knowledge["sourceSha256"],
+                "matchMode": "raw-and-stable-key-exact",
+                "applied": False,
+                "compiled": False,
+                "requiresCompile": True,
+                "verifiedBinaryCandidateMaySkipCompile": bool(
+                    knowledge.get("compiledCandidate")
+                ),
+                "requiresFreshTargetResourceBind": True,
+                "requiresLiveAbiRevalidation": True,
+                "oldResourceIdReused": False,
+                "oldReplacementIdReused": False,
+                "oldCaptureSessionReused": False,
             }

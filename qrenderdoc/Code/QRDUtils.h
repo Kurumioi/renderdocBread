@@ -610,6 +610,9 @@ public:
   PanelMenu panel;
   rdcarray<rdcstr> submenus;
   IExtensionManager::ExtensionCallback callback;
+  // Built-in integrations reuse the extension callback ABI, but they are application-owned UI
+  // and must not inherit the visual identity of optional extensions.
+  bool showExtensionIcon = true;
 };
 
 class QFileFilterModel : public QSortFilterProxyModel

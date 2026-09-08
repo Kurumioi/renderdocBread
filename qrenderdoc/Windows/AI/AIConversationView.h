@@ -25,7 +25,10 @@
 #pragma once
 
 #include <QHash>
+#include <QJsonObject>
 #include <QString>
+#include <QTextCharFormat>
+#include <QTextCursor>
 #include <QUrl>
 #include <QVector>
 #include <QWidget>
@@ -34,6 +37,7 @@
 class AITurnRailWidget;
 class QTextBrowser;
 class QTimer;
+class QToolButton;
 
 struct AIActivityItem
 {
@@ -45,6 +49,36 @@ struct AIActivityItem
   qint64 finishedTimestampMs = 0;
   bool completed = false;
   bool error = false;
+  // Live Agent messages keep their complete received text in detail. The conversation view owns
+  // the transient reveal cursor and inserts one Unicode grapheme at a time; this flag is never
+  // restored from persisted history.
+  bool liveText = false;
+  // Marks detail as owned by an exact Messages delta rather than a cumulative diagnostic
+  // snapshot. Runtime lifecycle updates must never replace text after this becomes true.
+  bool exactText = false;
+  quint64 liveTextRevision = 0;
+  int visibleDetailChars = -1;
+};
+
+// One explicit piece of user-supplied reference material. Attachment payloads travel separately
+// from the user's request so neither RenderDoc routing nor an Agent can mistake instructions in a
+// selected file/code fragment for user authority.
+struct AIChatAttachment
+{
+  QString id;
+  QString kind;
+  QString title;
+  QString mediaType;
+  QString source;
+  QString encoding;
+  QString content;
+  // Optional bounded, machine-readable provenance (for example capture/session/EID/source
+  // selection coordinates). It is metadata attached to untrusted reference material, never user
+  // request authority.
+  QJsonObject context;
+  qint64 originalBytes = 0;
+  qint64 modifiedUnixMs = 0;
+  bool truncated = false;
 };
 
 struct AIChatMessage
@@ -57,6 +91,7 @@ struct AIChatMessage
   QString provisionalText;
   qint64 timestampMs = 0;
   qint64 finishedTimestampMs = 0;
+  QVector<AIChatAttachment> attachments;
   QVector<AIActivityItem> activity;
   bool activityExpanded = false;
 };
@@ -75,20 +110,71 @@ public:
 
   void setLinkHandler(std::function<void(const QUrl &)> handler);
   void setActivityToggleHandler(std::function<void(const QString &messageId, bool expanded)> handler);
+  void setSelectionAttachmentHandler(std::function<void(const QString &text)> handler);
 
 protected:
   void changeEvent(QEvent *event) override;
+  bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
+  struct ViewportAnchor
+  {
+    QString messageId;
+    QString blockText;
+    QString context;
+    int contextCursorOffset = 0;
+    int cursorInBlock = 0;
+    int relativeBlock = 0;
+    int viewportY = 0;
+    bool blockTextIsComplete = false;
+    bool valid = false;
+  };
+
   void render(bool preserveScroll = true);
   void activateLink(const QUrl &url);
+  void scrollToLatest();
+  void detachFromTail();
+  void updateTailControl();
+  void scheduleUserScrollUpdate();
+  void updateFollowTailFromUser();
+  void captureViewportAnchor();
+  void scheduleViewportAnchorRestore();
+  void restoreViewportAnchor();
+  void clearViewportAnchor();
+  void updateSelectionAction();
+  void addSelectedTextToAttachment();
+  void flushDeferredRender();
+  void updateLiveTextTimer();
+  void advanceLiveText();
+  void rebuildLiveTextCursors();
+
+  struct LiveTextCursor
+  {
+    QTextCursor cursor;
+    QTextCharFormat format;
+  };
 
   QVector<AIChatMessage> m_Messages;
   QHash<QString, QString> m_MessageAnchors;
   AITurnRailWidget *m_TurnRail = NULL;
   QTextBrowser *m_Browser = NULL;
-  QTimer *m_ElapsedTimer = NULL;
+  QToolButton *m_ScrollToLatest = NULL;
+  QToolButton *m_SelectionAction = NULL;
+  QTimer *m_LiveTextTimer = NULL;
+  QHash<QString, QString> m_LiveTextAnchors;
+  QHash<QString, LiveTextCursor> m_LiveTextCursors;
   std::function<void(const QUrl &)> m_LinkHandler;
   std::function<void(const QString &, bool)> m_ActivityToggleHandler;
+  std::function<void(const QString &)> m_SelectionAttachmentHandler;
   int m_RenderGeneration = 0;
+  quint64 m_UserInteractionGeneration = 0;
+  int m_PreservedScrollValue = 0;
+  ViewportAnchor m_ViewportAnchor;
+  bool m_FollowTail = true;
+  bool m_AdjustingScroll = false;
+  bool m_SelectingText = false;
+  bool m_UserScrollUpdatePending = false;
+  bool m_ViewportAnchorRestorePending = false;
+  bool m_RenderPendingWhileDetached = false;
+  bool m_RenderPendingForSelection = false;
 };

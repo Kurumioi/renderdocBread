@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
-import json
+import importlib.metadata
 from pathlib import Path
 
 import pytest
 
 from replaylab_agent import selftest
-from replaylab_agent.selftest import SelfTestItem, run_protocol_self_test
+from replaylab_agent.selftest import run_protocol_self_test
 
 
 EXPECTED_NAMES = [
@@ -69,34 +69,6 @@ def _self_test_token() -> str:
     return selftest._SELF_TEST_TOKEN  # noqa: SLF001 - verify exact secret redaction
 
 
-@pytest.mark.parametrize("config_state", ["missing", "malformed"])
-def test_cli_self_test_never_loads_profiles(
-    tmp_path: Path, monkeypatch, capsys, config_state: str
-) -> None:
-    import replaylab_agent.cli as cli
-
-    config = tmp_path / "profiles.json"
-    if config_state == "malformed":
-        config.write_text("{ definitely not profile JSON", encoding="utf-8")
-
-    def forbidden_store_load(path):
-        raise AssertionError(f"self-test tried to load profiles: {path}")
-
-    async def fixed_result(*, timeout: float):
-        assert timeout == 3.0
-        return [SelfTestItem(name, "ok", "offline") for name in EXPECTED_NAMES]
-
-    monkeypatch.setattr(cli, "_load_store", forbidden_store_load)
-    monkeypatch.setattr(selftest, "run_protocol_self_test", fixed_result)
-
-    assert cli.main(
-        ["--config", str(config), "self-test", "--timeout", "3", "--json"]
-    ) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert [item["name"] for item in payload] == EXPECTED_NAMES
-    assert all(set(item) == {"name", "status", "detail"} for item in payload)
-
-
 def test_self_test_child_environment_excludes_accounts_and_credentials(monkeypatch) -> None:
     monkeypatch.setenv("HOME", "forbidden-home")
     monkeypatch.setenv("CODEX_HOME", "forbidden-codex-home")
@@ -114,3 +86,18 @@ def test_self_test_child_environment_excludes_accounts_and_credentials(monkeypat
     assert environment["PYTHONPATH"] == str(
         Path(selftest.__file__).resolve().parents[1]
     )
+
+
+def test_packaging_smoke_verifies_actual_framework_version(monkeypatch, capsys) -> None:
+    original = importlib.metadata.version
+
+    def wrong_deepagents(name: str) -> str:
+        return "999.0.0" if name == "deepagents" else original(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", wrong_deepagents)
+    assert selftest._external_mcp_import_smoke() == 40
+    assert "deepagents-version:runtime requires deepagents==" in capsys.readouterr().err
+
+
+def test_packaging_smoke_accepts_installed_pinned_framework() -> None:
+    assert selftest._external_mcp_import_smoke() == 0

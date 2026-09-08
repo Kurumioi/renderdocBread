@@ -177,6 +177,28 @@ class _FakeWatchManager:
                 "at": "2026-08-24T00:00:00Z",
                 "type": "RuntimeError",
                 "message": message,
+                "diagnostic": {
+                    "schema": "renderdoc-ultra-shader-recovery-diagnostic/v1",
+                    "schemaVersion": 1,
+                    "phase": "watch-compile",
+                    "category": "tool-rejected-input",
+                    "exceptionType": "RuntimeError",
+                    "message": message,
+                    "retryable": False,
+                    "allowedActions": [
+                        "preserve-evidence",
+                        "repair-provisional-source-if-compile-route-exists",
+                    ],
+                },
+                "diagnostics": [
+                    {
+                        "file": "shader.hlsl",
+                        "line": 9,
+                        "column": 1,
+                        "severity": "error",
+                        "message": message,
+                    }
+                ],
             }
             snapshot["events"].append(
                 {
@@ -184,6 +206,12 @@ class _FakeWatchManager:
                     "at": "2026-08-24T00:00:00Z",
                     "errorType": "RuntimeError",
                     "message": message,
+                    "diagnostic": copy.deepcopy(
+                        snapshot["lastError"]["diagnostic"]
+                    ),
+                    "diagnostics": copy.deepcopy(
+                        snapshot["lastError"]["diagnostics"]
+                    ),
                 }
             )
 
@@ -877,6 +905,13 @@ class ShaderLiveEditTests(unittest.TestCase):
         self.assertEqual(
             compile_failed["lastCompileError"]["message"],
             "syntax error at line 9",
+        )
+        self.assertEqual(
+            compile_failed["lastCompileError"]["diagnostic"]["category"],
+            "tool-rejected-input",
+        )
+        self.assertEqual(
+            compile_failed["lastCompileError"]["diagnostics"][0]["line"], 9
         )
         self.assertEqual(compile_failed["activeReplacement"], previous_replacement)
         self.assertIn(

@@ -21,12 +21,30 @@ import time
 
 SAVE_PATH = "/replaylab/shader-source/save"
 SAVE_SCHEMA = "replaylab-shader-source-save/v1"
+CHECK_PATH = "/replaylab/shader-source/check"
+CHECK_SCHEMA = "replaylab-shader-source-check/v1"
+MAX_CHECK_DIAGNOSTICS = 128
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_REQUEST_BYTES = MAX_SOURCE_BYTES + 64 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
+
+# The internal Host advertises its route families here.  New families (for
+# example "asset-index", 2026-09) are additive: a client requires the ones it
+# uses and ignores the rest, so a newer Host never fails an older client.
+REQUIRED_INTERNAL_CAPABILITIES = (
+    "project-service", "project-restore", "shader-source-save", "shader-live-edit")
+
+
+def _has_required_capabilities(value):
+    if not isinstance(value, list) or len(value) > 32:
+        return False
+    if any(not isinstance(item, str) or len(item) > 64 for item in value):
+        return False
+    return all(item in value for item in REQUIRED_INTERNAL_CAPABILITIES)
+
 MAX_STATE_BYTES = 64 * 1024
 MAX_TOKEN_BYTES = 1024
-EXPECTED_HOST_VERSION = "1.10.2"
+EXPECTED_HOST_VERSION = "1.13.0"
 INTERNAL_HOST_STATE_PROTOCOL_VERSION = 1
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,128}$")
 ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -246,6 +264,17 @@ def _winhttp_post(port, token, body, timeout_seconds):
         "POST", SAVE_PATH, port, headers, body, timeout_seconds)
 
 
+def _winhttp_post_check(port, token, body, timeout_seconds):
+    """POST an unsaved-buffer compile-check to the internal Host."""
+
+    headers = (
+        "Authorization: Bearer %s\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Accept: application/json\r\n" % token)
+    return _bounded_winhttp_request(
+        "POST", CHECK_PATH, port, headers, body, timeout_seconds)
+
+
 def runtime_root(environment=None):
     env = os.environ if environment is None else environment
     configured = str(
@@ -360,13 +389,15 @@ def _process_alive(pid):
 class ReplayLabShaderSaveClient(object):
     def __init__(self, runtime_directory=None, timeout_seconds=5.0,
                  startup_timeout_seconds=2.0, transport=None,
-                 health_transport=None, sleep=None, monotonic=None):
+                 health_transport=None, sleep=None, monotonic=None,
+                 check_transport=None):
         self.runtime_directory = os.path.abspath(
             runtime_directory or runtime_root())
         self.timeout_seconds = max(0.1, float(timeout_seconds))
         self.startup_timeout_seconds = max(
             0.1, float(startup_timeout_seconds))
         self.transport = transport or _winhttp_post
+        self.check_transport = check_transport or _winhttp_post_check
         self.health_transport = health_transport or _winhttp_health
         self.sleep = sleep or time.sleep
         self.monotonic = monotonic or time.monotonic
@@ -464,9 +495,7 @@ class ReplayLabShaderSaveClient(object):
                 value.get("transport") != "internal-http" or
                 value.get("version") != EXPECTED_HOST_VERSION or
                 value.get("version") != version or
-                value.get("capabilities") != [
-                    "project-service", "project-restore",
-                    "shader-source-save"] or
+                not _has_required_capabilities(value.get("capabilities")) or
                 isinstance(response_protocol_version, bool) or
                 not isinstance(response_protocol_version, int) or
                 response_protocol_version != protocol_version or
@@ -577,6 +606,105 @@ class ReplayLabShaderSaveClient(object):
             "compileScheduled": value["compileScheduled"],
             "watchId": value["watchId"],
         }
+
+    def check(self, live_edit_id, authorization_id, workspace_id, text):
+        """Compile an unsaved buffer for live diagnostics; never publishes.
+
+        Returns ``{"ok": bool|None, "diagnostics": [...]}``. ``ok`` is None
+        when the buffer could not be checked live (route-plan workspace or an
+        unavailable compiler); the caller then leaves existing squiggles as
+        they are instead of clearing or inventing them.
+        """
+
+        values = (live_edit_id, authorization_id, workspace_id)
+        if any(not isinstance(value, str) or ID_PATTERN.fullmatch(value) is None
+               for value in values):
+            raise ReplayLabShaderSaveError("Shader check identity is invalid")
+        if not isinstance(text, str) or not text or "\x00" in text:
+            raise ReplayLabShaderSaveError("Shader check source is invalid")
+        try:
+            source_size = len(text.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ReplayLabShaderSaveError(
+                "Shader check source is not UTF-8") from exc
+        if source_size > MAX_SOURCE_BYTES:
+            raise ReplayLabShaderSaveError(
+                "Shader check source exceeds its size limit")
+
+        payload = {
+            "liveEditId": live_edit_id,
+            "authorizationId": authorization_id,
+            "workspaceId": workspace_id,
+            "text": text,
+        }
+        body = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")
+        if len(body) > MAX_REQUEST_BYTES:
+            raise ReplayLabShaderSaveError(
+                "Shader check request exceeds its size limit")
+
+        (port, token, pid, version, protocol_version,
+         host_instance_id) = self._credentials()
+        self._verify_health(
+            port, pid, version, protocol_version, host_instance_id)
+        try:
+            status, response_body = self.check_transport(
+                port, token, body, self.timeout_seconds)
+        except ReplayLabShaderSaveError:
+            raise
+        except Exception as exc:
+            raise ReplayLabShaderSaveError(
+                "ReplayLab Host connection failed: %s" % str(exc))
+        if not response_body or len(response_body) > MAX_RESPONSE_BYTES:
+            raise ReplayLabShaderSaveError(
+                "ReplayLab Host returned an invalid response size")
+        value = _strict_json(response_body, "ReplayLab Host")
+        if status != 200:
+            message = str(value.get("error", "Shader check was rejected") or "")[:4096]
+            raise ReplayLabShaderSaveError(
+                "ReplayLab Host rejected the Shader check (HTTP %d): %s" %
+                (status, message))
+        expected_fields = {
+            "schema", "schemaVersion", "liveEditId", "authorizationId",
+            "workspaceId", "ok", "diagnostics", "reason",
+        }
+        schema_version = value.get("schemaVersion")
+        ok = value.get("ok")
+        raw_diagnostics = value.get("diagnostics")
+        if (set(value) != expected_fields or value.get("schema") != CHECK_SCHEMA or
+                isinstance(schema_version, bool) or schema_version != 1 or
+                value.get("liveEditId") != live_edit_id or
+                value.get("authorizationId") != authorization_id or
+                value.get("workspaceId") != workspace_id or
+                (ok is not None and not isinstance(ok, bool)) or
+                not isinstance(raw_diagnostics, list) or
+                not isinstance(value.get("reason"), str)):
+            raise ReplayLabShaderSaveError(
+                "ReplayLab Host returned an invalid Shader check result")
+        diagnostics = []
+        for item in raw_diagnostics[:MAX_CHECK_DIAGNOSTICS]:
+            if not isinstance(item, dict):
+                continue
+            line = item.get("line")
+            column = item.get("column")
+            severity = item.get("severity")
+            message = item.get("message")
+            if (isinstance(line, bool) or not isinstance(line, int) or line < 0 or
+                    isinstance(column, bool) or not isinstance(column, int) or
+                    column < 0 or
+                    severity not in ("error", "warning", "information", "hint") or
+                    not isinstance(message, str)):
+                raise ReplayLabShaderSaveError(
+                    "ReplayLab Host returned an invalid Shader check diagnostic")
+            diagnostics.append({
+                "line": line,
+                "column": column,
+                "severity": severity,
+                "text": message,
+            })
+        return {"ok": ok, "diagnostics": diagnostics,
+                "reason": str(value.get("reason", "") or "")[:512]}
 
 
 __all__ = [

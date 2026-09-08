@@ -2550,6 +2550,9 @@ void VulkanCreationInfo::Buffer::Init(VulkanResourceManager *resourceMan, Vulkan
   usage = GetBufferUsageFlags(pCreateInfo);
   size = pCreateInfo->size;
   gpuAddress = 0;
+  sparse = (pCreateInfo->flags & (VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
+                                VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT |
+                                VK_BUFFER_CREATE_SPARSE_ALIASED_BIT)) != 0;
 
   mrq = origMrq;
 
@@ -2585,6 +2588,9 @@ void VulkanCreationInfo::Image::Init(VulkanResourceManager *resourceMan, VulkanC
   mrq = origMrq;
 
   linear = pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR;
+  sparse = (pCreateInfo->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                                  VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                                  VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)) != 0;
 
   external = false;
 

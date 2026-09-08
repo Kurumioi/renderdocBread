@@ -75,6 +75,8 @@ _D3D11_STAGES = frozenset(
 _D3D12_STAGES = frozenset(
     {"vertex", "hull", "domain", "geometry", "fragment", "compute", "task", "mesh"}
 )
+_VULKAN_REPLACEABLE_STAGES = _D3D12_STAGES
+_OPENGL_REPLACEABLE_STAGES = _D3D11_STAGES
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -1375,10 +1377,6 @@ def compare_shader_abi(
                     }
                 )
             else:
-                # The evidence proves only the accessed physical byte/type set.
-                # Project both reflection trees to their already captured
-                # binding/storage/size envelope; never manufacture fields or
-                # names to make an ambiguous reflection look complete.
                 captured["fields"] = []
                 block["fields"] = []
                 captured["layoutCompleteness"] = "ambiguous"
@@ -1387,10 +1385,6 @@ def compare_shader_abi(
             baseline_completeness == "complete"
             and candidate_completeness == "ambiguous"
         ):
-            # Access equality can supplement a baseline that never had member
-            # layout facts; it must not erase a complete captured layout merely
-            # because the candidate reflection is weaker. Preserve both trees
-            # so the ordinary recursive diff also reports the lost fields.
             forced_differences.append(
                 {
                     "path": "constantBlocks[%d].layoutCompleteness" % block_index,
@@ -1403,9 +1397,6 @@ def compare_shader_abi(
                 }
             )
         elif baseline_completeness == "opaque":
-            # ``byteSize`` is the only captured access envelope for an opaque
-            # block.  Never synthesize a UInt4/array member merely to make the
-            # two reflection trees look alike.
             block["fields"] = []
             block["layoutCompleteness"] = "opaque"
         elif baseline_completeness == "partial":
@@ -1452,30 +1443,65 @@ def build_candidate_reflection_request(
     capture = _text(capture_id, "capture_id", allow_empty=False)
     api_value = _text(api, "api", allow_empty=False)
     api_token = api_value.strip().lower().replace("graphicsapi.", "")
-    if api_token == "direct3d11":
-        api_token = "d3d11"
-    elif api_token == "direct3d12":
-        api_token = "d3d12"
-    if api_token not in {"d3d11", "d3d12"}:
-        raise AbiValidationError("the native Direct3D ABI gate supports D3D11/D3D12 only")
+    api_token = {
+        "direct3d11": "d3d11",
+        "direct3d12": "d3d12",
+        "vk": "vulkan",
+        "gl": "opengl",
+    }.get(api_token, api_token)
+    if api_token not in {"d3d11", "d3d12", "vulkan", "opengl"}:
+        raise AbiValidationError(
+            "the native replay ABI gate supports D3D11/D3D12/Vulkan/OpenGL only"
+        )
     stage_value = normalize_stage(stage)
     candidate_encoding = _text(candidate_kind, "candidate_kind", allow_empty=False).lower()
     if api_token == "d3d11":
         if stage_value not in _D3D11_STAGES or candidate_encoding != "dxbc":
             raise AbiValidationError("D3D11 candidate reflection requires native DXBC")
-    elif stage_value not in _D3D12_STAGES or candidate_encoding not in {"dxbc", "dxil"}:
+    elif api_token == "d3d12" and (
+        stage_value not in _D3D12_STAGES
+        or candidate_encoding not in {"dxbc", "dxil"}
+    ):
         raise AbiValidationError(
             "D3D12 candidate reflection requires native DXBC/DXIL and a pipeline shader stage"
         )
+    elif api_token == "vulkan" and (
+        stage_value not in _VULKAN_REPLACEABLE_STAGES
+        or candidate_encoding != "spirv"
+    ):
+        raise AbiValidationError(
+            "Vulkan candidate reflection requires native SPIR-V and a graphics/compute pipeline stage"
+        )
+    elif api_token == "opengl" and (
+        stage_value not in _OPENGL_REPLACEABLE_STAGES
+        or candidate_encoding != "opengl-spirv"
+    ):
+        raise AbiValidationError(
+            "OpenGL candidate reflection requires native OpenGL SPIR-V and a legacy pipeline stage"
+        )
     entry = _text(entry_point, "entry_point", allow_empty=False)
     profile = _text(target_profile, "target_profile", allow_empty=False).lower()
-    profile_match = re.fullmatch(r"(ps|vs|gs|hs|ds|cs|as|ms)_(\d+)_(\d+)", profile)
-    profile_stage = {
-        "ps": "fragment", "vs": "vertex", "gs": "geometry", "hs": "hull",
-        "ds": "domain", "cs": "compute", "as": "task", "ms": "mesh",
-    }
-    if profile_match is None or profile_stage[profile_match.group(1)] != stage_value:
-        raise AbiValidationError("target_profile must exactly match the reflected shader stage")
+    if api_token in {"d3d11", "d3d12"}:
+        profile_match = re.fullmatch(
+            r"(ps|vs|gs|hs|ds|cs|as|ms)_(\d+)_(\d+)", profile
+        )
+        profile_stage = {
+            "ps": "fragment", "vs": "vertex", "gs": "geometry", "hs": "hull",
+            "ds": "domain", "cs": "compute", "as": "task", "ms": "mesh",
+        }
+        if (
+            profile_match is None
+            or profile_stage[profile_match.group(1)] != stage_value
+        ):
+            raise AbiValidationError(
+                "target_profile must exactly match the reflected shader stage"
+            )
+    else:
+        expected_profile = "spirv" if api_token == "vulkan" else "opengl-spirv"
+        if profile != expected_profile:
+            raise AbiValidationError(
+                "target_profile must preserve the capture-bound SPIR-V environment"
+            )
     digest = _text(candidate_sha256, "candidate_sha256", allow_empty=False).lower()
     if not SHA256_RE.fullmatch(digest):
         raise AbiValidationError("candidate_sha256 must be a lowercase SHA-256")

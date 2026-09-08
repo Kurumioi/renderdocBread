@@ -26,6 +26,7 @@ from .connectors.codex_app_server import CodexAppServerConnector
 from .errors import AuthenticationError, ConfigurationError, ConnectorError
 from .probe import discover_models
 from .profiles import Profile
+from .runtime_dependencies import verify_deepagents_version
 
 
 SelfTestStatus = Literal["ok", "warning", "error"]
@@ -445,7 +446,10 @@ async def _check_codex(timeout: float) -> str:
                 [item.get("id") for item in models] == ["codex-self-test"],
                 "Codex model/list parsing failed",
             )
-    return "fake app-server initialize, account/read, browser/device login URLs and model/list passed"
+    return (
+        "fake app-server initialize, account/read, browser/device login URLs and "
+        "model/list passed"
+    )
 
 
 async def _check_acp(timeout: float) -> str:
@@ -611,12 +615,64 @@ def _fake_acp_main() -> int:
     return 0
 
 
+def _external_mcp_import_smoke() -> int:
+    """Import the exact client surface required by user-configured MCPs.
+
+    This deliberately lives behind the frozen internal self-test dispatcher so
+    runtime packaging can catch a missing PyInstaller dependency before the
+    artifacts are published.  Distinct exit codes keep the check diagnosable
+    without printing exception text that could contain configuration secrets.
+    """
+
+    checks = (
+        lambda: __import__("anyio"),
+        lambda: __import__("httpx"),
+        lambda: __import__("mcp.types", fromlist=("JSONRPCMessage",)),
+        lambda: __import__("anyio.streams.text", fromlist=("TextReceiveStream",)),
+        lambda: __import__(
+            "mcp", fromlist=("ClientSession", "StdioServerParameters")
+        ),
+        lambda: __import__(
+            "mcp.client.stdio",
+            fromlist=(
+                "PROCESS_TERMINATION_TIMEOUT",
+                "_create_platform_compatible_process",
+                "_get_executable_command",
+                "_terminate_process_tree",
+                "get_default_environment",
+            ),
+        ),
+        lambda: __import__("mcp.shared.message", fromlist=("SessionMessage",)),
+        lambda: __import__("deepagents", fromlist=("create_deep_agent",)),
+        lambda: __import__("langchain_core", fromlist=("tools",)),
+    )
+    for index, check in enumerate(checks, start=1):
+        try:
+            check()
+        except ImportError as exc:
+            missing = str(getattr(exc, "name", "") or "unknown-module")
+            sys.stderr.write(
+                f"external-mcp-import-smoke:{index}:{missing}\n"
+            )
+            sys.stderr.flush()
+            return 30 + index
+    try:
+        verify_deepagents_version()
+    except ConfigurationError as exc:
+        sys.stderr.write(f"external-mcp-import-smoke:deepagents-version:{exc}\n")
+        sys.stderr.flush()
+        return 40
+    return 0
+
+
 def _child_entry(argv: list[str]) -> int:
     if argv == ["--fake-codex"]:
         return _fake_codex_main()
     if argv == ["--fake-acp"]:
         return _fake_acp_main()
-    raise SystemExit("selftest.py is an internal protocol peer; use replaylab-ai self-test")
+    if argv == ["--external-mcp-import-smoke"]:
+        return _external_mcp_import_smoke()
+    raise SystemExit("selftest.py is an internal packaging and protocol-test helper")
 
 
 if __name__ == "__main__":

@@ -33,6 +33,23 @@
 // of deltas to a shared view of the previous resource contents.
 #define TRANSFER_RESOURCE_CONTENTS_DELTAS OPTION_ON
 
+// Fork protocol revision is separate from the public RenderDoc major/minor version. The remote
+// handshake rejects older peers before any request using the extended parameter layout is sent.
+static const uint32_t ReplayControlProtocolRevision = 5;
+constexpr uint32_t ReplayControlHandshakeVersion(uint32_t applicationVersion)
+{
+  return 0x80000000U | (ReplayControlProtocolRevision << 16) | applicationVersion;
+}
+
+enum class ReplayControlOperation : uint32_t
+{
+  Capabilities = 0,
+  ConfigureCheckpoints = 1,
+  CheckpointStats = 2,
+  InvalidateCheckpoints = 3,
+  BufferPatches = 4,
+};
+
 enum ReplayProxyPacket
 {
   // we offset these packet numbers so that it can co-exist
@@ -114,6 +131,10 @@ enum ReplayProxyPacket
 
   eReplayProxy_ClearReplayCache,
   eReplayProxy_ReloadShaderDebugInformation,
+
+  // A versioned operation envelope: future replay controls extend its operation set without
+  // inserting/reordering packets or changing any existing packet identifier.
+  eReplayProxy_ReplayControl = 0x1100,
 };
 
 DECLARE_REFLECTION_ENUM(ReplayProxyPacket);
@@ -151,6 +172,13 @@ public:
   void RemoteExecutionThreadEntry();
 
   bool IsRemoteProxy() { return !m_RemoteServer; }
+  uint32_t GetReplayControlVersion() const override { return m_RemoteControlVersion; }
+  void ConfigureReplayCheckpoints(const ReplayCheckpointConfig &config,
+                                 const rdcarray<ReplayCheckpointCandidate> &candidates) override;
+  void InvalidateReplayCheckpoints(uint32_t firstAffectedEvent = 0) override;
+  ReplayCheckpointStats GetReplayCheckpointStats() override;
+  rdcstr SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches) override;
+  uint32_t GetReplayBufferPatchFirstAffectedEvent() const override { return m_BufferPatchFirstAffected; }
   RDResult FatalErrorCheck();
   IReplayDriver *MakeDummyDriver();
   void Shutdown() { delete this; }
@@ -602,6 +630,20 @@ public:
   }
 
 private:
+  friend struct RemoteExecution;
+  IMPLEMENT_FUNCTION_PROXIED(rdcstr, ReplayControl, uint32_t operation, const bytebuf &request,
+                             bytebuf &response);
+  rdcstr ReplayControlRequest(ReplayControlOperation operation, const bytebuf &request,
+                             bytebuf &response);
+  void QueryReplayControlCapabilities();
+  uint32_t m_RemoteControlVersion = 0;
+  uint32_t m_BufferPatchFirstAffected = 0;
+  uint64_t m_RemoteControlOperations = 0;
+  rdcstr m_CheckpointControlError;
+  bool m_RequestCheckpointBypass = false;
+  bool m_RequestCheckpointNaturalReference = false;
+  bool m_RequestCheckpointPrefixOnly = false;
+
   void EnsureTexCached(ResourceId &texid, CompType &typeCast, const Subresource &sub);
   void RemapProxyTextureIfNeeded(TextureDescription &tex, GetTextureDataParams &params);
   void EnsureBufCached(ResourceId bufid);

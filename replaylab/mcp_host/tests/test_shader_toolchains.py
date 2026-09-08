@@ -5,24 +5,27 @@ import json
 import os
 from pathlib import Path
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
 
 from src.shader_workspace import (
     ToolConfigurationError,
+    ToolExecutionError,
     ToolchainCatalog,
     ToolchainRoutingError,
     detect_shader_format,
     generate_official_toolchain_configs,
     extract_target_profile,
+    validate_target_profile,
 )
 from src.shader_workspace.io import atomic_write_json
 from src.shader_workspace.adapters.spirv_cross_adapter import (
     derive_spirv_cross_arguments,
 )
 from src.shader_workspace.toolchains import route_record, toolchain_document, validator_record
-from src.shader_workspace.tools import ToolRegistry
+from src.shader_workspace.tools import ToolRegistry, run_operation
 
 
 def make_container_from_chunks(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -267,9 +270,52 @@ class ShaderToolchainTests(unittest.TestCase):
             detect_shader_format(b"#version 450\nvoid main(){gl_Position=vec4(0);}\n").format,
             "glsl",
         )
+        essl_100 = (
+            b"#version 100\nprecision mediump float;\n"
+            b"void main(){gl_FragColor=vec4(1.0);}\n"
+        )
+        self.assertEqual(detect_shader_format(essl_100).format, "essl")
+        self.assertEqual(detect_shader_format(essl_100, "essl").format, "essl")
         self.assertIsNone(detect_shader_format(b"void main() {}\n").format)
         with self.assertRaisesRegex(ToolchainRoutingError, "contradicts"):
             detect_shader_format(make_container(), "spirv")
+
+    def test_all_high_level_compile_paths_reject_untracked_dependencies(self) -> None:
+        registry = ToolRegistry(self.tools_path)
+        operation = registry.operation("fake-compiler", "compile")
+        baseline = self.root / "baseline.dxbc"
+        baseline.write_bytes(make_container())
+        for index, (suffix, source) in enumerate(
+            (
+                (".hlsl", '#include "outside.hlsli"\nfloat4 main():SV_Target{return 1;}\n'),
+                (".glsl", "#line 99\n#version 450\nvoid main(){}\n"),
+                (".slang", "import external_module;\nfloat4 main(){return 1;}\n"),
+            )
+        ):
+            source_path = self.root / ("unsafe-%d%s" % (index, suffix))
+            source_path.write_text(source, encoding="utf-8")
+            with self.assertRaisesRegex(
+                ToolExecutionError, "hash-bound dependency|Slang import"
+            ):
+                run_operation(
+                    operation,
+                    {
+                        "input": str(source_path),
+                        "output": str(self.root / ("unsafe-%d.dxbc" % index)),
+                        "baseline": str(baseline),
+                        "job_dir": str(self.root / ("job-%d" % index)),
+                        "workspace_dir": str(self.root),
+                        "stage": "fragment",
+                        "entry_point": "main",
+                        "revision": "1",
+                        "capture_id": "capture",
+                        "raw_sha256": hashlib.sha256(baseline.read_bytes()).hexdigest(),
+                        "target_profile": "ps_5_0",
+                        "target_api": "d3d11",
+                    },
+                    self.root / ("job-%d" % index),
+                )
+            self.assertFalse((self.root / ("job-%d" % index)).exists())
 
     def test_exact_target_profile_is_read_from_compiled_tokens_never_stage_guessed(self) -> None:
         cases = (
@@ -297,11 +343,30 @@ class ShaderToolchainTests(unittest.TestCase):
         self.assertEqual(task.stage, "task")
         with self.assertRaisesRegex(ToolchainRoutingError, "contradicts"):
             extract_target_profile(make_container(), "vertex")
-        with self.assertRaisesRegex(ToolchainRoutingError, "multi-entry"):
-            extract_target_profile(
-                make_container(b"DXIL", make_dxil_program(0x00060063)),
-                "library",
-            )
+        library = extract_target_profile(
+            make_container(b"DXIL", make_dxil_program(0x00060063)),
+            "library",
+        )
+        self.assertEqual(library.profile, "lib_6_3")
+        self.assertEqual(library.stage, "library")
+        # A DXR capture selects one exported stage independently from the
+        # container-level Library ProgramType.  The physical profile remains
+        # lib_6_3 and is never relabelled as a single-entry target.
+        exported_raygen = extract_target_profile(
+            make_container(b"DXIL", make_dxil_program(0x00060063)),
+            "raygen",
+        )
+        self.assertEqual(exported_raygen.profile, "lib_6_3")
+        self.assertEqual(exported_raygen.stage, "library")
+        raygen_program = extract_target_profile(
+            make_container(b"DXIL", make_dxil_program(0x00070065)),
+            "raygen",
+        )
+        self.assertEqual(raygen_program.profile, "lib_6_5")
+        self.assertEqual(raygen_program.stage, "raygen")
+        self.assertEqual(validate_target_profile("lib_6_3", "miss"), "lib_6_3")
+        with self.assertRaisesRegex(ToolchainRoutingError, "contradicts"):
+            validate_target_profile("lib_6_3", "compute")
 
     def test_dxbc_profile_requires_complete_exact_tokenized_program_header(self) -> None:
         valid = make_container(code=make_dxbc_program(0x00010040, b"code"))
@@ -439,6 +504,24 @@ class ShaderToolchainTests(unittest.TestCase):
                 for action in recovery["allowedActions"]
             )
         )
+        diagnostic = next(
+            row
+            for row in ambiguous.diagnostic_matrix("fragment")["matrix"]
+            if row["inputFormat"] == "dxbc" and row["outputFormat"] == "hlsl"
+        )
+        self.assertTrue(diagnostic["roundTripReady"])
+        self.assertFalse(diagnostic["automaticRoundTripReady"])
+        self.assertFalse(diagnostic["editable"])
+        self.assertIn("ambiguous", diagnostic["unsupportedReason"])
+        hlsl_capability = next(
+            item
+            for item in ambiguous.diagnostic_matrix("fragment")[
+                "formatCapabilities"
+            ]
+            if item["format"] == "hlsl"
+        )
+        self.assertFalse(hlsl_capability["editable"])
+        self.assertIn("uniquely selectable", hlsl_capability["unsupportedReason"])
 
     def test_recovery_plan_keeps_compile_only_and_evidence_only_lanes(self) -> None:
         value = json.loads(self.routes_path.read_text(encoding="utf-8"))
@@ -505,6 +588,10 @@ class ShaderToolchainTests(unittest.TestCase):
                 }
             ],
         )
+        self.assertEqual(8, retry["automaticAttemptLimit"])
+        self.assertEqual(1, retry["totalAlternativePairCount"])
+        self.assertTrue(retry["doNotRepeatCandidatePair"])
+        self.assertIn("attempt-limit-reached", retry["stopConditions"])
 
     def test_route_catalog_is_bound_to_exact_registry_and_operation_digest(self) -> None:
         value = json.loads(self.routes_path.read_text(encoding="utf-8"))
@@ -529,6 +616,43 @@ class ShaderToolchainTests(unittest.TestCase):
             if row["inputFormat"] == "dxbc" and row["outputFormat"] == "hlsl"
         )
         self.assertEqual(dxbc_hlsl["status"], "ready")
+        self.assertTrue(dxbc_hlsl["recognized"])
+        self.assertTrue(dxbc_hlsl["analyzable"])
+        self.assertTrue(dxbc_hlsl["explanatory"])
+        self.assertTrue(dxbc_hlsl["editable"])
+        self.assertTrue(dxbc_hlsl["compilable"])
+        self.assertFalse(dxbc_hlsl["replayAbiValidated"])
+        self.assertFalse(dxbc_hlsl["replayReplaceable"])
+        slang = next(
+            item
+            for item in before["formatCapabilities"]
+            if item["format"] == "slang"
+        )
+        self.assertTrue(slang["recognized"])
+        self.assertFalse(slang["analyzable"])
+        self.assertFalse(slang["explanatory"])
+        self.assertFalse(slang["editable"])
+        self.assertFalse(slang["compilable"])
+        self.assertIn("not an end-to-end", slang["unsupportedReason"])
+        ray = catalog.diagnostic_matrix("raygen")
+        self.assertTrue(
+            all(not row["editable"] for row in ray["matrix"])
+        )
+        self.assertTrue(
+            all(not row["replayReplaceable"] for row in ray["matrix"])
+        )
+        self.assertTrue(
+            all(
+                "No provider declares" in row["unsupportedReason"]
+                for row in ray["matrix"]
+            )
+        )
+        self.assertTrue(
+            all(not row["replayStageSupported"] for row in ray["matrix"])
+        )
+        self.assertTrue(
+            all("SBT" in row["replayUnsupportedReason"] for row in ray["matrix"])
+        )
         with self.script.open("a", encoding="utf-8") as stream:
             stream.write("\n# tampered\n")
         after = catalog.diagnostic_matrix("fragment")
@@ -605,6 +729,26 @@ class ShaderToolchainTests(unittest.TestCase):
             target_api="vulkan",
         )
         self.assertEqual(selected["targetApi"], "vulkan")
+        self.assertTrue(selected["strictNativeIrValidationRequired"])
+        self.assertEqual(
+            [
+                item["validatorId"]
+                for item in selected["requiredValidators"]
+            ],
+            ["spirv-tools-validate"],
+        )
+        automatic = catalog.plan_automatic_recovery(
+            "spirv", "fragment", target_api="vulkan"
+        )
+        self.assertEqual(automatic["editableFormat"], "spirv-asm")
+        self.assertTrue(automatic["strictNativeIrValidationRequired"])
+        self.assertEqual(
+            [
+                item["validatorId"]
+                for item in automatic["requiredValidators"]
+            ],
+            ["spirv-tools-validate"],
+        )
         with self.assertRaisesRegex(ToolConfigurationError, "overwrite"):
             generate_official_toolchain_configs(
                 generated_root / "tools.json",
@@ -647,6 +791,471 @@ class ShaderToolchainTests(unittest.TestCase):
             ["-V", "--target-env", "vulkan1.3"],
         )
 
+    def test_vulkan_ray_glsl_round_trip_is_registered_but_replay_apply_is_separate(self) -> None:
+        generated_root = self.root / "vulkan-ray"
+        generated_root.mkdir()
+        spirv_cross = generated_root / "spirv-cross.exe"
+        glslang = generated_root / "glslangValidator.exe"
+        spirv_val = generated_root / "spirv-val.exe"
+        for path in (spirv_cross, glslang, spirv_val):
+            path.write_bytes(("fake " + path.name).encode("ascii"))
+
+        generate_official_toolchain_configs(
+            generated_root / "tools.json",
+            generated_root / "routes.json",
+            spirv_cross=spirv_cross,
+            glslang=glslang,
+            spirv_val=spirv_val,
+            spirv_target_env="vulkan1.2",
+        )
+        catalog = ToolchainCatalog(
+            generated_root / "tools.json", generated_root / "routes.json"
+        )
+        plan = catalog.select_round_trip(
+            "spirv", "raygen", editable_format="glsl", target_api="vulkan"
+        )
+        self.assertEqual(plan["decompileRouteIds"], ["spirv-cross-spirv-glsl"])
+        self.assertEqual(plan["compileRouteIds"], ["glslang-glsl-spirv-raygen"])
+
+        matrix = catalog.diagnostic_matrix("raygen")
+        row = next(
+            item
+            for item in matrix["matrix"]
+            if item["inputFormat"] == "spirv" and item["outputFormat"] == "glsl"
+        )
+        self.assertTrue(row["roundTripReady"])
+        self.assertTrue(row["automaticRoundTripReady"])
+        self.assertTrue(row["editable"])
+        self.assertTrue(row["compilable"])
+        self.assertFalse(row["replayAbiValidated"])
+        self.assertFalse(row["replayReplaceable"])
+        self.assertFalse(row["replayStageSupported"])
+        self.assertIsNone(row["unsupportedReason"])
+        self.assertIn("SBT", row["replayUnsupportedReason"])
+
+        tools = json.loads((generated_root / "tools.json").read_text(encoding="utf-8"))
+        arguments = tools["tools"]["glslang-raygen-vulkan"]["compile"]["args"]
+        self.assertEqual(arguments[arguments.index("-S") + 1], "rgen")
+        self.assertNotIn("glslang-raygen-opengl", tools["tools"])
+
+        cross_arguments = derive_spirv_cross_arguments(
+            source="ray.spv",
+            output="ray.rgen.glsl",
+            mode="vulkan-glsl",
+            entry_point="RayMain",
+            stage="raygen",
+            target_api="Vulkan",
+        )
+        self.assertEqual(cross_arguments[cross_arguments.index("--stage") + 1], "rgen")
+
+    @unittest.skipUnless(os.name == "nt", "native SPIR-V smoke requires Windows")
+    def test_real_spirv_source_and_ir_round_trips_when_explicitly_enabled(self) -> None:
+        if os.environ.get("REPLAYLAB_RUN_SPIRV_SMOKE") != "1":
+            self.skipTest("set REPLAYLAB_RUN_SPIRV_SMOKE=1 for native smoke")
+        variables = {
+            "glslang": "REPLAYLAB_GLSLANG_SMOKE_EXE",
+            "spirv_cross": "REPLAYLAB_SPIRV_CROSS_SMOKE_EXE",
+            "spirv_dis": "REPLAYLAB_SPIRV_DIS_SMOKE_EXE",
+            "spirv_as": "REPLAYLAB_SPIRV_AS_SMOKE_EXE",
+            "spirv_val": "REPLAYLAB_SPIRV_VAL_SMOKE_EXE",
+        }
+        binaries = {
+            name: Path(str(os.environ.get(variable, "") or "")).resolve()
+            for name, variable in variables.items()
+        }
+        missing = [name for name, path in binaries.items() if not path.is_file()]
+        if missing:
+            self.skipTest("explicit SPIR-V smoke tools are unavailable: %s" % missing)
+
+        config = self.root / "native-spirv-config"
+        config.mkdir()
+        generate_official_toolchain_configs(
+            config / "tools.json",
+            config / "routes.json",
+            glslang=binaries["glslang"],
+            spirv_cross=binaries["spirv_cross"],
+            spirv_dis=binaries["spirv_dis"],
+            spirv_as=binaries["spirv_as"],
+            spirv_val=binaries["spirv_val"],
+            spirv_target_env="vulkan1.2",
+            enable_opengl_spirv=True,
+        )
+        catalog = ToolchainCatalog(config / "tools.json", config / "routes.json")
+        cases = (
+            (
+                "fragment",
+                "vulkan",
+                "frag",
+                "spirv",
+                "#version 460\nlayout(location=0) out vec4 color;\n"
+                "void main(){ color=vec4(1,0,0,1); }\n",
+            ),
+            (
+                "compute",
+                "vulkan",
+                "comp",
+                "spirv",
+                "#version 460\nlayout(local_size_x=8) in;\n"
+                "layout(set=0,binding=0) buffer Data { uint values[]; };\n"
+                "void main(){ values[gl_GlobalInvocationID.x] += 1; }\n",
+            ),
+            (
+                "raygen",
+                "vulkan",
+                "rgen",
+                "spirv",
+                "#version 460\n#extension GL_EXT_ray_tracing : require\n"
+                "void main(){ }\n",
+            ),
+            (
+                "fragment",
+                "opengl",
+                "frag",
+                "opengl-spirv",
+                "#version 460\nlayout(location=0) out vec4 color;\n"
+                "void main(){ color=vec4(0,1,0,1); }\n",
+            ),
+        )
+        for index, (stage, api, suffix, format_hint, source) in enumerate(cases):
+            with self.subTest(stage=stage, api=api):
+                case_root = self.root / ("native-spirv-%d" % index)
+                case_root.mkdir()
+                source_path = case_root / ("source." + suffix)
+                binary_path = case_root / "captured.spv"
+                source_path.write_text(source, encoding="utf-8")
+                command = [
+                    str(binaries["glslang"]),
+                    "-G" if api == "opengl" else "-V",
+                    "--target-env",
+                    "opengl" if api == "opengl" else "vulkan1.2",
+                    "-S",
+                    suffix,
+                    "-e",
+                    "main",
+                    "-o",
+                    str(binary_path),
+                    str(source_path),
+                ]
+                subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                direct_cross_output = case_root / "direct-cross.glsl"
+                direct_cross = subprocess.run(
+                    [str(binaries["spirv_cross"])]
+                    + derive_spirv_cross_arguments(
+                        source=str(binary_path),
+                        output=str(direct_cross_output),
+                        mode=(
+                            "opengl-glsl" if api == "opengl" else "vulkan-glsl"
+                        ),
+                        entry_point="main",
+                        stage=stage,
+                        target_api=api,
+                    ),
+                    check=False,
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(
+                    0,
+                    direct_cross.returncode,
+                    direct_cross.stderr.decode("utf-8", errors="replace"),
+                )
+                editable_formats = (
+                    "glsl",
+                    "opengl-spirv-asm" if api == "opengl" else "spirv-asm",
+                )
+                for editable in editable_formats:
+                    smoke = catalog.round_trip_smoke(
+                        binary_path,
+                        editable,
+                        case_root / ("smoke-" + editable),
+                        stage,
+                        entry_point="main",
+                        input_format_hint=format_hint,
+                        target_api=api,
+                    )
+                    diagnostics = {
+                        str(path.relative_to(case_root)): path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        for path in case_root.rglob("stderr.log")
+                    }
+                    self.assertIsNone(
+                        smoke["error"], {"report": smoke, "diagnostics": diagnostics}
+                    )
+                    self.assertTrue(smoke["formatSmokePassed"])
+                    self.assertTrue(smoke["externalValidationConfigured"])
+                    self.assertTrue(smoke["externalValidationPassed"])
+                    self.assertFalse(smoke["semanticEquivalenceVerified"])
+                    self.assertFalse(smoke["replayAbiValidated"])
+
+    @unittest.skipUnless(os.name == "nt", "native DXBC smoke requires Windows")
+    def test_real_dxbc_hlsl_round_trip_when_explicitly_enabled(self) -> None:
+        if os.environ.get("REPLAYLAB_RUN_DXBC_SMOKE") != "1":
+            self.skipTest("set REPLAYLAB_RUN_DXBC_SMOKE=1 for native smoke")
+        decompiler = Path(
+            str(os.environ.get("REPLAYLAB_DXBC_DECOMPILER_SMOKE_EXE", "") or "")
+        ).resolve()
+        fxc = Path(
+            str(os.environ.get("REPLAYLAB_FXC_SMOKE_EXE", "") or "")
+        ).resolve()
+        dependency = decompiler.parent / "d3dcompiler_46.dll"
+        missing = [
+            label
+            for label, path in (
+                ("cmd_Decompiler", decompiler),
+                ("D3DCompiler_46", dependency),
+                ("FXC", fxc),
+            )
+            if not path.is_file()
+        ]
+        if missing:
+            self.skipTest("explicit DXBC smoke tools are unavailable: %s" % missing)
+
+        config = self.root / "native-dxbc-config"
+        config.mkdir()
+        generate_official_toolchain_configs(
+            config / "tools.json",
+            config / "routes.json",
+            fxc=fxc,
+            hlsl_decompiler=decompiler,
+            extra_fixed_files={"hlsl-decompiler": [dependency]},
+        )
+        catalog = ToolchainCatalog(config / "tools.json", config / "routes.json")
+        case_root = self.root / "native-dxbc"
+        case_root.mkdir()
+        source_path = case_root / "source.hlsl"
+        binary_path = case_root / "captured.dxbc"
+        source_path.write_text(
+            "cbuffer Params : register(b0) { float4 tint; };\n"
+            "Texture2D texture0 : register(t0);\n"
+            "SamplerState sampler0 : register(s0);\n"
+            "struct PSInput { float4 position : SV_Position; float2 uv : TEXCOORD0; };\n"
+            "float4 main(PSInput input) : SV_Target0 {\n"
+            "  return texture0.Sample(sampler0, input.uv) * tint;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        compile_baseline = subprocess.run(
+            [
+                str(fxc),
+                "/nologo",
+                "/T",
+                "ps_5_0",
+                "/E",
+                "main",
+                "/Fo",
+                str(binary_path),
+                str(source_path),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(
+            0,
+            compile_baseline.returncode,
+            compile_baseline.stderr.decode("utf-8", errors="replace"),
+        )
+        for editable in ("hlsl", "dxbc-asm"):
+            smoke = catalog.round_trip_smoke(
+                binary_path,
+                editable,
+                case_root / ("smoke-" + editable),
+                "fragment",
+                entry_point="main",
+                input_format_hint="dxbc",
+                target_api="d3d11",
+            )
+            diagnostics = {
+                str(path.relative_to(case_root)): path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                for path in case_root.rglob("stderr.log")
+            }
+            self.assertIsNone(
+                smoke["error"], {"report": smoke, "diagnostics": diagnostics}
+            )
+            self.assertEqual("ps_5_0", smoke["targetProfile"])
+            self.assertTrue(smoke["formatSmokePassed"])
+            self.assertFalse(smoke["semanticEquivalenceVerified"])
+            self.assertFalse(smoke["replayAbiValidated"])
+
+    @unittest.skipUnless(os.name == "nt", "native RenoDX smoke requires Windows")
+    def test_real_renodx_dxil_hlsl_round_trip_when_explicitly_enabled(self) -> None:
+        if os.environ.get("REPLAYLAB_RUN_RENODX_SMOKE") != "1":
+            self.skipTest("set REPLAYLAB_RUN_RENODX_SMOKE=1 for native smoke")
+        decompiler = Path(
+            str(os.environ.get("REPLAYLAB_RENODX_SMOKE_EXE", "") or "")
+        ).resolve()
+        dxc = Path(str(os.environ.get("REPLAYLAB_DXC_SMOKE_EXE", "") or "")).resolve()
+        dxcompiler = decompiler.parent / "dxcompiler.dll"
+        missing = [
+            label
+            for label, path in (
+                ("RenoDX decomp", decompiler),
+                ("DXC", dxc),
+                ("RenoDX dxcompiler", dxcompiler),
+            )
+            if not path.is_file()
+        ]
+        if missing:
+            self.skipTest("explicit RenoDX smoke tools are unavailable: %s" % missing)
+
+        case_root = self.root / "native-renodx"
+        case_root.mkdir()
+        source_path = case_root / "source.hlsl"
+        binary_path = case_root / "captured.dxil"
+        decompiled_path = case_root / "decompiled.hlsl"
+        round_trip_path = case_root / "round-trip.dxil"
+        source_path.write_text(
+            "float4 main(float4 position : SV_Position) : SV_Target0 {\n"
+            "  return float4(0.125, 0.25, 0.5, 1.0);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        def run(command: list[str]) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+
+        baseline = run(
+            [
+                str(dxc),
+                "-T",
+                "ps_6_0",
+                "-E",
+                "main",
+                "-Fo",
+                str(binary_path),
+                str(source_path),
+            ]
+        )
+        self.assertEqual(
+            0, baseline.returncode, baseline.stderr.decode("utf-8", errors="replace")
+        )
+        decompile = run([str(decompiler), str(binary_path), str(decompiled_path)])
+        self.assertEqual(
+            0,
+            decompile.returncode,
+            decompile.stderr.decode("utf-8", errors="replace"),
+        )
+        self.assertTrue(decompiled_path.is_file())
+        recompile = run(
+            [
+                str(dxc),
+                "-T",
+                "ps_6_0",
+                "-E",
+                "main",
+                "-Fo",
+                str(round_trip_path),
+                str(decompiled_path),
+            ]
+        )
+        self.assertEqual(
+            0,
+            recompile.returncode,
+            recompile.stderr.decode("utf-8", errors="replace"),
+        )
+        rebuilt = extract_target_profile(round_trip_path.read_bytes(), "fragment")
+        self.assertEqual("ps_6_0", rebuilt.profile)
+
+    @unittest.skipUnless(os.name == "nt", "native dxil-spirv smoke requires Windows")
+    def test_real_dxil_spirv_hlsl_bridge_when_explicitly_enabled(self) -> None:
+        if os.environ.get("REPLAYLAB_RUN_DXIL_SPIRV_SMOKE") != "1":
+            self.skipTest("set REPLAYLAB_RUN_DXIL_SPIRV_SMOKE=1 for native smoke")
+        dxc = Path(str(os.environ.get("REPLAYLAB_DXC_SMOKE_EXE", "") or "")).resolve()
+        dxil_spirv = Path(
+            str(os.environ.get("REPLAYLAB_DXIL_SPIRV_SMOKE_EXE", "") or "")
+        ).resolve()
+        spirv_cross = Path(
+            str(os.environ.get("REPLAYLAB_SPIRV_CROSS_SMOKE_EXE", "") or "")
+        ).resolve()
+        missing = [
+            label
+            for label, path in (
+                ("DXC", dxc),
+                ("dxil-spirv", dxil_spirv),
+                ("SPIRV-Cross", spirv_cross),
+            )
+            if not path.is_file()
+        ]
+        if missing:
+            self.skipTest("explicit DXIL bridge tools are unavailable: %s" % missing)
+
+        config = self.root / "native-dxil-spirv-config"
+        config.mkdir()
+        generate_official_toolchain_configs(
+            config / "tools.json",
+            config / "routes.json",
+            dxc=dxc,
+            dxil_spirv=dxil_spirv,
+            spirv_cross=spirv_cross,
+        )
+        catalog = ToolchainCatalog(config / "tools.json", config / "routes.json")
+        case_root = self.root / "native-dxil-spirv"
+        case_root.mkdir()
+        source_path = case_root / "source.hlsl"
+        binary_path = case_root / "captured.dxil"
+        source_path.write_text(
+            "float4 CapturedPS(float4 position : SV_Position) : SV_Target0 {\n"
+            "  return float4(position.xy * 0.001, 0.5, 1.0);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        baseline = subprocess.run(
+            [
+                str(dxc),
+                "-T",
+                "ps_6_0",
+                "-E",
+                "CapturedPS",
+                "-Fo",
+                str(binary_path),
+                str(source_path),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(
+            0, baseline.returncode, baseline.stderr.decode("utf-8", errors="replace")
+        )
+        smoke = catalog.round_trip_smoke(
+            binary_path,
+            "hlsl",
+            case_root / "smoke-hlsl",
+            "fragment",
+            entry_point="CapturedPS",
+            input_format_hint="dxil",
+            target_api="d3d12",
+        )
+        diagnostics = {
+            str(path.relative_to(case_root)): path.read_text(
+                encoding="utf-8", errors="replace"
+            )
+            for path in case_root.rglob("stderr.log")
+        }
+        self.assertIsNone(
+            smoke["error"], {"report": smoke, "diagnostics": diagnostics}
+        )
+        self.assertEqual("ps_6_0", smoke["targetProfile"])
+        self.assertTrue(smoke["formatSmokePassed"])
+        self.assertEqual(smoke["jobs"][0]["physicalEntryPoint"], "main")
+        self.assertEqual(smoke["jobs"][1]["physicalEntryPoint"], "main")
+        self.assertEqual(smoke["jobs"][1]["emittedEntryPoint"], "CapturedPS")
+        self.assertFalse(smoke["semanticEquivalenceVerified"])
+        self.assertFalse(smoke["replayAbiValidated"])
+
     def test_spirv_cross_adapter_uses_physical_multi_entry_stage_and_sm6_profile(self) -> None:
         arguments = derive_spirv_cross_arguments(
             source=r"D:\jobs\multi-entry.spv",
@@ -675,6 +1284,23 @@ class ShaderToolchainTests(unittest.TestCase):
                 "--output",
                 r"D:\jobs\selected.hlsl",
             ],
+        )
+        renamed = derive_spirv_cross_arguments(
+            source=r"D:\jobs\translated.spv",
+            output=r"D:\jobs\reconstructed.hlsl",
+            mode="hlsl",
+            entry_point="main",
+            captured_entry_point="MainPS",
+            stage="fragment",
+            target_api="D3D12",
+            target_profile="ps_6_6",
+        )
+        rename_index = renamed.index("--rename-entry-point")
+        entry_index = renamed.index("--entry")
+        self.assertEqual(renamed[entry_index + 1], "MainPS")
+        self.assertEqual(
+            renamed[rename_index + 1 : rename_index + 4],
+            ["main", "MainPS", "frag"],
         )
         with self.assertRaisesRegex(ValueError, "contradicts physical stage"):
             derive_spirv_cross_arguments(
@@ -706,6 +1332,35 @@ class ShaderToolchainTests(unittest.TestCase):
                 target_api="D3D11",
                 target_profile="ps_6_7",
             )
+
+    def test_vulkan_spirv_never_reports_direct3d_hlsl_route_ready(self) -> None:
+        generated_root = self.root / "spirv-api-applicability"
+        generated_root.mkdir()
+        spirv_cross = generated_root / "spirv-cross.exe"
+        spirv_cross.write_bytes(b"fake spirv-cross")
+        generate_official_toolchain_configs(
+            generated_root / "tools.json",
+            generated_root / "routes.json",
+            spirv_cross=spirv_cross,
+        )
+        catalog = ToolchainCatalog(
+            generated_root / "tools.json", generated_root / "routes.json"
+        )
+        hlsl_route = next(
+            route
+            for route in catalog.routes()
+            if route.route_id == "spirv-cross-spirv-hlsl"
+        )
+        self.assertEqual(hlsl_route.target_apis, ("d3d11", "d3d12"))
+        plan = catalog.plan_recovery(
+            "spirv",
+            "fragment",
+            editable_format="hlsl",
+            target_api="vulkan",
+        )
+        self.assertEqual(plan["mode"], "evidence-only")
+        self.assertEqual(plan["decompileRouteIds"], [])
+        self.assertEqual(plan["compileRouteIds"], [])
 
     def test_opengl_spirv_routes_never_alias_vulkan_semantics(self) -> None:
         generated_root = self.root / "opengl-spirv"
@@ -766,7 +1421,7 @@ class ShaderToolchainTests(unittest.TestCase):
         )
         self.assertEqual(
             tools["tools"]["spirv-tools-val-opengl"]["validate"]["args"],
-            ["--target-env", "opengl", "{input}"],
+            ["--target-env", "opengl4.5", "{input}"],
         )
 
         arguments = derive_spirv_cross_arguments(
@@ -1022,9 +1677,11 @@ class ShaderToolchainTests(unittest.TestCase):
                 "--output",
                 "{output}",
                 "--validate",
-                "--entry",
-                "{entry_point}",
             ],
+        )
+        self.assertNotIn(
+            "{entry_point}",
+            generated_tools["tools"]["dxil-spirv-transform"]["transform"]["args"],
         )
         assembly_tool = generated_tools["tools"]["community-dxbc-assembly"]
         decompile_args = assembly_tool["decompile"]["args"]
@@ -1258,6 +1915,34 @@ class ShaderToolchainTests(unittest.TestCase):
         self.assertEqual("round-trip", file_recovery["mode"])
         self.assertEqual("dxil-asm", file_recovery["editableFormat"])
 
+        ray_library_path = generated_root / "captured-ray-library.dxil"
+        ray_library_path.write_bytes(
+            make_container(b"DXIL", make_dxil_program(0x00060063))
+        )
+        ray_library_recovery = catalog.plan_recovery_for_file(
+            ray_library_path,
+            "raygen",
+            target_api="d3d12",
+        )
+        self.assertEqual("round-trip", ray_library_recovery["mode"])
+        self.assertEqual("dxil-asm", ray_library_recovery["editableFormat"])
+        self.assertEqual(
+            "lib_6_3", ray_library_recovery["targetProfile"]["profile"]
+        )
+        self.assertEqual(
+            "library", ray_library_recovery["targetProfile"]["stage"]
+        )
+        ray_matrix = catalog.diagnostic_matrix("raygen")
+        ray_ir = next(
+            row
+            for row in ray_matrix["matrix"]
+            if row["inputFormat"] == "dxil"
+            and row["outputFormat"] == "dxil-asm"
+        )
+        self.assertTrue(ray_ir["editable"])
+        self.assertTrue(ray_ir["compilable"])
+        self.assertFalse(ray_ir["replayStageSupported"])
+
         unavailable = self.root / "dxc-assembler-unavailable"
         unavailable.mkdir()
         lone_dxc = unavailable / "dxc.exe"
@@ -1283,7 +1968,7 @@ class ShaderToolchainTests(unittest.TestCase):
             ),
         )
 
-    def test_automatic_native_ir_fallback_rejects_multihop_and_ambiguity(self) -> None:
+    def test_route_schema_rejects_false_fidelity_and_native_family_edges(self) -> None:
         generated_root = self.root / "dxc-automatic-fallback-safety"
         generated_root.mkdir()
         dxc = generated_root / "dxc.exe"
@@ -1307,28 +1992,15 @@ class ShaderToolchainTests(unittest.TestCase):
             if route["routeId"] == "dxc-dxil-assemble-to-container"
         )
 
-        strange = json.loads(json.dumps(original))
-        strange["routes"] = [
-            route
-            for route in strange["routes"]
-            if route["routeId"]
-            not in {
-                "dxc-dxil-native-disassembly",
-                "dxc-dxil-assemble-to-container",
-            }
-        ]
-        # Keep every synthetic edge valid under the route schema while making
-        # the apparent round trip depend on unrelated, multi-hop formats.  A
-        # decompile operation must start from a binary format and a compile
-        # operation must end at one, hence the SPIR-V bridge in each direction.
-        for route_id, source, target, template, fidelity in (
-            ("strange-dxil-slang", "dxil", "slang", dump, "custom-transform"),
-            ("strange-slang-spirv", "slang", "spirv", assemble, "custom-transform"),
-            ("strange-spirv-ir", "spirv", "dxil-asm", dump, "ir-disassembly"),
-            ("strange-ir-spirv", "dxil-asm", "spirv", assemble, "custom-transform"),
-            ("strange-spirv-slang", "spirv", "slang", dump, "custom-transform"),
-            ("strange-slang-dxil", "slang", "dxil", assemble, "ir-assembly"),
-        ):
+        malformed_cases = (
+            ("source-labelled-ir", dump, "dxil", "hlsl", "ir-disassembly"),
+            ("wrong-native-family", dump, "dxil", "spirv-asm", "ir-disassembly"),
+            ("source-labelled-assembly", assemble, "hlsl", "dxil", "ir-assembly"),
+            ("wrong-assembly-family", assemble, "spirv-asm", "dxil", "ir-assembly"),
+            ("custom-on-decompile", dump, "dxil", "slang", "custom-transform"),
+        )
+        for route_id, template, source, target, fidelity in malformed_cases:
+            malformed = json.loads(json.dumps(original))
             route = json.loads(json.dumps(template))
             route.update(
                 {
@@ -1338,15 +2010,30 @@ class ShaderToolchainTests(unittest.TestCase):
                     "fidelity": fidelity,
                 }
             )
-            strange["routes"].append(route)
-        strange_path = generated_root / "routes-strange.json"
-        atomic_write_json(strange_path, strange)
-        strange_plan = ToolchainCatalog(
-            tool_path, strange_path
-        ).plan_automatic_recovery("dxil", "fragment", target_api="d3d12")
-        self.assertEqual("compile-only-recovery", strange_plan["mode"])
-        self.assertEqual("hlsl", strange_plan["editableFormat"])
+            malformed["routes"] = [route]
+            malformed_path = generated_root / ("routes-%s.json" % route_id)
+            atomic_write_json(malformed_path, malformed)
+            with self.assertRaises(ToolConfigurationError, msg=route_id):
+                ToolchainCatalog(tool_path, malformed_path)
 
+    def test_automatic_native_ir_fallback_rejects_ambiguity(self) -> None:
+        generated_root = self.root / "dxc-automatic-fallback-ambiguity"
+        generated_root.mkdir()
+        dxc = generated_root / "dxc.exe"
+        dxcompiler = generated_root / "dxcompiler.dll"
+        dxil = generated_root / "dxil.dll"
+        dxc.write_bytes(b"fake dxc cli")
+        dxcompiler.write_bytes(b"fake official dxc runtime")
+        dxil.write_bytes(b"fake optional validator runtime")
+        tool_path = generated_root / "tools.json"
+        route_path = generated_root / "routes.json"
+        generate_official_toolchain_configs(tool_path, route_path, dxc=dxc)
+        original = json.loads(route_path.read_text(encoding="utf-8"))
+        dump = next(
+            route
+            for route in original["routes"]
+            if route["routeId"] == "dxc-dxil-native-disassembly"
+        )
         ambiguous = json.loads(json.dumps(original))
         duplicate = json.loads(json.dumps(dump))
         duplicate["routeId"] = "dxc-dxil-native-disassembly-alternate"

@@ -152,6 +152,9 @@ private:
   void AddResourceUsageEntry(QMenu &menu, uint32_t start, uint32_t end, ResourceUsage usage);
   void ShowResourceContextMenu(RDTreeWidget *widget, const QPoint &pos, ResourceId id,
                                const rdcarray<EventUsage> &usage);
+  bool GetTextureHistoryDetails(RDTreeWidgetItem *item, ResourceId id,
+                                Subresource &subresource, CompType &typeCast);
+  void OpenRenderTargetHistory(ResourceId id, const Subresource &subresource, CompType typeCast);
 
   IShaderViewer *EditShader(ResourceId id, ShaderStage shaderType, const rdcstr &entry,
                             ShaderCompileFlags compileFlags, KnownShaderTool knownTool,

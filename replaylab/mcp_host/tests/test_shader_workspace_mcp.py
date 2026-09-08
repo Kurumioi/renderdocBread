@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import json
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -106,6 +107,7 @@ class _CatalogBridge:
         self.export_capture_id_override: str | None = None
         self.all_draw_dispatch_event_ids = [321]
         self.export_use_event_id_override: int | None = None
+        self.compiled_interface: dict | None = None
 
     def call(self, method: str, params: dict, timeout: float | None = None):
         self.calls.append((method, dict(params)))
@@ -169,6 +171,8 @@ class _CatalogBridge:
             "rawSize": len(self.blob),
             "rawSha256": self.key.raw_sha256,
         }
+        if self.compiled_interface is not None:
+            shader.update(copy.deepcopy(self.compiled_interface))
         use = {
             "eventId": (
                 self.export_use_event_id_override
@@ -239,6 +243,7 @@ class _CatalogBridge:
             "schema": catalog["schema"],
             "schemaVersion": 1,
             "captureId": returned_capture_id,
+            "captureSessionId": self.capture_session_id,
             "catalogPath": str(catalog_path),
             "counts": {"uniqueShaders": 1},
         }
@@ -406,17 +411,98 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         self.assertEqual(
             replacement["supportedCaptureScope"],
             {
-                "apis": ["D3D11", "D3D12"],
-                "containerKinds": ["DXBC", "DXIL"],
+                "apis": ["D3D11", "D3D12", "Vulkan", "OpenGL"],
+                "containerKinds": ["DXBC", "DXIL", "SPIRV", "OPENGL-SPIRV"],
                 "combinations": [
                     {"api": "D3D11", "containerKinds": ["DXBC"]},
                     {"api": "D3D12", "containerKinds": ["DXBC", "DXIL"]},
+                    {"api": "Vulkan", "containerKinds": ["SPIRV"]},
+                    {"api": "OpenGL", "containerKinds": ["OPENGL-SPIRV"]},
                 ],
             },
         )
         # No capture API was supplied in this synthetic response, so capability is not guessed.
         self.assertEqual(replacement["candidateScopeStatus"], "not-evaluated")
         self.assertIn("D3D12", replacement["reason"])
+
+    def test_workspace_response_reports_each_checked_shared_apply_combination(self) -> None:
+        for api, kind in (
+            ("GraphicsAPI.D3D11", "DXBC"),
+            ("D3D12", "DXBC"),
+            ("D3D12", "DXIL"),
+            ("GraphicsAPI.Vulkan", "SPIRV"),
+            ("OpenGL", "OPENGL-SPIRV"),
+        ):
+            with self.subTest(api=api, kind=kind):
+                response = json.loads(
+                    self.server._shader_workspace_response(
+                        "compile",
+                        {
+                            "workspacePath": str(self.root / (api + "-workspace")),
+                            "capture": {"api": api},
+                            "kind": kind,
+                            "requiresReplayAbiValidation": True,
+                        },
+                    )
+                )
+                replacement = response["renderDocReplacement"]
+                self.assertEqual(
+                    replacement["candidateScopeStatus"],
+                    "supported-after-fresh-gates",
+                )
+                self.assertFalse(replacement["supportedByThisOperation"])
+                self.assertFalse(replacement["attempted"])
+                self.assertFalse(replacement["applied"])
+                self.assertFalse(response["candidateState"]["applied"])
+                self.assertTrue(
+                    response["candidateState"]["requiresReplayAbiValidation"]
+                )
+
+    def test_workspace_response_rejects_unsupported_or_unchecked_apply_scope(self) -> None:
+        cases = (
+            ({"capture": {"api": "Metal"}, "kind": "SPIRV"}, "unsupported"),
+            ({"capture": {"api": "Vulkan"}, "kind": "DXBC"}, "unsupported"),
+            ({"kind": "SPIRV"}, "not-evaluated"),
+            ({"capture": {"api": "OpenGL"}}, "not-evaluated"),
+        )
+        for candidate, expected_status in cases:
+            with self.subTest(candidate=candidate):
+                response = json.loads(
+                    self.server._shader_workspace_response(
+                        "compile",
+                        {
+                            "workspacePath": str(self.root / "unchecked-workspace"),
+                            "requiresReplayAbiValidation": True,
+                            **candidate,
+                        },
+                    )
+                )
+                replacement = response["renderDocReplacement"]
+                self.assertEqual(
+                    replacement["candidateScopeStatus"], expected_status
+                )
+                self.assertFalse(replacement["supportedByThisOperation"])
+                self.assertFalse(replacement["attempted"])
+                self.assertFalse(replacement["applied"])
+
+    def test_prepare_preflights_tool_catalog_before_exporting_capture_bytes(self) -> None:
+        workspace = self.root / "preflight-failure"
+        with mock.patch.object(
+            self.server,
+            "_shader_workspace_service",
+            side_effect=RuntimeError("invalid process-owned tool catalog"),
+        ):
+            result = json.loads(
+                self.server.prepare_shader_workspace(
+                    321,
+                    "fragment",
+                    str(workspace),
+                )
+            )
+
+        self.assertIn("error", result)
+        self.assertEqual(self.bridge.calls, [])
+        self.assertFalse(workspace.exists())
 
     def test_prepare_edit_compile_status_never_applies_candidate(self) -> None:
         workspace = self.root / "workspace"
@@ -425,8 +511,6 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 321,
                 "fragment",
                 str(workspace),
-                "test-decompiler",
-                "test-compiler",
             )
         )
         self.assertNotIn("error", prepared)
@@ -448,9 +532,62 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         )
         source = workspace / "source" / "shader.hlsl"
         self.assertIn("prepared fragment/main", source.read_text(encoding="utf-8"))
+        operation_lock = workspace / ".workspace-operation.lock"
+        operation_lock.write_text("another-process-token\n", encoding="ascii")
+        locked_reuse = json.loads(
+            self.server.decompile_shader_workspace(str(workspace))
+        )
+        self.assertIn("error", locked_reuse)
+        self.assertIn("locked by another process", locked_reuse["error"])
+        self.assertEqual(
+            operation_lock.read_text(encoding="ascii"),
+            "another-process-token\n",
+        )
+        operation_lock.unlink()
+        reconstructed = json.loads(
+            self.server.decompile_shader_workspace(str(workspace))
+        )
+        self.assertNotIn("error", reconstructed)
+        self.assertTrue(reconstructed["result"]["reusedPreparedSource"])
+        self.assertEqual(
+            reconstructed["result"]["sourceSha256"],
+            prepared["result"]["representation"]["sha256"],
+        )
+        self.assertIsNone(reconstructed["result"]["latestCompiled"])
+        self.assertFalse(reconstructed["candidateState"]["present"])
+
+        pristine_compiled = json.loads(
+            self.server.compile_shader_workspace(str(workspace))
+        )
+        self.assertNotIn("error", pristine_compiled)
+        reconstructed_with_candidate = json.loads(
+            self.server.decompile_shader_workspace(str(workspace))
+        )
+        self.assertNotIn("error", reconstructed_with_candidate)
+        self.assertTrue(
+            reconstructed_with_candidate["result"]["reusedPreparedSource"]
+        )
+        self.assertEqual(
+            reconstructed_with_candidate["result"]["latestCompiled"]["rawSha256"],
+            pristine_compiled["result"]["rawSha256"],
+        )
+        self.assertTrue(reconstructed_with_candidate["candidateState"]["present"])
+        self.assertTrue(
+            reconstructed_with_candidate["candidateState"][
+                "requiresReplayAbiValidation"
+            ]
+        )
+        self.assertFalse(
+            reconstructed_with_candidate["candidateState"]["replayAbiValidated"]
+        )
         source.write_text(
             source.read_text(encoding="utf-8") + "// edited\n", encoding="utf-8"
         )
+        edited_repeat = json.loads(
+            self.server.decompile_shader_workspace(str(workspace))
+        )
+        self.assertIn("error", edited_repeat)
+        self.assertIn("refusing to overwrite", edited_repeat["error"])
 
         compiled = json.loads(self.server.compile_shader_workspace(str(workspace)))
         self.assertNotIn("error", compiled)
@@ -466,7 +603,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         )
         self.assertEqual(len(self.bridge.calls), 1)
 
-        lock_path = workspace / ".workspace-operation.lock"
+        lock_path = operation_lock
         lock_path.write_text("another-process-token\n", encoding="ascii")
         status = json.loads(self.server.get_shader_workspace_status(str(workspace)))
         self.assertNotIn("error", status)
@@ -479,6 +616,303 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         )
         self.assertFalse(status["result"]["applied"])
 
+    def test_failed_primary_route_exposes_agent_selected_recovery_candidate(self) -> None:
+        tool_document = json.loads(self.config.read_text(encoding="utf-8"))
+        tool_document["tools"]["failing-decompiler"] = {
+            "executable": str(Path(sys.executable).resolve()),
+            "executableSha256": hashlib.sha256(
+                Path(sys.executable).resolve().read_bytes()
+            ).hexdigest(),
+            "fixedFileHashes": {
+                str(self.script.resolve()): hashlib.sha256(
+                    self.script.read_bytes()
+                ).hexdigest()
+            },
+            "decompile": {
+                "args": [
+                    str(self.script.resolve()),
+                    "fail-decompile",
+                    "{input}",
+                    "{output}",
+                    "{stage}",
+                    "{entry_point}",
+                ],
+                "timeoutSeconds": 10,
+            },
+        }
+        self.config.write_text(json.dumps(tool_document), encoding="utf-8")
+        registry = ToolRegistry(self.config)
+        routes = [
+            route_record(
+                registry,
+                route_id="failing-primary-dxbc-hlsl",
+                tool_id="failing-decompiler",
+                operation="decompile",
+                input_format="dxbc",
+                output_format="hlsl",
+                stages=["fragment"],
+                fidelity="reconstructed-source",
+                priority=1,
+                implementation="failing primary fixture",
+                source_url="https://example.invalid/failing-primary",
+                caveats=["Fixture source is reconstructed."],
+            ),
+            route_record(
+                registry,
+                route_id="working-secondary-dxbc-hlsl",
+                tool_id="test-decompiler",
+                operation="decompile",
+                input_format="dxbc",
+                output_format="hlsl",
+                stages=["fragment"],
+                fidelity="reconstructed-source",
+                priority=10,
+                implementation="working secondary fixture",
+                source_url="https://example.invalid/working-secondary",
+                caveats=["Fixture source is reconstructed."],
+            ),
+            route_record(
+                registry,
+                route_id="failing-tertiary-dxbc-hlsl",
+                tool_id="failing-decompiler",
+                operation="decompile",
+                input_format="dxbc",
+                output_format="hlsl",
+                stages=["fragment"],
+                fidelity="reconstructed-source",
+                priority=20,
+                implementation="failing tertiary fixture",
+                source_url="https://example.invalid/failing-tertiary",
+                caveats=["Fixture source is reconstructed."],
+            ),
+            route_record(
+                registry,
+                route_id="test-hlsl-dxbc",
+                tool_id="test-compiler",
+                operation="compile",
+                input_format="hlsl",
+                output_format="dxbc",
+                stages=["fragment"],
+                fidelity="native-compile",
+                priority=10,
+                implementation="test compiler",
+                source_url="https://example.invalid/test-compiler",
+            ),
+        ]
+        self.toolchains_config.write_text(
+            json.dumps(toolchain_document(self.config, routes)),
+            encoding="utf-8",
+        )
+
+        source = self.root / "failed-primary"
+        prepared = json.loads(
+            self.server.prepare_shader_workspace(321, "fragment", str(source))
+        )
+        self.assertNotIn("error", prepared, prepared)
+        original_status = self.server._shader_workspace_service().status(source)
+        recovery = original_status["recoveryPlan"]
+        self.assertEqual(len(recovery["decompileCandidates"]), 3)
+        result = prepared["result"]
+        # The Host tool runs exactly one primary attempt and never traverses or
+        # ranks the remaining registered pairs: the child Agent owns the next
+        # technical decision. A failed primary therefore yields an Agent-owned
+        # recovery decision plus the full hash-bound candidate inventory, not a
+        # Host-selected reconstruction.
+        self.assertIsNone(result["reconstructionReceipt"])
+        decision = result["recoveryDecision"]
+        self.assertFalse(decision["hostSelectedNextRoute"])
+        self.assertEqual(decision["status"], "agent-route-selection-required")
+        self.assertEqual(decision["registeredDecompileCandidateCount"], 3)
+        self.assertGreater(decision["untriedAlternativePairCount"], 0)
+        self.assertIn(
+            result["representation"]["lane"], {"explanatory-ir", "binary-only"}
+        )
+        self.assertFalse(prepared["renderDocReplacement"]["attempted"])
+
+        # The child Agent selects a still-untried, hash-bound candidate. Index 1
+        # is the working secondary decompiler; the Host verifies the plan and
+        # identity binding and runs exactly that one route, producing the
+        # reconstruction receipt. The Host did not choose it — the Agent did.
+        working_target = self.root / "agent-selected-recovery"
+        recovered = json.loads(
+            self.server.try_shader_workspace_recovery_candidate(
+                str(source),
+                str(working_target),
+                recovery["planSha256"],
+                original_status["workspaceId"],
+                self.key.raw_sha256,
+                original_status["capture"]["captureId"],
+                decompile_candidate_index=1,
+                compile_candidate_index=0,
+            )
+        )
+        self.assertNotIn("error", recovered, recovered)
+        recovered_result = recovered["result"]
+        self.assertTrue(recovered_result["execution"]["succeeded"])
+        self.assertTrue(recovered_result["workspaceStatus"]["source"]["present"])
+        reconstruction = recovered_result["reconstructionReceipt"]
+        self.assertIsNotNone(reconstruction)
+        self.assertEqual(
+            reconstruction["schema"],
+            "renderdoc-ultra-shader-recovery-reconstruction/v1",
+        )
+        self.assertEqual(reconstruction["status"], "succeeded")
+        self.assertEqual(reconstruction["decompileCandidateIndex"], 1)
+        self.assertTrue(reconstruction["baselineCompileVerified"])
+        self.assertEqual(
+            recovered_result["created"]["recoveryAttempt"]["decompileRouteIds"],
+            ["working-secondary-dxbc-hlsl"],
+        )
+
+        invalid_target = self.root / "tampered-recovery"
+        rejected = json.loads(
+            self.server.try_shader_workspace_recovery_candidate(
+                str(source),
+                str(invalid_target),
+                "0" * 64,
+                original_status["workspaceId"],
+                self.key.raw_sha256,
+                original_status["capture"]["captureId"],
+                decompile_candidate_index=1,
+                compile_candidate_index=0,
+            )
+        )
+        self.assertIn("error", rejected)
+        self.assertFalse(invalid_target.exists())
+
+        manual_failed_target = self.root / "manual-failed-recovery"
+        failed_attempt = json.loads(
+            self.server.try_shader_workspace_recovery_candidate(
+                str(source),
+                str(manual_failed_target),
+                recovery["planSha256"],
+                original_status["workspaceId"],
+                self.key.raw_sha256,
+                original_status["capture"]["captureId"],
+                decompile_candidate_index=2,
+                compile_candidate_index=0,
+            )
+        )
+        self.assertNotIn("error", failed_attempt, failed_attempt)
+        failed_result = failed_attempt["result"]
+        self.assertFalse(failed_result["execution"]["succeeded"])
+        self.assertIsNone(failed_result["reconstructionReceipt"])
+        self.assertIn(
+            failed_result["representation"]["lane"],
+            {"explanatory-ir", "binary-only"},
+        )
+        manual_manifest = json.loads(
+            (manual_failed_target / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            sum(
+                item.get("operation") == "decompile-route-chain"
+                for item in manual_manifest["history"]
+            ),
+            1,
+        )
+
+    def test_exhausted_decompilers_publish_agent_reconstruction_scaffold(self) -> None:
+        tool_document = json.loads(self.config.read_text(encoding="utf-8"))
+        tool_document["tools"]["failing-decompiler"] = {
+            "executable": str(Path(sys.executable).resolve()),
+            "executableSha256": hashlib.sha256(
+                Path(sys.executable).resolve().read_bytes()
+            ).hexdigest(),
+            "fixedFileHashes": {
+                str(self.script.resolve()): hashlib.sha256(
+                    self.script.read_bytes()
+                ).hexdigest()
+            },
+            "decompile": {
+                "args": [
+                    str(self.script.resolve()),
+                    "fail-decompile",
+                    "{input}",
+                    "{output}",
+                    "{stage}",
+                    "{entry_point}",
+                ],
+                "timeoutSeconds": 10,
+            },
+        }
+        self.config.write_text(json.dumps(tool_document), encoding="utf-8")
+        registry = ToolRegistry(self.config)
+        routes = [
+            route_record(
+                registry,
+                route_id="failing-primary-dxbc-hlsl",
+                tool_id="failing-decompiler",
+                operation="decompile",
+                input_format="dxbc",
+                output_format="hlsl",
+                stages=["fragment"],
+                fidelity="reconstructed-source",
+                priority=1,
+                implementation="failing primary fixture",
+                source_url="https://example.invalid/failing-primary",
+                caveats=["Fixture source is reconstructed."],
+            ),
+            route_record(
+                registry,
+                route_id="failing-secondary-dxbc-hlsl",
+                tool_id="failing-decompiler",
+                operation="decompile",
+                input_format="dxbc",
+                output_format="hlsl",
+                stages=["fragment"],
+                fidelity="reconstructed-source",
+                priority=10,
+                implementation="failing secondary fixture",
+                source_url="https://example.invalid/failing-secondary",
+                caveats=["Fixture source is reconstructed."],
+            ),
+            route_record(
+                registry,
+                route_id="test-hlsl-dxbc",
+                tool_id="test-compiler",
+                operation="compile",
+                input_format="hlsl",
+                output_format="dxbc",
+                stages=["fragment"],
+                fidelity="native-compile",
+                priority=10,
+                implementation="test compiler",
+                source_url="https://example.invalid/test-compiler",
+            ),
+        ]
+        self.toolchains_config.write_text(
+            json.dumps(toolchain_document(self.config, routes)),
+            encoding="utf-8",
+        )
+
+        workspace = self.root / "all-decompilers-failed"
+        prepared = json.loads(
+            self.server.prepare_shader_workspace(321, "fragment", str(workspace))
+        )
+
+        self.assertNotIn("error", prepared, prepared)
+        result = prepared["result"]
+        # The primary decompile fails and no working candidate exists. The Host
+        # does not keep trying the remaining registered pairs on its own: it
+        # publishes the Agent-reconstruction scaffold (RenderDoc disassembly plus
+        # a hash-bound provisional candidate) and leaves the next technical
+        # decision to the child Agent.
+        self.assertIsNone(result["reconstructionReceipt"])
+        self.assertFalse(result["recoveryDecision"]["hostSelectedNextRoute"])
+        self.assertEqual(result["representation"]["lane"], "explanatory-ir")
+        provisional = result["provisionalReconstruction"]
+        self.assertEqual(provisional["status"], "ready-for-agent-reconstruction")
+        self.assertFalse(provisional["compileEligible"])
+        self.assertFalse(provisional["applyEligible"])
+        candidate = Path(provisional["candidatePath"])
+        self.assertTrue(candidate.is_file())
+        self.assertIn("Not original source", candidate.read_text(encoding="utf-8"))
+        self.assertEqual(
+            hashlib.sha256(candidate.read_bytes()).hexdigest(),
+            provisional["candidateSha256"],
+        )
+
     def test_restart_rebinds_exact_workspace_catalog_without_new_workspace(self) -> None:
         workspace = self.root / "workspace-rebind"
         prepared = json.loads(
@@ -486,8 +920,6 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 321,
                 "fragment",
                 str(workspace),
-                "test-decompiler",
-                "test-compiler",
             )
         )
         self.assertNotIn("error", prepared)
@@ -539,8 +971,6 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 321,
                 "fragment",
                 str(workspace),
-                "test-decompiler",
-                "test-compiler",
             )
         )
         self.assertNotIn("error", prepared)
@@ -606,8 +1036,6 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 321,
                 "fragment",
                 str(workspace),
-                "test-decompiler",
-                "test-compiler",
             )
         )
         self.assertNotIn("error", prepared)
@@ -660,8 +1088,6 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 321,
                 "fragment",
                 str(workspace),
-                "test-decompiler",
-                "test-compiler",
             )
         )
         self.assertNotIn("error", prepared)
@@ -683,8 +1109,6 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 321,
                 "fragment",
                 str(workspace),
-                "test-decompiler",
-                "test-compiler",
             )
         )
         self.assertNotIn("error", prepared)
@@ -1109,6 +1533,11 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         original_bridge_call = self.bridge.call
 
         def bridge_call(method: str, params: dict, timeout=None):
+            if method == "begin_export_shader_catalog":
+                raise RuntimeError(
+                    "Bridge error [-32601]: Unknown method: "
+                    "begin_export_shader_catalog"
+                )
             if method != "export_shader_catalog" or params.get("event_ids") != []:
                 return original_bridge_call(method, params, timeout)
             self.bridge.calls.append((method, dict(params)))
@@ -1130,6 +1559,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         old_active = self.server._ACTIVE_PROJECT_SERVICE
         self.server._ACTIVE_PROJECT_SERVICE = active
         self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS.clear()
+
         try:
             with mock.patch.object(self.bridge, "call", side_effect=bridge_call):
                 active_prepared = json.loads(
@@ -1163,20 +1593,28 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                     ]
                 )
 
+                wrong_workspace = workspace.parent / ("f" * 64)
+                wrong_path = json.loads(
+                    self.server.prepare_shader_workspace(
+                        321,
+                        "fragment",
+                        str(wrong_workspace),
+                    )
+                )
+                self.assertIn("deterministic path", wrong_path["error"])
+                self.assertFalse(wrong_workspace.exists())
+
                 bypass = json.loads(
                     self.server.prepare_shader_workspace(
                         321,
                         "fragment",
                         str(workspace),
-                        "test-decompiler",
-                        "test-compiler",
-                        str(self.root / "explicit-subset"),
+                        catalog_output_dir=str(self.root / "explicit-subset"),
                     )
                 )
                 self.assertIn("cannot bypass", bypass["error"])
                 self.assertFalse(workspace.exists())
 
-                race_workspace = workspace.with_name(workspace.name + "-binding-race")
                 workspace_service = self.server._shader_workspace_service()
                 original_create = workspace_service.create
                 with self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS_GUARD:
@@ -1208,9 +1646,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                             self.server.prepare_shader_workspace(
                                 321,
                                 "fragment",
-                                str(race_workspace),
-                                "test-decompiler",
-                                "test-compiler",
+                                str(workspace),
                             )
                         )
                     self.assertIn("binding changed", raced["error"])
@@ -1219,14 +1655,14 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                         self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS["a" * 32] = (
                             original_binding
                         )
+                    if workspace.exists():
+                        shutil.rmtree(workspace)
 
                 prepared = json.loads(
                     self.server.prepare_shader_workspace(
                         321,
                         "fragment",
                         str(workspace),
-                        "test-decompiler",
-                        "test-compiler",
                     )
                 )
                 self.assertNotIn("error", prepared, prepared)
@@ -1257,6 +1693,102 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS.clear()
             self.server._ACTIVE_PROJECT_SERVICE = old_active
 
+    def test_empty_capture_bootstrap_then_prepare_reuses_one_event_catalog(self) -> None:
+        active = ActiveReplayProjectService(self.root / "single-active.json", self.root / "single-projects")
+        active.ensure_pending("Single Shader bootstrap")
+        self.bridge.instance_id = "123-" + "b" * 32
+        self.bridge.context = {
+            "schema": "renderdoc-ultra-current-context/v1", "schemaVersion": 1,
+            "capture": {"loaded": True, "captureSessionId": self.bridge.capture_session_id,
+                        "captureId": "", "path": "D:/captures/frame.rdc", "api": "D3D11"},
+            "events": {"currentEventId": 321, "selectedEventId": 321},
+            "shaders": {"bound": [{"stage": "fragment", "resourceId": self.key.resource_id,
+                                   "entryPoint": self.key.entry_point, "rawSha256": self.key.raw_sha256}]},
+        }
+        with mock.patch.object(self.server, "_ACTIVE_PROJECT_SERVICE", active):
+            self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS.clear()
+            try:
+                target = json.loads(self.server.get_active_shader_workspace_path(321, "fragment"))
+                self.assertNotIn("error", target, target)
+                self.assertFalse(target["fullFrame"])
+                prepared = json.loads(self.server.prepare_shader_workspace(
+                    321, "fragment", target["workspacePath"],
+                    expected_resource_id=target["shaderResourceId"],
+                    expected_entry_point=target["entryPoint"],
+                    expected_raw_sha256=target["rawSha256"],
+                    expected_capture_id=target["captureId"],
+                    expected_capture_session_id=target["captureSessionId"],
+                    admit_existing=True,
+                ))
+                self.assertNotIn("error", prepared, prepared)
+                exported = prepared["result"]["catalogExport"]
+                self.assertTrue(exported["reusedActiveProjectCatalog"])
+                self.assertFalse(exported["fullFrame"])
+                self.assertEqual(exported["coveredEventIds"], [321])
+                exports = [args for method, args in self.bridge.calls if method == "export_shader_catalog"]
+                self.assertEqual(len(exports), 1)
+                self.assertEqual(exports[0]["event_ids"], [321])
+                self.assertEqual(exports[0]["stages"], ["fragment"])
+                status = json.loads(self.server.get_shader_workspace_status(target["workspacePath"]))["result"]
+                self.assertTrue(status["source"]["present"])
+                self.assertEqual(status["capture"]["catalogSha256"], target["catalogSha256"])
+            finally:
+                self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS.clear()
+
+    def test_strict_prepare_does_not_advertise_legacy_tool_ids(self) -> None:
+        annotations = self.server.prepare_shader_workspace.__annotations__
+        self.assertNotIn("decompiler_tool_id", annotations)
+        self.assertNotIn("compiler_tool_id", annotations)
+        with self.assertRaisesRegex(TypeError, "decompiler_tool_id"):
+            self.server.prepare_shader_workspace(
+                321, "fragment", str(self.root / "legacy-prepare"),
+                decompiler_tool_id="test-decompiler", compiler_tool_id="test-compiler")
+        self.assertEqual(self.bridge.calls, [])
+
+    def test_product_prepare_uses_project_source_before_any_decompile(self):
+        from tests.test_shader_abi import complete_interface
+        self.bridge.compiled_interface = complete_interface()
+        active = ActiveReplayProjectService(self.root / "source-active.json", self.root / "source-projects")
+        active.ensure_pending("Direct project source")
+        active.configure_scope(game_id="game", build_id="build", api_family="d3d11")
+        self.bridge.instance_id = "123-" + "b" * 32
+        self.bridge.context = {
+            "schema": "renderdoc-ultra-current-context/v1", "schemaVersion": 1,
+            "capture": {"loaded": True, "captureSessionId": self.bridge.capture_session_id,
+                        "captureId": "", "path": "D:/captures/frame.rdc", "api": "D3D11"},
+            "events": {"currentEventId": 321, "selectedEventId": 321},
+            "shaders": {"bound": [{"stage": "fragment", "resourceId": self.key.resource_id,
+                                   "entryPoint": self.key.entry_point, "rawSha256": self.key.raw_sha256}]},
+        }
+        with mock.patch.object(self.server, "_ACTIVE_PROJECT_SERVICE", active):
+            self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS.clear()
+            try:
+                target = json.loads(self.server.get_active_shader_workspace_path(321, "fragment"))
+                self.assertNotIn("error", target, target)
+                binding = self.server._active_capture_catalog_binding()
+                service = self.server._shader_workspace_service()
+                origin = self.root / "registered-origin"
+                service.create(binding[3], self.key.catalog_key, origin, editable_format="hlsl")
+                service.decompile(origin)
+                origin_status = service.status(origin)
+                registered = active.replay_service().register_workspace(origin_status, include_analysis=False)
+                plan = active.replay_service().reuse_plan(target["captureId"], target["catalogSha256"])
+                self.assertTrue(plan["matches"][0]["workspaceCandidates"][0]["sourceSeedEligible"], plan["matches"][0]["workspaceCandidates"])
+                with mock.patch.object(self.server, "_shader_workspace_service", return_value=service), mock.patch.object(service, "decompile", side_effect=AssertionError("project reuse must not decompile")):
+                    prepared = json.loads(self.server.prepare_shader_workspace(
+                        321, "fragment", target["workspacePath"],
+                        expected_resource_id=target["shaderResourceId"], expected_entry_point=target["entryPoint"],
+                        expected_raw_sha256=target["rawSha256"], expected_capture_id=target["captureId"],
+                        expected_capture_session_id=target["captureSessionId"], admit_existing=True))
+                self.assertNotIn("error", prepared, prepared)
+                result = prepared["result"]
+                self.assertFalse(result["projectSourceReuse"]["decompileInvoked"])
+                self.assertEqual(result["projectSourceReuse"]["knowledgeId"], registered["knowledge"]["knowledgeId"])
+                self.assertEqual(result["workspaceStatus"]["source"]["currentSha256"], origin_status["source"]["currentSha256"])
+                self.assertFalse(result["catalogExport"]["fullFrame"])
+                self.assertFalse(any(method == "reverse_shader" for method, unused in self.bridge.calls))
+            finally:
+                self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS.clear()
     def test_current_event_representation_covers_non_workspace_shader_formats(self) -> None:
         represented = json.loads(
             self.server.get_current_shader_representation(777, "fragment")
@@ -1368,8 +1900,6 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 322,
                 "fragment",
                 str(workspace),
-                "test-decompiler",
-                "test-compiler",
             )
         )
         self.assertNotIn("error", prepared)
@@ -1525,6 +2055,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             def __init__(inner_self):
                 inner_self.calls = []
                 inner_self.change_source_during_shared_apply = False
+                inner_self.malformed_shared_response = False
 
             def call(inner_self, method, params, timeout=None):
                 inner_self.calls.append((method, dict(params), timeout))
@@ -1548,9 +2079,12 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                         "eventId": 321,
                         "stage": "fragment",
                         "entryPoint": "main",
+                        "api": "d3d11",
+                        "encoding": "dxbc",
                         "originalResourceId": 77,
                         "originalRawSha256": baseline_hash,
                         "candidateRawSha256": candidate_hash,
+                        "physicalAbiSha256": "9" * 64,
                         "targetResourceId": 99,
                         "shaderFamilyId": "5" * 64,
                         "targetReferenceCount": 1,
@@ -1583,9 +2117,12 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                                 "eventId": event_id,
                                 "stage": "fragment",
                                 "entryPoint": "main",
+                                "api": "d3d11",
+                                "encoding": "dxbc",
                                 "originalResourceId": 77,
                                 "originalRawSha256": baseline_hash,
                                 "candidateRawSha256": candidate_hash,
+                                "physicalAbiSha256": "9" * 64,
                                 "targetResourceId": 100,
                                 "shaderFamilyId": "6" * 64,
                                 "targetReferenceCount": 2,
@@ -1606,6 +2143,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                         "captureId": capture_id,
                         "captureSessionId": "8" * 32,
                         "shaderFamilyId": "6" * 64,
+                        "physicalAbiSha256": "9" * 64,
                         "candidateRawSha256": candidate_hash,
                         "targetResourceId": 100,
                         "transactional": True,
@@ -1617,10 +2155,12 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                     self.assertEqual(params["expected_original_resource_id"], 77)
                     if inner_self.change_source_during_shared_apply:
                         status["source"]["currentSha256"] = "2" * 64
-                    return {
+                    response = {
                         "schema": "renderdoc-ultra-shared-shader-replacement/v1",
                         "schemaVersion": 1,
                         "replacementId": "7" * 32,
+                        "operationId": params["operation_id"],
+                        "operationCreatedReplacement": True,
                         "captureId": capture_id,
                         "captureSessionId": "8" * 32,
                         "workspaceId": workspace_id,
@@ -1646,6 +2186,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                         "singleOwner": True,
                         "checkedDerivedPipelineRebuild": False,
                         "capturedRootSignaturesReused": False,
+                        "postApplyAnchorVerified": False,
                         "idempotent": False,
                         "metadataOnly": False,
                         "targetBuiltOnce": True,
@@ -1653,6 +2194,11 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                         "supersededReplacementId": None,
                         "supersededTargetFreed": True,
                     }
+                    if inner_self.malformed_shared_response:
+                        response["replacementId"] = "4" * 32
+                        response["operationId"] = "3" * 32
+                        response.pop("physicalAbiSha256")
+                    return response
                 if method == "get_capture_status":
                     return {
                         "loaded": True,
@@ -1671,10 +2217,23 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                         "captureSessionId": "8" * 32,
                         "eventId": 321,
                         "stage": "fragment",
+                        "entryPoint": "main",
+                        "api": "d3d11",
+                        "encoding": "dxbc",
+                        "originalResourceId": 77,
+                        "originalRawSha256": baseline_hash,
                         "candidateRawSha256": candidate_hash,
+                        "physicalAbiSha256": "9" * 64,
+                        "shaderFamilyId": "5" * 64,
+                        "targetResourceId": 99,
+                        "resourceScoped": False,
+                        "eventScoped": True,
+                        "alreadyRestored": False,
+                        "idempotentRollback": False,
                         "cleared": True,
                         "targetFreed": True,
                         "clearWarning": "",
+                        "originalShaderPreserved": True,
                     }
                 if method == "rollback_shader_candidate_overrides":
                     return {
@@ -1684,6 +2243,8 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                         "captureSessionId": "8" * 32,
                         "transactional": True,
                         "originalShadersPreserved": True,
+                        "alreadyRestored": False,
+                        "idempotentRollback": False,
                         "overrides": [
                             {
                                 "schema": "renderdoc-ultra-event-shader-override/v1",
@@ -1693,7 +2254,19 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                                 "captureSessionId": "8" * 32,
                                 "eventId": event_id,
                                 "stage": "fragment",
+                                "entryPoint": "main",
+                                "api": "d3d11",
+                                "encoding": "dxbc",
+                                "originalResourceId": 77,
+                                "originalRawSha256": baseline_hash,
                                 "candidateRawSha256": candidate_hash,
+                                "physicalAbiSha256": "9" * 64,
+                                "shaderFamilyId": "6" * 64,
+                                "targetResourceId": 100,
+                                "resourceScoped": False,
+                                "eventScoped": True,
+                                "alreadyRestored": False,
+                                "idempotentRollback": False,
                                 "cleared": True,
                                 "targetFreed": index == 1,
                                 "originalShaderPreserved": True,
@@ -1711,10 +2284,20 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                         "captureId": capture_id,
                         "captureSessionId": "8" * 32,
                         "workspaceId": workspace_id,
+                        "stage": "fragment",
+                        "entryPoint": "main",
+                        "api": "d3d11",
+                        "encoding": "dxbc",
                         "originalResourceId": 77,
+                        "originalRawSha256": baseline_hash,
+                        "candidateRawSha256": candidate_hash,
+                        "physicalAbiSha256": "9" * 64,
+                        "shaderFamilyId": "7" * 64,
                         "targetResourceId": 101,
                         "resourceScoped": True,
                         "eventScoped": False,
+                        "alreadyRestored": False,
+                        "idempotentRollback": False,
                         "cleared": True,
                         "targetFreed": True,
                         "originalShaderPreserved": True,
@@ -1748,7 +2331,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             self.server,
             "list_exact_shader_family_uses",
             return_value=[321, 322],
-        ), mock.patch.object(
+        ) as list_exact_shader_family_uses, mock.patch.object(
             self.server,
             "_ensure_workspace_capture_catalog_identity",
             return_value={
@@ -1770,7 +2353,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
 
             applied = json.loads(
                 self.server.apply_shader_workspace_candidate(
-                    status["workspacePath"], 321
+                    status["workspacePath"], 321, 2, candidate_hash
                 )
             )
             self.assertTrue(applied["applied"])
@@ -1798,7 +2381,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
 
             family = json.loads(
                 self.server.apply_shader_workspace_candidate_family(
-                    status["workspacePath"]
+                    status["workspacePath"], 2, candidate_hash
                 )
             )
             self.assertTrue(family["applied"])
@@ -1816,12 +2399,21 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             self.assertFalse(family_rollback["applied"])
             self.assertTrue(family_rollback["family"]["transactional"])
 
+            all_use_scans_before_inventory_anchor = (
+                list_exact_shader_family_uses.call_count
+            )
             shared = json.loads(
                 self.server.apply_shader_workspace_shared_resource(
-                    status["workspacePath"]
+                    status["workspacePath"],
+                    expected_anchor_event_id=321,
                 )
             )
-            self.assertTrue(shared["applied"])
+            self.assertTrue(shared.get("applied"), shared)
+            self.assertNotIn("projectSync", shared)
+            self.assertEqual(
+                list_exact_shader_family_uses.call_count,
+                all_use_scans_before_inventory_anchor,
+            )
             self.assertEqual(shared["scope"], "captured-resource")
             self.assertTrue(shared["replacement"]["resourceScoped"])
             self.assertFalse(shared["replacement"]["eventScoped"])
@@ -1837,6 +2429,29 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             )
             self.assertFalse(shared_rollback["applied"])
             self.assertTrue(shared_rollback["replacement"]["targetFreed"])
+
+            # Malformed raw evidence may point at a pre-existing owner. It is
+            # not proof that this operation created that replacement, so the
+            # Host must not auto-rollback the supplied token.
+            rollbacks_before_malformed = sum(
+                call[0] == "rollback_shader_candidate_shared_resource"
+                for call in bridge.calls
+            )
+            bridge.malformed_shared_response = True
+            malformed = json.loads(
+                self.server.apply_shader_workspace_shared_resource(
+                    status["workspacePath"], 2, candidate_hash
+                )
+            )
+            self.assertIn("physicalAbiSha256", malformed["error"])
+            self.assertEqual(
+                sum(
+                    call[0] == "rollback_shader_candidate_shared_resource"
+                    for call in bridge.calls
+                ),
+                rollbacks_before_malformed,
+            )
+            bridge.malformed_shared_response = False
 
             exact_validation = json.loads(
                 self.server.validate_shader_workspace_candidate(
@@ -1904,20 +2519,20 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             ):
                 oversized = json.loads(
                     self.server.apply_shader_workspace_candidate_family(
-                        status["workspacePath"]
+                        status["workspacePath"], 2, candidate_hash
                     )
                 )
             self.assertIn("257 exact uses", oversized["error"])
             self.assertIn("explicit subset", oversized["error"])
 
         methods = [call[0] for call in bridge.calls]
-        self.assertEqual(methods.count("reflect_shader_candidate"), 7)
+        self.assertEqual(methods.count("reflect_shader_candidate"), 8)
         self.assertEqual(methods.count("apply_shader_candidate_override"), 1)
         self.assertEqual(methods.count("rollback_shader_candidate_override"), 1)
         self.assertEqual(methods.count("apply_shader_candidate_overrides"), 1)
         self.assertEqual(methods.count("rollback_shader_candidate_overrides"), 1)
         self.assertEqual(
-            methods.count("apply_shader_candidate_shared_resource"), 2
+            methods.count("apply_shader_candidate_shared_resource"), 3
         )
         self.assertEqual(
             methods.count("rollback_shader_candidate_shared_resource"), 2
@@ -1968,7 +2583,13 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                     "LOCALAPPDATA": str(self.root / "LocalAppData"),
                 }
             ),
-            (self.root / "LocalAppData" / "RenderDocUltra" / "shader-tools.v1.json").resolve(),
+            (
+                self.root
+                / "LocalAppData"
+                / "ReplayLab"
+                / "config"
+                / "shader-tools.v1.json"
+            ).resolve(),
         )
 
     def test_prepare_selector_fails_closed_on_two_event_stage_shaders(self) -> None:
@@ -2049,7 +2670,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
 
     def test_alias_apply_reexports_from_database_and_binds_exact_file_digest(self) -> None:
         database = self.root / "symbols.sqlite3"
-        capture_id = "capture-program-verified"
+        capture_id = "a" * 64
 
         class FakeService:
             def __init__(inner_self, database_path):
@@ -2074,7 +2695,14 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                     "aliases": [],
                 }
                 path.write_text(json.dumps(value), encoding="utf-8")
-                return {"path": str(path), "captureId": supplied_capture_id}
+                return {
+                    "schema": "renderdoc-ultra-aliases/v1",
+                    "schemaVersion": 1,
+                    "path": str(path),
+                    "captureId": supplied_capture_id,
+                    "verifiedOnly": True,
+                    "aliasCount": 0,
+                }
 
         class AliasBridge:
             def __init__(inner_self):
@@ -2082,7 +2710,36 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
 
             def call(inner_self, method, params, timeout=None):
                 inner_self.calls.append((method, dict(params), timeout))
-                return {"activeValidatedAliases": 0}
+                counts = {
+                    "manifestAliases": 0,
+                    "deterministicAliases": 0,
+                    "liveBoundAliases": 0,
+                    "activeValidatedAliases": 0,
+                    "renamedShaders": 0,
+                    "skipped": 0,
+                    "conflicts": 0,
+                }
+                return {
+                    "schema": "renderdoc-ultra-aliases/v1",
+                    "schemaVersion": 1,
+                    "captureId": capture_id,
+                    "captureSessionId": "b" * 32,
+                    "path": params["path"],
+                    "confirmedOnly": True,
+                    "strictAtomic": params.get("strict_atomic"),
+                    "atomicity": "complete-or-recovery-required",
+                    "physicalAtomic": False,
+                    "recoveryRequired": False,
+                    "rollbackAvailable": True,
+                    "recoveryLedgerPublished": True,
+                    "transactionId": "c" * 32,
+                    "recoveryResourceCount": 0,
+                    "committed": True,
+                    "counts": counts,
+                    "applied": [],
+                    "skipped": [],
+                    "conflicts": [],
+                }
 
         bridge = AliasBridge()
         with mock.patch.object(self.server, "SymbolService", FakeService), mock.patch.object(
@@ -2100,11 +2757,91 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         self.assertEqual(method, "load_symbol_aliases")
         self.assertEqual(timeout, 60.0)
         self.assertTrue(params["confirmed_only"])
+        self.assertIs(params["strict_atomic"], True)
         self.assertEqual(
             params["expected_sha256"],
             hashlib.sha256(Path(params["path"]).read_bytes()).hexdigest(),
         )
         self.assertNotEqual(Path(params["path"]), database)
+
+        bridge.calls.clear()
+        original_call = bridge.call
+
+        def partial_call(method, params, timeout=None):
+            receipt = original_call(method, params, timeout)
+            receipt["counts"]["skipped"] = 1
+            receipt["skipped"] = [{"reason": "not live-bound"}]
+            return receipt
+
+        with mock.patch.object(self.server, "SymbolService", FakeService), mock.patch.object(
+            bridge, "call", side_effect=partial_call
+        ), mock.patch.object(self.server, "ipc", bridge):
+            partial = json.loads(
+                self.server.apply_symbol_alias_table(
+                    str(database), capture_id, scan_id="trusted-scan"
+                )
+            )
+        self.assertIn("recovery ledger", partial["error"])
+
+    def test_alias_rollback_accepts_only_a_strict_capture_bound_receipt(self) -> None:
+        capture_id = "a" * 64
+
+        class AliasBridge:
+            def __init__(inner_self):
+                inner_self.calls = []
+                inner_self.invalid = False
+
+            def call(inner_self, method, params, timeout=None):
+                inner_self.calls.append((method, dict(params), timeout))
+                value = {
+                    "schema": "renderdoc-ultra-alias-rollback/v1",
+                    "schemaVersion": 1,
+                    "captureId": capture_id,
+                    "captureSessionId": "b" * 32,
+                    "transactionId": "c" * 32,
+                    "status": "restored",
+                    "restored": True,
+                    "alreadyRestored": False,
+                    "verified": True,
+                    "strictReceipt": True,
+                    "captureTokenVerified": True,
+                    "originalNamesVerified": True,
+                    "physicalAtomic": False,
+                    "recoveryRequired": False,
+                    "overlayRestored": True,
+                    "renameLedgerRestored": True,
+                    "resourceCount": 2,
+                    "failures": [],
+                }
+                if inner_self.invalid:
+                    value["verified"] = False
+                return value
+
+        bridge = AliasBridge()
+        with mock.patch.object(self.server, "ipc", bridge):
+            result = json.loads(self.server.rollback_symbol_alias_table(capture_id))
+
+        self.assertEqual(result["status"], "restored")
+        self.assertEqual(
+            bridge.calls,
+            [
+                (
+                    "rollback_symbol_aliases",
+                    {"expected_capture_id": capture_id},
+                    60.0,
+                )
+            ],
+        )
+        self.assertNotIn("path", bridge.calls[0][1])
+
+        bridge.invalid = True
+        with mock.patch.object(self.server, "ipc", bridge):
+            invalid = json.loads(self.server.rollback_symbol_alias_table(capture_id))
+        self.assertIn("strict capture-bound", invalid["error"])
+
+        with mock.patch.object(self.server, "ipc", bridge):
+            malformed = json.loads(self.server.rollback_symbol_alias_table("not-a-hash"))
+        self.assertIn("lowercase SHA-256", malformed["error"])
 
     def test_organization_semantic_context_is_capture_session_bound(self) -> None:
         capture_id = "a" * 64
@@ -2115,6 +2852,8 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             "capture": {
                 "captureId": capture_id,
                 "catalogPath": str(self.root / "catalog.json"),
+                "capturePath": "D:/captures/frame.rdc",
+                "api": "D3D12",
             },
             "shader": {
                 "resourceId": 71,
@@ -2143,6 +2882,8 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 "loaded": True,
                 "captureId": capture_id,
                 "captureSessionId": capture_session_id,
+                "path": "D:/captures/frame.rdc",
+                "api": "GraphicsAPI.D3D12",
             },
         }
 
@@ -2178,10 +2919,38 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             self.server, "_shader_workspace_service", return_value=FakeService()
         ), mock.patch.object(self.server, "ipc", bridge), mock.patch.object(
             self.server, "select_unique_shader_for_use", return_value=selected
+        ), mock.patch.object(
+            self.server,
+            "_ensure_workspace_capture_catalog_identity",
+            return_value={"workspaceId": status["workspaceId"], "captureId": capture_id,
+                          "captureSessionId": capture_session_id},
         ):
-            result = self.server._shader_organization_semantic_context(
-                str(self.root), 12892
-            )
+            # UI symbols can be empty after restart, or describe a different
+            # bounded export from the same loaded RDC. Neither changes identity.
+            for ui_capture_id in (capture_id, "", "e" * 64):
+                current_context["capture"]["captureId"] = ui_capture_id
+                bridge.calls.clear()
+                result = self.server._shader_organization_semantic_context(
+                    str(self.root), 12892
+                )
+                self.assertEqual(result["liveBindingEvidence"]["captureId"], capture_id)
+
+            current_context["capture"]["path"] = "D:/captures/different.rdc"
+            bridge.calls.clear()
+            with self.assertRaisesRegex(RuntimeError, "does not match this workspace"):
+                self.server._shader_organization_semantic_context(str(self.root), 12892)
+            self.assertEqual([call[0] for call in bridge.calls], ["get_current_renderdoc_context"])
+            current_context["capture"]["path"] = "D:/captures/frame.rdc"
+            selected.key.resource_id = 99
+            bridge.calls.clear()
+            with self.assertRaisesRegex(
+                self.server.ShaderOrganizationError, "not an exact use"
+            ):
+                self.server._shader_organization_semantic_context(str(self.root), 12892)
+            self.assertEqual([call[0] for call in bridge.calls], ["get_current_renderdoc_context"])
+            selected.key.resource_id = 71
+            bridge.calls.clear()
+            result = self.server._shader_organization_semantic_context(str(self.root), 12892)
 
         self.assertEqual(
             [call[0] for call in bridge.calls],
@@ -2209,6 +2978,8 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             "capture": {
                 "captureId": capture_id,
                 "catalogPath": str(self.root / "catalog.json"),
+                "capturePath": "D:/captures/frame.rdc",
+                "api": "D3D12",
             },
             "shader": {
                 "resourceId": 71,
@@ -2250,6 +3021,8 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                             "loaded": True,
                             "captureId": capture_id,
                             "captureSessionId": next(sessions),
+                            "path": "D:/captures/frame.rdc",
+                            "api": "D3D12",
                         },
                     }
                 if method == "get_bound_textures":
@@ -2271,6 +3044,11 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             self.server, "_shader_workspace_service", return_value=FakeService()
         ), mock.patch.object(self.server, "ipc", bridge), mock.patch.object(
             self.server, "select_unique_shader_for_use", return_value=selected
+        ), mock.patch.object(
+            self.server,
+            "_ensure_workspace_capture_catalog_identity",
+            return_value={"workspaceId": status["workspaceId"], "captureId": capture_id,
+                          "captureSessionId": "b" * 32},
         ):
             with self.assertRaisesRegex(
                 self.server.ShaderOrganizationError, "capture session changed"

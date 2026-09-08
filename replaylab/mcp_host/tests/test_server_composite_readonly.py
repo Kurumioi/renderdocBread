@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import inspect
 import json
-from pathlib import Path
 from unittest import mock
 
+from replaylab_agent.policy import READ_ONLY_TOOLS
 from src import server
 
 
 COMPOSITES = frozenset(("inspect_event", "analyze_pixel", "inspect_shader"))
+UNSUPPORTED_RAW_TOOL_IDS = frozenset(
+    ("export_drawcall", "export_to_unity", "get_shader_info", "reverse_shader", "save_texture")
+)
 
 
 class RecordingIPC:
@@ -66,7 +69,7 @@ def test_composites_delegate_to_the_same_bridge_methods_and_keep_result_schema()
             "inspect_shader",
             {"event_id": 41, "stage": "pixel"},
             120.0,
-            "renderdoc-internal-inspect-shader/v1",
+            "renderdoc-internal-inspect-shader/v2",
         ),
     )
 
@@ -98,20 +101,16 @@ def test_composite_signatures_match_the_internal_agent_contract() -> None:
     )
 
 
-def test_enabled_specialist_composites_are_available_on_external_mcp() -> None:
-    repository = Path(__file__).resolve().parents[3]
-    skill_paths = (
-        repository / ".agents" / "skills" / "renderdoc-explain-event" / "SKILL.md",
-        repository / ".agents" / "skills" / "renderdoc-shader-workbench" / "SKILL.md",
-    )
-    specialist_tools: set[str] = set()
-    for path in skill_paths:
-        source = path.read_text(encoding="utf-8")
-        line = next(
-            value for value in source.splitlines() if value.startswith("allowed-tools:")
-        )
-        specialist_tools.update(line.partition(":")[2].strip().split())
-
+def test_host_admitted_composites_are_available_on_task_mcp() -> None:
     exported = {name for name in COMPOSITES if callable(getattr(server, name, None))}
-    assert COMPOSITES <= specialist_tools
+    assert COMPOSITES <= READ_ONLY_TOOLS
     assert exported == COMPOSITES
+
+
+def test_raw_sidecar_manifest_does_not_register_retired_agent_tools() -> None:
+    registered = {
+        function.__name__ for function, _args, _kwargs in server.mcp._registrations
+    }
+
+    assert "inspect_shader" in registered
+    assert UNSUPPORTED_RAW_TOOL_IDS.isdisjoint(registered)

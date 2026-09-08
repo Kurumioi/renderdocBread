@@ -180,6 +180,30 @@ def _bounded_text(value: Any, maximum: int = 2048) -> str:
     return text[:maximum] + "...[truncated]"
 
 
+def _watch_start_rejection(status: dict, fallback: str) -> str:
+    """Keep invalid-source errors distinct from a valid source's stale tools."""
+    source = status.get("source")
+    representation = status.get("representation")
+    if (
+        status.get("toolchainStatus") != "refresh-required"
+        or not isinstance(source, dict)
+        or source.get("present") is not True
+        or source.get("lane") != "executable-editable"
+        or not isinstance(representation, dict)
+        or representation.get("lane") != "executable-editable"
+        or representation.get("compileEligible") is not False
+    ):
+        return fallback
+    diagnostic = _bounded_text(status.get("toolchainDiagnostic") or "toolchain binding is stale", 1024)
+    # This is a backend failure diagnostic, not a normal UI label. Never copy
+    # arbitrary requiredAction fields into it or automatically execute a refresh.
+    return (
+        "save watching requires a toolchain refresh: %s; "
+        "use migrate_shader_workspace_toolchain(in_place=true) with the current "
+        "paths and CAS hashes from get_shader_workspace_status.requiredAction"
+    ) % diagnostic
+
+
 def _validate_debounce(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise WorkspaceWatchError("debounce_ms must be an integer")
@@ -862,7 +886,8 @@ class ShaderWorkspaceWatchManager:
             or representation.get("compileEligible") is not True
         ):
             raise WorkspaceWatchError(
-                "save watching requires the executable-editable shader lane"
+                _watch_start_rejection(
+                    status_result, "save watching requires the executable-editable shader lane")
             )
         status_source = Path(source_record.get("path", ""))
         source = _fixed_source(root, status_source)
@@ -959,6 +984,10 @@ class ShaderWorkspaceWatchManager:
                     or locked_representation.get("compileEligible") is not True
                 ):
                     raise WorkspaceWatchError(
+                        _watch_start_rejection(
+                            locked_status,
+                            "workspace identity/lane changed while acquiring its source lease")
+                        if locked_root == root else
                         "workspace identity/lane changed while acquiring its source lease"
                     )
                 locked_status_source = Path(
@@ -1053,6 +1082,20 @@ class ShaderWorkspaceWatchManager:
     def save_source(self, watch_id: str, expected_raw_sha256: str,
                     text: str) -> dict:
         return self._job(watch_id).save_source(expected_raw_sha256, text)
+
+    def compile_check(self, workspace_path: str | Path, text: str) -> dict:
+        """Compile an unsaved editor buffer for live diagnostics only.
+
+        Unlike :meth:`save_source` this needs no active watch job: it builds
+        a fresh service (the same factory the watcher uses, so the compiler
+        binding, includes and target profile are identical) and runs the
+        workspace's bound compiler over the provided text in a throwaway
+        job. Nothing is written to the workspace, published, or applied;
+        only diagnostics are returned.
+        """
+
+        service = self._service_factory()
+        return service.compile_check(workspace_path, text)
 
     def stop(self, watch_id: str) -> dict:
         return self._job(watch_id).stop()

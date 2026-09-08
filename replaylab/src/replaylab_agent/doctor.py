@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .bridge import BridgeClient
-from .mcp_tools import find_replaylab_mcp
+from .conversation import resolve_context_spec
+from .mcp_runtime import find_replaylab_mcp
 from .profiles import Profile
 from .process_env import (
     agent_command_argv,
@@ -18,7 +19,7 @@ from .process_env import (
     resolve_agent_executable,
     resolve_executable,
 )
-from .skills import SkillCatalog
+from .agent_registry import CatalogView
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,18 +37,42 @@ def _command_path(command: str) -> str:
     return resolve_executable(command)
 
 
+def _profile_context_models(profile: Profile) -> list[tuple[str, str]]:
+    """Return every current/default/enabled selection exactly once."""
+
+    candidates: list[tuple[str, str]] = []
+    if profile.model:
+        candidates.append(("current model", profile.model))
+    if profile.default_model:
+        candidates.append(("default model", profile.default_model))
+    for index, model in enumerate(profile.models, start=1):
+        candidates.append((f"enabled model {index}", model))
+    if not candidates and profile.provider.kind == "agent":
+        candidates.append(("provider default", ""))
+
+    unique: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for label, model in candidates:
+        if model in seen:
+            continue
+        seen.add(model)
+        unique.append((label, model))
+    return unique
+
+
 def run_doctor(
     profile: Profile,
-    catalog: SkillCatalog,
+    catalog: CatalogView,
     *,
     bridge: BridgeClient | None = None,
     mcp_executable: Path | str | None = None,
     environ: Mapping[str, str] | None = None,
+    include_external_mcp: bool = True,
 ) -> list[DoctorCheck]:
     """Run non-networked checks; no login or provider quota is consumed."""
 
     checks: list[DoctorCheck] = []
-    version_ok = sys.version_info >= (3, 10)
+    version_ok = sys.version_info >= (3, 12)
     checks.append(
         DoctorCheck(
             "python",
@@ -56,21 +81,50 @@ def run_doctor(
         )
     )
 
+    profile_valid = False
     try:
         profile.validate()
+        profile_valid = True
         checks.append(DoctorCheck("profile", "ok", f"{profile.provider.title} / {profile.id}"))
     except Exception as exc:
         checks.append(DoctorCheck("profile", "error", str(exc)))
 
+    if profile_valid:
+        selections = _profile_context_models(profile)
+        for index, (label, model) in enumerate(selections):
+            check_name = "model-context" if index == 0 else "model-context-enabled"
+            try:
+                context = resolve_context_spec(profile, model=model)
+                detail = f"{context.context_window} tokens ({context.source})"
+                if index:
+                    detail = f"{label}: {detail}"
+                checks.append(DoctorCheck(check_name, "ok", detail))
+            except Exception as exc:
+                detail = str(exc)
+                if index:
+                    detail = f"{label}: {detail}"
+                checks.append(DoctorCheck(check_name, "error", detail))
+
     if profile.provider.kind == "model":
-        installed = importlib.util.find_spec("pydantic_ai") is not None
+        provider_module = {
+            "openai-responses": "langchain_openai",
+            "openai-chat": "langchain_openai",
+            "anthropic-messages": "langchain_anthropic",
+            "google-genai": "langchain_google_genai",
+            "google-cloud": "langchain_google_vertexai",
+            "azure-openai": "langchain_openai",
+        }.get(profile.provider.protocol, "")
+        required = ["deepagents", "langchain_core", "mcp"]
+        if provider_module:
+            required.append(provider_module)
+        missing = [name for name in required if importlib.util.find_spec(name) is None]
         checks.append(
             DoctorCheck(
                 "model-runtime",
-                "ok" if installed else "error",
-                "pydantic-ai available"
-                if installed
-                else "install replaylab-agenthost[model]",
+                "ok" if not missing else "error",
+                "deepagents and the selected LangChain provider are available"
+                if not missing
+                else "missing runtime package(s): " + ", ".join(missing),
             )
         )
         try:
@@ -108,8 +162,8 @@ def run_doctor(
                 DoctorCheck(
                     "codex-internal-tools",
                     "ok",
-                    "app-server dynamic tools with isolated Codex home; "
-                    "no ReplayLab MCP registration is injected into CODEX_HOME: "
+                    "task-scoped ReplayLab MCP with isolated Codex home; "
+                    "no persistent MCP registration is injected into CODEX_HOME: "
                     + str(home),
                 )
             )
@@ -131,15 +185,16 @@ def run_doctor(
                     "ok" if installed else "error",
                     "agent-client-protocol available"
                     if installed
-                    else "install replaylab-agenthost[acp]",
+                    else "install replaylab-agenthost",
                 )
             )
 
-    try:
-        host = find_replaylab_mcp(mcp_executable)
-        checks.append(DoctorCheck("replaylab-mcp", "ok", str(host)))
-    except Exception as exc:
-        checks.append(DoctorCheck("replaylab-mcp", "error", str(exc)))
+    if include_external_mcp:
+        try:
+            host = find_replaylab_mcp(mcp_executable)
+            checks.append(DoctorCheck("replaylab-mcp", "ok", str(host)))
+        except Exception as exc:
+            checks.append(DoctorCheck("replaylab-mcp", "error", str(exc)))
 
     checks.append(
         DoctorCheck(
@@ -148,6 +203,17 @@ def run_doctor(
             f"{len(catalog.skills)} validated skill(s)",
         )
     )
+    quarantine_summary = getattr(catalog, "quarantine_summary", None)
+    if callable(quarantine_summary):
+        summary = quarantine_summary()
+        if summary.quarantine_count:
+            checks.append(
+                DoctorCheck(
+                    "skills-quarantine",
+                    "warning",
+                    summary.doctor_detail(),
+                )
+            )
 
     client = bridge or BridgeClient(timeout=1.0)
     try:

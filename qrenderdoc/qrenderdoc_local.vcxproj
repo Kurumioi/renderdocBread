@@ -120,7 +120,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>user32.lib;$(PythonImportLib);qtmain.lib;Qt5Widgets.lib;Qt5Gui.lib;Qt5Core.lib;Qt5Svg.lib;Qt5Network.lib;shell32.lib</AdditionalDependencies>
+      <AdditionalDependencies>user32.lib;gdi32.lib;ole32.lib;windowscodecs.lib;$(PythonImportLib);qtmain.lib;Qt5Widgets.lib;Qt5Gui.lib;Qt5Core.lib;Qt5Svg.lib;Qt5Network.lib;shell32.lib</AdditionalDependencies>
       <AdditionalLibraryDirectories>3rdparty\pyside\$(Platform);$(QtLibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <DataExecutionPrevention>true</DataExecutionPrevention>
       <IgnoreImportLibrary>true</IgnoreImportLibrary>
@@ -147,7 +147,7 @@
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>user32.lib;$(PythonImportLib);qtmaind.lib;Qt5Widgetsd.lib;Qt5Guid.lib;Qt5Cored.lib;Qt5Svgd.lib;Qt5Networkd.lib;shell32.lib</AdditionalDependencies>
+      <AdditionalDependencies>user32.lib;gdi32.lib;ole32.lib;windowscodecs.lib;$(PythonImportLib);qtmaind.lib;Qt5Widgetsd.lib;Qt5Guid.lib;Qt5Cored.lib;Qt5Svgd.lib;Qt5Networkd.lib;shell32.lib</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="Exists('$(SolutionDir)\qrenderdoc\3rdparty\pyside\include\PySide2\pyside.h') AND '$(CustomPythonUsed)'=='0'">
@@ -609,7 +609,9 @@
     <ClCompile Include="Code\Resources.cpp" />
     <ClCompile Include="Code\RGPInterop.cpp" />
     <ClCompile Include="Code\ReplayLab\ReplayLabIntegration.cpp" />
+    <ClCompile Include="Code\ReplayLab\ReplayLabCBufferAliases.cpp" />
     <ClCompile Include="Code\CodeEditorService.cpp" />
+    <ClCompile Include="Widgets\ShaderCodeEditor.cpp" />
     <ClCompile Include="Code\TranslationManager.cpp" />
     <ClCompile Include="Code\ScintillaSyntax.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_RDStyle.cpp" />
@@ -627,6 +629,7 @@
     <ClCompile Include="$(IntDir)generated\moc_BufferFormatSpecifier.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_ComputeDebugSelector.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_FindReplace.cpp" />
+    <ClCompile Include="$(IntDir)generated\moc_ShaderCodeEditor.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_BufferViewer.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_CaptureDialog.cpp" />
     <ClCompile Include="$(IntDir)generated\moc_CustomPaintWidget.cpp" />
@@ -780,6 +783,7 @@
     <ClCompile Include="Windows\Dialogs\ConfigEditor.cpp" />
     <ClCompile Include="Windows\Dialogs\VirtualFileDialog.cpp" />
     <ClCompile Include="Windows\EventBrowser.cpp" />
+    <ClCompile Include="Windows\BookmarksView.cpp" />
     <ClCompile Include="3rdparty\flowlayout\FlowLayout.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <ForcedIncludeFiles>
@@ -799,11 +803,15 @@
     <ClCompile Include="Windows\PythonShell.cpp" />
     <ClCompile Include="Windows\ApiMonitorWindow.cpp" />
     <ClCompile Include="Windows\AI\AIAssistant.cpp" />
+    <ClCompile Include="Windows\AI\AIFileThumbnail.cpp" />
+    <ClCompile Include="Windows\AI\AIAgentMonitorWindow.cpp" />
+    <ClCompile Include="Windows\AI\AIAgentTraceStore.cpp" />
     <ClCompile Include="Windows\AI\AIConversationListView.cpp" />
     <ClCompile Include="Windows\AI\AIConversationStore.cpp" />
     <ClCompile Include="Windows\AI\AIConversationView.cpp" />
     <ClCompile Include="Windows\AI\AIPendingChatView.cpp" />
     <ClCompile Include="Windows\PixelHistoryView.cpp" />
+    <ClCompile Include="Windows\RenderTargetHistoryView.cpp" />
     <ClCompile Include="Windows\PerformanceCounterViewer.cpp" />
     <ClCompile Include="Windows\StatisticsViewer.cpp" />
     <ClCompile Include="Windows\TimelineBar.cpp" />
@@ -1007,10 +1015,15 @@
     <ClInclude Include="$(IntDir)generated\ui_PythonShell.h" />
     <ClInclude Include="$(IntDir)generated\ui_ApiMonitorWindow.h" />
     <ClInclude Include="Windows\AI\AIAssistant.h" />
+    <ClInclude Include="Windows\AI\AIFileThumbnail.h" />
+    <ClInclude Include="Windows\AI\AIAgentMonitorWindow.h" />
+    <ClInclude Include="Windows\AI\AIAgentTraceStore.h" />
     <ClInclude Include="Windows\AI\AIConversationListView.h" />
     <ClInclude Include="Windows\AI\AIConversationStore.h" />
     <ClInclude Include="Windows\AI\AIConversationView.h" />
     <ClInclude Include="Windows\AI\AIPendingChatView.h" />
+    <ClInclude Include="Windows\BookmarksView.h" />
+    <ClInclude Include="Windows\RenderTargetHistoryView.h" />
     <ClInclude Include="$(IntDir)generated\ui_PixelHistoryView.h" />
     <ClInclude Include="$(IntDir)generated\ui_PerformanceCounterViewer.h" />
     <ClInclude Include="$(IntDir)generated\ui_StatisticsViewer.h" />
@@ -1054,6 +1067,7 @@
     </CustomBuild>
     <ClInclude Include="Code\ReplayManager.h" />
     <ClInclude Include="Code\ReplayLab\ReplayLabIntegration.h" />
+    <ClInclude Include="Code\ReplayLab\ReplayLabCBufferAliases.h" />
     <ClInclude Include="Code\CodeEditorService.h" />
     <ClInclude Include="Code\TranslationManager.h" />
     <ClInclude Include="Code\ScintillaSyntax.h" />
@@ -1070,6 +1084,12 @@
       <Outputs>$(IntDir)generated\moc_%(Filename).cpp</Outputs>
     </CustomBuild>
     <CustomBuild Include="Widgets\FindReplace.h">
+      <AdditionalInputs>%(Fullpath);$(QtBinDir)\moc.exe;%(AdditionalInputs)</AdditionalInputs>
+      <Command>"$(QtBinDir)\moc.exe" -DUNICODE -DWIN32 -DWIN64 -D_WIN32 -D_WIN64 -DRENDERDOC_PLATFORM_WIN32 -DSCINTILLA_QT=1 -DSCI_LEXER=1 -DQT_NO_DEBUG -DQT_WIDGETS_LIB -DQT_GUI_LIB -DQT_CORE_LIB -D_MSC_VER=1900 -I"$(ProjectDir)." -I"$(SolutionDir)\renderdoc\api\replay" -I"$(QtIncludeDir)" -I"$(QtIncludeDir)\QtWidgets" -I"$(QtIncludeDir)\QtGui" -I"$(QtIncludeDir)\QtCore" "%(Fullpath)" -o "$(IntDir)generated\moc_%(Filename).cpp"</Command>
+      <Message>MOC %(Filename).h</Message>
+      <Outputs>$(IntDir)generated\moc_%(Filename).cpp</Outputs>
+    </CustomBuild>
+    <CustomBuild Include="Widgets\ShaderCodeEditor.h">
       <AdditionalInputs>%(Fullpath);$(QtBinDir)\moc.exe;%(AdditionalInputs)</AdditionalInputs>
       <Command>"$(QtBinDir)\moc.exe" -DUNICODE -DWIN32 -DWIN64 -D_WIN32 -D_WIN64 -DRENDERDOC_PLATFORM_WIN32 -DSCINTILLA_QT=1 -DSCI_LEXER=1 -DQT_NO_DEBUG -DQT_WIDGETS_LIB -DQT_GUI_LIB -DQT_CORE_LIB -D_MSC_VER=1900 -I"$(ProjectDir)." -I"$(SolutionDir)\renderdoc\api\replay" -I"$(QtIncludeDir)" -I"$(QtIncludeDir)\QtWidgets" -I"$(QtIncludeDir)\QtGui" -I"$(QtIncludeDir)\QtCore" "%(Fullpath)" -o "$(IntDir)generated\moc_%(Filename).cpp"</Command>
       <Message>MOC %(Filename).h</Message>
@@ -2204,11 +2224,47 @@
           DestinationFiles="@(ReplayLabIntegrationSource->'$(ReplayLabIntegrationOutputDir)%(RecursiveDir)%(Filename)%(Extension)')"
           SkipUnchangedFiles="true" />
   </Target>
-  <!-- Explicit release/developer deployment target. It is deliberately not attached to Build:
-       active sidecars keep their executables locked, and a normal C++ rebuild must not replace a
-       process serving an analysis session. Invoke /t:DeployReplayLabRuntime after packaging. -->
-  <Target Name="DeployReplayLabRuntime" DependsOnTargets="Build">
-    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)replaylab\packaging\Deploy-ReplayLabRuntime.ps1&quot; -ApplicationDirectory &quot;$(OutDir).&quot;" />
+  <!-- ReplayLab ships out-of-process runtime sidecars (agent / MCP / internal host) that are
+       PyInstaller-frozen from replaylab\src and replaylab\mcp_host. Their freeze is decoupled from
+       the C++ compile, so before this wiring a Python-only change silently shipped stale sidecars.
+       The freeze below is incremental (runs only when the Python source or freeze script changed)
+       and the whole runtime step is skipped when SkipReplayLabRuntime=true (fast C++-only iteration)
+       or when the build venv is absent (a contributor without the Python toolchain). -->
+  <PropertyGroup>
+    <ReplayLabRuntimeManifest>$(SolutionDir)replaylab\output\replaylab\replaylab-runtime-manifest.json</ReplayLabRuntimeManifest>
+    <ReplayLabBuildVenvPython>$(SolutionDir)replaylab\.venv\Scripts\python.exe</ReplayLabBuildVenvPython>
+    <ReplayLabRuntimeEnabled Condition="'$(SkipReplayLabRuntime)' != 'true' and Exists('$(ReplayLabBuildVenvPython)')">true</ReplayLabRuntimeEnabled>
+  </PropertyGroup>
+  <ItemGroup>
+    <ReplayLabRuntimeSource Include="$(SolutionDir)replaylab\src\**\*.py;$(SolutionDir)replaylab\mcp_host\src\**\*.py;$(SolutionDir)replaylab\pyproject.toml;$(SolutionDir)replaylab\mcp_host\pyproject.toml;$(SolutionDir)replaylab\packaging\*_entry.py;$(SolutionDir)replaylab\packaging\probe_frozen_mcp_route.py;$(SolutionDir)replaylab\packaging\Build-ReplayLabRuntime.ps1;$(SolutionDir).agents\skills\renderdoc-explain-event\**\*;$(SolutionDir).agents\skills\renderdoc-shader-workbench\**\*;$(SolutionDir).agents\skills\renderdoc-resource-export\**\*;$(SolutionDir).agents\skills\renderdoc-unpacked-asset-intelligence\**\*;$(SolutionDir).agents\skills\replaylab-core\**\*"
+                            Exclude="$(SolutionDir)replaylab\**\__pycache__\**" />
+  </ItemGroup>
+  <!-- Re-freeze the sidecars only when their source changed. Safe on every build: it writes to
+       replaylab\output\replaylab and never replaces a running sidecar in the application dir. -->
+  <Target Name="BuildReplayLabRuntime"
+          AfterTargets="Build"
+          Condition="'$(ReplayLabRuntimeEnabled)' == 'true'"
+          Inputs="@(ReplayLabRuntimeSource)"
+          Outputs="$(ReplayLabRuntimeManifest)">
+    <Message Importance="high" Text="ReplayLab: runtime source changed -- freezing agent/MCP/internal sidecars (PyInstaller)..." />
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)replaylab\packaging\Build-ReplayLabRuntime.ps1&quot;" />
+  </Target>
+  <!-- Deploy the frozen sidecars into the application directory. A live analysis session can keep a
+       sidecar exe locked; if so this degrades to a warning (the C++ build still succeeds) and the
+       runtime can be re-deployed with /t:DeployReplayLabRuntime once sessions end. Invoked
+       automatically after Build, and available explicitly for release packaging. -->
+  <Target Name="DeployReplayLabRuntime"
+          AfterTargets="Build"
+          DependsOnTargets="Build;BuildReplayLabRuntime"
+          Condition="'$(ReplayLabRuntimeEnabled)' == 'true'">
+    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(SolutionDir)replaylab\packaging\Deploy-ReplayLabRuntime.ps1&quot; -ApplicationDirectory &quot;$(OutDir).&quot;"
+          ContinueOnError="true">
+      <Output TaskParameter="ExitCode" PropertyName="ReplayLabRuntimeDeployExit" />
+    </Exec>
+    <Warning Condition="'$(ReplayLabRuntimeDeployExit)' != '0'"
+             Text="ReplayLab runtime was frozen but NOT deployed (a sidecar exe is likely locked by a live session). Close ReplayLab sessions, then run: msbuild qrenderdoc\qrenderdoc_local.vcxproj /t:DeployReplayLabRuntime" />
+    <Message Condition="'$(ReplayLabRuntimeDeployExit)' == '0'" Importance="high"
+             Text="ReplayLab: runtime sidecars deployed to $(OutDir)replaylab." />
   </Target>
   <ImportGroup Label="ExtensionTargets" />
   <ItemGroup>

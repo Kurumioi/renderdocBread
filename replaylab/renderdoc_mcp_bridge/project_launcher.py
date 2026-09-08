@@ -92,9 +92,18 @@ def _normalise_restore_progress(value):
 
     phase = str(value.get("phase", "") or "").strip()
     message = str(value.get("message", "") or "").strip()
+    raw_item = value.get("item", "")
+    if not isinstance(raw_item, str):
+        raise ProjectLauncherError("ReplayLab restore progress text is invalid")
+    item = raw_item.strip()
     if (not phase and not message) or len(phase) > 128 or len(message) > 1024:
         raise ProjectLauncherError("ReplayLab restore progress text is invalid")
-    if "\x00" in phase or "\x00" in message:
+    try:
+        item_bytes = item.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ProjectLauncherError("ReplayLab restore progress text is invalid")
+    if (len(item_bytes) > 1024 or "\x00" in phase or "\x00" in message or
+            "\x00" in item):
         raise ProjectLauncherError("ReplayLab restore progress text is invalid")
 
     current_value = value.get("current", 0)
@@ -119,6 +128,7 @@ def _normalise_restore_progress(value):
         "message": message,
         "current": current,
         "total": total,
+        "item": item,
     }
 
 
@@ -158,22 +168,64 @@ def _restore_progress_text(progress):
     elif phase == "index-required":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT,
-            "A full Shader index is required before project data can be restored")
+            "A unique Shader resource index is required before project data can be restored")
     elif phase == "cache-anchor":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Validating cached Shader anchors")
+    elif phase == "cache-resource":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Validating cached Shader resources")
     elif phase == "cache-hit":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Validating cached live Shader anchors")
+    elif phase == "resource-inventory":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Indexing unique Shader resources")
+    elif phase == "resource-match":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Matching exact project Shader artifacts")
+    elif phase == "resource-anchor":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT,
+            "Validating one representative EID per Shader")
     elif phase == "prepare":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Preparing the current capture project")
+    elif phase == "prepare-export-start":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Starting full-capture Shader export")
+    elif phase == "prepare-export-wait":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Waiting for full-capture Shader export")
+    elif phase == "prepare-export-validate":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Validating the exported Shader catalog")
+    elif phase == "prepare-project-import":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Importing the Shader catalog into the project")
+    elif phase == "prepare-reuse-plan":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Matching project Shader and CBuffer knowledge")
+    elif phase == "prepare-catalog-register":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Registering the active capture catalog")
+    elif phase == "prepare-symbol-resolve":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "Resolving project Shader and CBuffer aliases")
+    elif phase == "prepare-complete":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT,
+            "Current capture project preparation completed")
     elif phase == "shader-prepare":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Preparing shared Shaders")
     elif phase == "shader-compile":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Compiling shared Shaders")
+    elif phase == "shader-candidate-load":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT,
+            "Loading a verified project Shader candidate")
     elif phase == "shader-apply":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Validating ABI and applying Shaders")
@@ -183,6 +235,10 @@ def _restore_progress_text(progress):
     elif phase == "material-restore":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Restoring CBuffer data")
+    elif phase == "alias-restore":
+        message = QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT,
+            "Restoring verified Shader and CBuffer aliases")
     elif phase == "index-write":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Writing the RDC project association cache")
@@ -199,11 +255,26 @@ def _restore_progress_text(progress):
             TRANSLATION_CONTEXT, "Restoring project data")
     total = int(progress.get("total", 0) or 0)
     if total > 0:
-        return _qt_format(
+        message = _qt_format(
             QtCore.QCoreApplication.translate(
                 TRANSLATION_CONTEXT, "%1 (%2 / %3)"),
             message, int(progress.get("current", 0) or 0), total)
+    item = str(progress.get("item", "") or "")
+    if item:
+        return _qt_format(
+            QtCore.QCoreApplication.translate(
+                TRANSLATION_CONTEXT, "%1 · Current item: %2"),
+            message, item)
     return message
+
+
+def _restore_status_text(progress):
+    """Return the single-line status-bar text for one restore snapshot."""
+
+    return _qt_format(
+        QtCore.QCoreApplication.translate(
+            TRANSLATION_CONTEXT, "ReplayLab project recovery: %1"),
+        _restore_progress_text(progress))
 
 
 def _capture_open_error(value):
@@ -1345,58 +1416,118 @@ if HAS_QT:
                 pass
 
 
-    class ReplayLabRestoreProgressDialog(QtWidgets.QDialog):
-        """Display live, display-only progress for post-LoadCapture project restore."""
+    class ReplayLabRestoreStatusTask(QtCore.QObject):
+        """Run post-load restore while publishing progress in the main status bar."""
 
         def __init__(self, executor, owner_token, restore_capture,
-                     project_root, capture_path, completed, parent=None):
-            QtWidgets.QDialog.__init__(self, parent)
+                     project_root, capture_path, completed, status_bar=None,
+                     parent=None):
+            QtCore.QObject.__init__(self, parent)
             self.executor = executor
             self.owner_token = owner_token
             self.restore_capture = restore_capture
             self.project_root = project_root
             self.capture_path = capture_path
             self.completed = completed
+            self.status_bar = status_bar
+            self.status_widget = None
+            self.status_label = None
+            self.progress_bar = None
             self._progress_events = queue.Queue(MAX_RESTORE_PROGRESS_EVENTS)
             self._started = False
             self._finished = False
 
-            self.setObjectName("replayLabRestoreProgressDialog")
-            self.setWindowTitle(QtCore.QCoreApplication.translate(
-                TRANSLATION_CONTEXT, "Restoring ReplayLab Project"))
-            self.setWindowModality(QtCore.Qt.ApplicationModal)
-            self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
-            self.setWindowFlags(
-                QtCore.Qt.CustomizeWindowHint |
-                QtCore.Qt.Dialog |
-                QtCore.Qt.WindowTitleHint)
-            self.setMinimumWidth(420)
-
-            root = QtWidgets.QVBoxLayout(self)
-            title = QtWidgets.QLabel(QtCore.QCoreApplication.translate(
-                TRANSLATION_CONTEXT,
-                "Restoring verified project data for the opened RDC"))
-            title.setAlignment(QtCore.Qt.AlignCenter)
-            title.setWordWrap(True)
-            root.addWidget(title)
-
-            self.progress_bar = QtWidgets.QProgressBar()
-            self.progress_bar.setObjectName("replayLabRestoreProgressBar")
-            self.progress_bar.setRange(0, 0)
-            root.addWidget(self.progress_bar)
-
-            self.status_label = QtWidgets.QLabel(
-                QtCore.QCoreApplication.translate(
-                    TRANSLATION_CONTEXT,
-                    "Scheduling ReplayLab project recovery"))
-            self.status_label.setObjectName("replayLabRestoreProgressStatus")
-            self.status_label.setWordWrap(True)
-            root.addWidget(self.status_label)
+            self._install_status_widget()
 
             self._progress_timer = QtCore.QTimer(self)
             self._progress_timer.setInterval(25)
             self._progress_timer.timeout.connect(self._drain_progress)
             self._progress_timer.start()
+
+        def _install_status_widget(self):
+            add_widget = getattr(self.status_bar, "addWidget", None)
+            if not callable(add_widget):
+                return
+            try:
+                widget = QtWidgets.QWidget(self.status_bar)
+                widget.setObjectName("replayLabRestoreStatusWidget")
+                layout = QtWidgets.QHBoxLayout(widget)
+                layout.setContentsMargins(6, 0, 6, 0)
+                layout.setSpacing(8)
+
+                label = QtWidgets.QLabel(widget)
+                label.setObjectName("replayLabRestoreStatusText")
+                label.setTextFormat(QtCore.Qt.PlainText)
+                label.setMinimumWidth(0)
+                label.setSizePolicy(
+                    QtWidgets.QSizePolicy.Ignored,
+                    QtWidgets.QSizePolicy.Preferred)
+                layout.addWidget(label, 1)
+
+                progress = QtWidgets.QProgressBar(widget)
+                progress.setObjectName("replayLabRestoreStatusProgress")
+                progress.setRange(0, 0)
+                progress.setTextVisible(False)
+                progress.setMinimumWidth(120)
+                progress.setMaximumWidth(180)
+                layout.addWidget(progress)
+
+                # A normal status-bar widget is deliberately used instead of
+                # showMessage(). Qt temporarily hides normal widgets for menu
+                # or other foreground messages, so user activity stays higher
+                # priority and the background progress returns afterwards.
+                add_widget(widget, 1)
+                self.status_widget = widget
+                self.status_label = label
+                self.progress_bar = progress
+            except Exception:
+                self.status_widget = None
+                self.status_label = None
+                self.progress_bar = None
+
+        def _remove_status_widget(self):
+            widget = self.status_widget
+            self.status_widget = None
+            self.status_label = None
+            self.progress_bar = None
+            if widget is None:
+                return
+            try:
+                remove_widget = getattr(self.status_bar, "removeWidget", None)
+                if callable(remove_widget):
+                    remove_widget(widget)
+            except Exception:
+                pass
+            try:
+                widget.hide()
+                widget.deleteLater()
+            except Exception:
+                pass
+
+        def _show_terminal_failure(self, error):
+            """Keep a restore failure visible without blocking RenderDoc."""
+
+            show_message = getattr(self.status_bar, "showMessage", None)
+            if not callable(show_message):
+                return
+            failed = _restore_status_text({
+                "phase": "failed",
+                "message": "",
+                "current": 0,
+                "total": 0,
+                "item": "",
+            })
+            diagnostic = str(error or "")[:4096]
+            text = (_qt_format(QtCore.QCoreApplication.translate(
+                TRANSLATION_CONTEXT, "%1: %2"), failed, diagnostic)
+                if diagnostic else failed)
+            try:
+                # A temporary QStatusBar message is non-modal. It also hides
+                # the normal progress widget before that widget is removed,
+                # leaving foreground menus and EID navigation fully usable.
+                show_message(text, 30000)
+            except Exception:
+                pass
 
         def publish_progress(self, value):
             """Worker-thread callback: publish Python data only, never touch Qt."""
@@ -1458,13 +1589,17 @@ if HAS_QT:
             if latest is None:
                 return
             total = latest["total"]
-            if total > 0:
+            if self.progress_bar is not None and total > 0:
                 self.progress_bar.setRange(0, total)
                 self.progress_bar.setValue(latest["current"])
-            else:
+            elif self.progress_bar is not None:
                 self.progress_bar.setRange(0, 0)
-            self.status_label.setProperty("replaylabPhase", latest["phase"])
-            self.status_label.setText(_restore_progress_text(latest))
+            if self.status_label is not None:
+                text = _restore_status_text(latest)
+                self.status_label.setProperty(
+                    "replaylabPhase", latest["phase"])
+                self.status_label.setText(text)
+                self.status_label.setToolTip(text)
 
         def _restore_completed(self, value, error):
             if self._finished:
@@ -1472,25 +1607,18 @@ if HAS_QT:
             self._drain_progress()
             self._finished = True
             self._progress_timer.stop()
-            restore_error = _restore_result_error(value, error)
-            if _restore_action_required(value) and not error:
-                self.progress_bar.setRange(0, 1)
-                self.progress_bar.setValue(0)
-                self.status_label.setText(QtCore.QCoreApplication.translate(
-                    TRANSLATION_CONTEXT,
-                    "Project restore skipped because the full Shader index is unavailable"))
-            elif restore_error:
-                self.progress_bar.setRange(0, 1)
-                self.progress_bar.setValue(0)
-                self.status_label.setText(QtCore.QCoreApplication.translate(
-                    TRANSLATION_CONTEXT, "Project restore did not complete"))
-            else:
-                self.progress_bar.setRange(0, 1)
-                self.progress_bar.setValue(1)
-                self.status_label.setText(QtCore.QCoreApplication.translate(
-                    TRANSLATION_CONTEXT, "Project restore completed"))
-            self.accept()
-            self.completed(value, restore_error)
+            try:
+                self._progress_timer.timeout.disconnect(self._drain_progress)
+            except Exception:
+                pass
+            terminal_error = _restore_result_error(value, error)
+            if terminal_error:
+                self._show_terminal_failure(terminal_error)
+            self._remove_status_widget()
+            completed = self.completed
+            self.completed = lambda unused_value, unused_error: None
+            completed(value, terminal_error)
+            self.deleteLater()
 
         def abandon(self):
             """Detach a still-running restore when its launcher is torn down."""
@@ -1498,21 +1626,13 @@ if HAS_QT:
                 return
             self._finished = True
             self._progress_timer.stop()
+            try:
+                self._progress_timer.timeout.disconnect(self._drain_progress)
+            except Exception:
+                pass
             self.completed = lambda unused_value, unused_error: None
-            self.hide()
+            self._remove_status_widget()
             self.deleteLater()
-
-        def keyPressEvent(self, event):
-            if not self._finished and event.key() == QtCore.Qt.Key_Escape:
-                return
-            QtWidgets.QDialog.keyPressEvent(self, event)
-
-        def closeEvent(self, event):
-            if not self._finished:
-                event.ignore()
-                return
-            QtWidgets.QDialog.closeEvent(self, event)
-
 
     class NewProjectDialog(QtWidgets.QDialog):
         def __init__(self, parent=None):
@@ -1825,7 +1945,7 @@ if HAS_QT:
             self._async_owner = "launcher-%s" % uuid.uuid4().hex
             self._operation_generation = 0
             self._busy = False
-            self._restore_dialog = None
+            self._restore_task = None
             self.projects = []
             self._closed_notified = False
             self._thumbnail_generation = 0
@@ -2566,42 +2686,60 @@ if HAS_QT:
 
         def _start_capture_restore(self, project_root, capture_path):
             parent = self.parentWidget() or self
-            dialog = ReplayLabRestoreProgressDialog(
+            status_bar = getattr(parent, "statusBar", lambda: None)()
+            if status_bar is None:
+                # ICaptureContext.GetMainWindow().Widget() is intentionally
+                # exposed to Python as a plain QWidget by qrenderdoc's SWIG
+                # boundary, even though the native object is a QMainWindow.
+                # Resolve the Designer-owned status bar by type/object name.
+                find_child = getattr(parent, "findChild", None)
+                if callable(find_child):
+                    status_bar = find_child(
+                        QtWidgets.QStatusBar, "statusBar")
+            task = ReplayLabRestoreStatusTask(
                 self.async_executor, self._async_owner, self.restore_capture,
                 project_root, capture_path, self._capture_restore_finished,
-                parent)
-            self._restore_dialog = dialog
-            dialog.show()
-            dialog.raise_()
-            dialog.activateWindow()
-            dialog.start()
+                status_bar, self)
+            self._restore_task = task
+            task.start()
 
         def _capture_restore_finished(self, unused_value, error):
             del unused_value
-            self._restore_dialog = None
+            self._restore_task = None
             if error:
-                parent = self.parentWidget() or self
-                QtWidgets.QMessageBox.warning(
-                    parent,
-                    QtCore.QCoreApplication.translate(
-                        TRANSLATION_CONTEXT,
-                        "ReplayLab project restore incomplete"),
-                    _qt_format(QtCore.QCoreApplication.translate(
-                        TRANSLATION_CONTEXT,
-                        "The RDC opened successfully, but ReplayLab could not restore its "
-                        "project data:\n\n%1\n\nYou can continue using the opened capture. No failed "
-                        "replacement is treated as applied."), error))
+                # ReplayLabRestoreStatusTask already published the bounded
+                # diagnostic in the main status bar. A background accelerator
+                # failure must never put a modal window in front of the opened
+                # capture or prevent EID navigation.
+                print("[ReplayLab] Background project restore failed: %s" % error)
             self.close()
+
+        def abandon_capture_restore(self):
+            """Remove status for a restore whose owning capture was replaced."""
+            restore_task = self._restore_task
+            if restore_task is None:
+                return False
+            self._restore_task = None
+            try:
+                restore_task.abandon()
+            except Exception:
+                pass
+            try:
+                self.async_executor.cancel_owner(self._async_owner)
+            except Exception:
+                pass
+            self.close()
+            return True
 
         def _dialog_finished(self, unused_result=0):
             del unused_result
             self._cancel_thumbnail_queue()
             self._operation_generation += 1
-            restore_dialog = self._restore_dialog
-            self._restore_dialog = None
-            if restore_dialog is not None:
+            restore_task = self._restore_task
+            self._restore_task = None
+            if restore_task is not None:
                 try:
-                    restore_dialog.abandon()
+                    restore_task.abandon()
                 except Exception:
                     pass
             try:
@@ -2638,5 +2776,5 @@ __all__ = [
 
 if HAS_QT:
     __all__.extend([
-        "AsyncProjectExecutor", "ReplayLabRestoreProgressDialog",
+        "AsyncProjectExecutor", "ReplayLabRestoreStatusTask",
         "NewProjectDialog", "ProjectSettingsDialog", "ReplayLabProjectLauncher"])

@@ -26,13 +26,17 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QEvent>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QKeyEvent>
+#include <QMenu>
+#include <QAction>
 #include <QPointer>
+#include <QPalette>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QSet>
@@ -40,6 +44,7 @@
 #include <QTimer>
 #include <QUrl>
 #include <algorithm>
+#include <cctype>
 #include <limits>
 
 #include "scintilla/include/Scintilla.h"
@@ -49,11 +54,128 @@ namespace
 {
 const int ErrorIndicator = 8;
 const int WarningIndicator = 9;
+const int SymbolOccurrenceIndicator = 10;
+const int FunctionNameIndicator = 11;
+const int VariableNameIndicator = 12;
 const int DiagnosticsDebounceMS = 160;
 const int MaxCompletionItems = 256;
 const int MaxDiagnostics = 2000;
 const int MaxMessageBytes = 4 * 1024 * 1024;
 const int MaxHeaderBytes = 16 * 1024;
+const int NavigationHistoryLimit = 128;
+
+struct SmartNewlineEdit
+{
+  QByteArray replacement;
+  int caretOffset = 0;
+};
+
+struct TextReplacement
+{
+  int start = 0;
+  int removedLength = 0;
+  QByteArray inserted;
+};
+
+bool isHorizontalSpace(char c)
+{
+  return c == ' ' || c == '\t';
+}
+
+QByteArray leadingWhitespace(const QByteArray &text)
+{
+  int length = 0;
+  while(length < text.size() && isHorizontalSpace(text[length]))
+    length++;
+  return text.left(length);
+}
+
+char lastNonWhitespace(const QByteArray &text)
+{
+  for(int i = text.size() - 1; i >= 0; i--)
+    if(!isHorizontalSpace(text[i]) && text[i] != '\r')
+      return text[i];
+  return '\0';
+}
+
+char firstNonWhitespace(const QByteArray &text)
+{
+  for(char c : text)
+    if(!isHorizontalSpace(c) && c != '\r')
+      return c;
+  return '\0';
+}
+
+SmartNewlineEdit planSmartNewline(const QByteArray &text, int replaceStart, int replaceEnd,
+                                  const QByteArray &eol, const QByteArray &indentUnit,
+                                  bool indentAfterColon)
+{
+  SmartNewlineEdit ret;
+  replaceStart = qBound(0, replaceStart, text.size());
+  replaceEnd = qBound(replaceStart, replaceEnd, text.size());
+
+  const int previousLF = replaceStart > 0 ? text.lastIndexOf('\n', replaceStart - 1) : -1;
+  const int previousCR = replaceStart > 0 ? text.lastIndexOf('\r', replaceStart - 1) : -1;
+  const int currentLineStart = qMax(previousLF, previousCR) + 1;
+  const int nextLF = text.indexOf('\n', replaceEnd);
+  const int nextCR = text.indexOf('\r', replaceEnd);
+  const int currentLineEnd = nextLF < 0   ? (nextCR < 0 ? text.size() : nextCR)
+                             : nextCR < 0 ? nextLF
+                                          : qMin(nextLF, nextCR);
+  const QByteArray before = text.mid(currentLineStart, replaceStart - currentLineStart);
+  const QByteArray after = text.mid(replaceEnd, currentLineEnd - replaceEnd);
+  const QByteArray indentation = leadingWhitespace(before);
+  const char previous = lastNonWhitespace(before);
+  const char next = firstNonWhitespace(after);
+
+  if(previous == '{' && next == '}')
+  {
+    ret.replacement = eol + indentation + indentUnit + eol + indentation;
+    ret.caretOffset = eol.size() + indentation.size() + indentUnit.size();
+  }
+  else
+  {
+    const bool increaseIndent = previous == '{' || previous == '[' || previous == '(' ||
+                                (indentAfterColon && previous == ':');
+    ret.replacement = eol + indentation + (increaseIndent ? indentUnit : QByteArray());
+    ret.caretOffset = ret.replacement.size();
+  }
+  return ret;
+}
+
+QByteArray eolBytes(int mode)
+{
+  if(mode == SC_EOL_CRLF)
+    return QByteArray("\r\n");
+  if(mode == SC_EOL_CR)
+    return QByteArray("\r");
+  return QByteArray("\n");
+}
+
+int transformedPosition(int position, const QList<TextReplacement> &replacements)
+{
+  const int originalPosition = position;
+  int cumulativeDelta = 0;
+  for(const TextReplacement &replacement : replacements)
+  {
+    const int end = replacement.start + replacement.removedLength;
+    if(originalPosition < replacement.start)
+      continue;
+    if(originalPosition <= end)
+      return replacement.start + cumulativeDelta + replacement.inserted.size();
+    else
+      cumulativeDelta += replacement.inserted.size() - replacement.removedLength;
+  }
+  return originalPosition + cumulativeDelta;
+}
+
+bool hasPrimaryModifier(Qt::KeyboardModifiers modifiers, bool allowShift)
+{
+  modifiers &= ~Qt::KeypadModifier;
+  if(allowShift)
+    modifiers &= ~Qt::ShiftModifier;
+  return modifiers == Qt::ControlModifier || modifiers == Qt::MetaModifier;
+}
 
 long scintillaColour(int r, int g, int b)
 {
@@ -345,6 +467,81 @@ QString pathFromUri(const QString &uri)
   const QUrl url(uri);
   return url.isLocalFile() ? QDir::cleanPath(url.toLocalFile()) : QString();
 }
+
+QHash<int, int> codeDelimiterPairs(const QByteArray &code)
+{
+  QList<int> stack;
+  QHash<int, int> pairs;
+  for(int i = 0; i < code.size(); ++i)
+  {
+    if(code[i] == '{' || code[i] == '(' || code[i] == '[')
+      stack.push_back(i);
+    else if((code[i] == '}' || code[i] == ')' || code[i] == ']') && !stack.isEmpty())
+    {
+      const int open = stack.takeLast();
+      if((code[open] == '{' && code[i] == '}') ||
+         (code[open] == '(' && code[i] == ')') ||
+         (code[open] == '[' && code[i] == ']'))
+        pairs.insert(open, i);
+    }
+  }
+  return pairs;
+}
+
+struct FollowingDeclarator
+{
+  QString name;
+  QString valueType;
+  int position = -1;
+};
+
+QList<FollowingDeclarator> followingDeclarators(const QByteArray &code,
+                                               const QHash<int, int> &pairs, int position,
+                                               QString baseType)
+{
+  QList<FollowingDeclarator> ret;
+  // Pointer/reference modifiers belong to each declarator, not the common base type.
+  while(baseType.endsWith(QLatin1Char('*')) || baseType.endsWith(QLatin1Char('&')))
+    baseType = baseType.left(baseType.size() - 1).trimmed();
+  auto skipSpace = [&code](int index) {
+    while(index < code.size() && std::isspace(static_cast<unsigned char>(code[index]))) ++index;
+    return index;
+  };
+  for(int i = position; i < code.size() && ret.size() < 256; ++i)
+  {
+    const char c = code[i];
+    if(c == ';' || c == ')' || c == '}' || c == ']') break;
+    if(c == '(' || c == '{' || c == '[')
+    {
+      if(!pairs.contains(i)) break;
+      i = pairs.value(i); // Constructor arguments, array indices and aggregate initializers.
+      continue;
+    }
+    if(c != ',') continue;
+    int start = skipSpace(i + 1);
+    QString valueType = baseType;
+    while(start < code.size() && (code[start] == '*' || code[start] == '&'))
+    {
+      valueType += QChar::fromLatin1(code[start]);
+      start = skipSpace(start + 1);
+    }
+    if(start >= code.size() || !isIdentifierStartByte(code[start])) break;
+    int end = start + 1;
+    while(end < code.size() && isIdentifierByte(code[end])) ++end;
+    const int next = skipSpace(end);
+    if(next >= code.size() ||
+       (code[next] != '=' && code[next] != ';' && code[next] != ',' &&
+        code[next] != ':' && code[next] != '[' && code[next] != ')'))
+      break; // A new typed parameter (e.g. ', float other') is not another declarator.
+    FollowingDeclarator declaration;
+    declaration.name = QString::fromUtf8(code.mid(start, end - start));
+    declaration.valueType = valueType;
+    declaration.position = start;
+    ret.push_back(declaration);
+    i = end - 1;
+  }
+  return ret;
+}
 }    // namespace
 
 struct CodeEditorService::Impl
@@ -357,6 +554,10 @@ struct CodeEditorService::Impl
     QString signature;
     EditorState *state = NULL;
     int position = -1;
+    int scopeStart = 0;
+    int scopeEnd = 0;
+    QString ownerType;
+    QString valueType;
   };
 
   struct EditorState
@@ -369,12 +570,18 @@ struct CodeEditorService::Impl
     QList<Symbol> symbols;
     QList<Diagnostic> localDiagnostics;
     QList<Diagnostic> lspDiagnostics;
+    QList<Diagnostic> externalDiagnostics;
     int version = 1;
     quint64 editRevision = 1;
     bool textDirty = false;
     bool diagnosticsDirty = false;
     bool openSent = false;
     bool diagnosticTipActive = false;
+    QByteArray highlightedWord;
+    int highlightedVersion = -1;
+    int coloredVersion = -1;
+    QByteArray maskedText;
+    int maskedVersion = -1;
   };
 
   enum class PendingKind
@@ -395,7 +602,20 @@ struct CodeEditorService::Impl
     int position = -1;
     Location localFallback;
     QPointer<ScintillaEdit> localFallbackEditor;
+    QHash<ScintillaEdit *, quint64> documentRevisions;
   };
+
+  struct NavigationEntry
+  {
+    QPointer<ScintillaEdit> editor;
+    QString fileName;
+    int position = -1;
+    int line = -1;
+    int column = -1;
+  };
+
+  QPointer<QMenu> referencesMenu;
+  bool deliveringNavigation = false;
 
   explicit Impl(CodeEditorService *q) : owner(q)
   {
@@ -492,6 +712,8 @@ struct CodeEditorService::Impl
   QTimer *diagnosticTimer = NULL;
   QHash<ScintillaEdit *, EditorState *> states;
   QHash<QString, QList<Symbol>> symbolIndex;
+  QList<NavigationEntry> backHistory;
+  QList<NavigationEntry> forwardHistory;
   DefinitionHandler definitionHandler;
   DiagnosticsHandler diagnosticsHandler;
   StatusHandler statusHandler;
@@ -552,6 +774,18 @@ struct CodeEditorService::Impl
     editor->indicSetStyle(WarningIndicator, INDIC_SQUIGGLELOW);
     editor->indicSetFore(WarningIndicator, scintillaColour(245, 216, 106));
     editor->indicSetUnder(WarningIndicator, true);
+    editor->indicSetStyle(SymbolOccurrenceIndicator, INDIC_ROUNDBOX);
+    editor->indicSetFore(SymbolOccurrenceIndicator, scintillaColour(100, 150, 210));
+    editor->indicSetAlpha(SymbolOccurrenceIndicator, 45);
+    editor->indicSetOutlineAlpha(SymbolOccurrenceIndicator, 150);
+    editor->indicSetUnder(SymbolOccurrenceIndicator, true);
+    const bool dark = editor->palette().color(QPalette::Base).lightness() < 128;
+    editor->indicSetStyle(FunctionNameIndicator, INDIC_TEXTFORE);
+    editor->indicSetFore(FunctionNameIndicator, dark ? scintillaColour(57, 204, 155)
+                                                    : scintillaColour(0, 112, 82));
+    editor->indicSetStyle(VariableNameIndicator, INDIC_TEXTFORE);
+    editor->indicSetFore(VariableNameIndicator, dark ? scintillaColour(156, 205, 254)
+                                                    : scintillaColour(38, 78, 130));
     editor->autoCSetSeparator('\n');
     editor->autoCSetIgnoreCase(true);
     editor->autoCSetAutoHide(true);
@@ -559,10 +793,17 @@ struct CodeEditorService::Impl
     editor->autoCSetMaxHeight(12);
     editor->autoCSetMaxWidth(64);
     editor->setMouseDwellTime(500);
+    // Diagnostic hover tips are Scintilla call tips. Their default colours
+    // (white background, inherited light foreground) are unreadable on the
+    // dark theme, so the tip looked empty. Give them explicit theme colours.
+    editor->callTipUseStyle(0);
+    editor->callTipSetBack(dark ? scintillaColour(45, 47, 52) : scintillaColour(255, 255, 240));
+    editor->callTipSetFore(dark ? scintillaColour(224, 226, 230) : scintillaColour(30, 30, 30));
+    editor->callTipSetForeHlt(dark ? scintillaColour(120, 190, 255) : scintillaColour(20, 90, 200));
   }
 
   void addSymbol(EditorState *state, const QString &name, int position,
-                 const QString &signature = QString())
+                 const QString &signature = QString(), const QString &valueType = QString())
   {
     if(name.isEmpty() || position < 0 || name.size() > 128)
       return;
@@ -576,6 +817,8 @@ struct CodeEditorService::Impl
     symbol.position = position;
     symbol.signature = signature;
     symbol.state = state;
+    symbol.scopeEnd = state->text.size();
+    symbol.valueType = valueType;
     state->symbols.push_back(symbol);
   }
 
@@ -609,7 +852,7 @@ struct CodeEditorService::Impl
                        "([A-Za-z_][A-Za-z0-9_]*)\\s*(\\([^;{}]*\\))\\s*(?=[:{;])"));
     static const QRegularExpression variableDefinition(
         QStringLiteral("\\b([A-Za-z_][A-Za-z0-9_:<>]*(?:\\s*[*&])?)\\s+"
-                       "([A-Za-z_][A-Za-z0-9_]*)\\s*(?=[=;,:\\[])"));
+                       "([A-Za-z_][A-Za-z0-9_]*)\\s*(?=[=;,:\\[)])"));
     static const QSet<QString> invalidTypes = {
         QStringLiteral("return"), QStringLiteral("if"),      QStringLiteral("for"),
         QStringLiteral("while"),  QStringLiteral("switch"),  QStringLiteral("case"),
@@ -628,7 +871,8 @@ struct CodeEditorService::Impl
           continue;
         const QString name = match.captured(nameGroup);
         const int position = utf16IndexToByte(source, match.capturedStart(nameGroup));
-        addSymbol(state, name, position, function ? cleanSignature(match.captured(0)) : QString());
+        addSymbol(state, name, position, function ? cleanSignature(match.captured(0)) : QString(),
+                  nameGroup == 2 ? match.captured(1).trimmed() : QString());
       }
     };
 
@@ -636,6 +880,107 @@ struct CodeEditorService::Impl
     addMatches(usingDefinition, 1, false);
     addMatches(functionDefinition, 2, true);
     addMatches(variableDefinition, 2, false);
+
+    // Brace scopes and parameter ranges distinguish local shadowing and fields belonging to
+    // different structs. This is a conservative local fallback; macros and overload typing
+    // remain the language server/compiler's responsibility.
+    struct Scope { int start; int end; QString ownerType; bool cbuffer; };
+    QList<Scope> scopes;
+    const QHash<int, int> pairs = codeDelimiterPairs(masked);
+    const QList<Symbol> firstDeclarators = state->symbols;
+    for(const Symbol &symbol : firstDeclarators)
+    {
+      if(!symbol.signature.isEmpty() || symbol.valueType.isEmpty()) continue;
+      for(const FollowingDeclarator &declaration : followingDeclarators(
+              masked, pairs, symbol.position + symbol.name.toUtf8().size(), symbol.valueType))
+        addSymbol(state, declaration.name, declaration.position, QString(), declaration.valueType);
+    }
+    static const QRegularExpression typeScope(
+        QStringLiteral("\\b(struct|class|cbuffer)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*(?::[^{};]*)?$"));
+    for(auto it = pairs.constBegin(); it != pairs.constEnd(); ++it)
+    {
+      if(masked[it.key()] != '{') continue;
+      const int start = qMax(0, qMax(masked.lastIndexOf(';', it.key()),
+                                   qMax(masked.lastIndexOf('}', it.key()),
+                                        masked.lastIndexOf('{', it.key() - 1))) + 1);
+      const auto match = typeScope.match(QString::fromUtf8(masked.mid(start, it.key() - start)));
+      scopes.push_back({it.key(), it.value(), match.captured(2),
+                        match.captured(1) == QStringLiteral("cbuffer")});
+    }
+    auto skipSpace = [&masked](int index) {
+      while(index < masked.size() && std::isspace(static_cast<unsigned char>(masked[index]))) ++index;
+      return index;
+    };
+    std::function<int(int, int)> statementEnd = [&](int index, int depth) -> int {
+      index = skipSpace(index);
+      if(index >= masked.size() || depth > 32) return index;
+      if(masked[index] == '{') return pairs.value(index, index) + 1;
+      for(const QByteArray &control : {QByteArray("if"), QByteArray("for"), QByteArray("while"), QByteArray("switch")})
+      {
+        if(masked.mid(index, control.size()) != control) continue;
+        int open = skipSpace(index + control.size());
+        if(open >= masked.size() || masked[open] != '(' || !pairs.contains(open)) continue;
+        int end = statementEnd(pairs.value(open) + 1, depth + 1);
+        int next = skipSpace(end);
+        if(control == "if" && masked.mid(next, 4) == "else" &&
+           (next + 4 >= masked.size() || !isIdentifierByte(masked[next + 4])))
+          end = statementEnd(next + 4, depth + 1);
+        return end;
+      }
+      for(int i = index; i < masked.size(); ++i)
+      {
+        if(masked[i] == ';') return i + 1;
+        if(masked[i] == '}') return i;
+        if(pairs.contains(i)) i = pairs.value(i);
+      }
+      return masked.size();
+    };
+    QList<QPair<int, int>> forScopes;
+    for(int offset = 0; (offset = masked.indexOf("for", offset)) >= 0; offset += 3)
+    {
+      if(offset > 0 && isIdentifierByte(masked[offset - 1])) continue;
+      const int open = skipSpace(offset + 3);
+      if(open < masked.size() && masked[open] == '(' && pairs.contains(open))
+        forScopes.push_back(qMakePair(open, statementEnd(pairs.value(open) + 1, 0)));
+    }
+    for(Symbol &symbol : state->symbols)
+    {
+      for(const Scope &scope : scopes)
+      {
+        if(scope.start < symbol.position && symbol.position < scope.end &&
+           scope.end - scope.start < symbol.scopeEnd - symbol.scopeStart)
+        {
+          if(scope.cbuffer) continue; // CBuffer members are visible as globals in HLSL.
+          symbol.scopeStart = scope.start;
+          symbol.scopeEnd = scope.end;
+          symbol.ownerType = scope.ownerType;
+        }
+      }
+      if(!symbol.signature.isEmpty()) continue;
+      for(const Symbol &function : state->symbols)
+      {
+        if(function.signature.isEmpty()) continue;
+        int open = masked.indexOf('(', function.position);
+        int close = pairs.value(open, -1);
+        if(!(open < symbol.position && symbol.position < close)) continue;
+        // Prototype parameter names have no visibility outside their own declaration.
+        symbol.scopeStart = open;
+        symbol.scopeEnd = close;
+        int body = masked.indexOf('{', close);
+        int terminator = masked.indexOf(';', close);
+        if(body >= 0 && (terminator < 0 || body < terminator) && pairs.contains(body))
+        {
+          symbol.scopeStart = open;
+          symbol.scopeEnd = pairs.value(body);
+        }
+      }
+      for(const auto &scope : forScopes)
+        if(scope.first < symbol.position && symbol.position < pairs.value(scope.first))
+        {
+          symbol.scopeStart = scope.first;
+          symbol.scopeEnd = scope.second;
+        }
+    }
   }
 
   void rebuildSymbolIndex()
@@ -811,6 +1156,7 @@ struct CodeEditorService::Impl
   {
     QList<Diagnostic> ret = state->localDiagnostics;
     ret.append(state->lspDiagnostics);
+    ret.append(state->externalDiagnostics);
     return ret;
   }
 
@@ -865,6 +1211,7 @@ struct CodeEditorService::Impl
       state->diagnosticsDirty = false;
       displayDiagnostics(state);
     }
+    updateSymbolHighlights(state);
   }
 
   void flushDirtyDocuments()
@@ -882,7 +1229,30 @@ struct CodeEditorService::Impl
     state->textDirty = true;
     state->diagnosticsDirty = true;
     state->lspDiagnostics.clear();
+    // Compiler diagnostics supplied by the owning workspace describe the previous source
+    // revision. Drop their locations as soon as the buffer changes instead of leaving stale
+    // squiggles attached to unrelated text.
+    state->externalDiagnostics.clear();
+    if(referencesMenu)
+      referencesMenu->close();
     diagnosticTimer->start();
+  }
+
+  void moveHistoryForEdit(EditorState *state, int type, int position, int length)
+  {
+    auto update = [=](QList<NavigationEntry> &history) {
+      for(NavigationEntry &entry : history)
+      {
+        if(entry.editor != state->editor || entry.position < position) continue;
+        if(type & SC_MOD_INSERTTEXT) entry.position += length;
+        else if(type & SC_MOD_DELETETEXT)
+          entry.position = qMax(position, entry.position - length);
+        entry.line = int(state->editor->lineFromPosition(entry.position));
+        entry.column = entry.position - int(state->editor->positionFromLine(entry.line));
+      }
+    };
+    update(backHistory);
+    update(forwardHistory);
   }
 
   Location localDefinition(EditorState *sourceState, int position)
@@ -891,7 +1261,8 @@ struct CodeEditorService::Impl
     if(!sourceState || !sourceState->editor)
       return ret;
 
-    syncText(sourceState, false);
+    for(EditorState *state : states)
+      if(state->textDirty) syncText(state, false);
     if(position < 0)
       position = int(sourceState->editor->currentPos());
     QPair<int, int> wordRange;
@@ -899,21 +1270,56 @@ struct CodeEditorService::Impl
     if(word.isEmpty())
       return ret;
 
+    return resolveDefinition(sourceState, wordRange.first, word);
+  }
+
+  Location resolveDefinition(EditorState *sourceState, int wordPosition, const QString &word,
+                             int depth = 0)
+  {
+    Location ret;
+    if(depth > 8) return ret;
     const QList<Symbol> candidates = symbolIndex.value(word);
+    const QByteArray masked = maskedCode(sourceState->text, sourceState->language);
+    int previous = wordPosition - 1;
+    while(previous >= 0 && isspace(static_cast<unsigned char>(masked[previous]))) --previous;
+    const bool member = previous >= 0 && masked[previous] == '.';
+    QString memberType;
+    if(member)
+    {
+      --previous;
+      while(previous >= 0 && isspace(static_cast<unsigned char>(masked[previous]))) --previous;
+      QPair<int, int> range;
+      const QString object = identifierAt(masked, previous, &range);
+      const Location ownerLocation = resolveDefinition(sourceState, range.first, object, depth + 1);
+      for(const Symbol &ownerSymbol : symbolIndex.value(object))
+        if(ownerSymbol.state && ownerSymbol.state->editor == ownerLocation.editor &&
+           ownerSymbol.position == ownerLocation.position)
+          memberType = ownerSymbol.valueType;
+      if(memberType.isEmpty()) return ret;
+    }
     const Symbol *best = NULL;
     qint64 bestScore = std::numeric_limits<qint64>::min();
     for(const Symbol &candidate : candidates)
     {
       if(!candidate.state || !candidate.state->editor)
         continue;
+      const bool atDeclaration = candidate.state == sourceState && candidate.position == wordPosition;
+      if(!atDeclaration)
+      {
+        if(member && candidate.ownerType != memberType) continue;
+        if(!member && !candidate.ownerType.isEmpty()) continue;
+        if(candidate.ownerType.isEmpty() && candidate.scopeStart > 0 &&
+           (candidate.state != sourceState || wordPosition < candidate.position ||
+            wordPosition > candidate.scopeEnd)) continue;
+      }
       qint64 score = 0;
       if(candidate.state == sourceState)
       {
         score += 1000000000LL;
-        if(candidate.position <= wordRange.first)
-          score += 500000000LL - qMin(500000000, wordRange.first - candidate.position);
+        if(candidate.position <= wordPosition)
+          score += 500000000LL - qMin(500000000, wordPosition - candidate.position);
         else
-          score -= candidate.position - wordRange.first;
+          score -= candidate.position - wordPosition;
       }
       if(!best || score > bestScore)
       {
@@ -937,6 +1343,8 @@ struct CodeEditorService::Impl
   {
     if(!location.editor && location.fileName.isEmpty())
       return;
+    const bool wasDelivering = deliveringNavigation;
+    deliveringNavigation = true;
     if(definitionHandler)
     {
       definitionHandler(location);
@@ -946,6 +1354,538 @@ struct CodeEditorService::Impl
       location.editor->gotoPos(location.position);
       location.editor->QWidget::setFocus(Qt::ShortcutFocusReason);
     }
+    deliveringNavigation = wasDelivering;
+  }
+
+  QByteArray indentationUnit(ScintillaEdit *editor) const
+  {
+    if(editor->useTabs())
+      return QByteArray("\t");
+    int width = int(editor->indent());
+    if(width <= 0)
+      width = int(editor->tabWidth());
+    return QByteArray(qMax(1, width), ' ');
+  }
+
+  QByteArray lineIndentationBytes(ScintillaEdit *editor, int line) const
+  {
+    const int start = int(editor->positionFromLine(line));
+    const int end = int(editor->lineIndentPosition(line));
+    return editor->textRange(start, end);
+  }
+
+  QPair<int, int> selectedLineRange(ScintillaEdit *editor) const
+  {
+    const int start = int(editor->selectionStart());
+    const int end = int(editor->selectionEnd());
+    int firstLine = int(editor->lineFromPosition(start));
+    int lastLine = int(editor->lineFromPosition(end));
+    if(end > start && end == editor->positionFromLine(lastLine))
+      lastLine--;
+    return qMakePair(firstLine, qMax(firstLine, lastLine));
+  }
+
+  bool insertSmartNewline(EditorState *state)
+  {
+    ScintillaEdit *editor = state ? state->editor.data() : NULL;
+    if(!editor || editor->readOnly() || editor->selections() != 1 ||
+       editor->selectionIsRectangle())
+      return false;
+
+    const int start = int(editor->selectionStart());
+    const int end = int(editor->selectionEnd());
+    const QByteArray text = editor->getText(editor->textLength() + 1);
+    const SmartNewlineEdit edit =
+        planSmartNewline(text, start, end, eolBytes(int(editor->eOLMode())),
+                         indentationUnit(editor), state->language == QStringLiteral("python"));
+
+    editor->beginUndoAction();
+    editor->setTargetRange(start, end);
+    editor->replaceTarget(edit.replacement.size(), edit.replacement.constData());
+    editor->setEmptySelection(start + edit.caretOffset);
+    editor->endUndoAction();
+    return true;
+  }
+
+  bool insertOpenLine(EditorState *state, bool above)
+  {
+    ScintillaEdit *editor = state ? state->editor.data() : NULL;
+    if(!editor || editor->readOnly() || editor->selections() != 1 ||
+       editor->selectionIsRectangle())
+      return false;
+
+    const int line = int(editor->lineFromPosition(editor->currentPos()));
+    const QByteArray indentation = lineIndentationBytes(editor, line);
+    const QByteArray eol = eolBytes(int(editor->eOLMode()));
+    const int insertionPosition =
+        above ? int(editor->positionFromLine(line)) : int(editor->lineEndPosition(line));
+    const QByteArray insertion = above ? indentation + eol : eol + indentation;
+    const int caret = insertionPosition + (above ? indentation.size() : insertion.size());
+
+    editor->beginUndoAction();
+    editor->insertText(insertionPosition, insertion.constData());
+    editor->setEmptySelection(caret);
+    editor->endUndoAction();
+    return true;
+  }
+
+  bool indentSelectedLines(EditorState *state, bool unindent)
+  {
+    ScintillaEdit *editor = state ? state->editor.data() : NULL;
+    if(!editor || editor->readOnly() || editor->selectionStart() == editor->selectionEnd() ||
+       editor->selections() != 1 || editor->selectionIsRectangle())
+      return false;
+
+    const QPair<int, int> lines = selectedLineRange(editor);
+    int width = int(editor->indent());
+    if(width <= 0)
+      width = int(editor->tabWidth());
+    width = qMax(1, width);
+
+    editor->beginUndoAction();
+    for(int line = lines.first; line <= lines.second; line++)
+    {
+      const int oldIndent = int(editor->lineIndentation(line));
+      editor->setLineIndentation(line, unindent ? qMax(0, oldIndent - width) : oldIndent + width);
+    }
+    editor->endUndoAction();
+    return true;
+  }
+
+  bool toggleLineComment(EditorState *state)
+  {
+    ScintillaEdit *editor = state ? state->editor.data() : NULL;
+    if(!editor || editor->readOnly() || editor->selections() != 1 ||
+       editor->selectionIsRectangle())
+      return false;
+
+    const QByteArray marker = state->language == QStringLiteral("python") ? QByteArray("#")
+                                                                          : QByteArray("//");
+    const QPair<int, int> lines = selectedLineRange(editor);
+    bool anyNonBlank = false;
+    bool allCommented = true;
+    for(int line = lines.first; line <= lines.second; line++)
+    {
+      const int start = int(editor->positionFromLine(line));
+      const QByteArray content = editor->textRange(start, int(editor->lineEndPosition(line)));
+      const int indentation = leadingWhitespace(content).size();
+      const QByteArray remainder = content.mid(indentation);
+      if(remainder.trimmed().isEmpty())
+        continue;
+      anyNonBlank = true;
+      if(!remainder.startsWith(marker))
+        allCommented = false;
+    }
+    allCommented = anyNonBlank && allCommented;
+
+    QList<TextReplacement> replacements;
+    for(int line = lines.first; line <= lines.second; line++)
+    {
+      const int lineStartPosition = int(editor->positionFromLine(line));
+      const QByteArray content =
+          editor->textRange(lineStartPosition, int(editor->lineEndPosition(line)));
+      const int indentation = leadingWhitespace(content).size();
+      const QByteArray remainder = content.mid(indentation);
+      TextReplacement replacement;
+      replacement.start = lineStartPosition + indentation;
+      if(allCommented)
+      {
+        if(remainder.trimmed().isEmpty() || !remainder.startsWith(marker))
+          continue;
+        replacement.removedLength = marker.size();
+        if(remainder.size() > marker.size() && remainder[marker.size()] == ' ')
+          replacement.removedLength++;
+      }
+      else
+      {
+        replacement.inserted = marker + QByteArray(" ");
+      }
+      replacements.push_back(replacement);
+    }
+
+    if(replacements.isEmpty())
+      return true;
+
+    const int originalAnchor = int(editor->anchor());
+    const int originalCaret = int(editor->currentPos());
+    editor->beginUndoAction();
+    for(int i = replacements.size() - 1; i >= 0; i--)
+    {
+      const TextReplacement &replacement = replacements[i];
+      editor->setTargetRange(replacement.start, replacement.start + replacement.removedLength);
+      editor->replaceTarget(replacement.inserted.size(), replacement.inserted.constData());
+    }
+    editor->setSel(transformedPosition(originalAnchor, replacements),
+                   transformedPosition(originalCaret, replacements));
+    editor->endUndoAction();
+    return true;
+  }
+
+  bool typePairedCharacter(EditorState *state, char typed)
+  {
+    ScintillaEdit *editor = state ? state->editor.data() : NULL;
+    if(!editor || editor->readOnly() || editor->selections() != 1 ||
+       editor->selectionIsRectangle())
+      return false;
+
+    char closing = '\0';
+    if(typed == '(')
+      closing = ')';
+    else if(typed == '[')
+      closing = ']';
+    else if(typed == '{')
+      closing = '}';
+    else if(typed == '\'' || typed == '"')
+      closing = typed;
+
+    const int start = int(editor->selectionStart());
+    const int end = int(editor->selectionEnd());
+    if(start == end && (typed == ')' || typed == ']' || typed == '}' || typed == '\'' ||
+                        typed == '"') &&
+       editor->charAt(start) == typed)
+    {
+      editor->setEmptySelection(start + 1);
+      return true;
+    }
+
+    if(closing == '\0')
+      return false;
+    if(start == end && (typed == '\'' || typed == '"') && start > 0 &&
+       editor->charAt(start - 1) == '\\')
+      return false;
+
+    const QByteArray selected = editor->textRange(start, end);
+    QByteArray replacement;
+    replacement.reserve(selected.size() + 2);
+    replacement.append(typed);
+    replacement.append(selected);
+    replacement.append(closing);
+
+    const bool forwardSelection = editor->anchor() <= editor->currentPos();
+    editor->beginUndoAction();
+    editor->setTargetRange(start, end);
+    editor->replaceTarget(replacement.size(), replacement.constData());
+    if(start == end)
+      editor->setEmptySelection(start + 1);
+    else if(forwardSelection)
+      editor->setSel(start + 1, start + 1 + selected.size());
+    else
+      editor->setSel(start + 1 + selected.size(), start + 1);
+    editor->endUndoAction();
+
+    if(typed == '(')
+      callTip(state);
+    return true;
+  }
+
+  bool deleteEmptyPair(EditorState *state)
+  {
+    ScintillaEdit *editor = state ? state->editor.data() : NULL;
+    if(!editor || editor->readOnly() || editor->selections() != 1 ||
+       editor->selectionIsRectangle() || editor->selectionStart() != editor->selectionEnd())
+      return false;
+
+    const int caret = int(editor->currentPos());
+    if(caret <= 0 || caret >= editor->length())
+      return false;
+
+    const char previous = char(editor->charAt(caret - 1));
+    const char next = char(editor->charAt(caret));
+    const bool paired = (previous == '(' && next == ')') || (previous == '[' && next == ']') ||
+                        (previous == '{' && next == '}') ||
+                        (previous == '\'' && next == '\'') ||
+                        (previous == '"' && next == '"');
+    if(!paired)
+      return false;
+
+    editor->beginUndoAction();
+    editor->setTargetRange(caret - 1, caret + 1);
+    editor->replaceTarget(0, "");
+    editor->setEmptySelection(caret - 1);
+    editor->endUndoAction();
+    return true;
+  }
+
+  void updateSymbolHighlights(EditorState *state)
+  {
+    ScintillaEdit *editor = state ? state->editor.data() : NULL;
+    if(!editor || state->textDirty)
+      return;
+    const int previous = int(editor->indicatorCurrent());
+    if(state->maskedVersion != state->version)
+    {
+      state->maskedText = maskedCode(state->text, state->language);
+      state->maskedVersion = state->version;
+    }
+    const QByteArray &masked = state->maskedText;
+    if(state->coloredVersion != state->version)
+    {
+      state->coloredVersion = state->version;
+      for(int indicator : {FunctionNameIndicator, VariableNameIndicator})
+      {
+        editor->setIndicatorCurrent(indicator);
+        editor->indicatorClearRange(0, editor->length());
+      }
+      if(state->language != QStringLiteral("python") && masked.size() <= MaxMessageBytes)
+      {
+        QSet<QByteArray> functions, variables;
+        for(const Symbol &symbol : state->symbols)
+          (symbol.signature.isEmpty() ? variables : functions).insert(symbol.name.toUtf8());
+        for(int start = 0; start < masked.size();)
+        {
+          if(!isIdentifierByte(masked[start]))
+          {
+            start++;
+            continue;
+          }
+          int end = start + 1;
+          while(end < masked.size() && isIdentifierByte(masked[end]))
+            end++;
+          const QByteArray word = masked.mid(start, end - start);
+          const int indicator = functions.contains(word) ? FunctionNameIndicator
+                                : variables.contains(word) ? VariableNameIndicator : -1;
+          if(indicator >= 0)
+          {
+            editor->setIndicatorCurrent(indicator);
+            editor->indicatorFillRange(start, end - start);
+          }
+          start = end;
+        }
+      }
+    }
+    const QByteArray word = identifierAt(masked, int(editor->currentPos())).toUtf8();
+    if(state->highlightedWord != word || state->highlightedVersion != state->version)
+    {
+      state->highlightedWord = word;
+      state->highlightedVersion = state->version;
+      editor->setIndicatorCurrent(SymbolOccurrenceIndicator);
+      editor->indicatorClearRange(0, editor->length());
+      if(!word.isEmpty() && word.size() <= 128 && masked.size() <= MaxMessageBytes)
+      {
+        int start = 0;
+        for(int count = 0; count < 10000; count++)
+        {
+          start = masked.indexOf(word, start);
+          if(start < 0)
+            break;
+          const int end = start + word.size();
+          if((start == 0 || !isIdentifierByte(masked[start - 1])) &&
+             (end == masked.size() || !isIdentifierByte(masked[end])))
+            editor->indicatorFillRange(start, word.size());
+          start = end;
+        }
+      }
+    }
+    editor->setIndicatorCurrent(previous);
+  }
+
+  void updateBraceHighlight(EditorState *state)
+  {
+    ScintillaEdit *editor = state ? state->editor.data() : NULL;
+    if(!editor)
+      return;
+
+    editor->braceHighlight(-1, -1);
+    editor->braceBadLight(-1);
+    const int caret = int(editor->currentPos());
+    auto isBrace = [](int character) {
+      return character == '(' || character == ')' || character == '[' || character == ']' ||
+             character == '{' || character == '}';
+    };
+    int brace = -1;
+    if(caret < editor->length() && isBrace(int(editor->charAt(caret))))
+      brace = caret;
+    else if(caret > 0 && isBrace(int(editor->charAt(caret - 1))))
+      brace = caret - 1;
+    if(brace < 0)
+      return;
+
+    const int match = int(editor->braceMatch(brace, 0));
+    if(match >= 0)
+      editor->braceHighlight(brace, match);
+    else
+      editor->braceBadLight(brace);
+  }
+
+  NavigationEntry navigationEntry(ScintillaEdit *editor, int position = -1) const
+  {
+    NavigationEntry ret;
+    EditorState *state = stateFor(editor);
+    if(!state || !state->editor)
+      return ret;
+    ret.editor = state->editor;
+    ret.fileName = state->fileName;
+    ret.position = position < 0 ? int(editor->currentPos()) : position;
+    ret.position = qBound(0, ret.position, int(editor->length()));
+    ret.line = int(editor->lineFromPosition(ret.position));
+    ret.column = ret.position - int(editor->positionFromLine(ret.line));
+    return ret;
+  }
+
+  Location navigationLocation(const NavigationEntry &entry) const
+  {
+    Location ret;
+    ret.editor = entry.editor.data();
+    ret.fileName = entry.fileName;
+    ret.position = entry.position;
+    ret.line = entry.line;
+    ret.column = entry.column;
+    if(!ret.editor && !ret.fileName.isEmpty())
+    {
+      for(EditorState *state : states)
+      {
+        if(state->editor && state->fileName.compare(ret.fileName, Qt::CaseInsensitive) == 0)
+        {
+          ret.editor = state->editor.data();
+          ret.position = qBound(0, ret.position, int(ret.editor->length()));
+          ret.line = int(ret.editor->lineFromPosition(ret.position));
+          ret.column = ret.position - int(ret.editor->positionFromLine(ret.line));
+          break;
+        }
+      }
+    }
+    return ret;
+  }
+
+  void pushHistory(QList<NavigationEntry> &history, const NavigationEntry &entry)
+  {
+    if(!entry.editor && entry.fileName.isEmpty())
+      return;
+    if(!history.isEmpty())
+    {
+      const NavigationEntry &last = history.back();
+      if(last.editor == entry.editor && last.fileName == entry.fileName &&
+         last.position == entry.position)
+        return;
+    }
+    history.push_back(entry);
+    while(history.size() > NavigationHistoryLimit)
+      history.pop_front();
+  }
+
+  void navigateToDefinition(const Location &location, ScintillaEdit *sourceEditor,
+                            int sourcePosition)
+  {
+    const NavigationEntry source = navigationEntry(sourceEditor, sourcePosition);
+    if((location.editor != source.editor || location.position != source.position) &&
+       (source.editor || !source.fileName.isEmpty()))
+    {
+      pushHistory(backHistory, source);
+      forwardHistory.clear();
+    }
+    deliverDefinition(location);
+  }
+
+  bool navigateHistory(ScintillaEdit *editor, bool backwards)
+  {
+    QList<NavigationEntry> &source = backwards ? backHistory : forwardHistory;
+    QList<NavigationEntry> &destination = backwards ? forwardHistory : backHistory;
+    while(!source.isEmpty())
+    {
+      const NavigationEntry targetEntry = source.takeLast();
+      const Location target = navigationLocation(targetEntry);
+      if(!target.editor && (target.fileName.isEmpty() || !definitionHandler))
+        continue;
+      pushHistory(destination, navigationEntry(editor));
+      deliverDefinition(target);
+      return true;
+    }
+    return false;
+  }
+
+  void showReferences(EditorState *sourceState, int position)
+  {
+    if(!sourceState || !sourceState->editor) return;
+    // Synchronise every open document before taking the popup snapshot.
+    for(EditorState *state : states) syncText(state, false);
+    const Location definition = localDefinition(sourceState, position);
+    if(!definition.isValid()) return;
+    const QString word = identifierAt(sourceState->text, position);
+    const QByteArray needle = word.toUtf8();
+    if(needle.isEmpty()) return;
+    if(referencesMenu) referencesMenu->close();
+    const QPointer<ScintillaEdit> origin = sourceState->editor;
+    const quint64 originRevision = sourceState->editRevision;
+
+    struct ReferenceHit
+    {
+      QPointer<ScintillaEdit> editor;
+      quint64 revision;
+      Location target;
+      QString label;
+    };
+    QVector<ReferenceHit> hits;
+    for(EditorState *state : states)
+    {
+      const QByteArray masked = maskedCode(state->text, state->language);
+      int offset = 0;
+      while(hits.size() < 256 && (offset = masked.indexOf(needle, offset)) >= 0)
+      {
+        const int found = offset;
+        offset += needle.size();
+        if((found > 0 && isIdentifierByte(masked[found - 1])) ||
+           (offset < masked.size() && isIdentifierByte(masked[offset]))) continue;
+        if(state->editor == definition.editor && found == definition.position) continue;
+        const Location resolved = resolveDefinition(state, found, word);
+        if(resolved.editor != definition.editor || resolved.position != definition.position) continue;
+        const Location target = navigationLocation(navigationEntry(state->editor, found));
+        const int start = int(state->editor->positionFromLine(target.line));
+        const int end = int(state->editor->lineEndPosition(target.line));
+        QString snippet = QString::fromUtf8(state->text.mid(start, end - start)).simplified().left(140);
+        const QString label = QCoreApplication::translate("CodeEditorService", "%1:%2  %3")
+                                  .arg(QFileInfo(state->fileName).fileName()).arg(target.line + 1)
+                                  .arg(snippet);
+        ReferenceHit hit;
+        hit.editor = state->editor;
+        hit.revision = state->editRevision;
+        hit.target = target;
+        hit.label = label;
+        hits.push_back(hit);
+      }
+      if(hits.size() >= 256) break;
+    }
+
+    // A single call site needs no chooser: jump straight to it (guarding the
+    // captured revisions so a concurrent edit cannot mis-navigate).
+    if(hits.size() == 1)
+    {
+      const ReferenceHit &only = hits.front();
+      EditorState *from = stateFor(origin.data());
+      EditorState *to = stateFor(only.editor.data());
+      if(from && to && from->editRevision == originRevision && to->editRevision == only.revision)
+        navigateToDefinition(only.target, origin.data(), position);
+      return;
+    }
+
+    QMenu *menu = new QMenu(sourceState->editor);
+    referencesMenu = menu;
+    menu->setObjectName(QStringLiteral("shaderReferencesPopup")); // i18n-ignore: automation id.
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+    menu->addSection(QCoreApplication::translate("CodeEditorService", "References to %1").arg(word));
+    for(const ReferenceHit &hit : hits)
+    {
+      QAction *action = menu->addAction(QString(hit.label).replace(QLatin1Char('&'), QStringLiteral("&&")));
+      action->setData(hit.target.line + 1);
+      const QPointer<ScintillaEdit> targetEditor = hit.editor;
+      const quint64 targetRevision = hit.revision;
+      const Location target = hit.target;
+      QObject::connect(action, &QAction::triggered, owner,
+                       [this, origin, originRevision, targetEditor, targetRevision, target, position]() {
+        EditorState *from = stateFor(origin.data());
+        EditorState *to = stateFor(targetEditor.data());
+        if(!from || !to || from->editRevision != originRevision || to->editRevision != targetRevision)
+          return;
+        navigateToDefinition(target, origin.data(), position);
+      });
+    }
+    if(hits.isEmpty())
+      menu->addAction(QCoreApplication::translate("CodeEditorService", "No references found in open documents"))->setEnabled(false);
+    else if(hits.size() >= 256)
+      menu->addAction(QCoreApplication::translate("CodeEditorService", "Showing the first 256 references"))->setEnabled(false);
+    ScintillaEdit *editor = sourceState->editor;
+    const QPoint local(int(editor->pointXFromPosition(position)),
+                       int(editor->pointYFromPosition(position) + editor->textHeight(editor->lineFromPosition(position))));
+    menu->popup(editor->mapToGlobal(local));
   }
 
   QStringList completions(EditorState *state, const QString &prefix,
@@ -1382,8 +2322,11 @@ struct CodeEditorService::Impl
     request.sourceEditor = state->editor.data();
     request.version = state->version;
     request.editRevision = state->editRevision;
+    request.position = position;
     request.localFallback = fallback;
     request.localFallbackEditor = fallback.editor;
+    for(EditorState *documentState : states)
+      request.documentRevisions.insert(documentState->editor.data(), documentState->editRevision);
     return sendRequest(QStringLiteral("textDocument/definition"), params, request) >= 0;
   }
 
@@ -1612,14 +2555,26 @@ struct CodeEditorService::Impl
     }
     else if(request.kind == PendingKind::Definition)
     {
+      EditorState *sourceState = stateFor(request.editor.data());
+      if(!sourceState || sourceState->version != request.version ||
+         sourceState->editRevision != request.editRevision ||
+         sourceState->editor->currentPos() != request.position)
+        return;
+      // The server response uses positions from its request snapshot. Do not apply it if
+      // any open target changed in the meantime, even when the source stayed unchanged.
+      for(auto it = request.documentRevisions.constBegin(); it != request.documentRevisions.constEnd(); ++it)
+      {
+        EditorState *documentState = stateFor(it.key());
+        if(!documentState || documentState->editRevision != it.value()) return;
+      }
       const Location location = locationFromLsp(result);
       if(location.editor || !location.fileName.isEmpty())
-        deliverDefinition(location);
+        navigateToDefinition(location, request.editor.data(), request.position);
       else if(request.localFallbackEditor)
       {
         Location fallback = request.localFallback;
         fallback.editor = request.localFallbackEditor.data();
-        deliverDefinition(fallback);
+        navigateToDefinition(fallback, request.editor.data(), request.position);
       }
       else
         reportStatus(QCoreApplication::translate(
@@ -1655,7 +2610,10 @@ CodeEditorService::CodeEditorService(QObject *parent) : QObject(parent), m_Impl(
 CodeEditorService::~CodeEditorService()
 {
   for(ScintillaEdit *editor : m_Impl->states.keys())
+  {
+    editor->removeEventFilter(this);
     QObject::disconnect(editor, NULL, this, NULL);
+  }
   delete m_Impl;
   m_Impl = NULL;
 }
@@ -1691,6 +2649,7 @@ void CodeEditorService::registerEditor(ScintillaEdit *editor, const QString &fil
   state->text = editor->getText(editor->textLength() + 1);
   state->localDiagnostics = m_Impl->localDiagnosticsFor(state);
   m_Impl->states[editor] = state;
+  editor->installEventFilter(this);
   m_Impl->configureIndicators(editor);
   m_Impl->rebuildSymbolIndex();
   m_Impl->displayDiagnostics(state);
@@ -1698,9 +2657,12 @@ void CodeEditorService::registerEditor(ScintillaEdit *editor, const QString &fil
   QObject::connect(editor, &ScintillaEdit::destroyed, this,
                    [this, editor](QObject *) { unregisterEditor(editor); });
   QObject::connect(editor, &ScintillaEdit::modified, this,
-                   [this, state](int type, int, int, int, const QByteArray &, int, int, int) {
+                   [this, state](int type, int position, int length, int, const QByteArray &, int, int, int) {
                      if(type & (SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT))
+                     {
+                       m_Impl->moveHistoryForEdit(state, type, position, length);
                        m_Impl->markModified(state);
+                     }
                    });
   QObject::connect(editor, &ScintillaEdit::charAdded, this, [this, state](int character) {
     if(!state->editor)
@@ -1727,7 +2689,12 @@ void CodeEditorService::registerEditor(ScintillaEdit *editor, const QString &fil
     }
   });
   QObject::connect(editor, &ScintillaEdit::keyPressed, this,
-                   [this, editor](QKeyEvent *event) { handleKeyPress(editor, event); });
+                    [this, editor](QKeyEvent *event) { handleKeyPress(editor, event); });
+  QObject::connect(editor, &ScintillaEdit::updateUi, this,
+                   [this, state]() {
+                     m_Impl->updateBraceHighlight(state);
+                     m_Impl->updateSymbolHighlights(state);
+                   });
   QObject::connect(editor, &ScintillaEdit::dwellStart, this,
                    [this, state](int x, int y) { m_Impl->showDiagnosticAt(state, x, y); });
   QObject::connect(editor, &ScintillaEdit::dwellEnd, this, [state](int, int) {
@@ -1739,6 +2706,7 @@ void CodeEditorService::registerEditor(ScintillaEdit *editor, const QString &fil
   });
 
   m_Impl->sendDidOpen(state);
+  m_Impl->updateBraceHighlight(state);
   if(!m_Impl->serverAttempted)
     m_Impl->startServer(false);
 }
@@ -1763,7 +2731,12 @@ void CodeEditorService::unregisterEditor(ScintillaEdit *editor)
   }
 
   m_Impl->sendDidClose(state);
+  if(m_Impl->referencesMenu) m_Impl->referencesMenu->close();
+  editor->removeEventFilter(this);
   QObject::disconnect(editor, NULL, this, NULL);
+  for(QList<Impl::NavigationEntry> *history : {&m_Impl->backHistory, &m_Impl->forwardHistory})
+    for(int i = history->size() - 1; i >= 0; --i)
+      if((*history)[i].editor.data() == editor) history->removeAt(i);
   delete state;
   m_Impl->rebuildSymbolIndex();
 }
@@ -1789,6 +2762,107 @@ void CodeEditorService::setDiagnosticsHandler(const DiagnosticsHandler &handler)
 void CodeEditorService::setStatusHandler(const StatusHandler &handler)
 {
   m_Impl->statusHandler = handler;
+}
+
+bool CodeEditorService::eventFilter(QObject *watched, QEvent *event)
+{
+  ScintillaEdit *editor = qobject_cast<ScintillaEdit *>(watched);
+  Impl::EditorState *state = m_Impl->stateFor(editor);
+  if(!state || !event || event->type() != QEvent::KeyPress)
+    return QObject::eventFilter(watched, event);
+
+  QKeyEvent *keyEvent = static_cast<QKeyEvent *>(event);
+  const Qt::KeyboardModifiers modifiers = keyEvent->modifiers();
+  Qt::KeyboardModifiers modifiersWithoutKeypad = modifiers & ~Qt::KeypadModifier;
+
+  if(modifiersWithoutKeypad == Qt::AltModifier &&
+     (keyEvent->key() == Qt::Key_Left || keyEvent->key() == Qt::Key_Right))
+  {
+    if(m_Impl->navigateHistory(editor, keyEvent->key() == Qt::Key_Left))
+    {
+      event->accept();
+      return true;
+    }
+  }
+
+  // Handle command keys before Scintilla sees them. Its keyPressed signal is emitted after its
+  // normal key map has already run, which is too late for Ctrl+/ and the custom line operations.
+  if(handleKeyPress(editor, keyEvent))
+    return true;
+
+  if(editor->readOnly())
+    return QObject::eventFilter(watched, event);
+
+  const bool primary = hasPrimaryModifier(modifiers, false);
+  const bool primaryShift = (modifiersWithoutKeypad & Qt::ShiftModifier) &&
+                            hasPrimaryModifier(modifiers, true);
+  if(keyEvent->key() == Qt::Key_Backspace && modifiersWithoutKeypad == Qt::NoModifier)
+  {
+    if(m_Impl->deleteEmptyPair(state))
+    {
+      event->accept();
+      return true;
+    }
+  }
+  if((keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter) && primary)
+  {
+    if(m_Impl->insertOpenLine(state, false))
+    {
+      event->accept();
+      return true;
+    }
+  }
+  if((keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter) && primaryShift)
+  {
+    if(m_Impl->insertOpenLine(state, true))
+    {
+      event->accept();
+      return true;
+    }
+  }
+  if(keyEvent->key() == Qt::Key_Slash && primary)
+  {
+    if(m_Impl->toggleLineComment(state))
+    {
+      event->accept();
+      return true;
+    }
+  }
+  if((keyEvent->key() == Qt::Key_Tab || keyEvent->key() == Qt::Key_Backtab) &&
+     !(modifiersWithoutKeypad & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)))
+  {
+    const bool unindent = keyEvent->key() == Qt::Key_Backtab ||
+                          (modifiersWithoutKeypad & Qt::ShiftModifier);
+    if(m_Impl->indentSelectedLines(state, unindent))
+    {
+      event->accept();
+      return true;
+    }
+  }
+  if((keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter) &&
+     (modifiersWithoutKeypad == Qt::NoModifier ||
+      modifiersWithoutKeypad == Qt::ShiftModifier))
+  {
+    if(m_Impl->insertSmartNewline(state))
+    {
+      event->accept();
+      return true;
+    }
+  }
+
+  if(!(modifiersWithoutKeypad &
+       (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier)))
+  {
+    const QString text = keyEvent->text();
+    if(text.size() == 1 && text[0].unicode() <= 0x7f &&
+       m_Impl->typePairedCharacter(state, char(text[0].unicode())))
+    {
+      event->accept();
+      return true;
+    }
+  }
+
+  return QObject::eventFilter(watched, event);
 }
 
 bool CodeEditorService::handleKeyPress(ScintillaEdit *editor, QKeyEvent *event)
@@ -1820,14 +2894,50 @@ void CodeEditorService::requestDefinition(ScintillaEdit *editor, int position)
   if(position < 0)
     position = int(editor->currentPos());
   const Location fallback = m_Impl->localDefinition(state, position);
+  const auto range = identifierRange(state->text, position);
+  if(fallback.editor == editor && fallback.position == range.first)
+  {
+    m_Impl->showReferences(state, position);
+    return;
+  }
   if(!m_Impl->requestLspDefinition(state, position, fallback))
   {
     if(fallback.editor)
-      m_Impl->deliverDefinition(fallback);
+      m_Impl->navigateToDefinition(fallback, editor, position);
     else
       m_Impl->reportStatus(QCoreApplication::translate(
           "CodeEditorService", "No definition was found for the selected symbol"));
   }
+}
+
+void CodeEditorService::requestReferences(ScintillaEdit *editor, int position)
+{
+  if(!editor) return;
+  m_Impl->showReferences(m_Impl->stateFor(editor), position < 0 ? int(editor->currentPos()) : position);
+}
+
+void CodeEditorService::rememberNavigation(ScintillaEdit *editor, int targetPosition)
+{
+  if(!editor || m_Impl->deliveringNavigation || targetPosition == editor->currentPos()) return;
+  m_Impl->pushHistory(m_Impl->backHistory, m_Impl->navigationEntry(editor));
+  m_Impl->forwardHistory.clear();
+}
+
+void CodeEditorService::clearNavigation(ScintillaEdit *editor)
+{
+  for(QList<Impl::NavigationEntry> *history : {&m_Impl->backHistory, &m_Impl->forwardHistory})
+    for(int i = history->size() - 1; i >= 0; --i)
+      if((*history)[i].editor.data() == editor) history->removeAt(i);
+}
+
+bool CodeEditorService::navigateHistory(ScintillaEdit *editor, bool backwards)
+{
+  return m_Impl->navigateHistory(editor, backwards);
+}
+
+bool CodeEditorService::canNavigateHistory(bool backwards) const
+{
+  return !(backwards ? m_Impl->backHistory : m_Impl->forwardHistory).isEmpty();
 }
 
 void CodeEditorService::requestCompletion(ScintillaEdit *editor, bool explicitRequest)
@@ -1864,6 +2974,31 @@ QList<CodeEditorService::Diagnostic> CodeEditorService::diagnostics(ScintillaEdi
     return QList<Diagnostic>();
   m_Impl->syncText(state, true);
   return m_Impl->combinedDiagnostics(state);
+}
+
+void CodeEditorService::setExternalDiagnostics(ScintillaEdit *editor,
+                                               const QList<Diagnostic> &diagnostics)
+{
+  Impl::EditorState *state = m_Impl->stateFor(editor);
+  if(!state || !state->editor)
+    return;
+
+  state->externalDiagnostics.clear();
+  const int documentLength = int(editor->length());
+  const int count = qMin(diagnostics.size(), MaxDiagnostics);
+  state->externalDiagnostics.reserve(count);
+  for(int i = 0; i < count; i++)
+  {
+    Diagnostic diagnostic = diagnostics[i];
+    diagnostic.start = qBound(0, diagnostic.start, documentLength);
+    diagnostic.length = qMax(1, qMin(diagnostic.length, documentLength - diagnostic.start));
+    diagnostic.line = int(editor->lineFromPosition(diagnostic.start));
+    diagnostic.column = diagnostic.start - int(editor->positionFromLine(diagnostic.line));
+    diagnostic.message = diagnostic.message.left(2048);
+    diagnostic.source = diagnostic.source.left(128);
+    state->externalDiagnostics.push_back(diagnostic);
+  }
+  m_Impl->displayDiagnostics(state);
 }
 
 void CodeEditorService::setLanguageServerCommand(const QString &program, const QStringList &arguments)
@@ -1906,3 +3041,86 @@ bool CodeEditorService::languageServerRunning() const
 {
   return m_Impl->serverReady && m_Impl->process->state() == QProcess::Running;
 }
+
+#if ENABLE_UNIT_TESTS
+
+#include "3rdparty/catch/catch.hpp"
+
+TEST_CASE("Code editor smart newline planning", "[code-editor]")
+{
+  SECTION("an empty brace pair is split onto three lines")
+  {
+    const QByteArray text("if(enabled) {}");
+    const int caret = text.indexOf('{') + 1;
+    const SmartNewlineEdit edit =
+        planSmartNewline(text, caret, caret, QByteArray("\n"), QByteArray("  "), false);
+    CHECK(edit.replacement == QByteArray("\n  \n"));
+    CHECK(edit.caretOffset == 3);
+  }
+
+  SECTION("the current indentation and editor EOL are preserved")
+  {
+    const QByteArray text("\tif(enabled) {");
+    const SmartNewlineEdit edit = planSmartNewline(
+        text, text.size(), text.size(), QByteArray("\r\n"), QByteArray("\t"), false);
+    CHECK(edit.replacement == QByteArray("\r\n\t\t"));
+    CHECK(edit.caretOffset == edit.replacement.size());
+  }
+
+  SECTION("python suites indent after a colon")
+  {
+    const QByteArray text("def render():");
+    const SmartNewlineEdit edit = planSmartNewline(
+        text, text.size(), text.size(), QByteArray("\n"), QByteArray("    "), true);
+    CHECK(edit.replacement == QByteArray("\n    "));
+  }
+}
+
+TEST_CASE("Code editor position transforms follow line comment edits", "[code-editor]")
+{
+  QList<TextReplacement> edits;
+  edits.push_back({0, 0, QByteArray("// ")});
+  edits.push_back({8, 0, QByteArray("// ")});
+  CHECK(transformedPosition(0, edits) == 3);
+  CHECK(transformedPosition(5, edits) == 8);
+  CHECK(transformedPosition(10, edits) == 16);
+}
+
+TEST_CASE("Code editor indexes every comma declarator without indexing initializer arguments", "[code-editor]")
+{
+  SECTION("later local declarations retain their own source positions")
+  {
+    const QByteArray code("float value; float G(){ float first=0, value=1; return value; }");
+    const auto declarations = followingDeclarators(
+        code, codeDelimiterPairs(code), code.indexOf("first") + 5, QStringLiteral("float"));
+    REQUIRE(declarations.size() == 1);
+    CHECK(declarations[0].name.toUtf8() == QByteArray("value"));
+    CHECK(declarations[0].position == code.indexOf("value=1"));
+    CHECK(declarations[0].valueType.toUtf8() == QByteArray("float"));
+  }
+  SECTION("nested calls, indices and aggregates do not create declarations")
+  {
+    const QByteArray code("float first=Make(1, 2), values[2]={3, 4}, last=values[Index(0, 1)];");
+    const auto declarations = followingDeclarators(
+        code, codeDelimiterPairs(code), code.indexOf("first") + 5, QStringLiteral("float"));
+    REQUIRE(declarations.size() == 2);
+    CHECK(declarations[0].name.toUtf8() == QByteArray("values"));
+    CHECK(declarations[1].name.toUtf8() == QByteArray("last"));
+  }
+  SECTION("the next typed function parameter is not a comma variable")
+  {
+    const QByteArray code("float F(float first, float value) { return value; }");
+    CHECK(followingDeclarators(code, codeDelimiterPairs(code), code.indexOf("first") + 5,
+                              QStringLiteral("float")).isEmpty());
+  }
+  SECTION("for initializers stop before the loop condition")
+  {
+    const QByteArray code("for(int first=0, value=1; Check(first, value); ++value) {}");
+    const auto declarations = followingDeclarators(
+        code, codeDelimiterPairs(code), code.indexOf("first") + 5, QStringLiteral("int"));
+    REQUIRE(declarations.size() == 1);
+    CHECK(declarations[0].name.toUtf8() == QByteArray("value"));
+  }
+}
+
+#endif

@@ -1,8 +1,8 @@
 """Direct client for the bundled qrenderdoc bridge protocol v2.
 
-The internal AgentHost uses this transport through its controlled ToolService.
-ReplayLabMCP is a separate external adapter for IDEs and other out-of-process
-clients; it is not part of the internal model-to-RenderDoc call path.
+AgentHost uses this client for instance discovery, frozen capture context and
+connection diagnostics. Agent task tools use the task-scoped MCP filter and
+ReplayLabMCP, which forwards authorized calls to the bundled bridge.
 """
 
 from __future__ import annotations

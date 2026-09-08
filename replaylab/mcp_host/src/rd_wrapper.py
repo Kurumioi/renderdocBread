@@ -644,22 +644,36 @@ class CaptureSession:
 
     # ---- Bound texture mapping per shader stage ----
 
-    def _shader_stage(self, stage_name: str):
-        """Resolve a concrete stage without ever falling back to Fragment."""
+    @staticmethod
+    def _shader_stage_name(stage_name: str) -> str:
+        """Return the canonical stage identity used in every response."""
         aliases = {
             "pixel": "fragment",
             "ps": "fragment",
+            "fs": "fragment",
             "vs": "vertex",
+            "hs": "hull",
             "tess_ctrl": "hull",
+            "ds": "domain",
             "tess_eval": "domain",
+            "gs": "geometry",
+            "cs": "compute",
             "as": "task",
             "amplification": "task",
             "ms": "mesh",
+            "raygeneration": "raygen",
+            "ray generation": "raygen",
+            "ray-generation": "raygen",
+            "ray_generation": "raygen",
         }
         canonical = str(stage_name or "").strip().lower().replace(
             "shaderstage.", ""
         )
-        canonical = aliases.get(canonical, canonical)
+        return aliases.get(canonical, canonical)
+
+    def _shader_stage(self, stage_name: str):
+        """Resolve a concrete stage without ever falling back to Fragment."""
+        canonical = self._shader_stage_name(stage_name)
         enum_names = {
             "vertex": "Vertex",
             "hull": "Hull",
@@ -691,7 +705,8 @@ class CaptureSession:
         Args:
             stage_name: One of "vertex", "fragment", "geometry", "compute".
         """
-        stage = self._shader_stage(stage_name)
+        canonical_stage = self._shader_stage_name(stage_name)
+        stage = self._shader_stage(canonical_stage)
 
         shader_id, pipeline_id, refl = self._get_refl_for_stage(stage)
         if not refl:
@@ -871,7 +886,7 @@ class CaptureSession:
             return {"error": f"No shader bound at stage '{stage_name}'"}
 
         result: dict[str, Any] = {
-            "stage": stage_name,
+            "stage": canonical_stage,
             "shaderId": int(shader_id),
             "pipelineId": int(pipeline_id),
             "entryPoint": refl.entryPoint if hasattr(refl, "entryPoint") else "",
@@ -971,14 +986,15 @@ class CaptureSession:
         Args:
             stage_name: Shader stage name.
         """
-        stage = self._shader_stage(stage_name)
+        canonical_stage = self._shader_stage_name(stage_name)
+        stage = self._shader_stage(canonical_stage)
 
         shader_id, pipeline_id, refl = self._get_refl_for_stage(stage)
         if not refl:
             return {"error": f"No shader at stage '{stage_name}'"}
 
         result: dict[str, Any] = {
-            "stage": stage_name,
+            "stage": canonical_stage,
             "shaderId": int(shader_id),
             "hasDebugInfo": refl.debugInfo is not None,
         }

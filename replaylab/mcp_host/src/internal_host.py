@@ -16,10 +16,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import OrderedDict
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -33,19 +35,22 @@ import threading
 import time
 from typing import Any, Mapping, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from .active_projects import ActiveProjectError
 from .internal_tool_service import (
     InternalToolService,
     ProjectRestoreRequestError,
     ShaderEditorSaveRequestError,
+    MAX_ASSET_INDEX_OPERATION_BYTES,
+    MAX_SHADER_LIVE_EDIT_OPERATION_BYTES,
     _atomic_json,
     _load_json,
     _process_alive,
     _read_shader_editor_save_body,
     _secure_directory,
     project_association_guard,
+    project_restore_delete_response,
     project_restore_get_response,
     project_restore_post_response,
 )
@@ -61,6 +66,7 @@ DEFAULT_PORT = 49743
 MAX_PORT_SCAN = 16
 OWNER_IDLE_GRACE_SECONDS = 15.0
 OWNER_POLL_SECONDS = 1.0
+HOST_STARTUP_TIMEOUT_SECONDS = 60.0
 MAX_HEARTBEAT_AGE_MS = 5000
 MAX_HEARTBEAT_FUTURE_SKEW_MS = 2000
 MAX_PROJECT_REQUEST_BYTES = 16 * 1024 * 1024
@@ -74,6 +80,12 @@ TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,128}$")
 INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 REQUEST_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+# This service is fixed to the IPv4 loopback interface.  Explicitly bypass
+# ambient HTTP(S) proxy configuration so a corporate/user proxy cannot turn a
+# healthy private Host into a false cold-start failure.
+_LOOPBACK_PROXY_HANDLER = ProxyHandler({})
+_LOOPBACK_OPENER = build_opener(_LOOPBACK_PROXY_HANDLER)
 
 
 def runtime_root(environment: Mapping[str, str] | None = None) -> Path:
@@ -228,7 +240,7 @@ def choose_port(root: Path, requested: int | None = None) -> int:
 def health(port: int, timeout: float = 0.75) -> dict[str, Any] | None:
     request = Request("http://127.0.0.1:%d/health" % int(port), method="GET")
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with _LOOPBACK_OPENER.open(request, timeout=timeout) as response:
             raw = response.read(32 * 1024 + 1)
         if len(raw) > 32 * 1024:
             return None
@@ -365,11 +377,25 @@ def _self_command(arguments: Sequence[str]) -> list[str]:
 
 
 def _spawn_detached(arguments: Sequence[str]) -> None:
+    child_environment = os.environ.copy()
+    if getattr(sys, "frozen", False):
+        # `serve` outlives this short-lived `ensure` process. A same-executable
+        # PyInstaller child otherwise reuses the parent's extraction directory,
+        # which the parent removes before the service's later lazy imports.
+        child_environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     creation_flags = 0
     if os.name == "nt":
+        # The long-lived serve child is a PyInstaller onefile executable: this
+        # spawns its *bootloader*, which in turn spawns the real Python child.
+        # With DETACHED_PROCESS the bootloader has no console at all, so when
+        # it spawns the console-subsystem Python child Windows allocates that
+        # child a brand-new *visible* console window (Windows also ignores
+        # CREATE_NO_WINDOW whenever DETACHED_PROCESS is set). CREATE_NO_WINDOW
+        # without DETACHED_PROCESS instead gives the bootloader a hidden
+        # console that its Python child inherits, so no window ever appears.
+        # A new process group still isolates it from the parent's Ctrl+C.
         creation_flags = (
-            int(getattr(subprocess, "DETACHED_PROCESS", 0x00000008))
-            | int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+            int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
             | int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
         )
     subprocess.Popen(
@@ -380,6 +406,7 @@ def _spawn_detached(arguments: Sequence[str]) -> None:
         close_fds=True,
         creationflags=creation_flags,
         cwd=str(Path(sys.executable).resolve().parent),
+        env=child_environment,
         shell=False,
     )
 
@@ -414,7 +441,7 @@ def ensure(root: Path, owner_pid: int, port: int | None = None) -> dict[str, Any
                 ]
             )
         )
-        deadline = time.monotonic() + 12.0
+        deadline = time.monotonic() + HOST_STARTUP_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             current = health(selected_port)
             if current is not None:
@@ -431,7 +458,10 @@ def ensure(root: Path, owner_pid: int, port: int | None = None) -> dict[str, Any
                     % selected_port,
                 }
             time.sleep(0.1)
-    raise RuntimeError("ReplayLab internal Host did not become healthy within 12 seconds")
+    raise RuntimeError(
+        "ReplayLab internal Host did not become healthy within %d seconds"
+        % int(HOST_STARTUP_TIMEOUT_SECONDS)
+    )
 
 
 def _duplicate_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -859,6 +889,61 @@ class BearerAuthApp:
         await self.app(scope, receive, send)
 
 
+class _OwnerShaderSessionRefresh:
+    """One reconciliation worker, independent of HTTP workers and health ticks."""
+
+    def __init__(self, tool_service: InternalToolService):
+        self._tool_service = tool_service
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="shader-owner-reconcile"
+        )
+        self._lock = threading.Lock()
+        self._pending: Future | None = None
+        self._closed = False
+
+    @staticmethod
+    def _consume(future: Future) -> None:
+        try:
+            future.result()
+        except CancelledError:
+            pass
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Shader owner reconciliation failed (%s): %s",
+                type(exc).__name__, str(exc)[:1024],
+            )
+
+    def tick(self, owner_pids: list[int]) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            if self._pending is not None:
+                if not self._pending.done():
+                    return False
+                self._consume(self._pending)
+                self._pending = None
+            if not owner_pids:
+                return False
+            self._pending = self._executor.submit(
+                self._tool_service.refresh_shader_sessions, list(owner_pids)
+            )
+            return True
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            pending = self._pending
+            self._pending = None
+            if pending is not None:
+                pending.cancel()
+        # Cancelling a future cannot stop an already running synchronous job.
+        # Drain it before shutting down the Shader manager or withdrawing Host
+        # state, so reconciliation cannot create a watcher after service exit.
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        if pending is not None:
+            self._consume(pending)
+
+
 def _serve(root: Path, port: int) -> int:
     import uvicorn
     from starlette.requests import Request as StarletteRequest
@@ -891,7 +976,8 @@ def _serve(root: Path, port: int) -> int:
                 "pid": os.getpid(),
                 "hostInstanceId": instance_id,
                 "capabilities": [
-                    "project-service", "project-restore", "shader-source-save"
+                    "project-service", "project-restore", "shader-source-save", "shader-live-edit",
+                    "asset-index",
                 ],
             }
         )
@@ -933,8 +1019,14 @@ def _serve(root: Path, port: int) -> int:
         )
         return JSONResponse(value, status_code=status_code)
 
-    # Resume durable, capture-bound authorisations before publishing health.
-    # The closed ToolService owns the implementation and never mounts MCP.
+    async def restore_delete_endpoint(request: StarletteRequest) -> JSONResponse:
+        status_code, value = project_restore_delete_response(
+            request.path_params.get("job_id"), restore_jobs
+        )
+        return JSONResponse(value, status_code=status_code)
+
+    # Initialize the closed Shader owner before health. Durable resume runs
+    # through the registered-owner tick once the GUI can service replay calls.
     try:
         tool_service.start()
     except Exception:
@@ -955,8 +1047,44 @@ def _serve(root: Path, port: int) -> int:
         )
         return JSONResponse(value, status_code=status_code)
 
+    async def shader_source_check_endpoint(
+        request: StarletteRequest,
+    ) -> JSONResponse:
+        # Read-only compile-check of an unsaved buffer: same bounded body
+        # reader and byte limits as save, but it never writes or applies.
+        try:
+            payload = await _read_shader_editor_save_body(request)
+        except ShaderEditorSaveRequestError as exc:
+            return JSONResponse(
+                {"error": str(exc)[:2048]}, status_code=exc.status_code
+            )
+        status_code, value = await asyncio.to_thread(
+            tool_service.check_shader_source, payload
+        )
+        return JSONResponse(value, status_code=status_code)
+
+    async def shader_live_edit_endpoint(request: StarletteRequest) -> JSONResponse:
+        try:
+            payload = await _read_bounded_body(request, MAX_SHADER_LIVE_EDIT_OPERATION_BYTES)
+            status_code, value = await asyncio.to_thread(tool_service.shader_live_edit_operation, payload)
+        except OverflowError as exc:
+            return JSONResponse({"error": str(exc)[:2048]}, status_code=413)
+        value["hostInstanceId"] = instance_id
+        return JSONResponse(value, status_code=status_code)
+
+    async def asset_index_endpoint(request: StarletteRequest) -> JSONResponse:
+        try:
+            payload = await _read_bounded_body(request, MAX_ASSET_INDEX_OPERATION_BYTES)
+            status_code, value = await asyncio.to_thread(tool_service.asset_index_operation, payload)
+        except OverflowError as exc:
+            return JSONResponse({"error": str(exc)[:2048]}, status_code=413)
+        value["hostInstanceId"] = instance_id
+        return JSONResponse(value, status_code=status_code)
+
     # This is intentionally a plain Router, never a general MCP application.
     # Adding a route requires an explicit product-level contract review.
+    # asset-index (2026-09): the on-demand unpacked-asset scan must outlive one
+    # AI task, so it runs here and task processes only start/poll it.
     app = Router(
         routes=[
             Route("/health", health_endpoint, methods=["GET"]),
@@ -976,16 +1104,29 @@ def _serve(root: Path, port: int) -> int:
                 methods=["GET"],
             ),
             Route(
+                "/replaylab/project-restore/{job_id}",
+                restore_delete_endpoint,
+                methods=["DELETE"],
+            ),
+            Route(
                 "/replaylab/shader-source/save",
                 shader_source_save_endpoint,
                 methods=["POST"],
             ),
+            Route(
+                "/replaylab/shader-source/check",
+                shader_source_check_endpoint,
+                methods=["POST"],
+            ),
+            Route("/replaylab/shader-live-edit", shader_live_edit_endpoint, methods=["POST"]),
+            Route("/replaylab/asset-index", asset_index_endpoint, methods=["POST"]),
         ]
     )
     protected = BearerAuthApp(app, token)
     started_ms = int(time.time() * 1000)
     empty_since: float | None = None
     server_box: dict[str, Any] = {}
+    shader_session_refresh = _OwnerShaderSessionRefresh(tool_service)
 
     def publish_state() -> None:
         _atomic_json(
@@ -1005,7 +1146,8 @@ def _serve(root: Path, port: int) -> int:
                 "heartbeatUnixMs": int(time.time() * 1000),
                 "ownerPids": live_owners(root),
                 "capabilities": [
-                    "project-service", "project-restore", "shader-source-save"
+                    "project-service", "project-restore", "shader-source-save", "shader-live-edit",
+                    "asset-index",
                 ],
             },
         )
@@ -1025,6 +1167,15 @@ def _serve(root: Path, port: int) -> int:
             if server is not None:
                 server.should_exit = True
         publish_state()
+        if owners and not paths["shutdown"].exists():
+            # The private Host can outlive a GUI. Its existing owner tick must
+            # retire closed capture sessions and resume durable consent for a
+            # newly opened registered GUI even when no MCP client lists jobs.
+            # Uvicorn awaits this notification before scheduling its next
+            # heartbeat. Never await reconciliation here: a lifecycle lock or
+            # queued HTTP poll can outlast the five-second liveness contract.
+            # A dedicated single worker also avoids the HTTP executor queue.
+            shader_session_refresh.tick(owners)
 
     config = uvicorn.Config(
         protected,
@@ -1043,6 +1194,7 @@ def _serve(root: Path, port: int) -> int:
         server.run()
     finally:
         server.should_exit = True
+        shader_session_refresh.close()
         tool_service.shutdown()
         state = _load_json(paths["state"])
         if state is not None and state.get("pid") == os.getpid():

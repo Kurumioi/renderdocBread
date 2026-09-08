@@ -66,6 +66,12 @@ struct FixedVarTag
   VarType replayLabBaseType = VarType::Unknown;
   uint8_t replayLabComponents = 0;
   rdcstr name;
+  // ReplayLab alias view: the reflected path this row stands for, whether it is a leaf whose
+  // byte offset identifies it, and the display alias (empty = original name shown).
+  QString path;
+  bool leaf = false;
+  QString alias;
+  QString aliasSource;
   union
   {
     uint32_t byteOffset;
@@ -101,13 +107,11 @@ enum class ReplayLabMaterialGate
 {
   Available,
   UnsupportedAPI,
-  RemoteReplay,
   NotReplayableAction,
   ViewNotReady,
   MissingReflection,
   NoRuntimeBacking,
   RootConstants,
-  IndirectRootCBV,
   CompileConstants,
   CustomFormat,
   UnsupportedLeaf,
@@ -154,10 +158,9 @@ static uint64_t ReplayLabMaterialBindingByteSize(GraphicsAPI api, uint64_t repor
 
 static ReplayLabMaterialGate GetReplayLabMaterialGate(const ReplayLabMaterialGateState &state)
 {
-  if(state.api != GraphicsAPI::D3D11 && state.api != GraphicsAPI::D3D12)
+  if(state.api != GraphicsAPI::D3D11 && state.api != GraphicsAPI::D3D12 &&
+     state.api != GraphicsAPI::OpenGL && state.api != GraphicsAPI::Vulkan)
     return ReplayLabMaterialGate::UnsupportedAPI;
-  if(state.remoteReplay)
-    return ReplayLabMaterialGate::RemoteReplay;
   if(!state.replayableAction)
     return ReplayLabMaterialGate::NotReplayableAction;
   if(!state.viewReady)
@@ -168,8 +171,6 @@ static ReplayLabMaterialGate GetReplayLabMaterialGate(const ReplayLabMaterialGat
     return ReplayLabMaterialGate::NoRuntimeBacking;
   if(state.inlineData)
     return ReplayLabMaterialGate::RootConstants;
-  if(state.api == GraphicsAPI::D3D12 && state.rootCBV && state.indirectAction)
-    return ReplayLabMaterialGate::IndirectRootCBV;
   if(state.compileConstants)
     return ReplayLabMaterialGate::CompileConstants;
   if(state.customFormat)
@@ -180,11 +181,15 @@ static ReplayLabMaterialGate GetReplayLabMaterialGate(const ReplayLabMaterialGat
     return ReplayLabMaterialGate::ShaderUnbound;
   if(!state.bufferBound)
     return ReplayLabMaterialGate::BufferUnbound;
-  if(state.byteSize == 0 || state.byteSize > 64 * 1024 || state.byteOffset % 16 != 0 ||
-     state.byteSize % 16 != 0)
+  if(state.byteSize == 0 || state.byteSize == ~0ULL || state.byteOffset > ~0ULL - state.byteSize)
     return ReplayLabMaterialGate::InvalidBindingWindow;
-  if(state.bindArraySize != 1 || state.arrayIndex != 0)
+  // The shared edit addresses the selected storage range, not a stage/slot override. Descriptor
+  // arrays and remote replay use the same identity; the native backend validates patch support.
+  if(state.bindArraySize != 0 && state.arrayIndex >= state.bindArraySize)
     return ReplayLabMaterialGate::UnsupportedBinding;
+  if((state.api == GraphicsAPI::D3D11 || state.api == GraphicsAPI::D3D12) &&
+     (state.byteSize > 64 * 1024 || state.byteOffset % 16 != 0 || state.byteSize % 16 != 0))
+    return ReplayLabMaterialGate::InvalidBindingWindow;
   if(state.api == GraphicsAPI::D3D11 &&
      (state.physicalSlot >= 14 || state.registerSpace != 0))
     return ReplayLabMaterialGate::UnsupportedBinding;
@@ -3243,6 +3248,47 @@ void BufferViewer::fixedVars_contextMenu(const QPoint &pos)
   QObject::connect(&showPadding, &QAction::triggered,
                    [this]() { ui->showPadding->setChecked(!ui->showPadding->isChecked()); });
 
+  // ReplayLab alias view: rename a reflected constant for display only. The alias lives in the
+  // per-user store keyed by the constant block layout, never in the shader or the capture.
+  if(IsCBufferView() && item && tag.valid && !tag.padding && !tag.path.isEmpty())
+  {
+    contextMenu.addSeparator();
+    QAction *renameAlias = contextMenu.addAction(
+        tag.alias.isEmpty() ? tr("&Rename (Create Alias)...") : tr("&Rename Alias..."));
+    renameAlias->setIcon(Icons::page_white_edit());
+    const QString aliasPath = tag.path;
+    const QString aliasOriginal = QString(tag.name);
+    const qint64 aliasOffset = tag.leaf ? (qint64)tag.byteOffset : -1;
+    QObject::connect(renameAlias, &QAction::triggered, [this, aliasPath, aliasOriginal, aliasOffset]() {
+      editCBufferAlias(aliasPath, aliasOriginal, aliasOffset, false);
+    });
+    if(!tag.alias.isEmpty())
+    {
+      QAction *removeAlias = contextMenu.addAction(tr("Remove Alias (Show %1)").arg(aliasOriginal));
+      QObject::connect(removeAlias, &QAction::triggered, [this, aliasPath, aliasOriginal, aliasOffset]() {
+        editCBufferAlias(aliasPath, aliasOriginal, aliasOffset, true);
+      });
+    }
+  }
+
+  if(IsCBufferView() && m_CBufferAliases.Loaded())
+  {
+    contextMenu.addSeparator();
+    const ReplayLabCBufferAlias current = m_CBufferAliases.BlockAlias();
+    QAction *renameBlockAlias = contextMenu.addAction(
+        current.valid() ? tr("&Rename Constant Block Alias...")
+                        : tr("&Rename Constant Block (Create Alias)..."));
+    renameBlockAlias->setIcon(Icons::page_white_edit());
+    QObject::connect(renameBlockAlias, &QAction::triggered,
+                     [this]() { editCBufferBlockAlias(false); });
+    if(current.valid())
+    {
+      QAction *removeBlockAlias = contextMenu.addAction(tr("Remove Constant Block Alias"));
+      QObject::connect(removeBlockAlias, &QAction::triggered,
+                       [this]() { editCBufferBlockAlias(true); });
+    }
+  }
+
   // Stock qrenderdoc previously exposed only the whole BufferViewer panel to extensions. ReplayLab
   // needs a variable-scoped hook so its material panel can start from a native selection instead
   // of accepting a caller-supplied byte offset. The bridge still re-reflects and validates every
@@ -3318,12 +3364,8 @@ void BufferViewer::fixedVars_contextMenu(const QPoint &pos)
       case ReplayLabMaterialGate::Available: break;
       case ReplayLabMaterialGate::UnsupportedAPI:
         unavailable =
-            tr("Current capture API is %1; event-scoped material editing supports D3D11 and "
-               "D3D12 only")
+            tr("Shared material buffer editing is unavailable for the current capture API: %1")
                 .arg(ToQStr(gateState.api));
-        break;
-      case ReplayLabMaterialGate::RemoteReplay:
-        unavailable = tr("Material editing requires local replay");
         break;
       case ReplayLabMaterialGate::NotReplayableAction:
         unavailable = tr("Select an actual Draw, Dispatch, or MeshDispatch EID first");
@@ -3339,12 +3381,7 @@ void BufferViewer::fixedVars_contextMenu(const QPoint &pos)
             tr("The selected constant block is not backed by editable runtime buffer bytes");
         break;
       case ReplayLabMaterialGate::RootConstants:
-        unavailable = tr("D3D12 root constants are deliberately excluded; select a CBV-backed block");
-        break;
-      case ReplayLabMaterialGate::IndirectRootCBV:
-        unavailable =
-            tr("ExecuteIndirect can overwrite a root CBV during replay; select a descriptor-table "
-               "CBV or a direct Draw/Dispatch event");
+        unavailable = tr("Inline and push constants have no shared buffer; select a buffer-backed block");
         break;
       case ReplayLabMaterialGate::CompileConstants:
         unavailable = tr("Compile-time constants are not runtime CBuffer memory");
@@ -3366,9 +3403,7 @@ void BufferViewer::fixedVars_contextMenu(const QPoint &pos)
         unavailable = tr("The bound CBuffer byte window is invalid or unsupported");
         break;
       case ReplayLabMaterialGate::UnsupportedBinding:
-        unavailable = gateState.api == GraphicsAPI::D3D11
-                          ? tr("Only one fixed D3D11 b0-b13 binding in register space 0 is editable")
-                          : tr("Only one fixed D3D12 CBV binding is editable; arrays/root constants are excluded");
+        unavailable = tr("The selected constant-buffer binding or array element is invalid");
         break;
     }
 
@@ -3616,10 +3651,27 @@ void BufferViewer::OnCaptureLoaded()
 
 void BufferViewer::OnCaptureClosed()
 {
+  m_DeferredEventID = 0;
+  m_HasDeferredEvent = false;
   Reset();
 
   if(!m_MeshView)
     ToolWindowManager::closeToolWindow(this);
+}
+
+void BufferViewer::showEvent(QShowEvent *event)
+{
+  QFrame::showEvent(event);
+
+  if(!m_HasDeferredEvent || !m_Ctx.IsCaptureLoaded())
+    return;
+
+  const uint32_t eventId = m_DeferredEventID;
+  m_HasDeferredEvent = false;
+  QTimer::singleShot(0, this, [this, eventId]() {
+    if(isVisible() && m_Ctx.IsCaptureLoaded())
+      OnEventChanged(eventId);
+  });
 }
 
 void BufferViewer::FillScrolls(PopulateBufferData *bufdata)
@@ -3641,6 +3693,17 @@ void BufferViewer::FillScrolls(PopulateBufferData *bufdata)
 
 void BufferViewer::OnEventChanged(uint32_t eventId)
 {
+  // Inactive dock tabs still receive capture notifications. Post-VS extraction and buffer/CBuffer
+  // reads can materialise a cached virtual EID, so defer that work until the user actually exposes
+  // this viewer. Visible mesh outputs are already treated as a hard replay requirement.
+  if(!isVisible())
+  {
+    m_DeferredEventID = eventId;
+    m_HasDeferredEvent = true;
+    return;
+  }
+
+  m_HasDeferredEvent = false;
   PopulateBufferData *bufdata = new PopulateBufferData;
 
   m_Sequence++;
@@ -4280,6 +4343,7 @@ void BufferViewer::OnEventChanged(uint32_t eventId)
 
           if(!vars.isEmpty())
           {
+            UI_LoadCBufferAliases();
             UI_AddFixedVariables(ui->fixedVars->invisibleRootItem(), 0,
                                  bufdata->inConfig.fixedVars.type.members, vars);
 
@@ -4458,13 +4522,15 @@ void BufferViewer::UI_FixedAddMatrixRows(RDTreeWidgetItem *n, const ShaderConsta
     tag.rowmajor = v.RowMajor();
     n->setTag(QVariant::fromValue(tag));
 
+    const QString displayName = tag.alias.isEmpty() ? QString(v.name) : tag.alias;
+
     if(v.ColMajor())
       vecSize = VarTypeByteSize(v.type) * v.rows;
 
     for(uint32_t r = 0; r < v.rows; r++)
     {
-      n->addChild(new RDTreeWidgetItem({QFormatStr("%1.row%2").arg(v.name).arg(r), RowString(v, r),
-                                        QString(), RowTypeString(v)}));
+      n->addChild(new RDTreeWidgetItem({QFormatStr("%1.row%2").arg(displayName).arg(r),
+                                        RowString(v, r), QString(), RowTypeString(v)}));
 
       if(showPadding && v.RowMajor() && c.type.matrixByteStride > vecSize)
       {
@@ -4585,9 +4651,45 @@ void BufferViewer::UI_AddTaskPayloads(RDTreeWidgetItem *root, size_t baseOffset,
   }
 }
 
+// Applies the ReplayLab alias for one reflected constant: the row shows the alias (or the
+// original name when none is set) and remembers the original in the tag and tooltip. Nothing
+// about the shader, its reflection or the extension callback identity changes.
+static QString ApplyCBufferAlias(RDTreeWidgetItem *item, FixedVarTag &tag, const QString &original,
+                                 const QString &path, bool leaf,
+                                 const ReplayLabCBufferAliases &aliases)
+{
+  tag.path = path;
+  tag.leaf = leaf;
+  tag.alias.clear();
+  tag.aliasSource.clear();
+  if(!aliases.Loaded())
+    return original;
+
+  ReplayLabCBufferAliasKey key;
+  key.path = path;
+  key.offset = leaf ? (qint64)tag.byteOffset : -1;
+  const ReplayLabCBufferAlias alias = aliases.Resolve(key);
+  if(!alias.valid())
+    return original;
+
+  tag.alias = alias.alias;
+  tag.aliasSource = alias.source;
+  item->setText(0, alias.alias);
+  if(alias.source == QStringLiteral("user"))
+    item->setToolTip(0, QCoreApplication::translate("BufferViewer",
+                                                    "Original name: %1 (alias set by you)")
+                            .arg(original));
+  else
+    item->setToolTip(0, QCoreApplication::translate("BufferViewer",
+                                                    "Original name: %1 (alias proposed by AI)")
+                            .arg(original));
+  return alias.alias;
+}
+
 void BufferViewer::UI_AddFixedVariables(RDTreeWidgetItem *root, uint32_t baseOffset,
                                         const rdcarray<ShaderConstant> &consts,
-                                        const rdcarray<ShaderVariable> &vars)
+                                        const rdcarray<ShaderVariable> &vars,
+                                        const QString &parentPath)
 {
   const bool showPadding = ui->showPadding->isChecked() && m_CurCBuffer.bytesBacked;
 
@@ -4656,8 +4758,15 @@ void BufferViewer::UI_AddFixedVariables(RDTreeWidgetItem *root, uint32_t baseOff
       n->setIcon(1, MakeSwatchIcon(ui->fixedVars, swatchColor));
     }
 
-    n->setTag(QVariant::fromValue(
-        ReplayLabFixedVarTag(c, v, baseOffset + c.byteOffset)));
+    // i18n-ignore: "." joins reflected variable path segments, it is not user-facing prose.
+    const QString varPath =
+        parentPath.isEmpty() ? QString(v.name) : parentPath + lit(".") + QString(v.name);
+    {
+      FixedVarTag tag = ReplayLabFixedVarTag(c, v, baseOffset + c.byteOffset);
+      const bool leaf = c.type.members.empty() && c.type.elements <= 1;
+      ApplyCBufferAlias(n, tag, QString(v.name), varPath, leaf, m_CBufferAliases);
+      n->setTag(QVariant::fromValue(tag));
+    }
 
     root->addChild(n);
 
@@ -4685,14 +4794,32 @@ void BufferViewer::UI_AddFixedVariables(RDTreeWidgetItem *root, uint32_t baseOff
             TypeString(v.members[e], c),
         });
 
-        el->setTag(QVariant::fromValue(
-            ReplayLabFixedVarTag(c, v.members[e], elOffset)));
+        // i18n-ignore: "." joins reflected variable path segments, it is not user-facing prose.
+        const QString elPath = parentPath.isEmpty()
+                                   ? QString(v.members[e].name)
+                                   : parentPath + lit(".") + QString(v.members[e].name);
+        {
+          FixedVarTag tag = ReplayLabFixedVarTag(c, v.members[e], elOffset);
+          const bool leaf = c.type.baseType != VarType::Struct;
+          ApplyCBufferAlias(el, tag, QString(v.members[e].name), elPath, leaf, m_CBufferAliases);
+          // an aliased array shows its alias on every element unless the element has its own
+          if(tag.alias.isEmpty() && !n->tag().value<FixedVarTag>().alias.isEmpty())
+          {
+            const QString arrayAlias = n->tag().value<FixedVarTag>().alias;
+            const QString elementName = QString(v.members[e].name);
+            const int bracket = elementName.lastIndexOf(QLatin1Char('['));
+            if(bracket >= 0)
+              el->setText(0, arrayAlias + elementName.mid(bracket));
+            el->setToolTip(0, tr("Original name: %1").arg(QString(v.members[e].name)));
+          }
+          el->setTag(QVariant::fromValue(tag));
+        }
 
         // if it's an array of structs we can recurse, just need to do the outer iteration here
         // because v.members[...].members will be the actual struct members because of the expansion
         if(c.type.baseType == VarType::Struct)
         {
-          UI_AddFixedVariables(el, elOffset, c.type.members, v.members[e].members);
+          UI_AddFixedVariables(el, elOffset, c.type.members, v.members[e].members, elPath);
         }
         else
         {
@@ -4732,12 +4859,84 @@ void BufferViewer::UI_AddFixedVariables(RDTreeWidgetItem *root, uint32_t baseOff
       // Member offsets are relative to their containing struct. Preserve the full physical
       // CBuffer offset for nested structs so extension callback identities and the displayed
       // offset column refer to the same reflected byte.
-      UI_AddFixedVariables(n, baseOffset + c.byteOffset, c.type.members, v.members);
+      UI_AddFixedVariables(n, baseOffset + c.byteOffset, c.type.members, v.members, varPath);
     }
 
     // advance by the tight scalar-packed advance, so we can detect padding
     offset += BufferFormatter::GetVarAdvance(Packing::Scalar, c);
   }
+}
+
+void BufferViewer::UI_LoadCBufferAliases()
+{
+  const ConstantBlock *block = NULL;
+  if(IsCBufferView())
+  {
+    const ShaderReflection *reflection =
+        m_Ctx.CurPipelineState().GetShaderReflection(m_CBufferSlot.stage);
+    if(reflection && m_CBufferSlot.slot < reflection->constantBlocks.size())
+      block = &reflection->constantBlocks[m_CBufferSlot.slot];
+  }
+  // Keyed by the block's name + member layout, so the same aliases show for every shader and
+  // every capture of the game that binds this constant block, and for what the AI publishes
+  // from a shader workspace of any of them.
+  m_CBufferAliases.Load(block);
+}
+
+void BufferViewer::editCBufferAlias(const QString &path, const QString &original, qint64 offset,
+                                    bool remove)
+{
+  ReplayLabCBufferAliasKey key;
+  key.path = path;
+  key.offset = offset;
+  const ReplayLabCBufferAlias current = m_CBufferAliases.Resolve(key);
+
+  QString alias;
+  if(!remove)
+  {
+    if(!ReplayLabCBufferAliases::PromptAlias(this, original, current, alias))
+      return;
+  }
+
+  QString error;
+  const bool ok = alias.isEmpty() ? m_CBufferAliases.Remove(key, &error)
+                                  : m_CBufferAliases.Set(key, alias, &error);
+
+  if(!ok)
+  {
+    RDDialog::critical(this, tr("Constant Alias"), error);
+    return;
+  }
+
+  OnEventChanged(m_Ctx.CurEvent());
+}
+
+void BufferViewer::editCBufferBlockAlias(bool remove)
+{
+  const ShaderReflection *reflection =
+      m_Ctx.CurPipelineState().GetShaderReflection(m_CBufferSlot.stage);
+  if(!reflection || m_CBufferSlot.slot >= reflection->constantBlocks.size())
+    return;
+  const ConstantBlock &block = reflection->constantBlocks[m_CBufferSlot.slot];
+  m_CBufferAliases.Load(&block);
+  if(!m_CBufferAliases.Loaded())
+    return;
+
+  QString alias;
+  if(!remove && !ReplayLabCBufferAliases::PromptBlockAlias(
+                    this, QString(block.name), m_CBufferAliases.BlockAlias(), alias))
+    return;
+
+  QString error;
+  const bool ok = alias.isEmpty() ? m_CBufferAliases.RemoveBlockAlias(&error)
+                                  : m_CBufferAliases.SetBlockAlias(alias, &error);
+  if(!ok)
+  {
+    RDDialog::critical(this, tr("Constant Block Alias"), error);
+    return;
+  }
+
+  OnEventChanged(m_Ctx.CurEvent());
 }
 
 void BufferViewer::UI_RemoveOffsets(RDTreeWidgetItem *root)
@@ -5862,13 +6061,19 @@ void BufferViewer::updateLabelsAndLayout()
           m_Ctx.CurPipelineState().GetShaderReflection(m_CBufferSlot.stage);
 
       uint32_t arraySize = ~0U;
-      if(reflection != NULL)
+      const ConstantBlock *aliasBlock = NULL;
+      if(reflection != NULL && m_CBufferSlot.slot < reflection->constantBlocks.size())
+        aliasBlock = &reflection->constantBlocks[m_CBufferSlot.slot];
+
+      m_CBufferAliases.Load(aliasBlock);
+      if(aliasBlock != NULL)
       {
-        if(m_CBufferSlot.slot < reflection->constantBlocks.size() &&
-           !reflection->constantBlocks[m_CBufferSlot.slot].name.isEmpty())
+        if(!aliasBlock->name.isEmpty())
         {
-          bufName = QFormatStr("<%1>").arg(reflection->constantBlocks[m_CBufferSlot.slot].name);
-          arraySize = reflection->constantBlocks[m_CBufferSlot.slot].bindArraySize;
+          const ReplayLabCBufferAlias blockAlias = m_CBufferAliases.BlockAlias();
+          bufName = QFormatStr("<%1>").arg(blockAlias.valid() ? blockAlias.alias
+                                                              : QString(aliasBlock->name));
+          arraySize = aliasBlock->bindArraySize;
         }
       }
 
@@ -7835,7 +8040,7 @@ void BufferViewer::on_autofitCamera_clicked()
 
 #include "3rdparty/catch/catch.hpp"
 
-TEST_CASE("ReplayLab material gate enables only safe local D3D11/D3D12 reflected leaves",
+TEST_CASE("ReplayLab material gate accepts reflected shared storage across replay APIs",
           "[bufferviewer][replaylab][material]")
 {
   ReplayLabMaterialGateState state;
@@ -7875,21 +8080,42 @@ TEST_CASE("ReplayLab material gate enables only safe local D3D11/D3D12 reflected
     CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::RootConstants));
   }
 
-  SECTION("D3D12 ExecuteIndirect root CBVs fail closed")
+  SECTION("D3D12 indirect selection addresses a resource range rather than overriding a root slot")
   {
     state.api = GraphicsAPI::D3D12;
     state.rootCBV = true;
     state.indirectAction = true;
-    CHECK(int(GetReplayLabMaterialGate(state)) ==
-          int(ReplayLabMaterialGate::IndirectRootCBV));
+    CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::Available));
     state.rootCBV = false;
     CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::Available));
   }
 
-  SECTION("a remote D3D11 capture is rejected independently")
+  SECTION("remote replay uses the same shared storage contract")
   {
     state.remoteReplay = true;
-    CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::RemoteReplay));
+    CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::Available));
+  }
+
+  SECTION("GL and Vulkan selected buffer elements do not inherit D3D window limits")
+  {
+    for(GraphicsAPI api : {GraphicsAPI::OpenGL, GraphicsAPI::Vulkan})
+    {
+      state.api = api;
+      state.remoteReplay = true;
+      state.byteOffset = (1ULL << 33) + 4;
+      state.byteSize = 65540;
+      state.bindArraySize = 4;
+      state.arrayIndex = 3;
+      state.physicalSlot = 27;
+      state.registerSpace = 2;
+      CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::Available));
+      state.arrayIndex = 4;
+      CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::UnsupportedBinding));
+      state.bindArraySize = 0;
+      CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::Available));
+      state.byteOffset = UINT64_MAX - 8;
+      CHECK(int(GetReplayLabMaterialGate(state)) == int(ReplayLabMaterialGate::InvalidBindingWindow));
+    }
   }
 
   SECTION("a custom UI format is not treated as captured reflection")

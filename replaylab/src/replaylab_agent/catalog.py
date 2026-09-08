@@ -23,6 +23,12 @@ Protocol = Literal[
 ]
 SubscriptionLoginMode = Literal["none", "codex", "captured", "terminal"]
 
+# This name is part of both the ACP session/new injection contract and the
+# narrow CodeBuddy permission rule. Keep one source of truth so a rename cannot
+# silently make every CodeBuddy tool request fail closed.
+REPLAYLAB_MCP_SERVER_NAME = "ReplayLab"
+CODEBUDDY_REPLAYLAB_MCP_PERMISSION = f"mcp__{REPLAYLAB_MCP_SERVER_NAME}"
+
 
 @dataclass(frozen=True, slots=True)
 class ProviderPreset:
@@ -41,6 +47,12 @@ class ProviderPreset:
     acp_auth_method: str = ""
     subscription_instruction: str = ""
     install_hint: str = ""
+    # A curated, offline pick-list of valid model ids/aliases for presets whose
+    # vendor CLI exposes no machine-readable model listing (e.g. Claude Code has
+    # no non-interactive model list, only the interactive /model). When set, the
+    # model-fetch command returns exactly these so the UI shows a dropdown instead
+    # of a free-text box, avoiding typos.
+    selectable_models: tuple[str, ...] = ()
 
     @property
     def configuration_mode(self) -> Literal["api", "subscription"]:
@@ -62,6 +74,8 @@ class ProviderPreset:
 
     @property
     def supports_model_discovery(self) -> bool:
+        if self.selectable_models:
+            return True
         return self.protocol in {
             "openai-responses",
             "openai-chat",
@@ -94,9 +108,10 @@ PRESETS: tuple[ProviderPreset, ...] = (
         "ANTHROPIC_API_KEY",
         declared_capabilities=_RICH,
         note=(
-            "Claude API is supported here. Claude Code does not publish an ACP server mode, so "
-            "subscription access is not presented as ACP. A future dedicated CLI connector must "
-            "also follow Anthropic's third-party authentication terms."
+            "Uses an Anthropic API key. To use a Claude Code subscription instead, select the "
+            "separate Claude Code ACP preset; it wraps the official Claude Code CLI with the "
+            "Agent Client Protocol reference adapter and remains subject to Anthropic's "
+            "third-party authentication and usage terms."
         ),
     ),
     ProviderPreset(
@@ -324,8 +339,8 @@ PRESETS: tuple[ProviderPreset, ...] = (
         acp_auth_method="cursor_login",
         note=(
             "Uses Cursor's official `cursor-agent` executable (also installed as `agent`). The "
-            "wizard runs the `login` browser flow for a Cursor subscription, authenticates ACP "
-            "with `cursor_login`, then tests `cursor-agent acp`. Model choices are imported when "
+            "wizard runs the `login` browser flow for a Cursor subscription, then starts ACP with "
+            "that stored login and tests `cursor-agent acp`. Model choices are imported when "
             "exposed; otherwise leave the model blank for Cursor's configured default."
         ),
         install_hint=(
@@ -404,6 +419,113 @@ PRESETS: tuple[ProviderPreset, ...] = (
             "Kimi Code CLI was not found. Install it with the official Windows script or `npm "
             "install -g @moonshot-ai/kimi-code`, then restart qrenderdoc. Official guide: "
             "https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started.html"
+        ),
+    ),
+    ProviderPreset(
+        "codebuddy-acp",
+        "Tencent CodeBuddy / Hunyuan Subscription (ACP)",
+        "agent",
+        "acp",
+        command=(
+            "codebuddy",
+            "--acp",
+            "--agent",
+            "cli",
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--setting-sources",
+            "user",
+            "--tools",
+            "",
+            "--allowedTools",
+            CODEBUDDY_REPLAYLAB_MCP_PERMISSION,
+        ),
+        auth="managed",
+        declared_capabilities=frozenset({"chat", "tools", "approvals"}),
+        subscription_login=(
+            "codebuddy",
+            "--agent",
+            "cli",
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--setting-sources",
+            "user",
+            "--tools",
+            "",
+        ),
+        subscription_login_mode="terminal",
+        subscription_instruction=(
+            "Choose Log in via Chinese Site in the CodeBuddy terminal, complete the browser "
+            "flow with the account that owns the subscription, then exit after authentication "
+            "succeeds."
+        ),
+        note=(
+            "Uses the official CodeBuddy Code CLI and the signed-in CodeBuddy account "
+            "subscription. Hunyuan and other model choices are imported only when the ACP "
+            "session exposes them; model availability and quota are controlled by the "
+            "CodeBuddy plan."
+        ),
+        install_hint=(
+            "CodeBuddy Code was not found. Install it with `npm install -g "
+            "@tencent-ai/codebuddy-code` or the official Windows installer, then restart "
+            "qrenderdoc. Official guides: https://www.codebuddy.cn/docs/cli/quickstart and "
+            "https://www.codebuddy.cn/docs/cli/acp"
+        ),
+    ),
+    ProviderPreset(
+        "claude-code-acp",
+        "Claude Code (ACP subscription)",
+        "agent",
+        "acp",
+        command=("claude-agent-acp",),
+        auth="managed",
+        declared_capabilities=frozenset({"chat", "tools", "approvals", "skills"}),
+        # Claude Code exposes no non-interactive model list, so pre-fill the model
+        # picker with the current Claude model ids (name + version). Users can also
+        # add their own id with the box + Add button. A blank model follows the
+        # subscription's own default; ReplayLab passes the chosen id as
+        # ANTHROPIC_MODEL. Availability of a given model still depends on the plan.
+        # Refresh this list when Anthropic ships new model ids.
+        selectable_models=(
+            "claude-sonnet-5",
+            "claude-opus-5",
+            "claude-haiku-4-5-20251001",
+            "claude-fable-5-1",
+        ),
+        subscription_login=("claude", "setup-token"),
+        subscription_login_mode="terminal",
+        subscription_instruction=(
+            "Authenticate the official Claude Code CLI in the opened terminal: run "
+            "`claude setup-token`, complete Anthropic's sign-in with the account that owns "
+            "your Claude subscription, then exit after it reports success. This terminal already "
+            "uses this ReplayLab connection's isolated Claude profile; ReplayLab only reuses "
+            "Claude Code's stored official credentials and never sees your password or token."
+        ),
+        note=(
+            "Connects a Claude subscription through the official Claude Code CLI login, "
+            "bridged to ACP by the `@agentclientprotocol/claude-agent-acp` reference adapter "
+            "(formerly @zed-industries/claude-code-acp) -- no API key and no reverse-engineered "
+            "authentication. The connection wizard runs `claude setup-token` in a profile-isolated "
+            "Claude state directory; every task launches `claude-agent-acp` with the same directory. "
+            "Model: pick one from the list, or add a full model id with the box + Add button "
+            "(name plus version, for example `claude-sonnet-5`). Leave it blank to follow your "
+            "subscription's default; ReplayLab passes the id to Claude Code as ANTHROPIC_MODEL "
+            "(a model your plan does not include will be rejected by Claude Code at run time). "
+            "The adapter supports HTTP/stdio MCP servers, permission prompts and thinking, which "
+            "the archived `acp-claude-code` package did not. Using a subscription through a "
+            "third-party ACP client must follow Anthropic's third-party authentication and "
+            "usage terms."
+        ),
+        install_hint=(
+            "The Claude Code ACP bridge is missing. Install Node.js 22+, the official Claude Code "
+            "CLI, and `npm install -g @agentclientprotocol/claude-agent-acp` (binary "
+            "`claude-agent-acp`), then restart qrenderdoc. The bundled "
+            "packaging/setup_claude_code_acp.ps1 installs or updates these dependencies; complete "
+            "sign-in from ReplayLab's Save and Connect flow so credentials are stored in this "
+            "connection's isolated profile. "
+            "The archived `acp-claude-code` package is no longer supported: it ignores MCP "
+            "servers and never asks for permissions. Adapter: "
+            "https://github.com/agentclientprotocol/claude-agent-acp"
         ),
     ),
     ProviderPreset(

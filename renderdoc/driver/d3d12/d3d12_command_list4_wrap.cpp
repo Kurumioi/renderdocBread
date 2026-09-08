@@ -368,6 +368,22 @@ bool WrappedID3D12GraphicsCommandList::Serialise_BeginRenderPass(
 
       m_Cmd->AddAction(action);
 
+      // Pass clears modify attachments even when no draw follows. Record those writes as part
+      // of the pass action so resource checkpoints do not mistake them for initial contents.
+      BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
+      if((Flags & D3D12_RENDER_PASS_FLAG_RESUMING_PASS) == 0)
+      {
+        for(UINT i = 0; i < NumRenderTargets; i++)
+          if(pRenderTargets[i].BeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+            info.resourceUsage.push_back(make_rdcpair(
+                RTVs[i].GetResResourceId(), EventUsage(info.curEventID, ResourceUsage::Clear)));
+        if(pDepthStencil &&
+           (pDepthStencil->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR ||
+            pDepthStencil->StencilBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR))
+          info.resourceUsage.push_back(make_rdcpair(
+              DSV.GetResResourceId(), EventUsage(info.curEventID, ResourceUsage::Clear)));
+      }
+
       stateUpdate = true;
     }
 
@@ -678,6 +694,26 @@ bool WrappedID3D12GraphicsCommandList::Serialise_EndRenderPass(SerialiserType &s
       action.flags |= ActionFlags::EndPass | ActionFlags::PassBoundary;
 
       m_Cmd->AddAction(action);
+
+      BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
+      const auto addResolveUsage = [&](const D3D12_RENDER_PASS_ENDING_ACCESS &access) {
+        if(access.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE)
+        {
+          info.resourceUsage.push_back(make_rdcpair(
+              GetResID(access.Resolve.pSrcResource),
+              EventUsage(info.curEventID, ResourceUsage::ResolveSrc)));
+          info.resourceUsage.push_back(make_rdcpair(
+              GetResID(access.Resolve.pDstResource),
+              EventUsage(info.curEventID, ResourceUsage::ResolveDst)));
+        }
+      };
+      for(const D3D12_RENDER_PASS_RENDER_TARGET_DESC &target : state.rpRTs)
+        addResolveUsage(target.EndingAccess);
+      if(state.rpDSV.cpuDescriptor.ptr)
+      {
+        addResolveUsage(state.rpDSV.DepthEndingAccess);
+        addResolveUsage(state.rpDSV.StencilEndingAccess);
+      }
 
       stateUpdate = true;
     }

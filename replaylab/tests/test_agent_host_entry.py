@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from io import BytesIO
 from pathlib import Path
 import uuid
 
@@ -78,3 +79,66 @@ def test_frozen_entry_rejects_unknown_internal_modules() -> None:
 
     with pytest.raises(SystemExit, match="unsupported internal ReplayLab AgentHost module"):
         module._dispatch(["-I", "-m", "replaylab_agent.not_allowed"])
+
+
+def test_frozen_entry_hides_unexpected_bootstrap_exception(monkeypatch) -> None:
+    module = _load_entry_module()
+
+    class BinaryStderr:
+        def __init__(self) -> None:
+            self.buffer = BytesIO()
+
+    output = BinaryStderr()
+    private_path = r"C:\private\agent_host_entry.py"
+    secret = "sk-frozen-secret-value"
+
+    def fail_dispatch(_arguments):
+        raise NameError(
+            f"bootstrap failed at {private_path}; argv=--token={secret}"
+        )
+
+    monkeypatch.setattr(module.sys, "stderr", output)
+    monkeypatch.setattr(module, "_dispatch", fail_dispatch)
+
+    result = module._entry_main(["run", "--prompt", "private prompt"])
+
+    assert result == 2
+    terminal = output.buffer.getvalue().decode("utf-8")
+    assert terminal == (
+        "replaylab-ai: error[agent-host-bootstrap-failure]: "
+        "The local AI Host could not start. "
+        "Check RenderDoc's diagnostic log for technical details.\n"
+    )
+    for forbidden in (
+        "Traceback",
+        "NameError",
+        private_path,
+        secret,
+        "argv",
+        "private prompt",
+    ):
+        assert forbidden not in terminal
+
+
+def test_frozen_entry_does_not_reflect_string_system_exit(monkeypatch) -> None:
+    module = _load_entry_module()
+
+    class BinaryStderr:
+        def __init__(self) -> None:
+            self.buffer = BytesIO()
+
+    output = BinaryStderr()
+    secret = "sk-system-exit-secret-value"
+    monkeypatch.setattr(module.sys, "stderr", output)
+    monkeypatch.setattr(
+        module,
+        "_dispatch",
+        lambda _arguments: (_ for _ in ()).throw(SystemExit(f"argv --token={secret}")),
+    )
+
+    assert module._entry_main(["run"]) == 2
+    terminal = output.buffer.getvalue().decode("utf-8")
+    assert "error[agent-host-bootstrap-failure]" in terminal
+    assert secret not in terminal
+    assert "SystemExit" not in terminal
+    assert "argv" not in terminal

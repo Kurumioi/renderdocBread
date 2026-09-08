@@ -498,6 +498,41 @@ class EventCBufferBridgeTests(unittest.TestCase):
         self.assertTrue(retried["alreadyReleased"])
         self.assertEqual(len(self.controller.clear_calls), 1)
 
+    def test_committed_cbuffer_mutations_refresh_snapshot_consumers_once(self):
+        notifications = []
+        self.bridge._notify_shader_replay_changed = lambda: notifications.append(True)
+
+        snapshot = self._snapshot()
+        color = next(field for field in snapshot["fields"] if field["path"] == "颜色")
+        applied, _ = self._apply(
+            snapshot,
+            [(color["leafId"], struct.pack("<4f", 0.2, 0.4, 0.6, 1.0))],
+            0,
+            snapshot["rawSha256"],
+        )
+        self.assertEqual(len(notifications), 1)
+
+        self.bridge._rollback_event_cbuffer_override(
+            {
+                "snapshot_id": snapshot["snapshotId"],
+                "override_id": applied["overrideId"],
+                "expected_capture_id": CAPTURE_ID,
+                "expected_capture_session_id": CAPTURE_SESSION_ID,
+            }
+        )
+        self.assertEqual(len(notifications), 2)
+
+        # An idempotent retry performs no controller mutation and must not wake viewers again.
+        self.bridge._rollback_event_cbuffer_override(
+            {
+                "snapshot_id": snapshot["snapshotId"],
+                "override_id": applied["overrideId"],
+                "expected_capture_id": CAPTURE_ID,
+                "expected_capture_session_id": CAPTURE_SESSION_ID,
+            }
+        )
+        self.assertEqual(len(notifications), 2)
+
     def test_existing_physical_key_rejects_new_owner_without_mutating_original(self):
         snapshot = self._snapshot()
         original = self.bridge._event_cbuffer_snapshots[snapshot["snapshotId"]]
@@ -762,6 +797,7 @@ class EventCBufferBridgeTests(unittest.TestCase):
 
         for stage_name, stage_index in (("task", 6), ("mesh", 7)):
             controller.stage_index = stage_index
+            self.reflection.stage = stage_name
             state = self.bridge._event_cbuffer_live_state(
                 controller, 77, stage_name, stage_index, 0)
             self.assertEqual(state["stageName"], stage_name)

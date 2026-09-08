@@ -1518,17 +1518,22 @@ rdcarray<ShaderEntryPoint> Program::GetEntryPoints()
       {
         ShaderEntryPoint entryPoint;
         entryPoint.name = entry->children[1]->str;
+        if(uint32_t(m_Type) < uint32_t(DXBC::ShaderType::Max) &&
+           m_Type != DXBC::ShaderType::Library)
+          entryPoint.stage = GetShaderStage(m_Type);
 
-        Metadata *tags = entry->children[4];
+        Metadata *tags = entry->children.size() > 4 ? entry->children[4] : NULL;
         if(tags)
         {
-          for(size_t i = 0; i < tags->children.size(); i += 2)
+          for(size_t i = 0; i + 1 < tags->children.size(); i += 2)
           {
             // 8 is the type tag
             if(getival<uint32_t>(tags->children[i]) == 8U)
             {
-              entryPoint.stage =
-                  GetShaderStage((DXBC::ShaderType)getival<uint32_t>(tags->children[i + 1]));
+              const uint32_t shaderType = getival<uint32_t>(tags->children[i + 1]);
+              if(shaderType < uint32_t(DXBC::ShaderType::Max) &&
+                 shaderType != uint32_t(DXBC::ShaderType::Library))
+                entryPoint.stage = GetShaderStage((DXBC::ShaderType)shaderType);
               break;
             }
           }

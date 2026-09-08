@@ -221,6 +221,15 @@ bool WrappedID3D12GraphicsCommandList::Serialise_Reset(SerialiserType &ser,
         }
       }
 
+      bool reusedPrepared = false;
+      ID3D12GraphicsCommandListX *preparedList = NULL;
+
+      if(rerecord && !partial)
+      {
+        preparedList = m_Cmd->BeginPreparedCommandList(BakedCommandList, CommandList, type,
+                                                       pInitialState, reusedPrepared);
+      }
+
       {
         ID3D12GraphicsCommandList *listptr = NULL;
         HRESULT hr =
@@ -237,7 +246,7 @@ bool WrappedID3D12GraphicsCommandList::Serialise_Reset(SerialiserType &ser,
         // this is a safe upcast because it's a wrapped object
         ID3D12GraphicsCommandListX *list = (ID3D12GraphicsCommandListX *)listptr;
 
-        if(rerecord)
+        if(rerecord && preparedList == NULL)
         {
           // we store under both baked and non baked ID.
           // The baked ID is the 'real' entry, the non baked is simply so it
@@ -256,8 +265,11 @@ bool WrappedID3D12GraphicsCommandList::Serialise_Reset(SerialiserType &ser,
           list->Close();
         }
 
-        // always create a version of this list even if we're not re-recording, so the serialisation
-        // has an object to find
+        // Always retain a wrapper with the captured baked ID for command and queue-submit
+        // deserialisation. Prepared lists have an independent internal ID and cannot replace this
+        // identity object: without it ReplaceResource(parent, baked) fails after the previous
+        // replay's wrappers are released. The prepared native list stays in m_RerecordCmds while
+        // this closed, empty placeholder has the normal per-replay lifetime.
         m_Cmd->m_RerecordCmdList.push_back(list);
       }
 
@@ -295,6 +307,8 @@ bool WrappedID3D12GraphicsCommandList::Serialise_Reset(SerialiserType &ser,
           m_Cmd->m_BakedCmdListInfo[BakedCommandList].executeEvents;
       m_Cmd->m_BakedCmdListInfo[CommandList].barriers.clear();
       m_Cmd->m_BakedCmdListInfo[BakedCommandList].barriers.clear();
+
+      m_Cmd->PrepareFullReplayCompanion(BakedCommandList, CommandList, pInitialState);
     }
     else
     {
@@ -360,6 +374,17 @@ bool WrappedID3D12GraphicsCommandList::Serialise_Reset(SerialiserType &ser,
 
         m_Cmd->m_BakedCmdListInfo[BakedCommandList].beginChunk =
             uint32_t(m_Cmd->m_StructuredFile->chunks.size() - 1);
+
+        // Prepared replay is deliberately restricted to standalone DIRECT lists. The frame-reader
+        // scan will clear this bit if Reset..Close is not contiguous or contains a command with
+        // replay-time transient/callback requirements.
+        m_Cmd->m_BakedCmdListInfo[BakedCommandList].preparedReplaySafe =
+            (type == D3D12_COMMAND_LIST_TYPE_DIRECT);
+        m_Cmd->m_BakedCmdListInfo[BakedCommandList].preparedReplayBegin = 0;
+        m_Cmd->m_BakedCmdListInfo[BakedCommandList].preparedReplayEnd = 0;
+        m_Cmd->m_BakedCmdListInfo[BakedCommandList].checkpointQueries.clear();
+        m_Cmd->m_BakedCmdListInfo[BakedCommandList].checkpointBarriers.clear();
+        m_Cmd->m_BakedCmdListInfo[BakedCommandList].checkpointChunks.clear();
 
         // reset state
         D3D12RenderState &state = m_Cmd->m_BakedCmdListInfo[BakedCommandList].state;
@@ -485,6 +510,43 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ResourceBarrier(
   if(IsReplayingAndReading())
   {
     m_Cmd->m_LastCmdListID = GetResID(pCommandList);
+
+    if(IsLoading(m_State))
+    {
+      for(UINT i = 0; i < NumBarriers; i++)
+      {
+        const D3D12_RESOURCE_BARRIER &barrier = pBarriers[i];
+        if(barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING ||
+           (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+            barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE && barrier.Transition.pResource))
+        {
+          BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
+          BakedCmdListInfo::CheckpointBarrierOp op;
+          op.relativeEvent = info.curEventID;
+          op.type = barrier.Type;
+          op.flags = barrier.Flags;
+          if(barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING)
+          {
+            op.before = GetResID(barrier.Aliasing.pResourceBefore);
+            op.after = GetResID(barrier.Aliasing.pResourceAfter);
+          }
+          else
+          {
+            op.before = GetResID(barrier.Transition.pResource);
+            op.subresource = barrier.Transition.Subresource;
+            op.stateBefore = barrier.Transition.StateBefore;
+            op.stateAfter = barrier.Transition.StateAfter;
+          }
+          info.checkpointBarriers.push_back(op);
+        }
+        if(pBarriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
+        {
+          // Aliasing and UAV barriers can depend on ordering which is not represented by a single
+          // command-list-local state vector. Keep those lists on the original replay path.
+          m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID].preparedReplaySafe = false;
+        }
+      }
+    }
 
     rdcarray<D3D12_RESOURCE_BARRIER> filtered;
     {
@@ -2881,6 +2943,12 @@ bool WrappedID3D12GraphicsCommandList::Serialise_BeginQuery(SerialiserType &ser,
     }
     else
     {
+      if(IsLoading(m_State))
+      {
+        BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
+        if(!info.preparedReplayQueries.Begin(GetResID(pQueryHeap), Type, Index))
+          info.preparedReplaySafe = false;
+      }
       Unwrap(pCommandList)->BeginQuery(Unwrap(pQueryHeap), Type, Index);
     }
   }
@@ -2943,6 +3011,15 @@ bool WrappedID3D12GraphicsCommandList::Serialise_EndQuery(SerialiserType &ser,
     }
     else
     {
+      if(IsLoading(m_State))
+      {
+        BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
+        const bool completed = info.preparedReplayQueries.End(GetResID(pQueryHeap), Type, Index);
+        if(!completed)
+          info.preparedReplaySafe = false;
+        info.checkpointQueries.push_back(
+            {GetResID(pQueryHeap), Index, 1, info.curEventID, false, Type, completed});
+      }
       Unwrap(pCommandList)->EndQuery(Unwrap(pQueryHeap), Type, Index);
 
       // during replay store which queries are issued in the capture itself, so we know which ones
@@ -3014,11 +3091,18 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ResolveQueryData(
         // stored buffer
         queryHeap->ResolveValidQueryData(m_Cmd->RerecordCmdList(m_Cmd->m_LastCmdListID), Type,
                                          StartIndex, NumQueries, pDestinationBuffer,
-                                         AlignedDestinationBufferOffset);
+                                         AlignedDestinationBufferOffset, m_Cmd->m_LastCmdListID,
+                                         m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID].curEventID);
       }
     }
     else
     {
+      if(IsLoading(m_State))
+      {
+        BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
+        info.checkpointQueries.push_back(
+            {GetResID(pQueryHeap), StartIndex, NumQueries, info.curEventID, true, Type});
+      }
       // don't resolve queries during load, since we can't know for certain at record time whether
       // or not a query will be valid (it could have been queried in a previous frame so not valid
       // to resolve right now, and without knowing the submission order ahead of time we can't
@@ -5330,10 +5414,12 @@ bool WrappedID3D12GraphicsCommandList::Serialise_CopyBufferRegion(SerialiserType
         uint32_t eventId = m_Cmd->HandlePreCallback(list, ActionFlags::Copy);
         Unwrap(list)->CopyBufferRegion(Unwrap(pDstBuffer), DstOffset, Unwrap(pSrcBuffer), SrcOffset,
                                        NumBytes);
+        m_pDevice->RecordReplayBufferPatches(list, pDstBuffer);
         if(eventId && m_Cmd->m_ActionCallback->PostMisc(eventId, ActionFlags::Copy, list))
         {
           Unwrap(list)->CopyBufferRegion(Unwrap(pDstBuffer), DstOffset, Unwrap(pSrcBuffer),
                                          SrcOffset, NumBytes);
+          m_pDevice->RecordReplayBufferPatches(list, pDstBuffer);
           m_Cmd->m_ActionCallback->PostRemisc(eventId, ActionFlags::Copy, list);
         }
       }
@@ -5436,9 +5522,11 @@ bool WrappedID3D12GraphicsCommandList::Serialise_CopyTextureRegion(
 
         uint32_t eventId = m_Cmd->HandlePreCallback(list, ActionFlags::Copy);
         Unwrap(list)->CopyTextureRegion(&unwrappedDst, DstX, DstY, DstZ, &unwrappedSrc, pSrcBox);
+        m_pDevice->RecordReplayBufferPatches(list, dst.pResource);
         if(eventId && m_Cmd->m_ActionCallback->PostMisc(eventId, ActionFlags::Copy, list))
         {
           Unwrap(list)->CopyTextureRegion(&unwrappedDst, DstX, DstY, DstZ, &unwrappedSrc, pSrcBox);
+          m_pDevice->RecordReplayBufferPatches(list, dst.pResource);
           m_Cmd->m_ActionCallback->PostRemisc(eventId, ActionFlags::Copy, list);
         }
       }
@@ -5560,9 +5648,11 @@ bool WrappedID3D12GraphicsCommandList::Serialise_CopyResource(SerialiserType &se
 
         uint32_t eventId = m_Cmd->HandlePreCallback(list, ActionFlags::Copy);
         Unwrap(list)->CopyResource(Unwrap(pDstResource), Unwrap(pSrcResource));
+        m_pDevice->RecordReplayBufferPatches(list, pDstResource);
         if(eventId && m_Cmd->m_ActionCallback->PostMisc(eventId, ActionFlags::Copy, list))
         {
           Unwrap(list)->CopyResource(Unwrap(pDstResource), Unwrap(pSrcResource));
+          m_pDevice->RecordReplayBufferPatches(list, pDstResource);
           m_Cmd->m_ActionCallback->PostRemisc(eventId, ActionFlags::Copy, list);
         }
       }

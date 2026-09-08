@@ -17,7 +17,7 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 
 
 class McpContractTests(unittest.TestCase):
-    def test_capture_load_does_not_start_project_client_or_subprocess(self) -> None:
+    def test_capture_load_defers_project_restore_without_starting_client_or_subprocess_inline(self) -> None:
         bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
         source = bridge_path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(bridge_path))
@@ -48,10 +48,13 @@ class McpContractTests(unittest.TestCase):
             "_material_panel_ui": None,
             "_material_panel_controller": None,
             "_pass_panel_ui": None,
+            "_abandon_project_launcher_restore": lambda: False,
             "_reset_symbol_state": lambda restore_names: None,
             "_current_capture_token": lambda: "capture-token",
             "_publish_instance_manifest": lambda **kwargs: None,
             "_publish_console_event": lambda *args, **kwargs: None,
+            "_shader_workspace_capture_binding": lambda: None,
+            "_notify_shader_capture_changed": lambda binding: None,
             "_schedule_project_auto_activation": _record("schedule"),
             "_project_launcher_protocol": types.SimpleNamespace(
                 ReplayLabProjectClient=_record("projectClient")
@@ -62,11 +65,16 @@ class McpContractTests(unittest.TestCase):
         ast.fix_missing_locations(executable)
         exec(compile(executable, str(bridge_path), "exec"), namespace)
 
-        namespace["OnCaptureLoaded"](object())
+        # ``OnCaptureLoaded`` invalidates capture-local event selection via
+        # ``self._remember_current_events()``; the isolated exec needs a fake
+        # self that carries that no-op so this contract test still exercises
+        # only the project-client/subprocess restraint it is about.
+        fake_self = types.SimpleNamespace(_remember_current_events=lambda: None)
+        namespace["OnCaptureLoaded"](fake_self)
 
         self.assertEqual("capture-token", namespace["_active_capture_token"])
         self.assertEqual(
-            {"schedule": 0, "projectClient": 0, "popen": 0}, calls
+            {"schedule": 1, "projectClient": 0, "popen": 0}, calls
         )
 
     def test_bridge_restore_client_imports_without_embedded_network_modules(self) -> None:
@@ -656,6 +664,7 @@ class McpContractTests(unittest.TestCase):
             "submit_symbol_match",
             "export_symbol_alias_table",
             "apply_symbol_alias_table",
+            "rollback_symbol_alias_table",
         }
         self.assertTrue(expected.issubset(tools), expected - tools)
 
@@ -677,6 +686,13 @@ class McpContractTests(unittest.TestCase):
         self.assertNotIn("path", apply_args)
         self.assertIn("database_path", apply_args)
         self.assertIn("capture_id", apply_args)
+        rollback_args = {
+            argument.arg
+            for argument in functions["rollback_symbol_alias_table"].args.args
+        }
+        self.assertEqual(
+            rollback_args, {"capture_id", "expected_transaction_id"}
+        )
 
     def test_bridge_symbol_methods_are_present(self) -> None:
         bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
@@ -711,6 +727,9 @@ class McpContractTests(unittest.TestCase):
             source,
         )
         self.assertIn('"load_symbol_aliases": _load_symbol_aliases', source)
+        self.assertIn(
+            '"rollback_symbol_aliases": _rollback_symbol_aliases', source
+        )
 
         tree = ast.parse(source)
         functions = {
@@ -723,12 +742,215 @@ class McpContractTests(unittest.TestCase):
         )
         self.assertIn("_available_shader_stages", shader_info_source)
         self.assertIn("unsupported shader stage", shader_info_source)
+        self.assertIn('"api"', shader_info_source)
+        self.assertIn('"encoding"', shader_info_source)
+        self.assertIn('"entryPoints"', shader_info_source)
+        self.assertIn('"compiledInterface"', shader_info_source)
+        self.assertIn("_compiled_shader_interface(refl)", shader_info_source)
+        self.assertIn("_pipeline_shader_entry_selection", shader_info_source)
+        self.assertIn("_shader_entry_selection_failure", shader_info_source)
+        self.assertIn("_shader_reflection_identity_failure", shader_info_source)
+        selector_source = ast.get_source_segment(
+            source, functions["_pipeline_shader_entry_selection"]
+        )
+        selection_failure_source = ast.get_source_segment(
+            source, functions["_shader_entry_selection_failure"]
+        )
+        reflection_failure_source = ast.get_source_segment(
+            source, functions["_shader_reflection_identity_failure"]
+        )
+        self.assertIn('"shader-entry-point-ambiguous"', selector_source)
+        self.assertIn('"shader-entry-point-unavailable"', selector_source)
+        self.assertIn('"unknowns"', selection_failure_source)
+        self.assertIn(
+            '"shader-reflection-identity-mismatch"', reflection_failure_source
+        )
+        self.assertIn('"entryPointSelection"', shader_info_source)
+        self.assertIn('"roleInference"', shader_info_source)
+        self.assertIn('"variablesStatus"', shader_info_source)
+        self.assertIn('"sectionStatus"', shader_info_source)
+        self.assertIn('"evidenceContract"', shader_info_source)
         self.assertNotIn(
             "rd.ShaderStage.Fragment)", shader_info_source,
             "unknown task/mesh/ray stages must not silently inspect the pixel shader",
         )
         self.assertIn('(\"task\", \"Task\")', source)
         self.assertIn('(\"mesh\", \"Mesh\")', source)
+
+    def test_shader_catalog_restore_export_uses_async_replay_job_protocol(self) -> None:
+        bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
+        source = bridge_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(bridge_path))
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        begin_source = ast.get_source_segment(
+            source, functions["_begin_export_shader_catalog"]
+        )
+        export_source = ast.get_source_segment(
+            source, functions["_export_shader_catalog"]
+        )
+        consume_source = ast.get_source_segment(
+            source, functions["_consume_export_shader_catalog"]
+        )
+
+        self.assertIn("Replay().AsyncInvoke(", begin_source)
+        self.assertNotIn("BlockInvoke", begin_source)
+        self.assertIn("catalog, blobs = _do(replay_controller)", export_source)
+        self.assertIn("defer_publication=True", source)
+        self.assertIn("_commit_catalog_cache_publication(", consume_source)
+        quiet_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "CONSOLE_QUIET_REQUEST_METHODS"
+                for target in node.targets
+            )
+        )
+        quiet_source = ast.get_source_segment(source, quiet_node)
+        self.assertIn('"poll_export_shader_catalog"', quiet_source)
+        for method in (
+            "begin_export_shader_catalog",
+            "poll_export_shader_catalog",
+            "cancel_export_shader_catalog",
+            "consume_export_shader_catalog",
+        ):
+            self.assertIn('"%s": _%s' % (method, method), source)
+
+    def test_shader_catalog_async_job_is_lightweight_pollable_and_consumed_once(self) -> None:
+        bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
+        fake_renderdoc = types.ModuleType("renderdoc")
+        previous_renderdoc = sys.modules.get("renderdoc")
+        previous_qrenderdoc = sys.modules.pop("qrenderdoc", None)
+        module_name = "renderdoc_mcp_bridge_async_catalog_contract"
+        sys.modules["renderdoc"] = fake_renderdoc
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, bridge_path)
+            bridge = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = bridge
+            spec.loader.exec_module(bridge)
+
+            callbacks = []
+            exported = []
+            published = []
+            capture_path = os.path.abspath("C:/captures/frame.rdc")
+            capture_token = ("loaded", os.path.normcase(capture_path))
+
+            class Replay:
+                def AsyncInvoke(self, tag, callback):
+                    self.tag = tag
+                    callbacks.append(callback)
+
+            class Context:
+                def IsCaptureLoaded(self):
+                    return True
+
+                def CurEvent(self):
+                    return 42
+
+                def GetCaptureFilename(self):
+                    return capture_path
+
+                def Replay(self):
+                    return Replay()
+
+            bridge._ctx = Context()
+            bridge._capture_session_id = "c" * 32
+            bridge._active_capture_token = capture_token
+            bridge._available_shader_stages = (
+                lambda unused=None: [("vertex", object())]
+            )
+
+            def fake_export(params, replay_controller=None,
+                            capture_snapshot=None, cancel_event=None,
+                            progress_job_id="", defer_publication=False,
+                            defer_finalization=False):
+                del params, cancel_event
+                self.assertIsNotNone(replay_controller)
+                self.assertTrue(defer_publication)
+                self.assertTrue(defer_finalization)
+                exported.append(progress_job_id)
+                bridge._update_shader_catalog_export_progress(
+                    progress_job_id, 418, 3, 9
+                )
+                return {"captureSnapshot": capture_snapshot}
+
+            def fake_finalize(collected, cancel_event=None, defer_publication=False):
+                self.assertTrue(defer_publication)
+                self.assertEqual(capture_token, collected["captureSnapshot"]["captureToken"])
+                return {
+                    "schema": bridge.SYMBOL_CATALOG_SCHEMA,
+                    "schemaVersion": bridge.SYMBOL_CATALOG_VERSION,
+                    "captureId": "d" * 64,
+                    "catalogPath": os.path.abspath("C:/catalog.json"),
+                    "blobDirectory": os.path.abspath("C:/blobs"),
+                    "counts": {},
+                    "identityEvidenceSha256": "e" * 64,
+                    "_deferredPublication": {"prepared": True},
+                }
+
+            bridge._export_shader_catalog = fake_export
+            bridge._finalize_shader_catalog_export = fake_finalize
+            bridge._commit_catalog_cache_publication = published.append
+
+            started = bridge._begin_export_shader_catalog({
+                "output_dir": os.path.abspath("C:/export"),
+                "event_ids": [418],
+            })
+            self.assertEqual("queued", started["status"])
+            self.assertEqual([], exported)
+            self.assertEqual(1, len(callbacks))
+
+            callbacks.pop(0)(object())
+            with bridge._shader_catalog_export_jobs_guard:
+                workers = tuple(bridge._shader_catalog_finalize_workers)
+            for worker in workers:
+                worker.join(2.0)
+                self.assertFalse(worker.is_alive())
+            polled = bridge._poll_export_shader_catalog({
+                "job_id": started["jobId"],
+            })
+            self.assertEqual("completed", polled["status"])
+            self.assertEqual((3, 9, 418), (
+                polled["current"], polled["total"], polled["eventId"],
+            ))
+            self.assertNotIn("result", polled)
+
+            consumed = bridge._consume_export_shader_catalog({
+                "job_id": started["jobId"],
+            })
+            self.assertEqual("completed", consumed["status"])
+            self.assertEqual("d" * 64, consumed["result"]["captureId"])
+            self.assertEqual(1, len(published))
+            with self.assertRaisesRegex(ValueError, "Unknown or expired"):
+                bridge._consume_export_shader_catalog({
+                    "job_id": started["jobId"],
+                })
+
+            queued = bridge._begin_export_shader_catalog({
+                "output_dir": os.path.abspath("C:/export-two"),
+                "event_ids": [419],
+            })
+            cancelled = bridge._cancel_export_shader_catalog({
+                "job_id": queued["jobId"],
+            })
+            self.assertEqual("cancelled", cancelled["status"])
+            self.assertTrue(cancelled["cancellationRequested"])
+            callbacks.pop(0)(object())
+            self.assertEqual(1, len(exported))
+        finally:
+            for name in list(sys.modules):
+                if name == module_name or name.startswith(module_name + "."):
+                    sys.modules.pop(name, None)
+            if previous_renderdoc is None:
+                sys.modules.pop("renderdoc", None)
+            else:
+                sys.modules["renderdoc"] = previous_renderdoc
+            if previous_qrenderdoc is not None:
+                sys.modules["qrenderdoc"] = previous_qrenderdoc
 
     def test_bridge_compiled_interface_helpers_are_python_only_and_lossless(self) -> None:
         bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
@@ -1103,6 +1325,9 @@ class McpContractTests(unittest.TestCase):
             def __init__(self):
                 self.freed = []
 
+            def GetAPIProperties(self):
+                return types.SimpleNamespace(pipelineType="GraphicsAPI.D3D11")
+
             def GetTargetShaderEncodings(self):
                 return ["DXBC"]
 
@@ -1122,6 +1347,22 @@ class McpContractTests(unittest.TestCase):
         controller = Controller()
         module._ctx = types.SimpleNamespace(IsCaptureLoaded=lambda: True)
         module._replay = lambda callback: callback(controller)
+
+        exact_entry = types.SimpleNamespace(name="main", stage="Pixel")
+        self.assertIs(
+            module._exact_shader_entry([exact_entry], "main", "fragment"),
+            exact_entry,
+        )
+        self.assertIsNone(module._exact_shader_entry(
+            [types.SimpleNamespace(name="main", stage="Vertex")],
+            "main",
+            "fragment",
+        ))
+        self.assertIsNone(module._exact_shader_entry(
+            [exact_entry, types.SimpleNamespace(name="main", stage="Pixel")],
+            "main",
+            "fragment",
+        ))
 
         with tempfile.TemporaryDirectory() as temporary:
             candidate = Path(temporary) / "candidate.dxbc"
@@ -1483,7 +1724,9 @@ class McpContractTests(unittest.TestCase):
                 return self.value
 
         fake_renderdoc.ResourceId = ResourceId
-        fake_renderdoc.ShaderEncoding = types.SimpleNamespace(DXBC="DXBC")
+        fake_renderdoc.ShaderEncoding = types.SimpleNamespace(
+            DXBC="DXBC", SPIRV="SPIRV", OpenGLSPIRV="OpenGLSPIRV"
+        )
         fake_renderdoc.ShaderStage = types.SimpleNamespace(
             Pixel="Pixel", Fragment="Pixel"
         )
@@ -1507,7 +1750,7 @@ class McpContractTests(unittest.TestCase):
 
         def reflection(blob):
             return types.SimpleNamespace(
-                entryPoint="main", rawBytes=blob, interfaces=[]
+                entryPoint="main", rawBytes=blob, interfaces=[], encoding="DXBC"
             )
 
         class Pipeline:
@@ -1562,13 +1805,13 @@ class McpContractTests(unittest.TestCase):
                 # replayed pipeline.  This is the real behaviour that exposed
                 # the rev1 -> rev2 supersede bug: the pipeline still reports
                 # ResourceId 77 while GetShader(77) returns target 100's bytes.
-                if self.api == "GraphicsAPI.D3D12" and value in self.replacements:
+                if self.api != "GraphicsAPI.D3D11" and value in self.replacements:
                     value = int(self.replacements[value])
                 blob = self.original_blobs.get(value, self.target_blobs.get(value))
                 return reflection(blob) if blob is not None else None
 
             def GetTargetShaderEncodings(self):
-                return ["DXBC"]
+                return ["DXBC", "SPIRV", "OpenGLSPIRV"]
 
             def BuildTargetShader(self, entry, encoding, source, flags, stage):
                 target = ResourceId(self.next_target)
@@ -1683,7 +1926,9 @@ class McpContractTests(unittest.TestCase):
                     "abi_report_sha256": "d" * 64,
                 }
 
-            first = module._apply_shader_candidate_shared_resource(params())
+            first_params = params()
+            first_params["operation_id"] = "1" * 32
+            first = module._apply_shader_candidate_shared_resource(first_params)
             self.assertTrue(first["resourceScoped"])
             self.assertFalse(first["eventScoped"])
             self.assertTrue(first["allOriginalResourceUsesAffected"])
@@ -1691,28 +1936,34 @@ class McpContractTests(unittest.TestCase):
             self.assertEqual(int(controller.replacements[77]), 100)
             self.assertNotIn(77, controller.freed)
 
-            repeated = module._apply_shader_candidate_shared_resource(params())
+            repeated = module._apply_shader_candidate_shared_resource(first_params)
             self.assertEqual(repeated["replacementId"], first["replacementId"])
             self.assertTrue(repeated["idempotent"])
+            self.assertEqual(repeated["operationId"], "1" * 32)
+            self.assertFalse(repeated["operationCreatedReplacement"])
             self.assertEqual(
                 len([call for call in controller.calls
                      if call[0] == "BuildTargetShader"]), 1
             )
 
-            metadata = module._apply_shader_candidate_shared_resource(
-                params(revision=2)
-            )
+            renewed_params = params(revision=2)
+            renewed_params.update(abi_request_id="2" * 64, abi_report_sha256="3" * 64)
+            metadata = module._apply_shader_candidate_shared_resource(renewed_params)
             self.assertEqual(metadata["replacementId"], first["replacementId"])
             self.assertTrue(metadata["metadataOnly"])
+            self.assertEqual(metadata["abiLeaseRequestId"], "2" * 64)
+            self.assertEqual(metadata["abiLeaseReportSha256"], "3" * 64)
+            self.assertEqual(metadata["abiLeaseRevision"], 2)
 
             leased_params = params(revision=3)
             leased_params.update({
                 "abi_validation_mode": "inline-physical-with-initial-lease",
-                "abi_lease_request_id": "a" * 64,
+                "abi_report_sha256": "3" * 64,
+                "abi_lease_request_id": "2" * 64,
                 "abi_lease_candidate_sha256": hashlib.sha256(
                     candidate
                 ).hexdigest(),
-                "abi_lease_revision": 1,
+                "abi_lease_revision": 2,
                 "expected_physical_abi_sha256": first[
                     "physicalAbiSha256"
                 ],
@@ -1727,7 +1978,7 @@ class McpContractTests(unittest.TestCase):
             )
             self.assertTrue(leased["preliminaryReflectionSkipped"])
             self.assertTrue(leased["freshPhysicalAbiValidationPerformed"])
-            self.assertEqual(leased["abiLeaseRevision"], 1)
+            self.assertEqual(leased["abiLeaseRevision"], 2)
 
             forged_lease = dict(leased_params)
             forged_lease["abi_lease_request_id"] = "0" * 64
@@ -1742,10 +1993,12 @@ class McpContractTests(unittest.TestCase):
             replacement_blob = b"second edited shared DXBC"
             replacement_path = Path(temporary) / "replacement.dxbc"
             replacement_path.write_bytes(replacement_blob)
-            replacement_params = params(
-                revision=3, blob=replacement_blob, path=replacement_path
-            )
-            replacement_params["abi_report_sha256"] = "e" * 64
+            # A different executable may use the renewed physical-interface
+            # lease; retain the original target until checked replace and UI
+            # registration succeed, without requiring executable hash equality.
+            replacement_params = dict(
+                leased_params, revision=4, candidate_path=str(replacement_path),
+                expected_sha256=hashlib.sha256(replacement_blob).hexdigest())
 
             # A GUI registration failure restores both the replay mapping and
             # the old UI reverse mapping, while freeing only the new target.
@@ -1764,6 +2017,8 @@ class McpContractTests(unittest.TestCase):
                 replacement_params
             )
             self.assertNotEqual(replaced["replacementId"], first["replacementId"])
+            self.assertEqual(replaced["abiLeaseRevision"], 2)
+            self.assertEqual(replaced["abiLeaseRequestId"], "2" * 64)
             self.assertEqual(int(context.replacements[77]), 102)
             self.assertEqual(int(controller.replacements[77]), 102)
             self.assertIn(100, controller.freed)
@@ -1818,23 +2073,103 @@ class McpContractTests(unittest.TestCase):
                 controller.original_id = ResourceId(77)
                 module.MAX_SHARED_SHADER_REPLACEMENTS = old_limit
 
-            rolled_back = module._rollback_shader_candidate_shared_resource(
-                {
-                    "replacement_id": replaced["replacementId"],
-                    "expected_capture_id": capture_id,
-                    "workspace_id": "b" * 32,
-                }
+            exact_params = {
+                "expected_capture_id": capture_id,
+                "expected_capture_session_id": "7" * 32,
+                "workspace_id": "b" * 32,
+                "expected_event_id": 5,
+                "stage": replaced["stage"],
+                "entry_point": replaced["entryPoint"],
+                "expected_original_resource_id": replaced[
+                    "originalResourceId"
+                ],
+                "expected_original_sha256": replaced[
+                    "originalRawSha256"
+                ],
+                "expected_replacement_id": replaced["replacementId"],
+                "expected_operation_id": replaced["operationId"],
+                "expected_revision": replaced["revision"],
+                "expected_anchor_event_id": replaced["anchorEventId"],
+                "expected_api": replaced["api"],
+                "expected_encoding": replaced["encoding"],
+                "expected_candidate_sha256": replaced[
+                    "candidateRawSha256"
+                ],
+                "expected_physical_abi_sha256": replaced[
+                    "physicalAbiSha256"
+                ],
+                "expected_shader_family_id": replaced["shaderFamilyId"],
+                "expected_target_resource_id": replaced["targetResourceId"],
+            }
+            context.replacements[77] = ResourceId(900)
+            with self.assertRaisesRegex(RuntimeError, "no longer owned"):
+                module._restore_shader_candidate_shared_resource_exact(
+                    exact_params
+                )
+            context.replacements[77] = ResourceId(102)
+
+            exact_restore = (
+                module._restore_shader_candidate_shared_resource_exact(
+                    exact_params
+                )
             )
+            self.assertEqual(exact_restore["state"], "rolled-back")
+            self.assertTrue(exact_restore["linearized"])
+            self.assertTrue(exact_restore["stateAtLinearizationVerified"])
+            self.assertGreaterEqual(exact_restore["mutationEpoch"], 1)
+            rolled_back = exact_restore["rollback"]
             self.assertTrue(rolled_back["cleared"])
             self.assertTrue(rolled_back["targetFreed"])
+            self.assertEqual(
+                rolled_back["operationId"], replaced["operationId"]
+            )
             self.assertNotIn(77, context.replacements)
             self.assertNotIn(77, controller.replacements)
             self.assertIn(102, controller.freed)
             self.assertNotIn(77, controller.freed)
 
+            absent_params = {
+                "expected_capture_id": capture_id,
+                "expected_capture_session_id": "7" * 32,
+                "workspace_id": "b" * 32,
+                "expected_event_id": 5,
+                "stage": "fragment",
+                "entry_point": "main",
+                "expected_original_resource_id": 77,
+                "expected_original_sha256": hashlib.sha256(
+                    baseline
+                ).hexdigest(),
+            }
+            absent = module._restore_shader_candidate_shared_resource_exact(
+                absent_params
+            )
+            self.assertEqual(absent["state"], "absent")
+            self.assertIsNone(absent["rollback"])
+            self.assertTrue(absent["alreadyRestored"])
+
+            module._event_shader_overrides["a" * 32] = {
+                "eventId": 5,
+                "stageName": "fragment",
+            }
+            with self.assertRaisesRegex(RuntimeError, "event-scoped"):
+                module._restore_shader_candidate_shared_resource_exact(
+                    absent_params
+                )
+            module._event_shader_overrides.clear()
+            self.assertIs(
+                module.METHODS[
+                    "restore_shader_candidate_shared_resource_exact"
+                ],
+                module._restore_shader_candidate_shared_resource_exact,
+            )
+
             # A stock Editor replacement is foreign state. The bridge refuses
             # to overwrite it and does not build or remove anything.
             context.replacements[77] = ResourceId(900)
+            with self.assertRaisesRegex(RuntimeError, "foreign RenderDoc replacement"):
+                module._restore_shader_candidate_shared_resource_exact(
+                    absent_params
+                )
             build_count = len([
                 call for call in controller.calls
                 if call[0] == "BuildTargetShader"
@@ -1937,6 +2272,62 @@ class McpContractTests(unittest.TestCase):
             self.assertNotIn(77, controller.replacements)
             self.assertNotIn(77, context.replacements)
 
+            # Vulkan and OpenGL native SPIR-V use the same checked, derived-
+            # pipeline transaction and then re-read the live anchor.  This is
+            # deliberately separate from Ray/Library replacement, which the
+            # bridge rejects before reaching this path.
+            for api, encoding, suffix in (
+                ("GraphicsAPI.Vulkan", "spirv", "spv"),
+                ("GraphicsAPI.OpenGL", "opengl-spirv", "gl.spv"),
+            ):
+                with self.subTest(api=api):
+                    context.replacements.clear()
+                    controller.replacements.clear()
+                    module._forget_shared_shader_replacements()
+                    controller.api = api
+                    native_blob = ("checked %s candidate" % api).encode("ascii")
+                    native_path = Path(temporary) / ("candidate." + suffix)
+                    native_path.write_bytes(native_blob)
+                    native_params = params(
+                        workspace=("c" if api.endswith("Vulkan") else "d") * 32,
+                        revision=20,
+                        blob=native_blob,
+                        path=native_path,
+                    )
+                    native_params["encoding"] = encoding
+                    native_params["abi_report_sha256"] = (
+                        "2" if api.endswith("Vulkan") else "3"
+                    ) * 64
+
+                    native = module._apply_shader_candidate_shared_resource(
+                        native_params
+                    )
+                    self.assertTrue(native["checkedDerivedPipelineRebuild"])
+                    self.assertTrue(native["postApplyAnchorVerified"])
+                    self.assertEqual(native["api"], api.split(".")[-1].lower())
+                    self.assertEqual(native["encoding"], encoding)
+                    self.assertIn(
+                        (
+                            "ReplaceTargetShaderChecked",
+                            77,
+                            native["targetResourceId"],
+                        ),
+                        controller.calls,
+                    )
+
+                    native_rollback = (
+                        module._rollback_shader_candidate_shared_resource({
+                            "replacement_id": native["replacementId"],
+                            "expected_capture_id": capture_id,
+                            "workspace_id": native_params["workspace_id"],
+                        })
+                    )
+                    self.assertTrue(native_rollback["cleared"])
+                    self.assertIn(
+                        ("RemoveTargetShaderReplacementChecked", 77),
+                        controller.calls,
+                    )
+
     def test_shader_workspace_tools_keep_commands_out_of_mcp_contract(self) -> None:
         server_path = REPOSITORY / "mcp_host" / "src" / "server.py"
         source = server_path.read_text(encoding="utf-8")
@@ -1971,6 +2362,8 @@ class McpContractTests(unittest.TestCase):
             "list_shader_workspace_family_uses",
             "apply_shader_workspace_candidate_family",
             "apply_shader_workspace_shared_resource",
+            "register_active_project_shader_replacement",
+            "register_active_project_material_session",
             "rollback_shader_workspace_override",
             "rollback_shader_workspace_override_family",
             "rollback_shader_workspace_shared_resource",
@@ -1991,6 +2384,16 @@ class McpContractTests(unittest.TestCase):
             arguments = {argument.arg for argument in functions[name].args.args}
             self.assertFalse(arguments.intersection(forbidden), (name, arguments))
 
+        prepare_arguments = {
+            argument.arg
+            for argument in functions["prepare_shader_workspace"].args.args
+        }
+        self.assertNotIn("decompiler_tool_id", prepare_arguments)
+        self.assertNotIn("compiler_tool_id", prepare_arguments)
+        prepare_doc = ast.get_docstring(functions["prepare_shader_workspace"])
+        self.assertIsNotNone(prepare_doc)
+        self.assertNotIn("specialist", prepare_doc.casefold())
+
         prepare_source = ast.get_source_segment(
             source, functions["prepare_shader_workspace"]
         )
@@ -2010,6 +2413,39 @@ class McpContractTests(unittest.TestCase):
         }:
             arguments = {argument.arg for argument in functions[name].args.args}
             self.assertEqual(arguments, {"watch_id"})
+
+    def test_active_mcp_contracts_use_child_agent_vocabulary(self) -> None:
+        expected_literals = {
+            REPOSITORY / "mcp_host" / "src" / "resource_export.py": (
+                "child-Agent-produced semantic plans",
+                "specialist-produced semantic plans",
+            ),
+            REPOSITORY / "mcp_host" / "src" / "unpacked_asset_jobs.py": (
+                '"decisionOwner": "child-agent-with-project-evidence-or-user"',
+                "specialist-with-project-evidence-or-user",
+            ),
+        }
+        for path, (current, retired) in expected_literals.items():
+            source = path.read_text(encoding="utf-8")
+            self.assertIn(current, source)
+            self.assertNotIn(retired, source)
+
+        server_path = REPOSITORY / "mcp_host" / "src" / "server.py"
+        source = server_path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for name in {
+            "_active_workspace_publication_gate",
+            "query_active_shader_asset_evidence",
+            "register_replay_project_workspace",
+        }:
+            doc = ast.get_docstring(functions[name])
+            self.assertIsNotNone(doc)
+            self.assertNotIn("specialist", doc.casefold())
 
     def test_launch_renderdoc_does_not_accept_an_executable_override(self) -> None:
         server_path = REPOSITORY / "mcp_host" / "src" / "server.py"

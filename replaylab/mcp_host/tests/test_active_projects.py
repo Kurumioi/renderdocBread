@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 from pathlib import Path
+import signal
 import shutil
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
+from src import active_projects as active_projects_module
 from src.active_projects import (
     ActiveProjectError,
     ActiveReplayProjectService,
@@ -20,6 +26,13 @@ from src.active_projects import (
 )
 from src.symbols.dxbc import fingerprint_bytes
 from src.symbols.matcher import ALIAS_SCHEMA, ALIAS_VERSION, capture_identity
+from src.shader_workspace.flow_graph import (
+    build_shader_flow_graph,
+    load_workspace_flow_graph_status,
+    validate_shader_flow_graph,
+)
+from src.shader_workspace.organization import ShaderOrganizationManager
+from src.shader_workspace.templates import analysis_template, render_analysis_fields
 
 
 def _canonical_hash(value: dict, field: str) -> str:
@@ -119,6 +132,32 @@ class ActiveReplayProjectTests(unittest.TestCase):
     def _pending(self) -> dict:
         return self.service.ensure_pending("Example Game Project")
 
+    def _selection_lock_payload(
+        self,
+        *,
+        owner_pid: int = 424242,
+        process_identity: str = "windows-filetime:0000000000001234",
+        token: str = "a" * 32,
+    ) -> bytes:
+        value = {
+            "schema": active_projects_module.EXCLUSIVE_PROJECT_LOCK_SCHEMA,
+            "schemaVersion": active_projects_module.EXCLUSIVE_PROJECT_LOCK_VERSION,
+            "token": token,
+            "ownerPid": owner_pid,
+            "processStartIdentity": process_identity,
+            "acquiredAt": "2026-08-28T00:00:00Z",
+        }
+        value["lockSha256"] = _canonical_hash(value, "lockSha256")
+        return (
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+
     def _bound(self, *, api_family: str = "d3d11") -> dict:
         self._pending()
         return self.service.configure_scope(
@@ -202,6 +241,37 @@ class ActiveReplayProjectTests(unittest.TestCase):
         fingerprint = fingerprint_bytes(Path(shader["rawPath"]).read_bytes())
         self.assertIsNotNone(fingerprint)
         source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        target_profile = {
+            "kind": "DXBC",
+            "stage": "fragment",
+            "profile": "ps_5_0",
+        }
+        compiler_binding = {
+            "schema": "renderdoc-ultra-shader-compiler-binding/v1",
+            "schemaVersion": 1,
+            "targetProfile": dict(target_profile),
+            "routePlanSha256": "3" * 64,
+            "hops": [
+                {
+                    "hop": 1,
+                    "routeId": "test-hlsl-dxbc",
+                    "inputFormat": "hlsl",
+                    "outputFormat": "dxbc",
+                    "toolId": "test-dxc",
+                    "operation": "compile",
+                    "toolConfigDigest": "1" * 64,
+                    "executableSha256": "2" * 64,
+                    "fixedFileHashes": {},
+                    "argumentTemplate": ["-T", "{profile}", "-O3"],
+                    "placeholders": ["profile"],
+                }
+            ],
+            "executionAuthority": False,
+            "evidenceOnly": True,
+        }
+        compiler_binding["bindingSha256"] = _canonical_hash(
+            compiler_binding, "bindingSha256"
+        )
         return {
             "schema": "renderdoc-ultra-shader-workspace-status/v1",
             "workspacePath": str(workspace),
@@ -214,11 +284,8 @@ class ActiveReplayProjectTests(unittest.TestCase):
             },
             "stage": "fragment",
             "entryPoint": "main",
-            "targetProfile": {
-                "kind": "DXBC",
-                "stage": "fragment",
-                "profile": "ps_5_0",
-            },
+            "targetProfile": target_profile,
+            "compilerBinding": compiler_binding,
             "source": {
                 "present": True,
                 "path": str(source_path),
@@ -234,6 +301,62 @@ class ActiveReplayProjectTests(unittest.TestCase):
                 "abiSha256": "a" * 64,
             },
         }
+
+    def _with_fully_validated_candidate(
+        self, status: dict, candidate_blob: bytes, *, revision: int = 5
+    ) -> dict:
+        workspace = Path(status["workspacePath"])
+        source_bytes = Path(status["source"]["path"]).read_bytes()
+        revision_dir = workspace / "revisions" / ("%04d" % revision)
+        revision_dir.mkdir(parents=True)
+        candidate_path = revision_dir / "shader.bin"
+        revision_source = revision_dir / "shader.hlsl"
+        candidate_path.write_bytes(candidate_blob)
+        revision_source.write_bytes(source_bytes)
+        report_path = revision_dir / "abi-report.json"
+        report_path.write_text('{"compatible":true}\n', encoding="utf-8")
+        fingerprint = fingerprint_bytes(candidate_blob)
+        self.assertIsNotNone(fingerprint)
+        latest = {
+            "revision": revision,
+            "blobPath": candidate_path.relative_to(workspace).as_posix(),
+            "sourcePath": revision_source.relative_to(workspace).as_posix(),
+            "sourceSha256": hashlib.sha256(source_bytes).hexdigest(),
+            "rawSha256": hashlib.sha256(candidate_blob).hexdigest(),
+            "codeSha256": fingerprint.code_sha256,
+            "byteSize": len(candidate_blob),
+            "kind": fingerprint.kind,
+            "validationScope": "replay-reflection-abi-compatible",
+            "requiresReplayAbiValidation": False,
+            "replayAbiValidated": True,
+            "abiCompatible": True,
+            "semanticEquivalenceVerified": False,
+            "abiGate": {
+                "status": "compatible",
+                "baselineAbiSha256": status["baseline"]["abiSha256"],
+                "candidateAbiSha256": "b" * 64,
+                "requestId": "c" * 64,
+                "reportPath": report_path.relative_to(workspace).as_posix(),
+                "reportSha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+            },
+        }
+        Path(status["manifestPath"]).write_text(
+            json.dumps({"revision": revision, "latestCompiled": latest}),
+            encoding="utf-8",
+        )
+        status.update(
+            {
+                "revision": revision,
+                "latestCompiled": {
+                    **latest,
+                    "candidateBlobPath": str(candidate_path.resolve()),
+                    "applied": False,
+                },
+                "replayAbiValidated": True,
+                "abiCompatible": True,
+            }
+        )
+        return status
 
     def test_first_use_creates_persistent_pending_workspace(self) -> None:
         first = self._pending()
@@ -255,6 +378,288 @@ class ActiveReplayProjectTests(unittest.TestCase):
         ):
             self.assertTrue(Path(first["paths"][key]).is_dir())
         self.assertTrue(self.state_path.is_file())
+
+    def test_selection_lock_persists_pid_creation_identity_and_releases_exact_owner(
+        self,
+    ) -> None:
+        lock_path = self.service._selection_lock_path
+        with active_projects_module._exclusive_lock(lock_path, "test selection"):
+            value = json.loads(lock_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                active_projects_module.EXCLUSIVE_PROJECT_LOCK_SCHEMA,
+                value["schema"],
+            )
+            self.assertEqual(os.getpid(), value["ownerPid"])
+            self.assertTrue(value["processStartIdentity"])
+            self.assertRegex(value["token"], r"^[0-9a-f]{32}$")
+        self.assertFalse(lock_path.exists())
+
+    def test_live_structured_selection_lock_is_never_stolen(self) -> None:
+        self._pending()
+        lock_path = self.service._selection_lock_path
+        raw = self._selection_lock_payload()
+        lock_path.write_bytes(raw)
+        with mock.patch.object(
+            active_projects_module,
+            "_process_lock_owner_state",
+            return_value=("alive", "windows-filetime:0000000000001234"),
+        ):
+            with self.assertRaisesRegex(
+                ActiveProjectError, "owner could not be proven inactive"
+            ):
+                self.service.status()
+        self.assertEqual(raw, lock_path.read_bytes())
+
+    def test_unknown_structured_selection_lock_owner_stays_fail_closed(self) -> None:
+        self._pending()
+        lock_path = self.service._selection_lock_path
+        raw = self._selection_lock_payload()
+        lock_path.write_bytes(raw)
+        with mock.patch.object(
+            active_projects_module,
+            "_process_lock_owner_state",
+            return_value=("unknown", ""),
+        ):
+            with self.assertRaisesRegex(
+                ActiveProjectError, "owner could not be proven inactive"
+            ):
+                self.service.status()
+        self.assertEqual(raw, lock_path.read_bytes())
+
+    def test_dead_structured_selection_lock_is_recovered(self) -> None:
+        self._pending()
+        lock_path = self.service._selection_lock_path
+        owner_pid = 424242
+        lock_path.write_bytes(self._selection_lock_payload(owner_pid=owner_pid))
+        real_probe = active_projects_module._process_lock_owner_state
+
+        def probe(pid: int) -> tuple[str, str]:
+            if pid == owner_pid:
+                return "dead", ""
+            return real_probe(pid)
+
+        with mock.patch.object(
+            active_projects_module, "_process_lock_owner_state", side_effect=probe
+        ):
+            status = self.service.status()
+        self.assertEqual("Example Game Project", status["name"])
+        self.assertFalse(lock_path.exists())
+        self.assertEqual(
+            [], list(lock_path.parent.glob(lock_path.name + ".recovered-*"))
+        )
+
+    def test_reused_pid_structured_selection_lock_is_recovered(self) -> None:
+        self._pending()
+        lock_path = self.service._selection_lock_path
+        owner_pid = 424242
+        lock_path.write_bytes(
+            self._selection_lock_payload(
+                owner_pid=owner_pid,
+                process_identity="windows-filetime:0000000000001234",
+            )
+        )
+        real_probe = active_projects_module._process_lock_owner_state
+
+        def probe(pid: int) -> tuple[str, str]:
+            if pid == owner_pid:
+                return "alive", "windows-filetime:0000000000005678"
+            return real_probe(pid)
+
+        with mock.patch.object(
+            active_projects_module, "_process_lock_owner_state", side_effect=probe
+        ):
+            status = self.service.status()
+        self.assertEqual("Example Game Project", status["name"])
+        self.assertFalse(lock_path.exists())
+
+    def test_crashed_child_structured_lock_is_recovered_from_real_os_identity(
+        self,
+    ) -> None:
+        lock_path = self.root / "crashed-child.lock"
+        module_root = Path(active_projects_module.__file__).resolve().parents[1]
+        child_code = """
+import pathlib
+import sys
+import time
+from src import active_projects
+with active_projects._exclusive_lock(pathlib.Path(sys.argv[1]), "child test"):
+    time.sleep(60)
+"""
+        environment = dict(os.environ)
+        prior_python_path = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = str(module_root) + (
+            os.pathsep + prior_python_path if prior_python_path else ""
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-c", child_code, str(lock_path)],
+            cwd=str(module_root),
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5.0
+            while not lock_path.exists() and time.monotonic() < deadline:
+                if child.poll() is not None:
+                    break
+                time.sleep(0.02)
+            if not lock_path.exists():
+                unused_stdout, stderr = child.communicate(timeout=2.0)
+                self.fail("child did not publish its lock: %s" % stderr)
+            value = json.loads(lock_path.read_text(encoding="utf-8"))
+            # A Windows virtual-environment redirector may spawn the real
+            # interpreter, so Popen.pid can identify the redirector rather
+            # than the process which actually acquired the lock.  Exercise
+            # recovery against the OS identity sealed into the lock itself.
+            owner_pid = value["ownerPid"]
+            owner_state, owner_identity = (
+                active_projects_module._process_lock_owner_state(owner_pid)
+            )
+            self.assertEqual("alive", owner_state)
+            self.assertEqual(value["processStartIdentity"], owner_identity)
+            os.kill(owner_pid, signal.SIGTERM)
+            child.wait(timeout=10.0)
+            self.assertTrue(lock_path.exists())
+            with active_projects_module._exclusive_lock(
+                lock_path, "child crash recovery"
+            ):
+                replacement = json.loads(lock_path.read_text(encoding="utf-8"))
+                self.assertEqual(os.getpid(), replacement["ownerPid"])
+            self.assertFalse(lock_path.exists())
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10.0)
+            if child.stderr is not None:
+                child.stderr.close()
+
+    def test_unverifiable_identity_scheme_stays_fail_closed(self) -> None:
+        self._pending()
+        lock_path = self.service._selection_lock_path
+        raw = self._selection_lock_payload(
+            process_identity="process-local:" + "b" * 32
+        )
+        lock_path.write_bytes(raw)
+        with mock.patch.object(
+            active_projects_module,
+            "_process_lock_owner_state",
+            return_value=("alive", "windows-filetime:0000000000005678"),
+        ):
+            with self.assertRaisesRegex(
+                ActiveProjectError, "owner could not be proven inactive"
+            ):
+                self.service.status()
+        self.assertEqual(raw, lock_path.read_bytes())
+
+    def test_invalid_structured_identity_never_authorises_recovery(self) -> None:
+        self._pending()
+        lock_path = self.service._selection_lock_path
+        raw = self._selection_lock_payload(
+            process_identity="windows-filetime:not-a-filetime"
+        )
+        lock_path.write_bytes(raw)
+        with mock.patch.object(
+            active_projects_module,
+            "_process_lock_owner_state",
+            return_value=("alive", "windows-filetime:0000000000005678"),
+        ):
+            with self.assertRaisesRegex(
+                ActiveProjectError, "owner could not be proven inactive"
+            ):
+                self.service.status()
+        self.assertEqual(raw, lock_path.read_bytes())
+
+    def test_duplicate_structured_lock_keys_never_authorise_recovery(self) -> None:
+        self._pending()
+        lock_path = self.service._selection_lock_path
+        raw = self._selection_lock_payload().replace(
+            b'"ownerPid":424242,', b'"ownerPid":424242,"ownerPid":31337,'
+        )
+        lock_path.write_bytes(raw)
+        with mock.patch.object(
+            active_projects_module,
+            "_process_lock_owner_state",
+            return_value=("dead", ""),
+        ):
+            with self.assertRaisesRegex(
+                ActiveProjectError, "owner could not be proven inactive"
+            ):
+                self.service.status()
+        self.assertEqual(raw, lock_path.read_bytes())
+
+    def test_corrupt_structured_lock_hash_never_authorises_recovery(self) -> None:
+        self._pending()
+        lock_path = self.service._selection_lock_path
+        raw = self._selection_lock_payload().replace(
+            b"2026-08-28T00:00:00Z", b"2026-08-29T00:00:00Z"
+        )
+        lock_path.write_bytes(raw)
+        with mock.patch.object(
+            active_projects_module,
+            "_process_lock_owner_state",
+            return_value=("dead", ""),
+        ):
+            with self.assertRaisesRegex(
+                ActiveProjectError, "owner could not be proven inactive"
+            ):
+                self.service.status()
+        self.assertEqual(raw, lock_path.read_bytes())
+
+    def test_legacy_token_selection_lock_is_preserved_even_when_old(self) -> None:
+        self._pending()
+        lock_path = self.service._selection_lock_path
+        raw = ("c" * 32 + "\r\n").encode("ascii")
+        lock_path.write_bytes(raw)
+        old = time.time() - 7 * 24 * 60 * 60
+        os.utime(lock_path, (old, old))
+        with self.assertRaisesRegex(
+            ActiveProjectError, "owner could not be proven inactive"
+        ):
+            self.service.status()
+        self.assertEqual(raw, lock_path.read_bytes())
+
+    def test_malformed_selection_lock_is_preserved(self) -> None:
+        self._pending()
+        lock_path = self.service._selection_lock_path
+        raw = b'{"schema":"damaged"}\n'
+        lock_path.write_bytes(raw)
+        with self.assertRaisesRegex(
+            ActiveProjectError, "owner could not be proven inactive"
+        ):
+            self.service.status()
+        self.assertEqual(raw, lock_path.read_bytes())
+
+    def test_lock_release_never_removes_a_replaced_owner_payload(self) -> None:
+        lock_path = self.service._selection_lock_path
+        replacement = self._selection_lock_payload(
+            owner_pid=31337,
+            process_identity="windows-filetime:0000000000005678",
+            token="d" * 32,
+        )
+        with active_projects_module._exclusive_lock(lock_path, "test selection"):
+            lock_path.write_bytes(replacement)
+        self.assertEqual(replacement, lock_path.read_bytes())
+
+    def test_atomic_lock_publish_failure_leaves_no_partial_authoritative_lock(
+        self,
+    ) -> None:
+        lock_path = self.service._selection_lock_path
+        publish_primitive = "rename" if os.name == "nt" else "link"
+        with mock.patch.object(
+            active_projects_module.os,
+            publish_primitive,
+            side_effect=OSError("simulated publish failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "simulated publish failure"):
+                with active_projects_module._exclusive_lock(
+                    lock_path, "test selection"
+                ):
+                    self.fail("lock body must not run")
+        self.assertFalse(lock_path.exists())
+        self.assertEqual(
+            [], list(lock_path.parent.glob(".*.pending-*"))
+        )
 
     def test_launcher_project_library_lists_activates_and_tracks_rdc_references(self) -> None:
         captures = self.root / "external-captures"
@@ -1049,6 +1454,9 @@ class ActiveReplayProjectTests(unittest.TestCase):
         workspace_status = self._workspace_status(
             "workspace-a", capture_a, shader_a
         )
+        self._with_fully_validated_candidate(
+            workspace_status, _dxbc(b"validated edited program")
+        )
         registered = self.service.register_workspace(workspace_status)
         self.assertEqual(len(registered["flowchartArtifacts"]), 1)
         self.assertFalse(
@@ -1113,6 +1521,11 @@ class ActiveReplayProjectTests(unittest.TestCase):
         match = plan["matches"][0]
         source = match["workspaceCandidates"][0]
         self.assertTrue(source["sourceSeedEligible"])
+        self.assertTrue(source["binaryCandidateEligible"])
+        self.assertFalse(source["compileRequired"])
+        self.assertTrue(source["freshCompileMayBeSkipped"])
+        self.assertTrue(source["freshCaptureRebindRequired"])
+        self.assertTrue(source["liveAbiRevalidationRequired"])
         self.assertEqual(len(source["flowchartCandidates"]), 1)
         flowchart = source["flowchartCandidates"][0]
         self.assertTrue(Path(flowchart["path"]).is_file())
@@ -1126,16 +1539,483 @@ class ActiveReplayProjectTests(unittest.TestCase):
             kinds,
             {
                 "seed-reviewed-hlsl",
+                "load-verified-compiled-shader-candidate",
                 "load-verified-alias-candidate",
                 "list-material-value-candidate",
             },
         )
+        binary_step = next(
+            item
+            for item in plan["preparationSteps"]
+            if item["kind"] == "load-verified-compiled-shader-candidate"
+        )
+        self.assertTrue(Path(binary_step["artifactPath"]).is_file())
+        self.assertEqual(
+            binary_step["compilerBindingSha256"],
+            workspace_status["compilerBinding"]["bindingSha256"],
+        )
+        self.assertTrue(binary_step["freshCompileMayBeSkipped"])
+        self.assertTrue(binary_step["requiresFreshCaptureRebind"])
+        self.assertTrue(binary_step["requiresFreshLiveAbiValidation"])
+        self.assertFalse(binary_step["oldReplacementIdReused"])
+        self.assertFalse(binary_step["oldCaptureAbiAuthorityReused"])
         self.assertFalse(plan["activeProjectPolicy"]["physicalMutationAutoApply"])
         self.assertFalse(plan["activeProjectPolicy"]["aiProvisionalAutoApply"])
+        self.assertTrue(
+            plan["activeProjectPolicy"]["verifiedBinaryCandidateMaySkipCompile"]
+        )
 
         fetched = self.service.future_frame_plan(capture_b)
         self.assertFalse(fetched["blocked"])
-        self.assertEqual(len(fetched["preparationSteps"]), 3)
+        self.assertEqual(len(fetched["preparationSteps"]), 4)
+
+    def _soft_reviewed_project_workspace(self) -> tuple[dict, dict, bytes]:
+        """Use real review/session/graph publication with offline compiler evidence."""
+        self._bound()
+        catalog, shader, capture_id = self._catalog(
+            "soft-graph", _dxbc(b"baseline program"), resource_id=132
+        )
+        self.service.import_capture(catalog)
+        status = self._workspace_status(
+            "soft-graph", capture_id, shader, flowchart=None
+        )
+        status["source"]["compileEligible"] = True
+        status["representation"] = {
+            "lane": "executable-editable", "compileEligible": True
+        }
+        root = Path(status["workspacePath"])
+        source_path = Path(status["source"]["path"])
+        baseline = source_path.read_bytes()
+        fixture = self
+
+        class WorkspaceService:
+            def status(self, workspace_path):
+                fixture.assertEqual(Path(workspace_path).resolve(), root.resolve())
+                status["source"]["currentSha256"] = hashlib.sha256(
+                    source_path.read_bytes()
+                ).hexdigest()
+                current = copy.deepcopy(status)
+                current["flowGraph"] = load_workspace_flow_graph_status(
+                    root, workspace_id=current["workspaceId"],
+                    source_sha256=current["source"]["currentSha256"],
+                    source_revision=current.get("revision", 0),
+                    source_path="source/shader.hlsl",
+                )
+                return current
+
+            def compile(self, workspace_path):
+                self.status(workspace_path)
+                source = source_path.read_bytes()
+                code = b"proposal program" if source != baseline else b"baseline program"
+                fixture._with_fully_validated_candidate(
+                    status, _dxbc(code, source), revision=status.get("revision", 0) + 1
+                )
+                return {**status["latestCompiled"], "workspacePath": str(root)}
+
+            def validate(self, workspace_path, revision, raw_sha256):
+                current = self.status(workspace_path)
+                fixture.assertEqual(current["revision"], revision)
+                fixture.assertEqual(current["latestCompiled"]["rawSha256"], raw_sha256)
+                abi = current["latestCompiled"]["abiGate"]
+                return {
+                    "workspacePath": str(root), "revision": revision,
+                    "requestId": abi["requestId"],
+                    "abiReportSha256": abi["reportSha256"],
+                    "compatible": True, "replayAbiValidated": True,
+                    "requiresReplayAbiValidation": False,
+                }
+
+        def reject_comparison(unused_workspace, baseline_candidate, proposal_candidate):
+            return {
+                "schema": "renderdoc-ai-shader-organization-observation/v1",
+                "scope": "captured-event-output", "accepted": False,
+                "baselineCandidateRawSha256": baseline_candidate["rawSha256"],
+                "candidateRawSha256": proposal_candidate["rawSha256"],
+                "baselineSourceSha256": baseline_candidate["sourceSha256"],
+                "candidateSourceSha256": proposal_candidate["sourceSha256"],
+                "metrics": {"maxAbsoluteError": 1.0},
+                "tolerances": {"absolute": 0.00001, "relative": 0.001},
+                "sampleCount": 256, "semanticEquivalenceVerified": False,
+                "replayRestored": True,
+            }
+
+        workspace_service = WorkspaceService()
+        manager = ShaderOrganizationManager(
+            lambda: workspace_service, workspace_service.validate, reject_comparison
+        )
+        with mock.patch.dict(os.environ, {"REPLAYLAB_REVIEW_MAX_ROUNDS": "1"}):
+            opened = manager.begin(str(root), {"schema": "test-semantic-context/v1"})
+            Path(opened["proposalSourcePath"]).write_bytes(
+                b"float4 main() : SV_Target { return float4(0, 1, 0, 1); }\n"
+            )
+            analysis = analysis_template()
+            analysis.update(
+                overview="Returns one render target.",
+                computation=["The entry point returns a constant color."],
+                outputs=["Declared color output."],
+                observedFacts=[{"claim": "The source has a pixel entry point.",
+                                "evidence": "source:main"}],
+                inferences=[],
+            )
+            text, issues = render_analysis_fields(analysis)
+            self.assertEqual(issues, [])
+            Path(opened["analysisPath"]).write_text(text, encoding="utf-8")
+            reviewed = manager.review(str(root), opened["organizationId"])
+        current = workspace_service.status(str(root))
+        self.assertEqual(manager.validate_publication_gate(str(root), current), reviewed["gate"])
+        self.assertEqual(reviewed["gate"]["decision"], "soft-accepted-baseline")
+        self.assertFalse(reviewed["gate"]["observation"]["accepted"])
+        return current, reviewed, baseline
+
+    def test_host_soft_baseline_flow_graph_registers_as_project_navigation(self) -> None:
+        status, reviewed, baseline = self._soft_reviewed_project_workspace()
+        source_path = Path(status["source"]["path"])
+        graph_path = Path(reviewed["flowGraphPath"])
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        gate = reviewed["gate"]
+        self.assertEqual(source_path.read_bytes(), baseline)
+        self.assertNotEqual(gate["finalSourceSha256"], gate["proposalSourceSha256"])
+        self.assertNotEqual(gate["finalCodeSha256"], gate["organizedCodeSha256"])
+        self.assertEqual(graph["origin"], "recovered-baseline")
+        self.assertEqual(graph["sourceSha256"], hashlib.sha256(baseline).hexdigest())
+        self.assertEqual(graph["sourceSha256"], gate["baselineSourceSha256"])
+        self.assertEqual(graph["sourceRevision"], status["revision"])
+        self.assertEqual(graph["sourceRevision"], gate["finalBinding"]["revision"])
+
+        registered = self.service.register_workspace(status)
+
+        knowledge = registered["knowledge"]
+        self.assertEqual(knowledge["sourceSha256"], graph["sourceSha256"])
+        self.assertEqual(knowledge["compiledCandidate"]["sourceRevision"], graph["sourceRevision"])
+        self.assertEqual(len(registered["flowGraphArtifacts"]), 1)
+        record = registered["flowGraphArtifacts"][0]
+        published = Path(self.service.status()["projectRoot"]) / record["artifactPath"]
+        self.assertEqual(published.read_bytes(), graph_path.read_bytes())
+        self.assertEqual(record["artifactSha256"], gate["flowGraphSha256"])
+        self.assertTrue(record["policy"]["explanatoryOnly"])
+        self.assertFalse(record["policy"]["physicalEvidence"])
+        self.assertFalse(record["policy"]["applyAuthorization"])
+
+    def test_host_soft_baseline_flow_graph_rejects_contradictory_publication(self) -> None:
+        status, reviewed, unused_baseline = self._soft_reviewed_project_workspace()
+        gate_path = Path(reviewed["gatePath"])
+        graph_path = Path(reviewed["flowGraphPath"])
+        graph = json.loads(graph_path.read_text(encoding="utf-8"))
+        gate = reviewed["gate"]
+        cases = [
+            ("graph", ("origin",), "organized-proposal"),
+            ("graph", ("sourceSha256",), gate["proposalSourceSha256"]),
+            ("graph", ("sourceRevision",), status["revision"] - 1),
+            ("gate", ("decision",), "rejected"),
+            ("gate", ("baselineSourceSha256",), gate["proposalSourceSha256"]),
+            ("gate", ("finalSourceSha256",), gate["proposalSourceSha256"]),
+            ("gate", ("finalCodeSha256",), gate["organizedCodeSha256"]),
+            ("gate", ("rawRecoveryCompiledAndAbiValidated",), False),
+            ("gate", ("baselineCompiledAndAbiValidated",), False),
+            ("gate", ("organizedCompiledAndAbiValidated",), False),
+            ("gate", ("organizedSourcePromoted",), True),
+            ("gate", ("softPublishAllowed",), False),
+            ("gate", ("equivalenceLevel",), "observational-pass"),
+            ("gate", ("codeSha256Equal",), True),
+            ("gate", ("verdict", "budgetExhausted"), False),
+            ("gate", ("verdict", "maxRounds"), 2),
+            ("gate", ("verdict", "roundsLeft"), 1),
+            ("gate", ("verdict", "accepted"), True),
+            ("gate", ("verdict", "softAccepted"), False),
+            ("gate", ("verdict", "level"), "exact-code"),
+            ("gate", ("verdict", "reasons"), [{"severity": "blocker"}]),
+            ("gate", ("finalBinding", "sourceSha256"), gate["proposalSourceSha256"]),
+            ("gate", ("finalBinding", "abiRequestId"), "f" * 64),
+            ("status", ("latestCompiled", "replayAbiValidated"), False),
+            ("status", ("latestCompiled", "abiCompatible"), False),
+            ("status", ("latestCompiled", "requiresReplayAbiValidation"), True),
+            ("status", ("latestCompiled", "abiGate", "status"), "incompatible"),
+            ("status", ("latestCompiled", "abiGate", "reportSha256"), "f" * 64),
+        ]
+        for target, path, value in cases:
+            with self.subTest(target=target, field=".".join(path)):
+                values = {"graph": copy.deepcopy(graph), "gate": copy.deepcopy(gate),
+                          "status": copy.deepcopy(status)}
+                edited = values[target]
+                for key in path[:-1]:
+                    edited = edited[key]
+                edited[path[-1]] = value
+                # Keep artifact hashes/projections consistent so rejection
+                # exercises the baseline contract rather than stale bytes.
+                changed_graph = values["graph"]
+                material = {key: item for key, item in changed_graph.items()
+                            if key != "generatedAt"}
+                changed_graph["graphId"] = _canonical_hash(material, "graphId")[:32]
+                validate_shader_flow_graph(changed_graph)
+                graph_path.write_text(json.dumps(changed_graph), encoding="utf-8")
+                digest = hashlib.sha256(graph_path.read_bytes()).hexdigest()
+                values["status"]["flowGraph"].update(
+                    changed_graph, artifactSha256=digest
+                )
+                values["gate"].update(flowGraphId=changed_graph["graphId"], flowGraphSha256=digest)
+                gate_path.write_text(json.dumps(values["gate"]), encoding="utf-8")
+                with mock.patch.object(self.service, "replay_service") as base_service:
+                    with self.assertRaisesRegex(ActiveProjectError, "Shader flow graph"):
+                        self.service.register_workspace(values["status"])
+                    base_service.assert_not_called()
+
+    def test_reviewed_shader_flow_graph_is_content_addressed_by_knowledge(self) -> None:
+        self._bound()
+        blob_a = _dxbc(b"same graph program", b"frame-a graph reflection")
+        blob_b = _dxbc(b"same graph program", b"frame-b graph reflection")
+        catalog_a, shader_a, capture_a = self._catalog(
+            "graph-a", blob_a, resource_id=131
+        )
+        catalog_b, unused_shader_b, capture_b = self._catalog(
+            "graph-b", blob_b, resource_id=913
+        )
+        self.service.import_capture(catalog_a)
+        status = self._workspace_status("workspace-graph", capture_a, shader_a)
+        self._with_fully_validated_candidate(
+            status, _dxbc(b"validated graph program")
+        )
+        source_path = Path(status["source"]["path"])
+        source = source_path.read_bytes().decode("utf-8")
+        graph = build_shader_flow_graph(
+            source,
+            workspace_id=status["workspaceId"],
+            source_path="source/shader.hlsl",
+            source_sha256=status["source"]["currentSha256"],
+            source_revision=status["revision"],
+            stage=status["stage"],
+            entry_point=status["entryPoint"],
+            generated_at="2026-08-31T00:00:00Z",
+            origin="organized-proposal",
+            descriptions={"main": "Produces the final render-target color."},
+        )
+        graph_path = Path(status["workspacePath"]) / "ai" / "flow-graph.json"
+        graph_path.write_text(json.dumps(graph), encoding="utf-8")
+        graph_sha256 = hashlib.sha256(graph_path.read_bytes()).hexdigest()
+        status["flowGraph"] = {
+            **graph,
+            "available": True,
+            "status": "current",
+            "stale": False,
+            "artifactPath": str(graph_path),
+            "artifactSha256": graph_sha256,
+        }
+        (graph_path.parent / "organize-code-gate.json").write_text(
+            json.dumps(
+                {
+                    "schema": "renderdoc-ai-shader-organization-gate/v1",
+                    "schemaVersion": 1,
+                    "requestedTransformation": "organize-only",
+                    "decision": "accepted-executable-editable",
+                    "safeToStartLiveEdit": True,
+                    "replayApplied": False,
+                    "workspaceId": status["workspaceId"],
+                    "finalSourceSha256": status["source"]["currentSha256"],
+                    "finalRevision": status["revision"],
+                    "flowGraphId": graph["graphId"],
+                    "flowGraphSha256": graph_sha256,
+                    "flowGraphArtifactPath": str(graph_path),
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            active_projects_module,
+            "read_json_object",
+            side_effect=AssertionError(
+                "flow graph publication must validate its published bytes"),
+        ):
+            prepared = self.service._read_shader_flow_graph(status)
+        self.assertEqual(prepared[0], graph_path.read_bytes())
+        self.assertEqual(prepared[1], graph_sha256)
+        gate_path = graph_path.parent / "organize-code-gate.json"
+        gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        gate["flowGraphSha256"] = "0" * 64
+        gate_path.write_text(json.dumps(gate), encoding="utf-8")
+        with self.assertRaisesRegex(
+            ActiveProjectError, "organization gate does not bind"
+        ):
+            self.service._read_shader_flow_graph(status)
+        gate["flowGraphSha256"] = graph_sha256
+        gate_path.write_text(json.dumps(gate), encoding="utf-8")
+
+        registered = self.service.register_workspace(status)
+
+        self.assertEqual(len(registered["flowGraphArtifacts"]), 1)
+        record = registered["flowGraphArtifacts"][0]
+        self.assertEqual(record["kind"], "shader-flow-graph")
+        self.assertTrue(record["policy"]["explanatoryOnly"])
+        self.assertFalse(record["policy"]["physicalEvidence"])
+        project_root = Path(self.service.status()["projectRoot"])
+        published_graph = project_root / record["artifactPath"]
+        self.assertEqual(published_graph.read_bytes(), graph_path.read_bytes())
+
+        imported = self.service.import_capture(catalog_b)
+        candidate = imported["reusePlan"]["matches"][0][
+            "workspaceCandidates"
+        ][0]
+        self.assertEqual(len(candidate["flowGraphCandidates"]), 1)
+        projected = candidate["flowGraphCandidates"][0]
+        self.assertEqual(projected["kind"], "shader-flow-graph")
+        self.assertEqual(Path(projected["path"]), published_graph)
+        self.assertEqual(projected["sha256"], record["artifactSha256"])
+        self.assertFalse(projected["applyAuthorization"])
+
+    def test_applied_user_edit_publishes_current_source_without_old_ai_gate(self) -> None:
+        from src import project_restore, server
+
+        self._bound()
+        original = _dxbc(b"editable original", b"origin reflection")
+        catalog, shader, capture_id = self._catalog(
+            "applied-edit-origin", original, resource_id=181
+        )
+        self.service.import_capture(catalog)
+        status = self._workspace_status("applied-edit", capture_id, shader)
+        self._with_fully_validated_candidate(status, _dxbc(b"reviewed program"))
+        first = self.service.register_workspace(status)
+        old_knowledge = first["knowledge"]
+        workspace = Path(status["workspacePath"])
+        source_path = Path(status["source"]["path"])
+        edited_source = b"float4 main() : SV_Target { return float4(0, 1, 0, 1); }\n"
+        source_path.write_bytes(edited_source)
+        status["source"]["currentSha256"] = hashlib.sha256(edited_source).hexdigest()
+        self._with_fully_validated_candidate(
+            status, _dxbc(b"deliberately changed user program"), revision=6
+        )
+        # These files are deliberately stale: user editing must neither read
+        # their old organization authorization nor attach them to the new head.
+        graph_path = workspace / "ai" / "flow-graph.json"
+        graph_path.write_text('{"stale": true}', encoding="utf-8")
+        (workspace / "ai" / "organize-code-gate.json").write_text(
+            '{"stale": true}', encoding="utf-8"
+        )
+        watch_lock = workspace / ".workspace-watch.lock"
+        watch_lock.write_text("a" * 32 + "\n", encoding="utf-8")
+
+        class WorkspaceService:
+            def status(self, unused_path):
+                return copy.deepcopy(status)
+
+        active = self.service.status()
+        with self.service.pin_active_project(active["workspaceId"], active["projectRoot"]):
+            with mock.patch.object(
+                server, "_shader_organization_manager",
+                side_effect=AssertionError("user edit must not repeat AI organization"),
+            ):
+                published = project_restore._register_applied_workspace_with_readback(
+                    self.service, WorkspaceService(), workspace, copy.deepcopy(status)
+                )
+        knowledge = published["knowledge"]
+        self.assertNotEqual(knowledge["knowledgeId"], old_knowledge["knowledgeId"])
+        self.assertEqual(knowledge["sourceSha256"], hashlib.sha256(edited_source).hexdigest())
+        self.assertEqual(knowledge["compiledCandidate"]["sourceRevision"], 6)
+        self.assertFalse(knowledge.get("analysisSha256"))
+        self.assertEqual(published["flowchartArtifacts"], [])
+        self.assertEqual(published["flowGraphArtifacts"], [])
+        self.assertTrue(watch_lock.is_file())
+        self.assertTrue(graph_path.is_file())
+        self.assertEqual(self.service.get_workspace_knowledge(old_knowledge["knowledgeId"]), old_knowledge)
+
+        other_catalog, unused_shader, unused_capture = self._catalog(
+            "applied-edit-other-rdc",
+            _dxbc(b"editable original", b"different capture reflection"),
+            resource_id=9181,
+        )
+        plan = self.service.import_capture(other_catalog)["reusePlan"]
+        candidate = plan["matches"][0]["workspaceCandidates"][0]
+        self.assertEqual(candidate["knowledgeId"], knowledge["knowledgeId"])
+        self.assertEqual(candidate["sourceSha256"], knowledge["sourceSha256"])
+        self.assertTrue(candidate["freshCaptureRebindRequired"])
+        self.assertTrue(candidate["liveAbiRevalidationRequired"])
+        self.assertEqual(candidate["flowchartCandidates"], [])
+        self.assertEqual(candidate["flowGraphCandidates"], [])
+
+    def test_applied_publication_rejects_changed_source_before_project_write(self) -> None:
+        self._bound()
+        catalog, shader, capture_id = self._catalog(
+            "applied-race", _dxbc(b"race baseline"), resource_id=182
+        )
+        self.service.import_capture(catalog)
+        status = self._workspace_status("applied-race-workspace", capture_id, shader)
+        self._with_fully_validated_candidate(status, _dxbc(b"race validated program"))
+        first = self.service.register_workspace(status)
+        Path(status["source"]["path"]).write_text(
+            "// a newer save that has never been compiled\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ActiveProjectError, "current source"):
+            self.service.register_workspace(status, include_explanatory=False)
+        self.assertEqual(
+            self.service.replay_service().status()["knowledgeCounts"]["workspaces"], 1
+        )
+        self.assertEqual(
+            self.service.get_workspace_knowledge(first["knowledge"]["knowledgeId"]),
+            first["knowledge"],
+        )
+
+    def test_applied_publication_requires_abi_candidate_and_preserves_head_cas(self) -> None:
+        self._bound()
+        catalog, shader, capture_id = self._catalog(
+            "applied-cas", _dxbc(b"cas baseline"), resource_id=183
+        )
+        self.service.import_capture(catalog)
+        status = self._workspace_status("applied-cas-workspace", capture_id, shader)
+        with self.assertRaisesRegex(ActiveProjectError, "ABI-validated"):
+            self.service.register_workspace(status, include_explanatory=False)
+        self._with_fully_validated_candidate(status, _dxbc(b"cas first program"))
+        first = self.service.register_workspace(status)
+        Path(status["source"]["path"]).write_text(
+            "float4 main() : SV_Target { return 0; }\n", encoding="utf-8"
+        )
+        status["source"]["currentSha256"] = hashlib.sha256(
+            Path(status["source"]["path"]).read_bytes()
+        ).hexdigest()
+        self._with_fully_validated_candidate(status, _dxbc(b"cas second program"), revision=6)
+        second = self.service.register_workspace(
+            status, include_explanatory=False, expected_head=first["head"]
+        )
+        self.assertGreater(second["head"]["generation"], first["head"]["generation"])
+        with self.assertRaisesRegex(ActiveProjectError, "compare-and-swap conflict"):
+            self.service.register_workspace(
+                status, include_explanatory=False, expected_head=first["head"]
+            )
+
+    def test_shader_flow_graph_must_bind_current_workspace_source(self) -> None:
+        self._bound()
+        catalog, shader, capture_id = self._catalog(
+            "bad-graph-binding", _dxbc(), resource_id=132
+        )
+        self.service.import_capture(catalog)
+        status = self._workspace_status(
+            "workspace-bad-graph-binding", capture_id, shader
+        )
+        self._with_fully_validated_candidate(
+            status, _dxbc(b"validated bad graph program")
+        )
+        source_path = Path(status["source"]["path"])
+        source = source_path.read_bytes().decode("utf-8")
+        other_source = source + "// unbound graph source\n"
+        graph = build_shader_flow_graph(
+            other_source,
+            workspace_id=status["workspaceId"],
+            source_path="source/shader.hlsl",
+            source_sha256=hashlib.sha256(other_source.encode("utf-8")).hexdigest(),
+            source_revision=status["revision"],
+            stage=status["stage"],
+            entry_point=status["entryPoint"],
+            generated_at="2026-08-31T00:00:00Z",
+            origin="organized-proposal",
+        )
+        graph_path = Path(status["workspacePath"]) / "ai" / "flow-graph.json"
+        graph_path.write_text(json.dumps(graph), encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            ActiveProjectError, "belongs to different source bytes"
+        ):
+            self.service.register_workspace(status)
+
+        self.assertEqual(
+            self.service.replay_service().status()["knowledgeCounts"]["workspaces"],
+            0,
+        )
 
     def test_invalid_flowchart_is_rejected_before_workspace_registration(self) -> None:
         self._bound()

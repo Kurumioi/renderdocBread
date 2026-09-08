@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import unittest
+import subprocess
+import tempfile
+from pathlib import Path
 
 from src.shader_workspace.adapters.dxil_access_signature import (
     DxilCBufferAccess,
     DxilCBufferAccessBlock,
     DxilCBufferAccessSignature,
+    extract_dxil_cbuffer_access_signature,
 )
 from src.shader_workspace.adapters.hlsl_cbuffer_abi_repair import (
     HlslCBufferAbiRepairError,
@@ -91,6 +95,48 @@ float4 MainPS() : SV_Target0
 
 
 class HlslCBufferAbiRepairTests(unittest.TestCase):
+    def test_dynamic_umin_add_repair_round_trips_through_real_dxc(self) -> None:
+        dxc = Path(__file__).parents[3] / "x64/Development/replaylab/tools/dxc.exe"
+        if not dxc.is_file():
+            self.skipTest("bundled DXC is unavailable")
+        baseline_source = """cbuffer B : register(b0, space0) {
+float4 Values[8] : packoffset(c0); float Tail : packoffset(c8.x);
+};
+float4 MainPS(nointerpolation uint inputIndex : TEXCOORD0) : SV_Target0 {
+return Values[min(inputIndex, 7u)] + Tail;
+}
+"""
+        lowered = """cbuffer B : register(b0, space0) { float4 Raw[9] : packoffset(c0); };
+float4 MainPS(nointerpolation uint inputIndex : TEXCOORD0) : SV_Target0 {
+uint boundedIndex = min(inputIndex, 7u) + 0u;
+return Raw[boundedIndex] + Raw[8u].x;
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def compile_source(name: str, content: str):
+                path = root / (name + ".hlsl")
+                path.write_text(content, encoding="utf-8")
+                result = subprocess.run(
+                    [str(dxc), "-T", "ps_6_6", "-E", "MainPS", "-Fc", str(root / (name + ".ll")),
+                     "-Fo", str(root / (name + ".dxil")), str(path)], capture_output=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+                return extract_dxil_cbuffer_access_signature((root / (name + ".ll")).read_bytes())
+            original_access = compile_source("original", baseline_source)
+            repaired = repair_spirv_cross_hlsl_cbuffers(
+                lowered, baseline_constant_blocks=[baseline(0, 132)], dxil_access=original_access,
+            )
+            candidate_access = compile_source("candidate", repaired.hlsl)
+            self.assertEqual(original_access.signature_sha256, candidate_access.signature_sha256)
+            self.assertIn("switch (index)", repaired.hlsl)
+            self.assertEqual(candidate_access.block(0, 0).byte_size, 132)
+            with self.assertRaisesRegex(HlslCBufferAbiRepairError, "provably uint"):
+                repair_spirv_cross_hlsl_cbuffers(
+                    lowered.replace("uint inputIndex", "float inputIndex"),
+                    baseline_constant_blocks=[baseline(0, 132)], dxil_access=original_access,
+                )
+
     def test_repairs_current_odd_tails_and_integer_lanes_only(self) -> None:
         result = repair_spirv_cross_hlsl_cbuffers(
             CURRENT_SHAPE,

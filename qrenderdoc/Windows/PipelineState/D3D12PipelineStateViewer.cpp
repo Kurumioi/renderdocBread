@@ -622,6 +622,35 @@ ResourceId D3D12PipelineStateViewer::GetResource(RDTreeWidgetItem *item)
   return ResourceId();
 }
 
+bool D3D12PipelineStateViewer::GetTextureHistoryDetails(RDTreeWidgetItem *item,
+                                                        Subresource &subresource,
+                                                        CompType &typeCast)
+{
+  subresource = Subresource();
+
+  ResourceId resource = GetResource(item);
+  TextureDescription *tex = m_Ctx.GetTexture(resource);
+  if(tex == NULL)
+    return false;
+
+  typeCast = tex->format.compType;
+
+  QVariant tag = item->tag();
+  if(tag.canConvert<D3D12ViewTag>())
+  {
+    const Descriptor &descriptor = tag.value<D3D12ViewTag>().descriptor;
+    if(descriptor.resource == resource)
+    {
+      subresource.mip = descriptor.firstMip;
+      subresource.slice = descriptor.firstSlice;
+      typeCast = descriptor.format.compType;
+    }
+  }
+
+  subresource.sample = tex->msSamp > 1 ? TextureDisplay::ResolveSamples : 0;
+  return true;
+}
+
 void D3D12PipelineStateViewer::on_showUnused_toggled(bool checked)
 {
   setState();

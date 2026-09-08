@@ -46,6 +46,21 @@ public:
 
   QString CurrentContextJSON(QString *error = NULL) const;
   QString CurrentContextJSON(const QString &focusStage, QString *error) const;
+  // These entry points enqueue, inspect, or abandon an asynchronous replay-thread job. They must
+  // be called from the UI thread, like every other internal-integration call. The normal UI path
+  // calls Begin once and polls the returned result file with QFile, so replay-thread Python cannot
+  // stall the UI on the GIL. Poll and Abandon remain diagnostic/best-effort APIs and must not be
+  // used for real-time UI polling. JSON envelopes use replaylab-current-context-freeze-job/v1.
+  QString BeginCurrentContextFreezeJSON(const QString &focusStage = QString(),
+                                        QString *error = NULL) const;
+  QString BeginCurrentContextFreezeJSON(const QString &focusStage, qint64 expectedCurrentEventId,
+                                        qint64 expectedSelectedEventId,
+                                        const QString &expectedCaptureSessionId,
+                                        QString *error = NULL) const;
+  QString PollCurrentContextFreezeJSON(const QString &jobId, QString *error = NULL) const;
+  QString AbandonCurrentContextFreezeJSON(const QString &jobId, QString *error = NULL) const;
+  QString ValidateCurrentContextFreezeResultPath(const QString &jobId, const QString &resultPath,
+                                                 QString *error = NULL) const;
   QStringList AvailableShaderStages(QString *error = NULL) const;
 
 private:

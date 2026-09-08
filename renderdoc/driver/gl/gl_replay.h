@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include <memory>
 #include <unordered_map>
 #include "api/replay/renderdoc_replay.h"
 #include "core/core.h"
@@ -37,6 +38,8 @@ class IntelGlCounters;
 class WrappedOpenGL;
 struct GLCounterContext;
 class NVGLCounters;
+struct GLCheckpointBufferVersion;
+struct GLResource;
 
 struct GLPostVSData
 {
@@ -183,7 +186,7 @@ class GLReplay : public IReplayDriver
 {
 public:
   GLReplay(WrappedOpenGL *d);
-  virtual ~GLReplay() {}
+  virtual ~GLReplay();
   void SetProxy(bool p) { m_Proxy = p; }
   bool IsRemoteProxy() { return m_Proxy; }
   void Shutdown();
@@ -235,6 +238,10 @@ public:
 
   RDResult ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
   void ReplayLog(uint32_t endEventID, ReplayLogType replayType);
+  void ConfigureReplayCheckpoints(const ReplayCheckpointConfig &config,
+                                  const rdcarray<ReplayCheckpointCandidate> &candidates) override;
+  void InvalidateReplayCheckpoints(uint32_t firstAffectedEvent = 0) override;
+  ReplayCheckpointStats GetReplayCheckpointStats() override;
   SDFile *GetStructuredFile();
 
   rdcarray<uint32_t> GetPassEvents(uint32_t eventId);
@@ -273,6 +280,8 @@ public:
 
   void ReplaceResource(ResourceId from, ResourceId to);
   void RemoveReplacement(ResourceId id);
+  rdcstr ReplaceTargetShaderChecked(ResourceId from, ResourceId to);
+  rdcstr RemoveTargetShaderReplacementChecked(ResourceId id);
   void ClearReplayCache();
   void ReloadShaderDebugInformation();
 
@@ -292,7 +301,13 @@ public:
     // coming in.
     return {};
   }
-  rdcarray<ShaderEncoding> GetTargetShaderEncodings() { return {ShaderEncoding::GLSL}; }
+  rdcarray<ShaderEncoding> GetTargetShaderEncodings()
+  {
+    rdcarray<ShaderEncoding> encodings = {ShaderEncoding::GLSL};
+    if(HasExt[ARB_gl_spirv])
+      encodings.push_back(ShaderEncoding::OpenGLSPIRV);
+    return encodings;
+  }
   void BuildTargetShader(ShaderEncoding sourceEncoding, const bytebuf &source, const rdcstr &entry,
                          const ShaderCompileFlags &compileFlags, ShaderStage type, ResourceId &id,
                          rdcstr &errors);
@@ -336,12 +351,23 @@ public:
   ResourceId ApplyCustomShader(TextureDisplay &display);
 
   ResourceId CreateProxyTexture(const TextureDescription &templateTex);
+  ResourceId CreateProxyTextureSnapshot(const TextureDescription &templateTex);
+  bool SupportsProxyTextureSnapshots() { return true; }
   void SetProxyTextureData(ResourceId texid, const Subresource &sub, byte *data, size_t dataSize);
+  ResourceId CreateTextureSnapshot(ResourceId source, const Subresource &sourceSub,
+                                   CompType typeCast, Subresource &snapshotSub);
+  void FreeTextureSnapshot(ResourceId snapshot);
+  void FreeTextureSnapshots(const rdcarray<ResourceId> &snapshots);
   bool IsTextureSupported(const TextureDescription &tex);
   bool NeedRemapForFetch(const ResourceFormat &format);
 
   ResourceId CreateProxyBuffer(const BufferDescription &templateBuf);
   void SetProxyBufferData(ResourceId bufid, byte *data, size_t dataSize);
+  rdcstr SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches) override;
+  uint32_t GetReplayBufferPatchFirstAffectedEvent() const override
+  {
+    return m_ReplayPatchFirstAffectedEvent;
+  }
 
   RenderOutputSubresource GetRenderOutputSubresource(ResourceId id);
   bool IsRenderOutput(ResourceId id) { return GetRenderOutputSubresource(id).mip != ~0U; }
@@ -365,6 +391,30 @@ public:
   GLuint MakeShaderDebugSampleProg(const SamplingProgramConfig &config);
 
 private:
+  friend class WrappedOpenGL;
+  void TrackCheckpointBufferWrites(GLChunk chunk);
+  void ResetCheckpointBufferLineage();
+  void InvalidateCheckpointBufferVersion(const GLResource &buffer);
+  uint32_t m_ReplayPatchFirstAffectedEvent = 0;
+  uint32_t m_ReplayPatchAnchorEvent = 0;
+  struct ReplayCheckpoint;
+  bool PrepareReplayCheckpoints();
+  bool SaveReplayCheckpoint(uint32_t eventId);
+  bool RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint);
+  void ApplyCheckpointBindings(ReplayCheckpoint &checkpoint);
+  void UpdateCheckpointAccounting();
+  void EvictOldestCheckpoint();
+  uint64_t CheckpointStorageBytes(const ReplayCheckpoint *building, uint64_t &sharedBytes) const;
+  ReplayCheckpointConfig m_CheckpointConfig;
+  ReplayCheckpointStats m_CheckpointStats;
+  rdcarray<ReplayCheckpointCandidate> m_CheckpointCandidates;
+  std::map<uint32_t, std::unique_ptr<ReplayCheckpoint>> m_Checkpoints;
+  // Weak references never keep an evicted GPU allocation outside the checkpoint byte budget.
+  std::map<ResourceId, std::weak_ptr<GLCheckpointBufferVersion>> m_CheckpointBufferVersions;
+  uint64_t m_CheckpointUseSerial = 0;
+  bool m_CheckpointPrepared = false;
+  bool m_CheckpointPreparingFailed = false;
+
   void OpenGLFillCBufferVariables(ResourceId shader, GLuint prog, bool bufferBacked, rdcstr prefix,
                                   const rdcarray<ShaderConstant> &variables,
                                   rdcarray<ShaderVariable> &outvars, const bytebuf &data);
@@ -535,6 +585,7 @@ private:
   // cache the previous data returned
   ResourceId m_GetTexturePrevID;
   byte *m_GetTexturePrevData[16];
+  rdcarray<ResourceId> m_TextureSnapshots;
 
   GLuint CreateMeshProgram(GLuint vs, GLuint fs, GLuint gs = 0);
   void ConfigureTexDisplayProgramBindings(GLuint program);

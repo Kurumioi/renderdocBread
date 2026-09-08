@@ -649,6 +649,14 @@ struct VulkanCreationInfo
     uint64_t size;
     uint64_t gpuAddress;
     bool external;
+    bool sparse = false;
+
+    // Replay binding evidence for persistent byte-range edits. Do not infer aliases from usage:
+    // two views of the same allocation may never be accessed by the original shader.
+    ResourceId replayMemory;
+    uint64_t replayMemoryOffset = 0;
+    uint64_t replayMemorySize = 0;
+    bool replayPatchProtected = false;
 
     VkMemoryRequirements mrq;
 
@@ -681,6 +689,7 @@ struct VulkanCreationInfo
 
     bool linear;
     bool external;
+    bool sparse = false;
     bool cube;
     TextureCategory creationFlags;
 

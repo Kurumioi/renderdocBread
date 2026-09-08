@@ -689,6 +689,7 @@ void D3D12Replay::FlipOutputWindow(uint64_t id)
 
   m_pDevice->ExecuteLists();
   m_pDevice->FlushLists();
+  m_TextureDisplaySubmitPending = false;
 
   if(outw.swap)
   {

@@ -38,6 +38,19 @@ remain available without extra software. For compiler-aware HLSL, GLSL, or Slang
 integration uses LSP over a bounded, out-of-process connection and does not execute commands sent
 by a server.
 
+The Shader Workspace uses the same native editor. Declared variable and function names have
+distinct colours, and the identifier under the cursor highlights matching occurrences outside
+comments and strings. A diagnostic count below the editor jumps to its first reported location.
+Without a language server, live checks cover structural problems such as unmatched delimiters and
+unfinished strings; they do not provide full HLSL type or binding validation. Saving runs the
+workspace compiler and displays its actual diagnostics while keeping the last successful replacement.
+Diagnostics for an older saved revision are not underlined on newly edited text.
+
+The right-hand flow graph initially fits the available area without changing its aspect ratio.
+Resizing keeps that automatic fit until you zoom or pan. Manual views are retained when switching
+documents or refreshing the same graph. :guilabel:`Fit` restores automatic fitting and
+:guilabel:`100%` shows readable actual-size nodes with scrolling available.
+
 Pressing :kbd:`Ctrl-F` opens an inline search bar in the upper-right of the active source tab. Search
 results update while typing and show the current/total match count. :kbd:`Enter` or :kbd:`F3` moves
 forward, :kbd:`Shift-Enter` or :kbd:`Shift-F3` moves backward, :kbd:`Ctrl-H` expands replacement,

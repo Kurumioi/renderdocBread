@@ -20,7 +20,17 @@ from src.shader_workspace import (
     ToolConfigurationError,
     ToolExecutionError,
 )
-from src.shader_workspace.catalog import capture_identity
+from src.shader_workspace.catalog import capture_identity, normalize_stage
+from src.shader_workspace.toolchains import route_record, toolchain_document
+from src.shader_workspace.tools import ToolRegistry
+import src.shader_workspace.workspace as workspace_module
+
+
+class ShaderStageNormalizationTests(unittest.TestCase):
+    def test_task_and_ray_generation_aliases_are_canonical(self) -> None:
+        self.assertEqual(normalize_stage("amplification"), "task")
+        self.assertEqual(normalize_stage("raygeneration"), "raygen")
+        self.assertEqual(normalize_stage("ray generation"), "raygen")
 
 
 def make_dxbc(instructions: bytes = b"shader instructions") -> bytes:
@@ -88,6 +98,17 @@ elif mode == "decompile-self-tamper":
 elif mode == "decompile-timeout-tree":
     subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     time.sleep(60)
+elif mode == "disassemble-dxbc":
+    output_path.write_text(
+        "ps_5_0\n"
+        "dcl_globalFlags refactoringAllowed\n"
+        "dcl_output o0.xyzw\n"
+        "mov o0.xyzw, l(1.000000, 1.000000, 1.000000, 1.000000)\n"
+        "ret\n",
+        encoding="utf-8",
+    )
+elif mode == "assemble-dxbc":
+    shutil.copyfile(Path(sys.argv[4]), output_path)
 elif mode == "compile":
     baseline_path = Path(sys.argv[4])
     shutil.copyfile(baseline_path, output_path)
@@ -412,6 +433,65 @@ class ShaderWorkspaceTests(unittest.TestCase):
         )
         return service, workspace, created
 
+    def _dxbc_assembly_route_service(self) -> tuple[ShaderWorkspaceService, Path]:
+        document = json.loads(self.config.read_text(encoding="utf-8"))
+        script = str(self.fake_tool.resolve())
+        document["tools"]["dxbc-native"] = {
+            "executable": str(self.python_executable),
+            "executableSha256": self.python_sha256,
+            "fixedFileHashes": {script: self.fake_tool_sha256},
+            "decompile": {
+                "args": [script, "disassemble-dxbc", "{input}", "{output}"],
+                "timeoutSeconds": 10,
+            },
+            "compile": {
+                "args": [
+                    script,
+                    "assemble-dxbc",
+                    "{input}",
+                    "{output}",
+                    "{baseline}",
+                ],
+                "timeoutSeconds": 10,
+            },
+        }
+        self.config.write_text(json.dumps(document), encoding="utf-8")
+        registry = ToolRegistry(self.config)
+        routes = [
+            route_record(
+                registry,
+                route_id="test-portable-dxbc-disassembly",
+                tool_id="dxbc-native",
+                operation="decompile",
+                input_format="dxbc",
+                output_format="dxbc-asm",
+                stages=["fragment"],
+                fidelity="ir-disassembly",
+                priority=1,
+                implementation="fixture DXBC disassembler",
+                source_url="https://example.invalid/dxbc-disassembly",
+            ),
+            route_record(
+                registry,
+                route_id="test-portable-dxbc-assembly",
+                tool_id="dxbc-native",
+                operation="compile",
+                input_format="dxbc-asm",
+                output_format="dxbc",
+                stages=["fragment"],
+                fidelity="ir-assembly",
+                priority=1,
+                implementation="fixture DXBC assembler",
+                source_url="https://example.invalid/dxbc-assembly",
+            ),
+        ]
+        routes_path = self.root / "shader-toolchains.v1.json"
+        routes_path.write_text(
+            json.dumps(toolchain_document(self.config, routes, [])),
+            encoding="utf-8",
+        )
+        return ShaderWorkspaceService(self.config, routes_path), routes_path
+
     def test_create_decompile_compile_records_auditable_candidate(self) -> None:
         service, workspace, created = self._create("workspace-good")
         self.assertEqual(created["baselineRawSha256"], self.key.raw_sha256)
@@ -444,7 +524,138 @@ class ShaderWorkspaceTests(unittest.TestCase):
         self.assertEqual(
             [item["status"] for item in manifest["history"]], ["succeeded", "succeeded"]
         )
+
+    def test_status_exports_portable_dxbc_disassembly_as_display_evidence(
+        self,
+    ) -> None:
+        service, unused_routes = self._dxbc_assembly_route_service()
+        workspace = self.root / "workspace-portable-dxbc-disassembly"
+        service.create(
+            self.catalog,
+            self.key.catalog_key,
+            workspace,
+            editable_format="dxbc-asm",
+        )
+        service.decompile(workspace)
+
+        status = service.status(workspace)
+
+        self.assertEqual(len(status["assemblyDisassemblyArtifacts"]), 1)
+        artifact = status["assemblyDisassemblyArtifacts"][0]
+        self.assertEqual(artifact["kind"], "native-disassembly")
+        self.assertEqual(artifact["role"], "baseline")
+        self.assertEqual(artifact["format"], "dxbc-asm")
+        self.assertEqual(artifact["inputFormat"], "dxbc")
+        self.assertEqual(artifact["inputRawSha256"], self.key.raw_sha256)
+        self.assertTrue(artifact["physicalEvidence"])
+        self.assertTrue(artifact["displayEvidenceOnly"])
+        self.assertFalse(artifact["editableSource"])
+        self.assertFalse(artifact["applyAuthorization"])
+        self.assertNotEqual(Path(artifact["path"]), Path(status["source"]["path"]))
+        self.assertIn(
+            "dcl_output", Path(artifact["path"]).read_text(encoding="utf-8")
+        )
+
+        Path(artifact["path"]).write_text("ps_5_0\nret\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            ManifestValidationError, "physical/hash binding mismatch"
+        ):
+            service.status(workspace)
+
+    def test_portable_dxbc_disassembly_rejects_changed_tool_configuration(
+        self,
+    ) -> None:
+        service, routes_path = self._dxbc_assembly_route_service()
+        workspace = self.root / "workspace-portable-dxbc-config-change"
+        service.create(
+            self.catalog,
+            self.key.catalog_key,
+            workspace,
+            editable_format="dxbc-asm",
+        )
+        service.decompile(workspace)
+        document = json.loads(self.config.read_text(encoding="utf-8"))
+        document["tools"]["dxbc-native"]["decompile"]["timeoutSeconds"] = 11
+        self.config.write_text(json.dumps(document), encoding="utf-8")
+
+        with self.assertRaises((ToolConfigurationError, ManifestValidationError)):
+            ShaderWorkspaceService(self.config, routes_path).status(workspace)
         self.assertEqual(len(list((workspace / "jobs").iterdir())), 2)
+
+    def test_legacy_decompile_manifest_failure_rolls_back_source_and_history(
+        self,
+    ) -> None:
+        for publish_before_raise in (False, True):
+            with self.subTest(publish_before_raise=publish_before_raise):
+                service, workspace, unused = self._create(
+                    "workspace-decompile-manifest-%s"
+                    % ("after" if publish_before_raise else "before")
+                )
+                manifest_path = workspace / "manifest.json"
+                manifest_before = manifest_path.read_bytes()
+                real_write = workspace_module._write_manifest_with_retry
+                write_calls = 0
+
+                def fail_manifest_write(path, manifest):
+                    nonlocal write_calls
+                    write_calls += 1
+                    if publish_before_raise:
+                        real_write(path, manifest)
+                    raise OSError("injected manifest commit failure")
+
+                with mock.patch.object(
+                    workspace_module,
+                    "_write_manifest_with_retry",
+                    side_effect=fail_manifest_write,
+                ):
+                    for unused_attempt in range(2):
+                        with self.assertRaisesRegex(OSError, "injected manifest"):
+                            service.decompile(workspace)
+                        self.assertEqual(
+                            manifest_path.read_bytes(), manifest_before
+                        )
+                        self.assertFalse(
+                            (workspace / "source" / "shader.hlsl").exists()
+                        )
+                        self.assertEqual(write_calls, unused_attempt + 1)
+
+    def test_legacy_compile_manifest_failure_rolls_back_revision_and_history(
+        self,
+    ) -> None:
+        for publish_before_raise in (False, True):
+            with self.subTest(publish_before_raise=publish_before_raise):
+                service, workspace, unused = self._create(
+                    "workspace-compile-manifest-%s"
+                    % ("after" if publish_before_raise else "before")
+                )
+                service.decompile(workspace)
+                manifest_path = workspace / "manifest.json"
+                manifest_before = manifest_path.read_bytes()
+                real_write = workspace_module._write_manifest_with_retry
+                write_calls = 0
+
+                def fail_manifest_write(path, manifest):
+                    nonlocal write_calls
+                    write_calls += 1
+                    if publish_before_raise:
+                        real_write(path, manifest)
+                    raise OSError("injected manifest commit failure")
+
+                with mock.patch.object(
+                    workspace_module,
+                    "_write_manifest_with_retry",
+                    side_effect=fail_manifest_write,
+                ):
+                    for unused_attempt in range(2):
+                        with self.assertRaisesRegex(OSError, "injected manifest"):
+                            service.compile(workspace)
+                        self.assertEqual(
+                            manifest_path.read_bytes(), manifest_before
+                        )
+                        self.assertEqual(
+                            list((workspace / "revisions").iterdir()), []
+                        )
+                        self.assertEqual(write_calls, unused_attempt + 1)
 
     def test_zero_byte_and_non_utf8_decompiler_outputs_are_rejected(self) -> None:
         for index, (tool_id, message) in enumerate(

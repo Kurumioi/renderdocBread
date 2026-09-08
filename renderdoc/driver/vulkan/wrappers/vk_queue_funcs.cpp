@@ -26,9 +26,33 @@
 #include "../vk_core.h"
 #include "../vk_debug.h"
 #include "core/settings.h"
+#include "replay/replay_timing.h"
 
 RDOC_EXTERN_CONFIG(bool, Vulkan_Debug_VerboseCommandRecording);
 RDOC_EXTERN_CONFIG(bool, Vulkan_Debug_SingleSubmitFlushing);
+
+static bool AddFrameResourceUsage(std::map<ResourceId, rdcarray<EventUsage>> &resourceUses,
+                                  ResourceId id, const EventUsage &usage)
+{
+  if(usage.usage == ResourceUsage::Shader)
+  {
+    if(usage.eventId == 0)
+      return false;
+
+    auto it = resourceUses.find(id);
+    if(it != resourceUses.end())
+    {
+      for(const EventUsage &existing : it->second)
+      {
+        if(existing.usage == ResourceUsage::Shader && existing.eventId > 0)
+          return false;
+      }
+    }
+  }
+
+  resourceUses[id].push_back(usage);
+  return true;
+}
 
 template <typename SerialiserType>
 bool WrappedVulkan::Serialise_vkGetDeviceQueue(SerialiserType &ser, VkDevice device,
@@ -185,6 +209,7 @@ void WrappedVulkan::DoSubmit(VkQueue queue, VkSubmitInfo2 submitInfo)
 
     // don't submit the fence, since we have nothing to wait on it being signalled, and we
     // might not have it correctly in the unsignalled state.
+    ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitSubmit);
     ObjDisp(queue)->QueueSubmit2(Unwrap(queue), 1, unwrapped, VK_NULL_HANDLE);
   }
   else
@@ -238,6 +263,7 @@ void WrappedVulkan::DoSubmit(VkQueue queue, VkSubmitInfo2 submitInfo)
 
     // don't submit the fence, since we have nothing to wait on it being signalled, and we
     // might not have it correctly in the unsignalled state.
+    ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitSubmit);
     ObjDisp(queue)->QueueSubmit(Unwrap(queue), 1, unwrapped, VK_NULL_HANDLE);
   }
 }
@@ -274,6 +300,7 @@ void WrappedVulkan::ReplayQueueSubmit(VkQueue queue, VkSubmitInfo2 submitInfo, r
 {
   if(IsLoading(m_State))
   {
+    m_CheckpointSubmittedQueues.insert(GetResID(queue));
     AddEvent();
 
     // we're adding multiple events, need to increment ourselves
@@ -365,8 +392,8 @@ void WrappedVulkan::ReplayQueueSubmit(VkQueue queue, VkSubmitInfo2 submitInfo, r
         {
           EventUsage u = it->second;
           u.eventId += m_RootEventID;
-          m_ResourceUses[it->first].push_back(u);
-          m_EventFlags[u.eventId] |= PipeRWUsageEventFlags(u.usage);
+          if(AddFrameResourceUsage(m_ResourceUses, it->first, u))
+            m_EventFlags[u.eventId] |= PipeRWUsageEventFlags(u.usage);
         }
 
         m_RootEventID += cmdBufInfo.eventCount;
@@ -386,6 +413,8 @@ void WrappedVulkan::ReplayQueueSubmit(VkQueue queue, VkSubmitInfo2 submitInfo, r
         m_RootEventID++;
       }
     }
+    if(numCmds > 0)
+      m_CheckpointSubmissionEnds.insert(m_RootEventID - 1);
   }
   else
   {
@@ -417,6 +446,10 @@ void WrappedVulkan::ReplayQueueSubmit(VkQueue queue, VkSubmitInfo2 submitInfo, r
         }
       }
     }
+
+    const uint32_t completedEndEID = m_RootEventID - 1;
+    if(ReplayCheckpointSubmissionSkipped(completedEndEID))
+      return;
 
     if(submitInfo.commandBufferInfoCount == 0)
     {
@@ -482,6 +515,8 @@ void WrappedVulkan::ReplayQueueSubmit(VkQueue queue, VkSubmitInfo2 submitInfo, r
 
       submitInfo.pCommandBufferInfos = rerecordedCmds.data();
 
+      if(!rerecordedCmds.empty())
+        ++m_CheckpointExecutedSubmissions;
       if(Vulkan_Debug_SingleSubmitFlushing())
       {
         submitInfo.commandBufferInfoCount = 1;
@@ -499,6 +534,10 @@ void WrappedVulkan::ReplayQueueSubmit(VkQueue queue, VkSubmitInfo2 submitInfo, r
 
         DoSubmit(queue, submitInfo);
       }
+      if(m_CheckpointSaveSubmissions && m_LastEventID >= completedEndEID &&
+         !rerecordedCmds.empty())
+        SaveReplayCheckpoint(completedEndEID, eReplay_Full,
+                             ReplayCheckpointKind::CompletedSubmission);
     }
   }
 
@@ -927,10 +966,11 @@ void WrappedVulkan::InsertActionsAndRefreshIDs(BakedCmdBufferInfo &cmdBufInfo)
     {
       EventUsage u = it->second;
       u.eventId += m_RootEventID;
-      m_ResourceUses[it->first].push_back(u);
-      m_EventFlags[u.eventId] |= PipeRWUsageEventFlags(u.usage);
+      if(AddFrameResourceUsage(m_ResourceUses, it->first, u))
+        m_EventFlags[u.eventId] |= PipeRWUsageEventFlags(u.usage);
     }
 
+    RecordReplayPatchSubmittedReads(n);
     GetActionStack().back()->children.push_back(n);
 
     // if this is a push marker too, step down the action stack
@@ -1416,7 +1456,10 @@ bool WrappedVulkan::Serialise_vkQueueSubmit(SerialiserType &ser, VkQueue queue, 
       RDCDEBUG("Previous queue execution was on queue %s, now executing %s, syncing GPU",
                ToStr(GetResID(m_PrevQueue)).c_str(), ToStr(GetResID(queue)).c_str());
       if(m_PrevQueue != VK_NULL_HANDLE)
+      {
+        ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitWait);
         ObjDisp(m_PrevQueue)->QueueWaitIdle(Unwrap(m_PrevQueue));
+      }
 
       m_PrevQueue = queue;
     }
@@ -1428,7 +1471,10 @@ bool WrappedVulkan::Serialise_vkQueueSubmit(SerialiserType &ser, VkQueue queue, 
         doWait = true;
 
     if(doWait)
+    {
+      ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitWait);
       ObjDisp(queue)->QueueWaitIdle(Unwrap(queue));
+    }
 
     // add an action use for this submission, to tally up with any debug messages that come from it
     if(IsLoading(m_State))
@@ -1625,7 +1671,10 @@ bool WrappedVulkan::Serialise_vkQueueSubmit2(SerialiserType &ser, VkQueue queue,
       RDCDEBUG("Previous queue execution was on queue %s, now executing %s, syncing GPU",
                ToStr(GetResID(m_PrevQueue)).c_str(), ToStr(GetResID(queue)).c_str());
       if(m_PrevQueue != VK_NULL_HANDLE)
+      {
+        ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitWait);
         ObjDisp(m_PrevQueue)->QueueWaitIdle(Unwrap(m_PrevQueue));
+      }
 
       m_PrevQueue = queue;
     }
@@ -1637,7 +1686,10 @@ bool WrappedVulkan::Serialise_vkQueueSubmit2(SerialiserType &ser, VkQueue queue,
         doWait = true;
 
     if(doWait)
+    {
+      ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitWait);
       ObjDisp(queue)->QueueWaitIdle(Unwrap(queue));
+    }
 
     // add an action use for this submission, to tally up with any debug messages that come from it
     if(IsLoading(m_State))
@@ -2072,6 +2124,7 @@ bool WrappedVulkan::Serialise_vkQueueWaitIdle(SerialiserType &ser, VkQueue queue
 
   if(IsReplayingAndReading())
   {
+    ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitWait);
     ObjDisp(queue)->QueueWaitIdle(Unwrap(queue));
   }
 

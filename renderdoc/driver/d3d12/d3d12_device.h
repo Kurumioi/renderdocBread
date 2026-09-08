@@ -92,6 +92,7 @@ class WrappedID3D12Device;
 class WrappedID3D12Resource;
 class WrappedID3D12PipelineState;
 class D3D12AccelerationStructure;
+struct D3D12ReplayCheckpointCache;
 
 class D3D12Replay;
 class D3D12TextRenderer;
@@ -620,6 +621,7 @@ private:
 
   // if we've called ReplayWorkWaitForIdle since the last replay or internal work
   bool m_WaitedForIdleAfterReplay = false;
+  bool m_ReplayDescriptorWorkPending = false;
 
   // list of queues and buffers kept alive during capture artificially even if the user destroys
   // them, so we can use them in the capture. Storing this separately prevents races where a
@@ -654,8 +656,13 @@ private:
 
   ID3D12CommandAllocator *m_Alloc = NULL, *m_DataUploadAlloc = NULL;
   QueueReadbackData m_QueueReadbackData;
-  ID3D12GraphicsCommandList *m_DataUploadList[64] = {};
+  static const size_t dataUploadInitialPoolSize = 64;
+  static const size_t dataUploadMaxPoolSize = 4096;
+  rdcarray<ID3D12GraphicsCommandList *> m_DataUploadLists;
   size_t m_CurDataUpload = 0;
+  // Upload lists grow to a replay high-water mark and normally return to zero only after the next
+  // full-replay device drain. A defensive hard cap permits synchronised reuse for extreme captures.
+  bool m_DataUploadPending = false;
   ID3D12DescriptorHeap *m_RTVHeap = NULL;
   ID3D12Fence *m_WFIFence;
   HANDLE m_WFIHandle;
@@ -711,6 +718,57 @@ private:
 
   std::set<ResourceId> m_UploadResourceIds;
   std::set<ResourceId> m_ModResources;
+  bool m_ReplayDirtyValid = false;
+  bool m_ReplayDirtyRecordingAllowed = false;
+  bool m_ReplayDirtyResetRequested = false;
+  bool m_UseReplayDirtyInitialContents = false;
+  bool m_ReplayDirtyShadow = false;
+  bool m_ReplayDirtyTiming = false;
+  bool m_ReplayDirtyApplyingInitial = false;
+  bool m_ReplayDirtyInitialFailed = false;
+  rdcstr m_ReplayDirtyReason = "firstReplay";
+  std::set<ResourceId> m_ReplayDirtyResources;
+  std::map<ResourceId, rdcarray<rdcpair<uint64_t, uint64_t>>> m_ReplayDirtyHeapRanges;
+  std::map<ResourceId, rdcpair<uint64_t, uint64_t>> m_ReplayDirtyAllocations;
+  struct ReplayDirtyCopyStats
+  {
+    uint64_t actualBytes = 0, skippedBytes = 0, wholeCopies = 0;
+  };
+  std::map<ResourceId, ReplayDirtyCopyStats> m_ReplayDirtyCopyStats;
+  // This is an immutable, whole-frame overestimate, not the current sparse page table. Keeping
+  // every old heap is essential when a write is followed by a remap or CopyTileMappings.
+  std::map<ResourceId, std::set<ResourceId>> m_ReplaySparseLinks;
+  std::set<ResourceId> m_ReplaySparseMappingResources;
+  struct ReplaySparseDirtyComponent
+  {
+    std::set<ResourceId> resources;
+    std::map<ResourceId, uint64_t> heaps;
+  };
+  rdcarray<ReplaySparseDirtyComponent> m_ReplaySparseComponents;
+  std::map<ResourceId, size_t> m_ReplaySparseComponentIndex;
+  std::set<size_t> m_ReplaySparseDirtyComponents;
+  bool m_ReplaySparseGraphBuilt = false;
+  bool m_ReplaySparseGraphComplete = false;
+  bool m_ReplaySparseDirtyEnabled = true;
+  rdcstr m_ReplaySparseGraphReason;
+  struct LiveForwardState
+  {
+    bool valid = false;
+    uint32_t eventId = 0, baseEvent = 0, pendingTarget = 0;
+    ResourceId baked;
+    uint64_t generation = 1, publishedGeneration = 0, pendingGeneration = 0;
+    uint64_t attempts = 0, hits = 0, fallbacks = 0;
+    rdcstr reason = "noOrdinaryTarget";
+  } m_LiveForward;
+  void BuildReplaySparseDirtyGraph();
+  bool MarkReplaySparseComponentDirty(ResourceId resource);
+  void PrepareReplaySparseInitialWrites();
+  rdcarray<ReplayBufferPatch> m_ReplayBufferPatches;
+  rdcarray<uint64_t> m_ReplayBufferPatchOffsets;
+  ID3D12Resource *m_ReplayBufferPatchUpload = NULL;    // unwrapped, immutable while configured
+  uint32_t m_ReplayBufferPatchFirstConsumer = ~0U;
+  uint32_t m_ReplayBufferPatchFirstAffected = 0;
+  uint32_t m_ReplayBufferPatchAnchorEvent = 0;
   rdcflatmap<uint64_t, ID3D12Resource *> m_UploadBuffers;
   rdcflatmap<uint64_t, D3D12_RANGE> m_UploadRanges;
 
@@ -818,6 +876,10 @@ private:
   // to reset any resources to their proper initial state if they were created mid-frame, since for
   // those we won't have recorded their state at the start of the frame capture.
   std::map<ResourceId, SubresourceStateVector> m_InitialResourceStates;
+
+  D3D12ReplayCheckpointCache *m_ReplayCheckpoints = NULL;
+  bool m_UseCheckpointInitialSources = false;
+  bool m_CheckpointDependenciesEdited = false;
 
   std::set<ResourceId> m_Cubemaps;
 
@@ -1093,11 +1155,33 @@ public:
 
   ID3D12GraphicsCommandListX *GetNewList();
   ID3D12GraphicsCommandListX *GetInitialStateList();
+  ID3D12GraphicsCommandList *CreateDataUploadList();
+  ID3D12GraphicsCommandList *AcquireDataUploadList();
 
   ID3D12GraphicsCommandListX *StealNewList();
   void ReturnStolenList(ID3D12GraphicsCommandListX *list);
 
   bool IsReadOnlyResource(ResourceId id) { return m_ModResources.find(id) == m_ModResources.end(); }
+  void InvalidateReplayDirtyTracking(const char *reason);
+  bool IsReplayDirtyTrackingValid() const { return m_ReplayDirtyValid; }
+  void MarkReplayResourceDirty(ResourceId resource, bool unboundedRootUAV = false);
+  void MarkCheckpointReplayWrites();
+  bool IsReplayInitialContentsUnchanged(ResourceId resource, uint64_t sourceBytes);
+  void RecordReplayInitialCopy(ResourceId resource, uint64_t bytes, bool wholeResource = false);
+  void BeginReplayDirtyRestore(bool allowed);
+  void ObserveReplaySparseBind(ResourceId resource, ResourceId heap);
+  void ObserveReplaySparseCopy(ResourceId destination, ResourceId source);
+  void InvalidateLiveForward(const char *reason);
+  void CompleteLiveForwardTarget(uint32_t eventId);
+  rdcstr SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches);
+  uint32_t GetReplayBufferPatchFirstAffectedEvent() const
+  {
+    return m_ReplayBufferPatchFirstAffected;
+  }
+  void PatchReplayBufferCPU(ResourceId buffer, uint64_t offset, void *data, uint64_t length);
+  void RecordReplayBufferPatches(ID3D12GraphicsCommandList *list, ID3D12Resource *buffer);
+  void ApplyInitialReplayBufferPatches();
+  bool ApplyCheckpointReplayBufferPatches();
   void CloseInitialStateList();
   ID3D12Resource *GetUploadBuffer(uint64_t chunkOffset, uint64_t byteSize);
 
@@ -1107,20 +1191,34 @@ public:
   rdcarray<ID3D12Heap *> m_InitialStateHeaps;
   UINT64 m_LastInitialStateHeapOffset = 0;
 
-  void ApplyInitialContents();
+  void ApplyInitialContents(bool useCheckpointSources = false);
+  bool UsesCheckpointInitialContents(ResourceId resource);
+  void GetCheckpointInitialCopyRanges(ResourceId heap, uint64_t byteCount,
+                                      rdcarray<rdcpair<uint64_t, uint64_t>> &ranges);
 
   void AddCaptureSubmission();
 
   void ExecuteList(ID3D12GraphicsCommandListX *list, WrappedID3D12CommandQueue *queue = NULL,
                    bool InFrameCaptureBoundary = false);
   void MarkListExecuted(ID3D12GraphicsCommandListX *list);
-  void ExecuteLists(WrappedID3D12CommandQueue *queue = NULL, bool InFrameCaptureBoundary = false);
+  void ExecuteLists(WrappedID3D12CommandQueue *queue = NULL, bool InFrameCaptureBoundary = false,
+                    bool descriptorIndependent = false);
   void FlushLists(bool forceSync = false);
 
-  void DataUploadSync();
+  void DataUploadSync(ID3D12CommandQueue *targetQueue);
 
   // Sync a single queue, by submitting the fence then waiting on it
   void QueueWaitForIdle(ID3D12CommandQueue *queue, ID3D12Fence *fence);
+  // Preserve RenderDoc's conservative total ordering when replay switches captured queues, but do
+  // it with a GPU-side signal/wait hand-off instead of stalling the replay thread on every switch.
+  bool ReplayQueueSync(ResourceId previousQueue, ID3D12CommandQueue *nextQueue);
+  // Make the initial-state restore submitted on the internal DIRECT queue a GPU-side dependency of
+  // every captured queue. The submitted internal lists and their allocator deliberately remain
+  // alive until a later FlushLists() or the next full-replay device drain.
+  bool InstallInitialStateQueueDependencies();
+  // A captured queue Wait historically drained the whole device. Make the same already-submitted
+  // work a dependency of this queue without a CPU round-trip; later queue switches propagate it.
+  void ReplayQueueWaitForPreviousWork(ID3D12CommandQueue *queue);
   // Sync to the internal queue - used to ensure any internal work has finished (e.g. FlushLists() above)
   // or generally any internal command buffers submitted to the GetQueue() main internal queue.
   void InternalQueueWaitForIdle();
@@ -1129,6 +1227,22 @@ public:
   // Sync all queues but only once after each replay or internal work submit. used when fetching data
   // or after a replay to ensure work completes on all captured queues before doing any analysis work
   void ReplayWorkWaitForIdle();
+  void MarkReplayWorkSubmitted(bool consumesCapturedDescriptors = true)
+  {
+    m_WaitedForIdleAfterReplay = false;
+    m_ReplayDescriptorWorkPending |= consumesCapturedDescriptors;
+  }
+  // Initial-resource copies/barriers do not read captured descriptor heaps. Other internal work
+  // defaults to a consumer, including OnlyDraw, shader feedback and analysis dispatches.
+  bool ReplayDescriptorMutationNeedsWait() const
+  {
+    return ShouldUseConservativeReplaySync() || m_ReplayDescriptorWorkPending;
+  }
+  // Keep capture loading/validation conservative. Normal replay can queue the initial-state
+  // transition and defer captured Signals' CPU waits to the resource mutation that needs them.
+  bool ShouldUseConservativeReplaySync(bool allowLoading = false) const;
+  // Retire immutable prepared command lists after a replay-visible resource/PSO mutation.
+  void InvalidatePreparedReplayCache();
 
   RDCDriver GetFrameCaptureDriver() { return RDCDriver::D3D12; }
   void StartFrameCapture(DeviceOwnedWindow devWnd);
@@ -1154,7 +1268,25 @@ public:
                                          const rdcarray<DynamicDescriptorCopy> &DescriptorCopies);
 
   RDResult ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
-  void ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType);
+  void ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType,
+                 bool allowCheckpoints = false, bool knownShaderFeedback = false,
+                 bool knownOrdinaryTarget = false, bool naturalReference = false,
+                 bool ordinaryRoot = false);
+  bool IsReplayCheckpointAliasingSafe(ResourceId before, ResourceId after) const;
+  void ConfigureReplayCheckpoints(const ReplayCheckpointConfig &config,
+                                 const rdcarray<ReplayCheckpointCandidate> &candidates);
+  void InvalidateReplayCheckpoints(uint32_t firstAffectedEvent = 0);
+  ReplayCheckpointStats GetReplayCheckpointStats();
+  void PrepareReplayCheckpointRestore(uint32_t endEventID, ReplayLogType replayType,
+                                       bool allowCheckpoints);
+  bool ValidateReplayCheckpointRestore(uint32_t eventID, bool initialRestored, rdcstr &reason);
+  bool RestoreReplayCheckpoint(uint32_t endEventID, uint64_t &offset, uint32_t &nextEvent,
+                               uint32_t &nextAction);
+  void SaveReplayCheckpoint(uint32_t eventID, uint64_t offset, uint32_t nextEvent,
+                            uint32_t nextAction);
+  void GetReplayCheckpointQueryResult(ResourceId baked, uint32_t relativeEvent, ResourceId heap,
+                                       uint32_t index, ID3D12Resource *&resource,
+                                       UINT64 &offset) const;
   void ReplayDraw(ID3D12GraphicsCommandListX *cmd, const ActionDescription &action);
 
   void SetStructuredExport(uint64_t sectionVersion)

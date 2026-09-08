@@ -527,11 +527,24 @@ def _self_command(arguments: Sequence[str]) -> list[str]:
 
 
 def _spawn_detached(arguments: Sequence[str]) -> None:
+    child_environment = os.environ.copy()
+    if getattr(sys, "frozen", False):
+        # Give the detached service its own one-file extraction lifetime;
+        # its same-executable `ensure` parent exits as soon as it is healthy.
+        child_environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     creation_flags = 0
     if os.name == "nt":
+        # The long-lived serve child is a PyInstaller onefile executable: this
+        # spawns its *bootloader*, which in turn spawns the real Python child.
+        # With DETACHED_PROCESS the bootloader has no console at all, so when
+        # it spawns the console-subsystem Python child Windows allocates that
+        # child a brand-new *visible* console window (Windows also ignores
+        # CREATE_NO_WINDOW whenever DETACHED_PROCESS is set). CREATE_NO_WINDOW
+        # without DETACHED_PROCESS instead gives the bootloader a hidden
+        # console that its Python child inherits, so no window ever appears.
+        # A new process group still isolates it from the parent's Ctrl+C.
         creation_flags = (
-            int(getattr(subprocess, "DETACHED_PROCESS", 0x00000008))
-            | int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+            int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
             | int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
         )
     subprocess.Popen(
@@ -542,6 +555,7 @@ def _spawn_detached(arguments: Sequence[str]) -> None:
         close_fds=True,
         creationflags=creation_flags,
         cwd=str(Path(sys.executable).resolve().parent),
+        env=child_environment,
         shell=False,
     )
 

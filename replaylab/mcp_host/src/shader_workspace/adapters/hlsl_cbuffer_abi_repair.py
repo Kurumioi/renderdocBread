@@ -8,8 +8,9 @@ captured CBuffer envelope and a hash-bound DXIL physical-access signature.
 
 It deliberately does *not* repair resources, samplers, entry signatures,
 interpolation, root signatures, or shader algorithms.  It also does not infer
-source member names, matrices, structures, signedness, or dynamic indices.
-Those concerns require independent physical-interface and semantic gates.
+source member names, matrices, structures, or signedness. A single-assignment
+unsigned min-plus-constant index can be expanded into a bounded switch over
+independently proven physical lanes. Other dynamic indices remain unsupported.
 """
 
 from __future__ import annotations
@@ -65,12 +66,244 @@ class RepairedCBuffer:
     original_member: str
     access_count: int
     tail_guard_added: bool
+    naming_source: str = "lane"
+    asset_member_count: int = 0
+    asset_fallback_reason: str = ""
 
 
 @dataclass(frozen=True)
 class HlslCBufferAbiRepairResult:
     hlsl: str
     repaired_blocks: tuple[RepairedCBuffer, ...]
+
+    @property
+    def asset_layout_used(self) -> bool:
+        return any(block.naming_source in ("asset", "asset-partial") for block in self.repaired_blocks)
+
+
+@dataclass(frozen=True)
+class _AssetMember:
+    name: str
+    offset: int
+    size: int
+    base: str
+    columns: int
+    elements: int
+
+
+_ASSET_BASE_TYPES = {
+    "float": "float", "half": "half", "min16float": "min16float",
+    "int": "int", "uint": "uint", "bool": "bool", "dword": "uint",
+}
+_FLOAT_BASES = {"float", "half", "min16float"}
+_INT_BASES = {"int", "uint", "bool"}
+_HLSL_RESERVED = {
+    "asm", "bool", "break", "case", "cbuffer", "centroid", "class", "column_major",
+    "compile", "const", "continue", "default", "discard", "do", "double", "else",
+    "export", "extern", "false", "float", "for", "fxgroup", "groupshared", "half",
+    "if", "in", "inline", "inout", "int", "interface", "line", "lineadj", "linear",
+    "matrix", "min16float", "min16int", "min16uint", "namespace", "nointerpolation",
+    "noperspective", "out", "packoffset", "pass", "point", "precise", "register",
+    "return", "row_major", "sample", "sampler", "shared", "snorm", "stateblock",
+    "static", "string", "struct", "switch", "technique", "texture", "triangle",
+    "triangleadj", "true", "typedef", "uint", "uniform", "unorm", "unsigned",
+    "vector", "vertexfragment", "void", "volatile", "while", "dword",
+}
+
+
+def _asset_members(
+    block: Mapping[str, Any], byte_size: int
+) -> tuple[list[_AssetMember], str]:
+    """Normalize one asset block's members; return (members, fallback reason)."""
+
+    if not isinstance(block, Mapping):
+        return [], "asset block is not an object"
+    if _integer(block.get("byteSize"), "asset byteSize", minimum=1) != byte_size:
+        return [], "asset block byte size differs from the captured block"
+    raw_fields = block.get("fields")
+    if not isinstance(raw_fields, Sequence) or isinstance(raw_fields, (str, bytes)) or not raw_fields:
+        return [], "asset block has no member layout"
+    if len(raw_fields) > 4096:
+        return [], "asset block member count exceeds its limit"
+    members: list[_AssetMember] = []
+    names: set[str] = set()
+    for field in raw_fields:
+        if not isinstance(field, Mapping):
+            return [], "asset member is not an object"
+        name = str(field.get("name", "") or "")
+        if not re.fullmatch(_IDENTIFIER, name) or name.casefold() in _HLSL_RESERVED or name.startswith("__replaylab_"):
+            return [], "asset member name %r is not a usable HLSL identifier" % name[:64]
+        if name in names:
+            return [], "asset member name %r is duplicated" % name[:64]
+        names.add(name)
+        base = _ASSET_BASE_TYPES.get(str(field.get("baseType", "") or "").casefold())
+        rows = field.get("rows", 1)
+        columns = field.get("columns", 1)
+        elements = field.get("elements", 1)
+        if base is None or field.get("members"):
+            return [], "asset member %s has a struct/unsupported type" % name
+        if (isinstance(rows, bool) or not isinstance(rows, int) or rows != 1
+                or isinstance(columns, bool) or not isinstance(columns, int) or not 1 <= columns <= 4
+                or isinstance(elements, bool) or not isinstance(elements, int) or not 1 <= elements <= 4096):
+            return [], "asset member %s is a matrix or has an unsupported shape" % name
+        offset = _integer(field.get("byteOffset"), "asset member byteOffset")
+        size = _integer(field.get("byteSize"), "asset member byteSize", minimum=1)
+        if offset % 4 or offset + size > byte_size:
+            return [], "asset member %s lies outside the captured block" % name
+        if elements > 1 and offset % 16:
+            return [], "asset member %s array is not register aligned" % name
+        members.append(_AssetMember(name, offset, size, base, columns, elements))
+    members.sort(key=lambda item: item.offset)
+    for previous, current in zip(members, members[1:]):
+        if previous.offset + previous.size > current.offset:
+            return [], "asset members %s and %s overlap" % (previous.name, current.name)
+    return members, ""
+
+
+class _LaneNaming:
+    """Current behaviour: one scalar field per physically accessed lane."""
+
+    source = "lane"
+    fallback_reason = ""
+    member_count = 0
+
+    def __init__(self, space: int, bind: int, fields: Mapping[int, str], byte_size: int):
+        self.space, self.bind, self.fields, self.byte_size = space, bind, dict(fields), byte_size
+        self.tail_offset = byte_size - 4
+        self.tail_added = self.tail_offset not in self.fields
+
+    def names(self) -> set[str]:
+        result = {_field_name(self.space, self.bind, offset, kind) for offset, kind in self.fields.items()}
+        if self.tail_added:
+            result.add(_tail_field_name(self.space, self.bind, self.tail_offset))
+        return result
+
+    def lane_float(self, offset: int) -> str:
+        return _lane_as_float(self.fields, space=self.space, bind=self.bind, offset=offset)
+
+    def member_lines(self) -> list[str]:
+        lines = []
+        for offset, return_type in sorted(self.fields.items()):
+            register, component = offset // 16, _COMPONENT_NAME[(offset % 16) // 4]
+            hlsl_type = "float" if return_type == "f32" else "uint"
+            lines.append(
+                f"    {hlsl_type} {_field_name(self.space, self.bind, offset, return_type)} "
+                f": packoffset(c{register}.{component});"
+            )
+        if self.tail_added:
+            register, component = self.tail_offset // 16, _COMPONENT_NAME[(self.tail_offset % 16) // 4]
+            lines.append(
+                f"    uint {_tail_field_name(self.space, self.bind, self.tail_offset)} "
+                f": packoffset(c{register}.{component});"
+            )
+        return lines
+
+
+class _AssetNaming:
+    """Declare the captured block exactly as the matched unpacked asset does.
+
+    The asset supplies names, vector widths and the members the code never
+    reads; the captured envelope and the DXIL access evidence still decide
+    admissibility lane by lane, so a wrong-version asset falls back to lane
+    naming instead of producing a plausible but false layout.
+    """
+
+    source = "asset"
+
+    def __init__(self, space: int, bind: int, fields: Mapping[int, str], byte_size: int,
+                 members: Sequence[_AssetMember], source_text: str,
+                 declaration_ranges: Sequence[tuple[int, int]], *, allow_partial: bool = True):
+        self.space, self.bind, self.fields, self.byte_size = space, bind, dict(fields), byte_size
+        self.members = list(members)
+        self.member_count = len(self.members)
+        self.fallback_reason = ""
+        self.synthetic_count = 0
+        self._lane_member: dict[int, tuple[_AssetMember, int, int]] = {}
+        # Partial knowledge is still knowledge: an accessed lane no asset
+        # member covers keeps its physical lane name instead of discarding
+        # the names the asset does provide for the other members.
+        if allow_partial:
+            synthetic: list[_AssetMember] = []
+            for offset, return_type in sorted(self.fields.items()):
+                if any(m.offset <= offset < m.offset + m.size for m in self.members):
+                    continue
+                synthetic.append(_AssetMember(
+                    _field_name(space, bind, offset, return_type), offset, 4,
+                    "float" if return_type == "f32" else "uint", 1, 1))
+            if synthetic:
+                self.members = sorted(self.members + synthetic, key=lambda m: m.offset)
+                self.synthetic_count = len(synthetic)
+                self.source = "asset-partial"
+        for offset, return_type in self.fields.items():
+            member = next((m for m in self.members if m.offset <= offset < m.offset + m.size), None)
+            if member is None:
+                self.fallback_reason = "accessed lane at byte %d has no asset member" % offset
+                return
+            local = offset - member.offset
+            element, component = local // 16, (local % 16) // 4
+            if member.elements == 1 and member.columns * 4 <= local:
+                self.fallback_reason = "accessed lane at byte %d exceeds asset member %s" % (offset, member.name)
+                return
+            if member.elements > 1 and (element >= member.elements or component >= member.columns):
+                self.fallback_reason = "accessed lane at byte %d exceeds asset array %s" % (offset, member.name)
+                return
+            if member.elements == 1:
+                element, component = 0, local // 4
+            compatible = member.base in _FLOAT_BASES if return_type == "f32" else member.base in _INT_BASES
+            if not compatible:
+                self.fallback_reason = (
+                    "DXIL %s access at byte %d contradicts asset member %s (%s)"
+                    % (return_type, offset, member.name, member.base)
+                )
+                return
+            self._lane_member[offset] = (member, element, component)
+        last = self.members[-1]
+        self.tail_offset = byte_size - 4
+        self.tail_added = last.offset + last.size < byte_size
+        if self.tail_added and self.tail_offset < last.offset + last.size:
+            self.fallback_reason = "asset layout tail does not align with the captured block size"
+            return
+        for member in self.members:
+            pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(member.name)}(?![A-Za-z0-9_])")
+            for occurrence in pattern.finditer(source_text):
+                if not any(start <= occurrence.start() < end for start, end in declaration_ranges):
+                    self.fallback_reason = "asset member name %s already exists in the HLSL" % member.name
+                    return
+
+    def names(self) -> set[str]:
+        result = {member.name for member in self.members}
+        if self.tail_added:
+            result.add(_tail_field_name(self.space, self.bind, self.tail_offset))
+        return result
+
+    def lane_float(self, offset: int) -> str:
+        member, element, component = self._lane_member[offset]
+        expression = member.name
+        if member.elements > 1:
+            expression += f"[{element}]"
+        if member.columns > 1:
+            expression += "." + _COMPONENT_NAME[component]
+        if member.base in _INT_BASES:
+            return f"asfloat({expression})"
+        if member.base != "float":
+            return f"float({expression})"
+        return expression
+
+    def member_lines(self) -> list[str]:
+        lines = []
+        for member in self.members:
+            register, component = member.offset // 16, _COMPONENT_NAME[(member.offset % 16) // 4]
+            hlsl_type = member.base + (str(member.columns) if member.columns > 1 else "")
+            suffix = f"[{member.elements}]" if member.elements > 1 else ""
+            packing = f"c{register}" if member.elements > 1 or (member.offset % 16 == 0 and member.columns == 4) else f"c{register}.{component}"
+            lines.append(f"    {hlsl_type} {member.name}{suffix} : packoffset({packing});")
+        if self.tail_added:
+            register, component = self.tail_offset // 16, _COMPONENT_NAME[(self.tail_offset % 16) // 4]
+            lines.append(
+                f"    uint {_tail_field_name(self.space, self.bind, self.tail_offset)} "
+                f": packoffset(c{register}.{component});"
+            )
+        return lines
 
 
 @dataclass(frozen=True)
@@ -244,10 +477,9 @@ def _replacement_expression(
     *,
     register: int,
     swizzle: str | None,
-    fields: Mapping[int, str],
-    space: int,
-    bind: int,
+    naming: Any,
 ) -> tuple[str, set[int]]:
+    fields = naming.fields
     base = register * 16
     if swizzle:
         offsets = [base + _COMPONENT_INDEX[item.casefold()] * 4 for item in swizzle]
@@ -255,15 +487,7 @@ def _replacement_expression(
             raise HlslCBufferAbiRepairError(
                 "HLSL references a CBuffer lane absent from DXIL access evidence"
             )
-        values = [
-            _lane_as_float(
-                fields,
-                space=space,
-                bind=bind,
-                offset=offset,
-            )
-            for offset in offsets
-        ]
+        values = [naming.lane_float(offset) for offset in offsets]
         if len(values) == 1:
             return values[0], set(offsets)
         return f"float{len(values)}({', '.join(values)})", set(offsets)
@@ -273,14 +497,7 @@ def _replacement_expression(
     for lane in range(4):
         offset = base + lane * 4
         if offset in fields:
-            values.append(
-                _lane_as_float(
-                    fields,
-                    space=space,
-                    bind=bind,
-                    offset=offset,
-                )
-            )
+            values.append(naming.lane_float(offset))
             consumed.add(offset)
         else:
             values.append("0.0f")
@@ -295,12 +512,12 @@ def _reference_edits(
     source: str,
     declaration: _Declaration,
     declaration_ranges: Sequence[tuple[int, int]],
-    fields: Mapping[int, str],
-) -> tuple[list[_Edit], set[int]]:
+    naming: Any,
+) -> tuple[list[_Edit], set[int], str]:
     member = declaration.member_name
     reference = re.compile(
         rf"(?<![A-Za-z0-9_]){re.escape(member)}\s*"
-        rf"\[\s*(?P<index>\d+)(?:[uU])?\s*\]"
+        rf"\[\s*(?P<index>\d+(?:[uU])?|{_IDENTIFIER})\s*\]"
         rf"(?:\s*\.\s*(?P<swizzle>[xyzwrgbaXYZWRGBA]{{1,4}}))?"
     )
     token = re.compile(
@@ -329,8 +546,40 @@ def _reference_edits(
         )
     edits: list[_Edit] = []
     consumed: set[int] = set()
+    helpers: dict[str, str] = {}
+    dynamic_expansions = 0
     for match in matches:
-        register = int(match.group("index"), 10)
+        index = match.group("index")
+        if not re.fullmatch(r"\d+[uU]?", index):
+            lower, upper = _bounded_hlsl_index(source, index)
+            dynamic_expansions += upper - lower + 1
+            if dynamic_expansions > MAX_REWRITES:
+                raise HlslCBufferAbiRepairError("dynamic CBuffer recovery exceeds its expansion budget")
+            if upper >= declaration.count:
+                raise HlslCBufferAbiRepairError("bounded HLSL CBuffer index exceeds its array")
+            helper = f"__replaylab_load_s{declaration.space}_b{declaration.bind}_c{lower}_{upper}"
+            if re.search(rf"\b{re.escape(helper)}\b", source):
+                raise HlslCBufferAbiRepairError("generated CBuffer helper already exists")
+            cases = []
+            for register in range(lower, upper + 1):
+                _, offsets = _replacement_expression(
+                    register=register, swizzle=match.group("swizzle"), naming=naming,
+                )
+                consumed.update(offsets)
+                value, _ = _replacement_expression(
+                    register=register, swizzle=None, naming=naming,
+                )
+                cases.append(f"        case {register}u: return {value};")
+            helpers[helper] = "\n".join([
+                f"float4 {helper}(uint index)", "{", "    switch (index)", "    {",
+                *cases, "        default: return 0.0f;", "    }", "}",
+            ])
+            replacement = f"{helper}({index})"
+            if match.group("swizzle"):
+                replacement += "." + match.group("swizzle")
+            edits.append(_Edit(match.start(), match.end(), replacement))
+            continue
+        register = int(index.rstrip("uU"), 10)
         if register >= declaration.count:
             raise HlslCBufferAbiRepairError(
                 "HLSL CBuffer index exceeds its declared array"
@@ -338,21 +587,52 @@ def _reference_edits(
         replacement, offsets = _replacement_expression(
             register=register,
             swizzle=match.group("swizzle"),
-            fields=fields,
-            space=declaration.space,
-            bind=declaration.bind,
+            naming=naming,
         )
         edits.append(_Edit(match.start(), match.end(), replacement))
         consumed.update(offsets)
         if len(edits) > MAX_REWRITES:
             raise HlslCBufferAbiRepairError("HLSL rewrite count exceeds its limit")
-    return edits, consumed
+    return edits, consumed, "\n\n".join(helpers.values())
+
+
+def _bounded_hlsl_index(source: str, name: str) -> tuple[int, int]:
+    """Accept a single-assignment uint min(value, bound) + offset only."""
+    definition = re.compile(
+        rf"\buint\s+{re.escape(name)}\s*=\s*min\((?P<value>[^;\r\n]+),\s*"
+        rf"(?P<maximum>\d+)[uU]\s*\)\s*\+\s*(?P<offset>\d+)[uU]\s*;"
+    )
+    matches = list(definition.finditer(source))
+    if len(matches) != 1:
+        raise HlslCBufferAbiRepairError("CBuffer member has a dynamic or unsupported HLSL use")
+    match = matches[0]
+    value = match.group("value").strip()
+    uint_value = re.fullmatch(_IDENTIFIER, value)
+    resource_value = re.fullmatch(rf"(?P<resource>{_IDENTIFIER})\.Load\(.+\)\.x", value)
+    if uint_value:
+        typed = re.search(rf"\buint\s+{re.escape(value)}\b", source)
+    elif resource_value:
+        typed = re.search(rf"\bBuffer<uint[1-4]?>\s+{re.escape(resource_value.group('resource'))}\s*:", source)
+    else:
+        typed = None
+    if not typed:
+        raise HlslCBufferAbiRepairError("bounded HLSL min operand is not provably uint")
+    for occurrence in re.finditer(rf"\b{re.escape(name)}\b", source):
+        if match.start() <= occurrence.start() < match.end():
+            continue
+        before = source[:occurrence.start()].rstrip()
+        after = source[occurrence.end():].lstrip()
+        if not before.endswith("[") or not after.startswith("]"):
+            raise HlslCBufferAbiRepairError("bounded HLSL index has an unsupported additional use")
+    maximum, offset = int(match.group("maximum")), int(match.group("offset"))
+    if maximum >= 4096 or offset + maximum > 0xFFFFFFFF:
+        raise HlslCBufferAbiRepairError("bounded HLSL index exceeds its range budget")
+    return offset, offset + maximum
 
 
 def _declaration_text(
     declaration: _Declaration,
-    baseline: _BaselineBlock,
-    fields: Mapping[int, str],
+    naming: Any,
     newline: str,
 ) -> tuple[str, bool]:
     lines = [
@@ -362,28 +642,9 @@ def _declaration_text(
         ),
         "{",
     ]
-    for offset, return_type in sorted(fields.items()):
-        register = offset // 16
-        component = _COMPONENT_NAME[(offset % 16) // 4]
-        hlsl_type = "float" if return_type == "f32" else "uint"
-        lines.append(
-            f"    {hlsl_type} "
-            f"{_field_name(declaration.space, declaration.bind, offset, return_type)} "
-            f": packoffset(c{register}.{component});"
-        )
-    tail_offset = baseline.byte_size - 4
-    tail_added = tail_offset not in fields
-    if tail_added:
-        register = tail_offset // 16
-        component = _COMPONENT_NAME[(tail_offset % 16) // 4]
-        tail_name = _tail_field_name(
-            declaration.space, declaration.bind, tail_offset
-        )
-        lines.append(
-            f"    uint {tail_name} : packoffset(c{register}.{component});"
-        )
+    lines.extend(naming.member_lines())
     lines.extend(("};",))
-    return newline.join(lines), tail_added
+    return newline.join(lines), bool(naming.tail_added)
 
 
 def _apply_edits(source: str, edits: Sequence[_Edit]) -> str:
@@ -406,14 +667,22 @@ def repair_spirv_cross_hlsl_cbuffers(
     *,
     baseline_constant_blocks: Sequence[Mapping[str, Any]],
     dxil_access: DxilCBufferAccessSignature,
+    asset_layout: Mapping[str, Any] | None = None,
 ) -> HlslCBufferAbiRepairResult:
     """Repair statically provable ambiguous CBuffers in SPIRV-Cross HLSL.
 
     Only captured blocks explicitly labelled ``ambiguous`` are changed.  Every
     such block must be a single rounded ``float4`` array at ``packoffset(c0)``,
-    every HLSL use must have a static register index, and all consumed lanes
+    every HLSL use must have a static or proven bounded register index, and all consumed lanes
     must exactly cover the original DXIL f32/i32 access evidence.  Otherwise the
     whole operation fails without returning partially repaired source.
+
+    ``asset_layout`` (``renderdoc-ultra-asset-cbuffer-layout-hint/v1``) may
+    supply the matched unpacked asset's member layout per ``"space:bind"``.
+    A block is declared with those names and widths only when its byte size
+    equals the captured envelope, every DXIL-accessed lane lands inside a
+    member of the matching scalar class, and no member name collides with the
+    HLSL; otherwise that block keeps the physical lane naming and records why.
     """
 
     if not isinstance(source, str) or not source or len(source) > MAX_HLSL_CHARS:
@@ -457,25 +726,33 @@ def repair_spirv_cross_hlsl_cbuffers(
             )
         access_block = dxil_access.block(baseline.space, baseline.bind)
         fields = _physical_accesses(baseline, access_block)
-        for offset, return_type in fields.items():
-            generated_names.add(
-                _field_name(
-                    baseline.space,
-                    baseline.bind,
-                    offset,
-                    return_type,
+        naming: Any = _LaneNaming(baseline.space, baseline.bind, fields, baseline.byte_size)
+        fallback_reason = ""
+        asset_block = (
+            asset_layout.get("blocks", {}).get("%d:%d" % (baseline.space, baseline.bind))
+            if isinstance(asset_layout, Mapping) and isinstance(asset_layout.get("blocks"), Mapping)
+            else None
+        )
+        if asset_block is not None:
+            try:
+                members, fallback_reason = _asset_members(asset_block, baseline.byte_size)
+            except HlslCBufferAbiRepairError as exc:
+                members, fallback_reason = [], str(exc)
+            if not fallback_reason:
+                candidate = _AssetNaming(
+                    baseline.space, baseline.bind, fields, baseline.byte_size,
+                    members, source, declaration_ranges,
                 )
-            )
-        tail_offset = baseline.byte_size - 4
-        if tail_offset not in fields:
-            generated_names.add(
-                _tail_field_name(baseline.space, baseline.bind, tail_offset)
-            )
-        reference_edits, consumed = _reference_edits(
+                if candidate.fallback_reason:
+                    fallback_reason = candidate.fallback_reason
+                else:
+                    naming = candidate
+        generated_names.update(naming.names())
+        reference_edits, consumed, helpers = _reference_edits(
             source,
             declaration,
             declaration_ranges,
-            fields,
+            naming,
         )
         if consumed != set(fields):
             raise HlslCBufferAbiRepairError(
@@ -483,10 +760,11 @@ def repair_spirv_cross_hlsl_cbuffers(
             )
         replacement, tail_added = _declaration_text(
             declaration,
-            baseline,
-            fields,
+            naming,
             newline,
         )
+        if helpers:
+            replacement += newline + newline + helpers.replace("\n", newline)
         edits.extend(reference_edits)
         edits.append(_Edit(declaration.start, declaration.end, replacement))
         repaired.append(
@@ -497,10 +775,15 @@ def repair_spirv_cross_hlsl_cbuffers(
                 declaration.member_name,
                 len(fields),
                 tail_added,
+                naming.source,
+                naming.member_count,
+                fallback_reason[:512],
             )
         )
 
     for name in generated_names:
+        if not name.startswith("__replaylab_"):
+            continue  # asset member names were checked outside their declaration
         if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", source):
             raise HlslCBufferAbiRepairError(
                 "generated CBuffer field name already exists in HLSL"

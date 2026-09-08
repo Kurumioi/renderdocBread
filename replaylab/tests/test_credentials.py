@@ -55,6 +55,7 @@ def test_credential_cli_uses_stdin_and_never_serialises_secret(
 
     store_args = parser.parse_args(
         [
+            "profile",
             "credential",
             "store",
             "--profile",
@@ -74,13 +75,13 @@ def test_credential_cli_uses_stdin_and_never_serialises_secret(
     assert "sk-not-written-to-output" not in repr(emitted)
 
     status_args = parser.parse_args(
-        ["credential", "status", "--profile", "api-main", "--json"]
+        ["profile", "credential", "status", "--profile", "api-main", "--json"]
     )
     assert _credential_command(status_args, profiles, credentials) == 0
     assert emitted[-1]["stored"] is True
 
     delete_args = parser.parse_args(
-        ["credential", "delete", "--profile", "api-main", "--json"]
+        ["profile", "credential", "delete", "--profile", "api-main", "--json"]
     )
     assert _credential_command(delete_args, profiles, credentials) == 0
     assert emitted[-1]["deleted"] is True
@@ -102,6 +103,7 @@ def test_credential_cli_normalizes_pasted_bearer_before_persistence(
     )
     args = _parser().parse_args(
         [
+            "profile",
             "credential",
             "store",
             "--profile",
@@ -256,4 +258,6 @@ def test_provider_replacement_deletes_stale_credential(
 def test_store_parser_requires_explicit_stdin_flag() -> None:
     parser = _parser()
     with pytest.raises(SystemExit):
-        parser.parse_args(["credential", "store", "--profile", "api-main"])
+        parser.parse_args(
+            ["profile", "credential", "store", "--profile", "api-main"]
+        )

@@ -99,7 +99,12 @@ def test_api_key_environment_variable_name_is_validated() -> None:
         "PATH",
         "home",
         "CODEX_HOME",
+        "CODEBUDDY_CONFIG_DIR",
+        "COPILOT_HOME",
         "CURSOR_CONFIG_DIR",
+        "GEMINI_CLI_HOME",
+        "KIMI_CODE_HOME",
+        "CLAUDE_CONFIG_DIR",
         "LOCALAPPDATA",
         "PYTHONPATH",
         "HTTPS_PROXY",
@@ -113,6 +118,17 @@ def test_api_key_environment_cannot_reuse_process_or_replaylab_control_names(nam
             preset="openai",
             model="model",
             api_key_env=name,
+        ).validate()
+
+
+def test_external_agent_environment_cannot_expose_mcp_provider_configuration() -> None:
+    with pytest.raises(ConfigurationError, match="must not expose ReplayLab MCP provider"):
+        Profile(
+            id="unsafe-provider-env",
+            preset="custom-acp",
+            command=["agent"],
+            agent_env=["RENDERDOC_ULTRA_UEX_PROFILES"],
+            options={"allow_unsandboxed_agent": True},
         ).validate()
 
 
@@ -231,29 +247,32 @@ def test_profile_numeric_options_are_finite_and_bounded() -> None:
         ).validate()
 
     Profile(
-        id="bounded-agent-stages",
-        preset="codex",
+        id="bounded-current-options",
+        preset="ollama",
+        model="model",
         options={
-            "planner_timeout_seconds": 60,
-            "specialist_timeout_seconds": 300,
-            "chat_timeout_seconds": 90,
+            "max_output_tokens": 4096,
+            "context_recent_turns": 4,
+            "thinking_budget_tokens": 0,
         },
     ).validate()
-    with pytest.raises(ConfigurationError, match="specialist_timeout_seconds"):
+    with pytest.raises(ConfigurationError, match="max_output_tokens"):
         Profile(
-            id="bad-specialist-timeout",
-            preset="codex",
-            options={"specialist_timeout_seconds": 29},
+            id="bad-output-budget",
+            preset="ollama",
+            model="model",
+            options={"max_output_tokens": 0},
         ).validate()
 
 
-def test_model_settings_are_mapped_instead_of_silently_ignored() -> None:
-    from replaylab_agent.runtime import AgentRuntime
+def test_model_settings_are_mapped_instead_of_silently_ignored(monkeypatch) -> None:
+    from replaylab_agent.connectors import langchain_models
 
     profile = Profile(
         id="settings",
         preset="openai",
         model="model",
+        base_url="https://api.openai.test/v1",
         options={
             "max_output_tokens": 512,
             "context_window_tokens": 65536,
@@ -263,12 +282,22 @@ def test_model_settings_are_mapped_instead_of_silently_ignored() -> None:
         },
     )
     profile.validate()
-    assert AgentRuntime._model_settings(profile) == {
-        "max_tokens": 512,
-        "temperature": 0.2,
-        "timeout": 30.0,
-        "openai_reasoning_effort": "medium",
-    }
+    seen = {}
+
+    class FakeModule:
+        @staticmethod
+        def ChatOpenAI(**kwargs):
+            seen.update(kwargs)
+            return kwargs
+
+    monkeypatch.setattr(langchain_models, "_load", lambda *_args: FakeModule)
+    langchain_models.build_chat_model(
+        profile, environ={profile.key_env: "test-key"}
+    )
+    assert seen["max_tokens"] == 512
+    assert seen["temperature"] == 0.2
+    assert seen["timeout"] == 30.0
+    assert seen["reasoning_effort"] == "medium"
     with pytest.raises(ConfigurationError, match="requires options.api_version"):
         Profile(
             id="azure-legacy",
@@ -315,40 +344,6 @@ def test_subscription_auth_flow_is_agent_only_and_bounded() -> None:
         ).validate()
 
 
-def test_renderdoc_agent_tool_capability_only_rejects_explicitly_unsupported_models() -> None:
-    from replaylab_agent.runtime import AgentRuntime
-
-    for unprobed in (
-        Profile("local", "ollama", "model"),
-        Profile("openai-unconfirmed", "openai", "some-model"),
-    ):
-        unprobed.validate()
-        AgentRuntime._require_agent_capabilities(unprobed)
-        assert "tools" not in unprobed.capabilities
-        assert "json-schema" not in unprobed.capabilities
-        assert "vision" not in unprobed.capabilities
-
-    unsupported = Profile(
-        "local-chat-only",
-        "ollama",
-        "model",
-        options={"supports_tools": False},
-    )
-    unsupported.validate()
-    with pytest.raises(ConfigurationError, match="does not support tool calling"):
-        AgentRuntime._require_agent_capabilities(unsupported)
-
-    enabled = Profile(
-        "local-tools",
-        "ollama",
-        "model",
-        options={"supports_tools": True},
-    )
-    enabled.validate()
-    AgentRuntime._require_agent_capabilities(enabled)
-    assert "tools" in enabled.capabilities
-
-
 def test_managed_agent_presets_keep_their_protocol_tool_contract() -> None:
     codex = Profile("codex", "codex", "agent")
     codex.validate()
@@ -382,6 +377,51 @@ def test_v1_profile_is_migrated_to_enabled_and_default_models(tmp_path) -> None:
     assert saved["schema"] == PROFILE_SCHEMA
     assert saved["profiles"][0]["models"] == ["legacy-model"]
     assert saved["profiles"][0]["default_model"] == "legacy-model"
+    assert saved["profiles"][0]["model_context_windows"] == {}
+
+
+def test_per_model_context_windows_round_trip_without_changing_legacy_profiles(
+    tmp_path,
+) -> None:
+    path = tmp_path / "profiles.json"
+    store = ProfileStore(path)
+    store.add(
+        Profile(
+            "verified-windows",
+            "ollama",
+            model="small",
+            models=["small", "large"],
+            default_model="large",
+            model_context_windows={"small": 65_536, "large": 262_144},
+        )
+    )
+
+    store.save()
+    loaded = ProfileStore(path).load().active()
+
+    assert loaded.model_context_windows == {"small": 65_536, "large": 262_144}
+
+
+@pytest.mark.parametrize(
+    "windows",
+    [
+        [],
+        {1: 65_536},
+        {"": 65_536},
+        {"model\nsecret": 65_536},
+        {"model": True},
+        {"model": 4095},
+        {"model": 4_000_001},
+    ],
+)
+def test_per_model_context_windows_are_strictly_validated(windows) -> None:
+    with pytest.raises(ConfigurationError, match="model_context_windows"):
+        Profile(
+            "bad-window-map",
+            "ollama",
+            "model",
+            model_context_windows=windows,
+        ).validate()
 
 
 def test_profile_resolves_only_enabled_per_run_models() -> None:

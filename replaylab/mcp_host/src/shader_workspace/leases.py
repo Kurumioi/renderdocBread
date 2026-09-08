@@ -38,6 +38,7 @@ class WorkspaceSourceTransactionLease:
         *,
         owner_instance_id: str | None = None,
         recover_orphaned: bool = False,
+        recover_legacy: bool = False,
     ):
         self.root = root
         self.path = root / self.FILE_NAME
@@ -49,8 +50,14 @@ class WorkspaceSourceTransactionLease:
             raise WorkspaceSourceLeaseError(
                 "orphan lease recovery requires a process-owned host instance ID"
             )
+        if recover_legacy and (not recover_orphaned or not instance):
+            raise WorkspaceSourceLeaseError(
+                "legacy lease recovery requires explicit orphan recovery and a "
+                "process-owned host instance ID"
+            )
         self.owner_instance_id = instance
         self.recover_orphaned = bool(recover_orphaned)
+        self.recover_legacy = bool(recover_legacy)
         self._owned = False
         self._payload = self._lease_payload()
 
@@ -104,11 +111,12 @@ class WorkspaceSourceTransactionLease:
     def _archive_orphaned_host_lease(self) -> bool:
         """Archive a lease from a different singleton-host generation.
 
-        This path is deliberately unavailable to ordinary callers and legacy
-        token-only locks.  The ReplayLab singleton host supplies a random
-        generation ID, so a different well-formed owner ID is evidence that
-        the previous singleton generation ended.  Source transaction residue
-        still blocks recovery.
+        This path is deliberately unavailable to ordinary callers. The
+        ReplayLab singleton host supplies a random generation ID, so a
+        different well-formed v2 owner ID is evidence that the previous
+        singleton generation ended. A legacy token-only lock is archived only
+        when the already effect-authorised operation separately opted into
+        ``recover_legacy``. Source transaction residue still blocks recovery.
         """
 
         if not self.owner_instance_id:
@@ -135,26 +143,44 @@ class WorkspaceSourceTransactionLease:
                 != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
             ):
                 return False
-            value = json.loads(raw.decode("utf-8", errors="strict"))
-            if not isinstance(value, dict) or set(value) != {
-                "schema",
-                "schemaVersion",
-                "token",
-                "ownerInstanceId",
-                "ownerPid",
-                "createdAt",
-            }:
-                return False
-            previous_owner = str(value.get("ownerInstanceId", ""))
-            previous_token = str(value.get("token", ""))
-            if (
-                value.get("schema") != LEASE_SCHEMA
-                or value.get("schemaVersion") != LEASE_VERSION
-                or _TOKEN.fullmatch(previous_owner) is None
-                or _TOKEN.fullmatch(previous_token) is None
-                or previous_owner == self.owner_instance_id
-            ):
-                return False
+            try:
+                value = json.loads(raw.decode("utf-8", errors="strict"))
+            except json.JSONDecodeError:
+                value = None
+            legacy = value is None
+            if legacy:
+                if not self.recover_legacy:
+                    return False
+                try:
+                    legacy_text = raw.decode("ascii", errors="strict")
+                except UnicodeDecodeError:
+                    return False
+                if not legacy_text.endswith("\n") or legacy_text.count("\n") != 1:
+                    return False
+                previous_token = legacy_text[:-1]
+                if _TOKEN.fullmatch(previous_token) is None:
+                    return False
+                previous_owner = "legacy"
+            else:
+                if not isinstance(value, dict) or set(value) != {
+                    "schema",
+                    "schemaVersion",
+                    "token",
+                    "ownerInstanceId",
+                    "ownerPid",
+                    "createdAt",
+                }:
+                    return False
+                previous_owner = str(value.get("ownerInstanceId", ""))
+                previous_token = str(value.get("token", ""))
+                if (
+                    value.get("schema") != LEASE_SCHEMA
+                    or value.get("schemaVersion") != LEASE_VERSION
+                    or _TOKEN.fullmatch(previous_owner) is None
+                    or _TOKEN.fullmatch(previous_token) is None
+                    or previous_owner == self.owner_instance_id
+                ):
+                    return False
             watch_dir = self.root / "watch"
             if watch_dir.exists() and (watch_dir.is_symlink() or not watch_dir.is_dir()):
                 return False
@@ -162,7 +188,9 @@ class WorkspaceSourceTransactionLease:
             if watch_dir.resolve() != watch_dir or self.root.resolve() not in watch_dir.parents:
                 return False
             archive = watch_dir / (
-                "orphaned-lease-%s-%s.json" % (previous_owner, previous_token)
+                ("orphaned-legacy-lease-%s.lock" % previous_token)
+                if legacy
+                else ("orphaned-lease-%s-%s.json" % (previous_owner, previous_token))
             )
             if archive.exists() or archive.is_symlink():
                 return False

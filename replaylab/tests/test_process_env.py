@@ -18,13 +18,17 @@ from replaylab_agent.doctor import run_doctor
 from replaylab_agent.errors import ConfigurationError
 from replaylab_agent.process_env import (
     agent_command_argv,
+    codebuddy_profile_home,
     codex_profile_home,
     cursor_profile_home,
     ensure_cursor_profile_config,
     external_agent_environment,
     host_process_environment,
+    managed_vendor_profile_home,
+    remove_codebuddy_profile_home,
     remove_codex_profile_home,
     remove_cursor_profile_home,
+    remove_managed_vendor_profile_home,
     resolve_agent_executable,
     resolve_known_vendor_executable,
     resolved_agent_argv,
@@ -234,11 +238,17 @@ def test_known_npm_shim_is_literal_and_custom_acp_does_not_use_fallback(
     appdata = tmp_path / "roaming"
     appdata.mkdir()
     shim = _write_file(appdata / "npm" / "gemini.cmd", b"@echo off\r\n")
+    codebuddy_shim = _write_file(
+        appdata / "npm" / "codebuddy.cmd", b"@echo off\r\n"
+    )
     environment = {"PATH": "", "APPDATA": str(appdata)}
 
     assert resolve_known_vendor_executable(
         "gemini-acp", "gemini", environ=environment
     ) == str(shim.resolve())
+    assert resolve_known_vendor_executable(
+        "codebuddy-acp", "codebuddy", environ=environment
+    ) == str(codebuddy_shim.resolve())
     assert (
         resolve_agent_executable(
             Profile(
@@ -270,7 +280,12 @@ def test_detect_spawn_resolution_and_doctor_share_absolute_codex_path(
     local.mkdir()
     executable = _write_bundled_codex(local)
     environment = {"PATH": "", "LOCALAPPDATA": str(local)}
-    profile = Profile("codex-main", "codex", command=["ignored-user-command"])
+    profile = Profile(
+        "codex-main",
+        "codex",
+        "gpt-5.6-sol",
+        command=["ignored-user-command"],
+    )
 
     status = detect_subscription(profile, environ=environment)
     assert status["installed"] is True
@@ -308,8 +323,11 @@ def test_detect_spawn_resolution_and_doctor_share_absolute_codex_path(
         check for check in checks if check.name == "codex-internal-tools"
     )
     assert registration.status == "ok"
-    assert "app-server dynamic tools" in registration.detail
-    assert "no ReplayLab MCP registration" in registration.detail
+    assert "task-scoped ReplayLab MCP" in registration.detail
+    assert "no persistent MCP registration" in registration.detail
+    context = next(check for check in checks if check.name == "model-context")
+    assert context.status == "ok"
+    assert context.detail == "1050000 tokens (model-catalog)"
 
 
 def test_codex_environment_uses_profile_scoped_home_instead_of_global_home(
@@ -375,6 +393,142 @@ def test_cursor_environment_and_permission_config_are_profile_scoped(
         (expected / ".cursor" / "mcp.json").read_text(encoding="utf-8")
     ) == {"mcpServers": {}}
     assert not global_config.exists()
+
+
+def test_codebuddy_environment_is_profile_scoped_and_ignores_global_config(
+    tmp_path,
+) -> None:
+    profile = Profile(
+        "codebuddy-main",
+        "codebuddy-acp",
+        options={"allow_unsandboxed_agent": True},
+    )
+    global_config = tmp_path / "global-codebuddy"
+    source = {
+        "LOCALAPPDATA": str(tmp_path / "local"),
+        "CODEBUDDY_CONFIG_DIR": str(global_config),
+        "PATH": str(tmp_path / "bin"),
+    }
+
+    environment = external_agent_environment(profile, environ=source)
+    expected = (
+        tmp_path / "local" / "ReplayLab" / "codebuddy" / profile.id
+    ).resolve()
+
+    assert environment["CODEBUDDY_CONFIG_DIR"] == str(expected)
+    assert codebuddy_profile_home(profile, environ=source) == expected
+    assert environment.get("HOME") != str(expected)
+    assert not expected.exists()
+
+
+@pytest.mark.parametrize(
+    ("preset", "directory", "environment_key"),
+    [
+        ("copilot-acp", "copilot", "COPILOT_HOME"),
+        ("gemini-acp", "gemini", "GEMINI_CLI_HOME"),
+        ("kimi-acp", "kimi", "KIMI_CODE_HOME"),
+        ("claude-code-acp", "claude", "CLAUDE_CONFIG_DIR"),
+    ],
+)
+def test_other_subscription_vendor_state_is_profile_scoped(
+    tmp_path, preset, directory, environment_key
+) -> None:
+    profile = Profile(
+        preset + "-main",
+        preset,
+        options={"allow_unsandboxed_agent": True},
+    )
+    source = {
+        "LOCALAPPDATA": str(tmp_path / "local"),
+        environment_key: str(tmp_path / "global-vendor-state"),
+        "PATH": str(tmp_path / "bin"),
+    }
+
+    environment = external_agent_environment(profile, environ=source)
+    expected = (
+        tmp_path / "local" / "ReplayLab" / directory / profile.id
+    ).resolve()
+    assert environment[environment_key] == str(expected)
+    assert managed_vendor_profile_home(profile, environ=source) == expected
+    assert not expected.exists()
+    if preset in {"gemini-acp", "kimi-acp"}:
+        assert environment["HOME"] == str(expected)
+        assert environment["USERPROFILE"] == str(expected)
+
+
+def test_qwen_uses_managed_os_home_and_encrypted_token_storage(tmp_path) -> None:
+    profile = Profile(
+        "qwen-main",
+        "qwen-acp",
+        options={"allow_unsandboxed_agent": True},
+    )
+    source = {
+        "LOCALAPPDATA": str(tmp_path / "local"),
+        "HOME": str(tmp_path / "global-home"),
+        "USERPROFILE": str(tmp_path / "global-profile"),
+    }
+    environment = external_agent_environment(profile, environ=source)
+    expected = managed_vendor_profile_home(profile, environ=source)
+    assert environment["HOME"] == environment["USERPROFILE"] == str(expected)
+    assert environment["QWEN_CODE_FORCE_ENCRYPTED_FILE_STORAGE"] == "true"
+
+
+def test_managed_vendor_home_removal_leaves_global_state_untouched(tmp_path) -> None:
+    profile = Profile(
+        "kimi-delete",
+        "kimi-acp",
+        options={"allow_unsandboxed_agent": True},
+    )
+    local = (tmp_path / "local").resolve()
+    global_home = tmp_path / "global-kimi"
+    global_sentinel = global_home / "credentials" / "account.json"
+    global_sentinel.parent.mkdir(parents=True)
+    global_sentinel.write_text("global-must-survive", encoding="utf-8")
+    target = managed_vendor_profile_home(
+        profile, environ={"LOCALAPPDATA": str(local)}
+    )
+    (target / "credentials").mkdir(parents=True)
+    (target / "credentials" / "account.json").write_text(
+        "profile-only", encoding="utf-8"
+    )
+
+    remove_managed_vendor_profile_home(
+        profile,
+        environ={
+            "LOCALAPPDATA": str(local),
+            "KIMI_CODE_HOME": str(global_home),
+        },
+    )
+
+    assert not target.exists()
+    assert global_sentinel.read_text(encoding="utf-8") == "global-must-survive"
+
+
+def test_codebuddy_home_removal_leaves_global_state_untouched(tmp_path) -> None:
+    profile = Profile(
+        "codebuddy-delete",
+        "codebuddy-acp",
+        options={"allow_unsandboxed_agent": True},
+    )
+    local = (tmp_path / "local").resolve()
+    global_config = tmp_path / "global-codebuddy"
+    global_sentinel = global_config / "settings.json"
+    global_sentinel.parent.mkdir(parents=True)
+    global_sentinel.write_text("global-must-survive", encoding="utf-8")
+    target = codebuddy_profile_home(profile, environ={"LOCALAPPDATA": str(local)})
+    (target / "settings.json").parent.mkdir(parents=True)
+    (target / "settings.json").write_text("profile-only", encoding="utf-8")
+
+    remove_codebuddy_profile_home(
+        profile,
+        environ={
+            "LOCALAPPDATA": str(local),
+            "CODEBUDDY_CONFIG_DIR": str(global_config),
+        },
+    )
+
+    assert not target.exists()
+    assert global_sentinel.read_text(encoding="utf-8") == "global-must-survive"
 
 
 def test_cursor_home_removal_leaves_global_cursor_state_untouched(tmp_path) -> None:
@@ -460,6 +614,37 @@ def test_child_environments_force_utf8_and_preserve_chinese_paths(tmp_path) -> N
     assert host["PYTHONIOENCODING"] == "utf-8:strict"
     assert host["PYTHONUTF8"] == "1"
     assert host["REPLAYLAB_INSTANCE_ID"] == "实例-一"
+
+
+def test_managed_provider_paths_are_visible_only_to_mcp_host(tmp_path) -> None:
+    provider_values = {
+        "RENDERDOC_ULTRA_UNPACKED_ASSET_JOB_ROOT": str(tmp_path / "jobs"),
+        "RENDERDOC_ULTRA_RESOURCE_EXPORT_ROOT": str(tmp_path / "resource-exports"),
+        "RENDERDOC_ULTRA_UEX": str(tmp_path / "uex.exe"),
+        "RENDERDOC_ULTRA_UEX_PROFILES": str(tmp_path / "profiles.json"),
+        "RENDERDOC_ULTRA_BLENDER": str(tmp_path / "blender.exe"),
+        "RENDERDOC_ULTRA_GLTF_VALIDATOR": str(tmp_path / "gltf_validator.exe"),
+        "RENDERDOC_ULTRA_UNITY_VALIDATOR": str(tmp_path / "unity-validator.exe"),
+        "RENDERDOC_ULTRA_UEX_BLENDER_WRAPPER": str(tmp_path / "wrapper.py"),
+        "RENDERDOC_ULTRA_UEX_BLENDER_CONTINUATION_DRIVER": str(
+            tmp_path / "continuation-driver.py"
+        ),
+        "RENDERDOC_ULTRA_UEFORMAT_ADDON": str(tmp_path / "io_scene_ueformat"),
+        "RENDERDOC_ULTRA_UEX_PYTHON": str(tmp_path / "python.exe"),
+    }
+    source = {"PATH": str(tmp_path / "bin"), **provider_values}
+    profile = Profile(
+        "custom-provider-isolation",
+        "custom-acp",
+        command=[sys.executable],
+        options={"allow_unsandboxed_agent": True},
+    )
+
+    agent = external_agent_environment(profile, environ=source)
+    host = host_process_environment(environ=source)
+
+    assert provider_values.items() <= host.items()
+    assert set(provider_values).isdisjoint(agent)
 
 
 def test_non_codex_agent_keeps_explicit_inherited_codex_home(tmp_path) -> None:

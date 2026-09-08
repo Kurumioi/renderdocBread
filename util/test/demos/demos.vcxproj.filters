@@ -103,6 +103,9 @@
     <ClCompile Include="vk\vk_simple_triangle.cpp">
       <Filter>Vulkan\demos</Filter>
     </ClCompile>
+    <ClCompile Include="vk\vk_shared_buffer.cpp">
+      <Filter>Vulkan\demos</Filter>
+    </ClCompile>
     <ClCompile Include="vk\vk_draw_zoo.cpp">
       <Filter>Vulkan\demos</Filter>
     </ClCompile>
@@ -185,6 +188,12 @@
       <Filter>D3D12</Filter>
     </ClCompile>
     <ClCompile Include="d3d12\d3d12_simple_triangle.cpp">
+      <Filter>D3D12\demos</Filter>
+    </ClCompile>
+    <ClCompile Include="d3d12\d3d12_checkpoint_triangle.cpp">
+      <Filter>D3D12\demos</Filter>
+    </ClCompile>
+    <ClCompile Include="d3d12\d3d12_checkpoint_query.cpp">
       <Filter>D3D12\demos</Filter>
     </ClCompile>
     <ClCompile Include="dx\d3d_helpers.cpp">

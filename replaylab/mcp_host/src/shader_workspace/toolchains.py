@@ -41,6 +41,11 @@ MAX_CAVEATS = 16
 MAX_CAVEAT_CHARS = 2048
 MAX_SHADER_BYTES = 512 * 1024 * 1024
 MAX_ROUTE_HOPS = 4
+MAX_ROUTE_SUGGESTIONS = 8
+# The Agent owns candidate-pair selection order; this is the Host's ceiling on
+# automatic decompile/compile retry attempts before "attempt-limit-reached"
+# stops the recovery loop. It is a budget, not an execution queue.
+AUTOMATIC_RECOVERY_ATTEMPT_LIMIT = 8
 ROUTE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -93,9 +98,20 @@ TEXT_FORMATS = frozenset(
     }
 )
 BINARY_FORMATS = FORMATS.difference(TEXT_FORMATS)
+HIGH_LEVEL_SOURCE_FORMATS = frozenset(
+    {"hlsl", "glsl", "essl", "msl", "wgsl", "slang"}
+)
+NATIVE_ASSEMBLY_TO_BINARY = {
+    "dxbc-asm": "dxbc",
+    "dxil-asm": "dxil",
+    "spirv-asm": "spirv",
+    "opengl-spirv-asm": "opengl-spirv",
+}
 _NATIVE_EDITABLE_FALLBACKS = {
     "dxbc": ("dxbc-asm",),
     "dxil": ("dxil-asm",),
+    "spirv": ("spirv-asm",),
+    "opengl-spirv": ("opengl-spirv-asm",),
 }
 STAGES = frozenset(
     {
@@ -117,6 +133,17 @@ STAGES = frozenset(
         "library",
     }
 )
+_RAY_STAGES = frozenset(
+    {
+        "raygen",
+        "intersection",
+        "anyhit",
+        "closesthit",
+        "miss",
+        "callable",
+    }
+)
+_REPLAY_REPLACEMENT_BLOCKED_STAGES = _RAY_STAGES | {"library"}
 FIDELITIES = frozenset(
     {
         "native-compile",
@@ -144,6 +171,25 @@ _FORMAT_SUFFIX = {
     "slang": ".slang",
 }
 
+_SPIRV_EXECUTION_MODEL_STAGE = {
+    0: "vertex",
+    1: "hull",
+    2: "domain",
+    3: "geometry",
+    4: "fragment",
+    5: "compute",
+    5267: "task",
+    5268: "mesh",
+    5313: "raygen",
+    5314: "intersection",
+    5315: "anyhit",
+    5316: "closesthit",
+    5317: "miss",
+    5318: "callable",
+    5364: "task",
+    5365: "mesh",
+}
+
 
 def normalize_format(value: Any) -> str:
     result = str(value or "").strip().lower().replace("_", "-")
@@ -151,6 +197,88 @@ def normalize_format(value: Any) -> str:
     if result not in FORMATS:
         raise ToolchainRoutingError("unsupported shader format: %s" % (value,))
     return result
+
+
+def physical_spirv_entry_point(
+    data: bytes, stage: str, preferred_entry_point: str = ""
+) -> str:
+    """Resolve the entry carried by one physical SPIR-V intermediate."""
+
+    normalized_stage = normalize_stage(stage)
+    if len(data) < 20 or len(data) % 4:
+        raise ToolchainRoutingError("SPIR-V intermediate is truncated or unaligned")
+    little_magic = struct.unpack_from("<I", data, 0)[0]
+    if little_magic == 0x07230203:
+        endian = "<"
+    elif little_magic == 0x03022307:
+        endian = ">"
+    else:
+        raise ToolchainRoutingError("SPIR-V intermediate has invalid magic")
+    words = struct.unpack(endian + "%dI" % (len(data) // 4), data)
+    version = words[1]
+    if (
+        ((version >> 16) & 0xFF) != 1
+        or ((version >> 8) & 0xFF) > 6
+        or words[3] == 0
+        or words[4] != 0
+    ):
+        raise ToolchainRoutingError("SPIR-V intermediate has an invalid header")
+
+    entries: list[tuple[str, str]] = []
+    cursor = 5
+    while cursor < len(words):
+        instruction = words[cursor]
+        word_count = instruction >> 16
+        opcode = instruction & 0xFFFF
+        if word_count == 0 or word_count > len(words) - cursor:
+            raise ToolchainRoutingError("SPIR-V intermediate has an invalid instruction")
+        if opcode == 15 and word_count >= 4:
+            raw_name = bytearray()
+            terminated = False
+            for word in words[cursor + 3 : cursor + word_count]:
+                encoded = word.to_bytes(4, "little")
+                nul = encoded.find(b"\x00")
+                raw_name.extend(encoded if nul < 0 else encoded[:nul])
+                if nul >= 0:
+                    terminated = True
+                    break
+                if len(raw_name) > 512:
+                    break
+            if not terminated:
+                raise ToolchainRoutingError(
+                    "SPIR-V intermediate entry point is unterminated or too long"
+                )
+            try:
+                name = raw_name.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise ToolchainRoutingError(
+                    "SPIR-V intermediate entry point is not UTF-8"
+                ) from exc
+            if not name or len(name) > 512:
+                raise ToolchainRoutingError(
+                    "SPIR-V intermediate entry point is empty or too long"
+                )
+            entries.append(
+                (name, _SPIRV_EXECUTION_MODEL_STAGE.get(words[cursor + 1], ""))
+            )
+        cursor += word_count
+
+    matches = sorted(
+        {name for name, item_stage in entries if item_stage == normalized_stage}
+    )
+    preferred = str(preferred_entry_point or "")
+    if preferred in matches:
+        return preferred
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ToolchainRoutingError(
+            "SPIR-V intermediate has no OpEntryPoint for stage %s" % normalized_stage
+        )
+    raise ToolchainRoutingError(
+        "SPIR-V intermediate has ambiguous OpEntryPoint values for stage %s: %s"
+        % (normalized_stage, ", ".join(matches))
+    )
 
 
 def _normalize_target_api(value: Any) -> str:
@@ -288,8 +416,18 @@ def _detect_text_format(text: str) -> FormatDetection:
     )
     if (best >= 2 or uniquely_strong_single_marker) and len(winners) == 1:
         selected = winners[0]
-        if selected == "glsl" and re.search(r"(?m)^\s*#version\s+\d+\s+es\b", sample):
-            selected = "essl"
+        if selected == "glsl":
+            version = re.search(
+                r"(?m)^\s*#version\s+(\d+)(?:\s+(es))?\b", sample
+            )
+            # GLSL ES 1.00 uses ``#version 100`` without the later ``es``
+            # suffix.  Treat that normative spelling as decisive; a precision
+            # declaration is only supporting evidence and is never sufficient
+            # by itself to relabel desktop GLSL.
+            if version and (
+                version.group(2) == "es" or version.group(1) == "100"
+            ):
+                selected = "essl"
         return FormatDetection(
             selected,
             "strong",
@@ -463,6 +601,7 @@ class RouteCapability:
     input_format: str
     output_format: str
     stages: tuple[str, ...]
+    target_apis: tuple[str, ...]
     fidelity: str
     priority: int
     implementation: str
@@ -472,6 +611,9 @@ class RouteCapability:
 
     def supports_stage(self, stage: str) -> bool:
         return "*" in self.stages or stage in self.stages
+
+    def supports_api(self, target_api: str) -> bool:
+        return not target_api or target_api in self.target_apis
 
     @property
     def is_reconstructed(self) -> bool:
@@ -486,6 +628,7 @@ class RouteCapability:
             "inputFormat": self.input_format,
             "outputFormat": self.output_format,
             "stages": list(self.stages),
+            "targetApis": list(self.target_apis),
             "fidelity": self.fidelity,
             "priority": self.priority,
             "implementation": self.implementation,
@@ -623,6 +766,7 @@ def _parse_route(index: int, value: Any, registry: ToolRegistry) -> RouteCapabil
         "inputFormat",
         "outputFormat",
         "stages",
+        "targetApis",
         "fidelity",
         "priority",
         "implementation",
@@ -665,6 +809,27 @@ def _parse_route(index: int, value: Any, registry: ToolRegistry) -> RouteCapabil
         stages.add(stage)
     if "*" in stages and len(stages) != 1:
         raise ToolConfigurationError("%s wildcard stage must be used alone" % field)
+    target_apis_value = value.get("targetApis")
+    if (
+        not isinstance(target_apis_value, list)
+        or not target_apis_value
+        or len(target_apis_value) > 4
+    ):
+        raise ToolConfigurationError(
+            "%s.targetApis must be a non-empty bounded array" % field
+        )
+    try:
+        target_apis = tuple(
+            sorted({_normalize_target_api(item) for item in target_apis_value})
+        )
+    except ToolchainRoutingError as exc:
+        raise ToolConfigurationError(
+            "%s.targetApis contains an unsupported API" % field
+        ) from exc
+    if "" in target_apis or len(target_apis) != len(target_apis_value):
+        raise ToolConfigurationError(
+            "%s.targetApis must contain unique concrete APIs" % field
+        )
     fidelity = str(value.get("fidelity", ""))
     if fidelity not in FIDELITIES:
         raise ToolConfigurationError("%s.fidelity is unsupported" % field)
@@ -676,10 +841,56 @@ def _parse_route(index: int, value: Any, registry: ToolRegistry) -> RouteCapabil
         raise ToolConfigurationError(
             "%s HLSL compiler must consume the exact {target_profile} placeholder" % field
         )
-    if operation_name == "transform" and fidelity != "custom-transform":
-        raise ToolConfigurationError("%s.transform must be labelled custom-transform" % field)
-    if fidelity == "reconstructed-source" and output_format not in TEXT_FORMATS:
-        raise ToolConfigurationError("%s reconstructed output must be text" % field)
+    if operation_name == "transform":
+        if fidelity != "custom-transform":
+            raise ToolConfigurationError(
+                "%s.transform must be labelled custom-transform" % field
+            )
+    elif fidelity == "custom-transform":
+        raise ToolConfigurationError(
+            "%s custom-transform fidelity requires a transform operation" % field
+        )
+    elif operation_name == "decompile":
+        if output_format in HIGH_LEVEL_SOURCE_FORMATS:
+            if fidelity != "reconstructed-source":
+                raise ToolConfigurationError(
+                    "%s binary-to-source decompile must be labelled reconstructed-source"
+                    % field
+                )
+        elif output_format in NATIVE_ASSEMBLY_TO_BINARY:
+            if (
+                fidelity != "ir-disassembly"
+                or NATIVE_ASSEMBLY_TO_BINARY[output_format] != input_format
+            ):
+                raise ToolConfigurationError(
+                    "%s native disassembly must preserve its binary family and use ir-disassembly"
+                    % field
+                )
+        else:
+            raise ToolConfigurationError(
+                "%s decompile output must be high-level source or matching native assembly"
+                % field
+            )
+    elif operation_name == "compile":
+        if input_format in HIGH_LEVEL_SOURCE_FORMATS:
+            if fidelity != "native-compile":
+                raise ToolConfigurationError(
+                    "%s source compile must be labelled native-compile" % field
+                )
+        elif input_format in NATIVE_ASSEMBLY_TO_BINARY:
+            if (
+                fidelity != "ir-assembly"
+                or NATIVE_ASSEMBLY_TO_BINARY[input_format] != output_format
+            ):
+                raise ToolConfigurationError(
+                    "%s native assembly must preserve its binary family and use ir-assembly"
+                    % field
+                )
+        else:
+            raise ToolConfigurationError(
+                "%s compile input must be high-level source or matching native assembly"
+                % field
+            )
     priority_raw = value.get("priority", 100)
     if isinstance(priority_raw, bool):
         raise ToolConfigurationError("%s.priority must be an integer" % field)
@@ -713,6 +924,7 @@ def _parse_route(index: int, value: Any, registry: ToolRegistry) -> RouteCapabil
         input_format=input_format,
         output_format=output_format,
         stages=tuple(sorted(stages)),
+        target_apis=target_apis,
         fidelity=fidelity,
         priority=priority,
         implementation=implementation,
@@ -725,7 +937,7 @@ def _parse_route(index: int, value: Any, registry: ToolRegistry) -> RouteCapabil
 _KNOWN_MATRIX = (
     ("dxbc", "dxbc-asm", "FXC/RenderDoc can expose assembly, not original HLSL."),
     ("dxbc", "hlsl", "No Microsoft compiler provides a general DXBC-to-original-HLSL recovery guarantee."),
-    ("hlsl", "dxbc", "FXC compiles Shader Model 2 through 5.1 HLSL to DXBC."),
+    ("hlsl", "dxbc", "The supported FXC/DXBC profile parser covers Shader Model 4.0 through 5.1."),
     ("dxil", "dxil-asm", "DXC disassembles DXIL to an LLVM/DXIL representation, not recovered HLSL."),
     ("dxil", "hlsl", "DXC does not provide a general DXIL-to-original-HLSL decompiler."),
     ("hlsl", "dxil", "DXC compiles Shader Model 6+ HLSL to DXIL."),
@@ -871,6 +1083,61 @@ class ToolchainCatalog:
         ]
         return tuple(sorted(result, key=lambda item: (item.priority, item.validator_id)))
 
+    def strict_spirv_validator(
+        self, input_format: str, stage: str
+    ) -> ValidatorCapability:
+        """Select one integrity-valid, explicitly identified ``spirv-val``.
+
+        Native SPIR-V assembly is only a safe *automatic* fallback when the
+        assembled module is checked in its capture-declared API environment.
+        A validator capability is therefore selected with the same
+        deterministic, fail-closed priority rule as a route.  Merely having a
+        generic ``validate`` operation is insufficient: the trusted catalog
+        must identify it as ``spirv-val`` and bind its exact operation digest.
+        """
+
+        shader_format = normalize_format(input_format)
+        if shader_format not in {"spirv", "opengl-spirv"}:
+            raise ToolchainRoutingError(
+                "strict SPIR-V validation requires a Vulkan or OpenGL SPIR-V format"
+            )
+        normalized_stage = normalize_stage(stage)
+        configured = self.matching_validators(
+            shader_format, normalized_stage, require_integrity=False
+        )
+        ready = tuple(
+            item
+            for item in self.matching_validators(
+                shader_format, normalized_stage, require_integrity=True
+            )
+            if "spirv-val" in item.implementation.casefold()
+        )
+        if not ready:
+            reason = (
+                "configured spirv-val integrity is unavailable"
+                if any(
+                    "spirv-val" in item.implementation.casefold()
+                    for item in configured
+                )
+                else "no fixed spirv-val capability is configured"
+            )
+            raise ToolchainRoutingError(
+                "%s for %s at stage %s"
+                % (reason, shader_format, normalized_stage)
+            )
+        best_priority = min(item.priority for item in ready)
+        best = tuple(item for item in ready if item.priority == best_priority)
+        if len(best) != 1:
+            raise ToolchainRoutingError(
+                "strict spirv-val selection is ambiguous for %s at stage %s: %s"
+                % (
+                    shader_format,
+                    normalized_stage,
+                    ", ".join(item.validator_id for item in best),
+                )
+            )
+        return best[0]
+
     def _integrity(self) -> dict[tuple[str, str], dict[str, Any]]:
         result: dict[tuple[str, str], dict[str, Any]] = {}
         for operation in self.registry.operations():
@@ -886,10 +1153,12 @@ class ToolchainCatalog:
         *,
         allow_reconstructed: bool = True,
         require_integrity: bool = True,
+        target_api: str | None = None,
     ) -> tuple[RouteCapability, ...]:
         source = normalize_format(input_format)
         target = normalize_format(output_format)
         normalized_stage = normalize_stage(stage)
+        api = _normalize_target_api(target_api)
         if normalized_stage not in STAGES or normalized_stage == "*":
             raise ToolchainRoutingError("a concrete supported shader stage is required")
         integrity = self._integrity() if require_integrity else {}
@@ -898,6 +1167,8 @@ class ToolchainCatalog:
             if route.input_format != source or route.output_format != target:
                 continue
             if not route.supports_stage(normalized_stage):
+                continue
+            if not route.supports_api(api):
                 continue
             if not allow_reconstructed and route.is_reconstructed:
                 continue
@@ -915,10 +1186,12 @@ class ToolchainCatalog:
         allow_reconstructed: bool = True,
         max_hops: int = MAX_ROUTE_HOPS,
         require_unique: bool = True,
+        target_api: str | None = None,
     ) -> tuple[RouteCapability, ...]:
         source = normalize_format(input_format)
         target = normalize_format(output_format)
         normalized_stage = normalize_stage(stage)
+        api = _normalize_target_api(target_api)
         if normalized_stage not in STAGES or normalized_stage == "*":
             raise ToolchainRoutingError("a concrete supported shader stage is required")
         if not isinstance(allow_reconstructed, bool):
@@ -937,6 +1210,7 @@ class ToolchainCatalog:
             route
             for route in self._routes
             if route.supports_stage(normalized_stage)
+            and route.supports_api(api)
             and (allow_reconstructed or not route.is_reconstructed)
             and integrity[(route.tool_id, route.operation)]["available"]
         ]
@@ -1005,6 +1279,7 @@ class ToolchainCatalog:
         max_hops: int = MAX_ROUTE_HOPS,
         require_integrity: bool = True,
         limit: int = 16,
+        target_api: str | None = None,
     ) -> tuple[tuple[RouteCapability, ...], ...]:
         """Return bounded deterministic route candidates, best first.
 
@@ -1018,6 +1293,7 @@ class ToolchainCatalog:
         source = normalize_format(input_format)
         target = normalize_format(output_format)
         normalized_stage = normalize_stage(stage)
+        api = _normalize_target_api(target_api)
         if normalized_stage not in STAGES or normalized_stage == "*":
             raise ToolchainRoutingError("a concrete supported shader stage is required")
         if not isinstance(allow_reconstructed, bool):
@@ -1039,6 +1315,7 @@ class ToolchainCatalog:
             route
             for route in self._routes
             if route.supports_stage(normalized_stage)
+            and route.supports_api(api)
             and (allow_reconstructed or not route.is_reconstructed)
             and (
                 not require_integrity
@@ -1135,6 +1412,7 @@ class ToolchainCatalog:
             normalized_stage,
             allow_reconstructed=allow_reconstructed,
             require_integrity=True,
+            target_api=api,
         )
         compile_paths = self.candidate_paths(
             editable,
@@ -1142,6 +1420,7 @@ class ToolchainCatalog:
             normalized_stage,
             allow_reconstructed=allow_reconstructed,
             require_integrity=True,
+            target_api=api,
         )
         configured_decompile_paths = self.candidate_paths(
             original,
@@ -1149,6 +1428,7 @@ class ToolchainCatalog:
             normalized_stage,
             allow_reconstructed=allow_reconstructed,
             require_integrity=False,
+            target_api=api,
         )
         configured_compile_paths = self.candidate_paths(
             editable,
@@ -1156,7 +1436,32 @@ class ToolchainCatalog:
             normalized_stage,
             allow_reconstructed=allow_reconstructed,
             require_integrity=False,
+            target_api=api,
         )
+
+        def profile_applicable(
+            paths: Sequence[tuple[RouteCapability, ...]],
+        ) -> tuple[tuple[RouteCapability, ...], ...]:
+            if original in {"dxbc", "dxil"}:
+                return tuple(paths)
+            return tuple(
+                path
+                for path in paths
+                if not any(
+                    "target_profile"
+                    in self.registry.operation(
+                        route.tool_id, route.operation
+                    ).placeholders
+                    for route in path
+                )
+            )
+
+        decompile_paths = profile_applicable(decompile_paths)
+        compile_paths = profile_applicable(compile_paths)
+        configured_decompile_paths = profile_applicable(
+            configured_decompile_paths
+        )
+        configured_compile_paths = profile_applicable(configured_compile_paths)
 
         if decompile_paths and compile_paths:
             mode = "round-trip"
@@ -1170,16 +1475,34 @@ class ToolchainCatalog:
 
         primary_decompile = decompile_paths[0] if decompile_paths else ()
         primary_compile = compile_paths[0] if compile_paths else ()
-        alternate_route_pairs = [
+        # These are bounded, non-authoritative suggestions for the Agent.  They
+        # are intentionally not an execution queue or an admission allowlist:
+        # every hash-verified candidate in the two inventories below remains
+        # selectable, and the Agent may ignore or reorder these examples after
+        # observing a failure.
+        suggested_pair_indices: list[tuple[int, int]] = []
+        if decompile_paths and compile_paths:
+            frontier = max(len(decompile_paths), len(compile_paths))
+            for index in range(1, frontier):
+                if index < len(decompile_paths):
+                    suggested_pair_indices.append((index, 0))
+                if index < len(compile_paths):
+                    suggested_pair_indices.append((0, index))
+            suggested_pair_indices.extend(
+                (decompile_index, compile_index)
+                for decompile_index in range(1, len(decompile_paths))
+                for compile_index in range(1, len(compile_paths))
+            )
+        suggested_route_pairs = [
             {
                 "decompileCandidateIndex": decompile_index,
                 "compileCandidateIndex": compile_index,
-                "decompileRouteIds": path_ids(decompile_path),
-                "compileRouteIds": path_ids(compile_path),
+                "decompileRouteIds": path_ids(decompile_paths[decompile_index]),
+                "compileRouteIds": path_ids(compile_paths[compile_index]),
             }
-            for decompile_index, decompile_path in enumerate(decompile_paths)
-            for compile_index, compile_path in enumerate(compile_paths)
-            if (decompile_index, compile_index) != (0, 0)
+            for decompile_index, compile_index in suggested_pair_indices[
+                :MAX_ROUTE_SUGGESTIONS
+            ]
         ]
         diagnostics = [
             {
@@ -1231,21 +1554,30 @@ class ToolchainCatalog:
                     "producesExplanatoryIr": not executable_decompile,
                 }
             )
-            if len(decompile_paths) > 1 or alternate_route_pairs:
+            if len(decompile_paths) > 1 or suggested_route_pairs:
                 allowed_actions.append(
                     {
                         "id": "retry-registered-decompiler",
-                        "owner": "program-or-ai-selection",
+                        "owner": "agent",
                         "candidateRoutePaths": [
                             path_ids(path) for path in decompile_paths[1:]
                         ],
-                        # A recovered source is executable-editable only after
-                        # the untouched baseline also passes one fixed reverse
-                        # compiler path.  Keep the finite Cartesian alternatives
-                        # explicit so recovery can retry the same decompiler with
-                        # another compiler instead of incorrectly consuming the
-                        # whole decompile candidate after one compile-probe failure.
-                        "candidateRoutePairs": alternate_route_pairs,
+                        "candidateRoutePairs": suggested_route_pairs,
+                        "automaticAttemptLimit": AUTOMATIC_RECOVERY_ATTEMPT_LIMIT,
+                        "totalAlternativePairCount": max(
+                            0, len(decompile_paths) * len(compile_paths) - 1
+                        ),
+                        "suggestionsAreNonAuthoritative": True,
+                        "maySelectAnyRegisteredCandidatePair": True,
+                        "agentOwnsSelectionOrder": True,
+                        "doNotRepeatCandidatePair": True,
+                        "stopConditions": [
+                            "executable-source-baseline-compile-verified",
+                            "attempt-limit-reached",
+                            "no-untried-registered-pair",
+                            "capture-identity-or-provenance-conflict",
+                            "baseline-interface-evidence-unavailable",
+                        ],
                         "requiresCompileRoute": executable_decompile,
                         "producesExecutableSource": executable_decompile,
                         "producesExplanatoryIr": not executable_decompile,
@@ -1287,6 +1619,35 @@ class ToolchainCatalog:
                 "the selected recovery route requires the physical target API; it "
                 "will not be inferred from shader bytes"
             )
+        strict_validator: ValidatorCapability | None = None
+        native_spirv_lane = bool(
+            original in {"spirv", "opengl-spirv"}
+            and editable in _NATIVE_EDITABLE_FALLBACKS.get(original, ())
+            and (primary_decompile or primary_compile)
+        )
+        if native_spirv_lane:
+            if primary_decompile and not (
+                len(primary_decompile) == 1
+                and primary_decompile[0].input_format == original
+                and primary_decompile[0].output_format == editable
+                and primary_decompile[0].fidelity == "ir-disassembly"
+            ):
+                raise ToolchainRoutingError(
+                    "native SPIR-V source recovery requires one direct "
+                    "ir-disassembly route"
+                )
+            if primary_compile and not (
+                len(primary_compile) == 1
+                and primary_compile[0].input_format == editable
+                and primary_compile[0].output_format == original
+                and primary_compile[0].fidelity == "ir-assembly"
+            ):
+                raise ToolchainRoutingError(
+                    "native SPIR-V compilation requires one direct ir-assembly route"
+                )
+            strict_validator = self.strict_spirv_validator(
+                original, normalized_stage
+            )
         return {
             "schema": RECOVERY_PLAN_SCHEMA,
             "schemaVersion": 1,
@@ -1315,13 +1676,22 @@ class ToolchainCatalog:
             "allowedActions": allowed_actions,
             "aiPolicy": {
                 "mayClassifyDiagnostics": True,
-                "mayChooseOnlyListedActions": True,
+                "agentOwnsTechnicalRoute": True,
+                "mayIgnoreRouteSuggestions": True,
+                "maySelectAnyRegisteredCandidatePair": True,
+                "mayReplanAfterConclusiveFailure": True,
                 "mayAuthorProvisionalSource": bool(compile_paths),
                 "maySupplyCommandOrExecutable": False,
                 "mayAuthorizeApply": False,
             },
             "containsReconstructedSource": any(
                 item.is_reconstructed for item in primary_decompile
+            ),
+            "strictNativeIrValidationRequired": strict_validator is not None,
+            "requiredValidators": (
+                [strict_validator.as_dict()]
+                if strict_validator is not None
+                else []
             ),
             "lane": "candidate" if mode == "round-trip" else "evidence",
             "directReplayApplyAuthorized": False,
@@ -1413,6 +1783,10 @@ class ToolchainCatalog:
                     )
                 ):
                     continue
+                if original in {"spirv", "opengl-spirv"}:
+                    validator = self.strict_spirv_validator(original, stage)
+                    strict["strictNativeIrValidationRequired"] = True
+                    strict["requiredValidators"] = [validator.as_dict()]
                 alternate = self.plan_recovery(
                     original,
                     stage,
@@ -1431,6 +1805,12 @@ class ToolchainCatalog:
                 != strict.get("compileRouteIds")
             ):
                 continue
+            alternate["strictNativeIrValidationRequired"] = bool(
+                strict.get("strictNativeIrValidationRequired")
+            )
+            alternate["requiredValidators"] = list(
+                strict.get("requiredValidators", [])
+            )
             alternate["diagnostics"] = [
                 {
                     "phase": "editable-selection",
@@ -1518,6 +1898,7 @@ class ToolchainCatalog:
         failures = []
         forward: tuple[RouteCapability, ...] | None = None
         reverse: tuple[RouteCapability, ...] | None = None
+        strict_validator: ValidatorCapability | None = None
         editable = ""
         for candidate in editable_candidates:
             if candidate not in TEXT_FORMATS:
@@ -1531,6 +1912,7 @@ class ToolchainCatalog:
                     normalized_stage,
                     allow_reconstructed=allow_reconstructed,
                     require_unique=True,
+                    target_api=api,
                 )
                 candidate_reverse = self.find_path(
                     candidate,
@@ -1538,15 +1920,30 @@ class ToolchainCatalog:
                     normalized_stage,
                     allow_reconstructed=allow_reconstructed,
                     require_unique=True,
+                    target_api=api,
                 )
             except ToolchainRoutingError as exc:
                 if explicit_editable:
                     raise
                 failures.append("%s: %s" % (candidate, exc))
                 continue
+            if original not in {"dxbc", "dxil"} and any(
+                "target_profile"
+                in self.registry.operation(
+                    route.tool_id, route.operation
+                ).placeholders
+                for route in candidate_forward + candidate_reverse
+            ):
+                message = (
+                    "%s: route requires a Direct3D target profile that cannot "
+                    "be derived from this captured format" % candidate
+                )
+                if explicit_editable:
+                    raise ToolchainRoutingError(message)
+                failures.append(message)
+                continue
             if (
-                not explicit_editable
-                and candidate in _NATIVE_EDITABLE_FALLBACKS.get(original, ())
+                candidate in _NATIVE_EDITABLE_FALLBACKS.get(original, ())
                 and not self._is_direct_native_ir_round_trip(
                     original,
                     candidate,
@@ -1554,14 +1951,32 @@ class ToolchainCatalog:
                     candidate_reverse,
                 )
             ):
-                failures.append(
-                    "%s: automatic native-IR fallback requires one direct "
-                    "ir-disassembly and one direct ir-assembly route" % candidate
+                message = (
+                    "%s: native-IR editing requires one direct ir-disassembly "
+                    "and one direct ir-assembly route" % candidate
                 )
+                if explicit_editable:
+                    raise ToolchainRoutingError(message)
+                failures.append(message)
                 continue
+            candidate_validator = None
+            if (
+                original in {"spirv", "opengl-spirv"}
+                and candidate in _NATIVE_EDITABLE_FALLBACKS.get(original, ())
+            ):
+                try:
+                    candidate_validator = self.strict_spirv_validator(
+                        original, normalized_stage
+                    )
+                except ToolchainRoutingError as exc:
+                    if explicit_editable:
+                        raise
+                    failures.append("%s: %s" % (candidate, exc))
+                    continue
             editable = candidate
             forward = candidate_forward
             reverse = candidate_reverse
+            strict_validator = candidate_validator
             break
         if forward is None or reverse is None:
             raise ToolchainRoutingError(
@@ -1601,6 +2016,12 @@ class ToolchainCatalog:
                 ),
             ],
             "containsReconstructedSource": any(item.is_reconstructed for item in forward),
+            "strictNativeIrValidationRequired": strict_validator is not None,
+            "requiredValidators": (
+                [strict_validator.as_dict()]
+                if strict_validator is not None
+                else []
+            ),
             "lane": "candidate",
             "directReplayApplyAuthorized": False,
             "semanticEquivalenceVerified": False,
@@ -1705,6 +2126,63 @@ class ToolchainCatalog:
         if normalized_stage not in STAGES or normalized_stage == "*":
             raise ToolchainRoutingError("a concrete supported shader stage is required")
         integrity = self._integrity()
+        replay_stage_supported = (
+            normalized_stage not in _REPLAY_REPLACEMENT_BLOCKED_STAGES
+        )
+        if normalized_stage in _RAY_STAGES:
+            replay_unsupported_reason = (
+                "Ray shader source/IR can use a registered round trip, but replay "
+                "replacement is fail-closed until the exact export, shader-group, "
+                "pipeline/state-object, local/global root ABI, and SBT records can "
+                "be rebuilt and validated as one rollback-capable transaction."
+            )
+        elif normalized_stage == "library":
+            replay_unsupported_reason = (
+                "Library IR can use a registered round trip, but replay replacement "
+                "is fail-closed until every export and its state-object associations "
+                "can be rebuilt and validated as one rollback-capable transaction."
+            )
+        else:
+            replay_unsupported_reason = None
+        ready_routes = tuple(
+            route
+            for route in self._routes
+            if route.supports_stage(normalized_stage)
+            and integrity[(route.tool_id, route.operation)]["available"]
+        )
+
+        def unique_direct_route(
+            values: Sequence[RouteCapability], source: str, target: str
+        ) -> tuple[RouteCapability | None, str]:
+            if not values:
+                return None, ""
+
+            def score(route: RouteCapability) -> tuple[int, int, int]:
+                return (
+                    int(route.is_reconstructed),
+                    int(route.fidelity == "custom-transform"),
+                    route.priority,
+                )
+
+            best_score = min(score(route) for route in values)
+            best = tuple(
+                sorted(
+                    (route for route in values if score(route) == best_score),
+                    key=lambda route: route.route_id,
+                )
+            )
+            if len(best) != 1:
+                return (
+                    None,
+                    "Automatic route selection is ambiguous for %s -> %s: %s."
+                    % (
+                        source,
+                        target,
+                        ", ".join(route.route_id for route in best),
+                    ),
+                )
+            return best[0], ""
+
         rows = []
         known_pairs = {(source, target) for source, target, unused in _KNOWN_MATRIX}
         all_pairs = list(_KNOWN_MATRIX)
@@ -1735,6 +2213,62 @@ class ToolchainCatalog:
                 and integrity[(route.tool_id, route.operation)]["available"]
             ]
             round_trip_ready = bool(ready and reverse_ready)
+            selected_forward, forward_selection_error = unique_direct_route(
+                ready, source, target
+            )
+            selected_reverse, reverse_selection_error = unique_direct_route(
+                reverse_ready, target, source
+            )
+            unique_round_trip_ready = bool(
+                selected_forward is not None and selected_reverse is not None
+            )
+            strict_spirv_native = (source, target) in {
+                ("spirv", "spirv-asm"),
+                ("opengl-spirv", "opengl-spirv-asm"),
+            }
+            validation_format = (
+                source if source in BINARY_FORMATS and reverse_ready else target
+            )
+            configured_validators = self.matching_validators(
+                validation_format, normalized_stage, require_integrity=False
+            )
+            ready_validators = self.matching_validators(
+                validation_format, normalized_stage, require_integrity=True
+            )
+            strict_validator_ready = True
+            strict_validator_reason = ""
+            if strict_spirv_native and round_trip_ready:
+                try:
+                    self.strict_spirv_validator(source, normalized_stage)
+                except ToolchainRoutingError as exc:
+                    strict_validator_ready = False
+                    strict_validator_reason = str(exc)
+            automatic_round_trip_ready = bool(
+                unique_round_trip_ready
+                and strict_validator_ready
+            )
+            if not configured:
+                unsupported_reason = (
+                    "No provider declares this format edge for the selected stage."
+                )
+            elif not ready:
+                unsupported_reason = (
+                    "The declared provider failed its executable/fixed-file "
+                    "integrity check."
+                )
+            elif forward_selection_error:
+                unsupported_reason = forward_selection_error
+            elif not reverse_ready:
+                unsupported_reason = (
+                    "The representation is explanatory only because no "
+                    "integrity-valid reverse compiler/assembler is configured."
+                )
+            elif reverse_selection_error:
+                unsupported_reason = reverse_selection_error
+            elif not strict_validator_ready:
+                unsupported_reason = strict_validator_reason
+            else:
+                unsupported_reason = None
             rows.append(
                 {
                     "inputFormat": source,
@@ -1744,16 +2278,30 @@ class ToolchainCatalog:
                     "configuredRouteIds": [item.route_id for item in configured],
                     "readyRouteIds": [item.route_id for item in ready],
                     "roundTripReady": round_trip_ready,
+                    "automaticRoundTripReady": automatic_round_trip_ready,
                     "reverseRouteIds": [item.route_id for item in reverse_ready],
                     "readyValidatorIds": [
-                        item.validator_id
-                        for item in self.matching_validators(target, normalized_stage)
+                        item.validator_id for item in ready_validators
                     ],
+                    "recognized": True,
+                    "analyzable": bool(ready) or source in TEXT_FORMATS,
+                    "explanatory": bool(ready),
+                    "editable": automatic_round_trip_ready,
+                    "compilable": bool(reverse_ready),
+                    "externalValidatorConfigured": bool(configured_validators),
+                    "externalValidatorReady": bool(ready_validators),
+                    "externalValidatorExecuted": False,
+                    "replayAbiValidated": False,
+                    "replayReplaceable": False,
+                    "workspaceStageSupported": True,
+                    "replayStageSupported": replay_stage_supported,
+                    "replayUnsupportedReason": replay_unsupported_reason,
+                    "unsupportedReason": unsupported_reason,
                     "containsReconstructedSource": any(item.is_reconstructed for item in ready),
                     "boundary": boundary,
                     "lane": (
                         "executable-editable"
-                        if round_trip_ready
+                        if automatic_round_trip_ready
                         and target
                         in {
                             "dxbc-asm",
@@ -1778,6 +2326,84 @@ class ToolchainCatalog:
                     in {"dxbc", "dxil", "spirv", "opengl-spirv"},
                 }
             )
+
+        format_capabilities = []
+        content_detection = {
+            "dxbc": "exact-container",
+            "dxil": "exact-container",
+            "spirv": "strong-header-plus-structural-walk-at-artifact-gates",
+            "opengl-spirv": "capture-declared-environment-plus-physical-spirv",
+            "dxbc-asm": "strong-text-markers",
+            "dxil-asm": "strong-text-markers",
+            "spirv-asm": "strong-text-markers",
+            "opengl-spirv-asm": "capture-declared-environment-plus-text-markers",
+            "hlsl": "conservative-source-markers",
+            "glsl": "conservative-source-markers",
+            "essl": "conservative-source-markers",
+            "msl": "conservative-source-markers",
+            "wgsl": "conservative-source-markers",
+            "slang": "declared-vocabulary-only",
+        }
+        for shader_format in sorted(FORMATS):
+            outgoing = tuple(
+                route for route in ready_routes if route.input_format == shader_format
+            )
+            compiling = tuple(
+                route
+                for route in outgoing
+                if route.output_format in BINARY_FORMATS
+            )
+            validators_for_format = self.matching_validators(
+                shader_format, normalized_stage, require_integrity=True
+            )
+            vocabulary_only = shader_format == "slang" or (
+                not outgoing
+                and shader_format in {"essl", "msl", "wgsl", "slang"}
+            )
+            uniquely_editable_rows = tuple(
+                row
+                for row in rows
+                if row["outputFormat"] == shader_format
+                and row["automaticRoundTripReady"] is True
+            )
+            format_capabilities.append(
+                {
+                    "format": shader_format,
+                    "recognized": True,
+                    "contentDetection": content_detection[shader_format],
+                    "analyzable": bool(outgoing) or (
+                        shader_format in TEXT_FORMATS and not vocabulary_only
+                    ),
+                    "explanatory": bool(outgoing),
+                    "editable": (
+                        shader_format in TEXT_FORMATS
+                        and bool(uniquely_editable_rows)
+                    ),
+                    "compilable": bool(compiling),
+                    "externalValidatorReady": bool(validators_for_format),
+                    "replayAbiValidated": False,
+                    "replayReplaceable": False,
+                    "workspaceStageSupported": True,
+                    "replayStageSupported": replay_stage_supported,
+                    "replayUnsupportedReason": replay_unsupported_reason,
+                    "readyOutgoingRouteIds": [
+                        route.route_id for route in outgoing
+                    ],
+                    "unsupportedReason": (
+                        "The format name is recognized, but no integrity-valid "
+                        "provider route exists for this stage; recognition is not "
+                        "an end-to-end decompile/compile capability."
+                        if not outgoing
+                        else (
+                            "No uniquely selectable complete round trip makes this "
+                            "text format automatically editable."
+                            if shader_format in TEXT_FORMATS
+                            and not uniquely_editable_rows
+                            else None
+                        )
+                    ),
+                }
+            )
         return {
             "schema": "renderdoc-ultra-shader-toolchain-diagnostics/v1",
             "schemaVersion": 1,
@@ -1788,6 +2414,20 @@ class ToolchainCatalog:
             "operations": [
                 integrity[key] for key in sorted(integrity, key=lambda item: (item[0], item[1]))
             ],
+            "capabilityAxes": {
+                "recognized": "The format identifier is accepted by the router; this alone is not analysis or conversion.",
+                "analyzable": "Text can be inspected or an integrity-valid outgoing provider exists; this does not prove a semantic explanation.",
+                "explanatory": "A ready forward route can emit evidence for review; it may be one-way.",
+                "editable": "Exactly one best route is selectable in each direction and every strict static prerequisite is present; workspace probes must still run.",
+                "compilable": "A ready route can emit a binary artifact; no validator, ABI, or replay claim is implied.",
+                "externalValidator": "A fixed validator is configured and integrity-valid; diagnostics do not execute it.",
+                "replayAbi": "Always false here; only fresh capture-bound replay reflection may validate ABI.",
+                "replayReplaceable": "Always false here; route diagnostics never authorize or perform replacement.",
+                "workspaceStageSupported": "The stage may use a real registered source/IR round trip; Ray/Library can be true here independently of replay replacement.",
+                "replayStageSupported": "The stage class is admitted to the ordinary replay replacement transaction; Ray/Library are false until their export/state-object/SBT transaction exists.",
+                "replayUnsupportedReason": "A stage-level replay boundary kept separate from route-level unsupportedReason.",
+            },
+            "formatCapabilities": format_capabilities,
             "matrix": rows,
             "guarantee": (
                 "Availability and format routing only. Reconstructed source is not the original "
@@ -1836,6 +2476,7 @@ class ToolchainCatalog:
                     "workspace_dir": str(run_root),
                     "stage": stage,
                     "entry_point": "main",
+                    "captured_entry_point": "main",
                     "revision": str(start_index),
                     "capture_id": "round-trip-smoke",
                     "raw_sha256": baseline_hash,
@@ -1870,9 +2511,10 @@ class ToolchainCatalog:
         target_profile: str,
         target_api: str,
         job_index: int,
-    ) -> tuple[Path, str, list[dict[str, Any]], int]:
+    ) -> tuple[Path, str, list[dict[str, Any]], int, str]:
         current_path = initial_path
         current_format = initial_format
+        current_entry_point = str(entry_point)
         jobs: list[dict[str, Any]] = []
         baseline_hash = _sha256_file(baseline_path)
         for route in path:
@@ -1889,6 +2531,11 @@ class ToolchainCatalog:
             staged_input = job_dir / ("input" + _FORMAT_SUFFIX[current_format])
             atomic_write_bytes(staged_input, current_path.read_bytes())
             output_path = job_dir / ("output" + _FORMAT_SUFFIX[route.output_format])
+            hop_entry_point = current_entry_point
+            if current_format in {"spirv", "opengl-spirv"}:
+                hop_entry_point = physical_spirv_entry_point(
+                    staged_input.read_bytes(), stage, current_entry_point
+                )
             values = {
                 "input": str(staged_input),
                 "output": str(output_path),
@@ -1896,7 +2543,8 @@ class ToolchainCatalog:
                 "job_dir": str(job_dir),
                 "workspace_dir": str(run_root),
                 "stage": stage,
-                "entry_point": entry_point,
+                "entry_point": hop_entry_point,
+                "captured_entry_point": str(entry_point),
                 "revision": str(job_index),
                 "capture_id": "round-trip-smoke",
                 "raw_sha256": baseline_hash,
@@ -1935,8 +2583,29 @@ class ToolchainCatalog:
             )
             current_path = output_path
             current_format = route.output_format
+            if route.output_format in {"spirv", "opengl-spirv"}:
+                current_entry_point = physical_spirv_entry_point(
+                    output_path.read_bytes(), stage, hop_entry_point
+                )
+                jobs[-1]["physicalEntryPoint"] = current_entry_point
+            elif (
+                route.input_format in {"spirv", "opengl-spirv"}
+                and route.output_format == "hlsl"
+            ):
+                # Only routes whose pinned operation consumes the separate
+                # capture-name placeholder claim to rename the emitted HLSL
+                # entry.  Generic/legacy routes retain the parsed physical
+                # SPIR-V entry for the following compile hop.
+                if "captured_entry_point" in operation.placeholders:
+                    current_entry_point = str(entry_point)
+                else:
+                    current_entry_point = hop_entry_point
+                jobs[-1]["physicalEntryPoint"] = hop_entry_point
+                jobs[-1]["emittedEntryPoint"] = current_entry_point
+            else:
+                current_entry_point = hop_entry_point
             job_index += 1
-        return current_path, current_format, jobs, job_index
+        return current_path, current_format, jobs, job_index, current_entry_point
 
     def round_trip_smoke(
         self,
@@ -2006,12 +2675,14 @@ class ToolchainCatalog:
             editable,
             normalized_stage,
             allow_reconstructed=allow_reconstructed,
+            target_api=target_api_value,
         )
         reverse = self.find_path(
             editable,
             original_format,
             normalized_stage,
             allow_reconstructed=allow_reconstructed,
+            target_api=target_api_value,
         )
         if not target_profile_value and any(
             "target_profile"
@@ -2064,7 +2735,13 @@ class ToolchainCatalog:
             "error": None,
         }
         try:
-            middle, middle_format, jobs, next_index = self._execute_path(
+            (
+                middle,
+                middle_format,
+                jobs,
+                next_index,
+                middle_entry_point,
+            ) = self._execute_path(
                 original_copy,
                 original_format,
                 forward,
@@ -2076,13 +2753,19 @@ class ToolchainCatalog:
                 target_api_value,
                 1,
             )
-            final, final_format, reverse_jobs, unused_index = self._execute_path(
+            (
+                final,
+                final_format,
+                reverse_jobs,
+                unused_index,
+                _final_entry_point,
+            ) = self._execute_path(
                 middle,
                 middle_format,
                 reverse,
                 destination,
                 normalized_stage,
-                str(entry_point),
+                middle_entry_point,
                 original_copy,
                 target_profile_value,
                 target_api_value,
@@ -2120,6 +2803,35 @@ class ToolchainCatalog:
         return report
 
 
+def _default_route_target_apis(
+    input_format: str, output_format: str
+) -> tuple[str, ...]:
+    """Derive conservative physical-API applicability for generated routes.
+
+    Custom route documents still carry the resulting explicit ``targetApis``
+    field.  The derivation exists only in the trusted config builder so the
+    runtime never guesses applicability from a route selected by an agent.
+    """
+
+    source = normalize_format(input_format)
+    target = normalize_format(output_format)
+    formats = {source, target}
+    if formats & {"opengl-spirv", "opengl-spirv-asm"}:
+        return ("opengl",)
+    if formats & {"dxil", "dxil-asm"}:
+        return ("d3d12",)
+    if formats & {"dxbc", "dxbc-asm"}:
+        return ("d3d11", "d3d12")
+    if formats & {"spirv", "spirv-asm"}:
+        # SPIRV-Cross HLSL is used only as a Direct3D reconstruction step and
+        # requires an exact Direct3D profile.  Other generic SPIR-V routes are
+        # Vulkan-environment routes; OpenGL has distinct format identifiers.
+        if target == "hlsl":
+            return ("d3d11", "d3d12")
+        return ("vulkan",)
+    return ("d3d11", "d3d12", "opengl", "vulkan")
+
+
 def route_record(
     registry: ToolRegistry,
     *,
@@ -2133,12 +2845,18 @@ def route_record(
     priority: int,
     implementation: str,
     source_url: str,
+    target_apis: Iterable[str] | None = None,
     license_name: str = "",
     caveats: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Build one digest-bound route record for trusted config generators."""
 
     operation_record: ToolOperation = registry.operation(tool_id, operation)
+    selected_target_apis = tuple(
+        target_apis
+        if target_apis is not None
+        else _default_route_target_apis(input_format, output_format)
+    )
     return {
         "routeId": route_id,
         "toolId": tool_id,
@@ -2147,6 +2865,7 @@ def route_record(
         "inputFormat": input_format,
         "outputFormat": output_format,
         "stages": list(stages),
+        "targetApis": list(selected_target_apis),
         "fidelity": fidelity,
         "priority": priority,
         "implementation": implementation,

@@ -130,6 +130,7 @@ class _FakeLauncher:
         self.raise_count = 0
         self.activate_count = 0
         self.close_count = 0
+        self.abandon_count = 0
 
     def isVisible(self) -> bool:
         return self.visible
@@ -147,6 +148,10 @@ class _FakeLauncher:
     def close(self) -> None:
         self.visible = False
         self.close_count += 1
+
+    def abandon_capture_restore(self) -> bool:
+        self.abandon_count += 1
+        return True
 
 
 class ProjectLauncherRegistrationTests(unittest.TestCase):
@@ -281,6 +286,29 @@ class ProjectLauncherRegistrationTests(unittest.TestCase):
 
         timer.timeout.emit()
         self.assertEqual([], self.launchers)
+
+    def test_file_menu_reuses_a_hidden_launcher_with_an_active_restore(self) -> None:
+        self.bridge._register_project_launcher_ui(self.context)
+        menu_callback = self.context.extensions.window_menus[0][2]
+
+        menu_callback()
+        launcher = self.launchers[0]
+        launcher.visible = False
+        menu_callback()
+
+        self.assertEqual(1, len(self.launchers))
+        self.assertIs(launcher, self.bridge._project_launcher_ui)
+        self.assertEqual(2, launcher.show_count)
+        self.assertEqual(2, launcher.raise_count)
+        self.assertEqual(2, launcher.activate_count)
+
+    def test_capture_change_can_abandon_the_launchers_restore_status(self) -> None:
+        self.bridge._register_project_launcher_ui(self.context)
+        self.context.extensions.window_menus[0][2]()
+        launcher = self.launchers[0]
+
+        self.assertTrue(self.bridge._abandon_project_launcher_restore())
+        self.assertEqual(1, launcher.abandon_count)
 
 
 if __name__ == "__main__":

@@ -36,8 +36,10 @@
 #include "maths/formatpacking.h"
 #include "maths/matrix.h"
 #include "replay/dummy_driver.h"
+#include "replay/replay_timing.h"
 #include "serialise/rdcfile.h"
 #include "strings/string_utils.h"
+#include "d3d12_command_list.h"
 #include "d3d12_command_queue.h"
 #include "d3d12_debug.h"
 #include "d3d12_device.h"
@@ -74,13 +76,29 @@ void D3D12Replay::Shutdown()
 {
   bool apiValidation = m_pDevice->GetReplayOptions().apiValidation;
 
+  DrainTextureDisplaySubmit();
+
   // ReplayLab event CBuffer resources are replay-owned and may still be referenced by the cached
   // CPU render state. Restore that state and release every shadow before destroying the device.
   ClearEventCBufferOverrides();
 
+  if(!m_TextureSnapshots.empty() || !m_InitialStateSourceCache.empty())
+  {
+    // Snapshot creation is intentionally asynchronous during use. Teardown must drain that work
+    // before dropping the application's explicit D3D12 resource references.
+    m_pDevice->ExecuteLists();
+    m_pDevice->FlushLists(true);
+  }
+
   for(size_t i = 0; i < m_ProxyResources.size(); i++)
     m_ProxyResources[i]->Release();
   m_ProxyResources.clear();
+  m_TextureSnapshots.clear();
+
+  for(auto &entry : m_InitialStateSourceCache)
+    SAFE_RELEASE(entry.second);
+  m_InitialStateSourceCache.clear();
+  SAFE_RELEASE(m_InitialStateCacheAdapter);
 
   DXBC::ResetSearchDirsCache();
 
@@ -116,6 +134,105 @@ void D3D12Replay::Shutdown()
   }
 
   Threading::JobSystem::Shutdown();
+}
+
+ID3D12Resource *D3D12Replay::ResolveInitialStateCopySource(
+    ID3D12Resource *wrappedSource, ID3D12GraphicsCommandListX *wrappedList, bool allowLoading)
+{
+  ID3D12Resource *source = Unwrap(wrappedSource);
+  const D3D12_RESOURCE_DESC desc = source->GetDesc();
+
+  // Loading uses the original upload source, so all capture allocations are known before we
+  // reserve extra VRAM. Validation/conservative replay also retains the original path for A/B QA.
+  if(m_pDevice->ShouldUseConservativeReplaySync(allowLoading) ||
+     desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+    return source;
+
+  const ResourceId id = GetResID(wrappedSource);
+  auto found = m_InitialStateSourceCache.find(id);
+  if(found != m_InitialStateSourceCache.end())
+  {
+    if(found->second)
+    {
+      AddReplayTimingCounter(ReplayTimingCounter::InitialUploadCacheHits);
+      AddReplayTimingCounter(ReplayTimingCounter::InitialUploadCacheBytes, desc.Width);
+      return found->second;
+    }
+    AddReplayTimingCounter(ReplayTimingCounter::InitialUploadCacheFallbackBytes, desc.Width);
+    return source;
+  }
+
+  D3D12_HEAP_PROPERTIES sourceHeap = {};
+  if(FAILED(source->GetHeapProperties(&sourceHeap, NULL)) ||
+     sourceHeap.Type != D3D12_HEAP_TYPE_UPLOAD)
+    return source;
+
+  // Cache a rejected source too: repeated interaction must not retry allocations or query DXGI
+  // per resource when this capture has exhausted its spare budget. No eviction or GPU drain is
+  // performed while dragging. A new capture gets a fresh budget and cache.
+  m_InitialStateSourceCache[id] = NULL;
+  const auto fallback = [&]() {
+    AddReplayTimingCounter(ReplayTimingCounter::InitialUploadCacheFallbackBytes, desc.Width);
+    return source;
+  };
+
+  if(desc.Width < 64ULL * 1024)
+    return fallback();
+
+  if(!m_InitialStateCacheAdapterChecked)
+  {
+    m_InitialStateCacheAdapterChecked = true;
+    IDXGIAdapter *adapter = NULL;
+    if(m_pFactory && SUCCEEDED(EnumAdapterByLuid(m_pFactory, m_pDevice->GetAdapterLuid(), &adapter)))
+    {
+      adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void **)&m_InitialStateCacheAdapter);
+      adapter->Release();
+    }
+  }
+
+  DXGI_QUERY_VIDEO_MEMORY_INFO memory = {};
+  if(!m_InitialStateCacheAdapter ||
+     FAILED(m_InitialStateCacheAdapter->QueryVideoMemoryInfo(
+         0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory)))
+    return fallback();
+
+  const D3D12_RESOURCE_ALLOCATION_INFO allocation =
+      m_pDevice->GetReal()->GetResourceAllocationInfo(0, 1, &desc);
+  const uint64_t reserve = RDCMAX(512ULL * 1024 * 1024, memory.Budget / 8);
+  if(allocation.SizeInBytes == ~0ULL || memory.CurrentUsage >= memory.Budget ||
+     memory.Budget - memory.CurrentUsage <= reserve ||
+     allocation.SizeInBytes > memory.Budget - memory.CurrentUsage - reserve ||
+     m_InitialStateSourceCacheBytes + allocation.SizeInBytes > memory.Budget / 3)
+    return fallback();
+
+  D3D12_HEAP_PROPERTIES heap = {};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap.CreationNodeMask = heap.VisibleNodeMask = 1;
+  ID3D12Resource *resident = NULL;
+  HRESULT hr = m_pDevice->GetReal()->CreateCommittedResource(
+      &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+      __uuidof(ID3D12Resource), (void **)&resident);
+  if(FAILED(hr))
+    return fallback();
+
+  resident->SetName(L"RenderDoc immutable initial-state source");
+  ID3D12GraphicsCommandList *list = Unwrap(wrappedList);
+  list->CopyBufferRegion(resident, 0, source, 0, desc.Width);
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = resident;
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  list->ResourceBarrier(1, &barrier);
+
+  // The copy and its first consumer share this list/queue. The existing initial-state dependencies
+  // order later captured queues, and the next full replay drains prior work before reusing it.
+  // These are capture initial bytes, not event outputs: live edits never make this source stale.
+  m_InitialStateSourceCache[id] = resident;
+  m_InitialStateSourceCacheBytes += allocation.SizeInBytes;
+  AddReplayTimingCounter(ReplayTimingCounter::InitialUploadCachePromotedBytes, desc.Width);
+  return resident;
 }
 
 void D3D12Replay::Initialise(IDXGIFactory1 *factory, D3D12DevConfiguration *config)
@@ -279,7 +396,48 @@ void D3D12Replay::DestroyResources()
 
 RDResult D3D12Replay::ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers)
 {
-  return m_pDevice->ReadLogInitialisation(rdc, storeStructuredBuffers);
+  RDResult result = m_pDevice->ReadLogInitialisation(rdc, storeStructuredBuffers);
+  if(result != ResultCode::Succeeded || m_pDevice->ShouldUseConservativeReplaySync(true))
+    return result;
+
+  // All captured allocations and the writable-resource set are now known. Pay the one-time
+  // upload cost while opening the capture, before the first user gesture, without replaying or
+  // changing any captured resource contents. A separate timing API keeps this out of scrub stats.
+  ScopedReplayTiming timing("D3D12InitialWarmup", 0, 0, eReplay_Full, true);
+  D3D12ResourceManager *manager = m_pDevice->GetResourceManager();
+  ID3D12GraphicsCommandListX *list = NULL;
+  for(ResourceId id : manager->GetInitialContentResourceIDs())
+  {
+    ID3D12DeviceChild *live = manager->GetResource(id);
+    if(!live || m_pDevice->IsReadOnlyResource(GetResID(live)))
+      continue;
+
+    D3D12InitialContents data = manager->GetInitialContents(id);
+    if((data.resourceType != Resource_Resource && data.resourceType != Resource_Heap) ||
+       (data.tag != D3D12InitialContents::Copy && data.tag != D3D12InitialContents::ForceCopy) ||
+       !data.resource)
+      continue;
+
+    if(!list)
+    {
+      list = m_pDevice->GetNewList();
+      if(!list)
+        return m_pDevice->FatalErrorCheck();
+    }
+    ResolveInitialStateCopySource((ID3D12Resource *)data.resource, list, true);
+  }
+
+  if(list)
+  {
+    HRESULT hr = list->Close();
+    CHECK_HR(m_pDevice, hr);
+    if(FAILED(hr))
+      return m_pDevice->FatalErrorCheck();
+    // Keep the conservative default: there may also be loading-time debug lists pending.
+    m_pDevice->ExecuteLists(NULL, true);
+    m_pDevice->FlushLists(true);
+  }
+  return m_pDevice->FatalErrorCheck();
 }
 
 rdcarray<GPUDevice> D3D12Replay::GetAvailableGPUs()
@@ -345,16 +503,68 @@ APIProperties D3D12Replay::GetAPIProperties()
   return ret;
 }
 
+void D3D12Replay::ConfigureReplayCheckpoints(
+    const ReplayCheckpointConfig &config, const rdcarray<ReplayCheckpointCandidate> &candidates)
+{
+  m_pDevice->ConfigureReplayCheckpoints(config, candidates);
+}
+
+void D3D12Replay::InvalidateReplayCheckpoints(uint32_t firstAffectedEvent)
+{
+  m_pDevice->InvalidateReplayCheckpoints(firstAffectedEvent);
+}
+
+ReplayCheckpointStats D3D12Replay::GetReplayCheckpointStats()
+{
+  return m_pDevice->GetReplayCheckpointStats();
+}
+
+rdcstr D3D12Replay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
+{
+  return m_pDevice->SetReplayBufferPatches(patches);
+}
+
+uint32_t D3D12Replay::GetReplayBufferPatchFirstAffectedEvent() const
+{
+  return m_pDevice->GetReplayBufferPatchFirstAffectedEvent();
+}
+
 void D3D12Replay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
 {
+  const bool ordinaryTarget = replayType == eReplay_OnlyDraw && !m_EventCBufferStateApplied &&
+                              m_EventCBufferOverrides.empty() &&
+                              m_pDevice->GetQueue()->GetCommandData()->m_ActionCallback == NULL;
+  const bool ordinaryRoot = replayType == eReplay_WithoutDraw && !m_ReplayCheckpointBypass &&
+                            !m_EventCBufferStateApplied && m_EventCBufferOverrides.empty() &&
+                            m_pDevice->GetQueue()->GetCommandData()->m_ActionCallback == NULL;
   if(replayType == eReplay_OnlyDraw)
   {
+    const bool previousFeedbackScope = m_KnownOrdinaryTargetFeedback;
+    m_KnownOrdinaryTargetFeedback = ordinaryTarget;
     bool replayed = FetchShaderFeedback(endEventID);
+    m_KnownOrdinaryTargetFeedback = previousFeedbackScope;
     if(replayed)
+    {
+      if(ordinaryTarget)
+        m_pDevice->CompleteLiveForwardTarget(endEventID);
       return;
+    }
   }
 
-  m_pDevice->ReplayLog(0, endEventID, replayType);
+  // Internal analysis paths call the device directly and retain its default checkpoint bypass.
+  // Only the ordinary driver entry may reuse a prefix; the shared controller additionally
+  // bypasses this entry for canonical verification, analysis, and temporary event overrides.
+  // The controller intentionally bypasses checkpoints around every OnlyDraw, even without an
+  // event edit. That flag controls prefix reuse, not whether this unmodified target can preserve
+  // the preceding root replay's complete dirty-write proof.
+  const bool naturalReference = m_ReplayCheckpointBypass && m_ReplayCheckpointNaturalReference &&
+                                !m_EventCBufferStateApplied &&
+                                m_pDevice->GetQueue()->GetCommandData()->m_ActionCallback == NULL;
+  m_pDevice->ReplayLog(0, endEventID, replayType, !m_ReplayCheckpointBypass, false, ordinaryTarget,
+                      naturalReference, ordinaryRoot);
+
+  if(ordinaryTarget)
+    m_pDevice->CompleteLiveForwardTarget(endEventID);
 
   if(replayType == eReplay_WithoutDraw)
     m_pDevice->ReplayWorkWaitForIdle();
@@ -739,7 +949,12 @@ void D3D12Replay::FreeCustomShader(ResourceId id)
 
 rdcarray<EventUsage> D3D12Replay::GetUsage(ResourceId id)
 {
-  if(m_pDevice->GetResourceList().find(id) == m_pDevice->GetResourceList().end())
+  // Shader bytecode is exposed through GetResources(), but it is not an ID3D12Resource and
+  // therefore is intentionally absent from the device resource list. Keep the ordinary resource
+  // gate while allowing the bounded representative-Shader usage index populated during action
+  // construction.
+  if(m_pDevice->GetResourceList().find(id) == m_pDevice->GetResourceList().end() &&
+     !WrappedID3D12Shader::IsShader(id))
   {
     return {EventUsage(0, ResourceUsage::Unused)};
   }
@@ -4065,6 +4280,8 @@ rdcstr D3D12Replay::ApplyEventCBufferOverrides(uint32_t eventId)
   if(pending.empty())
     return {};
 
+  m_pDevice->InvalidateLiveForward("eventCBufferOverride");
+
   D3D12ResourceManager *rm = m_pDevice->GetResourceManager();
   D3D12CommandData &cmd = *m_pDevice->GetQueue()->GetCommandData();
   D3D12RenderState &state = cmd.m_RenderState;
@@ -4290,6 +4507,7 @@ void D3D12Replay::ReplaceResource(ResourceId from, ResourceId to)
 
   // A non-shader replacement cannot affect a derived shader PSO.
   m_pDevice->GetResourceManager()->ReplaceResource(from, to);
+  m_pDevice->InvalidatePreparedReplayCache();
 
   ClearPostVSCache();
   ClearFeedbackCache();
@@ -4311,6 +4529,7 @@ void D3D12Replay::RemoveReplacement(ResourceId id)
     return;
 
   rm->RemoveReplacement(id);
+  m_pDevice->InvalidatePreparedReplayCache();
 
   ClearPostVSCache();
   ClearFeedbackCache();
@@ -4395,6 +4614,7 @@ rdcstr D3D12Replay::ReplaceTargetShaderChecked(ResourceId from, ResourceId to)
 
   ClearPostVSCache();
   ClearFeedbackCache();
+  m_pDevice->InvalidatePreparedReplayCache();
   return {};
 }
 
@@ -4438,6 +4658,7 @@ rdcstr D3D12Replay::RemoveTargetShaderReplacementChecked(ResourceId id)
 
   ClearPostVSCache();
   ClearFeedbackCache();
+  m_pDevice->InvalidatePreparedReplayCache();
   return {};
 }
 
@@ -4682,6 +4903,7 @@ rdcstr D3D12Replay::RefreshDerivedReplacementsChecked(ResourceId requiredShader)
   // Nothing above changed a mapping. Commit only after every required PSO and root signature has
   // succeeded, then retire old derived PSOs after the device is idle.
   m_pDevice->DeviceWaitForIdle();
+  m_pDevice->InvalidatePreparedReplayCache();
 
   for(PendingPipeline &item : pending)
   {
@@ -5280,6 +5502,7 @@ void D3D12Replay::BuildCustomShader(ShaderEncoding sourceEncoding, const bytebuf
 
 ResourceId D3D12Replay::ApplyCustomShader(TextureDisplay &display)
 {
+  m_pDevice->InvalidateLiveForward("customShaderAnalysis");
   ID3D12Resource *resource = NULL;
 
   {
@@ -5392,17 +5615,349 @@ ResourceId D3D12Replay::ApplyCustomShader(TextureDisplay &display)
   return m_CustomShaderResourceId;
 }
 
-#pragma region not yet implemented
+#pragma region proxy resources
 
 ResourceId D3D12Replay::CreateProxyTexture(const TextureDescription &templateTex)
 {
-  return ResourceId();
+  // ReplayController's persistent event snapshots deliberately use this small common subset. Keep
+  // the proxy implementation equally strict instead of silently changing unsupported topology.
+  if(templateTex.dimension != 2 || templateTex.type != TextureType::Texture2D ||
+     templateTex.depth != 1 || templateTex.arraysize != 1 || templateTex.mips != 1 ||
+     templateTex.msSamp != 1 || templateTex.width == 0 || templateTex.height == 0)
+  {
+    RDCERR("Unsupported D3D12 proxy texture description");
+    return ResourceId();
+  }
+
+  const DXGI_FORMAT format = MakeDXGIFormat(templateTex.format);
+  if(format == DXGI_FORMAT_UNKNOWN)
+  {
+    RDCERR("Unsupported D3D12 proxy texture format %s", templateTex.format.Name().c_str());
+    return ResourceId();
+  }
+
+  D3D12_HEAP_PROPERTIES heapProps = {};
+  heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heapProps.CreationNodeMask = 1;
+  heapProps.VisibleNodeMask = 1;
+
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = templateTex.width;
+  desc.Height = templateTex.height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = format;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+  ID3D12Resource *proxy = NULL;
+  HRESULT hr = m_pDevice->CreateCommittedResource(
+      &heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
+      __uuidof(ID3D12Resource), (void **)&proxy);
+  if(FAILED(hr) || proxy == NULL)
+  {
+    RDCERR("Couldn't create D3D12 proxy texture: %s", ToStr(hr).c_str());
+    return ResourceId();
+  }
+
+  proxy->SetName(L"RenderDoc persistent event texture snapshot");
+  m_ProxyResources.push_back(proxy);
+  return GetResID(proxy);
+}
+
+ResourceId D3D12Replay::CreateProxyTextureSnapshot(const TextureDescription &templateTex)
+{
+  ResourceId snapshot = CreateProxyTexture(templateTex);
+  if(snapshot != ResourceId())
+    m_TextureSnapshots.push_back(snapshot);
+  return snapshot;
+}
+
+ResourceId D3D12Replay::CreateTextureSnapshot(ResourceId source, const Subresource &sourceSub,
+                                              CompType typeCast, Subresource &snapshotSub)
+{
+  (void)typeCast;
+
+  auto sourceIt = m_pDevice->GetResourceList().find(source);
+  if(sourceIt == m_pDevice->GetResourceList().end() || sourceIt->second == NULL)
+    return ResourceId();
+
+  ID3D12Resource *sourceResource = sourceIt->second;
+  const D3D12_RESOURCE_DESC sourceDesc = sourceResource->GetDesc();
+  if(sourceDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || sourceDesc.MipLevels == 0 ||
+     sourceDesc.Width == 0 || sourceDesc.Height == 0 || sourceDesc.SampleDesc.Count != 1 ||
+     (sourceDesc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+    return ResourceId();
+
+  // Reserved (sparse) resources don't expose heap properties and require tile-by-tile residency
+  // handling. Keep them on the portable fallback instead of taking a potentially incomplete copy.
+  D3D12_HEAP_PROPERTIES sourceHeap = {};
+  D3D12_HEAP_FLAGS sourceHeapFlags = D3D12_HEAP_FLAG_NONE;
+  if(FAILED(sourceResource->GetHeapProperties(&sourceHeap, &sourceHeapFlags)))
+    return ResourceId();
+
+  D3D12_FEATURE_DATA_FORMAT_INFO formatInfo = {};
+  formatInfo.Format = sourceDesc.Format;
+  if(FAILED(m_pDevice->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &formatInfo,
+                                            sizeof(formatInfo))) ||
+     formatInfo.PlaneCount != 1)
+    return ResourceId();
+
+  const UINT mip = RDCMIN(sourceSub.mip, UINT(sourceDesc.MipLevels - 1));
+  const bool is3D = sourceDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+  const UINT arraySize = is3D ? 1U : UINT(sourceDesc.DepthOrArraySize);
+  const UINT slice = is3D ? 0U : RDCMIN(sourceSub.slice, arraySize - 1);
+
+  D3D12_RESOURCE_DESC snapshotDesc = sourceDesc;
+  snapshotDesc.Alignment = 0;
+  snapshotDesc.Width = RDCMAX(1ULL, sourceDesc.Width >> mip);
+  snapshotDesc.Height = RDCMAX(1U, sourceDesc.Height >> mip);
+  snapshotDesc.DepthOrArraySize =
+      is3D ? UINT16(RDCMAX(1U, UINT(sourceDesc.DepthOrArraySize) >> mip)) : 1;
+  snapshotDesc.MipLevels = 1;
+  snapshotDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+  D3D12_HEAP_PROPERTIES heapProps = {};
+  heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heapProps.CreationNodeMask = 1;
+  heapProps.VisibleNodeMask = 1;
+
+  ID3D12Resource *snapshot = NULL;
+  HRESULT hr = m_pDevice->CreateCommittedResource(
+      &heapProps, D3D12_HEAP_FLAG_NONE, &snapshotDesc, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+      __uuidof(ID3D12Resource), (void **)&snapshot);
+  if(FAILED(hr) || snapshot == NULL)
+    return ResourceId();
+
+  ID3D12GraphicsCommandListX *list = m_pDevice->GetNewList();
+  if(list == NULL)
+  {
+    snapshot->Release();
+    return ResourceId();
+  }
+
+  BarrierSet sourceBarriers;
+  sourceBarriers.Configure(sourceResource, m_pDevice->GetSubresourceStates(source),
+                           BarrierSet::CopySourceAccess);
+  sourceBarriers.Apply(list);
+
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = snapshot;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst.SubresourceIndex = 0;
+
+  D3D12_TEXTURE_COPY_LOCATION src = {};
+  src.pResource = sourceResource;
+  src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  src.SubresourceIndex =
+      D3D12CalcSubresource(mip, slice, 0, sourceDesc.MipLevels, arraySize);
+
+  list->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
+  sourceBarriers.Unapply(list);
+
+  D3D12_RESOURCE_BARRIER ready = {};
+  ready.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  ready.Transition.pResource = snapshot;
+  ready.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  ready.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  ready.Transition.StateAfter = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+  list->ResourceBarrier(1, &ready);
+  list->Close();
+
+  m_pDevice->ExecuteLists();
+
+  const ResourceId snapshotId = GetResID(snapshot);
+  SubresourceStateVector &snapshotStates = m_pDevice->GetSubresourceStates(snapshotId);
+  for(D3D12ResourceLayout &state : snapshotStates)
+    state = D3D12ResourceLayout::FromStates(D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+
+  snapshot->SetName(L"RenderDoc GPU event texture snapshot");
+  m_ProxyResources.push_back(snapshot);
+  m_TextureSnapshots.push_back(snapshotId);
+
+  snapshotSub = Subresource();
+  if(is3D)
+    snapshotSub.slice =
+        RDCMIN(sourceSub.slice, UINT(snapshotDesc.DepthOrArraySize) - 1);
+  return snapshotId;
+}
+
+void D3D12Replay::FreeTextureSnapshot(ResourceId snapshot)
+{
+  rdcarray<ResourceId> snapshots;
+  snapshots.push_back(snapshot);
+  FreeTextureSnapshots(snapshots);
+}
+
+void D3D12Replay::FreeTextureSnapshots(const rdcarray<ResourceId> &snapshots)
+{
+  bool ownedSnapshot = false;
+  for(ResourceId snapshot : snapshots)
+  {
+    if(m_TextureSnapshots.contains(snapshot))
+    {
+      ownedSnapshot = true;
+      break;
+    }
+  }
+
+  if(!ownedSnapshot)
+    return;
+
+  // D3D12 requires the application to keep resources alive while submitted command lists may
+  // reference them. Batch all LRU victims behind one synchronization point.
+  m_pDevice->ExecuteLists();
+  m_pDevice->FlushLists(true);
+
+  for(ResourceId snapshot : snapshots)
+  {
+    for(size_t snapshotIndex = 0; snapshotIndex < m_TextureSnapshots.size(); snapshotIndex++)
+    {
+      if(m_TextureSnapshots[snapshotIndex] != snapshot)
+        continue;
+
+      for(size_t resourceIndex = 0; resourceIndex < m_ProxyResources.size(); resourceIndex++)
+      {
+        if(GetResID(m_ProxyResources[resourceIndex]) == snapshot)
+        {
+          ID3D12Resource *resource = m_ProxyResources[resourceIndex];
+          m_ProxyResources.erase(resourceIndex);
+          resource->Release();
+          break;
+        }
+      }
+
+      m_TextureSnapshots.erase(snapshotIndex);
+      break;
+    }
+  }
 }
 
 void D3D12Replay::SetProxyTextureData(ResourceId texid, const Subresource &sub, byte *data,
                                       size_t dataSize)
 {
+  m_pDevice->InvalidateLiveForward("proxyTextureWrite");
+  auto it = m_pDevice->GetResourceList().find(texid);
+  if(it == m_pDevice->GetResourceList().end() || it->second == NULL || data == NULL ||
+     sub != Subresource())
+  {
+    RDCERR("Invalid texture or subresource passed to D3D12 SetProxyTextureData");
+    return;
+  }
+
+  ID3D12Resource *proxy = it->second;
+  bool ownedProxy = false;
+  for(ID3D12Resource *resource : m_ProxyResources)
+    ownedProxy |= resource == proxy;
+  if(!ownedProxy)
+  {
+    RDCERR("Non-proxy texture passed to D3D12 SetProxyTextureData");
+    return;
+  }
+
+  const D3D12_RESOURCE_DESC texDesc = proxy->GetDesc();
+  if(texDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || texDesc.MipLevels != 1 ||
+     texDesc.DepthOrArraySize != 1 || texDesc.SampleDesc.Count != 1)
+  {
+    RDCERR("Unsupported D3D12 proxy texture topology");
+    return;
+  }
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
+  UINT numRows = 0;
+  UINT64 rowSize = 0;
+  UINT64 uploadSize = 0;
+  m_pDevice->GetCopyableFootprints(&texDesc, 0, 1, 0, &layout, &numRows, &rowSize, &uploadSize);
+
+  const UINT64 requiredDataSize = rowSize * UINT64(numRows) * layout.Footprint.Depth;
+  if(dataSize < requiredDataSize || uploadSize == 0)
+  {
+    RDCERR("Insufficient data provided to D3D12 SetProxyTextureData");
+    return;
+  }
+
+  D3D12_HEAP_PROPERTIES uploadHeap = {};
+  uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+  uploadHeap.CreationNodeMask = 1;
+  uploadHeap.VisibleNodeMask = 1;
+
+  D3D12_RESOURCE_DESC uploadDesc = {};
+  uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  uploadDesc.Width = uploadSize;
+  uploadDesc.Height = 1;
+  uploadDesc.DepthOrArraySize = 1;
+  uploadDesc.MipLevels = 1;
+  uploadDesc.SampleDesc.Count = 1;
+  uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+  ID3D12Resource *upload = NULL;
+  HRESULT hr = m_pDevice->CreateCommittedResource(
+      &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+      __uuidof(ID3D12Resource), (void **)&upload);
+  if(FAILED(hr) || upload == NULL)
+  {
+    RDCERR("Couldn't create D3D12 proxy upload buffer: %s", ToStr(hr).c_str());
+    return;
+  }
+
+  byte *mapped = NULL;
+  const D3D12_RANGE noRead = {0, 0};
+  hr = upload->Map(0, &noRead, (void **)&mapped);
+  if(FAILED(hr) || mapped == NULL)
+  {
+    RDCERR("Couldn't map D3D12 proxy upload buffer: %s", ToStr(hr).c_str());
+    SAFE_RELEASE(upload);
+    return;
+  }
+
+  const byte *src = data;
+  for(UINT z = 0; z < layout.Footprint.Depth; z++)
+  {
+    byte *dstSlice = mapped + layout.Offset + UINT64(z) * layout.Footprint.RowPitch * numRows;
+    for(UINT row = 0; row < numRows; row++)
+    {
+      memcpy(dstSlice + UINT64(row) * layout.Footprint.RowPitch, src, (size_t)rowSize);
+      src += rowSize;
+    }
+  }
+
+  const D3D12_RANGE written = {SIZE_T(layout.Offset), SIZE_T(uploadSize)};
+  upload->Unmap(0, &written);
+
+  ID3D12GraphicsCommandListX *list = m_pDevice->GetNewList();
+  if(list == NULL)
+  {
+    SAFE_RELEASE(upload);
+    return;
+  }
+
+  BarrierSet barriers;
+  barriers.Configure(proxy, m_pDevice->GetSubresourceStates(texid), BarrierSet::CopyDestAccess);
+  barriers.Apply(list);
+
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = proxy;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst.SubresourceIndex = 0;
+
+  D3D12_TEXTURE_COPY_LOCATION srcLocation = {};
+  srcLocation.pResource = upload;
+  srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  srcLocation.PlacedFootprint = layout;
+
+  list->CopyTextureRegion(&dst, 0, 0, 0, &srcLocation, NULL);
+  barriers.Unapply(list);
+  list->Close();
+
+  m_pDevice->ExecuteLists();
+  m_pDevice->FlushLists();
+  SAFE_RELEASE(upload);
 }
+
+#pragma endregion
+
+#pragma region not yet implemented
 
 ResourceId D3D12Replay::CreateProxyBuffer(const BufferDescription &templateBuf)
 {
@@ -5411,6 +5966,7 @@ ResourceId D3D12Replay::CreateProxyBuffer(const BufferDescription &templateBuf)
 
 void D3D12Replay::SetProxyBufferData(ResourceId bufid, byte *data, size_t dataSize)
 {
+  m_pDevice->InvalidateLiveForward("proxyBufferWrite");
 }
 
 #pragma endregion

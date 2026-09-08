@@ -18,7 +18,7 @@ class IntegrationManifestTests(unittest.TestCase):
         self.assertEqual(integration["module"], "renderdoc_mcp_bridge")
         self.assertEqual(integration["entrypoint"], "start")
         self.assertEqual(integration["shutdown"], "stop")
-        self.assertEqual(integration["version"], "1.10.2")
+        self.assertEqual(integration["version"], "1.13.0")
         self.assertEqual(integration["minimum_renderdoc"], "1.44")
 
         bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
@@ -32,7 +32,7 @@ class IntegrationManifestTests(unittest.TestCase):
             and isinstance(node.value, ast.Constant)
         }
         self.assertEqual(constants["BRIDGE_PROTOCOL_VERSION"], 2)
-        self.assertEqual(constants["BRIDGE_INTEGRATION_VERSION"], "1.10.2")
+        self.assertEqual(constants["BRIDGE_INTEGRATION_VERSION"], "1.13.0")
 
         functions = {
             node.name for node in tree.body if isinstance(node, ast.FunctionDef)
@@ -43,6 +43,9 @@ class IntegrationManifestTests(unittest.TestCase):
                 "stop",
                 "available_native_shader_stages",
                 "current_native_context_json",
+                "begin_native_context_freeze_json",
+                "poll_native_context_freeze_json",
+                "abandon_native_context_freeze_json",
             }.issubset(functions)
         )
         self.assertNotIn("register", functions)
@@ -63,7 +66,7 @@ class IntegrationManifestTests(unittest.TestCase):
             and isinstance((target := node.targets[0]), ast.Name)
             and isinstance(node.value, ast.Constant)
         }
-        self.assertEqual(constants["SERVICE_VERSION"], "1.10.2")
+        self.assertEqual(constants["SERVICE_VERSION"], "1.13.0")
         self.assertEqual(constants["HOST_STATE_PROTOCOL_VERSION"], 2)
 
         agent_path = REPOSITORY / "src" / "replaylab_agent" / "__init__.py"
@@ -76,14 +79,14 @@ class IntegrationManifestTests(unittest.TestCase):
             and isinstance((target := node.targets[0]), ast.Name)
             and isinstance(node.value, ast.Constant)
         }
-        self.assertEqual(agent_constants["__version__"], "1.10.2")
+        self.assertEqual(agent_constants["__version__"], "1.13.0")
 
         for metadata_path in (
             REPOSITORY / "pyproject.toml",
             REPOSITORY / "mcp_host" / "pyproject.toml",
         ):
             self.assertIn(
-                'version = "1.10.2"',
+                'version = "1.13.0"',
                 metadata_path.read_text(encoding="utf-8"),
             )
 
@@ -104,7 +107,7 @@ class IntegrationManifestTests(unittest.TestCase):
                 and isinstance((target := node.targets[0]), ast.Name)
                 and isinstance(node.value, ast.Constant)
             }
-            self.assertEqual(client_constants["EXPECTED_HOST_VERSION"], "1.10.2")
+            self.assertEqual(client_constants["EXPECTED_HOST_VERSION"], "1.13.0")
             self.assertEqual(
                 client_constants["INTERNAL_HOST_STATE_PROTOCOL_VERSION"],
                 expected_protocol,

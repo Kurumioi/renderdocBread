@@ -57,4 +57,6 @@ void WrappedID3D12Device::CreateSampler2(const D3D12_SAMPLER_DESC2 *pDesc,
   }
 
   GetWrapped(DestDescriptor)->Init(pDesc);
+  GetWrapped(DestDescriptor)->GetHeap()->MarkReplayDirtyRange(
+      GetWrapped(DestDescriptor)->GetHeapIndex(), 1);
 }

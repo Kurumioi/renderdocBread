@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import pytest
 
-from replaylab_agent.catalog import PRESETS, PRESET_BY_ID, get_preset
+from replaylab_agent.catalog import (
+    CODEBUDDY_REPLAYLAB_MCP_PERMISSION,
+    PRESETS,
+    PRESET_BY_ID,
+    REPLAYLAB_MCP_SERVER_NAME,
+    get_preset,
+)
+from replaylab_agent.errors import ConfigurationError
+from replaylab_agent.process_env import agent_command_argv
+from replaylab_agent.profiles import Profile
 
 
 def test_catalog_has_unique_stable_ids_and_both_connector_semantics() -> None:
@@ -32,6 +41,8 @@ def test_catalog_has_unique_stable_ids_and_both_connector_semantics() -> None:
         "gemini-acp",
         "qwen-acp",
         "kimi-acp",
+        "codebuddy-acp",
+        "claude-code-acp",
         "custom-acp",
     } <= set(ids)
 
@@ -79,6 +90,41 @@ def test_catalog_exposes_configuration_and_authentication_ui_semantics() -> None
         ("gemini-acp", ("gemini", "--acp"), ("gemini",), "terminal"),
         ("qwen-acp", ("qwen", "--acp"), ("qwen",), "terminal"),
         ("kimi-acp", ("kimi", "acp"), ("kimi", "login"), "captured"),
+        (
+            "codebuddy-acp",
+            (
+                "codebuddy",
+                "--acp",
+                "--agent",
+                "cli",
+                "--strict-mcp-config",
+                "--no-session-persistence",
+                "--setting-sources",
+                "user",
+                "--tools",
+                "",
+                "--allowedTools",
+                CODEBUDDY_REPLAYLAB_MCP_PERMISSION,
+            ),
+            (
+                "codebuddy",
+                "--agent",
+                "cli",
+                "--strict-mcp-config",
+                "--no-session-persistence",
+                "--setting-sources",
+                "user",
+                "--tools",
+                "",
+            ),
+            "terminal",
+        ),
+        (
+            "claude-code-acp",
+            ("claude-agent-acp",),
+            ("claude", "setup-token"),
+            "terminal",
+        ),
     ],
 )
 def test_official_acp_presets_match_vendor_entrypoints(
@@ -93,6 +139,38 @@ def test_official_acp_presets_match_vendor_entrypoints(
     assert "http" in preset.install_hint
 
 
-def test_claude_subscription_is_not_misrepresented_as_acp() -> None:
+def test_claude_api_and_subscription_reference_adapter_are_separate_presets() -> None:
     assert "claude-acp" not in PRESET_BY_ID
-    assert "does not publish an ACP server mode" in get_preset("anthropic").note
+    api = get_preset("anthropic")
+    subscription = get_preset("claude-code-acp")
+
+    assert api.kind == "model"
+    assert api.auth == "api-key"
+    assert "Anthropic API key" in api.note
+    assert subscription.kind == "agent"
+    assert subscription.protocol == "acp"
+    assert "reference adapter" in subscription.note
+    assert "official `@agentclientprotocol" not in subscription.note
+
+
+def test_codebuddy_exact_catalog_argv_admits_documented_empty_tool_allowlist() -> None:
+    profile = Profile(
+        "codebuddy-main",
+        "codebuddy-acp",
+        options={"allow_unsandboxed_agent": True},
+    )
+
+    profile.validate()
+    assert agent_command_argv(profile) == list(get_preset("codebuddy-acp").command)
+    assert CODEBUDDY_REPLAYLAB_MCP_PERMISSION == f"mcp__{REPLAYLAB_MCP_SERVER_NAME}"
+    assert "mcp__*" not in profile.argv
+    assert "-y" not in profile.argv
+    assert "bypassPermissions" not in profile.argv
+
+    with pytest.raises(ConfigurationError, match="invalid argument"):
+        Profile(
+            "custom-empty-argument",
+            "custom-acp",
+            command=["custom-agent", ""],
+            options={"allow_unsandboxed_agent": True},
+        ).validate()

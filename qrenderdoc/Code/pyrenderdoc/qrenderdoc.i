@@ -148,6 +148,7 @@ SWIGPY_DESTRUCTOR_CLOSURE(capviewer_deinit) /* defines capviewer_deinit_destruct
 
 
 // need to ignore the original function and add a helper that releases the python GIL while calling
+%ignore IReplayManager::BlockInvokeTagged;
 %ignore IReplayManager::BlockInvoke;
 
 // ignore these functions as we don't map QVariantMap to/from python
@@ -176,6 +177,7 @@ DOCUMENT("");
 
 TEMPLATE_ARRAY_INSTANTIATE(rdcarray, EventBookmark)
 TEMPLATE_ARRAY_INSTANTIATE(rdcarray, ShaderProcessingTool)
+TEMPLATE_ARRAY_INSTANTIATE(rdcarray, ShaderEditorDiagnostic)
 TEMPLATE_ARRAY_INSTANTIATE(rdcarray, rdcstrpair)
 TEMPLATE_ARRAY_INSTANTIATE(rdcarray, BugReport)
 TEMPLATE_ARRAY_INSTANTIATE(rdcarray, ExtensionMetadata)
@@ -184,9 +186,42 @@ TEMPLATE_ARRAY_INSTANTIATE(rdcarray, RemoteHost)
 TEMPLATE_ARRAY_INSTANTIATE_PTR(rdcarray, ICaptureViewer)
 
 // unignore the function from above
+%rename("%s") IReplayManager::BlockInvokeTagged;
 %rename("%s") IReplayManager::BlockInvoke;
 
 %extend IReplayManager {
+  DOCUMENT(R"(Make a tagged blocking invoke call onto the replay thread.
+
+The tag participates in replay queue ordering. Callers must use a unique tag for
+each blocking request; tagged coalescing remains an :meth:`AsyncInvoke` feature.
+This entry point is intended for a non-UI worker that must wait for a replay result
+without blocking qrenderdoc's event loop.
+
+:param str tag: The tag used to order this callback.
+:param InvokeCallback method: The function to callback on the replay thread.
+  Callback function signature must match :func:`InvokeCallback`.
+)");
+  void BlockInvokeTagged(const rdcstr &tag, InvokeCallback m) {
+    PyObject *global_internal_handle = NULL;
+
+    PyObject *globals = PyEval_GetGlobals();
+    if(globals)
+      global_internal_handle = PyDict_GetItemString(globals, "_renderdoc_internal");
+
+    SetThreadBlocking(global_internal_handle, true);
+
+    Py_BEGIN_ALLOW_THREADS
+    $self->BlockInvokeTagged(tag, m);
+    Py_END_ALLOW_THREADS
+
+    SetThreadBlocking(global_internal_handle, false);
+  }
+
+  DOCUMENT(R"(Make a blocking invoke call onto the replay thread.
+
+:param InvokeCallback method: The function to callback on the replay thread.
+  Callback function signature must match :func:`InvokeCallback`.
+)");
   void BlockInvoke(InvokeCallback m) {
     PyObject *global_internal_handle = NULL;
 

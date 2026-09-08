@@ -882,6 +882,8 @@ rdcstr DoStringise(const ResourceUsage &el)
     STRINGISE_ENUM_CLASS_NAMED(Barrier, "Barrier");
 
     STRINGISE_ENUM_CLASS_NAMED(CPUWrite, "CPU Write");
+
+    STRINGISE_ENUM_CLASS_NAMED(Shader, "Shader");
   }
   END_ENUM_STRINGISE();
 }

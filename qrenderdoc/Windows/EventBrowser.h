@@ -153,6 +153,14 @@ public:
   void OnSelectedEventChanged(uint32_t eventId) override {}
   void OnEventChanged(uint32_t eventId) override;
 
+  // Held arrow-key navigation drives a lightweight scrub; see eventFilter / events_currentChanged.
+  bool eventFilter(QObject *watched, QEvent *event) override;
+  QSet<int> m_ArrowScrubKeys;
+  bool m_UpdatingReplaySelection = false;
+
+  void BookmarksChanged();
+  void JumpToEID(uint32_t EID);
+
   QVariant persistData();
   void setPersistData(const QVariant &persistData);
 
@@ -206,7 +214,7 @@ private:
   void jumpToBookmark(int idx);
   void repopulateBookmarks();
   void highlightBookmarks();
-  void bookmarkContextMenu(QRClickToolButton *button, uint32_t EID);
+  void bookmarkContextMenu(uint32_t EID);
 
   int FindEvent(QModelIndex parent, QString filter, uint32_t after, bool forward);
   int FindEvent(QString filter, uint32_t after, bool forward);

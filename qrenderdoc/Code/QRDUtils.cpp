@@ -1084,6 +1084,13 @@ bool RichResourceTextMouseEvent(const QWidget *owner, const QVariant &var, QRect
     {
       if(var.userType() == qMetaTypeId<ResourceId>())
       {
+        if(event->type() == QEvent::MouseButtonRelease)
+        {
+          const RDTreeWidget *tree = qobject_cast<const RDTreeWidget *>(owner);
+          if(tree && tree->tryHandleResourceLink(id, event->pos()))
+            return true;
+        }
+
         if(event->type() == QEvent::MouseButtonRelease && ctxptr)
         {
           ICaptureContext &ctx = *(ICaptureContext *)ctxptr;
@@ -1170,6 +1177,13 @@ bool RichResourceTextMouseEvent(const QWidget *owner, const QVariant &var, QRect
         ResourceId res = v.value<ResourceId>();
         if(res == ResourceId())
           return false;
+
+        if(event->type() == QEvent::MouseButtonRelease)
+        {
+          const RDTreeWidget *tree = qobject_cast<const RDTreeWidget *>(owner);
+          if(tree && tree->tryHandleResourceLink(res, event->pos()))
+            return true;
+        }
 
         if(event->type() == QEvent::MouseButtonRelease && linkedText->ctxptr)
         {
@@ -1583,6 +1597,9 @@ QString ToQStr(const ResourceUsage usage, const GraphicsAPI apitype)
       case ResourceUsage::Barrier: return lit("Barrier");
 
       case ResourceUsage::CPUWrite: return lit("CPU Write");
+
+      // i18n-ignore: canonical enum spelling; ToQDisplayStr translates it under resource.usage.
+      case ResourceUsage::Shader: return lit("Shader");
     }
   }
   else if(apitype == GraphicsAPI::OpenGL || apitype == GraphicsAPI::Vulkan)
@@ -1650,6 +1667,9 @@ QString ToQStr(const ResourceUsage usage, const GraphicsAPI apitype)
       case ResourceUsage::Barrier: return lit("Barrier");
 
       case ResourceUsage::CPUWrite: return lit("CPU Write");
+
+      // i18n-ignore: canonical enum spelling; ToQDisplayStr translates it under resource.usage.
+      case ResourceUsage::Shader: return lit("Shader");
     }
   }
 
@@ -1809,10 +1829,11 @@ QString ToQDisplayStr(const ResourceUsage usage)
       QT_TRANSLATE_NOOP3("RDDisplayString", "Copy - Destination", "resource.usage"),
       QT_TRANSLATE_NOOP3("RDDisplayString", "Barrier", "resource.usage"),
       QT_TRANSLATE_NOOP3("RDDisplayString", "CPU Write", "resource.usage"),
+      QT_TRANSLATE_NOOP3("RDDisplayString", "Shader", "resource.usage"),
   };
   Q_UNUSED(registeredStrings);
 
-  if(usage < ResourceUsage::Unused || usage > ResourceUsage::CPUWrite)
+  if(usage < ResourceUsage::Unused || usage > ResourceUsage::Shader)
     return ToQStr(usage);
 
   return TranslateDisplayString(ToQStr(usage), "resource.usage");
@@ -1893,11 +1914,12 @@ QString ToQDisplayStr(const ResourceUsage usage, const GraphicsAPI apitype)
       QT_TRANSLATE_NOOP3("RDDisplayString", "Framebuffer blit", "resource.usage"),
       QT_TRANSLATE_NOOP3("RDDisplayString", "Framebuffer blit - Source", "resource.usage"),
       QT_TRANSLATE_NOOP3("RDDisplayString", "Framebuffer blit - Dest", "resource.usage"),
+      QT_TRANSLATE_NOOP3("RDDisplayString", "Shader", "resource.usage"),
       QT_TRANSLATE_NOOP3("RDDisplayString", "Unknown", "resource.usage"),
   };
   Q_UNUSED(registeredStrings);
 
-  if(usage < ResourceUsage::Unused || usage > ResourceUsage::CPUWrite)
+  if(usage < ResourceUsage::Unused || usage > ResourceUsage::Shader)
     return ToQStr(usage, apitype);
 
   return TranslateDisplayString(ToQStr(usage, apitype), "resource.usage");

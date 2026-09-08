@@ -38,7 +38,10 @@ backing memory 以及不支持的类型会在右键菜单或面板中明确拒�
 3. 从结果的 `parameters` 取得 `parameterId`、`displayName`、类型和当前值。
 4. 把返回的 `parameterId` 作为 `parameter` 调用
    `update_material_parameter(session_id, parameter, value)`；每次调用都会重放精确事件。
-5. 调试结束调用 `rollback_material_session(session_id)`。
+5. 更新本身只修改工作区/回放状态，不会隐式写项目。只有任务明确授权项目持久化时，才用
+   `register_active_project_material_session(session_id, parameter_ids)` 保存选中的、由 bridge
+   签发的参数 ID；这是一条独立的 project-effect 工具调用。
+6. 调试结束调用 `rollback_material_session(session_id)`。
 
 `constant_block_index` 是当前阶段 `ShaderReflection.constantBlocks` 数组中的索引，**不是**
 由用户猜测的 `b#`。结果会同时返回固定程序从反射得到的实际 `slot`。在同一阶段存在多个

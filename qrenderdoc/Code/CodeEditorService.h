@@ -31,6 +31,7 @@
 #include <functional>
 
 class QKeyEvent;
+class QEvent;
 class ScintillaEdit;
 
 // A small editor-services layer shared by editable shader source views. It deliberately has no
@@ -92,11 +93,20 @@ public:
   // F12, Ctrl+Space, identifier typing, '(' and ',' to the corresponding operations.
   bool handleKeyPress(ScintillaEdit *editor, QKeyEvent *event);
   void requestDefinition(ScintillaEdit *editor, int position = -1);
+  void requestReferences(ScintillaEdit *editor, int position = -1);
+  // Explicit owner jumps (graph/bookmark/diagnostic) participate in the same history as F12.
+  void rememberNavigation(ScintillaEdit *editor, int targetPosition);
+  void clearNavigation(ScintillaEdit *editor);
+  bool navigateHistory(ScintillaEdit *editor, bool backwards);
+  bool canNavigateHistory(bool backwards) const;
   void requestCompletion(ScintillaEdit *editor, bool explicitRequest = true);
   void showCallTip(ScintillaEdit *editor);
 
   Location findLocalDefinition(ScintillaEdit *editor, int position = -1) const;
   QList<Diagnostic> diagnostics(ScintillaEdit *editor) const;
+  // Adds diagnostics produced by an owning workspace/compiler to the local parser and optional
+  // language-server results. Passing an empty list clears the external diagnostics.
+  void setExternalDiagnostics(ScintillaEdit *editor, const QList<Diagnostic> &diagnostics);
 
   // An external server is optional. If no command is configured, startLanguageServer() checks
   // RENDERDOC_SHADER_LANGUAGE_SERVER, then shader-language-server and slangd on PATH. The server
@@ -107,6 +117,9 @@ public:
   void stopLanguageServer();
   QString languageServerProgram() const;
   bool languageServerRunning() const;
+
+protected:
+  bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
   struct Impl;

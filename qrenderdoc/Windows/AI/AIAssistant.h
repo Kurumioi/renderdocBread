@@ -24,9 +24,13 @@
 
 #pragma once
 
+#include <functional>
+#include <memory>
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QFrame>
 #include <QHash>
+#include <QImage>
 #include <QJsonArray>
 #include <QMap>
 #include <QPair>
@@ -42,14 +46,22 @@ class QButtonGroup;
 class QCommandLinkButton;
 class QLabel;
 class QLineEdit;
+class QHBoxLayout;
+class QMimeData;
+class QMenu;
 class QPlainTextEdit;
 class QProcess;
 class QPushButton;
+class QScrollArea;
 class QTimer;
+class QToolButton;
 class QVBoxLayout;
 class AIConversationListView;
 class AIPendingChatView;
+class AIAgentMonitorWindow;
+class AIAgentTraceStore;
 class CaptureContext;
+struct AIConfigurationProcessState;
 
 // Native qrenderdoc control surface for ReplayLab's provider-neutral RenderDoc AI host. The
 // provider SDKs and managed Agent processes deliberately remain out-of-process so they cannot
@@ -68,6 +80,11 @@ public:
   void StartCaptureSkill(const QString &prompt, const QString &skill,
                          const QString &focusStage = QString(),
                          const QString &intentKind = QString());
+  // Adds immutable, untrusted reference text to the composer without sending a request. Returns
+  // false when the selection is empty or exceeds the bounded attachment budget.
+  bool AddTextAttachment(const QString &title, const QString &text,
+                          const QString &source = QString(), bool code = false,
+                          const QString &contextJSON = QString());
   // CaptureContext calls this after Save Capture As so the in-memory thread history follows the
   // permanent RDC path without modifying the RDC itself.
   void RebindCaptureFile(const QString &capturePath);
@@ -101,6 +118,13 @@ private:
     QVector<ClarificationOption> options;
     bool allowOther = false;
     QString submitLabel;
+    // Preserve the user goal which caused this clarification. The visible reply is often only a
+    // choice label (for example "Fragment Shader") and must not replace the original requested
+    // outcome when AgentHost reconstructs workflow-effect authority.
+    QString originRequest;
+    // Long origins are never stored as a misleading prefix. Durable workflows keep the complete
+    // request in AgentHost; the native UI persists this UTF-8 SHA-256 for the typed reply.
+    QString originRequestSha256;
     // The context which produced this question remains a candidate when the user answers later.
     // The native UI also freezes the then-current state, so AgentHost can resolve the user's
     // intent instead of silently rebinding the follow-up to whichever EID happens to be selected.
@@ -121,6 +145,8 @@ private:
     QString clarificationId;
     QStringList optionIds;
     QString otherText;
+    QString originRequest;
+    QString originRequestSha256;
     QByteArray originContextSnapshot;
     QString originContextInstanceId;
     QByteArray currentContextSnapshot;
@@ -136,11 +162,17 @@ private:
   {
     QString id;
     QString title;
+    // Connection/model selection is conversation-owned. Switching to another conversation
+    // changes the composer pickers without changing an already running AgentHost process.
+    QString profileId;
+    QString modelId;
     qint64 createdMs = 0;
     qint64 updatedMs = 0;
+    int omittedMessageCount = 0;
     bool pinned = false;
     bool unread = false;
     QVector<AIChatMessage> messages;
+    QSet<QString> incompleteHistoryMessageIds;
     ClarificationPrompt clarification;
   };
 
@@ -149,25 +181,69 @@ private:
     QString taskId;
     QString messageId;
     QString conversationId;
+    // Freeze the conversation-owned provider selection at submit time so later picker changes
+    // cannot rebind queued work to another provider or model.
+    QString profileId;
+    QString modelId;
     QString prompt;
     QString effectivePrompt;
     QString skill;
     QString focusStage;
     QString intentKind;
+    QVector<AIChatAttachment> attachments;
     QStringList historyExcludeMessageIds;
     QByteArray contextSnapshot;
     QString contextInstanceId;
+    // Capture-bound requests remember their exact submit-time binding. Only one bridge freeze is
+    // begun at a time; later requests stay local until the preceding result file is terminal.
+    QString contextFreezeJobId;
+    QString requestedCaptureSessionId;
+    qint64 requestedEventId = 0;
+    qint64 requestedSelectedEventId = 0;
+    bool contextFreezeRequired = false;
     ClarificationResponse clarificationResponse;
     bool includeConversation = true;
   };
 
-  void appendSystem(const QString &text, bool error = false);
+  struct ChatExecution
+  {
+    PendingChat request;
+    QProcess *process = NULL;
+    QTimer *startTimer = NULL;
+    void *jobHandle = NULL;
+    void *processInformation = NULL;
+    QString contextFile;
+    QString cancelFile;
+    QByteArray stdoutData;
+    QByteArray stderrData;
+    QByteArray pendingInput;
+    bool promptSent = false;
+  };
+
+  struct ComposerRasterAnimation
+  {
+    QVector<QImage> frames;
+    QVector<int> frameDelaysMs;
+    QSize sourceSize;
+
+    bool isValid() const
+    {
+      return frames.size() >= 2 && frameDelaysMs.size() == frames.size() &&
+             sourceSize.isValid();
+    }
+  };
+
+  void appendSystem(const QString &text, bool error = false,
+                    const QString &conversationId = QString());
   QString appendUser(const QString &text, const QString &taskId = QString(),
                      const QString &state = QString(),
-                     const QString &conversationId = QString());
+                     const QString &conversationId = QString(),
+                     const QVector<AIChatAttachment> &attachments =
+                         QVector<AIChatAttachment>());
   void appendAssistant(const QString &text, const QString &conversationId = QString(),
                        const QString &taskId = QString());
   void renderConversation(bool refreshList = false);
+  void scheduleConversationRender();
   void refreshConversationList();
   void refreshPendingChats();
   void createConversation();
@@ -182,7 +258,14 @@ private:
                        const QString &detail = QString(), bool completed = false,
                        bool error = false, qint64 timestampMs = 0,
                        const QString &activityId = QString());
+  void appendTaskActivityText(const QString &taskId, const QString &kind, const QString &title,
+                              const QString &text, bool reset, bool completed, bool error,
+                              qint64 timestampMs, const QString &activityId);
+  bool updateTaskActivityLifecycle(const QString &taskId, const QString &kind,
+                                   const QString &title, bool completed, bool error,
+                                   qint64 timestampMs, const QString &activityId);
   void setTaskState(const QString &taskId, const QString &state, bool collapseActivity);
+  void updateTaskProgressUI();
   void updateComposerState();
   bool clarificationFromJSON(const QJsonObject &object, const QString &fallbackId,
                              ClarificationPrompt &clarification) const;
@@ -204,20 +287,37 @@ private:
   void updateCaptureStatus();
   void showShaderIntentMenu(QWidget *anchor);
   void clearCaptureTasks();
+  void chooseAttachmentFiles();
+  void requestSystemThumbnail(const QString &attachmentId, const QString &canonicalPath,
+                              qint64 expectedBytes, qint64 expectedModifiedUnixMs,
+                              bool preferRasterDecoder = false);
+  void requestInlineRasterThumbnail(const QString &attachmentId, const QByteArray &encodedBytes);
+  bool addAttachmentFiles(const QStringList &paths);
+  bool addMimeAttachments(const QMimeData *mimeData);
+  bool addComposerAttachment(const AIChatAttachment &attachment, QString *error = NULL);
+  void removeComposerAttachment(const QString &attachmentId);
+  void previewComposerAttachment(const QString &attachmentId);
+  void rebuildAttachmentChips();
 
   QString findAgentCLI() const;
   QString findBridgeInstance() const;
+  bool findBridgeBinding(QString *instanceId, QString *captureSessionId) const;
   QString taskEventRoot() const;
-  void configureProcess(QProcess *process,
-                        const QString &credentialProfile = QString()) const;
-  QByteArray runCLISync(const QStringList &arguments, int timeoutMs, int *exitCode,
-                        QString *error, const QString &credentialProfile = QString()) const;
-  QByteArray runCLIInputSync(const QStringList &arguments, const QByteArray &input, int timeoutMs,
-                             int *exitCode, QString *error,
-                             const QString &credentialProfile = QString()) const;
+  QString activeConversationTaskId() const;
+  void configureProcess(QProcess *process, const QString &credentialProfile,
+                        void **processInformation) const;
+  typedef std::function<void(int exitCode, const QByteArray &standardOutput,
+                             const QString &diagnostic, bool commandUnavailable)>
+      CLICompletion;
+  void runCLIAsync(const QStringList &arguments, const QByteArray &input, int timeoutMs,
+                   QObject *owner, const CLICompletion &completion,
+                   const QString &credentialProfile = QString());
 
-  void refreshProfiles();
+  void refreshProfiles(QObject *completionOwner = NULL,
+                       const std::function<void()> &completion = std::function<void()>());
   void refreshModelCombo();
+  bool repairConversationConnectionSelections();
+  void syncConnectionSelectionFromConversation();
   void selectProfile(int index);
   void selectModel(int index);
   bool connectionMutationAllowed(QWidget *parent) const;
@@ -225,8 +325,10 @@ private:
   void runDoctor();
 
   void refreshConnectionStatus();
+  void cancelConfigurationProcesses();
   void forceStopProcessesForDestruction();
   bool attachKillOnCloseJob(QProcess *process, void *&jobHandle, QString *error) const;
+  bool resumeSuspendedProcess(void *processInformation, QString *error) const;
   void closeKillOnCloseJob(void *&jobHandle) const;
 
   QString newTaskId() const;
@@ -234,20 +336,40 @@ private:
   QString conversationPrompt(const QString &prompt, const QString &conversationId,
                              const QStringList &excludeMessageIds = QStringList(),
                              const ClarificationResponse &clarificationResponse =
-                                 ClarificationResponse()) const;
+                                 ClarificationResponse(),
+                             const QVector<AIChatAttachment> &attachments =
+                                 QVector<AIChatAttachment>(),
+                             const QString &profileId = QString()) const;
   void startChat(const QString &prompt, const QString &skill = QString(),
                  bool includeConversation = true, const QString &focusStage = QString(),
                  const ClarificationResponse &clarificationResponse = ClarificationResponse(),
-                 const QString &intentKind = QString());
-  bool freezeChatContext(PendingChat &request, QString *error);
-  void clearChatContextFile();
+                 const QString &intentKind = QString(),
+                 const QVector<AIChatAttachment> &attachments =
+                     QVector<AIChatAttachment>());
+  void advanceChatContextFreeze();
+  void updateChatContextFreezeTimer();
+  void pollChatContextFreeze();
+  void failQueuedChatContextFreeze(const QString &taskId, const QString &jobId,
+                                   const QString &diagnostic);
+  void discardChatContextFreeze(PendingChat &request);
+  void discardAllChatContextFreezes();
+  ChatExecution *chatExecution(const QString &taskId) const;
+  ChatExecution *chatExecution(QProcess *process) const;
+  ChatExecution *conversationExecution(const QString &conversationId) const;
+  void clearChatContextFile(ChatExecution *execution);
+  void requestChatCancellation(ChatExecution *execution);
+  void clearChatCancelFile(ChatExecution *execution);
   void launchChat(PendingChat request);
+  void handleChatProcessStarted(QProcess *process);
+  void failChatProcessStart(QProcess *process, const QString &diagnostic);
   void startNextChat();
   void adjustQueuedChat(const QString &taskId);
   void editQueuedChat(const QString &taskId);
   void deleteQueuedChat(const QString &taskId);
-  void cancelChat(const QString &terminalState = QString(), bool continueQueue = true);
-  void finishChatProcess(int exitCode);
+  void cancelChat(const QString &terminalState = QString(), bool continueQueue = true,
+                  const QString &taskId = QString(), int cooperativeWaitMs = 0,
+                  bool refreshUI = true);
+  void finishChatProcess(const QString &taskId, int exitCode);
   void drainChatTaskEvents(const QString &taskId, int exitCode, qint64 remainingBytes);
   void finishChatResult(const QString &taskId, int exitCode);
 
@@ -258,9 +380,15 @@ private:
   void updateEventTimer();
   void pollTaskEvents();
   qint64 pollTaskEvent(const QString &taskId, qint64 maxReadBytes, bool *atEnd = NULL);
+  void consumePublicAgentMessageEvent(const QString &taskId, const QJsonObject &event,
+                                      const QJsonObject &eventData, qint64 timestampMs);
   void consumeTaskEvent(const QString &taskId, const QByteArray &line);
   void finishTask(const QString &taskId, const QString &kind, const QString &summary,
-                  qint64 timestampMs = 0);
+                  qint64 timestampMs = 0, const QJsonObject &report = QJsonObject(),
+                  const QJsonObject &verification = QJsonObject());
+  // Renders a replaylab-task-report/v1 form (the structured answer every backend hands in through
+  // report_task_result) as the fixed result card shown above the model's own prose.
+  QString renderTaskReport(const QJsonObject &report, const QJsonObject &verification) const;
 
   CaptureContext &m_Ctx;
 
@@ -281,30 +409,48 @@ private:
   QPushButton *m_ClarificationSubmit = NULL;
   QVector<QCommandLinkButton *> m_ClarificationButtons;
   QString m_VisibleClarificationKey;
+  QScrollArea *m_AttachmentScroll = NULL;
+  QWidget *m_AttachmentStrip = NULL;
+  QHBoxLayout *m_AttachmentLayout = NULL;
+  QPushButton *m_AddAttachment = NULL;
   QPlainTextEdit *m_Prompt = NULL;
+  QToolButton *m_TaskProgress = NULL;
+  QMenu *m_TaskProgressMenu = NULL;
   QPushButton *m_Send = NULL;
   QPushButton *m_Cancel = NULL;
+  AIAgentTraceStore *m_AgentTraceStore = NULL;
+  AIAgentMonitorWindow *m_AgentMonitor = NULL;
 
   QTimer *m_EventTimer = NULL;
   QTimer *m_ConversationSaveTimer = NULL;
   QTimer *m_ConversationRenderTimer = NULL;
-  QProcess *m_ChatProcess = NULL;
-  void *m_ChatJob = NULL;
-
+  QTimer *m_ChatContextFreezeTimer = NULL;
   QString m_CLIPath;
   QString m_InstanceId;
   QString m_ActiveProfile;
   QString m_ActiveKeyEnv;
   QString m_ActiveModel;
   QString m_ActiveConversationId;
-  QString m_ActiveChatConversationId;
-  QString m_ActiveChatMessageId;
-  QString m_ChatTaskId;
-  QString m_ChatContextFile;
   QString m_CaptureConversationPath;
-  QByteArray m_ChatStdout;
-  QByteArray m_ChatStderr;
+  QString m_ChatContextFreezeTaskId;
+  QString m_ChatContextFreezeJobId;
+  QString m_ChatContextFreezeResultPath;
+  QString m_ChatContextFreezeCaptureSessionId;
+  QString m_ChatContextFreezeInstanceId;
+  qint64 m_ChatContextFreezeEventId = 0;
+  qint64 m_ChatContextFreezeSelectedEventId = 0;
+  qint64 m_ChatContextFreezeDeadlineMs = 0;
+  bool m_ChatContextFreezeTimedOut = false;
   bool m_ProfileComboLoading = false;
+  bool m_ProfileRefreshRunning = false;
+  bool m_ProfileRefreshPending = false;
+  quint64 m_ProfileRefreshGeneration = 0;
+  struct ProfileRefreshCompletion
+  {
+    QPointer<QObject> owner;
+    std::function<void()> function;
+  };
+  QVector<ProfileRefreshCompletion> m_ProfileRefreshCompletions;
   bool m_ConnectionDialogOpen = false;
   bool m_ShuttingDown = false;
 
@@ -316,18 +462,50 @@ private:
   QHash<QString, QString> m_ProfileDefaultModels;
   QHash<QString, QStringList> m_ProfileRunInputSchemas;
   QJsonArray m_ProfileRows;
+  // Settings pages can outlive this panel. Keep every configuration command registered with the
+  // assistant as well as its UI owner so Shutdown can terminate the contained process tree and
+  // suppress callbacks which captured panel state without waiting on the GUI thread.
+  QHash<QProcess *, std::shared_ptr<AIConfigurationProcessState>> m_ConfigurationProcesses;
   QSet<QString> m_KnownTasks;
   QSet<QString> m_RunningTasks;
   QSet<QString> m_CompletedTasks;
+  int m_TaskEventPollCursor = 0;
+  int m_TaskEventRecordsRemaining = 0;
+  bool m_TaskEventBudgetActive = false;
+  QElapsedTimer m_TaskEventPollClock;
   QHash<QString, qint64> m_TaskOffsets;
   QHash<QString, qint64> m_TaskSequences;
   QHash<QString, QByteArray> m_TaskTails;
   QHash<QString, QString> m_TaskTexts;
+  // Characters of live raw reasoning already shown per task (bounded in the conversation).
+  QHash<QString, int> m_TaskReasoningChars;
+  struct LiveAgentMessageStream
+  {
+    QString activityId;
+    QString activityKind;
+    // The Agent Monitor owns the exact provider payload. The ordinary conversation keeps it only
+    // while this stream is active so structured JSON can be projected incrementally into prose.
+    QString sourceText;
+    QString projectedText;
+    QString replacementId;
+    QString replacementText;
+    int replacementChunks = 0;
+    int replacementBytes = -1;
+    int receivedChars = 0;
+    bool activityCreated = false;
+    bool omitted = false;
+  };
+  QHash<QString, QHash<QString, LiveAgentMessageStream>> m_TaskAgentMessageStreams;
   QHash<QString, QString> m_UserPrompts;
   QHash<QString, QString> m_TaskConversationIds;
   QHash<QString, QString> m_TaskMessageIds;
+  QVector<AIChatAttachment> m_ComposerAttachments;
+  // Ephemeral previews created while a user-selected local file path is available. They are never
+  // serialized, copied into the conversation wire format, or used to reopen historical files.
+  QHash<QString, QImage> m_ComposerSystemThumbnails;
+  QHash<QString, ComposerRasterAnimation> m_ComposerSystemAnimations;
   QVector<ConversationThread> m_Conversations;
   QVector<PendingChat> m_ChatQueue;
-  PendingChat m_ActiveChatRequest;
+  QHash<QString, ChatExecution *> m_ChatExecutions;
   bool m_LoadingConversations = false;
 };

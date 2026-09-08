@@ -1,3 +1,5 @@
+import base64
+import enum
 import hashlib
 import importlib.util
 import json
@@ -6,6 +8,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 from src.rdc_project_index import new_index
 
@@ -134,6 +137,9 @@ class _Replay:
     def __init__(self, access, controller):
         self.access = access
         self.controller = controller
+        self.async_tags = []
+        self._async_queue = []
+        self._draining_async = False
 
     def GetCaptureAccess(self):
         return self.access
@@ -144,8 +150,24 @@ class _Replay:
     def BlockInvoke(self, callback):
         callback(self.controller)
 
-    def AsyncInvoke(self, callback):
-        callback(self.controller)
+    def AsyncInvoke(self, *args):
+        if len(args) == 1:
+            tag = ""
+            callback = args[0]
+        elif len(args) == 2:
+            tag, callback = args
+        else:
+            raise TypeError("AsyncInvoke expects callback or tag, callback")
+        self.async_tags.append(tag)
+        self._async_queue.append(callback)
+        if self._draining_async:
+            return
+        self._draining_async = True
+        try:
+            while self._async_queue:
+                self._async_queue.pop(0)(self.controller)
+        finally:
+            self._draining_async = False
 
 
 class _Context:
@@ -217,6 +239,17 @@ class ReplayLabRdcProjectBridgeTests(unittest.TestCase):
         self.bridge._capture_session_id = "1" * 32
         self.bridge._known_catalog_capture_ids = {}
         self.bridge._known_catalog_identity_pairs = set()
+        self.bridge._symbol_capture_snapshot = {
+            "captureId": "",
+            "capturePath": "",
+            "shaderKeys": set(),
+            "usesByKey": {},
+        }
+        self.bridge._symbol_alias_overlay = self.bridge._new_symbol_alias_overlay()
+        self.bridge._symbol_resource_renames = {}
+        self.bridge._symbol_rename_capture_token = None
+        self.bridge._symbol_alias_recovery_ledger = None
+        self.bridge._symbol_alias_last_rollback_receipt = None
         with self.bridge._project_shader_index_jobs_guard:
             self.bridge._project_shader_index_jobs.clear()
 
@@ -225,6 +258,38 @@ class ReplayLabRdcProjectBridgeTests(unittest.TestCase):
             self.bridge._project_shader_index_jobs.clear()
         self.bridge._ctx = None
         self.temporary.cleanup()
+
+    def test_project_writer_uses_canonical_task_and_raygen_stage_names(self):
+        self.assertEqual(
+            self.bridge._normalise_stage_name("amplification"), "task"
+        )
+        self.assertEqual(
+            self.bridge._normalise_stage_name("raygeneration"), "raygen"
+        )
+        self.assertEqual(
+            self.bridge._normalise_stage_name("ray generation"), "raygen"
+        )
+
+        class FalseyVertexStage(int):
+            def __new__(cls):
+                return int.__new__(cls, 0)
+
+            def __str__(self):
+                return "ShaderStage.Vertex"
+
+        vertex = FalseyVertexStage()
+        self.assertFalse(bool(vertex))
+        self.assertEqual(
+            self.bridge._normalise_stage_name(vertex), "vertex"
+        )
+
+        class ModernShaderStage(enum.IntEnum):
+            Vertex = 0
+
+        self.assertEqual(
+            self.bridge._normalise_stage_name(ModernShaderStage.Vertex),
+            "vertex",
+        )
 
     def _expected_shader(self):
         reflection = self.controller.reflection
@@ -264,10 +329,245 @@ class ReplayLabRdcProjectBridgeTests(unittest.TestCase):
             "expected_shaders": [shader or self._expected_shader()],
         }
 
+    def _inventory_request(self, *, expected_shaders=None, discover_anchors=True):
+        request = self._index_request()
+        request["inventory_all_shaders"] = True
+        request["discover_anchor_eids"] = discover_anchors
+        request["expected_shaders"] = list(expected_shaders or [])
+        return request
+
     def _begin(self, shader=None):
         return self.bridge._begin_rdc_project_shader_resource_index(
             self._index_request(shader)
         )
+
+    def _target_request(self, targets):
+        request = self._inventory_request()
+        request["target_raw_sha256s"] = targets
+        return request
+
+    def test_target_raw_filter_is_strict_bounded_and_part_of_request_identity(self):
+        raw = hashlib.sha256(self.controller.raw).hexdigest()
+        request = self._target_request([raw])
+        selected = self.bridge._validated_project_shader_index_request(request, str(self.capture_path))
+        full = self.bridge._validated_project_shader_index_request(self._inventory_request(), str(self.capture_path))
+        self.assertNotEqual(selected["requestSha256"], full["requestSha256"])
+        first = self.bridge._validated_project_shader_index_request(self._target_request([raw, "a" * 64]), str(self.capture_path))
+        reordered = self.bridge._validated_project_shader_index_request(self._target_request(["a" * 64, raw, raw]), str(self.capture_path))
+        self.assertEqual(first["requestSha256"], reordered["requestSha256"])
+        for targets in ([], [raw.upper()], [" " + raw], [None], raw, ["a" * 64] * 17):
+            with self.subTest(targets=targets), self.assertRaises(ValueError):
+                self.bridge._validated_project_shader_index_request(self._target_request(targets), str(self.capture_path))
+        request["expected_shaders"] = [self._expected_shader()]
+        with self.assertRaises(ValueError):
+            self.bridge._validated_project_shader_index_request(request, str(self.capture_path))
+        request = self._target_request([raw])
+        request["inventory_all_shaders"] = False
+        with self.assertRaises(ValueError):
+            self.bridge._validated_project_shader_index_request(request, str(self.capture_path))
+        first = self.bridge._begin_rdc_project_shader_resource_index(self._target_request([raw]))
+        other = self.bridge._begin_rdc_project_shader_resource_index(self._target_request(["a" * 64]))
+        repeated = self.bridge._begin_rdc_project_shader_resource_index(self._target_request([raw, raw]))
+        self.assertNotEqual(first["jobId"], other["jobId"])
+        self.assertEqual(first["jobId"], repeated["jobId"])
+        self.assertTrue(repeated["idempotent"])
+
+    def test_target_raw_filter_skips_nonmatching_dxil_abi_and_usage(self):
+        self.controller.api = "D3D12"
+        self.controller.reflection.encoding = "DXIL"
+        self.controller.resources.append(types.SimpleNamespace(type="shader", resourceId=8))
+        other = types.SimpleNamespace(**vars(self.controller.reflection))
+        other.rawBytes = b"different-module"
+        self.controller.GetShader = lambda pipeline, resource, entry: self.controller.reflection if int(resource) == 7 else other
+        usage_calls = []
+        self.controller.GetUsage = lambda resource: (usage_calls.append(int(resource)) or [types.SimpleNamespace(eventId=42)])
+        raw = hashlib.sha256(self.controller.raw).hexdigest()
+        analyzed = []
+
+        def disassemble(controller, pipeline, reflection):
+            analyzed.append(reflection.rawBytes)
+            raise RuntimeError("fixture has no physical DXIL disassembler")
+
+        original_snapshot = self.bridge._symbol_capture_snapshot
+        with mock.patch.object(self.bridge, "_dxil_evidence_from_live_disassembly", side_effect=disassemble):
+            snapshot = self.bridge._begin_rdc_project_shader_resource_index(self._target_request([raw]))
+        self.assertEqual(snapshot["status"], "completed")
+        result = snapshot["result"]
+        self.assertEqual(analyzed, [self.controller.raw])
+        self.assertEqual(usage_calls, [7])
+        self.assertEqual(result["inventoryScope"], "target-raw-sha256")
+        self.assertFalse(result["inventoryComplete"])
+        self.assertTrue(result["scanComplete"])
+        self.assertTrue(result["targetInventoryComplete"])
+        self.assertTrue(result["rawIdentitySearchComplete"])
+        self.assertEqual(result["filteredOutShaderResourceIds"], [8])
+        self.assertEqual(result["unindexedShaderResourceCount"], 0)
+        self.assertEqual(result["targetMatchedShaderResourceIds"], [7])
+        self.assertEqual(result["observedTargetRawSha256s"], [raw])
+        self.assertEqual(result["assets"][0]["anchorEventId"], 42)
+        self.assertEqual(result["assets"][0]["ownerCaptureSessionId"], "1" * 32)
+        self.assertFalse(result["symbolSnapshotPublished"])
+        self.assertEqual(result["symbolSnapshotShaderCount"], 0)
+        self.assertIs(self.bridge._symbol_capture_snapshot, original_snapshot)
+        self.assertEqual(self.bridge._known_catalog_capture_ids, {})
+        self.assertEqual(self.controller.events, [])
+        with self.assertRaises((RuntimeError, ValueError)):
+            self._commit(snapshot)
+
+    def test_target_raw_lookup_cannot_enter_full_inventory_cache_or_project_projection(self):
+        from src import project_restore
+        from src.rdc_shader_inventory_cache import build_shader_inventory_cache_document, RdcShaderInventoryCacheError
+        raw = hashlib.sha256(self.controller.raw).hexdigest()
+        result, unused_calls = self._host_target_inventory([raw])
+        with self.assertRaisesRegex(RuntimeError, "filtered Shader lookup"):
+            project_restore._project_shader_inventory(result)
+        with self.assertRaises(RdcShaderInventoryCacheError):
+            build_shader_inventory_cache_document("1" * 32, "2" * 64, self.capture_path, result["bridgeResult"])
+
+    def test_target_raw_invalid_physical_resource_never_completes_search(self):
+        self.controller.resources.append(types.SimpleNamespace(type="shader", resourceId=0))
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(self._target_request(["a" * 64]))
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(snapshot["result"]["reasonId"], "shader-resource-index-invalid-resource-id")
+        self.assertFalse(snapshot["result"]["scanComplete"])
+        self.assertFalse(snapshot["result"]["rawIdentitySearchComplete"])
+
+    def test_target_raw_unobserved_is_not_an_absence_claim_or_full_inventory(self):
+        requested = "a" * 64
+        request = self._target_request([requested])
+        with mock.patch.object(self.bridge, "_compiled_shader_interface", side_effect=AssertionError("nonmatch ABI work")):
+            result = self.bridge._begin_rdc_project_shader_resource_index(request)["result"]
+        self.assertEqual(result["assets"], [])
+        self.assertEqual(result["observedTargetRawSha256s"], [])
+        self.assertEqual(result["unobservedTargetRawSha256s"], [requested])
+        self.assertEqual(result["filteredOutShaderResourceCount"], 1)
+        self.assertTrue(result["rawIdentitySearchComplete"])
+        self.assertTrue(result["targetInventoryComplete"])
+        self.assertFalse(result["inventoryComplete"])
+        self.assertFalse(result["physicalApplyAuthority"])
+        self.assertNotIn("absentTargetRawSha256s", result)
+        self.assertEqual(result["rawHashPurpose"], "captured-executable-identity")
+        self.assertFalse(result["semanticEquivalenceVerified"])
+
+    def test_target_raw_lookup_preserves_unreadable_resources_and_partial_target_metadata(self):
+        self.controller.resources.append(types.SimpleNamespace(type="shader", resourceId=8))
+        original = self.controller.reflection
+        self.controller.GetShader = lambda pipeline, resource, entry: original if int(resource) == 7 else None
+        result = self.bridge._begin_rdc_project_shader_resource_index(self._target_request(["a" * 64]))["result"]
+        self.assertEqual(result["filteredOutShaderResourceIds"], [7])
+        self.assertEqual(result["rawIdentityUnavailableShaderResourceIds"], [8])
+        self.assertEqual(result["unindexedShaderResourceIds"], [8])
+        self.assertFalse(result["rawIdentitySearchComplete"])
+        self.assertFalse(result["targetInventoryComplete"])
+        self.assertEqual(result["unobservedTargetRawSha256s"], ["a" * 64])
+        # A raw match with contradictory entry-point metadata is observed,
+        # but does not become a usable source/anchor tuple.
+        original.entryPoint = "contradictory-entry"
+        raw = hashlib.sha256(original.rawBytes).hexdigest()
+        result = self.bridge._begin_rdc_project_shader_resource_index(self._target_request([raw]))["result"]
+        self.assertEqual(result["observedTargetRawSha256s"], [raw])
+        self.assertEqual(result["assets"], [])
+        self.assertEqual(result["targetMatchedShaderResourceIds"], [7])
+        self.assertFalse(result["targetInventoryComplete"])
+
+    def _host_target_inventory(self, targets, mutate=None):
+        from src import project_restore
+        bridge = self.bridge
+        calls = []
+
+        class HostIpc:
+            def call(self, command, params, timeout):
+                calls.append((command, params))
+                if command == "begin_rdc_project_shader_resource_index":
+                    result = bridge._begin_rdc_project_shader_resource_index(params)
+                elif command == "poll_rdc_project_shader_resource_index":
+                    result = bridge._poll_rdc_project_shader_resource_index(params)
+                else:
+                    raise AssertionError("unexpected Host command " + command)
+                if mutate and result.get("status") == "completed":
+                    result = json.loads(json.dumps(result))
+                    mutate(result["result"])
+                return result
+
+        host = types.SimpleNamespace(ipc=HostIpc())
+        value = project_restore._inventory_shader_resources(
+            host, self.capture_path, "1" * 32, self.controller.api,
+            project_restore._Progress("test-target", None, []), target_raw_sha256s=targets)
+        return value, calls
+
+    def test_host_target_inventory_uses_real_byte_hash_anchor_and_retains_filtered_scope(self):
+        self.controller.resources.append(types.SimpleNamespace(type="shader", resourceId=8))
+        other = types.SimpleNamespace(**vars(self.controller.reflection))
+        other.rawBytes = b"other-shader"
+        self.controller.GetShader = lambda pipeline, resource, entry: self.controller.reflection if int(resource) == 7 else other
+        self.controller.GetUsage = lambda resource: [types.SimpleNamespace(eventId=42)]
+        raw = hashlib.sha256(self.controller.raw).hexdigest()
+        result, calls = self._host_target_inventory([raw])
+        self.assertEqual(result["shaders"][0]["resourceId"], 7)
+        self.assertEqual(result["shaders"][0]["rawSha256"], raw)
+        self.assertEqual(result["shaders"][0]["anchorEventId"], 42)
+        self.assertEqual(result["rawBytecode"][raw], self.controller.raw)
+        self.assertEqual(result["inventoryScope"], "target-raw-sha256")
+        self.assertEqual(result["filteredOutShaderResourceCount"], 1)
+        self.assertEqual(calls[0][1]["target_raw_sha256s"], [raw])
+        self.assertEqual(calls[0][1]["expected_shaders"], [])
+        self.assertFalse(result["bridgeResult"]["inventoryComplete"])
+        self.assertFalse(result["bridgeResult"]["symbolSnapshotPublished"])
+        self.assertEqual(self.controller.events, [])
+
+    def test_host_target_inventory_returns_unobserved_with_explicit_incomplete_raw_search(self):
+        self.controller.GetShader = lambda pipeline, resource, entry: None
+        result, unused_calls = self._host_target_inventory(["a" * 64])
+        self.assertEqual(result["shaders"], [])
+        self.assertEqual(result["unobservedTargetRawSha256s"], ["a" * 64])
+        self.assertFalse(result["rawIdentitySearchComplete"])
+        self.assertFalse(result["targetInventoryComplete"])
+
+    def test_host_target_inventory_rejects_widened_scope_ledger_and_claimed_publication(self):
+        from src import project_restore
+        raw = hashlib.sha256(self.controller.raw).hexdigest()
+        corruptions = (
+            ("inventoryComplete", True), ("symbolSnapshotPublished", True),
+            ("targetRawSha256s", ["a" * 64]), ("rawIdentitySearchComplete", False),
+            ("filteredOutShaderResourceIds", [7]), ("filteredOutShaderResourceCount", 1),
+            ("targetMatchedShaderResourceIds", []), ("observedTargetRawSha256s", []),
+            ("symbolSnapshotShaderCount", 1), ("scanComplete", False),
+            ("targetInventoryComplete", False),
+            ("rawHashPurpose", "organized-code-equivalence"), ("semanticEquivalenceVerified", True),
+        )
+        for field, value in corruptions:
+            with self.subTest(field=field), self.assertRaises(project_restore.CatalogPreparationRequired):
+                self._host_target_inventory([raw], lambda result, key=field, invalid=value: result.update({key: invalid}))
+
+    def test_host_target_inventory_rejects_invalid_filter_before_ipc(self):
+        from src import project_restore
+        ipc = types.SimpleNamespace(call=mock.Mock(side_effect=AssertionError("IPC must not run")))
+        for targets in ([], "a" * 64, ["A" * 64], [" a" * 32], [True], ["a" * 64] * 17):
+            with self.subTest(targets=targets), self.assertRaises((ValueError, RuntimeError)):
+                project_restore._inventory_shader_resources(
+                    types.SimpleNamespace(ipc=ipc), self.capture_path, "1" * 32, self.controller.api,
+                    project_restore._Progress("invalid-target", None, []), target_raw_sha256s=targets)
+        ipc.call.assert_not_called()
+
+    def test_target_raw_missing_bytes_or_entry_points_remain_unknown(self):
+        for unavailable in ("raw", "entries-empty", "entries-error"):
+            with self.subTest(unavailable=unavailable):
+                with self.bridge._project_shader_index_jobs_guard:
+                    self.bridge._project_shader_index_jobs.clear()
+                self.controller.reflection.rawBytes = self.controller.raw
+                self.controller.GetShaderEntryPoints = lambda resource: [self.controller.entry]
+                if unavailable == "raw":
+                    self.controller.reflection.rawBytes = b""
+                elif unavailable == "entries-empty":
+                    self.controller.GetShaderEntryPoints = lambda resource: []
+                else:
+                    self.controller.GetShaderEntryPoints = mock.Mock(side_effect=RuntimeError("driver unavailable"))
+                result, unused_calls = self._host_target_inventory(["a" * 64])
+                self.assertFalse(result["rawIdentitySearchComplete"])
+                self.assertFalse(result["targetInventoryComplete"])
+                self.assertEqual(result["rawIdentityUnavailableShaderResourceIds"], [7])
+                self.assertEqual(result["filteredOutShaderResourceCount"], 0)
+                self.assertEqual(result["unobservedTargetRawSha256s"], ["a" * 64])
 
     def _commit(self, snapshot):
         return self.bridge._commit_rdc_project_shader_resource_index({
@@ -297,6 +597,7 @@ class ReplayLabRdcProjectBridgeTests(unittest.TestCase):
         self.assertEqual(document, written["document"])
         self.assertEqual("unknown", self.access.sections[0][0].type)
         self.assertEqual("zstd", self.access.sections[0][0].flags)
+        self.assertEqual(document["schemaVersion"], self.access.sections[0][0].version)
 
         read = self.bridge._read_rdc_project_index({
             "expected_capture_path": str(self.capture_path),
@@ -304,6 +605,79 @@ class ReplayLabRdcProjectBridgeTests(unittest.TestCase):
         })
         self.assertEqual(document, read["document"])
         self.assertEqual(written["encodedSha256"], read["encodedSha256"])
+
+    def test_legacy_v1_section_remains_readable_without_transport_migration(self):
+        unsigned = {
+            "schema": "replaylab-rdc-project-reuse-index/v1",
+            "schemaVersion": 1,
+            "bindings": [],
+        }
+        document = dict(unsigned)
+        document["sealSha256"] = hashlib.sha256(
+            self.bridge._canonical_project_index_bytes(unsigned)
+        ).hexdigest()
+        payload = self.bridge._canonical_project_index_bytes(document)
+        properties = _Properties()
+        properties.name = self.bridge.REPLAYLAB_RDC_PROJECT_INDEX_SECTION
+        properties.version = 1
+        properties.uncompressedSize = len(payload)
+        self.access.sections = [(properties, payload)]
+
+        result = self.bridge._read_rdc_project_index({
+            "expected_capture_path": str(self.capture_path),
+            "expected_capture_session_id": "1" * 32,
+        })
+
+        self.assertTrue(result["present"])
+        self.assertEqual(result["sectionVersion"], 1)
+        self.assertEqual(result["document"], document)
+
+    def test_v2_section_remains_readable_but_bridge_only_writes_v3(self):
+        unsigned = {
+            "schema": "replaylab-rdc-project-reuse-index/v2",
+            "schemaVersion": 2,
+            "bindings": [],
+        }
+        document = dict(unsigned)
+        document["sealSha256"] = hashlib.sha256(
+            self.bridge._canonical_project_index_bytes(unsigned)
+        ).hexdigest()
+        payload = self.bridge._canonical_project_index_bytes(document)
+        properties = _Properties()
+        properties.name = self.bridge.REPLAYLAB_RDC_PROJECT_INDEX_SECTION
+        properties.version = 2
+        properties.uncompressedSize = len(payload)
+        self.access.sections = [(properties, payload)]
+
+        result = self.bridge._read_rdc_project_index({
+            "expected_capture_path": str(self.capture_path),
+            "expected_capture_session_id": "1" * 32,
+        })
+        self.assertTrue(result["present"])
+        self.assertEqual(result["sectionVersion"], 2)
+        self.assertEqual(result["document"], document)
+
+        with self.assertRaisesRegex(ValueError, "only writes the current"):
+            self.bridge._write_rdc_project_index({
+                "expected_capture_path": str(self.capture_path),
+                "expected_capture_session_id": "1" * 32,
+                "document": document,
+            })
+
+    def test_section_and_document_versions_must_match_for_v3(self):
+        document = new_index()
+        payload = self.bridge._canonical_project_index_bytes(document)
+        properties = _Properties()
+        properties.name = self.bridge.REPLAYLAB_RDC_PROJECT_INDEX_SECTION
+        properties.version = 2
+        properties.uncompressedSize = len(payload)
+        self.access.sections = [(properties, payload)]
+
+        with self.assertRaisesRegex(RuntimeError, "versions differ"):
+            self.bridge._read_rdc_project_index({
+                "expected_capture_path": str(self.capture_path),
+                "expected_capture_session_id": "1" * 32,
+            })
 
     def test_duplicate_named_sections_and_non_finite_json_fail_closed(self):
         document = new_index()
@@ -443,9 +817,1171 @@ class ReplayLabRdcProjectBridgeTests(unittest.TestCase):
         self.assertEqual(asset["ownerResourceId"], 8)
         self.assertFalse(asset["crossCaptureResourceIdReuse"])
 
+    def test_inventory_discovers_every_unique_shader_once_without_eid_traversal(self):
+        shader_8 = types.SimpleNamespace(type="shader", resourceId=8)
+        non_shader = types.SimpleNamespace(type="texture", resourceId=99)
+        self.controller.resources = [self.controller.resource, non_shader, shader_8]
+        reflection_7 = self.controller.reflection
+        reflection_8 = types.SimpleNamespace(**vars(self.controller.reflection))
+        # Deliberately identical content under another capture-local RID.  The
+        # stable key must remain identical while ownership remains distinct.
+        reflection_8.rawBytes = reflection_7.rawBytes
+        entry_7 = types.SimpleNamespace(name="main", stage="fragment")
+        entry_8 = types.SimpleNamespace(name="main", stage="fragment")
+        entry_calls = []
+        shader_calls = []
+        usage_calls = []
+        usage_records_seen = []
+
+        def get_entries(resource):
+            resource_id = int(resource)
+            entry_calls.append(resource_id)
+            return [entry_7 if resource_id == 7 else entry_8]
+
+        def get_shader(unused_pipeline, resource, unused_entry):
+            del unused_pipeline, unused_entry
+            resource_id = int(resource)
+            shader_calls.append(resource_id)
+            return reflection_7 if resource_id == 7 else reflection_8
+
+        def get_usage(resource):
+            resource_id = int(resource)
+            usage_calls.append(resource_id)
+            values = (20, 10) if resource_id == 7 else (31, 29)
+
+            def records():
+                for value in values:
+                    usage_records_seen.append((resource_id, value))
+                    yield types.SimpleNamespace(eventId=value)
+
+            return records()
+
+        self.controller.GetShaderEntryPoints = get_entries
+        self.controller.GetShader = get_shader
+        self.controller.GetUsage = get_usage
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request()
+        )
+
+        self.assertEqual(snapshot["status"], "completed")
+        result = snapshot["result"]
+        self.assertTrue(result["inventoryOnly"])
+        self.assertTrue(result["inventoryComplete"])
+        self.assertFalse(result["leaseEligible"])
+        self.assertFalse(result["matched"])
+        self.assertEqual(result["uniqueShaderResourceCount"], 2)
+        self.assertEqual(result["processedShaderResourceCount"], 2)
+        self.assertEqual(result["indexedShaderResourceCount"], 2)
+        self.assertEqual(result["unindexedShaderResourceCount"], 0)
+        self.assertEqual(result["unindexedShaderResourceIds"], [])
+        self.assertEqual(result["matchedShaderCount"], 2)
+        self.assertEqual(result["eventTraversalCount"], 0)
+        self.assertFalse(result["fullFrameTraversal"])
+        self.assertEqual(result["anchorQueryCount"], 2)
+        self.assertEqual(result["representativeEidCount"], 2)
+        self.assertEqual(result["anchorPerShaderMaximum"], 1)
+        self.assertEqual(entry_calls, [7, 8])
+        self.assertEqual(shader_calls, [7, 8])
+        self.assertEqual(usage_calls, [7, 8])
+        self.assertEqual(usage_records_seen, [(7, 20), (8, 31)])
+        self.assertEqual(result["anchorUsageRecordCount"], 2)
+        self.assertEqual(self.controller.events, [])
+        self.assertEqual(snapshot["progress"]["processedResourceCount"], 2)
+        self.assertEqual(snapshot["progress"]["totalResourceCount"], 2)
+        assets = result["assets"]
+        self.assertEqual([asset["resourceId"] for asset in assets], [7, 8])
+        self.assertEqual([asset["anchorEventId"] for asset in assets], [20, 31])
+        self.assertEqual(
+            [asset["anchorSource"] for asset in assets],
+            ["resource-usage-index", "resource-usage-index"],
+        )
+        self.assertEqual(assets[0]["stableKeySha256"], assets[1]["stableKeySha256"])
+        self.assertEqual(
+            set(assets[0]["stableKeyMaterial"]),
+            {
+                "api", "encoding", "rawSha256", "stage", "entryPoint",
+                "abiHash", "layoutHash",
+            },
+        )
+        self.assertNotIn("resourceId", assets[0]["stableKeyMaterial"])
+        self.assertNotIn("anchorEventId", assets[0]["stableKeyMaterial"])
+        expected_key = hashlib.sha256(
+            self.bridge._canonical_project_index_bytes(
+                assets[0]["stableKeyMaterial"]
+            )
+        ).hexdigest()
+        self.assertEqual(assets[0]["stableKeySha256"], expected_key)
+        self.assertEqual(len(result["rawBytecodeBlobs"]), 1)
+        blob = result["rawBytecodeBlobs"][0]
+        self.assertEqual(base64.b64decode(blob["data"]), reflection_7.rawBytes)
+        inventory_material = {
+            "api": "d3d11",
+            "shaders": [
+                {
+                    "resourceId": asset["resourceId"],
+                    "stableKeySha256": asset["stableKeySha256"],
+                    "anchorEventId": asset["anchorEventId"],
+                    "constantBlocks": asset["constantBlocks"],
+                }
+                for asset in assets
+            ],
+        }
+        self.assertEqual(
+            result["resourceInventorySha256"],
+            hashlib.sha256(
+                self.bridge._canonical_project_index_bytes(inventory_material)
+            ).hexdigest(),
+        )
+        self.assertTrue(result["symbolSnapshotPublished"])
+        self.assertEqual(result["symbolSnapshotShaderCount"], 2)
+        self.assertEqual(result["symbolSnapshotUseCount"], 2)
+        self.assertEqual(
+            result["symbolSnapshotCaptureId"],
+            result["stableResourceSetSha256"],
+        )
+        symbol_snapshot = self.bridge._symbol_capture_snapshot
+        self.assertEqual(
+            symbol_snapshot["captureId"], result["stableResourceSetSha256"]
+        )
+        self.assertEqual(len(symbol_snapshot["shaderKeys"]), 2)
+        self.assertEqual(
+            sorted(value[0] for value in symbol_snapshot["shaderKeys"]), [7, 8]
+        )
+        self.assertEqual(
+            sorted(values[0] for values in symbol_snapshot["usesByKey"].values()),
+            [20, 31],
+        )
+        # Inventory enables knowledge/alias revalidation only.  It must not
+        # grant the executable catalog identity fast path.
+        self.assertEqual(self.bridge._known_catalog_capture_ids, {})
+        self.assertEqual(self.bridge._known_catalog_identity_pairs, set())
+
+    def test_inventory_skips_zero_usage_then_uses_first_positive_eid_once(self):
+        class ResourceHandle:
+            def __init__(self, value):
+                self.value = value
+
+            def __int__(self):
+                return self.value
+
+        resource_handle = ResourceHandle(7)
+        self.controller.resource.resourceId = resource_handle
+        entries = [
+            types.SimpleNamespace(name="main", stage="fragment"),
+            types.SimpleNamespace(name="alternate", stage="fragment"),
+        ]
+        usage_calls = []
+        usage_records_seen = []
+        root_action_calls = []
+
+        def get_entries(resource):
+            self.assertIs(resource, resource_handle)
+            return list(entries)
+
+        def get_shader(unused_pipeline, resource, entry):
+            del unused_pipeline
+            self.assertIs(resource, resource_handle)
+            reflection = types.SimpleNamespace(**vars(self.controller.reflection))
+            reflection.entryPoint = entry.name
+            return reflection
+
+        def get_usage(resource):
+            self.assertIs(resource, resource_handle)
+            usage_calls.append(resource)
+
+            def records():
+                for record in (
+                    types.SimpleNamespace(eventId=0, usage="Unused"),
+                    types.SimpleNamespace(eventId=42, usage="PS_Resource"),
+                    types.SimpleNamespace(eventId=99, usage="PS_Resource"),
+                ):
+                    usage_records_seen.append((record.eventId, record.usage))
+                    yield record
+
+            return records()
+
+        def get_root_actions():
+            root_action_calls.append(True)
+            raise AssertionError(
+                "unique-Shader inventory must not traverse the action tree"
+            )
+
+        self.controller.GetShaderEntryPoints = get_entries
+        self.controller.GetShader = get_shader
+        self.controller.GetUsage = get_usage
+        self.controller.GetRootActions = get_root_actions
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request()
+        )
+
+        self.assertEqual(snapshot["status"], "completed")
+        result = snapshot["result"]
+        self.assertTrue(result["inventoryComplete"])
+        self.assertEqual(result["uniqueShaderResourceCount"], 1)
+        self.assertEqual(result["inspectedEntryPointCount"], 2)
+        self.assertEqual(result["anchorQueryCount"], 1)
+        self.assertEqual(result["anchorUsageRecordCount"], 2)
+        self.assertEqual(result["representativeEidCount"], 1)
+        self.assertEqual(result["anchorPerShaderMaximum"], 1)
+        self.assertEqual(result["eventTraversalCount"], 0)
+        self.assertFalse(result["fullFrameTraversal"])
+        self.assertEqual(usage_calls, [resource_handle])
+        self.assertEqual(
+            usage_records_seen,
+            [(0, "Unused"), (42, "PS_Resource")],
+        )
+        self.assertEqual(root_action_calls, [])
+        self.assertEqual(self.controller.events, [])
+        self.assertEqual(len(result["assets"]), 2)
+        self.assertEqual(
+            [asset["entryPoint"] for asset in result["assets"]],
+            ["alternate", "main"],
+        )
+        self.assertEqual(
+            [asset["anchorEventId"] for asset in result["assets"]],
+            [42, 42],
+        )
+        self.assertTrue(all(
+            asset["exactExecutableMatchEligible"]
+            for asset in result["assets"]
+        ))
+
+    def test_inventory_rejects_anchor_beyond_bounded_invalid_usage_prefix(self):
+        usage_calls = []
+        usage_records_seen = []
+        scan_limit = self.bridge.MAX_PROJECT_SHADER_INDEX_ANCHOR_PREFIX_SCAN_RECORDS
+
+        def get_usage(resource):
+            usage_calls.append(int(resource))
+
+            def records():
+                for index in range(scan_limit):
+                    usage_records_seen.append(index)
+                    yield types.SimpleNamespace(eventId=0)
+                usage_records_seen.append("beyond-limit")
+                yield types.SimpleNamespace(eventId=77)
+
+            return records()
+
+        self.controller.GetUsage = get_usage
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request()
+        )
+
+        self.assertEqual(snapshot["status"], "completed")
+        result = snapshot["result"]
+        self.assertTrue(result["inventoryComplete"])
+        self.assertEqual(result["anchorQueryCount"], 1)
+        self.assertEqual(result["anchorUsageRecordCount"], scan_limit)
+        self.assertEqual(result["representativeEidCount"], 0)
+        self.assertEqual(result["eventTraversalCount"], 0)
+        self.assertEqual(usage_calls, [7])
+        self.assertEqual(usage_records_seen, list(range(scan_limit)))
+        asset = result["assets"][0]
+        self.assertIsNone(asset["anchorEventId"])
+        self.assertIsNone(asset["anchorSource"])
+        self.assertFalse(asset["exactExecutableMatchEligible"])
+        self.assertIn(
+            {"code": "shader-resource-usage-limit", "resourceId": 7},
+            result["diagnostics"],
+        )
+        self.assertEqual(self.controller.events, [])
+
+    def test_inventory_keeps_knowledge_when_no_representative_eid_exists(self):
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request()
+        )
+
+        result = snapshot["result"]
+        self.assertTrue(result["inventoryComplete"])
+        self.assertEqual(result["anchorQueryCount"], 0)
+        self.assertEqual(result["representativeEidCount"], 0)
+        self.assertEqual(result["eventTraversalCount"], 0)
+        asset = result["assets"][0]
+        self.assertIsNone(asset["anchorEventId"])
+        self.assertIsNone(asset["anchorSource"])
+        self.assertTrue(asset["stableKeySha256"])
+        self.assertFalse(asset["exactExecutableMatchEligible"])
+        self.assertTrue(result["symbolSnapshotPublished"])
+        key = (
+            asset["resourceId"], asset["stage"], asset["entryPoint"],
+            asset["rawSha256"],
+        )
+        self.assertIn(key, self.bridge._symbol_capture_snapshot["shaderKeys"])
+        self.assertNotIn(key, self.bridge._symbol_capture_snapshot["usesByKey"])
+        self.assertEqual(result["symbolSnapshotUseCount"], 0)
+        self.assertEqual(self.controller.events, [])
+
+    def test_inventory_skips_unrepresentable_shader_stage_per_resource(self):
+        resource_8 = types.SimpleNamespace(type="shader", resourceId=8)
+        self.controller.resources = [self.controller.resource, resource_8]
+        entry_calls = []
+
+        def get_entries(resource):
+            resource_id = int(resource)
+            entry_calls.append(resource_id)
+            if resource_id == 7:
+                raise ValueError("152 is not a valid ShaderStage")
+            return [self.controller.entry]
+
+        self.controller.GetShaderEntryPoints = get_entries
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+
+        self.assertEqual(snapshot["status"], "completed")
+        result = snapshot["result"]
+        self.assertTrue(result["inventoryComplete"])
+        self.assertEqual(result["uniqueShaderResourceCount"], 2)
+        self.assertEqual(result["processedShaderResourceCount"], 2)
+        self.assertEqual(result["indexedShaderResourceCount"], 1)
+        self.assertEqual(result["unindexedShaderResourceCount"], 1)
+        self.assertEqual(result["unindexedShaderResourceIds"], [7])
+        self.assertEqual(entry_calls, [7, 8])
+        self.assertEqual(
+            [asset["resourceId"] for asset in result["assets"]], [8]
+        )
+        self.assertIn(
+            {"code": "shader-entry-points-unavailable", "resourceId": 7},
+            result["diagnostics"],
+        )
+        self.assertEqual(result["eventTraversalCount"], 0)
+        self.assertFalse(result["fullFrameTraversal"])
+        self.assertEqual(result["anchorPerShaderMaximum"], 1)
+        self.assertEqual(self.controller.events, [])
+
+    def test_inventory_never_queries_anchor_for_unindexed_shader_resource(self):
+        resource_8 = types.SimpleNamespace(type="shader", resourceId=8)
+        self.controller.resources = [self.controller.resource, resource_8]
+        usage_calls = []
+
+        def get_entries(resource):
+            if int(resource) == 7:
+                raise ValueError("152 is not a valid ShaderStage")
+            return [self.controller.entry]
+
+        def get_usage(resource):
+            usage_calls.append(int(resource))
+            return [types.SimpleNamespace(eventId=22)]
+
+        self.controller.GetShaderEntryPoints = get_entries
+        self.controller.GetUsage = get_usage
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=True)
+        )
+
+        self.assertEqual(snapshot["status"], "completed")
+        result = snapshot["result"]
+        self.assertTrue(result["inventoryComplete"])
+        self.assertEqual(result["indexedShaderResourceCount"], 1)
+        self.assertEqual(result["unindexedShaderResourceIds"], [7])
+        self.assertEqual(result["anchorQueryCount"], 1)
+        self.assertEqual(result["representativeEidCount"], 1)
+        self.assertEqual(usage_calls, [8])
+        self.assertEqual(result["assets"][0]["resourceId"], 8)
+        self.assertEqual(result["assets"][0]["anchorEventId"], 22)
+        self.assertEqual(result["eventTraversalCount"], 0)
+        self.assertEqual(self.controller.events, [])
+
+    def test_inventory_does_not_eagerly_read_invalid_entry_stage_fallback(self):
+        class EntryWithInvalidStage:
+            name = "main"
+
+            @property
+            def stage(self):
+                raise ValueError("72 is not a valid ShaderStage")
+
+        self.controller.GetShaderEntryPoints = (
+            lambda unused_resource: [EntryWithInvalidStage()]
+        )
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+
+        self.assertEqual(snapshot["status"], "completed")
+        result = snapshot["result"]
+        self.assertTrue(result["inventoryComplete"])
+        self.assertEqual(result["processedShaderResourceCount"], 1)
+        self.assertEqual(len(result["assets"]), 1)
+        self.assertEqual(result["assets"][0]["stage"], "fragment")
+        self.assertNotIn(
+            "shader-stage-unavailable",
+            {item["code"] for item in result["diagnostics"]},
+        )
+        self.assertEqual(result["eventTraversalCount"], 0)
+        self.assertEqual(self.controller.events, [])
+
+    def test_inventory_fails_closed_when_reflection_and_entry_stages_are_unknown(self):
+        request = self._inventory_request(discover_anchors=False)
+
+        class InvalidStage:
+            @property
+            def stage(self):
+                raise ValueError("232 is not a valid ShaderStage")
+
+        class ReflectionWithInvalidStage(InvalidStage):
+            def __init__(self, source):
+                self.source = source
+
+            def __getattr__(self, name):
+                return getattr(self.source, name)
+
+        class EntryWithInvalidStage(InvalidStage):
+            name = "main"
+
+        self.controller.reflection = ReflectionWithInvalidStage(
+            self.controller.reflection
+        )
+        self.controller.GetShaderEntryPoints = (
+            lambda unused_resource: [EntryWithInvalidStage()]
+        )
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            request
+        )
+
+        self.assertEqual(snapshot["status"], "completed")
+        result = snapshot["result"]
+        self.assertTrue(result["inventoryComplete"])
+        self.assertEqual(result["processedShaderResourceCount"], 1)
+        self.assertEqual(result["assets"], [])
+        self.assertEqual(result["indexedShaderResourceCount"], 0)
+        self.assertEqual(result["unindexedShaderResourceIds"], [7])
+        self.assertIn(
+            "shader-stage-unavailable",
+            {item["code"] for item in result["diagnostics"]},
+        )
+        self.assertEqual(result["eventTraversalCount"], 0)
+        self.assertEqual(self.controller.events, [])
+
+    def test_inventory_excludes_ambiguous_cbuffer_paths_without_losing_shader(self):
+        scalar = types.SimpleNamespace(
+            name="float",
+            baseType="Float",
+            rows=1,
+            columns=1,
+            elements=1,
+            arrayByteStride=0,
+            matrixByteStride=0,
+            flags=0,
+            pointerTypeID=0xFFFFFFFF,
+            members=[],
+        )
+        first = types.SimpleNamespace(
+            name="unknown", byteOffset=0, type=scalar,
+            bitFieldOffset=0, bitFieldSize=0,
+        )
+        second = types.SimpleNamespace(
+            name="unknown", byteOffset=4, type=scalar,
+            bitFieldOffset=0, bitFieldSize=0,
+        )
+        self.controller.reflection.constantBlocks = [
+            _constant_block(byte_size=16)
+        ]
+        self.controller.reflection.constantBlocks[0].variables = [first, second]
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+
+        self.assertEqual(snapshot["status"], "completed")
+        result = snapshot["result"]
+        self.assertTrue(result["inventoryComplete"])
+        self.assertEqual(len(result["assets"]), 1)
+        self.assertEqual(result["assets"][0]["constantBlocks"][0]["fields"], [])
+        self.assertIn(
+            {
+                "code": "shader-cbuffer-field-path-ambiguous",
+                "resourceId": 7,
+                "stage": "fragment",
+                "entryPoint": "main",
+                "count": 1,
+            },
+            result["diagnostics"],
+        )
+        self.assertEqual(result["eventTraversalCount"], 0)
+        self.assertEqual(self.controller.events, [])
+
+    def test_inventory_projects_rich_cbuffer_leaves_without_resolving_overlap(self):
+        float4 = types.SimpleNamespace(
+            name="float4",
+            baseType="VarType.Float",
+            rows=1,
+            columns=4,
+            elements=1,
+            arrayByteStride=0,
+            matrixByteStride=0,
+            flags=3,
+            pointerTypeID=17,
+            members=[],
+        )
+        scalar = types.SimpleNamespace(
+            name="float",
+            baseType="Float",
+            rows=1,
+            columns=1,
+            elements=1,
+            arrayByteStride=0,
+            matrixByteStride=0,
+            flags=0,
+            pointerTypeID=0xFFFFFFFF,
+            members=[],
+        )
+        nested_leaf = types.SimpleNamespace(
+            name="roughness",
+            byteOffset=8,
+            bitFieldOffset=2,
+            bitFieldSize=5,
+            type=scalar,
+        )
+        nested_type = types.SimpleNamespace(
+            name="MaterialParams",
+            baseType="Struct",
+            rows=1,
+            columns=1,
+            elements=1,
+            arrayByteStride=0,
+            matrixByteStride=0,
+            flags=0,
+            pointerTypeID=0xFFFFFFFF,
+            members=[nested_leaf],
+        )
+        color = types.SimpleNamespace(
+            name="color",
+            byteOffset=0,
+            bitFieldOffset=0,
+            bitFieldSize=0,
+            type=float4,
+        )
+        # A second reflected leaf at the same physical offset is intentionally
+        # retained; the project layer must fail closed if an alias target is
+        # ambiguous instead of the bridge choosing the first name.
+        overlap = types.SimpleNamespace(
+            name="tintAlias",
+            byteOffset=0,
+            bitFieldOffset=0,
+            bitFieldSize=0,
+            type=float4,
+        )
+        nested = types.SimpleNamespace(
+            name="params",
+            byteOffset=16,
+            bitFieldOffset=0,
+            bitFieldSize=0,
+            type=nested_type,
+        )
+        block = _constant_block(byte_size=64)
+        block.variables = [nested, overlap, color]
+        self.controller.reflection.constantBlocks = [block]
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+
+        self.assertEqual(snapshot["status"], "completed")
+        result = snapshot["result"]
+        projected = result["assets"][0]["constantBlocks"][0]
+        self.assertEqual(projected["name"], "PerMaterial")
+        expected_keys = {
+            "canonicalPath", "name", "absoluteByteOffset", "byteSize",
+            "baseType", "rows", "columns", "elements",
+            "arrayByteStride", "matrixByteStride", "rowMajor", "flags",
+            "pointerTypeID", "bitFieldOffset", "bitFieldSize",
+        }
+        self.assertEqual(len(projected["fields"]), 3)
+        self.assertTrue(all(set(field) == expected_keys
+                            for field in projected["fields"]))
+        self.assertEqual(
+            [(field["absoluteByteOffset"], field["canonicalPath"])
+             for field in projected["fields"]],
+            [(0, "color"), (0, "tintAlias"), (24, "params.roughness")],
+        )
+        self.assertEqual(projected["fields"][0]["baseType"], "Float")
+        self.assertEqual(projected["fields"][0]["byteSize"], 16)
+        self.assertEqual(projected["fields"][0]["flags"], 3)
+        self.assertEqual(projected["fields"][0]["pointerTypeID"], 17)
+        nested_projected = projected["fields"][2]
+        self.assertEqual(nested_projected["bitFieldOffset"], 2)
+        self.assertEqual(nested_projected["bitFieldSize"], 5)
+
+        inventory_material = {
+            "api": "d3d11",
+            "shaders": [{
+                "resourceId": result["assets"][0]["resourceId"],
+                "stableKeySha256": result["assets"][0]["stableKeySha256"],
+                "anchorEventId": None,
+                "constantBlocks": [projected],
+            }],
+        }
+        self.assertEqual(
+            result["resourceInventorySha256"],
+            hashlib.sha256(self.bridge._canonical_project_index_bytes(
+                inventory_material)).hexdigest(),
+        )
+        self.assertEqual(self.controller.events, [])
+
+    def test_inventory_cross_capture_publication_resets_alias_overlay(self):
+        self.bridge._symbol_capture_snapshot = {
+            "captureId": "a" * 64,
+            "capturePath": str(Path(self.temporary.name) / "old.rdc"),
+            "shaderKeys": {(99, "fragment", "main", "b" * 64)},
+            "usesByKey": {(99, "fragment", "main", "b" * 64): [3]},
+        }
+        self.bridge._symbol_alias_overlay = {
+            "schema": self.bridge.SYMBOL_ALIAS_SCHEMA,
+            "schemaVersion": self.bridge.SYMBOL_ALIAS_VERSION,
+            "captureId": "a" * 64,
+            "sourcePath": "old.json",
+            "confirmedOnly": True,
+            "allAliases": [{"displayName": "old"}],
+            "aliases": [{"displayName": "old"}],
+        }
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertTrue(snapshot["result"]["symbolSnapshotPublished"])
+        self.assertEqual(self.bridge._symbol_alias_overlay["aliases"], [])
+        self.assertEqual(
+            self.bridge._symbol_capture_snapshot["capturePath"],
+            self.bridge.os.path.normcase(str(self.capture_path.resolve())),
+        )
+
+    def test_inventory_replay_callback_defers_symbol_commit_until_gui_poll(self):
+        callbacks = []
+        self.bridge._ctx.replay.AsyncInvoke = (
+            lambda tag, callback: callbacks.append((tag, callback)))
+
+        queued = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+
+        self.assertEqual(queued["status"], "queued")
+        self.assertEqual(len(callbacks), 1)
+        tag, callback = callbacks.pop(0)
+        self.assertTrue(tag.startswith(
+            self.bridge.PROJECT_SHADER_INDEX_REPLAY_TAG_PREFIX))
+        callback(self.controller)
+        self.assertEqual(
+            self.bridge._project_shader_index_jobs[queued["jobId"]]["status"],
+            "running",
+        )
+        self.assertEqual(len(callbacks), 1)
+        while callbacks:
+            next_tag, callback = callbacks.pop(0)
+            self.assertEqual(next_tag, tag)
+            callback(self.controller)
+        job = self.bridge._project_shader_index_jobs[queued["jobId"]]
+        self.assertEqual(job["status"], "completed")
+        self.assertFalse(job["result"]["symbolSnapshotPublished"])
+        self.assertEqual(self.bridge._symbol_capture_snapshot["captureId"], "")
+
+        completed = self.bridge._poll_rdc_project_shader_resource_index({
+            "expected_capture_path": str(self.capture_path),
+            "expected_capture_session_id": "1" * 32,
+            "job_id": queued["jobId"],
+        })
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(completed["result"]["symbolSnapshotPublished"])
+        self.assertEqual(
+            self.bridge._symbol_capture_snapshot["captureId"],
+            completed["result"]["stableResourceSetSha256"],
+        )
+        self.assertEqual(self.controller.events, [])
+
+    def test_inventory_replay_slices_one_physical_shader_and_yields_to_set_event(self):
+        callbacks = []
+        foreground_runs = []
+        inspected_resources = []
+        self.controller.resources = [
+            types.SimpleNamespace(type="shader", resourceId=resource_id)
+            for resource_id in (7, 8, 9)
+        ]
+
+        def get_entries(resource):
+            inspected_resources.append(int(resource))
+            if len(inspected_resources) == 1:
+                callbacks.append((
+                    "replaySetEvent",
+                    lambda unused_controller: foreground_runs.append(True),
+                ))
+            return [self.controller.entry]
+
+        self.controller.GetShaderEntryPoints = get_entries
+        self.bridge._ctx.replay.AsyncInvoke = (
+            lambda tag, callback: callbacks.append((tag, callback)))
+
+        queued = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+        background_tag, first_slice = callbacks.pop(0)
+        first_slice(self.controller)
+
+        self.assertEqual(inspected_resources, [7])
+        job = self.bridge._project_shader_index_jobs[queued["jobId"]]
+        suspended = job["steps"].gi_frame.f_locals
+        for local_name in (
+            "ctrl",
+            "resources",
+            "description",
+            "resource",
+            "entries",
+            "entry",
+            "reflection",
+            "reflected_blocks",
+            "reflected_block",
+        ):
+            self.assertIsNone(
+                suspended.get(local_name),
+                "suspended inventory retained %s" % local_name,
+            )
+        self.assertTrue(all(
+            isinstance(value, int)
+            for value in suspended["by_id"].values()
+        ))
+        self.assertEqual(
+            [tag for tag, unused_callback in callbacks],
+            ["replaySetEvent", background_tag],
+        )
+        unused_tag, set_event = callbacks.pop(0)
+        set_event(self.controller)
+        self.assertEqual(foreground_runs, [True])
+        self.assertEqual(inspected_resources, [7])
+
+        while callbacks:
+            tag, callback = callbacks.pop(0)
+            inspected_before = len(inspected_resources)
+            callback(self.controller)
+            if tag == background_tag:
+                self.assertLessEqual(
+                    len(inspected_resources) - inspected_before, 1
+                )
+
+        job = self.bridge._project_shader_index_jobs[queued["jobId"]]
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(inspected_resources, [7, 8, 9])
+
+    def test_inventory_replay_yields_gil_before_requeue_but_not_on_completion(self):
+        callbacks = []
+        calls = []
+
+        def queue_slice(tag, callback):
+            calls.append(("queue", tag))
+            callbacks.append((tag, callback))
+
+        original_sleep = self.bridge.time.sleep
+        self.bridge.time.sleep = (
+            lambda seconds: calls.append(("yield", seconds)))
+        self.bridge._ctx.replay.AsyncInvoke = queue_slice
+        try:
+            queued = self.bridge._begin_rdc_project_shader_resource_index(
+                self._inventory_request(discover_anchors=False)
+            )
+            background_tag, first_slice = callbacks.pop(0)
+            calls.append(("run", 1))
+            first_slice(self.controller)
+            calls.append(("return", 1))
+
+            self.assertEqual(
+                [name for name, unused_value in calls],
+                ["queue", "run", "yield", "queue", "return"],
+            )
+            self.assertEqual(calls[0], ("queue", background_tag))
+            self.assertEqual(
+                calls[2],
+                ("yield", self.bridge.PROJECT_SHADER_INDEX_UI_YIELD_SECONDS),
+            )
+            self.assertEqual(calls[3], ("queue", background_tag))
+            self.assertEqual(len(callbacks), 1)
+            next_tag, final_slice = callbacks.pop(0)
+            self.assertEqual(next_tag, background_tag)
+
+            calls.append(("run", 2))
+            final_slice(self.controller)
+            calls.append(("return", 2))
+        finally:
+            self.bridge.time.sleep = original_sleep
+
+        self.assertEqual(
+            [name for name, unused_value in calls],
+            [
+                "queue", "run", "yield", "queue", "return",
+                "run", "return",
+            ],
+        )
+        self.assertEqual(callbacks, [])
+        job = self.bridge._project_shader_index_jobs[queued["jobId"]]
+        self.assertEqual(job["status"], "completed", job.get("error"))
+
+    def test_inventory_replay_uses_only_current_callback_controller_and_proxies(self):
+        class InvocationToken:
+            def __init__(self):
+                self.alive = True
+
+            def check(self):
+                if not self.alive:
+                    raise RuntimeError("expired invocation proxy")
+
+        class ScopedRecord:
+            def __init__(self, token, **values):
+                self._token = token
+                self._values = values
+
+            def __getattr__(self, name):
+                self._token.check()
+                try:
+                    return self._values[name]
+                except KeyError:
+                    raise AttributeError(name)
+
+        class ScopedResourceId:
+            def __init__(self, token, value):
+                self._token = token
+                self._value = value
+
+            def __int__(self):
+                self._token.check()
+                return self._value
+
+        issued = {
+            "controllers": [],
+            "resources": [],
+            "entries": [],
+            "reflections": [],
+            "usages": [],
+        }
+
+        class ScopedController:
+            def __init__(self, token):
+                self._token = token
+                issued["controllers"].append(self)
+
+            def _check(self):
+                self._token.check()
+
+            def GetAPIProperties(self):
+                self._check()
+                return ScopedRecord(self._token, pipelineType="D3D11")
+
+            def GetResources(self):
+                self._check()
+                descriptions = []
+                for value in (7, 8):
+                    resource = ScopedResourceId(self._token, value)
+                    issued["resources"].append(resource)
+                    descriptions.append(ScopedRecord(
+                        self._token, type="shader", resourceId=resource))
+                return descriptions
+
+            def GetShaderEntryPoints(self, resource):
+                self._check()
+                int(resource)
+                entry = ScopedRecord(
+                    self._token, name="main", stage="fragment")
+                issued["entries"].append(entry)
+                return [entry]
+
+            def GetShader(self, unused_pipeline, resource, entry):
+                self._check()
+                resource_id = int(resource)
+                self.assert_current_entry(entry)
+                reflection = ScopedRecord(
+                    self._token,
+                    rawBytes=("captured-shader-%d" % resource_id).encode("ascii"),
+                    stage="fragment",
+                    entryPoint="main",
+                    encoding="dxbc",
+                    inputSignature=[],
+                    outputSignature=[],
+                    readOnlyResources=[],
+                    readWriteResources=[],
+                    samplers=[],
+                    constantBlocks=[],
+                    interfaces=[],
+                    outputTopology="",
+                    dispatchThreadsDimension=[0, 0, 0],
+                )
+                issued["reflections"].append(reflection)
+                return reflection
+
+            def assert_current_entry(self, entry):
+                self._check()
+                if entry.name != "main":
+                    raise AssertionError("unexpected shader entry")
+
+            def GetUsage(self, resource):
+                self._check()
+                resource_id = int(resource)
+                usage = ScopedRecord(
+                    self._token, eventId=100 + resource_id)
+                issued["usages"].append(usage)
+                return [usage]
+
+        callbacks = []
+        self.bridge._ctx.replay.AsyncInvoke = (
+            lambda tag, callback: callbacks.append((tag, callback)))
+        queued = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=True)
+        )
+
+        retired = None
+        callback_tokens = []
+        while callbacks:
+            unused_tag, callback = callbacks.pop(0)
+            token = InvocationToken()
+            callback_tokens.append(token)
+            controller = ScopedController(token)
+            before = {name: len(values) for name, values in issued.items()}
+            try:
+                callback(controller)
+            finally:
+                token.alive = False
+            if retired is None and all(
+                    len(issued[name]) > before[name]
+                    for name in (
+                        "resources", "entries", "reflections", "usages")):
+                retired = (
+                    controller,
+                    issued["resources"][before["resources"]],
+                    issued["entries"][before["entries"]],
+                    issued["reflections"][before["reflections"]],
+                    issued["usages"][before["usages"]],
+                )
+
+        job = self.bridge._project_shader_index_jobs[queued["jobId"]]
+        self.assertEqual(job["status"], "completed", job.get("error"))
+        self.assertTrue(job["result"]["inventoryComplete"])
+        self.assertEqual(
+            [asset["resourceId"] for asset in job["result"]["assets"]],
+            [7, 8],
+        )
+        self.assertGreaterEqual(len(callback_tokens), 3)
+        self.assertEqual(
+            len({id(controller) for controller in issued["controllers"]}),
+            len(callback_tokens),
+        )
+
+        self.assertIsNotNone(retired)
+        old_controller, old_resource, old_entry, old_reflection, old_usage = retired
+        expired_accesses = (
+            old_controller.GetResources,
+            lambda: int(old_resource),
+            lambda: old_entry.name,
+            lambda: old_reflection.rawBytes,
+            lambda: old_usage.eventId,
+        )
+        for access in expired_accesses:
+            with self.assertRaisesRegex(RuntimeError, "expired invocation proxy"):
+                access()
+
+    def test_inventory_replay_slice_stops_on_capture_change_boundary(self):
+        callbacks = []
+        inspected_resources = []
+        self.controller.resources = [
+            types.SimpleNamespace(type="shader", resourceId=resource_id)
+            for resource_id in (7, 8)
+        ]
+
+        def get_entries(resource):
+            inspected_resources.append(int(resource))
+            return [self.controller.entry]
+
+        self.controller.GetShaderEntryPoints = get_entries
+        self.bridge._ctx.replay.AsyncInvoke = (
+            lambda tag, callback: callbacks.append((tag, callback)))
+
+        queued = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+        unused_tag, first_slice = callbacks.pop(0)
+        first_slice(self.controller)
+        self.assertEqual(inspected_resources, [7])
+
+        self.bridge._capture_session_id = "6" * 32
+        unused_tag, second_slice = callbacks.pop(0)
+        second_slice(self.controller)
+
+        job = self.bridge._project_shader_index_jobs[queued["jobId"]]
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("capture changed", job["error"])
+        self.assertEqual(inspected_resources, [7])
+        self.assertIsNone(job["steps"])
+
+    def test_inventory_replay_slice_stops_on_cancel_boundary(self):
+        callbacks = []
+        inspected_resources = []
+        self.controller.resources = [
+            types.SimpleNamespace(type="shader", resourceId=resource_id)
+            for resource_id in (7, 8)
+        ]
+
+        def get_entries(resource):
+            inspected_resources.append(int(resource))
+            return [self.controller.entry]
+
+        self.controller.GetShaderEntryPoints = get_entries
+        self.bridge._ctx.replay.AsyncInvoke = (
+            lambda tag, callback: callbacks.append((tag, callback)))
+
+        queued = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+        unused_tag, first_slice = callbacks.pop(0)
+        first_slice(self.controller)
+        self.assertEqual(inspected_resources, [7])
+
+        job = self.bridge._project_shader_index_jobs[queued["jobId"]]
+        with self.bridge._project_shader_index_jobs_guard:
+            self.bridge._request_project_shader_index_cancel(
+                job, self.bridge.time.monotonic(), "test cancellation"
+            )
+        unused_tag, second_slice = callbacks.pop(0)
+        second_slice(self.controller)
+
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["error"], "test cancellation")
+        self.assertEqual(inspected_resources, [7])
+        self.assertIsNone(job["steps"])
+
+    def test_inventory_publication_fails_closed_with_alias_recovery_ledger(self):
+        old_snapshot = {
+            "captureId": "a" * 64,
+            "capturePath": str(Path(self.temporary.name) / "old.rdc"),
+            "shaderKeys": {(99, "fragment", "main", "b" * 64)},
+            "usesByKey": {(99, "fragment", "main", "b" * 64): [3]},
+        }
+        self.bridge._symbol_capture_snapshot = old_snapshot
+        self.bridge._symbol_alias_recovery_ledger = {"state": "committed"}
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertIn("Rollback", snapshot["error"])
+        self.assertIs(self.bridge._symbol_capture_snapshot, old_snapshot)
+        self.assertEqual(self.controller.events, [])
+
+    def test_cbuffer_free_shader_has_a_complete_empty_layout_hash(self):
+        self.controller.reflection.constantBlocks = []
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+
+        asset = snapshot["result"]["assets"][0]
+        self.assertEqual(
+            asset["layoutHash"], self.bridge._canonical_json_sha256([])
+        )
+        self.assertTrue(asset["stableKeyComplete"])
+        self.assertTrue(asset["stableKeySha256"])
+
+    def test_inventory_cbuffer_name_falls_back_to_stable_block_path(self):
+        self.controller.reflection.constantBlocks = [_constant_block(name="   ")]
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+
+        block = snapshot["result"]["assets"][0]["constantBlocks"][0]
+        self.assertEqual(block["path"], "cbuffer0")
+        self.assertEqual(block["name"], "cbuffer0")
+
+    def test_inventory_invalid_cbuffer_size_fails_closed(self):
+        self.controller.reflection.constantBlocks = [
+            _constant_block(byte_size=0)
+        ]
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+
+        result = snapshot["result"]
+        self.assertFalse(result["inventoryComplete"])
+        self.assertEqual(
+            result["reasonId"],
+            "shader-resource-index-reflection-block-invalid",
+        )
+        self.assertEqual(self.bridge._symbol_capture_snapshot["captureId"], "")
+        self.assertEqual(self.controller.events, [])
+
+    def test_inventory_zero_byte_leaf_fails_closed_with_diagnostic(self):
+        invalid_leaf = types.SimpleNamespace(
+            name="opaque",
+            byteOffset=0,
+            bitFieldOffset=0,
+            bitFieldSize=0,
+            type=None,
+        )
+        block = _constant_block()
+        block.variables = [invalid_leaf]
+        self.controller.reflection.constantBlocks = [block]
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+
+        self.assertEqual(snapshot["status"], "completed")
+        result = snapshot["result"]
+        self.assertFalse(result["inventoryComplete"])
+        self.assertEqual(
+            result["reasonId"],
+            "shader-resource-index-reflection-field-invalid",
+        )
+        self.assertIn(
+            "shader-resource-index-reflection-field-invalid",
+            [item["code"] for item in result["diagnostics"]],
+        )
+        self.assertFalse(result.get("symbolSnapshotPublished", False))
+        self.assertEqual(self.bridge._symbol_capture_snapshot["captureId"], "")
+        self.assertEqual(self.controller.events, [])
+
+    def test_inventory_rejects_multiple_representative_eids_for_one_resource(self):
+        first = self._expected_shader()
+        second = dict(first)
+        second["entryPoint"] = "alternate"
+        second["anchorEventId"] = first["anchorEventId"] + 1
+
+        with self.assertRaisesRegex(ValueError, "more than one representative EID"):
+            self.bridge._begin_rdc_project_shader_resource_index(
+                self._inventory_request(expected_shaders=[first, second])
+            )
+
+    def test_vulkan_inventory_is_stable_knowledge_but_not_executable_authority(self):
+        self.controller.api = "Vulkan"
+        self.controller.encoding = "SPIRV"
+        self.controller.reflection.encoding = "SPIRV"
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False)
+        )
+
+        result = snapshot["result"]
+        self.assertTrue(result["inventoryComplete"])
+        asset = result["assets"][0]
+        self.assertTrue(asset["stableKeySha256"])
+        self.assertTrue(asset["abiHash"])
+        self.assertTrue(asset["layoutHash"])
+        self.assertFalse(asset["stableKeyComplete"])
+        self.assertFalse(asset["physicalAbiValidated"])
+        self.assertTrue(asset["requiresAnchorPreflight"])
+        self.assertFalse(asset["exactExecutableMatchEligible"])
+        self.assertFalse(result["physicalApplyAuthority"])
+        with self.assertRaisesRegex(RuntimeError, "incomplete or changed"):
+            self._commit(snapshot)
+
     def test_job_timeout_ttl_and_capture_change_fail_closed(self):
         replay = self.bridge._ctx.replay
-        replay.AsyncInvoke = lambda unused_callback: None
+        replay.AsyncInvoke = lambda unused_tag, unused_callback: None
         queued = self._begin()
         job = self.bridge._project_shader_index_jobs[queued["jobId"]]
         job["createdMonotonic"] -= (
@@ -471,7 +2007,8 @@ class ReplayLabRdcProjectBridgeTests(unittest.TestCase):
 
         with self.bridge._project_shader_index_jobs_guard:
             self.bridge._project_shader_index_jobs.clear()
-        replay.AsyncInvoke = lambda callback: callback(self.controller)
+        replay.AsyncInvoke = (
+            lambda unused_tag, callback: callback(self.controller))
         completed = self._begin()
         self.bridge._capture_session_id = "6" * 32
         with self.assertRaisesRegex(RuntimeError, "capture session changed"):

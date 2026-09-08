@@ -29,6 +29,7 @@
 #include "common/timing.h"
 #include "core/core.h"
 #include "driver/shaders/spirv/spirv_reflect.h"
+#include "replay/replay_driver.h"
 #include "gl_common.h"
 #include "gl_dispatch_table.h"
 #include "gl_manager.h"
@@ -101,6 +102,13 @@ struct GLDrawParams
   uint32_t indexWidth = 0;
   Topology topo = Topology::Unknown;
 };
+
+inline bool GLReplayPatchBindingCanWrite(GLenum target)
+{
+  return target == eGL_SHADER_STORAGE_BUFFER || target == eGL_ATOMIC_COUNTER_BUFFER ||
+         target == eGL_TRANSFORM_FEEDBACK_BUFFER || target == eGL_TEXTURE_BUFFER ||
+         target == eGL_PIXEL_PACK_BUFFER;
+}
 
 class WrappedOpenGL : public IFrameCapturer
 {
@@ -327,9 +335,25 @@ private:
     GLenum curType = eGL_NONE;
     BufferCategory creationFlags = BufferCategory::NoFlags;
     uint64_t size = 0;
+    // Bindings are recorded even if the original shader did not access them. A replacement shader
+    // must not make a previously unnoticed storage/atomic/texture-buffer write invalidate patches.
+    bool replayPatchUnsafe = false;
+    // Pixel-unpack reads have no draw action/EID; do not infer a first shader consumer for them.
+    bool replayPatchNonUniformInput = false;
+    uint64_t replayPatchMinSize = ~0ULL;
   };
 
   std::map<ResourceId, BufferData> m_Buffers;
+
+  rdcarray<ReplayBufferPatch> m_ReplayBufferPatches;
+  GLuint m_ReplayPatchUpload = 0;
+  bool m_ReplayPatchInitialBindingsChecked = false;
+  rdcstr m_ReplayPatchCaptureError;
+  std::map<ResourceId, uint32_t> m_ReplayPatchFirstReads;
+  rdcstr m_ReplayPatchReadEvidenceError;
+  void TrackReplayPatchBinding(GLResource buffer, GLenum target);
+  void ApplyReplayBufferPatches();
+  void TrackReplayCheckpointBufferWrite(const GLResource &buffer);
 
   // this object is only created on old captures where VAO0 was a single global object. In new
   // captures each context has its own VAO0.
@@ -564,8 +588,11 @@ private:
 
   void ReplaceResource(ResourceId from, ResourceId to);
   void RemoveReplacement(ResourceId id);
+  rdcstr ReplaceTargetShaderChecked(ResourceId from, ResourceId to);
+  rdcstr RemoveTargetShaderReplacementChecked(ResourceId id);
   void FreeTargetResource(ResourceId id);
   void RefreshDerivedReplacements();
+  rdcstr RefreshDerivedReplacementsChecked(ResourceId requiredShader = ResourceId());
 
   struct QueuedResource
   {

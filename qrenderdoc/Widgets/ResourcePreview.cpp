@@ -85,7 +85,12 @@ void ResourcePreview::Initialise()
   else if(m_ManualThumbnail)
     QObject::connect(m_ManualThumbnail, &RDLabel::clicked, this, &ResourcePreview::clickEvent);
   QObject::connect(ui->slotLabel, &RDLabel::clicked, this, &ResourcePreview::clickEvent);
-  QObject::connect(ui->descriptionLabel, &RDLabel::clicked, this, &ResourcePreview::clickEvent);
+  QObject::connect(ui->descriptionLabel, &RDLabel::clicked, [this](QMouseEvent *event) {
+    if(m_ResourceLinkEnabled && event->button() == Qt::LeftButton)
+      emit resourceLinkActivated();
+    else
+      clickEvent(event);
+  });
 
   if(ui->thumbnail)
     QObject::connect(ui->thumbnail, &CustomPaintWidget::doubleClicked, this,
@@ -94,8 +99,12 @@ void ResourcePreview::Initialise()
     QObject::connect(m_ManualThumbnail, &RDLabel::doubleClicked, this,
                      &ResourcePreview::doubleClickEvent);
   QObject::connect(ui->slotLabel, &RDLabel::doubleClicked, this, &ResourcePreview::doubleClickEvent);
-  QObject::connect(ui->descriptionLabel, &RDLabel::doubleClicked, this,
-                   &ResourcePreview::doubleClickEvent);
+  QObject::connect(ui->descriptionLabel, &RDLabel::doubleClicked, [this](QMouseEvent *event) {
+    if(m_ResourceLinkEnabled && event->button() == Qt::LeftButton)
+      emit resourceLinkActivated();
+    else
+      doubleClickEvent(event);
+  });
 
   if(m_ManualThumbnail)
     QObject::connect(m_ManualThumbnail, &RDLabel::resized, [this]() { emit resized(this); });
@@ -124,6 +133,22 @@ void ResourcePreview::setSlotName(const QString &n)
 void ResourcePreview::setResourceName(const QString &n)
 {
   ui->descriptionLabel->setText(n);
+}
+
+void ResourcePreview::setResourceLinkEnabled(bool enabled, const QString &toolTip)
+{
+  m_ResourceLinkEnabled = enabled;
+
+  QFont f = ui->descriptionLabel->font();
+  f.setUnderline(enabled);
+  ui->descriptionLabel->setFont(f);
+
+  QPalette pal = palette();
+  pal.setColor(QPalette::WindowText,
+               enabled ? palette().color(QPalette::Link) : palette().color(QPalette::WindowText));
+  ui->descriptionLabel->setPalette(pal);
+  ui->descriptionLabel->setCursor(enabled ? Qt::PointingHandCursor : Qt::ArrowCursor);
+  ui->descriptionLabel->setToolTip(enabled ? toolTip : QString());
 }
 
 void ResourcePreview::setSize(QSize s)
@@ -164,8 +189,21 @@ void ResourcePreview::UpdateThumb(QSize s, const bytebuf &imgData)
   if(!m_ManualThumbnail)
     return;
 
+  if(s.width() <= 0 || s.height() <= 0 || imgData.size() < size_t(s.width()) * size_t(s.height()) * 3)
+  {
+    ClearThumb();
+    return;
+  }
+
   QImage thumb(imgData.data(), s.width(), s.height(), s.width() * 3, QImage::Format_RGB888);
   m_ManualThumbnail->setPixmap(QPixmap::fromImage(thumb));
+}
+
+void ResourcePreview::ClearThumb()
+{
+  ++m_ThumbRequestSerial;
+  if(m_ManualThumbnail)
+    m_ManualThumbnail->clear();
 }
 
 void ResourcePreview::resizeEvent(QResizeEvent *e)

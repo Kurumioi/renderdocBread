@@ -366,6 +366,11 @@ public:
   void ClearMaps();
 
   uint32_t GetEventID() { return m_CurEventID; }
+  void RestoreCheckpointEvent(uint32_t eventId)
+  {
+    m_CurEventID = eventId;
+    m_CurEvents.clear();
+  }
   const APIEvent &GetEvent(uint32_t eventId) const;
 
   const ActionDescription &GetRootDraw() { return m_ParentAction; }

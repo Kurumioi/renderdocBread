@@ -6940,6 +6940,7 @@ bool WrappedOpenGL::Serialise_glTextureBufferRangeEXT(SerialiserType &ser, GLuin
 
   if(IsReplayingAndReading())
   {
+    TrackReplayPatchBinding(buffer, eGL_TEXTURE_BUFFER);
     ResourceId id = GetResourceManager()->GetResID(texture);
     if(IsLoading(m_State) && m_CurEventID == 0)
     {
@@ -7117,6 +7118,7 @@ bool WrappedOpenGL::Serialise_glTextureBufferEXT(SerialiserType &ser, GLuint tex
 
   if(IsReplayingAndReading())
   {
+    TrackReplayPatchBinding(buffer, eGL_TEXTURE_BUFFER);
     ResourceId id = GetResourceManager()->GetResID(texture);
     if(IsLoading(m_State) && m_CurEventID == 0)
     {

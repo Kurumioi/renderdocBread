@@ -3,7 +3,7 @@
 This is the Python 3.6-compatible Bridge counterpart of the Host parser in
 ``shader_workspace.adapters.dxil_access_signature``.  It is intentionally not
 an LLVM parser: only fixed, statically-bound forms emitted by Microsoft's DXC
-printer are accepted.  Anything dynamic, indirect, contradictory, or outside
+printer are accepted.  Unproven dynamic indices, indirect use, contradictions, or accesses outside
 the reflected CBuffer byte envelope fails closed.
 
 The Bridge runs this parser on disassembly obtained directly from the live
@@ -178,16 +178,16 @@ class _Handle(object):
 class _LegacyLoad(object):
     __slots__ = (
         "result", "result_type", "return_type", "handle",
-        "register_index", "definition_line",
+        "register_indices", "definition_line",
     )
 
     def __init__(self, result, result_type, return_type, handle,
-                 register_index, definition_line):
+                 register_indices, definition_line):
         self.result = result
         self.result_type = result_type
         self.return_type = return_type
         self.handle = handle
-        self.register_index = register_index
+        self.register_indices = register_indices
         self.definition_line = definition_line
 
 
@@ -381,6 +381,63 @@ def _static_handle(handles, token, label):
     return handles[token]
 
 
+def _bounded_register_ranges(lines):
+    """Prove only unsigned i32 UMin(x, constant) plus non-wrapping constants.
+
+    An unknown operand is never itself a range proof. The UMin instruction
+    supplies the finite envelope; additions must fit uint32 without wrapping.
+    This is an access envelope, not proof of shader numerical equivalence.
+    """
+    ranges = {}
+    umin = re.compile(
+        r"^(%s)\s*=\s*(?:tail\s+)?call\s+i32\s+@dx\.op\.binary\.i32"
+        r"\(i32\s+40,\s+i32\s+%s,\s+i32\s+(\d+)\)\s*$" % (_SSA, _SSA)
+    )
+    addition = re.compile(
+        r"^(%s)\s*=\s*add(?P<flags>(?:\s+(?:nuw|nsw))*)\s+i32\s+(%s),\s*(\d+)\s*$"
+        % (_SSA, _SSA)
+    )
+    for line in lines:
+        code = _strip_comment(line).strip()
+        match = umin.fullmatch(code)
+        if match is not None:
+            result, upper = match.groups()
+            upper = int(upper, 10)
+            if upper >= 4096:
+                continue
+            if result in ranges:
+                raise DxilAccessSignatureError("duplicate bounded index definition")
+            ranges[result] = (0, upper)
+            continue
+        match = addition.fullmatch(code)
+        if match is not None:
+            result, flags, operand, constant = match.groups()
+            if operand not in ranges:
+                continue
+            lower, upper = ranges[operand]
+            constant = int(constant, 10)
+            if constant > 0xFFFFFFFF or upper + constant > 0xFFFFFFFF:
+                continue
+            if "nsw" in flags and upper + constant > 0x7FFFFFFF:
+                continue
+            if result in ranges:
+                raise DxilAccessSignatureError("duplicate bounded index definition")
+            ranges[result] = (lower + constant, upper + constant)
+    return ranges
+
+
+def _register_indices(token, ranges):
+    if token.isdigit():
+        value = int(token, 10)
+        if value <= 0xFFFFFFFF:
+            return (value,)
+    elif token in ranges:
+        lower, upper = ranges[token]
+        return tuple(range(lower, upper + 1))
+    raise DxilAccessSignatureError(
+        "CBufferLoadLegacy is not a supported static DXC form or proven bounded index")
+
+
 def extract_dxil_cbuffer_access_signature(source, expected_sha256=None):
     """Return exact static CBuffer accesses from hash-bound DXIL LLVM text."""
 
@@ -413,6 +470,7 @@ def extract_dxil_cbuffer_access_signature(source, expected_sha256=None):
         raise DxilAccessSignatureError(
             "DXIL access evidence exceeds text bounds")
 
+    bounded_ranges = _bounded_register_ranges(lines)
     records = _parse_cbuffer_records(lines)
     return_types = _parse_cbuf_return_types(lines)
     handles = {}
@@ -440,8 +498,8 @@ def extract_dxil_cbuffer_access_signature(source, expected_sha256=None):
     legacy = re.compile(
         r"^(%s)\s*=\s*(?:tail\s+)?call\s+%%dx\.types\.CBufRet\.([A-Za-z0-9]+)\s+"
         r"@dx\.op\.cbufferLoadLegacy\.([A-Za-z0-9]+)\(i32\s+59,\s+"
-        r"%%dx\.types\.Handle\s+(%s),\s+i32\s+(\d+)\)\s*$"
-        % (_SSA, _SSA)
+        r"%%dx\.types\.Handle\s+(%s),\s+i32\s+(%s|\d+)\)\s*$"
+        % (_SSA, _SSA, _SSA)
     )
     scalar = re.compile(
         r"^(?:%s\s*=\s*)?(?:tail\s+)?call\s+(half|float|double|i16|i32|i64)\s+"
@@ -522,7 +580,7 @@ def extract_dxil_cbuffer_access_signature(source, expected_sha256=None):
                 result, result_type, overload,
                 _static_handle(
                     handles, handle_token, "CBufferLoadLegacy handle"),
-                int(register_text, 10), line_number)
+                _register_indices(register_text, bounded_ranges), line_number)
             continue
         if "@dx.op.cbufferLoad" in code:
             match = scalar.fullmatch(code)
@@ -556,17 +614,13 @@ def extract_dxil_cbuffer_access_signature(source, expected_sha256=None):
         r"^(?:%s\s*=\s*)?extractvalue\s+%%dx\.types\.CBufRet\.([A-Za-z0-9]+)\s+"
         r"(%s),\s*(\d+)(?:\s*,\s*!.*)?\s*$" % (_SSA, _SSA)
     )
+    codes, legacy_users = _index_legacy_users(lines, legacy_loads)
     for result, load in legacy_loads.items():
-        token = re.compile(
-            r"(?<![-A-Za-z$._0-9])%s(?![-A-Za-z$._0-9])" %
-            re.escape(result))
         lanes = set()
-        for line_number, line in enumerate(lines):
+        for line_number in legacy_users.get(result, ()):
             if line_number == load.definition_line:
                 continue
-            code = _strip_comment(line).strip()
-            if not code or token.search(code) is None:
-                continue
+            code = codes[line_number]
             match = extract.fullmatch(code)
             if match is None or match.group(2) != result:
                 raise DxilAccessSignatureError(
@@ -585,17 +639,18 @@ def extract_dxil_cbuffer_access_signature(source, expected_sha256=None):
                 raise DxilAccessSignatureError(
                     "CBufferLoadLegacy lane is out of range")
             lane_offset = sum(widths[:lane])
-            access = DxilCBufferAccess(
-                load.register_index * 16 + lane_offset,
-                widths[lane], load.return_type)
-            if access.byte_end > load.handle.record.byte_size:
-                raise DxilAccessSignatureError(
-                    "CBufferLoadLegacy lane exceeds its CBuffer envelope")
-            accesses.setdefault(
-                (load.handle.record.space, load.handle.bind), set()).add(access)
-            if sum(len(value) for value in accesses.values()) > MAX_ACCESSES:
-                raise DxilAccessSignatureError(
-                    "DXIL CBuffer accesses exceed their limit")
+            for register_index in load.register_indices:
+                access = DxilCBufferAccess(
+                    register_index * 16 + lane_offset,
+                    widths[lane], load.return_type)
+                if access.byte_end > load.handle.record.byte_size:
+                    raise DxilAccessSignatureError(
+                        "CBufferLoadLegacy lane exceeds its CBuffer envelope")
+                accesses.setdefault(
+                    (load.handle.record.space, load.handle.bind), set()).add(access)
+                if sum(len(value) for value in accesses.values()) > MAX_ACCESSES:
+                    raise DxilAccessSignatureError(
+                        "DXIL CBuffer accesses exceed their limit")
 
     blocks = []
     by_binding = {
@@ -613,6 +668,36 @@ def extract_dxil_cbuffer_access_signature(source, expected_sha256=None):
             min(item.byte_offset for item in ordered),
             max(item.byte_end for item in ordered), ordered))
     return DxilCBufferAccessSignature(source_sha256, len(source), tuple(blocks))
+
+
+def _index_legacy_users(lines, legacy_loads):
+    """Index every matching SSA occurrence once, including overlapping names.
+
+    The lookahead preserves the old ASCII token boundaries and also examines
+    tokens embedded in quoted SSA names. Unknown consumers must still reject.
+    """
+    token = re.compile(
+        r"(?=(?<![-A-Za-z$._0-9])(%s)(?![-A-Za-z$._0-9]))" % _SSA)
+    codes = [_strip_comment(line).strip() for line in lines]
+    users = {}
+    for index, code in enumerate(codes):
+        seen = set()
+        for match in token.finditer(code):
+            value = match.group(1)
+            if value in legacy_loads and value not in seen:
+                users.setdefault(value, []).append(index)
+                seen.add(value)
+    return codes, users
+
+
+def extract_dxil_cbuffer_evidence(source, expected_sha256=None):
+    """Parse accesses once; unavailable layout remains explicit and lower-only."""
+    access = extract_dxil_cbuffer_access_signature(source, expected_sha256)
+    try:
+        absent = _unannotated_from_validated_source(source)
+    except DxilAccessSignatureError:
+        absent = None
+    return access, absent
 
 
 def extract_dxil_unannotated_cbuffer_bindings(source, expected_sha256=None):
@@ -635,6 +720,11 @@ def extract_dxil_unannotated_cbuffer_bindings(source, expected_sha256=None):
     # also verifies ``expected_sha256`` without creating a second trust lane.
     extract_dxil_cbuffer_access_signature(
         source, expected_sha256=expected_sha256)
+    return _unannotated_from_validated_source(source)
+
+
+def _unannotated_from_validated_source(source):
+    """Private continuation after strict hash-bound access extraction."""
     try:
         text = source.decode("utf-8", errors="strict")
     except UnicodeDecodeError:

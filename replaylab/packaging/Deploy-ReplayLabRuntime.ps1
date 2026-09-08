@@ -19,18 +19,43 @@ $runtimeManifestSchema = "replaylab-runtime-output/v1"
 $deploymentMarkerName = ".replaylab-runtime-deployment.json"
 $deploymentMarkerSchema = "replaylab-runtime-deployment/v1"
 $runtimePayloadNames = @(
-    "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe")
+    "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe",
+    "ReplayLabShaderTools.exe")
 $runtimeOwnedNames = @(
     "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe",
+    "ReplayLabShaderTools.exe",
     $runtimeManifestName)
 $deploymentOwnedNames = @(
     "replaylab-ai.exe",
     "ReplayLabInternal.exe",
     "ReplayLabMCP.exe",
+    "ReplayLabShaderTools.exe",
     $runtimeManifestName,
     $deploymentMarkerName
 )
 $qrenderdocExecutableNames = @("qrenderdoc.exe", "q_render_soco_doc.exe")
+
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+    $stream = [IO.File]::Open(
+        [IO.Path]::GetFullPath($LiteralPath),
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read)
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            return [BitConverter]::ToString(
+                $algorithm.ComputeHash($stream)).Replace("-", "").ToLowerInvariant()
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
 
 function Get-NormalizedPath {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -241,7 +266,7 @@ function Get-ValidatedRuntimeOutput {
         if ([int64]$sourceItem.Length -ne $size) {
             throw "ReplayLab runtime payload '$name' size does not match its manifest."
         }
-        $actualHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actualHash = Get-Sha256Hex $sourcePath
         if ($actualHash -cne $expectedHash) {
             throw "ReplayLab runtime payload '$name' SHA-256 does not match its manifest."
         }
@@ -262,7 +287,7 @@ function Get-ValidatedRuntimeOutput {
     return [pscustomobject]@{
         Root = $sourceRoot
         ManifestPath = Assert-OrdinaryFile $manifestPath "ReplayLab runtime manifest"
-        ManifestSha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        ManifestSha256 = Get-Sha256Hex $manifestPath
         Version = $version
         Records = $records
     }
@@ -283,8 +308,20 @@ function Assert-DeploymentMarker {
     }
     $ownedFiles = @(Get-RequiredJsonProperty $marker "ownedFiles" `
         "ReplayLab runtime deployment marker")
-    Assert-ExactFileNames $ownedFiles $deploymentOwnedNames `
-        "ReplayLab runtime deployment marker ownedFiles"
+    if ($ownedFiles.Count -eq ($deploymentOwnedNames.Count - 1)) {
+        # A marker written before the independent runner owns exactly the
+        # original payload names. Only an absent new name may be added.
+        $legacyNames = @($deploymentOwnedNames | Where-Object { $_ -cne "ReplayLabShaderTools.exe" })
+        Assert-ExactFileNames $ownedFiles $legacyNames `
+            "legacy ReplayLab runtime deployment marker ownedFiles"
+        if (Test-Path -LiteralPath (Join-Path $TargetRoot "ReplayLabShaderTools.exe")) {
+            throw "Legacy deployment marker does not own the existing ReplayLabShaderTools.exe."
+        }
+    }
+    else {
+        Assert-ExactFileNames $ownedFiles $deploymentOwnedNames `
+            "ReplayLab runtime deployment marker ownedFiles"
+    }
 
     $stateValue = Get-RequiredJsonProperty $marker "state" `
         "ReplayLab runtime deployment marker"
@@ -372,6 +409,59 @@ function Get-ValidatedDeploymentTarget {
     }
 }
 
+function Assert-QRenderDocNotRunning {
+    param([Parameter(Mandatory = $true)][string]$ApplicationDirectory)
+
+    $applicationRoot = Get-NormalizedPath $ApplicationDirectory
+    $processFilter = ($qrenderdocExecutableNames | ForEach-Object {
+        "Name = '$($_)'"
+    }) -join " OR "
+    try {
+        $candidates = @(Get-CimInstance -ClassName Win32_Process `
+            -Filter $processFilter -ErrorAction Stop)
+    }
+    catch {
+        throw ("Cannot verify that qrenderdoc is stopped before ReplayLab deployment. " +
+            "No target files were changed. Details: $($_.Exception.Message)")
+    }
+
+    foreach ($candidate in $candidates) {
+        $name = [string]$candidate.Name
+        if (-not ($qrenderdocExecutableNames -icontains $name)) {
+            continue
+        }
+
+        $executablePath = [string]$candidate.ExecutablePath
+        if ([string]::IsNullOrWhiteSpace($executablePath)) {
+            try {
+                $executablePath = [string](Get-Process -Id ([int]$candidate.ProcessId) `
+                    -ErrorAction Stop).Path
+            }
+            catch {
+                # A same-named process in another security context cannot be
+                # attributed to this application directory without a path.
+                continue
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($executablePath)) {
+            continue
+        }
+
+        try {
+            $processPath = Get-NormalizedPath $executablePath
+            $processDirectory = Split-Path -Parent $processPath
+        }
+        catch {
+            continue
+        }
+        if (Test-SamePath $processDirectory $applicationRoot) {
+            throw ("Cannot deploy ReplayLab while qrenderdoc is running from the target " +
+                "application directory. Close '$processPath' (PID $($candidate.ProcessId)) " +
+                "and retry. No target files were changed.")
+        }
+    }
+}
+
 function Assert-ExistingRuntimeMatchesSource {
     param(
         [Parameter(Mandatory = $true)][string]$TargetRoot,
@@ -383,7 +473,7 @@ function Assert-ExistingRuntimeMatchesSource {
         $targetPath = Assert-OrdinaryFile (Join-Path $TargetRoot $name) `
             "existing ReplayLab runtime payload '$name'"
         $targetItem = Get-Item -LiteralPath $targetPath -Force
-        $targetHash = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $targetHash = Get-Sha256Hex $targetPath
         if ([int64]$targetItem.Length -ne [int64]$record.Size -or
             $targetHash -cne [string]$record.Sha256) {
             throw ("Cannot adopt the existing ReplayLab target because '$name' does not " +
@@ -393,8 +483,7 @@ function Assert-ExistingRuntimeMatchesSource {
 
     $targetManifest = Assert-OrdinaryFile (Join-Path $TargetRoot $runtimeManifestName) `
         "existing ReplayLab runtime manifest"
-    $targetManifestHash = (Get-FileHash -LiteralPath $targetManifest `
-        -Algorithm SHA256).Hash.ToLowerInvariant()
+    $targetManifestHash = Get-Sha256Hex $targetManifest
     if ($targetManifestHash -cne [string]$Runtime.ManifestSha256) {
         throw ("Cannot adopt the existing ReplayLab target because its runtime manifest " +
             "does not exactly match the verified build output: $TargetRoot")
@@ -511,6 +600,12 @@ if ($ValidateOnly) {
     return
 }
 
+# Runtime sidecars can legitimately be stopped while their owning qrenderdoc
+# window remains open. Replacing them in that interval strands the old bridge
+# on stale Host state, so gate the whole mutating path on the exact executable
+# directory rather than on process name alone.
+Assert-QRenderDocNotRunning $target.ApplicationRoot
+
 if ($target.NeedsAdoption) {
     $adoptionSessionId = [Guid]::NewGuid().ToString("N")
     Install-DeploymentMarker $target.TargetRoot $runtime "complete" $adoptionSessionId
@@ -543,7 +638,7 @@ try {
         $stagedPath = Assert-OrdinaryFile $stagedPath "staged ReplayLab runtime payload '$name'"
         $stagedFiles += $stagedPath
         $stagedItem = Get-Item -LiteralPath $stagedPath -Force
-        $stagedHash = (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $stagedHash = Get-Sha256Hex $stagedPath
         if ([int64]$stagedItem.Length -ne [int64]$record.Size -or
             $stagedHash -cne [string]$record.Sha256) {
             throw "Staged ReplayLab runtime payload '$name' failed size or SHA-256 verification."
@@ -559,7 +654,7 @@ try {
     Copy-Item -LiteralPath $runtime.ManifestPath -Destination $stagedManifest -ErrorAction Stop
     $stagedManifest = Assert-OrdinaryFile $stagedManifest "staged ReplayLab runtime manifest"
     $stagedFiles += $stagedManifest
-    $stagedManifestHash = (Get-FileHash -LiteralPath $stagedManifest -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stagedManifestHash = Get-Sha256Hex $stagedManifest
     if ($stagedManifestHash -cne $runtime.ManifestSha256) {
         throw "Staged ReplayLab runtime manifest failed SHA-256 verification."
     }
@@ -609,15 +704,13 @@ try {
         $deployedPath = Assert-OrdinaryFile (Join-Path $target.TargetRoot $name) `
             "deployed ReplayLab runtime payload '$name'"
         $deployedItem = Get-Item -LiteralPath $deployedPath -Force
-        $deployedHash = (Get-FileHash -LiteralPath $deployedPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $deployedHash = Get-Sha256Hex $deployedPath
         if ([int64]$deployedItem.Length -ne [int64]$record.Size -or
             $deployedHash -cne [string]$record.Sha256) {
             throw "Deployed ReplayLab runtime payload '$name' failed final verification."
         }
     }
-    $deployedManifestHash = (Get-FileHash `
-        -LiteralPath (Join-Path $target.TargetRoot $runtimeManifestName) `
-        -Algorithm SHA256).Hash.ToLowerInvariant()
+    $deployedManifestHash = Get-Sha256Hex (Join-Path $target.TargetRoot $runtimeManifestName)
     if ($deployedManifestHash -cne $runtime.ManifestSha256) {
         throw "Deployed ReplayLab runtime manifest failed final verification."
     }

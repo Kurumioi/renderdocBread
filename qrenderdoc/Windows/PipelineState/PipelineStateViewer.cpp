@@ -38,6 +38,7 @@
 #include "Code/ReplayLab/ReplayLabIntegration.h"
 #include "Code/Resources.h"
 #include "Windows/AI/AIAssistant.h"
+#include "Windows/RenderTargetHistoryView.h"
 #include "Widgets/Extended/RDLabel.h"
 #include "Widgets/Extended/RDTreeWidget.h"
 #include "toolwindowmanager/ToolWindowManager.h"
@@ -1122,11 +1123,12 @@ static HLSLAbiSkeleton GenerateHLSLAbiSkeleton(const ShaderReflection *shaderDet
                                                const QString &entryFunc)
 {
   HLSLAbiSkeleton result;
+  // i18n-ignore: generated HLSL source comments remain canonical English code text.
   result.source =
       lit("// ABI SKELETON ONLY - THIS IS NOT DECOMPILED SHADER SOURCE.\n"
           "// It contains only declarations recovered from reflection and a zero-behaviour entry.\n"
           "// This explanatory document is deliberately detached from Apply/ReplaceResource.\n"
-          "// Use a configured decompiler or RenderDoc AI > Reverse/Edit with AI for an\n"
+          "// Use a configured decompiler or Analyze Shader with RenderDoc AI for an\n"
           "// executable candidate where the format/API supports one. Compilation, ABI validation,\n"
           "// shared apply, and rollback are separate gates. D3D12 DXBC/DXIL candidates additionally\n"
           "// require a checked rebuild of every affected graphics/compute PSO before commit.\n\n");
@@ -1540,39 +1542,26 @@ void PipelineStateViewer::SetupShaderEditButton(QToolButton *button, ResourceId 
     menu->addAction(action);
   }
 
-  // Prefer the built-in ReplayLab workspace whenever the selected stage is bound. This path exports
-  // the original bytes and selects a configured/hash-pinned representation route. It only offers
-  // compile/ABI-gated shared replacement for an API/encoding combination which implements it.
-  // D3D12 DXBC/DXIL uses the checked all-PSO transaction; an explanatory reconstruction still
-  // remains offline unless its untouched round trip and exact ABI validation succeed. This action
-  // is deliberately ahead of stock processing tools unless embedded source was available above.
+  // Prefer capture-bound ReplayLab analysis whenever the selected stage is bound. Capability
+  // planning inside the specialist decides whether a configured/hash-pinned editable round trip is
+  // available; evidence-only reconstruction must not be presented here as compile/apply support.
+  // This action is deliberately ahead of stock processing tools unless embedded source was
+  // available above.
   if(HasShaderWorkspaceIntent(m_Ctx, shaderDetails->stage))
   {
-    const bool supportsD3D11Apply = m_Ctx.CurPipelineState().IsCaptureD3D11() &&
-                                    shaderDetails->encoding == ShaderEncoding::DXBC;
-    const bool supportsD3D12Apply =
-        m_Ctx.CurPipelineState().IsCaptureD3D12() &&
-        (shaderDetails->encoding == ShaderEncoding::DXBC ||
-         shaderDetails->encoding == ShaderEncoding::DXIL);
-    const bool supportsLiveApply = supportsD3D11Apply || supportsD3D12Apply;
     QAction *action = new QAction(tr("Analyze Shader with RenderDoc AI"), menu);
     action->setIcon(Icons::page_white_edit());
-    if(supportsLiveApply)
-      action->setToolTip(
-          tr("Analyze this exact D3D11/DXBC or D3D12/DXBC-DXIL shader with the built-in "
-             "RenderDoc AI host. Analysis is read-only; compilation and apply still require "
-             "separate native approval and exact ABI validation."));
-    else
-      action->setToolTip(
-          tr("Analyze this exact shader with the built-in RenderDoc AI host. The current "
-             "API/encoding has no supported live apply path; reconstructed source remains offline "
-             "until its baseline and ABI can be validated."));
+    action->setToolTip(
+        tr("Analyze this exact Shader from capture evidence. Analysis is read-only. Any readable "
+           "reconstruction is evidence-only unless capability planning finds a configured, "
+           "stage-matching, hash-verified round-trip route and exact ABI validation succeeds; "
+           "otherwise compilation and replay replacement are unavailable."));
 
     QObject::connect(action, &QAction::triggered, [this, shaderDetails]() {
       CaptureContext &capture = static_cast<CaptureContext &>(m_Ctx);
       const QString stageName = ShaderWorkspaceStageName(shaderDetails->stage);
       AIAssistant *assistant = capture.GetAIAssistant();
-      assistant->StartCaptureSkill(tr("Reverse/Edit selected shader with AI"),
+      assistant->StartCaptureSkill(tr("Analyze selected Shader with AI"),
                                    lit("renderdoc-shader-workbench"),    // i18n-ignore: internal Skill identifier
                                    stageName,
                                    lit("reverse-edit-selected-shader"));    // i18n-ignore: stable UI intent identifier
@@ -1737,13 +1726,27 @@ void PipelineStateViewer::ShowResourceContextMenu(RDTreeWidget *widget, const QP
                    [widget, pos, item]() { widget->copyItem(pos, item); });
 
   QAction usageTitle(tr("Used:"), this);
+  QAction openRenderTargetHistory(tr("Open Render Target History"), this);
   QAction openResourceInspector(tr("Open in Resource Inspector"), this);
 
+  openRenderTargetHistory.setIcon(Icons::link());
   openResourceInspector.setIcon(Icons::link());
 
   if(id != ResourceId())
   {
     contextMenu.addSeparator();
+
+    Subresource historySubresource;
+    CompType historyTypeCast = CompType::Typeless;
+    if(GetTextureHistoryDetails(item, id, historySubresource, historyTypeCast))
+    {
+      contextMenu.addAction(&openRenderTargetHistory);
+      QObject::connect(&openRenderTargetHistory, &QAction::triggered,
+                       [this, id, historySubresource, historyTypeCast]() {
+                         OpenRenderTargetHistory(id, historySubresource, historyTypeCast);
+                       });
+    }
+
     contextMenu.addAction(&openResourceInspector);
     contextMenu.addAction(&usageTitle);
 
@@ -1876,7 +1879,72 @@ void PipelineStateViewer::SetupResourceView(RDTreeWidget *widget)
   widget->setSelectionMode(QAbstractItemView::ExtendedSelection);
   QObject::connect(widget, &RDTreeWidget::customContextMenuRequested, handler);
 
+  widget->setResourceLinkHandler(
+      [this](ResourceId id, RDTreeWidgetItem *item, int) {
+        Subresource subresource;
+        CompType typeCast = CompType::Typeless;
+        if(!GetTextureHistoryDetails(item, id, subresource, typeCast))
+          return false;
+
+        OpenRenderTargetHistory(id, subresource, typeCast);
+        return true;
+      });
+
   widget->setCustomTooltip(m_Tooltip);
+}
+
+bool PipelineStateViewer::GetTextureHistoryDetails(RDTreeWidgetItem *item, ResourceId id,
+                                                   Subresource &subresource, CompType &typeCast)
+{
+  TextureDescription *texture = m_Ctx.GetTexture(id);
+  if(!item || !texture)
+    return false;
+
+  ResourceId taggedResource;
+  bool detailsFound = false;
+  if(m_D3D11)
+  {
+    taggedResource = m_D3D11->GetResource(item);
+    detailsFound = m_D3D11->GetTextureHistoryDetails(item, subresource, typeCast);
+  }
+  else if(m_D3D12)
+  {
+    taggedResource = m_D3D12->GetResource(item);
+    detailsFound = m_D3D12->GetTextureHistoryDetails(item, subresource, typeCast);
+  }
+  else if(m_GL)
+  {
+    taggedResource = m_GL->GetResource(item);
+    detailsFound = m_GL->GetTextureHistoryDetails(item, subresource, typeCast);
+  }
+  else if(m_Vulkan)
+  {
+    taggedResource = m_Vulkan->GetResource(item);
+    detailsFound = m_Vulkan->GetTextureHistoryDetails(item, subresource, typeCast);
+  }
+
+  if(!detailsFound || taggedResource != id)
+    return false;
+
+  subresource.mip = qMin(subresource.mip, qMax(1U, texture->mips) - 1U);
+  const uint32_t sliceCount = texture->depth > 1
+                                  ? qMax(1U, texture->depth >> qMin(subresource.mip, 31U))
+                                  : qMax(1U, texture->arraysize);
+  subresource.slice = qMin(subresource.slice, sliceCount - 1U);
+  if(typeCast == CompType::Typeless)
+    typeCast = texture->format.compType;
+  if(texture->msSamp > 1 && subresource.sample == TextureDisplay::ResolveSamples &&
+     (typeCast == CompType::UInt || typeCast == CompType::SInt || typeCast == CompType::Depth ||
+      (texture->creationFlags & TextureCategory::DepthTarget)))
+    subresource.sample = 0;
+  return true;
+}
+
+void PipelineStateViewer::OpenRenderTargetHistory(ResourceId id,
+                                                  const Subresource &subresource,
+                                                  CompType typeCast)
+{
+  RenderTargetHistoryView::Open(m_Ctx, id, subresource, typeCast, m_Ctx.CurEvent(), this);
 }
 
 QString PipelineStateViewer::GetVBufferFormatString(uint32_t slot)

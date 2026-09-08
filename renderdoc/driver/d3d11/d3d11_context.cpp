@@ -26,6 +26,7 @@
 #include "d3d11_context.h"
 #include <algorithm>
 #include "strings/string_utils.h"
+#include "replay/replay_timing.h"
 #include "d3d11_device.h"
 #include "d3d11_manager.h"
 #include "d3d11_renderstate.h"
@@ -760,6 +761,29 @@ bool WrappedID3D11DeviceContext::ProcessChunk(ReadSerialiser &ser, D3D11Chunk ch
 
   m_AddedAction = false;
 
+  if(IsActiveReplaying(m_State) && m_pDevice->GetReplay()->HasBufferPatches())
+  {
+    switch(chunk)
+    {
+      case D3D11Chunk::Draw:
+      case D3D11Chunk::DrawIndexed:
+      case D3D11Chunk::DrawInstanced:
+      case D3D11Chunk::DrawIndexedInstanced:
+      case D3D11Chunk::DrawAuto:
+      case D3D11Chunk::DrawIndexedInstancedIndirect:
+      case D3D11Chunk::DrawInstancedIndirect:
+      case D3D11Chunk::Dispatch:
+      case D3D11Chunk::DispatchIndirect:
+      case D3D11Chunk::CopyResource:
+      case D3D11Chunk::CopySubresourceRegion:
+      case D3D11Chunk::CopySubresourceRegion1:
+        if(!m_pDevice->GetReplay()->ApplyPendingBufferPatches())
+          return false;
+        break;
+      default: break;
+    }
+  }
+
   bool ret = false;
 
   switch(chunk)
@@ -1046,6 +1070,26 @@ bool WrappedID3D11DeviceContext::ProcessChunk(ReadSerialiser &ser, D3D11Chunk ch
     }
   }
 
+  if(IsActiveReplaying(m_State) && m_pDevice->GetReplay()->HasBufferPatches())
+  {
+    switch(chunk)
+    {
+      case D3D11Chunk::Unmap:
+      case D3D11Chunk::UpdateSubresource:
+      case D3D11Chunk::UpdateSubresource1:
+      case D3D11Chunk::CopyResource:
+      case D3D11Chunk::CopySubresourceRegion:
+      case D3D11Chunk::CopySubresourceRegion1:
+      case D3D11Chunk::CopyStructureCount:
+      case D3D11Chunk::DiscardResource:
+      case D3D11Chunk::DiscardView:
+      case D3D11Chunk::DiscardView1:
+        m_pDevice->GetReplay()->InvalidateBufferPatchContents();
+        break;
+      default: break;
+    }
+  }
+
   if(IsLoading(m_State) && m_CurEventID > 0)
   {
     if(chunk == D3D11Chunk::SetMarker)
@@ -1079,11 +1123,15 @@ void WrappedID3D11DeviceContext::AddUsage(const ActionDescription &a)
   const D3D11RenderState *pipe = m_CurrentPipelineState;
   uint32_t e = a.eventId;
 
+  if(IsLoading(m_State) && m_Type == D3D11_DEVICE_CONTEXT_IMMEDIATE && a.copySource != ResourceId())
+    m_pDevice->GetReplay()->RecordBufferPatchConsumer(a.copySource, e);
+
   ActionFlags ActionMask = ActionFlags::Drawcall | ActionFlags::Dispatch | ActionFlags::CmdList;
   if(!(a.flags & ActionMask))
     return;
 
   const bool isDispatch = bool(a.flags & ActionFlags::Dispatch);
+  const bool executesShader = bool(a.flags & (ActionFlags::Drawcall | ActionFlags::Dispatch));
 
   //////////////////////////////
   // IA
@@ -1115,6 +1163,24 @@ void WrappedID3D11DeviceContext::AddUsage(const ActionDescription &a)
   for(int s = firstShader; s < firstShader + numShaders; s++)
   {
     const D3D11RenderState::Shader &sh = *shArr[s];
+
+    // Index every physically bound CB slot, independent of reflection. A replacement shader
+    // may read a previously unused slot; Copy-source consumers above bound propagation too.
+    if(IsLoading(m_State) && m_Type == D3D11_DEVICE_CONTEXT_IMMEDIATE && executesShader)
+      for(ID3D11Buffer *buffer : sh.ConstantBuffers)
+        if(buffer)
+          m_pDevice->GetReplay()->RecordBufferPatchConsumer(GetIDForDeviceChild(buffer), e);
+
+    // Shader objects are resources too. Record the bound shader at the same point where the
+    // draw/dispatch's other resource uses are indexed, so GetUsage(shaderId) can find one
+    // representative event without walking the action/EID tree. Only the first event is needed:
+    // keeping one entry per physical shader makes this index constant-sized.
+    if(executesShader && sh.Object)
+    {
+      rdcarray<EventUsage> &uses = m_ResourceUses[GetIDForDeviceChild(sh.Object)];
+      if(uses.empty())
+        uses.push_back(EventUsage(e, ResourceUsage::Shader));
+    }
 
     for(int i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
       if(sh.Used_CB(i))
@@ -1291,7 +1357,11 @@ const APIEvent &WrappedID3D11DeviceContext::GetEvent(uint32_t eventId) const
 RDResult WrappedID3D11DeviceContext::ReplayLog(CaptureState readType, uint32_t startEventID,
                                                uint32_t endEventID, bool partial)
 {
+  ScopedReplayTimingSection replaySetup(ReplayTimingSection::ReplaySetup);
   m_State = readType;
+
+  if(IsActiveReplaying(m_State))
+    m_pDevice->GetReplay()->InvalidateBufferPatchContents();
 
   if(!m_FrameReader)
   {
@@ -1302,6 +1372,12 @@ RDResult WrappedID3D11DeviceContext::ReplayLog(CaptureState readType, uint32_t s
   m_FrameReader->SetOffset(0);
 
   ReadSerialiser ser(m_FrameReader, Ownership::Nothing);
+
+  if(IsReplayTimingActive())
+  {
+    ser.SetParameterReadCallback(&NotifyReplayTimingParametersDecoded);
+    SetReplayTimingChunkNameLookup(&GetChunkName);
+  }
 
   ser.SetStringDatabase(&m_StringDB);
   ser.SetUserData(GetResourceManager());
@@ -1357,9 +1433,11 @@ RDResult WrappedID3D11DeviceContext::ReplayLog(CaptureState readType, uint32_t s
   }
 
   uint64_t startOffset = ser.GetReader()->GetOffset();
+  replaySetup.End();
 
   for(;;)
   {
+    ScopedReplayTimingSection loopTiming(ReplayTimingSection::ReplayBookkeeping);
     if(IsActiveReplaying(m_State) && m_CurEventID > endEventID)
     {
       // set event ID correctly as we haven't actually replayed the next one.
@@ -1370,16 +1448,29 @@ RDResult WrappedID3D11DeviceContext::ReplayLog(CaptureState readType, uint32_t s
 
     m_CurChunkOffset = ser.GetReader()->GetOffset();
 
-    D3D11Chunk chunktype = ser.ReadChunk<D3D11Chunk>();
+    D3D11Chunk chunktype;
+    {
+      ScopedReplayTimingSection framing(ReplayTimingSection::ChunkFraming);
+      chunktype = ser.ReadChunk<D3D11Chunk>();
+    }
 
     if(ser.IsErrored())
       return RDResult(ResultCode::APIDataCorrupted, ser.GetError().message);
 
     m_ChunkMetadata = ser.ChunkMetadata();
 
-    bool success = ProcessChunk(ser, chunktype);
+    bool success;
+    {
+      ScopedReplayTimingChunk chunkTiming((uint32_t)chunktype);
+      success = ProcessChunk(ser, chunktype);
+    }
 
-    ser.EndChunk();
+    {
+      ScopedReplayTimingSection framing(ReplayTimingSection::ChunkFraming);
+      ser.EndChunk();
+    }
+    AddReplayTimingCounter(ReplayTimingCounter::ChunkBytes,
+                           ser.GetReader()->GetOffset() - m_CurChunkOffset);
 
     if(ser.IsErrored())
       return RDResult(ResultCode::APIDataCorrupted, ser.GetError().message);
@@ -1429,9 +1520,13 @@ RDResult WrappedID3D11DeviceContext::ReplayLog(CaptureState readType, uint32_t s
       return m_FailedReplayResult;
     }
 
-    RenderDoc::Inst().SetProgress(
-        LoadProgress::FrameEventsRead,
-        float(m_CurChunkOffset - startOffset) / float(ser.GetReader()->GetSize()));
+    // Load progress is consumed while opening/exporting the capture. Interactive replay neither
+    // rebuilds that action tree nor owns the load callback; avoid a global callback-map lookup per
+    // command on this path. All command decoding/execution remains unchanged.
+    if(IsLoading(m_State) || IsStructuredExporting(m_State))
+      RenderDoc::Inst().SetProgress(
+          LoadProgress::FrameEventsRead,
+          float(m_CurChunkOffset - startOffset) / float(ser.GetReader()->GetSize()));
 
     if((SystemChunk)chunktype == SystemChunk::CaptureEnd || ser.GetReader()->AtEnd())
       break;
@@ -1443,6 +1538,7 @@ RDResult WrappedID3D11DeviceContext::ReplayLog(CaptureState readType, uint32_t s
       m_CurEventID++;
   }
 
+  ScopedReplayTimingSection replayTail(ReplayTimingSection::ReplayBookkeeping);
   if(IsLoading(m_State))
   {
     m_pDevice->GetReplay()->WriteFrameRecord().actionList = m_ParentAction.children;
@@ -1481,6 +1577,9 @@ RDResult WrappedID3D11DeviceContext::ReplayLog(CaptureState readType, uint32_t s
   m_StructuredFile = NULL;
 
   m_DoStateVerify = false;
+
+  if(IsActiveReplaying(m_State) && !m_pDevice->GetReplay()->ApplyPendingBufferPatches())
+    return RDResult(ResultCode::APIReplayFailed, "Persistent D3D11 buffer edit application failed");
 
   return ResultCode::Succeeded;
 }

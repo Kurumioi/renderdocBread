@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 from src.material_sessions import (
+    CLEAR_ALL_SCHEMA,
     MATERIAL_SCHEMA,
     OVERRIDE_SCHEMA,
     SNAPSHOT_SCHEMA,
@@ -61,12 +62,14 @@ def _field(
 
 class _MaterialBridge:
     def __init__(self) -> None:
+        self.capture_id = CAPTURE_ID
         self.capture_session_id = CAPTURE_SESSION_ID
         self.calls: list[tuple[str, dict]] = []
         self.apply_requests: list[dict] = []
         self.snapshots: dict[str, dict] = {}
         self.override_ids: dict[str, str] = {}
         self.override_state: dict[str, dict] = {}
+        self.released_snapshots: dict[str, dict] = {}
         self.snapshot_keys: dict[tuple[int, str, int, int], str] = {}
         self.malformed_field: dict | None = None
         self.malformed_apply = False
@@ -74,6 +77,7 @@ class _MaterialBridge:
         self.api = "d3d11"
         self.slot = 2
         self.register_space = 0
+        self.lose_next_rollback_response = False
 
     def call(self, method: str, params: dict, timeout: float | None = None):
         self.calls.append((method, json.loads(json.dumps(params))))
@@ -81,10 +85,10 @@ class _MaterialBridge:
             return {
                 "loaded": True,
                 "api": "GraphicsAPI.%s" % self.api.upper(),
-                "captureId": CAPTURE_ID,
+                "captureId": self.capture_id,
                 "capturePath": "D:/captures/frame.rdc",
                 "captureSessionId": self.capture_session_id,
-                "knownCatalogCaptureIds": [CAPTURE_ID],
+                "knownCatalogCaptureIds": [self.capture_id],
             }
         if method == "snapshot_event_cbuffer":
             event_id = params["event_id"]
@@ -128,7 +132,7 @@ class _MaterialBridge:
                 "schema": SNAPSHOT_SCHEMA,
                 "schemaVersion": 1,
                 "snapshotId": snapshot_id,
-                "captureId": CAPTURE_ID,
+                "captureId": self.capture_id,
                 "captureSessionId": self.capture_session_id,
                 "api": self.api,
                 "eventId": event_id,
@@ -150,6 +154,7 @@ class _MaterialBridge:
                 "fields": fields,
             }
             self.snapshots[snapshot_id] = result
+            self.released_snapshots.pop(snapshot_id, None)
             self.snapshot_keys[physical_key] = snapshot_id
             return result
         if method == "apply_event_cbuffer_override":
@@ -172,7 +177,7 @@ class _MaterialBridge:
                 "schemaVersion": 1,
                 "snapshotId": params["snapshot_id"],
                 "overrideId": override_id,
-                "captureId": CAPTURE_ID,
+                "captureId": self.capture_id,
                 "captureSessionId": self.capture_session_id,
                 "api": snapshot["api"],
                 "eventId": snapshot["eventId"],
@@ -196,7 +201,7 @@ class _MaterialBridge:
                 "schema": OVERRIDE_SCHEMA,
                 "schemaVersion": 1,
                 "snapshotId": params["snapshot_id"],
-                "captureId": CAPTURE_ID,
+                "captureId": self.capture_id,
                 "captureSessionId": self.capture_session_id,
                 "api": snapshot["api"],
                 "eventId": snapshot["eventId"],
@@ -213,46 +218,73 @@ class _MaterialBridge:
         if method == "rollback_event_cbuffer_override":
             snapshot = self.snapshots[params["snapshot_id"]]
             state = self.override_state.get(params["snapshot_id"])
+            released = self.released_snapshots.get(params["snapshot_id"])
             requested_id = params["override_id"]
             if (
                 requested_id
-                and state is not None
-                and requested_id != state["overrideId"]
+                and requested_id
+                != (
+                    state["overrideId"]
+                    if state is not None
+                    else (released or {}).get("overrideId", "")
+                )
             ):
                 raise RuntimeError("requested override ID is not active")
-            self.override_state.pop(params["snapshot_id"], None)
-            self.snapshot_keys.pop(
-                (
-                    snapshot["eventId"], snapshot["stage"], snapshot["slot"],
-                    snapshot["registerSpace"],
-                ),
-                None,
-            )
-            return {
+            already_released = released is not None
+            if not already_released:
+                released = {
+                    "overrideId": state["overrideId"] if state else None,
+                    "revision": state["revision"] if state else 0,
+                    "currentRawSha256": (
+                        state["currentRawSha256"]
+                        if state
+                        else snapshot["rawSha256"]
+                    ),
+                }
+                self.released_snapshots[params["snapshot_id"]] = released
+                self.override_state.pop(params["snapshot_id"], None)
+                self.snapshot_keys.pop(
+                    (
+                        snapshot["eventId"], snapshot["stage"], snapshot["slot"],
+                        snapshot["registerSpace"],
+                    ),
+                    None,
+                )
+            result = {
                 "schema": OVERRIDE_SCHEMA,
                 "schemaVersion": 1,
                 "snapshotId": params["snapshot_id"],
-                "overrideId": state["overrideId"] if state else None,
-                "captureId": CAPTURE_ID,
+                "overrideId": released["overrideId"],
+                "captureId": self.capture_id,
                 "captureSessionId": self.capture_session_id,
                 "api": snapshot["api"],
                 "eventId": snapshot["eventId"],
                 "stage": snapshot["stage"],
+                "blockIndex": snapshot["blockIndex"],
                 "slot": snapshot["slot"],
                 "registerSpace": snapshot["registerSpace"],
-                "cleared": state is not None,
+                "revision": released["revision"],
+                "currentRawSha256": released["currentRawSha256"],
+                "cleared": bool(released["overrideId"]) and not already_released,
+                "alreadyReleased": already_released,
                 "snapshotReleased": True,
+                "configured": False,
             }
+            if self.lose_next_rollback_response:
+                self.lose_next_rollback_response = False
+                raise TimeoutError("rollback response was lost")
+            return result
         if method == "clear_all_event_cbuffer_snapshots":
             active = len(self.override_state)
             snapshots = len(self.snapshots)
             self.override_state.clear()
             self.snapshot_keys.clear()
             self.snapshots.clear()
+            self.released_snapshots.clear()
             return {
                 "schema": "renderdoc-ultra-event-cbuffer-clear-all/v1",
                 "schemaVersion": 1,
-                "captureId": CAPTURE_ID,
+                "captureId": self.capture_id,
                 "captureSessionId": self.capture_session_id,
                 "clearedOverrideCount": active,
                 "releasedSnapshotCount": snapshots,
@@ -598,9 +630,13 @@ class MaterialSessionTests(unittest.TestCase):
         applied = self.manager.update(prepared["sessionId"], "roughness", 0.25)
         result = self.manager.rollback(prepared["sessionId"])
         self.assertEqual(result["schema"], MATERIAL_SCHEMA)
+        self.assertEqual(result["schemaVersion"], 1)
+        self.assertEqual(result["operation"], "rollback")
         self.assertFalse(result["applied"])
         self.assertTrue(result["override"]["cleared"])
         self.assertTrue(result["snapshotReleased"])
+        self.assertFalse(result["alreadyRestored"])
+        self.assertFalse(result["idempotentRollback"])
         self.assertEqual(
             [name for name, _ in self.bridge.calls].count(
                 "rollback_event_cbuffer_override"
@@ -609,6 +645,122 @@ class MaterialSessionTests(unittest.TestCase):
         )
         with self.assertRaises(MaterialSessionError):
             self.manager.status(applied["sessionId"])
+
+        repeated = self.manager.rollback(prepared["sessionId"])
+        self.assertEqual(repeated["schema"], MATERIAL_SCHEMA)
+        self.assertEqual(repeated["schemaVersion"], 1)
+        self.assertEqual(repeated["operation"], "rollback")
+        self.assertEqual(repeated["sessionId"], prepared["sessionId"])
+        self.assertEqual(repeated["captureId"], CAPTURE_ID)
+        self.assertEqual(repeated["captureSessionId"], CAPTURE_SESSION_ID)
+        self.assertFalse(repeated["applied"])
+        self.assertTrue(repeated["snapshotReleased"])
+        self.assertTrue(repeated["alreadyRestored"])
+        self.assertTrue(repeated["idempotentRollback"])
+        self.assertEqual(repeated["override"], result["override"])
+        self.assertEqual(
+            [name for name, _ in self.bridge.calls].count(
+                "rollback_event_cbuffer_override"
+            ),
+            1,
+        )
+
+    def test_bridge_rollback_response_loss_can_be_retried_strictly(self) -> None:
+        prepared = self.prepare()
+        self.manager.update(prepared["sessionId"], "roughness", 0.25)
+        self.bridge.lose_next_rollback_response = True
+
+        with self.assertRaisesRegex(TimeoutError, "response was lost"):
+            self.manager.rollback(prepared["sessionId"])
+
+        # The host retains the exact session capability. The bridge's bounded
+        # snapshot tombstone then proves that this same capture-bound rollback
+        # already completed; no token or physical identity is reconstructed.
+        recovered = self.manager.rollback(prepared["sessionId"])
+        self.assertEqual(recovered["schema"], MATERIAL_SCHEMA)
+        self.assertEqual(recovered["operation"], "rollback")
+        self.assertEqual(recovered["sessionId"], prepared["sessionId"])
+        self.assertEqual(recovered["captureId"], CAPTURE_ID)
+        self.assertEqual(recovered["captureSessionId"], CAPTURE_SESSION_ID)
+        self.assertFalse(recovered["applied"])
+        self.assertTrue(recovered["snapshotReleased"])
+        self.assertTrue(recovered["alreadyRestored"])
+        self.assertTrue(recovered["idempotentRollback"])
+        self.assertTrue(recovered["override"]["alreadyReleased"])
+        self.assertEqual(
+            [name for name, _ in self.bridge.calls].count(
+                "rollback_event_cbuffer_override"
+            ),
+            2,
+        )
+
+        repeated = self.manager.rollback(prepared["sessionId"])
+        self.assertTrue(repeated["alreadyRestored"])
+        self.assertTrue(repeated["idempotentRollback"])
+        self.assertEqual(
+            [name for name, _ in self.bridge.calls].count(
+                "rollback_event_cbuffer_override"
+            ),
+            2,
+        )
+
+    def test_rollback_tombstone_rejects_wrong_binding_and_unknown_token(self) -> None:
+        prepared = self.prepare()
+        self.manager.rollback(prepared["sessionId"])
+        rollback_calls = [
+            name for name, unused in self.bridge.calls
+            if name == "rollback_event_cbuffer_override"
+        ]
+
+        with self.assertRaisesRegex(MaterialSessionError, "Unknown or expired"):
+            self.manager.rollback("f" * 32)
+        self.assertEqual(
+            [
+                name for name, unused in self.bridge.calls
+                if name == "rollback_event_cbuffer_override"
+            ],
+            rollback_calls,
+        )
+
+        self.bridge.capture_session_id = "7" * 32
+        with self.assertRaisesRegex(MaterialSessionError, "expired capture"):
+            self.manager.rollback(prepared["sessionId"])
+        with self.assertRaisesRegex(MaterialSessionError, "Unknown or expired"):
+            self.manager.rollback(prepared["sessionId"])
+
+        other_bridge = _MaterialBridge()
+        other_manager = MaterialSessionManager(other_bridge.call)
+        other = other_manager.prepare(10, "fragment", 0, CAPTURE_ID)
+        other_manager.rollback(other["sessionId"])
+        other_bridge.capture_id = "d" * 64
+        with self.assertRaisesRegex(MaterialSessionError, "different capture"):
+            other_manager.rollback(other["sessionId"])
+        with self.assertRaisesRegex(MaterialSessionError, "Unknown or expired"):
+            other_manager.rollback(other["sessionId"])
+
+    def test_rollback_tombstones_are_bounded_and_evict_oldest(self) -> None:
+        bridge = _MaterialBridge()
+        manager = MaterialSessionManager(
+            bridge.call, maximum_rollback_tombstones=2
+        )
+        session_ids = []
+        for event_id in (10, 11, 12):
+            prepared = manager.prepare(event_id, "fragment", 0, CAPTURE_ID)
+            session_ids.append(prepared["sessionId"])
+            manager.rollback(prepared["sessionId"])
+
+        with self.assertRaisesRegex(MaterialSessionError, "Unknown or expired"):
+            manager.rollback(session_ids[0])
+        for session_id in session_ids[1:]:
+            repeated = manager.rollback(session_id)
+            self.assertTrue(repeated["alreadyRestored"])
+            self.assertTrue(repeated["idempotentRollback"])
+        self.assertEqual(
+            [name for name, unused in bridge.calls].count(
+                "rollback_event_cbuffer_override"
+            ),
+            3,
+        )
 
     def test_status_revalidates_live_bridge_revision_and_hash(self) -> None:
         prepared = self.prepare()
@@ -653,6 +805,34 @@ class MaterialSessionTests(unittest.TestCase):
         other = MaterialSessionManager(self.bridge.call)
         recovered = other.prepare(10, "fragment", 0, CAPTURE_ID)
         self.assertEqual(recovered["eventId"], 10)
+
+    def test_clear_all_confirms_active_and_already_restored_sessions(self) -> None:
+        first = self.prepare(10)
+        second = self.prepare(11)
+        first_receipt = self.manager.rollback(first["sessionId"])
+
+        cleared = self.manager.clear_all(CAPTURE_ID)
+        self.assertEqual(cleared["restoredSessionCount"], 1)
+        self.assertEqual(cleared["restoredSessionIds"], [second["sessionId"]])
+        self.assertEqual(cleared["alreadyRestoredSessionCount"], 1)
+        self.assertEqual(
+            cleared["alreadyRestoredSessionIds"], [first["sessionId"]]
+        )
+
+        first_again = self.manager.rollback(first["sessionId"])
+        self.assertEqual(first_again["restoredBy"], "rollback")
+        self.assertEqual(first_again["override"], first_receipt["override"])
+        second_again = self.manager.rollback(second["sessionId"])
+        self.assertEqual(second_again["restoredBy"], "clearAll")
+        self.assertEqual(second_again["clearAll"]["schema"], CLEAR_ALL_SCHEMA)
+        for receipt in (first_again, second_again):
+            self.assertEqual(receipt["schema"], MATERIAL_SCHEMA)
+            self.assertEqual(receipt["schemaVersion"], 1)
+            self.assertEqual(receipt["operation"], "rollback")
+            self.assertFalse(receipt["applied"])
+            self.assertTrue(receipt["snapshotReleased"])
+            self.assertTrue(receipt["alreadyRestored"])
+            self.assertTrue(receipt["idempotentRollback"])
 
     def test_bridge_source_remains_python_36_parseable(self) -> None:
         source = (

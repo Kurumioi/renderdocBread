@@ -547,6 +547,23 @@ void D3D12Descriptor::CopyFrom(const D3D12Descriptor &src)
   data.samp.idx = index;
 }
 
+bool D3D12Descriptor::ContentsEqual(const D3D12Descriptor &src) const
+{
+  // Undefined slots may not have a corresponding initialised native descriptor.
+  if(GetType() == D3D12DescriptorType::Undefined ||
+     src.GetType() == D3D12DescriptorType::Undefined)
+    return false;
+
+  D3D12Descriptor normalised;
+  memcpy(&normalised, &src, sizeof(normalised));
+  normalised.data.samp.heap = data.samp.heap;
+  normalised.data.samp.idx = data.samp.idx;
+
+  // Include every payload byte, including resource/counter IDs and unused union storage. Differing
+  // padding can only reject an otherwise redundant update; it must never broaden equivalence.
+  return memcmp(this, &normalised, sizeof(normalised)) == 0;
+}
+
 void D3D12Descriptor::GetRefIDs(ResourceId &id, ResourceId &id2, FrameRefType &ref)
 {
   id = ResourceId();

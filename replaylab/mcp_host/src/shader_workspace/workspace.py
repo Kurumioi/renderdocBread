@@ -9,6 +9,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -17,7 +18,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .abi import (
     ShaderAbi,
@@ -29,6 +30,17 @@ from .adapters.dxil_access_signature import (
     DxilAccessSignatureError,
     DxilCBufferAccessSignature,
     extract_dxil_cbuffer_access_signature,
+)
+from .adapters.hlsl_cbuffer_abi_repair import (
+    HlslCBufferAbiRepairError,
+    repair_spirv_cross_hlsl_cbuffers,
+)
+from .adapters.hlsl_interface_abi_repair import repair_spirv_cross_hlsl_interface
+from .abi_explain import explain_abi_differences
+from .asset_layout import (
+    AssetLayoutHintError,
+    hint_sha256 as _asset_hint_sha256,
+    normalize_layout_hint as _normalize_asset_layout_hint,
 )
 from .binary_formats import (
     api_semantic_format,
@@ -52,7 +64,9 @@ from .errors import (
     ToolExecutionError,
     ToolchainRoutingError,
 )
+from .route_memory import ROUTE_MEMORY_SCHEMA, ShaderRouteMemory, dxil_route_features, feature_signature, route_key
 from .io import atomic_write_bytes, atomic_write_json, is_within, read_json_object
+from .flow_graph import load_workspace_flow_graph_status
 from .leases import WorkspaceSourceTransactionLease
 from .profiles import extract_target_profile
 from .representations import (
@@ -61,7 +75,7 @@ from .representations import (
     publish_fallback_representation,
     publish_tool_explanatory_representation,
 )
-from .diagnostics import classify_shader_failure
+from .diagnostics import classify_shader_failure, parse_compiler_diagnostics
 from .tools import ToolOperation, ToolRegistry, run_operation
 from .toolchains import (
     BINARY_FORMATS,
@@ -70,6 +84,7 @@ from .toolchains import (
     ToolchainCatalog,
     detect_shader_format,
     normalize_format,
+    physical_spirv_entry_point,
 )
 
 WORKSPACE_SCHEMA = "renderdoc-ultra-shader-workspace/v1"
@@ -77,11 +92,20 @@ WORKSPACE_VERSION = 1
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_COMPILED_BYTES = 512 * 1024 * 1024
+# Live compile-check diagnostics are read from the compiler's own bounded
+# stderr/stdout; cap what we ingest so an unexpectedly chatty tool cannot
+# balloon a single interactive keystroke's diagnostics pass.
+MAX_LIVE_CHECK_DIAGNOSTIC_BYTES = 1024 * 1024
+# Compiler failures name their job directory as "...; see <path>" (the same
+# hint the workspace watcher parses) — live checks read stderr from there.
+_LIVE_CHECK_JOB_HINT = re.compile(r"(?:^|[;\s])see\s+(.+?)\s*$", flags=re.IGNORECASE | re.MULTILINE)
 MAX_ABI_REPORT_BYTES = 16 * 1024 * 1024
 ABI_REPORT_SCHEMA = "renderdoc-ultra-shader-abi-report/v1"
 ABI_REPORT_VERSION = 1
-ROUTE_PLAN_SCHEMA = "renderdoc-ultra-shader-workspace-route-plan/v1"
-ROUTE_PLAN_VERSION = 1
+LEGACY_ROUTE_PLAN_SCHEMA = "renderdoc-ultra-shader-workspace-route-plan/v1"
+LEGACY_ROUTE_PLAN_VERSION = 1
+ROUTE_PLAN_SCHEMA = "renderdoc-ultra-shader-workspace-route-plan/v2"
+ROUTE_PLAN_VERSION = 2
 TOOLCHAIN_MIGRATION_SCHEMA = "renderdoc-ultra-shader-toolchain-migration/v1"
 TOOLCHAIN_MIGRATION_VERSION = 1
 LIVE_EDIT_AUTHORIZATION_MIGRATION_EVIDENCE_SCHEMA = (
@@ -92,6 +116,14 @@ INVALIDATED_CANDIDATE_SUMMARY_SCHEMA = (
     "renderdoc-ultra-invalidated-shader-candidate-summary/v1"
 )
 INVALIDATED_CANDIDATE_SUMMARY_VERSION = 1
+PROJECT_COMPILED_CANDIDATE_SCHEMA = (
+    "renderdoc-ultra-project-compiled-candidate/v1"
+)
+PROJECT_COMPILED_CANDIDATE_VERSION = 1
+PROJECT_CANDIDATE_IMPORT_SCHEMA = (
+    "renderdoc-ultra-shader-project-candidate-import/v1"
+)
+PROJECT_CANDIDATE_IMPORT_VERSION = 1
 DXIL_DISASSEMBLY_EVIDENCE_SCHEMA = (
     "renderdoc-ultra-shader-workspace-dxil-disassembly-evidence/v1"
 )
@@ -148,6 +180,36 @@ _DXIL_DISASSEMBLY_RECORD_FIELDS = frozenset(
         "status",
     }
 )
+_VALIDATOR_JOB_FIELDS = frozenset(
+    {
+        "operation",
+        "revision",
+        "toolId",
+        "toolConfigDigest",
+        "executableSha256",
+        "fixedFileHashes",
+        "jobPath",
+        "stdoutPath",
+        "stderrPath",
+        "returnCode",
+        "timedOut",
+        "launchError",
+        "stdoutTruncated",
+        "stderrTruncated",
+        "validatorIndex",
+        "validatorBinding",
+        "inputArtifactPath",
+        "inputFormat",
+        "inputPath",
+        "inputSha256",
+        "inputByteSize",
+        "inputDetection",
+        "stdoutSha256",
+        "stderrSha256",
+        "status",
+        "passed",
+    }
+)
 _FORMAT_SUFFIX = {
     "dxbc": ".dxbc",
     "dxil": ".dxil",
@@ -175,6 +237,11 @@ _EDITABLE_SOURCE_NAMES = {
     "dxil-asm": "shader.dxil.ll",
     "spirv-asm": "shader.spvasm",
     "opengl-spirv-asm": "shader.opengl.spvasm",
+}
+_PORTABLE_NATIVE_DISASSEMBLY_FORMATS = {
+    "dxbc": "dxbc-asm",
+    "spirv": "spirv-asm",
+    "opengl-spirv": "opengl-spirv-asm",
 }
 
 _LOCKS_GUARD = threading.Lock()
@@ -227,6 +294,79 @@ def _write_manifest_with_retry(path: Path, manifest: Mapping[str, Any]) -> None:
     # replacement.  Wrapping it in a second retry loop would multiply both the
     # attempts and latency when access is persistently denied.
     atomic_write_json(path, manifest)
+
+
+def _manifest_transaction_snapshot(
+    root: Path, manifest: Mapping[str, Any]
+) -> tuple[dict[str, Any], bytes]:
+    """Capture both the in-memory object and exact committed manifest bytes."""
+
+    path = root / "manifest.json"
+    if path.is_symlink() or not path.is_file():
+        raise ManifestValidationError("workspace manifest is not a regular file")
+    return deepcopy(dict(manifest)), path.read_bytes()
+
+
+def _restore_manifest_transaction(
+    root: Path,
+    manifest: dict[str, Any],
+    snapshot: Mapping[str, Any],
+    committed_bytes: bytes,
+) -> None:
+    """Restore a failed publication even if its writer raised after replace."""
+
+    manifest.clear()
+    manifest.update(deepcopy(dict(snapshot)))
+    path = root / "manifest.json"
+    if path.is_symlink() or not path.is_file():
+        raise ManifestValidationError(
+            "workspace manifest changed shape during transaction rollback"
+        )
+    if path.read_bytes() != committed_bytes:
+        atomic_write_bytes(path, committed_bytes)
+
+
+def _publication_file_snapshot(
+    paths: Sequence[Path],
+) -> dict[Path, bytes | None]:
+    """Snapshot the bounded files one workspace operation may publish."""
+
+    result: dict[Path, bytes | None] = {}
+    for path in paths:
+        if path.is_symlink():
+            raise ManifestValidationError(
+                "workspace publication path is redirected: %s" % path
+            )
+        if path.exists() and not path.is_file():
+            raise ManifestValidationError(
+                "workspace publication path is not a regular file: %s" % path
+            )
+        result[path] = path.read_bytes() if path.exists() else None
+    return result
+
+
+def _restore_publication_files(snapshot: Mapping[Path, bytes | None]) -> None:
+    for path, content in snapshot.items():
+        if path.is_symlink():
+            raise ManifestValidationError(
+                "workspace publication path was redirected during rollback: %s"
+                % path
+            )
+        if content is None:
+            if path.exists():
+                if not path.is_file():
+                    raise ManifestValidationError(
+                        "workspace publication path changed shape during rollback: %s"
+                        % path
+                    )
+                path.unlink()
+        else:
+            if path.exists() and not path.is_file():
+                raise ManifestValidationError(
+                    "workspace publication path changed shape during rollback: %s"
+                    % path
+                )
+            atomic_write_bytes(path, content)
 
 
 def _lock_for(path: Path) -> threading.RLock:
@@ -496,6 +636,28 @@ def _workspace_creation_identity(manifest: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _repaired_block_records(blocks: Sequence[Any]) -> list[dict[str, Any]]:
+    """Serialize repaired CBuffer blocks; legacy records omit the naming keys."""
+
+    result = []
+    for block in blocks:
+        record = {
+            "space": block.space,
+            "bind": block.bind,
+            "byteSize": block.byte_size,
+            "originalMember": block.original_member,
+            "accessCount": block.access_count,
+            "tailGuardAdded": block.tail_guard_added,
+        }
+        if block.naming_source != "lane" or block.asset_fallback_reason:
+            record["namingSource"] = block.naming_source
+            record["assetMemberCount"] = block.asset_member_count
+            if block.asset_fallback_reason:
+                record["assetFallbackReason"] = block.asset_fallback_reason
+        result.append(record)
+    return result
+
+
 def _operation_binding(operation: ToolOperation) -> dict[str, Any]:
     """Return the complete immutable operation identity used by a route hop."""
 
@@ -519,7 +681,13 @@ def _initial_abi_gate_status(manifest: Mapping[str, Any]) -> str:
     ).strip().casefold().replace(" ", "")
     if api.startswith("graphicsapi."):
         api = api[len("graphicsapi.") :]
-    if api not in {"d3d11", "direct3d11", "d3d12", "direct3d12"}:
+    api = {
+        "direct3d11": "d3d11",
+        "direct3d12": "d3d12",
+        "vk": "vulkan",
+        "gl": "opengl",
+    }.get(api, api)
+    if api not in {"d3d11", "d3d12", "vulkan", "opengl"}:
         return "blocked-apply-backend-unsupported"
     baseline = manifest.get("baseline")
     if not isinstance(baseline, Mapping) or baseline.get("abiStatus") not in {
@@ -529,6 +697,8 @@ def _initial_abi_gate_status(manifest: Mapping[str, Any]) -> str:
         return "blocked-baseline-interface-unavailable"
     interface = baseline.get("compiledInterface")
     if (
+        api == "d3d11"
+        and
         isinstance(interface, Mapping)
         and interface.get("dynamicLinkageInterfaceCount") != 0
     ):
@@ -658,8 +828,22 @@ class ShaderWorkspaceService:
         self,
         tool_config_path: str | Path,
         route_config_path: str | Path | None = None,
+        *,
+        asset_layout_provider: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
+        route_memory_provider: Callable[[], Any] | None = None,
     ):
         self.registry = ToolRegistry(tool_config_path)
+        # Optional project route memory (``route_memory.ShaderRouteMemory`` or
+        # None).  It only reorders lanes the fixed catalog already offers so a
+        # lane that worked for this game's shaders runs first; it never adds
+        # routes, tools or arguments.
+        self._route_memory_provider = route_memory_provider
+        # Optional retriever: given a workspace manifest, return an
+        # ``renderdoc-ultra-asset-cbuffer-layout-hint/v1`` for the captured
+        # shader (or None).  It only ever adds names/completeness to the fixed
+        # CBuffer repair; captured reflection and DXIL access evidence keep
+        # deciding what is admissible.
+        self._asset_layout_provider = asset_layout_provider
         self.route_config_path = (
             Path(route_config_path).expanduser().resolve()
             if route_config_path is not None
@@ -773,6 +957,89 @@ class ShaderWorkspaceService:
             result.append(by_id[value])
         return tuple(result)
 
+    def route_memory(self) -> Any | None:
+        """The project route memory, or None when no project/provider exists."""
+
+        provider = self._route_memory_provider
+        if provider is None:
+            return None
+        try:
+            return provider()
+        except Exception:  # noqa: BLE001 - memory is optional evidence only
+            return None
+
+    def _probe_route_features(
+        self, root: Path, manifest: dict[str, Any], baseline_bytes: bytes
+    ) -> dict[str, Any] | None:
+        """Disassemble a staged DXIL baseline once and extract route features."""
+
+        baseline = manifest.get("baseline")
+        if not isinstance(baseline, Mapping) or str(baseline.get("kind", "")).upper() != "DXIL":
+            return None
+        evidence_before = manifest.get("dxilDisassemblyEvidence")
+        try:
+            record = self._attempt_dedicated_dxil_disassembly(
+                root,
+                manifest,
+                role="baseline",
+                revision=0,
+                input_bytes=baseline_bytes,
+                input_artifact_path=self._artifact(root, baseline["path"]),
+                history={},
+            )
+            if not record or record.get("status") != "succeeded":
+                return None
+            output_path = self._artifact(root, record["outputPath"])
+            text = output_path.read_text(encoding="utf-8", errors="replace")
+            features = dxil_route_features(text)
+            features["disassemblyOutputSha256"] = record.get("outputSha256")
+            return features
+        except Exception:  # noqa: BLE001 - features are advisory only
+            return None
+        finally:
+            # The probe is a routing hint, not ABI evidence: the decompile step
+            # produces (and validates) the evidence record itself.
+            if evidence_before is None:
+                manifest.pop("dxilDisassemblyEvidence", None)
+            else:
+                manifest["dxilDisassemblyEvidence"] = evidence_before
+            try:
+                probe_job = self._artifact(root, record["outputPath"]).parent  # type: ignore[possibly-undefined]
+                shutil.rmtree(probe_job, ignore_errors=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _apply_route_memory(
+        self,
+        selection: Mapping[str, Any],
+        *,
+        target_api: str | None,
+        capture_encoding: str,
+        stage: str,
+        target_profile: str | None,
+        features: str = "",
+    ) -> tuple[Mapping[str, Any], dict[str, Any] | None]:
+        key = route_key(
+            target_api=target_api,
+            capture_encoding=capture_encoding,
+            stage=stage,
+            target_profile=target_profile,
+            editable_format=str(selection.get("editableFormat", "") or ""),
+            features=features,
+        )
+        memory = self.route_memory()
+        if memory is None:
+            # Without a project there is no memory, but built-in lane
+            # incompatibilities still apply.
+            memory = ShaderRouteMemory(Path(os.devnull))
+            memory._load = lambda: {"schema": ROUTE_MEMORY_SCHEMA, "schemaVersion": 1, "keys": {}}  # type: ignore[method-assign]
+            memory._save = lambda payload: None  # type: ignore[method-assign]
+        try:
+            return memory.prefer(selection, key)
+        except Exception as exc:  # noqa: BLE001
+            return selection, {"schema": ROUTE_MEMORY_SCHEMA, "key": key, "applied": False,
+                               "source": "error", "reason": str(exc)[:200]}
+
     def _route_plan(
         self,
         catalog: ToolchainCatalog,
@@ -854,6 +1121,51 @@ class ShaderWorkspaceService:
                 )
             return records
 
+        validator_bindings: list[dict[str, Any]] = []
+        native_assembly_format = {
+            "spirv": "spirv-asm",
+            "opengl-spirv": "opengl-spirv-asm",
+        }.get(original_format)
+        strict_spirv_native = bool(
+            native_assembly_format == editable and (forward or reverse)
+        )
+        if strict_spirv_native:
+            if forward and not (
+                len(forward) == 1
+                and forward[0].input_format == original_format
+                and forward[0].output_format == editable
+                and forward[0].fidelity == "ir-disassembly"
+            ):
+                raise ToolchainRoutingError(
+                    "native SPIR-V source recovery requires one direct "
+                    "ir-disassembly route"
+                )
+            if reverse and not (
+                len(reverse) == 1
+                and reverse[0].input_format == editable
+                and reverse[0].output_format == original_format
+                and reverse[0].fidelity == "ir-assembly"
+            ):
+                raise ToolchainRoutingError(
+                    "native SPIR-V compilation requires one direct ir-assembly route"
+                )
+            validator = catalog.strict_spirv_validator(original_format, stage)
+            operation = catalog.registry.operation(validator.tool_id, "validate")
+            integrity = catalog.registry.operation_integrity(
+                validator.tool_id, "validate"
+            )
+            if not integrity.get("available"):
+                raise ToolExecutionError(
+                    "spirv-val integrity failed while binding native SPIR-V lane: %s"
+                    % integrity.get("integrityError")
+                )
+            validator_bindings.append(
+                {
+                    "validator": validator.as_dict(),
+                    "operation": _operation_binding(operation),
+                }
+            )
+
         plan = {
             "schema": ROUTE_PLAN_SCHEMA,
             "schemaVersion": ROUTE_PLAN_VERSION,
@@ -866,6 +1178,7 @@ class ShaderWorkspaceService:
             "stage": stage,
             "decompile": bind_path(forward, original_format, editable),
             "compile": bind_path(reverse, editable, original_format),
+            "validators": validator_bindings,
         }
         plan["planSha256"] = _canonical_sha256(plan)
         return plan
@@ -930,6 +1243,11 @@ class ShaderWorkspaceService:
             )
         route_plan = None
         recovery_plan: dict[str, Any] | None = None
+        route_memory_memo: dict[str, Any] | None = None
+        route_features: dict[str, Any] | None = None
+        memory_eligible = False
+        selection: Mapping[str, Any] | None = None
+        catalog = None
         decompiler = None
         compiler = None
         if legacy_requested:
@@ -964,38 +1282,46 @@ class ShaderWorkspaceService:
                     )
             else:
                 selection = toolchain_selection
+            memory_eligible = toolchain_selection is None
             route_plan = self._route_plan(
-                catalog, selection, original_format, selected.key.stage
+                catalog,
+                selection,
+                original_format,
+                selected.key.stage,
             )
-            selection_mode = (
-                "round-trip"
-                if route_plan["decompile"] and route_plan["compile"]
-                else "compile-only-recovery"
-                if route_plan["compile"]
-                else "evidence-only"
-            )
-            recovery_plan = {
-                "schema": "renderdoc-ultra-shader-workspace-recovery/v1",
-                "schemaVersion": 1,
-                "mode": selection_mode,
-                "diagnostics": list(selection.get("diagnostics", [])),
-                "allowedActions": list(selection.get("allowedActions", [])),
-                "decompileCandidates": list(
-                    selection.get("decompileCandidates", [])
-                ),
-                "compileCandidates": list(selection.get("compileCandidates", [])),
-                "configuredButUnavailable": dict(
-                    selection.get("configuredButUnavailable", {})
-                ),
-                "aiPolicy": dict(selection.get("aiPolicy", {})),
-                "sourceConstructionEligible": bool(route_plan["compile"]),
-                "assetSourceSeedEligibleAfterVerification": bool(
-                    route_plan["compile"]
-                ),
-                "directReplayApplyAuthorized": False,
-                "semanticEquivalenceVerified": False,
-            }
-            recovery_plan["planSha256"] = _canonical_sha256(recovery_plan)
+            def _recovery_plan_for(plan: Mapping[str, Any], chosen: Mapping[str, Any]) -> dict[str, Any]:
+                mode_value = (
+                    "round-trip"
+                    if plan["decompile"] and plan["compile"]
+                    else "compile-only-recovery"
+                    if plan["compile"]
+                    else "evidence-only"
+                )
+                value = {
+                    "schema": "renderdoc-ultra-shader-workspace-recovery/v1",
+                    "schemaVersion": 1,
+                    "mode": mode_value,
+                    "diagnostics": list(chosen.get("diagnostics", [])),
+                    "allowedActions": list(chosen.get("allowedActions", [])),
+                    "decompileCandidates": list(
+                        chosen.get("decompileCandidates", [])
+                    ),
+                    "compileCandidates": list(chosen.get("compileCandidates", [])),
+                    "configuredButUnavailable": dict(
+                        chosen.get("configuredButUnavailable", {})
+                    ),
+                    "aiPolicy": dict(chosen.get("aiPolicy", {})),
+                    "sourceConstructionEligible": bool(plan["compile"]),
+                    "assetSourceSeedEligibleAfterVerification": bool(
+                        plan["compile"]
+                    ),
+                    "directReplayApplyAuthorized": False,
+                    "semanticEquivalenceVerified": False,
+                }
+                value["planSha256"] = _canonical_sha256(value)
+                return value
+
+            recovery_plan = _recovery_plan_for(route_plan, selection)
         target = Path(workspace_path).expanduser().resolve()
         if target.exists():
             raise ShaderWorkspaceError("workspace path already exists: %s" % target)
@@ -1066,6 +1392,8 @@ class ShaderWorkspaceService:
                 ),
                 "routePlan": route_plan,
                 "recoveryPlan": recovery_plan,
+                "routeMemory": route_memory_memo,
+                "routeFeatures": route_features,
                 "revision": 0,
                 # lastGood is deliberately the captured baseline until a future
                 # replay/ABI validation API explicitly promotes a candidate.
@@ -1083,6 +1411,32 @@ class ShaderWorkspaceService:
                     "recovery attempt resolved a different capture/shader identity"
                 )
             atomic_write_json(staging / "manifest.json", manifest)
+            if memory_eligible and route_plan is not None and selection is not None:
+                # Physical-IR features (for DXIL: dynamically indexed cbuffers)
+                # decide which decompiler lane can work at all.  Probe them on
+                # the staged baseline, then let known incompatibilities and the
+                # project's route memory pick the primary lane before the first
+                # decompile runs.  The probe's disassembly stays as evidence.
+                route_features = self._probe_route_features(staging, manifest, selected.blob)
+                chosen, route_memory_memo = self._apply_route_memory(
+                    selection,
+                    target_api=selected.api,
+                    capture_encoding=original_format,
+                    stage=selected.key.stage,
+                    target_profile=target_profile,
+                    features=feature_signature(route_features),
+                )
+                if route_memory_memo is not None and route_memory_memo.get("applied"):
+                    route_plan = self._route_plan(
+                        catalog, chosen, original_format, selected.key.stage
+                    )
+                    recovery_plan = _recovery_plan_for(route_plan, chosen)
+                    manifest["routePlan"] = route_plan
+                    manifest["recoveryPlan"] = recovery_plan
+                manifest["routeMemory"] = route_memory_memo
+                manifest["routeFeatures"] = route_features
+                manifest["updatedAt"] = _utc_now()
+                atomic_write_json(staging / "manifest.json", manifest)
             # Validate the complete staged workspace, including a fresh catalog
             # provenance read, before its directory can become visible. This
             # makes a catalog swap fail without publishing a target workspace.
@@ -1113,10 +1467,71 @@ class ShaderWorkspaceService:
             "targetProfile": target_profile,
             "routePlan": route_plan,
             "recoveryPlan": recovery_plan,
+            "routeMemory": route_memory_memo,
+            "routeFeatures": route_features,
             "revision": 0,
             "lastGoodRevision": 0,
             "requiresReplayAbiValidation": False,
         }
+
+    def import_project_source(
+        self, workspace_path: str | Path, bundle: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Fill a source-empty workspace from a currently verified project head."""
+        from ..projects import ReplayProjectService
+        from .project_source import source_receipt, validate_project_source
+
+        root = self._workspace_root(workspace_path)
+        with WorkspaceSourceTransactionLease(root), _lock_for(root), _WorkspaceFileLock(root):
+            manifest = self._load_manifest(root)
+            before = self.status(root)
+            if manifest.get("source") is not None or _source_path(root, manifest).exists():
+                raise ToolExecutionError("direct project import cannot overwrite existing source")
+            if _editable_format(manifest) != "hlsl" or not manifest.get("routePlan", {}).get("compile"):
+                raise ToolchainRoutingError("project source import requires a fixed HLSL compiler route")
+            if not isinstance(bundle, Mapping) or not isinstance(bundle.get("projectPath"), str):
+                raise ToolExecutionError("verified project source bundle is invalid")
+            verified = ReplayProjectService(bundle["projectPath"]).prepare_workspace_source(
+                str(bundle.get("knowledgeId", "")), before
+            )
+            if dict(bundle) != verified:
+                raise ToolExecutionError("project source head or destination changed before import")
+            payload = verified["sourceText"].encode("utf-8")
+            destination = _source_path(root, manifest)
+            inputs = root / "source-inputs"
+            if inputs.is_symlink() or (inputs.exists() and not inputs.is_dir()):
+                raise ToolExecutionError("project source input directory is redirected")
+            inputs.mkdir(exist_ok=True)
+            input_path = inputs / ("project-%s.hlsl" % verified["sourceSha256"])
+            if input_path.exists() or input_path.is_symlink():
+                raise ToolExecutionError("project source immutable input already exists")
+            receipt = source_receipt(verified, _relative(root, input_path))
+            source_record = {
+                "path": _relative(root, destination), "sha256": verified["sourceSha256"],
+                "entryPoint": verified["sourceEntryPoint"], "encoding": "utf-8",
+                "lane": "executable-editable", "origin": "verified-project-source",
+                "compileEligible": True, "semanticEquivalenceVerified": False,
+                "baselineRawSha256": manifest["baseline"]["rawSha256"],
+                "projectSource": receipt,
+            }
+            manifest_before, bytes_before = _manifest_transaction_snapshot(root, manifest)
+            try:
+                atomic_write_bytes(input_path, payload)
+                validate_project_source(root, manifest, source_record)
+                atomic_write_bytes(destination, payload)
+                manifest["source"] = source_record
+                self._append_history(root, manifest, {
+                    "operation": "import-project-source", "revision": manifest["revision"],
+                    "status": "succeeded", "knowledgeId": verified["knowledgeId"],
+                    "sourceSha256": verified["sourceSha256"], "applied": False,
+                })
+            except Exception:
+                _restore_manifest_transaction(root, manifest, manifest_before, bytes_before)
+                destination.unlink(missing_ok=True)
+                input_path.unlink(missing_ok=True)
+                raise
+            return {"workspacePath": str(root), "sourcePath": str(destination),
+                    **receipt, "decompileInvoked": False, "compiled": False}
 
     def create_recovery_attempt(
         self,
@@ -1197,6 +1612,18 @@ class ShaderWorkspaceService:
                 raise ToolchainRoutingError(
                     "source workspace has no program-generated recovery plan"
                 )
+            source_history = source_manifest.get("history")
+            if not isinstance(source_history, list):
+                raise ToolchainRoutingError("source workspace history is invalid")
+            if any(
+                isinstance(entry, Mapping)
+                and entry.get("operation") == "recovery-candidate-attempt"
+                for entry in source_history
+            ):
+                raise ToolchainRoutingError(
+                    "recovery candidates must remain siblings selected from the "
+                    "original failed workspace; chained recovery is not allowed"
+                )
             if recovery_plan.get("planSha256") != expected_plan_hash:
                 raise ToolchainRoutingError(
                     "source recovery plan changed before candidate selection"
@@ -1246,6 +1673,40 @@ class ShaderWorkspaceService:
                         "this recovery plan has no compile candidate"
                     )
                 selected_compile = []
+
+            def fixed_route_ids(field: str) -> list[str]:
+                path = route_plan.get(field)
+                if not isinstance(path, list):
+                    raise ToolchainRoutingError(
+                        "source workspace route path is invalid"
+                    )
+                result: list[str] = []
+                for hop in path:
+                    capability = (
+                        hop.get("capability")
+                        if isinstance(hop, Mapping)
+                        else None
+                    )
+                    route_id = (
+                        capability.get("routeId")
+                        if isinstance(capability, Mapping)
+                        else None
+                    )
+                    if not isinstance(route_id, str) or not route_id:
+                        raise ToolchainRoutingError(
+                            "source workspace route identity is invalid"
+                        )
+                    result.append(route_id)
+                return result
+
+            if (
+                selected_decompile
+                and selected_decompile == fixed_route_ids("decompile")
+                and selected_compile == fixed_route_ids("compile")
+            ):
+                raise ToolchainRoutingError(
+                    "recovery candidate repeats the failed source route pair"
+                )
             catalog_path = str(source_manifest["capture"]["catalogPath"])
             shader_key = str(source_manifest["shader"]["shaderKey"])
             input_format = str(route_plan["inputFormat"])
@@ -1301,6 +1762,9 @@ class ShaderWorkspaceService:
             {
                 "decompileRouteIds": selected_decompile,
                 "compileRouteIds": selected_compile,
+                "strictNativeIrValidationRequired": bool(
+                    route_plan.get("validators")
+                ),
                 "mode": (
                     "round-trip"
                     if selected_decompile and selected_compile
@@ -1334,6 +1798,162 @@ class ShaderWorkspaceService:
         result = dict(created)
         result["recoveryAttempt"] = attempt_evidence
         return result
+
+    def prepare_provisional_reconstruction(
+        self, workspace_path: str | Path
+    ) -> dict[str, Any]:
+        """Publish a review-only candidate entry after fixed routes are exhausted.
+
+        The scaffold deliberately contains no fabricated Shader body.  It binds
+        the exact native representation, reflection digest, capture identity and
+        compiler route so an Agent can replace the fixed candidate file, submit
+        its hash through ``promote_shader_workspace_explanation``, compile it and
+        still pass the ordinary replay ABI gate.  This operation never promotes,
+        compiles, validates, or applies the candidate.
+        """
+
+        root = self._workspace_root(workspace_path)
+        with _lock_for(root), _WorkspaceFileLock(root):
+            manifest = self._load_manifest(root)
+            plan = manifest.get("routePlan")
+            if not isinstance(plan, Mapping) or not plan.get("compile"):
+                raise ToolchainRoutingError(
+                    "provisional reconstruction requires a fixed compiler route"
+                )
+            editable = _editable_format(manifest)
+            source_name = _EDITABLE_SOURCE_NAMES.get(editable)
+            if source_name is None:
+                raise ToolchainRoutingError(
+                    "provisional reconstruction has no fixed editable source path"
+                )
+            baseline_path = self._artifact(root, manifest["baseline"]["path"])
+            representation = load_fallback_representation(
+                root,
+                expected_baseline_path=baseline_path,
+                expected_baseline_raw_sha256=manifest["baseline"]["rawSha256"],
+                expected_shader=manifest["shader"],
+                expected_stage=manifest["stage"],
+                expected_entry_point=manifest["entryPoint"],
+                expected_route_plan=manifest.get("routePlan"),
+                expected_history=manifest.get("history", ()),
+                expected_revision=manifest.get("revision"),
+            )
+            if representation is None:
+                raise ToolExecutionError(
+                    "publish native IR or a captured binary representation first"
+                )
+            explanation_root = root / "explanation"
+            if explanation_root.is_symlink() or not explanation_root.is_dir():
+                raise ManifestValidationError(
+                    "workspace explanation directory is unavailable or redirected"
+                )
+            suffix = Path(source_name).suffix
+            candidate_path = explanation_root / ("promoted" + suffix)
+            receipt_path = explanation_root / "provisional-reconstruction.json"
+            comment = ";" if editable.endswith("-asm") else "//"
+            if candidate_path.is_symlink() or receipt_path.is_symlink():
+                raise ManifestValidationError(
+                    "provisional reconstruction artifacts are redirected"
+                )
+            if receipt_path.exists() and not receipt_path.is_file():
+                raise ManifestValidationError(
+                    "provisional reconstruction receipt path is not a file"
+                )
+            if not candidate_path.exists():
+                scaffold = "\n".join(
+                    [
+                        "%s Generated provisional reconstruction scaffold." % comment,
+                        "%s Not original source; no semantic equivalence is claimed." % comment,
+                        "%s Capture entry: %s"
+                        % (
+                            comment,
+                            json.dumps(
+                                str(manifest["entryPoint"]), ensure_ascii=False
+                            ),
+                        ),
+                        "%s Stage/profile: %s / %s"
+                        % (
+                            comment,
+                            manifest["stage"],
+                            manifest["targetProfile"]["profile"],
+                        ),
+                        "%s Reconstruct from the bound representation and manifest reflection;"
+                        % comment,
+                        "%s then hash-promote, compile, and run the replay ABI gate." % comment,
+                        "",
+                    ]
+                ).encode("utf-8")
+                atomic_write_bytes(candidate_path, scaffold)
+            elif candidate_path.is_symlink() or not candidate_path.is_file():
+                raise ManifestValidationError(
+                    "provisional reconstruction candidate is redirected"
+                )
+            candidate_size = candidate_path.stat().st_size
+            if candidate_size <= 0 or candidate_size > MAX_SOURCE_BYTES:
+                raise ToolExecutionError(
+                    "provisional reconstruction candidate must contain 1..%d bytes"
+                    % MAX_SOURCE_BYTES
+                )
+            candidate_sha256 = _file_sha256(candidate_path)
+            compiled_interface = manifest["baseline"].get("compiledInterface")
+            compile_route_ids = [
+                item["capability"]["routeId"]
+                for item in plan["compile"]
+                if isinstance(item, Mapping)
+                and isinstance(item.get("capability"), Mapping)
+            ]
+            receipt = {
+                "schema": "renderdoc-ultra-provisional-shader-reconstruction/v1",
+                "schemaVersion": 1,
+                "status": "ready-for-agent-reconstruction",
+                "workspacePath": str(root),
+                "workspaceId": manifest["workspaceId"],
+                "captureId": manifest["capture"]["captureId"],
+                "baselineRawSha256": manifest["baseline"]["rawSha256"],
+                "stage": manifest["stage"],
+                "capturedEntryPoint": manifest["entryPoint"],
+                "targetProfile": manifest["targetProfile"]["profile"],
+                "editableFormat": editable,
+                "representationLane": representation["lane"],
+                "representationPath": representation["path"],
+                "representationSha256": representation["sha256"],
+                "compiledInterfaceSha256": (
+                    _canonical_sha256(compiled_interface)
+                    if isinstance(compiled_interface, Mapping)
+                    else None
+                ),
+                "candidatePath": str(candidate_path),
+                "candidateSha256": candidate_sha256,
+                "candidateByteSize": candidate_size,
+                "compileRouteIds": compile_route_ids,
+                "requiredGates": [
+                    "review-and-replace-provisional-candidate",
+                    "hash-bound-source-promotion",
+                    "fixed-route-compile",
+                    "fresh-replay-abi-validation",
+                ],
+                "compileEligible": False,
+                "applyEligible": False,
+                "semanticEquivalenceVerified": False,
+            }
+            atomic_write_json(receipt_path, receipt)
+            self._append_history(
+                root,
+                manifest,
+                {
+                    "operation": "prepare-provisional-reconstruction",
+                    "revision": manifest["revision"],
+                    "status": "ready-for-agent-reconstruction",
+                    "representationSha256": representation["sha256"],
+                    "candidatePath": _relative(root, candidate_path),
+                    "candidateSha256": candidate_sha256,
+                    "compileEligible": False,
+                    "semanticEquivalenceVerified": False,
+                },
+            )
+            result = dict(receipt)
+            result["receiptPath"] = str(receipt_path)
+            return result
 
     @staticmethod
     def _route_upgrade_identity(plan: Mapping[str, Any]) -> dict[str, Any]:
@@ -1702,6 +2322,12 @@ class ShaderWorkspaceService:
             self._validate_toolchain_migration_source_record(
                 manifest, source_record
             )
+        elif origin == "toolchain-refreshed-source":
+            from .toolchain_refresh import validate_refresh_source
+            validate_refresh_source(self, root, manifest, source_record)
+        elif origin == "verified-project-source":
+            from .project_source import validate_project_source
+            validate_project_source(root, manifest, source_record)
         else:
             raise ToolchainRoutingError(
                 "workspace source origin is not eligible for routed migration"
@@ -1716,6 +2342,8 @@ class ShaderWorkspaceService:
         expected_route_plan_sha256: str,
         expected_source_sha256: str,
         host_instance_id: str | None = None,
+        recover_legacy_source_lease: bool = False,
+        in_place: bool = False,
     ) -> dict:
         """Migrate source to current tools without importing old candidates.
 
@@ -1728,7 +2356,10 @@ class ShaderWorkspaceService:
 
         ``host_instance_id`` is internal process-owner evidence, never request
         data.  When present it enables only the shared lease implementation's
-        strict different-generation orphan recovery path.
+        strict different-generation orphan recovery path. A legacy token-only
+        lease remains blocked unless the effect-authorised caller explicitly
+        opts into ``recover_legacy_source_lease``; it is then archived, never
+        deleted, and transaction residue still fails closed.
         """
 
         expected_plan_hash = str(expected_route_plan_sha256 or "").lower()
@@ -1743,6 +2374,15 @@ class ShaderWorkspaceService:
                 raise ToolchainRoutingError("%s must be a lowercase SHA-256" % label)
         source_root = self._workspace_root(source_workspace_path)
         target = Path(workspace_path).expanduser().resolve()
+        if type(in_place) is not bool:
+            raise ToolchainRoutingError("in_place must be a boolean")
+        if in_place:
+            if target != source_root:
+                raise ToolchainRoutingError("in-place refresh must name the same source and target workspace")
+            from .toolchain_refresh import refresh_toolchain
+            return refresh_toolchain(self, source_root, expected_plan=expected_plan_hash,
+                                     expected_source=expected_source_hash, host_instance_id=host_instance_id,
+                                     recover_legacy=recover_legacy_source_lease)
         if target == source_root or is_within(source_root, target):
             raise ShaderWorkspaceError(
                 "a toolchain migration target must stay outside its source workspace"
@@ -1759,6 +2399,7 @@ class ShaderWorkspaceService:
                 source_root,
                 owner_instance_id=host_owner or None,
                 recover_orphaned=bool(host_owner),
+                recover_legacy=bool(recover_legacy_source_lease),
             ),
             _lock_for(source_root),
             _WorkspaceFileLock(source_root),
@@ -1797,6 +2438,9 @@ class ShaderWorkspaceService:
                 "compileRouteIds": [
                     item["routeId"] for item in old_identity["compile"]
                 ],
+                "strictNativeIrValidationRequired": bool(
+                    old_plan.get("validators")
+                ),
                 "mode": (
                     "round-trip"
                     if old_identity["decompile"] and old_identity["compile"]
@@ -2102,6 +2746,230 @@ class ShaderWorkspaceService:
             )
         return operation
 
+    @staticmethod
+    def _validator_bindings(
+        manifest: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], ...]:
+        plan = manifest.get("routePlan")
+        if not isinstance(plan, Mapping):
+            return ()
+        values = plan.get("validators", [])
+        if not isinstance(values, list):
+            raise ManifestValidationError(
+                "workspace route validator bindings are invalid"
+            )
+        return tuple(values)
+
+    def _require_native_spirv_validator_lane(
+        self, manifest: Mapping[str, Any], operation: str
+    ) -> None:
+        """Keep legacy v1 native assembly evidence readable but non-executable."""
+
+        plan = manifest.get("routePlan")
+        if not isinstance(plan, Mapping):
+            return
+        original = str(plan.get("inputFormat", ""))
+        expected_editable = {
+            "spirv": "spirv-asm",
+            "opengl-spirv": "opengl-spirv-asm",
+        }.get(original)
+        if expected_editable != plan.get("editableFormat"):
+            return
+        route_field = "decompile" if operation == "decompile" else "compile"
+        routes = plan.get(route_field)
+        if not isinstance(routes, list) or not routes:
+            return
+        validators = self._validator_bindings(manifest)
+        if (
+            plan.get("schema") != ROUTE_PLAN_SCHEMA
+            or plan.get("schemaVersion") != ROUTE_PLAN_VERSION
+            or len(validators) != 1
+        ):
+            raise ToolchainRoutingError(
+                "legacy native SPIR-V route plans are read-only evidence: create "
+                "a new v2 workspace bound to one integrity-valid spirv-val before "
+                "%s" % operation
+            )
+
+    def _bound_validator_operation(
+        self, binding: Mapping[str, Any]
+    ) -> ToolOperation:
+        capability = binding.get("validator")
+        operation_binding = binding.get("operation")
+        if not isinstance(capability, Mapping) or not isinstance(
+            operation_binding, Mapping
+        ):
+            raise ManifestValidationError(
+                "workspace route validator binding is invalid"
+            )
+        operation = self.registry.operation(
+            str(capability.get("toolId", "")), "validate"
+        )
+        if operation_binding != _operation_binding(operation):
+            raise ToolConfigurationError(
+                "workspace spirv-val operation changed after workspace creation"
+            )
+        return operation
+
+    def _run_bound_validators(
+        self,
+        root: Path,
+        manifest: dict,
+        revision: int,
+        input_bytes: bytes,
+        input_artifact_path: Path,
+        baseline_path: Path,
+        history: dict,
+        history_field: str,
+        job_label: str,
+    ) -> list[dict[str, Any]]:
+        """Run every immutable route-plan validator and retain hash evidence."""
+
+        bindings = self._validator_bindings(manifest)
+        records: list[dict[str, Any]] = []
+        history[history_field] = records
+        for index, binding in enumerate(bindings):
+            capability = binding.get("validator")
+            if not isinstance(capability, Mapping):
+                raise ManifestValidationError(
+                    "workspace route validator capability is invalid"
+                )
+            shader_format = normalize_format(capability.get("inputFormat"))
+            detection = detect_shader_format(input_bytes, shader_format)
+            if detection.format != shader_format:
+                raise ToolExecutionError(
+                    "spirv-val input declared %s but detected as %s"
+                    % (shader_format, detection.format or "unknown")
+                )
+            operation = self._bound_validator_operation(binding)
+            job_dir = self._new_job_path(
+                root, "%s-v%02d" % (job_label, index + 1), revision
+            )
+            job_dir.mkdir(parents=False, exist_ok=False)
+            input_path = job_dir / ("input" + _FORMAT_SUFFIX[shader_format])
+            output_path = job_dir / "unused-output"
+            atomic_write_bytes(input_path, input_bytes)
+            values = self._template_values(
+                root,
+                manifest,
+                revision,
+                job_dir,
+                input_path,
+                output_path,
+                baseline_path,
+            )
+            result = run_operation(operation, values, job_dir)
+            record = self._history_entry(root, operation, result, revision)
+            record.update(
+                {
+                    "validatorIndex": index + 1,
+                    "validatorBinding": dict(binding),
+                    "inputArtifactPath": _relative(root, input_artifact_path),
+                    "inputFormat": shader_format,
+                    "inputPath": _relative(root, input_path),
+                    "inputSha256": hashlib.sha256(input_bytes).hexdigest(),
+                    "inputByteSize": len(input_bytes),
+                    "inputDetection": detection.as_dict(),
+                    "stdoutSha256": hashlib.sha256(
+                        result.stdout_path.read_bytes()
+                    ).hexdigest(),
+                    "stderrSha256": hashlib.sha256(
+                        result.stderr_path.read_bytes()
+                    ).hexdigest(),
+                    "status": "running",
+                    "passed": False,
+                }
+            )
+            records.append(record)
+            try:
+                self._require_process_success(result)
+            except Exception as exc:
+                record.update({"status": "failed", "error": str(exc)})
+                raise
+            record.update({"status": "succeeded", "passed": True})
+        return records
+
+    def _validate_validator_jobs(
+        self,
+        root: Path,
+        manifest: Mapping[str, Any],
+        jobs: Any,
+        *,
+        expected_bytes: bytes,
+        expected_artifact_path: Path,
+        expected_revision: int,
+    ) -> None:
+        """Re-hash validator inputs/logs against the immutable plan binding."""
+
+        bindings = self._validator_bindings(manifest)
+        if not isinstance(jobs, list) or len(jobs) != len(bindings):
+            raise ManifestValidationError(
+                "workspace spirv-val provenance count is invalid"
+            )
+        expected_hash = hashlib.sha256(expected_bytes).hexdigest()
+        expected_artifact = expected_artifact_path.resolve()
+        if self._artifact(root, _relative(root, expected_artifact)) != expected_artifact:
+            raise ManifestValidationError(
+                "workspace spirv-val input artifact path is invalid"
+            )
+        for index, (binding, record) in enumerate(zip(bindings, jobs)):
+            if not isinstance(record, Mapping) or set(record) != _VALIDATOR_JOB_FIELDS:
+                raise ManifestValidationError(
+                    "workspace spirv-val provenance record is incomplete"
+                )
+            capability = binding.get("validator")
+            operation_binding = binding.get("operation")
+            if not isinstance(capability, Mapping) or not isinstance(
+                operation_binding, Mapping
+            ):
+                raise ManifestValidationError(
+                    "workspace spirv-val binding is invalid"
+                )
+            required_equal = {
+                "operation": "validate",
+                "revision": expected_revision,
+                "toolId": operation_binding.get("toolId"),
+                "toolConfigDigest": operation_binding.get("configDigest"),
+                "executableSha256": operation_binding.get("executableSha256"),
+                "fixedFileHashes": operation_binding.get("fixedFileHashes"),
+                "validatorIndex": index + 1,
+                "validatorBinding": binding,
+                "inputArtifactPath": _relative(root, expected_artifact),
+                "inputFormat": capability.get("inputFormat"),
+                "inputSha256": expected_hash,
+                "inputByteSize": len(expected_bytes),
+                "inputDetection": detect_shader_format(
+                    expected_bytes, capability.get("inputFormat")
+                ).as_dict(),
+                "returnCode": 0,
+                "timedOut": False,
+                "launchError": None,
+                "status": "succeeded",
+                "passed": True,
+            }
+            if any(record.get(key) != value for key, value in required_equal.items()):
+                raise ManifestValidationError(
+                    "workspace spirv-val provenance binding mismatch"
+                )
+            job_dir = self._job_directory(root, record.get("jobPath"))
+            input_path = self._artifact(root, record.get("inputPath"))
+            stdout_path = self._artifact(root, record.get("stdoutPath"))
+            stderr_path = self._artifact(root, record.get("stderrPath"))
+            for path in (input_path, stdout_path, stderr_path):
+                if not is_within(job_dir, path):
+                    raise ManifestValidationError(
+                        "workspace spirv-val artifact escapes its job"
+                    )
+            if (
+                input_path.read_bytes() != expected_bytes
+                or _file_sha256(input_path) != expected_hash
+                or record.get("stdoutSha256") != _file_sha256(stdout_path)
+                or record.get("stderrSha256") != _file_sha256(stderr_path)
+            ):
+                raise ManifestValidationError(
+                    "workspace spirv-val artifact/hash mismatch"
+                )
+
     def _run_route_chain(
         self,
         root: Path,
@@ -2111,7 +2979,8 @@ class ShaderWorkspaceService:
         initial_bytes: bytes,
         baseline_path: Path,
         history: dict,
-    ) -> tuple[bytes, list[dict[str, Any]]]:
+        entry_point: str | None = None,
+    ) -> tuple[bytes, list[dict[str, Any]], str]:
         plan = manifest.get("routePlan")
         if not isinstance(plan, Mapping):
             raise ManifestValidationError("workspace route plan is missing")
@@ -2119,6 +2988,7 @@ class ShaderWorkspaceService:
         if not isinstance(hops, list) or not hops:
             raise ManifestValidationError("workspace route chain is missing")
         current = initial_bytes
+        current_entry_point = str(entry_point or manifest["entryPoint"])
         provenance: list[dict[str, Any]] = []
         for index, hop in enumerate(hops):
             if not isinstance(hop, Mapping):
@@ -2146,6 +3016,13 @@ class ShaderWorkspaceService:
                 output_path,
                 baseline_path,
             )
+            hop_entry_point = current_entry_point
+            if input_format in {"spirv", "opengl-spirv"}:
+                hop_entry_point = physical_spirv_entry_point(
+                    current, str(manifest["stage"]), current_entry_point
+                )
+            values["entry_point"] = hop_entry_point
+            values["captured_entry_point"] = str(manifest["entryPoint"])
             result = run_operation(operation, values, job_dir)
             record = self._history_entry(root, operation, result, revision)
             record.update(
@@ -2204,10 +3081,31 @@ class ShaderWorkspaceService:
                     }
                 )
                 current = output
+                if output_format in {"spirv", "opengl-spirv"}:
+                    current_entry_point = physical_spirv_entry_point(
+                        output, str(manifest["stage"]), hop_entry_point
+                    )
+                    record["physicalEntryPoint"] = current_entry_point
+                elif input_format in {"spirv", "opengl-spirv"} and output_format == "hlsl":
+                    # A route opts into capture-name emission by consuming the
+                    # separately bound placeholder.  The first-party
+                    # SPIRV-Cross adapter does this and mechanically renames
+                    # the independently selected physical entry.  Older or
+                    # custom routes which only consume ``entry_point`` keep
+                    # their physical name; claiming a rename they did not
+                    # perform would poison the subsequent compile receipt.
+                    if "captured_entry_point" in operation.placeholders:
+                        current_entry_point = str(manifest["entryPoint"])
+                    else:
+                        current_entry_point = hop_entry_point
+                    record["physicalEntryPoint"] = hop_entry_point
+                    record["emittedEntryPoint"] = current_entry_point
+                else:
+                    current_entry_point = hop_entry_point
             except Exception as exc:
                 record.update({"status": "failed", "error": str(exc)})
                 raise
-        return current, provenance
+        return current, provenance, current_entry_point
 
     @staticmethod
     def _needs_dedicated_dxil_disassembly_evidence(
@@ -2474,9 +3372,261 @@ class ShaderWorkspaceService:
                 }
             return None
 
+    @staticmethod
+    def _uses_spirv_cross_hlsl_reconstruction(
+        manifest: Mapping[str, Any],
+    ) -> bool:
+        """Identify the narrow route shape admitted by the CBuffer repair.
+
+        The repair is intentionally not a generic HLSL rewriter.  It is bound
+        to a fixed SPIR-V -> HLSL reconstructed-source hop whose implementation
+        explicitly identifies SPIRV-Cross.  The source-shape parser remains a
+        second independent gate.
+        """
+
+        plan = manifest.get("routePlan")
+        if not isinstance(plan, Mapping):
+            return False
+        if plan.get("inputFormat") != "dxil" or plan.get("editableFormat") != "hlsl":
+            return False
+        hops = plan.get("decompile")
+        if not isinstance(hops, list):
+            return False
+        for hop in hops:
+            capability = hop.get("capability") if isinstance(hop, Mapping) else None
+            if (
+                isinstance(capability, Mapping)
+                and capability.get("inputFormat") == "spirv"
+                and capability.get("outputFormat") == "hlsl"
+                and capability.get("fidelity") == "reconstructed-source"
+                and "spirv-cross"
+                in str(capability.get("implementation", "")).casefold()
+            ):
+                return True
+        return False
+
+    def _asset_layout_hint(
+        self, root: Path, manifest: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], str, str] | None:
+        """Fetch, normalize and pin an asset layout hint for this workspace.
+
+        The provider is optional evidence: any failure returns None and the
+        repair proceeds with physical lane naming.  A used hint is copied to
+        ``source-inputs/asset-cbuffer-layout-<sha256>.json`` so provenance
+        re-verification never depends on the live asset index.
+        """
+
+        provider = self._asset_layout_provider
+        if provider is None:
+            return None
+        try:
+            raw = provider(manifest)
+            if raw is None:
+                return None
+            hint = _normalize_asset_layout_hint(raw)
+        except Exception:
+            return None
+        digest = _asset_hint_sha256(hint)
+        inputs = root / "source-inputs"
+        if inputs.is_symlink() or (inputs.exists() and not inputs.is_dir()):
+            return None
+        inputs.mkdir(exist_ok=True)
+        path = inputs / ("asset-cbuffer-layout-%s.json" % digest)
+        if path.is_symlink():
+            return None
+        if not path.exists():
+            atomic_write_json(path, hint)
+        return hint, _relative(root, path), digest
+
+    def _stored_asset_layout_hint(
+        self, root: Path, claimed: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        record = claimed.get("assetLayout")
+        if (
+            not isinstance(record, Mapping)
+            or set(record) != {"path", "sha256", "relation"}
+            or not isinstance(record.get("relation"), Mapping)
+        ):
+            raise ManifestValidationError("workspace asset layout provenance is invalid")
+        digest = str(record.get("sha256") or "")
+        relative = str(record.get("path") or "")
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or relative != "source-inputs/asset-cbuffer-layout-%s.json" % digest
+        ):
+            raise ManifestValidationError("workspace asset layout provenance is invalid")
+        path = root / relative
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
+            raise ManifestValidationError("workspace asset layout input is missing or redirected")
+        try:
+            hint = _normalize_asset_layout_hint(json.loads(path.read_bytes().decode("utf-8")))
+        except (ValueError, AssetLayoutHintError) as exc:
+            raise ManifestValidationError("workspace asset layout input is invalid: %s" % exc) from exc
+        if _asset_hint_sha256(hint) != digest or hint.get("relation") != dict(record["relation"]):
+            raise ManifestValidationError("workspace asset layout input changed")
+        return hint
+
+    def _repair_spirv_cross_hlsl_from_dxil_evidence(
+        self,
+        root: Path,
+        manifest: Mapping[str, Any],
+        source: bytes,
+        baseline_disassembly: Mapping[str, Any] | None,
+    ) -> tuple[bytes, dict[str, Any] | None]:
+        """Apply only a mechanically proven CBuffer repair before compilation.
+
+        Raw decompiler artifacts remain untouched in their route job.  The
+        returned provenance explains whether the publish/compile source was
+        repaired or why the narrow repair was not admitted.  A failed repair
+        is not promoted into guessed ABI data; the ordinary compiler and later
+        replay ABI gates remain authoritative.
+        """
+
+        if not self._uses_spirv_cross_hlsl_reconstruction(manifest):
+            return source, None
+        baseline = manifest.get("baseline")
+        if (
+            not isinstance(baseline, Mapping)
+            or baseline.get("abiStatus") != ABI_STATUS_DXIL_ACCESS_REQUIRED
+        ):
+            return source, None
+        record: dict[str, Any] = {
+            "schema": "renderdoc-ultra-spirv-cross-hlsl-cbuffer-repair/v1",
+            "schemaVersion": 1,
+            "status": "not-applied",
+            "sourceBeforeSha256": hashlib.sha256(source).hexdigest(),
+            "baselineAbiSha256": baseline.get("abiSha256"),
+        }
+        if baseline_disassembly is None:
+            record["reason"] = "baseline-dxil-disassembly-unavailable"
+            return source, record
+        try:
+            output_path = self._artifact(
+                root, baseline_disassembly.get("outputPath")
+            )
+            dxil_text = output_path.read_bytes()
+            output_sha256 = hashlib.sha256(dxil_text).hexdigest()
+            if output_sha256 != baseline_disassembly.get("outputSha256"):
+                raise ManifestValidationError(
+                    "fresh baseline DXIL disassembly hash mismatch"
+                )
+            access = extract_dxil_cbuffer_access_signature(
+                dxil_text, expected_sha256=output_sha256
+            )
+            baseline_abi = self._manifest_baseline_abi(manifest)
+            if baseline_abi is None:
+                record["reason"] = "baseline-interface-unavailable"
+                return source, record
+            text = source.decode("utf-8", errors="strict")
+            pinned_hint = self._asset_layout_hint(root, manifest)
+            repaired = repair_spirv_cross_hlsl_cbuffers(
+                text,
+                baseline_constant_blocks=[
+                    block.to_dict() for block in baseline_abi.constant_blocks
+                ],
+                dxil_access=access,
+                asset_layout=pinned_hint[0] if pinned_hint else None,
+            )
+            repaired_text = repaired.hlsl
+            # The interface repair is a second, independent phase.  When it
+            # cannot admit one declaration it must not discard the proven
+            # CBuffer repair; it records why so the Agent repair channel can
+            # finish exactly that part.
+            interface_record: dict[str, Any] | None = None
+            interface_applied = False
+            if "struct SPIRV_Cross_Input" in text:
+                try:
+                    repaired_text = repair_spirv_cross_hlsl_interface(
+                        repaired_text, baseline_interface=baseline_abi.to_dict()
+                    )
+                    interface_applied = True
+                    interface_record = {"status": "applied"}
+                except HlslCBufferAbiRepairError as interface_error:
+                    interface_record = {
+                        "status": "not-applied",
+                        "reason": str(interface_error)[:4096],
+                    }
+            payload = repaired_text.encode("utf-8")
+            if not payload or len(payload) > MAX_SOURCE_BYTES:
+                raise HlslCBufferAbiRepairError(
+                    "repaired HLSL source size is invalid"
+                )
+            if payload == source:
+                raise HlslCBufferAbiRepairError(
+                    "repair reported blocks without changing HLSL"
+                    + (
+                        "; interface repair not applied: "
+                        + interface_record["reason"]
+                        if interface_record
+                        and interface_record.get("status") == "not-applied"
+                        else ""
+                    )
+                )
+            if interface_applied:
+                record["interfaceRepairVersion"] = 1
+            if interface_record is not None:
+                record["interfaceRepair"] = interface_record
+            if pinned_hint is not None and repaired.asset_layout_used:
+                record["assetLayout"] = {
+                    "path": pinned_hint[1],
+                    "sha256": pinned_hint[2],
+                    "relation": dict(pinned_hint[0].get("relation") or {}),
+                }
+            record.update(
+                {
+                    "status": "applied",
+                    "sourceAfterSha256": hashlib.sha256(payload).hexdigest(),
+                    "dxilDisassemblySha256": output_sha256,
+                    "dxilAccessSignatureSha256": access.signature_sha256,
+                    "repairedBlocks": _repaired_block_records(repaired.repaired_blocks),
+                    "physicalAbiVerified": False,
+                    "semanticEquivalenceVerified": False,
+                }
+            )
+            return payload, record
+        except (
+            DxilAccessSignatureError,
+            HlslCBufferAbiRepairError,
+            UnicodeDecodeError,
+        ) as exc:
+            record["reason"] = str(exc)
+            return source, record
+
     def _decompile_route_chain(
         self, root: Path, manifest: dict, destination: Path
     ) -> dict:
+        self._require_native_spirv_validator_lane(manifest, "decompile")
+        manifest_before, manifest_bytes_before = _manifest_transaction_snapshot(
+            root, manifest
+        )
+        explanation_dir = root / "explanation"
+        if explanation_dir.is_symlink():
+            raise ManifestValidationError(
+                "workspace explanation directory is redirected"
+            )
+        explanation_dir_existed = explanation_dir.is_dir()
+        publication_before = _publication_file_snapshot(
+            (
+                destination,
+                explanation_dir / "tool-ir.txt",
+                explanation_dir / "representation.json",
+            )
+        )
+        manifest_commit_attempted = False
+
+        def rollback_publication() -> None:
+            _restore_manifest_transaction(
+                root, manifest, manifest_before, manifest_bytes_before
+            )
+            _restore_publication_files(publication_before)
+            if (
+                not explanation_dir_existed
+                and explanation_dir.is_dir()
+                and not explanation_dir.is_symlink()
+                and not any(explanation_dir.iterdir())
+            ):
+                explanation_dir.rmdir()
+
         revision = int(manifest["revision"])
         baseline_path = self._artifact(root, manifest["baseline"]["path"])
         history = {
@@ -2490,7 +3640,21 @@ class ShaderWorkspaceService:
             },
         }
         try:
-            source, hops = self._run_route_chain(
+            validator_bindings = self._validator_bindings(manifest)
+            baseline_validator_jobs: list[dict[str, Any]] = []
+            if validator_bindings:
+                baseline_validator_jobs = self._run_bound_validators(
+                    root,
+                    manifest,
+                    revision,
+                    baseline_path.read_bytes(),
+                    baseline_path,
+                    baseline_path,
+                    history,
+                    "baselineValidatorJobs",
+                    "baseline-spirv-val",
+                )
+            source, hops, source_entry_point = self._run_route_chain(
                 root,
                 manifest,
                 "decompile",
@@ -2537,6 +3701,7 @@ class ShaderWorkspaceService:
                         "representationSha256": representation["sha256"],
                     }
                 )
+                manifest_commit_attempted = True
                 self._append_history(root, manifest, history)
                 return {
                     "workspacePath": str(root),
@@ -2555,11 +3720,33 @@ class ShaderWorkspaceService:
                     "revision": revision,
                     "requiresReverseCompilerForExecutableEditing": True,
                 }
+            baseline_dxil_disassembly = None
+            if self._needs_dedicated_dxil_disassembly_evidence(manifest):
+                baseline_dxil_disassembly = self._attempt_dedicated_dxil_disassembly(
+                    root,
+                    manifest,
+                    role="baseline",
+                    revision=0,
+                    input_bytes=baseline_path.read_bytes(),
+                    input_artifact_path=baseline_path,
+                    history=history,
+                )
+            source, cbuffer_repair = (
+                self._repair_spirv_cross_hlsl_from_dxil_evidence(
+                    root,
+                    manifest,
+                    source,
+                    baseline_dxil_disassembly,
+                )
+            )
+            if cbuffer_repair is not None:
+                history["hlslCBufferAbiRepair"] = cbuffer_repair
             # A route that merely emits HLSL has not yet proved that its output
             # belongs in the executable-editable lane.  Before publishing the
-            # file, compile the untouched reconstruction through the exact
-            # reverse chain and verify the resulting physical container and
-            # target profile.  This is deliberately only a baseline compiler
+            # file, compile the untouched admitted reconstruction (including
+            # any deterministic evidence-bound ABI repair above) through the
+            # exact reverse chain and verify the resulting physical container
+            # and target profile. This is deliberately only a baseline compiler
             # probe: replay reflection/ABI equality and semantic equivalence
             # remain separate, mandatory gates for apply.
             probe_history = {
@@ -2569,20 +3756,44 @@ class ShaderWorkspaceService:
                 "hops": [],
             }
             history["baselineCompileProbe"] = probe_history
-            round_trip, compile_hops = self._run_route_chain(
-                root,
-                manifest,
-                "compile",
-                revision,
-                source,
-                baseline_path,
-                probe_history,
-            )
-            round_trip_container = self._validated_compiled_container(
-                round_trip,
-                manifest,
-                "untouched decompiler baseline compile probe",
-            )
+            try:
+                (
+                    round_trip,
+                    compile_hops,
+                    _round_trip_entry_point,
+                ) = self._run_route_chain(
+                    root,
+                    manifest,
+                    "compile",
+                    revision,
+                    source,
+                    baseline_path,
+                    probe_history,
+                    entry_point=source_entry_point,
+                )
+                round_trip_container = self._validated_compiled_container(
+                    round_trip,
+                    manifest,
+                    "untouched decompiler baseline compile probe",
+                )
+                compile_validator_jobs: list[dict[str, Any]] = []
+                if validator_bindings:
+                    compile_validator_jobs = self._run_bound_validators(
+                        root,
+                        manifest,
+                        revision,
+                        round_trip,
+                        self._artifact(root, compile_hops[-1]["outputPath"]),
+                        baseline_path,
+                        probe_history,
+                        "validatorJobs",
+                        "baseline-compile-spirv-val",
+                    )
+            except ToolExecutionError as exc:
+                raise ToolExecutionError(
+                    "untouched reconstructed-source baseline compile probe failed: %s"
+                    % exc
+                ) from exc
             probe_history.update(
                 {
                     "status": "succeeded",
@@ -2592,16 +3803,6 @@ class ShaderWorkspaceService:
                     "outputKind": round_trip_container.kind,
                 }
             )
-            if self._needs_dedicated_dxil_disassembly_evidence(manifest):
-                self._attempt_dedicated_dxil_disassembly(
-                    root,
-                    manifest,
-                    role="baseline",
-                    revision=0,
-                    input_bytes=baseline_path.read_bytes(),
-                    input_artifact_path=baseline_path,
-                    history=history,
-                )
             # Publication is deliberately last: a failed intermediate/final hop
             # or failed baseline compile leaves only isolated job evidence and
             # no executable-editable source.
@@ -2615,12 +3816,30 @@ class ShaderWorkspaceService:
                     "outputSha256": source_hash,
                 }
             )
-            manifest["source"] = {
+            baseline_compile_record = {
+                "routeIds": [
+                    item["routeBinding"]["capability"]["routeId"]
+                    for item in compile_hops
+                ],
+                "producedByJobs": [item["jobPath"] for item in compile_hops],
+                "blobPath": compile_hops[-1]["outputPath"],
+                "rawSha256": hashlib.sha256(round_trip).hexdigest(),
+                "codeSha256": round_trip_container.code_sha256,
+                "byteSize": len(round_trip),
+                "kind": round_trip_container.kind,
+                "targetProfile": manifest["targetProfile"],
+                "replayAbiValidated": False,
+                "semanticEquivalenceVerified": False,
+            }
+            if validator_bindings:
+                baseline_compile_record["validatorJobs"] = compile_validator_jobs
+            source_record = {
                 "path": _relative(root, source_path),
                 "sha256": source_hash,
                 "encoding": "utf-8",
                 "lane": "executable-editable",
                 "origin": "trusted-decompile-route",
+                "entryPoint": source_entry_point,
                 "compileEligible": True,
                 "semanticEquivalenceVerified": False,
                 "producedByJobs": [item["jobPath"] for item in hops],
@@ -2630,30 +3849,29 @@ class ShaderWorkspaceService:
                     for item in hops
                 ],
                 "baselineCompileVerified": True,
-                "baselineCompile": {
-                    "routeIds": [
-                        item["routeBinding"]["capability"]["routeId"]
-                        for item in compile_hops
-                    ],
-                    "producedByJobs": [item["jobPath"] for item in compile_hops],
-                    "blobPath": compile_hops[-1]["outputPath"],
-                    "rawSha256": hashlib.sha256(round_trip).hexdigest(),
-                    "codeSha256": round_trip_container.code_sha256,
-                    "byteSize": len(round_trip),
-                    "kind": round_trip_container.kind,
-                    "targetProfile": manifest["targetProfile"],
-                    "replayAbiValidated": False,
-                    "semanticEquivalenceVerified": False,
-                },
+                "baselineCompile": baseline_compile_record,
                 "baselineRawSha256": manifest["baseline"]["rawSha256"],
             }
+            if validator_bindings:
+                source_record["baselineValidatorJobs"] = baseline_validator_jobs
+            if cbuffer_repair is not None:
+                source_record["hlslCBufferAbiRepair"] = cbuffer_repair
+            manifest["source"] = source_record
+            manifest_commit_attempted = True
             self._append_history(root, manifest, history)
         except Exception as exc:
+            rollback_publication()
+            if manifest_commit_attempted:
+                raise
             probe = history.get("baselineCompileProbe")
             if isinstance(probe, dict) and probe.get("status") != "succeeded":
                 probe.update({"status": "failed", "error": str(exc)})
             history.update({"status": "failed", "error": str(exc)})
-            self._append_history(root, manifest, history)
+            try:
+                self._append_history(root, manifest, history)
+            except Exception:
+                rollback_publication()
+                raise
             raise
         return {
             "workspacePath": str(root),
@@ -2675,6 +3893,9 @@ class ShaderWorkspaceService:
                 for item in compile_hops
             ],
             "baselineCompileRawSha256": hashlib.sha256(round_trip).hexdigest(),
+            "baselineValidatorJobs": baseline_validator_jobs,
+            "baselineCompileValidatorJobs": compile_validator_jobs,
+            "hlslCBufferAbiRepair": cbuffer_repair,
             "revision": revision,
             "requiresReplayAbiValidation": True,
         }
@@ -2730,16 +3951,21 @@ class ShaderWorkspaceService:
     def _compile_route_chain(
         self, root: Path, manifest: dict, source: bytes
     ) -> dict:
+        self._require_native_spirv_validator_lane(manifest, "compile")
         self._ensure_dedicated_baseline_dxil_disassembly(root, manifest)
         # Baseline refresh above is an independently committed transaction.
         # Everything after this snapshot belongs to exactly one candidate
         # revision and must either publish together or leave the previous
         # candidate/evidence authoritative.
-        manifest_before_candidate = deepcopy(manifest)
+        (
+            manifest_before_candidate,
+            manifest_bytes_before_candidate,
+        ) = _manifest_transaction_snapshot(root, manifest)
         next_revision = int(manifest["revision"]) + 1
         baseline_path = self._artifact(root, manifest["baseline"]["path"])
         revision_dir = root / "revisions" / ("%04d" % next_revision)
         revision_published = False
+        manifest_commit_attempted = False
         history = {
             "operation": "compile-route-chain",
             "revision": next_revision,
@@ -2747,7 +3973,29 @@ class ShaderWorkspaceService:
             "hops": [],
         }
         try:
-            compiled, hops = self._run_route_chain(
+            validator_bindings = self._validator_bindings(manifest)
+            baseline_validator_jobs: list[dict[str, Any]] = []
+            if validator_bindings:
+                baseline_validator_jobs = self._run_bound_validators(
+                    root,
+                    manifest,
+                    next_revision,
+                    baseline_path.read_bytes(),
+                    baseline_path,
+                    baseline_path,
+                    history,
+                    "baselineValidatorJobs",
+                    "candidate-baseline-spirv-val",
+                )
+            source_record = manifest.get("source")
+            source_entry_point = (
+                str(source_record.get("entryPoint"))
+                if isinstance(source_record, Mapping)
+                and isinstance(source_record.get("entryPoint"), str)
+                and source_record.get("entryPoint")
+                else str(manifest["entryPoint"])
+            )
+            compiled, hops, _compiled_entry_point = self._run_route_chain(
                 root,
                 manifest,
                 "compile",
@@ -2755,10 +4003,24 @@ class ShaderWorkspaceService:
                 source,
                 baseline_path,
                 history,
+                entry_point=source_entry_point,
             )
             container = self._validated_compiled_container(
                 compiled, manifest, "workspace routed compiler output"
             )
+            validator_jobs: list[dict[str, Any]] = []
+            if validator_bindings:
+                validator_jobs = self._run_bound_validators(
+                    root,
+                    manifest,
+                    next_revision,
+                    compiled,
+                    self._artifact(root, hops[-1]["outputPath"]),
+                    baseline_path,
+                    history,
+                    "validatorJobs",
+                    "candidate-spirv-val",
+                )
             if revision_dir.exists():
                 raise ManifestValidationError(
                     "revision artifact already exists: %s" % revision_dir
@@ -2819,6 +4081,9 @@ class ShaderWorkspaceService:
                     "baselineAbiSha256": manifest["baseline"].get("abiSha256"),
                 },
             }
+            if validator_bindings:
+                candidate["baselineValidatorJobs"] = baseline_validator_jobs
+                candidate["validatorJobs"] = validator_jobs
             history.update(
                 {
                     "status": "succeeded",
@@ -2828,6 +4093,7 @@ class ShaderWorkspaceService:
             )
             manifest["revision"] = next_revision
             manifest["latestCompiled"] = candidate
+            manifest_commit_attempted = True
             self._append_history(root, manifest, history)
         except Exception as exc:
             # `_attempt_dedicated_dxil_disassembly` intentionally records its
@@ -2836,18 +4102,40 @@ class ShaderWorkspaceService:
             # essential: otherwise a failed revision N+1 can overwrite the
             # active DXIL evidence for the still-good revision N and make its
             # immutable ABI report impossible to revalidate.
-            manifest.clear()
-            manifest.update(manifest_before_candidate)
+            _restore_manifest_transaction(
+                root,
+                manifest,
+                manifest_before_candidate,
+                manifest_bytes_before_candidate,
+            )
             rollback_error: str | None = None
             if revision_published and revision_dir.is_dir() and not revision_dir.is_symlink():
                 try:
                     shutil.rmtree(revision_dir)
+                    revision_published = False
                 except OSError as cleanup_exc:
                     rollback_error = str(cleanup_exc)
+            if manifest_commit_attempted:
+                raise
             history.update({"status": "failed", "error": str(exc)})
             if rollback_error is not None:
                 history["rollbackError"] = rollback_error
-            self._append_history(root, manifest, history)
+            try:
+                self._append_history(root, manifest, history)
+            except Exception:
+                _restore_manifest_transaction(
+                    root,
+                    manifest,
+                    manifest_before_candidate,
+                    manifest_bytes_before_candidate,
+                )
+                if (
+                    revision_published
+                    and revision_dir.is_dir()
+                    and not revision_dir.is_symlink()
+                ):
+                    shutil.rmtree(revision_dir)
+                raise
             raise
         return {
             "workspacePath": str(root),
@@ -2863,6 +4151,8 @@ class ShaderWorkspaceService:
                 item["routeBinding"]["capability"]["routeId"] for item in hops
             ],
             "toolIds": [item["toolId"] for item in hops],
+            "baselineValidatorJobs": baseline_validator_jobs,
+            "validatorJobs": validator_jobs,
             "lastGoodRevision": manifest["lastGood"]["revision"],
             "requiresReplayAbiValidation": True,
             "replayAbiValidated": False,
@@ -2901,6 +4191,18 @@ class ShaderWorkspaceService:
                     )
                     raise error
                 return self._decompile_route_chain(root, manifest, destination)
+            manifest_before, manifest_bytes_before = _manifest_transaction_snapshot(
+                root, manifest
+            )
+            publication_before = _publication_file_snapshot((destination,))
+            manifest_commit_attempted = False
+
+            def rollback_publication() -> None:
+                _restore_manifest_transaction(
+                    root, manifest, manifest_before, manifest_bytes_before
+                )
+                _restore_publication_files(publication_before)
+
             operation = self._bound_operation(manifest, "decompiler", "decompile")
             revision = int(manifest["revision"])
             job_dir = self._new_job_path(root, "decompile", revision)
@@ -2938,10 +4240,18 @@ class ShaderWorkspaceService:
                     "producedByJob": _relative(root, job_dir),
                     "baselineRawSha256": manifest["baseline"]["rawSha256"],
                 }
+                manifest_commit_attempted = True
                 self._append_history(root, manifest, history)
             except Exception as exc:
+                rollback_publication()
+                if manifest_commit_attempted:
+                    raise
                 history.update({"status": "failed", "error": str(exc)})
-                self._append_history(root, manifest, history)
+                try:
+                    self._append_history(root, manifest, history)
+                except Exception:
+                    rollback_publication()
+                    raise
                 raise
             return {
                 "workspacePath": str(root),
@@ -2955,6 +4265,58 @@ class ShaderWorkspaceService:
                 "requiresReplayAbiValidation": True,
             }
 
+    def reuse_pristine_decompiled_source(
+        self, workspace_path: str | Path
+    ) -> dict | None:
+        """Atomically reuse fixed-program source already published by prepare.
+
+        Ordinary :meth:`status` intentionally stays lock-free. This shortcut is
+        an operation-level route receipt, so it revalidates source,
+        representation, and any existing compiled candidate while holding the
+        same in-process and cross-process locks as decompile/compile. Edited,
+        promoted, migrated, or otherwise non-pristine source returns ``None``
+        and remains subject to the normal overwrite refusal in :meth:`decompile`.
+        """
+
+        root = self._workspace_root(workspace_path)
+        with _lock_for(root), _WorkspaceFileLock(root):
+            status = self.status(root)
+            if Path(str(status.get("workspacePath", ""))).resolve() != root:
+                raise ManifestValidationError(
+                    "workspace identity changed during decompile admission"
+                )
+            source = status.get("source")
+            representation = status.get("representation")
+            if not (
+                isinstance(source, Mapping)
+                and isinstance(representation, Mapping)
+                and source.get("present") is True
+                and source.get("modifiedSinceDecompile") is False
+                and source.get("lane") == "executable-editable"
+                and source.get("origin")
+                in {"trusted-decompiler", "trusted-decompile-route"}
+                and isinstance(source.get("currentSha256"), str)
+                and source.get("currentSha256") == source.get("decompiledSha256")
+                and representation.get("present") is True
+                and representation.get("lane") == "executable-editable"
+                and representation.get("compileEligible") is True
+                and representation.get("sha256") == source.get("currentSha256")
+                and representation.get("path") == source.get("path")
+            ):
+                return None
+            return {
+                "workspacePath": status["workspacePath"],
+                "sourcePath": source["path"],
+                "sourceSha256": source["currentSha256"],
+                "revision": status["revision"],
+                "representation": representation,
+                "latestCompiled": status.get("latestCompiled"),
+                "capture": status.get("capture"),
+                "reusedPreparedSource": True,
+                "requiresReplayAbiValidation": True,
+                "replayAbiValidated": bool(status.get("replayAbiValidated")),
+            }
+
     def representation(
         self,
         workspace_path: str | Path,
@@ -2962,6 +4324,7 @@ class ShaderWorkspaceService:
         bridge_response: Mapping[str, Any] | None = None,
         bridge_event_id: int | None = None,
         retry_decompile: bool = False,
+        attempt_decompile: bool = True,
     ) -> dict:
         """Return a non-empty, provenance-bound representation of the shader.
 
@@ -2996,7 +4359,9 @@ class ShaderWorkspaceService:
                 diagnostics.extend(
                     item for item in existing_diagnostics if isinstance(item, Mapping)
                 )
-        if not (fallback_already_exists and bridge_response is not None):
+        if attempt_decompile and not (
+            fallback_already_exists and bridge_response is not None
+        ):
             try:
                 decompiled = self.decompile(root)
             except (
@@ -3079,6 +4444,7 @@ class ShaderWorkspaceService:
                     "workspace has no fixed compiler route; provisional source "
                     "may be kept as explanation but cannot enter the executable lane"
                 )
+            self._require_native_spirv_validator_lane(manifest, "compile")
             destination = _source_path(root, manifest)
             if manifest.get("source") is not None or destination.exists() or destination.is_symlink():
                 raise ToolExecutionError("workspace already contains a tracked executable source")
@@ -3192,7 +4558,28 @@ class ShaderWorkspaceService:
             if manifest.get("routePlan") is not None:
                 return self._compile_route_chain(root, manifest, source)
             operation = self._bound_operation(manifest, "compiler", "compile")
+            manifest_before, manifest_bytes_before = _manifest_transaction_snapshot(
+                root, manifest
+            )
             next_revision = int(manifest["revision"]) + 1
+            revision_dir = root / "revisions" / ("%04d" % next_revision)
+            revision_published = False
+            manifest_commit_attempted = False
+
+            def rollback_publication() -> None:
+                nonlocal revision_published
+                _restore_manifest_transaction(
+                    root, manifest, manifest_before, manifest_bytes_before
+                )
+                if revision_published:
+                    if revision_dir.is_symlink() or not revision_dir.is_dir():
+                        raise ManifestValidationError(
+                            "compiled revision changed shape during rollback: %s"
+                            % revision_dir
+                        )
+                    shutil.rmtree(revision_dir)
+                    revision_published = False
+
             job_dir = self._new_job_path(root, "compile", next_revision)
             job_dir.mkdir(parents=False, exist_ok=False)
             input_path = job_dir / "input.hlsl"
@@ -3226,7 +4613,6 @@ class ShaderWorkspaceService:
                 container = self._validated_compiled_container(
                     compiled, manifest, str(output_path)
                 )
-                revision_dir = root / "revisions" / ("%04d" % next_revision)
                 if revision_dir.exists():
                     raise ManifestValidationError(
                         "revision artifact already exists: %s" % revision_dir
@@ -3244,6 +4630,7 @@ class ShaderWorkspaceService:
                     )
                     atomic_write_bytes(staged_revision_source, source)
                     revision_staging.replace(revision_dir)
+                    revision_published = True
                 except Exception:
                     shutil.rmtree(revision_staging, ignore_errors=True)
                     raise
@@ -3283,10 +4670,18 @@ class ShaderWorkspaceService:
                 )
                 manifest["revision"] = next_revision
                 manifest["latestCompiled"] = candidate
+                manifest_commit_attempted = True
                 self._append_history(root, manifest, history)
             except Exception as exc:
+                rollback_publication()
+                if manifest_commit_attempted:
+                    raise
                 history.update({"status": "failed", "error": str(exc)})
-                self._append_history(root, manifest, history)
+                try:
+                    self._append_history(root, manifest, history)
+                except Exception:
+                    rollback_publication()
+                    raise
                 raise
             return {
                 "workspacePath": str(root),
@@ -3303,6 +4698,556 @@ class ShaderWorkspaceService:
                 "requiresReplayAbiValidation": True,
                 "replayAbiValidated": False,
             }
+
+    def compile_check(
+        self, workspace_path: str | Path, text: str
+    ) -> dict[str, Any]:
+        """Compile an unsaved editor buffer for live diagnostics only.
+
+        This is the interactive counterpart to :meth:`compile`.  It runs the
+        workspace's bound compiler over the *provided* buffer text — never the
+        on-disk source — so the editor can underline real compiler errors while
+        the buffer is still dirty (unsaved).  Unlike :meth:`compile` it has no
+        persistent effect: it publishes no revision, bumps no manifest, records
+        no history, creates no apply candidate, and removes every job
+        directory it created.  A successful check proves only that the text
+        compiles; it makes no ABI or apply claim.
+
+        Both compile lanes are supported: the direct bound compiler, and a
+        route-plan (multi-hop) chain, which reuses :meth:`_run_route_chain`
+        exactly as the real compile does but stops before publication.
+
+        Returns ``{"ok": bool, "diagnostics": [...]}``.  Any internal fault
+        (compiler unavailable, lane not compile-eligible, ...) is reported as
+        ``{"ok": None, "reason": ...}`` so the editor never shows a fabricated
+        error and simply keeps what it already displays.
+        """
+
+        # Stage 1 — validate and encode the candidate buffer.
+        if not isinstance(text, str):
+            return {"ok": None, "reason": "editor source must be text"}
+        if not text:
+            return {"ok": None, "reason": "editor source must not be empty"}
+        if "\x00" in text:
+            return {"ok": None, "reason": "editor source contains NUL characters"}
+        try:
+            source = text.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            return {"ok": None, "reason": "editor source is not valid UTF-8"}
+        if len(source) > MAX_SOURCE_BYTES:
+            return {"ok": None, "reason": "editor source exceeds its fixed size limit"}
+
+        root = self._workspace_root(workspace_path)
+        with _lock_for(root), _WorkspaceFileLock(root):
+            # Stage 2 — load the manifest and confirm the editable lane. Only
+            # the executable-editable source lane may be compiled at all; other
+            # lanes must be promoted first, exactly as in compile().
+            try:
+                manifest = self._load_manifest(root)
+            except ManifestValidationError as exc:
+                manifest = self._load_manifest_recovering_interrupted_compile(
+                    root, exc
+                )
+            source_record = manifest.get("source")
+            if (
+                not isinstance(source_record, Mapping)
+                or source_record.get("lane") != "executable-editable"
+                or source_record.get("compileEligible") is not True
+                or source_record.get("semanticEquivalenceVerified") is not False
+            ):
+                return {
+                    "ok": None,
+                    "reason": "workspace source lane is not compile-eligible",
+                }
+
+            # Every job this check creates lives under root/jobs. Snapshot the
+            # directory so the exact set created here can be removed afterwards
+            # (the workspace lock guarantees nothing else creates jobs meanwhile).
+            jobs_root = (root / "jobs").resolve()
+            try:
+                jobs_before = {p.name for p in jobs_root.iterdir()} if jobs_root.is_dir() else set()
+            except OSError:
+                jobs_before = set()
+            synthetic_revision = int(manifest["revision"]) + 1
+            baseline_path = self._artifact(root, manifest["baseline"]["path"])
+
+            def _read_bounded(path: Path) -> str:
+                try:
+                    with open(path, "rb") as handle:
+                        raw = handle.read(MAX_LIVE_CHECK_DIAGNOSTIC_BYTES)
+                except OSError:
+                    return ""
+                return raw.decode("utf-8", errors="replace")
+
+            def _cleanup() -> None:
+                try:
+                    for entry in jobs_root.iterdir():
+                        if entry.name not in jobs_before and entry.is_dir():
+                            shutil.rmtree(entry, ignore_errors=True)
+                except OSError:
+                    pass
+
+            try:
+                # Stage 3 — run the compiler over the buffer, on whichever lane
+                # this workspace uses, without publishing anything.
+                compile_error: BaseException | None = None
+                compiled_ok = False
+                direct_job_dir: Path | None = None
+                if manifest.get("routePlan") is not None:
+                    source_entry_point = (
+                        str(source_record.get("entryPoint"))
+                        if isinstance(source_record.get("entryPoint"), str)
+                        and source_record.get("entryPoint")
+                        else str(manifest["entryPoint"])
+                    )
+                    try:
+                        self._run_route_chain(
+                            root,
+                            manifest,
+                            "compile",
+                            synthetic_revision,
+                            source,
+                            baseline_path,
+                            {"operation": "live-check", "hops": []},
+                            entry_point=source_entry_point,
+                        )
+                        compiled_ok = True
+                    except Exception as exc:  # compile failure or tool fault
+                        compile_error = exc
+                else:
+                    operation = self._bound_operation(manifest, "compiler", "compile")
+                    direct_job_dir = self._new_job_path(root, "check", synthetic_revision)
+                    direct_job_dir.mkdir(parents=True, exist_ok=False)
+                    input_path = direct_job_dir / "input.hlsl"
+                    output_path = direct_job_dir / "compiled.bin"
+                    atomic_write_bytes(input_path, source)
+                    atomic_write_bytes(
+                        direct_job_dir / "baseline.bin", baseline_path.read_bytes()
+                    )
+                    values = self._template_values(
+                        root,
+                        manifest,
+                        synthetic_revision,
+                        direct_job_dir,
+                        input_path,
+                        output_path,
+                        direct_job_dir / "baseline.bin",
+                    )
+                    result = run_operation(operation, values, direct_job_dir)
+                    if result.launch_error or result.timed_out:
+                        return {
+                            "ok": None,
+                            "reason": "compiler unavailable for live check",
+                        }
+                    compiled_ok = (
+                        result.return_code == 0
+                        and output_path.is_file()
+                        and output_path.stat().st_size > 0
+                    )
+                    if not compiled_ok:
+                        compile_error = ToolExecutionError(
+                            "external tool exited with code %s; see %s"
+                            % (result.return_code, direct_job_dir)
+                        )
+
+                if compiled_ok:
+                    return {"ok": True, "diagnostics": []}
+
+                # Stage 4 — the buffer did not compile. A tool that could not
+                # launch or a broken toolchain is an environment fault, never a
+                # fault in the user's code, so it produces no squiggles.
+                message = str(compile_error or "")
+                if compile_error is not None and (
+                    "could not be launched" in message
+                    or "timed out" in message
+                    or isinstance(compile_error, (ToolConfigurationError, ManifestValidationError))
+                ):
+                    return {"ok": None, "reason": message[:512]}
+
+                # Collect the compiler's own diagnostic streams from every job
+                # directory the failure points at ("see <job_dir>"), exactly the
+                # hint the workspace watcher relies on.
+                texts: list[str] = []
+                seen_jobs: set[str] = set()
+                current: BaseException | None = compile_error
+                hops_guard = 0
+                while current is not None and hops_guard < 16:
+                    hops_guard += 1
+                    hint = _LIVE_CHECK_JOB_HINT.search(str(current))
+                    if hint is not None:
+                        candidate = hint.group(1).strip().strip('"')
+                        try:
+                            job = Path(candidate).resolve(strict=True)
+                        except OSError:
+                            job = None
+                        if (
+                            job is not None
+                            and is_within(jobs_root, job)
+                            and job != jobs_root
+                            and str(job) not in seen_jobs
+                        ):
+                            seen_jobs.add(str(job))
+                            for name in ("stderr.log", "stdout.log"):
+                                stream = job / name
+                                if stream.is_file() and not stream.is_symlink():
+                                    texts.append(_read_bounded(stream))
+                    current = current.__cause__ or current.__context__
+                parsed = parse_compiler_diagnostics("\n".join(texts), "input.hlsl")
+
+                # Only diagnostics anchored to a file inside this check's job
+                # directories describe the buffer itself and may carry a line
+                # number into the editor. Anything else (an include, a later
+                # transform hop) would mis-anchor on the open document, so it is
+                # collapsed into a single non-navigable signal instead.
+                # Compilers report the input by whatever path they were given —
+                # absolute, relative to the job/workspace, forward or back
+                # slashes — so decide by the *file name*: the editable text
+                # source every lane writes is "input.<text ext>". Diagnostics on
+                # binary intermediates of later hops (input.spv, ...) carry line
+                # numbers that mean nothing in the HLSL buffer and stay non-local.
+                text_inputs = {"input.hlsl", "input.glsl", "input.slang", "input.frag",
+                               "input.vert", "input.comp", "input.geom", "input.tesc",
+                               "input.tese", "shader.hlsl"}
+                buffer_local: list[dict[str, Any]] = []
+                other_error = False
+                for diagnostic in parsed:
+                    file_value = str(diagnostic.get("file", "") or "")
+                    base_name = file_value.replace("\\", "/").rsplit("/", 1)[-1].strip().lower()
+                    local = base_name in text_inputs
+                    if not local:
+                        try:
+                            resolved = Path(file_value).resolve()
+                            local = (is_within(jobs_root, resolved)
+                                     and resolved.suffix.lower() in
+                                     {".hlsl", ".glsl", ".slang", ".frag", ".vert", ".comp"})
+                        except (OSError, ValueError):
+                            local = False
+                    if local:
+                        entry = dict(diagnostic)
+                        entry["file"] = "<workspace>"
+                        buffer_local.append(entry)
+                    elif diagnostic.get("severity") == "error":
+                        other_error = True
+
+                diagnostics = list(buffer_local)
+                if not any(d.get("severity") == "error" for d in diagnostics):
+                    diagnostics.append(
+                        {
+                            "file": "<workspace>",
+                            "line": 0,
+                            "column": 0,
+                            "severity": "error",
+                            "message": (
+                                "The Shader does not compile (error outside the "
+                                "edited source)."
+                                if other_error
+                                else "The Shader does not compile."
+                            ),
+                        }
+                    )
+                return {"ok": False, "diagnostics": diagnostics}
+            except Exception as exc:  # never let a live check fault the editor
+                return {"ok": None, "reason": str(exc)[:512]}
+            finally:
+                _cleanup()
+
+    def hydrate_project_candidate(
+        self,
+        workspace_path: str | Path,
+        candidate_plan: Mapping[str, Any],
+    ) -> dict:
+        """Import one content-addressed project binary without trusting old ABI.
+
+        The project plan is only an origin receipt.  This method re-reads and
+        fingerprints the bytes, binds them to the current editable source and
+        physical target profile, then publishes a *new* target-workspace
+        revision.  Old capture IDs, ResourceIds, replacement handles, ABI
+        reports, and apply authorization are deliberately not accepted.  The
+        resulting candidate must still pass fresh replay reflection against
+        this workspace's captured baseline before it can be applied.
+        """
+
+        root = self._workspace_root(workspace_path)
+        with _lock_for(root), _WorkspaceFileLock(root):
+            manifest = self._load_manifest(root)
+            self._require_native_spirv_validator_lane(manifest, "compile")
+            if self._validator_bindings(manifest):
+                raise ToolExecutionError(
+                    "a strict native SPIR-V workspace cannot import a project "
+                    "candidate without freshly running its bound spirv-val"
+                )
+            source_record = manifest.get("source")
+            if (
+                not isinstance(source_record, Mapping)
+                or source_record.get("lane") != "executable-editable"
+                or source_record.get("compileEligible") is not True
+                or source_record.get("semanticEquivalenceVerified") is not False
+            ):
+                raise ToolExecutionError(
+                    "a project candidate requires the executable-editable source lane"
+                )
+            source_path = _source_path(root, manifest)
+            source = _source_bytes(source_path)
+            source_hash = hashlib.sha256(source).hexdigest()
+
+            required_fields = {
+                "schema",
+                "schemaVersion",
+                "artifactPath",
+                "sha256",
+                "codeSha256",
+                "byteSize",
+                "kind",
+                "sourceSha256",
+                "sourceRevision",
+                "targetProfile",
+                "compilerBindingSha256",
+                "candidateOnly",
+                "contentAddressed",
+                "integrityVerified",
+                "originValidationEvidenceOnly",
+                "applyAuthorization",
+                "freshCaptureRebindRequired",
+                "freshLiveAbiRevalidationRequired",
+                "oldReplacementIdReused",
+                "oldCaptureAbiAuthorityReused",
+            }
+            if not isinstance(candidate_plan, Mapping) or set(candidate_plan) != required_fields:
+                raise ToolExecutionError(
+                    "project compiled candidate receipt is incomplete or unsupported"
+                )
+
+            def valid_sha(value: Any) -> bool:
+                return bool(
+                    isinstance(value, str)
+                    and len(value) == 64
+                    and all(character in "0123456789abcdef" for character in value)
+                )
+
+            source_revision = candidate_plan.get("sourceRevision")
+            declared_size = candidate_plan.get("byteSize")
+            if isinstance(declared_size, bool) or not isinstance(
+                declared_size, int
+            ):
+                raise ToolExecutionError(
+                    "project compiled candidate byte size is invalid"
+                )
+            candidate_size = declared_size
+            if (
+                candidate_plan.get("schema") != PROJECT_COMPILED_CANDIDATE_SCHEMA
+                or candidate_plan.get("schemaVersion")
+                != PROJECT_COMPILED_CANDIDATE_VERSION
+                or not valid_sha(candidate_plan.get("sha256"))
+                or not valid_sha(candidate_plan.get("codeSha256"))
+                or not valid_sha(candidate_plan.get("sourceSha256"))
+                or not valid_sha(candidate_plan.get("compilerBindingSha256"))
+                or isinstance(source_revision, bool)
+                or not isinstance(source_revision, int)
+                or source_revision <= 0
+                or candidate_size <= 0
+                or candidate_size > MAX_COMPILED_BYTES
+                or candidate_plan.get("sourceSha256") != source_hash
+                or candidate_plan.get("targetProfile")
+                != manifest.get("targetProfile")
+                or candidate_plan.get("candidateOnly") is not True
+                or candidate_plan.get("contentAddressed") is not True
+                or candidate_plan.get("integrityVerified") is not True
+                or candidate_plan.get("originValidationEvidenceOnly") is not True
+                or candidate_plan.get("applyAuthorization") is not False
+                or candidate_plan.get("freshCaptureRebindRequired") is not True
+                or candidate_plan.get("freshLiveAbiRevalidationRequired") is not True
+                or candidate_plan.get("oldReplacementIdReused") is not False
+                or candidate_plan.get("oldCaptureAbiAuthorityReused") is not False
+            ):
+                raise ToolExecutionError(
+                    "project compiled candidate is not safely bound to this source and target"
+                )
+
+            artifact_value = candidate_plan.get("artifactPath")
+            if not isinstance(artifact_value, str) or not artifact_value.strip():
+                raise ToolExecutionError(
+                    "project compiled candidate artifact path is invalid"
+                )
+            artifact_path = Path(artifact_value).expanduser()
+            if not artifact_path.is_absolute():
+                raise ToolExecutionError(
+                    "project compiled candidate artifact path must be absolute"
+                )
+            if artifact_path.is_symlink() or not artifact_path.is_file():
+                raise ToolExecutionError(
+                    "project compiled candidate artifact is missing or is a symlink"
+                )
+            try:
+                if artifact_path.stat().st_size != candidate_size:
+                    raise ToolExecutionError(
+                        "project compiled candidate artifact/size mismatch"
+                    )
+                with artifact_path.open("rb") as stream:
+                    compiled = stream.read(candidate_size + 1)
+            except OSError as exc:
+                raise ToolExecutionError(
+                    "project compiled candidate artifact cannot be read: %s" % exc
+                ) from exc
+            compiled_hash = hashlib.sha256(compiled).hexdigest()
+            if compiled_hash != candidate_plan.get("sha256") or len(compiled) != candidate_size:
+                raise ToolExecutionError(
+                    "project compiled candidate artifact/hash mismatch"
+                )
+            container = self._validated_compiled_container(
+                compiled, manifest, "project compiled candidate"
+            )
+            if (
+                container.code_sha256 != candidate_plan.get("codeSha256")
+                or container.kind != candidate_plan.get("kind")
+            ):
+                raise ToolExecutionError(
+                    "project compiled candidate executable fingerprint mismatch"
+                )
+
+            self._ensure_dedicated_baseline_dxil_disassembly(root, manifest)
+            # Baseline refresh is an independent committed transaction.  From
+            # this point the imported revision is atomic, just like a compile.
+            manifest_before_candidate = deepcopy(manifest)
+            next_revision = int(manifest["revision"]) + 1
+            revision_dir = root / "revisions" / ("%04d" % next_revision)
+            revision_published = False
+            receipt = {
+                "schema": PROJECT_CANDIDATE_IMPORT_SCHEMA,
+                "schemaVersion": PROJECT_CANDIDATE_IMPORT_VERSION,
+                "projectCandidateSchema": PROJECT_COMPILED_CANDIDATE_SCHEMA,
+                "projectCandidateSchemaVersion": PROJECT_COMPILED_CANDIDATE_VERSION,
+                "artifactSha256": compiled_hash,
+                "codeSha256": container.code_sha256,
+                "byteSize": len(compiled),
+                "kind": container.kind,
+                "sourceSha256": source_hash,
+                "sourceRevision": source_revision,
+                "targetProfile": deepcopy(manifest.get("targetProfile")),
+                "compilerBindingSha256": candidate_plan[
+                    "compilerBindingSha256"
+                ],
+                "originValidationEvidenceOnly": True,
+                "freshCaptureRebindRequired": True,
+                "freshLiveAbiRevalidationRequired": True,
+                "applyAuthorization": False,
+                "oldReplacementIdReused": False,
+                "oldCaptureAbiAuthorityReused": False,
+            }
+            history = {
+                "operation": "project-candidate-import",
+                "revision": next_revision,
+                "routePlanSha256": (
+                    manifest.get("routePlan", {}).get("planSha256")
+                    if isinstance(manifest.get("routePlan"), Mapping)
+                    else None
+                ),
+                "sourceSha256": source_hash,
+                "outputSha256": compiled_hash,
+                "projectImport": receipt,
+            }
+            try:
+                if revision_dir.exists() or revision_dir.is_symlink():
+                    raise ManifestValidationError(
+                        "revision artifact already exists: %s" % revision_dir
+                    )
+                if self._needs_dedicated_dxil_disassembly_evidence(manifest):
+                    self._attempt_dedicated_dxil_disassembly(
+                        root,
+                        manifest,
+                        role="candidate",
+                        revision=next_revision,
+                        input_bytes=compiled,
+                        input_artifact_path=revision_dir / "shader.bin",
+                        history=history,
+                    )
+                revision_staging = (
+                    root
+                    / "revisions"
+                    / (".%04d.staging-%s" % (next_revision, uuid.uuid4().hex))
+                )
+                revision_staging.mkdir(parents=False, exist_ok=False)
+                try:
+                    atomic_write_bytes(revision_staging / "shader.bin", compiled)
+                    atomic_write_bytes(
+                        _revision_source_path(revision_staging, manifest), source
+                    )
+                    _replace_revision_directory(revision_staging, revision_dir)
+                    revision_published = True
+                except Exception:
+                    shutil.rmtree(revision_staging, ignore_errors=True)
+                    raise
+                revision_blob = revision_dir / "shader.bin"
+                revision_source = _revision_source_path(revision_dir, manifest)
+                imported_candidate = {
+                    "revision": next_revision,
+                    "blobPath": _relative(root, revision_blob),
+                    "sourcePath": _relative(root, revision_source),
+                    "sourceSha256": source_hash,
+                    "rawSha256": compiled_hash,
+                    "codeSha256": container.code_sha256,
+                    "byteSize": len(compiled),
+                    "kind": container.kind,
+                    "projectImport": receipt,
+                    "validationScope": "container-structure-only",
+                    "requiresReplayAbiValidation": True,
+                    "replayAbiValidated": False,
+                    "abiCompatible": False,
+                    "semanticEquivalenceVerified": False,
+                    "abiGate": {
+                        "status": _initial_abi_gate_status(manifest),
+                        "baselineAbiSha256": manifest["baseline"].get("abiSha256"),
+                    },
+                }
+                history.update(
+                    {"status": "succeeded", "candidate": imported_candidate}
+                )
+                manifest["revision"] = next_revision
+                manifest["latestCompiled"] = imported_candidate
+                self._append_history(root, manifest, history)
+            except Exception as exc:
+                manifest.clear()
+                manifest.update(manifest_before_candidate)
+                rollback_error: str | None = None
+                if (
+                    revision_published
+                    and revision_dir.is_dir()
+                    and not revision_dir.is_symlink()
+                ):
+                    try:
+                        shutil.rmtree(revision_dir)
+                    except OSError as cleanup_exc:
+                        rollback_error = str(cleanup_exc)
+                history.update({"status": "failed", "error": str(exc)})
+                if rollback_error is not None:
+                    history["rollbackError"] = rollback_error
+                self._append_history(root, manifest, history)
+                raise
+
+            return {
+                "workspacePath": str(root),
+                "revision": next_revision,
+                "sourceSha256": source_hash,
+                "candidateBlobPath": str(revision_blob),
+                "rawSha256": compiled_hash,
+                "codeSha256": container.code_sha256,
+                "kind": container.kind,
+                "projectImport": receipt,
+                "compilerSkipped": True,
+                "compiledFromProjectArtifact": True,
+                "requiresReplayAbiValidation": True,
+                "replayAbiValidated": False,
+                "abiCompatible": False,
+                "applied": False,
+            }
+
+    def import_project_candidate(
+        self,
+        workspace_path: str | Path,
+        candidate_plan: Mapping[str, Any],
+    ) -> dict:
+        """Backward-compatible name for :meth:`hydrate_project_candidate`."""
+
+        return self.hydrate_project_candidate(workspace_path, candidate_plan)
 
     def candidate_reflection_request(self, workspace_path: str | Path) -> dict:
         """Return the exact current-candidate request for the RenderDoc bridge.
@@ -3331,8 +5276,10 @@ class ShaderWorkspaceService:
         """Validate one bridge reflection and promote only an exact ABI match.
 
         An incompatible but well-formed reflection returns a bounded difference
-        report and leaves the candidate pending.  Malformed or incomplete
-        bridge evidence raises :class:`AbiValidationError`.
+        report and leaves the candidate unauthorized.  The rejected attempt is
+        persisted separately from the compatible ABI gate so later tasks can
+        distinguish a known mismatch from a candidate that was never reflected.
+        Malformed or incomplete bridge evidence raises :class:`AbiValidationError`.
         """
 
         root = self._workspace_root(workspace_path)
@@ -3369,17 +5316,13 @@ class ShaderWorkspaceService:
                 "replayAbiValidated": comparison.compatible,
                 "applied": False,
             }
-            if not comparison.compatible:
-                # A mismatch is not persisted as success and never changes the
-                # candidate's fail-closed pending state.
-                return result
-
             candidate = manifest.get("latestCompiled")
             if not isinstance(candidate, dict):
                 raise ManifestValidationError("latestCompiled is missing")
             existing_gate = candidate.get("abiGate")
             if (
-                isinstance(existing_gate, dict)
+                comparison.compatible
+                and isinstance(existing_gate, dict)
                 and existing_gate.get("status") == "compatible"
             ):
                 # Apply must obtain fresh replay reflection every time, but it
@@ -3390,14 +5333,11 @@ class ShaderWorkspaceService:
                     self._artifact(root, existing_gate.get("reportPath"))
                 )
                 result["abiReportSha256"] = existing_gate.get("reportSha256")
+                if manifest.pop("lastAbiAttempt", None) is not None:
+                    _write_manifest_with_retry(root / "manifest.json", manifest)
                 result["alreadyPersisted"] = True
                 return result
             revision_dir = root / "revisions" / ("%04d" % manifest["revision"])
-            report_path = revision_dir / "abi-report.json"
-            if report_path.exists() or report_path.is_symlink():
-                raise ManifestValidationError(
-                    "ABI report already exists for this revision"
-                )
             report = {
                 "schema": ABI_REPORT_SCHEMA,
                 "schemaVersion": ABI_REPORT_VERSION,
@@ -3429,7 +5369,96 @@ class ShaderWorkspaceService:
                     "candidate ABI report exceeds %d bytes"
                     % MAX_ABI_REPORT_BYTES
                 )
-            atomic_write_json(report_path, report)
+            if not comparison.compatible:
+                # This record is diagnostic evidence only. It cannot satisfy
+                # the compatible gate or authorize publication/replacement.
+                previous_attempt = self._current_rejected_abi_attempt(root, manifest)
+                if (
+                    previous_attempt is not None
+                    and previous_attempt["comparison"] == comparison.to_dict()
+                    and candidate.get("abiCompatible") is False
+                ):
+                    # Fresh replay allocations can have different target IDs.
+                    # Retain the first evidence for an unchanged rejection so
+                    # repeated checks do not grow history or duplicate reports.
+                    result.update({
+                        "abiValidationStatus": "incompatible",
+                        "abiReportPath": previous_attempt["reportPath"],
+                        "abiReportSha256": previous_attempt["reportSha256"],
+                        "alreadyPersisted": True,
+                    })
+                    return result
+                report_path = revision_dir / (
+                    "abi-rejected-%s.json" % _canonical_sha256(report)
+                )
+                if report_path.is_symlink():
+                    raise ManifestValidationError("candidate ABI report is redirected")
+                if report_path.exists():
+                    existing = read_json_object(
+                        report_path, MAX_ABI_REPORT_BYTES, "candidate ABI report"
+                    )
+                    if existing != report:
+                        raise ManifestValidationError("candidate ABI report content mismatch")
+                else:
+                    atomic_write_json(report_path, report)
+                report_hash = _file_sha256(report_path)
+                attempt = {
+                    "status": "incompatible",
+                    "revision": manifest["revision"],
+                    "sourceSha256": candidate["sourceSha256"],
+                    "candidateRawSha256": candidate["rawSha256"],
+                    "baselineAbiSha256": baseline_abi.sha256,
+                    "candidateAbiSha256": candidate_abi.sha256,
+                    "requestId": request["requestId"],
+                    "reportPath": _relative(root, report_path),
+                    "reportSha256": report_hash,
+                }
+                # A fresh rejection supersedes any older compatible result for
+                # these bytes. Keep old immutable reports for audit, but revoke
+                # their cached authorization before exposing the new attempt.
+                candidate.update({
+                    "validationScope": "container-structure-only",
+                    "requiresReplayAbiValidation": True,
+                    "replayAbiValidated": False,
+                    "abiCompatible": False,
+                    "semanticEquivalenceVerified": False,
+                    "abiGate": {
+                        "status": "pending-replay-reflection",
+                        "baselineAbiSha256": baseline_abi.sha256,
+                    },
+                })
+                if manifest.get("lastAbiAttempt") != attempt:
+                    manifest["lastAbiAttempt"] = attempt
+                    self._append_history(
+                        root, manifest,
+                        {"operation": "abi-validate", **attempt},
+                    )
+                else:
+                    result["alreadyPersisted"] = True
+                result["abiValidationStatus"] = "incompatible"
+                result["abiReportPath"] = str(report_path)
+                result["abiReportSha256"] = report_hash
+                return result
+
+            report_path = revision_dir / "abi-report.json"
+            if report_path.is_symlink():
+                raise ManifestValidationError("candidate ABI report is redirected")
+            if report_path.exists():
+                # The first success can have been superseded by a fresh
+                # rejection. Preserve it when this revision is validated again.
+                report_path = revision_dir / (
+                    "abi-report-%s.json" % _canonical_sha256(report)
+                )
+            if report_path.is_symlink():
+                raise ManifestValidationError("candidate ABI report is redirected")
+            if report_path.exists():
+                existing = read_json_object(
+                    report_path, MAX_ABI_REPORT_BYTES, "candidate ABI report"
+                )
+                if existing != report:
+                    raise ManifestValidationError("candidate ABI report content mismatch")
+            else:
+                atomic_write_json(report_path, report)
             report_hash = hashlib.sha256(report_path.read_bytes()).hexdigest()
             candidate["validationScope"] = "replay-reflection-abi-compatible"
             candidate["requiresReplayAbiValidation"] = False
@@ -3447,6 +5476,7 @@ class ShaderWorkspaceService:
                 "reportPath": _relative(root, report_path),
                 "reportSha256": report_hash,
             }
+            manifest.pop("lastAbiAttempt", None)
             self._append_history(
                 root,
                 manifest,
@@ -3465,13 +5495,600 @@ class ShaderWorkspaceService:
             result["abiReportSha256"] = report_hash
             return result
 
+    def _project_compiler_binding(
+        self, manifest: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Expose the exact compile profile/flags as non-authoritative evidence."""
+
+        plan = manifest.get("routePlan")
+        hops: list[dict[str, Any]] = []
+        if isinstance(plan, Mapping):
+            compile_hops = plan.get("compile")
+            if not isinstance(compile_hops, list) or not compile_hops:
+                return None
+            for index, hop in enumerate(compile_hops):
+                if not isinstance(hop, Mapping):
+                    raise ManifestValidationError(
+                        "workspace compile route binding is invalid"
+                    )
+                capability = hop.get("capability")
+                if not isinstance(capability, Mapping):
+                    raise ManifestValidationError(
+                        "workspace compile capability is invalid"
+                    )
+                operation = self._bound_route_operation(hop)
+                hops.append(
+                    {
+                        "hop": index + 1,
+                        "routeId": capability.get("routeId"),
+                        "inputFormat": capability.get("inputFormat"),
+                        "outputFormat": capability.get("outputFormat"),
+                        "toolId": operation.tool_id,
+                        "operation": operation.operation,
+                        "toolConfigDigest": operation.config_digest,
+                        "executableSha256": operation.executable_sha256,
+                        "fixedFileHashes": operation.fixed_file_hashes_dict(),
+                        "argumentTemplate": list(operation.arguments),
+                        "placeholders": sorted(operation.placeholders),
+                    }
+                )
+            route_plan_sha256 = plan.get("planSha256")
+        else:
+            operation = self._bound_operation(manifest, "compiler", "compile")
+            hops.append(
+                {
+                    "hop": 1,
+                    "routeId": "legacy:%s:compile" % operation.tool_id,
+                    "inputFormat": "hlsl",
+                    "outputFormat": normalize_format(
+                        manifest.get("baseline", {}).get("kind")
+                    ),
+                    "toolId": operation.tool_id,
+                    "operation": operation.operation,
+                    "toolConfigDigest": operation.config_digest,
+                    "executableSha256": operation.executable_sha256,
+                    "fixedFileHashes": operation.fixed_file_hashes_dict(),
+                    "argumentTemplate": list(operation.arguments),
+                    "placeholders": sorted(operation.placeholders),
+                }
+            )
+            route_plan_sha256 = None
+        result: dict[str, Any] = {
+            "schema": "renderdoc-ultra-shader-compiler-binding/v1",
+            "schemaVersion": 1,
+            "targetProfile": deepcopy(manifest.get("targetProfile")),
+            "routePlanSha256": route_plan_sha256,
+            "hops": hops,
+            "executionAuthority": False,
+            "evidenceOnly": True,
+        }
+        result["bindingSha256"] = _canonical_sha256(result)
+        return result
+
+    def _project_assembly_disassembly_artifacts(
+        self, root: Path, manifest: Mapping[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Return immutable display evidence, never executable apply authority.
+
+        Dedicated DXIL disassembly has a separate independently executed path.
+        Other native assembly formats are portable only when a single direct
+        ``ir-disassembly`` route can be rebound to the captured baseline, its
+        immutable job output, and the exact current tool configuration.
+        """
+
+        artifacts: list[dict[str, Any]] = []
+        if self._needs_dedicated_dxil_disassembly_evidence(manifest):
+            collection = manifest.get("dxilDisassemblyEvidence")
+            if isinstance(collection, Mapping):
+                for role in ("baseline", "candidate"):
+                    rebound = self._dedicated_dxil_asm_evidence(
+                        root, manifest, role
+                    )
+                    record = collection.get(role)
+                    if rebound is None or not isinstance(record, Mapping):
+                        continue
+                    payload, digest = rebound
+                    output = self._artifact(root, record.get("outputPath"))
+                    if (
+                        output.read_bytes() != payload
+                        or _file_sha256(output) != digest
+                        or record.get("outputSha256") != digest
+                    ):
+                        raise ManifestValidationError(
+                            "workspace DXIL disassembly evidence changed during status"
+                        )
+                    artifacts.append(
+                        {
+                            "kind": "dxil-disassembly",
+                            "role": role,
+                            "format": "dxil-asm",
+                            "path": str(output),
+                            "sha256": digest,
+                            "byteSize": len(payload),
+                            "routePlanSha256": record.get("routePlanSha256"),
+                            "toolId": record.get("toolId"),
+                            "toolConfigDigest": record.get("toolConfigDigest"),
+                            "executableSha256": record.get("executableSha256"),
+                            "physicalEvidence": True,
+                            "editableSource": False,
+                            "applyAuthorization": False,
+                        }
+                    )
+
+        portable = self._project_routed_native_disassembly_artifact(root, manifest)
+        if portable is not None:
+            if any(item.get("role") == portable["role"] for item in artifacts):
+                raise ManifestValidationError(
+                    "workspace has ambiguous assembly/disassembly evidence roles"
+                )
+            artifacts.append(portable)
+        return artifacts
+
+    def _project_routed_native_disassembly_artifact(
+        self, root: Path, manifest: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Rebind one non-DXIL native disassembly to its physical baseline.
+
+        Multi-hop and non-instruction routes are intentionally not guessed.
+        Once a route/source or route/representation claim qualifies, broken
+        hashes or redirected files are integrity errors rather than an excuse
+        to publish weaker evidence.
+        """
+
+        plan = manifest.get("routePlan")
+        baseline = manifest.get("baseline")
+        if not isinstance(plan, Mapping) or not isinstance(baseline, Mapping):
+            return None
+        input_format = normalize_format(baseline.get("kind"))
+        output_format = _PORTABLE_NATIVE_DISASSEMBLY_FORMATS.get(input_format)
+        decompile_hops = plan.get("decompile")
+        if output_format is None or not isinstance(decompile_hops, list):
+            return None
+        # A portable producer binding currently has one tool/config identity.
+        # Refuse to collapse a multi-hop chain into whichever tool ran last.
+        if len(decompile_hops) != 1:
+            return None
+        route_binding = decompile_hops[0]
+        capability = (
+            route_binding.get("capability")
+            if isinstance(route_binding, Mapping)
+            else None
+        )
+        if (
+            not isinstance(capability, Mapping)
+            or capability.get("fidelity") != "ir-disassembly"
+            or capability.get("inputFormat") != input_format
+            or capability.get("outputFormat") != output_format
+        ):
+            return None
+
+        claimed_sha256: Any = None
+        claimed_path: Any = None
+        claimed_job: Any = None
+        claimed_status = "succeeded"
+        source = manifest.get("source")
+        if (
+            isinstance(source, Mapping)
+            and source.get("origin") == "trusted-decompile-route"
+            and normalize_format(plan.get("editableFormat")) == output_format
+            and source.get("routePlanSha256") == plan.get("planSha256")
+            and source.get("decompileRouteIds") == [capability.get("routeId")]
+            and isinstance(source.get("producedByJobs"), list)
+            and len(source["producedByJobs"]) == 1
+        ):
+            claimed_sha256 = source.get("sha256")
+            claimed_path = source.get("path")
+            claimed_job = source["producedByJobs"][0]
+        else:
+            representation = load_fallback_representation(
+                root,
+                expected_baseline_path=self._artifact(
+                    root, baseline.get("path")
+                ),
+                expected_baseline_raw_sha256=baseline.get("rawSha256"),
+                expected_shader=manifest.get("shader", {}),
+                expected_stage=manifest.get("stage", ""),
+                expected_entry_point=manifest.get("entryPoint", ""),
+                expected_route_plan=plan,
+                expected_history=manifest.get("history", ()),
+                expected_revision=manifest.get("revision"),
+            )
+            provenance = (
+                representation.get("provenance")
+                if isinstance(representation, Mapping)
+                else None
+            )
+            if (
+                not isinstance(representation, Mapping)
+                or representation.get("kind")
+                != "trusted-tool-one-way-decompile"
+                or not isinstance(provenance, Mapping)
+                or provenance.get("routeIds") != [capability.get("routeId")]
+                or not isinstance(provenance.get("producedByJobs"), list)
+                or len(provenance["producedByJobs"]) != 1
+            ):
+                return None
+            claimed_sha256 = representation.get("sha256")
+            claimed_path = "explanation/" + Path(
+                str(representation.get("path", ""))
+            ).name
+            claimed_job = provenance["producedByJobs"][0]
+            claimed_status = "succeeded-explanatory"
+
+        matching_history: Mapping[str, Any] | None = None
+        for entry in reversed(list(manifest.get("history", ()))):
+            published_path = (
+                entry.get("publishedSourcePath")
+                if claimed_status == "succeeded"
+                else entry.get("publishedRepresentationPath")
+            ) if isinstance(entry, Mapping) else None
+            if (
+                isinstance(entry, Mapping)
+                and entry.get("operation") == "decompile-route-chain"
+                and entry.get("status") == claimed_status
+                and entry.get("routePlanSha256") == plan.get("planSha256")
+                and published_path == claimed_path
+                and entry.get("outputSha256") == claimed_sha256
+            ):
+                matching_history = entry
+                break
+        if matching_history is None:
+            raise ManifestValidationError(
+                "native disassembly has no hash-bound route history"
+            )
+        actual_hops = matching_history.get("hops")
+        if not isinstance(actual_hops, list) or len(actual_hops) != 1:
+            raise ManifestValidationError(
+                "native disassembly route history is ambiguous"
+            )
+        actual = actual_hops[0]
+        operation = self._bound_route_operation(route_binding)
+        required = {
+            "hop": 1,
+            "routeBinding": route_binding,
+            "inputFormat": input_format,
+            "outputFormat": output_format,
+            "toolId": operation.tool_id,
+            "toolConfigDigest": operation.config_digest,
+            "executableSha256": operation.executable_sha256,
+            "fixedFileHashes": operation.fixed_file_hashes_dict(),
+            "status": "succeeded",
+            "jobPath": claimed_job,
+        }
+        if not isinstance(actual, Mapping) or any(
+            actual.get(key) != value for key, value in required.items()
+        ):
+            raise ManifestValidationError(
+                "native disassembly route/tool binding mismatch"
+            )
+        job = self._job_directory(root, claimed_job)
+        input_path = self._regular_route_artifact(
+            root, job, actual.get("inputPath"), "native disassembly input"
+        )
+        output_path = self._regular_route_artifact(
+            root, job, actual.get("outputPath"), "native disassembly output"
+        )
+        unresolved_baseline = root / str(baseline.get("path", ""))
+        baseline_path = self._artifact(root, baseline.get("path"))
+        if unresolved_baseline.is_symlink() or baseline_path.is_symlink():
+            raise ManifestValidationError(
+                "native disassembly baseline is redirected"
+            )
+        if (
+            output_path.stat().st_size <= 0
+            or output_path.stat().st_size > MAX_SOURCE_BYTES
+        ):
+            raise ManifestValidationError(
+                "native disassembly output size is invalid"
+            )
+        baseline_bytes = baseline_path.read_bytes()
+        input_bytes = input_path.read_bytes()
+        output_bytes = output_path.read_bytes()
+        baseline_sha256 = hashlib.sha256(baseline_bytes).hexdigest()
+        input_sha256 = hashlib.sha256(input_bytes).hexdigest()
+        output_sha256 = hashlib.sha256(output_bytes).hexdigest()
+        try:
+            output_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ManifestValidationError(
+                "native disassembly output is not UTF-8"
+            ) from exc
+        if (
+            not output_bytes
+            or baseline_sha256 != baseline.get("rawSha256")
+            or input_bytes != baseline_bytes
+            or input_sha256 != baseline_sha256
+            or actual.get("inputSha256") != input_sha256
+            or actual.get("outputSha256") != output_sha256
+            or output_sha256 != claimed_sha256
+            or actual.get("inputDetection")
+            != detect_shader_format(input_bytes, input_format).as_dict()
+            or actual.get("outputDetection")
+            != detect_shader_format(output_bytes, output_format).as_dict()
+        ):
+            raise ManifestValidationError(
+                "native disassembly physical/hash binding mismatch"
+            )
+        return {
+            "kind": "native-disassembly",
+            "role": "baseline",
+            "format": output_format,
+            "path": str(output_path),
+            "sha256": output_sha256,
+            "byteSize": len(output_bytes),
+            "inputFormat": input_format,
+            "inputRawSha256": baseline_sha256,
+            "routePlanSha256": plan.get("planSha256"),
+            "routeId": capability.get("routeId"),
+            "toolId": operation.tool_id,
+            "operation": operation.operation,
+            "toolConfigDigest": operation.config_digest,
+            "executableSha256": operation.executable_sha256,
+            "physicalEvidence": True,
+            "displayEvidenceOnly": True,
+            "editableSource": False,
+            "applyAuthorization": False,
+        }
+
+    def _validated_hlsl_cbuffer_repair_provenance(
+        self,
+        root: Path,
+        manifest: Mapping[str, Any],
+        source_record: Mapping[str, Any],
+        source: bytes,
+    ) -> dict[str, Any] | None:
+        """Recompute a claimed HLSL CBuffer repair from physical evidence."""
+
+        claimed = source_record.get("hlslCBufferAbiRepair")
+        if claimed is None:
+            return None
+        if not isinstance(claimed, Mapping):
+            raise ManifestValidationError(
+                "workspace HLSL CBuffer repair provenance is invalid"
+            )
+        route_plan = manifest.get("routePlan")
+        if not isinstance(route_plan, Mapping):
+            raise ManifestValidationError(
+                "workspace HLSL CBuffer repair requires a routed workspace"
+            )
+        common_fields = {
+            "schema",
+            "schemaVersion",
+            "status",
+            "sourceBeforeSha256",
+            "baselineAbiSha256",
+        }
+        status = claimed.get("status")
+        expected_fields = (
+            common_fields
+            | {
+                "sourceAfterSha256",
+                "dxilDisassemblySha256",
+                "dxilAccessSignatureSha256",
+                "repairedBlocks",
+                "physicalAbiVerified",
+                "semanticEquivalenceVerified",
+            }
+            if status == "applied"
+            else common_fields | {"reason"}
+            if status == "not-applied"
+            else set()
+        )
+        if status == "applied" and claimed.get("interfaceRepairVersion") == 1:
+            expected_fields.add("interfaceRepairVersion")
+        interface_record = claimed.get("interfaceRepair")
+        if interface_record is not None:
+            if (
+                status != "applied"
+                or not isinstance(interface_record, Mapping)
+                or interface_record.get("status") not in {"applied", "not-applied"}
+                or (
+                    interface_record.get("status") == "applied"
+                    and (set(interface_record) != {"status"}
+                         or claimed.get("interfaceRepairVersion") != 1)
+                )
+                or (
+                    interface_record.get("status") == "not-applied"
+                    and (set(interface_record) != {"status", "reason"}
+                         or not isinstance(interface_record.get("reason"), str)
+                         or not 0 < len(interface_record["reason"]) <= 4096
+                         or "interfaceRepairVersion" in claimed)
+                )
+            ):
+                raise ManifestValidationError(
+                    "workspace HLSL interface repair provenance is invalid"
+                )
+            expected_fields.add("interfaceRepair")
+        if claimed.get("assetLayout") is not None:
+            if status != "applied":
+                raise ManifestValidationError(
+                    "workspace asset layout provenance is invalid"
+                )
+            expected_fields.add("assetLayout")
+        if (
+            not expected_fields
+            or set(claimed) != expected_fields
+            or claimed.get("schema")
+            != "renderdoc-ultra-spirv-cross-hlsl-cbuffer-repair/v1"
+            or claimed.get("schemaVersion") != 1
+            or claimed.get("baselineAbiSha256")
+            != manifest.get("baseline", {}).get("abiSha256")
+        ):
+            raise ManifestValidationError(
+                "workspace HLSL CBuffer repair provenance fields are invalid"
+            )
+
+        matching_history = [
+            entry
+            for entry in manifest.get("history", [])
+            if isinstance(entry, Mapping)
+            and entry.get("operation") == "decompile-route-chain"
+            and entry.get("status") == "succeeded"
+            and entry.get("routePlanSha256")
+            == route_plan.get("planSha256")
+            and entry.get("publishedSourcePath") == source_record.get("path")
+            and entry.get("outputSha256") == source_record.get("sha256")
+            and entry.get("hlslCBufferAbiRepair") == claimed
+        ]
+        if len(matching_history) != 1:
+            raise ManifestValidationError(
+                "workspace HLSL CBuffer repair has no unique route history"
+            )
+        hops = matching_history[0].get("hops")
+        produced_jobs = source_record.get("producedByJobs")
+        if (
+            not isinstance(hops, list)
+            or not hops
+            or not isinstance(produced_jobs, list)
+            or len(hops) != len(produced_jobs)
+        ):
+            raise ManifestValidationError(
+                "workspace HLSL CBuffer repair route history is invalid"
+            )
+        final_hop = hops[-1]
+        if not isinstance(final_hop, Mapping):
+            raise ManifestValidationError(
+                "workspace HLSL CBuffer repair final hop is invalid"
+            )
+        job = self._job_directory(root, produced_jobs[-1])
+        raw_path = self._regular_route_artifact(
+            root,
+            job,
+            final_hop.get("outputPath"),
+            "pre-repair HLSL",
+        )
+        raw_source = raw_path.read_bytes()
+        raw_sha256 = hashlib.sha256(raw_source).hexdigest()
+        if (
+            final_hop.get("jobPath") != produced_jobs[-1]
+            or final_hop.get("outputSha256") != raw_sha256
+            or claimed.get("sourceBeforeSha256") != raw_sha256
+        ):
+            raise ManifestValidationError(
+                "workspace pre-repair HLSL hash binding is invalid"
+            )
+        baseline_compile = source_record.get("baselineCompile")
+        probe = matching_history[0].get("baselineCompileProbe")
+        probe_hops = probe.get("hops") if isinstance(probe, Mapping) else None
+        compile_jobs = (
+            baseline_compile.get("producedByJobs")
+            if isinstance(baseline_compile, Mapping)
+            else None
+        )
+        if (
+            not isinstance(probe, Mapping)
+            or probe.get("status") != "succeeded"
+            or not isinstance(probe_hops, list)
+            or not probe_hops
+            or not isinstance(compile_jobs, list)
+            or len(probe_hops) != len(compile_jobs)
+            or not isinstance(probe_hops[0], Mapping)
+        ):
+            raise ManifestValidationError(
+                "workspace HLSL CBuffer repair compile probe is invalid"
+            )
+        first_compile_hop = probe_hops[0]
+        compile_job = self._job_directory(root, compile_jobs[0])
+        published_input_path = self._regular_route_artifact(
+            root,
+            compile_job,
+            first_compile_hop.get("inputPath"),
+            "published repaired HLSL",
+        )
+        published_source = published_input_path.read_bytes()
+        published_sha256 = hashlib.sha256(published_source).hexdigest()
+        if (
+            first_compile_hop.get("jobPath") != compile_jobs[0]
+            or first_compile_hop.get("inputSha256") != published_sha256
+            or source_record.get("sha256") != published_sha256
+        ):
+            raise ManifestValidationError(
+                "workspace repaired HLSL compile-probe binding is invalid"
+            )
+        if status == "not-applied":
+            reason = claimed.get("reason")
+            if (
+                not isinstance(reason, str)
+                or not reason
+                or len(reason) > 4096
+                or raw_source != published_source
+            ):
+                raise ManifestValidationError(
+                    "workspace non-applied HLSL CBuffer repair is invalid"
+                )
+            return dict(claimed)
+
+        if (
+            claimed.get("sourceAfterSha256")
+            != published_sha256
+            or claimed.get("physicalAbiVerified") is not False
+            or claimed.get("semanticEquivalenceVerified") is not False
+        ):
+            raise ManifestValidationError(
+                "workspace applied HLSL CBuffer repair safety flags are invalid"
+            )
+        baseline_access, unused_candidate_access = self._dxil_access_evidence(
+            root, manifest
+        )
+        baseline_abi = self._manifest_baseline_abi(manifest)
+        if baseline_access is None or baseline_abi is None:
+            raise ManifestValidationError(
+                "workspace applied HLSL CBuffer repair lost physical evidence"
+            )
+        stored_hint = (
+            self._stored_asset_layout_hint(root, claimed)
+            if claimed.get("assetLayout") is not None
+            else None
+        )
+        try:
+            recomputed = repair_spirv_cross_hlsl_cbuffers(
+                raw_source.decode("utf-8", errors="strict"),
+                baseline_constant_blocks=[
+                    block.to_dict() for block in baseline_abi.constant_blocks
+                ],
+                dxil_access=baseline_access,
+                asset_layout=stored_hint,
+            )
+            recomputed_text = recomputed.hlsl
+            if claimed.get("interfaceRepairVersion") == 1:
+                recomputed_text = repair_spirv_cross_hlsl_interface(
+                    recomputed_text, baseline_interface=baseline_abi.to_dict()
+                )
+        except (UnicodeDecodeError, HlslCBufferAbiRepairError) as exc:
+            raise ManifestValidationError(
+                "workspace HLSL CBuffer repair cannot be reproduced: %s" % exc
+            ) from exc
+        expected_blocks = _repaired_block_records(recomputed.repaired_blocks)
+        if stored_hint is not None and not recomputed.asset_layout_used:
+            raise ManifestValidationError(
+                "workspace asset layout provenance claims an unused hint"
+            )
+        if (
+            recomputed_text.encode("utf-8") != published_source
+            or claimed.get("dxilDisassemblySha256")
+            != baseline_access.source_sha256
+            or claimed.get("dxilAccessSignatureSha256")
+            != baseline_access.signature_sha256
+            or claimed.get("repairedBlocks") != expected_blocks
+        ):
+            raise ManifestValidationError(
+                "workspace HLSL CBuffer repair differs from physical evidence"
+            )
+        return dict(claimed)
+
     def status(self, workspace_path: str | Path) -> dict:
         """Validate and report a workspace without acquiring its operation lock."""
 
         root = self._workspace_root(workspace_path)
         try:
             manifest = self._load_manifest(root)
-        except ManifestValidationError as original_error:
+        except (ManifestValidationError, ToolConfigurationError, ToolExecutionError, ToolchainRoutingError) as original_error:
+            from .toolchain_refresh import stale_toolchain_status
+            try:
+                return stale_toolchain_status(self, root, original_error)
+            except (ManifestValidationError, ToolConfigurationError, ToolExecutionError, ToolchainRoutingError) as read_error:
+                if read_error is not original_error or not isinstance(original_error, ManifestValidationError):
+                    raise
             # Ordinary status remains lock-free. Only the exact historical
             # interrupted-publication defect enters this rare repair path, and
             # the cross-process operation lock prevents racing a live compile.
@@ -3500,6 +6117,7 @@ class ShaderWorkspaceService:
             "baselineCompileVerified": False,
             "semanticEquivalenceVerified": False,
             "toolchainMigration": None,
+            "hlslCBufferAbiRepair": None,
         }
         if source_record is None:
             if source_path.exists() or source_path.is_symlink():
@@ -3518,6 +6136,7 @@ class ShaderWorkspaceService:
                 raise ManifestValidationError(str(exc)) from exc
             decompiled_hash = source_record.get("sha256")
             current_hash = hashlib.sha256(source).hexdigest()
+            reconstructed_entry_point = source_record.get("entryPoint")
             if (
                 not isinstance(decompiled_hash, str)
                 or len(decompiled_hash) != 64
@@ -3531,6 +6150,15 @@ class ShaderWorkspaceService:
                 or source_record.get("semanticEquivalenceVerified") is not False
                 or source_record.get("baselineRawSha256")
                 != manifest["baseline"]["rawSha256"]
+                or (
+                    reconstructed_entry_point is not None
+                    and (
+                        not isinstance(reconstructed_entry_point, str)
+                        or not reconstructed_entry_point
+                        or len(reconstructed_entry_point) > 512
+                        or "\x00" in reconstructed_entry_point
+                    )
+                )
             ):
                 raise ManifestValidationError("workspace source metadata mismatch")
             origin = source_record.get("origin")
@@ -3539,11 +6167,15 @@ class ShaderWorkspaceService:
                 "trusted-decompile-route",
                 "explicit-explanatory-promotion",
                 "toolchain-migration-preserved-source",
+                "toolchain-refreshed-source",
+                "verified-project-source",
             }:
                 raise ManifestValidationError("workspace source origin is invalid")
             plan = manifest.get("routePlan")
             baseline_compile_verified = False
             migration_record: Mapping[str, Any] | None = None
+            refresh_record = None
+            project_source_record = None
             if origin == "trusted-decompile-route":
                 if plan is None:
                     raise ManifestValidationError(
@@ -3566,24 +6198,40 @@ class ShaderWorkspaceService:
                     )
                 for relative_job in produced_jobs:
                     self._job_directory(root, relative_job)
+                validator_bindings = self._validator_bindings(manifest)
+                if validator_bindings:
+                    baseline_path = self._artifact(
+                        root, manifest["baseline"]["path"]
+                    )
+                    self._validate_validator_jobs(
+                        root,
+                        manifest,
+                        source_record.get("baselineValidatorJobs"),
+                        expected_bytes=baseline_path.read_bytes(),
+                        expected_artifact_path=baseline_path,
+                        expected_revision=0,
+                    )
                 baseline_compile = source_record.get("baselineCompile")
                 if baseline_compile is not None:
+                    baseline_compile_fields = {
+                        "routeIds",
+                        "producedByJobs",
+                        "blobPath",
+                        "rawSha256",
+                        "codeSha256",
+                        "byteSize",
+                        "kind",
+                        "targetProfile",
+                        "replayAbiValidated",
+                        "semanticEquivalenceVerified",
+                    }
+                    if validator_bindings:
+                        baseline_compile_fields.add("validatorJobs")
                     if (
                         source_record.get("baselineCompileVerified") is not True
                         or not isinstance(baseline_compile, Mapping)
                         or set(baseline_compile)
-                        != {
-                            "routeIds",
-                            "producedByJobs",
-                            "blobPath",
-                            "rawSha256",
-                            "codeSha256",
-                            "byteSize",
-                            "kind",
-                            "targetProfile",
-                            "replayAbiValidated",
-                            "semanticEquivalenceVerified",
-                        }
+                        != baseline_compile_fields
                     ):
                         raise ManifestValidationError(
                             "workspace baseline compile provenance is incomplete"
@@ -3635,6 +6283,15 @@ class ShaderWorkspaceService:
                         raise ManifestValidationError(
                             "workspace baseline compile artifact/hash mismatch"
                         )
+                    if validator_bindings:
+                        self._validate_validator_jobs(
+                            root,
+                            manifest,
+                            baseline_compile.get("validatorJobs"),
+                            expected_bytes=compiled_probe,
+                            expected_artifact_path=probe_blob,
+                            expected_revision=0,
+                        )
                     baseline_compile_verified = True
                 elif (
                     source_record.get("baselineCompileVerified") is not None
@@ -3647,6 +6304,15 @@ class ShaderWorkspaceService:
                 migration_record = self._validate_toolchain_migration_source_record(
                     manifest, source_record
                 )
+            elif origin == "toolchain-refreshed-source":
+                from .toolchain_refresh import validate_refresh_source
+                refresh_record = validate_refresh_source(self, root, manifest, source_record)
+                if source_record.get("projectSource") is not None:
+                    from .project_source import validate_project_source
+                    project_source_record = validate_project_source(root, manifest, source_record)
+            elif origin == "verified-project-source":
+                from .project_source import validate_project_source
+                project_source_record = validate_project_source(root, manifest, source_record)
             elif origin == "trusted-decompiler":
                 if plan is not None:
                     raise ManifestValidationError(
@@ -3691,6 +6357,9 @@ class ShaderWorkspaceService:
                     raise ManifestValidationError(
                         "promoted source evidence/hash binding mismatch"
                     )
+            cbuffer_repair = self._validated_hlsl_cbuffer_repair_provenance(
+                root, manifest, source_record, source
+            )
             source_result = {
                 "present": True,
                 "path": str(tracked_path),
@@ -3708,6 +6377,9 @@ class ShaderWorkspaceService:
                     if origin == "toolchain-migration-preserved-source"
                     else None
                 ),
+                "hlslCBufferAbiRepair": cbuffer_repair,
+                "toolchainRefresh": refresh_record,
+                "projectSource": project_source_record,
             }
 
         latest = manifest.get("latestCompiled")
@@ -3719,12 +6391,25 @@ class ShaderWorkspaceService:
             )
             latest_result["applied"] = False
 
+        last_abi_attempt = self._current_rejected_abi_attempt(root, manifest)
+        current_matches_candidate = bool(
+            source_result["present"]
+            and latest_result
+            and latest_result.get("sourceSha256") == source_result["currentSha256"]
+        )
+        abi_validation_status = (
+            latest_result["abiGate"]["status"] if latest_result else "not-compiled"
+        )
+        if last_abi_attempt is not None:
+            last_abi_attempt["appliesToCurrentSource"] = current_matches_candidate
+            abi_validation_status = "incompatible"
+        if latest_result and not current_matches_candidate:
+            # This status describes the editor's current source. The legacy
+            # top-level ABI booleans and latestCompiled continue to describe
+            # the immutable compiled candidate, including its prior success.
+            abi_validation_status = "source-changed"
+
         if source_result["present"]:
-            current_matches_candidate = bool(
-                latest_result
-                and latest_result.get("sourceSha256")
-                == source_result["currentSha256"]
-            )
             editable_format = _editable_format(manifest)
             if source_result["origin"] == "explicit-explanatory-promotion":
                 representation_kind = "promoted-explanatory-hlsl"
@@ -3779,6 +6464,9 @@ class ShaderWorkspaceService:
                     "baselineCompileVerified": source_result[
                         "baselineCompileVerified"
                     ],
+                    "hlslCBufferAbiRepair": source_result[
+                        "hlslCBufferAbiRepair"
+                    ],
                 },
             }
         else:
@@ -3813,6 +6501,25 @@ class ShaderWorkspaceService:
             source_result,
             latest_result,
         )
+        compiler_binding = self._project_compiler_binding(manifest)
+        assembly_disassembly_artifacts = (
+            self._project_assembly_disassembly_artifacts(root, manifest)
+        )
+        if source_result["present"] and source_result["format"] == "hlsl":
+            flow_graph = load_workspace_flow_graph_status(
+                root,
+                workspace_id=str(manifest.get("workspaceId", "") or ""),
+                source_sha256=str(source_result["currentSha256"] or ""),
+                source_revision=int(manifest["revision"]),
+                source_path=_relative(root, source_path.resolve()),
+            )
+        else:
+            flow_graph = {
+                "available": False,
+                "status": "unavailable",
+                "stale": False,
+                "artifactPath": str(root / "ai" / "flow-graph.json"),
+            }
 
         return {
             "schema": "renderdoc-ultra-shader-workspace-status/v1",
@@ -3825,6 +6532,11 @@ class ShaderWorkspaceService:
             "entryPoint": manifest.get("entryPoint"),
             "targetProfile": manifest.get("targetProfile"),
             "routePlan": manifest.get("routePlan"),
+            "routeMemory": manifest.get("routeMemory"),
+            "routeFeatures": manifest.get("routeFeatures"),
+            "compilerBinding": compiler_binding,
+            "assemblyDisassemblyArtifacts": assembly_disassembly_artifacts,
+            "flowGraph": flow_graph,
             "recoveryPlan": manifest.get("recoveryPlan"),
             "revision": manifest["revision"],
             "source": source_result,
@@ -3833,6 +6545,8 @@ class ShaderWorkspaceService:
             "baseline": manifest["baseline"],
             "lastGood": manifest["lastGood"],
             "latestCompiled": latest_result,
+            "lastAbiAttempt": last_abi_attempt,
+            "abiValidationStatus": abi_validation_status,
             "historyCount": len(manifest["history"]),
             "workspaceLocked": (root / ".workspace-operation.lock").exists(),
             "requiresReplayAbiValidation": bool(
@@ -3875,7 +6589,7 @@ class ShaderWorkspaceService:
             return
         if not isinstance(plan, Mapping):
             raise ManifestValidationError("workspace routePlan must be an object")
-        required = {
+        legacy_required = {
             "schema",
             "schemaVersion",
             "routeCatalogPath",
@@ -3889,13 +6603,18 @@ class ShaderWorkspaceService:
             "compile",
             "planSha256",
         }
+        current_required = legacy_required | {"validators"}
+        plan_identity = (plan.get("schema"), plan.get("schemaVersion"))
+        legacy_plan = plan_identity == (
+            LEGACY_ROUTE_PLAN_SCHEMA,
+            LEGACY_ROUTE_PLAN_VERSION,
+        )
+        current_plan = plan_identity == (ROUTE_PLAN_SCHEMA, ROUTE_PLAN_VERSION)
+        if not legacy_plan and not current_plan:
+            raise ManifestValidationError("unsupported workspace route plan")
+        required = legacy_required if legacy_plan else current_required
         if set(plan) != required:
             raise ManifestValidationError("workspace routePlan fields are invalid")
-        if (
-            plan.get("schema") != ROUTE_PLAN_SCHEMA
-            or plan.get("schemaVersion") != ROUTE_PLAN_VERSION
-        ):
-            raise ManifestValidationError("unsupported workspace route plan")
         unsigned = dict(plan)
         declared_plan_hash = unsigned.pop("planSha256")
         if declared_plan_hash != _canonical_sha256(unsigned):
@@ -3940,6 +6659,7 @@ class ShaderWorkspaceService:
             )
         catalog = None
         routes: dict[str, RouteCapability] = {}
+        validators = {}
         if require_process_binding:
             if self.route_config_path is None:
                 raise ManifestValidationError(
@@ -3952,20 +6672,22 @@ class ShaderWorkspaceService:
                 raise ManifestValidationError(
                     "workspace route catalog differs from the process-owned path"
                 )
-            if plan.get("routeCatalogSha256") != _file_sha256(route_path):
-                raise ManifestValidationError(
-                    "workspace route catalog bytes changed after creation"
-                )
             if str(plan.get("toolRegistryPath", "")) != str(self.registry.path):
                 raise ManifestValidationError(
                     "workspace route plan tool registry path mismatch"
                 )
             catalog = self._process_catalog()
-            if plan.get("toolRegistrySha256") != catalog.tool_registry_sha256:
-                raise ManifestValidationError(
-                    "workspace route plan tool registry hash mismatch"
-                )
+            # The two recorded catalog hashes describe the creation snapshot;
+            # unrelated tools/routes may legitimately change after a restart.
+            # Authorize only the selected routes and validators by their exact
+            # capabilities and operation bindings below (including executable,
+            # fixed-file hashes and argv digest). The process catalog remains
+            # immutable and rejects config writes during this service lifetime.
             routes = {route.route_id: route for route in catalog.routes()}
+            validators = {
+                validator.validator_id: validator
+                for validator in catalog.validators()
+            }
 
         decompile_values = plan.get("decompile")
         compile_values = plan.get("compile")
@@ -4008,6 +6730,7 @@ class ShaderWorkspaceService:
                     "inputFormat",
                     "outputFormat",
                     "stages",
+                    "targetApis",
                     "fidelity",
                     "priority",
                     "implementation",
@@ -4028,6 +6751,20 @@ class ShaderWorkspaceService:
                 }
                 route_id = capability.get("routeId")
                 stages = capability.get("stages")
+                target_apis = capability.get("targetApis")
+                capture_api = str(
+                    manifest.get("capture", {}).get("api", "")
+                    if isinstance(manifest.get("capture"), Mapping)
+                    else ""
+                ).strip().casefold().replace(" ", "")
+                if capture_api.startswith("graphicsapi."):
+                    capture_api = capture_api[len("graphicsapi.") :]
+                capture_api = {
+                    "direct3d11": "d3d11",
+                    "direct3d12": "d3d12",
+                    "vk": "vulkan",
+                    "gl": "opengl",
+                }.get(capture_api, capture_api)
                 fixed_hashes = (
                     operation_binding.get("fixedFileHashes")
                     if isinstance(operation_binding, Mapping)
@@ -4063,6 +6800,14 @@ class ShaderWorkspaceService:
                     or not isinstance(stages, list)
                     or not stages
                     or any(not isinstance(item, str) for item in stages)
+                    or not isinstance(target_apis, list)
+                    or not target_apis
+                    or len(set(target_apis)) != len(target_apis)
+                    or any(
+                        item not in {"d3d11", "d3d12", "vulkan", "opengl"}
+                        for item in target_apis
+                    )
+                    or capture_api not in target_apis
                     or (
                         "*" not in stages
                         and str(manifest.get("stage", "")) not in stages
@@ -4135,6 +6880,193 @@ class ShaderWorkspaceService:
             "decompile", original_format, editable_format, allow_empty=True
         )
         validate_path("compile", editable_format, original_format, allow_empty=True)
+
+        validator_values = plan.get("validators", [])
+        if not isinstance(validator_values, list) or len(validator_values) > 1:
+            raise ManifestValidationError(
+                "workspace route validator bindings must contain at most one record"
+            )
+        native_assembly_format = {
+            "spirv": "spirv-asm",
+            "opengl-spirv": "opengl-spirv-asm",
+        }.get(original_format)
+        native_spirv_lane = bool(
+            editable_format == native_assembly_format
+            and (decompile_values or compile_values)
+        )
+        if current_plan and native_spirv_lane and len(validator_values) != 1:
+            raise ManifestValidationError(
+                "current native SPIR-V route plan requires exactly one bound "
+                "spirv-val validator"
+            )
+        if validator_values:
+            if (
+                not native_spirv_lane
+                or (
+                    decompile_values
+                    and (
+                        len(decompile_values) != 1
+                        or decompile_values[0]
+                        .get("capability", {})
+                        .get("fidelity")
+                        != "ir-disassembly"
+                    )
+                )
+                or (
+                    compile_values
+                    and (
+                        len(compile_values) != 1
+                        or compile_values[0]
+                        .get("capability", {})
+                        .get("fidelity")
+                        != "ir-assembly"
+                    )
+                )
+            ):
+                raise ManifestValidationError(
+                    "workspace spirv-val binding requires direct native SPIR-V "
+                    "assembly routes"
+                )
+            binding = validator_values[0]
+            if not isinstance(binding, Mapping) or set(binding) != {
+                "validator",
+                "operation",
+            }:
+                raise ManifestValidationError(
+                    "workspace route validator binding is invalid"
+                )
+            capability = binding.get("validator")
+            operation_binding = binding.get("operation")
+            capability_fields = {
+                "validatorId",
+                "toolId",
+                "operation",
+                "toolConfigDigest",
+                "inputFormat",
+                "stages",
+                "priority",
+                "implementation",
+                "sourceUrl",
+                "license",
+                "caveats",
+            }
+            operation_fields = {
+                "toolId",
+                "operation",
+                "configDigest",
+                "executableSha256",
+                "fixedFileHashes",
+                "placeholders",
+                "timeoutSeconds",
+            }
+            if not isinstance(capability, Mapping) or not isinstance(
+                operation_binding, Mapping
+            ):
+                raise ManifestValidationError(
+                    "workspace route validator binding is invalid"
+                )
+            try:
+                validator_format = normalize_format(
+                    capability.get("inputFormat")
+                )
+                timeout = float(operation_binding.get("timeoutSeconds"))
+            except (ToolchainRoutingError, TypeError, ValueError, OverflowError) as exc:
+                raise ManifestValidationError(
+                    "workspace route validator binding is invalid"
+                ) from exc
+            stages = capability.get("stages")
+            fixed_hashes = operation_binding.get("fixedFileHashes")
+            placeholders = operation_binding.get("placeholders")
+            if (
+                set(capability) != capability_fields
+                or set(operation_binding) != operation_fields
+                or capability.get("operation") != "validate"
+                or validator_format != original_format
+                or capability.get("inputFormat") != validator_format
+                or not isinstance(stages, list)
+                or not stages
+                or any(not isinstance(item, str) for item in stages)
+                or ("*" not in stages and manifest.get("stage") not in stages)
+                or "spirv-val"
+                not in str(capability.get("implementation", "")).casefold()
+                or operation_binding.get("toolId") != capability.get("toolId")
+                or operation_binding.get("operation") != "validate"
+                or operation_binding.get("configDigest")
+                != capability.get("toolConfigDigest")
+                or not isinstance(fixed_hashes, Mapping)
+                or any(
+                    not isinstance(path, str)
+                    or not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                    for path, digest in fixed_hashes.items()
+                )
+                or not isinstance(placeholders, list)
+                or any(not isinstance(item, str) for item in placeholders)
+                or timeout <= 0
+            ):
+                raise ManifestValidationError(
+                    "workspace route validator binding is inconsistent"
+                )
+            for digest in (
+                capability.get("toolConfigDigest"),
+                operation_binding.get("configDigest"),
+                operation_binding.get("executableSha256"),
+            ):
+                if (
+                    not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)
+                ):
+                    raise ManifestValidationError(
+                        "workspace route validator digest is invalid"
+                    )
+            configured_validator = (
+                validators.get(capability.get("validatorId"))
+                if require_process_binding
+                else None
+            )
+            ready_validator_ids: set[str] = set()
+            if require_process_binding and catalog is not None:
+                try:
+                    # Ranking chooses a validator when a workspace is created.
+                    # An existing workspace keeps its exact verified provider
+                    # even if a new, higher-priority provider is installed.
+                    ready_validator_ids = {
+                        item.validator_id
+                        for item in catalog.matching_validators(
+                            original_format,
+                            str(manifest.get("stage", "")),
+                            require_integrity=True,
+                        )
+                    }
+                except ToolchainRoutingError as exc:
+                    raise ManifestValidationError(str(exc)) from exc
+            if (
+                require_process_binding
+                and configured_validator is not None
+                and capability == configured_validator.as_dict()
+                and configured_validator.validator_id not in ready_validator_ids
+            ):
+                raise ManifestValidationError(
+                    "configured spirv-val integrity is unavailable for %s at stage %s"
+                    % (original_format, manifest.get("stage", ""))
+                )
+            if require_process_binding and (
+                configured_validator is None
+                or capability != configured_validator.as_dict()
+                or configured_validator.validator_id
+                not in ready_validator_ids
+                or binding.get("operation")
+                != _operation_binding(
+                    self.registry.operation(
+                        configured_validator.tool_id, "validate"
+                    )
+                )
+            ):
+                raise ManifestValidationError(
+                    "workspace spirv-val capability changed after creation"
+                )
 
     def _validate_recovery_plan(self, manifest: Mapping[str, Any]) -> None:
         """Validate immutable program/AI recovery boundaries for new workspaces."""
@@ -4728,6 +7660,16 @@ class ShaderWorkspaceService:
                     "revision 0 workspace must not contain latestCompiled"
                 )
             return
+        if candidate is None and manifest.get("source", {}).get("origin") == "toolchain-refreshed-source":
+            from .toolchain_refresh import validate_refresh_source
+            receipt = validate_refresh_source(self, root, manifest, manifest["source"])
+            history = manifest.get("history", [])
+            if (
+                receipt.get("revision") == revision and history
+                and history[-1] == {"operation": "toolchain-refresh", "revision": revision,
+                                    "status": "source-preserved-candidates-invalidated", "refresh": receipt}
+            ):
+                return
         if not isinstance(candidate, dict):
             raise ManifestValidationError("latestCompiled is missing")
         try:
@@ -4873,7 +7815,11 @@ class ShaderWorkspaceService:
             or candidate.get("semanticEquivalenceVerified") is not False
         ):
             raise ManifestValidationError("latestCompiled metadata mismatch")
-        if manifest.get("routePlan") is not None:
+        if candidate.get("projectImport") is not None:
+            self._validate_project_import_candidate(
+                root, manifest, candidate, source, compiled
+            )
+        elif manifest.get("routePlan") is not None:
             self._validate_candidate_route_provenance(
                 root, manifest, candidate, source, compiled
             )
@@ -4893,6 +7839,175 @@ class ShaderWorkspaceService:
                 raise ManifestValidationError(
                     "latestCompiled tool does not match workspace compiler binding"
                 )
+
+    def _validate_project_import_candidate(
+        self,
+        root: Path,
+        manifest: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        source: bytes,
+        compiled: bytes,
+    ) -> None:
+        """Revalidate the local, authority-free receipt for an imported binary."""
+
+        receipt = candidate.get("projectImport")
+        candidate_fields = {
+            "revision",
+            "blobPath",
+            "sourcePath",
+            "sourceSha256",
+            "rawSha256",
+            "codeSha256",
+            "byteSize",
+            "kind",
+            "projectImport",
+            "validationScope",
+            "requiresReplayAbiValidation",
+            "replayAbiValidated",
+            "abiCompatible",
+            "semanticEquivalenceVerified",
+            "abiGate",
+        }
+        required_fields = {
+            "schema",
+            "schemaVersion",
+            "projectCandidateSchema",
+            "projectCandidateSchemaVersion",
+            "artifactSha256",
+            "codeSha256",
+            "byteSize",
+            "kind",
+            "sourceSha256",
+            "sourceRevision",
+            "targetProfile",
+            "originValidationEvidenceOnly",
+            "freshCaptureRebindRequired",
+            "freshLiveAbiRevalidationRequired",
+            "applyAuthorization",
+            "oldReplacementIdReused",
+            "oldCaptureAbiAuthorityReused",
+        }
+        compiler_bound_fields = required_fields | {"compilerBindingSha256"}
+        source_hash = hashlib.sha256(source).hexdigest()
+        compiled_hash = hashlib.sha256(compiled).hexdigest()
+        if (
+            set(candidate) != candidate_fields
+            or not isinstance(receipt, Mapping)
+            or set(receipt) not in (required_fields, compiler_bound_fields)
+        ):
+            raise ManifestValidationError(
+                "project candidate import receipt is incomplete"
+            )
+        source_revision = receipt.get("sourceRevision")
+        compiler_binding_sha256 = receipt.get("compilerBindingSha256")
+        compiler_binding_digest_invalid = (
+            compiler_binding_sha256 is not None
+            and (
+                not isinstance(compiler_binding_sha256, str)
+                or len(compiler_binding_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in compiler_binding_sha256
+                )
+            )
+        )
+        if (
+            receipt.get("schema") != PROJECT_CANDIDATE_IMPORT_SCHEMA
+            or receipt.get("schemaVersion") != PROJECT_CANDIDATE_IMPORT_VERSION
+            or receipt.get("projectCandidateSchema")
+            != PROJECT_COMPILED_CANDIDATE_SCHEMA
+            or receipt.get("projectCandidateSchemaVersion")
+            != PROJECT_COMPILED_CANDIDATE_VERSION
+            or receipt.get("artifactSha256") != compiled_hash
+            or receipt.get("artifactSha256") != candidate.get("rawSha256")
+            or receipt.get("codeSha256") != candidate.get("codeSha256")
+            or receipt.get("byteSize") != len(compiled)
+            or receipt.get("byteSize") != candidate.get("byteSize")
+            or receipt.get("kind") != candidate.get("kind")
+            or receipt.get("sourceSha256") != source_hash
+            or receipt.get("sourceSha256") != candidate.get("sourceSha256")
+            or isinstance(source_revision, bool)
+            or not isinstance(source_revision, int)
+            or source_revision <= 0
+            or receipt.get("targetProfile") != manifest.get("targetProfile")
+            or receipt.get("originValidationEvidenceOnly") is not True
+            or receipt.get("freshCaptureRebindRequired") is not True
+            or receipt.get("freshLiveAbiRevalidationRequired") is not True
+            or receipt.get("applyAuthorization") is not False
+            or receipt.get("oldReplacementIdReused") is not False
+            or receipt.get("oldCaptureAbiAuthorityReused") is not False
+            or compiler_binding_digest_invalid
+        ):
+            raise ManifestValidationError(
+                "project candidate import receipt binding mismatch"
+            )
+
+        history = manifest.get("history")
+        if not isinstance(history, list):
+            raise ManifestValidationError(
+                "project candidate import history is unavailable"
+            )
+        matches = []
+        for entry in history:
+            if not isinstance(entry, Mapping):
+                continue
+            archived = entry.get("candidate")
+            allowed_history_fields = {
+                "operation",
+                "revision",
+                "routePlanSha256",
+                "sourceSha256",
+                "outputSha256",
+                "projectImport",
+                "status",
+                "candidate",
+            }
+            if "candidateDxilDisassemblyEvidence" in entry:
+                allowed_history_fields.add("candidateDxilDisassemblyEvidence")
+            if (
+                set(entry) == allowed_history_fields
+                and entry.get("operation") == "project-candidate-import"
+                and entry.get("status") == "succeeded"
+                and entry.get("revision") == candidate.get("revision")
+                and entry.get("routePlanSha256")
+                == (
+                    manifest.get("routePlan", {}).get("planSha256")
+                    if isinstance(manifest.get("routePlan"), Mapping)
+                    else None
+                )
+                and entry.get("sourceSha256") == source_hash
+                and entry.get("outputSha256") == compiled_hash
+                and entry.get("projectImport") == receipt
+                and isinstance(archived, Mapping)
+                and set(archived) == candidate_fields
+                and archived.get("revision") == candidate.get("revision")
+                and archived.get("blobPath") == candidate.get("blobPath")
+                and archived.get("sourcePath") == candidate.get("sourcePath")
+                and archived.get("sourceSha256") == source_hash
+                and archived.get("rawSha256") == compiled_hash
+                and archived.get("codeSha256") == candidate.get("codeSha256")
+                and archived.get("byteSize") == candidate.get("byteSize")
+                and archived.get("kind") == candidate.get("kind")
+                and archived.get("projectImport") == receipt
+                and archived.get("validationScope")
+                == "container-structure-only"
+                and archived.get("requiresReplayAbiValidation") is True
+                and archived.get("replayAbiValidated") is False
+                and archived.get("abiCompatible") is False
+                and archived.get("semanticEquivalenceVerified") is False
+                and archived.get("abiGate")
+                == {
+                    "status": _initial_abi_gate_status(manifest),
+                    "baselineAbiSha256": manifest.get("baseline", {}).get(
+                        "abiSha256"
+                    ),
+                }
+            ):
+                matches.append(entry)
+        if len(matches) != 1:
+            raise ManifestValidationError(
+                "project candidate import history binding mismatch"
+            )
 
     def _validate_candidate_route_provenance(
         self,
@@ -4979,6 +8094,35 @@ class ShaderWorkspaceService:
             raise ManifestValidationError(
                 "latestCompiled final route output does not match candidate bytes"
             )
+        validator_bindings = self._validator_bindings(manifest)
+        if validator_bindings:
+            baseline_path = self._artifact(root, manifest["baseline"]["path"])
+            self._validate_validator_jobs(
+                root,
+                manifest,
+                candidate.get("baselineValidatorJobs"),
+                expected_bytes=baseline_path.read_bytes(),
+                expected_artifact_path=baseline_path,
+                expected_revision=int(candidate["revision"]),
+            )
+            final_output = self._artifact(
+                root, actual_hops[-1].get("outputPath")
+            )
+            self._validate_validator_jobs(
+                root,
+                manifest,
+                candidate.get("validatorJobs"),
+                expected_bytes=compiled,
+                expected_artifact_path=final_output,
+                expected_revision=int(candidate["revision"]),
+            )
+        elif (
+            "baselineValidatorJobs" in candidate
+            or "validatorJobs" in candidate
+        ):
+            raise ManifestValidationError(
+                "latestCompiled has unbound spirv-val provenance"
+            )
 
     def _candidate_reflection_request_from_manifest(
         self,
@@ -5010,13 +8154,27 @@ class ShaderWorkspaceService:
             api_token = "d3d11"
         elif api_token == "direct3d12":
             api_token = "d3d12"
+        elif api_token == "vk":
+            api_token = "vulkan"
+        elif api_token == "gl":
+            api_token = "opengl"
         baseline_kind = str(baseline.get("kind", "")).upper()
         if api_token == "d3d11" and baseline_kind != "DXBC":
             raise AbiValidationError("D3D11 ABI validation accepts native DXBC only")
         if api_token == "d3d12" and baseline_kind not in {"DXBC", "DXIL"}:
             raise AbiValidationError("D3D12 ABI validation accepts native DXBC/DXIL only")
-        if api_token not in {"d3d11", "d3d12"}:
-            raise AbiValidationError("replay ABI validation supports D3D11/D3D12 only")
+        if api_token == "vulkan" and baseline_kind != "SPIRV":
+            raise AbiValidationError(
+                "Vulkan ABI validation accepts native SPIR-V only"
+            )
+        if api_token == "opengl" and baseline_kind != "OPENGL-SPIRV":
+            raise AbiValidationError(
+                "OpenGL ABI validation accepts native OpenGL SPIR-V only"
+            )
+        if api_token not in {"d3d11", "d3d12", "vulkan", "opengl"}:
+            raise AbiValidationError(
+                "replay ABI validation supports D3D11/D3D12/Vulkan/OpenGL only"
+            )
         if api_token == "d3d11" and baseline_abi.dynamic_linkage_interface_count != 0:
             raise AbiValidationError(
                 "D3D11 dynamic-linkage interfaces are not supported by this ABI gate"
@@ -5036,6 +8194,52 @@ class ShaderWorkspaceService:
             target_profile=str(manifest.get("targetProfile", {}).get("profile", "")),
         )
 
+    def _current_rejected_abi_attempt(
+        self, root: Path, manifest: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Rebind diagnostic failure evidence only to its compiled candidate."""
+
+        attempt = manifest.get("lastAbiAttempt")
+        if attempt is None:
+            return None
+        if not isinstance(attempt, Mapping):
+            raise ManifestValidationError("last ABI attempt metadata is invalid")
+        candidate = manifest.get("latestCompiled")
+        if not isinstance(candidate, Mapping) or attempt.get("revision") != candidate.get("revision"):
+            # Older reports remain immutable history, never a verdict on a
+            # newly compiled revision (even when the compiler emits equal bytes).
+            return None
+        gate_keys = {
+            "status", "baselineAbiSha256", "candidateAbiSha256",
+            "requestId", "reportPath", "reportSha256",
+        }
+        if (
+            set(attempt) != gate_keys | {"revision", "sourceSha256", "candidateRawSha256"}
+            or attempt.get("status") != "incompatible"
+            or attempt.get("sourceSha256") != candidate.get("sourceSha256")
+            or attempt.get("candidateRawSha256") != candidate.get("rawSha256")
+        ):
+            raise ManifestValidationError("last ABI attempt candidate binding mismatch")
+        baseline_abi = self._manifest_baseline_abi(manifest)
+        if baseline_abi is None or attempt.get("baselineAbiSha256") != baseline_abi.sha256:
+            raise ManifestValidationError("last ABI attempt baseline binding mismatch")
+        report = self._validate_abi_report(
+            root, manifest, candidate,
+            {key: attempt[key] for key in gate_keys}, baseline_abi,
+            expected_compatible=False,
+        )
+        return {
+            **attempt,
+            "reportPath": str(self._artifact(root, attempt["reportPath"])),
+            "comparison": report["comparison"],
+            # Identity-keyed, human/Agent-readable view of the same report:
+            # what the capture declares, what the candidate declares, and the
+            # HLSL change that closes each gap.  Derived on read, never stored.
+            "explanation": explain_abi_differences(
+                report.get("baselineInterface"), report.get("candidateInterface")
+            ),
+        }
+
     def _validate_abi_report(
         self,
         root: Path,
@@ -5043,7 +8247,9 @@ class ShaderWorkspaceService:
         candidate: Mapping[str, Any],
         gate: Mapping[str, Any],
         baseline_abi: ShaderAbi,
-    ) -> None:
+        *,
+        expected_compatible: bool = True,
+    ) -> dict[str, Any]:
         required_gate_keys = {
             "status",
             "baselineAbiSha256",
@@ -5111,7 +8317,7 @@ class ShaderWorkspaceService:
                 "candidate ABI report evidence is invalid: %s" % exc
             ) from exc
         if (
-            not comparison.compatible
+            comparison.compatible is not expected_compatible
             or reported_baseline != baseline_abi
             or reported_candidate != reflected_abi
             or report.get("comparison") != comparison.to_dict()
@@ -5120,7 +8326,10 @@ class ShaderWorkspaceService:
         ):
             raise ManifestValidationError(
                 "candidate ABI report does not prove exact compatibility"
+                if expected_compatible
+                else "candidate ABI report does not prove its recorded comparison"
             )
+        return report
 
     def _regular_route_artifact(
         self, root: Path, job: Path, relative_value: Any, label: str
@@ -5415,7 +8624,10 @@ class ShaderWorkspaceService:
             else:
                 owner_record = manifest.get("latestCompiled")
                 expected_revision = int(manifest.get("revision"))
-                expected_history_operations = {"compile-route-chain"}
+                expected_history_operations = {
+                    "compile-route-chain",
+                    "project-candidate-import",
+                }
                 history_key = "candidateDxilDisassemblyEvidence"
             if not isinstance(owner_record, Mapping):
                 return None
@@ -5826,6 +9038,7 @@ class ShaderWorkspaceService:
             "workspace_dir": str(root),
             "stage": str(manifest["stage"]),
             "entry_point": str(manifest["entryPoint"]),
+            "captured_entry_point": str(manifest["entryPoint"]),
             "revision": str(revision),
             "capture_id": str(manifest["capture"]["captureId"]),
             "raw_sha256": str(shader["rawSha256"]),

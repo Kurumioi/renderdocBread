@@ -344,7 +344,9 @@ class BridgeCatalogRebindTests(unittest.TestCase):
                 self.pipeline = Pipeline(self)
 
             def GetRootActions(self):
-                return []
+                raise AssertionError(
+                    "explicit representative-EID export must not scan actions"
+                )
 
             def GetAPIProperties(self):
                 return types.SimpleNamespace(

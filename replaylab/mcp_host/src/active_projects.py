@@ -10,7 +10,8 @@ stage capture catalogs and remember an unpacked asset root, but it cannot
 import, seed, or otherwise reuse physical knowledge until a user has supplied
 an exact game/build scope.  AI-produced analysis and Mermaid flowcharts are
 stored as explanatory, content-addressed artifacts and never become physical
-evidence or apply authorization.
+evidence or apply authorization. Structured Shader flow graphs are likewise
+stored only as navigation metadata bound to reviewed source hashes.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
+import sys
 import tempfile
 import threading
 import time
@@ -36,6 +39,11 @@ from .shader_workspace.io import (
     atomic_write_json,
     is_within,
     read_json_object,
+)
+from .shader_workspace.flow_graph import (
+    MAX_FLOW_GRAPH_BYTES,
+    ShaderFlowGraphError,
+    validate_shader_flow_graph,
 )
 from .symbols.matcher import _normalise_catalog
 
@@ -55,8 +63,11 @@ CAPTURE_CONTENT_IDENTITY_ALGORITHM = "sha256-full"
 CAPTURE_PROJECT_MATCH_SCHEMA = "replaylab-capture-project-match/v1"
 PROJECT_REGISTRY_SCHEMA = "replaylab-project-registry/v1"
 PROJECT_REGISTRY_VERSION = 1
+EXCLUSIVE_PROJECT_LOCK_SCHEMA = "replaylab-exclusive-project-lock/v2"
+EXCLUSIVE_PROJECT_LOCK_VERSION = 2
 
 MAX_CONFIG_BYTES = 1024 * 1024
+MAX_EXCLUSIVE_PROJECT_LOCK_BYTES = 4096
 MAX_CATALOG_BYTES = 256 * 1024 * 1024
 MAX_STAGED_SHADER_BYTES = 512 * 1024 * 1024
 MAX_STAGED_CATALOG_REVISIONS = 4096
@@ -71,6 +82,13 @@ CAPTURE_IDENTITY_CHUNK_BYTES = 4 * 1024 * 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 HEX32_RE = re.compile(r"^[0-9a-f]{32}$")
 SAFE_COMPONENT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+WINDOWS_PROCESS_IDENTITY_RE = re.compile(r"^windows-filetime:[0-9a-f]{16}$")
+LINUX_PROCESS_IDENTITY_RE = re.compile(r"^linux-startticks:[1-9][0-9]*$")
+LOCAL_PROCESS_IDENTITY_RE = re.compile(r"^process-local:[0-9a-f]{32}$")
+UTC_TIMESTAMP_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,6})?Z$"
+)
 
 _LAYOUT = {
     "metadataDirectory": ".replaylab",
@@ -97,6 +115,7 @@ _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 _SELECTION_LOCK_DEPTH = threading.local()
 _UNSET = object()
+_PROCESS_LOCAL_LOCK_IDENTITY = uuid.uuid4().hex
 
 
 class ActiveProjectError(ReplayProjectError):
@@ -293,31 +312,417 @@ def _thread_lock(path: Path) -> threading.RLock:
         return _LOCKS.setdefault(key, threading.RLock())
 
 
-@contextmanager
-def _exclusive_lock(path: Path, description: str) -> Iterator[None]:
-    token = uuid.uuid4().hex + "\n"
+def _process_lock_owner_state(pid: int) -> tuple[str, str]:
+    """Return ``(state, creation_identity)`` for one process.
+
+    ``state`` is ``alive``, ``dead`` or ``unknown``.  A missing or unreadable
+    identity never authorises recovery.  Windows FILETIME and Linux start
+    ticks distinguish a live process from a later process that reused its PID.
+    """
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return "unknown", ""
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            process_query_limited_information = 0x1000
+            error_invalid_parameter = 87
+            synchronize = 0x00100000
+            wait_object_0 = 0
+            wait_timeout = 258
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.GetProcessTimes.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+                ctypes.POINTER(wintypes.FILETIME),
+            ]
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            handle = kernel32.OpenProcess(
+                process_query_limited_information | synchronize, False, pid
+            )
+            if not handle:
+                if ctypes.get_last_error() == error_invalid_parameter:
+                    return "dead", ""
+                return "unknown", ""
+            try:
+                wait_result = int(kernel32.WaitForSingleObject(handle, 0))
+                if wait_result == wait_object_0:
+                    return "dead", ""
+                if wait_result != wait_timeout:
+                    return "unknown", ""
+                creation = wintypes.FILETIME()
+                exited = wintypes.FILETIME()
+                kernel = wintypes.FILETIME()
+                user = wintypes.FILETIME()
+                if not kernel32.GetProcessTimes(
+                    handle,
+                    ctypes.byref(creation),
+                    ctypes.byref(exited),
+                    ctypes.byref(kernel),
+                    ctypes.byref(user),
+                ):
+                    return "alive", ""
+                creation_value = (
+                    int(creation.dwHighDateTime) << 32
+                ) | int(creation.dwLowDateTime)
+                return "alive", "windows-filetime:%016x" % creation_value
+            finally:
+                kernel32.CloseHandle(handle)
+        except (AttributeError, ImportError, OSError, ValueError):
+            # Fall through to the conservative process-local/kill probe.
+            pass
+
+    if sys.platform.startswith("linux"):
+        process_stat = Path("/proc") / str(pid) / "stat"
+        try:
+            raw = process_stat.read_text(encoding="ascii", errors="strict")
+        except FileNotFoundError:
+            return "dead", ""
+        except (OSError, UnicodeError):
+            return "unknown", ""
+        # comm is parenthesised and may contain spaces or ')', so split after
+        # the final ')' rather than tokenising the complete record.
+        closing = raw.rfind(")")
+        fields = raw[closing + 2 :].split() if closing >= 0 else []
+        if len(fields) <= 19 or not fields[19].isdigit():
+            return "alive", ""
+        return "alive", "linux-startticks:%s" % fields[19]
+
+    if pid == os.getpid():
+        return "alive", "process-local:%s" % _PROCESS_LOCAL_LOCK_IDENTITY
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "dead", ""
+    except (PermissionError, OSError):
+        return "unknown", ""
+    return "alive", ""
+
+
+def _exclusive_project_lock_payload(token: str) -> bytes:
+    state, identity = _process_lock_owner_state(os.getpid())
+    if state != "alive" or not identity:
+        # This opaque identity is useful for exact release in the current
+        # process.  Another process cannot use it as PID-reuse evidence and
+        # therefore remains fail-closed until the PID is known to be dead.
+        identity = "process-local:%s" % _PROCESS_LOCAL_LOCK_IDENTITY
+    value = {
+        "schema": EXCLUSIVE_PROJECT_LOCK_SCHEMA,
+        "schemaVersion": EXCLUSIVE_PROJECT_LOCK_VERSION,
+        "token": token,
+        "ownerPid": os.getpid(),
+        "processStartIdentity": identity,
+        "acquiredAt": _utc_now(),
+    }
+    return _canonical_bytes(_seal(value, "lockSha256")) + b"\n"
+
+
+def _lock_snapshot(path: Path) -> tuple[bytes, os.stat_result] | None:
+    """Read one stable, bounded, regular lock file without following links."""
+
     descriptor = None
     try:
-        descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.write(descriptor, token.encode("ascii"))
+        if path.is_symlink():
+            return None
+        descriptor = os.open(
+            str(path),
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > MAX_EXCLUSIVE_PROJECT_LOCK_BYTES
+        ):
+            return None
+        chunks = []
+        remaining = MAX_EXCLUSIVE_PROJECT_LOCK_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        entry_after = path.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        _stat_modified_time_ns(before),
+    )
+    handle_after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        _stat_modified_time_ns(after),
+    )
+    entry_after_identity = (
+        entry_after.st_dev,
+        entry_after.st_ino,
+        entry_after.st_size,
+        _stat_modified_time_ns(entry_after),
+    )
+    if (
+        before_identity != handle_after_identity
+        or before_identity != entry_after_identity
+        or not stat.S_ISREG(entry_after.st_mode)
+        or len(raw) != before.st_size
+    ):
+        return None
+    return raw, after
+
+
+def _validated_process_identity_scheme(value: str) -> str:
+    if WINDOWS_PROCESS_IDENTITY_RE.fullmatch(value) is not None:
+        return "windows-filetime"
+    if LINUX_PROCESS_IDENTITY_RE.fullmatch(value) is not None:
+        return "linux-startticks"
+    if LOCAL_PROCESS_IDENTITY_RE.fullmatch(value) is not None:
+        return "process-local"
+    return ""
+
+
+def _json_object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _recoverable_exclusive_project_lock(
+    raw: bytes, unused_metadata: os.stat_result
+) -> bool:
+    """Return true only for a dead owner or reused PID proven by a v2 lock."""
+
+    if re.fullmatch(rb"[0-9a-f]{32}(?:\r?\n)?", raw) is not None:
+        # v1 closed its descriptor before entering the critical section and
+        # persisted no PID/host generation.  Age therefore cannot prove that
+        # its owner is gone: some pinned project operations have no uniform
+        # wall-clock limit.  Preserve the legacy token for explicit recovery.
+        return False
+
+    try:
+        value = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=_json_object_without_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(value, dict) or set(value) != {
+        "schema",
+        "schemaVersion",
+        "token",
+        "ownerPid",
+        "processStartIdentity",
+        "acquiredAt",
+        "lockSha256",
+    }:
+        return False
+    token = value.get("token")
+    owner_pid = value.get("ownerPid")
+    stored_identity = value.get("processStartIdentity")
+    acquired_at = value.get("acquiredAt")
+    lock_sha256 = value.get("lockSha256")
+    stored_scheme = (
+        _validated_process_identity_scheme(stored_identity)
+        if isinstance(stored_identity, str)
+        else ""
+    )
+    if (
+        value.get("schema") != EXCLUSIVE_PROJECT_LOCK_SCHEMA
+        or value.get("schemaVersion") != EXCLUSIVE_PROJECT_LOCK_VERSION
+        or not isinstance(token, str)
+        or HEX32_RE.fullmatch(token) is None
+        or isinstance(owner_pid, bool)
+        or not isinstance(owner_pid, int)
+        or owner_pid <= 0
+        or owner_pid > 0xFFFFFFFF
+        or not stored_scheme
+        or not isinstance(acquired_at, str)
+        or UTC_TIMESTAMP_RE.fullmatch(acquired_at) is None
+        or not isinstance(lock_sha256, str)
+        or SHA256_RE.fullmatch(lock_sha256) is None
+        or lock_sha256 != _document_hash(value, "lockSha256")
+    ):
+        return False
+    try:
+        datetime.fromisoformat(acquired_at[:-1] + "+00:00")
+    except ValueError:
+        return False
+    state, current_identity = _process_lock_owner_state(owner_pid)
+    if state == "dead":
+        return True
+    if (
+        state == "alive"
+        and current_identity
+        and current_identity != stored_identity
+        and _validated_process_identity_scheme(current_identity) == stored_scheme
+        and stored_scheme in {
+            "windows-filetime",
+            "linux-startticks",
+        }
+    ):
+        return True
+    return False
+
+
+def _archive_recoverable_exclusive_project_lock(path: Path) -> Path | None:
+    """Atomically move one verified stale lock aside before reacquisition."""
+
+    snapshot = _lock_snapshot(path)
+    if snapshot is None:
+        return None
+    raw, metadata = snapshot
+    if not _recoverable_exclusive_project_lock(raw, metadata):
+        return None
+    expected_identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        _stat_modified_time_ns(metadata),
+    )
+    archive = path.with_name("%s.recovered-%s" % (path.name, uuid.uuid4().hex))
+    try:
+        final = path.stat(follow_symlinks=False)
+        if (
+            final.st_dev,
+            final.st_ino,
+            final.st_size,
+            _stat_modified_time_ns(final),
+        ) != expected_identity:
+            return None
+        path.replace(archive)
+        moved = archive.stat(follow_symlinks=False)
+        moved_identity = (
+            moved.st_dev,
+            moved.st_ino,
+            moved.st_size,
+            _stat_modified_time_ns(moved),
+        )
+        if moved_identity != expected_identity or archive.read_bytes() != raw:
+            if not path.exists() and not path.is_symlink():
+                archive.replace(path)
+            return None
+        return archive
+    except OSError:
+        return None
+
+
+def _publish_exclusive_project_lock(path: Path, payload: bytes) -> None:
+    """Publish a complete lock payload with one no-replace filesystem step.
+
+    Writing the final O_EXCL path in place leaves an empty/partial lock if the
+    process dies between create and fsync.  A same-directory Windows rename or
+    POSIX hard link makes the already-fsynced inode visible at the authoritative
+    name atomically and fails when another owner already published that name.
+    """
+
+    temporary = path.with_name(".%s.pending-%s" % (path.name, uuid.uuid4().hex))
+    descriptor = None
+    try:
+        descriptor = os.open(
+            str(temporary),
+            os.O_CREAT
+            | os.O_EXCL
+            | os.O_WRONLY
+            | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise OSError("exclusive project lock write made no progress")
+            written += count
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
-    except FileExistsError as exc:
-        raise ActiveProjectError(
-            "%s is locked; a stale lock must be reviewed and removed manually"
-            % description
-        ) from exc
-    try:
-        yield
+        if os.name == "nt":
+            # Windows rename is no-replace: Python raises FileExistsError when
+            # the destination exists. It also works on volumes without links.
+            os.rename(str(temporary), str(path))
+        else:
+            # POSIX rename replaces an existing destination, so use link as
+            # the atomic no-replace publication primitive and drop the staging
+            # name in the finally block.
+            os.link(str(temporary), str(path))
     finally:
         if descriptor is not None:
             os.close(descriptor)
         try:
-            if path.read_text(encoding="ascii") == token:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+@contextmanager
+def _exclusive_lock(path: Path, description: str) -> Iterator[None]:
+    token = uuid.uuid4().hex
+    payload = _exclusive_project_lock_payload(token)
+    recovered = None
+    for attempt in range(2):
+        try:
+            _publish_exclusive_project_lock(path, payload)
+            break
+        except FileExistsError as exc:
+            if attempt or recovered is not None:
+                raise ActiveProjectError(
+                    "%s is locked; its owner could not be proven inactive"
+                    % description
+                ) from exc
+            recovered = _archive_recoverable_exclusive_project_lock(path)
+            if recovered is None:
+                raise ActiveProjectError(
+                    "%s is locked; its owner could not be proven inactive"
+                    % description
+                ) from exc
+        except Exception:
+            snapshot = _lock_snapshot(path)
+            if snapshot is not None and snapshot[0] == payload:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            raise
+    else:  # pragma: no cover - the bounded loop either acquires or raises
+        raise ActiveProjectError("%s lock acquisition failed" % description)
+    try:
+        yield
+    finally:
+        try:
+            snapshot = _lock_snapshot(path)
+            if snapshot is not None and snapshot[0] == payload:
                 path.unlink()
         except OSError:
             pass
+        if recovered is not None:
+            try:
+                recovered.unlink()
+            except OSError:
+                pass
 
 
 def _regular_bytes(path: Path, maximum: int, description: str) -> bytes:
@@ -1113,7 +1518,7 @@ class ActiveReplayProjectService:
             if not HEX32_RE.fullmatch(knowledge_id):
                 raise ActiveProjectError("shared explanatory knowledgeId is invalid")
             kind = _text(record.get("kind"), "explanatory.kind", 64)
-            if kind != "mermaid-flowchart":
+            if kind not in {"mermaid-flowchart", "shader-flow-graph"}:
                 raise ActiveProjectError("unsupported shared explanatory kind")
             digest = _sha256(record.get("artifactSha256"), "artifactSha256")
             identity = (knowledge_id, kind, digest)
@@ -1135,7 +1540,11 @@ class ActiveReplayProjectService:
                 root, artifact_relative, "shared explanatory artifact"
             )
             if hashlib.sha256(
-                _regular_bytes(artifact, MAX_EXPLANATORY_BYTES, "flowchart artifact")
+                _regular_bytes(
+                    artifact,
+                    MAX_EXPLANATORY_BYTES,
+                    "shared explanatory artifact",
+                )
             ).hexdigest() != digest:
                 raise ActiveProjectError("shared explanatory artifact hash mismatch")
         return value
@@ -2448,21 +2857,244 @@ class ActiveReplayProjectService:
             raise ActiveProjectError("workspace flowchart contains NUL characters")
         return raw, hashlib.sha256(raw).hexdigest()
 
-    def _register_flowchart(
+    @staticmethod
+    def _require_soft_published_shader_baseline(
+        gate: Mapping[str, Any], graph: Mapping[str, Any], status: Mapping[str, Any]
+    ) -> None:
+        """Keep a rejected proposal out of the baseline's navigation record.
+
+        The public publication path verifies the Host's sealed organization
+        session before calling this project writer. Here the explanatory
+        artifact must also match the current recovered source/candidate; this
+        projection is never an independent compile or apply authorization.
+        """
+        verdict = gate.get("verdict")
+        binding = gate.get("finalBinding")
+        source = status.get("source")
+        latest = status.get("latestCompiled")
+        capture = status.get("capture")
+        abi = latest.get("abiGate") if isinstance(latest, Mapping) else None
+        binding_fields = {
+            "complete", "sourceSha256", "revision", "candidateRawSha256",
+            "codeSha256", "abiRequestId", "abiReportSha256",
+        }
+        if (
+            gate.get("policyVersion") != "renderdoc-ai-organize-workspace/v1"
+            or gate.get("equivalenceLevel") != "rejected"
+            or gate.get("codeSha256Equal") is not False
+            or gate.get("baselineCodeSha256") == gate.get("organizedCodeSha256")
+            or gate.get("softPublishAllowed") is not True
+            or gate.get("organizedSourcePromoted") is not False
+            or gate.get("baselineCompiledAndAbiValidated") is not True
+            or gate.get("organizedCompiledAndAbiValidated") is not True
+            or gate.get("rawRecoveryCompiledAndAbiValidated") is not True
+            or gate.get("semanticEquivalenceVerified") is not False
+            or graph.get("origin") != "recovered-baseline"
+            or not isinstance(verdict, Mapping)
+            or verdict.get("schema") != "replaylab-review-verdict/v1"
+            or verdict.get("accepted") is not False
+            or verdict.get("softAccepted") is not True
+            or verdict.get("level") != "rejected"
+            or verdict.get("budgetExhausted") is not True
+            or type(verdict.get("round")) is not int
+            or type(verdict.get("maxRounds")) is not int
+            or not 1 <= verdict["round"] == verdict["maxRounds"] <= 10
+            or type(verdict.get("roundsLeft")) is not int
+            or verdict["roundsLeft"] != 0
+            or not isinstance(verdict.get("reasons"), list)
+            or any(not isinstance(reason, Mapping) or reason.get("severity") != "warning"
+                   for reason in verdict["reasons"])
+            or not isinstance(binding, Mapping) or set(binding) != binding_fields
+            or binding.get("complete") is not True
+            or not isinstance(source, Mapping) or not isinstance(latest, Mapping)
+            or not isinstance(capture, Mapping) or not isinstance(abi, Mapping)
+            or gate.get("captureId") != capture.get("captureId")
+            or gate.get("stage") != status.get("stage")
+            or gate.get("entryPoint") != status.get("entryPoint")
+            or graph.get("stage") != status.get("stage")
+            or graph.get("entryPoint") != status.get("entryPoint")
+            or latest.get("replayAbiValidated") is not True
+            or latest.get("abiCompatible") is not True
+            or latest.get("requiresReplayAbiValidation") is not False
+            or latest.get("semanticEquivalenceVerified") is not False
+            or latest.get("validationScope") != "replay-reflection-abi-compatible"
+            or abi.get("status") != "compatible"
+        ):
+            raise ShaderFlowGraphError("soft-published Shader graph lacks a validated baseline")
+        expected = {
+            "sourceSha256": source.get("currentSha256"),
+            "revision": status.get("revision"),
+            "candidateRawSha256": latest.get("rawSha256"),
+            "codeSha256": latest.get("codeSha256"),
+            "abiRequestId": abi.get("requestId"),
+            "abiReportSha256": abi.get("reportSha256"),
+        }
+        if (
+            type(expected["revision"]) is not int or expected["revision"] <= 0
+            or any(not isinstance(value, str) or SHA256_RE.fullmatch(value) is None
+                for key, value in expected.items() if key != "revision")
+            or any(binding.get(key) != value for key, value in expected.items())
+            or latest.get("sourceSha256") != expected["sourceSha256"]
+            or latest.get("revision") != expected["revision"]
+            or gate.get("baselineSourceSha256") != expected["sourceSha256"]
+            or gate.get("finalSourceSha256") != expected["sourceSha256"]
+            or gate.get("baselineCodeSha256") != expected["codeSha256"]
+            or gate.get("finalCodeSha256") != expected["codeSha256"]
+            or gate.get("finalCandidateRawSha256") != expected["candidateRawSha256"]
+            or gate.get("finalAbiRequestId") != expected["abiRequestId"]
+            or gate.get("finalAbiReportSha256") != expected["abiReportSha256"]
+        ):
+            raise ShaderFlowGraphError("soft-published Shader graph differs from its validated baseline")
+
+    @staticmethod
+    def _read_shader_flow_graph(
+        status: Mapping[str, Any],
+    ) -> tuple[bytes, str] | None:
+        if status.get("schema") != "renderdoc-ultra-shader-workspace-status/v1":
+            raise ActiveProjectError(
+                "workspace status must come from strict workspace validation"
+            )
+        workspace_text = str(status.get("workspacePath", "") or "")
+        if not workspace_text:
+            return None
+        raw_workspace = Path(workspace_text).expanduser()
+        if raw_workspace.exists() and raw_workspace.is_symlink():
+            raise ActiveProjectError("workspace path must not be a symlink")
+        workspace = raw_workspace.resolve()
+        if not workspace.is_dir():
+            return None
+        artifact = workspace / "ai" / "flow-graph.json"
+        if not artifact.exists() and not artifact.is_symlink():
+            return None
+        source = status.get("source")
+        if not isinstance(source, Mapping) or source.get("present") is not True:
+            raise ActiveProjectError(
+                "workspace Shader flow graph has no current source binding"
+            )
+        declared_source = Path(str(source.get("path", "") or ""))
+        source_path = declared_source.resolve()
+        if (
+            artifact.is_symlink()
+            or not is_within(workspace, artifact.resolve())
+            or declared_source.is_symlink()
+            or not source_path.is_file()
+            or not is_within(workspace, source_path)
+        ):
+            raise ActiveProjectError(
+                "workspace Shader flow graph escapes its workspace"
+            )
+        try:
+            # Validate and publish one exact byte string.  A second read would
+            # permit an atomic replacement between validation and copying.
+            raw = _regular_bytes(
+                artifact, MAX_FLOW_GRAPH_BYTES,
+                "workspace Shader flow graph"
+            )
+            value = json.loads(raw.decode("utf-8", errors="strict"))
+            if not isinstance(value, Mapping):
+                raise ShaderFlowGraphError(
+                    "workspace Shader flow graph must contain one JSON object"
+                )
+            validate_shader_flow_graph(
+                value,
+                expected_workspace_id=str(status.get("workspaceId", "") or ""),
+                expected_source_sha256=str(
+                    source.get("currentSha256", "") or ""
+                ),
+                expected_source_revision=status.get("revision"),
+                expected_source_path=str(
+                    source_path.relative_to(workspace)
+                ).replace("\\", "/"),
+            )
+            digest = hashlib.sha256(raw).hexdigest()
+
+            projected = status.get("flowGraph")
+            if (
+                not isinstance(projected, Mapping)
+                or projected.get("available") is not True
+                or projected.get("status") != "current"
+                or projected.get("stale") is not False
+                or projected.get("graphId") != value.get("graphId")
+                or projected.get("sourceSha256") != value.get("sourceSha256")
+                or projected.get("sourceRevision") != value.get("sourceRevision")
+                or projected.get("artifactSha256") != digest
+                or Path(str(projected.get("artifactPath", "") or "")).resolve()
+                != artifact.resolve()
+            ):
+                raise ShaderFlowGraphError(
+                    "workspace status does not bind the current Shader flow graph"
+                )
+
+            gate_path = workspace / "ai" / "organize-code-gate.json"
+            if (
+                gate_path.is_symlink()
+                or not gate_path.is_file()
+                or not is_within(workspace, gate_path.resolve())
+            ):
+                raise ShaderFlowGraphError(
+                    "workspace Shader flow graph has no organization gate"
+                )
+            gate_raw = _regular_bytes(
+                gate_path, MAX_EXPLANATORY_BYTES,
+                "workspace Shader organization gate"
+            )
+            gate = json.loads(gate_raw.decode("utf-8", errors="strict"))
+            declared_graph = Path(
+                str(gate.get("flowGraphArtifactPath", "") or "")
+            ) if isinstance(gate, Mapping) else Path()
+            if not declared_graph.is_absolute():
+                declared_graph = workspace / declared_graph
+            if (
+                not isinstance(gate, Mapping)
+                or gate.get("schema") !=
+                "renderdoc-ai-shader-organization-gate/v1"
+                or gate.get("schemaVersion") != 1
+                or gate.get("requestedTransformation") != "organize-only"
+                or gate.get("decision") not in (
+                    "accepted-executable-editable", "soft-accepted-baseline"
+                )
+                or gate.get("safeToStartLiveEdit") is not True
+                or gate.get("replayApplied") is not False
+                or gate.get("workspaceId") != status.get("workspaceId")
+                or gate.get("finalSourceSha256") !=
+                source.get("currentSha256")
+                or gate.get("finalRevision") != status.get("revision")
+                or gate.get("flowGraphId") != value.get("graphId")
+                or gate.get("flowGraphSha256") != digest
+                or declared_graph.resolve() != artifact.resolve()
+            ):
+                raise ShaderFlowGraphError(
+                    "workspace organization gate does not bind the Shader flow graph"
+                )
+            if gate.get("decision") == "soft-accepted-baseline":
+                ActiveReplayProjectService._require_soft_published_shader_baseline(gate, value, status)
+        except (UnicodeError, ValueError, TypeError,
+                ShaderFlowGraphError) as exc:
+            raise ActiveProjectError(
+                "workspace Shader flow graph is invalid: %s" % exc
+            ) from exc
+        return raw, digest
+
+    def _register_explanatory_artifact(
         self,
         root: Path,
         workspace_id: str,
         knowledge_id: str,
         prepared: tuple[bytes, str] | None,
+        *,
+        kind: str,
+        suffix: str,
+        label: str,
     ) -> list[dict[str, Any]]:
         if prepared is None:
             return []
         raw, digest = prepared
-        relative = "%s/%s.flowchart.mmd" % (
+        relative = "%s/%s.%s" % (
             _LAYOUT["sharedExplanatory"],
             digest,
+            suffix,
         )
-        destination = self._managed_path(root, relative, "flowchart artifact")
+        destination = self._managed_path(root, relative, label)
         policy = {
             "explanatoryOnly": True,
             "physicalEvidence": False,
@@ -2478,7 +3110,7 @@ class ActiveReplayProjectService:
                 for record in index["explanatory"]
                 if record["knowledgeId"] == knowledge_id
                 and record["artifactSha256"] == digest
-                and record["kind"] == "mermaid-flowchart"
+                and record["kind"] == kind
             ]
             if existing:
                 return existing
@@ -2487,15 +3119,17 @@ class ActiveReplayProjectService:
             if destination.exists():
                 if hashlib.sha256(
                     _regular_bytes(
-                        destination, MAX_EXPLANATORY_BYTES, "flowchart artifact"
+                        destination, MAX_EXPLANATORY_BYTES, label
                     )
                 ).hexdigest() != digest:
-                    raise ActiveProjectError("content-addressed flowchart changed")
+                    raise ActiveProjectError(
+                        "content-addressed %s changed" % label
+                    )
             else:
                 atomic_write_bytes(destination, raw)
             record = {
                 "knowledgeId": knowledge_id,
-                "kind": "mermaid-flowchart",
+                "kind": kind,
                 "artifactPath": relative,
                 "artifactSha256": digest,
                 "registeredAt": _utc_now(),
@@ -2505,14 +3139,63 @@ class ActiveReplayProjectService:
             self._write_shared_index(root, index)
             return [record]
 
+    def _register_flowchart(
+        self,
+        root: Path,
+        workspace_id: str,
+        knowledge_id: str,
+        prepared: tuple[bytes, str] | None,
+    ) -> list[dict[str, Any]]:
+        return self._register_explanatory_artifact(
+            root,
+            workspace_id,
+            knowledge_id,
+            prepared,
+            kind="mermaid-flowchart",
+            suffix="flowchart.mmd",
+            label="flowchart artifact",
+        )
+
+    def _register_shader_flow_graph(
+        self,
+        root: Path,
+        workspace_id: str,
+        knowledge_id: str,
+        prepared: tuple[bytes, str] | None,
+    ) -> list[dict[str, Any]]:
+        return self._register_explanatory_artifact(
+            root,
+            workspace_id,
+            knowledge_id,
+            prepared,
+            kind="shader-flow-graph",
+            suffix="flow-graph.json",
+            label="Shader flow graph artifact",
+        )
+
     @_pinned_active_operation
-    def register_workspace(self, status: Mapping[str, Any]) -> dict[str, Any]:
+    def register_workspace(
+        self,
+        status: Mapping[str, Any],
+        *,
+        include_explanatory: bool = True,
+        expected_head: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(status, Mapping):
             raise ActiveProjectError("workspace status must be an object")
-        prepared_flowchart = self._read_flowchart(status)
+        # A later user edit deliberately changes the program. Its old analysis
+        # and graph remain available on the original immutable project record,
+        # but cannot describe or block publication of the newly applied source.
+        prepared_flowchart = self._read_flowchart(status) if include_explanatory else None
+        prepared_flow_graph = self._read_shader_flow_graph(status) if include_explanatory else None
         service = self.replay_service()
         try:
-            result = service.register_workspace(status)
+            options: dict[str, Any] = {}
+            if expected_head is not None:
+                options["expected_head"] = expected_head
+            if not include_explanatory:
+                options.update(include_analysis=False, require_current_candidate=True)
+            result = service.register_workspace(status, **options)
         except ReplayProjectError as exc:
             if isinstance(exc, ActiveProjectError):
                 raise
@@ -2530,14 +3213,40 @@ class ActiveReplayProjectService:
             knowledge_id,
             prepared_flowchart,
         )
+        flow_graphs = self._register_shader_flow_graph(
+            root,
+            str(manifest["workspaceId"]),
+            knowledge_id,
+            prepared_flow_graph,
+        )
         value = dict(result)
         value["flowchartArtifacts"] = flowcharts
+        value["flowGraphArtifacts"] = flow_graphs
         value["policy"] = {
             "flowchartExplanatoryOnly": True,
+            "flowGraphNavigationOnly": True,
             "physicalEvidence": False,
             "applyAuthorization": False,
         }
         return value
+
+    @_pinned_active_operation
+    def get_workspace_knowledge(self, knowledge_id: str) -> dict[str, Any]:
+        """Round-trip one published workspace through the strict project reader.
+
+        Registration receipts alone are not publication evidence: an adapter
+        could acknowledge a write without the manifest or content-addressed
+        artifacts being readable.  The underlying project reader revalidates
+        the canonical knowledge identity and every referenced source/binary
+        artifact before this method returns.
+        """
+
+        try:
+            return self.replay_service().get_workspace_knowledge(knowledge_id)
+        except ReplayProjectError as exc:
+            if isinstance(exc, ActiveProjectError):
+                raise
+            raise ActiveProjectError(str(exc)) from exc
 
     @_pinned_active_operation
     def register_alias_table(self, alias_table_path: str | Path) -> dict[str, Any]:
@@ -2576,13 +3285,17 @@ class ActiveReplayProjectService:
                 raise
             raise ActiveProjectError(str(exc)) from exc
 
-    def _flowcharts_by_knowledge(self) -> dict[str, list[dict[str, Any]]]:
+    def _explanatory_by_knowledge(
+        self, kind: str
+    ) -> dict[str, list[dict[str, Any]]]:
         root, manifest = self._active()
         index = self._read_shared_index(root, str(manifest["workspaceId"]))
         result: dict[str, list[dict[str, Any]]] = {}
         for record in index["explanatory"]:
+            if record["kind"] != kind:
+                continue
             artifact = self._managed_path(
-                root, record["artifactPath"], "flowchart artifact"
+                root, record["artifactPath"], "shared explanatory artifact"
             )
             result.setdefault(record["knowledgeId"], []).append(
                 {
@@ -2594,8 +3307,15 @@ class ActiveReplayProjectService:
             )
         return result
 
+    def _flowcharts_by_knowledge(self) -> dict[str, list[dict[str, Any]]]:
+        return self._explanatory_by_knowledge("mermaid-flowchart")
+
+    def _flow_graphs_by_knowledge(self) -> dict[str, list[dict[str, Any]]]:
+        return self._explanatory_by_knowledge("shader-flow-graph")
+
     def _decorate_reuse_plan(self, plan: Mapping[str, Any]) -> dict[str, Any]:
         flowcharts = self._flowcharts_by_knowledge()
+        flow_graphs = self._flow_graphs_by_knowledge()
         matches = []
         preparation_steps = []
         for original in list(plan.get("matches", []) or []):
@@ -2603,11 +3323,23 @@ class ActiveReplayProjectService:
             workspace_candidates = []
             for source in list(match.get("workspaceCandidates", []) or []):
                 candidate = dict(source)
+                binary_eligible = bool(
+                    candidate.get("binaryCandidateEligible") is True
+                    and isinstance(candidate.get("binaryCandidate"), Mapping)
+                )
                 candidate["flowchartCandidates"] = flowcharts.get(
                     str(candidate.get("knowledgeId", "")), []
                 )
+                candidate["flowGraphCandidates"] = flow_graphs.get(
+                    str(candidate.get("knowledgeId", "")), []
+                )
                 candidate["preparationOnly"] = True
-                candidate["compileRequired"] = True
+                candidate["compileRequired"] = not binary_eligible
+                candidate["freshCompileMayBeSkipped"] = binary_eligible
+                candidate["compileFallbackRequiredOnBinaryRejection"] = (
+                    binary_eligible
+                )
+                candidate["freshCaptureRebindRequired"] = True
                 candidate["liveAbiRevalidationRequired"] = True
                 candidate["autoApplyAuthorized"] = False
                 workspace_candidates.append(candidate)
@@ -2620,7 +3352,34 @@ class ActiveReplayProjectService:
                             "matchMode": candidate.get("matchMode"),
                             "automaticPreparationEligible": True,
                             "physicalMutation": False,
-                            "requiresFreshCompileAndLiveAbiValidation": True,
+                            "requiresFreshCompileAndLiveAbiValidation": (
+                                not binary_eligible
+                            ),
+                            "requiresFreshCompile": not binary_eligible,
+                            "requiresFreshLiveAbiValidation": True,
+                        }
+                    )
+                if binary_eligible:
+                    binary = candidate["binaryCandidate"]
+                    preparation_steps.append(
+                        {
+                            "kind": "load-verified-compiled-shader-candidate",
+                            "knowledgeId": candidate.get("knowledgeId"),
+                            "shader": match.get("shader"),
+                            "matchMode": candidate.get("matchMode"),
+                            "artifactPath": binary.get("artifactPath"),
+                            "sha256": binary.get("sha256"),
+                            "sourceSha256": binary.get("sourceSha256"),
+                            "compilerBindingSha256": binary.get(
+                                "compilerBindingSha256"
+                            ),
+                            "automaticPreparationEligible": True,
+                            "physicalMutation": False,
+                            "freshCompileMayBeSkipped": True,
+                            "requiresFreshCaptureRebind": True,
+                            "requiresFreshLiveAbiValidation": True,
+                            "oldReplacementIdReused": False,
+                            "oldCaptureAbiAuthorityReused": False,
                         }
                     )
             match["workspaceCandidates"] = workspace_candidates
@@ -2659,13 +3418,20 @@ class ActiveReplayProjectService:
             "aiProvisionalMayPreparePhysicalCandidate": False,
             "aiProvisionalAutoApply": False,
             "physicalMutationAutoApply": False,
+            "verifiedBinaryCandidateMaySkipCompile": True,
+            "binaryCandidateRequiresFreshCaptureRebind": True,
+            "binaryCandidateRequiresFreshLiveAbiRevalidation": True,
+            "oldCompiledCandidateAbiAuthorityReused": False,
+            "oldReplacementIdReused": False,
             "liveAbiRevalidationRequired": True,
             "liveMaterialLayoutRevalidationRequired": True,
         }
         return decorated
 
     @_pinned_active_operation
-    def future_frame_plan(self, capture_id: str = "") -> dict[str, Any]:
+    def future_frame_plan(
+        self, capture_id: str = "", catalog_sha256: str = ""
+    ) -> dict[str, Any]:
         root, manifest = self._active()
         if manifest["state"] != "bound":
             return {
@@ -2689,7 +3455,7 @@ class ActiveReplayProjectService:
             }
         digest = _sha256(capture_id, "capture_id")
         decorated = self._decorate_reuse_plan(
-            self.replay_service().reuse_plan(digest)
+            self.replay_service().reuse_plan(digest, catalog_sha256)
         )
         return {
             "schema": FUTURE_FRAME_PLAN_SCHEMA,

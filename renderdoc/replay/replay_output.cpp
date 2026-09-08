@@ -25,10 +25,12 @@
 
 #include "common/common.h"
 #include "common/formatting.h"
+#include "common/timing.h"
 #include "maths/formatpacking.h"
 #include "maths/matrix.h"
 #include "strings/string_utils.h"
 #include "replay_controller.h"
+#include "replay_timing.h"
 
 static uint64_t GetHandle(WindowingData window)
 {
@@ -113,6 +115,7 @@ ReplayOutput::ReplayOutput(ReplayController *parent, WindowingData window, Repla
   m_ContextY = -1.0f;
 
   m_Type = type;
+  m_HeadlessWindow = window.system == WindowingSystem::Headless;
 
   if(window.system != WindowingSystem::Unknown)
     m_MainOutput.outputID = m_pDevice->MakeOutputWindow(window, type == ReplayOutputType::Mesh);
@@ -170,6 +173,20 @@ void ReplayOutput::SetTextureDisplay(const TextureDisplay &o)
 {
   CHECK_REPLAY_THREAD();
 
+  if(!m_pController->EnsureMaterializedCurrentEvent(__FUNCTION__))
+    return;
+
+  m_HistorySnapshotActive = false;
+  SetTextureDisplayInternal(o, false);
+}
+
+void ReplayOutput::SetTextureDisplayInternal(const TextureDisplay &o, bool reapRetiredSnapshots)
+{
+  CHECK_REPLAY_THREAD();
+
+  const bool resetTransientEventDisplay = m_TransientTextureEventDisplay;
+  m_TransientTextureEventDisplay = false;
+
   bool wasClearBeforeDraw = (m_RenderData.texDisplay.overlay == DebugOverlay::ClearBeforeDraw ||
                              m_RenderData.texDisplay.overlay == DebugOverlay::ClearBeforePass);
 
@@ -189,6 +206,8 @@ void ReplayOutput::SetTextureDisplay(const TextureDisplay &o)
   }
   if(wasClearBeforeDraw && o.backgroundColor != m_RenderData.texDisplay.backgroundColor)
     m_OverlayDirty = true;
+  if(resetTransientEventDisplay && o.overlay != DebugOverlay::NoOverlay)
+    m_OverlayDirty = true;
   m_CustomDirty = true;
   m_RenderData.texDisplay = o;
   m_MainOutput.dirty = true;
@@ -201,11 +220,20 @@ void ReplayOutput::SetTextureDisplay(const TextureDisplay &o)
       m_TextureDim = {m_pController->m_Textures[t].width, m_pController->m_Textures[t].height};
     }
   }
+
+  // Replacing the persistent display releases this output's pin on its previous event snapshot.
+  // Internal history rendering can temporarily restore the previous display, so that path reaps
+  // only after it has committed its final persistent binding.
+  if(reapRetiredSnapshots)
+    m_pController->ReapRetiredEventTextureSnapshots();
 }
 
 void ReplayOutput::SetMeshDisplay(const MeshDisplay &o)
 {
   CHECK_REPLAY_THREAD();
+
+  if(!m_pController->EnsureMaterializedCurrentEvent(__FUNCTION__))
+    return;
 
   if(o.showWholePass != m_RenderData.meshDisplay.showWholePass)
     m_OverlayDirty = true;
@@ -217,17 +245,29 @@ void ReplayOutput::SetFrameEvent(int eventId)
 {
   CHECK_REPLAY_THREAD();
 
+  SetScrubFrameEvent(eventId);
+  RefreshOverlay();
+}
+
+void ReplayOutput::SetScrubFrameEvent(int eventId)
+{
+  CHECK_REPLAY_THREAD();
+
+  m_TransientTextureEventDisplay = false;
   m_EventID = eventId;
 
-  m_OverlayDirty = (m_RenderData.texDisplay.overlay != DebugOverlay::NoOverlay);
+  // Mesh output must rebuild event-specific post-VS data after the viewer supplies its new
+  // bindings. NaN/clipping are evaluated by the texture display shader and need no replay.
+  const DebugOverlay overlay = m_RenderData.texDisplay.overlay;
+  m_OverlayDirty = m_Type == ReplayOutputType::Mesh ||
+                   (overlay != DebugOverlay::NoOverlay && overlay != DebugOverlay::NaN &&
+                    overlay != DebugOverlay::Clipping);
 
   m_CustomDirty = true;
   m_MainOutput.dirty = true;
 
   for(size_t i = 0; i < m_Thumbnails.size(); i++)
     m_Thumbnails[i].dirty = true;
-
-  RefreshOverlay();
 }
 
 void ReplayOutput::RefreshOverlay()
@@ -235,6 +275,14 @@ void ReplayOutput::RefreshOverlay()
   CHECK_REPLAY_THREAD();
 
   ActionDescription *action = m_pController->GetActionByEID(m_EventID);
+
+  // RenderOverlay and InitPostVSBuffers are driver operations that may perform their own replay in
+  // addition to the explicit ReplayLog calls below. Do not let a later scrub commit assume the
+  // exact state from ScrubFrameEvent survived any overlay preparation.
+  if((m_Type == ReplayOutputType::Texture &&
+      m_RenderData.texDisplay.overlay != DebugOverlay::NoOverlay) ||
+     (m_Type == ReplayOutputType::Mesh && m_OverlayDirty))
+    m_pController->InvalidateScrubReplay();
 
   passEvents = m_pDevice->GetPassEvents(m_EventID);
 
@@ -269,7 +317,7 @@ void ReplayOutput::RefreshOverlay()
         m_pDevice->InitPostVSBuffers(passEvents);
         m_pController->FatalErrorCheck();
 
-        m_pDevice->ReplayLog(m_EventID, eReplay_WithoutDraw);
+        ReplayCapture(m_EventID, eReplay_WithoutDraw);
         m_pController->FatalErrorCheck();
       }
     }
@@ -337,12 +385,17 @@ ResourceId ReplayOutput::GetDebugOverlayTexID()
 {
   CHECK_REPLAY_THREAD();
 
+  if(!m_pController->EnsureMaterializedCurrentEvent(__FUNCTION__))
+    return ResourceId();
+
   if(m_OverlayDirty)
   {
-    m_pDevice->ReplayLog(m_EventID, eReplay_WithoutDraw);
+    ReplayCapture(m_EventID, eReplay_WithoutDraw);
     m_pController->FatalErrorCheck();
+    m_pController->ReapplyAnalysisEventOverrides(m_EventID);
     RefreshOverlay();
-    m_pDevice->ReplayLog(m_EventID, eReplay_OnlyDraw);
+    m_pController->ReapplyAnalysisEventOverrides(m_EventID);
+    ReplayCapture(m_EventID, eReplay_OnlyDraw);
     m_pController->FatalErrorCheck();
   }
 
@@ -384,6 +437,13 @@ bytebuf ReplayOutput::DrawThumbnail(int32_t width, int32_t height, ResourceId te
                                     const Subresource &sub, CompType typeCast)
 {
   bytebuf ret;
+
+  ResourceId displayTextureId = textureId;
+  Subresource displaySubresource = sub;
+  CompType displayTypeCast = typeCast;
+
+  if(!m_pController->EnsureMaterializedCurrentEvent(__FUNCTION__))
+    return ret;
 
   width = RDCMAX(width, 1);
   height = RDCMAX(height, 1);
@@ -467,11 +527,11 @@ bytebuf ReplayOutput::DrawThumbnail(int32_t width, int32_t height, ResourceId te
     disp.hdrMultiplier = -1.0f;
     disp.linearDisplayAsGamma = true;
     disp.flipY = false;
-    disp.subresource = sub;
+    disp.subresource = displaySubresource;
     disp.subresource.sample = 0;
     disp.customShaderId = ResourceId();
-    disp.resourceId = textureId;
-    disp.typeCast = typeCast;
+    disp.resourceId = displayTextureId;
+    disp.typeCast = displayTypeCast;
     disp.scale = -1.0f;
     disp.rangeMin = 0.0f;
     disp.rangeMax = 1.0f;
@@ -480,7 +540,7 @@ bytebuf ReplayOutput::DrawThumbnail(int32_t width, int32_t height, ResourceId te
     disp.rawOutput = false;
     disp.overlay = DebugOverlay::NoOverlay;
 
-    if(typeCast == CompType::SNorm)
+    if(displayTypeCast == CompType::SNorm)
       disp.rangeMin = -1.0f;
 
     if(depthMode)
@@ -559,6 +619,9 @@ rdcpair<uint32_t, uint32_t> ReplayOutput::PickVertex(uint32_t x, uint32_t y)
   CHECK_REPLAY_THREAD();
 
   RENDERDOC_PROFILEFUNCTION();
+
+  if(!m_pController->EnsureMaterializedCurrentEvent(__FUNCTION__))
+    return {~0U, ~0U};
 
   ActionDescription *action = m_pController->GetActionByEID(m_EventID);
 
@@ -792,6 +855,43 @@ void ReplayOutput::Display()
 
   RENDERDOC_PROFILEFUNCTION();
 
+  if(!m_pController->EnsureMaterializedCurrentEvent(__FUNCTION__))
+    return;
+
+  if(m_HistorySnapshotActive)
+  {
+    const uint64_t generation = m_pController->GetShaderReplacementGeneration(0);
+    if(generation != m_HistorySnapshotGeneration)
+    {
+      TextureDisplay refreshed;
+      if(m_pController->ResolveEventTextureSnapshot(m_HistorySnapshotEventID,
+                                                    m_HistorySnapshotSource, refreshed))
+      {
+        SetTextureDisplayInternal(refreshed, true);
+        const TextureDescription refreshedDesc = m_pDevice->GetTexture(refreshed.resourceId);
+        m_TextureDim = {refreshedDesc.width, refreshedDesc.height};
+        // NaN and clipping are evaluated by the texture display shader. They are included in the
+        // presentation-only snapshot path and must not fall through to event-derived overlay
+        // replay just because the refreshed ResourceId differs from the previous snapshot.
+        m_OverlayDirty = false;
+        m_HistorySnapshotGeneration = generation;
+      }
+      else
+      {
+        // Preserve correctness for an unsupported topology. DisplayTextureAtEvent owns the
+        // analysis replay/restore fallback and clears persistent snapshot mode if it cannot cache.
+        // Drop the old snapshot binding first: Resolve may have retired it, and saving/restoring
+        // that stale ResourceId in the slow path would keep stale pixels alive after the edit.
+        const uint32_t historyEvent = m_HistorySnapshotEventID;
+        const TextureDisplay historySource = m_HistorySnapshotSource;
+        m_HistorySnapshotActive = false;
+        SetTextureDisplayInternal(historySource, true);
+        DisplayTextureAtEvent(historyEvent, historySource);
+        return;
+      }
+    }
+  }
+
   if(m_pDevice->CheckResizeOutputWindow(m_MainOutput.outputID))
   {
     m_pDevice->GetOutputWindowDimensions(m_MainOutput.outputID, m_Width, m_Height);
@@ -911,6 +1011,573 @@ void ReplayOutput::Display()
   }
 }
 
+void ReplayOutput::ReplayCapture(uint32_t eventId, ReplayLogType type)
+{
+  // CommitScrubFrameEvent may skip ReplayLog only while the capture state left by ScrubFrameEvent
+  // is still live. Overlay/custom/mesh preparation can replace that state between presentation and
+  // commit, even when it happens to replay the same EID.
+  m_pController->InvalidateScrubReplay();
+  m_pController->m_MaterializedEventValid = false;
+  const bool previousCheckpointBypass = m_pDevice->m_ReplayCheckpointBypass;
+  const bool previousReference = m_pDevice->m_ReplayCheckpointNaturalReference;
+  m_pDevice->m_ReplayCheckpointBypass = true;
+  m_pDevice->m_ReplayCheckpointNaturalReference = false;
+  m_pDevice->ReplayLog(eventId, type);
+  m_pDevice->m_ReplayCheckpointBypass = previousCheckpointBypass;
+  m_pDevice->m_ReplayCheckpointNaturalReference = previousReference;
+  if(m_pController->m_FatalError == ResultCode::Succeeded &&
+     (type == eReplay_Full || type == eReplay_OnlyDraw))
+  {
+    m_pController->m_MaterializedEventID = eventId;
+    m_pController->m_MaterializedEventValid = true;
+  }
+}
+
+void ReplayController::RetireEventTextureSnapshots(const rdcarray<ResourceId> &snapshots)
+{
+  CHECK_REPLAY_THREAD();
+
+  for(ResourceId snapshot : snapshots)
+    if(snapshot != ResourceId())
+      m_RetiredEventTextureSnapshots.insert(snapshot);
+}
+
+void ReplayController::ReapRetiredEventTextureSnapshots()
+{
+  CHECK_REPLAY_THREAD();
+
+  if(m_pDevice == NULL || m_RetiredEventTextureSnapshots.empty())
+    return;
+
+  std::set<ResourceId> pinned;
+
+  // A history snapshot remains the persistent TextureDisplay for repaint, resize and pixel
+  // context work. Never destroy it while any ReplayOutput still holds that binding.
+  for(const ReplayOutput *output : m_Outputs)
+  {
+    if(output != NULL && output->m_Type == ReplayOutputType::Texture)
+      pinned.insert(output->m_RenderData.texDisplay.resourceId);
+  }
+
+  // Retired resources should no longer be cache values, but keep this guard so a duplicate return
+  // from a backend cannot turn a bookkeeping mistake into a live-resource destruction.
+  for(const EventTextureSnapshot &entry : m_EventTextureSnapshots)
+    if(entry.snapshot != ResourceId())
+      pinned.insert(entry.snapshot);
+
+  rdcarray<ResourceId> resourcesToFree;
+  for(auto it = m_RetiredEventTextureSnapshots.begin();
+      it != m_RetiredEventTextureSnapshots.end();)
+  {
+    if(pinned.find(*it) != pinned.end())
+    {
+      ++it;
+      continue;
+    }
+
+    resourcesToFree.push_back(*it);
+    it = m_RetiredEventTextureSnapshots.erase(it);
+  }
+
+  if(!resourcesToFree.empty())
+    m_pDevice->FreeTextureSnapshots(resourcesToFree);
+}
+
+void ReplayController::TrimEventTextureSnapshots(ResourceId keepSnapshot)
+{
+  CHECK_REPLAY_THREAD();
+
+  // Bound output images must remain in the lookup cache as well as alive. Removing a still-bound
+  // entry makes the next visit rebuild an identical image and causes cache churn.
+  std::set<ResourceId> pinned;
+  pinned.insert(keepSnapshot);
+  for(const ReplayOutput *output : m_Outputs)
+  {
+    if(output != NULL && output->m_Type == ReplayOutputType::Texture)
+      pinned.insert(output->m_RenderData.texDisplay.resourceId);
+  }
+
+  constexpr uint64_t SnapshotHighBytes = 512ULL * 1024ULL * 1024ULL;
+  constexpr uint64_t SnapshotLowBytes = 384ULL * 1024ULL * 1024ULL;
+  constexpr size_t SnapshotEntryHighCount = 96;
+  constexpr size_t SnapshotEntryLowCount = 72;
+
+  rdcarray<ResourceId> snapshotsToRetire;
+  if(m_EventTextureSnapshotBytes > SnapshotHighBytes ||
+     m_EventTextureSnapshots.size() > SnapshotEntryHighCount)
+  {
+    while(m_EventTextureSnapshotBytes > SnapshotLowBytes ||
+          m_EventTextureSnapshots.size() > SnapshotEntryLowCount)
+    {
+      size_t oldestIndex = size_t(-1);
+      uint64_t oldestUse = ~0ULL;
+      for(size_t i = 0; i < m_EventTextureSnapshots.size(); i++)
+      {
+        const EventTextureSnapshot &entry = m_EventTextureSnapshots[i];
+        if(pinned.find(entry.snapshot) != pinned.end())
+          continue;
+        if(entry.lastUseSerial < oldestUse)
+        {
+          oldestUse = entry.lastUseSerial;
+          oldestIndex = i;
+        }
+      }
+
+      if(oldestIndex == size_t(-1))
+        break;
+
+      const EventTextureSnapshot &oldest = m_EventTextureSnapshots[oldestIndex];
+      if(oldest.snapshot != ResourceId())
+        snapshotsToRetire.push_back(oldest.snapshot);
+      if(oldest.allocationBytes >= m_EventTextureSnapshotBytes)
+        m_EventTextureSnapshotBytes = 0;
+      else
+        m_EventTextureSnapshotBytes -= oldest.allocationBytes;
+      m_EventTextureSnapshots.erase(oldestIndex);
+    }
+  }
+
+  // Batch retired history resource destruction at a replay boundary. Presentation-only changes
+  // must not introduce a queue drain merely to trim the history cache.
+  RetireEventTextureSnapshots(snapshotsToRetire);
+}
+
+bool ReplayController::ResolveEventTextureSnapshot(uint32_t eventId, const TextureDisplay &source,
+                                                   TextureDisplay &snapshotDisplay)
+{
+  CHECK_REPLAY_THREAD();
+
+  if(source.resourceId == ResourceId())
+    return false;
+
+  const TextureDescription sourceDesc = m_pDevice->GetTexture(source.resourceId);
+  if(sourceDesc.resourceId == ResourceId() || sourceDesc.width == 0 || sourceDesc.height == 0)
+    return false;
+
+  CompType sourceTypeCast = source.typeCast;
+  if(sourceTypeCast == CompType::Typeless)
+    sourceTypeCast = sourceDesc.format.compType;
+  if(sourceTypeCast == CompType::Typeless || sourceTypeCast == CompType::Depth)
+    sourceTypeCast = CompType::Float;
+
+  EventTextureSnapshot *cached = NULL;
+  for(EventTextureSnapshot &entry : m_EventTextureSnapshots)
+  {
+    if(entry.eventId == eventId && entry.source == source.resourceId &&
+       entry.sourceSubresource == source.subresource && entry.sourceTypeCast == sourceTypeCast)
+    {
+      cached = &entry;
+      break;
+    }
+  }
+
+  // A replacement at an earlier event can affect this event's output even if the replacement was
+  // installed through an event-scoped workbench operation. Conservatively use the global mutation
+  // serial until replacement dependency ranges are tracked explicitly.
+  const uint64_t outputMutationGeneration = GetShaderReplacementGeneration(0);
+  if(cached == NULL)
+  {
+    EventTextureSnapshot entry;
+    entry.eventId = eventId;
+    entry.source = source.resourceId;
+    entry.sourceSubresource = source.subresource;
+    entry.sourceTypeCast = sourceTypeCast;
+    m_EventTextureSnapshots.push_back(entry);
+    cached = &m_EventTextureSnapshots.back();
+  }
+
+  cached->lastUseSerial = ++m_EventTextureSnapshotUseSerial;
+
+  if(cached->unavailable && cached->outputMutationGeneration == outputMutationGeneration)
+    return false;
+
+  rdcarray<ResourceId> snapshotsToRetire;
+  auto removeTrackedBytes = [this](uint64_t bytes) {
+    if(bytes >= m_EventTextureSnapshotBytes)
+      m_EventTextureSnapshotBytes = 0;
+    else
+      m_EventTextureSnapshotBytes -= bytes;
+  };
+
+  if(cached->snapshot == ResourceId() ||
+     cached->outputMutationGeneration != outputMutationGeneration)
+  {
+    GetTextureDataParams params;
+    params.standardLayout = true;
+    params.typeCast = sourceTypeCast;
+    params.resolve = source.subresource.sample == TextureDisplay::ResolveSamples;
+    params.remap = RemapTexture::RGBA32;
+
+    // A snapshot of the already materialized current event only reads its captured resources.
+    // Native copies restore source barriers/state and write a replay-owned destination. Keep the
+    // normal replay/restore path for analysis state or presentation requiring event-derived work.
+    const bool currentState =
+        eventId == m_EventID && IsCurrentEventMaterialized() && !m_AnalysisEventOverridesActive &&
+        source.customShaderId == ResourceId() && !source.decodeYUV &&
+        (source.overlay == DebugOverlay::NoOverlay || source.overlay == DebugOverlay::NaN ||
+         source.overlay == DebugOverlay::Clipping);
+    if(!currentState)
+      ReplayFrameEventForAnalysis(eventId);
+
+    // A fatal replay error swaps the driver and clears the snapshot cache. In that case cached is
+    // no longer valid, and every resource created by the old driver is released by its Shutdown.
+    if(m_FatalError != ResultCode::Succeeded)
+      return false;
+
+    // Prefer a native, replay-owned GPU image. It survives subsequent frame replays, so zoom,
+    // channel/range and gamma changes can be drawn straight from this resource without staging the
+    // texture through CPU memory. Drivers return null for topology/format cases they cannot copy
+    // safely, preserving the portable readback fallback below.
+    const ResourceId staleNativeSnapshot =
+        cached->nativeGPUSnapshot ? cached->snapshot : ResourceId();
+    const uint64_t staleNativeBytes = cached->nativeGPUSnapshot ? cached->allocationBytes : 0;
+
+    Subresource nativeSnapshotSubresource;
+    ResourceId nativeSnapshot;
+    // Once a driver has fallen back to a CPU-upload proxy for this exact topology, keep updating
+    // that proxy after edits instead of orphaning it by retrying the same unsupported native copy.
+    if(cached->snapshot == ResourceId() || cached->nativeGPUSnapshot)
+      nativeSnapshot = m_pDevice->CreateTextureSnapshot(
+          source.resourceId, source.subresource, sourceTypeCast, nativeSnapshotSubresource);
+
+    // Snapshot creation can report a deferred device failure. FatalErrorCheck swaps the driver and
+    // clears m_EventTextureSnapshots, so do not touch cached afterwards in that case.
+    if(FatalErrorCheck())
+      return false;
+
+    if(nativeSnapshot != ResourceId())
+    {
+      if(!currentState)
+        RestoreFrameEventAfterAnalysis();
+
+      // Restore can itself detect a fatal error and clear m_EventTextureSnapshots.
+      if(m_FatalError != ResultCode::Succeeded)
+        return false;
+
+      if(staleNativeSnapshot != ResourceId())
+      {
+        removeTrackedBytes(staleNativeBytes);
+        if(staleNativeSnapshot != nativeSnapshot)
+          snapshotsToRetire.push_back(staleNativeSnapshot);
+      }
+
+      const TextureDescription nativeDesc = m_pDevice->GetTexture(nativeSnapshot);
+
+      cached->snapshot = nativeSnapshot;
+      cached->snapshotSubresource = nativeSnapshotSubresource;
+      cached->snapshotTypeCast = sourceTypeCast;
+      cached->outputMutationGeneration = outputMutationGeneration;
+      cached->allocationBytes = nativeDesc.byteSize;
+      cached->nativeGPUSnapshot = true;
+      cached->unavailable = false;
+      m_EventTextureSnapshotBytes += cached->allocationBytes;
+    }
+    else
+    {
+      // Vulkan, remote replay, image viewers, and dummy drivers have no replay-owned upload proxy.
+      // If their native copy rejects an exotic texture topology, fail closed here. Reading the
+      // whole texture to CPU only to discover that it cannot be uploaded again adds a large stall
+      // and cannot produce a persistent snapshot.
+      if(!m_pDevice->SupportsProxyTextureSnapshots())
+      {
+        if(!currentState)
+          RestoreFrameEventAfterAnalysis();
+
+        if(m_FatalError != ResultCode::Succeeded)
+          return false;
+
+        if(staleNativeSnapshot != ResourceId())
+        {
+          snapshotsToRetire.push_back(staleNativeSnapshot);
+          removeTrackedBytes(staleNativeBytes);
+          cached->snapshot = ResourceId();
+          cached->snapshotSubresource = Subresource();
+          cached->snapshotTypeCast = CompType::Typeless;
+          cached->allocationBytes = 0;
+          cached->nativeGPUSnapshot = false;
+        }
+
+        cached->unavailable = true;
+        cached->outputMutationGeneration = outputMutationGeneration;
+        RetireEventTextureSnapshots(snapshotsToRetire);
+        return false;
+      }
+
+      bytebuf pixels;
+      m_pDevice->GetTextureData(source.resourceId, source.subresource, params, pixels);
+
+      // As with snapshot creation, check before restoring or dereferencing the cache entry.
+      if(FatalErrorCheck())
+        return false;
+
+      if(!currentState)
+        RestoreFrameEventAfterAnalysis();
+
+      // As above, cached belongs to m_EventTextureSnapshots and is invalid after a fatal swap.
+      if(m_FatalError != ResultCode::Succeeded)
+        return false;
+
+      // A native snapshot is not a CPU-upload proxy. Retire the old GPU image before entering the
+      // portable fallback so SetProxyTextureData is never called on a driver-owned native image.
+      if(staleNativeSnapshot != ResourceId())
+      {
+        snapshotsToRetire.push_back(staleNativeSnapshot);
+        removeTrackedBytes(staleNativeBytes);
+        cached->snapshot = ResourceId();
+        cached->snapshotSubresource = Subresource();
+        cached->snapshotTypeCast = CompType::Typeless;
+        cached->allocationBytes = 0;
+        cached->nativeGPUSnapshot = false;
+      }
+
+      const uint32_t mip = RDCMIN(source.subresource.mip, 31U);
+      const uint32_t width = RDCMAX(1U, sourceDesc.width >> mip);
+      const uint32_t height = RDCMAX(1U, sourceDesc.height >> mip);
+      const uint64_t expectedSize = uint64_t(width) * uint64_t(height) * 4ULL * sizeof(uint32_t);
+      if(pixels.size() != expectedSize)
+      {
+        // A generation change may be rebuilding an existing CPU proxy. It still contains pixels
+        // from the previous generation, so remove it from the active entry and retire it instead
+        // of leaving stale output reachable through an unavailable cache entry.
+        if(cached->snapshot != ResourceId())
+        {
+          snapshotsToRetire.push_back(cached->snapshot);
+          removeTrackedBytes(cached->allocationBytes);
+          cached->snapshot = ResourceId();
+          cached->snapshotSubresource = Subresource();
+          cached->snapshotTypeCast = CompType::Typeless;
+          cached->allocationBytes = 0;
+          cached->nativeGPUSnapshot = false;
+        }
+
+        cached->unavailable = true;
+        cached->outputMutationGeneration = outputMutationGeneration;
+        RetireEventTextureSnapshots(snapshotsToRetire);
+        return false;
+      }
+
+      if(cached->snapshot == ResourceId())
+      {
+        TextureDescription snapshotDesc = {};
+        snapshotDesc.format.type = ResourceFormatType::Regular;
+        snapshotDesc.format.compCount = 4;
+        snapshotDesc.format.compByteWidth = 4;
+        snapshotDesc.format.compType = BaseRemapType(RemapTexture::RGBA32, sourceTypeCast);
+        if(snapshotDesc.format.compType == CompType::Typeless ||
+           snapshotDesc.format.compType == CompType::Depth)
+          snapshotDesc.format.compType = CompType::Float;
+        snapshotDesc.dimension = 2;
+        snapshotDesc.type = TextureType::Texture2D;
+        snapshotDesc.width = width;
+        snapshotDesc.height = height;
+        snapshotDesc.depth = 1;
+        snapshotDesc.cubemap = false;
+        snapshotDesc.mips = 1;
+        snapshotDesc.arraysize = 1;
+        snapshotDesc.creationFlags = TextureCategory::ShaderRead;
+        snapshotDesc.msQual = 0;
+        snapshotDesc.msSamp = 1;
+        snapshotDesc.byteSize = expectedSize;
+
+        const ResourceId proxySnapshot = m_pDevice->CreateProxyTextureSnapshot(snapshotDesc);
+
+        // FatalErrorCheck clears the entry containing cached. Assign only after the driver remains
+        // valid so an old-driver ResourceId can never enter the new driver's cache.
+        if(FatalErrorCheck())
+          return false;
+
+        cached->snapshot = proxySnapshot;
+        cached->snapshotSubresource = Subresource();
+        cached->snapshotTypeCast = snapshotDesc.format.compType;
+        if(cached->snapshot != ResourceId())
+        {
+          cached->allocationBytes = expectedSize;
+          m_EventTextureSnapshotBytes += cached->allocationBytes;
+        }
+        cached->nativeGPUSnapshot = false;
+      }
+
+      if(cached->snapshot == ResourceId())
+      {
+        cached->unavailable = true;
+        cached->outputMutationGeneration = outputMutationGeneration;
+        RetireEventTextureSnapshots(snapshotsToRetire);
+        return false;
+      }
+
+      m_pDevice->SetProxyTextureData(cached->snapshot, Subresource(), pixels.data(), pixels.size());
+
+      // Upload may surface device removal. The fatal path owns and destroys the proxy with the old
+      // driver, and clears cached, so stop before publishing generation metadata.
+      if(FatalErrorCheck())
+        return false;
+
+      cached->outputMutationGeneration = outputMutationGeneration;
+      cached->nativeGPUSnapshot = false;
+      cached->unavailable = false;
+    }
+  }
+
+  snapshotDisplay = source;
+  snapshotDisplay.resourceId = cached->snapshot;
+  snapshotDisplay.subresource = cached->snapshotSubresource;
+  snapshotDisplay.typeCast = cached->snapshotTypeCast;
+  snapshotDisplay.decodeYUV = false;
+  // RGBA32 remapping samples an sRGB source through an sRGB view, so the cached float pixels are
+  // linear. Preserve the original presentation by applying the display gamma curve to the float
+  // proxy even though the source TextureDisplay normally leaves this disabled for an sRGB format.
+  if(!cached->nativeGPUSnapshot &&
+     (sourceDesc.format.SRGBCorrected() || sourceTypeCast == CompType::UNormSRGB))
+    snapshotDisplay.linearDisplayAsGamma = true;
+
+  RetireEventTextureSnapshots(snapshotsToRetire);
+  TrimEventTextureSnapshots(cached->snapshot);
+
+  return true;
+}
+
+void ReplayOutput::DisplayTextureAtEvent(uint32_t eventId, const TextureDisplay &config)
+{
+  CHECK_REPLAY_THREAD();
+
+  if(m_Type != ReplayOutputType::Texture)
+    return;
+
+  RENDERDOC_PROFILEFUNCTION();
+
+  const bool timing = m_pController->EIDTimingEnabled();
+  const double timerFrequency = timing ? Timing::GetTickFrequency() : 1.0;
+  const uint64_t startTick = timing ? Timing::GetTick() : 0;
+  const auto elapsedMS = [&]() {
+    return timing ? double(Timing::GetTick() - startTick) / timerFrequency : 0.0;
+  };
+
+  auto remapIt = m_pController->m_EventRemap.find(eventId);
+  if(remapIt != m_pController->m_EventRemap.end())
+    eventId = remapIt->second;
+
+  // Event-derived overlays and custom display shaders require the original event state. The
+  // ordinary channel/range/gamma/zoom path in a native window is rendered from a persistent
+  // replay-owned snapshot instead, so presentation-only changes never replay the frame after the
+  // first capture. Headless thumbnail callers consume their small output with ReadbackOutputTexture
+  // immediately; retain only that result instead of allocating a full-size source snapshot.
+  const bool presentationOnly =
+      config.customShaderId == ResourceId() && !config.decodeYUV &&
+      (config.overlay == DebugOverlay::NoOverlay || config.overlay == DebugOverlay::NaN ||
+       config.overlay == DebugOverlay::Clipping);
+  const bool currentState =
+      presentationOnly && eventId == m_pController->m_EventID &&
+      m_pController->IsCurrentEventMaterialized() && !m_pController->m_AnalysisEventOverridesActive;
+  TextureDisplay snapshotDisplay;
+  const bool haveSnapshot =
+      !m_HeadlessWindow && presentationOnly &&
+      m_pController->ResolveEventTextureSnapshot(eventId, config, snapshotDisplay);
+  const double resolveMS = elapsedMS();
+
+  // Publish a new persistent identity only after the snapshot path succeeds below. A slow
+  // overlay/custom/YUV fallback must not leave a stale historical source attached to Display().
+  m_HistorySnapshotActive = false;
+
+  const uint32_t savedEventID = m_EventID;
+  const TextureDisplay savedDisplay = m_RenderData.texDisplay;
+  const bool savedCustomDirty = m_CustomDirty;
+  const bool savedOverlayDirty = m_OverlayDirty;
+  const bool savedForceOverlayRefresh = m_ForceOverlayRefresh;
+  const ResourceId savedOverlayResource = m_OverlayResourceId;
+  const ResourceId savedCustomResource = m_CustomShaderResourceId;
+  const rdcpair<uint32_t, uint32_t> savedTextureDim = m_TextureDim;
+  const rdcarray<uint32_t> savedPassEvents = passEvents;
+
+  const bool replayForDisplay = !haveSnapshot && !(m_HeadlessWindow && currentState);
+  if(replayForDisplay)
+    m_pController->ReplayFrameEventForAnalysis(eventId);
+  const double replayEndMS = elapsedMS();
+
+  m_EventID = eventId;
+  SetTextureDisplayInternal(haveSnapshot ? snapshotDisplay : config, false);
+  // NaN/clipping are evaluated by the display shader and never need capture replay.
+  m_OverlayDirty = !haveSnapshot && config.overlay != DebugOverlay::NoOverlay &&
+                   config.overlay != DebugOverlay::NaN && config.overlay != DebugOverlay::Clipping;
+  m_CustomDirty = true;
+  m_ForceOverlayRefresh = false;
+
+  if(haveSnapshot)
+  {
+    const TextureDescription snapshotDesc = m_pDevice->GetTexture(snapshotDisplay.resourceId);
+    m_TextureDim = {snapshotDesc.width, snapshotDesc.height};
+  }
+
+  if(m_pDevice->CheckResizeOutputWindow(m_MainOutput.outputID))
+    m_pDevice->GetOutputWindowDimensions(m_MainOutput.outputID, m_Width, m_Height);
+  if(m_pDevice->CheckResizeOutputWindow(m_PixelContext.outputID))
+    m_MainOutput.dirty = true;
+
+  m_pController->FatalErrorCheck();
+
+  DisplayTex();
+  m_pDevice->FlipOutputWindow(m_MainOutput.outputID);
+  m_pController->FatalErrorCheck();
+  DisplayContext();
+  const double renderEndMS = elapsedMS();
+
+  if(replayForDisplay)
+    m_pController->RestoreFrameEventAfterAnalysis();
+  const double restoreEndMS = elapsedMS();
+
+  const auto logTiming = [&]() {
+    if(!timing)
+      return;
+
+    const rdcstr line = StringFormat::Fmt(
+        "api=HistoryPreview eid=%u headless=%u snapshotroute=%u currentstate=%u resolve_ms=%.3f "
+        "replay_ms=%.3f render_ms=%.3f restore_ms=%.3f total_ms=%.3f",
+        eventId, m_HeadlessWindow ? 1U : 0U, haveSnapshot ? 1U : 0U, currentState ? 1U : 0U, resolveMS,
+        replayForDisplay ? replayEndMS - resolveMS : 0.0, renderEndMS - replayEndMS,
+        replayForDisplay ? restoreEndMS - renderEndMS : 0.0,
+        elapsedMS());
+    RDCLOG("[EIDTiming] %s", line.c_str());
+    AppendReplayTimingLog(line);
+  };
+
+  // A snapshot is an ordinary replay-owned texture. Keep it as this output's persistent display so
+  // resize, pixel-context refresh, and repaint continue to use static data. Leaving the history tab
+  // sends a normal SetTextureDisplay with the live texture and replaces it.
+  if(haveSnapshot)
+  {
+    m_EventID = savedEventID;
+    passEvents = savedPassEvents;
+    m_MainOutput.dirty = false;
+    m_TransientTextureEventDisplay = false;
+    m_HistorySnapshotSource = config;
+    m_HistorySnapshotEventID = eventId;
+    m_HistorySnapshotGeneration = m_pController->GetShaderReplacementGeneration(0);
+    m_HistorySnapshotActive = true;
+    m_pController->ReapRetiredEventTextureSnapshots();
+    logTiming();
+    return;
+  }
+
+  // Headless thumbnails and the overlay/custom-shader fallback retain the rendered output image.
+  // RestoreFrameEventAfterAnalysis restores captured resources without presenting ReplayOutputs,
+  // so restoring configuration here leaves that image intact for ReadbackOutputTexture.
+  m_EventID = savedEventID;
+  m_RenderData.texDisplay = savedDisplay;
+  m_CustomDirty = savedCustomDirty;
+  m_OverlayDirty = savedOverlayDirty;
+  m_ForceOverlayRefresh = savedForceOverlayRefresh;
+  m_OverlayResourceId = savedOverlayResource;
+  m_CustomShaderResourceId = savedCustomResource;
+  m_TextureDim = savedTextureDim;
+  passEvents = savedPassEvents;
+  m_MainOutput.dirty = false;
+  // Preserve the history overlay/custom result for picking while the embedded history remains
+  // active. The next ordinary SetTextureDisplay consumes this flag and forces event-derived
+  // resources to be rebuilt before the persistent current-event output is shown again.
+  m_TransientTextureEventDisplay = true;
+  m_pController->ReapRetiredEventTextureSnapshots();
+  logTiming();
+}
+
 void ReplayOutput::DisplayTex()
 {
   CHECK_REPLAY_THREAD();
@@ -936,17 +1603,22 @@ void ReplayOutput::DisplayTex()
   {
     if(m_OverlayDirty)
     {
-      m_pDevice->ReplayLog(m_EventID, eReplay_WithoutDraw);
+      ReplayCapture(m_EventID, eReplay_WithoutDraw);
       m_pController->FatalErrorCheck();
+      m_pController->ReapplyAnalysisEventOverrides(m_EventID);
       RefreshOverlay();
-      m_pDevice->ReplayLog(m_EventID, eReplay_OnlyDraw);
+      m_pController->ReapplyAnalysisEventOverrides(m_EventID);
+      ReplayCapture(m_EventID, eReplay_OnlyDraw);
       m_pController->FatalErrorCheck();
     }
   }
   else if(m_ForceOverlayRefresh)
   {
     m_ForceOverlayRefresh = false;
-    m_pDevice->ReplayLog(m_EventID, eReplay_Full);
+    if(m_pController->m_AnalysisEventOverridesActive)
+      m_pController->ReplayFrameEventForAnalysis(m_EventID);
+    else
+      ReplayCapture(m_EventID, eReplay_Full);
     m_pController->FatalErrorCheck();
   }
 
@@ -1011,6 +1683,9 @@ void ReplayOutput::DisplayMesh()
 
   RENDERDOC_PROFILEFUNCTION();
 
+  if(!m_pController->EnsureMaterializedCurrentEvent(__FUNCTION__))
+    return;
+
   ActionDescription *action = m_pController->GetActionByEID(m_EventID);
 
   if(action == NULL || m_MainOutput.outputID == 0 || m_Width <= 0 || m_Height <= 0 ||
@@ -1030,10 +1705,12 @@ void ReplayOutput::DisplayMesh()
 
   if(m_OverlayDirty)
   {
-    m_pDevice->ReplayLog(m_EventID, eReplay_WithoutDraw);
+    ReplayCapture(m_EventID, eReplay_WithoutDraw);
     m_pController->FatalErrorCheck();
+    m_pController->ReapplyAnalysisEventOverrides(m_EventID);
     RefreshOverlay();
-    m_pDevice->ReplayLog(m_EventID, eReplay_OnlyDraw);
+    m_pController->ReapplyAnalysisEventOverrides(m_EventID);
+    ReplayCapture(m_EventID, eReplay_OnlyDraw);
     m_pController->FatalErrorCheck();
   }
 

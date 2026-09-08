@@ -102,13 +102,18 @@ class InternalServiceLifecycleTests(unittest.TestCase):
                 completed = _CompletedProcess()
                 with mock.patch.object(
                     self.bridge.subprocess, "Popen", return_value=completed
-                ) as popen:
+                ) as popen, mock.patch.object(
+                    self.bridge, "_track_replaylab_control_process",
+                    wraps=self.bridge._track_replaylab_control_process,
+                ) as track:
                     self.assertTrue(self.bridge._start_replaylab_internal_host())
                     self.assertTrue(completed.finished.wait(1.0))
                 command = popen.call_args.args[0]
                 self.assertEqual(str(internal.resolve()), command[0])
                 self.assertEqual("ensure", command[1])
                 self.assertNotIn("ReplayLabMCP", " ".join(command))
+                track.assert_called_once_with(
+                    completed, "internal-ensure", timeout_seconds=75.0)
         finally:
             self.bridge.__file__ = original_file
             self.bridge.HAS_UI = original_has_ui

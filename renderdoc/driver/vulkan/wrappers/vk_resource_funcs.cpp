@@ -1156,6 +1156,9 @@ bool WrappedVulkan::SerialiseUnmap(SerialiserType &ser, VkDeviceMemory memory, u
     }
   }
 
+  if(IsReplayingAndReading() && memory != VK_NULL_HANDLE && MapData)
+    ApplyReplayBufferMemoryPatches(memory, MapOffset, MapData, MapSize);
+
   return true;
 }
 
@@ -1537,6 +1540,7 @@ bool WrappedVulkan::Serialise_vkFlushMappedMemoryRanges(SerialiserType &ser, VkD
 
   if(IsReplayingAndReading() && MappedData && MemRange.memory != VK_NULL_HANDLE && MemRange.size > 0)
   {
+    ApplyReplayBufferMemoryPatches(MemRange.memory, MemRange.offset, MappedData, memRangeSize);
     const VulkanCreationInfo::Memory &memInfo = m_CreationInfo.m_Memory[GetResID(MemRange.memory)];
     if((m_PhysicalDeviceData.memProps.memoryTypes[memInfo.memoryTypeIndex].propertyFlags &
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0)
@@ -1712,6 +1716,10 @@ bool WrappedVulkan::Serialise_vkBindBufferMemory(SerialiserType &ser, VkDevice d
       return false;
 
     ObjDisp(device)->BindBufferMemory(Unwrap(device), Unwrap(buffer), Unwrap(memory), memoryOffset);
+
+    bufInfo.replayMemory = memId;
+    bufInfo.replayMemoryOffset = memoryOffset;
+    bufInfo.replayMemorySize = mrq.size;
 
     GetResourceDesc(memId).derivedResources.push_back(resId);
     GetResourceDesc(resId).parentResources.push_back(memId);
@@ -2068,6 +2076,8 @@ bool WrappedVulkan::Serialise_vkCreateBuffer(SerialiserType &ser, VkDevice devic
 
       m_CreationInfo.m_Buffer[live].Init(GetResourceManager(), m_CreationInfo, &CreateInfo,
                                          memoryRequirements);
+      m_CreationInfo.m_Buffer[live].replayPatchProtected =
+          (CreateInfo.flags & VK_BUFFER_CREATE_PROTECTED_BIT) != 0;
 
       if(patchedusage & VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT)
       {
@@ -3499,6 +3509,10 @@ bool WrappedVulkan::Serialise_vkBindBufferMemory2(SerialiserType &ser, VkDevice 
       ResourceId memId = GetResID(bindInfo.memory);
 
       VulkanCreationInfo::Buffer &bufInfo = m_CreationInfo.m_Buffer[GetResID(bindInfo.buffer)];
+
+      bufInfo.replayMemory = memId;
+      bufInfo.replayMemoryOffset = bindInfo.memoryOffset;
+      bufInfo.replayMemorySize = mrqs[i].size;
 
       GetResourceDesc(memId).derivedResources.push_back(resId);
       GetResourceDesc(resId).parentResources.push_back(memId);
