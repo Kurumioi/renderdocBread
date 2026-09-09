@@ -232,8 +232,8 @@ void VulkanReplay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
 {
   const bool ordinaryRoot = replayType == eReplay_WithoutDraw && !m_ReplayCheckpointBypass &&
                             !m_ReplayCheckpointNaturalReference && !m_pDriver->m_ActionCallback;
-  // The controller bypasses checkpoints around an ordinary OnlyDraw too. The pending root
-  // identity, not that bypass flag, distinguishes it from an unrelated target-only operation.
+  // The pending root identity distinguishes a matching target from an unrelated OnlyDraw;
+  // prefix checkpoint eligibility alone cannot establish that execution provenance.
   const bool ordinaryTarget = replayType == eReplay_OnlyDraw && !m_pDriver->m_ActionCallback;
   if(replayType == eReplay_OnlyDraw)
   {

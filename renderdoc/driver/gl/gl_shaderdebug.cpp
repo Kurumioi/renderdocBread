@@ -2869,6 +2869,7 @@ uint32_t GetStorageBufferBinding(WrappedOpenGL *driver,
 ShaderDebugTrace *GLReplay::DebugVertex(uint32_t eventId, uint32_t vertid, uint32_t instid,
                                         uint32_t idx, uint32_t view)
 {
+  TextureAnalysisScope textureAnalysis(*this);
   MakeCurrentReplayContext(&m_ReplayCtx);
 
   GLRenderState rs;
@@ -3225,6 +3226,7 @@ ShaderDebugTrace *GLReplay::DebugVertex(uint32_t eventId, uint32_t vertid, uint3
 ShaderDebugTrace *GLReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t y,
                                        const DebugPixelInputs &inputs)
 {
+  TextureAnalysisScope textureAnalysis(*this);
   uint32_t sample = inputs.sample;
   uint32_t primitive = inputs.primitive;
   uint32_t view = inputs.view;
@@ -3790,6 +3792,7 @@ ShaderDebugTrace *GLReplay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t y,
 ShaderDebugTrace *GLReplay::DebugThread(uint32_t eventId, const rdcfixedarray<uint32_t, 3> &groupid,
                                         const rdcfixedarray<uint32_t, 3> &threadid)
 {
+  TextureAnalysisScope textureAnalysis(*this);
   rdcstr regionName =
       StringFormat::Fmt("Debug Thread @ %u of (%u,%u,%u) (%u,%u,%u)", eventId, groupid[0],
                         groupid[1], groupid[2], threadid[0], threadid[1], threadid[2]);
@@ -4269,6 +4272,7 @@ ShaderDebugTrace *GLReplay::DebugMeshThread(uint32_t eventId,
 
 rdcarray<ShaderDebugState> GLReplay::ContinueDebug(ShaderDebugger *debugger)
 {
+  TextureAnalysisScope textureAnalysis(*this);
   rdcspv::Debugger *spvDebugger = (rdcspv::Debugger *)debugger;
 
   if(!spvDebugger)

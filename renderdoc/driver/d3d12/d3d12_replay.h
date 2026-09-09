@@ -133,6 +133,10 @@ public:
   rdcarray<ResourceDescription> GetResources();
 
   rdcarray<DescriptorStoreDescription> GetDescriptorStores();
+  const rdcarray<DescriptorStoreDescription> &GetReplayDescriptorStores() const
+  {
+    return m_DescriptorStores;
+  }
   void RegisterDescriptorStore(const DescriptorStoreDescription &desc);
 
   rdcarray<BufferDescription> GetBuffers();
@@ -175,6 +179,7 @@ public:
                                  const rdcarray<ReplayCheckpointCandidate> &candidates);
   void InvalidateReplayCheckpoints(uint32_t firstAffectedEvent = 0);
   ReplayCheckpointStats GetReplayCheckpointStats();
+  bool RefreshReplayCheckpointMemoryBudget() override;
   rdcstr SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches) override;
   uint32_t GetReplayBufferPatchFirstAffectedEvent() const override;
   SDFile *GetStructuredFile();

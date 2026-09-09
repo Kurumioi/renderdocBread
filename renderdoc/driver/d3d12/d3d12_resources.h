@@ -485,9 +485,9 @@ struct D3D12DescriptorRestoreRange
 
 // Sorted non-overlapping descriptor ranges. Failure leaves the original copies untouched.
 bool D3D12SubtractDescriptorRanges(uint32_t count,
-                                  const rdcarray<D3D12DescriptorRestoreRange> &copies,
-                                  const rdcarray<D3D12DescriptorRestoreRange> &excluded,
-                                  rdcarray<D3D12DescriptorRestoreRange> &result);
+                                   const rdcarray<D3D12DescriptorRestoreRange> &copies,
+                                   const rdcarray<D3D12DescriptorRestoreRange> &excluded,
+                                   rdcarray<D3D12DescriptorRestoreRange> &result);
 
 // Dirty state since the last initial-state restore, separate from the permanent mutable-view
 // mask used by the descriptor inspection cache. Coarse 64-descriptor blocks bound metadata and
@@ -498,10 +498,12 @@ public:
   void Reset(uint32_t descriptorCount);
   void MarkRange(uint32_t first, uint32_t count);
   void GetRanges(rdcarray<D3D12DescriptorRestoreRange> &ranges);
+  uint64_t DescriptorCount() const { return m_DirtyDescriptorCount; }
   void ClearDirty();
 
 private:
   uint32_t m_DescriptorCount = 0;
+  uint64_t m_DirtyDescriptorCount = 0;
   rdcarray<uint64_t> m_DirtyBlockMask;
   rdcarray<uint32_t> m_DirtyBlocks;
 };
@@ -529,6 +531,24 @@ public:
   bool Complete() const { return m_Complete; }
 };
 
+// Byte bounds from every native descriptor version, never inferred from shader reflection.
+// SRV/UAV descriptors conservatively read the whole buffer; a CBV has explicit byte bounds.
+class D3D12ReplayBufferDescriptorRanges
+{
+  std::map<ResourceId, std::map<uint32_t, std::set<rdcpair<uint64_t, uint64_t>>>> m_Ranges;
+  size_t m_Count = 0;
+  bool m_Complete = true;
+public:
+  void Add(uint32_t slot, ResourceId resource, uint64_t offset, uint64_t size);
+  void Invalidate()
+  {
+    m_Complete = false;
+    m_Ranges.clear();
+  }
+  bool Gather(ResourceId resource, uint32_t first, uint32_t count,
+              rdcarray<rdcpair<uint64_t, uint64_t>> &ranges, size_t &work) const;
+};
+
 class WrappedID3D12DescriptorHeap : public WrappedDeviceChild12<ID3D12DescriptorHeap>,
                                     public IRenderDocDescriptorNamer
 {
@@ -554,6 +574,8 @@ class WrappedID3D12DescriptorHeap : public WrappedDeviceChild12<ID3D12Descriptor
   void UpdateReplayUAVIndex(uint32_t first, uint32_t count);
   D3D12ReplayDescriptorReferences m_ReplayReadReferences;
   bool m_ReplayReadReferencesReady = false;
+  D3D12ReplayBufferDescriptorRanges m_ReplayBufferReadRanges;
+  bool PrepareReplayReadReferences();
   void RecordReplayReadReference(uint32_t index, const D3D12Descriptor &descriptor);
 
   // for GPU handles that sit in GPU memory, this is the base of our descriptors array above during
@@ -612,10 +634,13 @@ public:
   // A true result includes unknown/missing history. False requires a complete capture-wide
   // descriptor union and valid bounds. This is used only for independent texture clear proofs.
   bool ReplayRangeMayReference(ResourceId resource, uint32_t first, uint32_t count);
+  bool GatherReplayBufferReadRanges(ResourceId resource, uint32_t first, uint32_t count,
+                                    rdcarray<rdcpair<uint64_t, uint64_t>> &ranges, size_t &work);
   // Returns false when no complete initial baseline is established. An empty range array with
   // true means the entire heap still shares that baseline. Reading ranges never clears dirtiness.
   bool GetCheckpointDescriptorRanges(ResourceId &baseline,
                                      rdcarray<D3D12DescriptorRestoreRange> &ranges);
+  uint64_t GetCheckpointDescriptorBytes() const;
   void InvalidateInitialDescriptorRestore();
   void RestoreInitialDescriptors(WrappedID3D12DescriptorHeap *source, bool forceFullRestore);
 

@@ -63,6 +63,26 @@ def changed_runs(before, after):
     return runs, changed
 
 
+def compact_upload_evidence(records, api, mode, before, after, active_bytes):
+    """An allocation/copy claim requires the exact native commit, separately from pixel parity."""
+    if api not in ("OpenGL", "OpenGLES") or mode not in ("compact", "full"):
+        raise ValueError("Compact upload acceptance is specific to GL/GLES and an explicit mode")
+    count = changed_runs(before, after)[1]
+    if not 0 < count <= len(after) <= active_bytes:
+        raise ValueError("Upload comparison needs a changed stable layout and its full active payload")
+    rows = [r for r in records if r.get("api") == APIS[api] and r.get("op") == "set"]
+    expected = {"uploadReused": int(mode == "compact"),
+                "uploadWrittenBytes": count if mode == "compact" else active_bytes}
+    issues = []
+    if len(rows) != 1:
+        issues.append("Upload acceptance needs exactly one native commit record")
+    else:
+        for key, value in expected.items():
+            if type(rows[0].get(key)) is not int or rows[0][key] != value:
+                issues.append("Upload %s must equal %d" % (key, value))
+    return {"mode": mode, "expected": expected, "records": rows, "issues": issues}
+
+
 def configure_environment(disabled, checkpoints=False, environ=None):
     environ = os.environ if environ is None else environ
     requested = {"RENDERDOC_EID_TIMING": "1", "RENDERDOC_REPLAY_CHECKPOINTS": "1" if checkpoints else "0",
@@ -184,7 +204,7 @@ def delta_evidence(records, api, event, generation, before, after, cutoff, disab
         for key, value in expected.items():
             if type(rows[0].get(key)) is not int or rows[0][key] != value:
                 issues.append("Native %s must equal %d" % (key, value))
-        if same and api == "D3D11" and not disabled and rows[0].get("rangeIndexKnown") != 1:
+        if same and api in ("D3D11", "D3D12", "OpenGL", "OpenGLES", "Vulkan") and not disabled and rows[0].get("rangeIndexKnown") != 1:
             issues.append("Same-buffer positive case lacks a complete native range-read index")
     controller = [row for row in records if row.get("api") == "ReplayController" and
                   row.get("op") == "shared_buffer_patch"]
@@ -244,10 +264,10 @@ def expected_window(window, baseline, active, specs):
     return bytes(result)
 
 
-def discover(controller, rd, recorder, report, args, maximum):
-    events = sorted(set((args.early_event, args.late_event, args.fixed_event) +
-                        (() if args.checkpoint_event is None else (args.checkpoint_event,))))
-    evidence = selected_event_evidence(controller, events)
+def fixture_event_evidence(controller, rd, args):
+    events = sorted(set((args.early_event, args.late_event, args.fixed_event)))
+    checked = sorted(set(events + ([] if args.checkpoint_event is None else [args.checkpoint_event])))
+    evidence = selected_event_evidence(controller, checked)
     if any(row["status"] != "exactAPIEvent" for row in evidence):
         raise RuntimeError("Binding/fixed EIDs must be exact captured API events")
     actions = {}
@@ -260,6 +280,14 @@ def discover(controller, rd, recorder, report, args, maximum):
         action = actions.get(event)
         if action is None or not action.flags & rd.ActionFlags.Drawcall or action.flags & rd.ActionFlags.Indirect:
             raise RuntimeError("This bounded fixture probe requires actual direct draw EIDs")
+    # The retained checkpoint can be a native submission/Close boundary. It is not a shader
+    # binding to inspect or draw to select. Exact API evidence is required above; preparation
+    # and each measured setter separately require that exact native checkpoint to be retained.
+    return events, evidence
+
+
+def discover(controller, rd, recorder, report, args, maximum):
+    events, evidence = fixture_event_evidence(controller, rd, args)
     buffers = {resource_number(buffer.resourceId): buffer for buffer in controller.GetBuffers()}
     specs, windows = {}, []
     for name in ("early", "late"):
@@ -371,6 +399,11 @@ class DeltaProbe:
             row["deltaEvidence"] = delta_evidence(timing["timingRecords"], self.report["captureDriver"], event,
                 self.generation, previous, value, cutoff, self.args.disable_delta, self.args.same_buffer_ranges)
             self.report["issues"].extend(label + ": " + issue for issue in row["deltaEvidence"]["issues"])
+            if getattr(self.args, "expect_upload_reuse", None):
+                row["uploadEvidence"] = compact_upload_evidence(timing["timingRecords"],
+                    self.report["captureDriver"], self.args.expect_upload_reuse, previous, value,
+                    sum(len(payload) for payload in self.active.values()))
+                self.report["issues"].extend(label + ": " + issue for issue in row["uploadEvidence"]["issues"])
             if status.get("sharedBufferPatchFirstAffectedEvent") != cutoff:
                 self.report["issues"].append(label + ": status cutoff differs from the expected native boundary")
             row["checkpointEvidence"] = checkpoint_evidence(before_status, status, self.args.early_event,
@@ -480,6 +513,8 @@ def main(argv=None):
     parser.add_argument("--expected-cutoff", type=int)
     parser.add_argument("--expected-disabled-cutoff", type=int)
     parser.add_argument("--disable-delta", action="store_true")
+    parser.add_argument("--expect-upload-reuse", choices=("compact", "full"),
+                        help="Require GL/GLES native changed-byte reuse or its full-payload control")
     parser.add_argument("--checkpoint-event", type=int)
     parser.add_argument("--budget-mib", type=int, default=256)
     parser.add_argument("--max-checkpoints", type=int, default=4)
@@ -504,6 +539,8 @@ def main(argv=None):
         parser.error(str(error))
     output.parent.mkdir(parents=True, exist_ok=True)
     environment = configure_environment(args.disable_delta, args.checkpoint_event is not None)
+    environment["RENDERDOC_GL_DISABLE_BUFFER_PATCH_UPLOAD_REUSE"] = os.environ.get(
+        "RENDERDOC_GL_DISABLE_BUFFER_PATCH_UPLOAD_REUSE")
     report = {"schema": "renderdoc-buffer-delta-profile/v1", "ok": False, "measurementComplete": False,
               "capture": str(capture), "configuration": vars(args), "environment": environment,
               "processId": os.getpid(), "samples": [], "mutations": [], "references": {}, "issues": [],
@@ -532,6 +569,9 @@ def main(argv=None):
         if result != rd.ResultCode.Succeeded:
             raise RuntimeError("OpenFile failed: " + str(result))
         report["captureDriver"] = str(cap.DriverName())
+        if args.expect_upload_reuse and (report["captureDriver"] not in ("OpenGL", "OpenGLES") or
+                                         args.disable_delta):
+            raise ValueError("Upload reuse comparison requires GL/GLES with delta invalidation enabled")
         if report["captureDriver"] not in APIS:
             raise RuntimeError("Unsupported buffer-delta fixture backend")
         opened, _ = recorder.measure("capture.openReplay", lambda: cap.OpenCapture(rd.ReplayOptions(), None))

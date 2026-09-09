@@ -24,8 +24,10 @@
 
 #include "d3d12_device.h"
 #include "driver/dxgi/dxgi_common.h"
-#include "d3d12_resources.h"
+#include "os/os_specific.h"
+#include "replay/replay_timing.h"
 #include "d3d12_api_monitor.h"
+#include "d3d12_resources.h"
 
 bool WrappedID3D12Device::Serialise_CreateResource(
     D3D12Chunk chunkType, ID3D12Heap *pHeap, UINT64 HeapOffset, D3D12_HEAP_PROPERTIES &props,
@@ -49,19 +51,24 @@ bool WrappedID3D12Device::Serialise_CreateResource(
       desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
   }
 
-  // if we're creating a committed resource (only place where heap properties is set)
-  if(props.Type == D3D12_HEAP_TYPE_UPLOAD && desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+  // Heap properties are set only for committed resources. Keep the original native UPLOAD path
+  // available for isolated memory-capacity A/B tests; the normal replay policy is unchanged.
+  const bool largeCapturedUpload = props.Type == D3D12_HEAP_TYPE_UPLOAD &&
+                                   desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+                                   desc.Width >= 1024 * 1024;
+  const bool preserveCapturedUpload =
+      largeCapturedUpload &&
+      Process::GetEnvVariable("RENDERDOC_D3D12_PRESERVE_CAPTURED_UPLOAD_HEAPS") == "1";
+  if(largeCapturedUpload && !preserveCapturedUpload)
   {
     // place large resources in local memory so that initial contents and maps can
     // be cached and copied on the GPU instead of memcpy'd from the CPU every time.
-    // smaller resources it's better to just leave them as upload and map into them
-    if(desc.Width >= 1024 * 1024)
-    {
-      RDCLOG("Remapping committed resource %s from upload to default for efficient replay",
-             ToStr(pResource).c_str());
-      props.Type = D3D12_HEAP_TYPE_DEFAULT;
-      m_UploadResourceIds.insert(pResource);
-    }
+    // Only remapped resources enter this set: direct CPU maps and immutable CPU initial contents
+    // continue to handle preserved UPLOAD buffers, including persistent parameter edits and undo.
+    RDCLOG("Remapping committed resource %s from upload to default for efficient replay",
+           ToStr(pResource).c_str());
+    props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    m_UploadResourceIds.insert(pResource);
   }
 
   APIProps.YUVTextures |= IsYUVFormat(desc.Format);
@@ -250,6 +257,24 @@ bool WrappedID3D12Device::Serialise_CreateResource(
                      "Failed recreating %s, HRESULT: %s", ToStr(chunkType).c_str(),
                      ToStr(hr).c_str());
     return false;
+  }
+
+  if(largeCapturedUpload && Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+  {
+    // One record per successfully recreated candidate, outside interactive replay. Query the
+    // selected native allocation rather than treating logical bytes as measured LOCAL residency.
+    const D3D12_RESOURCE_DESC nativeDesc = ret->GetDesc();
+    const D3D12_RESOURCE_ALLOCATION_INFO allocation =
+        m_pDevice->GetResourceAllocationInfo(0, 1, &nativeDesc);
+    const bool allocationKnown = allocation.SizeInBytes != ~0ULL && allocation.SizeInBytes != 0;
+    const rdcstr line = StringFormat::Fmt(
+        "api=D3D12CapturedUploadHeap resource=%s logicalWidth=%llu allocationBytes=%llu "
+        "allocationKnown=%u originalHeap=UPLOAD selectedHeap=%s preserveRequested=%u",
+        ToStr(pResource).c_str(), (unsigned long long)desc.Width,
+        (unsigned long long)(allocationKnown ? allocation.SizeInBytes : 0), allocationKnown ? 1U : 0U,
+        preserveCapturedUpload ? "UPLOAD" : "DEFAULT", preserveCapturedUpload ? 1U : 0U);
+    RDCLOG("%s", line.c_str());
+    AppendReplayTimingLog(line);
   }
 
   const char *ResourceTypeName = "?";

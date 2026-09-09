@@ -4,7 +4,7 @@
 
 struct BufferDeltaFixture : D3D11GraphicsTest
 {
-  int Run(bool sharedRanges)
+  int Run(bool sharedRanges, bool stages = false)
   {
     if(!Init())
       return 3;
@@ -35,6 +35,16 @@ struct BufferDeltaFixture : D3D11GraphicsTest
     const char lateName[] = "Delta_Late";
     early->SetPrivateData(WKPDID_D3DDebugObjectName, sizeof(earlyName) - 1, earlyName);
     late->SetPrivateData(WKPDID_D3DDebugObjectName, sizeof(lateName) - 1, lateName);
+    ID3D11Texture2DPtr stageTextures[3];
+    ID3D11RenderTargetViewPtr stageTargets[3];
+    if(stages)
+      for(uint32_t i = 0; i < 3; ++i)
+      {
+        stageTextures[i] = MakeTexture(DXGI_FORMAT_R8G8B8A8_UNORM, screenWidth, screenHeight).RTV();
+        stageTargets[i] = MakeRTV(stageTextures[i]);
+        const std::string name = "CheckpointStage" + std::to_string(i);
+        stageTextures[i]->SetPrivateData(WKPDID_D3DDebugObjectName, (UINT)name.size(), name.c_str());
+      }
     while(Running())
     {
       D3D11_MAPPED_SUBRESOURCE a = Map(early, 0, D3D11_MAP_WRITE_DISCARD);
@@ -44,6 +54,9 @@ struct BufferDeltaFixture : D3D11GraphicsTest
       memcpy(b.pData, lateData, sizeof(lateData));
       ctx->Unmap(late, 0);
       ClearRenderTargetView(bbRTV, {0.03125f, 0.0625f, 0.09375f, 1.0f});
+      if(stages)
+        for(uint32_t i = 0; i < 3; ++i)
+          ClearRenderTargetView(stageTargets[i], {0.03125f, 0.0625f, 0.09375f, 1.0f});
       ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
       ctx->IASetInputLayout(defaultLayout);
       IASetVertexBuffer(vb, sizeof(DefaultA2V), 0);
@@ -52,6 +65,12 @@ struct BufferDeltaFixture : D3D11GraphicsTest
       ctx->OMSetRenderTargets(1, &bbRTV.GetInterfacePtr(), NULL);
       for(uint32_t region = 0; region < 4; region++)
       {
+        if(stages)
+        {
+          ID3D11RenderTargetView *target =
+              region < 3 ? stageTargets[region].GetInterfacePtr() : bbRTV.GetInterfacePtr();
+          ctx->OMSetRenderTargets(1, &target, NULL);
+        }
         ID3D11Buffer *buffer = sharedRanges || region < 2 ? early.GetInterfacePtr() : late.GetInterfacePtr();
         if(sharedRanges)
         {
@@ -77,6 +96,20 @@ RD_TEST(D3D11_Buffer_Delta, BufferDeltaFixture)
 {
   static constexpr const char *Description = "Two parameter buffers with distinct first consumers";
   int main() { return Run(false); }
+};
+REGISTER_TEST();
+}
+
+namespace StageOutputs
+{
+RD_TEST(D3D11_Checkpoint_Stages, BufferDeltaFixture)
+{
+  static constexpr const char *Description =
+      "Independent stage outputs retain upstream resource versions";
+  int main()
+  {
+    return Run(true, true);
+  }
 };
 REGISTER_TEST();
 }

@@ -436,6 +436,8 @@ private:
   uint64_t m_CheckpointCaptureBytes = 0;
   uint64_t m_CheckpointResourceBytes = 0;
   bool m_CheckpointAutomatic = false;
+  // CPU planning happens at load. GPU prewarming is admitted only by idle maintenance.
+  bool m_CheckpointIdlePrewarm = false;
   const char *m_CheckpointControlMode = "unconfigured";
   const char *m_CheckpointAutoState = "observing";
   const char *m_CheckpointAutoReason = "awaitingNaturalReferenceVisits";
@@ -465,12 +467,19 @@ private:
     std::set<uint32_t> nativeEvents;
     bool retained = false;
     bool bufferEdit = false;
+    bool prewarmed = false;
     uint32_t requests = 0, builds = 0, hits = 0, profitableHits = 0;
+    uint32_t unmeasuredHits = 0;
     double baselineMS = 0.0, lastHitMS = 0.0, debtMS = 0.0;
   };
   std::map<uint64_t, CheckpointReferenceCost> m_CheckpointReferenceCosts;
   rdcarray<AutomaticCheckpointPoint> m_AutomaticCheckpointPoints;
   std::set<uint32_t> m_RejectedCheckpointCandidates;
+  // Memory rejection is reversible only after a real backend budget change. Safety/performance
+  // rejections remain in the ordinary set. Checks and successful recoveries are capture-bounded.
+  std::set<uint32_t> m_MemoryRejectedCheckpointCandidates;
+  uint32_t m_IdleCheckpointMemoryChecks = 0, m_IdleCheckpointMemoryRecoveries = 0;
+  uint64_t m_IdleCheckpointMemoryNextCheck = 0;
   ReplayBufferPatchSet m_SharedBufferPatches;
   uint64_t m_SharedBufferPatchGeneration = 0;
   rdcstr CommitSharedBufferPatches(const ReplayBufferPatchSet &patches);

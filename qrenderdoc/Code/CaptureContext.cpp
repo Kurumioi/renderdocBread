@@ -32,6 +32,8 @@
 #include <QEvent>
 #include <QFileInfo>
 #include <QFileSystemWatcher>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QMenu>
 #include <QMessageBox>
@@ -2225,7 +2227,7 @@ void CaptureContext::EndScrub()
     ScheduleIdleCheckpointMaintenance();
 }
 
-void CaptureContext::ScheduleIdleCheckpointMaintenance()
+void CaptureContext::ScheduleIdleCheckpointMaintenance(int delayMS)
 {
   const uint64_t request = ++m_IdleCheckpointGeneration;
   if(!IsCaptureLoaded() || m_Scrubbing || m_ScrubCommitPending || m_ScrubInFlight)
@@ -2235,19 +2237,20 @@ void CaptureContext::ScheduleIdleCheckpointMaintenance()
   const uint32_t eventId = m_EventID;
   // Capture both mutation versions after the current publication's viewer requests. A timer
   // must never silently adopt a newer edit merely because it targets the same EID.
-  m_Replay.AsyncInvoke([this, request, epoch, eventId](IReplayController *r) {
+  m_Replay.AsyncInvoke([this, request, epoch, eventId, delayMS](IReplayController *r) {
     if(request != m_IdleCheckpointGeneration.load() || epoch != m_ScrubEpoch.load() ||
        r->GetCurrentEventID() != eventId)
       return;
     const uint64_t mutation = r->GetShaderReplacementGeneration(eventId);
     const uint64_t buffer = r->GetSharedBufferPatchGeneration();
-    GUIInvoke::call(m_MainWindow, [this, request, epoch, eventId, mutation, buffer]() {
+    GUIInvoke::call(m_MainWindow, [this, request, epoch, eventId, mutation, buffer, delayMS]() {
       if(request != m_IdleCheckpointGeneration.load() || epoch != m_ScrubEpoch.load() ||
          !IsCaptureLoaded() || m_EventID != eventId)
         return;
-      QTimer::singleShot(750, m_MainWindow, [this, request, epoch, eventId, mutation, buffer]() {
+      QTimer::singleShot(delayMS, m_MainWindow, [this, request, epoch, eventId, mutation, buffer]() {
         if(request != m_IdleCheckpointGeneration.load() || epoch != m_ScrubEpoch.load() ||
-           !IsCaptureLoaded() || m_EventID != eventId || m_Scrubbing || m_ScrubInFlight)
+           !IsCaptureLoaded() || m_EventID != eventId || m_Scrubbing || m_ScrubCommitPending ||
+           m_ScrubInFlight)
           return;
         m_Replay.AsyncInvoke(
             // i18n-ignore: internal low-priority replay queue tag, not a UI label.
@@ -2260,6 +2263,20 @@ void CaptureContext::ScheduleIdleCheckpointMaintenance()
               // most one useful replay. It restores this same event before returning and does
               // not publish another image or rebuild the visible pipeline snapshot.
               const rdcstr receipt = r->RunIdleCheckpointMaintenance(eventId, mutation, buffer);
+              const bool continueIdle = receipt.contains("\"continueIdle\":true");
+              // i18n-ignore: internal maintenance receipt key, never displayed as a UI label.
+              const int retry = QJsonDocument::fromJson(QByteArray(receipt.c_str()))
+                                    .object()
+                                    .value(QLatin1String("retryIdleAfterMS"))
+                                    .toInt();
+              const int nextDelay = continueIdle ? 750 : retry >= 750 && retry <= 5000 ? retry : 0;
+              if(nextDelay)
+                GUIInvoke::call(m_MainWindow, [this, request, epoch, eventId, nextDelay]() {
+                  if(request == m_IdleCheckpointGeneration.load() && epoch == m_ScrubEpoch.load() &&
+                     IsCaptureLoaded() && m_EventID == eventId && !m_Scrubbing &&
+                     !m_ScrubCommitPending && !m_ScrubInFlight)
+                    ScheduleIdleCheckpointMaintenance(nextDelay);
+                });
               if(qEnvironmentVariableIntValue("RENDERDOC_EID_TIMING") == 1)
                 GUIInvoke::call(m_MainWindow, [this, receipt]() {
                   LogEIDTiming(QString::fromUtf8(receipt.c_str()));

@@ -451,6 +451,8 @@ void WrappedVulkan::ReplayQueueSubmit(VkQueue queue, VkSubmitInfo2 submitInfo, r
     if(ReplayCheckpointSubmissionSkipped(completedEndEID))
       return;
 
+    ForgetReplayCheckpointWrites(startEID, RDCMIN(completedEndEID, m_LastEventID));
+
     if(submitInfo.commandBufferInfoCount == 0)
     {
       // do nothing, don't bother with the logic below
@@ -971,6 +973,7 @@ void WrappedVulkan::InsertActionsAndRefreshIDs(BakedCmdBufferInfo &cmdBufInfo)
     }
 
     RecordReplayPatchSubmittedReads(n);
+    RecordReplayCheckpointSubmittedWrites(n);
     GetActionStack().back()->children.push_back(n);
 
     // if this is a push marker too, step down the action stack

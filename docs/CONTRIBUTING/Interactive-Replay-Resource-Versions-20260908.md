@@ -5,7 +5,7 @@
 **目前没有完成“大型 RDC 任意来回拖动均实时刷新”的最终目标。** 已验证可继续区间的真实增量回放，
 并减少部分重复恢复；`1.rdc` 的反向/跨阶段恢复仍有主要成本。
 
-记录截点包含 v7b 至 v17 的实际验收，具体证据分别列于后文。
+记录截点包含 v7b 至 v22 的实际验收，具体证据分别列于后文。
 旧二进制通过不自动等于新二进制通过。
 本轮回放与编辑作用于独立回放环境及替换层，原始 `.rdc`、捕获资产初值和原工作区的 Shader 项目
 不会因为调节参数而被改写。
@@ -621,6 +621,167 @@ D3D12 单个 float32 的 [上传复用开启](../../output/eid-perf-20260908/d3d
    其他厂商及远程环境。
 
 因此本轮状态是“增量执行和局部恢复优化已成立，主场景的后续阶段恢复仍未解决”，不能标记全部开发完成。
+
+## v19 实测与 v20 后续实现（2026-09-08）
+
+本节区分已经运行的二进制证据与后续源码，避免把正在开发的功能当成已经验收。
+隔离目录和主分支进程仍然分开；物理 GPU、系统显存预算仍共享。
+
+v19 已实际通过：
+
+- [构建](../../output/eid-perf-20260908/build-stage-v19-receipt.json)，
+  [原生测试](../../output/eid-perf-20260908/unit-stage-v19.log)：4736 assertions / 123 cases。
+- D3D11 多阶段 RT 检查点：完整比较三张阶段 RT 和当前输出，5 次原生命中；
+  一次恢复日志中复制 481,024 字节，驻留版本省略 1,441,024 字节。保存的是可继续渲染的资源状态，
+  不是截图。[报告](../../output/eid-perf-20260908/checkpoints-d3d11-stages-v19.json)
+- D3D12 缓冲区物理别名：开启/关闭路径都通过，四个完整 buffer 和当前颜色/深度输出逐次比较，
+  独立完整回放作参照。此时还不包含重叠纹理的 typed 恢复。
+  [开启](../../output/eid-perf-20260908/checkpoints-d3d12-buffer-alias-on-v19.json)、
+  [关闭](../../output/eid-perf-20260908/checkpoints-d3d12-buffer-alias-off-v19.json)。
+- 自动空闲预建：D3D11、GL、GLES 各 2 次真实构建，Vulkan 静态/动态 UBO fixture 各 1 次；
+  每份报告均有 4 次随后切换的原生命中，当前图像与完整回放一致。
+  [D3D11](../../output/eid-perf-20260908/prewarm-d3d11-stages-v19.json)、
+  [GL](../../output/eid-perf-20260908/prewarm-gl-ranges-v19.json)、
+  [GLES](../../output/eid-perf-20260908/prewarm-gles-ranges-v19.json)、
+  [Vulkan](../../output/eid-perf-20260908/prewarm-vk-ranges-v19.json)。
+- [Qt 纹理控件](../../output/gui-isolation/presentation-v19/ui-result.json) 10 项通过；
+  独立运行收据确认原用户配置未变，未结束其他分支进程。
+
+v19 失败也保留：
+
+- GL/GLES 同 buffer 范围的修改 cutoff 和图像正确，但严格要求的中间检查点复用没有命中。
+  定位到 live-forward 开关被首次调用的静态变量缓存，测试准备阶段无法关掉它；v20 改为逐次读取。
+- Vulkan 动态 UBO fixture 的修改未命中范围索引，退回从头重算。加载时只记录 descriptor set，
+  未记录实际 dynamic offsets；v20 补齐两版绑定命令的加载路径，重新测试前不称修复已验收。
+- D3D12 自动预建首选阶段落在第一次完整命令提交结束之前，未创建检查点；v20 增加原生候选规划
+  证据，先跳过无效位置的 GPU 重绘，再在有限的后续空闲单元尝试其他位置。
+- [1.rdc](../../output/eid-perf-20260908/prewarm-main1-v19.json) 输出比较通过，要求构建/命中的验收失败。
+  此次进程 CurrentUsage 为 7,814,643,712 字节、可用预算为 5,653,356,544 字节，原生保护因此拒绝
+  新检查点。CurrentUsage 是该进程的用量；其他进程会影响它获得的预算。不可把此结果解释为
+  后续阶段已流畅，也不可取消预算保护强行宣布优化命中。
+
+v20 源码增加 GL/GLES 和 Vulkan 的不可变 GPU 内容版本共享、弱引用驻留身份和实际写入失效；
+D3D12 增加原生 CBV 字节范围索引与重叠纹理活跃 owner 的 typed 备份路径。CBV table 的视图大小
+来自原生描述符，root CBV 无显式大小时保守使用剩余 buffer。描述符槽保存所有捕获版本的并集，
+不会用录制时或最后一次堆内容假装证明实际提交的绑定；这可能降低精度，但保证不漏掉消费者。
+
+仍需继续验收：多阶段 RT 共享正例、反向/跨点切换、固定 EID 连续调参及撤销、Shader 修改后重建、
+失败/预算/未知资源回退。特殊 alias、CPU 写入、bindless/generated addresses 等证据不足时保留完整
+恢复；Windows 的几种 API 通过不等于 Linux、Android、其他 GPU 或任意捕获全部已测试。
+
+## v21 统一验证与尚未通过的主场景
+
+隔离 v21 [构建收据](../../output/eid-perf-20260908/build-stage-v21-receipt.json) 为
+`success=true/sourceStable=true`；[原生检查](../../output/eid-perf-20260908/unit-stage-v21.log)
+为 4949 assertions / 139 cases，[Python 检查](../../output/eid-perf-20260908/python-v21-all.log)
+为 278 tests / 1 skipped；翻译同步检查为 4899 finished / 0 unfinished。后续 v22 源码不属于此构建。
+
+实际 GPU 证据（Windows / 当前 GPU 驱动）包括：
+
+- D3D12 同 buffer 的两个 CBV 范围：修改后段参数的最早消费者从提交基点 6 精确到 draw 50，
+  保留并命中中间原生检查点 35。两次连续固定 EID 修改、邻居字节、全部输出和撤销均通过。
+  [开启](../../output/eid-perf-20260908/delta-d3d12-ranges-on-v21-r2.json)、
+  [关闭差异索引对照](../../output/eid-perf-20260908/delta-d3d12-ranges-off-v21-r2.json)。
+  检查点是原生 Close/提交边界，不要求它本身是 draw；绑定和显示 EID 仍要求真实 draw。
+- GL/GLES 多阶段纹理各 19 次命中，完整比较绑定输出、两张阶段 RT 与 D24S8。
+  后段每次保存复制 480,000 B，共享 1,800,000 B；重复配置保留状态，1 B 预算正确回退。
+  [GL](../../output/eid-perf-20260908/checkpoint-gl-texture-versions-on-v21.json)、
+  [GLES](../../output/eid-perf-20260908/checkpoint-gles-texture-versions-on-v21.json)。
+  v21 所有恢复的 `textureResidentBytes=0`：公共控制器无条件绕过 OnlyDraw，清除了驻留证明。
+  v22 才修复此接入；这里的保存共享不能当作已经省去恢复复制的证据。
+- Vulkan 多阶段 RT 保存 3 点、命中 15 次，包含所有当前输出和两张额外 RT；
+  [报告](../../output/eid-perf-20260908/checkpoint-vk-stages-on-v21.json)。最初 fixture 在第一 EID
+  读取未来尚未初始化的 RT1，后改为第一 draw 前初始化两张 RT，再重新捕获；未放宽画面验收。
+- v20b 的 D3D11/D3D12/GL/GLES/Vulkan 着色器替换＋共享 CBuffer 连续修改＋撤销全部通过，
+  即时输出先记录，之后才进行强制参考。它们仍需在改变公共 OnlyDraw 行为后的版本回归。
+  [D3D12](../../output/eid-perf-20260908/d3d12-shader-cbuffer-v20b.json)、
+  [D3D11](../../output/eid-perf-20260908/portable-d3d11-shader-cbuffer-v20b.json)、
+  [GL](../../output/eid-perf-20260908/portable-gl-shader-cbuffer-v20b.json)、
+  [GLES](../../output/eid-perf-20260908/portable-gles-shader-cbuffer-v20b.json)、
+  [Vulkan](../../output/eid-perf-20260908/portable-vulkan-shader-cbuffer-v20b.json)。
+- 自动空闲预建已在 D3D12 buffer 别名 fixture 上创建 2 点、后续命中 3 次；
+  [报告](../../output/eid-perf-20260908/prewarm-d3d12-buffer-alias-v20b-r2.json)。
+
+`1.rdc` 的 [v21 连续往返](../../output/eid-perf-20260908/prewarm-main1-continuous-v21-r2.json)
+画面均通过双参考比较，但仍未创建/命中检查点，不能称主场景已流畅。第一次 682.59 ms，后续
+486.13–501.77 ms；独立进程仍受主 GUI 的物理 GPU 占用影响。旧 prewarm 工具在每个 visit 后
+插入 force，导致每次都测完整恢复；现在先完成连续 visit 和即时读取，再统一进行双参考比较。
+返回 24917 的默认稳态恢复量为 3,955,498,234 B，与 v17 默认一致。旧约 3.57 GB 数字额外启用了
+UAV 声明范围和稀疏驻留实验选项，不能混作默认基线。约 7.68 GB 是 force 后完整恢复搬运量，
+不是检查点显存占用。保留捕获 UPLOAD heap 的 A/B 只减少约 149 MiB 本地显存，且更慢，维持关闭。
+
+重叠 RT 的 v21 仍被旧 NULL-before 别名准入规则拒绝，画面只证明了完整回退正确；v22 源码仅在
+该原生边界已有完整 typed owner 证明时放开明确 after 的激活。后续仍需验证实际命中，并处理
+非活动 RT 的初值复制与中断后的恢复责任。公共模型适用于任意捕获，但未知访问/别名/同步必须
+保守回退；这些 Windows 测试不代表所有平台、所有捕获均已完成物理验收。
+
+## v22：跨 API 实际恢复、连续调参与主帧复测
+
+[构建收据](../../output/eid-perf-20260908/build-stage-v22-receipt.json) 为
+`success=true/sourceStable=true`；[原生测试](../../output/eid-perf-20260908/unit-stage-v22.log)
+通过 5537 assertions / 171 cases，[Python](../../output/eid-perf-20260908/python-v22-all.log)
+通过 280 tests / 1 skipped。其后追加的上传验收门槛另有
+[20 项纯测试](../../output/eid-perf-20260908/python-upload-gate-v22.log)，不是重新计算原生测试数。
+
+这次补齐了以下实际 GPU 证据：
+
+- D3D12 typed alias：2 个原生检查点（25、42）、13 次命中，绑定颜色/深度全字节与双参考一致。
+  分配 2,105,344 B，共享 1,056,876 B。
+  [报告](../../output/eid-perf-20260908/checkpoint-d3d12-typed-alias-on-v22.json)。
+  **v22 仍未省略 inactive typed RT 的初值复制**，不能把命中当成这项带宽优化已完成。
+- GL/GLES：各 19 次命中；公共 OnlyDraw 绕过修复后，后段恢复实际复制 480,000 B，
+  `textureResidentBytes=1,800,000`，两张额外阶段 RT、D24S8 和全部当前输出均与双参考一致。
+  [GL](../../output/eid-perf-20260908/checkpoint-gl-texture-versions-on-v22.json)、
+  [GLES](../../output/eid-perf-20260908/checkpoint-gles-texture-versions-on-v22.json)。
+  弱引用只证明当前工作内容仍为目标版本；写入、分析/强制回放、替换仍清除相应证明。
+- Vulkan 多阶段 RT：15 次命中，完整绑定输出及两张上游 RT 比较通过。
+  [报告](../../output/eid-perf-20260908/checkpoint-vk-stages-on-v22.json)。
+- GL/GLES 固定布局连续调参复用上传对象，实写 2 B、1 B；独立关闭对照写完整 8 B 补丁。
+  新验收门槛要求原生上传字节和实际检查点复用同时成立，四份报告均通过：
+  [GL 开启](../../output/eid-perf-20260908/delta-gl-upload-compact-v22.json)、
+  [GL 关闭](../../output/eid-perf-20260908/delta-gl-upload-full-v22.json)、
+  [GLES 开启](../../output/eid-perf-20260908/delta-gles-upload-compact-v22.json)、
+  [GLES 关闭](../../output/eid-perf-20260908/delta-gles-upload-full-v22.json)。
+  这里只减少参数上传，不代表整个前缀重算只有 1–2 B 工作量。
+- 捕获 CPU 写入：新的 2 MiB Buffer fixture 中，序列化写入虽覆盖整个 Buffer，加载时独立
+  初始源比较只得到 0–8 个实际差异字节。检查点关闭的稳态普通恢复实际从 2,097,152 B
+  减至 1、2 或 8 B；首次配置后的恢复仍完整执行。整个 2 MiB Buffer 与所有绑定输出通过，
+  开启/关闭各 13 次检查点命中。
+  [开启](../../output/eid-perf-20260908/checkpoint-cpu-ranges-on-v22.json)、
+  [独立关闭对照](../../output/eid-perf-20260908/checkpoint-cpu-ranges-off-v22.json)。
+  原始捕获及初始源未修改，GPU/UAV/别名/来源不明或预算耗尽继续走完整恢复。
+- 五条 API 路径的 Shader 替换＋固定 EID 连续共享参数修改＋两层撤销均通过：
+  [D3D11](../../output/eid-perf-20260908/portable-d3d11-shader-cbuffer-v22.json)、
+  [D3D12](../../output/eid-perf-20260908/d3d12-shader-cbuffer-v22.json)、
+  [GL](../../output/eid-perf-20260908/portable-gl-shader-cbuffer-v22.json)、
+  [GLES](../../output/eid-perf-20260908/portable-gles-shader-cbuffer-v22.json)、
+  [Vulkan](../../output/eid-perf-20260908/portable-vulkan-shader-cbuffer-v22.json)。
+- 另测 Shader 替换后检查点失效、实际重建/恢复和撤销：
+  [D3D11](../../output/eid-perf-20260908/checkpoint-d3d11-shader-mutations-v22-r2.json)、
+  [D3D12](../../output/eid-perf-20260908/checkpoint-d3d12-shader-mutations-v22.json)、
+  [GL](../../output/eid-perf-20260908/checkpoint-gl-shader-mutations-v22.json)、
+  [GLES](../../output/eid-perf-20260908/checkpoint-gles-shader-mutations-v22.json)、
+  [Vulkan](../../output/eid-perf-20260908/checkpoint-vulkan-shader-mutations-v22.json)。
+  D3D11 第一次采用正确的 live-forward，因未满足“目标必须用检查点”的门槛而失败；第二次
+  显式关闭 live-forward 后通过。没有修改门槛或把另一个阶段的命中冒充目标命中。
+- [Qt 回归](../../output/gui-isolation/presentation-v22/ui-result.json) 10 项通过；
+  [运行隔离](../../output/gui-isolation/presentation-v22/runner-receipt.json) 确认没有结束其他分支进程。
+  200 ms 轮询的控件测试不等于实际鼠标到显示延迟测试。
+
+`1.rdc` 的 [v22 连续往返](../../output/eid-perf-20260908/prewarm-main1-continuous-v22.json)
+完成五次即时画面与双参考比较，全部一致，但建点/命中门槛仍失败。进程本身的 DXGI
+`CurrentUsage=7,814,643,712 B`，系统给它的 `Budget=3,840,815,102 B`，安全保护拒绝新快照。
+这不是把两个进程的显存简单相加；其他应用竞争会影响当前进程获得的预算。
+首次 1192.73 ms，后续 722.68–1084.13 ms；共享 GPU 状态与 v21 不同，不能当作独占速度回归。
+返回 24917 的稳态实际恢复量为 3,942,915,473 B，比 v21 默认减少 12,582,761 B；
+CPU 字节差异优化有收益，但远不足以消除主帧恢复量。
+
+后续具体缺口：inactive typed 初值省略必须证明“读旧值之前完整覆盖”，并在中断/强制回放时
+补齐独立恢复债务；显存后来释放时需要有限空闲重新准入；Vulkan 可选绑定证据的生产端需要
+总量上限。公共 `PropagateEdit` 仍未生产接入完整逐 RT 依赖图，当前 Shader 保守全失效，
+共享 CBuffer 则按已证明的首次消费者保留此前检查点。不能称任意下游 RT 均已局部重算。
+所有规则必须从原生捕获证据形成，禁止依赖此处 fixture 的 EID、资源 ID 或文件名；
+Windows 五条 API 的通过仍不代表 Linux、Android、其他厂商设备均已物理验收。
 
 ## 测试与复现入口
 

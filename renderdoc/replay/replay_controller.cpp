@@ -611,7 +611,10 @@ void ReplayController::ReplayEvent(uint32_t eventId, bool updateOutputs, bool fe
   const bool previousCheckpointBypass = m_pDevice->m_ReplayCheckpointBypass;
   // A single-event shadow is not part of other events' canonical prefixes. Never checkpoint its
   // transient bindings or outputs as a resource version for later unmodified event selection.
-  m_pDevice->m_ReplayCheckpointBypass = true;
+  // An ordinary unmodified target must retain its native write lineage so unchanged upstream
+  // versions remain usable after this draw. Preserve any outer force/analysis bypass.
+  m_pDevice->m_ReplayCheckpointBypass =
+      previousCheckpointBypass || HasEventOverrides(eventId) || !m_LastEventOverrideError.empty();
   {
     ScopedCheckpointPrefixOnly prefix(m_pDevice, false);
     driverMS += ReplayDriverBoundary(eventId, eReplay_OnlyDraw);
@@ -3554,6 +3557,9 @@ RDResult ReplayController::PostCreateInit(IReplayDriver *device, RDCFile *rdc)
   return m_FatalError;
 }
 
+static const uint32_t CheckpointUnmeasuredHitLimit = 4;
+static const uint32_t CheckpointPrewarmTrialRequestLimit = 12;
+
 static void PlanReplayCheckpointCandidates(const rdcarray<ActionDescription *> &actions,
                                            uint64_t resourceBytes, uint64_t captureBytes,
                                            ReplayCheckpointConfig &config,
@@ -3568,8 +3574,7 @@ static void PlanReplayCheckpointCandidates(const rdcarray<ActionDescription *> &
       lastEvent = RDCMAX(lastEvent, action->eventId);
 
   const uint64_t mib = 1024ULL * 1024;
-  config.byteBudget =
-      RDCMIN(2048 * mib, RDCMAX(64 * mib, resourceBytes / 4 + captureBytes / 16));
+  config.byteBudget = RDCMIN(512 * mib, RDCMAX(64 * mib, resourceBytes / 4 + captureBytes / 16));
   config.maxCheckpoints = lastEvent < 256 ? 2 : 3;
   config.minEventGap = RDCMAX(1U, RDCMIN(2048U, lastEvent / 32));
 
@@ -3616,11 +3621,10 @@ static void PlanReplayCheckpointCandidates(const rdcarray<ActionDescription *> &
   }
 
   // Bound driver planning cost without concentrating every candidate in one busy pass.
-  const uint32_t bucketWidth = RDCMAX(1U, (lastEvent + 63) / 64);
+  const uint32_t bucketWidth = RDCMAX(1U, uint32_t((uint64_t(lastEvent) + 63) / 64));
   for(const ReplayCheckpointCandidate &candidate : candidates)
   {
-    if(!planned.empty() &&
-       planned.back().eventId / bucketWidth == candidate.eventId / bucketWidth)
+    if(!planned.empty() && planned.back().eventId / bucketWidth == candidate.eventId / bucketWidth)
     {
       if(candidate.priority > planned.back().priority)
         planned.back() = candidate;
@@ -3670,6 +3674,7 @@ void ReplayController::ConfigureInitialReplayCheckpoints()
   }
   PlanReplayCheckpoints();
   m_CheckpointAutomatic = true;
+  m_CheckpointIdlePrewarm = Process::GetEnvVariable("RENDERDOC_REPLAY_DISABLE_IDLE_PREWARM") != "1";
   m_CheckpointControlMode = "automatic";
   m_CheckpointAutoCapacity = m_CheckpointConfig.maxCheckpoints;
   m_CheckpointConfig.byteBudget = RDCMIN<uint64_t>(m_CheckpointConfig.byteBudget, 512ULL * 1024 * 1024);
@@ -3678,8 +3683,8 @@ void ReplayController::ConfigureInitialReplayCheckpoints()
   const ReplayCheckpointStats stats = m_pDevice->GetReplayCheckpointStats();
   if(!stats.supported)
     m_CheckpointAutoReason = "backendUnsupported";
-  // Loading never builds checkpoints or adds speculative GPU work. Two ordinary visits to the
-  // same EID/path establish a baseline; repeated value edits have their own first-consumer trial.
+  // Initialisation only plans CPU metadata. After the first image is published, the idle queue
+  // may build one bounded prefix at a time; native safety and memory checks remain authoritative.
 }
 
 void ReplayController::ResetAutomaticCheckpointCosts(uint32_t firstAffectedEvent)
@@ -3687,6 +3692,8 @@ void ReplayController::ResetAutomaticCheckpointCosts(uint32_t firstAffectedEvent
   // Also invalidates idle receipts in explicit mode, including FileChanged where the public
   // render-output generation need not change. No previously measured hint is resurrected here.
   ++m_IdleCheckpointRevision;
+  m_MemoryRejectedCheckpointCandidates.clear();
+  m_IdleCheckpointMemoryNextCheck = 0;
   if(!m_CheckpointAutomatic)
     return;
   for(auto it = m_CheckpointReferenceCosts.begin(); it != m_CheckpointReferenceCosts.end();)
@@ -3708,6 +3715,7 @@ void ReplayController::ResetAutomaticCheckpointCosts(uint32_t firstAffectedEvent
       // same-event baseline before its benefit is assumed to survive as well.
       point.retained = false;
       point.hits = point.profitableHits = point.requests = 0;
+      point.unmeasuredHits = 0;
       ++i;
     }
   }
@@ -3734,7 +3742,9 @@ void ReplayController::ApplyAutomaticCheckpointConfiguration()
             [](const ReplayCheckpointCandidate &a, const ReplayCheckpointCandidate &b) {
               return a.eventId < b.eventId;
             });
-  m_CheckpointConfig.enabled = !candidates.empty();
+  // Keep a measured memory rejection available to the idle-only recovery probe. An empty policy
+  // admits no native point; explicit disable still cancels this state below.
+  m_CheckpointConfig.enabled = !candidates.empty() || !m_MemoryRejectedCheckpointCandidates.empty();
   // Same budget/capacity candidate extensions preserve native versions and cumulative stats.
   // Removing a rejected trial preserves the intersection; only disable/invalidation resets all.
   m_pDevice->ConfigureReplayCheckpoints(m_CheckpointConfig, candidates);
@@ -3746,8 +3756,8 @@ ReplayController::AutomaticCheckpointRequest ReplayController::BeginAutomaticChe
 {
   AutomaticCheckpointRequest request;
   if(m_IdleCheckpointMaintenance || !m_CheckpointAutomatic || !m_pDevice ||
-     m_pDevice->m_ReplayCheckpointBypass ||
-     m_FatalError != ResultCode::Succeeded || HasEventOverrides(eventId))
+     m_pDevice->m_ReplayCheckpointBypass || m_FatalError != ResultCode::Succeeded ||
+     HasEventOverrides(eventId))
     return request;
   request.before = m_pDevice->GetReplayCheckpointStats();
   if(!request.before.supported)
@@ -3767,6 +3777,23 @@ ReplayController::AutomaticCheckpointRequest ReplayController::BeginAutomaticChe
                       RDCMAX(reference.milliseconds[0], reference.milliseconds[1]) <= baseline * 1.25;
   request.reference = reference.count < requiredReferences || !stable ||
                       reference.hitsSinceReference >= 8;
+  // Give an idle-built point a short initial trial, counted across EIDs rather than per key.
+  // Once any eligible point exhausts that grace, the user's next request is the ordinary
+  // reference itself. No extra replay is submitted, and continuously new EIDs cannot renew it.
+  if(reference.count == 0 && reference.hitsSinceReference < 8)
+  {
+    bool prewarmedPrefix = false, unmeasuredLimit = false;
+    for(const AutomaticCheckpointPoint &point : m_AutomaticCheckpointPoints)
+      if(point.prewarmed && point.candidate.eventId < eventId)
+        for(uint32_t nativeEvent : point.nativeEvents)
+          if(nativeEvent < eventId && request.before.events.contains(nativeEvent))
+          {
+            prewarmedPrefix = true;
+            unmeasuredLimit |= point.unmeasuredHits >= CheckpointUnmeasuredHitLimit;
+          }
+    if(prewarmedPrefix && !unmeasuredLimit)
+      request.reference = false;
+  }
 
   bool pendingTrial = false, unpaid = false;
   for(const AutomaticCheckpointPoint &point : m_AutomaticCheckpointPoints)
@@ -3850,20 +3877,52 @@ void ReplayController::ObserveAutomaticCheckpointRequest(const AutomaticCheckpoi
                                                          double driverMS,
                                                          const ReplayCheckpointStats &after)
 {
-  if(!request.active || !(driverMS > 0.0 && driverMS < 60000.0))
+  if(!request.active)
     return;
+  const uint32_t target = uint32_t(request.key >> 3);
+  // Every eligible trial ages, including references and trials hidden behind a newer point.
+  // Otherwise a stream of unique EIDs (or an unused older point) could retain unproven storage
+  // forever. A successful measured retention below is still allowed on the last trial request.
+  for(AutomaticCheckpointPoint &point : m_AutomaticCheckpointPoints)
+    if(!point.retained && point.candidate.eventId < target)
+      ++point.requests;
+  const auto retireExpiredTrials = [&]() {
+    for(size_t i = 0; i < m_AutomaticCheckpointPoints.size();)
+    {
+      const AutomaticCheckpointPoint &point = m_AutomaticCheckpointPoints[i];
+      const uint32_t limit = point.prewarmed ? CheckpointPrewarmTrialRequestLimit : 6U;
+      if(!point.retained && point.requests >= limit)
+      {
+        m_RejectedCheckpointCandidates.insert(point.candidate.eventId);
+        m_AutomaticCheckpointPoints.erase(i);
+        m_CheckpointAutoConfigurationDirty = true;
+        m_CheckpointAutoState = "rejected";
+        m_CheckpointAutoReason = "boundedTrialExpired";
+      }
+      else
+        ++i;
+    }
+  };
+  // Even an unusually slow request or an invalid timer sample consumes the finite trial.
+  // Such samples must not train a baseline or claim any savings.
+  if(!(driverMS > 0.0 && driverMS < 60000.0))
+  {
+    retireExpiredTrials();
+    return;
+  }
   CheckpointReferenceCost &reference = m_CheckpointReferenceCosts[request.key];
   m_CheckpointAutoDebtMS += request.configurationMS;
   if(request.reference)
   {
     reference.Add(driverMS);
     m_CheckpointAutoReferences++;
+    retireExpiredTrials();
     return;
   }
   const double baseline = reference.Baseline();
-  const uint64_t builds = after.builds >= request.before.builds ? after.builds - request.before.builds : 0;
+  const uint64_t builds =
+      after.builds >= request.before.builds ? after.builds - request.before.builds : 0;
   const uint64_t hits = after.hits >= request.before.hits ? after.hits - request.before.hits : 0;
-  const uint32_t target = uint32_t(request.key >> 3);
   int trial = -1, owner = -1;
   for(size_t i = 0; i < m_AutomaticCheckpointPoints.size(); i++)
   {
@@ -3876,7 +3935,6 @@ void ReplayController::ObserveAutomaticCheckpointRequest(const AutomaticCheckpoi
   if(trial >= 0)
   {
     AutomaticCheckpointPoint &point = m_AutomaticCheckpointPoints[trial];
-    point.requests++;
     point.builds += uint32_t(builds);
     point.debtMS += request.configurationMS;
     for(uint32_t nativeEvent : after.events)
@@ -3907,11 +3965,20 @@ void ReplayController::ObserveAutomaticCheckpointRequest(const AutomaticCheckpoi
         m_CheckpointAutoDebtMS += penalty;
         point.retained = false;
         point.hits = point.profitableHits = point.requests = 0;
+        point.unmeasuredHits = 0;
         break;
       }
   }
   bool reject = false;
   int rejectIndex = -1;
+  if(owner >= 0 && builds == 0 && baseline == 0.0)
+  {
+    AutomaticCheckpointPoint &point = m_AutomaticCheckpointPoints[owner];
+    point.hits++;
+    point.unmeasuredHits = RDCMIN(point.unmeasuredHits + 1, CheckpointUnmeasuredHitLimit);
+    point.lastHitMS = driverMS;
+    reference.hitsSinceReference++;
+  }
   if(owner >= 0 && builds == 0 && baseline > 0.0)
   {
     AutomaticCheckpointPoint &point = m_AutomaticCheckpointPoints[owner];
@@ -3923,6 +3990,7 @@ void ReplayController::ObserveAutomaticCheckpointRequest(const AutomaticCheckpoi
     point.hits++;
     point.lastHitMS = cost;
     point.baselineMS = baseline;
+    point.unmeasuredHits = 0;
     reference.hitsSinceReference++;
     const double gain = baseline - cost;
     const double minimumGain = RDCMAX(point.bufferEdit ? 0.05 : 2.0, baseline * 0.10);
@@ -3944,7 +4012,8 @@ void ReplayController::ObserveAutomaticCheckpointRequest(const AutomaticCheckpoi
   if(trial >= 0 && !reject)
   {
     const AutomaticCheckpointPoint &point = m_AutomaticCheckpointPoints[trial];
-    if(!point.retained && (point.requests >= 6 || (point.requests >= 2 && point.builds == 0)))
+    const uint32_t limit = point.prewarmed ? CheckpointPrewarmTrialRequestLimit : 6U;
+    if(!point.retained && (point.requests >= limit || (point.requests >= 2 && point.builds == 0)))
     {
       reject = true;
       rejectIndex = trial;
@@ -3958,6 +4027,7 @@ void ReplayController::ObserveAutomaticCheckpointRequest(const AutomaticCheckpoi
     // Applied before the next eligible normal request. No rejected candidate is replayed again.
     m_CheckpointAutoConfigurationDirty = true;
   }
+  retireExpiredTrials();
   m_CheckpointAutoState = m_RejectedCheckpointCandidates.empty() ? "observing" : "rejected";
   for(const AutomaticCheckpointPoint &point : m_AutomaticCheckpointPoints)
     if(point.retained)
@@ -3997,8 +4067,9 @@ void ReplayController::EndAutomaticCheckpointRequest(const AutomaticCheckpointRe
 }
 
 void ReplayController::ConfigureReplayCheckpoints(bool enabled, uint64_t byteBudget,
-                                                 uint32_t maxCheckpoints)
+                                                  uint32_t maxCheckpoints)
 {
+  m_CheckpointIdlePrewarm = false;
   CHECK_REPLAY_THREAD();
   ++m_IdleCheckpointRevision;
   m_CheckpointAutomatic = false;
@@ -4006,6 +4077,9 @@ void ReplayController::ConfigureReplayCheckpoints(bool enabled, uint64_t byteBud
   m_AutomaticCheckpointPoints.clear();
   m_CheckpointReferenceCosts.clear();
   m_RejectedCheckpointCandidates.clear();
+  m_MemoryRejectedCheckpointCandidates.clear();
+  m_IdleCheckpointMemoryNextCheck = 0;
+  m_IdleCheckpointMemoryChecks = m_IdleCheckpointMemoryRecoveries = 0;
   m_CheckpointAutoConfigurationDirty = false;
   PlanReplayCheckpoints();
   m_CheckpointConfig.enabled = enabled;
@@ -4017,13 +4091,18 @@ void ReplayController::ConfigureReplayCheckpoints(bool enabled, uint64_t byteBud
 }
 
 rdcstr ReplayController::RunIdleCheckpointMaintenance(uint32_t expectedEventId,
-                                                     uint64_t expectedMutationGeneration,
-                                                     uint64_t expectedBufferGeneration)
+                                                      uint64_t expectedMutationGeneration,
+                                                      uint64_t expectedBufferGeneration)
 {
   CHECK_REPLAY_THREAD();
   PerformanceTimer timer;
   bool performed = false, candidateSelected = false;
+  bool planRejected = false, tryAnotherCandidate = false, continueIdle = false;
+  bool memoryPlanBlocked = false;
+  bool candidateRetired = false;
+  rdcstr planningReason;
   uint32_t candidateEvent = 0;
+  uint32_t retryIdleAfterMS = 0;
   double configurationMS = 0.0, replayMS = 0.0;
   ReplayCheckpointStats before, after;
   const auto receipt = [&](const char *reason) {
@@ -4043,15 +4122,18 @@ rdcstr ReplayController::RunIdleCheckpointMaintenance(uint32_t expectedEventId,
         "\"builds\":%llu,\"hits\":%llu,\"checkpointCountBefore\":%u,\"checkpointCountAfter\":%u,"
         "\"lastSaveEvent\":%u,\"lastResumeEvent\":%u,\"hasInitialCheckpoint\":%s,"
         "\"materialized\":%s,\"configurationMS\":%.6f,\"replayMS\":%.6f,\"totalMS\":%.6f,"
-        "\"backendReason\":\"%s\"}",
+        "\"continueIdle\":%s,\"retryIdleAfterMS\":%u,\"memoryChecks\":%u,"
+        "\"memoryRecoveries\":%u,\"backendReason\":\"%s\"}",
         performed ? "true" : "false", reason, expectedEventId, m_EventID,
         GetShaderReplacementGeneration(m_EventID), m_SharedBufferPatchGeneration,
         m_IdleCheckpointRevision, candidateSelected ? "true" : "false", candidateEvent,
         performed ? 1U : 0U, after.builds >= before.builds ? after.builds - before.builds : 0,
         after.hits >= before.hits ? after.hits - before.hits : 0, before.checkpointCount,
         after.checkpointCount, after.lastSaveEvent, after.lastResumeEvent,
-        after.hasInitialCheckpoint ? "true" : "false", IsCurrentEventMaterialized() ? "true" : "false",
-        configurationMS, replayMS, timer.GetMilliseconds(), backendReason.c_str());
+        after.hasInitialCheckpoint ? "true" : "false",
+        IsCurrentEventMaterialized() ? "true" : "false", configurationMS, replayMS,
+        timer.GetMilliseconds(), continueIdle ? "true" : "false", retryIdleAfterMS,
+        m_IdleCheckpointMemoryChecks, m_IdleCheckpointMemoryRecoveries, backendReason.c_str());
   };
 
   if(m_IdleCheckpointMaintenance)
@@ -4070,10 +4152,58 @@ rdcstr ReplayController::RunIdleCheckpointMaintenance(uint32_t expectedEventId,
     return receipt("currentEventNotMaterialized");
   if(HasEventOverrides(expectedEventId))
     return receipt("eventOverridesActive");
-  if(!m_CheckpointConfig.enabled || !m_CheckpointConfig.byteBudget || !m_CheckpointConfig.maxCheckpoints)
+  const bool prewarm = m_CheckpointAutomatic && m_CheckpointIdlePrewarm;
+  if((!m_CheckpointConfig.enabled && !prewarm) || !m_CheckpointConfig.byteBudget ||
+     !m_CheckpointConfig.maxCheckpoints)
     return receipt("checkpointsDisabled");
   if(m_pDevice->m_ReplayCheckpointBypass)
     return receipt("checkpointBypassActive");
+  if(prewarm && !m_MemoryRejectedCheckpointCandidates.empty())
+  {
+    // Only idle requests with current event/edit identities reach this CPU-only probe. A caller
+    // that ignores the UI timer cannot turn this into a busy loop or spend extra native queries.
+    before = after = m_pDevice->GetReplayCheckpointStats();
+    if(!before.memoryBudgetBlocked)
+    {
+      m_MemoryRejectedCheckpointCandidates.clear();
+      m_IdleCheckpointMemoryNextCheck = 0;
+    }
+    else if(m_IdleCheckpointMemoryChecks >= 16 || m_IdleCheckpointMemoryRecoveries >= 2 ||
+            m_CheckpointAutoTrials >= m_CheckpointAutoCapacity * 2)
+      return receipt("memoryBudgetRetryLimit");
+    else
+    {
+      const uint64_t now = Timing::GetTick();
+      if(now < m_IdleCheckpointMemoryNextCheck)
+      {
+        retryIdleAfterMS =
+            RDCMAX(750U, RDCMIN(5000U, uint32_t(double(m_IdleCheckpointMemoryNextCheck - now) /
+                                                    Timing::GetTickFrequency() +
+                                                1.0)));
+        return receipt("memoryBudgetWaiting");
+      }
+      ++m_IdleCheckpointMemoryChecks;
+      if(m_pDevice->RefreshReplayCheckpointMemoryBudget())
+      {
+        // A budget recovery never forgives a safety, allocation, or profitability rejection.
+        // Re-run full native admission for just the candidates rejected before such analysis.
+        for(uint32_t event : m_MemoryRejectedCheckpointCandidates)
+          m_RejectedCheckpointCandidates.erase(event);
+        m_MemoryRejectedCheckpointCandidates.clear();
+        m_IdleCheckpointMemoryNextCheck = 0;
+        ++m_IdleCheckpointMemoryRecoveries;
+        ++m_IdleCheckpointRevision;
+        m_IdleCheckpointAttempted = false;
+      }
+      else
+      {
+        m_IdleCheckpointMemoryNextCheck = now + uint64_t(5000.0 * Timing::GetTickFrequency());
+        if(m_IdleCheckpointMemoryChecks < 16)
+          retryIdleAfterMS = 5000;
+        return receipt(retryIdleAfterMS ? "memoryBudgetWaiting" : "memoryBudgetRetryLimit");
+      }
+    }
+  }
   if(m_IdleCheckpointAttempted && m_IdleCheckpointLastEvent == expectedEventId &&
      m_IdleCheckpointLastMutation == expectedMutationGeneration &&
      m_IdleCheckpointLastBuffer == expectedBufferGeneration &&
@@ -4081,7 +4211,7 @@ rdcstr ReplayController::RunIdleCheckpointMaintenance(uint32_t expectedEventId,
     return receipt("alreadyAttempted");
 
   before = after = m_pDevice->GetReplayCheckpointStats();
-  if(!before.supported || !before.enabled)
+  if(!before.supported || (!before.enabled && !prewarm))
     return receipt("backendDisabledOrUnsupported");
   bool hasPrefix = false;
   uint32_t newestPrefix = 0;
@@ -4122,8 +4252,54 @@ rdcstr ReplayController::RunIdleCheckpointMaintenance(uint32_t expectedEventId,
         owner = int(i);
       }
     }
+    if(!candidateSelected && prewarm &&
+       m_AutomaticCheckpointPoints.size() < m_CheckpointAutoCapacity &&
+       m_CheckpointAutoTrials < m_CheckpointAutoCapacity * 2)
+    {
+      // Spread a small number of states across the already materialised prefix. Neither marker
+      // strings nor captured IDs participate. Choosing one new candidate keeps each idle work
+      // unit bounded and lets foreground requests run between successive units.
+      const uint32_t target =
+          newestPrefix + RDCMAX(1U, (m_EventID - newestPrefix) /
+                                        (m_CheckpointAutoCapacity -
+                                         uint32_t(m_AutomaticCheckpointPoints.size()) + 1));
+      const ReplayCheckpointCandidate *selected = NULL;
+      for(const ReplayCheckpointCandidate &candidate : m_CheckpointCandidates)
+      {
+        if(!eligiblePosition(candidate.eventId))
+          continue;
+        bool owned = false;
+        for(const AutomaticCheckpointPoint &point : m_AutomaticCheckpointPoints)
+          owned |= point.candidate.eventId == candidate.eventId;
+        if(owned)
+          continue;
+        const uint32_t distance =
+            candidate.eventId > target ? candidate.eventId - target : target - candidate.eventId;
+        const uint32_t previousDistance = !selected                    ? ~0U
+                                          : selected->eventId > target ? selected->eventId - target
+                                                                       : target - selected->eventId;
+        if(!selected || distance < previousDistance ||
+           (distance == previousDistance && candidate.priority > selected->priority))
+          selected = &candidate;
+      }
+      if(selected)
+      {
+        AutomaticCheckpointPoint point;
+        point.candidate = *selected;
+        point.prewarmed = true;
+        owner = int(m_AutomaticCheckpointPoints.size());
+        m_AutomaticCheckpointPoints.push_back(point);
+        policy.push_back(point.candidate);
+        candidateSelected = true;
+        candidateEvent = point.candidate.eventId;
+        ++m_CheckpointAutoTrials;
+        m_CheckpointConfig.enabled = true;
+        m_CheckpointAutoState = "prewarming";
+        m_CheckpointAutoReason = "idleStagePrebuild";
+      }
+    }
     if(!candidateSelected)
-      return receipt("noMissingMeasuredUsefulPoint");
+      return receipt(prewarm ? "noMissingIdleCandidate" : "noMissingMeasuredUsefulPoint");
     maintenance.push_back(m_AutomaticCheckpointPoints[owner].candidate);
   }
   else
@@ -4186,9 +4362,20 @@ rdcstr ReplayController::RunIdleCheckpointMaintenance(uint32_t expectedEventId,
       PerformanceTimer configureTimer;
       m_pDevice->ConfigureReplayCheckpoints(m_CheckpointConfig, maintenance);
       configurationMS += configureTimer.GetMilliseconds();
+      const ReplayCheckpointStats planned = m_pDevice->GetReplayCheckpointStats();
+      if(planned.candidatePlanKnown)
+      {
+        bool missingNative = false;
+        for(uint32_t event : planned.candidateEvents)
+          missingNative |= event < m_EventID && !before.events.contains(event);
+        planRejected = !missingNative;
+        tryAnotherCandidate = planRejected && planned.canTryOtherCandidates;
+        memoryPlanBlocked = planRejected && planned.memoryBudgetBlocked;
+        planningReason = planned.reason;
+      }
     }
     FatalErrorCheck();
-    if(m_FatalError == ResultCode::Succeeded && requestStillCurrent())
+    if(m_FatalError == ResultCode::Succeeded && requestStillCurrent() && !planRejected)
     {
       m_pDevice->m_ReplayCheckpointBypass = false;
       m_pDevice->m_ReplayCheckpointNaturalReference = false;
@@ -4201,6 +4388,8 @@ rdcstr ReplayController::RunIdleCheckpointMaintenance(uint32_t expectedEventId,
     }
   }
   after = m_pDevice->GetReplayCheckpointStats();
+  if(planRejected)
+    after.reason = planningReason;
   const double elapsed = timer.GetMilliseconds();
   if(performed)
     ++m_IdleCheckpointWorkUnits;
@@ -4221,8 +4410,27 @@ rdcstr ReplayController::RunIdleCheckpointMaintenance(uint32_t expectedEventId,
       {
         point.retained = false;
         point.hits = point.profitableHits = point.requests = 0;
+        point.unmeasuredHits = 0;
         m_CheckpointAutoState = "trial";
         m_CheckpointAutoReason = "idleRebuildRequiresIndependentHitEvidence";
+      }
+      else if(point.prewarmed && point.nativeEvents.empty())
+      {
+        // Memory pressure and unsupported boundaries must not become an endless background
+        // replay loop. Existing proven points remain in the compatible policy.
+        m_RejectedCheckpointCandidates.insert(point.candidate.eventId);
+        if(memoryPlanBlocked)
+        {
+          m_MemoryRejectedCheckpointCandidates.insert(point.candidate.eventId);
+          m_IdleCheckpointMemoryNextCheck =
+              Timing::GetTick() + uint64_t(5000.0 * Timing::GetTickFrequency());
+          if(m_IdleCheckpointMemoryChecks < 16 && m_IdleCheckpointMemoryRecoveries < 2 &&
+             m_CheckpointAutoTrials < m_CheckpointAutoCapacity * 2)
+            retryIdleAfterMS = 5000;
+        }
+        m_AutomaticCheckpointPoints.erase(owner);
+        candidateRetired = true;
+        m_CheckpointAutoConfigurationDirty = true;
       }
     }
   }
@@ -4233,8 +4441,20 @@ rdcstr ReplayController::RunIdleCheckpointMaintenance(uint32_t expectedEventId,
     m_MaterializedEventValid = false;
     InvalidateScrubReplay();
   }
-  const char *reason = !coherent ? "replayFailedOrStateChanged" :
-                       after.builds > before.builds ? "checkpointBuilt" : "replayedWithoutNewCheckpoint";
+  continueIdle =
+      coherent && prewarm &&
+      (after.builds > before.builds || (tryAnotherCandidate && candidateRetired &&
+                                        m_CheckpointAutoTrials < m_CheckpointAutoCapacity * 2));
+  if(continueIdle)
+  {
+    // Native planning may reject one module before any GPU work. Try a different candidate in
+    // the next idle unit, within the same finite trial budget. Storage failures stay suppressed.
+    m_IdleCheckpointAttempted = false;
+  }
+  const char *reason = !coherent                      ? "replayFailedOrStateChanged"
+                       : after.builds > before.builds ? "checkpointBuilt"
+                       : planRejected                 ? "candidateUnavailable"
+                                                      : "replayedWithoutNewCheckpoint";
   if(EIDTimingEnabled())
     AppendReplayTimingLog(StringFormat::Fmt(
         "api=ReplayCheckpointMaintenance eid=%u candidate=%u reason=%s builds=%llu hits=%llu "
@@ -4284,21 +4504,27 @@ rdcstr ReplayController::GetReplayCheckpointStatus()
       "\"metric\":\"WithoutDrawPlusOnlyDrawDriverWall\",\"resourceLogicalBytes\":%llu,"
       "\"naturalReferenceVisits\":%llu,\"trialCount\":%u,\"trialLimit\":%u,"
       "\"incrementalCostMS\":%.3f,\"observedSavingsMS\":%.3f,\"configurationPending\":%s,"
+      "\"idlePrewarmEnabled\":%s,\"idleWorkUnits\":%llu,\"idleTotalMS\":%.3f,"
       "\"points\":[",
       m_CheckpointControlMode, m_CheckpointAutoState, m_CheckpointAutoReason,
       m_CheckpointResourceBytes, m_CheckpointAutoReferences, m_CheckpointAutoTrials,
       m_CheckpointAutoCapacity * 2, m_CheckpointAutoDebtMS, m_CheckpointAutoSavingsMS,
-      m_CheckpointAutoConfigurationDirty ? "true" : "false");
+      m_CheckpointAutoConfigurationDirty ? "true" : "false",
+      m_CheckpointIdlePrewarm ? "true" : "false", m_IdleCheckpointWorkUnits, m_IdleCheckpointTotalMS);
   for(size_t i = 0; i < m_AutomaticCheckpointPoints.size(); i++)
   {
     const AutomaticCheckpointPoint &point = m_AutomaticCheckpointPoints[i];
     result += StringFormat::Fmt(
-        "%s{\"candidateEvent\":%u,\"moduleId\":%u,\"state\":\"%s\",\"bufferEdit\":%s,"
+        "%s{\"candidateEvent\":%u,\"moduleId\":%u,\"state\":\"%s\",\"bufferEdit\":%s,\"prewarmed\":"
+        "%s,"
         "\"requests\":%u,\"builds\":%u,\"hits\":%u,\"profitableHits\":%u,"
+        "\"unmeasuredHits\":%u,\"trialRequestLimit\":%u,"
         "\"baselineMS\":%.3f,\"remainingCostMS\":%.3f,\"lastHitMS\":%s,\"nativeEvents\":[",
         i ? "," : "", point.candidate.eventId, point.candidate.moduleId,
         point.retained ? "retained" : "trial", point.bufferEdit ? "true" : "false",
-        point.requests, point.builds, point.hits, point.profitableHits, point.baselineMS, point.debtMS,
+        point.prewarmed ? "true" : "false", point.requests, point.builds, point.hits,
+        point.profitableHits, point.unmeasuredHits,
+        point.prewarmed ? CheckpointPrewarmTrialRequestLimit : 6U, point.baselineMS, point.debtMS,
         point.hits ? StringFormat::Fmt("%.3f", point.lastHitMS).c_str() : "null");
     size_t n = 0;
     for(uint32_t event : point.nativeEvents)
@@ -4423,6 +4649,7 @@ void ReplayController::FetchPipelineState(uint32_t eventId)
 }
 
 #if ENABLED(ENABLE_UNIT_TESTS)
+#include <limits>
 #include "catch/catch.hpp"
 
 // No GPU, window, network or replay file: unexpected native operations fail the test.
@@ -4830,8 +5057,13 @@ public:
   ReplayCheckpointStats stats;
   std::function<void()> onReplay;
   bool build = true, fail = false;
+  uint32_t rejectedPlanEvent = 0;
+  uint32_t memoryProbes = 0;
+  bool memoryRecovers = false;
   uint32_t patchAnchor = 0;
   uint32_t shutdowns = 0;
+  rdcstr overrideError;
+  rdcstr ApplyEventCBufferOverrides(uint32_t eventId) override { return overrideError; }
   void Shutdown() override { ++shutdowns; }
   IReplayDriver *MakeDummyDriver() override { return this; }
   RDResult FatalErrorCheck() override
@@ -4845,12 +5077,31 @@ public:
     configurations.push_back(next);
     candidates = next;
     stats.enabled = config.enabled;
+    if(!config.enabled)
+      stats.memoryBudgetBlocked = false;
+    if(stats.candidatePlanKnown)
+    {
+      stats.candidateEvents.clear();
+      for(const auto &candidate : next)
+        if(candidate.eventId != rejectedPlanEvent)
+          stats.candidateEvents.push_back(candidate.eventId);
+    }
     for(size_t i = stats.events.size(); i > 0; --i)
       if(!ReplayCheckpointCandidateContains(candidates, stats.events[i - 1]))
         stats.events.erase(i - 1);
     stats.checkpointCount = uint32_t(stats.events.size());
   }
   ReplayCheckpointStats GetReplayCheckpointStats() override { return stats; }
+  bool RefreshReplayCheckpointMemoryBudget() override
+  {
+    ++memoryProbes;
+    if(!memoryRecovers || !stats.memoryBudgetBlocked)
+      return false;
+    stats.memoryBudgetBlocked = false;
+    stats.canTryOtherCandidates = true;
+    rejectedPlanEvent = 0;
+    return true;
+  }
   void InvalidateReplayCheckpoints(uint32_t firstAffectedEvent) override
   {
     for(size_t i = stats.events.size(); i > 0; --i)
@@ -4967,7 +5218,7 @@ struct ReplayControllerTestAccess
       CHECK((driver.calls[0].type == eReplay_WithoutDraw));
       CHECK((driver.calls[1].type == eReplay_OnlyDraw));
       CHECK_FALSE(driver.calls[0].bypass);
-      CHECK(driver.calls[1].bypass);
+      CHECK_FALSE(driver.calls[1].bypass);
       CHECK_FALSE(driver.calls[0].naturalReference);
       CHECK_FALSE(driver.calls[1].naturalReference);
       CHECK_FALSE(driver.calls[0].prefixOnly);
@@ -4984,6 +5235,50 @@ struct ReplayControllerTestAccess
       CHECK(run().contains("alreadyAttempted"));
       CHECK(driver.calls.size() == 2);
     }
+    SECTION("Local shadows bypass target publication without changing the canonical prefix")
+    {
+      ReplayController::EventCBufferOverrideKey key = {};
+      key.eventId = 100;
+      key.stage = ShaderStage::Pixel;
+      controller.m_EventCBufferOverrides.insert(key);
+      controller.ReplayEvent(100, false, false, false);
+      REQUIRE(driver.calls.size() == 2);
+      CHECK_FALSE(driver.calls[0].bypass);
+      CHECK(driver.calls[1].bypass);
+      CHECK_FALSE(driver.m_ReplayCheckpointBypass);
+      REQUIRE(controller.m_EventCBufferOverrides.size() == 1);
+    }
+    SECTION("Outer force and analysis bypass survives both target phases")
+    {
+      driver.m_ReplayCheckpointBypass = true;
+      controller.ReplayEvent(100, false, false, false);
+      REQUIRE(driver.calls.size() == 2);
+      CHECK(driver.calls[0].bypass);
+      CHECK(driver.calls[1].bypass);
+      CHECK(driver.m_ReplayCheckpointBypass);
+    }
+    SECTION("A rejected native override cannot publish target resource versions")
+    {
+      driver.overrideError = "test rejected override";
+      controller.ReplayEvent(100, false, false, false);
+      REQUIRE(driver.calls.size() == 2);
+      CHECK_FALSE(driver.calls[0].bypass);
+      CHECK(driver.calls[1].bypass);
+      CHECK_FALSE(driver.m_ReplayCheckpointBypass);
+      CHECK(controller.m_LastEventOverrideError == driver.overrideError);
+    }
+    SECTION("An override at another EID cannot suppress the ordinary target lineage")
+    {
+      ReplayController::EventCBufferOverrideKey key = {};
+      key.eventId = 80;
+      key.stage = ShaderStage::Pixel;
+      controller.m_EventCBufferOverrides.insert(key);
+      controller.ReplayEvent(100, false, false, false);
+      REQUIRE(driver.calls.size() == 2);
+      CHECK_FALSE(driver.calls[0].bypass);
+      CHECK_FALSE(driver.calls[1].bypass);
+      CHECK_FALSE(driver.m_ReplayCheckpointBypass);
+    }
     SECTION("Foreground shared replay leaves the invalidated suffix for idle maintenance")
     {
       driver.patchAnchor = 60;
@@ -4993,7 +5288,7 @@ struct ReplayControllerTestAccess
         // The production setter scopes precisely this replay operation; no resource mutation,
         // output or pipeline stubs are required to verify its checkpoint scheduling contract.
         ScopedSharedBufferPatchReplay sharedReplay(controller.m_pDevice,
-                                                    controller.m_SharedBufferPatchReplay);
+                                                   controller.m_SharedBufferPatchReplay);
         controller.ReplayEvent(100, false, false, false);
       }
       REQUIRE(driver.calls.size() == 2);
@@ -5035,7 +5330,188 @@ struct ReplayControllerTestAccess
       CHECK(controller.RunIdleCheckpointMaintenance(100, 8, 6).contains("noMissingExplicitCandidate"));
       CHECK(driver.calls.size() == 4);
     }
-    SECTION("Automatic maintenance requires existing measured usefulness")
+    SECTION("Cold automatic prewarming builds bounded prefixes without changing the selected event")
+    {
+      controller.m_CheckpointAutomatic = controller.m_CheckpointIdlePrewarm = true;
+      controller.m_CheckpointAutoCapacity = 3;
+      controller.m_CheckpointConfig.enabled = driver.stats.enabled = false;
+      CHECK(run().contains("checkpointBuilt"));
+      REQUIRE(driver.calls.size() == 2);
+      CHECK(driver.stats.events.contains(60U));
+      CHECK_FALSE(driver.stats.events.contains(80U));
+      CHECK(controller.m_EventID == 100);
+      CHECK(controller.m_SelectedEventID == 90);
+      CHECK(controller.IsCurrentEventMaterialized());
+      CHECK(controller.m_CheckpointAutoReferences == 0);
+      CHECK(controller.m_CheckpointAutoSavingsMS == 0.0);
+      CHECK(controller.m_AutomaticCheckpointPoints[0].prewarmed);
+      CHECK_FALSE(controller.m_AutomaticCheckpointPoints[0].retained);
+      CHECK(run().contains("checkpointBuilt"));
+      CHECK(driver.calls.size() == 4);
+      CHECK(driver.stats.events.contains(60U));
+      CHECK(driver.stats.events.contains(80U));
+      CHECK(run().contains("noMissingIdleCandidate"));
+      CHECK(driver.calls.size() == 4);
+      const auto request = controller.BeginAutomaticCheckpointRequest(100, 3);
+      CHECK(request.active);
+      CHECK_FALSE(request.reference);
+      CHECK_FALSE(driver.m_ReplayCheckpointBypass);
+      controller.EndAutomaticCheckpointRequest(request, 1.0);
+      CHECK(controller.m_CheckpointAutoReferences == 0);
+    }
+    SECTION("Cold prewarming honours capacity and does not spin after rejected native storage")
+    {
+      controller.m_CheckpointAutomatic = controller.m_CheckpointIdlePrewarm = true;
+      controller.m_CheckpointAutoCapacity = 1;
+      controller.m_CheckpointConfig.enabled = driver.stats.enabled = false;
+      driver.build = false;
+      CHECK(run().contains("replayedWithoutNewCheckpoint"));
+      CHECK(driver.calls.size() == 2);
+      CHECK(controller.m_AutomaticCheckpointPoints.empty());
+      CHECK(controller.m_RejectedCheckpointCandidates.count(60));
+      CHECK(run().contains("alreadyAttempted"));
+      CHECK(driver.calls.size() == 2);
+      CHECK(controller.IsCurrentEventMaterialized());
+    }
+    SECTION(
+        "Native planning skips unavailable modules without replay and tries another bounded point")
+    {
+      controller.m_CheckpointAutomatic = controller.m_CheckpointIdlePrewarm = true;
+      controller.m_CheckpointAutoCapacity = 2;
+      controller.m_CheckpointConfig.enabled = driver.stats.enabled = false;
+      driver.stats.candidatePlanKnown = driver.stats.canTryOtherCandidates = true;
+      driver.rejectedPlanEvent = 60;
+      const rdcstr unavailable = run();
+      CHECK(unavailable.contains("candidateUnavailable"));
+      CHECK(unavailable.contains("\"continueIdle\":true"));
+      CHECK(unavailable.contains("\"performed\":false"));
+      CHECK(driver.calls.empty());
+      CHECK(controller.m_RejectedCheckpointCandidates.count(60));
+      CHECK(controller.IsCurrentEventMaterialized());
+      CHECK(run().contains("checkpointBuilt"));
+      CHECK(driver.stats.events.contains(80U));
+      CHECK(driver.calls.size() == 2);
+      CHECK(controller.m_CheckpointAutoTrials == 2);
+      CHECK(run().contains("noMissingIdleCandidate"));
+      CHECK(driver.calls.size() == 2);
+    }
+    SECTION("Unavailable native storage does not replay or keep retrying idle configurations")
+    {
+      controller.m_CheckpointAutomatic = controller.m_CheckpointIdlePrewarm = true;
+      controller.m_CheckpointAutoCapacity = 2;
+      controller.m_CheckpointConfig.enabled = driver.stats.enabled = false;
+      driver.stats.candidatePlanKnown = true;
+      driver.stats.canTryOtherCandidates = false;
+      driver.rejectedPlanEvent = 60;
+      const rdcstr unavailable = run();
+      CHECK(unavailable.contains("candidateUnavailable"));
+      CHECK(unavailable.contains("\"continueIdle\":false"));
+      CHECK(driver.calls.empty());
+      CHECK(run().contains("alreadyAttempted"));
+      CHECK(driver.calls.empty());
+      CHECK(driver.memoryProbes == 0);
+      CHECK(controller.m_MemoryRejectedCheckpointCandidates.empty());
+    }
+    SECTION(
+        "Only measured memory recovery reopens its candidate without forgiving other rejections")
+    {
+      controller.m_CheckpointAutomatic = controller.m_CheckpointIdlePrewarm = true;
+      controller.m_CheckpointAutoCapacity = 2;
+      controller.m_CheckpointConfig.enabled = driver.stats.enabled = false;
+      driver.stats.candidatePlanKnown = driver.stats.memoryBudgetBlocked = true;
+      driver.rejectedPlanEvent = 60;
+      controller.m_RejectedCheckpointCandidates.insert(80);
+      const rdcstr rejected = run();
+      CHECK(rejected.contains("candidateUnavailable"));
+      CHECK(rejected.contains("\"continueIdle\":false"));
+      CHECK(rejected.contains("\"retryIdleAfterMS\":5000"));
+      CHECK(controller.m_MemoryRejectedCheckpointCandidates.count(60));
+      CHECK(driver.calls.empty());
+      // Removing an automatic trial must preserve the blocked native capability, not disable it.
+      controller.ApplyAutomaticCheckpointConfiguration();
+      CHECK(driver.stats.enabled);
+      CHECK(driver.stats.memoryBudgetBlocked);
+      for(uint32_t repeat = 0; repeat < 4; ++repeat)
+        CHECK(run().contains("memoryBudgetWaiting"));
+      CHECK(driver.memoryProbes == 0);
+      controller.m_IdleCheckpointMemoryNextCheck = 0;
+      CHECK(run().contains("memoryBudgetWaiting"));
+      CHECK(driver.memoryProbes == 1);
+      CHECK(driver.calls.empty());
+      CHECK(controller.m_RejectedCheckpointCandidates.count(60));
+      driver.memoryRecovers = true;
+      controller.m_IdleCheckpointMemoryNextCheck = 0;
+      CHECK(run().contains("checkpointBuilt"));
+      CHECK(driver.memoryProbes == 2);
+      CHECK(driver.stats.events.contains(60U));
+      CHECK(driver.calls.size() == 2);
+      CHECK(controller.m_RejectedCheckpointCandidates.count(60) == 0);
+      CHECK(controller.m_RejectedCheckpointCandidates.count(80) == 1);
+      CHECK(controller.m_CheckpointAutoTrials == 2);
+      CHECK(controller.m_IdleCheckpointMemoryRecoveries == 1);
+      CHECK(controller.IsCurrentEventMaterialized());
+      CHECK(controller.m_EventID == 100);
+      CHECK(controller.m_SelectedEventID == 90);
+      CHECK(controller.m_SharedBufferPatchGeneration == 5);
+      CHECK(controller.GetShaderReplacementGeneration(100) == 7);
+    }
+    SECTION("Memory probes honour request identities, bypass, and a finite monotonic timer budget")
+    {
+      controller.m_CheckpointAutomatic = controller.m_CheckpointIdlePrewarm = true;
+      controller.m_CheckpointAutoCapacity = 2;
+      controller.m_CheckpointConfig.enabled = driver.stats.enabled = false;
+      driver.stats.candidatePlanKnown = driver.stats.memoryBudgetBlocked = true;
+      driver.rejectedPlanEvent = 60;
+      CHECK(run().contains("candidateUnavailable"));
+      controller.m_IdleCheckpointMemoryNextCheck = 0;
+      CHECK(controller.RunIdleCheckpointMaintenance(99, 7, 5).contains("staleEvent"));
+      CHECK(controller.RunIdleCheckpointMaintenance(100, 6, 5).contains("staleMutation"));
+      CHECK(controller.RunIdleCheckpointMaintenance(100, 7, 4).contains("staleBufferGeneration"));
+      driver.m_ReplayCheckpointBypass = true;
+      CHECK(run().contains("checkpointBypassActive"));
+      driver.m_ReplayCheckpointBypass = false;
+      CHECK(driver.memoryProbes == 0);
+      for(uint32_t attempt = 0; attempt < 16; ++attempt)
+      {
+        controller.m_IdleCheckpointMemoryNextCheck = 0;
+        const rdcstr pending = run();
+        CHECK(pending.contains("\"performed\":false"));
+        CHECK(pending.contains("\"continueIdle\":false"));
+        CHECK(driver.memoryProbes == attempt + 1);
+      }
+      CHECK(run().contains("memoryBudgetRetryLimit"));
+      CHECK(run().contains("\"retryIdleAfterMS\":0"));
+      CHECK(driver.memoryProbes == 16);
+      CHECK(driver.calls.empty());
+      CHECK(controller.m_RejectedCheckpointCandidates.count(60));
+      CHECK(controller.IsCurrentEventMaterialized());
+    }
+    SECTION("Edits and explicit disable cancel pending memory probes")
+    {
+      controller.m_CheckpointAutomatic = controller.m_CheckpointIdlePrewarm = true;
+      controller.m_CheckpointAutoCapacity = 2;
+      controller.m_CheckpointConfig.enabled = driver.stats.enabled = false;
+      driver.stats.candidatePlanKnown = driver.stats.memoryBudgetBlocked = true;
+      driver.rejectedPlanEvent = 60;
+      CHECK(run().contains("candidateUnavailable"));
+      controller.m_IdleCheckpointMemoryRecoveries = 2;
+      controller.m_IdleCheckpointMemoryNextCheck = 0;
+      CHECK(run().contains("memoryBudgetRetryLimit"));
+      CHECK(driver.memoryProbes == 0);
+      controller.ResetAutomaticCheckpointCosts(0);
+      CHECK(controller.m_MemoryRejectedCheckpointCandidates.empty());
+      CHECK(controller.m_IdleCheckpointMemoryNextCheck == 0);
+      CHECK(controller.m_IdleCheckpointMemoryRecoveries == 2);
+      controller.m_MemoryRejectedCheckpointCandidates.insert(60);
+      controller.m_IdleCheckpointMemoryNextCheck = 1;
+      controller.ConfigureReplayCheckpoints(false);
+      CHECK(controller.m_MemoryRejectedCheckpointCandidates.empty());
+      CHECK(controller.m_IdleCheckpointMemoryNextCheck == 0);
+      CHECK_FALSE(driver.stats.memoryBudgetBlocked);
+      CHECK(run().contains("checkpointsDisabled"));
+      CHECK(driver.memoryProbes == 0);
+    }
+    SECTION("Automatic maintenance without prewarming requires existing measured usefulness")
     {
       controller.m_CheckpointAutomatic = true;
       ReplayController::AutomaticCheckpointPoint point;
@@ -5147,6 +5623,145 @@ struct ReplayControllerTestAccess
     }
   }
 
+  static void CheckAutomaticPrewarmLifetime()
+  {
+    ReplayController controller;
+    IdleCheckpointTestDriver driver;
+    controller.m_pDevice = &driver;
+    struct DetachDriver
+    {
+      ReplayController &controller;
+      ~DetachDriver() { controller.m_pDevice = NULL; }
+    } detach = {controller};
+    controller.m_CheckpointAutomatic = true;
+    controller.m_CheckpointAutoCapacity = 1;
+    controller.m_CheckpointAutoTrials = 1;
+    controller.m_CheckpointConfig.enabled = true;
+    controller.m_CheckpointConfig.byteBudget = 1024 * 1024;
+    controller.m_CheckpointConfig.maxCheckpoints = 1;
+    controller.m_CheckpointConfig.minEventGap = 1;
+    ReplayController::AutomaticCheckpointPoint point;
+    point.candidate.eventId = 60;
+    point.prewarmed = true;
+    point.builds = 1;
+    point.nativeEvents.insert(60);
+    controller.m_AutomaticCheckpointPoints = {point};
+    controller.m_CheckpointCandidates = driver.candidates = {point.candidate};
+    driver.stats.supported = driver.stats.enabled = true;
+    driver.stats.events = {60};
+    driver.stats.checkpointCount = 1;
+    driver.build = false;
+    const auto visit = [&](uint32_t event, double hitMS) {
+      const size_t calls = driver.calls.size();
+      const auto request = controller.BeginAutomaticCheckpointRequest(event, 0);
+      REQUIRE(request.active);
+      CHECK(driver.calls.size() == calls);
+      driver.ReplayLog(event, eReplay_WithoutDraw);
+      driver.ReplayLog(event, eReplay_OnlyDraw);
+      controller.EndAutomaticCheckpointRequest(request, request.reference ? 100.0 : hitMS);
+      CHECK(driver.calls.size() == calls + 2);
+      CHECK_FALSE(driver.m_ReplayCheckpointBypass);
+      CHECK_FALSE(driver.m_ReplayCheckpointNaturalReference);
+      return request.reference;
+    };
+    SECTION("Continuously new EIDs expire every unproven point, including a shadowed one")
+    {
+      point.candidate.eventId = 40;
+      point.nativeEvents = {40};
+      controller.m_AutomaticCheckpointPoints.push_back(point);
+      controller.m_CheckpointAutoCapacity = 2;
+      controller.m_CheckpointAutoTrials = 2;
+      controller.m_CheckpointCandidates.push_back(point.candidate);
+      driver.stats.events = {40, 60};
+      driver.stats.checkpointCount = 2;
+      for(uint32_t i = 0; i < CheckpointPrewarmTrialRequestLimit; ++i)
+      {
+        CHECK(visit(100 + i, 130.0) == (i >= CheckpointUnmeasuredHitLimit));
+        if(i + 1 < CheckpointPrewarmTrialRequestLimit)
+        {
+          REQUIRE(controller.m_AutomaticCheckpointPoints.size() == 2);
+          CHECK(controller.m_AutomaticCheckpointPoints[0].requests == i + 1);
+          CHECK(controller.m_AutomaticCheckpointPoints[1].requests == i + 1);
+        }
+      }
+      CHECK(controller.m_AutomaticCheckpointPoints.empty());
+      CHECK(controller.m_RejectedCheckpointCandidates.count(40) == 1);
+      CHECK(controller.m_RejectedCheckpointCandidates.count(60) == 1);
+      CHECK(controller.m_CheckpointAutoReferences ==
+            CheckpointPrewarmTrialRequestLimit - CheckpointUnmeasuredHitLimit);
+      CHECK(controller.m_CheckpointAutoSavingsMS == 0.0);
+      CHECK(visit(130, 130.0));
+      CHECK(driver.stats.events.empty());
+      CHECK_FALSE(driver.stats.enabled);
+      CHECK(controller.m_CheckpointAutoTrials == 2);
+    }
+    SECTION("Invalid and very slow timings still exhaust the finite trial")
+    {
+      const double samples[] = {0.0,
+                                -1.0,
+                                60000.0,
+                                60001.0,
+                                std::numeric_limits<double>::quiet_NaN(),
+                                std::numeric_limits<double>::infinity()};
+      for(uint32_t i = 0; i < CheckpointPrewarmTrialRequestLimit; ++i)
+        visit(100 + i, samples[i % ARRAY_COUNT(samples)]);
+      CHECK(controller.m_AutomaticCheckpointPoints.empty());
+      CHECK(controller.m_RejectedCheckpointCandidates.count(60) == 1);
+      CHECK(controller.m_CheckpointAutoReferences == 0);
+      CHECK(controller.m_CheckpointAutoSavingsMS == 0.0);
+      CHECK(visit(130, 100.0));
+      CHECK(driver.stats.events.empty());
+    }
+    SECTION("Same-EID natural references retain only a measured profitable point")
+    {
+      for(uint32_t i = 0; i < CheckpointUnmeasuredHitLimit; ++i)
+        CHECK_FALSE(visit(100, 70.0));
+      CHECK(visit(100, 70.0));
+      CHECK(visit(100, 70.0));
+      CHECK_FALSE(visit(100, 70.0));
+      CHECK_FALSE(visit(100, 70.0));
+      REQUIRE(controller.m_AutomaticCheckpointPoints.size() == 1);
+      CHECK(controller.m_AutomaticCheckpointPoints[0].retained);
+      CHECK(controller.m_AutomaticCheckpointPoints[0].profitableHits == 2);
+      CHECK(controller.m_AutomaticCheckpointPoints[0].unmeasuredHits == 0);
+      for(uint32_t i = 0; i < CheckpointPrewarmTrialRequestLimit; ++i)
+        visit(100, 70.0);
+      REQUIRE(controller.m_AutomaticCheckpointPoints.size() == 1);
+      CHECK(controller.m_AutomaticCheckpointPoints[0].retained);
+      CHECK(controller.m_RejectedCheckpointCandidates.empty());
+    }
+    SECTION("A comparable hit without savings retires the point and suppresses retry")
+    {
+      for(uint32_t i = 0; i < CheckpointUnmeasuredHitLimit; ++i)
+        CHECK_FALSE(visit(100, 100.0));
+      CHECK(visit(100, 100.0));
+      CHECK(visit(100, 100.0));
+      CHECK_FALSE(visit(100, 100.0));
+      CHECK(controller.m_AutomaticCheckpointPoints.empty());
+      CHECK(controller.m_RejectedCheckpointCandidates.count(60) == 1);
+      CHECK(visit(100, 100.0));
+      CHECK(driver.stats.events.empty());
+      CHECK(controller.m_CheckpointAutoTrials == 1);
+    }
+    SECTION("The real ReplayEvent reference uses exactly its ordinary two native phases")
+    {
+      controller.m_AutomaticCheckpointPoints[0].unmeasuredHits = CheckpointUnmeasuredHitLimit;
+      controller.m_EventID = controller.m_SelectedEventID = 100;
+      controller.ReplayEvent(100, false, false, false);
+      REQUIRE(driver.calls.size() == 2);
+      CHECK(driver.calls[0].type == eReplay_WithoutDraw);
+      CHECK(driver.calls[1].type == eReplay_OnlyDraw);
+      CHECK(driver.calls[0].bypass);
+      CHECK(driver.calls[1].bypass);
+      CHECK(driver.calls[0].naturalReference);
+      CHECK(driver.calls[1].naturalReference);
+      CHECK(controller.m_CheckpointAutoReferences == 1);
+      CHECK(driver.stats.builds == 0);
+      CHECK(driver.stats.hits == 0);
+      CHECK(controller.IsCurrentEventMaterialized());
+    }
+  }
+
   static void CheckAutomaticCheckpointAdmission()
   {
     ReplayController controller;
@@ -5181,7 +5796,7 @@ struct ReplayControllerTestAccess
       CHECK(controller.m_CheckpointAutoReferences == 1);
       CHECK(controller.m_CheckpointReferenceCosts[key].Baseline() == 80.0);
       CHECK(controller.m_AutomaticCheckpointPoints[0].hits == 0);
-      CHECK(controller.m_AutomaticCheckpointPoints[0].requests == 0);
+      CHECK(controller.m_AutomaticCheckpointPoints[0].requests == 1);
     }
     SECTION("Building and two real independent hits repay cost before retention")
     {
@@ -5465,6 +6080,12 @@ TEST_CASE("Idle checkpoint maintenance preserves the current event and counts ac
   ReplayControllerTestAccess::CheckIdleCheckpointMaintenance();
 }
 
+TEST_CASE("Automatic prewarmed checkpoints cannot extend an unproven trial indefinitely",
+          "[replay][checkpoints][automatic][idle]")
+{
+  ReplayControllerTestAccess::CheckAutomaticPrewarmLifetime();
+}
+
 TEST_CASE("Shared replay checkpoint intent is scoped across analysis and fatal driver replacement",
           "[replay][checkpoints][bufferpatch]")
 {
@@ -5521,14 +6142,23 @@ TEST_CASE("Replay checkpoints scale their budget and retain actual module bounda
   CHECK(config.byteBudget == 64ULL * 1024 * 1024);
   CHECK(config.minEventGap == 12);
   REQUIRE(planned.size() == 3);
-  CHECK(planned[1].eventId == 200); // after the last graphics draw, before compute
+  CHECK(planned[1].eventId == 200);    // after the last graphics draw, before compute
   CHECK(planned[1].moduleId == 1);
   CHECK(planned[2].moduleId == 2);
   CHECK(planned[1].priority > planned[0].priority);
   CHECK(planned.back().eventId < storage.back().eventId);
 
   PlanReplayCheckpointCandidates(actions, 64ULL * 1024 * 1024 * 1024, 0, config, planned);
-  CHECK(config.byteBudget == 2ULL * 1024 * 1024 * 1024);
+  CHECK(config.byteBudget == 512ULL * 1024 * 1024);
+  CHECK(config.maxCheckpoints == 3);
+  PlanReplayCheckpointCandidates(actions, ~0ULL, ~0ULL, config, planned);
+  CHECK(config.byteBudget == 512ULL * 1024 * 1024);
+  CHECK(config.maxCheckpoints == 3);
+  storage.back().eventId = ~0U;
+  PlanReplayCheckpointCandidates(actions, ~0ULL, 0, config, planned);
+  CHECK(config.byteBudget == 512ULL * 1024 * 1024);
+  CHECK(planned.size() <= 64);
+  storage.back().eventId = 400;
   actions.clear();
   PlanReplayCheckpointCandidates(actions, 0, 0, config, planned);
   CHECK(planned.empty());

@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from eid_buffer_delta_profile import (DeltaProbe, changed_runs, checkpoint_evidence, comparison,
-                                      configure_environment, delta_evidence, expected_window,
+from eid_buffer_delta_profile import (DeltaProbe, changed_runs, checkpoint_evidence, compact_upload_evidence, comparison,
+                                      configure_environment, delta_evidence, expected_window, fixture_event_evidence,
                                       member_component, phase_acceptance, scalar_bytes, validate_binding_pair,
                                       validate_parameters)
 
@@ -35,6 +35,27 @@ def checkpoint_status():
 
 
 class ParameterTests(unittest.TestCase):
+    def test_native_checkpoint_boundary_need_not_be_a_draw_but_draw_bindings_still_must_be(self):
+        nodes = [SimpleNamespace(eventId=event, flags=1, children=[]) for event in (11, 31, 41)]
+        nodes.append(SimpleNamespace(eventId=21, flags=0, children=[]))
+        controller = SimpleNamespace(GetRootActions=lambda: nodes)
+        rd = SimpleNamespace(ActionFlags=SimpleNamespace(Drawcall=1, Indirect=2))
+        exact = lambda _controller, events: [dict(eventId=e, status='exactAPIEvent') for e in events]
+        with patch('eid_buffer_delta_profile.selected_event_evidence', side_effect=exact):
+            draws, evidence = fixture_event_evidence(controller, rd, arguments())
+            self.assertEqual(draws, [11, 31, 41])
+            self.assertEqual([row['eventId'] for row in evidence], [11, 21, 31, 41])
+            nodes[1].flags = 0
+            with self.assertRaisesRegex(RuntimeError, 'direct draw'):
+                fixture_event_evidence(controller, rd, arguments())
+            nodes[1].flags = 3
+            with self.assertRaisesRegex(RuntimeError, 'direct draw'):
+                fixture_event_evidence(controller, rd, arguments())
+        with patch('eid_buffer_delta_profile.selected_event_evidence',
+                   return_value=[dict(eventId=21, status='missingAPIEvent')]):
+            with self.assertRaisesRegex(RuntimeError, 'exact captured'):
+                fixture_event_evidence(controller, rd, arguments())
+
     def test_scalar_delta_counts_actual_ieee_bytes_not_float_width(self):
         self.assertEqual(changed_runs(scalar_bytes(0.375), scalar_bytes(0.75)), (1, 2))
         self.assertEqual(changed_runs(b"\0" * 4, b"\1\0\1\0"), (2, 2))
@@ -99,6 +120,26 @@ class ParameterTests(unittest.TestCase):
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_compact_upload_cannot_pass_with_full_payload_or_missing_native_evidence(self):
+        before, after = scalar_bytes(0.375), scalar_bytes(0.75)
+        record = {"api": "OpenGLBufferPatch", "op": "set", "uploadReused": 1,
+                  "uploadWrittenBytes": 2}
+        check = lambda rows, mode="compact": compact_upload_evidence(
+            rows, "OpenGL", mode, before, after, 8)["issues"]
+        self.assertFalse(check([record]))
+        self.assertFalse(check([dict(record, uploadReused=0, uploadWrittenBytes=8)], "full"))
+        for rows in ([], [record, record], [dict(record, uploadReused=0)],
+                     [dict(record, uploadWrittenBytes=8)], [dict(record, uploadWrittenBytes=True)],
+                     [{"api": "OpenGLBufferPatch", "op": "set"}]):
+            self.assertTrue(check(rows))
+        self.assertTrue(check([record], "full"))
+        for api, mode, original, size in (("Vulkan", "compact", before, 8),
+                                          ("OpenGL", "unknown", before, 8),
+                                          ("OpenGL", "compact", after, 8),
+                                          ("OpenGL", "compact", before, 1)):
+            with self.assertRaises(ValueError):
+                compact_upload_evidence([record], api, mode, original, after, size)
+
     def records(self, disabled=False):
         cutoff = 11 if disabled else 31
         return [{"api": "D3D11BufferPatch", "op": "set", "firstAffected": cutoff,

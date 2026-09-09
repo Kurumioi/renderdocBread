@@ -1258,6 +1258,7 @@ bool WrappedOpenGL::Serialise_glCopyImageSubData(SerialiserType &ser, GLuint src
 
   if(IsReplayingAndReading())
   {
+    RecordReplayCheckpointTextureWrite(dstName);
     GL.glCopyImageSubData(srcName.name, srcTarget, srcLevel, srcX, srcY, srcZ, dstName.name,
                           dstTarget, dstLevel, dstX, dstY, dstZ, srcWidth, srcHeight, srcDepth);
 

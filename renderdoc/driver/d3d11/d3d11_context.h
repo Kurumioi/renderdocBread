@@ -363,6 +363,11 @@ public:
   void MarkResourceReferenced(ResourceId id, FrameRefType refType);
 
   rdcarray<EventUsage> GetUsage(ResourceId id) { return m_ResourceUses[id]; }
+  const rdcarray<EventUsage> *GetCheckpointUsage(ResourceId id) const
+  {
+    const auto found = m_ResourceUses.find(id);
+    return found == m_ResourceUses.end() ? NULL : &found->second;
+  }
   void ClearMaps();
 
   uint32_t GetEventID() { return m_CurEventID; }

@@ -2776,6 +2776,7 @@ rdcarray<PixelModification> GLReplay::PixelHistory(rdcarray<EventUsage> events, 
                                                    uint32_t x, uint32_t y, const Subresource &sub,
                                                    CompType typeCast)
 {
+  TextureAnalysisScope textureAnalysis(*this);
   rdcarray<PixelModification> history;
 
   if(events.empty())

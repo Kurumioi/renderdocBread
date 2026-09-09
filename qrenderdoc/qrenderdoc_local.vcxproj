@@ -802,7 +802,12 @@
     <ClCompile Include="Windows\ShaderMessageViewer.cpp" />
     <ClCompile Include="Windows\PythonShell.cpp" />
     <ClCompile Include="Windows\ApiMonitorWindow.cpp" />
-    <ClCompile Include="Windows\AI\AIAssistant.cpp" />
+    <ClCompile Include="Windows\AI\AIAssistant.cpp">
+      <!-- Keep translated UTF-8 source independent of the system-codepage PCH. -->
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ForcedIncludeFiles>Code\precompiled.h</ForcedIncludeFiles>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="Windows\AI\AIFileThumbnail.cpp" />
     <ClCompile Include="Windows\AI\AIAgentMonitorWindow.cpp" />
     <ClCompile Include="Windows\AI\AIAgentTraceStore.cpp" />

@@ -5,6 +5,89 @@
 
 #include <set>
 
+static uint64_t VulkanCheckpointSaturatingAdd(uint64_t a, uint64_t b)
+{
+  return b > ~0ULL - a ? ~0ULL : a + b;
+}
+
+struct VulkanCheckpointMetadataCounter
+{
+  explicit VulkanCheckpointMetadataCounter(uint64_t budget)
+      : limit(RDCMIN<uint64_t>(budget, 64ULL * 1024 * 1024))
+  {
+  }
+  uint64_t bytes = 0;
+  const uint64_t limit;
+  bool complete = true;
+
+  bool Add(uint64_t count, uint64_t stride)
+  {
+    if(!complete || bytes > limit || (stride && count > (limit - bytes) / stride))
+      return complete = false;
+    bytes += count * stride;
+    return true;
+  }
+
+  template <typename T>
+  bool Array(const rdcarray<T> &array)
+  {
+    // Include a conservative allocation header even for currently empty arrays. Copies start
+    // with empty destination arrays, so rdcarray allocates the exact source size.
+    return Add(1, 64) && Add(array.size(), sizeof(T));
+  }
+};
+
+static bool VulkanCheckpointImageMetadata(const ImageState &state,
+                                          VulkanCheckpointMetadataCounter &counter)
+{
+  // size() includes the inline singleton, which deliberately overcharges unsplit images.
+  return counter.Add(1, 64) &&
+         counter.Add(state.subresourceStates.size(), sizeof(ImageSubresourceState)) &&
+         counter.Array(state.oldQueueFamilyTransfers) && counter.Array(state.newQueueFamilyTransfers);
+}
+
+static bool VulkanCheckpointRenderMetadata(const VulkanRenderState &state,
+                                           VulkanCheckpointMetadataCounter &counter)
+{
+  if(!counter.Array(state.views) || !counter.Array(state.scissors) ||
+     !counter.Array(state.sampleLocations.locations) || !counter.Array(state.discardRectangles) ||
+     !counter.Array(state.GetFramebufferAttachments()) || !counter.Array(state.descBufs) ||
+     !counter.Array(state.vbuffers) || !counter.Array(state.xfbbuffers) ||
+     !counter.Array(state.xfbcounters) || !counter.Array(state.colorWriteEnable) ||
+     !counter.Array(state.colorBlendEnable) || !counter.Array(state.colorBlendEquation) ||
+     !counter.Array(state.colorWriteMask) || !counter.Array(state.sampleMask) ||
+     !counter.Array(state.vertexBindings) || !counter.Array(state.vertexAttributes) ||
+     !counter.Array(state.dynamicRendering.color) ||
+     !counter.Array(state.dynamicRendering.localRead.colorAttachmentLocations) ||
+     !counter.Array(state.dynamicRendering.localRead.colorAttachmentInputIndices) ||
+     !counter.Array(state.fragmentDensityMapOffsets) || !counter.Add(1, 64) ||
+     !counter.Add(state.dynamicRendering.color.size(), sizeof(VkAttachmentFeedbackLoopInfoEXT)) ||
+     !counter.Add(2, sizeof(VkAttachmentFeedbackLoopInfoEXT)))
+    return false;
+  // DynamicRendering::CopyAttachmentNexts reserves color.size()+2 feedback records even if
+  // there are no pNexts. These and every nested dynamic-offset array are separately owned.
+  const VulkanStatePipeline *pipelines[] = {&state.graphics, &state.compute, &state.rt};
+  for(const VulkanStatePipeline *pipeline : pipelines)
+  {
+    if(!counter.Array(pipeline->descSets))
+      return false;
+    for(const auto &set : pipeline->descSets)
+      if(!counter.Array(set.offsets))
+        return false;
+  }
+  return true;
+}
+
+template <typename Version>
+static bool VulkanCheckpointAccountVersion(const std::shared_ptr<Version> &version,
+                                           std::set<const Version *> &seen, uint64_t &bytes)
+{
+  if(!version || !seen.insert(version.get()).second)
+    return false;
+  bytes = VulkanCheckpointSaturatingAdd(bytes, version->bytes);
+  return true;
+}
+
 static void LogVulkanCheckpoint(const rdcstr &line)
 {
   RDCLOG("[EIDTiming] %s", line.c_str());
@@ -181,18 +264,11 @@ void WrappedVulkan::ConfigureReplayCheckpoints(
   m_CheckpointCandidates = candidates;
   if(retain)
   {
-    bool drained = false;
     for(size_t i = m_Checkpoints.size(); i > 0; --i)
     {
       ReplayCheckpoint *checkpoint = m_Checkpoints[i - 1];
       if(ReplayCheckpointCandidateSelected(checkpoint->eventId, checkpoint->kind))
         continue;
-      if(!drained)
-      {
-        SubmitCmds();
-        FlushQ();
-        drained = true;
-      }
       DestroyReplayCheckpoint(checkpoint);
       m_Checkpoints.erase(i - 1);
     }
@@ -200,6 +276,7 @@ void WrappedVulkan::ConfigureReplayCheckpoints(
   m_CheckpointStats.enabled = config.enabled;
   m_CheckpointStats.supported = true;
   m_CheckpointCaptureSafe = CheckReplayCheckpointCapture(m_CheckpointStats.reason);
+  PrepareReplayCheckpointWriteIndex();
   m_CheckpointSubmissionCaptureSafe = VulkanCheckpointSubmissionEvidenceSafe(
       m_CheckpointCaptureSafe, m_CheckpointSubmittedQueues, m_CheckpointSubmissionEnds);
   if(!config.enabled)
@@ -212,40 +289,69 @@ void WrappedVulkan::ConfigureReplayCheckpoints(
         m_CheckpointCaptureSafe ? 1U : 0U, m_CheckpointSubmissionCaptureSafe ? 1U : 0U,
         m_CheckpointSubmittedQueues.size(), m_CheckpointSubmissionEnds.size(),
         m_CheckpointStats.reason.c_str()));
+  if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+    LogVulkanCheckpoint(StringFormat::Fmt(
+        "api=VulkanCheckpoint op=writeIndex complete=%u reason=%s",
+        m_CheckpointWriteIndexComplete ? 1U : 0U,
+        m_CheckpointWriteIndexReason.empty() ? "completePhysicalWrites" : m_CheckpointWriteIndexReason.c_str()));
+}
+
+WrappedVulkan::ReplayCheckpointContent::~ReplayCheckpointContent()
+{
+  // An unproven device drain must not free an in-flight copy source. Such handles are left to
+  // device teardown after the fatal error, rather than returning their memory to the allocator.
+  if(!releaseSafe || !dispatch)
+    return;
+  if(buffer != VK_NULL_HANDLE)
+    dispatch->DestroyBuffer(device, buffer, NULL);
+  if(image != VK_NULL_HANDLE)
+    dispatch->DestroyImage(device, image, NULL);
+  if(memory != VK_NULL_HANDLE)
+    dispatch->FreeMemory(device, memory, NULL);
+}
+
+bool WrappedVulkan::DrainReplayCheckpointWork()
+{
+  SubmitCmds();
+  ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitWait);
+  const VkResult result = ObjDisp(GetDev())->DeviceWaitIdle(Unwrap(GetDev()));
+  if(result == VK_SUCCESS)
+  {
+    // FlushQ recycles submitted command buffers and runs deferred cleanup. Prove completion
+    // before it does either, including when a preceding queue wait would have failed.
+    FlushQ();
+    return true;
+  }
+  m_CheckpointResidentVersions.clear();
+  if(!HasFatalError())
+    SET_ERROR_RESULT(m_FatalError, ResultCode::InternalError,
+                     "Vulkan checkpoint GPU completion is unproven: %s", ToStr(result).c_str());
+  return false;
 }
 
 void WrappedVulkan::DestroyReplayCheckpoint(ReplayCheckpoint *checkpoint)
 {
-  const VkDevDispatchTable *vt = ObjDisp(GetDev());
-  for(ReplayCheckpointResource &resource : checkpoint->resources)
-  {
-    if(resource.buffer != VK_NULL_HANDLE)
-      vt->DestroyBuffer(Unwrap(GetDev()), resource.buffer, NULL);
-    if(resource.image != VK_NULL_HANDLE)
-      vt->DestroyImage(Unwrap(GetDev()), resource.image, NULL);
-    if(resource.memory != VK_NULL_HANDLE)
-      vt->FreeMemory(Unwrap(GetDev()), resource.memory, NULL);
-  }
+  bool ownsVersion = false;
+  for(const auto &resource : checkpoint->resources)
+    ownsVersion |= resource.version != NULL;
+  if(ownsVersion && !DrainReplayCheckpointWork())
+    for(auto &resource : checkpoint->resources)
+      if(resource.version)
+        resource.version->releaseSafe = false;
   delete checkpoint;
 }
 
 void WrappedVulkan::InvalidateReplayCheckpoints(uint32_t firstAffectedEvent)
 {
   InvalidateLiveForward("checkpointOrResourceEditInvalidated");
+  m_CheckpointResidentVersions.clear();
   if(firstAffectedEvent == 0)
     m_ReplayPatchAnchorAttempted = false;
-  bool drained = false;
   for(size_t i = m_Checkpoints.size(); i > 0; --i)
   {
     ReplayCheckpoint *checkpoint = m_Checkpoints[i - 1];
     if(firstAffectedEvent && checkpoint->eventId < firstAffectedEvent)
       continue;
-    if(!drained)
-    {
-      SubmitCmds();
-      FlushQ();
-      drained = true;
-    }
     DestroyReplayCheckpoint(checkpoint);
     m_Checkpoints.erase(i - 1);
   }
@@ -262,8 +368,10 @@ ReplayCheckpointStats WrappedVulkan::GetReplayCheckpointStats()
   ret.allocatedBytes = ret.sharedBytes = 0;
   ret.events.clear();
   std::set<ResourceId> shared;
+  std::set<const ReplayCheckpointContent *> versions;
   for(const ReplayCheckpoint *checkpoint : m_Checkpoints)
   {
+    ret.allocatedBytes = VulkanCheckpointSaturatingAdd(ret.allocatedBytes, checkpoint->metadataBytes);
     ret.hasInitialCheckpoint |= checkpoint->kind == ReplayCheckpointKind::FrameInitial;
     ret.events.push_back(checkpoint->eventId);
     for(const ReplayCheckpointResource &resource : checkpoint->resources)
@@ -272,11 +380,30 @@ ReplayCheckpointStats WrappedVulkan::GetReplayCheckpointStats()
         if(shared.insert(resource.source).second)
           ret.sharedBytes += resource.copyBytes;
       }
-      else
-        ret.allocatedBytes += resource.bytes;
+      else if(resource.version)
+      {
+        if(!VulkanCheckpointAccountVersion(resource.version, versions, ret.allocatedBytes))
+          ret.sharedBytes += resource.version->bytes;
+      }
   }
   std::sort(ret.events.begin(), ret.events.end());
   return ret;
+}
+
+uint64_t WrappedVulkan::ReplayCheckpointAllocatedBytes(const ReplayCheckpoint *pending) const
+{
+  uint64_t bytes = 0;
+  std::set<const ReplayCheckpointContent *> seen;
+  auto count = [&](const ReplayCheckpoint *checkpoint) {
+    bytes = VulkanCheckpointSaturatingAdd(bytes, checkpoint->metadataBytes);
+    for(const auto &resource : checkpoint->resources)
+      VulkanCheckpointAccountVersion(resource.version, seen, bytes);
+  };
+  for(const ReplayCheckpoint *checkpoint : m_Checkpoints)
+    count(checkpoint);
+  if(pending)
+    count(pending);
+  return bytes;
 }
 
 static bool VulkanCheckpointCommandKeepsPass(VulkanChunk chunk)
@@ -293,6 +420,329 @@ static bool VulkanCheckpointCommandKeepsPass(VulkanChunk chunk)
          name.find("Rendering") < 0 && name.find("NextSubpass") < 0 &&
          name.find("Indirect") < 0 && name.find("ExecuteCommands") < 0 &&
          name.find("Debug") < 0 && name.find("Marker") < 0;
+}
+
+// This additional envelope only authorises content reuse. Unknown commands retain the existing
+// checkpoint/full-copy path; absence from GetUsage alone never proves that a resource is static.
+static bool VulkanCheckpointWriteCommandKnown(const rdcstr &name)
+{
+  const char *statePrefixes[] = {"vkCmdSet", "vkCmdBind", "vkCmdPipelineBarrier",
+                                 "vkCmdDebugMarker", "vkCmdBeginDebugUtilsLabel",
+                                 "vkCmdEndDebugUtilsLabel", "vkCmdInsertDebugUtilsLabel"};
+  for(const char *prefix : statePrefixes)
+    if(name.find(prefix) == 0)
+      return true;
+  const char *known[] = {
+      "vkBeginCommandBuffer", "vkEndCommandBuffer", "vkResetCommandBuffer", "vkResetCommandPool",
+      "vkQueueSubmit", "vkQueueSubmit2", "vkQueueWaitIdle", "vkDeviceWaitIdle", "vkWaitForFences",
+      "vkResetFences", "vkGetFenceStatus", "vkMapMemory", "vkUnmapMemory",
+      "vkFlushMappedMemoryRanges", "vkInvalidateMappedMemoryRanges", "vkAcquireNextImageKHR",
+      "vkAcquireNextImage2KHR", "vkQueuePresentKHR", "vkCmdDraw", "vkCmdDrawIndexed",
+      "vkCmdDrawMeshTasksEXT", "vkCmdDrawMeshTasksNV", "vkCmdDispatch", "vkCmdDispatchBase",
+      "vkCmdPushConstants", "vkCmdPushConstants2",
+      "vkCmdBeginRenderPass", "vkCmdBeginRenderPass2", "vkCmdEndRenderPass", "vkCmdEndRenderPass2",
+      "vkCmdNextSubpass", "vkCmdNextSubpass2", "vkCmdBeginRendering", "vkCmdEndRendering",
+      "vkCmdClearColorImage", "vkCmdClearDepthStencilImage", "vkCmdClearAttachments",
+      "vkCmdFillBuffer", "vkCmdUpdateBuffer", "vkCmdCopyBuffer", "vkCmdCopyBuffer2",
+      "vkCmdCopyImage", "vkCmdCopyImage2", "vkCmdCopyBufferToImage", "vkCmdCopyBufferToImage2",
+      "vkCmdCopyImageToBuffer", "vkCmdCopyImageToBuffer2", "vkCmdBlitImage", "vkCmdBlitImage2",
+      "vkCmdResolveImage", "vkCmdResolveImage2"};
+  for(const char *command : known)
+    if(name == command)
+      return true;
+  return false;
+}
+
+static bool VulkanCheckpointIntervalWrites(const rdcarray<uint32_t> &writes, uint32_t first,
+                                           uint32_t last)
+{
+  if(first > last)
+    return false;
+  auto write = std::lower_bound(writes.begin(), writes.end(), first);
+  return write != writes.end() && *write <= last;
+}
+
+static bool VulkanCheckpointStorageSlots(const DescSetLayout &layout, const BindingStorage &storage,
+                                        rdcarray<DescriptorSetSlot> &slots)
+{
+  if(storage.totalDescriptorCount() > 1000000 || layout.bindings.size() > 1000000 ||
+     (layout.flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT))
+    return false;
+  for(size_t b = 0; b < layout.bindings.size(); ++b)
+  {
+    const DescSetLayout::Binding &binding = layout.bindings[b];
+    const uint32_t count = binding.GetDescriptorCount(storage.variableDescriptorCount);
+    if(binding.variableSize || binding.layoutDescType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT)
+      return false;
+    if(count == 0)
+      continue;
+    if(b >= storage.binds.size() || !storage.binds[b] ||
+       binding.elemOffset > storage.totalDescriptorCount() ||
+       count > storage.totalDescriptorCount() - binding.elemOffset)
+      return false;
+    for(uint32_t element = 0; element < count; ++element)
+    {
+      const DescriptorSetSlot &slot = storage.binds[b][element];
+      if(slot.type == DescriptorSlotType::StorageBuffer ||
+         slot.type == DescriptorSlotType::StorageBufferDynamic ||
+         slot.type == DescriptorSlotType::StorageImage ||
+         slot.type == DescriptorSlotType::StorageTexelBuffer)
+        slots.push_back(slot);
+      else if(slot.type == DescriptorSlotType::AccelerationStructure)
+        return false;
+    }
+  }
+  return true;
+}
+
+static bool VulkanReplayReserveAttachmentSnapshot(uint64_t framebufferSlots, uint64_t dynamicColors,
+                                                  bool dynamicRendering,
+                                                  VulkanReplayBindingEvidenceBudget &budget,
+                                                  size_t &capacity)
+{
+  capacity = 0;
+  if(!budget.ReserveStorage(1, sizeof(rdcarray<ResourceId>) + 64) ||
+     !budget.ReserveStorage(framebufferSlots, sizeof(ResourceId)) ||
+     (dynamicRendering &&
+      (!budget.ReserveStorage(dynamicColors, 2 * sizeof(ResourceId)) ||
+       !budget.ReserveStorage(4, sizeof(ResourceId)))))
+    return false;
+  // Successful byte reservations bound these additions, the multiplication and the size_t cast.
+  capacity = size_t(framebufferSlots + (dynamicRendering ? dynamicColors * 2 + 4 : 0));
+  return true;
+}
+
+void WrappedVulkan::RecordReplayCheckpointAttachments(VulkanActionTreeNode &action,
+                                                      const VulkanRenderState &state)
+{
+  if(!m_ReplayBindingEvidenceBudget.complete)
+    return;
+  const auto &framebufferAttachments = state.GetFramebufferAttachments();
+  size_t capacity = 0;
+  if(!VulkanReplayReserveAttachmentSnapshot(framebufferAttachments.size(),
+                                             state.dynamicRendering.color.size(),
+                                             state.dynamicRendering.active,
+                                             m_ReplayBindingEvidenceBudget, capacity))
+  {
+    InvalidateReplayBindingEvidence("attachmentSnapshotStorageBudget");
+    return;
+  }
+  rdcarray<ResourceId> attachments;
+  // Allocate the already charged upper bound once. Moving it into the immutable snapshot avoids
+  // both geometric-growth spare capacity and a second temporary copy outside that storage budget.
+  attachments.reserve(capacity);
+  auto view = [&](ResourceId id) {
+    if(id == ResourceId())
+      return;
+    auto found = m_CreationInfo.m_ImageView.find(id);
+    if(found == m_CreationInfo.m_ImageView.end() || found->second.image == ResourceId())
+      m_CheckpointPhysicalWritesComplete = false;
+    else
+      attachments.push_back(found->second.image);
+  };
+  for(ResourceId attachment : framebufferAttachments)
+    view(attachment);
+  if(state.dynamicRendering.active)
+  {
+    for(const auto &attachment : state.dynamicRendering.color)
+    {
+      view(GetResID(attachment.imageView));
+      view(GetResID(attachment.resolveImageView));
+    }
+    view(GetResID(state.dynamicRendering.depth.imageView));
+    view(GetResID(state.dynamicRendering.depth.resolveImageView));
+    view(GetResID(state.dynamicRendering.stencil.imageView));
+    view(GetResID(state.dynamicRendering.stencil.resolveImageView));
+  }
+  if(!attachments.empty())
+    action.replayCheckpointAttachments =
+        std::make_shared<const rdcarray<ResourceId>>(std::move(attachments));
+}
+
+void WrappedVulkan::RecordReplayCheckpointSubmittedWrites(const VulkanActionTreeNode &action)
+{
+  if(!m_CheckpointPhysicalWritesComplete)
+    return;
+  const uint32_t event = action.action.eventId;
+  auto record = [&](ResourceId id) {
+    if(id == ResourceId())
+      return;
+    if(event == 0 || m_CheckpointPhysicalWriteCount >= 1000000)
+    {
+      m_CheckpointPhysicalWritesComplete = false;
+      return;
+    }
+    m_CheckpointPhysicalWrites[id].push_back(event);
+    ++m_CheckpointPhysicalWriteCount;
+  };
+  for(ResourceId image : action.ReplayCheckpointAttachments())
+    record(image);
+  for(const auto &bound : action.ReplayPatchDescriptorSets())
+  {
+    if(!bound.IsBound())
+      continue;
+    if(bound.IsDescBufferBound() || bound.push || bound.descSet == ResourceId())
+    {
+      m_CheckpointPhysicalWritesComplete = false;
+      continue;
+    }
+    auto set = m_DescriptorSetState.find(bound.descSet);
+    if(set == m_DescriptorSetState.end())
+    {
+      m_CheckpointPhysicalWritesComplete = false;
+      continue;
+    }
+    auto layout = m_CreationInfo.m_DescSetLayout.find(set->second.layout);
+    rdcarray<DescriptorSetSlot> slots;
+    if(layout == m_CreationInfo.m_DescSetLayout.end() ||
+       !VulkanCheckpointStorageSlots(layout->second, set->second.data, slots))
+    {
+      m_CheckpointPhysicalWritesComplete = false;
+      continue;
+    }
+    for(const DescriptorSetSlot &slot : slots)
+    {
+      ResourceId id = slot.resource;
+      if(id == ResourceId())
+        continue;
+      if(slot.type == DescriptorSlotType::StorageImage)
+      {
+        auto image = m_CreationInfo.m_ImageView.find(id);
+        if(image == m_CreationInfo.m_ImageView.end())
+        {
+          m_CheckpointPhysicalWritesComplete = false;
+          continue;
+        }
+        id = image->second.image;
+      }
+      else if(slot.type == DescriptorSlotType::StorageTexelBuffer)
+      {
+        auto buffer = m_CreationInfo.m_BufferView.find(id);
+        if(buffer == m_CreationInfo.m_BufferView.end())
+        {
+          m_CheckpointPhysicalWritesComplete = false;
+          continue;
+        }
+        id = buffer->second.buffer;
+      }
+      record(id);
+    }
+  }
+}
+
+void WrappedVulkan::PrepareReplayCheckpointWriteIndex()
+{
+  if(m_CheckpointWriteIndexPrepared)
+    return;
+  m_CheckpointWriteIndexPrepared = true;
+  m_CheckpointWriteIndexComplete = m_CheckpointPhysicalWritesComplete && m_CheckpointCaptureSafe;
+  if(!m_CheckpointWriteIndexComplete)
+    m_CheckpointWriteIndexReason = "incompletePhysicalBindingsOrCaptureEnvelope";
+  bool frame = false;
+  if(!m_StructuredFile)
+    m_CheckpointWriteIndexComplete = false;
+  else for(const SDChunk *chunk : m_StructuredFile->chunks)
+  {
+    frame |= chunk->metadata.chunkID == (uint32_t)SystemChunk::CaptureBegin;
+    if(frame && chunk->metadata.chunkID >= (uint32_t)SystemChunk::FirstDriverChunk &&
+       !VulkanCheckpointWriteCommandKnown(ToStr((VulkanChunk)chunk->metadata.chunkID)))
+    {
+      m_CheckpointWriteIndexComplete = false;
+      m_CheckpointWriteIndexReason = "unknownWriteEnvelope:" + ToStr((VulkanChunk)chunk->metadata.chunkID);
+    }
+  }
+  m_CheckpointWriteIndexComplete &= frame;
+  if(!m_CheckpointWriteIndexComplete)
+    return;
+  std::map<ResourceId, ResourceId> units;
+  for(const auto &memory : m_CreationInfo.m_Memory)
+    if(!ResourceIDGen::IsReplayOnlyID(memory.first))
+      for(ResourceId child : GetResourceDesc(memory.first).derivedResources)
+        if(m_CreationInfo.m_Buffer.find(child) != m_CreationInfo.m_Buffer.end())
+          units[child] = memory.first;
+  auto unit = [&](ResourceId id) {
+    auto found = units.find(id);
+    return found == units.end() ? id : found->second;
+  };
+  for(const auto &resource : m_CheckpointPhysicalWrites)
+    m_CheckpointContentWrites[unit(resource.first)].append(resource.second);
+  uint64_t writes = m_CheckpointPhysicalWriteCount;
+  for(const auto &resource : m_ResourceUses)
+    for(const EventUsage &use : resource.second)
+      if(VulkanCheckpointWrite(use.usage))
+      {
+        if(++writes > 1000000)
+        {
+          m_CheckpointWriteIndexComplete = false;
+          m_CheckpointWriteIndexReason = "writeEvidenceWorkLimit";
+          m_CheckpointContentWrites.clear();
+          return;
+        }
+        m_CheckpointContentWrites[unit(resource.first)].push_back(use.eventId);
+        if(use.usage == ResourceUsage::CPUWrite)
+          m_CheckpointHostWrittenUnits.insert(unit(resource.first));
+      }
+  for(auto &resource : m_CheckpointContentWrites)
+    std::sort(resource.second.begin(), resource.second.end());
+}
+
+void WrappedVulkan::ForgetReplayCheckpointWrites(uint32_t first, uint32_t last)
+{
+  if(!m_CheckpointWriteIndexComplete)
+  {
+    m_CheckpointResidentVersions.clear();
+    return;
+  }
+  for(const auto &resource : m_CheckpointContentWrites)
+    if(VulkanCheckpointIntervalWrites(resource.second, first, last))
+      m_CheckpointResidentVersions.erase(resource.first);
+}
+
+bool WrappedVulkan::CanReuseReplayCheckpointContents(const ReplayCheckpointResource &resource) const
+{
+  if(!m_CheckpointWriteIndexComplete ||
+     Process::GetEnvVariable("RENDERDOC_VULKAN_DISABLE_CHECKPOINT_CONTENT_REUSE") == "1" ||
+     m_CheckpointHostWrittenUnits.count(resource.source) ||
+     (resource.sourceImage != VK_NULL_HANDLE &&
+      m_CheckpointHostWrittenUnits.count(resource.imageState.boundMemory)))
+    return false;
+  for(const ReplayBufferPatch &patch : m_ReplayBufferMemoryPatches)
+    if(patch.buffer == resource.source)
+      return false;
+  if(resource.sourceImage != VK_NULL_HANDLE)
+  {
+    const ImageInfo &info = resource.imageState.GetImageInfo();
+    for(auto aspect = ImageAspectFlagIter::begin(info.aspects); aspect != ImageAspectFlagIter::end(); ++aspect)
+      for(uint32_t mip = 0; mip < info.levelCount; ++mip)
+        for(uint32_t layer = 0; layer < info.layerCount; ++layer)
+        {
+          VkImageLayout layout = resource.imageState.GetImageLayout(*aspect, mip, layer);
+          if(layout == VK_IMAGE_LAYOUT_UNDEFINED || layout == UNKNOWN_PREV_IMG_LAYOUT)
+            return false;
+        }
+  }
+  return true;
+}
+
+static std::set<ResourceId> VulkanCheckpointWrittenResources(
+    const std::map<ResourceId, rdcarray<EventUsage>> &usage)
+{
+  std::set<ResourceId> written;
+  for(const auto &resource : usage)
+    for(const EventUsage &event : resource.second)
+      if(VulkanCheckpointWrite(event.usage))
+      {
+        written.insert(resource.first);
+        break;
+      }
+  return written;
+}
+
+static bool VulkanCheckpointResourceMayHaveWrites(ResourceId id,
+                                                   const std::set<ResourceId> &written,
+                                                   bool bindingEvidenceComplete)
+{
+  return !bindingEvidenceComplete || written.count(id) != 0;
 }
 
 template <typename EventAt, typename ChunkAt>
@@ -555,11 +1005,88 @@ void WrappedVulkan::SaveReplayCheckpoint(uint32_t endEventID, ReplayLogType repl
                                    m_CheckpointConfig.minEventGap))
       return;
 
-  ReplayCheckpoint *checkpoint = new ReplayCheckpoint;
+  // Reject oversized CPU snapshots before copying their maps or arrays. The conservative charge
+  // includes manifest capacity, possible version/control blocks, temporary resource-set nodes and
+  // resident-version bookkeeping. GPU VkMemoryRequirements are added to the same total below.
   PerformanceTimer timer;
+  VulkanCheckpointMetadataCounter metadata(m_CheckpointConfig.byteBudget);
+  auto rejectMetadata = [&]() {
+    ++m_CheckpointStats.rejected;
+    m_CheckpointStats.reason = "checkpointMetadataBudget";
+    if(IsReplayTimingActive())
+      LogVulkanCheckpoint(StringFormat::Fmt(
+          "api=VulkanCheckpoint op=reject event=%u reason=checkpointMetadataBudget metadataBytes=%llu total_ms=%.3f",
+          event, (unsigned long long)metadata.bytes, timer.GetMilliseconds()));
+  };
+  const uint64_t recordBytes = sizeof(ReplayCheckpointResource) + sizeof(ReplayCheckpointContent) + 256;
+  if(!metadata.Add(1, sizeof(ReplayCheckpoint) + 128) ||
+     !metadata.Add(m_CreationInfo.m_Memory.size(), recordBytes) ||
+     !metadata.Add(m_ImageStates.size(), recordBytes) ||
+     !metadata.Add(m_CreationInfo.m_Buffer.size(), 64))
+  {
+    rejectMetadata();
+    return;
+  }
+  if(baked)
+  {
+    if(!VulkanCheckpointRenderMetadata(m_RenderState, metadata) ||
+       !metadata.Array(m_Partial.partialStack) || !metadata.Array(baked->endBarriers) ||
+       !metadata.Add(1, 64) ||
+       !metadata.Add(baked->imageStates.size(), sizeof(rdcpair<ResourceId, ImageState>)))
+    {
+      rejectMetadata();
+      return;
+    }
+    for(const auto &state : baked->imageStates)
+      if(!VulkanCheckpointImageMetadata(state.second, metadata))
+      {
+        rejectMetadata();
+        return;
+      }
+  }
+  for(const auto &entry : m_ImageStates)
+  {
+    if(ResourceIDGen::IsReplayOnlyID(entry.first))
+      continue;
+    LockedConstImageStateRef state = FindConstImageState(entry.first);
+    if(!state || !VulkanCheckpointImageMetadata(*state, metadata))
+    {
+      rejectMetadata();
+      return;
+    }
+  }
+
+  ReplayCheckpoint *checkpoint = new ReplayCheckpoint;
   checkpoint->eventId = event;
   checkpoint->kind = kind;
   checkpoint->serial = ++m_CheckpointSerial;
+  checkpoint->metadataBytes = metadata.bytes;
+  while(!m_Checkpoints.empty() &&
+        (ReplayCheckpointAllocatedBytes(checkpoint) > m_CheckpointConfig.byteBudget ||
+         m_Checkpoints.size() >= m_CheckpointConfig.maxCheckpoints))
+  {
+    size_t oldest = m_Checkpoints.size();
+    for(size_t i = 0; i < m_Checkpoints.size(); ++i)
+      if(!ReplayCheckpointIsProtected(*m_Checkpoints[i], *checkpoint) &&
+         (oldest == m_Checkpoints.size() ||
+          m_Checkpoints[i]->serial < m_Checkpoints[oldest]->serial))
+        oldest = i;
+    if(oldest == m_Checkpoints.size())
+    {
+      delete checkpoint;
+      rejectMetadata();
+      return;
+    }
+    DestroyReplayCheckpoint(m_Checkpoints[oldest]);
+    m_Checkpoints.erase(oldest);
+    if(HasFatalError())
+    {
+      delete checkpoint;
+      return;
+    }
+  }
+  // The preflight bounds this addition/cast and prevents geometric spare manifest capacity.
+  checkpoint->resources.reserve(m_CreationInfo.m_Memory.size() + m_ImageStates.size());
   if(baked)
   {
     checkpoint->renderState = m_RenderState;
@@ -573,25 +1100,48 @@ void WrappedVulkan::SaveReplayCheckpoint(uint32_t endEventID, ReplayLogType repl
     checkpoint->endBarriers = baked->endBarriers;
   }
 
+  if(!m_CheckpointWriteUsageCached)
+  {
+    // Preserve the existing classification exactly, but scan captured usage only once. This is
+    // not a complete write-range proof: capability, memory-alias and edited-allocation guards
+    // below still decide which sources need snapshots even when this set has no entry.
+    m_CheckpointWrittenResources = VulkanCheckpointWrittenResources(m_ResourceUses);
+    m_CheckpointWriteUsageCached = true;
+  }
   auto written = [this](ResourceId id) {
-    auto uses = m_ResourceUses.find(id);
-    if(uses != m_ResourceUses.end())
-      for(const EventUsage &use : uses->second)
-        if(VulkanCheckpointWrite(use.usage))
-          return true;
-    return false;
+    // Exhausted optional metadata cannot turn a missing usage entry into a static-asset proof.
+    return VulkanCheckpointResourceMayHaveWrites(id, m_CheckpointWrittenResources,
+                                                 m_ReplayBindingEvidenceBudget.complete);
   };
   rdcstr failure;
   const VkDevDispatchTable *vt = ObjDisp(GetDev());
   uint64_t allocated = 0;
   std::set<ResourceId> coveredBuffers;
+  auto prepareVersion = [&](ReplayCheckpointResource &resource) {
+    auto resident = m_CheckpointResidentVersions.find(resource.source);
+    if(CanReuseReplayCheckpointContents(resource) && resident != m_CheckpointResidentVersions.end())
+    {
+      auto version = resident->second.lock();
+      if(version && version->populated && version->sourceBuffer == resource.sourceBuffer &&
+         version->sourceImage == resource.sourceImage && version->copyBytes == resource.copyBytes)
+        resource.version = version;
+    }
+    if(!resource.version)
+    {
+      resource.version = std::make_shared<ReplayCheckpointContent>();
+      resource.version->dispatch = vt;
+      resource.version->device = Unwrap(GetDev());
+      resource.version->sourceBuffer = resource.sourceBuffer;
+      resource.version->sourceImage = resource.sourceImage;
+      resource.version->copyBytes = resource.copyBytes;
+    }
+  };
   auto allocate = [&](ReplayCheckpointResource &resource, const VkMemoryRequirements &requirements) {
     // Eviction happens before allocation, keeping the *actual* allocation total within the budget.
-    if(requirements.size > m_CheckpointConfig.byteBudget - allocated)
+    if(requirements.size > m_CheckpointConfig.byteBudget)
       return false;
     while(!m_Checkpoints.empty() &&
-          (GetReplayCheckpointStats().allocatedBytes + allocated + requirements.size >
-               m_CheckpointConfig.byteBudget ||
+          (ReplayCheckpointAllocatedBytes(checkpoint) > m_CheckpointConfig.byteBudget - requirements.size ||
            m_Checkpoints.size() >= m_CheckpointConfig.maxCheckpoints))
     {
       size_t oldest = m_Checkpoints.size();
@@ -602,17 +1152,19 @@ void WrappedVulkan::SaveReplayCheckpoint(uint32_t endEventID, ReplayLogType repl
           oldest = i;
       if(oldest == m_Checkpoints.size())
         return false;
-      SubmitCmds();
-      FlushQ();
       DestroyReplayCheckpoint(m_Checkpoints[oldest]);
       m_Checkpoints.erase(oldest);
+      if(HasFatalError())
+        return false;
     }
+    if(ReplayCheckpointAllocatedBytes(checkpoint) > m_CheckpointConfig.byteBudget - requirements.size)
+      return false;
     VkMemoryAllocateInfo info = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, requirements.size,
                                 GetGPULocalMemoryIndex(requirements.memoryTypeBits)};
-    VkResult result = vt->AllocateMemory(Unwrap(GetDev()), &info, NULL, &resource.memory);
+    VkResult result = vt->AllocateMemory(Unwrap(GetDev()), &info, NULL, &resource.version->memory);
     if(result != VK_SUCCESS)
       return false;
-    resource.bytes = requirements.size;
+    resource.version->bytes = requirements.size;
     allocated += requirements.size;
     return true;
   };
@@ -667,22 +1219,25 @@ void WrappedVulkan::SaveReplayCheckpoint(uint32_t endEventID, ReplayLogType repl
     resource.sourceBuffer = Unwrap(mem.second.wholeMemBuf);
     resource.copyBytes = mem.second.wholeMemBufSize;
     resource.shared = !mutableMemory;
-    checkpoint->resources.push_back(resource);
+    checkpoint->resources.push_back(std::move(resource));
     ReplayCheckpointResource &stored = checkpoint->resources.back();
     if(stored.shared)
+      continue;
+    prepareVersion(stored);
+    if(stored.version->populated)
       continue;
     VkBufferCreateInfo create = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, stored.copyBytes,
                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                 VK_SHARING_MODE_EXCLUSIVE, 0, NULL};
-    if(vt->CreateBuffer(Unwrap(GetDev()), &create, NULL, &stored.buffer) != VK_SUCCESS)
+    if(vt->CreateBuffer(Unwrap(GetDev()), &create, NULL, &stored.version->buffer) != VK_SUCCESS)
     {
       failure = "createAllocationVersionFailed";
       break;
     }
     VkMemoryRequirements requirements = {};
-    vt->GetBufferMemoryRequirements(Unwrap(GetDev()), stored.buffer, &requirements);
+    vt->GetBufferMemoryRequirements(Unwrap(GetDev()), stored.version->buffer, &requirements);
     if(!allocate(stored, requirements) ||
-       vt->BindBufferMemory(Unwrap(GetDev()), stored.buffer, stored.memory, 0) != VK_SUCCESS)
+       vt->BindBufferMemory(Unwrap(GetDev()), stored.version->buffer, stored.version->memory, 0) != VK_SUCCESS)
     {
       failure = "allocationVersionBudgetOrBindFailed";
       break;
@@ -758,24 +1313,27 @@ void WrappedVulkan::SaveReplayCheckpoint(uint32_t endEventID, ReplayLogType repl
     resource.shared = !written(image.first) && !written(state->boundMemory) &&
                       !(info.creationFlags & (TextureCategory::ColorTarget |
                          TextureCategory::DepthTarget | TextureCategory::ShaderReadWrite));
-    checkpoint->resources.push_back(resource);
+    checkpoint->resources.push_back(std::move(resource));
     ReplayCheckpointResource &stored = checkpoint->resources.back();
     if(stored.shared)
+      continue;
+    prepareVersion(stored);
+    if(stored.version->populated)
       continue;
     VkImageCreateInfo create = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, DefaultImageCreateFlags(),
                                info.type, info.format, info.extent, info.mipLevels, info.arrayLayers,
                                info.samples, VK_IMAGE_TILING_OPTIMAL,
                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
-    if(vt->CreateImage(Unwrap(GetDev()), &create, NULL, &stored.image) != VK_SUCCESS)
+    if(vt->CreateImage(Unwrap(GetDev()), &create, NULL, &stored.version->image) != VK_SUCCESS)
     {
       failure = "createImageVersionFailed";
       break;
     }
     VkMemoryRequirements requirements = {};
-    vt->GetImageMemoryRequirements(Unwrap(GetDev()), stored.image, &requirements);
+    vt->GetImageMemoryRequirements(Unwrap(GetDev()), stored.version->image, &requirements);
     if(!allocate(stored, requirements) ||
-       vt->BindImageMemory(Unwrap(GetDev()), stored.image, stored.memory, 0) != VK_SUCCESS)
+       vt->BindImageMemory(Unwrap(GetDev()), stored.version->image, stored.version->memory, 0) != VK_SUCCESS)
     {
       failure = "imageVersionBudgetOrBindFailed";
       break;
@@ -812,10 +1370,13 @@ void WrappedVulkan::SaveReplayCheckpoint(uint32_t endEventID, ReplayLogType repl
       m_CheckpointStats.reason = "budgetReservedForSharedBufferPrefixAnchor";
       return;
     }
-    SubmitCmds();
-    FlushQ();
     DestroyReplayCheckpoint(m_Checkpoints[oldest]);
     m_Checkpoints.erase(oldest);
+    if(HasFatalError())
+    {
+      DestroyReplayCheckpoint(checkpoint);
+      return;
+    }
   }
   m_Checkpoints.push_back(checkpoint);
   ++m_CheckpointStats.builds;
@@ -825,10 +1386,11 @@ void WrappedVulkan::SaveReplayCheckpoint(uint32_t endEventID, ReplayLogType repl
                                                          "savedPrimaryCommandBufferPrefix";
   if(IsReplayTimingActive())
     LogVulkanCheckpoint(StringFormat::Fmt(
-        "api=VulkanCheckpoint op=save kind=%s event=%u bytes=%llu resources=%zu total_ms=%.3f",
+        "api=VulkanCheckpoint op=save kind=%s event=%u bytes=%llu metadataBytes=%llu resources=%zu total_ms=%.3f",
         kind == ReplayCheckpointKind::FrameInitial ? "FrameInitial" :
         kind == ReplayCheckpointKind::CompletedSubmission ? "CompletedSubmission" : "PartialCommand",
-        event, (unsigned long long)allocated, checkpoint->resources.size(), timer.GetMilliseconds()));
+        event, (unsigned long long)allocated, (unsigned long long)checkpoint->metadataBytes,
+        checkpoint->resources.size(), timer.GetMilliseconds()));
 }
 
 bool WrappedVulkan::CopyReplayCheckpointResources(ReplayCheckpoint &checkpoint, bool restore)
@@ -863,14 +1425,9 @@ bool WrappedVulkan::CopyReplayCheckpointResources(ReplayCheckpoint &checkpoint, 
         return false;
     }
   }
-  SubmitCmds();
-  FlushQ();
+  if(!DrainReplayCheckpointWork() || HasFatalError())
+    return false;
   const VkDevDispatchTable *vt = ObjDisp(GetDev());
-  {
-    ScopedReplayTimingSection timing(ReplayTimingSection::ExplicitWait);
-    if(vt->DeviceWaitIdle(Unwrap(GetDev())) != VK_SUCCESS)
-      return false;
-  }
   const double drainMS = timer.GetMilliseconds();
   VkCommandBuffer cmd = GetNextCmd();
   if(cmd == VK_NULL_HANDLE)
@@ -888,20 +1445,35 @@ bool WrappedVulkan::CopyReplayCheckpointResources(ReplayCheckpoint &checkpoint, 
                                   VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
   vt->CmdPipelineBarrier(Unwrap(cmd), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &memoryBarrier, 0, NULL, 0, NULL);
+  uint64_t copiedBytes = 0, retainedBytes = 0;
+  uint32_t copyCommands = 0, retainedResources = 0;
   for(ReplayCheckpointResource &resource : checkpoint.resources)
   {
+    auto resident = m_CheckpointResidentVersions.find(resource.source);
+    const bool retained = resource.version && (restore ?
+        CanReuseReplayCheckpointContents(resource) &&
+        Process::GetEnvVariable("RENDERDOC_VULKAN_DISABLE_CHECKPOINT_RESIDENT_SKIP") != "1" &&
+        resident != m_CheckpointResidentVersions.end() && resident->second.lock() == resource.version :
+        resource.version->populated);
+    if(resource.version && retained)
+    {
+      retainedBytes += resource.copyBytes;
+      ++retainedResources;
+    }
     if(resource.sourceImage == VK_NULL_HANDLE)
     {
-      if(!resource.shared)
+      if(!resource.shared && !retained)
       {
         VkBufferCopy copy = {0, 0, resource.copyBytes};
-        vt->CmdCopyBuffer(Unwrap(cmd), restore ? resource.buffer : resource.sourceBuffer,
-                          restore ? resource.sourceBuffer : resource.buffer, 1, &copy);
+        vt->CmdCopyBuffer(Unwrap(cmd), restore ? resource.version->buffer : resource.sourceBuffer,
+                          restore ? resource.sourceBuffer : resource.version->buffer, 1, &copy);
+        copiedBytes += resource.copyBytes;
+        ++copyCommands;
       }
       continue;
     }
     LockedImageStateRef state = FindImageState(resource.source);
-    if(resource.shared)
+    if(resource.shared || retained)
     {
       if(restore)
       {
@@ -930,12 +1502,17 @@ bool WrappedVulkan::CopyReplayCheckpointResources(ReplayCheckpoint &checkpoint, 
                                  RDCMAX(1U, info.extent.depth >> mip)}};
           regions.push_back(region);
         }
+    if(!regions.empty())
+    {
+      copiedBytes += resource.copyBytes;
+      ++copyCommands;
+    }
     if(!restore)
     {
       VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0,
                                      VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                     VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, resource.image,
+                                     VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, resource.version->image,
                                      {info.aspects, 0, info.levelCount, 0, info.layerCount}};
       vt->CmdPipelineBarrier(Unwrap(cmd), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
@@ -946,7 +1523,7 @@ bool WrappedVulkan::CopyReplayCheckpointResources(ReplayCheckpoint &checkpoint, 
       // Queue-family transfers were rejected before recording, so every barrier is inline.
       if(!regions.empty())
         vt->CmdCopyImage(Unwrap(cmd), Unwrap(resource.sourceImage), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                         resource.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         resource.version->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          (uint32_t)regions.size(), regions.data());
       InlineCleanupImageBarriers(cmd, cleanup);
       barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -962,7 +1539,7 @@ bool WrappedVulkan::CopyReplayCheckpointResources(ReplayCheckpoint &checkpoint, 
                               VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                               GetImageTransitionInfo());
       if(!regions.empty())
-        vt->CmdCopyImage(Unwrap(cmd), resource.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        vt->CmdCopyImage(Unwrap(cmd), resource.version->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                          Unwrap(resource.sourceImage), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          (uint32_t)regions.size(), regions.data());
       state->InlineTransition(cmd, m_QueueFamilyIdx, resource.imageState,
@@ -994,13 +1571,28 @@ bool WrappedVulkan::CopyReplayCheckpointResources(ReplayCheckpoint &checkpoint, 
     return false;
   }
   const double recordMS = timer.GetMilliseconds() - drainMS;
-  SubmitCmds();
-  FlushQ();
+  if(!DrainReplayCheckpointWork() || HasFatalError())
+  {
+    m_CheckpointResidentVersions.clear();
+    return false;
+  }
+  for(ReplayCheckpointResource &resource : checkpoint.resources)
+    if(resource.version)
+    {
+      resource.version->populated = true;
+      if(CanReuseReplayCheckpointContents(resource))
+        m_CheckpointResidentVersions[resource.source] = resource.version;
+      else
+        m_CheckpointResidentVersions.erase(resource.source);
+    }
   if(IsReplayTimingActive())
     LogVulkanCheckpoint(StringFormat::Fmt(
         "api=VulkanCheckpoint op=%s event=%u drain_ms=%.3f record_ms=%.3f "
-        "submitwait_ms=%.3f total_ms=%.3f", restore ? "restoreCopy" : "saveCopy",
+        "submitwait_ms=%.3f total_ms=%.3f copiedBytes=%llu retainedBytes=%llu writeIndexComplete=%u "
+        "copyCommands=%u retainedResources=%u copyBytesBasis=allocation",
+        restore ? "restoreCopy" : "saveCopy",
         checkpoint.eventId, drainMS, recordMS, timer.GetMilliseconds() - drainMS - recordMS,
-        timer.GetMilliseconds()));
+        timer.GetMilliseconds(), (unsigned long long)copiedBytes, (unsigned long long)retainedBytes,
+        m_CheckpointWriteIndexComplete ? 1U : 0U, copyCommands, retainedResources));
   return !HasFatalError();
 }

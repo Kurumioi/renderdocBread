@@ -1580,6 +1580,7 @@ void GLReplay::FillWithDiscardPattern(DiscardType type, GLuint framebuffer, GLsi
                                       const GLenum *attachments, GLint x, GLint y, GLsizei width,
                                       GLsizei height)
 {
+  ResetCheckpointTextureLineage();
   RDCASSERT(type == DiscardType::InvalidateCall);
 
   WrappedOpenGL &drv = *m_pDriver;
@@ -1718,6 +1719,7 @@ void GLReplay::FillWithDiscardPattern(DiscardType type, ResourceId id, GLuint mi
                                       GLint yoffset, GLint zoffset, GLsizei width, GLsizei height,
                                       GLsizei depth)
 {
+  ResetCheckpointTextureLineage();
   RDCASSERT(type == DiscardType::InvalidateCall);
 
   WrappedOpenGL &drv = *m_pDriver;

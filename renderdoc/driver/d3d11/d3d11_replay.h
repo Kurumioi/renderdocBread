@@ -211,6 +211,7 @@ public:
                                  uint64_t byteLength = ~0ULL);
   bool ApplyPendingBufferPatches();
   void InvalidateBufferPatchContents() { m_BufferPatchesDirty = !m_BufferPatches.empty(); }
+  void RecordCheckpointPotentialWrite(ResourceId resource, uint32_t eventId);
   bool HasBufferPatches() const { return !m_BufferPatches.empty(); }
   void InvalidateLiveForward();
   SDFile *GetStructuredFile();
@@ -434,11 +435,17 @@ private:
   bool RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint);
   void UpdateCheckpointAccounting();
   void EvictOldestCheckpoint();
+  void ForgetCheckpointWrites(uint32_t firstEvent, uint32_t lastEvent);
   ReplayCheckpointConfig m_CheckpointConfig;
   ReplayCheckpointStats m_CheckpointStats;
   rdcarray<ReplayCheckpointCandidate> m_CheckpointCandidates;
   rdcarray<CheckpointResource> m_CheckpointResources;
   std::map<uint32_t, std::unique_ptr<ReplayCheckpoint>> m_Checkpoints;
+  // Weak ownership cannot keep an evicted GPU backup outside the checkpoint memory budget.
+  std::map<ResourceId, std::weak_ptr<CheckpointVersion>> m_CheckpointResidentVersions;
+  std::map<ResourceId, rdcarray<uint32_t>> m_CheckpointPotentialWrites;
+  uint64_t m_CheckpointPotentialWriteCount = 0;
+  uint64_t m_CheckpointResidentSerial = 0;
   uint64_t m_CheckpointUseSerial = 0;
   uint32_t m_CheckpointCurrentEvent = 0;
   bool m_CheckpointPrepared = false;

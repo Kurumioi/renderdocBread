@@ -1673,6 +1673,7 @@ void WrappedOpenGL::ReplaceResource(ResourceId from, ResourceId to)
 {
   if(GetResourceManager()->HasResource(from))
   {
+    m_ReplayPatchReadIndex.InvalidateForEdit();
     GLResource fromresource = GetResourceManager()->GetResource(from);
     GLResource toresource = GetResourceManager()->GetResource(to);
 
@@ -1782,6 +1783,7 @@ void WrappedOpenGL::RemoveReplacement(ResourceId id)
 {
   if(GetResourceManager()->HasReplacement(id))
   {
+    m_ReplayPatchReadIndex.InvalidateForEdit();
     GetResourceManager()->RemoveReplacement(id);
 
     RefreshDerivedReplacements();
@@ -1838,6 +1840,7 @@ rdcstr WrappedOpenGL::ReplaceTargetShaderChecked(ResourceId from, ResourceId to)
     return error;
   }
 
+  m_ReplayPatchReadIndex.InvalidateForEdit();
   return {};
 }
 
@@ -1867,6 +1870,7 @@ rdcstr WrappedOpenGL::RemoveTargetShaderReplacementChecked(ResourceId id)
     return error;
   }
 
+  m_ReplayPatchReadIndex.InvalidateForEdit();
   return {};
 }
 
@@ -2398,16 +2402,14 @@ rdcstr WrappedOpenGL::RefreshDerivedReplacementsChecked(ResourceId requiredShade
     if(item.hadPrevious)
       rm->RemoveReplacement(item.original);
     if(item.replacement != 0)
-      rm->ReplaceResource(item.original,
-                          rm->GetResID(ProgramRes(GetCtx(), item.replacement)));
+      rm->ReplaceResource(item.original, rm->GetResID(ProgramRes(GetCtx(), item.replacement)));
   }
   for(PendingPipeline &item : pendingPipelines)
   {
     if(item.hadPrevious)
       rm->RemoveReplacement(item.original);
     if(item.replacement != 0)
-      rm->ReplaceResource(item.original,
-                          rm->GetResID(ProgramPipeRes(GetCtx(), item.replacement)));
+      rm->ReplaceResource(item.original, rm->GetResID(ProgramPipeRes(GetCtx(), item.replacement)));
   }
 
   for(PendingPipeline &item : pendingPipelines)
@@ -5664,6 +5666,16 @@ RDResult WrappedOpenGL::ContextReplayLog(CaptureState readType, uint32_t startEv
                                          uint32_t endEventID, bool partial)
 {
   ScopedReplayTimingSection replaySetup(ReplayTimingSection::ReplaySetup);
+  if(IsLoading(m_State))
+  {
+    m_ReplayPatchFirstReads.clear();
+    m_ReplayPatchReadEvidenceError.clear();
+    m_ReplayPatchReadIndex.Clear();
+    m_ReplayPatchReadRegistered.clear();
+    m_ReplayPatchReadLastEvent = 0;
+    m_ReplayCheckpointBufferWrites.Clear();
+    m_Replay->ResetCheckpointTextureTracking();
+  }
   m_FrameReader->SetOffset(0);
 
   ReadSerialiser ser(m_FrameReader, Ownership::Nothing);
@@ -5824,6 +5836,9 @@ RDResult WrappedOpenGL::ContextReplayLog(CaptureState readType, uint32_t startEv
 
   if(IsLoading(m_State))
   {
+    m_ReplayPatchReadLastEvent = m_CurEventID;
+    m_ReplayPatchReadIndex.FinalizeReads(1, m_ReplayPatchReadLastEvent,
+                                         m_ReplayPatchReadEvidenceError.empty());
     GetReplay()->WriteFrameRecord().actionList = m_ParentAction.children;
     GetReplay()->WriteFrameRecord().frameInfo.debugMessages = GetDebugMessages();
 
@@ -5891,10 +5906,63 @@ void WrappedOpenGL::TrackReplayPatchBinding(GLResource buffer, GLenum target)
     info.replayPatchNonUniformInput = true;
 }
 
+void WrappedOpenGL::RecordReplayPatchRead(ResourceId buffer, uint32_t eventId, uint64_t byteOffset,
+                                          uint64_t byteLength)
+{
+  if(!IsLoading(m_State) || eventId == 0)
+    return;
+  auto info = m_Buffers.find(buffer);
+  if(buffer == ResourceId() || info == m_Buffers.end() || info->second.size == 0)
+  {
+    m_ReplayPatchReadIndex.RecordUnknown(eventId);
+    return;
+  }
+  uint32_t &first = m_ReplayPatchFirstReads[buffer];
+  first = first ? RDCMIN(first, eventId) : eventId;
+  const uint64_t extent = info->second.size;
+  auto registered = m_ReplayPatchReadRegistered.find(buffer);
+  if(registered == m_ReplayPatchReadRegistered.end())
+  {
+    if(m_ReplayPatchReadRegistered.size() >= 65536)
+    {
+      m_ReplayPatchReadIndex.RecordUnknown(eventId);
+      return;
+    }
+    m_ReplayPatchReadRegistered[buffer] = extent;
+    // External/sparse storage and shader-writable aliases remain rejected by the existing
+    // persistent-patch guards. Retain uncertain storage as incomplete in the shared index too.
+    m_ReplayPatchReadIndex.Register(buffer, 0, extent, info->second.replayPatchUnsafe);
+  }
+  else if(registered->second != extent)
+  {
+    // glBufferData can redefine storage during the frame. A single registered storage interval
+    // cannot describe those lifetimes; retain the old resource-wide cutoff for this capture.
+    m_ReplayPatchReadIndex.RecordUnknown(eventId);
+    return;
+  }
+  if(byteOffset >= extent || byteLength == 0)
+  {
+    m_ReplayPatchReadIndex.RecordUnknown(eventId);
+    return;
+  }
+  m_ReplayPatchReadIndex.RecordRead(
+      eventId, {buffer, 0, byteOffset, RDCMIN(byteLength, extent - byteOffset)}, true);
+}
+
 void WrappedOpenGL::TrackReplayCheckpointBufferWrite(const GLResource &buffer)
 {
+  if(IsLoading(m_State))
+    m_ReplayCheckpointBufferWrites.Record(buffer.name && buffer.Namespace == eResBuffer
+                                              ? GetResourceManager()->GetResID(buffer)
+                                              : ResourceId());
   if(IsActiveReplaying(m_State))
     m_Replay->InvalidateCheckpointBufferVersion(buffer);
+}
+
+void WrappedOpenGL::RecordReplayCheckpointTextureWrite(const GLResource &resource)
+{
+  if(IsLoading(m_State))
+    m_Replay->RecordCheckpointTextureWrite(resource);
 }
 
 void WrappedOpenGL::ApplyReplayBufferPatches()
@@ -5924,6 +5992,8 @@ void WrappedOpenGL::ApplyReplayBufferPatches()
 bool WrappedOpenGL::ContextProcessChunk(ReadSerialiser &ser, GLChunk chunk)
 {
   m_AddedAction = false;
+
+  m_Replay->TrackCheckpointTextureWrites(chunk);
 
   if(IsActiveReplaying(m_State))
     m_Replay->TrackCheckpointBufferWrites(chunk);
@@ -6036,8 +6106,9 @@ void WrappedOpenGL::AddUsage(const ActionDescription &a)
   // bound as a UBO. This action carries the actual frame EID, independently of shader reflection.
   if(a.copySource != ResourceId() && m_Buffers.find(a.copySource) != m_Buffers.end())
   {
-    uint32_t &first = m_ReplayPatchFirstReads[a.copySource];
-    first = first ? RDCMIN(first, a.eventId) : a.eventId;
+    // Whole-buffer copies are deliberately conservative even when the native copy has a
+    // narrower range: a descendant may consume these bytes before the first direct UBO use.
+    RecordReplayPatchRead(a.copySource, a.eventId);
   }
   ActionFlags DrawDispatchMask = ActionFlags::Drawcall | ActionFlags::Dispatch;
   if(!(a.flags & DrawDispatchMask))
@@ -6051,10 +6122,14 @@ void WrappedOpenGL::AddUsage(const ActionDescription &a)
 
   // Enumerate all native UBO slots, including bindings unused by the captured shader. A shader
   // replacement can consume those slots; GetUsage's reflected used-block list is insufficient.
+  const bool uniformQueriesClean = GL.glGetError() == eGL_NONE;
   GLint uniformBindings = 0;
   GL.glGetIntegerv(eGL_MAX_UNIFORM_BUFFER_BINDINGS, &uniformBindings);
   if(!GL.glGetIntegeri_v || uniformBindings <= 0 || uniformBindings > 65536)
+  {
     m_ReplayPatchReadEvidenceError = "uniformBindingEnumerationUnavailable";
+    m_ReplayPatchReadIndex.RecordUnknown(e);
+  }
   else
     for(GLint slot = 0; slot < uniformBindings; ++slot)
     {
@@ -6065,10 +6140,21 @@ void WrappedOpenGL::AddUsage(const ActionDescription &a)
         const GLResource resource = BufferRes(ctx, buffer);
         const ResourceId id = rm->GetResID(resource);
         TrackReplayPatchBinding(resource, eGL_UNIFORM_BUFFER);
-        uint32_t &first = m_ReplayPatchFirstReads[id];
-        first = first ? RDCMIN(first, e) : e;
+        GLint64 start = 0, size = 0;
+        if(GL.glGetInteger64i_v)
+        {
+          GL.glGetInteger64i_v(eGL_UNIFORM_BUFFER_START, (GLuint)slot, &start);
+          GL.glGetInteger64i_v(eGL_UNIFORM_BUFFER_SIZE, (GLuint)slot, &size);
+        }
+        auto info = m_Buffers.find(id);
+        const uint64_t extent = info == m_Buffers.end() ? 0 : info->second.size;
+        const ReplayResourceRange range =
+            GLReplayPatchUniformReadRange(id, extent, start, size, GL.glGetInteger64i_v != NULL);
+        RecordReplayPatchRead(id, e, range.offset, range.size);
       }
     }
+  if(!uniformQueriesClean || GL.glGetError() != eGL_NONE)
+    m_ReplayPatchReadIndex.RecordUnknown(e);
 
   //////////////////////////////
   // Input
@@ -6079,8 +6165,11 @@ void WrappedOpenGL::AddUsage(const ActionDescription &a)
     GL.glGetIntegerv(eGL_ELEMENT_ARRAY_BUFFER_BINDING, (GLint *)&ibuffer);
 
     if(ibuffer)
+    {
+      RecordReplayPatchRead(rm->GetResID(BufferRes(ctx, ibuffer)), e);
       m_ResourceUses[rm->GetResID(BufferRes(ctx, ibuffer))].push_back(
           EventUsage(e, ResourceUsage::IndexBuffer));
+    }
   }
 
   // Vertex buffers and attributes
@@ -6091,8 +6180,32 @@ void WrappedOpenGL::AddUsage(const ActionDescription &a)
     GLuint buffer = GetBoundVertexBuffer(i);
 
     if(buffer)
+    {
+      RecordReplayPatchRead(rm->GetResID(BufferRes(ctx, buffer)), e);
       m_ResourceUses[rm->GetResID(BufferRes(ctx, buffer))].push_back(
           EventUsage(e, ResourceUsage::VertexBuffer));
+    }
+  }
+
+  if(a.flags & ActionFlags::Indirect)
+  {
+    GLuint indirect = 0;
+    GL.glGetIntegerv(a.flags & ActionFlags::Dispatch ? eGL_DISPATCH_INDIRECT_BUFFER_BINDING
+                                                     : eGL_DRAW_INDIRECT_BUFFER_BINDING,
+                     (GLint *)&indirect);
+    if(indirect)
+      RecordReplayPatchRead(rm->GetResID(BufferRes(ctx, indirect)), e);
+    else
+      m_ReplayPatchReadIndex.RecordUnknown(e);
+    // Count-based multi-draw can read a separate parameter buffer. Recording its whole storage
+    // also covers conservative extra reads on non-count indirect draws with that buffer bound.
+    if(!(a.flags & ActionFlags::Dispatch) && HasExt[ARB_indirect_parameters])
+    {
+      GLuint parameter = 0;
+      GL.glGetIntegerv(eGL_PARAMETER_BUFFER_BINDING_ARB, (GLint *)&parameter);
+      if(parameter)
+        RecordReplayPatchRead(rm->GetResID(BufferRes(ctx, parameter)), e);
+    }
   }
 
   //////////////////////////////
@@ -6462,7 +6575,7 @@ const GLDrawParams &WrappedOpenGL::GetDrawParameters(uint32_t eventId)
 }
 
 void WrappedOpenGL::ReplayLog(uint32_t startEventID, uint32_t endEventID, ReplayLogType replayType,
-                               bool liveCursorManaged)
+                              bool liveCursorManaged)
 {
   // Shader debugging, overlays, counters and pixel history call this internal entry directly.
   // Their replay cannot inherit or publish an ordinary navigation cursor.
@@ -6482,6 +6595,7 @@ void WrappedOpenGL::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
   if(!partial)
   {
     m_Replay->ResetCheckpointBufferLineage();
+    m_Replay->ResetCheckpointTextureLineage();
     RENDERDOC_PROFILEREGION("ApplyInitialContents");
     GLMarkerRegion apply("!!!!RenderDoc Internal: ApplyInitialContents");
     {
@@ -6516,8 +6630,8 @@ void WrappedOpenGL::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
       RDCFATAL("Unexpected replay type");
   }
 
-  m_LastReplaySucceeded = status.code == ResultCode::Succeeded &&
-                          FatalErrorCheck() == ResultCode::Succeeded;
+  m_LastReplaySucceeded =
+      status.code == ResultCode::Succeeded && FatalErrorCheck() == ResultCode::Succeeded;
   if(!m_LastReplaySucceeded)
     m_Replay->InvalidateLiveForward();
   RDCASSERTEQUAL(status.code, ResultCode::Succeeded);

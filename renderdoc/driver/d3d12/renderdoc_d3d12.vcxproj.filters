@@ -36,6 +36,9 @@
     <ClInclude Include="d3d12_replay_clear.h">
       <Filter>Util</Filter>
     </ClInclude>
+    <ClInclude Include="d3d12_buffer_read_index.inl">
+      <Filter>Util</Filter>
+    </ClInclude>
     <ClInclude Include="d3d12_device.h">
       <Filter>Core IFaces</Filter>
     </ClInclude>

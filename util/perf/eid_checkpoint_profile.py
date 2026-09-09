@@ -153,6 +153,35 @@ def resolve_extra_textures(names, resources, textures):
     return result
 
 
+def resolve_extra_buffers(names, resources, buffers):
+    if len(names) > 16 or len(set(names)) != len(names) or any(not name for name in names):
+        raise ValueError("Provide at most sixteen distinct nonempty extra buffer names")
+    result = []
+    for name in names:
+        named = [r for r in resources if str(r.name) == name]
+        if len(named) != 1:
+            raise ValueError("Extra buffer name is missing or ambiguous: " + name)
+        matches = [b for b in buffers if b.resourceId == named[0].resourceId]
+        if len(matches) != 1 or not 0 < int(matches[0].length) <= (1 << 64) - 1:
+            raise ValueError("Extra resource is not exactly one bounded captured buffer: " + name)
+        result.append((name, matches[0]))
+    return result
+
+
+def full_buffer_witness(controller, buffers, budget):
+    total = sum(int(buffer.length) for _, buffer in buffers)
+    if total > budget:
+        raise RuntimeError("Every extra buffer must fit the remaining read budget; none may be omitted")
+    result = []
+    for name, buffer in buffers:
+        raw = bytes(controller.GetBufferData(buffer.resourceId, 0, int(buffer.length)))
+        if len(raw) != int(buffer.length):
+            raise RuntimeError("Incomplete full-buffer readback: " + name)
+        result.append(dict(name=name, resource=str(buffer.resourceId), bytes=len(raw),
+                           sha256=hashlib.sha256(raw).hexdigest()))
+    return result
+
+
 def selected_event_evidence(controller, events):
     """Read existing structured metadata only; do not infer an API EID from its nearest draw."""
     structured = controller.GetStructuredFile()
@@ -201,6 +230,8 @@ def main():
     parser.add_argument("--max-read-mib", type=int, default=512)
     parser.add_argument("--extra-texture", action="append", default=[],
                         help="Also validate every subresource of this exact named texture at each EID")
+    parser.add_argument("--extra-buffer", action="append", default=[],
+                        help="Also validate every byte of this exact named buffer at each EID")
     parser.add_argument("--min-hits", type=int, default=1)
     parser.add_argument("--min-full-clear-restores", type=int, default=0,
                         help="Require actual checkpoint restores that omit a proven full-clear resource")
@@ -239,11 +270,18 @@ def main():
                   "RENDERDOC_D3D12_CHECKPOINT_FULL_CLEAR_PREFIX",
                   "RENDERDOC_D3D12_CHECKPOINT_FAIL_AFTER_INITIAL",
                   "RENDERDOC_D3D12_INITIAL_SOURCE_CACHE_ORDER",
-                  "RENDERDOC_GL_DISABLE_STATIC_CHECKPOINT_SHARING")},
+                   "RENDERDOC_GL_DISABLE_STATIC_CHECKPOINT_SHARING",
+                   "RENDERDOC_GL_DISABLE_CHECKPOINT_TEXTURE_VERSIONS",
+                   "RENDERDOC_VULKAN_DISABLE_CHECKPOINT_CONTENT_REUSE",
+                   "RENDERDOC_VULKAN_DISABLE_CHECKPOINT_RESIDENT_SKIP",
+                   "RENDERDOC_D3D12_DISABLE_CHECKPOINT_TYPED_ALIASES",
+                   "RENDERDOC_D3D12_PRESERVE_CAPTURED_UPLOAD_HEAPS",
+                   "RENDERDOC_D3D12_DISABLE_CPU_WRITE_DIRTY_RANGES")},
               "configuration": vars(args), "issues": [], "eventComparisons": [],
               "coverage": "Full native pixels of every bound color/depth output view (all view mips, "
                           "array slices and samples; whole volume for 3D), plus pipeline binding witness. "
-                          "Does not validate every UAV/buffer or implement shared-resource edits.",
+                          "Explicit extra textures cover all subresources; explicit extra buffers cover every byte. "
+                          "Other unrequested UAVs/buffers are not covered; shared-resource edits use separate probes.",
               "forceMeaning": "SetFrameEvent(force=True) bypasses checkpoint save/restore; never use it for hit measurements",
               "mutationCoverage": "Separate event-CBuffer fixture remains available; no shared edit is fabricated"}
     recorder = Recorder(report, output, output.with_suffix(".rdoc.log"), args.max_seconds)
@@ -256,6 +294,7 @@ def main():
     report["buildIdentity"] = build_identity(rd, None)
     capture_file, controller = None, None
     extra_textures = []
+    extra_buffers = []
     rd.InitialiseReplay(rd.GlobalEnvironment(), [])
 
     def status():
@@ -326,7 +365,7 @@ def main():
                 requests.append((key, texture.resourceId, sub))
         if not requests:
             raise RuntimeError("No bound color or depth output; choose render actions for pixel validation")
-        if estimated > budget:
+        if estimated + sum(int(buffer.length) for _, buffer in extra_buffers) > budget:
             raise RuntimeError("Every bound output must fit max-read-mib; no output is silently omitted")
         actual = 0
         for key, resource, sub in requests:
@@ -338,6 +377,8 @@ def main():
                 raise RuntimeError("Native output readback exceeded max-read-mib")
             witness["pixels"].append({"resource": key[0], "mip": sub[0], "slice": sub[1], "sample": sub[2],
                                       "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()})
+        if extra_buffers:
+            witness["extraBuffers"] = full_buffer_witness(controller, extra_buffers, budget - actual)
         fatal = controller.GetFatalErrorStatus()
         if fatal.code != rd.ResultCode.Succeeded:
             raise RuntimeError("Native replay failed: " + str(fatal))
@@ -514,6 +555,10 @@ def main():
             raise RuntimeError("OpenCapture failed: " + str(result))
         extra_textures = resolve_extra_textures(args.extra_texture, controller.GetResources(),
                                                 controller.GetTextures())
+        extra_buffers = resolve_extra_buffers(args.extra_buffer, controller.GetResources(),
+                                               controller.GetBuffers())
+        report["extraBufferResources"] = [dict(name=name, resource=str(buffer.resourceId),
+                                                bytes=int(buffer.length)) for name, buffer in extra_buffers]
         report["extraTextureResources"] = [{"name": name, "resource": str(texture.resourceId)}
                                              for name, texture in extra_textures]
         report["selectedEventEvidence"], _ = recorder.measure(

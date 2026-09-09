@@ -216,6 +216,7 @@ void GLReplay::ClearPostVSCache()
 
 void GLReplay::InitPostVSBuffers(uint32_t eventId)
 {
+  TextureAnalysisScope textureAnalysis(*this);
   InvalidateLiveForward();
   if(m_PostVSData.find(eventId) != m_PostVSData.end())
     return;

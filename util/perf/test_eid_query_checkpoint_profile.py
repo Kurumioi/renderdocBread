@@ -15,7 +15,8 @@ import eid_query_checkpoint_profile as probe
 from test_eid_shared_buffer_profile import Controller, Resource
 
 
-FLAGS = SimpleNamespace(Drawcall=1, CommandBufferBoundary=2, BeginPass=4, EndPass=8, Clear=32)
+FLAGS = SimpleNamespace(Drawcall=1, CommandBufferBoundary=2, BeginPass=4, EndPass=8,
+                        SetMarker=16, Clear=32)
 
 
 class QueryController(Controller):

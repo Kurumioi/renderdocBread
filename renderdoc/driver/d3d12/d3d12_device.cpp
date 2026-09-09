@@ -85,6 +85,24 @@ struct D3D12ReplayCheckpointResource
   ~D3D12ReplayCheckpointResource() { SAFE_RELEASE(gpu); }
 };
 
+// Buffer layouts have specified byte identity across aliases. UNKNOWN-layout textures do not:
+// their compression metadata cannot be captured through this physical-memory view.
+struct D3D12ReplayBufferAliasComponent
+{
+  ResourceId heap;
+  uint64_t begin = 0, end = 0, allocationBytes = 0;
+  std::set<ResourceId> members;
+  ReplayResourceRange Range() const { return {heap, 0, begin, end - begin}; }
+};
+
+struct D3D12ReplayCheckpointBufferAliases
+{
+  D3D12ReplayBufferAliasComponent component;
+  ID3D12Resource *gpu = NULL;
+  ReplayResourceVersion version;
+  ~D3D12ReplayCheckpointBufferAliases() { SAFE_RELEASE(gpu); }
+};
+
 struct D3D12ReplayCheckpointHeap
 {
   ResourceId id;
@@ -120,6 +138,9 @@ struct D3D12ReplayCheckpoint
   uint64_t lastUse = 0;
   std::map<ResourceId, SubresourceStateVector> states;
   std::map<ResourceId, std::shared_ptr<D3D12ReplayCheckpointResource>> resources;
+  std::map<ResourceId, std::shared_ptr<D3D12ReplayCheckpointBufferAliases>> bufferAliases;
+  std::set<ResourceId> typedAliasOwners;
+  std::set<ResourceId> typedAliasMembers;
   std::map<ResourceId, std::shared_ptr<D3D12ReplayCheckpointHeap>> heaps;
   std::map<D3D12CheckpointQuerySlot, D3D12ReplayCheckpointQuery> queries;
   std::set<D3D12CheckpointQueryResolve> queryResolves;
@@ -138,6 +159,12 @@ struct D3D12ReplayCheckpointCache
   // Only a version actually materialised during this replay may be shared. An equal write EID
   // from a different full replay is not proof that nondeterministic GPU contents are identical.
   std::map<ResourceId, std::shared_ptr<D3D12ReplayCheckpointResource>> currentVersions;
+  std::map<ResourceId, std::shared_ptr<D3D12ReplayCheckpointBufferAliases>> currentBufferAliases;
+  std::map<ResourceId, D3D12ReplayBufferAliasComponent> bufferAliasComponents;
+  std::map<ResourceId, ResourceId> bufferAliasMembers;
+  std::map<ResourceId, std::set<ResourceId>> typedAliasConflicts;
+  std::map<uint32_t, std::set<ResourceId>> selectedTypedOwners;
+  std::set<uint32_t> provedTypedBoundaries;
   // Content identity survives an EID request, unlike the per-replay snapshot sharing map. Only
   // actual checkpoint copies establish a known identity; potential writes invalidate it.
   ReplayResourceVersions residentVersions;
@@ -157,6 +184,8 @@ struct D3D12ReplayCheckpointCache
     for(const auto &entry : checkpoint.resources)
       if(!deferredInitialResources.count(entry.first))
         residentVersions.MarkResident(ResidentRange(entry.first), entry.second->contentVersion);
+    for(const auto &entry : checkpoint.bufferAliases)
+      residentVersions.MarkResident(entry.second->component.Range(), entry.second->version);
   }
   // These references also keep unwrapped query-copy sources alive until submitted work is idle.
   std::map<D3D12CheckpointQuerySlot, D3D12ReplayCheckpointQuery> activeQueries;
@@ -169,6 +198,7 @@ struct D3D12ReplayCheckpointCache
   uint32_t bufferEditFirstEvent = ~0U;
   uint32_t bufferEditAnchorConsumer = 0;
   uint64_t budget = 0;
+  bool memoryBudgetBlocked = false;
   uint64_t serial = 0;
   bool savedThisReplay = false;
   // Keep the original API request: WithoutDraw's queue end is one event earlier, but its
@@ -178,8 +208,8 @@ struct D3D12ReplayCheckpointCache
   {
     uint32_t eventId = 0;
     uint32_t queueEndEvent = 0;
-    // Half-open byte intervals belonging to independent placed buffers. Heap padding and every
-    // other resource retain their original initial source.
+    // Half-open physical byte intervals supplied by independent placed-buffer copies or whole
+    // qualified buffer-alias components. All remaining bytes retain their original initial source.
     std::map<ResourceId, rdcarray<rdcpair<uint64_t, uint64_t>>> heapExclusions;
     std::set<ResourceId> retainedResources;
     std::set<ResourceId> fullClearResources;
@@ -200,6 +230,9 @@ struct D3D12ReplayCheckpointCache
       for(const auto &resource : checkpoint.resources)
         if(seen.insert(resource.second.get()).second)
           bytes += resource.second->bytes;
+      for(const auto &aliases : checkpoint.bufferAliases)
+        if(seen.insert(aliases.second.get()).second)
+          bytes += aliases.second->component.allocationBytes;
       for(const auto &heap : checkpoint.heaps)
         if(seen.insert(heap.second.get()).second)
           bytes += heap.second->descriptors.byteSize();
@@ -333,6 +366,114 @@ static D3D12_RESOURCE_DESC CheckpointQueryBufferDesc(uint64_t bytes)
   return desc;
 }
 
+static bool D3D12CheckpointStatesEqual(const SubresourceStateVector &a,
+                                      const SubresourceStateVector &b)
+{
+  if(a.size() != b.size())
+    return false;
+  for(size_t i = 0; i < a.size(); i++)
+    if(!a[i].IsStates() || !b[i].IsStates() || a[i].ToStates() != b[i].ToStates())
+      return false;
+  return true;
+}
+
+static bool D3D12ProvedTypedAliasActivation(
+    bool boundaryProven, ResourceId after,
+    const std::map<ResourceId, std::set<ResourceId>> &conflicts)
+{
+  return boundaryProven && after != ResourceId() && conflicts.count(after) != 0;
+}
+
+static WrappedID3D12Heap *D3D12CheckpointOriginalHeap(D3D12ResourceManager *manager, ResourceId id)
+{
+  if(id == ResourceId() || !manager->HasResource(id) || manager->HasReplacement(id) ||
+     manager->GetUnreplacedID(id) != id)
+    return NULL;
+  ID3D12DeviceChild *object = manager->GetResourceWithoutReplacement(id, true);
+  return object && TryIdentifyTypeByPtr(object) == Resource_Heap ? (WrappedID3D12Heap *)object : NULL;
+}
+
+struct D3D12CheckpointPlacedRange
+{
+  ResourceId resource;
+  uint64_t begin = 0, end = 0;
+};
+
+static bool D3D12MayShareBufferAliasVersion(bool writesKnown, bool trackingAllowed, bool exactVersion)
+{
+  // Restoration can establish a known version even when the next shader/analysis replay has
+  // no complete potential-write tracking. That identity alone cannot prove it stayed unchanged.
+  return writesKnown && trackingAllowed && exactVersion;
+}
+
+static rdcarray<D3D12ReplayBufferAliasComponent> D3D12BufferAliasComponents(
+    ResourceId heap, uint64_t heapBytes, bool completeBufferHeap,
+    rdcarray<D3D12CheckpointPlacedRange> ranges)
+{
+  rdcarray<D3D12ReplayBufferAliasComponent> result;
+  if(!completeBufferHeap || heap == ResourceId() || !heapBytes)
+    return result;
+  std::set<ResourceId> seen;
+  for(const auto &range : ranges)
+    if(range.resource == ResourceId() || !seen.insert(range.resource).second ||
+       range.begin >= range.end || range.end > heapBytes)
+      return result;
+  std::sort(ranges.begin(), ranges.end(),
+            [](const D3D12CheckpointPlacedRange &a, const D3D12CheckpointPlacedRange &b) {
+              return a.begin < b.begin;
+            });
+  for(size_t i = 0; i < ranges.size();)
+  {
+    D3D12ReplayBufferAliasComponent component;
+    component.heap = heap;
+    component.begin = ranges[i].begin;
+    component.end = ranges[i].end;
+    component.members.insert(ranges[i++].resource);
+    // A-B-C overlap forms one physical component even when A and C do not overlap directly.
+    // Adjacent independent allocations remain separate and need no alias checkpoint storage.
+    while(i < ranges.size() && ranges[i].begin < component.end)
+    {
+      component.end = RDCMAX(component.end, ranges[i].end);
+      component.members.insert(ranges[i++].resource);
+    }
+    if(component.members.size() > 1)
+      result.push_back(std::move(component));
+  }
+  return result;
+}
+
+static void D3D12CheckpointAliasBarrier(ID3D12GraphicsCommandList *list, ID3D12Resource *after = NULL)
+{
+  D3D12_RESOURCE_BARRIER alias = {};
+  alias.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+  alias.Aliasing.pResourceAfter = after;
+  // Synchronize previous physical-memory accesses before using a typed checkpoint copy or an
+  // explicitly qualified buffer-only physical view. This alone does not initialize texture data.
+  list->ResourceBarrier(1, &alias);
+}
+
+static void D3D12BufferAliasCopy(ID3D12GraphicsCommandList *list, ID3D12Resource *wholeHeap,
+                                 const D3D12ReplayCheckpointBufferAliases &saved, bool restore)
+{
+  D3D12CheckpointAliasBarrier(list);
+  D3D12_RESOURCE_BARRIER transition = {};
+  transition.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  transition.Transition.pResource = wholeHeap;
+  transition.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  transition.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+  transition.Transition.StateAfter =
+      restore ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COPY_SOURCE;
+  list->ResourceBarrier(1, &transition);
+  const auto &component = saved.component;
+  if(restore)
+    list->CopyBufferRegion(wholeHeap, component.begin, saved.gpu, 0, component.end - component.begin);
+  else
+    list->CopyBufferRegion(saved.gpu, 0, wholeHeap, component.begin, component.end - component.begin);
+  std::swap(transition.Transition.StateBefore, transition.Transition.StateAfter);
+  list->ResourceBarrier(1, &transition);
+  D3D12CheckpointAliasBarrier(list);
+}
+
 static bool IsReplayBufferPatchCopy(D3D12Chunk chunk)
 {
   return chunk == D3D12Chunk::List_CopyBufferRegion || chunk == D3D12Chunk::List_CopyResource ||
@@ -366,6 +507,7 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
     return error;
   std::set<ResourceId> buffers;
   std::map<ResourceId, uint32_t> consumers;
+  std::map<ResourceId, uint64_t> bufferExtents;
   uint64_t bytes = 0;
   uint32_t firstConsumer = ~0U;
   for(const ReplayBufferPatch &patch : patches)
@@ -388,6 +530,7 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
     bytes += patch.data.size();
     if(!buffers.insert(patch.buffer).second)
       continue;
+    bufferExtents[patch.buffer] = desc.Width;
 
     const uint32_t nativeConsumer =
         m_Queue->GetCommandData()->GetBufferPatchFirstConsumer(patch.buffer);
@@ -477,6 +620,12 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
     auto consumer = consumers.find(change.buffer);
     changedConsumer = RDCMIN(changedConsumer, consumer == consumers.end() ? 0U : consumer->second);
   }
+  uint32_t rangeConsumer = ~0U;
+  const bool rangeIndexKnown =
+      deltaKnown && !changes.empty() &&
+      m_Queue->GetCommandData()->GetBufferPatchRangeConsumer(bufferExtents, changes, rangeConsumer);
+  if(rangeIndexKnown && rangeConsumer != ~0U)
+    changedConsumer = rangeConsumer;
   // The full-table consumer continues to identify the immutable edit-start anchor. Only the
   // invalidation cutoff may advance when a later parameter changes and earlier overlays do not.
   const uint32_t affectedConsumer = sameLayout && firstConsumer > 0 && firstConsumer != ~0U &&
@@ -636,14 +785,14 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
         "api=D3D12BufferPatch op=set ranges=%zu bytes=%llu resetBuffers=%zu firstConsumer=%u "
         "sameLayout=%u firstAffected=%u anchor=%u retainedCheckpoints=%zu "
         "deltaKnown=%u deltaEnabled=%u changedRanges=%zu changedBytes=%llu changedBuffers=%zu "
-        "uploadReused=%u uploadWrittenBytes=%llu "
-        "initialSourcesPreserved=1 frameInitialFastPath=0 consumerBoundary=submitBaseOrCopy",
+        "uploadReused=%u uploadWrittenBytes=%llu rangeIndexKnown=%u rangeConsumer=%u "
+        "initialSourcesPreserved=1 frameInitialFastPath=0 consumerBoundary=nativeRangeOrSubmitBase",
         patches.size(), (unsigned long long)bytes, buffers.size(), firstConsumer,
         sameLayout ? 1U : 0U, m_ReplayBufferPatchFirstAffected, m_ReplayBufferPatchAnchorEvent,
-        m_ReplayCheckpoints ? m_ReplayCheckpoints->checkpoints.size() : 0,
-        deltaKnown ? 1U : 0U, deltaEnabled ? 1U : 0U, changes.size(),
-        (unsigned long long)changedBytes, changedBuffers.size(), reuseUpload ? 1U : 0U,
-        (unsigned long long)uploadWrittenBytes));
+        m_ReplayCheckpoints ? m_ReplayCheckpoints->checkpoints.size() : 0, deltaKnown ? 1U : 0U,
+        deltaEnabled ? 1U : 0U, changes.size(), (unsigned long long)changedBytes,
+        changedBuffers.size(), reuseUpload ? 1U : 0U, (unsigned long long)uploadWrittenBytes,
+        rangeIndexKnown ? 1U : 0U, rangeConsumer));
   return {};
 }
 
@@ -664,8 +813,14 @@ void WrappedID3D12Device::RecordReplayBufferPatches(ID3D12GraphicsCommandList *l
   {
     const ReplayBufferPatch &patch = m_ReplayBufferPatches[i];
     if(patch.buffer == id)
+    {
+      // Map replay re-applies every persistent patch, including bytes outside the CPU-write
+      // chunk's range. These writes belong to the same dirty interval union.
+      if(!m_ReplayDirtyApplyingInitial)
+        MarkReplayBufferRangeDirty(id, patch.byteOffset, patch.data.size());
       Unwrap(list)->CopyBufferRegion(Unwrap(buffer), patch.byteOffset, m_ReplayBufferPatchUpload,
-                                     m_ReplayBufferPatchOffsets[i], patch.data.size());
+                                      m_ReplayBufferPatchOffsets[i], patch.data.size());
+    }
   }
 }
 
@@ -2661,6 +2816,7 @@ void WrappedID3D12Device::ApplyInitialContents(bool useCheckpointSources)
   }
   m_UseReplayDirtyInitialContents = false;
   m_ReplayDirtyResources.clear();
+  m_ReplayDirtyBufferRanges.clear();
   if(m_ReplayCheckpoints)
     m_ReplayDirtyResources.insert(m_ReplayCheckpoints->deferredInitialResources.begin(),
                                  m_ReplayCheckpoints->deferredInitialResources.end());
@@ -2669,7 +2825,13 @@ void WrappedID3D12Device::ApplyInitialContents(bool useCheckpointSources)
   m_ReplayDirtyApplyingInitial = false;
   m_ReplayDirtyValid = m_ReplayDirtyRecordingAllowed && !m_ReplayDirtyInitialFailed && !HasFatalError();
   if(m_ReplayDirtyValid)
+  {
     m_ReplayDirtyReason = "submittedWrites";
+    // Initial patch application changes the immutable capture baseline too. Keep those bytes in
+    // the new union even when this replay never encounters a captured CPU write to the buffer.
+    for(const ReplayBufferPatch &patch : m_ReplayBufferPatches)
+      MarkReplayBufferRangeDirty(patch.buffer, patch.byteOffset, patch.data.size());
+  }
 }
 
 static void MergeReplayDirtyRange(rdcarray<rdcpair<uint64_t, uint64_t>> &ranges,
@@ -2710,6 +2872,109 @@ static rdcarray<rdcpair<uint64_t, uint64_t>> IntersectReplayDirtyRanges(
       b++;
   }
   return result;
+}
+
+static bool MergeReplayBufferDirtyWrite(bool previouslyDirty, bool eligible, uint64_t width,
+                                        uint64_t offset, uint64_t length,
+                                        rdcarray<rdcpair<uint64_t, uint64_t>> &ranges,
+                                        size_t maxRanges = 256)
+{
+  // Absence of ranges on an already dirty resource represents an unknown/whole-buffer write.
+  // Check subtraction before addition so malformed native ranges can only widen restoration.
+  if(!eligible || (previouslyDirty && ranges.empty()) || !width || !length || offset > width ||
+     length > width - offset)
+  {
+    ranges.clear();
+    return false;
+  }
+  MergeReplayDirtyRange(ranges, offset, offset + length);
+  if(ranges.size() > maxRanges)
+  {
+    ranges.clear();
+    return false;
+  }
+  return true;
+}
+
+static rdcarray<rdcpair<uint64_t, uint64_t>> SelectReplayBufferDirtyCopies(
+    bool valid, uint64_t width, const rdcarray<rdcpair<uint64_t, uint64_t>> &dirty,
+    const rdcarray<rdcpair<uint64_t, uint64_t>> &requested)
+{
+  // The original initial-content/alias planner remains authoritative when proof is missing.
+  if(!valid || dirty.empty())
+    return requested;
+  uint64_t previousEnd = 0;
+  for(const auto &range : dirty)
+  {
+    if(range.first < previousEnd || range.first >= range.second || range.second > width)
+      return requested;
+    previousEnd = range.second;
+  }
+  return IntersectReplayDirtyRanges(requested, dirty);
+}
+
+static bool ReplayCPUWriteBaselineDifferences(
+    const byte *baseline, const byte *written, uint64_t offset, uint64_t length,
+    rdcarray<rdcpair<uint64_t, uint64_t>> &differences, size_t maxRanges = 256)
+{
+  differences.clear();
+  if(!baseline || !written || !length || length > SIZE_MAX || offset > ~0ULL - length)
+    return false;
+  size_t cursor = 0;
+  while(cursor < size_t(length))
+  {
+    if(baseline[cursor] == written[cursor])
+    {
+      cursor++;
+      continue;
+    }
+    const size_t first = cursor++;
+    while(cursor < size_t(length) && baseline[cursor] != written[cursor])
+      cursor++;
+    if(differences.size() >= maxRanges)
+    {
+      differences.clear();
+      return false;
+    }
+    differences.push_back({offset + first, offset + cursor});
+  }
+  return true;
+}
+
+template <typename WholeWrite, typename RangeWrite>
+static void ApplyReplayCPUWriteBaselineDebt(
+    ResourceId id, const rdcarray<rdcpair<uint64_t, uint64_t>> &differences,
+    std::set<ResourceId> &dirtyResources,
+    std::map<ResourceId, rdcarray<rdcpair<uint64_t, uint64_t>>> &dirtyRanges, const bool &valid,
+    WholeWrite wholeWrite, RangeWrite rangeWrite)
+{
+  const bool previouslyDirty = dirtyResources.count(id) != 0;
+  rdcarray<rdcpair<uint64_t, uint64_t>> previousRanges;
+  auto previous = dirtyRanges.find(id);
+  if(previous != dirtyRanges.end())
+    previousRanges.swap(previous->second);
+  // Even a blob equal to initial bytes overwrites the current checkpoint/live resource version.
+  // Preserve every real-write side effect, narrowing only the debt against immutable initial data.
+  wholeWrite();
+  if(!valid)
+    return;
+  if(!previouslyDirty)
+    dirtyResources.erase(id);
+  else if(!previousRanges.empty())
+    dirtyRanges[id] = std::move(previousRanges);
+  for(const auto &range : differences)
+    rangeWrite(range.first, range.second - range.first);
+}
+
+static bool ReplayBufferDirtyEligible(const D3D12_RESOURCE_DESC &desc, bool placed, bool sparse,
+                                      bool replaced, bool heapKnown, D3D12_HEAP_FLAGS heapFlags)
+{
+  return desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && desc.Width && !placed && !sparse &&
+         !replaced && heapKnown &&
+         !(heapFlags & (D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)) &&
+         !(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                         D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                         D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE));
 }
 
 static bool D3D12ReplayPreservesDirtyProof(ReplayLogType type, bool allowCheckpoints,
@@ -3180,6 +3445,8 @@ void WrappedID3D12Device::BeginReplayDirtyRestore(bool allowed)
       !D3D12_Debug_RT_Auditing() && m_InitParams.VendorExtensions == GPUVendor::Unknown;
   m_ReplayDirtyTiming = Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1";
   m_ReplayDirtyShadow = Process::GetEnvVariable("RENDERDOC_D3D12_DIRTY_RESTORE_SHADOW") == "1";
+  m_ReplayDirtyBufferRangesEnabled =
+      Process::GetEnvVariable("RENDERDOC_D3D12_DISABLE_CPU_WRITE_DIRTY_RANGES") != "1";
   m_ReplaySparseDirtyEnabled =
       Process::GetEnvVariable("RENDERDOC_D3D12_DISABLE_SPARSE_DIRTY_CLOSURE") != "1";
   BuildReplaySparseDirtyGraph();
@@ -3200,6 +3467,7 @@ void WrappedID3D12Device::InvalidateReplayDirtyTracking(const char *reason)
   }
   m_ReplayDirtyValid = false;
   m_UseReplayDirtyInitialContents = false;
+  m_ReplayDirtyBufferRanges.clear();
   if(m_ReplayDirtyApplyingInitial)
     m_ReplayDirtyInitialFailed = true;
   m_ReplayDirtyReason = reason;
@@ -3274,12 +3542,19 @@ void WrappedID3D12Device::MarkReplayResourceDirty(ResourceId id, bool unboundedR
     InvalidateLiveForward("resourceWriteOutsideReplay");
   m_ModResources.insert(id);
   m_ReplayDirtyResources.insert(id);
+  m_ReplayDirtyBufferRanges.erase(id);
   if(m_ReplayCheckpoints && !m_ReplayCheckpoints->markingRestoredContents)
   {
     if(unboundedRootUAV || GetResourceList().find(id) == GetResourceList().end())
       m_ReplayCheckpoints->residentVersions.InvalidateAll();
     else
+    {
       m_ReplayCheckpoints->residentVersions.Invalidate(m_ReplayCheckpoints->ResidentRange(id));
+      auto component = m_ReplayCheckpoints->bufferAliasMembers.find(id);
+      if(component != m_ReplayCheckpoints->bufferAliasMembers.end())
+        m_ReplayCheckpoints->residentVersions.Invalidate(
+            m_ReplayCheckpoints->bufferAliasComponents[component->second].Range());
+    }
   }
   const auto resource = GetResourceList().find(id);
   if(resource == GetResourceList().end())
@@ -3367,6 +3642,158 @@ void WrappedID3D12Device::MarkReplayResourceDirty(ResourceId id, bool unboundedR
   }
 }
 
+bool WrappedID3D12Device::ReplayBufferRangeTrackingEligible(ResourceId id, uint64_t &width)
+{
+  auto resource = GetResourceList().find(id);
+  if(resource == GetResourceList().end())
+    return false;
+  const D3D12_RESOURCE_DESC desc = resource->second->GetDesc();
+  width = desc.Width;
+  D3D12_HEAP_PROPERTIES properties = {};
+  D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE;
+  const bool heapKnown = SUCCEEDED(resource->second->GetReal()->GetHeapProperties(&properties, &flags));
+  return ReplayBufferDirtyEligible(desc, resource->second->GetHeap() != NULL,
+                                   m_SparseResources.count(id) != 0,
+                                   GetResourceManager()->HasReplacement(id), heapKnown, flags);
+}
+
+void WrappedID3D12Device::CacheReplayCPUWriteBaseline(uint64_t chunk, ResourceId id, uint64_t offset,
+                                                     const byte *data, uint64_t length)
+{
+  // Captured Unmap blobs may conservatively contain the whole buffer. Compare only while loading,
+  // against serialized immutable bytes, never against the live resource's current GPU contents.
+  const uint64_t byteBudget = 64ULL * 1024 * 1024;
+  if(!IsLoading(m_State) || !data || !length || offset > SIZE_MAX || length > SIZE_MAX - offset ||
+     length > byteBudget - m_ReplayCPUWriteComparedBytes ||
+     m_ReplayCPUWriteBaselines.size() >= 4096 ||
+     Process::GetEnvVariable("RENDERDOC_D3D12_DISABLE_CPU_WRITE_DIRTY_RANGES") == "1")
+    return;
+  uint64_t width = 0;
+  if(!ReplayBufferRangeTrackingEligible(id, width) || offset > width || length > width - offset)
+    return;
+  const D3D12InitialContents initial = GetResourceManager()->GetInitialContents(id);
+  if(initial.tag != D3D12InitialContents::Copy || initial.resourceType != Resource_Resource ||
+     initial.sparseBinds || initial.dataSize < width)
+    return;
+
+  m_ReplayCPUWriteComparedBytes += length;
+  const byte *baseline = NULL;
+  bytebuf copied;
+  if(initial.srcData)
+    baseline = initial.srcData + size_t(offset);
+  else if(initial.resource)
+  {
+    ID3D12Resource *source = (ID3D12Resource *)initial.resource;
+    D3D12_HEAP_PROPERTIES properties = {};
+    const D3D12_RESOURCE_DESC desc = source->GetDesc();
+    if(desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || desc.Width < width ||
+       FAILED(source->GetHeapProperties(&properties, NULL)) || properties.Type != D3D12_HEAP_TYPE_UPLOAD)
+      return;
+    const D3D12_RANGE read = {SIZE_T(offset), SIZE_T(offset + length)};
+    void *mapped = NULL;
+    // The original Copy source was created by Serialise_InitialState and retains its wrapper.
+    // Bypass wrapper bookkeeping for this read-only CPU inspection of that independent source.
+    ID3D12Resource *nativeSource = Unwrap(source);
+    if(FAILED(nativeSource->Map(0, &read, &mapped)))
+      return;
+    const D3D12_RANGE noWrite = {0, 0};
+    if(!mapped)
+    {
+      nativeSource->Unmap(0, &noWrite);
+      return;
+    }
+    copied.resize(size_t(length));
+    memcpy(copied.data(), (const byte *)mapped + size_t(offset), size_t(length));
+    nativeSource->Unmap(0, &noWrite);
+    baseline = copied.data();
+  }
+  ReplayCPUWriteBaseline evidence;
+  evidence.resource = id;
+  evidence.offset = offset;
+  evidence.length = length;
+  if(ReplayCPUWriteBaselineDifferences(baseline, data, offset, length, evidence.differences))
+  {
+    if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+    {
+      uint64_t bytes = 0;
+      for(const auto &range : evidence.differences)
+        bytes += range.second - range.first;
+      const rdcstr line = StringFormat::Fmt(
+          "api=D3D12CPUWriteBaseline chunk=%llu resource=%s offset=%llu writtenBytes=%llu "
+          "differentBytes=%llu ranges=%zu comparedBytes=%llu",
+          (unsigned long long)chunk, ToStr(id).c_str(), (unsigned long long)offset,
+          (unsigned long long)length, (unsigned long long)bytes, evidence.differences.size(),
+          (unsigned long long)m_ReplayCPUWriteComparedBytes);
+      RDCLOG("%s", line.c_str());
+      AppendReplayTimingLog(line);
+    }
+    m_ReplayCPUWriteBaselines[chunk] = std::move(evidence);
+  }
+}
+
+bool WrappedID3D12Device::MarkReplayCPUWriteBaseline(uint64_t chunk, ResourceId id, uint64_t offset,
+                                                    uint64_t length)
+{
+  if(!m_ReplayDirtyBufferRangesEnabled || !m_ReplayDirtyValid || m_ReplayDirtyApplyingInitial ||
+     HasFatalError())
+    return false;
+  const auto found = m_ReplayCPUWriteBaselines.find(chunk);
+  if(found == m_ReplayCPUWriteBaselines.end() || found->second.resource != id ||
+     found->second.offset != offset || found->second.length != length)
+    return false;
+  uint64_t width = 0;
+  if(!ReplayBufferRangeTrackingEligible(id, width))
+    return false;
+  ApplyReplayCPUWriteBaselineDebt(
+      id, found->second.differences, m_ReplayDirtyResources, m_ReplayDirtyBufferRanges,
+      m_ReplayDirtyValid, [&]() { MarkReplayResourceDirty(id); },
+      [&](uint64_t first, uint64_t bytes) { MarkReplayBufferRangeDirty(id, first, bytes); });
+  return true;
+}
+
+void WrappedID3D12Device::MarkReplayBufferRangeDirty(ResourceId id, uint64_t offset, uint64_t length)
+{
+  if(!IsActiveReplaying(m_State) || id == ResourceId() || ResourceIDGen::IsReplayOnlyID(id))
+    return;
+  const bool previouslyDirty = m_ReplayDirtyResources.count(id) != 0;
+  rdcarray<rdcpair<uint64_t, uint64_t>> ranges;
+  auto previous = m_ReplayDirtyBufferRanges.find(id);
+  if(previous != m_ReplayDirtyBufferRanges.end())
+    ranges.swap(previous->second);
+  // Preserve the existing live-state, checkpoint-version and unknown/alias invalidation hooks.
+  // Whole writes erase the interval entry, and can never be narrowed by a later precise write.
+  MarkReplayResourceDirty(id);
+  uint64_t width = 0;
+  const bool eligible = m_ReplayDirtyBufferRangesEnabled && m_ReplayDirtyValid &&
+                        !m_ReplayDirtyApplyingInitial && !HasFatalError() &&
+                        ReplayBufferRangeTrackingEligible(id, width);
+  if(MergeReplayBufferDirtyWrite(previouslyDirty, eligible, width, offset, length, ranges))
+    m_ReplayDirtyBufferRanges[id] = std::move(ranges);
+}
+
+void WrappedID3D12Device::FilterReplayDirtyBufferCopyRanges(
+    ResourceId id, uint64_t byteCount, rdcarray<rdcpair<uint64_t, uint64_t>> &ranges)
+{
+  const auto dirty = m_ReplayDirtyBufferRanges.find(id);
+  if(!m_UseReplayDirtyInitialContents || !m_ReplayDirtyBufferRangesEnabled ||
+     dirty == m_ReplayDirtyBufferRanges.end())
+    return;
+  uint64_t width = 0;
+  const bool eligible = ReplayBufferRangeTrackingEligible(id, width) && byteCount == width;
+  auto selected = SelectReplayBufferDirtyCopies(eligible, byteCount, dirty->second, ranges);
+  if(m_ReplayDirtyTiming)
+  {
+    uint64_t originalBytes = 0, copiedBytes = 0;
+    for(const auto &range : ranges)
+      originalBytes += range.second - range.first;
+    for(const auto &range : selected)
+      copiedBytes += range.second - range.first;
+    m_ReplayDirtyCopyStats[id].skippedBytes += originalBytes - copiedBytes;
+  }
+  if(!m_ReplayDirtyShadow)
+    ranges.swap(selected);
+}
+
 bool WrappedID3D12Device::IsReplayInitialContentsUnchanged(ResourceId resource, uint64_t sourceBytes)
 {
   if(!m_UseReplayDirtyInitialContents || m_ReplayDirtyResources.count(resource) ||
@@ -3437,6 +3864,9 @@ void WrappedID3D12Device::MarkCheckpointReplayWrites()
     m_ReplayCheckpoints->markingRestoredContents = true;
     for(const auto &resource : m_ReplayCheckpoints->currentVersions)
       MarkReplayResourceDirty(resource.first);
+    for(const auto &aliases : m_ReplayCheckpoints->currentBufferAliases)
+      for(ResourceId member : aliases.second->component.members)
+        MarkReplayResourceDirty(member);
     m_ReplayCheckpoints->markingRestoredContents = false;
   }
 }
@@ -3454,6 +3884,7 @@ void WrappedID3D12Device::MarkReplayFullOverwriteSubmitted(ResourceId id)
   cache.residentVersions.MarkResident(cache.ResidentRange(id),
                                      {++cache.contentSerial, cache.residentVersions.EditGeneration()});
   m_ReplayDirtyResources.insert(id);
+  m_ReplayDirtyBufferRanges.erase(id);
   if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
   {
     const rdcstr line = StringFormat::Fmt(
@@ -3942,8 +4373,18 @@ bool WrappedID3D12Device::Serialise_MapDataWrite(SerialiserType &ser, ID3D12Reso
   // don't do anything if end <= begin because the range is empty.
   if(IsReplayingAndReading() && Resource && range.End > range.Begin)
   {
-    MarkReplayResourceDirty(GetResID(Resource));
     D3D12CommandData &cmd = *m_Queue->GetCommandData();
+    if(Subresource == 0)
+    {
+      if(IsLoading(m_State))
+        CacheReplayCPUWriteBaseline(cmd.m_CurChunkOffset, GetResID(Resource), range.Begin, MappedData,
+                                   range.End - range.Begin);
+      else if(!MarkReplayCPUWriteBaseline(cmd.m_CurChunkOffset, GetResID(Resource), range.Begin,
+                                         range.End - range.Begin))
+        MarkReplayBufferRangeDirty(GetResID(Resource), range.Begin, range.End - range.Begin);
+    }
+    else
+      MarkReplayResourceDirty(GetResID(Resource));
 
     if(IsLoading(m_State))
     {
@@ -7769,6 +8210,98 @@ RDResult WrappedID3D12Device::ReadLogInitialisation(RDCFile *rdc, bool storeStru
   return ResultCode::Succeeded;
 }
 
+static bool D3D12QueryCheckpointMemory(ID3D12Device *device, DXGI_QUERY_VIDEO_MEMORY_INFO &memory)
+{
+  IDXGIFactory4 *factory = NULL;
+  IDXGIAdapter3 *adapter = NULL;
+  typedef HRESULT(WINAPI * PFN_CREATE_DXGI_FACTORY)(REFIID, void **);
+  PFN_CREATE_DXGI_FACTORY createFactory = (PFN_CREATE_DXGI_FACTORY)GetProcAddress(
+      GetModuleHandleA("dxgi.dll"), "CreateDXGIFactory1");
+  if(createFactory && SUCCEEDED(createFactory(__uuidof(IDXGIFactory4), (void **)&factory)))
+    factory->EnumAdapterByLuid(device->GetAdapterLuid(), __uuidof(IDXGIAdapter3),
+                               (void **)&adapter);
+  const bool known = adapter && SUCCEEDED(adapter->QueryVideoMemoryInfo(
+      0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory));
+  SAFE_RELEASE(adapter);
+  SAFE_RELEASE(factory);
+  return known;
+}
+
+static uint64_t D3D12CheckpointHeadroom(uint64_t requested,
+                                      const DXGI_QUERY_VIDEO_MEMORY_INFO &memory)
+{
+  const uint64_t reserve = RDCMAX(256ULL * 1024 * 1024, memory.Budget / 16);
+  if(memory.CurrentUsage >= memory.Budget || memory.Budget - memory.CurrentUsage <= reserve)
+    return 0;
+  return RDCMIN(requested, memory.Budget - memory.CurrentUsage - reserve);
+}
+
+static bool D3D12RecoverCheckpointBudget(bool enabled, bool stored, uint64_t requested,
+                                        bool queryKnown, const DXGI_QUERY_VIDEO_MEMORY_INFO &memory,
+                                        bool &blocked, uint64_t &budget)
+{
+  if(!enabled || stored || !blocked || budget || !queryKnown)
+    return false;
+  const uint64_t next = D3D12CheckpointHeadroom(requested, memory);
+  if(!next)
+    return false;
+  budget = next;
+  blocked = false;
+  return true;
+}
+
+static uint64_t D3D12CheckpointDescriptorAdmissionBytes(uint64_t fullBytes,
+                                                        uint64_t capturedFullBytes,
+                                                        uint64_t capturedBytes, bool edited)
+{
+  // Descriptor stores are append-only for this loaded capture. Any newly observed store or
+  // replacement invalidates the boundary's accounting, never making missing evidence zero bytes.
+  return !edited && capturedFullBytes == fullBytes && capturedBytes <= fullBytes ? capturedBytes
+                                                                                 : fullBytes;
+}
+
+static bool D3D12ConsumeCheckpointDescriptorPlanWork(uint64_t &used, uint64_t heapCount)
+{
+  const uint64_t work = RDCMAX<uint64_t>(1, heapCount);
+  if(used > 1000000 || work > 1000000 - used)
+  {
+    used = 1000001;
+    return false;
+  }
+  used += work;
+  return true;
+}
+
+void WrappedID3D12Device::RecordCheckpointDescriptorBytes(uint64_t &bytes, uint64_t &fullBytes)
+{
+  bytes = fullBytes = ~0ULL;
+  if(!m_Replay || !IsLoading(m_State) || HasFatalError())
+    return;
+  const auto &stores = m_Replay->GetReplayDescriptorStores();
+  // Count the same native dirty blocks as Save, without copying the store list or its ranges.
+  // A finite whole-load scan budget bounds even captures with many queues and descriptor heaps.
+  if(!D3D12ConsumeCheckpointDescriptorPlanWork(m_CheckpointDescriptorPlanWork, stores.size()))
+    return;
+  uint64_t counted = 0, full = 0;
+  for(const DescriptorStoreDescription &store : stores)
+  {
+    if(!GetResourceManager()->HasResource(store.resourceId))
+      return;
+    WrappedID3D12DescriptorHeap *heap =
+        GetResourceManager()->GetResAs<WrappedID3D12DescriptorHeap>(store.resourceId);
+    if(!heap || heap->GetNumDescriptors() != store.descriptorCount)
+      return;
+    const uint64_t heapFull = uint64_t(store.descriptorCount) * sizeof(D3D12Descriptor);
+    const uint64_t heapBytes = heap->GetCheckpointDescriptorBytes();
+    if(heapBytes > heapFull || full > ~0ULL - heapFull || counted > ~0ULL - heapBytes)
+      return;
+    full += heapFull;
+    counted += heapBytes;
+  }
+  bytes = counted;
+  fullBytes = full;
+}
+
 void WrappedID3D12Device::ConfigureReplayCheckpoints(
     const ReplayCheckpointConfig &config, const rdcarray<ReplayCheckpointCandidate> &candidates)
 {
@@ -7809,6 +8342,11 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
   cache.selected.clear();
   cache.selectedBytes.clear();
   cache.overlappingPlaced.clear();
+  cache.bufferAliasComponents.clear();
+  cache.bufferAliasMembers.clear();
+  cache.typedAliasConflicts.clear();
+  cache.selectedTypedOwners.clear();
+  cache.provedTypedBoundaries.clear();
   cache.stats.supported = true;
   cache.stats.enabled = config.enabled;
   cache.stats.reason.clear();
@@ -7836,6 +8374,7 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
       if(!DeviceWaitForIdle())
         return false;
       cache.currentVersions.clear();
+      cache.currentBufferAliases.clear();
       for(auto point = cache.checkpoints.begin(); point != cache.checkpoints.end();)
       {
         if(!cache.selected.count(point->first))
@@ -7874,15 +8413,18 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
           "api=D3D12Checkpoint op=configure enabled=%u requestedBytes=%llu effectiveBytes=%llu "
           "videoBudget=%llu videoUsage=%llu maxCheckpoints=%u requestedCandidates=%zu "
           "safeCandidates=%zu overlappingPlaced=%zu sparseResources=%zu descriptorBytes=%llu "
+          "bufferAliasComponents=%zu bufferAliasMembers=%zu typedAliasMembers=%zu "
           "firstUnsupportedWrite=%u unsupportedResource=%s events=%s queryLimits=%s "
           "queryPlans=%s preserveStorage=%u retainedCheckpoints=%zu reason=%s",
           config.enabled ? 1U : 0U, (unsigned long long)config.byteBudget,
           (unsigned long long)cache.budget, (unsigned long long)memory.Budget,
           (unsigned long long)memory.CurrentUsage, config.maxCheckpoints, candidates.size(),
           cache.selected.size(), cache.overlappingPlaced.size(), m_SparseResources.size(),
-          (unsigned long long)descriptorBytes, firstUnsupportedWrite,
+          (unsigned long long)descriptorBytes, cache.bufferAliasComponents.size(),
+          cache.bufferAliasMembers.size(), cache.typedAliasConflicts.size(), firstUnsupportedWrite,
           ToStr(firstUnsupportedResource).c_str(), selected.c_str(), queryLimits.c_str(),
-          queryPlans.c_str(), preserve ? 1U : 0U, cache.checkpoints.size(), cache.stats.reason.c_str()));
+          queryPlans.c_str(), preserve ? 1U : 0U, cache.checkpoints.size(),
+          cache.stats.reason.c_str()));
       if(!firstUnsupportedStorage.empty())
         LogD3D12Checkpoint(firstUnsupportedStorage);
     }
@@ -7890,6 +8432,7 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
   if(!config.enabled || !config.maxCheckpoints || !config.byteBudget)
   {
     cache.budget = 0;
+    cache.memoryBudgetBlocked = false;
     if(!retainSelectedCheckpoints())
       return;
     logConfiguration();
@@ -7902,32 +8445,24 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
   // again would charge the retained checkpoint allocations against their own available budget.
   if(!preserve)
   {
-    IDXGIFactory4 *factory = NULL;
-    IDXGIAdapter3 *adapter = NULL;
-    typedef HRESULT(WINAPI * PFN_CREATE_DXGI_FACTORY)(REFIID, void **);
-    PFN_CREATE_DXGI_FACTORY createFactory = (PFN_CREATE_DXGI_FACTORY)GetProcAddress(
-        GetModuleHandleA("dxgi.dll"), "CreateDXGIFactory1");
-    if(createFactory && SUCCEEDED(createFactory(__uuidof(IDXGIFactory4), (void **)&factory)))
-      factory->EnumAdapterByLuid(GetReal()->GetAdapterLuid(), __uuidof(IDXGIAdapter3),
-                                 (void **)&adapter);
-    if(!adapter || FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory)))
+    cache.memoryBudgetBlocked = false;
+    if(!D3D12QueryCheckpointMemory(GetReal(), memory))
     {
       cache.budget = 0;
       cache.stats.reason = "DXGI checkpoint memory budget is unavailable";
     }
     else
     {
-      const uint64_t reserve = RDCMAX(256ULL * 1024 * 1024, memory.Budget / 16);
-      const uint64_t spare = memory.Budget > memory.CurrentUsage + reserve
-                                 ? memory.Budget - memory.CurrentUsage - reserve
-                                 : 0;
-      cache.budget = RDCMIN(cache.budget, spare);
+      cache.budget = D3D12CheckpointHeadroom(cache.budget, memory);
       if(!cache.budget)
+      {
+        cache.memoryBudgetBlocked = true;
         cache.stats.reason = "Insufficient GPU memory headroom for checkpoints";
+      }
     }
-    SAFE_RELEASE(adapter);
-    SAFE_RELEASE(factory);
   }
+  else if(cache.memoryBudgetBlocked)
+    cache.stats.reason = "Insufficient GPU memory headroom for checkpoints";
   if(!cache.budget)
   {
     if(!retainSelectedCheckpoints())
@@ -7938,12 +8473,11 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
 
   // Placed resources are supported when their storage is independent. Heap flags alone cannot
   // establish this: retain HeapOffset from resource creation and test actual allocation ranges.
-  struct PlacedRange
-  {
-    ResourceId resource;
-    uint64_t begin, end;
-  };
+  using PlacedRange = D3D12CheckpointPlacedRange;
   std::map<ResourceId, rdcarray<PlacedRange>> heaps;
+  std::set<ResourceId> unsupportedBufferHeaps;
+  std::set<ResourceId> unsupportedTypedHeaps;
+  BuildReplaySparseDirtyGraph();
   for(const auto &entry : GetResourceList())
   {
     if(ResourceIDGen::IsReplayOnlyID(entry.first) || !entry.second->GetHeap())
@@ -7951,12 +8485,39 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
     const D3D12_RESOURCE_DESC desc = entry.second->GetReal()->GetDesc();
     const uint64_t bytes = GetReal()->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
     const uint64_t begin = entry.second->GetHeapOffset();
-    if(bytes == ~0ULL || begin + bytes < begin)
+    WrappedID3D12Heap *heap = entry.second->GetHeap();
+    const ResourceId heapId = GetResID(heap);
+    const D3D12_HEAP_DESC heapDesc = heap->GetDesc();
+    const UINT allowedHeapFlags = D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+                                  D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES |
+                                  D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+    const bool independentHeap =
+        D3D12CheckpointOriginalHeap(GetResourceManager(), heapId) == heap &&
+        heapDesc.Properties.Type == D3D12_HEAP_TYPE_DEFAULT &&
+        heapDesc.Properties.CreationNodeMask == 1 && heapDesc.Properties.VisibleNodeMask == 1 &&
+        !(UINT(heapDesc.Flags) & ~(allowedHeapFlags | D3D12_HEAP_FLAG_DENY_BUFFERS)) &&
+        m_ReplaySparseGraphComplete && !m_ReplaySparseComponentIndex.count(heapId);
+    if(!independentHeap)
+      unsupportedTypedHeaps.insert(heapId);
+    if(desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+       desc.Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR || desc.Format != DXGI_FORMAT_UNKNOWN ||
+       entry.second->IsAccelerationStructureResource() ||
+       GetResourceManager()->HasReplacement(entry.first) ||
+       GetResourceManager()->GetUnreplacedID(entry.first) != entry.first ||
+       heapDesc.Properties.Type != D3D12_HEAP_TYPE_DEFAULT ||
+       heapDesc.Properties.CreationNodeMask != 1 || heapDesc.Properties.VisibleNodeMask != 1 ||
+       (UINT(heapDesc.Flags) & ~allowedHeapFlags) || !heap->GetUnwrappedWholeMemBuffer() ||
+       !m_ReplaySparseGraphComplete || m_ReplaySparseComponentIndex.count(heapId) || !independentHeap)
+      unsupportedBufferHeaps.insert(heapId);
+    if(!bytes || bytes == ~0ULL || begin > heapDesc.SizeInBytes ||
+       bytes > heapDesc.SizeInBytes - begin)
     {
       cache.overlappingPlaced.insert(entry.first);
+      unsupportedBufferHeaps.insert(heapId);
+      unsupportedTypedHeaps.insert(heapId);
       continue;
     }
-    heaps[GetResID(entry.second->GetHeap())].push_back({entry.first, begin, begin + bytes});
+    heaps[heapId].push_back({entry.first, begin, begin + bytes});
   }
   for(auto &heap : heaps)
   {
@@ -7970,6 +8531,91 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
         cache.overlappingPlaced.insert(ranges[j].resource);
       }
   }
+  uint64_t bufferAliasBytes = 0;
+  if(Process::GetEnvVariable("RENDERDOC_D3D12_DISABLE_CHECKPOINT_BUFFER_ALIASES") != "1")
+    for(const auto &heap : heaps)
+    {
+      WrappedID3D12Heap *nativeHeap = D3D12CheckpointOriginalHeap(GetResourceManager(), heap.first);
+      if(!nativeHeap || unsupportedBufferHeaps.count(heap.first))
+        continue;
+      for(auto component :
+          D3D12BufferAliasComponents(heap.first, nativeHeap->GetDesc().SizeInBytes,
+                                     unsupportedBufferHeaps.count(heap.first) == 0, heap.second))
+      {
+        const D3D12_RESOURCE_DESC copyDesc =
+            CheckpointQueryBufferDesc(component.end - component.begin);
+        component.allocationBytes = GetReal()->GetResourceAllocationInfo(0, 1, &copyDesc).SizeInBytes;
+        if(!component.allocationBytes || component.allocationBytes == ~0ULL ||
+           component.allocationBytes > cache.budget ||
+           bufferAliasBytes > cache.budget - component.allocationBytes)
+          continue;
+        const ResourceId key = *component.members.begin();
+        cache.bufferAliasComponents[key] = component;
+        for(ResourceId member : component.members)
+          cache.bufferAliasMembers[member] = key;
+        cache.residentVersions.Register(heap.first, 0, nativeHeap->GetDesc().SizeInBytes);
+        bufferAliasBytes += component.allocationBytes;
+      }
+    }
+  uint64_t typedEdges = 0;
+  if(Process::GetEnvVariable("RENDERDOC_D3D12_DISABLE_CHECKPOINT_TYPED_ALIASES") != "1")
+    for(const auto &heap : heaps)
+    {
+      WrappedID3D12Heap *nativeHeap = D3D12CheckpointOriginalHeap(GetResourceManager(), heap.first);
+      if(!nativeHeap || unsupportedTypedHeaps.count(heap.first))
+        continue;
+      // Reuse only the geometry closure helper. Unlike buffer components these allocations are
+      // never copied as raw heap bytes: every accepted point needs a complete typed owner proof.
+      for(const auto &component : D3D12BufferAliasComponents(
+              heap.first, nativeHeap->GetDesc().SizeInBytes, true, heap.second))
+      {
+        bool qualified = true;
+        for(ResourceId member : component.members)
+        {
+          auto resource = GetResourceList().find(member);
+          if(resource == GetResourceList().end())
+          {
+            qualified = false;
+            break;
+          }
+          const auto desc = resource->second->GetDesc();
+          const UINT allowed =
+              D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+          qualified &= (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                        desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) &&
+                       desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN && desc.SampleDesc.Count == 1 &&
+                       desc.Format != DXGI_FORMAT_UNKNOWN && !(UINT(desc.Flags) & ~allowed) &&
+                       !IsSparseResource(member) &&
+                       !resource->second->IsAccelerationStructureResource() &&
+                       !GetResourceManager()->HasReplacement(member) &&
+                       GetResourceManager()->GetUnreplacedID(member) == member;
+        }
+        if(!qualified || cache.typedAliasConflicts.size() + component.members.size() > 4096)
+          continue;
+        std::map<ResourceId, std::set<ResourceId>> componentGraph;
+        uint64_t componentEdges = 0;
+        for(size_t i = 0; qualified && i < heap.second.size(); i++)
+          if(component.members.count(heap.second[i].resource))
+            for(size_t j = i + 1;
+                j < heap.second.size() && heap.second[j].begin < heap.second[i].end; j++)
+            {
+              componentEdges += 2;
+              if(typedEdges + componentEdges > 65536)
+              {
+                qualified = false;
+                break;
+              }
+              componentGraph[heap.second[i].resource].insert(heap.second[j].resource);
+              componentGraph[heap.second[j].resource].insert(heap.second[i].resource);
+            }
+        if(qualified)
+        {
+          cache.typedAliasConflicts.insert(componentGraph.begin(), componentGraph.end());
+          typedEdges += componentEdges;
+        }
+      }
+    }
   cache.directHeapAccess = false;
   for(WrappedID3D12PipelineState *pipe : *m_PipelineList)
     if(pipe->usedSig.Flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED)
@@ -7986,6 +8632,8 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
   {
     if(ResourceIDGen::IsReplayOnlyID(entry.first))
       continue;
+    if(cache.bufferAliasMembers.count(entry.first) || cache.typedAliasConflicts.count(entry.first))
+      continue;    // the entire physical component is saved, independent of shader usage
     uint32_t firstWrite = ~0U;
     for(const EventUsage &usage : m_Queue->GetUsage(entry.first))
       if(CheckpointResourceWrite(usage.usage))
@@ -8061,20 +8709,35 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
     else
       firstWriteBytes[firstWrite] += bytes;
   }
-  uint64_t prefixBytes = descriptorBytes;
+  // Every participating buffer alias is saved, even when no reflected write was reported.
+  // Accounting is the union allocation once, not the sum of overlapping logical buffer sizes.
+  const uint64_t fixedPointBytes = bufferAliasBytes;
+  uint64_t prefixBytes = fixedPointBytes;
   for(auto &entry : firstWriteBytes)
   {
     prefixBytes += entry.second;
     entry.second = prefixBytes;
   }
-  const auto completePointBytes = [&](uint32_t eventId) {
-    auto after = firstWriteBytes.upper_bound(eventId);
-    return after == firstWriteBytes.begin() ? descriptorBytes : (--after)->second;
+  const auto completePointBytes = [&](const D3D12CommandData::CheckpointBoundary &boundary) {
+    auto after = firstWriteBytes.upper_bound(boundary.eventId);
+    const uint64_t resourceBytes =
+        after == firstWriteBytes.begin() ? fixedPointBytes : (--after)->second;
+    const uint64_t descriptorStorage =
+        D3D12CheckpointDescriptorAdmissionBytes(descriptorBytes, boundary.fullDescriptorBytes,
+                                                boundary.descriptorBytes, cache.editedDependencies);
+    return resourceBytes > ~0ULL - descriptorStorage ? ~0ULL : resourceBytes + descriptorStorage;
   };
 
   D3D12CommandData &cmd = *m_Queue->GetCommandData();
   D3D12CommandData::CheckpointUnsupportedChunks continuationUnsupported;
   std::set<uint32_t> inspectedBoundaries;
+  struct TypedOwnerProof
+  {
+    bool complete = false;
+    std::set<ResourceId> owners;
+    rdcstr reason;
+  };
+  std::map<uint32_t, TypedOwnerProof> typedProofs;
   for(const ReplayCheckpointCandidate &candidate : candidates)
   {
     if(cache.selected.size() >= 64)
@@ -8085,8 +8748,7 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
       --boundary;
       if(boundary->eventId > candidate.eventId || boundary->eventId < config.minEventGap)
         continue;
-      if(boundary->eventId >= firstUnsupportedWrite ||
-         completePointBytes(boundary->eventId) > cache.budget)
+      if(boundary->eventId >= firstUnsupportedWrite || completePointBytes(*boundary) > cache.budget)
       {
         cache.stats.reason = boundary->eventId >= firstUnsupportedWrite
                                  ? "Later checkpoint prefix contains unsupported writable storage"
@@ -8102,6 +8764,51 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
       if(nearExisting)
         continue;
       rdcstr reason;
+      std::set<ResourceId> typedOwners;
+      if(!cache.typedAliasConflicts.empty())
+      {
+        auto proof = typedProofs.find(boundary->eventId);
+        if(proof == typedProofs.end())
+        {
+          // Candidate fallback can visit the same complete prefix many times. Memoize it and
+          // bound cold planning; no drag/edit may initiate an unbounded whole-frame proof sweep.
+          if(typedProofs.size() >= 32)
+          {
+            cache.stats.reason = "Texture alias candidate analysis budget exhausted";
+            break;
+          }
+          TypedOwnerProof checked;
+          checked.complete = cmd.GetReplayTextureAliasOwners(
+              boundary->eventId, cache.typedAliasConflicts, checked.owners, checked.reason);
+          proof = typedProofs.insert({boundary->eventId, std::move(checked)}).first;
+        }
+        if(!proof->second.complete)
+        {
+          cache.stats.reason = proof->second.reason;
+          cache.stats.rejected++;
+          continue;
+        }
+        typedOwners = proof->second.owners;
+        cache.provedTypedBoundaries.insert(boundary->eventId);
+      }
+      uint64_t typedBytes = 0;
+      for(ResourceId owner : typedOwners)
+      {
+        const auto desc = GetResourceList().find(owner)->second->GetDesc();
+        const uint64_t bytes = GetReal()->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+        if(!bytes || bytes == ~0ULL || bytes > cache.budget || typedBytes > cache.budget - bytes)
+        {
+          typedBytes = ~0ULL;
+          break;
+        }
+        typedBytes += bytes;
+      }
+      if(typedBytes > cache.budget || completePointBytes(*boundary) > cache.budget - typedBytes)
+      {
+        cache.stats.reason = "Active texture alias owners exceed the effective memory budget";
+        cache.stats.rejected++;
+        continue;
+      }
       inspectedBoundaries.insert(boundary->eventId);
       if(!cmd.IsCheckpointBoundarySafe(*boundary, reason, &continuationUnsupported))
       {
@@ -8111,26 +8818,49 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
       }
       uint64_t queryBytes = 0;
       for(const auto &slot : boundary->queries.slots)
-        queryBytes += GetResourceManager()->GetResAs<WrappedID3D12QueryHeap>(slot.first.first)
+        queryBytes += GetResourceManager()
+                          ->GetResAs<WrappedID3D12QueryHeap>(slot.first.first)
                           ->GetResolveDataSize();
       if(queryBytes)
       {
         const D3D12_RESOURCE_DESC desc = CheckpointQueryBufferDesc(queryBytes);
         queryBytes = GetReal()->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
       }
-      if(queryBytes > cache.budget || completePointBytes(boundary->eventId) > cache.budget - queryBytes)
+      if(queryBytes > cache.budget - typedBytes ||
+         completePointBytes(*boundary) > cache.budget - typedBytes - queryBytes)
       {
         cache.stats.reason = "Checkpoint query results exceed the effective memory budget";
         cache.stats.rejected++;
         continue;
       }
       cache.selected[boundary->eventId] = *boundary;
-      cache.selectedBytes[boundary->eventId] = completePointBytes(boundary->eventId) + queryBytes;
+      cache.selectedTypedOwners[boundary->eventId] = typedOwners;
+      cache.selectedBytes[boundary->eventId] =
+          completePointBytes(*boundary) + typedBytes + queryBytes;
+      if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+      {
+        const uint64_t descriptorStorage = D3D12CheckpointDescriptorAdmissionBytes(
+            descriptorBytes, boundary->fullDescriptorBytes, boundary->descriptorBytes,
+            cache.editedDependencies);
+        const rdcstr line = StringFormat::Fmt(
+            "api=D3D12Checkpoint op=admit event=%u descriptorBytes=%llu fullDescriptorBytes=%llu "
+            "descriptorPlanKnown=%u estimatedBytes=%llu",
+            boundary->eventId, (unsigned long long)descriptorStorage,
+            (unsigned long long)descriptorBytes,
+            !cache.editedDependencies && boundary->fullDescriptorBytes == descriptorBytes &&
+                    boundary->descriptorBytes <= descriptorBytes
+                ? 1U
+                : 0U,
+            (unsigned long long)cache.selectedBytes[boundary->eventId]);
+        RDCLOG("[EIDTiming] %s", line.c_str());
+        AppendReplayTimingLog(line);
+      }
       break;
     }
   }
   if(cache.selected.empty() && cache.stats.reason.empty())
-    cache.stats.reason = "No complete command-list submission boundary matches the requested modules";
+    cache.stats.reason =
+        "No complete command-list submission boundary matches the requested modules";
   if(!continuationUnsupported.empty() && Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
   {
     rdcstr details;
@@ -8155,19 +8885,37 @@ void WrappedID3D12Device::ConfigureReplayCheckpoints(
   logConfiguration();
 }
 
-bool WrappedID3D12Device::IsReplayCheckpointAliasingSafe(ResourceId before, ResourceId after) const
+bool WrappedID3D12Device::IsReplayCheckpointAliasingSafe(ResourceId before, ResourceId after,
+                                                        uint32_t boundaryEvent) const
 {
   if(!m_ReplayCheckpoints)
     return false;
   const auto &overlap = m_ReplayCheckpoints->overlappingPlaced;
-  // A wildcard can activate any alias. Without page/alias activation snapshots, accept it only
-  // when no captured resource has shared native storage. Named independent resources need only
-  // the existing full queue drain before snapshot copies.
+  const auto &bufferAliases = m_ReplayCheckpoints->bufferAliasMembers;
+  const auto &typed = m_ReplayCheckpoints->typedAliasConflicts;
+  const bool typedProven = m_ReplayCheckpoints->provedTypedBoundaries.count(boundaryEvent) != 0;
+  const auto restorable = [&](ResourceId id) {
+    return !m_SparseResources.count(id) && (!overlap.count(id) || bufferAliases.count(id) ||
+                                            (typedProven && typed.count(id)));
+  };
+  // NULL-before with an explicit destination activates that destination's exact physical
+  // overlap component. It is not NULL-after's unknown destination. The completed owner proof
+  // for this exact boundary already checked every activation/init/access in the prefix.
+  if(before == ResourceId() && !m_SparseResources.count(after) &&
+     D3D12ProvedTypedAliasActivation(typedProven, after, typed))
+    return true;
+  // Wildcards may include any storage. Only independent allocations and completely covered
+  // buffer alias components have a restoration proof; sparse/texture aliases retain fallback.
   if(before == ResourceId() || after == ResourceId())
-    return overlap.empty() && m_SparseResources.empty();
-  return overlap.find(before) == overlap.end() && overlap.find(after) == overlap.end() &&
-         m_SparseResources.find(before) == m_SparseResources.end() &&
-         m_SparseResources.find(after) == m_SparseResources.end();
+  {
+    if(!m_SparseResources.empty())
+      return false;
+    for(ResourceId id : overlap)
+      if(!bufferAliases.count(id))
+        return false;
+    return true;
+  }
+  return restorable(before) && restorable(after);
 }
 
 void WrappedID3D12Device::InvalidateReplayCheckpoints(uint32_t firstAffectedEvent)
@@ -8178,7 +8926,9 @@ void WrappedID3D12Device::InvalidateReplayCheckpoints(uint32_t firstAffectedEven
   cache.residentVersions.InvalidateAll();
   // Both texture/buffer copies and query sources may still be read by the last restored suffix.
   // A preceding patch/shader transaction's completed device drain can be reused here.
-  const bool removingSources = !cache.currentVersions.empty() || !cache.activeQueries.empty() ||
+  const bool removingSources =
+      !cache.currentVersions.empty() || !cache.currentBufferAliases.empty() ||
+      !cache.activeQueries.empty() ||
       cache.checkpoints.lower_bound(firstAffectedEvent) != cache.checkpoints.end();
   if(removingSources && !ReplayWorkWaitForIdle())
     return;
@@ -8188,6 +8938,7 @@ void WrappedID3D12Device::InvalidateReplayCheckpoints(uint32_t firstAffectedEven
     cache.activeQueries.clear();
   }
   cache.currentVersions.clear();
+  cache.currentBufferAliases.clear();
   for(auto it = cache.checkpoints.begin(); it != cache.checkpoints.end();)
   {
     if(firstAffectedEvent == 0 || it->first >= firstAffectedEvent)
@@ -8212,6 +8963,12 @@ ReplayCheckpointStats WrappedID3D12Device::GetReplayCheckpointStats()
   }
   auto &cache = *m_ReplayCheckpoints;
   cache.stats.events.clear();
+  cache.stats.candidatePlanKnown = true;
+  cache.stats.canTryOtherCandidates = cache.config.enabled && cache.budget > 0;
+  cache.stats.memoryBudgetBlocked = cache.config.enabled && cache.memoryBudgetBlocked;
+  cache.stats.candidateEvents.clear();
+  for(const auto &entry : cache.selected)
+    cache.stats.candidateEvents.push_back(entry.first);
   for(const auto &entry : cache.checkpoints)
     cache.stats.events.push_back(entry.first);
   cache.stats.checkpointCount = (uint32_t)cache.checkpoints.size();
@@ -8219,6 +8976,33 @@ ReplayCheckpointStats WrappedID3D12Device::GetReplayCheckpointStats()
   if(cache.checkpoints.empty())
     cache.stats.sharedBytes = 0;
   return cache.stats;
+}
+
+bool WrappedID3D12Device::RefreshReplayCheckpointMemoryBudget()
+{
+  // This optional entry is invoked only by bounded idle maintenance. It never waits for the GPU,
+  // creates a resource, changes an existing allocation, or bypasses native candidate admission.
+  if(HasFatalError() || !m_ReplayCheckpoints)
+    return false;
+  auto &cache = *m_ReplayCheckpoints;
+  if(!cache.config.enabled || !cache.memoryBudgetBlocked || cache.budget ||
+     !cache.checkpoints.empty())
+    return false;
+  DXGI_QUERY_VIDEO_MEMORY_INFO memory = {};
+  const bool known = D3D12QueryCheckpointMemory(GetReal(), memory);
+  const bool recovered = D3D12RecoverCheckpointBudget(
+      cache.config.enabled, !cache.checkpoints.empty(), cache.config.byteBudget, known, memory,
+      cache.memoryBudgetBlocked, cache.budget);
+  if(recovered)
+    cache.stats.reason.clear();
+  if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+    LogD3D12Checkpoint(StringFormat::Fmt(
+        "api=D3D12Checkpoint op=memoryProbe known=%u recovered=%u requestedBytes=%llu "
+        "effectiveBytes=%llu videoBudget=%llu videoUsage=%llu",
+        known ? 1U : 0U, recovered ? 1U : 0U, (unsigned long long)cache.config.byteBudget,
+        (unsigned long long)cache.budget, (unsigned long long)memory.Budget,
+        (unsigned long long)memory.CurrentUsage));
+  return recovered;
 }
 
 void WrappedID3D12Device::GetReplayCheckpointQueryResult(
@@ -8298,6 +9082,16 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
   (void)nextAction;
   checkpoint.offset = offset;
   checkpoint.lastUse = ++cache.serial;
+  const auto typedOwners = cache.selectedTypedOwners.find(eventID);
+  if(!cache.typedAliasConflicts.empty() && typedOwners == cache.selectedTypedOwners.end())
+  {
+    reject("Checkpoint texture alias owner evidence is missing");
+    return;
+  }
+  if(typedOwners != cache.selectedTypedOwners.end())
+    checkpoint.typedAliasOwners = typedOwners->second;
+  for(const auto &entry : cache.typedAliasConflicts)
+    checkpoint.typedAliasMembers.insert(entry.first);
 
   struct PendingResource
   {
@@ -8308,6 +9102,7 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
     bool readback;
   };
   rdcarray<PendingResource> pending;
+  rdcarray<ResourceId> pendingBufferAliases;
   uint64_t newBytes = 0, sharedBytes = 0;
   uint64_t descriptorBytes = 0, fullDescriptorBytes = 0, descriptorRanges = 0;
   uint32_t descriptorDeltaHeaps = 0;
@@ -8358,6 +9153,44 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
     }
     newBytes += queryAllocationBytes;
   }
+  for(const auto &entry : cache.bufferAliasComponents)
+  {
+    const auto &component = entry.second;
+    WrappedID3D12Heap *nativeHeap = D3D12CheckpointOriginalHeap(GetResourceManager(), component.heap);
+    if(!nativeHeap || !nativeHeap->GetUnwrappedWholeMemBuffer())
+    {
+      reject("Checkpoint physical buffer heap identity changed");
+      return;
+    }
+    for(ResourceId member : component.members)
+    {
+      const auto resource = GetResourceList().find(member);
+      if(resource == GetResourceList().end() || !resource->second->IsResident() ||
+         GetResourceManager()->HasReplacement(member) ||
+         GetResourceManager()->GetUnreplacedID(member) != member)
+      {
+        reject("Checkpoint buffer alias member is absent, replaced, or non-resident");
+        return;
+      }
+    }
+    const auto previous = cache.currentBufferAliases.find(entry.first);
+    if(previous != cache.currentBufferAliases.end() &&
+       D3D12MayShareBufferAliasVersion(
+           IsReplayDirtyTrackingValid(), m_ReplayDirtyRecordingAllowed,
+           cache.residentVersions.IsResident(component.Range(), previous->second->version)))
+    {
+      checkpoint.bufferAliases[entry.first] = previous->second;
+      sharedBytes += component.allocationBytes;
+      continue;
+    }
+    if(component.allocationBytes > cache.budget || newBytes > cache.budget - component.allocationBytes)
+    {
+      reject("Checkpoint buffer alias union exceeds the configured memory budget");
+      return;
+    }
+    newBytes += component.allocationBytes;
+    pendingBufferAliases.push_back(entry.first);
+  }
   for(const auto &entry : GetResourceList())
   {
     if(ResourceIDGen::IsReplayOnlyID(entry.first))
@@ -8382,11 +9215,36 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
       }
     checkpoint.states[entry.first] = states->second;
 
+    const bool typedAlias = checkpoint.typedAliasMembers.count(entry.first) != 0;
+    if(typedAlias && !checkpoint.typedAliasOwners.count(entry.first))
+    {
+      const auto initial = m_InitialResourceStates.find(entry.first);
+      if(initial == m_InitialResourceStates.end() ||
+         !D3D12CheckpointStatesEqual(initial->second, states->second))
+      {
+        reject("Inactive texture alias needs a state transition after restoring another owner");
+        return;
+      }
+      continue;    // undefined inactive contents are not copied, and require no restore transition
+    }
+    if(typedAlias &&
+       (GetResourceManager()->GetUnreplacedID(entry.first) != entry.first ||
+        !D3D12CheckpointOriginalHeap(GetResourceManager(), GetResID(resource->GetHeap()))))
+    {
+      reject("Checkpoint texture alias identity changed");
+      return;
+    }
+
+    if(cache.bufferAliasMembers.count(entry.first))
+      continue;    // the component owns one immutable physical copy for every overlapping view
+
     uint32_t version = 0;
     for(const EventUsage &usage : m_Queue->GetUsage(entry.first))
       if(usage.eventId <= eventID && CheckpointResourceWrite(usage.usage))
         version = RDCMAX(version, usage.eventId);
     const D3D12_RESOURCE_DESC desc = resource->GetReal()->GetDesc();
+    if(typedAlias)
+      version = eventID;    // snapshot every proved owner, independent of GetUsage or dirty tracking
     // Direct heap indexing can omit precise per-resource usage. Save every writable candidate
     // in that case, rather than silently treating an unreported UAV as immutable.
     if(eventID >= D3D12CheckpointConservativeWriteStart(cache.directHeapAccess,
@@ -8408,7 +9266,7 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
       continue;
     }
     if(IsSparseResource(entry.first) || resource->IsAccelerationStructureResource() ||
-       cache.overlappingPlaced.find(entry.first) != cache.overlappingPlaced.end())
+       (cache.overlappingPlaced.find(entry.first) != cache.overlappingPlaced.end() && !typedAlias))
     {
       reject("A prefix-written resource has sparse, acceleration-structure, or overlapping placed storage");
       return;
@@ -8419,7 +9277,7 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
       return;
     }
     auto previous = cache.currentVersions.find(entry.first);
-    if(previous != cache.currentVersions.end() && previous->second->version == version)
+    if(!typedAlias && previous != cache.currentVersions.end() && previous->second->version == version)
     {
       checkpoint.resources[entry.first] = previous->second;
       sharedBytes += previous->second->bytes;
@@ -8528,9 +9386,12 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
   uint64_t pendingBytes = queryAllocationBytes;
   for(const PendingResource &resource : pending)
     pendingBytes += resource.bytes;
+  for(ResourceId key : pendingBufferAliases)
+    pendingBytes += cache.bufferAliasComponents[key].allocationBytes;
   // Versions copied into the candidate above remain owned there. Drop obsolete per-replay
   // references before enforcing the physical budget and retiring LRU checkpoints.
   cache.currentVersions.clear();
+  cache.currentBufferAliases.clear();
   std::set<uint32_t> evictionPlan;
   if(!D3D12PlanCheckpointEvictions(cache, checkpoint, pendingBytes, protectedAnchor, evictionPlan))
   {
@@ -8550,6 +9411,26 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
     cache.checkpoints.erase(victim);
   // Allocate every copy before recording any commands, so an allocation failure leaves the
   // original replay state untouched and can return to normal full replay without GPU rollback.
+  for(ResourceId key : pendingBufferAliases)
+  {
+    auto saved = std::make_shared<D3D12ReplayCheckpointBufferAliases>();
+    saved->component = cache.bufferAliasComponents[key];
+    saved->version = {++cache.contentSerial, cache.residentVersions.EditGeneration()};
+    const D3D12_RESOURCE_DESC desc =
+        CheckpointQueryBufferDesc(saved->component.end - saved->component.begin);
+    D3D12_HEAP_PROPERTIES properties = {};
+    properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    properties.CreationNodeMask = properties.VisibleNodeMask = 1;
+    const HRESULT hr = GetReal()->CreateCommittedResource(
+        &properties, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+        __uuidof(ID3D12Resource), (void **)&saved->gpu);
+    if(FAILED(hr))
+    {
+      reject("GPU allocation for buffer alias checkpoint failed");
+      return;
+    }
+    checkpoint.bufferAliases[key] = saved;
+  }
   for(const PendingResource &item : pending)
   {
     auto saved = std::make_shared<D3D12ReplayCheckpointResource>();
@@ -8655,6 +9536,20 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
     ready.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     Unwrap(list)->ResourceBarrier(1, &ready);
   }
+  for(ResourceId key : pendingBufferAliases)
+  {
+    const auto &saved = checkpoint.bufferAliases[key];
+    WrappedID3D12Heap *heap =
+        GetResourceManager()->GetResAs<WrappedID3D12Heap>(saved->component.heap);
+    D3D12BufferAliasCopy(Unwrap(list), heap->GetUnwrappedWholeMemBuffer(), *saved, false);
+    D3D12_RESOURCE_BARRIER ready = {};
+    ready.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    ready.Transition.pResource = saved->gpu;
+    ready.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    ready.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    ready.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    Unwrap(list)->ResourceBarrier(1, &ready);
+  }
   for(const PendingResource &item : pending)
   {
     const auto &saved = checkpoint.resources[GetResID(item.resource)];
@@ -8673,7 +9568,19 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
     ready.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     Unwrap(list)->ResourceBarrier(1, &ready);
   }
-  CHECK_HR(this, list->Close());
+  const HRESULT closeResult = list->Close();
+  CHECK_HR(this, closeResult);
+  if(FAILED(closeResult))
+  {
+    cache.unconfirmedSave = std::move(checkpoint);
+    InvalidateReplayDirtyTracking("checkpointSaveCloseFailed");
+    RDResult failure;
+    SET_ERROR_RESULT(failure, ResultCode::APIReplayFailed,
+                     "D3D12 checkpoint save command list failed to close: %s",
+                     ToStr(closeResult).c_str());
+    ReportFatalError(failure);
+    return;
+  }
   ExecuteLists();
   if(!FlushLists(true) || HasFatalError())
   {
@@ -8681,6 +9588,7 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
     return;
   }
   cache.currentVersions = checkpoint.resources;
+  cache.currentBufferAliases = checkpoint.bufferAliases;
   cache.checkpoints[eventID] = std::move(checkpoint);
   cache.PublishResidentVersions(cache.checkpoints[eventID]);
   cache.stats.builds++;
@@ -8689,21 +9597,36 @@ void WrappedID3D12Device::SaveReplayCheckpoint(uint32_t eventID, uint64_t offset
   cache.stats.sharedBytes = sharedBytes;
   cache.stats.reason.clear();
   if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+  {
+    uint64_t aliasCopied = 0, aliasShared = 0;
+    for(const auto &entry : cache.checkpoints[eventID].bufferAliases)
+    {
+      const uint64_t bytes = entry.second->component.end - entry.second->component.begin;
+      if(pendingBufferAliases.contains(entry.first))
+        aliasCopied += bytes;
+      else
+        aliasShared += bytes;
+    }
     LogD3D12Checkpoint(StringFormat::Fmt(
         "api=D3D12Checkpoint op=save event=%u bytes=%llu sharedBytes=%llu total_ms=%.3f "
         "prepare_ms=%.3f copyPhase_ms=%.3f descriptorBytes=%llu fullDescriptorBytes=%llu "
         "descriptorRanges=%llu descriptorDeltaHeaps=%u firstResolve=%u queryType=%s "
         "savedQuerySlots=%zu queryDataBytes=%llu queryAllocationBytes=%llu querySavedResolves=%zu "
-        "protectedAnchor=%u evictedPoints=%zu",
+        "protectedAnchor=%u evictedPoints=%zu bufferAliasComponents=%zu "
+        "bufferAliasCopyBytes=%llu bufferAliasSharedBytes=%llu typedAliasOwners=%zu "
+        "typedAliasMembers=%zu",
         eventID, (unsigned long long)newBytes, (unsigned long long)sharedBytes,
         totalTimer.GetMilliseconds(), prepareMS, timer.GetMilliseconds(),
         (unsigned long long)descriptorBytes, (unsigned long long)fullDescriptorBytes,
         (unsigned long long)descriptorRanges, descriptorDeltaHeaps,
         selected->second.firstNativeResolveEID,
-        ToStr(selected->second.firstNativeResolveType).c_str(),
-        selected->second.queries.slots.size(), (unsigned long long)queryDataBytes,
-        (unsigned long long)queryAllocationBytes, selected->second.queries.resolves.size(),
-        protectedAnchor, evictionPlan.size()));
+        ToStr(selected->second.firstNativeResolveType).c_str(), selected->second.queries.slots.size(),
+        (unsigned long long)queryDataBytes, (unsigned long long)queryAllocationBytes,
+        selected->second.queries.resolves.size(), protectedAnchor, evictionPlan.size(),
+        cache.checkpoints[eventID].bufferAliases.size(), (unsigned long long)aliasCopied,
+        (unsigned long long)aliasShared, cache.checkpoints[eventID].typedAliasOwners.size(),
+        cache.checkpoints[eventID].typedAliasMembers.size()));
+  }
 }
 
 static void CheckpointInitialCopyRanges(
@@ -8728,6 +9651,167 @@ static void CheckpointInitialCopyRanges(
 
 #if ENABLED(ENABLE_UNIT_TESTS)
 #include "catch/catch.hpp"
+
+TEST_CASE("D3D12 checkpoint descriptor admission uses only the matching captured boundary",
+          "[d3d12][checkpoint][memory][descriptor-restore]")
+{
+  const uint64_t mib = 1024ULL * 1024;
+  const uint64_t full = 600 * mib, early = 64 * 1024, late = 2 * mib;
+  const uint64_t resources = 96 * mib, budget = 512 * mib;
+  CHECK(resources + full > budget);
+  CHECK(resources + D3D12CheckpointDescriptorAdmissionBytes(full, full, early, false) < budget);
+  CHECK(D3D12CheckpointDescriptorAdmissionBytes(full, full, late, false) == late);
+  // Future writes are counted at their own boundary. A changed heap topology, shader/resource
+  // replacement, or absent/malformed evidence always retains the complete admission charge.
+  CHECK(D3D12CheckpointDescriptorAdmissionBytes(full, full - 1, early, false) == full);
+  CHECK(D3D12CheckpointDescriptorAdmissionBytes(full, full, early, true) == full);
+  CHECK(D3D12CheckpointDescriptorAdmissionBytes(full, ~0ULL, ~0ULL, false) == full);
+  CHECK(D3D12CheckpointDescriptorAdmissionBytes(full, full, full + 1, false) == full);
+  CHECK(D3D12CheckpointDescriptorAdmissionBytes(full, full, 0, false) == 0);
+  CHECK(D3D12CheckpointDescriptorAdmissionBytes(full, ~0ULL, 0, false) == full);
+
+  uint64_t work = 0;
+  CHECK(D3D12ConsumeCheckpointDescriptorPlanWork(work, 999999));
+  CHECK(D3D12ConsumeCheckpointDescriptorPlanWork(work, 0));
+  CHECK(work == 1000000);
+  CHECK_FALSE(D3D12ConsumeCheckpointDescriptorPlanWork(work, 1));
+  CHECK_FALSE(D3D12ConsumeCheckpointDescriptorPlanWork(work, 0));
+  work = 0;
+  CHECK_FALSE(D3D12ConsumeCheckpointDescriptorPlanWork(work, ~0ULL));
+  CHECK_FALSE(D3D12ConsumeCheckpointDescriptorPlanWork(work, 1));
+}
+
+TEST_CASE("D3D12 idle memory recovery requires a measured positive budget and no stored point",
+          "[d3d12][checkpoint][memory]")
+{
+  const uint64_t mib = 1024ULL * 1024;
+  DXGI_QUERY_VIDEO_MEMORY_INFO memory = {};
+  memory.Budget = 4096 * mib;
+  memory.CurrentUsage = 4096 * mib;
+  CHECK(D3D12CheckpointHeadroom(512 * mib, memory) == 0);
+  memory.CurrentUsage = 5000 * mib;
+  CHECK(D3D12CheckpointHeadroom(512 * mib, memory) == 0);
+  memory.CurrentUsage = 3840 * mib;
+  CHECK(D3D12CheckpointHeadroom(512 * mib, memory) == 0);
+  memory.CurrentUsage = 3800 * mib;
+  CHECK(D3D12CheckpointHeadroom(512 * mib, memory) == 40 * mib);
+  memory.CurrentUsage = 3000 * mib;
+  CHECK(D3D12CheckpointHeadroom(512 * mib, memory) == 512 * mib);
+  bool blocked = true;
+  uint64_t budget = 0;
+  CHECK_FALSE(D3D12RecoverCheckpointBudget(true, false, 512 * mib, false, memory, blocked, budget));
+  CHECK(blocked);
+  CHECK(budget == 0);
+  CHECK_FALSE(D3D12RecoverCheckpointBudget(false, false, 512 * mib, true, memory, blocked, budget));
+  CHECK_FALSE(D3D12RecoverCheckpointBudget(true, true, 512 * mib, true, memory, blocked, budget));
+  CHECK_FALSE(D3D12RecoverCheckpointBudget(true, false, 0, true, memory, blocked, budget));
+  CHECK(blocked);
+  CHECK(budget == 0);
+  CHECK(D3D12RecoverCheckpointBudget(true, false, 512 * mib, true, memory, blocked, budget));
+  CHECK_FALSE(blocked);
+  CHECK(budget == 512 * mib);
+  CHECK_FALSE(D3D12RecoverCheckpointBudget(true, false, 512 * mib, true, memory, blocked, budget));
+  // A compatible existing reservation is not grown by this narrow zero-budget recovery path.
+  blocked = true;
+  CHECK_FALSE(D3D12RecoverCheckpointBudget(true, false, 1024 * mib, true, memory, blocked, budget));
+  CHECK(budget == 512 * mib);
+  memory.Budget = ~0ULL;
+  memory.CurrentUsage = ~0ULL - 1;
+  CHECK(D3D12CheckpointHeadroom(~0ULL, memory) == 0);
+}
+
+TEST_CASE(
+    "D3D12 buffer alias checkpoints close physical overlaps without absorbing adjacent storage",
+    "[d3d12][checkpoint][buffer-alias]")
+{
+  const ResourceId heap = ResourceIDGen::GetNewUniqueID();
+  const ResourceId a = ResourceIDGen::GetNewUniqueID(), b = ResourceIDGen::GetNewUniqueID();
+  const ResourceId c = ResourceIDGen::GetNewUniqueID(), d = ResourceIDGen::GetNewUniqueID();
+  const uint64_t unit = 65536;
+  const rdcarray<D3D12CheckpointPlacedRange> ranges = {
+      {c, 3 * unit, 5 * unit}, {a, 0, 2 * unit}, {d, 5 * unit, 6 * unit}, {b, unit, 4 * unit}};
+  const auto components = D3D12BufferAliasComponents(heap, 8 * unit, true, ranges);
+  REQUIRE(components.size() == 1);
+  CHECK(components[0].begin == 0);
+  CHECK(components[0].end == 5 * unit);
+  CHECK(components[0].members == std::set<ResourceId>({a, b, c}));
+  CHECK(components[0].Range().offset == 0);
+  CHECK(components[0].Range().size == 5 * unit);
+  const auto offset = D3D12BufferAliasComponents(heap, 8 * unit, true,
+                                                 {{a, unit, 3 * unit}, {b, 2 * unit, 4 * unit}});
+  REQUIRE(offset.size() == 1);
+  CHECK(offset[0].Range().offset == unit);
+  CHECK(offset[0].Range().size == 3 * unit);
+
+  // A texture anywhere in the heap, missing sparse closure, or another eligibility failure
+  // must veto raw-buffer access even if that resource's reported usage is empty.
+  CHECK(D3D12BufferAliasComponents(heap, 8 * unit, false, ranges).empty());
+  CHECK(D3D12BufferAliasComponents(ResourceId(), 8 * unit, true, ranges).empty());
+  CHECK(D3D12BufferAliasComponents(heap, 0, true, ranges).empty());
+  CHECK(D3D12BufferAliasComponents(heap, 4 * unit, true, ranges).empty());
+  CHECK(D3D12BufferAliasComponents(heap, 8 * unit, true, {{a, 0, unit}, {a, 0, unit}}).empty());
+  CHECK(D3D12BufferAliasComponents(heap, 8 * unit, true, {{a, unit, unit}}).empty());
+  CHECK(D3D12BufferAliasComponents(heap, 8 * unit, true, {{a, ~0ULL, unit}}).empty());
+  CHECK(D3D12BufferAliasComponents(heap, 8 * unit, true, {{a, 0, unit}, {b, unit, 2 * unit}}).empty());
+}
+
+TEST_CASE("D3D12 explicit typed alias activation requires the exact boundary proof",
+          "[d3d12][checkpoint][typed-alias]")
+{
+  const ResourceId a = ResourceIDGen::GetNewUniqueID(), b = ResourceIDGen::GetNewUniqueID();
+  const ResourceId unrelated = ResourceIDGen::GetNewUniqueID();
+  const std::map<ResourceId, std::set<ResourceId>> conflicts = {{a, {b}}, {b, {a}}};
+  CHECK(D3D12ProvedTypedAliasActivation(true, a, conflicts));
+  CHECK(D3D12ProvedTypedAliasActivation(true, b, conflicts));
+  CHECK_FALSE(D3D12ProvedTypedAliasActivation(false, a, conflicts));
+  CHECK_FALSE(D3D12ProvedTypedAliasActivation(true, ResourceId(), conflicts));
+  CHECK_FALSE(D3D12ProvedTypedAliasActivation(true, unrelated, conflicts));
+  CHECK_FALSE(D3D12ProvedTypedAliasActivation(true, a, {}));
+}
+
+TEST_CASE("D3D12 buffer alias snapshots share only exact resident physical versions",
+          "[d3d12][checkpoint][buffer-alias]")
+{
+  CHECK(D3D12MayShareBufferAliasVersion(true, true, true));
+  CHECK_FALSE(D3D12MayShareBufferAliasVersion(false, true, true));
+  CHECK_FALSE(D3D12MayShareBufferAliasVersion(true, false, true));
+  CHECK_FALSE(D3D12MayShareBufferAliasVersion(true, true, false));
+  D3D12ReplayCheckpointCache cache;
+  const ResourceId heap = ResourceIDGen::GetNewUniqueID();
+  const ResourceId a = ResourceIDGen::GetNewUniqueID(), b = ResourceIDGen::GetNewUniqueID();
+  const auto components = D3D12BufferAliasComponents(
+      heap, 8 * 65536, true, {{a, 65536, 3 * 65536}, {b, 2 * 65536, 4 * 65536}});
+  REQUIRE(components.size() == 1);
+  auto saved = std::make_shared<D3D12ReplayCheckpointBufferAliases>();
+  saved->component = components[0];
+  saved->component.allocationBytes = 3 * 65536;
+  saved->version = {7, 0};
+  cache.residentVersions.Register(heap, 0, 8 * 65536);
+  cache.checkpoints[10].bufferAliases[a] = saved;
+  cache.checkpoints[20].bufferAliases[a] = saved;
+  CHECK(cache.AllocatedBytes() == 3 * 65536);
+  cache.PublishResidentVersions(cache.checkpoints[10]);
+  CHECK(cache.residentVersions.IsResident(saved->component.Range(), saved->version));
+  // An unrelated adjacent interval does not dirty this component. An overlapping alias write
+  // must invalidate it as a whole, including bytes not visible through that particular alias.
+  cache.residentVersions.Invalidate({heap, 0, 4 * 65536, 65536});
+  CHECK(cache.residentVersions.IsResident(saved->component.Range(), saved->version));
+  cache.residentVersions.Invalidate({heap, 0, 2 * 65536, 16});
+  CHECK_FALSE(cache.residentVersions.IsResident(saved->component.Range(), saved->version));
+  cache.PublishResidentVersions(cache.checkpoints[20]);
+  cache.residentVersions.InvalidateAll();
+  CHECK_FALSE(cache.residentVersions.IsResident(saved->component.Range(), saved->version));
+  // A changed physical version receives a separate allocation and cannot be undercharged.
+  auto changed = std::make_shared<D3D12ReplayCheckpointBufferAliases>();
+  changed->component = saved->component;
+  changed->version = {8, 1};
+  cache.checkpoints[30].bufferAliases[a] = changed;
+  CHECK(cache.AllocatedBytes() == 6 * 65536);
+  cache.config.maxCheckpoints = 3;
+  cache.budget = 5 * 65536;
+  std::set<uint32_t> victims;
+  CHECK_FALSE(D3D12PlanCheckpointEvictions(cache, cache.checkpoints[30], 0, 10, victims));
+}
 
 TEST_CASE("D3D12 upload reuse requires actual GPU fence completion", "[bufferpatch][gpu-idle]")
 {
@@ -9281,6 +10365,239 @@ TEST_CASE("D3D12 dirty heap restoration composes alias ranges with checkpoint fi
   CHECK((IntersectReplayDirtyRanges(initial, dirty) == initial));
 }
 
+TEST_CASE("D3D12 unchanged CPU blobs invalidate live versions while preserving initial debt",
+          "[d3d12][replay][dirty-restore][buffer-ranges][cpu-baseline]")
+{
+  const ResourceId id = ResourceIDGen::GetNewUniqueID();
+  std::set<ResourceId> dirty;
+  std::map<ResourceId, rdcarray<rdcpair<uint64_t, uint64_t>>> ranges;
+  bool valid = true, residentVersion = true, liveCursor = true, invalidate = false;
+  uint32_t wholeWrites = 0, preciseWrites = 0;
+  const auto wholeWrite = [&]() {
+    wholeWrites++;
+    residentVersion = false;
+    liveCursor = false;
+    dirty.insert(id);
+    ranges.erase(id);
+    valid &= !invalidate;
+  };
+  const auto rangeWrite = [&](uint64_t, uint64_t) { preciseWrites++; };
+  ApplyReplayCPUWriteBaselineDebt(id, {}, dirty, ranges, valid, wholeWrite, rangeWrite);
+  CHECK(wholeWrites == 1);
+  CHECK(preciseWrites == 0);
+  CHECK_FALSE(residentVersion);
+  CHECK_FALSE(liveCursor);
+  CHECK(dirty.empty());    // proven equal to initial, but the cached live version was invalidated
+
+  dirty.insert(id);
+  ranges[id] = {{8, 12}};
+  residentVersion = liveCursor = true;
+  ApplyReplayCPUWriteBaselineDebt(id, {}, dirty, ranges, valid, wholeWrite, rangeWrite);
+  CHECK(wholeWrites == 2);
+  CHECK_FALSE(residentVersion);
+  CHECK_FALSE(liveCursor);
+  REQUIRE(ranges[id].size() == 1);
+  CHECK(ranges[id][0].first == 8);
+  CHECK(ranges[id][0].second == 12);    // unchanged write cannot remove an earlier dirty interval
+
+  invalidate = true;
+  ApplyReplayCPUWriteBaselineDebt(id, {{40, 44}}, dirty, ranges, valid, wholeWrite, rangeWrite);
+  CHECK_FALSE(valid);
+  CHECK(dirty.count(id) == 1);
+  CHECK(ranges.empty());    // failure in the write side effects must keep the whole-buffer debt
+  CHECK(preciseWrites == 0);
+}
+
+TEST_CASE("D3D12 full CPU blobs retain only differences from immutable initial bytes",
+          "[d3d12][replay][dirty-restore][buffer-ranges][cpu-baseline]")
+{
+  bytebuf original, first, second;
+  original.resize(64);
+  for(size_t i = 0; i < original.size(); i++)
+    original[i] = byte(i);
+  first = original;
+  first[8] = 0xfe;
+  first[9] = 0xfe;
+  first[40] = 0xfe;
+  rdcarray<rdcpair<uint64_t, uint64_t>> differences, dirty;
+  REQUIRE(ReplayCPUWriteBaselineDifferences(original.data(), first.data(), 0, 64, differences));
+  REQUIRE(differences.size() == 2);
+  bool previouslyDirty = false;
+  for(const auto &range : differences)
+  {
+    REQUIRE(MergeReplayBufferDirtyWrite(previouslyDirty, true, 64, range.first,
+                                        range.second - range.first, dirty));
+    previouslyDirty = true;
+  }
+  // The next whole blob restores byte 8 to its initial value, but changes another isolated byte.
+  // Keeping the union is conservative and avoids any assumption about intervening GPU writes.
+  second = first;
+  second[8] = original[8];
+  second[55] = 0xfe;
+  REQUIRE(ReplayCPUWriteBaselineDifferences(original.data(), second.data(), 0, 64, differences));
+  for(const auto &range : differences)
+    REQUIRE(MergeReplayBufferDirtyWrite(true, true, 64, range.first, range.second - range.first,
+                                        dirty));
+  auto working = second;
+  uint64_t bytes = 0;
+  for(const auto &range : SelectReplayBufferDirtyCopies(true, 64, dirty, {{0, 64}}))
+  {
+    memcpy(working.data() + size_t(range.first), original.data() + size_t(range.first),
+           size_t(range.second - range.first));
+    bytes += range.second - range.first;
+  }
+  CHECK(bytes == 4);
+  CHECK((working == original));
+  const auto previousDirty = dirty;
+  REQUIRE(ReplayCPUWriteBaselineDifferences(original.data(), original.data(), 0, 64, differences));
+  CHECK(differences.empty());
+  for(const auto &range : differences)
+    MergeReplayBufferDirtyWrite(true, true, 64, range.first, range.second - range.first, dirty);
+  CHECK((dirty == previousDirty));    // an unchanged full blob never clears prior write evidence
+}
+
+TEST_CASE("D3D12 CPU baseline proof rejects missing bytes overflow and fragmented data",
+          "[d3d12][replay][dirty-restore][buffer-ranges][cpu-baseline]")
+{
+  const byte original[] = {0, 1, 2, 3, 4, 5, 6, 7};
+  const byte written[] = {8, 1, 8, 3, 8, 5, 6, 7};
+  rdcarray<rdcpair<uint64_t, uint64_t>> differences;
+  CHECK_FALSE(ReplayCPUWriteBaselineDifferences(NULL, written, 0, 8, differences));
+  CHECK_FALSE(ReplayCPUWriteBaselineDifferences(original, NULL, 0, 8, differences));
+  CHECK_FALSE(ReplayCPUWriteBaselineDifferences(original, written, ~0ULL - 4, 8, differences));
+  CHECK_FALSE(ReplayCPUWriteBaselineDifferences(original, written, 0, 8, differences, 2));
+  CHECK(differences.empty());
+  REQUIRE(ReplayCPUWriteBaselineDifferences(original, written, 32, 8, differences));
+  REQUIRE(differences.size() == 3);
+  CHECK(differences[0].first == 32);
+  CHECK(differences[0].second == 33);
+  CHECK(differences[2].first == 36);
+  CHECK(differences[2].second == 37);
+  // An earlier unknown GPU write still dominates a subsequently verified CPU baseline blob.
+  rdcarray<rdcpair<uint64_t, uint64_t>> wholeDirty;
+  for(const auto &range : differences)
+    CHECK_FALSE(MergeReplayBufferDirtyWrite(true, true, 64, range.first,
+                                            range.second - range.first, wholeDirty));
+  const rdcarray<rdcpair<uint64_t, uint64_t>> all = {{0, 64}};
+  CHECK((SelectReplayBufferDirtyCopies(true, 64, wholeDirty, all) == all));
+}
+
+TEST_CASE("D3D12 exact CPU buffer writes restore the union without touching neighbours",
+          "[d3d12][replay][dirty-restore][buffer-ranges]")
+{
+  rdcarray<rdcpair<uint64_t, uint64_t>> dirty;
+  REQUIRE(MergeReplayBufferDirtyWrite(false, true, 64, 8, 4, dirty));
+  REQUIRE(MergeReplayBufferDirtyWrite(true, true, 64, 10, 6, dirty));
+  // A persistent patch is copied again outside the captured CPU write, and joins the union.
+  REQUIRE(MergeReplayBufferDirtyWrite(true, true, 64, 40, 4, dirty));
+  const auto copies = SelectReplayBufferDirtyCopies(true, 64, dirty, {{0, 64}});
+  REQUIRE(copies.size() == 2);
+  CHECK(copies[0].first == 8);
+  CHECK(copies[0].second == 16);
+  CHECK(copies[1].first == 40);
+  CHECK(copies[1].second == 44);
+
+  bytebuf original, working;
+  original.resize(64);
+  for(size_t i = 0; i < original.size(); i++)
+    original[i] = byte(i);
+  working = original;
+  memset(working.data() + 8, 0xa5, 8);
+  memset(working.data() + 40, 0xa5, 4);
+  uint64_t copiedBytes = 0;
+  for(const auto &range : copies)
+  {
+    memcpy(working.data() + size_t(range.first), original.data() + size_t(range.first),
+           size_t(range.second - range.first));
+    copiedBytes += range.second - range.first;
+  }
+  CHECK(copiedBytes == 12);
+  CHECK((working == original));
+
+  // Compose with a prior planner exclusion, without restoring bytes promised by another source.
+  const auto excluded = SelectReplayBufferDirtyCopies(true, 64, dirty, {{0, 10}, {42, 64}});
+  REQUIRE(excluded.size() == 2);
+  CHECK(excluded[0].first == 8);
+  CHECK(excluded[0].second == 10);
+  CHECK(excluded[1].first == 42);
+  CHECK(excluded[1].second == 44);
+}
+
+TEST_CASE("D3D12 unknown writes and invalidated baselines cannot inherit CPU buffer ranges",
+          "[d3d12][replay][dirty-restore][buffer-ranges]")
+{
+  const rdcarray<rdcpair<uint64_t, uint64_t>> all = {{0, 64}};
+  rdcarray<rdcpair<uint64_t, uint64_t>> dirty;
+  // A GPU/unknown write first marks the resource dirty with no exact ranges.
+  CHECK_FALSE(MergeReplayBufferDirtyWrite(true, true, 64, 8, 4, dirty));
+  CHECK((SelectReplayBufferDirtyCopies(true, 64, dirty, all) == all));
+  REQUIRE(MergeReplayBufferDirtyWrite(false, true, 64, 8, 4, dirty));
+  // Eligibility can be lost after the first write (replacement, alias or unknown native state).
+  CHECK_FALSE(MergeReplayBufferDirtyWrite(true, false, 64, 40, 4, dirty));
+  CHECK(dirty.empty());
+  CHECK_FALSE(MergeReplayBufferDirtyWrite(true, true, 64, 44, 4, dirty));
+  CHECK((SelectReplayBufferDirtyCopies(true, 64, dirty, all) == all));
+
+  REQUIRE(MergeReplayBufferDirtyWrite(false, true, 64, 8, 4, dirty));
+  // Force, mutation/undo, failed initial restore and the disabled path all invalidate reuse.
+  const auto reset = SelectReplayBufferDirtyCopies(false, 64, dirty, all);
+  CHECK((reset == all));
+  bytebuf original, working;
+  original.resize(64);
+  memset(original.data(), 0x31, original.size());
+  working = original;
+  working[8] = 0x7f;
+  working[50] = 0x7f;    // retired patch outside the preceding CPU range
+  for(const auto &range : reset)
+    memcpy(working.data() + size_t(range.first), original.data() + size_t(range.first),
+           size_t(range.second - range.first));
+  CHECK((working == original));
+}
+
+TEST_CASE("D3D12 CPU buffer ranges reject overflow and cap fragmentation conservatively",
+          "[d3d12][replay][dirty-restore][buffer-ranges]")
+{
+  rdcarray<rdcpair<uint64_t, uint64_t>> dirty;
+  CHECK_FALSE(MergeReplayBufferDirtyWrite(false, true, 64, 65, 1, dirty));
+  CHECK_FALSE(MergeReplayBufferDirtyWrite(false, true, 64, 63, 2, dirty));
+  CHECK_FALSE(MergeReplayBufferDirtyWrite(false, true, ~0ULL, ~0ULL - 1, 4, dirty));
+  CHECK_FALSE(MergeReplayBufferDirtyWrite(false, true, 64, 8, 0, dirty));
+  CHECK_FALSE(MergeReplayBufferDirtyWrite(false, true, 0, 0, 1, dirty));
+  REQUIRE(MergeReplayBufferDirtyWrite(false, true, ~0ULL, ~0ULL - 4, 4, dirty));
+  CHECK(dirty[0].second == ~0ULL);
+  dirty.clear();
+  REQUIRE(MergeReplayBufferDirtyWrite(false, true, 64, 0, 1, dirty, 2));
+  REQUIRE(MergeReplayBufferDirtyWrite(true, true, 64, 4, 1, dirty, 2));
+  CHECK_FALSE(MergeReplayBufferDirtyWrite(true, true, 64, 8, 1, dirty, 2));
+  CHECK(dirty.empty());
+  CHECK_FALSE(MergeReplayBufferDirtyWrite(true, true, 64, 9, 1, dirty, 2));
+  const rdcarray<rdcpair<uint64_t, uint64_t>> all = {{0, 64}};
+  CHECK((SelectReplayBufferDirtyCopies(true, 64, {{8, 65}}, all) == all));
+  CHECK((SelectReplayBufferDirtyCopies(true, 64, {{8, 8}}, all) == all));
+  CHECK((SelectReplayBufferDirtyCopies(true, 64, {{40, 44}, {8, 12}}, all) == all));
+}
+
+TEST_CASE("D3D12 CPU range restoration excludes physical alias and GPU-write capabilities",
+          "[d3d12][replay][dirty-restore][buffer-ranges]")
+{
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  desc.Width = 64;
+  CHECK(ReplayBufferDirtyEligible(desc, false, false, false, true, D3D12_HEAP_FLAG_NONE));
+  CHECK_FALSE(ReplayBufferDirtyEligible(desc, true, false, false, true, D3D12_HEAP_FLAG_NONE));
+  CHECK_FALSE(ReplayBufferDirtyEligible(desc, false, true, false, true, D3D12_HEAP_FLAG_NONE));
+  CHECK_FALSE(ReplayBufferDirtyEligible(desc, false, false, true, true, D3D12_HEAP_FLAG_NONE));
+  CHECK_FALSE(ReplayBufferDirtyEligible(desc, false, false, false, false, D3D12_HEAP_FLAG_NONE));
+  CHECK_FALSE(ReplayBufferDirtyEligible(desc, false, false, false, true, D3D12_HEAP_FLAG_SHARED));
+  CHECK_FALSE(ReplayBufferDirtyEligible(desc, false, false, false, true,
+                                       D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER));
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  CHECK_FALSE(ReplayBufferDirtyEligible(desc, false, false, false, true, D3D12_HEAP_FLAG_NONE));
+  desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  CHECK_FALSE(ReplayBufferDirtyEligible(desc, false, false, false, true, D3D12_HEAP_FLAG_NONE));
+}
+
 TEST_CASE("D3D12 shared value edits retain only same-layout pre-consumer checkpoints",
           "[d3d12][replay][checkpoint-buffer-patch]")
 {
@@ -9506,6 +10823,90 @@ bool WrappedID3D12Device::ValidateReplayCheckpointRestore(uint32_t eventID, bool
     return false;
   }
   const D3D12ReplayCheckpoint &checkpoint = found->second;
+  for(const auto &entry : checkpoint.bufferAliases)
+  {
+    const auto &saved = *entry.second;
+    const auto &component = saved.component;
+    const auto known = cache.bufferAliasComponents.find(entry.first);
+    WrappedID3D12Heap *heap = D3D12CheckpointOriginalHeap(GetResourceManager(), component.heap);
+    if(!heap || !saved.gpu || !heap->GetUnwrappedWholeMemBuffer() ||
+       GetResourceManager()->HasReplacement(component.heap) ||
+       known == cache.bufferAliasComponents.end() || known->second.heap != component.heap ||
+       known->second.begin != component.begin || known->second.end != component.end ||
+       known->second.members != component.members || component.begin >= component.end ||
+       component.end > heap->GetDesc().SizeInBytes ||
+       saved.gpu->GetDesc().Width != component.end - component.begin ||
+       !m_ReplaySparseGraphComplete || m_ReplaySparseComponentIndex.count(component.heap))
+    {
+      reason = "Checkpoint physical buffer alias identity or storage coverage changed";
+      return false;
+    }
+    for(ResourceId member : component.members)
+    {
+      const auto resource = GetResourceList().find(member);
+      if(resource == GetResourceList().end() || !resource->second->IsResident() ||
+         GetResID(resource->second->GetHeap()) != component.heap ||
+         resource->second->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
+         GetResourceManager()->HasReplacement(member) ||
+         GetResourceManager()->GetUnreplacedID(member) != member || !checkpoint.states.count(member))
+      {
+        reason = "Checkpoint physical buffer alias member changed";
+        return false;
+      }
+    }
+  }
+  if(!checkpoint.typedAliasMembers.empty())
+  {
+    std::set<ResourceId> currentMembers;
+    for(const auto &entry : cache.typedAliasConflicts)
+      currentMembers.insert(entry.first);
+    if(currentMembers != checkpoint.typedAliasMembers)
+    {
+      reason = "Checkpoint texture alias closure changed";
+      return false;
+    }
+    for(ResourceId member : checkpoint.typedAliasMembers)
+    {
+      const auto resource = GetResourceList().find(member);
+      const auto savedState = checkpoint.states.find(member);
+      if(resource == GetResourceList().end() || savedState == checkpoint.states.end() ||
+         !resource->second->IsResident() || GetResourceManager()->HasReplacement(member) ||
+         GetResourceManager()->GetUnreplacedID(member) != member ||
+         !D3D12CheckpointOriginalHeap(GetResourceManager(), GetResID(resource->second->GetHeap())))
+      {
+        reason = "Checkpoint texture alias member identity changed";
+        return false;
+      }
+      if(checkpoint.typedAliasOwners.count(member))
+      {
+        if(!checkpoint.resources.count(member) || !checkpoint.resources.at(member)->gpu)
+        {
+          reason = "Checkpoint active texture alias is missing its complete typed copy";
+          return false;
+        }
+        for(ResourceId other : cache.typedAliasConflicts.at(member))
+          if(checkpoint.typedAliasOwners.count(other))
+          {
+            reason = "Checkpoint active texture owners overlap";
+            return false;
+          }
+      }
+      else
+      {
+        const auto initial = m_InitialResourceStates.find(member);
+        const auto actual = m_ResourceStates.find(member);
+        if(checkpoint.resources.count(member) || initial == m_InitialResourceStates.end() ||
+           !D3D12CheckpointStatesEqual(initial->second, savedState->second) ||
+           (initialRestored &&
+            (actual == m_ResourceStates.end() ||
+             !D3D12CheckpointStatesEqual(actual->second, savedState->second))))
+        {
+          reason = "Inactive texture alias would need a hidden-layout state transition";
+          return false;
+        }
+      }
+    }
+  }
   for(const auto &query : checkpoint.queries)
   {
     WrappedID3D12QueryHeap *heap =
@@ -9629,6 +11030,7 @@ void WrappedID3D12Device::PrepareReplayCheckpointRestore(uint32_t requestedEvent
   auto &cache = *m_ReplayCheckpoints;
   cache.restorePlan = {};
   cache.currentVersions.clear();
+  cache.currentBufferAliases.clear();
   cache.savedThisReplay = false;
   if(!allowCheckpoints || !cache.config.enabled || m_Replay->m_ReplayCheckpointBypass ||
      m_Queue->GetCommandData()->m_ActionCallback || m_ReplayOptions.apiValidation)
@@ -9712,6 +11114,18 @@ void WrappedID3D12Device::PrepareReplayCheckpointRestore(uint32_t requestedEvent
       Process::GetEnvVariable("RENDERDOC_D3D12_DISABLE_CHECKPOINT_RESIDENT_REUSE") != "1";
   const bool initialSourcesEnabled =
       Process::GetEnvVariable("RENDERDOC_D3D12_DISABLE_CHECKPOINT_INITIAL_SOURCES") != "1";
+  for(const auto &entry : checkpoint.bufferAliases)
+  {
+    const auto &component = entry.second->component;
+    const D3D12InitialContents initial = GetResourceManager()->GetInitialContents(component.heap);
+    if(initial.sparseBinds)
+    {
+      reject("Checkpoint buffer alias heap acquired sparse initial mappings");
+      return;
+    }
+    plan.heapExclusions[component.heap].push_back({component.begin, component.end});
+    resourceBytes += component.allocationBytes;
+  }
   for(const auto &entry : checkpoint.resources)
   {
     WrappedID3D12Resource *resource = GetResourceList().find(entry.first)->second;
@@ -9727,9 +11141,10 @@ void WrappedID3D12Device::PrepareReplayCheckpointRestore(uint32_t requestedEvent
     resourceBytes += entry.second->bytes;
     // This plan only retains exact immutable snapshot identities. It makes no assumption from
     // absent GetUsage entries, and all normal initial/checkpoint barriers still execute.
-    const bool independentStorage = !m_ReplaySparseComponentIndex.count(entry.first) &&
-        (!resource->GetHeap() ||
-         !m_ReplaySparseComponentIndex.count(GetResID(resource->GetHeap())));
+    const bool independentStorage =
+        !m_ReplaySparseComponentIndex.count(entry.first) &&
+        (!resource->GetHeap() || desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) &&
+        (!resource->GetHeap() || !m_ReplaySparseComponentIndex.count(GetResID(resource->GetHeap())));
     if(D3D12MayRetainCheckpointContents(initialSourcesEnabled, retainResident,
                                        independentStorage,
                                        cache.residentVersions.IsResident(
@@ -9748,14 +11163,23 @@ void WrappedID3D12Device::PrepareReplayCheckpointRestore(uint32_t requestedEvent
       {
         ID3D12Resource *wholeHeap = resource->GetHeap()->GetUnwrappedWholeMemBuffer();
         const uint64_t offset = resource->GetHeapOffset();
-        if(desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || !wholeHeap ||
-           offset > wholeHeap->GetDesc().Width || desc.Width > wholeHeap->GetDesc().Width - offset ||
-           heapInitial.sparseBinds)
+        if(!wholeHeap || heapInitial.sparseBinds)
         {
           reject("Checkpoint cannot separate this placed resource from its whole-heap initial copy");
           return;
         }
-        plan.heapExclusions[heapId].push_back({offset, offset + desc.Width});
+        if(desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        {
+          if(offset > wholeHeap->GetDesc().Width || desc.Width > wholeHeap->GetDesc().Width - offset)
+          {
+            reject("Checkpoint placed buffer exceeds its whole-heap initial copy");
+            return;
+          }
+          plan.heapExclusions[heapId].push_back({offset, offset + desc.Width});
+        }
+        // An independent placed texture is restored by a full typed copy below. Keep its
+        // original heap initialization: UNKNOWN layouts cannot supply byte-range exclusions.
+        // Such textures are never retained across that physical initial copy.
       }
     }
     if(!entry.second->gpu)
@@ -9838,6 +11262,7 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
     const uint32_t eventId = cache.restorePlan.eventId;
     cache.restorePlan = {};
     cache.currentVersions.clear();
+    cache.currentBufferAliases.clear();
     cache.stats.reason = reason;
     cache.stats.rejected++;
     cache.stats.misses++;
@@ -9966,12 +11391,21 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
     mapped.resource->Unmap(0, &range);
   }
   const double cpuRestoreEndMS = timer.GetMilliseconds();
+  for(const auto &entry : checkpoint.bufferAliases)
+  {
+    const auto &saved = *entry.second;
+    WrappedID3D12Heap *heap = GetResourceManager()->GetResAs<WrappedID3D12Heap>(saved.component.heap);
+    D3D12BufferAliasCopy(Unwrap(list), heap->GetUnwrappedWholeMemBuffer(), saved, true);
+  }
   for(const auto &entry : checkpoint.resources)
   {
     if(!entry.second->gpu || cache.restorePlan.retainedResources.count(entry.first) ||
        cache.restorePlan.fullClearResources.count(entry.first))
       continue;
     WrappedID3D12Resource *resource = GetResourceList().find(entry.first)->second;
+    if(resource->GetHeap())
+      D3D12CheckpointAliasBarrier(
+          Unwrap(list), checkpoint.typedAliasOwners.count(entry.first) ? resource->GetReal() : NULL);
     BarrierSet barriers;
     barriers.Configure(resource, m_ResourceStates[entry.first], BarrierSet::CopyDestAccess);
     barriers.Apply(list);
@@ -9983,6 +11417,9 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
   {
     auto resource = GetResourceList().find(entry.first);
     SubresourceStateVector &before = m_ResourceStates[entry.first];
+    if(checkpoint.typedAliasMembers.count(entry.first) &&
+       !checkpoint.typedAliasOwners.count(entry.first))
+      continue;    // preflight proved the canonical state exact; never touch inactive metadata here
     for(size_t i = 0; i < entry.second.size(); i++)
     {
       if(before[i] == entry.second[i])
@@ -9999,7 +11436,18 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
   }
   if(!transitions.empty())
     Unwrap(list)->ResourceBarrier((UINT)transitions.size(), transitions.data());
-  CHECK_HR(this, list->Close());
+  const HRESULT closeResult = list->Close();
+  CHECK_HR(this, closeResult);
+  if(FAILED(closeResult))
+  {
+    InvalidateReplayDirtyTracking("checkpointRestoreCloseFailed");
+    RDResult failure;
+    SET_ERROR_RESULT(failure, ResultCode::APIReplayFailed,
+                     "D3D12 checkpoint restore command list failed to close: %s",
+                     ToStr(closeResult).c_str());
+    ReportFatalError(failure);
+    return false;
+  }
   const double copyRecordEndMS = timer.GetMilliseconds();
   ExecuteLists(NULL, false, descriptorIndependent);
   // The replay boundary already drained the preceding replay. In the qualified path, in-flight
@@ -10020,6 +11468,7 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
   nextEvent = checkpoint.nextEvent;
   nextAction = checkpoint.nextAction;
   cache.currentVersions = checkpoint.resources;
+  cache.currentBufferAliases = checkpoint.bufferAliases;
   cache.activeQueries = checkpoint.queries;
   cache.PublishResidentVersions(checkpoint);
   for(ResourceId id : cache.deferredInitialResources)
@@ -10031,20 +11480,28 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
   if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
   {
     uint64_t overlaySlots = 0;
+    uint64_t aliasCopyBytes = 0;
+    uint64_t typedCopyBytes = 0;
+    for(const auto &entry : checkpoint.bufferAliases)
+      aliasCopyBytes += entry.second->component.end - entry.second->component.begin;
+    for(ResourceId id : checkpoint.typedAliasOwners)
+      typedCopyBytes += checkpoint.resources.at(id)->bytes;
     for(const auto &heap : cache.restorePlan.descriptorExclusions)
       for(const auto &range : heap.second)
         overlaySlots += range.count;
     LogD3D12Checkpoint(StringFormat::Fmt(
         "api=D3D12Checkpoint op=restore event=%u target=%u prefixSkipped=1 total_ms=%.3f "
         "asyncRestore=%u preWait_ms=%.3f validate_ms=%.3f descriptors_ms=%.3f cpuRestore_ms=%.3f "
-        "copyRecord_ms=%.3f submitWait_ms=%.3f descriptorBytes=%llu descriptorChanges=%llu cpuBytes=%llu "
+        "copyRecord_ms=%.3f submitWait_ms=%.3f descriptorBytes=%llu descriptorChanges=%llu "
+        "cpuBytes=%llu "
         "initialResourceCopiesSkipped=%u initialResourceAllocationBytesSkipped=%llu "
         "initialHeapBytesSkipped=%llu restoredQuerySlots=%zu querySavedResolves=%zu "
         "residentCopiesSkipped=%zu residentAllocationBytesSkipped=%llu "
         "fullClearInitialCopiesDeferred=%zu fullClearAllocationBytes=%llu "
-        "initialDescriptorOverlaySlots=%llu",
-        checkpoint.eventId, endEventID, timer.GetMilliseconds(), asyncRestore ? 1U : 0U, preWaitEndMS,
-        validateEndMS - preWaitEndMS, descriptorEndMS - validateEndMS,
+        "initialDescriptorOverlaySlots=%llu bufferAliasComponents=%zu bufferAliasCopyBytes=%llu "
+        "typedAliasOwners=%zu typedAliasCopyAllocationBytes=%llu",
+        checkpoint.eventId, endEventID, timer.GetMilliseconds(), asyncRestore ? 1U : 0U,
+        preWaitEndMS, validateEndMS - preWaitEndMS, descriptorEndMS - validateEndMS,
         cpuRestoreEndMS - descriptorEndMS, copyRecordEndMS - cpuRestoreEndMS,
         submitWaitEndMS - copyRecordEndMS, (unsigned long long)descriptorBytes,
         (unsigned long long)descriptorChanges, (unsigned long long)cpuBytes,
@@ -10052,7 +11509,9 @@ bool WrappedID3D12Device::RestoreReplayCheckpoint(uint32_t endEventID, uint64_t 
         (unsigned long long)cache.restorePlan.skippedHeapBytes, checkpoint.queries.size(),
         checkpoint.queryResolves.size(), cache.restorePlan.retainedResources.size(),
         (unsigned long long)cache.restorePlan.retainedBytes, cache.deferredInitialResources.size(),
-        (unsigned long long)cache.restorePlan.fullClearBytes, (unsigned long long)overlaySlots));
+        (unsigned long long)cache.restorePlan.fullClearBytes, (unsigned long long)overlaySlots,
+        checkpoint.bufferAliases.size(), (unsigned long long)aliasCopyBytes,
+        checkpoint.typedAliasOwners.size(), (unsigned long long)typedCopyBytes));
   }
   cache.restorePlan = {};
   return true;

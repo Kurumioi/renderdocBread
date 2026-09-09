@@ -31,12 +31,12 @@
 
 namespace
 {
-// The outer packet is deliberately a single extension point. Future control operations change
-// this envelope version, not the ordinal layout of the existing replay proxy packets.
+// The outer packet is deliberately a single extension point. Wire-incompatible changes require
+// a new envelope version; optional new operations use capability bits without altering old payloads.
 static const uint64_t ReplayControlMaxPayload = 64ULL * 1024 * 1024;
 static const uint64_t ReplayControlMaxPatchBytes = 32ULL * 1024 * 1024;
 static const uint64_t ReplayControlOperations =
-    (1ULL << (uint32_t(ReplayControlOperation::BufferPatches) + 1)) - 1;
+    (1ULL << (uint32_t(ReplayControlOperation::CheckpointStatsWithPlan) + 1)) - 1;
 
 template <typename SerialiserType>
 bool ControlBytes(SerialiserType &ser, bytebuf &bytes, uint64_t limit, bool memoryPayload)
@@ -138,6 +138,81 @@ bool ControlStats(SerialiserType &ser, ReplayCheckpointStats &stats)
 }
 
 template <typename SerialiserType>
+bool ControlStatsWithPlan(SerialiserType &ser, ReplayCheckpointStats &stats)
+{
+  // Keep the original ControlStats layout untouched. This suffix is present only when the
+  // independently negotiated operation was requested, never inferred from trailing bytes.
+  if(ser.IsWriting() && stats.candidateEvents.size() > 4096)
+    return false;
+  if(ser.IsReading())
+  {
+    stats.candidatePlanKnown = stats.canTryOtherCandidates = false;
+    stats.candidateEvents.clear();
+  }
+  if(!ControlStats(ser, stats))
+    return false;
+  uint32_t flags = (stats.candidatePlanKnown ? 1U : 0U) | (stats.canTryOtherCandidates ? 2U : 0U);
+  uint32_t count = uint32_t(stats.candidateEvents.size());
+  ser.Serialise("planFlags"_lit, flags);
+  ser.Serialise("candidateCount"_lit, count);
+  if(ser.IsErrored() || (flags & ~3U) || ((flags & 2U) && !(flags & 1U)) || count > 4096 ||
+     (!(flags & 1U) && count != 0))
+    return false;
+  rdcarray<uint32_t> events;
+  if(ser.IsReading())
+  {
+    StreamReader *reader = ser.GetReader();
+    if(reader->GetOffset() > reader->GetSize() ||
+       uint64_t(count) * sizeof(uint32_t) > reader->GetSize() - reader->GetOffset())
+      return false;
+    events.resize(count);
+  }
+  else
+    events = stats.candidateEvents;
+  for(size_t i = 0; i < events.size(); ++i)
+  {
+    ser.Serialise("candidateEventId"_lit, events[i]);
+    // Zero may represent an admitted post-initialisation boundary. It must still be explicit,
+    // and a partial/truncated read must never turn into a fabricated zero candidate.
+    if(ser.IsErrored() || (i > 0 && events[i] <= events[i - 1]))
+      return false;
+  }
+  if(ser.IsReading())
+  {
+    stats.candidatePlanKnown = (flags & 1U) != 0;
+    stats.canTryOtherCandidates = (flags & 2U) != 0;
+    stats.candidateEvents.swap(events);
+  }
+  return true;
+}
+
+ReplayControlOperation ControlStatsOperation(uint32_t version, uint64_t operations)
+{
+  return version == 1 &&
+                 (operations & (1ULL << uint32_t(ReplayControlOperation::CheckpointStatsWithPlan)))
+             ? ReplayControlOperation::CheckpointStatsWithPlan
+             : ReplayControlOperation::CheckpointStats;
+}
+
+bool DecodeControlStats(ReplayControlOperation operation, const bytebuf &response,
+                        ReplayCheckpointStats &stats)
+{
+  ReplayCheckpointStats candidate;
+  ReadSerialiser ser(new StreamReader(response), Ownership::Stream);
+  const bool valid =
+      operation == ReplayControlOperation::CheckpointStatsWithPlan
+          ? ControlStatsWithPlan(ser, candidate)
+          : operation == ReplayControlOperation::CheckpointStats && ControlStats(ser, candidate);
+  if(!valid || !ControlPayloadFinished(ser))
+  {
+    stats = ReplayCheckpointStats();
+    return false;
+  }
+  stats = candidate;
+  return true;
+}
+
+template <typename SerialiserType>
 bool ControlPatches(SerialiserType &ser, rdcarray<ReplayBufferPatch> &patches)
 {
   if(ser.IsWriting() && patches.size() > 512)
@@ -171,7 +246,7 @@ rdcstr DispatchReplayControl(Driver *driver, uint32_t version, uint32_t operatio
     return "replayControlProtocolVersionMismatch";
   if(request.size() > ReplayControlMaxPayload)
     return "replayControlPayloadTooLarge";
-  if(operation > uint32_t(ReplayControlOperation::BufferPatches))
+  if(operation > uint32_t(ReplayControlOperation::CheckpointStatsWithPlan))
     return "replayControlOperationUnsupported";
 
   ReadSerialiser input(new StreamReader(request), Ownership::Stream);
@@ -198,12 +273,16 @@ rdcstr DispatchReplayControl(Driver *driver, uint32_t version, uint32_t operatio
         return "replayControlInvalidCheckpointConfig";
       driver->ConfigureReplayCheckpoints(config, candidates);
     }
-    else if(op == ReplayControlOperation::CheckpointStats)
+    else if(op == ReplayControlOperation::CheckpointStats ||
+            op == ReplayControlOperation::CheckpointStatsWithPlan)
     {
       if(!request.empty())
         return "replayControlUnexpectedPayload";
       ReplayCheckpointStats stats = driver->GetReplayCheckpointStats();
-      if(!ControlStats(output, stats))
+      const bool valid = op == ReplayControlOperation::CheckpointStatsWithPlan
+                             ? ControlStatsWithPlan(output, stats)
+                             : ControlStats(output, stats);
+      if(!valid)
         return "replayControlInvalidCheckpointStats";
     }
     else if(op == ReplayControlOperation::InvalidateCheckpoints)
@@ -690,11 +769,14 @@ ReplayCheckpointStats ReplayProxy::GetReplayCheckpointStats()
 {
   ReplayCheckpointStats stats;
   bytebuf response;
-  rdcstr error = ReplayControlRequest(ReplayControlOperation::CheckpointStats, bytebuf(), response);
+  // Capabilities were cached at proxy initialisation. Exactly one status request is needed;
+  // old peers return the original payload with the optional planning proof left unknown.
+  const ReplayControlOperation operation =
+      ControlStatsOperation(m_RemoteControlVersion, m_RemoteControlOperations);
+  rdcstr error = ReplayControlRequest(operation, bytebuf(), response);
   if(error.empty())
   {
-    ReadSerialiser ser(new StreamReader(response), Ownership::Stream);
-    if(!ControlStats(ser, stats) || !ControlPayloadFinished(ser))
+    if(!DecodeControlStats(operation, response, stats))
     {
       stats = ReplayCheckpointStats();
       error = "replayControlInvalidCheckpointStats";
@@ -3678,7 +3760,7 @@ struct ReplayControlTestDriver
   bool naturalReference = false;
   bool prefixOnly = false;
   bool rejectPatch = false;
-  uint32_t configurations = 0, invalidations = 0, clears = 0, patchCalls = 0;
+  uint32_t configurations = 0, invalidations = 0, clears = 0, patchCalls = 0, statsCalls = 0;
   uint32_t firstInvalidation = ~0U;
   uint32_t bufferPatchFirstAffected = 0;
   ReplayCheckpointConfig config;
@@ -3712,7 +3794,11 @@ struct ReplayControlTestDriver
     config = c;
     candidates = p;
   }
-  ReplayCheckpointStats GetReplayCheckpointStats() { return stats; }
+  ReplayCheckpointStats GetReplayCheckpointStats()
+  {
+    ++statsCalls;
+    return stats;
+  }
   void InvalidateReplayCheckpoints(uint32_t first)
   {
     ++invalidations;
@@ -3819,6 +3905,206 @@ TEST_CASE("Remote replay control validates version and complete payloads",
   invalidation.Serialise("firstAffectedEvent"_lit, first);
   REQUIRE(dispatch(ReplayControlOperation::InvalidateCheckpoints, ControlPayload(invalidation)).empty());
   CHECK(driver.firstInvalidation == 103);
+}
+
+TEST_CASE("Remote checkpoint planning preserves the legacy stats wire payload",
+          "[replay][proxy][checkpoint][plan]")
+{
+  ReplayControlTestDriver driver;
+  ReplayCheckpointStats &source = driver.stats;
+  source.supported = source.enabled = true;
+  source.checkpointCount = 2;
+  source.allocatedBytes = 0x0102030405060708ULL;
+  source.sharedBytes = 9;
+  source.builds = 10;
+  source.hits = 11;
+  source.misses = 12;
+  source.invalidations = 13;
+  source.rejected = 14;
+  source.lastResumeEvent = 3;
+  source.lastSaveEvent = 7;
+  source.events = {3, 7};
+  source.reason = "old";
+  const bytebuf legacy = {
+      0x01, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
+      0x01, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
+      0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x03,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6f, 0x6c, 0x64,
+  };
+  bytebuf response;
+  REQUIRE(DispatchReplayControl(&driver, 5, uint32_t(ReplayControlOperation::CheckpointStats), {},
+                                response)
+              .empty());
+  CHECK((response == legacy));
+  source.candidatePlanKnown = source.canTryOtherCandidates = true;
+  source.candidateEvents = {0, 31, 99};
+  REQUIRE(DispatchReplayControl(&driver, 5, uint32_t(ReplayControlOperation::CheckpointStats), {},
+                                response)
+              .empty());
+  CHECK((response == legacy));
+  ReplayCheckpointStats decoded = source;
+  REQUIRE(DecodeControlStats(ReplayControlOperation::CheckpointStats, response, decoded));
+  CHECK_FALSE(decoded.candidatePlanKnown);
+  CHECK_FALSE(decoded.canTryOtherCandidates);
+  CHECK(decoded.candidateEvents.empty());
+  CHECK(decoded.allocatedBytes == source.allocatedBytes);
+  CHECK((decoded.events == source.events));
+  CHECK(decoded.reason == source.reason);
+  CHECK(ReplayControlProtocolRevision == 5);
+  CHECK(uint32_t(ReplayControlOperation::CheckpointStats) == 2);
+}
+
+TEST_CASE("Remote checkpoint plans are negotiated and returned with one stats operation",
+          "[replay][proxy][checkpoint][plan]")
+{
+  const uint64_t legacyCapabilities = (1ULL << 5) - 1;
+  CHECK((ControlStatsOperation(1, legacyCapabilities) == ReplayControlOperation::CheckpointStats));
+  CHECK((ControlStatsOperation(0, ReplayControlOperations) ==
+         ReplayControlOperation::CheckpointStats));
+  CHECK((ControlStatsOperation(2, ReplayControlOperations) ==
+         ReplayControlOperation::CheckpointStats));
+  CHECK((ControlStatsOperation(1, ReplayControlOperations) ==
+         ReplayControlOperation::CheckpointStatsWithPlan));
+  ReplayControlTestDriver driver;
+  driver.stats.supported = driver.stats.enabled = driver.stats.hasInitialCheckpoint = true;
+  driver.stats.checkpointCount = 2;
+  driver.stats.events = {0, 31};
+  driver.stats.allocatedBytes = 4096;
+  driver.stats.candidatePlanKnown = driver.stats.canTryOtherCandidates = true;
+  driver.stats.candidateEvents = {0, 16, 31};
+  bytebuf response;
+  REQUIRE(DispatchReplayControl(&driver, 5, uint32_t(ReplayControlOperation::Capabilities), {},
+                                response)
+              .empty());
+  uint32_t version = 0;
+  uint64_t capabilities = 0;
+  ReadSerialiser capabilitiesReader(new StreamReader(response), Ownership::Stream);
+  capabilitiesReader.Serialise("version"_lit, version);
+  capabilitiesReader.Serialise("operations"_lit, capabilities);
+  REQUIRE(ControlPayloadFinished(capabilitiesReader));
+  REQUIRE((capabilities & (1ULL << uint32_t(ReplayControlOperation::CheckpointStatsWithPlan))) != 0);
+  CHECK(driver.statsCalls == 0);
+  const ReplayControlOperation operation = ControlStatsOperation(version, capabilities);
+  REQUIRE(DispatchReplayControl(&driver, 5, uint32_t(operation), {}, response).empty());
+  CHECK(driver.statsCalls == 1);
+  ReplayCheckpointStats decoded;
+  REQUIRE(DecodeControlStats(operation, response, decoded));
+  CHECK(decoded.candidatePlanKnown);
+  CHECK(decoded.canTryOtherCandidates);
+  CHECK((decoded.candidateEvents == driver.stats.candidateEvents));
+  CHECK((decoded.events == driver.stats.events));
+  CHECK(decoded.allocatedBytes == driver.stats.allocatedBytes);
+  CHECK_FALSE(DecodeControlStats(ReplayControlOperation::CheckpointStats, response, decoded));
+  CHECK_FALSE(decoded.candidatePlanKnown);
+
+  // A known empty plan is an explicit admission result, not an unsupported old peer.
+  driver.stats.candidateEvents.clear();
+  REQUIRE(DispatchReplayControl(&driver, 5, uint32_t(operation), {}, response).empty());
+  REQUIRE(DecodeControlStats(operation, response, decoded));
+  CHECK(decoded.candidatePlanKnown);
+  CHECK(decoded.canTryOtherCandidates);
+  CHECK(decoded.candidateEvents.empty());
+  driver.stats.candidatePlanKnown = driver.stats.canTryOtherCandidates = false;
+  REQUIRE(DispatchReplayControl(&driver, 5, uint32_t(operation), {}, response).empty());
+  REQUIRE(DecodeControlStats(operation, response, decoded));
+  CHECK_FALSE(decoded.candidatePlanKnown);
+  CHECK_FALSE(decoded.canTryOtherCandidates);
+  CHECK(decoded.candidateEvents.empty());
+
+  const uint32_t calls = driver.statsCalls;
+  CHECK_FALSE(DispatchReplayControl(&driver, 5, uint32_t(operation), {1}, response).empty());
+  CHECK(response.empty());
+  CHECK(driver.statsCalls == calls);
+  driver.version = 0;
+  CHECK_FALSE(DispatchReplayControl(&driver, 5, uint32_t(operation), {}, response).empty());
+  CHECK(response.empty());
+  CHECK(driver.statsCalls == calls);
+}
+
+TEST_CASE("Remote checkpoint plan decoding rejects incomplete and contradictory evidence",
+          "[replay][proxy][checkpoint][plan]")
+{
+  const ReplayControlOperation operation = ReplayControlOperation::CheckpointStatsWithPlan;
+  ReplayCheckpointStats source;
+  source.supported = true;
+  source.events = {0, 42};
+  source.checkpointCount = 2;
+  const auto payload = [&](uint32_t flags, uint32_t count, rdcarray<uint32_t> events) {
+    WriteSerialiser writer(new StreamWriter(1024), Ownership::Stream);
+    REQUIRE(ControlStats(writer, source));
+    writer.Serialise("planFlags"_lit, flags);
+    writer.Serialise("candidateCount"_lit, count);
+    for(uint32_t event : events)
+      writer.Serialise("candidateEventId"_lit, event);
+    return ControlPayload(writer);
+  };
+  const bytebuf valid = payload(3, 2, {0, 42});
+  bytebuf trailing = valid, truncated = valid;
+  trailing.push_back(0);
+  truncated.pop_back();
+  rdcarray<bytebuf> invalid = {payload(4, 0, {}),
+                               payload(2, 0, {}),
+                               payload(0, 1, {42}),
+                               payload(1, 4097, {}),
+                               payload(1, 2, {42}),
+                               payload(1, 2, {42, 42}),
+                               payload(1, 2, {43, 42}),
+                               trailing,
+                               truncated};
+  WriteSerialiser legacy(new StreamWriter(1024), Ownership::Stream);
+  REQUIRE(ControlStats(legacy, source));
+  invalid.push_back(ControlPayload(legacy));
+  for(const bytebuf &bytes : invalid)
+  {
+    ReplayCheckpointStats decoded;
+    REQUIRE(DecodeControlStats(operation, valid, decoded));
+    REQUIRE(decoded.candidatePlanKnown);
+    CHECK_FALSE(DecodeControlStats(operation, bytes, decoded));
+    CHECK_FALSE(decoded.supported);
+    CHECK_FALSE(decoded.candidatePlanKnown);
+    CHECK_FALSE(decoded.canTryOtherCandidates);
+    CHECK(decoded.candidateEvents.empty());
+    CHECK(decoded.events.empty());
+    CHECK(decoded.checkpointCount == 0);
+  }
+}
+
+TEST_CASE("Remote checkpoint plan encoding is bounded and leaves no partial response",
+          "[replay][proxy][checkpoint][plan]")
+{
+  ReplayControlTestDriver driver;
+  driver.stats.supported = driver.stats.candidatePlanKnown = true;
+  bytebuf response;
+  const auto dispatch = [&]() {
+    return DispatchReplayControl(
+        &driver, 5, uint32_t(ReplayControlOperation::CheckpointStatsWithPlan), {}, response);
+  };
+  for(uint32_t i = 0; i < 4096; ++i)
+    driver.stats.candidateEvents.push_back(i);
+  REQUIRE(dispatch().empty());
+  ReplayCheckpointStats decoded;
+  REQUIRE(DecodeControlStats(ReplayControlOperation::CheckpointStatsWithPlan, response, decoded));
+  CHECK(decoded.candidateEvents.size() == 4096);
+  driver.stats.candidateEvents.push_back(4096);
+  CHECK_FALSE(dispatch().empty());
+  CHECK(response.empty());
+  driver.stats.candidateEvents = {4, 4};
+  CHECK_FALSE(dispatch().empty());
+  CHECK(response.empty());
+  driver.stats.candidateEvents = {7, 4};
+  CHECK_FALSE(dispatch().empty());
+  CHECK(response.empty());
+  driver.stats.candidatePlanKnown = false;
+  driver.stats.candidateEvents = {4};
+  CHECK_FALSE(dispatch().empty());
+  CHECK(response.empty());
+  driver.stats.candidateEvents.clear();
+  driver.stats.canTryOtherCandidates = true;
+  CHECK_FALSE(dispatch().empty());
+  CHECK(response.empty());
 }
 
 TEST_CASE("Remote buffer patch replacement is bounded and atomic", "[replay][proxy][checkpoint]")

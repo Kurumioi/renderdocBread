@@ -33,7 +33,7 @@ Keep the early value constant and supply at least three distinct `--late-values`
 | Case | Required evidence |
 | --- | --- |
 | Two buffers, delta enabled | The unchanged early buffer remains patched; only the late buffer changes. Native `firstAffected` moves to `--expected-cutoff`. |
-| Same buffer, different offsets | Add `--same-buffer-ranges`. The early bound view must exclude the late scalar. A positive D3D11 result also requires `rangeIndexKnown=1`; resource-wide GL/Vulkan fallback is not a failed safety check. |
+| Same buffer, different offsets | Add `--same-buffer-ranges`. The early bound view must exclude the late scalar. Every supported API's positive result requires `rangeIndexKnown=1`. A conservative fallback may preserve correctness, but does not pass this optimization gate. |
 | Delta disabled control | Repeat in a fresh process with `--disable-delta`; native `firstAffected` must equal `--expected-disabled-cutoff`, normally the early consumer. Editing and image correctness must still pass. |
 
 The probe checks the actual `*BufferPatch op=set` timing record and controller
@@ -71,7 +71,7 @@ Both comparisons include full bound output bytes and the buffer window. This tes
 the native checked replacement transaction, **not the full Shader Workbench ABI
 gate**; that separate gate remains required for workbench acceptance.
 
-Windows D3D11/D3D12/OpenGL/Vulkan results establish four API paths on the tested
+Windows D3D11/D3D12/OpenGL/OpenGL ES/Vulkan results establish those API paths on the tested
 driver. They do not establish Linux/Android/other OS or vendor coverage. Keep capture,
 OS, GPU, driver, build receipt, and unsupported conservative paths in the report.
 
@@ -109,3 +109,32 @@ slider setter timings. Reference installs have separate `referenceGeneration` va
 compare their identical byte configurations with the saved immediate witnesses.
 GPU synchronization remains necessary before reusing upload storage, so allocation
 reuse alone cannot establish that total replay latency has become small.
+
+## GL/GLES compact upload reuse and captured CPU writes
+
+GL/GLES has its own independent upload control,
+`RENDERDOC_GL_DISABLE_BUFFER_PATCH_UPLOAD_REUSE=1`. Keep delta invalidation enabled
+in both processes. Add `--expect-upload-reuse compact` for the enabled run and
+`--expect-upload-reuse full` for the control; these gates reject missing or incorrect
+native copy evidence. For a stable two-scalar layout, the later setters in
+`eid_buffer_delta_profile.py` should report `uploadReused=1` and
+`uploadWrittenBytes=changedBytes`; the control should report `uploadReused=0`
+and the full active patch payload. These are upload-object writes, not all replay
+copies. Layout changes and undo may allocate a new compact upload. Compare both
+processes' immediate outputs and neighbor bytes with their forced references.
+
+Captured application CPU writes are a separate path from user parameter uploads.
+Capture the `D3D12_Buffer_CPU_Dirty_Ranges` fixture and discover its actual events
+and buffer with `discover_buffer_delta_fixture.py`. Run `eid_checkpoint_profile.py`
+with every fixture draw, `--steady-rounds 2`, and
+`--extra-buffer CPUWriteParameterBuffer`. This reads all bytes of the buffer as
+well as every bound output. Repeat with
+`RENDERDOC_D3D12_DISABLE_CPU_WRITE_DIRTY_RANGES=1` in a fresh process.
+
+Inspect `D3D12DirtyRestore` records in `steadyDisabled.replay`, where checkpoints
+are off but ordinary dirty restoration still runs. Exclude the first canonical
+restore after configuration. Require actual initial-copy reduction in the enabled
+case, equal full-buffer/output witnesses, and full-copy behavior in the control.
+`D3D12CPUWriteBaseline` diagnostics prove the loading-time comparison against
+original initial bytes; they alone do not prove a later copy was omitted. The
+comparison budget is bounded, and unknown/GPU-writable/aliased storage falls back.

@@ -50,10 +50,105 @@ RDOC_CONFIG(bool, OpenGL_HardwareCounters, true,
 
 static const char *SPIRVDisassemblyTarget = "SPIR-V (RenderDoc)";
 
-
-
 namespace
 {
+struct GLCheckpointMetadataBudget
+{
+  explicit GLCheckpointMetadataBudget(uint64_t budget)
+      : limit(RDCMIN<uint64_t>(budget, 64ULL * 1024 * 1024))
+  {
+  }
+  uint64_t bytes = 0;
+  const uint64_t limit;
+  bool Add(uint64_t count, uint64_t stride)
+  {
+    if(bytes > limit || (stride && count > (limit - bytes) / stride))
+    {
+      bytes = ~0ULL;
+      return false;
+    }
+    bytes += count * stride;
+    return true;
+  }
+};
+
+bool GLCheckpointUniformMetadata(GLCheckpointMetadataBudget &budget, int32_t block,
+                                 int32_t arraySize, int32_t nameLength)
+{
+  if(block >= 0)
+    return true;
+  // The existing uniform serializer uses a 1024-byte name buffer. Bound both its
+  // unrolled value array and all temporary/writer/final copies before entering it.
+  return arraySize >= 0 && nameLength > 0 && nameLength <= 1024 &&
+         (arraySize <= 1 || nameLength >= 4) && budget.Add(RDCMAX(1, arraySize), 2048);
+}
+
+bool GLCheckpointConstantMetadata(GLCheckpointMetadataBudget &budget, const ShaderConstant &var,
+                                  size_t parentLength, uint32_t depth)
+{
+  if(depth > 32 || var.name.empty() || var.name.size() > 1000 ||
+     parentLength > 1000 - var.name.size() || !budget.Add(1, 16384))
+    return false;
+  const size_t length = parentLength + var.name.size();
+  const uint32_t elements = RDCMAX(1U, var.type.elements);
+  if(var.type.members.empty())
+    return length < 1000 && budget.Add(elements, 2048);
+  // The general serializer expands struct arrays and constructs each nested name.
+  // Keep this optional preflight finite without allocating that expansion itself.
+  if(elements != 1 || length >= 1000)
+    return false;
+  for(const ShaderConstant &member : var.type.members)
+    if(!GLCheckpointConstantMetadata(budget, member, length + 1, depth + 1))
+      return false;
+  return true;
+}
+
+bool GLCheckpointProgramMetadata(GLCheckpointMetadataBudget &budget,
+                                 const PerStageReflections &stages, GLuint program)
+{
+  // Conservative charges cover the serializer's arrays, name strings, growing memory writer,
+  // final bytebuf, and SPIR-V unroll scratch simultaneously. No GPU storage is allocated here.
+  if(!budget.Add(1, 64 * 1024))
+    return false;
+  bool spirv = false;
+  for(size_t s = 0; s < NumShaderStages; s++)
+    spirv |= stages.refls[s] && stages.refls[s]->encoding == ShaderEncoding::OpenGLSPIRV;
+  if(spirv)
+  {
+    for(size_t s = 0; s < NumShaderStages; s++)
+      if(stages.refls[s])
+        for(const ConstantBlock &block : stages.refls[s]->constantBlocks)
+          if(!block.bufferBacked && block.byteSize > 0)
+            for(const ShaderConstant &var : block.variables)
+              if(!GLCheckpointConstantMetadata(budget, var, 0, 0))
+                return false;
+    return true;
+  }
+  GLint uniforms = 0;
+  GL.glGetProgramInterfaceiv(program, eGL_UNIFORM, eGL_ACTIVE_RESOURCES, &uniforms);
+  if(GL.glGetError() != eGL_NONE || uniforms < 0 || !budget.Add(uint64_t(uniforms), 16384))
+    return false;
+  const GLenum props[] = {eGL_BLOCK_INDEX, eGL_ARRAY_SIZE, eGL_NAME_LENGTH};
+  for(GLint i = 0; i < uniforms; i++)
+  {
+    GLint values[3] = {-1, -1, -1};
+    GL.glGetProgramResourceiv(program, eGL_UNIFORM, i, 3, props, 3, NULL, values);
+    if(GL.glGetError() != eGL_NONE ||
+       !GLCheckpointUniformMetadata(budget, values[0], values[1], values[2]))
+      return false;
+  }
+  for(GLenum type : {eGL_UNIFORM_BLOCK, eGL_SHADER_STORAGE_BLOCK})
+  {
+    if(type == eGL_SHADER_STORAGE_BLOCK && !HasExt[ARB_shader_storage_buffer_object])
+      continue;
+    GLint count = 0;
+    GL.glGetProgramInterfaceiv(program, type, eGL_ACTIVE_RESOURCES, &count);
+    if(GL.glGetError() != eGL_NONE || count < 0 || !budget.Add(uint64_t(count), 16384))
+      return false;
+  }
+  return true;
+}
+
 // GLInitialContents stores 8 colour attachments and 16 VAO attribute/buffer slots.
 // Inspect actual captured parameters, never reject a GPU merely for having higher limits.
 bool GLCheckpointObjectRangeUnsupported(const rdcstr &name, const SDObject &chunk)
@@ -104,21 +199,58 @@ bool GLCheckpointObjectRangeUnsupported(const rdcstr &name, const SDObject &chun
 
 bool GLCheckpointUnsupportedFrameCall(const rdcstr &name)
 {
-  if((name.beginsWith("glGen") && !name.beginsWith("glGenerate")) ||
-     name.beginsWith("glCreate") || name.beginsWith("glDelete"))
+  if((name.beginsWith("glGen") && !name.beginsWith("glGenerate")) || name.beginsWith("glCreate") ||
+     name.beginsWith("glDelete"))
     return true;
   // Object lifetime/storage, linked code, and hidden GPU execution state cannot be reconstructed
   // from the fixed-storage checkpoint below. Data uploads and ordinary state changes remain legal.
   const char *unsupported[] = {
-      "BufferData", "BufferStorage", "TexImage", "TextureImage", "TexStorage", "TextureStorage",
-      "CopyTexImage", "CopyTextureImage", "RenderbufferStorage", "TextureView", "PageCommitment",
-      "BeginQuery", "EndQuery", "QueryCounter", "QueryBufferObject", "ConditionalRender",
-      "TransformFeedback", "WaitSync", "FenceSync", "LinkProgram", "CompileShader",
-      "ShaderSource", "ShaderBinary", "ProgramBinary", "AttachShader", "DetachShader",
-      "SpecializeShader", "ProgramParameteri", "MakeTextureHandle", "MakeImageHandle",
-      "UniformHandle", "MemoryObject", "Semaphore", "MultisampleEXT", "MultiviewOVR",
-      "PerfQuery", "wglDX", "vrapi_", "FramebufferParameteri", "ParameterIiv", "ParameterIuiv",
-      "VertexAttribI1", "VertexAttribI2", "VertexAttribI3", "VertexAttribI4", "VertexAttribL",
+      "BufferData",
+      "BufferStorage",
+      "TexImage",
+      "TextureImage",
+      "TexStorage",
+      "TextureStorage",
+      "CopyTexImage",
+      "CopyTextureImage",
+      "RenderbufferStorage",
+      "TextureView",
+      "PageCommitment",
+      "BeginQuery",
+      "EndQuery",
+      "QueryCounter",
+      "QueryBufferObject",
+      "ConditionalRender",
+      "TransformFeedback",
+      "WaitSync",
+      "FenceSync",
+      "LinkProgram",
+      "CompileShader",
+      "ShaderSource",
+      "ShaderBinary",
+      "ProgramBinary",
+      "AttachShader",
+      "DetachShader",
+      "SpecializeShader",
+      "ProgramParameteri",
+      "MakeTextureHandle",
+      "MakeImageHandle",
+      "UniformHandle",
+      "MemoryObject",
+      "Semaphore",
+      "MultisampleEXT",
+      "MultiviewOVR",
+      "PerfQuery",
+      "wglDX",
+      "vrapi_",
+      "FramebufferParameteri",
+      "ParameterIiv",
+      "ParameterIuiv",
+      "VertexAttribI1",
+      "VertexAttribI2",
+      "VertexAttribI3",
+      "VertexAttribI4",
+      "VertexAttribL",
   };
   for(const char *unsafe : unsupported)
     if(name.contains(unsafe))
@@ -137,6 +269,25 @@ struct GLCheckpointBufferVersion
   {
     if(initial.resource.name)
       GL.glDeleteBuffers(1, &initial.resource.name);
+  }
+};
+
+struct GLCheckpointTextureVersion
+{
+  GLInitialContents initial;
+  GLResource source;
+  uint64_t bytes = 0;
+  GLenum target = eGL_NONE, format = eGL_NONE;
+  uint32_t width = 0, height = 0, depth = 0, mips = 0, samples = 0;
+  ~GLCheckpointTextureVersion()
+  {
+    if(initial.resource.name)
+    {
+      if(initial.resource.Namespace == eResRenderbuffer)
+        GL.glDeleteRenderbuffers(1, &initial.resource.name);
+      else
+        GL.glDeleteTextures(1, &initial.resource.name);
+    }
   }
 };
 
@@ -204,7 +355,8 @@ GLCheckpointBufferEffect GLCheckpointClassifyBufferEffect(GLChunk chunk)
     case GLChunk::glMultiDrawArraysIndirectCountARB:
     case GLChunk::glMultiDrawArraysIndirectCount:
     case GLChunk::glMultiDrawElementsIndirectCountARB:
-    case GLChunk::glMultiDrawElementsIndirectCount: return GLCheckpointBufferEffect::ShaderExecution;
+    case GLChunk::glMultiDrawElementsIndirectCount:
+      return GLCheckpointBufferEffect::ShaderExecution;
 
     // Explicitly audited buffer-content-preserving calls. In particular, glClearBufferfv is an
     // FBO operation; glClearBufferData/SubData are deliberately NOT in this list.
@@ -321,6 +473,169 @@ GLCheckpointBufferEffect GLCheckpointClassifyBufferEffect(GLChunk chunk)
   }
 }
 
+enum class GLCheckpointTextureEffect
+{
+  Unknown,
+  StateOnly,
+  Draw,
+  Dispatch,
+  BoundFramebuffer,
+  ExplicitDestination,
+};
+
+GLCheckpointTextureEffect GLCheckpointClassifyTextureEffect(GLChunk chunk)
+{
+  // The buffer whitelist contains clears, which are NOT texture-content-preserving calls.
+  switch(chunk)
+  {
+    case GLChunk::glActiveTexture:
+    case GLChunk::glActiveTextureARB:
+    case GLChunk::glTexParameteri:
+    case GLChunk::glTextureParameteri:
+    case GLChunk::glTextureParameteriEXT:
+    case GLChunk::glMultiTexParameteriEXT:
+    case GLChunk::glTexParameteriv:
+    case GLChunk::glTextureParameteriv:
+    case GLChunk::glTextureParameterivEXT:
+    case GLChunk::glMultiTexParameterivEXT:
+    case GLChunk::glTexParameterf:
+    case GLChunk::glTextureParameterf:
+    case GLChunk::glTextureParameterfEXT:
+    case GLChunk::glMultiTexParameterfEXT:
+    case GLChunk::glTexParameterfv:
+    case GLChunk::glTextureParameterfv:
+    case GLChunk::glTextureParameterfvEXT:
+    case GLChunk::glMultiTexParameterfvEXT: return GLCheckpointTextureEffect::StateOnly;
+    case GLChunk::glClear: return GLCheckpointTextureEffect::BoundFramebuffer;
+    case GLChunk::glClearBufferfv:
+    case GLChunk::glClearNamedFramebufferfv:
+    case GLChunk::glClearBufferiv:
+    case GLChunk::glClearNamedFramebufferiv:
+    case GLChunk::glClearBufferuiv:
+    case GLChunk::glClearNamedFramebufferuiv:
+    case GLChunk::glClearBufferfi:
+    case GLChunk::glClearNamedFramebufferfi:
+    case GLChunk::glBlitFramebuffer:
+    case GLChunk::glBlitFramebufferEXT:
+    case GLChunk::glBlitNamedFramebuffer:
+    case GLChunk::glCopyImageSubData:
+    case GLChunk::glCopyImageSubDataEXT:
+    case GLChunk::glCopyImageSubDataOES:
+    case GLChunk::glClearTexImage:
+    case GLChunk::glClearTexSubImage: return GLCheckpointTextureEffect::ExplicitDestination;
+    case GLChunk::glDispatchCompute:
+    case GLChunk::glDispatchComputeIndirect:
+    case GLChunk::glDispatchComputeGroupSizeARB: return GLCheckpointTextureEffect::Dispatch;
+    default: break;
+  }
+  const GLCheckpointBufferEffect buffer = GLCheckpointClassifyBufferEffect(chunk);
+  if(buffer == GLCheckpointBufferEffect::ShaderExecution)
+    return GLCheckpointTextureEffect::Draw;
+  // Explicit buffer copies cannot alias ordinary texture storage. Texture-buffer views own no
+  // image snapshot; external memory and texture views are excluded by the separate sharing gate.
+  if(buffer == GLCheckpointBufferEffect::StateOnly ||
+     buffer == GLCheckpointBufferEffect::ExplicitBufferWrite)
+    return GLCheckpointTextureEffect::StateOnly;
+  return GLCheckpointTextureEffect::Unknown;
+}
+
+uint64_t GLRenderbufferByteSize(uint32_t width, uint32_t height, uint32_t samples,
+                                GLenum internalFormat)
+{
+  if(!width || !height || !samples || internalFormat == eGL_NONE ||
+     IsCompressedFormat(internalFormat))
+    return 0;
+  const GLenum format = GetBaseFormat(internalFormat), type = GetDataType(internalFormat);
+  if(format == eGL_NONE || type == eGL_NONE)
+    return 0;
+  // Packed depth/stencil and packed colour formats deliberately have compByteWidth == 0.
+  // Use their native pixel representation, then perform all dimensional products in 64 bits.
+  uint64_t bytes = uint64_t(GetByteSize(1, 1, 1, format, type));
+  for(uint32_t factor : {width, height, samples})
+  {
+    if(bytes > ~uint64_t(0) / factor)
+      return 0;
+    bytes *= factor;
+  }
+  return bytes;
+}
+
+bool GLCheckpointTextureShapeMatches(const GLCheckpointTextureVersion &version,
+                                     const GLResource &source, uint64_t bytes, GLenum target,
+                                     GLenum format, const TextureDescription &texture)
+{
+  return version.source == source && version.bytes == bytes && version.target == target &&
+         version.format == format && version.width == texture.width &&
+         version.height == texture.height && version.depth == texture.depth &&
+         version.mips == texture.mips && version.samples == texture.msSamp;
+}
+
+template <typename Query, typename Resolve>
+bool GLCheckpointFramebufferWriteSet(GLint maximum, Query query, Resolve resolve,
+                                     rdcarray<ResourceId> &writes)
+{
+  if(maximum <= 0 || maximum > 256)
+    return false;
+  for(GLint index = 0; index < maximum + 2; ++index)
+  {
+    const GLenum attachment = index < maximum    ? GLenum(eGL_COLOR_ATTACHMENT0 + index)
+                              : index == maximum ? eGL_DEPTH_ATTACHMENT
+                                                 : eGL_STENCIL_ATTACHMENT;
+    GLint type = 0, name = 0;
+    if(!query(attachment, eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, type))
+      return false;
+    if(type == eGL_NONE)
+      continue;
+    if(!query(attachment, eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, name) || !name ||
+       (type != eGL_TEXTURE && type != eGL_RENDERBUFFER))
+      return false;
+    ResourceId id = resolve(GLenum(type), GLuint(name));
+    if(id == ResourceId())
+      return false;
+    if(!writes.contains(id))
+      writes.push_back(id);
+  }
+  return true;
+}
+
+void GLCheckpointApplyTextureWrites(
+    bool complete, const rdcarray<ResourceId> &writes,
+    std::map<ResourceId, std::weak_ptr<GLCheckpointTextureVersion>> &versions)
+{
+  if(!complete)
+    versions.clear();
+  else
+    for(ResourceId id : writes)
+      versions.erase(id);
+}
+
+bool GLCheckpointTextureResident(const std::weak_ptr<GLCheckpointTextureVersion> &resident,
+                                 const std::shared_ptr<GLCheckpointTextureVersion> &target)
+{
+  return target && resident.lock() == target;
+}
+
+GLInitialContents GLCheckpointTextureRestoreState(const GLInitialContents &state,
+                                                  GLResource contents, bool resident)
+{
+  GLInitialContents result = state;
+  result.resource = resident ? GLResource(MakeNullResource) : contents;
+  return result;
+}
+
+struct GLCheckpointTextureAccounting
+{
+  std::set<const GLCheckpointTextureVersion *> versions;
+  uint64_t allocated = 0, shared = 0;
+  void Add(const GLCheckpointTextureVersion *version)
+  {
+    if(versions.insert(version).second)
+      allocated += sizeof(GLCheckpointTextureVersion) + version->bytes;
+    else
+      shared += version->bytes;
+  }
+};
+
 // The callback queries the COMPLETE native slot range, not GLRenderState's fixed arrays or a
 // reflection's used bindings. Any uncertainty discards sharing, including a bound image that
 // could alias a buffer through a texture-buffer view.
@@ -386,7 +701,8 @@ bool GLCheckpointContentEvidenceComplete(GLChunk chunk)
   // excluded below, including unused bindings a replacement shader could start accessing.
   const GLCheckpointBufferEffect effect = GLCheckpointClassifyBufferEffect(chunk);
   return effect == GLCheckpointBufferEffect::StateOnly ||
-         effect == GLCheckpointBufferEffect::ShaderExecution;
+         effect == GLCheckpointBufferEffect::ShaderExecution ||
+         effect == GLCheckpointBufferEffect::ExplicitBufferWrite;
 }
 
 bool GLCheckpointShareOriginalContents(bool completeEvidence, bool potentialWrite,
@@ -411,6 +727,7 @@ struct GLReplay::ReplayCheckpoint
     GLResource live;
     GLInitialContents initial;
     std::shared_ptr<GLCheckpointBufferVersion> bufferVersion;
+    std::shared_ptr<GLCheckpointTextureVersion> textureVersion;
     bytebuf uniforms;
     uint64_t bytes = 0;
     uint32_t width = 0, height = 0;
@@ -457,6 +774,183 @@ void GLReplay::ResetCheckpointBufferLineage()
   m_CheckpointBufferVersions.clear();
 }
 
+void GLReplay::ResetCheckpointTextureLineage()
+{
+  m_CheckpointTextureVersions.clear();
+  m_CheckpointTexturePendingTarget = 0;
+}
+
+void GLReplay::ResetCheckpointTextureTracking()
+{
+  ResetCheckpointTextureLineage();
+  m_CheckpointTextureWrites.clear();
+  m_CheckpointTextureWriteResources = 0;
+  m_CheckpointTextureWriteOverflow = false;
+  m_CheckpointTextureBindingEdited = false;
+  m_CheckpointTextureSharingScanned = m_CheckpointTextureSharingSafe = false;
+}
+
+bool GLReplay::QueryCheckpointFramebufferWrites(GLuint framebuffer, rdcarray<ResourceId> &writes)
+{
+  if(!framebuffer || !GL.glGetNamedFramebufferAttachmentParameterivEXT)
+    return false;
+  GLint maximum = 0;
+  GL.glGetIntegerv(eGL_MAX_COLOR_ATTACHMENTS, &maximum);
+  return GLCheckpointFramebufferWriteSet(
+      maximum,
+      [framebuffer](GLenum attachment, GLenum parameter, GLint &value) {
+        GL.glGetNamedFramebufferAttachmentParameterivEXT(framebuffer, attachment, parameter, &value);
+        return true;
+      },
+      [this](GLenum type, GLuint name) {
+        const GLResource resource = type == eGL_TEXTURE ? TextureRes(m_pDriver->GetCtx(), name)
+                                                        : RenderbufferRes(m_pDriver->GetCtx(), name);
+        return m_pDriver->GetResourceManager()->GetResID(resource);
+      },
+      writes);
+}
+
+void GLReplay::RecordCheckpointTextureWrite(const GLResource &resource)
+{
+  auto found = m_CheckpointTextureWrites.find(m_pDriver->m_CurChunkOffset);
+  if(found == m_CheckpointTextureWrites.end() || m_CheckpointTextureWriteOverflow)
+    return;
+  TextureWriteRecord &record = found->second;
+  if(GL.glGetError() != eGL_NONE)
+    return;
+  if(resource.Namespace == eResFramebuffer)
+    record.complete = QueryCheckpointFramebufferWrites(resource.name, record.writes);
+  else if(resource.Namespace == eResTexture || resource.Namespace == eResRenderbuffer)
+  {
+    ResourceId id = m_pDriver->GetResourceManager()->GetResID(resource);
+    record.complete = id != ResourceId();
+    if(record.complete)
+      record.writes.push_back(id);
+  }
+  record.complete &= GL.glGetError() == eGL_NONE;
+  m_CheckpointTextureWriteResources += record.writes.size();
+  if(m_CheckpointTextureWriteResources > 1024 * 1024)
+  {
+    m_CheckpointTextureWrites.clear();
+    m_CheckpointTextureWriteOverflow = true;
+  }
+}
+
+void GLReplay::TrackCheckpointTextureWrites(GLChunk chunk)
+{
+  const GLCheckpointTextureEffect effect = GLCheckpointClassifyTextureEffect(chunk);
+  if(IsLoading(m_pDriver->m_State))
+  {
+    if(effect == GLCheckpointTextureEffect::StateOnly ||
+       effect == GLCheckpointTextureEffect::Unknown || m_CheckpointTextureWriteOverflow)
+      return;
+    if(m_CheckpointTextureWrites.size() >= 262144)
+    {
+      m_CheckpointTextureWrites.clear();
+      m_CheckpointTextureWriteOverflow = true;
+      return;
+    }
+    TextureWriteRecord &record = m_CheckpointTextureWrites[m_pDriver->m_CurChunkOffset];
+    record.chunk = uint32_t(chunk);
+    // DSA clear/copy serialisers provide their resolved destination after deserialisation. An
+    // absent callback leaves this record incomplete, never an empty set of possible writes.
+    if(effect == GLCheckpointTextureEffect::ExplicitDestination || GL.glGetError() != eGL_NONE)
+      return;
+    record.complete = true;
+    if(effect != GLCheckpointTextureEffect::Dispatch)
+    {
+      GLint framebuffer = 0;
+      GL.glGetIntegerv(eGL_DRAW_FRAMEBUFFER_BINDING, &framebuffer);
+      record.complete = QueryCheckpointFramebufferWrites(GLuint(framebuffer), record.writes);
+    }
+    if(effect != GLCheckpointTextureEffect::BoundFramebuffer && HasExt[ARB_shader_image_load_store])
+    {
+      GLint maximum = 0;
+      GL.glGetIntegerv(eGL_MAX_IMAGE_UNITS, &maximum);
+      if(!GL.glGetIntegeri_v || maximum <= 0 || maximum > 65536)
+        record.complete = false;
+      else
+        for(GLint slot = 0; slot < maximum; ++slot)
+        {
+          GLint name = 0;
+          GL.glGetIntegeri_v(eGL_IMAGE_BINDING_NAME, GLuint(slot), &name);
+          if(!name)
+            continue;
+          ResourceId id = m_pDriver->GetResourceManager()->GetResID(
+              TextureRes(m_pDriver->GetCtx(), GLuint(name)));
+          record.complete &= id != ResourceId();
+          if(!record.writes.contains(id))
+            record.writes.push_back(id);
+        }
+    }
+    record.complete &= GL.glGetError() == eGL_NONE;
+    m_CheckpointTextureWriteResources += record.writes.size();
+    if(m_CheckpointTextureWriteResources > 1024 * 1024)
+    {
+      m_CheckpointTextureWrites.clear();
+      m_CheckpointTextureWriteOverflow = true;
+    }
+    return;
+  }
+  if(!IsActiveReplaying(m_pDriver->m_State) || m_CheckpointTextureVersions.empty())
+    return;
+  if(!m_CheckpointTextureReplayManaged || m_ReplayCheckpointBypass || m_pDriver->m_FetchCounters ||
+     m_pDriver->m_ActiveFeedback || m_pDriver->m_ActiveConditional)
+  {
+    ResetCheckpointTextureLineage();
+    return;
+  }
+  if(effect == GLCheckpointTextureEffect::StateOnly)
+    return;
+  const auto found = m_CheckpointTextureWrites.find(m_pDriver->m_CurChunkOffset);
+  if(effect == GLCheckpointTextureEffect::Unknown || m_CheckpointTextureWriteOverflow ||
+     found == m_CheckpointTextureWrites.end() || !found->second.complete ||
+     found->second.chunk != uint32_t(chunk))
+  {
+    GLCheckpointApplyTextureWrites(false, {}, m_CheckpointTextureVersions);
+    m_CheckpointTexturePendingTarget = 0;
+    return;
+  }
+  // The index records complete native bindings, including unused image units, all colour
+  // attachments, and depth/stencil. Neither captured reflection nor write masks narrow it.
+  GLCheckpointApplyTextureWrites(true, found->second.writes, m_CheckpointTextureVersions);
+}
+
+bool GLReplay::PrepareCheckpointTextureSharing()
+{
+  if(m_CheckpointTextureBindingEdited ||
+     Process::GetEnvVariable("RENDERDOC_GL_DISABLE_CHECKPOINT_TEXTURE_VERSIONS") == "1")
+    return false;
+  if(m_CheckpointTextureSharingScanned)
+    return m_CheckpointTextureSharingSafe;
+  m_CheckpointTextureSharingScanned = true;
+  if(m_CheckpointTextureWriteOverflow || !PrepareReplayCheckpoints())
+    return false;
+  // A view may write its parent under another name. Keep the original full-image path until a
+  // complete storage-owner graph exists. Replay-only display/copy resources are not capture assets.
+  for(const auto &entry : m_pDriver->m_Textures)
+    if((!ResourceIDGen::IsReplayOnlyID(entry.first) ||
+        (entry.second.creationFlags & TextureCategory::SwapBuffer)) &&
+       entry.second.view)
+      return false;
+  SDFile *file = GetStructuredFile();
+  if(!file)
+    return false;
+  for(const SDChunk *chunk : file->chunks)
+  {
+    const rdcstr name = m_pDriver->GetChunkName(chunk->metadata.chunkID);
+    // Include capture-begin setup: automatic multisample resolves, bindless and external storage
+    // can affect bytes outside the draw's ordinary attachment/image binding set.
+    for(const char *unsafe :
+        {"TextureHandle", "ImageHandle", "UniformHandle", "PageCommitment", "MemoryObject",
+         "Semaphore", "EGLImage", "MultisampleEXT", "MultiviewOVR", "wglDX"})
+      if(name.contains(unsafe))
+        return false;
+  }
+  m_CheckpointTextureSharingSafe = true;
+  return true;
+}
+
 void GLReplay::InvalidateCheckpointBufferVersion(const GLResource &buffer)
 {
   m_CheckpointBufferVersions.erase(m_pDriver->GetResourceManager()->GetID(buffer));
@@ -496,8 +990,8 @@ void GLReplay::TrackCheckpointBufferWrites(GLChunk chunk)
     ResetCheckpointBufferLineage();
 }
 
-void GLReplay::ConfigureReplayCheckpoints(
-    const ReplayCheckpointConfig &config, const rdcarray<ReplayCheckpointCandidate> &candidates)
+void GLReplay::ConfigureReplayCheckpoints(const ReplayCheckpointConfig &config,
+                                          const rdcarray<ReplayCheckpointCandidate> &candidates)
 {
   MakeCurrentReplayContext(&m_ReplayCtx);
   ResetCheckpointBufferLineage();
@@ -539,6 +1033,7 @@ void GLReplay::InvalidateReplayCheckpoints(uint32_t firstAffectedEvent)
   // Value-only edits can retain a pre-consumer prefix, but every subsequent save must classify
   // the new edit table again. Set/clear and shader/resource replacement use this same reset.
   m_CheckpointStaticResources.clear();
+  m_CheckpointTextureSharingScanned = m_CheckpointTextureSharingSafe = false;
   for(auto it = m_Checkpoints.begin(); it != m_Checkpoints.end();)
   {
     if(firstAffectedEvent && it->first < firstAffectedEvent)
@@ -565,6 +1060,7 @@ void GLReplay::UpdateCheckpointAccounting()
 uint64_t GLReplay::CheckpointStorageBytes(const ReplayCheckpoint *building, uint64_t &sharedBytes) const
 {
   GLCheckpointBufferAccounting buffers;
+  GLCheckpointTextureAccounting textures;
   uint64_t bytes = 0, staticBytes = 0;
   const auto account = [&](const ReplayCheckpoint &checkpoint) {
     bytes += checkpoint.bytes;
@@ -572,6 +1068,8 @@ uint64_t GLReplay::CheckpointStorageBytes(const ReplayCheckpoint *building, uint
     {
       if(resource.bufferVersion)
         buffers.Add(resource.bufferVersion.get());
+      if(resource.textureVersion)
+        textures.Add(resource.textureVersion.get());
       if(resource.sharedContents)
         staticBytes += resource.bytes;
     }
@@ -580,8 +1078,8 @@ uint64_t GLReplay::CheckpointStorageBytes(const ReplayCheckpoint *building, uint
     account(*entry.second);
   if(building)
     account(*building);
-  sharedBytes = buffers.shared + staticBytes;
-  return bytes + buffers.allocated;
+  sharedBytes = buffers.shared + staticBytes + textures.shared;
+  return bytes + buffers.allocated + textures.allocated;
 }
 
 ReplayCheckpointStats GLReplay::GetReplayCheckpointStats()
@@ -612,9 +1110,18 @@ bool GLReplay::PrepareReplayCheckpoints()
     m_CheckpointPreparingFailed = true;
     return false;
   };
+  GLCheckpointMetadataBudget metadata(m_CheckpointConfig.byteBudget);
+  const uint64_t recordBytes = 2 * sizeof(ReplayCheckpoint::Resource) + sizeof(GLResource) +
+                               sizeof(TextureDescription) + sizeof(GLCheckpointBufferVersion) +
+                               sizeof(GLCheckpointTextureVersion) + 512;
+  if(!metadata.Add(1, sizeof(ReplayCheckpoint) + 4096) ||
+     !metadata.Add(m_Resources.size(), recordBytes) ||
+     !metadata.Add(m_pDriver->m_Textures.size(), recordBytes) || !metadata.Add(5, recordBytes))
+    return reject("OpenGL checkpoint metadata exceeds its bounded allocation budget");
   if(m_Proxy || !HasExt[ARB_copy_image] || !GL.glCopyImageSubData ||
      VendorCheck[VendorCheck_Qualcomm_avoid_glCopyImageSubData])
-    return reject("OpenGL checkpoint resource copies require a reliable local copy-image implementation");
+    return reject(
+        "OpenGL checkpoint resource copies require a reliable local copy-image implementation");
   SDFile *file = GetStructuredFile();
   if(!file)
     return reject("OpenGL checkpoint safety scan requires structured capture chunks");
@@ -661,15 +1168,16 @@ bool GLReplay::PrepareReplayCheckpoints()
        !(entry.second.creationFlags & TextureCategory::SwapBuffer))
       continue;
     const WrappedOpenGL::TextureData &tex = entry.second;
-    if(tex.internalFormat == eGL_DEPTH32F_STENCIL8 &&
-       VendorCheck[VendorCheck_NV_avoid_D32S8_copy])
+    if(tex.internalFormat == eGL_DEPTH32F_STENCIL8 && VendorCheck[VendorCheck_NV_avoid_D32S8_copy])
       return reject("OpenGL checkpoint cannot safely copy this driver's D32F_S8 texture");
     if(IsCompressedFormat(tex.internalFormat) &&
        (IsGLES || VendorCheck[VendorCheck_AMD_copy_compressed_tinymips] ||
         (tex.curType == eGL_TEXTURE_CUBE_MAP && VendorCheck[VendorCheck_AMD_copy_compressed_cubemaps])))
-      return reject("OpenGL compressed checkpoint resource needs an unsupported driver copy workaround");
+      return reject(
+          "OpenGL compressed checkpoint resource needs an unsupported driver copy workaround");
   }
-  PrepareCheckpointStaticResources(completeContentEvidence &&
+  PrepareCheckpointStaticResources(
+      completeContentEvidence && m_pDriver->m_ReplayCheckpointBufferWrites.complete &&
       Process::GetEnvVariable("RENDERDOC_GL_DISABLE_STATIC_CHECKPOINT_SHARING") != "1");
   m_CheckpointPrepared = true;
   m_CheckpointStats.reason.clear();
@@ -720,9 +1228,11 @@ void GLReplay::PrepareCheckpointStaticResources(bool completeContentEvidence)
     {
       auto info = m_pDriver->m_Buffers.find(id);
       if(info != m_pDriver->m_Buffers.end() &&
-         GLCheckpointShareOriginalContents(true,
+         GLCheckpointShareOriginalContents(
+             true,
              info->second.replayPatchUnsafe ||
-                 bool(info->second.creationFlags & BufferCategory::ReadWrite),
+                 bool(info->second.creationFlags & BufferCategory::ReadWrite) ||
+                 m_pDriver->m_ReplayCheckpointBufferWrites.buffers.count(id) != 0,
              aliasedBuffers.count(id) != 0, editedBuffers.count(description.resourceId) != 0))
         m_CheckpointStaticResources.insert(id);
     }
@@ -730,12 +1240,14 @@ void GLReplay::PrepareCheckpointStaticResources(bool completeContentEvidence)
     {
       auto info = m_pDriver->m_Textures.find(id);
       if(info != m_pDriver->m_Textures.end() &&
-         GLCheckpointShareOriginalContents(true,
-             bool(info->second.creationFlags & (TextureCategory::ColorTarget |
-                 TextureCategory::DepthTarget | TextureCategory::ShaderReadWrite |
-                 TextureCategory::SwapBuffer)) || attachedTextures.count(id) != 0,
-             textureAliases || missingInitialAttachments ||
-                 info->second.curType == eGL_TEXTURE_BUFFER, false))
+         GLCheckpointShareOriginalContents(
+             true,
+             bool(info->second.creationFlags &
+                  (TextureCategory::ColorTarget | TextureCategory::DepthTarget |
+                   TextureCategory::ShaderReadWrite | TextureCategory::SwapBuffer)) ||
+                 attachedTextures.count(id) != 0,
+             textureAliases || missingInitialAttachments || info->second.curType == eGL_TEXTURE_BUFFER,
+             false))
         m_CheckpointStaticResources.insert(id);
     }
   }
@@ -746,7 +1258,7 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
   if(m_ReplayCheckpointPrefixOnly && !m_pDriver->m_ReplayBufferPatches.empty() &&
      (m_ReplayPatchAnchorEvent == 0 || eventId != m_ReplayPatchAnchorEvent))
     return false;
-  if(m_ReplayCheckpointBypass || !m_CheckpointStats.enabled || !PrepareReplayCheckpoints() ||
+  if(m_ReplayCheckpointBypass || !m_CheckpointStats.enabled ||
      m_Checkpoints.find(eventId) != m_Checkpoints.end() || m_pDriver->m_ActiveConditional ||
      m_pDriver->m_ActiveFeedback || m_pDriver->m_FetchCounters)
     return false;
@@ -757,6 +1269,25 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
   const bool checkpointTiming = Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1";
   PerformanceTimer checkpointTimer;
   GLResourceManager *manager = m_pDriver->GetResourceManager();
+  GLCheckpointMetadataBudget metadata(m_CheckpointConfig.byteBudget);
+  const uint64_t perResourceMetadata =
+      2 * sizeof(ReplayCheckpoint::Resource) + sizeof(GLResource) + sizeof(TextureDescription) +
+      sizeof(GLCheckpointBufferVersion) + sizeof(GLCheckpointTextureVersion) + 512;
+  // Cover vector growth, deduplication/accounting nodes, and GetTextures' temporary array before
+  // constructing them. The texture map is an upper bound on replay-created attachments too.
+  if(!metadata.Add(1, sizeof(ReplayCheckpoint) + 4096) ||
+     !metadata.Add(m_Resources.size(), perResourceMetadata) ||
+     !metadata.Add(m_pDriver->m_Textures.size(), perResourceMetadata) ||
+     !metadata.Add(5, perResourceMetadata))
+  {
+    m_CheckpointStats.rejected++;
+    m_CheckpointStats.reason = "OpenGL checkpoint metadata exceeds its bounded allocation budget";
+    return false;
+  }
+  if(!PrepareReplayCheckpoints())
+    return false;
+  const bool textureSharing = m_CheckpointTextureReplayManaged && PrepareCheckpointTextureSharing();
+  uint64_t textureCopyBytes = 0, textureSharedBytes = 0;
   std::unique_ptr<ReplayCheckpoint> checkpoint(new ReplayCheckpoint());
   checkpoint->eventId = eventId;
   checkpoint->state.FetchState(m_pDriver);
@@ -812,14 +1343,15 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
   }
   auto reject = [&](const rdcstr &reason) {
     ResetCheckpointBufferLineage();
+    ResetCheckpointTextureLineage();
     ApplyCheckpointBindings(*checkpoint);
     m_CheckpointStats.rejected++;
     m_CheckpointStats.reason = reason;
     return false;
   };
   // Preflight before GPU allocations. Proven static contents need no copy. Mutable buffer
-  // versions can be shared only along this execution's successful restore/save lineage;
-  // mutable textures remain full copies.
+  // versions can be shared only along a successful native restore/save lineage. Texture content
+  // versions are separate from per-checkpoint sampler/object state.
   for(ReplayCheckpoint::Resource &res : checkpoint->resources)
   {
     if(res.live.Namespace == eResBuffer)
@@ -854,10 +1386,39 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
       if(details == m_pDriver->m_Textures.end())
         return reject("OpenGL checkpoint texture metadata is unavailable");
       if(details->second.view || details->second.curType == eGL_TEXTURE_BUFFER)
-        res.bytes = 0;    // Contents are owned by another buffer/texture, object state is saved below.
+        res.bytes =
+            0;    // Contents are owned by another buffer/texture, object state is saved below.
       if(details->second.internalFormat != eGL_NONE && !details->second.view &&
          details->second.curType != eGL_TEXTURE_BUFFER && !res.bytes)
         return reject("OpenGL checkpoint texture byte size is unavailable");
+      if(textureSharing && !res.sharedContents && res.bytes)
+      {
+        auto previous = m_CheckpointTextureVersions.find(manager->GetID(res.live));
+        if(previous != m_CheckpointTextureVersions.end())
+          res.textureVersion = previous->second.lock();
+        if(res.textureVersion && !GLCheckpointTextureShapeMatches(
+                                     *res.textureVersion, res.live, res.bytes,
+                                     details->second.curType, details->second.internalFormat, tex))
+          res.textureVersion.reset();
+        if(res.textureVersion)
+          textureSharedBytes += res.bytes;
+        else
+        {
+          res.textureVersion = std::make_shared<GLCheckpointTextureVersion>();
+          res.textureVersion->source = res.live;
+          res.textureVersion->bytes = res.bytes;
+          res.textureVersion->target = details->second.curType;
+          res.textureVersion->format = details->second.internalFormat;
+          res.textureVersion->width = tex.width;
+          res.textureVersion->height = tex.height;
+          res.textureVersion->depth = tex.depth;
+          res.textureVersion->mips = tex.mips;
+          res.textureVersion->samples = tex.msSamp;
+          textureCopyBytes += res.bytes;
+        }
+      }
+      else if(!res.sharedContents)
+        textureCopyBytes += res.bytes;
     }
     else if(res.live.Namespace == eResProgram)
     {
@@ -867,8 +1428,13 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
       {
         PerStageReflections stages;
         m_pDriver->FillReflectionArray(manager->GetID(res.live), stages);
+        if(!GLCheckpointProgramMetadata(metadata, stages, res.live.name))
+          return reject("OpenGL checkpoint uniform metadata exceeds its bounded allocation budget");
         WriteSerialiser ser(new StreamWriter(4096), Ownership::Stream);
         SerialiseProgramUniforms(ser, CaptureState::ActiveCapturing, stages, res.live.name, NULL);
+        if(ser.IsErrored() || ser.GetWriter()->GetOffset() > metadata.limit)
+          return reject(
+              "OpenGL checkpoint uniform serialization exceeded its bounded allocation budget");
         res.uniforms.assign(ser.GetWriter()->GetData(), (size_t)ser.GetWriter()->GetOffset());
         res.bytes = res.uniforms.size();
       }
@@ -958,10 +1524,14 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
       ++checkpoint->staticResources;
       checkpoint->staticBytes += res.bytes;
     }
-    checkpoint->bytes += sizeof(ReplayCheckpoint::Resource) +
-                         (res.bufferVersion || res.sharedContents ? 0 : res.bytes);
-    if(checkpoint->bytes > m_CheckpointConfig.byteBudget)
+    const uint64_t contentBytes =
+        res.bufferVersion || res.textureVersion || res.sharedContents ? 0 : res.bytes;
+    if(checkpoint->bytes > m_CheckpointConfig.byteBudget ||
+       sizeof(ReplayCheckpoint::Resource) > m_CheckpointConfig.byteBudget - checkpoint->bytes ||
+       contentBytes >
+           m_CheckpointConfig.byteBudget - checkpoint->bytes - sizeof(ReplayCheckpoint::Resource))
       return reject("OpenGL checkpoint working set exceeds its byte budget");
+    checkpoint->bytes += sizeof(ReplayCheckpoint::Resource) + contentBytes;
   }
   ApplyCheckpointBindings(*checkpoint);
   // Include the candidate's strong references while evicting. A reused version can survive its
@@ -995,7 +1565,7 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
       if(!res.bufferVersion->initial.resource.name)
         return reject("OpenGL checkpoint buffer copy allocation failed");
     }
-    else if(res.renderbuffer)
+    else if(res.renderbuffer && !(res.textureVersion && res.textureVersion->initial.resource.name))
     {
       GLint width = 0, height = 0, format = 0, samples = 0, old = 0;
       GL.glGetIntegerv(eGL_RENDERBUFFER_BINDING, &old);
@@ -1010,12 +1580,21 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
       GL.glRenderbufferStorageMultisample(eGL_RENDERBUFFER, samples, GLenum(format), width, height);
       GL.glBindRenderbuffer(eGL_RENDERBUFFER, old);
       res.initial.resource = GLResource(res.live.ContextShareGroup, eResRenderbuffer, copy);
-      GL.glCopyImageSubData(res.live.name, eGL_RENDERBUFFER, 0, 0, 0, 0,
-                            copy, eGL_RENDERBUFFER, 0, 0, 0, 0, width, height, 1);
+      GL.glCopyImageSubData(res.live.name, eGL_RENDERBUFFER, 0, 0, 0, 0, copy, eGL_RENDERBUFFER, 0,
+                            0, 0, 0, width, height, 1);
     }
-    else if(res.live.Namespace != eResProgram)
+    else if(res.live.Namespace != eResProgram && !res.renderbuffer)
     {
-      manager->ContextPrepare_InitialState(res.live, &res.initial, !res.sharedContents);
+      manager->ContextPrepare_InitialState(
+          res.live, &res.initial,
+          !res.sharedContents && !(res.textureVersion && res.textureVersion->initial.resource.name));
+    }
+    if(res.textureVersion && !res.textureVersion->initial.resource.name)
+    {
+      res.textureVersion->initial = res.initial;
+      res.initial.resource = GLResource(MakeNullResource);
+      if(!res.textureVersion->initial.resource.name)
+        return reject("OpenGL checkpoint texture copy allocation failed");
     }
     if(GL.glGetError() != eGL_NONE)
       return reject("OpenGL checkpoint resource copy or state capture failed");
@@ -1025,9 +1604,14 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
   if(GL.glGetError() != eGL_NONE)
     return reject("OpenGL checkpoint state reapplication failed");
   ResetCheckpointBufferLineage();
+  ResetCheckpointTextureLineage();
   for(const ReplayCheckpoint::Resource &res : checkpoint->resources)
+  {
     if(res.bufferVersion)
       m_CheckpointBufferVersions[manager->GetID(res.live)] = res.bufferVersion;
+    if(res.textureVersion)
+      m_CheckpointTextureVersions[manager->GetID(res.live)] = res.textureVersion;
+  }
   checkpoint->lastUsed = ++m_CheckpointUseSerial;
   const uint32_t staticResources = checkpoint->staticResources;
   const uint64_t staticBytes = checkpoint->staticBytes;
@@ -1040,13 +1624,16 @@ bool GLReplay::SaveReplayCheckpoint(uint32_t eventId)
   {
     const double totalMS = checkpointTimer.GetMilliseconds();
     const rdcstr line = StringFormat::Fmt(
-        "api=OpenGLCheckpoint op=save event=%u attempt=successful prepare_ms=%.3f resource_copy_ms=%.3f "
+        "api=OpenGLCheckpoint op=save event=%u attempt=successful prepare_ms=%.3f "
+        "resource_copy_ms=%.3f "
         "bind_finalize_ms=%.3f total_ms=%.3f allocatedBytes=%llu sharedBytes=%llu "
-        "sharedStaticResources=%u sharedStaticBytes=%llu", eventId,
-        checkpointPrepareMS, checkpointCopyMS - checkpointPrepareMS, totalMS - checkpointCopyMS,
-        totalMS, (unsigned long long)m_CheckpointStats.allocatedBytes,
+        "sharedStaticResources=%u sharedStaticBytes=%llu textureVersions=%u "
+        "textureCopyBytes=%llu textureSharedBytes=%llu",
+        eventId, checkpointPrepareMS, checkpointCopyMS - checkpointPrepareMS,
+        totalMS - checkpointCopyMS, totalMS, (unsigned long long)m_CheckpointStats.allocatedBytes,
         (unsigned long long)m_CheckpointStats.sharedBytes, staticResources,
-        (unsigned long long)staticBytes);
+        (unsigned long long)staticBytes, textureSharing ? 1U : 0U,
+        (unsigned long long)textureCopyBytes, (unsigned long long)textureSharedBytes);
     RDCLOG("[EIDTiming] %s", line.c_str());
     AppendReplayTimingLog(line);
   }
@@ -1067,12 +1654,24 @@ void GLReplay::ApplyCheckpointBindings(ReplayCheckpoint &checkpoint)
 bool GLReplay::RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint)
 {
   ResetCheckpointBufferLineage();
+  bool completed = false;
+  struct TextureRestoreFailure
+  {
+    bool &completed;
+    std::map<ResourceId, std::weak_ptr<GLCheckpointTextureVersion>> &versions;
+    ~TextureRestoreFailure()
+    {
+      if(!completed)
+        versions.clear();
+    }
+  } textureFailure = {completed, m_CheckpointTextureVersions};
   if(m_ReplayCheckpointBypass || m_pDriver->m_FetchCounters || m_pDriver->m_ActiveFeedback ||
      m_pDriver->m_ActiveConditional)
     return false;
   const bool checkpointTiming = Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1";
   PerformanceTimer checkpointTimer;
   GLResourceManager *manager = m_pDriver->GetResourceManager();
+  uint64_t textureCopyBytes = 0, textureResidentBytes = 0;
   for(const ReplayCheckpoint::Resource &res : checkpoint.resources)
     if(res.id != ResourceId() && manager->GetResource(res.id, true) != res.live)
       return false;
@@ -1086,10 +1685,34 @@ bool GLReplay::RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint)
   {
     if(res.sharedContents && res.live.Namespace == eResBuffer)
       continue;
-    if(res.renderbuffer)
-      GL.glCopyImageSubData(res.initial.resource.name, eGL_RENDERBUFFER, 0, 0, 0, 0,
-                            res.live.name, eGL_RENDERBUFFER, 0, 0, 0, 0,
-                            res.width, res.height, 1);
+    bool residentTexture = false;
+    if(res.textureVersion && m_CheckpointTextureReplayManaged && PrepareCheckpointTextureSharing())
+    {
+      const auto current = m_CheckpointTextureVersions.find(manager->GetID(res.live));
+      residentTexture = current != m_CheckpointTextureVersions.end() &&
+                        GLCheckpointTextureResident(current->second, res.textureVersion);
+    }
+    if(residentTexture)
+      textureResidentBytes += res.bytes;
+    else if((res.live.Namespace == eResTexture || res.renderbuffer) && !res.sharedContents)
+      textureCopyBytes += res.bytes;
+    if(res.textureVersion && res.renderbuffer)
+    {
+      if(!residentTexture)
+        GL.glCopyImageSubData(res.textureVersion->initial.resource.name, eGL_RENDERBUFFER, 0, 0, 0, 0,
+                              res.live.name, eGL_RENDERBUFFER, 0, 0, 0, 0, res.width, res.height, 1);
+    }
+    else if(res.textureVersion)
+    {
+      // Restore the checkpoint's own object/sampler state even when its pixels already reside
+      // in the working texture. The shared version owns only content, never another CP's state.
+      GLInitialContents apply = GLCheckpointTextureRestoreState(
+          res.initial, res.textureVersion->initial.resource, residentTexture);
+      manager->Apply_InitialState(res.live, apply);
+    }
+    else if(res.renderbuffer)
+      GL.glCopyImageSubData(res.initial.resource.name, eGL_RENDERBUFFER, 0, 0, 0, 0, res.live.name,
+                            eGL_RENDERBUFFER, 0, 0, 0, 0, res.width, res.height, 1);
     else if(res.live.Namespace == eResProgram)
     {
       if(!res.uniforms.empty())
@@ -1108,7 +1731,8 @@ bool GLReplay::RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint)
       // a checkpoint must restore null stages as well, because a later replay may bind them.
       if(res.live.Namespace == eResProgramPipe)
         m_pDriver->glUseProgramStages(res.live.name, GLbitfield(eGL_ALL_SHADER_BITS), 0);
-      manager->Apply_InitialState(res.live, res.bufferVersion ? res.bufferVersion->initial : res.initial);
+      manager->Apply_InitialState(res.live,
+                                  res.bufferVersion ? res.bufferVersion->initial : res.initial);
       if(res.live.Namespace == eResProgramPipe)
         GL.glActiveShaderProgram(res.live.name, res.activeProgram);
     }
@@ -1126,17 +1750,27 @@ bool GLReplay::RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint)
   const bool success = GL.glGetError() == eGL_NONE;
   if(success)
     for(const ReplayCheckpoint::Resource &res : checkpoint.resources)
+    {
       if(res.bufferVersion)
         m_CheckpointBufferVersions[manager->GetID(res.live)] = res.bufferVersion;
+      if(res.textureVersion && m_CheckpointTextureReplayManaged)
+        m_CheckpointTextureVersions[manager->GetID(res.live)] = res.textureVersion;
+      else
+        m_CheckpointTextureVersions.erase(manager->GetID(res.live));
+    }
+  completed = success;
   if(checkpointTiming)
   {
     const double totalMS = checkpointTimer.GetMilliseconds();
     const rdcstr line = StringFormat::Fmt(
-        "api=OpenGLCheckpoint op=restore event=%u success=%u validate_ms=%.3f resource_restore_ms=%.3f "
-        "bind_finalize_ms=%.3f total_ms=%.3f sharedStaticResources=%u sharedStaticBytes=%llu",
-        checkpoint.eventId, success ? 1U : 0U,
-        checkpointValidateMS, checkpointCopyMS - checkpointValidateMS, totalMS - checkpointCopyMS,
-        totalMS, checkpoint.staticResources, (unsigned long long)checkpoint.staticBytes);
+        "api=OpenGLCheckpoint op=restore event=%u success=%u validate_ms=%.3f "
+        "resource_restore_ms=%.3f "
+        "bind_finalize_ms=%.3f total_ms=%.3f sharedStaticResources=%u sharedStaticBytes=%llu "
+        "textureCopyBytes=%llu textureResidentBytes=%llu",
+        checkpoint.eventId, success ? 1U : 0U, checkpointValidateMS,
+        checkpointCopyMS - checkpointValidateMS, totalMS - checkpointCopyMS, totalMS,
+        checkpoint.staticResources, (unsigned long long)checkpoint.staticBytes,
+        (unsigned long long)textureCopyBytes, (unsigned long long)textureResidentBytes);
     RDCLOG("[EIDTiming] %s", line.c_str());
     AppendReplayTimingLog(line);
   }
@@ -1460,8 +2094,7 @@ bool GLLiveForwardCallSupported(GLChunk type)
     case GLChunk::glCompressedTexSubImage3DARB:
     case GLChunk::glCompressedTexSubImage3DOES:
     case GLChunk::glCompressedTextureSubImage3D:
-    case GLChunk::glCompressedTextureSubImage3DEXT:
-      return true;
+    case GLChunk::glCompressedTextureSubImage3DEXT: return true;
     default: return false;
   }
 }
@@ -1490,12 +2123,12 @@ bool GLLiveForwardTerminalPresent(const SDFile &file, size_t index)
 
 bool GLLiveForwardEventBoundary(const rdcarray<APIEvent> &events, uint32_t eventId)
 {
-  if(eventId == 0 || uint64_t(eventId) + 1 >= events.size() ||
-     events[eventId].eventId != eventId || events[eventId + 1].eventId != eventId + 1 ||
+  if(eventId == 0 || uint64_t(eventId) + 1 >= events.size() || events[eventId].eventId != eventId ||
+     events[eventId + 1].eventId != eventId + 1 ||
      events[eventId + 1].fileOffset <= events[eventId].fileOffset)
     return false;
   if(eventId > 1 && (events[eventId - 1].eventId != eventId - 1 ||
-                    events[eventId - 1].fileOffset >= events[eventId].fileOffset))
+                     events[eventId - 1].fileOffset >= events[eventId].fileOffset))
     return false;
   return true;
 }
@@ -1538,7 +2171,8 @@ bool GLReplay::PrepareLiveForward()
       continue;
     }
     if(!GLLiveForwardCallSupported(type))
-      return reject("unsupportedFrameCall:" + rdcstr(m_pDriver->GetChunkName(chunk->metadata.chunkID)));
+      return reject("unsupportedFrameCall:" +
+                    rdcstr(m_pDriver->GetChunkName(chunk->metadata.chunkID)));
     executedCall = true;
   }
   if(!frame || !executedCall)
@@ -1564,8 +2198,8 @@ bool GLReplay::LiveForwardEndpoint(uint32_t eventId) const
   if(!GLLiveForwardEventBoundary(m_pDriver->m_Events, eventId))
     return false;
   const ActionDescription *action = m_pDriver->GetAction(eventId);
-  return action && bool(action->flags & (ActionFlags::Drawcall | ActionFlags::Dispatch |
-                                         ActionFlags::Clear)) &&
+  return action &&
+         bool(action->flags & (ActionFlags::Drawcall | ActionFlags::Dispatch | ActionFlags::Clear)) &&
          !(action->flags & ActionFlags::MultiAction) && action->children.empty();
 }
 
@@ -1573,25 +2207,45 @@ void GLReplay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
 {
   MakeCurrentReplayContext(&m_ReplayCtx);
   PerformanceTimer liveTimer;
-  static const bool liveEnabled =
-      Process::GetEnvVariable("RENDERDOC_GL_ENABLE_LIVE_FORWARD") != "0";
+  const bool liveEnabled = Process::GetEnvVariable("RENDERDOC_GL_ENABLE_LIVE_FORWARD") != "0";
   const uint32_t previousEvent = m_LiveForward.event;
-  const bool ordinaryRoot =
-      GLLiveForwardOrdinaryRoot(replayType, m_ReplayCheckpointBypass,
-                               m_ReplayCheckpointNaturalReference) &&
-      !m_pDriver->m_FetchCounters && !m_pDriver->m_ActiveFeedback &&
-      !m_pDriver->m_WasActiveFeedback && !m_pDriver->m_ActiveConditional;
+  const bool ordinaryRoot = GLLiveForwardOrdinaryRoot(replayType, m_ReplayCheckpointBypass,
+                                                      m_ReplayCheckpointNaturalReference) &&
+                            !m_pDriver->m_FetchCounters && !m_pDriver->m_ActiveFeedback &&
+                            !m_pDriver->m_WasActiveFeedback && !m_pDriver->m_ActiveConditional;
   const bool pendingTarget = replayType == eReplay_OnlyDraw &&
                              m_LiveForward.pendingTarget == endEventID &&
                              !m_pDriver->m_FetchCounters;
   const bool safeEndpoint = liveEnabled && (ordinaryRoot || pendingTarget) &&
                             PrepareLiveForward() && LiveForwardEndpoint(endEventID);
-  const bool liveForward = ordinaryRoot && safeEndpoint &&
-                           m_LiveForward.CanAdvance(endEventID);
+  const bool liveForward = ordinaryRoot && safeEndpoint && m_LiveForward.CanAdvance(endEventID);
+  const bool textureTarget =
+      replayType == eReplay_OnlyDraw && m_CheckpointTexturePendingTarget == endEventID;
+  const bool trackTextures = m_CheckpointStats.enabled && !m_ReplayCheckpointBypass &&
+                             !m_CheckpointTextureAnalysis && !m_ReplayCheckpointNaturalReference &&
+                             (ordinaryRoot || textureTarget) && PrepareCheckpointTextureSharing();
+  bool keepTextureVersions = false;
+  struct TextureReplayScope
+  {
+    bool &managed, &keep;
+    bool previous;
+    std::map<ResourceId, std::weak_ptr<GLCheckpointTextureVersion>> &versions;
+    ~TextureReplayScope()
+    {
+      managed = previous;
+      if(!keep)
+        versions.clear();
+    }
+  } textureScope = {m_CheckpointTextureReplayManaged, keepTextureVersions,
+                    m_CheckpointTextureReplayManaged, m_CheckpointTextureVersions};
+  m_CheckpointTextureReplayManaged = trackTextures;
+  if(!trackTextures)
+    ResetCheckpointTextureLineage();
+  m_CheckpointTexturePendingTarget = 0;
   // Any other entry (including force/analysis) consumes the old provenance. A successful
   // ordinary root arms a new target only after its complete prefix has actually executed.
-  InvalidateLiveForward();
-  // No version proof survives a separate replay/analysis/OnlyDraw call. A successful checkpoint
+  m_LiveForward.Invalidate();
+  // No buffer version proof survives a separate replay/analysis/OnlyDraw call. A successful checkpoint
   // restore below establishes a fresh lineage; scoped reset also covers errors and early returns.
   ResetCheckpointBufferLineage();
   struct ResetLineage
@@ -1600,7 +2254,8 @@ void GLReplay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
     ~ResetLineage() { versions.clear(); }
   } resetLineage = {m_CheckpointBufferVersions};
   uint32_t startEvent = liveForward ? previousEvent + 1 : 0;
-  const uint32_t finalEvent = replayType == eReplay_WithoutDraw ? RDCMAX(1U, endEventID) - 1 : endEventID;
+  const uint32_t finalEvent =
+      replayType == eReplay_WithoutDraw ? RDCMAX(1U, endEventID) - 1 : endEventID;
   if(!liveForward && !m_ReplayCheckpointBypass && m_CheckpointStats.enabled && finalEvent > 0 &&
      (replayType == eReplay_Full || replayType == eReplay_WithoutDraw) &&
      !m_pDriver->m_FetchCounters && PrepareReplayCheckpoints())
@@ -1624,8 +2279,9 @@ void GLReplay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
     if(startEvent == 0)
       m_CheckpointStats.misses++;
     uint32_t saveEvent = 0;
-    const bool needsPatchAnchor = m_ReplayPatchAnchorEvent &&
-        m_ReplayPatchAnchorEvent >= startEvent && m_ReplayPatchAnchorEvent <= finalEvent &&
+    const bool needsPatchAnchor =
+        m_ReplayPatchAnchorEvent && m_ReplayPatchAnchorEvent >= startEvent &&
+        m_ReplayPatchAnchorEvent <= finalEvent &&
         m_Checkpoints.find(m_ReplayPatchAnchorEvent) == m_Checkpoints.end();
     for(const ReplayCheckpointCandidate &candidate : m_CheckpointCandidates)
     {
@@ -1661,6 +2317,9 @@ void GLReplay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
     replaySucceeded = m_pDriver->m_LastReplaySucceeded;
   }
   replaySucceeded &= FatalErrorCheck() == ResultCode::Succeeded;
+  keepTextureVersions = trackTextures && replaySucceeded;
+  if(keepTextureVersions && ordinaryRoot)
+    m_CheckpointTexturePendingTarget = endEventID;
   if(ordinaryRoot && safeEndpoint && replaySucceeded)
     m_LiveForward.Arm(endEventID);
   else if(pendingTarget && safeEndpoint)
@@ -1670,11 +2329,13 @@ void GLReplay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
   }
   if(replayType == eReplay_WithoutDraw && Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
   {
-    const rdcstr reason = !liveEnabled ? "disabled" : !ordinaryRoot ? "forceOrAnalysis" :
-                         !m_LiveForwardCaptureSafe ? m_LiveForwardReason :
-                         !safeEndpoint ? "sharedChunkOrUnsupportedEndpoint" :
-                         !previousEvent ? "noPublishedCursor" :
-                         endEventID <= previousEvent ? "notForward" : "residentPrefix";
+    const rdcstr reason = !liveEnabled                  ? "disabled"
+                          : !ordinaryRoot               ? "forceOrAnalysis"
+                          : !m_LiveForwardCaptureSafe   ? m_LiveForwardReason
+                          : !safeEndpoint               ? "sharedChunkOrUnsupportedEndpoint"
+                          : !previousEvent              ? "noPublishedCursor"
+                          : endEventID <= previousEvent ? "notForward"
+                                                        : "residentPrefix";
     const rdcstr line = StringFormat::Fmt(
         "api=GLLiveForward from=%u target=%u enabled=%u hit=%u initialRestoreSkipped=%u "
         "replayedFirst=%u replayedLast=%u succeeded=%u total_ms=%.3f reason=%s",
@@ -2044,8 +2705,7 @@ void GLReplay::CacheTexture(ResourceId id)
         tex.creationFlags |= TextureCategory::DepthTarget;
     }
 
-    tex.byteSize =
-        (tex.width * tex.height) * (tex.format.compByteWidth * tex.format.compCount) * tex.msSamp;
+    tex.byteSize = GLRenderbufferByteSize(tex.width, tex.height, tex.msSamp, res.internalFormat);
 
     m_CachedTextures[id] = tex;
     return;
@@ -5152,6 +5812,7 @@ void GLReplay::BuildCustomShader(ShaderEncoding sourceEncoding, const bytebuf &s
 
 ResourceId GLReplay::ApplyCustomShader(TextureDisplay &display)
 {
+  TextureAnalysisScope textureAnalysis(*this);
   if(display.customShaderId == ResourceId() || display.resourceId == ResourceId())
     return ResourceId();
 
@@ -5332,6 +5993,15 @@ void GLReplay::ReplaceResource(ResourceId from, ResourceId to)
   InvalidateLiveForward();
   MakeCurrentReplayContext(&m_ReplayCtx);
   ResetCheckpointBufferLineage();
+  if(m_pDriver->GetResourceManager()->HasResource(from))
+  {
+    const GLNamespace type = m_pDriver->GetResourceManager()->GetResource(from).Namespace;
+    // Generic image/FBO substitutions can redirect the loading-time physical destination set.
+    // Keep ordinary full copies for the remainder of this capture after such a substitution.
+    // Shader/program substitutions retain all physical bindings and invalidate CP generations.
+    if(type != eResShader && type != eResProgram && type != eResProgramPipe)
+      m_CheckpointTextureBindingEdited = true;
+  }
   m_pDriver->ReplaceResource(from, to);
   ClearPostVSCache();
 }
@@ -5358,6 +6028,7 @@ rdcstr GLReplay::ReplaceTargetShaderChecked(ResourceId from, ResourceId to)
 
 rdcstr GLReplay::RemoveTargetShaderReplacementChecked(ResourceId id)
 {
+  ResetCheckpointTextureLineage();
   MakeCurrentReplayContext(&m_ReplayCtx);
   rdcstr error = m_pDriver->RemoveTargetShaderReplacementChecked(id);
   if(error.empty())
@@ -5561,9 +6232,8 @@ ResourceId GLReplay::CreateTextureSnapshot(ResourceId source, const Subresource 
 
   const WrappedOpenGL::TextureData &sourceDetails = sourceIt->second;
   if(sourceDetails.curType == eGL_NONE || sourceDetails.samples > 1 || sourceDetails.width <= 0 ||
-     sourceDetails.height <= 0 || !HasExt[ARB_copy_image] ||
-     GL.glFenceSync == NULL || GL.glWaitSync == NULL || GL.glDeleteSync == NULL ||
-     GL.glFlush == NULL ||
+     sourceDetails.height <= 0 || !HasExt[ARB_copy_image] || GL.glFenceSync == NULL ||
+     GL.glWaitSync == NULL || GL.glDeleteSync == NULL || GL.glFlush == NULL ||
      VendorCheck[VendorCheck_Qualcomm_avoid_glCopyImageSubData] ||
      (sourceDetails.internalFormat == eGL_DEPTH32F_STENCIL8 &&
       VendorCheck[VendorCheck_NV_avoid_D32S8_copy]))
@@ -5579,8 +6249,7 @@ ResourceId GLReplay::CreateTextureSnapshot(ResourceId source, const Subresource 
   const bool source3D = sourceDetails.curType == eGL_TEXTURE_3D;
   const bool compressed = IsCompressedFormat(sourceDetails.internalFormat);
   if(compressed &&
-     (IsGLES ||
-      (VendorCheck[VendorCheck_AMD_copy_compressed_tinymips] && (width < 4 || height < 4)) ||
+     (IsGLES || (VendorCheck[VendorCheck_AMD_copy_compressed_tinymips] && (width < 4 || height < 4)) ||
       (VendorCheck[VendorCheck_AMD_copy_compressed_cubemaps] &&
        sourceDetails.curType == eGL_TEXTURE_CUBE_MAP)))
     return ResourceId();
@@ -5606,18 +6275,16 @@ ResourceId GLReplay::CreateTextureSnapshot(ResourceId source, const Subresource 
   {
     snapshotDesc.depth = 1;
     snapshotDesc.arraysize = 1;
-    snapshotDesc.dimension = sourceDetails.curType == eGL_TEXTURE_1D ||
-                                     sourceDetails.curType == eGL_TEXTURE_1D_ARRAY
-                                 ? 1
-                                 : 2;
-    snapshotDesc.type = snapshotDesc.dimension == 1 ? TextureType::Texture1D
-                                                     : TextureType::Texture2D;
+    snapshotDesc.dimension =
+        sourceDetails.curType == eGL_TEXTURE_1D || sourceDetails.curType == eGL_TEXTURE_1D_ARRAY ? 1
+                                                                                                 : 2;
+    snapshotDesc.type = snapshotDesc.dimension == 1 ? TextureType::Texture1D : TextureType::Texture2D;
 
     if(sourceDetails.curType == eGL_TEXTURE_1D_ARRAY)
       sourceY = (GLint)RDCMIN(sourceSub.slice, RDCMAX(1U, GetTexture(source).arraysize) - 1);
     else if(sourceDetails.curType == eGL_TEXTURE_2D_ARRAY ||
-       sourceDetails.curType == eGL_TEXTURE_CUBE_MAP ||
-       sourceDetails.curType == eGL_TEXTURE_CUBE_MAP_ARRAY)
+            sourceDetails.curType == eGL_TEXTURE_CUBE_MAP ||
+            sourceDetails.curType == eGL_TEXTURE_CUBE_MAP_ARRAY)
       sourceZ = (GLint)RDCMIN(sourceSub.slice, RDCMAX(1U, GetTexture(source).arraysize) - 1);
   }
 
@@ -5649,11 +6316,10 @@ ResourceId GLReplay::CreateTextureSnapshot(ResourceId source, const Subresource 
   MakeCurrentReplayContext(m_DebugCtx);
   GL.glWaitSync(replayReady, 0, GL_TIMEOUT_IGNORED);
   GL.glDeleteSync(replayReady);
-  GL.glCopyImageSubData(m_pDriver->GetResourceManager()->GetResource(source).name,
-                        sourceDetails.curType, (GLint)mip, 0, sourceY, sourceZ,
-                        m_pDriver->GetResourceManager()->GetResource(snapshot).name,
-                        snapshotIt->second.curType, 0, 0, 0, 0, (GLsizei)width, (GLsizei)height,
-                        copyDepth);
+  GL.glCopyImageSubData(
+      m_pDriver->GetResourceManager()->GetResource(source).name, sourceDetails.curType, (GLint)mip,
+      0, sourceY, sourceZ, m_pDriver->GetResourceManager()->GetResource(snapshot).name,
+      snapshotIt->second.curType, 0, 0, 0, 0, (GLsizei)width, (GLsizei)height, copyDepth);
 
   GLsync copyReady = GL.glFenceSync(eGL_SYNC_GPU_COMMANDS_COMPLETE, 0);
   if(copyReady == NULL)
@@ -6086,10 +6752,10 @@ void GLReplay::SetProxyBufferData(ResourceId bufid, byte *data, size_t dataSize)
 }
 
 static uint32_t GLReplayPatchValueCutoff(const rdcarray<ReplayBufferPatch> &previous,
-                                       const rdcarray<ReplayBufferPatch> &next,
-                                       const std::map<ResourceId, uint32_t> &firstReads,
-                                       rdcstr &reason,
-                                       const rdcarray<ReplayBufferPatchRange> *changes = NULL)
+                                         const rdcarray<ReplayBufferPatch> &next,
+                                         const std::map<ResourceId, uint32_t> &firstReads,
+                                         rdcstr &reason,
+                                         const rdcarray<ReplayBufferPatchRange> *changes = NULL)
 {
   if(!SameReplayBufferPatchLayout(previous, next))
   {
@@ -6108,9 +6774,9 @@ static uint32_t GLReplayPatchValueCutoff(const rdcarray<ReplayBufferPatch> &prev
     first = RDCMIN(first, use->second);
   }
   reason = "sameRangesPotentialUniformAndCopyReads";
-  // Validate every original proof above before using a value delta. The index only describes
-  // whole buffers, so two different parameter offsets in one buffer still share its earliest
-  // potential consumer. A shader may read any bound UBO slot, independent of original reflection.
+  // Validate every original proof above before using a value delta. This fallback map describes
+  // whole buffers; the separate native range index can refine it only with complete evidence.
+  // A shader may read any bound UBO slot, independent of original reflection.
   if(changes && !changes->empty())
   {
     uint32_t changedFirst = ~0U;
@@ -6130,9 +6796,153 @@ static uint32_t GLReplayPatchValueCutoff(const rdcarray<ReplayBufferPatch> &prev
   return first;
 }
 
+static uint32_t GLReplayPatchRangeValueCutoff(const rdcarray<ReplayBufferPatch> &previous,
+                                              const rdcarray<ReplayBufferPatch> &next,
+                                              const std::map<ResourceId, uint32_t> &firstReads,
+                                              const ReplayResourceAccessIndex &index,
+                                              uint32_t lastEvent, rdcstr &reason,
+                                              bool &rangeIndexKnown,
+                                              const rdcarray<ReplayBufferPatchRange> *changes)
+{
+  rangeIndexKnown = false;
+  const uint32_t fallback = GLReplayPatchValueCutoff(previous, next, firstReads, reason, changes);
+  if(!fallback || !changes || changes->empty())
+    return fallback;
+  uint32_t first = ~0U;
+  for(const ReplayBufferPatchRange &change : *changes)
+  {
+    const ReplayResourceReadQuery read =
+        index.FirstRead({change.buffer, 0, change.byteOffset, change.byteLength}, 1, lastEvent);
+    if(!read.complete || !read.found)
+    {
+      // A missing range is not an unused resource proof. Unknown events, storage lifetime,
+      // replacement invalidation and work budgets all retain the old whole-buffer cutoff.
+      reason = "rangeReadIndexIncomplete";
+      return fallback;
+    }
+    first = RDCMIN(first, read.eventId);
+  }
+  rangeIndexKnown = true;
+  reason = "changedRangesNativeUniformAndCopyReads";
+  return first;
+}
+
+namespace
+{
+struct GLReplayPatchUploadRange
+{
+  size_t patch = 0;
+  uint64_t patchOffset = 0, uploadOffset = 0, bytes = 0;
+};
+
+bool GLReplayPatchUploadRanges(const rdcarray<ReplayBufferPatch> &previous,
+                               const rdcarray<ReplayBufferPatch> &next,
+                               const rdcarray<ReplayBufferPatchRange> &changes,
+                               rdcarray<GLReplayPatchUploadRange> &ranges)
+{
+  ranges.clear();
+  if(!SameReplayBufferPatchLayout(previous, next) || changes.size() > 4096)
+    return false;
+  rdcarray<uint64_t> offsets;
+  uint64_t total = 0;
+  for(const ReplayBufferPatch &patch : next)
+  {
+    offsets.push_back(total);
+    total += patch.data.size();
+  }
+  const ReplayBufferPatchRange *last = NULL;
+  for(const ReplayBufferPatchRange &change : changes)
+  {
+    if(!change.byteLength || change.byteOffset > UINT64_MAX - change.byteLength ||
+       (last &&
+        (change.buffer < last->buffer ||
+         (change.buffer == last->buffer && change.byteOffset < last->byteOffset + last->byteLength))))
+    {
+      ranges.clear();
+      return false;
+    }
+    uint64_t position = change.byteOffset;
+    const uint64_t end = position + change.byteLength;
+    for(size_t i = 0; i < next.size() && position < end; ++i)
+    {
+      const ReplayBufferPatch &patch = next[i];
+      if(patch.buffer != change.buffer || position < patch.byteOffset ||
+         position >= patch.byteOffset + patch.data.size())
+        continue;
+      GLReplayPatchUploadRange range;
+      range.patch = i;
+      range.patchOffset = position - patch.byteOffset;
+      range.uploadOffset = offsets[i] + range.patchOffset;
+      range.bytes = RDCMIN(end - position, uint64_t(patch.data.size()) - range.patchOffset);
+      ranges.push_back(range);
+      position += range.bytes;
+    }
+    // A delta may cross adjacent patches, but never an unpatched gap or another buffer.
+    if(position != end)
+    {
+      ranges.clear();
+      return false;
+    }
+    last = &change;
+  }
+  return true;
+}
+
+enum class GLReplayPatchUploadResult
+{
+  Succeeded,
+  Restored,
+  RollbackFailed,
+};
+
+template <typename Generate, typename Bind, typename Allocate>
+bool GLReplayPatchAllocateUpload(Generate generate, Bind bind, Allocate allocate)
+{
+  // Failed binding leaves the previous object current. Never issue a storage write until
+  // generation and binding have both been confirmed independently.
+  return generate() && bind() && allocate();
+}
+
+template <typename Write>
+GLReplayPatchUploadResult GLReplayPatchUpdateUpload(const rdcarray<ReplayBufferPatch> &previous,
+                                                    const rdcarray<ReplayBufferPatch> &next,
+                                                    const rdcarray<GLReplayPatchUploadRange> &ranges,
+                                                    Write write, uint64_t &writtenBytes,
+                                                    uint64_t &rollbackBytes)
+{
+  writtenBytes = rollbackBytes = 0;
+  for(const GLReplayPatchUploadRange &range : ranges)
+  {
+    if(write(range.uploadOffset, next[range.patch].data.data() + size_t(range.patchOffset),
+             range.bytes, false))
+    {
+      writtenBytes += range.bytes;
+      continue;
+    }
+    // A failed native transfer may follow earlier successful transfers. Restore the complete
+    // accepted payload, including the failing range, before returning an ordinary edit error.
+    bool restored = true;
+    uint64_t offset = 0;
+    for(const ReplayBufferPatch &patch : previous)
+    {
+      const bool success = write(offset, patch.data.data(), patch.data.size(), true);
+      restored &= success;
+      if(success)
+        rollbackBytes += patch.data.size();
+      offset += patch.data.size();
+    }
+    return restored ? GLReplayPatchUploadResult::Restored : GLReplayPatchUploadResult::RollbackFailed;
+  }
+  return GLReplayPatchUploadResult::Succeeded;
+}
+}
+
 rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
 {
-  InvalidateLiveForward();
+  // Changing overlay bytes does not mutate the already resident upstream texture bytes. Their
+  // immutable checkpoint owner survives only when the existing first-consumer proof retains it.
+  m_LiveForward.Invalidate();
+  m_CheckpointTexturePendingTarget = 0;
   rdcstr error = ValidateReplayBufferPatches(patches);
   if(!error.empty())
     return error;
@@ -6147,7 +6957,7 @@ rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patch
     for(const auto &texture : m_pDriver->m_Textures)
       if(texture.second.curType == eGL_TEXTURE_BUFFER)
         m_pDriver->TrackReplayPatchBinding(rm->GetInitialContents(texture.first).tex.texBuffer,
-                                          eGL_TEXTURE_BUFFER);
+                                           eGL_TEXTURE_BUFFER);
     for(const ResourceDescription &resource : m_Resources)
     {
       GLResource object = rm->GetResource(resource.resourceId, true);
@@ -6157,7 +6967,8 @@ rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patch
     }
     SDFile *file = GetStructuredFile();
     if(!file)
-      m_pDriver->m_ReplayPatchCaptureError = "OpenGL buffer patches require structured context evidence";
+      m_pDriver->m_ReplayPatchCaptureError =
+          "OpenGL buffer patches require structured context evidence";
     else
     {
       bool frame = false;
@@ -6182,7 +6993,8 @@ rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patch
   uint64_t total = 0;
   for(const ReplayBufferPatch &patch : patches)
   {
-    if(!rm->HasResource(patch.buffer) || rm->HasReplacement(patch.buffer))
+    if(!rm->HasResource(patch.buffer) || rm->HasReplacement(patch.buffer) ||
+       rm->GetUnreplacedID(patch.buffer) != patch.buffer)
       return "OpenGL buffer patches require an unreplaced captured buffer";
     GLResource live = rm->GetResource(patch.buffer);
     auto it = m_pDriver->m_Buffers.find(rm->GetResID(live));
@@ -6222,6 +7034,8 @@ rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patch
     }
 
   GLuint upload = 0;
+  bool uploadReused = false;
+  uint64_t uploadWrittenBytes = 0;
   if(!patches.empty())
   {
     // These are core in GLES 3.0 too. Do not rely on desktop DSA or on immutable storage having
@@ -6229,39 +7043,116 @@ rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patch
     if(!GL.glCopyBufferSubData || !GL.glGenBuffers || !GL.glBufferData || !GL.glBufferSubData ||
        !GL.glBindBuffer || !GL.glGetBufferParameteriv)
       return "OpenGL/GLES replay context does not support buffer-copy patch uploads";
-    bytebuf data;
-    data.reserve((size_t)total);
-    for(const ReplayBufferPatch &patch : patches)
-      data.append(patch.data);
+    rdcarray<GLReplayPatchUploadRange> uploadRanges;
+    bool reuseUpload =
+        m_pDriver->m_ReplayPatchUpload && deltaKnown &&
+        Process::GetEnvVariable("RENDERDOC_GL_DISABLE_BUFFER_PATCH_UPLOAD_REUSE") != "1" &&
+        GLReplayPatchUploadRanges(m_pDriver->m_ReplayBufferPatches, patches, changes, uploadRanges);
+    // Consume only bounded stale errors before the transaction. Native errors below belong to
+    // this update and must never be ignored merely because the allocation size looks correct.
+    for(uint32_t i = 0; i < 8 && GL.glGetError() != eGL_NONE; ++i)
+    {
+    }
+    if(GL.glGetError() != eGL_NONE)
+      return "OpenGL persistent buffer patch upload has an unresolved context error";
     GLint previous = 0;
     GL.glGetIntegerv(eGL_COPY_READ_BUFFER_BINDING, &previous);
-    GL.glGenBuffers(1, &upload);
-    GL.glBindBuffer(eGL_COPY_READ_BUFFER, upload);
-    GL.glBufferData(eGL_COPY_READ_BUFFER, (GLsizeiptr)total, data.data(), eGL_STATIC_DRAW);
-    GLint allocated = 0;
-    GL.glGetBufferParameteriv(eGL_COPY_READ_BUFFER, eGL_BUFFER_SIZE, &allocated);
-    GL.glBindBuffer(eGL_COPY_READ_BUFFER, previous);
-    if(!upload || allocated != (GLint)total)
+    if(GL.glGetError() != eGL_NONE)
+      return "OpenGL persistent buffer patch upload binding is unavailable";
+    if(reuseUpload)
     {
-      if(upload)
-        GL.glDeleteBuffers(1, &upload);
-      return "OpenGL persistent buffer patch upload allocation failed";
+      GL.glBindBuffer(eGL_COPY_READ_BUFFER, m_pDriver->m_ReplayPatchUpload);
+      GLint allocated = 0;
+      GL.glGetBufferParameteriv(eGL_COPY_READ_BUFFER, eGL_BUFFER_SIZE, &allocated);
+      reuseUpload = GL.glGetError() == eGL_NONE && allocated == (GLint)total;
+    }
+    if(reuseUpload)
+    {
+      uint64_t rollbackBytes = 0;
+      const GLReplayPatchUploadResult result = GLReplayPatchUpdateUpload(
+          m_pDriver->m_ReplayBufferPatches, patches, uploadRanges,
+          [](uint64_t offset, const byte *data, uint64_t size, bool) {
+            // BufferSubData preserves GL command ordering against earlier GPU copies reading
+            // this upload object. Do not substitute an unsynchronised map or orphan its storage.
+            GL.glBufferSubData(eGL_COPY_READ_BUFFER, (GLintptr)offset, (GLsizeiptr)size, data);
+            return GL.glGetError() == eGL_NONE;
+          },
+          uploadWrittenBytes, rollbackBytes);
+      GL.glBindBuffer(eGL_COPY_READ_BUFFER, previous);
+      const bool bindingRestored = GL.glGetError() == eGL_NONE;
+      if(result != GLReplayPatchUploadResult::Succeeded || !bindingRestored)
+      {
+        if(result == GLReplayPatchUploadResult::RollbackFailed || !bindingRestored)
+        {
+          // The accepted CPU table is still unchanged. If native rollback cannot reproduce it,
+          // prevent another replay from consuming potentially mixed parameter bytes.
+          SET_ERROR_RESULT(m_pDriver->m_FatalError, ResultCode::APIReplayFailed,
+                           "OpenGL persistent buffer patch upload rollback could not be confirmed");
+          InvalidateReplayCheckpoints();
+        }
+        if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
+          AppendReplayTimingLog(StringFormat::Fmt(
+              "api=OpenGLBufferPatch op=uploadError uploadReused=1 uploadWrittenBytes=%llu "
+              "rollbackBytes=%llu rollbackSucceeded=%u bindingRestored=%u",
+              (unsigned long long)uploadWrittenBytes, (unsigned long long)rollbackBytes,
+              result == GLReplayPatchUploadResult::Restored ? 1U : 0U, bindingRestored ? 1U : 0U));
+        return "OpenGL persistent buffer patch upload failed; the new edit was not accepted";
+      }
+      upload = m_pDriver->m_ReplayPatchUpload;
+      uploadReused = true;
+    }
+    else
+    {
+      bytebuf data;
+      data.reserve((size_t)total);
+      for(const ReplayBufferPatch &patch : patches)
+        data.append(patch.data);
+      const bool allocatedSuccessfully = GLReplayPatchAllocateUpload(
+          [&]() {
+            GL.glGenBuffers(1, &upload);
+            return GL.glGetError() == eGL_NONE && upload != 0;
+          },
+          [&]() {
+            GL.glBindBuffer(eGL_COPY_READ_BUFFER, upload);
+            return GL.glGetError() == eGL_NONE;
+          },
+          [&]() {
+            GL.glBufferData(eGL_COPY_READ_BUFFER, (GLsizeiptr)total, data.data(), eGL_STATIC_DRAW);
+            GLint allocated = 0;
+            GL.glGetBufferParameteriv(eGL_COPY_READ_BUFFER, eGL_BUFFER_SIZE, &allocated);
+            return GL.glGetError() == eGL_NONE && allocated == (GLint)total;
+          });
+      GL.glBindBuffer(eGL_COPY_READ_BUFFER, previous);
+      const bool bindingRestored = GL.glGetError() == eGL_NONE;
+      if(!allocatedSuccessfully || !bindingRestored)
+      {
+        if(upload)
+          GL.glDeleteBuffers(1, &upload);
+        if(!bindingRestored)
+          SET_ERROR_RESULT(m_pDriver->m_FatalError, ResultCode::APIReplayFailed,
+                           "OpenGL persistent buffer patch upload binding could not be restored");
+        return "OpenGL persistent buffer patch upload allocation failed";
+      }
+      uploadWrittenBytes = total;
     }
   }
 
   rdcstr cutoffReason;
-  uint32_t cutoff = GLReplayPatchValueCutoff(m_pDriver->m_ReplayBufferPatches, patches,
-                                            m_pDriver->m_ReplayPatchFirstReads, cutoffReason,
-                                            deltaKnown && deltaEnabled ? &changes : NULL);
+  bool rangeIndexKnown = false;
+  uint32_t cutoff = GLReplayPatchRangeValueCutoff(
+      m_pDriver->m_ReplayBufferPatches, patches, m_pDriver->m_ReplayPatchFirstReads,
+      m_pDriver->m_ReplayPatchReadIndex, m_pDriver->m_ReplayPatchReadLastEvent, cutoffReason,
+      rangeIndexKnown, deltaKnown && deltaEnabled ? &changes : NULL);
   rdcstr anchorReason;
-  uint32_t firstRead = GLReplayPatchValueCutoff(patches, patches,
-                                               m_pDriver->m_ReplayPatchFirstReads, anchorReason);
+  uint32_t firstRead =
+      GLReplayPatchValueCutoff(patches, patches, m_pDriver->m_ReplayPatchFirstReads, anchorReason);
   // PBO uploads and non-UBO inputs need their own consumer evidence. Do not silently infer that
   // absence from the reflected usage list means they were never read.
   if(!m_pDriver->m_ReplayPatchReadEvidenceError.empty())
   {
     cutoffReason = m_pDriver->m_ReplayPatchReadEvidenceError;
     cutoff = firstRead = 0;
+    rangeIndexKnown = false;
   }
   for(const ReplayBufferPatch &patch : patches)
   {
@@ -6270,6 +7161,7 @@ rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patch
     {
       cutoffReason = "additionalBufferInputWithoutCompleteFirstReadEvidence";
       cutoff = firstRead = 0;
+      rangeIndexKnown = false;
     }
   }
   // Commit only after the complete new upload and every target have been validated. Initial
@@ -6277,12 +7169,27 @@ rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patch
   m_ReplayPatchFirstAffectedEvent = cutoff;
   m_ReplayPatchAnchorEvent = firstRead > 1 ? firstRead - 1 : 0;
   // Synthetic multi-draw children share one native chunk and cannot be checkpoint boundaries.
-  while(m_ReplayPatchAnchorEvent &&
-        m_pDriver->GetEvent(m_ReplayPatchAnchorEvent).fileOffset ==
-            m_pDriver->GetEvent(m_ReplayPatchAnchorEvent + 1).fileOffset)
+  while(m_ReplayPatchAnchorEvent && m_pDriver->GetEvent(m_ReplayPatchAnchorEvent).fileOffset ==
+                                        m_pDriver->GetEvent(m_ReplayPatchAnchorEvent + 1).fileOffset)
     --m_ReplayPatchAnchorEvent;
-  InvalidateReplayCheckpoints(cutoff);
-  if(m_pDriver->m_ReplayPatchUpload)
+  // Only the overlay bytes changed: the immutable capture stream and potential native write
+  // bindings have not. Keep the completed safety scan/static classification for other assets.
+  // Removed patches stay conservatively non-static until a later general classification pass.
+  const rdcarray<ReplayBufferPatch> *editTables[] = {&m_pDriver->m_ReplayBufferPatches, &patches};
+  for(const rdcarray<ReplayBufferPatch> *table : editTables)
+    for(const ReplayBufferPatch &patch : *table)
+    {
+      m_CheckpointStaticResources.erase(patch.buffer);
+      m_CheckpointBufferVersions.erase(patch.buffer);
+    }
+  for(auto checkpoint = m_Checkpoints.begin(); checkpoint != m_Checkpoints.end();)
+    if(cutoff && checkpoint->first < cutoff)
+      ++checkpoint;
+    else
+      checkpoint = m_Checkpoints.erase(checkpoint);
+  m_CheckpointStats.invalidations++;
+  UpdateCheckpointAccounting();
+  if(m_pDriver->m_ReplayPatchUpload && !uploadReused)
     GL.glDeleteBuffers(1, &m_pDriver->m_ReplayPatchUpload);
   m_pDriver->m_ReplayPatchUpload = upload;
   m_pDriver->m_ReplayBufferPatches = patches;
@@ -6290,10 +7197,12 @@ rdcstr GLReplay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patch
   {
     const rdcstr line = StringFormat::Fmt(
         "api=OpenGLBufferPatch op=set ranges=%zu firstAffected=%u anchor=%u reason=%s "
-        "deltaKnown=%u deltaEnabled=%u changedRanges=%zu changedBytes=%llu changedBuffers=%zu",
+        "deltaKnown=%u deltaEnabled=%u changedRanges=%zu changedBytes=%llu changedBuffers=%zu "
+        "rangeIndexKnown=%u uploadReused=%u uploadWrittenBytes=%llu",
         patches.size(), cutoff, m_ReplayPatchAnchorEvent, cutoffReason.c_str(),
         deltaKnown ? 1U : 0U, deltaEnabled ? 1U : 0U, deltaKnown ? changes.size() : 0,
-        (unsigned long long)changedBytes, changedBuffers.size());
+        (unsigned long long)changedBytes, changedBuffers.size(), rangeIndexKnown ? 1U : 0U,
+        uploadReused ? 1U : 0U, (unsigned long long)uploadWrittenBytes);
     RDCLOG("[EIDTiming] %s", line.c_str());
     AppendReplayTimingLog(line);
   }
@@ -6659,11 +7568,10 @@ TEST_CASE("OpenGL and GLES live forward exclude only a proven terminal present s
   append(uint32_t(GLChunk::glDrawArrays));
   append(uint32_t(GLChunk::SwapBuffers));
   append(uint32_t(SystemChunk::CaptureEnd));
-  for(GLChunk present : {GLChunk::SwapBuffers, GLChunk::wglSwapBuffers,
-                         GLChunk::glXSwapBuffers, GLChunk::CGLFlushDrawable,
-                         GLChunk::eglSwapBuffers, GLChunk::eglPostSubBufferNV,
-                         GLChunk::eglSwapBuffersWithDamageEXT,
-                         GLChunk::eglSwapBuffersWithDamageKHR})
+  for(GLChunk present :
+      {GLChunk::SwapBuffers, GLChunk::wglSwapBuffers, GLChunk::glXSwapBuffers,
+       GLChunk::CGLFlushDrawable, GLChunk::eglSwapBuffers, GLChunk::eglPostSubBufferNV,
+       GLChunk::eglSwapBuffersWithDamageEXT, GLChunk::eglSwapBuffersWithDamageKHR})
   {
     file.chunks[2]->metadata.chunkID = uint32_t(present);
     CHECK(GLLiveForwardTerminalPresent(file, 2));
@@ -6710,39 +7618,35 @@ TEST_CASE("OpenGL live forward cannot start or finish within a shared multi-draw
 TEST_CASE("OpenGL and GLES live forward reject hidden execution context and future commands",
           "[gl][replay][live-forward]")
 {
-  for(GLChunk chunk : {GLChunk::glDrawArrays, GLChunk::glDrawElements,
-                       GLChunk::glDispatchCompute, GLChunk::glMultiDrawArrays,
-                       GLChunk::glUniform1f, GLChunk::glBindBufferBase,
-                       GLChunk::glClear, GLChunk::glMemoryBarrier,
-                       GLChunk::glNamedBufferSubData, GLChunk::glTexSubImage2D,
-                       GLChunk::glCopyImageSubData, GLChunk::glClearBufferSubData,
-                       GLChunk::glFramebufferTextureLayer, GLChunk::glVertexAttribPointer,
-                       GLChunk::glVertexAttribIFormat})
+  for(GLChunk chunk : {GLChunk::glDrawArrays, GLChunk::glDrawElements, GLChunk::glDispatchCompute,
+                       GLChunk::glMultiDrawArrays, GLChunk::glUniform1f, GLChunk::glBindBufferBase,
+                       GLChunk::glClear, GLChunk::glMemoryBarrier, GLChunk::glNamedBufferSubData,
+                       GLChunk::glTexSubImage2D, GLChunk::glCopyImageSubData,
+                       GLChunk::glClearBufferSubData, GLChunk::glFramebufferTextureLayer,
+                       GLChunk::glVertexAttribPointer, GLChunk::glVertexAttribIFormat})
     CHECK(GLLiveForwardCallSupported(chunk));
-  for(GLChunk chunk : {GLChunk::glBeginQuery, GLChunk::glEndQuery,
-                       GLChunk::glBeginConditionalRender, GLChunk::glEndConditionalRender,
-                       GLChunk::glBeginTransformFeedback, GLChunk::glEndTransformFeedback,
-                       GLChunk::glFenceSync, GLChunk::glWaitSync,
-                       GLChunk::MakeContextCurrent, GLChunk::ImplicitThreadSwitch,
-                       GLChunk::ContextConfiguration, GLChunk::glNamedBufferStorage,
-                       GLChunk::glTextureView, GLChunk(~0U)})
+  for(GLChunk chunk :
+      {GLChunk::glBeginQuery, GLChunk::glEndQuery, GLChunk::glBeginConditionalRender,
+       GLChunk::glEndConditionalRender, GLChunk::glBeginTransformFeedback,
+       GLChunk::glEndTransformFeedback, GLChunk::glFenceSync, GLChunk::glWaitSync,
+       GLChunk::MakeContextCurrent, GLChunk::ImplicitThreadSwitch, GLChunk::ContextConfiguration,
+       GLChunk::glNamedBufferStorage, GLChunk::glTextureView, GLChunk(~0U)})
     CHECK_FALSE(GLLiveForwardCallSupported(chunk));
 }
 
 TEST_CASE("OpenGL checkpoint buffer sharing fails closed for unknown and hidden writes",
           "[gl][checkpoint][sharing]")
 {
-  for(GLChunk chunk : {GLChunk::glBufferStorage, GLChunk::glBufferData,
-                       GLChunk::glUnmapNamedBufferEXT, GLChunk::CoherentMapWrite,
-                       GLChunk::glFlushMappedBufferRange, GLChunk::glClearBufferData,
-                       GLChunk::glClearNamedBufferSubData, GLChunk::glClearTexImage,
-                       GLChunk::glReadPixels, GLChunk::glGetQueryBufferObjectuiv,
-                       GLChunk::glBeginTransformFeedback, GLChunk::MakeContextCurrent,
-                       GLChunk(~0U)})
+  for(GLChunk chunk :
+      {GLChunk::glBufferStorage, GLChunk::glBufferData, GLChunk::glUnmapNamedBufferEXT,
+       GLChunk::CoherentMapWrite, GLChunk::glFlushMappedBufferRange, GLChunk::glClearBufferData,
+       GLChunk::glClearNamedBufferSubData, GLChunk::glClearTexImage, GLChunk::glReadPixels,
+       GLChunk::glGetQueryBufferObjectuiv, GLChunk::glBeginTransformFeedback,
+       GLChunk::MakeContextCurrent, GLChunk(~0U)})
     CHECK((GLCheckpointClassifyBufferEffect(chunk) == GLCheckpointBufferEffect::Unknown));
-  for(GLChunk chunk : {GLChunk::glBindBufferRange, GLChunk::glBindImageTextures,
-                       GLChunk::glClearBufferfv, GLChunk::glClearNamedFramebufferfi,
-                       GLChunk::glProgramUniform4fv, GLChunk::glMemoryBarrier})
+  for(GLChunk chunk :
+      {GLChunk::glBindBufferRange, GLChunk::glBindImageTextures, GLChunk::glClearBufferfv,
+       GLChunk::glClearNamedFramebufferfi, GLChunk::glProgramUniform4fv, GLChunk::glMemoryBarrier})
     CHECK((GLCheckpointClassifyBufferEffect(chunk) == GLCheckpointBufferEffect::StateOnly));
   for(GLChunk chunk : {GLChunk::glNamedBufferSubDataEXT, GLChunk::glBufferSubDataARB,
                        GLChunk::glCopyBufferSubData, GLChunk::glCopyNamedBufferSubData})
@@ -6763,8 +7667,9 @@ TEST_CASE("OpenGL checkpoint potential writes enumerate all native SSBO and atom
     else
     {
       ++bindingQueries;
-      value = (parameter == eGL_SHADER_STORAGE_BUFFER_BINDING && index == 63) ? 101 :
-              (parameter == eGL_ATOMIC_COUNTER_BUFFER_BINDING && index == 47) ? 202 : 0;
+      value = (parameter == eGL_SHADER_STORAGE_BUFFER_BINDING && index == 63)   ? 101
+              : (parameter == eGL_ATOMIC_COUNTER_BUFFER_BINDING && index == 47) ? 202
+                                                                                : 0;
     }
     return true;
   };
@@ -6780,23 +7685,37 @@ TEST_CASE("OpenGL checkpoint image aliases and incomplete binding evidence forbi
           "[gl][checkpoint][sharing]")
 {
   auto ignore = [](GLuint) {};
-  CHECK_FALSE(GLCheckpointEnumerateBufferWrites(false, false, true,
+  CHECK_FALSE(GLCheckpointEnumerateBufferWrites(
+      false, false, true,
       [](GLenum, GLuint index, GLint &value) {
         value = index == ~0U ? 128 : (index == 127 ? 77 : 0);
         return true;
-      }, ignore));
+      },
+      ignore));
   for(GLint maximum : {0, -1, 65537})
-    CHECK_FALSE(GLCheckpointEnumerateBufferWrites(true, false, false,
-        [maximum](GLenum, GLuint, GLint &value) { value = maximum; return true; }, ignore));
-  CHECK_FALSE(GLCheckpointEnumerateBufferWrites(false, true, false,
+    CHECK_FALSE(GLCheckpointEnumerateBufferWrites(
+        true, false, false,
+        [maximum](GLenum, GLuint, GLint &value) {
+          value = maximum;
+          return true;
+        },
+        ignore));
+  CHECK_FALSE(GLCheckpointEnumerateBufferWrites(
+      false, true, false,
       [](GLenum, GLuint index, GLint &value) {
         value = index == ~0U ? 48 : 0;
         return index != 47;
-      }, ignore));
+      },
+      ignore));
   // GLES contexts without these features have no such write slots. Do not issue invalid queries.
   uint32_t queries = 0;
-  CHECK(GLCheckpointEnumerateBufferWrites(false, false, false,
-      [&](GLenum, GLuint, GLint &) { ++queries; return false; }, ignore));
+  CHECK(GLCheckpointEnumerateBufferWrites(
+      false, false, false,
+      [&](GLenum, GLuint, GLint &) {
+        ++queries;
+        return false;
+      },
+      ignore));
   CHECK(queries == 0);
 }
 
@@ -6846,6 +7765,374 @@ TEST_CASE("OpenGL checkpoint current lineage cannot retain evicted or resized bu
   CHECK_FALSE(bool(GLCheckpointReusableBufferVersion(current, 1024)));
 }
 
+TEST_CASE("OpenGL texture writes distinguish clears from buffer-only state calls",
+          "[gl][checkpoint][texture-sharing]")
+{
+  // Parenthesise the whole comparison: this private enum has no reflected string formatter.
+  // Catch should diagnose the boolean predicate without instantiating DoStringise for the enum.
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glClear) ==
+         GLCheckpointTextureEffect::BoundFramebuffer));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glClearNamedFramebufferfi) ==
+         GLCheckpointTextureEffect::ExplicitDestination));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glCopyImageSubData) ==
+         GLCheckpointTextureEffect::ExplicitDestination));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glClearTexImage) ==
+         GLCheckpointTextureEffect::ExplicitDestination));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glDrawArrays) == GLCheckpointTextureEffect::Draw));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glDispatchComputeIndirect) ==
+         GLCheckpointTextureEffect::Dispatch));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glClearColor) ==
+         GLCheckpointTextureEffect::StateOnly));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glActiveTexture) ==
+         GLCheckpointTextureEffect::StateOnly));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glActiveTextureARB) ==
+         GLCheckpointTextureEffect::StateOnly));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glTexParameteri) ==
+         GLCheckpointTextureEffect::StateOnly));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glBufferSubData) ==
+         GLCheckpointTextureEffect::StateOnly));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glTexSubImage2D) ==
+         GLCheckpointTextureEffect::Unknown));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk::glGenerateMipmap) ==
+         GLCheckpointTextureEffect::Unknown));
+  CHECK((GLCheckpointClassifyTextureEffect(GLChunk(0xffffffff)) ==
+         GLCheckpointTextureEffect::Unknown));
+}
+
+TEST_CASE("OpenGL checkpoint renderbuffer sizing includes packed depth and sample storage",
+          "[gl][checkpoint][texture-sharing]")
+{
+  CHECK(GLRenderbufferByteSize(640, 480, 1, eGL_DEPTH24_STENCIL8) == uint64_t(640) * 480 * 4);
+  CHECK(GLRenderbufferByteSize(640, 480, 4, eGL_DEPTH32F_STENCIL8) == uint64_t(640) * 480 * 4 * 8);
+  CHECK(GLRenderbufferByteSize(640, 480, 4, eGL_RGB10_A2) == uint64_t(640) * 480 * 4 * 4);
+  CHECK(GLRenderbufferByteSize(640, 480, 1, eGL_RGBA8) == uint64_t(640) * 480 * 4);
+  CHECK(GLRenderbufferByteSize(640, 480, 1, eGL_DEPTH_COMPONENT16) == uint64_t(640) * 480 * 2);
+  CHECK(GLRenderbufferByteSize(640, 480, 1, eGL_STENCIL_INDEX8) == uint64_t(640) * 480);
+  CHECK(GLRenderbufferByteSize(65536, 65536, 1, eGL_RGBA8) == (uint64_t(1) << 34));
+  CHECK(GLRenderbufferByteSize(~0U, ~0U, 2, eGL_RGBA8) == 0);
+  CHECK(GLRenderbufferByteSize(0, 480, 1, eGL_RGBA8) == 0);
+  CHECK(GLRenderbufferByteSize(640, 480, 0, eGL_RGBA8) == 0);
+  CHECK(GLRenderbufferByteSize(640, 480, 1, eGL_NONE) == 0);
+}
+
+TEST_CASE("OpenGL texture write evidence includes every FBO slot and fails closed",
+          "[gl][checkpoint][texture-sharing]")
+{
+  const ResourceId color = ResourceIDGen::GetNewUniqueID();
+  const ResourceId hiddenColor = ResourceIDGen::GetNewUniqueID();
+  const ResourceId depthStencil = ResourceIDGen::GetNewUniqueID();
+  const auto resolve = [&](GLenum type, GLuint name) {
+    return name == 10 && type == eGL_TEXTURE        ? color
+           : name == 11 && type == eGL_TEXTURE      ? hiddenColor
+           : name == 12 && type == eGL_RENDERBUFFER ? depthStencil
+                                                    : ResourceId();
+  };
+  bool failQuery = false, missingObject = false;
+  const auto query = [&](GLenum attachment, GLenum parameter, GLint &value) {
+    if(failQuery && attachment == eGL_COLOR_ATTACHMENT7)
+      return false;
+    const bool depth = attachment == eGL_DEPTH_ATTACHMENT || attachment == eGL_STENCIL_ATTACHMENT;
+    const bool present =
+        depth || attachment == eGL_COLOR_ATTACHMENT0 || attachment == eGL_COLOR_ATTACHMENT7;
+    if(parameter == eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE)
+      value = present ? (depth ? eGL_RENDERBUFFER : eGL_TEXTURE) : eGL_NONE;
+    else
+      value = missingObject ? 999 : depth ? 12 : attachment == eGL_COLOR_ATTACHMENT0 ? 10 : 11;
+    return true;
+  };
+  rdcarray<ResourceId> writes;
+  REQUIRE(GLCheckpointFramebufferWriteSet(8, query, resolve, writes));
+  CHECK(writes == rdcarray<ResourceId>({color, hiddenColor, depthStencil}));
+  // No colour write mask, draw route, shader reflection or depth-enable flag filters these IDs.
+  failQuery = true;
+  CHECK_FALSE(GLCheckpointFramebufferWriteSet(8, query, resolve, writes));
+  failQuery = false;
+  missingObject = true;
+  CHECK_FALSE(GLCheckpointFramebufferWriteSet(8, query, resolve, writes));
+  CHECK_FALSE(GLCheckpointFramebufferWriteSet(0, query, resolve, writes));
+  CHECK_FALSE(GLCheckpointFramebufferWriteSet(257, query, resolve, writes));
+}
+
+TEST_CASE("OpenGL texture versions preserve upstream bytes but never unknown or edited descendants",
+          "[gl][checkpoint][texture-sharing]")
+{
+  const ResourceId upstream = ResourceIDGen::GetNewUniqueID();
+  const ResourceId downstream = ResourceIDGen::GetNewUniqueID();
+  auto prefix = std::make_shared<GLCheckpointTextureVersion>();
+  auto suffix = std::make_shared<GLCheckpointTextureVersion>();
+  auto rewritten = std::make_shared<GLCheckpointTextureVersion>();
+  std::map<ResourceId, std::weak_ptr<GLCheckpointTextureVersion>> resident = {{upstream, prefix},
+                                                                              {downstream, suffix}};
+  GLCheckpointApplyTextureWrites(true, {downstream}, resident);
+  CHECK(GLCheckpointTextureResident(resident[upstream], prefix));
+  CHECK_FALSE(GLCheckpointTextureResident(resident[downstream], suffix));
+  CHECK_FALSE(GLCheckpointTextureResident(resident[upstream], rewritten));
+  resident[downstream] = suffix;
+  // Dropping all invalidated downstream CP owners expires its identity, while retained prefix
+  // owners keep upstream content usable across a same-layout CBuffer edit.
+  suffix.reset();
+  CHECK(resident[downstream].expired());
+  CHECK(GLCheckpointTextureResident(resident[upstream], prefix));
+  GLCheckpointApplyTextureWrites(false, {}, resident);
+  CHECK(resident.empty());
+  CHECK_FALSE(GLCheckpointTextureResident({}, prefix));
+}
+
+TEST_CASE("OpenGL shared texture content keeps each checkpoint's sampler state",
+          "[gl][checkpoint][texture-sharing]")
+{
+  GLInitialContents first, second;
+  first.tex.minFilter = eGL_NEAREST;
+  first.tex.wrap[0] = eGL_REPEAT;
+  second.tex.minFilter = eGL_LINEAR;
+  second.tex.wrap[0] = eGL_CLAMP_TO_EDGE;
+  const GLResource copy(NULL, eResTexture, 123);
+  const GLInitialContents restored = GLCheckpointTextureRestoreState(first, copy, false);
+  CHECK((restored.resource == copy));
+  CHECK(restored.tex.minFilter == eGL_NEAREST);
+  CHECK(restored.tex.wrap[0] == eGL_REPEAT);
+  const GLInitialContents alreadyResident = GLCheckpointTextureRestoreState(second, copy, true);
+  CHECK(alreadyResident.resource.name == 0);
+  CHECK(alreadyResident.tex.minFilter == eGL_LINEAR);
+  CHECK(alreadyResident.tex.wrap[0] == eGL_CLAMP_TO_EDGE);
+}
+
+TEST_CASE("OpenGL texture storage counts immutable allocations and validates native shape",
+          "[gl][checkpoint][texture-sharing]")
+{
+  auto prefix = std::make_shared<GLCheckpointTextureVersion>();
+  auto changed = std::make_shared<GLCheckpointTextureVersion>();
+  prefix->bytes = changed->bytes = 4096;
+  GLCheckpointTextureAccounting budget;
+  budget.Add(prefix.get());
+  budget.Add(prefix.get());
+  CHECK(budget.allocated == 4096 + sizeof(GLCheckpointTextureVersion));
+  CHECK(budget.shared == 4096);
+  budget.Add(changed.get());
+  CHECK(budget.allocated == 2 * (4096 + sizeof(GLCheckpointTextureVersion)));
+  auto candidate = prefix;
+  prefix.reset();
+  GLCheckpointTextureAccounting afterEviction;
+  afterEviction.Add(candidate.get());
+  afterEviction.Add(changed.get());
+  CHECK(afterEviction.allocated == budget.allocated);
+  CHECK(afterEviction.shared == 0);
+  TextureDescription desc;
+  desc.width = candidate->width = 32;
+  desc.height = candidate->height = 32;
+  desc.depth = candidate->depth = 1;
+  desc.mips = candidate->mips = 1;
+  desc.msSamp = candidate->samples = 1;
+  candidate->target = eGL_TEXTURE_2D;
+  candidate->format = eGL_RGBA8;
+  candidate->source = GLResource(NULL, eResTexture, 321);
+  CHECK(GLCheckpointTextureShapeMatches(*candidate, candidate->source, 4096, eGL_TEXTURE_2D,
+                                        eGL_RGBA8, desc));
+  desc.msSamp = 4;
+  CHECK_FALSE(GLCheckpointTextureShapeMatches(*candidate, candidate->source, 4096, eGL_TEXTURE_2D,
+                                              eGL_RGBA8, desc));
+  desc.msSamp = 1;
+  CHECK_FALSE(GLCheckpointTextureShapeMatches(*candidate, candidate->source, 8192, eGL_TEXTURE_2D,
+                                              eGL_RGBA8, desc));
+  CHECK_FALSE(GLCheckpointTextureShapeMatches(*candidate, GLResource(NULL, eResTexture, 322), 4096,
+                                              eGL_TEXTURE_2D, eGL_RGBA8, desc));
+}
+
+TEST_CASE("OpenGL patch deltas map original addresses into a compact upload",
+          "[gl][bufferpatch][upload]")
+{
+  ReplayBufferPatch first;
+  first.buffer = ResourceIDGen::GetNewUniqueID();
+  first.byteOffset = 256;
+  first.data = {1, 2, 3};
+  ReplayBufferPatch adjacent = first;
+  adjacent.byteOffset = 259;
+  adjacent.data = {4, 5};
+  ReplayBufferPatch other = first;
+  other.buffer = ResourceIDGen::GetNewUniqueID();
+  other.byteOffset = 4096;
+  other.data = {6, 7, 8};
+  rdcarray<ReplayBufferPatch> previous = {first, adjacent, other}, next = previous;
+  next[0].data[2] = 30;
+  next[1].data = {40, 50};
+  next[2].data[1] = 70;
+  rdcarray<ReplayBufferPatchRange> changes;
+  REQUIRE(GetReplayBufferPatchChanges(previous, next, changes).empty());
+  REQUIRE(changes.size() == 2);
+  rdcarray<GLReplayPatchUploadRange> ranges;
+  REQUIRE(GLReplayPatchUploadRanges(previous, next, changes, ranges));
+  REQUIRE(ranges.size() == 3);
+  CHECK(ranges[0].patch == 0);
+  CHECK(ranges[0].patchOffset == 2);
+  CHECK(ranges[0].uploadOffset == 2);
+  CHECK(ranges[0].bytes == 1);
+  CHECK(ranges[1].patch == 1);
+  CHECK(ranges[1].patchOffset == 0);
+  CHECK(ranges[1].uploadOffset == 3);
+  CHECK(ranges[1].bytes == 2);
+  CHECK(ranges[2].patch == 2);
+  CHECK(ranges[2].patchOffset == 1);
+  CHECK(ranges[2].uploadOffset == 6);
+  CHECK(ranges[2].bytes == 1);
+
+  bytebuf native = {1, 2, 3, 4, 5, 6, 7, 8};
+  const bytebuf expected = {1, 2, 30, 40, 50, 6, 70, 8};
+  uint64_t written = 0, rollback = 0;
+  uint32_t calls = 0;
+  const auto result = GLReplayPatchUpdateUpload(
+      previous, next, ranges,
+      [&](uint64_t offset, const byte *data, uint64_t size, bool undo) {
+        CHECK_FALSE(undo);
+        memcpy(native.data() + size_t(offset), data, size_t(size));
+        ++calls;
+        return true;
+      },
+      written, rollback);
+  CHECK((result == GLReplayPatchUploadResult::Succeeded));
+  CHECK((native == expected));
+  CHECK(written == 4);
+  CHECK(rollback == 0);
+  CHECK(calls == 3);
+
+  // Equal values keep the object but issue no native transfer at all.
+  REQUIRE(GLReplayPatchUploadRanges(next, next, {}, ranges));
+  const auto unchanged = GLReplayPatchUpdateUpload(
+      next, next, ranges,
+      [&](uint64_t, const byte *, uint64_t, bool) {
+        ++calls;
+        return false;
+      },
+      written, rollback);
+  CHECK((unchanged == GLReplayPatchUploadResult::Succeeded));
+  CHECK(calls == 3);
+  CHECK(written == 0);
+}
+
+TEST_CASE("OpenGL upload reuse rejects changed layouts and unrepresentable deltas",
+          "[gl][bufferpatch][upload]")
+{
+  ReplayBufferPatch first;
+  first.buffer = ResourceIDGen::GetNewUniqueID();
+  first.byteOffset = 64;
+  first.data = {1, 2};
+  ReplayBufferPatch second = first;
+  second.byteOffset = 128;
+  rdcarray<ReplayBufferPatch> previous = {first, second}, next = previous;
+  rdcarray<GLReplayPatchUploadRange> ranges;
+  ReplayBufferPatchRange valid = {first.buffer, 64, 1};
+  REQUIRE(GLReplayPatchUploadRanges(previous, next, {valid}, ranges));
+  CHECK_FALSE(GLReplayPatchUploadRanges({}, next, {valid}, ranges));
+  CHECK(ranges.empty());
+  CHECK_FALSE(GLReplayPatchUploadRanges(previous, {}, {valid}, ranges));
+  next[1].byteOffset++;
+  CHECK_FALSE(GLReplayPatchUploadRanges(previous, next, {valid}, ranges));
+  next = previous;
+  next[1].data.push_back(3);
+  CHECK_FALSE(GLReplayPatchUploadRanges(previous, next, {valid}, ranges));
+  next = previous;
+  for(ReplayBufferPatchRange invalid :
+      {ReplayBufferPatchRange{first.buffer, 65, 64}, ReplayBufferPatchRange{first.buffer, 128, 0},
+       ReplayBufferPatchRange{first.buffer, UINT64_MAX, 2},
+       ReplayBufferPatchRange{ResourceId(), 128, 1}, ReplayBufferPatchRange{first.buffer, 64, 1}})
+  {
+    CHECK_FALSE(GLReplayPatchUploadRanges(previous, next, {valid, invalid}, ranges));
+    CHECK(ranges.empty());
+  }
+}
+
+TEST_CASE("OpenGL failed upload allocation never overwrites a previously bound payload",
+          "[gl][bufferpatch][upload]")
+{
+  for(uint32_t failure = 0; failure <= 3; ++failure)
+  {
+    const bytebuf original = {1, 2, 3, 4};
+    const bytebuf replacement = {5, 6, 7, 8};
+    bytebuf accepted = original, candidate;
+    bytebuf *bound = &accepted;
+    uint32_t bindings = 0, allocations = 0;
+    const bool success = GLReplayPatchAllocateUpload([&]() { return failure != 1; },
+                                                     [&]() {
+                                                       ++bindings;
+                                                       if(failure == 2)
+                                                         return false;
+                                                       bound = &candidate;
+                                                       return true;
+                                                     },
+                                                     [&]() {
+                                                       ++allocations;
+                                                       *bound = replacement;
+                                                       return failure != 3;
+                                                     });
+    CHECK(success == (failure == 0));
+    CHECK((accepted == original));
+    CHECK(bindings == (failure == 1 ? 0U : 1U));
+    CHECK(allocations == (failure == 1 || failure == 2 ? 0U : 1U));
+    if(failure == 1 || failure == 2)
+      CHECK(candidate.empty());
+    else
+      CHECK((candidate == replacement));
+  }
+}
+
+TEST_CASE("OpenGL partial upload failure restores all accepted bytes before returning",
+          "[gl][bufferpatch][upload]")
+{
+  ReplayBufferPatch first;
+  first.buffer = ResourceIDGen::GetNewUniqueID();
+  first.byteOffset = 256;
+  first.data = {1, 2, 3, 4};
+  ReplayBufferPatch second = first;
+  second.byteOffset = 512;
+  second.data = {5, 6, 7, 8};
+  rdcarray<ReplayBufferPatch> previous = {first, second}, next = previous;
+  next[0].data[1] = 20;
+  next[1].data[2] = 70;
+  rdcarray<ReplayBufferPatchRange> changes;
+  REQUIRE(GetReplayBufferPatchChanges(previous, next, changes).empty());
+  rdcarray<GLReplayPatchUploadRange> ranges;
+  REQUIRE(GLReplayPatchUploadRanges(previous, next, changes, ranges));
+  const bytebuf original = {1, 2, 3, 4, 5, 6, 7, 8};
+  for(bool rollbackFails : {false, true})
+  {
+    bytebuf native = original;
+    uint32_t writes = 0, undos = 0;
+    uint64_t writtenBytes = 0, rollbackBytes = 0;
+    const auto result = GLReplayPatchUpdateUpload(
+        previous, next, ranges,
+        [&](uint64_t offset, const byte *data, uint64_t size, bool undo) {
+          if(undo)
+          {
+            ++undos;
+            if(rollbackFails && undos == 1)
+              return false;
+          }
+          else
+            ++writes;
+          // Simulate a driver writing the failing transfer too: rollback must cover it.
+          memcpy(native.data() + size_t(offset), data, size_t(size));
+          return undo || writes != 2;
+        },
+        writtenBytes, rollbackBytes);
+    CHECK(writes == 2);
+    CHECK(undos == 2);
+    CHECK(writtenBytes == 1);
+    if(rollbackFails)
+    {
+      CHECK((result == GLReplayPatchUploadResult::RollbackFailed));
+      CHECK((native != original));
+      CHECK(rollbackBytes == 4);
+    }
+    else
+    {
+      CHECK((result == GLReplayPatchUploadResult::Restored));
+      CHECK((native == original));
+      CHECK(rollbackBytes == 8);
+    }
+    CHECK(previous[0].data[1] == 2);
+    CHECK(previous[1].data[2] == 7);
+  }
+}
+
 TEST_CASE("OpenGL persistent uniform patches reject writable binding aliases", "[gl][bufferpatch]")
 {
   // Copy writes have a native post-write hook. Shader/TF/image writes are not assumed absent just
@@ -6860,7 +8147,8 @@ TEST_CASE("OpenGL persistent uniform patches reject writable binding aliases", "
   CHECK(GLReplayPatchBindingCanWrite(eGL_PIXEL_PACK_BUFFER));
 }
 
-TEST_CASE("OpenGL shared value edits preserve only a proven pre-consumer prefix", "[gl][bufferpatch]")
+TEST_CASE("OpenGL shared value edits preserve only a proven pre-consumer prefix",
+          "[gl][bufferpatch]")
 {
   ReplayBufferPatch patch;
   patch.buffer = ResourceIDGen::GetNewUniqueID();
@@ -6951,6 +8239,142 @@ TEST_CASE("OpenGL checkpoint boundary permits uploads but rejects hidden executi
   CHECK(GLCheckpointUnsupportedFrameCall("glFramebufferTexture2DMultisampleEXT"));
 }
 
+TEST_CASE("OpenGL indexed UBO reads use native windows with whole-buffer fallbacks",
+          "[gl][bufferpatch]")
+{
+  const ResourceId buffer = ResourceIDGen::GetNewUniqueID();
+  ReplayResourceRange range = GLReplayPatchUniformReadRange(buffer, 1024, 256, 16, true);
+  CHECK(range.offset == 256);
+  CHECK(range.size == 16);
+  for(const rdcpair<int64_t, int64_t> &values :
+      {rdcpair<int64_t, int64_t>(0, 0), {-1, 16}, {256, -1}, {1024, 16}, {1008, 32}})
+  {
+    range = GLReplayPatchUniformReadRange(buffer, 1024, values.first, values.second, true);
+    CHECK(range.offset == 0);
+    CHECK(range.size == 1024);
+  }
+  range = GLReplayPatchUniformReadRange(buffer, 1024, 256, 16, false);
+  CHECK(range.offset == 0);
+  CHECK(range.size == 1024);
+  // No 32-bit truncation of desktop native binding offsets.
+  range = GLReplayPatchUniformReadRange(buffer, 0x200000000ULL, 0x100000000LL, 16, true);
+  CHECK(range.offset == 0x100000000ULL);
+  CHECK(range.size == 16);
+}
+
+TEST_CASE("OpenGL same-buffer scalar deltas keep prefixes before a later native UBO window",
+          "[gl][bufferpatch]")
+{
+  ReplayBufferPatch early;
+  early.buffer = ResourceIDGen::GetNewUniqueID();
+  early.byteOffset = 0;
+  early.data = {1, 2, 3, 4};
+  ReplayBufferPatch late = early;
+  late.byteOffset = 256;
+  ReplayBufferPatch changed = late;
+  changed.data[2] = 9;
+  std::map<ResourceId, uint32_t> firstReads = {{early.buffer, 8}};
+  rdcarray<ReplayBufferPatchRange> changes;
+  REQUIRE(GetReplayBufferPatchChanges({early, late}, {early, changed}, changes).empty());
+  ReplayResourceAccessIndex index;
+  REQUIRE(index.Register(early.buffer, 0, 512, false));
+  REQUIRE(index.RecordRead(8, GLReplayPatchUniformReadRange(early.buffer, 512, 0, 16, true), true));
+  REQUIRE(index.RecordRead(44, GLReplayPatchUniformReadRange(early.buffer, 512, 256, 16, true), true));
+  REQUIRE(index.FinalizeReads(1, 64, true));
+  rdcstr reason;
+  bool known = false;
+  CHECK(GLReplayPatchRangeValueCutoff({early, late}, {early, changed}, firstReads, index, 64,
+                                      reason, known, &changes) == 44);
+  CHECK(known);
+  // The whole-table prefix anchor and A/B disabled path still start before the earliest UBO.
+  CHECK(GLReplayPatchValueCutoff({early, changed}, {early, changed}, firstReads, reason) == 8);
+  CHECK(GLReplayPatchRangeValueCutoff({early, late}, {early, changed}, firstReads, index, 64,
+                                      reason, known, NULL) == 8);
+  CHECK_FALSE(known);
+  CHECK(GLReplayPatchRangeValueCutoff({early, late}, {}, firstReads, index, 64, reason, known,
+                                      &changes) == 0);
+  ReplayBufferPatch moved = changed;
+  moved.byteOffset++;
+  CHECK(GLReplayPatchRangeValueCutoff({early, late}, {early, moved}, firstReads, index, 64, reason,
+                                      known, &changes) == 0);
+  index.InvalidateForEdit();
+  CHECK(GLReplayPatchRangeValueCutoff({early, late}, {early, changed}, firstReads, index, 64,
+                                      reason, known, &changes) == 8);
+  CHECK_FALSE(known);
+}
+
+TEST_CASE("OpenGL native read proof retains copy and unknown-consumer boundaries",
+          "[gl][bufferpatch]")
+{
+  ReplayBufferPatch old;
+  old.buffer = ResourceIDGen::GetNewUniqueID();
+  old.byteOffset = 256;
+  old.data = {1, 2, 3, 4};
+  ReplayBufferPatch next = old;
+  next.data[0] = 5;
+  rdcarray<ReplayBufferPatchRange> changes;
+  REQUIRE(GetReplayBufferPatchChanges({old}, {next}, changes).empty());
+  rdcstr reason;
+  bool known = false;
+  auto cutoff = [&](const ReplayResourceAccessIndex &index, uint32_t first) {
+    return GLReplayPatchRangeValueCutoff({old}, {next}, {{old.buffer, first}}, index, 64, reason,
+                                         known, &changes);
+  };
+  ReplayResourceAccessIndex copy;
+  REQUIRE(copy.Register(old.buffer, 0, 512, false));
+  // Copy sources and non-UBO inputs cover the whole original storage, not the shader member.
+  REQUIRE(copy.RecordRead(5, {old.buffer, 0, 0, 512}, true));
+  REQUIRE(copy.RecordRead(44, {old.buffer, 0, 256, 16}, true));
+  REQUIRE(copy.FinalizeReads(1, 64, true));
+  CHECK(cutoff(copy, 5) == 5);
+  CHECK(known);
+  for(uint32_t mode = 0; mode < 4; mode++)
+  {
+    ReplayResourceAccessIndex index;
+    REQUIRE(index.Register(old.buffer, 0, 512, mode == 1));
+    REQUIRE(index.RecordRead(8, {old.buffer, 0, 0, 16}, true));
+    if(mode != 2)
+      REQUIRE(index.RecordRead(44, {old.buffer, 0, 256, 16}, true));
+    if(mode == 0)
+      index.RecordUnknown(35);
+    index.FinalizeReads(1, 64, mode != 3);
+    // Unknown event, uncertain alias, no found read and an incomplete scan all keep fallback.
+    CHECK(cutoff(index, 8) == 8);
+    CHECK_FALSE(known);
+  }
+  ReplayResourceAccessIndex budget(16, 16, 1);
+  REQUIRE(budget.Register(old.buffer, 0, 512, false));
+  REQUIRE(budget.RecordRead(44, {old.buffer, 0, 256, 16}, true));
+  REQUIRE(budget.FinalizeReads(1, 64, true));
+  CHECK(cutoff(budget, 8) == 8);
+  CHECK_FALSE(known);
+}
+
+TEST_CASE("OpenGL explicit buffer uploads do not make unrelated static assets writable",
+          "[gl][checkpoint]")
+{
+  const ResourceId uniformBuffer = ResourceIDGen::GetNewUniqueID();
+  const ResourceId mesh = ResourceIDGen::GetNewUniqueID();
+  GLReplayCheckpointBufferWrites writes(1);
+  writes.Record(uniformBuffer);
+  writes.Record(uniformBuffer);
+  REQUIRE(writes.complete);
+  CHECK(writes.buffers.size() == 1);
+  CHECK_FALSE(GLCheckpointShareOriginalContents(
+      writes.complete, writes.buffers.count(uniformBuffer) != 0, false, false));
+  CHECK(GLCheckpointShareOriginalContents(writes.complete, writes.buffers.count(mesh) != 0, false,
+                                          false));
+  CHECK(GLCheckpointShareOriginalContents(writes.complete, false, false, false));
+  writes.Record(mesh);
+  CHECK_FALSE(writes.complete);
+  CHECK_FALSE(GLCheckpointShareOriginalContents(writes.complete, false, false, false));
+  writes.Clear();
+  CHECK(writes.complete);
+  CHECK(writes.buffers.empty());
+  writes.Record(ResourceId());
+  CHECK_FALSE(writes.complete);
+}
+
 TEST_CASE("OpenGL static checkpoint sharing requires complete frame content evidence",
           "[gl][checkpoint][resourceversions]")
 {
@@ -6958,10 +8382,10 @@ TEST_CASE("OpenGL static checkpoint sharing requires complete frame content evid
   CHECK(GLCheckpointContentEvidenceComplete(GLChunk::glDispatchCompute));
   CHECK(GLCheckpointContentEvidenceComplete(GLChunk::glBindFramebuffer));
   CHECK(GLCheckpointContentEvidenceComplete(GLChunk::glClear));
-  // Legal checkpoint commands can still invalidate the stronger static-content proof. Missing
-  // per-resource usage is not permission to share after an upload, copy, mip build or unknown call.
-  CHECK_FALSE(GLCheckpointContentEvidenceComplete(GLChunk::glNamedBufferSubDataEXT));
-  CHECK_FALSE(GLCheckpointContentEvidenceComplete(GLChunk::glCopyBufferSubData));
+  // Buffer SubData/copy destinations have a separate complete native write set. Other legal
+  // commands still invalidate the static-content proof until their destinations are tracked too.
+  CHECK(GLCheckpointContentEvidenceComplete(GLChunk::glNamedBufferSubDataEXT));
+  CHECK(GLCheckpointContentEvidenceComplete(GLChunk::glCopyBufferSubData));
   CHECK_FALSE(GLCheckpointContentEvidenceComplete(GLChunk::glTextureSubImage2DEXT));
   CHECK_FALSE(GLCheckpointContentEvidenceComplete(GLChunk::glGenerateMipmap));
   CHECK_FALSE(GLCheckpointContentEvidenceComplete(GLChunk(0xffffffffU)));
@@ -6973,7 +8397,42 @@ TEST_CASE("OpenGL static checkpoint sharing requires complete frame content evid
   CHECK_FALSE(GLCheckpointShareOriginalContents(true, false, false, true));
   CHECK_FALSE(GLCheckpointShareOriginalContents(true, true, true, true));
 }
-TEST_CASE("OpenGL checkpoints reject actual object slots beyond their saved state", "[gl][checkpoint]")
+TEST_CASE("OpenGL checkpoint metadata is bounded before uniform expansion",
+          "[gl][replay][checkpoint]")
+{
+  GLCheckpointMetadataBudget exact(64);
+  CHECK(exact.Add(4, 16));
+  CHECK_FALSE(exact.Add(1, 1));
+  CHECK_FALSE(exact.Add(0, 1));
+  GLCheckpointMetadataBudget overflow(~0ULL);
+  CHECK(overflow.limit == 64ULL * 1024 * 1024);
+  CHECK_FALSE(overflow.Add(~0ULL, 2048));
+  GLCheckpointMetadataBudget arrays(4096);
+  CHECK(GLCheckpointUniformMetadata(arrays, -1, 2, 8));
+  CHECK_FALSE(GLCheckpointUniformMetadata(arrays, -1, 1, 8));
+  GLCheckpointMetadataBudget invalid(65536);
+  CHECK_FALSE(GLCheckpointUniformMetadata(invalid, -1, 1, 1025));
+  CHECK_FALSE(GLCheckpointUniformMetadata(invalid, -1, -1, 8));
+  // Buffer-backed uniforms never allocate value arrays in the loose-uniform serializer.
+  CHECK(GLCheckpointUniformMetadata(invalid, 0, INT_MAX, INT_MAX));
+  ShaderConstant scalar;
+  scalar.name = "value";
+  scalar.type.elements = 2;
+  CHECK(GLCheckpointConstantMetadata(invalid, scalar, 0, 0));
+  scalar.type.elements = ~0U;
+  CHECK_FALSE(GLCheckpointConstantMetadata(invalid, scalar, 0, 0));
+  GLCheckpointMetadataBudget nested(65536);
+  ShaderConstant structure;
+  structure.name = "structure";
+  structure.type.elements = 2;
+  scalar.type.elements = 1;
+  structure.type.members.push_back(scalar);
+  CHECK_FALSE(GLCheckpointConstantMetadata(nested, structure, 0, 0));
+  CHECK_FALSE(GLCheckpointConstantMetadata(nested, scalar, 0, 33));
+}
+
+TEST_CASE("OpenGL checkpoints reject actual object slots beyond their saved state",
+          "[gl][checkpoint]")
 {
   SDChunk attachment("glNamedFramebufferTexture"_lit);
   SDObject *slot = attachment.AddAndOwnChild(makeSDEnum("attachment"_lit, eGL_COLOR_ATTACHMENT7));

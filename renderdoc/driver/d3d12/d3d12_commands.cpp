@@ -1246,6 +1246,9 @@ RDResult WrappedID3D12CommandQueue::ReplayLog(CaptureState readType, uint32_t st
   if(IsLoading(m_State))
   {
     m_Cmd.m_ReplaySubmissionQueues.clear();
+    m_Cmd.m_ReplayTypedRootChunks.clear();
+    m_Cmd.m_ReplayTypedFrameBegin = m_Cmd.m_ReplayTypedFrameEnd = ser.GetReader()->GetOffset();
+    m_Cmd.m_ReplayTypedRootComplete = true;
     m_pDevice->ApplyInitialContents();
 
     m_pDevice->ExecuteLists();
@@ -2093,13 +2096,22 @@ void BakedCmdListInfo::ShiftForRemoved(uint32_t shiftActionID, uint32_t shiftEID
     for(CheckpointBarrierOp &barrier : checkpointBarriers)
       if(barrier.relativeEvent >= firstFollowingEvent)
         barrier.relativeEvent -= shiftEID;
+    for(CheckpointBarrierOp &barrier : replayTypedBarriers)
+      if(barrier.relativeEvent >= firstFollowingEvent)
+        barrier.relativeEvent -= shiftEID;
     for(uint32_t &event : replayClearUnsafeBarriers)
       if(event >= firstFollowingEvent)
         event -= shiftEID;
     for(ReplayClearOp &clear : replayClearOps)
       if(clear.relativeEvent >= firstFollowingEvent)
         clear.relativeEvent -= shiftEID;
+    for(ReplayTextureCopyOp &copy : replayTextureCopies)
+      if(copy.relativeEvent >= firstFollowingEvent)
+        copy.relativeEvent -= shiftEID;
     for(ReplayTextureReadOp &read : replayTextureReadOps)
+      if(read.relativeEvent >= firstFollowingEvent)
+        read.relativeEvent -= shiftEID;
+    for(BufferPatchReadOp &read : bufferPatchReads)
       if(read.relativeEvent >= firstFollowingEvent)
         read.relativeEvent -= shiftEID;
     for(auto &write : replayWriteFirstEvents)
@@ -3097,6 +3109,8 @@ TEST_CASE("D3D12 checkpoint metadata follows final indirect event counts",
   BakedCmdListInfo::CheckpointBarrierOp barrier;
   barrier.relativeEvent = 8;
   info.checkpointBarriers.push_back(barrier);
+  info.replayTypedBarriers.push_back(barrier);
+  info.RecordReplayTextureCopy({baked, baked, 10, true, true});
   info.replayClearUnsafeBarriers = {2, 8};
   info.replayClearOps.push_back({baked, 10, true, true});
   BakedCmdListInfo::ReplayTextureReadOp beforeIndirect, afterIndirect;
@@ -3116,6 +3130,8 @@ TEST_CASE("D3D12 checkpoint metadata follows final indirect event counts",
   CHECK(info.checkpointQueries[0].relativeEvent == 1);
   CHECK(info.checkpointQueries[1].relativeEvent == 4);
   CHECK(info.checkpointBarriers[0].relativeEvent == 5);
+  CHECK(info.replayTypedBarriers[0].relativeEvent == 5);
+  CHECK(info.replayTextureCopies[0].relativeEvent == 7);
   REQUIRE(info.replayClearUnsafeBarriers.size() == 2);
   CHECK(info.replayClearUnsafeBarriers[0] == 2);
   CHECK(info.replayClearUnsafeBarriers[1] == 5);
@@ -4562,12 +4578,32 @@ void D3D12CommandData::MarkReplaySubmittedOverwrites(ResourceId baked, uint32_t 
 
 void D3D12CommandData::ObserveCheckpointChunk(D3D12Chunk chunk, uint64_t chunkEndOffset)
 {
+  m_ReplayTypedFrameEnd = chunkEndOffset;
+  if(m_ReplayTypedRootComplete && m_LastCmdListID == ResourceId())
+  {
+    if(m_ReplayTypedRootChunks.size() >= 1000000 || !m_StructuredFile ||
+       m_StructuredFile->chunks.empty() || m_CurChunkOffset >= chunkEndOffset)
+    {
+      m_ReplayTypedRootComplete = false;
+      m_ReplayTypedRootChunks.clear();
+    }
+    else
+      m_ReplayTypedRootChunks.push_back({m_CurChunkOffset, chunkEndOffset, m_RootEventID,
+          uint32_t(m_StructuredFile->chunks.size() - 1), chunk});
+  }
+  m_BufferPatchReadIndexPrepared = false;
   if(m_LastCmdListID != ResourceId())
   {
     BakedCmdListInfo &info = m_BakedCmdListInfo[m_LastCmdListID];
     if(chunk == D3D12Chunk::List_Reset)
     {
+      info.bufferPatchReads.clear();
+      info.bufferPatchReadsComplete = true;
       info.replayClearOps.clear();
+      info.replayTextureCopies.clear();
+      info.replayTextureCopiesComplete = true;
+      info.replayTypedBarriers.clear();
+      info.replayTypedBarriersComplete = true;
       info.replayTextureReadOps.clear();
       info.replayTextureReadEntries = 0;
       info.replayTextureReadsComplete = true;
@@ -4585,6 +4621,7 @@ void D3D12CommandData::ObserveCheckpointChunk(D3D12Chunk chunk, uint64_t chunkEn
       info.replayWritesKnown = info.replayWriteEventsKnown = info.replayUnknownWrites = false;
     }
     const uint32_t firstWriteEvent = ReplayChunkFirstWriteEvent(info, chunk);
+    ObserveBufferPatchReads(info, chunk, firstWriteEvent);
     const bool previouslyKnown = !info.replayUnknownWrites;
     if(!IsPreparedReplaySafeChunk(chunk) && chunk != D3D12Chunk::List_ExecuteIndirect &&
        chunk != D3D12Chunk::List_SetPredication && chunk != D3D12Chunk::List_DiscardResource &&
@@ -4685,8 +4722,13 @@ void D3D12CommandData::ObserveCheckpointChunk(D3D12Chunk chunk, uint64_t chunkEn
   else if(chunk == D3D12Chunk::List_Close)
     m_BakedCmdListInfo[m_LastCmdListID].checkpointEnd = chunkEndOffset;
   else if(chunk == D3D12Chunk::Queue_ExecuteCommandLists)
+  {
     m_CheckpointBoundaries.push_back(
         {m_RootEventID - 1, m_RootEventID, m_RootActionID, chunkEndOffset});
+    if(m_pDevice)
+      m_pDevice->RecordCheckpointDescriptorBytes(m_CheckpointBoundaries.back().descriptorBytes,
+                                                 m_CheckpointBoundaries.back().fullDescriptorBytes);
+  }
 
   // These commands carry state outside normal resource bytes and closed primary lists. A future
   // backend extension must explicitly save their state before permitting a seek across them.
@@ -4795,6 +4837,403 @@ static bool ObserveReplayClearPrefix(D3D12Chunk chunk, bool unsafeBarrier,
     return true;
   }
   return IsReplayClearPrefixState(chunk);
+}
+
+// The simple whole-resource model is used only for non-inheriting UNKNOWN-layout textures.
+// A frame can start with an unknown active owner. Later explicit activation and initialization
+// may establish a valid state; preceding unknown contents must never be copied as a checkpoint.
+struct ReplayTypedAliasOwners
+{
+  const std::map<ResourceId, std::set<ResourceId>> &conflicts;
+  std::set<ResourceId> unknown, active, valid;
+  ReplayTypedAliasOwners(const std::map<ResourceId, std::set<ResourceId>> &graph) : conflicts(graph)
+  {
+    for(const auto &entry : graph)
+      unknown.insert(entry.first);
+  }
+  void Activate(ResourceId id)
+  {
+    auto found = conflicts.find(id);
+    if(found == conflicts.end())
+      return;
+    unknown.erase(id);
+    valid.erase(id);
+    active.insert(id);
+    for(ResourceId other : found->second)
+    {
+      unknown.erase(other);
+      active.erase(other);
+      valid.erase(other);
+    }
+  }
+  void Access(ResourceId id)
+  {
+    auto found = conflicts.find(id);
+    if(found == conflicts.end() || valid.count(id))
+      return;
+    // No positive owner proof for this possible access. Do not guess data inheritance or
+    // activation from GetUsage; a later explicit full initialization can recover the proof.
+    for(ResourceId other : found->second)
+    {
+      // Descriptor ranges are upper bounds: this access might not actually execute. Therefore
+      // it cannot prove another possible owner's contents dead. Preserve that uncertainty until
+      // an unconditional explicit activation invalidates its actual physical overlap.
+      if(active.count(other) || valid.count(other))
+        unknown.insert(other);
+      active.erase(other);
+      valid.erase(other);
+    }
+    active.erase(id);
+    unknown.insert(id);
+  }
+  void Initialize(ResourceId id, bool full)
+  {
+    if(!conflicts.count(id))
+      return;
+    if(full && active.count(id))
+      valid.insert(id);
+    else
+      Access(id);
+  }
+  void Transition(ResourceId id)
+  {
+    // Transitioning an explicitly active owner is necessary before its initial Clear/Copy.
+    // An inactive/unknown alias can change layout metadata and destroys an overlapping proof.
+    if(!active.count(id))
+      Access(id);
+  }
+  bool Complete() const { return unknown.empty() && active == valid; }
+};
+
+bool D3D12CommandData::GetReplayTextureAliasOwners(
+    uint32_t throughEvent, const std::map<ResourceId, std::set<ResourceId>> &conflicts,
+    std::set<ResourceId> &owners, rdcstr &reason) const
+{
+  owners.clear();
+  const auto fail = [&](uint32_t event, const char *why) {
+    reason = StringFormat::Fmt("Texture alias owner proof: %s at EID %u", why, event);
+    return false;
+  };
+  if(conflicts.empty())
+    return true;
+  // Loading swaps the serialiser's structured file back to the device before returning. The
+  // command-data pointer can still name that temporary serialiser until the next replay starts.
+  const SDFile *structured = m_pDevice ? m_pDevice->GetStructuredFile() : m_StructuredFile;
+  if(!throughEvent || !structured || throughEvent >= m_Events.size() ||
+     throughEvent > 1000000 || conflicts.size() > 4096 || !m_CheckpointUnsupported.empty())
+    return fail(throughEvent, "invalid range, incomplete capture, or metadata budget");
+  uint64_t prefixEnd = 0;
+  for(const CheckpointBoundary &boundary : m_CheckpointBoundaries)
+    if(boundary.eventId == throughEvent && boundary.nextEvent == throughEvent + 1)
+      prefixEnd = boundary.offset;
+  if(!prefixEnd || !m_ReplayTypedRootComplete || !m_ReplayTypedFrameBegin ||
+     prefixEnd <= m_ReplayTypedFrameBegin || prefixEnd > m_ReplayTypedFrameEnd)
+    return fail(throughEvent, "missing complete native root prefix");
+  uint64_t work = 0, previousRootEnd = m_ReplayTypedFrameBegin;
+  bool submittedBoundary = false;
+  for(const ReplayTypedRootChunk &root : m_ReplayTypedRootChunks)
+  {
+    if(root.offset >= prefixEnd)
+      break;
+    if(++work > 1000000 || root.offset < previousRootEnd || root.offset >= root.endOffset ||
+       root.endOffset > prefixEnd || root.chunkIndex >= structured->chunks.size() ||
+       structured->chunks[root.chunkIndex]->metadata.chunkID != uint32_t(root.type) ||
+       !root.nextEvent || root.nextEvent > throughEvent + 1)
+      return fail(throughEvent, "invalid native root identity or prefix coverage");
+    previousRootEnd = root.endOffset;
+    submittedBoundary |= root.endOffset == prefixEnd && root.nextEvent == throughEvent + 1 &&
+                         root.type == D3D12Chunk::Queue_ExecuteCommandLists;
+    switch(root.type)
+    {
+      case D3D12Chunk::Queue_ExecuteCommandLists:
+      case D3D12Chunk::Queue_Signal:
+      case D3D12Chunk::Queue_Wait:
+      case D3D12Chunk::Queue_BeginEvent:
+      case D3D12Chunk::Queue_EndEvent:
+      case D3D12Chunk::Queue_SetMarker:
+      case D3D12Chunk::SetCommandAnnotation:
+      case D3D12Chunk::SetQueueAnnotation:
+      // Descriptor creation/copy changes descriptor storage, not texture contents or activation.
+      // Consumers still use complete captured descriptor history and exact RTV/DSV identities.
+      case D3D12Chunk::Device_CreateConstantBufferView:
+      case D3D12Chunk::Device_CreateShaderResourceView:
+      case D3D12Chunk::Device_CreateUnorderedAccessView:
+      case D3D12Chunk::Device_CreateRenderTargetView:
+      case D3D12Chunk::Device_CreateDepthStencilView:
+      case D3D12Chunk::Device_CreateSampler:
+      case D3D12Chunk::Device_CreateSampler2:
+      case D3D12Chunk::Device_CopyDescriptors:
+      case D3D12Chunk::Device_CopyDescriptorsSimple: break;
+      default:
+      {
+        reason = StringFormat::Fmt("Texture alias owner proof: unsupported root %s before EID %u",
+                                   ToStr(root.type).c_str(), root.nextEvent);
+        return false;
+      }
+    }
+  }
+  if(!submittedBoundary)
+    return fail(throughEvent, "native submission boundary is missing");
+  uint64_t graphEdges = 0;
+  for(const auto &entry : conflicts)
+  {
+    graphEdges += entry.second.size();
+    if(graphEdges > 65536)
+      return fail(0, "physical overlap graph budget");
+    if(entry.first == ResourceId() || entry.second.empty() || entry.second.count(entry.first))
+      return fail(0, "invalid physical overlap graph");
+    for(ResourceId other : entry.second)
+    {
+      auto opposite = conflicts.find(other);
+      if(opposite == conflicts.end() || !opposite->second.count(entry.first))
+        return fail(0, "incomplete physical overlap closure");
+    }
+  }
+  struct Occurrence
+  {
+    uint32_t base, end;
+    const BakedCmdListInfo *info;
+  };
+  rdcarray<Occurrence> occurrences;
+  std::set<ResourceId> queues;
+  std::map<uint32_t, const BakedCmdListInfo::ReplayTextureReadOp *> reads;
+  std::map<uint32_t, const BakedCmdListInfo::ReplayTextureCopyOp *> copies;
+  std::map<uint32_t, const BakedCmdListInfo::ReplayClearOp *> clears;
+  std::map<uint32_t, rdcarray<const BakedCmdListInfo::CheckpointBarrierOp *>> aliases;
+  std::set<uint32_t> unsafeBarriers;
+  for(const auto &entry : m_Partial[Primary].cmdListExecs)
+  {
+    const auto baked = m_BakedCmdListInfo.find(entry.first);
+    if(baked == m_BakedCmdListInfo.end())
+      return fail(0, "missing submitted command-list metadata");
+    const auto &info = baked->second;
+    for(uint32_t base : entry.second)
+    {
+      if(base > throughEvent)
+        continue;
+      const uint64_t end = uint64_t(base) + info.eventCount;
+      const auto queue = m_ReplaySubmissionQueues.find(base);
+      if(!info.eventCount || end > throughEvent || info.type != D3D12_COMMAND_LIST_TYPE_DIRECT ||
+         !info.checkpointBegin || !info.checkpointEnd || info.checkpointChunks.empty() ||
+         !info.replayTextureReadsComplete || !info.replayTextureCopiesComplete ||
+         !info.replayTypedBarriersComplete || queue == m_ReplaySubmissionQueues.end() ||
+         queue->second == ResourceId())
+        return fail(base, "incomplete primary submission or texture access evidence");
+      queues.insert(queue->second);
+      if(queues.size() != 1)
+        return fail(base, "multiple participating queues");
+      occurrences.push_back({base, uint32_t(end), &info});
+      for(const auto &read : info.replayTextureReadOps)
+        if(++work > 1000000 || read.relativeEvent >= info.eventCount ||
+           !reads.insert({base + read.relativeEvent, &read}).second)
+          return fail(base, "invalid read index or metadata budget");
+      for(const auto &copy : info.replayTextureCopies)
+        if(++work > 1000000 || copy.relativeEvent >= info.eventCount ||
+           !copies.insert({base + copy.relativeEvent, &copy}).second)
+          return fail(base, "invalid copy index or metadata budget");
+      for(const auto &clear : info.replayClearOps)
+        if(++work > 1000000 || clear.relativeEvent >= info.eventCount ||
+           !clears.insert({base + clear.relativeEvent, &clear}).second)
+          return fail(base, "invalid clear index or metadata budget");
+      for(const auto &barrier : info.replayTypedBarriers)
+      {
+        if(++work > 1000000 || barrier.relativeEvent >= info.eventCount)
+          return fail(base, "invalid barrier index or metadata budget");
+        aliases[base + barrier.relativeEvent].push_back(&barrier);
+      }
+      for(uint32_t unsafe : info.replayClearUnsafeBarriers)
+      {
+        if(++work > 1000000 || unsafe >= info.eventCount)
+          return fail(base, "invalid unsafe barrier index or metadata budget");
+        unsafeBarriers.insert(base + unsafe);
+      }
+    }
+  }
+  for(const auto &entry : m_Partial[Secondary].cmdListExecs)
+    for(uint32_t base : entry.second)
+      if(base <= throughEvent)
+        return fail(base, "secondary execution");
+  std::sort(occurrences.begin(), occurrences.end(),
+            [](const Occurrence &a, const Occurrence &b) { return a.base < b.base; });
+  for(size_t i = 1; i < occurrences.size(); i++)
+    if(occurrences[i].base < occurrences[i - 1].end)
+      return fail(occurrences[i].base, "overlapping primary submissions");
+
+  ReplayTypedAliasOwners state(conflicts);
+  std::map<BakedCmdListInfo::ReplayUAVRange, std::set<ResourceId>> descriptorAliases;
+  std::set<ResourceId> touchedMembers;
+  const auto chargeAccess = [&](ResourceId id) {
+    auto found = conflicts.find(id);
+    // Touching any member makes its entire physical overlap component relevant. Only wholly
+    // untouched components may retain their canonical initial contents without an owner copy.
+    if(found != conflicts.end() && touchedMembers.insert(id).second)
+    {
+      rdcarray<ResourceId> pending = {id};
+      while(!pending.empty())
+      {
+        const ResourceId member = pending.back();
+        pending.pop_back();
+        if(++work > 1000000)
+          return false;
+        for(ResourceId other : conflicts.at(member))
+        {
+          if(++work > 1000000)
+            return false;
+          if(touchedMembers.insert(other).second)
+            pending.push_back(other);
+        }
+      }
+    }
+    work += found == conflicts.end() ? 1 : 1 + found->second.size();
+    return work <= 1000000;
+  };
+  size_t occurrence = 0;
+  for(uint32_t eid = 1; eid <= throughEvent; eid++)
+  {
+    if(++work > 1000000)
+      return fail(eid, "query work budget");
+    while(occurrence < occurrences.size() && eid >= occurrences[occurrence].end)
+      occurrence++;
+    if(occurrence == occurrences.size() || eid < occurrences[occurrence].base)
+      continue;    // the native root index proved these calls, gaps, and synthetic boundaries
+    const APIEvent &event = m_Events[eid];
+    if(event.eventId != eid || event.chunkIndex >= structured->chunks.size())
+      return fail(eid, "missing exact submitted API event");
+    const auto chunk = D3D12Chunk(structured->chunks[event.chunkIndex]->metadata.chunkID);
+    const auto &item = occurrences[occurrence];
+    const auto &info = *item.info;
+    auto recorded = std::lower_bound(info.checkpointChunks.begin(), info.checkpointChunks.end(),
+                                     event.fileOffset,
+                                     [](const BakedCmdListInfo::CheckpointRecordingChunk &c,
+                                        uint64_t offset) { return c.offset < offset; });
+    if(recorded == info.checkpointChunks.end() || recorded->offset != event.fileOffset ||
+       recorded->type != chunk)
+      return fail(eid, "recording identity mismatch");
+    if(chunk == D3D12Chunk::List_ResourceBarrier)
+    {
+      if(unsafeBarriers.count(eid))
+        return fail(eid, "split or unknown barrier");
+      auto barriers = aliases.find(eid);
+      if(barriers != aliases.end())
+        for(const auto *barrier : barriers->second)
+        {
+          if(++work > 1000000)
+            return fail(eid, "barrier work budget");
+          if(barrier->flags != D3D12_RESOURCE_BARRIER_FLAG_NONE ||
+             (barrier->type != D3D12_RESOURCE_BARRIER_TYPE_ALIASING &&
+              barrier->type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION))
+            return fail(eid, "split or unknown typed barrier");
+          const ResourceId target = barrier->type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING
+                                        ? barrier->after
+                                        : barrier->before;
+          if(target == ResourceId())
+            return fail(eid, "wildcard alias activation or null transition");
+          if(!chargeAccess(target))
+            return fail(eid, "alias activation work budget");
+          if(barrier->type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING)
+            state.Activate(target);
+          else
+            state.Transition(target);
+        }
+      continue;
+    }
+    if(chunk == D3D12Chunk::List_DrawInstanced || chunk == D3D12Chunk::List_DrawIndexedInstanced ||
+       chunk == D3D12Chunk::List_Dispatch || chunk == D3D12Chunk::List_DispatchMesh ||
+       chunk == D3D12Chunk::List_ExecuteIndirect)
+    {
+      const auto found = reads.find(eid);
+      const auto *access = found == reads.end() ? NULL : found->second;
+      if(!access || access->unknown)
+        return fail(eid, "missing or unknown texture bindings");
+      std::set<ResourceId> mayAccess;
+      for(ResourceId direct : access->directResources)
+      {
+        if(++work > 1000000)
+          return fail(eid, "overlap access work budget");
+        if(conflicts.count(direct))
+          mayAccess.insert(direct);
+      }
+      for(const auto &range : access->descriptorRanges)
+      {
+        if(++work > 1000000)
+          return fail(eid, "descriptor access work budget");
+        auto known = descriptorAliases.find(range);
+        if(known == descriptorAliases.end())
+        {
+          auto *rm = m_pDevice ? m_pDevice->GetResourceManager() : NULL;
+          ID3D12DeviceChild *object = rm && rm->HasResource(range.heap) &&
+                                              !rm->HasReplacement(range.heap) &&
+                                              rm->GetUnreplacedID(range.heap) == range.heap
+                                          ? rm->GetResourceWithoutReplacement(range.heap, true)
+                                          : NULL;
+          if(!object || TryIdentifyTypeByPtr(object) != Resource_DescriptorHeap)
+            return fail(eid, "descriptor heap identity changed");
+          auto *heap = (WrappedID3D12DescriptorHeap *)object;
+          std::set<ResourceId> referenced;
+          for(const auto &candidate : conflicts)
+          {
+            if(++work > 1000000)
+              return fail(eid, "descriptor history work budget");
+            if(heap->ReplayRangeMayReference(candidate.first, range.first, range.count))
+              referenced.insert(candidate.first);
+          }
+          known = descriptorAliases.insert({range, std::move(referenced)}).first;
+        }
+        for(ResourceId id : known->second)
+        {
+          if(++work > 1000000)
+            return fail(eid, "descriptor closure work budget");
+          mayAccess.insert(id);
+        }
+      }
+      for(ResourceId id : mayAccess)
+      {
+        if(!chargeAccess(id))
+          return fail(eid, "owner update work budget");
+        state.Access(id);
+      }
+      continue;
+    }
+    if(chunk == D3D12Chunk::List_CopyResource || chunk == D3D12Chunk::List_CopyTextureRegion)
+    {
+      const auto found = copies.find(eid);
+      const auto *copy = found == copies.end() ? NULL : found->second;
+      if(!copy || copy->source == ResourceId() || copy->destination == ResourceId())
+        return fail(eid, "missing copy identities");
+      if(!chargeAccess(copy->source) || !chargeAccess(copy->destination))
+        return fail(eid, "copy owner work budget");
+      state.Access(copy->source);
+      state.Initialize(copy->destination, copy->unconditional && copy->fullResource);
+      continue;
+    }
+    if(chunk == D3D12Chunk::List_ClearRenderTargetView ||
+       chunk == D3D12Chunk::List_ClearDepthStencilView || chunk == D3D12Chunk::List_DiscardResource)
+    {
+      const auto found = clears.find(eid);
+      const auto *clear = found == clears.end() ? NULL : found->second;
+      if(!clear || clear->resource == ResourceId())
+        return fail(eid, "missing clear identity");
+      if(!chargeAccess(clear->resource))
+        return fail(eid, "clear owner work budget");
+      state.Initialize(clear->resource, clear->unconditional && clear->fullResource);
+      continue;
+    }
+    if(IsReplayClearPrefixState(chunk) || chunk == D3D12Chunk::List_CopyBufferRegion ||
+       chunk == D3D12Chunk::List_ResolveQueryData)
+      continue;
+    return fail(eid, "unclassified texture operation");
+  }
+  // A wholly untouched overlap component keeps its canonical initial contents. Initial heap
+  // restoration is not skipped by this path. Every component which was touched needs complete
+  // owner/initialization evidence, including unknown nonoverlapping owners in the same closure.
+  bool complete = state.active == state.valid;
+  for(ResourceId id : state.unknown)
+    complete &= touchedMembers.count(id) == 0;
+  if(!complete)
+    return fail(throughEvent, "active owner or full initialization remains unknown");
+  owners = state.valid;
+  reason.clear();
+  return true;
 }
 
 std::set<ResourceId> D3D12CommandData::GetReplayFullClearPrefix(
@@ -5098,6 +5537,262 @@ std::set<ResourceId> D3D12CommandData::GetReplayFullClearPrefix(
 }
 
 #if ENABLED(ENABLE_UNIT_TESTS)
+TEST_CASE("D3D12 typed alias owners require activation initialization and nonoverlap",
+          "[d3d12][checkpoint][typed-alias]")
+{
+  const ResourceId a = ResourceIDGen::GetNewUniqueID(), b = ResourceIDGen::GetNewUniqueID();
+  const ResourceId c = ResourceIDGen::GetNewUniqueID(), unrelated = ResourceIDGen::GetNewUniqueID();
+  // A spans B and C; B and C are adjacent nonoverlapping owners in the same closure.
+  std::map<ResourceId, std::set<ResourceId>> graph = {{a, {b, c}}, {b, {a}}, {c, {a}}};
+  ReplayTypedAliasOwners state(graph);
+  CHECK_FALSE(state.Complete());
+  state.Access(a);    // initially active capture state is not automatically a known snapshot
+  CHECK_FALSE(state.Complete());
+  state.Activate(a);
+  CHECK_FALSE(state.Complete());
+  state.Initialize(a, true);
+  REQUIRE(state.Complete());
+  CHECK(state.valid == std::set<ResourceId>{a});
+  state.Access(unrelated);
+  state.Initialize(a, false);    // partial update preserves an already fully initialized owner
+  CHECK(state.Complete());
+  state.Activate(b);
+  CHECK_FALSE(state.Complete());
+  state.Initialize(b, true);
+  REQUIRE(state.Complete());
+  CHECK(state.valid == std::set<ResourceId>{b});
+  state.Activate(c);
+  state.Initialize(c, true);
+  REQUIRE(state.Complete());
+  CHECK(state.valid == std::set<ResourceId>({b, c}));
+  state.Access(a);    // an unproved overlapping access invalidates both owners
+  CHECK_FALSE(state.Complete());
+  CHECK(state.valid.empty());
+  state.Initialize(a, true);    // full copy alone cannot infer an omitted explicit activation
+  CHECK_FALSE(state.Complete());
+  state.Activate(a);
+  state.Initialize(a, true);
+  CHECK(state.Complete());
+
+  // A and C do not overlap; B overlaps both. A *possible* B access cannot prove A dead when a
+  // subsequent explicit C activation only invalidates B. Otherwise A's live contents are lost.
+  std::map<ResourceId, std::set<ResourceId>> chain = {{a, {b}}, {b, {a, c}}, {c, {b}}};
+  ReplayTypedAliasOwners uncertain(chain);
+  uncertain.Activate(a);
+  uncertain.Initialize(a, true);
+  uncertain.Activate(c);
+  uncertain.Initialize(c, true);
+  REQUIRE(uncertain.Complete());
+  uncertain.Access(b);
+  uncertain.Activate(c);
+  uncertain.Initialize(c, true);
+  CHECK_FALSE(uncertain.Complete());
+  CHECK(uncertain.unknown.count(a) == 1);
+  ReplayTypedAliasOwners transitions(graph);
+  transitions.Activate(a);
+  transitions.Transition(a);    // owner transition before full initialization is necessary
+  transitions.Initialize(a, true);
+  CHECK(transitions.Complete());
+  transitions.Transition(b);    // another alias's transition may touch hidden metadata
+  CHECK_FALSE(transitions.Complete());
+  transitions.Activate(a);
+  transitions.Initialize(a, true);
+  CHECK(transitions.Complete());
+}
+
+TEST_CASE("D3D12 typed owner proof rebases actual submissions and rejects hidden work",
+          "[d3d12][checkpoint][typed-alias]")
+{
+  SDFile file;
+  D3D12CommandData command;
+  command.m_StructuredFile = &file;
+  const ResourceId a = ResourceIDGen::GetNewUniqueID(), b = ResourceIDGen::GetNewUniqueID();
+  const ResourceId source = ResourceIDGen::GetNewUniqueID(), queue = ResourceIDGen::GetNewUniqueID();
+  const ResourceId first = ResourceIDGen::GetNewUniqueID(), second = ResourceIDGen::GetNewUniqueID();
+  std::map<ResourceId, std::set<ResourceId>> graph = {{a, {b}}, {b, {a}}};
+  command.m_Events.resize(13);
+  const D3D12Chunk types[] = {D3D12Chunk::List_Reset,
+                              D3D12Chunk::List_ResourceBarrier,
+                              D3D12Chunk::List_ClearRenderTargetView,
+                              D3D12Chunk::List_DrawInstanced,
+                              D3D12Chunk::List_Close,
+                              D3D12Chunk::Queue_Signal,
+                              D3D12Chunk::List_Reset,
+                              D3D12Chunk::List_ResourceBarrier,
+                              D3D12Chunk::List_CopyResource,
+                              D3D12Chunk::List_DrawInstanced,
+                              D3D12Chunk::List_Close,
+                              D3D12Chunk::Queue_Signal};
+  for(uint32_t i = 0; i < ARRAY_COUNT(types); i++)
+  {
+    SDChunk *chunk = new SDChunk("typed-alias-owner-proof"_lit);
+    chunk->metadata.chunkID = uint32_t(types[i]);
+    file.chunks.push_back(chunk);
+    command.m_Events[i + 1] = APIEvent();
+    command.m_Events[i + 1].eventId = i + 1;
+    command.m_Events[i + 1].chunkIndex = i;
+    command.m_Events[i + 1].fileOffset = 100 + 10 * i;
+  }
+  command.m_ReplayTypedFrameBegin = 90;
+  command.m_ReplayTypedFrameEnd = 2000;
+  command.m_ReplayTypedRootComplete = true;
+  for(const auto root : {D3D12CommandData::ReplayTypedRootChunk{
+                            90, 100, 2, 12, D3D12Chunk::Queue_EndEvent},
+                        D3D12CommandData::ReplayTypedRootChunk{
+                            900, 1000, 7, 13, D3D12Chunk::Queue_ExecuteCommandLists},
+                        D3D12CommandData::ReplayTypedRootChunk{
+                            1900, 2000, 13, 14, D3D12Chunk::Queue_ExecuteCommandLists}})
+  {
+    SDChunk *chunk = new SDChunk("typed-alias-root-proof"_lit);
+    chunk->metadata.chunkID = uint32_t(root.type);
+    REQUIRE(file.chunks.size() == root.chunkIndex);
+    file.chunks.push_back(chunk);
+    command.m_ReplayTypedRootChunks.push_back(root);
+  }
+  command.m_CheckpointBoundaries = {{6, 7, 0, 1000}, {12, 13, 0, 2000}};
+  for(uint32_t base : {2U, 8U})
+  {
+    const ResourceId baked = base == 2 ? first : second;
+    BakedCmdListInfo &info = command.m_BakedCmdListInfo[baked];
+    info.type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    info.eventCount = 3;
+    info.checkpointBegin = 100 + base * 10;
+    info.checkpointEnd = info.checkpointBegin + 30;
+    command.m_Partial[D3D12CommandData::Primary].cmdListExecs[baked] = {base};
+    command.m_ReplaySubmissionQueues[base] = queue;
+    for(uint32_t eid = base; eid < base + 3; eid++)
+    {
+      const auto &event = command.m_Events[eid];
+      info.checkpointChunks.push_back(
+          {baked, event.fileOffset, event.fileOffset + 10, eid - base, types[eid - 1]});
+    }
+    BakedCmdListInfo::CheckpointBarrierOp barrier;
+    barrier.type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+    barrier.after = base == 2 ? a : b;
+    info.checkpointBarriers.push_back(barrier);
+    info.replayTypedBarriers.push_back(barrier);
+    BakedCmdListInfo::ReplayTextureReadOp draw;
+    draw.relativeEvent = 2;
+    draw.directResources = {barrier.after};
+    info.replayTextureReadOps.push_back(draw);
+  }
+  auto &firstInfo = command.m_BakedCmdListInfo[first];
+  auto &secondInfo = command.m_BakedCmdListInfo[second];
+  firstInfo.replayClearOps.push_back({a, 1, true, true});
+  secondInfo.RecordReplayTextureCopy({source, b, 1, true, true});
+  std::set<ResourceId> owners;
+  rdcstr reason;
+  REQUIRE(command.GetReplayTextureAliasOwners(6, graph, owners, reason));
+  CHECK(owners == std::set<ResourceId>{a});
+  REQUIRE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  CHECK(owners == std::set<ResourceId>{b});
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(3, graph, owners, reason));
+  CHECK(owners.empty());
+  secondInfo.replayTextureCopies[0].unconditional = false;
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  secondInfo.replayTextureCopies[0].unconditional = true;
+  secondInfo.replayTextureCopies[0].fullResource = false;
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  secondInfo.replayTextureCopies[0].fullResource = true;
+  secondInfo.replayTextureCopies[0].source =
+      a;    // cannot inherit from the now-inactive overlapping A
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  secondInfo.replayTextureCopies[0].source = source;
+  secondInfo.replayTypedBarriers[0].after = ResourceId();
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  secondInfo.replayTypedBarriers[0].after = b;
+  secondInfo.replayClearUnsafeBarriers = {0};
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  secondInfo.replayClearUnsafeBarriers.clear();
+  secondInfo.replayTextureReadOps[0].directResources = {a, b};
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  secondInfo.replayTextureReadOps[0].directResources = {b};
+  secondInfo.replayTextureReadOps[0].unknown = true;
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  secondInfo.replayTextureReadOps[0].unknown = false;
+  command.m_ReplaySubmissionQueues[8] = ResourceIDGen::GetNewUniqueID();
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  command.m_ReplaySubmissionQueues[8] = queue;
+  command.m_Partial[D3D12CommandData::Secondary].cmdListExecs[first] = {4};
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  command.m_Partial[D3D12CommandData::Secondary].cmdListExecs.clear();
+  file.chunks[12]->metadata.chunkID = uint32_t(D3D12Chunk::List_DispatchRays);
+  command.m_ReplayTypedRootChunks[0].type = D3D12Chunk::List_DispatchRays;
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  file.chunks[12]->metadata.chunkID = uint32_t(D3D12Chunk::Queue_EndEvent);
+  command.m_ReplayTypedRootChunks[0].type = D3D12Chunk::Queue_EndEvent;
+  file.chunks[12]->metadata.chunkID = uint32_t(D3D12Chunk::Device_CreateRenderTargetView);
+  command.m_ReplayTypedRootChunks[0].type = D3D12Chunk::Device_CreateRenderTargetView;
+  REQUIRE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  // A descriptor write is safe; a missing/mismatched root record is not silently skipped.
+  file.chunks[12]->metadata.chunkID = uint32_t(D3D12Chunk::Resource_WriteToSubresource);
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  command.m_ReplayTypedRootChunks[0].type = D3D12Chunk::Resource_WriteToSubresource;
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  file.chunks[12]->metadata.chunkID = uint32_t(D3D12Chunk::Queue_EndEvent);
+  command.m_ReplayTypedRootChunks[0].type = D3D12Chunk::Queue_EndEvent;
+  const auto firstRootEvent = command.m_Events[1];
+  command.m_Events[1] = APIEvent();    // Queue_EndEvent has no public APIEvent entry
+  REQUIRE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  command.m_Events[1] = firstRootEvent;
+  const auto firstSubmittedEvent = command.m_Events[2];
+  command.m_Events[2] = APIEvent();
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  command.m_Events[2] = firstSubmittedEvent;
+  command.m_ReplayTypedRootComplete = false;
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  command.m_ReplayTypedRootComplete = true;
+  command.m_ReplayTypedFrameEnd = 1999;
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  command.m_ReplayTypedFrameEnd = 2000;
+  secondInfo.replayTextureCopiesComplete = false;
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  secondInfo.replayTextureCopiesComplete = true;
+  REQUIRE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  // ResourceBarrier arrays preserve their native order even when all entries share one EID.
+  // Transitioning the previous valid owner before activation is safe; touching it afterward
+  // may alter the newly selected owner's metadata and cannot be repaired by guessing a copy.
+  BakedCmdListInfo::CheckpointBarrierOp transition;
+  transition.type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  transition.before = a;
+  const auto activation = secondInfo.replayTypedBarriers[0];
+  secondInfo.replayTypedBarriers = {transition, activation};
+  REQUIRE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  secondInfo.replayTypedBarriers = {activation, transition};
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  secondInfo.replayTypedBarriers = {activation};
+  // Earlier checkpoints remain possible before any alias component is touched at all.
+  auto untouchedGraph = graph;
+  const ResourceId untouchedA = ResourceIDGen::GetNewUniqueID();
+  const ResourceId untouchedB = ResourceIDGen::GetNewUniqueID();
+  untouchedGraph = {{untouchedA, {untouchedB}}, {untouchedB, {untouchedA}}};
+  REQUIRE(command.GetReplayTextureAliasOwners(6, untouchedGraph, owners, reason));
+  CHECK(owners.empty());
+  untouchedGraph.insert(graph.begin(), graph.end());
+  REQUIRE(command.GetReplayTextureAliasOwners(6, untouchedGraph, owners, reason));
+  CHECK(owners == std::set<ResourceId>{a});
+  graph[b].clear();
+  CHECK_FALSE(command.GetReplayTextureAliasOwners(12, graph, owners, reason));
+  command.m_StructuredFile = NULL;
+}
+
+TEST_CASE("D3D12 typed copy evidence has a sticky recording budget",
+          "[d3d12][checkpoint][typed-alias]")
+{
+  BakedCmdListInfo info;
+  BakedCmdListInfo::ReplayTextureCopyOp copy;
+  for(uint32_t i = 0; i < 65536; i++)
+    info.RecordReplayTextureCopy(copy);
+  REQUIRE(info.replayTextureCopiesComplete);
+  REQUIRE(info.replayTextureCopies.size() == 65536);
+  info.RecordReplayTextureCopy(copy);
+  CHECK_FALSE(info.replayTextureCopiesComplete);
+  CHECK(info.replayTextureCopies.empty());
+  info.RecordReplayTextureCopy(copy);
+  CHECK_FALSE(info.replayTextureCopiesComplete);
+  CHECK(info.replayTextureCopies.empty());
+}
+
 TEST_CASE("D3D12 discard coverage comes from an executed full pattern fill",
           "[d3d12][replay][clear-prefix]")
 {
@@ -5997,6 +6692,8 @@ TEST_CASE("D3D12 writes use only the executed graphics or compute pipeline bindi
 }
 #endif
 
+#include "d3d12_buffer_read_index.inl"
+
 uint32_t D3D12CommandData::GetBufferPatchFirstConsumer(ResourceId buffer) const
 {
   uint32_t first = ~0U;
@@ -6547,9 +7244,12 @@ bool D3D12CommandData::IsCheckpointBoundarySafe(CheckpointBoundary &boundary,
   {
     if(barrier.type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING)
     {
-      if(!m_pDevice || !m_pDevice->IsReplayCheckpointAliasingSafe(barrier.before, barrier.after))
+      if(!m_pDevice || !m_pDevice->IsReplayCheckpointAliasingSafe(
+                           barrier.before, barrier.after, boundary.eventId))
       {
-        reason = "Prefix aliasing involves overlapping or sparse storage";
+        reason = StringFormat::Fmt(
+            "Prefix aliasing at EID %u (%s -> %s) lacks proved restorable storage",
+            barrier.relativeEvent, ToStr(barrier.before).c_str(), ToStr(barrier.after).c_str());
         return false;
       }
       continue;

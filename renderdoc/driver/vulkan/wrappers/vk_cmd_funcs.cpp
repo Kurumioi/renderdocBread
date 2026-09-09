@@ -3924,6 +3924,9 @@ bool WrappedVulkan::Serialise_vkCmdBindDescriptorSets(
         descsets[firstSet + i].push = false;
       }
 
+      RecordReplayDescriptorOffsets(descsets, GetResID(layout), firstSet, setCount,
+                                     dynamicOffsetCount, pDynamicOffsets);
+
       ObjDisp(commandBuffer)
           ->CmdBindDescriptorSets(Unwrap(commandBuffer), pipelineBindPoint, Unwrap(layout),
                                   firstSet, setCount, UnwrapArray(pDescriptorSets, setCount),
@@ -4077,6 +4080,11 @@ bool WrappedVulkan::Serialise_vkCmdBindDescriptorSets2(
           descsets[firstSet + i].descSet = GetResID(BindDescriptorSetsInfo.pDescriptorSets[i]);
           descsets[firstSet + i].push = false;
         }
+
+        RecordReplayDescriptorOffsets(descsets, GetResID(BindDescriptorSetsInfo.layout), firstSet,
+                                       BindDescriptorSetsInfo.descriptorSetCount,
+                                       BindDescriptorSetsInfo.dynamicOffsetCount,
+                                       BindDescriptorSetsInfo.pDynamicOffsets);
       }
 
       ObjDisp(commandBuffer)->CmdBindDescriptorSets2(Unwrap(commandBuffer), unwrappedInfo);

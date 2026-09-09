@@ -850,10 +850,22 @@ private:
   bool m_UseReplayDirtyInitialContents = false;
   bool m_ReplayDirtyShadow = false;
   bool m_ReplayDirtyTiming = false;
+  bool m_ReplayDirtyBufferRangesEnabled = true;
   bool m_ReplayDirtyApplyingInitial = false;
   bool m_ReplayDirtyInitialFailed = false;
   rdcstr m_ReplayDirtyReason = "firstReplay";
   std::set<ResourceId> m_ReplayDirtyResources;
+  // An entry exists only when every write since the baseline has an exact byte range. A dirty
+  // resource without an entry is whole-dirty; later CPU writes must never narrow that decision.
+  std::map<ResourceId, rdcarray<rdcpair<uint64_t, uint64_t>>> m_ReplayDirtyBufferRanges;
+  struct ReplayCPUWriteBaseline
+  {
+    ResourceId resource;
+    uint64_t offset = 0, length = 0;
+    rdcarray<rdcpair<uint64_t, uint64_t>> differences;
+  };
+  std::map<uint64_t, ReplayCPUWriteBaseline> m_ReplayCPUWriteBaselines;
+  uint64_t m_ReplayCPUWriteComparedBytes = 0;
   std::map<ResourceId, rdcarray<rdcpair<uint64_t, uint64_t>>> m_ReplayDirtyHeapRanges;
   std::map<ResourceId, rdcpair<uint64_t, uint64_t>> m_ReplayDirtyAllocations;
   struct ReplayDirtyCopyStats
@@ -1012,6 +1024,7 @@ private:
   D3D12ReplayCheckpointCache *m_ReplayCheckpoints = NULL;
   bool m_UseCheckpointInitialSources = false;
   bool m_CheckpointDependenciesEdited = false;
+  uint64_t m_CheckpointDescriptorPlanWork = 0;
 
   std::set<ResourceId> m_Cubemaps;
 
@@ -1298,6 +1311,14 @@ public:
   void InvalidateReplayDirtyTracking(const char *reason);
   bool IsReplayDirtyTrackingValid() const { return m_ReplayDirtyValid; }
   void MarkReplayResourceDirty(ResourceId resource, bool unboundedRootUAV = false);
+  void MarkReplayBufferRangeDirty(ResourceId resource, uint64_t offset, uint64_t length);
+  void CacheReplayCPUWriteBaseline(uint64_t chunk, ResourceId resource, uint64_t offset,
+                                   const byte *data, uint64_t length);
+  bool MarkReplayCPUWriteBaseline(uint64_t chunk, ResourceId resource, uint64_t offset,
+                                  uint64_t length);
+  bool ReplayBufferRangeTrackingEligible(ResourceId resource, uint64_t &width);
+  void FilterReplayDirtyBufferCopyRanges(
+      ResourceId resource, uint64_t byteCount, rdcarray<rdcpair<uint64_t, uint64_t>> &ranges);
   void MarkCheckpointReplayWrites();
   bool HasReplayCheckpointDependencyEdits() const { return m_CheckpointDependenciesEdited; }
   void MarkReplayFullOverwriteSubmitted(ResourceId resource);
@@ -1415,13 +1436,16 @@ public:
                  bool allowCheckpoints = false, bool knownShaderFeedback = false,
                  bool knownOrdinaryTarget = false, bool naturalReference = false,
                  bool ordinaryRoot = false);
-  bool IsReplayCheckpointAliasingSafe(ResourceId before, ResourceId after) const;
+  bool IsReplayCheckpointAliasingSafe(ResourceId before, ResourceId after,
+                                      uint32_t boundaryEvent) const;
   void ConfigureReplayCheckpoints(const ReplayCheckpointConfig &config,
-                                 const rdcarray<ReplayCheckpointCandidate> &candidates);
+                                  const rdcarray<ReplayCheckpointCandidate> &candidates);
   void InvalidateReplayCheckpoints(uint32_t firstAffectedEvent = 0);
   ReplayCheckpointStats GetReplayCheckpointStats();
+  void RecordCheckpointDescriptorBytes(uint64_t &bytes, uint64_t &fullBytes);
+  bool RefreshReplayCheckpointMemoryBudget();
   void PrepareReplayCheckpointRestore(uint32_t endEventID, ReplayLogType replayType,
-                                       bool allowCheckpoints);
+                                      bool allowCheckpoints);
   bool ValidateReplayCheckpointRestore(uint32_t eventID, bool initialRestored, rdcstr &reason);
   bool RestoreReplayCheckpoint(uint32_t endEventID, uint64_t &offset, uint32_t &nextEvent,
                                uint32_t &nextAction);

@@ -228,7 +228,7 @@ def capture_one(api, demo, output, timeout, frame, compiler_dir, layer_manifest,
                 d3d12_demo="D3D12_Simple_Triangle", d3d11_demo="D3D11_Simple_Triangle",
                 gl_demo="GL_Simple_Triangle", vk_demo="VK_Simple_Triangle", live_forward_fixture=False,
                 portable_forward_fixture=False, checkpoint_clear_fixture=False,
-                checkpoint_alias_fixture="off"):
+                checkpoint_alias_fixture="off", vk_buffer_delta="static"):
     rd = renderdoc_module()
     tests = {"D3D11": d3d11_demo, "OpenGL": gl_demo, "OpenGLES": gl_demo,
              "Vulkan": vk_demo, "D3D12": d3d12_demo}
@@ -266,6 +266,14 @@ def capture_one(api, demo, output, timeout, frame, compiler_dir, layer_manifest,
         entry["checkpointClearFixture"] = bool(checkpoint_clear_fixture)
         entry["childEnvironment"][alias_fixture.name] = alias_fixture.value
         entry["checkpointAliasFixture"] = checkpoint_alias_fixture
+        for name, enabled in (("RENDERDOC_VK_BUFFER_DELTA_DYNAMIC", vk_buffer_delta in ("dynamic", "dynamic-stages")),
+                              ("RENDERDOC_VK_BUFFER_DELTA_SEPARATE", vk_buffer_delta == "separate"),
+                              ("RENDERDOC_VK_BUFFER_DELTA_STAGES", vk_buffer_delta in ("stages", "dynamic-stages"))):
+            modification = rd.EnvironmentModification()
+            modification.name, modification.value = name, "1" if enabled else "0"
+            modification.mod, modification.sep = rd.EnvMod.Set, rd.EnvSep.NoSep
+            envmods.append(modification)
+            entry["childEnvironment"][name] = modification.value
         if api == "OpenGLES":
             modification = rd.EnvironmentModification()
             modification.name, modification.value = "RENDERDOC_SHARED_BUFFER_GLES", "1"
@@ -371,7 +379,7 @@ def main():
     parser.add_argument("--demos", default=os.environ.get("RENDERDOC_API_SMOKE_DEMOS", str(repo / "util/test/demos_x64.exe")))
     parser.add_argument("--output", default=os.environ.get("RENDERDOC_API_SMOKE_OUTPUT", str(repo / "output/eid-api-smoke")))
     parser.add_argument("--apis", default=os.environ.get("RENDERDOC_API_SMOKE_APIS", "D3D11,OpenGL,Vulkan"))
-    parser.add_argument("--d3d12-demo", choices=("D3D12_Simple_Triangle", "D3D12_Checkpoint_Triangle", "D3D12_Checkpoint_Query", "D3D12_Shared_Buffer", "D3D12_CBuffer_Zoo", "D3D12_RenderTarget_Binds", "D3D12_UAV_Declarations", "D3D12_Sparse_Initial_Residency"),
+    parser.add_argument("--d3d12-demo", choices=("D3D12_Simple_Triangle", "D3D12_Checkpoint_Triangle", "D3D12_Checkpoint_Query", "D3D12_Shared_Buffer", "D3D12_CBuffer_Zoo", "D3D12_RenderTarget_Binds", "D3D12_UAV_Declarations", "D3D12_Sparse_Initial_Residency", "D3D12_Checkpoint_Buffer_Alias", "D3D12_Checkpoint_Typed_Alias", "D3D12_Buffer_Delta_Ranges", "D3D12_Buffer_CPU_Dirty_Ranges"),
                         default="D3D12_Simple_Triangle")
     parser.add_argument("--live-forward-fixture", action="store_true",
                         help="Enable per-frame RT clears in the D3D12_RenderTarget_Binds proof fixture")
@@ -382,9 +390,10 @@ def main():
     parser.add_argument("--checkpoint-alias-fixture", choices=("off", "clear", "read", "split"),
                         default="off", help="Committed RT clear after an unrelated alias barrier; "
                         "read and split select conservative negative cases")
-    parser.add_argument("--d3d11-demo", choices=("D3D11_Simple_Triangle", "D3D11_Shared_Buffer", "D3D11_CBuffer_Zoo", "D3D11_Buffer_Delta", "D3D11_Buffer_Delta_Ranges"), default="D3D11_Simple_Triangle")
-    parser.add_argument("--gl-demo", choices=("GL_Simple_Triangle", "GL_Shared_Buffer", "GL_CBuffer_Zoo"), default="GL_Simple_Triangle")
-    parser.add_argument("--vk-demo", choices=("VK_Simple_Triangle", "VK_Shared_Buffer", "VK_CBuffer_Zoo"), default="VK_Simple_Triangle")
+    parser.add_argument("--d3d11-demo", choices=("D3D11_Simple_Triangle", "D3D11_Shared_Buffer", "D3D11_CBuffer_Zoo", "D3D11_Buffer_Delta", "D3D11_Buffer_Delta_Ranges", "D3D11_Checkpoint_Stages"), default="D3D11_Simple_Triangle")
+    parser.add_argument("--gl-demo", choices=("GL_Simple_Triangle", "GL_Shared_Buffer", "GL_CBuffer_Zoo", "GL_Buffer_Delta", "GL_Buffer_Delta_Ranges", "GLES_Buffer_Delta", "GLES_Buffer_Delta_Ranges", "GL_Checkpoint_Texture_Versions", "GLES_Checkpoint_Texture_Versions"), default="GL_Simple_Triangle")
+    parser.add_argument("--vk-demo", choices=("VK_Simple_Triangle", "VK_Shared_Buffer", "VK_CBuffer_Zoo", "VK_Buffer_Delta"), default="VK_Simple_Triangle")
+    parser.add_argument("--vk-buffer-delta", choices=("static", "dynamic", "separate", "stages", "dynamic-stages"), default="static")
     parser.add_argument("--compiler-dir", default=os.environ.get("RENDERDOC_API_SMOKE_COMPILER_DIR", ""))
     parser.add_argument("--vulkan-layer-manifest", default=os.environ.get(
         "RENDERDOC_API_SMOKE_VULKAN_LAYER_MANIFEST", str(repo / "x64/Development/renderdoc.json")))
@@ -397,8 +406,8 @@ def main():
     apis = args.apis.split(",")
     if any(api not in ("D3D11", "D3D12", "OpenGL", "OpenGLES", "Vulkan") for api in apis):
         parser.error("--apis accepts D3D11,D3D12,OpenGL,OpenGLES,Vulkan")
-    if "OpenGLES" in apis and args.gl_demo != "GL_Shared_Buffer":
-        parser.error("OpenGLES requires GL_Shared_Buffer, which explicitly requests an ES context")
+    if "OpenGLES" in apis and args.gl_demo not in ("GL_Shared_Buffer", "GLES_Buffer_Delta", "GLES_Buffer_Delta_Ranges", "GLES_Checkpoint_Texture_Versions"):
+        parser.error("OpenGLES requires a demo that explicitly requests an ES context")
     if args.portable_forward_fixture and (apis != ["Vulkan"] or args.vk_demo != "VK_Shared_Buffer"):
         parser.error("--portable-forward-fixture requires --apis Vulkan --vk-demo VK_Shared_Buffer")
     try:
@@ -436,7 +445,7 @@ def main():
                                                 args.d3d11_demo, args.gl_demo, args.vk_demo,
                                                 args.live_forward_fixture, args.portable_forward_fixture,
                                                 args.checkpoint_clear_fixture,
-                                                args.checkpoint_alias_fixture))
+                                                args.checkpoint_alias_fixture, args.vk_buffer_delta))
             (run_output / "capture-results.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         result["ok"] = all(entry["ok"] for entry in result["captures"])
     finally:

@@ -1203,6 +1203,9 @@ void WrappedID3D11DeviceContext::AddUsage(const ActionDescription &a)
     {
       for(int i = 0; i < D3D11_1_UAV_SLOT_COUNT; i++)
       {
+        if(IsLoading(m_State) && executesShader && pipe->CSUAVs[i])
+          m_pDevice->GetReplay()->RecordCheckpointPotentialWrite(
+              ((WrappedID3D11UnorderedAccessView1 *)pipe->CSUAVs[i])->GetResourceResID(), e);
         if(pipe->CS.Used_UAV(i) && pipe->CSUAVs[i])
         {
           WrappedID3D11UnorderedAccessView1 *view =
@@ -1233,6 +1236,11 @@ void WrappedID3D11DeviceContext::AddUsage(const ActionDescription &a)
   //    provided by the user has the first UAV mapping to UAVStartSlot at zero.
   for(int i = pipe->OM.UAVStartSlot; i < D3D11_1_UAV_SLOT_COUNT; i++)
   {
+    if(IsLoading(m_State) && executesShader && pipe->OM.UAVs[i - pipe->OM.UAVStartSlot])
+      m_pDevice->GetReplay()->RecordCheckpointPotentialWrite(
+          ((WrappedID3D11UnorderedAccessView1 *)pipe->OM.UAVs[i - pipe->OM.UAVStartSlot])
+              ->GetResourceResID(),
+          e);
     if(pipe->PS.Used_UAV(i) && pipe->OM.UAVs[i - pipe->OM.UAVStartSlot])
     {
       WrappedID3D11UnorderedAccessView1 *view =

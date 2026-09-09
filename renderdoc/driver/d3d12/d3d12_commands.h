@@ -26,6 +26,7 @@
 
 #include <functional>
 #include "common/common.h"
+#include "replay/replay_resource_versions.h"
 #include "d3d12_common.h"
 #include "d3d12_device.h"
 #include "d3d12_resources.h"
@@ -320,6 +321,10 @@ struct BakedCmdListInfo
     D3D12_RESOURCE_STATES stateAfter = D3D12_RESOURCE_STATE_COMMON;
   };
   rdcarray<CheckpointBarrierOp> checkpointBarriers;
+  // Owner proof needs ordinary transitions too: they may touch a texture's hidden layout.
+  // Preserve the original barrier-array order independently of the existing split/alias index.
+  rdcarray<CheckpointBarrierOp> replayTypedBarriers;
+  bool replayTypedBarriersComplete = true;
   // Content-only proof: unsafe flags/types may not enter checkpointBarriers (e.g. an unknown
   // barrier type or a filtered NULL transition). Keep their event identity without reading the
   // native barrier union. This does not change checkpoint or continuation eligibility.
@@ -336,6 +341,28 @@ struct BakedCmdListInfo
   // Exact consumed RTV/DSV coverage from loading, independent of coarse EventUsage::Clear.
   // A partial or predicated clear stays in the index so it cannot masquerade as read-free work.
   rdcarray<ReplayClearOp> replayClearOps;
+  struct ReplayTextureCopyOp
+  {
+    ResourceId source, destination;
+    uint32_t relativeEvent = 0;
+    bool unconditional = false, fullResource = false;
+  };
+  // Explicit source and destination identity. Whole-resource initialization is a positive
+  // native coverage proof, not inferred from ResourceUsage::CopyDst.
+  rdcarray<ReplayTextureCopyOp> replayTextureCopies;
+  bool replayTextureCopiesComplete = true;
+  void RecordReplayTextureCopy(const ReplayTextureCopyOp &copy)
+  {
+    if(!replayTextureCopiesComplete)
+      return;
+    if(replayTextureCopies.size() >= 65536)
+    {
+      replayTextureCopiesComplete = false;
+      replayTextureCopies.clear();
+      return;
+    }
+    replayTextureCopies.push_back(copy);
+  }
   struct CheckpointRecordingChunk
   {
     ResourceId baked;
@@ -358,6 +385,21 @@ struct BakedCmdListInfo
   // Descriptor tables and generated addresses can name buffers absent from reflected GetUsage.
   // Until their complete descriptor history is indexed, this list may consume any patched buffer.
   bool bufferPatchUnknownConsumers = false;
+  struct BufferPatchReadOp
+  {
+    struct Table
+    {
+      ResourceId heap;
+      uint32_t first = 0, count = 0;
+    };
+    uint32_t relativeEvent = 0;
+    rdcarray<ReplayResourceRange> direct;
+    rdcarray<Table> tables;
+  };
+  rdcarray<BufferPatchReadOp> bufferPatchReads;
+  bool bufferPatchReadsComplete = true;
+  const char *bufferPatchReadFailure = "";
+  uint32_t bufferPatchReadFailureChunk = 0, bufferPatchReadFailureEvent = 0;
 
   struct ReplayUAVRange
   {
@@ -637,8 +679,22 @@ struct D3D12CommandData
     uint32_t firstNativeResolveEID = ~0U;
     D3D12_QUERY_TYPE firstNativeResolveType = D3D12_QUERY_TYPE_OCCLUSION;
     D3D12CheckpointQueryPlan queries;
+    // Loading-time storage at this exact stream boundary, relative to capture initial contents.
+    // Unknown/budget-exhausted observations use the full-heap admission fallback.
+    uint64_t descriptorBytes = ~0ULL, fullDescriptorBytes = ~0ULL;
   };
   rdcarray<CheckpointBoundary> m_CheckpointBoundaries;
+  struct ReplayTypedRootChunk
+  {
+    uint64_t offset = 0, endOffset = 0;
+    uint32_t nextEvent = 0, chunkIndex = 0;
+    D3D12Chunk type = D3D12Chunk::Max;
+  };
+  // APIEvent intentionally omits some root calls (e.g. Queue_EndEvent) and adds synthetic
+  // command-list boundaries. Keep exact decoded root calls for the texture-owner proof.
+  rdcarray<ReplayTypedRootChunk> m_ReplayTypedRootChunks;
+  uint64_t m_ReplayTypedFrameBegin = 0, m_ReplayTypedFrameEnd = 0;
+  bool m_ReplayTypedRootComplete = false;
   rdcstr m_CheckpointUnsupported;
   typedef std::map<D3D12Chunk, std::set<uint64_t>> CheckpointUnsupportedChunks;
   void ObserveCheckpointChunk(D3D12Chunk chunk, uint64_t chunkEndOffset);
@@ -655,6 +711,13 @@ struct D3D12CommandData
                                 uint32_t targetEvent, rdcstr &reason) const;
   bool HasResolvedLiveForwardState() const;
   uint32_t GetBufferPatchFirstConsumer(ResourceId buffer) const;
+  void ObserveBufferPatchReads(BakedCmdListInfo &info, D3D12Chunk chunk, uint32_t relativeEvent);
+  bool GetBufferPatchRangeConsumer(const std::map<ResourceId, uint64_t> &buffers,
+                                   const rdcarray<ReplayBufferPatchRange> &changes, uint32_t &first);
+  ReplayResourceAccessIndex m_BufferPatchReadIndex;
+  std::map<ResourceId, uint64_t> m_BufferPatchReadResources;
+  bool m_BufferPatchReadIndexPrepared = false;
+  size_t m_BufferPatchReadEntries = 0;
   // Content proof only: full clear before the first possible resource read in executed EID
   // order. throughEvent is the actual WithoutDraw end, not its following OnlyDraw target.
   // The caller supplies only independent committed textures, after rejecting buffers,
@@ -664,6 +727,11 @@ struct D3D12CommandData
   std::set<ResourceId> GetReplayFullClearPrefix(uint32_t checkpointEvent,
                                                uint32_t throughEvent,
                                                const std::set<ResourceId> &eligibleTextures) const;
+  // Complete prefix proof for non-inheriting UNKNOWN-layout placed texture aliases. The
+  // caller supplies a symmetric physical-overlap graph; output owners never overlap.
+  bool GetReplayTextureAliasOwners(uint32_t throughEvent,
+                                   const std::map<ResourceId, std::set<ResourceId>> &conflicts,
+                                   std::set<ResourceId> &owners, rdcstr &reason) const;
   void ObserveReplayWriteBindings(BakedCmdListInfo &info, const D3D12RenderState &state,
                                   uint32_t relativeEvent, bool graphics = true,
                                   bool compute = true, bool declarationBindingsKnown = true);

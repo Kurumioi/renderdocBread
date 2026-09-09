@@ -30,6 +30,7 @@
 #include "core/core.h"
 #include "driver/shaders/spirv/spirv_reflect.h"
 #include "replay/replay_driver.h"
+#include "replay/replay_resource_versions.h"
 #include "gl_common.h"
 #include "gl_dispatch_table.h"
 #include "gl_manager.h"
@@ -109,6 +110,40 @@ inline bool GLReplayPatchBindingCanWrite(GLenum target)
          target == eGL_TRANSFORM_FEEDBACK_BUFFER || target == eGL_TEXTURE_BUFFER ||
          target == eGL_PIXEL_PACK_BUFFER;
 }
+
+// Native indexed bindings, not reflected block sizes, bound possible shader reads. Base binding
+// reports (0, 0); missing, invalid or out-of-storage ranges retain the whole-buffer proof.
+inline ReplayResourceRange GLReplayPatchUniformReadRange(ResourceId buffer, uint64_t extent,
+                                                         int64_t start, int64_t size,
+                                                         bool rangeAvailable)
+{
+  if(rangeAvailable && start >= 0 && size > 0 && uint64_t(start) < extent &&
+     uint64_t(size) <= extent - uint64_t(start))
+    return {buffer, 0, uint64_t(start), uint64_t(size)};
+  return {buffer, 0, 0, extent};
+}
+
+struct GLReplayCheckpointBufferWrites
+{
+  explicit GLReplayCheckpointBufferWrites(size_t maximum = 65536) : limit(maximum) {}
+  void Clear()
+  {
+    buffers.clear();
+    complete = true;
+  }
+  void Record(ResourceId buffer)
+  {
+    if(!complete)
+      return;
+    if(buffer == ResourceId() || (buffers.size() >= limit && buffers.count(buffer) == 0))
+      complete = false;
+    else
+      buffers.insert(buffer);
+  }
+  std::set<ResourceId> buffers;
+  bool complete = true;
+  size_t limit;
+};
 
 class WrappedOpenGL : public IFrameCapturer
 {
@@ -351,9 +386,16 @@ private:
   rdcstr m_ReplayPatchCaptureError;
   std::map<ResourceId, uint32_t> m_ReplayPatchFirstReads;
   rdcstr m_ReplayPatchReadEvidenceError;
+  ReplayResourceAccessIndex m_ReplayPatchReadIndex;
+  std::map<ResourceId, uint64_t> m_ReplayPatchReadRegistered;
+  uint32_t m_ReplayPatchReadLastEvent = 0;
+  GLReplayCheckpointBufferWrites m_ReplayCheckpointBufferWrites;
+  void RecordReplayPatchRead(ResourceId buffer, uint32_t eventId, uint64_t byteOffset = 0,
+                             uint64_t byteLength = ~0ULL);
   void TrackReplayPatchBinding(GLResource buffer, GLenum target);
   void ApplyReplayBufferPatches();
   void TrackReplayCheckpointBufferWrite(const GLResource &buffer);
+  void RecordReplayCheckpointTextureWrite(const GLResource &resource);
 
   // this object is only created on old captures where VAO0 was a single global object. In new
   // captures each context has its own VAO0.

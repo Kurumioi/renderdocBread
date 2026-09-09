@@ -25,6 +25,7 @@
 
 #include "os/os_specific.h"
 #include "api/replay/control_types.h"
+#include "common/common.h"
 #include "common/formatting.h"
 #include "strings/string_utils.h"
 

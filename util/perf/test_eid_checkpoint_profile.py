@@ -6,7 +6,7 @@ import unittest
 
 from eid_checkpoint_profile import (compare_event, force_bypass_issues, glsl_fragment_fixture, output_subresources,
                                     parse_events, parse_status, selected_event_evidence, shader_encoding_names,
-                                    status_issues, resolve_extra_textures)
+                                    status_issues, resolve_extra_textures, resolve_extra_buffers, full_buffer_witness)
 
 
 def status(**changes):
@@ -18,6 +18,35 @@ def status(**changes):
 
 
 class CheckpointProfileTests(unittest.TestCase):
+    def test_full_buffer_witness_checks_all_bytes_and_rejects_short_reads_or_missing_resources(self):
+        resource = SimpleNamespace(name='parameter storage', resourceId=12)
+        buffer = SimpleNamespace(resourceId=12, length=64)
+        selected = resolve_extra_buffers([resource.name], [resource], [buffer])
+        calls = []
+        contents = bytearray(64)
+        def read(resource_id, offset, count):
+            calls.append((resource_id, offset, count))
+            return contents
+        controller = SimpleNamespace(GetBufferData=read)
+        original = full_buffer_witness(controller, selected, 64)
+        contents[63] = 1
+        self.assertNotEqual(original, full_buffer_witness(controller, selected, 64))
+        self.assertEqual(calls, [(12, 0, 64)] * 2)
+        with self.assertRaisesRegex(RuntimeError, 'budget'):
+            full_buffer_witness(controller, selected, 63)
+        self.assertEqual(len(calls), 2)
+        contents.pop()
+        with self.assertRaisesRegex(RuntimeError, 'Incomplete'):
+            full_buffer_witness(controller, selected, 64)
+        for names, resources, buffers in ((['missing'], [resource], [buffer]),
+                ([resource.name], [resource, resource], [buffer]),
+                ([resource.name], [resource], []), ([resource.name] * 2, [resource], [buffer])):
+            with self.assertRaises(ValueError):
+                resolve_extra_buffers(names, resources, buffers)
+        buffer.length = 0
+        with self.assertRaises(ValueError):
+            resolve_extra_buffers([resource.name], [resource], [buffer])
+
     def test_explicit_extra_textures_cover_whole_resource_and_reject_ambiguity(self):
         resource = SimpleNamespace(name="unbound witness", resourceId=71)
         texture = SimpleNamespace(resourceId=71, width=8, height=4, depth=1,

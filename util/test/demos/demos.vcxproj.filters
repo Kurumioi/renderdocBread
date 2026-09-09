@@ -1,6 +1,27 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
+    <ClCompile Include="d3d12\d3d12_checkpoint_typed_alias.cpp">
+      <Filter>D3D12\demos</Filter>
+    </ClCompile>
+    <ClCompile Include="d3d12\d3d12_buffer_delta.cpp">
+      <Filter>D3D12\demos</Filter>
+    </ClCompile>
+    <ClCompile Include="d3d12\d3d12_buffer_cpu_dirty_ranges.cpp">
+      <Filter>D3D12\demos</Filter>
+    </ClCompile>
+    <ClCompile Include="gl\gl_checkpoint_texture_versions.cpp">
+      <Filter>OpenGL\demos</Filter>
+    </ClCompile>
+    <ClCompile Include="gl\gl_buffer_delta.cpp">
+      <Filter>OpenGL\demos</Filter>
+    </ClCompile>
+    <ClCompile Include="d3d12\d3d12_checkpoint_buffer_alias.cpp">
+      <Filter>D3D12\demos</Filter>
+    </ClCompile>
+    <ClCompile Include="vk\vk_buffer_delta.cpp">
+      <Filter>Vulkan\demos</Filter>
+    </ClCompile>
     <ClCompile Include="d3d11\d3d11_simple_triangle.cpp">
       <Filter>D3D11\demos</Filter>
     </ClCompile>

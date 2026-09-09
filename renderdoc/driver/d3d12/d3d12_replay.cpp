@@ -646,6 +646,11 @@ ReplayCheckpointStats D3D12Replay::GetReplayCheckpointStats()
   return m_pDevice->GetReplayCheckpointStats();
 }
 
+bool D3D12Replay::RefreshReplayCheckpointMemoryBudget()
+{
+  return m_pDevice->RefreshReplayCheckpointMemoryBudget();
+}
+
 rdcstr D3D12Replay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
 {
   return m_pDevice->SetReplayBufferPatches(patches);
@@ -681,9 +686,8 @@ void D3D12Replay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
   // Internal analysis paths call the device directly and retain its default checkpoint bypass.
   // Only the ordinary driver entry may reuse a prefix; the shared controller additionally
   // bypasses this entry for canonical verification, analysis, and temporary event overrides.
-  // The controller intentionally bypasses checkpoints around every OnlyDraw, even without an
-  // event edit. That flag controls prefix reuse, not whether this unmodified target can preserve
-  // the preceding root replay's complete dirty-write proof.
+  // Prefix reuse and target provenance are separate: an unmodified target can preserve its
+  // matching root's complete dirty-write proof, including a natural reference replay.
   const bool naturalReference = m_ReplayCheckpointBypass && m_ReplayCheckpointNaturalReference &&
                                 !m_EventCBufferStateApplied &&
                                 m_pDevice->GetQueue()->GetCommandData()->m_ActionCallback == NULL;

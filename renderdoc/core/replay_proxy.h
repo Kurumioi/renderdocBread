@@ -48,6 +48,8 @@ enum class ReplayControlOperation : uint32_t
   CheckpointStats = 2,
   InvalidateCheckpoints = 3,
   BufferPatches = 4,
+  // Optional capability: operation 2 retains its original payload for revision-5 peers.
+  CheckpointStatsWithPlan = 5,
 };
 
 enum ReplayProxyPacket

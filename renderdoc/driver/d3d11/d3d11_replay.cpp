@@ -115,6 +115,34 @@ struct D3D11Replay::ReplayCheckpoint
 
 namespace
 {
+struct D3D11CheckpointMetadataBudget
+{
+  explicit D3D11CheckpointMetadataBudget(uint64_t budget)
+      : limit(RDCMIN<uint64_t>(budget, 64ULL * 1024 * 1024))
+  {
+  }
+  uint64_t bytes = 0;
+  const uint64_t limit;
+  bool Add(uint64_t count, uint64_t stride)
+  {
+    if(bytes > limit || (stride && count > (limit - bytes) / stride))
+    {
+      bytes = ~0ULL;
+      return false;
+    }
+    bytes += count * stride;
+    return true;
+  }
+};
+
+bool D3D11CheckpointAddBytes(uint64_t &bytes, uint64_t amount, uint64_t limit)
+{
+  if(bytes > limit || amount > limit - bytes)
+    return false;
+  bytes += amount;
+  return true;
+}
+
 bool CheckpointWritesResource(ResourceUsage usage)
 {
   return (usage >= ResourceUsage::VS_RWResource && usage <= ResourceUsage::All_RWResource) ||
@@ -1941,6 +1969,9 @@ RDResult D3D11Replay::ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBu
   m_BufferPatchReadIndex.Clear();
   m_BufferPatchReadRegistered.clear();
   m_BufferPatchReadLastEvent = 0;
+  m_CheckpointPotentialWrites.clear();
+  m_CheckpointPotentialWriteCount = 0;
+  m_CheckpointResidentVersions.clear();
   RDResult result = m_pDevice->ReadLogInitialisation(rdc, storeStructuredBuffers);
   // This scope proves reads of ordinary constant buffers only, not writes or output dependencies.
   // Every physical CB view is recorded without shader reflection, and copies conservatively read
@@ -1974,6 +2005,7 @@ void D3D11Replay::ConfigureReplayCheckpoints(
     return;
   }
   m_Checkpoints.clear();
+  m_CheckpointResidentVersions.clear();
   m_CheckpointResources.clear();
   m_CheckpointConfig = config;
   m_CheckpointCandidates = candidates;
@@ -1996,6 +2028,7 @@ void D3D11Replay::InvalidateReplayCheckpoints(uint32_t firstAffectedEvent)
   // Recorded GetUsage/last-write indices no longer prove immutability, even after rescanning.
   // Drop all saved prefixes and stop version reuse until the capture is reloaded.
   m_Checkpoints.clear();
+  m_CheckpointResidentVersions.clear();
   m_CheckpointStats.invalidations++;
   m_CheckpointConservativeWrites = true;
   m_CheckpointPrepared = false;
@@ -2072,6 +2105,14 @@ bool D3D11Replay::PrepareCheckpointResources()
     return reject("D3D11 checkpoints require a local feature-level 10.1+ replay");
   if(m_pDevice->GetNumDeferredContexts() != 0)
     return reject("D3D11 deferred-context checkpoint state is not yet restorable");
+  D3D11CheckpointMetadataBudget metadata(m_CheckpointConfig.byteBudget);
+  // Include preparation records, candidate arrays (including growth), and temporary accounting
+  // nodes before duplicating anything from the already-loaded resource/usage tables.
+  if(!metadata.Add(1, sizeof(ReplayCheckpoint) + 4096) ||
+     !metadata.Add(m_Resources.size(), 2 * sizeof(CheckpointResource) +
+                                           2 * sizeof(ReplayCheckpoint::Resource) +
+                                           2 * sizeof(ReplayCheckpoint::Counter) + 256))
+    return reject("D3D11 checkpoint metadata exceeds its bounded allocation budget");
   SDFile *file = GetStructuredFile();
   if(!file)
     return reject("D3D11 checkpoint safety scan requires structured capture chunks");
@@ -2145,11 +2186,31 @@ bool D3D11Replay::PrepareCheckpointResources()
     if(misc & unsupported)
       return reject("D3D11 tiled, shared or protected resource contents are not checkpointable");
     resource.minLOD = (misc & D3D11_RESOURCE_MISC_RESOURCE_CLAMP) != 0;
-    for(const EventUsage &event : GetUsage(resource.id))
-      if(CheckpointWritesResource(event.usage))
-        resource.writes.push_back(event.eventId);
-    resource.mutableContents = usage != D3D11_USAGE_IMMUTABLE &&
-                               (m_CheckpointConservativeWrites || !resource.writes.empty());
+    const rdcarray<EventUsage> *uses = m_pImmediateContext->GetCheckpointUsage(resource.id);
+    if(uses)
+    {
+      if(!metadata.Add(uses->size(), 4 * sizeof(uint32_t)))
+        return reject("D3D11 checkpoint write metadata exceeds its bounded allocation budget");
+      for(const EventUsage &event : *uses)
+        if(CheckpointWritesResource(event.usage))
+          resource.writes.push_back(event.eventId);
+    }
+    // Scalar branches and replacement shaders may use any physically bound UAV. Reflection's
+    // currently used slots do not bound potential writes; include the native binding envelope.
+    auto potential = m_CheckpointPotentialWrites.find(resource.id);
+    if(potential != m_CheckpointPotentialWrites.end())
+    {
+      if(!metadata.Add(potential->second.size(), 4 * sizeof(uint32_t)))
+        return reject("D3D11 checkpoint write metadata exceeds its bounded allocation budget");
+      resource.writes.append(potential->second);
+    }
+    std::sort(resource.writes.begin(), resource.writes.end());
+    bool patched = false;
+    for(const ReplayBufferPatch &patch : m_BufferPatches)
+      patched |= patch.buffer == resource.id;
+    resource.mutableContents =
+        usage != D3D11_USAGE_IMMUTABLE &&
+        (m_CheckpointConservativeWrites || !resource.writes.empty() || patched);
     if(resource.bytes == 0 && resource.mutableContents)
       return reject("D3D11 checkpoint resource has no reliable byte-size estimate");
     m_CheckpointResources.push_back(resource);
@@ -2171,6 +2232,24 @@ bool D3D11Replay::SaveReplayCheckpoint(uint32_t eventId)
     return false;
   const bool checkpointTiming = Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1";
   PerformanceTimer checkpointTimer;
+  D3D11CheckpointMetadataBudget metadata(m_CheckpointConfig.byteBudget);
+  if(!metadata.Add(1, sizeof(ReplayCheckpoint) + 4096) ||
+     !metadata.Add(m_Resources.size(), 2 * sizeof(CheckpointResource) +
+                                           2 * sizeof(ReplayCheckpoint::Resource) +
+                                           2 * sizeof(ReplayCheckpoint::Counter) + 256))
+  {
+    m_CheckpointStats.rejected++;
+    m_CheckpointStats.reason = "D3D11 checkpoint metadata exceeds its bounded allocation budget";
+    return false;
+  }
+  for(const CheckpointResource &source : m_CheckpointResources)
+    if(!metadata.Add(source.writes.size(), 4 * sizeof(uint32_t)))
+    {
+      m_CheckpointStats.rejected++;
+      m_CheckpointStats.reason =
+          "D3D11 checkpoint write metadata exceeds its bounded allocation budget";
+      return false;
+    }
   while(m_Checkpoints.size() >= m_CheckpointConfig.maxCheckpoints)
     EvictOldestCheckpoint();
   std::unique_ptr<ReplayCheckpoint> checkpoint(
@@ -2191,19 +2270,20 @@ bool D3D11Replay::SaveReplayCheckpoint(uint32_t eventId)
       const uint32_t lastWrite = CheckpointLastWrite(source.writes, eventId);
       // Only the checkpoint actually restored in this replay is a proven content version.
       // Re-executing the same write EID from the frame head does not prove byte identity.
-      auto restored = m_Checkpoints.find(m_CheckpointCurrentEvent);
-      if(!m_CheckpointConservativeWrites && restored != m_Checkpoints.end())
+      auto resident = m_CheckpointResidentVersions.find(source.id);
+      if(!m_CheckpointConservativeWrites && resident != m_CheckpointResidentVersions.end())
       {
-        for(const ReplayCheckpoint::Resource &older : restored->second->resources)
-          if(older.version && older.id == source.id && older.version->lastWrite == lastWrite &&
-             older.version->live == source.live)
-          {
-            resource.version = older.version;
-            break;
-          }
+        std::shared_ptr<CheckpointVersion> version = resident->second.lock();
+        if(version && version->lastWrite == lastWrite && version->live == source.live)
+          resource.version = version;
       }
-      if(!resource.version)
-        required += source.bytes;
+      if(!resource.version &&
+         !D3D11CheckpointAddBytes(required, source.bytes, m_CheckpointConfig.byteBudget))
+      {
+        m_CheckpointStats.rejected++;
+        m_CheckpointStats.reason = "D3D11 writable checkpoint working set exceeds its byte budget";
+        return false;
+      }
     }
     checkpoint->resources.push_back(resource);
   }
@@ -2226,9 +2306,18 @@ bool D3D11Replay::SaveReplayCheckpoint(uint32_t eventId)
       checkpoint->counters.push_back(counter);
     }
   }
-  required += checkpoint->counters.size() * sizeof(ReplayCheckpoint::Counter);
-  if(!checkpoint->counters.empty())
-    required += RDCMAX(16ULL, uint64_t(checkpoint->counters.size()) * sizeof(uint32_t));
+  const uint64_t counterBytes =
+      checkpoint->counters.empty() ? 0 : RDCMAX(16ULL, uint64_t(checkpoint->counters.size()) * 4);
+  if(counterBytes > UINT_MAX ||
+     !D3D11CheckpointAddBytes(required,
+                              checkpoint->counters.size() * sizeof(ReplayCheckpoint::Counter),
+                              m_CheckpointConfig.byteBudget) ||
+     !D3D11CheckpointAddBytes(required, counterBytes, m_CheckpointConfig.byteBudget))
+  {
+    m_CheckpointStats.rejected++;
+    m_CheckpointStats.reason = "D3D11 checkpoint counter storage exceeds its byte budget";
+    return false;
+  }
   UpdateCheckpointAccounting();
   if(required > m_CheckpointConfig.byteBudget ||
      m_CheckpointStats.allocatedBytes > m_CheckpointConfig.byteBudget - required)
@@ -2342,6 +2431,9 @@ bool D3D11Replay::SaveReplayCheckpoint(uint32_t eventId)
     return false;
   const double checkpointCountersMS = checkpointTiming ? checkpointTimer.GetMilliseconds() : 0.0;
   checkpoint->lastUsed = ++m_CheckpointUseSerial;
+  for(const ReplayCheckpoint::Resource &resource : checkpoint->resources)
+    if(resource.version)
+      m_CheckpointResidentVersions[resource.id] = resource.version;
   m_Checkpoints[eventId] = std::move(checkpoint);
   m_CheckpointCurrentEvent = eventId;
   m_CheckpointStats.builds++;
@@ -2382,10 +2474,26 @@ bool D3D11Replay::RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint)
   const double checkpointValidateMS = checkpointTiming ? checkpointTimer.GetMilliseconds() : 0.0;
   ID3D11DeviceContext *context = m_pImmediateContext->GetReal();
   m_pImmediateContext->ClearState();
+  uint64_t restoredBytes = 0, retainedBytes = 0;
   for(const ReplayCheckpoint::Resource &resource : checkpoint.resources)
   {
     if(resource.version)
-      context->CopyResource(resource.live, resource.version->copy);
+    {
+      auto resident = m_CheckpointResidentVersions.find(resource.id);
+      const bool retained =
+          !m_CheckpointConservativeWrites &&
+          Process::GetEnvVariable("RENDERDOC_D3D11_DISABLE_CHECKPOINT_RESIDENT_SKIP") != "1" &&
+          resident != m_CheckpointResidentVersions.end() &&
+          resident->second.lock() == resource.version;
+      if(retained)
+        retainedBytes += resource.version->bytes;
+      else
+      {
+        context->CopyResource(resource.live, resource.version->copy);
+        restoredBytes += resource.version->bytes;
+      }
+      m_CheckpointResidentVersions[resource.id] = resource.version;
+    }
     if(resource.restoreMinLOD)
       context->SetResourceMinLOD(resource.live, resource.minLOD);
   }
@@ -2405,14 +2513,55 @@ bool D3D11Replay::RestoreReplayCheckpoint(ReplayCheckpoint &checkpoint)
   {
     const double totalMS = checkpointTimer.GetMilliseconds();
     const rdcstr line = StringFormat::Fmt(
-        "api=D3D11Checkpoint op=restore event=%u success=%u validate_ms=%.3f resource_restore_ms=%.3f "
-        "bind_finalize_ms=%.3f total_ms=%.3f", checkpoint.eventId, success ? 1U : 0U,
-        checkpointValidateMS, checkpointCopyMS - checkpointValidateMS, totalMS - checkpointCopyMS,
-        totalMS);
+        "api=D3D11Checkpoint op=restore event=%u success=%u validate_ms=%.3f "
+        "resource_restore_ms=%.3f "
+        "bind_finalize_ms=%.3f total_ms=%.3f restoredBytes=%llu retainedBytes=%llu",
+        checkpoint.eventId, success ? 1U : 0U, checkpointValidateMS,
+        checkpointCopyMS - checkpointValidateMS, totalMS - checkpointCopyMS, totalMS, restoredBytes,
+        retainedBytes);
     RDCLOG("[EIDTiming] %s", line.c_str());
     AppendReplayTimingLog(line);
   }
   return success;
+}
+
+void D3D11Replay::RecordCheckpointPotentialWrite(ResourceId resource, uint32_t eventId)
+{
+  if(resource == ResourceId() || eventId == 0)
+    return;
+  if(m_CheckpointPotentialWriteCount >= 1024 * 1024)
+  {
+    m_CheckpointConservativeWrites = true;
+    m_CheckpointPotentialWrites.clear();
+    return;
+  }
+  rdcarray<uint32_t> &writes = m_CheckpointPotentialWrites[resource];
+  if(writes.empty() || writes.back() != eventId)
+  {
+    writes.push_back(eventId);
+    ++m_CheckpointPotentialWriteCount;
+  }
+}
+
+void D3D11Replay::ForgetCheckpointWrites(uint32_t firstEvent, uint32_t lastEvent)
+{
+  if(m_CheckpointConservativeWrites || firstEvent == 0)
+  {
+    m_CheckpointResidentVersions.clear();
+    return;
+  }
+  if(firstEvent > lastEvent)
+    return;
+  for(const CheckpointResource &resource : m_CheckpointResources)
+  {
+    auto first = std::lower_bound(resource.writes.begin(), resource.writes.end(), firstEvent);
+    if(first != resource.writes.end() && *first <= lastEvent)
+      m_CheckpointResidentVersions.erase(resource.id);
+  }
+  // CPU overlay hooks can write at more events than captured CPU writes. They are cheap buffers;
+  // never reuse a backup as the resident version without reestablishing its exact bytes.
+  for(const ReplayBufferPatch &patch : m_BufferPatches)
+    m_CheckpointResidentVersions.erase(patch.buffer);
 }
 
 void D3D11Replay::RecordBufferPatchConsumer(ResourceId buffer, uint32_t eventId,
@@ -2564,6 +2713,7 @@ rdcstr D3D11Replay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &pa
   m_BufferPatchAnchorEvent = firstConsumer > 1 && firstConsumer != ~0U ? firstConsumer - 1 : 0;
   m_BufferPatches = patches;
   InvalidateBufferPatchContents();
+  m_CheckpointResidentVersions.clear();
   if(m_BufferPatchFirstAffected)
   {
     // Same byte ranges fully cover every old overlay byte. Complete prefixes before the first
@@ -2574,7 +2724,18 @@ rdcstr D3D11Replay::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &pa
     UpdateCheckpointAccounting();
   }
   else
-    InvalidateReplayCheckpoints();
+  {
+    // Editing bytes does not change the command stream or the set of physically bound outputs.
+    // Preserve that write proof; the general shader/resource replacement hook intentionally
+    // remains more conservative. Rebuild metadata to include newly patched CPU-only buffers.
+    InvalidateLiveForward();
+    m_Checkpoints.clear();
+    m_CheckpointStats.invalidations++;
+    m_CheckpointPrepared = false;
+    m_CheckpointPreparingFailed = false;
+    m_CheckpointResources.clear();
+    UpdateCheckpointAccounting();
+  }
   ClearPostVSCache();
   if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
   {
@@ -2678,6 +2839,9 @@ void D3D11Replay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
                             !m_ReplayCheckpointBypass && !m_ReplayCheckpointNaturalReference &&
                             unmodified && IsLiveForwardContextSafe();
   const uint64_t entrySerial = m_pDevice->GetReplayExecutionSerial();
+  if(entrySerial != m_CheckpointResidentSerial || !unmodified ||
+     (m_ReplayCheckpointBypass && replayType != eReplay_OnlyDraw))
+    m_CheckpointResidentVersions.clear();
   const LiveForwardCursor previous = m_LiveForward;
   // Consume before executing any command. Force/analysis and failed attempts cannot leave a
   // half-updated cursor available; native analysis callers also change entrySerial.
@@ -2742,21 +2906,31 @@ void D3D11Replay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
       saveEvent = 0;
     if(saveEvent > 0)
     {
+      ForgetCheckpointWrites(startEvent, saveEvent);
       if(!m_pDevice->ReplayLog(startEvent, saveEvent, eReplay_Full))
+      {
+        m_CheckpointResidentVersions.clear();
         return;
+      }
       SaveReplayCheckpoint(saveEvent);
       startEvent = saveEvent + 1;
     }
   }
   bool success = true;
   if(startEvent == 0 || startEvent <= finalEvent || replayType == eReplay_OnlyDraw)
+  {
+    ForgetCheckpointWrites(replayType == eReplay_OnlyDraw ? endEventID : startEvent, finalEvent);
     success = m_pDevice->ReplayLog(startEvent, endEventID, replayType);
+  }
   // Save/restore is exclusively on complete prefix states. OnlyDraw may use a temporary edited
   // shader/CBuffer and therefore never creates a reusable suffix checkpoint.
   if(replayType == eReplay_WithoutDraw || replayType == eReplay_Full)
     m_RenderStateOM = m_pDevice->GetImmediateContext()->GetCurrentPipelineState()->OM;
 
   const bool safeResult = success && !m_pDevice->HasFatalError();
+  if(!safeResult)
+    m_CheckpointResidentVersions.clear();
+  m_CheckpointResidentSerial = m_pDevice->GetReplayExecutionSerial();
   if(ordinaryRoot && safeResult && IsLiveForwardContextSafe())
   {
     const rdcarray<APIEvent> &events = m_pImmediateContext->GetReplayEvents();
@@ -2769,8 +2943,8 @@ void D3D11Replay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
       m_LiveForward.pendingDeviceSerial = m_pDevice->GetReplayExecutionSerial();
     }
   }
-  // The controller deliberately bypasses checkpoints for every OnlyDraw. Publication instead
-  // requires its preceding ordinary root and unchanged native execution serial.
+  // A target-only call cannot establish a cursor on its own. Publication requires its preceding
+  // ordinary root and unchanged native execution serial, including across bypassed references.
   else if(D3D11LiveForwardCanPublish(endEventID, previous.pendingTarget, entrySerial,
                                     previous.pendingDeviceSerial, safeResult,
                                     enabled && unmodified && replayType == eReplay_OnlyDraw) &&
@@ -6642,6 +6816,25 @@ TEST_CASE("D3D11 checked shader replacement requires exact ordinary creation evi
   missing.AddAndOwnChild(makeSDResourceId("pShader"_lit, shader));
   CHECK_FALSE(D3D11CheckedShaderCreationMatches(missing, shader, ShaderStage::Pixel));
   CHECK(D3D11NativeShaderStage(NULL) == ShaderStage::Count);
+}
+
+TEST_CASE("D3D11 checkpoint metadata rejects before overflowing or exceeding its cap",
+          "[d3d11][replay][checkpoint]")
+{
+  D3D11CheckpointMetadataBudget tiny(64);
+  CHECK(tiny.Add(2, 16));
+  CHECK(tiny.Add(1, 32));
+  CHECK_FALSE(tiny.Add(1, 1));
+  CHECK_FALSE(tiny.Add(0, 1));
+  D3D11CheckpointMetadataBudget capped(~0ULL);
+  CHECK(capped.limit == 64ULL * 1024 * 1024);
+  CHECK_FALSE(capped.Add(~0ULL, ~0ULL));
+  uint64_t bytes = ~0ULL - 4;
+  CHECK_FALSE(D3D11CheckpointAddBytes(bytes, 8, ~0ULL));
+  CHECK(bytes == ~0ULL - 4);
+  bytes = 32;
+  CHECK(D3D11CheckpointAddBytes(bytes, 32, 64));
+  CHECK_FALSE(D3D11CheckpointAddBytes(bytes, 1, 64));
 }
 
 TEST_CASE("D3D11 event CBuffer shadows bind legal 256-byte ranges", "[d3d11][cbuffer]")

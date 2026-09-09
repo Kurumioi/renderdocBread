@@ -128,6 +128,14 @@ struct ReplayCheckpointStats
   uint32_t lastResumeEvent = 0;
   uint32_t lastSaveEvent = 0;
   rdcarray<uint32_t> events;
+  // Optional native planning proof, separate from materialized GPU checkpoints. Controllers can
+  // avoid a replay when no new boundary was admitted, and try another bounded idle candidate.
+  bool candidatePlanKnown = false;
+  bool canTryOtherCandidates = false;
+  rdcarray<uint32_t> candidateEvents;
+  // Optional local capability: native planning was stopped solely by a measured zero memory
+  // budget. Old remote peers leave this false; a missing plan is not evidence of memory pressure.
+  bool memoryBudgetBlocked = false;
   // Internal diagnostic, not a translated UI status. Empty means no current rejection.
   rdcstr reason;
 };
@@ -263,6 +271,9 @@ public:
   }
   virtual void InvalidateReplayCheckpoints(uint32_t firstAffectedEvent = 0) {}
   virtual ReplayCheckpointStats GetReplayCheckpointStats() { return {}; }
+  // Idle-only, CPU-only probe. True means a previously measured zero budget became positive;
+  // it does not admit a candidate or build/restore resources. Unsupported drivers return false.
+  virtual bool RefreshReplayCheckpointMemoryBudget() { return false; }
   virtual rdcstr SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
   {
     return patches.empty() ? rdcstr() : rdcstr("Persistent buffer edits are not supported by this replay driver");

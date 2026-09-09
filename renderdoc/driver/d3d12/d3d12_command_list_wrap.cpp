@@ -526,8 +526,7 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ResourceBarrier(
             info.replayClearUnsafeBarriers.push_back(info.curEventID);
         }
         if(barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING ||
-           (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
-            barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE && barrier.Transition.pResource))
+           (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && barrier.Transition.pResource))
         {
           BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
           BakedCmdListInfo::CheckpointBarrierOp op;
@@ -546,7 +545,19 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ResourceBarrier(
             op.stateBefore = barrier.Transition.StateBefore;
             op.stateAfter = barrier.Transition.StateAfter;
           }
-          info.checkpointBarriers.push_back(op);
+          if(barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING ||
+             barrier.Flags != D3D12_RESOURCE_BARRIER_FLAG_NONE)
+            info.checkpointBarriers.push_back(op);
+          if(info.replayTypedBarriersComplete)
+          {
+            if(info.replayTypedBarriers.size() >= 65536)
+            {
+              info.replayTypedBarriersComplete = false;
+              info.replayTypedBarriers.clear();
+            }
+            else
+              info.replayTypedBarriers.push_back(op);
+          }
         }
         if(pBarriers[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
         {
@@ -5613,6 +5624,32 @@ bool WrappedID3D12GraphicsCommandList::Serialise_CopyTextureRegion(
         ResourceId origSrc = liveSrc;
         ResourceId origDst = liveDst;
 
+        if(IsLoading(m_State))
+        {
+          BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
+          BakedCmdListInfo::ReplayTextureCopyOp copy;
+          copy.source = origSrc;
+          copy.destination = origDst;
+          copy.relativeEvent = info.curEventID;
+          copy.unconditional = info.state.predication.buffer == ResourceId();
+          // The first supported region-copy initialization is one complete texture subresource
+          // which is also the whole resource. Arrays/mips/planes require collective coverage.
+          if(dst.pResource && src.pResource && dst.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+             src.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && dst.SubresourceIndex == 0 &&
+             src.SubresourceIndex == 0 && !pSrcBox && DstX == 0 && DstY == 0 && DstZ == 0)
+          {
+            const D3D12_RESOURCE_DESC to = dst.pResource->GetDesc(), from = src.pResource->GetDesc();
+            copy.fullResource =
+                GetNumSubresources(m_pDevice, &to) == 1 &&
+                GetNumSubresources(m_pDevice, &from) == 1 && to.Dimension == from.Dimension &&
+                to.Width == from.Width && to.Height == from.Height &&
+                to.DepthOrArraySize == from.DepthOrArraySize && to.Format == from.Format &&
+                to.SampleDesc.Count == from.SampleDesc.Count &&
+                to.SampleDesc.Quality == from.SampleDesc.Quality;
+          }
+          info.RecordReplayTextureCopy(copy);
+        }
+
         ActionDescription action;
         action.flags |= ActionFlags::Copy;
 
@@ -5738,6 +5775,27 @@ bool WrappedID3D12GraphicsCommandList::Serialise_CopyResource(SerialiserType &se
         action.copySourceSubresource = Subresource();
         action.copyDestination = GetResID(pDstResource);
         action.copyDestinationSubresource = Subresource();
+
+        if(IsLoading(m_State))
+        {
+          BakedCmdListInfo &info = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
+          BakedCmdListInfo::ReplayTextureCopyOp copy;
+          copy.source = GetResID(pSrcResource);
+          copy.destination = GetResID(pDstResource);
+          copy.relativeEvent = info.curEventID;
+          copy.unconditional = info.state.predication.buffer == ResourceId();
+          if(pSrcResource && pDstResource && pSrcResource != pDstResource)
+          {
+            const D3D12_RESOURCE_DESC to = pDstResource->GetDesc(), from = pSrcResource->GetDesc();
+            copy.fullResource = to.Dimension == from.Dimension && to.Width == from.Width &&
+                                to.Height == from.Height &&
+                                to.DepthOrArraySize == from.DepthOrArraySize &&
+                                to.MipLevels == from.MipLevels && to.Format == from.Format &&
+                                to.SampleDesc.Count == from.SampleDesc.Count &&
+                                to.SampleDesc.Quality == from.SampleDesc.Quality;
+          }
+          info.RecordReplayTextureCopy(copy);
+        }
 
         action.flags |= ActionFlags::Copy;
 

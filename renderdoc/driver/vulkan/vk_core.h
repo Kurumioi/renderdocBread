@@ -24,12 +24,15 @@
 
 #pragma once
 
+#include <memory>
+
 #include "common/formatting.h"
 #include "common/timing.h"
 #include "core/gpu_address_range_tracker.h"
 #include "core/rdcbytetrie.h"
 #include "serialise/serialiser.h"
 #include "replay/replay_driver.h"
+#include "replay/replay_resource_versions.h"
 #include "vk_acceleration_structure.h"
 #include "vk_common.h"
 #include "vk_info.h"
@@ -131,6 +134,36 @@ struct VkIndirectPatchData
   ResourceId commandBuffer;
 };
 
+// Optional replay evidence must be bounded while it is produced, before action-tree copies or
+// final access-index construction. Charges are monotonic for this capture, including discarded
+// recordings: exhaustion permanently disables this proof rather than retrying at every draw.
+struct VulkanReplayBindingEvidenceBudget
+{
+  uint64_t storageBytes = 0, submittedWork = 0;
+  bool complete = true;
+
+  bool ReserveStorage(uint64_t count, uint64_t stride, uint64_t limit = 64ULL * 1024 * 1024)
+  {
+    return Reserve(storageBytes, count, stride, limit);
+  }
+  bool ReserveSubmittedWork(uint64_t count, uint64_t limit = 1000000)
+  {
+    return Reserve(submittedWork, count, 1, limit);
+  }
+
+private:
+  bool Reserve(uint64_t &used, uint64_t count, uint64_t stride, uint64_t limit)
+  {
+    if(!complete || used > limit || (stride && count > (limit - used) / stride))
+    {
+      complete = false;
+      return false;
+    }
+    used += count * stride;
+    return true;
+  }
+};
+
 struct VulkanActionTreeNode
 {
   VulkanActionTreeNode() {}
@@ -144,7 +177,24 @@ struct VulkanActionTreeNode
 
   // Potential UBO inputs include every bound descriptor element, independent of reflection.
   // EIDs are assigned only when this command-buffer recording is inserted into a submission.
-  rdcarray<ResourceId> replayPatchUniformInputs;
+  // Immutable IDs and dynamic offsets only. Descriptor contents are still resolved separately
+  // for every real submission. Repeated/secondary/indirect tree copies share these snapshots.
+  typedef rdcarray<VulkanStatePipeline::DescriptorAndOffsets> ReplayDescriptorSnapshot;
+  std::shared_ptr<const ReplayDescriptorSnapshot> replayPatchDescriptorSets;
+  // All framebuffer attachments, including resolves/input attachments. This is a conservative
+  // physical write envelope, recorded before submission assigns the absolute execution EID.
+  std::shared_ptr<const rdcarray<ResourceId>> replayCheckpointAttachments;
+
+  const ReplayDescriptorSnapshot &ReplayPatchDescriptorSets() const
+  {
+    static const ReplayDescriptorSnapshot empty;
+    return replayPatchDescriptorSets ? *replayPatchDescriptorSets : empty;
+  }
+  const rdcarray<ResourceId> &ReplayCheckpointAttachments() const
+  {
+    static const rdcarray<ResourceId> empty;
+    return replayCheckpointAttachments ? *replayCheckpointAttachments : empty;
+  }
 
   rdcarray<ResourceId> executedCmds;
 
@@ -1132,14 +1182,30 @@ private:
   bool m_ReplayPatchCaptureChecked = false;
   rdcstr m_ReplayPatchCaptureError;
   std::map<ResourceId, uint32_t> m_ReplayPatchFirstReads;
+  struct ReplayPatchRead
+  {
+    ReplayBufferPatchRange range;
+    uint32_t eventId;
+  };
+  rdcarray<ReplayPatchRead> m_ReplayPatchReads;
+  ReplayResourceAccessIndex m_ReplayPatchReadIndex;
+  std::set<ResourceId> m_ReplayPatchReadIndexBuffers;
+  uint32_t m_ReplayPatchReadLastEvent = 0;
+  bool m_ReplayPatchReadsComplete = true;
   rdcstr m_ReplayPatchReadEvidenceError;
+  VulkanReplayBindingEvidenceBudget m_ReplayBindingEvidenceBudget;
+  void InvalidateReplayBindingEvidence(const char *reason);
   uint32_t m_ReplayPatchFirstAffectedEvent = 0;
   uint32_t m_ReplayPatchAnchorEvent = 0;
   bool m_ReplayPatchAnchorAttempted = false;
   uint32_t m_ReplayPatchFirstConsumer = 0;
   void RecordReplayPatchUniformInputs(VulkanActionTreeNode &action,
                                       const VulkanStatePipeline &pipeline);
+  void RecordReplayDescriptorOffsets(rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &sets,
+                                     ResourceId layout, uint32_t firstSet, uint32_t setCount,
+                                     uint32_t offsetCount, const uint32_t *offsets);
   void RecordReplayPatchSubmittedReads(const VulkanActionTreeNode &action);
+  void PrepareReplayPatchReadIndex(const std::set<ResourceId> &validatedBuffers);
   bool CanBuildReplayPatchAnchor(uint32_t target, rdcstr &reason);
   rdcstr SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches);
   void DestroyReplayBufferPatches();
@@ -1148,15 +1214,26 @@ private:
                                        uint64_t size);
   // Native resource versions and the CPU cursor for a bounded primary-command-buffer prefix.
   // Kept separate from presentation snapshots: these are copied back into the original resources.
+  struct ReplayCheckpointContent
+  {
+    ~ReplayCheckpointContent();
+    const VkDevDispatchTable *dispatch = NULL;
+    VkDevice device = VK_NULL_HANDLE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkBuffer sourceBuffer = VK_NULL_HANDLE;
+    VkImage sourceImage = VK_NULL_HANDLE;
+    uint64_t bytes = 0, copyBytes = 0;
+    bool populated = false, releaseSafe = true;
+  };
   struct ReplayCheckpointResource
   {
     ResourceId source;
     VkBuffer sourceBuffer = VK_NULL_HANDLE;
     VkImage sourceImage = VK_NULL_HANDLE;
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    uint64_t bytes = 0, copyBytes = 0;
+    std::shared_ptr<ReplayCheckpointContent> version;
+    uint64_t copyBytes = 0;
     ImageState imageState;
     bool shared = false;
   };
@@ -1171,6 +1248,8 @@ private:
     ReplayCheckpointKind kind = ReplayCheckpointKind::PartialCommand;
     uint32_t eventId = 0;
     uint64_t serial = 0;
+    // Conservative CPU ownership charge, admitted before copying any variable-sized state.
+    uint64_t metadataBytes = 0;
     VulkanRenderState renderState;
     rdcarray<CommandBufferNode> partialStack;
     rdcflatmap<ResourceId, ImageState> cmdImageStates;
@@ -1186,6 +1265,23 @@ private:
   rdcarray<ReplayCheckpoint *> m_Checkpoints;
   uint64_t m_CheckpointSerial = 0;
   bool m_CheckpointCaptureSafe = false;
+  // Original capture usage is immutable after loading; edits add their mutable memory separately.
+  bool m_CheckpointWriteUsageCached = false;
+  std::set<ResourceId> m_CheckpointWrittenResources;
+  std::map<ResourceId, rdcarray<uint32_t>> m_CheckpointPhysicalWrites, m_CheckpointContentWrites;
+  std::map<ResourceId, std::weak_ptr<ReplayCheckpointContent>> m_CheckpointResidentVersions;
+  std::set<ResourceId> m_CheckpointHostWrittenUnits;
+  uint64_t m_CheckpointPhysicalWriteCount = 0;
+  bool m_CheckpointPhysicalWritesComplete = true, m_CheckpointWriteIndexPrepared = false;
+  bool m_CheckpointWriteIndexComplete = false;
+  rdcstr m_CheckpointWriteIndexReason;
+  void RecordReplayCheckpointAttachments(VulkanActionTreeNode &action, const VulkanRenderState &state);
+  void RecordReplayCheckpointSubmittedWrites(const VulkanActionTreeNode &action);
+  void PrepareReplayCheckpointWriteIndex();
+  void ForgetReplayCheckpointWrites(uint32_t first, uint32_t last);
+  bool CanReuseReplayCheckpointContents(const ReplayCheckpointResource &resource) const;
+  bool DrainReplayCheckpointWork();
+  uint64_t ReplayCheckpointAllocatedBytes(const ReplayCheckpoint *pending = NULL) const;
   // Actual submitted queues and complete VkSubmitInfo endpoints, gathered during loading. A
   // queue family alone does not prove serial execution when more than one queue was used.
   std::set<ResourceId> m_CheckpointSubmittedQueues;

@@ -1103,6 +1103,7 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
 
         D3D12InitialContents initContents(D3D12InitialContents::Copy, type);
         ResourceContents = initContents.srcData = AllocAlignedBuffer(RDCMAX(ContentsLength, 64ULL));
+        initContents.dataSize = ContentsLength;
         initContents.resourceType = type;
         SetInitialContents(id, initContents);
       }
@@ -1192,6 +1193,7 @@ bool D3D12ResourceManager::Serialise_InitialState(SerialiserType &ser, ResourceI
       D3D12InitialContents initContents(D3D12InitialContents::Copy, type);
       initContents.resourceType = type;
       initContents.resource = mappedBuffer;
+      initContents.dataSize = ContentsLength;
 
       initContents.sparseBinds = sparseBinds;
 
@@ -2082,6 +2084,7 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *res, D3D12Initi
           {
             rdcarray<rdcpair<uint64_t, uint64_t>> ranges;
             m_Device->GetCheckpointInitialCopyRanges(id, desc.Width, ranges);
+            m_Device->FilterReplayDirtyBufferCopyRanges(id, desc.Width, ranges);
             for(const auto &range : ranges)
             {
               AddReplayTimingCounter(ReplayTimingCounter::InitialCPUCopyBytes,
@@ -2217,6 +2220,7 @@ void D3D12ResourceManager::Apply_InitialState(ID3D12DeviceChild *res, D3D12Initi
 
           rdcarray<rdcpair<uint64_t, uint64_t>> ranges;
           m_Device->GetCheckpointInitialCopyRanges(id, RDCMIN(srcDesc.Width, dstDesc.Width), ranges);
+          m_Device->FilterReplayDirtyBufferCopyRanges(id, RDCMIN(srcDesc.Width, dstDesc.Width), ranges);
           for(const auto &range : ranges)
           {
             AddReplayTimingCounter(ReplayTimingCounter::InitialGPUCopyBufferBytes,

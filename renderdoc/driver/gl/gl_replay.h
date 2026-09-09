@@ -40,6 +40,7 @@ class WrappedOpenGL;
 struct GLCounterContext;
 class NVGLCounters;
 struct GLCheckpointBufferVersion;
+struct GLCheckpointTextureVersion;
 struct GLResource;
 
 // Ordinary replay provenance, independent of texture-display caches and checkpoint allocations.
@@ -50,7 +51,11 @@ struct GLLiveForwardCursor
   uint32_t pendingTarget = 0;
   void Invalidate() { event = pendingTarget = 0; }
   bool CanAdvance(uint32_t target) const { return event != 0 && target > event; }
-  void Arm(uint32_t target) { event = 0; pendingTarget = target; }
+  void Arm(uint32_t target)
+  {
+    event = 0;
+    pendingTarget = target;
+  }
   bool Complete(uint32_t target, bool success)
   {
     const bool publish = success && target != 0 && pendingTarget == target;
@@ -412,7 +417,11 @@ public:
 
 private:
   friend class WrappedOpenGL;
-  void InvalidateLiveForward() { m_LiveForward.Invalidate(); }
+  void InvalidateLiveForward()
+  {
+    m_LiveForward.Invalidate();
+    ResetCheckpointTextureLineage();
+  }
   bool PrepareLiveForward();
   bool LiveForwardEndpoint(uint32_t eventId) const;
   GLLiveForwardCursor m_LiveForward;
@@ -422,6 +431,12 @@ private:
   void TrackCheckpointBufferWrites(GLChunk chunk);
   void ResetCheckpointBufferLineage();
   void InvalidateCheckpointBufferVersion(const GLResource &buffer);
+  void ResetCheckpointTextureLineage();
+  void ResetCheckpointTextureTracking();
+  void TrackCheckpointTextureWrites(GLChunk chunk);
+  void RecordCheckpointTextureWrite(const GLResource &resource);
+  bool QueryCheckpointFramebufferWrites(GLuint framebuffer, rdcarray<ResourceId> &writes);
+  bool PrepareCheckpointTextureSharing();
   uint32_t m_ReplayPatchFirstAffectedEvent = 0;
   uint32_t m_ReplayPatchAnchorEvent = 0;
   struct ReplayCheckpoint;
@@ -439,6 +454,38 @@ private:
   std::map<uint32_t, std::unique_ptr<ReplayCheckpoint>> m_Checkpoints;
   // Weak references never keep an evicted GPU allocation outside the checkpoint byte budget.
   std::map<ResourceId, std::weak_ptr<GLCheckpointBufferVersion>> m_CheckpointBufferVersions;
+  std::map<ResourceId, std::weak_ptr<GLCheckpointTextureVersion>> m_CheckpointTextureVersions;
+  struct TextureWriteRecord
+  {
+    uint32_t chunk = 0;
+    bool complete = false;
+    rdcarray<ResourceId> writes;
+  };
+  std::map<uint64_t, TextureWriteRecord> m_CheckpointTextureWrites;
+  size_t m_CheckpointTextureWriteResources = 0;
+  bool m_CheckpointTextureWriteOverflow = false;
+  bool m_CheckpointTextureBindingEdited = false;
+  bool m_CheckpointTextureSharingScanned = false;
+  bool m_CheckpointTextureSharingSafe = false;
+  bool m_CheckpointTextureReplayManaged = false;
+  bool m_CheckpointTextureAnalysis = false;
+  uint32_t m_CheckpointTexturePendingTarget = 0;
+  struct TextureAnalysisScope
+  {
+    GLReplay &replay;
+    bool previous;
+    explicit TextureAnalysisScope(GLReplay &driver)
+        : replay(driver), previous(driver.m_CheckpointTextureAnalysis)
+    {
+      replay.m_CheckpointTextureAnalysis = true;
+      replay.ResetCheckpointTextureLineage();
+    }
+    ~TextureAnalysisScope()
+    {
+      replay.m_CheckpointTextureAnalysis = previous;
+      replay.ResetCheckpointTextureLineage();
+    }
+  };
   // Original live contents proven unchanged for the complete captured frame. Object/sampler
   // state still belongs to each checkpoint. Unknown calls and aliases invalidate this proof.
   std::set<ResourceId> m_CheckpointStaticResources;

@@ -4192,6 +4192,7 @@ RDResult WrappedVulkan::ContextReplayLog(CaptureState readType, uint32_t startEv
 void WrappedVulkan::ApplyInitialContents()
 {
   InvalidateLiveForward("initialContentsRestore");
+  m_CheckpointResidentVersions.clear();
   RENDERDOC_PROFILEFUNCTION();
   if(HasFatalError())
     return;
@@ -5165,6 +5166,7 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
   else if(!ordinaryTarget)
   {
     InvalidateLiveForward("forceOrAnalysisReplay");
+    m_CheckpointResidentVersions.clear();
   }
   bool liveRequestSucceeded = false;
   struct FinishLiveRequest
@@ -5177,6 +5179,8 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
     PerformanceTimer &timer;
     ~FinishLiveRequest()
     {
+      if(!succeeded || driver->HasFatalError())
+        driver->m_CheckpointResidentVersions.clear();
       driver->FinishLiveForwardRequest(eventId, ordinaryRoot, ordinaryTarget, succeeded);
       if(ordinaryRoot && Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
         LogVulkanCheckpoint(StringFormat::Fmt(
@@ -5430,6 +5434,12 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
 
     {
       ScopedReplayTimingSection timing(ReplayTimingSection::ContextReplay);
+
+      // Full/file-order replay invalidates per actual submitted execution below. A partial
+      // outside command buffer executes this exact interval and has no intermediate saves.
+      if(partial)
+        ForgetReplayCheckpointWrites(replayType == eReplay_OnlyDraw ? endEventID : startEventID,
+            replayType == eReplay_WithoutDraw ? RDCMAX(1U, endEventID) - 1 : endEventID);
 
       if(replayType == eReplay_Full)
         status = ContextReplayLog(m_State, startEventID, endEventID, partial);
@@ -6333,6 +6343,7 @@ void WrappedVulkan::AddAction(const ActionDescription &a)
     if(m_LastCmdBufferID != ResourceId())
     {
       node.resourceUsage.swap(m_BakedCmdBufferInfo[m_LastCmdBufferID].resourceUsage);
+      RecordReplayCheckpointAttachments(node, m_BakedCmdBufferInfo[m_LastCmdBufferID].state);
       AddUsage(node, m_BakedCmdBufferInfo[m_LastCmdBufferID].debugMessages);
     }
 
@@ -7124,6 +7135,7 @@ void WrappedVulkan::UpdateImageStates(const rdcflatmap<ResourceId, ImageState> &
 void WrappedVulkan::ReplayDraw(VkCommandBuffer cmd, const ActionDescription &action)
 {
   InvalidateLiveForward("analysisReplayDraw");
+  m_CheckpointResidentVersions.clear();
   // if this isn't a multidraw (or it's the first action in a multidraw, it's fairly easy
   if(action.drawIndex == 0)
   {
@@ -7391,6 +7403,554 @@ TEST_CASE("Vulkan value deltas retain prefixes before unchanged parameter consum
   changed.data[0] = 9;
   REQUIRE(GetReplayBufferPatchChanges({early, late}, {early, changed}, changes).empty());
   CHECK(VulkanReplayPatchValueCutoff({early, late}, {early, changed}, reads, reason, &changes) == 17);
+}
+
+TEST_CASE("Vulkan cached checkpoint writes preserve captured usage classification",
+          "[vulkan][checkpoint][writeusage]")
+{
+  const ResourceId readOnly = ResourceIDGen::GetNewUniqueID();
+  const ResourceId uploadedMemory = ResourceIDGen::GetNewUniqueID();
+  const ResourceId output = ResourceIDGen::GetNewUniqueID();
+  const ResourceId transfer = ResourceIDGen::GetNewUniqueID();
+  std::map<ResourceId, rdcarray<EventUsage>> uses;
+  uses[readOnly] = {EventUsage(12, ResourceUsage::PS_Constants),
+                    EventUsage(44, ResourceUsage::PS_Resource)};
+  uses[uploadedMemory] = {EventUsage(9, ResourceUsage::CPUWrite)};
+  uses[output] = {EventUsage(16, ResourceUsage::ColorTarget),
+                  EventUsage(30, ResourceUsage::ColorTarget)};
+  uses[transfer] = {EventUsage(20, ResourceUsage::CopySrc), EventUsage(24, ResourceUsage::CopyDst)};
+  const std::set<ResourceId> written = VulkanCheckpointWrittenResources(uses);
+  REQUIRE(written.size() == 3);
+  CHECK(written.count(uploadedMemory) == 1);
+  CHECK(written.count(output) == 1);
+  CHECK(written.count(transfer) == 1);
+  CHECK(written.count(readOnly) == 0);
+  // Shader/CB edits do not change this original capture table. Save separately retains the
+  // writable-capability and active patched-memory overlays; this set alone never proves static.
+  CHECK(uses[readOnly].size() == 2);
+  CHECK(uses[output].size() == 2);
+}
+
+TEST_CASE("Vulkan replay binding snapshots share immutable recording values across submissions",
+          "[vulkan][bufferpatch][evidence-budget]")
+{
+  VulkanReplayBindingEvidenceBudget budget;
+  VulkanActionTreeNode::ReplayDescriptorSnapshot sets;
+  sets.resize(2);
+  const ResourceId descriptor = ResourceIDGen::GetNewUniqueID();
+  sets[0].descSet = descriptor;
+  sets[0].offsets = {0, 256};
+  sets[1].offsets = {512};
+  VulkanActionTreeNode recorded;
+  recorded.replayPatchDescriptorSets = VulkanReplayPatchSnapshot(sets, budget);
+  REQUIRE(bool(recorded.replayPatchDescriptorSets));
+  const uint64_t charged = budget.storageBytes;
+  CHECK(charged == sizeof(VulkanActionTreeNode::ReplayDescriptorSnapshot) + 64 +
+                       2 * sizeof(VulkanStatePipeline::DescriptorAndOffsets) + 2 * 64 +
+                       3 * sizeof(uint32_t));
+  const rdcarray<ResourceId> attachments = {ResourceIDGen::GetNewUniqueID()};
+  recorded.replayCheckpointAttachments =
+      std::make_shared<const rdcarray<ResourceId>>(attachments);
+  std::weak_ptr<const VulkanActionTreeNode::ReplayDescriptorSnapshot> lifetime =
+      recorded.replayPatchDescriptorSets;
+  VulkanActionTreeNode submitted = recorded;
+  VulkanActionTreeNode root;
+  root.children.push_back(submitted);
+  root.children.push_back(submitted);
+  CHECK((recorded.replayPatchDescriptorSets.get() ==
+         root.children[1].replayPatchDescriptorSets.get()));
+  CHECK((recorded.replayCheckpointAttachments.get() ==
+         root.children[0].replayCheckpointAttachments.get()));
+  CHECK(budget.storageBytes == charged);
+  // Later binds/offset changes cannot mutate either submitted occurrence's saved inputs.
+  sets[0].descSet = ResourceIDGen::GetNewUniqueID();
+  sets[0].offsets[1] = 768;
+  sets.clear();
+  recorded = VulkanActionTreeNode();
+  submitted = VulkanActionTreeNode();
+  CHECK_FALSE(lifetime.expired());
+  CHECK(root.children[0].ReplayPatchDescriptorSets()[0].descSet == descriptor);
+  CHECK(root.children[1].ReplayPatchDescriptorSets()[0].offsets[1] == 256);
+  CHECK(root.children[0].ReplayCheckpointAttachments() == attachments);
+  root.children.clear();
+  CHECK(lifetime.expired());
+}
+
+TEST_CASE("Vulkan snapshot producer budget includes nested offsets before allocating",
+          "[vulkan][bufferpatch][evidence-budget]")
+{
+  VulkanActionTreeNode::ReplayDescriptorSnapshot sets;
+  sets.resize(2);
+  sets[0].offsets = {0, 256};
+  sets[1].offsets = {512};
+  const uint64_t limit = 64ULL * 1024 * 1024;
+  const uint64_t bytes = sizeof(VulkanActionTreeNode::ReplayDescriptorSnapshot) + 64 +
+                         2 * sizeof(VulkanStatePipeline::DescriptorAndOffsets) + 2 * 64 +
+                         3 * sizeof(uint32_t);
+  VulkanReplayBindingEvidenceBudget exact;
+  exact.storageBytes = limit - bytes;
+  REQUIRE(bool(VulkanReplayPatchSnapshot(sets, exact)));
+  CHECK(exact.complete);
+  CHECK(exact.storageBytes == limit);
+  CHECK_FALSE(bool(VulkanReplayPatchSnapshot(sets, exact)));
+  CHECK_FALSE(exact.complete);
+  CHECK(exact.storageBytes == limit);
+
+  VulkanReplayBindingEvidenceBudget shortBudget;
+  shortBudget.storageBytes = limit - bytes + 1;
+  CHECK_FALSE(bool(VulkanReplayPatchSnapshot(sets, shortBudget)));
+  CHECK_FALSE(shortBudget.complete);
+  CHECK(shortBudget.storageBytes <= limit);
+  const uint64_t failedBytes = shortBudget.storageBytes;
+  CHECK_FALSE(bool(VulkanReplayPatchSnapshot(sets, shortBudget)));
+  CHECK(shortBudget.storageBytes == failedBytes);
+  VulkanReplayBindingEvidenceBudget nextCapture;
+  CHECK(bool(VulkanReplayPatchSnapshot(sets, nextCapture)));
+  CHECK(nextCapture.complete);
+  CHECK(nextCapture.storageBytes == bytes);
+}
+
+TEST_CASE("Vulkan evidence budgets reject overflow and repeated submission growth",
+          "[vulkan][bufferpatch][evidence-budget]")
+{
+  VulkanReplayBindingEvidenceBudget overflow;
+  CHECK_FALSE(overflow.ReserveStorage(~0ULL, 2, ~0ULL));
+  CHECK(overflow.storageBytes == 0);
+  CHECK_FALSE(overflow.complete);
+  CHECK_FALSE(overflow.ReserveStorage(0, 0));
+  VulkanReplayBindingEvidenceBudget boundary;
+  CHECK(boundary.ReserveStorage(~0ULL, 1, ~0ULL));
+  CHECK_FALSE(boundary.ReserveStorage(1, 1, ~0ULL));
+  CHECK(boundary.storageBytes == ~0ULL);
+
+  VulkanReplayBindingEvidenceBudget submits;
+  // One immutable recording can be replayed repeatedly; each inspection still spends work.
+  CHECK(submits.ReserveSubmittedWork(3, 6));
+  CHECK(submits.ReserveSubmittedWork(3, 6));
+  CHECK_FALSE(submits.ReserveSubmittedWork(3, 6));
+  CHECK(submits.submittedWork == 6);
+  CHECK_FALSE(submits.ReserveSubmittedWork(0, 6));
+  CHECK_FALSE(submits.complete);
+}
+
+TEST_CASE("Vulkan attachment snapshots admit peak capacity before allocating",
+          "[vulkan][checkpoint][evidence-budget]")
+{
+  VulkanReplayBindingEvidenceBudget budget;
+  size_t capacity = 999;
+  REQUIRE(VulkanReplayReserveAttachmentSnapshot(3, 2, true, budget, capacity));
+  CHECK(capacity == 11);
+  CHECK(budget.storageBytes == sizeof(rdcarray<ResourceId>) + 64 + 11 * sizeof(ResourceId));
+  rdcarray<ResourceId> attachments;
+  attachments.reserve(capacity);
+  attachments.push_back(ResourceIDGen::GetNewUniqueID());
+  const ResourceId *allocation = attachments.data();
+  auto snapshot = std::make_shared<const rdcarray<ResourceId>>(std::move(attachments));
+  CHECK((snapshot->data() == allocation));
+  CHECK(snapshot->capacity() == capacity);
+  CHECK(attachments.empty());
+
+  VulkanReplayBindingEvidenceBudget inactive;
+  REQUIRE(VulkanReplayReserveAttachmentSnapshot(1, ~0ULL, false, inactive, capacity));
+  CHECK(capacity == 1);
+  VulkanReplayBindingEvidenceBudget overflow;
+  CHECK_FALSE(VulkanReplayReserveAttachmentSnapshot(0, ~0ULL, true, overflow, capacity));
+  CHECK(capacity == 0);
+  CHECK_FALSE(overflow.complete);
+  CHECK(overflow.storageBytes <= 64ULL * 1024 * 1024);
+}
+
+TEST_CASE("Vulkan checkpoint metadata admission bounds nested copied state",
+          "[vulkan][checkpoint][metadata-budget]")
+{
+  VulkanRenderState state;
+  VulkanCheckpointMetadataCounter empty(~0ULL);
+  REQUIRE(VulkanCheckpointRenderMetadata(state, empty));
+  state.graphics.descSets.resize(2);
+  state.graphics.descSets[0].offsets = {0, 256};
+  state.graphics.descSets[1].offsets = {512};
+  state.dynamicRendering.color.resize(3);
+  state.dynamicRendering.localRead.colorAttachmentLocations = {1, 0, 2};
+  VulkanCheckpointMetadataCounter populated(~0ULL);
+  REQUIRE(VulkanCheckpointRenderMetadata(state, populated));
+  CHECK(populated.bytes - empty.bytes ==
+        2 * sizeof(VulkanStatePipeline::DescriptorAndOffsets) + 2 * 64 +
+            6 * sizeof(uint32_t) +
+            3 * (sizeof(VkRenderingAttachmentInfo) + sizeof(VkAttachmentFeedbackLoopInfoEXT)));
+  VulkanCheckpointMetadataCounter exact(populated.bytes);
+  CHECK(VulkanCheckpointRenderMetadata(state, exact));
+  VulkanCheckpointMetadataCounter shortBudget(populated.bytes - 1);
+  CHECK_FALSE(VulkanCheckpointRenderMetadata(state, shortBudget));
+  CHECK_FALSE(shortBudget.complete);
+
+  ImageState image;
+  image.oldQueueFamilyTransfers.resize(2);
+  image.newQueueFamilyTransfers.resize(3);
+  VulkanCheckpointMetadataCounter imageBytes(~0ULL);
+  REQUIRE(VulkanCheckpointImageMetadata(image, imageBytes));
+  CHECK(imageBytes.bytes == 3 * 64 + sizeof(ImageSubresourceState) +
+                               5 * sizeof(VkImageMemoryBarrier));
+  VulkanCheckpointMetadataCounter hardLimit(~0ULL);
+  CHECK(hardLimit.limit == 64ULL * 1024 * 1024);
+  CHECK_FALSE(hardLimit.Add(~0ULL, 2));
+  CHECK(hardLimit.bytes == 0);
+  CHECK_FALSE(hardLimit.Add(0, 0));
+  CHECK(VulkanCheckpointSaturatingAdd(~0ULL - 1, 2) == ~0ULL);
+  CHECK(VulkanCheckpointSaturatingAdd(30, 12) == 42);
+}
+
+TEST_CASE("Exhausted Vulkan binding evidence cannot retain read or static-content proofs",
+          "[vulkan][bufferpatch][checkpoint][evidence-budget]")
+{
+  bool readsComplete = true, writesComplete = true;
+  rdcstr reason;
+  VulkanReplayBindingEvidenceLost(readsComplete, writesComplete, reason,
+                                  "descriptorSubmissionWorkBudget");
+  CHECK_FALSE(readsComplete);
+  CHECK_FALSE(writesComplete);
+  CHECK(reason == "descriptorSubmissionWorkBudget");
+  const ResourceId uniform = ResourceIDGen::GetNewUniqueID();
+  const ResourceId output = ResourceIDGen::GetNewUniqueID();
+  ReplayResourceAccessIndex reads;
+  REQUIRE(reads.Register(uniform, 0, 256, false));
+  REQUIRE(reads.RecordRead(10, {uniform, 0, 0, 256}, true));
+  REQUIRE(reads.FinalizeReads(1, 10, readsComplete));
+  CHECK_FALSE(reads.FirstRead({uniform, 0, 16, 4}, 1, 10).complete);
+  ReplayResourceAccessIndex writes;
+  REQUIRE(writes.Register(output, 0, 1, false));
+  REQUIRE(writes.RecordWrite(10, {output, 0, 0, 1}, true));
+  REQUIRE(writes.Finalize(1, 10, writesComplete));
+  CHECK_FALSE(writes.QueryWrites(1, 10).complete);
+  const std::set<ResourceId> capturedWrites = {output};
+  CHECK_FALSE(VulkanCheckpointResourceMayHaveWrites(uniform, capturedWrites, true));
+  CHECK(VulkanCheckpointResourceMayHaveWrites(uniform, capturedWrites, false));
+  CHECK(VulkanCheckpointResourceMayHaveWrites(output, capturedWrites, false));
+}
+
+TEST_CASE("Vulkan loading records exact dynamic offsets for each bound descriptor set",
+          "[vulkan][bufferpatch][readindex]")
+{
+  const uint32_t offsets[] = {0, 256, 512};
+  rdcarray<rdcarray<uint32_t>> split;
+  REQUIRE(VulkanReplayPatchSplitDynamicOffsets({0, 2, 1}, 3, offsets, split));
+  REQUIRE(split.size() == 3);
+  CHECK(split[0].empty());
+  CHECK(split[1] == rdcarray<uint32_t>({0, 256}));
+  CHECK(split[2] == rdcarray<uint32_t>({512}));
+  CHECK_FALSE(VulkanReplayPatchSplitDynamicOffsets({0, 2, 1}, 2, offsets, split));
+  CHECK(split.empty());
+  CHECK_FALSE(VulkanReplayPatchSplitDynamicOffsets({1}, 1, NULL, split));
+  CHECK_FALSE(VulkanReplayPatchSplitDynamicOffsets({~0U, 1}, 0, NULL, split));
+  CHECK(VulkanReplayPatchSplitDynamicOffsets({0, 0}, 0, NULL, split));
+}
+
+TEST_CASE("Vulkan checkpoint write evidence includes every physical storage descriptor",
+          "[vulkan][checkpoint][contentversion]")
+{
+  DescSetLayout layout = {};
+  layout.bindings.resize(1);
+  layout.bindings[0].layoutDescType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  layout.bindings[0].descriptorCount = layout.totalElems = 3;
+  BindingStorage storage;
+  layout.CreateBindingsArray(storage, 0);
+  const ResourceId first = ResourceIDGen::GetNewUniqueID();
+  const ResourceId last = ResourceIDGen::GetNewUniqueID();
+  storage.binds[0][0].type = DescriptorSlotType::StorageBuffer;
+  storage.binds[0][0].resource = first;
+  storage.binds[0][1].type = DescriptorSlotType::UniformBuffer;
+  storage.binds[0][2].type = DescriptorSlotType::StorageImage;
+  storage.binds[0][2].resource = last;
+  rdcarray<DescriptorSetSlot> slots;
+  REQUIRE(VulkanCheckpointStorageSlots(layout, storage, slots));
+  REQUIRE(slots.size() == 2);
+  CHECK(slots[0].resource == first);
+  CHECK(slots[1].resource == last);
+  // No reflection-active list participates; late array elements remain possible writers.
+  layout.bindings[0].variableSize = true;
+  CHECK_FALSE(VulkanCheckpointStorageSlots(layout, storage, slots));
+  layout.bindings[0].variableSize = false;
+  layout.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+  CHECK_FALSE(VulkanCheckpointStorageSlots(layout, storage, slots));
+  layout.flags = 0;
+  layout.bindings[0].layoutDescType = VK_DESCRIPTOR_TYPE_MUTABLE_EXT;
+  CHECK_FALSE(VulkanCheckpointStorageSlots(layout, storage, slots));
+  layout.bindings[0].layoutDescType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  layout.bindings[0].descriptorCount = 4;
+  CHECK_FALSE(VulkanCheckpointStorageSlots(layout, storage, slots));
+}
+
+TEST_CASE("Vulkan immutable content versions share ownership and count real allocation once",
+          "[vulkan][checkpoint][contentversion]")
+{
+  struct Version
+  {
+    uint64_t bytes;
+    int *destroyed;
+    ~Version() { ++*destroyed; }
+  };
+  int destroyed = 0;
+  auto first = std::make_shared<Version>();
+  first->bytes = 64;
+  first->destroyed = &destroyed;
+  auto second = std::make_shared<Version>();
+  second->bytes = 32;
+  second->destroyed = &destroyed;
+  std::shared_ptr<Version> cpA = first, cpB = first;
+  std::weak_ptr<Version> resident = first;
+  uint64_t allocated = 0;
+  std::set<const Version *> seen;
+  CHECK(VulkanCheckpointAccountVersion(cpA, seen, allocated));
+  CHECK_FALSE(VulkanCheckpointAccountVersion(cpB, seen, allocated));
+  CHECK(VulkanCheckpointAccountVersion(second, seen, allocated));
+  CHECK(allocated == 96);
+  first.reset();
+  cpA.reset();
+  // Compare before Catch decomposition: this test-local shared_ptr type has no ToStr overload.
+  CHECK((resident.lock() == cpB));
+  CHECK(destroyed == 0);
+  cpB.reset();
+  CHECK(resident.expired());
+  CHECK(destroyed == 1);
+  second.reset();
+  CHECK(destroyed == 2);
+}
+
+TEST_CASE("Vulkan resident content is invalidated by exact executed write intervals",
+          "[vulkan][checkpoint][contentversion]")
+{
+  // These are execution EIDs from two submissions of the same command buffer recording.
+  const rdcarray<uint32_t> writes = {16, 20, 116, 120};
+  CHECK(VulkanCheckpointIntervalWrites(writes, 16, 16));
+  CHECK(VulkanCheckpointIntervalWrites(writes, 115, 119));
+  CHECK_FALSE(VulkanCheckpointIntervalWrites(writes, 21, 115));
+  CHECK_FALSE(VulkanCheckpointIntervalWrites(writes, 121, ~0U));
+  CHECK_FALSE(VulkanCheckpointIntervalWrites(writes, 20, 19));
+  CHECK_FALSE(VulkanCheckpointIntervalWrites({}, 0, ~0U));
+  CHECK(VulkanCheckpointWriteCommandKnown("vkCmdCopyImageToBuffer2"));
+  CHECK(VulkanCheckpointWriteCommandKnown("vkCmdDispatch"));
+  CHECK_FALSE(VulkanCheckpointWriteCommandKnown("vkCmdFutureWriteMemoryEXT"));
+  CHECK_FALSE(VulkanCheckpointWriteCommandKnown("vkCmdExecuteCommands"));
+  CHECK_FALSE(VulkanCheckpointWriteCommandKnown("vkCmdDrawIndirect"));
+}
+
+TEST_CASE("Vulkan submitted uniform ranges include descriptor offsets and all dynamic slots",
+          "[vulkan][bufferpatch][readindex]")
+{
+  DescSetLayout layout = {};
+  layout.bindings.resize(3);
+  layout.bindings[0].layoutDescType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+  layout.bindings[0].descriptorCount = 1;
+  layout.bindings[1].layoutDescType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+  layout.bindings[1].descriptorCount = 2;
+  layout.bindings[1].elemOffset = 1;
+  layout.bindings[2].layoutDescType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  layout.bindings[2].descriptorCount = 1;
+  layout.bindings[2].elemOffset = 3;
+  layout.totalElems = 4;
+  layout.dynamicCount = 3;
+  BindingStorage storage;
+  layout.CreateBindingsArray(storage, 0);
+  const ResourceId buffer = ResourceIDGen::GetNewUniqueID();
+  storage.binds[0][0].type = DescriptorSlotType::StorageBufferDynamic;
+  storage.binds[1][0].type = storage.binds[1][1].type = DescriptorSlotType::UniformBufferDynamic;
+  storage.binds[2][0].type = DescriptorSlotType::UniformBuffer;
+  for(uint32_t i = 0; i < 2; i++)
+  {
+    storage.binds[1][i].resource = buffer;
+    storage.binds[1][i].offset = 64 * (i + 1);
+    storage.binds[1][i].range = 16 * (i + 1);
+  }
+  storage.binds[2][0].resource = buffer;
+  storage.binds[2][0].offset = 768;
+  storage.binds[2][0].range = 48;
+  rdcarray<uint32_t> offsets = {111, 256, 512};
+  rdcarray<ResourceId> inputs;
+  rdcarray<ReplayBufferPatchRange> ranges;
+  rdcstr reason;
+  REQUIRE(VulkanReplayPatchUniformInputs(layout, storage, inputs, reason, &offsets, &ranges));
+  REQUIRE(ranges.size() == 3);
+  CHECK(inputs.size() == 1);
+  CHECK(ranges[0].byteOffset == 320);
+  CHECK(ranges[0].byteLength == 16);
+  CHECK(ranges[1].byteOffset == 640);
+  CHECK(ranges[1].byteLength == 32);
+  CHECK(ranges[2].byteOffset == 768);
+  CHECK(ranges[2].byteLength == 48);
+
+  offsets.pop_back();
+  CHECK_FALSE(VulkanReplayPatchUniformInputs(layout, storage, inputs, reason, &offsets, &ranges));
+  CHECK(reason == "missingDynamicDescriptorOffset");
+  offsets = {111, 256, 512, 999};
+  CHECK_FALSE(VulkanReplayPatchUniformInputs(layout, storage, inputs, reason, &offsets, &ranges));
+  CHECK(reason == "unexpectedDynamicDescriptorOffsets");
+  offsets.pop_back();
+  storage.binds[1][0].offset = ~0ULL - 128;
+  CHECK_FALSE(VulkanReplayPatchUniformInputs(layout, storage, inputs, reason, &offsets, &ranges));
+  CHECK(reason == "invalidUniformDescriptorRange");
+  storage.binds[1][0].offset = 0;
+  storage.binds[1][0].range = DescriptorSetSlot::WholeSizeRange;
+  CHECK_FALSE(VulkanReplayPatchUniformInputs(layout, storage, inputs, reason, &offsets, &ranges));
+  // VK_WHOLE_SIZE with zero dynamic offset remains a suffix of the physical buffer.
+  offsets[1] = 0;
+  ranges.clear();
+  REQUIRE(VulkanReplayPatchUniformInputs(layout, storage, inputs, reason, &offsets, &ranges));
+  CHECK(ranges[0].byteLength == VK_WHOLE_SIZE);
+  storage.binds[1][0].range = 0;
+  CHECK_FALSE(VulkanReplayPatchUniformInputs(layout, storage, inputs, reason, &offsets, &ranges));
+}
+
+TEST_CASE("Vulkan repeated submission reads resolve current descriptor bytes at global EIDs",
+          "[vulkan][bufferpatch][readindex]")
+{
+  DescSetLayout layout = {};
+  layout.bindings.resize(1);
+  layout.bindings[0].layoutDescType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+  layout.bindings[0].descriptorCount = 1;
+  layout.totalElems = 1;
+  layout.dynamicCount = 1;
+  BindingStorage storage;
+  layout.CreateBindingsArray(storage, 0);
+  const ResourceId buffer = ResourceIDGen::GetNewUniqueID();
+  storage.binds[0][0].type = DescriptorSlotType::UniformBufferDynamic;
+  storage.binds[0][0].resource = buffer;
+  storage.binds[0][0].range = 16;
+  const rdcarray<uint32_t> boundOffsets = {256};
+  ReplayResourceAccessIndex index;
+  REQUIRE(index.Register(buffer, 0, 512, false));
+  // Descriptor contents belong to submission, while the bound dynamic offset belongs to the
+  // recorded command. Reusing a recorded descriptor-content snapshot would lose the second read.
+  const uint32_t globalEvents[] = {43, 103};
+  for(uint32_t submit = 0; submit < 2; submit++)
+  {
+    storage.binds[0][0].offset = 64 * (submit + 1);
+    rdcarray<ResourceId> inputs;
+    rdcarray<ReplayBufferPatchRange> ranges;
+    rdcstr reason;
+    REQUIRE(VulkanReplayPatchUniformInputs(layout, storage, inputs, reason, &boundOffsets, &ranges));
+    REQUIRE(ranges.size() == 1);
+    REQUIRE(index.RecordRead(globalEvents[submit],
+        {ranges[0].buffer, 0, ranges[0].byteOffset, ranges[0].byteLength}, true));
+  }
+  REQUIRE(index.FinalizeReads(1, 103, true));
+  ReplayResourceReadQuery first = index.FirstRead({buffer, 0, 320, 4}, 1, 103);
+  CHECK(first.complete);
+  CHECK(first.found);
+  CHECK(first.eventId == 43);
+  first = index.FirstRead({buffer, 0, 384, 4}, 1, 103);
+  CHECK(first.complete);
+  CHECK(first.found);
+  CHECK(first.eventId == 103);
+}
+
+TEST_CASE("Vulkan mutable and variable descriptor storage never fabricates exact byte views",
+          "[vulkan][bufferpatch][readindex]")
+{
+  DescSetLayout layout = {};
+  layout.bindings.resize(1);
+  layout.bindings[0].layoutDescType = VK_DESCRIPTOR_TYPE_MUTABLE_EXT;
+  layout.bindings[0].descriptorCount = 1;
+  layout.totalElems = 1;
+  BindingStorage storage;
+  layout.CreateBindingsArray(storage, 0);
+  storage.binds[0][0].type = DescriptorSlotType::UniformBuffer;
+  storage.binds[0][0].resource = ResourceIDGen::GetNewUniqueID();
+  storage.binds[0][0].offset = 256;
+  storage.binds[0][0].range = 16;
+  rdcarray<uint32_t> offsets;
+  rdcarray<ResourceId> inputs;
+  rdcarray<ReplayBufferPatchRange> ranges;
+  rdcstr reason;
+  REQUIRE(VulkanReplayPatchUniformInputs(layout, storage, inputs, reason, &offsets, &ranges));
+  REQUIRE(ranges.size() == 1);
+  CHECK(ranges[0].byteOffset == 0);
+  CHECK(ranges[0].byteLength == VK_WHOLE_SIZE);
+  layout.bindings[0].layoutDescType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  layout.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+  ranges.clear();
+  REQUIRE(VulkanReplayPatchUniformInputs(layout, storage, inputs, reason, &offsets, &ranges));
+  CHECK(ranges[0].byteLength == VK_WHOLE_SIZE);
+  layout.flags = 0;
+  layout.bindings[0].variableSize = 1;
+  storage.variableDescriptorCount = 1;
+  ranges.clear();
+  REQUIRE(VulkanReplayPatchUniformInputs(layout, storage, inputs, reason, &offsets, &ranges));
+  CHECK(ranges[0].byteLength == VK_WHOLE_SIZE);
+}
+
+TEST_CASE("Vulkan range delta cutoffs require positive complete submitted byte evidence",
+          "[vulkan][bufferpatch][readindex]")
+{
+  const ResourceId buffer = ResourceIDGen::GetNewUniqueID();
+  ReplayBufferPatch early;
+  early.buffer = buffer;
+  early.byteOffset = 16;
+  early.data = {1, 2, 3, 4};
+  ReplayBufferPatch late = early;
+  late.byteOffset = 272;
+  ReplayBufferPatch changed = late;
+  changed.data[2] = 9;
+  rdcarray<ReplayBufferPatchRange> changes;
+  REQUIRE(GetReplayBufferPatchChanges({early, late}, {early, changed}, changes).empty());
+  std::map<ResourceId, uint32_t> firstReads = {{buffer, 43}};
+  ReplayResourceAccessIndex index;
+  REQUIRE(index.Register(buffer, 0, 512, false));
+  // One recorded action can occur more than once; these are submitted EIDs, never local EID 3.
+  REQUIRE(index.RecordRead(143, {buffer, 0, 256, 48}, true));
+  REQUIRE(index.RecordRead(43, {buffer, 0, 0, 48}, true));
+  REQUIRE(index.RecordRead(103, {buffer, 0, 256, 48}, true));
+  REQUIRE(index.FinalizeReads(1, 143, true));
+  rdcstr reason;
+  bool known = false;
+  CHECK(VulkanReplayPatchValueCutoff({early, late}, {early, changed}, firstReads, reason,
+                                     &changes, &index, 143, &known) == 103);
+  CHECK(known);
+  CHECK(reason == "changedRangesSubmittedUniformAndCopyReads");
+  CHECK(VulkanReplayPatchValueCutoff({early, late}, {early, changed}, firstReads, reason) == 43);
+  CHECK(VulkanReplayPatchValueCutoff({early, late}, {early, changed}, firstReads, reason,
+                                     NULL, &index, 143, &known) == 43);
+  CHECK_FALSE(known);
+  CHECK(VulkanReplayPatchValueCutoff({early, late}, {}, firstReads, reason,
+                                     &changes, &index, 143, &known) == 0);
+  CHECK_FALSE(known);
+
+  // An unobserved range is not a proof that the edit has no consumer.
+  changes[0].byteOffset = 400;
+  CHECK(VulkanReplayPatchValueCutoff({early, late}, {early, changed}, firstReads, reason,
+                                     &changes, &index, 143, &known) == 43);
+  CHECK_FALSE(known);
+  changes[0].byteOffset = 274;
+  index.InvalidateForEdit();
+  CHECK(VulkanReplayPatchValueCutoff({early, late}, {early, changed}, firstReads, reason,
+                                     &changes, &index, 143, &known) == 43);
+  CHECK_FALSE(known);
+
+  // A copy read of the whole source precedes its bound uniform views.
+  index.Clear();
+  REQUIRE(index.Register(buffer, 0, 512, false));
+  REQUIRE(index.RecordRead(17, {buffer, 0, 0, 512}, true));
+  REQUIRE(index.RecordRead(103, {buffer, 0, 256, 48}, true));
+  REQUIRE(index.FinalizeReads(1, 143, true));
+  firstReads[buffer] = 17;
+  CHECK(VulkanReplayPatchValueCutoff({early, late}, {early, changed}, firstReads, reason,
+                                     &changes, &index, 143, &known) == 17);
+  CHECK(known);
+
+  // Missing native submission/descriptor evidence or query work exhaustion loses precision.
+  index.Clear();
+  REQUIRE(index.Register(buffer, 0, 512, false));
+  REQUIRE(index.RecordRead(103, {buffer, 0, 256, 48}, true));
+  index.RecordUnknown(50);
+  REQUIRE(index.FinalizeReads(1, 143, true));
+  CHECK(VulkanReplayPatchValueCutoff({early, late}, {early, changed}, firstReads, reason,
+                                     &changes, &index, 143, &known) == 17);
+  CHECK_FALSE(known);
+  ReplayResourceAccessIndex limited(2, 1, 0);
+  REQUIRE(limited.Register(buffer, 0, 512, false));
+  REQUIRE(limited.RecordRead(103, {buffer, 0, 256, 48}, true));
+  REQUIRE(limited.FinalizeReads(1, 143, true));
+  CHECK(VulkanReplayPatchValueCutoff({early, late}, {early, changed}, firstReads, reason,
+                                     &changes, &limited, 143, &known) == 17);
+  CHECK_FALSE(known);
 }
 
 TEST_CASE("Vulkan live forward requires an ordinary prefix and its matching successful target",

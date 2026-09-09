@@ -453,7 +453,7 @@ private:
   // One quiet-period request, cancelled by input/capture/publication changes. GPU replay itself
   // remains an atomic work unit; background queue priority does not imply GPU preemption.
   std::atomic<uint64_t> m_IdleCheckpointGeneration = {0};
-  void ScheduleIdleCheckpointMaintenance();
+  void ScheduleIdleCheckpointMaintenance(int delayMS = 750);
   void LogEIDTiming(const QString &line);
 
   const ActionDescription *GetAction(const rdcarray<ActionDescription> &actions, uint32_t eventId)
