@@ -32,10 +32,11 @@
 
 ## 2. 构建输入必须可恢复
 
-- 使用仓库中的封存清单和锁文件；归档通过锁文件固定的 GitHub Release 地址取得。
-  首次克隆执行 `Restore-BuildEnvironment.ps1`，缺少归档时下载并核对大小、SHA-256
-  和精确文件清单后才使用；已验证的本地归档可离线复用。公开 fork 不接受新的 LFS
-  对象，因此归档保存在 Release，源码仓库保留锁文件；不提交归档或无实体的 LFS 指针。
+- 完整封存输入随源码保存：`replaylab/dependencies/archives` 中的普通 Git 二进制
+  分卷每个不超过 48 MiB；锁文件记录顺序、大小、分卷和完整归档的 SHA-256。
+  普通 clone 后运行 `Restore-BuildEnvironment.ps1`，离线还原缺少的 ZIP 并验证精确
+  文件清单；不依赖 Git LFS 或 Release 下载。不要漏提交分卷，也不要把本机缓存当作
+  唯一来源。更新输入后运行 `seal_dependency_parts.py` 并一起提交清单和新分卷。
 - 源码、技能及引用文件、插件、工具获取/校验脚本、补丁、必要 SDK 输入、锁文件和
   已授权的封存依赖应能纳入 Git。缓存、展开的依赖、虚拟环境、编译中间文件、
   发布产物继续忽略。不能把被忽略的 `output`、旧 Development 安装、个人 Codex
@@ -137,6 +138,8 @@ Native/绑定构建、冻结 Host、UEX 自包含发布及最终组包。
 - 可执行文件名为 `RenderDocBread.exe`，ZIP 中仅有一个 `RenderDocBread` 顶层目录。
   使用脚本生成的时间戳名称，或与实际版本一致的
   `RenderDocBread-<version>-win-x64.zip`。保留旧版，避免同名覆盖。
+- GitHub Release 只上传用户直接使用的完整应用程序包及 SHA-256 校验文件。
+  源码构建所需的封存依赖随源码的普通 Git 分卷保存，不另行上传到 Release。
 - 默认成品目录为 `dist`；已有对话约定其他交付目录时沿用。
   跨盘移动、复制或重命名后，重新校对目标文件 SHA-256，并同步 `.zip.sha256`
   中的文件名和发布回执中的路径；不能只改 ZIP 名称。

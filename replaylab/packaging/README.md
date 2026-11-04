@@ -25,8 +25,9 @@ consistent source path: mixing a junction-based `SolutionDir` with projects
 opened through their original path can defeat MSVC precompiled-header identity.
 
 Build prerequisites: VS2022 C++/VC143 redistributable files, Windows SDK, 64-bit CPython
-3.12, and .NET 10 SDK. Missing sealed inputs are downloaded from pinned Release
-assets by `Restore-BuildEnvironment.ps1` and checked against the lock file. Qt Linguist, Shader tools, the
+3.12, and .NET 10 SDK. The ordinary Git checkout includes all sealed archive
+parts. `Restore-BuildEnvironment.ps1` assembles them offline and checks the lock
+file before use. Qt Linguist, Shader tools, the
 language service, Unity provider, UEX source and locked Python/NuGet dependencies are
 restored from sealed repository inputs. UEX is published with `-r win-x64 --self-contained
 true` so the recipient needs no .NET SDK or modern .NET runtime installation. Use
@@ -391,13 +392,19 @@ a provider-side 403/502 is not reported as a successful connection.
 ## Clean checkout and dependency inputs
 
 The Windows x64 package can restore its third-party inputs from
-`replaylab/dependencies/inputs.lock.json` and its pinned GitHub Release assets.
-Run `Restore-BuildEnvironment.ps1` after cloning; it downloads missing archives
-and verifies their locked size, SHA-256 and inventory before use. Existing valid
-archives work offline. Archives stay ignored locally, so GitHub Desktop pushes
-source without attempting unsupported new LFS uploads to this public fork.
-To fetch and verify inputs without creating an environment, run
-`python replaylab/packaging/restore_dependencies.py --download --verify-only`.
+`replaylab/dependencies/inputs.lock.json` and the ordinary Git binary parts in
+`replaylab/dependencies/archives`. Each part is at most 48 MiB, below GitHub's
+regular-file warning threshold. Clone normally; no LFS setup or separate Release
+download is needed. `Restore-BuildEnvironment.ps1` automatically reconstructs
+missing ZIPs, checks every part and archive SHA-256 plus the exact inventory,
+then restores the locked offline environment. Reconstructed ZIPs and expanded
+inputs stay ignored; the source parts are tracked and unchanged.
+To assemble and verify inputs without creating an environment, run
+`python replaylab/packaging/restore_dependencies.py --verify-only`.
+When deliberately updating sealed inputs, update the locked archive inventory,
+run `python replaylab/packaging/seal_dependency_parts.py`, and commit the new
+parts together with `inputs.lock.json`. Public Releases contain only the complete
+user application archive and its checksum, never separate build-input archives.
 See [the dependency and redistribution checklist](../dependencies/README.md)
 and [machine inventory](../dependencies/inventory.json).
 

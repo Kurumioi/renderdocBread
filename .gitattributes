@@ -47,5 +47,5 @@
 renderdoccmd/resource.h binary
 renderdoc/data/resource.h binary
 
-# Sealed third-party build archives are pinned Release assets, restored by
-# replaylab/packaging/Restore-BuildEnvironment.ps1 (public forks reject new LFS objects).
+# Sealed build inputs use ordinary Git binary parts below the per-file limit.
+replaylab/dependencies/archives/**/*.part binary

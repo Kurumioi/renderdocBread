@@ -7,7 +7,7 @@
 ## 优先核对的专用组件
 
 下表的许可证名称来自随附元数据，不代表重新授予许可证。
-公开仓库、GitHub Release 依赖资产和最终程序包都属于需要覆盖的分发方式。
+公开源码仓库（含封存分卷）和最终程序包都属于需要覆盖的分发方式。
 原始通知、对应源码要求及服务使用条件应与二进制一起保留。
 
 | 组件 | 快照版本 | 元数据声明 | 需要核对的具体内容 |
@@ -47,18 +47,22 @@ Bread 通用 MCP 适配器与提供商专用服务应分别进行健康检查。
 ## 依赖输入与产物边界
 
 `replaylab/dependencies` 保存锁文件、清单和封存的第三方依赖输入。
-封存归档作为 GitHub Release 资产保存；这些是构建输入，不是 RenderDocBread 发布包。
-公开 fork 不允许上传新的 LFS 对象，因此源码只跟踪锁文件和清单，归档在本地忽略。
-首次克隆执行 `./replaylab/packaging/Restore-BuildEnvironment.ps1`，自动下载缺少的固定
-版本归档并校验大小、SHA-256 和精确文件清单；已有归档可离线恢复。
-仅下载输入并验证可运行：
+封存归档以每个不超过 48 MiB 的普通 Git 二进制分卷保存在 `archives/`，随源码
+一起 clone；这些是构建输入，不是 RenderDocBread 用户发布包，不上传到 Release。
+锁文件记录各分卷的路径、顺序、大小与 SHA-256，并保留完整 ZIP 和内部文件清单。
+首次 clone 后执行 `./replaylab/packaging/Restore-BuildEnvironment.ps1`，自动离线还原
+缺少的 ZIP 并校验全部内容，再恢复构建环境。不需要 Git LFS 或单独下载依赖。
+只还原归档并验证可运行：
 
 ```powershell
-python replaylab/packaging/restore_dependencies.py --download --verify-only
+python replaylab/packaging/restore_dependencies.py --verify-only
 ```
 
-每个归档的真实下载地址保存在 `inputs.lock.json` 的 `downloadUrl`；不要删除或替换
-已发布的固定版本资产。下载失败或校验不符会停止，不会使用不完整文件。
+还原后的 ZIP 在本地忽略，源码分卷保持只读。分卷缺失、损坏或校验不符会停止，
+不会使用或覆盖已有的有效输入。更新封存依赖时先更新归档及其锁定文件清单，再运行
+`python replaylab/packaging/seal_dependency_parts.py`，把锁文件和新增分卷一并提交。
+源码自带依赖不包含开发机基础工具链：仍需安装下文列出的 VS、Windows SDK、
+64 位 CPython 3.12 和 .NET SDK。
 
 `3dmigoto-source.zip` 包含与现有工具来源记录对应的提交
 `cbc4993ca67b6d639e06c578d4e3dc8b3780243f`，其中含原始构建说明。

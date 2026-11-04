@@ -82,9 +82,10 @@ Run `PACKAGE_RENDERDOCBREAD.cmd` at the repository root, or:
 ./replaylab/packaging/Build-RenderDocBread.ps1
 ```
 
-After cloning, run `./replaylab/packaging/Restore-BuildEnvironment.ps1`. Missing
-sealed inputs are downloaded from pinned GitHub Release assets and verified against
-`replaylab/dependencies/inputs.lock.json`; public forks reject new Git LFS objects.
+After an ordinary clone, run `./replaylab/packaging/Restore-BuildEnvironment.ps1`.
+Sealed inputs are included as ordinary Git binary parts under
+`replaylab/dependencies/archives`; the build assembles and verifies them offline
+against `inputs.lock.json`. No Git LFS pull or Release dependency downloads are needed.
 The sealed build inputs and
 redistribution inventory are in `replaylab/dependencies`; `Restore-BuildEnvironment.ps1`
 creates the offline locked build environment without a pre-existing Development install.

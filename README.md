@@ -80,4 +80,8 @@ https://github.com/user-attachments/assets/22e66080-ca93-40d0-ab08-dcc3c5565b2a
 
 </details>
 
+## 从源码构建
+
+普通 `git clone` 会包含完整的封存依赖分卷，构建入口会自动离线还原和校验，无需从 Release 单独下载依赖或运行 Git LFS。开发机需安装 Visual Studio C++、Windows SDK、64 位 Python 3.12 和 .NET SDK；运行 `PACKAGE_RENDERDOCBREAD.cmd`，具体版本和步骤见[构建说明](replaylab/packaging/README.md)。
+
 基于 [RenderDoc](https://github.com/baldurk/renderdoc) 拓展。首方代码许可证见 [LICENSE.md](LICENSE.md)，随附依赖按各自许可证与通知分发。

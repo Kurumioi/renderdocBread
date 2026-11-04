@@ -21,7 +21,7 @@ $config = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'RenderDocBread.pack
 if (-not $Destination) { $Destination = Join-Path $repoRoot $config.destination }
 if (-not $BuildInputRoot) { $BuildInputRoot = Join-Path $repoRoot 'replaylab\output\build-inputs' }
 # Restore locked third-party inputs before looking for a pre-existing application.
-# Missing archives come from pinned Release assets; subsequent restoration is offline.
+# Checked-in archive parts restore all sealed inputs offline after an ordinary clone.
 $restoreArguments = @('-OutputRoot', $BuildInputRoot)
 if ($PythonExecutable) { $restoreArguments += @('-PythonExecutable', $PythonExecutable) }
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Restore-BuildEnvironment.ps1') @restoreArguments

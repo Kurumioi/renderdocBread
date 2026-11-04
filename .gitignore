@@ -174,7 +174,7 @@ venv/
 **/profiles.local.json
 **/agent-tools.local.json
 
-# Sealed build archives are downloaded from pinned GitHub Release assets.
+# Checked-in archive parts reconstruct these local build-input caches offline.
 /replaylab/dependencies/*.zip
-/replaylab/dependencies/.download-*.lock
-/replaylab/dependencies/.bread-download-*.partial
+/replaylab/dependencies/.assemble-*.lock
+/replaylab/dependencies/.bread-archive-*.partial

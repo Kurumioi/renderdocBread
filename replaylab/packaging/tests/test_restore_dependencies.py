@@ -1,7 +1,6 @@
 import hashlib
 import importlib.util
 import json
-import io
 from pathlib import Path
 import zipfile
 
@@ -78,52 +77,77 @@ def test_unsafe_archive_paths_are_rejected_before_extraction(tmp_path, entries):
 def test_lfs_pointer_gives_actionable_diagnostic(tmp_path):
     inputs, record = sealed(tmp_path)
     (inputs / record["path"]).write_text("version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 10000\n")
-    with pytest.raises(ValueError, match="--download"):
+    with pytest.raises(ValueError, match="complete source checkout"):
         restore.verify_archive(inputs, record)
 
 
-def downloadable(record):
-    return dict(record, downloadUrl="https://github.com/Straw1997/renderdocBread/releases/download/v1.13.121/" + record["path"])
-
-
-def test_download_verifies_and_atomically_restores_missing_input(tmp_path, monkeypatch):
-    inputs, record = sealed(tmp_path)
+def split_input(inputs, record):
     data = (inputs / record["path"]).read_bytes()
+    parts = []
+    for index, chunk in enumerate((data[:len(data)//2], data[len(data)//2:])):
+        name = f"archives/tools/{index}.part"
+        part = inputs / name
+        part.parent.mkdir(parents=True, exist_ok=True)
+        part.write_bytes(chunk)
+        parts.append({"path": name, "size": len(chunk), "sha256": hashlib.sha256(chunk).hexdigest()})
     (inputs / record["path"]).unlink()
-    monkeypatch.setattr(restore, "urlopen", lambda *a, **kw: io.BytesIO(data))
-    assert restore.download_archive(inputs, downloadable(record)).read_bytes() == data
-    assert not list(inputs.glob(".bread-download-*"))
+    return dict(record, parts=parts), data
 
 
-@pytest.mark.parametrize("corrupt", [b"short", b"x" * 10000])
-def test_failed_download_preserves_legacy_pointer_and_cleans_partial(tmp_path, monkeypatch, corrupt):
+@pytest.mark.parametrize("legacy_pointer", [False, True])
+def test_missing_archive_is_assembled_from_checkout_without_network(tmp_path, legacy_pointer):
     inputs, record = sealed(tmp_path)
+    record, data = split_input(inputs, record)
+    if legacy_pointer:
+        (inputs / record["path"]).write_bytes(b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 10000\n")
+    assert restore.verify_archive(inputs, record).read_bytes() == data
+    assert not list(inputs.glob(".bread-archive-*"))
+    assert restore.restore(inputs, tmp_path / "build", record).joinpath("tool/code.py").read_bytes() == b"print('tool')\n"
+
+
+@pytest.mark.parametrize("damage", ["missing", "truncated", "same_size"])
+def test_invalid_part_cannot_publish_archive_or_overwrite_pointer(tmp_path, damage):
+    inputs, record = sealed(tmp_path)
+    record, data = split_input(inputs, record)
     pointer = b"version https://git-lfs.github.com/spec/v1\noid sha256:abc\nsize 10000\n"
     (inputs / record["path"]).write_bytes(pointer)
-    monkeypatch.setattr(restore, "urlopen", lambda *a, **kw: io.BytesIO(corrupt))
-    with pytest.raises(ValueError):
-        restore.download_archive(inputs, downloadable(record))
+    part = inputs / record["parts"][0]["path"]
+    if damage == "missing":
+        part.unlink()
+    else:
+        part.write_bytes(b"x" * (part.stat().st_size - (damage == "truncated")))
+    with pytest.raises(ValueError, match="dependency part|part hash"):
+        restore.verify_archive(inputs, record)
     assert (inputs / record["path"]).read_bytes() == pointer
-    assert not list(inputs.glob(".bread-download-*"))
+    assert not list(inputs.glob(".bread-archive-*"))
 
 
-def test_existing_valid_or_damaged_input_is_never_downloaded_over(tmp_path, monkeypatch):
+@pytest.mark.parametrize("damage", ["duplicate", "escape", "archive_hash"])
+def test_invalid_parts_inventory_is_rejected(tmp_path, damage):
     inputs, record = sealed(tmp_path)
-    def no_network(*a, **kw):
-        pytest.fail("Existing archives must not be downloaded over")
-    monkeypatch.setattr(restore, "urlopen", no_network)
-    assert restore.download_archive(inputs, downloadable(record)) == inputs / record["path"]
-    (inputs / record["path"]).write_bytes(b"damaged archive")
-    with pytest.raises(ValueError, match="input changed"):
-        restore.download_archive(inputs, downloadable(record))
-    assert (inputs / record["path"]).read_bytes() == b"damaged archive"
+    record, data = split_input(inputs, record)
+    if damage == "duplicate":
+        record["parts"][1]["path"] = record["parts"][0]["path"]
+    elif damage == "escape":
+        record["parts"][0]["path"] = "../outside"
+    else:
+        record["sha256"] = "f" * 64
+    with pytest.raises(ValueError):
+        restore.verify_archive(inputs, record)
+    assert not (inputs / record["path"]).exists()
+    assert not list(inputs.glob(".bread-archive-*"))
 
 
-def test_untrusted_download_url_is_rejected_before_network(tmp_path, monkeypatch):
+def test_sealing_roundtrip_keeps_locked_archive_and_file_inventory(tmp_path):
+    from seal_dependency_parts import seal
     inputs, record = sealed(tmp_path)
+    (inputs / "inputs.lock.json").write_text(json.dumps({"schema": "bread-build-inputs/v1", "archives": [record]}))
+    sealed_record = seal(inputs, 64)["archives"][0]
+    assert sealed_record["sha256"] == record["sha256"]
+    assert sealed_record["files"] == record["files"]
+    original = (inputs / record["path"]).read_bytes()
     (inputs / record["path"]).unlink()
-    with pytest.raises(ValueError, match="download URL"):
-        restore.download_archive(inputs, dict(record, downloadUrl="https://example.invalid/tools.zip"))
+    assert restore.verify_archive(inputs, sealed_record).read_bytes() == original
 
 
 def test_extract_cannot_write_into_dependency_inputs(tmp_path):

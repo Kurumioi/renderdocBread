@@ -2,7 +2,7 @@
 
 Only archives listed in dependencies/inputs.lock.json are accepted. Expanded
 files are disposable build data; verified archives remain read-only. Missing
-archives can be downloaded explicitly from the pinned GitHub Release assets.
+archives are assembled offline from the ordinary Git files listed in the lock.
 """
 from __future__ import annotations
 
@@ -16,8 +16,6 @@ import shutil
 import stat
 import tempfile
 import time
-from urllib.parse import urlparse
-from urllib.request import urlopen
 import zipfile
 
 REPO = Path(__file__).resolve().parents[2]
@@ -43,11 +41,15 @@ def child(root: Path, relative: str) -> Path:
 def verify_archive(root: Path, record: dict) -> Path:
     archive = child(root, record["path"])
     if not archive.is_file():
-        raise ValueError(f"Missing dependency input {record['path']}; run Restore-BuildEnvironment.ps1 or restore_dependencies.py --download --verify-only.")
+        if record.get("parts"):
+            return assemble_archive(root, record)
+        raise ValueError(f"Missing dependency input {record['path']}; obtain the complete source checkout including replaylab/dependencies/archives.")
     if archive.stat().st_size != record["size"] or sha(archive) != record["sha256"]:
         with archive.open("rb") as stream:
             pointer = stream.read(128).startswith(b"version https://git-lfs.github.com/spec/v1")
-        hint = "; legacy Git LFS pointer found: run restore_dependencies.py --download --verify-only" if pointer else ""
+        if pointer and record.get("parts"):
+            return assemble_archive(root, record)
+        hint = "; legacy Git LFS pointer found: obtain the complete source checkout including replaylab/dependencies/archives" if pointer else ""
         raise ValueError(f"Dependency input changed: {record['path']}{hint}")
     expected = {r["path"] for r in record["files"]}
     if len(expected) != len(record["files"]):
@@ -69,37 +71,39 @@ def verify_archive(root: Path, record: dict) -> Path:
     return archive
 
 
-def download_archive(root: Path, record: dict) -> Path:
-    """Publish a missing sealed input only after its complete inventory passes."""
+def assemble_archive(root: Path, record: dict) -> Path:
+    """Restore an ignored ZIP from checked-in parts without any network access."""
     archive = child(root, record["path"])
     root.mkdir(parents=True, exist_ok=True)
-    with input_lock(root / (".download-" + archive.name + ".lock")):
+    parts = record.get("parts", [])
+    if (not parts or len({r["path"] for r in parts}) != len(parts)
+            or sum(r["size"] for r in parts) != record["size"]):
+        raise ValueError("Invalid dependency archive parts inventory")
+    with input_lock(root / (".assemble-" + archive.name + ".lock")):
         if archive.is_symlink() or archive.is_junction():
-            raise ValueError("Dependency download target must be an ordinary file")
+            raise ValueError("Dependency archive target must be an ordinary file")
         if archive.exists():
             with archive.open("rb") as stream:
                 pointer = stream.read(128).startswith(b"version https://git-lfs.github.com/spec/v1")
             if not pointer:
                 return verify_archive(root, record)
-        url = record.get("downloadUrl", "")
-        parsed = urlparse(url)
-        prefix = "/Straw1997/renderdocBread/releases/download/"
-        if (parsed.scheme != "https" or parsed.netloc != "github.com"
-                or not parsed.path.startswith(prefix) or parsed.query or parsed.fragment
-                or parsed.path.rsplit("/", 1)[-1] != archive.name):
-            raise ValueError("Missing or invalid pinned dependency download URL")
         pending = None
         try:
-            with tempfile.NamedTemporaryFile(dir=root, prefix=".bread-download-", suffix=".partial", delete=False) as stream:
+            with tempfile.NamedTemporaryFile(dir=root, prefix=".bread-archive-", suffix=".partial", delete=False) as stream:
                 pending = Path(stream.name)
-                with urlopen(url, timeout=60) as response:
-                    size = 0
-                    while chunk := response.read(1024 * 1024):
-                        size += len(chunk)
-                        if size > record["size"]:
-                            raise ValueError("Dependency download exceeds the locked size")
-                        stream.write(chunk)
-            staged = dict(record, path=pending.name)
+                for part in parts:
+                    source = child(root, part["path"])
+                    if (source == archive or source.is_symlink() or source.is_junction()
+                            or not source.is_file() or source.stat().st_size != part["size"]):
+                        raise ValueError(f"Missing or changed dependency part: {part['path']}; obtain a complete source checkout.")
+                    digest = hashlib.sha256()
+                    with source.open("rb") as data:
+                        while chunk := data.read(1024 * 1024):
+                            digest.update(chunk)
+                            stream.write(chunk)
+                    if digest.hexdigest() != part["sha256"]:
+                        raise ValueError(f"Dependency part hash differs: {part['path']}")
+            staged = dict(record, path=pending.name, parts=[])
             verify_archive(root, staged)
             os.replace(pending, archive)
         finally:
@@ -218,7 +222,6 @@ def main():
     parser.add_argument("--output", type=Path, default=REPO / "replaylab/output/dependencies")
     parser.add_argument("--only", action="append", default=[])
     parser.add_argument("--verify-only", action="store_true")
-    parser.add_argument("--download", action="store_true", help="Download missing pinned Release inputs before verification/restoration")
     parser.add_argument("--receipt", type=Path)
     args = parser.parse_args()
     lock = load_lock(args.inputs)
@@ -229,8 +232,6 @@ def main():
     for record in lock["archives"]:
         if record["id"] not in selected:
             continue
-        if args.download:
-            download_archive(args.inputs, record)
         path = (verify_archive(args.inputs, record) if args.verify_only
                 else restore(args.inputs, args.output, record))
         paths[record["id"]] = str(path.resolve())

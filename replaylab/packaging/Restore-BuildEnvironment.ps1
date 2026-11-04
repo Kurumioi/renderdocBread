@@ -22,9 +22,9 @@ if (-not $PythonExecutable) { throw 'Install 64-bit CPython 3.12 or supply -Pyth
 if ($LASTEXITCODE -ne 0) { throw 'The selected build interpreter is not 64-bit CPython 3.12.' }
 $arguments = @((Join-Path $PSScriptRoot 'restore_dependencies.py'), '--output', (Join-Path $OutputRoot 'expanded'))
 if ($VerifyOnly) { $arguments += '--verify-only' }
-else { $arguments += @('--download', '--receipt', (Join-Path $OutputRoot 'paths.json')) }
+else { $arguments += @('--receipt', (Join-Path $OutputRoot 'paths.json')) }
 & $PythonExecutable @arguments
-if ($LASTEXITCODE -ne 0) { throw 'Dependency input restoration failed. Check the pinned Release assets and the preceding diagnostic.' }
+if ($LASTEXITCODE -ne 0) { throw 'Dependency input restoration failed. Check the complete source checkout and the preceding diagnostic.' }
 if ($VerifyOnly) { return }
 $paths = Get-Content -LiteralPath (Join-Path $OutputRoot 'paths.json') -Raw | ConvertFrom-Json
 & $PythonExecutable (Join-Path $PSScriptRoot 'bootstrap_build.py') --output (Join-Path $OutputRoot 'environment') --wheels $paths.'python-wheels'

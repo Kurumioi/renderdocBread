@@ -3664,7 +3664,63 @@
           "sha256": "c44dff01661cefb023e604974a2488ce1cc3e8c9a3bd981bfec1caf2a8ea269d"
         }
       ],
-      "downloadUrl": "https://github.com/Straw1997/renderdocBread/releases/download/v1.13.121/capabilities.zip"
+      "parts": [
+        {
+          "path": "archives/capabilities/d52b9d6759d16cca.000.part",
+          "size": 50331648,
+          "sha256": "f1b58255660231d55a7bedec402fb6ad3fa76461a0007d0f88729c05271af7eb"
+        },
+        {
+          "path": "archives/capabilities/d52b9d6759d16cca.001.part",
+          "size": 50331648,
+          "sha256": "2a346a61e3e2f24b8cc38ee62b263b0f6ad9092f530040a09986896aa54be1c5"
+        },
+        {
+          "path": "archives/capabilities/d52b9d6759d16cca.002.part",
+          "size": 50331648,
+          "sha256": "d5fe6e526d69f9c7a09fc9ac679c078eeebc688157817c3ca21705abb7e5a866"
+        },
+        {
+          "path": "archives/capabilities/d52b9d6759d16cca.003.part",
+          "size": 50331648,
+          "sha256": "ffd9e882deb9b6139b7ea6bb540d9b02d24662c5d0cf5127898097a6f0f12d42"
+        },
+        {
+          "path": "archives/capabilities/d52b9d6759d16cca.004.part",
+          "size": 50331648,
+          "sha256": "1ccd288c391d25fe26a2b30f6b47dcd350b4f38b9bba96f8199e9f3d7e406445"
+        },
+        {
+          "path": "archives/capabilities/d52b9d6759d16cca.005.part",
+          "size": 50331648,
+          "sha256": "080a08e72420424b3e2e0f744668323c5acfce91e77c4c024a6e2e2f80227df1"
+        },
+        {
+          "path": "archives/capabilities/d52b9d6759d16cca.006.part",
+          "size": 50331648,
+          "sha256": "f6c4b98f3bd0a56417318c44b82b9eae69e1300b64ed65bb39297f53cbb548c1"
+        },
+        {
+          "path": "archives/capabilities/d52b9d6759d16cca.007.part",
+          "size": 50331648,
+          "sha256": "1378c36868d85bcceeef54cd823edc59269736ce9e7d5f9f53156a9f20f7938f"
+        },
+        {
+          "path": "archives/capabilities/d52b9d6759d16cca.008.part",
+          "size": 50331648,
+          "sha256": "4e04791c5c931273781b9e5b2de6da4d6aba82d6cdaa45cdce1d20e8b49fe6c9"
+        },
+        {
+          "path": "archives/capabilities/d52b9d6759d16cca.009.part",
+          "size": 50331648,
+          "sha256": "7f2f0984624e871961df78fe14ee82c71f1859766b28c415d0370f1c6fe1e8a3"
+        },
+        {
+          "path": "archives/capabilities/d52b9d6759d16cca.010.part",
+          "size": 19223046,
+          "sha256": "d4aa668f4b6e5b83ece4697dbd63511968418459c5d6dcabd781273c98ccba09"
+        }
+      ]
     },
     {
       "id": "application-tools",
@@ -4035,7 +4091,13 @@
           "sha256": "eb6cd8263f9a34af4a322b3cbd314c05b842ef9896ffb70911176dd22e8ef503"
         }
       ],
-      "downloadUrl": "https://github.com/Straw1997/renderdocBread/releases/download/v1.13.121/application-tools.zip"
+      "parts": [
+        {
+          "path": "archives/application-tools/0b159bea154b2783.000.part",
+          "size": 41477075,
+          "sha256": "0b159bea154b27830698c1ab29678e270034ae13959e63803f6405ac71a5e525"
+        }
+      ]
     },
     {
       "id": "shader-language-server",
@@ -4143,7 +4205,13 @@
           "sha256": "55284952bd483a64a38f48069796b813da1085f1360d8d59cfbef6cce802868e"
         }
       ],
-      "downloadUrl": "https://github.com/Straw1997/renderdocBread/releases/download/v1.13.121/shader-language-server.zip"
+      "parts": [
+        {
+          "path": "archives/shader-language-server/86750eecc2f3c695.000.part",
+          "size": 13088989,
+          "sha256": "86750eecc2f3c695a9be75aa4ba69ec2683760f0f34c5259a0aa683887672ad3"
+        }
+      ]
     },
     {
       "id": "unity-mcp",
@@ -32738,7 +32806,13 @@
           "sha256": "6a99bc0128e0c7d6cbbf615fcc26909565e17d4ca3451b97f8987f9c6acbc6c8"
         }
       ],
-      "downloadUrl": "https://github.com/Straw1997/renderdocBread/releases/download/v1.13.121/unity-mcp.zip"
+      "parts": [
+        {
+          "path": "archives/unity-mcp/be60c6f564e26437.000.part",
+          "size": 37958765,
+          "sha256": "be60c6f564e2643709afb843346ea6137f4755e9c2de31434d9de78c8d2f1cad"
+        }
+      ]
     },
     {
       "id": "uex-source",
@@ -43139,7 +43213,13 @@
           "sha256": "ae7f37b2683b6489b36d00457f45abb312134350e9c0b3189ec4b76224e8f9cf"
         }
       ],
-      "downloadUrl": "https://github.com/Straw1997/renderdocBread/releases/download/v1.13.121/uex-source.zip"
+      "parts": [
+        {
+          "path": "archives/uex-source/78d023de72d73ce8.000.part",
+          "size": 3277551,
+          "sha256": "78d023de72d73ce859cc05afbc1a29ae6b8317be2d334356f1918f532727c8c8"
+        }
+      ]
     },
     {
       "id": "python-wheels",
@@ -43843,7 +43923,18 @@
           "sha256": "ffef5a74088f1e09947aecf91011136665152e0b4b359c42be3373897fb39b01"
         }
       ],
-      "downloadUrl": "https://github.com/Straw1997/renderdocBread/releases/download/v1.13.121/python-wheels.zip"
+      "parts": [
+        {
+          "path": "archives/python-wheels/05e645352915b06b.000.part",
+          "size": 50331648,
+          "sha256": "9c5b17d66c3ef685826ce2c13b3906f779b46aecd4c00a321948a117486f07ad"
+        },
+        {
+          "path": "archives/python-wheels/05e645352915b06b.001.part",
+          "size": 50314344,
+          "sha256": "f6a14def091b38f99d9459741ba476f6c6dd3d1e84eb1665294f05c520fe63d8"
+        }
+      ]
     },
     {
       "id": "qt-linguist",
@@ -43902,7 +43993,13 @@
           "sha256": "dc1911b5c41cd592e7ba75c20bb5323611b8dc113663f40004a1c00cbb492706"
         }
       ],
-      "downloadUrl": "https://github.com/Straw1997/renderdocBread/releases/download/v1.13.121/qt-linguist.zip"
+      "parts": [
+        {
+          "path": "archives/qt-linguist/317b2da3fb0a80e4.000.part",
+          "size": 3216731,
+          "sha256": "317b2da3fb0a80e47296916d35b73b6ef195ef3c2bb7138944fc69f046ea84c4"
+        }
+      ]
     },
     {
       "id": "nuget-feed",
@@ -44389,7 +44486,28 @@
           "sha256": "f6797192deebf4535f0601c2273e750da0c02062e30a3e4a3c4011b9ac22403a"
         }
       ],
-      "downloadUrl": "https://github.com/Straw1997/renderdocBread/releases/download/v1.13.121/nuget-feed.zip"
+      "parts": [
+        {
+          "path": "archives/nuget-feed/735115ab06312925.000.part",
+          "size": 50331648,
+          "sha256": "03f2d1db5af0235761afcacc2fea31f3157656cd1102656dc20d6eb6294eaf49"
+        },
+        {
+          "path": "archives/nuget-feed/735115ab06312925.001.part",
+          "size": 50331648,
+          "sha256": "49a2bdf0689e49437c152f9b6dc3cb1aa60383c86ffe8d9223bb666f6f900c09"
+        },
+        {
+          "path": "archives/nuget-feed/735115ab06312925.002.part",
+          "size": 50331648,
+          "sha256": "ce9bc4128bf00305d0100f357e057538d6938e042e565a7e9993b54f82f58f73"
+        },
+        {
+          "path": "archives/nuget-feed/735115ab06312925.003.part",
+          "size": 45646691,
+          "sha256": "fcbddf69a32c08183e076714de3c702e666ba1237c81ee6ea7441793a3f3f46c"
+        }
+      ]
     },
     {
       "id": "3dmigoto-source",
@@ -53490,7 +53608,13 @@
           "sha256": "4161780fab46609cee16cbb06bede1d31b066933fb3771c130e4c883d1b707c0"
         }
       ],
-      "downloadUrl": "https://github.com/Straw1997/renderdocBread/releases/download/v1.13.121/3dmigoto-source.zip"
+      "parts": [
+        {
+          "path": "archives/3dmigoto-source/e775f48bbcf71eb9.000.part",
+          "size": 11162908,
+          "sha256": "e775f48bbcf71eb95923b5f4733f9ad57028df992dc1597921bba4f1e8791c14"
+        }
+      ]
     },
     {
       "id": "uex-native",
@@ -53523,7 +53647,13 @@
           "sha256": "454be2f3d10f804ace577198401431db5e95d0286b59589bc28a40085388e7c2"
         }
       ],
-      "downloadUrl": "https://github.com/Straw1997/renderdocBread/releases/download/v1.13.121/uex-native.zip"
+      "parts": [
+        {
+          "path": "archives/uex-native/88b45bb21aa5285c.000.part",
+          "size": 555368,
+          "sha256": "88b45bb21aa5285c75a531dfe4b78d5bf6d5942fbbe62c4bca73f29cd1b1e480"
+        }
+      ]
     }
   ]
 }
