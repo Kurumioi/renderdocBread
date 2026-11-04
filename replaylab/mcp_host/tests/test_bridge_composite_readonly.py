@@ -695,6 +695,36 @@ class CompositeReadonlyBridgeTests(unittest.TestCase):
                     ["copy-destination", "action-output"], output["roles"])
                 self.assertEqual(2, output["subresource"]["mip"])
 
+    def test_utility_destination_excludes_inherited_color_and_depth_targets(self) -> None:
+        bridge = load_bridge()
+        bridge.rd.ShaderStage = types.SimpleNamespace()
+        bridge.rd.ResourceId = lambda: 0
+        pipeline = types.SimpleNamespace(
+            GetVBuffers=lambda: [], GetVertexInputs=lambda: [], GetIBuffer=lambda: None,
+            GetColorBlends=lambda: [], GetOutputTargets=lambda: [], GetDepthTarget=lambda: None)
+        for flag in (0x0001, 0x100001, 0x0400, 0x0800):
+            with self.subTest(flag=flag):
+                action = types.SimpleNamespace(
+                    eventId=2, actionId=2, customName="Utility", flags=flag,
+                    copyDestination=55, outputs=[66], depthOut=77, children=[],
+                    numIndices=0, numInstances=0)
+                controller = types.SimpleNamespace(
+                    GetPipelineState=lambda: pipeline, GetRootActions=lambda: [action],
+                    GetResources=lambda: [], GetTextures=lambda: [],
+                    GetAPIProperties=lambda: types.SimpleNamespace(pipelineType="GraphicsAPI.Unknown"))
+                result = bridge._draw_call_details_on_replay(controller, 2)
+                self.assertEqual([55], [row["resourceId"] for row in result["outputs"]])
+                self.assertEqual([], result["possibleOutputs"])
+                self.assertEqual("utility", result["actionKind"])
+                self.assertFalse(result["drawState"]["pipelineStateApplicable"])
+                # If this API's native action lacks an exact destination, its
+                # declared targets remain candidates rather than disappearing.
+                action.copyDestination = 0
+                conservative = bridge._draw_call_details_on_replay(controller, 2)
+                resources = {row["resourceId"] for row in
+                             conservative["outputs"] + conservative["possibleOutputs"]}
+                self.assertEqual({66, 77}, resources)
+
     def test_frame_flow_input_receipt_is_self_measured_and_limit_truncated(self):
         bridge = load_bridge()
         session_id = "a" * 32
@@ -997,6 +1027,50 @@ class CompositeReadonlyBridgeTests(unittest.TestCase):
         self.assertEqual("fragment", result["stage"])
         self.assertEqual({"disassembly": {"DXIL": "shader"}}, result["shader"])
         self.assertNotIn("reconstructionEvidence", result)
+
+    def test_readonly_shader_prefers_source_or_one_portable_ir_without_external_tools(self) -> None:
+        bridge = load_bridge()
+        entry = types.SimpleNamespace(name="MainPS")
+        reflection = types.SimpleNamespace(entryPoint="MainPS", encoding="DXIL", debugInfo=None,
+                                            inputSignature=[], outputSignature=[])
+        calls = []
+        pipeline = types.SimpleNamespace(GetShader=lambda stage: 99)
+        controller = types.SimpleNamespace(
+            GetPipelineState=lambda: pipeline,
+            GetShaderEntryPoints=lambda sid: [entry],
+            GetShader=lambda *args: reflection,
+            GetAPIProperties=lambda: types.SimpleNamespace(pipelineType="D3D12"),
+            GetDisassemblyTargets=lambda full: ["AMD GCN ISA", "DXBC / DXIL", "DXC DXIL"],
+            DisassembleShader=lambda pid, refl, target: calls.append(target) or "define void @MainPS() { ret void }",
+            GetResources=lambda: [], GetTextures=lambda: [],
+        )
+        bridge._replay = lambda callback: callback(controller)
+        bridge._available_shader_stages = lambda names: [("fragment", "PS")]
+        bridge._set_frame_event = lambda *args: None
+        bridge._get_pipeline_obj = lambda *args: 17
+        bridge._pipeline_shader_entry_selection = lambda *args: {"entry": entry, "evidence": {"entryPoints": []}}
+        bridge._shader_reflection_identity_failure = lambda *args: None
+        bridge._shader_raw_bytes = lambda *args: b"captured shader"
+        bridge._compiled_shader_interface = lambda *args: {}
+        bridge._captured_shader_identity_for_context = lambda *args: None
+        bridge._matching_shader_aliases = lambda *args: []
+        result = bridge._reverse_shader({"event_id": 41, "stage": "fragment", "text_mode": "preferred"})
+        self.assertEqual(calls, ["DXBC / DXIL"])
+        self.assertEqual(list(result["disassembly"]), ["DXBC / DXIL"])
+        calls.clear()
+        reflection.debugInfo = types.SimpleNamespace(files=[types.SimpleNamespace(filename="main.hlsl", contents="float4 MainPS() { return 1; }")])
+        result = bridge._reverse_shader({"event_id": 41, "stage": "fragment", "text_mode": "preferred"})
+        self.assertEqual(calls, [])
+        self.assertTrue(result["textSelection"]["embeddedSourcePreferred"])
+        bridge._reverse_shader({"event_id": 41, "stage": "fragment"})
+        self.assertEqual(calls, ["AMD GCN ISA", "DXBC / DXIL", "DXC DXIL"])
+        calls.clear()
+        reflection.debugInfo = None
+        controller.DisassembleShader = lambda pid, refl, target: calls.append(target) or (
+            "error: target unavailable" if target == "DXBC / DXIL" else "valid instructions")
+        result = bridge._reverse_shader({"event_id": 41, "stage": "fragment", "text_mode": "preferred"})
+        self.assertEqual(calls, ["DXBC / DXIL", "DXC DXIL"])
+        self.assertEqual(result["disassembly"]["DXC DXIL"], "valid instructions")
 
     def test_shader_info_fails_closed_when_multi_entry_pipeline_selection_is_unknown(self) -> None:
         bridge = load_bridge()

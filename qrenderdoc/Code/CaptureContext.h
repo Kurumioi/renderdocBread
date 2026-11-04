@@ -25,6 +25,7 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <memory>
 #include <QDebug>
 #include <QList>
@@ -35,6 +36,7 @@
 #include <QtWidgets/QWidget>
 #include "Interface/QRDInterface.h"
 #include "ReplayManager.h"
+#include "ReplayLab/ReplayLabCBufferAliases.h"
 
 #if defined(RENDERDOC_PLATFORM_LINUX)
 #include <QX11Info>
@@ -121,6 +123,8 @@ public:
 
   void LoadCapture(const rdcstr &captureFile, const ReplayOptions &opts, const rdcstr &origFilename,
                    bool temporary, bool local) override;
+  ResultDetails LoadCaptureForReplayRecovery(const rdcstr &captureFile, const ReplayOptions &opts,
+                                             const rdcstr &origFilename) override;
   bool SaveCaptureTo(const rdcstr &captureFile) override;
   void RecompressCapture() override;
   void CloseCapture() override;
@@ -134,13 +138,22 @@ public:
   void EndScrub() override;
   bool IsScrubbing() override { return m_Scrubbing; }
   void SetRemoteHost(int hostIndex);
-  void RefreshStatus() override { SetEventID({}, m_SelectedEventID, m_EventID, true); }
+  void RefreshStatus() override;
   void RefreshReplayStatus(uint32_t expectedEventId, uint64_t expectedBufferGeneration,
                            std::function<void(bool)> completed) override;
   bool IsResourceReplaced(ResourceId id) override;
   ResourceId GetResourceReplacement(ResourceId id) override;
   void RegisterReplacement(ResourceId from, ResourceId to) override;
   void UnregisterReplacement(ResourceId id) override;
+  bool RegisterCBufferDebugDisplaySource(
+      const rdcstr &ownerToken, ResourceId original, ResourceId replacement,
+      const rdcstr &sourceRawSha256, const rdcstr &activeRawSha256, ShaderStage stage,
+      uint64_t mutationGeneration, const rdcarray<ConstantBlock> &sourceBlocks,
+      const rdcarray<ConstantBlock> &activeBlocks) override;
+  void UnregisterCBufferDebugDisplaySource(const rdcstr &ownerToken) override;
+  CBufferDebugDisplaySource GetCBufferDebugDisplaySource(
+      ResourceId original, ShaderStage stage, const rdcstr &activeRawSha256,
+      const ConstantBlock &activeBlock) override;
   void RefreshUIStatus(const rdcarray<ICaptureViewer *> &exclude, bool updateSelectedEvent,
                        bool updateEvent);
 
@@ -339,17 +352,28 @@ private:
   {
     explicit PublishedPipelineState(IReplayController *controller);
 
+    // Driver-owned reflection can disappear when a replacement is freed before the next GUI
+    // publication. Keep one independent copy per original pointer for this snapshot's lifetime.
+    std::map<const ShaderReflection *, std::unique_ptr<ShaderReflection>> reflections;
     std::unique_ptr<D3D11Pipe::State> d3d11;
     std::unique_ptr<D3D12Pipe::State> d3d12;
     std::unique_ptr<GLPipe::State> gl;
     std::unique_ptr<VKPipe::State> vulkan;
     PipeState pipeline;
+    uint64_t shaderMutationGeneration = 0;
   };
   void PublishPipelineState(std::shared_ptr<const PublishedPipelineState> state);
+  void QueueReplayStatusRefresh(bool force);
+  uint64_t m_StatusRefreshSerial = 0;
+  uint64_t m_StatusRefreshEpoch = 0;
+  bool m_StatusRefreshQueued = false;
+  bool m_StatusRefreshForce = false;
+  bool m_StatusRefreshDeferred = false;
   // Exactly one current publication, plus the in-flight worker's next value. These own metadata
   // only; no render target image or historical EID state is retained.
   std::shared_ptr<const PublishedPipelineState> m_PublishedPipelineState;
   uint64_t m_PipelinePublicationSerial = 0;
+  ReplayLabCBufferDebugDisplayRegistry m_CBufferDebugDisplay;
 
   const D3D11Pipe::State *m_CurD3D11PipelineState;
   const D3D12Pipe::State *m_CurD3D12PipelineState;
@@ -413,8 +437,12 @@ private:
     m_LoadCaptureStage.store(uint32_t(stage), std::memory_order_relaxed);
   }
 
+  void LoadCaptureInternal(const rdcstr &captureFile, const ReplayOptions &opts,
+                           const rdcstr &origFilename, bool temporary, bool local,
+                           bool showErrorDialog);
   void LoadCaptureThreaded(const QString &captureFile, const ReplayOptions &opts,
-                           const QString &origFilename, bool temporary, bool local);
+                           const QString &origFilename, bool temporary, bool local,
+                           bool showErrorDialog);
 
   void AddSortedMenuItem(QMenu *menu, bool rootMenu, bool showExtensionIcon,
                          const rdcarray<rdcstr> &items, std::function<void()> callback);

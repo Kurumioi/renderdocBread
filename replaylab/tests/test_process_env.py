@@ -323,7 +323,7 @@ def test_detect_spawn_resolution_and_doctor_share_absolute_codex_path(
         check for check in checks if check.name == "codex-internal-tools"
     )
     assert registration.status == "ok"
-    assert "task-scoped ReplayLab MCP" in registration.detail
+    assert "task-scoped Bread MCP" in registration.detail
     assert "no persistent MCP registration" in registration.detail
     context = next(check for check in checks if check.name == "model-context")
     assert context.status == "ok"
@@ -381,12 +381,15 @@ def test_cursor_environment_and_permission_config_are_profile_scoped(
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     assert payload["version"] == 1
     assert payload["approvalMode"] == "allowlist"
-    assert payload["permissions"]["allow"] == ["Mcp(ReplayLab:*)"]
+    assert payload["permissions"]["allow"] == ["Mcp(Bread:*)"]
     assert payload["permissions"]["deny"] == [
         "Shell(*)",
         "Read(**)",
         "Write(**)",
         "WebFetch(*)",
+        "Agent(*)",
+        "Task(*)",
+        "Subagent(*)",
     ]
     assert "Mcp(*:*)" not in payload["permissions"]["allow"]
     assert json.loads(

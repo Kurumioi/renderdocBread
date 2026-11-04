@@ -229,11 +229,10 @@ DECLARE_REFLECTION_STRUCT(BugReport);
   DOCUMENT(                                                                                        \
       "The style to load for the UI. Possible values include 'Native', 'RDLight', 'RDDark', "      \
       "'ultra'. "                                                                                  \
-      "If empty, the closest of RDLight and RDDark will be chosen, based on the overall "          \
-      "light-on-dark or dark-on-light theme of the application native style."                      \
+      "If empty, the Black style ('ultra') will be chosen."                                       \
       ""                                                                                           \
       ":type: str");                                                                               \
-  CONFIG_SETTING_VAL(public, QString, rdcstr, UIStyle, "")                                         \
+  CONFIG_SETTING_VAL(public, QString, rdcstr, UIStyle, "ultra")                                    \
                                                                                                    \
   DOCUMENT(                                                                                        \
       "The language to load for the UI. Supported stable values are 'zh_CN' for Simplified "      \

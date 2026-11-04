@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -419,6 +420,7 @@ async def _probe_agent_launch(
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             env=external_agent_environment(profile),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         # App-server/ACP processes normally stay alive waiting for protocol input.
         # A quick non-zero exit is a useful authentication/configuration failure;

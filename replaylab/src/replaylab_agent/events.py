@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 import threading
 import time
 import uuid
@@ -41,8 +40,12 @@ TaskEventKind = Literal[
 
 
 def default_task_event_root() -> Path:
-    local = os.environ.get("LOCALAPPDATA")
-    root = Path(local) if local else Path(tempfile.gettempdir())
+    local = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
+    # Never the shared temp directory: on Linux/macOS that put the task event
+    # stream, the log and the tool settings under a world-readable /tmp that any
+    # local user could pre-plant and that vanished on reboot. XDG data home is the
+    # per-user equivalent of LOCALAPPDATA, which the rest of the product uses.
+    root = Path(local).expanduser() if local else Path.home() / ".local" / "share"
     return root / "ReplayLab" / "ai-tasks"
 
 
@@ -156,6 +159,10 @@ class TaskEventWriter:
     def path(self) -> Path:
         return self.root / f"{self.task_id}.jsonl"
 
+    def _check_not_deleted(self) -> None:
+        if (self.root / ".deleted-tasks" / (self.task_id + ".json")).exists():
+            raise RuntimeError("The conversation owning this task was deleted")
+
     def emit(
         self,
         kind: TaskEventKind,
@@ -167,7 +174,9 @@ class TaskEventWriter:
         if delivery_id and not _DELIVERY_ID_RE.fullmatch(delivery_id):
             raise ValueError("delivery_id contains unsafe characters")
         with self._lock:
+            self._check_not_deleted()
             with _exclusive_path_lock(self.path.with_suffix(".jsonl.lock")):
+                self._check_not_deleted()
                 if delivery_id:
                     existing = self._event_for_delivery_id(delivery_id)
                     if existing is not None:

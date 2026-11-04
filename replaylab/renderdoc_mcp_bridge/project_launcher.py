@@ -23,10 +23,24 @@ import importlib.util
 import os
 import queue
 import re
+import subprocess
 import threading
 import time
 import uuid
 from collections import OrderedDict
+
+try:
+    from . import project_watch as _project_watch
+    from . import project_permissions as _project_permissions
+except (ImportError, ValueError):
+    _watch_spec = importlib.util.spec_from_file_location(
+        "_bread_project_watch", os.path.join(os.path.dirname(os.path.abspath(__file__)), "project_watch.py"))
+    _project_watch = importlib.util.module_from_spec(_watch_spec)
+    _watch_spec.loader.exec_module(_project_watch)
+    _permission_spec = importlib.util.spec_from_file_location(
+        "_bread_project_permissions", os.path.join(os.path.dirname(os.path.abspath(__file__)), "project_permissions.py"))
+    _project_permissions = importlib.util.module_from_spec(_permission_spec)
+    _permission_spec.loader.exec_module(_project_permissions)
 
 
 PROJECT_LIST_SCHEMA = "replaylab-project-list/v1"
@@ -71,7 +85,7 @@ except (ImportError, ValueError):
             "project_restore_client.py"))
     if (_internal_client_spec is None or
             _internal_client_spec.loader is None):
-        raise ImportError("Unable to load the ReplayLab internal service client")
+        raise ImportError("Unable to load the Bread internal service client")
     _internal_client_protocol = importlib.util.module_from_spec(
         _internal_client_spec)
     _internal_client_spec.loader.exec_module(_internal_client_protocol)
@@ -88,37 +102,37 @@ class ThumbnailReadError(ProjectLauncherError):
 def _normalise_restore_progress(value):
     """Return one bounded display-only project restore progress record."""
     if not isinstance(value, dict):
-        raise ProjectLauncherError("ReplayLab restore progress must be an object")
+        raise ProjectLauncherError("Bread restore progress must be an object")
 
     phase = str(value.get("phase", "") or "").strip()
     message = str(value.get("message", "") or "").strip()
     raw_item = value.get("item", "")
     if not isinstance(raw_item, str):
-        raise ProjectLauncherError("ReplayLab restore progress text is invalid")
+        raise ProjectLauncherError("Bread restore progress text is invalid")
     item = raw_item.strip()
     if (not phase and not message) or len(phase) > 128 or len(message) > 1024:
-        raise ProjectLauncherError("ReplayLab restore progress text is invalid")
+        raise ProjectLauncherError("Bread restore progress text is invalid")
     try:
         item_bytes = item.encode("utf-8")
     except UnicodeEncodeError:
-        raise ProjectLauncherError("ReplayLab restore progress text is invalid")
+        raise ProjectLauncherError("Bread restore progress text is invalid")
     if (len(item_bytes) > 1024 or "\x00" in phase or "\x00" in message or
             "\x00" in item):
-        raise ProjectLauncherError("ReplayLab restore progress text is invalid")
+        raise ProjectLauncherError("Bread restore progress text is invalid")
 
     current_value = value.get("current", 0)
     total_value = value.get("total", 0)
     if isinstance(current_value, bool) or isinstance(total_value, bool):
-        raise ProjectLauncherError("ReplayLab restore progress counts are invalid")
+        raise ProjectLauncherError("Bread restore progress counts are invalid")
     try:
         current = int(current_value)
         total = int(total_value)
     except (TypeError, ValueError, OverflowError):
-        raise ProjectLauncherError("ReplayLab restore progress counts are invalid")
+        raise ProjectLauncherError("Bread restore progress counts are invalid")
     if (current < 0 or total < 0 or
             current > MAX_RESTORE_PROGRESS_COUNT or
             total > MAX_RESTORE_PROGRESS_COUNT):
-        raise ProjectLauncherError("ReplayLab restore progress counts are invalid")
+        raise ProjectLauncherError("Bread restore progress counts are invalid")
     if total:
         current = min(current, total)
     else:
@@ -136,16 +150,16 @@ def _restore_progress_text(progress):
     phase = str(progress.get("phase", "") or "")
     if phase == "restore-dispatch":
         message = QtCore.QCoreApplication.translate(
-            TRANSLATION_CONTEXT, "Scheduling ReplayLab project recovery")
+            TRANSLATION_CONTEXT, "Scheduling project recovery")
     elif phase == "client-validate":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Validating the project recovery request")
     elif phase == "host-state":
         message = QtCore.QCoreApplication.translate(
-            TRANSLATION_CONTEXT, "Checking the ReplayLab Host state")
+            TRANSLATION_CONTEXT, "Checking the project service state")
     elif phase == "host-health":
         message = QtCore.QCoreApplication.translate(
-            TRANSLATION_CONTEXT, "Verifying the ReplayLab Host identity")
+            TRANSLATION_CONTEXT, "Verifying the project service identity")
     elif phase == "restore-submit":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Starting the project recovery job")
@@ -155,7 +169,7 @@ def _restore_progress_text(progress):
     elif phase == "restore-running":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT,
-            "ReplayLab Host is running project recovery")
+            "The project service is running project recovery")
     elif phase == "result-validate":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Validating the project recovery result")
@@ -228,7 +242,7 @@ def _restore_progress_text(progress):
             "Loading a verified project Shader candidate")
     elif phase == "shader-apply":
         message = QtCore.QCoreApplication.translate(
-            TRANSLATION_CONTEXT, "Validating ABI and applying Shaders")
+            TRANSLATION_CONTEXT, "Applying project Shaders")
     elif phase == "export-shader-bindings":
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Exporting Shader bindings")
@@ -243,11 +257,34 @@ def _restore_progress_text(progress):
         message = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Writing the RDC project association cache")
     elif phase == "complete":
-        message = QtCore.QCoreApplication.translate(
-            TRANSLATION_CONTEXT, "ReplayLab project restore completed")
+        if progress.get("preservedLocalEdits", 0):
+            if progress.get("sourceOnlyDrafts", 0):
+                message = _qt_format(QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects",
+                    "Project restore completed: %1 Shaders applied; %2 source drafts and local edits remain unapplied"),
+                    progress.get("appliedShaders", 0),
+                    progress["preservedLocalEdits"] + progress["sourceOnlyDrafts"])
+            else:
+                message = _qt_format(QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects",
+                    "Project restore completed: %1 Shaders applied; %2 local edits were preserved and remain unapplied"),
+                    progress.get("appliedShaders", 0), progress["preservedLocalEdits"])
+        elif progress.get("sourceOnlyDrafts", 0):
+            message = _qt_format(QtCore.QCoreApplication.translate(
+                "ReplayLabProjects",
+                "Project restore completed: %1 Shaders applied; %2 saved source drafts remain unapplied"),
+                progress.get("appliedShaders", 0), progress["sourceOnlyDrafts"])
+        else:
+            message = QtCore.QCoreApplication.translate(
+                TRANSLATION_CONTEXT, "Project restore completed")
+    elif phase == "partial" and progress.get("item") == "local-edit":
+        message = _qt_format(QtCore.QCoreApplication.translate(
+            "ReplayLabProjects",
+            "Project restore incomplete: %1 Shaders applied; %2 local edits were preserved but their saved replay state was not restored"),
+            progress.get("appliedShaders", 0), progress.get("unappliedLocalEdits", 0))
     elif phase == "failed":
         message = QtCore.QCoreApplication.translate(
-            TRANSLATION_CONTEXT, "ReplayLab project restore failed")
+            TRANSLATION_CONTEXT, "Project restore failed")
     else:
         # Unknown Host text is diagnostic data. Preserve it verbatim instead of
         # pretending that an unversioned backend sentence is a stable UI label.
@@ -260,7 +297,7 @@ def _restore_progress_text(progress):
                 TRANSLATION_CONTEXT, "%1 (%2 / %3)"),
             message, int(progress.get("current", 0) or 0), total)
     item = str(progress.get("item", "") or "")
-    if item:
+    if item and not (phase == "partial" and item == "local-edit"):
         return _qt_format(
             QtCore.QCoreApplication.translate(
                 TRANSLATION_CONTEXT, "%1 · Current item: %2"),
@@ -273,7 +310,7 @@ def _restore_status_text(progress):
 
     return _qt_format(
         QtCore.QCoreApplication.translate(
-            TRANSLATION_CONTEXT, "ReplayLab project recovery: %1"),
+            TRANSLATION_CONTEXT, "Project recovery: %1"),
         _restore_progress_text(progress))
 
 
@@ -317,14 +354,14 @@ def _restore_result_error(value, worker_error=""):
     if value is False:
         return QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT,
-            "ReplayLab reported that project data was not restored")
+            "Project data was not restored")
     if isinstance(value, dict):
         if _restore_action_required(value):
             return ""
         if value.get("outcome") == "action-required":
             reason_id = str(value.get("reasonId", "") or "")[:256]
             return reason_id or QtCore.QCoreApplication.translate(
-                TRANSLATION_CONTEXT, "ReplayLab project restore failed")
+                TRANSLATION_CONTEXT, "Project restore failed")
         error_id = str(value.get("errorId", "") or "")
         error = value.get("error")
         if isinstance(error, dict):
@@ -337,17 +374,16 @@ def _restore_result_error(value, worker_error=""):
         if error_id == "capture-changed-during-restore":
             return QtCore.QCoreApplication.translate(
                 TRANSLATION_CONTEXT,
-                "The active capture changed while ReplayLab restored project data")
+                "The active capture changed while project data was being restored")
         if error_id == "project-restore-client-unavailable":
             return QtCore.QCoreApplication.translate(
                 TRANSLATION_CONTEXT,
-                "This qrenderdoc build cannot restore ReplayLab project data after opening "
-                "an RDC")
+                "This qrenderdoc build cannot restore project data after opening an RDC")
         if error_id == "host-runtime-incompatible":
             return QtCore.QCoreApplication.translate(
                 TRANSLATION_CONTEXT,
-                "The running ReplayLab Host does not match this qrenderdoc build. Close "
-                "qrenderdoc and Codex, deploy the matching ReplayLab runtime, then restart "
+                "The running project service does not match this qrenderdoc build. "
+                "Close qrenderdoc and Codex, deploy the matching runtime, then restart "
                 "qrenderdoc.")
         if error_id:
             # Unknown future IDs are diagnostics. Do not mistake them for a
@@ -360,7 +396,7 @@ def _restore_result_error(value, worker_error=""):
             return diagnostic
         if value.get("error"):
             return QtCore.QCoreApplication.translate(
-                TRANSLATION_CONTEXT, "ReplayLab project restore failed")
+                TRANSLATION_CONTEXT, "Project restore failed")
     return ""
 
 
@@ -434,20 +470,20 @@ def _validated_content_identity(value, allow_none=True):
     if value is None and allow_none:
         return None
     if not isinstance(value, dict):
-        raise ProjectLauncherError("ReplayLab capture content identity is invalid")
+        raise ProjectLauncherError("Bread capture content identity is invalid")
     if (value.get("schema") != CAPTURE_CONTENT_IDENTITY_SCHEMA or
             value.get("algorithm") != "sha256-full"):
-        raise ProjectLauncherError("ReplayLab capture content identity is invalid")
+        raise ProjectLauncherError("Bread capture content identity is invalid")
     digest = str(value.get("sha256", "") or "").lower()
     if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-        raise ProjectLauncherError("ReplayLab capture content digest is invalid")
+        raise ProjectLauncherError("Bread capture content digest is invalid")
     try:
         size = int(value.get("sizeBytes"))
         modified = int(value.get("modifiedTimeNs"))
     except (TypeError, ValueError, OverflowError):
-        raise ProjectLauncherError("ReplayLab capture content metadata is invalid")
+        raise ProjectLauncherError("Bread capture content metadata is invalid")
     if size < 0 or modified < 0:
-        raise ProjectLauncherError("ReplayLab capture content metadata is invalid")
+        raise ProjectLauncherError("Bread capture content metadata is invalid")
     return {
         "schema": CAPTURE_CONTENT_IDENTITY_SCHEMA,
         "algorithm": "sha256-full",
@@ -492,10 +528,10 @@ def unique_project_for_capture(projects, capture_path, content_identity=None):
 def replace_project_snapshot(projects, updated_project):
     """Replace one project result in-place logically, preserving UI-local active state."""
     if not isinstance(updated_project, dict):
-        raise ProjectLauncherError("ReplayLab updated project is invalid")
+        raise ProjectLauncherError("Bread updated project is invalid")
     workspace_id = str(updated_project.get("workspaceId", "") or "")
     if not workspace_id:
-        raise ProjectLauncherError("ReplayLab updated project identity is missing")
+        raise ProjectLauncherError("Bread updated project identity is missing")
     result = list(projects or [])
     for row, current in enumerate(result):
         if (isinstance(current, dict) and
@@ -505,7 +541,7 @@ def replace_project_snapshot(projects, updated_project):
             result[row] = replacement
             return result, row
     raise ProjectLauncherError(
-        "ReplayLab updated project is not present in the current project list")
+        "Bread updated project is not present in the current project list")
 
 
 def _thumbnail_result(state, reason="", data=b"", width=0, height=0,
@@ -573,11 +609,41 @@ def _thumbnail_reason_text(result):
             TRANSLATION_CONTEXT, "Embedded RDC thumbnail is unavailable")
 
 
+def _load_projects_with_access_repair(client, attempted):
+    """Repair registered project ACL failures once, off the UI thread."""
+    projects = client.list_projects()
+    repaired = False
+    if os.name != "nt":
+        return projects
+    for project in projects:
+        if (not project.get("unavailable") or
+                project.get("unavailableReasonId") != "project-access-denied"):
+            continue
+        key = (project["workspaceId"], os.path.normcase(os.path.abspath(project["projectRoot"])))
+        if key in attempted:
+            continue
+        attempted.add(key)
+        try:
+            result = _project_permissions.repair(project["projectRoot"], project["workspaceId"], automatic=True)
+            repaired = result.get("status") == "repaired" or repaired
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+            project["automaticAccessRepairError"] = str(error)[:1024]
+    return client.list_projects() if repaired else projects
+
+
 def _unavailable_project_reason_text(project):
     """Localize a stable registry failure while preserving its diagnostic."""
     reason_id = str(project.get("unavailableReasonId", "") or "")
     detail = str(project.get("unavailableReasonDetail", "") or "") or \
         str(project.get("unavailableReason", "") or "")
+    if reason_id == "project-access-denied":
+        label = QtCore.QCoreApplication.translate(
+            "ReplayLabProjects", "Project access was denied. Check folder permissions and file access by other programs.")
+        return _qt_format(QtCore.QCoreApplication.translate("ReplayLabProjects", "%1: %2"), label, detail)
+    if reason_id == "project-files-busy":
+        label = QtCore.QCoreApplication.translate(
+            "ReplayLabProjects", "Project files are in use. Retry after the other operation finishes.")
+        return _qt_format(QtCore.QCoreApplication.translate("ReplayLabProjects", "%1: %2"), label, detail)
     if reason_id == "project-validation-failed":
         label = QtCore.QCoreApplication.translate(
             TRANSLATION_CONTEXT, "Project files are unavailable or invalid")
@@ -812,34 +878,34 @@ class AsyncCallbackRegistry(object):
 
 def validate_project(value):
     if not isinstance(value, dict) or value.get("schema") != PROJECT_WORKSPACE_SCHEMA:
-        raise ProjectLauncherError("ReplayLab returned an invalid project document")
+        raise ProjectLauncherError("Bread returned an invalid project document")
     workspace_id = _text(value.get("workspaceId", ""), "workspace ID", 32)
     if len(workspace_id) != 32 or any(c not in "0123456789abcdef" for c in workspace_id):
-        raise ProjectLauncherError("ReplayLab project workspace ID is invalid")
+        raise ProjectLauncherError("Bread project workspace ID is invalid")
     root = os.path.abspath(_text(value.get("projectRoot", ""), "project root"))
     name = _text(value.get("name", ""), "project name", 256)
     state = value.get("state")
     if state not in ("pending-scope", "bound"):
-        raise ProjectLauncherError("ReplayLab project state is invalid")
+        raise ProjectLauncherError("Bread project state is invalid")
     scope = value.get("scope")
     if not isinstance(scope, dict):
-        raise ProjectLauncherError("ReplayLab project scope is missing")
+        raise ProjectLauncherError("Bread project scope is missing")
     capture_library = value.get("captureLibrary")
     if (not isinstance(capture_library, dict) or
             capture_library.get("schema") != CAPTURE_LIBRARY_SCHEMA or
             capture_library.get("schemaVersion") not in (1, 2) or
             capture_library.get("workspaceId") != workspace_id):
-        raise ProjectLauncherError("ReplayLab project capture library is invalid")
+        raise ProjectLauncherError("Bread project capture library is invalid")
     captures = capture_library.get("captures")
     if not isinstance(captures, list) or len(captures) > MAX_CAPTURE_ARGUMENTS:
-        raise ProjectLauncherError("ReplayLab capture list is invalid")
+        raise ProjectLauncherError("Bread capture list is invalid")
     clean_captures = []
     for record in captures:
         if not isinstance(record, dict):
-            raise ProjectLauncherError("ReplayLab capture reference is invalid")
+            raise ProjectLauncherError("Bread capture reference is invalid")
         path = os.path.abspath(_text(record.get("path", ""), "capture path"))
         if not path.lower().endswith(".rdc"):
-            raise ProjectLauncherError("ReplayLab capture reference is not an .rdc path")
+            raise ProjectLauncherError("Bread capture reference is not an .rdc path")
         clean_captures.append({
             "captureRefId": _text(record.get("captureRefId", ""), "capture reference ID", 64),
             "path": path,
@@ -867,11 +933,11 @@ def validate_project(value):
 def validate_unavailable_project(value):
     """Validate a stale registry record that the UI may safely unregister."""
     if not isinstance(value, dict):
-        raise ProjectLauncherError("ReplayLab unavailable project record is invalid")
+        raise ProjectLauncherError("Bread unavailable project record is invalid")
     workspace_id = _text(value.get("workspaceId", ""), "workspace ID", 32)
     if len(workspace_id) != 32 or any(
             c not in "0123456789abcdef" for c in workspace_id):
-        raise ProjectLauncherError("ReplayLab unavailable workspace ID is invalid")
+        raise ProjectLauncherError("Bread unavailable workspace ID is invalid")
     legacy_reason = _text(
         value.get("reason", "") or "", "unavailable project reason", 1024, True)
     reason_detail = _text(
@@ -908,7 +974,7 @@ def _internal_project_operation(arguments):
 
     values = list(arguments or [])
     if not values or not isinstance(values[0], str):
-        raise ProjectLauncherError("ReplayLab project operation is invalid")
+        raise ProjectLauncherError("Bread project operation is invalid")
     command = values.pop(0)
     definitions = {
         "project-list": ({}, set()),
@@ -942,7 +1008,7 @@ def _internal_project_operation(arguments):
     }
     selected = definitions.get(command)
     if selected is None:
-        raise ProjectLauncherError("ReplayLab project operation is not allowed")
+        raise ProjectLauncherError("Bread project operation is not allowed")
     switches, repeated = selected
     parsed = {}
     index = 0
@@ -950,35 +1016,35 @@ def _internal_project_operation(arguments):
         switch = values[index]
         if switch not in switches:
             raise ProjectLauncherError(
-                "ReplayLab project operation contains an invalid option")
+                "Bread project operation contains an invalid option")
         field = switches[switch]
         if switch == "--clear-asset-root":
             if field in parsed:
                 raise ProjectLauncherError(
-                    "ReplayLab project operation contains a duplicate option")
+                    "Bread project operation contains a duplicate option")
             parsed[field] = True
             index += 1
             continue
         if index + 1 >= len(values):
             raise ProjectLauncherError(
-                "ReplayLab project operation option has no value")
+                "Bread project operation option has no value")
         item = values[index + 1]
         if switch in repeated:
             parsed.setdefault(field, []).append(item)
         elif field in parsed:
             raise ProjectLauncherError(
-                "ReplayLab project operation contains a duplicate option")
+                "Bread project operation contains a duplicate option")
         else:
             parsed[field] = item
         index += 2
 
     if command == "project-list":
         if parsed:
-            raise ProjectLauncherError("ReplayLab project list has invalid options")
+            raise ProjectLauncherError("Bread project list has invalid options")
         return "list-projects", {}
     if command == "project-create":
         if not {"name", "projectRoot"}.issubset(parsed):
-            raise ProjectLauncherError("ReplayLab project creation is incomplete")
+            raise ProjectLauncherError("Bread project creation is incomplete")
         return "create-project", {
             "name": parsed["name"],
             "projectRoot": parsed["projectRoot"],
@@ -992,7 +1058,7 @@ def _internal_project_operation(arguments):
     if command in (
             "project-register", "project-unregister", "project-activate"):
         if set(parsed) != {"projectRoot"}:
-            raise ProjectLauncherError("ReplayLab project path is incomplete")
+            raise ProjectLauncherError("Bread project path is incomplete")
         operation = {
             "project-register": "register-project",
             "project-unregister": "unregister-project",
@@ -1001,10 +1067,10 @@ def _internal_project_operation(arguments):
         return operation, {"projectRoot": parsed["projectRoot"]}
     if command == "project-configure":
         if "projectRoot" not in parsed:
-            raise ProjectLauncherError("ReplayLab project configuration is incomplete")
+            raise ProjectLauncherError("Bread project configuration is incomplete")
         if parsed.get("clearAssetRoot") and "assetRoot" in parsed:
             raise ProjectLauncherError(
-                "ReplayLab project configuration has conflicting asset roots")
+                "Bread project configuration has conflicting asset roots")
         mode = "unchanged"
         asset_root = ""
         if parsed.get("clearAssetRoot"):
@@ -1023,21 +1089,21 @@ def _internal_project_operation(arguments):
         }
     if command == "project-add-capture":
         if "projectRoot" not in parsed or not parsed.get("captureFiles"):
-            raise ProjectLauncherError("ReplayLab capture addition is incomplete")
+            raise ProjectLauncherError("Bread capture addition is incomplete")
         return "add-captures", {
             "projectRoot": parsed["projectRoot"],
             "captureFiles": parsed["captureFiles"],
         }
     if command == "project-remove-capture":
         if "projectRoot" not in parsed or not parsed.get("captureRefIds"):
-            raise ProjectLauncherError("ReplayLab capture removal is incomplete")
+            raise ProjectLauncherError("Bread capture removal is incomplete")
         return "remove-captures", {
             "projectRoot": parsed["projectRoot"],
             "captureRefIds": parsed["captureRefIds"],
         }
     if command == "project-match-capture":
         if "capturePath" not in parsed:
-            raise ProjectLauncherError("ReplayLab capture match is incomplete")
+            raise ProjectLauncherError("Bread capture match is incomplete")
         return "match-capture", {
             "capturePath": parsed["capturePath"],
             "associationLease": parsed.get("associationLease", ""),
@@ -1051,7 +1117,7 @@ class ReplayLabProjectClient(object):
 
     def __init__(self, executable, timeout_seconds=90, runner=None):
         self.executable = os.path.abspath(_text(
-            executable, "ReplayLab internal host executable"))
+            executable, "Bread internal host executable"))
         self.timeout_seconds = int(timeout_seconds)
         self._internal_client = None
         if runner is None:
@@ -1060,7 +1126,7 @@ class ReplayLabProjectClient(object):
                     self.executable))
             if not internal_executable:
                 raise ProjectLauncherError(
-                    "Packaged ReplayLabInternal.exe is unavailable: %s" %
+                    "Packaged Bread internal host (ReplayLabInternal.exe) is unavailable: %s" %
                     self.executable)
             self._internal_client = (
                 _internal_client_protocol.ReplayLabInternalProjectClient(
@@ -1083,15 +1149,15 @@ class ReplayLabProjectClient(object):
     def list_projects(self):
         value = self._invoke(["project-list"])
         if value.get("schema") != PROJECT_LIST_SCHEMA:
-            raise ProjectLauncherError("ReplayLab returned an invalid project list")
+            raise ProjectLauncherError("Bread returned an invalid project list")
         projects = value.get("projects")
         if not isinstance(projects, list):
-            raise ProjectLauncherError("ReplayLab project list is malformed")
+            raise ProjectLauncherError("Bread project list is malformed")
         rejected = value.get("rejected", [])
         if not isinstance(rejected, list):
-            raise ProjectLauncherError("ReplayLab unavailable project list is malformed")
+            raise ProjectLauncherError("Bread unavailable project list is malformed")
         if len(projects) + len(rejected) > MAX_CAPTURE_ARGUMENTS:
-            raise ProjectLauncherError("ReplayLab project list is oversized")
+            raise ProjectLauncherError("Bread project list is oversized")
         return (
             [validate_project(project) for project in projects] +
             [validate_unavailable_project(project) for project in rejected]
@@ -1139,7 +1205,7 @@ class ReplayLabProjectClient(object):
                 value.get("removed") is not True or
                 value.get("projectFilesDeleted") is not False):
             raise ProjectLauncherError(
-                "ReplayLab returned an invalid project removal result")
+                "Bread returned an invalid project removal result")
         return dict(value)
 
     def activate(self, project_root):
@@ -1192,7 +1258,7 @@ class ReplayLabProjectClient(object):
             capture_ref_id = str(value or "").strip().lower()
             if (len(capture_ref_id) != 64 or
                     any(c not in "0123456789abcdef" for c in capture_ref_id)):
-                raise ProjectLauncherError("ReplayLab capture reference ID is invalid")
+                raise ProjectLauncherError("Bread capture reference ID is invalid")
             if capture_ref_id not in seen:
                 seen.add(capture_ref_id)
                 references.append(capture_ref_id)
@@ -1229,26 +1295,26 @@ class ReplayLabProjectClient(object):
                 value.get("schema") != CAPTURE_PROJECT_MATCH_SCHEMA or
                 not isinstance(value.get("matches"), list)):
             raise ProjectLauncherError(
-                "ReplayLab returned an invalid capture/project match")
+                "Bread returned an invalid capture/project match")
         try:
             match_count = int(value.get("matchCount"))
         except (TypeError, ValueError, OverflowError):
             raise ProjectLauncherError(
-                "ReplayLab returned an invalid capture/project match count")
+                "Bread returned an invalid capture/project match count")
         if match_count != len(value["matches"]):
             raise ProjectLauncherError(
-                "ReplayLab capture/project match count is inconsistent")
+                "Bread capture/project match count is inconsistent")
         activated = bool(value.get("activated", False))
         project = value.get("project")
         if activated and not (match_count == 1 and isinstance(project, dict)):
             raise ProjectLauncherError(
-                "ReplayLab capture/project activation result is inconsistent")
+                "Bread capture/project activation result is inconsistent")
         if project is not None:
             workspace_id = str(project.get("workspaceId", "") or "")
             if (len(workspace_id) != 32 or
                     any(c not in "0123456789abcdef" for c in workspace_id)):
                 raise ProjectLauncherError(
-                    "ReplayLab matched project identity is invalid")
+                    "Bread matched project identity is invalid")
             project = dict(project)
             project["projectRoot"] = os.path.abspath(
                 _text(project.get("projectRoot", ""), "project root"))
@@ -1327,7 +1393,7 @@ if HAS_QT:
         def submit(self, owner_token, operation, callback):
             if self._shutdown:
                 raise ProjectLauncherError(
-                    "ReplayLab project executor has been shut down")
+                    "Bread project executor has been shut down")
             owner = _text(owner_token, "asynchronous owner", 128)
             token = self.registry.register(owner, callback)
             if not self._result_timer.isActive():
@@ -1376,7 +1442,7 @@ if HAS_QT:
                     "The Qt thread pool does not support bounded shutdown")
             if finished is False or self.pool.activeThreadCount() > 0:
                 raise ProjectLauncherError(
-                    "ReplayLab project workers did not stop within %d ms" %
+                    "Bread project workers did not stop within %d ms" %
                     max(1, int(timeout_ms)))
             while True:
                 try:
@@ -1462,7 +1528,6 @@ if HAS_QT:
                 label.setSizePolicy(
                     QtWidgets.QSizePolicy.Ignored,
                     QtWidgets.QSizePolicy.Preferred)
-                layout.addWidget(label, 1)
 
                 progress = QtWidgets.QProgressBar(widget)
                 progress.setObjectName("replayLabRestoreStatusProgress")
@@ -1470,7 +1535,9 @@ if HAS_QT:
                 progress.setTextVisible(False)
                 progress.setMinimumWidth(120)
                 progress.setMaximumWidth(180)
+                # Bar first, then the words.
                 layout.addWidget(progress)
+                layout.addWidget(label, 1)
 
                 # A normal status-bar widget is deliberately used instead of
                 # showMessage(). Qt temporarily hides normal widgets for menu
@@ -1638,16 +1705,16 @@ if HAS_QT:
         def __init__(self, parent=None):
             QtWidgets.QDialog.__init__(self, parent)
             self.setWindowTitle(QtCore.QCoreApplication.translate(
-                TRANSLATION_CONTEXT, "New ReplayLab Project"))
+                TRANSLATION_CONTEXT, "New Project"))
             self.resize(720, 520)
             self.capture_files = []
             root = QtWidgets.QVBoxLayout(self)
             explanation = QtWidgets.QLabel(
                 QtCore.QCoreApplication.translate(
                     TRANSLATION_CONTEXT,
-                    "The project folder stores ReplayLab's portable parsed data and shared "
-                    "knowledge. RDC entries remain references to their current files and are "
-                    "not copied."))
+                    "The project folder stores the portable parsed data and shared "
+                    "knowledge. RDC entries remain references to their current files and "
+                    "are not copied."))
             explanation.setWordWrap(True)
             root.addWidget(explanation)
             form = QtWidgets.QFormLayout()
@@ -1713,7 +1780,7 @@ if HAS_QT:
             for character in '<>:"/\\|?*':
                 name = name.replace(character, "-")
             return name.rstrip(" .") or QtCore.QCoreApplication.translate(
-                TRANSLATION_CONTEXT, "ReplayLab Project")
+                TRANSLATION_CONTEXT, "Project")
 
         def _browse_project(self):
             current = self.project_root.text().strip()
@@ -1817,7 +1884,7 @@ if HAS_QT:
                 scope.get("gameId") == "replaylab-project" and
                 len(str(scope.get("buildId", "") or "")) == 32)
             self.setWindowTitle(QtCore.QCoreApplication.translate(
-                TRANSLATION_CONTEXT, "ReplayLab Project Settings"))
+                TRANSLATION_CONTEXT, "Project Settings"))
             self.resize(650, 360)
             root = QtWidgets.QVBoxLayout(self)
             title = QtWidgets.QLabel("%s\n%s" % (
@@ -1957,13 +2024,13 @@ if HAS_QT:
             self.thumbnail_timer.timeout.connect(self._process_thumbnail_queue)
             self.finished.connect(self._dialog_finished)
             self.setWindowTitle(QtCore.QCoreApplication.translate(
-                TRANSLATION_CONTEXT, "ReplayLab Projects"))
+                TRANSLATION_CONTEXT, "Projects"))
             self.setModal(False)
             self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
             self.resize(1080, 700)
             root = QtWidgets.QVBoxLayout(self)
             title = QtWidgets.QLabel(QtCore.QCoreApplication.translate(
-                TRANSLATION_CONTEXT, "ReplayLab Project Workspace"))
+                TRANSLATION_CONTEXT, "Project Workspace"))
             font = title.font()
             font.setPointSize(font.pointSize() + 4)
             font.setBold(True)
@@ -2070,7 +2137,44 @@ if HAS_QT:
             self.operation_progress.setTextVisible(False)
             self.operation_progress.hide()
             root.addWidget(self.operation_progress)
+            self._watch_baseline = None
+            self._watch_in_flight = False
+            self._watch_pending = False
+            self.metadata_watch_timer = QtCore.QTimer(self)
+            self.metadata_watch_timer.setInterval(1500)
+            self.metadata_watch_timer.timeout.connect(self._poll_project_metadata)
+            self.metadata_watch_timer.start()
             self.refresh()
+
+        def _poll_project_metadata(self):
+            if (self._closed_notified or self._busy or self._watch_in_flight or
+                    not self.isVisible() or QtWidgets.QApplication.activeModalWidget() not in (None, self)):
+                return
+            if self._watch_pending:
+                self._watch_pending = False
+                self.refresh()
+                return
+            paths = _project_watch.metadata_paths(self.projects, os.environ)
+            self._watch_in_flight = True
+
+            def observed(value, error):
+                self._watch_in_flight = False
+                if self._closed_notified or error:
+                    return
+                changed = self._watch_baseline is not None and value != self._watch_baseline
+                first = self._watch_baseline is None
+                self._watch_baseline = value
+                # One initial resynchronization closes the opening-time race;
+                # subsequent ticks refresh only when metadata actually changes.
+                if changed or first:
+                    self._watch_pending = True
+                    if not self._busy and QtWidgets.QApplication.activeModalWidget() in (None, self):
+                        self._watch_pending = False
+                        self.refresh()
+            try:
+                self.async_executor.submit(self._async_owner, lambda: _project_watch.snapshot(paths), observed)
+            except Exception:
+                self._watch_in_flight = False
 
         @staticmethod
         def _placeholder_icon(available):
@@ -2147,17 +2251,80 @@ if HAS_QT:
             remove_action = menu.addAction(
                 QtCore.QCoreApplication.translate(
                     TRANSLATION_CONTEXT, "Remove Project"))
+            permissions_action = menu.addAction(
+                QtCore.QCoreApplication.translate(
+                    TRANSLATION_CONTEXT, "Open Folder Permissions…"))
+            repair_action = menu.addAction(
+                QtCore.QCoreApplication.translate(
+                    TRANSLATION_CONTEXT, "Repair Project Access (UAC)…"))
             refresh_action.setEnabled(not self._busy)
             # A blank-area click must never act on the stale current project.
             remove_action.setEnabled(
                 not self._busy and item is not None and
                 self._selected_project() is not None)
+            permissions_action.setEnabled(item is not None and self._selected_project() is not None)
+            repair_action.setEnabled(os.name == "nt" and not self._busy and item is not None and self._selected_project() is not None)
             chosen = menu.exec_(
                 self.project_list.viewport().mapToGlobal(position))
             if chosen is refresh_action:
                 self.refresh()
             elif chosen is remove_action:
                 self._remove_selected_project()
+            elif chosen is repair_action:
+                self._repair_selected_project_access()
+            elif chosen is permissions_action:
+                project = self._selected_project()
+                if not project:
+                    return
+                try:
+                    if os.name == "nt":
+                        # Explicit user action only. Open Windows' own folder
+                        # security dialog; never elevate the whole application
+                        # or grant broad ACLs to a copied project automatically.
+                        import ctypes
+                        from ctypes import wintypes
+                        class ShellExecuteInfo(ctypes.Structure):
+                            _fields_ = [("cbSize", wintypes.DWORD), ("fMask", wintypes.ULONG),
+                                ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
+                                ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+                                ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int),
+                                ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+                                ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+                                ("dwHotKey", wintypes.DWORD), ("hIcon", wintypes.HANDLE),
+                                ("hProcess", wintypes.HANDLE)]
+                        request = ShellExecuteInfo()
+                        request.cbSize = ctypes.sizeof(request); request.fMask = 0x0000000c
+                        request.lpVerb = "properties"; request.lpFile = project["projectRoot"]; request.nShow = 1
+                        shell = ctypes.WinDLL("shell32", use_last_error=True)
+                        shell.ShellExecuteExW.argtypes = [ctypes.POINTER(ShellExecuteInfo)]
+                        if not shell.ShellExecuteExW(ctypes.byref(request)):
+                            raise ctypes.WinError(ctypes.get_last_error())
+                    else:
+                        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(project["projectRoot"]))
+                except OSError as error:
+                    self.status.setText(_qt_format(QtCore.QCoreApplication.translate(
+                        TRANSLATION_CONTEXT, "Could not open folder permissions: %1"), str(error)))
+
+        def _repair_selected_project_access(self):
+            project = self._selected_project()
+            if not project:
+                return
+            root, workspace_id = project["projectRoot"], project["workspaceId"]
+
+            def repaired(result):
+                status = result.get("status")
+                if status == "repaired":
+                    self.refresh(workspace_id)
+                elif status == "cancelled":
+                    self.status.setText(QtCore.QCoreApplication.translate(
+                        TRANSLATION_CONTEXT, "Project access repair was cancelled."))
+                else:
+                    self.status.setText(QtCore.QCoreApplication.translate(
+                        TRANSLATION_CONTEXT, "Permission repair is still running. Refresh Projects after it finishes."))
+            self._run_async(_qt_format(QtCore.QCoreApplication.translate(
+                TRANSLATION_CONTEXT, "Repairing access to %1. Windows may request administrator approval for this project only…"), root),
+                lambda: _project_permissions.repair(root, workspace_id), repaired,
+                QtCore.QCoreApplication.translate(TRANSLATION_CONTEXT, "Could not repair project access"))
 
         def _show_capture_context_menu(self, position):
             item = self.capture_list.itemAt(position)
@@ -2228,18 +2395,31 @@ if HAS_QT:
             current = self._selected_project()
             if not previous and current:
                 previous = current["workspaceId"]
+            selected_captures = {item.data(QtCore.Qt.UserRole) for item in self.capture_list.selectedItems()}
+            selection_owner = current["workspaceId"] if current else ""
+            project_scroll = self.project_list.verticalScrollBar().value()
+            capture_scroll = self.capture_list.verticalScrollBar().value()
             def _loaded(projects):
                 self._apply_projects(projects, previous)
+                self.project_list.verticalScrollBar().setValue(project_scroll)
+                selected_project = self._selected_project()
+                if selected_project and selected_project["workspaceId"] == selection_owner:
+                    for index in range(self.capture_list.count()):
+                        item = self.capture_list.item(index)
+                        if item.data(QtCore.Qt.UserRole) in selected_captures:
+                            item.setSelected(True)
+                self.capture_list.verticalScrollBar().setValue(capture_scroll)
 
             return self._run_async(
                 QtCore.QCoreApplication.translate(
                     TRANSLATION_CONTEXT,
-                    "Loading ReplayLab projects in the background…"),
-                self.client.list_projects,
+                    "Loading projects in the background…"),
+                lambda: _load_projects_with_access_repair(self.client,
+                    self.__dict__.setdefault("_automatic_access_repairs", set())),
                 _loaded,
                 QtCore.QCoreApplication.translate(
                     TRANSLATION_CONTEXT,
-                    "Could not load ReplayLab projects"))
+                    "Could not load projects"))
 
         def _apply_projects(self, projects, previous=""):
             self.projects = list(projects or [])
@@ -2454,20 +2634,20 @@ if HAS_QT:
                 len(captures)) if captures else
                 QtCore.QCoreApplication.translate(
                     TRANSLATION_CONTEXT,
-                    "Creating the ReplayLab project in the background…"))
+                    "Creating the project in the background…"))
             self._run_async(
                 message,
                 lambda: self.client.create_project(**values),
                 _created,
                 QtCore.QCoreApplication.translate(
                     TRANSLATION_CONTEXT,
-                    "Could not create ReplayLab project"))
+                    "Could not create project"))
 
         def _add_existing_project(self):
             path = QtWidgets.QFileDialog.getExistingDirectory(
                 self, QtCore.QCoreApplication.translate(
                     TRANSLATION_CONTEXT,
-                    "Select an existing ReplayLab project folder"), "")
+                    "Select an existing project folder"), "")
             if not path:
                 return
 
@@ -2486,7 +2666,7 @@ if HAS_QT:
                 _registered,
                 QtCore.QCoreApplication.translate(
                     TRANSLATION_CONTEXT,
-                    "Could not add existing ReplayLab project"))
+                    "Could not add existing project"))
 
         def _remove_selected_project(self):
             project = self._selected_project()
@@ -2499,8 +2679,8 @@ if HAS_QT:
                     TRANSLATION_CONTEXT, "Remove project record"),
                 _qt_format(QtCore.QCoreApplication.translate(
                     TRANSLATION_CONTEXT,
-                    "Remove '%1' from this ReplayLab project list?\n\nThe project folder and "
-                    "every local file will remain on disk."), project["name"]),
+                    "Remove '%1' from this project list?\n\nThe project folder and every "
+                    "local file will remain on disk."), project["name"]),
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No)
             if answer != QtWidgets.QMessageBox.Yes:
@@ -2521,7 +2701,7 @@ if HAS_QT:
                 _removed,
                 QtCore.QCoreApplication.translate(
                     TRANSLATION_CONTEXT,
-                    "Could not remove ReplayLab project"))
+                    "Could not remove project"))
 
         def _project_settings(self):
             project = self._selected_project()
@@ -2548,7 +2728,7 @@ if HAS_QT:
                 _configured,
                 QtCore.QCoreApplication.translate(
                     TRANSLATION_CONTEXT,
-                    "Could not update ReplayLab project settings"))
+                    "Could not update project settings"))
 
         def _add_captures(self):
             project = self._selected_project()
@@ -2711,7 +2891,7 @@ if HAS_QT:
                 # diagnostic in the main status bar. A background accelerator
                 # failure must never put a modal window in front of the opened
                 # capture or prevent EID navigation.
-                print("[ReplayLab] Background project restore failed: %s" % error)
+                print("[Bread] Background project restore failed: %s" % error)
             self.close()
 
         def abandon_capture_restore(self):
@@ -2733,6 +2913,7 @@ if HAS_QT:
 
         def _dialog_finished(self, unused_result=0):
             del unused_result
+            self.metadata_watch_timer.stop()
             self._cancel_thumbnail_queue()
             self._operation_generation += 1
             restore_task = self._restore_task
@@ -2746,11 +2927,13 @@ if HAS_QT:
                 self.async_executor.cancel_owner(self._async_owner)
             except Exception:
                 pass
-            if self.closed_callback and not self._closed_notified:
-                self._closed_notified = True
+            notify = not self._closed_notified
+            self._closed_notified = True
+            if self.closed_callback and notify:
                 self.closed_callback()
 
         def closeEvent(self, event):
+            self.metadata_watch_timer.stop()
             self._dialog_finished()
             QtWidgets.QDialog.closeEvent(self, event)
 

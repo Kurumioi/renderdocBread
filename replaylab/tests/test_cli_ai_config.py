@@ -427,7 +427,7 @@ def test_replacing_codebuddy_provider_clears_connection_scoped_settings(
     assert not home.exists()
 
 
-def test_codebuddy_remove_failure_keeps_profile_and_connection_state(
+def test_codebuddy_remove_failure_retains_login_but_removes_connection(
     tmp_path, monkeypatch
 ) -> None:
     import replaylab_agent.cli as cli
@@ -447,9 +447,9 @@ def test_codebuddy_remove_failure_keeps_profile_and_connection_state(
     monkeypatch.setattr(cli, "remove_codebuddy_profile_home", fail_remove)
     args = _parser().parse_args(["profile", "remove", profile.id, "--json"])
 
-    with pytest.raises(ConfigurationError, match="state is busy"):
-        _profile_command(args, store)
-    assert store.profiles[profile.id].preset == "codebuddy-acp"
+    assert _profile_command(args, store) == 0
+    assert profile.id not in store.profiles
+    assert profile.id not in ProfileStore(store.path).load().profiles
 
 
 def test_api_provider_replacement_clears_old_endpoint_key_options_and_models(

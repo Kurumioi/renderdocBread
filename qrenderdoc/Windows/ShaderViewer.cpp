@@ -654,7 +654,7 @@ void ShaderViewer::cacheResources()
 void ShaderViewer::debugShader(const ShaderReflection *shader, ResourceId pipeline,
                                ShaderDebugTrace *trace, const QString &debugContext)
 {
-  m_ShaderDetails = shader;
+  m_ShaderDetails = shader ? std::make_shared<ShaderReflection>(*shader) : nullptr;
   m_Pipeline = pipeline;
   m_Trace = trace;
   m_Stage = ShaderStage::Vertex;
@@ -674,30 +674,34 @@ void ShaderViewer::debugShader(const ShaderReflection *shader, ResourceId pipeli
     m_Stage = m_ShaderDetails->stage;
 
     QPointer<ShaderViewer> me(this);
+    const auto shaderDetails = m_ShaderDetails;
 
-    m_Ctx.Replay().AsyncInvoke([me, this](IReplayController *r) {
+    m_Ctx.Replay().AsyncInvoke([me, this, shaderDetails, pipeline](IReplayController *r) {
       if(!me)
         return;
 
-      rdcarray<rdcstr> targets = r->GetDisassemblyTargets(m_Pipeline != ResourceId());
+      rdcarray<rdcstr> targets = r->GetDisassemblyTargets(pipeline != ResourceId());
+      rdcarray<rdcstr> pipelineTargets;
 
-      if(m_Pipeline == ResourceId())
+      if(pipeline == ResourceId())
       {
-        rdcarray<rdcstr> pipelineTargets = r->GetDisassemblyTargets(true);
+        pipelineTargets = r->GetDisassemblyTargets(true);
 
         if(pipelineTargets.size() > targets.size())
         {
-          m_PipelineTargets = pipelineTargets;
-          m_PipelineTargets.removeIf([&targets](const rdcstr &t) { return targets.contains(t); });
+          pipelineTargets.removeIf([&targets](const rdcstr &t) { return targets.contains(t); });
         }
+        else
+          pipelineTargets.clear();
       }
 
-      rdcstr disasm = r->DisassembleShader(m_Pipeline, m_ShaderDetails, "");
+      rdcstr disasm = r->DisassembleShader(pipeline, shaderDetails.get(), "");
 
       if(!me)
         return;
 
-      GUIInvoke::call(this, [this, targets, disasm]() {
+      GUIInvoke::call(this, [this, targets, pipelineTargets, disasm]() {
+        m_PipelineTargets = pipelineTargets;
         QStringList targetNames;
         for(int i = 0; i < targets.count(); i++)
         {
@@ -2634,7 +2638,8 @@ void ShaderViewer::disassemble_typeChanged(int index)
   {
     if(targetStr == targetName(disasm))
     {
-      ShaderToolOutput out = disasm.DisassembleShader(this, m_ShaderDetails, "");
+      const auto shaderDetails = m_ShaderDetails;
+      ShaderToolOutput out = disasm.DisassembleShader(this, shaderDetails.get(), "");
 
       rdcstr text;
 
@@ -2672,12 +2677,14 @@ void ShaderViewer::disassemble_typeChanged(int index)
   }
 
   QPointer<ShaderViewer> me(this);
+  const auto shaderDetails = m_ShaderDetails;
+  const ResourceId pipeline = m_Pipeline;
 
-  m_Ctx.Replay().AsyncInvoke([me, this, targetStr](IReplayController *r) {
+  m_Ctx.Replay().AsyncInvoke([me, this, targetStr, shaderDetails, pipeline](IReplayController *r) {
     if(!me)
       return;
 
-    rdcstr disasm = r->DisassembleShader(m_Pipeline, m_ShaderDetails, targetStr);
+    rdcstr disasm = r->DisassembleShader(pipeline, shaderDetails.get(), targetStr);
 
     if(!me)
       return;
@@ -7079,7 +7086,7 @@ void ShaderViewer::on_refresh_clicked()
 
   if(m_Trace)
   {
-    m_Ctx.GetPipelineViewer()->SaveShaderFile(m_ShaderDetails);
+    m_Ctx.GetPipelineViewer()->SaveShaderFile(m_ShaderDetails.get());
     return;
   }
 

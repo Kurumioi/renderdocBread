@@ -433,6 +433,86 @@ class ShaderWorkspaceTests(unittest.TestCase):
         )
         return service, workspace, created
 
+    def test_source_edit_status_ignores_broken_candidate_and_toolchain(self):
+        service, workspace, _ = self._create("text-only")
+        service.decompile(workspace)
+        manifest_path = workspace / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["latestCompiled"] = {"path": "missing-candidate.dxbc"}
+        manifest["tools"]["compiler"]["executableSha256"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        before = manifest_path.read_bytes()
+        with mock.patch.object(service, "_load_manifest", side_effect=AssertionError("strict status")), \
+             mock.patch.object(service, "_process_catalog", side_effect=AssertionError("toolchain")), \
+             mock.patch.object(workspace_module, "fingerprint_shader_executable", side_effect=AssertionError("ABI")):
+            result = service.source_edit_status(workspace)
+        self.assertEqual(result["validationScope"], "source-edit-only")
+        self.assertTrue(result["source"]["present"])
+        self.assertEqual(result["shader"], self.key.as_dict())
+        self.assertFalse(result["replayAbiValidated"])
+        self.assertFalse(result["abiCompatible"])
+        self.assertIsNone(result["latestCompiled"])
+        self.assertEqual(before, manifest_path.read_bytes())
+        with self.assertRaises(ManifestValidationError):
+            service.status(workspace)
+
+    def test_source_edit_status_reads_current_text_without_incrementing_revision(self):
+        service, workspace, _ = self._create("text-edited")
+        service.decompile(workspace)
+        before = service.source_edit_status(workspace)
+        path = Path(before["source"]["path"])
+        revised = path.read_bytes() + b"\n// all branches can be edited together\n"
+        path.write_bytes(revised)
+        after = service.source_edit_status(workspace)
+        self.assertEqual(after["source"]["currentSha256"], hashlib.sha256(revised).hexdigest())
+        self.assertEqual(after["revision"], before["revision"])
+        self.assertEqual(after["source"]["decompiledSha256"], before["source"]["decompiledSha256"])
+
+    def test_source_edit_status_does_not_require_compile_eligibility(self):
+        service, workspace, _ = self._create("text-not-compiled")
+        service.decompile(workspace)
+        manifest_path = workspace / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["source"]["compileEligible"] = False
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        before = manifest_path.read_bytes()
+        status = service.source_edit_status(workspace)
+        self.assertTrue(status["source"]["present"])
+        self.assertFalse(status["source"]["compileEligible"])
+        self.assertFalse(status["representation"]["applyEligible"])
+        self.assertEqual(before, manifest_path.read_bytes())
+        with self.assertRaises(ManifestValidationError):
+            service.status(workspace)
+
+    def test_source_edit_status_rejects_wrong_text_identity(self):
+        service, workspace, _ = self._create("text-invalid")
+        service.decompile(workspace)
+        manifest_path = workspace / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for change in ({"path": "../fake_tool.py"}, {"baselineRawSha256": "0" * 64}):
+            with self.subTest(change=change):
+                changed = json.loads(json.dumps(manifest))
+                changed["source"].update(change)
+                manifest_path.write_text(json.dumps(changed), encoding="utf-8")
+                with self.assertRaises(ManifestValidationError):
+                    service.source_edit_status(workspace)
+
+    def test_source_edit_status_rejects_changed_baseline_and_invalid_text(self):
+        service, workspace, _ = self._create("text-corrupt")
+        service.decompile(workspace)
+        manifest = json.loads((workspace / "manifest.json").read_text(encoding="utf-8"))
+        path = workspace / manifest["source"]["path"]
+        original = path.read_bytes()
+        for invalid in (b"", b"\xff", b"float\x00 x;"):
+            with self.subTest(invalid=invalid):
+                path.write_bytes(invalid)
+                with self.assertRaises(ManifestValidationError):
+                    service.source_edit_status(workspace)
+        path.write_bytes(original)
+        (workspace / manifest["baseline"]["path"]).write_bytes(b"changed")
+        with self.assertRaisesRegex(ManifestValidationError, "baseline hash mismatch"):
+            service.source_edit_status(workspace)
+
     def _dxbc_assembly_route_service(self) -> tuple[ShaderWorkspaceService, Path]:
         document = json.loads(self.config.read_text(encoding="utf-8"))
         script = str(self.fake_tool.resolve())

@@ -12,7 +12,6 @@ from src.shader_workspace.equivalence import (
 from src.shader_workspace.flow_graph import (
     _function_records, bind_computation_range, build_shader_flow_graph, computation_ranges,
 )
-from src.shader_workspace.templates import organization_contract, organization_structure_issues
 
 
 SOURCE = """Texture2D<float4> albedo : register(t0);
@@ -64,18 +63,22 @@ def _graph(source, spec):
                                    origin="organized-proposal", flow_spec=spec)
 
 
-def test_algorithm_stages_survive_into_navigation_graph_and_mermaid():
+def test_algorithm_stages_stay_in_review_spec_and_public_graph_is_function_only():
     spec, issues = _validate(SOURCE, _stages())
     assert issues == []
     graph = _graph(SOURCE, spec)
-    assert graph["graphKind"] == "algorithm-dataflow" and graph["layoutDirection"] == "TD"
-    assert [node["label"] for node in graph["nodes"]] == [stage["label"] for stage in _stages()]
-    assert [node["source"]["line"] for node in graph["nodes"]] == [6, 12, 13, 14]
-    assert graph["nodes"][0]["sourceRange"] == {"startLine": 6, "endLine": 6}
-    assert [edge["values"] for edge in graph["edges"]] == [["SampleMaterial.return"], ["sampled"], ["result"]]
+    assert [stage["label"] for stage in spec["stages"]] == [stage["label"] for stage in _stages()]
+    assert "graphKind" not in graph and "layoutDirection" not in graph
+    assert [node["name"] for node in graph["nodes"]] == ["MainPS", "SampleMaterial"]
+    assert {node["kind"] for node in graph["nodes"]} == {"entry-point", "function"}
+    assert all({"signature", "inputs", "outputs"}.issubset(node) for node in graph["nodes"])
+    assert all(edge["kind"] == "calls" and "values" not in edge for edge in graph["edges"])
     diagram = mermaid_from_flow_graph(graph)
     assert diagram.startswith("flowchart TD")
-    assert "Sample material" in diagram and "sampled" in diagram
+    assert "MainPS" in diagram and "SampleMaterial" in diagram
+    assert "in: uv" in diagram and "out: SV_Target0" in diagram
+    assert "Receive material sample" not in diagram and "Scale color contribution" not in diagram
+    assert "sampled =" not in diagram and "float4 result" not in diagram
     assert "subgraph RES" not in diagram
     assert graph["policy"]["applyAuthorization"] is False
 
@@ -105,35 +108,15 @@ def test_same_named_locals_in_different_functions_do_not_create_fake_data_edges(
         {"id": "second", "label": "Second computation", "function": "MainPS", "reads": ["value"], "writes": ["SV_Target"], "next": []},
     ])
     assert issues == []
-    assert _graph(source, spec)["edges"] == [{"source": "stage-first", "target": "stage-second", "kind": "control"}]
+    graph = _graph(source, spec)
+    assert graph["edges"] == []
+    # A is not called by the entry point; it is not a second diagram root.
+    assert [node["name"] for node in graph["nodes"]] == ["MainPS"]
+    assert "value" not in mermaid_from_flow_graph(graph)
 
 
-def test_long_comment_only_body_is_incomplete_but_simple_shader_needs_no_artificial_lighting():
-    body = "\n".join("    _1 = _1 + 0.0;" for _ in range(180))
-    baseline = "float4 MainPS() : SV_Target {\nfloat4 _1 = 1;\n" + body + "\nreturn _1;\n}\n"
-    contract = organization_contract(baseline)
-    assert contract["needsAlgorithmRestructuring"] is True
-    issues = organization_structure_issues(baseline, "// Pretty comments\n" + baseline, {})
-    assert "algorithm-organization-incomplete" in {item["code"] for item in issues}
-    assert all(item["severity"] == "blocker" and item["direction"] and item["target"] for item in issues)
-    simple = "float4 MainPS() : SV_Target { return 1; }"
-    assert organization_structure_issues(simple, simple, {}) == []
 
 
-def test_cohesive_function_extraction_satisfies_structure_without_claiming_semantics():
-    operations = ["    value = value + 0.0;" for _ in range(180)]
-    for index in (0, 45, 90, 135):
-        operations[index] = "    // Accumulate this bounded input contribution.\n" + operations[index]
-    baseline = "float4 MainPS() : SV_Target {\nfloat4 value = 1;\n" + "\n".join(operations) + "\nreturn value;\n}"
-    proposal = ("float4 First(float4 value) {\n" + "\n".join(operations[:90]) + "\nreturn value;\n}\n"
-                + "float4 Second(float4 value) {\n" + "\n".join(operations[90:]) + "\nreturn value;\n}\n"
-                + "float4 MainPS() : SV_Target { return Second(First(1)); }\n")
-    stages = [{"id": name.lower(), "label": name + " computation", "function": name, "reads": [], "writes": [], "next": []}
-              for name in ("First", "Second", "MainPS")]
-    spec, issues = _validate(proposal, stages)
-    assert issues == []
-    assert organization_structure_issues(baseline, proposal, spec) == []
-    assert max(item["statementCount"] for item in computation_ranges(proposal)) < 160
 
 
 def test_inout_struct_fields_follow_the_actual_unique_call_chain():
@@ -150,14 +133,19 @@ float MainPS() : SV_Target { FragmentData data; Prepare(data); Compute(data); re
     ]
     spec, issues = _validate(source, stages)
     assert issues == []
-    edges = _graph(source, spec)["edges"]
-    assert edges[0]["kind"] == "data" and edges[0]["values"] == ["data.inputValue"]
-    assert edges[1]["kind"] == "data" and edges[1]["values"] == ["data.color"]
+    graph = _graph(source, spec)
+    by_name = {node["name"]: node for node in graph["nodes"]}
+    assert by_name["Prepare"]["inputs"] == ["data"]
+    assert by_name["Prepare"]["outputs"] == ["data"]
+    assert all(edge["kind"] == "calls" and "values" not in edge for edge in graph["edges"])
+    assert (by_name["Compute"]["id"], by_name["ComputePart"]["id"]) in {
+        (edge["source"], edge["target"]) for edge in graph["edges"]
+    }
     # Same parameter spelling does not bind two independent actual arguments.
     unrelated = source.replace("Prepare(data); Compute(data);", "Prepare(data); FragmentData other; Compute(other);")
     spec, issues = _validate(unrelated, stages)
     assert issues == []
-    assert all(edge["kind"] == "control" for edge in _graph(unrelated, spec)["edges"])
+    assert all(edge["kind"] == "calls" for edge in _graph(unrelated, spec)["edges"])
 
 
 def test_ambiguous_multiple_calls_do_not_invent_inout_data_identity():
@@ -172,7 +160,11 @@ float MainPS() : SV_Target { FragmentData data; Prepare(data); Prepare(data); Co
     ]
     spec, issues = _validate(source, stages)
     assert issues == []
-    assert _graph(source, spec)["edges"][0]["kind"] == "control"
+    graph = _graph(source, spec)
+    by_name = {node["name"]: node for node in graph["nodes"]}
+    prepare_edges = [edge for edge in graph["edges"] if edge["target"] == by_name["Prepare"]["id"]]
+    assert len(prepare_edges) == 1 and prepare_edges[0]["kind"] == "calls"
+    assert all("values" not in edge for edge in graph["edges"])
 
 
 def test_template_omits_large_local_inventory_without_truncating_validation():
@@ -198,7 +190,10 @@ float MainPS() : SV_Target { { FragmentData data; Prepare(data); } { FragmentDat
     ]
     spec, issues = _validate(source, stages)
     assert issues == []
-    assert _graph(source, spec)["edges"][0]["kind"] == "control"
+    graph = _graph(source, spec)
+    assert all(edge["kind"] == "calls" and "values" not in edge for edge in graph["edges"])
+    prepare = next(node for node in graph["nodes"] if node["name"] == "Prepare")
+    assert prepare["outputs"] == ["data"] and "return" not in prepare["outputs"]
     stages[0]["writes"] = ["Prepare.return"]
     _, issues = _validate(source, stages)
     assert "flow-spec-value-binding" in {issue["code"] for issue in issues}

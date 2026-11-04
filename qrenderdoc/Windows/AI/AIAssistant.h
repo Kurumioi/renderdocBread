@@ -34,6 +34,7 @@
 #include <QJsonArray>
 #include <QMap>
 #include <QPair>
+#include <QPointer>
 #include <QSet>
 #include <QStringList>
 #include <QVector>
@@ -63,7 +64,7 @@ class AIAgentTraceStore;
 class CaptureContext;
 struct AIConfigurationProcessState;
 
-// Native qrenderdoc control surface for ReplayLab's provider-neutral RenderDoc AI host. The
+// Native qrenderdoc control surface for ReplayLab's provider-neutral Bread AI host. The
 // provider SDKs and managed Agent processes deliberately remain out-of-process so they cannot
 // destabilise replay or gain implicit access to ICaptureContext.
 class AIAssistant : public QFrame, public ICaptureViewer
@@ -77,9 +78,9 @@ public:
   QWidget *Widget() { return this; }
 
   void ReportError(const QString &message);
-  void StartCaptureSkill(const QString &prompt, const QString &skill,
-                         const QString &focusStage = QString(),
-                         const QString &intentKind = QString());
+  void StartCaptureIntent(const QString &prompt,
+                          const QString &focusStage = QString(),
+                          const QString &intentKind = QString());
   // Adds immutable, untrusted reference text to the composer without sending a request. Returns
   // false when the selection is empty or exceeds the bounded attachment budget.
   bool AddTextAttachment(const QString &title, const QString &text,
@@ -188,6 +189,8 @@ private:
     QString prompt;
     QString effectivePrompt;
     QString skill;
+    // MCP servers the message named with "@mcp:<id>"; enabled for this request only.
+    QStringList mcpServerIds;
     QString focusStage;
     QString intentKind;
     QVector<AIChatAttachment> attachments;
@@ -241,13 +244,14 @@ private:
                      const QVector<AIChatAttachment> &attachments =
                          QVector<AIChatAttachment>());
   void appendAssistant(const QString &text, const QString &conversationId = QString(),
-                       const QString &taskId = QString());
+                       const QString &taskId = QString(), const QJsonArray &artifacts = QJsonArray());
   void renderConversation(bool refreshList = false);
   void scheduleConversationRender();
   void refreshConversationList();
   void refreshPendingChats();
   void createConversation();
   void deleteConversation(const QString &conversationId = QString());
+  void forgetDeletedTask(const QString &taskId);
   void toggleConversationPinned(const QString &conversationId);
   void selectConversation(const QString &conversationId);
   ConversationThread *conversation(const QString &conversationId = QString());
@@ -311,7 +315,10 @@ private:
       CLICompletion;
   void runCLIAsync(const QStringList &arguments, const QByteArray &input, int timeoutMs,
                    QObject *owner, const CLICompletion &completion,
-                   const QString &credentialProfile = QString());
+                   const QString &credentialProfile = QString(),
+                   const std::function<void(const QByteArray &)> &outputProgress = {});
+  void runConnectionCheck(QWidget *parent, const QString &profile, bool executionTest,
+                          const std::function<void()> &completion = {});
 
   void refreshProfiles(QObject *completionOwner = NULL,
                        const std::function<void()> &completion = std::function<void()>());
@@ -323,6 +330,46 @@ private:
   bool connectionMutationAllowed(QWidget *parent) const;
   void manageConnections();
   void runDoctor();
+  // Settings > AI: the user's Skill folders, per-Skill enablement and external MCP
+  // servers. Both engines read the same configuration through the AgentHost.
+  QWidget *createToolCatalogSection(QWidget *parent, QWidget *connectionsPage);
+  // Settings > AI edits the same three files the Agent configures itself: the Skill
+  // catalog, the MCP server list and the asset-reader registry.
+  void showSkillDocument(QWidget *parent, const QString &skillId,
+                         const std::function<void()> &reload);
+  void presentSkillDocument(QWidget *parent, const QString &skillId, const QJsonObject &document,
+                            const std::function<void()> &reload);
+  enum class ToolDialogMode
+  {
+    Any,
+    Server,
+    Program
+  };
+  void editToolProvider(QWidget *parent, const QJsonObject &existing,
+                        ToolDialogMode mode = ToolDialogMode::Any);
+  void editBuiltinUnpacker(QWidget *parent, const QJsonObject &unpacker,
+                           const QString &detectedProgram = QString());
+  QJsonArray builtinUnpackerCatalog() const { return m_BuiltinUnpackerCatalog; }
+  QJsonArray m_BuiltinUnpackerCatalog;
+  void detectAssetReaders(QWidget *parent);
+  // Row text for the tool list: how it is reached, what it may be used for, and
+  // whether its interface has actually been proved.
+  static QString connectionSummary(const QJsonObject &connection);
+  static QString connectionDetail(const QJsonObject &connection);
+  static QString toolRoleSummary(const QJsonObject &tool);
+  // The conversational route to the same settings: the request goes into the composer
+  // so the person sees exactly what is being asked before it is sent.
+  void askAIToConfigure(QWidget *parent);
+  void askAIToCompleteUnpacker(QWidget *parent, const QJsonObject &tool);
+  void presentDetectedAssetReaders(QWidget *parent, const QJsonArray &candidates);
+  // Runs one configuration edit and refreshes the panel; reports a refusal to the user
+  // rather than leaving the list silently unchanged.
+  void runConfigurationEdit(QWidget *parent, const QStringList &arguments,
+                            const QByteArray &input);
+  void refreshToolMentionCatalog();
+  QStringList mentionedSkillIds(const QString &prompt) const;
+  std::function<void()> m_ToolCatalogReload;
+  QStringList mentionedMcpServerIds(const QString &prompt) const;
 
   void refreshConnectionStatus();
   void cancelConfigurationProcesses();
@@ -340,8 +387,8 @@ private:
                              const QVector<AIChatAttachment> &attachments =
                                  QVector<AIChatAttachment>(),
                              const QString &profileId = QString()) const;
-  void startChat(const QString &prompt, const QString &skill = QString(),
-                 bool includeConversation = true, const QString &focusStage = QString(),
+  void startChat(const QString &prompt, bool includeConversation = true,
+                 const QString &focusStage = QString(),
                  const ClarificationResponse &clarificationResponse = ClarificationResponse(),
                  const QString &intentKind = QString(),
                  const QVector<AIChatAttachment> &attachments =
@@ -384,11 +431,7 @@ private:
                                       const QJsonObject &eventData, qint64 timestampMs);
   void consumeTaskEvent(const QString &taskId, const QByteArray &line);
   void finishTask(const QString &taskId, const QString &kind, const QString &summary,
-                  qint64 timestampMs = 0, const QJsonObject &report = QJsonObject(),
-                  const QJsonObject &verification = QJsonObject());
-  // Renders a replaylab-task-report/v1 form (the structured answer every backend hands in through
-  // report_task_result) as the fixed result card shown above the model's own prose.
-  QString renderTaskReport(const QJsonObject &report, const QJsonObject &verification) const;
+                  qint64 timestampMs = 0);
 
   CaptureContext &m_Ctx;
 
@@ -437,6 +480,11 @@ private:
   QString m_ChatContextFreezeResultPath;
   QString m_ChatContextFreezeCaptureSessionId;
   QString m_ChatContextFreezeInstanceId;
+  // A bridge heartbeat can briefly disappear while project restoration owns replay. Keep the
+  // accepted capture-bound request queued until the same binding returns or this wait expires.
+  QString m_ChatBridgeRetryTaskId;
+  qint64 m_ChatBridgeRetryDeadlineMs = 0;
+  bool m_ChatBridgeRetryScheduled = false;
   qint64 m_ChatContextFreezeEventId = 0;
   qint64 m_ChatContextFreezeSelectedEventId = 0;
   qint64 m_ChatContextFreezeDeadlineMs = 0;
@@ -469,6 +517,7 @@ private:
   QSet<QString> m_KnownTasks;
   QSet<QString> m_RunningTasks;
   QSet<QString> m_CompletedTasks;
+  QSet<QString> m_DeletedTasks;
   int m_TaskEventPollCursor = 0;
   int m_TaskEventRecordsRemaining = 0;
   bool m_TaskEventBudgetActive = false;
@@ -478,7 +527,9 @@ private:
   QHash<QString, QByteArray> m_TaskTails;
   QHash<QString, QString> m_TaskTexts;
   // Characters of live raw reasoning already shown per task (bounded in the conversation).
-  QHash<QString, int> m_TaskReasoningChars;
+  // Ids offered by the composer's "@" picker, refreshed from the AgentHost.
+  QStringList m_MentionSkillIds;
+  QStringList m_MentionMcpIds;
   struct LiveAgentMessageStream
   {
     QString activityId;
@@ -494,6 +545,10 @@ private:
     int receivedChars = 0;
     bool activityCreated = false;
     bool omitted = false;
+    // When this stream last received a delta. The producer mints a new item id per
+    // 8 KB chunk and never marks a child message's lifecycle terminal, so the map
+    // fills up on a long run; this is what decides which one to evict.
+    qint64 touchedMs = 0;
   };
   QHash<QString, QHash<QString, LiveAgentMessageStream>> m_TaskAgentMessageStreams;
   QHash<QString, QString> m_UserPrompts;
@@ -508,4 +563,7 @@ private:
   QVector<PendingChat> m_ChatQueue;
   QHash<QString, ChatExecution *> m_ChatExecutions;
   bool m_LoadingConversations = false;
+  // Set when this capture's conversation store could not be read. The store is then
+  // never written, so a transient read failure cannot destroy the stored history.
+  bool m_ConversationStoreReadOnly = false;
 };

@@ -900,7 +900,8 @@ def _continuation_verify_artifacts(
 
 def _run_continuation_command(command: Sequence[str], label: str) -> None:
     try:
-        completed = subprocess.run(list(command), shell=False, check=False)
+        completed = subprocess.run(list(command), shell=False, check=False,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except OSError as error:
         raise UnpackedAssetJobError("%s could not start: %s" % (label, error)) from error
     if completed.returncode != 0:

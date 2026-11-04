@@ -1,18 +1,10 @@
-"""Rename-only equivalence, Host-applied renames, review rounds and verdicts."""
+"""Rename-only equivalence, Host-applied renames, and factual verdicts."""
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
-import subprocess
-import sys
 import unittest
-from pathlib import Path
-from unittest import mock
 
 from src.shader_workspace import equivalence as eq
-from src.shader_workspace.templates import analysis_markdown_issues
 
 BASELINE = """cbuffer cb0 : register(b0) { float4 v0 : packoffset(c0); float4x4 m0; };
 Texture2D<float4> t0 : register(t0);
@@ -53,13 +45,13 @@ class RenameTests(unittest.TestCase):
             ({"v0": "m0"}, "already exists"),
             ({"zzz": "y"}, "does not occur"),
             ({"v0": "SV_Target"}, "reserved HLSL word"),
-            ({"v0": "newName", "m0": "newName"}, "both map to"),
+            ({"v0": "newName", "m0": "newName"}, "would collide"),
         ):
             with self.assertRaises(eq.EquivalenceError) as raised:
                 eq.validate_renames(BASELINE, renames)
             self.assertIn(fragment, str(raised.exception))
 
-    def test_code_change_is_located_with_a_direction(self) -> None:
+    def test_code_change_reports_a_source_location_without_directing_the_agent(self) -> None:
         clean = eq.validate_renames(BASELINE, RENAMES)
         proposal = eq.apply_renames(BASELINE, clean).replace("a * b", "b * a")
         result = eq.rename_only_equivalent(BASELINE, proposal, clean)
@@ -71,143 +63,148 @@ class RenameTests(unittest.TestCase):
         reasons = eq.differences_to_reasons(result["differences"])
         self.assertEqual(reasons[0]["code"], "code-changed")
         self.assertEqual(reasons[0]["location"], "proposal.hlsl:5")
-        self.assertIn("rename_shader_workspace_symbols", reasons[0]["direction"])
+        self.assertNotIn("direction", reasons[0])
+        self.assertTrue(reasons[0]["message"])
 
     def test_comments_and_whitespace_never_count_as_changes(self) -> None:
         proposal = "// header\n" + BASELINE.replace("{ return", "{\n    return /* tint */")
         self.assertTrue(eq.rename_only_equivalent(BASELINE, proposal)["equal"])
 
 
-class RoundsAndVerdictTests(unittest.TestCase):
-    def test_rounds_from_env_config_and_default(self) -> None:
-        with mock.patch.dict(os.environ, {"REPLAYLAB_REVIEW_MAX_ROUNDS": "5"}):
-            self.assertEqual(eq.max_rounds(), 5)
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "ReplayLab" / "config" / "review.json"
-            config.parent.mkdir(parents=True)
-            config.write_text(json.dumps({"maxRounds": 2, "shader-organization": {"maxRounds": 4}}), encoding="utf-8")
-            with mock.patch.dict(os.environ, {"REPLAYLAB_REVIEW_MAX_ROUNDS": "", "LOCALAPPDATA": tmp}):
-                self.assertEqual(eq.max_rounds("shader-organization"), 4)
-                self.assertEqual(eq.max_rounds("other"), 2)
-        with mock.patch.dict(os.environ, {"REPLAYLAB_REVIEW_MAX_ROUNDS": "nonsense"}):
-            self.assertEqual(eq.max_rounds(), eq.DEFAULT_MAX_ROUNDS)
+class SourceBoundRenameTests(unittest.TestCase):
+    CBUFFER_SHADOWS = """cbuffer MaterialCB : register(b0) {
+  float4 _2 : packoffset(c0);
+};
+struct OtherData { float4 _2; };
+float4 ReadMaterial() { return _2; }
+float4 MainPS(OtherData input) : SV_Target0 {
+  float4 _2 = input._2;
+  return _2 + ReadMaterial();
+}
+"""
 
-    def test_rounds_persist_and_soft_accept_after_the_limit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"REPLAYLAB_REVIEW_MAX_ROUNDS": "2"}):
-            rounds = eq.ReviewRounds(Path(tmp))
-            first = rounds.record(accepted=False, reasons=[eq.reason("code-changed", "x")])
-            self.assertEqual(first, 1)
-            self.assertFalse(rounds.exhausted(first))
-            second = eq.ReviewRounds(Path(tmp)).record(accepted=False, reasons=[])
-            self.assertEqual(second, 2)
-            self.assertTrue(eq.ReviewRounds(Path(tmp)).exhausted(second))
-            verdict = eq.build_verdict(accepted=False, level="rejected", round_used=2, round_limit=2, soft_accepted=True)
-            self.assertTrue(verdict["softAccepted"])
-            self.assertIn("baseline", verdict["nextStep"])
-            # Exhaustion cannot be reset by a late concurrent success.
-            with self.assertRaisesRegex(eq.EquivalenceError, "exhausted"):
-                eq.ReviewRounds(Path(tmp)).record(accepted=True, reasons=[])
-        with tempfile.TemporaryDirectory() as tmp:
-            eq.ReviewRounds(Path(tmp)).record(accepted=True, reasons=[])
-            self.assertEqual(eq.ReviewRounds(Path(tmp)).used, 0)
-            payload = json.loads((Path(tmp) / "ai" / eq.ROUNDS_FILE).read_text(encoding="utf-8"))
-            self.assertTrue(payload["shader-organization"]["lastAccepted"])
+    CONSTANT_BUFFER_ARRAY = """struct MaterialData { float4 _3; };
+struct OtherData { float4 _3; };
+ConstantBuffer<MaterialData> materials[4] : register(b1);
+ConstantBuffer<MaterialData> fallback : register(b2);
+float4 MainPS(OtherData materials, uint index : TEXCOORD0) : SV_Target0 {
+  float4 _3 = materials._3;
+  return fallback._3 + _3;
+}
+float4 ReadIndexed(uint index) { return materials[index]._3; }
+"""
 
-    def test_template_errors_never_consume_content_rounds(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"REPLAYLAB_REVIEW_MAX_ROUNDS": "2"}):
-            rounds = eq.ReviewRounds(Path(tmp))
-            for _ in range(5):
-                errors, limit = rounds.record_template_error([eq.reason("analysis-schema", "bad fields")])
-            self.assertEqual((errors, limit), (5, 6))
-            self.assertEqual(eq.ReviewRounds(Path(tmp)).used, 0)
-            self.assertFalse(rounds.template_exhausted())
-            rounds.record_template_error([])
-            self.assertTrue(eq.ReviewRounds(Path(tmp)).template_exhausted())
+    def test_cbuffer_selector_renames_only_flat_physical_field_identity(self) -> None:
+        clean = eq.validate_renames(self.CBUFFER_SHADOWS, {"MaterialCB._2": "materialTint"})
+        proposal = eq.apply_renames(self.CBUFFER_SHADOWS, clean)
+        self.assertIn("float4 materialTint : packoffset(c0);", proposal)
+        self.assertIn("return materialTint;", proposal)
+        self.assertIn("struct OtherData { float4 _2; };", proposal)
+        self.assertIn("float4 _2 = input._2;", proposal)
+        self.assertTrue(eq.rename_only_equivalent(self.CBUFFER_SHADOWS, proposal, clean)["equal"])
 
-    def test_exhausted_verdict_carries_the_user_decision(self) -> None:
-        verdict = eq.build_verdict(accepted=False, level="content-rejected", round_used=3, round_limit=3,
-                                   reasons=[eq.reason("algorithm-anonymous-values", "__replaylab_* remain")],
-                                   workspace_path="D:/p/ws")
-        self.assertTrue(verdict["budgetExhausted"])
-        decision = verdict["userDecision"]
-        self.assertTrue(decision["required"])
-        self.assertEqual(decision["tool"], "decide_shader_organization_review_budget")
-        self.assertEqual([o["id"] for o in decision["options"]], ["extend", "publish-baseline", "stop"])
-        self.assertEqual(decision["toolArguments"]["workspace_path"], "D:/p/ws")
-        self.assertIn("decide_shader_organization_review_budget", verdict["nextStep"])
-        # not exhausted -> no question
-        self.assertNotIn("userDecision", eq.build_verdict(accepted=False, level="x", round_used=1, round_limit=3))
+    def test_plain_identifier_with_field_and_local_identities_is_rejected(self) -> None:
+        with self.assertRaisesRegex(eq.EquivalenceError, "multiple declaration identities"):
+            eq.validate_renames(self.CBUFFER_SHADOWS, {"_2": "materialTint"})
+        with self.assertRaisesRegex(eq.EquivalenceError, "multiple declaration identities"):
+            eq.apply_renames(self.CBUFFER_SHADOWS, {"_2": "materialTint"})
 
-    def test_user_grant_extends_rounds_and_soft_publish_is_bounded(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"REPLAYLAB_REVIEW_MAX_ROUNDS": "2"}):
-            rounds = eq.ReviewRounds(Path(tmp))
-            rounds.record(accepted=False, reasons=[])
-            rounds.record(accepted=False, reasons=[])
-            self.assertTrue(rounds.exhausted(rounds.used))
-            state = eq.ReviewRounds(Path(tmp)).grant(extra_rounds=3, soft_publish_allowed=False, note="用户：再来3轮")
-            self.assertEqual((state["maxRounds"], state["roundsLeft"]), (5, 3))
-            again = eq.ReviewRounds(Path(tmp))
-            self.assertEqual(again.limit, 5)
-            self.assertFalse(again.user_soft_publish_allowed)
-            self.assertEqual(again.record(accepted=False, reasons=[]), 3)
-            eq.ReviewRounds(Path(tmp)).grant(extra_rounds=1, soft_publish_allowed=True, note="原样入库")
-            self.assertTrue(eq.ReviewRounds(Path(tmp)).user_soft_publish_allowed)
-            eq.ReviewRounds(Path(tmp)).grant(extra_rounds=1, soft_publish_allowed=False, note="3")
-            with self.assertRaisesRegex(eq.EquivalenceError, "budget grants"):
-                eq.ReviewRounds(Path(tmp)).grant(extra_rounds=1, soft_publish_allowed=False, note="4")
-            # an accepted review closes the chapter: extension and consent are dropped
-            eq.ReviewRounds(Path(tmp)).record(accepted=True, reasons=[])
-            fresh = eq.ReviewRounds(Path(tmp))
-            self.assertEqual(fresh.limit, 2)
-            self.assertFalse(fresh.user_soft_publish_allowed)
+    def test_constant_buffer_array_owner_selects_struct_field_not_shadowing_owner(self) -> None:
+        clean = eq.validate_renames(
+            self.CONSTANT_BUFFER_ARRAY, {"materials._3": "packedMaterialColor"}
+        )
+        proposal = eq.apply_renames(self.CONSTANT_BUFFER_ARRAY, clean)
+        self.assertIn("struct MaterialData { float4 packedMaterialColor; };", proposal)
+        self.assertIn("fallback.packedMaterialColor", proposal)
+        self.assertIn("materials[index].packedMaterialColor", proposal)
+        self.assertIn("OtherData { float4 _3; }", proposal)
+        self.assertIn("float4 _3 = materials._3;", proposal)
+        self.assertTrue(eq.rename_only_equivalent(self.CONSTANT_BUFFER_ARRAY, proposal, clean)["equal"])
 
-    def test_verdict_shape_for_rejection(self) -> None:
+    def test_function_local_selector_separates_same_spelling_between_functions(self) -> None:
+        source = """float4 First() { float4 _9 = 1.0; return _9; }
+float4 Second() { float4 _9 = 2.0; return _9; }
+"""
+        with self.assertRaisesRegex(eq.EquivalenceError, "multiple declaration identities"):
+            eq.validate_renames(source, {"_9": "value"})
+        clean = eq.validate_renames(source, {"First::_9": "firstValue"})
+        proposal = eq.apply_renames(source, clean)
+        self.assertIn("float4 firstValue = 1.0; return firstValue;", proposal)
+        self.assertIn("float4 _9 = 2.0; return _9;", proposal)
+        self.assertTrue(eq.rename_only_equivalent(source, proposal, clean)["equal"])
+
+    def test_selectors_written_against_prior_owner_and_function_renames_are_canonicalized(self) -> None:
+        source = """cbuffer cb0 { float4 _4; };
+float4 Helper() { float4 _5 = _4; return _5; }
+"""
+        requested = {
+            "cb0": "MaterialCB",
+            "MaterialCB._4": "materialColor",
+            "Helper": "ReadMaterial",
+            "ReadMaterial::_5": "resultColor",
+        }
+        clean = eq.validate_renames(source, requested)
+        self.assertIn("cb0._4", clean)
+        self.assertIn("Helper::_5", clean)
+        proposal = eq.apply_renames(source, clean)
+        self.assertIn("cbuffer MaterialCB { float4 materialColor; };", proposal)
+        self.assertIn("float4 ReadMaterial() { float4 resultColor = materialColor; return resultColor; }", proposal)
+        self.assertTrue(eq.rename_only_equivalent(source, proposal, clean)["equal"])
+
+    def test_function_local_selector_refuses_shadowed_declarations(self) -> None:
+        source = """float4 MainPS() : SV_Target0 {
+  float4 _7 = 1.0;
+  if (_7.x > 0.0) { float4 _7 = 2.0; }
+  return _7;
+}
+"""
+        with self.assertRaisesRegex(eq.EquivalenceError, "not a unique declaration"):
+            eq.validate_renames(source, {"MainPS::_7": "value"})
+
+    def test_unsupported_or_unbound_selector_is_explicitly_rejected(self) -> None:
+        with self.assertRaisesRegex(eq.EquivalenceError, "unsupported rename selector"):
+            eq.validate_renames(self.CBUFFER_SHADOWS, {"MaterialCB[0]._2": "value"})
+        with self.assertRaisesRegex(eq.EquivalenceError, "does not identify one"):
+            eq.validate_renames(self.CBUFFER_SHADOWS, {"Missing._2": "value"})
+
+    def test_glsl_interface_is_protected_while_scoped_local_can_rename(self) -> None:
+        source = """layout(location = 0) in vec2 _8;
+layout(location = 0) out vec4 outColor;
+void helper() { vec2 _8 = vec2(1.0); outColor = vec4(_8, 0.0, 1.0); }
+void main() { helper(); }
+"""
+        with self.assertRaisesRegex(eq.EquivalenceError, "multiple declaration identities"):
+            eq.validate_renames(source, {"_8": "uv"})
+        clean = eq.validate_renames(source, {"helper::_8": "localUv"})
+        proposal = eq.apply_renames(source, clean)
+        self.assertIn("in vec2 _8;", proposal)
+        self.assertIn("vec2 localUv = vec2(1.0)", proposal)
+        self.assertIn("vec4(localUv, 0.0, 1.0)", proposal)
+
+
+class VerdictTests(unittest.TestCase):
+    def test_verdict_reports_facts_without_review_budget_or_next_action(self) -> None:
         verdict = eq.build_verdict(
-            accepted=False, level="rejected", round_used=1, round_limit=3,
-            reasons=[eq.reason("code-changed", "line 5 differs", location="proposal.hlsl:5", direction="revert")],
+            accepted=False,
+            level="rejected",
+            reasons=[eq.reason(
+                "code-changed", "line 5 differs", location="proposal.hlsl:5",
+                direction="revert", target="old source", example="old identifier",
+            )],
         )
         self.assertEqual(verdict["schema"], eq.REVIEW_VERDICT_SCHEMA)
-        self.assertEqual(verdict["roundsLeft"], 2)
-        self.assertEqual(verdict["reasons"][0]["direction"], "revert")
-        self.assertIn("2 round(s) left", verdict["nextStep"])
+        self.assertEqual(verdict["accepted"], False)
+        self.assertEqual(verdict["reasons"][0]["location"], "proposal.hlsl:5")
+        for key in ("direction", "target", "example", "round", "maxRounds", "nextStep"):
+            self.assertNotIn(key, verdict)
+            self.assertNotIn(key, verdict["reasons"][0])
 
-    def test_corrupt_or_negative_existing_state_never_resets(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "ai" / eq.ROUNDS_FILE
-            path.parent.mkdir()
-            for content in ("{", "[]", '{"shader-organization":{"rounds":-1}}',
-                            '{"shader-organization":{"rounds":true}}', '{"shader-organization":{"rounds":"2"}}'):
-                path.write_text(content, encoding="utf-8")
-                with self.subTest(content=content), self.assertRaises(eq.EquivalenceError):
-                    eq.ReviewRounds(Path(tmp))
-                self.assertEqual(path.read_text(encoding="utf-8"), content)
-
-    def test_redirected_state_is_not_reset(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "ai" / eq.ROUNDS_FILE
-            path.parent.mkdir()
-            target = Path(tmp) / "actual.json"
-            target.write_text("{}", encoding="utf-8")
-            os.link(target, path)
-            with self.assertRaisesRegex(eq.EquivalenceError, "redirected"):
-                eq.ReviewRounds(Path(tmp))
-            self.assertEqual(target.read_text(encoding="utf-8"), "{}")
-
-    def test_stale_instances_and_separate_processes_increment_one_counter(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"REPLAYLAB_REVIEW_MAX_ROUNDS": "10"}):
-            first, stale = eq.ReviewRounds(Path(tmp)), eq.ReviewRounds(Path(tmp))
-            self.assertEqual(first.record(accepted=False, reasons=[]), 1)
-            self.assertEqual(stale.record(accepted=False, reasons=[]), 2)
-            code = ("import sys; from pathlib import Path; from src.shader_workspace.equivalence import ReviewRounds; "
-                    "ReviewRounds(Path(sys.argv[1])).record(accepted=False,reasons=[])")
-            processes = [subprocess.Popen([sys.executable, "-c", code, tmp],
-                         cwd=Path(__file__).resolve().parents[1], stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(4)]
-            for process in processes:
-                stdout, stderr = process.communicate(timeout=30)
-                self.assertEqual(process.returncode, 0, stderr.decode(errors="replace"))
-            self.assertEqual(first.used, 6)
-            first.record(accepted=True, reasons=[])
-            self.assertEqual(stale.used, 0)
+    def test_accepted_verdict_cannot_hide_physical_blocker(self) -> None:
+        with self.assertRaisesRegex(ValueError, "blocking review reasons"):
+            eq.build_verdict(
+                accepted=True, level="exact-code",
+                reasons=[eq.reason("abi-incompatible", "candidate ABI differs")],
+            )
 
 
 class DiagramAndAnalysisTests(unittest.TestCase):
@@ -215,23 +212,33 @@ class DiagramAndAnalysisTests(unittest.TestCase):
         graph = {
             "entryPoint": "MainPS",
             "nodes": [
-                {"id": "a", "name": "MainPS", "kind": "entry-point", "description": "entry"},
-                {"id": "b", "name": "applyTint", "kind": "function", "description": 'tint "x" <b>'},
+                {"id": "a", "name": "MainPS", "kind": "entry-point", "description": "entry",
+                 "signature": "float4 MainPS(float2 uv) : SV_Target0", "inputs": ["uv"],
+                 "outputs": ["SV_Target0"]},
+                {"id": "b", "name": "applyTint", "kind": "function", "description": 'tint "x" <b>',
+                 "signature": "float3 applyTint(float3 color)", "inputs": ["color"],
+                 "outputs": ["return"]},
+                {"id": "stage", "name": "MainPS", "label": "Execute assignment",
+                 "kind": "computation", "description": "float hidden = uv.x;",
+                 "sourceRange": {"startLine": 4, "endLine": 4}},
             ],
-            "edges": [{"source": "a", "target": "b"}],
+            "edges": [{"source": "a", "target": "b", "kind": "calls"},
+                      {"source": "stage", "target": "a", "kind": "data",
+                       "values": ["hidden"]}],
         }
         text = eq.mermaid_from_flow_graph(graph)
         self.assertTrue(text.startswith("flowchart TD\n"))
-        self.assertIn('n0["MainPS — entry"]', text)
+        self.assertIn("MainPS — entry", text)
+        self.assertNotIn("signature:", text)
+        self.assertIn("in: uv", text)
+        self.assertIn("out: SV_Target0", text)
         self.assertIn("n0 --> n1", text)
         self.assertNotIn("<b>", text)
+        self.assertNotIn("Execute assignment", text)
+        self.assertNotIn("float hidden", text)
+        self.assertNotIn("hidden", text)
         self.assertEqual(text, eq.mermaid_from_flow_graph(graph))
         self.assertIn("classDef entry", eq.mermaid_from_flow_graph({"nodes": [], "edges": []}))
-
-    def test_analysis_placeholders_are_not_valid_content(self) -> None:
-        self.assertTrue(analysis_markdown_issues(eq.ANALYSIS_TEMPLATE))
-        self.assertFalse(hasattr(eq, "validate_analysis"))
-
 
 class FlowSpecTests(unittest.TestCase):
     SOURCE = """cbuffer MaterialCB : register(b0) { float4 tint; };
@@ -281,8 +288,100 @@ float4 MainPS(float2 uv : TEXCOORD0) : SV_Target0 { return float4(applyTint(tAlb
         codes = [r["code"] for r in reasons]
         for code in ("flow-spec-id", "flow-spec-text", "flow-spec-function", "flow-spec-output", "flow-spec-read"):
             self.assertIn(code, codes)
-        self.assertTrue(all(r["direction"] for r in reasons))
+        self.assertTrue(all(r["message"] for r in reasons))
+        self.assertTrue(all("direction" not in r for r in reasons))
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SwizzleRenameTests(unittest.TestCase):
+    """A swizzle is component selection, not a name.
+
+    Renaming one changes which channels the shader reads while still compiling,
+    still having an identical ABI, and -- because the same map is applied to the
+    baseline before the two are compared -- still proving "rename-only equivalent".
+    Every gate in the pipeline accepted it.
+    """
+
+    BASELINE = ("float4 main(float4 uv : TEXCOORD0) : SV_Target\n"
+                "{\n"
+                "  float c = uv.xy.x;\n"
+                "  return float4(c, c, c, 1);\n"
+                "}\n")
+
+    def test_a_swizzle_cannot_be_renamed(self) -> None:
+        with self.assertRaises(eq.EquivalenceError) as refusal:
+            eq.validate_renames(self.BASELINE, {"xy": "xz"})
+        self.assertIn("swizzle", str(refusal.exception))
+
+    def test_applying_a_swizzle_rename_changes_nothing(self) -> None:
+        """Defence in depth: even handed a map that reached apply directly."""
+
+        applied = eq.apply_renames(self.BASELINE, {"xy": "xz"})
+        self.assertEqual(applied, self.BASELINE)
+
+    def test_a_variable_whose_name_looks_like_a_swizzle_still_renames(self) -> None:
+        """The common accidental case: a decompiler local called `x` or `r`."""
+
+        source = ("float4 main() : SV_Target\n"
+                  "{\n"
+                  "  float x = 1.0;\n"
+                  "  float3 v = float3(x, x, x);\n"
+                  "  return float4(v.xy, v.z, x);\n"
+                  "}\n")
+        clean = eq.validate_renames(source, {"x": "brightness"})
+        applied = eq.apply_renames(source, clean)
+        self.assertIn("float brightness = 1.0;", applied)
+        # ...and its swizzles are untouched.
+        self.assertIn("v.xy", applied)
+        self.assertIn("v.z", applied)
+        self.assertNotIn("v.brightness", applied)
+
+    def test_a_real_field_rename_after_a_dot_still_works(self) -> None:
+        source = ("struct Params { float intensity; };\n"
+                  "float4 main(Params p) : SV_Target { return p.intensity.xxxx; }\n")
+        clean = eq.validate_renames(source, {"intensity": "strength"})
+        applied = eq.apply_renames(source, clean)
+        self.assertIn("p.strength.xxxx", applied)
+
+
+class PhysicalDeclarationSelectorTests(unittest.TestCase):
+    def test_block_member_and_resource_selectors_bind_duplicate_spellings(self) -> None:
+        source = (
+            "struct Params0 { float _1; };\n"
+            "struct Params1 { float _1; };\n"
+            "ConstantBuffer<Params0> cb0 : register(b0);\n"
+            "ConstantBuffer<Params1> cb1 : register(b1);\n"
+            "Texture2D _32 : register(t0);\n"
+            "float4 MainPS(float _32 : TEXCOORD0) : SV_Target { return cb0._1 + cb1._1 + _32.x; }\n"
+        )
+        renames = {
+            "cbuffer:cb0": "CBufferS0B0",
+            "cbuffer:cb1": "CBufferS0B1",
+            "cb0._1": "cbufferS0B0ScalarAtByte0",
+            "cb1._1": "cbufferS0B1ScalarAtByte0",
+            "resource:_32": "tTextureS0T0",
+        }
+        clean = eq.validate_renames(source, renames)
+        applied = eq.apply_renames(source, clean)
+        self.assertIn("ConstantBuffer<Params0> CBufferS0B0", applied)
+        self.assertIn("ConstantBuffer<Params1> CBufferS0B1", applied)
+        self.assertIn("float cbufferS0B0ScalarAtByte0", applied)
+        self.assertIn("float cbufferS0B1ScalarAtByte0", applied)
+        self.assertIn("Texture2D tTextureS0T0", applied)
+        self.assertIn("MainPS(float _32", applied)
+
+    def test_typed_texture_buffer_uses_cbuffer_selector(self) -> None:
+        source = (
+            "struct Params { float _1; };\n"
+            "TextureBuffer<Params> cb0 : register(b0);\n"
+            "float MainPS() : SV_Target { return cb0._1; }"
+        )
+        applied = eq.apply_renames(source, eq.validate_renames(source, {
+            "cbuffer:cb0": "CBufferS0B0",
+            "cb0._1": "cbufferS0B0ScalarAtByte0",
+        }))
+        self.assertIn("TextureBuffer<Params> CBufferS0B0", applied)
+        self.assertIn("CBufferS0B0.cbufferS0B0ScalarAtByte0", applied)

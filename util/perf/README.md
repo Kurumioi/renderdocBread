@@ -483,6 +483,26 @@ alone does not identify a GPU stall or exclude a GUI Python slot waiting for the
 
 ### Persistent shared Buffer editing
 
+The native inline CBuffer editor exposes a diagnostic `lastTiming` map on the
+`cbufferLiveEditor` widget. It separates input coalescing, replay queue wait, initial lane readback,
+binding validation, native mutation/replay/display, and final viewer publication. `inputSamples`
+counts coalesced UI inputs and `nativeChanges` counts actual native generation advances. The
+`qrenderdoc_cbuffer_live_edit_smoke.py` fixture records these maps without counting its verification
+readbacks as edit latency. With `RENDERDOC_EID_TIMING=1`, `cbuffer_publication` UI records split the
+pipeline snapshot and viewer notification costs; driver `shared_buffer_patch` records already split
+backend commit, replay and display. Neither the fixture's complete capture-loading time nor the
+native setter alone is input-to-preview latency.
+
+For a same-build comparison, start a separate owned process with
+`RENDERDOC_CBUFFER_EDIT_LEGACY_REFRESH=1` to retain the previous 80 ms coalescing interval, unbounded
+Root-CBV remainder reads, repeated alias parsing and selected-EID notifications. The default uses
+16 ms initial coalescing and keeps one replay in flight. Ordinary reflected CBuffer reads are
+bounded by both reflection size and the real binding; custom formats and binding identities remain
+unchanged. Alias parsing is reused only for a value publication with identical project, shader,
+layout, binding, replacement status and unchanged alias file. Capture/event/source changes and file
+watcher refreshes invalidate that reuse. This does not cache rendered output or skip GPU replay.
+Run A/B processes serially with the same capture, selected EID, visible viewers and build flags.
+
 `SetSharedBufferPatch(buffer, absoluteOffset, bytes)`, `ClearSharedBufferPatch(buffer,
 absoluteOffset, byteLength)` and `ClearSharedBufferPatches()` operate on captured storage across
 all consuming events. They return an empty diagnostic string on success. Each actual byte change
@@ -522,3 +542,34 @@ Run `eid_idle_checkpoint_profile.py --discovery <fixture.json> --fixed-values-he
 It checks stale/no-op intervals, actual builds, unchanged current EID/bytes/neighbors/bound color and
 depth outputs, forced references and clear-to-original. A raw planned candidate can map to an
 already saved native boundary, so only an actual new native build satisfies the strict flag.
+
+### Persistent Shader value debugging
+
+Bread's workspace preview replaces the original Shader resource until canceled. EID navigation
+does not compile, migrate or reinstall that target. All draws using the Shader participate in
+normal replay, so later shaders can consume its actual RT output. The captured blend/write-mask
+state still applies. Independent RGBA32F event previews cannot propagate to later draws and are
+not available in this scope. Cancellation restores the exact prior native replacement, including
+an existing edited Shader; transient debug targets are not saved into the project or capture.
+
+`shader_visual_debug_persistent_smoke.py` runs with `--python` in a private application profile.
+Set `BREAD_SHADER_VISUAL_PERSISTENT_CONFIG` to a JSON file containing `repository`, `output`,
+and `captures` (each with `name`, `capture`, `sourceFile`, `language`, and `entryPoint`). The
+Shared_Buffer fixtures must contain four draws sharing a Shader and RT. Acceptance starts at
+a non-draw EID, reads real pixels across earlier/later events, checks that compilation happens
+once, compares/restores a borrowed prior target, and verifies a cached restart. Optional
+`serverURL` uses an already running compatible ReplayProxy server with no local fallback.
+The launcher owns its server/process lifetime; remote tests do not establish Android or Linux
+GPU coverage unless actually run on those devices.
+
+`shader_visual_debug_persistent_workspace_smoke.py` runs with `--ui-script` and
+`BREAD_SHADER_VISUAL_DEBUG_WORKSPACE_CONFIG` (`capture`, `sourceFile`, `output`). Use private
+fixture copies whose source entry point matches the captured reflection. It exercises the real
+workspace toolbar, non-draw startup, earlier/later navigation, native ownership and cancellation.
+Delegating observers count compiler calls and editor marks without replacing their implementation.
+Screenshots record the highlighted source; source/capture bytes must remain unchanged.
+
+Native tests tagged `[shared-shader]` cover the replacement getter, cross-EID ownership,
+checked remote request validation and old-peer capability rejection. Build both client and server
+against the updated API. Existing protocol payloads remain compatible; an old peer without the
+new checked-replacement capability explicitly rejects this operation.

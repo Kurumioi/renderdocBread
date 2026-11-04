@@ -11,8 +11,11 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 import copy
 from dataclasses import dataclass
+from functools import lru_cache
 import hmac
 import inspect
 import json
@@ -22,13 +25,54 @@ from pathlib import Path
 import re
 import secrets
 import stat
-import tempfile
 import threading
 import time
 from typing import Any, Callable, Mapping
 
 from .active_projects import ActiveReplayProjectService
-from .shader_live_edit import ShaderLiveEditManager, ShaderLiveEditSession
+from .shader_live_edit import (
+    ShaderLiveEditDeferred,
+    ShaderLiveEditManager,
+    ShaderLiveEditSession,
+    ShaderLiveEditSessionUnavailable,
+    capture_bindings_match,
+)
+
+
+_AUTOMATIC_SHADER_RESUME_ALLOWED: ContextVar[Callable[[], bool] | None] = ContextVar(
+    "automatic_shader_resume_allowed", default=None)
+_SHADER_LIVE_START_TIMING: ContextVar[dict[str, Any] | None] = ContextVar(
+    "shader_live_start_timing", default=None)
+
+
+@contextmanager
+def _shader_live_start_phase(phase: str):
+    """Measure private owner-start work without adding filesystem or IPC reads."""
+    timing = _SHADER_LIVE_START_TIMING.get()
+    if timing is None:
+        yield
+        return
+    started = time.perf_counter()
+    try:
+        yield
+    except BaseException:
+        if not timing["failedPhase"]:
+            timing["failedPhase"] = phase
+        raise
+    finally:
+        phases = timing["phasesMs"]
+        phases[phase] = round(phases.get(phase, 0.0) + (time.perf_counter() - started) * 1000, 3)
+
+
+def _shader_live_start_timing_result(timing: dict[str, Any], started: float) -> dict[str, Any]:
+    return {"totalMs": round((time.perf_counter() - started) * 1000, 3),
+            "phasesMs": dict(timing["phasesMs"]), "failedPhase": timing["failedPhase"]}
+
+
+def _automatic_shader_resume_checkpoint() -> None:
+    allowed = _AUTOMATIC_SHADER_RESUME_ALLOWED.get()
+    if allowed is not None and not allowed():
+        raise ShaderLiveEditDeferred("automatic Shader resume deferred to project restore")
 
 
 ACTIVE_PROJECT_STATE_ENV = "RENDERDOC_ULTRA_ACTIVE_PROJECT_STATE"
@@ -56,9 +100,9 @@ PROJECT_RESTORE_HISTORY_TTL_SECONDS = 15 * 60.0
 # additional cleanup/transport margin beyond this server-owned deadline.
 PROJECT_RESTORE_DEADLINE_SECONDS = 30 * 60.0
 PROJECT_RESTORE_CLEANUP_GRACE_SECONDS = 5 * 60.0
-PROJECT_RESTORE_CANCELLED_ERROR = "ReplayLab project restore was cancelled"
+PROJECT_RESTORE_CANCELLED_ERROR = "Bread project restore was cancelled"
 PROJECT_RESTORE_DEADLINE_ERROR = (
-    "ReplayLab project restore exceeded its server deadline"
+    "Bread project restore exceeded its server deadline"
 )
 SHADER_EDITOR_SAVE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SHADER_EDITOR_SAVE_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -66,7 +110,7 @@ MAX_SHADER_EDITOR_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_SHADER_EDITOR_SAVE_REQUEST_BYTES = MAX_SHADER_EDITOR_SOURCE_BYTES + 64 * 1024
 MAX_SHADER_EDITOR_CHECK_DIAGNOSTICS = 128
 SHADER_LIVE_EDIT_OPERATION_SCHEMA = "replaylab-internal-shader-live-edit/v1"
-MAX_SHADER_LIVE_EDIT_OPERATION_BYTES = 64 * 1024
+MAX_SHADER_LIVE_EDIT_OPERATION_BYTES = MAX_SHADER_EDITOR_SAVE_REQUEST_BYTES
 ASSET_INDEX_OPERATION_SCHEMA = "replaylab-internal-asset-index/v1"
 MAX_ASSET_INDEX_OPERATION_BYTES = 4 * 1024
 _ASSET_INDEX_DEPTHS = frozenset({"names", "headers", "full"})
@@ -93,6 +137,65 @@ def parse_asset_index_operation(payload: bytes) -> dict[str, Any]:
     return value
 
 
+def _save_workspace_source_now(**parameters) -> dict[str, Any]:
+    from . import server
+
+    active = server._active_project_service()
+    selected = active.status()
+    root = server._require_managed_active_workspace(selected, parameters["workspace_path"])
+    parameters["workspace_path"] = str(root)
+    with active.snapshot_active_project(
+        str(selected.get("workspaceId") or ""), str(selected.get("projectRoot") or "")
+    ) as snapshot:
+        return server._shader_organization_manager().save_editor_source(
+            **parameters,
+            commit_guard=lambda: active.commit_active_project_snapshot(snapshot))
+
+
+def _source_document_now(operation, parameters):
+    from . import server
+    from .shader_workspace.source_documents import open_source_document, save_source_document
+    active = server._active_project_service()
+    selected = active.status()
+    parameters["workspace_path"] = str(server._require_managed_active_workspace(
+        selected, parameters["workspace_path"]))
+    with active.snapshot_active_project(str(selected.get("workspaceId") or ""),
+                                       str(selected.get("projectRoot") or "")) as snapshot:
+        method = open_source_document if operation == "open" else save_source_document
+        return method(server._shader_organization_manager(), **parameters,
+                      commit_guard=lambda: active.commit_active_project_snapshot(snapshot))
+
+
+def _open_workspace_source_document_now(**parameters):
+    return _source_document_now("open", parameters)
+
+
+def _save_workspace_source_document_now(**parameters):
+    return _source_document_now("save", parameters)
+
+
+def _save_and_apply_editor_source(manager, parameters, *, binding, include=False):
+    """A user save owns both durable text and a separate manual compile request.
+
+    Compilation/application is asynchronous and checks the physical interface,
+    never organization equivalence: the user is allowed to change the image.
+    """
+    saved = (_save_workspace_source_document_now(**parameters) if include else
+             _save_workspace_source_now(**parameters))
+    result = dict(saved, sourceOnly=False, compileScheduled=False)
+    try:
+        expected = saved.get("rootSourceSha256") if include else saved.get("rawSha256")
+        queued = manager.compile_saved_source(parameters["workspace_path"],
+            parameters["source_workspace_id"], expected, capture_binding=binding)
+        result.update(queued)
+    except Exception as error:
+        # A successfully saved file stays saved even when the current capture
+        # cannot start replay. Expose that failure without losing the text or
+        # pretending its effects were applied. Ctrl+S can retry the same bytes.
+        result["autoApplyError"] = str(error)[:2048]
+    return result
+
+
 def parse_shader_live_edit_operation(payload: bytes) -> dict[str, Any]:
     if not isinstance(payload, bytes) or not payload or len(payload) > MAX_SHADER_LIVE_EDIT_OPERATION_BYTES:
         raise ValueError("Shader live-edit request has an invalid size")
@@ -103,7 +206,19 @@ def parse_shader_live_edit_operation(payload: bytes) -> dict[str, Any]:
         raise ValueError("Shader live-edit request identity is invalid")
     fields = {"start": {"workspace_path", "debounce_ms"}, "list": set(),
               "poll": {"live_edit_id"}, "stop": {"live_edit_id"},
-              "migrate": {"source_workspace_path", "workspace_path", "expected_source_sha256"}}
+              "migrate": {"source_workspace_path", "workspace_path", "expected_source_sha256"},
+              "convert-hlsl": {"source_workspace_path", "expected_source_sha256"},
+              # The editor's "use compiled HLSL / use original Shader" switch.
+              "apply": {"workspace_path"},
+              "compiler-contract": {"workspace_path", "source_workspace_id", "expected_raw_sha256"},
+              "save-source": {"workspace_path", "source_workspace_id", "expected_raw_sha256", "text"},
+              "save-and-apply-source": {"workspace_path", "source_workspace_id", "expected_raw_sha256", "text"},
+              "open-source-document": {"workspace_path", "source_workspace_id", "requested_path"},
+              "save-source-document": {"workspace_path", "source_workspace_id", "document_id",
+                                       "expected_raw_sha256", "expected_source_sha256", "text"},
+              "save-and-apply-source-document": {"workspace_path", "source_workspace_id", "document_id",
+                                       "expected_raw_sha256", "expected_source_sha256", "text"},
+              "restore": {"workspace_path", "replacement_id"}}
     parameters = value["parameters"]
     if value["operation"] not in fields or not isinstance(parameters, dict) or set(parameters) != fields[value["operation"]]:
         raise ValueError("Shader live-edit operation or parameters are invalid")
@@ -114,7 +229,12 @@ def parse_shader_live_edit_operation(payload: bytes) -> dict[str, Any]:
         elif key.endswith("_path"):
             if not isinstance(item, str) or not item or len(item) > 32768 or "\0" in item or not Path(item).is_absolute():
                 raise ValueError("Shader live-edit workspace path is invalid")
-        elif key == "live_edit_id":
+        elif key == "text":
+            if (not isinstance(item, str) or
+                    (value["operation"] not in {"save-source-document", "save-and-apply-source-document"} and not item.strip()) or "\0" in item
+                    or len(item.encode("utf-8", errors="strict")) > MAX_SHADER_EDITOR_SOURCE_BYTES):
+                raise ValueError("Shader source text is invalid")
+        elif key in {"live_edit_id", "replacement_id", "source_workspace_id"}:
             if not isinstance(item, str) or SHADER_EDITOR_SAVE_ID_PATTERN.fullmatch(item) is None:
                 raise ValueError("Shader live-edit ID is invalid")
         elif not isinstance(item, str) or SHADER_EDITOR_SAVE_SHA256_PATTERN.fullmatch(item) is None:
@@ -163,7 +283,16 @@ def active_project_paths(
 
 def project_service(environment: Mapping[str, str] | None = None):
     state_path, projects_home = active_project_paths(environment)
-    return ActiveReplayProjectService(state_path, projects_home)
+    env = os.environ if environment is None else environment
+    return _project_service_cached(str(state_path), str(projects_home),
+        str(env.get("RENDERDOC_ULTRA_PROJECT_REGISTRY") or ""))
+
+
+@lru_cache(maxsize=16)
+def _project_service_cached(state_path, projects_home, registry_path):
+    # Reuse service/index state for one application. Individual metadata reads
+    # still observe current file stamps; caching is not a project-wide lock.
+    return ActiveReplayProjectService(state_path, projects_home, registry_path=registry_path or None)
 
 
 def project_association_guard(
@@ -181,16 +310,17 @@ def project_association_guard(
     expected_capture = os.path.normcase(
         str(Path(expected_capture_path).expanduser().resolve())
     )
-    local = str(os.environ.get("LOCALAPPDATA", "") or "").strip()
+    local = (str(os.environ.get("LOCALAPPDATA", "") or "").strip()
+             or str(os.environ.get("XDG_DATA_HOME", "") or "").strip())
     boundary = (
-        Path(local).expanduser() / "ReplayLab" / "ipc-v2" / "instances"
-        if local else Path(tempfile.gettempdir()) / "ReplayLab" / "ipc-v2" / "instances"
+        (Path(local).expanduser() if local else Path.home() / ".local" / "share")
+        / "ReplayLab" / "ipc-v2" / "instances"
     ).resolve()
     try:
         if os.path.commonpath((str(boundary), str(lease))) != str(boundary):
-            raise ValueError("project association lease escapes ReplayLab IPC")
+            raise ValueError("project association lease escapes Bread IPC")
     except ValueError as exc:
-        raise ValueError("project association lease escapes ReplayLab IPC") from exc
+        raise ValueError("project association lease escapes Bread IPC") from exc
 
     def _guard() -> bool:
         if lease.is_symlink() or not lease.is_file():
@@ -342,6 +472,9 @@ class _ProjectRestoreJob:
     completed_order: int | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+    persisted_sequence: int = 0
+    result_finalized: bool = False
+    final_progress: list[dict[str, Any]] | None = None
 
 
 def _bounded_restore_text(
@@ -557,6 +690,7 @@ def _run_project_restore(
     progress_callback: Callable[[dict[str, Any]], None],
     cancel_event: threading.Event,
     deadline_monotonic: float,
+    post_restore_callback: Callable[[Callable[[], dict[str, Any]]], None] | None = None,
 ) -> dict[str, Any]:
     """Import the restore implementation only inside the background worker."""
 
@@ -569,7 +703,188 @@ def _run_project_restore(
         progress_callback=progress_callback,
         cancel_event=cancel_event,
         deadline_monotonic=deadline_monotonic,
+        post_restore_callback=post_restore_callback,
     )
+
+
+def _restore_result_record_path(project_root: str, capture_path: str) -> Path:
+    from .rdc_shader_inventory_cache import capture_path_sha256
+
+    return (Path(project_root) / ".replaylab" / "replay-project" / "derived"
+            / "restore-results" / (capture_path_sha256(capture_path) + ".json"))
+
+
+def _convert_workspace_to_hlsl_now(source_workspace_path: str,
+                                   expected_source_sha256: str) -> dict[str, Any]:
+    """Convert saved source without replacing it or activating an invalid result."""
+    from . import server
+
+    active = server._active_project_service()
+    selected = active.status()
+    root = server._require_managed_active_workspace(selected, source_workspace_path)
+    with active.snapshot_active_project(str(selected.get("workspaceId") or ""),
+                                       str(selected.get("projectRoot") or "")) as snapshot:
+        envelope = json.loads(server.convert_shader_workspace_to_hlsl(
+            str(root), expected_source_sha256))
+        if envelope.get("error"):
+            raise RuntimeError(str(envelope["error"])[:4096])
+        result = envelope.get("result") or {}
+        if result.get("readyForEditing") is not True:
+            validation = result.get("abiValidation") or {}
+            raise RuntimeError(str(validation.get("error") or
+                                   "HLSL conversion did not pass interface validation")[:4096])
+        active.commit_active_project_snapshot(snapshot)
+        shown = json.loads(server.show_shader_workspace_source(result["workspacePath"]))
+        if shown.get("error"):
+            raise RuntimeError(str(shown["error"])[:4096])
+    # Compiler/reflection receipts can exceed the editor transport budget. Keep
+    # them in the workspace and return only source/navigation facts here.
+    return {key: result[key] for key in (
+        "workspacePath", "sourcePath", "sourceWorkspacePath", "sourcePreserved",
+        "previousSourceSha256", "sourceSha256", "preservedSourcePath",
+        "conversionReceiptPath", "readyForEditing", "applied") if key in result}
+
+
+def _apply_workspace_candidate_now(workspace_path: str) -> dict[str, Any]:
+    """Switch the captured Shader to this workspace's compiled HLSL.
+
+    The latest compiled candidate is applied as it is when it was built from the
+    source currently on disk; only a changed source is compiled first. Nothing
+    is recompiled for a switch back and forth.
+    """
+
+    from . import server
+
+    service = server._shader_workspace_service()
+    status = service.status(workspace_path)
+    source = status.get("source") or {}
+    latest = status.get("latestCompiled") or {}
+    current = str(source.get("currentSha256") or "")
+    compiled = False
+    if not (isinstance(latest, dict) and latest.get("sourceSha256") == current
+            and status.get("sourceDependenciesCurrent", True) is True
+            and isinstance(latest.get("revision"), int) and latest.get("rawSha256")):
+        built = getattr(service, "compile_for_live_edit", service.compile)(workspace_path)
+        latest = {"revision": built.get("revision"), "rawSha256": built.get("rawSha256"),
+                  "sourceSha256": built.get("sourceSha256")}
+        compiled = True
+    result = server._shader_live_edit_apply_candidate(
+        workspace_path, int(latest["revision"]), str(latest["rawSha256"]))
+    replacement = result.get("replacement") if isinstance(result, dict) else None
+    if not isinstance(result, dict) or result.get("error") or not isinstance(replacement, dict):
+        detail = (result.get("error") if isinstance(result, dict) else None) or "no replacement evidence"
+        raise RuntimeError("apply did not replace the captured Shader: %s" % str(detail)[:1500])
+    return {
+        "operation": "apply",
+        "workspacePath": workspace_path,
+        "revision": int(latest["revision"]),
+        "candidateRawSha256": str(latest["rawSha256"]),
+        "compiled": compiled,
+        "applied": True,
+        "replacementId": replacement.get("replacementId"),
+        "result": _switch_result_summary(result),
+    }
+
+
+_SWITCH_RESULT_KEYS = ("scope", "replacement", "rollback", "verification", "status",
+                       "revision", "rawSha256", "sourceSha256", "evidence", "message")
+
+
+def _switch_result_summary(value: Any) -> Any:
+    """Keep the parts of an apply/rollback reply the switch button reads.
+
+    The full replacement receipt carries manifest excerpts that can exceed the
+    bridge client's response budget; the button needs the identifiers only.
+    """
+
+    if not isinstance(value, dict):
+        return value
+    summary = {key: value[key] for key in _SWITCH_RESULT_KEYS if key in value}
+    encoded = json.dumps(summary, ensure_ascii=False, default=str)
+    if len(encoded.encode("utf-8")) > 16384:
+        summary = {key: summary[key] for key in ("scope", "replacement", "rollback", "status")
+                   if key in summary}
+    return summary
+
+
+def _restore_workspace_original(workspace_path: str, replacement_id: str) -> dict[str, Any]:
+    """Put the captured Shader back for every use; the workspace keeps its candidate."""
+
+    from . import server
+
+    raw = server.rollback_shader_workspace_shared_resource(workspace_path, replacement_id)
+    value = json.loads(raw) if isinstance(raw, str) else raw
+    if isinstance(value, dict) and value.get("error"):
+        raise RuntimeError(str(value.get("error"))[:2048])
+    return {"operation": "restore", "workspacePath": workspace_path,
+            "replacementId": replacement_id, "result": _switch_result_summary(value)}
+
+
+def persist_restore_result(project_root: str, capture_path: str,
+                           result: Mapping[str, Any] | None, error: str | None,
+                           *, running: bool = False,
+                           progress: list[Mapping[str, Any]] | None = None,
+                           job_metadata: Mapping[str, Any] | None = None) -> None:
+    """Keep the last restore outcome for this capture where a person can read it.
+
+    The job registry forgets a result minutes after the GUI reads it, and the
+    GUI shows one status line. When a Shader the project knows was not restored,
+    the question is always "was it looked for, and what did the lookup say" --
+    ``targetLookup`` (observed / unobserved project heads) and the per-Shader
+    items answer it, so they are written next to the project's other derived
+    files. Best effort: a write failure never changes the restore's outcome.
+    """
+
+    try:
+        nested_error = result.get("error") if isinstance(result, Mapping) else None
+        effective_error = error or nested_error
+        record: dict[str, Any] = {
+            "schema": "replaylab-project-restore-result/v1",
+            "schemaVersion": 1,
+            "capturePath": str(capture_path),
+            "status": "running" if running else ("failed" if effective_error else "finished"),
+            ("updatedAt" if running else "finishedAt"):
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "error": (str(effective_error)[:4096] if effective_error else None),
+        }
+        if progress:
+            # Timed phases: where a nine-minute restore spent its time.
+            record["progress"] = copy.deepcopy(list(progress)[-48:])
+        if running and isinstance(result, Mapping):
+            record.update({key: copy.deepcopy(value) for key, value in result.items()})
+        elif isinstance(result, Mapping):
+            for key in ("operationId", "completed", "outcome", "restoreMode", "reasonId",
+                        "errorType", "cache", "inventoryCache", "inventoryScope", "fullFrame",
+                        "targetLookup", "index", "realizedReceipts", "warnings",
+                        "verifiedRdcCache", "editing", "contextRecovery", "performance"):
+                if key in result:
+                    record[key] = copy.deepcopy(result[key])
+            for section in ("shaders", "materials"):
+                value = result.get(section)
+                if isinstance(value, Mapping):
+                    trimmed = {k: v for k, v in value.items() if k != "items"}
+                    items = value.get("items")
+                    if isinstance(items, list):
+                        # The result was already protocol/byte bounded. Cutting
+                        # this list at 64 hid later failures and broke its own
+                        # attempted/applied/failed counts on ordinary projects.
+                        trimmed["items"] = copy.deepcopy(items)
+                    record[section] = trimmed
+        if job_metadata:
+            record.update(job_metadata)
+        path = _restore_result_record_path(project_root, capture_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(record, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        if len(encoded) > 2 * 1024 * 1024:
+            record.pop("shaders", None)
+            record.pop("materials", None)
+            encoded = json.dumps(record, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        # Readers on Windows can briefly deny replacement while polling this
+        # file. Reuse the unique temporary and bounded sharing-error retries.
+        from .shader_workspace.io import atomic_write_bytes
+        atomic_write_bytes(path, encoded)
+    except Exception:  # noqa: BLE001 - diagnostics must never fail a restore
+        pass
 
 
 def _runner_accepts_restore_control(runner: Callable[..., Any]) -> bool:
@@ -644,6 +959,10 @@ class ProjectRestoreJobRegistry:
         self._monotonic = monotonic
         self._unix_time = unix_time
         self._lock = threading.Lock()
+        self._result_write_lock = threading.Lock()
+        self._shader_resume_condition = threading.Condition(self._lock)
+        self._shader_resume_readers: dict[tuple[str, str], int] = {}
+        self._project_editor_scopes: dict[tuple[str, str, str], None] = {}
         self._jobs: dict[str, _ProjectRestoreJob] = {}
         self._active_by_key: dict[tuple[str, str, str], str] = {}
         self._next_completed_order = 0
@@ -651,9 +970,95 @@ class ProjectRestoreJobRegistry:
         self._runner_accepts_control = (
             runner is None or _runner_accepts_restore_control(self._runner)
         )
+        parameters = inspect.signature(self._runner).parameters if runner is None else {}
+        if runner is not None:
+            try:
+                parameters = inspect.signature(runner).parameters
+            except (TypeError, ValueError):
+                pass
+        self._runner_accepts_post_restore = "post_restore_callback" in parameters
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="replaylab-project-restore"
         )
+
+    @staticmethod
+    def _shader_scope(capture_path: str, capture_session_id: str) -> tuple[str, str]:
+        # Callers already canonicalize these paths; bookkeeping must not do
+        # filesystem resolution while holding the short scheduling lock.
+        return (os.path.normcase(os.path.abspath(capture_path)), capture_session_id)
+
+    def _shader_restore_active_locked(self, scope: tuple[str, str]) -> bool:
+        return any(job.status in self._ACTIVE_STATUSES
+                   and self._shader_scope(job.capture_path, job.capture_session_id) == scope
+                   for job in self._jobs.values())
+
+    def shader_resume_allowed(self, binding: Mapping[str, str]) -> bool:
+        scope = self._shader_scope(binding["capturePath"], binding["captureSessionId"])
+        with self._lock:
+            return (not self._closed and not self._shader_restore_active_locked(scope)
+                    and (*scope, binding["instanceId"]) not in self._project_editor_scopes)
+
+    def _remember_project_editors_locked(self, job: _ProjectRestoreJob, result: dict) -> None:
+        editing = result.get("editing")
+        enabled = editing.get("enabled") if isinstance(editing, dict) else None
+        deferred = editing.get("deferred", 0) if isinstance(editing, dict) else 0
+        pending = editing.get("pending", 0) if isinstance(editing, dict) else 0
+        if (result.get("completed") is not True or isinstance(enabled, bool)
+                or not isinstance(enabled, int) or isinstance(deferred, bool)
+                or not isinstance(deferred, int) or type(pending) is not int or enabled + deferred + pending <= 0):
+            return
+        scope = self._shader_scope(job.capture_path, job.capture_session_id)
+        items = editing.get("items")
+        if not isinstance(items, list):
+            return
+        for item in items[:MAX_PROJECT_RESTORE_PROGRESS_EVENTS]:
+            binding = item.get("captureBinding") if isinstance(item, dict) else None
+            if (not isinstance(item, dict) or item.get("status") not in {"enabled", "deferred", "pending"} or not isinstance(binding, dict)
+                    or not isinstance(binding.get("instanceId"), str) or not binding["instanceId"]
+                    or self._shader_scope(str(binding.get("capturePath", "")),
+                                          str(binding.get("captureSessionId", ""))) != scope):
+                continue
+            # A restore-owned source-only decision also suppresses background
+            # live-edit reconciliation for this capture. It grants no editor
+            # or replay authority; explicit final publication remains separate.
+            key = (*scope, binding["instanceId"])
+            self._project_editor_scopes.pop(key, None)
+            self._project_editor_scopes[key] = None
+        # These are only automatic-resume scheduling hints for exact live
+        # sessions, not permanent consent or mutation authority.
+        while len(self._project_editor_scopes) > 128:
+            self._project_editor_scopes.pop(next(iter(self._project_editor_scopes)))
+
+    @contextmanager
+    def reserve_shader_resume(self, binding: Mapping[str, str]):
+        """Admit an automatic reader or defer it, without holding a long lock.
+
+        Submitting restore immediately blocks new readers. A reader admitted
+        first is allowed to finish its in-flight replay call before mutation;
+        checkpoints stop it from starting additional workspace preflights.
+        """
+        binding = dict(binding)
+        scope = self._shader_scope(binding["capturePath"], binding["captureSessionId"])
+        with self._lock:
+            admitted = (not self._closed and not self._shader_restore_active_locked(scope)
+                        and (*scope, binding["instanceId"]) not in self._project_editor_scopes)
+            if admitted:
+                self._shader_resume_readers[scope] = self._shader_resume_readers.get(scope, 0) + 1
+        if not admitted:
+            yield False
+            return
+        token = _AUTOMATIC_SHADER_RESUME_ALLOWED.set(lambda: self.shader_resume_allowed(binding))
+        try:
+            yield True
+        finally:
+            _AUTOMATIC_SHADER_RESUME_ALLOWED.reset(token)
+            with self._shader_resume_condition:
+                count = self._shader_resume_readers[scope] - 1
+                if count:
+                    self._shader_resume_readers[scope] = count
+                else:
+                    self._shader_resume_readers.pop(scope, None)
+                self._shader_resume_condition.notify_all()
 
     def _unix_ms(self) -> int:
         return int(self._unix_time() * 1000)
@@ -664,6 +1069,8 @@ class ProjectRestoreJobRegistry:
             for job in self._jobs.values()
             if job.status in self._TERMINAL_STATUSES
             and job.completed_monotonic is not None
+            and not (isinstance(job.result, dict)
+                     and (job.result.get("editing") or {}).get("status") == "pending")
         ]
         expired = {
             job.job_id
@@ -771,6 +1178,10 @@ class ProjectRestoreJobRegistry:
             )
             self._jobs[job_id] = job
             self._active_by_key[key] = job_id
+            scope = self._shader_scope(capture_path, capture_session_id)
+            for owner_scope in list(self._project_editor_scopes):
+                if owner_scope[:2] == scope:
+                    self._project_editor_scopes.pop(owner_scope, None)
             try:
                 self._executor.submit(self._execute, job_id)
             except BaseException:
@@ -805,12 +1216,79 @@ class ProjectRestoreJobRegistry:
             event = {"sequence": job.latest_sequence, **clean}
             job.progress.append(event)
             job.updated_unix_ms = self._unix_ms()
+            timed = self.__dict__.setdefault("_progress_trails", {}).setdefault(job_id, [])
+            timed.append({"unixMs": job.updated_unix_ms, **event})
+            del timed[:-48]
+            trail = list(timed)
+            persisted_at = self.__dict__.setdefault("_progress_persisted_at", {})
+            now = time.monotonic()
+            last = persisted_at.get(job_id, 0.0)
+            persist = now - last >= 1.0 or clean.get("phase") in ("complete", "failed")
+            if persist:
+                persisted_at[job_id] = now
+        # Outside the lock: a restore that stops answering leaves its last
+        # phases where a person can read them (derived/restore-results), which
+        # the in-memory registry cannot do once the GUI stops polling.
+        if persist:
+            self._persist_result(job_id, None, None, running=True, progress=trail)
+
+    def _persist_result(self, job_id: str, result: Mapping[str, Any] | None,
+                        error: str | None, *, running: bool = False,
+                        progress: list[Mapping[str, Any]] | None = None,
+                        editor_update: bool = False) -> None:
+        # A callback may have left the registry lock before its worker finishes.
+        # Serialize publication without blocking HTTP status/cancel, and recheck
+        # this exact job so delayed progress cannot overwrite its terminal result
+        # or the next job's result for the same capture.
+        with self._result_write_lock:
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if job is None or (job.result_finalized and not editor_update):
+                    return
+                if editor_update and (job.status != "completed" or job.result is not result):
+                    return
+                if running:
+                    sequence = int((progress or [{}])[-1].get("sequence", 0))
+                    if job.status not in self._ACTIVE_STATUSES or sequence <= job.persisted_sequence:
+                        return
+                else:
+                    job.result_finalized = True
+                    sequence = job.latest_sequence
+                    if editor_update:
+                        progress = list(job.final_progress or [])
+                    else:
+                        trails = self.__dict__.get("_progress_trails") or {}
+                        progress = list(trails.pop(job_id, []))
+                        job.final_progress = copy.deepcopy(progress[-48:])
+                    self.__dict__.get("_progress_persisted_at", {}).pop(job_id, None)
+                job.persisted_sequence = sequence
+                project_root, capture_path = job.project_root, job.capture_path
+                metadata = {"jobId": job_id, "captureSessionId": job.capture_session_id,
+                            "startedUnixMs": job.created_unix_ms, "latestSequence": sequence}
+            persist_restore_result(project_root, capture_path, result, error,
+                                   running=running, progress=progress,
+                                   job_metadata=metadata)
 
     def _execute(self, job_id: str) -> None:
+        from .shader_restore_admission import restore_admission
+        with restore_admission(getattr(self, "_local_shader_dispatcher", None)):
+            self._execute_admitted(job_id)
+
+    def _execute_admitted(self, job_id: str) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None or job.status != "queued":
                 return
+            scope = self._shader_scope(job.capture_path, job.capture_session_id)
+            while self._shader_resume_readers.get(scope, 0):
+                remaining = job.deadline_monotonic - self._monotonic()
+                if job.cancel_event.is_set() or remaining <= 0:
+                    break
+                # Condition.wait releases the registry lock. Status, cancel,
+                # unrelated capture reads and new job submissions stay live.
+                self._shader_resume_condition.wait(min(0.05, remaining))
+                if job.status != "queued":
+                    return
             now = self._monotonic()
             if job.cancel_event.is_set():
                 self._fail_locked(job, PROJECT_RESTORE_CANCELLED_ERROR, now)
@@ -827,6 +1305,7 @@ class ProjectRestoreJobRegistry:
             cancel_event = job.cancel_event
             deadline_monotonic = job.deadline_monotonic
         try:
+            post_restore_work: list[Callable[[], dict[str, Any]]] = []
             runner_kwargs: dict[str, Any] = {
                 "progress_callback": lambda event: self._append_progress(
                     job_id, event
@@ -839,11 +1318,14 @@ class ProjectRestoreJobRegistry:
                         "deadline_monotonic": deadline_monotonic,
                     }
                 )
+            if self._runner_accepts_post_restore:
+                runner_kwargs["post_restore_callback"] = post_restore_work.append
             value = self._runner(inputs[0], inputs[1], inputs[2], **runner_kwargs)
             result = _bounded_restore_json_object(
                 value, "project restore result", MAX_PROJECT_RESTORE_RESULT_BYTES
             )
         except BaseException as exc:
+            self._persist_result(job_id, None, "%s: %s" % (type(exc).__name__, exc))
             with self._lock:
                 job = self._jobs.get(job_id)
                 if job is None:
@@ -861,6 +1343,7 @@ class ProjectRestoreJobRegistry:
                     self._fail_locked(job, _bounded_restore_error(exc), now)
                 self._cleanup_locked(now)
             return
+        self._persist_result(job_id, result, None)
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -882,6 +1365,7 @@ class ProjectRestoreJobRegistry:
                 return
             job.status = "completed"
             job.result = result
+            self._remember_project_editors_locked(job, result)
             job.completed_monotonic = now
             self._next_completed_order += 1
             job.completed_order = self._next_completed_order
@@ -889,6 +1373,41 @@ class ProjectRestoreJobRegistry:
             if self._active_by_key.get(job.key) == job_id:
                 self._active_by_key.pop(job.key, None)
             self._cleanup_locked(job.completed_monotonic)
+
+        # Publish completion before starting watchers. Keep this ordered on the
+        # same worker, outside every registry/project/restore lock. A slow or
+        # failed editor never relabels already committed replay state as failed.
+        if committed and post_restore_work:
+            editor_started = self._monotonic()
+            try:
+                editing = post_restore_work[0]()
+                editing = _bounded_restore_json_object(editing, "restored editor result", MAX_PROJECT_RESTORE_RESULT_BYTES)
+            except Exception as exc:
+                pending_items = (result.get("editing") or {}).get("items", [])
+                failed_items = [{"workspaceId": item["workspaceId"], "workspacePath": item["workspacePath"],
+                                 "status": "failed", "error": _bounded_restore_error(exc)} for item in pending_items]
+                editing = {"attempted": len(failed_items), "enabled": 0, "deferred": 0,
+                           "failed": len(failed_items), "items": failed_items}
+            from .shader_restore_admission import statistics
+            editing["initializationMs"] = round((self._monotonic() - editor_started) * 1000, 3)
+            editing["startupReuse"] = statistics()
+            with self._lock:
+                if self._jobs.get(job_id) is not job:
+                    return
+                for item in (result.get("editing") or {}).get("items", []):
+                    binding = item.get("captureBinding") or {}
+                    if binding.get("instanceId"):
+                        scope = self._shader_scope(job.capture_path, job.capture_session_id)
+                        self._project_editor_scopes.pop((*scope, binding["instanceId"]), None)
+                # Replace the result atomically for readers taking snapshots.
+                result = dict(result, editing=editing)
+                job.result = result
+                # Retain the final editor receipt for a full history window,
+                # even if automatic startup used most of its own time budget.
+                job.completed_monotonic = self._monotonic()
+                job.updated_unix_ms = self._unix_ms()
+                self._remember_project_editors_locked(job, result)
+            self._persist_result(job_id, result, None, editor_update=True)
 
     def cancel(self, job_id: str) -> dict[str, Any] | None:
         if (
@@ -939,6 +1458,9 @@ class ProjectRestoreJobRegistry:
             self._closed = True
             now = self._monotonic()
             for job in list(self._jobs.values()):
+                if (job.status == "completed" and isinstance(job.result, dict)
+                        and (job.result.get("editing") or {}).get("status") == "pending"):
+                    job.cancel_event.set()
                 if job.status not in self._ACTIVE_STATUSES:
                     continue
                 job.cancel_event.set()
@@ -1330,6 +1852,15 @@ _SHADER_LIVE_EDIT_BINDINGS: dict[str, ShaderLiveEditSession] = {}
 _SHADER_LIVE_EDIT_BINDING_GUARD = threading.Lock()
 
 
+def require_local_shader_apply_owner(workspace_path, expected, direct_binding):
+    """Read existing owner state only; never start a manager or resume a job."""
+    with _SHADER_LIVE_EDIT_MANAGER_GUARD:
+        manager = _SHADER_LIVE_EDIT_MANAGER
+        if manager is None:
+            raise RuntimeError("Shader live-edit apply owner is unavailable")
+        manager.require_local_apply_owner(workspace_path, expected, direct_binding)
+
+
 def _shader_capture_mailbox(directory: Path) -> dict[str, Any] | None:
     path = directory / "instance.json"
     try:
@@ -1341,7 +1872,46 @@ def _shader_capture_mailbox(directory: Path) -> dict[str, Any] | None:
         return None
 
 
-def _shader_capture_session_state(binding: dict[str, str], pid: int) -> str:
+_SHADER_SESSION_OBSERVATIONS: dict[tuple, tuple] = {}
+_SHADER_SESSION_OBSERVATION_GUARD = threading.Lock()
+_SHADER_SESSION_OBSERVATION_SECONDS = 0.25
+
+
+def _shader_capture_session_state(binding: dict[str, str], pid: int, *, fresh: bool = False) -> str:
+    """Share one idle mailbox observation across stages of the same GUI.
+
+    A changed mailbox is observed immediately. The short expiry also notices
+    process exit and path redirection without a mailbox update. A write/replay
+    operation requests a fresh observation and retains its exact IPC binding.
+    """
+    from .ipc_client import INSTANCE_ROOT, IPCClient
+
+    if not IPCClient._process_alive(pid):
+        return "expired"
+    if fresh:
+        return _read_shader_capture_session_state(binding, pid)
+    try:
+        path = Path(INSTANCE_ROOT) / binding["instanceId"] / "instance.json"
+        info = path.stat(follow_symlinks=False)
+        stamp = (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                 info.st_mtime_ns, info.st_ctime_ns, getattr(info, "st_file_attributes", 0))
+        key = (str(INSTANCE_ROOT), pid, binding["instanceId"],
+               binding["captureSessionId"], binding["capturePath"])
+    except (OSError, KeyError, TypeError):
+        return _read_shader_capture_session_state(binding, pid)
+    with _SHADER_SESSION_OBSERVATION_GUARD:
+        now = time.monotonic()
+        previous = _SHADER_SESSION_OBSERVATIONS.get(key)
+        if previous is not None and previous[0] == stamp and now < previous[1]:
+            return previous[2]
+        state = _read_shader_capture_session_state(binding, pid)
+        if len(_SHADER_SESSION_OBSERVATIONS) >= 128:
+            _SHADER_SESSION_OBSERVATIONS.clear()
+        _SHADER_SESSION_OBSERVATIONS[key] = (stamp, now + _SHADER_SESSION_OBSERVATION_SECONDS, state)
+        return state
+
+
+def _read_shader_capture_session_state(binding: dict[str, str], pid: int) -> str:
     """Distinguish a closed capture from an unavailable but possibly live owner.
 
     A stalled UI heartbeat is not evidence that another GUI may take over.
@@ -1364,9 +1934,14 @@ def _shader_capture_session_state(binding: dict[str, str], pid: int) -> str:
                 or SHADER_EDITOR_SAVE_ID_PATTERN.fullmatch(session) is None
                 or not isinstance(capture_path, str) or not capture_path):
             return "unavailable"
-        if (session != binding["captureSessionId"]
-                or os.path.normcase(str(Path(capture_path).resolve()))
+        if (os.path.normcase(str(Path(capture_path).resolve()))
                 != os.path.normcase(str(Path(binding["capturePath"]).resolve()))):
+            return "expired"
+        if session != binding["captureSessionId"]:
+            # Reloading the same RDC destroys its GPU replacements and ABI
+            # leases. Retire this job without changing its frozen identity;
+            # reconcile_capture may reuse durable consent in a newly admitted
+            # job, but must never carry an old replacement token into it.
             return "expired"
         return "current"
     except (OSError, TypeError, ValueError):
@@ -1377,6 +1952,7 @@ def _freeze_shader_live_session(instance: str, session: str, pid: int,
                                 capture_path: str) -> ShaderLiveEditSession:
     from .ipc_client import bind_direct_tool_call
 
+    # Exactly the three keys the persisted-binding validator and the bridge accept.
     binding = {"instanceId": instance, "captureSessionId": session,
                "capturePath": capture_path}
 
@@ -1386,21 +1962,134 @@ def _freeze_shader_live_session(instance: str, session: str, pid: int,
     def apply_candidate(workspace_path: str, revision: int, candidate_sha256: str) -> dict[str, Any]:
         from . import server
 
-        if state() != "current":
+        session_state = _shader_capture_session_state(binding, pid, fresh=True)
+        if session_state == "unavailable":
+            raise ShaderLiveEditSessionUnavailable(
+                "Shader live-edit capture session is temporarily unavailable"
+            )
+        if session_state != "current":
             raise RuntimeError("Shader live-edit capture session is no longer current")
         # This closure belongs to one job. A later job for the same workspace
-        # cannot retarget an old in-flight worker or inherit its ABI lease.
-        with bind_direct_tool_call(instance, session):
-            return server._shader_live_edit_apply_candidate(workspace_path, revision, candidate_sha256)
+        # cannot retarget an old in-flight worker or inherit its ABI lease. The session
+        # A reload expires this frozen binding and requires a newly admitted job.
+        with bind_direct_tool_call(instance, binding["captureSessionId"]):
+            from . import shader_saved_publication
+            from .ipc_client import _CALL_BINDING
+            from .shader_live_edit import current_live_apply_owner
+            prepared = None
+            preparation_error = ""
+            expected = {"revision": revision, "candidateRawSha256": candidate_sha256}
+            if current_live_apply_owner(workspace_path, expected, _CALL_BINDING.get()) is not None:
+                try:
+                    prepared = shader_saved_publication.prepare(
+                        server, workspace_path, revision, candidate_sha256, binding, manual_edit=True)
+                except Exception as exc:
+                    preparation_error = str(exc)[:512]
+            try:
+                result = server._shader_live_edit_apply_candidate(workspace_path, revision, candidate_sha256)
+            except Exception:
+                try:
+                    shader_saved_publication.cancel(prepared)
+                except Exception:
+                    pass
+                raise
+            source_publication = None
+            if prepared is not None and result.get("applied") is not True:
+                try:
+                    shader_saved_publication.cancel(prepared)
+                except Exception:
+                    # Cleanup must not hide the actual compiler/ABI rejection.
+                    pass
+            elif prepared is not None:
+                try:
+                    source_publication = shader_saved_publication.complete(prepared, result)
+                except Exception as exc:
+                    source_publication = {"status": "pending", "message": str(exc)[:512]}
+            replacement = result.get("replacement") or {}
+            applied_binding = result.get("binding") or {}
+            if (result.get("applied") is True
+                    and result.get("validation", {}).get("manualEdit") is not True
+                    and applied_binding.get("revision") == revision
+                    and applied_binding.get("candidateRawSha256") == candidate_sha256
+                    and isinstance(replacement.get("replacementId"), str)):
+                # A saved source that was actually applied is the project head
+                # other RDCs must restore. This is a delivery step after the
+                # physical transaction: a disk/project failure cannot undo or
+                # misreport the successful live replacement.
+                try:
+                    if state() != "current":
+                        raise RuntimeError("capture changed before project source publication")
+                    from .project_restore import _RESTORE_GUARD, sync_active_shader_workspace_after_apply
+                    # Restore can wait for this apply worker to stop. Do not
+                    # wait back on its lock while the RDC is being replaced.
+                    if not _RESTORE_GUARD.acquire(blocking=False):
+                        raise RuntimeError("project restore is busy; source publication is pending")
+                    try:
+                        publication = sync_active_shader_workspace_after_apply(
+                            workspace_path, revision, candidate_sha256, replacement["replacementId"],
+                            embed_capture_index=False)
+                    finally:
+                        _RESTORE_GUARD.release()
+                    result["projectPublication"] = {
+                        "status": "committed" if publication.get("projectCommitted") is True else "pending",
+                        "knowledgeId": str((publication.get("knowledge") or {}).get("knowledgeId") or ""),
+                        "message": str(publication.get("warning") or "")[:512],
+                    }
+                except Exception as exc:
+                    result["projectPublication"] = {"status": "pending", "message": str(exc)[:512]}
+            if source_publication is not None:
+                if source_publication.get("status") in {"committed", "superseded"}:
+                    # Auxiliary RDC association/alias receipts must not turn a
+                    # durable source-head commit into a false pending result.
+                    auxiliary = result.get("projectPublication") or {}
+                    if auxiliary.get("status") == "pending":
+                        source_publication["message"] = auxiliary.get("message", "")
+                result["projectPublication"] = source_publication
+            elif preparation_error and result.get("projectPublication", {}).get("status") not in {"committed", "superseded"}:
+                result["projectPublication"] = {"status": "pending", "message": preparation_error}
+            if (result.get("applied") is True and applied_binding.get("revision") == revision
+                    and applied_binding.get("candidateRawSha256") == candidate_sha256):
+                # Names are display metadata. Restore them after the successful
+                # native transaction, outside the compile/apply critical path.
+                try:
+                    from .shader_workspace.alias_live_restore import schedule
+                    result["displayAliases"] = schedule(
+                        server, workspace_path, revision, candidate_sha256, binding)
+                except Exception as exc:
+                    result["displayAliases"] = {"status": "failed", "diagnostic": str(exc)[:400]}
+            return result
 
-    return ShaderLiveEditSession(binding, state, apply_candidate)
+    def recover_active_candidate(workspace_path: str) -> dict[str, Any] | None:
+        from . import server
+        if state() != "current":
+            raise ShaderLiveEditSessionUnavailable("Shader resume capture session is unavailable")
+        with bind_direct_tool_call(instance, binding["captureSessionId"]), _shader_live_start_phase("nativeRecovery"):
+            result = server._shader_live_edit_recover_active_candidate(workspace_path, binding)
+        if state() != "current":
+            raise ShaderLiveEditSessionUnavailable("Shader resume capture session changed")
+        return result
+
+    return ShaderLiveEditSession(binding, state, apply_candidate, recover_active_candidate)
 
 
+@_shader_live_start_phase("workspaceIdentity")
 def _bound_shader_workspace_identity(workspace_path: str) -> dict[str, Any]:
     from . import server
     from .ipc_client import _CALL_BINDING, bind_direct_tool_call
+    from .shader_workspace.watcher import validate_watch_start_status
+    from .shader_workspace.status_snapshot import bound_status_snapshot
 
-    status = server._shader_workspace_service().status(workspace_path)
+    service = server._shader_workspace_service()
+    snapshot = bound_status_snapshot(workspace_path)
+    status = snapshot.validated_status() if snapshot is not None else service.status(workspace_path)
+    if status.get("toolchainStatus") == "refresh-required":
+        service.prepare_compile_binding(workspace_path)
+        status = service.status(workspace_path)
+    # Historical authorizations can survive a toolchain upgrade. Reject their
+    # non-executable lane before any replay/catalog request: starting a watcher
+    # would reject the same status after an otherwise unnecessary catalog export.
+    validate_watch_start_status(status)
+    _automatic_shader_resume_checkpoint()
     identity = server._shader_live_edit_workspace_identity(workspace_path, status=status)
     from .ipc_client import INSTANCE_ROOT, IPCClient
 
@@ -1429,20 +2118,34 @@ def _bound_shader_workspace_identity(workspace_path: str) -> dict[str, Any]:
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         raise RuntimeError("Shader live-edit mailbox has an invalid process identity")
     frozen = _freeze_shader_live_session(instance, session, pid, str(identity["capturePath"]))
-    if frozen.state() != "current":
+    frozen_state = frozen.state()
+    if frozen_state == "unavailable":
+        raise ShaderLiveEditDeferred(
+            "Shader live-edit capture mailbox is temporarily unavailable"
+        )
+    if frozen_state != "current" or frozen.binding["captureSessionId"] != session:
         raise RuntimeError("Shader live-edit capture changed while binding its job")
     with bind_direct_tool_call(instance, session):
-        context = server._workspace_active_capture_context(workspace_path, status=status)
+        _automatic_shader_resume_checkpoint()
+        with _shader_live_start_phase("capturePreflight"):
+            context = server._workspace_active_capture_context(workspace_path, status=status)
     capture = context.get("capture") if isinstance(context, dict) else None
+    final_state = frozen.state()
+    if final_state == "unavailable":
+        raise ShaderLiveEditDeferred(
+            "Shader live-edit capture mailbox became temporarily unavailable"
+        )
     if (
         not isinstance(capture, dict)
         or capture.get("captureId") != identity["captureId"]
         or capture.get("captureSessionId") != session
         or not isinstance(capture.get("path"), str)
         or os.path.normcase(str(Path(capture["path"]).resolve())) != expected_path
-        or frozen.state() != "current"
+        or final_state != "current"
+        or frozen.binding["captureSessionId"] != session
     ):
         raise RuntimeError("Shader live-edit capture changed during catalog identity validation")
+    _automatic_shader_resume_checkpoint()
     with _SHADER_LIVE_EDIT_BINDING_GUARD:
         _SHADER_LIVE_EDIT_BINDINGS[os.path.normcase(str(Path(workspace_path).resolve()))] = frozen
     return identity
@@ -1454,6 +2157,25 @@ def _bound_shader_session(workspace_path: str) -> ShaderLiveEditSession:
     if binding is None:
         raise RuntimeError("Shader live-edit has no bound qrenderdoc capture session")
     return binding
+
+
+@contextmanager
+def _shader_live_edit_start_context(workspace_path: str):
+    from . import server
+    from .shader_workspace.status_snapshot import bind_status_snapshot, capture_status_snapshot
+    from .shader_workspace.watcher import validate_watch_start_status
+
+    _automatic_shader_resume_checkpoint()
+    with _shader_live_start_phase("statusSnapshot"):
+        service = server._shader_workspace_service()
+        from .shader_restore_admission import restored_snapshot
+        snapshot = restored_snapshot(service, workspace_path)
+        if snapshot is None:
+            snapshot = capture_status_snapshot(service, workspace_path)
+        validate_watch_start_status(snapshot.validated_status())
+    _automatic_shader_resume_checkpoint()
+    with bind_status_snapshot(snapshot):
+        yield
 
 
 def shader_live_edit_manager() -> ShaderLiveEditManager:
@@ -1481,6 +2203,8 @@ def shader_live_edit_manager() -> ShaderLiveEditManager:
                 registry_path=_SHADER_LIVE_EDIT_REGISTRY_PATH,
                 workspace_identity=_bound_shader_workspace_identity,
                 bind_session=_bound_shader_session,
+                start_context=_shader_live_edit_start_context,
+                phase_context=_shader_live_start_phase,
                 workspace_migration_evidence=(
                     _shader_live_edit_workspace_migration_evidence
                 ),
@@ -1509,6 +2233,8 @@ class InternalToolService:
         self.restore_jobs = restore_jobs or ProjectRestoreJobRegistry()
         self.shader_manager = shader_manager
         self._shader_refresh_guard = threading.Lock()
+        if isinstance(self.restore_jobs, ProjectRestoreJobRegistry):
+            self.restore_jobs._local_shader_dispatcher = self.shader_live_edit_operation
 
     def start(self) -> dict[str, Any]:
         if self.shader_manager is None:
@@ -1531,6 +2257,22 @@ class InternalToolService:
             raise RuntimeError("internal Shader service has not started")
         return shader_editor_check_response(payload, self.shader_manager)
 
+    @contextmanager
+    def _automatic_shader_resume(self, scope: Mapping[str, str]):
+        from . import server
+        if getattr(server, "_shader_editors_on_demand", False) is True:
+            # Listing and idle owner discovery must not activate all historical
+            # edit subscriptions. Explicit start and save still bind one owner.
+            yield False
+            return
+        reserve = getattr(self.restore_jobs, "reserve_shader_resume", None)
+        if callable(reserve):
+            with reserve(scope) as admitted:
+                yield admitted
+        else:
+            # Historical embedders can supply a registry without scheduling.
+            yield True
+
     def refresh_shader_sessions(self, owner_pids: list[int]) -> dict[str, Any]:
         """Reconcile registered GUI captures during the existing owner tick.
 
@@ -1539,6 +2281,9 @@ class InternalToolService:
         explicit current-capture operation may choose between them.
         """
         from .ipc_client import INSTANCE_ROOT, IPCClient, bind_direct_tool_call
+        from . import server
+        if getattr(server, "_shader_editors_on_demand", False) is True:
+            return {"attempted": False, "results": [], "reason": "editors-on-demand"}
 
         reconcile = getattr(self.shader_manager, "reconcile_capture", None)
         if not callable(reconcile) or not self._shader_refresh_guard.acquire(blocking=False):
@@ -1586,8 +2331,13 @@ class InternalToolService:
                 if IPCClient._manifest(str(Path(INSTANCE_ROOT) / scope["instanceId"])) is None:
                     continue
                 try:
-                    with bind_direct_tool_call(scope["instanceId"], scope["captureSessionId"]):
-                        result = reconcile(scope)
+                    with self._automatic_shader_resume(scope) as admitted:
+                        if not admitted:
+                            results.append({"binding": scope, "deferred": True,
+                                            "reason": "project-restore"})
+                            continue
+                        with bind_direct_tool_call(scope["instanceId"], scope["captureSessionId"]):
+                            result = reconcile(scope)
                     results.append({"binding": scope, "result": result})
                 except Exception as exc:
                     results.append({"binding": scope, "errorType": type(exc).__name__, "message": str(exc)[:2048]})
@@ -1628,43 +2378,74 @@ class InternalToolService:
         from . import server
         from .ipc_client import bind_direct_tool_call
 
+        timing = None
+        timing_token = None
+        started = time.perf_counter()
         try:
             value = parse_shader_live_edit_operation(payload)
+            if value["operation"] == "start":
+                timing = {"phasesMs": {}, "failedPhase": ""}
+                timing_token = _SHADER_LIVE_START_TIMING.set(timing)
             if self.shader_manager is None:
                 raise RuntimeError("internal Shader service has not started")
             binding = value["binding"]
             with bind_direct_tool_call(binding["instanceId"], binding["captureSessionId"]):
-                context = server._active_live_context(allow_missing_capture_id=True)
-                capture = context["capture"]
-                if (capture["captureSessionId"] != binding["captureSessionId"]
-                        or os.path.normcase(str(Path(capture["path"]).resolve())) != os.path.normcase(str(Path(binding["capturePath"]).resolve()))):
-                    raise RuntimeError("Shader live-edit capture session changed")
+                with _shader_live_start_phase("captureIdentity"):
+                    context = server._active_live_context(allow_missing_capture_id=True)
+                    capture = context["capture"]
+                    if (capture["captureSessionId"] != binding["captureSessionId"]
+                            or os.path.normcase(str(Path(capture["path"]).resolve())) != os.path.normcase(str(Path(binding["capturePath"]).resolve()))):
+                        raise RuntimeError("Shader live-edit capture session changed")
                 operation = value["operation"]
                 if operation == "list":
                     reconcile = getattr(self.shader_manager, "reconcile_capture", None)
                     if callable(reconcile):
-                        reconcile(binding)
+                        with self._automatic_shader_resume(binding) as admitted:
+                            if admitted:
+                                reconcile(binding)
                 elif operation in {"poll", "stop"}:
                     require_binding = getattr(self.shader_manager, "require_capture_binding", None)
                     if callable(require_binding):
                         require_binding(value["parameters"]["live_edit_id"], binding)
                 method = {"start": self.shader_manager.start, "list": self.shader_manager.list,
                           "poll": self.shader_manager.poll, "stop": self.shader_manager.stop,
-                          "migrate": self.shader_manager.migrate_authorization}[operation]
-                result = method(**value["parameters"])
+                          "migrate": self.shader_manager.migrate_authorization,
+                          "convert-hlsl": _convert_workspace_to_hlsl_now,
+                          "apply": _apply_workspace_candidate_now,
+                          "compiler-contract": lambda workspace_path, source_workspace_id, expected_raw_sha256:
+                              server._shader_workspace_service().compiler_contract(
+                                  workspace_path, source_workspace_id, expected_raw_sha256),
+                          "save-source": _save_workspace_source_now,
+                          "save-and-apply-source": lambda **args: _save_and_apply_editor_source(self.shader_manager, args, binding=binding),
+                          "open-source-document": _open_workspace_source_document_now,
+                          "save-source-document": _save_workspace_source_document_now,
+                          "save-and-apply-source-document": lambda **args: _save_and_apply_editor_source(self.shader_manager, args, binding=binding, include=True),
+                          "restore": _restore_workspace_original}[operation]
+                with _shader_live_start_phase("startAdmission"):
+                    result = method(**value["parameters"])
+                if operation == "start" and isinstance(result, dict) and result.get("joinedExistingSession") is True:
+                    self.shader_manager.require_capture_binding(result["liveEditId"], binding)
                 if operation == "list" and isinstance(result, dict):
                     # Retained historical jobs and a still-live foreign GUI
                     # are not active editor authority for this caller.
                     result["sessions"] = [item for item in result.get("sessions", [])
-                                          if item.get("captureBinding") == binding]
+                                          if capture_bindings_match(item.get("captureBinding"), binding)]
             if not isinstance(result, dict):
                 raise RuntimeError("Shader live-edit operation returned invalid state")
+            if timing is not None:
+                result["startTiming"] = _shader_live_start_timing_result(timing, started)
             return 200, {"schema": SHADER_LIVE_EDIT_OPERATION_SCHEMA, "requestId": value["requestId"],
                          "binding": binding, "result": result}
         except (ValueError, UnicodeError) as exc:
-            return 400, {"error": str(exc)[:2048]}
+            return 400, {"error": str(exc)[:2048], **({"startTiming": _shader_live_start_timing_result(timing, started)} if timing is not None else {})}
         except Exception as exc:
-            return 409, {"error": str(exc)[:2048]}
+            from .shader_workspace.errors import WorkspaceWatchConflictError
+            return 409, {"error": str(exc)[:2048],
+                         "conflict": isinstance(exc, WorkspaceWatchConflictError),
+                         **({"startTiming": _shader_live_start_timing_result(timing, started)} if timing is not None else {})}
+        finally:
+            if timing_token is not None:
+                _SHADER_LIVE_START_TIMING.reset(timing_token)
 
     def shutdown(self) -> None:
         self.restore_jobs.shutdown(wait=True)

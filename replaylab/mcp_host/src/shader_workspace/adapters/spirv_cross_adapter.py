@@ -10,6 +10,7 @@ shell.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -84,14 +85,23 @@ def derive_spirv_cross_arguments(
     if not captured_entry or len(captured_entry) > 512 or "\x00" in captured_entry:
         raise ValueError("captured entry point must be a bounded non-empty string")
     arguments = [str(source)]
-    if mode == "hlsl":
-        if api not in {"d3d11", "d3d12"}:
+    if mode in {"hlsl", "vulkan-hlsl"}:
+        if mode == "hlsl" and api not in {"d3d11", "d3d12"}:
             raise ValueError("HLSL reconstruction requires a physical Direct3D API")
+        if mode == "vulkan-hlsl" and api != "vulkan":
+            raise ValueError("Vulkan HLSL authoring requires physical Vulkan API")
+        if normalised_stage not in _STAGE_TO_PROFILE_PREFIX:
+            raise ValueError("SPIRV-Cross HLSL does not support this stage")
         if not _HLSL_IDENTIFIER_RE.fullmatch(entry):
             raise ValueError("physical HLSL entry point is not a source identifier")
         if not _HLSL_IDENTIFIER_RE.fullmatch(captured_entry):
             raise ValueError("captured HLSL entry point is not a source identifier")
-        profile = str(target_profile).strip().casefold()
+        # This is an authoring dialect, not an invented captured DirectX
+        # profile. SPIRV-Cross needs SM 6 syntax for descriptor register spaces.
+        profile = ("%s_6_0" % _STAGE_TO_PROFILE_PREFIX[normalised_stage]
+                   if mode == "vulkan-hlsl" else str(target_profile).strip().casefold())
+        if mode == "vulkan-hlsl" and str(target_profile).strip():
+            raise ValueError("Vulkan HLSL must not relabel the physical target profile")
         match = _PROFILE_RE.fullmatch(profile)
         if match is None:
             raise ValueError("HLSL reconstruction requires an exact target profile")
@@ -153,6 +163,82 @@ def derive_spirv_cross_arguments(
     return arguments
 
 
+def preserve_vulkan_locations(source: str) -> str:
+    """Keep sparse captured locations through the HLSL compiler's IO mapper.
+
+    SPIRV-Cross encodes physical locations as TEXCOORD/SV_Target indices in its
+    generated interface structs. HLSL compilers can otherwise compact them
+    (for example location 8 becomes 6), even with --hlsl-iomap enabled.
+    Builtins keep their system semantics and are never assigned a location.
+    """
+    def structure(match: re.Match[str]) -> str:
+        body = re.sub(
+            r"(?m)^(\s*)([^;\r\n]+\s*:\s*(?:TEXCOORD|SV_Target)(\d+)\s*;)",
+            lambda field: "%s[[vk::location(%s)]] %s" %
+                (field.group(1), field.group(3), field.group(2)), match.group(2))
+        return match.group(1) + body + match.group(3)
+    return re.sub(r"(\bstruct\s+SPIRV_Cross_(?:Input|Output)\s*\{)(.*?)(\};)",
+                  structure, source, flags=re.S)
+
+
+def preserve_readonly_array_buffers(source: str, reflection: dict) -> str:
+    """Retain a captured scalar/vector storage array's physical element layout.
+
+    SPIRV-Cross lowers storage arrays to ByteAddressBuffer, changing reflection
+    from (for example) float4/stride16 to uint/stride4. Word access helpers retain
+    the original typed array while preserving Load/Load2/Load3/Load4 bit values,
+    including dynamically addressed loads across element boundaries.
+    """
+    types = reflection.get("types", {})
+    element_types = {"float": ("float", 1), "int": ("int", 1), "uint": ("uint", 1)}
+    for prefix, scalar in (("vec", "float"), ("ivec", "int"), ("uvec", "uint")):
+        for size in (2, 4):
+            element_types[prefix + str(size)] = (scalar + str(size), size)
+    for resource in reflection.get("ssbos", []):
+        fields = types.get(resource.get("type"), {}).get("members", [])
+        if (resource.get("readonly") is not True or len(fields) != 1
+                or fields[0].get("offset") != 0 or fields[0].get("array") != [0]
+                or fields[0].get("type") not in element_types):
+            continue
+        typename, width = element_types[fields[0]["type"]]
+        stride = width * 4
+        if fields[0].get("array_stride") != stride:
+            continue
+        binding, space = resource.get("binding"), resource.get("set", 0)
+        if type(binding) is not int or type(space) is not int:
+            continue
+        declaration = re.compile(r"\bByteAddressBuffer\s+(\w+)\s*:\s*register\(t" +
+                                 str(binding) + r"\s*,\s*space" + str(space) + r"\)\s*;")
+        matches = list(declaration.finditer(source))
+        if len(matches) != 1:
+            continue
+        name = matches[0].group(1)
+        helper = "_bread_" + name + "_word"
+        if re.search(r"\b" + re.escape(helper) + r"\b", source):
+            continue
+        # Only the pure word-load interface is supported here. Keep every other
+        # storage shape/method unchanged for the ordinary replay ABI gate.
+        methods = set(re.findall(r"\b" + re.escape(name) + r"\.([A-Za-z_]\w*)\s*\(", source))
+        if not methods <= {"Load", "Load2", "Load3", "Load4"}:
+            continue
+        expression = "asuint(%s[address / %du])" % (name, stride)
+        if width != 1:
+            expression += "[(address %% %du) / 4u]" % stride
+        replacement = ("StructuredBuffer<%s> %s : register(t%d, space%d);\n" %
+                       (typename, name, binding, space))
+        replacement += "uint %s(uint address) { return %s; }\n" % (helper, expression)
+        for method in sorted(methods):
+            count = int(method[4:] or "1")
+            result_type = "uint" + (str(count) if count > 1 else "")
+            parts = ["%s(address + %du)" % (helper, component * 4) for component in range(count)]
+            value = parts[0] if count == 1 else "%s(%s)" % (result_type, ", ".join(parts))
+            replacement += "%s %s_%s(uint address) { return %s; }\n" % (result_type, helper, method, value)
+        source = declaration.sub(lambda _: replacement, source, count=1)
+        source = re.sub(r"\b" + re.escape(name) + r"\.(Load[234]?)\s*\(",
+                        lambda match: helper + "_" + match.group(1) + "(", source)
+    return source
+
+
 def _regular_file(raw: str, label: str) -> Path:
     path = Path(raw)
     if not path.is_absolute():
@@ -171,7 +257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument(
-        "--mode", choices=("hlsl", "vulkan-glsl", "opengl-glsl"), required=True
+        "--mode", choices=("hlsl", "vulkan-hlsl", "vulkan-glsl", "opengl-glsl"), required=True
     )
     parser.add_argument("--entry", required=True)
     # Optional only for backwards compatibility with previously generated
@@ -216,11 +302,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         shell=False,
         env=dict(os.environ),
         check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if completed.returncode != 0:
         return int(completed.returncode or 1)
     if output.is_symlink() or not output.is_file() or output.stat().st_size <= 0:
         raise RuntimeError("SPIRV-Cross did not produce its expected output")
+    if parsed.mode == "vulkan-hlsl":
+        reflected = subprocess.run([str(tool), str(source), "--reflect"], cwd=str(source.parent),
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, shell=False, check=False, timeout=60,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if reflected.returncode or len(reflected.stdout) > 64 * 1024 * 1024:
+            raise RuntimeError("SPIRV-Cross could not reflect the HLSL storage layout")
+        text = preserve_vulkan_locations(output.read_text(encoding="utf-8"))
+        text = preserve_readonly_array_buffers(text, json.loads(reflected.stdout))
+        output.write_text(text, encoding="utf-8", newline="\n")
     return 0
 
 

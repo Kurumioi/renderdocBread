@@ -1196,6 +1196,9 @@
     <ClInclude Include="Windows\AI\AIConversationView.h">
       <Filter>Windows\AI</Filter>
     </ClInclude>
+    <ClInclude Include="Windows\AI\AIGuiHeartbeat.h">
+      <Filter>Windows\AI</Filter>
+    </ClInclude>
     <ClInclude Include="Windows\AI\AIPendingChatView.h">
       <Filter>Windows\AI</Filter>
     </ClInclude>

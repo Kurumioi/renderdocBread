@@ -355,6 +355,9 @@ def _artifact_alias_groups(
         raise project_model.ReplayProjectError(
             "project alias artifact aliases are invalid or oversized"
         )
+    raw_aliases, alias_recovery = project_model._recover_legacy_alias_rows(
+        raw_aliases, source_capture
+    )
     groups: OrderedDict[tuple[int, str, str, str], dict[str, Any]] = OrderedDict()
     for index, alias in enumerate(raw_aliases):
         if (
@@ -413,6 +416,7 @@ def _artifact_alias_groups(
                 "interfaceComplete": compact_shader.get("interfaceComplete") is True,
                 "aliases": [],
                 "sourceAliases": [],
+                "aliasRecovery": alias_recovery,
                 "sourceShader": {
                     **source_full_by_identity[key],
                     "_projectApi": source_capture["api"],
@@ -1064,16 +1068,39 @@ def _ensure_inventory_shader_identity(
         raise project_model.ReplayProjectError(
             "target alias Shader stable key is internally inconsistent"
         )
-    if (
-        source_stable_key != target_stable_key
-        or source_stable_identity != target_stable_identity
-        or target_shader.get("interfaceComplete") is not True
-        or project_model._sha(
-            target_shader.get("interfaceHash"),
-            "target alias Shader interfaceHash",
-        )
-        != source_interface
+    target_interface = project_model._sha(
+        target_shader.get("interfaceHash"), "target alias Shader interfaceHash"
+    )
+    identical = (
+        source_stable_key == target_stable_key
+        and source_stable_identity == target_stable_identity
+        and target_interface == source_interface
+    )
+    if not identical and _physical_enum(source_shader.get("outputTopology", "")) in (
+        "", "unknown"
     ):
+        # Old Bridge versions serialized Topology.Unknown (zero) as an empty
+        # string. Preserve every stored digest, but recognize the other spelling
+        # only by recomputing BOTH complete interfaces from the verified source
+        # catalog. The inventory's hashes alone cannot justify compatibility.
+        from .symbols.scanner import interface_hash
+
+        source_material = dict(source_shader)
+        alternate = dict(source_material)
+        alternate["outputTopology"] = (
+            "unknown" if not _physical_enum(source_material.get("outputTopology", ""))
+            else ""
+        )
+        alternate_identity = dict(source_stable_identity)
+        alternate_identity["abiHash"] = _source_shader_abi_sha256(alternate)
+        identical = (
+            interface_hash(source_material) == source_interface
+            and target_stable_identity == alternate_identity
+            and target_stable_key
+            == project_model._stable_shader_identity_sha256(alternate_identity)
+            and target_interface == interface_hash(alternate)
+        )
+    if target_shader.get("interfaceComplete") is not True or not identical:
         raise project_model.ReplayProjectError(
             "project CBuffer alias Shader stable key or ABI differs from the target"
         )
@@ -1671,6 +1698,11 @@ def _materialize_alias_candidates_snapshot(
         raise project_model.ReplayProjectError(
             "alias candidate contains no materializable display aliases"
         )
+    alias_recovery = {
+        knowledge_id: reconstructed["aliasRecovery"]
+        for knowledge_id, _, _, _, reconstructed in resolved
+        if reconstructed.get("aliasRecovery")
+    }
     alias_table: dict[str, Any] = {
         "schema": project_model.ALIAS_SCHEMA,
         "schemaVersion": project_model.ALIAS_VERSION,
@@ -1701,6 +1733,7 @@ def _materialize_alias_candidates_snapshot(
             "projectId": expected_project_id,
             "targetShader": target_identity,
             "sourceBindings": source_bindings,
+            **({"aliasRecovery": alias_recovery} if alias_recovery else {}),
             "displayAliasesOnly": True,
             "captureLocalReplayStateReused": False,
         },
@@ -1732,6 +1765,7 @@ def _materialize_alias_candidates_snapshot(
         "sha256": project_model._sha256_bytes(json_bytes),
         "displayAliasesOnly": True,
         "applied": False,
+        **({"aliasRecovery": alias_recovery} if alias_recovery else {}),
     }
 
 

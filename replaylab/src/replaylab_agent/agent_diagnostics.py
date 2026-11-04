@@ -10,23 +10,33 @@ import logging
 import logging.handlers
 import os
 import re
-import tempfile
 import traceback
 from pathlib import Path
 
 LOGGER_NAME = "replaylab.agent"
 _MAX_PUBLIC_ERROR_CHARS = 600
+# The keyword and separator are captured apart from the value, so the value can be
+# replaced whole. Keeping a fixed-width prefix of the *whole match* used to leave the
+# head of a short secret in the log -- and for a short enough one, all of it.
 _SECRET_RE = re.compile(
-    r"(?i)(bearer\s+[a-z0-9._~+/=-]{8,}|"
-    r"(?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*[^\s,;]{4,})"
+    r"(?i)(?P<lead>bearer\s+|"
+    r"(?:api[_-]?key|token|secret|password|authorization)[\"']?\s*[=:]\s*)"
+    # `Authorization: Bearer <token>` is one secret, not a keyword followed by the
+    # word "Bearer": without this the scheme was redacted and the token was not.
+    r'''(?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|(?:bearer\s+)?[^\s,;]+)'''
 )
+_URL_USERINFO_RE = re.compile(r"(?i)(?P<scheme>[a-z][a-z0-9+.-]*://)[^/\s?#]*@")
 _handler: logging.Handler | None = None
 _handler_root: Path | None = None
 
 
 def default_log_root() -> Path:
-    local = os.environ.get("LOCALAPPDATA")
-    root = Path(local) if local else Path(tempfile.gettempdir())
+    local = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
+    # Never the shared temp directory: on Linux/macOS that put the task event
+    # stream, the log and the tool settings under a world-readable /tmp that any
+    # local user could pre-plant and that vanished on reboot. XDG data home is the
+    # per-user equivalent of LOCALAPPDATA, which the rest of the product uses.
+    root = Path(local).expanduser() if local else Path.home() / ".local" / "share"
     return root / "ReplayLab" / "logs"
 
 
@@ -94,7 +104,17 @@ def close_logging() -> None:
 
 
 def redact(text: str) -> str:
-    return _SECRET_RE.sub(lambda m: m.group(0).split()[0][:12] + "[REDACTED]", str(text or ""))
+    """Replace the value, keep the keyword, so the line still says what was there."""
+
+    def replace_secret(found: re.Match) -> str:
+        value = found.group("value")
+        quote = value[0] if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0] else ""
+        return found.group("lead") + quote + "[REDACTED]" + quote
+
+    # Keep the endpoint useful for diagnosis, but never publish URL credentials.
+    text = _URL_USERINFO_RE.sub(lambda found: found.group("scheme") + "[REDACTED]@", str(text or ""))
+    return _SECRET_RE.sub(
+        replace_secret, text)
 
 
 def public_error(exc: BaseException, *, limit: int = _MAX_PUBLIC_ERROR_CHARS) -> str:

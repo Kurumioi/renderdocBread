@@ -33,7 +33,7 @@ from src.shader_workspace.leases import (
 from src.shader_workspace.toolchains import route_record, toolchain_document
 from src.shader_workspace.tools import ToolRegistry
 from src.shader_workspace.watcher import ShaderWorkspaceWatchManager
-from src.shader_workspace.workspace import _reconstruction_fidelity_status
+from src.shader_workspace.workspace import _canonical_sha256, _reconstruction_fidelity_status
 
 
 def make_container(chunks: list[tuple[bytes, bytes]]) -> bytes:
@@ -87,6 +87,9 @@ mode = sys.argv[1]
 input_path = Path(sys.argv[2])
 output_path = Path(sys.argv[3])
 if mode in {"dxil-to-spirv", "hlsl-to-spirv"}:
+    if mode == "hlsl-to-spirv" and b"missing_bread_symbol" in input_path.read_bytes():
+        print("error: unknown identifier missing_bread_symbol", file=sys.stderr)
+        raise SystemExit(2)
     name = b"main\0"
     name += b"\0" * (-len(name) % 4)
     name_words = struct.unpack("<%dI" % (len(name) // 4), name)
@@ -464,6 +467,26 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
 
     def service(self) -> ShaderWorkspaceService:
         return ShaderWorkspaceService(self.tools_path, self.routes_path)
+
+    def test_legacy_recovery_plan_is_readable_without_exposing_agent_instructions(self) -> None:
+        workspace = self.root / "workspace-legacy-recovery-plan"
+        service = self.service()
+        created = service.create(self.catalog_path, self.key.catalog_key, workspace)
+        self.assertNotIn("allowedActions", created["recoveryPlan"])
+        manifest_path = workspace / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        recovery = manifest["recoveryPlan"]
+        recovery["allowedActions"] = [{"id": "obsolete-retry-order"}]
+        recovery["aiPolicy"] = {"mayChooseOnlyAllowedActions": True}
+        recovery["planSha256"] = _canonical_sha256({
+            key: value for key, value in recovery.items() if key != "planSha256"
+        })
+        atomic_write_json(manifest_path, manifest)
+
+        status = service.status(workspace)
+        self.assertEqual(status["recoveryPlan"]["planSha256"], recovery["planSha256"])
+        self.assertNotIn("allowedActions", status["recoveryPlan"])
+        self.assertNotIn("aiPolicy", status["recoveryPlan"])
 
     def _catalog_with_entry(self, entry_point: str) -> tuple[Path, ShaderKey]:
         catalog = json.loads(self.catalog_path.read_text(encoding="utf-8"))
@@ -1351,6 +1374,8 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
         )
 
     def test_compile_only_recovery_workspace_promotes_hash_bound_source(self) -> None:
+        from tests.test_shader_abi import reflection_response
+
         routes = json.loads(self.routes_path.read_text(encoding="utf-8"))
         routes["routes"] = [
             route
@@ -1362,6 +1387,8 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
 
         workspace = self.root / "workspace-compile-only"
         service = self.service()
+        interface = self._complete_dxil_interface()
+        self._install_interface(self.catalog_path, interface)
         created = service.create(self.catalog_path, self.key.catalog_key, workspace)
         self.assertEqual("compile-only-recovery", created["recoveryPlan"]["mode"])
         self.assertEqual([], created["routePlan"]["decompile"])
@@ -1391,6 +1418,52 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
         self.assertTrue(status["source"]["compileEligible"])
         self.assertFalse(status["semanticEquivalenceVerified"])
         self.assertFalse(status["applied"])
+
+        reflected = reflection_response(
+            interface, compiled["rawSha256"], Path(compiled["candidateBlobPath"]).stat().st_size
+        )
+        reflected["encoding"] = "dxil"
+        self.assertTrue(service.validate_candidate_reflection(workspace, reflected)["replayAbiValidated"])
+        original_record = json.loads((workspace / "manifest.json").read_bytes())["source"]
+        editable = Path(promoted["sourcePath"])
+
+        edited = source.replace(b"float4(1,", b"float4(0.2,")
+        editable.write_bytes(edited)
+        stale = self.service().status(workspace)
+        self.assertTrue(stale["source"]["compileEligible"])
+        self.assertTrue(stale["source"]["modifiedSinceDecompile"])
+        self.assertEqual(stale["source"]["decompiledSha256"], hashlib.sha256(source).hexdigest())
+        self.assertEqual(stale["abiValidationStatus"], "source-changed")
+        self.assertFalse(stale["representation"]["abiCompatible"])
+        recompiled = self.service().compile(workspace)
+        self.assertEqual(recompiled["sourceSha256"], hashlib.sha256(edited).hexdigest())
+        self.assertEqual(recompiled["revision"], compiled["revision"] + 1)
+        self.assertFalse(recompiled["replayAbiValidated"])
+
+        editable.write_bytes(edited.replace(b"0.2", b"missing_bread_symbol"))
+        with self.assertRaises(ToolExecutionError):
+            self.service().compile(workspace)
+        failed = self.service().status(workspace)
+        self.assertTrue(failed["source"]["compileEligible"])
+        self.assertEqual(failed["revision"], recompiled["revision"])
+        self.assertEqual(failed["abiValidationStatus"], "source-changed")
+
+        corrected = edited.replace(b"0.2", b"0.3")
+        editable.write_bytes(corrected)
+        self.assertTrue(self.service().status(workspace)["source"]["compileEligible"])
+        retried = self.service().compile(workspace)
+        self.assertEqual(retried["revision"], recompiled["revision"] + 1)
+        self.assertEqual(retried["sourceSha256"], hashlib.sha256(corrected).hexdigest())
+        self.assertFalse(retried["replayAbiValidated"])
+        self.assertEqual(candidate.read_bytes(), source)
+        self.assertEqual(
+            json.loads((workspace / "manifest.json").read_bytes())["source"], original_record
+        )
+
+        # Mutable editor contents never replace the original reviewed evidence.
+        candidate.write_bytes(corrected)
+        with self.assertRaisesRegex(ManifestValidationError, "promoted source evidence/hash binding mismatch"):
+            self.service().status(workspace)
 
     def test_compile_only_recovery_promotes_instruction_assembly(self) -> None:
         original_routes = json.loads(
@@ -1457,14 +1530,8 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
         service = self.service()
         created = service.create(self.catalog_path, self.key.catalog_key, workspace)
         self.assertEqual("evidence-only", created["recoveryPlan"]["mode"])
-        decompiler_action = next(
-            action
-            for action in created["recoveryPlan"]["allowedActions"]
-            if action["id"] == "run-registered-decompiler"
-        )
-        self.assertFalse(decompiler_action["requiresCompileRoute"])
-        self.assertFalse(decompiler_action["producesExecutableSource"])
-        self.assertTrue(decompiler_action["producesExplanatoryIr"])
+        self.assertNotIn("allowedActions", created["recoveryPlan"])
+        self.assertNotIn("aiPolicy", created["recoveryPlan"])
         self.assertEqual([], created["routePlan"]["compile"])
         self.assertEqual(
             ["test-dxil-spirv", "test-spirv-hlsl"],
@@ -1830,7 +1897,7 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
         self.assertFalse(stale["source"]["compileEligible"])
         self.assertFalse(stale["replayAbiValidated"])
         with self.assertRaises(ManifestValidationError):
-            self.service().compile(workspace)
+            self.service()._load_manifest(workspace)
 
         refreshed = self._refresh_same_workspace(workspace, created["routePlan"], source)
 
@@ -1890,12 +1957,12 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
         self.assertFalse(stale["source"]["compileEligible"])
         self.assertIsNone(stale["latestCompiled"])
         with self.assertRaises(ManifestValidationError):
-            self.service().compile(workspace)
+            self.service()._load_manifest(workspace)
         self._refresh_same_workspace(workspace, created["routePlan"], source)
         self.assertEqual(self.service().compile(workspace)["revision"], json.loads(before)["revision"] + 1)
         self.assertEqual(source.read_bytes(), preserved)
 
-    def test_in_place_refresh_rejects_stale_cas_and_active_source_lease(self) -> None:
+    def test_in_place_refresh_rejects_stale_cas_but_not_another_participant(self) -> None:
         workspace, created, source, before, unused_decompiler = self._prepare_in_place_refresh("refresh-cas-lease")
         self._upgrade_in_place_compiler()
         values = {"expected_route_plan_sha256": created["routePlan"]["planSha256"],
@@ -1906,11 +1973,13 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
                 with self.assertRaisesRegex(ToolchainRoutingError, "changed before"):
                     self.service().migrate_toolchain(workspace, workspace, in_place=True, **invalid)
                 self.assertEqual((workspace / "manifest.json").read_bytes(), before)
+        # Another participant on the workspace (an editor watching it) is not
+        # an exclusion: the refresh proceeds, guarded by its own CAS checks.
         with WorkspaceSourceTransactionLease(workspace):
-            with self.assertRaises(WorkspaceSourceLeaseError):
-                self.service().migrate_toolchain(workspace, workspace, in_place=True, **values)
-        self.assertEqual((workspace / "manifest.json").read_bytes(), before)
-        self.assertFalse((workspace / "toolchain-history").exists())
+            refreshed = self.service().migrate_toolchain(workspace, workspace, in_place=True, **values)
+        self.assertNotEqual((workspace / "manifest.json").read_bytes(), before)
+        self.assertTrue((workspace / "toolchain-history").exists())
+        self.assertEqual(refreshed["sourceWorkspacePath"], str(workspace.resolve()))
 
     def test_in_place_refresh_rechecks_source_at_commit(self) -> None:
         from src.shader_workspace import toolchain_refresh
@@ -2028,7 +2097,7 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
                 self.assertFalse(stale["source"]["compileEligible"])
                 self.assertIsNone(stale["latestCompiled"])
                 with self.assertRaises(ManifestValidationError):
-                    self.service().compile(source_workspace)
+                    self.service()._load_manifest(source_workspace)
 
                 target = self.root / ("workspace-after-" + change)
                 migrated = self.service().migrate_toolchain(
@@ -2244,6 +2313,206 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
                 expected_source_sha256="0" * 64,
             )
 
+    def test_project_restore_reopens_only_matching_source_with_old_abi_receipt(self) -> None:
+        from tests.test_dxil_access_signature import ambiguous_interface
+        from tests.test_shader_abi import reflection_response
+
+        catalog = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+        interface = ambiguous_interface()
+        interface["encoding"] = "ShaderEncoding.DXIL"
+        catalog["shaders"][0].update(interface)
+        atomic_write_json(self.catalog_path, catalog)
+
+        service = self.service()
+        workspace = self.root / "restore-old-abi-receipt"
+        service.create(self.catalog_path, self.key.catalog_key, workspace)
+        source_path = Path(service.decompile(workspace)["sourcePath"])
+        source_path.write_bytes(source_path.read_bytes() + b"// project source\n")
+        compiled = service.compile(workspace)
+        response = reflection_response(
+            interface,
+            compiled["rawSha256"],
+            Path(compiled["candidateBlobPath"]).stat().st_size,
+        )
+        response["encoding"] = "dxil"
+        validated = service.validate_candidate_reflection(workspace, response)
+        self.assertTrue(validated["replayAbiValidated"])
+        # One unavailable DXIL evidence probe must be retried; persistent
+        # absence still denies the old compatible receipt.
+        real_access = service._dxil_access_evidence
+        access_calls = 0
+
+        def transient_access(*args):
+            nonlocal access_calls
+            access_calls += 1
+            return (None, None) if access_calls == 1 else real_access(*args)
+
+        with mock.patch.object(service, "_dxil_access_evidence", side_effect=transient_access):
+            self.assertTrue(service.status(workspace)["latestCompiled"]["replayAbiValidated"])
+        self.assertGreaterEqual(access_calls, 2)
+        with mock.patch.object(service, "_dxil_access_evidence", return_value=(None, None)) as missing:
+            with self.assertRaisesRegex(
+                ManifestValidationError,
+                "DXIL access evidence unavailable after bounded recheck",
+            ):
+                service.status(workspace)
+            self.assertGreaterEqual(missing.call_count, 2)
+        report_path = Path(validated["abiReportPath"])
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["comparison"]["compatible"] = False
+        atomic_write_json(report_path, report)
+        manifest_path = workspace / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["latestCompiled"]["abiGate"]["reportSha256"] = hashlib.sha256(
+            report_path.read_bytes()
+        ).hexdigest()
+        atomic_write_json(manifest_path, manifest)
+        old_manifest = manifest_path.read_bytes()
+        old_report = report_path.read_bytes()
+        old_source = source_path.read_bytes()
+        source_sha = hashlib.sha256(old_source).hexdigest()
+        key = manifest["shader"]
+        capture_id = manifest["capture"]["captureId"]
+
+        with self.assertRaisesRegex(
+            ManifestValidationError,
+            "candidate ABI report does not prove exact compatibility",
+        ):
+            service.status(workspace)
+        with self.assertRaisesRegex(
+            ManifestValidationError, "source target or ABI state is invalid"
+        ):
+            service.reopen_candidate_for_project_restore(
+                workspace,
+                expected_capture_id=capture_id,
+                expected_resource_id=key["resourceId"],
+                expected_stage=key["stage"],
+                expected_entry_point=key["entryPoint"],
+                expected_original_raw_sha256=key["rawSha256"],
+                expected_source_sha256="not-a-project-source-sha",
+            )
+        self.assertEqual(manifest_path.read_bytes(), old_manifest)
+
+        self.assertTrue(
+            service.reopen_candidate_for_project_restore(
+                workspace,
+                expected_capture_id=capture_id,
+                expected_resource_id=key["resourceId"],
+                expected_stage=key["stage"],
+                expected_entry_point=key["entryPoint"],
+                expected_original_raw_sha256=key["rawSha256"],
+                expected_source_sha256=source_sha,
+            )
+        )
+        pending = service.status(workspace)
+        self.assertEqual(pending["source"]["currentSha256"], source_sha)
+        self.assertEqual(pending["latestCompiled"]["abiGate"]["status"], "pending-replay-reflection")
+        self.assertFalse(pending["latestCompiled"]["replayAbiValidated"])
+        self.assertEqual(source_path.read_bytes(), old_source)
+        self.assertEqual(report_path.read_bytes(), old_report)
+        archives = list((workspace / "candidate-evidence-archives").iterdir())
+        self.assertEqual(len(archives), 1)
+        self.assertEqual((archives[0] / "manifest.json").read_bytes(), old_manifest)
+        self.assertEqual((archives[0] / "abi-report.json").read_bytes(), old_report)
+        self.assertFalse(
+            service.reopen_candidate_for_project_restore(
+                workspace,
+                expected_capture_id=capture_id,
+                expected_resource_id=key["resourceId"],
+                expected_stage=key["stage"],
+                expected_entry_point=key["entryPoint"],
+                expected_original_raw_sha256=key["rawSha256"],
+                expected_source_sha256=source_sha,
+            )
+        )
+        self.assertTrue(
+            service.validate_candidate_reflection(workspace, response)["replayAbiValidated"]
+        )
+
+    def test_project_restore_reopens_stale_import_candidate_before_new_source_compile(self) -> None:
+        from tests.test_shader_abi import reflection_response
+
+        interface = self._complete_dxil_interface()
+        self._install_interface(self.catalog_path, interface)
+        service = self.service()
+        workspace = self.root / "restore-project-import-old-candidate"
+        service.create(self.catalog_path, self.key.catalog_key, workspace)
+        before = service.status(workspace)
+        bundle = {
+            "schema": "replaylab-verified-project-shader-source/v1",
+            "projectId": "a" * 32,
+            "projectPath": str(self.root / "project"),
+            "knowledgeId": "b" * 32,
+            "sourceText": "float4 main() : SV_Target { return 1; }\n",
+            "sourceEntryPoint": "main",
+            "originalRawSha256": before["baseline"]["rawSha256"],
+            "baselineAbiSha256": before["baseline"]["abiSha256"],
+            "stage": before["stage"],
+            "entryPoint": before["entryPoint"],
+            "targetProfile": before["targetProfile"],
+            "originWorkspaceId": "c" * 32,
+            "originWorkspacePath": str(self.root / "origin"),
+            "analysisSha256": "",
+            "applied": False,
+            "requiresCompile": True,
+            "requiresLiveAbiRevalidation": True,
+            "semanticEquivalenceVerified": False,
+        }
+        bundle["sourceSha256"] = hashlib.sha256(bundle["sourceText"].encode()).hexdigest()
+        with mock.patch(
+            "src.projects.ReplayProjectService.prepare_workspace_source",
+            return_value=bundle,
+        ):
+            service.import_project_source(workspace, bundle)
+        compiled = service.compile(workspace)
+        response = reflection_response(
+            interface,
+            compiled["rawSha256"],
+            Path(compiled["candidateBlobPath"]).stat().st_size,
+        )
+        response["encoding"] = "dxil"
+        validated = service.validate_candidate_reflection(workspace, response)
+        self.assertTrue(validated["replayAbiValidated"])
+        source_path = workspace / "source" / "shader.hlsl"
+        desired_source = b"float4 main() : SV_Target { return 0; }\n"
+        source_path.write_bytes(desired_source)
+        desired_sha = hashlib.sha256(desired_source).hexdigest()
+        self.assertNotEqual(compiled["sourceSha256"], desired_sha)
+        report_path = Path(validated["abiReportPath"])
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["comparison"]["compatible"] = False
+        atomic_write_json(report_path, report)
+        manifest_path = workspace / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["latestCompiled"]["abiGate"]["reportSha256"] = hashlib.sha256(
+            report_path.read_bytes()
+        ).hexdigest()
+        atomic_write_json(manifest_path, manifest)
+        old_report = report_path.read_bytes()
+        key = manifest["shader"]
+
+        self.assertTrue(
+            service.reopen_candidate_for_project_restore(
+                workspace,
+                expected_capture_id=manifest["capture"]["captureId"],
+                expected_resource_id=key["resourceId"],
+                expected_stage=key["stage"],
+                expected_entry_point=key["entryPoint"],
+                expected_original_raw_sha256=key["rawSha256"],
+                expected_source_sha256=desired_sha,
+            )
+        )
+        pending = service.status(workspace)
+        self.assertEqual(pending["source"]["origin"], "verified-project-source")
+        self.assertEqual(pending["source"]["currentSha256"], desired_sha)
+        self.assertEqual(pending["latestCompiled"]["sourceSha256"], compiled["sourceSha256"])
+        self.assertEqual(pending["latestCompiled"]["abiGate"]["status"], "pending-replay-reflection")
+        self.assertFalse(pending["latestCompiled"]["replayAbiValidated"])
+        self.assertEqual(report_path.read_bytes(), old_report)
+        replacement = service.compile(workspace)
+        self.assertEqual(replacement["sourceSha256"], desired_sha)
+        self.assertTrue(replacement["requiresReplayAbiValidation"])
+
     def test_toolchain_migration_invalidates_incomplete_old_abi_report(self) -> None:
         # Import locally so unittest discovery of this module does not collect
         # the support module's TestCase classes a second time.
@@ -2338,7 +2607,7 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
         self.assertFalse(summary["imported"])
         self.assertFalse(status["semanticEquivalenceVerified"])
 
-    def test_toolchain_migration_respects_shared_source_lease(self) -> None:
+    def test_toolchain_migration_proceeds_alongside_another_participant(self) -> None:
         source_workspace = self.root / "workspace-migration-leased"
         created = self.service().create(
             self.catalog_path, self.key.catalog_key, source_workspace
@@ -2356,94 +2625,21 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
         lease = WorkspaceSourceTransactionLease(source_workspace)
         lease.acquire()
         try:
-            with self.assertRaisesRegex(
-                WorkspaceSourceLeaseError, "source transaction lease"
-            ):
-                self.service().migrate_toolchain(
-                    source_workspace,
-                    target,
-                    expected_route_plan_sha256=created["routePlan"]["planSha256"],
-                    expected_source_sha256=hashlib.sha256(source_bytes).hexdigest(),
-                )
+            migrated = self.service().migrate_toolchain(
+                source_workspace,
+                target,
+                expected_route_plan_sha256=created["routePlan"]["planSha256"],
+                expected_source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+            )
         finally:
             self.assertTrue(lease.release())
-        self.assertFalse(target.exists())
+        self.assertEqual(migrated["sourceWorkspacePath"], str(source_workspace.resolve()))
+        self.assertEqual((target / "source" / "shader.hlsl").read_bytes(), source_bytes)
         self.assertEqual(source_path.read_bytes(), source_bytes)
 
-    def test_toolchain_migration_host_recovery_rejects_unsafe_leases(self) -> None:
-        source_workspace = self.root / "workspace-migration-unsafe-leases"
-        created = self.service().create(
-            self.catalog_path, self.key.catalog_key, source_workspace
-        )
-        decompiled = self.service().decompile(source_workspace)
-        source_path = Path(decompiled["sourcePath"])
-        source_bytes = source_path.read_bytes()
-        source_hash = hashlib.sha256(source_bytes).hexdigest()
+    def test_toolchain_migration_retires_a_stale_exclusive_lock(self) -> None:
+        """A lock file left by an older build's crash is archived, never obeyed."""
 
-        upgraded_catalog = json.loads(self.routes_path.read_text(encoding="utf-8"))
-        for route in upgraded_catalog["routes"]:
-            route["implementation"] = route["implementation"] + " upgraded"
-        atomic_write_json(self.routes_path, upgraded_catalog)
-
-        current_owner = "2" * 32
-        lease_path = source_workspace / WorkspaceSourceTransactionLease.FILE_NAME
-
-        def assert_blocked(label: str, *, host_instance_id: str | None) -> None:
-            target = self.root / ("workspace-migration-blocked-" + label)
-            lease_before = lease_path.read_bytes()
-            with self.assertRaisesRegex(
-                WorkspaceSourceLeaseError, "source transaction lease"
-            ):
-                self.service().migrate_toolchain(
-                    source_workspace,
-                    target,
-                    expected_route_plan_sha256=created["routePlan"]["planSha256"],
-                    expected_source_sha256=source_hash,
-                    host_instance_id=host_instance_id,
-                )
-            self.assertEqual(lease_path.read_bytes(), lease_before)
-            self.assertFalse(target.exists())
-
-        different_host = WorkspaceSourceTransactionLease(
-            source_workspace, owner_instance_id="1" * 32
-        )
-        different_host.acquire()
-        assert_blocked("no-host-instance", host_instance_id=None)
-        self.assertTrue(different_host.release())
-
-        same_host = WorkspaceSourceTransactionLease(
-            source_workspace, owner_instance_id=current_owner
-        )
-        same_host.acquire()
-        assert_blocked("same-host-instance", host_instance_id=current_owner)
-        self.assertTrue(same_host.release())
-
-        legacy = WorkspaceSourceTransactionLease(source_workspace)
-        legacy.acquire()
-        assert_blocked("legacy-token", host_instance_id=current_owner)
-        self.assertTrue(legacy.release())
-
-        lease_path.write_bytes(b"{malformed-json\n")
-        assert_blocked("malformed-lock", host_instance_id=current_owner)
-        lease_path.unlink()
-
-        for residue_name, label in (
-            (SOURCE_TRANSACTION_JOURNAL_FILE, "transaction-journal"),
-            (SOURCE_TRANSACTION_BACKUP_FILE, "transaction-backup"),
-        ):
-            previous = WorkspaceSourceTransactionLease(
-                source_workspace, owner_instance_id="1" * 32
-            )
-            previous.acquire()
-            residue = source_workspace / residue_name
-            residue.write_bytes(b"transaction residue")
-            assert_blocked(label, host_instance_id=current_owner)
-            residue.unlink()
-            self.assertTrue(previous.release())
-
-        self.assertEqual(source_path.read_bytes(), source_bytes)
-
-    def test_toolchain_migration_explicitly_recovers_legacy_lease(self) -> None:
         source_workspace = self.root / "workspace-migration-legacy-lease"
         created = self.service().create(
             self.catalog_path, self.key.catalog_key, source_workspace
@@ -2457,12 +2653,8 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
             route["implementation"] = route["implementation"] + " upgraded"
         atomic_write_json(self.routes_path, upgraded_catalog)
 
-        legacy = WorkspaceSourceTransactionLease(source_workspace)
-        legacy.acquire()
-        legacy_payload = (
-            source_workspace / WorkspaceSourceTransactionLease.FILE_NAME
-        ).read_bytes()
-        legacy_token = legacy_payload.decode("ascii").strip()
+        stale = source_workspace / WorkspaceSourceTransactionLease.FILE_NAME
+        stale.write_text("0123456789abcdef0123456789abcdef\n", encoding="ascii")
         target = self.root / "workspace-migration-after-legacy-lease"
         migrated = self.service().migrate_toolchain(
             source_workspace,
@@ -2475,17 +2667,106 @@ class ShaderWorkspaceRouteChainTests(unittest.TestCase):
 
         self.assertEqual(migrated["sourceWorkspacePath"], str(source_workspace.resolve()))
         self.assertEqual((target / "source" / "shader.hlsl").read_bytes(), source_bytes)
-        self.assertEqual(
-            (
-                source_workspace
-                / "watch"
-                / ("orphaned-legacy-lease-%s.lock" % legacy_token)
-            ).read_bytes(),
-            legacy_payload,
-        )
-        self.assertFalse(
-            (source_workspace / WorkspaceSourceTransactionLease.FILE_NAME).exists()
-        )
+        self.assertFalse(stale.exists())
+        retired = list((source_workspace / "watch").glob("retired-exclusive-lease-*.lock"))
+        self.assertEqual(len(retired), 1)
+        self.assertEqual(retired[0].read_text(encoding="ascii"),
+                         "0123456789abcdef0123456789abcdef\n")
+
+
+    def test_interactive_compile_ignores_removed_historical_decompiler(self):
+        root, created, source, before, decompiler = self._prepare_in_place_refresh(
+            "interactive-old-decompiler", split_decompiler=True)
+        tools = json.loads(self.tools_path.read_bytes())
+        for key in ("dxil-spv", "spv-hlsl"):
+            tools["tools"].pop(key)
+        self._refresh_test_registry(tools)
+        decompiler.unlink()
+        service = self.service()
+        recipe = service.compiler_contract(root, created["workspaceId"], json.loads(before)["baseline"]["rawSha256"])
+        self.assertEqual(recipe["backend"], "bound-route")
+        self.assertEqual((root / "manifest.json").read_bytes(), before)
+        result = service.compile_for_live_edit(root)
+        self.assertTrue(result["manualFastCompile"])
+        self.assertFalse(result["replayAbiValidated"])
+        self.assertTrue(service.compile_for_live_edit(root)["compilationCacheHit"])
+
+    def test_interactive_compiler_upgrade_repairs_once_preserving_source_and_history(self):
+        root, created, source, before, unused = self._prepare_in_place_refresh("interactive-upgrade")
+        original_source = source.read_bytes()
+        old = json.loads(before)
+        previous_blob = root / old["latestCompiled"]["blobPath"]
+        previous_bytes = previous_blob.read_bytes()
+        self._upgrade_in_place_compiler()
+        service = self.service()
+        with self.assertRaisesRegex(ManifestValidationError, "identity changed"):
+            service.compiler_contract(root, "0" * 32, old["baseline"]["rawSha256"])
+        self.assertEqual((root / "manifest.json").read_bytes(), before)
+        service.compiler_contract(root, old["workspaceId"], old["baseline"]["rawSha256"])
+        repaired = json.loads((root / "manifest.json").read_bytes())
+        self.assertIsNone(repaired["latestCompiled"])
+        self.assertEqual(repaired["revision"], old["revision"])
+        self.assertEqual(source.read_bytes(), original_source)
+        self.assertEqual(previous_blob.read_bytes(), previous_bytes)
+        self.assertEqual(len(list((root / "toolchain-history").iterdir())), 1)
+        service.compiler_contract(root, old["workspaceId"], old["baseline"]["rawSha256"])
+        self.assertEqual(len(list((root / "toolchain-history").iterdir())), 1)
+        self.assertTrue(service.compile_for_live_edit(root)["manualFastCompile"])
+
+    def test_previous_candidate_damage_does_not_block_preview_or_fresh_manual_compile(self):
+        root, created, source, before, unused = self._prepare_in_place_refresh("interactive-bad-candidate")
+        old = json.loads(before)
+        (root / old["latestCompiled"]["blobPath"]).unlink()
+        service = self.service()
+        recipe = service.compiler_contract(root, old["workspaceId"], old["baseline"]["rawSha256"])
+        self.assertEqual(recipe["stage"], old["stage"])
+        self.assertEqual((root / "manifest.json").read_bytes(), before)
+        compiled = service.compile_for_live_edit(root)
+        self.assertGreater(compiled["revision"], old["revision"])
+        self.assertFalse(compiled["replayAbiValidated"])
+
+    def test_removed_compiler_route_uses_an_installed_compatible_route_once(self):
+        root, created, source, before, unused = self._prepare_in_place_refresh("interactive-removed-route")
+        original = source.read_bytes()
+        routes = json.loads(self.routes_path.read_bytes())
+        for route in routes["routes"]:
+            if route["routeId"] == "test-hlsl-spirv":
+                route["routeId"] = "test-hlsl-spirv-upgraded"
+        atomic_write_json(self.routes_path, routes)
+        service = self.service()
+        old = json.loads(before)
+        recipe = service.compiler_contract(root, old["workspaceId"], old["baseline"]["rawSha256"])
+        self.assertEqual(recipe["stage"], old["stage"])
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(len(list((root / "toolchain-history").iterdir())), 1)
+        self.assertTrue(service.compile_for_live_edit(root)["manualFastCompile"])
+
+    def test_baseline_reflection_enrichment_does_not_invalidate_compile_history(self):
+        from tests.test_shader_abi import reflection_response
+        root = self.root / "refresh-then-reflection-recovery"
+        created = self.service().create(self.catalog_path, self.key.catalog_key, root)
+        self.service().decompile(root)
+        before = (root / "source/shader.hlsl").read_bytes()
+        self._upgrade_in_place_compiler()
+        service = self.service()
+        service.compiler_contract(root, created["workspaceId"], self.key.raw_sha256)
+        status = service.status(root)
+        self.assertEqual(status["baseline"]["abiStatus"], "unavailable")
+        response = reflection_response(self._complete_dxil_interface(), self.key.raw_sha256, len(self.blob))
+        response.update(captureId=status["capture"]["captureId"], encoding="dxil")
+        service.recover_baseline_reflection(root, service.baseline_reflection_request(root), response)
+        ready = service.status(root)
+        self.assertEqual(ready["baseline"]["abiStatus"], "captured-reflection-complete")
+        service.compiler_contract(root, created["workspaceId"], self.key.raw_sha256)
+        self.assertEqual((root / "source/shader.hlsl").read_bytes(), before)
+        self.assertTrue(service.compile_for_live_edit(root)["manualFastCompile"])
+        manifest = json.loads((root / "manifest.json").read_bytes())
+        manifest["baselineInterfaceRecovery"]["baselineRawSha256"] = "0" * 64
+        atomic_write_json(root / "manifest.json", manifest)
+        with self.assertRaises(ManifestValidationError):
+            service.status(root)
+
+
 
 
 DXBC_ASSEMBLY_ROUTE_TOOL = r'''from pathlib import Path
@@ -2509,6 +2790,7 @@ elif mode == "assemble":
 else:
     raise SystemExit(9)
 '''
+
 
 
 class DxbcAssemblyWorkspaceTests(unittest.TestCase):
@@ -2720,6 +3002,8 @@ class DxbcAssemblyWorkspaceTests(unittest.TestCase):
             self.assertEqual(1, snapshot["latestCandidateRevision"])
         finally:
             manager.shutdown()
+
+
 
 
 if __name__ == "__main__":

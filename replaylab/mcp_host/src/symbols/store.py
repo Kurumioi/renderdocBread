@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 
 SCHEMA_VERSION = 3
@@ -500,7 +500,112 @@ class SymbolStore:
                         _json(shader),
                     ),
                 )
+            # Aliases of Shaders that left this catalog are orphans; the rest stay
+            # (a rescan must not lose names the user approved under this identity),
+            # and Shaders that have none yet inherit by their bytes.
+            keys = {(int(shader.get("shaderResourceId", 0)), str(shader.get("stage", "") or ""),
+                     str(shader.get("entryPoint", "") or ""))
+                    for shader in catalog.get("shaders", [])}
+            for row in db.execute(
+                    "SELECT DISTINCT shader_resource_id, stage, entry_point FROM aliases"
+                    " WHERE capture_id=?", (capture_id,)).fetchall():
+                key = (int(row["shader_resource_id"]), str(row["stage"]), str(row["entry_point"]))
+                if key not in keys:
+                    db.execute(
+                        "DELETE FROM aliases WHERE capture_id=? AND shader_resource_id=?"
+                        " AND stage=? AND entry_point=?", (capture_id,) + key)
+            inherited = self._inherit_aliases(db, capture_id, catalog.get("shaders", []))
+        if inherited:
+            self._log_inheritance(capture_id, inherited)
         return capture_id
+
+    def _inherit_aliases(self, db: Any, capture_id: str, shaders: Iterable[dict]) -> int:
+        """Carry aliases forward to a new capture identity by the Shader's own bytes.
+
+        The capture identity hashes RenderDoc's ResourceIds, which are reassigned on
+        every open, so reopening the very same .rdc produces a new ``capture_id`` --
+        and every CBuffer name and asset match the user approved was left under the
+        old one, unreachable. Nothing read them back. The Shader itself is the same
+        bytes at the same stage and entry point, so that is the key that survives:
+        for each Shader in the new catalog, aliases recorded for the same
+        ``(stage, entry_point, raw_sha256)`` under any earlier capture are copied to
+        the new identity and the new ResourceId, with their provenance saying where
+        they came from. Verified stays verified; the user already said yes. A Shader
+        that already has aliases under this identity keeps them and inherits nothing.
+        """
+
+        copied = 0
+        for shader in shaders:
+            raw = str(shader.get("rawSha256", "") or "").lower()
+            stage = str(shader.get("stage", "") or "")
+            entry_point = str(shader.get("entryPoint", "") or "")
+            new_resource_id = int(shader.get("shaderResourceId", 0) or 0)
+            if len(raw) != 64 or not stage:
+                continue
+            own = db.execute(
+                """SELECT 1 FROM aliases
+                   WHERE capture_id=? AND shader_resource_id=? AND stage=? AND entry_point=?
+                   LIMIT 1""",
+                (capture_id, new_resource_id, stage, entry_point),
+            ).fetchone()
+            if own is not None:
+                # This identity already has names for the Shader; they are newer
+                # than anything another capture could lend it.
+                continue
+            donors = db.execute(
+                """SELECT capture_id, shader_resource_id FROM capture_shaders
+                   WHERE raw_sha256=? AND stage=? AND entry_point=? AND capture_id<>?
+                   ORDER BY rowid DESC LIMIT 8""",
+                (raw, stage, entry_point, capture_id),
+            ).fetchall()
+            for donor in donors:
+                rows = db.execute(
+                    """SELECT * FROM aliases
+                       WHERE capture_id=? AND shader_resource_id=? AND stage=? AND entry_point=?""",
+                    (donor["capture_id"], donor["shader_resource_id"], stage, entry_point),
+                ).fetchall()
+                if not rows:
+                    continue
+                for row in rows:
+                    item = dict(row)
+                    metadata = json.loads(item.get("metadata_json") or "{}")
+                    metadata.setdefault("inheritedFrom", {
+                        "captureId": donor["capture_id"],
+                        "shaderResourceId": donor["shader_resource_id"],
+                    })
+                    # The export path accepts a row only when its metadata names the
+                    # capture it is read under; rebind, the origin stays in inheritedFrom.
+                    metadata["captureId"] = capture_id
+                    metadata["shaderResourceId"] = new_resource_id
+                    cursor = db.execute(
+                        """INSERT OR IGNORE INTO aliases(
+                               capture_id, shader_resource_id, stage, entry_point, binding_kind,
+                               register_space, bind_number, byte_offset, canonical_path,
+                               alias, original_name, provenance, confidence, verified,
+                               metadata_json)
+                           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            capture_id, new_resource_id, stage, entry_point,
+                            item["binding_kind"], item["register_space"], item["bind_number"],
+                            item["byte_offset"], item["canonical_path"], item["alias"],
+                            item["original_name"], item["provenance"], item["confidence"],
+                            item["verified"], _json(metadata),
+                        ),
+                    )
+                    copied += int(cursor.rowcount or 0)
+                # The most recent donor that had anything is the one to inherit from;
+                # older captures' names would only disagree with it.
+                break
+        return copied
+
+    def _log_inheritance(self, capture_id: str, copied: int) -> None:
+        try:
+            import logging
+
+            logging.getLogger("replaylab.symbols").info(
+                "capture %s inherited %d alias row(s) by Shader bytes", capture_id[:12], copied)
+        except Exception:  # noqa: BLE001 - logging must never fail a save
+            pass
 
     def get_capture_catalog(self, capture_id: str) -> dict | None:
         with self.connection() as db:

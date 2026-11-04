@@ -27,11 +27,81 @@ import struct
 import sys
 import threading
 import traceback
-import tempfile
 import time
 import uuid
 
+try:
+    from . import dxbc_cbuffer_layout as _dxbc_cbuffer_layout
+except (ImportError, ValueError):
+    _dxbc_layout_spec = importlib.util.spec_from_file_location(
+        "_bread_dxbc_cbuffer_layout", os.path.join(os.path.dirname(__file__), "dxbc_cbuffer_layout.py"))
+    _dxbc_cbuffer_layout = importlib.util.module_from_spec(_dxbc_layout_spec)
+    _dxbc_layout_spec.loader.exec_module(_dxbc_cbuffer_layout)
+
+try:
+    from . import bridge_diagnostics as _bridge_diagnostics
+except ImportError:
+    _bridge_diagnostics = None
+
 import renderdoc as rd
+
+try:
+    from . import shader_apply_receipts as _shader_restore_protocol
+except (ImportError, ValueError):
+    _shader_restore_spec = importlib.util.spec_from_file_location(
+        "_replaylab_shader_restore_protocol",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "shader_apply_receipts.py"))
+    if _shader_restore_spec is None or _shader_restore_spec.loader is None:
+        raise ImportError("Unable to load the Shader restore proof protocol")
+    _shader_restore_protocol = importlib.util.module_from_spec(_shader_restore_spec)
+    _shader_restore_spec.loader.exec_module(_shader_restore_protocol)
+
+_shader_restore_receipt_store = _shader_restore_protocol.ReceiptStore()
+_shader_restore_capture_digests = _shader_restore_protocol.CaptureDigestCache()
+_shader_restore_policy_paths = [__file__, _shader_restore_protocol.__file__,
+    os.path.join(os.path.dirname(__file__), "dxil_access_signature.py")]
+_shader_restore_native_paths = []
+for _shader_restore_binary in (
+        getattr(rd, "__file__", ""),
+        os.path.join(os.path.dirname(sys.executable), "renderdoc.dll")):
+    if _shader_restore_binary and os.path.isfile(_shader_restore_binary):
+        _shader_restore_policy_paths.append(_shader_restore_binary)
+        _shader_restore_native_paths.append(_shader_restore_binary)
+_shader_restore_package_provenance_sha256 = _shader_restore_protocol.validation_policy_sha256(
+    _shader_restore_policy_paths)
+_shader_restore_algorithm_sources = [
+        ("bridge-physical-shader-validation", __file__, (
+            "_physical_shader_interfaces_compatible", "_dxil_ambiguous_interface_compatible",
+            "_physical_shader_interface_sha256", "_validate_live_shader_event",
+            "_read_shader_candidate", "_shader_encoding_token", "_exact_shader_entry",
+            "_shader_api_token", "_build_target_shader", "_replace_shared_shader_resource",
+            "_verified_shader_restore_request",
+            "_apply_shader_candidate_shared_resource._do",
+        ), (
+            "_set_frame_event", "_begin_replay_atomic_transaction",
+            "_require_shader_target_build_capacity", "_register_orphan_shader_target",
+            "_current_capture_token", "_request_capture_loaded", "_invoke_on_ui_sync",
+        )),
+        ("captured-dxil-layout-access", os.path.join(os.path.dirname(__file__), "dxil_access_signature.py"), None, ()),
+        ("captured-dxbc-declarations", os.path.join(os.path.dirname(__file__), "dxbc_cbuffer_layout.py"), None, ()),
+        ("signed-shader-pair-verification", _shader_restore_protocol.__file__,
+         ("ReceiptStore", "restore_dxil_evidence", "capture_dxil_evidence", "_stream_sha256",
+          "physical_validation_binding_sha256"), ()),
+    ]
+_shader_restore_physical_validation_binding = None
+_shader_restore_physical_binding_error = ""
+try:
+    _shader_restore_physical_validation_binding = _shader_restore_protocol.physical_validation_binding(
+        _shader_restore_algorithm_sources, _shader_restore_native_paths)
+    _shader_restore_policy_sha256 = _shader_restore_protocol.physical_validation_binding_sha256(
+        _shader_restore_physical_validation_binding)
+except Exception as _shader_restore_binding_failure:
+    # Optional cross-version reuse must not disable the Bridge. A genuinely
+    # unrecognized algorithm shape falls back to the conservative complete
+    # code/native policy, including the formerly omitted DXIL parser.
+    _shader_restore_physical_binding_error = str(_shader_restore_binding_failure)[:512]
+    _shader_restore_physical_validation_binding = None
+    _shader_restore_policy_sha256 = _shader_restore_package_provenance_sha256
 
 try:
     from . import resource_export as _resource_export_protocol
@@ -44,7 +114,7 @@ except (ImportError, ValueError):
             "resource_export.py"))
     if (_resource_export_spec is None or
             _resource_export_spec.loader is None):
-        raise ImportError("Unable to load the ReplayLab resource export protocol")
+        raise ImportError("Unable to load the Bread resource export protocol")
     _resource_export_protocol = importlib.util.module_from_spec(
         _resource_export_spec)
     _resource_export_spec.loader.exec_module(_resource_export_protocol)
@@ -59,7 +129,7 @@ except (ImportError, ValueError):
         "_renderdoc_ultra_ai_context_protocol",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_context.py"))
     if _ai_context_spec is None or _ai_context_spec.loader is None:
-        raise ImportError("Unable to load the RenderDoc AI context protocol")
+        raise ImportError("Unable to load the Bread AI context protocol")
     _ai_context_protocol = importlib.util.module_from_spec(_ai_context_spec)
     _ai_context_spec.loader.exec_module(_ai_context_protocol)
 
@@ -72,7 +142,7 @@ except (ImportError, ValueError):
         "_replaylab_material_panel_protocol",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "material_panel.py"))
     if _material_panel_spec is None or _material_panel_spec.loader is None:
-        raise ImportError("Unable to load the ReplayLab material-panel protocol")
+        raise ImportError("Unable to load the Bread material-panel protocol")
     _material_panel_protocol = importlib.util.module_from_spec(_material_panel_spec)
     _material_panel_spec.loader.exec_module(_material_panel_protocol)
 
@@ -83,7 +153,7 @@ except (ImportError, ValueError):
         "_replaylab_shared_cbuffer_protocol",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "shared_cbuffer.py"))
     if _shared_cbuffer_spec is None or _shared_cbuffer_spec.loader is None:
-        raise ImportError("Unable to load the ReplayLab shared CBuffer protocol")
+        raise ImportError("Unable to load the Bread shared CBuffer protocol")
     _shared_cbuffer_protocol = importlib.util.module_from_spec(_shared_cbuffer_spec)
     _shared_cbuffer_spec.loader.exec_module(_shared_cbuffer_protocol)
 
@@ -94,7 +164,7 @@ except (ImportError, ValueError):
         "_replaylab_material_panel_ui",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "project_material_panel.py"))
     if _material_ui_spec is None or _material_ui_spec.loader is None:
-        raise ImportError("Unable to load the ReplayLab material panel UI")
+        raise ImportError("Unable to load the Bread material panel UI")
     _material_panel_ui_protocol = importlib.util.module_from_spec(_material_ui_spec)
     _material_ui_spec.loader.exec_module(_material_panel_ui_protocol)
 
@@ -107,7 +177,7 @@ except (ImportError, ValueError):
             os.path.dirname(os.path.abspath(__file__)),
             "project_pass_panel.py"))
     if _pass_panel_spec is None or _pass_panel_spec.loader is None:
-        raise ImportError("Unable to load the ReplayLab pass-panel protocol")
+        raise ImportError("Unable to load the Bread pass-panel protocol")
     _pass_panel_protocol = importlib.util.module_from_spec(_pass_panel_spec)
     _pass_panel_spec.loader.exec_module(_pass_panel_protocol)
 
@@ -120,7 +190,7 @@ except (ImportError, ValueError):
         # i18n-ignore: fixed first-party Python module filename used by the import loader
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "project_launcher.py"))
     if _project_launcher_spec is None or _project_launcher_spec.loader is None:
-        raise ImportError("Unable to load the ReplayLab project launcher protocol")
+        raise ImportError("Unable to load the Bread project launcher protocol")
     _project_launcher_protocol = importlib.util.module_from_spec(_project_launcher_spec)
     _project_launcher_spec.loader.exec_module(_project_launcher_protocol)
 
@@ -131,13 +201,15 @@ try:
         from . import project_restore_client as _project_restore_client_protocol
     else:
         _project_restore_client_spec = importlib.util.spec_from_file_location(
+            # i18n-ignore: private Python import module identifier, never displayed as UI text.
             "_replaylab_project_restore_client_protocol",
             os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
+                # i18n-ignore: canonical Python protocol module filename, not a display label.
                 "project_restore_client.py"))
         if (_project_restore_client_spec is None or
                 _project_restore_client_spec.loader is None):
-            raise ImportError("Unable to load the ReplayLab project restore client")
+            raise ImportError("Unable to load the Bread project restore client")
         _project_restore_client_protocol = importlib.util.module_from_spec(
             _project_restore_client_spec)
         _project_restore_client_spec.loader.exec_module(
@@ -156,7 +228,7 @@ except (ImportError, ValueError):
         "_replaylab_shader_console_protocol",
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "shader_console.py"))
     if _shader_console_spec is None or _shader_console_spec.loader is None:
-        raise ImportError("Unable to load the ReplayLab Console protocol")
+        raise ImportError("Unable to load the Bread Console protocol")
     _shader_console_protocol = importlib.util.module_from_spec(_shader_console_spec)
     _shader_console_spec.loader.exec_module(_shader_console_protocol)
 
@@ -173,7 +245,7 @@ try:
                 "learning_observation_inbox.py"))
         if (_learning_observation_spec is None or
                 _learning_observation_spec.loader is None):
-            raise ImportError("Unable to load the ReplayLab learning observation writer")
+            raise ImportError("Unable to load the Bread learning observation writer")
         _learning_observation_module = importlib.util.module_from_spec(
             _learning_observation_spec)
         _learning_observation_spec.loader.exec_module(
@@ -195,7 +267,7 @@ except (ImportError, ValueError):
             os.path.dirname(os.path.abspath(__file__)),
             "project_shader_workspace.py"))
     if _shader_workspace_spec is None or _shader_workspace_spec.loader is None:
-        raise ImportError("Unable to load the ReplayLab Shader Workspace UI")
+        raise ImportError("Unable to load the Bread Shader Workspace UI")
     _shader_workspace_protocol = importlib.util.module_from_spec(
         _shader_workspace_spec)
     _shader_workspace_spec.loader.exec_module(_shader_workspace_protocol)
@@ -213,7 +285,7 @@ except (ImportError, ValueError):
             os.path.dirname(os.path.abspath(__file__)),
             "dxil_access_signature.py"))
     if _dxil_access_spec is None or _dxil_access_spec.loader is None:
-        raise ImportError("Unable to load the ReplayLab DXIL access parser")
+        raise ImportError("Unable to load the Bread DXIL access parser")
     _dxil_access_protocol = importlib.util.module_from_spec(_dxil_access_spec)
     _dxil_access_spec.loader.exec_module(_dxil_access_protocol)
 
@@ -232,9 +304,12 @@ except ImportError:
 # Each qrenderdoc process owns a private mailbox. The external ReplayLab host
 # discovers the most recently interacted-with live instance from its manifest,
 # so two qrenderdoc windows can never race to execute the same replay command.
-_replaylab_local_root = os.environ.get("LOCALAPPDATA", "").strip()
+_replaylab_local_root = (os.environ.get("LOCALAPPDATA", "").strip()
+                         or os.environ.get("XDG_DATA_HOME", "").strip())
 if not _replaylab_local_root:
-    _replaylab_local_root = tempfile.gettempdir()
+    # Per-user data home, never the shared temp directory (world-readable and
+    # pre-plantable); the host, the agent and qrenderdoc use the same rule.
+    _replaylab_local_root = os.path.join(os.path.expanduser("~"), ".local", "share")
 IPC_ROOT = os.path.join(_replaylab_local_root, "ReplayLab", "ipc-v2")
 INSTANCE_ID = "%d-%s" % (os.getpid(), uuid.uuid4().hex)
 IPC_DIR = os.path.join(IPC_ROOT, "instances", INSTANCE_ID)
@@ -277,6 +352,12 @@ _shader_console_ui = None
 _shader_console_callbacks = []
 _shader_workspace_ui = None
 _shader_workspace_callbacks = []
+_frame_render_flow_ui = None
+_frame_render_flow_callbacks = []
+_frame_render_flow_layout = None
+_frame_render_flow_outline_cache = None
+_frame_render_flow_saved = None
+_frame_render_flow_generation = 0
 _event_filter_ui_callbacks = []
 _event_filter_registered = False
 _instance_started_unix_ms = int(time.time() * 1000)
@@ -334,13 +415,16 @@ MAX_EVENT_TEXTURE_EVIDENCE_PNG_BYTES = 128 * 1024 * 1024
 MAX_LIGHTING_CBUFFER_BYTES = 2048
 MAX_CAPTURE_SECTION_COUNT = 16384
 BRIDGE_PROTOCOL_VERSION = 2
-BRIDGE_INTEGRATION_VERSION = "1.13.0"
+BRIDGE_INTEGRATION_VERSION = "1.13.121"
 # This mailbox exists for explicit external MCP/IDE clients. Built-in project,
 # material, and Shader Workspace actions call the bridge's controlled
 # high-level functions directly, so they do not need a frame-rate filesystem
 # poll. A coarse 4 Hz cadence keeps external control responsive without
 # preventing an otherwise idle qrenderdoc process from settling.
 IPC_POLL_INTERVAL_MS = 250
+# Keep Qt admission short while accepting a small concurrent burst in one tick.
+# Every claimed request still captures its own actual UI/session facts.
+IPC_MAX_CLAIMS_PER_TICK = 4
 MAX_KNOWN_CATALOG_CAPTURE_IDS = 4096
 MAX_KNOWN_CATALOG_IDENTITY_PAIRS = 4096
 MAX_CATALOG_IDENTITY_EVENTS = 1000000
@@ -407,6 +491,7 @@ CURRENT_CONTEXT_FREEZE_REPLAY_TAG_PREFIX = (
     "ReplayLab.current-context-freeze.")
 MAX_EVENT_SHADER_OVERRIDES = 256
 MAX_SHARED_SHADER_REPLACEMENTS = 256
+MAX_SHARED_SHADER_ORPHAN_TARGETS = 64
 MAX_SHARED_SHADER_OPERATION_OUTCOMES = 512
 MAX_EVENT_SHADER_ROLLBACK_TOMBSTONES = 256
 MAX_SHARED_SHADER_ROLLBACK_TOMBSTONES = 256
@@ -450,6 +535,9 @@ _symbol_capture_snapshot = {
 }
 _known_catalog_capture_ids = {}
 _known_catalog_identity_pairs = set()
+# The same authorisation, keyed by an identity a stored workspace can reproduce
+# after a restart: (stableCaptureId, stableIdentityEvidenceSha256).
+_known_catalog_stable_pairs = set()
 _project_shader_index_jobs = {}
 _project_shader_index_jobs_guard = threading.RLock()
 _shader_catalog_export_jobs = {}
@@ -458,6 +546,8 @@ _shader_catalog_finalize_workers = set()
 _shader_catalog_finalize_stopping = False
 _current_context_freeze_jobs = {}
 _current_context_freeze_jobs_guard = threading.RLock()
+_replay_recovery_path = ""
+_replay_recovery_coordinator = None
 _request_event_state = threading.local()
 _request_dispatch_state = threading.local()
 _symbol_resource_renames = {}
@@ -489,6 +579,7 @@ _event_shader_rollback_tombstone_order = []
 # mistaken for one another.
 _shared_shader_replacements = {}
 _shared_shader_orphan_targets = []
+_shared_shader_manual_target_cache = []
 _shared_shader_replacement_capture_token = None
 # A caller-issued operation token closes the gap between a committed replay
 # mutation and a lost/corrupt IPC response. Outcomes remain capture-local and
@@ -545,7 +636,19 @@ def _atomic_write_bytes(path, data):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(native_tmp_path, native_path)
+        for replace_attempt in range(5):
+            try:
+                os.replace(native_tmp_path, native_path)
+                break
+            except OSError as exc:
+                # Discovery/mailbox readers can briefly hold a Win32 handle
+                # without FILE_SHARE_DELETE. Retry only that replace, keeping
+                # the old document intact and bounding GUI-thread waits to
+                # 150 ms in total. Persistent or unrelated failures still fail.
+                if (getattr(exc, "winerror", None) not in (5, 32, 33) or
+                        replace_attempt == 4):
+                    raise
+                time.sleep(0.01 * (2 ** replace_attempt))
     finally:
         if os.path.exists(native_tmp_path):
             try:
@@ -756,6 +859,8 @@ def _publish_instance_manifest(activity=False, stopped=False):
         "pid": os.getpid(),
         "protocolVersion": BRIDGE_PROTOCOL_VERSION,
         "bridgeVersion": BRIDGE_INTEGRATION_VERSION,
+        "shaderRestoreBatchLimit": 16,
+        "verifiedRestoreMappingCheck": True,
         "startedUnixMs": _instance_started_unix_ms,
         "lastActivityUnixMs": _instance_activity_unix_ms,
         "heartbeatUnixMs": now_ms,
@@ -771,19 +876,21 @@ def _publish_instance_manifest(activity=False, stopped=False):
 
 def _find_replaylab_host():
     """Locate only the packaged Python 3.10+ host; never use embedded 3.6."""
-    configured = os.environ.get("REPLAYLAB_MCP_HOST", "").strip()
     candidates = []
-    if configured:
-        candidates.append(configured)
+    for env_name in ("BREAD_MCP_HOST", "REPLAYLAB_MCP_HOST"):
+        configured = os.environ.get(env_name, "").strip()
+        if configured:
+            candidates.append(configured)
+    host_names = (
+        "BreadMCP.unicode.exe",
+        "BreadMCP.exe",
+    )
     if HAS_UI:
         try:
             app_dir = str(QtCore.QCoreApplication.applicationDirPath())
-            candidates.extend([
-                os.path.join(app_dir, "replaylab", "ReplayLabMCP.unicode.exe"),
-                os.path.join(app_dir, "replaylab", "ReplayLabMCP.exe"),
-                os.path.join(app_dir, "ReplayLabMCP.unicode.exe"),
-                os.path.join(app_dir, "ReplayLabMCP.exe"),
-            ])
+            for name in host_names:
+                candidates.append(os.path.join(app_dir, "replaylab", name))
+                candidates.append(os.path.join(app_dir, name))
         except Exception:
             pass
     integration_dir = os.path.dirname(os.path.abspath(__file__))
@@ -793,10 +900,8 @@ def _find_replaylab_host():
     # qrenderdoc itself always contributes applicationDirPath() above.
     installed_app_dir = os.path.abspath(os.path.join(
         integration_dir, os.pardir, os.pardir, os.pardir, os.pardir))
-    candidates.extend([
-        os.path.join(installed_app_dir, "replaylab", "ReplayLabMCP.unicode.exe"),
-        os.path.join(installed_app_dir, "replaylab", "ReplayLabMCP.exe"),
-    ])
+    for name in host_names:
+        candidates.append(os.path.join(installed_app_dir, "replaylab", name))
     for candidate in candidates:
         if os.path.isfile(candidate) and not os.path.islink(candidate):
             return os.path.abspath(candidate)
@@ -928,7 +1033,7 @@ def _start_replaylab_host():
     executable = _find_replaylab_host()
     _replaylab_host_executable = executable
     if not executable:
-        print("[ReplayLab] Packaged ReplayLabMCP.exe not found; stdio clients may still "
+        print("[Bread] Packaged MCP host (BreadMCP.exe) not found; stdio clients may still "
               "launch a separately registered host")
         return False
     try:
@@ -943,27 +1048,30 @@ def _start_replaylab_host():
         _track_replaylab_control_process(
             _replaylab_host_control_process, "mcp-ensure")
         _replaylab_host_owner_active = True
-        print("[ReplayLab] Starting/attaching packaged MCP host: %s" % executable)
+        print("[Bread] Starting/attaching packaged MCP host: %s" % executable)
         return True
     except Exception as exc:
-        print("[ReplayLab] Host startup error: %s" % str(exc))
+        print("[Bread] Host startup error: %s" % str(exc))
         _replaylab_host_owner_active = False
         _replaylab_host_control_process = None
         return False
 
 
-def _start_replaylab_internal_host():
+def _start_replaylab_internal_host(force=False):
     """Ensure qrenderdoc's private high-level service is running."""
 
     global _replaylab_internal_host_executable
     global _replaylab_internal_control_process
     global _replaylab_internal_owner_active
-    if _replaylab_internal_owner_active:
+    if _replaylab_internal_owner_active and not force:
+        return True
+    if (force and _replaylab_internal_control_process is not None and
+            _replaylab_internal_control_process.poll() is None):
         return True
     executable = _find_replaylab_internal_host()
     _replaylab_internal_host_executable = executable
     if not executable:
-        print("[ReplayLab] Packaged ReplayLabInternal.exe not found; internal "
+        print("[Bread] Packaged internal host (ReplayLabInternal.exe) not found; internal "
               "project and Shader Workspace services are unavailable")
         return False
     try:
@@ -979,14 +1087,25 @@ def _start_replaylab_internal_host():
             _replaylab_internal_control_process, "internal-ensure",
             timeout_seconds=75.0)
         _replaylab_internal_owner_active = True
-        print("[ReplayLab] Starting/attaching private internal host: %s" %
+        print("[Bread] Starting/attaching private internal host: %s" %
               executable)
         return True
     except Exception as exc:
-        print("[ReplayLab] Internal host startup error: %s" % str(exc))
+        print("[Bread] Internal host startup error: %s" % str(exc))
         _replaylab_internal_owner_active = False
         _replaylab_internal_control_process = None
         return False
+
+
+def _ensure_internal_shader_service(params):
+    """Restart only this application's fixed Host, independent of AI shell policy."""
+    expected = _shader_override_hex(params.get('expected_capture_session_id'),
+                                    'expected_capture_session_id', 32)
+    if expected != _capture_session_id or not _request_capture_loaded():
+        raise RuntimeError('Capture changed before internal Shader service recovery')
+    if not _start_replaylab_internal_host(force=True):
+        raise RuntimeError('The packaged internal Shader Host could not be started')
+    return {'startupScheduled': True, 'captureSessionId': expected}
 
 
 def _release_packaged_owner(executable, label):
@@ -1010,7 +1129,7 @@ def _release_packaged_owner(executable, label):
             except Exception:
                 pass
     except Exception as exc:
-        print("[ReplayLab] %s owner release error: %s" % (label, str(exc)))
+        print("[Bread] %s owner release error: %s" % (label, str(exc)))
 
 
 def _release_replaylab_host_owner():
@@ -1068,6 +1187,7 @@ IPC_GUI_THREAD_METHODS = frozenset((
     "load_pass_classification",
     "close_pass_panel",
     "open_capture",
+    "recover_replay",
     "begin_export_shader_catalog",
     "consume_export_shader_catalog",
     "begin_rdc_project_shader_resource_index",
@@ -1098,9 +1218,13 @@ if HAS_UI:
 
         def OnCaptureLoaded(self):
             global _active_capture_token
+            if (_replay_recovery_path and _ctx.IsCaptureLoaded() and
+                    _capture_path_key(_ctx.GetCaptureFilename()) == _replay_recovery_path):
+                self._remember_current_events()
+                return
             poller = globals().get("_poller")
             if poller:
-                poller.cancel_active_for_user_activity()
+                poller.cancel_active_for_user_activity(capture_changed=True)
             self._remember_current_events()
             _abandon_project_launcher_restore()
             if _material_panel_ui:
@@ -1119,12 +1243,15 @@ if HAS_UI:
             # The new symbol/session state and GUI binding must be visible
             # before the deferred timer starts project matching and restore.
             _schedule_project_auto_activation()
+            _schedule_frame_render_flow_restore()
 
         def OnCaptureClosed(self):
             global _active_capture_token
+            if _replay_recovery_path:
+                return
             poller = globals().get("_poller")
             if poller:
-                poller.cancel_active_for_user_activity()
+                poller.cancel_active_for_user_activity(capture_changed=True)
             self._selected_event_id = None
             self._visible_event_id = None
             _abandon_project_launcher_restore()
@@ -1150,7 +1277,7 @@ if HAS_UI:
                 self._selected_event_id != event_id)
             self._selected_event_id = event_id
             poller = globals().get("_poller")
-            if poller and changed:
+            if poller and changed and not _replay_recovery_path:
                 poller.cancel_active_for_user_activity()
             _publish_instance_manifest(activity=True)
 
@@ -1161,7 +1288,7 @@ if HAS_UI:
                 self._visible_event_id != event_id)
             self._visible_event_id = event_id
             poller = globals().get("_poller")
-            if poller and changed:
+            if poller and changed and not _replay_recovery_path:
                 poller.cancel_active_for_user_activity()
             _publish_instance_manifest(activity=True)
 
@@ -1176,6 +1303,7 @@ if HAS_UI:
             self._handler = handler_fn
             self._timer_id = 0
             self._last_manifest_ms = 0
+            self._last_poll_monotonic = None
             self._request_queue = queue.Queue(MAX_IPC_BACKGROUND_REQUESTS)
             self._stop_event = threading.Event()
             self._active_guard = threading.RLock()
@@ -1207,7 +1335,7 @@ if HAS_UI:
             self._worker.start()
             self._timer_id = self.startTimer(IPC_POLL_INTERVAL_MS)
             _publish_instance_manifest(activity=True)
-            print("[ReplayLab] Poller started (timer_id=%d, interval=%dms, dir=%s)" %
+            print("[Bread] Poller started (timer_id=%d, interval=%dms, dir=%s)" %
                   (self._timer_id, IPC_POLL_INTERVAL_MS, IPC_DIR))
 
         def stop(self):
@@ -1231,7 +1359,7 @@ if HAS_UI:
                 item["cancelEvent"].set()
                 self._finish_item(
                     item, self._cancelled_response(
-                        item["requestId"], "ReplayLab IPC bridge is stopping"))
+                        item["requestId"], "Bread IPC bridge is stopping"))
 
             try:
                 self._request_queue.put_nowait(self._WORKER_STOP)
@@ -1243,16 +1371,20 @@ if HAS_UI:
                 worker.join(IPC_WORKER_STOP_TIMEOUT_SECONDS)
                 if worker.is_alive():
                     raise RuntimeError(
-                        "ReplayLab IPC worker did not stop before its deadline")
+                        "Bread IPC worker did not stop before its deadline")
             self._worker = None
-            print("[ReplayLab] Poller stopped")
+            print("[Bread] Poller stopped")
 
-        def cancel_active_for_user_activity(self):
+        def cancel_active_for_user_activity(self, capture_changed=False):
             """Invalidate queued work and signal the active tool for a real UI context change."""
             with self._active_guard:
                 self._user_activity_generation += 1
                 active = self._active_item
             if active is not None:
+                if capture_changed:
+                    active["captureInvalidatedEvent"].set()
+                else:
+                    active["selectionPreemptedEvent"].set()
                 active["cancelEvent"].set()
 
         @staticmethod
@@ -1265,22 +1397,30 @@ if HAS_UI:
         def _finish_item(self, item, response):
             published = False
             try:
+                if item.get("stageTiming") is not None and isinstance(response, dict):
+                    try:
+                        timed_response = dict(response, bridgeTiming=_bridge_request_timing(item))
+                        if (_frame_flow_result(timed_response) is None or
+                                len(_ipc_json_bytes(timed_response)) <= MAX_FRAME_FLOW_SERIALIZED_BYTES):
+                            response = timed_response
+                    except Exception:
+                        pass
                 _atomic_write_json(item["responsePath"], response)
                 published = True
             except Exception as exc:
-                print("[ReplayLab] Response write error: %s" % str(exc))
+                print("[Bread] Response write error: %s" % str(exc))
                 traceback.print_exc()
                 try:
                     _atomic_write_json(item["responsePath"], {
                         "id": item.get("requestId", "?"),
                         "error": {
                             "code": -1,
-                            "message": "ReplayLab could not persist the full response",
+                            "message": "Bread could not persist the full response",
                         },
                     })
                     published = True
                 except Exception as fallback_exc:
-                    print("[ReplayLab] Fallback response write error: %s" %
+                    print("[Bread] Fallback response write error: %s" %
                           str(fallback_exc))
             finally:
                 claim_path = item.get("claimPath")
@@ -1300,6 +1440,12 @@ if HAS_UI:
             error = [None]
             phase_guard = threading.Lock()
             phase = ["pending"]
+            timing = item.get("stageTiming")
+            posted_at = time.monotonic() if timing is not None else None
+            callback_started = [None]
+            callback_finished = [None]
+            callback_cpu_started = [None]
+            callback_cpu_finished = [None]
 
             def _invoke():
                 with phase_guard:
@@ -1311,11 +1457,17 @@ if HAS_UI:
                         completed.set()
                         return
                     phase[0] = "running"
+                if timing is not None:
+                    callback_started[0] = time.monotonic()
+                    callback_cpu_started[0] = _bridge_thread_cpu_seconds()
                 try:
                     response[0] = self._handler(item["request"])
                 except BaseException as exc:
                     error[0] = exc
                 finally:
+                    if timing is not None:
+                        callback_cpu_finished[0] = _bridge_thread_cpu_seconds()
+                        callback_finished[0] = time.monotonic()
                     with phase_guard:
                         phase[0] = "done"
                     completed.set()
@@ -1333,14 +1485,19 @@ if HAS_UI:
                             completed.set()
             with phase_guard:
                 final_phase = phase[0]
+            if timing is not None:
+                _record_bridge_ui_timing(timing, "uiHandler", posted_at,
+                    callback_started[0], callback_finished[0],
+                    callback_cpu_started[0], callback_cpu_finished[0], final_phase)
             if final_phase == "cancelled":
                 return self._cancelled_response(
-                    item["requestId"], "ReplayLab IPC request was cancelled")
+                    item["requestId"], _request_preemption_message(
+                        item, "Bread IPC request was cancelled"))
             if error[0] is not None:
                 raise error[0]
             return response[0]
 
-        def _execute_item(self, item):
+        def _prepare_item_request(self, item):
             request = item.get("request")
             if request is None:
                 request = _read_ipc_request_json(item["claimPath"])
@@ -1357,6 +1514,14 @@ if HAS_UI:
                         },
                     }
                 item["request"] = request
+            item["selectionIndependent"] = _selection_independent_request(request)
+            return None
+
+        def _execute_item(self, item):
+            invalid_request = self._prepare_item_request(item)
+            if invalid_request is not None:
+                return invalid_request
+            request = item["request"]
             method = str(request.get("method", "") or "")
             if method in IPC_GUI_THREAD_METHODS:
                 return self._invoke_handler_on_ui(item)
@@ -1365,8 +1530,13 @@ if HAS_UI:
             _request_dispatch_state.current = {
                 "backgroundReplayTag": item["replayTag"],
                 "cancelEvent": item["cancelEvent"],
+                "captureInvalidatedEvent": item["captureInvalidatedEvent"],
+                "selectionPreemptedEvent": item["selectionPreemptedEvent"],
+                "stopEvent": self._stop_event,
+                "selectionIndependent": item["selectionIndependent"],
                 "captureSnapshot": item["captureSnapshot"],
                 "foregroundReplayGeneration": item["foregroundReplayGeneration"],
+                "stageTiming": item.get("stageTiming"),
             }
             try:
                 return self._handler(request)
@@ -1387,6 +1557,10 @@ if HAS_UI:
                     return
                 with self._active_guard:
                     self._active_item = item
+                timing = item.get("stageTiming")
+                if timing is not None:
+                    timing["workerStartedMonotonic"] = time.monotonic()
+                    timing["workerStartedCpuSeconds"] = _bridge_thread_cpu_seconds()
                 try:
                     with self._active_guard:
                         stale_activity = (
@@ -1394,45 +1568,69 @@ if HAS_UI:
                             self._user_activity_generation)
                     if self._stop_event.is_set():
                         response = self._cancelled_response(
-                            item["requestId"], "ReplayLab IPC bridge is stopping")
-                    elif item["cancelEvent"].is_set() or stale_activity:
-                        response = self._cancelled_response(
-                            item["requestId"],
-                            "ReplayLab IPC request was superseded by user activity")
+                            item["requestId"], "Bread IPC bridge is stopping")
                     else:
-                        response = self._execute_item(item)
+                        invalid_request = self._prepare_item_request(item)
+                        if invalid_request is not None:
+                            response = invalid_request
+                        elif (item["cancelEvent"].is_set() or stale_activity) and (
+                                not item["selectionIndependent"] or
+                                _request_dispatch_cancelled(item)):
+                            response = self._cancelled_response(
+                                item["requestId"],
+                                _request_preemption_message(item,
+                                    "Bread IPC request was superseded by user activity",
+                                    selection_changed=stale_activity))
+                        else:
+                            response = self._execute_item(item)
                 except BaseException as exc:
-                    print("[ReplayLab] Background request error: %s" % str(exc))
+                    print("[Bread] Background request error: %s" % str(exc))
                     traceback.print_exc()
                     response = {
                         "id": item["requestId"],
                         "error": {"code": -1, "message": str(exc)},
                     }
                 finally:
+                    if timing is not None:
+                        timing["workerFinishedCpuSeconds"] = _bridge_thread_cpu_seconds()
+                        timing["workerFinishedMonotonic"] = time.monotonic()
                     with self._active_guard:
                         if self._active_item is item:
                             self._active_item = None
                 self._finish_item(item, response)
 
         def _new_item(self, request_id, response_path, claim_path, request,
-                      expected_id):
+                      expected_id, poll_timing=None):
             # This method is called only by the Qt timer. Capture the small UI-owned
             # state here so the worker never needs to discover the user's selection.
+            claim_started = time.monotonic()
+            claim_cpu_started = _bridge_thread_cpu_seconds()
+            claim_age_ms = None
+            if claim_path:
+                try:
+                    claim_age_ms = max(0.0, (time.time() - os.stat(claim_path).st_mtime) * 1000.0)
+                except OSError:
+                    pass
             _synchronise_capture_lifecycle()
             try:
-                capture_loaded = bool(_ctx and _ctx.IsCaptureLoaded())
+                capture_identity = _capture_identity_on_ui()
+                capture_loaded = capture_identity.get("loaded") is True
                 visible_event_id = _safe_int(_ctx.CurEvent(), 0) if capture_loaded else 0
                 selected_event_id = (
                     _safe_int(_ctx.CurSelectedEvent(), visible_event_id)
                     if capture_loaded else 0)
                 replay_manager = _ctx.Replay() if _ctx else None
             except Exception:
+                capture_identity = None
                 capture_loaded = False
                 visible_event_id = 0
                 selected_event_id = 0
                 replay_manager = None
             with self._active_guard:
                 activity_generation = self._user_activity_generation
+            capture_token = _current_capture_token()
+            foreground_generation = _foreground_replay_generation()
+            claim_cpu_finished = _bridge_thread_cpu_seconds()
             return {
                 "request": request,
                 "expectedId": expected_id,
@@ -1440,16 +1638,32 @@ if HAS_UI:
                 "responsePath": response_path,
                 "claimPath": claim_path,
                 "cancelEvent": threading.Event(),
+                "captureInvalidatedEvent": threading.Event(),
+                "selectionPreemptedEvent": threading.Event(),
+                "stopEvent": self._stop_event,
                 "replayTag": IPC_BACKGROUND_REPLAY_TAG_PREFIX + uuid.uuid4().hex,
                 "activityGeneration": activity_generation,
-                "foregroundReplayGeneration": _foreground_replay_generation(),
+                "foregroundReplayGeneration": foreground_generation,
+                "stageTiming": {
+                    "claimStartedMonotonic": claim_started,
+                    "claimFinishedMonotonic": time.monotonic(),
+                    "claimStartedCpuSeconds": claim_cpu_started,
+                    "claimFinishedCpuSeconds": claim_cpu_finished,
+                    "mailboxAgeAtClaimMs": claim_age_ms,
+                    "pollGapMs": (poll_timing or {}).get("pollGapMs"),
+                    "pendingRequestsAtPoll": (poll_timing or {}).get("pendingRequestsAtPoll"),
+                    "manifestPublishWallMs": (poll_timing or {}).get("manifestPublishWallMs"),
+                    "uiTransactions": [],
+                    "replayTransactions": [],
+                },
                 "captureSnapshot": {
                     "captureLoaded": capture_loaded,
                     "captureSessionId": _capture_session_id,
                     "visibleEventId": visible_event_id,
                     "selectedEventId": selected_event_id,
-                    "captureToken": _current_capture_token(),
+                    "captureToken": capture_token,
                     "replayManager": replay_manager,
+                    "captureIdentity": capture_identity,
                 },
             }
 
@@ -1457,14 +1671,14 @@ if HAS_UI:
             request_id = item["requestId"]
             if not self._accepting or self._stop_event.is_set():
                 self._finish_item(item, self._cancelled_response(
-                    request_id, "ReplayLab IPC bridge is not accepting requests"))
+                    request_id, "Bread IPC bridge is not accepting requests"))
                 return False
             try:
                 self._request_queue.put_nowait(item)
             except queue.Full:
                 self._finish_item(
                     item, self._cancelled_response(
-                        request_id, "ReplayLab IPC background queue is full"))
+                        request_id, "Bread IPC background queue is full"))
                 return False
             return True
 
@@ -1474,20 +1688,34 @@ if HAS_UI:
                 request_id, response_path, claim_path, request, None))
 
         def _submit_claimed_request(self, request_id, response_path, claim_path,
-                                    expected_id=None):
+                                    expected_id=None, poll_timing=None):
             return self._enqueue_item(self._new_item(
                 str(request_id or "?"), response_path, claim_path, None,
-                expected_id))
+                expected_id, poll_timing))
 
         def timerEvent(self, event):
             """Called by Qt at the bounded IPC polling interval."""
+            entered = time.monotonic()
+            previous = self._last_poll_monotonic
+            self._last_poll_monotonic = entered
+            poll_timing = {
+                # Python callback entry includes both Qt scheduling and GIL
+                # acquisition. This is not a native Qt-only queue measurement.
+                "pollGapMs": (round(max(0.0, entered - previous) * 1000.0, 3)
+                              if previous is not None else None),
+                "pendingRequestsAtPoll": 0,
+                "manifestPublishWallMs": 0.0,
+            }
             now_ms = int(time.time() * 1000)
             if now_ms - self._last_manifest_ms >= 1000:
+                manifest_started = time.monotonic()
                 _publish_instance_manifest()
+                poll_timing["manifestPublishWallMs"] = round(
+                    max(0.0, time.monotonic() - manifest_started) * 1000.0, 3)
                 self._last_manifest_ms = now_ms
             # Protocol v2: each caller owns one UUID-named request/response pair. Claiming by
             # rename is atomic, so multiple RenderDoc processes can never execute one request.
-            if self._process_queued_request():
+            if self._process_queued_request(poll_timing):
                 return
 
             # Protocol v1 is retained for older MCP clients.
@@ -1504,9 +1732,10 @@ if HAS_UI:
                     os.getpid(), int(time.time() * 1000000))
                 claim_path = os.path.join(PROCESSING_DIR, claim_name)
                 os.replace(REQ_FILE, claim_path)
-                self._submit_claimed_request("?", RESP_FILE, claim_path)
+                self._submit_claimed_request(
+                    "?", RESP_FILE, claim_path, poll_timing=poll_timing)
             except Exception as e:
-                print("[ReplayLab] Error: %s" % str(e))
+                print("[Bread] Error: %s" % str(e))
                 traceback.print_exc()
                 try:
                     if os.path.lexists(REQ_FILE):
@@ -1518,46 +1747,60 @@ if HAS_UI:
                 except Exception:
                     pass
 
-        def _process_queued_request(self):
+        def _process_queued_request(self, poll_timing=None):
             try:
-                names = sorted(
-                    name for name in os.listdir(REQUEST_DIR)
-                    if name.endswith(".json") and os.path.isfile(
-                        os.path.join(REQUEST_DIR, name)))
+                pending = []
+                for name in os.listdir(REQUEST_DIR):
+                    if not name.endswith(".json"):
+                        continue
+                    try:
+                        info = os.stat(os.path.join(REQUEST_DIR, name))
+                    except OSError:
+                        # A different claimant/client may have removed it.
+                        continue
+                    if stat.S_ISREG(info.st_mode):
+                        pending.append((info.st_mtime_ns, name))
+                pending.sort()
             except Exception:
                 return False
-            if not names:
+            if poll_timing is not None:
+                poll_timing["pendingRequestsAtPoll"] = len(pending)
+            if not pending:
                 return False
-
-            name = names[0]
-            request_path = os.path.join(REQUEST_DIR, name)
-            claim_name = "%s.claim.%d.%d" % (
-                name, os.getpid(), int(time.time() * 1000000))
-            claim_path = os.path.join(PROCESSING_DIR, claim_name)
-            response_path = os.path.join(RESPONSE_DIR, name)
-            try:
-                # os.replace is atomic on one filesystem. If another poller won the race the
-                # source no longer exists and this poller simply tries again on the next tick.
-                os.replace(request_path, claim_path)
-            except (FileNotFoundError, PermissionError, OSError):
-                return False
-
-            expected_id = name[:-5]
-            try:
-                self._submit_claimed_request(
-                    expected_id, response_path, claim_path, expected_id)
-            except Exception as exc:
-                print("[ReplayLab] Queued request error: %s" % str(exc))
-                traceback.print_exc()
-                self._finish_item({
-                    "requestId": expected_id,
-                    "responsePath": response_path,
-                    "claimPath": claim_path,
-                }, {
-                    "id": expected_id,
-                    "error": {"code": -1, "message": str(exc)},
-                })
-            return True
+            claimed = False
+            # Mtime is caller publication order, unlike random UUID sorting.
+            # A fixed attempt budget also bounds races/errors on the GUI thread.
+            for unused_modified_ns, name in pending[:IPC_MAX_CLAIMS_PER_TICK]:
+                if self._stop_event.is_set() or not self._accepting:
+                    break
+                request_path = os.path.join(REQUEST_DIR, name)
+                claim_name = "%s.claim.%d.%d" % (
+                    name, os.getpid(), int(time.time() * 1000000))
+                claim_path = os.path.join(PROCESSING_DIR, claim_name)
+                response_path = os.path.join(RESPONSE_DIR, name)
+                try:
+                    # Atomic rename gives exactly one owner, including races.
+                    os.replace(request_path, claim_path)
+                except (FileNotFoundError, PermissionError, OSError):
+                    continue
+                claimed = True
+                expected_id = name[:-5]
+                try:
+                    self._submit_claimed_request(
+                        expected_id, response_path, claim_path, expected_id,
+                        poll_timing=poll_timing)
+                except Exception as exc:
+                    print("[Bread] Queued request error: %s" % str(exc))
+                    traceback.print_exc()
+                    self._finish_item({
+                        "requestId": expected_id,
+                        "responsePath": response_path,
+                        "claimPath": claim_path,
+                    }, {
+                        "id": expected_id,
+                        "error": {"code": -1, "message": str(exc)},
+                    })
+            return claimed
 
 
 # =====================================================================
@@ -1592,6 +1835,10 @@ CONSOLE_QUIET_REQUEST_METHODS = frozenset((
     "get_capture_status",
     "get_current_renderdoc_context",
     "get_shared_shader_replacements",
+    "get_shader_cbuffer_alias_identity",
+    "get_shader_cbuffer_display_identity",
+    "get_shader_workspace_ui_state",
+    "get_application_ui_state",
     "recover_shader_candidate_shared_resource_operation",
     "get_symbol_alias_transaction",
     "get_event_cbuffer_override_status",
@@ -1608,6 +1855,162 @@ def _request_dispatch_context():
     return getattr(_request_dispatch_state, "current", None)
 
 
+def _selection_independent_request(request):
+    """Small capture identity/source observations do not depend on a UI EID."""
+    if not isinstance(request, dict):
+        return False
+    method = request.get("method")
+    if method == "get_current_renderdoc_context":
+        # The request freezes its dispatch EID, not whichever EID is selected
+        # later. Capture close/reload and explicit task cancellation still win.
+        return True
+    params = request.get("params") or {}
+    if (method in ("inspect_event", "inspect_event_api_parameters",
+                   "inspect_frame_render_stage", "get_draw_call_details",
+                   "get_pipeline_state", "get_shader_info", "get_bound_textures",
+                   "get_constant_buffer_values", "get_post_vs_data", "get_draw_geometry") and
+            isinstance(params, dict) and _safe_int(params.get("event_id", 0), 0) > 0):
+        return True
+    return method in (
+        "ping", "get_capture_status", "get_shader_workspace_ui_state", "read_shader_workspace_source",
+        "get_frame_summary", "get_draw_calls", "get_pass_classification_inputs",
+        "get_current_frame_flow_inputs",
+        "get_application_ui_state", "control_application_ui", "open_document",
+        "get_shader_cbuffer_display_identity",
+        "get_frame_render_flow_outline", "show_frame_render_flow",
+        "get_saved_frame_render_flow", "save_frame_render_flow",
+        "show_shader_organization_preview",
+    )
+
+
+def _request_dispatch_cancelled(dispatch):
+    """Separate selection preemption from capture invalidation and shutdown."""
+    for name in ("stopEvent", "captureInvalidatedEvent"):
+        event = dispatch.get(name)
+        if event is not None and event.is_set():
+            return True
+    expected_session = str(dispatch.get("captureSnapshot", {}).get(
+        "captureSessionId", "") or "")
+    if expected_session and expected_session != str(_capture_session_id or ""):
+        return True
+    event = dispatch.get("cancelEvent")
+    if event is None or not event.is_set():
+        return False
+    selected = dispatch.get("selectionPreemptedEvent")
+    return not (dispatch.get("selectionIndependent") is True and expected_session and
+                selected is not None and selected.is_set())
+
+
+def _request_preemption_message(dispatch, fallback, selection_changed=False):
+    """Only an observed EID change on the same capture is resumable."""
+    if not isinstance(dispatch, dict):
+        return fallback
+    for name in ("stopEvent", "captureInvalidatedEvent"):
+        event = dispatch.get(name)
+        if event is not None and event.is_set():
+            return fallback
+    session = str(dispatch.get("captureSnapshot", {}).get("captureSessionId", "") or "")
+    selected = dispatch.get("selectionPreemptedEvent")
+    if (session and session == str(_capture_session_id or "") and
+            (selection_changed or (selected is not None and selected.is_set()))):
+        return "Bread background tool yielded after a user replay operation; retry it if still needed"
+    return fallback
+
+
+def _bridge_thread_cpu_seconds():
+    """Measure this thread's CPU, including the bundled Python 3.6 on Windows."""
+    try:
+        clock = getattr(time, "thread_time", None)
+        if clock is not None:
+            return clock()
+        if os.name == "nt":
+            import ctypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.GetCurrentThread.restype = ctypes.c_void_p
+            kernel.GetThreadTimes.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(ctypes.c_uint64)] * 4
+            created, exited, system, user = [ctypes.c_uint64() for unused in range(4)]
+            if kernel.GetThreadTimes(kernel.GetCurrentThread(), ctypes.byref(created),
+                    ctypes.byref(exited), ctypes.byref(system), ctypes.byref(user)):
+                return (system.value + user.value) / 10000000.0
+    except Exception:
+        pass
+    return None
+
+
+def _record_bridge_ui_timing(timing, callback_name, posted, started, finished,
+                             cpu_started, cpu_finished, outcome):
+    """Only fixed callback names and numeric durations enter protocol telemetry."""
+    try:
+        stages = timing["uiTransactions"]
+        if len(stages) >= 16:
+            return
+        completed_at = finished if finished is not None else time.monotonic()
+        began_at = started if started is not None else completed_at
+        name = str(callback_name or "uiTransaction")
+        if re.fullmatch(r"[A-Za-z0-9_]{1,64}", name) is None:
+            name = "uiTransaction"
+        stages.append({
+            "callback": name, "outcome": outcome,
+            "uiQueueWallMs": round(max(0.0, began_at - posted) * 1000.0, 3),
+            "callbackWallMs": round(max(0.0, completed_at - began_at) * 1000.0, 3),
+            "callbackThreadCpuMs": (round(max(0.0, cpu_finished - cpu_started) * 1000.0, 3)
+                                    if cpu_started is not None and cpu_finished is not None else None),
+        })
+    except Exception:
+        # Diagnostics cannot alter capture work, cancellation or publication.
+        pass
+
+
+def _record_bridge_replay_timing(timing, callback_name, posted, started, finished,
+                                 cpu_started, cpu_finished, outcome):
+    """Bounded replay scheduling/run timing; no source, arguments or results."""
+    try:
+        stages = timing.setdefault("replayTransactions", [])
+        if len(stages) >= 16:
+            return
+        completed_at = finished if finished is not None else time.monotonic()
+        began_at = started if started is not None else completed_at
+        name = str(callback_name or "replayTransaction")
+        if re.fullmatch(r"[A-Za-z0-9_]{1,64}", name) is None:
+            name = "replayTransaction"
+        stages.append({
+            "callback": name, "outcome": outcome,
+            "replayQueueAndGILWallMs": round(max(0.0, began_at - posted) * 1000.0, 3),
+            "callbackWallMs": round(max(0.0, completed_at - began_at) * 1000.0, 3),
+            "callbackThreadCpuMs": (round(max(0.0, cpu_finished - cpu_started) * 1000.0, 3)
+                                    if cpu_started is not None and cpu_finished is not None else None),
+        })
+    except Exception:
+        pass  # Telemetry must never affect replay or transaction restoration.
+
+
+def _bridge_request_timing(item):
+    timing = item["stageTiming"]
+    claimed = timing["claimFinishedMonotonic"]
+    started = timing.get("workerStartedMonotonic", claimed)
+    finished = timing.get("workerFinishedMonotonic", started)
+    claim_cpu_started = timing.get("claimStartedCpuSeconds")
+    claim_cpu_finished = timing.get("claimFinishedCpuSeconds")
+    worker_cpu_started = timing.get("workerStartedCpuSeconds")
+    worker_cpu_finished = timing.get("workerFinishedCpuSeconds")
+    return {
+        "schema": "bread-bridge-request-timing/v1", "schemaVersion": 1,
+        "mailboxAgeAtClaimMs": timing.get("mailboxAgeAtClaimMs"),
+        "pollGapMs": timing.get("pollGapMs"),
+        "pendingRequestsAtPoll": timing.get("pendingRequestsAtPoll"),
+        "manifestPublishWallMs": timing.get("manifestPublishWallMs"),
+        "claimSnapshotWallMs": round(max(0.0, claimed - timing["claimStartedMonotonic"]) * 1000.0, 3),
+        "claimSnapshotThreadCpuMs": (round(max(0.0, claim_cpu_finished - claim_cpu_started) * 1000.0, 3)
+                                    if claim_cpu_started is not None and claim_cpu_finished is not None else None),
+        "workerQueueWallMs": round(max(0.0, started - claimed) * 1000.0, 3),
+        "workerWallMs": round(max(0.0, finished - started) * 1000.0, 3),
+        "workerThreadCpuMs": (round(max(0.0, worker_cpu_finished - worker_cpu_started) * 1000.0, 3)
+                              if worker_cpu_started is not None and worker_cpu_finished is not None else None),
+        "uiTransactions": list(timing["uiTransactions"]),
+        "replayTransactions": list(timing.get("replayTransactions", [])),
+    }
+
+
 def _invoke_on_ui_sync(callback):
     """Run one short CaptureContext transaction on Qt while its worker waits."""
     dispatch = _request_dispatch_context()
@@ -1619,27 +2022,44 @@ def _invoke_on_ui_sync(callback):
     error = [None]
     phase_guard = threading.Lock()
     phase = ["pending"]
-    cancel_event = dispatch.get("cancelEvent")
     request_tracker = _request_event_tracker()
     cancellation_allowed = not bool(
         request_tracker and request_tracker.get("replayAtomicCommitStarted"))
+    timing = dispatch.get("stageTiming")
+    posted_at = time.monotonic() if timing is not None else None
+    callback_started = [None]
+    callback_finished = [None]
+    callback_cpu_started = [None]
+    callback_cpu_finished = [None]
 
     def _invoke():
         with phase_guard:
             if phase[0] != "pending":
                 completed.set()
                 return
-            if (cancellation_allowed and cancel_event is not None and
-                    cancel_event.is_set()):
+            if cancellation_allowed and _request_dispatch_cancelled(dispatch):
                 phase[0] = "cancelled"
                 completed.set()
                 return
             phase[0] = "running"
+        if timing is not None:
+            callback_started[0] = time.monotonic()
+            callback_cpu_started[0] = _bridge_thread_cpu_seconds()
         try:
+            if _bridge_diagnostics is not None:
+                _bridge_diagnostics.ui_event("ui-begin", (request_tracker or {}).get("method", ""),
+                                             getattr(callback, "__name__", ""))
             result[0] = callback()
         except BaseException as exc:
             error[0] = exc
         finally:
+            if _bridge_diagnostics is not None:
+                _bridge_diagnostics.ui_event("ui-end", (request_tracker or {}).get("method", ""),
+                                             getattr(callback, "__name__", ""),
+                                             "error" if error[0] is not None else "ok")
+            if timing is not None:
+                callback_cpu_finished[0] = _bridge_thread_cpu_seconds()
+                callback_finished[0] = time.monotonic()
             with phase_guard:
                 phase[0] = "done"
             completed.set()
@@ -1648,17 +2068,21 @@ def _invoke_on_ui_sync(callback):
     # ExtensionManager itself does not expose InvokeOntoUIThread.
     _ctx.Extensions().GetMiniQtHelper().InvokeOntoUIThread(_invoke)
     while not completed.wait(0.05):
-        if (cancellation_allowed and cancel_event is not None and
-                cancel_event.is_set()):
+        if cancellation_allowed and _request_dispatch_cancelled(dispatch):
             with phase_guard:
                 if phase[0] == "pending":
                     phase[0] = "cancelled"
                     completed.set()
     with phase_guard:
         final_phase = phase[0]
+    if timing is not None:
+        _record_bridge_ui_timing(timing, getattr(callback, "__name__", "uiTransaction"),
+            posted_at, callback_started[0], callback_finished[0],
+            callback_cpu_started[0], callback_cpu_finished[0], final_phase)
     if final_phase == "cancelled":
         raise _ReplayLabBackgroundPreempted(
-            "ReplayLab background tool was cancelled before its UI transaction")
+            _request_preemption_message(dispatch,
+                "Bread background tool was cancelled before its UI transaction"))
     if error[0] is not None:
         raise error[0]
     return result[0]
@@ -1743,10 +2167,18 @@ def _background_replay_checkpoint():
         # run immediately afterwards and must not interrupt recovery midway.
         return
     cancel_event = tracker.get("cancelEvent")
-    if cancel_event is not None and cancel_event.is_set():
+    dispatch = tracker.get("dispatchContext") or _request_dispatch_context()
+    independent = isinstance(dispatch, dict) and dispatch.get("selectionIndependent") is True
+    if (cancel_event is not None and cancel_event.is_set() and
+            (not independent or _request_dispatch_cancelled(dispatch))):
         tracker["backgroundAbandoned"] = True
         raise _ReplayLabBackgroundPreempted(
-            "ReplayLab background tool was cancelled")
+            _request_preemption_message(tracker.get("dispatchContext") or _request_dispatch_context(),
+                "Bread background tool was cancelled"))
+    if independent:
+        # A short fixed-EID observation finishes on the serialized replay
+        # callback. The user's queued foreground replay executes afterwards.
+        return
     expected_generation = tracker.get("foregroundReplayGeneration")
     current_generation = _foreground_replay_generation()
     if (expected_generation is not None and current_generation is not None and
@@ -1754,14 +2186,37 @@ def _background_replay_checkpoint():
         tracker["userPreempted"] = True
         tracker["backgroundAbandoned"] = True
         raise _ReplayLabBackgroundPreempted(
-            "ReplayLab background tool yielded after a user replay operation; retry it if still needed")
+            "Bread background tool yielded after a user replay operation; retry it if still needed")
     if _foreground_replay_pending():
         # Do not restore the request's old visible EID. The queued foreground
         # command is now authoritative and will establish the user's new state.
         tracker["userPreempted"] = True
         tracker["backgroundAbandoned"] = True
         raise _ReplayLabBackgroundPreempted(
-            "ReplayLab background tool yielded to a user replay operation; retry it if still needed")
+            "Bread background tool yielded to a user replay operation; retry it if still needed")
+
+
+def _require_healthy_replay(ctrl):
+    """A native fatal replay switches to DummyDriver; empty reads are not success."""
+    getter = getattr(ctrl, "GetFatalErrorStatus", None)
+    if callable(getter):
+        status = getter()
+        if status.code != rd.ResultCode.Succeeded:
+            raise RuntimeError(
+                "bread-replay-unavailable: native replay is in a fatal state (%s). "
+                "Repeated EID selection cannot recover this controller. Preserve cached evidence; "
+                "rebuild replay before requesting current bindings or new pixels." % str(status))
+
+
+def _get_replay_health(params):
+    """Read native status without selecting an event or requesting GPU work."""
+    def read(ctrl):
+        status = ctrl.GetFatalErrorStatus()
+        return {"schema": "bread-replay-health/v1", "captureSessionId": _capture_session_id,
+                "healthy": status.code == rd.ResultCode.Succeeded,
+                "code": str(status.code), "diagnostic": str(status),
+                "recovery": "none" if status.code == rd.ResultCode.Succeeded else "recreate-controller"}
+    return _replay(read)
 
 
 def _set_frame_event(ctrl, event_id, force=True, allow_background_preemption=True):
@@ -1769,6 +2224,7 @@ def _set_frame_event(ctrl, event_id, force=True, allow_background_preemption=Tru
 
     if allow_background_preemption:
         _background_replay_checkpoint()
+    _require_healthy_replay(ctrl)
     tracker = _request_event_tracker()
     if tracker is not None:
         tracker["mutated"] = True
@@ -1776,6 +2232,7 @@ def _set_frame_event(ctrl, event_id, force=True, allow_background_preemption=Tru
         tracker["lastSetSucceeded"] = False
         tracker["eventDirty"] = True
     ctrl.SetFrameEvent(event_id, force)
+    _require_healthy_replay(ctrl)
     if tracker is not None:
         tracker["lastSetSucceeded"] = True
         tracker["eventDirty"] = (
@@ -1789,6 +2246,28 @@ def _restore_visible_replay_event(event_id=None):
         event_id = _safe_int(_ctx.CurEvent(), 0)
     _replay(lambda ctrl: _set_frame_event(
         ctrl, event_id, True, allow_background_preemption=False))
+
+
+_read_pipeline_capability = None
+
+
+def _select_event_for_read(ctrl, event_id):
+    """Use native current-pipeline reuse only when that core advertises it.
+
+    Older cores retain their forced-query behavior, including after analysis
+    that restored pixels without fetching pipeline metadata.
+    """
+    global _read_pipeline_capability
+    key = str(_capture_session_id or "")
+    if _read_pipeline_capability is None or _read_pipeline_capability[0] != key:
+        supported = False
+        try:
+            status = json.loads(str(ctrl.GetReplayCheckpointStatus()))
+            supported = status.get("pipelineStateReuse") is True
+        except Exception:
+            pass
+        _read_pipeline_capability = (key, supported)
+    _set_frame_event(ctrl, int(event_id), not _read_pipeline_capability[1])
 
 
 def _console_request_lifecycle_visible(method):
@@ -1814,6 +2293,11 @@ def _publish_current_context_freeze_console_event(job):
     if status not in ("completed", "failed", "abandoned"):
         return
     job["consoleEventPublished"] = True
+    if status == "completed":
+        # The AI panel freezes the current context routinely (every refresh, every
+        # task). A completed freeze is not news; forty of them an hour buried the
+        # messages that were. Failures and abandonments still publish.
+        return
     failure_code = str(job.get("failureCode", "") or "")
     if failure_code not in CURRENT_CONTEXT_FREEZE_FAILURE_CODES:
         failure_code = "unknown"
@@ -1871,7 +2355,7 @@ def handle_request(request):
 
     if method not in METHODS:
         _publish_console_event(
-            "bridge", "error", "未知 ReplayLab 请求：%s" % str(method),
+            "bridge", "error", "未知请求：%s" % str(method),
             phase="请求失败", code="requestRejected",
             context={"operation": str(method or "")})
         return {"id": rid, "error": {"code": -32601, "message": "Unknown method: %s" % method}}
@@ -1905,6 +2389,7 @@ def handle_request(request):
             if dispatch is not None else ""),
         "cancelEvent": (
             dispatch.get("cancelEvent") if dispatch is not None else None),
+        "dispatchContext": dispatch,
         "foregroundReplayGeneration": (
             dispatch.get("foregroundReplayGeneration")
             if dispatch is not None else None),
@@ -1925,11 +2410,11 @@ def handle_request(request):
             params.get("__replaylab_expected_capture_session_id", "") or "").lower()
         if expected_session and expected_session != _capture_session_id:
             raise RuntimeError(
-                "The frozen capture session changed before the ReplayLab tool started")
+                "The frozen capture session changed before the Bread tool started")
         result = METHODS[method](params)
         if tracker["eventDirty"]:
             raise RuntimeError(
-                "ReplayLab replay callback returned without restoring the user's event")
+                "Bread replay callback returned without restoring the user's event")
         response = {"id": rid, "result": result}
         if (_frame_flow_result(response) is not None and
                 len(_ipc_json_bytes(response)) >
@@ -1976,8 +2461,21 @@ def _replay(fn):
     result = [None]
     error = [None]
     request_tracker = _request_event_tracker()
+    dispatch = _request_dispatch_context()
+    timing = dispatch.get("stageTiming") if dispatch is not None else None
+    posted_at = time.monotonic() if timing is not None else None
+    callback_started = [None]
+    callback_finished = [None]
+    callback_cpu_started = [None]
+    callback_cpu_finished = [None]
+    invocation_failed = [False]
 
     def _invoke(ctrl):
+        if timing is not None:
+            # Entry includes replay-queue scheduling and Python GIL acquisition;
+            # this does not claim to measure the native queue in isolation.
+            callback_started[0] = time.monotonic()
+            callback_cpu_started[0] = _bridge_thread_cpu_seconds()
         previous_tracker = _request_event_tracker()
         had_atomic_state = False
         previous_atomic_state = False
@@ -2008,15 +2506,19 @@ def _replay(fn):
                     # cannot interleave between the AI's temporary EID and this
                     # restore, so the next queued user callback sees its own state.
                     ctrl.SetFrameEvent(restore_event, True)
+                    _require_healthy_replay(ctrl)
                     request_tracker["lastEventId"] = restore_event
                     request_tracker["lastSetSucceeded"] = True
                     request_tracker["eventDirty"] = False
                 except Exception as restore_error:
                     request_tracker["lastSetSucceeded"] = False
-                    if error[0] is None:
-                        error[0] = RuntimeError(
-                            "ReplayLab could not restore the user's replay event: %s" %
-                            str(restore_error))
+                    original_error = error[0]
+                    error[0] = RuntimeError(
+                        "Bread could not restore the user's replay event: %s%s" %
+                        (str(restore_error),
+                         "; original operation: %s" % str(original_error)
+                         if original_error is not None else ""))
+                    error[0].__cause__ = restore_error
             if request_tracker is not None:
                 if had_atomic_state:
                     request_tracker["replayAtomicTransaction"] = (
@@ -2030,6 +2532,9 @@ def _replay(fn):
                     pass
             else:
                 _request_event_state.current = previous_tracker
+            if timing is not None:
+                callback_cpu_finished[0] = _bridge_thread_cpu_seconds()
+                callback_finished[0] = time.monotonic()
 
     replay = _foreground_replay_manager()
     if replay is None:
@@ -2048,7 +2553,7 @@ def _replay(fn):
         if background_tag:
             if tagged_block is None:
                 raise RuntimeError(
-                    "This qrenderdoc build does not support background ReplayLab replay requests")
+                    "This qrenderdoc build does not support background Bread replay requests")
             tagged_block(background_tag, _invoke)
         else:
             replay.BlockInvoke(_invoke)
@@ -2059,7 +2564,15 @@ def _replay(fn):
         # so a committed mutation and its recovery keep their exact outcome.
         if error[0] is None:
             _background_replay_checkpoint()
+    except BaseException:
+        invocation_failed[0] = True
+        raise
     finally:
+        if timing is not None:
+            _record_bridge_replay_timing(timing, getattr(fn, "__name__", "replayTransaction"),
+                posted_at, callback_started[0], callback_finished[0],
+                callback_cpu_started[0], callback_cpu_finished[0],
+                "failed" if invocation_failed[0] or error[0] is not None else "completed")
         if request_tracker is not None:
             if had_replay_manager:
                 request_tracker["replayManager"] = previous_replay_manager
@@ -2077,6 +2590,8 @@ def _notify_shader_replay_changed():
     invalidate persistent event-texture snapshots, so each successful mutation must send the same
     viewer refresh hint after the replay transaction commits.
     """
+    if getattr(_request_dispatch_state, 'defer_shader_notifications', False):
+        return
     try:
         _invoke_on_ui_sync(lambda: _ctx.RefreshStatus())
     except BaseException:
@@ -2240,7 +2755,7 @@ def _release_event_shader_overrides():
             try:
                 ctrl.FreeTargetResource(target["targetResource"])
             except Exception:
-                pass
+                _register_orphan_shader_target(target["targetResource"])
 
     try:
         _replay(_do)
@@ -2252,7 +2767,57 @@ def _release_event_shader_overrides():
 def _advance_shared_shader_mutation_epoch():
     global _shared_shader_mutation_epoch
     _shared_shader_mutation_epoch += 1
+    globals().get("_event_texture_raw_cache", {}).clear()
     return _shared_shader_mutation_epoch
+
+
+def _register_orphan_shader_target(target):
+    """Queue a built target the caller could not free for the Host orphan sweep.
+
+    A target that is still bound by a live replacement (for example after a
+    failed restore) cannot be freed immediately without risking live replay,
+    but it must not leak for the capture's lifetime either. ``release_replay
+    _transient_caches`` frees every queued orphan once the binding clears, so
+    routing unfreeable targets here keeps qrenderdoc memory bounded across many
+    validation calls.
+
+    Build admission enforces the normal hard bound. If a target already
+    exists (for example from an in-flight or older caller), preserving its
+    cleanup ID takes precedence over truncating the queue.
+    """
+    global _shared_shader_orphan_targets
+    if target is None:
+        return False
+    if target in _shared_shader_orphan_targets:
+        return False
+    _shared_shader_orphan_targets.append(target)
+    return True
+
+
+def _require_shader_target_build_capacity(required_targets=1):
+    """Fail before native allocation when orphan cleanup has no safe room."""
+    required = int(required_targets or 0)
+    if required <= 0:
+        return
+    remaining = max(
+        0, int(MAX_SHARED_SHADER_ORPHAN_TARGETS) -
+        len(_shared_shader_orphan_targets))
+    if required > remaining:
+        raise RuntimeError(
+            "The active capture reached the %d orphan Shader target limit; "
+            "retry transient replay cleanup or close the capture before "
+            "building another target" % MAX_SHARED_SHADER_ORPHAN_TARGETS)
+
+
+def _build_target_shader(ctrl, entry_point, encoding, candidate_bytes,
+                         compile_flags, stage):
+    """The single admission gate for every bridge-created target Shader."""
+    _require_healthy_replay(ctrl)
+    _require_shader_target_build_capacity(1)
+    result = ctrl.BuildTargetShader(
+        entry_point, encoding, candidate_bytes, compile_flags, stage)
+    _require_healthy_replay(ctrl)
+    return result
 
 
 def _forget_shared_shader_replacements():
@@ -2263,9 +2828,11 @@ def _forget_shared_shader_replacements():
     global _shared_shader_rollback_tombstone_order
     global _shared_shader_operation_outcomes
     global _shared_shader_operation_outcome_order
+    global _shared_shader_manual_target_cache
     had_active_replacement = bool(_shared_shader_replacements)
     _shared_shader_replacements = {}
     _shared_shader_orphan_targets = []
+    _shared_shader_manual_target_cache = []
     _shared_shader_replacement_capture_token = None
     _shared_shader_rollback_tombstones = {}
     _shared_shader_rollback_tombstone_order = []
@@ -2338,7 +2905,7 @@ def _require_shared_shader_ui_owner(original_resource, owned_record):
             "The captured Shader replacement is no longer owned by this bridge")
 
 
-def _set_shared_shader_ui_owner(original_resource, target_resource):
+def _set_shared_shader_ui_owner(original_resource, target_resource, replace_direct=False):
     """Set and then prove one CaptureContext replacement owner.
 
     RegisterReplacement is outside the replay thread and is therefore the only
@@ -2360,7 +2927,7 @@ def _set_shared_shader_ui_owner(original_resource, target_resource):
         if not callable(unregister):
             raise RuntimeError(
                 "This qrenderdoc context does not expose UnregisterReplacement")
-        if current is not None:
+        if current is not None and not (replace_direct and expected_id):
             unregister(original_resource)
 
         if expected_id:
@@ -2387,6 +2954,7 @@ def _release_shared_shader_replacements():
     """Best-effort remove/unregister replacements and free generated targets."""
     records = list(_shared_shader_replacements.values())
     orphan_targets = list(_shared_shader_orphan_targets)
+    orphan_targets.extend(row["targetResource"] for row in _shared_shader_manual_target_cache)
     owner_token = _shared_shader_replacement_capture_token
     if not records and not orphan_targets:
         _forget_shared_shader_replacements()
@@ -2468,7 +3036,7 @@ def _release_shared_shader_replacements():
             try:
                 ctrl.FreeTargetResource(target)
             except Exception:
-                pass
+                _register_orphan_shader_target(target)
 
     try:
         _replay(_free)
@@ -2542,10 +3110,17 @@ def _symbol_alias_rename_ledger_copy(value):
     """Copy only the bounded primitive fields used to restore captured names."""
     result = {}
     for resource_id, original in value.items():
-        result[int(resource_id)] = {
+        item = {
             "hadCustomName": bool(original.get("hadCustomName")),
             "name": str(original.get("name", "") or ""),
         }
+        managed_name = original.get("managedName")
+        if isinstance(managed_name, str) and managed_name:
+            item["managedName"] = managed_name[:512]
+        binding_kind = str(original.get("bindingKind", "") or "")
+        if binding_kind in ("shader", "textureresource"):
+            item["bindingKind"] = binding_kind
+        result[int(resource_id)] = item
     return result
 
 
@@ -2597,7 +3172,8 @@ def _require_symbol_alias_recovery_binding(ledger, expected_capture_id):
     return expected
 
 
-def _symbol_alias_rollback_receipt(ledger, status):
+def _symbol_alias_rollback_receipt(ledger, status, kept_user=None):
+    kept_user = list(kept_user or [])
     return {
         "schema": SYMBOL_ALIAS_ROLLBACK_SCHEMA,
         "schemaVersion": SYMBOL_ALIAS_ROLLBACK_VERSION,
@@ -2616,6 +3192,10 @@ def _symbol_alias_rollback_receipt(ledger, status):
         "overlayRestored": True,
         "renameLedgerRestored": True,
         "resourceCount": len(ledger.get("resources", {})),
+        "restoredResourceCount": max(
+            0, len(ledger.get("resources", {})) - len(kept_user)),
+        "keptUser": kept_user,
+        "userTakeoverCount": len(kept_user),
         "failures": [],
     }
 
@@ -2635,7 +3215,47 @@ def _restore_symbol_alias_recovery_ledger(ledger, expected_capture_id):
 
     resources = _context_resource_ids()
     failures = []
+    kept_user = []
+    takeover_ids = set()
+    committed = str(ledger.get("state", "") or "").startswith("committed")
+    managed_names = ledger.get("managedNames", {})
+    managed_names = managed_names if isinstance(managed_names, dict) else {}
+    if committed:
+        for resource_id in sorted(originals):
+            expected = managed_names.get(resource_id)
+            if expected is None:
+                expected = managed_names.get(str(resource_id))
+            if not isinstance(expected, dict):
+                continue
+            rid = resources.get(resource_id)
+            if rid is None:
+                continue
+            try:
+                current_custom = bool(_ctx.HasResourceCustomName(rid))
+                current_name = str(
+                    _ctx.GetResourceNameUnsuffixed(rid) or "")
+            except Exception as exc:
+                failures.append("resource %d ownership check failed: %s" % (
+                    resource_id, str(exc)))
+                continue
+            expected_custom = bool(expected.get("hadCustomName"))
+            expected_name = str(expected.get("name", "") or "")
+            if (current_custom != expected_custom or
+                    (expected_custom and current_name != expected_name)):
+                takeover_ids.add(resource_id)
+                kept_user.append({
+                    "resourceId": resource_id,
+                    "displayName": current_name,
+                    "managedDisplayName": expected_name,
+                    "reason": "current custom name no longer matches Bread's managed value",
+                })
+    if failures:
+        raise RuntimeError(
+            "Symbol alias rollback could not verify Bread ownership; "
+            "recovery remains required (%s)" % "; ".join(failures[:16]))
     for resource_id in sorted(originals):
+        if resource_id in takeover_ids:
+            continue
         original = originals[resource_id]
         rid = resources.get(resource_id)
         if rid is None:
@@ -2658,6 +3278,16 @@ def _restore_symbol_alias_recovery_ledger(ledger, expected_capture_id):
         try:
             actual_custom = bool(_ctx.HasResourceCustomName(rid))
             actual_name = str(_ctx.GetResourceNameUnsuffixed(rid) or "")
+            if resource_id in takeover_ids:
+                takeover = next(
+                    item for item in kept_user
+                    if item["resourceId"] == resource_id)
+                if (not actual_custom or
+                        actual_name != takeover["displayName"]):
+                    failures.append(
+                        "resource %d user-owned name changed during rollback"
+                        % resource_id)
+                continue
             if (actual_custom != original["hadCustomName"] or
                     actual_name != original["name"]):
                 failures.append(
@@ -2675,10 +3305,14 @@ def _restore_symbol_alias_recovery_ledger(ledger, expected_capture_id):
             "recovery remains required (%s)" % "; ".join(failures[:16]))
 
     _symbol_alias_overlay = ledger["originalOverlay"]
-    _symbol_resource_renames = _symbol_alias_rename_ledger_copy(
+    restored_renames = _symbol_alias_rename_ledger_copy(
         ledger["originalResourceRenames"])
+    for resource_id in takeover_ids:
+        restored_renames.pop(resource_id, None)
+    _symbol_resource_renames = restored_renames
     _symbol_rename_capture_token = ledger["originalRenameCaptureToken"]
-    receipt = _symbol_alias_rollback_receipt(ledger, "restored")
+    receipt = _symbol_alias_rollback_receipt(
+        ledger, "restored", kept_user=kept_user)
     _symbol_alias_recovery_ledger = None
     _symbol_alias_last_rollback_receipt = receipt
     return dict(receipt)
@@ -2713,6 +3347,14 @@ def _legacy_symbol_alias_recovery_ledger(capture_id):
         "originalResourceRenames": {},
         "originalRenameCaptureToken": None,
         "resources": _symbol_alias_rename_ledger_copy(_symbol_resource_renames),
+        "managedNames": {
+            resource_id: {
+                "hadCustomName": True,
+                "name": str(original.get("managedName", "") or ""),
+            }
+            for resource_id, original in _symbol_resource_renames.items()
+            if str(original.get("managedName", "") or "")
+        },
     }
     return ledger
 
@@ -2812,6 +3454,7 @@ def _get_symbol_alias_transaction(params):
     mutation_present = False
     committed = False
     manifest_sha256 = ""
+    manifest_path = ""
     if (isinstance(ledger, dict) and
             (not transaction_id or
              str(ledger.get("transactionId", "") or "") == transaction_id)):
@@ -2820,6 +3463,11 @@ def _get_symbol_alias_transaction(params):
         mutation_present = True
         committed = state == "committed"
         manifest_sha256 = str(ledger.get("manifestSha256", "") or "")
+        commit_response = ledger.get("commitResponse")
+        if committed and isinstance(commit_response, dict):
+            candidate_path = str(commit_response.get("path", "") or "")
+            if candidate_path and len(candidate_path) <= 32768:
+                manifest_path = candidate_path
     elif (isinstance(last, dict) and
           (not transaction_id or
            str(last.get("transactionId", "") or "") == transaction_id) and
@@ -2839,6 +3487,7 @@ def _get_symbol_alias_transaction(params):
         "recoveryRequired": mutation_present,
         "rollbackAvailable": mutation_present,
         "manifestSha256": manifest_sha256,
+        "manifestPath": manifest_path,
         "replayMutation": False,
     }
 
@@ -2858,6 +3507,15 @@ def _restore_symbol_resource_names_best_effort(resource_renames, capture_token):
             rid = resources.get(resource_id)
             if rid is None:
                 continue
+            managed_name = str(original.get("managedName", "") or "")
+            if managed_name:
+                current_custom = bool(_ctx.HasResourceCustomName(rid))
+                current_name = str(
+                    _ctx.GetResourceNameUnsuffixed(rid) or "")
+                if not current_custom or current_name != managed_name:
+                    # The user changed or cleared Bread's last value.  Resetting
+                    # the overlay must not reclaim ownership of that resource.
+                    continue
             name = original.get("name", "") if original.get("hadCustomName") else ""
             _ctx.SetResourceCustomName(rid, name)
         except Exception:
@@ -2895,7 +3553,9 @@ def _reset_symbol_overlay(restore_names=True):
 
 def _reset_symbol_state(restore_names=True):
     global _symbol_capture_snapshot, _known_catalog_capture_ids
-    global _known_catalog_identity_pairs, _capture_session_id
+    global _known_catalog_identity_pairs, _known_catalog_stable_pairs
+    global _capture_session_id
+    globals().get("_event_texture_raw_cache", {}).clear()
     _reset_symbol_overlay(restore_names=restore_names)
     _forget_event_shader_overrides()
     _forget_shared_shader_replacements()
@@ -2909,6 +3569,7 @@ def _reset_symbol_state(restore_names=True):
     }
     _known_catalog_capture_ids = {}
     _known_catalog_identity_pairs = set()
+    _known_catalog_stable_pairs = set()
     with _project_shader_index_jobs_guard:
         now = time.monotonic()
         for job in _project_shader_index_jobs.values():
@@ -2960,6 +3621,8 @@ def _reset_symbol_state(restore_names=True):
 
 def _synchronise_capture_lifecycle():
     global _active_capture_token
+    if _replay_recovery_path:
+        return
     token = _current_capture_token()
     if _active_capture_token is None:
         if token is not None and not _capture_session_id:
@@ -2997,6 +3660,92 @@ def _catalog_capture_id(catalog):
     canonical = json.dumps(
         identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _stable_shader_key(shader_key):
+    """A Shader key without the capture-local ResourceId.
+
+    RenderDoc hands out a fresh ResourceId every time a capture is opened, so a key
+    that contains one identifies a Shader *in this replay session* and nothing more.
+    What is stable across sessions, across .rdc files and across re-recordings of the
+    same game build is ``stage:entryPoint:rawSha256`` -- the Shader's own bytes.
+    """
+    parts = str(shader_key or "").split(":", 1)
+    return parts[1] if len(parts) == 2 else str(shader_key or "")
+
+
+def _catalog_stable_capture_id(catalog):
+    """The capture identity with the volatile ResourceId removed.
+
+    ``captureId`` answers "which replay session is this"; this answers "which Shaders
+    are these", which is the question a stored workspace actually needs to ask when it
+    reattaches. Everything else in the hash -- capture path, API, Shader bytes -- is
+    the same across sessions.
+    """
+    shaders = []
+    for shader in catalog.get("shaders", []):
+        if not isinstance(shader, dict):
+            continue
+        shaders.append({
+            "stage": _normalise_stage_name(shader.get("stage", "")),
+            "entryPoint": str(
+                shader.get("entryPoint", shader.get("entry", "")) or ""),
+            "rawSha256": str(shader.get("rawSha256", "") or "").lower(),
+        })
+    shaders.sort(key=lambda value: (
+        value["stage"], value["entryPoint"], value["rawSha256"]))
+    # No capture path: this identity answers "which Shaders are these", and that
+    # does not change with the file's spelling, its folder, or a second capture of
+    # the same build. The Host computes the same hash from the stored catalog.
+    identity = {
+        "api": str(catalog.get("api", "") or ""),
+        "shaders": shaders,
+    }
+    canonical = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _catalog_stable_identity_evidence(evidence):
+    """The same evidence with every ResourceId dropped from its Shader keys."""
+    return {
+        "selection": evidence["selection"],
+        "shaderKeys": sorted(set(
+            _stable_shader_key(key) for key in evidence["shaderKeys"])),
+        "useTuples": sorted(
+            [event_id, _stable_shader_key(shader_key)]
+            for event_id, shader_key in evidence["useTuples"]),
+    }
+
+
+def _catalog_capture_id_description(catalog, expected_capture_id):
+    """Say which identity input differs, because the hash alone says nothing.
+
+    The captureId is a hash of exactly three things: the capture path, the API name
+    and the selected Shader tuples. When a stored workspace stops rebinding, exactly
+    one of them has drifted -- a re-recorded .rdc, a path spelled differently, an API
+    enum whose text changed, or a selection that now resolves to a different Shader.
+    Printing them turns a dead end into a one-line diagnosis.
+    """
+    shaders = []
+    for shader in (catalog.get("shaders", []) or [])[:6]:
+        if not isinstance(shader, dict):
+            continue
+        shaders.append("%s:%s:%s:%s" % (
+            _safe_int(shader.get("shaderResourceId", shader.get("resourceId", 0)), 0),
+            _normalise_stage_name(shader.get("stage", "")),
+            str(shader.get("entryPoint", shader.get("entry", "")) or ""),
+            str(shader.get("rawSha256", "") or "").lower()[:16]))
+    return ("computed=%s expected=%s capturePath=%r api=%r shaderCount=%d selection=%s "
+            "shaders=[%s]" % (
+                str(catalog.get("captureId", ""))[:16],
+                str(expected_capture_id or "")[:16],
+                str(catalog.get("capturePath", "") or ""),
+                str(catalog.get("api", "") or ""),
+                len(catalog.get("shaders", []) or []),
+                json.dumps(catalog.get("selection", {}), ensure_ascii=False,
+                           sort_keys=True)[:160],
+                ", ".join(shaders)))
 
 
 def _catalog_identity_evidence(catalog):
@@ -3153,6 +3902,16 @@ def _catalog_identity_evidence_sha256(catalog):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _catalog_stable_identity_evidence_sha256(catalog):
+    """The evidence hash a stored workspace can still reproduce next session."""
+    evidence = _catalog_stable_identity_evidence(
+        _catalog_identity_evidence(catalog))
+    encoded = json.dumps(
+        evidence, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _catalog_identity_cache_projection(catalog, identity_evidence_sha256=None):
     """Build bounded exact-identity cache state without publishing any of it."""
     if not isinstance(catalog, dict):
@@ -3194,17 +3953,30 @@ def _catalog_identity_cache_projection(catalog, identity_evidence_sha256=None):
         raise RuntimeError(
             "Too many exact catalog selections were exported in this capture session")
     new_identity_pairs.add(identity_pair)
+    stable_capture_id = _catalog_stable_capture_id(catalog)
+    stable_evidence_sha256 = _catalog_stable_identity_evidence_sha256(catalog)
+    new_stable_pairs = set(_known_catalog_stable_pairs)
+    stable_pair = (stable_capture_id, stable_evidence_sha256)
+    if (stable_pair not in new_stable_pairs and
+            len(new_stable_pairs) >= MAX_KNOWN_CATALOG_IDENTITY_PAIRS):
+        raise RuntimeError(
+            "Too many exact catalog selections were exported in this capture session")
+    new_stable_pairs.add(stable_pair)
     return {
         "captureId": capture_id,
         "capturePath": capture_path,
         "knownCaptureIds": new_known_capture_ids,
         "knownIdentityPairs": new_identity_pairs,
+        "knownStablePairs": new_stable_pairs,
         "identityEvidenceSha256": identity_evidence_sha256,
+        "stableCaptureId": stable_capture_id,
+        "stableIdentityEvidenceSha256": stable_evidence_sha256,
     }
 
 
 def _prepare_catalog_cache_publication(catalog, identity_evidence_sha256=None,
-                                       identity_only=False):
+                                       identity_only=False,
+                                       recover_aliases_before_switch=False):
     """Build every potentially large catalog cache value off the GUI thread."""
     projected = _catalog_identity_cache_projection(
         catalog, identity_evidence_sha256)
@@ -3212,6 +3984,7 @@ def _prepare_catalog_cache_publication(catalog, identity_evidence_sha256=None,
         "identityOnly": bool(identity_only),
         "baseKnownCaptureIds": _known_catalog_capture_ids,
         "baseKnownIdentityPairs": _known_catalog_identity_pairs,
+        "baseKnownStablePairs": _known_catalog_stable_pairs,
         "projected": projected,
     }
     if identity_only:
@@ -3260,7 +4033,9 @@ def _prepare_catalog_cache_publication(catalog, identity_evidence_sha256=None,
 
     old_capture_id = str(_symbol_capture_snapshot.get("captureId", "") or "")
     reset_overlay = bool(old_capture_id and old_capture_id != capture_id)
-    if reset_overlay and _symbol_alias_recovery_ledger is not None:
+    recover_aliases_before_switch = bool(recover_aliases_before_switch)
+    if (reset_overlay and _symbol_alias_recovery_ledger is not None and
+            not recover_aliases_before_switch):
         raise RuntimeError(
             "Rollback the capture-bound symbol aliases before publishing a "
             "different catalog identity")
@@ -3271,6 +4046,9 @@ def _prepare_catalog_cache_publication(catalog, identity_evidence_sha256=None,
         "baseResourceRenamesValue": dict(_symbol_resource_renames),
         "baseRenameCaptureToken": _symbol_rename_capture_token,
         "baseAliasRecoveryLedger": _symbol_alias_recovery_ledger,
+        "recoverAliasesBeforeSwitch": bool(
+            reset_overlay and _symbol_alias_recovery_ledger is not None and
+            recover_aliases_before_switch),
         "newSnapshot": new_snapshot,
         "resetOverlay": reset_overlay,
         "newOverlay": _new_symbol_alias_overlay() if reset_overlay else None,
@@ -3386,9 +4164,11 @@ def _prepare_inventory_symbol_snapshot_publication(result, capture_path):
         "identityOnly": False,
         "baseKnownCaptureIds": _known_catalog_capture_ids,
         "baseKnownIdentityPairs": _known_catalog_identity_pairs,
+        "baseKnownStablePairs": _known_catalog_stable_pairs,
         "projected": {
             "knownCaptureIds": dict(_known_catalog_capture_ids),
             "knownIdentityPairs": set(_known_catalog_identity_pairs),
+            "knownStablePairs": set(_known_catalog_stable_pairs),
         },
         "baseSymbolSnapshot": _symbol_capture_snapshot,
         "baseAliasOverlay": _symbol_alias_overlay,
@@ -3411,13 +4191,16 @@ def _commit_catalog_cache_publication(publication):
     global _symbol_alias_overlay, _symbol_resource_renames
     global _symbol_rename_capture_token, _symbol_capture_snapshot
     global _known_catalog_capture_ids, _known_catalog_identity_pairs
+    global _known_catalog_stable_pairs
     global _symbol_alias_recovery_ledger, _symbol_alias_last_rollback_receipt
 
     if not isinstance(publication, dict):
         raise RuntimeError("Shader catalog cache publication is invalid")
     if (_known_catalog_capture_ids is not publication.get("baseKnownCaptureIds") or
             _known_catalog_identity_pairs is not publication.get(
-                "baseKnownIdentityPairs")):
+                "baseKnownIdentityPairs") or
+            _known_catalog_stable_pairs is not publication.get(
+                "baseKnownStablePairs")):
         raise RuntimeError("Shader catalog cache changed before publication")
     projected = publication.get("projected")
     if not isinstance(projected, dict):
@@ -3427,6 +4210,7 @@ def _commit_catalog_cache_publication(publication):
         # reader can observe a known captureId without the pair (safe slow
         # path), never a newly-authorised pair without its path binding.
         _known_catalog_capture_ids = projected["knownCaptureIds"]
+        _known_catalog_stable_pairs = projected["knownStablePairs"]
         _known_catalog_identity_pairs = projected["knownIdentityPairs"]
         return
 
@@ -3442,14 +4226,30 @@ def _commit_catalog_cache_publication(publication):
                 "baseAliasRecoveryLedger")):
         raise RuntimeError("Shader symbol state changed before catalog publication")
     if publication.get("resetOverlay") is True:
+        if publication.get("recoverAliasesBeforeSwitch") is True:
+            recovery = publication.get("baseAliasRecoveryLedger")
+            if not isinstance(recovery, dict):
+                raise RuntimeError(
+                    "Shader catalog switch lost its alias recovery ledger")
+            old_capture_id = str(
+                publication["baseSymbolSnapshot"].get("captureId", "") or "")
+            # Keep the old catalog active until every Bread-managed name has
+            # either been restored or explicitly preserved as a user takeover.
+            # A failed restore leaves the old snapshot and exact ledger in
+            # place, so the same recovery can be retried without guessing.
+            _restore_symbol_alias_recovery_ledger(recovery, old_capture_id)
+            if _symbol_alias_recovery_ledger is not None:
+                raise RuntimeError(
+                    "Shader catalog switch did not complete alias recovery")
         _restore_symbol_resource_names_best_effort(
-            publication["resourceRenames"], publication["renameCaptureToken"])
+            _symbol_resource_renames, _symbol_rename_capture_token)
         _symbol_alias_overlay = publication["newOverlay"]
         _symbol_resource_renames = {}
         _symbol_rename_capture_token = None
         _symbol_alias_last_rollback_receipt = None
     _symbol_capture_snapshot = publication["newSnapshot"]
     _known_catalog_capture_ids = projected["knownCaptureIds"]
+    _known_catalog_stable_pairs = projected["knownStablePairs"]
     _known_catalog_identity_pairs = projected["knownIdentityPairs"]
 
 
@@ -3510,10 +4310,45 @@ def _revalidate_symbol_shader_keys(expected_keys):
                     if selected is None:
                         failures[key] = "shader entry point changed since catalog export"
                         continue
-                    reflection = ctrl.GetShader(_get_pipeline_obj(ps, ctrl), shader_id, selected)
-                    if not reflection:
+                    active_reflection = ctrl.GetShader(
+                        _get_pipeline_obj(ps, ctrl), shader_id, selected)
+                    if not active_reflection:
                         failures[key] = "shader reflection is unavailable"
                         continue
+                    # D3D12 resolves GetShader through an active shared
+                    # replacement even though GetPipelineState().GetShader()
+                    # still returns the captured ResourceId.  Catalog export
+                    # deliberately records the retained captured-original
+                    # reflection in that case, so live alias revalidation must
+                    # prove the bridge-owned target and then compare the same
+                    # retained original bytes.  Hashing the active target here
+                    # made every valid resource-name publication fail after a
+                    # Shader workspace replacement had been applied.
+                    reflection = active_reflection
+                    owner = _shared_shader_replacements.get(resource_id)
+                    if owner is not None:
+                        capture_token = _current_capture_token()
+                        if (owner.get("captureSessionId") != _capture_session_id or
+                                owner.get("captureToken") != capture_token or
+                                _shared_shader_replacement_capture_token != capture_token or
+                                owner.get("api") != _shader_api_token(ctrl) or
+                                _resource_id_int(owner.get("originalResource")) !=
+                                resource_id):
+                            failures[key] = (
+                                "shared Shader replacement owner belongs to another capture")
+                            continue
+                        reflection = _captured_original_from_shared_owner(
+                            active_reflection,
+                            {
+                                "eventId": int(event_ids[0]),
+                                "expectedOriginalResourceId": resource_id,
+                                "expectedOriginalSha256": raw_sha256,
+                            },
+                            stage_name,
+                            entry_point,
+                            owner,
+                            allow_original_active=(owner.get("api") in ("d3d11", "vulkan", "opengl")),
+                        )
                     actual_entry = str(getattr(reflection, "entryPoint", "") or
                                        getattr(selected, "name", "") or "")
                     raw = _shader_raw_bytes(reflection)
@@ -3526,6 +4361,121 @@ def _revalidate_symbol_shader_keys(expected_keys):
                     verified.add(key)
                 except Exception as exc:
                     failures[key] = str(exc)
+        finally:
+            if restore_original_event:
+                try:
+                    _set_frame_event(ctrl, original_event, True)
+                except Exception:
+                    pass
+        return verified, failures
+
+    return _replay(_do)
+
+
+def _revalidate_symbol_texture_aliases(candidates):
+    """Prove each texture alias still names the resource bound at its exact EID.
+
+    The Host seals the asset/content decision, while the bridge owns the live
+    capture fact.  Keeping those responsibilities separate prevents a stale
+    material receipt from renaming an unrelated resource after the selected
+    draw or capture changes.
+    """
+    candidates = [item for item in candidates if item[3] == "textureresource"]
+    if not candidates:
+        return set(), {}
+
+    stage_map = dict(_available_shader_stages())
+    try:
+        original_event = _request_visible_event_id(0)
+        restore_original_event = True
+    except Exception:
+        original_event = 0
+        restore_original_event = False
+
+    def _do(ctrl):
+        verified = set()
+        failures = {}
+        try:
+            texture_ids = {
+                _resource_id_int(getattr(texture, "resourceId", None))
+                for texture in (ctrl.GetTextures() or [])
+            }
+            for index, alias, shader_key, unused_kind in candidates:
+                metadata = alias.get("metadata", {})
+                event_id = _safe_int(
+                    metadata.get("eventId") if isinstance(metadata, dict) else 0, 0)
+                target_id = _alias_target_resource_id(alias)
+                bind_number = _safe_int(_alias_first(
+                    alias, ("bindNumber", "bind", "fixedBindNumber"), -1), -1)
+                register_space = _safe_int(_alias_first(
+                    alias, ("registerSpace", "space", "fixedBindSetOrSpace"), 0), 0)
+                requested_array = _alias_first(
+                    alias, ("arrayIndex", "arrayElement"), None)
+                requested_array = (
+                    _safe_int(requested_array, -1)
+                    if requested_array is not None else None)
+                shader_id, stage_name, entry_point, unused_raw_sha256 = shader_key
+                stage = stage_map.get(stage_name)
+                if event_id <= 0 or target_id <= 0 or bind_number < 0:
+                    failures[index] = (
+                        "texture resource alias requires eventId, resourceId and bindNumber")
+                    continue
+                if target_id not in texture_ids:
+                    failures[index] = "texture resource is absent from the active capture"
+                    continue
+                if stage is None:
+                    failures[index] = "shader stage is unavailable in this RenderDoc build"
+                    continue
+                try:
+                    _set_frame_event(ctrl, event_id, True)
+                    pipeline = ctrl.GetPipelineState()
+                    live_shader = pipeline.GetShader(stage)
+                    if _resource_id_int(live_shader) != shader_id:
+                        failures[index] = "the Shader bound at the alias EID changed"
+                        continue
+                    entries = list(ctrl.GetShaderEntryPoints(live_shader) or [])
+                    selected = next((
+                        entry for entry in entries
+                        if str(getattr(entry, "name", "") or "") == entry_point
+                    ), None)
+                    if selected is None:
+                        failures[index] = "the Shader entry point at the alias EID changed"
+                        continue
+                    reflection = ctrl.GetShader(
+                        _get_pipeline_obj(pipeline, ctrl), live_shader, selected)
+                    if reflection is None:
+                        failures[index] = "Shader reflection is unavailable at the alias EID"
+                        continue
+                    try:
+                        bindings = pipeline.GetReadOnlyResources(stage)
+                    except Exception:
+                        bindings = None
+                    matches = []
+                    for slot_index, resource in enumerate(
+                            getattr(reflection, "readOnlyResources", []) or []):
+                        if not getattr(resource, "isTexture", False):
+                            continue
+                        live_bind = _safe_int(
+                            getattr(resource, "fixedBindNumber", slot_index), slot_index)
+                        live_space = _safe_int(
+                            getattr(resource, "fixedBindSetOrSpace", 0), 0)
+                        if live_bind != bind_number or live_space != register_space:
+                            continue
+                        for exact in _exact_readonly_descriptor_resources(
+                                bindings, slot_index):
+                            if (exact["resourceId"] == target_id and
+                                    (requested_array is None or
+                                     exact["arrayElement"] == requested_array)):
+                                matches.append((
+                                    slot_index, exact["arrayElement"],
+                                    exact["descriptorStoreId"]))
+                    if not matches:
+                        failures[index] = (
+                            "texture resource is not exactly bound at the authorized register")
+                        continue
+                    verified.add(index)
+                except Exception as exc:
+                    failures[index] = str(exc)
         finally:
             if restore_original_event:
                 try:
@@ -3599,13 +4549,31 @@ def _shader_type_info(shader_type):
     }
 
 
+def _shader_type_is_empty_struct(shader_type):
+    """A reflected empty declaration occupies no storage or ABI field."""
+    return (shader_type is not None and
+            str(getattr(shader_type, "baseType", "")).lower() in ("struct", "vartype.struct") and
+            not list(getattr(shader_type, "members", []) or []) and
+            _safe_int(getattr(shader_type, "rows", -1), -1) == 0 and
+            _safe_int(getattr(shader_type, "columns", -1), -1) == 0 and
+            _safe_int(getattr(shader_type, "elements", 0), 0) == 1 and
+            _safe_int(getattr(shader_type, "arrayByteStride", -1), -1) == 0 and
+            _safe_int(getattr(shader_type, "matrixByteStride", -1), -1) == 0 and
+            _safe_int(getattr(shader_type, "pointerTypeID", 0xFFFFFFFF), 0xFFFFFFFF) == 0xFFFFFFFF)
+
+
 def _shader_type_byte_size(shader_type):
     if shader_type is None:
         return 0
+    if _shader_type_is_empty_struct(shader_type):
+        return 0
     elements = max(_safe_int(getattr(shader_type, "elements", 1), 1), 1)
     array_stride = _safe_int(getattr(shader_type, "arrayByteStride", 0), 0)
-    if elements > 1 and array_stride > 0:
-        return elements * array_stride
+    # RenderDoc uses ~0U for a runtime-sized SPIR-V array. Its capacity comes
+    # from the bound buffer, not from reflection. Preserve the sentinel/stride
+    # separately and report only the fixed prefix, never stride * ~0U.
+    if elements == 0xFFFFFFFF:
+        return 0
 
     members = getattr(shader_type, "members", []) or []
     if members:
@@ -3614,7 +4582,8 @@ def _shader_type_byte_size(shader_type):
             member_end = (_safe_int(getattr(member, "byteOffset", 0), 0) +
                           _shader_type_byte_size(getattr(member, "type", None)))
             end = max(end, member_end)
-        return end * elements
+        return ((elements - 1) * array_stride + end
+                if elements > 1 and array_stride > 0 else end * elements)
 
     rows = max(_safe_int(getattr(shader_type, "rows", 1), 1), 1)
     columns = max(_safe_int(getattr(shader_type, "columns", 1), 1), 1)
@@ -3622,7 +4591,10 @@ def _shader_type_byte_size(shader_type):
     if rows > 1 and columns > 1 and matrix_stride > 0:
         info = _shader_type_info(shader_type)
         major_count = rows if info["rowMajor"] else columns
-        return matrix_stride * major_count * elements
+        minor_count = columns if info["rowMajor"] else rows
+    else:
+        major_count = 1
+        minor_count = rows * columns
 
     base = str(getattr(shader_type, "baseType", "")).lower()
     component_size = 4
@@ -3632,7 +4604,12 @@ def _shader_type_byte_size(shader_type):
         component_size = 2
     elif "byte" in base and "byteaddress" not in base:
         component_size = 1
-    return rows * columns * component_size * elements
+    # The final row/column/array element does not own its trailing alignment
+    # padding. HLSL may place the next variable there (for example float2 after
+    # a float2x2 with 16-byte row stride). Keep strides separately from extent.
+    element_size = (major_count - 1) * matrix_stride + minor_count * component_size
+    return ((elements - 1) * array_stride + element_size
+            if elements > 1 and array_stride > 0 else element_size * elements)
 
 
 def _shader_constant_fields(constants, prefix="", parent_offset=0, depth=0):
@@ -3647,6 +4624,10 @@ def _shader_constant_fields(constants, prefix="", parent_offset=0, depth=0):
         relative_offset = _safe_int(getattr(constant, "byteOffset", 0), 0)
         absolute_offset = parent_offset + relative_offset
         shader_type = getattr(constant, "type", None)
+        if _shader_type_is_empty_struct(shader_type):
+            # Native DXIL includes empty declarations at the next member's
+            # offset. They carry no bytes and must not fabricate an overlap.
+            continue
         type_info = _shader_type_info(shader_type)
         field = {
             "path": path,
@@ -3706,15 +4687,27 @@ def _constant_field_annotations_are_complete(fields, parent_byte_size, depth=0):
         columns = _safe_int(field.get("columns"), 0)
         elements = _safe_int(field.get("elements"), 0)
         base_type = _physical_base_type(field.get("baseType"))
-        if (byte_offset < 0 or byte_size <= 0 or rows <= 0 or columns <= 0 or
-                elements <= 0 or base_type in ("", "unknown")):
+        members = list(field.get("members", []) or [])
+        aggregate = base_type == "struct" and bool(members)
+        if (byte_offset < 0 or byte_size <= 0 or
+                (not aggregate and (rows <= 0 or columns <= 0)) or
+                rows < 0 or columns < 0 or elements <= 0 or
+                base_type in ("", "unknown")):
             return False
         if byte_offset + byte_size > parent_byte_size:
             return False
 
-        members = list(field.get("members", []) or [])
+        # Native SPIR-V struct reflection has rows=columns=0. Its members,
+        # offsets and array stride define the layout, not scalar dimensions.
+        # Validate children against one array element, never the whole array.
+        member_limit = byte_size
+        if aggregate and elements > 1:
+            stride = _safe_int(field.get("arrayByteStride"), 0)
+            if stride <= 0 or stride * (elements - 1) >= byte_size:
+                return False
+            member_limit = min(stride, byte_size - stride * (elements - 1))
         if members and not _constant_field_annotations_are_complete(
-                members, byte_size, depth + 1):
+                members, member_limit, depth + 1):
             return False
 
         bit_offset = _safe_int(field.get("bitFieldOffset"), 0)
@@ -3831,6 +4824,11 @@ def _drop_conflicting_legacy_unknown_fields(fields):
 def _shader_constant_type_dict(shader_type):
     """Serialise the physical shape of a ShaderConstantType without trusting its name."""
     info = _shader_type_info(shader_type)
+    members = getattr(shader_type, "members", []) if shader_type is not None else []
+    # SPIR-V storage-buffer wrappers use Float/0/0 in native reflection even
+    # though their member tree is a struct. Canonicalise that aggregate shape.
+    if members and info["rows"] == 0 and info["columns"] == 0:
+        info["baseType"] = "VarType.Struct"
     return {
         "name": info["name"],
         "baseType": info["baseType"],
@@ -3844,8 +4842,7 @@ def _shader_constant_type_dict(shader_type):
         "pointerTypeID": _safe_int(getattr(shader_type, "pointerTypeID", 0xFFFFFFFF),
                                    0xFFFFFFFF),
         "byteSize": _shader_type_byte_size(shader_type),
-        "members": _shader_constant_fields(
-            getattr(shader_type, "members", []) if shader_type is not None else []),
+        "members": _shader_constant_fields(members),
     }
 
 
@@ -3911,7 +4908,8 @@ def _constant_block_binding_key(cb, block_index):
     )
 
 
-def _constant_block_dict(cb, block_index, binding=None, layout_evidence=None):
+def _constant_block_dict(cb, block_index, binding=None, layout_evidence=None,
+                         dxbc_declaration=None):
     layout_fields, layout_completeness = _constant_block_layout(cb)
     if layout_evidence is not None:
         # This is a lower-only classification.  The evidence comes from the
@@ -3932,6 +4930,16 @@ def _constant_block_dict(cb, block_index, binding=None, layout_evidence=None):
         "fields": layout_fields,
         "layoutCompleteness": layout_completeness,
     }
+    if dxbc_declaration is not None and layout_evidence is None:
+        # Inspect the untouched fallback tree: the strict layout serializer has
+        # already dropped native zero-element placeholders. Only exact raw
+        # declaration + native fallback agreement permits an opaque envelope.
+        original = dict(block)
+        original["fields"] = _shader_constant_fields(getattr(cb, "variables", []))
+        if _dxbc_cbuffer_layout.matches_synthetic_fields(original, dxbc_declaration):
+            block["fields"] = []
+            block["layoutCompleteness"] = "opaque"
+            block["layoutEvidence"] = dict(dxbc_declaration)
     if layout_evidence is not None:
         block["layoutEvidence"] = dict(layout_evidence)
     if binding is not None:
@@ -3961,9 +4969,9 @@ def _signature_parameter_dict(parameter):
     }
 
 
-def _shader_binding_dict(binding):
+def _shader_binding_dict(binding, dxbc_declaration=None):
     descriptor_type = str(getattr(binding, "descriptorType", ""))
-    return {
+    result = {
         "name": str(getattr(binding, "name", "")),
         "space": _safe_int(getattr(binding, "fixedBindSetOrSpace", 0), 0),
         "bind": _safe_int(getattr(binding, "fixedBindNumber", -1), -1),
@@ -3980,6 +4988,16 @@ def _shader_binding_dict(binding):
         "isInputAttachment": bool(getattr(binding, "isInputAttachment", False)),
         "isReadOnly": bool(getattr(binding, "isReadOnly", False)),
     }
+    variable = result['variableType']
+    if (dxbc_declaration is not None and not result['isTexture'] and
+            result['arraySize'] == dxbc_declaration['bindArraySize'] and
+            _physical_base_type(variable['baseType']) == 'unknown' and
+            variable['rows'] == 0 and variable['columns'] == 0 and
+            variable['elements'] == 0 and not variable['members']):
+        variable.update(elements=1, byteSize=dxbc_declaration['byteSize'],
+            arrayByteStride=dxbc_declaration['byteSize'], layoutCompleteness='opaque')
+        result['layoutEvidence'] = dict(dxbc_declaration)
+    return result
 
 
 def _shader_sampler_dict(sampler):
@@ -3992,6 +5010,10 @@ def _shader_sampler_dict(sampler):
 
 
 def _thread_group_size(reflection):
+    # Only workgroup stages populate this native field. Some producers leave
+    # it uninitialized for other stages; do not read those bytes.
+    if _known_stage_name(reflection) not in ("compute", "task", "mesh"):
+        return []
     value = getattr(reflection, "dispatchThreadsDimension", None)
     if value is None:
         return []
@@ -4010,12 +5032,14 @@ def _thread_group_size(reflection):
 def _compiled_shader_interface(reflection, dxil_layout_evidence=None):
     """Serialise only physical compiled-interface facts from ShaderReflection."""
     evidence = dxil_layout_evidence or {}
+    dxbc_declarations = _dxbc_cbuffer_layout.declarations(_shader_raw_bytes(reflection))
     constant_blocks = [
         _constant_block_dict(
             value,
             index,
             layout_evidence=evidence.get(
                 _constant_block_binding_key(value, index)),
+            dxbc_declaration=dxbc_declarations.get(_constant_block_binding_key(value, index)),
         )
         for index, value in enumerate(getattr(reflection, "constantBlocks", []))
     ]
@@ -4025,7 +5049,7 @@ def _compiled_shader_interface(reflection, dxil_layout_evidence=None):
             for block in constant_blocks),
         "stage": _known_stage_name(reflection),
         "entryPoint": str(getattr(reflection, "entryPoint", "") or ""),
-        "encoding": str(getattr(reflection, "encoding", "") or ""),
+        "encoding": _native_enum_text(getattr(reflection, "encoding", None)),
         "inputSignature": [
             _signature_parameter_dict(value)
             for value in getattr(reflection, "inputSignature", [])
@@ -4035,11 +5059,11 @@ def _compiled_shader_interface(reflection, dxil_layout_evidence=None):
             for value in getattr(reflection, "outputSignature", [])
         ],
         "readOnlyResources": [
-            _shader_binding_dict(value)
+            _shader_binding_dict(value, dxbc_declarations.get(('srv',) + _constant_block_binding_key(value, -1)))
             for value in getattr(reflection, "readOnlyResources", [])
         ],
         "readWriteResources": [
-            _shader_binding_dict(value)
+            _shader_binding_dict(value, dxbc_declarations.get(('uav',) + _constant_block_binding_key(value, -1)))
             for value in getattr(reflection, "readWriteResources", [])
         ],
         "samplers": [
@@ -4049,14 +5073,19 @@ def _compiled_shader_interface(reflection, dxil_layout_evidence=None):
         "constantBlocks": constant_blocks,
         "dynamicLinkageInterfaceCount": len(
             getattr(reflection, "interfaces", []) or []),
-        "outputTopology": str(getattr(reflection, "outputTopology", "") or ""),
+        "outputTopology": _native_enum_text(getattr(reflection, "outputTopology", None)),
         "threadGroupSize": _thread_group_size(reflection),
     }
     return interface
 
 
+def _native_enum_text(value):
+    """Native enums may have a valid zero value; only None denotes absence."""
+    return "" if value is None else str(value)
+
+
 def _physical_enum(value):
-    return (str(value or "").strip().lower().rsplit(".", 1)[-1]
+    return (_native_enum_text(value).strip().lower().rsplit(".", 1)[-1]
             .replace("_", "").replace(" ", ""))
 
 
@@ -4122,7 +5151,7 @@ def _physical_constant_field(field):
 
 def _physical_variable_type(value):
     value = value if isinstance(value, dict) else {}
-    return {
+    result = {
         "baseType": _physical_base_type(value.get("baseType")),
         "rows": _safe_int(value.get("rows"), 0),
         "columns": _safe_int(value.get("columns"), 0),
@@ -4138,6 +5167,9 @@ def _physical_variable_type(value):
             for member in list(value.get("members", []) or [])
         ]),
     }
+    if value.get('layoutCompleteness') == 'opaque':
+        result['layoutCompleteness'] = 'opaque'
+    return result
 
 
 def _physical_shader_interface(interface):
@@ -4330,12 +5362,22 @@ def _interface_incompatibilities(baseline, candidate):
     """
     differences = []
     for key in _INTERFACE_STRUCTURAL_KEYS:
+        # Historical bridges dropped the false-valued Topology.Unknown enum.
+        # Interpret its two spellings only for comparison: persisted physical
+        # hashes and signed restore evidence must keep their original bytes.
+        if (key == "outputTopology" and key in baseline and key in candidate and
+                baseline[key] in ("", "unknown") and
+                candidate[key] in ("", "unknown")):
+            continue
         if baseline.get(key) != candidate.get(key):
             differences.append(key)
             return differences
     for key in _INTERFACE_USAGE_KEYS:
         available = list(baseline.get(key, []) or [])
-        for entry in candidate.get(key, []) or []:
+        requested = [dict(entry) for entry in candidate.get(key, []) or []]
+        if key in ('readOnlyResources', 'readWriteResources'):
+            _dxbc_cbuffer_layout.project_opaque_resource_types(available, requested)
+        for entry in requested:
             if entry not in available:
                 differences.append(key)
                 return differences
@@ -4501,20 +5543,48 @@ def _dxil_evidence_from_snapshot(source_bytes, blocks):
         access, absent = _dxil_access_protocol.extract_dxil_cbuffer_evidence(
             source_bytes)
     except _dxil_access_protocol.DxilAccessSignatureError as error:
-        raise RuntimeError(
-            "DXC DXIL CBuffer access evidence is incomplete: %s" % str(error))
+        # Access extraction is required only when reconstructing ambiguous
+        # layouts. Valid native reflection with matching DXIL type annotations
+        # remains authoritative even for instructions outside that parser.
+        try:
+            annotated = _dxil_access_protocol.extract_dxil_annotated_cbuffer_bindings(
+                source_bytes)
+        except _dxil_access_protocol.DxilAccessSignatureError:
+            annotated = ()
+        if not annotated:
+            raise RuntimeError(
+                "DXC DXIL CBuffer access evidence is incomplete: %s" % str(error))
+        evidence = _dxil_layout_evidence_from_snapshot(blocks, "unavailable")
+        for space, bind, byte_size in annotated:
+            reflected = [block for block in blocks if
+                         (block["space"], block["bind"]) == (space, bind)]
+            if len(reflected) != 1 or reflected[0]["byteSize"] != byte_size:
+                raise RuntimeError("DXC DXIL CBuffer type annotation contradicts reflection")
+            evidence.pop((space, bind), None)
+        return None, evidence
 
     if absent is None:
-        # If the fixed printer's layout section cannot be reconciled with
-        # resource metadata, no reflected CBuffer is allowed to remain
-        # "complete".  Exact access tuples can still prove a later candidate;
-        # if those tuples are unavailable the ordinary gate remains closed.
-        return access, _dxil_layout_evidence_from_snapshot(
+        # Old printers can omit the textual layout section while retaining
+        # exact LLVM type annotations. Preserve complete native layouts only
+        # for those proven bindings; all others still need exact access proof.
+        evidence = _dxil_layout_evidence_from_snapshot(
             blocks,
             "unavailable",
             source_sha256=access.source_sha256,
             access_signature_sha256=access.signature_sha256,
         )
+        try:
+            annotated = _dxil_access_protocol.extract_dxil_annotated_cbuffer_bindings(
+                source_bytes)
+        except _dxil_access_protocol.DxilAccessSignatureError:
+            annotated = ()
+        for space, bind, byte_size in annotated:
+            reflected = [block for block in blocks if
+                         (block["space"], block["bind"]) == (space, bind)]
+            if len(reflected) != 1 or reflected[0]["byteSize"] != byte_size:
+                raise RuntimeError("DXC DXIL CBuffer type annotation contradicts reflection")
+            evidence.pop((space, bind), None)
+        return access, evidence
 
     evidence = {}
     by_key = _dxil_layout_evidence_from_snapshot(
@@ -4694,16 +5764,47 @@ def _alias_display_name(alias):
 
 
 def _alias_confirmed(alias):
-    """Only deterministic program evidence is trusted by this headless loader.
+    """Accept aliases whose current physical target can be revalidated live.
 
-    A future UI approval channel can add a signed approval token. Plain JSON fields such as
-    `confirmed`, `status`, or `verified` are intentionally insufficient because the MCP caller can
-    write them itself.
+    ``verified`` alone remains insufficient.  Texture display names published by
+    Bread use a private Host-to-Bridge manifest and are accepted here only when
+    the Host marked the current Shader/resource binding for live validation.  The
+    loader below still rechecks the exact Shader and descriptor at the recorded
+    EID before changing any RenderDoc name.  Legacy asset-resolution receipts
+    remain readable, but their semantic authorization fields are not required by
+    the current ``ai-content-match`` path.
     """
     metadata = alias.get("metadata", {})
     if not isinstance(metadata, dict) or metadata.get("programVerified") is not True:
         return False
     provenance = str(alias.get("provenance", "") or "").strip().lower()
+    if _alias_kind(alias) == "textureresource":
+        # The raw load_symbol_aliases RPC is private to the local Host.  These
+        # fields describe the physical target; they are not semantic authority.
+        # The bridge independently revalidates the current EID, Shader and
+        # descriptor binding below.
+        event_id = _safe_int(metadata.get("eventId"), 0)
+        physical_binding = bool(
+            metadata.get("resourceBindingVerified") is True and event_id > 0)
+        if provenance == "ai-content-match":
+            return physical_binding
+        # Compatibility for manifests produced before direct content-match
+        # publication.  Keep their stricter stored shape without imposing it on
+        # new publications.
+        asset_content_sha256 = str(
+            metadata.get("assetContentSha256", "") or "").strip().lower()
+        reader_proof_sha256 = str(
+            metadata.get("readerProofSha256", "") or "").strip().lower()
+        return bool(
+            provenance == "asset-resolution"
+            and physical_binding
+            and str(metadata.get("assetResolutionId", "") or "").strip()
+            and str(metadata.get("assetId", "") or "").strip()
+            and len(asset_content_sha256) == 64
+            and not set(asset_content_sha256) - set("0123456789abcdef")
+            and len(reader_proof_sha256) == 64
+            and not set(reader_proof_sha256) - set("0123456789abcdef")
+        )
     return provenance in ("program", "rule:program", "rule:deterministic")
 
 
@@ -4728,6 +5829,15 @@ def _alias_shader_key(alias):
         str(entry_value or ""),
         raw_sha256,
     )
+
+
+def _alias_target_resource_id(alias):
+    """Return the physical resource renamed by an alias, not its owning Shader."""
+    if _alias_kind(alias) == "textureresource":
+        return _safe_int(_alias_first(
+            alias, ("textureResourceId", "resourceId", "captureResourceId"), 0), 0)
+    return _safe_int(_alias_first(
+        alias, ("shaderResourceId", "resourceId", "captureResourceId"), 0), 0)
 
 
 def _matching_shader_aliases(resource_id, stage_name, entry_point, raw_sha256,
@@ -4866,8 +5976,64 @@ def _ping(params):
     }
 
 
+def _capture_catalog_identity_status():
+    """Copy the identities this Bridge actually admitted in this capture."""
+    raw_identity_pairs = sorted(_known_catalog_identity_pairs)
+    if len(raw_identity_pairs) > MAX_KNOWN_CATALOG_IDENTITY_PAIRS:
+        raise RuntimeError("Bridge catalog identity-pair state exceeds its bound")
+    known_identity_pairs = []
+    for capture_id, evidence_sha256 in raw_identity_pairs:
+        if (len(capture_id) != 64 or len(evidence_sha256) != 64 or
+                any(character not in "0123456789abcdef"
+                    for character in capture_id + evidence_sha256)):
+            raise RuntimeError("Bridge catalog identity-pair state is invalid")
+        known_identity_pairs.append({
+            "captureId": capture_id,
+            "identityEvidenceSha256": evidence_sha256,
+        })
+    return {
+        "restoreValidationPolicySha256": _shader_restore_policy_sha256,
+        "restoreValidationCompatiblePolicySha256s": _shader_restore_protocol.compatible_validation_policies(
+            _shader_restore_physical_validation_binding),
+        "captureId": str(_symbol_capture_snapshot.get("captureId", "") or ""),
+        "knownCatalogCaptureIds": sorted(_known_catalog_capture_ids.keys()),
+        "knownCatalogIdentityPairs": known_identity_pairs,
+        "knownCatalogStablePairs": [
+            {"stableCaptureId": stable_id,
+             "stableIdentityEvidenceSha256": stable_sha256}
+            for stable_id, stable_sha256 in sorted(_known_catalog_stable_pairs)],
+    }
+
+
 def _get_capture_status(params):
     """Check if capture is loaded."""
+    if isinstance(params, dict) and params.get("identity_only") is True:
+        # Catalog admission needs no draw statistics or replay-thread work.
+        # These are real UI-owned capture facts plus the identities admitted
+        # by this process; no caller assertion creates an identity here.
+        identity = _request_admitted_capture_identity()
+        if identity is not None:
+            if not identity["loaded"]:
+                return {"loaded": False, "identityOnly": True}
+            return dict({
+                "loaded": True, "identityOnly": True,
+                "api": identity["api"], "renderer": identity["renderer"],
+                "capturePath": identity["path"], "captureSessionId": identity["captureSessionId"],
+            }, **_capture_catalog_identity_status())
+        def _read_identity():
+            if not _ctx or not _ctx.IsCaptureLoaded():
+                return {"loaded": False, "identityOnly": True}
+            props = _ctx.APIProps()
+            return dict({
+                "loaded": True,
+                "identityOnly": True,
+                "api": str(props.pipelineType),
+                "renderer": _native_enum_text(getattr(props, "localRenderer", None)),
+                "capturePath": str(_ctx.GetCaptureFilename() or ""),
+                "captureSessionId": str(_capture_session_id or ""),
+            }, **_capture_catalog_identity_status())
+        return _invoke_on_ui_sync(_read_identity)
+
     dispatch = _request_dispatch_context()
     snapshot = dispatch.get("captureSnapshot", {}) if dispatch is not None else None
     loaded = (bool(snapshot.get("captureLoaded")) if snapshot is not None
@@ -4888,19 +6054,6 @@ def _get_capture_status(params):
     def _do(ctrl):
         props = ctrl.GetAPIProperties()
         fi = ctrl.GetFrameInfo()
-        raw_identity_pairs = sorted(_known_catalog_identity_pairs)
-        if len(raw_identity_pairs) > MAX_KNOWN_CATALOG_IDENTITY_PAIRS:
-            raise RuntimeError("Bridge catalog identity-pair state exceeds its bound")
-        known_identity_pairs = []
-        for capture_id, evidence_sha256 in raw_identity_pairs:
-            if (len(capture_id) != 64 or len(evidence_sha256) != 64 or
-                    any(character not in "0123456789abcdef"
-                        for character in capture_id + evidence_sha256)):
-                raise RuntimeError("Bridge catalog identity-pair state is invalid")
-            known_identity_pairs.append({
-                "captureId": capture_id,
-                "identityEvidenceSha256": evidence_sha256,
-            })
         result = {
             "loaded": True,
             "api": str(props.pipelineType),
@@ -4908,11 +6061,8 @@ def _get_capture_status(params):
             "frameNumber": fi.frameNumber,
             "capturePath": capture_path,
             "captureSessionId": capture_session_id,
-            "captureId": str(
-                _symbol_capture_snapshot.get("captureId", "") or ""),
-            "knownCatalogCaptureIds": sorted(_known_catalog_capture_ids.keys()),
-            "knownCatalogIdentityPairs": known_identity_pairs,
         }
+        result.update(_capture_catalog_identity_status())
         # Stats structure varies by RenderDoc version
         try:
             result["draws"] = fi.stats.recorded.draws
@@ -5004,6 +6154,29 @@ def _current_texture_context(warnings):
         return None
 
 
+def _captured_shader_identity_for_context(ctrl, reflection, resource_id, event_id,
+                                          stage_name, entry_point):
+    """Keep current replacement bytes and immutable capture identity distinct."""
+    owner = _shared_shader_replacements.get(resource_id)
+    if owner is None:
+        return None
+    capture_token = _current_capture_token()
+    if (not _capture_session_id or owner.get("captureSessionId") != _capture_session_id or
+            owner.get("captureToken") != capture_token or
+            _shared_shader_replacement_capture_token != capture_token or
+            owner.get("api") != _shader_api_token(ctrl) or
+            _resource_id_int(owner.get("originalResource")) != resource_id):
+        raise RuntimeError("Shader context replacement owner belongs to another capture")
+    original = _captured_original_from_shared_owner(
+        reflection, {"eventId": event_id, "expectedOriginalResourceId": resource_id,
+                     "expectedOriginalSha256": owner.get("expectedOriginalSha256")},
+        stage_name, entry_point, owner, allow_original_active=owner.get("api") in ("d3d11", "vulkan", "opengl"))
+    return {"resourceId": resource_id, "stage": stage_name,
+            "entryPoint": str(getattr(original, "entryPoint", "") or entry_point),
+            "rawSha256": hashlib.sha256(_shader_raw_bytes(original)).hexdigest(),
+            "captureSessionId": _capture_session_id}
+
+
 def _bound_shader_stage_context(ctrl, event_id, stage_name, stage, aliases=None):
     """Inspect one fixed-EID stage and return only primitive Python values."""
     warnings = []
@@ -5023,6 +6196,7 @@ def _bound_shader_stage_context(ctrl, event_id, stage_name, stage, aliases=None)
             selection["evidence"].get("selectedEntryPoint") or "")
 
         raw_sha256 = ""
+        captured_identity = None
         reflected_entry = pipeline_entry
         if selected_entry is not None:
             reflection = ctrl.GetShader(
@@ -5038,6 +6212,8 @@ def _bound_shader_stage_context(ctrl, event_id, stage_name, stage, aliases=None)
                 raw = _shader_raw_bytes(reflection)
                 if raw:
                     raw_sha256 = hashlib.sha256(raw).hexdigest()
+                captured_identity = _captured_shader_identity_for_context(
+                    ctrl, reflection, resource_id, event_id, stage_name, reflected_entry)
         else:
             warnings.append(
                 "%s shader entry selection is %s" % (
@@ -5060,6 +6236,8 @@ def _bound_shader_stage_context(ctrl, event_id, stage_name, stage, aliases=None)
             "displayName": display_name,
             "entryPointSelection": dict(selection["evidence"]),
         }
+        if captured_identity is not None:
+            shader["capturedOriginalIdentity"] = captured_identity
     except Exception as exc:
         warnings.append(
             "%s shader context is unavailable: %s" % (stage_name, str(exc)))
@@ -5074,7 +6252,9 @@ def _current_bound_shader_context(event_id, action):
         warnings = []
         shaders = []
         if event_id > 0:
-            _set_frame_event(ctrl, int(event_id), True)
+            # A context read does not invalidate replay. The controller still materializes a
+            # changed/invalid EID, but can reuse the already current, valid pipeline state.
+            _set_frame_event(ctrl, int(event_id), False)
         for stage_name, stage in _available_shader_stages(compatible_stages):
             shader, stage_warnings = _bound_shader_stage_context(
                 ctrl, event_id, stage_name, stage)
@@ -5177,7 +6357,7 @@ def _capture_current_renderdoc_context_facts(
                 "Expected current event ID does not identify a valid action")
         try:
             props = _ctx.APIProps()
-            api_name = str(getattr(props, "pipelineType", "") or "")
+            api_name = _native_enum_text(getattr(props, "pipelineType", None))
         except Exception:
             api_name = ""
         try:
@@ -5392,7 +6572,10 @@ def _run_current_context_freeze_job(job_id, ctrl):
             # This callback is a ReplayManager foreground ordering barrier, so
             # later user replay operations cannot overtake this mutation.
             event_dirty = True
-            _set_frame_event(ctrl, int(event_id), True)
+            # Do not force a full GPU replay merely to observe the current shaders. Native
+            # resource replacement already invalidates and refreshes its event, and the
+            # controller replays different or non-materialized EIDs even with force=False.
+            _set_frame_event(ctrl, int(event_id), False)
         for stage_name, stage in _available_shader_stages(compatible_stages):
             shader, stage_warnings = _bound_shader_stage_context(
                 ctrl, event_id, stage_name, stage, aliases=aliases)
@@ -5407,9 +6590,16 @@ def _run_current_context_freeze_job(job_id, ctrl):
         facts["boundShaders"] = shaders
         facts["warnings"].extend(warnings)
     except Exception as exc:
-        failure = exc
-        if not failure_code:
-            failure_code = "replay-callback-failed"
+        if "bread-replay-unavailable" in str(exc):
+            # Keep the AI usable for recovery/static inspection. Identity and
+            # action metadata are still valid; empty live bindings are not.
+            facts["boundShaders"] = []
+            facts["warnings"].append(str(exc))
+            event_dirty = False
+        else:
+            failure = exc
+            if not failure_code:
+                failure_code = "replay-callback-failed"
     finally:
         if (event_dirty and restore_needed and
                 expected_session == _capture_session_id and
@@ -5565,9 +6755,109 @@ def _abandon_current_context_freeze(job_id):
         return _current_context_freeze_job_snapshot(job)
 
 
+def _capture_identity_on_ui():
+    """Copy only cached CaptureContext facts while already on the Qt thread."""
+    if not _ctx or not _ctx.IsCaptureLoaded():
+        return {"loaded": False}
+    try:
+        props = _ctx.APIProps()
+        api_name = _native_enum_text(getattr(props, "pipelineType", None))
+        renderer = _native_enum_text(getattr(props, "localRenderer", None))
+    except Exception:
+        api_name, renderer = "", ""
+    try:
+        local = bool(_ctx.IsCaptureLocal())
+    except Exception:
+        local = False
+    try:
+        capture_path = str(_ctx.GetCaptureFilename() or "")
+    except Exception:
+        capture_path = ""
+    return {
+        "loaded": True, "captureSessionId": _capture_session_id,
+        "captureId": str(_symbol_capture_snapshot.get("captureId", "") or ""),
+        "path": capture_path, "api": api_name, "local": local, "renderer": renderer,
+    }
+
+
+def _request_admitted_capture_identity():
+    """Reuse this request's Qt admission, never an instance discovery manifest."""
+    dispatch = _request_dispatch_context()
+    if not isinstance(dispatch, dict):
+        return None
+    snapshot = dispatch.get("captureSnapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    identity = snapshot.get("captureIdentity")
+    session = snapshot.get("captureSessionId")
+    token = snapshot.get("captureToken")
+    if (not isinstance(identity, dict) or type(identity.get("loaded")) is not bool
+            or identity["loaded"] != snapshot.get("captureLoaded") or not isinstance(session, str)):
+        return None
+    if identity["loaded"]:
+        if (not re.fullmatch(r"[0-9a-f]{32}", session)
+                or identity.get("captureSessionId") != session
+                or not isinstance(identity.get("path"), str) or not identity["path"]
+                or not isinstance(identity.get("api"), str) or not identity["api"]
+                or type(identity.get("local")) is not bool
+                or not isinstance(identity.get("renderer"), str)
+                or not isinstance(token, tuple) or len(token) != 2 or token[0] != "loaded"
+                or token[1] != os.path.normcase(os.path.abspath(identity["path"]))):
+            return None
+    elif session or token is not None:
+        return None
+    if (_request_dispatch_cancelled(dispatch) or session != str(_capture_session_id or "")
+            or token != _active_capture_token):
+        raise _ReplayLabBackgroundPreempted(
+            "Bread request capture admission changed before its identity read")
+    result = dict(identity)
+    if result["loaded"]:
+        # Catalog admission can advance inside this same capture session. It is
+        # not a native capture getter and must remain a current process fact.
+        result["captureId"] = str(_symbol_capture_snapshot.get("captureId", "") or "")
+    return result
+
+
+def _capture_identity_context():
+    """Which capture is open -- nothing about where the user is looking.
+
+    Host tools re-check the capture identity (session, path, API) before they
+    touch it. That check must not freeze the UI's current event: the AI's
+    request was frozen once, when it was asked, and the user is free to move
+    around the capture while the task runs. So this is a plain read of the
+    identity facts, with no event, action or Texture Viewer state.
+    """
+
+    capture = _request_admitted_capture_identity()
+    if capture is None:
+        capture = _invoke_on_ui_sync(_capture_identity_on_ui)
+    facts = {
+        "contextGeneration": 0,
+        "capture": capture,
+        "events": {"currentEventId": 0, "selectedEventId": 0},
+        "action": None,
+        "boundShaders": [],
+        "texture": None,
+        "warnings": ["identity-only read: events, action and texture context "
+                     "were not captured"],
+    }
+    context = _ai_context_protocol.build_context(facts)
+    context["identityOnly"] = True
+    # Reuse this existing Host identity read for an early cache-miss hint.
+    # It never grants apply authority; the Bridge checks the signed policy again.
+    context["restoreValidationPolicySha256"] = _shader_restore_policy_sha256
+    context["restoreValidationCompatiblePolicySha256s"] = _shader_restore_protocol.compatible_validation_policies(
+        _shader_restore_physical_validation_binding)
+    context["snapshotId"] = _canonical_json_sha256({
+        key: value for key, value in context.items() if key != "snapshotId"})
+    return context
+
+
 def _get_current_renderdoc_context(params):
     # MCP/IPC callers cannot assert an explicit UI shader selection. Explicit
     # focus exists only in a RenderDoc stage-scoped menu callback.
+    if isinstance(params, dict) and params.get("identity_only"):
+        return _capture_identity_context()
     if _request_dispatch_context() is None:
         return _build_current_renderdoc_context()
     dispatch = _request_dispatch_context()
@@ -5601,10 +6891,10 @@ def _get_current_renderdoc_context(params):
     deadline = time.monotonic() + CURRENT_CONTEXT_FREEZE_JOB_TIMEOUT_SECONDS + 1.0
     cancel_event = dispatch.get("cancelEvent")
     while True:
-        if cancel_event is not None and cancel_event.is_set():
+        if _request_dispatch_cancelled(dispatch):
             _abandon_current_context_freeze(job_id)
             raise _ReplayLabBackgroundPreempted(
-                "ReplayLab current context freeze was cancelled by user activity")
+                "Bread current context freeze was cancelled by user activity")
         snapshot = _poll_current_context_freeze(job_id)
         status = str(snapshot.get("status", "") or "")
         if status == "completed":
@@ -5630,6 +6920,21 @@ def _get_current_renderdoc_context(params):
 def _action_name(action):
     return str(getattr(action, "customName", "") or
                "Action %d" % _safe_int(getattr(action, "actionId", 0), 0))
+
+
+_INDIRECT_ARGS_RE = re.compile(r"(Indirect[A-Za-z]*)\(<[^>]*>\)")
+
+
+def _stable_action_name(name):
+    """An action label fit for a content-addressed catalog.
+
+    RenderDoc names indirect actions with the arguments it read back during
+    replay ("IndirectDispatch(<2, 2, 123>)"); those numbers change from one
+    replay to the next and would turn every re-index of the same capture
+    into a new catalog revision. The label keeps the action, not the values.
+    """
+
+    return _INDIRECT_ARGS_RE.sub(r"\1(<indirect>)", str(name or ""))
 
 
 def _action_flags_mask(names, fallback=0):
@@ -5931,6 +7236,7 @@ def _shader_reflection_identity_failure(reflection, selected_entry,
 
 def _pipeline_state_on_replay(ctrl):
     """Collect pipeline evidence from the controller's already-selected event."""
+    _require_healthy_replay(ctrl)
     ps = ctrl.GetPipelineState()
     pipeline_id = _get_pipeline_obj(ps, ctrl)
 
@@ -5986,10 +7292,29 @@ def _get_pipeline_state(params):
         raise ValueError("event_id required")
 
     def _do(ctrl):
-        _set_frame_event(ctrl, int(event_id), True)
+        _select_event_for_read(ctrl, event_id)
         return _pipeline_state_on_replay(ctrl)
 
     return _replay(_do)
+
+
+def _shader_analysis_targets(targets, mode):
+    """Prefer portable instructions to duplicate hardware ISA for explanation."""
+    values = list(targets)
+    if mode == "all":
+        return values
+    if mode != "preferred":
+        raise ValueError("text_mode must be preferred or all")
+
+    def priority(value):
+        name = str(value).lower()
+        if any(token in name for token in ("dxbc", "dxil", "spir-v", "spirv", "glsl", "hlsl")):
+            return 0
+        if name in ("native", "default"):
+            return 1
+        return 2
+
+    return sorted(values, key=priority)
 
 
 def _get_shader_info(params):
@@ -6041,16 +7366,18 @@ def _get_shader_info(params):
         raw_bytes = _shader_raw_bytes(refl)
         raw_sha256 = hashlib.sha256(raw_bytes).hexdigest() if raw_bytes else None
         compiled_interface = _compiled_shader_interface(refl)
+        captured_identity = _captured_shader_identity_for_context(
+            ctrl, refl, int(sid), int(event_id), stage_name, entry_point)
 
         result = {
             "shaderId": int(sid),
             "pipelineId": int(pid),
-            "api": str(getattr(ctrl.GetAPIProperties(), "pipelineType", "") or ""),
+            "api": _native_enum_text(getattr(ctrl.GetAPIProperties(), "pipelineType", None)),
             "stage": stage_name,
             "entryPoint": entry_point,
             "entryPoints": list(selection["evidence"]["entryPoints"]),
             "entryPointSelection": dict(selection["evidence"]),
-            "encoding": str(getattr(refl, "encoding", "") or ""),
+            "encoding": _native_enum_text(getattr(refl, "encoding", None)),
             "rawSha256": raw_sha256,
             # This is compiled reflection evidence, not recovered source or a
             # semantic interpretation.  A quick-analysis child can use
@@ -6059,6 +7386,8 @@ def _get_shader_info(params):
             "diagnostics": [],
             "unknowns": [],
         }
+        if captured_identity is not None:
+            result["capturedOriginalIdentity"] = captured_identity
 
         aliases = _matching_shader_aliases(
             int(sid), stage_name, entry_point, raw_sha256)
@@ -6068,13 +7397,26 @@ def _get_shader_info(params):
             if len(aliases) > 1:
                 result["aliasCandidates"] = aliases
 
-        # Disassembly — all targets
+        # Explanation-only callers prefer embedded source, otherwise one useful
+        # portable IR. Existing inspection/editing callers retain all targets.
+        text_mode = params.get("text_mode", "all")
+        embedded_files = list(getattr(getattr(refl, "debugInfo", None), "files", []) or [])
+        has_source = any(isinstance(getattr(f, "contents", None), str)
+                         and f.contents.strip() and "\x00" not in f.contents
+                         for f in embedded_files)
         targets = ctrl.GetDisassemblyTargets(True)
         result["disassemblyTargets"] = list(targets)
         disasm = {}
-        for t in targets:
+        ordered_targets = _shader_analysis_targets(targets, text_mode)
+        attempted_targets = []
+        for t in ([] if text_mode == "preferred" and has_source else ordered_targets):
+            attempted_targets.append(str(t))
             try:
-                disasm[t] = ctrl.DisassembleShader(pid, refl, t)
+                value = ctrl.DisassembleShader(pid, refl, t)
+                disasm[t] = value
+                if (text_mode == "preferred" and isinstance(value, str) and value.strip()
+                        and "\x00" not in value and not value.lstrip().lower().startswith("error:")):
+                    break
             except Exception as e:
                 message = str(e).replace("\x00", "")[:1024]
                 disasm[t] = None
@@ -6085,6 +7427,10 @@ def _get_shader_info(params):
                     "message": message,
                 })
         result["disassembly"] = disasm
+        result["textSelection"] = {
+            "mode": text_mode, "embeddedSourcePreferred": text_mode == "preferred" and has_source,
+            "attemptedTargets": attempted_targets,
+        }
 
         # Embedded source
         if refl.debugInfo and hasattr(refl.debugInfo, "files") and refl.debugInfo.files:
@@ -6306,7 +7652,9 @@ def _dimension_triplet(value):
 
 
 def _frame_flow_text(value, maximum=MAX_FRAME_FLOW_TEXT):
-    text = str(value or "").replace("\x00", "").strip()
+    # Zero-valued SWIG enums include Add and Zero blend operations/factors.
+    # They are observations, not missing text.
+    text = str("" if value is None else value).replace("\x00", "").strip()
     return text[:maximum]
 
 
@@ -7799,6 +9147,225 @@ def _get_current_frame_flow_inputs(params):
         params, False, "replaylab-current-frame-flow-inputs/v1")
 
 
+def _collect_frame_render_flow_outline(ctrl, capture, session, checkpoint=lambda: None):
+    from .frame_render_flow_outline import collect_actions
+    from .frame_stage_evidence import resolved_indirect_workload
+    masks = {
+        "marker": _marker_action_mask(),
+        "draw": _action_flags_mask(("Drawcall", "MeshDispatch"), 0x0002 | 0x0008),
+        "mesh": _action_flags_mask(("MeshDispatch",), 0x0008),
+        "indirect": _action_flags_mask(("Indirect",), 0x080000),
+        "dispatch": _action_flags_mask(("Dispatch", "DispatchRay"), 0x0004 | 0x4000),
+        "copy": _action_flags_mask(("Copy",)), "resolve": _action_flags_mask(("Resolve",)),
+        "clear": _action_flags_mask(("Clear",)), "present": _action_flags_mask(("Present",)),
+    }
+    # Structured capture data is immutable while this session is pinned. This
+    # reads the native decoded argument chunks, without replaying each action.
+    structured = _ctx.GetStructuredFile() if _ctx is not None and hasattr(_ctx, "GetStructuredFile") else None
+    rows, count = collect_actions(ctrl.GetRootActions(), _action_name, _resource_id_int,
+                                  masks, checkpoint=checkpoint,
+                                  indirect_workload=(lambda action: resolved_indirect_workload(action, structured))
+                                  if structured is not None else None)
+    return {"schema": "bread-frame-render-flow-outline/v1", "captureSessionId": session,
+            "captureId": str(capture.get("captureId", "") or ""),
+            "capturePath": str(capture.get("path", "") or ""),
+            "api": str(capture.get("api", "") or ""),
+            "frameNumber": _safe_int(getattr(ctrl.GetFrameInfo(), "frameNumber", 0), 0),
+            "actions": rows, "summary": {"complete": len(rows) == count,
+                "totalActionCount": count, "storedActionCount": len(rows),
+                "omittedActionCount": count - len(rows)}}
+
+
+def _get_frame_render_flow_outline(params):
+    """Page a capture-scoped action tree, with no per-action replay or pipeline reads."""
+    global _frame_render_flow_outline_cache
+    from .frame_render_flow_outline import outline_page
+    expected = str(params.get("expected_capture_session_id", "") or "")
+    if (len(expected) != 32 or expected != _request_capture_session_id() or
+            expected != _capture_session_id or not _request_capture_loaded()):
+        raise RuntimeError("Frame flow capture session changed or no capture is loaded")
+    refresh = params.get("refresh", False)
+    if not isinstance(refresh, bool):
+        raise ValueError("Frame flow refresh must be a boolean")
+    offset, limit = params.get("offset", 0), params.get("limit", 4000)
+    if (isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or
+            isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5000):
+        raise ValueError("Frame flow offset/limit must be non-negative integers; limit is 1..5000")
+    cached = _frame_render_flow_outline_cache
+    hit = bool(not refresh and cached and cached.get("captureSessionId") == expected)
+    if not hit:
+        capture = _capture_identity_context()["capture"]
+
+        def collect(ctrl):
+            return _collect_frame_render_flow_outline(ctrl, capture, expected,
+                                                       _background_replay_checkpoint)
+
+        cached = _replay(collect)
+        if expected != _capture_session_id:
+            raise RuntimeError("Capture changed while reading the frame flow outline")
+        _frame_render_flow_outline_cache = cached
+    page = outline_page(cached, offset, limit, cache_hit=hit)
+    if offset == 0 and _frame_render_flow_saved:
+        saved = _frame_render_flow_saved.get("document", {})
+        if saved.get("captureSessionId") == expected:
+            page["restoredDocument"] = saved
+    return page
+
+
+def _show_frame_render_flow(params):
+    document = params.get("document")
+    if (not isinstance(document, dict) or
+            document.get("schema") != "bread-frame-render-flow/v1"):
+        raise ValueError("Invalid frame render flow document")
+    expected = str(document.get("captureSessionId", "") or "")
+    if (not expected or expected != _request_capture_session_id() or
+            expected != _capture_session_id or not _request_capture_loaded()):
+        raise RuntimeError("Frame flow belongs to a different capture session")
+
+    def publish():
+        global _frame_render_flow_generation
+        if expected != _capture_session_id or not _ctx.IsCaptureLoaded():
+            raise RuntimeError("Capture changed before opening the frame flow")
+        _frame_render_flow_generation += 1
+        panel = _ensure_frame_render_flow_ui()
+        panel.set_document(document)
+        panel.show()
+        shown = bool(panel.top.isVisible())
+        return {"schema": "bread-frame-render-flow-window/v1", "published": shown,
+                "shown": shown, "flowId": document.get("flowId"),
+                "captureSessionId": expected, "state": panel.get_state()}
+
+    return _invoke_on_ui_sync(publish)
+
+
+def _frame_flow_artifact_root():
+    from pathlib import Path
+    configured = os.environ.get("RENDERDOC_ULTRA_EVENT_ARTIFACTS_HOME", "")
+    if configured:
+        if not os.path.isabs(configured):
+            raise ValueError("Configured Event artifact root must be absolute")
+        return Path(configured)
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+        return Path(local) / "ReplayLab" / "event-artifacts"
+    return Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "ReplayLab" / "event-artifacts"
+
+
+def _save_frame_render_flow(params):
+    """Persist verified Host data without modifying the RDC or replay state."""
+    global _frame_render_flow_saved
+    from .frame_flow_persistence import canonical_outline, digest, save
+    document, outline = params.get("document"), params.get("outline")
+    session = _request_capture_session_id()
+    capture = _capture_identity_context()["capture"]
+    if (not isinstance(document, dict) or not isinstance(outline, dict) or
+            not session or session != _capture_session_id or not _request_capture_loaded() or
+            document.get("captureSessionId") != session or outline.get("captureSessionId") != session):
+        raise ValueError("Frame flow persistence requires the active capture session")
+    clean = canonical_outline(outline)
+    if document.get("snapshotId") != digest(clean):
+        raise ValueError("Frame diagram does not match its action outline")
+    result = save(capture["path"], document, clean, _frame_flow_artifact_root())
+    if session != _capture_session_id:
+        raise RuntimeError("Capture changed while saving the frame flow")
+    _frame_render_flow_saved = {"document": document, "outline": clean, "persistence": result}
+    return result
+
+
+def _capture_frame_flow_channels(params):
+    """Pre-generate a bounded batch; the Host validates and persists receipts."""
+    from .frame_flow_channels import capture_channel_batch, mutation_identity
+    session = params.get("expected_capture_session_id")
+    if (not isinstance(session, str) or not re.match(r"^[0-9a-f]{32}$", session) or
+            session != _request_capture_session_id() or session != _capture_session_id or
+            not _request_capture_loaded()):
+        raise RuntimeError("Frame channel generation requires the active capture session")
+    items = params.get("items")
+    if not isinstance(items, list) or not 1 <= len(items) <= 8:
+        raise ValueError("Frame channel generation requires one to eight parent previews")
+    replay = _foreground_replay_manager()
+    original_event = _request_visible_event_id(0)
+    snapshot = {"session": session, "originalEvent": original_event, "replay": replay,
+                "flowGeneration": _frame_render_flow_generation,
+                "foregroundGeneration": _replay_foreground_generation(replay),
+                "mutationEpoch": mutation_identity(sys.modules[__name__])}
+    tracker = _request_event_tracker() or {}
+    cancel_event = tracker.get("cancelEvent")
+    cancelled = cancel_event.is_set if cancel_event is not None else lambda: False
+    result, keys = [], set()
+    for item in items:
+        _background_replay_checkpoint()
+        if not isinstance(item, dict) or not isinstance(item.get("preview"), dict):
+            raise ValueError("Frame channel parent preview is invalid")
+        key = item.get("key")
+        if not isinstance(key, str) or not key or len(key) > 160 or key in keys:
+            raise ValueError("Frame channel parent key must be unique and bounded")
+        keys.add(key)
+        requests = item.get("requests")
+        if not isinstance(requests, list) or len(requests) > 6:
+            raise ValueError("Frame channel request directories are invalid")
+        by_channel = {}
+        for request in requests:
+            if not isinstance(request, dict) or request.get("channel") not in ("rgb", "r", "g", "b", "a", "depth"):
+                raise ValueError("Frame channel request uses an unsupported channel")
+            if request["channel"] in by_channel:
+                raise ValueError("Frame channel request contains a duplicate channel")
+            by_channel[request["channel"]] = request
+        value = capture_channel_batch(sys.modules[__name__], item["preview"], snapshot,
+                                      {}, cancelled, requests=by_channel)
+        # Files are generated under Host-allocated directories. Only the Host
+        # writes authoritative manifests and adds admitted images to the flow.
+        result.append({"key": key, "componentCount": value["componentCount"],
+                       "channelGroups": value["channelGroups"], "receipts": value["receipts"],
+                       "errors": value["errors"], "complete": value["complete"]})
+    return {"schema": "bread-frame-flow-channel-capture/v1", "captureSessionId": session,
+            "originalEventId": original_event, "replayRevision": snapshot["mutationEpoch"], "items": result}
+
+
+def _capture_frame_flow_volume(params):
+    """Prepare a bounded volume slice set without per-slice event replay."""
+    from .frame_flow_channels import mutation_identity
+    from .frame_flow_volume import capture_volume
+    session = params.get("expected_capture_session_id")
+    if (not isinstance(session, str) or not re.match(r"^[0-9a-f]{32}$", session) or
+            session != _request_capture_session_id() or session != _capture_session_id or
+            not _request_capture_loaded()):
+        raise RuntimeError("Frame volume generation requires the active capture session")
+    preview = params.get("preview")
+    if not isinstance(preview, dict):
+        raise ValueError("Frame volume parent preview is invalid")
+    replay = _foreground_replay_manager()
+    snapshot = {"session": session, "originalEvent": _request_visible_event_id(0), "replay": replay,
+                "flowGeneration": _frame_render_flow_generation,
+                "foregroundGeneration": _replay_foreground_generation(replay),
+                "mutationEpoch": mutation_identity(sys.modules[__name__])}
+    tracker = _request_event_tracker() or {}
+    cancel_event = tracker.get("cancelEvent")
+    cancelled = cancel_event.is_set if cancel_event is not None else lambda: False
+    return capture_volume(sys.modules[__name__], preview, params.get("requests"), snapshot, cancelled)
+
+
+def _get_saved_frame_render_flow(params):
+    """Reuse checked restoration data, or load and bind it to the current outline."""
+    global _frame_render_flow_saved
+    from .frame_flow_persistence import load, rebind
+    session = str(params.get("expected_capture_session_id", "") or "")
+    if not session or session != _capture_session_id or session != _request_capture_session_id():
+        raise RuntimeError("Frame flow restoration requires the active capture session")
+    if _frame_render_flow_saved and _frame_render_flow_saved["document"].get("captureSessionId") == session:
+        return _frame_render_flow_saved
+    capture = _capture_identity_context()["capture"]
+    bundle = load(capture["path"], _frame_flow_artifact_root())
+    if bundle is None:
+        return {"restored": False}
+    _get_frame_render_flow_outline({"expected_capture_session_id": session, "limit": 1})
+    result = rebind(bundle, _frame_render_flow_outline_cache)
+    if session != _capture_session_id:
+        raise RuntimeError("Capture changed while restoring the frame flow")
+    _frame_render_flow_saved = result
+    return result
+
+
 def _parse_catalog_event_ids(value):
     if value is None:
         return None
@@ -7857,19 +9424,32 @@ def _read_shader_candidate(params):
             any(c not in "0123456789abcdef" for c in expected_sha256)):
         raise ValueError("expected_sha256 must be a 64-character lowercase SHA-256")
 
-    maximum_size = 512 * 1024 * 1024
+    is_glsl = str(params.get("encoding", "") or "").strip().lower() == "glsl"
+    maximum_size = (4 if is_glsl else 512) * 1024 * 1024
     if os.path.getsize(candidate_path) > maximum_size:
-        raise ValueError("Candidate shader is larger than the 512 MiB safety limit")
+        raise ValueError("Candidate shader exceeds its bounded artifact size limit")
     with open(candidate_path, "rb") as stream:
         candidate_bytes = stream.read(maximum_size + 1)
     if len(candidate_bytes) > maximum_size:
-        raise ValueError("Candidate shader is larger than the 512 MiB safety limit")
+        raise ValueError("Candidate shader exceeds its bounded artifact size limit")
     if not candidate_bytes:
         raise ValueError("Candidate shader is empty")
     actual_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
     if actual_sha256 != expected_sha256:
         raise ValueError("Candidate shader bytes do not match expected_sha256")
+    if is_glsl:
+        try:
+            source = candidate_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("GLSL candidate must be exact UTF-8 source")
+        if "\x00" in source or not source.strip():
+            raise ValueError("GLSL candidate must be nonempty source without NUL bytes")
     return candidate_path, candidate_bytes, actual_sha256
+
+
+def _compile_shader_source_native(params):
+    from .native_shader_compile import compile_source
+    return compile_source(sys.modules[__name__], params)
 
 
 def _reflect_shader_candidate(params):
@@ -7888,10 +9468,11 @@ def _reflect_shader_candidate(params):
         "dxil": "DXIL",
         "spirv": "SPIRV",
         "opengl-spirv": "OpenGLSPIRV",
+        "glsl": "GLSL",
     }.get(encoding_name)
     if encoding_attribute is None:
         raise ValueError(
-            "Candidate reflection accepts native DXBC, DXIL, Vulkan SPIR-V, or OpenGL SPIR-V only")
+            "Candidate reflection accepts DXBC, DXIL, Vulkan SPIR-V, OpenGL SPIR-V or GLSL")
     encoding = getattr(rd.ShaderEncoding, encoding_attribute, None)
     if encoding is None:
         raise RuntimeError(
@@ -7906,6 +9487,8 @@ def _reflect_shader_candidate(params):
     entry_point = str(params.get("entry_point", "") or "").strip()
     if not entry_point:
         raise ValueError("entry_point is required")
+    if encoding_name == "glsl" and (entry_point != "main" or requested_stage in ("task", "mesh")):
+        raise ValueError("OpenGL GLSL requires main and a legacy pipeline stage")
 
     def _do(ctrl):
         result = {
@@ -7945,7 +9528,7 @@ def _reflect_shader_candidate(params):
                 (api_token == "d3d11" and encoding_name == "dxbc") or
                 (api_token == "d3d12" and encoding_name in ("dxbc", "dxil")) or
                 (api_token == "vulkan" and encoding_name == "spirv") or
-                (api_token == "opengl" and encoding_name == "opengl-spirv"))
+                (api_token == "opengl" and encoding_name in ("opengl-spirv", "glsl")))
             if not valid_pair:
                 result["buildMessages"] = (
                     "Candidate encoding does not match the active replay API")
@@ -7957,7 +9540,8 @@ def _reflect_shader_candidate(params):
                 return result
 
             compile_flags = rd.ShaderCompileFlags()
-            target_id, messages = ctrl.BuildTargetShader(
+            target_id, messages = _build_target_shader(
+                ctrl,
                 entry_point, encoding, candidate_bytes, compile_flags, stage)
             result["buildMessages"] = str(messages or "")
             if not _resource_id_int(target_id):
@@ -7982,6 +9566,12 @@ def _reflect_shader_candidate(params):
                 return result
 
             reflected_raw = _shader_raw_bytes(reflection)
+            if encoding_name == "glsl" and (
+                    _shader_encoding_token(getattr(reflection, "encoding", "")) != "glsl"
+                    or reflected_raw != candidate_bytes):
+                result["buildMessages"] = (
+                    result["buildMessages"] + "\nGLSL reflection does not preserve exact source identity").strip()
+                return result
             result["reflectedRawSha256"] = (
                 hashlib.sha256(reflected_raw).hexdigest() if reflected_raw else "")
             result["reflectedEntryPoint"] = str(
@@ -8008,6 +9598,7 @@ def _reflect_shader_candidate(params):
                     result["freeTargetResourceSucceeded"] = True
                 except Exception as exc:
                     result["freeTargetResourceError"] = str(exc)
+                    _register_orphan_shader_target(target_id)
 
     return _replay(_do)
 
@@ -8028,7 +9619,7 @@ def _d3d11_stage_state(ctrl, stage_name):
 
 
 def _shader_api_token(ctrl):
-    api_name = str(getattr(ctrl.GetAPIProperties(), "pipelineType", "") or "")
+    api_name = _native_enum_text(getattr(ctrl.GetAPIProperties(), "pipelineType", None))
     token = api_name.lower().replace("graphicsapi.", "")
     if token == "direct3d11":
         token = "d3d11"
@@ -8247,11 +9838,45 @@ def _shader_override_events(params):
     return result
 
 
+def _captured_original_from_shared_owner(active_reflection, event, stage_name,
+                                         entry_point, owner, allow_original_active=False):
+    """Validate retained original identity under a separately verified owner."""
+    if any((owner.get("expectedOriginalResourceId") != event["expectedOriginalResourceId"],
+            owner.get("expectedOriginalSha256") != event["expectedOriginalSha256"],
+            owner.get("stageName") != stage_name, owner.get("entryPoint") != entry_point)):
+        raise RuntimeError("The shared Shader owner is bound to a different captured original identity")
+    active_entry = str(getattr(active_reflection, "entryPoint", "") or entry_point)
+    active_bytes = _shader_raw_bytes(active_reflection)
+    active_sha256 = hashlib.sha256(active_bytes).hexdigest() if active_bytes else ""
+    allowed = {owner.get("candidateRawSha256")}
+    # Reflection is not a universal query for the active executable. Vulkan
+    # and OpenGL look up the requested captured shader's creation record;
+    # D3D11 may also expose captured reflection while replacement is active.
+    # Ownership and checked replacement are proved separately by the caller.
+    if allow_original_active:
+        allowed.add(event["expectedOriginalSha256"])
+    if active_entry != entry_point or active_sha256 not in allowed:
+        raise RuntimeError("Event %d active shared Shader target changed outside Bread" % event["eventId"])
+    reflection = owner.get("capturedOriginalReflection")
+    if reflection is None:
+        raise RuntimeError("The captured-original Shader reflection is no longer available")
+    raw_bytes = _shader_raw_bytes(reflection)
+    if (str(getattr(reflection, "entryPoint", "") or entry_point) != entry_point or
+            not raw_bytes or hashlib.sha256(raw_bytes).hexdigest() != event["expectedOriginalSha256"]):
+        raise RuntimeError("The retained captured-original Shader identity changed")
+    return reflection
+
+
 def _validate_live_shader_event(ctrl, event, stage, stage_name, entry_point,
                                 require_d3d11_state=True,
-                                owned_shared_replacement=None):
+                                owned_shared_replacement=None,
+                                verified_physical_abi_sha256="",
+                                event_already_selected=False):
     """Return immutable live facts for one exact captured event/stage."""
-    _set_frame_event(ctrl, event["eventId"], True)
+    if not event_already_selected:
+        _set_frame_event(ctrl, event["eventId"], True)
+    else:
+        _require_healthy_replay(ctrl)
     pipeline = ctrl.GetPipelineState()
     original_id = pipeline.GetShader(stage)
     if (_resource_id_int(original_id) !=
@@ -8292,13 +9917,6 @@ def _validate_live_shader_event(ctrl, event, stage, stage_name, entry_point,
         raise RuntimeError(
             "Event %d shader reflection is unavailable" %
             event["eventId"])
-    active_entry = str(
-        getattr(active_reflection, "entryPoint", "") or
-        getattr(selected_entry, "name", "") or "")
-    active_bytes = _shader_raw_bytes(active_reflection)
-    active_sha256 = (
-        hashlib.sha256(active_bytes).hexdigest() if active_bytes else "")
-
     # Resource replacement is intentionally transparent to the pipeline state:
     # GetShader(stage) still returns the canonical captured ResourceId.  On
     # D3D12, however, GetShader(pipeline, that_id, entry) resolves through the
@@ -8312,32 +9930,9 @@ def _validate_live_shader_event(ctrl, event, stage, stage_name, entry_point,
     # supersede to fail before ReplaceTargetShaderChecked could run.
     reflection = active_reflection
     if owned_shared_replacement is not None:
-        if any((
-                owned_shared_replacement.get("expectedOriginalResourceId") !=
-                event["expectedOriginalResourceId"],
-                owned_shared_replacement.get("expectedOriginalSha256") !=
-                event["expectedOriginalSha256"],
-                owned_shared_replacement.get("stageName") != stage_name,
-                owned_shared_replacement.get("entryPoint") != entry_point)):
-            raise RuntimeError(
-                "The shared Shader owner is bound to a different captured "
-                "original identity")
-        owned_target_sha256 = owned_shared_replacement.get("candidateRawSha256")
-        allowed_active_sha256 = {owned_target_sha256}
-        # D3D11's reflection API can remain capture-original even while replay
-        # ReplaceResource is active. D3D12's checked path, which triggered this
-        # bug, resolves the active target and must prove that exact owner.
-        if require_d3d11_state:
-            allowed_active_sha256.add(event["expectedOriginalSha256"])
-        if (active_entry != entry_point or
-                active_sha256 not in allowed_active_sha256):
-            raise RuntimeError(
-                "Event %d active shared Shader target changed outside ReplayLab" %
-                event["eventId"])
-        reflection = owned_shared_replacement.get("capturedOriginalReflection")
-        if reflection is None:
-            raise RuntimeError(
-                "The captured-original Shader reflection is no longer available")
+        reflection = _captured_original_from_shared_owner(
+            active_reflection, event, stage_name, entry_point, owned_shared_replacement,
+            allow_original_active=(_shader_api_token(ctrl) in ("d3d11", "vulkan", "opengl")))
 
     reflected_entry = str(getattr(reflection, "entryPoint", "") or entry_point)
     original_bytes = _shader_raw_bytes(reflection)
@@ -8370,8 +9965,10 @@ def _validate_live_shader_event(ctrl, event, stage, stage_name, entry_point,
     dxil_layout_evidence = (
         owned_shared_replacement.get("capturedDxilLayoutEvidence")
         if owned_shared_replacement is not None else None)
-    physical_abi_sha256 = _physical_shader_interface_sha256(reflection)
-    if _shader_encoding_token(getattr(reflection, "encoding", "")) == "dxil":
+    physical_abi_sha256 = (verified_physical_abi_sha256 or
+                           _physical_shader_interface_sha256(reflection))
+    if (not verified_physical_abi_sha256 and
+            _shader_encoding_token(getattr(reflection, "encoding", "")) == "dxil"):
         # The catalog and Host ABI bind stripped DXIL using the same fixed DXC
         # layout/access evidence. Hashing raw RenderDoc placeholder members here
         # would produce a different identity even though the subsequent strict
@@ -8385,7 +9982,9 @@ def _validate_live_shader_event(ctrl, event, stage, stage_name, entry_point,
             reflection, dxil_layout_evidence)
     if (owned_shared_replacement is not None and
             physical_abi_sha256 !=
-            owned_shared_replacement.get("physicalAbiSha256")):
+            owned_shared_replacement.get("physicalAbiSha256") and
+            not (owned_shared_replacement.get("abiValidationMode") == "manual-fast" and
+                 not owned_shared_replacement.get("physicalAbiSha256"))):
         raise RuntimeError(
             "The captured-original Shader ABI identity changed")
 
@@ -8394,10 +9993,106 @@ def _validate_live_shader_event(ctrl, event, stage, stage_name, entry_point,
         "originalResource": original_id,
         "pipelineResource": pipeline_id,
         "reflection": reflection,
+        "activeReflection": active_reflection,
         "physicalAbiSha256": physical_abi_sha256,
         "dxilAccessSignature": dxil_access,
         "dxilLayoutEvidence": dxil_layout_evidence,
     }
+
+
+def _manual_shared_shader_original(ctrl, original_resource, event, stage_name,
+                                   entry_point, owner):
+    """Read captured identity without stepping/replaying an anchor or comparing ABI.
+
+    Shader resources are immutable for a capture lifetime. Once retained by an
+    owned replacement, these facts do not depend on the currently selected EID.
+    UI ownership, capture/session and the original raw hash are checked by this
+    path; none of these checks asserts candidate interface compatibility.
+    """
+    if owner is not None:
+        if any((owner.get("expectedOriginalResourceId") != event["expectedOriginalResourceId"],
+                owner.get("expectedOriginalSha256") != event["expectedOriginalSha256"],
+                owner.get("stageName") != stage_name, owner.get("entryPoint") != entry_point,
+                owner.get("captureSessionId") != _capture_session_id,
+                owner.get("captureToken") != _current_capture_token())):
+            raise RuntimeError("The manual Shader edit belongs to a different captured original")
+        reflection = owner.get("capturedOriginalReflection")
+        pipeline_resource = owner.get("capturedOriginalPipelineResource", rd.ResourceId())
+    else:
+        entries = list(ctrl.GetShaderEntryPoints(original_resource) or [])
+        entry = _exact_shader_entry(entries, entry_point, stage_name)
+        if entry is None:
+            raise RuntimeError("The captured Shader entry point/stage changed or became ambiguous")
+        pipeline_resource = rd.ResourceId()
+        reflection = ctrl.GetShader(pipeline_resource, original_resource, entry)
+    raw = _shader_raw_bytes(reflection) if reflection else b""
+    if (not raw or hashlib.sha256(raw).hexdigest() != event["expectedOriginalSha256"] or
+            str(getattr(reflection, "entryPoint", "") or entry_point) != entry_point):
+        raise RuntimeError("The captured Shader bytes or entry point changed before manual edit")
+    return {
+        "event": event, "originalResource": original_resource,
+        "pipelineResource": pipeline_resource, "reflection": reflection,
+        # This is an optional identity of the captured original, never a proof
+        # that the unvalidated manual candidate has the same interface.
+        "physicalAbiSha256": owner.get("physicalAbiSha256", "") if owner else "",
+        "dxilAccessSignature": owner.get("capturedDxilAccessSignature") if owner else None,
+        "dxilLayoutEvidence": owner.get("capturedDxilLayoutEvidence") if owner else None,
+    }
+
+
+def _manual_shader_target_key(record):
+    return tuple(record.get(key) for key in (
+        "captureToken", "api", "encoding", "expectedOriginalResourceId",
+        "expectedOriginalSha256", "stageName", "entryPoint", "candidateRawSha256"))
+
+
+def _verified_restore_original(ctrl, resource, event, stage_name, entry_point, payload, owner=None):
+    """Read immutable native bytes without replaying a historical anchor.
+
+    Only an authenticated exact-RDC/native-byte pair enters this path. Resource
+    replacement affects all uses, so re-rendering one old EID adds no identity
+    evidence. Unknown IDs, unavailable resource-only reflection and an existing
+    owner retain the ordinary anchor path. Never cache a GPU object on disk.
+    """
+    if (payload is None or owner is not None or resource is None
+            or _shader_api_token(ctrl) not in ("d3d11", "d3d12", "vulkan", "opengl")):
+        return None
+    _require_healthy_replay(ctrl)
+    try:
+        live = _manual_shared_shader_original(ctrl, resource, event, stage_name, entry_point, None)
+    except (RuntimeError, ValueError, AttributeError, TypeError):
+        return None
+    if list(getattr(live["reflection"], "interfaces", []) or []):
+        return None
+    live["physicalAbiSha256"] = payload["physicalAbiSha256"]
+    return live
+
+
+def _take_manual_shader_target(key):
+    for index, record in enumerate(_shared_shader_manual_target_cache):
+        if _manual_shader_target_key(record) == key:
+            return _shared_shader_manual_target_cache.pop(index)["targetResource"]
+    return None
+
+
+def _retain_manual_shader_target(ctrl, record):
+    """Keep a small LRU of inactive native targets for edit/undo/A-B toggles."""
+    target = record.get("targetResource")
+    target_id = _resource_id_int(target)
+    if not target_id or any(row.get("targetResourceId") == target_id
+                            for row in _shared_shader_replacements.values()):
+        return False
+    if any(_resource_id_int(row.get("targetResource")) == target_id
+           for row in _shared_shader_manual_target_cache):
+        return True
+    _shared_shader_manual_target_cache.append(dict(record))
+    while len(_shared_shader_manual_target_cache) > 8:
+        expired = _shared_shader_manual_target_cache.pop(0)
+        try:
+            ctrl.FreeTargetResource(expired["targetResource"])
+        except Exception:
+            _register_orphan_shader_target(expired["targetResource"])
+    return True
 
 
 def _shader_override_response(record, superseded_id=None,
@@ -8496,7 +10191,7 @@ def _apply_shader_candidate_overrides(params):
         original_event = 0
 
     def _do(ctrl):
-        api_name = str(getattr(ctrl.GetAPIProperties(), "pipelineType", "") or "")
+        api_name = _native_enum_text(getattr(ctrl.GetAPIProperties(), "pipelineType", None))
         if api_name.lower().replace("graphicsapi.", "") not in (
                 "d3d11", "direct3d11"):
             raise RuntimeError("Event shader overrides currently require a D3D11 capture")
@@ -8547,7 +10242,8 @@ def _apply_shader_candidate_overrides(params):
         target_id = target.get("targetResource") if target else None
         built_target = False
         if target is None and any(not item["idempotent"] for item in prepared):
-            target_id, messages = ctrl.BuildTargetShader(
+            target_id, messages = _build_target_shader(
+                ctrl,
                 entry_point, encoding, candidate_bytes,
                 rd.ShaderCompileFlags(), stage)
             if not _resource_id_int(target_id):
@@ -8559,7 +10255,10 @@ def _apply_shader_candidate_overrides(params):
             target_entry = _exact_shader_entry(
                 target_entries, entry_point, requested_stage)
             if target_entry is None:
-                ctrl.FreeTargetResource(target_id)
+                try:
+                    ctrl.FreeTargetResource(target_id)
+                except Exception:
+                    _register_orphan_shader_target(target_id)
                 raise RuntimeError(
                     "The target shader has no unique requested entry point/stage")
             target_reflection = ctrl.GetShader(
@@ -8576,7 +10275,10 @@ def _apply_shader_candidate_overrides(params):
                     raise RuntimeError(
                         "The candidate physical ABI differs from the original Shader family")
             except Exception:
-                ctrl.FreeTargetResource(target_id)
+                try:
+                    ctrl.FreeTargetResource(target_id)
+                except Exception:
+                    _register_orphan_shader_target(target_id)
                 raise
             target = {
                 "familyId": family_id,
@@ -8662,7 +10364,7 @@ def _apply_shader_candidate_overrides(params):
                 try:
                     ctrl.FreeTargetResource(target_id)
                 except Exception:
-                    pass
+                    _register_orphan_shader_target(target_id)
             if original_event > 0:
                 try:
                     _set_frame_event(ctrl, original_event, True)
@@ -8742,7 +10444,8 @@ def _apply_shader_candidate_overrides(params):
             except Exception:
                 # Retain an unreferenced target for lifecycle cleanup rather
                 # than accidentally freeing a captured/original shader.
-                pass
+                _register_orphan_shader_target(old_target["targetResource"])
+                _event_shader_targets.pop(old_family, None)
 
         responses = []
         for item in committed:
@@ -8944,6 +10647,8 @@ def _rollback_shader_candidate_overrides(params):
                 freed.add(family_id)
             except Exception as exc:
                 free_warnings[family_id] = str(exc)
+                _register_orphan_shader_target(target["targetResource"])
+                _event_shader_targets.pop(family_id, None)
 
         selection_warning = ""
         if original_event > 0:
@@ -9018,7 +10723,14 @@ def _shared_shader_replacement_response(record, idempotent=False,
                                         operation_id=None,
                                         operation_created_replacement=False,
                                         superseded_id=None,
-                                        superseded_target_freed=True):
+                                        superseded_target_freed=True,
+                                        verified_restore_receipt=None,
+                                        verified_restore_mode="verified-rdc-restore"):
+    if record.get("postApplyValidationFailed") is True:
+        raise RuntimeError(
+            "Shader replacement %s requires recovery after failed post-apply validation; "
+            "its live target is retained, not a completed apply"
+            % record["replacementId"])
     result = {
         "schema": "renderdoc-ultra-shared-shader-replacement/v1",
         "schemaVersion": 1,
@@ -9053,6 +10765,7 @@ def _shared_shader_replacement_response(record, idempotent=False,
         "capturedRootSignaturesReused": record["api"] == "d3d12",
         "postApplyAnchorVerified": bool(
             record.get("postApplyAnchorVerified", False)),
+        "postApplyMappingVerified": record.get("postApplyMappingVerified") is True,
         "idempotent": bool(idempotent),
         "metadataOnly": bool(metadata_only),
         "targetBuiltOnce": not (idempotent or metadata_only),
@@ -9060,7 +10773,30 @@ def _shared_shader_replacement_response(record, idempotent=False,
         "supersededReplacementId": superseded_id,
         "supersededTargetFreed": bool(superseded_target_freed),
     }
+    if record.get("restoreValidationReceipt") is not None:
+        result["restoreValidationReceipt"] = record["restoreValidationReceipt"]
+    if record.get("restoreValidationReceiptError"):
+        result["restoreValidationReceiptError"] = record["restoreValidationReceiptError"]
+    if record.get("restoreValidationReceiptUpgrade"):
+        result["restoreValidationReceiptUpgrade"] = record["restoreValidationReceiptUpgrade"]
+    if record.get("restoredOriginalResourceId") is not None:
+        result["restoredOriginalResourceId"] = record["restoredOriginalResourceId"]
     validation_mode = str(record.get("abiValidationMode", "") or "")
+    if validation_mode == "manual-fast":
+        result.update({
+            "validationScope": "manual-edit-unvalidated",
+            "manualEdit": True,
+            "replayAbiValidated": False,
+            "freshPhysicalValidationPerformed": False,
+            "sourceSha256": record.get("sourceSha256", ""),
+            "targetProfile": record.get("targetProfile"),
+            "targetCacheHit": bool(record.get("targetCacheHit", False)),
+            "supersededTargetCached": bool(record.get("supersededTargetCached", False)),
+            "targetBuiltOnce": not (idempotent or metadata_only or record.get("targetCacheHit")),
+            "targetReused": bool(idempotent or metadata_only or record.get("targetCacheHit")),
+        })
+    if record.get("timingsMs") is not None:
+        result["timingsMs"] = dict(record["timingsMs"])
     if validation_mode:
         result.update({
             "abiValidationMode": validation_mode,
@@ -9074,7 +10810,279 @@ def _shared_shader_replacement_response(record, idempotent=False,
                 "abiLeaseCandidateRawSha256"),
             "abiLeaseRevision": record.get("abiLeaseRevision"),
         })
+    if verified_restore_receipt is not None:
+        # A successfully authenticated restore can reuse a target whose owner
+        # was established by a full apply. Describe this request's validation
+        # in its response; retain the owner's original validation/lease history.
+        result.update({
+            "abiValidationMode": verified_restore_mode,
+            "preliminaryReflectionSkipped": True,
+            "freshPhysicalAbiValidationPerformed": False,
+            "restoreValidationReceipt": verified_restore_receipt,
+        })
     return result
+
+
+def _shader_restore_binding(params):
+    binding = params.get("workspace_catalog_binding")
+    if not isinstance(binding, dict) or set(binding) != {"projection", "scope"}:
+        raise ValueError("Shader restore catalog binding is required")
+    projection, scope = binding["projection"], binding["scope"]
+    if (not isinstance(projection, dict) or not isinstance(scope, dict) or
+            not isinstance(scope.get("identityEvidence"), dict) or
+            not isinstance(scope.get("stableIdentityEvidence"), dict)):
+        raise ValueError("Shader restore catalog identity evidence is incomplete")
+    return {
+        "captureId": _shader_override_hex(params.get("expected_capture_id"), "expected_capture_id", 64),
+        "workspaceId": _shader_override_hex(params.get("workspace_id"), "workspace_id", 32),
+        "revision": _safe_int(params.get("revision"), 0),
+        "sourceSha256": _shader_override_hex(params.get("expected_source_sha256"), "expected_source_sha256", 64),
+        "candidateRawSha256": _shader_override_hex(params.get("expected_sha256"), "expected_sha256", 64),
+        "originalRawSha256": _shader_override_hex(params.get("expected_original_sha256"), "expected_original_sha256", 64),
+        "stage": _normalise_stage_name(params.get("stage")),
+        "entryPoint": str(params.get("entry_point", "") or ""),
+        "encoding": str(params.get("encoding", "dxbc") or "dxbc").lower(),
+        "abiRequestId": _shader_override_hex(params.get("abi_request_id"), "abi_request_id", 64),
+        "abiReportSha256": _shader_override_hex(params.get("abi_report_sha256"), "abi_report_sha256", 64),
+        "catalogBindingSha256": _canonical_json_sha256(binding),
+    }
+
+
+def _shader_restore_catalog_pairs(params):
+    binding = params["workspace_catalog_binding"]
+    scope = binding["scope"]
+    return (
+        (params["expected_capture_id"], _canonical_json_sha256(scope["identityEvidence"])),
+        (_shader_override_hex(scope.get("stableCaptureId"), "stableCaptureId", 64),
+         _canonical_json_sha256(scope["stableIdentityEvidence"])))
+
+
+def _verified_shader_restore_request(params):
+    """Authenticate old proof, then bind its complete RDC bytes to this session."""
+    global _known_catalog_capture_ids, _known_catalog_identity_pairs, _known_catalog_stable_pairs
+    payload = _shader_restore_receipt_store.verify(params.get("restore_validation_receipt"))
+    pair_mode = params.get("abi_validation_mode") == "verified-shader-pair"
+    physical_binding = payload.get("physicalValidationBinding")
+    if _shader_restore_physical_validation_binding is None:
+        if payload.get("validationPolicySha256") != _shader_restore_policy_sha256:
+            raise RuntimeError("Shader restore conservative validation policy or replay binary changed")
+    elif physical_binding is None:
+        raise RuntimeError("Shader restore proof predates physical validation binding; fresh validation is required once")
+    elif (_shader_restore_protocol.physical_validation_binding_sha256(
+                _shader_restore_physical_validation_binding) != _shader_restore_policy_sha256
+            or payload.get("validationPolicySha256") !=
+            _shader_restore_protocol.physical_validation_binding_sha256(physical_binding)
+            or (physical_binding != _shader_restore_physical_validation_binding
+                and not _shader_restore_protocol.compatible_validation_binding(
+                    physical_binding, _shader_restore_physical_validation_binding))):
+        raise RuntimeError("Shader restore validation policy or replay binary changed")
+    expected = _shader_restore_binding(params)
+    # Native bytes determine the Shader profile and interface. A successfully
+    # checked pair remains that same pair after an unrelated package update or
+    # source/workspace/catalog allocation change. Those fields remain signed
+    # origin provenance; current source-to-candidate binding belongs to Host.
+    pair_fields = ("candidateRawSha256", "originalRawSha256", "stage", "entryPoint", "encoding")
+    compared_fields = pair_fields if pair_mode else tuple(expected)
+    if any(payload.get(key) != expected[key] for key in compared_fields):
+        raise RuntimeError("Shader restore proof no longer matches source/candidate/catalog/report")
+    if pair_mode:
+        pair_policy = payload.get("pairValidationPolicyVersion", 1)
+        if type(pair_policy) is not int or pair_policy != 1:
+            raise RuntimeError("Shader pair validation policy is incompatible")
+        if params.get("expected_physical_abi_sha256") != payload.get("physicalAbiSha256"):
+            raise RuntimeError("Shader pair proof no longer matches its physical ABI")
+        if "targetProfile" in payload and params.get("expected_profile") != payload["targetProfile"]:
+            raise RuntimeError("Shader pair proof no longer matches its native profile")
+    expected_session = _shader_override_hex(
+        params.get("expected_capture_session_id"), "expected_capture_session_id", 32)
+    token = _current_capture_token()
+    if (not _request_capture_loaded() or token is None or
+            expected_session != _capture_session_id):
+        raise RuntimeError("Shader restore capture session changed")
+    capture_path = token[1]
+    requested_path = str(params.get("expected_capture_path", "") or "")
+    if requested_path and os.path.normcase(os.path.abspath(requested_path)) != capture_path:
+        raise RuntimeError("Shader restore capture path changed")
+    replay_sha = payload.get("captureReplaySha256")
+    if replay_sha is not None:
+        if payload.get("captureReplayIdentitySchema") != "bread-rdc-replay-content/v1":
+            raise RuntimeError("Shader restore replay-content identity is unsupported")
+        _shader_override_hex(replay_sha, "captureReplaySha256", 64)
+        current_replay_sha = _shader_restore_capture_digests.replay_digest(capture_path, _capture_session_id)
+        if current_replay_sha != replay_sha:
+            raise RuntimeError("Shader restore RDC replay contents changed")
+        if params.get("expected_capture_sha256", payload["captureSha256"]) != payload["captureSha256"]:
+            raise RuntimeError("Shader restore origin capture binding changed")
+    else:
+        capture_sha256 = _shader_restore_capture_digests.digest(capture_path, _capture_session_id)
+        if (capture_sha256 != payload.get("captureSha256") or
+                params.get("expected_capture_sha256", capture_sha256) != capture_sha256):
+            raise RuntimeError("Shader restore RDC content SHA-256 changed")
+    _shader_override_hex(payload.get("physicalAbiSha256"), "physicalAbiSha256", 64)
+    exact_pair, stable_pair = _shader_restore_catalog_pairs(params)
+    if (len(_known_catalog_capture_ids) >= MAX_KNOWN_CATALOG_CAPTURE_IDS and
+            expected["captureId"] not in _known_catalog_capture_ids):
+        raise RuntimeError("Too many cached capture identities are active")
+    catalog_matches = payload.get("catalogBindingSha256") == expected["catalogBindingSha256"]
+    for pair, known in ((exact_pair, _known_catalog_identity_pairs),
+                        (stable_pair, _known_catalog_stable_pairs)) if catalog_matches else ():
+        if len(known) >= MAX_KNOWN_CATALOG_IDENTITY_PAIRS and pair not in known:
+            raise RuntimeError("Too many cached catalog identities are active")
+    # Only signed catalog evidence for the exact same RDC enters these caches.
+    known_ids = dict(_known_catalog_capture_ids)
+    known_ids[expected["captureId"]] = capture_path
+    _known_catalog_capture_ids = known_ids
+    if catalog_matches:
+        _known_catalog_identity_pairs = set(_known_catalog_identity_pairs) | {exact_pair}
+        _known_catalog_stable_pairs = set(_known_catalog_stable_pairs) | {stable_pair}
+    return payload
+
+
+def _attach_shader_restore_receipt(record, params, verified=None):
+    if record.get("abiValidationMode") == "manual-fast":
+        # Manual edits deliberately did not establish a candidate ABI proof.
+        # Never turn their persistence metadata into a strict restore receipt.
+        record.pop("restoreValidationReceipt", None)
+        record.pop("restoreValidationReceiptError", None)
+        return
+    if verified is not None:
+        if params.get("abi_validation_mode") == "verified-shader-pair":
+            rebound = _shader_restore_binding(params)
+            rebound.update({
+                "schema": _shader_restore_protocol.SCHEMA,
+                "validationPolicySha256": _shader_restore_policy_sha256,
+                "physicalValidationBinding": _shader_restore_physical_validation_binding,
+                "packageProvenanceSha256": _shader_restore_package_provenance_sha256,
+                "pairValidationPolicyVersion": 1,
+                "captureSha256": verified["captureSha256"],
+                "physicalAbiSha256": record["physicalAbiSha256"],
+                "api": record["api"],
+            })
+            if "capturedDxilEvidence" in verified:
+                rebound["capturedDxilEvidence"] = verified["capturedDxilEvidence"]
+            if params.get("expected_profile") is not None:
+                rebound["targetProfile"] = params["expected_profile"]
+            try:
+                if verified.get("captureReplaySha256") is not None:
+                    rebound["captureReplaySha256"] = verified["captureReplaySha256"]
+                    rebound["captureReplayIdentitySchema"] = verified["captureReplayIdentitySchema"]
+                record["restoreValidationReceipt"] = _shader_restore_receipt_store.seal(rebound)
+            except Exception as exc:
+                # Receipt persistence is a future optimization. Preserve the
+                # authenticated pair proof and the successful replay effect.
+                record["restoreValidationReceipt"] = params["restore_validation_receipt"]
+                record["restoreValidationReceiptError"] = str(exc)[:512]
+        else:
+            record["restoreValidationReceipt"] = params["restore_validation_receipt"]
+        if verified.get("captureReplaySha256") is None:
+            try:
+                token = _current_capture_token()
+                upgraded = dict(record["restoreValidationReceipt"]["payload"])
+                upgraded["captureReplaySha256"] = _shader_restore_capture_digests.replay_digest(token[1], _capture_session_id)
+                upgraded["captureReplayIdentitySchema"] = "bread-rdc-replay-content/v1"
+                # Preserve the receipt used by this operation. Publish a new
+                # optional proof rather than rewriting its immutable history.
+                record["restoreValidationReceiptUpgrade"] = _shader_restore_receipt_store.seal(upgraded)
+            except (ValueError, OSError, AttributeError, TypeError):
+                pass  # Unknown/legacy containers retain whole-file validation.
+        return
+    # Legacy callers do not yet supply a source/catalog binding. Their full
+    # apply remains valid but cannot authorize a later restore fast path.
+    if not params.get("expected_source_sha256") or not params.get("workspace_catalog_binding"):
+        return
+    try:
+        payload = _shader_restore_binding(params)
+        exact_pair, stable_pair = _shader_restore_catalog_pairs(params)
+        if (exact_pair not in _known_catalog_identity_pairs and
+                stable_pair not in _known_catalog_stable_pairs):
+            raise RuntimeError("Shader restore catalog evidence was not validated in this capture")
+        token = _current_capture_token()
+        if token is None or record["captureSessionId"] != _capture_session_id:
+            raise RuntimeError("Capture changed before Shader restore proof publication")
+        payload.update({
+            "schema": _shader_restore_protocol.SCHEMA,
+            "pairValidationPolicyVersion": 1,
+            "validationPolicySha256": _shader_restore_policy_sha256,
+            "physicalValidationBinding": _shader_restore_physical_validation_binding,
+            "packageProvenanceSha256": _shader_restore_package_provenance_sha256,
+            "captureSha256": _shader_restore_capture_digests.digest(token[1], _capture_session_id),
+            "physicalAbiSha256": record["physicalAbiSha256"],
+            "api": record["api"],
+        })
+        try:
+            payload["captureReplaySha256"] = _shader_restore_capture_digests.replay_digest(token[1], _capture_session_id)
+            payload["captureReplayIdentitySchema"] = "bread-rdc-replay-content/v1"
+        except (ValueError, OSError, AttributeError, TypeError):
+            pass
+        if params.get("expected_profile") is not None:
+            profile = params["expected_profile"]
+            if not isinstance(profile, str) or not profile or len(profile) > 128:
+                raise ValueError("expected_profile must be a bounded profile token")
+            payload["targetProfile"] = profile
+        if payload["encoding"] == "dxil":
+            payload["capturedDxilEvidence"] = _shader_restore_protocol.capture_dxil_evidence(
+                record.get("capturedDxilAccessSignature"),
+                record.get("capturedDxilLayoutEvidence"), _dxil_access_protocol)
+        record["restoreValidationReceipt"] = _shader_restore_receipt_store.seal(payload)
+    except Exception as exc:
+        # The already completed GPU/UI transaction must not become a reported
+        # failure merely because its optional future-reuse proof cannot persist.
+        record["restoreValidationReceiptError"] = str(exc)[:512]
+
+
+def _verify_restored_shader_mapping(ctrl, original, target):
+    query = getattr(ctrl, "GetTargetShaderReplacement", None)
+    if not callable(query):
+        return False
+    if _resource_id_int(query(original)) != _resource_id_int(target):
+        raise RuntimeError("Checked Shader replacement mapping differs from the built target")
+    return True
+
+
+def _apply_shader_candidate_shared_resource_batch(params):
+    """One bounded owner transaction; retain independent errors per resource."""
+    items = params.get('items')
+    if not isinstance(items, list) or not 1 <= len(items) <= 16:
+        raise ValueError('Shader restore batch must contain 1..16 items')
+    session = str(_capture_session_id or '')
+    operations = set()
+    for item in items:
+        if (not isinstance(item, dict) or item.get('abi_validation_mode') != 'verified-rdc-restore'
+                or item.get('expected_capture_session_id') != session):
+            raise ValueError('Shader restore batch requires the current signed capture binding')
+        operation = _shader_override_hex(item.get('operation_id'), 'operation_id', 32)
+        if operation in operations:
+            raise ValueError('Duplicate Shader restore batch operation')
+        operations.add(operation)
+    owner = [0]
+    previous = getattr(_request_dispatch_state, 'defer_shader_notifications', False)
+    results = []
+    def begin(ctrl):
+        begin_batch = getattr(ctrl, 'BeginShaderReplacementBatch', None)
+        if callable(begin_batch):
+            _begin_replay_atomic_transaction()
+            owner[0] = int(begin_batch())
+    try:
+        _replay(begin)
+        _request_dispatch_state.defer_shader_notifications = bool(owner[0])
+        for item in items:
+            try:
+                if _capture_session_id != session:
+                    raise RuntimeError('Capture changed during Shader restore batch')
+                result = _apply_shader_candidate_shared_resource(item)
+                results.append({'ok': True, 'result': result})
+            except Exception as error:
+                results.append({'ok': False, 'error': str(error)[:2048],
+                                'operationId': item['operation_id']})
+    finally:
+        _request_dispatch_state.defer_shader_notifications = previous
+        if owner[0] and _capture_session_id == session:
+            ended = _replay(lambda ctrl: ctrl.EndShaderReplacementBatch(owner[0]))
+            if not ended:
+                raise RuntimeError('Shader restore batch ownership changed before final replay')
+        if owner[0]:
+            _notify_shader_replay_changed()
+    return {'items': results, 'captureSessionId': session, 'replayCoalesced': bool(owner[0])}
 
 
 def _apply_shader_candidate_shared_resource(params):
@@ -9087,6 +11095,26 @@ def _apply_shader_candidate_shared_resource(params):
     global _shared_shader_replacements, _shared_shader_orphan_targets
     global _shared_shader_replacement_capture_token
 
+    apply_started = time.monotonic()
+    timings = {}
+    abi_validation_mode = str(params.get("abi_validation_mode", "") or "").strip().lower()
+    manual_fast = abi_validation_mode == "manual-fast"
+    expected_session = ""
+    if manual_fast or "expected_capture_session_id" in params:
+        expected_session = _shader_override_hex(
+            params.get("expected_capture_session_id"), "expected_capture_session_id", 32)
+        if expected_session != _capture_session_id or not _request_capture_loaded():
+            raise RuntimeError("Shader apply capture session changed")
+    manual_source_sha256 = (_shader_override_hex(
+        params.get("expected_source_sha256"), "expected_source_sha256", 64)
+        if manual_fast and params.get("expected_source_sha256") else "")
+    restore_payload = None
+    restored_dxil_evidence = None
+    if params.get("abi_validation_mode") in ("verified-rdc-restore", "verified-shader-pair"):
+        restore_payload = _verified_shader_restore_request(params)
+        if restore_payload["encoding"] == "dxil":
+            restored_dxil_evidence = _shader_restore_protocol.restore_dxil_evidence(
+                restore_payload.get("capturedDxilEvidence"), _dxil_access_protocol)
     capture_id = _require_capture_identity(params.get("expected_capture_id"))
     requested_operation_id = str(
         params.get("operation_id", params.get("operationId", "")) or ""
@@ -9107,10 +11135,11 @@ def _apply_shader_candidate_shared_resource(params):
         "dxil": "DXIL",
         "spirv": "SPIRV",
         "opengl-spirv": "OpenGLSPIRV",
+        "glsl": "GLSL",
     }.get(encoding_name)
     if encoding_attribute is None:
         raise ValueError(
-            "Shared Shader replacement accepts native DXBC, DXIL, Vulkan SPIR-V, or OpenGL SPIR-V only")
+            "Shared Shader replacement accepts DXBC, DXIL, Vulkan SPIR-V, OpenGL SPIR-V or GLSL")
     requested_stage = _normalise_stage_name(params.get("stage", ""))
     stage_map = dict(_available_shader_stages([requested_stage]))
     stage = stage_map.get(requested_stage)
@@ -9125,17 +11154,19 @@ def _apply_shader_candidate_shared_resource(params):
     revision = _safe_int(params.get("revision"), 0)
     if revision <= 0:
         raise ValueError("revision must be a positive integer")
-    request_id = _shader_override_hex(params.get("abi_request_id"), "abi_request_id", 64)
-    report_sha256 = _shader_override_hex(
-        params.get("abi_report_sha256"), "abi_report_sha256", 64)
-    abi_validation_mode = str(
-        params.get("abi_validation_mode", "") or "").strip().lower()
+    request_id = ("" if manual_fast else _shader_override_hex(
+        params.get("abi_request_id"), "abi_request_id", 64))
+    report_sha256 = ("" if manual_fast else _shader_override_hex(
+        params.get("abi_report_sha256"), "abi_report_sha256", 64))
     lease_request_id = request_id
     lease_report_sha256 = report_sha256
     lease_candidate_sha256 = candidate_sha256
     lease_revision = revision
+    if manual_fast:
+        lease_request_id = lease_report_sha256 = lease_candidate_sha256 = None
+        lease_revision = None
     expected_physical_abi_sha256 = ""
-    if abi_validation_mode:
+    if abi_validation_mode and restore_payload is None and not manual_fast:
         if abi_validation_mode != "inline-physical-with-initial-lease":
             raise ValueError("Unsupported shared Shader ABI validation mode")
         lease_request_id = _shader_override_hex(
@@ -9155,6 +11186,27 @@ def _apply_shader_candidate_shared_resource(params):
     if len(events) != 1:
         raise ValueError("A shared Shader replacement requires one live anchor event")
     event = events[0]
+    restored_original_resource_id = None
+    if restore_payload is not None and not (
+            abi_validation_mode == "verified-shader-pair" and
+            params.get("use_current_anchor_resource") is True):
+        # Historical restore IDs need one rebound query. A current inventory
+        # anchor can skip that replay; the final mutation callback still checks
+        # its actual pipeline binding and captured-original bytes before build.
+        restored_original_resource_id = event["expectedOriginalResourceId"]
+        resource_hint = _invoke_on_ui_sync(
+            lambda: _context_resource_ids().get(restored_original_resource_id))
+        def _current_original(ctrl):
+            immutable = _verified_restore_original(
+                ctrl, resource_hint, event, requested_stage, entry_point, restore_payload)
+            if immutable is not None:
+                return _resource_id_int(immutable["originalResource"])
+            _set_frame_event(ctrl, event["eventId"], True)
+            return _resource_id_int(ctrl.GetPipelineState().GetShader(stage))
+        current_resource_id = _replay(_current_original)
+        if not current_resource_id:
+            raise RuntimeError("Shader restore anchor has no current Shader resource")
+        event["expectedOriginalResourceId"] = current_resource_id
     original_resource_id = event["expectedOriginalResourceId"]
     if any(
             record.get("expectedOriginalResourceId") == original_resource_id
@@ -9169,6 +11221,10 @@ def _apply_shader_candidate_shared_resource(params):
             "This RenderDoc build does not expose ShaderEncoding.%s" %
             encoding_attribute)
     existing = _shared_shader_replacements.get(original_resource_id)
+    if existing is not None and existing.get("postApplyValidationFailed") is True:
+        # Failed validation is an explicit recovery owner, never an idempotent
+        # success or a source of a newly signed persistent ABI receipt.
+        _shared_shader_replacement_response(existing)
     previous_operation = _shared_shader_operation_outcomes.get(operation_id)
     if previous_operation is not None:
         if any((
@@ -9191,7 +11247,10 @@ def _apply_shader_candidate_shared_resource(params):
                 prior_replacement,
                 idempotent=True,
                 operation_id=operation_id,
-                operation_created_replacement=False)
+                operation_created_replacement=False,
+                verified_restore_receipt=(prior_replacement.get("restoreValidationReceipt")
+                                          if restore_payload is not None else None),
+                verified_restore_mode=abi_validation_mode)
         raise RuntimeError(
             "Shared Shader operation token already completed without its exact active replacement")
     if (existing is None and
@@ -9205,12 +11264,26 @@ def _apply_shader_candidate_shared_resource(params):
             for record in _shared_shader_replacements.values()):
         raise RuntimeError(
             "The workspace already owns a different captured Shader ResourceId")
+    handoff = params.get("expected_owner")
+    if handoff is not None:
+        fields = {"replacementId", "workspaceId", "captureId", "captureSessionId",
+                  "candidateRawSha256", "revision"}
+        if not isinstance(handoff, dict) or set(handoff) != fields:
+            raise ValueError("expected_owner must bind the exact previous Shader replacement")
+        if (existing is None or any(existing.get(key) != handoff[key] for key in fields)
+                or handoff["workspaceId"] == workspace_id
+                or handoff["captureSessionId"] != _capture_session_id
+                or existing.get("captureToken") != capture_token):
+            raise RuntimeError("Shared Shader handoff owner changed before replacement")
+        _require_capture_identity(handoff["captureId"])
+        if abi_validation_mode and restore_payload is None and not manual_fast:
+            raise RuntimeError("Shared Shader handoff requires a full candidate ABI proof")
     if (existing is not None and
-            existing.get("workspaceId") != workspace_id):
+            existing.get("workspaceId") != workspace_id and handoff is None):
         raise RuntimeError(
             "The captured Shader is owned by a different workspace; explicit "
             "replacement handoff is not supported")
-    if abi_validation_mode:
+    if abi_validation_mode and restore_payload is None and not manual_fast:
         if existing is None:
             raise RuntimeError(
                 "An inline ABI lease requires an active fully validated replacement")
@@ -9240,8 +11313,25 @@ def _apply_shader_candidate_shared_resource(params):
     def _do(ctrl):
         new_target = None
         replacement_attempted = False
+        replacement_committed = False
+        target_cache_hit = False
+        anchor_replayed = not manual_fast
         try:
+            if expected_session and (_capture_session_id != expected_session or
+                    _current_capture_token() != capture_token):
+                raise RuntimeError("Shader apply capture session changed before replay mutation")
+            if manual_fast and (_capture_session_id != expected_session or
+                    _current_capture_token() != capture_token or
+                    _shared_shader_replacements.get(original_resource_id) is not existing):
+                raise RuntimeError("Manual Shader edit owner or capture changed before replay mutation")
+            if handoff is not None and (
+                    _shared_shader_replacements.get(original_resource_id) is not existing or
+                    any(existing.get(key) != value for key, value in handoff.items()) or
+                    _shared_shader_replacement_capture_token != capture_token):
+                raise RuntimeError("Shared Shader handoff owner changed before replay mutation")
             api_token = _shader_api_token(ctrl)
+            if restore_payload is not None and api_token != restore_payload.get("api"):
+                raise RuntimeError("Shader restore replay API changed")
             if api_token == "d3d11":
                 if encoding_name != "dxbc" or requested_stage in ("task", "mesh"):
                     raise RuntimeError(
@@ -9263,10 +11353,11 @@ def _apply_shader_candidate_shared_resource(params):
                     raise RuntimeError(
                         "This RenderDoc build lacks checked Vulkan Shader replacement")
             elif api_token == "opengl":
-                if (encoding_name != "opengl-spirv" or
-                        requested_stage in ("task", "mesh")):
+                if (encoding_name not in ("opengl-spirv", "glsl") or
+                        requested_stage in ("task", "mesh") or
+                        (encoding_name == "glsl" and entry_point != "main")):
                     raise RuntimeError(
-                        "OpenGL shared replacement requires native OpenGL SPIR-V and a legacy pipeline stage")
+                        "OpenGL shared replacement requires GLSL main or OpenGL SPIR-V and a legacy pipeline stage")
                 if not callable(getattr(ctrl, "ReplaceTargetShaderChecked", None)):
                     raise RuntimeError(
                         "This RenderDoc build lacks checked OpenGL Shader replacement")
@@ -9278,12 +11369,27 @@ def _apply_shader_candidate_shared_resource(params):
                     "%s target shaders are unsupported by this replay" %
                     encoding_name.upper())
 
-            live = _validate_live_shader_event(
-                ctrl, event, stage, requested_stage, entry_point,
-                require_d3d11_state=(api_token == "d3d11"),
-                owned_shared_replacement=existing)
+            identity_started = time.monotonic()
+            if manual_fast:
+                live = _manual_shared_shader_original(
+                    ctrl, original_resource, event, requested_stage, entry_point, existing)
+            else:
+                live = _verified_restore_original(
+                    ctrl, original_resource, event, requested_stage, entry_point, restore_payload, existing)
+                if live is not None:
+                    anchor_replayed = False
+                else:
+                    live = _validate_live_shader_event(
+                        ctrl, event, stage, requested_stage, entry_point,
+                        require_d3d11_state=(api_token == "d3d11"),
+                        owned_shared_replacement=existing,
+                        verified_physical_abi_sha256=(restore_payload["physicalAbiSha256"]
+                                                     if restore_payload is not None else ""))
+            timings["originalIdentity"] = (time.monotonic() - identity_started) * 1000
+            if restored_dxil_evidence is not None:
+                live["dxilAccessSignature"], live["dxilLayoutEvidence"] = restored_dxil_evidence
             abi_sha256 = live["physicalAbiSha256"]
-            if (abi_validation_mode and
+            if (abi_validation_mode and restore_payload is None and not manual_fast and
                     abi_sha256 != expected_physical_abi_sha256):
                 raise RuntimeError(
                     "The live captured Shader ABI no longer matches the initial lease")
@@ -9293,6 +11399,7 @@ def _apply_shader_candidate_shared_resource(params):
                 candidate_sha256, abi_sha256)
             exact = bool(
                 existing is not None and
+                (manual_fast or existing.get("abiValidationMode") != "manual-fast") and
                 existing.get("familyId") == family_id and
                 existing.get("workspaceId") == workspace_id and
                 existing.get("revision") == revision and
@@ -9300,7 +11407,8 @@ def _apply_shader_candidate_shared_resource(params):
                 existing.get("abiReportSha256") == report_sha256)
             metadata_only = bool(
                 existing is not None and
-                existing.get("familyId") == family_id and not exact)
+                (manual_fast or existing.get("abiValidationMode") != "manual-fast") and
+                existing.get("familyId") == family_id and not exact and handoff is None)
             if exact or metadata_only:
                 return {
                     "mode": "idempotent" if exact else "metadata",
@@ -9310,27 +11418,51 @@ def _apply_shader_candidate_shared_resource(params):
                     "api": api_token,
                 }
 
-            new_target, messages = ctrl.BuildTargetShader(
-                entry_point, encoding, candidate_bytes,
-                rd.ShaderCompileFlags(), stage)
+            build_started = time.monotonic()
+            if manual_fast:
+                cache_key = (capture_token, api_token, encoding_name, original_resource_id,
+                             event["expectedOriginalSha256"], requested_stage,
+                             entry_point, candidate_sha256)
+                new_target = _take_manual_shader_target(cache_key)
+                target_cache_hit = new_target is not None
+            if new_target is None:
+                new_target, messages = _build_target_shader(
+                    ctrl,
+                    entry_point, encoding, candidate_bytes,
+                    rd.ShaderCompileFlags(), stage)
+            else:
+                messages = ""
+            timings["buildTarget"] = (time.monotonic() - build_started) * 1000
             if not _resource_id_int(new_target):
                 raise RuntimeError(
                     "BuildTargetShader failed: %s" % str(messages or ""))
-            target_entries = list(ctrl.GetShaderEntryPoints(new_target) or [])
+            # GLSL receipts seal source, not machine code. A new driver build
+            # must still reflect that exact source and validate the resulting
+            # interface, even when a prior source/ABI pair was authenticated.
+            reflect_target = not manual_fast and (restore_payload is None or encoding_name == "glsl")
+            target_entries = list(ctrl.GetShaderEntryPoints(new_target) or []) if reflect_target else []
             target_entry = _exact_shader_entry(
                 target_entries, entry_point, requested_stage)
-            if target_entry is None:
+            if target_entry is None and reflect_target:
                 raise RuntimeError(
                     "The target shader has no unique requested entry point/stage")
-            target_reflection = ctrl.GetShader(
-                rd.ResourceId(), new_target, target_entry)
+            target_reflection = (ctrl.GetShader(rd.ResourceId(), new_target, target_entry)
+                                 if reflect_target else None)
             target_raw = (
                 _shader_raw_bytes(target_reflection) if target_reflection else b"")
-            if (not target_reflection or
-                    hashlib.sha256(target_raw).hexdigest() != candidate_sha256):
+            if reflect_target and (not target_reflection or
+                    hashlib.sha256(target_raw).hexdigest() != candidate_sha256 or
+                    (encoding_name == "glsl" and _shader_encoding_token(
+                        getattr(target_reflection, "encoding", "")) != "glsl")):
                 raise RuntimeError(
                     "The built target shader does not match candidate bytes")
-            if encoding_name == "dxil":
+            if manual_fast:
+                # The user chose direct editing. Driver compilation/pipeline
+                # creation is required, but candidate ABI validation is not.
+                interface_compatible = True
+            elif restore_payload is not None and encoding_name != "glsl":
+                interface_compatible = True  # Exact native bytes were fully validated before sealing.
+            elif encoding_name == "dxil":
                 interface_compatible = _dxil_ambiguous_interface_compatible(
                     ctrl, live["pipelineResource"],
                     live["reflection"], target_reflection,
@@ -9346,10 +11478,23 @@ def _apply_shader_candidate_shared_resource(params):
             # Validation and mutation are adjacent on the replay thread. The
             # replacement key is always the captured original ResourceId.
             replacement_attempted = True
+            replace_started = time.monotonic()
             _replace_shared_shader_resource(
                 ctrl, api_token, live["originalResource"], new_target)
+            timings["replaceResource"] = (time.monotonic() - replace_started) * 1000
+            replacement_committed = True
             post_apply_anchor_verified = False
-            if api_token in ("vulkan", "opengl"):
+            post_apply_mapping_verified = False
+            if (restore_payload is not None and abi_validation_mode == "verified-rdc-restore"
+                    and params.get("verify_replacement_mapping") is True
+                    and api_token in ("vulkan", "opengl")):
+                # The signed same-RDC proof authenticates the original/candidate
+                # interface. Checked driver creation has just rebuilt affected
+                # pipelines. Confirm the actual controller mapping here instead
+                # of replaying the entire frame once per restored stage.
+                post_apply_mapping_verified = _verify_restored_shader_mapping(
+                    ctrl, live["originalResource"], new_target)
+            if not manual_fast and api_token in ("vulkan", "opengl") and not post_apply_mapping_verified:
                 pending_owner = {
                     "expectedOriginalResourceId": original_resource_id,
                     "expectedOriginalSha256": event["expectedOriginalSha256"],
@@ -9366,7 +11511,13 @@ def _apply_shader_candidate_shared_resource(params):
                 _validate_live_shader_event(
                     ctrl, event, stage, requested_stage, entry_point,
                     require_d3d11_state=False,
-                    owned_shared_replacement=pending_owner)
+                    owned_shared_replacement=pending_owner,
+                    verified_physical_abi_sha256=(restore_payload["physicalAbiSha256"]
+                                                 if restore_payload is not None else ""),
+                    # Same atomic replay callback: the checked replacement
+                    # already refreshed this selected anchor. Inspect its new
+                    # binding without rendering that event a second time.
+                    event_already_selected=anchor_replayed)
                 post_apply_anchor_verified = True
             return {
                 "mode": "replaced",
@@ -9376,9 +11527,13 @@ def _apply_shader_candidate_shared_resource(params):
                 "physicalAbiSha256": abi_sha256,
                 "api": api_token,
                 "postApplyAnchorVerified": post_apply_anchor_verified,
+                "postApplyMappingVerified": post_apply_mapping_verified,
+                "targetCacheHit": target_cache_hit,
             }
-        except BaseException:
-            if replacement_attempted:
+        except BaseException as mutation_error:
+            # Checked mutations fail atomically. If their call failed, the old
+            # owner is already intact and must not be replaced a second time.
+            if replacement_attempted and (replacement_committed or api_token == "d3d11"):
                 try:
                     if existing is not None:
                         _replace_shared_shader_resource(
@@ -9387,16 +11542,28 @@ def _apply_shader_candidate_shared_resource(params):
                     else:
                         _remove_shared_shader_resource(
                             ctrl, api_token, live["originalResource"])
-                except Exception:
-                    pass
+                except Exception as restore_error:
+                    if replacement_committed:
+                        # The checked rollback kept the new owner. Publish it
+                        # through the existing UI/bookkeeping recovery path,
+                        # without a success receipt. Neither immediate cleanup
+                        # nor the orphan sweep may free this still-bound target.
+                        return {
+                            "mode": "replaced", "live": live, "newTarget": new_target,
+                            "familyId": family_id, "physicalAbiSha256": abi_sha256,
+                            "api": api_token, "postApplyAnchorVerified": False,
+                            "postApplyValidationFailed": True,
+                            "recoveryWarning": "Post-apply validation failed: %s; checked replay rollback failed: %s"
+                                               % (mutation_error, restore_error),
+                        }
             if new_target is not None and _resource_id_int(new_target):
                 try:
                     ctrl.FreeTargetResource(new_target)
                 except Exception:
-                    pass
+                    _register_orphan_shader_target(new_target)
             raise
         finally:
-            if original_event > 0:
+            if original_event > 0 and anchor_replayed:
                 try:
                     _set_frame_event(ctrl, original_event, True)
                 except Exception:
@@ -9426,7 +11593,7 @@ def _apply_shader_candidate_shared_resource(params):
                     abi_validation_mode or
                     "full-replay-report-and-inline-physical"),
                 "preliminaryReflectionSkipped": bool(abi_validation_mode),
-                "freshPhysicalAbiValidationPerformed": True,
+                "freshPhysicalAbiValidationPerformed": not manual_fast and restore_payload is None,
                 # A new full report may renew the lease while reusing exactly
                 # the same target bytes (e.g. the singleton Host's first save).
                 # Inline metadata refreshes retain the already checked lease.
@@ -9436,14 +11603,27 @@ def _apply_shader_candidate_shared_resource(params):
                 "abiLeaseCandidateRawSha256": lease_candidate_sha256,
                 "abiLeaseRevision": lease_revision,
             })
+            if manual_fast:
+                existing["postApplyAnchorVerified"] = False
+                existing["targetCacheHit"] = False
+                existing["sourceSha256"] = manual_source_sha256
+                existing["targetProfile"] = params.get("expected_profile")
             _advance_shared_shader_mutation_epoch()
         _shared_shader_replacement_capture_token = capture_token
+        _attach_shader_restore_receipt(existing, params, restore_payload)
+        if restored_original_resource_id is not None:
+            existing["restoredOriginalResourceId"] = restored_original_resource_id
         _remember_shared_shader_operation(existing, operation_id, False)
+        timings["total"] = (time.monotonic() - apply_started) * 1000
+        existing["timingsMs"] = timings
         return _shared_shader_replacement_response(
             existing, idempotent=(mode == "idempotent"),
             metadata_only=(mode == "metadata"),
             operation_id=operation_id,
-            operation_created_replacement=False)
+            operation_created_replacement=False,
+            verified_restore_receipt=(existing.get("restoreValidationReceipt")
+                                      if restore_payload is not None else None),
+            verified_restore_mode=abi_validation_mode)
 
     new_target = outcome["newTarget"]
     original_resource = live["originalResource"]
@@ -9480,18 +11660,32 @@ def _apply_shader_candidate_shared_resource(params):
         "abiValidationMode": (
             abi_validation_mode or "full-replay-report-and-inline-physical"),
         "preliminaryReflectionSkipped": bool(abi_validation_mode),
-        "freshPhysicalAbiValidationPerformed": True,
+        "freshPhysicalAbiValidationPerformed": not manual_fast and (restore_payload is None or encoding_name == "glsl"),
         "postApplyAnchorVerified": bool(
             outcome.get("postApplyAnchorVerified", False)),
+        "postApplyMappingVerified": outcome.get("postApplyMappingVerified") is True,
         "abiLeaseRequestId": lease_request_id,
         "abiLeaseReportSha256": lease_report_sha256,
         "abiLeaseCandidateRawSha256": lease_candidate_sha256,
         "abiLeaseRevision": lease_revision,
         "uiSynchronized": True,
+        "targetCacheHit": bool(outcome.get("targetCacheHit", False)),
     }
+    if manual_fast:
+        record["sourceSha256"] = manual_source_sha256
+        record["targetProfile"] = params.get("expected_profile")
+    if outcome.get("postApplyValidationFailed") is True:
+        record["postApplyValidationFailed"] = True
+        record["recoveryWarning"] = outcome["recoveryWarning"]
 
+    ui_started = time.monotonic()
     try:
-        _set_shared_shader_ui_owner(original_resource, new_target)
+        if manual_fast:
+            # Native RegisterReplacement retires the previous reverse edge.
+            # Avoid an intermediate unregister/cache refresh during live edits.
+            _set_shared_shader_ui_owner(original_resource, new_target, replace_direct=True)
+        else:
+            _set_shared_shader_ui_owner(original_resource, new_target)
     except Exception as register_exc:
         # Keep replay and GUI replacement registries in lock-step. Restore the
         # exact previous replay owner first, and do not free the new target
@@ -9552,7 +11746,7 @@ def _apply_shader_candidate_shared_resource(params):
                             _replay(lambda ctrl: ctrl.FreeTargetResource(
                                 existing["targetResource"]))
                         except Exception:
-                            _shared_shader_orphan_targets.append(
+                            _register_orphan_shader_target(
                                 existing["targetResource"])
                     raise RuntimeError(
                         "%s. The new replay replacement remains active and tracked as %s; "
@@ -9562,7 +11756,7 @@ def _apply_shader_candidate_shared_resource(params):
                 # Replay is still at the verified prior owner. The new target
                 # may nevertheless be referenced by a damaged UI registry, so
                 # retain it for lifecycle cleanup instead of freeing it.
-                _shared_shader_orphan_targets.append(new_target)
+                _register_orphan_shader_target(new_target)
                 raise RuntimeError(
                     "qrenderdoc registration failed: %s. Replay was restored, but the UI "
                     "owner could not be restored (%s) and re-applying the new target failed "
@@ -9575,7 +11769,7 @@ def _apply_shader_candidate_shared_resource(params):
                 _replay(lambda ctrl: ctrl.FreeTargetResource(new_target))
             except Exception as exc:
                 free_error = exc
-                _shared_shader_orphan_targets.append(new_target)
+                _register_orphan_shader_target(new_target)
             suffix = (
                 " The unused target could not be freed and was retained: %s" %
                 str(free_error)) if free_error else ""
@@ -9606,14 +11800,19 @@ def _apply_shader_candidate_shared_resource(params):
                 _replay(lambda ctrl: ctrl.FreeTargetResource(
                     existing["targetResource"]))
             except Exception:
-                _shared_shader_orphan_targets.append(existing["targetResource"])
+                _register_orphan_shader_target(existing["targetResource"])
         raise RuntimeError(
             "%s. The new replay replacement remains active and tracked as %s; "
             "it was not freed. Retry shared-resource rollback with that ID."
             % (record["recoveryWarning"], replacement_id))
 
     _shared_shader_replacements[original_resource_id] = record
+    timings["uiRegistration"] = (time.monotonic() - ui_started) * 1000
     _shared_shader_replacement_capture_token = capture_token
+    if record.get("postApplyValidationFailed") is not True:
+        _attach_shader_restore_receipt(record, params, restore_payload)
+    if restored_original_resource_id is not None:
+        record["restoredOriginalResourceId"] = restored_original_resource_id
     _advance_shared_shader_mutation_epoch()
     _remember_shared_shader_operation(record, operation_id, True)
 
@@ -9621,11 +11820,25 @@ def _apply_shader_candidate_shared_resource(params):
     superseded_id = existing.get("replacementId") if existing else None
     if existing is not None:
         try:
-            _replay(lambda ctrl: ctrl.FreeTargetResource(
-                existing["targetResource"]))
+            if manual_fast:
+                retained = _replay(lambda ctrl: _retain_manual_shader_target(ctrl, existing))
+                if retained:
+                    superseded_freed = False
+                    record["supersededTargetCached"] = True
+                else:
+                    _replay(lambda ctrl: ctrl.FreeTargetResource(existing["targetResource"]))
+            else:
+                _replay(lambda ctrl: ctrl.FreeTargetResource(existing["targetResource"]))
         except Exception:
             superseded_freed = False
-            _shared_shader_orphan_targets.append(existing["targetResource"])
+            _register_orphan_shader_target(existing["targetResource"])
+    if record.get("postApplyValidationFailed") is True:
+        raise RuntimeError(
+            "%s. The new replay replacement remains active and tracked as %s; "
+            "it was not freed. Retry shared-resource rollback with that ID."
+            % (record["recoveryWarning"], replacement_id))
+    timings["total"] = (time.monotonic() - apply_started) * 1000
+    record["timingsMs"] = timings
     return _shared_shader_replacement_response(
         record, operation_id=operation_id,
         operation_created_replacement=True,
@@ -9713,10 +11926,11 @@ def _rollback_shader_candidate_shared_resource(params):
     except Exception as exc:
         target_freed = False
         free_warning = str(exc)
-        _shared_shader_orphan_targets.append(target_resource)
+        _register_orphan_shader_target(target_resource)
     _shared_shader_replacements.pop(record["expectedOriginalResourceId"], None)
     _advance_shared_shader_mutation_epoch()
-    if not _shared_shader_replacements and not _shared_shader_orphan_targets:
+    if (not _shared_shader_replacements and not _shared_shader_orphan_targets and
+            not _shared_shader_manual_target_cache):
         _shared_shader_replacement_capture_token = None
     result = {
         "schema": "renderdoc-ultra-shared-shader-replacement/v1",
@@ -9745,6 +11959,11 @@ def _rollback_shader_candidate_shared_resource(params):
         "alreadyRestored": False,
         "idempotentRollback": False,
     }
+    if record.get("abiValidationMode") == "manual-fast":
+        result.update({
+            "abiValidationMode": "manual-fast", "manualEdit": True,
+            "validationScope": "manual-edit-unvalidated", "replayAbiValidated": False,
+        })
     _remember_shared_shader_rollback_receipt(result, capture_token)
     return result
 
@@ -9754,12 +11973,17 @@ def _recover_shader_candidate_shared_resource_operation(params):
     operation_id = _shader_override_hex(
         params.get("operation_id", params.get("operationId")),
         "operation_id", 32)
-    capture_id = _require_capture_identity(params.get("expected_capture_id"))
+    capture_id = _shader_override_hex(params.get("expected_capture_id"), "expected_capture_id", 64)
     capture_session_id = _shader_rollback_capture_session(params)
     workspace_id = _shader_override_hex(
         params.get("workspace_id"), "workspace_id", 32)
     capture_token = _current_capture_token()
     outcome = _shared_shader_operation_outcomes.get(operation_id)
+    if outcome is not None or capture_id in _known_catalog_capture_ids:
+        _require_capture_identity(capture_id)
+    elif (not _request_capture_loaded() or capture_token is None or
+          params.get("expected_capture_session_id") != capture_session_id):
+        raise RuntimeError("Unknown Shader restore operation needs the exact active capture session")
     base = {
         "schema": "renderdoc-ultra-shared-shader-operation-recovery/v1",
         "schemaVersion": 1,
@@ -9851,13 +12075,52 @@ def _get_shared_shader_replacements(params):
     A newly connected MCP process can therefore restore the current Shader
     without trusting stale host memory or guessing a replacement token.
     """
-    capture_id = _require_capture_identity(params.get("expected_capture_id"))
-    expected_session = _shader_override_hex(
-        params.get("expected_capture_session_id"),
-        "expected_capture_session_id", 32)
+    include_validation = params.get("include_validation_receipts", False)
+    if not isinstance(include_validation, bool):
+        raise ValueError("include_validation_receipts must be a boolean")
+    lease_only = params.get("lease_metadata_only", False)
+    if not isinstance(lease_only, bool):
+        raise ValueError("lease_metadata_only must be a boolean")
+    query_workspace = (_shader_override_hex(params["workspace_id"], "workspace_id", 32)
+                       if "workspace_id" in params else None)
+    query_replacement = (_shader_override_hex(params["replacement_id"], "replacement_id", 32)
+                         if "replacement_id" in params else None)
+    if lease_only and (not query_workspace or not query_replacement or include_validation):
+        raise ValueError("Lease metadata requires one exact workspace/replacement and no full receipts")
+    include_all_catalogs = params.get("include_all_capture_catalogs", False)
+    if not isinstance(include_all_catalogs, bool):
+        raise ValueError("include_all_capture_catalogs must be a boolean")
+    current_snapshot = not any(key in params for key in (
+        "expected_capture_id", "expected_capture_session_id"))
+    if current_snapshot:
+        # A read-only inventory can describe this exact live instance without
+        # first creating a catalog. It grants no identity or apply authority.
+        capture_id = ""
+        expected_session = str(_capture_session_id or "")
+        include_all_catalogs = True
+    else:
+        capture_id = _shader_override_hex(
+            params.get("expected_capture_id"), "expected_capture_id", 64)
+        expected_session = _shader_override_hex(
+            params.get("expected_capture_session_id"),
+            "expected_capture_session_id", 32)
     if not _capture_session_id or expected_session != _capture_session_id:
         raise RuntimeError("Capture session changed before replacement query")
     capture_token = _current_capture_token()
+    if not _request_capture_loaded() or capture_token is None:
+        raise RuntimeError("No capture loaded")
+    catalog_ready = bool(_known_catalog_capture_ids.get(capture_id))
+    if include_all_catalogs and not catalog_ready and not current_snapshot:
+        raise RuntimeError("All-catalog replacement inventory requires a current catalog identity")
+    if catalog_ready:
+        _require_capture_identity(capture_id)
+    elif any(record.get("captureId") == capture_id
+             for record in _shared_shader_replacements.values()):
+        raise RuntimeError("Shared Shader replacement lost its catalog identity")
+    # An editor may reconnect before project restore has registered its catalog.
+    # This read-only absence result grants neither catalog nor apply authority.
+    # All mutations still require _require_capture_identity, and an existing
+    # mapping can never be concealed by an unregistered catalog.
     if (_shared_shader_replacement_capture_token is not None and
             _shared_shader_replacement_capture_token != capture_token):
         _forget_shared_shader_replacements()
@@ -9865,7 +12128,9 @@ def _get_shared_shader_replacements(params):
     records = []
     for record in _shared_shader_replacements.values():
         if any((
-                record.get("captureId") != capture_id,
+                query_workspace is not None and record.get("workspaceId") != query_workspace,
+                query_replacement is not None and record.get("replacementId") != query_replacement,
+                not include_all_catalogs and record.get("captureId") != capture_id,
                 record.get("captureSessionId") != expected_session,
                 record.get("captureToken") != capture_token)):
             continue
@@ -9889,7 +12154,48 @@ def _get_shared_shader_replacements(params):
             "eventScoped": False,
             "allOriginalResourceUsesAffected": True,
             "originalShaderPreserved": True,
+            "postApplyValidationFailed": record.get("postApplyValidationFailed") is True,
         })
+        if include_all_catalogs:
+            # Resource ownership spans catalog projections of this one live
+            # capture. Preserve the owner's catalog for an exact rollback;
+            # never relabel its receipt as belonging to the querying catalog.
+            _require_capture_identity(record["captureId"])
+            records[-1]["captureId"] = record["captureId"]
+            records[-1]["captureSessionId"] = record["captureSessionId"]
+        if record.get("abiValidationMode") == "manual-fast":
+            records[-1].update({
+                "abiValidationMode": "manual-fast", "manualEdit": True,
+                "validationScope": "manual-edit-unvalidated",
+                "replayAbiValidated": False, "freshPhysicalValidationPerformed": False,
+                "sourceSha256": record.get("sourceSha256", ""),
+                "targetProfile": record.get("targetProfile"),
+            })
+        if include_validation or lease_only:
+            # Optional readback of the already performed transaction, never a
+            # new ABI check or replacement. Keep physical revisions and signed
+            # envelopes intact for final publication by a newly connected Host.
+            records[-1].update({
+                "schema": "renderdoc-ultra-shared-shader-replacement/v1",
+                "schemaVersion": 1,
+                "captureId": record["captureId"],
+                "captureSessionId": record["captureSessionId"],
+            })
+            for key in (
+                    "abiRequestId", "abiReportSha256", "restoreValidationReceipt",
+                    "restoredOriginalResourceId",
+                    "restoreValidationReceiptError", "abiValidationMode",
+                    "postApplyMappingVerified",
+                    "postApplyValidationFailed", "recoveryWarning",
+                    "preliminaryReflectionSkipped", "freshPhysicalAbiValidationPerformed",
+                    "abiLeaseRequestId", "abiLeaseReportSha256",
+                    "abiLeaseCandidateRawSha256", "abiLeaseRevision"):
+                if lease_only and key not in (
+                        "postApplyValidationFailed", "abiLeaseRequestId", "abiLeaseReportSha256",
+                        "abiLeaseCandidateRawSha256", "abiLeaseRevision"):
+                    continue
+                if key in record:
+                    records[-1][key] = json.loads(json.dumps(record[key]))
     records.sort(key=lambda item: (
         item["originalResourceId"], item["stage"], item["replacementId"]))
     return {
@@ -9897,11 +12203,15 @@ def _get_shared_shader_replacements(params):
         "schemaVersion": 1,
         "captureId": capture_id,
         "captureSessionId": expected_session,
+        "catalogReady": catalog_ready,
         "replacements": records,
         "count": len(records),
         "mutationEpoch": _shared_shader_mutation_epoch,
         "originalShadersPreserved": True,
         "replayMutation": False,
+        "leaseMetadataOnly": lease_only,
+        "queryWorkspaceId": query_workspace,
+        "queryReplacementId": query_replacement,
     }
 
 
@@ -9979,12 +12289,19 @@ def _restore_shader_candidate_shared_resource_exact(params):
                 (api_name == "d3d12" and encoding_name in ("dxbc", "dxil")) or
                 (api_name == "vulkan" and encoding_name == "spirv") or
                 (api_name == "opengl" and
-                 encoding_name == "opengl-spirv")):
+                 encoding_name in ("opengl-spirv", "glsl"))):
             raise ValueError("expected_api/expected_encoding is unsupported")
         candidate_sha256 = _shader_override_hex(
             candidate_text, "expected_candidate_sha256", 64)
-        physical_abi_sha256 = _shader_override_hex(
-            physical_abi_text, "expected_physical_abi_sha256", 64)
+        current_owner = _shared_shader_replacements.get(original_resource_id)
+        if (not physical_abi_text and current_owner is not None and
+                current_owner.get("replacementId") == replacement_id and
+                current_owner.get("abiValidationMode") == "manual-fast" and
+                not current_owner.get("physicalAbiSha256")):
+            physical_abi_sha256 = ""
+        else:
+            physical_abi_sha256 = _shader_override_hex(
+                physical_abi_text, "expected_physical_abi_sha256", 64)
         family_id = _shader_override_hex(
             family_text, "expected_shader_family_id", 64)
         if target_resource_id <= 0:
@@ -10080,19 +12397,22 @@ def _restore_shader_candidate_shared_resource_exact(params):
         if live_api not in ("d3d11", "d3d12", "vulkan", "opengl"):
             raise RuntimeError(
                 "Exact shared Shader restore supports D3D11/D3D12/Vulkan/OpenGL only")
-        live = _validate_live_shader_event(
-            ctrl,
-            {
-                "eventId": expected_event_id,
-                "expectedOriginalResourceId": original_resource_id,
-                "expectedOriginalSha256": original_sha256,
-            },
-            stage_object,
-            stage_name,
-            entry_point,
-            require_d3d11_state=(live_api == "d3d11"),
-            owned_shared_replacement=owned_record,
-        )
+        restore_event = {
+            "eventId": expected_event_id,
+            "expectedOriginalResourceId": original_resource_id,
+            "expectedOriginalSha256": original_sha256,
+        }
+        if owned_record is not None and owned_record.get("abiValidationMode") == "manual-fast":
+            if _resource_id_int(ctrl.GetPipelineState().GetShader(stage_object)) != original_resource_id:
+                raise RuntimeError("The current event bound a different Shader before manual restore")
+            live = _manual_shared_shader_original(
+                ctrl, owned_record["originalResource"], restore_event,
+                stage_name, entry_point, owned_record)
+        else:
+            live = _validate_live_shader_event(
+                ctrl, restore_event, stage_object, stage_name, entry_point,
+                require_d3d11_state=(live_api == "d3d11"),
+                owned_shared_replacement=owned_record)
         live_encoding = _shader_encoding_token(
             getattr(live.get("reflection"), "encoding", ""))
         if not (
@@ -10100,7 +12420,7 @@ def _restore_shader_candidate_shared_resource_exact(params):
                 (live_api == "d3d12" and live_encoding in ("dxbc", "dxil")) or
                 (live_api == "vulkan" and live_encoding == "spirv") or
                 (live_api == "opengl" and
-                 live_encoding == "opengl-spirv")):
+                 live_encoding in ("opengl-spirv", "glsl"))):
             raise RuntimeError(
                 "The exact live Shader API/encoding identity is unsupported")
         return {
@@ -11289,7 +13609,7 @@ def _clear_all_event_cbuffer_snapshots(params):
 
     def _do(ctrl):
         props = ctrl.GetAPIProperties()
-        api_name = str(getattr(props, "pipelineType", "") or "")
+        api_name = _native_enum_text(getattr(props, "pipelineType", None))
         api_token = api_name.lower().replace("graphicsapi.", "").replace(
             "direct3d", "d3d")
         if api_token not in ("d3d11", "d3d12"):
@@ -11392,6 +13712,26 @@ def _export_shader_catalog(params, replay_controller=None,
         params.get("expected_capture_id", "") or "").strip()
     expected_identity_sha256 = str(
         params.get("expected_identity_evidence_sha256", "") or "").strip()
+    # The capture-independent pair. When it is supplied it is what the export is
+    # judged against, because a stored workspace can reproduce it next session and
+    # cannot reproduce a ResourceId.
+    expected_stable_capture_id = str(
+        params.get("expected_stable_capture_id", "") or "").strip().lower()
+    expected_stable_identity_sha256 = str(
+        params.get("expected_stable_identity_evidence_sha256", "") or "").strip().lower()
+    activate_catalog_if_valid = params.get("activate_catalog_if_valid", False)
+    if type(activate_catalog_if_valid) is not bool:
+        raise ValueError("activate_catalog_if_valid must be a boolean")
+    if bool(expected_stable_capture_id) != bool(expected_stable_identity_sha256):
+        raise ValueError(
+            "expected_stable_capture_id and "
+            "expected_stable_identity_evidence_sha256 must be supplied together")
+    for value, label in ((expected_stable_capture_id, "expected_stable_capture_id"),
+                         (expected_stable_identity_sha256,
+                          "expected_stable_identity_evidence_sha256")):
+        if value and (len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value)):
+            raise ValueError("%s must be a lowercase SHA-256" % label)
     if bool(expected_capture_id) != bool(expected_identity_sha256):
         raise ValueError(
             "expected_capture_id and expected_identity_evidence_sha256 must "
@@ -11406,6 +13746,10 @@ def _export_shader_catalog(params, replay_controller=None,
                     for character in expected_identity_sha256)):
             raise ValueError(
                 "expected_identity_evidence_sha256 must be a lowercase SHA-256")
+    if activate_catalog_if_valid and not (
+            expected_capture_id or expected_stable_capture_id):
+        raise ValueError(
+            "activate_catalog_if_valid requires an expected catalog identity")
 
     output_dir = str(params.get("output_dir", "") or "").strip()
     if not output_dir:
@@ -11429,6 +13773,12 @@ def _export_shader_catalog(params, replay_controller=None,
     original_event = _safe_int(capture_snapshot.get("originalEvent"), 0)
     restore_original_event = bool(capture_snapshot.get("restoreOriginalEvent"))
     capture_path = str(capture_snapshot.get("capturePath", "") or "")
+    if capture_path:
+        # Qt/CLI can spell the same Windows RDC with '/' or '\\'. Catalog
+        # identity includes this text, so canonicalize at the export boundary
+        # while retaining the historical native path spelling and case. Do
+        # not change the capture-ID algorithm or rewrite existing catalogs.
+        capture_path = os.path.abspath(os.path.normpath(capture_path))
 
     def _do(ctrl):
         action_info = {}
@@ -11583,6 +13933,24 @@ def _export_shader_catalog(params, replay_controller=None,
                                     "scope": "reflection",
                                     "message": "No shader reflection"})
                                 continue
+                            owner = _shared_shader_replacements.get(shader_resource_id)
+                            if owner is not None:
+                                # Catalogs identify captured resources. D3D12 resolves
+                                # GetShader through active replacements, so use only
+                                # the current owner's proven original reflection.
+                                if (owner.get("captureSessionId") != capture_snapshot["captureSessionId"] or
+                                        owner.get("captureSessionId") != _capture_session_id or
+                                        owner.get("captureToken") != capture_snapshot["captureToken"] or
+                                        _shared_shader_replacement_capture_token != capture_snapshot["captureToken"] or
+                                        owner.get("api") != _shader_api_token(ctrl) or
+                                        _resource_id_int(owner.get("originalResource")) != shader_resource_id):
+                                    raise RuntimeError("Shader catalog replacement owner belongs to another capture")
+                                reflection = _captured_original_from_shared_owner(
+                                    reflection, {"eventId": event_id,
+                                        "expectedOriginalResourceId": shader_resource_id,
+                                        "expectedOriginalSha256": owner.get("expectedOriginalSha256")},
+                                    stage_name, selected_entry_name, owner,
+                                    allow_original_active=owner.get("api") in ("d3d11", "vulkan", "opengl"))
                             identity_failure = _shader_reflection_identity_failure(
                                 reflection, selected_entry, shader_id,
                                 pipeline_id, stage_name, selection)
@@ -11622,23 +13990,36 @@ def _export_shader_catalog(params, replay_controller=None,
                                     "boundBlocks": [],
                                 }
                                 try:
-                                    dxil_request["sourceBytes"] = _dxil_disassembly_source(
-                                        ctrl, pipeline_id, reflection)
-                                    source_size = len(dxil_request["sourceBytes"])
-                                    if (source_size > _dxil_access_protocol.MAX_IR_BYTES or
-                                            dxil_snapshot_bytes + source_size >
-                                            MAX_SHADER_CATALOG_DXIL_SNAPSHOT_BYTES):
-                                        raise RuntimeError("DXIL catalog evidence snapshot exceeds its byte budget")
-                                    dxil_snapshot_bytes += source_size
-                                    dxil_request["sourceSha256"] = hashlib.sha256(
-                                        dxil_request["sourceBytes"]).hexdigest()
+                                    if owner is not None:
+                                        # D3D12 DisassembleShader also follows the
+                                        # replacement map, even with original reflection.
+                                        retained = owner.get("capturedDxilLayoutEvidence")
+                                        if not isinstance(retained, dict):
+                                            raise RuntimeError(
+                                                "Captured-original DXIL layout evidence is unavailable while its Shader is replaced")
+                                        dxil_request["retainedLayoutEvidence"] = {
+                                            key: dict(marker) for key, marker in retained.items()}
+                                    else:
+                                        dxil_request["sourceBytes"] = _dxil_disassembly_source(
+                                            ctrl, pipeline_id, reflection)
+                                        source_size = len(dxil_request["sourceBytes"])
+                                        if (source_size > _dxil_access_protocol.MAX_IR_BYTES or
+                                                dxil_snapshot_bytes + source_size >
+                                                MAX_SHADER_CATALOG_DXIL_SNAPSHOT_BYTES):
+                                            raise RuntimeError("DXIL catalog evidence snapshot exceeds its byte budget")
+                                        dxil_snapshot_bytes += source_size
+                                        dxil_request["sourceSha256"] = hashlib.sha256(
+                                            dxil_request["sourceBytes"]).hexdigest()
                                 except RuntimeError as exc:
                                     dxil_request["sourceBytes"] = None
                                     dxil_request["sourceError"] = str(exc)
 
                             reflected_blocks = []
+                            dxbc_declarations = _dxbc_cbuffer_layout.declarations(raw_bytes)
                             for block_index, cb in enumerate(constant_blocks):
-                                reflected_blocks.append(_constant_block_dict(cb, block_index))
+                                reflected_blocks.append(_constant_block_dict(cb, block_index,
+                                    dxbc_declaration=dxbc_declarations.get(
+                                        _constant_block_binding_key(cb, block_index))))
                             if dxil_request is not None:
                                 dxil_request["blocks"] = reflected_blocks
                                 dxil_requests.append(dxil_request)
@@ -11664,12 +14045,12 @@ def _export_shader_catalog(params, replay_controller=None,
                                         reflection, "outputSignature", [])
                                 ],
                                 "readOnlyResources": [
-                                    _shader_binding_dict(value)
+                                    _shader_binding_dict(value, dxbc_declarations.get(('srv',) + _constant_block_binding_key(value, -1)))
                                     for value in getattr(
                                         reflection, "readOnlyResources", [])
                                 ],
                                 "readWriteResources": [
-                                    _shader_binding_dict(value)
+                                    _shader_binding_dict(value, dxbc_declarations.get(('uav',) + _constant_block_binding_key(value, -1)))
                                     for value in getattr(
                                         reflection, "readWriteResources", [])
                                 ],
@@ -11679,8 +14060,8 @@ def _export_shader_catalog(params, replay_controller=None,
                                 ],
                                 "dynamicLinkageInterfaceCount": len(
                                     getattr(reflection, "interfaces", []) or []),
-                                "outputTopology": str(
-                                    getattr(reflection, "outputTopology", "") or ""),
+                                "outputTopology": _native_enum_text(
+                                    getattr(reflection, "outputTopology", None)),
                                 "threadGroupSize": _thread_group_size(reflection),
                             }
                             shader_details_cache[details_key] = shader_details
@@ -11754,7 +14135,7 @@ def _export_shader_catalog(params, replay_controller=None,
 
                         use_record = {
                             "eventId": event_id,
-                            "actionName": action.get("name", ""),
+                            "actionName": _stable_action_name(action.get("name", "")),
                             "actionFlags": action.get("flags", 0),
                             "stage": stage_name,
                             "entry": entry_point,
@@ -11808,6 +14189,9 @@ def _export_shader_catalog(params, replay_controller=None,
         "outputDir": output_dir, "blobDirectory": blob_dir,
         "expectedCaptureId": expected_capture_id,
         "expectedIdentitySha256": expected_identity_sha256,
+        "expectedStableCaptureId": expected_stable_capture_id,
+        "expectedStableIdentitySha256": expected_stable_identity_sha256,
+        "activateCatalogIfValid": activate_catalog_if_valid,
     }
     if defer_finalization:
         return collected
@@ -11838,6 +14222,9 @@ def _finalize_shader_catalog_export(collected, cancel_event=None, defer_publicat
     output_dir, blob_dir = collected["outputDir"], collected["blobDirectory"]
     expected_capture_id = collected["expectedCaptureId"]
     expected_identity_sha256 = collected["expectedIdentitySha256"]
+    expected_stable_capture_id = collected.get("expectedStableCaptureId", "")
+    expected_stable_identity_sha256 = collected.get("expectedStableIdentitySha256", "")
+    activate_catalog_if_valid = bool(collected.get("activateCatalogIfValid", False))
     _check_shader_catalog_finalize_cancel(cancel_event, capture_snapshot)
     for raw_sha256, raw_bytes in blobs.items():
         if not isinstance(raw_bytes, bytes) or hashlib.sha256(raw_bytes).hexdigest() != raw_sha256:
@@ -11847,14 +14234,18 @@ def _finalize_shader_catalog_export(collected, cancel_event=None, defer_publicat
         blocks = request["blocks"]
         if request["rawSha256"] and request["rawSha256"] not in blobs:
             raise RuntimeError("Shader catalog DXIL evidence lost its captured bytecode")
-        if not request["sourceError"] and (
+        retained_evidence = request.get("retainedLayoutEvidence")
+        if retained_evidence is None and not request["sourceError"] and (
                 not isinstance(request["sourceBytes"], bytes) or
                 hashlib.sha256(request["sourceBytes"]).hexdigest() != request["sourceSha256"]):
             raise RuntimeError("Shader catalog captured disassembly identity changed")
         try:
-            if request["sourceError"]:
+            if retained_evidence is not None:
+                evidence = retained_evidence
+            elif request["sourceError"]:
                 raise RuntimeError(request["sourceError"])
-            unused_access, evidence = _dxil_evidence_from_snapshot(request["sourceBytes"], blocks)
+            else:
+                unused_access, evidence = _dxil_evidence_from_snapshot(request["sourceBytes"], blocks)
         except RuntimeError as exc:
             evidence = _dxil_layout_evidence_from_snapshot(blocks, "unavailable")
             catalog["errors"].append({
@@ -11880,18 +14271,42 @@ def _finalize_shader_catalog_export(collected, cancel_event=None, defer_publicat
     catalog["counts"]["errors"] = len(catalog["errors"])
     _check_shader_catalog_finalize_cancel(cancel_event, capture_snapshot)
     catalog["captureId"] = _catalog_capture_id(catalog)
+    catalog["stableCaptureId"] = _catalog_stable_capture_id(catalog)
     identity_evidence_sha256 = _catalog_identity_evidence_sha256(catalog)
-    if expected_capture_id:
-        # A restart rebind is an atomic compare-before-publish transaction.
-        # Never let a failed expected export enter _known_catalog_capture_ids
-        # or replace _symbol_capture_snapshot: another Host request may use
-        # those process-local facts as its capture-identity fast path.
+    stable_identity_evidence_sha256 = _catalog_stable_identity_evidence_sha256(catalog)
+    # A restart rebind is an atomic compare-before-publish transaction. Never let a
+    # failed expected export enter _known_catalog_capture_ids or replace
+    # _symbol_capture_snapshot: another Host request may use those process-local
+    # facts as its capture-identity fast path.
+    if expected_stable_capture_id:
+        # The capture-independent gate. ResourceIds are reassigned on every open, so
+        # comparing them here would refuse a workspace whose Shader has not changed
+        # by one byte. The volatile captureId is still reported, never enforced.
+        if catalog["stableCaptureId"] != expected_stable_capture_id:
+            raise RuntimeError(
+                "Live Shader catalog did not match expected_stable_capture_id (%s)"
+                % _catalog_capture_id_description(catalog, expected_stable_capture_id))
+        if stable_identity_evidence_sha256 != expected_stable_identity_sha256:
+            raise RuntimeError(
+                "Live Shader catalog selection/Shader/use evidence changed "
+                "(selection=%s, uses=%d, shaders=%d)"
+                % (json.dumps(catalog.get("selection", {}), ensure_ascii=False,
+                              sort_keys=True)[:200],
+                   len(catalog.get("uses", []) or []),
+                   len(catalog.get("shaders", []) or [])))
+    elif expected_capture_id:
         if catalog["captureId"] != expected_capture_id:
             raise RuntimeError(
-                "Live Shader catalog did not match expected_capture_id")
+                "Live Shader catalog did not match expected_capture_id (%s)"
+                % _catalog_capture_id_description(catalog, expected_capture_id))
         if identity_evidence_sha256 != expected_identity_sha256:
             raise RuntimeError(
-                "Live Shader catalog selection/Shader/use evidence changed")
+                "Live Shader catalog selection/Shader/use evidence changed "
+                "(selection=%s, uses=%d, shaders=%d)"
+                % (json.dumps(catalog.get("selection", {}), ensure_ascii=False,
+                              sort_keys=True)[:200],
+                   len(catalog.get("uses", []) or []),
+                   len(catalog.get("shaders", []) or [])))
 
     native_blob_dir = _native_filesystem_path(blob_dir)
     if not os.path.exists(native_blob_dir):
@@ -11928,14 +14343,27 @@ def _finalize_shader_catalog_export(collected, cancel_event=None, defer_publicat
         "counts": catalog["counts"],
     }
     result["identityEvidenceSha256"] = identity_evidence_sha256
-    if expected_capture_id:
+    result["stableCaptureId"] = catalog["stableCaptureId"]
+    result["stableIdentityEvidenceSha256"] = stable_identity_evidence_sha256
+    if expected_capture_id or expected_stable_capture_id:
         result["expectedIdentityValidatedBeforeCache"] = True
+    if activate_catalog_if_valid:
+        result["activeCatalogPublished"] = True
     # Hashing, validation, and Shader/use indexing can be proportional to the
     # entire frame, so prepare the publication on the CPU/request worker.
     # Only its short checked state/name commit may touch CaptureContext on Qt.
     publication = _prepare_catalog_cache_publication(
         catalog, identity_evidence_sha256,
-        identity_only=bool(expected_capture_id))
+        identity_only=bool(
+            (expected_capture_id or expected_stable_capture_id)
+            and not activate_catalog_if_valid
+        ),
+        # An explicit expected-identity activation is the one safe place to
+        # switch bounded symbol catalogs automatically.  The expected catalog
+        # was validated above; the UI commit will first recover any old strict
+        # alias transaction while its original catalog is still active.
+        recover_aliases_before_switch=activate_catalog_if_valid,
+    )
     if defer_publication:
         result["_deferredPublication"] = publication
     else:
@@ -12301,19 +14729,22 @@ def _commit_symbol_aliases_on_ui(plan):
     snapshot_capture_id = plan["snapshotCaptureId"]
     skipped = plan["skipped"]
     conflicts = plan["conflicts"]
-    transaction_resource_ids = set(_symbol_resource_renames)
-    transaction_resource_ids.update(plan["renameCandidates"])
-    if len(transaction_resource_ids) > MAX_SYMBOL_ALIAS_UI_RENAME_RESOURCES:
-        raise RuntimeError(
-            "Symbol alias UI rename transaction exceeds the %d-resource limit"
-            % MAX_SYMBOL_ALIAS_UI_RENAME_RESOURCES)
     resources = _context_resource_ids()
     rename_plan = []
+    kept_user = []
     for resource_id in sorted(plan["renameCandidates"].keys()):
         names = sorted(plan["renameCandidates"][resource_id])
+        kinds = sorted(plan.get("renameCandidateKinds", {}).get(resource_id, ()))
         if len(names) != 1:
             conflicts.append({
                 "target": ["shader-resource", resource_id], "displayNames": names})
+            continue
+        if len(kinds) != 1:
+            conflicts.append({
+                "target": ["capture-resource", resource_id],
+                "bindingKinds": kinds,
+                "displayNames": names,
+            })
             continue
         rid = resources.get(resource_id)
         if rid is None:
@@ -12323,17 +14754,134 @@ def _commit_symbol_aliases_on_ui(plan):
                 "reason": "resource ID is not present in the current capture",
             })
             continue
-        rename_plan.append((resource_id, rid, names[0]))
+        kind = kinds[0]
+        if kind in ("shader", "textureresource"):
+            try:
+                current_custom = bool(_ctx.HasResourceCustomName(rid))
+                current_name = str(
+                    _ctx.GetResourceNameUnsuffixed(rid) or "")
+                managed = _symbol_resource_renames.get(resource_id)
+                managed = managed if isinstance(managed, dict) else {}
+                managed_name = str(managed.get("managedName", "") or "")
+                legacy_shader_ownership = bool(
+                    kind == "shader" and managed and not managed_name)
+                bread_still_owns = bool(
+                    legacy_shader_ownership or (
+                        managed.get("bindingKind") == kind
+                        and managed_name
+                        and current_custom
+                        and current_name == managed_name))
+                user_took_over = bool(
+                    managed_name and not bread_still_owns)
+                if ((current_custom and not bread_still_owns) or
+                        user_took_over):
+                    kept_user.append({
+                        "resourceId": resource_id,
+                        "displayName": current_name,
+                        "hadCustomName": current_custom,
+                        "requestedDisplayName": names[0],
+                        "bindingKind": kind,
+                    })
+                    continue
+            except Exception as exc:
+                skipped.append({
+                    "resourceId": resource_id,
+                    "displayName": names[0],
+                    "reason": "could not inspect existing custom name: %s" % str(exc),
+                })
+                continue
+        rename_plan.append((resource_id, rid, names[0], kind))
+
+    transaction_resource_ids = set(_symbol_resource_renames)
+    transaction_resource_ids.update(item[0] for item in rename_plan)
+    if len(transaction_resource_ids) > MAX_SYMBOL_ALIAS_UI_RENAME_RESOURCES:
+        raise RuntimeError(
+            "Symbol alias UI rename transaction exceeds the %d-resource limit"
+            % MAX_SYMBOL_ALIAS_UI_RENAME_RESOURCES)
+
+    kept_targets = set(
+        (item["bindingKind"], item["resourceId"]) for item in kept_user)
+    if kept_targets:
+        effective_overlay = dict(plan["newOverlay"])
+        effective_overlay["aliases"] = [
+            alias for alias in plan["newOverlay"].get("aliases", [])
+            if (_alias_kind(alias), _alias_target_resource_id(alias))
+            not in kept_targets
+        ]
+        plan["newOverlay"] = effective_overlay
+
+    logical_mutation = (
+        plan["newOverlay"].get("aliases", []) !=
+        _symbol_alias_overlay.get("aliases", []))
+    if strict_atomic and (skipped or conflicts):
+        details = []
+        for item in list(skipped)[:3]:
+            reason = str(item.get("reason", "") or "").strip()
+            if reason and reason not in details:
+                details.append(reason)
+        suffix = ("; first reasons: " + " | ".join(details)) if details else ""
+        raise ValueError(
+            "Strict atomic alias load rejected %d skipped aliases and %d conflicts%s"
+            % (len(skipped), len(conflicts), suffix))
+    if strict_atomic and not transaction_resource_ids and not logical_mutation:
+        # The only requested physical names were user-owned and the active
+        # logical overlay is unchanged.  Report the preserved names without
+        # manufacturing an empty recovery transaction.
+        return {
+            "schema": SYMBOL_ALIAS_SCHEMA,
+            "schemaVersion": plan["version"],
+            "captureId": snapshot_capture_id,
+            "captureSessionId": str(_capture_session_id or ""),
+            "path": plan["path"],
+            "confirmedOnly": plan["confirmedOnly"],
+            "strictAtomic": True,
+            "atomicity": "no-mutation",
+            "physicalAtomic": False,
+            "recoveryRequired": False,
+            "rollbackAvailable": False,
+            "recoveryLedgerPublished": False,
+            "transactionId": "",
+            "operationId": plan["operationId"],
+            "idempotent": False,
+            "committed": True,
+            "mutationPresent": False,
+            "counts": {
+                "manifestAliases": len(plan["allAliases"]),
+                "deterministicAliases": len(plan["candidates"]),
+                "liveBoundAliases": len(plan["liveCandidates"]),
+                "activeValidatedAliases": len(plan["activeAliases"]),
+                "renamedShaders": 0,
+                "renamedTextures": 0,
+                "renamedResources": 0,
+                "keptUser": len(kept_user),
+                "skipped": len(skipped),
+                "conflicts": len(conflicts),
+            },
+            "applied": [],
+            "written": [],
+            "replacedManaged": [],
+            "keptUser": kept_user,
+            "skipped": skipped,
+            "conflicts": conflicts,
+        }
 
     applied = []
+    written = []
+    replaced_managed = []
     if strict_atomic:
         # Strict means complete-or-recovery-required, not physical atomicity:
         # validate everything first, publish a capture-bound recovery ledger,
         # then perform and verify the ordered qrenderdoc name updates.
         if skipped or conflicts:
+            details = []
+            for item in list(skipped)[:3]:
+                reason = str(item.get("reason", "") or "").strip()
+                if reason and reason not in details:
+                    details.append(reason)
+            suffix = ("; first reasons: " + " | ".join(details)) if details else ""
             raise ValueError(
-                "Strict atomic alias load rejected %d skipped aliases and %d conflicts"
-                % (len(skipped), len(conflicts)))
+                "Strict atomic alias load rejected %d skipped aliases and %d conflicts%s"
+                % (len(skipped), len(conflicts), suffix))
 
         previous_renames = _symbol_resource_renames
         binding = _symbol_alias_binding(snapshot_capture_id)
@@ -12393,6 +14941,10 @@ def _commit_symbol_aliases_on_ui(plan):
                 previous_renames),
             "originalRenameCaptureToken": _symbol_rename_capture_token,
             "resources": previous_names,
+            "managedNames": {
+                resource_id: dict(desired)
+                for resource_id, desired in desired_names.items()
+            },
         }
         # This assignment is the transaction's write-ahead publication point.
         # Nothing below may call SetResourceCustomName without this exact ledger.
@@ -12431,17 +14983,28 @@ def _commit_symbol_aliases_on_ui(plan):
                 % str(exc))
 
         new_renames = {}
-        for resource_id, unused_rid, display_name in rename_plan:
+        for resource_id, unused_rid, display_name, binding_kind in rename_plan:
             baseline = previous_renames.get(
                 resource_id, previous_names[resource_id])
             new_renames[resource_id] = {
                 "hadCustomName": bool(baseline.get("hadCustomName")),
                 "name": str(baseline.get("name", "") or ""),
+                "managedName": display_name,
+                "bindingKind": binding_kind,
             }
-            applied.append({
+            receipt = {
                 "resourceId": resource_id,
                 "displayName": display_name,
-            })
+            }
+            typed_receipt = {
+                **receipt,
+                "bindingKind": binding_kind,
+            }
+            applied.append(receipt)
+            if resource_id in previous_renames:
+                replaced_managed.append(typed_receipt)
+            else:
+                written.append(typed_receipt)
 
         # Every fallible replay/UI operation completed. Publish the complete
         # capture-bound state only now.
@@ -12452,9 +15015,10 @@ def _commit_symbol_aliases_on_ui(plan):
         recovery_ledger["state"] = "committed"
     else:
         # Historical callers retain their best-effort behaviour.
+        previous_renames = dict(_symbol_resource_renames)
         _reset_symbol_overlay(restore_names=True)
         _symbol_alias_overlay = plan["newOverlay"]
-        for resource_id, rid, display_name in rename_plan:
+        for resource_id, rid, display_name, binding_kind in rename_plan:
             try:
                 had_custom_name = bool(_ctx.HasResourceCustomName(rid))
                 original_name = str(
@@ -12462,12 +15026,23 @@ def _commit_symbol_aliases_on_ui(plan):
                 _symbol_resource_renames[resource_id] = {
                     "hadCustomName": had_custom_name,
                     "name": original_name,
+                    "managedName": display_name,
+                    "bindingKind": binding_kind,
                 }
                 _ctx.SetResourceCustomName(rid, display_name)
-                applied.append({
+                receipt = {
                     "resourceId": resource_id,
                     "displayName": display_name,
-                })
+                }
+                typed_receipt = {
+                    **receipt,
+                    "bindingKind": binding_kind,
+                }
+                applied.append(receipt)
+                if resource_id in previous_renames:
+                    replaced_managed.append(typed_receipt)
+                else:
+                    written.append(typed_receipt)
             except Exception as exc:
                 skipped.append({
                     "resourceId": resource_id,
@@ -12500,16 +15075,27 @@ def _commit_symbol_aliases_on_ui(plan):
         "operationId": plan["operationId"],
         "idempotent": False,
         "committed": True,
+        "mutationPresent": bool(transaction_resource_ids or logical_mutation),
         "counts": {
             "manifestAliases": len(plan["allAliases"]),
             "deterministicAliases": len(plan["candidates"]),
             "liveBoundAliases": len(plan["liveCandidates"]),
             "activeValidatedAliases": len(plan["activeAliases"]),
-            "renamedShaders": len(applied),
+            "renamedShaders": sum(
+                item.get("bindingKind") == "shader"
+                for item in written + replaced_managed),
+            "renamedTextures": sum(
+                item.get("bindingKind") == "textureresource"
+                for item in written + replaced_managed),
+            "renamedResources": len(applied),
+            "keptUser": len(kept_user),
             "skipped": len(skipped),
             "conflicts": len(conflicts),
         },
         "applied": applied,
+        "written": written,
+        "replacedManaged": replaced_managed,
+        "keptUser": kept_user,
         "skipped": skipped,
         "conflicts": conflicts,
     }
@@ -12639,7 +15225,8 @@ def _load_symbol_aliases(params):
     candidates = []
     expected_keys = set()
     snapshot_keys = request_capture_snapshot.get("shaderKeys", set())
-    allowed_kinds = ("shader", "constantbuffer", "constantfield")
+    allowed_kinds = (
+        "shader", "constantbuffer", "constantfield", "textureresource")
     for index, alias in enumerate(all_aliases):
         if not _alias_validated(alias):
             skipped.append({
@@ -12668,6 +15255,25 @@ def _load_symbol_aliases(params):
         if kind not in allowed_kinds:
             skipped.append({"index": index, "reason": "unsupported alias binding kind"})
             continue
+        if kind == "textureresource":
+            target_resource_id = _alias_target_resource_id(alias)
+            bind_number = _safe_int(_alias_first(
+                alias, ("bindNumber", "bind", "fixedBindNumber"), -1), -1)
+            array_value = _alias_first(
+                alias, ("arrayIndex", "arrayElement"), None)
+            metadata = alias.get("metadata", {})
+            if (target_resource_id <= 0 or bind_number < 0 or
+                    (array_value is not None and
+                     _safe_int(array_value, -1) < 0) or
+                    not isinstance(metadata, dict) or
+                    _safe_int(metadata.get("eventId"), 0) <= 0):
+                skipped.append({
+                    "index": index,
+                    "reason": (
+                        "texture resource alias requires resourceId, bindNumber "
+                        "and metadata.eventId"),
+                })
+                continue
         if not _alias_display_name(alias):
             skipped.append({"index": index, "reason": "empty alias display name"})
             continue
@@ -12687,16 +15293,41 @@ def _load_symbol_aliases(params):
             continue
         live_candidates.append((index, alias, shader_key, kind))
 
+    texture_candidates = [
+        item for item in live_candidates if item[3] == "textureresource"]
+    live_texture_indexes, texture_failures = (
+        _revalidate_symbol_texture_aliases(texture_candidates))
+    if texture_candidates:
+        checked_candidates = []
+        for index, alias, shader_key, kind in live_candidates:
+            if kind != "textureresource" or index in live_texture_indexes:
+                checked_candidates.append((index, alias, shader_key, kind))
+                continue
+            skipped.append({
+                "index": index,
+                "resourceId": _alias_target_resource_id(alias),
+                "reason": texture_failures.get(
+                    index, "texture binding failed live revalidation"),
+            })
+        live_candidates = checked_candidates
+
     # Never choose a first alias when one physical target has conflicting names.
     target_groups = {}
     for index, alias, shader_key, kind in live_candidates:
         target_key = [kind] + list(shader_key)
-        if kind in ("constantbuffer", "constantfield"):
+        if kind in ("constantbuffer", "constantfield", "textureresource"):
             target_key.extend([
                 _safe_int(_alias_first(
                     alias, ("registerSpace", "space", "fixedBindSetOrSpace"), 0), 0),
                 _safe_int(_alias_first(
                     alias, ("bindNumber", "bind", "fixedBindNumber"), -1), -1),
+            ])
+        if kind == "textureresource":
+            target_key.extend([
+                _alias_target_resource_id(alias),
+                _safe_int((alias.get("metadata") or {}).get("eventId"), 0),
+                _safe_int(_alias_first(
+                    alias, ("arrayIndex", "arrayElement"), 0), 0),
             ])
         if kind == "constantfield":
             target_key.append(_safe_int(
@@ -12727,13 +15358,15 @@ def _load_symbol_aliases(params):
     }
 
     rename_candidates = {}
+    rename_candidate_kinds = {}
     for alias in active_aliases:
-        if _alias_kind(alias) != "shader":
+        alias_kind = _alias_kind(alias)
+        if alias_kind not in ("shader", "textureresource"):
             continue
-        resource_id = _safe_int(_alias_first(
-            alias, ("shaderResourceId", "resourceId", "captureResourceId"), 0), 0)
+        resource_id = _alias_target_resource_id(alias)
         display_name = _alias_display_name(alias)
         rename_candidates.setdefault(resource_id, set()).add(display_name)
+        rename_candidate_kinds.setdefault(resource_id, set()).add(alias_kind)
 
     plan = {
         "captureToken": request_capture_token,
@@ -12748,6 +15381,7 @@ def _load_symbol_aliases(params):
         "skipped": skipped,
         "conflicts": conflicts,
         "renameCandidates": rename_candidates,
+        "renameCandidateKinds": rename_candidate_kinds,
         "operationId": operation_id,
         "expectedSha256": expected_sha256,
         "newOverlay": new_overlay,
@@ -13207,6 +15841,25 @@ def _save_texture(params):
         raise ValueError("resource_id and output_path required")
 
     req_slice = params.get("slice", -1)  # -1 = auto (all faces for cubemap)
+    raw_crop = params.get("crop")
+    crop = None
+    if raw_crop is not None:
+        if not isinstance(raw_crop, dict):
+            raise ValueError("crop must be an object with x, y, width and height")
+        crop = {}
+        for name, minimum in (("x", 0), ("y", 0), ("width", 1), ("height", 1)):
+            value = raw_crop.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("crop.%s must be a whole number of pixels" % name)
+            if int(value) < minimum:
+                raise ValueError("crop.%s must be at least %d" % (name, minimum))
+            crop[name] = int(value)
+    max_dimension = params.get("max_dimension")
+    if max_dimension is not None:
+        if isinstance(max_dimension, bool) or not isinstance(max_dimension, int):
+            raise ValueError("max_dimension must be an integer")
+        if not 16 <= max_dimension <= 8192:
+            raise ValueError("max_dimension must be between 16 and 8192")
 
     def _do(ctrl):
         # Find the actual texture info
@@ -13240,7 +15893,12 @@ def _save_texture(params):
             save.destType = dest_type
             ret = ctrl.SaveTexture(save, output_path)
             if ret.code == rd.ResultCode.Succeeded:
-                return {"saved": output_path, "type": "2D"}
+                # Cropping and scaling here is what keeps a 4K input texture usable as
+                # evidence: a model reading it has a finite context.
+                reduction = None
+                if crop or max_dimension:
+                    reduction = _reduce_saved_image(output_path, crop, max_dimension)
+                return {"saved": output_path, "type": "2D", "reduction": reduction}
             return {"error": "Save failed: %s" % str(ret)}
 
         # CubeMap handling
@@ -13498,94 +16156,53 @@ def _resolve_bound_resource(bindings, index, ctrl):
     return 0
 
 
-def _resolve_vulkan_descriptors(ctrl, ps, stage, refl):
-    """Resolve Vulkan descriptor set bindings to actual resource IDs.
+def _exact_readonly_descriptor_resources(bindings, reflection_index):
+    """Return only resources exactly mapped to one reflection binding index.
 
-    Vulkan uses descriptor sets which are not always resolvable through
-    GetReadOnlyResources. This function uses GetDescriptorLocations (if available)
-    or enumerates all used descriptors to map binding points to resource IDs.
-
-    Returns dict: {binding_number: resource_id}
+    Modern RenderDoc returns ``UsedDescriptor`` rows whose ``access.index`` is
+    the index into ``ShaderReflection.readOnlyResources`` and whose
+    ``access.arrayElement`` identifies a descriptor-array element.  That is
+    current-EID evidence.  Older APIs return one row per reflection index; the
+    positional fallback is accepted only when *none* of the rows exposes an
+    access record.  This helper deliberately never consults resource usage or
+    another EID.
     """
-    result = {}
+    values = list(bindings or [])
+    has_access_records = any(
+        getattr(value, "access", None) is not None for value in values)
+    result = []
+    if has_access_records:
+        for value in values:
+            access = getattr(value, "access", None)
+            if access is None or _safe_int(
+                    getattr(access, "index", -1), -1) != reflection_index:
+                continue
+            descriptor = getattr(value, "descriptor", None)
+            resource_id = _resource_id_int(
+                getattr(descriptor, "resource", None))
+            if resource_id <= 0:
+                resource_id = _resource_id_int(
+                    getattr(descriptor, "view", None))
+            if resource_id <= 0:
+                continue
+            result.append({
+                "resourceId": resource_id,
+                "arrayElement": _safe_int(
+                    getattr(access, "arrayElement", 0), 0),
+                "descriptorStoreId": _resource_id_int(
+                    getattr(access, "descriptorStore", None)),
+                "evidence": "used-descriptor-access",
+            })
+        return result
 
-    # Method 1: Try GetDescriptorAccess on the replay controller
-    try:
-        accesses = ctrl.GetDescriptorAccess()
-        if accesses:
-            for a in accesses:
-                bind = getattr(a, 'index', getattr(a, 'binding', -1))
-                dset = getattr(a, 'descriptorSet', getattr(a, 'set', -1))
-                rid = 0
-                if hasattr(a, 'resource'):
-                    rid = int(a.resource)
-                elif hasattr(a, 'resourceId'):
-                    rid = int(a.resourceId)
-                if rid != 0 and bind >= 0:
-                    result[bind] = rid
-            if result:
-                return result
-    except Exception:
-        pass
-
-    # Method 2: Try Vulkan pipeline state descriptor sets
-    try:
-        vk_state = None
-        if hasattr(ps, 'vulkan'):
-            vk_state = ps.vulkan
-        elif hasattr(ps, 'GetVulkanPipelineState'):
-            vk_state = ps.GetVulkanPipelineState()
-
-        if vk_state and hasattr(vk_state, 'graphics') and hasattr(vk_state.graphics, 'descriptorSets'):
-            desc_sets = vk_state.graphics.descriptorSets
-            for ds in desc_sets:
-                bindings_list = getattr(ds, 'bindings', [])
-                for b in bindings_list:
-                    bind_num = getattr(b, 'binding', getattr(b, 'descriptorIndex', -1))
-                    descriptors = getattr(b, 'binds', getattr(b, 'descriptors', []))
-                    for d in descriptors:
-                        rid = 0
-                        if hasattr(d, 'resource'):
-                            rid = int(d.resource)
-                        elif hasattr(d, 'resourceId'):
-                            rid = int(d.resourceId)
-                        elif hasattr(d, 'viewResourceId'):
-                            rid = int(d.viewResourceId)
-                        elif hasattr(d, 'imageInfo'):
-                            img = d.imageInfo
-                            if hasattr(img, 'imageView'):
-                                rid = int(img.imageView)
-                        if rid != 0 and bind_num >= 0:
-                            result[bind_num] = rid
-                            break  # First valid descriptor in array
-    except Exception:
-        pass
-
-    # Method 3: Try to get resource usage to find which textures were sampled
-    if not result:
-        try:
-            textures = ctrl.GetTextures()
-            for tex in textures:
-                try:
-                    usages = ctrl.GetUsage(tex.resourceId)
-                    for u in usages:
-                        eid = getattr(u, 'eventId', getattr(u, 'eventID', 0))
-                        if eid == 0:
-                            continue
-                        # Check if this is a read in this event (fragment shader sample)
-                        usage_type = str(getattr(u, 'usage', ''))
-                        if 'read' in usage_type.lower() or 'sample' in usage_type.lower() \
-                                or 'input' in usage_type.lower() or 'fs' in usage_type.lower():
-                            rid = int(tex.resourceId)
-                            # We don't know the exact binding, use negative slot as fallback
-                            if rid not in result.values():
-                                next_slot = len(result)
-                                result[next_slot] = rid
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
+    resource_id = _resolve_bound_resource(values, reflection_index, None)
+    if resource_id > 0:
+        result.append({
+            "resourceId": resource_id,
+            "arrayElement": 0,
+            "descriptorStoreId": 0,
+            "evidence": "positional-pipeline-binding",
+        })
     return result
 
 
@@ -13645,6 +16262,7 @@ def _find_action_by_event(actions, event_id):
 
 def _draw_call_details_on_replay(ctrl, event_id):
     """Collect compact single-EID draw/workload/I/O evidence."""
+    _require_healthy_replay(ctrl)
     ps = ctrl.GetPipelineState()
     event_id = int(event_id)
     try:
@@ -14100,6 +16718,11 @@ def _draw_call_details_on_replay(ctrl, event_id):
             for value in (getattr(action, "outputs", None) or [])
             if _resource_id_int(value)
         ]
+        if flags & utility_mask and copy_destination and not (flags & present_mask):
+            # Utility actions inherit the preceding pipeline's bound RTs. The
+            # native destination identifies the actual clear/discard/transfer;
+            # retain an identical alias, never unrelated inherited targets.
+            declared_outputs = [value for value in declared_outputs if value == copy_destination]
         for resource_id in declared_outputs[
                 :MAX_FRAME_FLOW_RESOURCES_PER_DIRECTION]:
             if flags & present_mask:
@@ -14119,7 +16742,8 @@ def _draw_call_details_on_replay(ctrl, event_id):
             else:
                 output_omitted += omitted
         depth_output = _resource_id_int(getattr(action, "depthOut", None))
-        if depth_output and not (flags & present_mask):
+        if (depth_output and not (flags & present_mask) and
+                (not (flags & utility_mask) or not copy_destination or depth_output == copy_destination)):
             if flags & clear_mask:
                 outputs.append(_fact(depth_output, "action-depth-output"))
             elif flags & utility_mask:
@@ -14227,7 +16851,7 @@ def _get_draw_call_details(params):
         raise ValueError("event_id required")
 
     def _do(ctrl):
-        _set_frame_event(ctrl, int(event_id), True)
+        _select_event_for_read(ctrl, event_id)
         return _draw_call_details_on_replay(ctrl, event_id)
 
     return _replay(_do)
@@ -14241,7 +16865,7 @@ def _inspect_event(params):
     event_id = int(event_id)
 
     def _do(ctrl):
-        _set_frame_event(ctrl, event_id, True)
+        _select_event_for_read(ctrl, event_id)
         return {
             "schema": "renderdoc-internal-inspect-event/v1",
             "eventId": event_id,
@@ -14250,6 +16874,98 @@ def _inspect_event(params):
         }
 
     return _replay(_do)
+
+
+def _inspect_event_api_parameters(params):
+    """Read exact captured API arguments without changing the selected EID."""
+    from .frame_stage_evidence import event_api_evidence
+    expected = params.get("expected_capture_session_id")
+    if not expected or expected != _capture_session_id or not _request_capture_loaded():
+        raise RuntimeError("API evidence belongs to a different capture session")
+
+    def read():
+        if expected != _capture_session_id:
+            raise RuntimeError("Capture changed while reading API evidence")
+        result = event_api_evidence(_ctx, params.get("event_id"), _resource_id_int,
+                                    params.get("max_depth", 6), params.get("max_nodes", 512))
+        result["captureSessionId"] = expected
+        return result
+
+    result = _invoke_on_ui_sync(read)
+    call = result.get("indirect", {}).get("call", {})
+    command = call.get("command")
+    formats = {"vkCmdDrawIndexedIndirect": ("<IIIiI", ("indexCount", "instanceCount", "firstIndex", "vertexOffset", "firstInstance")),
+               "vkCmdDrawIndirect": ("<IIII", ("vertexCount", "instanceCount", "firstVertex", "firstInstance")),
+               "vkCmdDispatchIndirect": ("<III", ("groupCountX", "groupCountY", "groupCountZ"))}
+    if command in formats and call.get("drawCount") == 1:
+        import base64
+        import struct
+        fmt, fields = formats[command]
+        receipt = _get_buffer_data({"resource_id": call["argumentBufferId"], "offset": call["argumentOffset"],
+            "length": struct.calcsize(fmt), "event_id": params["event_id"], "before_action": True,
+            "expected_capture_session_id": expected})
+        raw = base64.b64decode(receipt["base64"])
+        if len(raw) == struct.calcsize(fmt):
+            values = dict(zip(fields, struct.unpack(fmt, raw)))
+            work = {key: value for key, value in values.items() if key in ("indexCount", "vertexCount", "instanceCount", "groupCountX", "groupCountY", "groupCountZ")}
+            result["indirect"].update(status="resolved", decoded={"status": "resolved", "eventId": params["event_id"],
+                "source": "event-bound-indirect-arguments", "workload": work,
+                "nonZeroWorkload": all(value > 0 for value in work.values()), "arguments": values, "bufferEvidence": receipt})
+    return result
+
+
+def _inspect_frame_render_stage(params):
+    from .frame_stage_evidence import inventory, resolved_indirect_workload
+    event_id = _event_texture_evidence_int(params.get("event_id"), "event_id", 1, 0xFFFFFFFF)
+    expected = params.get("expected_capture_session_id")
+    if not expected or expected != _capture_session_id:
+        raise RuntimeError("Frame stage belongs to a different capture session")
+    original = _request_visible_event_id(0)
+
+    def collect(ctrl):
+        try:
+            action = _find_action_by_event(ctrl.GetRootActions(), event_id)
+            if action is None:
+                raise ValueError("The requested EID is not an exact captured action")
+            _set_frame_event(ctrl, event_id, True)
+            details = _draw_call_details_on_replay(ctrl, event_id)
+            if _ctx is not None and hasattr(_ctx, "GetStructuredFile"):
+                decoded = resolved_indirect_workload(action, _ctx.GetStructuredFile())
+                if decoded is not None:
+                    details["indirectWorkload"] = decoded
+                    if decoded.get("status") == "resolved":
+                        details["workload"].update(decoded["workload"])
+                        details["workload"]["indirectArgumentsResolved"] = True
+                        details["participation"].update(indirectArgumentsResolved=True,
+                                                        nonZeroWorkload=decoded["nonZeroWorkload"])
+                        if decoded["nonZeroWorkload"] is False:
+                            details["participation"]["outputAffectingCandidate"] = False
+                            details["actualWorkState"] = "not-established"
+            resources = inventory(ctrl, ctrl.GetPipelineState(), details,
+                                  _available_shader_stages(list(details.get("shaders", {}))),
+                                  _resource_id_int, _fmt_str, action=action)
+            return dict(resources, schema="bread-frame-stage-evidence/v1", eventId=event_id,
+                        captureSessionId=expected, details=details)
+        finally:
+            _set_frame_event(ctrl, original, True)
+
+    result = _replay(collect)
+    indirect = result.get("details", {}).get("indirectWorkload") or {}
+    if indirect.get("status") == "unresolved":
+        decoded = _inspect_event_api_parameters({"event_id": event_id,
+            "expected_capture_session_id": expected}).get("indirect", {}).get("decoded")
+        if decoded and decoded.get("status") == "resolved":
+            result["details"]["indirectWorkload"] = decoded
+            result["indirectWorkload"] = decoded
+            result["details"]["workload"].update(decoded["workload"], indirectArgumentsResolved=True)
+            result["details"]["participation"].update(indirectArgumentsResolved=True,
+                nonZeroWorkload=decoded["nonZeroWorkload"])
+            if decoded["nonZeroWorkload"] is False:
+                result["details"]["participation"]["outputAffectingCandidate"] = False
+                result["details"]["actualWorkState"] = "observed-no-work"
+    if expected != _capture_session_id:
+        raise RuntimeError("Capture changed while inspecting the frame stage")
+    return result
 
 
 def _texture_info_on_replay(ctrl, resource_id):
@@ -14268,6 +16984,17 @@ def _texture_info_on_replay(ctrl, resource_id):
     return {"error": "Texture not found"}
 
 
+def _get_effect_resource_info(params):
+    expected = params.get("expected_capture_session_id")
+    if not expected or expected != _capture_session_id:
+        raise RuntimeError("Resource dependency belongs to another capture session")
+    usage = _find_by_resource(params)
+    texture = _get_texture_info(params)
+    if expected != _capture_session_id:
+        raise RuntimeError("Capture changed while inspecting resource dependencies")
+    return {"usage": usage, "texture": texture, "captureSessionId": expected}
+
+
 def _get_texture_info(params):
     """Get single texture info."""
     resource_id = params.get("resource_id")
@@ -14275,6 +17002,66 @@ def _get_texture_info(params):
         raise ValueError("resource_id required")
 
     return _replay(lambda ctrl: _texture_info_on_replay(ctrl, resource_id))
+
+
+_event_texture_raw_cache = {}
+
+
+def _get_event_texture_bytes(params):
+    import base64
+    import hashlib
+    from .frame_flow_channels import mutation_identity
+    expected = params.get("expected_capture_session_id")
+    if expected != _capture_session_id or not _request_capture_loaded():
+        raise RuntimeError("Texture read belongs to another capture session")
+    event = _event_texture_evidence_int(params.get("event_id"), "event_id", 1, 0xFFFFFFFF)
+    rid = int(params["resource_id"]); mip = int(params.get("mip", 0)); offset = int(params.get("offset", 0))
+    slice_index = int(params.get("slice", 0)); sample_index = int(params.get("sample", 0))
+    length = max(1, min(1024 * 1024, int(params.get("length", 1024 * 1024))))
+    if offset < 0 or mip < 0 or slice_index < 0 or sample_index < 0:
+        raise ValueError("Texture offset/mip must be non-negative")
+    original = _request_visible_event_id(0)
+    mutation = hashlib.sha256(json.dumps(mutation_identity(sys.modules[__name__])).encode("utf-8")).hexdigest()
+    key = (expected, mutation, event, rid, mip, slice_index, sample_index)
+    def read(ctrl):
+        if key in _event_texture_raw_cache:
+            return _event_texture_raw_cache[key]
+        try:
+            if _find_action_by_event(ctrl.GetRootActions(), event) is None:
+                raise ValueError("Texture reads require an exact captured EID")
+            _set_frame_event(ctrl, event, True)
+            texture = next((row for row in ctrl.GetTextures() if int(row.resourceId) == rid), None)
+            if texture is None or mip >= int(texture.mips):
+                raise ValueError("Texture or requested mip is unavailable")
+            if slice_index >= max(1,int(getattr(texture,"arraysize",1))) or sample_index >= max(1,int(getattr(texture,"msSamp",1))):
+                raise ValueError("Texture slice/sample is unavailable")
+            if int(texture.byteSize) > 256 * 1024 * 1024:
+                raise ValueError("Texture exceeds bounded readback size")
+            _event_texture_raw_cache.clear()
+            data = bytes(ctrl.GetTextureData(texture.resourceId, rd.Subresource(mip, slice_index, sample_index)))
+            if len(data) > 256 * 1024 * 1024:
+                raise ValueError("Texture mip exceeds bounded readback size")
+            metadata = {"width": max(1,int(texture.width)>>mip), "height": max(1,int(texture.height)>>mip),
+                "depth": max(1,int(texture.depth)>>mip), "mips": int(texture.mips),
+                "format": _fmt_str(texture.format), "dimension": str(texture.type),
+                "arraySize": int(getattr(texture,"arraysize",1)), "samples": int(getattr(texture,"msSamp",1)),
+                "sha256": hashlib.sha256(data).hexdigest()}
+            result = (data, metadata)
+            # Cache one bounded mip across all IPC chunks, including HDR 4K.
+            _event_texture_raw_cache[key] = result
+            return result
+        finally:
+            _set_frame_event(ctrl, original, True)
+    data, metadata = _replay(read)
+    if expected != _capture_session_id:
+        raise RuntimeError("Capture changed while reading texture")
+    if mutation != hashlib.sha256(json.dumps(mutation_identity(sys.modules[__name__])).encode("utf-8")).hexdigest():
+        raise RuntimeError("Texture inputs changed during readback")
+    part = data[offset:offset+length]
+    return dict(metadata, eventId=event, resourceId=str(rid), mip=mip, offset=offset,
+        sliceIndex=slice_index, sampleIndex=sample_index,
+        length=len(data), returnedBytes=len(part), base64=base64.b64encode(part).decode("ascii"),
+        captureSessionId=expected, mutationEpoch=key[1], restoredEventId=original)
 
 
 def _get_texture_data(params):
@@ -14309,6 +17096,7 @@ def _get_texture_data(params):
 def _get_buffer_data(params):
     """Get buffer contents."""
     import base64
+    import hashlib
     resource_id = params.get("resource_id")
     if resource_id is None:
         raise ValueError("resource_id required")
@@ -14319,10 +17107,25 @@ def _get_buffer_data(params):
     if requested_length <= 0:
         raise ValueError("length must be positive")
     read_length = min(requested_length, MAX_BUFFER_DATA_BYTES)
+    event_id = params.get("event_id")
+    expected = params.get("expected_capture_session_id")
+    original = _request_visible_event_id(0) if event_id is not None else None
+    if event_id is not None:
+        event_id = _event_texture_evidence_int(event_id, "event_id", 1, 0xFFFFFFFF)
+        if expected != _capture_session_id:
+            raise RuntimeError("Event buffer read belongs to another capture session")
 
     def _do(ctrl):
         bid = _resolve_resource_id(ctrl, resource_id, "buffer")
-        raw_data = ctrl.GetBufferData(bid, offset, read_length)
+        try:
+            if event_id is not None:
+                if _find_action_by_event(ctrl.GetRootActions(), event_id) is None:
+                    raise ValueError("Event buffer reads require an exact captured action")
+                _set_frame_event(ctrl, event_id - 1 if params.get("before_action", True) else event_id, True)
+            raw_data = ctrl.GetBufferData(bid, offset, read_length)
+        finally:
+            if event_id is not None:
+                _set_frame_event(ctrl, original, True)
         data = raw_data[:read_length]
         base64_bytes = data
         hex_bytes = data[:512]
@@ -14338,6 +17141,11 @@ def _get_buffer_data(params):
             "hex": hex_bytes.hex(),
             "hexReturnedBytes": len(hex_bytes),
             "hexTruncated": len(hex_bytes) < len(data),
+            "eventId": event_id, "captureSessionId": _capture_session_id,
+            "capturePhase": ("before-action" if params.get("before_action", True) else "after-action") if event_id is not None else "current-replay-state",
+            "replayEventId": (event_id - 1 if params.get("before_action", True) else event_id) if event_id is not None else original,
+            "restoredEventId": original,
+            "sha256": hashlib.sha256(data).hexdigest(),
         }
 
     return _replay(_do)
@@ -14418,28 +17226,123 @@ def _event_texture_evidence_hash(path, maximum_bytes):
     return total, digest.hexdigest()
 
 
-def _capture_event_texture_evidence(params):
+def _reduce_saved_image(path, crop, max_dimension, opaque_rgb=False, flip_y=False):
+    """Crop and shrink a saved image, using Qt's own image code.
+
+    A model reading this has a finite context, and a 4K render target spends it on
+    pixels that say nothing. Cropping to where the draw actually landed and scaling the
+    result down keeps what the picture is *for* — what was drawn, and where — at a
+    fraction of the size. Done before publication so the hash, the byte budget and the
+    atomic link all apply to the file that is actually kept.
+
+    Returns what was applied, or None when nothing was.
+    """
+
+    if not crop and not max_dimension and not opaque_rgb and not flip_y:
+        return None
+    try:
+        from PySide2 import QtGui
+    except Exception as exc:  # pragma: no cover - depends on the host runtime
+        raise RuntimeError("PySide2 is unavailable for image reduction: %s" % exc)
+    image = QtGui.QImage(path)
+    if image.isNull():
+        raise RuntimeError("the evidence PNG could not be read back for reduction")
+    original = {"width": int(image.width()), "height": int(image.height())}
+    applied = {"original": original, "crop": None, "scaledTo": None}
+    if opaque_rgb:
+        # RenderDoc's AlphaMapping.Discard does not affect PNG exports. Remove
+        # alpha before Qt's smooth scaler premultiplies it: scene RGB may be
+        # valid with alpha zero, and clearing alpha after scaling loses it.
+        image = image.convertToFormat(QtGui.QImage.Format_RGB32)
+        if image.isNull():
+            raise RuntimeError("the evidence PNG could not be converted to opaque RGB")
+        applied["opaqueRgbProcessed"] = True
+    if crop:
+        left = max(0, min(int(crop.get("x", 0)), original["width"] - 1))
+        top = max(0, min(int(crop.get("y", 0)), original["height"] - 1))
+        width = max(1, min(int(crop.get("width", 0)), original["width"] - left))
+        height = max(1, min(int(crop.get("height", 0)), original["height"] - top))
+        image = image.copy(left, top, width, height)
+        if image.isNull():
+            raise RuntimeError("the requested crop rectangle produced no image")
+        applied["crop"] = {"x": left, "y": top, "width": width, "height": height}
+    if flip_y:
+        # Presentation transform only. Crop coordinates continue to address the
+        # native subresource; hash the transformed file actually sent to the AI.
+        image = image.mirrored(False, True)
+        applied["flipYProcessed"] = True
+    if max_dimension:
+        longest = max(int(image.width()), int(image.height()))
+        if longest > int(max_dimension):
+            image = image.scaled(
+                int(max_dimension), int(max_dimension),
+                QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            if image.isNull():
+                raise RuntimeError("scaling the evidence PNG produced no image")
+    applied["scaledTo"] = {"width": int(image.width()), "height": int(image.height())}
+    if not image.save(path, "PNG"):
+        raise RuntimeError("the reduced evidence PNG could not be written")
+    return applied
+
+
+def _save_decoded_grayscale_evidence(path, gray, width, height):
+    from PySide2 import QtGui
+    # Own the bytes until saving finishes; the external-buffer QImage overload does not copy them.
+    pixels = bytes(gray)
+    image = QtGui.QImage(pixels, width, height, width, QtGui.QImage.Format_Grayscale8)
+    if image.isNull() or not image.save(path, "PNG"):
+        raise RuntimeError("decoded scalar evidence could not be written as a PNG")
+
+
+def _capture_event_texture_evidence(params, _controller=None, _original_event=None,
+                                    _expected_resource_id=None):
     """Save one exact EID-bound RTV/DSV view into a Host-owned directory.
 
     This composite deliberately does not call the legacy ``_save_texture``
     handler: that API accepts arbitrary paths and is not capture/EID bound.
     """
 
+    flip_y = params.get("flip_y", False)
+    if type(flip_y) is not bool:
+        raise ValueError("flip_y must be a boolean")
     event_id = _event_texture_evidence_int(
         params.get("event_id"), "event_id", 1, 0xFFFFFFFF)
     attachment_kind = params.get("attachment_kind")
     if (not isinstance(attachment_kind, str) or
-            attachment_kind not in ("rtv", "dsv")):
-        raise ValueError("attachment_kind must be exactly 'rtv' or 'dsv'")
+            attachment_kind not in ("rtv", "dsv", "uav", "srv", "present")):
+        raise ValueError("attachment_kind must be rtv, dsv, uav, srv or present")
     attachment_index = _event_texture_evidence_int(
-        params.get("attachment_index", 0), "attachment_index", 0, 7)
-    if attachment_kind == "dsv" and attachment_index != 0:
-        raise ValueError("a DSV attachment_index must be 0")
+        params.get("attachment_index", 0), "attachment_index", 0,
+        7 if attachment_kind in ("rtv", "dsv") else 4095)
+    stage_name = params.get("stage", "fragment")
+    stages = dict(_available_shader_stages([stage_name])) if attachment_kind in ("uav", "srv") else {}
+    if attachment_kind in ("uav", "srv") and stage_name not in stages:
+        raise ValueError("A supported Shader stage is required")
+    if attachment_kind in ("dsv", "present") and attachment_index != 0:
+        raise ValueError("a DSV or Present attachment_index must be 0")
     mip = _event_texture_evidence_int(params.get("mip"), "mip", 0, 0x7FFFFFFF)
     array_slice = _event_texture_evidence_int(
         params.get("slice"), "slice", 0, 0x7FFFFFFF)
     sample = _event_texture_evidence_int(
         params.get("sample"), "sample", 0, 0x7FFFFFFF)
+    if attachment_kind == "present" and (mip or array_slice or sample):
+        raise ValueError("Present evidence requires mip, slice and sample 0")
+
+    raw_crop = params.get("crop")
+    crop = None
+    if raw_crop is not None:
+        if not isinstance(raw_crop, dict):
+            raise ValueError("crop must be an object with x, y, width and height")
+        crop = {name: _event_texture_evidence_int(raw_crop.get(name), "crop.%s" % name,
+                                                  0, 0x7FFFFFFF)
+                for name in ("x", "y")}
+        crop.update({name: _event_texture_evidence_int(raw_crop.get(name), "crop.%s" % name,
+                                                       1, 0x7FFFFFFF)
+                     for name in ("width", "height")})
+    max_dimension = params.get("max_dimension")
+    if max_dimension is not None:
+        max_dimension = _event_texture_evidence_int(
+            max_dimension, "max_dimension", 16, 8192)
 
     channel = params.get("channel")
     if (not isinstance(channel, str) or
@@ -14447,14 +17350,19 @@ def _capture_event_texture_evidence(params):
         raise ValueError("channel must be rgba, r, g, b, a, or depth")
     if attachment_kind == "dsv" and channel != "depth":
         raise ValueError("DSV evidence only supports the raw depth channel")
-    if attachment_kind == "rtv" and channel == "depth":
+    if attachment_kind != "dsv" and channel == "depth":
         raise ValueError("the depth channel requires a DSV attachment")
+    value_decode = params.get("value_decode", "native")
+    if value_decode not in ("native", "float32-bits"):
+        raise ValueError("value_decode must be native or float32-bits")
+    if value_decode != "native" and channel not in ("r", "rgba"):
+        raise ValueError("float32-bits evidence requires the r or rgba channel")
 
-    range_mode = params.get("range_mode")
+    range_mode = params.get("range_mode", "visible-distribution")
     if (not isinstance(range_mode, str) or
-            range_mode not in ("native", "explicit", "subresource-minmax")):
+            range_mode not in ("native", "explicit", "subresource-minmax", "visible-distribution")):
         raise ValueError(
-            "range_mode must be native, explicit, or subresource-minmax")
+            "range_mode must be native, explicit, subresource-minmax, or visible-distribution")
     supplied_black = params.get("black_point")
     supplied_white = params.get("white_point")
     if range_mode == "explicit":
@@ -14504,7 +17412,8 @@ def _capture_event_texture_evidence(params):
         raise ValueError("artifact_dir must be a new empty directory")
 
     try:
-        original_event = _request_visible_event_id(0)
+        original_event = (_request_visible_event_id(0) if _controller is None
+                          else _original_event)
     except Exception:
         raise RuntimeError("the original visible EID is unavailable")
     if original_event < 0 or original_event > 0xFFFFFFFF:
@@ -14536,14 +17445,19 @@ def _capture_event_texture_evidence(params):
             if action is None:
                 raise RuntimeError("event_id is not an exact captured action EID")
 
-            pipeline = ctrl.GetPipelineState()
-            if attachment_kind == "rtv":
-                targets = list(pipeline.GetOutputTargets() or [])
-                if attachment_index >= len(targets):
-                    raise RuntimeError("the requested RTV slot is not bound at this EID")
-                binding = targets[attachment_index]
-            else:
-                binding = pipeline.GetDepthTarget()
+            from .frame_stage_evidence import bindings, present_output_binding
+            pipeline = ctrl.GetPipelineState() if attachment_kind != "present" else None
+            if attachment_kind in ("uav", "srv"):
+                compatible = _ai_context_protocol.compatible_shader_stages({
+                    "eventId": event_id, "flags": str(action.flags), "matchesCurrentEvent": True})
+                if stage_name not in compatible:
+                    raise ValueError("Shader stage does not execute at this event")
+            targets = ([present_output_binding(action, ctrl, _resource_id_int)]
+                       if attachment_kind == "present" else
+                       bindings(pipeline, attachment_kind, stages.get(stage_name)))
+            if attachment_index >= len(targets):
+                raise RuntimeError("The requested texture binding index is unavailable at this EID")
+            binding = targets[attachment_index]
             descriptor = getattr(binding, "descriptor", binding)
             resource_id = _resource_id_int(
                 getattr(descriptor, "resource", None))
@@ -14554,6 +17468,8 @@ def _capture_event_texture_evidence(params):
                 raise RuntimeError(
                     "the requested %s is not bound at this EID" %
                     attachment_kind.upper())
+            if _expected_resource_id is not None and resource_id != _expected_resource_id:
+                raise RuntimeError("texture binding no longer matches the requested resource")
 
             texture = None
             resolved_resource = None
@@ -14604,12 +17520,15 @@ def _capture_event_texture_evidence(params):
             if mip < first_mip or mip >= bound_mip_end:
                 raise RuntimeError(
                     "the requested mip is not part of the bound output view")
-            slice_count = (
-                max(1, texture_depth >> mip)
-                if texture_depth > 1 else texture_array)
-            if num_slices <= 0 or first_slice >= slice_count:
-                raise RuntimeError("the output binding slice range is invalid")
-            bound_slice_end = min(slice_count, first_slice + num_slices)
+            from .frame_stage_evidence import texture_slice_view
+            native_descriptor = {
+                "firstMip": first_mip, "numMips": num_mips,
+                "firstSlice": first_slice, "numSlices": num_slices,
+            }
+            slice_view = texture_slice_view(texture, descriptor, attachment_kind, mip)
+            first_slice = slice_view["viewSliceFirst"]
+            num_slices = slice_view["viewSliceCount"]
+            bound_slice_end = first_slice + num_slices
             if array_slice < first_slice or array_slice >= bound_slice_end:
                 raise RuntimeError(
                     "the requested slice is not part of the bound output view")
@@ -14621,6 +17540,12 @@ def _capture_event_texture_evidence(params):
             mip_height = max(1, texture_height >> mip)
             pixel_count = mip_width * mip_height
             texture_format = getattr(texture, "format", None)
+            component_type = getattr(texture_format, "compType", rd.CompType.Typeless)
+            type_cast = rd.CompType.Typeless
+            if component_type == rd.CompType.Typeless:
+                view_type = getattr(getattr(descriptor, "format", None), "compType", rd.CompType.Typeless)
+                if view_type != rd.CompType.Typeless:
+                    component_type = type_cast = view_type
             component_count = max(
                 0, _safe_int(getattr(texture_format, "compCount", 0), 0))
             if component_count <= 0 or component_count > 4:
@@ -14628,10 +17553,19 @@ def _capture_event_texture_evidence(params):
             if channel_extract >= component_count and channel_extract >= 0:
                 raise RuntimeError(
                     "the requested channel is absent from the output texture")
+            if value_decode == "float32-bits" and (
+                    component_count != 1 or
+                    getattr(texture_format, "compByteWidth", None) != 4 or
+                    component_type != getattr(rd.CompType, "UInt", None) or
+                    getattr(texture_format, "Special", lambda: True)() or
+                    getattr(texture, "dimension", None) != 2 or texture_depth != 1 or
+                    sample_count != 1):
+                raise ValueError("float32-bits requires a regular R32_UINT 2D non-MS texture")
 
             attachment = {
                 "kind": attachment_kind,
                 "index": attachment_index,
+                "stage": stage_name,
                 "resourceId": resource_id,
                 "mip": mip,
                 "slice": array_slice,
@@ -14639,23 +17573,31 @@ def _capture_event_texture_evidence(params):
                 "viewWidth": mip_width,
                 "viewHeight": mip_height,
                 "format": _fmt_str(texture_format)[:256],
+                "componentCount": component_count,
                 "textureByteSize": texture_byte_size,
                 "sampleCount": sample_count,
+                "presentedBackbuffer": attachment_kind == "present",
                 "descriptor": {
                     "firstMip": first_mip,
                     "numMips": num_mips,
                     "firstSlice": first_slice,
                     "numSlices": num_slices,
                 },
+                "nativeDescriptor": native_descriptor,
             }
+            attachment.update(slice_view)
+            if slice_view["textureDimension"] == 3:
+                attachment["depthSlice"] = array_slice
             display = {
                 "channel": channel,
+                "flipY": flip_y,
                 "channelExtract": channel_extract,
                 "rangeMode": range_mode,
                 "blackPoint": black_point,
                 "whitePoint": white_point,
                 "subresourceMin": None,
                 "subresourceMax": None,
+                "valueDecode": value_decode,
                 "depthInterpretation": (
                     "raw-resource-component-0" if channel == "depth" else None),
             }
@@ -14673,32 +17615,86 @@ def _capture_event_texture_evidence(params):
                 return _skipped("source-size-unavailable")
             if texture_byte_size > MAX_EVENT_TEXTURE_EVIDENCE_SOURCE_BYTES:
                 return _skipped("source-size-budget-exceeded")
-            if pixel_count > MAX_EVENT_TEXTURE_EVIDENCE_PIXELS:
+            # Large atlas UAVs (e.g. 16384 x 2048 page tables) still need a
+            # readable overview. Allow a bounded 32 Mpix source only when the
+            # caller explicitly requests a small presentation preview.
+            pixel_budget = MAX_EVENT_TEXTURE_EVIDENCE_PIXELS
+            if max_dimension and max_dimension <= 2048:
+                pixel_budget = max(pixel_budget, 32 * 1024 * 1024)
+            if pixel_count > pixel_budget:
                 return _skipped("subresource-pixel-budget-exceeded")
 
-            if range_mode == "subresource-minmax":
+            decoded_gray = None
+            if value_decode == "float32-bits":
+                from .texture_value_decode import decode_r32_uint_grayscale
+                # Read complete bytes directly inside this exact-event transaction. The legacy
+                # get_texture_data endpoint truncates its transport and cannot decode an atlas.
+                raw = ctrl.GetTextureData(resolved_resource, rd.Subresource(mip, array_slice, sample))
+                decoded_gray, decoded_display = decode_r32_uint_grayscale(
+                    raw, mip_width, mip_height, value_decode=value_decode,
+                    range_mode=range_mode, black_point=supplied_black, white_point=supplied_white)
+                display.update(decoded_display)
+                del raw
+                if decoded_gray is None:
+                    if not decoded_display["decoding"]["finiteCount"]:
+                        raise ValueError("No finite decoded texels; use visible-distribution or explicit range")
+                    return _skipped("subresource-range-flat")
+            elif range_mode in ("subresource-minmax", "visible-distribution"):
                 subresource = rd.Subresource(mip, array_slice, sample)
                 minimum, maximum = ctrl.GetMinMax(
-                    resolved_resource, subresource, rd.CompType.Typeless)
+                    resolved_resource, subresource, type_cast)
+                # PixelValue is a union. Integer UAV/SRV ranges must not be
+                # interpreted as the float bit-patterns of those values.
+                value_field = "floatValue"
+                if component_type == getattr(rd.CompType, "UInt", None):
+                    value_field = "uintValue"
+                elif component_type == getattr(rd.CompType, "SInt", None):
+                    value_field = "intValue"
+                minimum_components = getattr(minimum, value_field)
+                maximum_components = getattr(maximum, value_field)
                 minimum_values = []
                 maximum_values = []
                 for index in range(component_count):
-                    minimum_values.append(_event_texture_evidence_float(
-                        minimum.floatValue[index], "subresource minimum"))
-                    maximum_values.append(_event_texture_evidence_float(
-                        maximum.floatValue[index], "subresource maximum"))
-                    if minimum_values[index] > maximum_values[index]:
+                    if range_mode == "visible-distribution":
+                        # An HDR target can contain NaN/Inf in unused cells.
+                        # Keep their absence explicit in evidence; the finite
+                        # GPU histogram still measures the occupied content.
+                        low_value = float(minimum_components[index])
+                        high_value = float(maximum_components[index])
+                        minimum_values.append(low_value if math.isfinite(low_value) and abs(low_value) <= 1.0e30 else None)
+                        maximum_values.append(high_value if math.isfinite(high_value) and abs(high_value) <= 1.0e30 else None)
+                    else:
+                        minimum_values.append(_event_texture_evidence_float(
+                            minimum_components[index], "subresource minimum"))
+                        maximum_values.append(_event_texture_evidence_float(
+                            maximum_components[index], "subresource maximum"))
+                    if (minimum_values[index] is not None and maximum_values[index] is not None and
+                            minimum_values[index] > maximum_values[index]):
                         raise RuntimeError(
                             "subresource min/max returned an inverted component range")
                 display["subresourceMin"] = minimum_values
                 display["subresourceMax"] = maximum_values
                 selected_indices = (
-                    range(component_count)
+                    range(min(component_count, 3))
                     if channel == "rgba" else [channel_extract])
-                display["blackPoint"] = min(
-                    minimum_values[index] for index in selected_indices)
-                display["whitePoint"] = max(
-                    maximum_values[index] for index in selected_indices)
+                if range_mode == "visible-distribution":
+                    from .texture_preview_range import visible_distribution_range
+                    mask = [index in selected_indices for index in range(4)]
+                    normalized = component_type in (
+                        getattr(rd.CompType, "UNorm", "__unorm_missing__"),
+                        getattr(rd.CompType, "SNorm", "__snorm_missing__"))
+                    def histogram(lower, upper, enabled):
+                        return ctrl.GetHistogram(resolved_resource, subresource,
+                                                 type_cast, lower, upper, enabled)
+                    (display["blackPoint"], display["whitePoint"],
+                     display["distribution"]) = visible_distribution_range(
+                        histogram, minimum_values, maximum_values, mask,
+                        depth=channel == "depth", normalized=normalized)
+                else:
+                    display["blackPoint"] = min(
+                        minimum_values[index] for index in selected_indices)
+                    display["whitePoint"] = max(
+                        maximum_values[index] for index in selected_indices)
                 if channel == "depth" and (
                         display["blackPoint"] < 0.0 or
                         display["whitePoint"] > 1.0):
@@ -14722,19 +17718,27 @@ def _capture_event_texture_evidence(params):
 
             save = rd.TextureSave()
             save.resourceId = resolved_resource
-            save.typeCast = rd.CompType.Typeless
+            save.typeCast = type_cast
             save.destType = rd.FileType.PNG
             save.mip = mip
             save.slice.sliceIndex = array_slice
             save.sample.mapToArray = False
             save.sample.sampleIndex = sample
             save.channelExtract = channel_extract
+            if hasattr(rd, "AlphaMapping"):
+                save.alpha = rd.AlphaMapping.Discard
+            display["alphaMode"] = "opaque-rgb"
             save.comp.blackPoint = display["blackPoint"]
             save.comp.whitePoint = display["whitePoint"]
             try:
-                result = ctrl.SaveTexture(save, temporary_path)
-                if result.code != rd.ResultCode.Succeeded:
-                    raise RuntimeError("RenderDoc SaveTexture failed: %s" % str(result))
+                if decoded_gray is not None:
+                    _save_decoded_grayscale_evidence(
+                        temporary_path, decoded_gray, mip_width, mip_height)
+                    del decoded_gray
+                else:
+                    result = ctrl.SaveTexture(save, temporary_path)
+                    if result.code != rd.ResultCode.Succeeded:
+                        raise RuntimeError("RenderDoc SaveTexture failed: %s" % str(result))
                 if expected_session != _capture_session_id:
                     raise RuntimeError(
                         "capture session changed during texture evidence export")
@@ -14744,12 +17748,19 @@ def _capture_event_texture_evidence(params):
                     raise RuntimeError(
                         "RenderDoc texture evidence output was redirected")
                 temporary_size = temporary_info.st_size
-                if temporary_size > MAX_EVENT_TEXTURE_EVIDENCE_PNG_BYTES:
+                # A target too large even to open safely is refused before Qt sees it.
+                if temporary_size > MAX_EVENT_TEXTURE_EVIDENCE_PNG_BYTES * 8:
                     return _skipped("png-byte-budget-exceeded")
                 with open(temporary_path, "rb") as stream:
                     if stream.read(8) != b"\x89PNG\r\n\x1a\n":
                         raise RuntimeError(
                             "RenderDoc did not produce a valid PNG evidence file")
+                reduction = _reduce_saved_image(
+                    temporary_path, crop, max_dimension, opaque_rgb=True, flip_y=flip_y)
+                if reduction is not None:
+                    temporary_size = os.lstat(temporary_path).st_size
+                if temporary_size > MAX_EVENT_TEXTURE_EVIDENCE_PNG_BYTES:
+                    return _skipped("png-byte-budget-exceeded")
                 png_size, png_sha256 = _event_texture_evidence_hash(
                     temporary_path, MAX_EVENT_TEXTURE_EVIDENCE_PNG_BYTES)
                 # A hard-link publication is atomic and fails if the final
@@ -14780,17 +17791,20 @@ def _capture_event_texture_evidence(params):
                     "byteSize": final_size,
                     "sha256": final_sha256,
                     "noOverwrite": True,
+                    "reduction": reduction,
                 },
             }
 
         artifact = None
         try:
-            _set_frame_event(ctrl, event_id, True)
+            if _controller is None:
+                _set_frame_event(ctrl, event_id, True)
             artifact = _capture_at_event()
         finally:
             # Restoration failure is deliberately not swallowed. Returning an
             # evidence receipt without proving restoration would be unsafe.
-            _set_frame_event(ctrl, original_event, True)
+            if _controller is None:
+                _set_frame_event(ctrl, original_event, True)
         if expected_session != _capture_session_id:
             raise RuntimeError(
                 "capture session changed before texture evidence receipt")
@@ -14802,7 +17816,7 @@ def _capture_event_texture_evidence(params):
             "eventId": event_id,
             "restoration": {
                 "originalEventId": original_event,
-                "restored": True,
+                "restored": _controller is None,
             },
             "exactEventBinding": True,
             "replayMutation": False,
@@ -14810,7 +17824,9 @@ def _capture_event_texture_evidence(params):
             "artifact": artifact,
         }
 
-    return _replay(_do)
+    # The private batch path already owns the replay callback and restores once
+    # after all channels. It never consults Qt objects from a worker thread.
+    return _do(_controller) if _controller is not None else _replay(_do)
 
 
 def _compare_shader_organization_candidates(params):
@@ -14818,75 +17834,276 @@ def _compare_shader_organization_candidates(params):
     return compare_candidates(sys.modules[__name__], params)
 
 
+def _read_shader_workspace_source(params):
+    """Read an explicitly attached editor revision, including historical unsaved text."""
+    from .shader_source_references import REFERENCES
+
+    def read():
+        return REFERENCES.read(
+            params.get("workspace_id"), params.get("capture_session_id"),
+            params.get("source_sha256"), params.get("start_line", 1),
+            params.get("end_line", 0), params.get("offset", 0), params.get("limit", 12000),
+            current_capture_session=str(_capture_session_id or ""))
+    return _invoke_on_ui_sync(read)
+
+
 def _get_shader_workspace_ui_state(params):
-    """Read the actual native editor state without returning its source text."""
+    """Read actual tree/editor state without returning shader source text.
+
+    A running live-edit session and a replay replacement do not prove that the
+    editor projection accepted the source. Report the native tree separately
+    so a delivery receipt can distinguish those effects.
+    """
     def read():
         panel = _shader_workspace_ui
         if panel is None:
-            return {"present": False, "documents": []}
+            return {"present": False, "documents": [], "workspaces": [],
+                    "workspaceTreeCount": 0, "selectedShader": None}
         documents = []
         for key, document in panel._documents.items():
             editor = document.get("editor")
             text = panel._document_source_text(document) if editor is not None else ""
+            flow_key = getattr(panel, "_source_flow_key", None)
+            outline_current = bool(callable(flow_key) and
+                document.get("sourceFlowKey") == flow_key(document) and
+                document.get("sourceFlowState") == "available")
+            flow_request = getattr(panel, "_flow_request", None) or {}
+            outline_pending = bool(flow_request.get("workspaceId") == key and
+                callable(flow_key) and flow_request.get("key") == flow_key(document))
             documents.append({"workspaceId": key,
+                "sourceWorkspaceId": (document.get("workspace") or {}).get("sourceWorkspaceId", key),
                 "documentKind": document.get("documentKind"),
                 "sourcePath": document.get("sourcePath"),
                 "readOnly": bool(editor.IsReadOnly()) if editor is not None else True,
+                "available": document.get("available") is True,
+                "openInTab": panel._tab_index(key) >= 0,
                 "dirty": bool(document.get("dirty")),
+                "stageOutlineState": dict(document.get("stageOutlineState") or {}),
+                "stageOutlineSourceSha256": str(document.get("stageOutlineSourceSha256") or ""),
+                "stageOutlineOverviewSha256": str(document.get("stageOutlineOverviewSha256") or ""),
+                "stageOutlineStageIds": [str(row.get("semanticId") or row.get("id") or "")
+                    for row in document.get("stageOutline", [])],
+                "stageOutlineCurrent": outline_current,
+                "stageOutlinePending": outline_pending,
+                # Exact bytes loaded from disk can differ from the editor's
+                # normalized save text for mixed CRLF/LF files. Preserve both
+                # observations so delivery checks do not report a false edit.
+                "loadedSourceSha256": str(document.get("rawSha256") or ""),
                 "sourceSha256": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+        workspaces = []
+        selected_workspace_id = panel._current_workspace_id()
+        for key, workspace in panel._workspaces.items():
+            if not isinstance(workspace, dict):
+                continue
+            tree_item = panel._tree_items.get(key)
+            visible_in_tree = bool(
+                tree_item is not None and
+                tree_item.treeWidget() is panel.file_tree)
+            workspaces.append({
+                "workspaceId": key,
+                "sourceWorkspaceId": workspace.get("sourceWorkspaceId", key),
+                "workspacePath": workspace.get("workspacePath"),
+                "captureId": workspace.get("captureId"),
+                "captureApi": workspace.get("captureApi"),
+                "stage": workspace.get("stage"),
+                "entryPoint": workspace.get("entryPoint"),
+                "resourceId": workspace.get("resourceId"),
+                "shaderRawSha256": workspace.get("shaderRawSha256"),
+                "logicalShaderId": workspace.get("logicalShaderId") or
+                    _shader_console_protocol.logical_shader_document_id(workspace),
+                "eventIds": list(panel._workspace_event_ids.get(key, ())),
+                "projectSourceIdentity": workspace.get("projectSourceIdentity"),
+                "projectSourceBinding": workspace.get("projectSourceBinding"),
+                "retainedWorkingCopy": workspace.get("retainedWorkingCopy") is True,
+                "sourcePath": workspace.get("sourcePath"),
+                "documentKind": workspace.get("documentKind", "shader"),
+                "editorEligible": workspace.get("editorEligible") is True,
+                "autoApplyReady": workspace.get("autoApplyReady") is True,
+                "visibleInWorkspaceTree": visible_in_tree,
+                "openInTab": panel._tab_index(key) >= 0,
+            })
+        selected_shader = next(
+            (workspace for workspace in workspaces
+             if workspace["workspaceId"] == selected_workspace_id), None)
         return {"present": True, "visible": bool(panel.top.isVisible()),
-                "selectedWorkspaceId": panel._current_workspace_id(),
-                "documents": documents}
+                "captureBinding": getattr(panel, "_capture_binding", None),
+                "snapshotInFlight": bool(getattr(panel, "_snapshot_running", False)),
+                "pendingWorkspaceIds": list(getattr(panel, "_pending_open", {})),
+                "sourceReadErrors": dict(getattr(panel, "_source_open_errors", {})),
+                "sourceDiscoveryError": getattr(panel, "_source_discovery_error", ""),
+                "selectedWorkspaceId": selected_workspace_id,
+                "selectedShader": selected_shader,
+                "workspaceTreeCount": sum(1 for workspace in workspaces
+                                          if workspace["visibleInWorkspaceTree"]),
+                "workspaces": workspaces, "documents": documents}
     return _invoke_on_ui_sync(read)
 
 
-def _get_shader_cbuffer_alias_identity(params):
-    """Read original reflected display identities, separate from physical ABI."""
-    from .cbuffer_alias_identity import reflection_alias_blocks
-    capture_id = _require_capture_identity(params.get("expected_capture_id"))
-    session = params.get("expected_capture_session_id")
-    if not session or session != _capture_session_id:
-        raise ValueError("capture session changed before CBuffer alias lookup")
-    events = _shader_override_events(params)
-    if len(events) != 1:
-        raise ValueError("CBuffer aliases require one bound event")
-    event = events[0]
-    stage_name = _normalise_stage_name(params.get("stage"))
-    stage = dict(_available_shader_stages([stage_name])).get(stage_name)
-    if stage is None:
-        raise ValueError("unsupported CBuffer shader stage")
-    entry = str(params.get("entry_point", ""))
-    rid = event["expectedOriginalResourceId"]
-    existing = _shared_shader_replacements.get(rid)
-    if existing is not None and (
-            existing.get("captureId") != capture_id or
-            existing.get("captureSessionId") != session):
-        raise ValueError("CBuffer alias replacement belongs to a different capture session")
-    if any(r.get("expectedOriginalResourceId") == rid for r in _event_shader_overrides.values()):
-        raise ValueError("CBuffer aliases require captured-original reflection")
-    original = existing.get("originalResource") if existing else _invoke_on_ui_sync(lambda: _context_resource_ids().get(rid))
-    if original is None:
-        raise ValueError("captured Shader is unavailable")
-    _require_shared_shader_ui_owner(original, existing)
-    visible_event = _request_visible_event_id(0)
+def _show_shader_organization_preview(params):
+    """Display exact saved Source or one separately verified proposal preview."""
+    activate_window = params.get("activate_window", True)
+    if type(activate_window) is not bool:
+        raise ValueError("Shader window activation must be a boolean")
+    canonical_source = params.get("canonical_source") is True
+    capture_id = ("" if canonical_source else
+                  _require_capture_identity(params.get("expected_capture_id")))
+    expected_session = _shader_override_hex(
+        params.get("expected_capture_session_id"),
+        "expected_capture_session_id", 32)
+    organization_id = ("" if canonical_source else _shader_override_hex(
+        params.get("organization_id"), "organization_id", 32))
+    source_sha256 = _shader_override_hex(
+        params.get("expected_source_sha256"),
+        "expected_source_sha256", 64)
+    if expected_session != str(_capture_session_id or "").lower():
+        raise RuntimeError("Capture session changed before organization preview")
+    identity = _request_admitted_capture_identity()
+    binding = (_shader_console_protocol.normalize_capture_binding({
+                "instanceId": INSTANCE_ID, "captureSessionId": identity["captureSessionId"],
+                "capturePath": identity["path"]}) if identity is not None and identity["loaded"] else
+               _invoke_on_ui_sync(_shader_workspace_capture_binding))
+    if (not isinstance(binding, dict) or
+            binding.get("captureSessionId") != expected_session):
+        raise RuntimeError("Organization preview has no current capture binding")
+    if canonical_source:
+        opened = _shader_console_protocol.load_saved_shader_source_preview(
+            params.get("workspace_path"), source_sha256, capture_binding=binding)
+    else:
+        opened = _shader_console_protocol.load_verified_organization_preview(
+            params.get("workspace_path"), organization_id, source_sha256,
+            capture_binding=binding)
+    if params.get("project_source_binding") is not None:
+        opened = _shader_console_protocol.bind_project_shader_source_display(
+            opened, params["project_source_binding"])
+    if ((not canonical_source and opened.get("captureId") != capture_id) or
+            opened.get("captureBinding") != binding or
+            opened.get("organizationId") != organization_id or
+            opened.get("rawSha256") != source_sha256):
+        raise RuntimeError("Organization preview returned a different identity")
 
-    def run(ctrl):
-        try:
-            live = _validate_live_shader_event(ctrl, event, stage, stage_name, entry,
-                require_d3d11_state=(_shader_api_token(ctrl) == "d3d11"), owned_shared_replacement=existing)
-            blocks = reflection_alias_blocks(live["reflection"], _shader_constant_fields,
-                                             _constant_field_annotations_are_complete)
-            if session != _capture_session_id:
-                raise RuntimeError("capture changed during CBuffer alias lookup")
-            return {"schema": "replaylab-cbuffer-alias-identity/v1",
-                    "captureId": capture_id, "captureSessionId": session,
-                    "eventId": event["eventId"], "stage": stage_name,
-                    "entryPoint": entry,
-                    "shaderResourceId": rid, "rawSha256": event["expectedOriginalSha256"],
-                    "blocks": blocks}
-        finally:
-            _set_frame_event(ctrl, visible_event, True)
-    return _replay(run)
+    def show():
+        global _shader_workspace_ui
+        if (expected_session != _capture_session_id or
+                binding != _shader_workspace_capture_binding()):
+            raise RuntimeError(
+                "Capture session changed while organization preview was loading")
+        if _shader_workspace_ui is None:
+            for callback in list(_shader_workspace_callbacks):
+                callback(activate_window=activate_window)
+                if _shader_workspace_ui is not None:
+                    break
+        panel = _shader_workspace_ui
+        if panel is None:
+            raise RuntimeError("Shader Workspace panel is unavailable")
+        if getattr(panel, "_capture_binding", None) != binding:
+            panel.capture_changed(binding)
+        shown = panel.show_organization_preview(opened)
+        redirected = isinstance(shown, dict) and bool(shown.get("redirectedFromWorkspaceId"))
+        if redirected:
+            # A saved recovery file can resolve to the current authoring document.
+            # Read its actual identity on Qt; never attach the older file's source
+            # hash or project display binding to newer (possibly unsaved) text.
+            requested_id = opened["sourceWorkspaceId"]
+            displayed_id = shown.get("workspaceId")
+            document = panel._documents.get(displayed_id) or {}
+            workspace = panel._workspaces.get(displayed_id) or {}
+            if (not canonical_source or opened.get("canonicalSourceUpdated") is not True or
+                    shown.get("redirectedFromWorkspaceId") != requested_id or
+                    displayed_id == requested_id or
+                    panel._canonical_workspace_id(requested_id) != displayed_id or
+                    document.get("available") is not True or
+                    document.get("captureBinding") != binding or
+                    panel._capture_binding != binding or
+                    any(workspace.get(key) != opened.get(key) or not opened.get(key)
+                        for key in ("resourceId", "shaderRawSha256", "stage", "entryPoint")) or
+                    not _shader_console_protocol._same_path(
+                        workspace.get("capturePath", ""), binding["capturePath"])):
+                raise RuntimeError("Shader Workspace returned an invalid current-source redirect")
+            actual_text = panel._document_source_text(document)
+            actual_sha = hashlib.sha256(actual_text.encode("utf-8")).hexdigest()
+            actual_source_id = str(document.get("sourceWorkspaceId") or displayed_id)
+            actual_path = str(document.get("sourcePath") or "")
+            if (shown.get("displayedSourceSha256") != actual_sha or
+                    shown.get("displayedSourceWorkspaceId") != actual_source_id or
+                    shown.get("displayedSourcePath") != actual_path or
+                    shown.get("readOnly") is not bool(document["editor"].IsReadOnly())):
+                raise RuntimeError("Shader Workspace current-source text changed during display")
+            shown = dict(shown, displayedSource={
+                "workspaceId": displayed_id, "sourceWorkspaceId": actual_source_id,
+                "sourceSha256": actual_sha, "sourcePath": actual_path,
+                "workspacePath": workspace.get("workspacePath"),
+                "captureId": workspace.get("captureId"),
+                "eventIds": list(panel._workspace_event_ids.get(displayed_id, ())),
+                "projectSourceIdentity": workspace.get("projectSourceIdentity"),
+                "projectSourceBinding": workspace.get("projectSourceBinding"),
+                "dirty": document.get("dirty") is True,
+            })
+        if (not isinstance(shown, dict) or shown.get("shown") is not True or
+                (shown.get("workspaceId") not in (opened["workspaceId"], opened["sourceWorkspaceId"]) and
+                 not redirected and
+                 (not opened.get("projectSourceIdentity") or
+                  shown.get("canonicalProjectSourceReused") != opened.get("projectSourceIdentity"))) or
+                type(shown.get("readOnly")) is not bool):
+            raise RuntimeError("Shader Workspace rejected organization preview")
+        if activate_window:
+            panel.show()
+        return shown
+
+    displayed = _invoke_on_ui_sync(show)
+    result = {
+        "schema": "replaylab-shader-organization-preview-display/v1",
+        "schemaVersion": 1,
+        "shown": True,
+        "selected": True,
+        "readOnly": displayed["readOnly"],
+        "documentKind": displayed["documentKind"],
+        "workspaceId": displayed["workspaceId"],
+        "previewWorkspaceId": opened["workspaceId"],
+        "canonicalWorkspaceReused": displayed.get("canonicalWorkspaceReused") is True,
+        "sourceWorkspaceId": opened["sourceWorkspaceId"],
+        "organizationId": organization_id,
+        "captureId": capture_id,
+        "sourceCaptureId": opened.get("sourceCaptureId", opened.get("captureId")),
+        "sourceKind": "saved-source" if canonical_source else "organization-preview",
+        "captureSessionId": expected_session,
+        "sourceSha256": source_sha256,
+        "eventIds": list(opened.get("eventIds") or []),
+        "projectSourceIdentity": opened.get("projectSourceIdentity"),
+        "projectSourceBinding": opened.get("projectSourceBinding"),
+        "canonicalSourceUpdated": opened.get("canonicalSourceUpdated") is True,
+        "liveEditStarted": False,
+        "replayApplied": False,
+    }
+    if displayed.get("redirectedFromWorkspaceId") and displayed.get("displayedSource"):
+        actual = displayed["displayedSource"]
+        result.update(
+            redirectedToCurrentSource=True,
+            requestedSource={
+                "workspaceId": opened["sourceWorkspaceId"], "sourceSha256": source_sha256,
+                "sourcePath": opened.get("sourcePath"), "workspacePath": opened.get("workspacePath"),
+                "projectSourceIdentity": opened.get("projectSourceIdentity"),
+                "projectSourceBinding": opened.get("projectSourceBinding"),
+            },
+            displayedSource=actual,
+            sourceWorkspaceId=actual["sourceWorkspaceId"],
+            sourceSha256=actual["sourceSha256"], sourceCaptureId=actual.get("captureId"),
+            sourceWorkspacePath=actual.get("workspacePath"),
+            eventIds=actual["eventIds"], projectSourceIdentity=actual["projectSourceIdentity"],
+            projectSourceBinding=actual["projectSourceBinding"],
+        )
+    return result
+
+
+def _get_shader_cbuffer_alias_identity(params):
+    """Read exact original/current CBuffer layouts without replay or ABI checks."""
+    from .cbuffer_display_reflection import read_alias_identity
+    return read_alias_identity(sys.modules[__name__], params)
+
+
+def _get_shader_cbuffer_display_identity(params):
+    """Read the loaded panel identity without replaying or selecting an EID."""
+    from .cbuffer_display_reflection import read_display_identity
+    return read_display_identity(sys.modules[__name__], params)
 
 
 def _fingerprint_event_outputs(params):
@@ -15598,6 +18815,218 @@ def _analyze_pixel(params):
     return _replay(_do)
 
 
+def _debug_variable_snapshot(variable, depth=0, budget=None, member_limit=16, max_depth=4):
+    """Serialize actual debug values, never source-variable mapping metadata."""
+    if budget is None:
+        budget = [64]
+    budget[0] -= 1
+    type_value = getattr(variable, "type", None)
+    type_name = str(type_value).rsplit(".", 1)[-1]
+    storage = {"Float": "f32v", "Double": "f64v", "Half": "u16v",
+               "SInt": "s32v", "UInt": "u32v", "SShort": "s16v",
+               "UShort": "u16v", "SLong": "s64v", "ULong": "u64v",
+               "SByte": "s8v", "UByte": "u8v", "Bool": "u32v"}
+    enum_type = getattr(rd, "VarType", None)
+    for name in storage:
+        if enum_type is not None and type_value == getattr(enum_type, name, object()):
+            type_name = name
+            break
+    rows = max(0, _safe_int(getattr(variable, "rows", 0), 0))
+    columns = max(0, _safe_int(getattr(variable, "columns", 0), 0))
+    result = {"name": str(getattr(variable, "name", "")), "type": type_name,
+              "rows": rows, "columns": columns, "valueAvailable": False}
+    members = getattr(variable, "members", ())
+    if members:
+        result["membersTruncated"] = depth >= max_depth or len(members) > member_limit
+        if depth < max_depth:
+            result["members"] = [_debug_variable_snapshot(
+                member, depth + 1, budget, member_limit, max_depth)
+                for member in members[:member_limit] if budget[0] > 0]
+            result["membersTruncated"] = len(result["members"]) < len(members)
+        return result
+    values = getattr(getattr(variable, "value", None), storage.get(type_name, ""), None)
+    if values is None or not rows or not columns:
+        return result
+    count = min(rows * columns, 16)
+    if type_name == "Half":
+        values = [struct.unpack("<e", struct.pack("<H", int(value)))[0]
+                  for value in values[:count]]
+    if type_name in ("Float", "Double", "Half"):
+        values, non_finite = _strict_float_vector(values, count)
+        if non_finite:
+            result["nonFinite"] = non_finite
+    else:
+        values = [int(value) for value in values[:count]]
+    result.update({"valueAvailable": True, "value": list(values)})
+    return result
+
+
+_SHADER_DEBUG_TRACE_MAX_BYTES = 32 * 1024 * 1024
+_SHADER_DEBUG_TRACE_MAX_STEPS = 50000
+_SHADER_DEBUG_TRACE_LIFETIME = 24 * 60 * 60
+_SHADER_DEBUG_TRACE_RETAINED = 16
+
+
+def _shader_debug_trace_root():
+    """Per-user diagnostic artifacts, independent of the short-lived IPC response mailbox."""
+    root = os.path.join(_replaylab_local_root, "ReplayLab", "shader-debug-traces")
+    candidate = os.path.abspath(root)
+    while candidate:
+        if os.path.lexists(candidate):
+            info = os.lstat(candidate)
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise RuntimeError("Shader debug evidence directory is redirected")
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            break
+        candidate = parent
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    entries = []
+    now = time.time()
+    for name in os.listdir(root):
+        if not re.match(r"^[0-9]+-[a-f0-9]{32}-[a-f0-9]{32}\.jsonl$", name):
+            continue
+        path = os.path.join(root, name)
+        try:
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                continue
+            entries.append((info.st_mtime, path))
+        except OSError:
+            continue
+    entries.sort(reverse=True)
+    for index, (modified, path) in enumerate(entries):
+        if index >= _SHADER_DEBUG_TRACE_RETAINED - 1 or now - modified > _SHADER_DEBUG_TRACE_LIFETIME:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    return root
+
+
+def _debug_snapshot_truncated(value):
+    if isinstance(value, dict):
+        return bool(value.get("membersTruncated") or value.get("changesTruncated") or
+                    value.get("callstackTruncated") or
+                    any(_debug_snapshot_truncated(child) for child in value.values()))
+    if isinstance(value, list):
+        return any(_debug_snapshot_truncated(child) for child in value)
+    return False
+
+
+def _collect_shader_debug_states(ctrl, trace, invocation=None):
+    """Persist late debug values once; the inline preview remains deliberately small."""
+    root = _shader_debug_trace_root()
+    path = os.path.join(root, "%s-%s.jsonl" % (INSTANCE_ID, uuid.uuid4().hex))
+    partial = path + ".part"
+    states, index = [], []
+    count, byte_count, summary_offset, last_step_offset = 0, 0, 0, 0
+    truncation_reasons = set()
+    stopped = False
+    digest = hashlib.sha256()
+    fd = os.open(partial, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            def write(record):
+                nonlocal byte_count
+                encoded = (json.dumps(record, ensure_ascii=False, separators=(",", ":"),
+                                      allow_nan=False) + "\n").encode("utf-8")
+                # Keep room for the compact final completion record.
+                if byte_count + len(encoded) > _SHADER_DEBUG_TRACE_MAX_BYTES - 4096:
+                    return False
+                stream.write(encoded)
+                digest.update(encoded)
+                byte_count += len(encoded)
+                return True
+
+            header = {"record": "header", "schema": "bread-shader-debug-trace/v1",
+                      "createdUnixMs": int(time.time() * 1000),
+                      "captureSessionId": str(_capture_session_id or ""),
+                      "invocation": dict(invocation or {}),
+                      "variableRepresentation": "debug-variable-changes"}
+            write(header)
+            batch = ctrl.ContinueDebug(trace.debugger)
+            while batch and not stopped:
+                _background_replay_checkpoint()
+                for state in batch:
+                    if count and count % 128 == 0:
+                        _background_replay_checkpoint()
+                    if count >= _SHADER_DEBUG_TRACE_MAX_STEPS:
+                        truncation_reasons.add("step-limit")
+                        stopped = True
+                        break
+                    changes = getattr(state, "changes", ())
+                    entries, budget = [], [4096]
+                    for change in changes[:1024]:
+                        if budget[0] < 2:
+                            break
+                        entries.append({
+                            "before": _debug_variable_snapshot(change.before, budget=budget,
+                                                               member_limit=256, max_depth=8),
+                            "after": _debug_variable_snapshot(change.after, budget=budget,
+                                                              member_limit=256, max_depth=8)})
+                    callstack = getattr(state, "callstack", ())
+                    record = {"record": "step", "ordinal": count,
+                              "step": state.stepIndex, "nextInstruction": state.nextInstruction,
+                              "flags": str(getattr(state, "flags", "")),
+                              "callstack": [str(name) for name in callstack[:256]],
+                              "callstackTruncated": len(callstack) > 256,
+                              "changes": entries, "changesTruncated": len(changes) > len(entries)}
+                    offset = byte_count
+                    if not write(record):
+                        truncation_reasons.add("byte-limit")
+                        stopped = True
+                        break
+                    last_step_offset = offset
+                    if count % 128 == 0:
+                        index.append({"ordinal": count, "step": state.stepIndex, "offset": offset})
+                    count += 1
+                    if _debug_snapshot_truncated(record):
+                        truncation_reasons.add("variable-detail-limit")
+                    if len(states) < 50:
+                        preview_entries = [
+                            {"before": _debug_variable_snapshot(change.before),
+                             "after": _debug_variable_snapshot(change.after)}
+                            for change in changes[:10]]
+                        preview = dict(record)
+                        preview.update(changes=preview_entries, changesTruncated=len(changes) > 10,
+                                       callstack=record["callstack"][:16],
+                                       vars=[entry["after"] for entry in preview_entries])
+                        states.append(preview)
+                if not stopped:
+                    batch = ctrl.ContinueDebug(trace.debugger)
+            summary_offset = byte_count
+            summary = {"record": "summary", "steps": count, "executionComplete": not stopped,
+                       "complete": not truncation_reasons,
+                       "truncationReasons": sorted(truncation_reasons)}
+            # The reserved footer fits even if a state reached the byte ceiling.
+            encoded = (json.dumps(summary, separators=(",", ":")) + "\n").encode("utf-8")
+            stream.write(encoded)
+            digest.update(encoded)
+            byte_count += len(encoded)
+        os.replace(partial, path)
+    finally:
+        if os.path.exists(partial):
+            try:
+                os.unlink(partial)
+            except OSError:
+                pass
+    artifact = {
+        "schema": "bread-shader-debug-trace/v1", "path": path,
+        "format": "jsonl", "byteSize": byte_count, "sha256": digest.hexdigest(),
+        "steps": count, "complete": not truncation_reasons, "executionComplete": not stopped,
+        "truncationReasons": sorted(truncation_reasons),
+        "stepIndex": index, "lastStepOffset": last_step_offset, "summaryOffset": summary_offset,
+        "maxBytes": _SHADER_DEBUG_TRACE_MAX_BYTES, "maxSteps": _SHADER_DEBUG_TRACE_MAX_STEPS,
+        "retentionSeconds": _SHADER_DEBUG_TRACE_LIFETIME,
+        "readTool": "read_evidence_file",
+        "readHint": "Use stepIndex.offset to read a later JSONL page without rerunning debug.",
+    }
+    return {"steps": count, "trace": states, "traceTruncated": count > len(states) or stopped,
+            "executionComplete": not stopped, "traceArtifact": artifact,
+            "variableRepresentation": "debug-variable-changes"}
+
+
 def _debug_pixel(params):
     """Debug pixel shader execution."""
     x = params.get("x", 0)
@@ -15631,33 +19060,20 @@ def _debug_pixel(params):
                     "x": x, "y": y, "sample": sample,
                     "primitiveId": primitive_id, "view": view,
                 }
-            states = []
-            batch = ctrl.ContinueDebug(trace.debugger)
-            while batch:
-                _background_replay_checkpoint()
-                for state in batch:
-                    step = {"step": state.stepIndex}
-                    if state.sourceVars:
-                        step["vars"] = [
-                            {"name": variable.name, "val": str(variable.value)}
-                            for variable in state.sourceVars[:10]
-                        ]
-                    states.append(step)
-                batch = ctrl.ContinueDebug(trace.debugger)
-            return {
+            result = {
                 "eventId": event_id if event_id > 0 else original_event,
                 "x": x, "y": y, "sample": sample,
                 "primitiveId": primitive_id, "view": view,
-                "steps": len(states), "trace": states[:50],
             }
+            result.update(_collect_shader_debug_states(ctrl, trace, dict(result, kind="pixel")))
+            return result
         finally:
             if trace:
                 try:
                     ctrl.FreeTrace(trace)
                 except Exception:
                     pass
-            if changed_event:
-                _set_frame_event(ctrl, original_event, True)
+            _set_frame_event(ctrl, original_event, True)
 
     return _replay(_do)
 
@@ -15666,23 +19082,23 @@ def _debug_vertex(params):
     """Debug vertex shader execution."""
     vertex_id = params.get("vertex_id", 0)
     instance_id = params.get("instance_id", 0)
+    original_event = _request_visible_event_id(0)
 
     def _do(ctrl):
-        trace = ctrl.DebugVertex(vertex_id, instance_id, 0, 0)
-        if not trace or not trace.debugger:
-            return {"error": "No debug trace for this vertex"}
-        states = []
-        batch = ctrl.ContinueDebug(trace.debugger)
-        while batch:
-            _background_replay_checkpoint()
-            for s in batch:
-                step = {"step": s.stepIndex}
-                if s.sourceVars:
-                    step["vars"] = [{"name": v.name, "val": str(v.value)} for v in s.sourceVars[:10]]
-                states.append(step)
-            batch = ctrl.ContinueDebug(trace.debugger)
-        ctrl.FreeTrace(trace)
-        return {"vertexId": vertex_id, "steps": len(states), "trace": states[:50]}
+        trace = None
+        try:
+            trace = ctrl.DebugVertex(vertex_id, instance_id, 0, 0)
+            if not trace or not trace.debugger:
+                return {"error": "No debug trace for this vertex"}
+            result = {"vertexId": vertex_id, "instanceId": instance_id, "eventId": original_event}
+            result.update(_collect_shader_debug_states(ctrl, trace, dict(result, kind="vertex")))
+            return result
+        finally:
+            try:
+                if trace:
+                    ctrl.FreeTrace(trace)
+            finally:
+                _set_frame_event(ctrl, original_event, True)
 
     return _replay(_do)
 
@@ -15860,11 +19276,73 @@ def _get_action_timings(params):
 
 
 def _get_post_vs_data(params):
-    """Get post-VS mesh data."""
+    """Read bounded post-transform positions at one exact EID and restore replay."""
+    from .mesh_evidence import bounded_integer, read_mesh
+
+    original_event = _request_visible_event_id()
+    event_id = params.get("event_id", 0)
+    bounded_integer(event_id, "event_id", 0, 0xffffffff)
+    event_id = event_id or original_event
+    bounded_integer(event_id, "event_id", 1, 0xffffffff)
+    instance = bounded_integer(params.get("instance", 0), "instance", 0, 0xffffffff)
+    view = bounded_integer(params.get("view", 0), "view", 0, 2047)
+    max_vertices = bounded_integer(params.get("max_vertices", 4096), "max_vertices", 1, 16384)
+    max_indices = bounded_integer(params.get("max_indices", 12288), "max_indices", 1, 49152)
+    stage_name = params.get("stage", "vs-out")
+    if stage_name not in ("vs-out", "gs-out"):
+        raise ValueError("stage must be vs-out or gs-out")
+
     def _do(ctrl):
-        mesh = ctrl.GetPostVSData(0, 0, rd.MeshDataStage.VSOut)
-        return {"numIndices": mesh.numIndices, "topology": str(mesh.topology),
-                "indexStride": mesh.indexByteStride, "vertexStride": mesh.vertexByteStride}
+        try:
+            _set_frame_event(ctrl, event_id, True)
+            action = _find_action_by_event(ctrl.GetRootActions(), event_id)
+            if action is None or not int(action.flags) & (0x0002 | 0x0008):
+                raise ValueError("The event is not a captured geometry draw")
+            instances = int(action.numInstances)
+            if int(action.flags) & 0x0002 and (instances <= 0 or instance >= instances):
+                raise ValueError("The requested draw instance is unavailable or unresolved")
+            if int(action.flags) & 0x0008 and instance:
+                raise ValueError("Mesh dispatch geometry does not select a draw instance")
+            pipeline = ctrl.GetPipelineState()
+            try:
+                view_count = max(1, int(pipeline.MultiviewBroadcastCount()))
+            except Exception:
+                view_count = 1
+            if view >= view_count:
+                raise ValueError("The requested geometry view is not available in this pipeline")
+            mesh = ctrl.GetPostVSData(instance, view, rd.MeshDataStage.VSOut if stage_name == "vs-out"
+                                      else rd.MeshDataStage.GSOut)
+            _require_healthy_replay(ctrl)
+            result = read_mesh(ctrl, mesh, max_vertices, max_indices)
+            _require_healthy_replay(ctrl)
+            final_positions = stage_name == "gs-out"
+            if stage_name == "vs-out":
+                try:
+                    final_positions = not any(int(pipeline.GetShader(getattr(rd.ShaderStage, name)))
+                                              for name in ("Hull", "Domain", "Geometry", "Mesh")
+                                              if hasattr(rd.ShaderStage, name))
+                except Exception:
+                    final_positions = False
+            result.update({"schema": "bread-mesh-evidence/v1", "eventId": event_id,
+                           "captureSessionId": _request_capture_session_id(),
+                           "instance": instance, "view": view, "stage": stage_name,
+                           "viewCount": view_count,
+                           "instanceCount": instances,
+                           "allInstances": instances == 1,
+                           "finalPositionStage": final_positions,
+                           "rasterCoverageVerified": False})
+            if instances > 1:
+                result["limitations"].append("selected-instance-only")
+            try:
+                viewport = pipeline.GetViewport(0)
+                result["viewport"] = {name: _finite_pipeline_number(getattr(viewport, name, None))
+                                      for name in ("x", "y", "width", "height")}
+            except Exception:
+                result["viewport"] = None
+            return result
+        finally:
+            if original_event != event_id:
+                _set_frame_event(ctrl, original_event, True, allow_background_preemption=False)
     return _replay(_do)
 
 
@@ -15895,7 +19373,7 @@ def _reject_duplicate_json_object(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError("ReplayLab RDC project index contains a duplicate JSON key")
+            raise ValueError("Bread RDC project index contains a duplicate JSON key")
         result[key] = value
     return result
 
@@ -15908,32 +19386,32 @@ def _canonical_project_index_bytes(document):
 
 def _reject_project_index_json_constant(value):
     raise ValueError(
-        "ReplayLab RDC project index contains a non-finite number: %s" % value)
+        "Bread RDC project index contains a non-finite number: %s" % value)
 
 
 def _validated_project_index_document(value):
     """Validate the small sealed envelope; the Host validates every record."""
 
     if not isinstance(value, dict):
-        raise ValueError("ReplayLab RDC project index must be a JSON object")
+        raise ValueError("Bread RDC project index must be a JSON object")
     version = value.get("schemaVersion")
     if (not isinstance(version, int) or isinstance(version, bool) or
             version not in REPLAYLAB_RDC_PROJECT_INDEX_SCHEMAS):
-        raise ValueError("ReplayLab RDC project index has an unsupported version")
+        raise ValueError("Bread RDC project index has an unsupported version")
     if value.get("schema") != REPLAYLAB_RDC_PROJECT_INDEX_SCHEMAS[version]:
-        raise ValueError("ReplayLab RDC project index has an unsupported schema")
+        raise ValueError("Bread RDC project index has an unsupported schema")
     bindings = value.get("bindings")
     if not isinstance(bindings, list) or len(bindings) > 4096:
-        raise ValueError("ReplayLab RDC project index bindings are invalid")
+        raise ValueError("Bread RDC project index bindings are invalid")
     seal = str(value.get("sealSha256", "") or "").lower()
     if (len(seal) != 64 or
             any(character not in "0123456789abcdef" for character in seal)):
-        raise ValueError("ReplayLab RDC project index seal is invalid")
+        raise ValueError("Bread RDC project index seal is invalid")
     unsigned = dict(value)
     unsigned.pop("sealSha256", None)
     expected = hashlib.sha256(_canonical_project_index_bytes(unsigned)).hexdigest()
     if seal != expected:
-        raise ValueError("ReplayLab RDC project index seal does not match its content")
+        raise ValueError("Bread RDC project index seal does not match its content")
     return value
 
 
@@ -15957,14 +19435,14 @@ def _require_project_index_capture(params):
 def _project_index_section(access):
     count = int(access.GetSectionCount())
     if count < 0 or count > MAX_CAPTURE_SECTION_COUNT:
-        raise RuntimeError("The RDC section table exceeds ReplayLab's safety bound")
+        raise RuntimeError("The RDC section table exceeds Bread's safety bound")
     matches = []
     for index in range(count):
         props = access.GetSectionProperties(index)
         if str(getattr(props, "name", "") or "") == REPLAYLAB_RDC_PROJECT_INDEX_SECTION:
             matches.append((index, props))
     if len(matches) > 1:
-        raise RuntimeError("The RDC contains duplicate ReplayLab project-index sections")
+        raise RuntimeError("The RDC contains duplicate Bread project-index sections")
     return matches[0] if matches else (None, None)
 
 
@@ -15980,26 +19458,26 @@ def _read_project_index_from_access(access):
         }
     section_version = int(getattr(props, "version", 0))
     if section_version not in REPLAYLAB_RDC_PROJECT_INDEX_SCHEMAS:
-        raise RuntimeError("The RDC ReplayLab project-index section version is unsupported")
+        raise RuntimeError("The RDC Bread project-index section version is unsupported")
     declared_size = int(getattr(props, "uncompressedSize", 0))
     if declared_size < 0 or declared_size > MAX_REPLAYLAB_RDC_PROJECT_INDEX_BYTES:
-        raise RuntimeError("The RDC ReplayLab project index exceeds the size limit")
+        raise RuntimeError("The RDC Bread project index exceeds the size limit")
     contents = bytes(access.GetSectionContents(index))
     if not contents or len(contents) > MAX_REPLAYLAB_RDC_PROJECT_INDEX_BYTES:
-        raise RuntimeError("The RDC ReplayLab project index has an invalid size")
+        raise RuntimeError("The RDC Bread project index has an invalid size")
     if declared_size and declared_size != len(contents):
-        raise RuntimeError("The RDC ReplayLab project-index size metadata is inconsistent")
+        raise RuntimeError("The RDC Bread project-index size metadata is inconsistent")
     try:
         document = json.loads(
             contents.decode("utf-8"),
             object_pairs_hook=_reject_duplicate_json_object,
             parse_constant=_reject_project_index_json_constant)
     except (UnicodeDecodeError, ValueError, TypeError) as exc:
-        raise RuntimeError("The RDC ReplayLab project index is not strict UTF-8 JSON: %s" % exc)
+        raise RuntimeError("The RDC Bread project index is not strict UTF-8 JSON: %s" % exc)
     _validated_project_index_document(document)
     if document.get("schemaVersion") != section_version:
         raise RuntimeError(
-            "The RDC ReplayLab project-index section and document versions differ")
+            "The RDC Bread project-index section and document versions differ")
     return {
         "schema": "replaylab-rdc-project-index-transport/v1",
         "schemaVersion": 1,
@@ -16037,17 +19515,17 @@ def _write_rdc_project_index(params):
     if (document.get("schemaVersion") != REPLAYLAB_RDC_PROJECT_INDEX_VERSION or
             document.get("schema") != REPLAYLAB_RDC_PROJECT_INDEX_SCHEMA):
         raise ValueError(
-            "ReplayLab only writes the current RDC project-index schema")
+            "Bread only writes the current RDC project-index schema")
     encoded = _canonical_project_index_bytes(document)
     if not encoded or len(encoded) > MAX_REPLAYLAB_RDC_PROJECT_INDEX_BYTES:
-        raise ValueError("ReplayLab RDC project index exceeds the size limit")
+        raise ValueError("Bread RDC project index exceeds the size limit")
     def _snapshot_on_ui():
         path = _require_project_index_capture(params)
         return path, _ctx.Replay().GetCaptureFile(), str(_capture_session_id or "")
 
     path, capture_file, capture_session_id = _invoke_on_ui_sync(_snapshot_on_ui)
     if capture_file is None:
-        raise RuntimeError("ReplayLab can only write an index to a local capture file")
+        raise RuntimeError("Bread can only write an index to a local capture file")
     # Unknown + a unique name is RenderDoc's public custom-section contract.
     props = rd.SectionProperties()
     props.name = REPLAYLAB_RDC_PROJECT_INDEX_SECTION
@@ -16058,14 +19536,14 @@ def _write_rdc_project_index(params):
     ok = getattr(written, "OK", None)
     if callable(ok) and not ok():
         message = str(getattr(written, "message", "") or "")
-        raise RuntimeError(message or "RenderDoc could not write the ReplayLab RDC index")
+        raise RuntimeError(message or "RenderDoc could not write the Bread RDC index")
     # Treat the section as committed only after an exact read-back through the
     # same capture handle. It remains a cache, never physical apply authority.
     verified = _read_project_index_from_access(capture_file)
     if (not verified.get("present") or
             verified.get("encodedSha256") != hashlib.sha256(encoded).hexdigest() or
             verified.get("document") != document):
-        raise RuntimeError("ReplayLab RDC project index failed post-write verification")
+        raise RuntimeError("Bread RDC project index failed post-write verification")
     verified.update({
         "capturePath": path,
         "captureSessionId": capture_session_id,
@@ -16564,7 +20042,8 @@ def _project_shader_reflection_stage_name(reflection, entry):
     return ""
 
 
-def _project_shader_index_constants(values, budget, depth=0):
+def _project_shader_index_constants(values, budget, depth=0,
+                                    allow_runtime_arrays=False):
     if depth > MAX_PROJECT_SHADER_INDEX_REFLECTION_DEPTH:
         raise _ProjectShaderIndexLimit(
             "shader-resource-index-reflection-depth-limit",
@@ -16581,13 +20060,18 @@ def _project_shader_index_constants(values, budget, depth=0):
             _project_shader_index_text(
                 getattr(shader_type, attribute, ""), budget)
         elements = _safe_int(getattr(shader_type, "elements", 1), 1)
-        if elements < 0 or elements > (1 << 20):
+        # SPIR-V OpTypeRuntimeArray is reflected as UINT32_MAX, not billions
+        # of materialized fields. Preserve that type identity for storage
+        # resources while continuing to bound the actual reflected nodes.
+        runtime_array = allow_runtime_arrays and elements == 0xFFFFFFFF
+        if elements < 0 or (elements > (1 << 20) and not runtime_array):
             raise _ProjectShaderIndexLimit(
                 "shader-resource-index-reflection-field-limit",
                 "Shader reflection contains an invalid array element count")
         members = getattr(shader_type, "members", []) or []
         if members:
-            _project_shader_index_constants(members, budget, depth + 1)
+            _project_shader_index_constants(
+                members, budget, depth + 1, allow_runtime_arrays)
 
 
 def _validate_project_shader_reflection_budget(reflection, budget):
@@ -16632,7 +20116,8 @@ def _validate_project_shader_reflection_budget(reflection, budget):
                     _project_shader_index_text(
                         getattr(variable_type, name, ""), budget)
                 _project_shader_index_constants(
-                    getattr(variable_type, "members", []) or [], budget)
+                    getattr(variable_type, "members", []) or [], budget,
+                    allow_runtime_arrays=True)
 
     for value in getattr(reflection, "samplers", []) or []:
         _project_shader_index_charge(
@@ -16974,6 +20459,10 @@ def _project_shader_index_block_fields(reflection_block, projection_budget):
                 getattr(constant, "byteOffset", 0), 0, "field byte offset")
             absolute_offset = parent_offset + local_offset
             shader_type = getattr(constant, "type", None)
+            if _shader_type_is_empty_struct(shader_type):
+                # DXIL can retain empty declarations beside the next field.
+                # Match ordinary CBuffer serialization: they own no ABI bytes.
+                continue
             members = list(
                 getattr(shader_type, "members", []) or []) \
                 if shader_type is not None else []
@@ -17186,6 +20675,44 @@ def _publish_project_shader_index_progress(progress_callback, current, total,
     })
 
 
+def _project_shader_index_captured_reflection(reflection, entry, resource_id, request, api):
+    """Inventory captured bytes, proving any transparent live replacement first."""
+    owner = _shared_shader_replacements.get(resource_id)
+    if owner is None:
+        return reflection, None
+    capture_token = _current_capture_token()
+    if (capture_token is None or
+            owner.get("captureSessionId") != request["captureSessionId"] or
+            owner.get("captureSessionId") != _capture_session_id or
+            owner.get("captureToken") != capture_token or
+            _shared_shader_replacement_capture_token != capture_token or
+            owner.get("api") != api or
+            _resource_id_int(owner.get("originalResource")) != resource_id):
+        raise RuntimeError("Shader inventory replacement owner belongs to another capture")
+    stage_name = _project_shader_reflection_stage_name(reflection, entry)
+    original = _captured_original_from_shared_owner(
+        reflection, {"eventId": 0, "expectedOriginalResourceId": resource_id,
+                     "expectedOriginalSha256": owner.get("expectedOriginalSha256")},
+        stage_name, str(getattr(entry, "name", "") or ""), owner,
+        allow_original_active=api in ("d3d11", "vulkan", "opengl"))
+    if _project_shader_reflection_stage_name(original, entry) != stage_name:
+        raise RuntimeError("The retained captured-original Shader stage changed")
+    return original, owner
+
+
+def _project_shader_index_dxil_layout(ctrl, reflection, owner):
+    # DisassembleShader also resolves replacements, including when handed the
+    # original reflection. A verified owner retains its original layout evidence.
+    if owner is not None:
+        retained = owner.get("capturedDxilLayoutEvidence")
+        if not isinstance(retained, dict):
+            raise RuntimeError("Captured-original DXIL layout evidence is unavailable")
+        return {key: dict(marker) for key, marker in retained.items()}
+    unused_access, evidence = _dxil_evidence_from_live_disassembly(
+        ctrl, rd.ResourceId(), reflection)
+    return evidence
+
+
 def _iter_expected_project_shader_resource_index(ctrl, request,
                                                  cancel_event=None,
                                                  progress_callback=None):
@@ -17370,6 +20897,16 @@ def _iter_expected_project_shader_resource_index(ctrl, request,
             _check_project_shader_index_cancel(cancel_event)
             if reflection is None:
                 continue
+            try:
+                reflection, replacement_owner = _project_shader_index_captured_reflection(
+                    reflection, entry, resource_id, request, api)
+            except RuntimeError as exc:
+                base["diagnostics"].append({
+                    "code": "shader-replacement-original-unavailable",
+                    "resourceId": resource_id, "entryPoint": entry_name,
+                    "message": str(exc),
+                })
+                continue
             stage_name = _project_shader_reflection_stage_name(reflection, entry)
             if not stage_name:
                 base["diagnostics"].append({
@@ -17399,9 +20936,8 @@ def _iter_expected_project_shader_resource_index(ctrl, request,
                 if encoding == "dxil":
                     _check_project_shader_index_cancel(cancel_event)
                     try:
-                        unused_access, dxil_layout_evidence = (
-                            _dxil_evidence_from_live_disassembly(
-                                ctrl, rd.ResourceId(), reflection))
+                        dxil_layout_evidence = _project_shader_index_dxil_layout(
+                            ctrl, reflection, replacement_owner)
                     except Exception:
                         dxil_layout_evidence = _dxil_layout_evidence_for_all_blocks(
                             reflection, "unavailable")
@@ -17867,6 +21403,17 @@ def _iter_all_project_shader_resource_index(ctrl, request, cancel_event=None,
                     "entryPoint": entry_name,
                 })
                 continue
+            try:
+                reflection, replacement_owner = _project_shader_index_captured_reflection(
+                    reflection, entry, resource_id, request, api)
+            except RuntimeError as exc:
+                resource_raw_complete = False
+                base["diagnostics"].append({
+                    "code": "shader-replacement-original-unavailable",
+                    "resourceId": resource_id, "entryPoint": entry_name,
+                    "message": str(exc),
+                })
+                continue
             # The requested bytes are read from this current capture's real
             # reflection. Do not disassemble/compute ABI/GetUsage for another
             # Shader merely to decide that its raw SHA is not a target.
@@ -17921,9 +21468,8 @@ def _iter_all_project_shader_resource_index(ctrl, request, cancel_event=None,
                 dxil_layout_evidence = None
                 if encoding == "dxil":
                     try:
-                        unused_access, dxil_layout_evidence = (
-                            _dxil_evidence_from_live_disassembly(
-                                ctrl, rd.ResourceId(), reflection))
+                        dxil_layout_evidence = _project_shader_index_dxil_layout(
+                            ctrl, reflection, replacement_owner)
                     except Exception:
                         dxil_layout_evidence = _dxil_layout_evidence_for_all_blocks(
                             reflection, "unavailable")
@@ -18167,6 +21713,7 @@ def _iter_all_project_shader_resource_index(ctrl, request, cancel_event=None,
     base["symbolSnapshotUseCount"] = len(snapshot_use_keys)
     base["symbolSnapshotCaptureId"] = base["stableResourceSetSha256"]
     base["inventoryComplete"] = True
+    base["originalShaderIdentityPolicy"] = "captured-original-owner-v1"
     base["reasonId"] = ""
     if target_raw_hashes:
         # A completed filtered search is not a complete Shader inventory and
@@ -18583,15 +22130,170 @@ def _consume_preselected_project_capture(path):
     return expected == _capture_path_key(path)
 
 
+def _recover_replay(params):
+    """Rebuild only a fatal same-file controller; retain drafts and saved media."""
+    from .replay_recovery import ReplayRecoveryCoordinator
+    global _replay_recovery_coordinator
+    if _replay_recovery_coordinator is None:
+        _replay_recovery_coordinator = ReplayRecoveryCoordinator()
+
+    class Hooks(object):
+        def snapshot(self):
+            return {"loaded": bool(_ctx and _ctx.IsCaptureLoaded()),
+                    "local": bool(_ctx and _ctx.IsCaptureLocal()),
+                    "temporary": bool(_ctx and _ctx.IsCaptureTemporary()),
+                    "capturePath": str(_ctx.GetCaptureFilename() or ""),
+                    "captureSessionId": _capture_session_id,
+                    "eventId": int(_ctx.CurEvent()), "selectedEventId": int(_ctx.CurSelectedEvent())}
+
+        def health(self):
+            return _get_replay_health({})
+
+        def preserve(self, snapshot):
+            # Source editors and project/diagram files are not closed or rewritten.
+            # The old native driver has already destroyed every applied override.
+            panel = _shader_workspace_ui
+            documents = getattr(panel, "_documents", {})
+            models = getattr(panel, "_workspaces", {})
+            before = []
+            for workspace_id, document in documents.items():
+                model = models.get(workspace_id, {})
+                live = model.get("liveEdit", {}) if isinstance(model, dict) else {}
+                last = live.get("lastApply", {}) if isinstance(live, dict) else {}
+                replacement = last.get("replacement", {}) if isinstance(last, dict) else {}
+                applied = document.get("appliedReplacementId") or (
+                    replacement.get("replacementId") if isinstance(replacement, dict) else "")
+                before.append({"workspaceId": str(workspace_id),
+                               "sourcePath": str(document.get("sourcePath", "") or ""),
+                               "dirty": bool(document.get("dirty")),
+                               "wasApplied": bool(applied)})
+            return {"preserved": True, "sharedShaders": list(_shared_shader_replacements.values()),
+                    "eventShaders": list(_event_shader_overrides.values()),
+                    "beforeSavedApplied": before, "documents": documents,
+                    "savedDiagram": _frame_render_flow_saved,
+                    "flowDocument": getattr(_frame_render_flow_ui, "document", None)}
+
+        def begin(self, snapshot, preserved):
+            global _replay_recovery_path
+            _replay_recovery_path = _capture_path_key(snapshot["capturePath"])
+            window = _ctx.GetMainWindow().Widget()
+            window.setProperty("breadReplayRecoveryCapturePath", snapshot["capturePath"])
+            _cancel_project_auto_activation()
+            _abandon_project_launcher_restore()
+            if _project_async_executor is not None:
+                _project_async_executor.cancel_owner("frame-flow-restore")
+            return window
+
+        def invalidate(self, snapshot, preserved):
+            global _frame_render_flow_generation
+            # Do not rollback through DummyDriver. Invalidate live IDs only.
+            _forget_event_shader_overrides()
+            _forget_shared_shader_replacements()
+            _forget_event_cbuffer_snapshots()
+            _shared_cbuffer_edits.forget()
+            panel = _shader_workspace_ui
+            for document in getattr(panel, "_documents", {}).values():
+                document.pop("appliedReplacementId", None)
+            # Workspace models live in the panel's _workspaces registry, not in
+            # an editor document. Clear only the live receipt, never saved source.
+            for model in getattr(panel, "_workspaces", {}).values():
+                if isinstance(model, dict) and isinstance(model.get("liveEdit"), dict):
+                    model["liveEdit"].pop("lastApply", None)
+            _frame_render_flow_generation += 1
+            flow = _frame_render_flow_ui
+            loader = getattr(flow, "_channel_preview_loader", None)
+            if loader is not None:
+                loader.close()
+                flow._channel_preview_loader = None
+            view = getattr(flow, "view", None)
+            cache = getattr(view, "_channel_cache", None)
+            if isinstance(cache, dict):
+                cache.clear()
+
+        def reopen(self, snapshot):
+            global _active_capture_token, _frame_render_flow_outline_cache
+            status = _ctx.LoadCaptureForReplayRecovery(
+                snapshot["capturePath"], _ctx.Config().DefaultReplayOptions, snapshot["capturePath"])
+            self.reopen_status = {"code": str(status.code), "diagnostic": str(status)}
+            if status.code != rd.ResultCode.Succeeded:
+                raise RuntimeError("bread-replay-reopen-failed: %s" % str(status))
+            _reset_symbol_state(restore_names=False)
+            _active_capture_token = _current_capture_token()
+            _frame_render_flow_outline_cache = None
+            self.reopened_session = _capture_session_id
+            # Saved media retains its old session. Keeping the immutable record
+            # does not authorize navigation or claim the old pixels are current.
+
+        def restore_event(self, snapshot):
+            if (not _ctx.IsCaptureLoaded() or
+                    _capture_path_key(_ctx.GetCaptureFilename()) != _replay_recovery_path or
+                    _capture_session_id != getattr(self, "reopened_session", None)):
+                raise RuntimeError("The capture changed before replay recovery could restore the selected event")
+            _ctx.SetEventID([], snapshot["selectedEventId"], snapshot["eventId"], True)
+
+        def cancelled(self):
+            poller = globals().get("_poller")
+            item = getattr(poller, "_active_item", None)
+            return bool(item and item.get("cancelEvent") and item["cancelEvent"].is_set())
+
+        def finish(self, snapshot, preserved, result, token):
+            global _replay_recovery_path
+            try:
+                if hasattr(self, "reopen_status"):
+                    result["reopenStatus"] = self.reopen_status
+                # Preserve dirty text, but invalidate its former replay authority.
+                binding = _shader_workspace_capture_binding()
+                for panel in (_shader_workspace_ui, _shader_console_ui):
+                    changed = getattr(panel, "capture_changed", None)
+                    if callable(changed):
+                        changed(binding)
+                result["beforeSavedApplied"] = preserved.get("beforeSavedApplied", [])
+                result["retainedShaderDraftCount"] = sum(1 for row in result["beforeSavedApplied"] if row["dirty"])
+                result["invalidatedShaderReplacementCount"] = len(preserved.get("sharedShaders", [])) + len(preserved.get("eventShaders", []))
+                result["savedDiagramRetained"] = bool(
+                    preserved.get("savedDiagram") or preserved.get("flowDocument"))
+                result["nextAction"] = ("Prepare the frame flow for the new capture session; inspect original capture evidence. "
+                                        "Saved diagrams remain historical; Shader replacements and live CBuffer edits require separate validation.")
+                _publish_instance_manifest(activity=True)
+            finally:
+                try:
+                    window = token or _ctx.GetMainWindow().Widget()
+                    window.setProperty("breadReplayRecoveryCapturePath", None)
+                finally:
+                    _replay_recovery_path = ""
+
+    return _replay_recovery_coordinator.recover(Hooks(), str(params.get("expected_capture_session_id", "") or ""))
+
+
 def _open_capture(params, _project_open_token=None):
-    """Open a capture file in RenderDoc."""
+    """Open a capture, preserving an already open file unless reload is explicit."""
     path = params.get("capture_path", "")
     if not path:
         raise ValueError("capture_path required")
+    force_reload = params.get("force_reload", False)
+    if type(force_reload) is not bool:
+        raise ValueError("force_reload must be a boolean")
     if not _ctx:
         return {"error": "No context"}
     global _active_capture_token, _project_preselected_capture_path
     global _project_preselected_open_depth
+    project_preselected = _project_open_token is _PROJECT_PRESELECTED_OPEN_TOKEN
+    if not force_reload and not project_preselected:
+        try:
+            loaded_path = str(_ctx.GetCaptureFilename() or "")
+            already_open = (bool(_ctx.IsCaptureLoaded()) and bool(loaded_path)
+                            and _capture_path_key(loaded_path) == _capture_path_key(path))
+        except Exception:
+            already_open = False
+        if already_open:
+            # LoadCapture emits capture lifecycle callbacks which interrupt
+            # capture-bound AI tasks. An Agent ensuring this same RDC is open
+            # must not clear live replacements or terminate its own turn.
+            return {
+                "opened": os.path.abspath(loaded_path),
+                "captureSessionId": _capture_session_id,
+                "alreadyOpen": True,
+            }
     _release_event_shader_overrides()
     _release_shared_shader_replacements()
     _release_event_cbuffer_snapshots()
@@ -18599,7 +22301,6 @@ def _open_capture(params, _project_open_token=None):
     # Match the bundled qrenderdoc ICaptureContext contract exactly. Reusing
     # the configured defaults preserves the user's replay/GPU validation
     # choices, while origFilename identifies the same local RDC.
-    project_preselected = _project_open_token is _PROJECT_PRESELECTED_OPEN_TOKEN
     preselected_path = _capture_path_key(path) if project_preselected else ""
     if project_preselected:
         # project_launcher activates and fully validates the selected project
@@ -18643,9 +22344,17 @@ def _open_capture(params, _project_open_token=None):
         }
     # Some qrenderdoc versions do not synchronously deliver CaptureViewer
     # callbacks for integration-initiated loads. Establish a fresh physical
-    # session explicitly before any catalog identity can be cached.
-    _reset_symbol_state(restore_names=False)
-    _active_capture_token = _current_capture_token()
+    # session explicitly before any catalog identity can be cached -- but only when
+    # they really did not run. On a build that delivers them synchronously,
+    # OnCaptureLoaded has already minted a session and scheduled the project
+    # auto-restore against it; minting a second one here made that restore run and
+    # then discard its own result at the session check, leaving the status line
+    # stuck on "matching this RDC" with nothing restored and nothing logged.
+    token = _current_capture_token()
+    if _active_capture_token != token:
+        _reset_symbol_state(restore_names=False)
+        token = _current_capture_token()
+    _active_capture_token = token
     return {
         "opened": loaded_path,
         "captureSessionId": _capture_session_id,
@@ -18711,47 +22420,51 @@ def _get_bound_textures(params):
         except Exception:
             ro_bindings = None
 
-        # Pre-resolve Vulkan descriptors as fallback
-        vk_desc = {}
-        try:
-            vk_desc = _resolve_vulkan_descriptors(ctrl, ps, stage, refl)
-        except Exception:
-            pass
-
         result = []
         for i, ro in enumerate(getattr(refl, 'readOnlyResources', [])):
             if not getattr(ro, 'isTexture', False):
                 continue
             ro_name = getattr(ro, 'name', 'tex%d' % i)
             bind_num = getattr(ro, 'fixedBindNumber', i)
-            entry = {"slot": i, "name": ro_name, "bind": bind_num, "resourceId": 0}
-            # Resolve bound resource — compatible with D3D11/D3D12/Vulkan/GL
-            entry["resourceId"] = _resolve_bound_resource(ro_bindings, i, ctrl)
-            # Fallback: try Vulkan descriptor resolution by binding number
-            if entry["resourceId"] == 0 and bind_num in vk_desc:
-                entry["resourceId"] = vk_desc[bind_num]
-            # Fallback: try by slot index
-            if entry["resourceId"] == 0 and i in vk_desc:
-                entry["resourceId"] = vk_desc[i]
-            rid = entry["resourceId"]
-            if rid and rid in tex_lookup:
-                t = tex_lookup[rid]
-                entry["texName"] = name_lookup.get(rid, "")
-                entry["width"] = t.width
-                entry["height"] = t.height
-                entry["format"] = _fmt_str(t.format)
-                inferred_role = _infer_role(
-                    ro_name, name_lookup.get(rid, ""), _fmt_str(t.format))
-            else:
-                inferred_role = _infer_role(ro_name, "", "")
-            entry["role"] = inferred_role
-            entry["roleInference"] = {
-                "value": inferred_role,
-                "basis": "reflection/resource names and texture-format heuristic",
-                "confidence": "low",
-                "observed": False,
-            }
-            result.append(entry)
+            exact_bindings = _exact_readonly_descriptor_resources(
+                ro_bindings, i)
+            if not exact_bindings:
+                exact_bindings = [{
+                    "resourceId": 0, "arrayElement": 0,
+                    "descriptorStoreId": 0, "evidence": "unbound",
+                }]
+            for exact in exact_bindings:
+                entry = {
+                    "slot": i,
+                    "name": ro_name,
+                    "bind": bind_num,
+                    "space": _safe_int(
+                        getattr(ro, 'fixedBindSetOrSpace', 0), 0),
+                    "arrayIndex": exact["arrayElement"],
+                    "resourceId": exact["resourceId"],
+                    "bindingEvidence": exact["evidence"],
+                }
+                if exact["descriptorStoreId"] > 0:
+                    entry["descriptorStoreId"] = exact["descriptorStoreId"]
+                rid = entry["resourceId"]
+                if rid and rid in tex_lookup:
+                    t = tex_lookup[rid]
+                    entry["texName"] = name_lookup.get(rid, "")
+                    entry["width"] = t.width
+                    entry["height"] = t.height
+                    entry["format"] = _fmt_str(t.format)
+                    inferred_role = _infer_role(
+                        ro_name, name_lookup.get(rid, ""), _fmt_str(t.format))
+                else:
+                    inferred_role = _infer_role(ro_name, "", "")
+                entry["role"] = inferred_role
+                entry["roleInference"] = {
+                    "value": inferred_role,
+                    "basis": "reflection/resource names and texture-format heuristic",
+                    "confidence": "low",
+                    "observed": False,
+                }
+                result.append(entry)
         return result
 
     return _replay(_do)
@@ -18823,9 +22536,18 @@ def _get_constant_buffer_values(params):
                     entry["reason"] = "constant block has no bound buffer (inline/root constants or unbound)"
                 else:
                     size = min(int(size), MAX_CONSTANT_BUFFER_VALUE_BYTES)
+                    # A D3D12 root CBV can expose the remainder of a shared
+                    # upload buffer. That is not this block's parameter extent;
+                    # reading it mixes neighbouring draws/materials into the
+                    # matching evidence. Keep the reflected extent when known.
+                    if entry["byteSize"] > 0:
+                        size = min(size, entry["byteSize"])
                     data = bytes(ctrl.GetBufferData(buffer_rid, int(binding["byteOffset"]), size))
                     lanes = len(data) // 4
-                    entry["floats"] = [round(v, 7) for v in _struct.unpack_from("<%df" % lanes, data, 0)]
+                    entry["floats"], non_finite = _strict_float_vector(
+                        _struct.unpack_from("<%df" % lanes, data, 0), lanes)
+                    if non_finite:
+                        entry["floatNonFinite"] = non_finite
                     entry["uints"] = list(_struct.unpack_from("<%dI" % lanes, data, 0))
                     entry["readBytes"] = len(data)
                     entry["status"] = "available"
@@ -18840,6 +22562,137 @@ def _get_constant_buffer_values(params):
 
 MAX_TEXTURE_FINGERPRINT_PNG_BYTES = 256 * 1024
 TEXTURE_FINGERPRINT_MAX_DIM = 64
+# One SaveTexture pass per (capture, event, resource) identity; cleared after
+# Host asset authorization so matching no longer retains PNG blobs in-process.
+_TEXTURE_FINGERPRINT_CACHE = {}
+_TEXTURE_FINGERPRINT_CACHE_ORDER = []
+_TEXTURE_FINGERPRINT_CACHE_MAX = 64
+
+
+def _texture_fingerprint_cache_key(event_id, resource_ids):
+    capture = ""
+    try:
+        if _ctx is not None:
+            capture = str(getattr(_ctx, "GetCaptureFilename", lambda: "")() or "")
+    except Exception:
+        capture = ""
+    ids = []
+    for raw in list(resource_ids or [])[:32]:
+        try:
+            ids.append(int(_resource_id_int(raw)))
+        except Exception:
+            ids.append(str(raw))
+    return (capture, int(event_id) if event_id is not None else None, tuple(ids))
+
+
+def _cache_texture_fingerprints(key, payload):
+    global _TEXTURE_FINGERPRINT_CACHE, _TEXTURE_FINGERPRINT_CACHE_ORDER
+    if key in _TEXTURE_FINGERPRINT_CACHE:
+        try:
+            _TEXTURE_FINGERPRINT_CACHE_ORDER.remove(key)
+        except ValueError:
+            pass
+    _TEXTURE_FINGERPRINT_CACHE[key] = payload
+    _TEXTURE_FINGERPRINT_CACHE_ORDER.append(key)
+    while len(_TEXTURE_FINGERPRINT_CACHE_ORDER) > _TEXTURE_FINGERPRINT_CACHE_MAX:
+        old = _TEXTURE_FINGERPRINT_CACHE_ORDER.pop(0)
+        _TEXTURE_FINGERPRINT_CACHE.pop(old, None)
+
+
+def _release_texture_fingerprint_cache(params=None):
+    """Drop cached SaveTexture fingerprints after asset matching is done."""
+
+    global _TEXTURE_FINGERPRINT_CACHE, _TEXTURE_FINGERPRINT_CACHE_ORDER
+    released = len(_TEXTURE_FINGERPRINT_CACHE)
+    _TEXTURE_FINGERPRINT_CACHE = {}
+    _TEXTURE_FINGERPRINT_CACHE_ORDER = []
+    # Best-effort: also clear project thumbnail cache if present.
+    try:
+        if _project_thumbnail_cache is not None:
+            _project_thumbnail_cache.clear()
+    except Exception:
+        pass
+    return {
+        "schema": "replaylab-texture-fingerprint-release/v1",
+        "releasedEntries": released,
+        "applied": True,
+    }
+
+
+def _release_replay_transient_caches(params=None):
+    """Drop rebuildable replay/bridge transients without unloading the capture.
+
+    Opening an RDC already materialises the capture's shaders/resources once.
+    Tool calls that force SetFrameEvent, BuildTargetShader, or GetTextureData
+    can grow Private on top of that session. This release clears:
+
+    - SaveTexture fingerprint / thumbnail Python caches
+    - ReplayController.ClearReplayCache (driver-side replay scratch)
+    - orphaned FreeTargetResource entries not owned by a live shared replace
+
+    It does **not** CloseCapture, rollback applied shared shader replacements,
+    or drop event overrides the user/Agent still owns.
+    """
+
+    global _shared_shader_orphan_targets
+
+    options = params if isinstance(params, dict) else {}
+    clear_replay = options.get("clear_replay_cache", True)
+    release_orphans = options.get("release_orphaned_targets", True)
+
+    fingerprint = _release_texture_fingerprint_cache({})
+    replay_cleared = False
+    replay_error = ""
+    if clear_replay is not False:
+        try:
+            def _clear(ctrl):
+                clearer = getattr(ctrl, "ClearReplayCache", None)
+                if not callable(clearer):
+                    raise RuntimeError("ReplayController.ClearReplayCache is unavailable")
+                clearer()
+                return True
+
+            replay_cleared = bool(_replay(_clear))
+        except Exception as exc:
+            replay_error = str(exc)[:400]
+
+    orphans_freed = 0
+    orphan_error = ""
+    if release_orphans is not False:
+        pending = list(_shared_shader_orphan_targets)
+        if pending:
+            kept = []
+            try:
+                def _free_orphans(ctrl):
+                    freed = 0
+                    remaining = []
+                    for target in pending:
+                        try:
+                            ctrl.FreeTargetResource(target)
+                            freed += 1
+                        except Exception:
+                            remaining.append(target)
+                    return freed, remaining
+
+                orphans_freed, kept = _replay(_free_orphans)
+            except Exception as exc:
+                orphan_error = str(exc)[:400]
+                kept = pending
+            _shared_shader_orphan_targets = list(kept)
+
+    return {
+        "schema": "replaylab-replay-transient-release/v1",
+        "applied": True,
+        "fingerprint": fingerprint,
+        "releasedEntries": int(fingerprint.get("releasedEntries") or 0),
+        "replayCacheCleared": bool(replay_cleared),
+        "replayCacheError": replay_error,
+        "orphanedTargetsFreed": int(orphans_freed),
+        "orphanedTargetsRemaining": len(_shared_shader_orphan_targets),
+        "orphanError": orphan_error,
+        "captureUnloaded": False,
+        "sharedReplacementsPreserved": True,
+    }
 
 
 def _get_texture_fingerprints(params):
@@ -18849,7 +22702,8 @@ def _get_texture_fingerprints(params):
     (never above 64) is saved as PNG through RenderDoc's own converter — so
     every GPU format, BC7 and float included, arrives as plain RGBA — and
     returned base64-encoded for the Host to hash. Failures are per texture
-    with a reason; nothing here mutates replay state.
+    with a reason; nothing here mutates replay state. Identical requests reuse
+    one in-process cache until ``release_texture_fingerprint_cache``.
     """
     import base64 as _base64
     import tempfile as _tempfile
@@ -18857,10 +22711,25 @@ def _get_texture_fingerprints(params):
     if not isinstance(raw_ids, list) or len(raw_ids) > 32:
         raise ValueError("resource_ids must be a list of at most 32 ids")
     event_id = params.get("event_id")
+    cache_key = _texture_fingerprint_cache_key(event_id, raw_ids)
+    cached = _TEXTURE_FINGERPRINT_CACHE.get(cache_key)
+    if isinstance(cached, dict) and cached.get("textures") is not None:
+        reused = dict(cached)
+        reused["cacheHit"] = True
+        return reused
 
     def _do(ctrl):
         if event_id is not None:
-            _set_frame_event(ctrl, int(event_id), True)
+            # Prefer a non-force set when the controller is already at this EID.
+            # Force=True materialises more replay resources and was observed to
+            # leave large unreclaimed allocations in the qrenderdoc process.
+            current_event = 0
+            try:
+                if _ctx is not None:
+                    current_event = _safe_int(_ctx.CurEvent(), 0)
+            except Exception:
+                current_event = 0
+            _set_frame_event(ctrl, int(event_id), force=(current_event != int(event_id)))
         tex_lookup = {int(t.resourceId): t for t in ctrl.GetTextures()}
         name_lookup = {int(r.resourceId): r.name for r in ctrl.GetResources()}
         results = []
@@ -18933,9 +22802,11 @@ def _get_texture_fingerprints(params):
                 os.rmdir(temp_dir)
             except OSError:
                 pass
-        return {"eventId": event_id, "textures": results}
+        return {"eventId": event_id, "textures": results, "cacheHit": False}
 
-    return _replay(_do)
+    payload = _replay(_do)
+    _cache_texture_fingerprints(cache_key, payload)
+    return payload
 
 
 def _get_draw_geometry(params):
@@ -19015,7 +22886,8 @@ def _reverse_shader(params):
         raise ValueError("event_id required")
 
     # Reuse get_shader_info which already does full reverse
-    return _get_shader_info({"event_id": event_id, "stage": stage_name})
+    return _get_shader_info({"event_id": event_id, "stage": stage_name,
+                             "text_mode": params.get("text_mode", "all")})
 
 
 def _inspect_shader(params):
@@ -20951,7 +24823,7 @@ def _extract_mesh_obj(ctrl, ps, mesh_out, mesh_name, output_dir, event_id=None):
     num_faces = len(indices) // 3
 
     with open(obj_path, 'w', encoding='utf-8') as f:
-        f.write("# Exported from ReplayLab + Model Extractor\n")
+        f.write("# Exported from Bread + Model Extractor\n")
         f.write("# Vertices: %d, Faces: %d\n\n" % (len(positions), num_faces))
         f.write("o %s\n\n" % mesh_name)
 
@@ -21129,7 +25001,7 @@ def _write_fbx_ascii(filepath, name, positions, normals, uvs, indices, num_faces
     now = time.gmtime()
 
     content = """; FBX 7.4.0 project file
-; Exported by ReplayLab (Model Extractor engine)
+; Exported by Bread (Model Extractor engine)
 FBXHeaderExtension:  {
 \tFBXHeaderVersion: 1003
 \tFBXVersion: 7400
@@ -21143,7 +25015,7 @@ FBXHeaderExtension:  {
 \t\tSecond: %d
 \t\tMillisecond: 0
 \t}
-\tCreator: "ReplayLab v1.8"
+\tCreator: "Bread v1.8"
 }
 
 GlobalSettings:  {
@@ -21277,7 +25149,7 @@ def _generate_unity_import_script(mesh_name, unity_mat, tex_exports, output_dir)
             % (prop_name, col["r"], col["g"], col["b"], col["a"])
         )
 
-    script = '''// Auto-generated Unity Import Script from ReplayLab
+    script = '''// Auto-generated Unity Import Script from Bread
 // Mesh: %(mesh_name)s | Event ID: exported from RenderDoc capture
 //
 // Usage: Place this script in Assets/Editor/ and run from menu:
@@ -21339,11 +25211,11 @@ public class Import_%(safe_name)s
             {
                 r.sharedMaterial = mat;
             }
-            Debug.Log("[ReplayLab] Imported %(mesh_name)s with " + renderers.Length + " renderers");
+            Debug.Log("[Bread] Imported %(mesh_name)s with " + renderers.Length + " renderers");
         }
 
         AssetDatabase.SaveAssets();
-        Debug.Log("[ReplayLab] Import complete: " + destDir);
+        Debug.Log("[Bread] Import complete: " + destDir);
     }
 }
 #endif
@@ -21374,10 +25246,10 @@ def _load_pass_classification(params):
     """Load one fixed-program pass tree into the capture-bound UI panel."""
     global _pass_panel_ui
     if not HAS_UI:
-        raise RuntimeError("ReplayLab Semantic Passes UI is unavailable")
+        raise RuntimeError("Bread Semantic Passes UI is unavailable")
     if _pass_panel_ui is None:
         if not callable(_pass_panel_factory):
-            raise RuntimeError("ReplayLab Semantic Passes UI is unavailable")
+            raise RuntimeError("Bread Semantic Passes UI is unavailable")
         _pass_panel_ui = _pass_panel_factory()
     expected_session = _shader_override_hex(
         params.get("expected_capture_session_id"),
@@ -21436,19 +25308,91 @@ def _close_pass_panel(_params):
 
 
 # ---- Method table ----
+_application_ui_controller = None
+
+
+def _application_ui():
+    global _application_ui_controller
+    if not HAS_UI or _ctx is None:
+        raise RuntimeError("Bread application UI is unavailable")
+    if _application_ui_controller is None:
+        from .project_ui_control import ApplicationUIController
+
+        def _panel(callbacks, get_panel):
+            if not callbacks:
+                raise RuntimeError("Bread panel is unavailable")
+            callbacks[0]()
+            panel = get_panel()
+            if panel is None or getattr(panel, "top", None) is None:
+                raise RuntimeError("Bread panel could not be opened")
+            if not panel.top.isVisible():
+                raise RuntimeError("Bread panel did not become visible")
+
+        def _assistant():
+            action = _ctx.GetMainWindow().Widget().findChild(
+                QtWidgets.QAction, "action_AI_Assistant")
+            if action is None:
+                raise RuntimeError("Bread AI window action is unavailable")
+            action.trigger()
+
+        _application_ui_controller = ApplicationUIController(_ctx, {
+            "shader-workspace": lambda: _panel(
+                _shader_workspace_callbacks, lambda: _shader_workspace_ui),
+            "console": lambda: _panel(
+                _shader_console_callbacks, lambda: _shader_console_ui),
+            "bread-ai": _assistant,
+            "frame-render-flow": lambda: _ensure_frame_render_flow_ui().show(),
+        })
+    return _application_ui_controller
+
+
+def _open_document_rpc(params):
+    return _invoke_on_ui_sync(lambda: json.loads(open_native_document_json(json.dumps(params))))
+
+
+def _get_application_ui_state(params):
+    return _invoke_on_ui_sync(lambda: _application_ui().inspect(params))
+
+
+def _control_application_ui(params):
+    return _invoke_on_ui_sync(lambda: _application_ui().perform(params))
+
+
+def _shutdown_application_ui():
+    global _application_ui_controller
+    document_module = sys.modules.get(__name__ + ".project_document_viewer")
+    if document_module is not None:
+        document_module.shutdown()
+    if _application_ui_controller is not None:
+        _application_ui_controller.shutdown()
+        _application_ui_controller = None
+
+
 METHODS = {
     "ping": _ping,
     "get_capture_status": _get_capture_status,
     "get_current_renderdoc_context": _get_current_renderdoc_context,
+    "get_application_ui_state": _get_application_ui_state,
+    "open_document": _open_document_rpc,
+    "control_application_ui": _control_application_ui,
     "inspect_event": _inspect_event,
+    "inspect_event_api_parameters": _inspect_event_api_parameters,
     "analyze_pixel": _analyze_pixel,
     "inspect_shader": _inspect_shader,
     "get_frame_summary": _get_frame_summary,
     "get_draw_calls": _get_draw_calls,
     "get_draw_call_details": _get_draw_call_details,
     "get_pipeline_state": _get_pipeline_state,
+    "get_replay_health": _get_replay_health,
     "get_pass_classification_inputs": _get_pass_classification_inputs,
     "get_current_frame_flow_inputs": _get_current_frame_flow_inputs,
+    "get_frame_render_flow_outline": _get_frame_render_flow_outline,
+    "show_frame_render_flow": _show_frame_render_flow,
+    "save_frame_render_flow": _save_frame_render_flow,
+    "capture_frame_flow_channels": _capture_frame_flow_channels,
+    "capture_frame_flow_volume": _capture_frame_flow_volume,
+    "get_saved_frame_render_flow": _get_saved_frame_render_flow,
+    "inspect_frame_render_stage": _inspect_frame_render_stage,
     "load_pass_classification": _load_pass_classification,
     "close_pass_panel": _close_pass_panel,
     "get_shader_info": _get_shader_info,
@@ -21458,9 +25402,12 @@ METHODS = {
     "cancel_export_shader_catalog": _cancel_export_shader_catalog,
     "consume_export_shader_catalog": _consume_export_shader_catalog,
     "reflect_shader_candidate": _reflect_shader_candidate,
+    "compile_shader_source_native": _compile_shader_source_native,
     "apply_shader_candidate_override": _apply_shader_candidate_override,
     "apply_shader_candidate_overrides": _apply_shader_candidate_overrides,
     "apply_shader_candidate_shared_resource": _apply_shader_candidate_shared_resource,
+    "apply_shader_candidate_shared_resource_batch": _apply_shader_candidate_shared_resource_batch,
+    "ensure_internal_shader_service": _ensure_internal_shader_service,
     "rollback_shader_candidate_override": _rollback_shader_candidate_override,
     "rollback_shader_candidate_overrides": _rollback_shader_candidate_overrides,
     "rollback_shader_candidate_shared_resource": _rollback_shader_candidate_shared_resource,
@@ -21479,7 +25426,9 @@ METHODS = {
     "get_buffers": _get_buffers,
     "get_resources": _get_resources,
     "get_texture_info": _get_texture_info,
+    "get_effect_resource_info": _get_effect_resource_info,
     "get_texture_data": _get_texture_data,
+    "get_event_texture_bytes": _get_event_texture_bytes,
     "get_buffer_data": _get_buffer_data,
     "inspect_resource_export": _inspect_resource_export,
     "capture_resource_export_bundle": _capture_resource_export_bundle,
@@ -21488,7 +25437,10 @@ METHODS = {
     "fingerprint_event_outputs": _fingerprint_event_outputs,
     "compare_shader_organization_candidates": _compare_shader_organization_candidates,
     "get_shader_cbuffer_alias_identity": _get_shader_cbuffer_alias_identity,
+    "get_shader_cbuffer_display_identity": _get_shader_cbuffer_display_identity,
     "get_shader_workspace_ui_state": _get_shader_workspace_ui_state,
+    "read_shader_workspace_source": _read_shader_workspace_source,
+    "show_shader_organization_preview": _show_shader_organization_preview,
     "get_texture_minmax": _get_texture_minmax,
     "pixel_history": _pixel_history,
     "inspect_pixel_object": _inspect_pixel_object,
@@ -21510,9 +25462,12 @@ METHODS = {
     "poll_rdc_project_shader_resource_index": _poll_rdc_project_shader_resource_index,
     "commit_rdc_project_shader_resource_index": _commit_rdc_project_shader_resource_index,
     "open_capture": _open_capture,
+    "recover_replay": _recover_replay,
     "get_bound_textures": _get_bound_textures,
     "get_constant_buffer_values": _get_constant_buffer_values,
     "get_texture_fingerprints": _get_texture_fingerprints,
+    "release_texture_fingerprint_cache": _release_texture_fingerprint_cache,
+    "release_replay_transient_caches": _release_replay_transient_caches,
     "get_draw_geometry": _get_draw_geometry,
     "reverse_shader": _reverse_shader,
     "export_drawcall": _export_drawcall,
@@ -21621,12 +25576,13 @@ def _register_event_browser_filter_ui(ctx):
             _apply_event_browser_filter_preset(_ctx_value, selected)
 
         _event_filter_ui_callbacks.append(_select)
+        group = QtCore.QCoreApplication.translate("ReplayLabProjects", "Bread AI")
         ctx.Extensions().RegisterWindowMenu(
             qrd.WindowMenu.Tools,
-            ["ReplayLab", "Event Browser Filter", label], _select)
+            [group, "Event Browser Filter", label], _select)
         ctx.Extensions().RegisterPanelMenu(
             qrd.PanelMenu.EventBrowser,
-            ["ReplayLab", "Filter", label], _select)
+            [group, "Filter", label], _select)
 
 
 def _unregister_event_browser_filter_ui(ctx):
@@ -21640,7 +25596,7 @@ def _unregister_event_browser_filter_ui(ctx):
                 browser.SetCurrentFilterText("")
             browser.UnregisterEventFilterFunction(EVENT_FILTER_FUNCTION)
         except Exception as exc:
-            print("[ReplayLab] Event filter unregister error: %s" % str(exc))
+            print("[Bread] Event filter unregister error: %s" % str(exc))
     _event_filter_registered = False
     _event_filter_ui_callbacks = []
 
@@ -21728,7 +25684,7 @@ def _unregister_material_panel_ui():
         try:
             _material_panel_controller.rollback_all()
         except Exception as exc:
-            print("[ReplayLab] Material controller unregister rollback error: %s" % str(exc))
+            print("[Bread] Material controller unregister rollback error: %s" % str(exc))
         _material_panel_controller.forget_all()
     _material_panel_controller = None
     _material_panel_callbacks = []
@@ -21787,12 +25743,12 @@ def _register_pass_panel_ui(ctx):
     ctx.Extensions().RegisterWindowMenu(
         qrd.WindowMenu.Window,
         [QtCore.QCoreApplication.translate(
-            "ReplayLabProjects", "ReplayLab Semantic Passes")],
+            "ReplayLabProjects", "Semantic Passes")],
         _show)
     ctx.Extensions().RegisterPanelMenu(
         qrd.PanelMenu.EventBrowser,
         [QtCore.QCoreApplication.translate(
-             "ReplayLabProjects", "ReplayLab"),
+             "ReplayLabProjects", "Bread AI"),
          QtCore.QCoreApplication.translate(
              "ReplayLabProjects", "Open Semantic Passes")],
         _show)
@@ -21916,8 +25872,108 @@ def _project_ui_format(translated, *arguments):
     return re.sub(r"%([1-9][0-9]*)", _replace, str(translated))
 
 
-def _show_project_background_status(message, timeout_ms=0):
-    """Use qrenderdoc's status bar when available; never display a modal."""
+_PROJECT_STATUS_UI = {"widget": None, "label": None, "progress": None, "timer": None}
+
+
+def _project_status_bar():
+    """qrenderdoc's status bar, however this build exposes it."""
+    if not HAS_UI or not _ctx:
+        return None
+    try:
+        window = _ctx.GetMainWindow().Widget()
+        status_bar = getattr(window, "statusBar", lambda: None)()
+        if status_bar is None:
+            find_child = getattr(window, "findChild", None)
+            if callable(find_child):
+                status_bar = find_child(QtWidgets.QStatusBar, "statusBar")
+        return status_bar
+    except Exception:
+        return None
+
+
+def _project_status_parts():
+    """Our own label and progress bar, kept out of the way of everyone else's text.
+
+    ``showMessage`` was the wrong home for this: it is one shared slot, so RenderDoc's
+    own hover and API text overwrote background progress the moment the pointer moved,
+    and the user saw a status line that flickered between two unrelated things. A
+    *permanent* widget is the one kind Qt does not hide for temporary messages, so this
+    sits to the right of them and stays readable while both have something to say.
+    """
+    parts = _PROJECT_STATUS_UI
+    widget = parts["widget"]
+    try:
+        # All three, not just the container. A child whose C++ side is gone while the
+        # container's survives made every later status message vanish into the
+        # try/except in _show_project_background_status, with nothing shown and
+        # nothing logged -- the user watched a stale line through a whole restore.
+        if (widget is not None
+                and not _sip_deleted(widget)
+                and parts["label"] is not None and not _sip_deleted(parts["label"])
+                and parts["progress"] is not None and not _sip_deleted(parts["progress"])):
+            return parts["label"], parts["progress"]
+    except Exception:
+        pass
+    parts["widget"] = parts["label"] = parts["progress"] = None
+    status_bar = _project_status_bar()
+    add_permanent = getattr(status_bar, "addPermanentWidget", None)
+    if not callable(add_permanent):
+        return None, None
+    try:
+        widget = QtWidgets.QWidget(status_bar)
+        widget.setObjectName("replayLabBackgroundStatusWidget")
+        layout = QtWidgets.QHBoxLayout(widget)
+        layout.setContentsMargins(6, 0, 6, 0)
+        layout.setSpacing(8)
+        label = QtWidgets.QLabel(widget)
+        label.setObjectName("replayLabBackgroundStatusText")
+        label.setTextFormat(QtCore.Qt.PlainText)
+        # Elide rather than push the window wider: a long project name must not be able
+        # to shove RenderDoc's own status text off the bar.
+        label.setMinimumWidth(160)
+        label.setMaximumWidth(520)
+        label.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
+                            QtWidgets.QSizePolicy.Preferred)
+        progress = QtWidgets.QProgressBar(widget)
+        progress.setObjectName("replayLabBackgroundStatusProgress")
+        progress.setTextVisible(False)
+        progress.setMinimumWidth(110)
+        progress.setMaximumWidth(160)
+        progress.setMaximumHeight(14)
+        progress.hide()
+        # Bar first, then the words: the eye finds the moving part, then reads.
+        layout.addWidget(progress)
+        layout.addWidget(label)
+        add_permanent(widget, 1)
+        widget.hide()
+        parts["widget"] = widget
+        parts["label"] = label
+        parts["progress"] = progress
+        return label, progress
+    except Exception:
+        parts["widget"] = parts["label"] = parts["progress"] = None
+        return None, None
+
+
+def _sip_deleted(widget):
+    try:
+        widget.objectName()
+        return False
+    except Exception:
+        return True
+
+
+def _elide_status_text(label, message):
+    try:
+        metrics = label.fontMetrics()
+        return metrics.elidedText(str(message), QtCore.Qt.ElideMiddle,
+                                  max(120, label.maximumWidth() - 12))
+    except Exception:
+        return str(message)
+
+
+def _show_project_background_status(message, timeout_ms=0, current=0, total=0):
+    """Say what the background is doing, where nothing else will overwrite it."""
     if str(message or ""):
         project_phase = (QtCore.QCoreApplication.translate(
             "ReplayLabProjects", "Project") if HAS_UI else "")
@@ -21926,33 +25982,108 @@ def _show_project_background_status(message, timeout_ms=0):
             code="projectStatus")
     if not HAS_UI or not _ctx:
         return
-    try:
-        window = _ctx.GetMainWindow().Widget()
-        status_bar = getattr(window, "statusBar", lambda: None)()
-        if status_bar is None:
-            find_child = getattr(window, "findChild", None)
-            if callable(find_child):
-                status_bar = find_child(QtWidgets.QStatusBar, "statusBar")
+    label, progress = _project_status_parts()
+    if label is None:
+        # No permanent-widget support in this build: the shared slot is better than
+        # saying nothing, even though other text can take it away again.
+        status_bar = _project_status_bar()
         if status_bar is not None:
-            status_bar.showMessage(str(message), int(timeout_ms))
+            try:
+                status_bar.showMessage(str(message), int(timeout_ms))
+            except Exception:
+                pass
+        return
+    try:
+        label.setText(_elide_status_text(label, message))
+        label.setToolTip(str(message))
+        total = _safe_int(total, 0)
+        current = _safe_int(current, 0)
+        if total > 0:
+            # A real fraction when the work knows its size, a moving bar when it does
+            # not: a determinate bar stuck at 0 reads as "hung" rather than "working".
+            progress.setRange(0, total)
+            progress.setValue(max(0, min(current, total)))
+            progress.show()
+        elif str(message or ""):
+            progress.setRange(0, 0)
+            progress.show()
+        else:
+            progress.hide()
+        parts = _PROJECT_STATUS_UI
+        widget = parts["widget"]
+        if widget is not None:
+            widget.setVisible(bool(str(message or "")))
+        timer = parts["timer"]
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+            parts["timer"] = None
+        if int(timeout_ms) > 0:
+            timer = QtCore.QTimer(widget if widget is not None else None)
+            timer.setSingleShot(True)
+            timer.timeout.connect(_clear_project_background_status)
+            timer.start(int(timeout_ms))
+            parts["timer"] = timer
+    except Exception:
+        pass
+
+
+def _remove_project_background_status():
+    """Take our permanent widget back out of RenderDoc's status bar.
+
+    Hiding it is not enough on a module reload: the next load builds a fresh
+    ``_PROJECT_STATUS_UI`` and adds a second permanent widget while the first stays
+    parented to the status bar for the life of the process.
+    """
+
+    parts = _PROJECT_STATUS_UI
+    _clear_project_background_status()
+    widget = parts["widget"]
+    parts["widget"] = parts["label"] = parts["progress"] = None
+    if widget is None:
+        return
+    try:
+        if _sip_deleted(widget):
+            return
+        status_bar = _project_status_bar()
+        remove = getattr(status_bar, "removeWidget", None)
+        if callable(remove):
+            remove(widget)
+        widget.setParent(None)
+        widget.deleteLater()
     except Exception:
         pass
 
 
 def _clear_project_background_status():
-    if not HAS_UI or not _ctx:
-        return
+    parts = _PROJECT_STATUS_UI
+    timer = parts["timer"]
+    parts["timer"] = None
+    if timer is not None:
+        try:
+            timer.stop()
+        except Exception:
+            pass
+    widget, label, progress = parts["widget"], parts["label"], parts["progress"]
     try:
-        window = _ctx.GetMainWindow().Widget()
-        status_bar = getattr(window, "statusBar", lambda: None)()
-        if status_bar is None:
-            find_child = getattr(window, "findChild", None)
-            if callable(find_child):
-                status_bar = find_child(QtWidgets.QStatusBar, "statusBar")
-        if status_bar is not None:
-            status_bar.clearMessage()
+        if label is not None and not _sip_deleted(label):
+            label.setText("")
+            label.setToolTip("")
+        if progress is not None and not _sip_deleted(progress):
+            progress.hide()
+        if widget is not None and not _sip_deleted(widget):
+            widget.hide()
+            return
     except Exception:
         pass
+    status_bar = _project_status_bar()
+    if status_bar is not None:
+        try:
+            status_bar.clearMessage()
+        except Exception:
+            pass
 
 
 def _consume_project_association_lease(expected_token):
@@ -21973,7 +26104,7 @@ def _ensure_project_async_executor():
     global _project_async_executor
     if _project_async_executor is None:
         if not HAS_UI or not getattr(_project_launcher_protocol, "HAS_QT", False):
-            raise RuntimeError("ReplayLab project worker requires the Qt UI thread")
+            raise RuntimeError("Bread project worker requires the Qt UI thread")
         if _project_restore_client_protocol is not None:
             resume_restores = getattr(_project_restore_client_protocol, "resume_restore_generation", None)
             if callable(resume_restores):
@@ -21991,6 +26122,174 @@ def _stop_project_auto_restore_progress():
     stop = _project_auto_restore_progress_stop
     if stop is not None:
         stop()
+
+
+def _publish_project_window_restore_outcome(project_root, path, session_id, result, worker_error):
+    """One bounded console record per project-window restore, success or not.
+
+    The window's status task shows one line and forgets the rest. This is the
+    same observation the automatic path records, so a restore that found less
+    than expected -- or died -- leaves its reason somewhere readable, followed
+    by what the project knows against what this capture bound.
+    """
+    try:
+        summary, diagnostic = _project_auto_restore_diagnostic(result, worker_error, 0, session_id)
+        _publish_console_event(
+            "project", "info" if summary["phase"] == "complete" else "warning",
+            _project_launcher_protocol._restore_status_text(
+                {"phase": summary["phase"], "item": diagnostic}),
+            phase=summary["phase"], code="projectRestoreFinished",
+            context={"operation": "projectWindowRestore", "captureSessionId": session_id,
+                     "jobId": summary["operationId"],
+                     "failureCode": summary["reasonId"] or summary["errorType"],
+                     "diagnostics": json.dumps({key: summary.get(key) for key in
+                         ("completed", "outcome", "restoreMode", "reasonId", "shaders",
+                          "materials", "targetLookup", "error")},
+                         ensure_ascii=False, separators=(",", ":"))[:1400]})
+    except Exception as exc:
+        _publish_console_event(
+            "project", "warning",
+            "项目恢复已结束，但结果无法整理为摘要：%s: %s" % (type(exc).__name__, str(exc)[:300]),
+            phase="project", code="projectRestoreFinished")
+    try:
+        _report_shared_shader_reuse(project_root, path, session_id,
+                                    _project_auto_activation_generation)
+    except Exception:
+        pass
+
+
+def _restore_result_record_path(project_root, path):
+    """The Host's persisted outcome of the last restore of this capture."""
+    canonical = os.path.normcase(os.path.abspath(str(path or ""))).replace("\\", "/")
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return os.path.join(str(project_root), ".replaylab", "replay-project", "derived",
+                        "restore-results", digest + ".json")
+
+
+def _report_shared_shader_reuse(project_root, path, session_id, generation):
+    """Say what the project knows and what this open found of it.
+
+    Two files answer it without asking anyone: the replay project's knowledge
+    heads (how many Shaders have organized work at all) and the restore result the
+    Host persisted for this capture (which of those heads were looked for, found,
+    restored, or not found). "Not found" is what the user wants to know about --
+    a Shader organized in another capture that this capture also binds should
+    appear here as found, and when it does not the persisted result names it.
+    This reports and applies nothing.
+    """
+    if not HAS_UI or _project_async_executor is None or not str(project_root or ""):
+        return
+    executor = _project_async_executor
+    project_file = os.path.join(str(project_root), ".replaylab", "replay-project", "project.json")
+    record_file = _restore_result_record_path(project_root, path)
+
+    def _plan():
+        heads = 0
+        try:
+            with open(project_file, "r", encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            workspaces = (manifest.get("knowledge") or {}).get("workspaces") or []
+            heads = len({(str(item.get("stage", "")), str(item.get("entryPoint", "")),
+                          str(item.get("rawSha256", "")))
+                         for item in workspaces if isinstance(item, dict)})
+        except Exception:
+            heads = 0
+        record = None
+        try:
+            with open(record_file, "r", encoding="utf-8") as stream:
+                record = json.load(stream)
+        except Exception:
+            record = None
+        return {"heads": heads, "record": record if isinstance(record, dict) else None}
+
+    def _planned(value, error):
+        if (generation != _project_auto_activation_generation or
+                str(_capture_session_id or "") != session_id):
+            return
+        if error or not isinstance(value, dict):
+            return
+        heads = _safe_int(value.get("heads"), 0)
+        if heads <= 0:
+            return    # nothing has been organized in this project yet.
+        record = value.get("record") or {}
+        lookup = record.get("targetLookup") if isinstance(record.get("targetLookup"), dict) else {}
+        observed = lookup.get("observedTargetRawSha256s")
+        unobserved = lookup.get("unobservedTargetRawSha256s")
+        shaders = record.get("shaders") if isinstance(record.get("shaders"), dict) else {}
+        applied = _safe_int(shaders.get("applied"), 0)
+        # Knowledge heads, matched resources and editable sessions are different
+        # units. In particular the watcher pool must never masquerade as matches.
+        editing = record.get("editing") or {}
+        matched_resources = len({(item.get("stage"), str(item.get("resourceId")))
+            for item in shaders.get("items", []) if isinstance(item, dict)})
+        if shaders.get("items"):
+            message = _project_ui_format(QtCore.QCoreApplication.translate(
+                "ReplayLabProjects", "Project knowledge: %1; matched Shader resources: %2; replacements: %3; editable: %4; pending: %5"),
+                str(heads), str(matched_resources), str(applied), str(_safe_int(editing.get("enabled"), 0) + _safe_int(editing.get("ready"), 0)),
+                str(_safe_int(shaders.get("failed"), 0) + _safe_int(editing.get("failed"), 0)))
+            _show_project_background_status(message, 60000)
+            _publish_console_event("project", "info", message, phase="project", code="projectReuseSummary",
+                context={"operation": "projectReuseSummary", "captureSessionId": session_id,
+                    "knowledgeHeads": heads, "matchedResources": matched_resources, "replacements": applied,
+                    "editable": _safe_int(editing.get("enabled"), 0) + _safe_int(editing.get("ready"), 0)})
+            return
+        source_only = 0
+        try:
+            _project_restore_client_protocol._validate_shader_items(shaders)
+            source_only = _project_restore_client_protocol._validated_source_only_skips(shaders["items"])
+        except Exception:
+            pass
+        superseded = sum(1 for item in (shaders.get("items") or [])
+                         if isinstance(item, dict)
+                         and item.get("status") == "applied"    # i18n-ignore: restore record status identifier
+                         and isinstance(item.get("supersededLocalEdit"), dict))
+        if source_only:
+            message = _project_ui_format(QtCore.QCoreApplication.translate(
+                "ReplayLabProjects",
+                "The project holds work for %1 Shaders; %2 applied, %3 saved source drafts remain unapplied"),
+                str(heads), str(applied), str(source_only))
+        elif superseded and (isinstance(observed, list) or isinstance(unobserved, list)):
+            found = len(observed) if isinstance(observed, list) else 0
+            message = _project_ui_format(QtCore.QCoreApplication.translate(
+                "ReplayLabProjects",
+                "The project holds organized work for %1 Shaders; this capture binds %2 "
+                "of them: %3 restored, %4 of which replaced a local edit (backup kept in "
+                "the workspace's ai/local-edits)"),
+                str(heads), str(found), str(applied), str(superseded))
+        elif isinstance(observed, list) or isinstance(unobserved, list):
+            found = len(observed) if isinstance(observed, list) else 0
+            missing = len(unobserved) if isinstance(unobserved, list) else 0
+            message = _project_ui_format(QtCore.QCoreApplication.translate(
+                "ReplayLabProjects",
+                "The project holds organized work for %1 Shaders; this capture binds %2 "
+                "of them (%3 restored), %4 not found here -- details in "
+                "derived/restore-results"), str(heads), str(found), str(applied), str(missing))
+        elif record.get("restoreMode") == "verified-rdc-restore":
+            message = _project_ui_format(QtCore.QCoreApplication.translate(
+                "ReplayLabProjects",
+                "The project holds organized work for %1 Shaders (%2 restored from the verified content cache)"),
+                str(heads), str(applied))
+        else:
+            message = _project_ui_format(QtCore.QCoreApplication.translate(
+                "ReplayLabProjects",
+                "The project holds organized work for %1 Shaders (%2 restored into this "
+                "capture; restore mode %3)"), str(heads), str(applied),
+                str(record.get("restoreMode") or "none"))    # i18n-ignore: restore mode identifier
+        # The line the user waited for: keep it a full minute, and in the console
+        # for good.
+        _show_project_background_status(message, 60000)
+        _publish_console_event(
+            "project", "info", message, phase="project", code="projectReuseSummary",
+            context={"operation": "projectReuseSummary", "captureSessionId": session_id,
+                     "heads": heads, "restoreMode": str(record.get("restoreMode") or ""),
+                     "observed": observed if isinstance(observed, list) else None,
+                     "unobserved": unobserved if isinstance(unobserved, list) else None,
+                     "applied": applied})
+
+    try:
+        executor.submit("shared-shader-library", _plan, _planned)
+    except Exception:
+        pass
 
 
 def _attach_project_auto_restore_progress(executor, restore_client, generation, session_id, path):
@@ -22039,7 +26338,9 @@ def _attach_project_auto_restore_progress(executor, restore_client, generation, 
         with guard:
             latest, state["latest"] = state["latest"], None
         if latest is not None:
-            _show_project_background_status(_project_launcher_protocol._restore_status_text(latest))
+            _show_project_background_status(
+                _project_launcher_protocol._restore_status_text(latest),
+                current=latest.get("current", 0), total=latest.get("total", 0))
 
     def publish(value):
         if not current():
@@ -22086,25 +26387,103 @@ def _project_auto_restore_diagnostic(value, worker_error, generation, session_id
         "error": text(worker_error or result.get("error"), 1024),
     }
     incomplete = False
+    unexplained_incomplete = False
+    preserved_workspace_ids = set()
+    skipped_local_edits = set()
     for name, success in (("shaders", "applied"), ("materials", "restored"),
                           ("editing", "enabled")):
         section = result.get(name)
         section = section if isinstance(section, dict) else {}
+        items = section.get("items")
+        pending_sources = set()
+        fallback_drafts = 0
+        preserved_local_edits = 0
+        if name == "shaders" and isinstance(items, list) and (
+                section.get("skipped", 0) or any(isinstance(item, dict) and
+                    ("pendingSource" in item or "preservedLocalSource" in item) for item in items)):
+            try:
+                # Share the strict receipt reader's identity checks. A known
+                # reason alone must not turn an arbitrary skipped failure into
+                # a successful restore observation.
+                _project_restore_client_protocol._validate_shader_items(section)
+                pending_count = _project_restore_client_protocol._validated_source_only_skips(items)
+                if pending_count:
+                    pending_sources = {id(item) for item in items if item.get("status") == "skipped"
+                                       and item.get("reason") in (
+                                           "source-only-project-draft", "legacy-saved-organization-draft",
+                                           "legacy-organization-publication-needs-review")}
+                # A previous validated source and its newer editable draft are
+                # one restored Shader. Report the unapplied draft as well,
+                # without counting a second restore or a skipped replacement.
+                fallback_drafts = sum(1 for item in items if item.get("status") == "applied"
+                                      and isinstance(item.get("pendingSource"), dict))
+                preserved_local_edits = sum(1 for item in items if item.get("status") == "applied"
+                                            and isinstance(item.get("preservedLocalSource"), dict))
+                preserved_workspace_ids = {item.get("workspaceId") for item in items
+                                           if item.get("status") == "applied"
+                                           and isinstance(item.get("preservedLocalSource"), dict)}
+                skipped_local_edits = {id(item) for item in items
+                    if item.get("status") == "skipped" and item.get("reason") == "local-edit"
+                    and re.fullmatch(r"[0-9a-f]{32}", str(item.get("knowledgeId", "")))
+                    and all(re.fullmatch(r"[0-9a-f]{64}", str(item.get(key, "")))
+                            for key in ("rawSha256", "knowledgeSourceSha256", "workspaceSourceSha256"))
+                    and item["knowledgeSourceSha256"] != item["workspaceSourceSha256"]
+                    and os.path.isabs(str(item.get("workspacePath", "")))}
+            except Exception:
+                pending_sources = set()
+                fallback_drafts = 0
+                preserved_local_edits = 0
+                incomplete = True
+                unexplained_incomplete = True
         counts = {}
-        for key in ("attempted", success, "skipped", "failed"):
+        for key in (("attempted", success, "skipped", "failed", "deferred", "ready")
+                    if name == "editing" else ("attempted", success, "skipped", "failed")):
             count = section.get(key, 0)
             if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 1000000:
                 counts[key] = count
-        if (counts.get("failed", 0) or counts.get("skipped", 0) or
-                counts.get("attempted", 0) != counts.get(success, 0)):
+        if pending_sources or fallback_drafts:
+            counts["sourceOnlyDrafts"] = len(pending_sources) + fallback_drafts
+        if fallback_drafts:
+            counts["replayFallbackDrafts"] = fallback_drafts
+        if preserved_local_edits:
+            counts["preservedLocalEdits"] = preserved_local_edits
+        local_skips = skipped_local_edits if name == "shaders" else set()
+        if local_skips:
+            counts["unappliedLocalEdits"] = len(local_skips)
             incomplete = True
-        items = section.get("items")
+        if (counts.get("failed", 0) or counts.get("skipped", 0) != len(pending_sources) + len(local_skips) or
+                counts.get("attempted", 0) != counts.get(success, 0) + counts.get("deferred", 0) + counts.get("ready", 0)):
+            incomplete = True
+            unexplained_incomplete = True
         failures = []
         for item in (items[:256] if isinstance(items, list) else []):
             if not isinstance(item, dict):
                 continue
-            if item.get("status") not in ("applied", "restored", "enabled"):
-                incomplete = True
+            if item.get("status") != success:
+                # A validated restore may intentionally keep an unfinished
+                # organization read-only instead of authorizing a watcher.
+                # Its reason is explanatory, not a failed restore operation.
+                startup_pending = (name == "editing" and section.get("status") == "pending"
+                                   and type(section.get("pending")) is int
+                                   and section["pending"] == len(items)
+                                   and counts.get("attempted", 0) == 0
+                                   and item.get("status") == "pending")
+                ready = (name == "editing" and item.get("status") == "ready"
+                         and item.get("editingMode") == "on-demand"
+                         and item.get("readOnly") is False
+                         and item.get("backgroundAutoApplyAuthorized") is False)
+                deferred = startup_pending or ready or (name == "editing" and item.get("status") == "deferred"
+                            and item.get("backgroundAutoApplyAuthorized") is False
+                            and ((item.get("reason") == "organization-draft-open"
+                                  and item.get("readOnly") is True)
+                                 or (item.get("reason") == "local-edit-preserved"
+                                     and item.get("readOnly") is False
+                                     and item.get("editingMode") == "source-only"
+                                     and item.get("workspaceId") in preserved_workspace_ids)))
+                if not deferred and id(item) not in pending_sources:
+                    incomplete = True
+                    if id(item) not in local_skips:
+                        unexplained_incomplete = True
                 if len(failures) < 8:
                     failures.append({key: text(item.get(key)) for key in
                                      ("status", "workspaceId", "knowledgeId", "reason", "error")
@@ -22132,18 +26511,22 @@ def _project_auto_restore_diagnostic(value, worker_error, generation, session_id
     if result.get("outcome") == "action-required":
         phase = "index-required" if summary["reasonId"] == "catalog-index-required" else "failed"
         diagnostic = summary["reasonId"] or diagnostic or "action-required"
+    elif skipped_local_edits and summary["completed"] and not diagnostic and not unexplained_incomplete:
+        phase = "partial"
+        diagnostic = "local-edit"
     elif diagnostic or not summary["completed"] or incomplete or result.get("outcome") == "partial":
         phase = "failed"
         item_diagnostic = next((item.get("error") or item.get("reason")
                                 for name in ("shadersItems", "materialsItems", "editingItems")
                                 for item in summary.get(name, [])
-                                if item.get("error") or item.get("reason")), "")
+                                if item.get("status") == "failed" and
+                                (item.get("error") or item.get("reason"))), "")
         diagnostic = diagnostic or summary["reasonId"] or item_diagnostic or "restore-incomplete"
     else:
         phase = "complete"
     summary["phase"] = phase
     summary["diagnostic"] = diagnostic
-    if phase != "complete":
+    if phase not in ("complete", "partial"):
         # i18n-ignore: these are bounded Host result counters/reason IDs, shown only as diagnostics below the translated status.
         diagnostic += "; " + json.dumps({name: summary[name] for name in ("shaders", "materials", "editing")}, separators=(",", ":"))
     return summary, diagnostic[:1024]
@@ -22168,7 +26551,7 @@ def _schedule_project_auto_activation():
         _show_project_background_status(
             QtCore.QCoreApplication.translate(
                 "ReplayLabProjects",
-                "ReplayLab: using the project selected for this RDC"), 5000)
+                "Using the project selected for this RDC"), 5000)
         return
     _project_auto_activation_generation += 1
     generation = _project_auto_activation_generation
@@ -22184,7 +26567,7 @@ def _schedule_project_auto_activation():
             "generation": generation,
         })
     except Exception as exc:
-        print("[ReplayLab] Could not create capture/project association lease: %s" %
+        print("[Bread] Could not create capture/project association lease: %s" %
               str(exc))
         return
 
@@ -22206,7 +26589,7 @@ def _schedule_project_auto_activation():
             _show_project_background_status(
                 QtCore.QCoreApplication.translate(
                     "ReplayLabProjects",
-                    "ReplayLab: matching this RDC to a registered project path…"))
+                    "Matching this RDC to a registered project path…"))
 
             def _matched(value, error):
                 global _project_auto_restore_client, _project_auto_restore_result
@@ -22225,23 +26608,23 @@ def _schedule_project_auto_activation():
                     return
                 _consume_project_association_lease(lease_token)
                 if error:
-                    print("[ReplayLab] Capture/project association skipped: %s" % error)
+                    print("[Bread] Capture/project association skipped: %s" % error)
                     _show_project_background_status(
                         _project_ui_format(QtCore.QCoreApplication.translate(
                             "ReplayLabProjects",
-                            "ReplayLab: project association was not changed (%1)"),
+                            "Project association was not changed (%1)"),
                             error),
                         7000)
                     return
                 project = (value or {}).get("project")
                 if ((value or {}).get("activated") is True and
                         (value or {}).get("matchCount") == 1 and isinstance(project, dict)):
-                    print("[ReplayLab] Activated path-matched project '%s' for %s" %
+                    print("[Bread] Activated path-matched project '%s' for %s" %
                           (project.get("name", ""), path))
                     _show_project_background_status(
                         _project_ui_format(QtCore.QCoreApplication.translate(
                             "ReplayLabProjects",
-                            "ReplayLab: active project is %1"),
+                            "Active project: %1"),
                             project.get("name", "")), 5000)
                     if _project_restore_client_protocol is None:
                         return
@@ -22293,7 +26676,11 @@ def _schedule_project_auto_activation():
                             restored, restore_error, generation, session_id)
                         _project_auto_restore_result = summary
                         message = _project_launcher_protocol._restore_status_text({
-                            "phase": summary["phase"], "item": diagnostic})
+                            "phase": summary["phase"], "item": diagnostic,
+                            "appliedShaders": summary["shaders"].get("applied", 0),
+                            "preservedLocalEdits": summary["shaders"].get("preservedLocalEdits", 0),
+                            "unappliedLocalEdits": summary["shaders"].get("unappliedLocalEdits", 0),
+                            "sourceOnlyDrafts": summary["shaders"].get("sourceOnlyDrafts", 0)})
                         _publish_console_event(
                             "project", "info" if summary["phase"] == "complete" else "warning",
                             message, phase=summary["phase"], code="projectAutoRestoreFinished",
@@ -22307,6 +26694,10 @@ def _schedule_project_auto_activation():
                         _show_project_background_status(message, 10000 if summary["phase"] != "complete" else 5000)
                         if _shader_workspace_ui is not None:
                             _shader_workspace_ui.refresh(force=True)
+                        # Whatever the outcome: what the project knows against what
+                        # this capture bound is the line the user is waiting for.
+                        _report_shared_shader_reuse(
+                            project.get("projectRoot", ""), path, session_id, generation)
 
                     _show_project_background_status(
                         # i18n-ignore: client-validate is the existing restore phase ID, not display text
@@ -22316,8 +26707,7 @@ def _schedule_project_auto_activation():
                     _show_project_background_status(
                         QtCore.QCoreApplication.translate(
                             "ReplayLabProjects",
-                            "ReplayLab: no unique registered project path; active project "
-                            "unchanged"),
+                            "No unique registered project path; active project unchanged"),
                         5000)
 
             _project_async_executor.cancel_owner("capture-auto-activation")
@@ -22329,7 +26719,7 @@ def _schedule_project_auto_activation():
         except Exception as exc:
             # Capture loading succeeded independently. Project association is a
             # best-effort metadata step and must never close or disturb it.
-            print("[ReplayLab] Capture/project association skipped: %s" % str(exc))
+            print("[Bread] Capture/project association skipped: %s" % str(exc))
 
     # Start only a bounded worker from the lifecycle callback. Use an explicitly
     # owned timer so unregister can detach its Python closure before Py_Finalize.
@@ -22354,7 +26744,7 @@ def _register_project_launcher_ui(ctx):
     global _project_launcher_callbacks, _project_thumbnail_cache, _project_thumbnail_reader
     global _project_async_executor, _project_startup_timer
     if not getattr(_project_launcher_protocol, "HAS_QT", False):
-        raise RuntimeError("PySide2 is unavailable for the ReplayLab project launcher")
+        raise RuntimeError("PySide2 is unavailable for the Bread project launcher")
     if _project_thumbnail_cache is None:
         _project_thumbnail_cache = _project_launcher_protocol.ThumbnailCache()
     if _project_thumbnail_reader is None:
@@ -22388,20 +26778,34 @@ def _register_project_launcher_ui(ctx):
             }
         client = _project_restore_client_protocol.ReplayLabRestoreHostClient(
             internal_executable=_find_replaylab_internal_host())
+        result = None
+        worker_error = None
         try:
             result = client.restore(
                 project_root, expected_path, session_id, progress_callback)
         except _project_restore_client_protocol.ReplayLabRestoreHostIncompatible:
-            return {
-                "errorId": "host-runtime-incompatible"
-            }
+            worker_error = "host-runtime-incompatible"
+            result = {"errorId": "host-runtime-incompatible"}
+        except Exception as exc:
+            # The exception still reaches the window's status task below; the
+            # console must hear about it too, or a failed restore looks like a
+            # restore that never ended.
+            worker_error = "%s: %s" % (type(exc).__name__, str(exc)[:800])
+            _publish_project_window_restore_outcome(
+                project_root, expected_path, session_id, None, worker_error)
+            raise
         unchanged = bool(
             str(_capture_session_id or "") == session_id and
             _active_capture_token == expected_token)
         if not unchanged:
+            _publish_project_window_restore_outcome(
+                project_root, expected_path, session_id, result,
+                "capture-changed-during-restore")
             return {
                 "errorId": "capture-changed-during-restore"
             }
+        _publish_project_window_restore_outcome(
+            project_root, expected_path, session_id, result, worker_error)
         return result
 
     def _show(_ctx_value=None, _data=None):
@@ -22423,10 +26827,10 @@ def _register_project_launcher_ui(ctx):
             ctx.Extensions().ErrorDialog(
                 QtCore.QCoreApplication.translate(
                     "ReplayLabProjects",
-                    "The packaged ReplayLabInternal.exe is unavailable. Reinstall the "
-                    "complete ReplayLab bundle before using project management."),
+                    "The Bread project service is unavailable. "
+                    "Reinstall the complete runtime bundle before using project management."),
                 QtCore.QCoreApplication.translate(
-                    "ReplayLabProjects", "ReplayLab Projects"))
+                    "ReplayLabProjects", "Projects"))
             return
         try:
             client = _project_launcher_protocol.ReplayLabProjectClient(executable)
@@ -22442,7 +26846,7 @@ def _register_project_launcher_ui(ctx):
             _project_launcher_ui = None
             ctx.Extensions().ErrorDialog(
                 str(exc), QtCore.QCoreApplication.translate(
-                    "ReplayLabProjects", "ReplayLab Projects"))
+                    "ReplayLabProjects", "Projects"))
 
     def _show_startup():
         if _ctx is ctx and _project_launcher_startup_allowed():
@@ -22451,7 +26855,7 @@ def _register_project_launcher_ui(ctx):
     _project_launcher_callbacks.extend((_show, _show_startup))
     ctx.Extensions().RegisterWindowMenu(
         qrd.WindowMenu.File, [QtCore.QCoreApplication.translate(
-            "ReplayLabProjects", "ReplayLab Projects…")], _show)
+            "ReplayLabProjects", "Projects…")], _show)
     # Let CaptureContext.Begin process command-line capture parameters first.
     # A direct .rdc open or a loading capture suppresses this optional home UI.
     # This must be cancellable during fast application shutdown.
@@ -22506,7 +26910,7 @@ def _unregister_project_launcher_ui():
             shutdown_result = executor.shutdown()
             if shutdown_result is not True:
                 raise RuntimeError(
-                    "ReplayLab project executor did not confirm shutdown")
+                    "Bread project executor did not confirm shutdown")
             if (restore_shutdown_generation is not None and
                     _project_restore_client_protocol is not None):
                 wait_quiescent = getattr(
@@ -22515,12 +26919,25 @@ def _unregister_project_launcher_ui():
                 if (callable(wait_quiescent) and
                         not wait_quiescent(restore_shutdown_generation, 0.0)):
                     raise RuntimeError(
-                        "ReplayLab project restore workers did not quiesce")
+                        "Bread project restore workers did not quiesce")
         except Exception as exc:
             # Never silently continue into Py_Finalize with a live QRunnable.
-            print("[ReplayLab] Project executor shutdown error: %s" % str(exc))
+            print("[Bread] Project executor shutdown error: %s" % str(exc))
             raise
         _project_async_executor = None
+
+
+_shader_visual_debug_manager = None
+
+
+def _shader_visual_debug_operation(operation, params):
+    """Direct portable worker entry; preview never goes through save/publication."""
+    global _shader_visual_debug_manager
+    if _shader_visual_debug_manager is None:
+        from . import shader_visual_debug
+        _shader_visual_debug_manager = shader_visual_debug.Manager(
+            shader_visual_debug.ReplayDriver(sys.modules[__name__]))
+    return _shader_visual_debug_manager.operation(operation, params)
 
 
 def _shader_workspace_capture_binding():
@@ -22540,23 +26957,68 @@ def _shader_workspace_capture_binding():
 
 
 def _notify_shader_capture_changed(binding):
+    global _frame_render_flow_outline_cache, _frame_render_flow_saved, _frame_render_flow_generation
+    _frame_render_flow_outline_cache = None
+    _frame_render_flow_saved = None
+    _frame_render_flow_generation += 1
+    if _project_async_executor is not None:
+        _project_async_executor.cancel_owner("frame-flow-restore")
     for panel in (_shader_workspace_ui, _shader_console_ui):
         changed = getattr(panel, "capture_changed", None)
         if callable(changed):
             changed(binding)
+    if _frame_render_flow_ui is not None:
+        loader = getattr(_frame_render_flow_ui, "_channel_preview_loader", None)
+        if loader is not None:
+            loader.close()
+            _frame_render_flow_ui._channel_preview_loader = None
+        _frame_render_flow_ui.capture_changed()
+
+
+def open_native_document_json(request_json):
+    request = json.loads(str(request_json or "{}"))
+    from .project_document_viewer import open_document
+    path = os.path.abspath(str(request.get("path") or ""))
+    if not os.path.isfile(path):
+        raise ValueError("Document does not exist")
+    def navigate(eid):
+        if _ctx.IsCaptureLoaded() and _ctx.GetAction(eid) is not None:
+            _ctx.SetEventID([], eid, eid)
+    window = open_document(path, _ctx.GetMainWindow().Widget(), navigate)
+    return json.dumps({"opened": bool(window), "path": path})
+
+
+def navigate_native_shader_source_json(request_json):
+    """Native chat navigation; no replay calls, filesystem reads or arbitrary file opening."""
+    request = json.loads(str(request_json or "{}"))
+    accepted = False
+    if isinstance(request, dict) and _shader_workspace_ui is not None:
+        if request.get("target") is True:
+            # Pipeline reflection may expose the active replacement RID. Its
+            # current-session owner already records the captured original;
+            # navigation never needs a replay/catalog query to recover it.
+            binding = _shader_workspace_capture_binding() or {}
+            for record in list(_shared_shader_replacements.values()):
+                if (record.get("captureSessionId") == binding.get("captureSessionId")
+                        and str(record.get("targetResourceId", "")) == str(request.get("resourceId", ""))):
+                    request["resourceId"] = str(record["expectedOriginalResourceId"])
+                    break
+            return json.dumps(_shader_workspace_ui.navigate_shader_target(request))
+        accepted = _shader_workspace_ui.navigate_source_link(request)
+    return json.dumps({"accepted": bool(accepted)})
 
 
 def _register_shader_workspace_ui(ctx):
     """Register and immediately show the reviewed HLSL workspace dock."""
     global _shader_workspace_callbacks
     if not getattr(_shader_workspace_protocol, "HAS_QT", False):
-        raise RuntimeError("PySide2 is unavailable for ReplayLab Shader Workspace")
+        raise RuntimeError("PySide2 is unavailable for Bread Shader Workspace")
 
     def _closed():
         global _shader_workspace_ui
         _shader_workspace_ui = None
 
-    def _show(_ctx_value=None, _data=None):
+    def _show(_ctx_value=None, _data=None, activate_window=True):
         global _shader_workspace_ui
         if _shader_workspace_ui is None:
             _shader_workspace_ui = (
@@ -22564,13 +27026,15 @@ def _register_shader_workspace_ui(ctx):
                     ctx, qrd, closed_callback=_closed,
                     registry_path=_shader_console_protocol.default_registry_path(),
                     capture_binding_provider=_shader_workspace_capture_binding,
+                    visual_debug_operation=_shader_visual_debug_operation,
                     async_executor=_ensure_project_async_executor()))
-        _shader_workspace_ui.show()
+        if activate_window:
+            _shader_workspace_ui.show()
 
     _shader_workspace_callbacks.append(_show)
     ctx.Extensions().RegisterWindowMenu(
         qrd.WindowMenu.Tools,
-        [QtCore.QCoreApplication.translate("ReplayLabProjects", "ReplayLab"),
+        [QtCore.QCoreApplication.translate("ReplayLabProjects", "Bread AI"),
          QtCore.QCoreApplication.translate(
              "ReplayLabProjects", "Shader Workspace")], _show)
     ctx.Extensions().RegisterWindowMenu(
@@ -22596,12 +27060,189 @@ def _unregister_shader_workspace_ui():
     _shader_workspace_callbacks = []
 
 
-# replaylab-project-i18n-end
+def _ensure_frame_render_flow_ui():
+    global _frame_render_flow_ui
+    if not HAS_UI or _ctx is None:
+        raise RuntimeError("Bread frame render flow UI is unavailable")
+    if _frame_render_flow_ui is None:
+        from .project_frame_flow import FrameRenderFlowPanel
+        from .frame_flow_channels import (ChannelPreviewLoader, capture_channels,
+                                          existing_channel_semantics, mutation_identity)
+
+        owner = [None]
+
+        def request_channels(preview, completion):
+            # This callback runs on UI: snapshot all native context here. GPU,
+            # directory creation, PNG reads and hash checks run in the worker.
+            panel = owner[0]
+            binding = _shader_workspace_capture_binding()
+            if panel is None or not binding:
+                raise RuntimeError("Channel preview requires an active capture")
+            replay = _ctx.Replay()
+            snapshot = {"session": _capture_session_id, "originalEvent": int(_ctx.CurEvent()),
+                        "replay": replay, "flowGeneration": _frame_render_flow_generation,
+                        "foregroundGeneration": _replay_foreground_generation(replay),
+                        "mutationEpoch": mutation_identity(sys.modules[__name__])}
+            loader = getattr(panel, "_channel_preview_loader", None)
+            if loader is None:
+                loader = ChannelPreviewLoader(
+                    _ensure_project_async_executor(),
+                    lambda parent, state, meanings, cancelled: capture_channels(
+                        sys.modules[__name__], parent, state, meanings, cancelled),
+                    lambda: _capture_session_id,
+                    current_mutation=lambda: mutation_identity(sys.modules[__name__]))
+                panel._channel_preview_loader = loader
+            semantics = existing_channel_semantics(panel.document, preview)
+            loader.request(preview, snapshot, semantics, completion)
+
+        def closed(*args):
+            global _frame_render_flow_ui
+            panel = owner[0]
+            loader = getattr(panel, "_channel_preview_loader", None)
+            if loader is not None:
+                loader.close()
+            owner[0] = None
+            if not args or _frame_render_flow_ui is args[0]:
+                _frame_render_flow_ui = None
+
+        _frame_render_flow_ui = FrameRenderFlowPanel(
+            _ctx, qrd, capture_binding_provider=_shader_workspace_capture_binding,
+            closed_callback=closed, navigation_callback=_navigate_frame_render_flow,
+            channel_request_callback=request_channels,
+            channel_revision_provider=lambda: mutation_identity(sys.modules[__name__]))
+        owner[0] = _frame_render_flow_ui
+    return _frame_render_flow_ui
+
+
+def _schedule_frame_render_flow_restore():
+    """Restore the capture's diagram asynchronously; GUI callbacks never read files."""
+    if not HAS_UI or not _ctx or not _ctx.IsCaptureLoaded():
+        return
+    from .frame_flow_persistence import load, legacy_candidates, rebind, save
+    capture = _capture_identity_on_ui()
+    if not capture.get("local") or not capture.get("path"):
+        return
+    session, generation = _capture_session_id, _frame_render_flow_generation
+    replay, executor = _ctx.Replay(), _ensure_project_async_executor()
+
+    def worker():
+        if session != _capture_session_id:
+            return None
+        root = _frame_flow_artifact_root()
+        bundle = load(capture["path"], root)
+        candidates = [bundle] if bundle else legacy_candidates(capture["path"], root)
+        if not candidates:
+            return None
+        result, failure = [None], [None]
+
+        def collect(ctrl):
+            if session != _capture_session_id:
+                return
+            try:
+                result[0] = _collect_frame_render_flow_outline(ctrl, capture, session)
+            except Exception as error:
+                failure[0] = error
+
+        # This only traverses the already-loaded action tree. It never calls
+        # SetFrameEvent, compiles a Shader or waits for one replay per EID.
+        replay.BlockInvoke(collect)
+        if failure[0] is not None:
+            raise failure[0]
+        if result[0] is None or session != _capture_session_id:
+            return None
+        restore_errors = []
+        for candidate in candidates:
+            try:
+                restored = rebind(candidate, result[0])
+                if candidate.get("legacy"):
+                    restored["persistence"] = save(capture["path"], restored["document"],
+                                                    restored["outline"], root)
+                    restored["persistence"]["migratedLegacy"] = True
+                return restored
+            except (ValueError, OSError) as error:
+                restore_errors.append(str(error))
+                if not candidate.get("legacy"):
+                    raise
+        if restore_errors:
+            raise RuntimeError("No saved frame diagram matched the opened capture: " + restore_errors[0])
+        return None
+
+    def completed(value, error):
+        global _frame_render_flow_saved, _frame_render_flow_outline_cache
+        if (session != _capture_session_id or generation != _frame_render_flow_generation or
+                _ctx is None or not _ctx.IsCaptureLoaded()):
+            return
+        if error:
+            _publish_console_event("frame-flow", "warning",
+                QtCore.QCoreApplication.translate("ReplayLabProjects",
+                    "Saved frame diagram was not restored: %1").replace("%1", str(error)),
+                phase="restore", code="frameFlowRestoreFailed")
+            return
+        if value:
+            _frame_render_flow_saved = value
+            _frame_render_flow_outline_cache = value["outline"]
+            panel = _ensure_frame_render_flow_ui()
+            panel.set_document(value["document"])
+            panel.show()
+
+    executor.cancel_owner("frame-flow-restore")
+    executor.submit("frame-flow-restore", worker, completed)
+
+
+def _navigate_frame_render_flow(value):
+    from .frame_stage_evidence import navigate
+    return navigate(_ctx, rd, value, _resource_id_int, qrd)
+
+
+def _register_frame_render_flow_ui(ctx):
+    global _frame_render_flow_layout
+    from .project_frame_flow_layout import FrameFlowLayoutController
+
+    def show(_ctx_value=None, _data=None):
+        _ensure_frame_render_flow_ui().show()
+
+    _frame_render_flow_callbacks.append(show)
+    ctx.Extensions().RegisterWindowMenu(
+        qrd.WindowMenu.Window,
+        [QtCore.QCoreApplication.translate("ReplayLabProjects", "Frame Rendering Flow")], show)
+    ctx.Extensions().RegisterWindowMenu(
+        qrd.WindowMenu.Tools,
+        [QtCore.QCoreApplication.translate("ReplayLabProjects", "Bread AI"),
+         QtCore.QCoreApplication.translate("ReplayLabProjects", "Frame Rendering Flow")], show)
+    _frame_render_flow_layout = FrameFlowLayoutController(
+        ctx.GetMainWindow().Widget(), _ensure_frame_render_flow_ui,
+        existing_panel=lambda: _frame_render_flow_ui)
+    if ctx.IsCaptureLoaded():
+        _schedule_frame_render_flow_restore()
+
+
+def _unregister_frame_render_flow_ui():
+    global _frame_render_flow_ui, _frame_render_flow_callbacks, _frame_render_flow_outline_cache
+    global _frame_render_flow_layout
+    global _frame_render_flow_saved, _frame_render_flow_generation
+    _frame_render_flow_generation += 1
+    _frame_render_flow_saved = None
+    if _frame_render_flow_layout is not None:
+        _frame_render_flow_layout.close()
+        _frame_render_flow_layout = None
+    if _project_async_executor is not None:
+        _project_async_executor.cancel_owner("frame-flow-restore")
+    panel = _frame_render_flow_ui
+    if panel is not None:
+        loader = getattr(panel, "_channel_preview_loader", None)
+        if loader is not None:
+            loader.close()
+        panel.shutdown()
+    _frame_render_flow_ui = None
+    _frame_render_flow_callbacks = []
+    _frame_render_flow_outline_cache = None
+
+
 def _register_shader_console_ui(ctx):
-    """Register the audit-only, continuously refreshed ReplayLab Console dock."""
+    """Register the audit-only, continuously refreshed console dock."""
     global _shader_console_callbacks
     if not getattr(_shader_console_protocol, "HAS_QT", False):
-        raise RuntimeError("PySide2 is unavailable for ReplayLab Console")
+        raise RuntimeError("PySide2 is unavailable for Bread Console")
 
     def _closed():
         global _shader_console_ui
@@ -22609,32 +27250,61 @@ def _register_shader_console_ui(ctx):
 
     def _show(_ctx_value=None, _data=None):
         global _shader_console_ui
-        if _shader_console_ui is None:
-            _shader_console_ui = _shader_console_protocol.ReplayLabConsolePanel(
-                ctx, qrd, closed_callback=_closed,
-                capture_binding_provider=_shader_workspace_capture_binding)
-        _shader_console_ui.show()
+        # A failure here used to vanish into qrenderdoc's Python log, and the
+        # menu entry simply "did nothing". Say what went wrong, where the user
+        # clicked, and drop the half-built instance so the next click retries.
+        try:
+            if _shader_console_ui is None:
+                _shader_console_ui = _shader_console_protocol.ReplayLabConsolePanel(
+                    ctx, qrd, closed_callback=_closed,
+                    capture_binding_provider=_shader_workspace_capture_binding)
+            _shader_console_ui.show()
+        except Exception as exc:
+            detail = "%s: %s" % (type(exc).__name__, str(exc)[:600])
+            print("[Bread] Console could not be opened: %s" % detail)
+            traceback.print_exc()
+            broken = _shader_console_ui
+            _shader_console_ui = None
+            if broken is not None:
+                try:
+                    broken.shutdown()
+                except Exception:
+                    pass
+            if _ctx_value is not None or _data is not None:
+                # Opened from a menu by a person: tell them, not the log.
+                try:
+                    ctx.Extensions().ErrorDialog(
+                        _project_ui_format(QtCore.QCoreApplication.translate(
+                            "ReplayLabProjects",
+                            "The console could not be opened: %1"), detail),
+                        QtCore.QCoreApplication.translate("ReplayLabProjects", "Console"))
+                except Exception:
+                    pass
 
     _shader_console_callbacks.append(_show)
+    _group = QtCore.QCoreApplication.translate("ReplayLabProjects", "Bread AI")
+    _console = QtCore.QCoreApplication.translate("ReplayLabProjects", "Console")
     ctx.Extensions().RegisterWindowMenu(
-        qrd.WindowMenu.Tools, ["ReplayLab", "Console"], _show)
+        qrd.WindowMenu.Tools, [_group, _console], _show)
     ctx.Extensions().RegisterWindowMenu(
-        qrd.WindowMenu.Window, ["ReplayLab Console"], _show)
-    # Keep the previous Tools entry for installed workflows/bookmarks. Both
-    # callbacks open the same general console instance.
-    ctx.Extensions().RegisterWindowMenu(
-        qrd.WindowMenu.Tools, ["ReplayLab", "Shader Console"], _show)
+        qrd.WindowMenu.Window, [_console], _show)
+    # Open at startup, docked along the bottom: project, restore, AI and Shader
+    # results are published as console events, and a console nobody sees is a
+    # log file with extra steps.
+    _show()
 
 
+# replaylab-project-i18n-end
 def _unregister_shader_console_ui():
     global _shader_console_ui, _shader_console_callbacks
     panel = _shader_console_ui
-    _shader_console_ui = None
     if panel is not None:
         try:
             panel.shutdown()
         except Exception as exc:
-            print("[ReplayLab] Console shutdown error: %s" % str(exc))
+            print("[Bread] Console shutdown error: %s" % str(exc))
+            raise
+    _shader_console_ui = None
     _shader_console_callbacks = []
 
 
@@ -22645,6 +27315,10 @@ def _unregister_shader_console_ui():
 def start(version, ctx):
     global _ctx, _poller, _capture_viewer, _active_capture_token
     global _shader_catalog_finalize_stopping
+    from .instance_environment import configure
+    configure(os.environ, INSTANCE_ID, IPC_DIR)
+    if _bridge_diagnostics is not None:
+        _bridge_diagnostics.start(BRIDGE_INTEGRATION_VERSION)
     with _shader_catalog_export_jobs_guard:
         if _shader_catalog_finalize_workers:
             raise RuntimeError("Shader catalog CPU worker is still stopping")
@@ -22658,12 +27332,21 @@ def start(version, ctx):
         try:
             ctx.AddCaptureViewer(_capture_viewer)
         except Exception as exc:
-            print("[ReplayLab] Capture viewer error: %s" % str(exc))
+            print("[Bread] Capture viewer error: %s" % str(exc))
             _capture_viewer = None
 
     _poller = JsonPoller(handle_request) if HAS_UI else None
     if _poller:
         _poller.start()
+
+    # The local editor/value-preview path needs no child process. Keep Unix
+    # usable without weakening the separate Windows Job containment contract
+    # of the packaged AI/Host sidecars.
+    if os.name != "nt":
+        if HAS_UI:
+            _register_shader_workspace_ui(ctx)
+        print("[Bread] Local Shader Workspace loaded (RenderDoc %s)" % version)
+        return
 
     # The private Host owns qrenderdoc's bounded project/restore/save services.
     # ReplayLabMCP is a separate external Codex/IDE adapter, owned by qrenderdoc
@@ -22673,49 +27356,50 @@ def start(version, ctx):
     if _external_mcp_autostart_enabled():
         _start_replaylab_host()
     if _project_restore_client_protocol is None:
-        print("[ReplayLab] Optional project restore transport unavailable: %s" %
+        print("[Bread] Optional project restore transport unavailable: %s" %
               _project_restore_client_import_error)
 
     if HAS_UI:
         try:
             _register_project_launcher_ui(ctx)
         except Exception as e:
-            print("[ReplayLab] Project launcher error: %s" % str(e))
+            print("[Bread] Project launcher error: %s" % str(e))
         try:
             ctx.Extensions().RegisterWindowMenu(
-                qrd.WindowMenu.Tools, ["ReplayLab", "Status"], _show_status)
+                qrd.WindowMenu.Tools,
+                [QtCore.QCoreApplication.translate("ReplayLabProjects", "Bread AI"), "Status"],
+                _show_status)
         except Exception as e:
-            print("[ReplayLab] Menu error: %s" % str(e))
+            print("[Bread] Menu error: %s" % str(e))
         try:
             _register_event_browser_filter_ui(ctx)
         except Exception as e:
-            print("[ReplayLab] Event Browser filter error: %s" % str(e))
-        try:
-            _register_material_panel_ui(ctx)
-        except Exception as e:
-            print("[ReplayLab] Material panel error: %s" % str(e))
-        try:
-            _register_pass_panel_ui(ctx)
-        except Exception as e:
-            print("[ReplayLab] Pass panel error: %s" % str(e))
+            print("[Bread] Event Browser filter error: %s" % str(e))
+        # Material editing lives in the native CBuffer views. The retired material
+        # and semantic-pass docks are not registered or instantiated at startup.
         try:
             _register_shader_console_ui(ctx)
         except Exception as e:
-            print("[ReplayLab] Console error: %s" % str(e))
+            print("[Bread] Console error: %s" % str(e))
         try:
             _register_shader_workspace_ui(ctx)
         except Exception as e:
-            print("[ReplayLab] Shader Workspace error: %s" % str(e))
+            print("[Bread] Shader Workspace error: %s" % str(e))
+        try:
+            _register_frame_render_flow_ui(ctx)
+        except Exception as e:
+            print("[Bread] Frame Rendering Flow error: %s" % str(e))
 
-    print("[ReplayLab] Loaded (RenderDoc %s)" % version)
-    print("[ReplayLab] IPC: %s" % IPC_DIR)
+    print("[Bread] Loaded (RenderDoc %s)" % version)
+    print("[Bread] IPC: %s" % IPC_DIR)
     _publish_console_event(
-        "system", "info", "ReplayLab 内置集成已加载", phase="系统",
+        "system", "info", "Bread AI 集成已加载", phase="系统",
         code="integrationLoaded")
 
 
 def stop():
     global _ctx, _poller, _capture_viewer, _active_capture_token
+    global _shader_visual_debug_manager
     errors = []
 
     def _cleanup(label, callback):
@@ -22724,7 +27408,7 @@ def stop():
         except Exception as exc:
             detail = "%s: %s" % (label, str(exc)[:512])
             errors.append(detail)
-            print("[ReplayLab] Shutdown cleanup error: %s" % detail)
+            print("[Bread] Shutdown cleanup error: %s" % detail)
 
     # Cancel/join project restore workers while both the persistent Host and
     # qrenderdoc IPC bridge are still alive. Releasing either side first can
@@ -22734,8 +27418,16 @@ def stop():
     # IPC bridge, and capture context below. Preserve those dependencies and
     # propagate the failure so native shutdown can skip Python finalization.
     _stop_shader_catalog_finalize_workers()
+    _cleanup("project status widget", _remove_project_background_status)
+    _cleanup("application UI control", _shutdown_application_ui)
     _unregister_project_launcher_ui()
     _unregister_shader_workspace_ui()
+    # A visual-preview worker owns event overrides and native target resources.
+    # Preserve the replay/Python lifetime if it cannot finish its restoration.
+    if _shader_visual_debug_manager is not None:
+        _shader_visual_debug_manager.shutdown()
+        _shader_visual_debug_manager = None
+    _cleanup("frame render flow", _unregister_frame_render_flow_ui)
     # Stop the IPC worker before releasing any remaining UI, Host, or capture
     # dependency. This is also a hard lifetime gate: if an uninterruptible
     # driver call has not returned yet, preserve the integration for retry.
@@ -22762,17 +27454,19 @@ def stop():
         _cleanup("capture viewer", lambda: _ctx.RemoveCaptureViewer(viewer))
     _active_capture_token = None
     _ctx = None
-    print("[ReplayLab] Unloaded")
+    if _bridge_diagnostics is not None:
+        _bridge_diagnostics.record("integration-stopped")
+    print("[Bread] Unloaded")
     if errors:
-        raise RuntimeError("ReplayLab shutdown incomplete: %s" % "; ".join(errors))
+        raise RuntimeError("Bread shutdown incomplete: %s" % "; ".join(errors))
 
 
 def _show_status(ctx, data):
     if _poller:
         msg = "MCP bridge is RUNNING\nIPC: %s\nMethods: %s" % (IPC_DIR, ", ".join(sorted(METHODS.keys())))
-        ctx.Extensions().MessageDialog(msg, "ReplayLab")
+        ctx.Extensions().MessageDialog(msg, "MCP Bridge")
     else:
-        ctx.Extensions().ErrorDialog("MCP bridge is NOT running", "ReplayLab")
+        ctx.Extensions().ErrorDialog("MCP bridge is NOT running", "MCP Bridge")
 
 
 def current_native_context_json(focus_stage=""):

@@ -29,6 +29,9 @@ import os
 import re
 import stat
 import struct
+import threading
+import ctypes
+from ctypes import wintypes
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -60,6 +63,151 @@ _MAX_REPORT_JSON_BYTES = 8 * 1024 * 1024
 _READ_CHUNK_BYTES = 1024 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _D3D_PROFILE_RE = re.compile(r"^(?:ps|vs|gs|hs|ds|cs|as|ms|lib)_\d+_\d+$")
+
+
+# ctypes caches every generated ``POINTER(SomeStructure)`` class for the life of
+# the process. Defining these structures inside the per-file read path creates a
+# fresh type (and therefore permanently cached pointer classes) for every asset.
+# Keep both the structures and their pointer types at module scope.
+class _WIN_UNICODE_STRING(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.USHORT),
+        ("MaximumLength", wintypes.USHORT),
+        ("Buffer", wintypes.LPWSTR),
+    ]
+
+
+class _WIN_OBJECT_ATTRIBUTES(ctypes.Structure):
+    pass
+
+
+_WIN_UNICODE_STRING_PTR = ctypes.POINTER(_WIN_UNICODE_STRING)
+_WIN_OBJECT_ATTRIBUTES._fields_ = [
+    ("Length", wintypes.ULONG),
+    ("RootDirectory", wintypes.HANDLE),
+    ("ObjectName", _WIN_UNICODE_STRING_PTR),
+    ("Attributes", wintypes.ULONG),
+    ("SecurityDescriptor", wintypes.LPVOID),
+    ("SecurityQualityOfService", wintypes.LPVOID),
+]
+
+
+class _WIN_IO_STATUS_UNION(ctypes.Union):
+    _fields_ = [("Status", wintypes.LONG), ("Pointer", wintypes.LPVOID)]
+
+
+class _WIN_IO_STATUS_BLOCK(ctypes.Structure):
+    _anonymous_ = ("value",)
+    _fields_ = [("value", _WIN_IO_STATUS_UNION), ("Information", ctypes.c_size_t)]
+
+
+class _WIN_FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
+    _fields_ = [
+        ("FileAttributes", wintypes.DWORD),
+        ("ReparseTag", wintypes.DWORD),
+    ]
+
+
+_WIN_HANDLE_PTR = ctypes.POINTER(wintypes.HANDLE)
+_WIN_OBJECT_ATTRIBUTES_PTR = ctypes.POINTER(_WIN_OBJECT_ATTRIBUTES)
+_WIN_IO_STATUS_BLOCK_PTR = ctypes.POINTER(_WIN_IO_STATUS_BLOCK)
+
+
+class _WindowsSecureFileApi:
+    """One process-wide, immutable binding of the Windows secure-open APIs."""
+
+    __slots__ = (
+        "create_file",
+        "close_handle",
+        "get_information",
+        "nt_create_file",
+        "open_osfhandle",
+    )
+
+    def __init__(self) -> None:
+        if os.name != "nt" or not hasattr(ctypes, "WinDLL"):
+            raise OSError("Windows secure-open APIs are unavailable")
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        get_information = kernel32.GetFileInformationByHandleEx
+        get_information.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        get_information.restype = wintypes.BOOL
+        nt_create_file = ntdll.NtCreateFile
+        nt_create_file.argtypes = [
+            _WIN_HANDLE_PTR,
+            wintypes.DWORD,
+            _WIN_OBJECT_ATTRIBUTES_PTR,
+            _WIN_IO_STATUS_BLOCK_PTR,
+            wintypes.LPVOID,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.ULONG,
+            wintypes.LPVOID,
+            wintypes.ULONG,
+        ]
+        nt_create_file.restype = wintypes.LONG
+        self.create_file = create_file
+        self.close_handle = close_handle
+        self.get_information = get_information
+        self.nt_create_file = nt_create_file
+        self.open_osfhandle = msvcrt.open_osfhandle
+
+
+_WINDOWS_SECURE_FILE_API_LOCK = threading.Lock()
+_WINDOWS_SECURE_FILE_API: _WindowsSecureFileApi | None = None
+_WINDOWS_SECURE_FILE_API_UNAVAILABLE = False
+
+
+def _windows_secure_file_api() -> _WindowsSecureFileApi | None:
+    """Return the lazy singleton without rebuilding ctypes function metadata."""
+
+    global _WINDOWS_SECURE_FILE_API, _WINDOWS_SECURE_FILE_API_UNAVAILABLE
+    if _WINDOWS_SECURE_FILE_API is not None:
+        return _WINDOWS_SECURE_FILE_API
+    if _WINDOWS_SECURE_FILE_API_UNAVAILABLE or os.name != "nt":
+        return None
+    with _WINDOWS_SECURE_FILE_API_LOCK:
+        if _WINDOWS_SECURE_FILE_API is not None:
+            return _WINDOWS_SECURE_FILE_API
+        if _WINDOWS_SECURE_FILE_API_UNAVAILABLE:
+            return None
+        try:
+            _WINDOWS_SECURE_FILE_API = _WindowsSecureFileApi()
+        except (AttributeError, ImportError, OSError):
+            _WINDOWS_SECURE_FILE_API_UNAVAILABLE = True
+            return None
+        return _WINDOWS_SECURE_FILE_API
+
+
+def _windows_extended_path(path: Path) -> str:
+    value = str(path.absolute())
+    if value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
 
 
 # Values are (language, role, extension stage hint).  These are classifications
@@ -1272,97 +1420,13 @@ def _read_regular_file_windows(
     handle, and any reparse point in the relative lookup fails closed.
     """
 
-    try:
-        import ctypes
-        import msvcrt
-        from ctypes import wintypes
-    except ImportError:
+    api = _windows_secure_file_api()
+    if api is None:
         return None, "secure-open-unavailable", 0
-
-    class _UNICODE_STRING(ctypes.Structure):
-        _fields_ = [
-            ("Length", wintypes.USHORT),
-            ("MaximumLength", wintypes.USHORT),
-            ("Buffer", wintypes.LPWSTR),
-        ]
-
-    class _OBJECT_ATTRIBUTES(ctypes.Structure):
-        _fields_ = [
-            ("Length", wintypes.ULONG),
-            ("RootDirectory", wintypes.HANDLE),
-            ("ObjectName", ctypes.POINTER(_UNICODE_STRING)),
-            ("Attributes", wintypes.ULONG),
-            ("SecurityDescriptor", wintypes.LPVOID),
-            ("SecurityQualityOfService", wintypes.LPVOID),
-        ]
-
-    class _IO_STATUS_UNION(ctypes.Union):
-        _fields_ = [("Status", wintypes.LONG), ("Pointer", wintypes.LPVOID)]
-
-    class _IO_STATUS_BLOCK(ctypes.Structure):
-        _anonymous_ = ("value",)
-        _fields_ = [("value", _IO_STATUS_UNION), ("Information", ctypes.c_size_t)]
-
-    class _FILE_ATTRIBUTE_TAG_INFO(ctypes.Structure):
-        _fields_ = [
-            ("FileAttributes", wintypes.DWORD),
-            ("ReparseTag", wintypes.DWORD),
-        ]
-
-    try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
-        create_file = kernel32.CreateFileW
-        create_file.argtypes = [
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            wintypes.HANDLE,
-        ]
-        create_file.restype = wintypes.HANDLE
-        close_handle = kernel32.CloseHandle
-        close_handle.argtypes = [wintypes.HANDLE]
-        close_handle.restype = wintypes.BOOL
-        get_information = kernel32.GetFileInformationByHandleEx
-        get_information.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-        ]
-        get_information.restype = wintypes.BOOL
-        nt_create_file = ntdll.NtCreateFile
-        nt_create_file.argtypes = [
-            ctypes.POINTER(wintypes.HANDLE),
-            wintypes.DWORD,
-            ctypes.POINTER(_OBJECT_ATTRIBUTES),
-            ctypes.POINTER(_IO_STATUS_BLOCK),
-            wintypes.LPVOID,
-            wintypes.ULONG,
-            wintypes.ULONG,
-            wintypes.ULONG,
-            wintypes.ULONG,
-            wintypes.LPVOID,
-            wintypes.ULONG,
-        ]
-        nt_create_file.restype = wintypes.LONG
-    except (AttributeError, OSError):
-        return None, "secure-open-unavailable", 0
-
-    def extended_path(path: Path) -> str:
-        value = str(path.absolute())
-        if value.startswith("\\\\?\\"):
-            return value
-        if value.startswith("\\\\"):
-            return "\\\\?\\UNC\\" + value[2:]
-        return "\\\\?\\" + value
 
     invalid_handle = ctypes.c_void_p(-1).value
-    root_handle = create_file(
-        extended_path(root),
+    root_handle = api.create_file(
+        _windows_extended_path(root),
         0x0001 | 0x0080 | 0x00100000,  # LIST_DIRECTORY|READ_ATTRIBUTES|SYNCHRONIZE
         0x0001 | 0x0002 | 0x0004,  # share read/write/delete
         None,
@@ -1375,8 +1439,8 @@ def _read_regular_file_windows(
     file_handle = wintypes.HANDLE()
     fd = -1
     try:
-        root_attributes = _FILE_ATTRIBUTE_TAG_INFO()
-        if not get_information(
+        root_attributes = _WIN_FILE_ATTRIBUTE_TAG_INFO()
+        if not api.get_information(
             root_handle,
             9,  # FileAttributeTagInfo
             ctypes.byref(root_attributes),
@@ -1394,21 +1458,21 @@ def _read_regular_file_windows(
         if encoded_length <= 0 or encoded_length > 0xFFFC:
             return None, "relative-path-too-long", 0
         relative_buffer = ctypes.create_unicode_buffer(relative_value)
-        unicode_name = _UNICODE_STRING(
+        unicode_name = _WIN_UNICODE_STRING(
             encoded_length,
             encoded_length + 2,
             ctypes.cast(relative_buffer, wintypes.LPWSTR),
         )
-        attributes = _OBJECT_ATTRIBUTES(
-            ctypes.sizeof(_OBJECT_ATTRIBUTES),
+        attributes = _WIN_OBJECT_ATTRIBUTES(
+            ctypes.sizeof(_WIN_OBJECT_ATTRIBUTES),
             root_handle,
             ctypes.pointer(unicode_name),
             0x0040 | 0x1000,  # OBJ_CASE_INSENSITIVE|OBJ_DONT_REPARSE
             None,
             None,
         )
-        io_status = _IO_STATUS_BLOCK()
-        status = nt_create_file(
+        io_status = _WIN_IO_STATUS_BLOCK()
+        status = api.nt_create_file(
             ctypes.byref(file_handle),
             0x80000000 | 0x00100000,  # GENERIC_READ|SYNCHRONIZE
             ctypes.byref(attributes),
@@ -1423,8 +1487,8 @@ def _read_regular_file_windows(
         )
         if status < 0 or not file_handle.value:
             return None, "reparse-or-path-race", 0
-        file_attributes = _FILE_ATTRIBUTE_TAG_INFO()
-        if not get_information(
+        file_attributes = _WIN_FILE_ATTRIBUTE_TAG_INFO()
+        if not api.get_information(
             file_handle,
             9,
             ctypes.byref(file_attributes),
@@ -1437,7 +1501,7 @@ def _read_regular_file_windows(
         ):
             return None, "reparse-or-symlink", 0
 
-        fd = msvcrt.open_osfhandle(
+        fd = api.open_osfhandle(
             int(file_handle.value), os.O_RDONLY | getattr(os, "O_BINARY", 0)
         )
         file_handle = wintypes.HANDLE()
@@ -1451,8 +1515,8 @@ def _read_regular_file_windows(
             except OSError:
                 pass
         if file_handle.value:
-            close_handle(file_handle)
-        close_handle(root_handle)
+            api.close_handle(file_handle)
+        api.close_handle(root_handle)
 
 
 def read_recovery_regular_file(

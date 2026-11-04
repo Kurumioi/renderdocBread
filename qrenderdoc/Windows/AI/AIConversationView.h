@@ -25,6 +25,8 @@
 #pragma once
 
 #include <QHash>
+#include <QSet>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QString>
 #include <QTextCharFormat>
@@ -93,6 +95,10 @@ struct AIChatMessage
   qint64 finishedTimestampMs = 0;
   QVector<AIChatAttachment> attachments;
   QVector<AIActivityItem> activity;
+  // Files/directories recorded with historical task results (with Host-computed
+  // size/change statistics). Rendered as chips below the answer; click opens, right-click offers
+  // copy path / show in folder.
+  QJsonArray artifacts;
   bool activityExpanded = false;
 };
 
@@ -107,6 +113,7 @@ public:
   void setMessages(const QVector<AIChatMessage> &messages);
   void clear();
   void scrollToMessage(const QString &messageId);
+  void followSubmittedTurn();
 
   void setLinkHandler(std::function<void(const QUrl &)> handler);
   void setActivityToggleHandler(std::function<void(const QString &messageId, bool expanded)> handler);
@@ -163,11 +170,35 @@ private:
   QTimer *m_LiveTextTimer = NULL;
   QHash<QString, QString> m_LiveTextAnchors;
   QHash<QString, LiveTextCursor> m_LiveTextCursors;
+  // Elapsed-time labels of running work: updated in place every second through a
+  // cursor, never by re-rendering the transcript (a re-render drops a selection).
+  struct ElapsedCursor
+  {
+    QTextCursor cursor;
+    QTextCharFormat format;
+    int length = 0;
+    qint64 startMs = 0;
+    // The exact characters this view last wrote into that span. The clock tick
+    // replaces the span only when it still holds them, so a document that changed
+    // underneath (a re-render, a fragment split between digits and unit) makes the
+    // tick rebuild instead of overwriting a span it no longer owns.
+    QString text;
+  };
+  // Store the timestamp and exact rendered text; an HTML anchor marks only the
+  // first character, so QTextFragment::length() is not the duration's full length.
+  QHash<QString, QPair<qint64, QString>> m_ElapsedAnchors;
+  QHash<QString, ElapsedCursor> m_ElapsedCursors;
+  QTimer *m_ElapsedTimer = NULL;
+  QSet<QString> m_ExpandedArtifactMessages;
+  QHash<QString, int> m_ActivityHistoryLimits;
+  void rebuildElapsedCursors();
+  void advanceElapsedText();
   std::function<void(const QUrl &)> m_LinkHandler;
   std::function<void(const QString &, bool)> m_ActivityToggleHandler;
   std::function<void(const QString &)> m_SelectionAttachmentHandler;
   int m_RenderGeneration = 0;
   quint64 m_UserInteractionGeneration = 0;
+  quint64 m_TailResetGeneration = 0;
   int m_PreservedScrollValue = 0;
   ViewportAnchor m_ViewportAnchor;
   bool m_FollowTail = true;

@@ -23,6 +23,9 @@
  ******************************************************************************/
 
 #include "AIConversationStore.h"
+#include "AIConversationMerge.h"
+#include <QStandardPaths>
+#include <cstdlib>
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -33,11 +36,22 @@
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QSaveFile>
+#include <QLockFile>
+#include <QMutex>
+#include <QMutexLocker>
 #include "Code/Interface/QRDInterface.h"
 
 namespace
 {
 const char StoreSchema[] = "replaylab-ai-conversations/v1";
+QMutex baselineMutex;
+QHash<QString, QByteArray> localBaselines;
+
+void rememberBaseline(const QString &path, const QByteArray &payload)
+{
+  QMutexLocker guard(&baselineMutex);
+  localBaselines.insert(path, payload);
+}
 
 // Base64 expands an opaque payload by four thirds. Leave room for the small JSON envelope and a
 // future metadata field while still rejecting unexpectedly large or hostile files before reading.
@@ -90,7 +104,8 @@ QString AIConversationStore::StoragePathForCapture(const QString &capturePath)
   return QDir(directory).filePath(QString::fromLatin1(digest) + QStringLiteral(".json"));
 }
 
-bool AIConversationStore::Load(const QString &capturePath, QByteArray *payload, QString *error)
+static bool readConversationStore(const QString &normalised, const QString &storePath,
+                                  QByteArray *payload, QString *error)
 {
   if(payload)
     payload->clear();
@@ -104,8 +119,6 @@ bool AIConversationStore::Load(const QString &capturePath, QByteArray *payload, 
     return false;
   }
 
-  const QString normalised = NormalizedCapturePath(capturePath);
-  const QString storePath = StoragePathForCapture(capturePath);
   if(normalised.isEmpty())
   {
     setError(error, QCoreApplication::translate(
@@ -186,7 +199,7 @@ bool AIConversationStore::Load(const QString &capturePath, QByteArray *payload, 
   const QByteArray encodedPayload =
       root.value(QStringLiteral("payload")).toString().toLatin1();
   const QByteArray decodedPayload = QByteArray::fromBase64(encodedPayload);
-  if(decodedPayload.size() > MaximumPayloadBytes || decodedPayload.toBase64() != encodedPayload)
+  if(decodedPayload.size() > AIConversationStore::MaximumPayloadBytes || decodedPayload.toBase64() != encodedPayload)
   {
     setError(error, QCoreApplication::translate(
                         "AIConversationStore",
@@ -195,6 +208,106 @@ bool AIConversationStore::Load(const QString &capturePath, QByteArray *payload, 
   }
 
   *payload = decodedPayload;
+  return true;
+}
+
+bool AIConversationStore::Load(const QString &capturePath, QByteArray *payload, QString *error)
+{
+  const QString normalised = NormalizedCapturePath(capturePath);
+  const QString storePath = StoragePathForCapture(capturePath);
+  if(!readConversationStore(normalised, storePath, payload, error))
+    return false;
+  rememberBaseline(storePath, *payload);
+
+  QStringList roots;
+#if defined(Q_OS_WIN)
+  // i18n-ignore: Historical per-user application directories, not display labels.
+  const QString roaming = QString::fromWCharArray(_wgetenv(L"APPDATA"));
+  const QString local = QString::fromWCharArray(_wgetenv(L"LOCALAPPDATA"));
+  if(!roaming.isEmpty())
+    for(const QString &app : {QStringLiteral("q_render_soco_doc"), QStringLiteral("qrenderdoc"),
+                             QStringLiteral("RenderDocBread")})
+      roots << QDir(roaming).filePath(app + QStringLiteral("/ReplayLab/conversations"));
+  if(!local.isEmpty())
+    roots << QDir(local).filePath(QStringLiteral("RenderDocBread/ui/ReplayLab/conversations"));
+#else
+  const QString config = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
+  for(const QString &app : {QStringLiteral("q_render_soco_doc"), QStringLiteral("qrenderdoc"),
+                           QStringLiteral("RenderDocBread")})
+    roots << QDir(config).filePath(app + QStringLiteral("/ReplayLab/conversations"));
+#endif
+#if defined(Q_OS_WIN)
+  const Qt::CaseSensitivity pathCase = Qt::CaseInsensitive;
+#else
+  const Qt::CaseSensitivity pathCase = Qt::CaseSensitive;
+#endif
+  const QString current = QDir::cleanPath(QFileInfo(storePath).absolutePath());
+  bool defaultProfile = false;
+  for(const QString &root : roots)
+    defaultProfile |= QDir::cleanPath(root).compare(current, pathCase) == 0;
+  // An explicitly isolated test/operator profile must not import ordinary user history.
+  if(!defaultProfile)
+    return true;
+
+  QByteArray combined = *payload;
+  bool changed = false;
+  roots.removeDuplicates();
+  for(const QString &root : roots)
+  {
+    if(QDir::cleanPath(root).compare(current, pathCase) == 0)
+      continue;
+    const QString legacyPath = QDir(root).filePath(QFileInfo(storePath).fileName());
+    if(!QFileInfo::exists(legacyPath))
+      continue;
+    QByteArray legacy;
+    QString legacyError;
+    if(!readConversationStore(normalised, legacyPath, &legacy, &legacyError))
+    {
+      setError(error, legacyError);
+      continue;
+    }
+    if(legacy.isEmpty() || legacy == combined)
+      continue;
+    const QJsonDocument oldDocument = QJsonDocument::fromJson(legacy);
+    const QJsonDocument newDocument = QJsonDocument::fromJson(combined);
+    if(!oldDocument.isObject() || !AIConversationMerge::known(oldDocument.object()) ||
+       (!combined.isEmpty() && (!newDocument.isObject() || !AIConversationMerge::known(newDocument.object()))))
+    {
+      setError(error, QCoreApplication::translate("AIConversationStore",
+                                                "The conversation store uses an unsupported schema."));
+      continue;
+    }
+    const QJsonObject merged = combined.isEmpty() ? oldDocument.object() :
+        AIConversationMerge::merge(newDocument.object(), oldDocument.object());
+    const QByteArray next = QJsonDocument(merged).toJson(QJsonDocument::Compact);
+    if(next.size() > MaximumPayloadBytes || merged.value(QStringLiteral("conversations")).toArray().size() > 32)
+    {
+      setError(error, QCoreApplication::translate("AIConversationStore",
+                                                "The conversation store is larger than the allowed limit."));
+      continue;
+    }
+    changed |= next != combined;
+    combined = next;
+  }
+  *payload = combined;
+  if(changed && (!error || error->isEmpty()))
+  {
+    // Preserve the current store as well as the untouched legacy originals.
+    if(QFileInfo::exists(storePath))
+    {
+      const QString backup = storePath + QStringLiteral(".before-history-compat-") +
+          QString::fromLatin1(QCryptographicHash::hash(combined, QCryptographicHash::Sha256).toHex().left(12));
+      if(!QFileInfo::exists(backup) && !QFile::copy(storePath, backup))
+      {
+        setError(error, QCoreApplication::translate("AIConversationStore",
+                         "Unable to open the conversation store: %1").arg(storePath));
+        return true;
+      }
+    }
+    QString saveError;
+    if(!Save(capturePath, combined, &saveError))
+      setError(error, saveError);
+  }
   return true;
 }
 
@@ -224,26 +337,49 @@ bool AIConversationStore::Save(const QString &capturePath, const QByteArray &pay
     return false;
   }
 
-  QJsonObject root;
-  root.insert(QStringLiteral("schema"), QString::fromLatin1(StoreSchema));
-  root.insert(QStringLiteral("capturePath"), normalised);
-  root.insert(QStringLiteral("payloadEncoding"), QStringLiteral("base64"));
-  root.insert(QStringLiteral("payload"), QString::fromLatin1(payload.toBase64()));
-
-  const QByteArray encodedDocument = QJsonDocument(root).toJson(QJsonDocument::Compact);
-  if(encodedDocument.size() > MaximumStoreDocumentBytes)
-  {
-    // i18n-ignore: Save failure is written only to the internal diagnostic log.
-    setError(error, QStringLiteral("Encoded conversation history exceeds the storage limit."));
-    return false;
-  }
-
   const QFileInfo storeInfo(storePath);
   QDir directory;
   if(!directory.mkpath(storeInfo.absolutePath()))
   {
     // i18n-ignore: Save failure is written only to the internal diagnostic log.
     setError(error, QStringLiteral("Unable to create the conversation storage directory."));
+    return false;
+  }
+  QLockFile transaction(storePath + QStringLiteral(".update.lock"));
+  if(!transaction.tryLock(500))
+  {
+    // i18n-ignore: Save failure is written only to the internal diagnostic log.
+    setError(error, QStringLiteral("Conversation file update is busy."));
+    return false;
+  }
+  QByteArray effective = payload, disk;
+  if(!readConversationStore(normalised, storePath, &disk, error)) return false;
+  const QJsonObject local = QJsonDocument::fromJson(payload).object();
+  const QJsonObject latest = QJsonDocument::fromJson(disk).object();
+  if(AIConversationMerge::known(local) && AIConversationMerge::known(latest))
+  {
+    QByteArray baseline;
+    { QMutexLocker guard(&baselineMutex); baseline = localBaselines.value(storePath); }
+    effective = QJsonDocument(AIConversationMerge::concurrent(
+        local, QJsonDocument::fromJson(baseline).object(), latest)).toJson(QJsonDocument::Compact);
+  }
+  if(effective.size() > MaximumPayloadBytes)
+  {
+    // i18n-ignore: Save failure is written only to the internal diagnostic log.
+    setError(error, QStringLiteral("Merged conversation history exceeds the storage limit."));
+    return false;
+  }
+  QJsonObject root;
+  root.insert(QStringLiteral("schema"), QString::fromLatin1(StoreSchema));
+  root.insert(QStringLiteral("capturePath"), normalised);
+  root.insert(QStringLiteral("payloadEncoding"), QStringLiteral("base64"));
+  root.insert(QStringLiteral("payload"), QString::fromLatin1(effective.toBase64()));
+
+  const QByteArray encodedDocument = QJsonDocument(root).toJson(QJsonDocument::Compact);
+  if(encodedDocument.size() > MaximumStoreDocumentBytes)
+  {
+    // i18n-ignore: Save failure is written only to the internal diagnostic log.
+    setError(error, QStringLiteral("Encoded conversation history exceeds the storage limit."));
     return false;
   }
 
@@ -276,5 +412,6 @@ bool AIConversationStore::Save(const QString &capturePath, const QByteArray &pay
     return false;
   }
 
+  rememberBaseline(storePath, payload);
   return true;
 }

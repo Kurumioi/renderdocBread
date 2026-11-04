@@ -11,6 +11,10 @@ class CatalogValidationError(ShaderWorkspaceError):
     """The capture catalog or selected shader record is not trustworthy."""
 
 
+class CatalogUseNotCoveredError(CatalogValidationError):
+    """A valid catalog has no row for the requested event and stage."""
+
+
 class ToolConfigurationError(ShaderWorkspaceError):
     """The user-owned external tool registry is invalid or changed."""
 

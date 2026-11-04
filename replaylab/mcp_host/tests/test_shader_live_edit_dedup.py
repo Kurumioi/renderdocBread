@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from src.shader_live_edit import ShaderLiveEditManager
+from src.shader_live_edit import MAX_ACTIVE_LIVE_EDITS, ShaderLiveEditError, ShaderLiveEditManager
 from tests.test_shader_live_edit import _wait_until
 from tests.test_shader_live_edit_lifecycle import (
     _LifecycleRig,
@@ -183,7 +183,7 @@ def test_foreign_or_unavailable_owner_blocks_other_workspaces_for_the_same_shade
     new_binding = rig.gui_binding("new-gui", "2" * 32)
     rig.use_gui(new_binding, previous_state=owner_state)
     if owner_state == "unavailable":
-        _wait_until(lambda: rig.manager.poll(old["liveEditId"])["state"] == "failed")
+        _wait_until(lambda: rig.manager.poll(old["liveEditId"])["sessionState"] == "unavailable")
 
     rig.manager.reconcile_capture(new_binding)
     assert rig.watch.persistent_start_calls == []
@@ -191,6 +191,13 @@ def test_foreign_or_unavailable_owner_blocks_other_workspaces_for_the_same_shade
     assert rig.entries() == before
     if owner_state == "current":
         assert rig.manager.poll(old["liveEditId"])["state"] == "running"
+        assert rig.watch.stop_calls == []
+    else:
+        # A temporarily unresponsive GUI retains the owner so historical
+        # consent cannot silently transfer its captured Shader elsewhere.
+        owner = rig.manager.poll(old["liveEditId"])
+        assert owner["state"] == "running"
+        assert owner["sessionState"] == "unavailable"
         assert rig.watch.stop_calls == []
 
 
@@ -248,3 +255,57 @@ def test_group_does_not_start_another_workspace_while_old_apply_worker_cannot_st
     assert rig.watch.persistent_start_calls == []
     assert len(rig.watch.start_calls) == 1
     assert rig.entries() == before
+
+
+def test_project_restore_can_authorize_all_five_shaders_after_capture_local_id_changes(rig):
+    historical = [rig.another_workspace("historical-%d" % index, resource_id=700 + index) for index in range(5)]
+    for index, workspace in enumerate(historical):
+        identity = rig.identities[str(workspace)]
+        identity["shaderRawSha256"] = "%064x" % (index + 1)
+        identity["shaderKey"] = "%d:fragment:MainPS:%s" % (identity["resourceId"], identity["shaderRawSha256"])
+    rig.seed_history(*historical)
+    before = copy.deepcopy(rig.entries())
+    restored = [rig.another_workspace("restored-%d" % index, resource_id=900 + index) for index in range(5)]
+    for index, workspace in enumerate(restored):
+        identity = rig.identities[str(workspace)]
+        identity["shaderRawSha256"] = rig.identities[str(historical[index])]["shaderRawSha256"]
+        identity["shaderKey"] = "%d:fragment:MainPS:%s" % (identity["resourceId"], identity["shaderRawSha256"])
+        identity["captureId"] = "%064x" % (index + 100)
+        rig.manager.start(workspace, 100)
+    _wait_until(lambda: len(rig.active()) == 5)
+    entries = rig.entries()
+    assert len(entries) == 10
+    assert len(rig.watch.start_calls) == 5
+    assert {job["workspacePath"] for job in rig.active()} == {str(path) for path in restored}
+    # Historic consent is neither revoked nor retargeted by matching raw bytes.
+    assert {path: entries[path] for path in before} == before
+    for workspace in restored:
+        assert entries[str(workspace)]["workspaceIdentity"] == rig.identities[str(workspace)]
+    assert not rig.apply_calls  # Starting watchers must not apply a baseline again.
+    # A new Host can read the registry even though it exceeds active concurrency.
+    restarted = rig.new_manager(_PersistentWatchManager())
+    try:
+        assert restarted.list()["authorizations"] == rig.manager.list()["authorizations"]
+        assert restarted.list()["sessions"] == []
+    finally:
+        restarted.shutdown()
+
+
+def test_historical_authorizations_do_not_raise_the_actual_concurrent_editor_limit(rig):
+    historical = [rig.another_workspace("previous-%d" % index, resource_id=700 + index)
+                  for index in range(MAX_ACTIVE_LIVE_EDITS)]
+    rig.seed_history(*historical)
+    previous_entries = copy.deepcopy(rig.entries())
+    current = [rig.another_workspace("current-%d" % index, resource_id=900 + index)
+               for index in range(MAX_ACTIVE_LIVE_EDITS)]
+    for workspace in current:
+        rig.manager.start(workspace, 100)
+    _wait_until(lambda: len(rig.active()) == MAX_ACTIVE_LIVE_EDITS)
+    overflow = rig.another_workspace("current-overflow", resource_id=999)
+    entries_before_rejection = copy.deepcopy(rig.entries())
+    with pytest.raises(ShaderLiveEditError, match="active live-edit limit reached"):
+        rig.manager.start(overflow, 100)
+    assert rig.entries() == entries_before_rejection
+    assert {path: rig.entries()[path] for path in previous_entries} == previous_entries
+    assert len(rig.watch.start_calls) == MAX_ACTIVE_LIVE_EDITS
+    assert len(rig.entries()) == MAX_ACTIVE_LIVE_EDITS * 2

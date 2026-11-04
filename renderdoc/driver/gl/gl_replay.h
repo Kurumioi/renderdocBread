@@ -42,6 +42,7 @@ class NVGLCounters;
 struct GLCheckpointBufferVersion;
 struct GLCheckpointTextureVersion;
 struct GLResource;
+struct GLRenderState;
 
 // Ordinary replay provenance, independent of texture-display caches and checkpoint allocations.
 // Only the matching unmodified target may publish a prefix completed by WithoutDraw.
@@ -307,6 +308,15 @@ public:
   void RemoveReplacement(ResourceId id);
   rdcstr ReplaceTargetShaderChecked(ResourceId from, ResourceId to);
   rdcstr RemoveTargetShaderReplacementChecked(ResourceId id);
+  rdcstr SetEventShaderOverride(uint32_t eventId, ShaderStage stage, ResourceId expectedOriginal,
+                                ResourceId replacement, uint32_t outputTarget = ~0U,
+                                bool independentFloatOutput = false) override;
+  TextureDescription GetEventShaderPreviewTexture(uint32_t eventId, ShaderStage stage) override;
+  void ClearEventShaderOverride(uint32_t eventId, ShaderStage stage) override;
+  void ClearEventShaderOverrides() override;
+  void ClearEventShaderOverridesForResource(ResourceId id) override;
+  rdcstr ApplyEventShaderOverrides(uint32_t eventId) override;
+  void RestoreEventShaderOverrides() override;
   void ClearReplayCache();
   void ReloadShaderDebugInformation();
 
@@ -690,6 +700,35 @@ private:
 
   uint64_t m_OutputWindowID;
   std::map<uint64_t, OutputWindow> m_OutputWindows;
+
+  std::map<std::pair<uint32_t, ShaderStage>, EventShaderOverrideBinding> m_EventShaderOverrides;
+  std::map<EventShaderPipelineKey, GLuint> m_EventShaderPrograms;
+  std::map<EventShaderPipelineKey, GLuint> m_EventShaderPipelines;
+  std::unique_ptr<GLRenderState> m_EventShaderPreviousState;
+  void ReleaseEventShaderPrograms(ResourceId target = ResourceId());
+  struct EventShaderFloatAttachment
+  {
+    ResourceId source;
+    GLenum attachment = eGL_NONE, sourceTarget = eGL_NONE, format = eGL_NONE;
+    GLuint sourceName = 0, texture = 0;
+    GLint mip = 0, layer = 0, layers = 1, width = 0, height = 0, samples = 1;
+    bool layered = false, multiview = false, fixedSamples = true;
+  };
+  struct EventShaderFloatPreview
+  {
+    GLuint framebuffer = 0;
+    rdcarray<EventShaderFloatAttachment> attachments;
+    rdcarray<GLenum> drawBuffers;
+    size_t selected = 0;
+    rdcstr signature;
+    uint64_t bytes = 0, used = 0;
+  };
+  std::map<std::pair<uint32_t, uint32_t>, EventShaderFloatPreview> m_EventShaderFloatPreviews;
+  uint64_t m_EventShaderFloatClock = 0;
+  void DestroyEventShaderFloatPreview(EventShaderFloatPreview &preview);
+  void ReleaseEventShaderFloatPreviews();
+  rdcstr PrepareEventShaderFloatPreview(uint32_t eventId, uint32_t outputTarget,
+                                        GLRenderState &original, EventShaderFloatPreview *&preview);
 
   bool m_Proxy;
 

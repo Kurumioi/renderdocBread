@@ -392,7 +392,7 @@ class BridgeDxilAccessGateTests(unittest.TestCase):
             ],
         )
 
-    def test_dxil_shared_apply_recomputes_two_exact_live_signatures(self):
+    def test_dxil_shared_apply_reuses_original_evidence_and_checks_physical_envelope(self):
         module = load_bridge()
         baseline_blob = b"captured native DXIL"
         candidate_blob = b"candidate native DXIL"
@@ -417,6 +417,7 @@ class BridgeDxilAccessGateTests(unittest.TestCase):
                 self.calls = []
                 self.freed = []
                 self.replacements = {}
+                self.candidate_byte_size = None
 
             def GetAPIProperties(self):
                 return types.SimpleNamespace(
@@ -443,7 +444,10 @@ class BridgeDxilAccessGateTests(unittest.TestCase):
                         return reflection(baseline_blob)
                     shader_id = int(active)
                 blob = self.target_blobs.get(shader_id)
-                return reflection(blob) if blob is not None else None
+                value = reflection(blob) if blob is not None else None
+                if value is not None and self.candidate_byte_size is not None:
+                    value.constantBlocks[0].byteSize = self.candidate_byte_size
+                return value
 
             def GetTargetShaderEncodings(self):
                 return ["DXIL"]
@@ -559,13 +563,13 @@ class BridgeDxilAccessGateTests(unittest.TestCase):
                 call for call in controller.calls
                 if call[0] == "DisassembleShader"
             ]
-            self.assertEqual(len(disassembly_calls), 2)
+            self.assertEqual(len(disassembly_calls), 1)
             self.assertEqual(
                 [call[2] for call in disassembly_calls],
-                ["DXC DXIL", "DXC DXIL"],
+                ["DXC DXIL"],
             )
             self.assertEqual(
-                [call[1] for call in disassembly_calls], [5, 0]
+                [call[1] for call in disassembly_calls], [5]
             )
 
             supersede_blob = b"second candidate native DXIL"
@@ -589,14 +593,14 @@ class BridgeDxilAccessGateTests(unittest.TestCase):
                 if call == ("FreeTargetResource", 100)
             )
             self.assertLess(replace_index, free_index)
-            # The captured DXIL access signature is cached from the immutable
-            # original; supersede disassembles only the new candidate.
+            # Original layout evidence remains bound to the captured bytes.
+            # Candidate access instructions are not a physical ABI contract.
             disassembly_calls = [
                 call for call in controller.calls
                 if call[0] == "DisassembleShader"
             ]
-            self.assertEqual(len(disassembly_calls), 3)
-            self.assertEqual([call[1] for call in disassembly_calls], [5, 0, 0])
+            self.assertEqual(len(disassembly_calls), 1)
+            self.assertEqual([call[1] for call in disassembly_calls], [5])
 
             rolled_back = module._rollback_shader_candidate_shared_resource({
                 "replacement_id": superseded["replacementId"],
@@ -612,6 +616,8 @@ class BridgeDxilAccessGateTests(unittest.TestCase):
                 b"%21 = extractvalue %dx.types.CBufRet.i32 %20, 0",
                 b"%21 = extractvalue %dx.types.CBufRet.f32 %20, 0",
             )
+            # A changed CBuffer byte span is still rejected before replacement.
+            controller.candidate_byte_size = 8192
             with self.assertRaisesRegex(
                 RuntimeError, "physical ABI differs"
             ):
@@ -625,6 +631,7 @@ class BridgeDxilAccessGateTests(unittest.TestCase):
             self.assertEqual(len(replacement_calls), 2)
 
             controller.candidate_ir = REAL_SHAPE_DXIL
+            controller.candidate_byte_size = None
             controller.targets = ["DXBC/DXIL", "DXC DXIL (untrusted guess)"]
             with self.assertRaisesRegex(
                 RuntimeError, "one exact 'DXC DXIL'"

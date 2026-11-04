@@ -3593,7 +3593,9 @@ bool WrappedVulkan::Serialise_vkCmdBindPipeline(SerialiserType &ser, VkCommandBu
             {
               renderstate.colorWriteEnable.resize(pipeInfo.attachments.size());
               for(size_t i = 0; i < renderstate.colorWriteEnable.size(); i++)
-                renderstate.colorWriteEnable[i] = pipeInfo.attachments[i].channelWriteMask != 0;
+                renderstate.colorWriteEnable[i] = i < pipeInfo.colorWriteEnables.size()
+                                                     ? pipeInfo.colorWriteEnables[i]
+                                                     : VK_TRUE;
             }
             if(!pipeInfo.dynamicStates[VkDynamicDepthBiasEnable])
             {

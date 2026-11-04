@@ -53,6 +53,7 @@ _ALLOWED_OPTION_KEYS = frozenset(
         "image_input",
         "location",
         "max_output_tokens",
+        "native_shell",
         "project",
         "reasoning_effort",
         "context_fallback_window_tokens",
@@ -333,7 +334,7 @@ class Profile:
             raise ConfigurationError("api_key_env must be a valid environment variable name")
         if self.key_env.upper() in RESERVED_CREDENTIAL_ENV:
             raise ConfigurationError(
-                "api_key_env must not reuse a system, execution, trust, or ReplayLab control "
+                "api_key_env must not reuse a system, execution, trust, or Bread control "
                 "environment variable"
             )
         if len(self.agent_env) != len(set(self.agent_env)):
@@ -342,7 +343,7 @@ class Profile:
             raise ConfigurationError("agent_env entries must be valid environment variable names")
         if any(name.upper() in MCP_HOST_PROVIDER_ENV for name in self.agent_env):
             raise ConfigurationError(
-                "agent_env must not expose ReplayLab MCP provider configuration"
+                "agent_env must not expose Bread MCP provider configuration"
             )
         if preset.kind != "agent" and self.agent_env:
             raise ConfigurationError("agent_env is only valid for external Agent profiles")
@@ -403,6 +404,7 @@ class Profile:
 
     def _validate_option_values(self) -> None:
         boolean_options = {
+            "native_shell",
             "allow_unsandboxed_agent",
             "document_input",
             "image_input",
@@ -568,12 +570,16 @@ class ProfileStore:
         self.path = Path(path) if path else default_config_path()
         self.active_profile = ""
         self.profiles: dict[str, Profile] = {}
+        self._baseline: dict[str, dict] = {}
+        self._baseline_active = ""
 
     def load(self) -> "ProfileStore":
         if not self.path.exists():
             return self
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            from .configuration_io import open_shared_read
+            with open_shared_read(self.path) as stream:
+                payload = json.loads(stream.read().decode("utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ConfigurationError(f"cannot read profile store {self.path}: {exc}") from exc
         if not isinstance(payload, dict) or payload.get("schema") not in {
@@ -593,9 +599,31 @@ class ProfileStore:
         self.active_profile = str(payload.get("activeProfile", ""))
         if self.active_profile and self.active_profile not in self.profiles:
             raise ConfigurationError("activeProfile does not exist")
+        self._baseline = {key: asdict(value) for key, value in self.profiles.items()}
+        self._baseline_active = self.active_profile
         return self
 
     def save(self) -> None:
+        from .configuration_io import file_transaction
+        with file_transaction(self.path):
+            self._save_transaction()
+
+    def _save_transaction(self) -> None:
+        # Merge only this writer's edits. A second application may have added
+        # or removed an unrelated connection since this UI loaded its catalog.
+        if self.path.exists():
+            current = ProfileStore(self.path).load()
+            merged = dict(current.profiles)
+            for key in self._baseline.keys() - self.profiles.keys():
+                merged.pop(key, None)
+            for key, profile in self.profiles.items():
+                if key not in self._baseline or asdict(profile) != self._baseline[key]:
+                    merged[key] = profile
+            if self.active_profile == self._baseline_active:
+                self.active_profile = current.active_profile
+            self.profiles = merged
+            if self.active_profile not in merged:
+                self.active_profile = sorted(merged)[0] if merged else ""
         for profile in self.profiles.values():
             profile.validate()
         if self.active_profile and self.active_profile not in self.profiles:
@@ -613,12 +641,22 @@ class ProfileStore:
                 stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
+            import time
+            for attempt in range(6):
+                try:
+                    os.replace(temporary, self.path)
+                    break
+                except OSError as error:
+                    if getattr(error, "winerror", None) not in {5, 32, 33} or attempt == 5:
+                        raise
+                    time.sleep(.01 * 2**attempt)
         finally:
             try:
                 Path(temporary).unlink(missing_ok=True)
             except OSError:
                 pass
+        self._baseline = {key: asdict(value) for key, value in self.profiles.items()}
+        self._baseline_active = self.active_profile
 
     def add(self, profile: Profile, *, select: bool = False) -> None:
         profile.validate()

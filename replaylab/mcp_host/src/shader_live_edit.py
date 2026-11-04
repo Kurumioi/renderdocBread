@@ -19,23 +19,33 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from contextlib import nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .shader_scheduler import ScheduledTask, is_current_task
 from .shader_workspace.diagnostics import DIAGNOSTIC_SCHEMA, classify_shader_failure
 from .shader_workspace.io import atomic_write_json, is_within, read_json_object
+from .shader_workspace.source_observation import source_observation_transaction
 
 LIVE_EDIT_SCHEMA = "replaylab-shader-live-edit/v1"
 LIVE_EDIT_VERSION = 1
-MAX_ACTIVE_LIVE_EDITS = 8
+MAX_ACTIVE_LIVE_EDITS = 128
+# Durable consent survives closed captures and Host restarts; it is not a live
+# watcher slot. In particular, a restored project may create a new workspace
+# identity when capture-local ResourceIds/catalogs change. Keep those exact
+# authorizations separate instead of revoking or migrating them by Shader hash.
+MAX_PERSISTENT_LIVE_EDIT_AUTHORIZATIONS = 512
 MAX_RETAINED_LIVE_EDITS = 32
 MAX_AUDIT_EVENTS = 128
-POLL_SECONDS = 0.05
+POLL_SECONDS = 0.2
 DEFAULT_DEBOUNCE_MS = 100
 JOIN_SECONDS = 3.0
+SESSION_UNAVAILABLE_RETRY_SECONDS = 1.0
 MIN_POLL_SECONDS = 0.001
 MAX_POLL_SECONDS = 10.0
 MIN_JOIN_SECONDS = 0.05
@@ -52,10 +62,20 @@ AUTHORIZATION_MIGRATION_EVIDENCE_SCHEMA = (
 
 _TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_LIVE_APPLY_OWNER: ContextVar[tuple[Any, int, str] | None] = ContextVar(
+    "shader_live_apply_owner", default=None)
 
 
 class ShaderLiveEditError(RuntimeError):
     pass
+
+
+class ShaderLiveEditDeferred(ShaderLiveEditError):
+    """Automatic admission yielded to a project restore for the same capture."""
+
+
+class ShaderLiveEditSessionUnavailable(ShaderLiveEditError):
+    """The owning GUI is alive but its capture mailbox is temporarily unreadable."""
 
 
 @dataclass(frozen=True)
@@ -65,6 +85,7 @@ class ShaderLiveEditSession:
     binding: dict[str, str]
     state: Callable[[], str]
     apply_candidate: Callable[[str, int, str], dict[str, Any]]
+    recover_active_candidate: Callable[[str], dict[str, Any] | None] | None = None
 
 
 def _utc_now() -> str:
@@ -74,6 +95,21 @@ def _utc_now() -> str:
 def _bounded(value: Any, maximum: int = 2048) -> str:
     text = str(value)
     return text if len(text) <= maximum else text[:maximum] + "...[truncated]"
+
+
+def _timing_counters(value: Any) -> dict[str, float]:
+    """Retain bounded diagnostic counters, never interpret them as authority."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key, duration in value.items():
+        if (isinstance(key, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", key)
+                and type(duration) in (int, float) and 0 <= duration <= 86400000
+                and math.isfinite(duration)):
+            result[key] = float(duration)
+            if len(result) >= 32:
+                break
+    return result
 
 
 def _positive_integer(value: Any, label: str) -> int:
@@ -97,6 +133,51 @@ def _workspace_key(path: Path) -> str:
     return os.path.normcase(os.path.normpath(str(path)))
 
 
+def capture_bindings_match(left: Any, right: Any) -> bool:
+    """Keep GUI/session identity exact; compare paths using the host OS rules."""
+    fields = {"instanceId", "captureSessionId", "capturePath"}
+    if any(not isinstance(value, Mapping) or set(value) != fields
+           or any(not isinstance(value[key], str) or not value[key] for key in fields)
+           for value in (left, right)):
+        return False
+    if any(left[key] != right[key] for key in ("instanceId", "captureSessionId")):
+        return False
+    try:
+        return _workspace_key(Path(left["capturePath"]).resolve()) == _workspace_key(
+            Path(right["capturePath"]).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def current_live_apply_owner(workspace_path: str, expected: Mapping[str, Any] | None,
+                             direct_binding: tuple[str, str] | None) -> dict[str, Any] | None:
+    """Private in-process authority, confined to the actual job's apply thread.
+
+    No request flag or serialized caller claim can create this authority. The
+    public mutation guard must additionally match it to its current owner list.
+    """
+    owner = _LIVE_APPLY_OWNER.get()
+    if owner is None or expected is None:
+        return None
+    job, revision, raw_sha256 = owner
+    if (not isinstance(job, _LiveEditJob) or job.session is None
+            or not is_current_task(job._apply_thread)
+            or expected.get("revision") != revision
+            or expected.get("candidateRawSha256") != raw_sha256
+            or _workspace_key(Path(workspace_path).resolve()) != _workspace_key(job.workspace)
+            or direct_binding != (job.session.binding["instanceId"], job.session.binding["captureSessionId"])):
+        return None
+    with job._lock:
+        if (job._state != "running" or job._stop.is_set()
+                or job._apply_in_progress != (revision, raw_sha256)
+                or job._latest_handled_revision != revision
+                or job._latest_handled_raw_sha256 != raw_sha256):
+            return None
+        job.require_current_session()
+        return {"liveEditId": job.live_edit_id, "watchId": job.watch_id,
+                "captureBinding": dict(job.session.binding)}
+
+
 def _canonical_sha256(value: Any) -> str:
     payload = json.dumps(
         value,
@@ -105,6 +186,32 @@ def _canonical_sha256(value: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _current_compiled_source_identity(root: Path, revision: int, raw_sha256: str) -> dict[str, str] | None:
+    """Identify the current root and headers, without parsing executable bytes."""
+    try:
+        from .shader_workspace.compile_source_unit import current_dependencies
+        from .shader_workspace.watcher import _source_bytes
+
+        manifest_path = root / "manifest.json"
+        if manifest_path.is_symlink():
+            return None
+        manifest = read_json_object(manifest_path, 16 * 1024 * 1024, "Shader manifest")
+        latest = manifest.get("latestCompiled") or {}
+        if (latest.get("revision") != revision or latest.get("rawSha256") != raw_sha256):
+            return None
+        source_path = root / str((manifest.get("source") or {}).get("path") or "source/shader.hlsl")
+        source = _source_bytes(root, source_path)
+        source_sha = hashlib.sha256(source).hexdigest()
+        dependencies = current_dependencies(source_path, source, latest)
+        if latest.get("sourceSha256") != source_sha or dependencies["current"] is not True:
+            return None
+        return {"sourceSha256": source_sha, "sourceDependenciesDigest": dependencies["digest"]}
+    except (OSError, ValueError, TypeError, AttributeError, RuntimeError):
+        # Missing evidence disables only the optimization. The ordinary apply
+        # path still performs its complete source/candidate/capture checks.
+        return None
 
 
 def _persistent_identity(value: Any) -> dict[str, Any]:
@@ -257,7 +364,7 @@ class _PersistentLiveEditRegistry:
         ):
             raise ShaderLiveEditError("persistent live-edit registry schema is invalid")
         entries = value.get("entries")
-        if not isinstance(entries, list) or len(entries) > MAX_ACTIVE_LIVE_EDITS:
+        if not isinstance(entries, list) or len(entries) > MAX_PERSISTENT_LIVE_EDIT_AUTHORIZATIONS:
             raise ShaderLiveEditError("persistent live-edit registry entries are invalid")
         normalized = [self._validate_entry(entry) for entry in entries]
         keys = [_workspace_key(Path(entry["workspacePath"])) for entry in normalized]
@@ -269,6 +376,14 @@ class _PersistentLiveEditRegistry:
     def entries(self) -> list[dict[str, Any]]:
         with self._lock:
             return copy.deepcopy(self._load_locked()["entries"])
+
+    def _write_locked(self, registry: dict[str, Any]) -> None:
+        # Use the same encoding as atomic_write_json. Reject an oversized new
+        # record before replacing a registry that the next startup must read.
+        encoded = (json.dumps(registry, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        if len(encoded) > MAX_LIVE_EDIT_REGISTRY_BYTES:
+            raise ShaderLiveEditError("persistent live-edit registry exceeds its byte budget")
+        atomic_write_json(self.path, registry)
 
     def authorize(
         self,
@@ -321,10 +436,10 @@ class _PersistentLiveEditRegistry:
                     raise ShaderLiveEditError(
                         "persistent live-edit authorization was revoked before resume"
                     )
-                if len(entries) >= MAX_ACTIVE_LIVE_EDITS:
+                if len(entries) >= MAX_PERSISTENT_LIVE_EDIT_AUTHORIZATIONS:
                     raise ShaderLiveEditError(
                         "persistent live-edit authorization limit reached (%d)"
-                        % MAX_ACTIVE_LIVE_EDITS
+                        % MAX_PERSISTENT_LIVE_EDIT_AUTHORIZATIONS
                     )
                 existing = {
                     "authorizationId": authorization_id or uuid.uuid4().hex,
@@ -360,7 +475,7 @@ class _PersistentLiveEditRegistry:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self.path.parent.is_symlink() or self.path.parent.resolve() != self.path.parent:
                 raise ShaderLiveEditError("persistent live-edit registry directory is redirected")
-            atomic_write_json(self.path, registry)
+            self._write_locked(registry)
             # Determine ownership in the same locked transaction as the write.
             # A failed start may revoke only the grant that it created itself.
             return copy.deepcopy(existing), created
@@ -426,7 +541,7 @@ class _PersistentLiveEditRegistry:
                     "lastLiveEditId": None,
                 }
             )
-            atomic_write_json(self.path, registry)
+            self._write_locked(registry)
             return copy.deepcopy(source)
 
     def reclaim_for(
@@ -439,7 +554,8 @@ class _PersistentLiveEditRegistry:
 
         Historical tasks leave persistent authorizations behind: workspaces that
         were deleted, captures that moved, and older attempt directories for the
-        very same physical Shader.  Rather than surfacing "limit reached (8)" to
+        very same physical Shader. At the separate durable registry limit,
+        rather than surfacing the authorization capacity error to
         the AI/user and expecting them to hunt down stale entries, retire them
         here in a fixed order and report exactly what was released:
 
@@ -458,7 +574,7 @@ class _PersistentLiveEditRegistry:
         with self._lock:
             registry = self._load_locked()
             entries = registry["entries"]
-            if len(entries) < MAX_ACTIVE_LIVE_EDITS:
+            if len(entries) < MAX_PERSISTENT_LIVE_EDIT_AUTHORIZATIONS:
                 return []
             def release(entry: dict[str, Any], reason: str) -> None:
                 record = copy.deepcopy(entry)
@@ -476,7 +592,7 @@ class _PersistentLiveEditRegistry:
                     release(entry, "workspace-missing")
                 elif not capture_file.is_file():
                     release(entry, "capture-missing")
-            if len(entries) >= MAX_ACTIVE_LIVE_EDITS:
+            if len(entries) >= MAX_PERSISTENT_LIVE_EDIT_AUTHORIZATIONS:
                 same_shader = [
                     entry for entry in entries
                     if _workspace_key(Path(entry["workspacePath"])) not in protected_keys
@@ -484,10 +600,10 @@ class _PersistentLiveEditRegistry:
                 ]
                 same_shader.sort(key=lambda entry: (entry["updatedAt"], entry["authorizedAt"]))
                 for entry in same_shader:
-                    if len(entries) < MAX_ACTIVE_LIVE_EDITS:
+                    if len(entries) < MAX_PERSISTENT_LIVE_EDIT_AUTHORIZATIONS:
                         break
                     release(entry, "superseded-same-shader")
-            if len(entries) >= MAX_ACTIVE_LIVE_EDITS:
+            if len(entries) >= MAX_PERSISTENT_LIVE_EDIT_AUTHORIZATIONS:
                 capture_key = _workspace_key(Path(wanted["capturePath"]))
                 other_capture = [
                     entry for entry in entries
@@ -496,12 +612,12 @@ class _PersistentLiveEditRegistry:
                 ]
                 other_capture.sort(key=lambda entry: (entry["updatedAt"], entry["authorizedAt"]))
                 for entry in other_capture:
-                    if len(entries) < MAX_ACTIVE_LIVE_EDITS:
+                    if len(entries) < MAX_PERSISTENT_LIVE_EDIT_AUTHORIZATIONS:
                         break
                     release(entry, "least-recent-other-capture")
             if released:
                 registry["entries"] = entries
-                atomic_write_json(self.path, registry)
+                self._write_locked(registry)
         return released
 
     def revoke(self, workspace: Path, authorization_id: str | None = None,
@@ -522,7 +638,7 @@ class _PersistentLiveEditRegistry:
                 retained.append(entry)
             if removed:
                 registry["entries"] = retained
-                atomic_write_json(self.path, registry)
+                self._write_locked(registry)
             return removed
 
     def revoke_unique_last_live_edit_id(
@@ -569,7 +685,7 @@ class _PersistentLiveEditRegistry:
                     "no authorization was revoked"
                 )
             registry["entries"] = retained
-            atomic_write_json(self.path, registry)
+            self._write_locked(registry)
             return copy.deepcopy(target)
 
 
@@ -634,13 +750,6 @@ def _watch_diagnostic(value: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(value, dict):
         raise ShaderLiveEditError("workspace watcher returned an invalid diagnostic")
-    actions = value.get("allowedActions")
-    if not isinstance(actions, list) or len(actions) > 32 or any(
-        not isinstance(item, str) or not item or len(item) > 256 for item in actions
-    ):
-        raise ShaderLiveEditError(
-            "workspace watcher returned invalid diagnostic actions"
-        )
     retryable = value.get("retryable")
     if (
         value.get("schema") != DIAGNOSTIC_SCHEMA
@@ -656,7 +765,6 @@ def _watch_diagnostic(value: Any) -> dict[str, Any] | None:
         "exceptionType": _bounded(value.get("exceptionType", "Diagnostic"), 128),
         "message": _bounded(value.get("message", "workspace compile failed"), 4096),
         "retryable": retryable,
-        "allowedActions": list(actions),
     }
 
 
@@ -775,7 +883,7 @@ def _latest_watch_compile_failure(watch: dict[str, Any]) -> dict[str, str] | Non
         # The watcher keeps bounded history after recovery.  The newest
         # compile outcome, rather than any older failure still in that history,
         # defines the current error state.
-        if event.get("type") == "compileSucceeded":
+        if event.get("type") in {"compileSucceeded", "compileAdopted"}:
             return None
         if event.get("type") == "compileFailed":
             return _watch_error(event)
@@ -806,6 +914,7 @@ class _LiveEditJob:
         on_finished: Callable[[_LiveEditJob], None],
         poll_seconds: float,
         join_seconds: float,
+        session_unavailable_retry_seconds: float,
         session: ShaderLiveEditSession | None = None,
     ) -> None:
         self.live_edit_id = live_edit_id
@@ -819,21 +928,14 @@ class _LiveEditJob:
         self.on_finished = on_finished
         self.poll_seconds = poll_seconds
         self.join_seconds = join_seconds
+        self.session_unavailable_retry_seconds = session_unavailable_retry_seconds
         self._lock = threading.RLock()
         self._apply_condition = threading.Condition(self._lock)
         self._watch_stop_lock = threading.Lock()
         self._watch_stopped = False
         self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="shader-live-edit-%s" % live_edit_id[:8],
-            daemon=True,
-        )
-        self._apply_thread = threading.Thread(
-            target=self._run_apply_queue,
-            name="shader-live-apply-%s" % live_edit_id[:8],
-            daemon=True,
-        )
+        self._thread = ScheduledTask(self._run, name="shader-live-edit-%s" % live_edit_id[:8], lane="monitor")
+        self._apply_thread = ScheduledTask(self._run_apply_queue, name="shader-live-apply-%s" % live_edit_id[:8], lane="apply")
         self._state = "starting"
         self._created_at = _utc_now()
         self._started_at: str | None = None
@@ -876,6 +978,7 @@ class _LiveEditJob:
         self._last_apply: dict[str, Any] | None = None
         self._active_apply: dict[str, Any] | None = None
         self._last_error: dict[str, Any] | None = None
+        self._session_unavailable = False
         self._last_compile_error = (
             _latest_watch_compile_failure(watch_snapshot)
             if self._watch_snapshot["compileFailures"] > 0
@@ -906,11 +1009,9 @@ class _LiveEditJob:
                 catchUpCandidateAlreadyCompiled=(
                     self._watch_snapshot["compileSuccesses"] > 0
                 ),
-                message=(
-                    "Only candidates compiled after this live-edit session starts are "
-                    "eligible. Different candidate bytes require fresh ABI/live replay "
-                    "validation; bytes identical to the active validated replacement are reused"
-                ),
+                reuseExistingCompiledSource=True,
+                compileChangedSourceOnly=True,
+                reuseUnchangedValidatedPair=True,
             )
             if self._last_compile_error is not None:
                 self._record_locked(
@@ -938,7 +1039,7 @@ class _LiveEditJob:
         if terminal:
             self._stop_workspace_watcher()
             for worker in (self._thread, self._apply_thread):
-                if worker is not threading.current_thread():
+                if not is_current_task(worker):
                     worker.join(self.join_seconds)
                 if worker.is_alive():
                     raise ShaderLiveEditError("terminal live-edit worker has not finished")
@@ -959,7 +1060,7 @@ class _LiveEditJob:
         except Exception as exc:
             if stop_error is None:
                 stop_error = exc
-        if self._thread is not threading.current_thread():
+        if not is_current_task(self._thread):
             self._thread.join(self.join_seconds)
         if self._thread.is_alive():
             raise ShaderLiveEditError(
@@ -1012,12 +1113,72 @@ class _LiveEditJob:
             return self._state in {"stopped", "failed"}
 
     def require_current_session(self) -> None:
-        if self.session is not None and self.session.state() != "current":
+        state = self._capture_session_state()
+        if state == "unavailable":
+            raise ShaderLiveEditSessionUnavailable(
+                "shader live-edit capture session is temporarily unavailable"
+            )
+        if state == "expired":
             with self._lock:
                 # Historical receipts remain in lastApply/events, but a target
                 # from a closed capture is never presented as currently owned.
                 self._active_apply = None
-            raise ShaderLiveEditError("shader live-edit capture session is no longer current")
+            raise ShaderLiveEditError(
+                "shader live-edit capture session is no longer current (expired)"
+            )
+
+    def _capture_session_state(self) -> str:
+        if self.session is None:
+            return "current"
+        try:
+            state = self.session.state()
+        except Exception:
+            return "unavailable"
+        return state if state in {"current", "unavailable", "expired"} else "unavailable"
+
+    def _wait_for_current_session(self) -> bool:
+        """Bound one unavailable retry window without retiring the monitor.
+
+        A busy qrenderdoc may stop refreshing its mailbox while replay work is
+        in progress. Retry that observation for a bounded window and, if it is
+        still unavailable, yield this iteration. Only an explicit ``expired``
+        state permanently terminates the live-edit job.
+        """
+
+        deadline = time.monotonic() + self.session_unavailable_retry_seconds
+        while not self._stop.is_set():
+            state = self._capture_session_state()
+            if state == "current":
+                with self._lock:
+                    if self._session_unavailable:
+                        self._session_unavailable = False
+                        self._record_locked(
+                            "captureSessionAvailable",
+                            message="Capture session became available again",
+                            persist_failure_is_fatal=False,
+                        )
+                return True
+            if state == "expired":
+                with self._lock:
+                    self._active_apply = None
+                raise ShaderLiveEditError(
+                    "shader live-edit capture session is no longer current (expired)"
+                )
+            with self._lock:
+                if not self._session_unavailable:
+                    self._session_unavailable = True
+                    self._record_locked(
+                        "captureSessionUnavailable",
+                        message=(
+                            "Capture session is temporarily unavailable; monitoring is retained"
+                        ),
+                        persist_failure_is_fatal=False,
+                    )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self._stop.wait(min(max(self.poll_seconds, 0.01), remaining))
+        return False
 
     def save_source(self, expected_raw_sha256: str, text: str) -> dict[str, Any]:
         """Save through the exact running watcher owned by this live session."""
@@ -1035,17 +1196,26 @@ class _LiveEditJob:
                 )
             return result
 
-    def _run(self) -> None:
+    def _run(self):
         try:
+            watch_sequence = None
             with self._lock:
                 self._state = "stopping" if self._stop.is_set() else "running"
                 self._started_at = _utc_now()
                 self._record_locked("liveEditStarted")
-            while not self._stop.wait(self.poll_seconds):
-                self.require_current_session()
-                watch = self._checked_watch_snapshot(
-                    self.watch_manager.poll(self.watch_id)
-                )
+            while not self._stop.is_set():
+                yield self.poll_seconds
+                if self._stop.is_set():
+                    break
+                if not self._wait_for_current_session():
+                    continue
+                poll_changed = getattr(self.watch_manager, "poll_if_changed", None)
+                raw_watch = (poll_changed(self.watch_id, watch_sequence) if callable(poll_changed)
+                             else self.watch_manager.poll(self.watch_id))
+                if raw_watch is None:
+                    continue
+                watch = self._checked_watch_snapshot(raw_watch)
+                watch_sequence = watch.get("observationSequence")
                 self._observe_watch(watch)
                 state = str(watch.get("state", ""))
                 if state in {"stopping", "stopped", "failed"}:
@@ -1126,12 +1296,13 @@ class _LiveEditJob:
             with self._apply_condition:
                 self._pending_apply = None
                 self._apply_condition.notify_all()
-            if self._apply_thread is not threading.current_thread():
-                # Match the old single-worker lifetime: an in-flight replay
-                # mutation owns the session until it returns. The public stop
-                # call remains bounded and may report its existing timeout,
-                # while this daemon coordinator finishes safely afterwards.
-                self._apply_thread.join()
+            if not is_current_task(self._apply_thread):
+                # An in-flight mutation retains its owner until it returns.
+                # Yield while waiting so stopping two slow jobs cannot occupy
+                # both shared monitor workers and stall unrelated editors.
+                while self._apply_thread.is_alive():
+                    self._apply_thread.wake()
+                    yield min(self.poll_seconds, 0.1)
             with self._lock:
                 if self._state != "failed":
                     self._state = "stopped"
@@ -1199,25 +1370,41 @@ class _LiveEditJob:
                 queuePolicy="latest-wins",
             )
             self._apply_condition.notify_all()
+            self._apply_thread.wake()
 
-    def _run_apply_queue(self) -> None:
+    def _run_apply_queue(self):
         """Apply serially while the independent monitor keeps polling saves."""
 
         while True:
             with self._apply_condition:
-                self._apply_condition.wait_for(
-                    lambda: self._pending_apply is not None or self._stop.is_set()
-                )
                 if self._stop.is_set():
                     self._pending_apply = None
                     return
                 candidate = self._pending_apply
                 self._pending_apply = None
-                if candidate is None:  # defensive condition invariant
-                    continue
                 self._apply_in_progress = candidate
+            if candidate is None:
+                yield self.poll_seconds
+                continue
             try:
                 self._apply(candidate[0], candidate[1])
+            except (ShaderLiveEditDeferred, ShaderLiveEditSessionUnavailable):
+                # No replay mutation was admitted. Preserve the newest pending
+                # candidate and retry it after another bounded availability
+                # window; a later save still wins over this one.
+                with self._apply_condition:
+                    self._apply_in_progress = None
+                    if (
+                        not self._stop.is_set()
+                        and (
+                            self._pending_apply is None
+                            or self._pending_apply[0] < candidate[0]
+                        )
+                    ):
+                        self._pending_apply = candidate
+                    self._apply_condition.notify_all()
+                yield min(max(self.poll_seconds, 0.05), 0.5)
+                continue
             except Exception as exc:
                 # Audit persistence and internal evidence checks can fail before
                 # the callback's own guarded section. Such a failure terminates
@@ -1315,7 +1502,11 @@ class _LiveEditJob:
                     observedSourceSha256=summary["observedSourceSha256"],
                 )
 
-            if success_advanced:
+            # Several compiles can finish between coordinator polls. A success
+            # counter advancing does not recover a later failure in that same
+            # snapshot; use the most recent compile outcome, including adoption
+            # of a candidate published by another writer.
+            if success_advanced and _latest_watch_compile_failure(watch) is None:
                 self._last_compile_error = None
                 if previous_error is not None or failure_advanced:
                     self._record_locked(
@@ -1331,15 +1522,28 @@ class _LiveEditJob:
             self._last_seen_compile_failures = summary["compileFailures"]
 
     def _apply(self, revision: int, raw_sha256: str) -> None:
-        # Mark a candidate handled before invoking the callback. A failed apply
-        # stays auditable and is never retried indefinitely without a newer save.
+        with source_observation_transaction(self.workspace, blocking=False) as available:
+            if not available:
+                raise ShaderLiveEditDeferred(
+                    "organization is validating a temporary source; wait for canonical publication"
+                )
+            self._apply_observed_candidate(revision, raw_sha256)
+
+    def _apply_observed_candidate(self, revision: int, raw_sha256: str) -> None:
+        # Temporary capture unavailability is checked before a candidate is
+        # marked handled. A real apply failure stays auditable and is not
+        # retried indefinitely without a newer save.
+        if not self._wait_for_current_session():
+            raise ShaderLiveEditSessionUnavailable(
+                "shader live-edit capture session remained temporarily unavailable"
+            )
+        source_identity = _current_compiled_source_identity(self.workspace, revision, raw_sha256)
         with self._lock:
             if self._stop.is_set():
                 return
-            self.require_current_session()
             self._latest_handled_revision = revision
             self._latest_handled_raw_sha256 = raw_sha256
-            if self._reuse_active_replacement_locked(revision, raw_sha256):
+            if self._reuse_active_replacement_locked(revision, raw_sha256, source_identity):
                 return
             self._apply_attempts += 1
             # This is the durable pre-mutation barrier.  _record_locked raises
@@ -1352,16 +1556,25 @@ class _LiveEditJob:
                 applyScope="captured-shader-resource",
             )
         try:
-            result = self.apply_candidate(str(self.workspace), revision, raw_sha256)
+            owner_token = _LIVE_APPLY_OWNER.set((self, revision, raw_sha256))
+            try:
+                result = self.apply_candidate(str(self.workspace), revision, raw_sha256)
+            finally:
+                _LIVE_APPLY_OWNER.reset(owner_token)
             result = self._validated_apply_result(result, revision, raw_sha256)
+            if (source_identity is not None
+                    and _current_compiled_source_identity(self.workspace, revision, raw_sha256) == source_identity):
+                result["sourceIdentity"] = source_identity
             applied = result["applied"]
             if applied is True:
                 replacement = result["replacement"]
                 with self._lock:
                     self._apply_successes += 1
                     self._last_apply = result
-                    self.require_current_session()
-                    self._active_apply = result
+                    session_state = self._capture_session_state()
+                    self._active_apply = (
+                        None if session_state == "expired" else result
+                    )
                     self._last_error = None
                     # Include the queue transition in the same durable snapshot
                     # as the result.  Otherwise the on-disk audit permanently
@@ -1383,6 +1596,7 @@ class _LiveEditJob:
                         freshPhysicalValidationPerformed=result[
                             "validation"
                         ].get("freshPhysicalValidationPerformed", True),
+                        captureSessionState=session_state,
                     )
                 return
             if applied is False:
@@ -1399,7 +1613,31 @@ class _LiveEditJob:
                     )
                 return
             raise ShaderLiveEditError("shared-resource apply omitted its applied decision")
+        except (ShaderLiveEditDeferred, ShaderLiveEditSessionUnavailable) as exc:
+            with self._lock:
+                self._apply_in_progress = None
+                self._record_locked(
+                    "applyDeferred",
+                    revision=revision,
+                    candidateRawSha256=raw_sha256,
+                    errorType=type(exc).__name__,
+                    message=_bounded(exc),
+                    persist_failure_is_fatal=False,
+                )
+            raise
         except Exception as exc:
+            if "Shader workspace no longer contains the expected saved candidate" in str(exc):
+                # A completed review or a newer editor save can supersede an
+                # already queued revision. Its CAS rejection is a normal queue
+                # transition, not a replay failure or a reason to ask the user.
+                with self._lock:
+                    self._apply_in_progress = None
+                    self._record_locked(
+                        "applySuperseded", revision=revision,
+                        candidateRawSha256=raw_sha256,
+                        message="a newer canonical candidate superseded this queued revision",
+                    )
+                return
             diagnostic = classify_shader_failure(exc, phase="live-edit-apply")
             with self._lock:
                 self._apply_failures += 1
@@ -1420,7 +1658,7 @@ class _LiveEditJob:
                 )
 
     def _reuse_active_replacement_locked(
-        self, revision: int, raw_sha256: str
+        self, revision: int, raw_sha256: str, source_identity: dict[str, str] | None,
     ) -> bool:
         """Accept an exact byte-identical save without replay work.
 
@@ -1435,16 +1673,21 @@ class _LiveEditJob:
         if (
             not isinstance(replacement, dict)
             or replacement.get("candidateRawSha256") != raw_sha256
+            or source_identity is None
+            or active.get("sourceIdentity") != source_identity
+            or active.get("projectPublication", {}).get("status") == "pending"
         ):
             return False
         source_revision = _positive_integer(
             replacement.get("revision"), "active replacement revision"
         )
         validation = active.get("validation")
-        if (
-            not isinstance(validation, dict)
-            or validation.get("replayAbiValidated") is not True
-        ):
+        manual = (isinstance(validation, dict) and validation.get("manualEdit") is True
+                  and validation.get("abiValidationMode") == "manual-fast"
+                  and validation.get("validationScope") == "manual-edit-unvalidated"
+                  and validation.get("replayAbiValidated") is False
+                  and validation.get("freshPhysicalValidationPerformed") is False)
+        if not isinstance(validation, dict) or not (validation.get("replayAbiValidated") is True or manual):
             raise ShaderLiveEditError(
                 "active replacement lost its replay ABI validation evidence"
             )
@@ -1459,12 +1702,14 @@ class _LiveEditJob:
                 "candidateRawSha256": raw_sha256,
             },
             "validation": {
-                "replayAbiValidated": True,
+                **copy.deepcopy(validation),
+                "replayAbiValidated": validation["replayAbiValidated"],
                 "performedForRevision": False,
                 "evidenceReusedFromRevision": source_revision,
             },
             "replacement": copy.deepcopy(replacement),
             "rollback": copy.deepcopy(active.get("rollback")),
+            "sourceIdentity": dict(source_identity),
         }
         self._apply_reuses += 1
         self._last_apply = reuse
@@ -1482,7 +1727,8 @@ class _LiveEditJob:
         return True
 
     def _validated_apply_result(
-        self, result: Any, revision: int, raw_sha256: str
+        self, result: Any, revision: int, raw_sha256: str,
+        *, operation: str = "apply-shared-resource", native_revision_may_differ: bool = False,
     ) -> dict[str, Any]:
         """Return bounded evidence for the exact candidate requested by this job."""
 
@@ -1490,7 +1736,7 @@ class _LiveEditJob:
             raise ShaderLiveEditError("shared-resource apply returned a non-object")
         if result.get("schema") != SHARED_APPLY_SCHEMA:
             raise ShaderLiveEditError("shared-resource apply returned an unexpected schema")
-        if result.get("operation") != "apply-shared-resource":
+        if result.get("operation") != operation:
             raise ShaderLiveEditError("shared-resource apply returned an unexpected operation")
 
         binding = result.get("binding")
@@ -1515,7 +1761,7 @@ class _LiveEditJob:
             raise ShaderLiveEditError("shared-resource apply omitted its applied decision")
         evidence: dict[str, Any] = {
             "schema": SHARED_APPLY_SCHEMA,
-            "operation": "apply-shared-resource",
+            "operation": operation,
             "applied": applied,
             "binding": {
                 "revision": revision,
@@ -1527,6 +1773,8 @@ class _LiveEditJob:
         }
         optional_validation = {
             "validationScope": str,
+            "abiValidationMode": str,
+            "manualEdit": bool,
             "preliminaryReplayReflectionSkipped": bool,
             "freshPhysicalValidationPerformed": bool,
             "freshLiveCaptureValidationPerformed": bool,
@@ -1539,6 +1787,18 @@ class _LiveEditJob:
                 and not (expected_type is int and isinstance(value, bool))
             ):
                 evidence["validation"][key] = value
+        publication = result.get("projectPublication")
+        if isinstance(publication, dict):
+            evidence["projectPublication"] = {
+                key: _bounded(publication[key], 512)
+                for key in ("status", "knowledgeId", "message") if isinstance(publication.get(key), str)
+            }
+        display_aliases = result.get("displayAliases")
+        if isinstance(display_aliases, dict):
+            evidence["displayAliases"] = {
+                key: _bounded(display_aliases[key], 400)
+                for key in ("status", "reason", "diagnostic") if isinstance(display_aliases.get(key), str)
+            }
 
         if applied is False:
             if validation["replayAbiValidated"] is not False:
@@ -1550,7 +1810,12 @@ class _LiveEditJob:
             )
             return evidence
 
-        if validation["replayAbiValidated"] is not True:
+        manual = (validation.get("manualEdit") is True
+                  and validation.get("abiValidationMode") == "manual-fast"
+                  and validation.get("validationScope") == "manual-edit-unvalidated"
+                  and validation.get("replayAbiValidated") is False
+                  and validation.get("freshPhysicalValidationPerformed") is False)
+        if validation["replayAbiValidated"] is not True and not manual:
             raise ShaderLiveEditError(
                 "shared-resource apply claimed success without replay ABI validation"
             )
@@ -1568,7 +1833,9 @@ class _LiveEditJob:
         replacement_revision = _positive_integer(
             replacement.get("revision"), "shared-resource replacement revision"
         )
-        if replacement_revision != revision:
+        if (replacement_revision != revision and not native_revision_may_differ
+                and not (result.get("idempotent") is True and replacement_revision < revision
+                         and validation.get("currentSourceAbiValidated") is True)):
             raise ShaderLiveEditError("shared-resource replacement revision changed")
         if replacement.get("candidateRawSha256") != raw_sha256:
             raise ShaderLiveEditError("shared-resource replacement candidate hash changed")
@@ -1607,7 +1874,7 @@ class _LiveEditJob:
                 "scope": "captured-resource",
                 "replacement": {
                     "replacementId": replacement_id,
-                    "revision": revision,
+                    "revision": replacement_revision,
                     "candidateRawSha256": raw_sha256,
                     "originalResourceId": original_resource_id,
                     "resourceScoped": True,
@@ -1622,7 +1889,56 @@ class _LiveEditJob:
                 },
             }
         )
+        for destination, source in ((evidence, result), (evidence["replacement"], replacement)):
+            counters = _timing_counters(source.get("timingsMs"))
+            if counters:
+                destination["timingsMs"] = counters
         return evidence
+
+    def recover_active_candidate(self) -> None:
+        """Reuse current Native mapping evidence, without apply or audit replay."""
+        if self.session is None or self.session.recover_active_candidate is None:
+            return
+        with source_observation_transaction(self.workspace):
+            result = self.session.recover_active_candidate(str(self.workspace))
+            if result is None:
+                return
+            watch = self.watch_manager.poll(self.watch_id)
+            source_sha = (result.get("binding") or {}).get("sourceSha256")
+            revision = (result.get("binding") or {}).get("revision")
+            raw_sha = (result.get("binding") or {}).get("candidateRawSha256")
+            epoch = result.get("nativeMutationEpoch")
+            if (self.session.state() != "current" or result.get("captureBinding") != self.session.binding
+                    or result.get("mutationPerformed") is not False
+                    or type(epoch) is not int or epoch <= 0
+                    or not isinstance(source_sha, str) or _SHA256.fullmatch(source_sha) is None
+                    or watch.get("state") not in {"starting", "running"}
+                    or watch.get("compileInProgress") is not False
+                    or watch.get("pending") is not False
+                    or watch.get("caughtUp") is not True
+                    or watch.get("observedSourceSha256") != source_sha
+                    or watch.get("lastCompiledSourceSha256") != source_sha
+                    or watch.get("latestCandidateRevision") != revision
+                    or watch.get("latestCandidateRawSha256") != raw_sha):
+                raise ShaderLiveEditError("Native resume proof no longer matches the current watcher/session")
+            evidence = self._validated_apply_result(result, revision, raw_sha,
+                operation="resume-existing-shared-resource", native_revision_may_differ=True)
+            if evidence.get("applied") is not True:
+                raise ShaderLiveEditError("Native resume proof has no current replacement")
+            evidence.update(mutationPerformed=False, reused=True, nativeMutationEpoch=epoch)
+            evidence["binding"]["sourceSha256"] = source_sha
+            source_identity = _current_compiled_source_identity(self.workspace, revision, raw_sha)
+            if source_identity is not None:
+                evidence["sourceIdentity"] = source_identity
+            with self._lock:
+                self._active_apply = evidence
+                self._last_apply = copy.deepcopy(evidence)
+                self._latest_handled_revision = revision
+                self._latest_handled_raw_sha256 = raw_sha
+                self._latest_scheduled_revision = revision
+                self._latest_scheduled_raw_sha256 = raw_sha
+                self._record_locked("nativeReplacementResumed", revision=revision,
+                    candidateRawSha256=raw_sha, nativeMutationEpoch=epoch, mutationPerformed=False)
 
     def _record_locked(
         self,
@@ -1679,6 +1995,9 @@ class _LiveEditJob:
             "state": self._state,
             "workspacePath": str(self.workspace),
             "captureBinding": copy.deepcopy(self.session.binding) if self.session is not None else None,
+            # A running worker whose capture session went away still refuses every save.
+            # Report that plainly so the editor can say why instead of failing on save.
+            "sessionState": self._capture_session_state(),
             "watchId": self.watch_id,
             "auditPath": str(self.audit_path),
             "createdAt": self._created_at,
@@ -1723,10 +2042,13 @@ class _LiveEditJob:
             "droppedAuditEvents": self._dropped_events,
             "events": copy.deepcopy(list(self._events)),
             "policy": {
-                "newSaveRequired": True,
-                "freshCompileRequired": True,
-                "initialFullReplayAbiValidationRequired": True,
-                "freshReplayAbiValidationRequired": True,
+                "newSaveRequired": False,
+                "freshCompileRequired": False,
+                "compileWhenSourceChanged": True,
+                "initialFullReplayAbiValidationRequired": False,
+                "freshReplayAbiValidationRequired": False,
+                "unprovenCandidateRequiresAbiCheck": True,
+                "unchangedValidatedPairReusesAbiEvidence": True,
                 "freshPreliminaryReplayReflectionRequired": False,
                 "changedBytesUseInlinePhysicalAbiGate": True,
                 "freshLiveCaptureValidationRequired": True,
@@ -1736,6 +2058,7 @@ class _LiveEditJob:
                 "sharedResourceIdentityPreserved": True,
                 "originalShaderPreserved": True,
                 "failedSavePreservesLastGoodReplacement": True,
+                "temporaryCaptureUnavailabilityRetries": True,
                 "aiCanBypassApplyGate": False,
             },
         }
@@ -1751,12 +2074,15 @@ class ShaderLiveEditManager:
         *,
         poll_seconds: float = POLL_SECONDS,
         join_seconds: float = JOIN_SECONDS,
+        session_unavailable_retry_seconds: float = SESSION_UNAVAILABLE_RETRY_SECONDS,
         registry_path: str | Path | None = None,
         workspace_identity: Callable[[str], dict[str, Any]] | None = None,
         workspace_migration_evidence: (
             Callable[[str, str, str], dict[str, Any]] | None
         ) = None,
         bind_session: Callable[[str], ShaderLiveEditSession] | None = None,
+        start_context: Callable[[str], Any] | None = None,
+        phase_context: Callable[[str], Any] | None = None,
     ) -> None:
         self.watch_manager = watch_manager
         if not callable(apply_candidate):
@@ -1765,11 +2091,23 @@ class ShaderLiveEditManager:
         if bind_session is not None and not callable(bind_session):
             raise ShaderLiveEditError("bind_session must be callable")
         self._bind_session = bind_session
+        if start_context is not None and not callable(start_context):
+            raise ShaderLiveEditError("start_context must be callable")
+        self._start_context = start_context
+        if phase_context is not None and not callable(phase_context):
+            raise ShaderLiveEditError("phase_context must be callable")
+        self._phase_context = phase_context or (lambda unused: nullcontext())
         self.poll_seconds = _duration(
             poll_seconds, "poll_seconds", MIN_POLL_SECONDS, MAX_POLL_SECONDS
         )
         self.join_seconds = _duration(
             join_seconds, "join_seconds", MIN_JOIN_SECONDS, MAX_JOIN_SECONDS
+        )
+        self.session_unavailable_retry_seconds = _duration(
+            session_unavailable_retry_seconds,
+            "session_unavailable_retry_seconds",
+            MIN_POLL_SECONDS,
+            MAX_JOIN_SECONDS,
         )
         if (registry_path is None) != (workspace_identity is None):
             raise ShaderLiveEditError(
@@ -1808,9 +2146,46 @@ class ShaderLiveEditManager:
             if key in self._starting_workspaces:
                 raise ShaderLiveEditError("workspace already has a live-edit start in progress")
         with self._lifecycle_lock:
+            # An explicit save can arrive before background capture reconciliation.
+            # Retire a confirmed-expired owner here instead of joining its old
+            # capture and making the first save fail. Keep durable consent, and
+            # wait for its apply worker before admitting a new watcher.
+            with self._lock:
+                active_id = self._active_by_workspace.get(key)
+                previous = [job for live_id, job in self._jobs.items()
+                            if _workspace_key(job.workspace) == key
+                            and (live_id == active_id or job._thread.is_alive()
+                                 or job._apply_thread.is_alive())]
+            for job in previous:
+                if job.session is None or job.session.state() != "expired":
+                    continue
+                job.stop()
+                with self._lock:
+                    if self._active_by_workspace.get(key) == job.live_edit_id:
+                        self._active_by_workspace.pop(key, None)
             return self._start(workspace_path, debounce_ms, persistent_entry=None)
 
     def _start(
+        self,
+        workspace_path: str | Path,
+        debounce_ms: int,
+        *,
+        persistent_entry: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        # Joining an already running editor needs no new source admission.
+        key = _workspace_key(_resolved_workspace(workspace_path, "workspace_path"))
+        with self._lock:
+            existing = self._jobs.get(self._active_by_workspace.get(key, ""))
+            if existing is not None and not existing.is_terminal():
+                snapshot = existing.snapshot()
+                snapshot["joinedExistingSession"] = True
+                return snapshot
+        context = (self._start_context(str(workspace_path))
+                   if self._start_context is not None else nullcontext())
+        with context:
+            return self._start_prepared(workspace_path, debounce_ms, persistent_entry=persistent_entry)
+
+    def _start_prepared(
         self,
         workspace_path: str | Path,
         debounce_ms: int,
@@ -1825,9 +2200,13 @@ class ShaderLiveEditManager:
             if existing_id:
                 existing = self._jobs.get(existing_id)
                 if existing is not None and not existing.is_terminal():
-                    raise ShaderLiveEditError(
-                        "workspace already has an active live-edit session: %s" % existing_id
-                    )
+                    # The editor already watches this workspace (the user has it
+                    # open). Starting "again" -- typically the AI after an
+                    # organization -- joins that session instead of failing: one
+                    # workspace, one watcher, whoever asked second gets its id.
+                    snapshot = existing.snapshot()
+                    snapshot["joinedExistingSession"] = True
+                    return snapshot
                 self._active_by_workspace.pop(key, None)
             if key in self._starting_workspaces:
                 raise ShaderLiveEditError("workspace already has a live-edit start in progress")
@@ -1886,10 +2265,11 @@ class ShaderLiveEditManager:
                 if not isinstance(session, ShaderLiveEditSession) or session.state() != "current":
                     raise ShaderLiveEditError("live-edit capture session could not be frozen")
             persistent_start = getattr(self.watch_manager, "start_persistent", None)
-            if persistent_entry is not None and callable(persistent_start):
-                watch_value = persistent_start(workspace_path, debounce_ms)
-            else:
-                watch_value = self.watch_manager.start(workspace_path, debounce_ms)
+            with self._phase_context("watcherStart"):
+                if persistent_entry is not None and callable(persistent_start):
+                    watch_value = persistent_start(workspace_path, debounce_ms)
+                else:
+                    watch_value = self.watch_manager.start(workspace_path, debounce_ms)
             if not isinstance(watch_value, dict):
                 raise ShaderLiveEditError("workspace watcher returned a non-object identity")
             watch = copy.deepcopy(watch_value)
@@ -1916,9 +2296,13 @@ class ShaderLiveEditManager:
                     on_finished=self._finished,
                     poll_seconds=self.poll_seconds,
                     join_seconds=self.join_seconds,
+                    session_unavailable_retry_seconds=(
+                        self.session_unavailable_retry_seconds
+                    ),
                     session=session,
                 )
-                with self._lock:
+                job.recover_active_candidate()
+                with self._phase_context("editorPublication"), self._lock:
                     self._jobs[live_edit_id] = job
                     self._active_by_workspace[key] = live_edit_id
                     if authorization is not None:
@@ -2040,6 +2424,37 @@ class ShaderLiveEditManager:
                 }
             )
             return result
+
+    def compile_saved_source(self, workspace_path: str, source_workspace_id: str,
+                             expected_source_sha256: str, *,
+                             capture_binding: dict[str, str]) -> dict[str, Any]:
+        """Authorize a manual save even when this document has no live session yet."""
+        if not isinstance(source_workspace_id, str) or _TOKEN.fullmatch(source_workspace_id) is None:
+            raise ShaderLiveEditError("shader editor workspace identity is invalid")
+        started = self.start(workspace_path, 100)
+        live_edit_id = started["liveEditId"]
+        with self._lock:
+            job = self._jobs.get(live_edit_id)
+            authorization_id = self._authorization_by_live_edit.get(live_edit_id)
+            if job is None or job.is_terminal() or self._registry is None:
+                raise ShaderLiveEditError("shader editor live-edit session is not running")
+            matches = [entry for entry in self._registry.entries()
+                       if entry["authorizationId"] == authorization_id
+                       and entry.get("lastLiveEditId") == live_edit_id
+                       and entry["workspaceIdentity"]["workspaceId"] == source_workspace_id
+                       and _workspace_key(Path(entry["workspacePath"])) == _workspace_key(job.workspace)]
+            if len(matches) != 1:
+                raise ShaderLiveEditError("shader editor authorization changed before compile scheduling")
+            with job._lock:
+                # start() may join an existing job for this workspace. Its
+                # original GUI being alive does not authorize this GUI to use it.
+                self.require_capture_binding(live_edit_id, capture_binding)
+                if job._state not in {"starting", "running"} or job._stop.is_set():
+                    raise ShaderLiveEditError("shader live-edit session is not running")
+                result = self.watch_manager.request_saved_source_compile(
+                    job.watch_id, expected_source_sha256)
+            return {**result, "liveEditId": live_edit_id, "authorizationId": authorization_id,
+                    "sourceWorkspaceId": source_workspace_id}
 
     def check_authorized_source(
         self,
@@ -2413,7 +2828,7 @@ class ShaderLiveEditManager:
                 if len(matches) == 1:
                     return
             raise ShaderLiveEditError("live-edit session does not belong to this capture")
-        if job.session is not None and job.session.binding != binding:
+        if job.session is not None and not capture_bindings_match(job.session.binding, binding):
             raise ShaderLiveEditError("live-edit session belongs to another GUI capture session")
         job.require_current_session()
 
@@ -2461,7 +2876,7 @@ class ShaderLiveEditManager:
                         continue
                     owner_state = old.session.state() if old.session is not None else "unavailable"
                     jobs[entry["authorizationId"]] = (old, owner_state)
-                    if (old.session is not None and old.session.binding == binding
+                    if (old.session is not None and capture_bindings_match(old.session.binding, binding)
                             and owner_state == "current" and not old.is_terminal()):
                         current.append(entry)
                     elif owner_state != "expired":
@@ -2481,7 +2896,7 @@ class ShaderLiveEditManager:
                         continue
                     old, owner_state = previous
                     if owner_state != "expired" and (
-                            old.session is None or old.session.binding != binding):
+                            old.session is None or not capture_bindings_match(old.session.binding, binding)):
                         continue
                     try:
                         old.stop()
@@ -2509,7 +2924,7 @@ class ShaderLiveEditManager:
                     if old.session is None:
                         continue
                     owner_state = old.session.state()
-                    if old.session.binding == binding and owner_state == "current":
+                    if capture_bindings_match(old.session.binding, binding) and owner_state == "current":
                         continue
                     if owner_state != "expired":
                         continue
@@ -2529,6 +2944,11 @@ class ShaderLiveEditManager:
                     started = self._start(workspace, int(entry["debounceMs"]), persistent_entry=entry)
                     results.append({"workspacePath": workspace, "authorizationId": authorization_id,
                                     "resumed": True, "liveEditId": started["liveEditId"], "watchId": started["watchId"]})
+                except ShaderLiveEditDeferred:
+                    # No watcher/replay admission was published. A later owner
+                    # tick may retry after restore completes or fails.
+                    self._capture_resume_attempts.pop(authorization_id, None)
+                    break
                 except Exception as exc:
                     results.append({"workspacePath": workspace, "authorizationId": authorization_id,
                                     "resumed": False, "errorType": type(exc).__name__, "message": _bounded(exc)})
@@ -2595,6 +3015,31 @@ class ShaderLiveEditManager:
             self._resume_results = copy.deepcopy(results)
         return {"enabled": True, "attempted": True, "results": results}
 
+    def require_local_apply_owner(self, workspace_path: str, expected: Mapping[str, Any],
+                                  direct_binding: tuple[str, str] | None) -> None:
+        """Admit only this manager's exact current worker, without polling IPC.
+
+        This path cannot be requested over the protocol. The ContextVar must
+        name the real job object on its actual apply thread, and manager state
+        must still agree while every competing workspace writer is excluded.
+        """
+        key = _workspace_key(Path(workspace_path).resolve())
+        with self._lock:
+            owner = current_live_apply_owner(workspace_path, expected, direct_binding)
+            context = _LIVE_APPLY_OWNER.get()
+            if owner is None or context is None:
+                raise ShaderLiveEditError("Shader live-edit apply owner is no longer current")
+            job = context[0]
+            if (self._jobs.get(owner["liveEditId"]) is not job
+                    or self._active_by_workspace.get(key) != owner["liveEditId"]):
+                raise ShaderLiveEditError("Shader live-edit apply owner is not registered")
+            for other in self._jobs.values():
+                if other is not job and _workspace_key(other.workspace) == key and not other.is_terminal():
+                    raise ShaderLiveEditError(
+                        "stop the exact Shader live-edit session before applying its shared replacement")
+            if current_live_apply_owner(workspace_path, expected, direct_binding) != owner:
+                raise ShaderLiveEditError("Shader live-edit apply owner changed before its shared replacement")
+
     def list(self) -> dict[str, Any]:
         with self._lock:
             sessions = [job.snapshot() for job in self._jobs.values()]
@@ -2656,6 +3101,10 @@ __all__ = [
     "LIVE_EDIT_VERSION",
     "LIVE_EDIT_REGISTRY_SCHEMA",
     "LIVE_EDIT_REGISTRY_VERSION",
+    "SESSION_UNAVAILABLE_RETRY_SECONDS",
+    "ShaderLiveEditDeferred",
     "ShaderLiveEditError",
     "ShaderLiveEditManager",
+    "ShaderLiveEditSession",
+    "ShaderLiveEditSessionUnavailable",
 ]

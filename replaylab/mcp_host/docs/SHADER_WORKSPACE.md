@@ -1,6 +1,21 @@
 # External Shader Workspace
 
-The external Shader workspace is ReplayLab's deterministic foundation for
+Interactive save, unsaved-buffer compiler checks and workspace value previews
+use the same bound compiler recipe. The recipe is projected from the existing
+manifest and current pinned tool registry; it does not migrate source, paths or
+history. When a registered compile route exists, all three paths use it instead
+of independently preferring a replay-native or private compiler. Captured native
+GLSL workspaces without an external route keep their native compiler. Temporary
+preview source and output paths differ, while language/profile, entry contract,
+macros, target environment, layouts, position conventions and process environment
+come from that recipe. Route/argument/tool changes invalidate the preview cache;
+unchanged targets and manual-save bytecode caches remain reusable. AI organization
+validation stays separate from this interactive compilation policy.
+
+For the source-bound symbol table, edit latency and validation tiers, see
+[Shader refactoring latency and symbol ownership](SHADER_REFACTOR_ACCELERATION.md).
+
+The external Shader workspace is Bread's deterministic foundation for
 turning one captured Shader into a reviewable edit/compile experiment. It is
 format- and API-driven rather than Unreal-, Unity-, or engine-driven: fixed
 code reads the captured API, executable bytes, stage, entry point and physical
@@ -18,6 +33,15 @@ separate fail-closed boundary.
 
 ## End-to-end user workflow
 
+The workspace UI identifies a logical Shader by its captured original bytes,
+API, stage and entry point. Source language, catalog/toolchain revisions and
+project knowledge versions are history of that Shader, not additional tree
+entries. Capture-local replay bindings still retain their own capture and
+ResourceId checks. Reorganization resolves the existing canonical source first;
+it does not start from decompilation merely because an import receipt or catalog
+revision is older. Clean superseded tabs follow the canonical source. Unsaved
+or externally modified working copies remain protected.
+
 The normal "reverse this draw's Shader, make it readable, then apply my saves"
 workflow is:
 
@@ -26,34 +50,23 @@ workflow is:
    detects DXBC, DXIL, Vulkan SPIR-V or OpenGL SPIR-V from physical evidence,
    and derives the stage/entry/profile. It does not guess a profile from a UI
    label.
-2. Select a complete `binary -> editable text -> binary` route from the fixed
-   source-integrated provider catalog. Every executable, adapter, dependency,
-   argument template and validator is SHA-256-bound. If a hop or untouched
-   baseline compile fails, the diagnostic is classified and the server itself
-   executes each untried opaque pair listed in `candidateRoutePairs`; every attempt
-   uses a new sibling workspace. The fixed plan caps this recovery frontier at eight
-   attempts and neither server nor Agent can invent a command, executable, route ID
-   or Apply request. No second model/tool turn is required to start an alternate.
-   `try_shader_workspace_recovery_candidate` already runs the selected decompile
-   and untouched-source baseline compile probe in that sibling. On success it
-   returns `reconstructionReceipt`, bound to the exact source/target workspaces,
-   capture/raw identity, route hashes, candidate indices, and published source
-   representation. AgentHost accepts this as the `workspace-reconstruct` step
-   only through the exact Host audit record and then reads the representation;
-   it does not call `decompile_shader_workspace` a second time. An ordinary MCP
-   success with `execution.succeeded=false` records the attempted pair with
-   `reconstructionReceipt=null`; it is recoverable evidence, not an invalid success
-   receipt and not permission to repeat the same process.
-   If every registered decompiler fails but a fixed compiler route exists,
-   preparation publishes RenderDoc native IR (or the exact captured binary view),
-   `explanation/promoted.<format>`, and a hash-bound provisional reconstruction
-   receipt. The Agent may construct reviewed source there, but it must still promote
-   the exact hash, compile through the bound route, and pass fresh replay ABI checks.
-   When an existing workspace was created against older catalog/registry bytes,
-   do not rewrite its manifest. `migrate_shader_workspace_toolchain` creates a
-   new workspace, preserves the exact current source bytes, rebinds the same
-   route shape to the current process-owned catalog, and starts again at
-   revision zero. Old revisions and candidates stay isolated in the archive.
+2. Inspect the returned bound workspace, representation lane, and hash-bound
+   route inventory. Preparation does not run a route probe or decompiler by
+   default. The Agent may call `decompile_shader_workspace` for the bound route,
+   `try_shader_workspace_recovery_candidate` for a selected registered pair in a
+   sibling workspace, or `get_shader_workspace_representation` for RenderDoc
+   disassembly. `attempt_reconstruction=true` explicitly requests the former
+   one-shot preparation behavior. A selected recovery pair receives an exact
+   source/target, capture/raw identity and route-bound receipt; a failed attempt
+   leaves the original workspace intact. Compiler-capable explanatory source
+   remains a draft until explicitly promoted, compiled and ABI-validated.
+   Read legacy metadata using its original schema. Missing modern identity
+   fields are completed from matching captured bytes, reflection and verified
+   workspace evidence; a schema upgrade alone does not invalidate saved work.
+   Preserve project names, paths, source edits and immutable revisions. A real
+   incompatible toolchain change can use `migrate_shader_workspace_toolchain`
+   to create a new workspace with the exact current source bytes and the same
+   route shape. Old revisions and candidates remain available in the archive.
 3. If an unpacked `assetRoot` is configured and the project catalog has already
    been prepared, `query_active_shader_asset_evidence(event_id, stage, top_k)`
    reads only the active project's hash-bound full catalog and managed symbol
@@ -63,21 +76,32 @@ workflow is:
    explain the program, but only program-verified blob/code/interface/layout
    matches may seed physical aliases or cross-capture knowledge. `AIProvisional`
    evidence remains review-only.
-4. For executable HLSL, call `begin_shader_workspace_organization`, let AI edit
-   only the returned proposal/analysis/Mermaid files, then call
-   `review_shader_workspace_organization`. The fixed review transaction is
-   described below. GLSL and instruction assembly remain directly editable,
-   but are not fed to the HLSL organiser.
-   These are Host artifact contracts, not an AgentHost workflow state machine.
+4. For executable source, `begin_shader_workspace_organization` opens an
+   editable draft from the current source. The Agent chooses the edits and
+   tools. The final `finish_shader_workspace_organization` binds the exact
+   draft and its source review, then compiles and validates the candidate once.
+   A checkpoint/source-only finish does not authorize replay replacement.
    Prefer available compilable native source or a directly successful fixed
    tool route; bytecode alone does not imply ABI repair. Reuse the current
-   compile/ABI evidence and repair only an actual failure. Register accepted
-   or soft-accepted baseline results with `register_active_project_workspace`.
-   Registration saves knowledge and shows the panel but may leave it read-only.
-   Complete default editable delivery with a checked
-   `apply_shader_workspace_shared_resource`, then a persistent
-   `start_shader_workspace_live_edit`; read back the canonical editable source
-   and durable session. A short-lived Agent-owned watcher is not sufficient.
+   compile/ABI evidence and repair only an actual failure. Register the
+   validated source separately only for an explicit low-level/recovery route.
+   For the normal requested replacement, finish with `apply_shared_resource=true` and the
+   requested workspace display/live-edit options. Finish applies the validated
+   candidate, publishes the reviewed source and navigation, and records the
+   active project's replacement association in one operation. Its
+   `replacementRegistration` receipt is the result: do not repeat registration
+   or validation after a successful receipt. Read back the canonical editable
+   source and durable live session. A short-lived Agent-owned watcher is not
+   sufficient. If only project publication fails, retain the applied candidate
+   and use the returned registration recovery parameters without recompiling
+   or reorganizing unchanged source.
+   When display is requested, final readback also checks the actual calculation
+   directory: the current source, reviewed semantic overview digest and ordered
+   stage IDs must agree with the editor projection. Pending generation is
+   distinguished from a missing, provisional or stale directory. A display
+   mismatch leaves source/replay results intact and requires display/metadata
+   recovery; it does not require another compilation or ABI pass. Directory
+   quality follows the reviewed rendering calculations, never a fixed row count.
    Registration verifies the workspace's immutable catalog against the live
    Shader/event uses and instance/session/path/API. The UI symbol catalog ID
    may be empty or belong to a different export selection of the same RDC;
@@ -89,9 +113,13 @@ workflow is:
 5. For the normal editable/save/compile/replace request, start the live session
    above; explain-only and explicit export-only requests skip apply/watch.
    A stable source save is debounced,
-   compiled to an immutable revision, freshly ABI-validated, rebound to the
-   current capture/session and original Shader, and then applied through the
-   checked shared-resource path for the capture API. A newer pending save
+   compiled to an immutable revision, rebound to the current capture/session
+   and original Shader, and applied through the checked native replacement
+   path for the capture API. Ordinary editor saves do not repeat the AI
+   organization's ABI review. Strict AI publication reuses a successful
+   in-process validation only for the exact source/revision/candidate, tool
+   route, original Shader and current capture session; stale or incomplete
+   receipts take the normal validation path. A newer pending save
    prevents an older revision from being applied. Ray/Library workspaces may
    still compile source/IR, but cannot start auto-apply while their complete
    export/state-object/shader-group/SBT transaction is unavailable.
@@ -100,8 +128,8 @@ workflow is:
    `list_shader_workspace_live_edits` to inspect active, authorised and failed
    resume records; an explicit stop revokes the durable authorisation.
    The qrender Bridge intentionally forgets capture-session-local catalog IDs
-   on restart. The watcher may resume before a capture is ready; on the first
-   later candidate validation, fixed Host code derives a canonical evidence hash
+   on restart. The watcher may resume before a capture is ready. When a strict
+   AI publication later needs candidate validation, fixed Host code derives a canonical evidence hash
    from the immutable, `catalogSha256`-bound workspace catalog and checks the
    exact `(captureId, evidenceSha256)` pair. If that pair is absent, the Host replays the catalog's
    original `selection` into a temporary process-owned export and requires the
@@ -148,6 +176,126 @@ If no executable round trip exists, ReplayLab publishes non-empty
 `explanatory-ir` or `binary-only` evidence and stops before watch/apply. This is
 the extension point for another local provider; it is not a claim that every
 engine cache, vendor ISA or assembly language is already supported.
+
+## Visual debugging in Bread Shader Workspace
+
+With a capture open and a draw selected, open its compilable pixel/fragment
+source in Shader Workspace. The toolbar operates on the open working copy;
+the temporary Source import menu has been removed.
+The debug toolbar stays above the source and wraps on narrow panels. Place the caret on
+a value, a function call's name, or `return`, or select a complete value expression,
+and press **Ctrl+E** (or **Output to
+RT**). The expression and its source line are marked while the preview is
+active. **Ctrl+Shift+E** or **Restore** restores the state from
+before the session, including an existing draw override. **Hold to compare**
+temporarily restores that state and returns to the preview on release.
+
+The default destination is the first bound four-component color target, or
+the first bound color target if none has four components. The target selector
+can override that choice. **Custom**, the default display mode, automatically
+converts scalar and vector values to the target's numeric type and width:
+a scalar is `(x, x, x, 1)` on a four-channel
+target, a two-component value is `(x, y, 0, 1)`, and a three-component value is
+`(x, y, z, 1)`; a four-component value is unchanged. A narrower target receives the corresponding leading
+components. Integer targets retain integer output types. The target format
+still controls quantization, clamping and sRGB conversion.
+
+Clicking a function name observes that call's result; clicking `return` observes
+its returned expression. Reads inside helper functions, call arguments, nested
+arithmetic and conditional expressions can be selected independently. Probes
+stay at the selected expression, so they do not move a call outside its branch
+or evaluate the selected call again. The occurrence control also applies to a
+helper called more than once by the same fragment.
+
+Structs and nested structs, including structure-valued function results, open
+a member picker even when only one displayable member is available. Matrix rows (HLSL) or columns
+(GLSL) and fixed-size array elements are selectable. Large or unsized arrays
+require selecting an indexed element in source. Numeric scalar/vector types,
+including Boolean and integer values, are supported; an opaque texture,
+sampler or resource handle must first be sampled/read into a numeric value.
+Statements without a value (such as a bare `return;`), resource handles and
+expressions whose type cannot be determined have specific diagnostics. An
+`out`/`inout` argument must retain writable storage; select its value after the
+call instead. The compiler and parser reject unsupported syntax or interface
+layouts with a diagnostic, without applying a partially validated candidate.
+
+The optional **Independent RGBA32F preview** uses a private floating-point
+texture at the selected output slot, retaining negative and HDR values. Its
+output location remains the same; color and depth/stencil attachments are
+cloned so this draw cannot overwrite the captured attachments through those
+bindings. The captured attachments remain at their state immediately before
+the draw until comparison or stop replays the original draw. The private
+texture is shown directly in Texture Viewer and is not added to the capture's
+resource list. FP32 conversion has normal 32-bit floating-point precision;
+large integer and double values are not represented losslessly. Unsupported
+attachment topologies or unavailable FP32/MSAA
+capabilities fail explicitly. Original-RT mode remains available.
+
+Additional controls select all components or R/G/B/A individually. A selected
+component displays as `(v, v, v, 1)` before any optional range/normal mapping;
+unavailable components are disabled. Grayscale uses Rec.709 RGB luminance for
+vectors and directly displays a scalar. Other modes provide
+normal-vector mapping from `[-1, 1]`, a custom display range, execution
+coverage, and the occurrence to observe in a loop or repeated function call.
+Fragments that never reach the selected occurrence are marked. Texture
+Viewer restores its prior follow/tab/subresource state on exit unless the
+user has manually navigated elsewhere.
+
+This is an **observation preview**, not a GPU execution breakpoint. The
+selected read is observed at that expression; an assignment target is
+observed after its assignment, with side-effecting accesses evaluated only
+once. Later calculations and resource writes may still run to preserve
+derivatives. A later `discard`/`clip` is suppressed after observation; a kill
+before observation is honored. The panel displays this distinction. Debugging
+is limited to the selected draw's pixel/fragment stage; it does not create a
+global shader replacement or modify the saved source/workspace revision.
+
+First use preprocesses/instruments and compiles a temporary source snapshot,
+then validates the emitted interface and installs the draw override. Repeated
+previews reuse bounded source plans, compiled shaders, pipelines and scratch
+textures. Cache keys include source/include bytes, compiler/library identity,
+compile flags, capture/shader identity, output format and display options.
+Cache hits avoid recompilation and repeated ABI validation; capture, source,
+ownership and remote-health checks still run. A cold new expression or new
+display option can compile, and replay time remains capture-dependent.
+Receipts report cache hits and high-resolution compile/replay timings.
+
+**Debug snapshot** or **Ctrl+Shift+B** saves the selected expression, structure
+member and display settings. **Debug snapshots** toggles a persistent left
+sidebar alongside Shader files and Rendering stages. Entries show an ordinal,
+current line and expression; they support Unicode names, drag ordering and
+deletion. Clicking an entry resolves its function/token anchor against the
+current editor buffer, navigates there, and creates a fresh preview. It never
+stores rendered pixels or compiled shaders in the snapshot. Inserting lines
+or changing earlier calculations preserves a uniquely identified location;
+deleted/duplicated/ambiguous locations are marked unresolved and never guessed.
+An explicitly selected RT or member that disappears is reported instead of
+silently changing the requested output. Recipes are stored atomically in local
+application data, keyed by workspace/source/stage/original Shader identity,
+with cross-process locking. Temporary imported documents have temporary
+identities; persistent workspaces retain snapshots across application restarts.
+
+Work is asynchronous, and an older compile cannot overwrite a newer request
+or resurrect a cancelled session. Switching EID retains the debug intent:
+the old Draw's override is restored before inspecting the new event. A Draw
+using the same Shader and compatible output receives a fresh preview with the
+compiled cache reused where possible. Other Shaders, non-Draw events or absent
+outputs pause it; returning to a compatible Draw resumes it. Only the current
+Draw owns the preview override. Restore clears this follow intent. Source edits,
+capture changes and panel closure restore an owned session. A lost remote connection is reported
+as unconfirmed recovery, rather than successful restoration. Reconnect or
+reopen the capture to recover when the replay peer itself is unavailable.
+
+The native paths cover D3D11, D3D12, OpenGL, OpenGL ES and Vulkan. Linux uses
+the same GL/Vulkan replay and Qt editor paths. Android uses host-side
+preprocessing/compilation and the remote replay protocol; it needs no compiler
+or Python UI on the device. The remote peer must have the matching override
+capability. Packaging verifies pinned compiler binaries and dependencies;
+Linux packages enable `BREAD_BUNDLE_SHADER_COMPILERS` to include both DXC and
+glslang. Windows GPU and remote-loopback checks, Linux native build/editor and
+compiler tests are recorded under
+`output/shader-visual-debug-acceptance-20261028/`. Linux GPU and Android device
+validation require hardware and have not been performed in this environment.
 
 ## Trust boundary
 
@@ -365,7 +513,8 @@ remain authoritative.
 
 `prepare_shader_workspace` asks the bridge to export exactly one event and
 stage. It then requires exactly one matching `uses` record, verifies its shader
-key and physical blob, creates the workspace, and performs the first decompile.
+key and physical blob, and creates the workspace. The default call does not
+run a decompiler, RenderDoc reverse disassembly, or provisional reconstruction.
 
 ```text
 prepare_shader_workspace(
@@ -375,28 +524,22 @@ prepare_shader_workspace(
 )
 ```
 
-Leaving both tool IDs and `editable_format` empty is the recommended path: the
-server first prefers HLSL/GLSL, then selects a unique, direct, hash-verified
-DXIL/DXBC native-IR round trip—or a validator-gated Vulkan/OpenGL SPIR-V
-assembly round trip—when the preferred high-level lane has no complete route.
-The recovery diagnostics retain both the preferred failure and the selected
-fallback. Cross-format choice remains a static planning decision: runtime
-failure never silently changes the requested editable format. Instead,
-`prepare_shader_workspace` automatically executes the finite hash-bound
-same-format alternate route pairs in isolated sibling workspaces. When that
-frontier is exhausted and a compiler is available, it publishes a review-only
-provisional source path bound to the native representation so the Agent can
-construct source and continue through promotion, compilation and replay ABI
-validation. SPIR-V assembly becomes an automatic native-IR fallback only when
-its direct disassembler, direct assembler and exactly one fixed `spirv-val`
+Leaving both tool IDs and `editable_format` empty lets static planning select
+HLSL/GLSL or an available native-IR lane; the selected plan and other registered
+capabilities are returned as facts. Runtime failure never silently changes the
+requested editable format. The Agent explicitly chooses a bound decompile,
+an alternate registered pair, or RenderDoc evidence. The optional
+`attempt_reconstruction=true` argument runs one selected decompile and publishes
+the native representation and provisional scaffold on failure. SPIR-V assembly
+is a native-IR option only when its direct disassembler, direct assembler and
+exactly one fixed `spirv-val`
 capability are integrity-valid. Selection alone is not publication: the
 workspace must run the bound validator on the captured baseline and the
 untouched disassemble/assemble output before writing the editable source, then
 validate the baseline and output again for every edited candidate compile. Any
 missing, ambiguous, changed or failing validator leaves the source/revision
-unpublished. An older integration may still pass both
-`decompiler_tool_id` and `compiler_tool_id` to request its registered direct
-single-hop workflow.
+unpublished. `create_shader_workspace` also accepts a pair of registered legacy
+tool IDs for a catalog already exported by another operation.
 
 An explicit `editable_format="hlsl"` keeps the HLSL recovery/AI-construction
 lane and never silently changes language. Explicit `dxbc-asm` or `dxil-asm`
@@ -470,13 +613,10 @@ analysis. The query accepts no filesystem or database path, opens only
 `shared/dictionaries/assets/symbols-v3.sqlite3` in SQLite read-only/query-only
 mode, verifies the current active-project/full-catalog binding and freezes the
 capture/session/EID/stage/resource/entry/raw-hash/catalog identity. Missing
-configuration, catalog or database returns `ready=false` plus
-`requiredAction=prepare_active_capture_project`; it is a recoverable state, not
-permission to fabricate a match or an instruction to mutate the project. For
-read-only analysis, record `reasonCode` as the skipped reason and continue with
-capture evidence. Call `prepare_active_capture_project` only when both project
-and UI effects are already authorized and asset correlation is required by an
-acceptance criterion. The response separates `observed` relations
+configuration, catalog or database returns `ready=false` with a factual
+`reasonCode`. The Agent can continue from capture evidence or prepare the active
+project when asset correlation is useful and the required project/UI effects are
+available. The response separates `observed` relations
 from `inferred` hints and persists no new relation by itself.
 `candidateCount=0` proves only that the bounded query found no match in the
 frozen catalog/database snapshot; it neither proves nor disproves a concrete
@@ -562,10 +702,10 @@ D3D12/native DXBC or DXIL, Vulkan/native SPIR-V, or OpenGL/native OpenGL SPIR-V;
 other combinations are `unsupported`, and unresolved status is `not-evaluated`.
 Fresh replay ABI, live-event, stage, and backend gates still run during apply.
 
-### Transactional AI source organisation
+### AI source drafts and final publication
 
-For an `executable-editable` HLSL workspace, the readable-source transaction is
-explicitly split into two calls:
+An `executable-editable` Shader Workspace can open a draft from its current
+source:
 
 ```text
 begin_shader_workspace_organization(
@@ -575,45 +715,69 @@ begin_shader_workspace_organization(
 ```
 
 `begin` takes the shared source-transaction lease, preserves the byte-for-byte
-decompiler output and snapshots the current editable source. It reuses valid
-Host compile/ABI evidence bound to these exact bytes; otherwise it compiles
-with the fixed route and validates the current candidate. When an EventId is
-provided, the immutable semantic context also contains the capture/session,
-bound textures and pipeline evidence; it includes the current
-`reconstructionFidelity` record. The call returns fixed paths under one
-organisation session:
+decompiler output when available, and snapshots the current editable source.
+It does not compile or run replay ABI validation. When an EventId is provided,
+the semantic context verifies that the selected EID uses this exact captured
+Shader and records the current capture/session identity and
+`reconstructionFidelity`. Bound textures and pipeline state are optional hints:
+the default does not fetch them, so the AI can request those tools only when
+useful. Set `include_live_binding_evidence=true` to fetch both during `begin`;
+each result reports `available`, `unavailable`, or `notFetched` in
+`liveBindingEvidence.evidenceStatus`. A failed or malformed hint does not block
+draft creation; a changed capture/session or mismatched Shader identity does.
+The call returns
+paths under one draft session:
 
 ```text
-organized-proposal.hlsl   # the only HLSL file AI may change
-analysis.md               # inferred algorithm/resource meaning, labelled as such
-flowchart.mmd              # bounded Mermaid without click/URL/HTML/init directives
-module-descriptions.json  # bounded AI descriptions keyed only by discovered function name
-semantic-context.json     # fixed evidence, not an AI-editable authority
+organized-proposal.hlsl   # editable draft; this SHA is checked at finalization
+analysis.md               # optional free-form explanation
+flowchart.mmd              # optional diagram artifact
+module-descriptions.json  # optional function descriptions
+semantic-context.json     # captured evidence, not publication authority
 ```
 
-AI may introduce readable local names, comments, sections and helper
-boundaries in the proposal, but it must preserve the physical interface and
-algorithm. When stripped reflection leaves numeric CBuffer slots or byte-offset
-variables, the physical declarations remain unchanged; the algorithm layer
-uses role-derived semantic aliases or typed accessors instead. Weakly supported
-roles are labelled provisional. These aliases never change register/space,
-packoffset, offset, size, scalar type, shape, stride, matrix orientation,
-resource kind, array length or the observed access tuple. `#include`, `#line`
-and other source-expanding/diagnostic-remapping
-directives are rejected in this transaction. The live workspace source is not
-published from the proposal until:
+The Agent may use source-bound rename, bounded rewrite, extraction and ordinary
+draft editing as needed. Mechanical edits do static and compare-and-swap checks
+without compiling the entire Shader after every step. `#include`, `#line` and
+other source-expanding or diagnostic-remapping directives are rejected in this
+transaction. The capture's physical resource and CBuffer layout remains the
+authority for final replay ABI validation. When the current draft is ready:
 
 ```text
-review_shader_workspace_organization(
+finish_shader_workspace_organization(
   workspace_path="D:/ShaderLabs/frame-481-ps",
-  organization_id="<begin result>"
+  organization_id="<begin result>",
+  apply_shared_resource=false,
+  generate_flow_graph=false
 )
 ```
 
-`review` obtains the same lease used by watchers, rereads all bindings and
-reuses the current validated baseline when still fresh. It performs a source
-compare-and-swap and compiles/ABI-validates the proposal when needed. Promotion
-uses the cheapest sufficient check:
+The default `finish` obtains the same source lease used by watchers, rereads
+the exact source and proposal hashes, and uses compare-and-swap to make the
+proposal the current editable Shader Workspace source. It records an
+`editable-draft` receipt, without compiling, validating ABI or replacing replay
+code. The optional `generate_flow_graph=true` builds navigation metadata from
+those saved source calls and comments; failure to make a graph does not undo
+the saved source. A later compile/ABI/apply uses the current source and fresh
+candidate identity.
+
+The Shader Workspace can show this current HLSL draft read-only before any
+live-edit session exists. For a managed active project it discovers only
+capture-matching workspaces below that project's fixed `workspaces/shaders`
+directory; this view does not create a live-edit authorization. After a
+current-source candidate passes replay ABI validation and an authorized live
+edit is running, the editor can use its normal save/watch path.
+
+The Agent may call `compile_shader_workspace`,
+`validate_shader_workspace_candidate`, and
+`apply_shader_workspace_shared_resource` directly when replay replacement is
+requested. That route enforces the physical current-source and ABI checks
+without requiring the optional organization equivalence receipt.
+
+For an explicitly requested strict validation, `validate_for_apply=true`
+compiles and ABI-validates the baseline and exact proposal, then checks final
+equivalence before issuing its publication receipt. This optional check uses
+the cheapest sufficient evidence:
 
 - `exact-code`: candidate executable code bytes match the reconstructed baseline.
 - `rename-only`: the fixed token checker proves only declared names, comments
@@ -624,12 +788,29 @@ uses the cheapest sufficient check:
   and exact integer comparison, then restores replay state. This is bounded
   output evidence, never proof for all inputs.
 
-Substantial proposals should be reviewed in a few complete-function or meaningful
-computation-stage batches; small edits are combined, not reviewed every few
-lines. There is no model-authored test-vector loop. Unsupported sampling is not
-a pass. Current numerical support is deliberately bounded; read the returned
-scope, counts, tolerances and unsupported diagnostics rather than extrapolating
-to unmeasured outputs or other stages.
+The Agent chooses draft size and decomposition. The Host does not impose review
+rounds or compile each segment. Unsupported sampling is not a pass. Current
+numerical support is bounded; read the returned scope, counts, tolerances and
+unsupported diagnostics rather than extrapolating to other outputs or stages.
+
+Vertex observations include post-VS channels for every admitted instance/view,
+with reflected scalar types and API alignment, plus raster outputs. Hull,
+domain, geometry, task and mesh changes use raster/downstream-storage output
+observations. Compute observes its bound storage buffers/images and counters,
+never stale graphics attachments. Non-fragment full-replay observations require
+a repeatable A/B/A baseline; the fragment paired-draw optimization remains
+fragment-specific. All routes retain bounded coverage and rollback. Native ray
+pipeline/library replacement still requires complete pipeline/state-object/SBT
+support and is not authorized by an offline compile or source review.
+
+For a Unity port these are preferred upstream checks, reusing existing validated
+source or preparing it in Bread first. Permanent replay replacement is not
+required. Concrete application/tool limitations permit transferring an exact
+retained proposal with partial evidence and missing/failed checks, then continuing
+organization/compilation/debugging in Unity. The read tool prefers current proof
+and preserves reference-only status when proof is incomplete. Source-integrity,
+target compilation, bindings, execution and visual checks still apply. Proof for
+captured HLSL does not certify changed Unity engine interfaces or scene inputs.
 
 The comparator reads complete bound color/depth output data in one replay
 callback, using the RTV/DSV view format when the underlying texture is typeless.
@@ -656,69 +837,57 @@ mapping. A restoration failure remains an RPC error; it cannot report
 the captured original ResourceId, observation runs the original pipeline
 directly instead of trying to replace a Shader with itself.
 
-Publication checks the process-sealed decision, source bindings, declared
-rename proof or complete Host observation. Editable JSON alone grants no
-authority. Neither source nor executable hash equality is a universal gate;
-hashes still identify which exact files and candidates each check covered. The final
+Strict publication checks the external Host receipt, source bindings, declared rename
+proof or complete captured-output observation. Editable JSON alone grants no
+authority. Neither source nor executable hash equality proves universal Shader
+equivalence; hashes identify the exact files and candidates checked. The final
 gate binds workspace/capture/stage/entry, source SHA-256, revision, candidate
 raw/code SHA-256 and fresh ABI request/report hashes. The completed session and
 supporting evidence are committed before `ai/organize-code-gate.json` can say
 `safeToStartLiveEdit=true`.
 
-The same review also publishes `ai/flow-graph.json` using schema
-`replaylab-shader-flow-graph/v1`. Function locations and caller-to-callee edges
-are parsed deterministically from the final source that actually remains in the
-workspace; AI can only fill the bounded descriptions for function names already
-present in the begin template. The graph is bound to workspace ID, source
-SHA-256, revision, stage and entry point, and is navigation-only: it is not
-physical evidence and grants no compile, ABI or Apply authority. The Shader
-Workspace displays this graph beside the editor, retains per-Shader node
-positions, and marks it out of date after later source edits instead of treating
-old relationships as current.
+The graph remains independent navigation metadata. It is bound to workspace
+ID, source SHA-256, stage and entry point; an uncompiled editable draft has no
+compiler revision. The Shader Workspace marks the graph stale after later
+source edits. It never authorizes compile, ABI or Apply.
 
-For a project-publication or full-lifecycle route, the explicit generic compile
-and replay-ABI preflight runs before `begin`/`review`. The review above is the
-final source/candidate transaction: after it accepts, the route may apply that
-exact candidate and may call `register_active_project_workspace`, but it must
-not call `compile_shader_workspace` in between. Registration reparses the
-organization gate and requires its `finalRevision` to equal the manifest's
-current `latest` revision; any intervening editor change or compile therefore
-blocks publication. Apply and registration also revalidate the sealed hashes
-and ABI evidence independently.
+The strict source/candidate transaction may optionally apply the exact validated
+candidate and may register the workspace with the active project. Registration
+requires the gate's `finalRevision` to equal the manifest's current `latest`
+revision; an intervening editor change or compile therefore blocks publication.
+Apply and registration revalidate sealed hashes and ABI evidence independently.
 
-When no review path passes, the proposal remains `organized-provisional.hlsl`
-and the source is restored to the compiled, ABI-validated baseline. An ordinary
-rejection leaves the same session open for correction and review. At the bounded
-round limit, `softAccepted` / `soft-accepted-baseline` publishes that usable
-baseline with explanatory documents; its sealed final binding identifies the
-baseline, not the rejected proposal. It can be registered and edited. Opening a
-new session to evade the exhausted budget is not permitted.
+When optional strict validation fails, the draft remains available and the baseline
+source is restored without overwriting newer editor bytes. The Agent may repair
+the same draft and retry. Missing or unfinished analysis and diagram documents
+do not block source finalization. The Host does not enforce readability quotas,
+review rounds or partial-stage publication.
 
 A compiler/ABI/concurrency failure restores the baseline only when it can do
 so without overwriting newer editor bytes. Temporary numerical comparison
 requires the `workspace + replay` effects and must restore replay state; it
 does not authorize permanent replacement. Registration opens the editor and
-requires `project + ui`. Every review path leaves
+requires `project + ui`. Final validation leaves
 `semanticEquivalenceVerified=false`: none proves that all possible inputs
 match the captured executable or recovers the original source.
 
-`rename_shader_workspace_symbols` also uses the existing external CBuffer alias
-store for inferred block/member names. The captured block's original top-level
-names/offsets determine its layout key; a generated HLSL layout key can point
-to an entirely different file. The new Host identity path retains raw reflection,
-matches blocks by bind/space and maps only unique equal-width leaf regions.
-Unknown/overlapping fields remain unmapped; a confirmed block alias can still
-be stored. User aliases take priority. Actual display on the captured CBuffer
-must be verified separately from a successful file write. Display aliases do
-not change original reflection or resource bindings.
+`rename_shader_workspace_symbols` changes source tokens only. It may read an
+existing user panel name as optional naming evidence, but it never writes the
+external CBuffer alias store and no alias/session receipt can satisfy source
+finalization. Panel display names are a separate explicit `publish_cbuffer_aliases`
+operation. Semantic rows or block names on that route require a same-platform
+`compiledLayoutReceipt`; unknown/overlapping fields remain unmapped and user
+aliases keep priority. A failed or unavailable panel publication does not
+invalidate a valid source rename or block source organization. Display aliases
+do not change original reflection or resource bindings.
 
 Ordinary user editing is a separate operation: new source and compiled code
 hashes are expected. A save compares the editor's last observed hash with the
 current disk bytes to avoid overwriting a newer edit, then compiles the new
 source into a new revision. Apply requires that revision's current source,
 candidate, capture identity and fresh ABI evidence; it does not require the
-edited executable to equal the untouched reconstruction. An old organization
-review or ABI receipt cannot authorize different edited bytes.
+edited executable to equal the untouched reconstruction. An old source
+validation or ABI receipt cannot authorize different edited bytes.
 
 After a successful user edit is actually applied, explicit replacement
 registration has its own current-source/candidate/ABI readback path for project
@@ -726,8 +895,8 @@ synchronization. It does not require the old
 AI organization verdict or treat the user's new computation as a rejected
 readability change. It excludes stale analysis and flow-chart artifacts.
 Ordinary temporary saves do not automatically overwrite the project's shared
-head. The first organized HLSL and its explanatory artifacts are saved by the
-reviewed-workspace registration path.
+head. The validated HLSL and any optional explanatory artifacts are saved by
+the workspace registration path.
 Matching shaders in another RDC may reuse project HLSL; each target capture
 still needs a new exact binding and compatible current candidate before apply.
 
@@ -942,13 +1111,14 @@ mapping and frees only the generated target. The captured original Shader is
 retained throughout. Event/family overrides described next are a separate,
 D3D11-only isolation tool, not the default shared edit scope.
 
-Shared-resource apply has replay effect only and never writes project state.
-When project persistence is explicitly authorized, a full-lifecycle route next
-calls `register_active_project_shader_replacement` with the exact successful
-revision, candidate SHA-256, and `replacementId`. That separate project-effect
-receipt commits reviewed workspace knowledge and the restart/restore binding;
-an inactive/read-only project fails that step without changing the already
-reported replay apply result.
+The low-level shared-resource apply has replay effect only. Final organization
+finish coordinates that apply with project persistence when requested, using
+the exact successful revision, candidate SHA-256 and `replacementId`. It returns
+the project-effect receipt together with the apply result. The separate
+`register_active_project_shader_replacement` endpoint remains available for
+metadata-only recovery and explicit low-level workflows. An inactive/read-only
+project fails publication without changing the already reported replay apply
+result. Registration does not compile or revalidate an unchanged candidate.
 
 ## Event-scoped D3D11 apply and rollback
 

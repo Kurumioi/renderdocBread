@@ -77,6 +77,7 @@ def _function_source(function_name: str) -> str:
 
 def _standalone_class_method(class_name: str, method_name: str, **globals_):
     namespace = dict(globals_)
+    namespace.setdefault("_replay_recovery_path", "")
     exec(textwrap.dedent(_class_method_source(class_name, method_name)), namespace)
     return namespace[method_name]
 
@@ -169,13 +170,16 @@ def test_user_activity_generation_cancels_active_background_work() -> None:
     poller = types.SimpleNamespace(
         _active_guard=threading.RLock(),
         _user_activity_generation=7,
-        _active_item={"cancelEvent": cancel_event},
+        _active_item={"cancelEvent": cancel_event, "selectionPreemptedEvent": threading.Event(),
+                      "captureInvalidatedEvent": threading.Event()},
     )
 
     cancel(poller)
 
     assert poller._user_activity_generation == 8
     assert cancel_event.is_set()
+    assert poller._active_item["selectionPreemptedEvent"].is_set()
+    assert not poller._active_item["captureInvalidatedEvent"].is_set()
 
 
 def test_background_replay_uses_tagged_blocking_lane_off_the_gui_thread() -> None:
@@ -671,6 +675,28 @@ def test_background_replay_restores_temporary_eid_inside_the_same_callback() -> 
     assert tracker["eventDirty"] is False
 
 
+def test_native_fatal_controller_cannot_report_successful_event_selection() -> None:
+    bridge = _load_bridge()
+    bridge.rd.ResultCode = types.SimpleNamespace(Succeeded=0)
+    bridge._background_replay_checkpoint = lambda: None
+    for already_failed in (True, False):
+        calls = []
+        class Controller:
+            def GetFatalErrorStatus(self):
+                return types.SimpleNamespace(code=1 if already_failed or calls else 0)
+            def SetFrameEvent(self, event, force):
+                calls.append(event)
+        tracker = {"visibleEventId": 41, "lastSetSucceeded": False}
+        bridge._request_event_state.current = tracker
+        try:
+            with pytest.raises(RuntimeError, match="bread-replay-unavailable"):
+                bridge._set_frame_event(Controller(), 99)
+            assert tracker["lastSetSucceeded"] is False
+            assert calls == ([] if already_failed else [99])
+        finally:
+            del bridge._request_event_state.current
+
+
 def test_current_context_freeze_barrier_owns_fixed_eid_and_restores_it() -> None:
     bridge = _load_bridge()
     set_events = []
@@ -704,7 +730,7 @@ def test_current_context_freeze_barrier_owns_fixed_eid_and_restores_it() -> None
     bridge._current_context_freeze_jobs = {"current": current}
     bridge._run_current_context_freeze_job("current", object())
     assert current["status"] == "completed"
-    assert set_events == [(77, True), (41, True)]
+    assert set_events == [(77, False), (41, True)]
 
     # Capture identity remains the hard stale boundary. A job from another
     # capture must fail before touching replay even though generation is no
@@ -738,6 +764,8 @@ def test_ipc_current_context_reuses_native_fixed_eid_barrier() -> None:
         "context": expected_context,
     }
     bridge._invoke_on_ui_sync = lambda callback: callback()
+    # This fixture tests fixed-EID ordering; cancellation has dedicated tests.
+    bridge._request_dispatch_cancelled = lambda dispatch: False
     bridge._build_current_renderdoc_context = lambda: (_ for _ in ()).throw(
         AssertionError("IPC context must use the native fixed-EID barrier"))
     bridge._current_bound_shader_context = lambda *unused: (_ for _ in ()).throw(
@@ -780,6 +808,7 @@ def test_cancelled_pending_ui_callback_cannot_run_after_worker_returns() -> None
 
     invoke_handler = _standalone_class_method(
         "JsonPoller", "_invoke_handler_on_ui", threading=threading,
+        _request_preemption_message=lambda dispatch, fallback, **kwargs: fallback,
         _ctx=types.SimpleNamespace(Extensions=lambda: Extensions()))
 
     poller = types.SimpleNamespace(
@@ -1181,3 +1210,25 @@ def test_connection_dialog_probes_and_subscription_cancel_remain_bounded() -> No
     kill = cancellation.index("process->kill()")
     complete = cancellation.index("completeOperation(-1, QProcess::CrashExit, detail)")
     assert close_job < kill < complete
+
+def test_fatal_replay_keeps_context_available_for_recovery_without_gpu_work():
+    bridge = _load_bridge()
+    bridge.rd.ResultCode = types.SimpleNamespace(Succeeded=0)
+    bridge._capture_session_id = "session-a"
+    bridge._active_capture_token = "capture-a"
+    bridge._write_current_context_freeze_terminal = lambda job: None
+    bridge._finish_current_renderdoc_context = lambda facts: dict(facts)
+    job = {"status": "queued", "facts": {"warnings": []}, "compatibleStages": (),
+           "aliases": {}, "captureSessionId": "session-a", "captureToken": "capture-a",
+           "currentEventId": 77, "restoreEventId": 41}
+    class Controller:
+        def GetFatalErrorStatus(self):
+            return types.SimpleNamespace(code=1)
+        def SetFrameEvent(self, *args):
+            raise AssertionError("A fatal controller cannot perform GPU work")
+    bridge._current_context_freeze_jobs = {"fatal": job}
+    bridge._run_current_context_freeze_job("fatal", Controller())
+    assert job["status"] == "completed"
+    assert job["context"]["boundShaders"] == []
+    assert "bread-replay-unavailable" in job["context"]["warnings"][0]
+

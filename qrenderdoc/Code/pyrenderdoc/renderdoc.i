@@ -276,6 +276,77 @@ TEMPLATE_FIXEDARRAY_DECLARE(rdcfixedarray);
 // Actually include header files here. Note that swig is configured not to recurse, so we
 // need to list all headers in include order that we want to process
 
+// A replay callback enters Python with the GIL held. BlockInvoke only releases it while
+// waiting for that callback. Shader inspection/build, GPU readback/debug and replacement can hold
+// it for seconds, preventing Qt's Python timers from entering and freezing the GUI thread.
+// In particular, checked replacement/removal call SetFrameEvent internally in native C++:
+// an exception feature on the Python SetFrameEvent entry point cannot cover those replays.
+// Release only around these native actions. Argument/result conversion and SWIG ownership
+// run with the GIL. These methods keep their existing replay-thread contract; the thread check
+// is not a lock and this does not permit concurrent mutation of their borrowed input objects.
+%define REPLAY_NATIVE_GIL_RELEASE(Method)
+%exception IReplayController::Method {
+  struct ScopedReplayGILRelease
+  {
+    ScopedReplayGILRelease() : state(PyEval_SaveThread()) {}
+    ~ScopedReplayGILRelease() noexcept { PyEval_RestoreThread(state); }
+    PyThreadState *state;
+  };
+  {
+    // Restore on both normal return and native C++ stack unwinding.
+    ScopedReplayGILRelease release;
+    $action
+  }
+}
+%enddef
+
+REPLAY_NATIVE_GIL_RELEASE(SetFrameEvent)
+REPLAY_NATIVE_GIL_RELEASE(ReplayFrameEventForAnalysis)
+REPLAY_NATIVE_GIL_RELEASE(RestoreFrameEventAfterAnalysis)
+REPLAY_NATIVE_GIL_RELEASE(ComparePixelShaderPair)
+REPLAY_NATIVE_GIL_RELEASE(GetShaderEntryPoints)
+REPLAY_NATIVE_GIL_RELEASE(GetShader)
+REPLAY_NATIVE_GIL_RELEASE(DisassembleShader)
+REPLAY_NATIVE_GIL_RELEASE(BuildTargetShader)
+REPLAY_NATIVE_GIL_RELEASE(GetTextureData)
+REPLAY_NATIVE_GIL_RELEASE(GetBufferData)
+REPLAY_NATIVE_GIL_RELEASE(SaveTexture)
+REPLAY_NATIVE_GIL_RELEASE(GetCBufferVariableContents)
+REPLAY_NATIVE_GIL_RELEASE(GetPostVSData)
+REPLAY_NATIVE_GIL_RELEASE(PixelHistory)
+REPLAY_NATIVE_GIL_RELEASE(GetMinMax)
+REPLAY_NATIVE_GIL_RELEASE(FetchCounters)
+REPLAY_NATIVE_GIL_RELEASE(DebugVertex)
+REPLAY_NATIVE_GIL_RELEASE(DebugPixel)
+REPLAY_NATIVE_GIL_RELEASE(ContinueDebug)
+REPLAY_NATIVE_GIL_RELEASE(FreeTrace)
+REPLAY_NATIVE_GIL_RELEASE(ReplaceResource)
+REPLAY_NATIVE_GIL_RELEASE(ReplaceTargetShaderChecked)
+REPLAY_NATIVE_GIL_RELEASE(GetTargetShaderReplacement)
+REPLAY_NATIVE_GIL_RELEASE(RemoveReplacement)
+REPLAY_NATIVE_GIL_RELEASE(RemoveTargetShaderReplacementChecked)
+// Event overrides and persistent buffer edits also replay internally, including rollback.
+REPLAY_NATIVE_GIL_RELEASE(SetEventShaderOverride)
+REPLAY_NATIVE_GIL_RELEASE(ClearEventShaderOverride)
+REPLAY_NATIVE_GIL_RELEASE(ClearEventShaderOverrides)
+REPLAY_NATIVE_GIL_RELEASE(SetEventCBufferOverride)
+REPLAY_NATIVE_GIL_RELEASE(ClearEventCBufferOverride)
+REPLAY_NATIVE_GIL_RELEASE(ClearEventCBufferOverrides)
+REPLAY_NATIVE_GIL_RELEASE(SetSharedBufferPatch)
+REPLAY_NATIVE_GIL_RELEASE(ClearSharedBufferPatch)
+REPLAY_NATIVE_GIL_RELEASE(ResetSharedBufferRange)
+REPLAY_NATIVE_GIL_RELEASE(ClearSharedBufferPatches)
+REPLAY_NATIVE_GIL_RELEASE(ClearReplayCache)
+REPLAY_NATIVE_GIL_RELEASE(FreeTargetResource)
+
+// This bounded result may still own 192 MiB of readback bytes. Transfer its buffers to the
+// Python-owned result instead of making another full copy after reacquiring the GIL.
+%typemap(out) ShaderPairComparison {
+  $result = SWIG_NewPointerObj(
+      new ShaderPairComparison(static_cast<ShaderPairComparison &&>($1)),
+      $descriptor(ShaderPairComparison *), SWIG_POINTER_OWN);
+}
+
 %include <stdint.i>
 
 %include "apidefs.h"
@@ -428,6 +499,7 @@ TEMPLATE_ARRAY_INSTANTIATE(rdcarray, DebugVariableReference)
 TEMPLATE_ARRAY_INSTANTIATE(rdcarray, SourceVariableMapping)
 TEMPLATE_ARRAY_INSTANTIATE(rdcarray, SigParameter)
 TEMPLATE_ARRAY_INSTANTIATE(rdcarray, TextureDescription)
+TEMPLATE_ARRAY_INSTANTIATE(rdcarray, ShaderPairSnapshot)
 TEMPLATE_ARRAY_INSTANTIATE(rdcarray, ShaderEntryPoint)
 TEMPLATE_ARRAY_INSTANTIATE(rdcarray, Viewport)
 TEMPLATE_ARRAY_INSTANTIATE(rdcarray, Scissor)

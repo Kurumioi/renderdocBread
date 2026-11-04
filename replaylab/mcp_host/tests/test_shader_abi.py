@@ -247,6 +247,13 @@ class ShaderFamilyCatalogTests(unittest.TestCase):
                 list_exact_shader_family_uses(path, duplicate_code.catalog_key),
                 [13],
             )
+            catalog["shaders"][0]["interfaceComplete"] = False
+            path.write_text(json.dumps(catalog), encoding="utf-8")
+            with self.assertRaisesRegex(CatalogValidationError, "no complete compiled ABI"):
+                list_exact_shader_family_uses(path, first.catalog_key)
+            self.assertEqual(list_exact_shader_family_uses(
+                path, first.catalog_key, require_complete_abi=False), [11, 12])
+            catalog["shaders"][0]["interfaceComplete"] = True
             catalog["uses"].append(use(11, duplicate_code))
             path.write_text(json.dumps(catalog), encoding="utf-8")
             with self.assertRaisesRegex(
@@ -254,6 +261,8 @@ class ShaderFamilyCatalogTests(unittest.TestCase):
                 "does not preserve the selected Shader family",
             ):
                 list_exact_shader_family_uses(path, first.catalog_key)
+            with self.assertRaisesRegex(CatalogValidationError, "does not preserve"):
+                list_exact_shader_family_uses(path, first.catalog_key, require_complete_abi=False)
 
 
 class ShaderAbiModelTests(unittest.TestCase):
@@ -1143,8 +1152,16 @@ class ShaderWorkspaceAbiGateTests(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["lastAbiAttempt"]["reportSha256"] = hashlib.sha256(report_path.read_bytes()).hexdigest()
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        # The tampered record is diagnostic evidence only: status still answers
+        # (source, candidate and gate do not depend on it), but the record is
+        # reported as unreadable rather than as the verdict it claims.
+        status = service.status(workspace)
+        self.assertEqual(status["lastAbiAttempt"]["status"], "unavailable")
+        self.assertIn("recorded comparison", status["lastAbiAttempt"]["error"])
+        self.assertFalse(status["latestCompiled"]["abiCompatible"])
         with self.assertRaisesRegex(ManifestValidationError, "recorded comparison"):
-            service.status(workspace)
+            service._current_rejected_abi_attempt(
+                Path(workspace), json.loads(manifest_path.read_text(encoding="utf-8")))
 
     def test_workspace_report_tampering_is_rejected(self) -> None:
         service, workspace, unused_created, compiled, interface = (

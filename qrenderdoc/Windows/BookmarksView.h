@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <QCoreApplication>
 #include <QFrame>
 #include <QList>
 #include "Code/Interface/QRDInterface.h"

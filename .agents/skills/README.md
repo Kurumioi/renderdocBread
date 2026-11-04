@@ -1,47 +1,36 @@
-# ReplayLab RenderDoc Skills
+# Bread AI Skills
 
-These filesystem Skills are the current bundled procedures and shared output
-standard. API mode uses the pinned GitHub `deepagents` framework with a main
-Agent and bounded domain children. ACP mode uses the vendor's own single Agent;
-Codex app-server is the other supported native transport.
+API and ACP modes expose the same domain Skills through their respective
+transports. For capture, Shader, export or asset work, load the matching
+`SKILL.md` to obtain its useful paths and acceptance criteria. General chat
+does not need a domain Skill. The user's request sets the outcome; the Agent
+chooses tools and checks. A Skill does not grant a tool effect. Source-bound
+review records preserve the Agent's assessment; the Host checks their identity
+and structure, not whether the source is semantically good.
 
-- `replaylab-core` is mandatory for API main Agents, API children and every
-  native Agent, including follow-up threads. It defines Host templates,
-  evidence labels, acceptance, bounded corrections and reports. It is marked
-  `replaylab-always: "true"` and is never a selectable domain. A missing or
-  invalid core stops execution; it cannot be silently quarantined and skipped.
-- `renderdoc-explain-event` covers EIDs, draw/dispatch, pipeline, passes and
-  frame-flow analysis.
-- `renderdoc-shader-workbench` covers reconstruction, readable HLSL, analysis,
-  numerical comparison, compile/ABI checks, replacement, external CBuffer
-  aliases, editable workspaces and project reuse.
-- `renderdoc-resource-export` covers capture-bound mesh, texture, sampler,
-  material, CBuffer and shader export into managed Unity/Blender packages.
-- `renderdoc-unpacked-asset-intelligence` covers authorized project asset
-  catalogs, Strong UEX Inventory reports, capture matching and cooked UE
-  SkeletalMesh/Blender delivery.
+- `replaylab-core`: shared capture-identity, tool-effect and reporting boundaries.
+- `renderdoc-explain-event`: EID, pass and frame analysis.
+- `renderdoc-shader-workbench`: captured Shader analysis, source work, names and replay replacement.
+- `renderdoc-resource-export`: capture-bound resource packages for Unity or Blender.
+- `renderdoc-unpacked-asset-intelligence`: project asset search, reports and selected UEX delivery.
 
-The runtime catalog selects domain procedures from their metadata. Core rules
-are injected in full independently of that selection. Invalid optional domain
-Skills are quarantined individually. Skills do not define Agent topology, MCP
-registration, tool allowlists or effect authority. The task-scoped Host tool
-inventory and user authorization remain authoritative.
+Each `SKILL.md` is a short entry point. Load it with `load_bread_skill`;
+`list_bread_capabilities` can locate Skills and tools when needed. Its
+`references/` pages are available on demand for an operation that needs their
+detail. They are not an automatic bundle or a required phase sequence. A
+missing Skill or reference is a relevant diagnostic, not a reason to prevent
+independent work or a general conversation.
 
-Models fill the typed templates returned by Host tools; Host renderers own
-diagram/document style and deterministic checks own acceptance. Domain Skills
-describe their procedure and tool-specific fields without duplicating the
-shared standard. The contract unifies output structure and evidence quality;
-it does not promise identical wording or semantic conclusions across models.
+Host tools provide capture observations, operation results and physical safety
+checks. The Agent chooses semantic interpretations and source edits. A saved
+draft, compiled candidate, validated candidate and applied replay replacement
+are different effects; describe them using their actual receipts. Compare
+requested deliverables with observed results, repair concrete gaps, and repeat
+only the checks affected by a change. Reuse completed work and inspect uncertain
+mutations before retrying.
 
-Corrections are bounded by Host verdicts. Blocking errors remain rejected when
-the budget is spent; minor issues can pass with explicit limitations. A useful
-partial result is valid when the evidence supports only part of the request.
-Keep completed effects and receipts, and inspect uncertain mutations before
-retrying. Ask the user only when an unresolved choice materially changes the
-target, scope or authorized effect.
-
-The old runtime Agent registry, virtual configuration Skill, per-child Skill
-switch loop and custom planner/reviewer are not part of this architecture.
-Historical migration documents describe their removal, not active extension
-points. Change provider configuration through the current Settings/profile
-interfaces, not an obsolete Agent-owned configuration workflow.
+For Shader organization, first edit the whole requested scope and self-review
+the source for readability, structure, calls and redundant temporaries. Repair
+feasible findings and review again, keeping a record for the current bytes.
+Perform necessary compilation and replay checks after that source work; an
+intermediate save or successful compile does not establish readable completion.

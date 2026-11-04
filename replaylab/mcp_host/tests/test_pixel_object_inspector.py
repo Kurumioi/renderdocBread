@@ -10,6 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -240,6 +241,13 @@ class PixelObjectInspectorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.bridge = _load_bridge()
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        patch = mock.patch.object(self.bridge, "_replaylab_local_root", temporary.name)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def test_inspector_preserves_history_and_classifies_without_object_guess(self):
         controller = _Controller()
@@ -478,6 +486,186 @@ class PixelObjectInspectorTests(unittest.TestCase):
         self.assertEqual(controller.last_debug_inputs.sample, 0)
         self.assertEqual(controller.last_debug_inputs.primitive, 7)
         self.assertEqual(controller.last_debug_inputs.view, 0)
+
+    def test_debug_pixel_serializes_current_state_changes_and_preserves_zero_components(self):
+        controller = _Controller()
+        self.bridge._ctx = _Context(controller)
+        trace = types.SimpleNamespace(debugger=object())
+        before = types.SimpleNamespace(name="r0", type="VarType.Float", rows=1, columns=3,
+                                       members=[], value=types.SimpleNamespace(f32v=[1.0, 0.0, 0.0]))
+        after = types.SimpleNamespace(name="r0", type="VarType.Float", rows=1, columns=3,
+                                      members=[], value=types.SimpleNamespace(f32v=[2.0, float("inf"), 0.0]))
+        # ShaderDebugState has changes, not sourceVars. No source mapping is fabricated.
+        state = types.SimpleNamespace(stepIndex=7, nextInstruction=12, flags="NoEvent",
+                                      changes=[types.SimpleNamespace(before=before, after=after)],
+                                      callstack=["MainPS", "Lighting"])
+        batches = iter([[state], []])
+        freed = []
+        controller.DebugPixel = lambda *_args: trace
+        controller.ContinueDebug = lambda _debugger: next(batches)
+        controller.FreeTrace = freed.append
+        result = self.bridge._debug_pixel({"x": 3, "y": 4, "event_id": 10})
+        step = result["trace"][0]
+        self.assertEqual(step["changes"][0]["before"]["value"], [1.0, 0.0, 0.0])
+        self.assertEqual(step["vars"][0]["value"], [2.0, None, 0.0])
+        self.assertEqual(step["vars"][0]["nonFinite"], [{"index": 1, "value": "+inf"}])
+        self.assertEqual(step["nextInstruction"], 12)
+        self.assertEqual(step["callstack"], ["MainPS", "Lighting"])
+        self.assertEqual(result["variableRepresentation"], "debug-variable-changes")
+        self.assertFalse(result["traceTruncated"])
+        self.assertEqual(freed, [trace])
+        self.assertEqual(controller.set_events, [(10, True), (99, True)])
+        json.dumps(result, allow_nan=False)
+
+    def test_debug_vertex_bounds_retained_trace_but_reports_full_step_count(self):
+        controller = _Controller()
+        self.bridge._ctx = _Context(controller)
+        trace = types.SimpleNamespace(debugger=object())
+        states = [types.SimpleNamespace(stepIndex=i, nextInstruction=i, changes=[], callstack=[])
+                  for i in range(65)]
+        batches = iter([states[:40], states[40:], []])
+        freed = []
+        controller.DebugVertex = lambda *_args: trace
+        controller.ContinueDebug = lambda _debugger: next(batches)
+        controller.FreeTrace = freed.append
+        result = self.bridge._debug_vertex({"vertex_id": 7})
+        self.assertEqual(result["steps"], 65)
+        self.assertEqual(len(result["trace"]), 50)
+        self.assertTrue(result["traceTruncated"])
+        self.assertEqual(result["trace"][-1]["step"], 49)
+        self.assertEqual(freed, [trace])
+        artifact = result["traceArtifact"]
+        records = [json.loads(line) for line in Path(artifact["path"]).read_text().splitlines()]
+        self.assertEqual(records[-2]["step"], 64)
+        self.assertTrue(artifact["complete"])
+        self.assertTrue(artifact["executionComplete"])
+        self.assertEqual(records[-1]["steps"], 65)
+        self.assertEqual(hashlib.sha256(Path(artifact["path"]).read_bytes()).hexdigest(), artifact["sha256"])
+        self.assertEqual(controller.set_events, [(99, True)])
+
+    def test_debug_trace_late_actual_values_have_reusable_byte_offsets(self):
+        controller = _Controller()
+        self.bridge._ctx = _Context(controller)
+        trace = types.SimpleNamespace(debugger=object())
+        states = []
+        for number in range(3483):
+            variable = types.SimpleNamespace(
+                name="result", type="Float", rows=1, columns=2, members=[],
+                value=types.SimpleNamespace(f32v=[float(number), 0.0]))
+            states.append(types.SimpleNamespace(
+                stepIndex=number, nextInstruction=number, callstack=["MainPS"],
+                changes=[types.SimpleNamespace(before=variable, after=variable)]))
+        batches = iter([states, []])
+        controller.DebugPixel = lambda *_args: trace
+        controller.ContinueDebug = lambda _debugger: next(batches)
+        freed = []
+        controller.FreeTrace = freed.append
+        result = self.bridge._debug_pixel({"x": 3, "y": 4, "event_id": 10})
+        artifact = result["traceArtifact"]
+        self.assertEqual(result["steps"], 3483)
+        self.assertEqual(len(result["trace"]), 50)
+        self.assertTrue(artifact["complete"])
+        with Path(artifact["path"]).open("rb") as stream:
+            stream.seek(artifact["stepIndex"][-1]["offset"])
+            tail = [json.loads(line) for line in stream]
+        self.assertEqual(tail[-2]["step"], 3482)
+        self.assertEqual(tail[-2]["changes"][0]["after"]["value"], [3482.0, 0.0])
+        self.assertEqual(freed, [trace])
+        self.assertEqual(controller.set_events, [(10, True), (99, True)])
+
+    def test_debug_artifact_limits_are_explicit_and_stop_unbounded_continuation(self):
+        for limit_name, limit_value, expected in (
+                ("_SHADER_DEBUG_TRACE_MAX_STEPS", 60, "step-limit"),
+                ("_SHADER_DEBUG_TRACE_MAX_BYTES", 8192, "byte-limit")):
+            with self.subTest(limit=limit_name), mock.patch.object(self.bridge, limit_name, limit_value):
+                controller = _Controller()
+                self.bridge._ctx = _Context(controller)
+                trace = types.SimpleNamespace(debugger=object())
+                states = [types.SimpleNamespace(
+                    stepIndex=i, nextInstruction=i, changes=[], callstack=[]) for i in range(80)]
+                controller.DebugVertex = lambda *_args: trace
+                calls = []
+                controller.ContinueDebug = lambda _debugger: calls.append(True) or states
+                freed = []
+                controller.FreeTrace = freed.append
+                result = self.bridge._debug_vertex({"vertex_id": 3})
+                artifact = result["traceArtifact"]
+                self.assertFalse(artifact["complete"])
+                self.assertFalse(artifact["executionComplete"])
+                self.assertIn(expected, artifact["truncationReasons"])
+                self.assertEqual(len(calls), 1)
+                self.assertLessEqual(artifact["byteSize"], self.bridge._SHADER_DEBUG_TRACE_MAX_BYTES)
+                self.assertEqual(freed, [trace])
+                self.assertEqual(controller.set_events, [(99, True)])
+
+    def test_debug_artifact_prunes_only_owned_finished_traces(self):
+        root = Path(self.bridge._shader_debug_trace_root())
+        unrelated = root / "user-document.jsonl"
+        unrelated.write_text("keep")
+        old = root / ("1-" + "a" * 32 + "-" + "b" * 32 + ".jsonl")
+        old.write_text("old")
+        self.bridge.os.utime(str(old), (1, 1))
+        pending = root / ("1-" + "c" * 32 + "-" + "d" * 32 + ".jsonl.part")
+        pending.write_text("active")
+        self.bridge._shader_debug_trace_root()
+        self.assertFalse(old.exists())
+        self.assertTrue(unrelated.exists())
+        self.assertTrue(pending.exists())
+
+    def test_debug_trace_is_freed_when_continuation_fails(self):
+        for operation in ("pixel", "vertex"):
+            with self.subTest(operation=operation):
+                controller = _Controller()
+                self.bridge._ctx = _Context(controller)
+                trace = types.SimpleNamespace(debugger=object())
+                freed = []
+                controller.DebugPixel = lambda *_args: trace
+                controller.DebugVertex = lambda *_args: trace
+                controller.FreeTrace = freed.append
+
+                def fail(_debugger):
+                    raise RuntimeError("debug continuation failed")
+
+                controller.ContinueDebug = fail
+                with self.assertRaisesRegex(RuntimeError, "debug continuation failed"):
+                    if operation == "pixel":
+                        self.bridge._debug_pixel({"event_id": 10})
+                    else:
+                        self.bridge._debug_vertex({"vertex_id": 0})
+                self.assertEqual(freed, [trace])
+                if operation == "pixel":
+                    self.assertEqual(controller.set_events, [(10, True), (99, True)])
+                else:
+                    self.assertEqual(controller.set_events, [(99, True)])
+                self.assertEqual(list(Path(self.bridge._shader_debug_trace_root()).glob("*.part")), [])
+
+    def test_vertex_event_restored_when_debug_creation_or_trace_release_fails(self):
+        for phase in ("create", "release"):
+            with self.subTest(phase=phase):
+                controller = _Controller()
+                self.bridge._ctx = _Context(controller)
+
+                def fail(*_args):
+                    raise RuntimeError("debug failed")
+
+                controller.DebugVertex = fail if phase == "create" else (
+                    lambda *_args: types.SimpleNamespace(debugger=object()))
+                controller.FreeTrace = fail
+                controller.ContinueDebug = lambda *_args: []
+                with self.assertRaisesRegex(RuntimeError, "debug failed"):
+                    self.bridge._debug_vertex({"vertex_id": 7})
+                self.assertEqual(controller.set_events, [(99, True)])
+
+    def test_debug_values_use_declared_integer_and_half_storage(self):
+        signed = types.SimpleNamespace(name="index", type="SInt", rows=1, columns=2,
+                                       members=[], value=types.SimpleNamespace(s32v=[-3, 0]))
+        half = types.SimpleNamespace(name="weight", type="Half", rows=1, columns=2,
+                                     members=[], value=types.SimpleNamespace(u16v=[0x3c00, 0]))
+        unavailable = types.SimpleNamespace(name="gone", type="Unknown", rows=0, columns=0,
+                                            members=[], value=object())
+        self.assertEqual(self.bridge._debug_variable_snapshot(signed)["value"], [-3, 0])
+        self.assertEqual(self.bridge._debug_variable_snapshot(half)["value"], [1.0, 0.0])
+        self.assertFalse(self.bridge._debug_variable_snapshot(unavailable)["valueAvailable"])
 
     def test_action_timings_use_real_duration_counter_or_report_unsupported(self):
         controller = _Controller()

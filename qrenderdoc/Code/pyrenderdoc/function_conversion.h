@@ -267,8 +267,10 @@ struct ScopedFuncCall
 {
   ScopedFuncCall(PyObject *h)
   {
-    handle = Py_XNewRef(h);
     gil = PyGILState_Ensure();
+    // Native replay calls may have released the GIL before invoking a callback.
+    // Acquire it before touching the callback's Python handle, including INCREF.
+    handle = Py_XNewRef(h);
   }
 
   ~ScopedFuncCall()

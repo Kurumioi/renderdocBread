@@ -30,6 +30,7 @@
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
+#include <QStandardPaths>
 #include <QSysInfo>
 #include "Code/CaptureContext.h"
 #include "Code/QRDUtils.h"
@@ -320,8 +321,30 @@ int main(int argc, char *argv[])
 
   QApplication application(argc, argv);
 
+  // Portable releases use a separate UI profile and only the co-located first-party runtime.
+  // Existing installations keep their original settings and project identities.
+  if(QFileInfo(QDir(QCoreApplication::applicationDirPath()).filePath(
+         lit("RenderDocBread.portable"))).isFile())    // i18n-ignore: portable package marker
+  {
+    QCoreApplication::setApplicationName(lit("RenderDocBread"));    // i18n-ignore: product brand
+    if(qEnvironmentVariableIsEmpty("RENDERDOC_CONFIG_DIR"))
+    {
+      const QString profile = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation))
+                                  .filePath(lit("RenderDocBread/ui"));    // i18n-ignore: isolated portable UI profile path
+      qputenv("RENDERDOC_CONFIG_DIR", profile.toUtf8());
+    }
+    QCoreApplication::setLibraryPaths(
+        {QDir(QCoreApplication::applicationDirPath()).filePath(lit("qtplugins"))});    // i18n-ignore: fixed bundled Qt plugin path
+  }
+  else if(QCoreApplication::applicationName().compare(lit("RenderDocBread"), Qt::CaseInsensitive) == 0)    // i18n-ignore: executable identity
+  {
+    // The renamed non-portable executable must keep the existing UI/conversation
+    // store. This technical identity is not the displayed application brand.
+    QCoreApplication::setApplicationName(lit("q_render_soco_doc"));    // i18n-ignore: legacy persistent-data path identity
+  }
+
   QCommandLineParser parser;
-  parser.setApplicationDescription(QApplication::translate("qrenderdoc", "Qt UI for RenderDoc"));
+  parser.setApplicationDescription(QApplication::translate("qrenderdoc", "RenderDocBread graphics debugger"));
   QCommandLineOption helpOption = parser.addHelpOption();
   QCommandLineOption versionOption = parser.addVersionOption();
 
@@ -393,7 +416,7 @@ int main(int argc, char *argv[])
 
   if(parser.isSet(versionOption))
   {
-    printf("QRenderDoc v%s (%s)\n", MAJOR_MINOR_VERSION_STRING, RENDERDOC_GetCommitHash());
+    printf("RenderDocBread v%s (%s)\n", MAJOR_MINOR_VERSION_STRING, RENDERDOC_GetCommitHash());
 #if defined(DISTRIBUTION_VERSION)
     printf("Packaged for %s - %s\n", DISTRIBUTION_NAME, DISTRIBUTION_CONTACT);
 #endif
@@ -569,14 +592,12 @@ int main(int argc, char *argv[])
     else
       Analytics::Load();
 
-    bool isDarkTheme = IsDarkTheme();
-
     bool styleSet = config.SetStyle();
 
     // unrecognised style, or empty (none set), choose a default
     if(!styleSet)
     {
-      config.UIStyle = isDarkTheme ? lit("RDDark") : lit("RDLight");
+      config.UIStyle = lit("ultra");    // i18n-ignore: persisted Black theme identifier
 
       config.SetStyle();
     }

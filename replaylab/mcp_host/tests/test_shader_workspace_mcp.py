@@ -94,6 +94,54 @@ def load_server_module():
         return importlib.import_module("src.server")
 
 
+def stable_capture_identity(catalog):
+    """The Bridge's stableCaptureId: capture identity minus the volatile ResourceId."""
+
+    shaders = sorted(
+        (
+            {
+                "stage": str(shader.get("stage", "") or ""),
+                "entryPoint": str(shader.get("entryPoint", shader.get("entry", "")) or ""),
+                "rawSha256": str(shader.get("rawSha256", "") or "").lower(),
+            }
+            for shader in catalog.get("shaders", [])
+        ),
+        key=lambda value: (value["stage"], value["entryPoint"], value["rawSha256"]),
+    )
+    identity = {
+        "api": str(catalog.get("api", "") or ""),
+        "shaders": shaders,
+    }
+    return hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True,
+                   separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def stable_identity_evidence(evidence):
+    """The same use evidence with every ResourceId dropped from its Shader keys."""
+
+    def _stable(shader_key):
+        parts = str(shader_key or "").split(":", 1)
+        return parts[1] if len(parts) == 2 else str(shader_key or "")
+
+    return {
+        "selection": evidence["selection"],
+        "shaderKeys": sorted({_stable(key) for key in evidence["shaderKeys"]}),
+        "useTuples": sorted(
+            [event_id, _stable(shader_key)]
+            for event_id, shader_key in evidence["useTuples"]
+        ),
+    }
+
+
+def _evidence_sha256(evidence):
+    return hashlib.sha256(
+        json.dumps(evidence, ensure_ascii=False, sort_keys=True,
+                   separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 class _CatalogBridge:
     def __init__(self, blob: bytes, key: ShaderKey):
         self.blob = blob
@@ -102,9 +150,15 @@ class _CatalogBridge:
         self.disassembly = {"Native": "mov r0, r0\nret"}
         self.context: dict | None = None
         self.capture_session_id = "8" * 32
+        self.capture_path = "D:/captures/frame.rdc"
         self.known_catalog_capture_ids: set[str] = set()
         self.known_catalog_identity_pairs: dict[str, str] = {}
+        # (stableCaptureId, stableIdentityEvidenceSha256) -- the pair a workspace can
+        # still reproduce after a restart, because it contains no ResourceId.
+        self.known_catalog_stable_pairs: set[tuple[str, str]] = set()
+        self.active_catalog_capture_id = ""
         self.export_capture_id_override: str | None = None
+        self.export_stable_capture_id_override: str | None = None
         self.all_draw_dispatch_event_ids = [321]
         self.export_use_event_id_override: int | None = None
         self.compiled_interface: dict | None = None
@@ -115,6 +169,14 @@ class _CatalogBridge:
             if self.context is None:
                 raise AssertionError("current context was not configured")
             return copy.deepcopy(self.context)
+        if method == "get_shared_shader_replacements":
+            return {
+                "schema": "renderdoc-ultra-shared-shader-replacement-list/v1",
+                "schemaVersion": 1, "captureId": params["expected_capture_id"],
+                "captureSessionId": self.context["capture"]["captureSessionId"],
+                "originalShadersPreserved": True, "replayMutation": False,
+                "count": 0, "replacements": [],
+            }
         if method == "reverse_shader":
             return {
                 "shaderId": self.key.resource_id,
@@ -123,16 +185,39 @@ class _CatalogBridge:
                 "rawSha256": self.key.raw_sha256,
                 "disassembly": dict(self.disassembly),
             }
+        if method == "compile_shader_source_native":
+            # This fixture models a replay driver that cannot compile source.
+            # The workspace must record that capability and use its fixed tool.
+            return {
+                "schema": "bread-native-shader-compile/v1",
+                "captureSessionId": params["expected_capture_session_id"],
+                "capturePath": params["capture_path"],
+                "sourceSha256": params["expected_sha256"],
+                "sourceFormat": params["source_format"],
+                "targetApi": params["target_api"],
+                "stage": params["stage"],
+                "entryPoint": params["entry_point"],
+                "targetProfile": params["target_profile"],
+                "outputFormat": params["output_format"],
+                "status": "unsupported",
+                "reason": "source-encoding-unavailable",
+                "buildTargetShaderSucceeded": False,
+                "freeTargetResourceSucceeded": True,
+                "replayApplied": False,
+            }
         if method == "get_capture_status":
             return {
                 "loaded": True,
                 "api": "GraphicsAPI.D3D11",
                 "captureId": (
-                    sorted(self.known_catalog_capture_ids)[-1]
-                    if self.known_catalog_capture_ids
-                    else ""
+                    self.active_catalog_capture_id
+                    or (
+                        sorted(self.known_catalog_capture_ids)[-1]
+                        if self.known_catalog_capture_ids
+                        else ""
+                    )
                 ),
-                "capturePath": "D:/captures/frame.rdc",
+                "capturePath": self.capture_path,
                 "captureSessionId": self.capture_session_id,
                 "knownCatalogCaptureIds": sorted(
                     self.known_catalog_capture_ids
@@ -146,6 +231,14 @@ class _CatalogBridge:
                     }
                     for capture_id in sorted(self.known_catalog_capture_ids)
                     if capture_id in self.known_catalog_identity_pairs
+                ],
+                "knownCatalogStablePairs": [
+                    {
+                        "stableCaptureId": stable_id,
+                        "stableIdentityEvidenceSha256": stable_sha256,
+                    }
+                    for stable_id, stable_sha256 in sorted(
+                        self.known_catalog_stable_pairs)
                 ],
             }
         if method != "export_shader_catalog":
@@ -188,7 +281,7 @@ class _CatalogBridge:
         catalog = {
             "schema": "renderdoc-ultra-capture-symbols/v1",
             "schemaVersion": 1,
-            "capturePath": "D:/captures/frame.rdc",
+            "capturePath": self.capture_path,
             "api": "D3D11",
             "selection": {
                 "mode": (
@@ -203,29 +296,26 @@ class _CatalogBridge:
             "uses": [use],
         }
         catalog["captureId"] = capture_identity(catalog, [self.key])
+        catalog["stableCaptureId"] = stable_capture_identity(catalog)
         identity_evidence = {
             "selection": copy.deepcopy(catalog["selection"]),
             "shaderKeys": [self.key.catalog_key],
             "useTuples": [[use["eventId"], self.key.catalog_key]],
         }
-        identity_evidence_sha256 = hashlib.sha256(
-            json.dumps(
-                identity_evidence,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        expected_capture_id = str(params.get("expected_capture_id", "") or "")
-        expected_evidence_sha256 = str(
-            params.get("expected_identity_evidence_sha256", "") or ""
+        identity_evidence_sha256 = _evidence_sha256(identity_evidence)
+        stable_identity_evidence_sha256 = _evidence_sha256(
+            stable_identity_evidence(identity_evidence))
+        expected_stable_capture_id = str(
+            params.get("expected_stable_capture_id", "") or "")
+        expected_stable_evidence_sha256 = str(
+            params.get("expected_stable_identity_evidence_sha256", "") or ""
         )
-        if expected_capture_id:
-            if catalog["captureId"] != expected_capture_id:
+        if expected_stable_capture_id:
+            if catalog["stableCaptureId"] != expected_stable_capture_id:
                 raise RuntimeError(
-                    "Live Shader catalog did not match expected_capture_id"
+                    "Live Shader catalog did not match expected_stable_capture_id"
                 )
-            if identity_evidence_sha256 != expected_evidence_sha256:
+            if stable_identity_evidence_sha256 != expected_stable_evidence_sha256:
                 raise RuntimeError(
                     "Live Shader catalog selection/Shader/use evidence changed"
                 )
@@ -234,22 +324,37 @@ class _CatalogBridge:
         returned_capture_id = (
             self.export_capture_id_override or catalog["captureId"]
         )
-        if self.export_capture_id_override is None:
+        returned_stable_id = (
+            self.export_stable_capture_id_override or catalog["stableCaptureId"]
+        )
+        if (self.export_capture_id_override is None
+                and self.export_stable_capture_id_override is None):
             self.known_catalog_capture_ids.add(catalog["captureId"])
             self.known_catalog_identity_pairs[catalog["captureId"]] = (
                 identity_evidence_sha256
             )
+            self.known_catalog_stable_pairs.add(
+                (catalog["stableCaptureId"], stable_identity_evidence_sha256))
+            if (
+                params.get("activate_catalog_if_valid") is True
+                or not expected_stable_capture_id
+            ):
+                self.active_catalog_capture_id = catalog["captureId"]
         result = {
             "schema": catalog["schema"],
             "schemaVersion": 1,
             "captureId": returned_capture_id,
+            "stableCaptureId": returned_stable_id,
             "captureSessionId": self.capture_session_id,
             "catalogPath": str(catalog_path),
             "counts": {"uniqueShaders": 1},
         }
-        if expected_capture_id:
+        if expected_stable_capture_id:
             result["identityEvidenceSha256"] = identity_evidence_sha256
+            result["stableIdentityEvidenceSha256"] = stable_identity_evidence_sha256
             result["expectedIdentityValidatedBeforeCache"] = True
+        if params.get("activate_catalog_if_valid") is True:
+            result["activeCatalogPublished"] = True
         return result
 
 
@@ -412,12 +517,12 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             replacement["supportedCaptureScope"],
             {
                 "apis": ["D3D11", "D3D12", "Vulkan", "OpenGL"],
-                "containerKinds": ["DXBC", "DXIL", "SPIRV", "OPENGL-SPIRV"],
+                "containerKinds": ["DXBC", "DXIL", "SPIRV", "OPENGL-SPIRV", "GLSL"],
                 "combinations": [
                     {"api": "D3D11", "containerKinds": ["DXBC"]},
                     {"api": "D3D12", "containerKinds": ["DXBC", "DXIL"]},
                     {"api": "Vulkan", "containerKinds": ["SPIRV"]},
-                    {"api": "OpenGL", "containerKinds": ["OPENGL-SPIRV"]},
+                    {"api": "OpenGL", "containerKinds": ["OPENGL-SPIRV", "GLSL"]},
                 ],
             },
         )
@@ -511,6 +616,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 321,
                 "fragment",
                 str(workspace),
+                attempt_reconstruction=True,
             )
         )
         self.assertNotIn("error", prepared)
@@ -535,7 +641,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         operation_lock = workspace / ".workspace-operation.lock"
         operation_lock.write_text("another-process-token\n", encoding="ascii")
         locked_reuse = json.loads(
-            self.server.decompile_shader_workspace(str(workspace))
+            self.server.decompile_shader_workspace(str(workspace), validate_for_apply=False)
         )
         self.assertIn("error", locked_reuse)
         self.assertIn("locked by another process", locked_reuse["error"])
@@ -545,7 +651,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         )
         operation_lock.unlink()
         reconstructed = json.loads(
-            self.server.decompile_shader_workspace(str(workspace))
+            self.server.decompile_shader_workspace(str(workspace), validate_for_apply=False)
         )
         self.assertNotIn("error", reconstructed)
         self.assertTrue(reconstructed["result"]["reusedPreparedSource"])
@@ -561,7 +667,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         )
         self.assertNotIn("error", pristine_compiled)
         reconstructed_with_candidate = json.loads(
-            self.server.decompile_shader_workspace(str(workspace))
+            self.server.decompile_shader_workspace(str(workspace), validate_for_apply=False)
         )
         self.assertNotIn("error", reconstructed_with_candidate)
         self.assertTrue(
@@ -584,7 +690,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             source.read_text(encoding="utf-8") + "// edited\n", encoding="utf-8"
         )
         edited_repeat = json.loads(
-            self.server.decompile_shader_workspace(str(workspace))
+            self.server.decompile_shader_workspace(str(workspace), validate_for_apply=False)
         )
         self.assertIn("error", edited_repeat)
         self.assertIn("refusing to overwrite", edited_repeat["error"])
@@ -601,7 +707,11 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         self.assertFalse(
             compiled["renderDocReplacement"]["supportedByThisOperation"]
         )
-        self.assertEqual(len(self.bridge.calls), 1)
+        self.assertEqual([method for method, unused in self.bridge.calls], [
+            "export_shader_catalog",
+            "get_capture_status", "compile_shader_source_native",
+            "get_capture_status", "compile_shader_source_native",
+        ])
 
         lock_path = operation_lock
         lock_path.write_text("another-process-token\n", encoding="ascii")
@@ -615,6 +725,111 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             lock_path.read_text(encoding="ascii"), "another-process-token\n"
         )
         self.assertFalse(status["result"]["applied"])
+
+    def test_reference_decompile_preserves_edited_source_and_candidate(self) -> None:
+        workspace = self.root / "reference-workspace"
+        prepared = json.loads(self.server.prepare_shader_workspace(
+            321, "fragment", str(workspace), attempt_reconstruction=True))
+        self.assertNotIn("error", prepared)
+        source = workspace / "source" / "shader.hlsl"
+        source.write_text(source.read_text(encoding="utf-8") + "// user edits\n", encoding="utf-8")
+        compiled = json.loads(self.server.compile_shader_workspace(str(workspace)))
+        self.assertNotIn("error", compiled)
+        service = self.server._shader_workspace_service()
+        before = service.status(workspace)
+        source_before = source.read_bytes()
+        calls_before = len(self.bridge.calls)
+        result = json.loads(self.server.decompile_shader_workspace(str(workspace), reference_only=True))
+        self.assertNotIn("error", result)
+        reference = result["result"]
+        self.assertTrue(reference["referenceOnly"])
+        self.assertTrue(reference["decompilerExecuted"])
+        self.assertFalse(reference["matchesCurrentSource"])
+        self.assertFalse(reference["compileEligible"])
+        self.assertNotIn(b"user edits", Path(reference["sourcePath"]).read_bytes())
+        self.assertEqual(source.read_bytes(), source_before)
+        after = service.status(workspace)
+        self.assertEqual(after["revision"], before["revision"])
+        self.assertEqual(after["latestCompiled"], before["latestCompiled"])
+        self.assertEqual(after["source"], before["source"])
+        self.assertEqual(len(self.bridge.calls), calls_before)
+        jobs = set((workspace / "jobs").iterdir())
+        reused = json.loads(self.server.decompile_shader_workspace(str(workspace), reference_only=True))["result"]
+        self.assertTrue(reused["reusedReference"])
+        self.assertFalse(reused["decompilerExecuted"])
+        self.assertEqual(reused["sourceSha256"], reference["sourceSha256"])
+        self.assertEqual(jobs, set((workspace / "jobs").iterdir()))
+        # A changed reference is regenerated, never treated as captured text.
+        Path(reference["sourcePath"]).write_text("// tampered reference", encoding="utf-8")
+        repaired = json.loads(self.server.decompile_shader_workspace(str(workspace), reference_only=True))["result"]
+        self.assertFalse(repaired["reusedReference"])
+        self.assertEqual(repaired["sourceSha256"], reference["sourceSha256"])
+        self.assertEqual(source.read_bytes(), source_before)
+
+    def test_failed_reference_decompile_never_destroys_working_source(self) -> None:
+        workspace = self.root / "reference-failure"
+        self.server.prepare_shader_workspace(321, "fragment", str(workspace), attempt_reconstruction=True)
+        service = self.server._shader_workspace_service()
+        source = workspace / "source" / "shader.hlsl"
+        source.write_text("// preserve this incomplete draft\n", encoding="utf-8")
+        before = source.read_bytes()
+        from src.shader_workspace.errors import ToolExecutionError
+        with mock.patch.object(service, "_require_process_success", side_effect=ToolExecutionError("decompiler failed")):
+            result = json.loads(self.server.decompile_shader_workspace(str(workspace), reference_only=True))
+        self.assertIn("decompiler failed", result["error"])
+        self.assertEqual(source.read_bytes(), before)
+
+    def test_reference_cache_tracks_current_source_without_recompiling_or_touching_draft(self) -> None:
+        workspace = self.root / "reference-cache-source-change"
+        prepared = json.loads(self.server.prepare_shader_workspace(
+            321, "fragment", str(workspace), attempt_reconstruction=True))
+        self.assertNotIn("error", prepared)
+        service = self.server._shader_workspace_service()
+        source = workspace / "source" / "shader.hlsl"
+        draft = workspace / "ai" / "organization-sessions" / "retained-draft" / "proposal.hlsl"
+        draft.parent.mkdir(parents=True, exist_ok=True)
+        draft.write_text("// independent unfinished user draft\n", encoding="utf-8")
+        before_draft = draft.read_bytes()
+        with mock.patch.object(service, "_run_route_chain", wraps=service._run_route_chain) as route:
+            first = service.decompile_reference(workspace)
+            self.assertEqual([call.args[2] for call in route.call_args_list], ["decompile"])
+        self.assertTrue(first["matchesCurrentSource"])
+        source.write_bytes(source.read_bytes() + b"// later source edit\n")
+        source_bytes = source.read_bytes()
+        jobs = set((workspace / "jobs").iterdir())
+        with mock.patch.object(service, "_run_route_chain", side_effect=AssertionError("cache must not execute a route")):
+            second = service.decompile_reference(workspace)
+        self.assertTrue(second["reusedReference"])
+        self.assertFalse(second["decompilerExecuted"])
+        self.assertFalse(second["matchesCurrentSource"])
+        self.assertEqual(second["sourceSha256"], first["sourceSha256"])
+        self.assertEqual(set((workspace / "jobs").iterdir()), jobs)
+        self.assertEqual(source.read_bytes(), source_bytes)
+        self.assertEqual(draft.read_bytes(), before_draft)
+
+    def test_reference_cache_cannot_bypass_baseline_or_fixed_tool_integrity(self) -> None:
+        workspace = self.root / "reference-cache-integrity"
+        prepared = json.loads(self.server.prepare_shader_workspace(
+            321, "fragment", str(workspace), attempt_reconstruction=True))
+        self.assertNotIn("error", prepared)
+        service = self.server._shader_workspace_service()
+        reference = service.decompile_reference(workspace)
+        source = workspace / "source" / "shader.hlsl"
+        source_bytes = source.read_bytes()
+        jobs = set((workspace / "jobs").iterdir())
+        for target in (Path(reference["baselinePath"]), self.script):
+            with self.subTest(target=target.name):
+                original = target.read_bytes()
+                try:
+                    target.write_bytes(original + b"\n# altered\n")
+                    rejected = json.loads(self.server.decompile_shader_workspace(str(workspace), reference_only=True))
+                    self.assertIn("error", rejected)
+                    self.assertEqual(set((workspace / "jobs").iterdir()), jobs)
+                    self.assertEqual(source.read_bytes(), source_bytes)
+                finally:
+                    target.write_bytes(original)
+        restored = service.decompile_reference(workspace)
+        self.assertTrue(restored["reusedReference"])
 
     def test_failed_primary_route_exposes_agent_selected_recovery_candidate(self) -> None:
         tool_document = json.loads(self.config.read_text(encoding="utf-8"))
@@ -706,7 +921,9 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
 
         source = self.root / "failed-primary"
         prepared = json.loads(
-            self.server.prepare_shader_workspace(321, "fragment", str(source))
+            self.server.prepare_shader_workspace(
+                321, "fragment", str(source), attempt_reconstruction=True
+            )
         )
         self.assertNotIn("error", prepared, prepared)
         original_status = self.server._shader_workspace_service().status(source)
@@ -720,8 +937,8 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         # Host-selected reconstruction.
         self.assertIsNone(result["reconstructionReceipt"])
         decision = result["recoveryDecision"]
-        self.assertFalse(decision["hostSelectedNextRoute"])
-        self.assertEqual(decision["status"], "agent-route-selection-required")
+        self.assertTrue(decision["reconstructionRequested"])
+        self.assertEqual(decision["status"], "route-candidates-available")
         self.assertEqual(decision["registeredDecompileCandidateCount"], 3)
         self.assertGreater(decision["untriedAlternativePairCount"], 0)
         self.assertIn(
@@ -888,7 +1105,9 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
 
         workspace = self.root / "all-decompilers-failed"
         prepared = json.loads(
-            self.server.prepare_shader_workspace(321, "fragment", str(workspace))
+            self.server.prepare_shader_workspace(
+                321, "fragment", str(workspace), attempt_reconstruction=True
+            )
         )
 
         self.assertNotIn("error", prepared, prepared)
@@ -899,7 +1118,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         # a hash-bound provisional candidate) and leaves the next technical
         # decision to the child Agent.
         self.assertIsNone(result["reconstructionReceipt"])
-        self.assertFalse(result["recoveryDecision"]["hostSelectedNextRoute"])
+        self.assertTrue(result["recoveryDecision"]["reconstructionRequested"])
         self.assertEqual(result["representation"]["lane"], "explanatory-ir")
         provisional = result["provisionalReconstruction"]
         self.assertEqual(provisional["status"], "ready-for-agent-reconstruction")
@@ -926,6 +1145,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         capture_id = prepared["result"]["created"]["captureId"]
         manifest_before = (workspace / "manifest.json").read_bytes()
         self.bridge.known_catalog_capture_ids.clear()
+        self.bridge.known_catalog_stable_pairs.clear()
         self.bridge.calls.clear()
 
         rebound = self.server._ensure_workspace_capture_catalog_identity(
@@ -964,6 +1184,65 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             [call[0] for call in self.bridge.calls], ["get_capture_status"]
         )
 
+    def test_restore_batch_rebind_refreshes_pre_export_catalog_snapshot(self) -> None:
+        workspace = self.root / "workspace-batch-rebind"
+        prepared = json.loads(self.server.prepare_shader_workspace(
+            321, "fragment", str(workspace)))
+        self.assertNotIn("error", prepared)
+        self.bridge.known_catalog_capture_ids.clear()
+        self.bridge.known_catalog_identity_pairs.clear()
+        self.bridge.known_catalog_stable_pairs.clear()
+        self.bridge.calls.clear()
+        cache = {}
+        batch_token = self.server._RESTORED_SHADER_EDITOR_CONTEXT.set(({}, lambda: None))
+        catalog_token = self.server._RESTORED_SHADER_CATALOG_CONTEXT.set(cache)
+        try:
+            rebound = self.server._ensure_workspace_capture_catalog_identity(str(workspace))
+            self.assertTrue(rebound["rebound"])
+            self.assertTrue(cache["live"]["knownCatalogStablePairs"])
+            # Other unchanged items reuse the new observation. No repeated export
+            # or capture query is needed merely because this item was exceptional.
+            calls = len(self.bridge.calls)
+            known = self.server._ensure_workspace_capture_catalog_identity(str(workspace))
+            self.assertFalse(known["rebound"])
+            self.assertEqual(len(self.bridge.calls), calls)
+        finally:
+            self.server._RESTORED_SHADER_CATALOG_CONTEXT.reset(catalog_token)
+            self.server._RESTORED_SHADER_EDITOR_CONTEXT.reset(batch_token)
+        self.assertEqual(sum(method == "export_shader_catalog"
+                             for method, params in self.bridge.calls), 1)
+
+    def test_restart_rebind_accepts_same_shader_after_capture_moves(self) -> None:
+        workspace = self.root / "workspace-rebind-moved-capture"
+        prepared = json.loads(
+            self.server.prepare_shader_workspace(321, "fragment", str(workspace))
+        )
+        self.assertNotIn("error", prepared)
+        manifest_before = (workspace / "manifest.json").read_bytes()
+
+        # Paths are transport metadata. Force the slow re-export path so this
+        # covers both the live-status check and validation of the new catalog.
+        self.bridge.capture_path = "E:/moved/frame.rdc"
+        self.bridge.known_catalog_capture_ids.clear()
+        self.bridge.known_catalog_identity_pairs.clear()
+        self.bridge.known_catalog_stable_pairs.clear()
+        self.bridge.active_catalog_capture_id = ""
+        self.bridge.calls.clear()
+
+        rebound = self.server._ensure_workspace_capture_catalog_identity(
+            str(workspace), require_active_catalog=True
+        )
+
+        self.assertTrue(rebound["rebound"])
+        self.assertTrue(rebound["activeCatalogPublished"])
+        self.assertEqual((workspace / "manifest.json").read_bytes(), manifest_before)
+        export_calls = [
+            params
+            for method, params in self.bridge.calls
+            if method == "export_shader_catalog"
+        ]
+        self.assertEqual(len(export_calls), 1)
+
     def test_restart_fast_path_requires_exact_catalog_evidence_pair(self) -> None:
         workspace = self.root / "workspace-rebind-exact-pair"
         prepared = json.loads(
@@ -998,11 +1277,17 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         self.assertNotEqual(
             different_evidence_sha256, workspace_evidence_sha256
         )
-        # The live Bridge knows the same captureId, but only for a different
-        # exact selection/use binding. That is not a valid fast-path hit.
+        # The live Bridge knows the same capture, but only for a different exact
+        # selection/use binding. That is not a valid fast-path hit.
         self.bridge.known_catalog_identity_pairs[capture_id] = (
             different_evidence_sha256
         )
+        stable_known = {
+            (stable_id, different_evidence_sha256)
+            for stable_id, unused_sha256 in self.bridge.known_catalog_stable_pairs
+        }
+        self.bridge.known_catalog_stable_pairs.clear()
+        self.bridge.known_catalog_stable_pairs.update(stable_known)
         self.bridge.calls.clear()
 
         rebound = self.server._ensure_workspace_capture_catalog_identity(
@@ -1017,17 +1302,46 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             if method == "export_shader_catalog"
         ]
         self.assertEqual(len(export_calls), 1)
+        self.assertNotIn("expected_capture_id", export_calls[0])
+        self.assertEqual(len(export_calls[0]["expected_stable_capture_id"]), 64)
         self.assertEqual(
-            export_calls[0]["expected_capture_id"], capture_id
-        )
-        self.assertEqual(
-            export_calls[0]["expected_identity_evidence_sha256"],
-            workspace_evidence_sha256,
+            len(export_calls[0]["expected_stable_identity_evidence_sha256"]), 64
         )
         self.assertEqual(
             self.bridge.known_catalog_identity_pairs[capture_id],
             workspace_evidence_sha256,
         )
+
+    def test_alias_preflight_activates_exact_catalog_even_when_pair_is_known(self) -> None:
+        workspace = self.root / "workspace-active-alias-catalog"
+        prepared = json.loads(
+            self.server.prepare_shader_workspace(321, "fragment", str(workspace))
+        )
+        self.assertNotIn("error", prepared)
+        capture_id = prepared["result"]["created"]["captureId"]
+        self.assertTrue(self.bridge.known_catalog_stable_pairs)
+        # Simulate an unrelated later export becoming the active symbol snapshot
+        # while the exact workspace pair remains present in the identity cache.
+        self.bridge.active_catalog_capture_id = "9" * 64
+        self.bridge.calls.clear()
+
+        rebound = self.server._ensure_workspace_capture_catalog_identity(
+            str(workspace), require_active_catalog=True
+        )
+
+        self.assertTrue(rebound["rebound"])
+        self.assertTrue(rebound["activeCatalogPublished"])
+        self.assertEqual(rebound["activeCaptureId"], capture_id)
+        export_calls = [
+            params
+            for method, params in self.bridge.calls
+            if method == "export_shader_catalog"
+        ]
+        self.assertEqual(len(export_calls), 1)
+        self.assertIs(export_calls[0]["activate_catalog_if_valid"], True)
+        self.assertEqual(export_calls[0]["event_ids"], [321])
+        self.assertEqual(export_calls[0]["stages"], ["fragment"])
+        self.assertEqual(self.bridge.active_catalog_capture_id, capture_id)
 
     def test_failed_expected_reexport_does_not_enable_next_fast_path(self) -> None:
         workspace = self.root / "workspace-rebind-failed-expected"
@@ -1048,6 +1362,9 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         self.bridge.known_catalog_identity_pairs[capture_id] = (
             stale_evidence_sha256
         )
+        # The fast path now asks about the capture-independent pair, so the stale
+        # entry has to be planted there too or the rebind simply succeeds.
+        self.bridge.known_catalog_stable_pairs.clear()
         self.bridge.export_use_event_id_override = 322
         self.bridge.calls.clear()
 
@@ -1114,10 +1431,11 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         self.assertNotIn("error", prepared)
         manifest_before = (workspace / "manifest.json").read_bytes()
         self.bridge.known_catalog_capture_ids.clear()
-        self.bridge.export_capture_id_override = "f" * 64
+        self.bridge.known_catalog_stable_pairs.clear()
+        self.bridge.export_stable_capture_id_override = "f" * 64
 
         with self.assertRaisesRegex(
-            RuntimeError, "did not reproduce the workspace captureId"
+            RuntimeError, "did not reproduce the workspace Shader identity"
         ):
             self.server._ensure_workspace_capture_catalog_identity(str(workspace))
         self.assertEqual(self.bridge.known_catalog_capture_ids, set())
@@ -1148,6 +1466,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         )
         self.assertNotIn("error", created)
         self.bridge.known_catalog_capture_ids.clear()
+        self.bridge.known_catalog_stable_pairs.clear()
         self.bridge.calls.clear()
 
         rebound = self.server._ensure_workspace_capture_catalog_identity(
@@ -1184,6 +1503,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         )
         self.assertNotIn("error", created)
         self.bridge.known_catalog_capture_ids.clear()
+        self.bridge.known_catalog_stable_pairs.clear()
         self.bridge.export_use_event_id_override = 322
 
         with self.assertRaisesRegex(
@@ -1346,7 +1666,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         )
         self.assertNotIn("error", created)
         decompiled = json.loads(
-            self.server.decompile_shader_workspace(str(source_workspace))
+            self.server.decompile_shader_workspace(str(source_workspace), validate_for_apply=False)
         )
         self.assertNotIn("error", decompiled)
         source_path = Path(decompiled["result"]["sourcePath"])
@@ -1369,33 +1689,12 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         )
 
         target_workspace = self.root / "workspace-after-migration"
+        # Another participant (a previous host's watcher) holds a record on the
+        # workspace; it is not an exclusion, so the migration proceeds.
         previous_host_lease = WorkspaceSourceTransactionLease(
             source_workspace, owner_instance_id="1" * 32
         )
         previous_host_lease.acquire()
-        previous_lease = json.loads(
-            (source_workspace / ".workspace-watch.lock").read_text(encoding="utf-8")
-        )
-        with mock.patch.dict(os.environ, {}):
-            os.environ.pop("REPLAYLAB_HOST_INSTANCE_ID", None)
-            blocked = json.loads(
-                self.server.migrate_shader_workspace_toolchain(
-                    str(source_workspace),
-                    str(target_workspace),
-                    created["result"]["routePlan"]["planSha256"],
-                    source_hash,
-                )
-            )
-        self.assertEqual(blocked["type"], "WorkspaceSourceLeaseError")
-        self.assertFalse(target_workspace.exists())
-        self.assertEqual(
-            json.loads(
-                (source_workspace / ".workspace-watch.lock").read_text(
-                    encoding="utf-8"
-                )
-            ),
-            previous_lease,
-        )
         with mock.patch.dict(
             os.environ, {"REPLAYLAB_HOST_INSTANCE_ID": "2" * 32}
         ):
@@ -1421,14 +1720,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             source_bytes,
         )
         self.assertFalse((source_workspace / ".workspace-watch.lock").exists())
-        archived_lease = source_workspace / "watch" / (
-            "orphaned-lease-%s-%s.json"
-            % (previous_lease["ownerInstanceId"], previous_lease["token"])
-        )
-        self.assertEqual(
-            json.loads(archived_lease.read_text(encoding="utf-8")),
-            previous_lease,
-        )
+        self.assertTrue(previous_host_lease.release())
 
         status = json.loads(
             self.server.get_shader_workspace_status(str(target_workspace))
@@ -1719,6 +2011,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                     expected_capture_id=target["captureId"],
                     expected_capture_session_id=target["captureSessionId"],
                     admit_existing=True,
+                    attempt_reconstruction=True,
                 ))
                 self.assertNotIn("error", prepared, prepared)
                 exported = prepared["result"]["catalogExport"]
@@ -1732,6 +2025,45 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 status = json.loads(self.server.get_shader_workspace_status(target["workspacePath"]))["result"]
                 self.assertTrue(status["source"]["present"])
                 self.assertEqual(status["capture"]["catalogSha256"], target["catalogSha256"])
+                # A second admission in the verified session preserves the
+                # source, while avoiding repeated full provenance/tool hashes.
+                service = self.server._shader_workspace_service()
+                with mock.patch.object(self.server, "_shader_workspace_service", return_value=service), \
+                        mock.patch.object(service, "status", wraps=service.status) as status_calls, \
+                        mock.patch.object(service, "representation", side_effect=AssertionError("editable admission already has its representation")), \
+                        mock.patch.object(service, "decompile", side_effect=AssertionError("existing source must be preserved")):
+                    admitted = json.loads(self.server.prepare_shader_workspace(
+                        321, "fragment", target["workspacePath"],
+                        expected_resource_id=target["shaderResourceId"],
+                        expected_entry_point=target["entryPoint"],
+                        expected_raw_sha256=target["rawSha256"],
+                        expected_capture_id=target["captureId"],
+                        expected_capture_session_id=target["captureSessionId"],
+                        admit_existing=True))
+                self.assertNotIn("error", admitted, admitted)
+                self.assertTrue(admitted["result"]["created"]["admittedExisting"])
+                self.assertTrue(admitted["result"]["created"]["sourcePreserved"])
+                self.assertEqual(admitted["result"]["workspaceStatus"]["source"], status["source"])
+                self.assertEqual(admitted["result"]["representation"], status["representation"])
+                self.assertEqual(status_calls.call_count, 1)
+                self.assertEqual(len([1 for method, unused in self.bridge.calls if method == "export_shader_catalog"]), 1)
+                # The next AI task can run in a fresh Host. Re-admission must
+                # rebuild only the selected event/stage catalog automatically.
+                self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS.clear()
+                restarted = json.loads(self.server.prepare_shader_workspace(
+                    321, "fragment", target["workspacePath"],
+                    expected_resource_id=target["shaderResourceId"],
+                    expected_raw_sha256=target["rawSha256"],
+                    expected_capture_id=target["captureId"],
+                    expected_capture_session_id=target["captureSessionId"],
+                    admit_existing=True))
+                self.assertNotIn("error", restarted, restarted)
+                self.assertTrue(restarted["result"]["created"]["sourcePreserved"])
+                self.assertEqual(restarted["result"]["workspaceStatus"]["source"], status["source"])
+                exports = [args for method, args in self.bridge.calls if method == "export_shader_catalog"]
+                self.assertEqual(len(exports), 2)
+                self.assertEqual(exports[-1]["event_ids"], [321])
+                self.assertEqual(exports[-1]["stages"], ["fragment"])
             finally:
                 self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS.clear()
 
@@ -1789,9 +2121,23 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 self.assertFalse(any(method == "reverse_shader" for method, unused in self.bridge.calls))
             finally:
                 self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS.clear()
+    def test_current_event_representation_preserves_failed_shader_query_diagnostic(self) -> None:
+        original_call = self.bridge.call
+
+        def query(method, *args, **kwargs):
+            if method == "reverse_shader":
+                return {"error": "No shader at stage 'fragment'"}
+            return original_call(method, *args, **kwargs)
+
+        with mock.patch.object(self.bridge, "call", side_effect=query):
+            represented = json.loads(self.server.get_current_shader_representation(777, "fragment"))
+        self.assertIn("No shader at stage 'fragment'", str(represented["error"]))
+        self.assertNotIn("stage contradicts", str(represented["error"]))
+        self.assertFalse(self.server._SHADER_REPRESENTATIONS_ROOT.exists())
+
     def test_current_event_representation_covers_non_workspace_shader_formats(self) -> None:
         represented = json.loads(
-            self.server.get_current_shader_representation(777, "fragment")
+            self.server.get_current_shader_representation(777, "fragment", include_raw_bytes=True)
         )
         self.assertNotIn("error", represented)
         self.assertEqual(represented["lane"], "explanatory-ir")
@@ -1814,6 +2160,32 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             list(self.server._SHADER_REPRESENTATIONS_ROOT.glob("_catalog-*")), []
         )
 
+    def test_current_representation_analysis_needs_no_workspace_or_binary_catalog(self) -> None:
+        self.bridge.disassembly = {"Native": "// 雨滴\n" + "sample texture0\n" * 700}
+        with mock.patch.object(self.server, "_export_current_shader_raw_bytes",
+                               side_effect=AssertionError("analysis must not export a catalog")), \
+             mock.patch.object(self.server, "_shader_workspace_service",
+                               side_effect=AssertionError("analysis must not create a workspace")), \
+             mock.patch.object(self.server, "_active_asset_catalog_context", side_effect=RuntimeError("no project")), \
+             mock.patch.object(self.server, "_active_project_service", side_effect=RuntimeError("no project")):
+            result = json.loads(self.server.get_current_shader_representation(779, "fragment"))
+            self.assertNotIn("error", result)
+            preview = result["textPreview"]
+            self.assertTrue(preview["truncated"])
+            self.assertFalse(result["rawBytesAvailable"])
+            self.assertFalse(result["continuation"]["replayRequired"])
+            artifact = Path(result["path"]).read_bytes()
+            self.assertEqual(artifact[:preview["returnedBytes"]], preview["content"].encode("utf-8"))
+            for section in result["sections"]:
+                self.assertEqual(artifact[section["offset"]:section["offset"] + 10], b"// \xe9\x9b\xa8\xe6\xbb\xb4\n")
+            calls_before = list(self.bridge.calls)
+            readback = self.server.read_evidence_file(result["path"], offset=preview["nextOffset"])
+            self.assertNotIn("error", json.loads(readback[0]))
+            self.assertEqual(self.bridge.calls, calls_before)
+            self.assertEqual(self.bridge.calls[-2][1]["text_mode"], "preferred")
+            self.assertEqual({method for method, _ in self.bridge.calls[-2:]},
+                             {"reverse_shader", "get_capture_status"})
+
         self.bridge.disassembly = {}
         binary_only = json.loads(
             self.server.get_current_shader_representation(778, "fragment")
@@ -1831,15 +2203,19 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             list(self.server._SHADER_REPRESENTATIONS_ROOT.glob("_catalog-*")), []
         )
 
-    def test_prepare_without_tool_ids_uses_server_owned_route_catalog(self) -> None:
+    def test_prepare_default_returns_routes_without_running_reconstruction(self) -> None:
         workspace = self.root / "workspace-auto-route"
-        prepared = json.loads(
-            self.server.prepare_shader_workspace(
-                322,
-                "fragment",
-                str(workspace),
+        service = self.server._shader_workspace_service()
+        with mock.patch.object(self.server, "_shader_workspace_service", return_value=service), \
+                mock.patch.object(service, "_probe_route_features", side_effect=AssertionError("route probe must be explicit")), \
+                mock.patch.object(service, "decompile", side_effect=AssertionError("decompile must be explicit")):
+            prepared = json.loads(
+                self.server.prepare_shader_workspace(
+                    322,
+                    "fragment",
+                    str(workspace),
+                )
             )
-        )
         self.assertNotIn("error", prepared)
         plan = prepared["result"]["created"]["routePlan"]
         self.assertEqual(
@@ -1850,10 +2226,18 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             [item["capability"]["routeId"] for item in plan["compile"]],
             ["test-hlsl-dxbc"],
         )
-        self.assertEqual(
-            prepared["result"]["decompiled"]["routeIds"],
-            ["test-dxbc-hlsl"],
-        )
+        self.assertFalse(prepared["result"]["workspaceStatus"]["source"]["present"])
+        self.assertEqual(prepared["result"]["representation"]["lane"], "binary-only")
+        self.assertFalse(any(method == "reverse_shader" for method, unused in self.bridge.calls))
+        self.assertEqual(prepared["result"]["created"]["routeFeatures"], None)
+        self.assertEqual(prepared["result"]["recoveryDecision"]["untriedAlternativePairCount"], 1)
+        self.assertFalse(prepared["result"]["recoveryDecision"]["reconstructionRequested"])
+        self.assertFalse(prepared["result"]["recoveryDecision"]["primaryAttemptSucceeded"])
+        self.assertFalse((workspace / "source" / "shader.hlsl").exists())
+        decompiled = json.loads(self.server.decompile_shader_workspace(str(workspace), validate_for_apply=False))
+        self.assertNotIn("error", decompiled, decompiled)
+        self.assertFalse(decompiled["result"]["reusedPreparedSource"])
+        self.assertTrue((workspace / "source" / "shader.hlsl").is_file())
 
     def test_toolchain_mcp_plans_and_smokes_without_caller_commands(self) -> None:
         shader_path = self.root / "captured.dxbc"
@@ -1900,6 +2284,7 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 322,
                 "fragment",
                 str(workspace),
+                attempt_reconstruction=True,
             )
         )
         self.assertNotIn("error", prepared)
@@ -1930,7 +2315,9 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
         self.assertEqual(polled["result"]["latestCandidateRevision"], 1)
         self.assertFalse(polled["result"]["candidatePolicy"]["applied"])
         self.assertFalse(polled["renderDocReplacement"]["attempted"])
-        self.assertEqual(len(self.bridge.calls), 1)
+        self.assertEqual([method for method, unused in self.bridge.calls], [
+            "export_shader_catalog",
+        ])
         revision_source = workspace / "revisions" / "0001" / "shader.hlsl"
         self.assertEqual(revision_source.read_text(encoding="utf-8"), edited)
         audit = json.loads(
@@ -2342,7 +2729,11 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 "candidateApplied": False,
                 "previousCandidateRetried": False,
             },
-        ):
+        ), mock.patch.object(
+            self.server,
+            "_shader_live_edit_remote",
+            return_value={"sessions": [], "authorizations": []},
+        ) as live_edit_status:
             validated = json.loads(
                 self.server.validate_shader_workspace_candidate(
                     status["workspacePath"]
@@ -2402,6 +2793,35 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             all_use_scans_before_inventory_anchor = (
                 list_exact_shader_family_uses.call_count
             )
+            live_edit_status.return_value = {
+                "sessions": [{"workspacePath": status["workspacePath"], "state": "running"}],
+                "authorizations": [],
+            }
+            blocked_apply = json.loads(
+                self.server.apply_shader_workspace_shared_resource(
+                    status["workspacePath"], expected_anchor_event_id=321
+                )
+            )
+            self.assertIn("stop the exact Shader live-edit session", blocked_apply["error"])
+            self.assertFalse(any(
+                call[0] == "apply_shader_candidate_shared_resource"
+                for call in bridge.calls
+            ))
+            live_edit_status.return_value = {
+                "sessions": [],
+                "authorizations": [{"workspacePath": status["workspacePath"]}],
+            }
+            restored_with_authorization = json.loads(
+                self.server.apply_shader_workspace_shared_resource(
+                    status["workspacePath"], expected_anchor_event_id=321
+                )
+            )
+            # A retained preference to resume editing is not a running writer.
+            # Project restore must be able to apply before restarting editors.
+            self.assertTrue(restored_with_authorization.get("applied"), restored_with_authorization)
+            self.assertEqual(live_edit_status.return_value["authorizations"],
+                             [{"workspacePath": status["workspacePath"]}])
+            live_edit_status.return_value = {"sessions": [], "authorizations": []}
             shared = json.loads(
                 self.server.apply_shader_workspace_shared_resource(
                     status["workspacePath"],
@@ -2421,6 +2841,21 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 shared["rollback"]["tool"],
                 "rollback_shader_workspace_shared_resource",
             )
+            live_edit_status.return_value = {
+                "sessions": [{"workspacePath": status["workspacePath"], "state": "running"}],
+                "authorizations": [],
+            }
+            blocked_rollback = json.loads(
+                self.server.rollback_shader_workspace_shared_resource(
+                    status["workspacePath"], shared["replacement"]["replacementId"]
+                )
+            )
+            self.assertIn("stop the exact Shader live-edit session", blocked_rollback["error"])
+            self.assertFalse(any(
+                call[0] == "rollback_shader_candidate_shared_resource"
+                for call in bridge.calls
+            ))
+            live_edit_status.return_value = {"sessions": [], "authorizations": []}
             shared_rollback = json.loads(
                 self.server.rollback_shader_workspace_shared_resource(
                     status["workspacePath"],
@@ -2526,19 +2961,38 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             self.assertIn("explicit subset", oversized["error"])
 
         methods = [call[0] for call in bridge.calls]
-        self.assertEqual(methods.count("reflect_shader_candidate"), 8)
+        self.assertEqual(methods.count("reflect_shader_candidate"), 10)
         self.assertEqual(methods.count("apply_shader_candidate_override"), 1)
         self.assertEqual(methods.count("rollback_shader_candidate_override"), 1)
         self.assertEqual(methods.count("apply_shader_candidate_overrides"), 1)
         self.assertEqual(methods.count("rollback_shader_candidate_overrides"), 1)
         self.assertEqual(
-            methods.count("apply_shader_candidate_shared_resource"), 3
+            methods.count("apply_shader_candidate_shared_resource"), 4
         )
         self.assertEqual(
             methods.count("rollback_shader_candidate_shared_resource"), 2
         )
         self.assertNotIn("ReplaceResource", methods)
         self.assertNotIn("replace_shader", methods)
+
+    def test_create_default_does_not_probe_or_decompile(self) -> None:
+        catalog_dir = self.root / "catalog-for-create-only"
+        exported = self.bridge.call(
+            "export_shader_catalog",
+            {"output_dir": str(catalog_dir), "event_ids": [321], "stages": ["fragment"]},
+        )
+        workspace = self.root / "created-without-route-probe"
+        service = self.server._shader_workspace_service()
+        with mock.patch.object(self.server, "_shader_workspace_service", return_value=service), \
+                mock.patch.object(service, "_probe_route_features", side_effect=AssertionError("route probe must be explicit")), \
+                mock.patch.object(service, "decompile", side_effect=AssertionError("decompile must be explicit")):
+            created = json.loads(self.server.create_shader_workspace(
+                exported["catalogPath"], self.key.catalog_key, str(workspace)
+            ))
+        self.assertNotIn("error", created, created)
+        self.assertIsNone(created["result"]["routeFeatures"])
+        self.assertIsNone(created["result"]["routeMemory"])
+        self.assertFalse((workspace / "source" / "shader.hlsl").exists())
 
     def test_create_uses_exact_key_and_host_owned_registry_path(self) -> None:
         catalog_dir = self.root / "catalog"
@@ -2934,12 +3388,26 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                     str(self.root), 12892
                 )
                 self.assertEqual(result["liveBindingEvidence"]["captureId"], capture_id)
+                self.assertEqual(
+                    [call[0] for call in bridge.calls],
+                    [],
+                )
+                self.assertFalse(result["liveBindingEvidence"]["available"])
+                self.assertIsNone(result["liveBindingEvidence"]["boundTextures"])
+                self.assertEqual(
+                    result["liveBindingEvidence"]["evidenceStatus"]["boundTextures"],
+                    {"status": "notFetched"},
+                )
 
             current_context["capture"]["path"] = "D:/captures/different.rdc"
             bridge.calls.clear()
+            # Draft editing depends on local captured source identity, not the
+            # currently opened capture. Explicit live evidence still checks it.
+            self.server._shader_organization_semantic_context(str(self.root), 12892)
+            self.assertEqual(bridge.calls, [])
             with self.assertRaisesRegex(RuntimeError, "does not match this workspace"):
-                self.server._shader_organization_semantic_context(str(self.root), 12892)
-            self.assertEqual([call[0] for call in bridge.calls], ["get_current_renderdoc_context"])
+                self.server._shader_organization_semantic_context(
+                    str(self.root), 12892, include_live_binding_evidence=True)
             current_context["capture"]["path"] = "D:/captures/frame.rdc"
             selected.key.resource_id = 99
             bridge.calls.clear()
@@ -2947,10 +3415,12 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
                 self.server.ShaderOrganizationError, "not an exact use"
             ):
                 self.server._shader_organization_semantic_context(str(self.root), 12892)
-            self.assertEqual([call[0] for call in bridge.calls], ["get_current_renderdoc_context"])
+            self.assertEqual(bridge.calls, [])
             selected.key.resource_id = 71
             bridge.calls.clear()
-            result = self.server._shader_organization_semantic_context(str(self.root), 12892)
+            result = self.server._shader_organization_semantic_context(
+                str(self.root), 12892, include_live_binding_evidence=True,
+            )
 
         self.assertEqual(
             [call[0] for call in bridge.calls],
@@ -2970,6 +3440,95 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             result["reconstructionFidelity"]["classification"],
             "abi-compatible-executable-code-mismatch",
         )
+
+    def test_begin_treats_requested_binding_reads_as_optional_diagnostics(self) -> None:
+        capture_id = "a" * 64
+        capture_session_id = "b" * 32
+        raw_sha256 = "c" * 64
+        status = {
+            "workspaceId": "d" * 32,
+            "capture": {
+                "captureId": capture_id,
+                "catalogPath": str(self.root / "catalog.json"),
+                "capturePath": "D:/captures/frame.rdc",
+                "api": "D3D12",
+            },
+            "shader": {"resourceId": 71, "stage": "fragment", "entryPoint": "MainPS"},
+            "stage": "fragment",
+            "entryPoint": "MainPS",
+            "targetProfile": {"profile": "ps_6_6"},
+            "baseline": {"rawSha256": raw_sha256, "compiledInterface": {}},
+        }
+        current_context = {
+            "capture": {
+                "loaded": True,
+                "captureId": capture_id,
+                "captureSessionId": capture_session_id,
+                "path": "D:/captures/frame.rdc",
+                "api": "D3D12",
+            },
+        }
+
+        class Bridge:
+            def __init__(inner_self):
+                inner_self.calls = []
+
+            def call(inner_self, method, params, timeout=None):
+                inner_self.calls.append(method)
+                if method == "get_bound_textures":
+                    raise TimeoutError("texture evidence timed out")
+                if method == "get_pipeline_state":
+                    return []  # malformed optional evidence
+                raise AssertionError(method)
+
+        manager = mock.Mock()
+        manager.begin.return_value = {"organizationId": "draft", "applied": False,
+                                      "proposalSourceSha256": "e" * 64,
+                                      "workspacePath": str(self.root)}
+        bridge = Bridge()
+        selected = types.SimpleNamespace(
+            key=types.SimpleNamespace(
+                resource_id=71, stage="fragment", entry_point="MainPS",
+                raw_sha256=raw_sha256,
+            )
+        )
+        with mock.patch.object(
+            self.server, "_shader_workspace_service",
+            return_value=types.SimpleNamespace(status=lambda unused_path: status),
+        ), mock.patch.object(
+            self.server, "_workspace_active_capture_context",
+            return_value=current_context,
+        ), mock.patch.object(
+            self.server, "_active_live_context", return_value=current_context,
+        ), mock.patch.object(
+            self.server, "select_unique_shader_for_use", return_value=selected,
+        ), mock.patch.object(
+            self.server, "_shader_organization_manager", return_value=manager,
+        ), mock.patch.object(self.server, "ipc", bridge):
+            default = json.loads(self.server.begin_shader_workspace_organization(
+                str(self.root), event_id=12892, stage="fragment",
+            ))
+            self.assertEqual(default.get("organizationId"), "draft", default)
+            self.assertEqual(bridge.calls, [])
+            default_live = manager.begin.call_args.args[1]["liveBindingEvidence"]
+            self.assertTrue(default_live["identityVerified"])
+            self.assertEqual(default_live["evidenceStatus"]["boundTextures"],
+                             {"status": "notFetched"})
+
+            requested = json.loads(self.server.begin_shader_workspace_organization(
+                str(self.root), event_id=12892, stage="fragment",
+                include_live_binding_evidence=True,
+            ))
+            self.assertEqual(requested["organizationId"], "draft")
+            self.assertEqual(bridge.calls, ["get_bound_textures", "get_pipeline_state"])
+            live = manager.begin.call_args.args[1]["liveBindingEvidence"]
+            self.assertFalse(live["available"])
+            self.assertIsNone(live["boundTextures"])
+            self.assertIsNone(live["pipelineState"])
+            self.assertIn("texture evidence timed out",
+                          live["evidenceStatus"]["boundTextures"]["reason"])
+            self.assertIn("invalid get_pipeline_state response",
+                          live["evidenceStatus"]["pipelineState"]["reason"])
 
     def test_organization_semantic_context_discards_capture_session_drift(self) -> None:
         capture_id = "a" * 64
@@ -3053,7 +3612,9 @@ class ShaderWorkspaceMcpFlowTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 self.server.ShaderOrganizationError, "capture session changed"
             ):
-                self.server._shader_organization_semantic_context(str(self.root), 12892)
+                self.server._shader_organization_semantic_context(
+                    str(self.root), 12892, include_live_binding_evidence=True,
+                )
 
         self.assertEqual(
             [call[0] for call in bridge.calls],

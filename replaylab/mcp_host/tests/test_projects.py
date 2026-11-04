@@ -118,6 +118,176 @@ def _compiler_binding(target_profile: dict, *, flag: str = "-O3") -> dict:
 
 
 class ReplayProjectTests(unittest.TestCase):
+    def test_source_registration_preserves_optional_catalog_code_identity(self):
+        self.project = self.root / "vulkan-project"
+        ReplayProjectService.create(self.project, "Vulkan source", game_id="example-game",
+                                    build_id="build-1", platform="windows-x64", api_family="vulkan")
+        self.service = ReplayProjectService(self.project)
+        catalog, shader, capture_id = self._catalog("raw-fingerprint", _dxbc(), resource_id=91)
+        status = self._workspace_status("raw-workspace", capture_id, shader,
+                                        "float4 main() : SV_Target { return 1; }\n")
+        from tests.test_recovery_assets import _make_spirv
+        blob = _make_spirv()
+        Path(shader["rawPath"]).write_bytes(blob)
+        document = json.loads(catalog.read_text(encoding="utf-8"))
+        document["api"] = "Vulkan"
+        document["shaders"][0].update(codeSha256="", rawSha256=hashlib.sha256(blob).hexdigest(),
+                                       rawSize=len(blob), encoding="SPIR-V")
+        document["captureId"] = capture_identity(document, document["shaders"])
+        catalog.write_text(json.dumps(document), encoding="utf-8")
+        self.service.import_capture(catalog)
+        status["capture"]["captureId"] = document["captureId"]
+        status["shader"]["rawSha256"] = status["baseline"]["rawSha256"] = hashlib.sha256(blob).hexdigest()
+        status["baseline"]["kind"] = "SPIRV"
+        status["baseline"]["codeSha256"] = status["baseline"]["rawSha256"]
+        result = self.service.register_workspace(status, include_compiled_candidate=False)
+        knowledge = result["knowledge"]
+        self.assertEqual(knowledge["codeSha256"], "")
+        self.assertEqual(self.service.get_workspace_knowledge(knowledge["knowledgeId"]), knowledge)
+        # Pre-1.13.67 native-format records put the raw hash in codeSha256.
+        # They remain content-addressed and must be readable without editing
+        # their immutable publication history or relaxing physical identity.
+        legacy = copy.deepcopy(knowledge)
+        legacy["codeSha256"] = legacy["rawSha256"]
+        identity_keys = (
+            "workspaceId", "captureId", "originCatalogSha256", "stage", "entryPoint",
+            "rawSha256", "codeSha256", "layoutHash", "interfaceHash", "interfaceComplete",
+            "baselineAbiSha256", "targetProfile", "sourceSha256", "analysisSha256",
+            "publicationMode", "originResourceId", "compilerBinding",
+        )
+        identity = {key: legacy[key] for key in identity_keys if key in legacy}
+        legacy["knowledgeId"] = projects_module._canonical_sha256(identity)[:32]
+        legacy["sourcePath"] = "knowledge/workspaces/%s.hlsl" % legacy["knowledgeId"]
+        (self.project / legacy["sourcePath"]).write_bytes(
+            (self.project / knowledge["sourcePath"]).read_bytes())
+        manifest = self.service._load()
+        self.assertEqual(self.service._workspace_knowledge_from_manifest(
+            manifest, legacy["knowledgeId"], record=legacy), legacy)
+        for field, bad_value in (("codeSha256", "f" * 64),
+                                 ("layoutHash", "f" * 64),
+                                 ("interfaceHash", "f" * 64)):
+            changed = {**legacy, field: bad_value}
+            with self.assertRaisesRegex(ReplayProjectError, "physical identity differs"):
+                self.service._workspace_knowledge_from_manifest(
+                    manifest, legacy["knowledgeId"], record=changed)
+        status["baseline"]["codeSha256"] = "f" * 64
+        with self.assertRaisesRegex(ReplayProjectError, "code identity differs"):
+            self.service.register_workspace(status, include_compiled_candidate=False)
+
+    def test_source_only_workspace_draft_skips_compiled_candidate(self):
+        catalog, shader, capture_id = self._catalog(
+            "source-only-draft", _dxbc(), resource_id=91
+        )
+        self.service.import_capture(catalog)
+        source = "float4 main() : SV_Target { return 0.75; }\n"
+        status = self._workspace_status(
+            "source-only-draft-workspace", capture_id, shader, source
+        )
+        status["latestCompiled"] = {"replayAbiValidated": True, "rawSha256": "0" * 64}
+        with mock.patch.object(
+            ReplayProjectService, "_validated_compiled_candidate",
+            side_effect=AssertionError("draft registration must not inspect ABI"),
+        ):
+            result = self.service.register_workspace(
+                status, include_compiled_candidate=False
+            )
+        knowledge = result["knowledge"]
+        self.assertNotIn("compiledCandidate", knowledge)
+        self.assertEqual(knowledge["publicationMode"], "source-only-draft")
+        self.assertEqual(self.service.get_workspace_knowledge(knowledge["knowledgeId"]), knowledge)
+        inventory = self._shader_inventory(
+            resource_id=9912, raw_sha256=knowledge["rawSha256"],
+            layout_hash=knowledge["layoutHash"], interface_hash=knowledge["interfaceHash"])
+        snapshot = self.service.reuse_snapshot_for_shader_inventory(inventory)
+        from src.project_restore import _inventory_binding_state
+        from src.shader_source_publication import source_only_restore_reason
+        projected = _inventory_binding_state(snapshot, inventory)["workspaces"][knowledge["knowledgeId"]]
+        self.assertEqual(projected["workspaceId"], knowledge["workspaceId"])
+        self.assertEqual(projected["workspacePath"], knowledge["workspacePath"])
+        self.assertEqual(projected["sourceOriginPath"], knowledge["sourceOriginPath"])
+        self.assertEqual(source_only_restore_reason(projected), "source-only-project-draft")
+        self.assertFalse(result["applied"])
+        self.assertEqual(
+            (self.project / knowledge["sourcePath"]).read_text(encoding="utf-8"),
+            source,
+        )
+        with self.assertRaisesRegex(ReplayProjectError, "cannot be required and omitted"):
+            self.service.register_workspace(
+                status, require_current_candidate=True,
+                include_compiled_candidate=False,
+            )
+
+    def test_project_source_languages_share_original_head_and_keep_historical_artifacts(self):
+        # Storage/identity fixture: compiler and live ABI behavior are covered
+        # by the workspace route suites, not inferred from this mocked status.
+        catalog, shader, capture_id = self._catalog("source-languages", _dxbc(), resource_id=91)
+        self.service.import_capture(catalog)
+        hlsl = self._workspace_status("source-hlsl", capture_id, shader, "float4 main() : SV_Target { return 1; }\n")
+        hlsl_record = self.service.register_workspace(hlsl)["knowledge"]
+        glsl_text = "#version 450\nlayout(location=0) out vec4 color;\nvoid main() { color=vec4(1); }\n"
+        glsl = self._workspace_status("source-glsl", capture_id, shader, glsl_text)
+        old_path = Path(glsl["source"]["path"])
+        glsl_path = old_path.with_suffix(".glsl")
+        old_path.rename(glsl_path)
+        glsl["source"].update(format="glsl", path=str(glsl_path))
+        registered = self.service.register_workspace(glsl)
+        knowledge = registered["knowledge"]
+        self.assertEqual(knowledge["sourceFormat"], "glsl")
+        self.assertTrue(knowledge["sourcePath"].endswith(".glsl"))
+        self.assertNotEqual(knowledge["knowledgeId"], hlsl_record["knowledgeId"])
+        self.assertEqual(self.service._workspace_head_key(knowledge, self.service._load()),
+                            self.service._workspace_head_key(hlsl_record, self.service._load()))
+        current = self.service.current_workspace_source_head(hlsl_record["knowledgeId"])
+        self.assertEqual(current["knowledge"]["knowledgeId"], knowledge["knowledgeId"])
+        # Old installations published one head per language. Read/validate that
+        # exact index before merging the active lanes, without rewriting IDs,
+        # source artifacts or a deliberately selected historical publication.
+        manifest = self.service._load()
+        legacy_heads = {}
+        for record in (hlsl_record, knowledge):
+            legacy_heads[self.service._legacy_workspace_head_key(record, manifest)] = {
+                "generation": 1, "knowledgeId": record["knowledgeId"],
+                "publishedAt": record["registeredAt"],
+            }
+        manifest["activeHeads"]["workspaces"] = legacy_heads
+        before = copy.deepcopy(manifest["knowledge"])
+        self.service.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        migrated = self.service._load(persist_migrations=True)
+        self.assertEqual(migrated["knowledge"], before)
+        self.assertEqual(len(migrated["activeHeads"]["workspaces"]), 1)
+        self.assertEqual(self.service.current_workspace_source_head(hlsl_record["knowledgeId"])
+                         ["knowledge"]["knowledgeId"], knowledge["knowledgeId"])
+        broken = copy.deepcopy(manifest)
+        broken["activeHeads"]["workspaces"].pop(next(iter(legacy_heads)))
+        with self.assertRaisesRegex(ReplayProjectError, "incomplete"):
+            self.service._active_heads_state(broken)
+        self.assertEqual(self.service.get_workspace_knowledge(knowledge["knowledgeId"]), knowledge)
+        inventory = self._shader_inventory(
+            resource_id=9912, raw_sha256=knowledge["rawSha256"],
+            layout_hash=knowledge["layoutHash"], interface_hash=knowledge["interfaceHash"])
+        snapshot = self.service.reuse_snapshot_for_shader_inventory(inventory)
+        from src.project_restore import _inventory_binding_state
+        projected = _inventory_binding_state(snapshot, inventory)["workspaces"][knowledge["knowledgeId"]]
+        self.assertEqual(projected["sourceFormat"], "glsl")
+        self.assertEqual(snapshot["knowledge"]["workspaces"][knowledge["knowledgeId"]]["source"]["kind"],
+                         "verified-glsl")
+        target = self._workspace_status("source-glsl-target", capture_id, shader, "// target\n")
+        with self.assertRaisesRegex(ReplayProjectError, "source formats differ"):
+            self.service.seed_workspace(knowledge["knowledgeId"], target)
+        old_path = Path(target["source"]["path"])
+        target_path = old_path.with_suffix(".glsl")
+        old_path.rename(target_path)
+        target["source"].update(format="glsl", path=str(target_path))
+        seeded = self.service.seed_workspace(knowledge["knowledgeId"], target)
+        self.assertTrue(seeded["requiresLiveAbiRevalidation"])
+        self.assertEqual(target_path.read_bytes(), glsl_path.read_bytes())
+        target_path.unlink()
+        target["source"]["present"] = False
+        target["capture"]["api"] = "D3D11"
+        bundle = self.service.prepare_workspace_source(knowledge["knowledgeId"], target)
+        self.assertEqual(bundle["sourceFormat"], "glsl")
+        self.assertEqual(bundle["sourceText"], glsl_path.read_bytes().decode("utf-8"))
+
     def test_project_source_bundle_needs_no_decompiled_destination(self):
         catalog, shader, capture_id = self._catalog("direct-project-source", _dxbc(), resource_id=91)
         self.service.import_capture(catalog)
@@ -133,11 +303,19 @@ class ReplayProjectTests(unittest.TestCase):
         self.assertFalse(Path(destination["source"]["path"]).exists())
         self.assertTrue(bundle["requiresLiveAbiRevalidation"])
         self.assertEqual(self.service.restorable_shader_raw_hashes(), [knowledge["rawSha256"]])
-        for field in ("rawSha256", "abiSha256"):
-            changed = copy.deepcopy(destination)
-            changed["baseline"][field] = "e" * 64
-            with self.subTest(field=field), self.assertRaisesRegex(ReplayProjectError, "physical ABI"):
-                self.service.prepare_workspace_source(knowledge["knowledgeId"], changed)
+        changed = copy.deepcopy(destination)
+        changed["baseline"]["rawSha256"] = "e" * 64
+        with self.assertRaisesRegex(ReplayProjectError, "original Shader"):
+            self.service.prepare_workspace_source(knowledge["knowledgeId"], changed)
+        changed = copy.deepcopy(destination)
+        changed["baseline"]["abiSha256"] = "e" * 64
+        refreshed = self.service.prepare_workspace_source(knowledge["knowledgeId"], changed)
+        self.assertEqual(refreshed["sourceSha256"], knowledge["sourceSha256"])
+        self.assertEqual(refreshed["baselineAbiSha256"], "e" * 64)
+        self.assertNotEqual(refreshed["baselineAbiSha256"], knowledge["baselineAbiSha256"])
+        self.assertTrue(refreshed["requiresCompile"])
+        self.assertTrue(refreshed["requiresLiveAbiRevalidation"])
+        self.assertFalse(refreshed["applied"])
         replaced = self._workspace_status("direct-new-head", capture_id, shader, "float4 main() : SV_Target { return 0; }\n")
         self.service.register_workspace(replaced)
         with self.assertRaisesRegex(ReplayProjectError, "active knowledge head"):
@@ -152,6 +330,89 @@ class ReplayProjectTests(unittest.TestCase):
         self.assertEqual(
             projects_module._normalised_stage("amplification"), "task"
         )
+
+    def test_seeding_existing_project_import_renews_receipt_and_immutable_input(self):
+        from src.shader_workspace.project_source import source_receipt, validate_project_source
+
+        for inventory_mode in (False, True):
+            for already_seeded in (False, True):
+                with self.subTest(inventory=inventory_mode, retry=already_seeded):
+                    label = "renew-%s-%s" % (inventory_mode, already_seeded)
+                    catalog, shader, capture_id = self._catalog(label, _dxbc(), resource_id=91)
+                    self.service.import_capture(catalog)
+                    old_text = "float4 main() : SV_Target { return 1; }\n"
+                    new_text = "float4 main() : SV_Target { return 2; }\n"
+                    origin = self._workspace_status(label + "-origin", capture_id, shader, old_text)
+                    old = self.service.register_workspace(origin)["knowledge"]
+                    target = self._workspace_status(label + "-target", capture_id, shader, old_text)
+                    target["capture"]["api"] = "D3D11"
+                    empty = copy.deepcopy(target)
+                    empty["source"]["present"] = False
+                    bundle = self.service.prepare_workspace_source(old["knowledgeId"], empty)
+                    root = Path(target["workspacePath"])
+                    input_relative = "source-inputs/project-%s.hlsl" % old["sourceSha256"]
+                    old_input = root / input_relative
+                    old_input.parent.mkdir()
+                    old_bytes = bundle["sourceText"].encode("utf-8")
+                    old_input.write_bytes(old_bytes)
+                    record = {
+                        "path": "source/shader.hlsl", "sha256": old["sourceSha256"],
+                        "entryPoint": "main", "origin": "verified-project-source",
+                        "projectSource": source_receipt(bundle, input_relative),
+                    }
+                    manifest = {key: copy.deepcopy(target[key]) for key in
+                                ("workspaceId", "stage", "entryPoint", "targetProfile", "baseline")}
+                    manifest.update(source=record, routePlan={"editableFormat": "hlsl"})
+                    projects_module.atomic_write_json(root / "manifest.json", manifest)
+                    target["source"].update(origin=record["origin"], projectSource=record["projectSource"])
+                    new_status = self._workspace_status(label + "-new-head", capture_id, shader, new_text)
+                    new_bytes = Path(new_status["source"]["path"]).read_bytes()
+                    new = self.service.register_workspace(new_status)["knowledge"]
+                    if already_seeded:
+                        # Reproduce the old seed's partial result on the next open:
+                        # desired current bytes, but the old managed receipt.
+                        Path(target["source"]["path"]).write_bytes(new_bytes)
+                        target["source"].update(currentSha256=new["sourceSha256"], modifiedSinceDecompile=True)
+                    if not inventory_mode and not already_seeded:
+                        before_manifest = (root / "manifest.json").read_bytes()
+                        before_source = Path(target["source"]["path"]).read_bytes()
+                        write_json = projects_module.atomic_write_json
+
+                        def fail_manifest(path, value):
+                            if Path(path) == root / "manifest.json":
+                                raise OSError("simulated manifest write failure")
+                            return write_json(path, value)
+
+                        with mock.patch.object(projects_module, "atomic_write_json", side_effect=fail_manifest):
+                            with self.assertRaisesRegex(OSError, "simulated manifest"):
+                                self.service.seed_workspace(new["knowledgeId"], target)
+                        self.assertEqual((root / "manifest.json").read_bytes(), before_manifest)
+                        self.assertEqual(Path(target["source"]["path"]).read_bytes(), before_source)
+                        self.assertFalse((root / ("source-inputs/project-%s.hlsl" % new["sourceSha256"])).exists())
+                    if inventory_mode:
+                        inventory = self._shader_inventory(
+                            resource_id=91, raw_sha256=new["rawSha256"],
+                            layout_hash=new["layoutHash"], interface_hash=new["interfaceHash"])
+                        snapshot = self.service.reuse_snapshot_for_shader_inventory(inventory)
+                        seeded = self.service.seed_workspace_from_inventory(
+                            new["knowledgeId"], target, inventory["shaders"][0], inventory, snapshot["binding"])
+                    else:
+                        seeded = self.service.seed_workspace(new["knowledgeId"], target)
+                    renewed = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+                    receipt = validate_project_source(root, renewed, renewed["source"])
+                    self.assertEqual(receipt["knowledgeId"], new["knowledgeId"])
+                    self.assertEqual(receipt["sourceSha256"], new["sourceSha256"])
+                    self.assertEqual(receipt["baselineAbiSha256"], target["baseline"]["abiSha256"])
+                    self.assertEqual((root / receipt["inputPath"]).read_bytes(), new_bytes)
+                    self.assertEqual(Path(target["source"]["path"]).read_bytes(), new_bytes)
+                    self.assertEqual(old_input.read_bytes(), old_bytes)
+                    self.assertNotEqual(receipt["receiptSha256"], record["projectSource"]["receiptSha256"])
+                    self.assertTrue(seeded["requiresCompile"])
+                    self.assertTrue(receipt["requiresLiveAbiRevalidation"])
+                    self.assertFalse(receipt["applied"])
+                    # No historical replay/ABI grant was copied into the new receipt.
+                    self.assertNotIn("latestCompiled", renewed)
+                    self.assertNotIn("replacementResourceId", receipt)
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -170,7 +431,7 @@ class ReplayProjectTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_legacy_project_persists_active_heads_on_first_open(self) -> None:
+    def test_legacy_project_reads_without_writes_and_persists_heads_on_next_mutation(self) -> None:
         manifest_path = self.project / "project.json"
         created = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(
@@ -201,10 +462,8 @@ class ReplayProjectTests(unittest.TestCase):
 
         self.service.status()
 
-        self.assertNotEqual(manifest_path.read_bytes(), before)
-        migrated_on_open = json.loads(
-            manifest_path.read_text(encoding="utf-8")
-        )
+        self.assertEqual(manifest_path.read_bytes(), before)
+        migrated_on_open = self.service._load(persist_migrations=False)
         token = registered["knowledge"]["knowledgeId"]
         self.assertEqual(migrated_on_open["activeKnowledge"]["revision"], 1)
         migrated_head = next(
@@ -225,6 +484,7 @@ class ReplayProjectTests(unittest.TestCase):
             "// newer active source\n",
         )
         newer = self.service.register_workspace(newer_status)
+        self.assertNotEqual(manifest_path.read_bytes(), before)
         migrated = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(migrated["activeKnowledge"]["revision"], 2)
         self.assertEqual(migrated["activeKnowledge"]["workspaces"][token], 1)
@@ -561,6 +821,88 @@ class ReplayProjectTests(unittest.TestCase):
         )
         return status
 
+    def test_native_glsl_candidate_requires_exact_source_binding_and_current_abi(self):
+        from types import SimpleNamespace
+        from src.shader_workspace import native_glsl
+        unused_catalog, shader, capture = self._catalog("native-glsl-binding", _dxbc(), resource_id=91)
+        source = "#version 450\nvoid main() {}\n"
+        status = self._workspace_status("native-glsl-source", capture, shader, source)
+        status["capture"]["api"] = "GraphicsAPI.OpenGL"
+        status["source"]["format"] = "glsl"
+        status["baseline"]["kind"] = "GLSL"
+        status["targetProfile"] = native_glsl.profile("fragment", "OpenGL")
+        status["compilerBinding"] = native_glsl.compiler_binding(
+            {"targetProfile": status["targetProfile"], "routePlan": native_glsl.plan("fragment")})
+        blob = Path(status["source"]["path"]).read_bytes()
+        digest = hashlib.sha256(blob).hexdigest()
+        with mock.patch(__name__ + ".fingerprint_bytes", return_value=SimpleNamespace(kind="GLSL", code_sha256=digest)):
+            self._with_fully_validated_candidate(status, blob)
+        args = {"source_bytes": blob, "workspace_root": Path(status["workspacePath"]),
+                "manifest_bytes": Path(status["manifestPath"]).read_bytes(), "baseline": status["baseline"]}
+        identity, actual = self.service._validated_compiled_candidate(status, **args)
+        self.assertEqual(actual, blob)
+        self.assertEqual(identity["kind"], "GLSL")
+        self.assertEqual(identity["rawSha256"], identity["sourceSha256"])
+        self.assertFalse(identity["semanticEquivalenceVerified"])
+        for api in ("OpenGL", "opengl", "GraphicsAPI.OpenGL", "graphicsapiopengl"):
+            with self.subTest(native_glsl_api=api):
+                native_status = copy.deepcopy(status)
+                native_status["capture"]["api"] = api
+                self.assertEqual(
+                    self.service._validated_compiled_candidate(native_status, **args)[0], identity)
+        inventory = self._shader_inventory(
+            resource_id=91, raw_sha256=status["baseline"]["rawSha256"],
+            layout_hash="1" * 64, interface_hash="2" * 64,
+            api="opengl", encoding="GLSL", protocol_encoding="glsl")
+        status["capture"]["captureId"] = inventory["capture"]["captureId"]
+        registered = self.service.register_workspace_from_inventory(
+            status, inventory["shaders"][0], inventory,
+            self.service.reuse_snapshot_for_shader_inventory(inventory)["binding"])
+        knowledge = registered["knowledge"]
+        self.assertEqual(self.service.get_workspace_knowledge(knowledge["knowledgeId"]), knowledge)
+        snapshot = self.service.reuse_snapshot_for_shader_inventory(inventory)
+        projected = snapshot["knowledge"]["workspaces"][knowledge["knowledgeId"]]
+        self.assertEqual(projected["sourceFormat"], "glsl")
+        self.assertEqual(projected["compiledCandidate"]["kind"], "GLSL")
+        self.assertTrue(projected["compiledCandidate"]["freshLiveAbiRevalidationRequired"])
+        self.assertFalse(projected["compiledCandidate"]["applyAuthorization"])
+        for binding in (None, _compiler_binding(status["targetProfile"])):
+            changed = copy.deepcopy(status)
+            changed["compilerBinding"] = binding
+            with self.assertRaises(ReplayProjectError):
+                self.service._validated_compiled_candidate(changed, **args)
+        changed = copy.deepcopy(status)
+        changed["capture"]["api"] = "Vulkan"
+        with self.assertRaisesRegex(ReplayProjectError, "OpenGL source revision"):
+            self.service._validated_compiled_candidate(changed, **args)
+        changed = copy.deepcopy(status)
+        changed["latestCompiled"]["replayAbiValidated"] = False
+        with self.assertRaisesRegex(ReplayProjectError, "inconsistent"):
+            self.service._validated_compiled_candidate(changed, **args)
+        changed = copy.deepcopy(identity)
+        changed["sourceSha256"] = "e" * 64
+        with self.assertRaisesRegex(ReplayProjectError, "source/API binding"):
+            projects_module._compiled_candidate_identity(changed)
+
+    def test_native_glsl_compiler_binding_is_evidence_only_and_content_bound(self):
+        from src.shader_workspace import native_glsl
+        for container in ("glsl", "opengl-spirv"):
+            profile = {**native_glsl.profile("fragment", "opengl"), "containerFormat": container}
+            binding = native_glsl.compiler_binding(
+                {"targetProfile": profile, "routePlan": {"planSha256": "a" * 64}})
+            self.assertEqual(projects_module._compiler_binding_identity(binding), binding)
+            for field, value in (("executionAuthority", True), ("evidenceOnly", False),
+                                 ("api", "vulkan"), ("sourceFormat", "hlsl"),
+                                 ("backend", "external"), ("compilerContract", "unknown"),
+                                 ("hops", []), ("bindingSha256", "b" * 64),
+                                 ("routePlanSha256", "not-a-digest")):
+                changed = {**binding, field: value}
+                if field != "bindingSha256":
+                    changed["bindingSha256"] = projects_module._canonical_sha256(
+                        {key: item for key, item in changed.items() if key != "bindingSha256"})
+                with self.subTest(container=container, field=field), self.assertRaises(ReplayProjectError):
+                    projects_module._compiler_binding_identity(changed)
+
     def test_cross_frame_reuse_seeds_source_but_never_reuses_live_state(self) -> None:
         blob_a = _dxbc(b"same program", b"frame-a reflection")
         blob_b = _dxbc(b"same program", b"frame-b reflection")
@@ -675,6 +1017,27 @@ class ReplayProjectTests(unittest.TestCase):
         self.assertFalse(seeded["applied"])
         self.assertTrue(seeded["requiresCompile"])
         self.assertTrue(seeded["requiresLiveAbiRevalidation"])
+        self.assertEqual(
+            Path(status_b["source"]["path"]).read_text(encoding="utf-8"),
+            "float4 main() : SV_Target { return 1; }\n",
+        )
+        self.assertIsNone(seeded["supersededLocalEdit"])
+
+        # A local edit in the destination: the plain seed refuses it; the
+        # restore's superseding seed backs it up beside the workspace first.
+        edited = "// my local edit\nfloat4 main() : SV_Target { return 0.5; }\n"
+        Path(status_b["source"]["path"]).write_text(edited, encoding="utf-8")
+        status_b["source"]["currentSha256"] = hashlib.sha256(Path(status_b["source"]["path"]).read_bytes()).hexdigest()
+        status_b["source"]["modifiedSinceDecompile"] = True
+        with self.assertRaisesRegex(ReplayProjectError, "still unmodified"):
+            self.service.seed_workspace(workspace["knowledge"]["knowledgeId"], status_b)
+        superseded = self.service.seed_workspace(
+            workspace["knowledge"]["knowledgeId"], status_b, supersede_local_edit=True)
+        backup = Path(superseded["supersededLocalEdit"]["backupPath"])
+        self.assertEqual(backup.parent, Path(status_b["workspacePath"]) / "ai" / "local-edits")
+        self.assertEqual(backup.read_text(encoding="utf-8"), edited)
+        self.assertEqual(superseded["supersededLocalEdit"]["sourceSha256"],
+                         status_b["source"]["currentSha256"])
         self.assertEqual(
             Path(status_b["source"]["path"]).read_text(encoding="utf-8"),
             "float4 main() : SV_Target { return 1; }\n",
@@ -1094,6 +1457,8 @@ class ReplayProjectTests(unittest.TestCase):
             status["compilerBinding"]["bindingSha256"],
         )
         self.assertFalse(artifact["originResourceIdReused"])
+        self.assertEqual(artifact["registeredWorkspace"], {
+            "workspaceId": status["workspaceId"], "path": status["workspacePath"]})
         serialized = json.dumps(result["knowledge"], sort_keys=True)
         self.assertNotIn("captureSessionId", serialized)
         self.assertNotIn("replacementId", serialized)
@@ -1104,6 +1469,14 @@ class ReplayProjectTests(unittest.TestCase):
             )["snapshotSha256"],
             result["snapshotSha256"],
         )
+        # An old cached projection has no registered-workspace field. Its
+        # unchanged binding is only a hint: validation must rebuild knowledge
+        # from the authenticated manifest rather than return that projection.
+        legacy = copy.deepcopy(result)
+        legacy["knowledge"]["workspaces"][knowledge["knowledgeId"]].pop("registeredWorkspace")
+        refreshed = self.service.validate_shader_inventory_snapshot(inventory, legacy["binding"])
+        self.assertEqual(refreshed["knowledge"]["workspaces"][knowledge["knowledgeId"]]["registeredWorkspace"], {
+            "workspaceId": status["workspaceId"], "path": status["workspacePath"]})
 
     def test_incomplete_inventory_interface_only_prepares_verified_source(self) -> None:
         for origin_complete, target_complete in ((True, False), (False, True), (False, False)):
@@ -1144,8 +1517,10 @@ class ReplayProjectTests(unittest.TestCase):
                                      for item in snapshot["binding"]["artifactRefs"]))
                 self.assertEqual(Path(record["source"]["artifactPath"]).read_text(encoding="utf-8"), source)
                 for flag in ("rawExactSourcePreparationAllowed", "stableKeyExactRequiredForBinary",
-                             "stableKeyExactRequiredForSourceOrBinary", "liveAbiRevalidationRequiredBeforeShaderApply"):
+                             "liveAbiRevalidationRequiredBeforeShaderApply"):
                     self.assertTrue(snapshot["reusePlan"]["policy"][flag])
+                self.assertFalse(snapshot["reusePlan"]["policy"]["stableKeyExactRequiredForSource"])
+                self.assertFalse(snapshot["reusePlan"]["policy"]["stableKeyExactRequiredForSourceOrBinary"])
                 self.assertEqual(self.service.manifest_path.read_bytes(), before)
                 self.assertEqual(self.service.restore_knowledge_snapshot_for_shader_inventory(
                     inventory, expected_binding=snapshot["binding"])["snapshotSha256"], snapshot["snapshotSha256"])
@@ -1158,8 +1533,7 @@ class ReplayProjectTests(unittest.TestCase):
             "float4 main() : SV_Target { return 0.5; }\n"))["knowledge"]
         options = dict(resource_id=9962, raw_sha256=knowledge["rawSha256"],
                        layout_hash=knowledge["layoutHash"], interface_hash=knowledge["interfaceHash"])
-        for field, replacement in (("raw_sha256", "e" * 64), ("abi_hash", "f" * 64),
-                                   ("layout_hash", "d" * 64), ("api", "d3d12")):
+        for field, replacement in (("raw_sha256", "e" * 64), ("api", "d3d12")):
             with self.subTest(field=field):
                 inventory = self._shader_inventory(**{**options, field: replacement})
                 inventory["shaders"][0]["interfaceComplete"] = False
@@ -1167,17 +1541,67 @@ class ReplayProjectTests(unittest.TestCase):
                 self.assertFalse(any(match["workspaceCandidates"] for match in result["reusePlan"]["matches"]))
                 self.assertEqual(result["knowledge"]["workspaces"], {})
                 self.assertEqual(result["binding"]["knowledgeIds"]["workspaces"], [])
-                if field in ("abi_hash", "layout_hash"):
-                    match, = result["reusePlan"]["matches"]
-                    self.assertEqual(match["sourcePreparationBlockedReason"], "project-shader-stable-identity-mismatch")
-                else:
-                    self.assertEqual(result["reusePlan"]["matches"], [])
+                self.assertEqual(result["reusePlan"]["matches"], [])
         inventory = self._shader_inventory(**options)
         inventory["shaders"][0]["interfaceComplete"] = False
         source_path = self.project / knowledge["sourcePath"]
         source_path.write_text("// tampered immutable project source\n", encoding="utf-8")
         with self.assertRaisesRegex(ReplayProjectError, "source.*(content|hash|changed)"):
             self.service.reuse_snapshot_for_shader_inventory(inventory)
+
+    def test_raw_exact_source_survives_old_abi_and_layout_without_binary_authority(self) -> None:
+        catalog, shader, capture_id = self._catalog(
+            "changed-reflection-origin", _dxbc(b"same original program"), resource_id=1644)
+        self.service.import_capture(catalog)
+        source_text = "float4 main() : SV_Target { return 0.25; }\n"
+        origin = self._workspace_status("changed-reflection-source", capture_id, shader, source_text)
+        self._with_fully_validated_candidate(origin, _dxbc(b"old compiled candidate"))
+        knowledge = self.service.register_workspace(origin)["knowledge"]
+        original_manifest = self.service.manifest_path.read_bytes()
+
+        for field, replacement in (("abi_hash", "d" * 64), ("layout_hash", "e" * 64)):
+            with self.subTest(field=field):
+                options = dict(resource_id=9964, raw_sha256=knowledge["rawSha256"],
+                               layout_hash=knowledge["layoutHash"], interface_hash=knowledge["interfaceHash"])
+                inventory = self._shader_inventory(**{**options, field: replacement})
+                snapshot = self.service.reuse_snapshot_for_shader_inventory(inventory)
+                match, = snapshot["reusePlan"]["matches"]
+                candidate, = match["workspaceCandidates"]
+                self.assertEqual(candidate["matchMode"], "raw-exact")
+                self.assertTrue(candidate["sourceSeedEligible"])
+                self.assertTrue(candidate["sourcePreparationOnly"])
+                self.assertTrue(candidate["requiresFreshCompile"])
+                self.assertFalse(candidate["stableKeyMatched"])
+                self.assertFalse(candidate["binaryCandidateEligible"])
+                self.assertIsNone(candidate["binaryCandidate"])
+                artifact = snapshot["knowledge"]["workspaces"][knowledge["knowledgeId"]]
+                self.assertEqual(artifact["physicalIdentity"]["abiHash"], knowledge["baselineAbiSha256"])
+                self.assertEqual(artifact["physicalIdentity"]["layoutHash"], knowledge["layoutHash"])
+                self.assertEqual(candidate["originStableKeySha256"], artifact["physicalIdentity"]["stableKeySha256"])
+                self.assertNotEqual(candidate["originStableKeySha256"], candidate["targetStableKeySha256"])
+                self.assertIsNone(artifact["compiledCandidate"])
+                self.assertFalse(any(ref["kind"] == "verified-compiled-candidate"
+                                     for ref in snapshot["binding"]["artifactRefs"]))
+                self.assertEqual(Path(artifact["source"]["artifactPath"]).read_text(encoding="utf-8"), source_text)
+
+                target_shader = {**shader, "shaderResourceId": 9964}
+                destination = self._workspace_status("changed-reflection-target-" + field,
+                                                     "f" * 64, target_shader, "// fresh source\n")
+                destination["baseline"]["abiSha256"] = inventory["shaders"][0]["abiHash"]
+                mismatched_target = copy.deepcopy(destination)
+                mismatched_target["baseline"]["abiSha256"] = "9" * 64
+                with self.assertRaisesRegex(ReplayProjectError, "identity differs from inventory"):
+                    self.service.seed_workspace_from_inventory(knowledge["knowledgeId"], mismatched_target,
+                        inventory["shaders"][0], inventory, snapshot["binding"])
+                seeded = self.service.seed_workspace_from_inventory(knowledge["knowledgeId"], destination,
+                    inventory["shaders"][0], inventory, snapshot["binding"])
+                self.assertEqual(seeded["matchMode"], "raw-exact")
+                self.assertTrue(seeded["requiresCompile"])
+                self.assertTrue(seeded["requiresLiveAbiRevalidation"])
+                self.assertFalse(seeded["verifiedBinaryCandidateMaySkipCompile"])
+                self.assertFalse(seeded["applied"])
+                self.assertEqual(Path(destination["source"]["path"]).read_text(encoding="utf-8"), source_text)
+                self.assertEqual(self.service.manifest_path.read_bytes(), original_manifest)
 
     def test_reuse_policy_change_invalidates_legacy_negative_routing_cache(self) -> None:
         catalog, shader, capture_id = self._catalog("old-negative-cache", _dxbc(b"old-negative-cache"), resource_id=1643)
@@ -1620,7 +2044,7 @@ class ReplayProjectTests(unittest.TestCase):
         ):
             self.service.status()
 
-    def test_direct_inventory_recomputes_hashes_and_rejects_abi_drift(self) -> None:
+    def test_direct_inventory_recomputes_hashes_and_recovers_source_after_abi_drift(self) -> None:
         catalog, shader, capture_id = self._catalog(
             "inventory-hash-origin", _dxbc(b"inventory hash"), resource_id=1511
         )
@@ -1656,9 +2080,13 @@ class ReplayProjectTests(unittest.TestCase):
         )
         plan = self.service.reuse_plan_for_shader_inventory(drifted)
         self.assertEqual(plan["matchedShaderCount"], 1)
-        self.assertEqual(plan["matches"][0]["workspaceCandidates"], [])
-        self.assertEqual(plan["matches"][0]["sourcePreparationBlockedReason"],
-                         "project-shader-stable-identity-mismatch")
+        candidate, = plan["matches"][0]["workspaceCandidates"]
+        self.assertTrue(candidate["sourceSeedEligible"])
+        self.assertTrue(candidate["sourcePreparationOnly"])
+        self.assertTrue(candidate["requiresFreshCompile"])
+        self.assertFalse(candidate["binaryCandidateEligible"])
+        self.assertFalse(candidate["stableKeyMatched"])
+        self.assertIsNone(candidate["binaryCandidate"])
         self.assertFalse(plan["policy"]["fuzzyExecutableMatchAllowed"])
 
     def test_seed_workspace_from_inventory_uses_fresh_resource_and_abi(self) -> None:
@@ -1716,13 +2144,183 @@ class ReplayProjectTests(unittest.TestCase):
             "// fresh decompile\n",
         )
         wrong_profile["targetProfile"]["profile"] = "ps_4_0"
-        with self.assertRaisesRegex(ReplayProjectError, "profile/ABI"):
+        with self.assertRaisesRegex(ReplayProjectError, "target profile"):
             self.service.seed_workspace_from_inventory(
                 knowledge["knowledgeId"],
                 wrong_profile,
                 inventory["shaders"][0],
                 inventory,
             )
+
+    def _published_source_advance_fixture(self):
+        catalog, shader, capture_id = self._catalog("published-advance", _dxbc(), resource_id=1611)
+        self.service.import_capture(catalog)
+        previous = self._with_fully_validated_candidate(self._workspace_status(
+            "published-previous", capture_id, shader, "float4 main():SV_Target { return 0.75; }\n"),
+            _dxbc(b"previous candidate"), revision=21)
+        old = self.service.register_workspace(previous)["knowledge"]
+        current = self._with_fully_validated_candidate(self._workspace_status(
+            "published-current", capture_id, shader, "float4 main():SV_Target { return 0.25; }\n"),
+            _dxbc(b"current candidate"), revision=6)
+        head = self.service.register_workspace(current)["knowledge"]
+        self.published_head_status = current
+        previous["capture"]["api"] = "D3D11"
+        previous["source"]["modifiedSinceDecompile"] = True
+        manifest = Path(previous["manifestPath"])
+        saved = json.loads(manifest.read_text(encoding="utf-8"))
+        saved.update(workspaceId=previous["workspaceId"], baseline=previous["baseline"],
+                     targetProfile=previous["targetProfile"], stage=previous["stage"],
+                     entryPoint=previous["entryPoint"], source={
+                         "path": "source/shader.hlsl", "sha256": previous["source"]["currentSha256"],
+                         "entryPoint": previous["entryPoint"]})
+        manifest.write_text(json.dumps(saved), encoding="utf-8")
+        inventory = self._shader_inventory(resource_id=1611, raw_sha256=head["rawSha256"],
+            layout_hash=head["layoutHash"], interface_hash=head["interfaceHash"])
+        receipt = self.service.published_workspace_source_advance(head["knowledgeId"], previous)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["previousKnowledgeId"], old["knowledgeId"])
+        return previous, head, inventory, receipt
+
+    def test_unchanged_previous_publication_advances_head_with_backup(self):
+        previous, head, inventory, receipt = self._published_source_advance_fixture()
+        source = Path(previous["source"]["path"])
+        old_bytes = source.read_bytes()
+        with self.assertRaisesRegex(ReplayProjectError, "still unmodified"):
+            self.service.seed_workspace_from_inventory(head["knowledgeId"], previous,
+                inventory["shaders"][0], inventory)
+        seeded = self.service.seed_workspace_from_inventory(head["knowledgeId"], previous,
+            inventory["shaders"][0], inventory, published_source_advance=receipt)
+        self.assertEqual(source.read_bytes(), (self.project / head["sourcePath"]).read_bytes())
+        self.assertEqual(Path(seeded["supersededLocalEdit"]["backupPath"]).read_bytes(), old_bytes)
+        self.assertEqual((Path(previous["workspacePath"]) / "revisions/0021/shader.hlsl").read_bytes(), old_bytes)
+        self.assertEqual(seeded["sourceSha256"], head["sourceSha256"])
+        from src.shader_workspace.project_source import validate_project_source
+        updated = json.loads(Path(previous["manifestPath"]).read_text())
+        imported = validate_project_source(Path(previous["workspacePath"]), updated, updated["source"])
+        self.assertEqual(imported["knowledgeId"], head["knowledgeId"])
+        self.assertEqual(imported["sourceSha256"], head["sourceSha256"])
+        self.assertFalse(imported["applied"])
+        self.assertTrue(imported["requiresCompile"])
+
+    def test_inventory_seed_retry_renews_missing_receipt_and_retires_old_draft(self):
+        self._assert_seed_retry_renews_missing_receipt(inventory_mode=True)
+
+    def test_catalog_seed_retry_renews_missing_receipt_and_retires_old_draft(self):
+        self._assert_seed_retry_renews_missing_receipt(inventory_mode=False)
+
+    def _assert_seed_retry_renews_missing_receipt(self, *, inventory_mode):
+        previous, head, inventory, receipt = self._published_source_advance_fixture()
+        root = Path(previous["workspacePath"])
+        source = Path(previous["source"]["path"])
+        old_source = source.read_bytes()
+        old_sha = hashlib.sha256(old_source).hexdigest()
+        # Model the interrupted older seed: canonical bytes advanced, but the
+        # captured/decompiled manifest and draft still describe the old text.
+        source.write_bytes((self.project / head["sourcePath"]).read_bytes())
+        previous["source"]["currentSha256"] = head["sourceSha256"]
+        organization = "d" * 32
+        directory = root / "ai" / "organization-sessions" / organization
+        directory.mkdir(parents=True)
+        proposal = directory / "organized-proposal.hlsl"
+        proposal.write_bytes(old_source)
+        session = directory / "session.json"
+        session.write_text(json.dumps({
+            "schema": "renderdoc-ai-shader-organization-session/v1",
+            "organizationId": organization, "workspaceId": previous["workspaceId"],
+            "originalRawSha256": previous["baseline"]["rawSha256"],
+            "baselineSourceSha256": old_sha, "syncedDraftSourceSha256": old_sha,
+        }))
+        gate = root / "ai" / "organize-code-gate.json"
+        gate.write_text(json.dumps({
+            "schema": "renderdoc-ai-shader-organization-gate/v1",
+            "organizationId": organization, "workspaceId": previous["workspaceId"],
+            "decision": "editable-draft", "proposalSourceSha256": old_sha,
+        }))
+        from src.shader_workspace.project_source import archive_superseded_project_source_gate
+        self.assertIsNone(archive_superseded_project_source_gate(root))
+        before = {path: path.read_bytes() for path in (source, session, proposal)}
+        if inventory_mode:
+            self.service.seed_workspace_from_inventory(head["knowledgeId"], previous,
+                inventory["shaders"][0], inventory)
+        else:
+            self.service.seed_workspace(head["knowledgeId"], previous)
+        self.assertIsNotNone(archive_superseded_project_source_gate(root))
+        self.assertFalse(gate.exists())
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_published_source_advance_preserves_unpublished_or_different_owner(self):
+        previous, head, inventory, receipt = self._published_source_advance_fixture()
+        for change in (
+            lambda s: s["source"].update(currentSha256="e" * 64),
+            lambda s: s.update(revision=22),
+            lambda s: (s.update(revision=22), s["latestCompiled"].update(revision=22)),
+            lambda s: s["latestCompiled"].update(rawSha256="e" * 64),
+            lambda s: s.update(workspaceId="e" * 32),
+            lambda s: s.update(workspacePath=str(self.root / "another-owner")),
+            lambda s: s["baseline"].update(rawSha256="e" * 64),
+            lambda s: s["targetProfile"].update(profile="ps_4_0"),
+            lambda s: s["latestCompiled"].update(replayAbiValidated=False),
+        ):
+            with self.subTest(change=change):
+                status = copy.deepcopy(previous)
+                change(status)
+                self.assertIsNone(self.service.published_workspace_source_advance(head["knowledgeId"], status))
+
+    def test_published_source_advance_rechecks_head_source_and_candidate_under_locks(self):
+        previous, head, inventory, receipt = self._published_source_advance_fixture()
+        source = Path(previous["source"]["path"])
+        old_bytes = source.read_bytes()
+        for field in ("generation", "knowledgeId", "previousKnowledgeId", "candidateRawSha256"):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(receipt)
+                changed[field] = changed[field] + 1 if field == "generation" else "e" * len(changed[field])
+                with self.assertRaisesRegex(ReplayProjectError, "source/head changed"):
+                    self.service.seed_workspace_from_inventory(head["knowledgeId"], previous,
+                        inventory["shaders"][0], inventory, published_source_advance=changed)
+                self.assertEqual(source.read_bytes(), old_bytes)
+        source.write_bytes(b"new manual edit")
+        with self.assertRaisesRegex(ReplayProjectError, "source changed after"):
+            self.service.seed_workspace_from_inventory(head["knowledgeId"], previous,
+                inventory["shaders"][0], inventory, published_source_advance=receipt)
+        self.assertEqual(source.read_bytes(), b"new manual edit")
+        source.write_bytes(old_bytes)
+        manifest = Path(previous["manifestPath"])
+        saved = json.loads(manifest.read_text(encoding="utf-8"))
+        saved["revision"] += 1
+        manifest.write_text(json.dumps(saved), encoding="utf-8")
+        with self.assertRaisesRegex(ReplayProjectError, "revision changed"):
+            self.service.seed_workspace_from_inventory(head["knowledgeId"], previous,
+                inventory["shaders"][0], inventory, published_source_advance=receipt)
+        self.assertEqual(source.read_bytes(), old_bytes)
+
+    def test_published_source_advance_rejects_head_changed_since_read(self):
+        previous, head, inventory, receipt = self._published_source_advance_fixture()
+        # Publish a third source under the same physical head after admission.
+        source = Path(previous["source"]["path"])
+        old_bytes = source.read_bytes()
+        status = copy.deepcopy(previous)
+        source.write_bytes(b"// next project head\n")
+        status["source"]["currentSha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+        status.pop("latestCompiled")
+        self.service.register_workspace(status, include_compiled_candidate=False)
+        source.write_bytes(old_bytes)
+        with self.assertRaisesRegex(ReplayProjectError, "active knowledge head|not matched|source/head changed before seed"):
+            self.service.seed_workspace_from_inventory(head["knowledgeId"], previous,
+                inventory["shaders"][0], inventory, published_source_advance=receipt)
+        self.assertEqual(source.read_bytes(), old_bytes)
+
+    def test_published_source_advance_rejects_same_head_id_at_new_generation(self):
+        previous, head, inventory, receipt = self._published_source_advance_fixture()
+        expected = {key: receipt[key] for key in ("headKey", "generation", "knowledgeId")}
+        switched = self.service.register_workspace(previous, expected_head=expected)
+        restored = self.service.register_workspace(self.published_head_status, expected_head=switched["head"])
+        self.assertEqual(restored["head"]["knowledgeId"], receipt["knowledgeId"])
+        self.assertGreater(restored["head"]["generation"], receipt["generation"])
+        before = Path(previous["source"]["path"]).read_bytes()
+        with self.assertRaisesRegex(ReplayProjectError, "source/head changed"):
+            self.service.seed_workspace_from_inventory(head["knowledgeId"], previous,
+                inventory["shaders"][0], inventory, published_source_advance=receipt)
+        self.assertEqual(Path(previous["source"]["path"]).read_bytes(), before)
 
     def test_pending_binary_is_not_published_and_legacy_source_stays_reusable(self) -> None:
         catalog_a, shader_a, capture_a = self._catalog(
@@ -1751,6 +2349,74 @@ class ReplayProjectTests(unittest.TestCase):
         self.assertTrue(candidate["sourceSeedEligible"])
         self.assertFalse(candidate["binaryCandidateEligible"])
         self.assertIsNone(candidate["binaryCandidate"])
+
+    def test_legacy_source_without_baseline_abi_is_recovered_by_exact_raw_only(self) -> None:
+        original_blob = _dxbc(b"legacy absent ABI", b"original reflection")
+        catalog, shader, capture_id = self._catalog(
+            "missing-abi-origin", original_blob, resource_id=1711)
+        self.service.import_capture(catalog)
+        source_text = "float4 main() : SV_Target { return 0.5; }\n"
+        origin = self._workspace_status("missing-abi-source", capture_id, shader, source_text)
+        origin["baseline"].pop("abiSha256")
+        knowledge = self.service.register_workspace(origin)["knowledge"]
+        self.assertEqual(knowledge["baselineAbiSha256"], "")
+        self.assertNotIn("compiledCandidate", knowledge)
+
+        target_catalog, target_shader, target_capture = self._catalog(
+            "missing-abi-target", original_blob, resource_id=9711)
+        plan = self.service.import_capture(target_catalog)
+        candidate, = plan["matches"][0]["workspaceCandidates"]
+        self.assertEqual(candidate["matchMode"], "raw-exact")
+        self.assertTrue(candidate["sourceSeedEligible"])
+        self.assertFalse(candidate["binaryCandidateEligible"])
+        self.assertIsNone(candidate["binaryCandidate"])
+        self.assertIn("fresh compile", candidate["binaryBlockedReason"])
+
+        destination = self._workspace_status(
+            "missing-abi-seed", target_capture, target_shader, "// fresh decompile\n")
+        destination["baseline"]["abiSha256"] = "d" * 64
+        seeded = self.service.seed_workspace(knowledge["knowledgeId"], destination)
+        self.assertTrue(seeded["requiresCompile"])
+        self.assertTrue(seeded["requiresLiveAbiRevalidation"])
+        self.assertFalse(seeded["applied"])
+        self.assertEqual(Path(destination["source"]["path"]).read_text(encoding="utf-8"), source_text)
+
+        destination = self._workspace_status(
+            "missing-abi-prepare", target_capture, target_shader, "temporary")
+        Path(destination["source"]["path"]).unlink()
+        destination["source"]["present"] = False
+        destination["capture"]["api"] = "D3D11"
+        destination["baseline"]["abiSha256"] = "d" * 64
+        bundle = self.service.prepare_workspace_source(knowledge["knowledgeId"], destination)
+        self.assertEqual(bundle["sourceText"].encode("utf-8"), Path(origin["source"]["path"]).read_bytes())
+        self.assertEqual(bundle["baselineAbiSha256"], "d" * 64)
+        self.assertTrue(bundle["requiresCompile"])
+        self.assertTrue(bundle["requiresLiveAbiRevalidation"])
+        self.assertFalse(bundle["applied"])
+
+        inventory = self._shader_inventory(resource_id=9711, raw_sha256=knowledge["rawSha256"],
+            layout_hash=knowledge["layoutHash"], interface_hash=knowledge["interfaceHash"], abi_hash="d" * 64)
+        snapshot = self.service.reuse_snapshot_for_shader_inventory(inventory)
+        candidate, = snapshot["reusePlan"]["matches"][0]["workspaceCandidates"]
+        self.assertTrue(candidate["sourceSeedEligible"])
+        self.assertTrue(candidate["sourcePreparationOnly"])
+        self.assertTrue(candidate["requiresFreshCompile"])
+        self.assertFalse(candidate["binaryCandidateEligible"])
+        artifact = snapshot["knowledge"]["workspaces"][knowledge["knowledgeId"]]
+        self.assertEqual(artifact["physicalIdentity"]["abiHash"], "")
+        self.assertIsNone(artifact["compiledCandidate"])
+
+        changed_catalog, changed_shader, changed_capture = self._catalog(
+            "missing-abi-code-only", _dxbc(b"legacy absent ABI", b"different reflection"), resource_id=9712)
+        changed_plan = self.service.import_capture(changed_catalog)
+        changed_candidate, = changed_plan["matches"][0]["workspaceCandidates"]
+        self.assertEqual(changed_candidate["matchMode"], "code-interface-layout-exact")
+        self.assertFalse(changed_candidate["sourceSeedEligible"])
+        self.assertFalse(changed_candidate["binaryCandidateEligible"])
+        changed_destination = self._workspace_status(
+            "missing-abi-code-target", changed_capture, changed_shader, "// fresh decompile\n")
+        with self.assertRaisesRegex(ReplayProjectError, "physical ABI"):
+            self.service.seed_workspace(knowledge["knowledgeId"], changed_destination)
 
     def test_compiled_candidate_tampering_fails_closed(self) -> None:
         catalog, shader, capture_id = self._catalog(
@@ -1945,6 +2611,45 @@ class ReplayProjectTests(unittest.TestCase):
         )
         self.assertFalse(repeated["derivedCache"]["physicalGateBypassed"])
 
+    def test_cross_rdc_cached_sources_follow_project_head_after_editing_another_capture(self) -> None:
+        blob = _dxbc(b"shared program across RDC files")
+        captures = []
+        for name, resource_id in (("head-frame-a", 754), ("head-frame-b", 860), ("head-frame-c", 61523)):
+            catalog, shader, capture_id = self._catalog(name, blob, resource_id=resource_id)
+            imported = self.service.import_capture(catalog)
+            captures.append((catalog, shader, capture_id, imported["catalogSha256"]))
+        status_a = self._workspace_status("head-source-a", captures[0][2], captures[0][1], "// previous organized source\n")
+        old = self.service.register_workspace(status_a)
+        old_id = old["knowledge"]["knowledgeId"]
+        for _, _, capture_id, catalog_sha in captures:
+            planned = self.service.reuse_plan(capture_id, catalog_sha)
+            self.assertEqual(planned["matches"][0]["workspaceCandidates"][0]["knowledgeId"], old_id)
+        # Edit and publish from another RDC. Different EIDs/resource IDs never
+        # partition the logical project source or make the old cache a head.
+        status_b = self._workspace_status("head-source-b", captures[1][2], captures[1][1], "// latest organized source\n")
+        current = self.service.register_workspace(status_b, expected_head=old["head"])
+        self.assertEqual(current["head"]["headKey"], old["head"]["headKey"])
+        reopened = ReplayProjectService(self.project)
+        latest_head = reopened.current_workspace_source_head(old_id)
+        self.assertEqual(latest_head["headKey"], current["head"]["headKey"])
+        self.assertEqual(latest_head["generation"], current["head"]["generation"])
+        self.assertEqual(latest_head["knowledge"]["knowledgeId"], current["knowledge"]["knowledgeId"])
+        self.assertEqual(latest_head["knowledge"]["sourceSha256"], current["knowledge"]["sourceSha256"])
+        for _, _, capture_id, catalog_sha in captures:
+            planned = reopened.reuse_plan(capture_id, catalog_sha)
+            candidates = planned["matches"][0]["workspaceCandidates"]
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]["knowledgeId"], current["knowledge"]["knowledgeId"])
+            self.assertEqual(candidates[0]["sourceSha256"], current["knowledge"]["sourceSha256"])
+            warmed = reopened.reuse_plan(capture_id, catalog_sha)
+            self.assertTrue(warmed["derivedCache"]["hit"])
+            self.assertEqual(warmed["matches"], planned["matches"])
+        with self.assertRaisesRegex(ReplayProjectError, "expected_head"):
+            reopened.register_workspace(status_a)
+        # The original file is retained; newer project publication is explicit,
+        # never an overwrite disguised as opening a different capture.
+        self.assertEqual(Path(status_a["source"]["path"]).read_text(), "// previous organized source\n")
+
     def test_reuse_cache_invalidates_on_knowledge_or_catalog_content_change(self) -> None:
         blob_a = _dxbc(b"same invalidation program", b"frame-a reflection")
         blob_b = _dxbc(b"same invalidation program", b"frame-b reflection")
@@ -2015,6 +2720,65 @@ class ReplayProjectTests(unittest.TestCase):
             catalog_changed["derivedCache"]["path"],
             knowledge_changed["derivedCache"]["path"],
         )
+
+    def test_pending_head_preserves_latest_validated_replay_version_and_binds_both_sources(self):
+        catalog, shader, capture_id = self._catalog("dual-source", _dxbc(), resource_id=754)
+        self.service.import_capture(catalog)
+        valid_status = self._workspace_status("dual-valid", capture_id, shader,
+            "float4 main() : SV_Target { return 0.25; }\n")
+        self._with_fully_validated_candidate(valid_status, _dxbc(b"verified program"))
+        valid = self.service.register_workspace(valid_status)
+        pending_status = self._workspace_status("dual-pending", capture_id, shader,
+            "float4 main() : SV_Target { return needsRepair; }\n")
+        pending = self.service.register_workspace(pending_status, include_compiled_candidate=False,
+                                                  expected_head=valid["head"])
+        original_manifest = self.service.manifest_path.read_bytes()
+        inventory = self._shader_inventory(resource_id=728, raw_sha256=valid["knowledge"]["rawSha256"],
+            layout_hash=valid["knowledge"]["layoutHash"], interface_hash=valid["knowledge"]["interfaceHash"])
+        snapshot = self.service.reuse_snapshot_for_shader_inventory(inventory)
+        candidate, = snapshot["reusePlan"]["matches"][0]["workspaceCandidates"]
+        self.assertEqual(candidate["knowledgeId"], valid["knowledge"]["knowledgeId"])
+        self.assertEqual(candidate["pendingSource"]["knowledgeId"], pending["knowledge"]["knowledgeId"])
+        self.assertEqual(set(snapshot["binding"]["knowledgeIds"]["workspaces"]),
+                         {valid["knowledge"]["knowledgeId"], pending["knowledge"]["knowledgeId"]})
+        self.assertEqual(self.service.manifest_path.read_bytes(), original_manifest)
+        from src import shader_source_publication
+        original_reason = shader_source_publication.source_only_restore_reason
+        def revised_reason(knowledge, project_path=None):
+            if knowledge.get("knowledgeId") == pending["knowledge"]["knowledgeId"]:
+                return "legacy-saved-organization-draft"
+            return original_reason(knowledge, project_path)
+        with mock.patch.object(shader_source_publication, "source_only_restore_reason", side_effect=revised_reason):
+            changed_reason = self.service.reuse_snapshot_for_shader_inventory(inventory)
+        self.assertNotEqual(changed_reason["binding"], snapshot["binding"])
+        self.assertEqual(changed_reason["reusePlan"]["matches"][0]["workspaceCandidates"][0]["pendingSource"]["reason"],
+                         "legacy-saved-organization-draft")
+        # Matching code with different captured container bytes is useful for
+        # general source discovery, but cannot borrow this head's fallback.
+        variant_catalog, unused_shader, variant_capture = self._catalog(
+            "dual-variant", _dxbc(metadata=b"different original container"), resource_id=861)
+        variant = self.service.import_capture(variant_catalog)
+        variant_plan = self.service.reuse_plan(variant_capture, variant["catalogSha256"])
+        self.assertFalse(any(candidate.get("pendingSource") for match in variant_plan["matches"]
+                             for candidate in match["workspaceCandidates"]))
+        destination = copy.deepcopy(valid_status)
+        destination["source"].update(present=False)
+        destination["capture"]["api"] = "D3D11"
+        self.assertEqual(self.service.prepare_workspace_source(valid["knowledge"]["knowledgeId"], destination)["sourceSha256"],
+                         valid["knowledge"]["sourceSha256"])
+        self.assertEqual(self.service.prepare_workspace_source(pending["knowledge"]["knowledgeId"], destination)["sourceSha256"],
+                         pending["knowledge"]["sourceSha256"])
+        repaired_status = self._workspace_status("dual-repaired", capture_id, shader,
+            "float4 main() : SV_Target { return 0.5; }\n")
+        self._with_fully_validated_candidate(repaired_status, _dxbc(b"repaired verified"))
+        repaired = self.service.register_workspace(repaired_status, expected_head=pending["head"])
+        after = self.service.reuse_snapshot_for_shader_inventory(inventory)
+        new, = after["reusePlan"]["matches"][0]["workspaceCandidates"]
+        self.assertEqual(new["knowledgeId"], repaired["knowledge"]["knowledgeId"])
+        self.assertNotIn("pendingSource", new)
+        self.assertNotEqual(after["binding"], snapshot["binding"])
+        with self.assertRaisesRegex(ReplayProjectError, "active knowledge head"):
+            self.service.prepare_workspace_source(valid["knowledge"]["knowledgeId"], destination)
 
     def test_historical_workspace_requires_cas_before_head_reactivation(self) -> None:
         catalog, shader, capture_id = self._catalog(
@@ -3056,3 +3820,57 @@ class ReplayProjectApiReuseCompatibilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_a_lock_left_by_a_dead_owner_is_recovered_and_a_read_never_needs_the_lock(tmp_path):
+    """A Host killed mid-operation must not brick the project until a file is deleted by hand."""
+    import inspect
+    import json
+    from unittest import mock
+
+    import pytest
+
+    from src import active_projects as selection_locks
+    from src import projects
+
+    root = tmp_path / "replay-project"
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".project-operation.lock"
+    owner_pid = 424242
+    value = {
+        "schema": selection_locks.EXCLUSIVE_PROJECT_LOCK_SCHEMA,
+        "schemaVersion": selection_locks.EXCLUSIVE_PROJECT_LOCK_VERSION,
+        "token": "a" * 32,
+        "ownerPid": owner_pid,
+        "processStartIdentity": "windows-filetime:0000000000001234",
+        "acquiredAt": "2026-08-28T00:00:00Z",
+    }
+    value["lockSha256"] = selection_locks._document_hash(value, "lockSha256")
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    lock_path.write_bytes(raw)
+    real_probe = selection_locks._process_lock_owner_state
+
+    def probe(pid):
+        return ("dead", "") if pid == owner_pid else real_probe(pid)
+
+    with mock.patch.object(selection_locks, "_process_lock_owner_state", side_effect=probe):
+        with projects._project_lock(root):
+            assert lock_path.is_file()
+            assert lock_path.read_bytes() != raw
+    assert not lock_path.exists()
+    assert list(root.glob(".project-operation.lock.recovered-*")) == []
+    # A legacy token recorded no owner: still a manual matter for mutations...
+    lock_path.write_text("a" * 32, encoding="ascii")
+    with pytest.raises(projects.ReplayProjectError, match="stale lock"):
+        with projects._project_lock(root):
+            pass
+    # ...but a status read does not create or require any disk lock, even on
+    # read-only media. Check behavior rather than an implementation string.
+    service = projects.ReplayProjectService(root)
+    fake_manifest = {"projectId": "b"*32, "name": "retained", "scope": {}, "captures": [],
+                     "knowledge": {"workspaces": [], "materials": [], "aliases": []}}
+    with mock.patch.object(service, "_load", return_value=fake_manifest), \
+            mock.patch.object(projects, "_project_lock", side_effect=PermissionError("read-only")) as disk_lock:
+        assert service.status()["projectId"] == "b"*32
+        disk_lock.assert_not_called()
+    assert lock_path.read_text(encoding="ascii") == "a"*32

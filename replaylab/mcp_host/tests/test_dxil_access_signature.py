@@ -495,6 +495,61 @@ class AmbiguousCBufferAbiTests(unittest.TestCase):
         )
         self.assertTrue(comparison.compatible)
 
+    def test_candidate_may_drop_loads_but_not_add_or_retype_them(self) -> None:
+        # Block 1 (two loads in the fixture) is ambiguous as well, like every
+        # block of a stripped shipped shader.
+        interface = ambiguous_interface()
+        second = copy.deepcopy(interface["constantBlocks"][0])
+        second.update({"bind": 1, "byteSize": 7572})
+        interface["constantBlocks"].append(second)
+        baseline = parse_shader_abi(interface)
+        candidate = parse_shader_abi(copy.deepcopy(interface))
+        # Dead-code elimination after an edit: block 1 keeps one of its two
+        # loads. Every remaining load is one the capture performed.
+        dropped_source = REAL_SHAPE_DXIL.replace(
+            b"  %24 = call %dx.types.CBufRet.f32 @dx.op.cbufferLoadLegacy.f32"
+            b"(i32 59, %dx.types.Handle %17, i32 205)\n"
+            b"  %25 = extractvalue %dx.types.CBufRet.f32 %24, 0\n",
+            b"",
+        )
+        self.assertNotEqual(dropped_source, REAL_SHAPE_DXIL)
+        dropped = extract_dxil_cbuffer_access_signature(dropped_source)
+        comparison = compare_shader_abi(
+            baseline,
+            candidate,
+            baseline_dxil_access=self.access,
+            candidate_dxil_access=dropped,
+        )
+        self.assertTrue(comparison.compatible, comparison.differences)
+        # The reverse direction (the capture is the smaller set) adds a load the
+        # capture never proved and stays rejected.
+        comparison = compare_shader_abi(
+            baseline,
+            candidate,
+            baseline_dxil_access=dropped,
+            candidate_dxil_access=self.access,
+        )
+        self.assertFalse(comparison.compatible)
+        self.assertEqual(
+            "access-signature-mismatch", comparison.differences[0]["reason"]
+        )
+        # Dropping every load of a block is not a subset proof either.
+        emptied_source = dropped_source.replace(
+            b"  %22 = call %dx.types.CBufRet.f32 @dx.op.cbufferLoadLegacy.f32"
+            b"(i32 59, %dx.types.Handle %17, i32 44)\n"
+            b"  %23 = extractvalue %dx.types.CBufRet.f32 %22, 3\n",
+            b"",
+        )
+        self.assertNotEqual(emptied_source, dropped_source)
+        emptied = extract_dxil_cbuffer_access_signature(emptied_source)
+        comparison = compare_shader_abi(
+            baseline,
+            candidate,
+            baseline_dxil_access=self.access,
+            candidate_dxil_access=emptied,
+        )
+        self.assertFalse(comparison.compatible)
+
     def test_return_type_and_reflection_envelope_must_match_exactly(self) -> None:
         changed_type_source = REAL_SHAPE_DXIL.replace(
             b"%20 = call %dx.types.CBufRet.i32 @dx.op.cbufferLoadLegacy.i32",
@@ -932,6 +987,7 @@ class DxilAccessWorkspaceEvidenceTests(unittest.TestCase):
         # Mirrors stripped-DXIL bridge catalogs: all non-CBuffer ABI records are
         # present, but unreliable member reflection lowers the global claim.
         shader["interfaceComplete"] = False
+        shader["encoding"] = "ShaderEncoding.DXIL"
         shader.update(
             {
                 "shaderKey": self.key.catalog_key,
@@ -1235,6 +1291,44 @@ class DxilAccessWorkspaceEvidenceTests(unittest.TestCase):
         response["encoding"] = "dxil"
         validated = service.validate_candidate_reflection(workspace, response)
         self.assertTrue(validated["compatible"])
+
+    def test_baseline_native_evidence_survives_replaced_editable_source(self) -> None:
+        service, workspace, manifest, compiled = (
+            self._compiled_hlsl_evidence_manifest("hlsl-restored-source-evidence")
+        )
+        response = abi_support.reflection_response(
+            ambiguous_interface(), compiled["rawSha256"],
+            Path(compiled["candidateBlobPath"]).stat().st_size,
+        )
+        response["encoding"] = "dxil"
+        service.validate_candidate_reflection(workspace, response)
+        manifest = json.loads((workspace / "manifest.json").read_text(encoding="utf-8"))
+        original = service._dedicated_dxil_asm_evidence(workspace, manifest, "baseline")
+        self.assertIsNotNone(original)
+        changed = copy.deepcopy(manifest)
+        # Project-source publication can replace both the HLSL origin and its hash, while
+        # baseline/shader.bin, the compiled revision and all native evidence stay identical.
+        changed["source"] = {
+            **changed["source"], "origin": "verified-project-source", "sha256": "1" * 64,
+        }
+        with mock.patch.object(service, "_attempt_dedicated_dxil_disassembly") as execute:
+            self.assertEqual(
+                original, service._dedicated_dxil_asm_evidence(workspace, changed, "baseline")
+            )
+            service._ensure_dedicated_baseline_dxil_disassembly(workspace, changed)
+            execute.assert_not_called()
+        candidate = changed["latestCompiled"]
+        service._validate_abi_report(
+            workspace, changed, candidate, candidate["abiGate"],
+            service._manifest_baseline_abi(changed),
+        )
+        # Removing the precise historical owner still rejects the same native artifact.
+        changed["history"] = [
+            entry for entry in changed["history"]
+            if entry.get("baselineDxilDisassemblyEvidence") !=
+            changed["dxilDisassemblyEvidence"]["baseline"]
+        ]
+        self.assertIsNone(service._dedicated_dxil_asm_evidence(workspace, changed, "baseline"))
 
     @staticmethod
     def _revision_publish_denied(staging: Path, destination: Path) -> PermissionError:

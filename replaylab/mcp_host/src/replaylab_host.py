@@ -2,7 +2,7 @@
 
 qrenderdoc loads a first-party bridge from its fixed built-in integration
 directory. The bridge runs in embedded Python 3.6 and deliberately remains a
-thin replay/UI adapter. This module is packaged as ``ReplayLabMCP.exe`` with a
+thin replay/UI adapter. This module is packaged as ``BreadMCP.exe`` with a
 Python 3.10+ runtime and supports two transports:
 
 ``stdio``
@@ -157,12 +157,12 @@ def _prepare_shader_tools() -> None:
 
         report = configure_environment(Path(sys.executable).resolve().parent)
         if report.get("error"):
-            print("ReplayLab shader tools: %s" % report["error"], file=sys.stderr)
+            print("Bread shader tools: %s" % report["error"], file=sys.stderr)
     except Exception as error:
         # Capture inspection remains useful without an external compiler. Tool
         # operations will expose the precise missing/invalid registry error.
         print(
-            "ReplayLab shader tool discovery failed: %s: %s"
+            "Bread shader tool discovery failed: %s: %s"
             % (type(error).__name__, error),
             file=sys.stderr,
         )
@@ -249,7 +249,7 @@ def _load_or_create_token(root: Path) -> str:
     except FileExistsError:
         token = paths["token"].read_text(encoding="ascii").strip()
         if not TOKEN_PATTERN.fullmatch(token):
-            raise RuntimeError("ReplayLab token file is corrupt")
+            raise RuntimeError("Bread token file is corrupt")
         return token
     with os.fdopen(descriptor, "w", encoding="ascii", newline="\n") as stream:
         stream.write(token + "\n")
@@ -394,7 +394,7 @@ def choose_port(root: Path, requested: int | None = None) -> int:
             configured = int(raw)
     if configured is not None:
         if not 1024 <= int(configured) <= 65535:
-            raise ValueError("ReplayLab port must be between 1024 and 65535")
+            raise ValueError("Bread port must be between 1024 and 65535")
         return int(configured)
     previous = _state_port(root)
     candidates = ([previous] if previous is not None else []) + list(
@@ -403,7 +403,7 @@ def choose_port(root: Path, requested: int | None = None) -> int:
     for candidate in dict.fromkeys(candidates):
         if _port_is_free(candidate):
             return candidate
-    raise RuntimeError("No free ReplayLab loopback port is available")
+    raise RuntimeError("No free Bread loopback port is available")
 
 
 def health(port: int, timeout: float = 0.75) -> dict[str, Any] | None:
@@ -420,14 +420,14 @@ def health(port: int, timeout: float = 0.75) -> dict[str, Any] | None:
 
 def _different_host_version_error() -> RuntimeError:
     return RuntimeError(
-        "A different ReplayLab host version is already running; close all "
+        "A different Bread Host version is already running; close all "
         "qrenderdoc instances before upgrading"
     )
 
 
 def _host_identity_contract_error(source: str) -> RuntimeError:
     return RuntimeError(
-        "A same-version ReplayLab host has an incompatible identity contract "
+        "A same-version Bread Host has an incompatible identity contract "
         "in %s; expected hostStateProtocolVersion=%d and a 32-character "
         "lowercase hexadecimal hostInstanceId. Close all qrenderdoc instances "
         "before retrying"
@@ -596,7 +596,7 @@ def _ensure_generation_lock(root: Path, timeout_seconds: float = 15.0):
                 except OSError:
                     time.sleep(0.05)
         if not locked:
-            raise RuntimeError("timed out acquiring ReplayLab MCP launch lock")
+            raise RuntimeError("timed out acquiring Bread MCP launch lock")
         yield
     finally:
         if locked:
@@ -684,7 +684,7 @@ def _ensure_unlocked(
                 raise _different_host_version_error()
             _identity_from_record(live_state, "host.json")
         time.sleep(0.1)
-    raise RuntimeError("ReplayLab host did not become healthy within 12 seconds")
+    raise RuntimeError("Bread host did not become healthy within 12 seconds")
 
 
 def ensure(root: Path, owner_pid: int, port: int | None = None) -> dict[str, Any]:
@@ -731,7 +731,7 @@ def _serve(root: Path, port: int, owner_pid: int | None = None) -> int:
     from starlette.routing import Route
 
     if not 1024 <= int(port) <= 65535:
-        raise ValueError("ReplayLab port must be between 1024 and 65535")
+        raise ValueError("Bread port must be between 1024 and 65535")
     power_policy = disable_windows_execution_speed_throttling()
     if (
         power_policy.get("supported") is True
@@ -746,7 +746,7 @@ def _serve(root: Path, port: int, owner_pid: int | None = None) -> int:
             context={"operation": "serve"},
         )
         print(
-            "ReplayLab background execution-speed throttling could not be disabled "
+            "Bread background execution-speed throttling could not be disabled "
             "(Win32 error %s)" % power_policy.get("errorCode", "unknown"),
             file=sys.stderr,
         )
@@ -851,7 +851,7 @@ def _serve(root: Path, port: int, owner_pid: int | None = None) -> int:
     emit_console_event(
         "host",
         "info",
-        "ReplayLab Host 已完成初始化并开始监听。",
+        "Bread AI 服务已完成初始化并开始监听。",
         phase="lifecycle",
         code="host.ready",
         context={"operation": "serve"},
@@ -879,7 +879,7 @@ def serve(root: Path, port: int, owner_pid: int | None = None) -> int:
     emit_console_event(
         "host",
         "info",
-        "ReplayLab Host 正在启动。",
+        "Bread AI 服务正在启动。",
         phase="lifecycle",
         code="host.starting",
         context={"operation": "serve"},
@@ -890,7 +890,7 @@ def serve(root: Path, port: int, owner_pid: int | None = None) -> int:
         emit_console_event(
             "host",
             "error",
-            "ReplayLab Host 运行失败：%s" % str(exc)[:2048],
+            "Bread AI 服务运行失败：%s" % str(exc)[:2048],
             phase="lifecycle",
             code="host.failed",
             context={"operation": "serve"},
@@ -900,7 +900,7 @@ def serve(root: Path, port: int, owner_pid: int | None = None) -> int:
         emit_console_event(
             "host",
             "info",
-            "ReplayLab Host 已停止。",
+            "Bread AI 服务已停止。",
             phase="lifecycle",
             code="host.stopped",
             context={"operation": "serve"},
@@ -928,7 +928,7 @@ def codex_toml(executable: Path) -> str:
     path = str(executable.resolve()).replace("\\", "/").replace("'", "\\'")
     return "\n".join(
         [
-            "[mcp_servers.replaylab]",
+            "[mcp_servers.Bread]",
             "command = '%s'" % path,
             "args = ['stdio']",
             "startup_timeout_sec = 30",
@@ -940,8 +940,8 @@ def codex_toml(executable: Path) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="ReplayLabMCP",
-        description="External ReplayLab MCP adapter for Codex and IDE clients",
+        prog="BreadMCP",
+        description="External Bread MCP adapter for Codex and IDE clients",
     )
     parser.add_argument(
         "command",
@@ -1011,7 +1011,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 context={"operation": "stdio"},
             )
             print(
-                "ReplayLab background execution-speed throttling could not be disabled "
+                "Bread background execution-speed throttling could not be disabled "
                 "(Win32 error %s)" % power_policy.get("errorCode", "unknown"),
                 file=sys.stderr,
             )

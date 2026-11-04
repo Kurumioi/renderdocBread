@@ -20,6 +20,7 @@ import traceback
 
 from PySide2 import QtCore, QtWidgets
 import renderdoc as rd
+import qrenderdoc as qrd
 
 
 EXPECTED_ALIASES = ["GlobalsCB", "ViewCB", "ToonMainLightCB", "CartoonBasePassCB",
@@ -123,8 +124,8 @@ class _DeliveryProbe(object):
                 if created:
                     # Native BufferViewer deliberately defers reads while
                     # hidden; expose this temporary read-only viewer first.
-                    widget.resize(900, 600)
-                    widget.show()
+                    context.AddDockWindow(widget, qrd.DockReference.TransientPopupArea,
+                                          context.GetPipelineViewer().Widget(), 0.3)
                 self.viewers.append((index, str(block.name), viewer, widget,
                                      created))
             self.viewers_started = time.time()

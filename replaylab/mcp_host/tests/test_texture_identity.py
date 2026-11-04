@@ -63,6 +63,13 @@ def texture_package(name: str) -> bytes:
 
 
 class ImagingTests(unittest.TestCase):
+    def test_png_inflated_payload_cannot_exceed_declared_dimensions(self) -> None:
+        data = bytearray(png_bytes(bytes((1, 2, 3, 255)) * 1024, 32, 32))
+        # Advertise one pixel without changing the much larger IDAT payload.
+        struct.pack_into(">II", data, 16, 1, 1)
+        with self.assertRaisesRegex(ValueError, "exceeds its declared dimensions"):
+            decode_png(bytes(data))
+
     def test_bc1_and_dds_decode(self) -> None:
         # BC1 block: c0 = pure red (0xF800), c1 = pure blue (0x001F), all indices 0 -> red
         block = struct.pack("<HHI", 0xF800, 0x001F, 0)
@@ -163,7 +170,9 @@ class TextureIdentityRetrievalTests(unittest.TestCase):
         self.assertEqual(leader["relativePath"], "Game/Content/Art/Materials/M_CrowFeather.uasset")
         self.assertEqual(leader["facets"]["textureIdentity"]["sameImage"], 1)
         self.assertGreaterEqual(leader["confidence"], 0.6)
-        self.assertIn("identified by content", leader["why"])
+        self.assertIn("matched by content", leader["why"])
+        self.assertIn("strong perceptual matches", leader["why"])
+        self.assertFalse(material["physicalIdentityVerified"])
 
 
 if __name__ == "__main__":

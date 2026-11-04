@@ -110,8 +110,9 @@ class ReplayLabHostTests(unittest.TestCase):
                 for stream in ("stdin", "stdout", "stderr"):
                     self.assertEqual(replaylab_host.subprocess.DEVNULL, options[stream])
                 if os.name == "nt":
-                    self.assertEqual(replaylab_host.subprocess.DETACHED_PROCESS
-                                     | replaylab_host.subprocess.CREATE_NEW_PROCESS_GROUP
+                    # DETACHED_PROCESS overrides CREATE_NO_WINDOW and can let
+                    # the frozen bootloader's child allocate a visible console.
+                    self.assertEqual(replaylab_host.subprocess.CREATE_NEW_PROCESS_GROUP
                                      | replaylab_host.subprocess.CREATE_NO_WINDOW, options["creationflags"])
 
     @staticmethod
@@ -142,7 +143,7 @@ class ReplayLabHostTests(unittest.TestCase):
         pid: int | None = None,
         instance_id: str = "a" * 32,
         protocol_version: int = 2,
-        version: str = "1.13.0",
+        version: str = replaylab_host.SERVICE_VERSION,
     ) -> dict:
         process_id = os.getpid() if pid is None else pid
         replaylab_host._atomic_json(
@@ -463,8 +464,8 @@ class ReplayLabHostTests(unittest.TestCase):
             second = replaylab_host._load_or_create_token(root)
             self.assertEqual(first, second)
             self.assertRegex(first, replaylab_host.TOKEN_PATTERN)
-            snippet = replaylab_host.codex_toml(root / "ReplayLabMCP.exe")
-            self.assertIn("mcp_servers.replaylab", snippet)
+            snippet = replaylab_host.codex_toml(root / "BreadMCP.exe")
+            self.assertIn("mcp_servers.Bread", snippet)
             self.assertIn("args = ['stdio']", snippet)
             self.assertNotIn(first, snippet)
             self.assertNotIn("mcp_servers.renderdoc", snippet)
@@ -1518,7 +1519,7 @@ class ReplayLabHostTests(unittest.TestCase):
     def test_packaged_adapter_host_is_hash_pinned_and_dispatches_fixed_subcommand(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            host = root / "ReplayLabMCP.exe"
+            host = root / "BreadMCP.exe"
             decompiler = root / "cmd_Decompiler.exe"
             host.write_bytes(b"packaged-host")
             decompiler.write_bytes(b"community-decompiler")
@@ -1549,7 +1550,7 @@ class ReplayLabHostTests(unittest.TestCase):
     def test_packaged_d3dcompile_adapter_is_pinned_and_host_dispatches_it(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            host = root / "ReplayLabMCP.exe"
+            host = root / "BreadMCP.exe"
             dll = root / "d3dcompiler_47.dll"
             host.write_bytes(b"packaged-host")
             dll.write_bytes(b"packaged-d3dcompiler")
@@ -1584,7 +1585,7 @@ class ReplayLabHostTests(unittest.TestCase):
     def test_packaged_dxil_assembler_is_pinned_and_host_dispatches_it(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            host = root / "ReplayLabMCP.exe"
+            host = root / "BreadMCP.exe"
             dxc = root / "dxc.exe"
             dll = root / "dxcompiler.dll"
             host.write_bytes(b"packaged-host")
@@ -1642,7 +1643,7 @@ class ReplayLabHostTests(unittest.TestCase):
     def test_packaged_host_never_requires_external_adapter_scripts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            host = root / "ReplayLabMCP.exe"
+            host = root / "BreadMCP.exe"
             dll = root / "d3dcompiler_47.dll"
             spirv_cross = root / "spirv-cross.exe"
             decompiler = root / "cmd_Decompiler.exe"
@@ -1747,7 +1748,7 @@ class ReplayLabHostTests(unittest.TestCase):
                 root = Path(temporary)
                 host = root / "Release"
                 host.mkdir()
-                mcp = host / "ReplayLabMCP.exe"
+                mcp = host / "BreadMCP.exe"
                 runner = host / "ReplayLabShaderTools.exe"
                 dll = host / "d3dcompiler_47.dll"
                 mcp.write_bytes(b"old monolithic Host containing adapters and report modules")
@@ -1977,7 +1978,7 @@ class ReplayLabHostTests(unittest.TestCase):
             root = Path(temporary)
             host = root / "Release" / "ReplayLab"
             host.mkdir(parents=True)
-            names = ("ReplayLabMCP.exe", "ReplayLabInternal.exe", "replaylab-ai.exe")
+            names = ("BreadMCP.exe", "ReplayLabInternal.exe", "replaylab-ai.exe")
             (host / "ReplayLabShaderTools.exe").write_bytes(b"independent-shader-runner")
             for name in names:
                 (host / name).write_bytes(name.encode("ascii"))
@@ -2060,7 +2061,7 @@ class ReplayLabHostTests(unittest.TestCase):
             host.mkdir()
             runner = host / "ReplayLabShaderTools.exe"
             runner.write_bytes(b"fixed-adapter-closure")
-            mcp = host / "ReplayLabMCP.exe"
+            mcp = host / "BreadMCP.exe"
             mcp.write_bytes(b"host-report-version-one")
             dll = host / "d3dcompiler_47.dll"
             dll.write_bytes(b"fixed-compiler-dll")
@@ -2089,7 +2090,7 @@ class ReplayLabHostTests(unittest.TestCase):
     def test_source_diagnostic_does_not_fall_back_to_mcp_without_shader_runner(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "ReplayLabMCP.exe").write_bytes(b"old-full-host")
+            (root / "BreadMCP.exe").write_bytes(b"old-full-host")
             with mock.patch.object(replaylab_tools, "generate_official_toolchain_configs") as generate:
                 with self.assertRaisesRegex(RuntimeError, "ReplayLabShaderTools"):
                     replaylab_tools.configure_environment(root, {"REPLAYLAB_CONFIG_DIR": str(root / "config")})

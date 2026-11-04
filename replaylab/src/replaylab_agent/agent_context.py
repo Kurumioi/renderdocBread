@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
-import re
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -12,7 +10,11 @@ from typing import Any, Mapping, Sequence
 
 from .errors import ConfigurationError
 from .events import default_task_event_root
-from .policy import EFFECTFUL_TOOLS, READ_ONLY_TOOLS, tool_effects
+from .policy import (
+    EFFECTFUL_TOOLS,
+    READ_ONLY_TOOLS,
+    tool_admissible_at_effect_ceiling,
+)
 from .process_env import external_agent_environment, resolved_agent_argv
 from .profiles import Profile
 from .tool_scope import ToolCallScope
@@ -28,9 +30,10 @@ class ProviderContext:
     mcp_executable: Path | None = None
     workspace_base: Path | None = None
     log_root: Path | None = None
-    main_timeout: float = 3600.0
-    max_tool_calls: int = 480
+    main_timeout: float = 86_400.0
     task_id: str = ""
+    conversation_id: str = ""
+    inherit_desktop_capabilities: bool = False
 
     @property
     def protocol(self) -> str:
@@ -53,7 +56,10 @@ class ProviderContext:
             "cursor-workspace" if self.profile.preset == "cursor-acp" else "agent-workspace"
         )
         workspace.mkdir(mode=0o700)
-        if self.profile.preset == "cursor-acp":
+        from .conversation_cleanup import record_workspace_owner
+
+        record_workspace_owner(turn_root, self.task_id, self.conversation_id)
+        if self.profile.preset == "cursor-acp" and not self.inherit_desktop_capabilities:
             from .process_env import ensure_cursor_profile_config, ensure_cursor_workspace
 
             ensure_cursor_profile_config(self.profile)
@@ -61,22 +67,55 @@ class ProviderContext:
         return workspace, turn_root
 
     @staticmethod
-    def cleanup_turn_workspace(turn_root: Path | None) -> None:
+    def cleanup_turn_workspace(turn_root: Path | None) -> dict | None:
         if turn_root is None:
-            return
-        with contextlib.suppress(Exception):
-            resolved = turn_root.resolve(strict=True)
-            if (
-                re.fullmatch(r"native-[0-9a-f]{32}", resolved.name) is not None
-                and not resolved.is_symlink()
-            ):
-                shutil.rmtree(resolved)
+            return None
+        from .agent_diagnostics import get_logger, public_error
+        from .shader_draft_recovery import recover_shader_drafts, retain_owned_work_outputs, validated_turn_root
+        recovery = None
+        try:
+            if not turn_root.exists():
+                return None
+            resolved = validated_turn_root(turn_root)
+            retained = retain_owned_work_outputs(resolved)
+            if retained is not None:
+                get_logger().info("Agent task outputs retained: source=%s count=%s reason=%s",
+                    retained["sourceDirectory"], retained["outputCount"], retained["reason"])
+                return retained
+            recovery = recover_shader_drafts(resolved)
+            if recovery is not None:
+                get_logger().warning("Shader draft recovery: status=%s manifest=%s source=%s reason=%s",
+                    recovery["status"], recovery["manifestPath"], recovery["sourceDirectory"], recovery["reason"])
+                if recovery["sourceRetained"]:
+                    return recovery
+                # A provider can finish a report while Shader copies are being
+                # archived. Do not delete that newly delivered ordinary output.
+                retained = retain_owned_work_outputs(resolved)
+                if retained is not None:
+                    retained["shaderRecovery"] = recovery
+                    return retained
+            # Validate the exact absolute directory again immediately before
+            # recursive deletion; a redirected root must never be removed.
+            shutil.rmtree(validated_turn_root(resolved))
+            return recovery
+        except Exception as error:
+            get_logger().warning("Agent turn cleanup retained %s: %s", turn_root, public_error(error))
+            if recovery is not None:
+                # Archiving may have succeeded before deletion hit a busy
+                # provider file. Keep its usable locator in the final receipt.
+                return {**recovery, "sourceRetained": True, "reason": public_error(error)}
+            return {"schema": "replaylab-shader-draft-recovery/v1", "status": "source-retained",
+                    "sourceRetained": True, "sourceDirectory": str(turn_root), "manifestPath": "",
+                    "recoveryDirectory": "", "files": [], "reason": public_error(error)}
 
     def agent_argv(self) -> list[str]:
         return resolved_agent_argv(self.profile)
 
     def agent_env(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
-        return external_agent_environment(self.profile, dict(extra or {}))
+        # `self.model` is the run's model: the panel's per-request pick when there was
+        # one, otherwise the profile's own.
+        return external_agent_environment(
+            self.profile, dict(extra or {}), model=str(self.model or ""))
 
     def scope(self) -> ToolCallScope:
         return ToolCallScope.from_request(self.context, self.intent)
@@ -90,12 +129,12 @@ def normalized_effects(effects: Sequence[str]) -> frozenset[str]:
 
 
 def child_tool_grant(effects: Sequence[str]) -> frozenset[str]:
-    """Expose read-only tools plus effectful tools inside the connection ceiling."""
+    """Expose Host capabilities permitted by this task's effect ceiling."""
 
     granted = normalized_effects(effects)
     allowed = set(READ_ONLY_TOOLS)
     for name in EFFECTFUL_TOOLS:
-        if tool_effects(name).issubset(granted):
+        if tool_admissible_at_effect_ceiling(name, granted):
             allowed.add(name)
     return frozenset(allowed)
 
@@ -112,7 +151,7 @@ _CODEX_FORBIDDEN_ARGS = frozenset(
 )
 _CODEX_CONFIG_OVERRIDES = (
     'model_provider="replaylab_openai_subscription"',
-    'model_providers.replaylab_openai_subscription.name="ReplayLab OpenAI subscription"',
+    'model_providers.replaylab_openai_subscription.name="Bread OpenAI subscription"',
     "model_providers.replaylab_openai_subscription.requires_openai_auth=true",
     "model_providers.replaylab_openai_subscription.supports_websockets=false",
     'model_providers.replaylab_openai_subscription.wire_api="responses"',
@@ -138,8 +177,11 @@ _CODEX_CONFIG_OVERRIDES = (
     "features.workspace_dependencies=false",
     "features.unbounded_connection_retries=false",
     "apps._default.enabled=false",
-    "features.shell_tool=false",
-    "features.unified_exec=false",
+    # The connector verifies :read-only plus the exact per-turn workspace roots
+    # before the model starts. Native commands may inspect that workspace, while
+    # Shader/project/replay writes continue through the scoped Bread MCP route.
+    "features.shell_tool=true",
+    "features.unified_exec=true",
     "features.skill_mcp_dependency_install=false",
     "features.hooks=false",
     "features.multi_agent=false",
@@ -148,20 +190,21 @@ _CODEX_CONFIG_OVERRIDES = (
     "features.memories=false",
     "project_doc_max_bytes=0",
     "project_doc_fallback_filenames=[]",
-    "tools.view_image=false",
+    "tools.view_image=true",
     'web_search="disabled"',
     'history.persistence="none"',
     "allow_login_shell=false",
 )
 
 
-def harden_codex_argv(argv: Sequence[str]) -> list[str]:
-    """Disable ambient Codex capabilities before adding the one ReplayLab MCP."""
+def harden_codex_argv(argv: Sequence[str], *, inherit_desktop_capabilities: bool = False,
+                      config_overrides: Sequence[str] = ()) -> list[str]:
+    """Scope Codex to a read-only workspace before adding the Bread MCP route."""
 
     values = list(argv)
     if any(value in _CODEX_FORBIDDEN_ARGS for value in values[1:]):
         raise ConfigurationError(
-            "Codex profile command may not override ReplayLab's security configuration"
+            "Codex profile command may not override Bread's security configuration"
         )
     try:
         index = values.index("app-server")
@@ -170,7 +213,14 @@ def harden_codex_argv(argv: Sequence[str]) -> list[str]:
             "Codex profile command must contain the app-server subcommand"
         ) from exc
     hardened = values[:index]
-    for value in _CODEX_CONFIG_OVERRIDES:
+    overrides = _CODEX_CONFIG_OVERRIDES
+    if inherit_desktop_capabilities:
+        # Keep transport reliability/history settings. Do not negate the user's
+        # installed plugins, web/browser/computer tools, skills or permissions.
+        overrides = tuple(value for value in overrides if value.startswith((
+            "model_provider", "model_providers.", "history.persistence=",
+            "features.unbounded_connection_retries=")))
+    for value in (*overrides, *config_overrides):
         hardened.extend(("-c", value))
     hardened.extend(values[index:])
     return hardened

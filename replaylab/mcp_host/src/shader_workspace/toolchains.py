@@ -41,11 +41,6 @@ MAX_CAVEATS = 16
 MAX_CAVEAT_CHARS = 2048
 MAX_SHADER_BYTES = 512 * 1024 * 1024
 MAX_ROUTE_HOPS = 4
-MAX_ROUTE_SUGGESTIONS = 8
-# The Agent owns candidate-pair selection order; this is the Host's ceiling on
-# automatic decompile/compile retry attempts before "attempt-limit-reached"
-# stops the recovery loop. It is a budget, not an execution queue.
-AUTOMATIC_RECOVERY_ATTEMPT_LIMIT = 8
 ROUTE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -837,7 +832,9 @@ def _parse_route(index: int, value: Any, registry: ToolRegistry) -> RouteCapabil
         raise ToolConfigurationError("%s.decompile input must be a binary format" % field)
     if operation_name == "compile" and output_format not in BINARY_FORMATS:
         raise ToolConfigurationError("%s.compile output must be a binary format" % field)
-    if input_format == "hlsl" and operation_name == "compile" and "target_profile" not in operation.placeholders:
+    if (input_format == "hlsl" and operation_name == "compile"
+            and any(api in {"d3d11", "d3d12"} for api in target_apis)
+            and "target_profile" not in operation.placeholders):
         raise ToolConfigurationError(
             "%s HLSL compiler must consume the exact {target_profile} placeholder" % field
         )
@@ -1161,7 +1158,12 @@ class ToolchainCatalog:
         api = _normalize_target_api(target_api)
         if normalized_stage not in STAGES or normalized_stage == "*":
             raise ToolchainRoutingError("a concrete supported shader stage is required")
-        integrity = self._integrity() if require_integrity else {}
+        # A narrow lookup (for example DXIL disassembly evidence during a
+        # workspace status read) must not hash every unrelated compiler and
+        # companion DLL. Check only matching operations, once per lookup.
+        # Keep these checks fresh: neither a previous lookup nor catalog
+        # construction authorizes changed executable/dependency bytes.
+        integrity: dict[tuple[str, str], dict[str, Any]] = {}
         result = []
         for route in self._routes:
             if route.input_format != source or route.output_format != target:
@@ -1172,8 +1174,12 @@ class ToolchainCatalog:
                 continue
             if not allow_reconstructed and route.is_reconstructed:
                 continue
-            if require_integrity and not integrity[(route.tool_id, route.operation)]["available"]:
-                continue
+            if require_integrity:
+                key = (route.tool_id, route.operation)
+                if key not in integrity:
+                    integrity[key] = self.registry.operation_integrity(*key)
+                if not integrity[key]["available"]:
+                    continue
             result.append(route)
         return tuple(sorted(result, key=lambda item: (item.priority, item.route_id)))
 
@@ -1223,6 +1229,8 @@ class ToolchainCatalog:
                 if route.input_format != current or route.output_format in seen:
                     continue
                 next_path = path + (route,)
+                if not set.intersection(*(set(item.target_apis) for item in next_path)):
+                    continue
                 if route.output_format == target:
                     paths.append(next_path)
                 else:
@@ -1335,6 +1343,8 @@ class ToolchainCatalog:
                 if route.input_format != current or route.output_format in seen:
                     continue
                 candidate = path + (route,)
+                if not set.intersection(*(set(item.target_apis) for item in candidate)):
+                    continue
                 if route.output_format == target:
                     discovered.append(candidate)
                 else:
@@ -1370,11 +1380,9 @@ class ToolchainCatalog:
     ) -> dict[str, Any]:
         """Plan a recoverable workspace even when decompilation is unavailable.
 
-        Program logic owns format detection, route enumeration, integrity and
-        the allowed next actions.  AI is permitted to choose among those
-        actions and, only when a fixed reverse compiler route exists, author a
-        provisional source candidate.  The result never authorizes replay
-        apply and never claims original-source or semantic recovery.
+        Program logic reports format, registered routes, integrity and route
+        availability. The caller chooses how to use that evidence. A candidate
+        can replace replay code only through the separate compile and ABI gates.
         """
 
         original = normalize_format(input_format)
@@ -1401,6 +1409,15 @@ class ToolchainCatalog:
             )
         if editable_format is None:
             editable = "hlsl" if original in {"dxbc", "dxil"} else "glsl"
+            if original == "spirv":
+                try:
+                    self.select_round_trip(original, normalized_stage, editable_format="hlsl",
+                                           capture_encoding=original, target_api=api,
+                                           allow_reconstructed=allow_reconstructed)
+                except ToolchainRoutingError:
+                    pass
+                else:
+                    editable = "hlsl"
         else:
             editable = normalize_format(editable_format)
         if editable not in TEXT_FORMATS:
@@ -1475,35 +1492,6 @@ class ToolchainCatalog:
 
         primary_decompile = decompile_paths[0] if decompile_paths else ()
         primary_compile = compile_paths[0] if compile_paths else ()
-        # These are bounded, non-authoritative suggestions for the Agent.  They
-        # are intentionally not an execution queue or an admission allowlist:
-        # every hash-verified candidate in the two inventories below remains
-        # selectable, and the Agent may ignore or reorder these examples after
-        # observing a failure.
-        suggested_pair_indices: list[tuple[int, int]] = []
-        if decompile_paths and compile_paths:
-            frontier = max(len(decompile_paths), len(compile_paths))
-            for index in range(1, frontier):
-                if index < len(decompile_paths):
-                    suggested_pair_indices.append((index, 0))
-                if index < len(compile_paths):
-                    suggested_pair_indices.append((0, index))
-            suggested_pair_indices.extend(
-                (decompile_index, compile_index)
-                for decompile_index in range(1, len(decompile_paths))
-                for compile_index in range(1, len(compile_paths))
-            )
-        suggested_route_pairs = [
-            {
-                "decompileCandidateIndex": decompile_index,
-                "compileCandidateIndex": compile_index,
-                "decompileRouteIds": path_ids(decompile_paths[decompile_index]),
-                "compileRouteIds": path_ids(compile_paths[compile_index]),
-            }
-            for decompile_index, compile_index in suggested_pair_indices[
-                :MAX_ROUTE_SUGGESTIONS
-            ]
-        ]
         diagnostics = [
             {
                 "phase": "decompile",
@@ -1534,81 +1522,6 @@ class ToolchainCatalog:
                 "configuredCandidateCount": len(configured_compile_paths),
             },
         ]
-        allowed_actions: list[dict[str, Any]] = [
-            {
-                "id": "inspect-native-ir",
-                "owner": "program",
-                "requiresCompileRoute": False,
-                "producesExecutableSource": False,
-            }
-        ]
-        if decompile_paths:
-            executable_decompile = bool(compile_paths)
-            allowed_actions.append(
-                {
-                    "id": "run-registered-decompiler",
-                    "owner": "program",
-                    "routeIds": path_ids(primary_decompile),
-                    "requiresCompileRoute": executable_decompile,
-                    "producesExecutableSource": executable_decompile,
-                    "producesExplanatoryIr": not executable_decompile,
-                }
-            )
-            if len(decompile_paths) > 1 or suggested_route_pairs:
-                allowed_actions.append(
-                    {
-                        "id": "retry-registered-decompiler",
-                        "owner": "agent",
-                        "candidateRoutePaths": [
-                            path_ids(path) for path in decompile_paths[1:]
-                        ],
-                        "candidateRoutePairs": suggested_route_pairs,
-                        "automaticAttemptLimit": AUTOMATIC_RECOVERY_ATTEMPT_LIMIT,
-                        "totalAlternativePairCount": max(
-                            0, len(decompile_paths) * len(compile_paths) - 1
-                        ),
-                        "suggestionsAreNonAuthoritative": True,
-                        "maySelectAnyRegisteredCandidatePair": True,
-                        "agentOwnsSelectionOrder": True,
-                        "doNotRepeatCandidatePair": True,
-                        "stopConditions": [
-                            "executable-source-baseline-compile-verified",
-                            "attempt-limit-reached",
-                            "no-untried-registered-pair",
-                            "capture-identity-or-provenance-conflict",
-                            "baseline-interface-evidence-unavailable",
-                        ],
-                        "requiresCompileRoute": executable_decompile,
-                        "producesExecutableSource": executable_decompile,
-                        "producesExplanatoryIr": not executable_decompile,
-                    }
-                )
-        if compile_paths:
-            allowed_actions.extend(
-                [
-                    {
-                        "id": "seed-reviewed-asset-source",
-                        "owner": "program-or-ai-selection",
-                        "requiresExactIdentityAndFreshAbiValidation": True,
-                        "producesExecutableSource": True,
-                    },
-                    {
-                        "id": "construct-provisional-source",
-                        "owner": "ai",
-                        "requiresExplicitHashBoundPromotion": True,
-                        "producesExecutableSource": True,
-                    },
-                ]
-            )
-        else:
-            allowed_actions.append(
-                {
-                    "id": "install-or-register-format-provider",
-                    "owner": "user-or-program-owner",
-                    "producesExecutableSource": False,
-                }
-            )
-
         chosen = list(primary_decompile) + list(primary_compile)
         if not api and any(
             "target_api"
@@ -1673,17 +1586,6 @@ class ToolchainCatalog:
                 else [],
             },
             "diagnostics": diagnostics,
-            "allowedActions": allowed_actions,
-            "aiPolicy": {
-                "mayClassifyDiagnostics": True,
-                "agentOwnsTechnicalRoute": True,
-                "mayIgnoreRouteSuggestions": True,
-                "maySelectAnyRegisteredCandidatePair": True,
-                "mayReplanAfterConclusiveFailure": True,
-                "mayAuthorProvisionalSource": bool(compile_paths),
-                "maySupplyCommandOrExecutable": False,
-                "mayAuthorizeApply": False,
-            },
             "containsReconstructedSource": any(
                 item.is_reconstructed for item in primary_decompile
             ),
@@ -1888,6 +1790,7 @@ class ToolchainCatalog:
             )
         elif original in {"spirv", "opengl-spirv"}:
             editable_candidates = (
+                *(("hlsl",) if original == "spirv" else ()),
                 "glsl",
                 *_NATIVE_EDITABLE_FALLBACKS.get(original, ()),
             )

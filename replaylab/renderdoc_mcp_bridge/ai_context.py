@@ -292,7 +292,7 @@ def _normalise_shader(value):
     raw_hash = _text(value.get("rawSha256", ""), "shader raw SHA-256", 64).lower()
     if raw_hash and not _SHA256_RE.match(raw_hash):
         raise ContextProtocolError("shader raw SHA-256 is invalid")
-    return {
+    result = {
         "stage": stage,
         "resourceId": resource_id,
         "entryPoint": _text(value.get("entryPoint", ""), "shader entry point", 4096),
@@ -300,6 +300,21 @@ def _normalise_shader(value):
         "exactRawBytesAvailable": bool(raw_hash),
         "displayName": _text(value.get("displayName", ""), "shader display name", 4096),
     }
+    original = value.get("capturedOriginalIdentity")
+    if original is not None:
+        if not isinstance(original, dict):
+            raise ContextProtocolError("captured original Shader identity must be an object")
+        original_id = _resource_id(original.get("resourceId"), "captured Shader resource ID", 1)
+        original_hash = _text(original.get("rawSha256", ""), "captured Shader SHA-256", 64).lower()
+        session = _text(original.get("captureSessionId", ""), "captured Shader session", 32)
+        if (original_id != resource_id or normalise_stage(original.get("stage", "")) != stage
+                or original.get("entryPoint") != result["entryPoint"]
+                or not _SHA256_RE.match(original_hash) or not re.match(r"^[0-9a-f]{32}$", session)):
+            raise ContextProtocolError("captured original Shader identity differs from its binding")
+        result["capturedOriginalIdentity"] = {
+            "resourceId": original_id, "stage": stage, "entryPoint": result["entryPoint"],
+            "rawSha256": original_hash, "captureSessionId": session}
+    return result
 
 
 def _normalise_shaders(values, focus_stage, focus_source, action):

@@ -12,6 +12,7 @@ sandbox.  Only binaries the user has deliberately registered should be run.
 
 from __future__ import annotations
 
+import ctypes as _ctypes
 from dataclasses import dataclass, field
 import fnmatch
 import hashlib
@@ -113,6 +114,100 @@ _LOGICAL_PATH_KEYS = frozenset(("assetpath", "path", "sourcepath"))
 _ATTESTATION_KEY = secrets.token_bytes(32)
 _RESULT_CONSTRUCTOR_TOKEN = object()
 _OUTPUT_VERIFICATION_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _WindowsJobApi:
+    create_job: Any
+    set_information: Any
+    assign_process: Any
+    terminate_job: Any
+    close_handle: Any
+
+
+class _WindowsJobIoCounters(_ctypes.Structure):
+    _fields_ = [
+        (name, _ctypes.c_ulonglong)
+        for name in (
+            "ReadOperationCount",
+            "WriteOperationCount",
+            "OtherOperationCount",
+            "ReadTransferCount",
+            "WriteTransferCount",
+            "OtherTransferCount",
+        )
+    ]
+
+
+class _WindowsJobBasicLimits(_ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", _ctypes.c_longlong),
+        ("PerJobUserTimeLimit", _ctypes.c_longlong),
+        ("LimitFlags", _ctypes.c_uint32),
+        ("MinimumWorkingSetSize", _ctypes.c_size_t),
+        ("MaximumWorkingSetSize", _ctypes.c_size_t),
+        ("ActiveProcessLimit", _ctypes.c_uint32),
+        ("Affinity", _ctypes.c_size_t),
+        ("PriorityClass", _ctypes.c_uint32),
+        ("SchedulingClass", _ctypes.c_uint32),
+    ]
+
+
+class _WindowsJobExtendedLimits(_ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _WindowsJobBasicLimits),
+        ("IoInfo", _WindowsJobIoCounters),
+        ("ProcessMemoryLimit", _ctypes.c_size_t),
+        ("JobMemoryLimit", _ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", _ctypes.c_size_t),
+        ("PeakJobMemoryUsed", _ctypes.c_size_t),
+    ]
+
+
+_WINDOWS_JOB_API_LOCK = threading.Lock()
+_WINDOWS_JOB_API: _WindowsJobApi | None = None
+
+
+def _windows_job_api() -> _WindowsJobApi | None:
+    """Return one typed WinAPI table for all provider child processes."""
+
+    global _WINDOWS_JOB_API
+    if os.name != "nt":
+        return None
+    if _WINDOWS_JOB_API is not None:
+        return _WINDOWS_JOB_API
+    with _WINDOWS_JOB_API_LOCK:
+        if _WINDOWS_JOB_API is not None:
+            return _WINDOWS_JOB_API
+        kernel32 = _ctypes.WinDLL("kernel32", use_last_error=True)
+        create_job = kernel32.CreateJobObjectW
+        create_job.argtypes = [_ctypes.c_void_p, _ctypes.c_wchar_p]
+        create_job.restype = _ctypes.c_void_p
+        set_information = kernel32.SetInformationJobObject
+        set_information.argtypes = [
+            _ctypes.c_void_p,
+            _ctypes.c_int,
+            _ctypes.c_void_p,
+            _ctypes.c_uint32,
+        ]
+        set_information.restype = _ctypes.c_int
+        assign_process = kernel32.AssignProcessToJobObject
+        assign_process.argtypes = [_ctypes.c_void_p, _ctypes.c_void_p]
+        assign_process.restype = _ctypes.c_int
+        terminate_job = kernel32.TerminateJobObject
+        terminate_job.argtypes = [_ctypes.c_void_p, _ctypes.c_uint32]
+        terminate_job.restype = _ctypes.c_int
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [_ctypes.c_void_p]
+        close_handle.restype = _ctypes.c_int
+        _WINDOWS_JOB_API = _WindowsJobApi(
+            create_job=create_job,
+            set_information=set_information,
+            assign_process=assign_process,
+            terminate_job=terminate_job,
+            close_handle=close_handle,
+        )
+        return _WINDOWS_JOB_API
 
 
 class ProviderError(RuntimeError):
@@ -716,75 +811,44 @@ def _assign_windows_kill_job(process: subprocess.Popen[bytes]) -> int | None:
 
     if os.name != "nt":
         return None
+    api = _windows_job_api()
+    if api is None:
+        return None
+    return _assign_windows_kill_job_with_api(process, api)
+
+
+def _assign_windows_kill_job_with_api(
+    process: subprocess.Popen[bytes], api: _WindowsJobApi
+) -> int | None:
+    """Assign one provider process while retaining the full-width job handle."""
+
+    job: Any = None
+    keep_job = False
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        class _BasicLimitInformation(ctypes.Structure):
-            _fields_ = [
-                ("PerProcessUserTimeLimit", ctypes.c_longlong),
-                ("PerJobUserTimeLimit", ctypes.c_longlong),
-                ("LimitFlags", wintypes.DWORD),
-                ("MinimumWorkingSetSize", ctypes.c_size_t),
-                ("MaximumWorkingSetSize", ctypes.c_size_t),
-                ("ActiveProcessLimit", wintypes.DWORD),
-                ("Affinity", ctypes.c_size_t),
-                ("PriorityClass", wintypes.DWORD),
-                ("SchedulingClass", wintypes.DWORD),
-            ]
-
-        class _IoCounters(ctypes.Structure):
-            _fields_ = [
-                ("ReadOperationCount", ctypes.c_ulonglong),
-                ("WriteOperationCount", ctypes.c_ulonglong),
-                ("OtherOperationCount", ctypes.c_ulonglong),
-                ("ReadTransferCount", ctypes.c_ulonglong),
-                ("WriteTransferCount", ctypes.c_ulonglong),
-                ("OtherTransferCount", ctypes.c_ulonglong),
-            ]
-
-        class _ExtendedLimitInformation(ctypes.Structure):
-            _fields_ = [
-                ("BasicLimitInformation", _BasicLimitInformation),
-                ("IoInfo", _IoCounters),
-                ("ProcessMemoryLimit", ctypes.c_size_t),
-                ("JobMemoryLimit", ctypes.c_size_t),
-                ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                ("PeakJobMemoryUsed", ctypes.c_size_t),
-            ]
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-        kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
-        kernel32.SetInformationJobObject.argtypes = (
-            wintypes.HANDLE,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-        )
-        kernel32.AssignProcessToJobObject.argtypes = (
-            wintypes.HANDLE,
-            wintypes.HANDLE,
-        )
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-
-        job = kernel32.CreateJobObjectW(None, None)
+        job = api.create_job(None, None)
         if not job:
             return None
-        information = _ExtendedLimitInformation()
+        information = _WindowsJobExtendedLimits()
         information.BasicLimitInformation.LimitFlags = 0x00002000
-        configured = kernel32.SetInformationJobObject(
-            job, 9, ctypes.byref(information), ctypes.sizeof(information)
+        configured = api.set_information(
+            job, 9, _ctypes.byref(information), _ctypes.sizeof(information)
         )
-        assigned = configured and kernel32.AssignProcessToJobObject(
-            job, wintypes.HANDLE(int(process._handle))
+        assigned = configured and api.assign_process(
+            job, int(process._handle)
         )
         if not assigned:
-            kernel32.CloseHandle(job)
             return None
-        return int(job)
+        value = getattr(job, "value", job)
+        keep_job = True
+        return int(value)
     except (AttributeError, OSError, TypeError, ValueError):
         return None
+    finally:
+        if job and not keep_job:
+            try:
+                api.close_handle(job)
+            except Exception:
+                pass
 
 
 def _terminate_process_tree(
@@ -795,18 +859,21 @@ def _terminate_process_tree(
     """Best-effort bounded termination of the provider and its descendants."""
 
     if os.name == "nt" and windows_job:
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
-            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-            kernel32.TerminateJobObject(wintypes.HANDLE(windows_job), 1)
-            kernel32.CloseHandle(wintypes.HANDLE(windows_job))
+        api = _windows_job_api()
+        terminated = False
+        closed = False
+        if api is not None:
+            try:
+                terminated = bool(api.terminate_job(int(windows_job), 1))
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+            finally:
+                try:
+                    closed = bool(api.close_handle(int(windows_job)))
+                except (AttributeError, OSError, TypeError, ValueError):
+                    pass
+        if terminated or closed:
             return
-        except (AttributeError, OSError, TypeError, ValueError):
-            pass
     elif os.name != "nt":
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -842,6 +909,7 @@ def _terminate_process_tree(
                     shell=False,
                     timeout=1.0,
                     check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
             except (OSError, subprocess.TimeoutExpired):
                 pass

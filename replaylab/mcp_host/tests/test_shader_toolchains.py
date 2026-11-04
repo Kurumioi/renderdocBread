@@ -498,12 +498,7 @@ class ShaderToolchainTests(unittest.TestCase):
             recovery["decompileCandidates"],
         )
         self.assertEqual(["fake-dxbc-hlsl"], recovery["decompileRouteIds"])
-        self.assertTrue(
-            any(
-                action["id"] == "retry-registered-decompiler"
-                for action in recovery["allowedActions"]
-            )
-        )
+        self.assertNotIn("allowedActions", recovery)
         diagnostic = next(
             row
             for row in ambiguous.diagnostic_matrix("fragment")["matrix"]
@@ -537,7 +532,7 @@ class ShaderToolchainTests(unittest.TestCase):
         self.assertEqual("compile-only-recovery", compile_only["mode"])
         self.assertEqual([], compile_only["decompileRouteIds"])
         self.assertEqual(["fake-hlsl-dxbc"], compile_only["compileRouteIds"])
-        self.assertTrue(compile_only["aiPolicy"]["mayAuthorProvisionalSource"])
+        self.assertNotIn("aiPolicy", compile_only)
         self.assertFalse(compile_only["directReplayApplyAuthorized"])
 
         value["routes"] = []
@@ -547,15 +542,10 @@ class ShaderToolchainTests(unittest.TestCase):
         ).plan_recovery("dxbc", "fragment", target_api="d3d11")
         self.assertEqual("evidence-only", evidence_only["mode"])
         self.assertEqual([], evidence_only["compileRouteIds"])
-        self.assertFalse(evidence_only["aiPolicy"]["mayAuthorProvisionalSource"])
-        self.assertTrue(
-            any(
-                action["id"] == "install-or-register-format-provider"
-                for action in evidence_only["allowedActions"]
-            )
-        )
+        self.assertNotIn("aiPolicy", evidence_only)
+        self.assertNotIn("allowedActions", evidence_only)
 
-    def test_recovery_plan_enumerates_alternate_compiler_pairs(self) -> None:
+    def test_recovery_plan_enumerates_alternate_compilers_without_retry_policy(self) -> None:
         value = json.loads(self.routes_path.read_text(encoding="utf-8"))
         compiler = next(
             route
@@ -571,27 +561,11 @@ class ShaderToolchainTests(unittest.TestCase):
         plan = ToolchainCatalog(
             self.tools_path, self.routes_path
         ).plan_recovery("dxbc", "fragment", target_api="d3d11")
-        retry = next(
-            action
-            for action in plan["allowedActions"]
-            if action["id"] == "retry-registered-decompiler"
-        )
-        self.assertEqual(retry["candidateRoutePaths"], [])
-        self.assertEqual(
-            retry["candidateRoutePairs"],
-            [
-                {
-                    "decompileCandidateIndex": 0,
-                    "compileCandidateIndex": 1,
-                    "decompileRouteIds": ["fake-dxbc-hlsl"],
-                    "compileRouteIds": ["fake-hlsl-dxbc-alternate"],
-                }
-            ],
-        )
-        self.assertEqual(8, retry["automaticAttemptLimit"])
-        self.assertEqual(1, retry["totalAlternativePairCount"])
-        self.assertTrue(retry["doNotRepeatCandidatePair"])
-        self.assertIn("attempt-limit-reached", retry["stopConditions"])
+        self.assertEqual(plan["decompileCandidates"], [["fake-dxbc-hlsl"]])
+        self.assertEqual(plan["compileCandidates"], [
+            ["fake-hlsl-dxbc"], ["fake-hlsl-dxbc-alternate"]
+        ])
+        self.assertNotIn("allowedActions", plan)
 
     def test_route_catalog_is_bound_to_exact_registry_and_operation_digest(self) -> None:
         value = json.loads(self.routes_path.read_text(encoding="utf-8"))
@@ -1359,7 +1333,7 @@ class ShaderToolchainTests(unittest.TestCase):
             target_api="vulkan",
         )
         self.assertEqual(plan["mode"], "evidence-only")
-        self.assertEqual(plan["decompileRouteIds"], [])
+        self.assertEqual(plan["decompileRouteIds"], ["spirv-cross-vulkan-hlsl"])
         self.assertEqual(plan["compileRouteIds"], [])
 
     def test_opengl_spirv_routes_never_alias_vulkan_semantics(self) -> None:

@@ -141,6 +141,11 @@
             </File>
           </Component>
 
+          <!-- Bread AI runtime + bundled unpackers; the files themselves are
+               harvested into the BreadRuntimeFiles group by heat. -->
+          <Directory Id='BreadRuntimeDirRef' Name='replaylab' />
+          <Directory Id='BreadIntegrationsDirRef' Name='integrations' />
+
           <Directory Id='qtplugins' Name='qtplugins'>
             <Directory Id='qtplugins_imageformats' Name='imageformats'>
               <Component Id='qt_imgplugin' Guid='6D852A69-D99E-4085-9899-5FA799FF72EA'>
@@ -364,6 +369,9 @@
         <ComponentRef Id='android_plugin' />
         <ComponentRef Id='spirv_plugin' />
         <ComponentRef Id='d3d12_plugin' />
+
+        <ComponentGroupRef Id='BreadRuntimeFiles' />
+        <ComponentGroupRef Id='BreadIntegrationFiles' />
 
         <ComponentRef Id='ProgramMenuDir' />
 

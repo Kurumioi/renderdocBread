@@ -10,6 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -351,7 +352,7 @@ class SourceBoundaryTests(unittest.TestCase):
             "Codex Desktop",
         ):
             self.assertNotIn(marker, combined)
-        self.assertIn("StartCaptureSkill(", assistant)
+        self.assertIn("StartCaptureIntent(", assistant)
         self.assertIn('lit("codex-app-server")', assistant)
         self.assertIn("CurrentContextJSON", integration)
 
@@ -416,9 +417,18 @@ class _Controller(object):
     def __init__(self, pipeline):
         self.pipeline = pipeline
         self.events = []
+        self.current_event = 142
+        self.materialized = True
+        self.replayed_events = []
 
     def SetFrameEvent(self, event_id, force):
         self.events.append((event_id, force))
+        # Mirror ReplayController's public event-selection contract: force=False still repairs
+        # invalidated state or moves to another EID, but an unchanged read performs no replay.
+        if event_id != self.current_event or force or not self.materialized:
+            self.replayed_events.append(event_id)
+            self.current_event = event_id
+            self.materialized = True
 
     def GetPipelineState(self):
         return self.pipeline
@@ -595,6 +605,117 @@ class BridgeContextContractTests(unittest.TestCase):
         self.assertGreater(len(str(target)), 260)
         self.assertEqual(target.read_bytes(), b"dxil")
 
+    def test_atomic_write_retries_transient_windows_replace_without_rewriting(self):
+        target = Path(self._temp.name) / "document.json"
+        real_replace = os.replace
+        real_fsync = os.fsync
+        for winerror in (5, 32, 33):
+            with self.subTest(winerror=winerror):
+                target.write_bytes(b'{"old": true}')
+                attempted_sources = []
+
+                def temporarily_busy(source, destination):
+                    attempted_sources.append(source)
+                    self.assertEqual(target.read_bytes(), b'{"old": true}')
+                    self.assertEqual(Path(source).read_bytes(), b'{"new": true}')
+                    if len(attempted_sources) < 3:
+                        error = PermissionError("reader temporarily holds the target")
+                        error.winerror = winerror
+                        raise error
+                    return real_replace(source, destination)
+
+                with mock.patch.object(self.bridge.os, "replace", side_effect=temporarily_busy), \
+                        mock.patch.object(self.bridge.os, "fsync", wraps=real_fsync) as fsync, \
+                        mock.patch.object(self.bridge.time, "sleep") as sleep:
+                    self.bridge._atomic_write_bytes(str(target), b'{"new": true}')
+                self.assertEqual(len(attempted_sources), 3)
+                self.assertEqual(len(set(attempted_sources)), 1)
+                fsync.assert_called_once()
+                self.assertEqual(sleep.call_args_list, [mock.call(0.01), mock.call(0.02)])
+                self.assertEqual(target.read_bytes(), b'{"new": true}')
+                self.assertEqual(list(target.parent.glob("document.json.tmp.*")), [])
+
+    def test_atomic_write_bounds_persistent_windows_conflict_and_preserves_old_document(self):
+        target = Path(self._temp.name) / "document.json"
+        target.write_bytes(b'{"old": true}')
+        error = PermissionError("persistent reader conflict")
+        error.winerror = 5
+        with mock.patch.object(self.bridge.os, "replace", side_effect=error) as replace, \
+                mock.patch.object(self.bridge.time, "sleep") as sleep:
+            with self.assertRaises(PermissionError) as caught:
+                self.bridge._atomic_write_bytes(str(target), b'{"new": true}')
+        self.assertIs(caught.exception, error)
+        self.assertEqual(replace.call_count, 5)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.01), mock.call(0.02), mock.call(0.04), mock.call(0.08)])
+        self.assertLessEqual(sum(call.args[0] for call in sleep.call_args_list), 0.15)
+        self.assertEqual(target.read_bytes(), b'{"old": true}')
+        self.assertEqual(list(target.parent.glob("document.json.tmp.*")), [])
+
+    def test_atomic_write_does_not_retry_unrelated_replace_errors(self):
+        target = Path(self._temp.name) / "document.json"
+        for winerror in (None, 2, 87):
+            with self.subTest(winerror=winerror):
+                target.write_bytes(b"previous")
+                error = OSError("unrelated replace failure")
+                if winerror is not None:
+                    error.winerror = winerror
+                with mock.patch.object(self.bridge.os, "replace", side_effect=error) as replace, \
+                        mock.patch.object(self.bridge.time, "sleep") as sleep:
+                    with self.assertRaises(OSError) as caught:
+                        self.bridge._atomic_write_bytes(str(target), b"replacement")
+                self.assertIs(caught.exception, error)
+                replace.assert_called_once()
+                sleep.assert_not_called()
+                self.assertEqual(target.read_bytes(), b"previous")
+                self.assertEqual(list(target.parent.glob("document.json.tmp.*")), [])
+
+    @unittest.skipUnless(os.name == "nt", "Win32 reader sharing regression")
+    def test_manifest_publish_recovers_after_actual_windows_reader_releases_handle(self):
+        import ctypes
+        from ctypes import wintypes
+
+        self.bridge._publish_instance_manifest()
+        target = Path(self.bridge.INSTANCE_FILE)
+        previous_document = target.read_bytes()
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        create_file.restype = wintypes.HANDLE
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        # Permit readers/writers, but intentionally omit FILE_SHARE_DELETE:
+        # this is a real sharing conflict, not a mocked os.replace exception.
+        handle = create_file(str(target), 0x80000000, 0x00000001 | 0x00000002,
+                             None, 3, 0x00000080, None)
+        self.assertNotEqual(handle, ctypes.c_void_p(-1).value)
+        self.assertIsNotNone(handle)
+
+        def release_reader(_delay):
+            nonlocal handle
+            self.assertEqual(target.read_bytes(), previous_document)
+            self.assertTrue(close_handle(handle))
+            handle = None
+
+        self.bridge._capture_session_id = "d" * 32
+        real_replace = os.replace
+        try:
+            with mock.patch.object(self.bridge.os, "replace", wraps=real_replace) as replace, \
+                    mock.patch.object(self.bridge.time, "sleep", side_effect=release_reader) as sleep:
+                self.bridge._publish_instance_manifest(activity=True)
+        finally:
+            if handle is not None:
+                close_handle(handle)
+        self.assertEqual(replace.call_count, 2)
+        sleep.assert_called_once_with(0.01)
+        manifest = json.loads(target.read_text("utf-8"))
+        self.assertEqual(manifest["captureSessionId"], "d" * 32)
+        self.assertEqual(manifest["instanceId"], self.bridge.INSTANCE_ID)
+        self.assertTrue(manifest["captureLoaded"])
+        self.assertFalse(manifest["stopped"])
+        self.assertEqual(list(target.parent.glob("instance.json.tmp.*")), [])
+
     def test_bridge_reads_exact_current_event_shader_texture_and_marker_context(self):
         first = self.bridge._build_current_renderdoc_context()
         second = self.bridge._build_current_renderdoc_context()
@@ -614,7 +735,23 @@ class BridgeContextContractTests(unittest.TestCase):
         self.assertIsNone(first["shaders"]["focused"])
         self.assertEqual(first["texture"]["resourceId"], "444")
         self.assertEqual(first["texture"]["pickedPixel"], {"x": 320, "y": 180})
-        self.assertIn((142, True), self.controller.events)
+        self.assertEqual(self.controller.events, [(142, False), (142, False)])
+        self.assertEqual(self.controller.replayed_events, [])
+
+    def test_context_read_materializes_invalidated_state_without_forced_replay(self):
+        first = self.bridge._build_current_renderdoc_context()
+        self.controller.materialized = False
+        self.controller.GetShader = lambda pipeline, resource, entry: types.SimpleNamespace(
+            entryPoint=entry.name, rawBytes=b"changed-shader")
+
+        second = self.bridge._build_current_renderdoc_context()
+
+        self.assertEqual(self.controller.replayed_events, [142])
+        self.assertNotEqual(first["snapshotId"], second["snapshotId"])
+        self.assertEqual(
+            second["shaders"]["bound"][1]["rawSha256"],
+            __import__("hashlib").sha256(b"changed-shader").hexdigest(),
+        )
 
     def test_only_internal_stage_scoped_ui_path_can_mark_shader_focus_explicit(self):
         untrusted = self.bridge._get_current_renderdoc_context(
@@ -673,10 +810,24 @@ class BridgeContextContractTests(unittest.TestCase):
             json.loads(self.bridge.poll_native_context_freeze_json(begin["jobId"])),
             terminal,
         )
+        self.assertEqual(self.controller.events, [(142, False)])
+        self.assertEqual(self.controller.replayed_events, [])
+
+    def test_async_native_context_freeze_materializes_invalidated_current_event(self):
+        self.controller.materialized = False
+        begin = json.loads(self.bridge.begin_native_context_freeze_json("fragment"))
+
+        self.bridge._ctx.replay.run_next()
+
+        terminal = json.loads(Path(begin["resultPath"]).read_text("utf-8"))
+        self.assertEqual(terminal["status"], "completed")
+        self.assertEqual(self.controller.events, [(142, False)])
+        self.assertEqual(self.controller.replayed_events, [142])
 
     def test_delayed_begin_binds_expected_events_and_omits_later_texture(self):
         self.bridge._ctx.current_event = 99
         self.bridge._ctx.selected_event = 98
+        self.controller.current_event = 99
 
         begin = json.loads(self.bridge.begin_native_context_freeze_json(
             "fragment", "142", "140", "a" * 32
@@ -693,8 +844,9 @@ class BridgeContextContractTests(unittest.TestCase):
             for warning in context["warnings"]
         ))
         self.assertEqual(
-            self.controller.events[-2:], [(142, True), (99, True)]
+            self.controller.events[-2:], [(142, False), (99, True)]
         )
+        self.assertEqual(self.controller.replayed_events, [142, 99])
 
     def test_delayed_begin_rejects_session_mismatch_and_invalid_action(self):
         with self.assertRaisesRegex(RuntimeError, "capture session changed"):
@@ -756,7 +908,7 @@ class BridgeContextContractTests(unittest.TestCase):
         self.assertEqual(terminal["status"], "failed")
         self.assertIn("synthetic stage failure", terminal["error"])
         self.assertEqual(
-            self.controller.events[-2:], [(142, True), (99, True)]
+            self.controller.events[-2:], [(142, False), (99, True)]
         )
         self.assertEqual(len(writes), 1)
 

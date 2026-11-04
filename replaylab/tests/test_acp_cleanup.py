@@ -6,6 +6,87 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_windows_job_keeps_64_bit_handles_and_terminates_descendants() -> None:
+    import replaylab_agent.connectors.acp as acp_connector
+
+    job_handle = 0x1234567887654321
+    process_handle = 0x2345678998765432
+    closed: list[int] = []
+    terminated: list[tuple[int, int]] = []
+    assigned: list[tuple[int, int]] = []
+
+    api = acp_connector._WindowsJobApi(
+        create_job=lambda security, name: (
+            job_handle if security is None and name is None else 0
+        ),
+        set_information=lambda handle, info_class, pointer, size: (
+            handle == job_handle
+            and info_class
+            == acp_connector._WindowsJob._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION
+            and pointer is not None
+            and size > 0
+        ),
+        open_process=lambda access, inherit, pid: (
+            process_handle
+            if access
+            == (
+                acp_connector._WindowsJob._PROCESS_SET_QUOTA
+                | acp_connector._WindowsJob._PROCESS_TERMINATE
+            )
+            and inherit is False
+            and pid == 4242
+            else 0
+        ),
+        assign_process=lambda job, process: (
+            assigned.append((job, process)) or True
+        ),
+        terminate_job=lambda handle, code: (
+            terminated.append((handle, code)) or True
+        ),
+        close_handle=lambda handle: closed.append(handle) or True,
+    )
+
+    job = acp_connector._WindowsJob._assign_with_api(4242, api)
+
+    assert job is not None
+    assert job.handle == job_handle
+    assert assigned == [(job_handle, process_handle)]
+    assert closed == [process_handle]
+
+    job.close()
+    job.close()
+
+    assert terminated == [(job_handle, 0)]
+    assert closed == [process_handle, job_handle]
+
+
+def test_windows_job_closes_handle_when_termination_fails() -> None:
+    import replaylab_agent.connectors.acp as acp_connector
+
+    closed: list[int] = []
+
+    def fail_termination(handle: int, code: int) -> bool:
+        del handle, code
+        raise OSError("termination failed")
+
+    api = acp_connector._WindowsJobApi(
+        create_job=lambda security, name: 0,
+        set_information=lambda *args: False,
+        open_process=lambda *args: 0,
+        assign_process=lambda *args: False,
+        terminate_job=fail_termination,
+        close_handle=lambda handle: closed.append(handle) or True,
+    )
+    job = acp_connector._WindowsJob()
+    job.handle = 0x1234567887654321
+    job.assigned = True
+    job._api = api
+
+    job.close()
+
+    assert closed == [0x1234567887654321]
+
+
 @pytest.mark.asyncio
 async def test_managed_agent_process_closes_windows_pipe_transport_before_return(
     monkeypatch,

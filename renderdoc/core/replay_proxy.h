@@ -50,6 +50,18 @@ enum class ReplayControlOperation : uint32_t
   BufferPatches = 4,
   // Optional capability: operation 2 retains its original payload for revision-5 peers.
   CheckpointStatsWithPlan = 5,
+  SetEventShader = 6,
+  ClearEventShader = 7,
+  ClearEventShaders = 8,
+  ClearEventShaderResource = 9,
+  ApplyEventShaders = 10,
+  RestoreEventShaders = 11,
+  // New optional operations keep the original SetEventShader wire payload unchanged.
+  SetEventShaderFloatOutput = 12,
+  EventShaderPreviewTexture = 13,
+  // Optional resource-scoped Shader transactions; older peers remain event-only.
+  ReplaceTargetShaderChecked = 14,
+  RemoveTargetShaderReplacementChecked = 15,
 };
 
 enum ReplayProxyPacket
@@ -591,6 +603,17 @@ public:
                              ResourceId &id, rdcstr &errors);
   IMPLEMENT_FUNCTION_PROXIED(void, ReplaceResource, ResourceId from, ResourceId to);
   IMPLEMENT_FUNCTION_PROXIED(void, RemoveReplacement, ResourceId id);
+  rdcstr ReplaceTargetShaderChecked(ResourceId from, ResourceId to) override;
+  rdcstr RemoveTargetShaderReplacementChecked(ResourceId id) override;
+  rdcstr SetEventShaderOverride(uint32_t eventId, ShaderStage stage, ResourceId expectedOriginal,
+                                ResourceId replacement, uint32_t outputTarget = ~0U,
+                                bool independentFloatOutput = false) override;
+  TextureDescription GetEventShaderPreviewTexture(uint32_t eventId, ShaderStage stage) override;
+  void ClearEventShaderOverride(uint32_t eventId, ShaderStage stage) override;
+  void ClearEventShaderOverrides() override;
+  void ClearEventShaderOverridesForResource(ResourceId id) override;
+  rdcstr ApplyEventShaderOverrides(uint32_t eventId) override;
+  void RestoreEventShaderOverrides() override;
   IMPLEMENT_FUNCTION_PROXIED(void, ClearReplayCache);
   IMPLEMENT_FUNCTION_PROXIED(void, ReloadShaderDebugInformation);
 

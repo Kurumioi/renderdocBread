@@ -23,7 +23,8 @@ from typing import Any
 from .asset_catalog import AssetCatalogService
 
 ASSET_INDEX_OPERATION_SCHEMA = "replaylab-internal-asset-index/v1"
-CHECKPOINT_SECONDS = 90.0
+# A checkpoint is one commit of the live index (cheap), so keep readers current.
+CHECKPOINT_SECONDS = 30.0
 
 _JOBS: dict[str, dict[str, Any]] = {}
 _GUARD = threading.Lock()
@@ -58,6 +59,13 @@ def ensure_index_job(
         job = _JOBS.get(key)
         if job is not None and job.get("status") == "running":
             return _public(job)
+        # Bind/reset the catalog synchronously before advertising a running
+        # job.  On Windows a locked incompatible database now fails this call
+        # explicitly; it can never be relabelled by the worker in the
+        # background after the caller was told startup succeeded.
+        AssetCatalogService(database_path).prepare_root(
+            asset_root, build_id=build_id
+        )
         job = {"status": "running", "startedAt": time.monotonic(), "progress": {}, "result": None,
                "error": None, "depth": depth, "owner": owner}
         _JOBS[key] = job
@@ -67,9 +75,29 @@ def ensure_index_job(
 
         def _run() -> None:
             try:
-                job["result"] = AssetCatalogService(database_path).scan(
+                catalog = AssetCatalogService(database_path)
+                result = catalog.scan(
                     asset_root, build_id=build_id, scan_mode="incremental", depth=depth,
                     progress=_progress, checkpoint_seconds=CHECKPOINT_SECONDS)
+                if depth == "names":
+                    # Root selection must stay cheap and bounded.  A names-only
+                    # catalog is enough for scoped search/direct reads; hashing
+                    # every byte in a large unpacked game is an explicit deeper
+                    # indexing effect, not a side effect of changing projects.
+                    result["contentManifest"] = {
+                        "ready": False,
+                        "deferred": True,
+                        "reasonCode": "names-only-index",
+                    }
+                else:
+                    job["progress"] = {
+                        **dict(job.get("progress") or {}),
+                        "phase": "content-manifest",
+                    }
+                    result["contentManifest"] = catalog.refresh_content_manifest(
+                        asset_root
+                    )
+                job["result"] = result
                 job["status"] = "done"
             except Exception as error:  # surfaced through status()
                 job["error"] = str(error)[:400]

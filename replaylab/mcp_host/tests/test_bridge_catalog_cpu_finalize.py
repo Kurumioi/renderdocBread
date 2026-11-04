@@ -256,6 +256,57 @@ def test_synchronous_export_also_runs_parser_after_replay_callback_returns(rig):
     assert Path(result["catalogPath"]).is_file()
 
 
+@pytest.mark.parametrize("retained", [True, False])
+def test_replaced_catalog_preserves_original_identity_without_candidate_dxil(rig, monkeypatch, retained):
+    module = rig.module
+    before = module._export_shader_catalog(rig.params())
+    baseline = json.loads(Path(before["catalogPath"]).read_text(encoding="utf-8"))
+    unused_access, original_layout = rig.snapshot_parser(
+        REAL_SHAPE_DXIL, baseline["shaders"][0]["constantBlocks"])
+    candidate = b"different active replacement DXIL"
+    active_reflection = _native(rig, dxil_reflection(candidate))
+    owner = {
+        "captureSessionId": module._capture_session_id,
+        "captureToken": module._active_capture_token, "api": "d3d12",
+        "originalResource": 77, "expectedOriginalResourceId": 77,
+        "expectedOriginalSha256": hashlib.sha256(rig.blob).hexdigest(),
+        "stageName": "fragment", "entryPoint": "main",
+        "candidateRawSha256": hashlib.sha256(candidate).hexdigest(),
+        "capturedOriginalReflection": rig.reflection,
+        "capturedDxilLayoutEvidence": original_layout if retained else None,
+    }
+    module._shared_shader_replacements[77] = owner
+    module._shared_shader_replacement_capture_token = module._active_capture_token
+
+    def active_shader(*arguments):
+        rig.require_replay()
+        return active_reflection
+
+    def reject_disassembly(*arguments):
+        raise AssertionError("replacement disassembly must never identify the original")
+
+    monkeypatch.setattr(rig.controller, "GetShader", active_shader)
+    monkeypatch.setattr(rig.controller, "DisassembleShader", reject_disassembly)
+    parameters = dict(rig.params(), output_dir=str(rig.output.parent / "replaced"),
+                      expected_stable_capture_id=before["stableCaptureId"],
+                      expected_stable_identity_evidence_sha256=before["stableIdentityEvidenceSha256"])
+    after = module._export_shader_catalog(parameters)
+    catalog = json.loads(Path(after["catalogPath"]).read_text(encoding="utf-8"))
+    for field in ("captureId", "stableCaptureId", "identityEvidenceSha256", "stableIdentityEvidenceSha256"):
+        assert after[field] == before[field]
+    assert catalog["shaders"][0]["rawSha256"] == hashlib.sha256(rig.blob).hexdigest()
+    assert len(rig.parse_calls) == 1
+    if retained:
+        assert catalog["errors"] == baseline["errors"]
+        assert catalog["shaders"][0]["constantBlocks"] == baseline["shaders"][0]["constantBlocks"]
+    else:
+        assert catalog["shaders"][0]["interfaceComplete"] is False
+        assert all(block["layoutEvidence"]["typeAnnotation"] == "unavailable"
+                   for block in catalog["shaders"][0]["constantBlocks"])
+        assert "Captured-original DXIL layout evidence is unavailable" in catalog["errors"][0]["message"]
+    assert module._shared_shader_replacements[77] is owner
+
+
 def test_synchronous_dispatch_cancel_stops_cpu_phase_before_files(rig):
     collected = rig.collect()
     cancel = threading.Event()

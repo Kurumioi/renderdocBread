@@ -259,7 +259,7 @@
   </action>
   <action name="action_AI_Assistant">
    <property name="text">
-    <string>RenderDoc &amp;AI</string>
+    <string>Bread &amp;AI</string>
    </property>
    <property name="shortcut">
     <string>Ctrl+Shift+A</string>

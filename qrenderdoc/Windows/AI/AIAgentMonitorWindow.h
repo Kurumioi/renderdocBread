@@ -54,6 +54,7 @@ public:
   void Open();
   void OpenEmpty();
   void HideAll();
+  void ForgetTask(const QString &taskId);
   void SetTaskEventRoot(const QString &eventRoot);
   QString TaskEventRoot() const { return m_EventRoot; }
   bool OpenTask(const QString &taskId, QString *error = NULL);

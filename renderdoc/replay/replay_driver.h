@@ -62,6 +62,45 @@ struct BucketForRecord<T, BucketRecordType::Pow2>
   }
 };
 
+// Event overlays do not alter resource mappings. Keys bind cached derived pipelines to the
+// exact live base pipeline (which may itself be a user's shared replacement).
+struct EventShaderOverrideBinding
+{
+  ResourceId original;
+  ResourceId replacement;
+  uint32_t outputTarget = ~0U;
+  bool independentFloatOutput = false;
+};
+
+struct EventShaderPipelineKey
+{
+  ResourceId pipeline;
+  uint32_t eventId = 0;
+  ResourceId replacements[8] = {};
+  uint32_t outputTarget = ~0U;
+  bool independentFloatOutput = false;
+  bool operator<(const EventShaderPipelineKey &other) const
+  {
+    if(pipeline != other.pipeline)
+      return pipeline < other.pipeline;
+    if(eventId != other.eventId)
+      return eventId < other.eventId;
+    for(size_t i = 0; i < ARRAY_COUNT(replacements); i++)
+      if(replacements[i] != other.replacements[i])
+        return replacements[i] < other.replacements[i];
+    if(outputTarget != other.outputTarget)
+      return outputTarget < other.outputTarget;
+    return independentFloatOutput < other.independentFloatOutput;
+  }
+  bool Uses(ResourceId target) const
+  {
+    for(ResourceId replacement : replacements)
+      if(replacement == target)
+        return true;
+    return false;
+  }
+};
+
 struct FrameRecord
 {
   FrameDescription frameInfo;
@@ -187,12 +226,21 @@ class ReplayBufferPatchSet
 public:
   rdcstr Set(ResourceId buffer, uint64_t byteOffset, const bytebuf &data);
   bool Remove(ResourceId buffer, uint64_t byteOffset, uint64_t byteLength);
+  // Remove every layer covering these bytes, retaining other bytes and exact undo identities.
+  bool ResetRange(ResourceId buffer, uint64_t byteOffset, uint64_t byteLength);
   void Clear() { m_Layers.clear(); }
   bool Empty() const { return m_Layers.empty(); }
   rdcarray<ReplayBufferPatch> Flatten() const;
 
 private:
-  rdcarray<ReplayBufferPatch> m_Layers;
+  struct Layer
+  {
+    ResourceId buffer;
+    uint64_t byteOffset = 0;
+    uint64_t byteLength = 0;
+    rdcarray<ReplayBufferPatch> ranges;
+  };
+  rdcarray<Layer> m_Layers;
 };
 
 enum class RemapTexture : uint32_t
@@ -351,6 +399,15 @@ public:
   virtual void GetTextureData(ResourceId tex, const Subresource &sub,
                               const GetTextureDataParams &params, bytebuf &data) = 0;
 
+  virtual ShaderPairComparison ComparePixelShaderPair(uint32_t eventId, ResourceId expectedOriginal,
+                                                       ResourceId baseline, ResourceId candidate)
+  {
+    ShaderPairComparison result;
+    result.eventId = eventId;
+    result.reason = "Single-prefix pixel Shader comparison is not supported by this replay driver";
+    return result;
+  }
+
   virtual void BuildTargetShader(ShaderEncoding sourceEncoding, const bytebuf &source,
                                  const rdcstr &entry, const ShaderCompileFlags &compileFlags,
                                  ShaderStage type, ResourceId &id, rdcstr &errors) = 0;
@@ -373,7 +430,9 @@ public:
   // layer. Unsupported drivers keep these no-op defaults, while a local driver can temporarily
   // bind configured shaders around ReplayController's eReplay_OnlyDraw call.
   virtual rdcstr SetEventShaderOverride(uint32_t eventId, ShaderStage stage,
-                                        ResourceId expectedOriginal, ResourceId replacement)
+                                        ResourceId expectedOriginal, ResourceId replacement,
+                                        uint32_t outputTarget = ~0U,
+                                        bool independentFloatOutput = false)
   {
     return "Event-scoped shader overrides are not supported by this replay driver";
   }
@@ -382,6 +441,8 @@ public:
   virtual void ClearEventShaderOverridesForResource(ResourceId id) {}
   virtual rdcstr ApplyEventShaderOverrides(uint32_t eventId) { return {}; }
   virtual void RestoreEventShaderOverrides() {}
+  virtual TextureDescription GetEventShaderPreviewTexture(uint32_t eventId, ShaderStage stage)
+  { return {}; }
 
   virtual rdcstr SetEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
                                          ResourceId expectedShader, ResourceId expectedBuffer,

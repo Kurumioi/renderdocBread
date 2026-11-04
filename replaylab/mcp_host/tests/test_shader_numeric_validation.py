@@ -15,6 +15,10 @@ MODULE_PATH = Path(__file__).resolve().parents[2] / "renderdoc_mcp_bridge" / "sh
 spec = importlib.util.spec_from_file_location("replaylab_shader_numeric_validation", MODULE_PATH)
 validation = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(validation)
+storage_spec = importlib.util.spec_from_file_location("bread_storage_validation", MODULE_PATH.with_name("shader_storage_validation.py"))
+storage_validation = importlib.util.module_from_spec(storage_spec)
+storage_spec.loader.exec_module(storage_validation)
+validation._storage_module = lambda: storage_validation
 
 
 def descriptor(kind="Float", width=4, count=1, pixels=1, output_kind="color", format_type="Regular"):
@@ -25,6 +29,12 @@ def descriptor(kind="Float", width=4, count=1, pixels=1, output_kind="color", fo
 
 def packed(fmt, *values):
     return struct.pack("<" + fmt * len(values), *values)
+
+
+def native_blob(label):
+    payload = label.encode("ascii")
+    return (b"DXBC" + b"\0" * 16 + struct.pack("<III", 1, 44 + len(payload), 1)
+            + struct.pack("<I", 36) + b"SHDR" + struct.pack("<I", len(payload)) + payload)
 
 
 def test_half_target_allows_one_unit_scale_storage_quantum_but_not_larger_changes():
@@ -102,13 +112,65 @@ def test_exact_regular_output_counts_components_instead_of_pixels(kind, width, f
     assert metrics["accepted"] and metrics["comparedComponents"] == 8
 
 
-def test_changed_packed_output_rejects_but_exact_storage_is_recorded_as_bytes():
-    desc = descriptor("UNorm", width=0, count=4, format_type="ResourceFormatType.R10G10B10A2")
+def test_unknown_packed_output_rejects_but_exact_storage_is_recorded_as_bytes():
+    desc = descriptor("UNorm", width=0, count=4, format_type="ResourceFormatType.BC7")
     raw = b"abcd"
     metrics = validation.compare_bytes(raw, raw, desc)
     assert metrics["accepted"] and metrics["comparisonKind"] == "byte-exact"
     with pytest.raises(ValueError, match="packed/compressed"):
         validation.compare_bytes(raw, b"abce", desc)
+
+
+@pytest.mark.parametrize("bits,mantissa,value", [
+    (0x000, 6, 0.0), (0x001, 6, 2.0 ** -20), (0x03f, 6, 63 * 2.0 ** -20),
+    (0x040, 6, 2.0 ** -14), (0x3c0, 6, 1.0), (0x400, 6, 2.0),
+    (0x7bf, 6, 65024.0), (0x001, 5, 2.0 ** -19), (0x1e0, 5, 1.0),
+    (0x3df, 5, 64512.0),
+])
+def test_packed_unsigned_float_independent_bit_patterns(bits, mantissa, value):
+    assert validation._unsigned_float(bits, mantissa) == value
+
+
+@pytest.mark.parametrize("bits,mantissa,infinite", [(0x7c0, 6, True), (0x7c1, 6, False),
+                                                    (0x3e0, 5, True), (0x3ff, 5, False)])
+def test_packed_unsigned_float_infinity_and_nan(bits, mantissa, infinite):
+    import math
+    value = validation._unsigned_float(bits, mantissa)
+    assert (math.isinf(value) if infinite else math.isnan(value))
+
+
+def test_r11g11b10_checks_rgb_independently_without_relaxing_float_tolerance():
+    desc = descriptor("Float", width=0, count=3, pixels=2, format_type="R11G11B10")
+    one = 0x3c0 | (0x3c0 << 11) | (0x1e0 << 22)
+    before = packed("I", one, one)
+    after = packed("I", one + (1 << 11), one + (1 << 22))
+    result = validation.compare_bytes(before, after, desc)
+    assert result["comparedComponents"] == 6 and result["failedComponents"] == 2
+    assert [(s["x"], s["component"]) for s in result["mismatchSamples"]] == [(0, 1), (1, 2)]
+    assert result["mismatchSamples"][0]["baselineValue"] == 1.0
+    assert result["mismatchSamples"][0]["candidateValue"] == 1.015625
+    assert result["worstMismatch"]["absoluteError"] == 0.03125
+    assert result["mismatchSamples"][0]["allowedAbsoluteError"] == pytest.approx(0.0001 + 0.001 * 1.015625)
+
+
+@pytest.mark.parametrize("code", [0x7c0, 0x7c1])
+def test_identical_packed_nonfinite_values_are_not_accepted(code):
+    raw = packed("I", code)
+    result = validation.compare_bytes(raw, raw, descriptor("Float", width=0, count=3, format_type="R11G11B10"))
+    assert result["byteExact"] and not result["accepted"]
+    assert result["failedComponents"] == result["baselineNonFiniteComponents"] == 1
+
+
+def test_r10g10b10a2_uses_rgb_and_alpha_quantization_separately():
+    desc = descriptor("UNorm", width=0, count=4, format_type="R10G10B10A2")
+    assert validation.compare_bytes(packed("I", 0), packed("I", 1 | (1 << 30)), desc)["accepted"]
+    result = validation.compare_bytes(packed("I", 0), packed("I", 2 | (2 << 30)), desc)
+    assert result["failedComponents"] == 2
+    assert [s["component"] for s in result["mismatchSamples"]] == [0, 3]
+    assert result["mismatchSamples"][0]["allowedAbsoluteError"] == pytest.approx(1.0 / 1023)
+    assert result["mismatchSamples"][1]["allowedAbsoluteError"] == pytest.approx(1.0 / 3)
+    desc["componentType"] = "UInt"
+    assert not validation.compare_bytes(packed("I", 0), packed("I", 1), desc)["accepted"]
 
 
 @pytest.mark.parametrize("before,after", [(b"", b""), (b"1234", b"12")])
@@ -120,6 +182,38 @@ def test_empty_or_size_changed_outputs_are_not_accepted(before, after):
 def test_same_bytes_with_invalid_regular_row_layout_do_not_inflate_coverage():
     with pytest.raises(ValueError, match="row layout"):
         validation.compare_bytes(b"1234", b"1234", descriptor(count=4))
+
+
+def test_mismatch_diagnostics_locate_sparse_channels_without_another_replay():
+    desc = descriptor(count=4, pixels=3)
+    desc["height"] = 2
+    before, after = [0.] * 24, [0.] * 24
+    after[7], after[21] = 0.25, 0.5
+    result = validation.compare_bytes(packed("f", *before), packed("f", *after), desc)
+    assert result["failedComponents"] == 2
+    assert [(s["x"], s["y"], s["component"]) for s in result["mismatchSamples"]] == [(1, 0, 3), (2, 1, 1)]
+    assert result["mismatchBounds"] == {"minX": 1, "minY": 0, "maxX": 2, "maxY": 1}
+    assert result["worstMismatch"]["candidateValue"] == 0.5
+    assert result["worstMismatch"]["allowedAbsoluteError"] == pytest.approx(0.0006)
+    assert result["mismatchSamplesTruncated"] is False
+
+
+def test_mismatch_diagnostics_are_bounded_and_preserve_worst_outside_sample():
+    count = validation.MAX_MISMATCH_SAMPLES + 5
+    result = validation.compare_bytes(packed("f", *([0.] * count)),
+        packed("f", *([1.] * (count - 1) + [2.])), descriptor(pixels=count))
+    assert len(result["mismatchSamples"]) == validation.MAX_MISMATCH_SAMPLES
+    assert result["failedComponents"] == count
+    assert result["mismatchSamplesTruncated"] is True
+    assert result["worstMismatch"]["x"] == count - 1
+    assert result["worstMismatch"]["absoluteError"] == 2
+
+
+def test_nonfinite_mismatch_diagnostics_are_strict_json_values():
+    import json
+    result = validation.compare_bytes(packed("f", float("nan")), packed("f", float("inf")), descriptor())
+    json.dumps(result, allow_nan=False)
+    assert result["mismatchSamples"][0]["reason"] == "non-finite"
 
 
 def texture_format(kind="CompType.Float", width=4):
@@ -189,6 +283,8 @@ class FakeBridge:
         self._capture_session_id = "b" * 32
         self._event_shader_overrides = {}
         self._shared_shader_replacements = ({7: {"originalResource": 7, "targetResource": 999}} if existing else {})
+        self.orphan_targets = []
+        self.orphan_target_limit = 64
         self.ctrl.mapping = 999 if existing else None
         self.replace_failure = None
         self.restore_failure = False
@@ -197,7 +293,7 @@ class FakeBridge:
         self.event = {"eventId": 50, "expectedOriginalResourceId": 7}
         self.params = {"expected_capture_id": "a" * 64, "expected_capture_session_id": self._capture_session_id,
                        "stage": "fragment", "encoding": "dxbc", "entry_point": "MainPS"}
-        for key, blob in (("baseline", b"baseline binary"), ("candidate", b"candidate binary")):
+        for key, blob in (("baseline", native_blob("baseline")), ("candidate", native_blob("candidate"))):
             self.params[key] = {"path": key, "rawSha256": hashlib.sha256(blob).hexdigest()}
 
     def _require_capture_identity(self, value):
@@ -222,7 +318,7 @@ class FakeBridge:
         return [("fragment", "fragment")]
 
     def _read_shader_candidate(self, params):
-        blob = (b"baseline binary" if params["candidate_path"] == "baseline" else b"candidate binary")
+        blob = native_blob("baseline" if params["candidate_path"] == "baseline" else "candidate")
         return None, blob, hashlib.sha256(blob).hexdigest()
 
     def _request_visible_event_id(self, fallback):
@@ -233,7 +329,7 @@ class FakeBridge:
 
     def _validate_live_shader_event(self, ctrl, *args, **kwargs):
         ctrl.event_id = 50
-        return {"reflection": NS(readWriteResources=[]), "pipelineResource": 3}
+        return {"reflection": NS(raw=native_blob("captured"), readWriteResources=[]), "pipelineResource": 3}
 
     def _resource_id_int(self, value):
         return int(value or 0)
@@ -274,6 +370,20 @@ class FakeBridge:
     def _replay(self, fn):
         return fn(self.ctrl)
 
+    def _register_orphan_shader_target(self, target):
+        if target in self.orphan_targets:
+            return False
+        self.orphan_targets.append(target)
+        return True
+
+    def _require_shader_target_build_capacity(self, required_targets=1):
+        if len(self.orphan_targets) + int(required_targets or 0) > self.orphan_target_limit:
+            raise RuntimeError("orphan Shader target limit")
+
+    def _build_target_shader(self, ctrl, entry, encoding, blob, flags, stage):
+        self._require_shader_target_build_capacity(1)
+        return ctrl.BuildTargetShader(entry, encoding, blob, flags, stage)
+
 
 def test_exact_captured_baseline_is_observed_without_building_or_freeing_original():
     bridge = FakeBridge(existing=True)
@@ -295,6 +405,282 @@ def test_ab_observation_restores_prior_replacement_and_visible_event(existing):
     assert not result["semanticEquivalenceVerified"]
     assert bridge.ctrl.mapping == (999 if existing else None)
     assert bridge.ctrl.event_id == 17 and bridge.ctrl.targets == {}
+    assert bridge.ctrl.observe_count == 2
+    assert "baselineStability" not in result
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_native_analysis_avoids_viewer_refresh_for_each_observation(failed):
+    bridge = FakeBridge(existing=True)
+    bridge.ctrl.ReplayFrameEventForAnalysis = lambda event: bridge.ctrl.calls.append(("analysis", event))
+    if failed:
+        bridge.ctrl.output_values[202] = packed("f", 1.5)
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert result["accepted"] is (not failed)
+    assert result["replayMethod"] == "analysis-full"
+    assert bridge.ctrl.calls.count(("analysis", 50)) == (3 if failed else 2)
+    assert [call for call in bridge.ctrl.calls if call[0] == "event"] == [("event", 17)]
+    assert bridge.ctrl.mapping == 999 and bridge.ctrl.targets == {}
+
+
+def test_native_analysis_failure_still_restores_mapping_and_event():
+    bridge = FakeBridge(existing=True)
+    def fail(event):
+        raise RuntimeError("analysis replay failed")
+    bridge.ctrl.ReplayFrameEventForAnalysis = fail
+    with pytest.raises(RuntimeError, match="analysis replay failed"):
+        validation.compare_candidates(bridge, bridge.params)
+    assert bridge.ctrl.mapping == 999 and bridge.ctrl.event_id == 17
+    assert bridge.ctrl.targets == {}
+
+
+def test_original_self_observation_does_not_remove_absent_mapping_per_leg():
+    bridge = FakeBridge()
+    bridge.params["candidate"] = dict(bridge.params["baseline"])
+    bridge.event["expectedOriginalSha256"] = bridge.params["baseline"]["rawSha256"]
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert result["accepted"] is True
+    assert bridge.ctrl.observe_count == 2
+    # Only the unconditional final restoration touches the mapping; neither
+    # observation starts a redundant checked removal/presentation replay.
+    assert bridge.ctrl.calls.count(("remove", 7)) == 1
+    assert bridge.ctrl.build_count == 0
+
+
+def install_pair_result(bridge, candidate=1.0005, repeat=1.0):
+    bridge.event["expectedOriginalSha256"] = bridge.params["baseline"]["rawSha256"]
+    output = NS(resourceId=41, index=0, depth=False,
+                subresource=NS(mip=0, slice=0, sample=0),
+                format=texture_format(), width=1, height=1,
+                baseline=packed("f", 1), candidate=packed("f", candidate),
+                baselineRepeat=packed("f", repeat))
+    pair = NS(eventId=50, supported=True, completed=True, reason="", outputs=[output])
+    def compare(event, original, baseline, target):
+        assert bridge.ctrl.mapping is None
+        bridge.ctrl.calls.append(("paired", event, original, baseline, target))
+        return pair
+    bridge.ctrl.ComparePixelShaderPair = compare
+    return pair
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("api", ["d3d11", "d3d12", "vulkan", "opengl"])
+def test_same_input_pair_uses_native_snapshots_without_installing_candidate(existing, api):
+    bridge = FakeBridge(existing)
+    bridge._shader_api_token = lambda ctrl: api
+    install_pair_result(bridge)
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert result["accepted"] and result["replayRestored"]
+    assert result["replayMethod"] == "same-input-paired-draw"
+    assert result["sampleCount"] == 1
+    assert result["baselineStability"]["byteExact"]
+    assert bridge.ctrl.observe_count == 0
+    assert ("paired", 50, 7, 7, 201) in bridge.ctrl.calls
+    assert ("replace", 201) not in bridge.ctrl.calls
+    assert bridge.ctrl.mapping == (999 if existing else None)
+    assert bridge.ctrl.event_id == 17 and bridge.ctrl.targets == {}
+
+
+def test_same_input_self_comparison_passes_original_resource_without_building():
+    bridge = FakeBridge()
+    install_pair_result(bridge, candidate=1)
+    bridge.params["candidate"] = dict(bridge.params["baseline"])
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert result["accepted"] and bridge.ctrl.build_count == 0
+    assert ("paired", 50, 7, 7, 7) in bridge.ctrl.calls
+
+
+def test_same_input_pair_also_compares_two_nonoriginal_drafts():
+    bridge = FakeBridge(existing=True)
+    install_pair_result(bridge)
+    bridge.event.pop("expectedOriginalSha256")
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert result["accepted"] and result["replayMethod"] == "same-input-paired-draw"
+    assert ("paired", 50, 7, 201, 202) in bridge.ctrl.calls
+    assert bridge.ctrl.build_count == 2 and bridge.ctrl.targets == {}
+    assert bridge.ctrl.observe_count == 0 and bridge.ctrl.mapping == 999
+
+
+def test_same_input_matching_candidate_cannot_hide_unstable_baseline():
+    bridge = FakeBridge()
+    install_pair_result(bridge, candidate=1, repeat=1.5)
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert not result["accepted"]
+    assert result["metrics"]["outputs"][0]["accepted"]
+    assert not result["baselineStability"]["withinTolerance"]
+    assert result["diagnosticCode"] == "baseline-replay-unstable"
+    assert result["candidateDifferenceConclusive"] is False
+    assert bridge.ctrl.observe_count == 0
+
+
+def test_unsupported_native_pair_falls_back_with_reason_and_restores():
+    bridge = FakeBridge(existing=True)
+    pair = install_pair_result(bridge)
+    pair.supported, pair.completed, pair.reason = False, False, "render pass unsupported"
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert result["accepted"]
+    assert result["pairedReplayUnavailable"] == "render pass unsupported"
+    assert result["replayMethod"] == "frame-event"
+    assert bridge.ctrl.observe_count == 2
+    assert bridge.ctrl.mapping == 999 and bridge.ctrl.event_id == 17
+
+
+def test_fallback_failure_preserves_why_same_input_pair_was_unavailable():
+    bridge = FakeBridge()
+    pair = install_pair_result(bridge)
+    pair.supported, pair.completed, pair.reason = False, False, "render pass unsupported"
+    bridge.ctrl.observe_failure = 1
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert not result["accepted"] and result["replayRestored"]
+    assert result["pairedReplayUnavailable"] == "render pass unsupported"
+    assert "unsupported output" in result["reason"]
+
+
+@pytest.mark.parametrize("failure", ["incomplete", "wrong-event", "native-error"])
+def test_started_pair_failure_is_not_retried_or_accepted(failure):
+    bridge = FakeBridge(existing=True)
+    pair = install_pair_result(bridge)
+    if failure == "incomplete":
+        pair.completed, pair.reason = False, "GPU readback unavailable"
+    elif failure == "wrong-event":
+        pair.eventId = 49
+    else:
+        def fail(*unused):
+            raise RuntimeError("native paired failure")
+        bridge.ctrl.ComparePixelShaderPair = fail
+    with pytest.raises(RuntimeError):
+        validation.compare_candidates(bridge, bridge.params)
+    assert bridge.ctrl.observe_count == 0
+    assert bridge.ctrl.mapping == 999 and bridge.ctrl.event_id == 17
+    assert bridge.ctrl.targets == {}
+
+
+@pytest.mark.parametrize("invalid", ["empty", "duplicate", "wrong-slice", "short", "budget"])
+def test_malformed_pair_snapshots_fail_after_restoring_replay(invalid):
+    bridge = FakeBridge()
+    pair = install_pair_result(bridge)
+    output = pair.outputs[0]
+    if invalid == "empty":
+        pair.outputs = []
+    elif invalid == "duplicate":
+        pair.outputs.append(output)
+    elif invalid == "wrong-slice":
+        output.subresource.slice = 1
+    elif invalid == "short":
+        output.candidate = b"\0"
+    else:
+        output.width = 2
+    with mock.patch.object(validation, "OUTPUT_LIMIT", 3 if invalid == "budget" else 32 * 1024 * 1024):
+        result = validation.compare_candidates(bridge, bridge.params)
+    assert not result["accepted"] and result["sampleCount"] == 0
+    assert result["replayRestored"] and bridge.ctrl.event_id == 17
+    assert bridge.ctrl.targets == {}
+
+
+@pytest.mark.parametrize("unstable", [False, True])
+def test_failed_comparison_repeats_baseline_once_without_relaxing_acceptance(unstable):
+    bridge = FakeBridge(existing=True)
+    bridge.ctrl.output_values[202] = packed("f", 1.5)
+    original = bridge.ctrl.GetTextureData
+    def read(resource, subresource):
+        if unstable and bridge.ctrl.observe_count == 2:
+            bridge.ctrl.output_values[201] = packed("f", 1.5)
+        return original(resource, subresource)
+    bridge.ctrl.GetTextureData = read
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert result["accepted"] is False
+    assert result["baselineStability"]["checked"] is True
+    assert result["baselineStability"]["byteExact"] is (not unstable)
+    if unstable:
+        assert result["diagnosticCode"] == "baseline-replay-unstable"
+        assert result["candidateDifferenceConclusive"] is False
+    else:
+        assert "candidateDifferenceConclusive" not in result
+    assert bridge.ctrl.observe_count == 3
+    assert bridge.ctrl.mapping == 999 and bridge.ctrl.event_id == 17
+    assert bridge.ctrl.targets == {}
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_optional_baseline_repeat_honors_cancel_and_diagnostic_budget(cancelled):
+    import threading
+    bridge = FakeBridge()
+    bridge.ctrl.output_values[202] = packed("f", 1.5)
+    cancel = threading.Event()
+    if cancelled:
+        cancel.set()
+    bridge._request_dispatch_context = lambda: {"cancelEvent": cancel}
+    with mock.patch.object(validation, "BASELINE_REPEAT_START_LIMIT_SECONDS", 45 if cancelled else 0):
+        result = validation.compare_candidates(bridge, bridge.params)
+    assert result["accepted"] is False
+    assert result["baselineStability"]["checked"] is False
+    assert bridge.ctrl.observe_count == 2 and bridge.ctrl.targets == {}
+
+
+def test_optional_repeat_checks_cancellation_carried_to_native_replay_thread():
+    import threading
+    bridge = FakeBridge()
+    bridge.ctrl.output_values[202] = packed("f", 1.5)
+    cancelled = threading.Event()
+    cancelled.set()
+    bridge._request_dispatch_context = lambda: None
+    bridge._request_event_tracker = lambda: {"dispatchContext": {"cancelEvent": cancelled}}
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert result["baselineStability"]["reason"] == "request-cancelled-or-preempted"
+    assert bridge.ctrl.observe_count == 2
+
+
+def test_exact_repeated_nonfinite_baseline_is_stable_but_not_within_numeric_policy():
+    bridge = FakeBridge()
+    bridge.ctrl.output_values[201] = packed("f", float("nan"))
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert result["accepted"] is False
+    assert result["baselineStability"]["byteExact"] is True
+    assert result["baselineStability"]["withinTolerance"] is False
+
+
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+def test_optional_repeat_failure_preserves_primary_mismatch_evidence(error_type):
+    bridge = FakeBridge(existing=True)
+    bridge.ctrl.output_values[202] = packed("f", 1.5)
+    read = bridge.ctrl.GetTextureData
+    def fail_third(resource, subresource):
+        if bridge.ctrl.observe_count == 2:
+            raise error_type("third read unavailable")
+        return read(resource, subresource)
+    bridge.ctrl.GetTextureData = fail_third
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert result["accepted"] is False and result["sampleCount"] == 1
+    metric = result["metrics"]["outputs"][0]
+    assert metric["failedComponents"] == 1
+    assert metric["mismatchSamples"][0]["candidateValue"] == 1.5
+    assert result["baselineStability"]["checked"] is False
+    assert result["baselineStability"]["errorType"] == error_type.__name__
+    assert result["replayRestored"] is True
+    assert bridge.ctrl.mapping == 999 and bridge.ctrl.targets == {}
+
+
+def test_optional_repeat_failure_cannot_hide_failed_restoration():
+    bridge = FakeBridge(existing=True)
+    bridge.ctrl.output_values[202] = packed("f", 1.5)
+    bridge.ctrl.observe_failure = 3
+    bridge.restore_failure = True
+    with pytest.raises(RuntimeError, match="replacement failure"):
+        validation.compare_candidates(bridge, bridge.params)
+    assert sorted(bridge.orphan_targets) == [201, 202]
+
+
+@pytest.mark.parametrize("pending,current", [(True, 7), (False, 8)])
+def test_optional_repeat_yields_to_foreground_work_without_selection_event(pending, current):
+    bridge = FakeBridge()
+    bridge.ctrl.output_values[202] = packed("f", 1.5)
+    bridge._request_event_tracker = lambda: {"foregroundReplayGeneration": 7}
+    bridge._foreground_replay_pending = lambda: pending
+    bridge._foreground_replay_generation = lambda: current
+    result = validation.compare_candidates(bridge, bridge.params)
+    assert result["baselineStability"]["checked"] is False
+    assert result["baselineStability"]["reason"].startswith("foreground-replay-")
+    assert result["sampleCount"] == 1 and bridge.ctrl.observe_count == 2
 
 
 @pytest.mark.parametrize("failure", [1, 2])
@@ -305,6 +691,31 @@ def test_build_failure_restores_visible_event_and_releases_earlier_target(failur
         validation.compare_candidates(bridge, bridge.params)
     assert bridge.ctrl.mapping is None and bridge.ctrl.event_id == 17
     assert bridge.ctrl.targets == {}
+
+
+def test_two_target_validation_reserves_capacity_before_first_build():
+    bridge = FakeBridge()
+    bridge.orphan_targets = [object()] * (bridge.orphan_target_limit - 1)
+
+    with pytest.raises(RuntimeError, match="orphan Shader target limit"):
+        validation.compare_candidates(bridge, bridge.params)
+
+    assert bridge.ctrl.build_count == 0
+    assert len(bridge.orphan_targets) == bridge.orphan_target_limit - 1
+
+
+def test_successful_restore_retains_every_target_when_free_permanently_fails():
+    bridge = FakeBridge()
+
+    def fail_free(target):
+        raise RuntimeError("permanent free failure")
+
+    bridge.ctrl.FreeTargetResource = fail_free
+    result = validation.compare_candidates(bridge, bridge.params)
+
+    assert result["accepted"] is True
+    assert sorted(bridge.orphan_targets) == [201, 202]
+    assert sorted(bridge.ctrl.targets) == [201, 202]
 
 
 @pytest.mark.parametrize("failure", [1, 2])
@@ -338,6 +749,7 @@ def test_restore_failure_is_rpc_error_and_does_not_free_possibly_referenced_targ
         validation.compare_candidates(bridge, bridge.params)
     assert len(bridge.ctrl.targets) == 2
     assert not any(call[0] == "free" for call in bridge.ctrl.calls)
+    assert sorted(bridge.orphan_targets) == [201, 202]
 
 
 def test_visible_event_restore_failure_cannot_claim_replay_restored():
@@ -346,6 +758,7 @@ def test_visible_event_restore_failure_cannot_claim_replay_restored():
     with pytest.raises(RuntimeError, match="visible restore failure"):
         validation.compare_candidates(bridge, bridge.params)
     assert len(bridge.ctrl.targets) == 2
+    assert sorted(bridge.orphan_targets) == [201, 202]
 
 
 @pytest.mark.parametrize("target", [201, 202])

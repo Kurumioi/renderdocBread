@@ -2,7 +2,7 @@
 
 This process is deliberately not an MCP server and contains no model/provider
 entry point.  It exposes only the bounded project-management and project-
-restore operations needed by the built-in RenderDoc AI product.  The listener
+restore operations needed by the built-in Bread AI product.  The listener
 is fixed to ``127.0.0.1``, every non-health route requires a per-generation
 random bearer token, and owner PID records bound its lifetime to qrenderdoc.
 
@@ -54,7 +54,12 @@ from .internal_tool_service import (
     project_restore_get_response,
     project_restore_post_response,
 )
-from .version import INTERNAL_HOST_STATE_PROTOCOL_VERSION, SERVICE_VERSION
+from .version import (
+    INTERNAL_HOST_CAPABILITY_SCHEMA,
+    INTERNAL_HOST_CAPABILITY_VERSIONS,
+    INTERNAL_HOST_STATE_PROTOCOL_VERSION,
+    SERVICE_VERSION,
+)
 
 
 SERVICE_NAME = "ReplayLabInternal"
@@ -78,6 +83,7 @@ MAX_OPERATION_CACHE = 256
 OPERATION_CACHE_TTL_SECONDS = 10 * 60.0
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,128}$")
 INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+INTERNAL_HOST_CAPABILITIES = tuple(INTERNAL_HOST_CAPABILITY_VERSIONS)
 REQUEST_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -119,7 +125,7 @@ def _write_generation_token(root: Path) -> str:
     _secure_directory(root)
     token = secrets.token_urlsafe(32)
     if TOKEN_PATTERN.fullmatch(token) is None:
-        raise RuntimeError("generated ReplayLab internal token is invalid")
+        raise RuntimeError("generated Bread internal token is invalid")
     target = _paths(root)["token"]
     temporary = target.with_name(
         "%s.tmp.%d.%d" % (target.name, os.getpid(), time.time_ns())
@@ -225,7 +231,7 @@ def choose_port(root: Path, requested: int | None = None) -> int:
             configured = int(raw)
     if configured is not None:
         if not 1024 <= int(configured) <= 65535:
-            raise ValueError("ReplayLab internal port must be between 1024 and 65535")
+            raise ValueError("Bread internal port must be between 1024 and 65535")
         return int(configured)
     previous = _state_port(root)
     candidates = ([previous] if previous is not None else []) + list(
@@ -234,7 +240,7 @@ def choose_port(root: Path, requested: int | None = None) -> int:
     for candidate in dict.fromkeys(candidates):
         if _port_is_free(candidate):
             return int(candidate)
-    raise RuntimeError("no free ReplayLab internal loopback port is available")
+    raise RuntimeError("no free Bread internal loopback port is available")
 
 
 def health(port: int, timeout: float = 0.75) -> dict[str, Any] | None:
@@ -289,7 +295,7 @@ def _validate_generation(
 ) -> str:
     state = _fresh_state(root, port)
     if state is None:
-        raise RuntimeError("ReplayLab internal Host state is stale or unavailable")
+        raise RuntimeError("Bread internal Host state is stale or unavailable")
     instance = current.get("hostInstanceId")
     if (
         current.get("version") != SERVICE_VERSION
@@ -306,7 +312,7 @@ def _validate_generation(
         or state.get("endpoint")
         != "http://127.0.0.1:%d/replaylab/internal" % int(port)
     ):
-        raise RuntimeError("ReplayLab internal Host identity is incompatible")
+        raise RuntimeError("Bread internal Host identity is incompatible")
     return instance
 
 
@@ -346,7 +352,7 @@ def _ensure_lock(root: Path, timeout_seconds: float = 15.0):
                 except OSError:
                     time.sleep(0.05)
         if not locked:
-            raise RuntimeError("timed out acquiring ReplayLab internal launch lock")
+            raise RuntimeError("timed out acquiring Bread internal launch lock")
         yield
     finally:
         if locked:
@@ -459,7 +465,7 @@ def ensure(root: Path, owner_pid: int, port: int | None = None) -> dict[str, Any
                 }
             time.sleep(0.1)
     raise RuntimeError(
-        "ReplayLab internal Host did not become healthy within %d seconds"
+        "Bread internal Host did not become healthy within %d seconds"
         % int(HOST_STARTUP_TIMEOUT_SECONDS)
     )
 
@@ -738,12 +744,20 @@ def _dispatch_project_operation(
 class ProjectOperationRegistry:
     """Serialise and deduplicate bounded high-level project mutations."""
 
+    # How long a request waits for the operation before it; past that the
+    # caller is told what is running instead of timing out its own transport.
+    LOCK_WAIT_SECONDS = 20.0
+    # Operations without side effects run outside the serialising lock: the
+    # project window's list must open while an activation is still validating.
+    READ_ONLY_OPERATIONS = frozenset({"list-projects"})
+
     def __init__(self, service: Any):
         self.service = service
         self._lock = threading.RLock()
         self._results: OrderedDict[str, tuple[float, str, int, dict[str, Any]]] = (
             OrderedDict()
         )
+        self._running: tuple[str, float] | None = None
 
     def _purge(self, now: float) -> None:
         expired = [
@@ -770,73 +784,151 @@ class ProjectOperationRegistry:
         digest = hashlib.sha256(canonical).hexdigest()
         request_id = str(request["requestId"])
         now = time.monotonic()
-        with self._lock:
-            self._purge(now)
-            prior = self._results.get(request_id)
-            if prior is not None:
-                if not hmac.compare_digest(prior[1], digest):
-                    return 409, {
-                        "schema": PROJECT_OPERATION_RESULT_SCHEMA,
-                        "requestId": request_id,
-                        "error": {
-                            "code": "request-id-conflict",
-                            "message": "requestId was already used for another operation",
-                        },
-                    }
-                self._results.move_to_end(request_id)
-                return prior[2], dict(prior[3])
+        operation = str(request["operation"])
+        if operation in self.READ_ONLY_OPERATIONS:
+            return self._execute_read(request, request_id, digest, now)
+        if not self._lock.acquire(timeout=self.LOCK_WAIT_SECONDS):
+            running = self._running
+            detail = ("%s has been running for %d s" % (
+                running[0], int(time.monotonic() - running[1])) if running else
+                "another operation is still running")
+            return 503, {
+                "schema": PROJECT_OPERATION_RESULT_SCHEMA,
+                "requestId": request_id,
+                "error": {
+                    "code": "project-service-busy",
+                    "message": "Bread project service is busy: %s; try again when "
+                               "it finishes" % detail,
+                },
+            }
+        try:
+            return self._execute_locked(request, request_id, digest, now)
+        finally:
+            self._lock.release()
+
+    def _replay(self, request_id: str, digest: str) -> tuple[int, dict[str, Any]] | None:
+        """The cached answer for a repeated requestId, or the 409 for a reused one."""
+
+        prior = self._results.get(request_id)
+        if prior is None:
+            return None
+        if not hmac.compare_digest(prior[1], digest):
+            return 409, {
+                "schema": PROJECT_OPERATION_RESULT_SCHEMA,
+                "requestId": request_id,
+                "error": {
+                    "code": "request-id-conflict",
+                    "message": "requestId was already used for another operation",
+                },
+            }
+        self._results.move_to_end(request_id)
+        return prior[2], dict(prior[3])
+
+    def _execute_read(self, request: Mapping[str, Any], request_id: str,
+                      digest: str, now: float) -> tuple[int, dict[str, Any]]:
+        # Same requestId contract as a mutation, but the read itself runs
+        # outside the lock; if the lock is busy the read is simply not
+        # deduplicated -- it has no side effect to duplicate.
+        if self._lock.acquire(timeout=0.5):
             try:
-                result = _dispatch_project_operation(
-                    self.service, request["operation"], request["parameters"]
-                )
-                if not isinstance(result, dict):
-                    raise RuntimeError("project service returned a non-object")
-                status = 200
-                response = {
-                    "schema": PROJECT_OPERATION_RESULT_SCHEMA,
-                    "requestId": request_id,
-                    "result": result,
-                }
-            except (ActiveProjectError, ValueError) as exc:
-                status = 400
-                response = {
-                    "schema": PROJECT_OPERATION_RESULT_SCHEMA,
-                    "requestId": request_id,
-                    "error": {
-                        "code": "project-operation-rejected",
-                        "message": str(exc)[:4096],
-                    },
-                }
-            except Exception as exc:
-                status = 503
-                response = {
-                    "schema": PROJECT_OPERATION_RESULT_SCHEMA,
-                    "requestId": request_id,
-                    "error": {
-                        "code": "project-service-failed",
-                        "message": ("%s: %s" % (type(exc).__name__, exc))[:4096],
-                    },
-                }
-            encoded = json.dumps(
-                response,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
-            if len(encoded) > MAX_PROJECT_RESPONSE_BYTES:
-                status = 503
-                response = {
-                    "schema": PROJECT_OPERATION_RESULT_SCHEMA,
-                    "requestId": request_id,
-                    "error": {
-                        "code": "project-response-oversized",
-                        "message": "project service response exceeds its byte limit",
-                    },
-                }
-            self._results[request_id] = (now, digest, status, dict(response))
-            self._purge(now)
-            return status, response
+                self._purge(now)
+                replayed = self._replay(request_id, digest)
+                if replayed is not None:
+                    return replayed
+            finally:
+                self._lock.release()
+        try:
+            result = _dispatch_project_operation(
+                self.service, request["operation"], request["parameters"])
+            if not isinstance(result, dict):
+                raise RuntimeError("project service returned a non-object")
+            status, response = 200, {"schema": PROJECT_OPERATION_RESULT_SCHEMA,
+                                     "requestId": request_id, "result": result}
+        except PermissionError as exc:
+            status, response = 403, {
+                "schema": PROJECT_OPERATION_RESULT_SCHEMA, "requestId": request_id,
+                "error": {"code": "project-access-denied", "message": str(exc)[:4096]}}
+        except (ActiveProjectError, ValueError) as exc:
+            status, response = 400, {
+                "schema": PROJECT_OPERATION_RESULT_SCHEMA, "requestId": request_id,
+                "error": {"code": "project-operation-rejected", "message": str(exc)[:4096]}}
+        except Exception as exc:
+            status, response = 503, {
+                "schema": PROJECT_OPERATION_RESULT_SCHEMA, "requestId": request_id,
+                "error": {"code": "project-service-failed",
+                          "message": ("%s: %s" % (type(exc).__name__, exc))[:4096]}}
+        if self._lock.acquire(timeout=0.5):
+            try:
+                self._results[request_id] = (now, digest, status, dict(response))
+                self._purge(now)
+            finally:
+                self._lock.release()
+        return status, response
+
+    def _execute_locked(self, request: Mapping[str, Any], request_id: str,
+                        digest: str, now: float) -> tuple[int, dict[str, Any]]:
+        self._purge(now)
+        replayed = self._replay(request_id, digest)
+        if replayed is not None:
+            return replayed
+        self._running = (str(request["operation"]), time.monotonic())
+        try:
+            result = _dispatch_project_operation(
+                self.service, request["operation"], request["parameters"]
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("project service returned a non-object")
+            status = 200
+            response = {
+                "schema": PROJECT_OPERATION_RESULT_SCHEMA,
+                "requestId": request_id,
+                "result": result,
+            }
+        except PermissionError as exc:
+            status, response = 403, {
+                "schema": PROJECT_OPERATION_RESULT_SCHEMA, "requestId": request_id,
+                "error": {"code": "project-access-denied", "message": str(exc)[:4096]}}
+        except (ActiveProjectError, ValueError) as exc:
+            status = 400
+            response = {
+                "schema": PROJECT_OPERATION_RESULT_SCHEMA,
+                "requestId": request_id,
+                "error": {
+                    "code": "project-operation-rejected",
+                    "message": str(exc)[:4096],
+                },
+            }
+        except Exception as exc:
+            status = 503
+            response = {
+                "schema": PROJECT_OPERATION_RESULT_SCHEMA,
+                "requestId": request_id,
+                "error": {
+                    "code": "project-service-failed",
+                    "message": ("%s: %s" % (type(exc).__name__, exc))[:4096],
+                },
+            }
+        encoded = json.dumps(
+            response,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        if len(encoded) > MAX_PROJECT_RESPONSE_BYTES:
+            status = 503
+            response = {
+                "schema": PROJECT_OPERATION_RESULT_SCHEMA,
+                "requestId": request_id,
+                "error": {
+                    "code": "project-response-oversized",
+                    "message": "project service response exceeds its byte limit",
+                },
+            }
+        self._running = None
+        self._results[request_id] = (now, digest, status, dict(response))
+        self._purge(now)
+        return status, response
 
 
 async def _read_bounded_body(request: Any, maximum: int) -> bytes:
@@ -951,7 +1043,7 @@ def _serve(root: Path, port: int) -> int:
     from starlette.routing import Route, Router
 
     if not 1024 <= int(port) <= 65535:
-        raise ValueError("ReplayLab internal port must be between 1024 and 65535")
+        raise ValueError("Bread internal port must be between 1024 and 65535")
     _secure_directory(root)
     paths = _paths(root)
     token = _write_generation_token(root)
@@ -975,10 +1067,9 @@ def _serve(root: Path, port: int) -> int:
                 "transport": "internal-http",
                 "pid": os.getpid(),
                 "hostInstanceId": instance_id,
-                "capabilities": [
-                    "project-service", "project-restore", "shader-source-save", "shader-live-edit",
-                    "asset-index",
-                ],
+                "capabilities": list(INTERNAL_HOST_CAPABILITIES),
+                "capabilitySchema": INTERNAL_HOST_CAPABILITY_SCHEMA,
+                "capabilityVersions": dict(INTERNAL_HOST_CAPABILITY_VERSIONS),
             }
         )
 
@@ -1145,10 +1236,9 @@ def _serve(root: Path, port: int) -> int:
                 "startedUnixMs": started_ms,
                 "heartbeatUnixMs": int(time.time() * 1000),
                 "ownerPids": live_owners(root),
-                "capabilities": [
-                    "project-service", "project-restore", "shader-source-save", "shader-live-edit",
-                    "asset-index",
-                ],
+                "capabilities": list(INTERNAL_HOST_CAPABILITIES),
+                "capabilitySchema": INTERNAL_HOST_CAPABILITY_SCHEMA,
+                "capabilityVersions": dict(INTERNAL_HOST_CAPABILITY_VERSIONS),
             },
         )
 
@@ -1232,7 +1322,7 @@ def _parser() -> argparse.ArgumentParser:
         description="Private high-level project service for qrenderdoc",
     )
     parser.add_argument(
-        "command", choices=("serve", "ensure", "release", "status")
+        "command", choices=("serve", "ensure", "release", "status", "project-request")
     )
     parser.add_argument("--runtime-dir")
     parser.add_argument("--port", type=int)
@@ -1242,6 +1332,9 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(list(sys.argv[1:] if argv is None else argv))
+    if arguments.command=="project-request":
+        from .project_http_helper import main as project_request
+        return project_request()
     root = (
         Path(arguments.runtime_dir).expanduser().resolve()
         if arguments.runtime_dir

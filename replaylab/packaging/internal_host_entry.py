@@ -22,6 +22,11 @@ def _configure_process() -> None:
 
 
 def main(argv=None) -> int:
+    args=list(sys.argv[1:] if argv is None else argv)
+    if args==["project-request"]:
+        # Transport helpers neither discover compilers nor instantiate services.
+        from src.project_http_helper import main as project_request
+        return project_request()
     _configure_process()
     from src.internal_host import main as run
     return run(argv)

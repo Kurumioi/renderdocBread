@@ -145,6 +145,10 @@ public:
   void ViewTexture(ResourceId ID, CompType typeCast, bool focus) override;
   void ViewFollowedResource(FollowType followType, ShaderStage stage, int32_t index,
                             int32_t arrayElement) override;
+  uint64_t BeginTemporaryOutputFollow(uint32_t index) override;
+  bool UpdateTemporaryOutputFollow(uint64_t token, uint32_t index) override;
+  bool ShowTemporaryTexturePreview(uint64_t token, const TextureDescription &texture) override;
+  bool EndTemporaryOutputFollow(uint64_t token) override;
   ResourceId GetCurrentResource() override;
 
   Subresource GetSelectedSubresource() override;
@@ -163,6 +167,7 @@ public:
 
   uint32_t GetChannelVisibilityBits() override;
   void SetChannelVisibility(bool red, bool green, bool blue, bool alpha) override;
+  void SetFlipY(bool flipped) override;
 
   RenderTargetHistoryView *OpenRenderTargetHistory(ResourceId resource,
                                                    const Subresource &subresource,
@@ -411,6 +416,17 @@ private:
 
   TextureDescription *m_CachedTexture;
   Following m_Following;
+  uint64_t m_TemporaryOutputFollowToken = 0;
+  uint64_t m_NextTemporaryOutputFollowToken = 0;
+  bool m_UpdatingTemporaryOutputFollow = false;
+  Following m_BeforeTemporaryOutputFollow;
+  QPointer<QWidget> m_BeforeTemporaryOutputTab;
+  ResourceId m_BeforeTemporaryOutputResource;
+  CompType m_BeforeTemporaryOutputType = CompType::Typeless;
+  Subresource m_BeforeTemporaryOutputSubresource;
+  TextureDescription m_TemporaryPreviewTexture;
+  bool m_TemporaryPreviewActive = false;
+  uint32_t m_TemporaryPreviewEvent = 0;
   std::map<OutputBindingKey, std::pair<Following, ResourceId>> m_OutputPreferences;
   QMap<ResourceId, TexSettings> m_TextureSettings;
 

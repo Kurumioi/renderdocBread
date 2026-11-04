@@ -277,7 +277,7 @@ TEST_CASE("Explicit configuration directory remains isolated", "[osspecific][con
   CHECK(path == "/data/local/tmp/replay/renderdoc.conf");
   CHECK(FileIO::ConfigOverridePath("/", "renderdoc.conf", false, path));
   CHECK(path == "/renderdoc.conf");
-  for(const rdcstr &directory : {"relative", "D:relative", "/drive-relative", "\\drive-relative",
+  for(const rdcstr directory : {"relative", "D:relative", "/drive-relative", "\\drive-relative",
                                  "\\\\server", "\\\\server\\", "\\\\?\\D:\\config", "D:/bad?name"})
   {
     CHECK_FALSE(FileIO::ConfigOverridePath(directory, "renderdoc.conf", true, path));
@@ -285,7 +285,7 @@ TEST_CASE("Explicit configuration directory remains isolated", "[osspecific][con
   }
   CHECK_FALSE(FileIO::ConfigOverridePath("relative", "renderdoc.conf", false, path));
   CHECK_FALSE(FileIO::ConfigOverridePath("", "renderdoc.conf", false, path));
-  for(const rdcstr &filename : {"../global.conf", "sub/../../global.conf", "/global.conf", "D:/global.conf", ""})
+  for(const rdcstr filename : {"../global.conf", "sub/../../global.conf", "/global.conf", "D:/global.conf", ""})
   {
     CHECK_FALSE(FileIO::ConfigOverridePath("D:/workspace/config", filename, true, path));
     CHECK(path.empty());

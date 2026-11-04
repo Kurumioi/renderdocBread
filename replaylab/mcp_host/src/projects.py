@@ -23,6 +23,8 @@ from typing import Any, Iterator, Mapping, Sequence
 import uuid
 
 from .shader_workspace.io import atomic_write_bytes, atomic_write_json, is_within, read_json_object
+from .shader_workspace.explanations import source_binding_metadata
+from .shader_source_publication import SOURCE_ONLY_PUBLICATION
 from .symbols.matcher import ALIAS_SCHEMA, ALIAS_VERSION, _normalise_catalog
 
 
@@ -47,7 +49,7 @@ MAX_REUSE_CACHE_BYTES = 256 * 1024 * 1024
 MAX_ACTIVE_KNOWLEDGE_REVISION = (1 << 63) - 1
 REUSE_CACHE_SCHEMA = "renderdoc-ultra-project-reuse-cache/v1"
 REUSE_CACHE_VERSION = 1
-REUSE_MATCH_POLICY = "raw-exact-or-code-interface-layout-exact-v2-known-api-source-preparation"
+REUSE_MATCH_POLICY = "raw-exact-or-code-interface-layout-exact-v4-current-source-family"
 REUSE_MATCH_POLICY_SHA256 = hashlib.sha256(REUSE_MATCH_POLICY.encode("utf-8")).hexdigest()
 RESTORE_KNOWLEDGE_SCOPE_SCHEMA = (
     "renderdoc-ultra-project-referenced-knowledge/v1"
@@ -68,6 +70,25 @@ SHADER_INVENTORY_BINDING_SCHEMA = (
 SHADER_INVENTORY_BINDING_VERSION = 1
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 HEX32_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _workspace_publication_scope() -> dict[str, Any]:
+    """The base project stores source/analysis, not navigable UI diagrams.
+
+    ActiveReplayProjectService adds its own published diagrams to this receipt.
+    Explicit-project publication must return the same truthful empty scope so
+    the shared readback validator does not reject an already committed source.
+    """
+    return {
+        "flowchartArtifacts": [],
+        "flowGraphArtifacts": [],
+        "policy": {
+            "flowchartExplanatoryOnly": True,
+            "flowGraphNavigationOnly": True,
+            "physicalEvidence": False,
+            "applyAuthorization": False,
+        },
+    }
 
 _THREAD_LOCKS: dict[str, threading.RLock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
@@ -91,7 +112,9 @@ def _file_bytes(path: Path, maximum: int, label: str) -> bytes:
     size = path.stat().st_size
     if size <= 0 or size > maximum:
         raise ReplayProjectError("%s must contain 1..%d bytes" % (label, maximum))
-    value = path.read_bytes()
+    from .project_read_cache import reading
+    with reading(path):
+        value = path.read_bytes()
     if len(value) != size:
         raise ReplayProjectError("%s changed while it was read" % label)
     return value
@@ -170,6 +193,12 @@ def _compiled_candidate_identity(value: Any) -> dict[str, Any]:
 
     if not isinstance(value, Mapping):
         raise ReplayProjectError("workspace compiled candidate is invalid")
+    if value.get("validationScope") == "manual-edit-unvalidated":
+        from .project_manual_shader import compiled_identity
+        try:
+            return compiled_identity(value, COMPILED_CANDIDATE_SCHEMA, COMPILED_CANDIDATE_VERSION)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ReplayProjectError(str(exc)) from exc
     allowed = {
         "schema",
         "schemaVersion",
@@ -204,6 +233,13 @@ def _compiled_candidate_identity(value: Any) -> dict[str, Any]:
         raise ReplayProjectError(
             "workspace compiled candidate semantic-equivalence policy is invalid"
         )
+    if value.get("kind") == "GLSL" and (
+        profile.get("apiEnvironment") != "opengl"
+        or profile.get("containerFormat") not in {"glsl", "opengl-spirv"}
+        or value.get("rawSha256") != value.get("sourceSha256")
+        or value.get("codeSha256") != value.get("rawSha256")
+    ):
+        raise ReplayProjectError("native GLSL candidate source/API binding is invalid")
     return {
         "schema": COMPILED_CANDIDATE_SCHEMA,
         "schemaVersion": COMPILED_CANDIDATE_VERSION,
@@ -248,7 +284,39 @@ def _compiled_candidate_identity(value: Any) -> dict[str, Any]:
     }
 
 
+def _check_manual_candidate_original(candidate: Mapping[str, Any], original: Mapping[str, Any]) -> None:
+    if candidate.get("validationScope") != "manual-edit-unvalidated":
+        return
+    receipt = candidate["manualApplyReceipt"]
+    if (receipt["originalRawSha256"] != original.get("rawSha256")
+            or receipt["stage"] != original.get("stage")
+            or receipt["entryPoint"] != original.get("entryPoint", "")):
+        raise ReplayProjectError("manual project Shader original identity differs")
+
+
 def _compiler_binding_identity(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping) and value.get("schema") == "bread-native-shader-compiler-binding/v1":
+        expected = {
+            "schema", "schemaVersion", "backend", "api", "sourceFormat", "outputFormat",
+            "compilerContract", "targetProfile", "routePlanSha256", "executionAuthority",
+            "evidenceOnly", "bindingSha256",
+        }
+        profile = value.get("targetProfile")
+        if (set(value) != expected or value.get("schemaVersion") != 1
+                or value.get("backend") != "renderdoc-native" or value.get("api") != "opengl"
+                or value.get("sourceFormat") != "glsl" or value.get("outputFormat") != "glsl"
+                or value.get("compilerContract") != "bread-native-shader-compile/v1"
+                or value.get("executionAuthority") is not False or value.get("evidenceOnly") is not True
+                or not isinstance(profile, Mapping) or profile.get("apiEnvironment") != "opengl"
+                or profile.get("containerFormat") not in {"glsl", "opengl-spirv"}):
+            raise ReplayProjectError("native compiler binding fields/policy are invalid")
+        result = copy.deepcopy(dict(value))
+        claimed = result.pop("bindingSha256")
+        _sha(result["routePlanSha256"], "compilerBinding.routePlanSha256")
+        if _sha(claimed, "compilerBinding.bindingSha256") != _canonical_sha256(result):
+            raise ReplayProjectError("workspace compiler binding hash mismatch")
+        result["bindingSha256"] = claimed
+        return result
     if not isinstance(value, Mapping) or set(value) != {
         "schema",
         "schemaVersion",
@@ -365,6 +433,16 @@ def _compiler_binding_identity(value: Any) -> dict[str, Any]:
         raise ReplayProjectError("workspace compiler binding hash mismatch")
     result["bindingSha256"] = _canonical_sha256(result)
     return result
+
+
+def _validate_native_candidate_binding(candidate: Mapping[str, Any], binding: Any,
+                                       source_format: str) -> None:
+    if candidate.get("kind") != "GLSL":
+        return
+    clean = _compiler_binding_identity(binding)
+    if (clean["schema"] != "bread-native-shader-compiler-binding/v1"
+            or source_format != "glsl" or clean["targetProfile"] != candidate["targetProfile"]):
+        raise ReplayProjectError("native GLSL candidate requires its exact native compiler binding")
 
 
 def _assembly_disassembly_identity(value: Any) -> dict[str, Any]:
@@ -637,6 +715,13 @@ def _inventory_observation(value: Any) -> dict[str, Any]:
     }
 
 
+def _workspace_source_format(value: Mapping[str, Any]) -> str:
+    language = value.get("sourceFormat", "hlsl")
+    if language not in {"hlsl", "glsl"}:
+        raise ReplayProjectError("workspace knowledge source format must be HLSL or GLSL")
+    return language
+
+
 def _inventory_workspace_artifact_identity(value: Any) -> dict[str, Any]:
     """Return the capture-independent identity of inventory-published work.
 
@@ -695,6 +780,8 @@ def _inventory_workspace_artifact_identity(value: Any) -> dict[str, Any]:
             value.get("sourceSha256"), "inventoryWorkspace.sourceSha256"
         ),
     }
+    if _workspace_source_format(value) != "hlsl":
+        identity["sourceFormat"] = _workspace_source_format(value)
     physical = identity["physicalIdentity"]
     if any(
         (
@@ -746,6 +833,8 @@ def _inventory_workspace_artifact_identity(value: Any) -> dict[str, Any]:
     compiled = value.get("compiledCandidate")
     if compiled is not None:
         clean_compiled = _compiled_candidate_identity(compiled)
+        _check_manual_candidate_original(clean_compiled, value)
+        _validate_native_candidate_binding(clean_compiled, compiler_binding, _workspace_source_format(value))
         if (
             clean_compiled["sourceSha256"] != identity["sourceSha256"]
             or clean_compiled["targetProfile"] != identity["targetProfile"]
@@ -767,14 +856,15 @@ def _inventory_workspace_artifact_identity(value: Any) -> dict[str, Any]:
             "originBaselineAbiSha256": clean_compiled[
                 "originBaselineAbiSha256"
             ],
-            "originCandidateAbiSha256": clean_compiled[
-                "originCandidateAbiSha256"
-            ],
             "validationScope": clean_compiled["validationScope"],
             "semanticEquivalenceVerified": clean_compiled[
                 "semanticEquivalenceVerified"
             ],
         }
+        if clean_compiled.get("validationScope") == "manual-edit-unvalidated":
+            identity["compiledArtifact"]["manualApplyReceipt"] = clean_compiled["manualApplyReceipt"]
+        else:
+            identity["compiledArtifact"]["originCandidateAbiSha256"] = clean_compiled["originCandidateAbiSha256"]
     return identity
 
 
@@ -1188,9 +1278,11 @@ def _normalise_shader_inventory(value: Any) -> dict[str, Any]:
                 raise ReplayProjectError("shader inventory constant block is duplicated")
             block_keys.add(block_key)
             blocks.append(block)
+        # Match the Bridge inventory's binding order before recomputing its
+        # aggregate digest; reflection indices need not follow register order.
         blocks.sort(
             key=lambda item: (
-                item["index"], item["path"], item["space"], item["bind"]
+                item["space"], item["bind"], item["index"], item["path"]
             )
         )
         stable_identity = {
@@ -1287,64 +1379,161 @@ def _thread_lock(root: Path) -> threading.RLock:
 
 @contextmanager
 def _project_lock(root: Path) -> Iterator[None]:
+    """Cross-process exclusive lock for one replay project's mutations.
+
+    The lock file carries its owner (pid + process start identity, the same v2
+    payload the active-project selection lock uses), so a lock left behind by a
+    Host that was killed mid-operation is moved aside and reacquired instead of
+    turning the whole project "unavailable" until someone deletes a file by
+    hand. A legacy 32-hex token (written by builds before this) still needs
+    that manual step -- it recorded no owner, so nothing can prove it dead.
+    """
+
+    from . import active_projects as _selection_locks
+
     lock_path = root / ".project-operation.lock"
     token = uuid.uuid4().hex
-    descriptor = None
-    try:
-        descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(descriptor, token.encode("ascii"))
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-    except FileExistsError as exc:
-        raise ReplayProjectError(
-            "project is locked; a stale lock must be reviewed and removed manually"
-        ) from exc
+    payload = _selection_locks._exclusive_project_lock_payload(token)
+    recovered: Path | None = None
+    for attempt in range(2):
+        try:
+            _selection_locks._publish_exclusive_project_lock(lock_path, payload)
+            break
+        except FileExistsError as exc:
+            if attempt or recovered is not None:
+                raise ReplayProjectError(
+                    "project is locked; its owner could not be proven inactive "
+                    "(%s)" % lock_path
+                ) from exc
+            recovered = _selection_locks._archive_recoverable_exclusive_project_lock(lock_path)
+            if recovered is None:
+                raise ReplayProjectError(
+                    "project is locked; a stale lock must be reviewed and removed "
+                    "manually (%s)" % lock_path
+                ) from exc
     try:
         yield
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
         try:
-            if lock_path.read_text(encoding="ascii") == token:
+            snapshot = _selection_locks._lock_snapshot(lock_path)
+            if snapshot is not None and snapshot[0] == payload:
                 lock_path.unlink()
         except OSError:
             pass
+        if recovered is not None:
+            try:
+                recovered.unlink()
+            except OSError:
+                pass
+
+
+def _backup_local_edit(workspace_root: Path, destination: Path, current_bytes: bytes,
+                       *, superseding: bool) -> dict[str, Any] | None:
+    """Keep a person's edit next to the workspace before the project source replaces it.
+
+    The project version is the one every capture applies; a local edit is not
+    lost for that -- it is written to ``ai/local-edits/<time>-<sha8>.hlsl`` so it
+    can be diffed or restored by hand.
+    """
+
+    if not superseding:
+        return None
+    digest = _sha256_bytes(current_bytes)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backups = workspace_root / "ai" / "local-edits"
+    backups.mkdir(parents=True, exist_ok=True)
+    backup = backups / ("%s-%s%s" % (stamp, digest[:8], destination.suffix or ".hlsl"))
+    if not backup.exists():
+        atomic_write_bytes(backup, current_bytes)
+    return {"backupPath": str(backup), "sourceSha256": digest, "bytes": len(current_bytes)}
+
+
+def _write_seeded_workspace_source(
+    root: Path, destination: Path, current_bytes: bytes, source_bytes: bytes,
+    status: Mapping[str, Any], bundle: Mapping[str, Any] | None,
+) -> None:
+    """Replace source and its managed import provenance in one locked transaction.
+
+    A project import's immutable input authenticates the imported revision.
+    Copying a newer head into that workspace must renew that input/receipt too;
+    preserving the previous receipt makes the next restore reject valid bytes.
+    The caller owns both the project and workspace locks and checked source CAS.
+    """
+    if bundle is None:
+        atomic_write_bytes(destination, source_bytes)
+        return
+    from .shader_workspace.project_source import source_receipt, validate_project_source
+
+    manifest_path = root / "manifest.json"
+    before_bytes = _file_bytes(manifest_path, MAX_PROJECT_BYTES, "destination manifest")
+    manifest = json.loads(before_bytes.decode("utf-8"))
+    original = manifest.get("source") or {}
+    if (manifest.get("workspaceId") != status.get("workspaceId")
+            or original.get("projectSource") != status["source"].get("projectSource")
+            or (root / str(original.get("path", ""))).resolve() != destination
+            or manifest.get("baseline", {}).get("rawSha256") != status["baseline"].get("rawSha256")
+            or manifest.get("baseline", {}).get("abiSha256") != status["baseline"].get("abiSha256")
+            or manifest.get("targetProfile") != status.get("targetProfile")
+            or manifest.get("stage") != status.get("stage")
+            or manifest.get("entryPoint", "") != status.get("entryPoint", "")):
+        raise ReplayProjectError("destination project source provenance changed after validation")
+    if source_bytes != bundle["sourceText"].encode("utf-8"):
+        raise ReplayProjectError("verified project source changed before seed")
+    language = bundle.get("sourceFormat", "hlsl")
+    inputs = root / "source-inputs"
+    if inputs.is_symlink() or (inputs.exists() and not inputs.is_dir()):
+        raise ReplayProjectError("project source input directory is redirected")
+    inputs.mkdir(exist_ok=True)
+    input_path = inputs / ("project-%s.%s" % (bundle["sourceSha256"], language))
+    input_existed = input_path.exists()
+    if input_existed or input_path.is_symlink():
+        if _file_bytes(input_path, MAX_SOURCE_BYTES, "project source immutable input") != source_bytes:
+            raise ReplayProjectError("project source immutable input changed")
+    receipt = source_receipt(bundle, input_path.relative_to(root).as_posix())
+    updated = {
+        "path": destination.relative_to(root).as_posix(), "sha256": bundle["sourceSha256"],
+        "entryPoint": bundle["sourceEntryPoint"], "encoding": "utf-8",
+        "lane": "executable-editable", "origin": "verified-project-source",
+        "compileEligible": True, "semanticEquivalenceVerified": False,
+        "baselineRawSha256": manifest["baseline"]["rawSha256"], "projectSource": receipt,
+    }
+    writing = False
+    try:
+        if not input_existed:
+            atomic_write_bytes(input_path, source_bytes)
+        validate_project_source(root, manifest, updated)
+        # Include the provenance CAS in the same operation as the source CAS.
+        if manifest_path.read_bytes() != before_bytes or destination.read_bytes() != current_bytes:
+            raise ReplayProjectError("destination source or manifest changed before seed")
+        writing = True
+        atomic_write_bytes(destination, source_bytes)
+        manifest["source"] = updated
+        manifest["updatedAt"] = _utc_now()
+        atomic_write_json(manifest_path, manifest)
+    except Exception:
+        # Do not roll back a concurrent writer if the CAS failed before writes.
+        if writing:
+            atomic_write_bytes(destination, current_bytes)
+            atomic_write_bytes(manifest_path, before_bytes)
+        if not input_existed:
+            input_path.unlink(missing_ok=True)
+        raise
 
 
 @contextmanager
 def _workspace_seed_lock(root: Path) -> Iterator[None]:
     """Participate in the workspace service's cross-process operation lock.
 
-    This intentionally uses the same fail-closed filename and token ownership
-    rules as the workspace lifecycle without importing its private helpers.
+    Seed/admission uses the same OS ownership and crash recovery as compile;
+    a separate token implementation would strand a recovered workspace here.
     """
-
-    lock_path = root / ".workspace-operation.lock"
-    token = uuid.uuid4().hex + "\n"
-    descriptor = None
+    from .shader_workspace.errors import ManifestValidationError
+    from .shader_workspace.workspace import _WorkspaceFileLock
     try:
-        descriptor = os.open(
-            str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-        )
-        os.write(descriptor, token.encode("ascii"))
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
-    except FileExistsError as exc:
-        raise ReplayProjectError(
-            "destination workspace is locked by another operation"
-        ) from exc
-    try:
-        yield
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        try:
-            if lock_path.read_text(encoding="ascii") == token:
-                lock_path.unlink()
-        except OSError:
-            pass
+        with _WorkspaceFileLock(root):
+            yield
+    except ManifestValidationError as error:
+        raise ReplayProjectError(str(error)) from error
 
 
 def _compact_shader(shader: Mapping[str, Any]) -> dict[str, Any]:
@@ -1396,6 +1585,56 @@ def _shader_identity(value: Mapping[str, Any]) -> tuple[int, str, str, str]:
     )
 
 
+def _recover_legacy_alias_rows(
+    rows: Sequence[Any], capture: Mapping[str, Any]
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """Resolve omitted legacy IDs from this already verified capture catalog.
+
+    Names and physical coordinates are not matching evidence. Only one exact
+    original bytecode/stage/entry-point match can repair a missing ID. Explicit
+    IDs and provenance are left to the normal validators; a conflicting ID is
+    never silently rebound. Unresolvable legacy rows stay in the source artifact
+    and are omitted from this derived view with an actionable diagnostic.
+    """
+
+    by_program: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+    for shader in capture.get("shaders", []):
+        key = (str(shader.get("rawSha256") or ""),
+               str(shader.get("stage") or ""), str(shader.get("entryPoint") or ""))
+        by_program.setdefault(key, []).append(shader)
+    recovered: list[Any] = []
+    diagnostics: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if (not isinstance(row, Mapping)
+                or row.get("verified") is not True
+                or row.get("captureId") != capture.get("captureId")
+                or row.get("shaderResourceId") not in (None, "")):
+            recovered.append(row)
+            continue
+        raw = str(row.get("rawSha256") or "").strip().lower()
+        stage = str(row.get("stage") or "").strip()
+        entry = str(row.get("entryPoint") or "").strip()
+        candidates = by_program.get((raw, stage, entry), []) if SHA256_RE.fullmatch(raw) else []
+        diagnostic: dict[str, Any] = {
+            "rowIndex": index,
+            "status": "skipped",
+            "reasonId": "legacy-alias-shader-identity-unresolved",
+            "candidateCount": len(candidates),
+            "sourcePreserved": True,
+        }
+        if len(candidates) == 1:
+            resource_id = _positive(candidates[0].get("resourceId"), "shader.resourceId")
+            recovered.append({**row, "shaderResourceId": resource_id})
+            diagnostic.update({
+                "status": "repaired",
+                "reasonId": "legacy-alias-shader-resource-id-recovered",
+                "shaderResourceId": resource_id,
+                "matchedBy": "original-bytecode-stage-entry-point",
+            })
+        diagnostics.append(diagnostic)
+    return recovered, diagnostics
+
+
 def _match_mode(knowledge: Mapping[str, Any], shader: Mapping[str, Any]) -> str:
     if (
         knowledge.get("stage") != shader.get("stage")
@@ -1405,6 +1644,10 @@ def _match_mode(knowledge: Mapping[str, Any], shader: Mapping[str, Any]) -> str:
     raw = str(knowledge.get("rawSha256", "") or "")
     if raw and raw == shader.get("rawSha256"):
         return "raw-exact"
+    if (knowledge.get("compiledCandidate") or {}).get("validationScope") == "manual-edit-unvalidated":
+        # A manual edit is associated only with the original captured bytes;
+        # it carries no interface-validation authority for another program.
+        return ""
     code = str(knowledge.get("codeSha256", "") or "")
     if not code or code != shader.get("codeSha256"):
         return ""
@@ -1481,8 +1724,11 @@ def _normalised_catalog_evidence(
 
 
 class ReplayProjectService:
-    def __init__(self, project_path: str | Path):
+    def __init__(self, project_path: str | Path, *, cache_validated_reads: bool = False):
         self.root = _normal_path(project_path)
+        from .project_read_cache import ProjectReadCache
+        self._validated_read = ProjectReadCache()
+        self._cache_validated_reads = cache_validated_reads
 
     @property
     def manifest_path(self) -> Path:
@@ -1789,7 +2035,7 @@ class ReplayProjectService:
         return identity
 
     @classmethod
-    def _workspace_head_key(
+    def _legacy_workspace_head_key(
         cls,
         record: Mapping[str, Any],
         manifest: Mapping[str, Any] | None = None,
@@ -1822,9 +2068,23 @@ class ReplayProjectService:
                     }
                 ),
                 "targetProfile": copy.deepcopy(dict(profile)),
-                "sourceLane": "hlsl",
+                "sourceLane": _workspace_source_format(record),
             }
         )
+
+    @classmethod
+    def _workspace_head_key(
+        cls, record: Mapping[str, Any], manifest: Mapping[str, Any] | None = None,
+    ) -> str:
+        # Source language, compiler versions and reflected names describe a
+        # representation, not another original program. Actual replay admission
+        # still checks the target profile/layout in the destination capture.
+        identity = cls._head_shader_identity(record, baseline_abi=True, manifest=manifest)
+        return _canonical_sha256({
+            "schema": "renderdoc-ultra-project-workspace-head-key/v2",
+            **{key: identity[key] for key in
+               ("api", "encoding", "rawSha256", "stage", "entryPoint")},
+        })
 
     @classmethod
     def _material_head_key(
@@ -1916,7 +2176,7 @@ class ReplayProjectService:
 
     @classmethod
     def _knowledge_head_members(
-        cls, manifest: Mapping[str, Any]
+        cls, manifest: Mapping[str, Any], *, legacy_workspaces: bool = False,
     ) -> dict[str, dict[str, list[dict[str, Any]]]]:
         knowledge = manifest.get("knowledge")
         if not isinstance(knowledge, Mapping):
@@ -1927,7 +2187,7 @@ class ReplayProjectService:
             "aliases": {},
         }
         for kind, key_builder in (
-            ("workspaces", cls._workspace_head_key),
+            ("workspaces", cls._legacy_workspace_head_key if legacy_workspaces else cls._workspace_head_key),
             ("materials", cls._material_head_key),
         ):
             records = knowledge.get(kind)
@@ -2045,9 +2305,18 @@ class ReplayProjectService:
             "aliases",
         }:
             raise ReplayProjectError("project activeHeads index is invalid")
+        legacy_members = None
+        if not isinstance(active_heads.get("workspaces"), dict):
+            raise ReplayProjectError("project activeHeads workspaces index is invalid")
+        if set(active_heads["workspaces"]) != set(members["workspaces"]):
+            # Authenticate the old index using its original algorithm before
+            # merging lanes. Never repair an incomplete/corrupt index by taking
+            # the last arbitrary history record.
+            legacy_members = cls._knowledge_head_members(manifest, legacy_workspaces=True)
+        validation_members = legacy_members or members
         for kind in ("workspaces", "materials", "aliases"):
             heads = active_heads.get(kind)
-            if not isinstance(heads, dict) or set(heads) != set(members[kind]):
+            if not isinstance(heads, dict) or set(heads) != set(validation_members[kind]):
                 raise ReplayProjectError(
                     "project activeHeads %s index is incomplete" % kind
                 )
@@ -2070,11 +2339,23 @@ class ReplayProjectService:
                     or not HEX32_RE.fullmatch(knowledge_id)
                     or knowledge_id
                     not in {
-                        item["knowledgeId"] for item in members[kind][head_key]
+                        item["knowledgeId"] for item in validation_members[kind][head_key]
                     }
                 ):
                     raise ReplayProjectError("project active head binding is invalid")
                 _text(head.get("publishedAt"), "active head publishedAt", 128)
+        if legacy_members is not None:
+            activation = cls._active_knowledge_state(manifest)["workspaces"]
+            current_by_id = {head["knowledgeId"]: head
+                             for head in active_heads["workspaces"].values()}
+            migrated = {}
+            for key, candidates in members["workspaces"].items():
+                active_ids = [item["knowledgeId"] for item in candidates
+                              if item["knowledgeId"] in current_by_id]
+                selected = max(active_ids, key=lambda token: activation[token])
+                migrated[key] = {**current_by_id[selected], "generation": max(
+                    current_by_id[token]["generation"] for token in active_ids)}
+            active_heads["workspaces"] = migrated
         return active_heads
 
     @staticmethod
@@ -2092,9 +2373,10 @@ class ReplayProjectService:
             expected_key != head_key
             or isinstance(generation, bool)
             or not isinstance(generation, int)
-            or generation <= 0
+            or generation < 0
             or generation > MAX_ACTIVE_KNOWLEDGE_REVISION
-            or not HEX32_RE.fullmatch(knowledge_id)
+            or (generation == 0 and knowledge_id != "")
+            or (generation > 0 and not HEX32_RE.fullmatch(knowledge_id))
         ):
             raise ReplayProjectError("expected_head receipt is invalid")
         return {
@@ -2166,7 +2448,7 @@ class ReplayProjectService:
                     "knowledgeId": current["knowledgeId"],
                 }
                 if current is not None
-                else None
+                else {"headKey": head_key, "generation": 0, "knowledgeId": ""}
             )
             if current_token != expected:
                 raise ReplayProjectError(
@@ -2259,6 +2541,27 @@ class ReplayProjectService:
         return revision
 
     def _load(
+        self,
+        *,
+        alias_artifact_cache: dict[str, bytes] | None = None,
+        alias_artifact_knowledge_ids: set[str] | None = None,
+        alias_artifact_cache_max_bytes: int = MAX_ALIAS_BYTES,
+        persist_migrations: bool = False,
+    ) -> dict[str, Any]:
+        # Materialization explicitly requests artifact bytes, so it retains
+        # the ordinary reader. Cached manifests are defensive copies and all
+        # consumed file change identities are checked on every reuse.
+        def load():
+            return self._load_uncached(alias_artifact_cache=alias_artifact_cache,
+                alias_artifact_knowledge_ids=alias_artifact_knowledge_ids,
+                alias_artifact_cache_max_bytes=alias_artifact_cache_max_bytes,
+                persist_migrations=persist_migrations)
+        if (not self._cache_validated_reads or alias_artifact_cache is not None
+                or self.root.is_symlink() or not self.root.is_dir()):
+            return load()
+        return self._validated_read.load(self.manifest_path, load, key=persist_migrations)
+
+    def _load_uncached(
         self,
         *,
         alias_artifact_cache: dict[str, bytes] | None = None,
@@ -2471,7 +2774,9 @@ class ReplayProjectService:
         # Missing state is the sole legacy-v1 migration path. It is derived in
         # memory here and atomically persisted by the next locked mutation.
         self._active_knowledge_state(manifest)
+        heads_before = copy.deepcopy(manifest.get("activeHeads"))
         self._active_heads_state(manifest)
+        migration_required = migration_required or heads_before != manifest.get("activeHeads")
         for record in knowledge["workspaces"]:
             artifact = self._artifact(record.get("sourcePath"), "workspace source")
             if _sha256_bytes(_file_bytes(artifact, MAX_SOURCE_BYTES, "workspace source")) != _sha(record.get("sourceSha256"), "sourceSha256"):
@@ -2490,6 +2795,8 @@ class ReplayProjectService:
             compiled_candidate = record.get("compiledCandidate")
             if compiled_candidate is not None:
                 identity = _compiled_candidate_identity(compiled_candidate)
+                _check_manual_candidate_original(identity, record)
+                _validate_native_candidate_binding(identity, compiler_binding, _workspace_source_format(record))
                 if (
                     identity["sourceSha256"] != record.get("sourceSha256")
                     or identity["targetProfile"] != record.get("targetProfile")
@@ -2634,6 +2941,8 @@ class ReplayProjectService:
         path = (self.root / value).resolve()
         if not is_within(self.root, path):
             raise ReplayProjectError("%s escapes the project" % label)
+        from .project_read_cache import observe_path
+        observe_path(self.root / value, path)
         return path
 
     def _stage_catalog_snapshot(
@@ -2707,11 +3016,30 @@ class ReplayProjectService:
         manifest["updatedAt"] = _utc_now()
         atomic_write_json(self.manifest_path, manifest)
 
+    # How long a status read waits for a mutation on the same project in this
+    # process before reading the manifest as it is on disk.
+    STATUS_LOCK_WAIT_SECONDS = 2.0
+
     def status(self) -> dict[str, Any]:
-        with _thread_lock(self.root), _project_lock(self.root):
-            manifest = self._load(persist_migrations=True)
+        # A read. It used to queue behind every mutation of this project in the
+        # process -- a workspace registration validating DXIL for a minute held
+        # the same RLock -- so the project window's list request timed out at
+        # 90 s and the user saw "Host request outcome is uncertain". Wait
+        # briefly for a consistent snapshot; past that, the manifest on disk is
+        # atomically written and good enough for a status line.
+        # A read takes no file lock: another process holding the project for a
+        # mutation (or a lock it left behind) must not make the project
+        # "unavailable" in the window. Migrations persist on the next mutation.
+        lock = _thread_lock(self.root)
+        busy = not lock.acquire(timeout=self.STATUS_LOCK_WAIT_SECONDS)
+        try:
+              manifest = self._load(persist_migrations=False)
+        finally:
+            if not busy:
+                lock.release()
         knowledge = manifest["knowledge"]
         return {
+            "busy": busy,
             "schema": PROJECT_SCHEMA,
             "schemaVersion": PROJECT_VERSION,
             "projectId": manifest["projectId"],
@@ -3114,6 +3442,15 @@ class ReplayProjectService:
         stale/current decision is made.
         """
 
+        if status.get("manualApplyReceipt") is not None:
+            from .project_manual_shader import candidate_from_status
+            try:
+                return candidate_from_status(status, source_bytes=source_bytes,
+                    workspace_root=workspace_root, manifest_bytes=manifest_bytes,
+                    baseline=baseline, schema=COMPILED_CANDIDATE_SCHEMA,
+                    version=COMPILED_CANDIDATE_VERSION)
+            except (ValueError, KeyError, TypeError, OSError) as exc:
+                raise ReplayProjectError(str(exc)) from exc
         latest = status.get("latestCompiled")
         if latest is None:
             if (
@@ -3319,6 +3656,13 @@ class ReplayProjectService:
                 "semanticEquivalenceVerified": False,
             }
         )
+        _validate_native_candidate_binding(identity, status.get("compilerBinding"),
+                                           str((status.get("source") or {}).get("format")))
+        if identity["kind"] == "GLSL":
+            if (_reuse_api_family((status.get("capture") or {}).get("api")) != "opengl"
+                    or baseline.get("kind") not in {"GLSL", "OPENGL-SPIRV"}
+                    or compiled != revision_source_bytes):
+                raise ReplayProjectError("native GLSL candidate differs from its OpenGL source revision")
         return identity, compiled
 
     def register_workspace(
@@ -3328,7 +3672,14 @@ class ReplayProjectService:
         *,
         include_analysis: bool = True,
         require_current_candidate: bool = False,
+        include_compiled_candidate: bool = True,
     ) -> dict[str, Any]:
+        if type(include_compiled_candidate) is not bool:
+            raise ReplayProjectError("include_compiled_candidate must be a boolean")
+        if require_current_candidate and not include_compiled_candidate:
+            raise ReplayProjectError(
+                "a current compiled candidate cannot be required and omitted"
+            )
         if not isinstance(status, Mapping) or status.get("schema") != "renderdoc-ultra-shader-workspace-status/v1":
             raise ReplayProjectError("workspace status must come from strict workspace validation")
         source = status.get("source")
@@ -3339,16 +3690,13 @@ class ReplayProjectService:
             raise ReplayProjectError("workspace status provenance is incomplete")
         if source.get("present") is not True:
             raise ReplayProjectError("workspace has no decompiled/edited source to register")
-        # Project source reuse is intentionally HLSL-only.  Instruction-level
-        # workspaces such as DXBC assembly have their own executable-editable
-        # lane and fixed filename, but must not be persisted under a .hlsl
-        # artifact or later seeded into an HLSL workspace.
+        # Keep textual source languages separate from instruction-level IR.
         if (
             source.get("lane") != "executable-editable"
-            or source.get("format") != "hlsl"
+            or source.get("format") not in {"hlsl", "glsl"}
         ):
             raise ReplayProjectError(
-                "project workspace source reuse supports only executable-editable HLSL"
+                "project workspace source reuse supports executable-editable HLSL or GLSL"
             )
         source_path = _normal_path(str(source.get("path", "")))
         source_bytes = _file_bytes(source_path, MAX_SOURCE_BYTES, "workspace source")
@@ -3356,19 +3704,26 @@ class ReplayProjectService:
         analysis_path = workspace_root / "ai" / "analysis.md"
         analysis_bytes: bytes | None = None
         analysis_sha256 = ""
+        explanatory_diagnostics: list[dict[str, str]] = []
         if include_analysis and (analysis_path.exists() or analysis_path.is_symlink()):
             if not is_within(workspace_root, analysis_path.resolve()):
                 raise ReplayProjectError("workspace analysis escapes its workspace")
             analysis_bytes = _file_bytes(
                 analysis_path, MAX_ANALYSIS_BYTES, "workspace ai/analysis.md"
             )
-            try:
-                analysis_text = analysis_bytes.decode("utf-8", errors="strict")
-            except UnicodeDecodeError as exc:
-                raise ReplayProjectError("workspace analysis must be UTF-8 text") from exc
-            if "\x00" in analysis_text:
-                raise ReplayProjectError("workspace analysis contains NUL characters")
-            analysis_sha256 = _sha256_bytes(analysis_bytes)
+            provenance = source_binding_metadata(workspace_root, analysis_path, analysis_bytes, status)
+            if provenance["currentSourceMatches"] is False:
+                explanatory_diagnostics.append({"artifact": "ai/analysis.md", "status": "skipped",
+                                                "reason": provenance["reason"]})
+                analysis_bytes, analysis_sha256 = None, ""
+            else:
+                try:
+                    analysis_text = analysis_bytes.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise ReplayProjectError("workspace analysis must be UTF-8 text") from exc
+                if "\x00" in analysis_text:
+                    raise ReplayProjectError("workspace analysis contains NUL characters")
+                analysis_sha256 = _sha256_bytes(analysis_bytes)
         manifest_path = _normal_path(str(status.get("manifestPath", "")))
         manifest_bytes = _file_bytes(manifest_path, MAX_PROJECT_BYTES, "workspace manifest")
         capture_id = _sha(capture_status.get("captureId"), "workspace.captureId")
@@ -3379,6 +3734,12 @@ class ReplayProjectService:
         entry = _text(str(status.get("entryPoint", "") or ""), "workspace.entryPoint", 512, True)
         resource_id = _positive(shader_status.get("resourceId"), "workspace.resourceId")
         raw = _sha(baseline.get("rawSha256"), "workspace.rawSha256")
+        try:
+            from .shader_workspace.semantic_overview_storage import publish_overview
+            publish_overview(self.root, workspace_root, raw, _sha256_bytes(source_bytes))
+        except (ValueError, OSError) as exc:
+            explanatory_diagnostics.append({"artifact": "ai/semantic-overview.json",
+                                            "status": "skipped", "reason": str(exc)[:800]})
         compiler_binding = (
             _compiler_binding_identity(status.get("compilerBinding"))
             if status.get("compilerBinding") is not None
@@ -3434,12 +3795,15 @@ class ReplayProjectService:
                 )
             prepared_disassembly.append((identity, payload))
             seen_disassembly_roles.add(identity["role"])
-        prepared_compiled = self._validated_compiled_candidate(
-            status,
-            source_bytes=source_bytes,
-            workspace_root=workspace_root,
-            manifest_bytes=manifest_bytes,
-            baseline=baseline,
+        prepared_compiled = (
+            self._validated_compiled_candidate(
+                status,
+                source_bytes=source_bytes,
+                workspace_root=workspace_root,
+                manifest_bytes=manifest_bytes,
+                baseline=baseline,
+            )
+            if include_compiled_candidate else None
         )
         if require_current_candidate and (
             prepared_compiled is None
@@ -3455,6 +3819,15 @@ class ReplayProjectService:
                 manifest, capture_id, catalog_revision_sha256
             )
             shader = self._capture_shader(capture, resource_id=resource_id, stage=stage, entry_point=entry, raw_sha256=raw)
+            catalog_code_sha = _sha(shader.get("codeSha256"), "capture.codeSha256", True)
+            workspace_code_sha = _sha(baseline.get("codeSha256"), "workspace.codeSha256", True)
+            # Some executable formats have no separate normalized instruction
+            # hash in the capture catalog. The workspace fingerprints those
+            # bytes with their raw hash. Preserve the catalog's representation
+            # instead of publishing a record that its own reader rejects.
+            if (workspace_code_sha != catalog_code_sha
+                    and not (not catalog_code_sha and workspace_code_sha == raw)):
+                raise ReplayProjectError("workspace code identity differs from its capture")
             material = {
                 "workspaceId": _text(str(status.get("workspaceId", "")), "workspaceId", 64),
                 "captureId": capture_id,
@@ -3463,7 +3836,7 @@ class ReplayProjectService:
                 "stage": stage,
                 "entryPoint": entry,
                 "rawSha256": raw,
-                "codeSha256": _sha(baseline.get("codeSha256"), "workspace.codeSha256", True),
+                "codeSha256": catalog_code_sha,
                 "layoutHash": shader.get("layoutHash", ""),
                 "interfaceHash": shader.get("interfaceHash", ""),
                 "interfaceComplete": shader.get("interfaceComplete") is True,
@@ -3472,6 +3845,12 @@ class ReplayProjectService:
                 "sourceSha256": _sha256_bytes(source_bytes),
                 "analysisSha256": analysis_sha256,
             }
+            if source["format"] != "hlsl":
+                material["sourceFormat"] = source["format"]
+            if not include_compiled_candidate:
+                # Persist this in the content-bound identity: source delivery
+                # must not become auto-apply authority after a fresh compile.
+                material["publicationMode"] = SOURCE_ONLY_PUBLICATION
             if compiler_binding is not None:
                 material["compilerBinding"] = compiler_binding
             if prepared_disassembly:
@@ -3483,7 +3862,7 @@ class ReplayProjectService:
                 material["compiledCandidate"] = compiled_identity
             knowledge_id = _canonical_sha256(material)[:32]
             head_key = self._workspace_head_key(material, manifest)
-            relative = "knowledge/workspaces/%s.hlsl" % knowledge_id
+            relative = "knowledge/workspaces/%s.%s" % (knowledge_id, source["format"])
             destination = self._artifact(relative, "workspace knowledge path")
             analysis_relative = (
                 "knowledge/workspaces/%s.analysis.md" % analysis_sha256
@@ -3513,6 +3892,8 @@ class ReplayProjectService:
                 )
                 return {
                     "knowledge": existing,
+                    **_workspace_publication_scope(),
+                    "explanatoryDiagnostics": explanatory_diagnostics,
                     "idempotent": not head_publication["changed"],
                     "applied": False,
                     "head": {
@@ -3647,6 +4028,8 @@ class ReplayProjectService:
             head_receipt = self._head_receipt("workspaces", head_publication)
             return {
                 "knowledge": record,
+                **_workspace_publication_scope(),
+                "explanatoryDiagnostics": explanatory_diagnostics,
                 "idempotent": False,
                 "applied": False,
                 "head": {
@@ -3661,6 +4044,26 @@ class ReplayProjectService:
                 "headReceipt": head_receipt,
                 "headChanged": True,
             }
+
+    @staticmethod
+    def _workspace_inventory_abi_matches(status: Mapping[str, Any], target_hash: str) -> bool:
+        """Only complete, self-consistent workspace evidence proves a hash alias."""
+        baseline = status.get("baseline") or {}
+        digest = _sha(baseline.get("abiSha256"), "workspace.abiSha256", allow_empty=True)
+        if digest == target_hash:
+            return True
+        if not digest or baseline.get("compiledInterface") is None:
+            return False
+        from .shader_workspace.abi import parse_shader_abi, physical_shader_abi_hashes
+        try:
+            abi = parse_shader_abi(
+                baseline["compiledInterface"], expected_stage=str(status.get("stage") or ""),
+                expected_entry_point=str(status.get("entryPoint") or ""))
+        except Exception as error:
+            raise ReplayProjectError("workspace physical ABI evidence is invalid") from error
+        if abi.sha256 != digest:
+            raise ReplayProjectError("workspace physical ABI evidence/hash differs")
+        return target_hash in physical_shader_abi_hashes(abi)
 
     def register_workspace_from_inventory(
         self,
@@ -3703,10 +4106,10 @@ class ReplayProjectService:
         if (
             source.get("present") is not True
             or source.get("lane") != "executable-editable"
-            or source.get("format") != "hlsl"
+            or source.get("format") not in {"hlsl", "glsl"}
         ):
             raise ReplayProjectError(
-                "inventory workspace registration requires executable-editable HLSL"
+                "inventory workspace registration requires executable-editable HLSL or GLSL"
             )
         if (
             _positive(shader_status.get("resourceId"), "workspace.resourceId")
@@ -3721,12 +4124,7 @@ class ReplayProjectService:
             != target["entryPoint"]
             or _sha(baseline.get("rawSha256"), "workspace.rawSha256")
             != target["rawSha256"]
-            or _sha(
-                baseline.get("abiSha256"),
-                "workspace.abiSha256",
-                allow_empty=True,
-            )
-            != target["abiHash"]
+            or not self._workspace_inventory_abi_matches(status, target["abiHash"])
             or _shader_encoding(baseline.get("kind")) != target["encoding"]
         ):
             raise ReplayProjectError(
@@ -3755,21 +4153,26 @@ class ReplayProjectService:
         analysis_path = workspace_root / "ai" / "analysis.md"
         analysis_bytes: bytes | None = None
         analysis_sha256 = ""
+        explanatory_diagnostics: list[dict[str, str]] = []
         if analysis_path.exists() or analysis_path.is_symlink():
             if not is_within(workspace_root, analysis_path.resolve()):
                 raise ReplayProjectError("workspace analysis escapes its workspace")
             analysis_bytes = _file_bytes(
                 analysis_path, MAX_ANALYSIS_BYTES, "workspace ai/analysis.md"
             )
-            try:
-                analysis_text = analysis_bytes.decode("utf-8", errors="strict")
-            except UnicodeDecodeError as exc:
-                raise ReplayProjectError(
-                    "workspace analysis must be UTF-8 text"
-                ) from exc
-            if "\x00" in analysis_text:
-                raise ReplayProjectError("workspace analysis contains NUL characters")
-            analysis_sha256 = _sha256_bytes(analysis_bytes)
+            provenance = source_binding_metadata(workspace_root, analysis_path, analysis_bytes, status)
+            if provenance["currentSourceMatches"] is False:
+                explanatory_diagnostics.append({"artifact": "ai/analysis.md", "status": "skipped",
+                                                "reason": provenance["reason"]})
+                analysis_bytes, analysis_sha256 = None, ""
+            else:
+                try:
+                    analysis_text = analysis_bytes.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise ReplayProjectError("workspace analysis must be UTF-8 text") from exc
+                if "\x00" in analysis_text:
+                    raise ReplayProjectError("workspace analysis contains NUL characters")
+                analysis_sha256 = _sha256_bytes(analysis_bytes)
         manifest_path = _normal_path(str(status.get("manifestPath", "")))
         manifest_bytes = _file_bytes(
             manifest_path, MAX_PROJECT_BYTES, "workspace manifest"
@@ -3839,6 +4242,18 @@ class ReplayProjectService:
             baseline=baseline,
         )
 
+        cache_diagnostics: dict[str, Any] = {}
+        if baseline.get("abiSha256") != target["abiHash"]:
+            # The fresh inventory is the new knowledge's exact physical origin.
+            # A historical binary report still binds the old spelling. Keep it
+            # in its original workspace, but do not rewrite/promote its origin
+            # into this new record. Source reuse can compile and validate anew.
+            prepared_compiled = None
+            cache_diagnostics = {"compiledCandidateCache": {
+                "retained": False,
+                "reasonId": "historical-topology-abi-recompile-required",
+            }}
+
         with _thread_lock(self.root), _project_lock(self.root):
             manifest = self._load()
             before_snapshot = self._reuse_snapshot_for_normalized_inventory(
@@ -3891,6 +4306,8 @@ class ReplayProjectService:
                 "analysisSha256": analysis_sha256,
                 "inventoryOrigin": inventory_origin,
             }
+            if source["format"] != "hlsl":
+                material["sourceFormat"] = source["format"]
             if compiler_binding is not None:
                 material["compilerBinding"] = compiler_binding
             if prepared_disassembly:
@@ -3931,7 +4348,7 @@ class ReplayProjectService:
                     "receiptSha256": _canonical_sha256(observation_material),
                 }
             )
-            source_relative = "knowledge/workspaces/%s.hlsl" % knowledge_id
+            source_relative = "knowledge/workspaces/%s.%s" % (knowledge_id, source["format"])
             destination = self._artifact(
                 source_relative, "workspace knowledge path"
             )
@@ -4013,6 +4430,8 @@ class ReplayProjectService:
                 )
                 return {
                     "knowledge": copy.deepcopy(existing),
+                    **cache_diagnostics,
+                    "explanatoryDiagnostics": explanatory_diagnostics,
                     "idempotent": not head_publication["changed"],
                     "applied": False,
                     "observationRecorded": observation_recorded,
@@ -4156,6 +4575,8 @@ class ReplayProjectService:
             head_receipt = self._head_receipt("workspaces", head_publication)
             return {
                 "knowledge": copy.deepcopy(record),
+                **cache_diagnostics,
+                "explanatoryDiagnostics": explanatory_diagnostics,
                 "idempotent": False,
                 "applied": False,
                 "observationRecorded": True,
@@ -4204,6 +4625,14 @@ class ReplayProjectService:
             capture = self._capture_for_provenance(
                 manifest, capture_id, alias_catalog_sha256
             )
+            aliases, alias_recovery = _recover_legacy_alias_rows(aliases, capture)
+            recovery_result = ({"aliasRecovery": alias_recovery} if alias_recovery else {})
+            if alias_recovery and not aliases:
+                return {
+                    "knowledge": None, "registered": False, "applied": False,
+                    "idempotent": True, "headChanged": False,
+                    "aliasCount": 0, **recovery_result,
+                }
             groups: dict[tuple[int, str, str, str], dict[str, Any]] = {}
             for index, alias in enumerate(aliases):
                 if not isinstance(alias, Mapping) or alias.get("verified") is not True or alias.get("captureId") != capture_id:
@@ -4287,6 +4716,7 @@ class ReplayProjectService:
                 ]
                 result = {
                     "knowledge": existing,
+                    **recovery_result,
                     "idempotent": not changed,
                     "applied": False,
                     "heads": [
@@ -4333,6 +4763,7 @@ class ReplayProjectService:
             ]
             result = {
                 "knowledge": record,
+                **recovery_result,
                 "idempotent": False,
                 "applied": False,
                 "heads": [
@@ -4738,6 +5169,7 @@ class ReplayProjectService:
         compiled_identity: dict[str, Any] | None = None
         if compiled_candidate is not None:
             compiled_identity = _compiled_candidate_identity(compiled_candidate)
+            _check_manual_candidate_original(compiled_identity, record)
             if (
                 compiled_identity["sourceSha256"] != source_sha256
                 or compiled_identity["targetProfile"]
@@ -4892,9 +5324,18 @@ class ReplayProjectService:
                     "workspace knowledge does not select one imported Shader"
                 )
             shader = shader_matches[0]
+        # Older native-format workspaces used the complete executable hash as
+        # their optional code fingerprint when the capture had no separate
+        # code hash. The exact raw hash, stage, entry and resource have already
+        # selected this Shader above. Preserve the content-bound record;
+        # accept only that known fallback, never an arbitrary missing hash.
+        catalog_code_sha256 = str(shader.get("codeSha256", "") or "")
+        legacy_raw_code_fallback = (
+            not catalog_code_sha256 and code_sha256 == raw_sha256
+        )
         if any(
             (
-                shader.get("codeSha256", "") != code_sha256,
+                catalog_code_sha256 != code_sha256 and not legacy_raw_code_fallback,
                 shader.get("layoutHash", "") != layout_hash,
                 shader.get("interfaceHash", "") != interface_hash,
                 (shader.get("interfaceComplete") is True) != interface_complete,
@@ -4906,6 +5347,9 @@ class ReplayProjectService:
         source_path = self._artifact(
             record.get("sourcePath"), "workspace knowledge source"
         )
+        source_format = _workspace_source_format(record)
+        if record.get("sourcePath") != "knowledge/workspaces/%s.%s" % (token, source_format):
+            raise ReplayProjectError("workspace knowledge source format/path differs")
         if not source_artifact_verified and (
             _sha256_bytes(
                 _file_bytes(source_path, MAX_SOURCE_BYTES, "workspace knowledge source")
@@ -4929,6 +5373,13 @@ class ReplayProjectService:
             "sourceSha256": source_sha256,
             "analysisSha256": analysis_sha256,
         }
+        if source_format != "hlsl":
+            identity["sourceFormat"] = source_format
+        publication_mode = record.get("publicationMode")
+        if publication_mode is not None:
+            if publication_mode != SOURCE_ONLY_PUBLICATION or compiled_identity is not None:
+                raise ReplayProjectError("workspace source-only publication mode is invalid")
+            identity["publicationMode"] = publication_mode
         if origin_resource_id is not None:
             identity["originResourceId"] = origin_resource_id
         if inventory_origin is not None:
@@ -4970,6 +5421,7 @@ class ReplayProjectService:
                 )
             identity["assemblyDisassemblyArtifacts"] = clean_disassembly
         if compiled_identity is not None:
+            _validate_native_candidate_binding(compiled_identity, compiler_binding, source_format)
             identity["compiledCandidate"] = compiled_identity
         expected_knowledge_id = (
             _canonical_sha256(_inventory_workspace_artifact_identity(identity))[:32]
@@ -4985,6 +5437,201 @@ class ReplayProjectService:
 
         return self._workspace_knowledge_from_manifest(self._load(), knowledge_id)
 
+    def current_workspace_source_head(self, knowledge_id: str) -> dict[str, Any]:
+        """Read this source family's latest head without scanning capture matches."""
+        manifest = self._load()
+        records = [item for item in manifest["knowledge"]["workspaces"]
+                   if item.get("knowledgeId") == knowledge_id]
+        if len(records) != 1:
+            raise ReplayProjectError("unknown project workspace knowledge ID")
+        head_key = self._workspace_head_key(records[0], manifest)
+        head = self._active_heads_state(manifest)["workspaces"][head_key]
+        knowledge = self._workspace_knowledge_from_manifest(manifest, head["knowledgeId"])
+        return {"headKey": head_key, "generation": head["generation"],
+                "knowledge": knowledge}
+
+    def find_current_workspace_source_head(
+        self, *, source_sha256: str, raw_sha256: str, stage: str, entry_point: str,
+        workspace_id: str | None = None, capture_id: str | None = None,
+        target_profile: Mapping[str, Any] | None = None, baseline_abi_sha256: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Find a current source head, optionally bound to one physical workspace.
+
+        Callers publishing an applied workspace know its exact scope. Filter it
+        before ambiguity detection: identical source/raw bytes may legitimately
+        have separate active heads for different target profiles or ABI layouts.
+        Unscoped callers retain the existing ambiguity error.
+        """
+        manifest = self._load()
+        heads = self._active_heads_state(manifest)["workspaces"]
+        active = {value["knowledgeId"]: (key, value) for key, value in heads.items()}
+        matches = [item for item in manifest["knowledge"]["workspaces"]
+                   if item["knowledgeId"] in active
+                   and item.get("sourceSha256") == source_sha256
+                   and item.get("rawSha256") == raw_sha256
+                   and item.get("stage") == stage
+                   and item.get("entryPoint", "") == entry_point
+                   and (workspace_id is None or item.get("workspaceId") == workspace_id)
+                   and (capture_id is None or item.get("captureId") == capture_id)
+                   and (target_profile is None or item.get("targetProfile") == target_profile)
+                   and (baseline_abi_sha256 is None or item.get("baselineAbiSha256") == baseline_abi_sha256)]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise ReplayProjectError("current project Shader source head is ambiguous")
+        knowledge_id = matches[0]["knowledgeId"]
+        key, head = active[knowledge_id]
+        return {"projectId": manifest["projectId"], "headKey": key,
+                "generation": head["generation"],
+                "knowledge": self._workspace_knowledge_from_manifest(manifest, knowledge_id)}
+
+    def _published_workspace_source_advance(
+        self, manifest: dict[str, Any], knowledge_id: str,
+        status: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Recognize an unchanged old publication, never an arbitrary local edit."""
+        source = status.get("source") or {}
+        latest = status.get("latestCompiled") or {}
+        revision = status.get("revision")
+        records = manifest["knowledge"]["workspaces"]
+        heads = self._active_heads_state(manifest)["workspaces"]
+        activation = self._active_knowledge_state(manifest)["workspaces"]
+        requested = [record for record in records if record.get("knowledgeId") == knowledge_id]
+        if len(requested) != 1:
+            raise ReplayProjectError("unknown project workspace knowledge ID")
+        target = requested[0]
+        head_key = self._workspace_head_key(target, manifest)
+        head = heads[head_key]
+        if (head["knowledgeId"] != knowledge_id
+                and knowledge_id not in self._workspace_restore_fallbacks(manifest)):
+            raise ReplayProjectError("project source is no longer the active knowledge head")
+        if (source.get("currentSha256") == target.get("sourceSha256")
+                or source.get("present") is not True
+                or source.get("modifiedSinceDecompile") is False
+                or type(revision) is not int or revision <= 0
+                or latest.get("revision") != revision
+                or latest.get("sourceSha256") != source.get("currentSha256")
+                or latest.get("replayAbiValidated") is not True
+                or latest.get("abiCompatible") is not True
+                or latest.get("requiresReplayAbiValidation") is not False
+                or (latest.get("abiGate") or {}).get("status") != "compatible"):
+            return None
+        for previous in records:
+            compiled = previous.get("compiledCandidate") or {}
+            if (previous.get("knowledgeId") == knowledge_id
+                    or previous.get("workspaceId") != status.get("workspaceId")
+                    or previous.get("sourceSha256") != source.get("currentSha256")
+                    or previous.get("captureId") != (status.get("capture") or {}).get("captureId")
+                    or previous.get("rawSha256") != (status.get("baseline") or {}).get("rawSha256")
+                    or previous.get("baselineAbiSha256") != (status.get("baseline") or {}).get("abiSha256")
+                    or previous.get("stage") != status.get("stage")
+                    or previous.get("entryPoint", "") != status.get("entryPoint", "")
+                    or previous.get("targetProfile") != status.get("targetProfile")
+                    or _workspace_source_format(previous) != source.get("format")
+                    or compiled.get("sourceRevision") != revision
+                    or compiled.get("sourceSha256") != source.get("currentSha256")
+                    or compiled.get("rawSha256") != latest.get("rawSha256")
+                    or compiled.get("targetProfile") != status.get("targetProfile")
+                    or (previous.get("originResourceId") is not None
+                        and previous["originResourceId"] != (status.get("shader") or {}).get("resourceId"))):
+                continue
+            if (_normal_path(str(previous.get("workspacePath") or ""))
+                    != _normal_path(str(status.get("workspacePath") or ""))):
+                continue
+            previous_head_key = self._workspace_head_key(previous, manifest)
+            if previous_head_key != head_key:
+                # Separate captures can wrap identical DirectX instructions
+                # in different debug containers. Only the registered target
+                # catalog can establish that these are the same source family.
+                try:
+                    capture = self._capture_for_provenance(
+                        manifest, status["capture"]["captureId"],
+                        self._capture_status_catalog_sha256(status["capture"]))
+                    shader = self._capture_shader(
+                        capture, resource_id=status["shader"]["resourceId"],
+                        stage=status["stage"], entry_point=status.get("entryPoint", ""),
+                        raw_sha256=status["baseline"]["rawSha256"])
+                    physical = self._head_shader_identity(target, baseline_abi=True, manifest=manifest)
+                    if (_match_mode(target, shader) != "code-interface-layout-exact"
+                            or _reuse_api_family(capture.get("api")) != _reuse_api_family(physical["api"])
+                            or _shader_encoding(shader.get("encoding")) != _shader_encoding(physical["encoding"])
+                            or status["baseline"].get("codeSha256") != shader.get("codeSha256")
+                            or target.get("baselineAbiSha256") != status["baseline"].get("abiSha256")
+                            or target.get("targetProfile") != status.get("targetProfile")
+                            or _workspace_source_format(target) != source.get("format")
+                            or activation[knowledge_id] <= activation[heads[previous_head_key]["knowledgeId"]]):
+                        continue
+                except (KeyError, TypeError, ValueError, ReplayProjectError):
+                    continue
+            if not self._published_workspace_candidate_current(status):
+                return None
+            # Metadata alone cannot authorize replacing source. Authenticate
+            # the historical source, binary and publication's content identity.
+            self._workspace_knowledge_from_manifest(
+                manifest, previous["knowledgeId"], record=previous)
+            return {
+                "schema": "renderdoc-ultra-published-workspace-source-advance/v1",
+                "schemaVersion": 1, "projectId": manifest["projectId"],
+                "headKey": head_key, "generation": head["generation"],
+                "knowledgeId": knowledge_id, "previousKnowledgeId": previous["knowledgeId"],
+                "workspaceId": status["workspaceId"],
+                "workspacePath": str(_normal_path(str(status["workspacePath"]))),
+                "sourceSha256": source["currentSha256"], "revision": revision,
+                "candidateRawSha256": latest["rawSha256"],
+                **({"previousHeadKey": previous_head_key,
+                    "previousHeadGeneration": heads[previous_head_key]["generation"],
+                    "previousHeadKnowledgeId": heads[previous_head_key]["knowledgeId"]}
+                   if previous_head_key != head_key else {}),
+            }
+        return None
+
+    @staticmethod
+    def _published_workspace_candidate_current(status: Mapping[str, Any]) -> bool:
+        """An unpublished binary/header edit must survive source-head recovery."""
+        try:
+            from .shader_workspace.compile_source_unit import current_dependencies
+            root = _normal_path(str(status["workspacePath"]))
+            latest = status["latestCompiled"]
+            candidate = root / latest["blobPath"]
+            source = Path(status["source"]["path"])
+            if (candidate.is_symlink() or source.is_symlink()
+                    or not is_within(root, candidate.resolve()) or not is_within(root, source.resolve())
+                    or _sha256_bytes(_file_bytes(candidate, MAX_COMPILED_CANDIDATE_BYTES, "workspace candidate")) != latest["rawSha256"]):
+                return False
+            source_bytes = _file_bytes(source, MAX_SOURCE_BYTES, "workspace source")
+            # The caller separately compares root-source bytes under its seed
+            # lock. Keep the legacy source-mismatch diagnostic at that boundary.
+            if _sha256_bytes(source_bytes) != status["source"]["currentSha256"]:
+                return True
+            dependencies = current_dependencies(source, source_bytes, latest)
+            return dependencies["current"] or (
+                "sourceDependencies" not in latest and dependencies["documentCount"] == 1
+                and not dependencies["error"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+
+    @classmethod
+    def _recheck_published_source_seed(cls, root: Path, status: Mapping[str, Any]) -> None:
+        saved = json.loads(_file_bytes(root / "manifest.json", MAX_PROJECT_BYTES,
+                                     "destination manifest").decode("utf-8"))
+        latest = saved.get("latestCompiled") or {}
+        if (saved.get("workspaceId") != status.get("workspaceId")
+                or saved.get("revision") != status.get("revision")
+                or any(latest.get(key) != status["latestCompiled"].get(key)
+                       for key in ("revision", "sourceSha256", "rawSha256", "abiGate",
+                                   "replayAbiValidated", "requiresReplayAbiValidation", "abiCompatible",
+                                   "sourceDependencies"))):
+            raise ReplayProjectError("published workspace revision changed before seed")
+        if not cls._published_workspace_candidate_current(status):
+            raise ReplayProjectError("published workspace candidate or includes changed before seed")
+
+    def published_workspace_source_advance(
+        self, knowledge_id: str, status: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Read an exact old-publication receipt; seeding rechecks it under locks."""
+        with _thread_lock(self.root), _project_lock(self.root):
+            return self._published_workspace_source_advance(self._load(), knowledge_id, status)
+
     def restorable_shader_raw_hashes(self) -> list[str]:
         """Return original executable identities of current project heads only."""
         with _thread_lock(self.root), _project_lock(self.root):
@@ -4996,6 +5643,91 @@ class ReplayProjectService:
                 for entry in entries
             }
             return sorted(_sha(value, "restorable original Shader hash") for value in values)
+
+    def restorable_shader_code_hashes(
+        self, missing_raw_hashes: Sequence[str], api: str,
+    ) -> list[str]:
+        """Route a bounded source lookup after exact container lookup misses.
+
+        Only DirectX containers currently expose a separate parsed executable
+        hash. This is a search accelerator, never permission to reuse source
+        or binaries: the selected target catalog must still prove its complete
+        interface/layout and the workspace must compile against the live ABI.
+        """
+        missing = {_sha(value, "missing original Shader hash") for value in missing_raw_hashes}
+        family = _reuse_api_family(api)
+        if family not in {"d3d11", "d3d12"}:
+            return []
+        with _thread_lock(self.root), _project_lock(self.root):
+            state = self._reuse_knowledge_state(self._load())
+            hashes: set[str] = set()
+            for bucket in state["indexes"]["workspaces"]["code"].values():
+                entries = [row for row in bucket if not row.get("rawOnly")
+                           and _reuse_api_family(row["api"]) == family
+                           and row["encoding"] in {"DXBC", "DXIL"}]
+                for entry in entries:
+                    origin = state["workspaces"][entry["reference"]["knowledgeId"]]
+                    newer = self._newer_program_source(state, origin)
+                    if origin["rawSha256"] not in missing:
+                        if newer is not None:
+                            hashes.add(entry["matcher"]["codeSha256"])
+                        continue
+                    desired = newer or origin
+                    # Another container of this exact program may already be
+                    # present with the latest source. Do not turn that common
+                    # reopen into a full unique-Shader lookup just because an
+                    # older debug container is absent from this capture.
+                    represented = any(
+                        row["matcher"]["rawSha256"] not in missing
+                        and row["encoding"] == entry["encoding"]
+                        and (candidate := state["workspaces"][row["reference"]["knowledgeId"]]).get("sourceSha256") == desired.get("sourceSha256")
+                        and candidate.get("targetProfile") == desired.get("targetProfile")
+                        and candidate.get("baselineAbiSha256") == desired.get("baselineAbiSha256")
+                        and _workspace_source_format(candidate) == _workspace_source_format(desired)
+                        for row in entries)
+                    if not represented:
+                        hashes.add(entry["matcher"]["codeSha256"])
+            return sorted(hashes)
+
+    def _newer_program_source(
+        self, state: Mapping[str, Any], origin: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        """Find a newer compatible source publication in this exact program family.
+
+        Per-head generations are local counters and cannot compare two raw
+        containers. Global publication activation orders them. Code families
+        require the same complete interface/layout and physical ABI/profile;
+        this lookup grants no binary or replay authority.
+        """
+        from .shader_source_publication import source_only_restore_reason
+        origin_id = origin["knowledgeId"]
+        unused_raw, code_key = self._reuse_index_keys(origin)
+        if code_key is None:
+            return None
+        entries = [entry for entry in state["indexes"]["workspaces"]["code"].get(code_key, [])
+                   if entry["reference"].get("knowledgeId") == origin_id]
+        if len(entries) != 1:
+            return None
+        physical = entries[0]
+        target = {**origin, "api": physical["api"], "encoding": physical["encoding"]}
+        candidates = []
+        for reference, mode in self._indexed_reuse_matches(state["indexes"]["workspaces"], target):
+            candidate = state["workspaces"][reference["knowledgeId"]]
+            if (candidate.get("targetProfile") != origin.get("targetProfile")
+                    or not candidate.get("baselineAbiSha256")
+                    or candidate.get("baselineAbiSha256") != origin.get("baselineAbiSha256")
+                    or _workspace_source_format(candidate) != _workspace_source_format(origin)
+                    or source_only_restore_reason(candidate, self.root)):
+                continue
+            candidates.append(candidate)
+        if not candidates:
+            return None
+        activation = state["activation"]["workspaces"]
+        newest = max(candidates, key=lambda row: (activation.get(row["knowledgeId"], 0), row["knowledgeId"]))
+        if (activation.get(newest["knowledgeId"], 0) > activation.get(origin_id, 0)
+                and newest.get("sourceSha256") != origin.get("sourceSha256")):
+            return newest
+        return None
 
     def prepare_workspace_source(
         self, knowledge_id: str, destination_status: Mapping[str, Any]
@@ -5015,57 +5747,95 @@ class ReplayProjectService:
         source = destination_status.get("source")
         if not all(isinstance(item, Mapping) for item in (baseline, shader, capture, source)):
             raise ReplayProjectError("destination workspace physical provenance is incomplete")
-        if source.get("present") is not False:
-            raise ReplayProjectError("direct project source import requires an empty destination source")
+        from .shader_workspace.project_source import can_import_project_source
+        if not can_import_project_source(destination_status):
+            raise ReplayProjectError("direct project source import requires an empty destination or untouched captured GLSL")
         with _thread_lock(self.root), _project_lock(self.root):
-            manifest = self._load()
-            knowledge = self._workspace_knowledge_from_manifest(manifest, knowledge_id)
-            head_key = self._workspace_head_key(knowledge, manifest)
-            if self._active_heads_state(manifest)["workspaces"][head_key]["knowledgeId"] != knowledge_id:
-                raise ReplayProjectError("project source is no longer the active knowledge head")
-            if (knowledge.get("rawSha256") != baseline.get("rawSha256")
-                    or shader.get("rawSha256") != baseline.get("rawSha256")
-                    or knowledge.get("stage") != destination_status.get("stage")
-                    or knowledge.get("entryPoint", "") != destination_status.get("entryPoint", "")
-                    or knowledge.get("targetProfile") != destination_status.get("targetProfile")
-                    or not knowledge.get("baselineAbiSha256")
-                    or knowledge.get("baselineAbiSha256") != baseline.get("abiSha256")):
-                raise ReplayProjectError("project source differs from the current original Shader/profile/physical ABI")
-            physical = self._head_shader_identity(knowledge, baseline_abi=True, manifest=manifest)
-            if (_reuse_api_family(capture.get("api")) != _reuse_api_family(physical["api"])
-                    or _shader_encoding(baseline.get("kind")) != _shader_encoding(physical["encoding"])):
+            return self._prepare_workspace_source_locked(knowledge_id, destination_status, self._load())
+
+    def _prepare_workspace_source_locked(
+        self, knowledge_id: str, destination_status: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Verify current project bytes while the caller owns the project lock."""
+        baseline = destination_status["baseline"]
+        shader = destination_status["shader"]
+        capture = destination_status["capture"]
+        source = destination_status["source"]
+        knowledge = self._workspace_knowledge_from_manifest(manifest, knowledge_id)
+        source_format = _workspace_source_format(knowledge)
+        if source.get("format", "hlsl") != source_format:
+            raise ReplayProjectError("project and destination source formats differ")
+        head_key = self._workspace_head_key(knowledge, manifest)
+        if (self._active_heads_state(manifest)["workspaces"][head_key]["knowledgeId"] != knowledge_id
+                and knowledge_id not in self._workspace_restore_fallbacks(dict(manifest))):
+            raise ReplayProjectError("project source is no longer the active knowledge head")
+        if (shader.get("rawSha256") != baseline.get("rawSha256")
+                or knowledge.get("stage") != destination_status.get("stage")
+                or knowledge.get("entryPoint", "") != destination_status.get("entryPoint", "")
+                or knowledge.get("targetProfile") != destination_status.get("targetProfile")):
+            raise ReplayProjectError("project source differs from the current original Shader/profile")
+        # A prior reflection hash does not identify the source program.
+        # Bind the imported text to the freshly observed target ABI and
+        # require a new compile/validation before any executable apply.
+        target_abi_sha256 = _sha(baseline.get("abiSha256"), "destination.abiSha256")
+        physical = self._head_shader_identity(knowledge, baseline_abi=True, manifest=manifest)
+        if (_reuse_api_family(capture.get("api")) != _reuse_api_family(physical["api"])
+                or _shader_encoding(baseline.get("kind")) != _shader_encoding(physical["encoding"])):
+            raise ReplayProjectError("project source capture API/encoding differs from the destination")
+        if knowledge.get("rawSha256") != baseline.get("rawSha256"):
+            # Debug/container metadata can differ while the captured program is
+            # identical. Resolve the target from its verified project catalog,
+            # never from a caller-supplied code hash alone.
+            registered_capture = self._capture_for_provenance(
+                manifest, _sha(capture.get("captureId"), "destination.captureId"),
+                self._capture_status_catalog_sha256(capture))
+            registered_shader = self._capture_shader(
+                registered_capture,
+                resource_id=_positive(shader.get("resourceId"), "destination.resourceId"),
+                stage=destination_status["stage"],
+                entry_point=destination_status["entryPoint"],
+                raw_sha256=_sha(baseline.get("rawSha256"), "destination.rawSha256"))
+            if (_reuse_api_family(registered_capture.get("api")) != _reuse_api_family(physical["api"])
+                    or _shader_encoding(registered_shader.get("encoding")) != _shader_encoding(physical["encoding"])):
                 raise ReplayProjectError("project source capture API/encoding differs from the destination")
-            payload = _file_bytes(self._artifact(knowledge["sourcePath"], "project source"), MAX_SOURCE_BYTES, "project source")
-            if _sha256_bytes(payload) != knowledge["sourceSha256"]:
-                raise ReplayProjectError("project source bytes changed")
-            text = payload.decode("utf-8", errors="strict")
-            if not text.strip() or "\x00" in text:
-                raise ReplayProjectError("project source must be nonempty UTF-8 HLSL")
-            # Existing knowledge records retain the captured entry name. The
-            # fixed SPIR-V round trip may emit main instead; bind only an
-            # actual uniquely declared function, never an invented entry.
-            from .shader_workspace.flow_graph import _function_records
-            names = [item["name"] for item in _function_records(text)]
-            entry = str(knowledge.get("entryPoint", ""))
-            if names.count(entry) != 1:
-                if names.count("main") != 1:
-                    raise ReplayProjectError("project source has no unique captured/main compile entry")
-                entry = "main"
-            return {
-                "schema": "replaylab-verified-project-shader-source/v1",
-                "projectId": manifest["projectId"], "projectPath": str(self.root),
-                "knowledgeId": knowledge_id, "sourceSha256": knowledge["sourceSha256"],
-                "sourceText": text, "sourceEntryPoint": entry,
-                "originalRawSha256": baseline["rawSha256"],
-                "baselineAbiSha256": baseline["abiSha256"],
-                "stage": destination_status["stage"], "entryPoint": destination_status["entryPoint"],
-                "targetProfile": copy.deepcopy(destination_status["targetProfile"]),
-                "originWorkspacePath": knowledge.get("workspacePath"),
-                "originWorkspaceId": knowledge["workspaceId"],
-                "analysisSha256": knowledge.get("analysisSha256", ""),
-                "applied": False, "requiresCompile": True, "requiresLiveAbiRevalidation": True,
-                "semanticEquivalenceVerified": False,
-            }
+            if (_match_mode(knowledge, registered_shader) != "code-interface-layout-exact"
+                    or baseline.get("codeSha256") != registered_shader.get("codeSha256")):
+                raise ReplayProjectError("project source differs from the current original Shader code/interface/layout")
+            if not knowledge.get("baselineAbiSha256") or knowledge["baselineAbiSha256"] != target_abi_sha256:
+                raise ReplayProjectError("destination target profile/physical ABI differs from project knowledge")
+        payload = _file_bytes(self._artifact(knowledge["sourcePath"], "project source"), MAX_SOURCE_BYTES, "project source")
+        if _sha256_bytes(payload) != knowledge["sourceSha256"]:
+            raise ReplayProjectError("project source bytes changed")
+        text = payload.decode("utf-8", errors="strict")
+        if not text.strip() or "\x00" in text:
+            raise ReplayProjectError("project source must be nonempty UTF-8 Shader text")
+        # Existing knowledge records retain the captured entry name. The
+        # fixed SPIR-V round trip may emit main instead; bind only an
+        # actual uniquely declared function, never an invented entry.
+        from .shader_workspace.flow_graph import _function_records
+        names = [item["name"] for item in _function_records(text)]
+        entry = str(knowledge.get("entryPoint", ""))
+        if names.count(entry) != 1:
+            if names.count("main") != 1:
+                raise ReplayProjectError("project source has no unique captured/main compile entry")
+            entry = "main"
+        return {
+            "schema": "replaylab-verified-project-shader-source/v1",
+            "projectId": manifest["projectId"], "projectPath": str(self.root),
+            "knowledgeId": knowledge_id, "sourceSha256": knowledge["sourceSha256"],
+            "sourceText": text, "sourceEntryPoint": entry,
+            **({"sourceFormat": source_format} if source_format != "hlsl" else {}),
+            "originalRawSha256": baseline["rawSha256"],
+            "baselineAbiSha256": target_abi_sha256,
+            "stage": destination_status["stage"], "entryPoint": destination_status["entryPoint"],
+            "targetProfile": copy.deepcopy(destination_status["targetProfile"]),
+            "originWorkspacePath": knowledge.get("workspacePath"),
+            "originWorkspaceId": knowledge["workspaceId"],
+            "analysisSha256": knowledge.get("analysisSha256", ""),
+            "applied": False, "requiresCompile": True, "requiresLiveAbiRevalidation": True,
+            "semanticEquivalenceVerified": False,
+        }
 
     def _material_knowledge_from_manifest(
         self,
@@ -5493,6 +6263,47 @@ class ReplayProjectService:
             "knowledgeId": head["knowledgeId"],
         }
 
+    def _workspace_restore_fallbacks(self, manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Keep a pending source head while selecting its last verified executable.
+
+        This is a derived restore view, never a publication or head rewrite.
+        History must share the complete physical head key (including original
+        bytes, API, encoding and profile), and carry a verified binary artifact.
+        """
+        from .shader_source_publication import source_only_restore_reason
+
+        heads = self._active_heads_state(manifest)["workspaces"]
+        members = self._knowledge_head_members(manifest)["workspaces"]
+        activation = self._active_knowledge_state(manifest)["workspaces"]
+        records = {record["knowledgeId"]: record for record in manifest["knowledge"]["workspaces"]}
+        result: dict[str, dict[str, Any]] = {}
+        for head_key, head in heads.items():
+            pending = records[head["knowledgeId"]]
+            reason = source_only_restore_reason(pending, self.root)
+            if not reason:
+                continue
+            history = sorted(members[head_key],
+                key=lambda item: (activation.get(item["knowledgeId"], 0), item["ordinal"]), reverse=True)
+            for item in history:
+                token = item["knowledgeId"]
+                prior = records[token]
+                if (token == pending["knowledgeId"] or not prior.get("compiledCandidate")
+                        or source_only_restore_reason(prior, self.root)):
+                    continue
+                # The normal reader authenticates source, binary and ABI origin
+                # evidence. An old workspace path alone never makes a fallback.
+                try:
+                    self._workspace_knowledge_from_manifest(manifest, token, record=prior)
+                except (ReplayProjectError, OSError):
+                    # A missing/corrupt historical artifact cannot authorize
+                    # replay or prevent a still older verified version.
+                    continue
+                result[token] = {"knowledgeId": pending["knowledgeId"],
+                    "sourceSha256": pending["sourceSha256"], "reason": reason,
+                    "headKey": head_key, "generation": head["generation"]}
+                break
+        return result
+
     def _reuse_knowledge_state(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
         """Build linear-time lookup tables over the exact manifest knowledge revision."""
 
@@ -5502,8 +6313,11 @@ class ReplayProjectService:
         active = self._active_knowledge_state(manifest)
         active_heads = self._active_heads_state(manifest)
         head_members = self._knowledge_head_members(manifest)
+        replay_fallbacks = self._workspace_restore_fallbacks(manifest)
+        pending_with_fallback = {item["knowledgeId"] for item in replay_fallbacks.values()}
         state: dict[str, Any] = {
             "knowledgeContentSha256": "",
+            "replayFallbacks": replay_fallbacks,
             "indexes": {
                 kind: {"raw": {}, "code": {}}
                 for kind in ("workspaces", "aliases", "materials")
@@ -5549,6 +6363,7 @@ class ReplayProjectService:
                 "reference": dict(reference),
                 "api": physical_identity["api"],
                 "encoding": physical_identity["encoding"],
+                "rawOnly": kind == "workspaces" and str(reference.get("knowledgeId", "")) in replay_fallbacks,
             }
             if raw_key is not None:
                 state["indexes"][kind]["raw"].setdefault(raw_key, []).append(entry)
@@ -5565,24 +6380,21 @@ class ReplayProjectService:
             state["ordinals"]["workspaces"][key] = (index, 0)
             head_key = self._workspace_head_key(workspace, manifest)
             head = active_heads["workspaces"][head_key]
-            if head["knowledgeId"] == key:
+            if head["knowledgeId"] == key or key in replay_fallbacks:
                 physical_identity = self._head_shader_identity(
                     workspace, baseline_abi=True, manifest=manifest
                 )
                 state["headBindings"]["workspaces"][key] = {
                     **self._semantic_head(head_key, head),
+                    "knowledgeId": key,
                     "historyCount": len(head_members["workspaces"][head_key]),
                     "api": physical_identity["api"],
                     "encoding": physical_identity["encoding"],
                 }
-                index_entry(
-                    "workspaces",
-                    "workspace:%s" % key,
-                    (index, 0),
-                    workspace,
-                    {"knowledgeId": key},
-                    physical_identity,
-                )
+                if key not in pending_with_fallback:
+                    index_entry(
+                        "workspaces", "workspace:%s" % key, (index, 0), workspace,
+                        {"knowledgeId": key}, physical_identity)
 
         for alias_index, alias_set in enumerate(knowledge["aliases"]):
             if not isinstance(alias_set, Mapping):
@@ -5654,6 +6466,7 @@ class ReplayProjectService:
 
         global_semantics = {
             "schema": "renderdoc-ultra-project-active-head-semantics/v1",
+            **({"replayFallbacks": copy.deepcopy(replay_fallbacks)} if replay_fallbacks else {}),
             "workspaces": [
                 {
                     "head": {
@@ -5746,7 +6559,7 @@ class ReplayProjectService:
             # Keep the original matcher as the final authority. The indexes are
             # only candidate routing and can never relax raw/interface/layout.
             mode = _match_mode(candidate["matcher"], shader)
-            if mode:
+            if mode and (not candidate.get("rawOnly") or mode == "raw-exact"):
                 result.append((dict(candidate["reference"]), mode))
         return result
 
@@ -5865,6 +6678,8 @@ class ReplayProjectService:
                     )
                 alias_keys.add((knowledge_id, group_index))
 
+        workspace_ids.update(state.get("replayFallbacks", {})[token]["knowledgeId"]
+                             for token in tuple(workspace_ids) if token in state.get("replayFallbacks", {}))
         ordered_workspace_ids = tuple(sorted(workspace_ids))
         ordered_material_ids = tuple(sorted(material_ids))
         aliases: list[dict[str, Any]] = []
@@ -5893,6 +6708,9 @@ class ReplayProjectService:
 
         digest_document = {
             "schema": RESTORE_KNOWLEDGE_SCOPE_SCHEMA,
+            **({"replayFallbacks": {token: copy.deepcopy(state["replayFallbacks"][token])
+                for token in ordered_workspace_ids if token in state["replayFallbacks"]}}
+               if any(token in state.get("replayFallbacks", {}) for token in ordered_workspace_ids) else {}),
             "captureId": _sha(capture.get("captureId"), "capture.captureId"),
             "catalogSha256": _sha(
                 capture.get("catalogSha256"), "capture.catalogSha256"
@@ -6029,7 +6847,13 @@ class ReplayProjectService:
                     raise ReplayProjectError(
                         "reuse cache workspace reference failed exact matching"
                     )
-                seed_eligible = bool(workspace.get("baselineAbiSha256"))
+                if knowledge_id in state.get("replayFallbacks", {}) and mode != "raw-exact":
+                    raise ReplayProjectError("validated replay fallback requires the same captured original bytes")
+                origin_abi_available = bool(workspace.get("baselineAbiSha256"))
+                # Exact captured bytes identify their editable source even if
+                # a legacy record did not persist its reflection ABI. Such a
+                # record never supplies executable validation authority.
+                seed_eligible = mode == "raw-exact" or origin_abi_available
                 binary_candidate = workspace.get("compiledCandidate")
                 compiler_binding = workspace.get("compilerBinding")
                 compiler_binding_identity = (
@@ -6042,6 +6866,7 @@ class ReplayProjectService:
                 if (
                     binary_candidate is not None
                     and compiler_binding_identity is not None
+                    and origin_abi_available
                 ):
                     binary_identity = _compiled_candidate_identity(binary_candidate)
                     binary_artifact = self._artifact(
@@ -6087,16 +6912,20 @@ class ReplayProjectService:
                         "oldReplacementIdReused": False,
                         "oldCaptureAbiAuthorityReused": False,
                     }
+                    if binary_identity.get("validationScope") == "manual-edit-unvalidated":
+                        binary_plan.update(manualEdit=True, validationScope="manual-edit-unvalidated",
+                            manualApplyReceipt=copy.deepcopy(binary_identity["manualApplyReceipt"]),
+                            originValidationEvidenceOnly=False, freshLiveAbiRevalidationRequired=False)
                 candidate = {
                     "knowledgeId": knowledge_id,
                     "matchMode": mode,
                     "sourceSha256": workspace["sourceSha256"],
                     "sourceSeedEligible": seed_eligible,
                     "binaryCandidateEligible": bool(
-                        seed_eligible and binary_plan is not None
+                        origin_abi_available and binary_plan is not None
                     ),
                     "binaryCandidate": (
-                        binary_plan if seed_eligible else None
+                        binary_plan if origin_abi_available else None
                     ),
                     "analysisCandidate": (
                         {
@@ -6115,9 +6944,15 @@ class ReplayProjectService:
                         else None
                     ),
                 }
+                if knowledge_id in state.get("replayFallbacks", {}):
+                    candidate["pendingSource"] = copy.deepcopy(state["replayFallbacks"][knowledge_id])
                 if not seed_eligible:
                     candidate["blockedReason"] = (
                         "origin workspace has no complete captured baseline ABI"
+                    )
+                elif not origin_abi_available:
+                    candidate["binaryBlockedReason"] = (
+                        "origin workspace has no captured baseline ABI; fresh compile required"
                     )
                 elif (
                     binary_candidate is not None
@@ -6134,7 +6969,10 @@ class ReplayProjectService:
                 candidate["supersededCandidateCount"] = (
                     head["historyCount"] - 1
                 )
-                workspace_candidates.append((head["generation"], candidate))
+                # Generation counts belong to individual raw-container heads.
+                # Equivalent programs in other RDCs can have different debug
+                # chunks and different head ages; use global publication order.
+                workspace_candidates.append((state["activation"]["workspaces"].get(knowledge_id, 0), candidate))
 
             if workspace_candidates:
                 # Knowledge remains append-only, but automatic restore consumes
@@ -6477,8 +7315,8 @@ class ReplayProjectService:
                     "entryPoint": shader["entryPoint"],
                     "rawSha256": shader["rawSha256"],
                     # The normalized inventory intentionally carries no fuzzy
-                    # executable-only key. Project code reuse is raw-container
-                    # exact and then stable-key exact.
+                    # executable-only key. Source reuse is raw-container exact;
+                    # old binary reuse also requires the complete stable key.
                     "codeSha256": "",
                     "interfaceHash": shader["interfaceHash"],
                     "layoutHash": shader["layoutHash"],
@@ -6626,7 +7464,6 @@ class ReplayProjectService:
                     "inventory contains an ambiguous resource/entry target"
                 )
             inventory_by_target[key] = shader
-        provenance_index = self._restore_provenance_index(manifest)
         filtered: list[dict[str, Any]] = []
         for raw_mapping in mappings:
             mapping = copy.deepcopy(dict(raw_mapping))
@@ -6642,26 +7479,21 @@ class ReplayProjectService:
                     raise ReplayProjectError(
                         "inventory reuse mapping references absent workspace knowledge"
                     )
-                # No code-only/fuzzy executable matching is permitted here.
-                # A reusable binary/source must bind to the exact normalized
-                # stable key, including API, encoding, ABI and layout.
-                origin_identity = self._workspace_inventory_stable_identity(
-                    record, provenance_index
-                )
-                if (
-                    reference.get("matchMode") == "raw-exact"
-                    and origin_identity["stableKeySha256"]
-                    == target["stableKeySha256"]
-                ):
+                # An exact original program can recover its source even when
+                # old reflection/ABI metadata differs. The plan below keeps
+                # the original evidence separate and disables binary reuse
+                # until a fresh compile and target ABI validation succeed.
+                if reference.get("matchMode") == "raw-exact":
+                    if self._newer_program_source(state, record) is not None:
+                        raise ReplayProjectError("newer equivalent Shader source requires target preparation")
                     workspace_refs.append(dict(reference))
             mapping["workspaces"] = workspace_refs
             # Resource inventories are not event/value snapshots. Persisted
             # material values stay on the explicit EID/live-session path.
             mapping["materials"] = []
             if workspace_refs or mapping["aliases"] or raw_mapping["workspaces"]:
-                # Preserve a known exact raw/API/encoding target even when its
-                # ABI/layout differs. An empty candidate list reports a skip;
-                # it never grants source or executable reuse eligibility.
+                # Preserve an exact raw/API/encoding target. No code-only or
+                # fuzzy match can authorize an inventory source seed.
                 filtered.append(mapping)
         return filtered
 
@@ -6710,7 +7542,7 @@ class ReplayProjectService:
                 record, provenance_index
             )
             source_ref = {
-                "kind": "verified-hlsl",
+                "kind": "verified-" + _workspace_source_format(record),
                 "knowledgeId": knowledge_id,
                 "artifactPath": str(source_path),
                 "sha256": record["sourceSha256"],
@@ -6765,6 +7597,10 @@ class ReplayProjectService:
                     "oldReplacementIdReused": False,
                     "oldCaptureAbiAuthorityReused": False,
                 }
+                if compiled.get("validationScope") == "manual-edit-unvalidated":
+                    compiled_plan.update(manualEdit=True, validationScope="manual-edit-unvalidated",
+                        manualApplyReceipt=copy.deepcopy(compiled["manualApplyReceipt"]),
+                        originValidationEvidenceOnly=False, freshLiveAbiRevalidationRequired=False)
                 artifact_refs.append(
                     {
                         "kind": "verified-compiled-candidate",
@@ -6822,6 +7658,15 @@ class ReplayProjectService:
                 "schemaVersion": 1,
                 "knowledgeId": knowledge_id,
                 "source": source_ref,
+                **({"sourceFormat": _workspace_source_format(record)}
+                   if _workspace_source_format(record) != "hlsl" else {}),
+                "registeredWorkspace": {
+                    "workspaceId": record["workspaceId"],
+                    "path": str(record.get("workspacePath") or ""),
+                },
+                "publicationMode": record.get("publicationMode"),
+                "sourceOriginPath": record.get("sourceOriginPath"),
+                "registeredCompiledCandidatePresent": record.get("compiledCandidate") is not None,
                 "targetProfile": copy.deepcopy(record["targetProfile"]),
                 "physicalIdentity": stable_identity,
                 "interfaceHash": record["interfaceHash"],
@@ -6937,6 +7782,7 @@ class ReplayProjectService:
         plan = self._reuse_plan_from_mappings(
             manifest, capture, state, mappings
         )
+        provenance_index = self._restore_provenance_index(manifest)
         for match in plan["matches"]:
             if (not match["workspaceCandidates"] and
                     self._indexed_reuse_matches(state["indexes"]["workspaces"], match["shader"])):
@@ -6948,18 +7794,35 @@ class ReplayProjectService:
             match["targetAnchorAvailable"] = anchor_available
             for candidate in match["workspaceCandidates"]:
                 origin = state["workspaces"][candidate["knowledgeId"]]
+                origin_identity = self._workspace_inventory_stable_identity(
+                    origin, provenance_index
+                )
+                stable_key_matched = (
+                    origin_identity["stableKeySha256"]
+                    == match["shader"]["stableKeySha256"]
+                )
                 source_preparation_only = (
                     origin.get("interfaceComplete") is not True
                     or match["shader"].get("interfaceComplete") is not True
+                    or not stable_key_matched
                 )
                 candidate["sourcePreparationOnly"] = source_preparation_only
+                candidate["originStableKeySha256"] = origin_identity["stableKeySha256"]
+                candidate["targetStableKeySha256"] = match["shader"]["stableKeySha256"]
+                candidate["stableKeyMatched"] = stable_key_matched
+                candidate["requiresFreshCompile"] = source_preparation_only
                 if source_preparation_only:
-                    # Exact raw/API/encoding/ABI/layout identifies a source
-                    # input. Incomplete interface evidence cannot route an old
-                    # binary; a new workspace must compile and validate live.
+                    # Source recovery does not inherit old ABI or binary
+                    # authority. Resolve both from the current target.
+                    candidate["sourceSeedEligible"] = True
+                    candidate.pop("blockedReason", None)
                     candidate["binaryCandidateEligible"] = False
                     candidate["binaryCandidate"] = None
-                    candidate["binaryBlockedReason"] = "fresh compile required for incomplete interface evidence"
+                    candidate["binaryBlockedReason"] = (
+                        "fresh compile required for changed ABI/layout evidence"
+                        if not stable_key_matched else
+                        "fresh compile required for incomplete interface evidence"
+                    )
                 candidate["targetAnchorAvailable"] = anchor_available
                 candidate["targetAnchorRequiredBeforeExecutableApply"] = True
                 candidate["binaryExecutableAutoApplyEligible"] = False
@@ -6968,7 +7831,8 @@ class ReplayProjectService:
             {
                 "inventoryOnly": True,
                 "fuzzyExecutableMatchAllowed": False,
-                "stableKeyExactRequiredForSourceOrBinary": True,
+                "stableKeyExactRequiredForSourceOrBinary": False,
+                "stableKeyExactRequiredForSource": False,
                 "rawExactSourcePreparationAllowed": True,
                 "stableKeyExactRequiredForBinary": True,
                 "targetAnchorRequiredBeforeExecutableApply": True,
@@ -7165,7 +8029,9 @@ class ReplayProjectService:
             [candidate],
         )
 
-    def seed_workspace(self, knowledge_id: str, destination_status: Mapping[str, Any]) -> dict[str, Any]:
+    def seed_workspace(self, knowledge_id: str, destination_status: Mapping[str, Any],
+                       *, supersede_local_edit: bool = False,
+                       published_source_advance: Mapping[str, Any] | None = None) -> dict[str, Any]:
         token = str(knowledge_id or "").strip().lower()
         if not HEX32_RE.fullmatch(token):
             raise ReplayProjectError("knowledge_id must be 32 lowercase hexadecimal characters")
@@ -7177,14 +8043,14 @@ class ReplayProjectService:
         shader_status = destination_status.get("shader")
         if not all(isinstance(value, Mapping) for value in (source_status, baseline, capture_status, shader_status)):
             raise ReplayProjectError("destination workspace provenance is incomplete")
-        if source_status.get("present") is not True or source_status.get("modifiedSinceDecompile") is not False:
+        if source_status.get("present") is not True:
             raise ReplayProjectError("destination source must be present and still unmodified")
         if (
             source_status.get("lane") != "executable-editable"
-            or source_status.get("format") != "hlsl"
+            or source_status.get("format") not in {"hlsl", "glsl"}
         ):
             raise ReplayProjectError(
-                "project source seeding supports only executable-editable HLSL"
+                "project source seeding supports executable-editable HLSL or GLSL"
             )
         capture_id = _sha(
             capture_status.get("captureId"), "destination.captureId"
@@ -7198,6 +8064,21 @@ class ReplayProjectService:
             if len(records) != 1:
                 raise ReplayProjectError("unknown project workspace knowledge ID")
             knowledge = records[0]
+            if published_source_advance is not None:
+                current_advance = self._published_workspace_source_advance(manifest, token, destination_status)
+                if (not isinstance(published_source_advance, Mapping) or current_advance is None
+                        or set(published_source_advance) != set(current_advance)
+                        or any(type(published_source_advance[key]) is not type(value)
+                               or published_source_advance[key] != value
+                               for key, value in current_advance.items())):
+                    raise ReplayProjectError("published workspace source/head changed before seed")
+            if (source_status.get("modifiedSinceDecompile") is not False
+                    and not supersede_local_edit
+                    and published_source_advance is None
+                    and source_status.get("currentSha256") != knowledge.get("sourceSha256")):
+                raise ReplayProjectError("destination source must be present and still unmodified")
+            if _workspace_source_format(knowledge) != source_status["format"]:
+                raise ReplayProjectError("project and destination source formats differ")
             capture = self._capture_for_provenance(
                 manifest, capture_id, catalog_revision_sha256
             )
@@ -7213,12 +8094,17 @@ class ReplayProjectService:
                 raise ReplayProjectError("project source knowledge does not match the destination shader")
             if (
                 knowledge.get("targetProfile") != destination_status.get("targetProfile")
-                or not knowledge.get("baselineAbiSha256")
-                or knowledge.get("baselineAbiSha256") != baseline.get("abiSha256")
+                or (mode != "raw-exact" and (
+                    not knowledge.get("baselineAbiSha256")
+                    or knowledge.get("baselineAbiSha256") != baseline.get("abiSha256")
+                ))
             ):
                 raise ReplayProjectError("destination target profile/physical ABI differs from project knowledge")
+            _sha(baseline.get("abiSha256"), "destination.abiSha256")
             project_source = self._artifact(knowledge["sourcePath"], "workspace source")
             source_bytes = _file_bytes(project_source, MAX_SOURCE_BYTES, "workspace source")
+            if _sha256_bytes(source_bytes) != knowledge["sourceSha256"]:
+                raise ReplayProjectError("project source bytes changed")
             destination = _normal_path(str(source_status.get("path", "")))
             workspace_root = _normal_path(str(destination_status.get("workspacePath", "")))
             if destination.is_symlink() or not destination.is_file() or not is_within(workspace_root, destination):
@@ -7227,17 +8113,27 @@ class ReplayProjectService:
                 source_status.get("currentSha256"),
                 "destination.source.currentSha256",
             )
+            project_bundle = (
+                self._prepare_workspace_source_locked(token, destination_status, manifest)
+                if (source_status.get("projectSource") is not None
+                    or published_source_advance is not None
+                    or source_status.get("currentSha256") == knowledge["sourceSha256"]) else None
+            )
             with _workspace_seed_lock(workspace_root):
-                if (
-                    _sha256_bytes(
-                        _file_bytes(destination, MAX_SOURCE_BYTES, "destination source")
-                    )
-                    != expected_destination_hash
-                ):
+                current_bytes = _file_bytes(destination, MAX_SOURCE_BYTES, "destination source")
+                if _sha256_bytes(current_bytes) != expected_destination_hash:
                     raise ReplayProjectError(
                         "destination source changed after workspace validation"
                     )
-                atomic_write_bytes(destination, source_bytes)
+                if published_source_advance is not None:
+                    self._recheck_published_source_seed(workspace_root, destination_status)
+                superseded = _backup_local_edit(
+                    workspace_root, destination, current_bytes,
+                    superseding=bool(source_status.get("modifiedSinceDecompile"))
+                    and (supersede_local_edit or published_source_advance is not None))
+                _write_seeded_workspace_source(
+                    workspace_root, destination, current_bytes, source_bytes,
+                    destination_status, project_bundle)
                 if (
                     _sha256_bytes(
                         _file_bytes(destination, MAX_SOURCE_BYTES, "seeded source")
@@ -7246,6 +8142,7 @@ class ReplayProjectService:
                 ):
                     raise ReplayProjectError("seeded workspace source hash mismatch")
             return {
+                "supersededLocalEdit": superseded,
                 "schema": "renderdoc-ultra-project-workspace-seed/v1",
                 "schemaVersion": 1,
                 "projectId": manifest["projectId"],
@@ -7268,8 +8165,10 @@ class ReplayProjectService:
         target_shader: Mapping[str, Any],
         inventory: Mapping[str, Any],
         expected_binding: Mapping[str, Any] | None = None,
+        supersede_local_edit: bool = False,
+        published_source_advance: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Seed only verified HLSL using a fresh resource inventory.
+        """Seed verified editable source using a fresh resource inventory.
 
         This path intentionally does not require the target RDC to be imported
         as a full one-EID catalog.  The current target ResourceId, profile,
@@ -7310,14 +8209,16 @@ class ReplayProjectService:
             for value in (source_status, baseline, capture_status, shader_status)
         ):
             raise ReplayProjectError("destination workspace provenance is incomplete")
+        baseline_abi = _sha(baseline.get("abiSha256"), "destination.abiSha256",
+                            allow_empty=True)
+        incomplete_inventory = target.get("interfaceComplete") is not True
         if (
             source_status.get("present") is not True
-            or source_status.get("modifiedSinceDecompile") is not False
             or source_status.get("lane") != "executable-editable"
-            or source_status.get("format") != "hlsl"
+            or source_status.get("format") not in {"hlsl", "glsl"}
         ):
             raise ReplayProjectError(
-                "destination must contain unmodified executable-editable HLSL"
+                "destination must contain unmodified executable-editable HLSL or GLSL"
             )
         if _positive(
             shader_status.get("resourceId"), "destination.resourceId"
@@ -7336,12 +8237,10 @@ class ReplayProjectService:
             != target["entryPoint"]
             or _sha(baseline.get("rawSha256"), "destination.rawSha256")
             != target["rawSha256"]
-            or _sha(
-                baseline.get("abiSha256"),
-                "destination.abiSha256",
-                allow_empty=True,
-            )
-            != target["abiHash"]
+            or _sha(shader_status.get("rawSha256"), "destination.shader.rawSha256")
+            != target["rawSha256"]
+            or (not incomplete_inventory and not self._workspace_inventory_abi_matches(
+                destination_status, target["abiHash"]))
             or _shader_encoding(baseline.get("kind")) != target["encoding"]
         ):
             raise ReplayProjectError(
@@ -7367,6 +8266,22 @@ class ReplayProjectService:
                 raise ReplayProjectError(
                     "workspace knowledge is not matched by this inventory"
                 )
+            if incomplete_inventory:
+                # An incomplete catalog ABI is not the workspace's live ABI.
+                # Only an exact original-program source match may cross this
+                # boundary; no cached executable gains replacement authority.
+                matched_source = any(
+                    match["shader"].get("resourceId") == target["resourceId"]
+                    and match["shader"].get("stableKeySha256") == target["stableKeySha256"]
+                    and any(candidate.get("knowledgeId") == token
+                            and candidate.get("sourcePreparationOnly") is True
+                            and candidate.get("sourceSeedEligible") is True
+                            and candidate.get("binaryCandidateEligible") is False
+                            and candidate.get("binaryCandidate") is None
+                            for candidate in match["workspaceCandidates"])
+                    for match in snapshot["reusePlan"]["matches"])
+                if not matched_source:
+                    raise ReplayProjectError("incomplete inventory has no verified source-only target match")
             records = [
                 item
                 for item in manifest["knowledge"]["workspaces"]
@@ -7375,29 +8290,55 @@ class ReplayProjectService:
             if len(records) != 1:
                 raise ReplayProjectError("unknown project workspace knowledge ID")
             knowledge = records[0]
+            if published_source_advance is not None:
+                current_advance = self._published_workspace_source_advance(
+                    manifest, token, destination_status)
+                if (not isinstance(published_source_advance, Mapping)
+                        or current_advance is None
+                        or set(published_source_advance) != set(current_advance)
+                        or any(type(published_source_advance[key]) is not type(value)
+                               or published_source_advance[key] != value
+                               for key, value in current_advance.items())):
+                    raise ReplayProjectError("published workspace source/head changed before seed")
+            if (source_status.get("modifiedSinceDecompile") is not False
+                    and not supersede_local_edit
+                    and published_source_advance is None
+                    and source_status.get("currentSha256") != knowledge.get("sourceSha256")):
+                raise ReplayProjectError("destination source must be present and still unmodified")
+            if _workspace_source_format(knowledge) != source_status["format"]:
+                raise ReplayProjectError("project and destination source formats differ")
             provenance_index = self._restore_provenance_index(manifest)
             origin_identity = self._workspace_inventory_stable_identity(
                 knowledge, provenance_index
             )
-            if origin_identity["stableKeySha256"] != target["stableKeySha256"]:
-                raise ReplayProjectError(
-                    "project knowledge stable key differs from target Shader"
-                )
             if (
-                knowledge.get("targetProfile")
-                != destination_status.get("targetProfile")
-                or not knowledge.get("baselineAbiSha256")
-                or knowledge.get("baselineAbiSha256") != target["abiHash"]
+                _match_mode(knowledge, target) != "raw-exact"
+                or origin_identity["api"] != target["api"]
+                or origin_identity["encoding"] != target["encoding"]
             ):
                 raise ReplayProjectError(
-                    "destination target profile/ABI differs from project knowledge"
+                    "project source does not match the exact original target Shader"
                 )
+            if knowledge.get("targetProfile") != destination_status.get("targetProfile"):
+                raise ReplayProjectError(
+                    "destination target profile differs from project knowledge"
+                )
+            stable_key_matched = origin_identity["stableKeySha256"] == target["stableKeySha256"]
+            binary_eligible = bool(
+                stable_key_matched
+                and knowledge.get("interfaceComplete") is True
+                and target.get("interfaceComplete") is True
+                and knowledge.get("compiledCandidate")
+                and knowledge.get("compilerBinding")
+            )
             project_source = self._artifact(
                 knowledge["sourcePath"], "workspace source"
             )
             source_bytes = _file_bytes(
                 project_source, MAX_SOURCE_BYTES, "workspace source"
             )
+            if _sha256_bytes(source_bytes) != knowledge["sourceSha256"]:
+                raise ReplayProjectError("project source bytes changed")
             destination = _normal_path(str(source_status.get("path", "")))
             workspace_root = _normal_path(
                 str(destination_status.get("workspacePath", ""))
@@ -7414,21 +8355,33 @@ class ReplayProjectService:
                 source_status.get("currentSha256"),
                 "destination.source.currentSha256",
             )
+            project_bundle = (
+                self._prepare_workspace_source_locked(token, destination_status, manifest)
+                if (source_status.get("projectSource") is not None or incomplete_inventory
+                    or published_source_advance is not None
+                    or source_status.get("currentSha256") == knowledge["sourceSha256"]) else None
+            )
             with _workspace_seed_lock(workspace_root):
-                if _sha256_bytes(
-                    _file_bytes(
-                        destination, MAX_SOURCE_BYTES, "destination source"
-                    )
-                ) != expected_destination_hash:
+                current_bytes = _file_bytes(destination, MAX_SOURCE_BYTES, "destination source")
+                if _sha256_bytes(current_bytes) != expected_destination_hash:
                     raise ReplayProjectError(
                         "destination source changed after workspace validation"
                     )
-                atomic_write_bytes(destination, source_bytes)
+                if published_source_advance is not None:
+                    self._recheck_published_source_seed(workspace_root, destination_status)
+                superseded = _backup_local_edit(
+                    workspace_root, destination, current_bytes,
+                    superseding=bool(source_status.get("modifiedSinceDecompile"))
+                    and (supersede_local_edit or published_source_advance is not None))
+                _write_seeded_workspace_source(
+                    workspace_root, destination, current_bytes, source_bytes,
+                    destination_status, project_bundle)
                 if _sha256_bytes(
                     _file_bytes(destination, MAX_SOURCE_BYTES, "seeded source")
                 ) != knowledge["sourceSha256"]:
                     raise ReplayProjectError("seeded workspace source hash mismatch")
             return {
+                "supersededLocalEdit": superseded,
                 "schema": "renderdoc-ultra-project-workspace-inventory-seed/v1",
                 "schemaVersion": 1,
                 "projectId": manifest["projectId"],
@@ -7440,13 +8393,13 @@ class ReplayProjectService:
                 "workspacePath": str(workspace_root),
                 "sourcePath": str(destination),
                 "sourceSha256": knowledge["sourceSha256"],
-                "matchMode": "raw-and-stable-key-exact",
+                "matchMode": "raw-and-stable-key-exact" if stable_key_matched else "raw-exact",
+                "originStableKeySha256": origin_identity["stableKeySha256"],
+                "stableKeyMatched": stable_key_matched,
                 "applied": False,
                 "compiled": False,
                 "requiresCompile": True,
-                "verifiedBinaryCandidateMaySkipCompile": bool(
-                    knowledge.get("compiledCandidate")
-                ),
+                "verifiedBinaryCandidateMaySkipCompile": binary_eligible,
                 "requiresFreshTargetResourceBind": True,
                 "requiresLiveAbiRevalidation": True,
                 "oldResourceIdReused": False,

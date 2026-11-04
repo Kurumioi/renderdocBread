@@ -175,9 +175,9 @@ def _managed_config_evidence(
         result["reason"] = "The previous status path is a symlink"
         return result
     try:
-        status = read_json_object(status_path, MAX_STATUS_BYTES, "ReplayLab shader status")
+        status = read_json_object(status_path, MAX_STATUS_BYTES, "Bread shader status")
     except (OSError, ValueError) as exc:
-        result["reason"] = "No valid ReplayLab ownership status is available: %s" % exc
+        result["reason"] = "No valid Bread ownership status is available: %s" % exc
         return result
     if status.get("schema") != DISCOVERY_SCHEMA:
         result["reason"] = (
@@ -200,7 +200,7 @@ def _managed_config_evidence(
         result["reason"] = "The managed config ownership record has unexpected fields"
         return result
     if record.get("schema") != MANAGED_CONFIG_SCHEMA or record.get("owner") != "ReplayLab":
-        result["reason"] = "The managed config ownership record is not a ReplayLab record"
+        result["reason"] = "The managed config ownership record has an unexpected compatibility owner id"
         return result
     if not _same_path(record.get("toolConfigPath"), tool_path) or not _same_path(
         record.get("routeConfigPath"), route_path
@@ -224,11 +224,11 @@ def _managed_config_evidence(
         return result
     if current_tool_hash != tool_hash or current_route_hash != route_hash:
         result["reason"] = (
-            "A default config differs from the exact hashes in the last ReplayLab status"
+            "A default config differs from the exact hashes in the last Bread status"
         )
         return result
     result["managed"] = True
-    result["reason"] = "Both current config hashes match the last ReplayLab status"
+    result["reason"] = "Both current config hashes match the last Bread status"
     return result
 
 
@@ -618,7 +618,7 @@ def configure_environment(
     # silently fall back to another executable or to temporary Python files.
     adapter_host = _regular(base / "ReplayLabShaderTools.exe")
     if adapter_host is None and (
-        getattr(sys, "frozen", False) or _regular(base / "ReplayLabMCP.exe") is not None
+        getattr(sys, "frozen", False) or _regular(base / "BreadMCP.exe") is not None
     ):
         raise RuntimeError(
             "The packaged shader runner is missing: %s; deploy the complete runtime before using shader tools"
@@ -680,7 +680,7 @@ def _configure_automatic_environment(
             report["source"] = "existing-unmanaged-config"
             report["refreshBlockedReason"] = report["ownershipEvidence"]
             report["error"] = (
-                "Existing default shader configs were not replaced because ReplayLab "
+                "Existing default shader configs were not replaced because Bread "
                 "cannot prove they are its untouched managed pair."
             )
             atomic_write_json(status_path, report)
@@ -753,7 +753,7 @@ def _configure_automatic_environment(
                     )
     elif tool_present or route_present:
         report["source"] = "incomplete-existing-config"
-        report["error"] = "Only one ReplayLab shader config exists; refusing to overwrite it"
+        report["error"] = "Only one Bread shader config exists; refusing to overwrite it"
         atomic_write_json(status_path, report)
     elif any(found.values()):
         staged_tool, staged_route, generated = _stage_generation(config, found, adapter_host)

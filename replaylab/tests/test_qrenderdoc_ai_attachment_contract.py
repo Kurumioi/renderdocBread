@@ -1319,8 +1319,10 @@ def test_shader_views_forward_exact_selections_and_structured_context_through_th
     assert "GetShader(m_Stage) == shaderId" in native_context
     assert "QJsonDocument(context).toJson(QJsonDocument::Compact)" in native_context
     assert "os.path.basename(source_path)" in workspace_forwarder
-    assert '"schema": "replaylab-attachment-context/v1"' in workspace_forwarder
-    assert '"panel": "shader-workspace"' in workspace_forwarder
+    workspace_context = _section(workspace, "def _selection_attachment(", "def _normal_path(")
+    assert "_selection_attachment(" in workspace_forwarder
+    assert '"schema": "replaylab-attachment-context/v1"' in workspace_context
+    assert '"panel": "shader-workspace"' in workspace_context
 
 
 def test_active_multi_step_task_uses_a_rounded_hover_popup_with_wrapped_status_rows() -> None:

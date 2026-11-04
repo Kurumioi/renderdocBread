@@ -1,8 +1,9 @@
 """Persistent-host orchestration for safe ReplayLab project restoration.
 
-The RDC section consumed here is only a disposable routing cache.  Every
-Shader is first matched by a bounded, zero-EID target-capture resource index,
-then passes the ordinary single-anchor live ABI/apply transaction. CBuffer
+The RDC section consumed here is only a disposable routing cache. Shaders
+normally pass a bounded target-resource match and single-anchor live ABI
+transaction. A separate same-file content snapshot can reuse Bridge-signed
+successful validation while independently checking all current bytes. CBuffer
 names and field aliases are restored from exact ABI/layout knowledge, while
 numeric values and material snapshots remain explicit current-EID operations.
 
@@ -23,12 +24,13 @@ import json
 import math
 import os
 from pathlib import Path, PurePosixPath
+import re
 import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 import uuid
 
-from .projects import MAX_CAPTURE_CATALOG_BYTES, ReplayProjectError, ReplayProjectService
+from .projects import MAX_CAPTURE_CATALOG_BYTES, MAX_PROJECT_BYTES, PROJECT_SCHEMA, ReplayProjectError, ReplayProjectService, _reuse_api_family
 from . import rdc_project_index as _rdc_project_index
 from .rdc_project_index import (
     RDC_PROJECT_INDEX_VERSION,
@@ -45,8 +47,13 @@ from .rdc_shader_inventory_cache import (
     load_shader_inventory_cache,
     write_shader_inventory_cache,
 )
-from .shader_workspace.io import atomic_write_bytes, is_within
+from .shader_workspace.io import atomic_write_bytes, is_within, read_json_object
+from .shader_source_publication import source_only_restore_reason
 from .symbols.scanner import interface_hash, interface_is_complete, layout_hash
+from .ipc_client import (
+    IPCBridgeResponseError, IPCTransportError, _CALL_BINDING,
+    resume_after_foreground_yield,
+)
 
 
 RESTORE_SCHEMA = "replaylab-project-restore/v1"
@@ -79,6 +86,17 @@ _MAX_RESTORE_ALIAS_CANDIDATES = 4096
 _MAX_RESTORE_ALIASES = 65536
 _FAST_INDEX_POLL_SECONDS = 0.025
 _FAST_INDEX_TIMEOUT_SECONDS = 15.0
+_MAX_INTERNAL_TOOL_SPILL_BYTES = 8 * 1024 * 1024
+
+
+def _workspace_artifact_service(host: Any) -> Any:
+    """Persisted bytes/metadata never depend on an unrelated installed tool.
+
+    Execution paths keep the normal service. The fallback preserves older
+    Host adapters which expose only the original service interface.
+    """
+    factory = getattr(host, "_shader_workspace_artifact_service", None)
+    return factory() if callable(factory) else host._shader_workspace_service()
 
 
 def _is_transient_bridge_poll_timeout(error: BaseException) -> bool:
@@ -131,8 +149,16 @@ class RestoreContextChanged(RuntimeError):
     """The active project/capture lifecycle changed during restoration."""
 
 
+class RestoreContextUnavailable(RuntimeError):
+    """The current lifecycle could not be read; no change was established."""
+
+
 class RestoreRollbackFailed(RuntimeError):
     """A live Shader replacement could not be transactionally rolled back."""
+
+
+class RestoreRetainedShaderApply(RuntimeError):
+    """An exact handoff committed, but the current source is not yet verified."""
 
 
 class RestoreControlStop(RuntimeError):
@@ -156,11 +182,11 @@ def _restore_control_checkpoint(
 
     if cancel_event is not None and cancel_event.is_set():
         raise RestoreCancelled(
-            "ReplayLab project restore was cancelled at %s" % phase
+            "Bread project restore was cancelled at %s" % phase
         )
     if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
         raise RestoreDeadlineExceeded(
-            "ReplayLab project restore exceeded its server deadline at %s" % phase
+            "Bread project restore exceeded its server deadline at %s" % phase
         )
 
 
@@ -376,6 +402,75 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _expand_internal_tool_spill(
+    value: dict[str, Any], operation: str
+) -> dict[str, Any]:
+    """Read a Host-owned exact result when the public tool returned a preview.
+
+    Public MCP responses are deliberately compacted so vendor clients do not
+    lose a large result in their transport.  Project restore runs inside that
+    same trusted Host process and needs the complete prepare receipt.  Treating
+    the compact preview as the full schema caused one identical failure for
+    every Shader in a capture.  Resolve only the content-addressed result-spill
+    pointer, below the Host-owned directory and within the restore byte bound.
+    """
+
+    compacted = value.get("_compacted")
+    pointer = value.get("completeContent")
+    if compacted is None and pointer is None:
+        return value
+    if (
+        not isinstance(compacted, Mapping)
+        or compacted.get("schema") != "replaylab-complete-result-spill/v1"
+        or compacted.get("mode") != "exact-content-pointer"
+        or not isinstance(pointer, Mapping)
+        or pointer.get("mediaType") != "application/json"
+        or pointer.get("encoding") != "utf-8"
+    ):
+        raise RuntimeError("%s returned an invalid compact-result receipt" % operation)
+    path_text = pointer.get("path")
+    byte_size = pointer.get("byteSize")
+    digest = pointer.get("sha256")
+    if (
+        not isinstance(path_text, str)
+        or not path_text
+        or "\0" in path_text
+        or isinstance(byte_size, bool)
+        or not isinstance(byte_size, int)
+        or byte_size <= 0
+        or byte_size > _MAX_INTERNAL_TOOL_SPILL_BYTES
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in _SHA256_CHARS for character in digest)
+    ):
+        raise RuntimeError("%s returned an invalid compact-result identity" % operation)
+    from . import server
+
+    root = (
+        server._asset_tool_output_root() / server._RESULT_SPILL_PREFIX
+    ).resolve(strict=True)
+    raw_path = Path(path_text).expanduser()
+    if not raw_path.is_absolute() or raw_path.is_symlink():
+        raise RuntimeError("%s compact result path is invalid" % operation)
+    target = raw_path.resolve(strict=True)
+    if not target.is_file() or not is_within(root, target):
+        raise RuntimeError("%s compact result escaped Host storage" % operation)
+    data = target.read_bytes()
+    if len(data) != byte_size or hashlib.sha256(data).hexdigest() != digest:
+        raise RuntimeError("%s compact result content changed" % operation)
+    try:
+        exact = json.loads(
+            data.decode("utf-8", errors="strict"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("%s compact result is not exact JSON" % operation) from exc
+    if not isinstance(exact, dict):
+        raise RuntimeError("%s compact result is not an object" % operation)
+    return exact
+
+
 def _tool_json(
     payload: Any,
     operation: str,
@@ -395,10 +490,17 @@ def _tool_json(
         raise RuntimeError("%s returned invalid JSON" % operation) from exc
     if not isinstance(value, dict):
         raise RuntimeError("%s returned a non-object JSON wrapper" % operation)
+    value = _expand_internal_tool_spill(value, operation)
     if value.get("error"):
-        raise RuntimeError("%s failed: %s" % (operation, value.get("error")))
+        error = RuntimeError("%s failed: %s" % (operation, value.get("error")))
+        if isinstance(value.get("data"), Mapping):
+            error.tool_data = copy.deepcopy(value["data"])
+        raise error
     if schema is not None and value.get("schema") != schema:
-        raise RuntimeError("%s returned an unsupported schema" % operation)
+        raise RuntimeError(
+            "%s returned an unsupported schema %r (expected %r)"
+            % (operation, value.get("schema"), schema)
+        )
     if schema_version is not None and value.get("schemaVersion") != schema_version:
         raise RuntimeError("%s returned an unsupported schema version" % operation)
     return value
@@ -424,6 +526,16 @@ class _Progress:
         self._lock = threading.RLock()
         self._last_signature: tuple[Any, ...] | None = None
         self._callback_available = callback is not None
+        self._phase = ""
+        self._phase_started = time.monotonic()
+        self._phases_ms: dict[str, float] = {}
+
+    def timings(self) -> dict[str, float]:
+        with self._lock:
+            result = dict(self._phases_ms)
+            if self._phase:
+                result[self._phase] = result.get(self._phase, 0) + (time.monotonic()-self._phase_started)*1000
+            return {key: round(value,3) for key,value in result.items()}
 
     @staticmethod
     def _item_from_detail(detail: Mapping[str, Any]) -> str:
@@ -503,6 +615,11 @@ class _Progress:
             event["item"],
         )
         with self._lock:
+            if phase != self._phase:
+                now = time.monotonic()
+                if self._phase:
+                    self._phases_ms[self._phase] = self._phases_ms.get(self._phase,0)+(now-self._phase_started)*1000
+                self._phase, self._phase_started = phase, now
             if signature == self._last_signature:
                 return
             self._last_signature = signature
@@ -544,7 +661,7 @@ def _validate_capture_and_project(
         or active.get("scopeConfigured") is not True
         or _path_key(active.get("projectRoot", "")) != _path_key(project)
     ):
-        raise RuntimeError("the requested bound project is not the active ReplayLab project")
+        raise RuntimeError("the requested bound project is not the active Bread project")
     workspace_id = _hex(active.get("workspaceId"), 32, "active workspaceId")
     replay_status = active.get("replayProject")
     paths = active.get("paths")
@@ -558,7 +675,7 @@ def _validate_capture_and_project(
         or _path_key(replay_path) != _path_key(replay_status.get("projectPath", ""))
     ):
         raise RuntimeError("active replay-project path is invalid")
-    context = host._active_live_context(allow_missing_capture_id=True)
+    context = _read_restore_identity_context(host)
     live_capture = context.get("capture")
     if not isinstance(live_capture, dict):
         raise RuntimeError("RenderDoc current context omitted capture identity")
@@ -662,6 +779,20 @@ def _inventory_binding_state(
         source_sha256 = _hex(
             source.get("sha256"), 64, "project Shader sourceSha256"
         )
+        source_format = value.get("sourceFormat", "hlsl")
+        if source_format not in {"hlsl", "glsl"}:
+            raise RuntimeError("project Shader source format is unsupported")
+        compiled_candidate = copy.deepcopy(value.get("compiledCandidate"))
+        if isinstance(compiled_candidate, Mapping) and "sha256" in compiled_candidate:
+            # Inventory artifacts use sha256; persisted/workspace candidates
+            # use rawSha256. Normalize at this read-model boundary so every
+            # later source/ABI/artifact comparison still checks the same bytes.
+            candidate_sha = _hex(compiled_candidate["sha256"], 64,
+                                 "project Shader compiled artifact sha256")
+            if ("rawSha256" in compiled_candidate
+                    and compiled_candidate["rawSha256"] != candidate_sha):
+                raise RuntimeError("project Shader compiled artifact hash fields disagree")
+            compiled_candidate = {**compiled_candidate, "rawSha256": candidate_sha}
         workspaces[str(knowledge_id)] = {
             "knowledgeId": str(knowledge_id),
             "api": _asset_api(physical.get("api")),
@@ -678,19 +809,26 @@ def _inventory_binding_state(
             ),
             "abiHash": _hex(
                 physical.get("abiHash"), 64, "project Shader abiHash"
-            ),
+            ) if physical.get("abiHash") else "",
             "baselineAbiSha256": _hex(
                 physical.get("abiHash"), 64, "project Shader abiHash"
-            ),
+            ) if physical.get("abiHash") else "",
             "layoutHash": _hex(
                 physical.get("layoutHash"), 64, "project Shader layoutHash"
-            ),
+            ) if physical.get("layoutHash") else "",
             "stableKeyComplete": value.get("interfaceComplete") is True,
             "stableKeySha256": stable_key,
             "sourceSha256": source_sha256,
+            **({"sourceFormat": source_format} if source_format != "hlsl" else {}),
             "source": copy.deepcopy(dict(source)),
+            "registeredWorkspace": copy.deepcopy(value.get("registeredWorkspace")),
+            "publicationMode": value.get("publicationMode"),
+            "sourceOriginPath": value.get("sourceOriginPath"),
+            "workspaceId": (value.get("registeredWorkspace") or {}).get("workspaceId"),
+            "workspacePath": (value.get("registeredWorkspace") or {}).get("path"),
+            "registeredCompiledCandidatePresent": value.get("registeredCompiledCandidatePresent"),
             "targetProfile": copy.deepcopy(value.get("targetProfile")),
-            "compiledCandidate": copy.deepcopy(value.get("compiledCandidate")),
+            "compiledCandidate": compiled_candidate,
             "compilerBinding": copy.deepcopy(value.get("compilerBinding")),
             "assemblyDisassemblyArtifacts": copy.deepcopy(
                 value.get("assemblyDisassemblyArtifacts", [])
@@ -794,8 +932,15 @@ def _capture_shader(
                         "entryPoint",
                         "rawSha256",
                         "layoutHash",
-                        "anchorEventId",
                     )
+                )
+                # A legacy catalog's representative is an observation, not
+                # part of the shared Shader identity. Publication may have
+                # checked another use of these exact original bytes. Preserve
+                # that receipt's anchor for the later live binding check.
+                matched = matched and all(
+                    not item.get(field) or normalise(item[field]) == wanted.get(field)
+                    for field, normalise in (("api", _asset_api), ("encoding", _asset_encoding))
                 )
         else:
             # Legacy project revisions remain readable as routing hints, but
@@ -816,8 +961,11 @@ def _capture_shader(
             matches.append(dict(item))
     if len(matches) != 1:
         raise RuntimeError("RDC Shader association differs from the exact project catalog")
-    expected_anchor = _normal_shader_identity(matches[0]).get("anchorEventId")
-    if wanted.get("anchorEventId") != expected_anchor:
+    matched_identity = _normal_shader_identity(matches[0])
+    expected_anchor = matched_identity.get("anchorEventId")
+    if (wanted.get("anchorEventId") != expected_anchor
+            and not (wanted.get("stableKeyComplete") is True
+                     and matched_identity.get("stableKeyComplete") is False)):
         raise RuntimeError(
             "RDC Shader representative EID differs from the project inventory"
         )
@@ -863,7 +1011,7 @@ def _validate_workspace_record(
     workspace = _resolve_workspace_path(
         project_root, shader_root, str(managed.get("path", ""))
     )
-    status = host._shader_workspace_service().status(str(workspace))
+    status = _workspace_artifact_service(host).status(str(workspace))
     capture = status.get("capture") if isinstance(status, Mapping) else None
     shader = status.get("shader") if isinstance(status, Mapping) else None
     source = status.get("source") if isinstance(status, Mapping) else None
@@ -908,6 +1056,8 @@ def _validate_workspace_record(
     artifact_refs = record.get("artifactRefs")
     if not isinstance(knowledge, Mapping):
         raise RuntimeError("RDC Shader association references absent project knowledge")
+    if source_only_restore_reason(knowledge, binding_state.get("projectPath")):
+        raise RuntimeError("RDC Shader association references a source-only organization draft")
     if (
         knowledge.get("sourceSha256") != record.get("sourceSha256")
         or knowledge.get("stage") != identity.get("stage")
@@ -2055,14 +2205,12 @@ def _inventory_shader_resources(
         or result.get("identityEvidenceSha256") != evidence_sha256
         or result.get("requestSha256") != request_sha256
         or result.get("inventoryOnly") is not True
-        or result.get("inventoryComplete") is not (not targets)
         or result.get("leaseEligible") is not False
         or result.get("eventTraversalCount") != 0
         or result.get("fullFrameTraversal") is not False
         or result.get("gpuReplayMutation") is not False
         or result.get("physicalApplyAuthority") is not False
         or result.get("anchorPerShaderMaximum") != 1
-        or result.get("symbolSnapshotPublished") is not (not targets)
         or result.get("resourceOwnershipScope") != "target-capture-session"
         or result.get("crossCaptureResourceIdReuse") is not False
         or not isinstance(capability, Mapping)
@@ -2075,6 +2223,31 @@ def _inventory_shader_resources(
     ):
         raise CatalogPreparationRequired(
             "RenderDoc returned invalid zero-EID Shader inventory evidence",
+            "shader-resource-index-invalid-response",
+        )
+
+    # A bounded Bridge scan may finish with a structured diagnostic before
+    # publishing success-only aggregates. Validate its capture/request and
+    # non-mutating ownership above, then retain the actual cause rather than
+    # replacing it with a misleading malformed-response error.
+    reason = result.get("reasonId")
+    if (isinstance(reason, str)
+            and re.fullmatch(r"shader-resource-index-[a-z0-9-]{1,96}", reason)
+            and result.get("matched") is False
+            and result.get("inventoryComplete") is False):
+        details = []
+        diagnostics = result.get("diagnostics")
+        for item in (diagnostics[:8] if isinstance(diagnostics, list) else []):
+            if isinstance(item, Mapping):
+                details.append({key: item[key] for key in ("code", "resourceId", "stage", "entryPoint")
+                                if isinstance(item.get(key), (str, int))})
+        raise CatalogPreparationRequired(
+            "Shader resource inventory stopped: %s; diagnostics=%s" % (
+                reason, json.dumps(details, ensure_ascii=False)[:2048]), reason)
+    if (result.get("inventoryComplete") is not (not targets)
+            or result.get("symbolSnapshotPublished") is not (not targets)):
+        raise CatalogPreparationRequired(
+            "RenderDoc returned invalid zero-EID Shader inventory completion evidence",
             "shader-resource-index-invalid-response",
         )
 
@@ -2517,20 +2690,117 @@ def _inventory_shader_resources(
         "eventTraversalCount": 0,
         "fullFrameTraversal": False,
         "anchorPerShaderMaximum": 1,
+        "originalShaderIdentityPolicy": result.get("originalShaderIdentityPolicy"),
         **target_coverage,
         "bridgeResult": dict(result),
     }
+
+
+def _project_target_inventory_cache(
+    host: Any, replay: ReplayProjectService, capture: Path, session: str,
+    api: str, targets: Sequence[str], checkpoint: Callable[[str], None] | None,
+    *, inventory: Mapping[str, Any] | None = None,
+    cache_diagnostic: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Keep same-session target/EID observations independently of apply coverage.
+
+    This is routing data, not an ABI/apply receipt. Exact RDC bytes, project
+    scope, replay session and original target set must match. Synthetic Shader
+    ResourceIds can change when the same process reopens identical RDC bytes;
+    the old session's IDs must never be relabelled as current observations.
+    Candidate bytecode and signed ABI pair proofs have separate reuse gates.
+    """
+    if (not callable(getattr(host, "_apply_project_shader_pair_restore", None))
+            or not isinstance(getattr(replay, "root", None), Path)):
+        return None
+    try:
+        root = replay.root
+        path = root / "derived" / "shader-target-inventories" / (
+            hashlib.sha256(_path_key(capture).encode("utf-8")).hexdigest() + ".json")
+        if not is_within(root, path.resolve()) or path.is_symlink():
+            return None
+        if inventory is None and not path.is_file():
+            return None
+        project = replay.status()
+        binding = {
+            "projectId": project["projectId"],
+            "scopeSha256": _canonical_sha256(project["scope"]) if isinstance(project.get("scope"), Mapping) else project.get("scopeSha256"),
+            "capturePath": _path_key(capture), "api": _asset_api(api),
+            "targetRawSha256s": sorted(targets),
+        }
+        if inventory is None:
+            if path.stat().st_size > _MAX_FAST_CATALOG_BYTES:
+                return None
+            value = json.loads(path.read_text(encoding="utf-8"))
+            seal = value.pop("sealSha256", None)
+            if (seal != _canonical_sha256(value)
+                    or value.get("schema") != "replaylab-project-shader-target-inventory/v1"
+                    or value.get("schemaVersion") != 1 or value.get("binding") != binding
+                    or value.get("captureSha256") != _verified_rdc_content_sha256(capture, checkpoint)):
+                return None
+            cached = value.get("inventory")
+            if (not isinstance(cached, Mapping)
+                    or cached.get("targetInventoryComplete") is not True
+                    or cached.get("rawIdentitySearchComplete") is not True
+                    or sorted(cached.get("targetRawSha256s") or []) != sorted(targets)
+                    or cached.get("originalShaderIdentityPolicy") != "captured-original-owner-v1"):
+                return None
+            cached_capture = cached.get("capture")
+            if (not isinstance(cached_capture, Mapping)
+                    or cached_capture.get("captureSessionId") != session):
+                if cache_diagnostic is not None:
+                    cache_diagnostic["reason"] = "target-inventory-capture-session-changed"
+                return None
+            result = copy.deepcopy(dict(cached))
+            result["capture"].update(capturePath=str(capture))
+            result.update(rawBytecode={}, bridgeResult=None, cachedTargetInventory=True)
+            # Exercise the strict projection before a cached row reaches any
+            # source, alias or replacement operation.
+            _project_shader_inventory(result, allow_target_lookup=True)
+            return result
+        if (inventory.get("targetInventoryComplete") is not True
+                or inventory.get("rawIdentitySearchComplete") is not True
+                or inventory.get("originalShaderIdentityPolicy") != "captured-original-owner-v1"):
+            return None
+        saved = {key: copy.deepcopy(value) for key, value in inventory.items()
+                 if key not in {"rawBytecode", "bridgeResult"}}
+        _project_shader_inventory(saved, allow_target_lookup=True)
+        value = {
+            "schema": "replaylab-project-shader-target-inventory/v1", "schemaVersion": 1,
+            "binding": binding, "captureSha256": _verified_rdc_content_sha256(capture, checkpoint),
+            "inventory": saved,
+        }
+        value["sealSha256"] = _canonical_sha256(value)
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > _MAX_FAST_CATALOG_BYTES:
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(path, encoded)
+    except RestoreControlStop:
+        raise
+    except Exception:
+        # Missing/stale optional observations retain the bounded live lookup.
+        return None
+    return None
 
 
 def _inventory_project_shader_targets(
     host: Any, replay: ReplayProjectService, capture_path: Path,
     capture_session_id: str, api: str, progress: _Progress,
     control_checkpoint: Callable[[str], None] | None = None,
+    *, cache_diagnostic: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Index only current project heads, in fixed batches of 16 original hashes."""
     targets = replay.restorable_shader_raw_hashes()
     if not targets or len(targets) > 65536:
         raise CatalogPreparationRequired("project has no bounded original Shader lookup targets", "shader-resource-index-targets-unavailable")
+    cached = _project_target_inventory_cache(
+        host, replay, capture_path, capture_session_id, api, targets, control_checkpoint,
+        cache_diagnostic=cache_diagnostic)
+    if cached is not None:
+        progress.emit("resource-inventory", "Reusing known original Shader targets and EIDs",
+                      current=len(cached["shaders"]), total=len(cached["shaders"]))
+        return cached
     deadline = time.monotonic() + 300.0
     def checkpoint(phase: str) -> None:
         if control_checkpoint is not None:
@@ -2552,6 +2822,8 @@ def _inventory_project_shader_targets(
             )
         results.append(result)
     if len(results) == 1:
+        _project_target_inventory_cache(host, replay, capture_path, capture_session_id,
+                                        api, targets, control_checkpoint, inventory=results[0])
         return results[0]
     merged = copy.deepcopy(results[0])
     by_target: dict[tuple[int, str], dict[str, Any]] = {}
@@ -2581,12 +2853,145 @@ def _inventory_project_shader_targets(
     for result in results[1:]:
         filtered.intersection_update(result["filteredOutShaderResourceIds"])
     merged.update(shaders=shaders, rawBytecode=blobs, bridgeResult=None,
+                  originalShaderIdentityPolicy=("captured-original-owner-v1" if all(
+                      item.get("originalShaderIdentityPolicy") == "captured-original-owner-v1"
+                      for item in results) else None),
                   targetRawSha256s=targets, observedTargetRawSha256s=sorted(observed),
                   unobservedTargetRawSha256s=sorted(set(targets) - observed),
                   targetMatchedShaderResourceIds=sorted({item["resourceId"] for item in shaders}),
                   filteredOutShaderResourceIds=sorted(filtered), filteredOutShaderResourceCount=len(filtered),
                   targetBatchCount=len(results))
+    _project_target_inventory_cache(host, replay, capture_path, capture_session_id,
+                                    api, targets, control_checkpoint, inventory=merged)
     return merged
+
+
+def _recover_equivalent_shader_sources(
+    host: Any, replay: ReplayProjectService, active: Mapping[str, Any],
+    project: Path, capture: Path, session: str, api: str,
+    inventory: Mapping[str, Any], progress: _Progress,
+    checkpoint: Callable[[str], None], diagnostic: dict[str, Any],
+) -> Mapping[str, Any]:
+    """Resolve missed container hashes through strict target source imports.
+
+    Container debug data may differ between RDCs while executable instructions
+    are identical. A raw miss therefore is not evidence that the Shader is
+    absent. One unique-resource scan finds code candidates; only their anchor
+    EIDs need a catalog. Code alone never authorizes source or binary reuse.
+    The ordinary project catalog matcher and source importer check the complete
+    interface/layout, then the normal restore recompiles and validates the ABI.
+    """
+    missing = inventory.get("unobservedTargetRawSha256s", [])
+    lookup = getattr(replay, "restorable_shader_code_hashes", None)
+    if not callable(lookup):
+        return inventory
+    codes = set(lookup(missing, api))
+    if not codes:
+        return inventory
+    from .shader_workspace.binary_formats import fingerprint_shader_executable
+
+    diagnostic.update(attempted=True, prepared=0, candidateCount=0, items=[])
+    checkpoint("before equivalent Shader source lookup")
+    # If all raw targets were observed, the bounded target scan already has
+    # every known family member. Only a missing container needs a full unique
+    # resource index; neither path traverses every EID.
+    full = (_inventory_shader_resources(host, capture, session, api, progress, checkpoint)
+            if missing else inventory)
+    _require_restore_context(host, active, project, capture, session)
+    candidates = []
+    for shader in full["shaders"]:
+        if (shader.get("encoding") not in {"dxbc", "dxil"}
+                or shader.get("anchorEventId") is None
+                or shader.get("interfaceComplete") is not True
+                or shader.get("identityAmbiguous") is not False):
+            continue
+        payload = full.get("rawBytecode", {}).get(shader["rawSha256"])
+        if not isinstance(payload, bytes):
+            continue
+        executable = fingerprint_shader_executable(
+            payload, "current Shader source lookup", format_hint=shader["encoding"])
+        if (executable is not None and executable.raw_sha256 == shader["rawSha256"]
+                and executable.code_sha256 in codes):
+            candidates.append(shader)
+    diagnostic["candidateCount"] = len(candidates)
+    for shader in candidates:
+        checkpoint("before equivalent Shader target catalog")
+        identity = _normal_shader_identity(shader)
+        located = _tool_json(host.get_active_shader_workspace_path(
+            identity["anchorEventId"], identity["stage"],
+            expected_resource_id=identity["resourceId"],
+            expected_entry_point=identity["entryPoint"],
+            expected_raw_sha256=identity["rawSha256"],
+            expected_capture_session_id=session),
+            "resolve equivalent Shader source", schema="replaylab-active-shader-workspace-path/v1",
+            schema_version=1)
+        if (located.get("captureSessionId") != session
+                or located.get("shaderResourceId") != identity["resourceId"]
+                or located.get("rawSha256") != identity["rawSha256"]
+                or located.get("stage") != identity["stage"]
+                or located.get("entryPoint", "") != identity["entryPoint"]
+                or located.get("eventId") != identity["anchorEventId"]):
+            raise RestoreContextChanged("equivalent Shader target changed during catalog lookup")
+        plan = replay.reuse_plan(located["captureId"], located["catalogSha256"])
+        matches = [candidate for match in plan.get("matches", [])
+            if all(match.get("shader", {}).get(key) == identity[key]
+                   for key in ("resourceId", "stage", "entryPoint", "rawSha256"))
+            for candidate in match.get("workspaceCandidates", [])
+            if candidate.get("matchMode") == "code-interface-layout-exact"
+            and candidate.get("activeCandidate") is True
+            and candidate.get("sourceSeedEligible") is True]
+        if len(matches) != 1:
+            diagnostic["items"].append({"resourceId": identity["resourceId"],
+                "status": "unmatched", "reason": "no-unique-code-interface-layout-match"})
+            continue
+        candidate = matches[0]
+        workspace, status, unused_capture, unused_catalog = _prepare_reuse_workspace(
+            host, active, identity, session, located["catalogSha256"],
+            expected_anchor_event_id=identity["anchorEventId"],
+            expected_source_sha256=candidate["sourceSha256"], inventory_mode=True,
+            capture_path=capture, progress=progress)
+        source = status.get("source") or {}
+        if source.get("currentSha256") != candidate["sourceSha256"]:
+            advance = replay.published_workspace_source_advance(candidate["knowledgeId"], status)
+            if advance is None and source.get("modifiedSinceDecompile") is not False:
+                raise RestoreLocalEdit("equivalent Shader target has an unpublished local source", workspace,
+                                       str(source.get("currentSha256") or ""))
+            suspension = _suspend_workspace_watchers(host, workspace)
+            try:
+                checkpoint("before advancing published equivalent Shader source")
+                _require_restore_context(host, active, project, capture, session)
+                replay.seed_workspace(candidate["knowledgeId"], status,
+                    **({"published_source_advance": advance} if advance is not None else {}))
+                status = _reuse_workspace_status(host, active, workspace, identity,
+                                                 unused_capture, unused_catalog)
+            finally:
+                if suspension is not None:
+                    suspension.__exit__(None, None, None)
+            source = status.get("source") or {}
+        receipt = source.get("projectSource") or {}
+        if (source.get("currentSha256") != candidate["sourceSha256"]
+                or receipt.get("knowledgeId") != candidate["knowledgeId"]
+                or receipt.get("sourceSha256") != candidate["sourceSha256"]
+                or receipt.get("originalRawSha256") != identity["rawSha256"]
+                or receipt.get("projectId") != active["replayProject"]["projectId"]
+                or receipt.get("requiresCompile") is not True
+                or receipt.get("requiresLiveAbiRevalidation") is not True):
+            raise RuntimeError("equivalent Shader source import has no exact target provenance")
+        checkpoint("before equivalent Shader source registration")
+        _require_restore_context(host, active, project, capture, session)
+        # Publish the authenticated target-bound source, not an old binary or
+        # ABI grant. With no current candidate this remains preparation-only;
+        # the existing raw-exact restore below compiles and validates it.
+        registered = replay.register_workspace(status, include_analysis=False)
+        if (registered.get("knowledge", {}).get("rawSha256") != identity["rawSha256"]
+                or registered["knowledge"].get("sourceSha256") != candidate["sourceSha256"]):
+            raise RuntimeError("equivalent Shader source registration changed identity")
+        diagnostic["prepared"] += 1
+        diagnostic["items"].append({"resourceId": identity["resourceId"], "status": "prepared",
+            "workspacePath": str(workspace), "matchMode": "code-interface-layout-exact"})
+    checkpoint("after equivalent Shader source lookup")
+    _require_restore_context(host, active, project, capture, session)
+    return full if diagnostic["prepared"] else inventory
 
 
 def _project_shader_inventory(inventory: Mapping[str, Any], *, allow_target_lookup: bool = False) -> dict[str, Any]:
@@ -2669,7 +3074,7 @@ def _project_shader_inventory(inventory: Mapping[str, Any], *, allow_target_look
             )
         blocks.sort(
             key=lambda item: (
-                item["index"], item["path"], item["space"], item["bind"]
+                item["space"], item["bind"], item["index"], item["path"]
             )
         )
         projected.append(
@@ -2688,7 +3093,11 @@ def _project_shader_inventory(inventory: Mapping[str, Any], *, allow_target_look
                 "interfaceHash": _hex(
                     shader.get("interfaceHash"), 64, "Shader interfaceHash"
                 ),
-                "interfaceComplete": shader.get("interfaceComplete") is True,
+                # The project v1 inventory has no separate stable-key
+                # completeness flag. A module-only reflection must remain
+                # source-only even when its interface section is populated.
+                "interfaceComplete": (shader.get("interfaceComplete") is True
+                                      and identity.get("stableKeyComplete") is True),
                 "stableKeySha256": identity["stableKeySha256"],
                 "anchorEventId": identity["anchorEventId"],
                 "constantBlocks": blocks,
@@ -3657,13 +4066,73 @@ def _validate_workspace_apply_response(
         64,
     ).lower()
     validation_scope = validation.get("validationScope", "")
+    if validation_scope == "already-applied-live-resource":
+        # This public route has just checked exact current files and the live
+        # Bridge inventory. It deliberately has no new ABI request/report or
+        # physical mutation. Validate that readback as such, not as a fresh
+        # apply (which used to reject it and redo every successful batch item).
+        current = _workspace_artifact_service(host).status(str(workspace))
+        current_latest = current.get("latestCompiled") or {}
+        row_revision = replacement.get("revision")
+        physical = replacement.get("physicalAbiSha256")
+        requested = wrapped.get("requestedBinding") or {}
+        same_anchor = (replacement.get("anchorEventId") == expected_anchor_event_id or (
+            requested.get("eventId") == expected_anchor_event_id
+            and requested.get("originalResourceId") == shader.get("resourceId")
+            and requested.get("originalRawSha256") == original_raw_sha256
+            and requested.get("stage") == status.get("stage")
+            and requested.get("entryPoint", "") == status.get("entryPoint", "")))
+        valid = all((
+            wrapped.get("schema") == "renderdoc-ultra-shader-shared-resource-apply-mcp/v1",
+            wrapped.get("operation") == "apply-shared-resource", wrapped.get("operationId") == operation_id,
+            wrapped.get("scope") == "captured-resource", wrapped.get("applied") is True,
+            wrapped.get("idempotent") is True, wrapped.get("appliedByThisCall") is False,
+            wrapped.get("replayMutation") is False, wrapped.get("evidenceSource") == "current-workspace-and-bridge",
+            binding.get("workspaceId") == status.get("workspaceId"), binding.get("captureId") == capture.get("captureId"),
+            binding.get("revision") == expected_revision, binding.get("candidateRawSha256") == expected_candidate_raw_sha256,
+            binding.get("sourceSha256") == latest.get("sourceSha256"),
+            binding.get("stage") == status.get("stage"), binding.get("entryPoint", "") == status.get("entryPoint", ""),
+            binding.get("api") == expected_api, binding.get("encoding") == expected_encoding,
+            validation.get("compatible") is True, validation.get("replayAbiValidated") is True,
+            validation.get("reusedValidation") is True, validation.get("freshPhysicalValidationPerformed") is False,
+            validation.get("captureSessionId") == capture_session_id,
+            type(row_revision) is int and 0 < row_revision <= expected_revision,
+            validation.get("physicalCandidateRevision") == row_revision,
+            validation.get("baselineAbiSha256") == physical, physical in _workspace_physical_abi_hashes(status),
+            replacement.get("workspaceId") == status.get("workspaceId"), same_anchor,
+            replacement.get("originalResourceId") == shader.get("resourceId"), replacement.get("originalRawSha256") == original_raw_sha256,
+            replacement.get("candidateRawSha256") == expected_candidate_raw_sha256,
+            replacement.get("stage") == status.get("stage"), replacement.get("entryPoint", "") == status.get("entryPoint", ""),
+            replacement.get("api") == expected_api, replacement.get("encoding") == expected_encoding,
+            replacement.get("resourceScoped") is True, replacement.get("eventScoped") is False,
+            replacement.get("allOriginalResourceUsesAffected") is True, replacement.get("originalShaderPreserved") is True,
+            replacement.get("postApplyValidationFailed") is False,
+            type(replacement.get("targetResourceId")) is int and replacement["targetResourceId"] > 0,
+            rollback.get("tool") == "rollback_shader_workspace_shared_resource",
+            _path_key(rollback.get("workspacePath", "")) == _path_key(workspace),
+            rollback.get("replacementId") == replacement.get("replacementId"),
+            current.get("workspaceId") == status.get("workspaceId"),
+            current.get("capture") == capture, current.get("shader") == shader,
+            current.get("revision") == expected_revision,
+            current.get("source", {}).get("currentSha256") == binding.get("sourceSha256"),
+            current_latest.get("sourceSha256") == binding.get("sourceSha256"),
+            current_latest.get("rawSha256") == expected_candidate_raw_sha256,
+            current_latest.get("replayAbiValidated") is True, current_latest.get("abiCompatible") is True,
+            (current_latest.get("abiGate") or {}).get("status") == "compatible",
+        ))
+        _hex(replacement.get("replacementId"), 32, "live readback replacementId")
+        _hex(replacement.get("operationId"), 32, "live readback physical operationId")
+        if not valid:
+            raise RuntimeError("Shader current-session readback differs from its source/candidate/physical binding")
+        return dict(wrapped)
     # Project restore calls the public direct-MCP apply route. Lease/live-edit
     # wrappers have a different request binding and are not accepted here.
     ordinary_validation = validation_scope == ""
+    pair_validation = validation_scope == "verified-shader-pair"
     request_id = ""
     report_sha256 = ""
     validation_evidence_valid = False
-    if ordinary_validation:
+    if ordinary_validation or pair_validation:
         request_id = _hex(
             validation.get("requestId"), 64, "Shader apply validation.requestId"
         )
@@ -3708,12 +4177,37 @@ def _validate_workspace_apply_response(
         validation_evidence_valid = bool(
             validation.get("workspacePath") == str(workspace)
             and validation.get("revision") == expected_revision
-            and validation.get("baselineAbiSha256") == baseline_abi_sha256
+            and validation.get("baselineAbiSha256") == (
+                replacement.get("physicalAbiSha256") if pair_validation else baseline_abi_sha256)
             and isinstance(validation.get("differences"), list)
             and not validation.get("differences")
             and validation.get("differencesTruncated") is False
             and validation.get("applied") is False
         )
+        if pair_validation:
+            # GLSL is compiled by the replay driver when its target is rebuilt.
+            # Its inline interface check is additional fresh evidence even
+            # though the original/candidate pair has an authenticated receipt.
+            expected_fresh = bool(_asset_encoding(latest.get("kind")) == "glsl"
+                                  and replacement.get("targetBuiltOnce") is True)
+            validation_evidence_valid = validation_evidence_valid and bool(
+                validation.get("reusedValidation") is True
+                and validation.get("freshPhysicalValidationPerformed") is expected_fresh
+                and validation.get("captureSessionId") == capture_session_id
+                and replacement.get("abiValidationMode") == "verified-shader-pair"
+                and replacement.get("freshPhysicalAbiValidationPerformed") is expected_fresh
+                # Pair replay describes the authenticated current physical
+                # interface; the immutable report/binding above still uses
+                # its original baseline spelling. Require the exact signed
+                # physical digest here, and only the verified topology alias
+                # set below, without rewriting either historical artifact.
+                and replacement.get("physicalAbiSha256") == (replacement.get(
+                    "restoreValidationReceipt") or {}).get("payload", {}).get("physicalAbiSha256")
+                and _shader_pair_receipt_matches(
+                    replacement.get("restoreValidationReceipt"),
+                    _shader_pair_validation_material(status), status,
+                )
+            )
     replacement_id = str(replacement.get("replacementId", "") or "")
     anchor_event_id = replacement.get("anchorEventId")
     candidate_byte_size = binding.get("candidateByteSize")
@@ -3758,7 +4252,7 @@ def _validate_workspace_apply_response(
         or replacement.get("originalResourceId") != shader.get("resourceId")
         or replacement.get("originalRawSha256") != original_raw_sha256
         or replacement.get("candidateRawSha256") != expected_candidate_raw_sha256
-        or replacement.get("physicalAbiSha256") != baseline_abi_sha256
+        or replacement.get("physicalAbiSha256") not in _workspace_physical_abi_hashes(status)
         or replacement.get("abiRequestId") != request_id
         or replacement.get("abiReportSha256") != report_sha256
         or len(replacement_id) != 32
@@ -3848,7 +4342,402 @@ def _recover_uncertain_workspace_apply(
     return dict(receipt)
 
 
+_SHADER_PAIR_VALIDATION_SCHEMA = "replaylab-project-validated-shader-pair/v1"
+
+
+def _workspace_physical_abi_hashes(status: Mapping[str, Any]) -> frozenset[str]:
+    """Verify stored evidence before accepting the historical Unknown spelling.
+
+    Keep cache keys, ABI report bindings and signed payloads byte-for-byte. A
+    digest with no complete physical interface remains exact-only.
+    """
+    from .shader_workspace.abi import parse_shader_abi, physical_shader_abi_hashes
+
+    baseline = status.get("baseline") or {}
+    digest = _hex(baseline.get("abiSha256"), 64, "workspace physical ABI SHA-256")
+    if baseline.get("compiledInterface") is None:
+        return frozenset((digest,))
+    abi = parse_shader_abi(
+        baseline["compiledInterface"], expected_stage=str(status.get("stage") or ""),
+        expected_entry_point=str(status.get("entryPoint") or ""))
+    if abi.sha256 != digest:
+        raise RuntimeError("workspace baseline physical ABI evidence differs from its hash")
+    return physical_shader_abi_hashes(abi)
+
+
+def _shader_pair_validation_material(status: Mapping[str, Any]) -> dict[str, Any]:
+    latest = status.get("latestCompiled") or {}
+    source = status.get("source") or {}
+    baseline = status.get("baseline") or {}
+    capture = status.get("capture") or {}
+    if (source.get("present") is not True
+            or source.get("currentSha256") != latest.get("sourceSha256")
+            or latest.get("revision") != status.get("revision")):
+        raise RuntimeError("cached Shader pair has no current source/candidate binding")
+    return {
+        "originalRawSha256": _hex(baseline.get("rawSha256"), 64, "pair originalRawSha256"),
+        "candidateRawSha256": _hex(latest.get("rawSha256"), 64, "pair candidateRawSha256"),
+        "physicalAbiSha256": _hex(baseline.get("abiSha256"), 64, "pair physicalAbiSha256"),
+        "api": _asset_api(capture.get("api")),
+        "stage": str(status.get("stage") or ""),
+        "entryPoint": str(status.get("entryPoint") or ""),
+        "encoding": _asset_encoding(latest.get("kind")),
+        "targetProfile": copy.deepcopy(status.get("targetProfile")),
+    }
+
+
+def _shader_pair_validation_path(project: Path, status: Mapping[str, Any]) -> Path:
+    capture_path = status.get("capture", {}).get("capturePath", "")
+    capture_key = hashlib.sha256(_path_key(capture_path).encode("utf-8")).hexdigest()
+    key = _canonical_sha256(_shader_pair_validation_material(status))
+    return project / ".replaylab" / "replay-project" / "derived" / "validated-shader-pairs" / capture_key / (key + ".json")
+
+
+def _shader_pair_receipt_matches(
+    receipt: Any, material: Mapping[str, Any], status: Mapping[str, Any] | None = None,
+) -> bool:
+    payload = receipt.get("payload") if isinstance(receipt, Mapping) else None
+    if not isinstance(payload, Mapping) or payload.get("schema") != "replaylab-validated-shader-restore/v1":
+        return False
+    try:
+        _hex(receipt.get("signature"), 64, "Shader pair receipt signature")
+        _hex(payload.get("captureSha256"), 64, "Shader pair RDC content hash")
+    except RuntimeError:
+        return False
+    if "targetProfile" in payload:
+        profile = payload["targetProfile"]
+        expected_profile = material.get("targetProfile")
+        if isinstance(profile, str):
+            if not isinstance(expected_profile, Mapping) or profile != expected_profile.get("profile"):
+                return False
+        elif profile != expected_profile:
+            return False
+    physical_hashes = frozenset((material["physicalAbiSha256"],))
+    if status is not None:
+        try:
+            physical_hashes = _workspace_physical_abi_hashes(status)
+        except Exception:
+            return False
+        if material["physicalAbiSha256"] != (status.get("baseline") or {}).get("abiSha256"):
+            return False
+    return payload.get("physicalAbiSha256") in physical_hashes and all(payload.get(key) == material[key] for key in (
+        "originalRawSha256", "candidateRawSha256",
+        "api", "stage", "entryPoint", "encoding",
+    ))
+
+
+def _workspace_shader_pair_validation_path(status: Mapping[str, Any]) -> Path:
+    workspace = Path(str(status.get("workspacePath", "")))
+    path = workspace / "ai" / "validated-shader-pair.json"
+    if (not workspace.is_absolute() or workspace.is_symlink() or not workspace.is_dir()
+            or path.is_symlink() or not is_within(workspace.resolve(), path.resolve())):
+        raise RuntimeError("workspace Shader pair cache path is redirected")
+    return path
+
+
+def _persist_workspace_shader_pair_validation(
+    status: Mapping[str, Any], replacement: Mapping[str, Any], abi_lease: Mapping[str, Any],
+    *, allow_same_pair_revision_reuse: bool = False,
+) -> bool:
+    """Save an already checked AI/live-edit effect without another project read.
+
+    The caller owns successful replacement validation. This optional local
+    record checks its current source/candidate and signed byte-pair binding;
+    only the Bridge can authenticate the proof when a future apply consumes it.
+    """
+    try:
+        material = _shader_pair_validation_material(status)
+        receipt = replacement.get("restoreValidationReceipt")
+        physical_revision = replacement.get("revision")
+        current_revision = status.get("revision")
+        revision_matches = physical_revision == current_revision
+        if allow_same_pair_revision_reuse and not revision_matches:
+            revision_matches = bool(
+                isinstance(physical_revision, int) and not isinstance(physical_revision, bool)
+                and isinstance(current_revision, int) and 0 < physical_revision < current_revision
+                and _current_compiled_pair_matches(status, current_revision, material["candidateRawSha256"])
+                and isinstance(receipt, Mapping)
+                and receipt.get("payload", {}).get("revision") == physical_revision
+            )
+            if (revision_matches and "targetProfile" not in receipt.get("payload", {})
+                    and receipt["payload"].get("sourceSha256") != status["source"]["currentSha256"]):
+                # Legacy signed receipts did not include profile metadata.
+                # If the Bridge sealed this exact current source/candidate,
+                # the validated compiled bytecode fixes its native profile.
+                # A later source must instead retain the saved exact profile
+                # and envelope; an old proof cannot infer a new source lane.
+                old_path = _workspace_shader_pair_validation_path(status)
+                if not old_path.is_file() or old_path.stat().st_size > _MAX_FAST_CATALOG_BYTES:
+                    return False
+                old = json.loads(old_path.read_text(encoding="utf-8"))
+                seal = old.pop("sealSha256", None)
+                if (seal != _canonical_sha256(old)
+                        or old.get("schema") != _SHADER_PAIR_VALIDATION_SCHEMA
+                        or old.get("workspaceId") != status.get("workspaceId")
+                        or old.get("pair") != material
+                        or old.get("replacement", {}).get("restoreValidationReceipt") != receipt):
+                    return False
+        if (replacement.get("schema") != "renderdoc-ultra-shared-shader-replacement/v1"
+                or replacement.get("schemaVersion") != 1
+                or replacement.get("workspaceId") != status.get("workspaceId")
+                or not revision_matches
+                or replacement.get("captureId") != status.get("capture", {}).get("captureId")
+                or replacement.get("originalResourceId") != status.get("shader", {}).get("resourceId")
+                or replacement.get("resourceScoped") is not True
+                or replacement.get("eventScoped") is not False
+                or replacement.get("allOriginalResourceUsesAffected") is not True
+                or any(replacement.get(key) != material[key] for key in (
+                    "originalRawSha256", "candidateRawSha256",
+                    "api", "stage", "entryPoint", "encoding"))
+                or replacement.get("physicalAbiSha256") not in _workspace_physical_abi_hashes(status)
+                or not _shader_pair_receipt_matches(receipt, material, status)):
+            return False
+        lease = {key: abi_lease.get(key) for key in (
+            "abiLeaseRequestId", "abiLeaseReportSha256", "abiLeaseCandidateRawSha256", "abiLeaseRevision")}
+        for key in ("abiLeaseRequestId", "abiLeaseReportSha256", "abiLeaseCandidateRawSha256"):
+            _hex(lease[key], 64, key)
+        _integer(lease["abiLeaseRevision"], "ABI lease revision", 0)
+        request_id = _hex(replacement.get("abiRequestId"), 64, "applied ABI request")
+        report_sha = _hex(replacement.get("abiReportSha256"), 64, "applied ABI report")
+        payload = receipt["payload"]
+        if (payload.get("abiRequestId") != request_id
+                or payload.get("abiReportSha256") != report_sha
+                or report_sha != lease["abiLeaseReportSha256"]):
+            return False
+        if replacement.get("abiValidationMode") == "inline-physical-with-initial-lease":
+            # A later save signs its NEW byte-bound request. The old report is
+            # explicitly a lease; do not relabel its request as the new one.
+            if (replacement.get("freshPhysicalAbiValidationPerformed") is not True
+                    or any(replacement.get(key) != value for key, value in lease.items())):
+                return False
+        elif request_id != lease["abiLeaseRequestId"]:
+            return False
+        path = _workspace_shader_pair_validation_path(status)
+        value = {
+            "schema": _SHADER_PAIR_VALIDATION_SCHEMA, "schemaVersion": 1,
+            "workspaceId": status["workspaceId"],
+            "capturePath": str(status["capture"]["capturePath"]),
+            "pair": material, "sourceSha256": status["source"]["currentSha256"],
+            "candidateCodeSha256": status["latestCompiled"].get("codeSha256"),
+            "replacement": copy.deepcopy(dict(replacement)), "abiLease": lease,
+        }
+        value["sealSha256"] = _canonical_sha256(value)
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > _MAX_FAST_CATALOG_BYTES:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(path, encoded)
+        return True
+    except Exception:
+        return False
+
+
+def _load_workspace_shader_pair_validation(status: Mapping[str, Any]) -> dict[str, Any] | None:
+    try:
+        material = _shader_pair_validation_material(status)
+        path = _workspace_shader_pair_validation_path(status)
+        if not path.is_file() or path.stat().st_size > _MAX_FAST_CATALOG_BYTES:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+        seal = value.pop("sealSha256", None)
+        if (seal == _canonical_sha256(value)
+                and value.get("schema") == _SHADER_PAIR_VALIDATION_SCHEMA
+                and value.get("schemaVersion") == 1
+                and value.get("workspaceId") == status.get("workspaceId")
+                and value.get("pair") == material
+                and value.get("sourceSha256") == status.get("source", {}).get("currentSha256")
+                and value.get("candidateCodeSha256") == status.get("latestCompiled", {}).get("codeSha256")
+                and _path_key(value.get("capturePath", "")) == _path_key(status["capture"]["capturePath"])
+                and _shader_pair_receipt_matches(value.get("replacement", {}).get("restoreValidationReceipt"), material, status)):
+            return value
+    except Exception:
+        return None
+    return None
+
+
+def _persist_shader_pair_validation(
+    project: Path, status: Mapping[str, Any], applied: Mapping[str, Any],
+) -> bool:
+    """Persist each successful immutable pair even when another Shader fails."""
+    replacement = applied.get("replacement") or {}
+    receipt = replacement.get("restoreValidationReceipt")
+    material = _shader_pair_validation_material(status)
+    if (applied.get("applied") is not True
+            or applied.get("validation", {}).get("compatible") is not True
+            or not _shader_pair_receipt_matches(receipt, material, status)):
+        return False
+    path = _shader_pair_validation_path(project, status)
+    if not is_within(project.resolve(), path.resolve()) or path.is_symlink():
+        raise RuntimeError("Shader pair cache path is redirected")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    value = {
+        "schema": _SHADER_PAIR_VALIDATION_SCHEMA, "schemaVersion": 1,
+        "capturePath": str(status["capture"]["capturePath"]),
+        "pair": material,
+        "sourceSha256": status["source"]["currentSha256"],
+        "candidateCodeSha256": status["latestCompiled"].get("codeSha256"),
+        "replacement": copy.deepcopy(dict(replacement)),
+        "validation": copy.deepcopy(dict(applied["validation"])),
+    }
+    value["sealSha256"] = _canonical_sha256(value)
+    atomic_write_bytes(path, json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    return True
+
+
+def _load_shader_pair_validation(
+    project: Path, status: Mapping[str, Any], current_validation_policy_sha256: str | None = None,
+    compatible_policy_sha256s: Sequence[str] = (),
+) -> dict[str, Any] | None:
+    """Find origin evidence; only the Bridge's HMAC can authorize pair reuse."""
+    try:
+        if (status.get("latestCompiled", {}).get("abiGate", {}).get("status") != "compatible"):
+            return None
+        def current_physical_policy(value: Mapping[str, Any]) -> bool:
+            if not current_validation_policy_sha256:
+                return True
+            receipt = value.get("replacement", {}).get("restoreValidationReceipt")
+            payload = receipt.get("payload") if isinstance(receipt, Mapping) else None
+            physical = payload.get("physicalValidationBinding") if isinstance(payload, Mapping) else None
+            return bool(
+                isinstance(physical, Mapping)
+                and physical.get("schema") == "replaylab-shader-physical-validation-binding/v1"
+                and physical.get("schemaVersion") == 1
+                and payload.get("validationPolicySha256") in (current_validation_policy_sha256, *compatible_policy_sha256s)
+                and _canonical_sha256(physical) == payload.get("validationPolicySha256")
+            )
+        local = _load_workspace_shader_pair_validation(status)
+        if local is not None and current_physical_policy(local):
+            return local
+        material = _shader_pair_validation_material(status)
+        path = _shader_pair_validation_path(project, status)
+        if path.is_file() and not path.is_symlink() and is_within(project.resolve(), path.resolve()):
+            if path.stat().st_size > _MAX_FAST_CATALOG_BYTES:
+                return None
+            value = json.loads(path.read_text(encoding="utf-8"))
+            seal = value.pop("sealSha256", None)
+            if (seal == _canonical_sha256(value)
+                    and value.get("schema") == _SHADER_PAIR_VALIDATION_SCHEMA
+                    and value.get("schemaVersion") == 1
+                    and value.get("pair") == material
+                    and current_physical_policy(value)
+                    and _path_key(value.get("capturePath", "")) == _path_key(status["capture"]["capturePath"])
+                    and _shader_pair_receipt_matches(value.get("replacement", {}).get("restoreValidationReceipt"), material, status)):
+                return value
+        # A previous complete RDC snapshot already contains independently
+        # signed pairs. Package policy/source/catalog changes do not erase the
+        # exact original/candidate bytes proven by those receipts.
+        legacy = _verified_rdc_restore_path(
+            project / ".replaylab" / "replay-project",
+            Path(status["capture"]["capturePath"]),
+        )
+        if not legacy.is_file() or legacy.is_symlink() or legacy.stat().st_size > _MAX_FAST_CATALOG_BYTES:
+            return None
+        snapshot = json.loads(legacy.read_text(encoding="utf-8"))
+        seal = snapshot.pop("sealSha256", None)
+        if (seal != _canonical_sha256(snapshot)
+                or _path_key(snapshot.get("capturePath", "")) != _path_key(status["capture"]["capturePath"])):
+            return None
+        for record in list(snapshot.get("shaders") or [])[:_MAX_FAST_PROJECT_SHADERS]:
+            knowledge = snapshot.get("bindingState", {}).get("workspaces", {}).get(
+                record.get("knowledgeId") if isinstance(record, Mapping) else "")
+            if (isinstance(record, Mapping) and isinstance(knowledge, Mapping)
+                    and current_physical_policy(record)
+                    and knowledge.get("targetProfile") == material["targetProfile"]
+                    and _shader_pair_receipt_matches(
+                record.get("replacement", {}).get("restoreValidationReceipt"), material, status
+            )):
+                return {**copy.deepcopy(dict(record)), "pair": material}
+    except Exception:
+        return None
+    return None
+
+
+def _retained_shader_handoff_error(
+    error: Exception, status: Mapping[str, Any], operation_id: str,
+    capture_session_id: str, expected_revision: int,
+    expected_candidate_raw_sha256: str, expected_anchor_event_id: int,
+) -> str | None:
+    """Recognise only this call's explicit, validated post-handoff failure.
+
+    This grants no completion or replay authority. It prevents generic lost-
+    response recovery from undoing a known committed handoff to the stock shader.
+    Missing, malformed or foreign evidence keeps the ordinary recovery path.
+    """
+    data = getattr(error, "tool_data", None)
+    if (not isinstance(data, Mapping)
+            or set(data) != {"operationId", "replayReplacementRetained", "currentSourceVerified",
+                             "replacement", "recordingError"}
+            or data.get("operationId") != operation_id
+            or data.get("replayReplacementRetained") is not True
+            or data.get("currentSourceVerified") is not False
+            or not isinstance(data.get("recordingError"), str)):
+        return None
+    replacement = data.get("replacement")
+    if not isinstance(replacement, Mapping):
+        return None
+    expected = {
+        "schema": "renderdoc-ultra-shared-shader-replacement/v1", "schemaVersion": 1,
+        "operationId": operation_id, "captureSessionId": capture_session_id,
+        "captureId": status.get("capture", {}).get("captureId"),
+        "workspaceId": status.get("workspaceId"), "revision": expected_revision,
+        "originalResourceId": status.get("shader", {}).get("resourceId"),
+        "originalRawSha256": status.get("baseline", {}).get("rawSha256"),
+        "candidateRawSha256": expected_candidate_raw_sha256,
+        "anchorEventId": expected_anchor_event_id,
+        "stage": status.get("stage"), "entryPoint": status.get("entryPoint", ""),
+        "operationCreatedReplacement": True, "idempotent": False, "metadataOnly": False,
+        "resourceScoped": True, "eventScoped": False, "configured": True,
+        "singleOwner": True, "originalShaderPreserved": True, "allOriginalResourceUsesAffected": True,
+    }
+    if any(type(replacement.get(key)) is not type(value) or replacement.get(key) != value
+           for key, value in expected.items()):
+        return None
+    try:
+        replacement_id = _hex(replacement.get("replacementId"), 32, "retained replacementId")
+        superseded_id = _hex(replacement.get("supersededReplacementId"), 32, "retained supersededReplacementId")
+    except (ValueError, RuntimeError):
+        return None
+    if (replacement.get("replacementId") != replacement_id
+            or replacement.get("supersededReplacementId") != superseded_id):
+        return None
+    return replacement_id if replacement_id != superseded_id else None
+
+
 def _apply_workspace(
+    host: Any, workspace: Path, status: Mapping[str, Any], *, expected_revision: int,
+    expected_candidate_raw_sha256: str, expected_anchor_event_id: int,
+    capture_session_id: str, project_root: Path | None = None,
+) -> dict[str, Any]:
+    scope = getattr(host, '_shader_artifact_replay_scope', None)
+    with scope() if callable(scope) else contextlib.nullcontext():
+        return _apply_workspace_binary(host, workspace, status,
+            expected_revision=expected_revision,
+            expected_candidate_raw_sha256=expected_candidate_raw_sha256,
+            expected_anchor_event_id=expected_anchor_event_id,
+            capture_session_id=capture_session_id, project_root=project_root)
+
+
+def _pair_restore_rdc_hint(status: Mapping[str, Any], capture_session_id: str) -> str | None:
+    """A restore-local routing hint; the Bridge remains the apply authority."""
+    try:
+        path = Path(status["capture"]["capturePath"])
+        facts = path.stat()
+        key = (capture_session_id, _path_key(path), facts.st_dev, facts.st_ino,
+               facts.st_size, facts.st_mtime_ns, facts.st_ctime_ns)
+        observations = getattr(_RESTORE_THREAD_STATE, "pair_rdc_observations", None)
+        if observations is not None and key in observations:
+            return observations[key]
+        value = _verified_rdc_content_sha256(path)
+        if observations is not None:
+            if len(observations) >= 32:
+                observations.clear()
+            observations[key] = value
+        return value
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _apply_workspace_binary(
     host: Any,
     workspace: Path,
     status: Mapping[str, Any],
@@ -3857,21 +4746,77 @@ def _apply_workspace(
     expected_candidate_raw_sha256: str,
     expected_anchor_event_id: int,
     capture_session_id: str,
+    project_root: Path | None = None,
 ) -> dict[str, Any]:
+    latest = status.get("latestCompiled") or {}
+    if (latest.get("validationScope") == "manual-edit-unvalidated"
+            or (latest.get("projectImport") or {}).get("manualEdit") is True):
+        from .project_manual_shader import from_apply
+        applied = host._shader_live_edit_apply_candidate(
+            str(workspace), expected_revision, expected_candidate_raw_sha256,
+            expected_anchor_event_id=expected_anchor_event_id)
+        try:
+            from_apply(applied, status)
+            replacement = applied.get("replacement") or {}
+            if (replacement.get("captureSessionId") != capture_session_id
+                    or replacement.get("anchorEventId") != expected_anchor_event_id):
+                raise RuntimeError("manual project Shader changed its current capture or event")
+        except Exception as apply_exc:
+            try:
+                _recover_uncertain_workspace_apply(host, status,
+                    applied.get("operationId"), capture_session_id)
+            except Exception as recovery_exc:
+                raise RestoreRollbackFailed(
+                    "manual Shader apply identity changed and operation recovery failed: %s" % recovery_exc
+                ) from apply_exc
+            raise
+        applied["pairValidationCache"] = {"hit": False, "written": False,
+                                           "reason": "manual-edit-unvalidated"}
+        return applied
     operation_id = uuid.uuid4().hex
     try:
-        wrapped = _tool_json(
-            host.apply_shader_workspace_shared_resource(
+        prior_pair = (
+            _load_shader_pair_validation(project_root, status,
+                getattr(_RESTORE_THREAD_STATE, "validation_policy_sha256", None),
+                getattr(_RESTORE_THREAD_STATE, "compatible_policy_sha256s", ()))
+            if project_root is not None else None
+        )
+        pair_apply = getattr(host, "_apply_project_shader_pair_restore", None)
+        if prior_pair is not None and callable(pair_apply):
+            # The Bridge binds these legacy receipts to the complete RDC.
+            # Detect an ordinary cache miss before submitting an apply: an RDC
+            # section edit otherwise produces one rejected mutation and a
+            # recovery transaction for every Shader. Reuse this routing hint
+            # within the restore; it never substitutes for native admission.
+            payload = prior_pair.get("replacement", {}).get("restoreValidationReceipt", {}).get("payload", {})
+            current_rdc = _pair_restore_rdc_hint(status, capture_session_id)
+            if not current_rdc or payload.get("captureSha256") != current_rdc:
+                prior_pair = None
+        if prior_pair is not None and callable(pair_apply):
+            try:
+                wrapped = pair_apply(
+                    dict(status), prior_pair, capture_session_id, operation_id,
+                    expected_anchor_event_id,
+                )
+            except (RestoreContextChanged, RestoreContextUnavailable, RestoreRollbackFailed, RestoreControlStop):
+                raise
+            except Exception:
+                # A stale/corrupt optional proof must not become a repeated
+                # restore gate. Recover the exact attempt before falling back
+                # to a newly identified ordinary validation transaction.
+                _recover_uncertain_workspace_apply(host, status, operation_id, capture_session_id)
+                prior_pair = None
+                operation_id = uuid.uuid4().hex
+        if prior_pair is None or not callable(pair_apply):
+            wrapped = _tool_json(host.apply_shader_workspace_shared_resource(
                 str(workspace),
                 expected_revision,
                 expected_candidate_raw_sha256,
                 operation_id,
                 expected_anchor_event_id=expected_anchor_event_id,
-            ),
-            "apply Shader workspace",
-            schema="renderdoc-ultra-shader-shared-resource-apply-mcp/v1",
-        )
-        return _validate_workspace_apply_response(
+            ), "apply Shader workspace",
+            schema="renderdoc-ultra-shader-shared-resource-apply-mcp/v1")
+        checked = _validate_workspace_apply_response(
             host,
             workspace,
             status,
@@ -3882,9 +4827,32 @@ def _apply_workspace(
             expected_anchor_event_id=expected_anchor_event_id,
             capture_session_id=capture_session_id,
         )
+        if project_root is not None:
+            try:
+                current = _workspace_artifact_service(host).status(str(workspace))
+                written = _persist_shader_pair_validation(project_root, current, checked)
+            except Exception:
+                # A derived proof cache is optional. Failure to save it must
+                # never revoke a successfully checked replay replacement.
+                written = False
+            checked["pairValidationCache"] = {
+                "hit": checked.get("validation", {}).get("reusedValidation") is True,
+                "written": written,
+            }
+        return checked
     except RestoreRollbackFailed:
         raise
     except Exception as apply_exc:
+        retained = _retained_shader_handoff_error(
+            apply_exc, status, operation_id, capture_session_id, expected_revision,
+            expected_candidate_raw_sha256, expected_anchor_event_id)
+        if retained is not None:
+            # No successful result is returned or added to applied_workspaces.
+            # The per-item failure remains visible while the physically checked
+            # effect survives; it must not enter uncertain-operation rollback.
+            raise RestoreRetainedShaderApply(
+                "Shader handoff replacement %s was retained; current source verification "
+                "remains incomplete (%s)" % (retained, apply_exc)) from apply_exc
         try:
             recovery = _recover_uncertain_workspace_apply(
                 host, status, operation_id, capture_session_id
@@ -3957,13 +4925,24 @@ def _adopt_exact_live_replacement(
             identity.get("stableKeyComplete") is not True,
             identity.get("resourceId") != shader.get("resourceId"),
             identity.get("rawSha256") != original_raw,
-            identity.get("abiHash") != physical_abi,
+            identity.get("abiHash") not in _workspace_physical_abi_hashes(status),
             status.get("workspaceId") != workspace_id,
             latest.get("revision") != revision,
             latest.get("rawSha256") != candidate_raw,
         )
     ):
         raise RuntimeError("live replacement adoption differs from desired Shader")
+    gate = latest.get("abiGate")
+    if (
+        latest.get("replayAbiValidated") is not True
+        or latest.get("abiCompatible") is not True
+        or not isinstance(gate, Mapping)
+        or gate.get("status") != "compatible"
+    ):
+        # A source-preserving restore may have reopened a historical candidate
+        # for fresh ABI reflection.  Current-session replay state alone cannot
+        # turn that pending candidate into apply authority.
+        return None
     try:
         response = host.ipc.call(
             "get_shared_shader_replacements",
@@ -4013,7 +4992,7 @@ def _adopt_exact_live_replacement(
         and item.get("encoding") == expected_encoding
         and item.get("originalResourceId") == identity["resourceId"]
         and item.get("originalRawSha256") == original_raw
-        and item.get("physicalAbiSha256") == physical_abi
+        and item.get("physicalAbiSha256") in _workspace_physical_abi_hashes(status)
         and item.get("resourceScoped") is True
         and item.get("eventScoped") is False
         and item.get("allOriginalResourceUsesAffected") is True
@@ -4155,11 +5134,14 @@ def _normal_shader_identity(shader: Mapping[str, Any]) -> dict[str, Any]:
         allow_empty=True,
     )
     raw_sha256 = _hex(shader.get("rawSha256"), 64, "shader.rawSha256")
-    if any(
+    legacy_catalog = bool(
+        ("interfaceHash" in shader or "interfaceComplete" in shader)
+        and not any(field in shader for field in ("abiHash", "stableKeyComplete", "stableKeySha256"))
+    )
+    if not legacy_catalog and any(
         field in shader
         for field in (
             "api",
-            "encoding",
             "abiHash",
             "stableKeyComplete",
             "stableKeySha256",
@@ -4176,7 +5158,11 @@ def _normal_shader_identity(shader: Mapping[str, Any]) -> dict[str, Any]:
         ):
             if value:
                 _hex(value, 64, label)
-        complete = shader.get("stableKeyComplete") is True
+        # The sealed project inventory calls this interfaceComplete; the live
+        # Bridge read model calls it stableKeyComplete. Preserve an explicit
+        # live false/null value, and still verify all physical key fields
+        # and their supplied digest below before admitting the project form.
+        complete = shader.get("stableKeyComplete", shader.get("interfaceComplete")) is True
         if complete and (not api or not encoding or not abi_hash or not layout_digest):
             raise RuntimeError(
                 "complete Shader stable key omitted API, encoding, ABI, or layout"
@@ -4207,6 +5193,12 @@ def _normal_shader_identity(shader: Mapping[str, Any]) -> dict[str, Any]:
             "anchorEventId": anchor,
         }
 
+    # Legacy v1 catalog rows already had encoding/interfaceComplete, and some
+    # readers added API/anchor routing hints. These are not v2 discriminators
+    # when a row still explicitly carries the old interface shape; they keep API on the capture and
+    # their interfaceHash is not the physical ABI hash. Retain them only as
+    # incomplete routing evidence until a checked publication/live job binds
+    # the missing physical identity; explicit v2 fields above stay strict.
     code_sha256 = str(shader.get("codeSha256", "") or "")
     interface_hash = str(shader.get("interfaceHash", "") or "")
     layout_digest = str(shader.get("layoutHash", "") or "")
@@ -4223,7 +5215,10 @@ def _normal_shader_identity(shader: Mapping[str, Any]) -> dict[str, Any]:
             for value in list(shader.get("eventIds", []) or [])
         }
     )
-    if not event_ids:
+    legacy_anchor = shader.get("anchorEventId")
+    if legacy_anchor is not None:
+        legacy_anchor = _integer(legacy_anchor, "shader.anchorEventId", 1)
+    if not event_ids and legacy_anchor is None:
         raise RuntimeError("legacy Shader identity has no representative event")
     legacy_material = {
         "api": "",
@@ -4239,7 +5234,7 @@ def _normal_shader_identity(shader: Mapping[str, Any]) -> dict[str, Any]:
         "resourceId": resource_id,
         "stableKeyComplete": False,
         "stableKeySha256": _canonical_sha256(legacy_material),
-        "anchorEventId": event_ids[0],
+        "anchorEventId": legacy_anchor if legacy_anchor is not None else event_ids[0],
     }
 
 
@@ -4390,45 +5385,292 @@ def _source_preparation_matches_shader(
         and candidate.get("knowledgeId") == knowledge.get("knowledgeId")
         and candidate.get("sourceSha256") == knowledge.get("sourceSha256")
         and identity.get("anchorEventId") is not None
+        # Source lookup uses the original program, not the old reflection
+        # snapshot. The prepared target receipt and live apply below validate
+        # the current ABI; a changed reflection/layout digest is not a reason
+        # to discard source belonging to exactly the same original bytes.
         and all(knowledge.get(key) == identity.get(key) and identity.get(key)
-                for key in ("api", "encoding", "rawSha256", "stage", "abiHash"))
+                for key in ("api", "encoding", "rawSha256", "stage"))
         and knowledge.get("entryPoint", "") == identity.get("entryPoint", "")
-        and knowledge.get("baselineAbiSha256") == identity.get("abiHash")
-        and knowledge.get("stableKeySha256") == identity.get("stableKeySha256")
     )
+
+
+class RestoreProjectSourceRefresh(RuntimeError):
+    """Current project bytes need a fresh authenticated managed import receipt."""
+
+
+class RestoreLocalEdit(RuntimeError):
+    """The target workspace holds a source that is not the project's knowledge.
+
+    A person's edit (or an earlier revision they kept) lives there; the project
+    must not overwrite it. This is a stable outcome, not a failure: it is
+    remembered so the next open of the same capture does not spend minutes
+    rediscovering it.
+    """
+
+    def __init__(self, message: str, workspace: Path | None,
+                 workspace_source_sha256: str) -> None:
+        super().__init__(message)
+        self.workspace = workspace
+        self.workspace_source_sha256 = workspace_source_sha256
+
+
+def _local_edit_memo_hit(project: Path, capture_path: str | Path,
+                         replay: Any) -> dict[str, Any] | None:
+    """Reuse last time's answer when it was "your local edits were kept".
+
+    A restore whose every matched Shader was skipped for a local edit has
+    nothing to apply, and the two-minute inventory/preparation would only
+    rediscover that. The previous record is trusted when nothing it depended
+    on has moved: the project's restorable heads, each knowledge source, and
+    each workspace's current source bytes.
+    """
+
+    try:
+        from .rdc_shader_inventory_cache import capture_path_sha256
+
+        record_path = (project / ".replaylab" / "replay-project" / "derived"
+                       / "restore-results" / (capture_path_sha256(capture_path) + ".json"))
+        if not record_path.is_file():
+            return None
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        if record.get("status") != "finished" or record.get("error"):
+            return None
+        shaders = record.get("shaders") or {}
+        items = [item for item in shaders.get("items") or [] if isinstance(item, Mapping)]
+        if not items or shaders.get("applied") or shaders.get("failed"):
+            return None
+        if any(item.get("status") != "skipped" or item.get("reason") != "local-edit"
+               for item in items):
+            return None
+        lookup = record.get("targetLookup") or {}
+        recorded_targets = sorted(str(value) for value in lookup.get("targetRawSha256s") or [])
+        if not recorded_targets or recorded_targets != sorted(replay.restorable_shader_raw_hashes()):
+            return None
+        for item in items:
+            knowledge = replay.get_workspace_knowledge(str(item.get("knowledgeId") or ""))
+            if str(knowledge.get("sourceSha256") or "") != str(item.get("knowledgeSourceSha256") or ""):
+                return None
+            workspace = Path(str(item.get("workspacePath") or ""))
+            language = knowledge.get("sourceFormat", "hlsl")
+            if language not in {"hlsl", "glsl"}:
+                return None
+            source = workspace / "source" / ("shader." + language)
+            if not item.get("workspaceSourceSha256") or not source.is_file():
+                return None
+            if hashlib.sha256(source.read_bytes()).hexdigest() != item.get("workspaceSourceSha256"):
+                return None
+        return {"items": items, "lookup": lookup, "recordedAt": record.get("finishedAt")}
+    except Exception:
+        return None
 
 
 def _validate_prepared_project_source(
     status: Mapping[str, Any], knowledge: Mapping[str, Any],
     identity: Mapping[str, Any], binding_state: Mapping[str, Any],
+    *, source_preparation_only: bool = False,
 ) -> None:
-    """Recheck the original project input after normal workspace admission."""
+    """Recheck imported provenance and the current active project's source bytes."""
     source = status.get("source") or {}
     origin = source.get("projectSource") or {}
+    # A toolchain refresh keeps the original verified import receipt in its
+    # validated source-provenance chain. Later edits published from the same
+    # registered workspace remain legitimate current heads after that refresh.
+    refresh = source.get("toolchainRefresh") or {}
+    provenance = refresh.get("sourceProvenance") or {}
+    project_origin = source.get("origin") == "verified-project-source" or (
+        source.get("origin") == "toolchain-refreshed-source"
+        and provenance.get("origin") == "verified-project-source"
+        and provenance.get("projectSource") == origin
+        and provenance.get("sha256") == origin.get("sourceSha256")
+        and refresh.get("preservedSourceSha256") == origin.get("sourceSha256"))
     baseline = status.get("baseline") or {}
-    if (
-        not isinstance(origin, Mapping)
-        or origin.get("schema") != "replaylab-verified-project-shader-source/v1"
-        or origin.get("projectId") != binding_state.get("projectId")
-        or _path_key(origin.get("projectPath", "")) != _path_key(binding_state.get("projectPath", ""))
-        or origin.get("knowledgeId") != knowledge.get("knowledgeId")
-        or origin.get("sourceSha256") != knowledge.get("sourceSha256")
-        or source.get("currentSha256") != knowledge.get("sourceSha256")
-        or origin.get("originalRawSha256") != identity.get("rawSha256")
-        or origin.get("baselineAbiSha256") != identity.get("abiHash")
-        or baseline.get("abiSha256") != identity.get("abiHash")
-        or _asset_encoding(baseline.get("kind")) != identity.get("encoding")
-        or _asset_api((status.get("capture") or {}).get("api")) != identity.get("api")
-        or origin.get("stage") != identity.get("stage")
-        or origin.get("entryPoint", "") != identity.get("entryPoint", "")
-        or origin.get("targetProfile") != knowledge.get("targetProfile")
-        or status.get("targetProfile") != knowledge.get("targetProfile")
-        or origin.get("applied") is not False
-        or origin.get("requiresCompile") is not True
-        or origin.get("requiresLiveAbiRevalidation") is not True
+    registered = knowledge.get("registeredWorkspace") or {}
+    current_sha = source.get("currentSha256") or source.get("sha256")
+    expected_abi = identity.get("abiHash")
+    if (baseline.get("abiSha256") != expected_abi
+            and baseline.get("compiledInterface") is not None
+            and expected_abi in _workspace_physical_abi_hashes(status)):
+        # Imported origin receipts authenticate the workspace's immutable old
+        # baseline. A freshly observed equivalent inventory hash does not
+        # rewrite that provenance; all receipt checks below remain exact.
+        expected_abi = baseline["abiSha256"]
+    if (source_preparation_only
+            and binding_state.get("capture", {}).get("inventoryOnly") is True
+            and identity.get("stableKeyComplete") is False
+            and baseline.get("abiSha256") != expected_abi):
+        # Incomplete inventories (notably Vulkan module-only reflection) use
+        # an interface summary, not the workspace's physical ABI hash schema.
+        # Source import binds the saved text to the authenticated current
+        # workspace baseline. Historical knowledge can use another reflection
+        # schema even for the exact same original bytes; it is not the new
+        # import receipt's ABI authority. Verify the current physical evidence
+        # when present, and keep all receipt/raw/profile checks below exact.
+        # This is never a binary/apply grant: the caller still validates the
+        # compiled candidate against the current live pipeline ABI.
+        _workspace_physical_abi_hashes(status)
+        expected_abi = baseline["abiSha256"]
+    if (source.get("origin") != "verified-project-source"
+            and source.get("projectSource") is None):
+        # A locally decompiled/edited workspace never imported project source,
+        # so it has no import receipt. Its status has already verified the
+        # actual source bytes and captured baseline. Equal project bytes can
+        # be reused under that current target evidence without inventing an
+        # import receipt or inheriting an old binary/ABI grant.
+        shader = status.get("shader") or {}
+        mismatches = []
+        if (source.get("present") is not True
+                or source.get("lane") != "executable-editable"
+                or source.get("format") not in {"hlsl", "glsl"}
+                or source.get("format") != knowledge.get("sourceFormat", "hlsl")):
+            mismatches.append("source")
+        if (shader.get("rawSha256") != identity.get("rawSha256")
+                or baseline.get("rawSha256") != identity.get("rawSha256")
+                or knowledge.get("rawSha256") != identity.get("rawSha256")
+                or not identity.get("rawSha256")):
+            mismatches.append("originalRawSha256")
+        if (baseline.get("abiSha256") != expected_abi or not expected_abi):
+            mismatches.append("baseline.abiSha256")
+        if _asset_encoding(baseline.get("kind")) != identity.get("encoding"):
+            mismatches.append("encoding")
+        if _asset_api((status.get("capture") or {}).get("api")) != identity.get("api"):
+            mismatches.append("api")
+        for field in ("stage", "entryPoint"):
+            if (status.get(field, "") != identity.get(field, "")
+                    or knowledge.get(field, "") != identity.get(field, "")):
+                mismatches.append(field)
+        if (not isinstance(status.get("targetProfile"), Mapping)
+                or status.get("targetProfile") != knowledge.get("targetProfile")):
+            mismatches.append("targetProfile")
+        if mismatches:
+            raise RuntimeError(
+                "existing workspace source differs from the current original Shader "
+                "or active knowledge (%s)" % ", ".join(mismatches)
+            )
+        _hex(current_sha, 64, "existing workspace sourceSha256")
+        _hex(knowledge.get("sourceSha256"), 64, "active project sourceSha256")
+        if current_sha != knowledge.get("sourceSha256"):
+            raise RestoreLocalEdit(
+                "workspace source differs from the project knowledge (a local edit or "
+                "an earlier revision); it was kept, not overwritten",
+                Path(str(status.get("workspacePath") or "")) if status.get("workspacePath") else None,
+                str(current_sha),
+            )
+        return
+    # projectSource authenticates the immutable imported input, not every
+    # later edit. An edited source published from this same workspace has a
+    # new head while its original import receipt intentionally stays unchanged.
+    published_revision = bool(
+        isinstance(origin, Mapping) and isinstance(registered, Mapping)
+        and project_origin
+        and current_sha == knowledge.get("sourceSha256")
+        and origin.get("knowledgeId") != knowledge.get("knowledgeId")
+        and origin.get("sourceSha256") != knowledge.get("sourceSha256")
+        and origin.get("sourceSha256")
+        and (
+            source.get("decompiledSha256") == origin.get("sourceSha256")
+            or source.get("sha256") == origin.get("sourceSha256")
+        )
+        and registered.get("workspaceId")
+        and registered.get("workspaceId") == status.get("workspaceId")
+        and registered.get("path") and status.get("workspacePath")
+        and _path_key(registered["path"]) == _path_key(status["workspacePath"])
+    )
+    # Same organized bytes re-registered under a newer knowledgeId keep the
+    # original import receipt. The workspace already matches the active head,
+    # so restore must accept the rebind instead of failing closed.
+    same_content_knowledge_rebind = bool(
+        isinstance(origin, Mapping)
+        and project_origin
+        and current_sha
+        and current_sha == knowledge.get("sourceSha256")
+        and origin.get("sourceSha256") == knowledge.get("sourceSha256")
+        and origin.get("knowledgeId")
+        and origin.get("knowledgeId") != knowledge.get("knowledgeId")
+        and origin.get("originalRawSha256") == identity.get("rawSha256")
+        and origin.get("baselineAbiSha256") == expected_abi
+        and origin.get("stage") == identity.get("stage")
+        and origin.get("entryPoint", "") == identity.get("entryPoint", "")
+        and origin.get("projectId") == binding_state.get("projectId")
+    )
+    mismatches: list[str] = []
+    if not isinstance(origin, Mapping):
+        mismatches.append("projectSource")
+    elif origin.get("schema") != "replaylab-verified-project-shader-source/v1":
+        mismatches.append("projectSource.schema")
+    if origin.get("projectId") != binding_state.get("projectId"):
+        mismatches.append("projectId")
+    if _path_key(origin.get("projectPath", "")) != _path_key(
+        binding_state.get("projectPath", "")
     ):
-        raise RuntimeError("prepared project source differs from the current original Shader or active knowledge")
-
+        mismatches.append("projectPath")
+    if not published_revision and not same_content_knowledge_rebind:
+        if origin.get("knowledgeId") != knowledge.get("knowledgeId"):
+            mismatches.append(
+                "knowledgeId(origin=%s,active=%s)"
+                % (origin.get("knowledgeId"), knowledge.get("knowledgeId"))
+            )
+        if origin.get("sourceSha256") != knowledge.get("sourceSha256"):
+            mismatches.append("projectSource.sourceSha256")
+    if current_sha != knowledge.get("sourceSha256"):
+        mismatches.append("currentSha256")
+    if source.get("format") != knowledge.get("sourceFormat", "hlsl"):
+        mismatches.append("source.format")
+    if origin.get("sourceFormat", "hlsl") != knowledge.get("sourceFormat", "hlsl"):
+        mismatches.append("projectSource.sourceFormat")
+    if origin.get("originalRawSha256") != identity.get("rawSha256"):
+        mismatches.append("originalRawSha256")
+    if (baseline.get("rawSha256") != identity.get("rawSha256")
+            or (status.get("shader") or {}).get("rawSha256") != identity.get("rawSha256")
+            or knowledge.get("rawSha256") != identity.get("rawSha256")):
+        mismatches.append("baseline.rawSha256")
+    if origin.get("baselineAbiSha256") != expected_abi:
+        mismatches.append("baselineAbiSha256")
+    if baseline.get("abiSha256") != expected_abi:
+        mismatches.append("baseline.abiSha256")
+    if _asset_encoding(baseline.get("kind")) != identity.get("encoding"):
+        mismatches.append("encoding")
+    if _asset_api((status.get("capture") or {}).get("api")) != identity.get("api"):
+        mismatches.append("api")
+    if origin.get("stage") != identity.get("stage"):
+        mismatches.append("stage")
+    if origin.get("entryPoint", "") != identity.get("entryPoint", ""):
+        mismatches.append("entryPoint")
+    if origin.get("targetProfile") != knowledge.get("targetProfile"):
+        mismatches.append("projectSource.targetProfile")
+    if status.get("targetProfile") != knowledge.get("targetProfile"):
+        mismatches.append("status.targetProfile")
+    if origin.get("applied") is not False:
+        mismatches.append("applied")
+    if origin.get("requiresCompile") is not True:
+        mismatches.append("requiresCompile")
+    if origin.get("requiresLiveAbiRevalidation") is not True:
+        mismatches.append("requiresLiveAbiRevalidation")
+    if mismatches:
+        if (project_origin
+                and current_sha == knowledge.get("sourceSha256")
+                and origin.get("sourceSha256")
+                and origin.get("sourceSha256") in (
+                    source.get("decompiledSha256"), source.get("sha256"))
+                and all(value == "projectSource.sourceSha256"
+                        or value.startswith("knowledgeId(") for value in mismatches)):
+            # The original managed input is still valid, but a previous seed
+            # copied a newer project head without renewing that input/receipt.
+            # Require a real verified seed; do not waive this validation.
+            raise RestoreProjectSourceRefresh("project source import receipt needs the current head")
+        if (
+            current_sha
+            and current_sha != knowledge.get("sourceSha256")
+        ):
+            raise RestoreLocalEdit(
+                "workspace source differs from the project knowledge (a local edit or "
+                "an earlier revision); it was kept, not overwritten",
+                Path(str(status.get("workspacePath") or "")) if status.get("workspacePath") else None,
+                str(current_sha or ""))
+        raise RuntimeError(
+            "prepared project source differs from the current original Shader or "
+            "active knowledge (%s)" % ", ".join(mismatches[:8])
+        )
 
 def _restore_material(
     host: Any,
@@ -4803,15 +6045,62 @@ def _realized_receipt_from_record(
     )
 
 
+def _realized_identity_abi(
+    record: Mapping[str, Any], replacement: Mapping[str, Any],
+    status: Mapping[str, Any] | None,
+) -> str:
+    """Project an already validated live alias onto the desired cache identity.
+
+    This is a derived project receipt, not a rewritten Bridge observation or
+    signed proof. Keep the downstream record schema and exact hash checks.
+    """
+    live = _hex(replacement.get("physicalAbiSha256"), 64, "live physical ABI")
+    identity = _normal_shader_identity(record.get("identity", {}))
+    desired = identity["abiHash"]
+    if live == desired:
+        return live
+    if status is None:
+        raise RuntimeError("realized Shader ABI alias lacks verified workspace evidence")
+    allowed = _workspace_physical_abi_hashes(status)
+    baseline, shader = status.get("baseline") or {}, status.get("shader") or {}
+    latest, managed = status.get("latestCompiled") or {}, record.get("managedWorkspace") or {}
+    expected = {
+        "api": _asset_api(status.get("capture", {}).get("api")),
+        "stage": status.get("stage"), "entryPoint": status.get("entryPoint", ""),
+        "encoding": _asset_encoding(latest.get("kind")),
+        "originalResourceId": shader.get("resourceId"),
+        "originalRawSha256": baseline.get("rawSha256"),
+        "candidateRawSha256": latest.get("rawSha256"),
+        "workspaceId": status.get("workspaceId"), "revision": latest.get("revision"),
+    }
+    if (live not in allowed or desired not in allowed
+            or any(replacement.get(key) != value for key, value in expected.items())
+            or any(identity.get(key) != expected[key] for key in ("api", "stage", "entryPoint", "encoding"))
+            or identity.get("resourceId") != expected["originalResourceId"]
+            or identity.get("rawSha256") != expected["originalRawSha256"]
+            or record.get("candidateRevision") != expected["revision"]
+            or record.get("candidateRawSha256") != expected["candidateRawSha256"]
+            or managed.get("workspaceId") != expected["workspaceId"]):
+        raise RuntimeError("realized Shader ABI alias differs from verified desired identity")
+    return desired
+
+
 def _realized_receipt_from_apply(
-    record: Mapping[str, Any], applied: Mapping[str, Any]
+    record: Mapping[str, Any], applied: Mapping[str, Any],
+    status: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     replacement = applied.get("replacement")
     if not isinstance(replacement, Mapping):
         raise RuntimeError("Shader apply omitted realized replacement evidence")
+    if applied.get("validation", {}).get("manualEdit") is True:
+        # This is a successful transaction observation, never a realized ABI
+        # proof. Manual records are excluded from the strict RDC index below.
+        return {"manualEdit": True, "validationScope": "manual-edit-unvalidated",
+                "identity": copy.deepcopy(record["identity"]),
+                "replacement": copy.deepcopy(dict(replacement))}
     return _realized_receipt_from_record(
         record,
-        str(replacement.get("physicalAbiSha256", "")),
+        _realized_identity_abi(record, replacement, status),
         abi_report_sha256=str(replacement.get("abiReportSha256", "") or "")
         or None,
     )
@@ -5019,7 +6308,10 @@ def _binding_document(
         "catalogSha256": binding_state["catalogSha256"],
         "knowledgeContentSha256": binding_state["knowledgeContentSha256"],
         "matcherPolicySha256": binding_state["matcherPolicySha256"],
-        "shaders": [copy.deepcopy(dict(item)) for item in shader_records],
+        # Local editor hints are carried by the derived restore snapshot, not
+        # the stable RDC executable-index schema or its authority hashes.
+        "shaders": [{key: copy.deepcopy(value) for key, value in item.items()
+                     if key != "preservedLocalSource"} for item in shader_records],
         "materials": materials,
     }
     desired_head = _desired_project_head(
@@ -5044,6 +6336,91 @@ def _binding_document(
     )
 
 
+def _read_restore_identity_context(
+    host: Any, project_checkpoint: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Retry one read-only identity request on the same living admitted owner."""
+
+    checkpoint = getattr(_RESTORE_THREAD_STATE, "control_checkpoint", None)
+    recovery = getattr(_RESTORE_THREAD_STATE, "context_recovery", None)
+    diagnostic = None
+    for attempt in range(2):
+        if callable(checkpoint):
+            checkpoint("before restore identity read" if not attempt else "before restore identity retry")
+        if project_checkpoint is not None:
+            project_checkpoint()
+        try:
+            live = host._active_live_context(allow_missing_capture_id=True)
+        except (RestoreContextChanged, RestoreContextUnavailable, RestoreControlStop):
+            raise
+        except IPCBridgeResponseError as exc:
+            # The frozen request binding rejects a real reload before returning
+            # its identity. These existing bridge diagnostics report an observed
+            # lifecycle mismatch; other bridge rejections grant no such evidence.
+            if exc.message in {
+                "The RenderDoc capture changed before the background tool started",
+                "The frozen capture session changed before the Bread tool started",
+            }:
+                raise RestoreContextChanged(
+                    "active project or capture changed during project restore: %s" % exc) from exc
+            raise RestoreContextUnavailable(
+                "restore identity is unavailable: %s: %s" % (type(exc).__name__, exc)) from exc
+        except (IPCTransportError, OSError, TimeoutError) as exc:
+            binding = _CALL_BINDING.get()
+            state_reader = getattr(getattr(host, "ipc", None), "bound_instance_state", None)
+            try:
+                owner = state_reader() if callable(state_reader) else None
+            except Exception:
+                owner = None
+            can_retry = bool(
+                not attempt and binding is not None and isinstance(owner, Mapping)
+                and owner.get("alive") is True and owner.get("instanceId") == binding[0]
+            )
+            if not can_retry:
+                raise RestoreContextUnavailable(
+                    "restore identity is unavailable: %s: %s" % (type(exc).__name__, exc)) from exc
+            diagnostic = {
+                "instanceId": binding[0], "errorType": type(exc).__name__,
+                "error": str(exc)[:4096], "recovered": False,
+            }
+            if isinstance(recovery, list):
+                recovery.append(diagnostic)
+                del recovery[:-16]
+            continue
+        except Exception as exc:
+            if str(exc) == "No RenderDoc capture is loaded":
+                raise RestoreContextChanged(
+                    "active project or capture changed during project restore: %s" % exc) from exc
+            raise RestoreContextUnavailable(
+                "restore identity is unreadable: %s: %s" % (type(exc).__name__, exc)) from exc
+        if callable(checkpoint):
+            checkpoint("after restore identity read")
+        if project_checkpoint is not None:
+            project_checkpoint()
+        if diagnostic is not None:
+            diagnostic["recovered"] = True
+        return live
+    raise AssertionError("restore identity read exhausted its bounded attempts")
+
+
+def _read_restore_project_identity(path: Path) -> dict[str, Any]:
+    from .file_content_cache import file_stamp
+    cache = getattr(_RESTORE_THREAD_STATE, "project_identities", None)
+    if cache is None:
+        return read_json_object(path, MAX_PROJECT_BYTES, "restore project identity")
+    # Share stable project metadata, not mutable per-Shader state. A reliable
+    # filesystem change identity includes same-size/mtime-preserving edits.
+    before = file_stamp(path)
+    key = _path_key(path)
+    cached = cache.get(key) if before is not None else None
+    if cached is not None and cached[0] == before:
+        return copy.deepcopy(cached[1])
+    value = read_json_object(path, MAX_PROJECT_BYTES, "restore project identity")
+    if before is not None and file_stamp(path) == before:
+        cache[key] = (before, copy.deepcopy(value))
+    return value
+
+
 def _require_restore_context(
     host: Any,
     active: Mapping[str, Any],
@@ -5052,6 +6429,54 @@ def _require_restore_context(
     capture_session_id: str,
 ) -> dict[str, Any]:
     """Revalidate the exact project/capture lifecycle after a long operation."""
+
+    service = host._active_project_service()
+    snapshot_factory = getattr(service, "snapshot_active_project", None)
+    snapshot_reader = getattr(service, "_bound_project_snapshot", None)
+    assert_snapshot = getattr(service, "assert_active_project_snapshot", None)
+    if all(callable(value) for value in (snapshot_factory, snapshot_reader, assert_snapshot)):
+        # The initial admission has already validated all project artifacts.
+        # Later lifecycle checks need the real current selection/configuration
+        # and project identity, rather than revalidating every saved artifact
+        # twice through status() and the server status race guard.
+        existing = snapshot_reader()
+        context = (contextlib.nullcontext(existing) if existing is not None else
+                   snapshot_factory(active["workspaceId"], project_root))
+        try:
+            with context as snapshot:
+                assert_snapshot(snapshot)
+                manifest = json.loads(snapshot.manifest_json)
+                if (snapshot.project_root != project_root
+                        or snapshot.workspace_id != active.get("workspaceId")
+                        or manifest.get("state") != active.get("state")
+                        or manifest.get("scope") != active.get("scope")
+                        or str(manifest.get("assetRoot") or "") != str(active.get("assetRoot") or "")):
+                    raise RuntimeError("active project configuration changed")
+                replay_path = Path(str(active["paths"]["replayProject"]))
+                if replay_path.is_symlink() or not replay_path.is_dir():
+                    raise RuntimeError("active replay project path changed")
+                project_identity = _read_restore_project_identity(replay_path / "project.json")
+                expected_replay = active["replayProject"]
+                if (project_identity.get("schema") != PROJECT_SCHEMA
+                        or project_identity.get("projectId") != expected_replay.get("projectId")
+                        or project_identity.get("scope") != expected_replay.get("scope")):
+                    raise RuntimeError("active replay project identity changed")
+                live = _read_restore_identity_context(host, lambda: assert_snapshot(snapshot))
+                capture = live.get("capture") or {}
+                expected_api = expected_replay.get("scope", {}).get("apiFamily") or active.get("scope", {}).get("apiFamily")
+                if (capture.get("captureSessionId") != capture_session_id
+                        or _path_key(capture.get("path", "")) != _path_key(capture_path)
+                        or (expected_api and _reuse_api_family(capture.get("api")) != _reuse_api_family(expected_api))):
+                    raise RuntimeError("live capture session, path or API changed")
+                assert_snapshot(snapshot)
+            return dict(active)
+        except (RestoreContextChanged, RestoreContextUnavailable, RestoreControlStop):
+            raise
+        except OSError as exc:
+            raise RestoreContextUnavailable(
+                "restore project identity is unreadable: %s: %s" % (type(exc).__name__, exc)) from exc
+        except Exception as exc:
+            raise RestoreContextChanged("active project or capture changed during project restore: %s" % exc) from exc
 
     current, unused_context, project, unused_replay, session = (
         _validate_capture_and_project(
@@ -5200,7 +6625,7 @@ def _prepare_response(
             prepare = getattr(host, "prepare_active_capture_project", None)
             if not callable(prepare):
                 raise RuntimeError(
-                    "ReplayLab Host has no active-capture preparation route"
+                    "Bread Host has no active-capture preparation route"
                 )
             raw = prepare()
     if control_checkpoint is not None:
@@ -5331,7 +6756,14 @@ def _prepare_inventory_response(
         or not isinstance(policy, Mapping)
         or policy.get("inventoryOnly") is not True
         or policy.get("fuzzyExecutableMatchAllowed") is not False
-        or policy.get("stableKeyExactRequiredForSourceOrBinary") is not True
+        or not (
+            policy.get("stableKeyExactRequiredForSourceOrBinary") is True
+            or (
+                policy.get("stableKeyExactRequiredForSource") is False
+                and policy.get("stableKeyExactRequiredForBinary") is True
+                and policy.get("rawExactSourcePreparationAllowed") is True
+            )
+        )
         or policy.get("targetAnchorRequiredBeforeExecutableApply") is not True
         or policy.get("binaryExecutableAutoApplyAuthorized") is not False
         or policy.get("inventoryMaterialValueReuseAllowed") is not False
@@ -5460,16 +6892,28 @@ def _reuse_workspace_status(
     capture_id: str,
     catalog_sha256: str | None,
 ) -> dict[str, Any]:
-    wrapped = _tool_json(
-        host.get_shader_workspace_status(str(workspace)),
-        "get target Shader workspace status",
-        schema="renderdoc-ultra-shader-workspace-mcp/v1",
+    # Restore needs current source/candidate bytes, not the public status
+    # endpoint's organization/draft recovery walk on every before/after read.
+    # Keep fresh per-workspace observations across mutations; only omit that
+    # unrelated UI enrichment. Older Host adapters retain their status route.
+    factory = getattr(host, "_shader_workspace_artifact_service", None)
+    if callable(factory):
+        status = dict(factory().status(str(workspace)))
+    else:
+        wrapped = _tool_json(host.get_shader_workspace_status(str(workspace)),
+            "get target Shader workspace status", schema="renderdoc-ultra-shader-workspace-mcp/v1")
+        if wrapped.get("operation") != "status" or not isinstance(wrapped.get("result"), Mapping):
+            raise RuntimeError("target Shader workspace status is invalid")
+        status = dict(wrapped["result"])
+    return _validate_reuse_workspace_status(
+        status, active, workspace, identity, capture_id, catalog_sha256
     )
-    if wrapped.get("operation") != "status" or not isinstance(
-        wrapped.get("result"), Mapping
-    ):
-        raise RuntimeError("target Shader workspace status is invalid")
-    status = dict(wrapped["result"])
+
+
+def _validate_reuse_workspace_status(
+    status: dict[str, Any], active: Mapping[str, Any], workspace: Path,
+    identity: Mapping[str, Any], capture_id: str, catalog_sha256: str | None,
+) -> dict[str, Any]:
     capture = status.get("capture")
     shader = status.get("shader")
     baseline = status.get("baseline")
@@ -5477,39 +6921,375 @@ def _reuse_workspace_status(
     shader_root = Path(
         str(active.get("paths", {}).get("shaderWorkspaces", ""))
     ).resolve()
-    status_catalog = (
-        capture.get("catalogSha256", capture.get("catalogRevisionSha256", ""))
-        if isinstance(capture, Mapping)
-        else ""
-    )
-    status_catalog = str(status_catalog or "") or None
-    expected_catalog = str(catalog_sha256 or "") or None
-    if (
-        status.get("schema") != "renderdoc-ultra-shader-workspace-status/v1"
-        or _path_key(status.get("workspacePath", "")) != _path_key(workspace)
-        or workspace.is_symlink()
-        or not workspace.is_dir()
-        or not shader_root.is_dir()
-        or not is_within(shader_root, workspace)
-        or not isinstance(capture, Mapping)
-        or not isinstance(shader, Mapping)
-        or not isinstance(baseline, Mapping)
-        or not isinstance(source, Mapping)
-        or capture.get("captureId") != capture_id
-        or status_catalog != expected_catalog
-        or shader.get("resourceId") != identity.get("resourceId")
-        or shader.get("rawSha256") != identity.get("rawSha256")
-        or baseline.get("rawSha256") != identity.get("rawSha256")
-        or status.get("stage") != identity.get("stage")
-        or status.get("entryPoint", "") != identity.get("entryPoint", "")
-        or source.get("present") is not True
-        or source.get("lane") != "executable-editable"
-        or source.get("format") != "hlsl"
-    ):
-        raise RuntimeError("target Shader workspace changed physical identity")
+    # A matching captured program can still have only its binary representation
+    # while the saved project source is being imported. Report that missing step
+    # separately: it does not mean the current ResourceId or original bytes changed.
+    mismatches = []
+    if status.get("schema") != "renderdoc-ultra-shader-workspace-status/v1":
+        mismatches.append("schema")
+    if (_path_key(status.get("workspacePath", "")) != _path_key(workspace)
+            or workspace.is_symlink() or not workspace.is_dir()
+            or not shader_root.is_dir() or not is_within(shader_root, workspace)):
+        mismatches.append("workspacePath")
+    if not isinstance(capture, Mapping):
+        mismatches.append("capture")
+    else:
+        if capture.get("captureId") != capture_id:
+            mismatches.append("capture.captureId")
+        # A fresh bounded catalog can have a different snapshot/serialization
+        # hash from this workspace's original catalog. It is provenance for
+        # that snapshot, not the Shader's physical identity. Strict status has
+        # already validated the stored catalog; retain its provenance and bind
+        # this restore to the actual current capture/program below.
+        if identity.get("api") and _asset_api(capture.get("api")) != identity["api"]:
+            mismatches.append("capture.api")
+    if not isinstance(shader, Mapping):
+        mismatches.append("shader")
+    else:
+        for field in ("resourceId", "rawSha256"):
+            if shader.get(field) != identity.get(field):
+                mismatches.append("shader." + field)
+    if not isinstance(baseline, Mapping):
+        mismatches.append("baseline")
+    else:
+        if baseline.get("rawSha256") != identity.get("rawSha256"):
+            mismatches.append("baseline.rawSha256")
+        if identity.get("encoding") and _asset_encoding(baseline.get("kind")) != identity["encoding"]:
+            mismatches.append("baseline.kind")
+    for field in ("stage", "entryPoint"):
+        if status.get(field, "") != identity.get(field, ""):
+            mismatches.append(field)
+    if mismatches:
+        raise RuntimeError("target Shader workspace changed physical identity (%s)" %
+                           ", ".join(mismatches))
     _hex(status.get("workspaceId"), 32, "target workspaceId")
+    source_mismatches = []
+    if not isinstance(source, Mapping):
+        source_mismatches.append("source")
+    else:
+        if source.get("present") is not True:
+            source_mismatches.append("source.present")
+        if source.get("lane") != "executable-editable":
+            source_mismatches.append("source.lane")
+        if source.get("format") not in {"hlsl", "glsl"}:
+            source_mismatches.append("source.format")
+    if source_mismatches:
+        raise RuntimeError("target Shader workspace has no executable editable source (%s); "
+                           "the matching saved project source must be imported before compilation" %
+                           ", ".join(source_mismatches))
     _hex(source.get("currentSha256"), 64, "target sourceSha256")
     return status
+
+
+def _local_restore_candidate(status: Mapping[str, Any], project_source_sha256: str) -> bool:
+    """Preserve a divergent edit; only its exact validated candidate may restore.
+
+    Callers pass the ordinary strict workspace status after checking its current
+    capture/original identity. A project snapshot is not permission to replace a
+    person's working source, whether or not that source has compiled yet.
+    """
+    source = status.get("source") or {}
+    current_sha = source.get("currentSha256")
+    _preserve_unpublished_include_edit(status)
+    if current_sha == project_source_sha256 or source.get("modifiedSinceDecompile") is False:
+        return False
+    latest = status.get("latestCompiled") or {}
+    if (current_sha and latest.get("sourceSha256") == current_sha
+            and type(latest.get("revision")) is int and latest["revision"] > 0
+            and latest["revision"] == status.get("revision")
+            and latest.get("replayAbiValidated") is True
+            and latest.get("abiCompatible") is True
+            and latest.get("requiresReplayAbiValidation") is False
+            and (latest.get("abiGate") or {}).get("status") == "compatible"):
+        _hex(latest.get("rawSha256"), 64, "local candidateRawSha256")
+        return True
+    raise RestoreLocalEdit(
+        "The local Shader source differs from project knowledge and has no exact "
+        "validated current candidate; the source was preserved. Compile and validate "
+        "this edit, or explicitly select a saved revision before restoring it.",
+        Path(str(status.get("workspacePath") or "")) if status.get("workspacePath") else None,
+        str(current_sha or ""),
+    )
+
+
+def _preserve_unpublished_include_edit(status: Mapping[str, Any]) -> None:
+    source = status.get("source") or {}
+    latest = status.get("latestCompiled") or {}
+    if (status.get("sourceDependenciesCurrent", True) is False and latest
+            and latest.get("sourceSha256") == source.get("currentSha256")):
+        raise RestoreLocalEdit(
+            "A Shader include changed since the saved candidate was validated; "
+            "the editable source was preserved and was not automatically applied.",
+            Path(str(status.get("workspacePath") or "")) if status.get("workspacePath") else None,
+            str(source.get("currentSha256") or ""),
+        )
+
+
+def _registered_reuse_workspace(
+    host: Any, active: Mapping[str, Any], identity: Mapping[str, Any],
+    knowledge: Mapping[str, Any] | None, capture_path: Path | None,
+    expected_source_sha256: str,
+) -> tuple[Path, dict[str, Any], str, str | None] | None:
+    """Reuse the exact saved source owner already proven by the live inventory.
+
+    The registered path is a hint, never apply authority. The strict workspace
+    reader validates its source/candidate bytes, and the normal apply boundary
+    still checks the current original Shader and representative EID.
+    """
+
+    if not isinstance(knowledge, Mapping) or capture_path is None:
+        return None
+    registered = knowledge.get("registeredWorkspace")
+    factory = (getattr(host, "_shader_workspace_artifact_service", None)
+               or getattr(host, "_shader_workspace_service", None))
+    if not isinstance(registered, Mapping) or not callable(factory):
+        return None
+    try:
+        raw_path = Path(str(registered.get("path") or "")).expanduser()
+        root = Path(str(active.get("paths", {}).get("shaderWorkspaces", ""))).resolve()
+        if (not raw_path.is_absolute() or raw_path.is_symlink() or not raw_path.is_dir()
+                or not is_within(root, raw_path.resolve())):
+            return None
+        workspace = raw_path.resolve()
+        status = factory().status(str(workspace))
+        capture = status.get("capture") if isinstance(status, Mapping) else None
+        source = status.get("source") if isinstance(status, Mapping) else None
+        baseline = status.get("baseline") if isinstance(status, Mapping) else None
+        if (not all(isinstance(value, Mapping) for value in (capture, source, baseline))
+                or status.get("workspaceId") != registered.get("workspaceId")
+                or _path_key(capture.get("capturePath", "")) != _path_key(capture_path)
+                or _asset_api(capture.get("api")) != identity.get("api")
+                or _asset_encoding(baseline.get("kind")) != identity.get("encoding")
+                or knowledge.get("sourceSha256") != expected_source_sha256
+                or status.get("targetProfile") != knowledge.get("targetProfile")):
+            return None
+        capture_id = _hex(capture.get("captureId"), 64, "registered workspace captureId")
+        catalog_sha = str(capture.get("catalogSha256") or "") or None
+        status = _validate_reuse_workspace_status(
+            dict(status), active, workspace, identity, capture_id, catalog_sha
+        )
+        local_candidate = _local_restore_candidate(status, expected_source_sha256)
+        if source.get("currentSha256") != expected_source_sha256 and not local_candidate:
+            return None
+        return workspace, status, capture_id, catalog_sha
+    except RestoreLocalEdit:
+        raise
+    except Exception:
+        # Stale/missing registered owners retain the ordinary source preparation
+        # path. Never overwrite an existing source to make the hint fit.
+        return None
+
+
+def _snapshot_reuse_workspace(
+    host: Any, active: Mapping[str, Any], identity: Mapping[str, Any],
+    knowledge: Mapping[str, Any] | None, capture_path: Path | None,
+    expected_source_sha256: str,
+) -> tuple[Path, dict[str, Any], str, str | None] | None:
+    """Read an unchanged item's route from a stale whole-project snapshot.
+
+    Another Shader's edit can invalidate the snapshot as a transaction. Its
+    saved path remains only a hint: canonical current source/candidate/profile
+    and original identity are checked, then normal apply authenticates proof.
+    """
+    if not isinstance(knowledge, Mapping) or capture_path is None:
+        return None
+    try:
+        project = Path(str(active["projectRoot"])).resolve()
+        path = _verified_rdc_restore_path(Path(active["paths"]["replayProject"]), capture_path)
+        if (not path.is_file() or path.is_symlink() or not is_within(project, path.resolve())
+                or path.stat().st_size > _MAX_FAST_CATALOG_BYTES):
+            return None
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        seal = saved.pop("sealSha256", None)
+        if (seal != _canonical_sha256(saved)
+                or saved.get("schema") != _VERIFIED_RDC_RESTORE_SCHEMA
+                or saved.get("schemaVersion") != _VERIFIED_RDC_RESTORE_VERSION
+                or saved.get("projectId") != active["replayProject"]["projectId"]
+                or saved.get("projectWorkspaceId") != active["workspaceId"]
+                or _path_key(saved.get("capturePath", "")) != _path_key(capture_path)):
+            return None
+        records = saved.get("shaders")
+        if not isinstance(records, list) or len(records) > _MAX_FAST_PROJECT_SHADERS:
+            return None
+        exact = [record for record in records if isinstance(record, Mapping)
+                 and record.get("knowledgeId") == knowledge.get("knowledgeId")
+                 and record.get("sourceSha256") == expected_source_sha256
+                 and all(record.get("identity", {}).get(key) == identity.get(key)
+                         for key in ("resourceId", "rawSha256", "api", "encoding", "stage", "entryPoint"))]
+        if len(exact) != 1:
+            return None
+        record = exact[0]
+        origin = saved.get("bindingState", {}).get("workspaces", {}).get(record["knowledgeId"])
+        if not isinstance(origin, Mapping) or origin.get("targetProfile") != knowledge.get("targetProfile"):
+            return None
+        managed = record.get("managedWorkspace") or {}
+        workspace = _resolve_workspace_path(project, Path(active["paths"]["shaderWorkspaces"]), managed.get("path", ""))
+        hint = {**knowledge, "registeredWorkspace": {"path": str(workspace), "workspaceId": managed.get("workspaceId")}}
+        reused = _registered_reuse_workspace(host, active, identity, hint, capture_path, expected_source_sha256)
+        if reused is None:
+            return None
+        latest = reused[1].get("latestCompiled") or {}
+        if (latest.get("rawSha256") != record.get("candidateRawSha256")
+                or latest.get("sourceSha256") != expected_source_sha256
+                or latest.get("revision") != reused[1].get("revision")
+                or saved.get("captureSha256") != _verified_rdc_content_sha256(capture_path)):
+            return None
+        return reused
+    except RestoreLocalEdit:
+        raise
+    except Exception:
+        return None
+
+
+def _suspend_workspace_watchers(host: Any, workspace: Path):
+    """Pause the process's live-edit watchers of one workspace, if any.
+
+    The restore compiles and applies into the same workspace the GUI may be
+    watching for editor saves. Without this the watcher compiles the restore's
+    own source write as revision N+1 and applies it, and the restore then finds
+    that the workspace "no longer contains the expected saved candidate".
+    Returns an entered context object (call ``__exit__`` when done) or None.
+    """
+
+    # Automatic resume may finish before restore reserves this capture. Retire
+    # that exact in-memory writer without revoking durable consent or rolling
+    # back the current replacement. Restore starts its editor after committing;
+    # another GUI session is never paused by this transaction.
+    from . import internal_tool_service
+    binding = _CALL_BINDING.get()
+    with internal_tool_service._SHADER_LIVE_EDIT_MANAGER_GUARD:
+        manager = internal_tool_service._SHADER_LIVE_EDIT_MANAGER
+    if manager is not None and binding is not None:
+        with manager._lifecycle_lock:
+            with manager._lock:
+                jobs = [job for job in manager._jobs.values()
+                    if _path_key(job.workspace) == _path_key(workspace)
+                    and job.session is not None
+                    and (job.session.binding.get("instanceId"), job.session.binding.get("captureSessionId")) == binding
+                    and not job.is_terminal()]
+            for job in jobs:
+                job.stop()
+                with manager._lock:
+                    key = _path_key(workspace)
+                    if manager._active_by_workspace.get(key) == job.live_edit_id:
+                        manager._active_by_workspace.pop(key, None)
+    factory = getattr(host, "_shader_workspace_watch_manager", None)
+    if not callable(factory):
+        return None
+    try:
+        manager = factory()
+        suspend = getattr(manager, "suspend_workspace", None)
+        if not callable(suspend):
+            return None
+        suspension = suspend(str(workspace), "project-restore")
+        suspension.__enter__()
+        return suspension
+    except Exception:
+        return None
+
+
+def _local_source_hint(
+    host: Any, active: Mapping[str, Any], workspace: Path,
+    identity: Mapping[str, Any], capture_path: Path | None,
+) -> dict[str, Any]:
+    """Keep a source owner as a managed display hint, never replay authority."""
+    project = Path(str(active["projectRoot"])).resolve()
+    root = Path(str(active["paths"]["shaderWorkspaces"])).resolve()
+    relative = workspace.resolve().relative_to(project).as_posix()
+    workspace = _resolve_workspace_path(project, root, relative)
+    status = _workspace_artifact_service(host).status(str(workspace))
+    capture = status.get("capture") or {}
+    if capture_path is None or _path_key(capture.get("capturePath", "")) != _path_key(capture_path):
+        raise RuntimeError("preserved Shader source belongs to another capture")
+    _validate_reuse_workspace_status(dict(status), active, workspace, identity,
+        _hex(capture.get("captureId"), 64, "preserved source captureId"),
+        str(capture.get("catalogSha256") or "") or None)
+    return {"path": relative,
+            "workspaceId": _hex(status.get("workspaceId"), 32, "preserved source workspaceId")}
+
+
+def _prior_local_source_hint(
+    active: Mapping[str, Any], workspace: Path, identity: Mapping[str, Any], capture: Path,
+) -> dict[str, Any] | None:
+    """Recover display-only ownership after the legacy RDC codec drops it."""
+    try:
+        project = Path(str(active["projectRoot"])).resolve()
+        path = _verified_rdc_restore_path(Path(active["paths"]["replayProject"]), capture)
+        if (path.is_symlink() or not path.is_file() or not is_within(project, path.resolve())
+                or path.stat().st_size > _MAX_FAST_CATALOG_BYTES):
+            return None
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        seal = saved.pop("sealSha256", None)
+        if (seal != _canonical_sha256(saved) or saved.get("schema") != _VERIFIED_RDC_RESTORE_SCHEMA
+                or saved.get("projectId") != active["replayProject"]["projectId"]
+                or saved.get("projectWorkspaceId") != active["workspaceId"]
+                or _path_key(saved.get("capturePath", "")) != _path_key(capture)):
+            return None
+        rows = saved.get("shaders")
+        if not isinstance(rows, list) or len(rows) > _MAX_FAST_PROJECT_SHADERS:
+            return None
+        matches = [row.get("preservedLocalSource") for row in rows if isinstance(row, Mapping)
+                   and _path_key(project / str(row.get("managedWorkspace", {}).get("path", ""))) == _path_key(workspace)
+                   and all(row.get("identity", {}).get(key) == identity.get(key)
+                           for key in ("resourceId", "rawSha256", "api", "encoding", "stage", "entryPoint"))
+                   and isinstance(row.get("preservedLocalSource"), Mapping)]
+        return dict(matches[0]) if len(matches) == 1 else None
+    except Exception:
+        return None
+
+
+def _restore_local_source_display(
+    host: Any, active: Mapping[str, Any], project: Path, capture: Path,
+    record: Mapping[str, Any], knowledge: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Read today's draft separately from the immutable restored executable.
+
+    Hints are display-only and cannot veto an authenticated replay restoration.
+    Missing/deleted drafts and untrusted paths are ignored, never displayed or
+    watched. Draft edits do not invalidate the independent signed replay cache.
+    """
+    try:
+        hint = record.get("preservedLocalSource")
+        if not isinstance(hint, Mapping):
+            replay_workspace = project / record["managedWorkspace"]["path"]
+            hint = _prior_local_source_hint(active, replay_workspace, record["identity"], capture)
+        if not isinstance(hint, Mapping) and isinstance(knowledge, Mapping):
+            registered = knowledge.get("registeredWorkspace") or {}
+            if registered.get("workspaceId") != record["managedWorkspace"]["workspaceId"]:
+                hint = {"workspaceId": registered.get("workspaceId"),
+                        "path": Path(str(registered.get("path") or "")).resolve().relative_to(project).as_posix()}
+        if not isinstance(hint, Mapping):
+            return None
+        workspace = _resolve_workspace_path(project,
+            Path(str(active["paths"]["shaderWorkspaces"])).resolve(), str(hint.get("path", "")))
+        checked = _local_source_hint(host, active, workspace, record["identity"], capture)
+        if checked != dict(hint) or checked.get("workspaceId") == record["managedWorkspace"]["workspaceId"]:
+            return None
+        status = _workspace_artifact_service(host).status(str(workspace))
+        item = {"workspaceId": checked["workspaceId"], "workspacePath": str(workspace),
+                "sourceSha256": _hex(status.get("source", {}).get("currentSha256"), 64,
+                                     "preserved Shader sourceSha256"),
+                "reason": "local-edit", "shown": False}
+    except Exception:
+        return None
+    show = getattr(host, "_show_saved_shader_workspace_source", None)
+    if callable(show):
+        try:
+            shown = _tool_json(show(str(workspace), activate_window=False),
+                               "show preserved local Shader source")
+            item["shown"] = shown.get("shown") is True
+        except Exception:
+            pass
+    return item
+
+
+def _isolated_replay_workspace_path(workspace: Path, knowledge_id: str) -> Path:
+    """Keep replay owners within the normal workspace path budget on all hosts."""
+    return workspace.with_name(_canonical_sha256({
+        "domain": "replaylab-isolated-replay-workspace/v1",
+        "originalWorkspace": workspace.name,
+        "knowledgeId": _hex(knowledge_id, 32, "replay knowledge ID"),
+    }))
 
 
 def _prepare_reuse_workspace(
@@ -5520,7 +7300,13 @@ def _prepare_reuse_workspace(
     catalog_sha256: str,
     *,
     expected_anchor_event_id: int,
+    expected_source_sha256: str,
     inventory_mode: bool = False,
+    registered_knowledge: Mapping[str, Any] | None = None,
+    capture_path: Path | None = None,
+    progress: Any = None,
+    diagnostic: dict[str, Any] | None = None,
+    pending_source: Mapping[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any], str, str | None]:
     # Freeze the representative EID selected by the current unique-resource
     # inventory. Every later workspace admission and apply receipt must remain
@@ -5530,6 +7316,81 @@ def _prepare_reuse_workspace(
     )
     if event_id != _shader_anchor_event_id(identity):
         raise RuntimeError("target Shader inventory representative EID changed")
+    preserved_local_edit = None
+    # Saved executable source owns replay independently from a newer working
+    # draft. Isolation is available only for knowledge belonging to this exact
+    # captured original, never a fuzzy match or an arbitrary source path.
+    can_isolate_source = bool(
+        isinstance(registered_knowledge, Mapping)
+        and callable(getattr(host, "_active_capture_catalog_selection", None))
+        and callable(getattr(getattr(host, "_shader_workspace_service", lambda: None)(), "create", None))
+        and registered_knowledge.get("sourceSha256") == expected_source_sha256
+        and registered_knowledge.get("knowledgeId")
+        and all(registered_knowledge.get(key) == identity.get(key)
+                for key in ("rawSha256", "api", "encoding", "stage"))
+        and registered_knowledge.get("entryPoint", "") == identity.get("entryPoint", ""))
+    if inventory_mode:
+        try:
+            existing = _registered_reuse_workspace(
+                host, active, identity, registered_knowledge, capture_path,
+                expected_source_sha256,
+            )
+        except RestoreLocalEdit as exc:
+            # The original knowledge owner may now contain an unfinished edit.
+            # Preserve it, but first try the already saved exact-source owner
+            # from this RDC's last successful restore. That path still checks
+            # source/candidate/profile/capture bytes and grants no apply rights.
+            preserved_local_edit = exc
+            existing = None
+        if (existing is not None and pending_source
+                and existing[1].get("source", {}).get("currentSha256") == pending_source.get("sourceSha256")
+                and pending_source.get("sourceSha256") != expected_source_sha256):
+            existing = None
+        from_snapshot = False
+        if existing is None:
+            try:
+                existing = _snapshot_reuse_workspace(
+                    host, active, identity, registered_knowledge, capture_path,
+                    expected_source_sha256,
+                )
+            except RestoreLocalEdit as exc:
+                if preserved_local_edit is None:
+                    preserved_local_edit = exc
+            if (existing is not None and pending_source
+                    and existing[1].get("source", {}).get("currentSha256") == pending_source.get("sourceSha256")
+                    and pending_source.get("sourceSha256") != expected_source_sha256):
+                existing = None
+            from_snapshot = existing is not None
+        if (existing is None and preserved_local_edit is not None and not can_isolate_source
+                and (not pending_source or preserved_local_edit.workspace_source_sha256 != pending_source.get("sourceSha256"))):
+            raise preserved_local_edit
+        if existing is not None:
+            workspace, status, capture_id, located_catalog = existing
+            if diagnostic is not None:
+                diagnostic.update(
+                    workspacePath=str(workspace), resolvedCatalogSha256=located_catalog,
+                    requestedProjectSourceSha256=expected_source_sha256,
+                    reusedRegisteredWorkspace=not from_snapshot,
+                    reusedPriorSnapshotWorkspace=from_snapshot,
+                )
+                if (can_isolate_source and preserved_local_edit is not None
+                        and preserved_local_edit.workspace is not None):
+                    diagnostic["preservedLocalSource"] = _local_source_hint(
+                        host, active, preserved_local_edit.workspace, identity, capture_path)
+                elif capture_path is not None:
+                    prior_hint = _prior_local_source_hint(active, workspace, identity, capture_path)
+                    if prior_hint is not None:
+                        diagnostic["preservedLocalSource"] = prior_hint
+            if progress is not None:
+                progress.emit("resource-anchor", "Reusing the exact registered Shader workspace",
+                              item="Shader ResourceId %d" % identity["resourceId"])
+            return existing
+    if progress is not None:
+        progress.emit(
+            "resource-anchor",
+            "Resolving the target Shader workspace (bounded catalog export)",
+            item="Shader ResourceId %d" % identity["resourceId"],
+        )
     located = _tool_json(
         host.get_active_shader_workspace_path(
             event_id, str(identity["stage"]),
@@ -5567,22 +7428,203 @@ def _prepare_reuse_workspace(
     ).resolve()
     if not shader_root.is_dir() or not is_within(shader_root, workspace):
         raise RuntimeError("target Shader workspace escaped the active project")
+    factory = getattr(host, "_shader_workspace_service", None)
+    desired_format = (registered_knowledge or {}).get("sourceFormat", "hlsl")
+    representation_changed = False
+    if (pending_source or can_isolate_source) and workspace.exists() and callable(factory):
+        try:
+            observed = _workspace_artifact_service(host).status(str(workspace))
+        except RuntimeError as exc:
+            if "candidate ABI report does not prove exact compatibility" not in str(exc):
+                raise
+            factory().reopen_candidate_for_project_restore(
+                workspace, expected_capture_id=capture_id,
+                expected_resource_id=int(identity["resourceId"]), expected_stage=str(identity["stage"]),
+                expected_entry_point=str(identity.get("entryPoint", "") or ""),
+                expected_original_raw_sha256=str(identity["rawSha256"]),
+                expected_source_sha256=_hex(expected_source_sha256, 64, "project Shader sourceSha256"))
+            observed = _workspace_artifact_service(host).status(str(workspace))
+        if (observed.get("source") or {}).get("present") is True:
+            observed = _validate_reuse_workspace_status(
+                dict(observed), active, workspace, identity, capture_id, located_catalog)
+            representation_changed = bool(can_isolate_source
+                and observed["source"].get("format") != desired_format)
+            if (preserved_local_edit is not None and preserved_local_edit.workspace is not None
+                    and _path_key(preserved_local_edit.workspace) != _path_key(workspace)
+                    and observed["source"].get("currentSha256") == expected_source_sha256
+                    and observed.get("sourceDependenciesCurrent", True) is True):
+                # The active lookup may already return the isolated replay
+                # owner. Retain its identity/cache instead of nesting suffixes.
+                if diagnostic is not None:
+                    diagnostic.update(workspacePath=str(workspace), resolvedCatalogSha256=located_catalog,
+                        requestedProjectSourceSha256=expected_source_sha256,
+                        preservedLocalSource=_local_source_hint(host, active,
+                            preserved_local_edit.workspace, identity, capture_path))
+                return workspace, observed, capture_id, located_catalog
+            if (pending_source
+                    and observed["source"].get("currentSha256") == pending_source.get("sourceSha256")
+                    and pending_source.get("sourceSha256") != expected_source_sha256):
+                preserved_local_edit = RestoreLocalEdit("pending project source", workspace,
+                    observed["source"]["currentSha256"])
+            else:
+                try:
+                    _local_restore_candidate(observed, expected_source_sha256)
+                except RestoreLocalEdit as exc:
+                    if not can_isolate_source:
+                        raise
+                    preserved_local_edit = exc
+    if representation_changed:
+        # An original program can have only one current project source. Keep
+        # immutable old receipts/drafts at their recorded paths, and bind the
+        # current representation to a stable owner, independent of revisions.
+        # Feeding HLSL into a GLSL route is never a compatibility migration.
+        if preserved_local_edit is not None and preserved_local_edit.workspace is not None and diagnostic is not None:
+            diagnostic["preservedLocalSource"] = _local_source_hint(
+                host, active, preserved_local_edit.workspace, identity, capture_path)
+        workspace = workspace.with_name(_canonical_sha256({
+            "domain": "replaylab-project-source-representation/v1",
+            "captureId": capture_id, "resourceId": identity["resourceId"],
+            "rawSha256": identity["rawSha256"], "stage": identity["stage"],
+            "entryPoint": identity.get("entryPoint", ""), "sourceFormat": desired_format,
+        }))
+    if preserved_local_edit is not None and not representation_changed and (pending_source or can_isolate_source):
+        # Never import the saved executable into a person's unfinished source.
+        # The independent replay owner is prepared from the exact current
+        # captured program and still passes normal seed/compile/apply checks.
+        if can_isolate_source and preserved_local_edit.workspace is not None and diagnostic is not None:
+            diagnostic["preservedLocalSource"] = _local_source_hint(
+                host, active, preserved_local_edit.workspace, identity, capture_path)
+        knowledge_id = _hex((registered_knowledge or {}).get("knowledgeId"), 32,
+                            "replay knowledge ID")
+        legacy_workspace = workspace.with_name(workspace.name + "-replay-" + knowledge_id)
+        workspace = _isolated_replay_workspace_path(workspace, knowledge_id)
+        if workspace.is_symlink() or not is_within(shader_root, workspace.resolve()):
+            raise RuntimeError("validated replay source escaped the active project")
+        if (not workspace.exists() and legacy_workspace.exists()
+                and not legacy_workspace.is_symlink()
+                and is_within(shader_root, legacy_workspace.resolve())):
+            # Published older owners can keep their signed paths and compiled
+            # cache. An unfinished legacy owner must not force a new compiler
+            # job back onto the overlong path this naming scheme replaces.
+            try:
+                legacy_status = _validate_reuse_workspace_status(
+                    _workspace_artifact_service(host).status(str(legacy_workspace)), active, legacy_workspace,
+                    identity, capture_id, located_catalog)
+                latest = legacy_status.get("latestCompiled") or {}
+                if (legacy_status["source"].get("currentSha256") == expected_source_sha256
+                        and legacy_status.get("sourceDependenciesCurrent", True) is True
+                        and legacy_status.get("targetProfile") == (registered_knowledge or {}).get("targetProfile")
+                        and latest.get("sourceSha256") == expected_source_sha256
+                        and type(latest.get("revision")) is int and latest["revision"] > 0
+                        and latest["revision"] == legacy_status.get("revision")):
+                    _hex(latest.get("rawSha256"), 64, "legacy replay candidateRawSha256")
+                    if diagnostic is not None:
+                        diagnostic.update(workspacePath=str(legacy_workspace),
+                            resolvedCatalogSha256=located_catalog,
+                            requestedProjectSourceSha256=expected_source_sha256)
+                    return legacy_workspace, legacy_status, capture_id, located_catalog
+            except (RuntimeError, ValueError):
+                pass
+    if not workspace.exists() and (representation_changed or
+            (preserved_local_edit is not None and (pending_source or can_isolate_source))):
+        selection = host._active_capture_catalog_selection(event_id, str(identity["stage"]))
+        if selection is None:
+            raise RuntimeError("validated replay source has no current exact Shader catalog")
+        exported, catalog_path, selected, unused_binding = selection
+        if (exported.get("captureSessionId") != capture_session_id
+                or selected.capture_id != capture_id
+                or selected.key.resource_id != identity["resourceId"]
+                or selected.key.raw_sha256 != identity["rawSha256"]
+                or selected.key.stage != identity["stage"]
+                or selected.key.entry_point != identity.get("entryPoint", "")):
+            raise RuntimeError("validated replay source catalog changed its original Shader")
+        factory().create(catalog_path, selected.key.catalog_key, workspace,
+                         editable_format=desired_format)
+    if diagnostic is not None:
+        diagnostic.update(
+            workspacePath=str(workspace),
+            resolvedCatalogSha256=located_catalog,
+            requestedProjectSourceSha256=expected_source_sha256,
+        )
     workspace_existed = workspace.exists()
-    prepared = _tool_json(
-        host.prepare_shader_workspace(
-            event_id,
-            str(identity["stage"]),
-            str(workspace),
-            expected_resource_id=int(identity["resourceId"]),
-            expected_entry_point=str(identity.get("entryPoint", "") or ""),
-            expected_raw_sha256=str(identity["rawSha256"]),
+    def reopen_stale_candidate() -> None:
+        factory = getattr(host, "_shader_workspace_service", None)
+        if not callable(factory):
+            raise RuntimeError("target workspace has no candidate recovery service")
+        factory().reopen_candidate_for_project_restore(
+            workspace,
             expected_capture_id=capture_id,
-            expected_capture_session_id=capture_session_id,
-            admit_existing=workspace_existed,
-        ),
-        "prepare target Shader workspace",
-        schema="renderdoc-ultra-shader-workspace-mcp/v1",
-    )
+            expected_resource_id=int(identity["resourceId"]),
+            expected_stage=str(identity["stage"]),
+            expected_entry_point=str(identity.get("entryPoint", "") or ""),
+            expected_original_raw_sha256=str(identity["rawSha256"]),
+            expected_source_sha256=_hex(expected_source_sha256, 64, "project Shader sourceSha256"),
+        )
+
+    if workspace_existed:
+        # prepare() may import project source. Inspect the existing owner's
+        # source before entering that path, not after it has already been seeded.
+        factory = (getattr(host, "_shader_workspace_artifact_service", None)
+                   or getattr(host, "_shader_workspace_service", None))
+        reader = getattr(factory(), "status", None) if callable(factory) else None
+        def read_existing_status():
+            if callable(reader):
+                return reader(str(workspace))
+            return _tool_json(host.get_shader_workspace_status(str(workspace)),
+                             "read existing target Shader source",
+                             schema="renderdoc-ultra-shader-workspace-mcp/v1")["result"]
+        try:
+            existing_status = read_existing_status()
+        except RuntimeError as exc:
+            if "candidate ABI report does not prove exact compatibility" not in str(exc):
+                raise
+            # The recovery API authenticates the exact current source digest
+            # before clearing a stale ABI gate. It rejects divergent drafts,
+            # so this bounded retry cannot make an old project overwrite one.
+            reopen_stale_candidate()
+            existing_status = read_existing_status()
+        if (existing_status.get("source") or {}).get("present") is True:
+            status = _validate_reuse_workspace_status(
+                dict(existing_status), active, workspace, identity, capture_id, located_catalog)
+            if _local_restore_candidate(status, expected_source_sha256):
+                return workspace, status, capture_id, located_catalog
+    if progress is not None:
+        progress.emit(
+            "resource-anchor",
+            "Preparing the target Shader workspace from its captured program",
+            item="Shader ResourceId %d" % identity["resourceId"],
+        )
+    def prepare_once() -> dict[str, Any]:
+        return _tool_json(
+            host.prepare_shader_workspace(
+                event_id,
+                str(identity["stage"]),
+                str(workspace),
+                expected_resource_id=int(identity["resourceId"]),
+                expected_entry_point=str(identity.get("entryPoint", "") or ""),
+                expected_raw_sha256=str(identity["rawSha256"]),
+                expected_capture_id=capture_id,
+                expected_capture_session_id=capture_session_id,
+                admit_existing=workspace_existed,
+                **({"editable_format": desired_format} if can_isolate_source else {}),
+            ),
+            "prepare target Shader workspace",
+            schema="renderdoc-ultra-shader-workspace-mcp/v1",
+        )
+
+    try:
+        prepared = prepare_once()
+    except RuntimeError as exc:
+        if (
+            not workspace_existed
+            or not str(exc).startswith(
+                "prepare target Shader workspace failed: "
+                "candidate ABI report does not prove exact compatibility"
+            )
+        ):
+            raise
+        reopen_stale_candidate()
+        prepared = prepare_once()
     prepared_result = prepared.get("result")
     prepared_binding = (
         prepared_result.get("binding")
@@ -5659,6 +7701,7 @@ def _compile_reuse_workspace(
     expected_source_sha256 = _hex(
         candidate_plan.get("sourceSha256"), 64, "reuse sourceSha256"
     )
+    _preserve_unpublished_include_edit(status)
     source = status.get("source")
     latest = status.get("latestCompiled")
     target_profile = status.get("targetProfile")
@@ -5669,6 +7712,7 @@ def _compile_reuse_workspace(
     ):
         raise RuntimeError("target Shader source/profile changed before candidate reuse")
     binary = candidate_plan.get("binaryCandidate")
+    manual = isinstance(binary, Mapping) and binary.get("manualEdit") is True
     expected_compiler_binding_sha256: str | None = None
     if candidate_plan.get("binaryCandidateEligible") is True:
         source_revision = (
@@ -5699,6 +7743,7 @@ def _compile_reuse_workspace(
         latest, Mapping
     ) and (
         latest.get("sourceSha256") == source.get("currentSha256")
+        and status.get("sourceDependenciesCurrent", True) is True
         and latest.get("revision") == status.get("revision")
         and isinstance(latest.get("revision"), int)
         and latest.get("revision") > 0
@@ -5738,8 +7783,27 @@ def _compile_reuse_workspace(
             and receipt.get("oldReplacementIdReused") is False
             and receipt.get("oldCaptureAbiAuthorityReused") is False
         )
-    if (existing_candidate_current and existing_project_candidate_exact
-            and candidate_plan.get("sourcePreparationOnly") is not True):
+        if manual:
+            provenance = binary.get("manualApplyReceipt") or {}
+            existing_project_candidate_exact = bool(
+                latest.get("rawSha256") == binary.get("sha256")
+                and latest.get("codeSha256") == binary.get("codeSha256")
+                and latest.get("byteSize") == binary.get("byteSize")
+                and latest.get("validationScope") == "manual-edit-unvalidated"
+                and provenance.get("originalRawSha256") == (status.get("baseline") or {}).get("rawSha256")
+                and provenance.get("candidateRawSha256") == latest.get("rawSha256")
+                and provenance.get("sourceSha256") == expected_source_sha256
+                and provenance.get("stage") == status.get("stage")
+                and provenance.get("entryPoint", "") == status.get("entryPoint", "")
+                and provenance.get("targetProfile") == target_profile)
+    # Incomplete project reflection prevents importing a cross-workspace binary
+    # or publishing an executable RDC index. It does not invalidate the exact
+    # target workspace's own compiled source. status() already checks the
+    # candidate bytes, original Shader, profile and bound compiler provenance;
+    # the apply path below still obtains current-session ABI/anchor authority.
+    # Recompiling this unchanged source on every open only creates identical
+    # revisions (and source-only restores intentionally never acquire an index).
+    if existing_candidate_current and existing_project_candidate_exact:
         _hex(latest.get("rawSha256"), 64, "existing candidateRawSha256")
         progress.emit(
             "shader-candidate-load",
@@ -5782,7 +7846,7 @@ def _compile_reuse_workspace(
                 != status.get("source", {}).get("currentSha256")
                 or imported.get("compilerSkipped") is not True
                 or imported.get("compiledFromProjectArtifact") is not True
-                or imported.get("requiresReplayAbiValidation") is not True
+                or imported.get("requiresReplayAbiValidation") is not (not manual)
                 or imported.get("replayAbiValidated") is not False
                 or imported.get("applied") is not False
             ):
@@ -5830,9 +7894,9 @@ def _compile_reuse_workspace(
                 != binary.get("targetProfile")
                 or imported_receipt.get("compilerBindingSha256")
                 != expected_compiler_binding_sha256
-                or imported_receipt.get("originValidationEvidenceOnly") is not True
+                or imported_receipt.get("originValidationEvidenceOnly") is not (not manual)
                 or imported_receipt.get("freshCaptureRebindRequired") is not True
-                or imported_receipt.get("freshLiveAbiRevalidationRequired") is not True
+                or imported_receipt.get("freshLiveAbiRevalidationRequired") is not (not manual)
                 or imported_receipt.get("applyAuthorization") is not False
                 or imported_receipt.get("oldReplacementIdReused") is not False
                 or imported_receipt.get("oldCaptureAbiAuthorityReused") is not False
@@ -5871,7 +7935,7 @@ def _compile_reuse_workspace(
         raise RuntimeError("target Shader source changed before fallback compile")
     progress.emit(
         "shader-compile",
-        "Compiling project HLSL %d/%d" % (position, total),
+        "Compiling project Shader source %d/%d" % (position, total),
         current=position,
         total=total,
         detail=progress_detail,
@@ -5879,11 +7943,15 @@ def _compile_reuse_workspace(
     if control_checkpoint is not None:
         control_checkpoint("before fallback Shader compile")
     before_compile_revision = _integer(status.get("revision"), "pre-compile revision")
-    compiled = _tool_json(
-        host.compile_shader_workspace(str(workspace)),
-        "compile reused Shader source",
-        schema="renderdoc-ultra-shader-workspace-mcp/v1",
-    )
+    if manual:
+        compiled = {"operation": "compile", "result":
+                    host._shader_workspace_service().compile(str(workspace), manual_fast=True)}
+    else:
+        compiled = _tool_json(
+            host.compile_shader_workspace(str(workspace)),
+            "compile reused Shader source",
+            schema="renderdoc-ultra-shader-workspace-mcp/v1",
+        )
     if control_checkpoint is not None:
         control_checkpoint("after fallback Shader compile")
     if compiled.get("operation") != "compile":
@@ -5905,6 +7973,7 @@ def _compile_reuse_workspace(
     if (
         not isinstance(source, Mapping)
         or not isinstance(latest, Mapping)
+        or after.get("sourceDependenciesCurrent", True) is not True
         or source.get("currentSha256") != candidate_plan.get("sourceSha256")
         or latest.get("sourceSha256") != source.get("currentSha256")
         or latest.get("revision") != after.get("revision")
@@ -6552,6 +8621,79 @@ def _restore_reuse_aliases_best_effort(
         return False
 
 
+def _pending_project_source_item(
+    host: Any, knowledge: Mapping[str, Any], identity: Mapping[str, Any], reason: str,
+    *, project_id: str, capture_id: str, capture_path: Path, capture_session_id: str,
+    replay_source: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Restore a saved draft's editor without granting replay/watch authority."""
+    item = {"status": "skipped", "source": "reuse-plan",
+            "resourceId": identity["resourceId"], "stage": identity["stage"],
+            "knowledgeId": knowledge["knowledgeId"], "reason": reason,
+            "knowledgeSourceSha256": knowledge["sourceSha256"]}
+    workspace = Path(str(knowledge.get("workspacePath", "")))
+    try:
+        # The immutable project source, not the continued existence of its
+        # original editor file, owns the shared head. The Host verifies that
+        # artifact and opens/creates a current-target working copy with CAS.
+        show = getattr(host, "_show_project_shader_source", None)
+        if not callable(show):
+            raise RuntimeError("saved source display is unavailable")
+        shown = _tool_json(show(str(workspace), knowledge["sourceSha256"],
+            project_id=project_id, knowledge_id=knowledge["knowledgeId"], identity=identity,
+            capture_id=capture_id, capture_path=str(capture_path), capture_session_id=capture_session_id,
+            activate_window=False,
+            **({"replay_source": replay_source} if replay_source is not None else {})),
+            "show pending project Shader source")
+        if shown.get("shown") is not True:
+            raise RuntimeError("saved project Shader source was not displayed")
+        display_binding = shown.get("projectSourceBinding") or {}
+        if display_binding:
+            item["resourceId"] = display_binding["resourceId"]
+        item.update(workspacePath=str(shown.get("sourceWorkspacePath") or workspace),
+                    workspaceSourceSha256=knowledge["sourceSha256"],
+                    detail="Saved source opened for editing; compile, validation and replay application remain pending")
+    except Exception as error:
+        item["detail"] = ("Source-only draft was not applied; " + str(error))[:4096]
+    return item
+
+
+def _fallback_pending_knowledge(candidate: Mapping[str, Any], state: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    pending = candidate.get("pendingSource")
+    if pending is None:
+        return None
+    if not isinstance(pending, Mapping):
+        raise RuntimeError("project pending source binding is invalid")
+    knowledge = state.get("workspaces", {}).get(pending.get("knowledgeId"))
+    applied = state.get("workspaces", {}).get(candidate.get("knowledgeId"))
+    if (not isinstance(knowledge, Mapping) or not isinstance(applied, Mapping)
+            or knowledge.get("sourceSha256") != pending.get("sourceSha256")
+            or knowledge.get("knowledgeId") == applied.get("knowledgeId")
+            or any(knowledge.get(key) != applied.get(key) for key in (
+                "rawSha256", "stage", "entryPoint", "targetProfile"))
+            or source_only_restore_reason(knowledge, state.get("projectPath")) != pending.get("reason")):
+        raise RuntimeError("project pending source differs from its validated replay head")
+    return knowledge
+
+
+def _show_fallback_pending_source(host: Any, candidate: Mapping[str, Any], state: Mapping[str, Any],
+    identity: Mapping[str, Any], capture_id: str, capture_path: Path, session: str) -> dict[str, Any] | None:
+    pending = candidate.get("pendingSource")
+    if pending is None:
+        return None
+    # The relationship is admitted before applying. Display cannot turn a
+    # committed valid replacement into a second failed apply if a source-only
+    # diagnostic changes while the editor is opening.
+    knowledge = state["workspaces"][pending["knowledgeId"]]
+    shown = _pending_project_source_item(host, knowledge, identity, candidate["pendingSource"]["reason"],
+        project_id=state["projectId"], capture_id=capture_id, capture_path=capture_path,
+        capture_session_id=session, replay_source={"knowledgeId": candidate["knowledgeId"],
+            "sourceSha256": candidate["sourceSha256"], "applied": True})
+    return {"knowledgeId": knowledge["knowledgeId"], "sourceSha256": knowledge["sourceSha256"],
+            "reason": candidate["pendingSource"]["reason"], "shown": bool(shown.get("workspacePath")),
+            **({"workspacePath": shown["workspacePath"]} if shown.get("workspacePath") else {})}
+
+
 def _restore_from_reuse_plan(
     host: Any,
     replay: ReplayProjectService,
@@ -6687,6 +8829,16 @@ def _restore_from_reuse_plan(
                 candidate.get("knowledgeId"), 32, "workspace knowledgeId"
             )
             knowledge = binding_state.get("workspaces", {}).get(knowledge_id)
+            _fallback_pending_knowledge(candidate, binding_state)
+            pending_reason = (source_only_restore_reason(knowledge, binding_state.get("projectPath"))
+                              if isinstance(knowledge, Mapping) else None)
+            if pending_reason:
+                shader_summary["skipped"] += 1
+                shader_summary["items"].append(
+                    _pending_project_source_item(host, knowledge, identity, pending_reason,
+                        project_id=binding_state["projectId"], capture_id=capture_id,
+                        capture_path=capture_path, capture_session_id=capture_session_id))
+                continue
             if (
                 candidate.get("sourceSeedEligible") is not True
                 or identity.get("anchorEventId") is None
@@ -6715,9 +8867,11 @@ def _restore_from_reuse_plan(
                 )
             else:
                 shader_summary["attempted"] += 1
+                watch_suspension = None
+                workspace_diagnostic: dict[str, Any] = {}
                 progress.emit(
                     "shader-prepare",
-                    "Preparing project HLSL %d/%d" % (position, len(matches)),
+                    "Preparing project Shader source %d/%d" % (position, len(matches)),
                     current=position,
                     total=len(matches),
                     detail={
@@ -6753,22 +8907,70 @@ def _restore_from_reuse_plan(
                         capture_session_id,
                         catalog_sha256,
                         expected_anchor_event_id=expected_anchor_event_id,
+                        expected_source_sha256=str(candidate["sourceSha256"]),
                         inventory_mode=inventory_mode,
+                        registered_knowledge=knowledge,
+                        capture_path=capture_path,
+                        progress=progress,
+                        diagnostic=workspace_diagnostic,
+                        pending_source=_fallback_pending_knowledge(candidate, binding_state),
                     )
                     if control_checkpoint is not None:
                         control_checkpoint("after target Shader workspace preparation")
-                    if source_preparation_only:
+                    watch_suspension = _suspend_workspace_watchers(host, workspace)
+                    local_candidate = _local_restore_candidate(status, str(candidate["sourceSha256"]))
+                    published_source_advance = None
+                    if local_candidate and inventory_mode:
+                        advance = getattr(replay, "published_workspace_source_advance", None)
+                        if callable(advance):
+                            published_source_advance = advance(knowledge_id, status)
+                            if published_source_advance is not None:
+                                # Exact old published bytes are a prior project
+                                # version, not an unpublished local edit. The
+                                # seed rechecks head generation and source /
+                                # candidate CAS under both ownership locks.
+                                local_candidate = False
+                    if local_candidate:
+                        # This same-capture owner has an unpublished successful
+                        # local source. Restore
+                        # its exact binary through the ordinary apply/CAS path;
+                        # do not publish it as shared project knowledge.
+                        candidate = {**candidate,
+                                     "sourceSha256": status["source"]["currentSha256"],
+                                     "binaryCandidateEligible": False}
+                        source_preparation_only = True
+                    superseded_local_edit = None
+                    # Older inventory seeds could copy the active project text
+                    # without recording its import receipt. Retry through the
+                    # ordinary verified seed before asking the physical gate
+                    # to retire an old draft. Equal bytes alone never retire it.
+                    refresh_project_source = bool(
+                        not local_candidate
+                        and status["source"].get("origin") != "verified-project-source"
+                        and status["source"].get("projectSource") is None
+                        and status["source"].get("currentSha256") == candidate.get("sourceSha256")
+                        and (workspace / "ai" / "organize-code-gate.json").is_file()
+                    )
+                    if source_preparation_only and not local_candidate:
                         # The normal public prepare path must have imported the
                         # exact active project source. Never fall back to an old
                         # seed, reverse-engineer it again, or adopt its grant.
-                        _validate_prepared_project_source(status, knowledge, identity, binding_state)
+                        if published_source_advance is None:
+                            try:
+                                _validate_prepared_project_source(status, knowledge, identity, binding_state,
+                                    source_preparation_only=source_preparation_only)
+                            except RestoreLocalEdit:
+                                if status["source"].get("modifiedSinceDecompile") is not False:
+                                    raise
+                            except RestoreProjectSourceRefresh:
+                                refresh_project_source = True
                         _prepared_binding_state(replay, active, prepared)
                     source = status["source"]
-                    if source.get("currentSha256") != candidate.get("sourceSha256"):
-                        if source.get("modifiedSinceDecompile") is not False:
-                            raise RuntimeError(
-                                "target Shader workspace contains a different user edit"
-                            )
+                    if (source.get("currentSha256") != candidate.get("sourceSha256")
+                            or refresh_project_source):
+                        # Only untouched output, identical source needing a
+                        # receipt refresh, or an exact previous publication may
+                        # reach this seed. Unknown local edits remain protected.
                         if control_checkpoint is not None:
                             control_checkpoint("before target Shader source seed")
                         if inventory_mode:
@@ -6802,6 +9004,8 @@ def _restore_from_reuse_plan(
                                 target_shader,
                                 project_inventory,
                                 expected_binding,
+                                **({"published_source_advance": published_source_advance}
+                                   if published_source_advance is not None else {}),
                             )
                             if (
                                 not isinstance(seeded, Mapping)
@@ -6829,6 +9033,10 @@ def _restore_from_reuse_plan(
                                 schema="replaylab-active-workspace-seed/v1",
                                 schema_version=1,
                             )
+                        seed_result = seeded.get("result") if isinstance(seeded.get("result"), Mapping) else seeded
+                        if isinstance(seed_result, Mapping) and isinstance(
+                                seed_result.get("supersededLocalEdit"), Mapping):
+                            superseded_local_edit = dict(seed_result["supersededLocalEdit"])
                         if control_checkpoint is not None:
                             control_checkpoint("after target Shader source seed")
                         if not inventory_mode and (
@@ -6848,6 +9056,9 @@ def _restore_from_reuse_plan(
                             live_capture_id,
                             live_catalog_sha256,
                         )
+                        if source_preparation_only and not local_candidate:
+                            _validate_prepared_project_source(status, knowledge, identity, binding_state,
+                                    source_preparation_only=source_preparation_only)
                     if status["source"].get("currentSha256") != candidate.get(
                         "sourceSha256"
                     ):
@@ -6859,6 +9070,15 @@ def _restore_from_reuse_plan(
                         capture_path,
                         capture_session_id,
                     )
+                    try:
+                        from .shader_workspace.semantic_overview_storage import restore_overview
+                        restore_overview(Path(active["paths"]["replayProject"]), workspace,
+                            identity["rawSha256"], candidate["sourceSha256"],
+                            origin_workspace=Path(knowledge["workspacePath"]) if knowledge.get("workspacePath") else None,
+                            origin_workspace_id=knowledge.get("workspaceId"))
+                    except (ValueError, OSError):
+                        # Navigation is independent of executable authority.
+                        pass
                     status = _compile_reuse_workspace(
                         host,
                         active,
@@ -6880,8 +9100,9 @@ def _restore_from_reuse_plan(
                     candidate_raw = _hex(
                         latest.get("rawSha256"), 64, "candidateRawSha256"
                     )
-                    if source_preparation_only:
-                        _validate_prepared_project_source(status, knowledge, identity, binding_state)
+                    if source_preparation_only and not local_candidate:
+                        _validate_prepared_project_source(status, knowledge, identity, binding_state,
+                                    source_preparation_only=source_preparation_only)
                         _prepared_binding_state(replay, active, prepared)
                     _require_restore_context(
                         host,
@@ -6913,7 +9134,8 @@ def _restore_from_reuse_plan(
                         "candidateRevision": revision,
                         "candidateRawSha256": candidate_raw,
                     }
-                    applied = None if source_preparation_only else _adopt_exact_live_replacement(
+                    manual_edit = (status.get("latestCompiled") or {}).get("validationScope") == "manual-edit-unvalidated"
+                    applied = None if source_preparation_only or manual_edit else _adopt_exact_live_replacement(
                         host,
                         workspace,
                         status,
@@ -6930,6 +9152,7 @@ def _restore_from_reuse_plan(
                             expected_candidate_raw_sha256=candidate_raw,
                             expected_anchor_event_id=expected_anchor_event_id,
                             capture_session_id=capture_session_id,
+                            project_root=project_root,
                         )
                     operation_created = bool(
                         not adopted
@@ -6947,6 +9170,16 @@ def _restore_from_reuse_plan(
                             live_capture_id,
                             live_catalog_sha256,
                         )
+                        after_latest = after.get("latestCompiled") or {}
+                        if (after.get("source", {}).get("currentSha256") != candidate["sourceSha256"]
+                                or after_latest.get("sourceSha256") != candidate["sourceSha256"]
+                                or after.get("revision") != revision
+                                or after_latest.get("revision") != revision
+                                or after_latest.get("rawSha256") != candidate_raw):
+                            raise RuntimeError("applied Shader source/candidate changed before restore report")
+                        if applied.get("validation", {}).get("manualEdit") is True:
+                            from .project_manual_shader import from_apply
+                            after = dict(after, manualApplyReceipt=from_apply(applied, after))
                         _require_restore_context(
                             host,
                             active,
@@ -6954,8 +9187,9 @@ def _restore_from_reuse_plan(
                             capture_path,
                             capture_session_id,
                         )
-                        if source_preparation_only:
-                            _validate_prepared_project_source(after, knowledge, identity, binding_state)
+                        if source_preparation_only and not local_candidate:
+                            _validate_prepared_project_source(after, knowledge, identity, binding_state,
+                                source_preparation_only=source_preparation_only)
                             _prepared_binding_state(replay, active, prepared)
                         if inventory_mode and not source_preparation_only:
                             project_inventory = prepared.get("inventory")
@@ -7063,6 +9297,8 @@ def _restore_from_reuse_plan(
                                 else None
                             ),
                         )
+                        if applied.get("validation", {}).get("manualEdit") is True:
+                            record["manualEdit"] = True
                     except Exception:
                         if operation_created:
                             try:
@@ -7090,6 +9326,8 @@ def _restore_from_reuse_plan(
                         )
                     if source_preparation_only:
                         record["sourcePreparationOnly"] = True
+                        if local_candidate:
+                            record["localValidatedCandidate"] = True
                         # This is the freshly validated current-session apply
                         # observation, not the complete-key executable cache
                         # receipt. It is counted but never persisted in RDC.
@@ -7097,10 +9335,12 @@ def _restore_from_reuse_plan(
                                    "identity": copy.deepcopy(identity),
                                    "replacement": copy.deepcopy(dict(applied["replacement"]))}
                     else:
-                        receipt = _realized_receipt_from_apply(record, applied)
+                        receipt = _realized_receipt_from_apply(record, applied, after)
                     realized_receipts.append(receipt)
                     if receipt_stats is not None:
                         receipt_stats["produced"] += 1
+                        if applied.get("validation", {}).get("reusedValidation") is True:
+                            receipt_stats["reusedValidation"] = receipt_stats.get("reusedValidation", 0) + 1
                         if adopted:
                             receipt_stats["adoptedCurrentSession"] += 1
                         elif operation_created:
@@ -7109,8 +9349,11 @@ def _restore_from_reuse_plan(
                             receipt_stats["idempotentApplyResponses"] += 1
                     if control_checkpoint is not None:
                         control_checkpoint("after project Shader apply")
+                    if workspace_diagnostic.get("preservedLocalSource") is not None:
+                        record["preservedLocalSource"] = copy.deepcopy(workspace_diagnostic["preservedLocalSource"])
                     successful_shader_records.append(record)
                     shader_summary["applied"] += 1
+                    reported_knowledge = binding_state.get("workspaces", {}).get(knowledge_id) or knowledge
                     shader_summary["items"].append(
                         {
                             "status": "applied",
@@ -7123,17 +9366,75 @@ def _restore_from_reuse_plan(
                                 "replacementId"
                             ],
                             "idempotentlyAdopted": adopted,
+                            "reusedValidation": applied.get("validation", {}).get("reusedValidation") is True,
+                            "pairValidationCache": copy.deepcopy(applied.get("pairValidationCache")),
                             "knowledgeId": knowledge_id,
+                            "sourceSha256": after["source"]["currentSha256"],
+                            "candidateRawSha256": candidate_raw,
+                            "candidateRevision": revision,
+                            "projectSourceSha256": reported_knowledge["sourceSha256"],
+                            "projectCandidateRawSha256": (reported_knowledge.get("compiledCandidate") or {}).get("rawSha256", ""),
+                            "sourcePreparationOnly": source_preparation_only,
+                            "localValidatedCandidate": local_candidate,
+                            "supersededLocalEdit": superseded_local_edit,
                         }
                     )
+                    pending_display = _show_fallback_pending_source(host, candidate, binding_state,
+                        identity, capture_id, capture_path, capture_session_id)
+                    if pending_display is not None:
+                        shader_summary["items"][-1]["pendingSource"] = pending_display
+                    local_display = _restore_local_source_display(host, active, project_root,
+                        capture_path, record, reported_knowledge)
+                    if local_display is not None:
+                        shader_summary["items"][-1]["preservedLocalSource"] = local_display
+                        # Snapshot-format migration can recover this hint only
+                        # at display time, after target preparation reused an
+                        # unchanged registered replay owner. Retain that checked
+                        # owner in the replacement snapshot as well as the UI.
+                        record["preservedLocalSource"] = {
+                            "workspaceId": local_display["workspaceId"],
+                            "path": Path(local_display["workspacePath"]).relative_to(project_root).as_posix(),
+                        }
+                    if superseded_local_edit is not None:
+                        shader_summary["supersededLocalEdits"] = int(
+                            shader_summary.get("supersededLocalEdits", 0)) + 1
                 except (
                     RestoreContextChanged,
+                    RestoreContextUnavailable,
                     RestoreRollbackFailed,
                     RestoreControlStop,
                 ):
                     raise
+                except RestoreLocalEdit as exc:
+                    # Admission never reached an apply attempt. Keep the
+                    # established result contract: attempted = applied + failed.
+                    shader_summary["attempted"] -= 1
+                    shader_summary["skipped"] += 1
+                    shader_summary["items"].append(
+                        {
+                            "status": "skipped",
+                            "reason": "local-edit",
+                            "detail": str(exc),
+                            "source": "reuse-plan",
+                            "knowledgeId": knowledge_id,
+                            "knowledgeSourceSha256": str(knowledge.get("sourceSha256") or ""),
+                            "resourceId": identity["resourceId"],
+                            "stage": identity["stage"],
+                            "rawSha256": identity.get("rawSha256"),
+                            "workspacePath": str(exc.workspace) if exc.workspace else "",
+                            "workspaceSourceSha256": exc.workspace_source_sha256,
+                        }
+                    )
                 except Exception as exc:
                     shader_summary["failed"] += 1
+                    diagnostic_text = (
+                        " [workspacePath=%s; catalogSha256=%s; projectSourceSha256=%s]"
+                        % (
+                            workspace_diagnostic.get("workspacePath", "unresolved"),
+                            workspace_diagnostic.get("resolvedCatalogSha256", "unresolved"),
+                            workspace_diagnostic.get("requestedProjectSourceSha256", "unresolved"),
+                        )
+                    )
                     shader_summary["items"].append(
                         {
                             "status": "failed",
@@ -7141,9 +9442,14 @@ def _restore_from_reuse_plan(
                             "knowledgeId": knowledge_id,
                             "resourceId": identity["resourceId"],
                             "stage": identity["stage"],
-                            "error": "%s: %s" % (type(exc).__name__, exc),
+                            "error": "%s: %s%s" % (
+                                type(exc).__name__, exc, diagnostic_text
+                            ),
                         }
                     )
+                finally:
+                    if watch_suspension is not None:
+                        watch_suspension.__exit__(None, None, None)
                 _require_restore_context(
                     host,
                     active,
@@ -7344,6 +9650,7 @@ def _restore_from_cache(
                         _normal_shader_identity(record["identity"])
                     ),
                     capture_session_id=capture_session_id,
+                    project_root=project_root,
                 )
             operation_created = bool(
                 not adopted
@@ -7381,10 +9688,12 @@ def _restore_from_cache(
                         capture_session_id,
                     )
                 )
-            receipt = _realized_receipt_from_apply(record, applied)
+            receipt = _realized_receipt_from_apply(record, applied, status)
             realized_receipts.append(receipt)
             if receipt_stats is not None:
                 receipt_stats["produced"] += 1
+                if applied.get("validation", {}).get("reusedValidation") is True:
+                    receipt_stats["reusedValidation"] = receipt_stats.get("reusedValidation", 0) + 1
                 if adopted:
                     receipt_stats["adoptedCurrentSession"] += 1
                 elif operation_created:
@@ -7403,11 +9712,27 @@ def _restore_from_cache(
                 "stage": record["identity"]["stage"],
                 "replacementId": applied["replacement"]["replacementId"],
                 "idempotentlyAdopted": adopted,
+                "reusedValidation": applied.get("validation", {}).get("reusedValidation") is True,
+                "pairValidationCache": copy.deepcopy(applied.get("pairValidationCache")),
             }
+            local_display = _restore_local_source_display(host, active, project_root,
+                capture_path, record, binding_state.get("workspaces", {}).get(record.get("knowledgeId")))
+            restored_record = copy.deepcopy(dict(record))
+            if local_display is not None:
+                item["preservedLocalSource"] = local_display
+                item["sourceSha256"] = record["sourceSha256"]
+                # A legacy index omits editor hints. Preserve the independently
+                # revalidated owner when publishing the upgraded derived
+                # snapshot, otherwise the next warm reopen loses the draft.
+                restored_record["preservedLocalSource"] = {
+                    "workspaceId": local_display["workspaceId"],
+                    "path": Path(local_display["workspacePath"]).relative_to(project_root).as_posix(),
+                }
             shader_summary["items"].append(item)
-            successful_shader_records.append(copy.deepcopy(dict(record)))
+            successful_shader_records.append(restored_record)
         except (
             RestoreContextChanged,
+            RestoreContextUnavailable,
             RestoreRollbackFailed,
             RestoreControlStop,
         ):
@@ -7439,6 +9764,7 @@ def _enable_restored_shader_editing(
     capture_path: Path, capture_session_id: str,
     records: Sequence[Mapping[str, Any]], shader_items: Sequence[Mapping[str, Any]],
     *, cancel_event: Any = None, deadline_monotonic: float | None = None,
+    progress: _Progress | None = None,
 ) -> dict[str, Any]:
     from .ipc_client import _CALL_BINDING, bind_direct_tool_call
     try:
@@ -7450,10 +9776,27 @@ def _enable_restored_shader_editing(
         # path/session INSIDE this binding before any start, then retain it for
         # every nested request even when another GUI becomes more active.
         with bind_direct_tool_call(instance, capture_session_id):
-            return _enable_restored_shader_editing_bound(
-                host, active, project_root, capture_path, capture_session_id,
-                records, shader_items, cancel_event=cancel_event,
-                deadline_monotonic=deadline_monotonic)
+            batch = getattr(host, "_restored_shader_editor_batch", None)
+            # Only the in-process Host supplies this private scope. Ordinary
+            # tools have no parameter that can mint a cached capture identity.
+            context = (batch(capture_path, capture_session_id)
+                       if callable(batch) and any(item.get("status") == "applied" for item in shader_items)
+                       else contextlib.nullcontext())
+            active_service = host._active_project_service()
+            snapshot_factory = getattr(active_service, "snapshot_active_project", None)
+            snapshot_reader = getattr(active_service, "_bound_project_snapshot", None)
+            existing_snapshot = snapshot_reader() if callable(snapshot_reader) else None
+            # Read-only observations hold no project/selection lock across
+            # watcher startup. Reuse this configuration snapshot; each lifecycle
+            # checkpoint still checks the real current selection and session.
+            project_context = (snapshot_factory(active["workspaceId"], project_root)
+                               if existing_snapshot is None and callable(snapshot_factory)
+                               and callable(snapshot_reader) else contextlib.nullcontext(existing_snapshot))
+            with project_context, context:
+                return _enable_restored_shader_editing_bound(
+                    host, active, project_root, capture_path, capture_session_id,
+                    records, shader_items, cancel_event=cancel_event,
+                    deadline_monotonic=deadline_monotonic, progress=progress)
     except Exception as exc:
         items = [{"workspaceId": item["workspaceId"], "workspacePath": item["workspacePath"],
                   "status": "failed", "error": ("%s: %s" % (type(exc).__name__, exc))[:4096]}
@@ -7489,6 +9832,7 @@ def _enable_restored_shader_editing_bound(
     capture_path: Path, capture_session_id: str,
     records: Sequence[Mapping[str, Any]], shader_items: Sequence[Mapping[str, Any]],
     *, cancel_event: Any = None, deadline_monotonic: float | None = None,
+    progress: _Progress | None = None,
 ) -> dict[str, Any]:
     """Authorize editing only after restore has committed and released its leases.
 
@@ -7497,20 +9841,56 @@ def _enable_restored_shader_editing_bound(
     while that request acquires the watcher lease. An editor failure is separate
     from the already committed, physically validated replay replacement.
     """
-    result: dict[str, Any] = {"attempted": 0, "enabled": 0, "failed": 0, "items": []}
+    result: dict[str, Any] = {"attempted": 0, "enabled": 0, "deferred": 0, "failed": 0, "items": []}
+    on_demand = getattr(host, "_shader_editors_on_demand", False) is True
+    if on_demand:
+        result["ready"] = 0
     by_id = {str(record.get("managedWorkspace", {}).get("workspaceId", "")): record
              for record in records}
+    if not any(item.get("status") == "applied" for item in shader_items):
+        return result
+    editor_total = sum(item.get("status") == "applied" for item in shader_items)
+    if progress is not None:
+        progress.emit("shader-prepare", "Enabling restored Shader workspaces",
+                      total=editor_total)
+    _restore_control_checkpoint(cancel_event, deadline_monotonic, "before restored Shader editor batch")
+    _require_restore_context(host, active, project_root, capture_path, capture_session_id)
+    from .ipc_client import _CALL_BINDING
+    expected_instance = _CALL_BINDING.get()[0]
+    expected_binding = {"instanceId": expected_instance, "captureSessionId": capture_session_id,
+                        "capturePath": str(capture_path)}
+
+    def read_editors() -> Mapping[str, Any]:
+        listing = _tool_json(host.list_shader_workspace_live_edits(),
+            "list restored Shader editors", schema="replaylab-shader-live-edit-mcp/v1", schema_version=1)
+        sessions = (listing.get("result") or {}).get("sessions")
+        if (listing.get("operation") != "list" or listing.get("appliedByThisCall") is not False
+                or not isinstance(sessions, list) or len(sessions) > 256
+                or any(not isinstance(candidate, Mapping) for candidate in sessions)):
+            raise RuntimeError("restored Shader editor list is invalid")
+        return listing
+
+    # Listing can reconcile persistent live-edit consent. A source-only draft
+    # needs no watcher service at all, so defer that call until a live editor
+    # is actually eligible below.
+    listing = None
+    created_jobs: dict[str, tuple[Path, Mapping[str, Any]]] = {}
+    from .shader_workspace.alias_display_mirror import DisplayAliasRestoreCache, restore_display_alias_mirrors
+    display_alias_cache = DisplayAliasRestoreCache(project_root)
     for applied in shader_items:
         if applied.get("status") != "applied":
             continue
         result["attempted"] += 1
         item = {"workspaceId": applied["workspaceId"], "workspacePath": applied["workspacePath"]}
+        if progress is not None:
+            progress.emit("shader-prepare", "Enabling restored Shader workspace editing",
+                          current=result["attempted"], total=editor_total,
+                          item=str(applied["workspacePath"]))
         started_live_id = ""
         started_binding = None
         created_editor = False
         try:
             _restore_control_checkpoint(cancel_event, deadline_monotonic, "before restored Shader editor start")
-            _require_restore_context(host, active, project_root, capture_path, capture_session_id)
             record = by_id.get(str(applied["workspaceId"]))
             if not isinstance(record, Mapping):
                 raise RuntimeError("applied Shader has no committed project record")
@@ -7520,14 +9900,13 @@ def _enable_restored_shader_editing_bound(
             )
             if _path_key(workspace) != _path_key(applied["workspacePath"]):
                 raise RuntimeError("applied Shader workspace path changed before editor start")
-            status_response = _tool_json(
-                host.get_shader_workspace_status(str(workspace)),
-                "read restored Shader before editor start",
-                schema="renderdoc-ultra-shader-workspace-mcp/v1",
-            )
-            if status_response.get("operation") != "status" or not isinstance(status_response.get("result"), Mapping):
+            # Editor admission needs the current source/candidate bytes, not
+            # organization summaries or the unrelated unpacked-asset catalog
+            # appended by the public status tool (including another HTTP hop).
+            status = _workspace_artifact_service(host).status(str(workspace))
+            if (not isinstance(status, Mapping)
+                    or status.get("schema") != "renderdoc-ultra-shader-workspace-status/v1"):
                 raise RuntimeError("restored Shader status response is invalid")
-            status = status_response["result"]
             identity = record["identity"]
             latest = status.get("latestCompiled") or {}
             if (status.get("workspaceId") != applied["workspaceId"]
@@ -7537,53 +9916,114 @@ def _enable_restored_shader_editing_bound(
                     or status.get("stage") != identity.get("stage")
                     or status.get("entryPoint", "") != identity.get("entryPoint", "")
                     or status.get("source", {}).get("currentSha256") != record.get("sourceSha256")
+                    or status.get("sourceDependenciesCurrent", True) is not True
                     or latest.get("sourceSha256") != record.get("sourceSha256")
                     or latest.get("revision") != record.get("candidateRevision")
                     or latest.get("rawSha256") != record.get("candidateRawSha256")):
                 raise RuntimeError("applied Shader source or physical identity changed before editor start")
-            from .ipc_client import _CALL_BINDING
-            direct_binding = _CALL_BINDING.get()
-            expected_instance = direct_binding[0]
-            expected_binding = {"instanceId": expected_instance, "captureSessionId": capture_session_id,
-                                "capturePath": str(capture_path)}
-
-            def current_editor_id() -> str:
-                listing = _tool_json(host.list_shader_workspace_live_edits(),
-                    "list restored Shader editors", schema="replaylab-shader-live-edit-mcp/v1", schema_version=1)
-                sessions = (listing.get("result") or {}).get("sessions")
-                if (listing.get("operation") != "list" or listing.get("appliedByThisCall") is not False
-                        or not isinstance(sessions, list) or len(sessions) > 256):
-                    raise RuntimeError("restored Shader editor list is invalid")
+            if applied.get("preservedLocalSource") is not None:
+                # The replay owner is deliberately separate from the user's
+                # editable draft. Keep that original editor/snapshot identity;
+                # only an explicit save may compile and hand over replay.
+                item.update(status="deferred", reason="local-edit-preserved",
+                            editingMode="source-only", readOnly=False,
+                            backgroundAutoApplyAuthorized=False,
+                            captureBinding=copy.deepcopy(expected_binding))
+                result["deferred"] += 1
+                result["items"].append(item)
+                continue
+            # Display metadata is part of restore even when file watching is on demand.
+            # The shared snapshot/cache skips unchanged names without replay or compilation.
+            alias_started = time.perf_counter()
+            try:
+                item["displayAliases"] = restore_display_alias_mirrors(
+                    host, workspace, status, capture_session_id, project_root,
+                    active_project=active, metadata_cache=display_alias_cache)
+            except Exception as alias_error:
+                item["displayAliases"] = {"status": "failed", "diagnostic": str(alias_error)[:400]}
+            item["displayAliasElapsedMs"] = round((time.perf_counter() - alias_started) * 1000, 3)
+            if on_demand:
+                from .shader_workspace.organization import active_draft_id
+                from .shader_workspace.project_source import archive_superseded_project_source_gate
+                archive_superseded_project_source_gate(
+                    workspace, restored_record=record, applied_item=applied)
+                draft = active_draft_id(workspace)
+                if draft:
+                    item.update(status="deferred", reason="organization-draft-open",
+                                organizationId=draft, editingMode="source-only", readOnly=True,
+                                backgroundAutoApplyAuthorized=False,
+                                captureBinding=copy.deepcopy(expected_binding))
+                    result["deferred"] += 1
+                else:
+                    item.update(status="ready", editingMode="on-demand", readOnly=False,
+                                backgroundAutoApplyAuthorized=False,
+                                captureBinding=copy.deepcopy(expected_binding))
+                    result["ready"] += 1
+                result["items"].append(item)
+                continue
+            from .shader_workspace.project_source import archive_superseded_project_source_gate
+            archive_superseded_project_source_gate(
+                workspace, restored_record=record, applied_item=applied)
+            from .shader_workspace.organization import active_draft_id
+            organization_id = active_draft_id(workspace)
+            if organization_id:
+                # Restore has already proved/applied the saved candidate. The
+                # separate unfinished proposal is durable source work, not
+                # permission to compile or start an automatic watcher. Keep
+                # its normal organization read/write route and the source
+                # preview; do not close/rewrite the draft or create live consent.
+                item.update(status="deferred", reason="organization-draft-open",
+                            organizationId=organization_id, editingMode="source-only",
+                            readOnly=True, backgroundAutoApplyAuthorized=False,
+                            captureBinding=copy.deepcopy(expected_binding))
+                result["deferred"] += 1
+                result["items"].append(item)
+                continue
+            if listing is None:
+                listing = read_editors()
+            def current_editor() -> Mapping[str, Any] | None:
                 matches = []
-                for candidate in sessions:
-                    if not isinstance(candidate, Mapping):
-                        raise RuntimeError("restored Shader editor list contains an invalid session")
+                for candidate in listing["result"]["sessions"]:
                     scope = candidate.get("captureBinding") or {}
                     if (candidate.get("state") in ("starting", "running")
                             and _path_key(candidate.get("workspacePath", "")) == _path_key(workspace)
                             and scope.get("instanceId") == expected_instance
                             and scope.get("captureSessionId") == capture_session_id
                             and _path_key(scope.get("capturePath", "")) == _path_key(capture_path)):
-                        matches.append(_hex(candidate.get("liveEditId"), 32, "existing restored liveEditId"))
+                        _hex(candidate.get("liveEditId"), 32, "existing restored liveEditId")
+                        matches.append(candidate)
                 if len(matches) > 1:
                     raise RuntimeError("multiple current editors own the restored workspace")
-                return matches[0] if matches else ""
+                return matches[0] if matches else None
 
-            existing_id = current_editor_id()
+            existing = current_editor()
+            existing_id = str(existing.get("liveEditId")) if existing is not None else ""
             operation = "poll" if existing_id else "start"
-            if existing_id:
+            if (existing is not None and existing.get("sessionState") == "current"
+                    and existing.get("state") == "running"
+                    and existing.get("watch", {}).get("state") == "running"
+                    and existing.get("watch", {}).get("caughtUp") is True
+                    and existing.get("watch", {}).get("observedSourceSha256") == record.get("sourceSha256")):
+                # list() returns the same owner-authenticated job snapshot as
+                # poll(). A ready current-session snapshot needs no second hop.
+                operation = "list"
+                wrapped = {**listing, "result": existing}
+            elif existing_id:
                 wrapped = _tool_json(host.poll_shader_workspace_live_edit(existing_id),
                     "read resumed Shader editor", schema="replaylab-shader-live-edit-mcp/v1", schema_version=1)
             else:
                 try:
+                    _require_restore_context(host, active, project_root, capture_path, capture_session_id)
                     wrapped = _tool_json(host.start_shader_workspace_live_edit(str(workspace)),
                         "start restored Shader editing", schema="replaylab-shader-live-edit-mcp/v1", schema_version=1)
-                    created_editor = True
+                    created_editor = wrapped.get("result", {}).get("joinedExistingSession") is not True
                 except Exception as start_error:
                     # Owner reconciliation can win between list and start.
                     # Re-read one exact current session; never repeat start.
                     try:
-                        existing_id = current_editor_id()
+                        listing = read_editors()
+                        existing = current_editor()
+                        existing_id = str(existing.get("liveEditId")) if existing is not None else ""
                     except Exception as lookup_error:
                         raise RuntimeError("%s; current editor recovery failed: %s" % (start_error, lookup_error)) from start_error
                     if not existing_id:
@@ -7592,6 +10032,8 @@ def _enable_restored_shader_editing_bound(
                     wrapped = _tool_json(host.poll_shader_workspace_live_edit(existing_id),
                         "read concurrently resumed Shader editor", schema="replaylab-shader-live-edit-mcp/v1", schema_version=1)
             live = wrapped.get("result") or {}
+            if isinstance(live.get("startTiming"), Mapping):
+                item["startTiming"] = copy.deepcopy(live["startTiming"])
             started_live_id = _hex(live.get("liveEditId"), 32, "restored liveEditId")
             if existing_id and started_live_id != existing_id:
                 raise RuntimeError("resumed Shader editor returned another job")
@@ -7615,11 +10057,11 @@ def _enable_restored_shader_editing_bound(
                 started_binding = expected_binding
                 watch = live.get("watch") or {}
                 _restore_control_checkpoint(cancel_event, deadline_monotonic, "waiting for restored Shader editor")
-                _require_restore_context(host, active, project_root, capture_path, capture_session_id)
                 if (live.get("state") == "running" and watch.get("state") == "running"
                         and watch.get("caughtUp") is True
                         and watch.get("observedSourceSha256") == record.get("sourceSha256")):
                     break
+                _require_restore_context(host, active, project_root, capture_path, capture_session_id)
                 if live.get("state") not in ("starting", "running") or watch.get("state") not in ("starting", "running"):
                     raise RuntimeError("restored Shader editor stopped before becoming ready")
                 if time.monotonic() >= poll_deadline:
@@ -7647,14 +10089,18 @@ def _enable_restored_shader_editing_bound(
                     or (expected_instance is not None and binding["instanceId"] != expected_instance)
                     or watch.get("observedSourceSha256") != record.get("sourceSha256")):
                 raise RuntimeError("restored Shader editor returned a different capture or source")
-            _require_restore_context(host, active, project_root, capture_path, capture_session_id)
             item.update(status="enabled",
                         liveEditId=_hex(live.get("liveEditId"), 32, "restored liveEditId"),
                         watchId=_hex(live.get("watchId"), 32, "restored watchId"),
                         captureBinding=copy.deepcopy(binding))
+            if created_editor:
+                created_jobs[started_live_id] = (workspace, copy.deepcopy(started_binding))
             result["enabled"] += 1
         except Exception as exc:
             diagnostic = "%s: %s" % (type(exc).__name__, exc)
+            data = getattr(exc, "tool_data", None)
+            if isinstance(data, Mapping) and isinstance(data.get("startTiming"), Mapping):
+                item["startTiming"] = copy.deepcopy(data["startTiming"])
             if created_editor and started_live_id and started_binding is not None:
                 try:
                     diagnostic += "; " + _retire_restored_editor_job(started_live_id, workspace, started_binding)
@@ -7663,7 +10109,788 @@ def _enable_restored_shader_editing_bound(
             item.update(status="failed", error=diagnostic[:4096])
             result["failed"] += 1
         result["items"].append(item)
+        if progress is not None:
+            progress.emit("shader-prepare", "Restored Shader workspace editor admission finished",
+                          current=result["attempted"], total=editor_total,
+                          item=str(applied["workspacePath"]))
+    try:
+        _restore_control_checkpoint(cancel_event, deadline_monotonic, "after restored Shader editor batch")
+        _require_restore_context(host, active, project_root, capture_path, capture_session_id)
+        if progress is not None:
+            progress.emit("shader-prepare", "Restored Shader workspace editing batch finished",
+                          current=editor_total, total=editor_total)
+    except Exception as exc:
+        for item in result["items"]:
+            if item.get("status") not in {"enabled", "deferred", "ready"}:
+                continue
+            previous_status = item["status"]
+            diagnostic = "%s: %s" % (type(exc).__name__, exc)
+            owned = created_jobs.get(item.get("liveEditId"))
+            if owned is not None:
+                try:
+                    diagnostic += "; " + _retire_restored_editor_job(item["liveEditId"], *owned)
+                except Exception as cleanup_exc:
+                    diagnostic += "; exact editor retirement failed: %s" % cleanup_exc
+            workspace_id, workspace_path = item["workspaceId"], item["workspacePath"]
+            item.clear()
+            item.update(workspaceId=workspace_id, workspacePath=workspace_path,
+                        status="failed", error=diagnostic[:4096])
+            result[previous_status] -= 1
+            result["failed"] += 1
     return result
+
+
+_VERIFIED_RDC_RESTORE_SCHEMA = "replaylab-verified-rdc-restore/v1"
+_VERIFIED_RDC_RESTORE_VERSION = 2
+
+
+class _VerifiedRdcRestorePolicyMiss(RuntimeError):
+    """Expected cache invalidation before any hashing or replay mutation."""
+
+
+def _verified_rdc_restore_path(replay_path: Path, capture_path: Path) -> Path:
+    key = hashlib.sha256(_path_key(capture_path).encode("utf-8")).hexdigest()
+    return replay_path / "derived" / "validated-rdc-restores" / (key + ".json")
+
+
+def _verified_rdc_content_sha256(
+    capture_path: Path, checkpoint: Callable[[str], None] | None = None,
+) -> str:
+    from . import file_content_cache
+    if checkpoint is not None:
+        checkpoint("reading verified RDC contents")
+    try:
+        return file_content_cache.digest_file(capture_path, persistent=True, checkpoint=checkpoint)
+    except ValueError as error:
+        raise RuntimeError("RDC contents changed while hashing") from error
+
+
+def _verified_replay_content_sha256(capture, checkpoint=None):
+    from .rdc_replay_identity import digest_file
+    return digest_file(capture, checkpoint)
+
+
+def _refresh_snapshot_replay_identity(snapshot):
+    """An unsigned sidecar may route only the scope signed by every item."""
+    payloads = [record.get("replacement", {}).get("restoreValidationReceipt", {}).get("payload", {})
+                for record in snapshot["shaders"]]
+    values = {p.get("captureReplaySha256") for p in payloads}
+    if (len(values) == 1 and None not in values and all(
+            p.get("captureReplayIdentitySchema") == "bread-rdc-replay-content/v1" for p in payloads)):
+        snapshot["captureReplaySha256"] = _hex(next(iter(values)), 64, "replay content hash")
+        snapshot["captureReplayIdentitySchema"] = "bread-rdc-replay-content/v1"
+
+
+def _verified_workspace_binding(status: Mapping[str, Any]) -> str:
+    # The canonical status reader validates these artifacts from current disk
+    # bytes. Exclude editor/last-apply state, which legitimately changes when a
+    # capture is reopened; retain the complete persisted ABI/compiler inputs.
+    return _canonical_sha256({field: status.get(field) for field in (
+        "workspaceId", "capture", "shader", "stage", "entryPoint", "revision",
+        "source", "baseline", "targetProfile", "compilerBinding", "routePlan",
+        "latestCompiled", "assemblyDisassemblyArtifacts",
+    )})
+
+
+def _verified_restore_binding_state(
+    replay: ReplayProjectService, state: Mapping[str, Any],
+) -> dict[str, Any]:
+    if state.get("capture", {}).get("inventoryOnly") is True:
+        checked = replay.validate_shader_inventory_snapshot(
+            state["projectInventory"], state["inventoryBinding"])
+        current = _inventory_binding_state(checked, state["capture"])
+    else:
+        current = replay.restore_knowledge_snapshot(
+            str(state["captureId"]), str(state["catalogSha256"]))
+    for field in ("projectId", "projectPath", "scopeSha256", "captureId", "catalogSha256",
+                  "knowledgeContentSha256", "matcherPolicySha256", "workspaces",
+                  "materials", "inventoryBinding", "projectInventory"):
+        if current.get(field) != state.get(field):
+            raise RuntimeError("verified RDC project contents changed: " + field)
+    return current
+
+
+def _verified_restore_ticket(
+    record: Mapping[str, Any], status: Mapping[str, Any], capture_sha256: str,
+    replay_sha256: str | None = None,
+) -> Mapping[str, Any]:
+    replacement = record.get("replacement") or {}
+    receipt = replacement.get("restoreValidationReceipt") or {}
+    payload = receipt.get("payload") or {}
+    latest = status.get("latestCompiled") or {}
+    gate = latest.get("abiGate") or {}
+    expected = {
+        "schema": "replaylab-validated-shader-restore/v1",
+        "captureSha256": capture_sha256,
+        "captureId": status.get("capture", {}).get("captureId"),
+        "workspaceId": status.get("workspaceId"),
+        "revision": record.get("candidateRevision"),
+        "sourceSha256": record.get("sourceSha256"),
+        "candidateRawSha256": record.get("candidateRawSha256"),
+        "originalRawSha256": status.get("baseline", {}).get("rawSha256"),
+        "physicalAbiSha256": status.get("baseline", {}).get("abiSha256"),
+        "api": _asset_api(status.get("capture", {}).get("api")),
+        "stage": status.get("stage"),
+        "entryPoint": status.get("entryPoint", ""),
+        "encoding": _asset_encoding(latest.get("kind")),
+        "abiRequestId": gate.get("requestId"),
+        "abiReportSha256": gate.get("reportSha256"),
+    }
+    replay_bound = bool(replay_sha256 and payload.get("captureReplaySha256") == replay_sha256
+        and payload.get("captureReplayIdentitySchema") == "bread-rdc-replay-content/v1")
+    if (replay_sha256 is not None and not replay_bound):
+        raise RuntimeError("verified RDC restore Shader has a different replay scope")
+    if (not isinstance(receipt, Mapping) or not isinstance(payload, Mapping)
+            or any(payload.get(key) != value for key, value in expected.items()
+                   if key != "physicalAbiSha256" and not (key == "captureSha256" and replay_bound))
+            or payload.get("physicalAbiSha256") not in _workspace_physical_abi_hashes(status)
+            or gate.get("status") != "compatible"
+            or not isinstance(record.get("validation"), Mapping)
+            or record["validation"].get("compatible") is not True):
+        raise RuntimeError("verified RDC restore has no matching signed validation receipt")
+    _hex(receipt.get("signature"), 64, "verified RDC receipt signature")
+    # Host and Bridge independently check the HMAC and current resource bytes.
+    # This derived JSON seal is corruption detection, never apply authority.
+    return receipt
+
+
+def _verified_restore_workspace_statuses(
+    host: Any, active: Mapping[str, Any], project: Path, capture: Path,
+    snapshot: Mapping[str, Any], prepared_statuses: Sequence[Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    statuses = []
+    shader_root = Path(str(active.get("paths", {}).get("shaderWorkspaces", ""))).resolve()
+    workspaces = [_resolve_workspace_path(project, shader_root, record["managedWorkspace"]["path"])
+                  for record in snapshot["shaders"]]
+    if prepared_statuses is None:
+        from .restore_file_preparation import artifact_statuses
+        factory = getattr(host, "_shader_workspace_artifact_service", None)
+        if callable(factory):
+            prepared_statuses = artifact_statuses(factory, workspaces,
+                getattr(_RESTORE_THREAD_STATE, "control_checkpoint", None))
+        else:
+            prepared_statuses = [_workspace_artifact_service(host).status(str(path)) for path in workspaces]
+    if len(prepared_statuses) != len(workspaces):
+        raise RuntimeError("verified RDC artifact preparation is incomplete")
+    seen = set()
+    for index, record in enumerate(snapshot["shaders"]):
+        managed = record["managedWorkspace"]
+        workspace = workspaces[index]
+        status = prepared_statuses[index]
+        identity = record["identity"]
+        _capture_shader(snapshot["bindingState"], identity)
+        knowledge = snapshot["bindingState"].get("workspaces", {}).get(record.get("knowledgeId"))
+        if isinstance(knowledge, Mapping) and source_only_restore_reason(
+                knowledge, snapshot["bindingState"].get("projectPath")):
+            raise _VerifiedRdcRestorePolicyMiss("source-only-organization-draft")
+        if (not isinstance(knowledge, Mapping)
+                or knowledge.get("sourceSha256") != record.get("sourceSha256")
+                or any(knowledge.get(field) != identity.get(field)
+                       for field in ("rawSha256", "stage", "entryPoint"))):
+            raise RuntimeError("verified RDC workspace differs from shared project source")
+        latest = status.get("latestCompiled") or {}
+        source = status.get("source") or {}
+        if status.get("sourceDependenciesCurrent", True) is not True:
+            raise _VerifiedRdcRestorePolicyMiss("source-dependencies-changed")
+        if (managed.get("workspaceId") in seen
+                or status.get("workspaceId") != managed.get("workspaceId")
+                or _path_key(status.get("workspacePath", "")) != _path_key(workspace)
+                or _path_key(status.get("capture", {}).get("capturePath", "")) != _path_key(capture)
+                or status.get("shader", {}).get("rawSha256") != identity.get("rawSha256")
+                or status.get("stage") != identity.get("stage")
+                or status.get("entryPoint", "") != identity.get("entryPoint", "")
+                or source.get("present") is not True
+                or source.get("currentSha256") != record.get("sourceSha256")
+                or latest.get("sourceSha256") != record.get("sourceSha256")
+                or latest.get("revision") != record.get("candidateRevision")
+                or latest.get("rawSha256") != record.get("candidateRawSha256")
+                or _verified_workspace_binding(status) != snapshot["workspaceBindings"][index]):
+            raise RuntimeError("verified RDC workspace contents changed")
+        _verified_restore_ticket(record, status, snapshot["captureSha256"], snapshot.get("captureReplaySha256"))
+        seen.add(managed["workspaceId"])
+        statuses.append(status)
+    return statuses
+
+
+def _load_verified_rdc_restore(
+    host: Any, replay: ReplayProjectService, active: Mapping[str, Any],
+    project: Path, replay_path: Path, capture: Path,
+    checkpoint: Callable[[str], None],
+    current_validation_policy_sha256: str | None = None,
+    compatible_policy_sha256s: Sequence[str] = (),
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    if not callable(getattr(host, "_apply_verified_project_restore", None)):
+        return None
+    path = _verified_rdc_restore_path(replay_path, capture)
+    if not path.is_file():
+        return None
+    if path.stat().st_size > _MAX_FAST_CATALOG_BYTES:
+        raise RuntimeError("verified RDC restore snapshot exceeds size limit")
+    snapshot = json.loads(path.read_text(encoding="utf-8"))
+    seal = snapshot.pop("sealSha256", None)
+    if (seal != _canonical_sha256(snapshot)
+            or snapshot.get("schema") != _VERIFIED_RDC_RESTORE_SCHEMA
+            or snapshot.get("projectId") != active["replayProject"]["projectId"]
+            or snapshot.get("projectWorkspaceId") != active["workspaceId"]
+            or _path_key(snapshot.get("capturePath", "")) != _path_key(capture)
+            or not isinstance(snapshot.get("shaders"), list)
+            or not 0 < len(snapshot["shaders"]) <= _MAX_FAST_PROJECT_SHADERS
+            or len(snapshot.get("workspaceBindings", [])) != len(snapshot["shaders"])):
+        raise RuntimeError("verified RDC restore snapshot is invalid")
+    if snapshot.get("schemaVersion") != _VERIFIED_RDC_RESTORE_VERSION:
+        # Version 1 could be primed while a replacement hid an original
+        # program from the resource inventory. Rebuild its coverage once.
+        raise _VerifiedRdcRestorePolicyMiss("original-shader-inventory-policy-changed")
+    deferred = snapshot.get("deferredShaders", [])
+    if (not isinstance(deferred, list) or len(deferred) > _MAX_FAST_PROJECT_SHADERS
+            or any(not isinstance(item, Mapping) or set(item) != {"identity", "knowledgeId", "requiresIndividualRecovery"}
+                   or item.get("requiresIndividualRecovery") is not True for item in deferred)):
+        raise RuntimeError("verified RDC deferred Shader inventory is invalid")
+    # Deferred identities prove inventory coverage only. They carry no ticket
+    # or candidate and always enter ordinary recovery on the next open.
+    _verified_restore_coverage(snapshot["bindingState"], snapshot["reusePlan"],
+                               snapshot["shaders"] + deferred, snapshot.get("inventoryEvidence"))
+    if (not isinstance(current_validation_policy_sha256, str)
+            or len(current_validation_policy_sha256) != 64
+            or any(character not in "0123456789abcdef"
+                   for character in current_validation_policy_sha256)):
+        raise _VerifiedRdcRestorePolicyMiss("validation-policy-unavailable")
+    policy_matches = lambda record: record.get("replacement", {}).get("restoreValidationReceipt", {}).get(
+        "payload", {}).get("validationPolicySha256") in (current_validation_policy_sha256, *compatible_policy_sha256s)
+    prepared = None
+    if any(not policy_matches(record) for record in snapshot["shaders"]):
+        refreshed = _refresh_verified_restore_pairs(host, active, project, capture, snapshot,
+            current_validation_policy_sha256, compatible_policy_sha256s, checkpoint)
+        if refreshed is None:
+            raise _VerifiedRdcRestorePolicyMiss("validation-policy-changed")
+        snapshot, prepared = refreshed
+    for record in snapshot["shaders"]:
+        replacement = record.get("replacement") if isinstance(record, Mapping) else None
+        receipt = replacement.get("restoreValidationReceipt") if isinstance(replacement, Mapping) else None
+        payload = receipt.get("payload") if isinstance(receipt, Mapping) else None
+        if (not isinstance(payload, Mapping) or payload.get("validationPolicySha256") not in
+                (current_validation_policy_sha256, *compatible_policy_sha256s)):
+            # The current process supplied this hint in the already-required
+            # identity read. Equality only permits the normal checks to run;
+            # it does not replace Bridge HMAC/content/session validation.
+            raise _VerifiedRdcRestorePolicyMiss("validation-policy-changed")
+        physical_binding = payload.get("physicalValidationBinding")
+        if physical_binding is not None and (
+                not isinstance(physical_binding, Mapping)
+                or physical_binding.get("schema") != "replaylab-shader-physical-validation-binding/v1"
+                or physical_binding.get("schemaVersion") != 1
+                or _canonical_sha256(physical_binding) != payload.get("validationPolicySha256")):
+            # The Bridge's current identity hint is the physical-domain digest,
+            # not its package/UI provenance. HMAC and native live-original
+            # checks still occur inside Bridge before a replacement is built.
+            raise _VerifiedRdcRestorePolicyMiss("physical-validation-binding-changed")
+    if snapshot.get("captureReplaySha256") is not None:
+        expected_replay = snapshot["captureReplaySha256"]
+        if (snapshot.get("captureReplayIdentitySchema") != "bread-rdc-replay-content/v1" or
+                any(record.get("replacement", {}).get("restoreValidationReceipt", {}).get("payload", {}).get("captureReplaySha256")
+                    != expected_replay for record in snapshot["shaders"])):
+            raise RuntimeError("verified RDC replay identity is not signed by every Shader")
+        if _verified_replay_content_sha256(capture, checkpoint) != expected_replay:
+            raise RuntimeError("verified RDC replay contents changed")
+    elif _verified_rdc_content_sha256(capture, checkpoint) != snapshot["captureSha256"]:
+        raise RuntimeError("verified RDC file contents changed")
+    return _prepare_verified_restore_subset(host, replay, active, project, capture, snapshot, checkpoint,
+        prepared_statuses=prepared, validation_policy=current_validation_policy_sha256,
+        compatible_policies=compatible_policy_sha256s)
+
+
+def _current_verified_pair_record(host, active, project, capture, snapshot, record, status, policy, compatible):
+    prior = _load_shader_pair_validation(project, status, policy, compatible)
+    if prior is None:
+        raise RuntimeError("no current signed Shader pair")
+    # Workspace-local proofs retain an ABI lease rather than a full apply
+    # response. Reconstitute its report identity from the authenticated ticket
+    # and the current artifact reader; never substitute a compatible boolean.
+    gate = status["latestCompiled"]["abiGate"]
+    validation = copy.deepcopy(prior.get("validation") or record.get("validation") or {})
+    validation.update(compatible=True, workspacePath=status["workspacePath"], revision=status["revision"],
+        requestId=gate["requestId"], abiReportSha256=gate["reportSha256"])
+    if gate.get("candidateAbiSha256"):
+        validation["candidateAbiSha256"] = gate["candidateAbiSha256"]
+    if gate.get("reportPath"):
+        validation["abiReportPath"] = str(Path(status["workspacePath"]) / gate["reportPath"])
+    saved = copy.deepcopy(record)
+    saved.update(replacement=copy.deepcopy(prior["replacement"]),
+                 validation=validation,
+                 sourceSha256=status["source"]["currentSha256"],
+                 candidateRawSha256=status["latestCompiled"]["rawSha256"],
+                 candidateRevision=status["latestCompiled"]["revision"])
+    binding = _verified_workspace_binding(status)
+    one = {**snapshot, "shaders": [saved], "workspaceBindings": [binding]}
+    _verified_restore_workspace_statuses(host, active, project, capture, one, [status])
+    return saved, binding
+
+
+def _refresh_verified_restore_pairs(host, active, project, capture, snapshot, policy, compatible, checkpoint):
+    """Recover already verified pairs after an interrupted whole-project memo write.
+
+    Individual receipts are still authenticated by the Bridge on apply. This
+    only avoids repeating compilation/ABI work whose exact signed result is
+    already on disk under the current physical validation policy.
+    """
+    from .restore_file_preparation import artifact_statuses
+    factory = getattr(host, "_shader_workspace_artifact_service", None) or (lambda: _workspace_artifact_service(host))
+    shader_root = Path(active["paths"]["shaderWorkspaces"]).resolve()
+    paths = [_resolve_workspace_path(project, shader_root, record["managedWorkspace"]["path"])
+             for record in snapshot["shaders"]]
+    prepared = artifact_statuses(factory, paths, checkpoint, collect_errors=True)
+    selected, statuses, bindings = [], [], []
+    deferred = list(snapshot.get("deferredShaders", []))
+    for record, status in zip(snapshot["shaders"], prepared):
+        checkpoint("before cached Shader pair recovery")
+        try:
+            if isinstance(status, Exception):
+                raise status
+            saved, binding = _current_verified_pair_record(host, active, project, capture, snapshot,
+                record, status, policy, compatible)
+            selected.append(saved); statuses.append(status); bindings.append(binding)
+        except (RestoreControlStop, RestoreContextChanged, RestoreContextUnavailable):
+            raise
+        except Exception:
+            deferred.append({"identity": copy.deepcopy(record["identity"]),
+                "knowledgeId": record["knowledgeId"], "requiresIndividualRecovery": True})
+    if not selected:
+        return None
+    return {**snapshot, "shaders": selected, "workspaceBindings": bindings,
+            "deferredShaders": deferred, "_currentPairRecovery": True}, statuses
+
+
+def _prepare_verified_restore_subset(host, replay, active, project, capture, snapshot, checkpoint,
+                                     prepared_statuses=None, validation_policy=None, compatible_policies=()):
+    """Read the current project head once, then isolate changed/broken items."""
+    old = snapshot["bindingState"]
+    if old.get("capture", {}).get("inventoryOnly") is True:
+        current = replay.reuse_snapshot_for_shader_inventory(old["projectInventory"])
+        state = _inventory_binding_state(current, old["capture"])
+        plan = current["reusePlan"]
+    else:
+        state = replay.restore_knowledge_snapshot(str(old["captureId"]), str(old["catalogSha256"]))
+        plan = replay.reuse_plan(str(old["captureId"]), str(old["catalogSha256"]))
+    for field in ("projectId", "projectPath", "scopeSha256", "captureId", "catalogSha256", "matcherPolicySha256"):
+        if state.get(field) != old.get(field):
+            raise RuntimeError("verified RDC project domain changed: " + field)
+    def key(identity, knowledge):
+        return tuple(identity.get(field) for field in ("resourceId", "stage", "entryPoint", "rawSha256")) + (knowledge,)
+    allowed = set()
+    for match in plan.get("matches", []):
+        candidates = match.get("workspaceCandidates") or []
+        chosen = [c for c in candidates if c.get("activeCandidate") is True]
+        if not chosen and len(candidates) == 1:
+            chosen = candidates
+        if len(chosen) == 1 and chosen[0].get("sourceSeedEligible") is True:
+            knowledge = state.get("workspaces", {}).get(chosen[0].get("knowledgeId"))
+            if isinstance(knowledge, Mapping) and source_only_restore_reason(knowledge, state.get("projectPath")):
+                continue
+            allowed.add(key(match["shader"], chosen[0].get("knowledgeId")))
+    from .restore_file_preparation import artifact_statuses
+    factory = getattr(host, "_shader_workspace_artifact_service", None) or (lambda: _workspace_artifact_service(host))
+    shader_root = Path(active["paths"]["shaderWorkspaces"]).resolve()
+    paths = [_resolve_workspace_path(project, shader_root, record["managedWorkspace"]["path"])
+             for record in snapshot["shaders"]]
+    prepared = (prepared_statuses if prepared_statuses is not None else
+                artifact_statuses(factory, paths, checkpoint, collect_errors=True))
+    selected, statuses, bindings, excluded = [], [], [], []
+    for index, (record, status) in enumerate(zip(snapshot["shaders"], prepared)):
+        try:
+            if isinstance(status, Exception):
+                raise status
+            if key(record["identity"], record.get("knowledgeId")) not in allowed:
+                raise RuntimeError("project source head changed")
+            one = {**snapshot, "bindingState": state, "shaders": [record],
+                   "workspaceBindings": [snapshot["workspaceBindings"][index]]}
+            binding = snapshot["workspaceBindings"][index]
+            try:
+                _verified_restore_workspace_statuses(host, active, project, capture, one, [status])
+            except (RestoreControlStop, RestoreContextChanged, RestoreContextUnavailable):
+                raise
+            except Exception:
+                if validation_policy is None:
+                    raise
+                record, binding = _current_verified_pair_record(host, active, project, capture, snapshot,
+                    record, status, validation_policy, compatible_policies)
+                snapshot["_currentPairRecovery"] = True
+            selected.append(record); statuses.append(status)
+            bindings.append(binding)
+        except (RestoreControlStop, RestoreContextChanged, RestoreContextUnavailable):
+            raise
+        except Exception as error:
+            excluded.append({"workspaceId": record["managedWorkspace"]["workspaceId"], "error": str(error)[:1024]})
+    if not selected:
+        detail = excluded[0]["error"] if excluded else "no matching project source head"
+        raise _VerifiedRdcRestorePolicyMiss("no-unchanged-verified-shaders: " + detail)
+    partial = bool(excluded or {key(r["identity"], r.get("knowledgeId")) for r in selected} != allowed)
+    deferred = list(snapshot.get("deferredShaders", []))
+    selected_keys = {key(r["identity"], r.get("knowledgeId")) for r in selected}
+    deferred.extend({"identity": copy.deepcopy(r["identity"]), "knowledgeId": r["knowledgeId"],
+                     "requiresIndividualRecovery": True} for r in snapshot["shaders"]
+                    if key(r["identity"], r.get("knowledgeId")) not in selected_keys)
+    return {**snapshot, "shaders": selected, "workspaceBindings": bindings,
+            "deferredShaders": deferred,
+            "bindingState": state, "reusePlan": plan, "_partialRecovery": partial,
+            "_individualRecovery": excluded}, statuses
+
+
+def _verified_restore_coverage(
+    state: Mapping[str, Any], plan: Mapping[str, Any], records: Sequence[Mapping[str, Any]],
+    inventory_evidence: Mapping[str, Any] | None,
+) -> None:
+    """Require all matched originals, without requiring another capture's assets."""
+    if state.get("capture", {}).get("inventoryOnly") is True:
+        if (not isinstance(inventory_evidence, Mapping)
+                or inventory_evidence.get("originalShaderIdentityPolicy") != "captured-original-owner-v1"
+                or inventory_evidence.get("observedRawSha256s") != sorted({
+                    item["rawSha256"] for item in state["capture"]["shaders"]})):
+            raise RuntimeError("verified RDC restore requires an inventory of captured original Shaders")
+    def key(identity, knowledge_id):
+        return (identity.get("resourceId"), identity.get("stage"), identity.get("entryPoint", ""),
+                identity.get("rawSha256"), knowledge_id)
+    expected = set()
+    for match in plan.get("matches") or []:
+        candidates = match.get("workspaceCandidates") or []
+        active = [item for item in candidates if item.get("activeCandidate") is True]
+        if not active and len(candidates) == 1:
+            active = candidates
+        if len(active) == 1 and active[0].get("sourceSeedEligible") is True:
+            knowledge_id = active[0].get("knowledgeId")
+            knowledge = state.get("workspaces", {}).get(knowledge_id)
+            if isinstance(knowledge, Mapping) and source_only_restore_reason(
+                    knowledge, state.get("projectPath")):
+                continue
+            expected.add(key(match["shader"], knowledge_id))
+    actual = {key(item["identity"], item.get("knowledgeId")) for item in records}
+    if not expected or actual != expected or len(actual) != len(records):
+        raise RuntimeError("verified RDC restore omits or repeats a matched original Shader")
+
+
+def _build_verified_rdc_restore(
+    host: Any, replay: ReplayProjectService, active: Mapping[str, Any],
+    project: Path, capture: Path, binding_state: Mapping[str, Any],
+    records: Sequence[Mapping[str, Any]], applied_workspaces: Sequence[Any],
+    checkpoint: Callable[[str], None],
+    *, inventory: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if (not callable(getattr(host, "_apply_verified_project_restore", None))
+            or not records or len(records) > _MAX_FAST_PROJECT_SHADERS):
+        return None
+    applied_by_id = {status["workspaceId"]: applied
+                     for workspace, status, applied, session in applied_workspaces}
+    # Old unsigned results cannot prime this accelerator. A subsequent full
+    # apply will issue the first signed receipt without trusting old booleans.
+    reusable, deferred = [], []
+    for record in records:
+        receipt = applied_by_id.get(record["managedWorkspace"]["workspaceId"], {})\
+            .get("replacement", {}).get("restoreValidationReceipt")
+        if receipt:
+            reusable.append(record)
+        elif record.get("manualEdit") is True:
+            deferred.append({"identity": copy.deepcopy(record["identity"]),
+                             "knowledgeId": record["knowledgeId"], "requiresIndividualRecovery": True})
+        else:
+            return None
+    if not reusable:
+        return None
+    state = _verified_restore_binding_state(replay, binding_state)
+    plan = state.get("reusePlan")
+    if not isinstance(plan, Mapping):
+        plan = replay.reuse_plan(str(state["captureId"]), str(state["catalogSha256"]))
+    evidence = None
+    if state.get("capture", {}).get("inventoryOnly") is True:
+        evidence = {
+            "originalShaderIdentityPolicy": (inventory or {}).get("originalShaderIdentityPolicy"),
+            "observedRawSha256s": sorted({item["rawSha256"] for item in (inventory or {}).get("shaders", [])}),
+        }
+    _verified_restore_coverage(state, plan, records, evidence)
+    capture_sha256 = _verified_rdc_content_sha256(capture, checkpoint)
+    snapshot = {
+        "schema": _VERIFIED_RDC_RESTORE_SCHEMA, "schemaVersion": _VERIFIED_RDC_RESTORE_VERSION,
+        "capturePath": str(capture), "captureSha256": capture_sha256,
+        "projectId": active["replayProject"]["projectId"],
+        "projectWorkspaceId": active["workspaceId"],
+        "bindingState": copy.deepcopy(dict(state)), "reusePlan": copy.deepcopy(plan),
+        "inventoryEvidence": evidence,
+        "shaders": [], "workspaceBindings": [],
+    }
+    if deferred:
+        snapshot["deferredShaders"] = deferred
+    prepared_statuses = []
+    for record in reusable:
+        applied = applied_by_id[record["managedWorkspace"]["workspaceId"]]
+        saved = copy.deepcopy(dict(record))
+        saved.update(validation=copy.deepcopy(applied["validation"]),
+                     replacement=copy.deepcopy(applied["replacement"]))
+        workspace = project / record["managedWorkspace"]["path"]
+        status = _workspace_artifact_service(host).status(str(workspace))
+        prepared_statuses.append(status)
+        snapshot["shaders"].append(saved)
+        snapshot["workspaceBindings"].append(_verified_workspace_binding(status))
+    _refresh_snapshot_replay_identity(snapshot)
+    _verified_restore_workspace_statuses(host, active, project, capture, snapshot, prepared_statuses)
+    snapshot["sealSha256"] = _canonical_sha256(snapshot)
+    return snapshot
+
+
+def _write_verified_rdc_restore(replay_path: Path, capture: Path, snapshot: Mapping[str, Any]) -> None:
+    encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                         allow_nan=False).encode("utf-8")
+    if len(encoded) > _MAX_FAST_CATALOG_BYTES:
+        raise RuntimeError("verified RDC restore snapshot exceeds size limit")
+    atomic_write_bytes(_verified_rdc_restore_path(replay_path, capture), encoded)
+
+
+def _apply_verified_rdc_restore(
+    host: Any, replay: ReplayProjectService, active: Mapping[str, Any],
+    project: Path, capture: Path, session: str, snapshot: Mapping[str, Any],
+    statuses: Sequence[Mapping[str, Any]], progress: _Progress, result: dict[str, Any],
+    applied_workspaces: list[Any], alias_transactions: list[dict[str, str]],
+    checkpoint: Callable[[str], None],
+    *, restored_material_sessions=None,
+) -> list[dict[str, Any]]:
+    checkpoint("before verified RDC Shader apply")
+    progress.emit("shader-apply", "Applying cached Shader %d/%d" % (0, len(statuses)),
+                  current=0, total=len(statuses))
+    _require_restore_context(host, active, project, capture, session)
+    for match in snapshot["reusePlan"].get("matches", []):
+        for candidate in match.get("workspaceCandidates", []):
+            if candidate.get("pendingSource") is not None:
+                _fallback_pending_knowledge(candidate, snapshot["bindingState"])
+    scope = getattr(host, '_shader_artifact_replay_scope', None)
+    # A saved compiled candidate does not execute a compiler. Use the same
+    # artifact-only replay service as individual recovery, so a package/tool
+    # route update cannot invalidate its already authenticated GPU proof.
+    with scope() if callable(scope) else contextlib.nullcontext():
+        response = host._apply_verified_project_restore(
+            snapshot, list(statuses), session, result["operationId"])
+    if isinstance(response, Mapping) and response.get("batchTimings"):
+        progress.emit("shader-apply", "Applying cached Shader %d/%d" % (len(statuses), len(statuses)),
+            current=len(statuses), total=len(statuses), detail={"restoreBatches": response["batchTimings"]})
+    items = response.get("items") if isinstance(response, Mapping) else None
+    if not isinstance(items, list):
+        raise RuntimeError("verified RDC restore returned an incomplete apply batch")
+    # Register every committed item before validating the response so a bad
+    # later item or changed project unwinds the complete batch.
+    statuses_by_id = {status["workspaceId"]: status for status in statuses}
+    for index, applied in enumerate(items):
+        binding = applied.get("binding") if isinstance(applied, Mapping) else None
+        # Older Host responses have no binding envelope; their ordered result
+        # is checked against every exact replacement field below as before.
+        status = (statuses_by_id.get(binding.get("workspaceId")) if isinstance(binding, Mapping)
+                  else statuses[index] if index < len(statuses) and isinstance(applied, Mapping) else None)
+        if status is None:
+            raise RuntimeError("verified RDC restore returned an unrelated Shader")
+        if isinstance(applied, Mapping) and applied.get("replacement", {}).get("operationCreatedReplacement") is True:
+            applied_workspaces.append((Path(status["workspacePath"]), copy.deepcopy(dict(status)),
+                                       copy.deepcopy(dict(applied)), session))
+    if response.get("itemErrors"):
+        # Confirmed successes stay owned and will be adopted by the ordinary
+        # per-item recovery path. Only failed/changed inputs require work again.
+        raise _VerifiedRdcRestorePolicyMiss("batch-items-require-individual-recovery")
+    if response.get("applied") is not True or len(items) != len(statuses):
+        raise RuntimeError("verified RDC restore was not applied")
+    shader_items = []
+    upgraded_receipts = False
+    applied_by_original: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for record, status, applied in zip(snapshot["shaders"], statuses, items):
+        replacement = applied.get("replacement") or {}
+        validation = applied.get("validation") or {}
+        if (applied.get("applied") is not True
+                or applied.get("operation") != "apply-shared-resource"
+                or replacement.get("abiValidationMode") != "verified-rdc-restore"
+                or replacement.get("captureSessionId") != session
+                or replacement.get("workspaceId") != status["workspaceId"]
+                or replacement.get("revision") != record["candidateRevision"]
+                or replacement.get("candidateRawSha256") != record["candidateRawSha256"]
+                or replacement.get("originalRawSha256") != record["identity"]["rawSha256"]
+                or replacement.get("restoreValidationReceipt") != record["replacement"]["restoreValidationReceipt"]
+                or validation.get("validationScope") != "verified-rdc-restore"
+                or validation.get("reusedValidation") is not True
+                or validation.get("captureSessionId") != session):
+            raise RuntimeError("verified RDC apply returned invalid current-session evidence")
+        _hex(replacement.get("replacementId"), 32, "verified RDC replacementId")
+        upgrade = replacement.get("restoreValidationReceiptUpgrade")
+        if isinstance(upgrade, Mapping):
+            payload = dict(upgrade.get("payload") or {})
+            replay_sha = payload.pop("captureReplaySha256", None)
+            schema = payload.pop("captureReplayIdentitySchema", None)
+            if (schema == "bread-rdc-replay-content/v1" and
+                    payload == record["replacement"]["restoreValidationReceipt"]["payload"]):
+                _hex(replay_sha, 64, "upgraded replay-content hash")
+                _hex(upgrade.get("signature"), 64, "upgraded replay signature")
+                record["replacement"]["restoreValidationReceipt"] = copy.deepcopy(dict(upgrade))
+                upgraded_receipts = True
+        if (replacement.get("originalResourceId") != record["identity"]["resourceId"]
+                and any(match.get("aliasCandidates") for match in snapshot["reusePlan"].get("matches", []))):
+            # Shader bytes are authenticated, but display aliases still use the
+            # saved inventory's capture-local owners. Rebuild that inventory if
+            # RenderDoc assigned different IDs in this session; never attach a
+            # saved alias table to an unrelated resource with the old number.
+            raise RuntimeError("verified RDC resource ownership changed; alias inventory requires rebinding")
+        shader_items.append({
+            "status": "applied", "source": "verified-rdc-restore",
+            "workspacePath": status["workspacePath"], "workspaceId": status["workspaceId"],
+            "resourceId": replacement["originalResourceId"], "stage": record["identity"]["stage"],
+            "replacementId": replacement["replacementId"], "knowledgeId": record["knowledgeId"],
+            "reusedValidation": True, "sourceSha256": record["sourceSha256"],
+        })
+        local_display = _restore_local_source_display(host, active, project, capture, record,
+            snapshot["bindingState"].get("workspaces", {}).get(record.get("knowledgeId")))
+        if local_display is not None:
+            shader_items[-1]["preservedLocalSource"] = local_display
+        original = record["identity"]
+        applied_by_original[(record["knowledgeId"], original["resourceId"], original["stage"],
+                             original.get("entryPoint", ""), original["rawSha256"])] = shader_items[-1]
+    checkpoint("after verified RDC Shader apply")
+    _require_restore_context(host, active, project, capture, session)
+    state = snapshot["bindingState"]
+    _verified_restore_binding_state(replay, state)
+    if snapshot.get("_currentPairRecovery"):
+        # Publish only after the Bridge has authenticated/applied these exact
+        # receipts in this capture. No failed/deferred item gains authority.
+        renewed = {key: copy.deepcopy(value) for key, value in snapshot.items()
+                   if not key.startswith("_") and key != "sealSha256"}
+        try:
+            _verified_restore_coverage(state, renewed["reusePlan"],
+                renewed["shaders"] + renewed.get("deferredShaders", []), renewed.get("inventoryEvidence"))
+            _refresh_snapshot_replay_identity(renewed)
+            renewed["sealSha256"] = _canonical_sha256(renewed)
+            _write_verified_rdc_restore(Path(state["projectPath"]), capture, renewed)
+        except (OSError, ValueError, RuntimeError):
+            pass  # A disposable memo failure cannot undo an authenticated apply.
+    if upgraded_receipts and not snapshot.get("_partialRecovery"):
+        _refresh_snapshot_replay_identity(snapshot)
+        if snapshot.get("captureReplaySha256") is not None:
+            upgraded_snapshot = copy.deepcopy(dict(snapshot))
+            upgraded_snapshot.pop("_partialRecovery", None)
+            upgraded_snapshot.pop("_individualRecovery", None)
+            upgraded_snapshot["sealSha256"] = _canonical_sha256(upgraded_snapshot)
+            try:
+                _write_verified_rdc_restore(Path(state["projectPath"]), capture, upgraded_snapshot)
+            except (OSError, ValueError, RuntimeError):
+                # A disposable cache write cannot revoke the checked effect.
+                pass
+    plan = snapshot["reusePlan"]
+    _restore_reuse_aliases_best_effort(
+        host, replay, active, project, capture, session, plan, plan.get("matches", []),
+        progress, checkpoint, state.get("projectInventory"), state.get("inventoryBinding"),
+        alias_transactions)
+    result["capture"]["captureId"] = state["captureId"]
+    result["restoreMode"] = "verified-rdc-restore"
+    result["cache"] = {"hit": True, "reason": "same-rdc-verified-content"}
+    result["verifiedRdcCache"] = {"hit": True, "written": False, "reason": "same-rdc-verified-content"}
+    pending_items = []
+    for match in plan.get("matches", []):
+        candidates = match.get("workspaceCandidates") or []
+        active_candidates = [item for item in candidates if item.get("activeCandidate") is True]
+        if not active_candidates and len(candidates) == 1:
+            active_candidates = candidates
+        if len(active_candidates) != 1:
+            continue
+        knowledge = state.get("workspaces", {}).get(active_candidates[0].get("knowledgeId"))
+        candidate = active_candidates[0]
+        if candidate.get("pendingSource") is not None:
+            original = match["shader"]
+            applied_item = applied_by_original.get((candidate["knowledgeId"], original["resourceId"],
+                original["stage"], original.get("entryPoint", ""), original["rawSha256"]))
+            if applied_item is None:
+                raise RuntimeError("pending project source omitted its validated replay version")
+            current_identity = {**match["shader"], "resourceId": applied_item["resourceId"]}
+            pending_display = _show_fallback_pending_source(host, candidate, state, current_identity,
+                state["captureId"], capture, session)
+            applied_item["pendingSource"] = pending_display
+        reason = (source_only_restore_reason(knowledge, state.get("projectPath"))
+                  if isinstance(knowledge, Mapping) else None)
+        if reason:
+            checkpoint("before pending project source display")
+            pending_items.append(_pending_project_source_item(host, knowledge, match["shader"], reason,
+                project_id=state["projectId"], capture_id=state["captureId"], capture_path=capture,
+                capture_session_id=session))
+    result["shaders"].update(attempted=len(items), applied=len(items),
+                             skipped=len(pending_items), items=shader_items + pending_items)
+    result["realizedReceipts"].update(
+        produced=len(items), reusedValidation=len(items),
+        mutationsCreated=sum(item["replacement"].get("operationCreatedReplacement") is True for item in items))
+    records = [dict(record) for record in snapshot["shaders"]]
+    if snapshot.get("_partialRecovery"):
+        recovered = _recover_verified_restore_exceptions(host, replay, active, project, capture, session,
+            state, plan, records, result, progress, checkpoint, applied_workspaces, alias_transactions,
+            restored_material_sessions=restored_material_sessions)
+        records.extend(recovered)
+        if not result["shaders"]["failed"] and any(r.get("manualEdit") is not True for r in recovered):
+            # A repaired exception may now join its signed siblings. A still
+            # manual draft cannot be promoted merely because replay succeeded.
+            try:
+                refreshed = _build_verified_rdc_restore(host, replay, active, project, capture,
+                    state, records, applied_workspaces, checkpoint,
+                    inventory={"originalShaderIdentityPolicy": (snapshot.get("inventoryEvidence") or {}).get(
+                        "originalShaderIdentityPolicy"), "shaders": state["capture"]["shaders"]})
+                if refreshed is not None:
+                    _write_verified_rdc_restore(Path(state["projectPath"]), capture, refreshed)
+            except (RestoreControlStop, RestoreContextChanged, RestoreContextUnavailable):
+                raise
+            except Exception:
+                pass
+    return records
+
+
+def _recover_verified_restore_exceptions(host, replay, active, project, capture, session,
+        state, plan, records, result, progress, checkpoint, applied_workspaces, alias_transactions,
+        *, restored_material_sessions=None):
+    # Preserve the successful native subset. Only the unmatched physical
+    # resources enter ordinary inventory/preparation/compile/apply paths.
+    restored = {tuple(record["identity"].get(field) for field in (
+        "resourceId", "stage", "entryPoint", "rawSha256")) for record in records}
+    missing = [match["shader"] for match in plan.get("matches", [])
+               if tuple(match["shader"].get(field) for field in (
+                   "resourceId", "stage", "entryPoint", "rawSha256")) not in restored]
+    extra_records = []
+    all_targets = sorted({item["rawSha256"] for item in missing})
+    for offset in range(0, len(all_targets), _MAX_TARGET_RAW_SHADER_HASHES):
+        targets = all_targets[offset:offset + _MAX_TARGET_RAW_SHADER_HASHES]
+        try:
+            inventory = _inventory_shader_resources(host, capture, session, state["capture"]["api"],
+                progress, checkpoint, target_raw_sha256s=targets)
+            prepared = _prepare_inventory_response(replay, active, inventory, progress, checkpoint)
+        except (RestoreControlStop, RestoreContextChanged, RestoreContextUnavailable, RestoreRollbackFailed):
+            raise
+        except Exception as error:
+            # An unavailable exception must not fall through to whole-project
+            # recovery after its signed siblings were already applied.
+            for identity in missing:
+                if identity["rawSha256"] not in targets:
+                    continue
+                result["shaders"]["attempted"] += 1
+                result["shaders"]["failed"] += 1
+                match = next(item for item in plan["matches"] if item["shader"] == identity)
+                candidates = match.get("workspaceCandidates") or []
+                chosen = [item for item in candidates if item.get("activeCandidate") is True]
+                if not chosen and len(candidates) == 1:
+                    chosen = candidates
+                knowledge_id = chosen[0]["knowledgeId"] if len(chosen) == 1 else None
+                result["shaders"]["items"].append({"status": "failed", "source": "reuse-plan",
+                    "knowledgeId": knowledge_id,
+                    "resourceId": identity["resourceId"], "stage": identity["stage"],
+                    "error": str(error)[:2048] or type(error).__name__})
+            continue
+        prepared["reusePlan"]["matches"] = [match for match in prepared["reusePlan"].get("matches", [])
+            if tuple(match["shader"].get(field) for field in (
+                "resourceId", "stage", "entryPoint", "rawSha256")) not in restored]
+        prepared["reusePlan"]["matchedShaderCount"] = len(prepared["reusePlan"]["matches"])
+        recovered, unused_materials, unused_state = _restore_from_reuse_plan(
+            host, replay, active, project, capture, session, prepared, inventory, progress,
+            result["shaders"], result["materials"], applied_workspaces,
+            restored_material_sessions if restored_material_sessions is not None else [], alias_transactions,
+            checkpoint, receipt_stats=result["realizedReceipts"])
+        extra_records.extend(recovered)
+    result["verifiedRdcCache"].update(reason="same-rdc-verified-subset")
+    result["cache"] = {"hit": True, "reason": "same-rdc-verified-subset"}
+    result["restoreMode"] = "verified-rdc-subset"
+    result["realizedReceipts"]["manualEdit"] = sum(record.get("manualEdit") is True
+                                                  for record in records + extra_records)
+    return extra_records
 
 
 def restore_active_capture_project(
@@ -7673,6 +10900,7 @@ def restore_active_capture_project(
     progress_callback: Callable[[dict[str, Any]], Any] | None = None,
     cancel_event: Any = None,
     deadline_monotonic: float | None = None,
+    post_restore_callback: Callable[[Callable[[], dict[str, Any]]], None] | None = None,
 ) -> dict[str, Any]:
     """Restore project Shader/CBuffer knowledge into the active local capture.
 
@@ -7680,8 +10908,9 @@ def restore_active_capture_project(
     thread. An exact RDC association validates only its bounded Shader set. On
     a miss, a sealed project-side inventory can narrow the same bounded live
     validation; only a first open or stale cache inventories every unique
-    Shader resource. No path walks the EID stream, and every cache remains a
-    routing hint until fresh target-session ABI and anchor validation succeeds.
+    Shader resource. Unchanged RDC/source/candidate/project contents may reuse
+    a signed successful validation, with fresh byte and current-session checks.
+    No path walks the EID stream or reuses a persisted GPU resource handle.
     """
 
     if cancel_event is not None and not callable(
@@ -7700,11 +10929,27 @@ def restore_active_capture_project(
                 "deadline_monotonic must be a finite monotonic timestamp"
             )
 
+    active_snapshot = None
+    active_service = None
+
     def control_checkpoint(phase: str) -> None:
         _restore_control_checkpoint(cancel_event, clean_deadline, phase)
+        if active_snapshot is not None:
+            try:
+                active_service.assert_active_project_snapshot(active_snapshot)
+            except Exception as exc:
+                raise RestoreContextChanged("active project changed: " + str(exc)) from exc
+
+    def project_commit():
+        if active_snapshot is not None:
+            return active_service.commit_active_project_snapshot(active_snapshot)
+        return contextlib.nullcontext()
 
     control_checkpoint("restore start")
     operation_id = uuid.uuid4().hex
+    restore_started = time.monotonic()
+    from .file_content_cache import statistics as digest_statistics
+    initial_digest_statistics = digest_statistics()
     warnings: list[str] = []
     progress = _Progress(operation_id, progress_callback, warnings)
     result: dict[str, Any] = {
@@ -7773,6 +11018,7 @@ def restore_active_capture_project(
     commit_checkpoint_passed = False
     inventory_cache_binding: tuple[str, str] | None = None
     inventory_cache_write_source: Mapping[str, Any] | None = None
+    verified_cache_miss_reason: str | None = None
 
     def release_active_project_pin() -> None:
         nonlocal pin_context
@@ -7780,6 +11026,37 @@ def restore_active_capture_project(
         pin_context = None
         if current is not None:
             current.close()
+
+    def enable_editing_after_restore(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        items = result["shaders"]["items"]
+        if post_restore_callback is None:
+            return _enable_restored_shader_editing(
+                host, active, project, Path(capture_path).resolve(), live_session,
+                records, items, cancel_event=cancel_event,
+                deadline_monotonic=clean_deadline, progress=progress)
+        # Retain the exact IPC owner, but no project pin, workspace lease or
+        # restore guard. The registry invokes this only after publishing the
+        # committed restore result. Editor startup has its own bounded budget.
+        direct_binding = _CALL_BINDING.get()
+        saved_records, saved_items = copy.deepcopy(list(records)), copy.deepcopy(items)
+        def start_editors() -> dict[str, Any]:
+            from .ipc_client import bind_direct_tool_call
+            with bind_direct_tool_call(direct_binding[0] if direct_binding else host.ipc.instance_id, live_session):
+                return _enable_restored_shader_editing(
+                    host, active, project, Path(capture_path).resolve(), live_session,
+                    saved_records, saved_items, cancel_event=cancel_event,
+                    deadline_monotonic=time.monotonic() + 900, progress=None)
+        pending_items = [{"workspaceId": item["workspaceId"],
+                          "workspacePath": item["workspacePath"], "status": "pending",
+                          "captureBinding": {"instanceId": (_CALL_BINDING.get() or ("", ""))[0],
+                                             "captureSessionId": live_session,
+                                             "capturePath": str(Path(capture_path).resolve())}}
+                         for item in saved_items if item.get("status") == "applied"]
+        if not pending_items:
+            return {"attempted": 0, "enabled": 0, "deferred": 0, "failed": 0, "items": []}
+        post_restore_callback(start_editors)
+        return {"status": "pending", "pending": len(pending_items),
+                "attempted": 0, "enabled": 0, "deferred": 0, "failed": 0, "items": pending_items}
 
     def rollback_restored_state() -> str:
         failures: list[str] = []
@@ -7800,9 +11077,26 @@ def restore_active_capture_project(
 
     with _RESTORE_GUARD:
         previous_restore_state = automatic_project_sync_suppressed()
+        previous_restore_policy = getattr(_RESTORE_THREAD_STATE, "validation_policy_sha256", None)
+        previous_compatible_policies = getattr(_RESTORE_THREAD_STATE, "compatible_policy_sha256s", ())
+        previous_context_checkpoint = getattr(_RESTORE_THREAD_STATE, "control_checkpoint", None)
+        previous_context_recovery = getattr(_RESTORE_THREAD_STATE, "context_recovery", None)
+        previous_project_identities = getattr(_RESTORE_THREAD_STATE, "project_identities", None)
+        previous_pair_rdc_observations = getattr(_RESTORE_THREAD_STATE, "pair_rdc_observations", None)
         _RESTORE_THREAD_STATE.active = True
+        _RESTORE_THREAD_STATE.validation_policy_sha256 = None
+        _RESTORE_THREAD_STATE.compatible_policy_sha256s = ()
+        _RESTORE_THREAD_STATE.control_checkpoint = control_checkpoint
+        _RESTORE_THREAD_STATE.context_recovery = []
+        _RESTORE_THREAD_STATE.project_identities = {}
+        _RESTORE_THREAD_STATE.pair_rdc_observations = {}
+        transport_context = contextlib.ExitStack()
         try:
             host = _host_module()
+            bind_transport = getattr(getattr(host, "ipc", None), "bind_capture_session", None)
+            if callable(bind_transport):
+                transport_context.enter_context(bind_transport(capture_session_id or ""))
+            transport_context.enter_context(resume_after_foreground_yield(control_checkpoint))
             progress.emit("validate", "Validating active project and capture")
             control_checkpoint("before active project and capture validation")
             active, live_context, project, replay_path, live_session = (
@@ -7810,16 +11104,29 @@ def restore_active_capture_project(
                     host, project_root, capture_path, capture_session_id
                 )
             )
+            _RESTORE_THREAD_STATE.validation_policy_sha256 = live_context.get("restoreValidationPolicySha256")
+            policy_hints = live_context.get("restoreValidationCompatiblePolicySha256s", [])
+            if isinstance(policy_hints, list) and len(policy_hints) <= 8:
+                _RESTORE_THREAD_STATE.compatible_policy_sha256s = tuple(value for value in policy_hints
+                    if isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value))
+            if callable(bind_transport) and not capture_session_id:
+                transport_context.enter_context(bind_transport(live_session))
             control_checkpoint("after active project and capture validation")
+            batch_identity = getattr(host, "_project_shader_restore_batch", None)
+            if callable(batch_identity):
+                transport_context.enter_context(batch_identity(Path(capture_path).resolve(), live_session))
             active_service = host._active_project_service()
-            pin = getattr(active_service, "pin_active_project", None)
+            snapshot_factory = getattr(active_service, "snapshot_active_project", None)
+            pin = snapshot_factory if callable(snapshot_factory) else getattr(active_service, "pin_active_project", None)
             if not callable(pin):
                 raise RuntimeError(
                     "active project service has no transaction pin route"
                 )
             pin_context = contextlib.ExitStack()
             control_checkpoint("before active project transaction pin")
-            pin_context.enter_context(pin(active["workspaceId"], project))
+            project_token = pin_context.enter_context(pin(active["workspaceId"], project))
+            if callable(snapshot_factory):
+                active_snapshot = project_token
             control_checkpoint("after active project transaction pin")
             result["capture"].update({"path": str(Path(capture_path).resolve()), "sessionId": live_session})
             result["project"].update(
@@ -7829,7 +11136,12 @@ def restore_active_capture_project(
                     "replayProjectId": active["replayProject"]["projectId"],
                 }
             )
-            replay = ReplayProjectService(replay_path)
+            # A preceding editor save may have finished while this RDC was
+            # opening. Commit its frozen successful source before consulting
+            # any cached restore plan or selecting the project head.
+            from .shader_saved_publication import drain as drain_saved_shader_publications
+            drain_saved_shader_publications(project, replay_path, control_checkpoint)
+            replay = ReplayProjectService(replay_path, cache_validated_reads=True)
             live_capture = live_context.get("capture")
             if not isinstance(live_capture, Mapping):
                 raise RuntimeError("RenderDoc current context omitted capture API")
@@ -7856,7 +11168,7 @@ def restore_active_capture_project(
                 result["completed"] = True
                 progress.emit(
                     "complete",
-                    "ReplayLab project restore completed",
+                    "Bread project restore completed",
                     detail={
                         "shaderApplied": 0,
                         "materialRestored": 0,
@@ -7865,6 +11177,41 @@ def restore_active_capture_project(
                     },
                 )
                 return result
+            try:
+                verified = _load_verified_rdc_restore(
+                    host, replay, active, project, replay_path, Path(capture_path).resolve(),
+                    control_checkpoint, live_context.get("restoreValidationPolicySha256"),
+                    _RESTORE_THREAD_STATE.compatible_policy_sha256s)
+                if verified is not None:
+                    snapshot, workspace_statuses = verified
+                    shader_records = _apply_verified_rdc_restore(
+                        host, replay, active, project, Path(capture_path).resolve(), live_session,
+                        snapshot, workspace_statuses, progress, result, applied_workspaces,
+                        restored_alias_transactions, control_checkpoint,
+                        restored_material_sessions=restored_material_sessions)
+                    control_checkpoint("before verified RDC restore completion")
+                    release_active_project_pin()
+                    result["completed"] = True
+                    result["editing"] = enable_editing_after_restore(shader_records)
+                    progress.emit("complete", "Bread project restore completed", detail={
+                        "shaderApplied": len(shader_records), "materialRestored": 0, "cacheHit": True})
+                    return result
+            except (RestoreContextChanged, RestoreContextUnavailable, RestoreRollbackFailed, RestoreControlStop):
+                raise
+            except _VerifiedRdcRestorePolicyMiss as exc:
+                verified_cache_miss_reason = str(exc)[:4096]
+                result["verifiedRdcCache"] = {
+                    "hit": False, "written": False, "reason": str(exc)}
+            except Exception as exc:
+                verified_cache_miss_reason = ("invalid-or-stale: %s: %s" % (type(exc).__name__, exc))[:4096]
+                cleanup_error = rollback_restored_state()
+                if cleanup_error:
+                    raise RestoreRollbackFailed("verified RDC restore cleanup failed: " + cleanup_error) from exc
+                control_checkpoint("after verified RDC restore cache miss")
+                _require_restore_context(host, active, project, Path(capture_path).resolve(), live_session)
+                result["verifiedRdcCache"] = {
+                    "hit": False, "written": False,
+                    "reason": ("invalid-or-stale: %s: %s" % (type(exc).__name__, exc))[:4096]}
             inventory: dict[str, Any] | None = None
             index_transport: dict[str, Any] | None = None
             index_document: dict[str, Any] | None = None
@@ -7954,6 +11301,7 @@ def restore_active_capture_project(
                     )
                 except (
                     RestoreContextChanged,
+                    RestoreContextUnavailable,
                     RestoreRollbackFailed,
                     RestoreControlStop,
                 ):
@@ -7978,6 +11326,7 @@ def restore_active_capture_project(
                     realized_receipts.clear()
                     for field in (
                         "produced",
+                        "reusedValidation",
                         "adoptedCurrentSession",
                         "mutationsCreated",
                         "idempotentApplyResponses",
@@ -8083,6 +11432,7 @@ def restore_active_capture_project(
                         result["restoreMode"] = "inventory-sidecar"
                     except (
                         RestoreContextChanged,
+                        RestoreContextUnavailable,
                         RestoreRollbackFailed,
                         RestoreControlStop,
                     ):
@@ -8139,6 +11489,7 @@ def restore_active_capture_project(
                         str(live_capture.get("api", "")),
                         progress,
                         control_checkpoint,
+                        cache_diagnostic=result["inventoryCache"],
                     )
                     _require_restore_context(
                         host, active, project, capture, live_session
@@ -8148,6 +11499,19 @@ def restore_active_capture_project(
                     result["targetLookup"] = {key: copy.deepcopy(inventory[key]) for key in (
                         "targetRawSha256s", "observedTargetRawSha256s", "unobservedTargetRawSha256s",
                         "targetInventoryComplete", "rawIdentitySearchComplete")}
+                    code_recovery: dict[str, Any] = {}
+                    inventory = _recover_equivalent_shader_sources(
+                        host, replay, active, project, Path(capture_path).resolve(), live_session,
+                        str(live_capture.get("api", "")), inventory, progress,
+                        control_checkpoint, code_recovery)
+                    if code_recovery.get("prepared"):
+                        if inventory.get("inventoryScope", "all-shaders") == "all-shaders":
+                            result["restoreMode"] = "full-inventory"
+                            for key in ("inventoryScope", "fullFrame", "targetLookup"):
+                                result.pop(key, None)
+                        progress.emit("resource-match", "Matching exact project Shader artifacts",
+                                      detail={"equivalentSourcesPrepared": code_recovery["prepared"],
+                                              "codeCandidateCount": code_recovery["candidateCount"]})
                     if not inventory["shaders"]:
                         result["capture"]["captureId"] = inventory["capture"]["captureId"]
                         result["cache"] = {"hit": False, "reason": "project-targets-not-present"}
@@ -8155,7 +11519,7 @@ def restore_active_capture_project(
                         control_checkpoint("before completed empty project target lookup")
                         release_active_project_pin()
                         result["completed"] = True
-                        progress.emit("complete", "ReplayLab project restore completed", detail={"matchedShaderCount": 0, "fullFrame": False})
+                        progress.emit("complete", "Bread project restore completed", detail={"matchedShaderCount": 0, "fullFrame": False})
                         return result
                     bridge_result = inventory.get("bridgeResult")
                     if (isinstance(bridge_result, Mapping)
@@ -8253,13 +11617,47 @@ def restore_active_capture_project(
             control_checkpoint("after final active restore context validation")
             incomplete_restore = bool(
                 result["shaders"]["failed"]
-                or result["shaders"]["skipped"]
+                or any(item.get("status") == "skipped" and item.get("reason") not in {
+                    "source-only-project-draft", "legacy-saved-organization-draft",
+                    "legacy-organization-publication-needs-review",
+                } for item in result["shaders"]["items"])
                 or result["shaders"]["applied"]
                 != result["shaders"]["attempted"]
                 or result["materials"]["failed"]
                 or result["materials"]["restored"]
                 != result["materials"]["attempted"]
             )
+            verified_snapshot = None
+            result["realizedReceipts"]["manualEdit"] = sum(
+                record.get("manualEdit") is True for record in shader_records)
+            if not incomplete_restore and not result["materials"]["attempted"]:
+                try:
+                    progress.emit("index-write", "Publishing verified RDC restore snapshot")
+                    control_checkpoint("before verified RDC restore snapshot")
+                    verified_snapshot = _build_verified_rdc_restore(
+                        host, replay, active, project, Path(capture_path).resolve(),
+                        binding_state, shader_records, applied_workspaces, control_checkpoint,
+                        inventory=inventory)
+                    if verified_snapshot is not None:
+                        # Keep RDC bytes unchanged after the Bridge signed them.
+                        # Writing the legacy embedded index here would invalidate
+                        # every receipt immediately, on every successful reopen.
+                        with project_commit():
+                            _write_verified_rdc_restore(
+                                replay_path, Path(capture_path).resolve(), verified_snapshot)
+                        result["verifiedRdcCache"] = {
+                            "hit": False, "written": True,
+                            "reason": ("validated-content-subset-snapshot" if verified_snapshot.get("deferredShaders")
+                                       else "validated-content-snapshot")}
+                        result["realizedReceipts"]["persisted"] = len(verified_snapshot["shaders"])
+                        progress.emit("index-write", "Verified RDC restore snapshot published")
+                except (RestoreContextChanged, RestoreContextUnavailable, RestoreControlStop):
+                    raise
+                except Exception as exc:
+                    verified_snapshot = None
+                    result["verifiedRdcCache"] = {
+                        "hit": False, "written": False,
+                        "reason": ("write-failed: %s: %s" % (type(exc).__name__, exc))[:4096]}
             if incomplete_restore:
                 alias_error = _rollback_restored_alias_transactions(
                     host, restored_alias_transactions
@@ -8276,13 +11674,23 @@ def restore_active_capture_project(
                 )
                 result["index"]["warning"] = warning
                 warnings.append(warning)
+            elif verified_snapshot is not None:
+                if not result["cache"]["hit"]:
+                    result["cache"]["reason"] = "verified-rdc-content-snapshot-written"
+            elif any(record.get("manualEdit") is True for record in shader_records):
+                # The portable project head already owns exact manual source
+                # and bytes. Do not relabel them as ABI-proven RDC receipts.
+                result["cache"]["reason"] = "manual-project-source-and-binary"
+                result["index"]["written"] = False
+                result["realizedReceipts"]["manualEdit"] = sum(
+                    record.get("manualEdit") is True for record in shader_records)
             elif any(record.get("sourcePreparationOnly") is True for record in shader_records):
                 # A partial-reflection source can pass the full current live
                 # ABI gate without acquiring complete-index routing authority.
                 # Keep the prior whole binding intact for mixed restores too.
                 result["cache"]["reason"] = "project-source-preparation:fresh-live-abi-no-executable-index"
                 result["index"]["warning"] = (
-                    "Project HLSL was compiled and applied with current live ABI validation; "
+                    "Project Shader candidates were applied with current live ABI validation; "
                     "the previous RDC executable index was preserved because reflected layout knowledge is incomplete"
                 )
                 warnings.append(result["index"]["warning"])
@@ -8392,14 +11800,16 @@ def restore_active_capture_project(
                 control_checkpoint("before restored state commit")
             release_active_project_pin()
             result["completed"] = True
-            result["editing"] = _enable_restored_shader_editing(
-                host, active, project, Path(capture_path).resolve(), live_session,
-                shader_records, result["shaders"]["items"],
-                cancel_event=cancel_event, deadline_monotonic=clean_deadline,
-            )
+            result["editing"] = enable_editing_after_restore(shader_records)
+            if verified_cache_miss_reason is not None and not result["cache"]["hit"]:
+                # The new write receipt describes the output of this run. Keep
+                # the input miss separately so a successful fallback does not
+                # conceal why reopening needed the full restoration path.
+                result["cache"]["reason"] = (
+                    "verified-rdc-cache-miss: " + verified_cache_miss_reason)[:4096]
             progress.emit(
                 "complete",
-                "ReplayLab project restore completed",
+                "Bread project restore completed",
                 detail={
                     "shaderApplied": result["shaders"]["applied"],
                     "materialRestored": result["materials"]["restored"],
@@ -8423,7 +11833,7 @@ def restore_active_capture_project(
                 diagnostic += "; active project pin release failed: " + pin_error
             progress.emit(
                 "failed",
-                "ReplayLab project restore was cancelled",
+                "Bread project restore was cancelled",
                 detail={"error": diagnostic[:4096]},
             )
             if rollback_error or pin_error:
@@ -8454,12 +11864,13 @@ def restore_active_capture_project(
                 result["errorType"] = "RestoreRollbackFailed"
                 progress.emit(
                     "failed",
-                    "ReplayLab project restore failed and restored state cleanup also failed",
+                    "Bread project restore failed and restored state cleanup also failed",
                     detail={"error": result["error"]},
                 )
             else:
                 result["outcome"] = "action-required"
                 result["reasonId"] = exc.reason_id
+                result["reasonDetail"] = str(exc)[:4096]
         except Exception as exc:
             rollback_error = rollback_restored_state()
             pin_error = ""
@@ -8486,14 +11897,96 @@ def restore_active_capture_project(
                     result["errorType"] = "RestoreContextChanged"
             progress.emit(
                 "failed",
-                "ReplayLab project restore failed",
+                "Bread project restore failed",
                 detail={"error": result["error"]},
             )
         finally:
-            if pin_context is not None:
-                release_active_project_pin()
-            _RESTORE_THREAD_STATE.active = previous_restore_state
+            try:
+                if pin_context is not None:
+                    release_active_project_pin()
+            finally:
+                transport_context.close()
+                if _RESTORE_THREAD_STATE.context_recovery:
+                    result["contextRecovery"] = copy.deepcopy(_RESTORE_THREAD_STATE.context_recovery)
+                _RESTORE_THREAD_STATE.active = previous_restore_state
+                _RESTORE_THREAD_STATE.validation_policy_sha256 = previous_restore_policy
+                _RESTORE_THREAD_STATE.compatible_policy_sha256s = previous_compatible_policies
+                _RESTORE_THREAD_STATE.control_checkpoint = previous_context_checkpoint
+                _RESTORE_THREAD_STATE.context_recovery = previous_context_recovery
+                _RESTORE_THREAD_STATE.project_identities = previous_project_identities
+                _RESTORE_THREAD_STATE.pair_rdc_observations = previous_pair_rdc_observations
+                result["performance"] = {"elapsedMs": round((time.monotonic()-restore_started)*1000,3),
+                    "phasesMs": progress.timings(), "digestCache": {key:value-initial_digest_statistics.get(key,0)
+                        for key,value in digest_statistics().items()}, "filePreparationWorkers": 2, "replayWorkers": 1}
     return result
+
+
+def _current_compiled_pair_matches(
+    status: Mapping[str, Any], revision: int, candidate_raw_sha256: str,
+) -> bool:
+    latest, source = status.get("latestCompiled") or {}, status.get("source") or {}
+    return bool(
+        status.get("revision") == revision and latest.get("revision") == revision
+        and status.get("sourceDependenciesCurrent", True) is True
+        and source.get("present") is True
+        and latest.get("sourceSha256") == source.get("currentSha256")
+        and latest.get("rawSha256") == candidate_raw_sha256
+        and latest.get("abiGate", {}).get("status") == "compatible"
+        and latest.get("replayAbiValidated") is True
+        and latest.get("abiCompatible") is True
+    )
+
+
+def _publication_shader_identity(
+    shader: Mapping[str, Any], status: Mapping[str, Any],
+    live_replacement: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Complete publication metadata only after the live native pair check.
+
+    Historical catalogs attach API to the capture, rather than each Shader.
+    The exact live replacement proves the original physical ABI; missing
+    routing fields may be filled from that same canonical workspace, while
+    contradictory fields still fail. This does not grant replay authority.
+    """
+    capture, baseline = status.get("capture") or {}, status.get("baseline") or {}
+    api = _reuse_api_family(capture.get("api"))
+    encoding = _asset_encoding(baseline.get("kind"))
+    abi_hash = _hex(baseline.get("abiSha256"), 64, "publication physical ABI")
+    if (shader.get("resourceId") != (status.get("shader") or {}).get("resourceId")
+            or shader.get("rawSha256") != baseline.get("rawSha256")
+            or shader.get("stage") != status.get("stage")
+            or shader.get("entryPoint", "") != status.get("entryPoint", "")):
+        raise RuntimeError("project catalog differs from the live original Shader identity")
+    catalog_identity = dict(shader)
+    if (("interfaceComplete" in shader or "interfaceHash" in shader) and "stableKeyComplete" not in shader
+            and "stableKeySha256" not in shader and "abiHash" not in shader):
+        # V1 catalog rows already carry encoding/interfaceComplete but keep API
+        # on the capture. Their interfaceHash describes the catalog interface,
+        # not the physical ABI hash. Complete this legacy publication boundary
+        # before the strict v2 parser sees its completeness flag. Never repair
+        # an explicitly supplied v2 key or rewrite immutable catalog records.
+        catalog_identity["api"] = shader.get("api") or api
+        catalog_identity["encoding"] = shader.get("encoding") or encoding
+        catalog_identity["abiHash"] = abi_hash
+    original = _normal_shader_identity(catalog_identity)
+    if (not api or not encoding
+            or original.get("api") and _reuse_api_family(original["api"]) != api
+            or original.get("encoding") and original["encoding"] != encoding
+            or original.get("abiHash") and original["abiHash"] not in _workspace_physical_abi_hashes(status)):
+        raise RuntimeError("project catalog differs from the live original Shader identity")
+    # Preserve a complete desired catalog identity. The live receipt carries
+    # its own spelling; the bounded projection below proves their equivalence.
+    abi_hash = original.get("abiHash") or abi_hash
+    identity = {**original, "api": api, "encoding": encoding, "abiHash": abi_hash}
+    if live_replacement is not None:
+        # A resource-wide replacement may have been checked at another use
+        # than the historical catalog's representative EID. Preserve the
+        # actual checked live anchor as capture-local delivery evidence.
+        identity["anchorEventId"] = _integer(
+            live_replacement.get("anchorEventId"), "publication live anchor EID", 1)
+    identity["stableKeyComplete"] = bool(identity.get("layoutHash"))
+    identity.pop("stableKeySha256", None)
+    return _normal_shader_identity(identity)
 
 
 def _live_replacement(
@@ -8503,6 +11996,7 @@ def _live_replacement(
     replacement_id: str,
     revision: int,
     candidate_raw_sha256: str,
+    *, include_validation_receipts: bool = False,
 ) -> dict[str, Any]:
     capture_id = _hex(status.get("capture", {}).get("captureId"), 64, "workspace captureId")
     baseline = status.get("baseline")
@@ -8529,14 +12023,13 @@ def _live_replacement(
         },
         required=False,
     )
-    response = host.ipc.call(
-        "get_shared_shader_replacements",
-        {
+    query = {
             "expected_capture_id": capture_id,
             "expected_capture_session_id": capture_session_id,
-        },
-        timeout=30.0,
-    )
+        }
+    if include_validation_receipts:
+        query["include_validation_receipts"] = True
+    response = host.ipc.call("get_shared_shader_replacements", query, timeout=30.0)
     replacements = response.get("replacements") if isinstance(response, Mapping) else None
     if (
         not isinstance(response, dict)
@@ -8556,15 +12049,21 @@ def _live_replacement(
         if isinstance(item, Mapping)
         and item.get("replacementId") == replacement_id
         and item.get("workspaceId") == status.get("workspaceId")
-        and item.get("revision") == revision
+        and (
+            item.get("revision") == revision
+            or isinstance(item.get("revision"), int)
+            and not isinstance(item.get("revision"), bool)
+            and 0 < item["revision"] < revision
+            and _current_compiled_pair_matches(status, revision, candidate_raw_sha256)
+        )
         and item.get("candidateRawSha256") == candidate_raw_sha256
         and item.get("stage") == status.get("stage")
         and item.get("entryPoint", "") == status.get("entryPoint", "")
-        and item.get("api") == _asset_api(capture.get("api"))
+        and item.get("api") == _reuse_api_family(capture.get("api"))
         and item.get("encoding") == _asset_encoding(latest.get("kind"))
         and item.get("originalResourceId") == shader.get("resourceId")
         and item.get("originalRawSha256") == original_raw_sha256
-        and item.get("physicalAbiSha256") == physical_abi_sha256
+        and item.get("physicalAbiSha256") in _workspace_physical_abi_hashes(status)
         and (
             expected_anchor is None
             or item.get("anchorEventId") == expected_anchor
@@ -8577,6 +12076,38 @@ def _live_replacement(
     if len(matches) != 1:
         raise RuntimeError("replacement_id is not the exact applied workspace candidate")
     return dict(matches[0])
+
+
+def _persist_derived_shader_association(
+    active: Mapping[str, Any], replay: Any, binding_state: Mapping[str, Any],
+    capture_path: Path, capture_session_id: str, shader_record: Mapping[str, Any],
+    realized_receipt: Mapping[str, Any], live_replacement: Mapping[str, Any],
+) -> Path:
+    """Keep current project/EID delivery receipts without changing RDC bytes."""
+    binding = _binding_document(active, binding_state, [shader_record], [], [realized_receipt])
+    _revalidate_binding_state_before_commit(replay, binding_state, binding)
+    project = Path(active["projectRoot"]).resolve()
+    replay_path = Path(active["paths"]["replayProject"]).resolve()
+    capture_key = hashlib.sha256(_path_key(capture_path).encode("utf-8")).hexdigest()
+    path = replay_path / "derived" / "shader-associations" / capture_key / (shader_record["knowledgeId"] + ".json")
+    if not is_within(project, path.resolve()) or path.is_symlink() or replay_path.is_symlink():
+        raise RuntimeError("derived Shader association path is redirected")
+    value = {
+        "schema": "replaylab-project-shader-association/v1", "schemaVersion": 1,
+        "capturePath": str(capture_path), "captureSessionId": capture_session_id,
+        "captureSha256": _verified_rdc_content_sha256(capture_path),
+        "binding": binding, "replacement": copy.deepcopy(dict(live_replacement)),
+        "physicalCandidateRevision": live_replacement["revision"],
+        "currentSourceRevision": shader_record["candidateRevision"],
+        "physicalApplyAuthority": False, "freshTargetValidationRequired": True,
+    }
+    value["sealSha256"] = _canonical_sha256(value)
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > _MAX_FAST_CATALOG_BYTES:
+        raise RuntimeError("derived Shader association exceeds its byte limit")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_bytes(path, encoded)
+    return path
 
 
 def _sync_index_binding(
@@ -8864,7 +12395,65 @@ def _register_applied_workspace_with_readback(
         or latest.get("sourceSha256") != source.get("currentSha256")
     ):
         raise RuntimeError("applied project publication requires current compatible ABI evidence")
-    committed = project.register_workspace(status, include_explanatory=False)
+    host = _host_module()
+    context = host._workspace_active_capture_context(str(workspace), status=status)
+    # The applied workspace may refer to a recovered/historical catalog. Admit
+    # that exact validated revision before publication; importing the current
+    # UI catalog cannot repair a different revision's missing provenance.
+    host._ensure_active_workspace_project_capture(project, status, context)
+    if workspace_service.status(str(workspace)) != status:
+        raise RuntimeError("workspace changed during applied catalog registration")
+    from .shader_final_publication import preserve_historical_artifacts
+    publication_status = preserve_historical_artifacts(project, status)
+    historical = publication_status.get("historicalPublicationEvidence")
+    # Finish/source publication may already have committed this exact pair
+    # with current analysis. Reuse that verified active head instead of trying
+    # to reactivate its older analysis-free sibling as "new" knowledge.
+    head = project.replay_service().find_current_workspace_source_head(
+        source_sha256=source["currentSha256"],
+        raw_sha256=status["baseline"]["rawSha256"],
+        stage=status["stage"], entry_point=status.get("entryPoint", ""),
+        workspace_id=status["workspaceId"], capture_id=status["capture"]["captureId"],
+        target_profile=status["targetProfile"], baseline_abi_sha256=status["baseline"].get("abiSha256", ""),
+    )
+    existing = head.get("knowledge") if isinstance(head, Mapping) else None
+    if not historical and isinstance(existing, Mapping) and (
+        existing.get("workspaceId") == status.get("workspaceId")
+        and existing.get("captureId") == status["capture"]["captureId"]
+        and existing.get("originResourceId") == status["shader"]["resourceId"]
+        and Path(str(existing.get("workspacePath", ""))).resolve() == workspace.resolve()
+        and existing.get("workspaceManifestSha256")
+        == host._bounded_file_sha256(Path(status["manifestPath"]), 64 * 1024 * 1024, "workspace manifest")
+        and isinstance(existing.get("compiledCandidate"), Mapping)
+        and existing["compiledCandidate"].get("sourceRevision") == status["revision"]
+        and existing["compiledCandidate"].get("rawSha256") == latest["rawSha256"]
+    ):
+        from .projects import _workspace_publication_scope
+        receipt = {"knowledge": dict(existing), "applied": False, "idempotent": True,
+                   "reusedCurrentHead": True, **_workspace_publication_scope()}
+        validated = host._validated_active_workspace_registration(receipt, status, existing)
+        if workspace_service.status(str(workspace)) != status:
+            raise RuntimeError("workspace changed during applied project readback")
+        head_after = project.replay_service().find_current_workspace_source_head(
+            source_sha256=source["currentSha256"], raw_sha256=status["baseline"]["rawSha256"],
+            stage=status["stage"], entry_point=status.get("entryPoint", ""),
+            workspace_id=status["workspaceId"], capture_id=status["capture"]["captureId"],
+            target_profile=status["targetProfile"], baseline_abi_sha256=status["baseline"].get("abiSha256", ""),
+        )
+        if head_after != head:
+            raise RuntimeError("project head changed during applied project readback")
+        host._require_same_active_capture(context, allow_missing_capture_id=True)
+        return validated
+    from .shader_final_publication import recover_finished_binding, require_finish_binding
+    recovered_finish = recover_finished_binding(workspace, status)
+    if recovered_finish is not None:
+        require_finish_binding(host, status, recovered_finish)
+    # A watcher may already own the source lease. Keep this existing applied
+    # transaction/readback path instead of nesting the finish-only lease.
+    publication_options = {"include_explanatory": recovered_finish is not None}
+    if historical:
+        publication_options["expected_head"] = historical["expectedHead"]
+    committed = project.register_workspace(publication_status, **publication_options)
     knowledge = committed.get("knowledge") if isinstance(committed, Mapping) else None
     if not isinstance(knowledge, Mapping):
         raise RuntimeError("applied project publication omitted workspace knowledge")
@@ -8872,15 +12461,16 @@ def _register_applied_workspace_with_readback(
     published = project.get_workspace_knowledge(knowledge_id)
     if workspace_service.status(str(workspace)) != status:
         raise RuntimeError("workspace changed during applied project publication")
-    if (
+    if recovered_finish is None and (
         knowledge.get("analysisSha256")
         or committed.get("flowchartArtifacts") != []
         or committed.get("flowGraphArtifacts") != []
     ):
         raise RuntimeError("applied project publication reused stale AI documentation")
-    return _host_module()._validated_active_workspace_registration(
-        committed, status, published, publication_gate=None
-    )
+    host._require_same_active_capture(context, allow_missing_capture_id=True)
+    validation_options = {"allow_historical_manifest": True} if historical else {}
+    validated = host._validated_active_workspace_registration(committed, status, published, **validation_options)
+    return {**validated, **({"recoveredCurrentReview": True} if recovered_finish is not None else {})}
 
 
 def sync_active_shader_workspace_after_apply(
@@ -8888,15 +12478,19 @@ def sync_active_shader_workspace_after_apply(
     expected_revision: int,
     expected_candidate_raw_sha256: str,
     replacement_id: str,
+    *, embed_capture_index: bool = False,
+    expected_finish: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Commit one exactly applied workspace, then refresh the RDC cache."""
+    """Commit current source/native-pair delivery and a derived RDC/EID receipt."""
 
+    if not isinstance(embed_capture_index, bool):
+        raise ValueError("embed_capture_index must be a boolean")
     with _RESTORE_GUARD:
         host = _host_module()
         active = host._active_project_service().status()
         workspace = Path(workspace_path).expanduser().resolve()
         managed = host._require_managed_active_workspace(active, str(workspace))
-        status = host._shader_workspace_service().status(str(managed))
+        status = _workspace_artifact_service(host).status(str(managed))
         revision = _integer(expected_revision, "expected_revision", 1)
         candidate_raw = _hex(
             expected_candidate_raw_sha256, 64, "expected_candidate_raw_sha256"
@@ -8912,6 +12506,11 @@ def sync_active_shader_workspace_after_apply(
             or latest.get("sourceSha256") != source.get("currentSha256")
         ):
             raise RuntimeError("workspace changed after the applied candidate")
+        if expected_finish is not None:
+            from .shader_final_publication import require_finish_binding
+            # A finish already validated this exact source. Never turn a late
+            # source change into another ABI/compile pass during persistence.
+            require_finish_binding(host, status, expected_finish)
         capture_path = Path(str(status.get("capture", {}).get("capturePath", ""))).resolve()
         live = host._active_live_context(allow_missing_capture_id=True)
         session_id = _hex(
@@ -8921,24 +12520,46 @@ def sync_active_shader_workspace_after_apply(
         )
         if _path_key(live.get("capture", {}).get("path", "")) != _path_key(capture_path):
             raise RuntimeError("active capture differs from the applied workspace")
+        if active.get("scopeConfigured") is False:
+            raise RuntimeError("project scope is not configured for applied Shader publication")
+        if (latest.get("replayAbiValidated") is not True
+                or latest.get("abiCompatible") is not True
+                or latest.get("requiresReplayAbiValidation") is not False
+                or latest.get("validationScope") != "replay-reflection-abi-compatible"):
+            # The fast live-save route validates the complete physical ABI at
+            # replacement time, but does not fabricate an immutable reflection
+            # report for the new source. Project restoration needs that report
+            # alongside the executable. Obtain it only when missing; keep the
+            # installed Native target and its signed physical revision intact.
+            unused_service, checked, unused_request, validation = host._fresh_shader_candidate_validation(
+                str(managed), revision, candidate_raw)
+            if (validation.get("replayAbiValidated") is not True
+                    or validation.get("captureSessionId") != session_id
+                    or checked.get("source", {}).get("currentSha256") != source.get("currentSha256")):
+                raise RuntimeError("applied Shader project validation changed its source or capture")
+            status = checked
+            latest, source = status["latestCompiled"], status["source"]
         live_replacement = _live_replacement(
-            host, status, session_id, replacement, revision, candidate_raw
+            host, status, session_id, replacement, revision, candidate_raw,
+            include_validation_receipts=True,
         )
         active_service = host._active_project_service()
         with active_service.pin_active_project(active["workspaceId"], active["projectRoot"]):
             host._require_same_active_project(active)
-            committed = _register_applied_workspace_with_readback(
-                active_service,
-                host._shader_workspace_service(),
-                managed,
-                status,
-            )
+            if expected_finish is not None:
+                from .shader_final_publication import register_finished_workspace
+                committed = register_finished_workspace(
+                    host, active_service, _workspace_artifact_service(host), managed,
+                    status, expected_finish, live)
+            else:
+                committed = _register_applied_workspace_with_readback(
+                    active_service, _workspace_artifact_service(host), managed, status)
             knowledge = committed.get("knowledge") if isinstance(committed, Mapping) else None
             if not isinstance(knowledge, Mapping):
                 raise RuntimeError("project workspace registration returned invalid knowledge")
         # Re-read after the durable project commit so a newer save cannot be
         # represented by the old applied revision in the RDC cache.
-        after = host._shader_workspace_service().status(str(managed))
+        after = _workspace_artifact_service(host).status(str(managed))
         if (
             after.get("revision") != status.get("revision")
             or after.get("source", {}).get("currentSha256")
@@ -8947,15 +12568,25 @@ def sync_active_shader_workspace_after_apply(
         ):
             raise RuntimeError("workspace changed while project knowledge was committed")
         live_replacement = _live_replacement(
-            host, after, session_id, replacement, revision, candidate_raw
+            host, after, session_id, replacement, revision, candidate_raw,
+            include_validation_receipts=True,
         )
         replay = ReplayProjectService(active["paths"]["replayProject"])
+        # Workspace catalogSha256 hashes the on-disk capture catalog; the
+        # project's originCatalogSha256 hashes its normalized immutable copy.
+        # Recovery/export can change blob paths or formatting without changing
+        # the Shader. Use the validated publication's project identity, never
+        # the transport-file hash or whichever catalog happens to be active.
+        origin_catalog_sha = _hex(
+            knowledge.get("originCatalogSha256"), 64,
+            "workspace knowledge originCatalogSha256",
+        )
         binding_state = replay.restore_knowledge_snapshot(
-            status["capture"]["captureId"], status["capture"].get("catalogSha256", "")
+            status["capture"]["captureId"], origin_catalog_sha
         )
         identity = next(
             (
-                _normal_shader_identity(item)
+                _publication_shader_identity(item, after, live_replacement)
                 for item in binding_state["capture"]["shaders"]
                 if item.get("resourceId") == status["shader"]["resourceId"]
                 and item.get("stage") == status["stage"]
@@ -8976,21 +12607,44 @@ def sync_active_shader_workspace_after_apply(
         )
         realized_receipt = _realized_receipt_from_record(
             shader_record,
-            str(live_replacement.get("physicalAbiSha256", "")),
+            _realized_identity_abi(shader_record, live_replacement, after),
             abi_report_sha256=(
                 str(live_replacement.get("abiReportSha256", "") or "") or None
             ),
         )
-        written, warning = _sync_index_binding(
-            host,
-            active,
-            replay,
-            binding_state,
-            capture_path,
-            session_id,
-            shader_record=shader_record,
-            realized_receipt=realized_receipt,
-        )
+        association_path = None
+        warning = ""
+        try:
+            association_path = _persist_derived_shader_association(
+                active, replay, binding_state, capture_path, session_id,
+                shader_record, realized_receipt, live_replacement)
+        except Exception as exc:
+            warning = "derived Shader association could not be saved: %s: %s" % (type(exc).__name__, exc)
+        # An unchanged native binary can represent a newer source revision.
+        # Keep the signed physical revision/report intact while binding its
+        # optional derived proof to the exact newly compiled source.
+        pair_written = False
+        lease = {key: live_replacement.get(key) for key in (
+            "abiLeaseRequestId", "abiLeaseReportSha256", "abiLeaseCandidateRawSha256", "abiLeaseRevision")}
+        if lease["abiLeaseRequestId"] is None:
+            lease = {"abiLeaseRequestId": live_replacement.get("abiRequestId"),
+                     "abiLeaseReportSha256": live_replacement.get("abiReportSha256"),
+                     "abiLeaseCandidateRawSha256": live_replacement.get("candidateRawSha256"),
+                     "abiLeaseRevision": live_replacement.get("revision")}
+        pair_written = _persist_workspace_shader_pair_validation(
+            after, live_replacement, lease, allow_same_pair_revision_reuse=True)
+        written = False
+        if embed_capture_index:
+            written, index_warning = _sync_index_binding(
+                host, active, replay, binding_state, capture_path, session_id,
+                shader_record=shader_record, realized_receipt=realized_receipt)
+            warning = "; ".join(item for item in (warning, index_warning) if item)
+        from .shader_workspace.alias_display_mirror import restore_display_alias_mirrors
+        try:
+            display_aliases = restore_display_alias_mirrors(
+                host, managed, after, session_id, active["projectRoot"])
+        except Exception as alias_error:
+            display_aliases = {"status": "failed", "diagnostic": str(alias_error)[:400]}
         return {
             "schema": SHADER_SYNC_SCHEMA,
             "schemaVersion": 1,
@@ -9000,11 +12654,17 @@ def sync_active_shader_workspace_after_apply(
             "captureSessionId": session_id,
             "replacementId": replacement,
             "revision": revision,
+            "physicalCandidateRevision": live_replacement["revision"],
             "candidateRawSha256": candidate_raw,
             "projectCommitted": True,
             "knowledge": copy.deepcopy(dict(knowledge)),
+            **({"workspaceRegistration": committed} if expected_finish is not None else {}),
             "rdcIndexWritten": written,
-            "warning": warning or None,
+            "derivedAssociationWritten": association_path is not None,
+            "derivedAssociationPath": str(association_path) if association_path else None,
+            "workspacePairValidationWritten": pair_written,
+            "displayAliases": display_aliases,
+            "warning": warning[:4096] or None,
         }
 
 

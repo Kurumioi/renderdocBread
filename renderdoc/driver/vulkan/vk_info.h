@@ -456,6 +456,10 @@ struct VulkanCreationInfo
     };
     rdcarray<CBAttachment> attachments;
 
+    // Keep the enable separate from the channel mask: either can be dynamic.
+    // Empty means that VkPipelineColorWriteCreateInfoEXT was not supplied.
+    rdcarray<VkBool32> colorWriteEnables;
+
     // VkPipelineDynamicStateCreateInfo
     bool dynamicStates[VkDynamicCount];
 

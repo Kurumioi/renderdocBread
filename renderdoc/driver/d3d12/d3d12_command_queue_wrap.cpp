@@ -25,6 +25,7 @@
 #include "d3d12_command_queue.h"
 #include "core/settings.h"
 #include "replay/replay_timing.h"
+#include "replay/resource_usage.h"
 #include "d3d12_command_list.h"
 #include "d3d12_replay.h"
 #include "d3d12_resources.h"
@@ -678,8 +679,7 @@ bool WrappedID3D12CommandQueue::Serialise_ExecuteCommandLists(SerialiserType &se
           EventUsage u = it->second;
           u.eventId += m_Cmd.m_RootEventID;
           rdcarray<EventUsage> &uses = m_Cmd.m_ResourceUses[it->first];
-          if(u.usage != ResourceUsage::Shader || uses.empty())
-            uses.push_back(u);
+          AppendFrameResourceUsage(uses, u);
         }
 
         m_Cmd.m_RootEventID += cmdListInfo.eventCount;

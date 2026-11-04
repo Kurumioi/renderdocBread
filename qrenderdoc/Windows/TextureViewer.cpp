@@ -40,6 +40,7 @@
 #include <QStyledItemDelegate>
 #include <memory>
 #include "Code/QRDUtils.h"
+#include "Code/ReplayLab/ReplayLabAIResourceAttachment.h"
 #include "Code/Resources.h"
 #include "Dialogs/TextureSaveDialog.h"
 #include "Windows/RenderTargetHistoryView.h"
@@ -312,6 +313,11 @@ Descriptor Following::GetDescriptor(ICaptureContext &ctx, uint32_t arrayIdx)
 rdcarray<Descriptor> Following::GetOutputTargets(ICaptureContext &ctx)
 {
   const ActionDescription *curAction = ctx.CurAction();
+  // Present can retain an unrelated offscreen RT in the graphics pipeline. The following view
+  // must show the actual presented image, matching the frame diagram's final output evidence.
+  if(curAction && (curAction->flags & ActionFlags::Present) &&
+     curAction->copyDestination != ResourceId())
+    return {MakeDescriptor(curAction->copyDestination, curAction->copyDestinationSubresource)};
   bool copy = false, clear = false, compute = false;
   GetActionContext(ctx, copy, clear, compute);
 
@@ -584,6 +590,9 @@ void TextureViewer::UI_UpdateCachedTexture()
     id = m_Following.GetResourceId(m_Ctx);
 
   m_CachedTexture = m_Ctx.GetTexture(id);
+  if(m_TemporaryOutputFollowToken && m_TemporaryPreviewActive &&
+     m_TemporaryPreviewEvent == m_Ctx.CurEvent() && m_LockedId == ResourceId())
+    m_CachedTexture = &m_TemporaryPreviewTexture;
 
   if(m_CachedTexture != NULL)
   {
@@ -646,7 +655,8 @@ TextureViewer::TextureViewer(ICaptureContext &ctx, QWidget *parent)
     : QFrame(parent),
       ui(new Ui::TextureViewer),
       m_Ctx(ctx),
-      m_Following(*this, FollowType::OutputColor, ShaderStage::Pixel, 0, 0)
+      m_Following(*this, FollowType::OutputColor, ShaderStage::Pixel, 0, 0),
+      m_BeforeTemporaryOutputFollow(*this, FollowType::OutputColor, ShaderStage::Pixel, 0, 0)
 {
   ui->setupUi(this);
 
@@ -914,6 +924,8 @@ void TextureViewer::HighlightUsage()
 
 void TextureViewer::SelectPreview(ResourcePreview *prev)
 {
+  if(!m_UpdatingTemporaryOutputFollow)
+    m_TemporaryOutputFollowToken = 0;
   Following follow = prev->property("f").value<Following>();
 
   for(ResourcePreview *p : ui->outputThumbs->thumbs())
@@ -1640,10 +1652,14 @@ void TextureViewer::UI_UpdateTextureDetails()
       }
     }
 
+    if(m_CachedTexture == &m_TemporaryPreviewTexture && m_TemporaryPreviewActive)
+      title = tr("Visual debug preview - RGBA32F");
     ui->renderContainer->setWindowTitle(title);
   }
 
-  ui->texStatusName->setText(m_Ctx.GetResourceName(current.resourceId) + lit(" - "));
+  ui->texStatusName->setText((m_CachedTexture == &m_TemporaryPreviewTexture && m_TemporaryPreviewActive
+                                ? tr("Visual debug preview - RGBA32F")
+                                : QString(m_Ctx.GetResourceName(current.resourceId))) + lit(" - "));
 
   status = QString();
 
@@ -1756,7 +1772,9 @@ void TextureViewer::UI_OnTextureSelectionChanged(bool newAction)
   m_TexDisplay.resourceId = tex.resourceId;
 
   // interpret the texture according to the currently following type.
-  if(!currentTextureIsLocked())
+  if(m_CachedTexture == &m_TemporaryPreviewTexture && m_TemporaryPreviewActive)
+    m_TexDisplay.typeCast = CompType::Float;
+  else if(!currentTextureIsLocked())
     m_TexDisplay.typeCast = m_Following.GetTypeHint(m_Ctx);
   else
     m_TexDisplay.typeCast = CompType::Typeless;
@@ -2482,6 +2500,8 @@ void TextureViewer::textureTab_Menu(const QPoint &pos)
 
 void TextureViewer::textureTab_Changed(int index)
 {
+  if(!m_UpdatingTemporaryOutputFollow)
+    m_TemporaryOutputFollowToken = 0;
   ToolWindowManagerArea *textureTabs = ui->dockarea->areaOf(ui->renderContainer);
 
   if(!textureTabs)
@@ -2601,6 +2621,9 @@ void TextureViewer::ViewTexture(ResourceId ID, CompType typeCast, bool focus)
     return;
   }
 
+  if(!m_UpdatingTemporaryOutputFollow)
+    m_TemporaryOutputFollowToken = 0;
+
   if(typeCast != CompType::Typeless)
     m_TextureSettings[ID].typeCast = typeCast;
 
@@ -2707,6 +2730,96 @@ void TextureViewer::ViewFollowedResource(FollowType followType, ShaderStage stag
   }
 
   qWarning() << "Couldn't find matching bound resource";
+}
+
+uint64_t TextureViewer::BeginTemporaryOutputFollow(uint32_t index)
+{
+  if(m_TemporaryOutputFollowToken != 0 || !m_Ctx.IsCaptureLoaded())
+    return 0;
+
+  m_BeforeTemporaryOutputFollow = m_Following;
+  m_BeforeTemporaryOutputTab = CurrentTextureTab();
+  m_BeforeTemporaryOutputResource = m_TexDisplay.resourceId;
+  m_BeforeTemporaryOutputType = m_TexDisplay.typeCast;
+  m_BeforeTemporaryOutputSubresource = m_TexDisplay.subresource;
+  const uint64_t token = ++m_NextTemporaryOutputFollowToken;
+  m_TemporaryOutputFollowToken = token;
+  if(!UpdateTemporaryOutputFollow(token, index))
+  {
+    m_TemporaryOutputFollowToken = 0;
+    return 0;
+  }
+  ToolWindowManager::raiseToolWindow(this);
+  return token;
+}
+
+bool TextureViewer::UpdateTemporaryOutputFollow(uint64_t token, uint32_t index)
+{
+  if(token == 0 || token != m_TemporaryOutputFollowToken || !m_Ctx.IsCaptureLoaded())
+    return false;
+  QScopedValueRollback<bool> changing(m_UpdatingTemporaryOutputFollow, true);
+  m_TemporaryPreviewActive = false;
+  ViewFollowedResource(FollowType::OutputColor, ShaderStage::Pixel, index, 0);
+  return CurrentTextureTab() == ui->renderContainer && m_Following.Type == FollowType::OutputColor &&
+         m_Following.index >= 0 && uint32_t(m_Following.index) == index;
+}
+
+bool TextureViewer::ShowTemporaryTexturePreview(uint64_t token, const TextureDescription &texture)
+{
+  if(token == 0 || token != m_TemporaryOutputFollowToken || !m_Ctx.IsCaptureLoaded() ||
+     texture.resourceId == ResourceId() || texture.width == 0 || texture.height == 0 ||
+     texture.format.compCount != 4 || texture.format.compByteWidth != 4 ||
+     texture.format.compType != CompType::Float || CurrentTextureTab() != ui->renderContainer)
+    return false;
+  QScopedValueRollback<bool> changing(m_UpdatingTemporaryOutputFollow, true);
+  m_TemporaryPreviewTexture = texture;
+  m_TemporaryPreviewActive = true;
+  m_TemporaryPreviewEvent = m_Ctx.CurEvent();
+  UI_UpdateCachedTexture();
+  UI_OnTextureSelectionChanged(false);
+  m_TexDisplay.typeCast = CompType::Float;
+  SetSelectedSubresource(Subresource());
+  UI_UpdateTextureDetails();
+  QueueUpdateAndDisplay();
+  return true;
+}
+
+bool TextureViewer::EndTemporaryOutputFollow(uint64_t token)
+{
+  if(token == 0 || token != m_TemporaryOutputFollowToken || !m_Ctx.IsCaptureLoaded())
+    return false;
+  m_TemporaryOutputFollowToken = 0;
+  m_TemporaryPreviewActive = false;
+  QScopedValueRollback<bool> changing(m_UpdatingTemporaryOutputFollow, true);
+  ToolWindowManagerArea *textureTabs = ui->dockarea->areaOf(ui->renderContainer);
+  if(!textureTabs || !m_BeforeTemporaryOutputTab ||
+     textureTabs->indexOf(m_BeforeTemporaryOutputTab) < 0)
+  {
+    // The user may close the saved tab while the temporary dynamic view is
+    // active. Detach its descriptor even though that tab cannot be restored.
+    UI_UpdateCachedTexture();
+    UI_OnTextureSelectionChanged(false);
+    return false;
+  }
+
+  m_Following = m_BeforeTemporaryOutputFollow;
+  UI_RememberOutputFollowing();
+  for(ResourcePreview *preview : ui->outputThumbs->thumbs())
+    preview->setSelected(preview->property("f").value<Following>() == m_Following);
+  for(ResourcePreview *preview : ui->inputThumbs->thumbs())
+    preview->setSelected(preview->property("f").value<Following>() == m_Following);
+  textureTabs->setCurrentWidget(m_BeforeTemporaryOutputTab);
+  UI_UpdateCachedTexture();
+  UI_OnTextureSelectionChanged(false);
+  if(m_TexDisplay.resourceId == m_BeforeTemporaryOutputResource)
+  {
+    m_TexDisplay.typeCast = m_BeforeTemporaryOutputType;
+    m_TextureSettings[m_TexDisplay.resourceId].typeCast = m_BeforeTemporaryOutputType;
+    SetSelectedSubresource(m_BeforeTemporaryOutputSubresource);
+    UI_UpdateTextureDetails();
+    QueueUpdateAndDisplay();
+  }
+  return true;
 }
 
 ResourceId TextureViewer::GetCurrentResource()
@@ -2865,6 +2978,11 @@ uint32_t TextureViewer::GetChannelVisibilityBits()
   if(m_TexDisplay.alpha)
     ret |= 0x8;
   return ret;
+}
+
+void TextureViewer::SetFlipY(bool flipped)
+{
+  ui->flip_y->setChecked(flipped);
 }
 
 void TextureViewer::SetChannelVisibility(bool red, bool green, bool blue, bool alpha)
@@ -3072,6 +3190,25 @@ void TextureViewer::OpenResourceContextMenu(ResourceId id, bool input,
   {
     contextMenu.addAction(&openLockedTab);
     contextMenu.addAction(&openResourceInspector);
+
+    QJsonObject attachment = ReplayLabAIResourceContext(m_Ctx, id, "texture-viewer");
+    if(id == m_TexDisplay.resourceId)
+    {
+      QJsonObject resource = attachment[QLatin1String("resource")].toObject();
+      resource[QLatin1String("mip")] = int(m_TexDisplay.subresource.mip);
+      resource[QLatin1String("slice")] = int(m_TexDisplay.subresource.slice);
+      if(m_TexDisplay.subresource.sample != ~0U)
+        resource[QLatin1String("sample")] = int(m_TexDisplay.subresource.sample);
+      attachment[QLatin1String("resource")] = resource;
+    }
+    const QString title = tr("Texture: %1 (EID %2)").arg(m_Ctx.GetResourceName(id)).arg(m_Ctx.CurEvent());
+    const QString json = ReplayLabAIResourceJSON(attachment);
+    const QString text = ReplayLabAIResourceJSON(ReplayLabAIResourceDetails(m_Ctx, id, attachment));
+    QAction *addToChat = contextMenu.addAction(tr("Add texture to AI conversation"));
+    addToChat->setObjectName(QStringLiteral("addTextureToAI"));
+    QObject::connect(addToChat, &QAction::triggered, [this, title, text, json]() {
+      m_Ctx.AddTextToAIAssistant(title, text, title, json);
+    });
 
     contextMenu.addSeparator();
     m_Ctx.Extensions().MenuDisplaying(input ? ContextMenu::TextureViewer_InputThumbnail
@@ -3378,11 +3515,16 @@ void TextureViewer::thumb_clicked(QMouseEvent *e)
     }
     else
     {
-      m_Ctx.Replay().AsyncInvoke([this, id, input](IReplayController *r) {
+      QPointer<TextureViewer> owner(this);
+      const uint64_t serial = m_EventRequestSerial.load(std::memory_order_acquire);
+      m_Ctx.Replay().AsyncInvoke([owner, id, input, serial](IReplayController *r) {
         rdcarray<EventUsage> usage = r->GetUsage(id);
-
-        GUIInvoke::call(this,
-                        [this, id, input, usage]() { OpenResourceContextMenu(id, input, usage); });
+        if(!owner)
+          return;
+        GUIInvoke::call(owner, [owner, id, input, usage, serial]() {
+          if(owner && owner->m_EventRequestSerial.load(std::memory_order_acquire) == serial)
+            owner->OpenResourceContextMenu(id, input, usage);
+        });
       });
     }
   }
@@ -3738,6 +3880,8 @@ void TextureViewer::OnCaptureLoaded()
 
 void TextureViewer::Reset()
 {
+  m_TemporaryOutputFollowToken = 0;
+  m_BeforeTemporaryOutputTab.clear();
   m_PresentationSuspended = false;
   m_PresentationPending = false;
   // i18n-ignore: internal completion-evidence properties for UI regression fixtures.

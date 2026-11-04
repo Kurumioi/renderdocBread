@@ -57,10 +57,13 @@ Assert-True ($claudeSetupSource.Contains("isolated CLAUDE_CONFIG_DIR") -and
 Assert-True (-not $claudeSetupSource.Contains(
         ([Environment]::NewLine + "    claude setup-token"))) `
     "Claude ACP dependency setup must not write credentials to the user's global Claude profile."
+Assert-True (-not $claudeSetupSource.Contains(
+        ([Environment]::NewLine + "    claude auth login"))) `
+    "Claude ACP dependency setup must keep interactive login in the selected connection."
 Assert-True ($source.Contains('$PythonExecutable "replaylab-ai"')) `
     "Build script must name the AgentHost executable replaylab-ai."
-Assert-True ($source.Contains('$PythonExecutable "ReplayLabMCP"')) `
-    "Build script must name the MCP executable ReplayLabMCP."
+Assert-True ($source.Contains('$PythonExecutable "BreadMCP"')) `
+    "Build script must name the MCP executable BreadMCP."
 Assert-True ($source.Contains('$PythonExecutable "ReplayLabInternal"')) `
     "Build script must name the private executable ReplayLabInternal."
 Assert-True ($source.Contains('$PythonExecutable -I $shaderToolsBuilder') -and
@@ -82,7 +85,7 @@ Assert-True ($source.Contains(
     "Build script must smoke-test the frozen external MCP client imports."
 Assert-True ($source.Contains(
         '& $PythonExecutable $frozenMcpRouteProbe --agent $builtAgent')) `
-    "Build script must handshake through the frozen AgentHost filter and ReplayLabMCP."
+    "Build script must handshake through the frozen AgentHost filter and BreadMCP."
 Assert-True ($source.Contains(
         '& $frozenHostLifetimeProbe -InternalHost $builtInternal -McpHost $builtMcp')) `
     "Both frozen Hosts must retain their extracted runtime after ensure exits."
@@ -111,8 +114,10 @@ Assert-True ($source.Contains(
         '$continuationDriverSource + ":replaylab_helpers"')) `
     "MCP packaging must embed the fixed UEX Blender continuation source helper."
 Assert-True ($source.Contains(
-        '(Join-Path $skillRoot "replaylab-core\SKILL.md")')) `
-    "Runtime packaging must validate the standing ReplayLab Skill before freezing."
+        '$bundledSkillFolders = @(Get-ChildItem -LiteralPath $skillRoot -Directory') -and
+    $source.Contains('Where-Object { $_.Name -eq "replaylab-core" }') -and
+    $source.Contains('$agentSkillData = @($bundledSkillFolders | ForEach-Object')) `
+    "Runtime packaging must discover, validate, and bundle the standing ReplayLab Skill set before freezing."
 Assert-True ($projectFile.Contains(
         '$(SolutionDir).agents\skills\renderdoc-shader-workbench\**\*') -and
     $projectFile.Contains('$(SolutionDir).agents\skills\replaylab-core\**\*') -and
@@ -120,7 +125,7 @@ Assert-True ($projectFile.Contains(
     $projectFile.Contains('$(SolutionDir)replaylab\mcp_host\pyproject.toml')) `
     "qrenderdoc incremental runtime inputs must include bundled Skills and dependency manifests."
 Assert-True ($source.Contains('-AddData @($mcpProviderData)')) `
-    "ReplayLabMCP packaging must add its fixed provider helper data."
+    "BreadMCP packaging must add its fixed provider helper data."
 Assert-True ($source.Contains(
         '(Join-Path $mcpRoot "src\resource_export.py")')) `
     "ValidateOnly must require the resource export Host source."
@@ -147,8 +152,8 @@ Assert-True ($source.Contains('$parsedCursorDoctorChecks.GetEnumerator()')) `
 Assert-True ($agentEntrySource.Contains(
         '["-m", "replaylab_agent.mcp_proxy"]')) `
     "AgentHost entry point must dispatch the task-filtered MCP proxy."
-Assert-True ($agentEntrySource.Contains('ReplayLabMCP.exe')) `
-    "Frozen AgentHost must resolve its co-packaged ReplayLabMCP executable."
+Assert-True ($agentEntrySource.Contains('BreadMCP.exe')) `
+    "Frozen AgentHost must resolve its co-packaged BreadMCP executable."
 
 $encodingProbe = Join-Path ([IO.Path]::GetTempPath()) `
     ("replaylab-profile-encoding-" + [Guid]::NewGuid().ToString("N") + ".json")
@@ -186,5 +191,18 @@ catch {
     $unsafeRejected = $true
 }
 Assert-True $unsafeRejected "ValidateOnly must reject the ReplayLab source root as output."
+
+$scratchRoot = Join-Path ([IO.Path]::GetTempPath()) ("bread-runtime-test-" + [Guid]::NewGuid().ToString("N"))
+$result = & $buildScript -ValidateOnly -TemporaryBuildRoot $scratchRoot `
+    -OutputDirectory (Join-Path $scratchRoot "runtime") -WorkDirectory (Join-Path $scratchRoot "work")
+Assert-True ($result.Status -eq "valid") "Named temporary output should be accepted."
+Assert-True (-not (Test-Path -LiteralPath $scratchRoot)) "Validation must not create temporary outputs."
+$unsafeRejected = $false
+try {
+    & $buildScript -ValidateOnly -TemporaryBuildRoot ([IO.Path]::GetTempPath()) `
+        -OutputDirectory $validationOutput -WorkDirectory $validationWork | Out-Null
+}
+catch { $unsafeRejected = $true }
+Assert-True $unsafeRejected "The system temporary root itself must never be a generated build root."
 
 Write-Host "ReplayLab packaging static and parameter-safety tests passed."

@@ -4,13 +4,17 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from src import server
 from src.asset_catalog import AssetCatalogService, asset_tokens
 from src.shader_asset_retrieval import (
     ShaderAssetResolutionStore,
+    abi_block_shape_sha256,
     retrieve,
     structural_key,
-    texture_name_tokens,
+    bound_texture_names,
+    value_evidence,
 )
 from src.symbols.engines import detect_engine, parse_engine_asset
 from src.symbols.engines.unreal_package import map_object_path, read_summary
@@ -174,20 +178,41 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(parents[0]["targetPath"], "Game/Content/Art/Materials/M_CrowFeather.uasset")
         self.assertTrue(parents[0]["verified"])
 
-    def test_texture_names_drive_retrieval_and_memory_short_circuits(self) -> None:
-        tokens, evidence = texture_name_tokens(["Texture2D 812 T_Crow_Body_D", "T_Crow_Body_N", "SceneDepth", "white"])
-        self.assertIn("crow_body", tokens)
-        self.assertFalse([item for item in evidence if item["texture"] == "white"][0]["used"])
-        features = {"stage": "fragment", "boundTextureNames": ["Texture2D 812 T_Crow_Body_D", "T_Crow_Body_N"],
+    def test_user_words_and_folders_drive_retrieval_and_memory_short_circuits(self) -> None:
+        # Names are reported, never interpreted: no prefix/suffix table decides
+        # that "_D" means diffuse or that "white" is not worth looking at.
+        evidence = bound_texture_names(["Texture2D 812 T_Crow_Body_D", "T_Crow_Body_N", "SceneDepth", "white"])
+        self.assertEqual([item["name"] for item in evidence],
+                         ["T_Crow_Body_D", "T_Crow_Body_N", "SceneDepth", "white"])
+        # Capture-side texture names are not evidence: alone they find nothing.
+        names_only = retrieve(self.catalog, {"stage": "fragment",
+                                             "boundTextureNames": ["Texture2D 812 T_Crow_Body_D", "T_Crow_Body_N"]},
+                              top_k=3)
+        self.assertEqual(names_only["candidates"], [])
+        self.assertFalse(names_only["signals"]["boundTextures"]["usedForRanking"])
+        # The reader's own words do.
+        features = {"stage": "fragment", "extraTokens": ["crow", "feather"],
                     "passHint": "basepass", "meshHint": "skeletal", "textureSlotCount": 2}
         result = retrieve(self.catalog, features, top_k=3)
         self.assertEqual(result["candidates"][0]["relativePath"], "Game/Content/Art/Materials/M_CrowFeather.uasset")
-        self.assertEqual(result["decisionHint"], "clear leader")
+        self.assertNotEqual(result["decisionHint"], "clear leader")
+        self.assertEqual(result["candidates"][0]["identityStatus"], "unresolved")
         leader = result["candidates"][0]
         self.assertIn("crow", leader["matchedTokens"])
         self.assertTrue(all(check["agrees"] for check in leader["consistency"]), leader["consistency"])
         self.assertIn("TBasePassPSFNoLightMapPolicy", leader["document"]["shaderTypes"])
         self.assertNotIn("M_Rock", [c["relativePath"] for c in result["candidates"][:1]])
+        # Folder-first, no words at all: every parsed material in the chosen
+        # folder is a candidate and content agreement ranks them; the rock
+        # material stays in the list (lower), never dropped for disagreeing.
+        scoped = retrieve(self.catalog, {"stage": "fragment", "passHint": "basepass", "meshHint": "skeletal",
+                                         "textureSlotCount": 2}, top_k=5,
+                          scope_prefixes=["Game/Content/Art/Materials"])
+        paths = [c["relativePath"] for c in scoped["candidates"]]
+        self.assertEqual(paths[0], "Game/Content/Art/Materials/M_CrowFeather.uasset", scoped)
+        self.assertIn("Game/Content/Art/Materials/M_Rock.uasset", paths)
+        self.assertTrue(scoped["candidates"][0]["fromScope"])
+        self.assertGreater(scoped["candidates"][0]["adjustedScore"], scoped["candidates"][-1]["adjustedScore"])
         empty = retrieve(self.catalog, {"stage": "fragment", "boundTextureNames": ["white"]}, top_k=3)
         self.assertEqual(empty["candidates"], [])
         store = ShaderAssetResolutionStore(Path(self.temporary.name) / "resolutions.sqlite3")
@@ -216,7 +241,7 @@ if __name__ == "__main__":
 
 
 class ValueMatchingTests(RetrievalTests):
-    def test_shared_complex_values_identify_the_material_without_texture_names(self) -> None:
+    def test_shared_complex_values_find_a_candidate_without_claiming_identity(self) -> None:
         # No usable texture names at all: only the cbuffer lanes speak.
         lanes = [{"bind": 2, "space": 0, "lane": 4, "value": 12.354754},
                  {"bind": 2, "space": 0, "lane": 5, "value": 0.7318211},
@@ -232,18 +257,111 @@ class ValueMatchingTests(RetrievalTests):
         self.assertEqual(values["rareMatchedCount"], 3)
         self.assertTrue(values["adjacentRuns"], values)
         self.assertGreaterEqual(values["adjacentRuns"][0]["consecutiveLanes"], 3)
-        self.assertGreaterEqual(leader["confidence"], 0.9)
+        self.assertLessEqual(leader["confidence"], 0.65)
+        self.assertFalse(leader["physicalIdentityVerified"])
+        self.assertEqual(leader["identityStatus"], "unresolved")
         self.assertIn("adjacent run", leader["why"])
         self.assertIn("b2:s0 lane 4", values["laneRefs"]["12.35475"])
         # A single popular/round value is not evidence.
         weak = retrieve(self.catalog, {"stage": "fragment", "boundTextureNames": ["white"],
                                        "constantBufferLanes": [{"bind": 0, "space": 0, "lane": 0, "value": 0.5}]}, top_k=3)
         self.assertEqual(weak["candidates"], [])
-        # Values lift a name match that textures alone left uncertain.
-        mixed = retrieve(self.catalog, {"stage": "fragment", "boundTextureNames": ["T_Crow_Body_D"],
+        # Values lift a word match that the word alone left uncertain.
+        mixed = retrieve(self.catalog, {"stage": "fragment", "extraTokens": ["crow"],
                                         "constantBufferLanes": lanes[:1]}, top_k=3)
         self.assertEqual(mixed["candidates"][0]["relativePath"], "Game/Content/Art/Materials/M_CrowFeather.uasset")
         self.assertEqual(mixed["candidates"][0]["facets"]["values"]["matched"], ["12.35475"])
+
+    def test_complete_directory_with_sparse_content_reports_each_missing_channel(self) -> None:
+        lanes = [{"bind": 5, "space": 0, "lane": i, "value": v}
+                 for i, v in enumerate([12.354754, 0.7318211, 3.1415927])]
+        actual_coverage = self.catalog.coverage()
+        # The failed real task had a finished walk over 702124 entries but only
+        # 62 numeric index rows and no decoded asset textures.
+        with mock.patch.object(self.catalog, "coverage", return_value={
+                **actual_coverage, "indexCoverage": "complete", "deferredCount": 702116,
+                "valueIndexRows": 62, "thumbnailRows": 0}):
+            result = retrieve(self.catalog, {"stage": "fragment", "constantBufferLanes": lanes,
+                                             "textureSlotCount": 19,
+                                             "drawGeometry": {"available": True, "indexCount": 79485}})
+        leader = result["candidates"][0]
+        self.assertTrue(leader["valueEvidence"]["matchedValues"])
+        self.assertLessEqual(leader["confidence"], 0.65)
+        self.assertNotEqual(result["decisionHint"], "clear leader")
+        self.assertNotIn("texture-count-plausible", [c["signal"] for c in leader["consistency"]])
+        coverage = result["evidenceCoverage"]
+        self.assertEqual(coverage["directoryScan"]["status"], "complete")
+        self.assertEqual(coverage["directoryScan"]["deferredFiles"], 702116)
+        self.assertEqual(coverage["numeric"]["status"], "indexed-subset")
+        self.assertEqual(coverage["numeric"]["indexedRows"], 62)
+        self.assertFalse(coverage["numeric"]["absenceProven"])
+        self.assertEqual(coverage["texture"]["status"], "unavailable")
+        self.assertTrue(coverage["mesh"]["captureGeometryAvailable"])
+        self.assertEqual(coverage["mesh"]["status"], "not-compared")
+        self.assertEqual(leader["evidenceChannels"]["texture"], "no-indexed-support")
+        self.assertFalse(result["policy"]["automaticNamePublication"])
+
+    def test_one_distinctive_value_remains_a_search_candidate(self) -> None:
+        result = retrieve(self.catalog, {"constantBufferLanes": [
+            {"bind": 5, "space": 0, "lane": 20, "value": 12.354754}]})
+        self.assertTrue(result["candidates"])
+        self.assertEqual(result["candidates"][0]["valueEvidence"]["matchedCount"], 1)
+        self.assertLessEqual(result["bestConfidence"], 0.65)
+
+
+class NumericEvidenceBoundaryTests(unittest.TestCase):
+    def test_run_cannot_join_different_blocks_or_disjoint_lanes(self) -> None:
+        catalog = mock.Mock()
+        keys = ["12.35475", "0.7318211", "3.141593"]
+        catalog.search_values.return_value = {"indexCoverage": "complete",
+            "keyPopularity": dict.fromkeys(keys, 1), "candidates": [{
+                "relativePath": "M_A.uexp", "matchedValues": keys,
+                "numericRuns": [{"offset": 8, "values": keys}]}]}
+        for block in (1, 5):
+            with self.subTest(second_block=block):
+                lanes = [
+                    {"bind": 1, "space": 0, "lane": 1, "value": 12.354754},
+                    {"bind": 1, "space": 0, "lane": 2, "value": 0.7318211},
+                    {"bind": block, "space": 0, "lane": 20, "value": 0.7318211},
+                    {"bind": block, "space": 0, "lane": 21, "value": 3.1415927},
+                ]
+                result = value_evidence(catalog, lanes)["M_A.uasset"]
+                self.assertEqual(result["adjacentRuns"][0]["consecutiveLanes"], 2)
+                self.assertLessEqual(result["confidence"], 0.65)
+                self.assertFalse(result["physicalIdentityVerified"])
+
+    def test_view_values_do_not_strengthen_material_block_and_common_values_are_not_scanned(self) -> None:
+        catalog = mock.Mock()
+        keys = ["0.001953125", "0.0078125", "0.03125", "0.06301", "0.401978"]
+        candidate = {"relativePath": "MI_Body.uexp", "matchedValues": keys,
+                     "numericRuns": [{"offset": 4385, "values": ["0.401978", "0.06301"]}]}
+        catalog.search_values.return_value = {"indexCoverage": "complete",
+            "keyPopularity": dict.fromkeys(keys, 2), "candidates": [candidate]}
+        lanes = [{"bind": 1, "space": 0, "lane": i * 10, "value": float(key)}
+                 for i, key in enumerate(keys[:3])]
+        lanes += [{"bind": 5, "space": 0, "lane": i + 221, "value": v}
+                  for i, v in enumerate([0.401978, 0.06301, 1.0, 0.0, 1.0, 0.5])]
+        diagnostics = {}
+        result = value_evidence(catalog, lanes, diagnostics=diagnostics)["MI_Body.uasset"]
+        self.assertEqual([b["matchedCount"] for b in result["blocks"]], [3, 2])
+        self.assertEqual(result["adjacentRuns"][0]["block"], "b5:s0")
+        self.assertLessEqual(result["confidence"], 0.65)
+        query = catalog.search_values.call_args.args[0]
+        self.assertFalse({"1", "0", "0.5"} & set(query))
+        self.assertEqual(diagnostics["commonValueNeighborhoods"], "not-provided")
+        self.assertEqual(diagnostics["popularityScope"], "indexed-assets-only")
+
+    def test_duplicate_header_export_run_is_one_observation(self) -> None:
+        catalog = mock.Mock()
+        keys = ["0.401978", "0.06301"]
+        catalog.search_values.return_value = {"keyPopularity": dict.fromkeys(keys, 2),
+            "candidates": [{"relativePath": "MI_Body" + suffix, "matchedValues": keys,
+                            "numericRuns": [{"offset": 12, "values": keys}]}
+                           for suffix in (".uasset", ".uexp")]}
+        result = value_evidence(catalog, [
+            {"bind": 5, "space": 0, "lane": i, "value": float(key)}
+            for i, key in enumerate(keys)])["MI_Body.uasset"]
+        self.assertEqual(len(result["adjacentRuns"]), 1)
 
 
 class MemberRuleTests(unittest.TestCase):
@@ -269,6 +387,147 @@ class MemberRuleTests(unittest.TestCase):
             rules = store.member_rules("g@1", ["Mat/M_Parent.uasset"])
             self.assertEqual([f["name"] for f in rules["0:2"]], ["BaseColor", "Cutoff"])
             self.assertEqual(store.member_rules("other", ["Mat/M_Parent.uasset"]), {})
+
+    def test_family_rules_follow_verified_abi_shape_across_api_slots(self) -> None:
+        source_block = {
+            "name": "PerMaterial",
+            "space": 0,
+            "bind": 1,
+            "byteSize": 48,
+            "fields": [
+                {"name": "_0", "byteOffset": 0, "byteSize": 16,
+                 "baseType": "VarType.Float", "rows": 1, "columns": 4},
+                {"name": "_1", "byteOffset": 32, "byteSize": 4,
+                 "baseType": "VarType.Float", "rows": 1, "columns": 1},
+            ],
+        }
+        shape = abi_block_shape_sha256(source_block)
+        self.assertRegex(shape, r"^[0-9a-f]{64}$")
+        members = [
+            {"space": 0, "bind": 1, "byteOffset": 0, "byteSize": 16,
+             "name": "BaseColor", "baseType": "float", "columns": 4,
+             "semanticBlock": "PerMaterial", "blockByteSize": 48,
+             "abiShapeSha256": shape},
+            {"space": 0, "bind": 1, "byteOffset": 32, "byteSize": 4,
+             "name": "Roughness", "baseType": "float", "columns": 1,
+             "semanticBlock": "PerMaterial", "blockByteSize": 48,
+             "abiShapeSha256": shape},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ShaderAssetResolutionStore(Path(temporary) / "r.sqlite3")
+            store.record_member_rules(
+                game_key="g@1", family_keys=["Mat/M_Surface.uasset"],
+                members=members, source="host-asset-rename", confidence=0.95,
+                shader_raw_sha256="a" * 64,
+            )
+            # These are representative binding models, not assumptions about a
+            # fixed register: DX11, DX12, OpenGL and Vulkan all project the same
+            # reflected physical block to their own current slot.
+            for api, space, bind in (
+                ("DX11", 0, 5), ("DX12", 2, 9),
+                ("OpenGL", 0, 12), ("Vulkan", 3, 4),
+            ):
+                target = {
+                    **source_block,
+                    "name": "generated_%s" % api,
+                    "space": space,
+                    "bind": bind,
+                    "fields": [
+                        {**field, "name": "anonymous%d" % index}
+                        for index, field in enumerate(source_block["fields"])
+                    ],
+                }
+                with self.subTest(api=api):
+                    projected = store.member_rules(
+                        "g@1", ["Mat/M_Surface.uasset"],
+                        constant_blocks=[target],
+                    )
+                    key = "%d:%d" % (space, bind)
+                    self.assertEqual(
+                        [row["name"] for row in projected[key]],
+                        ["BaseColor", "Roughness"],
+                    )
+                    self.assertEqual(
+                        projected[key][0]["mappedFrom"], {"space": 0, "bind": 1}
+                    )
+
+            ambiguous = [
+                {**source_block, "name": "generatedA", "space": 4, "bind": 1},
+                {**source_block, "name": "generatedB", "space": 4, "bind": 2},
+            ]
+            self.assertEqual(store.member_rules(
+                "g@1", ["Mat/M_Surface.uasset"], constant_blocks=ambiguous
+            ), {})
+
+    def test_workspace_layout_provider_injects_the_current_variant_slot(self) -> None:
+        source_block = {
+            "name": "PerMaterial", "space": 0, "bind": 1, "byteSize": 16,
+            "fields": [{
+                "name": "anonymous", "byteOffset": 0, "byteSize": 16,
+                "baseType": "float", "rows": 1, "columns": 4,
+            }],
+        }
+        shape = abi_block_shape_sha256(source_block)
+        target = {
+            **source_block, "name": "_Globals", "space": 7, "bind": 23,
+        }
+        authority = {
+            "assetVersionSha256": "5" * 64,
+            "assetResolutionHmacSha256": "6" * 64,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            store = ShaderAssetResolutionStore(Path(temporary) / "r.sqlite3")
+            store.record_member_rules(
+                game_key="g@1", family_keys=["Mat/M_Surface.uasset"],
+                members=[{
+                    "space": 0, "bind": 1, "byteOffset": 0, "byteSize": 16,
+                    "name": "BaseColor", "baseType": "float", "columns": 4,
+                    "semanticBlock": "PerMaterial", "blockByteSize": 16,
+                    "abiShapeSha256": shape,
+                }],
+                source="host-asset-rename", confidence=0.95,
+                family_authorities={"Mat/M_Surface.uasset": authority},
+                proof_signer=server._seal_member_rule_proof,
+            )
+            memory = {
+                "store": store, "gameKey": "g@1",
+                "familyKeys": ["Mat/M_Surface.uasset"],
+                "familyAuthorities": {"Mat/M_Surface.uasset": authority},
+            }
+            manifest = {
+                "capture": {"captureId": "capture"},
+                "shader": {"resourceId": 7},
+                "stage": "fragment", "entryPoint": "MainPS",
+                "baseline": {
+                    "rawSha256": "a" * 64,
+                    "compiledInterface": {"constantBlocks": [target]},
+                },
+            }
+            with mock.patch.object(server, "_shader_asset_memory", return_value=memory):
+                hint = server._workspace_asset_layout_provider(manifest)
+            self.assertIsNotNone(hint)
+            self.assertNotIn("0:1", hint["blocks"])
+            self.assertEqual(
+                hint["blocks"]["7:23"]["fields"][0]["name"], "BaseColor"
+            )
+
+            # The project SQLite row is not authority by itself.  A forged or copied
+            # family receipt cannot be projected through the production provider.
+            memory["familyAuthorities"]["Mat/M_Surface.uasset"] = {
+                **authority, "assetResolutionHmacSha256": "7" * 64,
+            }
+            with mock.patch.object(server, "_shader_asset_memory", return_value=memory):
+                self.assertIsNone(server._workspace_asset_layout_provider(manifest))
+                exact_slot_manifest = {
+                    **manifest,
+                    "baseline": {
+                        **manifest["baseline"],
+                        "compiledInterface": {"constantBlocks": [source_block]},
+                    },
+                }
+                self.assertIsNone(
+                    server._workspace_asset_layout_provider(exact_slot_manifest)
+                )
 
 
 class GenericEngineTests(unittest.TestCase):
@@ -297,7 +556,7 @@ class GenericEngineTests(unittest.TestCase):
             self.assertIn("12.35475", material["metadata"]["numericValues"])
             targets = sorted(item["targetPath"] for item in material["relationships"] if item["relation"] == "mentions-asset")
             self.assertEqual(targets, ["textures/T_Crow_Body_D.png", "textures/T_Crow_Body_N.tex"])
-            retrieval = retrieve(catalog, {"stage": "fragment", "boundTextureNames": ["T_Crow_Body_D"],
+            retrieval = retrieve(catalog, {"stage": "fragment", "extraTokens": ["crow", "body"],
                                            "constantBufferLanes": [
                                                {"bind": 0, "space": 0, "lane": 0, "value": 12.354754},
                                                {"bind": 0, "space": 0, "lane": 1, "value": 0.7318211}]}, top_k=3)

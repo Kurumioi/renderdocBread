@@ -24,6 +24,7 @@ from .abi import (
     ShaderAbi,
     build_candidate_reflection_request,
     parse_shader_abi,
+    same_physical_shader_abi,
     validate_candidate_reflection_response,
 )
 from .adapters.dxil_access_signature import (
@@ -67,6 +68,7 @@ from .errors import (
 from .route_memory import ROUTE_MEMORY_SCHEMA, ShaderRouteMemory, dxil_route_features, feature_signature, route_key
 from .io import atomic_write_bytes, atomic_write_json, is_within, read_json_object
 from .flow_graph import load_workspace_flow_graph_status
+from .compile_source_unit import capture_compilation_unit, current_dependencies, execution_context, validate_snapshot, write_snapshot
 from .leases import WorkspaceSourceTransactionLease
 from .profiles import extract_target_profile
 from .representations import (
@@ -376,46 +378,157 @@ def _lock_for(path: Path) -> threading.RLock:
 
 
 class _WorkspaceFileLock:
-    """Cross-process fail-closed lock with exact token ownership.
+    """Hold an OS lock, with an exclusive marker for older Host processes.
 
-    A crashed owner intentionally leaves the lock behind. This class never
-    guesses that a lock is stale; a user must inspect/remove it explicitly.
+    The OS releases ownership when a process exits. Only markers created by
+    this protocol may then be recovered while holding that same OS lock. A
+    legacy token has no verifiable owner and remains busy instead of being
+    stolen from a potentially active older writer.
     """
 
-    def __init__(self, root: Path):
+    _SCHEMA = "bread-workspace-operation-lock/v2"
+
+    def __init__(self, root: Path, *, wait_seconds: float = 2.0):
         self.path = root / ".workspace-operation.lock"
+        self.os_path = root / ".workspace-operation.oslock"
         self.token = uuid.uuid4().hex
+        self.wait_seconds = max(0.0, float(wait_seconds))
         self._owned = False
+        self._descriptor: int | None = None
+
+    @staticmethod
+    def _try_os_lock(descriptor: int) -> None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _unlock_os(descriptor: int) -> None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+    def _marker(self) -> dict[str, Any] | None:
+        try:
+            if self.path.is_symlink() or self.path.stat().st_size > 4096:
+                return None
+            value = json.loads(self.path.read_text(encoding="ascii"))
+        except (OSError, ValueError, UnicodeError):
+            return None
+        if (not isinstance(value, dict) or value.get("schema") != self._SCHEMA
+                or re.fullmatch(r"[0-9a-f]{32}", str(value.get("token", ""))) is None
+                or type(value.get("pid")) is not int or value["pid"] <= 0):
+            return None
+        return value
 
     def __enter__(self):
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if self.os_path.is_symlink():
+            raise ManifestValidationError("workspace OS lock path is redirected")
+        descriptor = os.open(self.os_path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.set_inheritable(descriptor, False)
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"\0")
+        deadline = time.monotonic() + self.wait_seconds
         try:
-            descriptor = os.open(self.path, flags, 0o600)
-        except FileExistsError as exc:
-            raise ManifestValidationError(
-                "workspace is locked by another process; the lock is never "
-                "assumed stale: %s" % self.path
-            ) from exc
-        try:
-            payload = (self.token + "\n").encode("ascii")
-            os.write(descriptor, payload)
-            os.fsync(descriptor)
+            while True:
+                try:
+                    self._try_os_lock(descriptor)
+                    break
+                except OSError as error:
+                    if error.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise ManifestValidationError(
+                            "workspace is busy with another process; retry after its operation completes"
+                        ) from error
+                    time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            self._descriptor = descriptor
+            if self.path.exists():
+                if self._marker() is None:
+                    raise ManifestValidationError(
+                        "workspace is locked by another process or an unverifiable legacy owner; "
+                        "a legacy token is never assumed stale: %s" % self.path
+                    )
+                # A v2 owner must hold this OS lock throughout its operation.
+                # Ownership is now ours, so its residual marker cannot be live.
+                self.path.unlink()
+            temporary = self.path.with_name(self.path.name + "." + self.token + ".tmp")
+            try:
+                with temporary.open("xb") as marker_file:
+                    marker_file.write(json.dumps({
+                        "schema": self._SCHEMA, "token": self.token, "pid": os.getpid(),
+                    }, sort_keys=True).encode("ascii"))
+                    marker_file.flush()
+                    os.fsync(marker_file.fileno())
+                # Publish complete bytes with create-only semantics. An older
+                # token writer racing here wins instead of being overwritten.
+                os.link(temporary, self.path)
+            except FileExistsError as error:
+                raise ManifestValidationError("workspace is locked by another process") from error
+            finally:
+                temporary.unlink(missing_ok=True)
             self._owned = True
-        finally:
+        except BaseException:
             os.close(descriptor)
+            self._descriptor = None
+            raise
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if not self._owned:
-            return False
         try:
-            if self.path.read_text(encoding="ascii") == self.token + "\n":
-                self.path.unlink()
-        except OSError:
-            # Losing/removing somebody else's lock would be less safe than
-            # leaving our own token for explicit inspection.
-            pass
+            if self._owned:
+                try:
+                    marker = self._marker()
+                    if marker is not None and marker["token"] == self.token:
+                        self.path.unlink()
+                except OSError:
+                    pass
+        finally:
+            if self._descriptor is not None:
+                try:
+                    self._unlock_os(self._descriptor)
+                finally:
+                    os.close(self._descriptor)
+                    self._descriptor = None
+            self._owned = False
         return False
+
+
+def _workspace_operation_locked(root: Path) -> bool:
+    """Observe active ownership without treating a crashed v2 marker as busy.
+
+    Unknown legacy markers remain protected. Probing the OS lock neither
+    creates lock files nor modifies another operation's marker.
+    """
+    lock = _WorkspaceFileLock(root, wait_seconds=0)
+    if lock.path.is_symlink() or lock.os_path.is_symlink():
+        return True
+    legacy_marker = lock.path.exists() and lock._marker() is None
+    try:
+        descriptor = os.open(lock.os_path, os.O_RDWR)
+    except FileNotFoundError:
+        return legacy_marker
+    except OSError:
+        return True
+    try:
+        try:
+            lock._try_os_lock(descriptor)
+        except OSError:
+            return True
+        try:
+            return legacy_marker
+        finally:
+            lock._unlock_os(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _utc_now() -> str:
@@ -478,13 +591,8 @@ def _source_bytes(path: Path) -> bytes:
 
 
 def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while True:
-            chunk = stream.read(1024 * 1024)
-            if not chunk:
-                return digest.hexdigest()
-            digest.update(chunk)
+    from ..file_content_cache import digest_file
+    return digest_file(path)
 
 
 def _catalog_file_sha256(catalog_path: str | Path) -> tuple[Path, str]:
@@ -562,6 +670,19 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _public_recovery_plan(value: Any) -> Any:
+    """Expose legacy plan facts without its retired agent instructions.
+
+    The stored plan and its digest remain intact for existing workspaces.
+    """
+    if not isinstance(value, Mapping):
+        return value
+    public = dict(value)
+    public.pop("allowedActions", None)
+    public.pop("aiPolicy", None)
+    return public
+
+
 def _physical_target_profile(
     blob: bytes,
     stage: str,
@@ -572,6 +693,9 @@ def _physical_target_profile(
 
     if shader_format in {"dxbc", "dxil"}:
         return extract_target_profile(blob, stage).as_dict()
+    if shader_format == "glsl":
+        from .native_glsl import profile
+        return profile(stage, capture_api)
     if shader_format not in {"spirv", "opengl-spirv"}:
         raise ToolchainRoutingError(
             "no physical target-profile adapter is registered for %s" % shader_format
@@ -831,6 +955,7 @@ class ShaderWorkspaceService:
         *,
         asset_layout_provider: Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None = None,
         route_memory_provider: Callable[[], Any] | None = None,
+        native_compile_provider: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     ):
         self.registry = ToolRegistry(tool_config_path)
         # Optional project route memory (``route_memory.ShaderRouteMemory`` or
@@ -838,6 +963,9 @@ class ShaderWorkspaceService:
         # lane that worked for this game's shaders runs first; it never adds
         # routes, tools or arguments.
         self._route_memory_provider = route_memory_provider
+        self._native_compile_provider = native_compile_provider
+        self._manual_compile_cache: OrderedDict[tuple, dict] = OrderedDict()
+        self._manual_compile_cache_lock = threading.RLock()
         # Optional retriever: given a workspace manifest, return an
         # ``renderdoc-ultra-asset-cbuffer-layout-hint/v1`` for the captured
         # shader (or None).  It only ever adds names/completeness to the fixed
@@ -1195,9 +1323,10 @@ class ShaderWorkspaceService:
         toolchain_selection: Mapping[str, Any] | None = None,
         editable_format: str = "",
         allow_reconstructed: bool = True,
+        probe_route_features: bool = False,
         _expected_creation_identity: Mapping[str, Any] | None = None,
     ) -> dict:
-        """Create a new workspace from one physically verified catalog blob."""
+        """Bind one verified catalog blob without executing route probes by default."""
 
         canonical_catalog, catalog_sha256 = _catalog_file_sha256(catalog_path)
         selected = load_selected_shader(canonical_catalog, shader_key)
@@ -1260,6 +1389,11 @@ class ShaderWorkspaceService:
                     "workspace HLSL compiler must consume {target_profile}; fixed or "
                     "stage-guessed profiles can change the captured shader ABI"
                 )
+        elif original_format == "glsl":
+            from .native_glsl import plan as native_source_plan
+            if selected.key.entry_point != "main" or requested_editable_format != "glsl":
+                raise ToolchainRoutingError("captured OpenGL GLSL requires its main entry and GLSL source")
+            route_plan = native_source_plan(selected.key.stage)
         else:
             catalog = self._catalog_for_create(toolchain_catalog)
             if toolchain_selection is None:
@@ -1302,7 +1436,6 @@ class ShaderWorkspaceService:
                     "schemaVersion": 1,
                     "mode": mode_value,
                     "diagnostics": list(chosen.get("diagnostics", [])),
-                    "allowedActions": list(chosen.get("allowedActions", [])),
                     "decompileCandidates": list(
                         chosen.get("decompileCandidates", [])
                     ),
@@ -1310,7 +1443,6 @@ class ShaderWorkspaceService:
                     "configuredButUnavailable": dict(
                         chosen.get("configuredButUnavailable", {})
                     ),
-                    "aiPolicy": dict(chosen.get("aiPolicy", {})),
                     "sourceConstructionEligible": bool(plan["compile"]),
                     "assetSourceSeedEligibleAfterVerification": bool(
                         plan["compile"]
@@ -1402,6 +1534,15 @@ class ShaderWorkspaceService:
                 "source": None,
                 "history": [],
             }
+            if original_format == "glsl":
+                atomic_write_bytes(staging / "source" / "shader.glsl", selected.blob)
+                manifest["source"] = {
+                    "path": "source/shader.glsl", "sha256": selected.key.raw_sha256,
+                    "encoding": "utf-8", "lane": "executable-editable",
+                    "origin": "captured-native-source", "entryPoint": "main",
+                    "baselineRawSha256": selected.key.raw_sha256,
+                    "compileEligible": True, "semanticEquivalenceVerified": False,
+                }
             if (
                 _expected_creation_identity is not None
                 and _workspace_creation_identity(manifest)
@@ -1411,7 +1552,7 @@ class ShaderWorkspaceService:
                     "recovery attempt resolved a different capture/shader identity"
                 )
             atomic_write_json(staging / "manifest.json", manifest)
-            if memory_eligible and route_plan is not None and selection is not None:
+            if probe_route_features and memory_eligible and route_plan is not None and selection is not None:
                 # Physical-IR features (for DXIL: dynamically indexed cbuffers)
                 # decide which decompiler lane can work at all.  Probe them on
                 # the staged baseline, then let known incompatibilities and the
@@ -1485,16 +1626,26 @@ class ShaderWorkspaceService:
         with WorkspaceSourceTransactionLease(root), _lock_for(root), _WorkspaceFileLock(root):
             manifest = self._load_manifest(root)
             before = self.status(root)
-            if manifest.get("source") is not None or _source_path(root, manifest).exists():
+            from .native_glsl import is_native
+            destination = _source_path(root, manifest)
+            pristine_native = (is_native(manifest)
+                and (manifest.get("source") or {}).get("origin") == "captured-native-source"
+                and manifest.get("latestCompiled") is None
+                and destination.is_file() and not destination.is_symlink()
+                and _file_sha256(destination) == manifest["baseline"]["rawSha256"])
+            original_source = destination.read_bytes() if pristine_native else None
+            if not pristine_native and (manifest.get("source") is not None or destination.exists()):
                 raise ToolExecutionError("direct project import cannot overwrite existing source")
-            if _editable_format(manifest) != "hlsl" or not manifest.get("routePlan", {}).get("compile"):
-                raise ToolchainRoutingError("project source import requires a fixed HLSL compiler route")
+            language = _editable_format(manifest)
+            if language not in {"hlsl", "glsl"} or not (
+                    is_native(manifest) or manifest.get("routePlan", {}).get("compile")):
+                raise ToolchainRoutingError("project source import requires a fixed HLSL or GLSL compiler route")
             if not isinstance(bundle, Mapping) or not isinstance(bundle.get("projectPath"), str):
                 raise ToolExecutionError("verified project source bundle is invalid")
             verified = ReplayProjectService(bundle["projectPath"]).prepare_workspace_source(
                 str(bundle.get("knowledgeId", "")), before
             )
-            if dict(bundle) != verified:
+            if dict(bundle) != verified or verified.get("sourceFormat", "hlsl") != language:
                 raise ToolExecutionError("project source head or destination changed before import")
             payload = verified["sourceText"].encode("utf-8")
             destination = _source_path(root, manifest)
@@ -1502,7 +1653,7 @@ class ShaderWorkspaceService:
             if inputs.is_symlink() or (inputs.exists() and not inputs.is_dir()):
                 raise ToolExecutionError("project source input directory is redirected")
             inputs.mkdir(exist_ok=True)
-            input_path = inputs / ("project-%s.hlsl" % verified["sourceSha256"])
+            input_path = inputs / ("project-%s.%s" % (verified["sourceSha256"], language))
             if input_path.exists() or input_path.is_symlink():
                 raise ToolExecutionError("project source immutable input already exists")
             receipt = source_receipt(verified, _relative(root, input_path))
@@ -1518,6 +1669,8 @@ class ShaderWorkspaceService:
             try:
                 atomic_write_bytes(input_path, payload)
                 validate_project_source(root, manifest, source_record)
+                if pristine_native and destination.read_bytes() != original_source:
+                    raise ToolExecutionError("captured GLSL source changed during project import")
                 atomic_write_bytes(destination, payload)
                 manifest["source"] = source_record
                 self._append_history(root, manifest, {
@@ -1527,10 +1680,24 @@ class ShaderWorkspaceService:
                 })
             except Exception:
                 _restore_manifest_transaction(root, manifest, manifest_before, bytes_before)
-                destination.unlink(missing_ok=True)
+                if original_source is None:
+                    destination.unlink(missing_ok=True)
+                elif destination.exists() and destination.read_bytes() == payload:
+                    atomic_write_bytes(destination, original_source)
                 input_path.unlink(missing_ok=True)
                 raise
+            overview_restored = False
+            try:
+                from .semantic_overview_storage import restore_overview
+                overview_restored = restore_overview(Path(verified["projectPath"]), root,
+                    verified["originalRawSha256"], verified["sourceSha256"],
+                    origin_workspace=Path(verified["originWorkspacePath"]) if verified.get("originWorkspacePath") else None,
+                    origin_workspace_id=verified.get("originWorkspaceId"))
+            except (ValueError, OSError):
+                # Optional navigation data cannot invalidate the saved Shader.
+                pass
             return {"workspacePath": str(root), "sourcePath": str(destination),
+                    "semanticOverviewRestored": overview_restored,
                     **receipt, "decompileInvoked": False, "compiled": False}
 
     def create_recovery_attempt(
@@ -2328,11 +2495,24 @@ class ShaderWorkspaceService:
         elif origin == "verified-project-source":
             from .project_source import validate_project_source
             validate_project_source(root, manifest, source_record)
+        elif origin == "captured-native-source":
+            from .native_glsl import validate_plan
+            validate_plan(manifest)
+            if tracked_hash != manifest["baseline"]["rawSha256"] or source_record.get("entryPoint") != "main":
+                raise ManifestValidationError("captured GLSL source origin changed")
         else:
             raise ToolchainRoutingError(
                 "workspace source origin is not eligible for routed migration"
             )
         return tracked_path, source, source_record
+
+    def convert_to_hlsl(self, source_workspace_path: str | Path, workspace_path: str | Path = "", *,
+                        expected_source_sha256: str, host_instance_id: str | None = None) -> dict:
+        """Compile current GLSL into a separate HLSL authoring workspace."""
+        from .authoring import convert_to_hlsl
+        return convert_to_hlsl(self, source_workspace_path, workspace_path,
+                               expected_source_sha256=expected_source_sha256,
+                               host_instance_id=host_instance_id)
 
     def migrate_toolchain(
         self,
@@ -2980,6 +3160,7 @@ class ShaderWorkspaceService:
         baseline_path: Path,
         history: dict,
         entry_point: str | None = None,
+        source_unit: Mapping[str, Any] | None = None,
     ) -> tuple[bytes, list[dict[str, Any]], str]:
         plan = manifest.get("routePlan")
         if not isinstance(plan, Mapping):
@@ -3005,7 +3186,14 @@ class ShaderWorkspaceService:
             job_dir.mkdir(parents=False, exist_ok=False)
             input_path = job_dir / ("input" + _FORMAT_SUFFIX[input_format])
             output_path = job_dir / ("output" + _FORMAT_SUFFIX[output_format])
-            atomic_write_bytes(input_path, current)
+            dependencies = None
+            if index == 0 and source_unit is not None:
+                dependencies = write_snapshot(root, input_path, source_unit)
+                if dependencies is not None:
+                    history["sourceDependencies"] = dependencies
+                current = input_path.read_bytes()
+            else:
+                atomic_write_bytes(input_path, current)
             input_detection = detect_shader_format(current, input_format)
             values = self._template_values(
                 root,
@@ -3023,7 +3211,9 @@ class ShaderWorkspaceService:
                 )
             values["entry_point"] = hop_entry_point
             values["captured_entry_point"] = str(manifest["entryPoint"])
-            result = run_operation(operation, values, job_dir)
+            result = run_operation(operation, values, job_dir,
+                                   **(execution_context(root, source_unit, dependencies)
+                                      if source_unit is not None and index == 0 else {}))
             record = self._history_entry(root, operation, result, revision)
             record.update(
                 {
@@ -3901,7 +4091,7 @@ class ShaderWorkspaceService:
         }
 
     def _validated_compiled_container(
-        self, compiled: bytes, manifest: Mapping[str, Any], label: str
+        self, compiled: bytes, manifest: Mapping[str, Any], label: str, *, artifact_format: str = ""
     ):
         plan = manifest.get("routePlan")
         expected_format = (
@@ -3909,8 +4099,10 @@ class ShaderWorkspaceService:
             if isinstance(plan, Mapping)
             else str(manifest.get("targetProfile", {}).get("containerFormat", ""))
         )
+        from .native_glsl import candidate_allowed
+        native_glsl = artifact_format == "glsl" and candidate_allowed(manifest, "GLSL")
         container = fingerprint_shader_executable(
-            compiled, label, format_hint=expected_format or None
+            compiled, label, format_hint="glsl" if native_glsl else expected_format or None
         )
         baseline_kind = manifest.get("baseline", {}).get("kind")
         if container is None or container.byte_size != len(compiled):
@@ -3922,7 +4114,7 @@ class ShaderWorkspaceService:
                     else "structurally valid executable for the captured shader format"
                 )
             )
-        if container.kind != baseline_kind:
+        if container.kind != baseline_kind and not native_glsl:
             raise ToolExecutionError(
                 "compile route changed the captured container format from %s to %s"
                 % (baseline_kind, container.kind)
@@ -3941,7 +4133,7 @@ class ShaderWorkspaceService:
                 "compiled target profile cannot be read from executable bytes: %s"
                 % exc
             ) from exc
-        if physical_profile != manifest.get("targetProfile"):
+        if physical_profile != manifest.get("targetProfile") and not native_glsl:
             raise ToolExecutionError(
                 "compiled executable target profile differs from the captured "
                 "physical target profile"
@@ -3949,10 +4141,13 @@ class ShaderWorkspaceService:
         return container
 
     def _compile_route_chain(
-        self, root: Path, manifest: dict, source: bytes
+        self, root: Path, manifest: dict, source: bytes,
+        source_unit: Mapping[str, Any] | None = None,
+        *, manual_fast: bool = False,
     ) -> dict:
-        self._require_native_spirv_validator_lane(manifest, "compile")
-        self._ensure_dedicated_baseline_dxil_disassembly(root, manifest)
+        if not manual_fast:
+            self._require_native_spirv_validator_lane(manifest, "compile")
+            self._ensure_dedicated_baseline_dxil_disassembly(root, manifest)
         # Baseline refresh above is an independently committed transaction.
         # Everything after this snapshot belongs to exactly one candidate
         # revision and must either publish together or leave the previous
@@ -3973,7 +4168,7 @@ class ShaderWorkspaceService:
             "hops": [],
         }
         try:
-            validator_bindings = self._validator_bindings(manifest)
+            validator_bindings = [] if manual_fast else self._validator_bindings(manifest)
             baseline_validator_jobs: list[dict[str, Any]] = []
             if validator_bindings:
                 baseline_validator_jobs = self._run_bound_validators(
@@ -4004,7 +4199,10 @@ class ShaderWorkspaceService:
                 baseline_path,
                 history,
                 entry_point=source_entry_point,
+                source_unit=source_unit,
             )
+            validate_snapshot(root, _source_path(root, manifest), source,
+                              history.get("sourceDependencies"))
             container = self._validated_compiled_container(
                 compiled, manifest, "workspace routed compiler output"
             )
@@ -4025,7 +4223,7 @@ class ShaderWorkspaceService:
                 raise ManifestValidationError(
                     "revision artifact already exists: %s" % revision_dir
                 )
-            if self._needs_dedicated_dxil_disassembly_evidence(manifest):
+            if not manual_fast and self._needs_dedicated_dxil_disassembly_evidence(manifest):
                 self._attempt_dedicated_dxil_disassembly(
                     root,
                     manifest,
@@ -4084,6 +4282,11 @@ class ShaderWorkspaceService:
             if validator_bindings:
                 candidate["baselineValidatorJobs"] = baseline_validator_jobs
                 candidate["validatorJobs"] = validator_jobs
+            if history.get("sourceDependencies") is not None:
+                candidate["sourceDependencies"] = history["sourceDependencies"]
+            if manual_fast:
+                from .manual_compile import mark_candidate
+                mark_candidate(candidate)
             history.update(
                 {
                     "status": "succeeded",
@@ -4142,6 +4345,8 @@ class ShaderWorkspaceService:
             "revision": next_revision,
             "sourceSha256": source_hash,
             "candidateBlobPath": str(revision_blob),
+            **({"sourceDependencies": candidate["sourceDependencies"]}
+               if "sourceDependencies" in candidate else {}),
             "rawSha256": compiled_hash,
             "codeSha256": container.code_sha256,
             "kind": container.kind,
@@ -4154,9 +4359,109 @@ class ShaderWorkspaceService:
             "baselineValidatorJobs": baseline_validator_jobs,
             "validatorJobs": validator_jobs,
             "lastGoodRevision": manifest["lastGood"]["revision"],
-            "requiresReplayAbiValidation": True,
+            "requiresReplayAbiValidation": not manual_fast,
             "replayAbiValidated": False,
+            "manualFastCompile": manual_fast,
         }
+
+    def decompile_reference(self, workspace_path: str | Path) -> dict:
+        """Reconstruct the captured binary without replacing any working source.
+
+        This is reference text, not an executable publication. In particular it
+        does not run a compiler, change a revision, or invalidate a good current
+        candidate. Identical bound inputs reuse the verified reference output.
+        """
+        root = self._workspace_root(workspace_path)
+        with _lock_for(root), _WorkspaceFileLock(root):
+            manifest = self._load_manifest(root)
+            from .native_glsl import is_native, reference
+            if is_native(manifest):
+                return reference(self, root, manifest)
+            baseline = self._artifact(root, manifest["baseline"]["path"])
+            baseline_sha = manifest["baseline"]["rawSha256"]
+            if _file_sha256(baseline) != baseline_sha:
+                raise ManifestValidationError("captured baseline bytes changed")
+            plan = manifest.get("routePlan")
+            if plan is not None:
+                if not plan.get("decompile"):
+                    raise ToolchainRoutingError("workspace has no executable decompile route")
+                operations = [self._bound_route_operation(hop) for hop in plan["decompile"]]
+                binding = plan
+                operation = None
+            else:
+                operation = self._bound_operation(manifest, "decompiler", "decompile")
+                operations = [operation]
+                binding = manifest["tools"]["decompiler"]
+            key = hashlib.sha256(json.dumps({
+                "baseline": baseline_sha, "binding": binding,
+                "stage": manifest["stage"], "entry": manifest["entryPoint"],
+            }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+            def response(record: dict, reused: bool) -> dict:
+                reference = self._artifact(root, record["outputPath"])
+                source = _source_path(root, manifest)
+                return {
+                    "workspacePath": str(root), "referenceOnly": True,
+                    "sourcePath": str(reference),
+                    "relativePath": record["outputPath"],
+                    "sourceSha256": record["outputSha256"],
+                    "baselinePath": str(baseline), "baselineRawSha256": baseline_sha,
+                    "sourceFormat": _editable_format(manifest),
+                    "entryPoint": record.get("sourceEntryPoint", manifest["entryPoint"]),
+                    "reusedReference": reused, "decompilerExecuted": not reused,
+                    "matchesCurrentSource": source.is_file()
+                    and _file_sha256(source) == record["outputSha256"],
+                    "currentSourcePreserved": True, "revision": manifest["revision"],
+                    "compileEligible": False, "applyEligible": False,
+                    "semanticEquivalenceVerified": False,
+                    "nextAction": "Read the reference and use useful reconstruction in the organization proposal; compile/ABI validation happens at delivery.",
+                }
+
+            for previous in reversed(manifest.get("history", [])):
+                if (previous.get("operation") == "decompile-reference"
+                        and previous.get("referenceKey") == key
+                        and previous.get("status") == "succeeded"):
+                    try:
+                        raw = _source_bytes(self._artifact(root, previous["outputPath"]))
+                    except (OSError, KeyError, ShaderWorkspaceError):
+                        continue
+                    if hashlib.sha256(raw).hexdigest() == previous["outputSha256"]:
+                        for bound in operations:
+                            integrity = self.registry.operation_integrity(bound.tool_id, bound.operation)
+                            if not integrity["available"]:
+                                raise ToolConfigurationError(integrity["integrityError"])
+                        return response(previous, True)
+            revision = int(manifest["revision"])
+            history = {"operation": "decompile-reference", "referenceKey": key,
+                       "revision": revision, "baselineRawSha256": baseline_sha,
+                       "referenceOnly": True, "hops": []}
+            try:
+                if plan is not None:
+                    raw, hops, entry = self._run_route_chain(
+                        root, manifest, "decompile", revision,
+                        baseline.read_bytes(), baseline, history)
+                    output = self._artifact(root, hops[-1]["outputPath"])
+                else:
+                    job = self._new_job_path(root, "decompile-reference", revision)
+                    job.mkdir(parents=False, exist_ok=False)
+                    input_path, output = job / "input.bin", job / "decompiled.hlsl"
+                    atomic_write_bytes(input_path, baseline.read_bytes())
+                    values = self._template_values(
+                        root, manifest, revision, job, input_path, output, baseline)
+                    result = run_operation(operation, values, job)
+                    history["process"] = self._history_entry(root, operation, result, revision)
+                    self._require_process_success(result)
+                    self._require_job_output(job, output, "decompiler")
+                    raw, entry = _source_bytes(output), manifest["entryPoint"]
+                history.update(status="succeeded", outputPath=_relative(root, output),
+                               outputSha256=hashlib.sha256(raw).hexdigest(),
+                               sourceEntryPoint=entry)
+            except Exception as error:
+                history.update(status="failed", error=str(error))
+                self._append_history(root, manifest, history)
+                raise
+            self._append_history(root, manifest, history)
+            return response(history, False)
 
     def decompile(self, workspace_path: str | Path) -> dict:
         root = self._workspace_root(workspace_path)
@@ -4294,7 +4599,7 @@ class ShaderWorkspaceService:
                 and source.get("modifiedSinceDecompile") is False
                 and source.get("lane") == "executable-editable"
                 and source.get("origin")
-                in {"trusted-decompiler", "trusted-decompile-route"}
+                in {"trusted-decompiler", "trusted-decompile-route", "captured-native-source"}
                 and isinstance(source.get("currentSha256"), str)
                 and source.get("currentSha256") == source.get("decompiledSha256")
                 and representation.get("present") is True
@@ -4376,7 +4681,7 @@ class ShaderWorkspaceService:
                 diagnostics.append(
                     bounded_diagnostic(
                         "recovery-category:%s" % classified["category"],
-                        ", ".join(classified["allowedActions"]),
+                        classified["message"],
                     )
                 )
             else:
@@ -4531,11 +4836,73 @@ class ShaderWorkspaceService:
                 "requiresExplicitApplyAuthorization": True,
             }
 
-    def compile(self, workspace_path: str | Path) -> dict:
+    def compile_for_live_edit(self, workspace_path: str | Path) -> dict:
+        """Compile a user save without organization-only ABI/validator work."""
+        from .manual_compile import remember, reuse
+        root = self._workspace_root(workspace_path)
+        self.prepare_compile_binding(root)
+        with _lock_for(root), _WorkspaceFileLock(root):
+            previous_candidate_valid = True
+            try:
+                manifest = self._load_manifest(root, compile_only=True)
+            except (ManifestValidationError, ToolConfigurationError, ToolExecutionError, ToolchainRoutingError, OSError):
+                # A prior candidate is irrelevant to a fresh user compile.
+                # Verify its independent inputs and skip only cache reuse.
+                manifest = self._load_manifest(root, compile_only=True, validate_latest_candidate=False)
+                previous_candidate_valid = False
+            source_path = _source_path(root, manifest)
+            source = _source_bytes(source_path)
+            unit = capture_compilation_unit(source_path, source)
+            cached = reuse(self, root, manifest, source, unit) if previous_candidate_valid else None
+            if cached is not None:
+                return cached
+        from .compiler_contract import prefer_native
+        result = self.compile(workspace_path, manual_fast=True,
+                              prefer_native=prefer_native(self, manifest))
+        with _lock_for(root), _WorkspaceFileLock(root):
+            manifest = self._load_manifest(root, compile_only=True)
+            source_path = _source_path(root, manifest)
+            source = _source_bytes(source_path)
+            if hashlib.sha256(source).hexdigest() == result.get("sourceSha256"):
+                remember(self, root, manifest, capture_compilation_unit(source_path, source), result)
+        return result
+
+    def manual_candidate_apply_request(self, workspace_path: str | Path) -> dict:
+        """Bind exact saved bytes for manual apply without an ABI request or proof."""
+        from .manual_compile import apply_request
         root = self._workspace_root(workspace_path)
         with _lock_for(root), _WorkspaceFileLock(root):
+            return apply_request(self, root)
+
+    def compiler_contract(self, workspace_path, source_workspace_id, expected_original_sha256):
+        from .compiler_contract import project
+        root = self._workspace_root(workspace_path)
+        self.prepare_compile_binding(root, expected_workspace_id=source_workspace_id,
+                                     expected_original_sha256=expected_original_sha256)
+        with _lock_for(root), _WorkspaceFileLock(root):
+            manifest = self._load_manifest(root, compile_only=True, validate_latest_candidate=False)
+            if (manifest["workspaceId"] != source_workspace_id or
+                    manifest["baseline"]["rawSha256"] != expected_original_sha256 or
+                    (manifest.get("source") or {}).get("compileEligible") is not True):
+                raise ManifestValidationError("Shader compiler source/original identity changed")
+            return project(self, root, manifest)
+
+    def prepare_compile_binding(self, workspace_path, **identity):
+        """Repair a stale execution recipe once, without rewriting source."""
+        from .toolchain_refresh import prepare_compile_binding
+        return prepare_compile_binding(self, self._workspace_root(workspace_path), **identity)
+
+    def compile(self, workspace_path: str | Path, *, prefer_native: bool = True,
+                manual_fast: bool = False) -> dict:
+        if not isinstance(prefer_native, bool):
+            raise ValueError("prefer_native must be a boolean")
+        if not isinstance(manual_fast, bool):
+            raise ValueError("manual_fast must be a boolean")
+        root = self._workspace_root(workspace_path)
+        self.prepare_compile_binding(root)
+        with _lock_for(root), _WorkspaceFileLock(root):
             try:
-                manifest = self._load_manifest(root)
+                manifest = self._load_manifest(root, compile_only=True, validate_latest_candidate=False)
             except ManifestValidationError as exc:
                 manifest = self._load_manifest_recovering_interrupted_compile(
                     root, exc
@@ -4555,8 +4922,27 @@ class ShaderWorkspaceService:
             if not is_within(root, source_path.resolve()):
                 raise ToolExecutionError("shader source escapes the workspace")
             source = _source_bytes(source_path)
+            source_unit = capture_compilation_unit(source_path, source)
+            # Cross-compiled Vulkan HLSL has an explicit position-w convention
+            # and sparse locations. Its pinned route is part of that contract;
+            # a generic native HLSL compiler may silently choose different flags.
+            route_plan = manifest.get("routePlan") or {}
+            vulkan_hlsl = (route_plan.get("inputFormat") == "spirv"
+                           and route_plan.get("editableFormat") == "hlsl")
+            if prefer_native and self._native_compile_provider is not None and not vulkan_hlsl:
+                from .native_compile import compile_current
+                native_result = compile_current(self, root, manifest, source, source_unit,
+                                                manual_fast=manual_fast)
+                if native_result is not None:
+                    return native_result
+            from .native_glsl import is_native
+            if is_native(manifest):
+                raise ToolExecutionError(
+                    "OpenGL GLSL requires the current replay's native compiler; "
+                    "inspect native-attempt diagnostics and repair the source or reconnect its capture")
             if manifest.get("routePlan") is not None:
-                return self._compile_route_chain(root, manifest, source)
+                return self._compile_route_chain(root, manifest, source, source_unit,
+                                                 manual_fast=manual_fast)
             operation = self._bound_operation(manifest, "compiler", "compile")
             manifest_before, manifest_bytes_before = _manifest_transaction_snapshot(
                 root, manifest
@@ -4585,7 +4971,7 @@ class ShaderWorkspaceService:
             input_path = job_dir / "input.hlsl"
             output_path = job_dir / "compiled.bin"
             baseline_path = self._artifact(root, manifest["baseline"]["path"])
-            atomic_write_bytes(input_path, source)
+            source_dependencies = write_snapshot(root, input_path, source_unit)
             atomic_write_bytes(job_dir / "baseline.bin", baseline_path.read_bytes())
             job_baseline = job_dir / "baseline.bin"
             values = self._template_values(
@@ -4597,10 +4983,12 @@ class ShaderWorkspaceService:
                 output_path,
                 job_baseline,
             )
-            result = run_operation(operation, values, job_dir)
+            result = run_operation(operation, values, job_dir,
+                                   **execution_context(root, source_unit, source_dependencies))
             history = self._history_entry(root, operation, result, next_revision)
             try:
                 self._require_process_success(result)
+                validate_snapshot(root, source_path, source, source_dependencies)
                 self._require_job_output(job_dir, output_path, "compiler")
                 output_size = output_path.stat().st_size
                 if output_size <= 0:
@@ -4645,6 +5033,8 @@ class ShaderWorkspaceService:
                     "codeSha256": container.code_sha256,
                     "byteSize": len(compiled),
                     "kind": container.kind,
+                    **({"sourceDependencies": source_dependencies}
+                       if source_dependencies is not None else {}),
                     "toolId": operation.tool_id,
                     "toolConfigDigest": operation.config_digest,
                     "executableSha256": operation.executable_sha256,
@@ -4661,6 +5051,9 @@ class ShaderWorkspaceService:
                         ),
                     },
                 }
+                if manual_fast:
+                    from .manual_compile import mark_candidate
+                    mark_candidate(candidate)
                 history.update(
                     {
                         "status": "succeeded",
@@ -4687,6 +5080,8 @@ class ShaderWorkspaceService:
                 "workspacePath": str(root),
                 "revision": next_revision,
                 "sourceSha256": candidate["sourceSha256"],
+                **({"sourceDependencies": source_dependencies}
+                   if source_dependencies is not None else {}),
                 "candidateBlobPath": str(revision_blob),
                 "rawSha256": candidate["rawSha256"],
                 "codeSha256": candidate["codeSha256"],
@@ -4695,9 +5090,18 @@ class ShaderWorkspaceService:
                 "stdoutPath": str(result.stdout_path),
                 "stderrPath": str(result.stderr_path),
                 "lastGoodRevision": manifest["lastGood"]["revision"],
-                "requiresReplayAbiValidation": True,
+                "requiresReplayAbiValidation": not manual_fast,
                 "replayAbiValidated": False,
+                "manualFastCompile": manual_fast,
             }
+
+    def compile_diagnostic_candidate(
+        self, workspace_path: str | Path, source_text: str,
+        expected_source_sha256: str, label: str = "",
+    ) -> dict[str, Any]:
+        """Retain an isolated trial blob without source/revision publication."""
+        from .diagnostic_candidate import compile_trial
+        return compile_trial(self, workspace_path, source_text, expected_source_sha256, label)
 
     def compile_check(
         self, workspace_path: str | Path, text: str
@@ -4743,7 +5147,7 @@ class ShaderWorkspaceService:
             # the executable-editable source lane may be compiled at all; other
             # lanes must be promoted first, exactly as in compile().
             try:
-                manifest = self._load_manifest(root)
+                manifest = self._load_manifest(root, compile_only=True, validate_latest_candidate=False)
             except ManifestValidationError as exc:
                 manifest = self._load_manifest_recovering_interrupted_compile(
                     root, exc
@@ -4759,6 +5163,12 @@ class ShaderWorkspaceService:
                     "ok": None,
                     "reason": "workspace source lane is not compile-eligible",
                 }
+            from .native_glsl import is_native, check_source
+            if is_native(manifest):
+                try:
+                    return check_source(self, root, manifest, source)
+                except Exception as error:
+                    return {"ok": None, "reason": str(error)[:512]}
 
             # Every job this check creates lives under root/jobs. Snapshot the
             # directory so the exact set created here can be removed afterwards
@@ -4790,6 +5200,7 @@ class ShaderWorkspaceService:
             try:
                 # Stage 3 — run the compiler over the buffer, on whichever lane
                 # this workspace uses, without publishing anything.
+                source_unit = capture_compilation_unit(_source_path(root, manifest), source)
                 compile_error: BaseException | None = None
                 compiled_ok = False
                 direct_job_dir: Path | None = None
@@ -4810,6 +5221,7 @@ class ShaderWorkspaceService:
                             baseline_path,
                             {"operation": "live-check", "hops": []},
                             entry_point=source_entry_point,
+                            source_unit=source_unit,
                         )
                         compiled_ok = True
                     except Exception as exc:  # compile failure or tool fault
@@ -4820,7 +5232,7 @@ class ShaderWorkspaceService:
                     direct_job_dir.mkdir(parents=True, exist_ok=False)
                     input_path = direct_job_dir / "input.hlsl"
                     output_path = direct_job_dir / "compiled.bin"
-                    atomic_write_bytes(input_path, source)
+                    source_dependencies = write_snapshot(root, input_path, source_unit)
                     atomic_write_bytes(
                         direct_job_dir / "baseline.bin", baseline_path.read_bytes()
                     )
@@ -4833,7 +5245,8 @@ class ShaderWorkspaceService:
                         output_path,
                         direct_job_dir / "baseline.bin",
                     )
-                    result = run_operation(operation, values, direct_job_dir)
+                    result = run_operation(operation, values, direct_job_dir,
+                                           **execution_context(root, source_unit, source_dependencies))
                     if result.launch_error or result.timed_out:
                         return {
                             "ok": None,
@@ -4914,14 +5327,11 @@ class ShaderWorkspaceService:
                     file_value = str(diagnostic.get("file", "") or "")
                     base_name = file_value.replace("\\", "/").rsplit("/", 1)[-1].strip().lower()
                     local = base_name in text_inputs
-                    if not local:
-                        try:
-                            resolved = Path(file_value).resolve()
-                            local = (is_within(jobs_root, resolved)
-                                     and resolved.suffix.lower() in
-                                     {".hlsl", ".glsl", ".slang", ".frag", ".vert", ".comp"})
-                        except (OSError, ValueError):
-                            local = False
+                    # Frozen includes also live under jobs, and may use .hlsl
+                    # rather than .hlsli. Their line numbers belong to another
+                    # document, never to the edited main buffer.
+                    if "/source-input/" in file_value.replace("\\", "/"):
+                        local = False
                     if local:
                         entry = dict(diagnostic)
                         entry["file"] = "<workspace>"
@@ -4963,15 +5373,17 @@ class ShaderWorkspaceService:
         physical target profile, then publishes a *new* target-workspace
         revision.  Old capture IDs, ResourceIds, replacement handles, ABI
         reports, and apply authorization are deliberately not accepted.  The
-        resulting candidate must still pass fresh replay reflection against
-        this workspace's captured baseline before it can be applied.
+        Strict candidates require fresh replay reflection. Explicit manual
+        edits retain their source/binary provenance without claiming ABI proof.
         """
 
+        manual = isinstance(candidate_plan, Mapping) and candidate_plan.get("manualEdit") is True
         root = self._workspace_root(workspace_path)
         with _lock_for(root), _WorkspaceFileLock(root):
             manifest = self._load_manifest(root)
-            self._require_native_spirv_validator_lane(manifest, "compile")
-            if self._validator_bindings(manifest):
+            if not manual:
+                self._require_native_spirv_validator_lane(manifest, "compile")
+            if not manual and self._validator_bindings(manifest):
                 raise ToolExecutionError(
                     "a strict native SPIR-V workspace cannot import a project "
                     "candidate without freshly running its bound spirv-val"
@@ -5012,6 +5424,26 @@ class ShaderWorkspaceService:
                 "oldReplacementIdReused",
                 "oldCaptureAbiAuthorityReused",
             }
+            if manual:
+                required_fields.update(("manualEdit", "validationScope", "manualApplyReceipt"))
+                from ..project_manual_shader import receipt_identity
+                provenance = receipt_identity(candidate_plan.get("manualApplyReceipt"))
+                if (candidate_plan.get("validationScope") != "manual-edit-unvalidated"
+                        or provenance["originalRawSha256"] != manifest["baseline"]["rawSha256"]
+                        or provenance["candidateRawSha256"] != candidate_plan.get("sha256")
+                        or provenance["sourceSha256"] != source_hash
+                        or provenance["sourceRevision"] != candidate_plan.get("sourceRevision")
+                        or provenance["stage"] != manifest["stage"]
+                        or provenance["entryPoint"] != manifest.get("entryPoint", "")
+                        or provenance["targetProfile"] != manifest.get("targetProfile")):
+                    raise ToolExecutionError("manual project candidate original/source binding differs")
+            if capture_compilation_unit(source_path, source)["digest"]:
+                # The portable v1 binary cache binds only the main source SHA.
+                # It cannot stand in for a current include graph; the caller's
+                # ordinary compile fallback produces a fully bound local job.
+                raise ToolExecutionError(
+                    "project compiled candidate has no include dependency binding; "
+                    "compile the current source unit")
             if not isinstance(candidate_plan, Mapping) or set(candidate_plan) != required_fields:
                 raise ToolExecutionError(
                     "project compiled candidate receipt is incomplete or unsupported"
@@ -5052,10 +5484,10 @@ class ShaderWorkspaceService:
                 or candidate_plan.get("candidateOnly") is not True
                 or candidate_plan.get("contentAddressed") is not True
                 or candidate_plan.get("integrityVerified") is not True
-                or candidate_plan.get("originValidationEvidenceOnly") is not True
+                or candidate_plan.get("originValidationEvidenceOnly") is not (not manual)
                 or candidate_plan.get("applyAuthorization") is not False
                 or candidate_plan.get("freshCaptureRebindRequired") is not True
-                or candidate_plan.get("freshLiveAbiRevalidationRequired") is not True
+                or candidate_plan.get("freshLiveAbiRevalidationRequired") is not (not manual)
                 or candidate_plan.get("oldReplacementIdReused") is not False
                 or candidate_plan.get("oldCaptureAbiAuthorityReused") is not False
             ):
@@ -5093,9 +5525,20 @@ class ShaderWorkspaceService:
                 raise ToolExecutionError(
                     "project compiled candidate artifact/hash mismatch"
                 )
-            container = self._validated_compiled_container(
-                compiled, manifest, "project compiled candidate"
-            )
+            if manual:
+                from types import SimpleNamespace
+                container = SimpleNamespace(kind=candidate_plan["kind"],
+                                            code_sha256=candidate_plan["codeSha256"])
+            else:
+                container = self._validated_compiled_container(
+                    compiled, manifest, "project compiled candidate",
+                    artifact_format="glsl" if candidate_plan.get("kind") == "GLSL" else "",
+                )
+            if container.kind == "GLSL":
+                from .native_glsl import compiler_binding
+                if (compiled != source or candidate_plan.get("compilerBindingSha256")
+                        != compiler_binding(manifest)["bindingSha256"]):
+                    raise ToolExecutionError("native GLSL project source/compiler binding mismatch")
             if (
                 container.code_sha256 != candidate_plan.get("codeSha256")
                 or container.kind != candidate_plan.get("kind")
@@ -5104,7 +5547,8 @@ class ShaderWorkspaceService:
                     "project compiled candidate executable fingerprint mismatch"
                 )
 
-            self._ensure_dedicated_baseline_dxil_disassembly(root, manifest)
+            if not manual:
+                self._ensure_dedicated_baseline_dxil_disassembly(root, manifest)
             # Baseline refresh is an independent committed transaction.  From
             # this point the imported revision is atomic, just like a compile.
             manifest_before_candidate = deepcopy(manifest)
@@ -5126,13 +5570,16 @@ class ShaderWorkspaceService:
                 "compilerBindingSha256": candidate_plan[
                     "compilerBindingSha256"
                 ],
-                "originValidationEvidenceOnly": True,
+                "originValidationEvidenceOnly": not manual,
                 "freshCaptureRebindRequired": True,
-                "freshLiveAbiRevalidationRequired": True,
+                "freshLiveAbiRevalidationRequired": not manual,
                 "applyAuthorization": False,
                 "oldReplacementIdReused": False,
                 "oldCaptureAbiAuthorityReused": False,
             }
+            if manual:
+                receipt.update(manualEdit=True, validationScope="manual-edit-unvalidated",
+                               manualApplyReceipt=deepcopy(provenance))
             history = {
                 "operation": "project-candidate-import",
                 "revision": next_revision,
@@ -5150,7 +5597,7 @@ class ShaderWorkspaceService:
                     raise ManifestValidationError(
                         "revision artifact already exists: %s" % revision_dir
                     )
-                if self._needs_dedicated_dxil_disassembly_evidence(manifest):
+                if not manual and self._needs_dedicated_dxil_disassembly_evidence(manifest):
                     self._attempt_dedicated_dxil_disassembly(
                         root,
                         manifest,
@@ -5198,6 +5645,11 @@ class ShaderWorkspaceService:
                         "baselineAbiSha256": manifest["baseline"].get("abiSha256"),
                     },
                 }
+                if manual:
+                    imported_candidate.update(validationScope="manual-edit-unvalidated",
+                        requiresReplayAbiValidation=False,
+                        abiGate={"status": "skipped-manual-edit",
+                                 "baselineAbiSha256": manifest["baseline"].get("abiSha256")})
                 history.update(
                     {"status": "succeeded", "candidate": imported_candidate}
                 )
@@ -5234,7 +5686,7 @@ class ShaderWorkspaceService:
                 "projectImport": receipt,
                 "compilerSkipped": True,
                 "compiledFromProjectArtifact": True,
-                "requiresReplayAbiValidation": True,
+                "requiresReplayAbiValidation": not manual,
                 "replayAbiValidated": False,
                 "abiCompatible": False,
                 "applied": False,
@@ -5248,6 +5700,25 @@ class ShaderWorkspaceService:
         """Backward-compatible name for :meth:`hydrate_project_candidate`."""
 
         return self.hydrate_project_candidate(workspace_path, candidate_plan)
+
+    def baseline_reflection_request(self, workspace_path: str | Path) -> dict:
+        """Describe a temporary reflection of the exact captured binary."""
+        from .baseline_reflection_recovery import reflection_request
+        root = self._workspace_root(workspace_path)
+        with _lock_for(root), _WorkspaceFileLock(root):
+            manifest = self._load_manifest(root)
+            if manifest["baseline"].get("abiStatus") != ABI_STATUS_UNAVAILABLE:
+                raise AbiValidationError("the baseline already has captured reflection")
+            return reflection_request(self, root, manifest)
+
+    def recover_baseline_reflection(self, workspace_path: str | Path,
+                                    request: Mapping[str, Any],
+                                    response: Mapping[str, Any]) -> dict:
+        """Restore absent metadata without rewriting source or applying a Shader."""
+        from .baseline_reflection_recovery import recover
+        root = self._workspace_root(workspace_path)
+        with _lock_for(root), _WorkspaceFileLock(root):
+            return recover(self, root, self._load_manifest(root), request, response)
 
     def candidate_reflection_request(self, workspace_path: str | Path) -> dict:
         """Return the exact current-candidate request for the RenderDoc bridge.
@@ -5325,10 +5796,11 @@ class ShaderWorkspaceService:
                 and isinstance(existing_gate, dict)
                 and existing_gate.get("status") == "compatible"
             ):
-                # Apply must obtain fresh replay reflection every time, but it
-                # need not rewrite the immutable first-success audit report.
-                # The response above was fully revalidated before reaching
-                # this idempotent branch.
+                # An explicit reflection need not rewrite the immutable
+                # first-success audit report. The response above was fully
+                # revalidated before this idempotent branch. Host apply may
+                # reuse its exact in-process validation in the same capture
+                # session; this persisted gate alone grants no such reuse.
                 result["abiReportPath"] = str(
                     self._artifact(root, existing_gate.get("reportPath"))
                 )
@@ -5500,6 +5972,9 @@ class ShaderWorkspaceService:
     ) -> dict[str, Any] | None:
         """Expose the exact compile profile/flags as non-authoritative evidence."""
 
+        from .native_glsl import is_native, candidate_allowed, compiler_binding
+        if is_native(manifest) or candidate_allowed(manifest, (manifest.get("latestCompiled") or {}).get("kind")):
+            return compiler_binding(manifest)
         plan = manifest.get("routePlan")
         hops: list[dict[str, Any]] = []
         if isinstance(plan, Mapping):
@@ -6076,13 +6551,247 @@ class ShaderWorkspaceService:
             )
         return dict(claimed)
 
-    def status(self, workspace_path: str | Path) -> dict:
+    def reopen_candidate_for_project_restore(
+        self,
+        workspace_path: str | Path,
+        *,
+        expected_capture_id: str,
+        expected_resource_id: int,
+        expected_stage: str,
+        expected_entry_point: str,
+        expected_original_raw_sha256: str,
+        expected_source_sha256: str,
+    ) -> bool:
+        """Keep a matched project source when an old ABI receipt cannot rebind.
+
+        This never grants apply authority.  The old manifest and ABI report are
+        archived, while the same compiled bytes become pending fresh replay
+        reflection.  Only the exact historical compatible-report disagreement
+        may enter this path; other workspace validation failures stay fatal.
+        """
+
+        root = self._workspace_root(workspace_path)
+        with _lock_for(root), _WorkspaceFileLock(root):
+            try:
+                self._load_manifest(root)
+                return False
+            except ManifestValidationError as exc:
+                if not str(exc).startswith(
+                    "candidate ABI report does not prove exact compatibility"
+                ):
+                    raise
+            manifest = self._load_manifest(
+                root,
+                validate_latest_candidate=False,
+                allow_interrupted_candidate_recovery=True,
+            )
+            shader = manifest.get("shader")
+            capture = manifest.get("capture")
+            if (
+                not isinstance(shader, Mapping)
+                or not isinstance(capture, Mapping)
+                or capture.get("captureId") != expected_capture_id
+                or shader.get("resourceId") != expected_resource_id
+                or shader.get("stage") != expected_stage
+                or shader.get("entryPoint") != expected_entry_point
+                or shader.get("rawSha256") != expected_original_raw_sha256
+            ):
+                raise ManifestValidationError(
+                    "project restore candidate recovery changed Shader identity"
+                )
+            if manifest.get("source", {}).get("origin") not in {
+                "trusted-decompile-route",
+                "verified-project-source",
+                "captured-native-source",
+            }:
+                raise ManifestValidationError(
+                    "project restore candidate recovery requires provenance-verified source"
+                )
+            _, source, _ = self._source_for_toolchain_migration(root, manifest)
+            candidate = manifest.get("latestCompiled")
+            current_source_sha256 = hashlib.sha256(source).hexdigest()
+            if (
+                not isinstance(expected_source_sha256, str)
+                or len(expected_source_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in expected_source_sha256)
+                or not isinstance(candidate, dict)
+                or candidate.get("replayAbiValidated") is not True
+                or candidate.get("abiCompatible") is not True
+                or not isinstance(candidate.get("abiGate"), dict)
+                or candidate["abiGate"].get("status") != "compatible"
+            ):
+                raise ManifestValidationError(
+                    "project restore candidate recovery source target or ABI state is invalid"
+                )
+            baseline_abi = self._manifest_baseline_abi(manifest)
+            if baseline_abi is None or _initial_abi_gate_status(manifest) != "pending-replay-reflection":
+                raise ManifestValidationError(
+                    "project restore candidate recovery has no fresh ABI validation route"
+                )
+            original_gate = deepcopy(candidate["abiGate"])
+            old_report = self._artifact(root, original_gate.get("reportPath"))
+            old_report_bytes = old_report.read_bytes()
+            if hashlib.sha256(old_report_bytes).hexdigest() != original_gate.get(
+                "reportSha256"
+            ):
+                raise ManifestValidationError("candidate ABI report hash mismatch")
+            reopened = deepcopy(manifest)
+            pending = reopened["latestCompiled"]
+            pending.update(
+                validationScope="container-structure-only",
+                requiresReplayAbiValidation=True,
+                replayAbiValidated=False,
+                abiCompatible=False,
+                semanticEquivalenceVerified=False,
+                abiGate={
+                    "status": "pending-replay-reflection",
+                    "baselineAbiSha256": baseline_abi.sha256,
+                },
+            )
+            reopened.pop("lastAbiAttempt", None)
+            # Prove the candidate bytes and the complete compile route still
+            # bind before recording a source-preserving recovery.
+            self._validate_latest_candidate(
+                root, reopened, int(reopened["revision"]), baseline_abi
+            )
+            manifest_path = root / "manifest.json"
+            old_manifest_bytes = manifest_path.read_bytes()
+            archive = root / "candidate-evidence-archives" / uuid.uuid4().hex
+            archive.mkdir(parents=True, exist_ok=False)
+            atomic_write_bytes(archive / "manifest.json", old_manifest_bytes)
+            atomic_write_bytes(archive / "abi-report.json", old_report_bytes)
+            reopened["history"].append(
+                {
+                    "operation": "project-restore-candidate-abi-revalidation",
+                    "revision": reopened["revision"],
+                    "status": "pending-fresh-replay-reflection",
+                    "requestedProjectSourceSha256": expected_source_sha256,
+                    "currentSourceSha256": current_source_sha256,
+                    "previousCandidateSourceSha256": pending["sourceSha256"],
+                    "candidateRawSha256": pending["rawSha256"],
+                    "previousManifestPath": _relative(root, archive / "manifest.json"),
+                    "previousManifestSha256": hashlib.sha256(old_manifest_bytes).hexdigest(),
+                    "previousAbiReportPath": _relative(root, archive / "abi-report.json"),
+                    "previousAbiReportSha256": hashlib.sha256(old_report_bytes).hexdigest(),
+                }
+            )
+            reopened["updatedAt"] = _utc_now()
+            if manifest_path.read_bytes() != old_manifest_bytes:
+                raise ManifestValidationError(
+                    "workspace manifest changed during candidate recovery"
+                )
+            _write_manifest_with_retry(manifest_path, reopened)
+            return True
+
+    def source_edit_status(self, workspace_path: str | Path) -> dict:
+        """Read local text identity without compiling or inspecting replay state.
+
+        Draft editing must remain possible with a stale compiler binding or a
+        missing previous candidate. This deliberately grants no compile/apply
+        authority; the final publication path still uses strict ``status``.
+        """
+        root = self._workspace_root(workspace_path)
+        try:
+            manifest = read_json_object(
+                root / "manifest.json", MAX_MANIFEST_BYTES, "workspace manifest"
+            )
+        except ValueError as exc:
+            raise ManifestValidationError(str(exc)) from exc
+        if (manifest.get("schema") != WORKSPACE_SCHEMA
+                or manifest.get("schemaVersion") != WORKSPACE_VERSION):
+            raise ManifestValidationError("unsupported workspace manifest schema/version")
+        revision = manifest.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ManifestValidationError("workspace revision is invalid")
+        baseline = manifest.get("baseline")
+        capture = manifest.get("capture")
+        if not isinstance(baseline, dict) or not isinstance(capture, dict):
+            raise ManifestValidationError("workspace baseline/capture is missing")
+        if not re.fullmatch(r"[0-9a-f]{32}", str(manifest.get("workspaceId", ""))):
+            raise ManifestValidationError("workspace identity is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(capture.get("captureId", ""))):
+            raise ManifestValidationError("workspace capture identity is invalid")
+        baseline_path = self._artifact(root, baseline.get("path"))
+        if not 0 < baseline_path.stat().st_size <= MAX_COMPILED_BYTES:
+            raise ManifestValidationError("workspace baseline size is invalid")
+        baseline_hash = _file_sha256(baseline_path)
+        if baseline_hash != baseline.get("rawSha256"):
+            raise ManifestValidationError("workspace baseline hash mismatch")
+        key = ShaderKey.from_value(manifest.get("shader"))
+        if (key.raw_sha256 != baseline_hash or manifest.get("stage") != key.stage
+                or manifest.get("entryPoint") != key.entry_point):
+            raise ManifestValidationError("workspace source shader identity mismatch")
+        source_record = manifest.get("source")
+        source_path = _source_path(root, manifest)
+        source = {
+            "present": False, "path": str(source_path),
+            "format": _editable_format(manifest), "currentSha256": None,
+            "decompiledSha256": None, "lane": None, "compileEligible": False,
+        }
+        if source_record is None:
+            if source_path.exists():
+                raise ManifestValidationError("untracked shader source exists in the workspace")
+        else:
+            if not isinstance(source_record, dict):
+                raise ManifestValidationError("workspace source metadata is invalid")
+            tracked = self._artifact(root, source_record.get("path"))
+            if tracked != source_path.resolve():
+                raise ManifestValidationError("workspace source path is invalid")
+            if (source_record.get("encoding") != "utf-8"
+                    or source_record.get("lane") != "executable-editable"
+                    or type(source_record.get("compileEligible")) is not bool
+                    or source_record.get("baselineRawSha256") != baseline_hash
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(source_record.get("sha256", "")))):
+                raise ManifestValidationError("workspace source metadata mismatch")
+            before = tracked.stat()
+            try:
+                raw = _source_bytes(tracked)
+            except ToolExecutionError as exc:
+                raise ManifestValidationError(str(exc)) from exc
+            after = tracked.stat()
+            if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                    != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+                raise ManifestValidationError("workspace source changed while reading")
+            source.update({
+                "present": True, "path": str(tracked),
+                "currentSha256": hashlib.sha256(raw).hexdigest(),
+                "decompiledSha256": source_record["sha256"],
+                "lane": "executable-editable",
+                "compileEligible": source_record["compileEligible"],
+                "origin": source_record.get("origin"),
+                "entryPoint": source_record.get("entryPoint") or key.entry_point,
+            })
+        return {
+            "schema": "renderdoc-ultra-shader-source-edit-status/v1",
+            "validationScope": "source-edit-only",
+            "workspacePath": str(root), "manifestPath": str(root / "manifest.json"),
+            "workspaceId": manifest["workspaceId"], "revision": revision,
+            "capture": deepcopy(capture), "shader": key.as_dict(),
+            "stage": key.stage, "entryPoint": key.entry_point,
+            "targetProfile": deepcopy(manifest.get("targetProfile")),
+            "baseline": deepcopy(baseline), "baselineInterfaceValidation": "deferred",
+            "source": source,
+            "representation": {
+                "present": source["present"], "lane": source["lane"],
+                "compileEligible": source["compileEligible"], "applyEligible": False,
+            },
+            "reconstructionFidelity": {}, "latestCompiled": None,
+            "requiresReplayAbiValidation": True, "replayAbiValidated": False,
+            "abiCompatible": False, "semanticEquivalenceVerified": False,
+            "applied": False,
+        }
+
+    def status(self, workspace_path: str | Path, *, _artifacts_only: bool = False) -> dict:
         """Validate and report a workspace without acquiring its operation lock."""
 
         root = self._workspace_root(workspace_path)
         try:
-            manifest = self._load_manifest(root)
+            manifest = self._load_manifest(root, allow_stale_route_bindings=_artifacts_only, compile_only=True)
         except (ManifestValidationError, ToolConfigurationError, ToolExecutionError, ToolchainRoutingError) as original_error:
+            if _artifacts_only:
+                # A read-only publication/status path must never repair files
+                # or resolve execution tools as a side effect of inspection.
+                raise
             from .toolchain_refresh import stale_toolchain_status
             try:
                 return stale_toolchain_status(self, root, original_error)
@@ -6098,8 +6807,9 @@ class ShaderWorkspaceService:
                 )
         # Status also verifies that the process-owned registry still resolves to
         # the exact tool definitions bound when this workspace was created.
-        if manifest.get("routePlan") is None:
-            self._bound_operation(manifest, "decompiler", "decompile")
+        if not _artifacts_only and manifest.get("routePlan") is None:
+            if not ((manifest.get("source") or {}).get("compileEligible") is True):
+                self._bound_operation(manifest, "decompiler", "decompile")
             self._bound_operation(manifest, "compiler", "compile")
 
         source_path = _source_path(root, manifest)
@@ -6169,6 +6879,7 @@ class ShaderWorkspaceService:
                 "toolchain-migration-preserved-source",
                 "toolchain-refreshed-source",
                 "verified-project-source",
+                "captured-native-source",
             }:
                 raise ManifestValidationError("workspace source origin is invalid")
             plan = manifest.get("routePlan")
@@ -6176,7 +6887,13 @@ class ShaderWorkspaceService:
             migration_record: Mapping[str, Any] | None = None
             refresh_record = None
             project_source_record = None
-            if origin == "trusted-decompile-route":
+            if origin == "captured-native-source":
+                from .native_glsl import validate_plan
+                validate_plan(manifest)
+                if (decompiled_hash != manifest["baseline"]["rawSha256"]
+                        or source_record.get("entryPoint") != "main"):
+                    raise ManifestValidationError("captured GLSL source provenance mismatch")
+            elif origin == "trusted-decompile-route":
                 if plan is None:
                     raise ManifestValidationError(
                         "routed source is missing its immutable route plan"
@@ -6349,7 +7066,9 @@ class ShaderWorkspaceService:
                     representation is None
                     or promotion.get("representationLane") != representation.get("lane")
                     or promotion.get("representationSha256") != representation.get("sha256")
-                    or promotion.get("reviewedSourceSha256") != current_hash
+                    # Promotion binds the immutable reviewed starting source.
+                    # Editor changes remain eligible for a fresh compile/ABI check.
+                    or promotion.get("reviewedSourceSha256") != decompiled_hash
                     or promotion.get("reviewedSourceSha256")
                     != hashlib.sha256(_source_bytes(reviewed_path)).hexdigest()
                     or promotion.get("semanticEquivalenceAcknowledgedUnverified") is not True
@@ -6391,11 +7110,32 @@ class ShaderWorkspaceService:
             )
             latest_result["applied"] = False
 
-        last_abi_attempt = self._current_rejected_abi_attempt(root, manifest)
+        dependencies = (current_dependencies(source_path, source, latest_result)
+                        if source_result["present"] else
+                        {"digest": "", "current": False, "documentCount": 0, "error": ""})
+        source_result["dependenciesDigest"] = dependencies["digest"]
+        source_result["dependencyDocumentCount"] = dependencies["documentCount"]
+        if dependencies["error"]:
+            source_result["dependencyError"] = dependencies["error"]
+
+        # The last rejected attempt is diagnostic evidence for the editor. A record
+        # that no longer re-verifies (an older comparison rule, a hand-edited
+        # report) is reported as unreadable instead of failing the whole status:
+        # nothing about the workspace's source, candidate or gate depends on it.
+        try:
+            last_abi_attempt = self._current_rejected_abi_attempt(root, manifest)
+        except ManifestValidationError as exc:
+            last_abi_attempt = {
+                "status": "unavailable",
+                "revision": (manifest.get("lastAbiAttempt") or {}).get("revision")
+                if isinstance(manifest.get("lastAbiAttempt"), Mapping) else None,
+                "error": "last ABI attempt evidence could not be re-verified: %s" % exc,
+            }
         current_matches_candidate = bool(
             source_result["present"]
             and latest_result
             and latest_result.get("sourceSha256") == source_result["currentSha256"]
+            and dependencies["current"]
         )
         abi_validation_status = (
             latest_result["abiGate"]["status"] if latest_result else "not-compiled"
@@ -6505,7 +7245,7 @@ class ShaderWorkspaceService:
         assembly_disassembly_artifacts = (
             self._project_assembly_disassembly_artifacts(root, manifest)
         )
-        if source_result["present"] and source_result["format"] == "hlsl":
+        if source_result["present"] and source_result["format"] in {"hlsl", "glsl"}:
             flow_graph = load_workspace_flow_graph_status(
                 root,
                 workspace_id=str(manifest.get("workspaceId", "") or ""),
@@ -6521,8 +7261,12 @@ class ShaderWorkspaceService:
                 "artifactPath": str(root / "ai" / "flow-graph.json"),
             }
 
+        from .source_language import organization_capabilities
         return {
             "schema": "renderdoc-ultra-shader-workspace-status/v1",
+            "organizationCapabilities": organization_capabilities(
+                str(source_result.get("format") or ""),
+                compile_eligible=source_result.get("compileEligible") is True),
             "workspacePath": str(root),
             "manifestPath": str(root / "manifest.json"),
             "workspaceId": manifest.get("workspaceId"),
@@ -6537,18 +7281,20 @@ class ShaderWorkspaceService:
             "compilerBinding": compiler_binding,
             "assemblyDisassemblyArtifacts": assembly_disassembly_artifacts,
             "flowGraph": flow_graph,
-            "recoveryPlan": manifest.get("recoveryPlan"),
+            "recoveryPlan": _public_recovery_plan(manifest.get("recoveryPlan")),
             "revision": manifest["revision"],
             "source": source_result,
             "representation": representation_result,
             "reconstructionFidelity": reconstruction_fidelity,
             "baseline": manifest["baseline"],
+            "baselineInterfaceRecovery": manifest.get("baselineInterfaceRecovery"),
             "lastGood": manifest["lastGood"],
             "latestCompiled": latest_result,
             "lastAbiAttempt": last_abi_attempt,
             "abiValidationStatus": abi_validation_status,
+            "sourceDependenciesCurrent": dependencies["current"],
             "historyCount": len(manifest["history"]),
-            "workspaceLocked": (root / ".workspace-operation.lock").exists(),
+            "workspaceLocked": _workspace_operation_locked(root),
             "requiresReplayAbiValidation": bool(
                 latest_result
                 and latest_result.get("requiresReplayAbiValidation") is True
@@ -6575,7 +7321,12 @@ class ShaderWorkspaceService:
         original_format: str,
         *,
         require_process_binding: bool = True,
+        compile_only: bool = False,
     ) -> None:
+        from .native_glsl import is_native, validate_plan
+        if is_native(manifest):
+            validate_plan(manifest)
+            return
         plan = manifest.get("routePlan")
         if plan is None:
             tools = manifest.get("tools")
@@ -6850,17 +7601,31 @@ class ShaderWorkspaceService:
                         raise ManifestValidationError(
                             "workspace route hop digest is invalid"
                         )
-                route = routes.get(route_id) if require_process_binding else None
-                if require_process_binding and (
-                    route is None or capability != route.as_dict()
-                ):
+                source_record = manifest.get("source") or {}
+                historical_source = (compile_only and name == "decompile" and
+                    isinstance(source_record, Mapping) and
+                    source_record.get("lane") == "executable-editable" and
+                    source_record.get("compileEligible") is True)
+                bind_live = require_process_binding and not historical_source
+                route = routes.get(route_id) if bind_live else None
+                current_capability = route.as_dict() if route is not None else None
+                capability_matches = capability == current_capability
+                if compile_only and current_capability is not None:
+                    # Presentation, route ranking and list ordering do not
+                    # change the executable recipe used for this Shader.
+                    fields = ("routeId", "toolId", "operation", "toolConfigDigest",
+                              "inputFormat", "outputFormat", "requiresReplayAbiValidation")
+                    capability_matches = all(capability.get(key) == current_capability.get(key)
+                                             for key in fields)
+                    capability_matches = capability_matches and route.supports_stage(manifest["stage"]) and route.supports_api(capture_api)
+                if bind_live and (route is None or not capability_matches):
                     raise ManifestValidationError(
                         "workspace route capability changed after creation"
                     )
                 if (
                     hop.get("hop") != index + 1
                     or (
-                        require_process_binding
+                        bind_live
                         and hop.get("operation")
                         != _operation_binding(
                             self.registry.operation(route.tool_id, route.operation)
@@ -7083,18 +7848,18 @@ class ShaderWorkspaceService:
             "schemaVersion",
             "mode",
             "diagnostics",
-            "allowedActions",
             "decompileCandidates",
             "compileCandidates",
             "configuredButUnavailable",
-            "aiPolicy",
             "sourceConstructionEligible",
             "assetSourceSeedEligibleAfterVerification",
             "directReplayApplyAuthorized",
             "semanticEquivalenceVerified",
             "planSha256",
         }
-        if set(recovery) != required:
+        legacy_fields = {"allowedActions", "aiPolicy"}
+        legacy = set(recovery) == required | legacy_fields
+        if set(recovery) != required and not legacy:
             raise ManifestValidationError("workspace recoveryPlan fields are invalid")
         if (
             recovery.get("schema")
@@ -7134,7 +7899,7 @@ class ShaderWorkspaceService:
             or recovery.get("semanticEquivalenceVerified") is not False
         ):
             raise ManifestValidationError("workspace recovery safety policy is invalid")
-        for field in ("diagnostics", "allowedActions"):
+        for field in (("diagnostics", "allowedActions") if legacy else ("diagnostics",)):
             values = recovery.get(field)
             if not isinstance(values, list) or len(values) > 128 or any(
                 not isinstance(item, Mapping) for item in values
@@ -7157,9 +7922,8 @@ class ShaderWorkspaceService:
                 raise ManifestValidationError(
                     "workspace recovery route candidates are invalid"
                 )
-        if not isinstance(recovery.get("configuredButUnavailable"), Mapping) or not isinstance(
-            recovery.get("aiPolicy"), Mapping
-        ):
+        if (not isinstance(recovery.get("configuredButUnavailable"), Mapping)
+                or (legacy and not isinstance(recovery.get("aiPolicy"), Mapping))):
             raise ManifestValidationError("workspace recovery policy metadata is invalid")
 
     def _load_manifest(
@@ -7169,9 +7933,10 @@ class ShaderWorkspaceService:
         allow_stale_route_bindings: bool = False,
         validate_latest_candidate: bool = True,
         allow_interrupted_candidate_recovery: bool = False,
+        compile_only: bool = False,
     ) -> dict:
         if not validate_latest_candidate and not (
-            allow_stale_route_bindings or allow_interrupted_candidate_recovery
+            allow_stale_route_bindings or allow_interrupted_candidate_recovery or compile_only
         ):
             raise ManifestValidationError(
                 "candidate validation may be relaxed only for stale-route migration "
@@ -7272,6 +8037,7 @@ class ShaderWorkspaceService:
             manifest,
             exact_profile["containerFormat"],
             require_process_binding=not allow_stale_route_bindings,
+            compile_only=compile_only,
         )
         self._validate_recovery_plan(manifest)
         baseline_abi = self._manifest_baseline_abi(manifest)
@@ -7640,7 +8406,7 @@ class ShaderWorkspaceService:
         if (
             selected.abi is not None
             and baseline_abi is not None
-            and selected.abi.sha256 != baseline_abi.sha256
+            and not same_physical_shader_abi(selected.abi, baseline_abi)
         ):
             raise ManifestValidationError(
                 "workspace baseline ABI no longer matches the capture catalog"
@@ -7692,8 +8458,10 @@ class ShaderWorkspaceService:
             if isinstance(target, Mapping)
             else ""
         )
+        from .native_glsl import candidate_allowed
+        native_glsl = candidate_allowed(manifest, candidate.get("kind"))
         container = fingerprint_shader_executable(
-            compiled, str(blob_path), format_hint=target_format or None
+            compiled, str(blob_path), format_hint="glsl" if native_glsl else target_format or None
         )
         if container is None or container.byte_size != len(compiled):
             raise ManifestValidationError(
@@ -7712,7 +8480,7 @@ class ShaderWorkspaceService:
             raise ManifestValidationError(
                 "latestCompiled target profile is invalid: %s" % exc
             ) from exc
-        if (
+        if not native_glsl and (
             candidate_profile != manifest.get("targetProfile")
             or container.kind != manifest.get("baseline", {}).get("kind")
         ):
@@ -7730,7 +8498,14 @@ class ShaderWorkspaceService:
             raise ManifestValidationError(
                 "latestCompiled baseline ABI binding mismatch"
             )
-        if gate_status == "pending-replay-reflection":
+        if gate_status == "skipped-manual-edit":
+            manual_import = (isinstance(candidate.get("projectImport"), dict)
+                             and candidate["projectImport"].get("manualEdit") is True)
+            if ((candidate.get("manualFastCompile") is not True and not manual_import)
+                    or set(abi_gate) != {"status", "baselineAbiSha256"}):
+                raise ManifestValidationError("manual compile policy metadata is invalid")
+            expected_validation = ("manual-edit-unvalidated", False, False, False)
+        elif gate_status == "pending-replay-reflection":
             if baseline_abi is None or set(abi_gate) != {
                 "status",
                 "baselineAbiSha256",
@@ -7815,7 +8590,13 @@ class ShaderWorkspaceService:
             or candidate.get("semanticEquivalenceVerified") is not False
         ):
             raise ManifestValidationError("latestCompiled metadata mismatch")
-        if candidate.get("projectImport") is not None:
+        if candidate.get("manualCompileCache") is not None:
+            from .manual_compile import validate_cache
+            validate_cache(self, root, manifest, candidate, source, compiled, baseline_abi)
+        elif candidate.get("nativeCompile") is not None:
+            from .native_compile import validate_provenance
+            validate_provenance(self, root, manifest, candidate, source, compiled)
+        elif candidate.get("projectImport") is not None:
             self._validate_project_import_candidate(
                 root, manifest, candidate, source, compiled
             )
@@ -7824,6 +8605,8 @@ class ShaderWorkspaceService:
                 root, manifest, candidate, source, compiled
             )
         else:
+            validate_snapshot(root, _source_path(root, manifest), source,
+                              candidate.get("sourceDependencies"))
             compiler_binding = manifest["tools"].get("compiler")
             if not isinstance(compiler_binding, dict) or any(
                 (
@@ -7851,6 +8634,7 @@ class ShaderWorkspaceService:
         """Revalidate the local, authority-free receipt for an imported binary."""
 
         receipt = candidate.get("projectImport")
+        manual = isinstance(receipt, Mapping) and receipt.get("manualEdit") is True
         candidate_fields = {
             "revision",
             "blobPath",
@@ -7887,9 +8671,28 @@ class ShaderWorkspaceService:
             "oldReplacementIdReused",
             "oldCaptureAbiAuthorityReused",
         }
+        if manual:
+            required_fields.update(("manualEdit", "validationScope", "manualApplyReceipt"))
+            from ..project_manual_shader import receipt_identity
+            provenance = receipt_identity(receipt.get("manualApplyReceipt"))
+            if (receipt.get("validationScope") != "manual-edit-unvalidated"
+                    or provenance["originalRawSha256"] != manifest["baseline"]["rawSha256"]
+                    or provenance["candidateRawSha256"] != candidate.get("rawSha256")
+                    or provenance["sourceSha256"] != candidate.get("sourceSha256")
+                    or provenance["sourceRevision"] != receipt.get("sourceRevision")
+                    or provenance["stage"] != manifest["stage"]
+                    or provenance["entryPoint"] != manifest.get("entryPoint", "")
+                    or provenance["targetProfile"] != manifest.get("targetProfile")):
+                raise ManifestValidationError("manual project candidate provenance changed")
         compiler_bound_fields = required_fields | {"compilerBindingSha256"}
         source_hash = hashlib.sha256(source).hexdigest()
         compiled_hash = hashlib.sha256(compiled).hexdigest()
+        if candidate.get("kind") == "GLSL":
+            from .native_glsl import candidate_allowed, compiler_binding
+            if (not candidate_allowed(manifest, "GLSL") or compiled != source
+                    or not isinstance(receipt, Mapping)
+                    or receipt.get("compilerBindingSha256") != compiler_binding(manifest)["bindingSha256"]):
+                raise ManifestValidationError("native GLSL project source/compiler binding mismatch")
         if (
             set(candidate) != candidate_fields
             or not isinstance(receipt, Mapping)
@@ -7930,9 +8733,9 @@ class ShaderWorkspaceService:
             or not isinstance(source_revision, int)
             or source_revision <= 0
             or receipt.get("targetProfile") != manifest.get("targetProfile")
-            or receipt.get("originValidationEvidenceOnly") is not True
+            or receipt.get("originValidationEvidenceOnly") is not (not manual)
             or receipt.get("freshCaptureRebindRequired") is not True
-            or receipt.get("freshLiveAbiRevalidationRequired") is not True
+            or receipt.get("freshLiveAbiRevalidationRequired") is not (not manual)
             or receipt.get("applyAuthorization") is not False
             or receipt.get("oldReplacementIdReused") is not False
             or receipt.get("oldCaptureAbiAuthorityReused") is not False
@@ -7990,14 +8793,14 @@ class ShaderWorkspaceService:
                 and archived.get("kind") == candidate.get("kind")
                 and archived.get("projectImport") == receipt
                 and archived.get("validationScope")
-                == "container-structure-only"
-                and archived.get("requiresReplayAbiValidation") is True
+                == ("manual-edit-unvalidated" if manual else "container-structure-only")
+                and archived.get("requiresReplayAbiValidation") is (not manual)
                 and archived.get("replayAbiValidated") is False
                 and archived.get("abiCompatible") is False
                 and archived.get("semanticEquivalenceVerified") is False
                 and archived.get("abiGate")
                 == {
-                    "status": _initial_abi_gate_status(manifest),
+                    "status": "skipped-manual-edit" if manual else _initial_abi_gate_status(manifest),
                     "baselineAbiSha256": manifest.get("baseline", {}).get(
                         "abiSha256"
                     ),
@@ -8034,7 +8837,8 @@ class ShaderWorkspaceService:
             raise ManifestValidationError(
                 "latestCompiled route-chain binding mismatch"
             )
-        previous_hash = hashlib.sha256(source).hexdigest()
+        previous_hash = validate_snapshot(root, _source_path(root, manifest), source,
+                                          candidate.get("sourceDependencies"))
         for index, (expected, actual) in enumerate(
             zip(expected_hops, actual_hops)
         ):
@@ -8095,6 +8899,11 @@ class ShaderWorkspaceService:
                 "latestCompiled final route output does not match candidate bytes"
             )
         validator_bindings = self._validator_bindings(manifest)
+        if candidate.get("manualFastCompile") is True:
+            if (candidate.get("abiGate", {}).get("status") != "skipped-manual-edit"
+                    or "baselineValidatorJobs" in candidate or "validatorJobs" in candidate):
+                raise ManifestValidationError("manual compile cannot contain a validator proof")
+            return
         if validator_bindings:
             baseline_path = self._artifact(root, manifest["baseline"]["path"])
             self._validate_validator_jobs(
@@ -8167,7 +8976,7 @@ class ShaderWorkspaceService:
             raise AbiValidationError(
                 "Vulkan ABI validation accepts native SPIR-V only"
             )
-        if api_token == "opengl" and baseline_kind != "OPENGL-SPIRV":
+        if api_token == "opengl" and baseline_kind not in {"OPENGL-SPIRV", "GLSL"}:
             raise AbiValidationError(
                 "OpenGL ABI validation accepts native OpenGL SPIR-V only"
             )
@@ -8293,6 +9102,19 @@ class ShaderWorkspaceService:
             baseline_access, candidate_access = self._dxil_access_evidence(
                 root, manifest
             )
+            # A transient fixed-tool integrity/read failure is represented as
+            # absent DXIL access evidence.  Rebind once before adjudicating a
+            # previously compatible report; a persistent absence remains a
+            # hard failure and never authorizes replay replacement.
+            if (
+                expected_compatible
+                and str(manifest.get("baseline", {}).get("kind", "")).upper() == "DXIL"
+                and (baseline_access is None or candidate_access is None)
+            ):
+                time.sleep(0.05)
+                baseline_access, candidate_access = self._dxil_access_evidence(
+                    root, manifest
+                )
             reflected_abi, comparison, evidence = (
                 validate_candidate_reflection_response(
                     request,
@@ -8316,16 +9138,43 @@ class ShaderWorkspaceService:
             raise ManifestValidationError(
                 "candidate ABI report evidence is invalid: %s" % exc
             ) from exc
+        # A rejection recorded under an earlier, stricter comparison rule is
+        # still a truthful record of that rejection: the interfaces and the
+        # physical evidence must re-verify byte for byte, but the verdict may
+        # have softened since (for example the ambiguous-block subset rule).
+        # The revision stays rejected; it is not re-adjudicated here, and the
+        # workspace is not declared corrupt for holding an old verdict.
+        recorded = report.get("comparison")
+        stale_rejection = (
+            not expected_compatible
+            and comparison.compatible
+            and isinstance(recorded, Mapping)
+            and recorded.get("compatible") is False
+            and recorded.get("baselineAbiSha256") == comparison.baseline_sha256
+            and recorded.get("candidateAbiSha256") == comparison.candidate_sha256
+        )
         if (
-            comparison.compatible is not expected_compatible
-            or reported_baseline != baseline_abi
+            reported_baseline != baseline_abi
             or reported_candidate != reflected_abi
-            or report.get("comparison") != comparison.to_dict()
             or report.get("evidence") != evidence
             or gate.get("candidateAbiSha256") != reflected_abi.sha256
+            or (
+                not stale_rejection
+                and (
+                    comparison.compatible is not expected_compatible
+                    or recorded != comparison.to_dict()
+                )
+            )
         ):
+            missing_dxil_access = (
+                expected_compatible
+                and str(manifest.get("baseline", {}).get("kind", "")).upper() == "DXIL"
+                and (baseline_access is None or candidate_access is None)
+            )
             raise ManifestValidationError(
                 "candidate ABI report does not prove exact compatibility"
+                + (" (DXIL access evidence unavailable after bounded recheck)"
+                   if missing_dxil_access else "")
                 if expected_compatible
                 else "candidate ABI report does not prove its recorded comparison"
             )
@@ -8497,7 +9346,11 @@ class ShaderWorkspaceService:
             or candidate_hash != candidate.get("rawSha256")
         ):
             return None
-        previous_hash = source_hash
+        try:
+            previous_hash = validate_snapshot(root, _source_path(root, manifest), source_bytes,
+                                              candidate.get("sourceDependencies"))
+        except ManifestValidationError:
+            return None
         matches: list[tuple[bytes, str]] = []
         for index, (expected, actual) in enumerate(
             zip(expected_hops, actual_hops, strict=True)
@@ -8801,17 +9654,16 @@ class ShaderWorkspaceService:
             for entry in history_values:
                 if not isinstance(entry, Mapping):
                     continue
-                expected_output_hash = (
-                    manifest.get("source", {}).get("sha256")
-                    if role == "baseline"
-                    else owner_digest
-                )
                 if (
                     entry.get("operation") in expected_history_operations
                     and entry.get("status") == "succeeded"
                     and entry.get("revision") == expected_revision
                     and entry.get("routePlanSha256") == plan.get("planSha256")
-                    and entry.get("outputSha256") == expected_output_hash
+                    # Baseline evidence describes the immutable native binary, whose input
+                    # hash/size and job provenance were verified above. Its history output is
+                    # the HLSL present when that job ran, not the currently edited/imported
+                    # source. Coupling those hashes invalidated sound DXIL evidence on restore.
+                    and (role == "baseline" or entry.get("outputSha256") == owner_digest)
                     and entry.get(history_key) == record
                 ):
                     history_matches.append(entry)

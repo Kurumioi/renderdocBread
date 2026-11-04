@@ -18,6 +18,7 @@ from src.shader_live_edit import (
     ShaderLiveEditManager,
 )
 from src.shader_workspace import ShaderWorkspaceWatchManager
+from src.shader_workspace.source_observation import source_observation_transaction
 
 
 def _wait_until(predicate, timeout: float = 2.0) -> None:
@@ -360,6 +361,23 @@ class ShaderLiveEditTests(unittest.TestCase):
         self.assertEqual(calls, [(str(self.workspace), 6, candidate_hash)])
         manager.stop(started["liveEditId"])
 
+    def test_queued_live_apply_waits_until_source_review_transaction_finishes(self):
+        calls = []
+        def apply_candidate(workspace, revision, raw_sha256):
+            calls.append(revision)
+            return _compatible_result(self.workspace, revision, raw_sha256)
+        manager = self._manager(apply_candidate)
+        started = manager.start(self.workspace, 100)
+        with source_observation_transaction(self.workspace):
+            self.watch.publish(started["watchId"], 6, "6" * 64)
+            _wait_until(lambda: self.watch.poll_calls >= 5)
+            time.sleep(0.05)
+            self.assertEqual(calls, [])
+        _wait_until(lambda: calls == [6])
+        status = manager.poll(started["liveEditId"])
+        self.assertEqual(status["applyFailures"], 0)
+        manager.stop(started["liveEditId"])
+
     def test_catch_up_compile_that_finishes_during_start_is_not_skipped(self):
         self.watch = _FakeWatchManager(
             initial_revision=6,
@@ -442,11 +460,70 @@ class ShaderLiveEditTests(unittest.TestCase):
             calls,
             [(str(self.workspace), 1, candidate_sha256)],
         )
+        # The callback records entry before the asynchronous coordinator has
+        # persisted its successful result. Observe completion before counters.
+        _wait_until(lambda: self.manager.poll(started["liveEditId"])["applySuccesses"] == 1,
+                    timeout=5.0)
         status = self.manager.poll(started["liveEditId"])
         self.assertEqual(status["watch"]["compileSuccesses"], 1)
         self.assertEqual(status["applySuccesses"], 1)
-        self.assertTrue(status["policy"]["freshReplayAbiValidationRequired"])
+        self.assertFalse(status["policy"]["freshReplayAbiValidationRequired"])
+        self.assertTrue(status["policy"]["unprovenCandidateRequiresAbiCheck"])
+        self.assertTrue(status["policy"]["compileWhenSourceChanged"])
         self.manager.stop(started["liveEditId"])
+
+    def test_manual_saved_glsl_preview_starts_and_retries_rejected_candidate(self):
+        from src.shader_live_edit import ShaderLiveEditSession
+        from src.shader_workspace.organization import ORGANIZATION_GATE_SCHEMA, ORGANIZATION_SESSION_SCHEMA
+        source_dir = self.workspace / "source"
+        source_dir.mkdir()
+        original = source_dir / "shader.hlsl"
+        original.write_bytes(b"void main() { outColor = vec4(0); }\n")
+        service = _SourceWorkspaceService(self.workspace)
+        service.source = source_dir / "shader.glsl"
+        original.rename(service.source)
+        edited = b"void main() { outColor = vec4(1, 0, 1, 1); }\n"
+        service.source.write_bytes(edited)
+        expected = hashlib.sha256(edited).hexdigest()
+        session = self.workspace / "ai/organization-sessions" / ("d" * 32) / "session.json"
+        session.parent.mkdir(parents=True)
+        session.write_text(json.dumps({"schema": ORGANIZATION_SESSION_SCHEMA,
+            "organizationId": "d" * 32, "state": "drafting"}), encoding="utf-8")
+        (self.workspace / "ai/organize-code-gate.json").write_text(json.dumps({
+            "schema": ORGANIZATION_GATE_SCHEMA, "organizationId": "d" * 32,
+            "decision": "editable-draft"}), encoding="utf-8")
+        watch = ShaderWorkspaceWatchManager(lambda: service)
+        calls = []
+        def apply(workspace, revision, raw):
+            calls.append(revision)
+            return (_rejected_result(revision, raw) if len(calls) == 1 else
+                    _compatible_result(self.workspace, revision, raw))
+        self.manager = ShaderLiveEditManager(watch, apply, poll_seconds=0.005, join_seconds=0.5,
+            registry_path=Path(self.temporary.name) / "live-edit.json",
+            workspace_identity=lambda _path: self._identity(),
+            bind_session=lambda _path: ShaderLiveEditSession(capture_binding, lambda: "current", apply))
+        capture_binding = {"instanceId": "gui", "captureSessionId": "b" * 32,
+                           "capturePath": self._identity()["capturePath"]}
+        first = self.manager.compile_saved_source(str(self.workspace), "a" * 32, expected,
+                                                  capture_binding=capture_binding)
+        self.assertTrue(first["compileScheduled"])
+        _wait_until(lambda: self.manager.poll(first["liveEditId"])["applyRejections"] == 1, timeout=5.0)
+        second = self.manager.compile_saved_source(str(self.workspace), "a" * 32, expected,
+                                                   capture_binding=capture_binding)
+        self.assertEqual(first["liveEditId"], second["liveEditId"])
+        _wait_until(lambda: self.manager.poll(first["liveEditId"])["applySuccesses"] == 1, timeout=5.0)
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(service.compile_hashes, [expected, expected])
+        self.assertEqual(service.source.read_bytes(), edited)
+        # The request cannot become an authorization for a different workspace.
+        with self.assertRaisesRegex(ShaderLiveEditError, "authorization changed"):
+            self.manager.compile_saved_source(str(self.workspace), "f" * 32, expected,
+                                             capture_binding=capture_binding)
+        for changed in ({"instanceId": "other-gui"}, {"captureSessionId": "c" * 32}):
+            with self.subTest(binding=changed), self.assertRaisesRegex(ShaderLiveEditError, "another GUI"):
+                self.manager.compile_saved_source(str(self.workspace), "a" * 32, expected,
+                    capture_binding={**capture_binding, **changed})
+        self.assertEqual(service.compile_hashes, [expected, expected])
 
     def test_host_save_requires_exact_running_authorization_and_workspace(self):
         registry = Path(self.temporary.name) / "config" / "live-edit.json"
@@ -697,12 +774,21 @@ class ShaderLiveEditTests(unittest.TestCase):
         manager = self._manager(apply_candidate)
         started = manager.start(self.workspace, 100)
         candidate_hash = "6" * 64
-        self.watch.publish(started["watchId"], 6, candidate_hash)
+        source = self.workspace / "source/shader.hlsl"
+        source.parent.mkdir()
+        source.write_bytes(b"float4 MainPS() : SV_Target { return 1; }\n")
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        manifest = {"source": {"path": "source/shader.hlsl"}, "latestCompiled": {
+            "revision": 6, "rawSha256": candidate_hash, "sourceSha256": source_hash}}
+        (self.workspace / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        self.watch.publish(started["watchId"], 6, candidate_hash, source_hash)
         _wait_until(
             lambda: manager.poll(started["liveEditId"])["applySuccesses"] == 1
         )
 
-        self.watch.publish(started["watchId"], 7, candidate_hash)
+        manifest["latestCompiled"]["revision"] = 7
+        (self.workspace / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        self.watch.publish(started["watchId"], 7, candidate_hash, source_hash)
         _wait_until(
             lambda: manager.poll(started["liveEditId"])["applyReuses"] == 1
         )
@@ -910,6 +996,7 @@ class ShaderLiveEditTests(unittest.TestCase):
             compile_failed["lastCompileError"]["diagnostic"]["category"],
             "tool-rejected-input",
         )
+        self.assertNotIn("allowedActions", compile_failed["lastCompileError"]["diagnostic"])
         self.assertEqual(
             compile_failed["lastCompileError"]["diagnostics"][0]["line"], 9
         )
@@ -955,8 +1042,11 @@ class ShaderLiveEditTests(unittest.TestCase):
             )
         )
         first = manager.start(self.workspace, 100)
-        with self.assertRaisesRegex(ShaderLiveEditError, "already has an active"):
-            manager.start(self.workspace, 100)
+        # A second start joins the one session instead of failing: still one
+        # owner, one watcher, and the caller learns which session it joined.
+        joined = manager.start(self.workspace, 100)
+        self.assertEqual(joined["liveEditId"], first["liveEditId"])
+        self.assertTrue(joined["joinedExistingSession"])
         self.assertEqual(len(self.watch.start_calls), 1)
 
         manager.stop(first["liveEditId"])

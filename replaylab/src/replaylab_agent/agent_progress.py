@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 
 from .events import TaskEventWriter
 from .agent_protocol import ClarificationRequest
+from .run_lifetime import current_run_lifetime
 
 _CHUNK = 8 * 1024
 _MAX_TEXT = 1024 * 1024
@@ -42,6 +43,7 @@ class ProgressReporter:
 
     # ------------------------------------------------------------- lifecycle
     def queued(self, *, prompt_chars: int, preset: str, profile_title: str, model: str) -> None:
+        lifetime = current_run_lifetime()
         self.writer.emit(
             "queued",
             backend=self.backend,
@@ -55,6 +57,7 @@ class ProgressReporter:
                 "model": model,
                 "activityTitleId": "task.queued",
                 "activityTitleArgs": [],
+                **(lifetime.metadata() if lifetime is not None else {}),
             },
         )
 
@@ -308,18 +311,15 @@ class ProgressReporter:
         clarification: ClarificationRequest | None = None,
         context: Mapping[str, Any] | None = None,
         instance_id: str = "",
-        report: Mapping[str, Any] | None = None,
-        verification: Mapping[str, Any] | None = None,
     ) -> str:
-        data: dict[str, Any] = {"terminalStatus": terminal_status}
-        if report:
-            # replaylab-task-report/v1: the structured answer the panel renders
-            # (summary, findings with evidence, artifacts, unknowns, next steps).
-            data["report"] = dict(report)
-            data["artifacts"] = list(report.get("artifacts") or [])
-        if verification:
-            # Layer 3: bounded Host follow-ups and any still-open factual reasons.
-            data["verification"] = dict(verification)
+        # Completion marks the provider turn's lifecycle. The Agent judges
+        # task acceptance from the user's goal, Skill guidance and actual tools;
+        # the Host does not invent a semantic pass or force another model round.
+        data: dict[str, Any] = {
+            "terminalStatus": terminal_status,
+            "completionScope": "agent-turn",
+            "acceptanceAuthority": "agent",
+        }
         if clarification is not None:
             payload = clarification.event_payload()
             if context and instance_id:
@@ -339,22 +339,30 @@ class ProgressReporter:
         )
         return delivery_id
 
-    def failed(self, error: str) -> None:
+    def failed(self, error: str, *, cause: BaseException | None = None) -> None:
+        from .provider_diagnostics import provider_failure_metadata
+        metadata = provider_failure_metadata(cause) if cause is not None else {}
         self.writer.emit(
             "failed",
             backend=self.backend,
             profile=self.profile_id,
             summary=_bounded(error, 1000),
-            data={"terminalStatus": "failed", "error": _bounded(error, 4000)},
+            data={"terminalStatus": "failed", "error": _bounded(error, 4000), **metadata},
         )
 
     def cancelled(self) -> None:
+        lifetime = current_run_lifetime()
+        owner_exited = lifetime is not None and lifetime.cancellation_reason == "owner-process-exited"
         self.writer.emit(
             "cancelled",
             backend=self.backend,
             profile=self.profile_id,
-            summary="cancelled by user",
-            data={},
+            summary="The application exited; the unfinished task was cancelled." if owner_exited else "cancelled by user",
+            data={
+                "terminalStatus": "cancelled", "reason": "owner-process-exited",
+                "activityTitleId": "task.owner-exited", "activityTitleArgs": [],
+                **lifetime.metadata(),
+            } if owner_exited else {},
         )
 
 

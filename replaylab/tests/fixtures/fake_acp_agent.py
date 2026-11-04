@@ -31,7 +31,7 @@ class EchoAgent:
         if "no-mcp" in sys.argv:
             assert not mcp_servers
             return schema.NewSessionResponse(sessionId="session-test")
-        assert mcp_servers and mcp_servers[0].name == "ReplayLab"
+        assert mcp_servers and mcp_servers[0].name == "Bread"
         if "filtered" in sys.argv:
             server = mcp_servers[0]
             assert isinstance(server, schema.HttpMcpServer)
@@ -68,6 +68,15 @@ class EchoAgent:
 
     async def prompt(self, session_id, prompt, **kwargs):
         assert session_id == "session-test"
+        if "large-tool-record" in sys.argv:
+            await self.connection.session_update(session_id, schema.ToolCallStart(
+                toolCallId="large-tool", title="Mcp(Bread:get_pipeline_state)", kind="read",
+                status="in_progress", rawInput={"semantic_fields": "x" * (20 * 1024 * 1024)},
+                sessionUpdate="tool_call"))
+            await self.connection.session_update(session_id, schema.ToolCallProgress(
+                toolCallId="large-tool", status="completed",
+                rawOutput={"image": {"mimeType": "image/png", "data": "y" * (20 * 1024 * 1024)}},
+                sessionUpdate="tool_call_update"))
         if "exit" in sys.argv:
             os._exit(23)
         if "permission-exact" in sys.argv:
@@ -78,7 +87,7 @@ class EchoAgent:
                     title="Untrusted provider label",
                     kind="other",
                     rawInput={
-                        "server": "ReplayLab",
+                        "server": "Bread",
                         "tool": "get_pipeline_state",
                     },
                 ),
@@ -133,7 +142,7 @@ class EchoAgent:
                 session_id,
                 schema.ToolCallStart(
                     toolCallId="C:/private/tool-call-token-secret",
-                    title="Mcp(ReplayLab:get_pipeline_state)",
+                    title="Mcp(Bread:get_pipeline_state)",
                     kind="read",
                     status="in_progress",
                     rawInput={

@@ -59,6 +59,12 @@ SAFE_EXTERNAL_ENV = frozenset(
 # code remains responsible for returning only redacted fingerprints.
 MCP_HOST_PROVIDER_ENV = frozenset(
     {
+        "REPLAYLAB_INSTANCE_ID",
+        "REPLAYLAB_RUNTIME_DIR",
+        "REPLAYLAB_INTERNAL_RUNTIME_DIR",
+        "RENDERDOC_ULTRA_ACTIVE_PROJECT_STATE",
+        "RENDERDOC_ULTRA_PROJECT_REGISTRY",
+        "RENDERDOC_ULTRA_PROJECTS_HOME",
         "RENDERDOC_ULTRA_UNPACKED_ASSET_JOB_ROOT",
         "RENDERDOC_ULTRA_RESOURCE_EXPORT_ROOT",
         "RENDERDOC_ULTRA_UEX",
@@ -83,7 +89,8 @@ REPLAYLAB_CONTROL_ENV = frozenset(
         "REPLAYLAB_AI_CLI",
         "REPLAYLAB_ALLOWED_TOOLS",
         "REPLAYLAB_INSTANCE_ID",
-        "REPLAYLAB_MCP_HOST_ARGS",
+        "REPLAYLAB_MCP_HOST",
+    "REPLAYLAB_MCP_HOST_ARGS",
         "REPLAYLAB_TOOL_AUDIT",
         "REPLAYLAB_TOOL_SCOPE",
     }
@@ -188,6 +195,7 @@ def external_agent_environment(
     extra: Mapping[str, str] | None = None,
     *,
     environ: Mapping[str, str] | None = None,
+    model: str = "",
 ) -> dict[str, str]:
     source = os.environ if environ is None else environ
     result = {
@@ -211,6 +219,7 @@ def external_agent_environment(
         # while ReplayLab's Agent contract stays isolated.
         home = codex_profile_home(profile, environ=source)
         result["CODEX_HOME"] = str(home)
+        result["REPLAYLAB_MANAGED_CODEX_HOME"] = "1"
     elif profile.preset == "cursor-acp":
         # Cursor's global CLI directory can contain account state, permissions,
         # MCP registrations and preferences.  Keep ReplayLab on a durable,
@@ -268,7 +277,11 @@ def external_agent_environment(
         # (claude-sonnet-5) or an alias (opus, sonnet). The value is trimmed and
         # lower-cased so stray spaces or capitalization from manual entry do not
         # break it (Claude model ids and aliases are lower-case).
-        normalized_model = profile.model.strip().lower()
+        # The model the user picked for *this run*, not the one saved on the profile.
+        # This adapter takes the model only from the environment, and its ACP session
+        # exposes no model option, so a per-run pick that stopped here ran the whole
+        # task on the saved model while the panel reported the picked one.
+        normalized_model = (str(model or "").strip() or profile.model.strip()).lower()
         if normalized_model:
             result["ANTHROPIC_MODEL"] = normalized_model
         result["CLAUDE_CONFIG_DIR"] = str(
@@ -322,7 +335,7 @@ def _managed_vendor_profiles_root(source: Mapping[str, str], directory: str) -> 
     local = source.get("LOCALAPPDATA") or source.get("XDG_DATA_HOME")
     data_root = Path(local).expanduser() if local else Path.home() / ".local" / "share"
     if not data_root.is_absolute():
-        raise ConfigurationError("ReplayLab managed vendor state root must be absolute")
+        raise ConfigurationError("Bread managed vendor state root must be absolute")
     return data_root / "ReplayLab" / directory
 
 
@@ -337,7 +350,11 @@ def codex_profile_home(
     # Profile.validate() constrains ids to a single traversal-free component.
     profile.validate()
     root = _codex_profiles_root(source)
-    return (root / profile.id).resolve()
+    # Canonicalizing an existing denied directory can fail before the CLI can
+    # diagnose/recover it. The validated single-component ID already fixes its
+    # lexical owner; the spawn boundary validates the actual directory.
+    from .managed_state import selected_codex_home
+    return selected_codex_home(root / profile.id, source)
 
 
 def _codex_profiles_root(source: Mapping[str, str]) -> Path:
@@ -347,7 +364,7 @@ def _codex_profiles_root(source: Mapping[str, str]) -> Path:
     else:
         data_root = Path.home() / ".local" / "share"
     if not data_root.is_absolute():
-        raise ConfigurationError("ReplayLab Codex home root must be absolute")
+        raise ConfigurationError("Bread Codex home root must be absolute")
     return data_root / "ReplayLab" / "codex"
 
 
@@ -371,7 +388,7 @@ def _cursor_profiles_root(source: Mapping[str, str]) -> Path:
     else:
         data_root = Path.home() / ".local" / "share"
     if not data_root.is_absolute():
-        raise ConfigurationError("ReplayLab Cursor home root must be absolute")
+        raise ConfigurationError("Bread Cursor home root must be absolute")
     return data_root / "ReplayLab" / "cursor"
 
 
@@ -396,7 +413,7 @@ def _codebuddy_profiles_root(source: Mapping[str, str]) -> Path:
     else:
         data_root = Path.home() / ".local" / "share"
     if not data_root.is_absolute():
-        raise ConfigurationError("ReplayLab CodeBuddy home root must be absolute")
+        raise ConfigurationError("Bread CodeBuddy home root must be absolute")
     return data_root / "ReplayLab" / "codebuddy"
 
 
@@ -405,20 +422,35 @@ _CURSOR_DENIED_PERMISSIONS = (
     "Read(**)",
     "Write(**)",
     "WebFetch(*)",
+    # Delegated agents inherit the parent's MCP server but carry no caller role.
+    # Without this deny a child can submit the main Agent's bounded report form.
+    "Agent(*)",
+    "Task(*)",
+    "Subagent(*)",
 )
 
 
-def _cursor_permissions() -> dict[str, list[str]]:
+def _cursor_permissions(workspace: Path | None = None, *, writable: bool = False) -> dict[str, list[str]]:
     # Cursor's allow-list is the outer transport boundary, not ReplayLab's
-    # workflow policy.  The per-turn MCP proxy exposes only the task's
-    # Host-admitted live tools and independently enforces frozen scope, requested effects,
-    # postconditions and rollback.  Allow the complete first-party namespace so
-    # a newly added or effectful child-Agent tool is not silently blocked by a
-    # second static list.  Ambient shell/file/web access remains denied below.
-    return {
-        "allow": ["Mcp(ReplayLab:*)"],
-        "deny": list(_CURSOR_DENIED_PERMISSIONS),
-    }
+    # workflow policy.  The per-turn MCP proxy exposes only the compact gateway
+    # and independently enforces the selected Host operation's frozen scope,
+    # requested effects, postconditions and rollback.  Allow that first-party
+    # namespace while ambient shell/file/web/delegation stays denied below.
+    if workspace is None:
+        return {"allow": ["Mcp(Bread:*)"], "deny": list(_CURSOR_DENIED_PERMISSIONS)}
+    from .owned_workspace import OwnedWorkspace
+    root = OwnedWorkspace(Path(workspace)).root.as_posix()
+    denied = [rule for rule in _CURSOR_DENIED_PERMISSIONS if rule not in {"Read(**)", "Write(**)"}]
+    allowed = ["Mcp(Bread:*)", "Read(%s/**)" % root]
+    if writable:
+        allowed.append("Write(%s/**)" % root)
+    else:
+        denied.append("Write(**)")
+    for operation in ("Read", "Write"):
+        denied.extend(["%s(%s/**/.*)" % (operation, root), "%s(%s/**/.*/**)" % (operation, root)])
+        for name in ("mcp.json", "settings.json", "config.toml", "AGENTS.md", "CLAUDE.md", "GEMINI.md"):
+            denied.append("%s(%s/**/%s*)" % (operation, root, name))
+    return {"allow": allowed, "deny": denied}
 
 
 def _write_cursor_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -450,7 +482,8 @@ def _write_cursor_json(path: Path, payload: Mapping[str, object]) -> None:
 
 
 def ensure_cursor_profile_config(
-    profile: Profile, *, environ: Mapping[str, str] | None = None
+    profile: Profile, *, environ: Mapping[str, str] | None = None,
+    workspace: Path | None = None, writable: bool = False,
 ) -> Path:
     """Atomically enforce ReplayLab's isolated Cursor CLI permission policy."""
 
@@ -503,14 +536,25 @@ def ensure_cursor_profile_config(
         "version": 1,
         "editor": {"vimMode": False},
         "approvalMode": "allowlist",
-        "permissions": _cursor_permissions(),
+        "permissions": _cursor_permissions(workspace, writable=writable),
     }
+    if config_path.is_file():
+        try:
+            old = json.loads(config_path.read_text(encoding="utf-8"))
+            previous = (old.get("permissions") or {}).get("deny", [])
+            # Preserve added user denials. The legacy blanket file rules were
+            # controller-generated defaults, replaced by this run's exact grant.
+            extra = [rule for rule in previous if isinstance(rule, str) and rule not in _CURSOR_DENIED_PERMISSIONS
+                     and rule not in payload["permissions"]["deny"]]
+            payload["permissions"]["deny"].extend(extra)
+        except (OSError, ValueError, TypeError, AttributeError):
+            raise ConfigurationError("cannot preserve managed Cursor permission denials")
     _write_cursor_json(config_path, payload)
     _write_cursor_json(cursor_home / "mcp.json", {"mcpServers": {}})
     return config_path
 
 
-def ensure_cursor_workspace(workspace: Path | str) -> Path:
+def ensure_cursor_workspace(workspace: Path | str, *, writable: bool | None = None) -> Path:
     """Pin one Cursor cwd to ReplayLab-owned project policy and no file MCPs."""
 
     root = Path(workspace)
@@ -535,10 +579,38 @@ def ensure_cursor_workspace(workspace: Path | str) -> Path:
         os.chmod(cursor_dir, stat.S_IRWXU)
     _write_cursor_json(
         cursor_dir / "cli.json",
-        {"permissions": _cursor_permissions()},
+        {"permissions": _cursor_permissions(root, writable=writable) if writable is not None else _cursor_permissions()},
     )
     _write_cursor_json(cursor_dir / "mcp.json", {"mcpServers": {}})
     return root
+
+
+def release_cursor_managed_tool_restrictions(profile: Profile) -> None:
+    """Migrate the identifiable old Bread-generated denial list only.
+
+    Native tools keep Cursor's approval mode and all user-added rules. An
+    unrecognised/custom configuration is left unchanged, never rewritten into
+    blanket shell approval merely because integration inheritance is enabled.
+    """
+    target = cursor_profile_home(profile) / "cli-config.json"
+    if not target.is_file() or _is_reparse_or_symlink(target):
+        return
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    permissions = payload.get("permissions") or {}
+    allowed = permissions.get("allow") or []
+    denied = permissions.get("deny") or []
+    if (payload.get("version") != 1 or payload.get("editor") != {"vimMode": False}
+            or payload.get("approvalMode") != "allowlist" or "Mcp(Bread:*)" not in allowed
+            or not isinstance(denied, list)):
+        return
+    known = set(_CURSOR_DENIED_PERMISSIONS)
+    retained = [rule for rule in denied if rule not in known]
+    if retained != denied:
+        permissions["deny"] = retained
+        _write_cursor_json(target, payload)
 
 
 def _is_reparse_or_symlink(path: Path) -> bool:

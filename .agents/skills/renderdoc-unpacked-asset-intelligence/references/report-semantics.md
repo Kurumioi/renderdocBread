@@ -1,96 +1,35 @@
-# UEX asset report semantics
+# UEX asset report fields
 
-## Inventory quality gate
+This reference applies only to a requested UEX asset report. The Host route
+`start_unpacked_asset_report` currently requires a concrete committed Strong,
+complete, untruncated Inventory and a project-specific grouping specification.
+It does not infer missing grouping rules from a sample game. If those rules are
+materially unknown, resolve them from authorized project evidence or ask for
+the missing choice. Reporting reads the selected Inventory; it should not
+reopen paks to invent absent cooked metrics.
 
-Generate statistics only from a persisted UEX Inventory. Do not reopen paks or
-infer missing cooked values while reporting. Require discovery confidence
-`Strong`, then select a concrete Inventory whose own metadata is `Strong`,
-complete, and not truncated. Prefer the newest acceptable snapshot, but bind
-the job to its exact Inventory id so a newer Moderate snapshot cannot be chosen
-implicitly.
+The grouping specification defines character parts, variants, scene scope
+and exclusions. Apply its rules to actual virtual paths. Do not make
+`Combat`, `Default/Show` or another game's layout a universal convention.
+Keep unmatched in-scope content visible in the appropriate fallback category
+rather than silently discarding it.
 
-Partial or non-Strong reporting is allowed only after the user explicitly
-accepts an incomplete result. Preserve all resulting gaps and warnings. Missing
-or unavailable cooked index, vertex, bone, animation, or texture metadata stays
-null/`missing`; it is never converted to zero.
+For reports requesting Role and Role+Weapon, aggregate the intended component
+meshes per character/variant/state. Sum available triangles and vertices for
+the selected LOD. Do not sum a shared Skeleton's bones once per mesh: group
+by exact Skeleton reference, take the maximum active or reference bone count
+per distinct Skeleton, then sum across distinct Skeletons. Associate
+animations by exact Skeleton reference. Missing frame counts or durations
+remain missing, not zero.
 
-## Project grouping rules
+Follow mesh-material-parent-texture references for texture counts and
+deduplicate exact texture assets before grouping by resolution. Scene
+categories use the configured scope and exclusions. For available LOD0
+triangle values, nearest-rank P90 is the sorted one-based value at
+`ceil(0.90 * N)`; report how many values were missing from that population.
 
-Validate the project specification against actual Inventory paths before
-aggregation. Do not apply one game's folder conventions to another project.
-
-- Exclude presentation duplicates such as `Default/Show` only through an
-  explicit narrow rule.
-- Retain the authoritative `Combat` assembly.
-- Classify other unmatched valid states as `Additional` so they remain
-  auditable.
-- Map components to `Role`, `Weapon`, or independent categories such as `Pet`,
-  `Prop`, `Summon`, or vehicle.
-- Scope scene patterns narrowly and exclude collision, proxy, placeholder,
-  test, cinematic, and other technical content.
-
-## Character, LOD, and Skeleton aggregation
-
-A row represents one logical character assembly rather than one Unreal asset.
-`Role` combines every mesh assigned to the Role component for the same
-character, variant, and state. `Role+Weapon` is the union of those Role and
-Weapon meshes. Other components stay independent unless the project spec
-explicitly combines them.
-
-Sum triangles and vertices across included meshes. At requested LOD `n`, a
-component without exact LOD `n` may use its last native LOD at or below `n`; if
-no effective LOD exists, the value is unavailable.
-
-Never sum bone counts per submesh. For each requested LOD:
-
-1. group skeletal meshes by exact Skeleton reference;
-2. for each shared Skeleton, take the maximum active-bone count among its
-   included meshes; and
-3. sum those maxima only across distinct Skeletons.
-
-Reference-bone counts follow the same distinct-Skeleton rule.
-
-## Animations and textures
-
-Associate animations through exact Skeleton references, not filename or folder
-proximity. Count clips and sum only available durations. Histogram clips by the
-configured frame-count bins; clips with missing frame counts remain in the
-total but not the histogram. `Core` is an explicit project-spec path marker and
-may be compared with All. Curves, notifies, physics, and montage semantics are
-outside this report.
-
-Resolve textures through mesh -> material/material instance -> parent material
--> texture references. Deduplicate exact texture assets before grouping by
-width x height. Resolution and texture counts are in scope; material slots,
-Shader fidelity, compression quality, and estimated memory are not silently
-derived.
-
-## Scene categories and P90
-
-Only assets within the configured scene scope are candidates. Apply global
-exclusions first, then ordered category rules; send unmatched in-scope meshes
-to the configured fallback, normally `Other`. Common categories such as large
-buildings and vegetation must be defined by project rules rather than guessed
-from one filename.
-
-Scene distributions use available LOD0 triangle counts. Compute P90 by nearest
-rank: sort the `N` available values ascending and select the one-based item at
-`ceil(0.90 * N)`. P90 is neither a mean, maximum, nor budget. A model with
-missing LOD0 remains in the category model total but is omitted from the
-histogram and P90 population with a warning.
-
-## Portable output and validation
-
-One report job produces:
-
-- `asset-report.html`, self-contained with no CDN;
-- `asset-report.json`, the complete renderer-independent model;
-- `asset-summary.csv`, the flat review/BI extract; and
-- `asset-report-manifest.json`, written last as the completion marker.
-
-The JSON, HTML, and completion manifest must directly identify the same selected
-Inventory. The flat CSV need not duplicate that metadata when the manifest
-binds its exact name, byte length, and SHA-256 into the same completed bundle.
-Verify grouping diagnostics, missing value counts, coverage/truncation, output
-hashes, and Inventory identity before delivery. An HTML file without the other
-artifacts and completion manifest is not a successful report.
+A completed report includes `asset-report.html`, `asset-report.json`,
+`asset-summary.csv` and `asset-report-manifest.json`. The manifest binds
+the selected Inventory, output names, sizes and hashes. A lone HTML preview
+or job still running is not a completed report. Report grouping diagnostics,
+coverage and missing values alongside the result.

@@ -23,11 +23,13 @@
  ******************************************************************************/
 
 #include "AIConversationView.h"
+#include "Code/Interface/QRDInterface.h"
 
 #include <QAbstractSlider>
 #include <QAction>
 #include <QApplication>
 #include <QBuffer>
+#include <QClipboard>
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QCursor>
@@ -40,6 +42,7 @@
 #include <QFocusEvent>
 #include <QFontMetrics>
 #include <QGridLayout>
+#include <QGuiApplication>
 #include <QHideEvent>
 #include <QHBoxLayout>
 #include <QImage>
@@ -47,15 +50,17 @@
 #include <QKeyEvent>
 #include <QKeySequence>
 #include <QLabel>
+#include <QLocale>
 #include <QMouseEvent>
 #include <QMenu>
 #include <QPainter>
 #include <QPalette>
+#include <QPointer>
+#include <QRegularExpression>
 #include <QScrollBar>
 #include <QSet>
 #include <QShowEvent>
 #include <QTextBlock>
-#include <QTextBoundaryFinder>
 #include <QTextBrowser>
 #include <QTextDocument>
 #include <QTextFragment>
@@ -65,6 +70,7 @@
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <utility>
+#include <algorithm>
 #include "Code/Resources.h"
 #include "AIFileThumbnail.h"
 
@@ -72,7 +78,103 @@ namespace
 {
 const int ViewportAnchorContextChars = 192;
 const int ViewportAnchorCompleteBlockChars = 512;
-const int LiveTextRevealIntervalMs = 4;
+const int LiveTextRevealIntervalMs = 33;
+
+// Only accepts the simple tag/class selectors emitted by this file. Model text has already
+// passed safeMarkdown (which escapes raw HTML). Resolve our stylesheet once, rather than asking
+// Qt 5.9's HTML importer to match every class rule against every node on every live update. The
+// class-selector path is also where the production transcript crash was observed; this avoids
+// that path without treating arbitrary model output as CSS or HTML.
+QString inlineTranscriptStyles(const QString &html)
+{
+  struct Rule
+  {
+    QString tag;
+    QStringList classes;
+    QString declarations;
+  };
+  const int start = html.indexOf(QLatin1String("<style>"));
+  const int end = html.indexOf(QLatin1String("</style>"), start);
+  if(start < 0 || end < 0)
+    return html;
+
+  QVector<Rule> rules;
+  const QString css = html.mid(start + 7, end - start - 7);
+  const QRegularExpression selectorPattern(
+      QLatin1String("^(?:[a-z][a-z0-9]*)?(?:\\.[a-z][a-z0-9-]*)*$"));
+  int position = 0;
+  while(position < css.size())
+  {
+    const int open = css.indexOf(QLatin1Char('{'), position);
+    const int close = css.indexOf(QLatin1Char('}'), open);
+    if(open < 0 || close < 0)
+      break;
+    const QString declarations = css.mid(open + 1, close - open - 1) + QLatin1Char(';');
+    for(const QString &selector : css.mid(position, open - position).split(QLatin1Char(',')))
+    {
+      const QString normalized = selector.trimmed();
+      // A future, more complex first-party selector needs an explicit implementation here.
+      // Do not silently change its cascade by partially expanding the stylesheet.
+      if(normalized.isEmpty() || !selectorPattern.match(normalized).hasMatch())
+        return html;
+      Rule rule;
+      rule.classes = normalized.split(QLatin1Char('.'));
+      rule.tag = rule.classes.takeFirst();
+      rule.declarations = declarations;
+      rules.push_back(rule);
+    }
+    position = close + 1;
+  }
+  std::stable_sort(rules.begin(), rules.end(), [](const Rule &left, const Rule &right) {
+    const int leftSpecificity = left.classes.size() * 100 + !left.tag.isEmpty();
+    const int rightSpecificity = right.classes.size() * 100 + !right.tag.isEmpty();
+    return leftSpecificity < rightSpecificity;
+  });
+
+  const QString body = html.left(start) + html.mid(end + 8);
+  const QRegularExpression tagPattern(
+      QLatin1String("<([a-z][a-z0-9]*)(?:[^<>\"']|\"[^\"]*\"|'[^']*')*>"));
+  const QRegularExpression classPattern(QLatin1String("\\sclass=\"([^\"]*)\""));
+  const QRegularExpression stylePattern(QLatin1String("\\sstyle=\"([^\"]*)\""));
+  QString result;
+  result.reserve(body.size() * 2);
+  position = 0;
+  auto tags = tagPattern.globalMatch(body);
+  while(tags.hasNext())
+  {
+    const QRegularExpressionMatch tag = tags.next();
+    result += body.mid(position, tag.capturedStart() - position);
+    QString element = tag.captured();
+    const auto classAttribute = classPattern.match(element);
+    const QStringList classes = classAttribute.captured(1).split(QLatin1Char(' '),
+                                                                QString::SkipEmptyParts);
+    QString declarations;
+    for(const Rule &rule : rules)
+    {
+      if(!rule.tag.isEmpty() && rule.tag != tag.captured(1))
+        continue;
+      bool matches = true;
+      for(const QString &className : rule.classes)
+        matches &= classes.contains(className);
+      if(matches)
+        declarations += rule.declarations;
+    }
+    element.remove(classPattern);
+    const auto inlineStyle = stylePattern.match(element);
+    // Existing inline declarations already are HTML-escaped and have highest specificity.
+    const QString style = declarations.toHtmlEscaped() + inlineStyle.captured(1);
+    element.remove(stylePattern);
+    if(!style.isEmpty())
+    {
+      const int insertion = element.size() - (element.endsWith(QLatin1String("/>")) ? 2 : 1);
+      element.insert(insertion, QLatin1String(" style=\"") + style + QLatin1Char('"'));
+    }
+    result += element;
+    position = tag.capturedEnd();
+  }
+  result += body.mid(position);
+  return result;
+}
 
 QString liveTextKey(const AIChatMessage &message, const AIActivityItem &activity)
 {
@@ -87,16 +189,6 @@ QString liveTextAnchor(const QString &key)
   return lit("replaylab-live-text-") +
          QString::fromLatin1(QCryptographicHash::hash(key.toUtf8(), QCryptographicHash::Sha256)
                                  .toHex());
-}
-
-int nextGraphemeBoundary(const QString &text, int position)
-{
-  if(position < 0 || position >= text.size())
-    return text.size();
-  QTextBoundaryFinder finder(QTextBoundaryFinder::Grapheme, text);
-  finder.setPosition(position);
-  const int next = finder.toNextBoundary();
-  return next > position ? next : qMin(position + 1, text.size());
 }
 
 bool sameAttachment(const AIChatAttachment &left, const AIChatAttachment &right)
@@ -210,7 +302,44 @@ bool allowedLink(const QUrl &url)
   if(!url.isValid())
     return false;
   const QString scheme = url.scheme().toLower();
-  return scheme == lit("http") || scheme == lit("https") || scheme == lit("rdoc");
+  return scheme == lit("http") || scheme == lit("https") || scheme == lit("rdoc") || // i18n-ignore: URL scheme identifiers.
+         scheme == lit("replaylab-artifact"); // i18n-ignore: Local artifact URL scheme identifier.
+}
+
+QUrl markdownNavigationTarget(QString target)
+{
+  // Source citations are navigation requests, never shell-open requests. The workspace controller
+  // resolves the exact absolute path against its authorised documents when the user clicks.
+  target.replace(QLatin1Char('\\'), QLatin1Char('/'));
+  if(target.startsWith(QLatin1String("file:")))
+    target = QUrl(target).toLocalFile();
+  static const QRegularExpression sourceCitation(
+      QStringLiteral(R"(^((?:[A-Za-z]:/|/)[^\r\n]*\.(?:hlsl|hlsli|glsl|glslinc|slang|slangh|vert|frag|geom|comp|tesc|tese|fx|fxh|h|inc|usf|ush))(?::([1-9][0-9]{0,8})(?::([1-9][0-9]{0,8}))?|#L([1-9][0-9]{0,8})(?:C([1-9][0-9]{0,8}))?)?$)"),
+      QRegularExpression::CaseInsensitiveOption);
+  const QRegularExpressionMatch match = sourceCitation.match(target);
+  if(match.hasMatch())
+  {
+    QUrl source(QStringLiteral("rdoc://shader"));
+    QUrlQuery query;
+    query.addQueryItem(QStringLiteral("path"), match.captured(1));
+    const QString line = match.captured(2).isEmpty() ? match.captured(4) : match.captured(2);
+    const QString column = match.captured(3).isEmpty() ? match.captured(5) : match.captured(3);
+    if(!line.isEmpty())
+      query.addQueryItem(QStringLiteral("line"), line);
+    if(!column.isEmpty())
+      query.addQueryItem(QStringLiteral("column"), column);
+    source.setQuery(query);
+    return source;
+  }
+  static const QRegularExpression localPath(QStringLiteral(R"(^(?:[A-Za-z]:/|/|//)[^\r\n]+$)"));
+  static const QRegularExpression executablePath(QStringLiteral(R"(\.(?:exe|com|cmd|bat|msi|scr|lnk|url|vbs|jse|wsf|reg)$)"),
+                                                QRegularExpression::CaseInsensitiveOption);
+  if(localPath.match(target).hasMatch() && executablePath.match(target).hasMatch())
+    return QUrl();
+  if(localPath.match(target).hasMatch())
+    return QUrl(lit("replaylab-artifact://open/") + // i18n-ignore: Local artifact navigation URI.
+                QString::fromUtf8(QUrl::toPercentEncoding(target)));
+  return QUrl(target, QUrl::StrictMode);
 }
 
 // Render inline code and [label](target) links in one forward pass. A nested '[' invalidates the
@@ -229,7 +358,12 @@ QString inlineMarkdown(const QString &text)
       if(end < 0)
         break;
       html += text.mid(plainStart, i - plainStart).toHtmlEscaped();
-      html += lit("<code>") + text.mid(i + 1, end - i - 1).toHtmlEscaped() + lit("</code>");
+      const QString code = text.mid(i + 1, end - i - 1);
+      const QUrl path = markdownNavigationTarget(code);
+      if(path.scheme() == QLatin1String("replaylab-artifact"))
+        html += lit("<a href=\"") + path.toString(QUrl::FullyEncoded).toHtmlEscaped() + lit("\"><code>") + code.toHtmlEscaped() + lit("</code></a>"); // i18n-ignore: HTML link/code markup with escaped user path.
+      else
+        html += lit("<code>") + code.toHtmlEscaped() + lit("</code>"); // i18n-ignore: HTML code markup with escaped user content.
       i = end + 1;
       plainStart = i;
       continue;
@@ -253,27 +387,33 @@ QString inlineMarkdown(const QString &text)
       if(labelEnd > i + 1 && labelEnd + 1 < text.size() && text[labelEnd + 1] == QLatin1Char('('))
       {
         int targetEnd = -1;
-        for(int j = labelEnd + 2; j < text.size(); ++j)
+        int targetStart = labelEnd + 2;
+        const bool angleTarget = targetStart < text.size() && text[targetStart] == QLatin1Char('<');
+        if(angleTarget)
+          ++targetStart;
+        for(int j = targetStart; j < text.size(); ++j)
         {
-          if(text[j] == QLatin1Char(')'))
+          if((!angleTarget && text[j] == QLatin1Char(')')) ||
+             (angleTarget && text[j] == QLatin1Char('>') && j + 1 < text.size() &&
+              text[j + 1] == QLatin1Char(')')))
           {
             targetEnd = j;
             break;
           }
-          if(text[j].isSpace() || text[j] == QLatin1Char('('))
+          if(text[j] == QLatin1Char('\n') || text[j] == QLatin1Char('\r') ||
+             (!angleTarget && (text[j].isSpace() || text[j] == QLatin1Char('('))))
             break;
         }
 
-        if(targetEnd > labelEnd + 2)
+        if(targetEnd > targetStart)
         {
-          const QString targetText = text.mid(labelEnd + 2, targetEnd - labelEnd - 2);
-          const QUrl target(targetText, QUrl::StrictMode);
+          const QUrl target = markdownNavigationTarget(text.mid(targetStart, targetEnd - targetStart));
           if(allowedLink(target))
           {
             html += text.mid(plainStart, i - plainStart).toHtmlEscaped();
             html += lit("<a href=\"") + target.toString(QUrl::FullyEncoded).toHtmlEscaped() +
                     lit("\">") + text.mid(i + 1, labelEnd - i - 1).toHtmlEscaped() + lit("</a>");
-            i = targetEnd + 1;
+            i = targetEnd + (angleTarget ? 2 : 1);
             plainStart = i;
             continue;
           }
@@ -317,6 +457,8 @@ bool sourceKeyword(const QString &word)
                     << QLatin1String("false") << QLatin1String("for")
                     << QLatin1String("if") << QLatin1String("in")
                     << QLatin1String("interface")
+                    << QLatin1String("inout") << QLatin1String("precise")
+                    << QLatin1String("nointerpolation") << QLatin1String("centroid")
                     << QLatin1String("namespace") << QLatin1String("null")
                     << QLatin1String("nullptr") << QLatin1String("out")
                     << QLatin1String("register") << QLatin1String("return") << QLatin1String("static")
@@ -364,7 +506,7 @@ bool sourceType(const QString &word)
   return !word.isEmpty() && word[0].isUpper();
 }
 
-QString highlightedSourceLine(const QString &line, const QString &language)
+QString highlightedSourceLine(const QString &line, const QString &language, bool &blockComment)
 {
   const QString loweredLanguage = language.toLower();
   const bool hashComment =
@@ -376,6 +518,16 @@ QString highlightedSourceLine(const QString &line, const QString &language)
   int i = 0;
   while(i < line.size())
   {
+    if(blockComment)
+    {
+      const int end = line.indexOf(QLatin1String("*/"), i);
+      const int length = end < 0 ? line.size() - i : end + 2 - i;
+      html += QLatin1String("<span class=\"source-comment\">") +
+              line.mid(i, length).toHtmlEscaped() + QLatin1String("</span>");
+      blockComment = end < 0;
+      i += length;
+      continue;
+    }
     if(i + 1 < line.size() && line[i] == QLatin1Char('/') &&
        line[i + 1] == QLatin1Char('/'))
     {
@@ -387,6 +539,7 @@ QString highlightedSourceLine(const QString &line, const QString &language)
        line[i + 1] == QLatin1Char('*'))
     {
       const int end = line.indexOf(QLatin1String("*/"), i + 2);
+      blockComment = end < 0;
       const int length = end < 0 ? line.size() - i : end + 2 - i;
       html += QLatin1String("<span class=\"source-comment\">") +
               line.mid(i, length).toHtmlEscaped() + QLatin1String("</span>");
@@ -451,14 +604,14 @@ QString highlightedSourceLine(const QString &line, const QString &language)
       continue;
     }
     if(line[i].isDigit() ||
-       (line[i] == QLatin1Char('-') && i + 1 < line.size() && line[i + 1].isDigit()))
+       (line[i] == QLatin1Char('.') && i + 1 < line.size() && line[i + 1].isDigit()))
     {
       const int start = i++;
       while(i < line.size() &&
-            (line[i].isDigit() || line[i] == QLatin1Char('.') ||
-             line[i] == QLatin1Char('x') || line[i] == QLatin1Char('X') ||
-             (line[i].toLower() >= QLatin1Char('a') &&
-              line[i].toLower() <= QLatin1Char('f'))))
+            (line[i].isLetterOrNumber() || line[i] == QLatin1Char('.') ||
+             ((line[i] == QLatin1Char('+') || line[i] == QLatin1Char('-')) &&
+              i > start && (line[i - 1].toLower() == QLatin1Char('e') ||
+                            line[i - 1].toLower() == QLatin1Char('p')))))
         ++i;
       html += QLatin1String("<span class=\"source-number\">") +
               line.mid(start, i - start).toHtmlEscaped() + QLatin1String("</span>");
@@ -482,13 +635,14 @@ QString renderFencedCode(const QStringList &lines, QString language)
                  QLatin1String("class=\"source-header\">") + label.toHtmlEscaped() +
                  QLatin1String("</td></tr>");
   const int lineCount = qMax(1, lines.size());
+  bool blockComment = false;
   for(int lineIndex = 0; lineIndex < lineCount; ++lineIndex)
   {
     const QString line = lineIndex < lines.size() ? lines[lineIndex] : QString();
     html += QLatin1String("<tr><td class=\"source-line-number\" width=\"36\" align=\"right\" ") +
             QLatin1String("valign=\"top\">") + QString::number(lineIndex + 1) +
             QLatin1String("</td><td class=\"source-line\" valign=\"top\">") +
-            (line.isEmpty() ? QLatin1String("&nbsp;") : highlightedSourceLine(line, language)) +
+            (line.isEmpty() ? QLatin1String("&nbsp;") : highlightedSourceLine(line, language, blockComment)) +
             QLatin1String("</td></tr>");
   }
   return html + QLatin1String("</table>");
@@ -610,9 +764,16 @@ QString activityState(const AIActivityItem &activity)
     return QCoreApplication::translate("AIConversationView", "blocked");
   // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
   if(activity.kind == lit("partial"))
-    return QCoreApplication::translate("AIConversationView", "completed with limitations");
+    return QCoreApplication::translate("AIConversationView", "turn ended with unfinished work");
   if(activity.error)
     return QCoreApplication::translate("AIConversationView", "failed");
+  // i18n-ignore: Activity kinds are backend protocol identifiers used only for label selection.
+  if(activity.kind == lit("completed") || activity.kind == lit("main") ||
+     // i18n-ignore: Child activity-kind prefix is a backend protocol identifier.
+     activity.kind.startsWith(lit("child-")))
+    return activity.completed
+               ? QCoreApplication::translate("AIConversationView", "turn ended")
+               : QCoreApplication::translate("AIConversationView", "running");
   if(activity.completed)
     return QCoreApplication::translate("AIConversationView", "completed");
   return QCoreApplication::translate("AIConversationView", "running");
@@ -649,10 +810,10 @@ QString messageStateLabel(const QString &state)
     return QCoreApplication::translate("AIConversationView", "failed");
   // i18n-ignore: Conversation state is an internal lifecycle identifier used only for lookup.
   if(state == lit("completed"))
-    return QCoreApplication::translate("AIConversationView", "completed");
+    return QCoreApplication::translate("AIConversationView", "turn ended");
   // i18n-ignore: Conversation state is an internal lifecycle identifier used only for lookup.
   if(state == lit("partial"))
-    return QCoreApplication::translate("AIConversationView", "completed with limitations");
+    return QCoreApplication::translate("AIConversationView", "turn ended with unfinished work");
   // i18n-ignore: Conversation state is an internal lifecycle identifier used only for lookup.
   if(state == lit("needs-user-input"))
     return QCoreApplication::translate("AIConversationView", "waiting for input");
@@ -700,7 +861,7 @@ QString activityKindLabel(const QString &kind)
     return QCoreApplication::translate("AIConversationView", "Reasoning summary");
   // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
   if(kind == lit("reasoning-raw"))
-    return QCoreApplication::translate("AIConversationView", "Reasoning");
+    return QCoreApplication::translate("AIConversationView", "Raw reasoning");
   // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
   if(kind == lit("commandExecution"))
     return QCoreApplication::translate("AIConversationView", "Command");
@@ -733,10 +894,10 @@ QString activityKindLabel(const QString &kind)
     return QCoreApplication::translate("AIConversationView", "Blocked");
   // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
   if(kind == lit("completed"))
-    return QCoreApplication::translate("AIConversationView", "Completed");
+    return QCoreApplication::translate("AIConversationView", "Turn ended");
   // i18n-ignore: Activity kind is a backend protocol identifier used only for label selection.
   if(kind == lit("partial"))
-    return QCoreApplication::translate("AIConversationView", "Completed with limitations");
+    return QCoreApplication::translate("AIConversationView", "Turn ended with unfinished work");
   // i18n-ignore: Activity kinds are backend protocol identifiers used only for label selection.
   if(kind == lit("steered") || kind == lit("superseded"))
     return QCoreApplication::translate("AIConversationView", "Direction");
@@ -966,15 +1127,20 @@ QString renderLiveActivityDetail(const AIChatMessage &message, const AIActivityI
 }
 
 QString renderActivityGroup(const AIChatMessage &message, qint64 finishedMs, qint64 nowMs,
-                            QHash<QString, QString> *liveTextAnchors)
+                            QHash<QString, QString> *liveTextAnchors,
+                            QHash<QString, QPair<qint64, QString>> *elapsedAnchors = NULL,
+                            int maxActivities = 96)
 {
   if(message.activity.isEmpty())
     return QString();
 
+  const QString elapsedToken = QString::fromLatin1(QUrl::toPercentEncoding(message.id));
   qint64 effectiveFinishedMs = finishedMs;
+  bool groupRunning = false;
   if(isLiveState(message.state))
   {
     effectiveFinishedMs = nowMs;
+    groupRunning = true;
   }
   else if(effectiveFinishedMs <= 0)
   {
@@ -990,8 +1156,18 @@ QString renderActivityGroup(const AIChatMessage &message, qint64 finishedMs, qin
   const bool nextExpanded = !message.activityExpanded;
   const QString href = lit("replaylab-activity://toggle/") + token + lit("?expanded=") +
                        (nextExpanded ? lit("1") : lit("0"));
+  // A running group's duration is a live label: the anchor name lets the view
+  // update just those characters every second.
+  QString durationHtml = duration.toHtmlEscaped();
+  if(groupRunning && message.timestampMs > 0 && elapsedAnchors != NULL)
+  {
+    const QString anchorName = lit("elapsed-g-") + elapsedToken;    // i18n-ignore: internal anchor id.
+    elapsedAnchors->insert(anchorName, qMakePair(message.timestampMs, duration));
+    // i18n-ignore: Structural transcript HTML contains no user-visible prose.
+    durationHtml = lit("<a name=\"") + anchorName + lit("\">") + duration.toHtmlEscaped() + lit("</a>");
+  }
   const QString elapsed =
-      QCoreApplication::translate("AIConversationView", "Elapsed %1").arg(duration);
+      QCoreApplication::translate("AIConversationView", "Elapsed %1").arg(lit("\x01"));
 
   // i18n-ignore: Structural transcript HTML contains no user-visible prose.
   QString html = lit("<div class=\"activity-group\"><table class=\"activity-header\" ") +
@@ -1004,7 +1180,8 @@ QString renderActivityGroup(const AIChatMessage &message, qint64 finishedMs, qin
                  (message.activityExpanded ? lit("&#9660;") : lit("&#9654;")) +
                  // i18n-ignore: Structural transcript HTML contains no user-visible prose.
                  lit("</a></td><td><a class=\"activity-toggle\" href=\"") +
-                 href.toHtmlEscaped() + lit("\">") + elapsed.toHtmlEscaped() +
+                 href.toHtmlEscaped() + lit("\">") +
+                 elapsed.toHtmlEscaped().replace(lit("\x01"), durationHtml) +
                  // i18n-ignore: Structural transcript HTML contains no user-visible prose.
                  lit("</a></td></tr></table><hr/>");
 
@@ -1012,29 +1189,52 @@ QString renderActivityGroup(const AIChatMessage &message, qint64 finishedMs, qin
   {
     // i18n-ignore: Structural transcript HTML contains no user-visible prose.
     html += lit("<div class=\"activity-list\">");
-    for(const AIActivityItem &activity : message.activity)
+    const int firstActivity = qMax(0, message.activity.size() - maxActivities);
+    if(firstActivity > 0)
+      html += lit("<p><a href=\"replaylab-activity://more/") + token + lit("\">") + // i18n-ignore: HTML and internal activity pagination URI.
+          QCoreApplication::translate("AIConversationView", "Show earlier activities (%1 remaining)").arg(firstActivity).toHtmlEscaped() + lit("</a></p>"); // i18n-ignore: HTML closing link/paragraph markup.
+    for(int activityIndex = firstActivity; activityIndex < message.activity.size(); ++activityIndex)
     {
+      const AIActivityItem &activity = message.activity[activityIndex];
       QString title = activity.title.trimmed();
       if(title.isEmpty())
         title = activityKindLabel(activity.kind);
 
       qint64 itemFinishedMs = activity.finishedTimestampMs;
-      if(itemFinishedMs <= 0 && !activity.completed && !activity.error)
+      const bool itemRunning = itemFinishedMs <= 0 && !activity.completed && !activity.error;
+      if(itemRunning)
         itemFinishedMs = nowMs;
       QString itemDuration;
       if(activity.timestampMs > 0 && itemFinishedMs >= activity.timestampMs)
         itemDuration = elapsedText(itemFinishedMs - activity.timestampMs);
+      QString itemDurationHtml = itemDuration.toHtmlEscaped();
+      if(itemRunning && !itemDuration.isEmpty() && elapsedAnchors != NULL)
+      {
+        const QString anchorName =
+            lit("elapsed-i-") + elapsedToken + lit("-") + QString::number(activityIndex);    // i18n-ignore: internal anchor id.
+        elapsedAnchors->insert(anchorName, qMakePair(activity.timestampMs, itemDuration));
+        // i18n-ignore: Structural transcript HTML contains no user-visible prose.
+        itemDurationHtml = lit("<a name=\"") + anchorName + lit("\">") + itemDurationHtml + lit("</a>");
+      }
 
       const QString statusClass = activityStatusClass(activity);
       const QString marker =
           // i18n-ignore: HTML entities are visual status markers, not user-visible prose.
           activity.error ? lit("&#10005;") : (activity.completed ? lit("&#10003;") : lit("&#9679;"));
+      const bool failedTool = activity.error &&
+          // i18n-ignore: Backend activity kind identifiers, not display labels.
+          (activity.kind == lit("tool") || activity.kind == lit("mcpToolCall"));
+      const QString markerHint = failedTool
+          ? QCoreApplication::translate("AIConversationView",
+                                        "This tool call failed. The Agent may continue and retry.")
+          : activityState(activity);
       // i18n-ignore: Structural transcript HTML contains no user-visible prose.
       html += lit("<div class=\"activity-row\"><table width=\"100%\" border=\"0\" ") +
               // i18n-ignore: Structural transcript HTML contains no user-visible prose.
               lit("cellspacing=\"0\" cellpadding=\"0\"><tr><td width=\"22\" valign=\"top\">") +
               // i18n-ignore: Structural transcript HTML contains no user-visible prose.
-              lit("<span class=\"activity-marker ") + statusClass + lit("\">") + marker +
+              lit("<span class=\"activity-marker ") + statusClass + lit("\" title=\"") +
+              markerHint.toHtmlEscaped() + lit("\">") + marker +
               // i18n-ignore: Structural transcript HTML contains no user-visible prose.
               lit("</span></td><td><div class=\"activity-title\">") + title.toHtmlEscaped() +
               // i18n-ignore: Structural transcript HTML contains no user-visible prose.
@@ -1045,7 +1245,7 @@ QString renderActivityGroup(const AIChatMessage &message, qint64 finishedMs, qin
               activityState(activity).toHtmlEscaped();
       if(!itemDuration.isEmpty())
         // i18n-ignore: HTML entity is a visual separator, not user-visible prose.
-        html += lit(" &middot; ") + itemDuration.toHtmlEscaped();
+        html += lit(" &middot; ") + itemDurationHtml;
       // i18n-ignore: Structural transcript HTML contains no user-visible prose.
       html += lit("</span></div>");
       if(activity.liveText)
@@ -1234,6 +1434,179 @@ QImage conversationImageThumbnail(const AIChatAttachment &attachment, const QSiz
   return QImage();
 }
 
+QString artifactBadgeText(const QJsonObject &stats)
+{
+  QStringList parts;
+  if(stats.contains(lit("addedChars")) || stats.contains(lit("removedChars")))    // i18n-ignore: transcript protocol identifier, not UI prose.
+  {
+    const qint64 added = qint64(stats.value(lit("addedChars")).toDouble());    // i18n-ignore: transcript protocol identifier, not UI prose.
+    const qint64 removed = qint64(stats.value(lit("removedChars")).toDouble());
+    // i18n-ignore: Numeric change badge; signs are presentation, not prose.
+    parts << lit("+%1").arg(QLocale().toString(added)) << lit("-%1").arg(QLocale().toString(removed));
+  }
+  else if(stats.contains(lit("chars")))    // i18n-ignore: transcript protocol identifier, not UI prose.
+    parts << QCoreApplication::translate("AIConversationView", "%1 chars")
+                 .arg(QLocale().toString(qint64(stats.value(lit("chars")).toDouble())));    // i18n-ignore: transcript protocol identifier, not UI prose.
+  else if(stats.contains(lit("files")))
+    parts << QCoreApplication::translate("AIConversationView", "%1 files")
+                 .arg(QLocale().toString(qint64(stats.value(lit("files")).toDouble())));    // i18n-ignore: transcript protocol identifier, not UI prose.
+  else if(stats.contains(lit("bytes")))
+    parts << QCoreApplication::translate("AIConversationView", "%1 bytes")
+                 .arg(QLocale().toString(qint64(stats.value(lit("bytes")).toDouble())));    // i18n-ignore: transcript protocol identifier, not UI prose.
+  // i18n-ignore: Separator glyph is presentation, not prose.
+  return parts.join(lit(" "));
+}
+
+QString artifactFileName(const QString &path)
+{
+  const int slash = qMax(path.lastIndexOf(QLatin1Char('/')), path.lastIndexOf(QLatin1Char('\\')));
+  return (slash >= 0 && slash + 1 < path.size()) ? path.mid(slash + 1) : path;
+}
+
+QString artifactRowHtml(const QString &path, const QString &label, const QString &badge,
+                        const QString &badgeClass, const QString &tooltip)
+{
+  // i18n-ignore: Internal link scheme routed to the transcript link handler.
+  const QString href = lit("replaylab-artifact://open/") + QString::fromUtf8(QUrl::toPercentEncoding(path));
+  // i18n-ignore: Structural transcript HTML contains no user-visible prose.
+  QString row = lit("<tr><td class=\"artifact-row\"><a class=\"artifact-link\" href=\"") +
+                href.toHtmlEscaped() + lit("\" title=\"") + tooltip.toHtmlEscaped() + lit("\">") +    // i18n-ignore: transcript protocol identifier, not UI prose.
+                label.toHtmlEscaped() + lit("</a></td><td class=\"artifact-badge ") + badgeClass +
+                lit("\" align=\"right\">") + badge.toHtmlEscaped() + lit("</td></tr>");    // i18n-ignore: transcript protocol identifier, not UI prose.
+  return row;
+}
+
+// One card per assistant message: what the run produced, and what changed inside it.
+// A directory artifact (a resource export) lists its own files, so the receipt is
+// readable without opening the folder.
+const int ArtifactRowsCollapsed = 3;
+
+QString renderMessageArtifacts(const AIChatMessage &message, bool expanded, int messageIndex)
+{
+  if(message.artifacts.isEmpty())
+    return QString();
+
+  qint64 totalAdded = 0, totalRemoved = 0, totalFiles = 0, totalBytes = 0;
+  bool hasChangeCounts = false;
+  QStringList rowList;
+  QString rows;
+  for(int index = 0; index < message.artifacts.size(); ++index)
+  {
+    const QJsonObject artifact = message.artifacts.at(index).toObject();
+    const QString path = artifact.value(lit("path")).toString();    // i18n-ignore: transcript protocol identifier, not UI prose.
+    if(path.isEmpty())
+      continue;
+    const QJsonObject stats = artifact.value(lit("stats")).toObject();    // i18n-ignore: transcript protocol identifier, not UI prose.
+    const QString status = artifact.value(lit("status")).toString();
+    QString tooltip = path;
+    const QString note = artifact.value(lit("note")).toString().trimmed();    // i18n-ignore: transcript protocol identifier, not UI prose.
+    if(!note.isEmpty())
+      // i18n-ignore: Newline separates path from note in a tooltip.
+      tooltip += lit("\n") + note;
+
+    QString badge = artifactBadgeText(stats);
+    // i18n-ignore: Artifact status values are backend protocol identifiers.
+    if(status == lit("failed"))
+      badge = QCoreApplication::translate("AIConversationView", "failed");
+    // i18n-ignore: Artifact status values are backend protocol identifiers.
+    else if(status == lit("partial"))
+      badge = badge.isEmpty()
+                  ? QCoreApplication::translate("AIConversationView", "partial")
+                  : badge + lit(" ") + QCoreApplication::translate("AIConversationView", "partial");
+
+    if(stats.contains(lit("addedChars")) || stats.contains(lit("removedChars")))    // i18n-ignore: transcript protocol identifier, not UI prose.
+    {
+      hasChangeCounts = true;
+      totalAdded += qint64(stats.value(lit("addedChars")).toDouble());    // i18n-ignore: transcript protocol identifier, not UI prose.
+      totalRemoved += qint64(stats.value(lit("removedChars")).toDouble());
+    }
+    if(stats.value(lit("kind")).toString() == lit("directory"))    // i18n-ignore: transcript protocol identifier, not UI prose.
+      totalFiles += qint64(stats.value(lit("files")).toDouble());
+    else
+      totalFiles += 1;
+    totalBytes += qint64(stats.value(lit("bytes")).toDouble());    // i18n-ignore: transcript protocol identifier, not UI prose.
+
+    rowList << artifactRowHtml(path, artifactFileName(path), badge,
+                               // i18n-ignore: CSS class selection from a protocol status value.
+                               status == lit("failed") ? lit("artifact-failed") : QString(), tooltip);
+
+    const QJsonArray children = stats.value(lit("children")).toArray();    // i18n-ignore: transcript protocol identifier, not UI prose.
+    for(const QJsonValue &value : children)
+    {
+      const QJsonObject child = value.toObject();
+      const QString childPath = child.value(lit("path")).toString();    // i18n-ignore: transcript protocol identifier, not UI prose.
+      const QString childName = child.value(lit("name")).toString();
+      if(childPath.isEmpty() || childName.isEmpty())
+        continue;
+      const QString childBadge = QCoreApplication::translate("AIConversationView", "%1 bytes")
+                                     .arg(QLocale().toString(qint64(child.value(lit("bytes")).toDouble())));    // i18n-ignore: transcript protocol identifier, not UI prose.
+      // i18n-ignore: Structural indent for a nested file row.
+      rowList << artifactRowHtml(childPath, lit("    ") + childName, childBadge,
+                                 lit("artifact-child"), childPath);    // i18n-ignore: transcript protocol identifier, not UI prose.
+    }
+    if(stats.value(lit("childrenTruncated")).toBool())    // i18n-ignore: transcript protocol identifier, not UI prose.
+      // i18n-ignore: Structural transcript HTML; the visible text is translated.
+      rowList << lit("<tr><td class=\"artifact-row artifact-child\" colspan=\"2\">") +
+                     QCoreApplication::translate("AIConversationView", "... and more files in this folder")
+                         .toHtmlEscaped() +
+                     lit("</td></tr>");    // i18n-ignore: transcript protocol identifier, not UI prose.
+  }
+  if(rowList.isEmpty())
+    return QString();
+  // A few rows stay visible; the rest fold behind one line, so a long receipt
+  // never pushes the reply off the screen.
+  const int hidden = expanded ? 0 : qMax(0, rowList.size() - ArtifactRowsCollapsed);
+  for(int index = 0; index < rowList.size() - hidden; ++index)
+    rows += rowList.at(index);
+  if(rowList.size() > ArtifactRowsCollapsed)
+  {
+    const QString token = QString::fromLatin1(QUrl::toPercentEncoding(message.id));
+    // i18n-ignore: Internal link scheme routed to the transcript link handler.
+    const QString href = lit("replaylab-artifacts://toggle/") + token + lit("?expanded=") +
+                         (expanded ? lit("0") : lit("1"));
+    const QString label =
+        expanded ? QCoreApplication::translate("AIConversationView", "Show fewer")
+                 : QCoreApplication::translate("AIConversationView", "Show %1 more files")
+                       .arg(QLocale().toString(hidden));
+    // i18n-ignore: Structural transcript HTML; the visible text is translated.
+    rows += lit("<tr><td class=\"artifact-row artifact-more\" colspan=\"2\"><a class=\"artifact-toggle\" href=\"") +
+            href.toHtmlEscaped() + lit("\">") + label.toHtmlEscaped() +
+            // i18n-ignore: HTML entities are visual disclosure indicators, not prose.
+            (expanded ? lit(" &#9652;") : lit(" &#9662;")) + lit("</a></td></tr>");
+  }
+
+  QString heading = hasChangeCounts
+                        ? QCoreApplication::translate("AIConversationView", "Edited %1 files")
+                              .arg(QLocale().toString(totalFiles))
+                        : QCoreApplication::translate("AIConversationView", "Produced %1 files")
+                              .arg(QLocale().toString(totalFiles));
+  QString summary;
+  if(hasChangeCounts)
+    // i18n-ignore: Numeric change badge; signs are presentation, not prose.
+    summary = lit("<span class=\"artifact-add\">+%1</span> <span class=\"artifact-del\">-%2</span>")
+                  .arg(QLocale().toString(totalAdded), QLocale().toString(totalRemoved));
+  else if(totalBytes > 0)
+    summary = QCoreApplication::translate("AIConversationView", "%1 bytes")
+                  .arg(QLocale().toString(totalBytes))
+                  .toHtmlEscaped();
+
+  // The card's rounded dark panel is painted by the browser between the two
+  // named anchors; the table itself carries no background.
+  // i18n-ignore: Generated anchor prefix is an internal transcript identifier.
+  const QString cardStart = lit("replaylab-card-start-") + QString::number(messageIndex);
+  // i18n-ignore: Generated anchor prefix is an internal transcript identifier.
+  const QString cardEnd = lit("replaylab-card-end-") + QString::number(messageIndex);
+  // i18n-ignore: Structural transcript HTML contains no user-visible prose.
+  return lit("<table class=\"artifact-card\" width=\"100%\" cellspacing=\"0\" cellpadding=\"0\">") +
+         lit("<tr><td class=\"artifact-head\"><a name=\"") + cardStart + lit("\">&#8203;</a>") +    // i18n-ignore: transcript protocol identifier, not UI prose.
+         heading.toHtmlEscaped() +
+         lit("</td><td class=\"artifact-head\" align=\"right\">") + summary + lit("</td></tr>") + // i18n-ignore: structural artifact table HTML.
+         rows +
+         // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
+         lit("<tr><td class=\"artifact-foot\" colspan=\"2\"><a name=\"") + cardEnd +
+         lit("\">&#8203;</a></td></tr></table>");    // i18n-ignore: transcript protocol identifier, not UI prose.
+}
+
 QString renderMessageAttachments(const QVector<AIChatAttachment> &attachments,
                                  QTextDocument *document)
 {
@@ -1302,16 +1675,33 @@ QString renderMessageAttachments(const QVector<AIChatAttachment> &attachments,
 class AIRoundedTextBrowser : public QTextBrowser
 {
 public:
-  explicit AIRoundedTextBrowser(QWidget *parent = NULL) : QTextBrowser(parent) {}
+  explicit AIRoundedTextBrowser(QWidget *parent = NULL) : QTextBrowser(parent)
+  {
+    // The background is painted here (base colour, then the opaque rounded cards)
+    // before the document draws its text, so a card can be a real dark panel with
+    // light text rather than a tint laid over it.
+    viewport()->setAutoFillBackground(false);
+  }
+
+  void setCardAnchors(const QVector<QPair<QString, QString>> &anchors)
+  {
+    m_CardCursors = resolveAnchorPairs(anchors);
+    viewport()->update();
+  }
 
   void setBubbleAnchors(const QVector<QPair<QString, QString>> &anchors)
   {
-    m_BubbleCursors.clear();
+    m_BubbleCursors = resolveAnchorPairs(anchors);
+    viewport()->update();
+  }
+
+private:
+  QVector<QPair<QTextCursor, QTextCursor>> resolveAnchorPairs(
+      const QVector<QPair<QString, QString>> &anchors)
+  {
+    QVector<QPair<QTextCursor, QTextCursor>> resolved;
     if(anchors.isEmpty() || !document())
-    {
-      viewport()->update();
-      return;
-    }
+      return resolved;
 
     QHash<QString, QTextCursor> anchorCursors;
     for(QTextBlock block = document()->begin(); block.isValid(); block = block.next())
@@ -1333,15 +1723,45 @@ public:
     for(const QPair<QString, QString> &names : anchors)
     {
       if(anchorCursors.contains(names.first) && anchorCursors.contains(names.second))
-        m_BubbleCursors.push_back(
+        resolved.push_back(
             qMakePair(anchorCursors.value(names.first), anchorCursors.value(names.second)));
     }
-    viewport()->update();
+    return resolved;
+  }
+
+  QRectF spanRect(const QPair<QTextCursor, QTextCursor> &cursors, qreal leftInset,
+                  qreal topInset, qreal rightInset, qreal bottomInset) const
+  {
+    const QRect start = cursorRect(cursors.first);
+    const QRect end = cursorRect(cursors.second);
+    if(end.bottom() < start.top())
+      return QRectF();
+    return QRectF(start.left() - leftInset, start.top() - topInset,
+                  viewport()->width() - start.left() - rightInset,
+                  end.bottom() - start.top() + topInset + bottomInset);
   }
 
 protected:
   void paintEvent(QPaintEvent *event) override
   {
+    {
+      QPainter background(viewport());
+      background.fillRect(event->rect(), palette().brush(QPalette::Base));
+      if(!m_CardCursors.isEmpty() && document())
+      {
+        background.setRenderHint(QPainter::Antialiasing, true);
+        background.setClipRect(event->rect());
+        background.setBrush(QColor(0x18, 0x18, 0x18));
+        background.setPen(QPen(QColor(0x3c, 0x3c, 0x3c), 1.0));
+        for(const QPair<QTextCursor, QTextCursor> &cursors : m_CardCursors)
+        {
+          const QRectF card = spanRect(cursors, 8.0, 6.0, 9.0, 8.0);
+          if(card.width() <= 4.0 || card.height() <= 4.0 || !card.intersects(QRectF(event->rect())))
+            continue;
+          background.drawRoundedRect(card, 10.0, 10.0);
+        }
+      }
+    }
     QTextBrowser::paintEvent(event);
     if(m_BubbleCursors.isEmpty() || !document())
       return;
@@ -1372,6 +1792,7 @@ protected:
 
 private:
   QVector<QPair<QTextCursor, QTextCursor>> m_BubbleCursors;
+  QVector<QPair<QTextCursor, QTextCursor>> m_CardCursors;
 };
 
 static QColor blendedColor(const QColor &from, const QColor &to, int toPercent)
@@ -1901,6 +2322,31 @@ AIConversationView::AIConversationView(QWidget *parent) : QWidget(parent)
   connect(m_Browser, &QTextBrowser::customContextMenuRequested, this,
           [this](const QPoint &position) {
             QMenu *menu = m_Browser->createStandardContextMenu();
+            const QString anchorHref = m_Browser->anchorAt(position);
+            // i18n-ignore: Internal link scheme routed to the transcript link handler.
+            if(anchorHref.startsWith(lit("replaylab-artifact://")) ||
+               anchorHref.startsWith(lit("rdoc://shader"))) // i18n-ignore: Captured Shader navigation URI.
+            {
+              const QUrl artifactUrl(anchorHref);
+              const QString artifactPath = artifactUrl.scheme() == QLatin1String("rdoc")
+                  ? QUrlQuery(artifactUrl).queryItemValue(QStringLiteral("path"), QUrl::FullyDecoded)
+                  : QUrl::fromPercentEncoding(artifactUrl.path().mid(1).toUtf8());
+              menu->addSeparator();
+              QAction *open = menu->addAction(
+                  QCoreApplication::translate("AIConversationView", "Open file"));
+              connect(open, &QAction::triggered, this, [this, artifactUrl]() { activateLink(artifactUrl); });
+              QAction *copy = menu->addAction(
+                  QCoreApplication::translate("AIConversationView", "Copy path"));
+              connect(copy, &QAction::triggered, this,
+                      [artifactPath]() { QGuiApplication::clipboard()->setText(artifactPath); });
+              QAction *reveal = menu->addAction(
+                  QCoreApplication::translate("AIConversationView", "Show in folder"));
+              connect(reveal, &QAction::triggered, this, [this, artifactPath]() {
+                // i18n-ignore: Internal link scheme routed to the transcript link handler.
+                activateLink(QUrl(lit("replaylab-artifact://reveal/") +
+                                  QString::fromUtf8(QUrl::toPercentEncoding(artifactPath))));
+              });
+            }
             if(m_SelectionAttachmentHandler && m_Browser->textCursor().hasSelection())
             {
               menu->addSeparator();
@@ -2004,6 +2450,105 @@ AIConversationView::AIConversationView(QWidget *parent) : QWidget(parent)
   m_LiveTextTimer->setInterval(LiveTextRevealIntervalMs);
   m_LiveTextTimer->setTimerType(Qt::PreciseTimer);
   connect(m_LiveTextTimer, &QTimer::timeout, this, [this]() { advanceLiveText(); });
+  m_ElapsedTimer = new QTimer(this);
+  m_ElapsedTimer->setInterval(1000);
+  connect(m_ElapsedTimer, &QTimer::timeout, this, [this]() { advanceElapsedText(); });
+}
+
+void AIConversationView::rebuildElapsedCursors()
+{
+  m_ElapsedCursors.clear();
+  if(!m_Browser || !m_Browser->document() || m_ElapsedAnchors.isEmpty())
+  {
+    if(m_ElapsedTimer)
+      m_ElapsedTimer->stop();
+    return;
+  }
+  QTextDocument *document = m_Browser->document();
+  for(QTextBlock block = document->begin(); block.isValid(); block = block.next())
+  {
+    for(QTextBlock::iterator it = block.begin(); !it.atEnd(); ++it)
+    {
+      const QTextFragment fragment = it.fragment();
+      if(!fragment.isValid())
+        continue;
+      for(const QString &name : fragment.charFormat().anchorNames())
+      {
+        const auto anchor = m_ElapsedAnchors.constFind(name);
+        if(anchor == m_ElapsedAnchors.constEnd() || m_ElapsedCursors.contains(name))
+          continue;
+        // Qt's HTML importer assigns a named anchor only to the first character,
+        // not the whole <a> contents. Use the exact rendered label length: neither
+        // that fragment nor a merge of same-name fragments includes the unit.
+        ElapsedCursor target;
+        target.cursor = QTextCursor(document);
+        target.cursor.setPosition(fragment.position());
+        target.format = fragment.charFormat();
+        target.text = anchor.value().second;
+        target.length = target.text.size();
+        target.startMs = anchor.value().first;
+        if(target.length == 0 || fragment.position() + target.length >= document->characterCount())
+          continue;
+        QTextCursor span(target.cursor);
+        span.setPosition(fragment.position() + target.length, QTextCursor::KeepAnchor);
+        if(span.selectedText() != target.text)
+          continue;
+        m_ElapsedCursors.insert(name, target);
+      }
+    }
+  }
+  if(m_ElapsedTimer)
+  {
+    if(m_ElapsedCursors.isEmpty())
+      m_ElapsedTimer->stop();
+    else if(!m_ElapsedTimer->isActive())
+      m_ElapsedTimer->start();
+  }
+}
+
+void AIConversationView::advanceElapsedText()
+{
+  // Replace each complete running duration, including its translated units. The
+  // surrounding document, selection, scroll position and toggle links stay intact.
+  if(!m_Browser || !m_Browser->document() || m_ElapsedCursors.isEmpty())
+  {
+    if(m_ElapsedTimer)
+      m_ElapsedTimer->stop();
+    return;
+  }
+  const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+  bool stale = false;
+  for(auto it = m_ElapsedCursors.begin(); it != m_ElapsedCursors.end(); ++it)
+  {
+    ElapsedCursor &entry = it.value();
+    const QString text = elapsedText(nowMs - entry.startMs);
+    if(text.size() == 0 || entry.cursor.isNull())
+      continue;
+    const int position = entry.cursor.position();
+    QTextCursor edit(m_Browser->document());
+    edit.setPosition(position);
+    edit.setPosition(position + entry.length, QTextCursor::KeepAnchor);
+    const QString current = edit.selectedText();
+    if(current == text)
+      continue;
+    // Replace this span only while it still holds exactly what this view put there.
+    // Anything else means the document moved on (a re-render between ticks, a span
+    // that spells the label differently); overwriting it then corrupts the label,
+    // and the repair is to find the label again, not to write over what is there.
+    if(current != entry.text)
+    {
+      stale = true;
+      continue;
+    }
+    edit.insertText(text, entry.format);
+    entry.length = text.size();
+    entry.text = text;
+    m_ElapsedAnchors[it.key()].second = text;
+    // insertText leaves the tracking cursor after the new text; keep it at the start.
+    entry.cursor.setPosition(position);
+  }
+  if(stale)
+    rebuildElapsedCursors();
 }
 
 void AIConversationView::setMessages(const QVector<AIChatMessage> &messages)
@@ -2036,6 +2581,7 @@ void AIConversationView::setMessages(const QVector<AIChatMessage> &messages)
   if(conversationChanged)
   {
     ++m_UserInteractionGeneration;
+    ++m_TailResetGeneration;
     m_FollowTail = true;
     m_PreservedScrollValue = 0;
     clearViewportAnchor();
@@ -2054,7 +2600,7 @@ void AIConversationView::setMessages(const QVector<AIChatMessage> &messages)
       if(conversationChanged)
       {
         // Switching conversations materializes existing history immediately. Later extensions to
-        // the same live stream still resume at one grapheme per timer tick.
+        // the same live stream are coalesced into one insertion per display frame.
         activity.visibleDetailChars = -1;
         continue;
       }
@@ -2123,10 +2669,13 @@ void AIConversationView::setMessages(const QVector<AIChatMessage> &messages)
 void AIConversationView::clear()
 {
   ++m_RenderGeneration;
+  ++m_TailResetGeneration;
   m_Messages.clear();
   m_MessageAnchors.clear();
   m_LiveTextAnchors.clear();
   m_LiveTextCursors.clear();
+  m_ElapsedAnchors.clear();
+  m_ElapsedCursors.clear();
   m_FollowTail = true;
   m_AdjustingScroll = false;
   m_SelectingText = false;
@@ -2183,14 +2732,16 @@ void AIConversationView::advanceLiveText()
          activity.visibleDetailChars >= activity.detail.size())
         continue;
 
-      const int next = nextGraphemeBoundary(activity.detail, activity.visibleDetailChars);
-      const QString grapheme =
-          activity.detail.mid(activity.visibleDetailChars, next - activity.visibleDetailChars);
+      // Display the complete received suffix in one edit. The provider already streams bounded
+      // text fragments; animating those again one grapheme at a time both delayed visible progress
+      // and repeatedly segmented the entire growing string on the GUI thread. Appending a suffix
+      // intact preserves all Unicode text without introducing artificial grapheme boundaries.
+      const QString suffix = activity.detail.mid(activity.visibleDetailChars);
       const QString key = liveTextKey(message, activity);
       auto cursor = m_LiveTextCursors.find(key);
       if(cursor != m_LiveTextCursors.end())
       {
-        cursor.value().cursor.insertText(grapheme, cursor.value().format);
+        cursor.value().cursor.insertText(suffix, cursor.value().format);
       }
       else if(message.activityExpanded)
       {
@@ -2200,9 +2751,7 @@ void AIConversationView::advanceLiveText()
         continue;
       }
 
-      activity.visibleDetailChars = next;
-      if(activity.visibleDetailChars >= activity.detail.size())
-        activity.visibleDetailChars = -1;
+      activity.visibleDetailChars = -1;
     }
   }
 
@@ -2275,6 +2824,29 @@ void AIConversationView::scrollToMessage(const QString &messageId)
   }
 }
 
+void AIConversationView::followSubmittedTurn()
+{
+  // Sending is an explicit request to return to the live conversation. A selection in the old
+  // answer survives focus moving to the composer; leaving it in place would defer every new row
+  // indefinitely. Do not do this on background updates, which must preserve reading/copying.
+  ++m_UserInteractionGeneration;
+  ++m_TailResetGeneration;
+  m_SelectingText = false;
+  m_FollowTail = true;
+  clearViewportAnchor();
+  if(m_Browser)
+  {
+    const bool wasAdjusting = m_AdjustingScroll;
+    m_AdjustingScroll = true;
+    QTextCursor cursor = m_Browser->textCursor();
+    cursor.clearSelection();
+    m_Browser->setTextCursor(cursor);
+    m_AdjustingScroll = wasAdjusting;
+  }
+  updateSelectionAction();
+  scrollToLatest();
+}
+
 void AIConversationView::scrollToLatest()
 {
   QScrollBar *bar = m_Browser ? m_Browser->verticalScrollBar() : NULL;
@@ -2331,9 +2903,11 @@ void AIConversationView::scheduleUserScrollUpdate()
   if(m_UserScrollUpdatePending)
     return;
   m_UserScrollUpdatePending = true;
-  QTimer::singleShot(0, this, [this]() {
+  const quint64 tailResetGeneration = m_TailResetGeneration;
+  QTimer::singleShot(0, this, [this, tailResetGeneration]() {
     m_UserScrollUpdatePending = false;
-    updateFollowTailFromUser();
+    if(tailResetGeneration == m_TailResetGeneration)
+      updateFollowTailFromUser();
   });
 }
 
@@ -2732,13 +3306,31 @@ bool AIConversationView::eventFilter(QObject *watched, QEvent *event)
 
 void AIConversationView::activateLink(const QUrl &url)
 {
+  if(url.scheme() == QLatin1String("replaylab-activity") && url.host() == QLatin1String("more"))
+  {
+    const QString id = QUrl::fromPercentEncoding(url.path().mid(1).toUtf8());
+    m_ActivityHistoryLimits[id] = m_ActivityHistoryLimits.value(id, 96) + 96;
+    render();
+    return;
+  }
   if(url.scheme().compare(lit("replaylab-message"), Qt::CaseInsensitive) == 0)
   {
     scrollToMessage(QUrl::fromPercentEncoding(url.path().mid(1).toUtf8()));
     return;
   }
-  if(url.scheme().compare(lit("replaylab-activity"), Qt::CaseInsensitive) == 0 &&
+  if(url.scheme().compare(lit("replaylab-artifacts"), Qt::CaseInsensitive) == 0 && // i18n-ignore: transcript action URL scheme.
      url.host().compare(lit("toggle"), Qt::CaseInsensitive) == 0)
+  {
+    const QString messageId = QUrl::fromPercentEncoding(url.path().mid(1).toUtf8());
+    if(QUrlQuery(url).queryItemValue(lit("expanded")) == lit("1")) // i18n-ignore: transcript action URL query.
+      m_ExpandedArtifactMessages.insert(messageId);
+    else
+      m_ExpandedArtifactMessages.remove(messageId);
+    render();
+    return;
+  }
+  if(url.scheme().compare(lit("replaylab-activity"), Qt::CaseInsensitive) == 0 &&
+     url.host().compare(lit("toggle"), Qt::CaseInsensitive) == 0) // i18n-ignore: transcript action URL host.
   {
     const QString messageId = QUrl::fromPercentEncoding(url.path().mid(1).toUtf8());
     const bool expanded = QUrlQuery(url).queryItemValue(lit("expanded")) == lit("1");
@@ -2780,6 +3372,7 @@ void AIConversationView::render(bool preserveScroll)
 
   m_MessageAnchors.clear();
   m_LiveTextAnchors.clear();
+  m_ElapsedAnchors.clear();
   QVector<AITurnRailWidget::Turn> turns;
   QHash<QString, QString> assistantTextByTask;
   for(const AIChatMessage &message : m_Messages)
@@ -2874,11 +3467,21 @@ void AIConversationView::render(bool preserveScroll)
   // anchoring even when no conversation text changed.
   const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
 
+  // Prepare an unobserved document. Replacing the visible document in place causes selection,
+  // layout and scrollbar callbacks while the HTML importer is still rebuilding its contents.
+  // Attachment resources belong to this document as well, not to the one being replaced.
+  QTextDocument *document = new QTextDocument(m_Browser);
+  document->setDefaultFont(m_Browser->document()->defaultFont());
+  document->setDocumentMargin(m_Browser->document()->documentMargin());
+  document->setUndoRedoEnabled(false);
+
   // i18n-ignore: Structural transcript HTML contains no user-visible prose.
   QString html = lit("<!DOCTYPE html><html><head><style>");
   html +=
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
-      lit("body{background:") + base + lit(";color:") + text +
+      // The viewport paints the base colour itself (see AIRoundedTextBrowser), so
+      // the document body stays transparent and opaque cards can sit behind text.
+      lit("body{color:") + text + // i18n-ignore: transcript CSS declaration.
       QLatin1String(";margin:7px;font-family:'Segoe UI Variable Text','Segoe UI','Microsoft YaHei UI',") +
       QLatin1String("'Noto Sans CJK SC',sans-serif;font-size:10pt;line-height:145%;}a{color:") + link +
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
@@ -2930,7 +3533,28 @@ void AIConversationView::render(bool preserveScroll)
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
       lit(";background-color:") + separator + lit(";color:") + separator +
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
-      lit(";height:1px;margin:4px 0 7px 0;}.activity-list{margin-left:9px;padding-left:11px;") +
+      lit(";height:1px;margin:4px 0 7px 0;}") +
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      // The card panel (dark, rounded) is painted by the browser; the table only
+      // spaces its rows and colours the text for that dark panel.
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      lit(".artifact-card{margin:12px 0 8px 0;}.artifact-head{color:#f2f2f2;font-weight:600;") +
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      lit("font-size:12px;padding:8px 12px 6px 12px;}.artifact-row{padding:3px 12px;font-size:12px;}") +
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      lit(".artifact-foot{padding:0 12px 4px 12px;font-size:4px;}") +
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      lit(".artifact-badge{padding:3px 12px;font-size:11px;color:#9a9a9a;}") +
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      lit(".artifact-link{color:#e6e6e6;text-decoration:none;}.artifact-add{color:#3fb950;}") +
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      lit(".artifact-toggle{color:#9a9a9a;text-decoration:none;}.artifact-more{padding:4px 12px 6px 12px;}") +
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      lit(".artifact-del{color:#f85149;}.artifact-child{color:#b0b0b0;") +
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      lit("}.artifact-failed{color:#8a8a8a;") +
+      // i18n-ignore: Transcript CSS declarations contain no user-visible text.
+      lit(";text-decoration:line-through;}.activity-list{margin-left:9px;padding-left:11px;") +
       QLatin1String("border-left:1px solid ") + border +
       QLatin1String(";}.activity-row{margin:4px 0 9px 0;color:") +
       // i18n-ignore: Transcript CSS declarations contain no user-visible text.
@@ -2985,6 +3609,7 @@ void AIConversationView::render(bool preserveScroll)
       lit(";padding-left:8px;margin:2px 0 2px 4px;}</style></head><body>");
 
   QVector<QPair<QString, QString>> bubbleAnchors;
+  QVector<QPair<QString, QString>> cardAnchors;
   for(int messageIndex = 0; messageIndex < m_Messages.size(); ++messageIndex)
   {
     const AIChatMessage &message = m_Messages[messageIndex];
@@ -3016,7 +3641,7 @@ void AIConversationView::render(bool preserveScroll)
                 // i18n-ignore: Structural transcript HTML contains no user-visible prose.
                 lit("</div>");
       // i18n-ignore: Structural transcript HTML contains no user-visible prose.
-      html += renderMessageAttachments(message.attachments, m_Browser->document()) +
+      html += renderMessageAttachments(message.attachments, document) +
               safeMarkdown(message.text) +
               // i18n-ignore: Structural transcript HTML contains no user-visible prose.
               lit("<a class=\"bubble-marker\" name=\"") + bubbleEnd +
@@ -3028,19 +3653,26 @@ void AIConversationView::render(bool preserveScroll)
         const qint64 finishedMs = message.finishedTimestampMs > 0
                                       ? message.finishedTimestampMs
                                       : assistantFinishedByTask.value(message.taskId, 0);
-        html += renderActivityGroup(message, finishedMs, nowMs, &m_LiveTextAnchors);
+        html += renderActivityGroup(message, finishedMs, nowMs, &m_LiveTextAnchors,
+                                    &m_ElapsedAnchors, m_ActivityHistoryLimits.value(message.id, 96));
       }
     }
     // i18n-ignore: Message role is a backend protocol identifier used only for routing.
     else if(message.role == lit("assistant"))
     {
+      if(!message.artifacts.isEmpty())
+        // i18n-ignore: Generated anchor prefixes are internal transcript identifiers.
+        cardAnchors.push_back(qMakePair(lit("replaylab-card-start-") + QString::number(messageIndex),
+                                        lit("replaylab-card-end-") + QString::number(messageIndex))); // i18n-ignore: generated transcript anchor identifier.
       // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
       html += lit("<div class=\"assistant\"><a class=\"message-marker\" name=\"") +
               anchor.toHtmlEscaped() +
               // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
               lit("\">&#8203;</a>") +
-              renderMessageAttachments(message.attachments, m_Browser->document()) +
+              renderMessageAttachments(message.attachments, document) +
               safeMarkdown(message.text) +
+              renderMessageArtifacts(message, m_ExpandedArtifactMessages.contains(message.id),
+                                     messageIndex) +
               // i18n-ignore: Structural transcript HTML contains no user-visible prose.
               lit("</div>");
     }
@@ -3051,7 +3683,7 @@ void AIConversationView::render(bool preserveScroll)
               anchor.toHtmlEscaped() +
               // i18n-ignore: Structural transcript HTML and zero-width marker contain no prose.
               lit("\">&#8203;</a>") +
-              renderMessageAttachments(message.attachments, m_Browser->document()) +
+              renderMessageAttachments(message.attachments, document) +
               safeMarkdown(message.text) +
               // i18n-ignore: Structural transcript HTML contains no user-visible prose.
               lit("</div>");
@@ -3063,13 +3695,14 @@ void AIConversationView::render(bool preserveScroll)
       const qint64 finishedMs = message.finishedTimestampMs > 0
                                     ? message.finishedTimestampMs
                                     : assistantFinishedByTask.value(message.taskId, 0);
-      html += renderActivityGroup(message, finishedMs, nowMs, &m_LiveTextAnchors);
+      html += renderActivityGroup(message, finishedMs, nowMs, &m_LiveTextAnchors,
+                                  &m_ElapsedAnchors, m_ActivityHistoryLimits.value(message.id, 96));
     }
 
     if(!message.provisionalText.isEmpty())
     {
       QString provisionalLabel =
-          QCoreApplication::translate("AIConversationView", "ReplayLab (live)");
+          QCoreApplication::translate("AIConversationView", "AI (live)");
       if(message.state == lit("superseded") || message.state == lit("interrupted") ||
          message.state == lit("cancelled"))
         provisionalLabel =
@@ -3086,11 +3719,22 @@ void AIConversationView::render(bool preserveScroll)
 
   const int generation = ++m_RenderGeneration;
   const quint64 userInteractionGeneration = m_UserInteractionGeneration;
+  document->setHtml(inlineTranscriptStyles(html));
   m_AdjustingScroll = true;
-  m_Browser->setHtml(html);
+  m_LiveTextCursors.clear();
+  m_ElapsedCursors.clear();
+  static_cast<AIRoundedTextBrowser *>(m_Browser)->setBubbleAnchors({});
+  static_cast<AIRoundedTextBrowser *>(m_Browser)->setCardAnchors({});
+  // QTextEdit deletes its original control-owned document, but not externally supplied ones.
+  // QPointer covers both cases; do not accumulate a document for every streamed update.
+  QPointer<QTextDocument> previousDocument = m_Browser->document();
+  m_Browser->setDocument(document);
+  delete previousDocument.data();
   rebuildLiveTextCursors();
+  rebuildElapsedCursors();
   updateLiveTextTimer();
   static_cast<AIRoundedTextBrowser *>(m_Browser)->setBubbleAnchors(bubbleAnchors);
+  static_cast<AIRoundedTextBrowser *>(m_Browser)->setCardAnchors(cardAnchors);
   QTimer::singleShot(0, this, [this, generation, userInteractionGeneration]() {
     if(generation != m_RenderGeneration)
       return;

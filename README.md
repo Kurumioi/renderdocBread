@@ -1,74 +1,83 @@
-<p align="center"><img src="https://user-images.githubusercontent.com/661798/36482670-f81601c0-170b-11e8-8adb-2365b346ac27.png" /></p>
+# RenderDocBread
 
-[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
-[![CI](https://github.com/baldurk/renderdoc/actions/workflows/ci.yml/badge.svg?branch=v1.x&event=push)](https://github.com/baldurk/renderdoc/actions)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.0%20adopted-ff69b4.svg)](docs/CODE_OF_CONDUCT.md) 
+RenderDoc 史诗升级，内嵌 AI、调试工具，快使用它来调试渲染吧！
 
-RenderDoc is a frame-capture based graphics debugger, currently available for Vulkan, D3D11, D3D12, OpenGL, and OpenGL ES development on Windows, Linux, Android, and Nintendo Switch&trade;. It is completely open-source under the MIT license.
+直接在捕获帧中提问，让 AI 分析渲染流程、整理和调试 Shader、动态调整 CBuffer；也可以让 AI 将选定的渲染效果移植到 Unity，搭建可编辑的场景，再对照画面逐步调整。
 
-RenderDoc is intended for debugging your own programs only. Any discussion of capturing programs that you did not create will not be allowed in any official public RenderDoc setting, including the issue tracker, discord, or via email. For example this includes capturing commercial games that you did not create, or capturing Google Maps or Google Earth. Note: Capturing projects you created that use a third party engine like Unreal or Unity, or open source and free projects is completely fine and supported.
+📖 [完整介绍与使用教程：RenderDocBread 史诗升级（知乎）](https://zhuanlan.zhihu.com/p/2098534987763131428)
 
-If you have any questions, suggestions or problems or you can [create an issue](https://github.com/baldurk/renderdoc/issues/new/choose) here on github, [email me directly](mailto:baldurk@baldurk.org) or come into [IRC](https://webchat.oftc.net/?channels=renderdoc) or [Discord](https://discord.gg/ahq6yRB) to discuss it.
+## 下载
 
-To install on windows run the appropriate installer for your OS ([64-bit](https://renderdoc.org/stable/latest/RenderDoc_latest_64.msi) | [32-bit](https://renderdoc.org/stable/latest/RenderDoc_latest_32.msi)) or download the portable zip from the [builds page](https://renderdoc.org/builds). The 64-bit windows build fully supports capturing from 32-bit programs. On linux only 64-bit x86 is supported - there is a precompiled [binary tarball](https://renderdoc.org/stable/latest/renderdoc_latest.tar.gz) available, or your distribution may package it. If not you can [build from source](docs/CONTRIBUTING/Compiling.md).
+在 [Releases](https://github.com/Straw1997/renderdocBread/releases/latest) 下载 Windows x64 完整便携版和 SHA-256 校验文件。解压后运行 `RenderDocBread.exe`。
 
-* **Downloads**: Stable and nightly builds: https://renderdoc.org/builds ( [Symbol server](https://renderdoc.org/symbols) )
-* **Documentation**: [HTML online](https://renderdoc.org/docs), [CHM in builds](https://renderdoc.org/docs/renderdoc.chm), [Videos](https://www.youtube.com/user/baldurkarlsson)
-* **Contact**: [baldurk@baldurk.org](mailto:baldurk@baldurk.org), [#renderdoc on OFTC IRC](https://webchat.oftc.net/?channels=renderdoc), [Discord server](https://discord.gg/ahq6yRB)
-* **Code of Conduct**: [Contributor Covenant](docs/CODE_OF_CONDUCT.md)
-* **Information for contributors**: [All contribution information](docs/CONTRIBUTING.md), [Compilation instructions](docs/CONTRIBUTING/Compiling.md)
-* **Community extensions**: [Extensions repository](https://github.com/baldurk/renderdoc-contrib)
+## 效果演示
 
-Screenshots
---------------
+### 一句话在 Unity 中还原渲染
 
-| [ ![Texture view](https://renderdoc.org/fp/ts_screen1.jpg?2) ](https://renderdoc.org/fp/screen1.jpg) | [ ![Pixel history & shader debug](https://renderdoc.org/fp/ts_screen2.jpg?2) ](https://renderdoc.org/fp/screen2.png) |
+从捕获中分析模型、纹理、Shader 和参数，在 Unity 中还原并对照效果。
+
+<!-- bread-video:unity-restoration:begin -->
+
+https://github.com/user-attachments/assets/74984035-3306-43dd-b3bd-e33d555f3b32
+
+<!-- bread-video:unity-restoration:end -->
+
+[MP4 文件：Unity 效果还原演示（约 25 秒，含音轨）](docs/media/bread/unity-restoration.mp4)
+
+<!-- bread-video:unity-frame-debugger:begin -->
+
+https://github.com/user-attachments/assets/22e66080-ca93-40d0-ab08-dcc3c5565b2a
+
+<!-- bread-video:unity-frame-debugger:end -->
+
+[MP4 文件：Unity Frame Debugger 绘制过程（约 15 秒，含音轨）](docs/media/bread/unity-frame-debugger.mp4)
+
+复杂的光照、后处理和历史帧效果仍需要结合捕获内容分析、移植与校准。
+
+### RenderDoc 中直接使用 AI
+
+在同一个窗口中查看捕获、阅读整理后的 Shader，并让 Bread AI 调用工作流与工具继续分析。
+
+![RenderDocBread 与内嵌 Bread AI](docs/media/bread/renderdocbread.png)
+
+### Shader 可视化调试
+
+选择代码中的变量或计算结果，直接输出到画面，观察这一部分对渲染的影响。
+
+![Shader 可视化调试动图](docs/media/bread/shader-debug.gif)
+
+### CBuffer 参数动态调整
+
+为参数整理可读名称，修改数值后实时观察捕获画面的变化。
+
+![CBuffer 参数动态调整动图](docs/media/bread/cbuffer-live-edit.gif)
+
+### 帧渲染流程图
+
+把一帧中的绘制阶段、输入输出纹理和关联事件串起来，点击查看对应内容。
+
+![帧渲染流程图](docs/media/bread/frame-flow.png)
+
+*图示来自演示版本，界面以当前版本为准。*
+
+## 新增与拓展
+
+| 功能 | 可以做什么 |
 | --- | --- |
-| [ ![Mesh viewer](https://renderdoc.org/fp/ts_screen3.jpg?2) ](https://renderdoc.org/fp/screen3.png) | [ ![Pipeline viewer & constants](https://renderdoc.org/fp/ts_screen4.jpg?2) ](https://renderdoc.org/fp/screen4.png) |
+| **Bread AI** | 在 RenderDoc 内对话，使用 Skills、MCP 和内置工具分析捕获；支持模型 API 与 Agent 订阅连接。 |
+| **项目与资源关联** | 保存项目中的 Shader、参数别名与分析成果；关联解包资源，辅助查找模型、纹理和材质信息。 |
+| **着色器工作区** | 将 Shader 整理为可读函数、计算目录和流程图，编辑、编译、替换并观察渲染结果。 |
+| **Shader 与 CBuffer 调试** | 可视化查看中间计算结果，动态调整参数，定位画面差异。 |
+| **帧渲染流程图** | 由 AI 梳理 Pass、事件和资源关系，在应用中查看通道详情、跳转事件并导出流程图图片。 |
+| **Unity 效果还原** | 导出并移植模型、纹理、Shader 和参数，搭建材质、预制体与场景；自动准备 Unity MCP 连接，断线后恢复并继续处理。 |
+| **日常调试改进** | 事件过滤、书签与 Shader 跳转、RT 历史、像素检查，以及中英界面和黑色主题。 |
+| **智能体监视器** | 查看 AI 任务、工具调用和执行状态，方便跟进分析过程。 |
 
-API Support
---------------
+<details>
+<summary>查看智能体监视器</summary>
 
-|                          | Windows                  | Linux                    | Android                   |
-| ------------------------ | ------------------------ | ------------------------ | ------------------------  |
-| Vulkan                   | :heavy_check_mark:       | :heavy_check_mark:       | :heavy_check_mark:        |
-| OpenGL ES 2.0 - 3.2      | :heavy_check_mark:       | :heavy_check_mark:       | :heavy_check_mark:        |
-| OpenGL 3.2 - 4.6 Core    | :heavy_check_mark:       | :heavy_check_mark:       |  N/A                      |
-| D3D11 & D3D12            | :heavy_check_mark:       |  N/A                     |  N/A                      |
-| OpenGL 1.0 - 2.0 Compat  | :heavy_multiplication_x: | :heavy_multiplication_x: |  N/A                      |
-| D3D9 & 10                | :heavy_multiplication_x: |  N/A                     |  N/A                      |
-| Metal                    |  N/A                     |  N/A                     |  N/A                      |
+![智能体监视器](docs/media/bread/agent-monitor.png)
 
-* Nintendo Switch&trade; support is distributed separately for authorized developers as part of the NintendoSDK. For more information, consult the Nintendo Developer Portal.
+</details>
 
-Downloads
---------------
-
-There are [binary releases](https://renderdoc.org/builds) available, built from the release targets. If you just want to use the program and you ended up here, this is what you want :).
-
-It's recommended that if you're new you start with the stable builds. Nightly builds are available every day from the [v1.x branch here](https://renderdoc.org/builds#nightly) if you need it, but correspondingly may be less stable.
-
-Documentation
---------------
-
-The text documentation is available [online for the latest stable version](https://renderdoc.org/docs/), as well as in [renderdoc.chm](https://renderdoc.org/docs/renderdoc.chm) in any build. It's built from [restructured text with sphinx](docs).
-
-As mentioned above there are some [youtube videos](https://www.youtube.com/user/baldurkarlsson) showing the use of some basic features and an introduction/overview.
-
-There is also a great presentation by [@Icetigris](https://twitter.com/Icetigris) which goes into some details of how RenderDoc can be used in real world situations: [slides are up here](https://docs.google.com/presentation/d/1LQUMIld4SGoQVthnhT1scoA3k4Sg0as14G4NeSiSgFU/edit#slide=id.p).
-
-License
---------------
-
-RenderDoc is released under the MIT license, see [LICENSE.md](LICENSE.md) for full text as well as 3rd party library acknowledgements.
-
-Compiling
----------
-
-Building RenderDoc is fairly straight forward on most platforms. See [Compiling.md](docs/CONTRIBUTING/Compiling.md) for more details.
-
-Contributing & Development
---------------
-
-I've added some notes on how to contribute, as well as where to get started looking through the code in [Developing-Change.md](docs/CONTRIBUTING/Developing-Change.md). All contribution information is available under [CONTRIBUTING.md](docs/CONTRIBUTING.md).
-
+基于 [RenderDoc](https://github.com/baldurk/renderdoc) 拓展。首方代码许可证见 [LICENSE.md](LICENSE.md)，随附依赖按各自许可证与通知分发。

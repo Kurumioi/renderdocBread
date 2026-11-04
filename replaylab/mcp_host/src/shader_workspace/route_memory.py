@@ -81,21 +81,42 @@ _CBUFFER_LOAD = re.compile(
 )
 
 
+# Dynamically indexed constant-buffer *handles* (``cb[idx]``): SM6.0-6.5
+# ``createHandle(i32 57, i8 2 /*CBuffer*/, i32 rangeId, i32 %idx, i1 nonUniform)`` and SM6.6
+# ``createHandleFromBinding(i32 217, %dx.types.ResBind { ..., i8 2 }, i32 %idx, i1 ...)``.
+_CBUFFER_HANDLE = re.compile(
+    r"@dx\.op\.createHandle\s*\(\s*i32\s+57\s*,\s*i8\s+2\s*,\s*i32\s+\d+\s*,\s*i32\s+(?P<index>%?[A-Za-z0-9_.]+)"
+)
+_CBUFFER_HANDLE_FROM_BINDING = re.compile(
+    r"@dx\.op\.createHandleFromBinding\s*\(\s*i32\s+217\s*,\s*%dx\.types\.ResBind\s*\{[^}]*i8\s+2\s*\}\s*,\s*i32\s+(?P<index>%?[A-Za-z0-9_.]+)"
+)
+
+
 def dxil_route_features(disassembly_text: str) -> dict[str, Any]:
     """Facts about one DXIL module that decide decompiler compatibility."""
 
     loads = 0
-    dynamic = 0
+    dynamic_rows = 0
     for match in _CBUFFER_LOAD.finditer(disassembly_text):
         loads += 1
         if match.group("row").startswith("%"):
-            dynamic += 1
+            dynamic_rows += 1
+    handles = 0
+    dynamic_handles = 0
+    for pattern in (_CBUFFER_HANDLE, _CBUFFER_HANDLE_FROM_BINDING):
+        for match in pattern.finditer(disassembly_text):
+            handles += 1
+            if match.group("index").startswith("%"):
+                dynamic_handles += 1
+    dynamic = dynamic_rows + dynamic_handles
     return {
         "schema": "renderdoc-ultra-shader-route-features/v1",
         "cbufferLoads": loads,
-        "dynamicCBufferLoads": dynamic,
+        "dynamicCBufferLoads": dynamic_rows,
+        "cbufferHandles": handles,
+        "dynamicCBufferHandles": dynamic_handles,
         "dynamicCBufferIndex": dynamic > 0,
-        "signature": "dyncb" if dynamic else ("static" if loads else "nocb"),
+        "signature": "dyncb" if dynamic else ("static" if (loads or handles) else "nocb"),
     }
 
 

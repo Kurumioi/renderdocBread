@@ -46,14 +46,14 @@ function Set-FakeRuntimeOutput {
         (Join-Path $Directory "ReplayLabInternal.exe"),
         [Text.Encoding]::UTF8.GetBytes("fake-internal-runtime"))
     [IO.File]::WriteAllBytes(
-        (Join-Path $Directory "ReplayLabMCP.exe"),
+        (Join-Path $Directory "BreadMCP.exe"),
         [Text.Encoding]::UTF8.GetBytes("fake-mcp-runtime"))
     [IO.File]::WriteAllBytes(
         (Join-Path $Directory "ReplayLabShaderTools.exe"),
         [Text.Encoding]::UTF8.GetBytes("fake-independent-shader-tools"))
     $records = @()
     foreach ($name in @(
-        "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe",
+        "replaylab-ai.exe", "ReplayLabInternal.exe", "BreadMCP.exe",
         "ReplayLabShaderTools.exe")) {
         $path = Join-Path $Directory $name
         $item = Get-Item -LiteralPath $path
@@ -70,7 +70,7 @@ function Set-FakeRuntimeOutput {
         ownedFiles = @(
             "replaylab-ai.exe",
             "ReplayLabInternal.exe",
-            "ReplayLabMCP.exe",
+            "BreadMCP.exe",
             "ReplayLabShaderTools.exe",
             "replaylab-runtime-manifest.json"
         )
@@ -183,12 +183,12 @@ try {
     Assert-True (([IO.Path]::GetFullPath($deployment.TargetDirectory)) -eq
         ([IO.Path]::GetFullPath($targetRoot))) `
         "Deployment must target exactly the application's replaylab child directory."
-    Assert-True (-not (Test-Path -LiteralPath (Join-Path $appRoot "ReplayLabMCP.exe"))) `
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $appRoot "BreadMCP.exe"))) `
         "Deployment must not place runtime payloads directly in the application directory."
     foreach ($name in @(
         "replaylab-ai.exe",
         "ReplayLabInternal.exe",
-        "ReplayLabMCP.exe",
+        "BreadMCP.exe",
         "ReplayLabShaderTools.exe",
         "replaylab-runtime-manifest.json",
         ".replaylab-runtime-deployment.json"
@@ -197,7 +197,7 @@ try {
             "Deployment did not create $name."
     }
     foreach ($name in @(
-        "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe",
+        "replaylab-ai.exe", "ReplayLabInternal.exe", "BreadMCP.exe",
         "ReplayLabShaderTools.exe")) {
         $sourceHash = (Get-FileHash -LiteralPath (Join-Path $runtimeRoot $name) `
             -Algorithm SHA256).Hash
@@ -250,13 +250,13 @@ try {
     $interruptedMarker.state = "incomplete"
     $interruptedMarker | ConvertTo-Json -Depth 4 | Set-Content `
         -LiteralPath $markerPath -Encoding UTF8
-    Remove-Item -LiteralPath (Join-Path $targetRoot "ReplayLabMCP.exe") -Force
+    Remove-Item -LiteralPath (Join-Path $targetRoot "BreadMCP.exe") -Force
     & $deployScript -ApplicationDirectory $appRoot `
         -RuntimeOutputDirectory $runtimeRoot | Out-Null
     $recoveredMarker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
     Assert-True ([string]$recoveredMarker.state -ceq "complete") `
         "A retry must recover an incomplete deployment and complete its marker."
-    Assert-True (Test-Path -LiteralPath (Join-Path $targetRoot "ReplayLabMCP.exe") `
+    Assert-True (Test-Path -LiteralPath (Join-Path $targetRoot "BreadMCP.exe") `
         -PathType Leaf) "A retry must restore a missing owned payload."
 
     $unmarkedApp = Join-Path $resolvedTestRoot "unmarked-application"
@@ -280,7 +280,7 @@ try {
     foreach ($name in @(
         "replaylab-ai.exe",
         "ReplayLabInternal.exe",
-        "ReplayLabMCP.exe",
+        "BreadMCP.exe",
         "ReplayLabShaderTools.exe",
         "replaylab-runtime-manifest.json"
     )) {
@@ -314,14 +314,14 @@ try {
     foreach ($name in @(
         "replaylab-ai.exe",
         "ReplayLabInternal.exe",
-        "ReplayLabMCP.exe",
+        "BreadMCP.exe",
         "ReplayLabShaderTools.exe",
         "replaylab-runtime-manifest.json"
     )) {
         Copy-Item -LiteralPath (Join-Path $runtimeRoot $name) `
             -Destination (Join-Path $mismatchedAdoptTarget $name)
     }
-    Add-Content -LiteralPath (Join-Path $mismatchedAdoptTarget "ReplayLabMCP.exe") `
+    Add-Content -LiteralPath (Join-Path $mismatchedAdoptTarget "BreadMCP.exe") `
         -Value "legacy mismatch"
     Assert-Throws {
         & $deployScript -ApplicationDirectory $mismatchedAdoptApp `
@@ -334,7 +334,7 @@ try {
 
     $tamperedRoot = Join-Path $resolvedTestRoot "tampered-runtime"
     Set-FakeRuntimeOutput $tamperedRoot
-    Add-Content -LiteralPath (Join-Path $tamperedRoot "ReplayLabMCP.exe") -Value "tampered"
+    Add-Content -LiteralPath (Join-Path $tamperedRoot "BreadMCP.exe") -Value "tampered"
     $cleanApp = Join-Path $resolvedTestRoot "clean-application"
     New-Item -ItemType Directory -Path $cleanApp | Out-Null
     Set-Content -LiteralPath (Join-Path $cleanApp "qrenderdoc.exe") -Value "fake-qrenderdoc"
@@ -394,7 +394,7 @@ try {
         }
     }
 
-    $lockedPath = Join-Path $targetRoot "ReplayLabMCP.exe"
+    $lockedPath = Join-Path $targetRoot "BreadMCP.exe"
     $lock = [IO.File]::Open(
         $lockedPath,
         [IO.FileMode]::Open,

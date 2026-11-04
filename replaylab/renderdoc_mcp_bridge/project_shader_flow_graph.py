@@ -96,29 +96,6 @@ def _normalized_io(value):
     return result
 
 
-def _io_summary_lines(node):
-    """Small "in: ..." / "out: ..." lines, shown only on the Input/Output nodes.
-
-    Internal nodes carry their explanation and code instead; their data flow
-    stays available in ``node["io"]`` without cluttering the box.
-    """
-    io = node.get("io") or {}
-    kind = node.get("kind", "")
-
-    def join(items, limit=6):
-        shown = ", ".join(items[:limit])
-        if len(items) > limit:
-            shown += " +%d" % (len(items) - limit)
-        return shown
-    if kind == "input":
-        items = list(io.get("reads", [])) or list(io.get("writes", []))
-        return [QtCore.QCoreApplication.translate("ReplayLabProjects", "in: %1").replace("%1", join(items))] if items else []
-    if kind == "output":
-        items = list(io.get("writes", [])) or list(io.get("reads", []))
-        return [QtCore.QCoreApplication.translate("ReplayLabProjects", "out: %1").replace("%1", join(items))] if items else []
-    return []
-
-
 # Background tints per node kind, mixed into the palette base so they read
 # correctly on both light and dark themes.
 _NODE_TINTS = {
@@ -145,6 +122,8 @@ def _localized_known_description(value):
     """Localize fixed Host presets while preserving AI-authored descriptions."""
 
     text = str(value or "")
+    if text == "Not yet described.":
+        return QtCore.QCoreApplication.translate("ReplayLabProjects", "Unknown")
     if text == "Shader entry point that coordinates the final stage result.":
         return QtCore.QCoreApplication.translate(
             "ReplayLabProjects",
@@ -201,6 +180,8 @@ def _navigation_from_node(node):
     )
     for field in text_fields:
         value = source.get(field, node.get(field))
+        if field == "functionSignature" and value in (None, ""):
+            value = node.get("signature")
         clean = _bounded_text(value, MAX_LOCATION_TEXT_LENGTH, field != "snippet")
         if clean:
             navigation[field] = clean
@@ -265,6 +246,15 @@ def normalize_flow_graph(value, graph_key=None, source_sha256=None, stale=False)
     for index, candidate in enumerate(considered_nodes):
         if not isinstance(candidate, dict):
             continue
+        kind = _bounded_text(candidate.get("kind"), 64, True).lower()
+        if not kind:
+            kind = "entry-point" if candidate.get("name") == raw.get("entryPoint") else "function"
+        execution_node = (raw.get("graphKind") == "function-execution" and
+                          kind in ("flow-control", "function-group"))
+        if not execution_node and kind not in ("entry-point", "function", "function-call", "function-summary", "input", "output"):
+            # Statement/control/computation boxes are internal evidence. They
+            # never enter the Qt scene, including from legacy algorithm graphs.
+            continue
         node_id = _bounded_text(
             candidate.get("id", candidate.get("nodeId")),
             MAX_NODE_ID_LENGTH, True)
@@ -279,18 +269,42 @@ def normalize_flow_graph(value, graph_key=None, source_sha256=None, stale=False)
         if not label:
             label = QtCore.QCoreApplication.translate(
                 "ReplayLabProjects", "Unnamed module")
+        description = _localized_known_description(_bounded_text(
+            candidate.get("description", candidate.get("summary")),
+            MAX_DESCRIPTION_LENGTH, False))
+        # i18n-ignore: exact legacy Host-generated prose compatibility value.
+        legacy_entry_description = "Shader entry point; the stage result is produced here."
+        if description != legacy_entry_description and (
+                any(marker in description for marker in (";", "{", "}", "```")) or
+                re.search(r"(?<![=!<>])=(?!=)|\b(?:return|discard)\s+", description)):
+            description = ""
+        if not description and kind in (
+                "entry-point", "function", "function-call", "function-summary"):
+            description = QtCore.QCoreApplication.translate(
+                "ReplayLabProjects", "Unknown")
+        raw_io = candidate.get("io")
+        interface_known = (isinstance(raw_io, dict) or
+                           isinstance(candidate.get("inputs"), list) and
+                           isinstance(candidate.get("outputs"), list))
+        if not isinstance(raw_io, dict):
+            raw_io = {"reads": candidate.get("inputs", []),
+                      "writes": candidate.get("outputs", []),
+                      "resources": [], "locals": []}
         node = {
             "id": node_id,
             "label": label,
             "symbol": _bounded_text(candidate.get("name", label), MAX_LABEL_LENGTH, True),
-            "description": _localized_known_description(_bounded_text(
-                candidate.get("description", candidate.get("summary")),
-                MAX_DESCRIPTION_LENGTH, False)),
-            "kind": _bounded_text(candidate.get("kind"), 64, True).lower(),
+            "description": description,
+            "kind": kind,
             "navigation": _navigation_from_node(candidate),
             "functionId": _bounded_text(candidate.get("functionId"), MAX_NODE_ID_LENGTH, True),
-            "io": _normalized_io(candidate.get("io")),
+            "helperGroupId": _bounded_text(candidate.get("helperGroupId"), MAX_NODE_ID_LENGTH, True),
+            "signature": _bounded_text(candidate.get("signature"),
+                                       MAX_LOCATION_TEXT_LENGTH, True),
+            "interfaceKnown": interface_known,
+            "io": _normalized_io(raw_io),
         }
+        node["navigation"].pop("snippet", None)
         # Boundary nodes are generated with English labels by the pure-Python
         # hierarchy; localise them here where Qt translation is available.
         if node["kind"] == "input":
@@ -298,6 +312,31 @@ def normalize_flow_graph(value, graph_key=None, source_sha256=None, stale=False)
                 " \u00b7 " + node["symbol"] if node.get("symbol") else "")
         elif node["kind"] == "output":
             node["label"] = QtCore.QCoreApplication.translate("ReplayLabProjects", "Output")
+        elif node["kind"] == "flow-control":
+            control = candidate.get("controlKind")
+            if control in ("for", "while", "do"):
+                node["label"] = QtCore.QCoreApplication.translate("ReplayLabProjects", "Repeat these steps")
+            elif control == "switch":
+                node["label"] = QtCore.QCoreApplication.translate("ReplayLabProjects", "Choose a path")
+            elif control in ("return", "discard"):
+                node["label"] = QtCore.QCoreApplication.translate("ReplayLabProjects", "Finish this path")
+            elif control == "break":
+                node["label"] = QtCore.QCoreApplication.translate("ReplayLabProjects", "Exit the loop")
+            elif control == "continue":
+                node["label"] = QtCore.QCoreApplication.translate("ReplayLabProjects", "Continue with the next iteration")
+            else:
+                node["label"] = QtCore.QCoreApplication.translate("ReplayLabProjects", "Check a condition")
+            if not node["description"]:
+                node["description"] = QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects", "Follow the source condition; open this step to inspect its code.")
+        elif node["kind"] == "function-group" and candidate.get("summaryId") == "implementation-helpers":
+            node["label"] = QtCore.QCoreApplication.translate(
+                "ReplayLabProjects", "Implementation helpers")
+            node["description"] = QtCore.QCoreApplication.translate(
+                "ReplayLabProjects", "Open to inspect the supporting calculations.")
+        elif node["kind"] == "function-group" and not node["description"]:
+            node["description"] = QtCore.QCoreApplication.translate(
+                "ReplayLabProjects", "These calls share an expression; their evaluation order is not expanded here.")
         nodes.append(node)
 
     edges = []
@@ -392,16 +431,29 @@ def normalize_flow_graph(value, graph_key=None, source_sha256=None, stale=False)
         "graphKind": _bounded_text(raw.get("graphKind"), 64, True),
         "functionId": _bounded_text(raw.get("functionId"), MAX_NODE_ID_LENGTH, True),
         "functionName": _bounded_text(raw.get("functionName"), MAX_LABEL_LENGTH, True),
+        "helperGroupId": _bounded_text(raw.get("helperGroupId"), MAX_NODE_ID_LENGTH, True),
         "sourceSha256": graph_source_sha256,
         "nodes": nodes,
         "edges": edges,
         "stale": is_stale,
         "generated": generated,
+        "sourceDerived": raw.get("sourceDerived") is True,
+        "emptyState": (raw.get("emptyState") if raw.get("emptyState") in (
+            "building", "invalid-source", "entry-unavailable") else "unavailable"),
+        "errorDetail": _bounded_text(raw.get("errorDetail"), 1024, False),
         "nodesTruncated": nodes_truncated,
         "edgesTruncated": edges_truncated,
         "omittedNodeCount": omitted_nodes,
         "omittedEdgeCount": omitted_edges,
     }
+
+
+def _node_title(node):
+    # Old algorithm artifacts can label a function with explanatory prose.
+    # Keep the actual function name prominent; control-flow labels remain prose.
+    if node.get("kind") in ("entry-point", "function", "function-call", "function-summary"):
+        return node.get("symbol") or node.get("label", "")
+    return node.get("label", "")
 
 
 def _node_description(node, algorithm):
@@ -410,7 +462,7 @@ def _node_description(node, algorithm):
     # and summary. Display it once without removing either field from the
     # source-bound graph or discarding a genuinely different explanation.
     if (algorithm and " ".join(description.split()) ==
-            " ".join(node.get("label", "").split())):
+            " ".join(_node_title(node).split())):
         return ""
     return description
 
@@ -435,14 +487,30 @@ class GraphNavigationHistory(object):
                 "canForward": 0 <= self._cursor < len(self._entries) - 1,
                 "index": self._cursor, "length": len(self._entries)}
 
-    def open(self, graph, options=None):
+    def open(self, graph, options=None, ancestors=None):
+        if ancestors is not None:
+            # Explicit source ancestry replaces unrelated visited graphs.
+            self._entries = [(copy.deepcopy(parent), dict(settings or {}))
+                             for parent, settings in ancestors]
+            self._cursor = len(self._entries) - 1
         if self._cursor < 0:
             return self.reset(graph, options)
+        target = graph or {}
+        if target.get("graphId"):
+            for index, (existing, unused_options) in enumerate(self._entries[:self._cursor + 1]):
+                existing = existing or {}
+                same_function = (target.get("functionId") and
+                                 existing.get("functionId") == target["functionId"] and
+                                 existing.get("helperGroupId") == target.get("helperGroupId"))
+                if existing.get("graphId") == target["graphId"] or same_function:
+                    # A recursive call returns to that ancestor. It must not
+                    # grow a synthetic visitation chain or discard a parent.
+                    self._entries = self._entries[:index + 1]
+                    self._entries[index] = (copy.deepcopy(graph), dict(options or {}))
+                    self._cursor = index
+                    return self.current()
         self._entries = self._entries[:self._cursor + 1]
         self._entries.append((copy.deepcopy(graph), dict(options or {})))
-        if len(self._entries) > 64:
-            # Keep the top-level graph reachable when deeply exploring calls.
-            del self._entries[1]
         self._cursor = len(self._entries) - 1
         return self.current()
 
@@ -458,7 +526,7 @@ class GraphNavigationHistory(object):
 
 
 if HAS_QT:
-    _NODE_WIDTH = 232.0
+    _NODE_WIDTH = 280.0
     _NODE_MIN_HEIGHT = 88.0
     # Width of the jump-to-code arrow strip kept free at every node's right edge.
     _NODE_ARROW_STRIP = 26.0
@@ -505,7 +573,17 @@ if HAS_QT:
             delta_x = target_center.x() - source_center.x()
             delta_y = target_center.y() - source_center.y()
 
-            if abs(delta_y) >= 30.0:
+            if (self.kind == "calls" and
+                    target_rect.top() - source_rect.bottom() > _LAYER_GAP + 20.0):
+                # A caller can invoke several children. Route long arrows to
+                # the side of the single-column stack so they do not cross
+                # intervening function boxes.
+                side_x = min(source_rect.left(), target_rect.left()) - 64.0
+                start = QtCore.QPointF(source_rect.left(), source_center.y())
+                end = QtCore.QPointF(target_rect.left(), target_center.y())
+                first_control = QtCore.QPointF(side_x, start.y())
+                second_control = QtCore.QPointF(side_x, end.y())
+            elif abs(delta_y) >= 30.0:
                 if delta_y >= 0.0:
                     start = QtCore.QPointF(source_center.x(), source_rect.bottom())
                     end = QtCore.QPointF(target_center.x(), target_rect.top())
@@ -561,11 +639,12 @@ if HAS_QT:
 
     class _FlowNodeItem(QtWidgets.QGraphicsObject):
         def __init__(self, node, activate_callback, expand_callback, palette,
-                     algorithm=False):
+                     algorithm=False, context_callback=None):
             super(_FlowNodeItem, self).__init__()
             self.node = node
             self._activate_callback = activate_callback
             self._expand_callback = expand_callback
+            self._context_callback = context_callback
             self._edges = []
             self._press_position = None
             self._laying_out = False
@@ -590,15 +669,9 @@ if HAS_QT:
             self._accent_color = palette.color(QtGui.QPalette.Highlight)
 
             self._title = QtWidgets.QGraphicsTextItem(self)
-            self._title.setPlainText(node["label"])
+            self._title.setPlainText(_node_title(node))
             self._title.setDefaultTextColor(self._text_color)
-            title_font = self._title.font()
-            title_font.setBold(True)
-            title_font.setPointSizeF(max(
-                10.5 if algorithm else 9.0, title_font.pointSizeF()))
-            self._title.setFont(title_font)
             self._title.setTextWidth(self._width - 30.0 - _NODE_ARROW_STRIP)
-            self._title.setPos(18.0, 8.0 if algorithm else 10.0)
             self._title.setAcceptedMouseButtons(QtCore.Qt.NoButton)
 
             description = _node_description(node, algorithm)
@@ -607,35 +680,27 @@ if HAS_QT:
             description_color = QtGui.QColor(self._text_color)
             description_color.setAlpha(205)
             self._description.setDefaultTextColor(description_color)
-            if algorithm:
-                description_font = self._description.font()
-                description_font.setPointSizeF(max(9.5, description_font.pointSizeF()))
-                self._description.setFont(description_font)
+            description_font = self._description.font()
+            description_font.setPointSizeF(max(9.5, description_font.pointSizeF()))
+            self._description.setFont(description_font)
+            title_font = self._title.font()
+            title_font.setBold(True)
+            title_font.setPointSizeF(description_font.pointSizeF() + 1.5)
+            self._title.setFont(title_font)
             self._description.setTextWidth(self._width - 30.0 - _NODE_ARROW_STRIP)
             self._description.setVisible(bool(description))
             self._description.setAcceptedMouseButtons(QtCore.Qt.NoButton)
-            title_height = self._title.boundingRect().height()
-            self._description.setPos(18.0, (10.0 if algorithm else 13.0) + title_height)
+            # Read the purpose first, then locate the corresponding function.
+            # Interface metadata remains available for navigation and analysis;
+            # it is deliberately not another text block inside the card.
+            top = 10.0
+            self._description.setPos(18.0, top)
             description_height = (
                 self._description.boundingRect().height() if description else 0.0)
-            # Data-flow summary ("in / res / out") under the description.
-            io_lines = _io_summary_lines(node)
-            self._io = QtWidgets.QGraphicsTextItem(self)
-            self._io.setPlainText("\n".join(io_lines))
-            io_color = QtGui.QColor(self._text_color)
-            io_color.setAlpha(150)
-            self._io.setDefaultTextColor(io_color)
-            io_font = self._io.font()
-            io_font.setPointSizeF(max(7.5, io_font.pointSizeF() - 1.0))
-            self._io.setFont(io_font)
-            self._io.setTextWidth(self._width - 30.0 - _NODE_ARROW_STRIP)
-            self._io.setVisible(bool(io_lines))
-            self._io.setAcceptedMouseButtons(QtCore.Qt.NoButton)
-            self._io.setPos(18.0, (10.0 if algorithm else 13.0) + title_height + description_height + (2.0 if io_lines else 0.0))
-            io_height = self._io.boundingRect().height() + 2.0 if io_lines else 0.0
+            self._title.setPos(18.0, top + description_height + (3.0 if description else 0.0))
             self._height = max(
                 minimum_height,
-                (18.0 if algorithm else 26.0) + title_height + description_height + io_height)
+                self._title.pos().y() + self._title.boundingRect().height() + 12.0)
             self._kind = str(node.get("kind", "") or "")
             self._fill_color = _tinted(self._base_color, self._kind)
 
@@ -778,12 +843,23 @@ if HAS_QT:
                 return
             super(_FlowNodeItem, self).keyPressEvent(event)
 
+        def contextMenuEvent(self, event):
+            if not callable(self._context_callback):
+                return super(_FlowNodeItem, self).contextMenuEvent(event)
+            menu = QtWidgets.QMenu()
+            action = menu.addAction(QtCore.QCoreApplication.translate(
+                "ReplayLabProjects", "Add to Bread AI chat"))
+            if menu.exec_(event.screenPos()) == action:
+                self._context_callback(self.node)
+            event.accept()
+
 
     class ShaderFlowGraphView(QtWidgets.QGraphicsView):
         """Fixed graph layout with per-graph pan and zoom retention."""
 
         nodeActivated = QtCore.Signal(object)
         subgraphRequested = QtCore.Signal(object)
+        contextRequested = QtCore.Signal(object)
         graphStateChanged = QtCore.Signal(object)
 
         def __init__(self, parent=None):
@@ -832,6 +908,11 @@ if HAS_QT:
         def graph_key(self):
             return self._graph_key
 
+        def _request_context(self, node):
+            self.contextRequested.emit({"node": copy.deepcopy(node),
+                                        "graph": copy.deepcopy(self.graph_info()),
+                                        "graphKey": self.graph_key()})
+
         def _remember_positions(self):
             if self._graph_key:
                 center = self.mapToScene(self.viewport().rect().center())
@@ -876,6 +957,8 @@ if HAS_QT:
                 return
             navigation = dict(node.get("navigation", {}))
             navigation.update({"nodeId": node["id"], "functionId": node["functionId"]})
+            if node.get("helperGroupId"):
+                navigation["helperGroupId"] = node["helperGroupId"]
             navigation.setdefault("symbol", node["symbol"])
             # Expanding clears the scene. Defer until the native double-click
             # handler has returned, so it cannot delete its own active item.
@@ -919,6 +1002,19 @@ if HAS_QT:
             return depths
 
         def _automatic_positions(self):
+            if self._graph["graphKind"] == "function-call":
+                # The call hierarchy is browsed one function at a time. A
+                # single column preserves invocation order and keeps the
+                # main flow top-to-bottom regardless of fan-out.
+                positions = {}
+                y_position = 0.0
+                for node in self._graph["nodes"]:
+                    node_id = node["id"]
+                    item = self._nodes[node_id]
+                    positions[node_id] = QtCore.QPointF(
+                        -item.boundingRect().width() * 0.5, y_position)
+                    y_position += item.boundingRect().height() + _LAYER_GAP
+                return positions
             depths = self._depths(self._graph["nodes"], self._graph["edges"])
             layers = {}
             for node in self._graph["nodes"]:
@@ -965,9 +1061,21 @@ if HAS_QT:
                 self._updating_scene_rect = False
 
         def _show_empty_state(self):
-            empty = self._scene.addText(QtCore.QCoreApplication.translate(
-                "ReplayLabProjects",
-                "No call flow is available for this Shader."))
+            state = self._graph.get("emptyState")
+            if state == "building":
+                message = QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects", "Building call flow from the current source...")
+            elif state == "invalid-source":
+                message = QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects", "The current Shader source cannot be parsed for call flow.")
+            elif state == "entry-unavailable":
+                message = QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects", "The Shader entry point is missing or ambiguous in the current source.")
+            else:
+                message = QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects", "No call flow is available for this Shader.")
+            empty = self._scene.addText(message)
+            empty.setToolTip(self._graph.get("errorDetail", ""))
             empty.setDefaultTextColor(
                 self.palette().color(QtGui.QPalette.Text))
             empty.setTextWidth(340.0)
@@ -998,7 +1106,7 @@ if HAS_QT:
             for node in normalized["nodes"]:
                 item = _FlowNodeItem(
                     node, self._activate_node, self._expand_node, palette,
-                    algorithm)
+                    algorithm, self._request_context)
                 self._scene.addItem(item)
                 self._nodes[node["id"]] = item
 
@@ -1176,10 +1284,12 @@ if HAS_QT:
 
         nodeActivated = QtCore.Signal(object)
         subgraphRequested = QtCore.Signal(object)
+        contextRequested = QtCore.Signal(object)
 
-        def __init__(self, parent=None, navigate_callback=None):
+        def __init__(self, parent=None, navigate_callback=None, navigation_resolver=None):
             super(ShaderFlowGraphPanel, self).__init__(parent)
             self._navigate_callback = navigate_callback
+            self._navigation_resolver = navigation_resolver
             self._history = GraphNavigationHistory()
             self.setObjectName("replaylabShaderFlowGraph")
             layout = QtWidgets.QVBoxLayout(self)
@@ -1190,7 +1300,7 @@ if HAS_QT:
             self.back_button = QtWidgets.QToolButton(self)
             self.back_button.setArrowType(QtCore.Qt.LeftArrow)
             self.back_button.setToolTip(QtCore.QCoreApplication.translate(
-                "ReplayLabProjects", "Back to the previous graph"))
+                "ReplayLabProjects", "Back to the parent function"))
             header.addWidget(self.back_button)
             self.forward_button = QtWidgets.QToolButton(self)
             self.forward_button.setArrowType(QtCore.Qt.RightArrow)
@@ -1229,6 +1339,7 @@ if HAS_QT:
             self.view = ShaderFlowGraphView(self)
             self.view.nodeActivated.connect(self._node_activated)
             self.view.subgraphRequested.connect(self.subgraphRequested.emit)
+            self.view.contextRequested.connect(self.contextRequested.emit)
             self.back_button.clicked.connect(self.go_back)
             self.forward_button.clicked.connect(self.go_forward)
             self.fit_button.clicked.connect(self.view.fit_graph)
@@ -1249,16 +1360,26 @@ if HAS_QT:
             elif info.get("graphKind") == "algorithm-dataflow":
                 self.title_label.setText(QtCore.QCoreApplication.translate(
                     "ReplayLabProjects", "Shader algorithm flow"))
+            elif info.get("graphKind") == "function-execution":
+                self.title_label.setText(QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects", "Shader execution flow"))
             else:
                 self.title_label.setText(QtCore.QCoreApplication.translate(
                     "ReplayLabProjects", "Shader call flow"))
             count = len(info.get("nodes", []))
             if count == 0:
-                self.state_label.setText(QtCore.QCoreApplication.translate(
-                    "ReplayLabProjects", "Unavailable"))
-                self.state_label.setToolTip(QtCore.QCoreApplication.translate(
-                    "ReplayLabProjects",
-                    "A call flow will appear when organized HLSL includes module relationships."))
+                if info.get("emptyState") == "building":
+                    self.state_label.setText(QtCore.QCoreApplication.translate(
+                        "ReplayLabProjects", "Building"))
+                    self.state_label.setToolTip(QtCore.QCoreApplication.translate(
+                        "ReplayLabProjects", "Building call flow from the current source..."))
+                else:
+                    self.state_label.setText(QtCore.QCoreApplication.translate(
+                        "ReplayLabProjects", "Unavailable"))
+                    self.state_label.setToolTip(info.get("errorDetail") or
+                        QtCore.QCoreApplication.translate(
+                            "ReplayLabProjects",
+                            "A call flow will appear when organized HLSL includes module relationships."))
             elif info.get("stale"):
                 self.state_label.setText(QtCore.QCoreApplication.translate(
                     "ReplayLabProjects", "Out of date"))
@@ -1271,6 +1392,15 @@ if HAS_QT:
                 self.state_label.setToolTip(QtCore.QCoreApplication.translate(
                     "ReplayLabProjects",
                     "Module names and descriptions are generated reconstruction, not original source."))
+            elif info.get("sourceDerived"):
+                self.state_label.setText(QtCore.QCoreApplication.translate(
+                    "ReplayLabProjects", "Derived from source"))
+                if info.get("graphKind") == "function-execution":
+                    self.state_label.setToolTip(QtCore.QCoreApplication.translate(
+                        "ReplayLabProjects", "Main steps follow the current source execution paths; open a function for more detail. This is not a validation result."))
+                else:
+                    self.state_label.setToolTip(QtCore.QCoreApplication.translate(
+                        "ReplayLabProjects", "Call relationships are derived from the current editor source; this is not a validation result."))
             else:
                 self.state_label.setText(QtCore.QCoreApplication.translate(
                     "ReplayLabProjects", "Available"))
@@ -1305,24 +1435,46 @@ if HAS_QT:
             self.forward_button.setEnabled(state["canForward"])
             return info
 
-        def open_subgraph(self, graph, graph_key=None, source_sha256=None, stale=False):
+        def open_subgraph(self, graph, graph_key=None, source_sha256=None, stale=False,
+                          ancestors=None):
             self._history.open(graph, {"graph_key": graph_key,
-                                      "source_sha256": source_sha256, "stale": stale})
+                                      "source_sha256": source_sha256, "stale": stale}, ancestors)
             return self._show_history()
 
         def go_back(self):
-            self._history.back()
-            return self._show_history()
+            return self._navigate_history(-1)
 
         def go_forward(self):
-            self._history.forward()
+            return self._navigate_history(1)
+
+        def _navigate_history(self, direction):
+            target = self._history._cursor + direction
+            if not 0 <= target < len(self._history._entries):
+                return self.view.graph_info()
+            graph, options = self._history._entries[target]
+            if callable(self._navigation_resolver):
+                resolved = self._navigation_resolver(copy.deepcopy(graph), dict(options))
+                if resolved is None:
+                    return self.view.graph_info()
+                self._history._entries[target] = resolved
+            self._history._cursor = target
             return self._show_history()
 
         def navigation_state(self):
             return self._history.state()
 
-        def clear_graph(self, graph_key=None):
-            return self.set_graph(None, graph_key)
+        def mark_source_changed(self):
+            # Keep native anchors and the user's exploration intact while
+            # making the older source binding explicit without scene rebuilds.
+            if self.view._graph.get("stale"):
+                return
+            for unused_graph, options in self._history._entries:
+                options["stale"] = True
+            self.view._graph["stale"] = True
+            self._update_state(self.view.graph_info())
+
+        def clear_graph(self, graph_key=None, state="unavailable", detail=""):
+            return self.set_graph({"emptyState": state, "errorDetail": detail}, graph_key)
 
         def fit_graph(self):
             self.view.fit_graph()

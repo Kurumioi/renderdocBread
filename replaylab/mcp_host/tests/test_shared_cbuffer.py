@@ -175,10 +175,48 @@ class SharedCBufferTests(unittest.TestCase):
         self.ctrl.generation += 1
         with self.assertRaisesRegex(RuntimeError, "outside this material editor"):
             self.panel.update(status["sessionId"], pid, 0.25)
-        with self.assertRaisesRegex(RuntimeError, "outside this material editor"):
+        with self.assertRaisesRegex(RuntimeError, "expired material-panel session"):
             self.panel.rollback(status["sessionId"])
         self.assertEqual(len(self.ctrl.sets), 1)
         self.assertEqual(self.ctrl.clears, [])
+        self.assertEqual(self.panel.list_status(), [])
+        self.assertEqual(self.edits.records, {})
+        reopened = self.expose()
+        self.panel.update(reopened["sessionId"], reopened["parameters"][0]["parameterId"], 0.75)
+        self.assertEqual(len(self.ctrl.sets), 2)
+
+    def test_first_selection_after_native_edit_adopts_generation_and_resets_to_current_baseline(self):
+        external = struct.pack("<f", 0.625)
+        self.ctrl.SetSharedBufferPatch(self.ctrl.resource, 64, external)
+        original_snapshot = self.bridge.snapshot
+
+        def snapshot(params):
+            value = original_snapshot(params)
+            raw = external + base64.b64decode(value["rawBase64"])[4:]
+            value["rawBase64"] = base64.b64encode(raw).decode("ascii")
+            value["rawSha256"] = hashlib.sha256(raw).hexdigest()
+            return value
+
+        self.bridge.snapshot = snapshot
+        status = self.expose()
+        self.assertEqual(status["parameters"][0]["value"], [0.625])
+        self.assertEqual(status["resetMode"], "snapshot-baseline")
+        self.panel.update(status["sessionId"], status["parameters"][0]["parameterId"], 0.125)
+        result = self.panel.rollback(status["sessionId"])
+        self.assertTrue(result["snapshotReleased"])
+        self.assertEqual(self.ctrl.configured[(64, 4)], external)
+        self.assertEqual(self.ctrl.clears, [])
+
+    def test_external_change_before_reset_never_replaces_other_editors_value(self):
+        status = self.expose()
+        self.panel.update(status["sessionId"], status["parameters"][0]["parameterId"], 0.25)
+        external = struct.pack("<f", 0.875)
+        self.ctrl.SetSharedBufferPatch(self.ctrl.resource, 64, external)
+        with self.assertRaisesRegex(RuntimeError, "outside this material editor"):
+            self.panel.rollback(status["sessionId"])
+        self.assertEqual(self.ctrl.configured[(64, 4)], external)
+        self.assertEqual(self.ctrl.clears, [])
+        self.assertEqual(self.panel.list_status(), [])
 
     def test_clear_failure_keeps_remaining_ownership_and_retries_exact_ranges(self):
         first = self.expose()

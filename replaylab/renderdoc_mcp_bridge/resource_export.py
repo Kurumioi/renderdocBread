@@ -37,6 +37,8 @@ MAX_VERTEX_ATTRIBUTES = 128
 MAX_VERTEX_SPAN_BYTES = 512 * 1024 * 1024
 MAX_TEXTURES = 512
 MAX_TEXTURE_FILE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_BOUND_BUFFER_BYTES = 64 * 1024 * 1024
+MAX_BOUND_BUFFER_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_RESOURCE_TEXT = 512
 
 _HEX_32 = re.compile(r"^[0-9a-f]{32}$")
@@ -292,9 +294,22 @@ def _validate_selection(params, capture_id, capture_session_id):
     supplied = params.get("request_sha256")
     if supplied is not None:
         _require_hex(supplied, _HEX_64, "request_sha256")
+    formats = params.get("texture_formats")
+    if formats is None:
+        formats = ("auto",)
+    if not isinstance(formats, (list, tuple)) or len(formats) > 6:
+        raise ValueError("texture_formats must be a short list of encodings")
+    cleaned = []
+    for item in formats:
+        text = str(item or "").strip().lower()
+        if text and text not in cleaned:
+            if text not in ("auto", "dds", "tga", "exr", "png", "jpg", "hdr", "bmp"):
+                raise ValueError("unsupported texture format %r" % text)
+            cleaned.append(text)
     return {
         "captureId": capture_id,
         "captureSessionId": capture_session_id,
+        "textureFormats": tuple(cleaned) or ("auto",),
         "eventId": event_id,
         "instance": instance,
         "view": view,
@@ -532,7 +547,28 @@ def encode_canonical_float32(format_info, elements):
         values = decode_regular_vertex_element(format_info, element)
         if len(values) != components:
             raise UnsupportedVertexFormat("decoded component count changed")
-        output.extend(struct.pack("<%df" % components, *values))
+        try:
+            encoded = struct.pack("<%df" % components, *values)
+        except (OverflowError, struct.error):
+            raise UnsupportedVertexFormat("vertex values exceed the canonical float32 range; raw source is preserved")
+        if (_component_kind(format_info.get("compType")) == "float"
+                and _safe_int(format_info.get("compByteWidth"), 0) == 8
+                and any(decoded != original for decoded, original in
+                        zip(struct.unpack("<%df" % components, encoded), values))):
+            raise UnsupportedVertexFormat("float64 vertex data requires a precision-preserving target; float32 would lose bits")
+        if _component_kind(format_info.get("compType")) in ("uint", "sint"):
+            width = _safe_int(format_info.get("compByteWidth"), 0)
+            # IDs/bitfields are not approximate colors: rounding a UInt32 to
+            # float32 changes Shader behavior. Retain raw evidence instead.
+            chars = ({1: "B", 2: "H", 4: "I", 8: "Q"} if _component_kind(format_info.get("compType")) == "uint"
+                     else {1: "b", 2: "h", 4: "i", 8: "q"})
+            original = list(struct.unpack("<%d%s" % (components, chars[width]), element))
+            if format_info.get("bgraOrder") and components >= 4:
+                original[0], original[2] = original[2], original[0]
+            if any(decoded != integer for decoded, integer in
+                   zip(struct.unpack("<%df" % components, encoded), original)):
+                raise UnsupportedVertexFormat("integer vertex data requires an exact integer/raw-buffer target; float32 would lose bits")
+        output.extend(encoded)
     return bytes(output)
 
 
@@ -576,7 +612,17 @@ def _generic_canonical(value, format_info, count):
     if not candidates or components < 1 or len(candidates) < components:
         raise UnsupportedVertexFormat("generic vertex value is unavailable")
     values = [float(item) for item in candidates[:components]]
-    row = struct.pack("<%df" % components, *values)
+    try:
+        row = struct.pack("<%df" % components, *values)
+    except (OverflowError, struct.error):
+        raise UnsupportedVertexFormat("generic vertex values exceed the canonical float32 range")
+    if kind in ("uint", "sint") and any(decoded != original for decoded, original in
+            zip(struct.unpack("<%df" % components, row), candidates[:components])):
+        raise UnsupportedVertexFormat("generic integer vertex data cannot be represented exactly as float32")
+    if (kind == "float" and _safe_int(format_info.get("compByteWidth"), 0) == 8
+            and any(decoded != original for decoded, original in
+                    zip(struct.unpack("<%df" % components, row), values))):
+        raise UnsupportedVertexFormat("generic float64 vertex data cannot be represented exactly as float32")
     return row * count
 
 
@@ -835,16 +881,16 @@ class _ArtifactWriter(object):
     def write_json(self, relative, value, kind):
         return self.write_bytes(relative, canonical_json_bytes(value), kind)
 
-    def texture_destination(self, relative):
+    def texture_destination(self, relative, suffix="dds"):
         relative, absolute = self._absolute(relative)
         self._parents(absolute)
         if os.path.lexists(absolute):
             raise RuntimeError("resource export texture already exists: %s" % relative)
         temporary = os.path.join(
-            os.path.dirname(absolute), ".tmp-%s.dds" % uuid.uuid4().hex)
+            os.path.dirname(absolute), ".tmp-%s.%s" % (uuid.uuid4().hex, suffix))
         return relative, absolute, temporary
 
-    def adopt_texture(self, relative, absolute, temporary):
+    def adopt_texture(self, relative, absolute, temporary, encoding="dds"):
         size, digest = _hash_regular_file(
             temporary, MAX_TEXTURE_FILE_BYTES, allow_empty=False)
         os.replace(temporary, absolute)
@@ -854,7 +900,7 @@ class _ArtifactWriter(object):
             "size": size,
             "byteLength": size,
             "sha256": digest,
-            "kind": "texture-dds",
+            "kind": "texture-%s" % encoding,
         }
         self.files.append(record)
         return dict(record)
@@ -1260,6 +1306,7 @@ def _stage_resources(pipeline, stages, texture_lookup):
     textures = {}
     samplers = []
     bound_shader_stages = []
+    unexported = []
     for stage_name, stage in stages:
         try:
             shader_id = _resource_id(pipeline.GetShader(stage))
@@ -1274,13 +1321,21 @@ def _stage_resources(pipeline, stages, texture_lookup):
                     bindings = list(method(stage, False) or [])
                 except TypeError:
                     bindings = list(method(stage) or [])
-            except Exception:
+            except Exception as exc:
                 bindings = []
+                if shader_id:
+                    unexported.append({"stage": stage_name, "kind": "read-only-resources",
+                        "status": "unavailable", "reason": str(exc)[:1024]})
             for item in bindings:
                 descriptor_value = getattr(item, "descriptor", item)
                 descriptor = _descriptor(descriptor_value)
                 resource_id = descriptor.get("resourceId", 0) if descriptor else 0
                 if resource_id not in texture_lookup:
+                    access = _descriptor_access(getattr(item, "access", None))
+                    if resource_id and not (access or {}).get("staticallyUnused"):
+                        unexported.append({"stage": stage_name, "kind": "read-only-buffer",
+                            "resourceId": resource_id, "access": access, "descriptor": descriptor,
+                            "status": "content-not-exported"})
                     continue
                 entry = textures.setdefault(resource_id, {
                     "resourceId": resource_id,
@@ -1312,12 +1367,96 @@ def _stage_resources(pipeline, stages, texture_lookup):
                     "access": _descriptor_access(getattr(item, "access", None)),
                     "sampler": _sampler(sampler_value),
                 })
+        writable_method = getattr(pipeline, "GetReadWriteResources", None)
+        if callable(writable_method):
+            try:
+                try:
+                    writable = list(writable_method(stage, False) or [])
+                except TypeError:
+                    writable = list(writable_method(stage) or [])
+            except Exception as exc:
+                writable = []
+                if shader_id:
+                    unexported.append({"stage": stage_name, "kind": "read-write-resources",
+                        "status": "unavailable", "reason": str(exc)[:1024]})
+            for item in writable:
+                descriptor = _descriptor(getattr(item, "descriptor", item))
+                resource_id = (descriptor or {}).get("resourceId", 0)
+                access = _descriptor_access(getattr(item, "access", None))
+                if resource_id and not (access or {}).get("staticallyUnused"):
+                    unexported.append({"stage": stage_name, "kind": "read-write-resource",
+                        "resourceId": resource_id, "access": access, "descriptor": descriptor,
+                        "status": "content-not-exported"})
     if len(textures) > MAX_TEXTURES:
         raise RuntimeError("bound texture count exceeds the resource export safety bound")
-    return list(textures.values()), samplers, bound_shader_stages
+    return list(textures.values()), samplers, bound_shader_stages, unexported
 
 
-def _save_texture_dds(ctrl, rd_module, texture, writer):
+# What a DCC actually opens. DDS stays as the exact evidence copy (all mips, all
+# slices, no conversion); these are the readable copies beside it.
+_TEXTURE_FILE_TYPES = {
+    "tga": "TGA",
+    "exr": "EXR",
+    "png": "PNG",
+    "jpg": "JPG",
+    "hdr": "HDR",
+    "bmp": "BMP",
+}
+_FLOAT_FORMAT_MARKERS = ("FLOAT", "SFLOAT", "R16G16B16A16", "R32G32B32A32", "R11G11B10", "R9G9B9E5")
+
+
+def _auto_texture_formats(texture):
+    """LDR surfaces become TGA, floating-point surfaces become EXR."""
+
+    resource = texture.get("resource") or {}
+    name = str((resource.get("format") or {}).get("name", "") or
+               resource.get("formatName", "") or "").upper()
+    if any(marker in name for marker in _FLOAT_FORMAT_MARKERS):
+        return ("exr",)
+    return ("tga", "png")
+
+
+def _save_texture_copy(ctrl, rd_module, texture, writer, resource_object, encoding, sample_count):
+    """Save one readable copy of a bound texture next to its DDS evidence."""
+
+    file_types = getattr(rd_module, "FileType", None)
+    texture_save_type = getattr(rd_module, "TextureSave", None)
+    member = _TEXTURE_FILE_TYPES.get(encoding)
+    file_type = getattr(file_types, member, None) if (file_types and member) else None
+    if file_type is None or texture_save_type is None:
+        return {"encoding": encoding, "status": "unavailable",
+                "reason": "RenderDoc cannot write %s in this build" % encoding}
+    relative = "textures/resource-%d.%s" % (texture["resourceId"], encoding)
+    try:
+        relative, absolute, temporary = writer.texture_destination(relative, encoding)
+        save = texture_save_type()
+        save.resourceId = resource_object
+        save.destType = file_type
+        # Single-image formats carry one mip and one slice; say so rather than
+        # pretending the copy is complete evidence.
+        if hasattr(save, "mip"):
+            save.mip = 0
+        if hasattr(save, "slice") and hasattr(save.slice, "sliceIndex"):
+            save.slice.sliceIndex = 0
+        sample_mapping = getattr(save, "sample", None)
+        if sample_mapping is not None and hasattr(sample_mapping, "sampleIndex"):
+            if hasattr(sample_mapping, "mapToArray"):
+                sample_mapping.mapToArray = False
+            sample_mapping.sampleIndex = 0 if sample_count > 1 else 0
+        ctrl.SaveTexture(save, temporary)
+        artifact = writer.adopt_texture(relative, absolute, temporary, encoding=encoding)
+        return dict(artifact, status="captured", encoding=encoding,
+                    scope="mip 0, slice 0" if sample_count <= 1 else "mip 0, slice 0, sample 0")
+    except Exception as exc:
+        try:
+            if "temporary" in locals() and os.path.lexists(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
+        return {"encoding": encoding, "status": "unavailable", "reason": str(exc)[:1024]}
+
+
+def _save_texture_dds(ctrl, rd_module, texture, writer, extra_formats=()):
     resource_id = texture["resourceId"]
     relative = "textures/resource-%d.dds" % resource_id
     sample_count = _safe_int(
@@ -1391,6 +1530,18 @@ def _save_texture_dds(ctrl, rd_module, texture, writer):
         ctrl.SaveTexture(save, temporary)
         artifact = writer.adopt_texture(relative, absolute, temporary)
         texture["artifact"] = dict(artifact, status="captured", encoding="dds")
+        wanted: list[str] = []
+        for encoding in extra_formats:
+            if encoding == "auto":
+                wanted.extend(_auto_texture_formats(texture))
+            elif encoding != "dds":
+                wanted.append(encoding)
+        copies = []
+        for encoding in list(dict.fromkeys(wanted)):
+            copies.append(_save_texture_copy(
+                ctrl, rd_module, texture, writer, resource_object, encoding, sample_count))
+        if copies:
+            texture["artifacts"] = copies
     except Exception as exc:
         try:
             if "temporary" in locals() and os.path.lexists(temporary):
@@ -1417,26 +1568,209 @@ def _pipeline_snapshot(ctrl, pipeline, stages):
             texture_lookup[_resource_id(getattr(texture, "resourceId", None))] = texture
     except Exception:
         pass
-    textures, samplers, bound_shader_stages = _stage_resources(
+    textures, samplers, bound_shader_stages, unexported = _stage_resources(
         pipeline, stages, texture_lookup)
     try:
         api = _enum_text(getattr(ctrl.GetAPIProperties(), "pipelineType", None))
     except Exception:
         api = None
-    return api, textures, samplers, bound_shader_stages
+    return api, textures, samplers, bound_shader_stages, unexported
+
+
+def _dispatch_only(action, rd_module):
+    flags = getattr(action, "flags", 0)
+    dispatch_flag = getattr(getattr(rd_module, "ActionFlags", None), "Dispatch", 0)
+    try:
+        return bool(dispatch_flag and (int(flags) & int(dispatch_flag)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _action_stages(action, rd_module, stages):
+    """Bound state from an idle pipeline is not an executed stage of this EID."""
+    flags = getattr(action, "flags", 0)
+    enum = getattr(rd_module, "ActionFlags", None)
+
+    def has(name):
+        value = getattr(enum, name, 0)
+        try:
+            return bool(value and int(flags) & int(value))
+        except (TypeError, ValueError):
+            return False
+
+    if has("DispatchRay") or has("RayDispatch"):
+        allowed = {"raygen", "intersection", "anyhit", "closesthit", "miss", "callable"}
+    elif has("MeshDispatch"):
+        allowed = {"task", "mesh", "fragment"}
+    elif has("Dispatch"):
+        allowed = {"compute"}
+    else:
+        allowed = {"vertex", "hull", "domain", "geometry", "fragment"}
+    return [(name, stage) for name, stage in stages if name in allowed]
+
+
+def _action_mesh(ctrl, pipeline, action, request, rd_module, writer, capture):
+    if _dispatch_only(action, rd_module):
+        # IA state can still describe a previous draw at a compute EID. It is
+        # not this dispatch's geometry and must never become a fake Mesh.
+        return {"source": "not-applicable-dispatch", "topology": None, "attributes": [],
+                "indexed": False, "instance": request["instance"], "view": request["view"],
+                "managedMeshImport": {"supported": False, "reasonId": "dispatch-requires-render-plan",
+                    "requiredRoute": "unity-effect-graph", "effectImportSupported": True,
+                    "nextTools": ["finalize_resource_export", "validate_unity_render_plan", "bind_unity_restoration"]}}
+    return _mesh(ctrl, pipeline, action, request, rd_module, writer, capture)
+
+
+def _capture_bound_buffers(ctrl, requests, mesh, event_id, writer, rd_module=None):
+    """Export exact selected buffer-view windows before the action, plus UAV outputs.
+
+    ReplayFrameEventForAnalysis is the common controller API: replay through
+    EID-1 while retaining the selected EID's cached bindings, then restore in a
+    finally block. Never label a post-action snapshot as an input.
+    """
+    descriptions = {}
+    try:
+        for item in ctrl.GetBuffers() or []:
+            descriptions[_resource_id(item.resourceId)] = item
+    except Exception:
+        pass
+    candidates = list(requests)
+    for requested in requests:
+        descriptor = requested.get("descriptor") or {}
+        secondary = descriptor.get("secondaryResourceId", 0)
+        if secondary and requested.get("kind") == "read-write-resource":
+            candidates.append({"kind": "read-write-counter", "stage": requested.get("stage"),
+                "resourceId": secondary, "access": requested.get("access"),
+                "parentResourceId": requested.get("resourceId"), "descriptor": {
+                    "resourceId": secondary, "byteOffset": descriptor.get("counterByteOffset", 0),
+                    "byteSize": 4, "elementByteSize": 4}, "status": "content-not-exported"})
+    for attribute in mesh.get("attributes", []):
+        if attribute.get("perInstance") and attribute.get("used") is not False:
+            bound = attribute.get("buffer") or {}
+            candidates.append({"kind": "per-instance-stream", "stage": "vertex-input",
+                "resourceId": bound.get("resourceId", 0), "access": {
+                    "attributeIndex": attribute.get("index"), "instanceStepRate": attribute.get("instanceStepRate"),
+                    "instance": mesh.get("instance", 0)}, "descriptor": {
+                    "resourceId": bound.get("resourceId", 0), "byteOffset": bound.get("byteOffset", 0),
+                    "byteSize": bound.get("byteSize", 0), "elementByteSize": bound.get("byteStride", 0)},
+                "status": "content-not-exported"})
+    windows, gaps, total = {}, [], 0
+    for candidate in candidates:
+        rid = candidate.get("resourceId", 0)
+        descriptor = candidate.get("descriptor") or {}
+        description = descriptions.get(rid)
+        if not rid or description is None:
+            gaps.append(candidate)
+            continue
+        flag_type = getattr(rd_module, "DescriptorFlags", None)
+        counter_mask = (_safe_int(getattr(flag_type, "AppendBuffer", 2), 2) |
+                        _safe_int(getattr(flag_type, "CounterBuffer", 4), 4))
+        if (candidate.get("kind") == "read-write-resource" and
+                _safe_int(descriptor.get("flags", 0)) & counter_mask and
+                not descriptor.get("secondaryResourceId")):
+            gaps.append({"resourceId": rid, "stage": candidate.get("stage"),
+                "kind": "hidden-uav-counter", "status": "initial-counter-unavailable",
+                "blocking": True, "access": candidate.get("access"),
+                "outputCounterValue": descriptor.get("bufferStructCount"),
+                "outputCounterPhase": "after-action",
+                "reason": "Pre-action buffer bytes do not include the hidden append/consume counter. Reconstruct its producer or obtain an exact pre-action descriptor counter before restoring this dispatch."})
+        offset = _safe_int(descriptor.get("byteOffset"), -1)
+        length = _safe_int(getattr(description, "length", getattr(description, "byteSize", 0)), 0)
+        count = _safe_int(descriptor.get("byteSize"), 0)
+        if count == 0:
+            count = length - offset
+        key = (rid, offset, count)
+        if offset < 0 or count <= 0 or offset + count > length or count > MAX_BOUND_BUFFER_BYTES:
+            gaps.append(dict(candidate, status="unavailable", reason="bound buffer window is invalid or exceeds 64 MiB"))
+            continue
+        if key not in windows:
+            # Budget includes before and after snapshots; the replay stays bounded.
+            if total + count * 2 > MAX_BOUND_BUFFER_TOTAL_BYTES:
+                gaps.append(dict(candidate, status="unavailable", reason="bound buffer export exceeds 256 MiB"))
+                continue
+            total += count * 2
+            windows[key] = {"resourceId": rid, "byteOffset": offset, "byteSize": count,
+                "resourceByteSize": length, "bindings": [], "status": "pending"}
+        windows[key]["bindings"].append({key: candidate.get(key) for key in ("stage", "kind", "access", "descriptor", "parentResourceId")})
+    if not windows:
+        return [], gaps
+    replay = getattr(ctrl, "ReplayFrameEventForAnalysis", None)
+    restore = getattr(ctrl, "RestoreFrameEventAfterAnalysis", None)
+    select = getattr(ctrl, "SetFrameEvent", None)
+    current = getattr(ctrl, "GetCurrentEventID", None)
+    if not all(callable(method) for method in (replay, restore, select, current)) or event_id <= 0:
+        for window in windows.values():
+            gaps.append(dict(window, status="unavailable", reason="exact pre-action buffer replay is unavailable"))
+        return [], gaps
+    if int(current()) != event_id:
+        raise RuntimeError("selected event changed before buffer snapshot")
+    def healthy():
+        getter = getattr(ctrl, "GetFatalErrorStatus", None)
+        if callable(getter):
+            status = getter()
+            code = getattr(status, "code", None)
+            succeeded = getattr(getattr(rd_module, "ResultCode", None), "Succeeded", None)
+            if ((succeeded is not None and code != succeeded) or
+                    (succeeded is None and str(code).rsplit(".", 1)[-1] != "Succeeded")):
+                raise RuntimeError("native replay is unavailable during buffer snapshot: %s" % status)
+    healthy()
+    try:
+        replay(event_id - 1)
+        healthy()
+        for index, (key, window) in enumerate(sorted(windows.items())):
+            rid, offset, count = key
+            try:
+                raw = bytes(ctrl.GetBufferData(descriptions[rid].resourceId, offset, count) or b"")
+                if len(raw) != count:
+                    raise RuntimeError("RenderDoc returned a truncated buffer view")
+                artifact = writer.write_bytes("buffers/%03d.before.bin" % index, raw, "bound-buffer-before-action")
+                window.update(status="captured", capturePhase="before-action", replayEventId=event_id - 1,
+                              selectedEventId=event_id, raw=dict(artifact, status="captured"))
+            except Exception as exc:
+                window.update(status="unavailable", reason=str(exc)[:1024])
+                gaps.append(dict(window))
+    finally:
+        try:
+            restore()
+        finally:
+            # A failed analysis restore must not let unrelated replay use its
+            # temporary bytes. Force the exact selected EID before returning.
+            select(event_id, True)
+            if int(current()) != event_id:
+                raise RuntimeError("selected EID could not be restored after buffer snapshot")
+            healthy()
+    for window in windows.values():
+        window["replayRestoration"] = {"selectedEventId": event_id, "restored": True,
+            "nativeHealthChecked": callable(getattr(ctrl, "GetFatalErrorStatus", None))}
+    for index, (key, window) in enumerate(sorted(windows.items())):
+        if window["status"] != "captured" or not any(str(binding.get("kind", "")).startswith("read-write-") for binding in window["bindings"]):
+            continue
+        rid, offset, count = key
+        try:
+            raw = bytes(ctrl.GetBufferData(descriptions[rid].resourceId, offset, count) or b"")
+            if len(raw) != count:
+                raise RuntimeError("RenderDoc returned a truncated UAV output view")
+            artifact = writer.write_bytes("buffers/%03d.after.bin" % index, raw, "bound-buffer-after-action")
+            window["postRaw"] = dict(artifact, status="captured", capturePhase="after-action", replayEventId=event_id)
+        except Exception as exc:
+            window["postRaw"] = {"status": "unavailable", "reason": str(exc)[:1024]}
+            gaps.append({"resourceId": rid, "kind": "read-write-output", "status": "unavailable", "reason": str(exc)[:1024]})
+    healthy()
+    return list(windows.values()), gaps
 
 
 def inspect_controller(ctrl, rd_module, request, stages):
     action = _find_action(ctrl.GetRootActions(), request["eventId"])
     if action is None:
         raise ValueError("event_id does not identify an action")
+    stages = _action_stages(action, rd_module, stages)
     instance_count = _safe_int(getattr(action, "numInstances", 0), 0)
     if (instance_count > 0 and request["instance"] >= instance_count) or (
             instance_count <= 0 and request["instance"] != 0):
         raise ValueError("instance is outside the selected action")
     pipeline = ctrl.GetPipelineState()
     writer = None
-    api, textures, samplers, bound_stages = _pipeline_snapshot(ctrl, pipeline, stages)
+    api, textures, samplers, bound_stages, unexported = _pipeline_snapshot(ctrl, pipeline, stages)
     return {
         "schema": INSPECT_SCHEMA,
         "schemaVersion": 1,
@@ -1449,10 +1783,11 @@ def inspect_controller(ctrl, rd_module, request, stages):
         "view": request["view"],
         "api": api,
         "action": _action_record(action),
-        "mesh": _mesh(ctrl, pipeline, action, request, rd_module, writer, False),
+        "mesh": _action_mesh(ctrl, pipeline, action, request, rd_module, writer, False),
         "textures": textures,
         "samplers": samplers,
         "boundShaderStages": bound_stages,
+        "unexportedResources": unexported,
         "evidenceContract": {
             "observed": ["action", "mesh", "textures", "samplers", "boundShaderStages"],
             "inferred": [],
@@ -1467,17 +1802,25 @@ def capture_controller(ctrl, rd_module, request, stages):
         action = _find_action(ctrl.GetRootActions(), request["eventId"])
         if action is None:
             raise ValueError("event_id does not identify an action")
+        stages = _action_stages(action, rd_module, stages)
         instance_count = _safe_int(getattr(action, "numInstances", 0), 0)
         if instance_count > 0 and request["instance"] >= instance_count:
             raise ValueError("instance is outside the selected action")
         if instance_count <= 0 and request["instance"] != 0:
             raise ValueError("a non-instanced action only supports instance 0")
         pipeline = ctrl.GetPipelineState()
-        api, textures, samplers, bound_stages = _pipeline_snapshot(
+        # Which readable copies to write beside the DDS evidence. "auto" resolves per
+        # texture: TGA (plus PNG) for LDR surfaces, EXR for floating-point ones.
+        texture_formats = request.get("textureFormats") or ("auto",)
+        texture_formats = tuple(
+            str(item).strip().lower() for item in texture_formats
+            if str(item or "").strip())[:6]
+        api, textures, samplers, bound_stages, unexported = _pipeline_snapshot(
             ctrl, pipeline, stages)
-        mesh = _mesh(ctrl, pipeline, action, request, rd_module, writer, True)
+        mesh = _action_mesh(ctrl, pipeline, action, request, rd_module, writer, True)
+        buffers, unexported = _capture_bound_buffers(ctrl, unexported, mesh, request["eventId"], writer, rd_module)
         for texture in textures:
-            _save_texture_dds(ctrl, rd_module, texture, writer)
+            _save_texture_dds(ctrl, rd_module, texture, writer, extra_formats=texture_formats)
         bundle = {
             "schema": BUNDLE_SCHEMA,
             "schemaVersion": 1,
@@ -1494,7 +1837,9 @@ def capture_controller(ctrl, rd_module, request, stages):
             "mesh": mesh,
             "textures": textures,
             "samplers": samplers,
+            "buffers": buffers,
             "boundShaderStages": bound_stages,
+            "unexportedResources": unexported,
             "shaders": [],
             "constantBuffers": [],
             "files": writer.files,
@@ -1524,7 +1869,7 @@ def condense_shader_evidence(value):
             "reason": str(value.get("error"))[:2048],
         }
     keys = (
-        "shaderId", "pipelineId", "api", "stage", "entryPoint", "entryPoints",
+        "shaderId", "pipelineId", "api", "stage", "entryPoint", "entryPoints", "rawArtifact",
         "entryPointSelection", "encoding", "rawSha256", "compiledInterface",
         "inputs", "outputs", "boundTextures", "constantBuffers", "samplers",
         "sectionStatus", "evidenceContract", "diagnostics", "unknowns",
@@ -1630,11 +1975,14 @@ def finalize_capture(state, shader_evidence):
                     stage_name, block_index, block)
                 block["physicalIdentity"] = identity
                 block["physicalId"] = physical_id
+                requires_data = _safe_int(block.get("byteSize", block.get("size", 0)), 0) > 0
                 block["layoutStatus"] = (
-                    "captured" if isinstance(block.get("layoutFields"), list)
-                    else "unavailable")
-                block["liveValuesStatus"] = block.get(
-                    "variablesStatus", "unavailable")
+                    "captured" if isinstance(block.get("layoutFields"), list) and
+                    (block["layoutFields"] or not requires_data) else "unavailable")
+                live_status = block.get("variablesStatus", "unavailable")
+                if requires_data and not block.get("variables"):
+                    live_status = "unavailable"
+                block["liveValuesStatus"] = live_status
                 raw = block.get("raw")
                 if isinstance(raw, dict):
                     raw.setdefault("exact", raw.get("status") == "captured")
@@ -1683,6 +2031,10 @@ def finalize_capture(state, shader_evidence):
         bundle["files"] = list(writer.files)
 
         incomplete = []
+        for resource in bundle.get("unexportedResources", []):
+            incomplete.append("resource.%s.%s:%s" % (
+                resource.get("stage", "unknown"), resource.get("resourceId", resource.get("kind", "unknown")),
+                resource.get("status", "unavailable")))
         for attribute in bundle.get("mesh", {}).get("attributes", []):
             status = attribute.get("canonical", {}).get("status")
             if status != "captured":
@@ -1696,6 +2048,16 @@ def finalize_capture(state, shader_evidence):
             if shader.get("status") != "captured":
                 incomplete.append("shader.%s:%s" % (
                     shader.get("stage", "unknown"), shader.get("status")))
+        for block in constant_buffers:
+            label = "cbuffer.%s.%d" % (
+                block.get("stage", "unknown"), block.get("constantBlockIndex", -1))
+            if block.get("layoutStatus") != "captured":
+                incomplete.append(label + ".layout:unavailable")
+            # Root/push/inline constants need not have a buffer-backed byte
+            # artifact. Their captured live values are an independent source.
+            if (block.get("liveValuesStatus") not in ("available", "captured") and
+                    (block.get("raw") or {}).get("status") != "captured"):
+                incomplete.append(label + ".values:unavailable")
         bundle["completion"] = {
             "status": "complete" if not incomplete else "partial",
             "incomplete": incomplete,

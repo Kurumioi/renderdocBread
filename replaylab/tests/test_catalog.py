@@ -3,10 +3,10 @@ from __future__ import annotations
 import pytest
 
 from replaylab_agent.catalog import (
-    CODEBUDDY_REPLAYLAB_MCP_PERMISSION,
+    CODEBUDDY_BREAD_MCP_PERMISSION,
     PRESETS,
     PRESET_BY_ID,
-    REPLAYLAB_MCP_SERVER_NAME,
+    BREAD_MCP_SERVER_NAME,
     get_preset,
 )
 from replaylab_agent.errors import ConfigurationError
@@ -104,7 +104,7 @@ def test_catalog_exposes_configuration_and_authentication_ui_semantics() -> None
                 "--tools",
                 "",
                 "--allowedTools",
-                CODEBUDDY_REPLAYLAB_MCP_PERMISSION,
+                CODEBUDDY_BREAD_MCP_PERMISSION,
             ),
             (
                 "codebuddy",
@@ -122,7 +122,7 @@ def test_catalog_exposes_configuration_and_authentication_ui_semantics() -> None
         (
             "claude-code-acp",
             ("claude-agent-acp",),
-            ("claude", "setup-token"),
+            ("claude", "auth", "login"),
             "terminal",
         ),
     ],
@@ -162,7 +162,7 @@ def test_codebuddy_exact_catalog_argv_admits_documented_empty_tool_allowlist() -
 
     profile.validate()
     assert agent_command_argv(profile) == list(get_preset("codebuddy-acp").command)
-    assert CODEBUDDY_REPLAYLAB_MCP_PERMISSION == f"mcp__{REPLAYLAB_MCP_SERVER_NAME}"
+    assert CODEBUDDY_BREAD_MCP_PERMISSION == f"mcp__{BREAD_MCP_SERVER_NAME}"
     assert "mcp__*" not in profile.argv
     assert "-y" not in profile.argv
     assert "bypassPermissions" not in profile.argv

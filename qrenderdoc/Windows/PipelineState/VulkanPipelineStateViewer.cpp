@@ -5593,6 +5593,12 @@ void VulkanPipelineStateViewer::computeDebugSelector_beginDebug(
   if(!shaderDetails)
     return;
 
+  // The progress dialog can publish a newer event while this debug request is running.
+  // Retain the reflection used to start the request until the viewer has taken its own copy.
+  const ShaderReflection shaderSnapshot(*shaderDetails);
+  shaderDetails = &shaderSnapshot;
+  const ResourceId pipeline = m_Ctx.CurPipelineState().GetComputePipelineObject();
+
   struct threadSelect
   {
     rdcfixedarray<uint32_t, 3> g;
@@ -5644,7 +5650,7 @@ void VulkanPipelineStateViewer::computeDebugSelector_beginDebug(
 
   // viewer takes ownership of the trace
   IShaderViewer *s = m_Ctx.DebugShader(
-      shaderDetails, m_Ctx.CurPipelineState().GetComputePipelineObject(), trace, debugContext);
+      shaderDetails, pipeline, trace, debugContext);
 
   m_Ctx.AddDockWindow(s->Widget(), DockReference::AddTo, this);
 }

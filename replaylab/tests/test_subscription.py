@@ -28,6 +28,8 @@ def test_known_subscription_message_ids_are_covered_by_qrenderdoc() -> None:
         REPOSITORY_ROOT / "replaylab" / "src" / "replaylab_agent" / "cli.py",
         REPOSITORY_ROOT / "replaylab" / "src" / "replaylab_agent" / "connectors"
         / "subscription.py",
+        REPOSITORY_ROOT / "replaylab" / "src" / "replaylab_agent" / "connectors"
+        / "claude_auth.py",
     ]
     python_ids = set()
     for path in production_sources:
@@ -1160,7 +1162,7 @@ async def test_claude_login_and_acp_share_the_profile_scoped_state_root(
         )
         argv, kwargs = launches[0]
         expected = (tmp_path / "ReplayLab" / "claude" / "claude-main").resolve()
-        assert argv == ["C:/trusted/claude.cmd", "setup-token"]
+        assert argv == ["C:/trusted/claude.cmd", "auth", "login"]
         assert kwargs["env"]["CLAUDE_CONFIG_DIR"] == str(expected)
         assert kwargs["env"]["CLAUDE_CONFIG_DIR"] != str(tmp_path / "global-claude")
         assert "OPENAI_API_KEY" not in kwargs["env"]
@@ -1286,6 +1288,57 @@ async def test_operation_cancel_runs_cleanup_and_cancels_inflight_work() -> None
         await task
     assert cleanup_called is True
     assert operation_closed is True
+
+
+@pytest.mark.asyncio
+async def test_outer_task_cancellation_also_cleans_subscription_operation() -> None:
+    from replaylab_agent.connectors.subscription import _await_or_cancel
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    cleanup = []
+
+    async def operation():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    async def cancel_vendor():
+        cleanup.append(True)
+
+    task = asyncio.create_task(_await_or_cancel(operation(), asyncio.Event(), on_cancel=cancel_vendor))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert closed.is_set()
+    assert cleanup == [True]
+
+
+@pytest.mark.asyncio
+async def test_failed_vendor_cancel_still_stops_local_subscription_operation() -> None:
+    from replaylab_agent.connectors.subscription import _await_or_cancel
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    cancel = asyncio.Event()
+
+    async def operation():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    async def cancel_vendor():
+        raise RuntimeError("vendor cancel failed")
+
+    task = asyncio.create_task(_await_or_cancel(operation(), cancel, on_cancel=cancel_vendor))
+    await started.wait()
+    cancel.set()
+    with pytest.raises(RuntimeError, match="vendor cancel failed"):
+        await task
+    assert closed.is_set()
 
 
 @pytest.mark.asyncio

@@ -134,6 +134,24 @@ class MaterialEditQueueTests(unittest.TestCase):
         self.execute()()
         self.assertEqual(self.model.status(self.sid)["revision"], 1)
 
+    def test_external_native_edit_expires_pending_values_without_retrying_or_locking_reopen(self):
+        self.submit("0.25")
+        self.submit("0.5")
+        self.ctrl.generation += 1
+        self.execute()()
+        self.assertEqual(len(self.observed), 1)
+        self.assertTrue(getattr(self.observed[0][1], "snapshot_expired", False))
+        self.assertEqual(self.ctrl.sets, [])
+        self.assertEqual(self.jobs, [])
+        self.assertFalse(self.model.edit_queue.busy)
+        self.assertEqual(self.model.list_status(), [])
+        status = self.model.expose(_selection())
+        self.sid = status["sessionId"]
+        self.pid = status["parameters"][0]["parameterId"]
+        self.submit("0.75")
+        self.execute()()
+        self.assertEqual(self.model.status(self.sid)["parameters"][0]["value"], [0.75])
+
     def test_clear_waits_for_committed_edit_and_drops_pending_values(self):
         self.submit("0.25")
         self.submit("0.5")

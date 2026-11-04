@@ -45,8 +45,8 @@ public:
 
 #if !defined(SWIG)
   // C++ publication helper: copy common descriptor metadata while rebinding the API view to
-  // caller-owned state copies. The pointed-to states must outlive this PipeState. Shader
-  // reflection remains shared immutable capture metadata, as in the API-specific state copies.
+  // caller-owned state copies. The caller must preserve the lifetime of the pointed-to states
+  // and their shader reflection data for as long as this PipeState references them.
   void CopyStateAndRebind(const PipeState &source, const D3D11Pipe::State *d3d11,
                           const D3D12Pipe::State *d3d12, const GLPipe::State *gl,
                           const VKPipe::State *vulkan)

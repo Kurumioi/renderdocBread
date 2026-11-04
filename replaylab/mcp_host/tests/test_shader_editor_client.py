@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = (
@@ -48,7 +49,7 @@ class _Transport:
 
 
 class _HealthTransport:
-    def __init__(self, pid=None, version="1.13.0", status=200,
+    def __init__(self, pid=None, version=client_module.EXPECTED_HOST_VERSION, status=200,
                  protocol_version=1, host_instance_id=HOST_INSTANCE_ID):
         self.pid = os.getpid() if pid is None else pid
         self.version = version
@@ -104,7 +105,7 @@ class ReplayLabShaderSaveClientTests(unittest.TestCase):
                 {
                     "schema": "replaylab-internal-host/v1",
                     "service": "ReplayLabInternal",
-                    "version": "1.13.0",
+                    "version": client_module.EXPECTED_HOST_VERSION,
                     "hostStateProtocolVersion": 1,
                     "host": "127.0.0.1",
                     "port": 49643,
@@ -135,7 +136,9 @@ class ReplayLabShaderSaveClientTests(unittest.TestCase):
         source = MODULE_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(MODULE_PATH), feature_version=(3, 6))
         imported = set()
-        for node in ast.walk(tree):
+        # Windows' compact embedded interpreter must import this module without
+        # _socket. Unix imports http.client lazily in its dedicated transport.
+        for node in tree.body:
             if isinstance(node, ast.Import):
                 imported.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
@@ -143,11 +146,88 @@ class ReplayLabShaderSaveClientTests(unittest.TestCase):
         self.assertTrue(imported.isdisjoint(
             {"http", "http.client", "urllib", "urllib.request", "socket", "_socket"}
         ))
+        portable = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "_portable_loopback_request")
+        self.assertTrue(any(isinstance(node, ast.Import) and
+                            any(alias.name == "http.client" for alias in node.names)
+                            for node in ast.walk(portable)))
         self.assertIn("WinHttpOpen", source)
         self.assertIn('"127.0.0.1"', source)
         self.assertIn("WINHTTP_DISABLE_REDIRECTS", source)
         self.assertIn("DISABLE_AUTHENTICATION", source)
         self.assertIn("WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH", source)
+
+    def test_source_only_save_uses_draft_route_and_reports_newer_source_conflict(self):
+        text = "float4 MainPS() : SV_Target { return 1; }\n"
+        binding = {"instanceId": "instance", "captureSessionId": "a" * 32,
+                   "capturePath": "D:/captures/current.rdc"}
+        result = {"rawSha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                  "sourceOnly": True, "compileScheduled": False,
+                  "sourceWorkspaceId": WORKSPACE_ID,
+                  "sourcePath": "D:/project/workspace/source/shader.hlsl",
+                  "modifiedNs": 123, "size": len(text), "changed": True}
+        with tempfile.TemporaryDirectory() as temporary:
+            client, _transport, health = self._client(self._runtime(temporary), 200, {})
+            transport = _Transport(200, {"result": result})
+            with mock.patch.object(client_module, "_winhttp_post_live_edit", transport):
+                self.assertEqual(result, client.save_source(
+                    "D:/project/workspace", WORKSPACE_ID, EXPECTED_SHA256, text, binding))
+            payload = json.loads(transport.calls[0][2].decode("utf-8"))
+            self.assertEqual("save-source", payload["operation"])
+            self.assertEqual(text, payload["parameters"]["text"])
+            self.assertEqual(EXPECTED_SHA256, payload["parameters"]["expected_raw_sha256"])
+            self.assertEqual(binding, payload["binding"])
+            self.assertTrue(health.calls)
+            conflict = _Transport(409, {"conflict": True, "error": "newer source"})
+            with mock.patch.object(client_module, "_winhttp_post_live_edit", conflict):
+                with self.assertRaisesRegex(client_module.ReplayLabShaderSaveConflict, "newer source"):
+                    client.save_source("D:/project/workspace", WORKSPACE_ID,
+                                       EXPECTED_SHA256, text, binding)
+
+    def test_explicit_save_requests_apply_without_an_existing_session(self):
+        text = "float4 MainPS() : SV_Target { return 0; }\n"
+        binding = {"instanceId": "instance", "captureSessionId": "a" * 32,
+                   "capturePath": "D:/captures/current.rdc"}
+        saved = {"rawSha256": hashlib.sha256(text.encode()).hexdigest(),
+                 "sourceWorkspaceId": WORKSPACE_ID, "sourcePath": "D:/project/source.hlsl",
+                 "modifiedNs": 123, "sourceOnly": False, "compileScheduled": True}
+        with tempfile.TemporaryDirectory() as temporary:
+            client, _, _ = self._client(self._runtime(temporary), 200, {})
+            for startup_error in ("", "Compiler is unavailable"):
+                with self.subTest(startup_error=startup_error):
+                    receipt = dict(saved, compileScheduled=not bool(startup_error),
+                                   autoApplyError=startup_error)
+                    transport = _Transport(200, {"result": receipt})
+                    with mock.patch.object(client_module, "_winhttp_post_live_edit", transport):
+                        result = client.save_and_apply_source(
+                            "D:/project/workspace", WORKSPACE_ID, EXPECTED_SHA256, text, binding)
+                    request = json.loads(transport.calls[0][2])
+                    self.assertEqual(request["operation"], "save-and-apply-source")
+                    self.assertEqual(request["binding"], binding)
+                    self.assertEqual(result, receipt)  # Persisted text remains a successful save.
+
+    def test_include_apply_uses_header_and_root_revision(self):
+        text = "#define VALUE 2\n"
+        document_id, root_sha = "1" * 64, "2" * 64
+        saved = {"schema": "bread-shader-source-document/v1", "sourceDocumentId": document_id,
+                 "rawSha256": hashlib.sha256(text.encode()).hexdigest(),
+                 "sourceWorkspaceId": WORKSPACE_ID, "sourcePath": "D:/project/source/math.hlsli",
+                 "modifiedNs": 123, "sourceOnly": False, "compileScheduled": True}
+        with tempfile.TemporaryDirectory() as temporary:
+            client, _, _ = self._client(self._runtime(temporary), 200, {})
+            transport = _Transport(200, {"result": saved})
+            with mock.patch.object(client_module, "_winhttp_post_live_edit", transport):
+                client.save_and_apply_source_document("D:/project/workspace", WORKSPACE_ID,
+                    document_id, EXPECTED_SHA256, root_sha, text, {})
+            request = json.loads(transport.calls[0][2])
+            self.assertEqual(request["operation"], "save-and-apply-source-document")
+            self.assertEqual(request["parameters"]["expected_source_sha256"], root_sha)
+            self.assertEqual(request["parameters"]["document_id"], document_id)
+            saved["rawSha256"] = "9" * 64
+            with mock.patch.object(client_module, "_winhttp_post_live_edit", _Transport(200, {"result": saved})):
+                with self.assertRaisesRegex(client_module.ReplayLabShaderSaveError, "invalid editor save"):
+                    client.save_and_apply_source_document("D:/project/workspace", WORKSPACE_ID,
+                        document_id, EXPECTED_SHA256, root_sha, text, {})
 
     def test_save_uses_host_port_bearer_and_bounded_transport(self):
         text = "float4 MainPS() : SV_Target { return 1; }\n"
@@ -460,7 +540,7 @@ class ReplayLabShaderSaveClientTests(unittest.TestCase):
             self.assertTrue(client_module.ReplayLabShaderSaveClient.request_pending())
             with self.assertRaisesRegex(
                 client_module.ReplayLabShaderSaveError,
-                "previous ReplayLab Host request is still pending",
+                "previous Bread Host request is still pending",
             ):
                 client_module._bounded_winhttp_request(
                     "GET", "/health", 49643, "", b"", 0.1)

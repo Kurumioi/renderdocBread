@@ -64,6 +64,21 @@
 #define JSON_ID "rdocLayoutData"
 #define JSON_VER 1
 
+static QWidget *CreateFrameRenderFlowPlaceholder()
+{
+  // The first-party Python integration starts after native layout restoration. Keep its dock
+  // position and selected-tab index intact until the real panel populates this same widget.
+  QWidget *panel = new QWidget();
+  // i18n-ignore: stable first-party dock identity and lifecycle properties.
+  panel->setObjectName(lit("breadFrameRenderFlow"));
+  panel->setProperty("breadFrameFlowPlaceholder", true);
+  panel->setProperty("breadPreserveOnLayoutRestore", true);
+  panel->setWindowTitle(
+      QCoreApplication::translate("ReplayLabProjects", "Frame Rendering Flow"));
+  panel->setWindowIcon(QIcon(lit(":/logo.svg")));    // i18n-ignore: application icon resource path
+  return panel;
+}
+
 #if defined(Q_OS_WIN32)
 extern "C" void *__stdcall GetModuleHandleA(const char *);
 #endif
@@ -446,6 +461,9 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
   bugupdate->start();
 
   ui->toolWindowManager->setToolWindowCreateCallback([this](const QString &objectName) -> QWidget * {
+    // i18n-ignore: stable first-party dock identity stored in layout files.
+    if(objectName == lit("breadFrameRenderFlow"))
+      return CreateFrameRenderFlowPlaceholder();
     return m_Ctx.CreateBuiltinWindow(objectName);
   });
 
@@ -1248,15 +1266,10 @@ void MainWindow::SetTitle(const QString &filename)
   if(m_Ctx.Replay().CurrentRemote().IsValid())
     prefix += tr("Remote: %1 - ").arg(m_Ctx.Replay().CurrentRemote().Name());
 
-  QString text = prefix + lit("RenderSocoDoc ");
+  QString text = prefix + lit("RenderDocBread ");    // i18n-ignore: product brand
 
-  if(RENDERDOC_STABLE_BUILD)
-    text += lit(FULL_VERSION_STRING);
-  else
-    text += tr("Unstable %1 Build (%2 - %3)")
-                .arg(RENDERDOC_IsReleaseBuild() ? lit("Release") : lit("Development"))
-                .arg(lit(FULL_VERSION_STRING))
-                .arg(QString::fromLatin1(RENDERDOC_GetCommitHash()));
+  // Build configuration/commit details remain available through diagnostics.
+  text += lit(FULL_VERSION_STRING);
 
   if(IsRunningAsAdmin())
     text += tr(" (Administrator)");
@@ -1462,6 +1475,15 @@ void MainWindow::PopulateReportedBugs()
 
 void MainWindow::CheckUpdates(bool forceCheck, UpdateResultMethod callback)
 {
+  if(QFileInfo(QDir(QCoreApplication::applicationDirPath()).filePath(
+         lit("RenderDocBread.portable"))).isFile())    // i18n-ignore: portable release marker
+  {
+    if(updateAction)
+      updateAction->setVisible(false);
+    if(callback)
+      callback(UpdateResult::Disabled);
+    return;
+  }
   if(!updateAction)
     return;
 
@@ -1764,7 +1786,7 @@ void MainWindow::LoadInitialLayout()
     ui->toolWindowManager->addToolWindow(
         bookmarksView,
         ToolWindowManager::AreaReference(ToolWindowManager::BottomOf,
-                                         ui->toolWindowManager->areaOf(eventBrowser), 0.3f));
+                                         ui->toolWindowManager->areaOf(eventBrowser), 0.45f));
 
     QWidget *apiInspector = m_Ctx.GetAPIInspector()->Widget();
 
@@ -1774,12 +1796,35 @@ void MainWindow::LoadInitialLayout()
                                          ui->toolWindowManager->areaOf(bookmarksView)));
     ToolWindowManager::raiseToolWindow(bookmarksView);
 
+    QWidget *annotationViewer = m_Ctx.GetAnnotationViewer()->Widget();
+    ui->toolWindowManager->addToolWindow(
+        annotationViewer, ToolWindowManager::AreaReference(
+                              ToolWindowManager::AddTo,
+                              ui->toolWindowManager->areaOf(bookmarksView)));
+    ToolWindowManager::raiseToolWindow(bookmarksView);
+
+    for(QWidget *tool : {m_Ctx.GetResourceInspector()->Widget(), m_Ctx.GetPythonShell()->Widget()})
+      ui->toolWindowManager->addToolWindow(
+          tool, ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
+                                                ui->toolWindowManager->areaOf(textureViewer)));
+    ui->toolWindowManager->addToolWindow(
+        CreateFrameRenderFlowPlaceholder(),
+        ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
+                                         ui->toolWindowManager->areaOf(textureViewer)));
+    ToolWindowManager::raiseToolWindow(textureViewer);
+
+    ui->toolWindowManager->addToolWindow(
+        ctx.GetAIAssistant()->Widget(),
+        ToolWindowManager::AreaReference(ToolWindowManager::RightWindowSide,
+                                         ui->toolWindowManager->areaOf(textureViewer), 0.28f),
+        ToolWindowManager::HideOnClose);
+
     QWidget *timelineBar = m_Ctx.GetTimelineBar()->Widget();
 
     ui->toolWindowManager->addToolWindow(
         timelineBar,
         ToolWindowManager::AreaReference(ToolWindowManager::TopWindowSide,
-                                         ui->toolWindowManager->areaOf(textureViewer), 0.2f));
+                                         ui->toolWindowManager->areaOf(textureViewer), 0.08f));
   }
 }
 
@@ -3451,6 +3496,22 @@ bool MainWindow::LoadLayout(int layout)
       {
         if(ui->toolWindowManager->areaOf(toolWindow) == NULL)
         {
+          // An omitted frame-flow tab is an intentional choice in this saved layout. Keep its
+          // in-memory analysis alive but hidden instead of inserting it into a custom layout.
+          // i18n-ignore: stable first-party dock identity stored in layout files.
+          if(toolWindow->objectName() == lit("breadFrameRenderFlow"))
+            continue;
+          // First-party Python panels own unsaved documents and asynchronous callbacks.
+          // Loading an older layout must not destroy them behind their controllers' backs.
+          // i18n-ignore: first-party widget lifecycle property, never user-visible.
+          // Bread AI may have an active conversation even when an older layout omits its tab.
+          // HideOnClose is deliberately bypassed by forceCloseToolWindow, so preserve it here too.
+          if(toolWindow->property("breadPreserveOnLayoutRestore").toBool() ||
+             dynamic_cast<AIAssistant *>(toolWindow))
+          {
+            ui->toolWindowManager->moveToolWindow(toolWindow, mainToolArea());
+            continue;
+          }
           qInfo() << "Manually closing orphaned window " << toolWindow->objectName();
           ui->toolWindowManager->forceCloseToolWindow(toolWindow);
         }
@@ -3462,6 +3523,11 @@ bool MainWindow::LoadLayout(int layout)
       if(layout == 0 && state[lit("bookmarksViewLayoutVersion")].toInt() < 1)
         on_action_Bookmarks_triggered();
 
+      // Notify the already-running Python integration after the complete native restore. At
+      // startup it will instead find and adopt the placeholder when it registers its windows.
+      // i18n-ignore: internal UI-only layout lifecycle notification, not a user-facing value.
+      setProperty("breadFrameFlowLayoutGeneration",
+                  property("breadFrameFlowLayoutGeneration").toInt() + 1);
       return true;
     }
     return false;

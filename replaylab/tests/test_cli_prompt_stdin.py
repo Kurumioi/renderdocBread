@@ -30,6 +30,7 @@ def _args(**overrides):
         "skill": "",
         "intent_kind": "",
         "task_id": "task",
+        "conversation_id": "",
         "cancel_file": None,
         "engine_config": None,
         "json": False,
@@ -59,6 +60,29 @@ def _install_engine(monkeypatch, implementation):
             return await implementation(request)
 
     monkeypatch.setattr(cli, "DeepAgentsEngine", FakeEngine)
+
+
+def test_parser_rejects_malicious_conversation_id_without_echo(capsys) -> None:
+    import replaylab_agent.cli as cli
+
+    hostile = "../capture/conversation"
+    with pytest.raises(SystemExit) as failure:
+        cli._parser().parse_args(
+            [
+                "run",
+                "--profile",
+                "local",
+                "--prompt",
+                "inspect",
+                "--conversation-id",
+                hostile,
+            ]
+        )
+
+    assert failure.value.code == 2
+    diagnostic = capsys.readouterr().err
+    assert hostile not in diagnostic
+    assert "invalid-command-line" in diagnostic
 
 
 @pytest.mark.asyncio
@@ -214,6 +238,142 @@ async def test_run_reads_prompt_from_stdin(monkeypatch, tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "profile_id", "engine_name"),
+    [
+        (Profile("local", "ollama", "test-model"), "local", "DeepAgentsEngine"),
+        (Profile("subscription", "codex"), "subscription", "NativeAgentEngine"),
+    ],
+)
+async def test_explicit_conversation_id_reaches_every_engine_request(
+    monkeypatch, tmp_path, profile, profile_id, engine_name
+) -> None:
+    import replaylab_agent.cli as cli
+
+    observed = {}
+
+    class FakeEngine:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        async def run(self, request):
+            observed["request"] = request
+            return RunResult(
+                task_id=request.task_id,
+                profile_id=request.profile.id,
+                executor="fixture",
+                text="ok",
+                terminal_status="completed",
+            )
+
+    class ForbiddenEngine:
+        def __init__(self, *args, **kwargs) -> None:  # pragma: no cover
+            del args, kwargs
+            raise AssertionError("the wrong engine route was selected")
+
+    store = ProfileStore(tmp_path / "profiles.json")
+    store.add(profile)
+    monkeypatch.setattr(cli, engine_name, FakeEngine)
+    other = "NativeAgentEngine" if engine_name == "DeepAgentsEngine" else "DeepAgentsEngine"
+    monkeypatch.setattr(cli, other, ForbiddenEngine)
+
+    assert (
+        await cli._run_once(
+            _args(
+                profile=profile_id,
+                prompt="organize this shader",
+                conversation_id="conversation-4a8f",
+            ),
+            store,
+        )
+        == 0
+    )
+    assert observed["request"].conversation_id == "conversation-4a8f"
+
+
+@pytest.mark.asyncio
+async def test_explicit_conversation_id_must_match_typed_envelope(
+    monkeypatch, tmp_path
+) -> None:
+    import replaylab_agent.cli as cli
+
+    called = False
+
+    async def run(_request):
+        nonlocal called
+        called = True
+        return _result()
+
+    _install_engine(monkeypatch, run)
+    prompt = (
+        '{"schema":"replaylab-conversation/v5",'
+        '"conversationId":"conversation-envelope",'
+        '"messages":[],"request":{"role":"user","content":"continue"}}'
+    )
+    with pytest.raises(ValueError, match="conflicts with the typed conversation envelope"):
+        await cli._run_once(
+            _args(prompt=prompt, conversation_id="conversation-explicit"),
+            _store(tmp_path),
+        )
+    assert called is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "conversation_id",
+    ["../escape", "bad/id", " leading-space", "line\nbreak", "x" * 161],
+)
+async def test_run_rejects_noncanonical_conversation_ids(
+    monkeypatch, tmp_path, conversation_id
+) -> None:
+    import replaylab_agent.cli as cli
+
+    called = False
+
+    async def run(_request):
+        nonlocal called
+        called = True
+        return _result()
+
+    _install_engine(monkeypatch, run)
+    with pytest.raises(ValueError, match="conversation identity is invalid") as failure:
+        await cli._run_once(
+            _args(conversation_id=conversation_id),
+            _store(tmp_path),
+        )
+    assert conversation_id not in str(failure.value)
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_matching_explicit_and_envelope_conversation_id_is_accepted(
+    monkeypatch, tmp_path
+) -> None:
+    import replaylab_agent.cli as cli
+
+    observed = {}
+
+    async def run(request):
+        observed["request"] = request
+        return _result()
+
+    _install_engine(monkeypatch, run)
+    prompt = (
+        '{"schema":"replaylab-conversation/v5",'
+        '"conversationId":"conversation-same",'
+        '"messages":[],"request":{"role":"user","content":"continue"}}'
+    )
+    assert (
+        await cli._run_once(
+            _args(prompt=prompt, conversation_id="conversation-same"),
+            _store(tmp_path),
+        )
+        == 0
+    )
+    assert observed["request"].conversation_id == "conversation-same"
+
+
+@pytest.mark.asyncio
 async def test_direct_action_becomes_scoped_intent(monkeypatch, tmp_path) -> None:
     import replaylab_agent.cli as cli
 
@@ -276,3 +436,37 @@ async def test_explain_event_intent_keeps_agent_skill_choice_adaptive(
     request = observed["request"]
     assert request.skill_name == ""
     assert request.intent == {"kind": "explain-current-event", "arguments": {}}
+
+
+@pytest.mark.asyncio
+async def test_direct_action_does_not_restrict_an_explicit_alternate_skill(
+    monkeypatch, tmp_path
+) -> None:
+    import replaylab_agent.cli as cli
+
+    observed = {}
+
+    async def run(request):
+        observed["request"] = request
+        return _result()
+
+    _install_engine(monkeypatch, run)
+    monkeypatch.setattr(
+        cli,
+        "_read_context",
+        lambda _args: (
+            {"capture": {"loaded": True, "captureSessionId": "a" * 32}},
+            "qrenderdoc-test",
+            "C:/capture.rdc",
+        ),
+    )
+    args = _args(
+        prompt="explain this shader target",
+        skill="renderdoc-shader-workbench",
+        intent_kind="explain-current-event",
+    )
+    assert await cli._run_once(args, _store(tmp_path)) == 0
+    assert observed["request"].skill_name == "renderdoc-shader-workbench"
+    assert observed["request"].intent == {
+        "kind": "explain-current-event", "arguments": {},
+    }

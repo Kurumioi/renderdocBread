@@ -2,6 +2,7 @@
 import ast
 import copy
 import json
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -65,6 +66,10 @@ class DirectProjectRestoreTests(unittest.TestCase):
         self.path = os.path.abspath("current.rdc")
         self.session = "f" * 32
         self.executor = Executor(); self.messages = []; self.refreshes = []; self.clients = []
+        # The status line now carries progress as keyword arguments, and the
+        # restore reports what the shared Shader library already knows. Both are
+        # recorded separately so the positional assertions below stay readable.
+        self.status_progress = []; self.reuse_reports = []
         self.executor_creations = []; self.generation_resumes = []
         self.console = []
         self.match = {"activated": True, "matchCount": 1,
@@ -81,6 +86,7 @@ class DirectProjectRestoreTests(unittest.TestCase):
             _restore_status_text=lambda value:value["phase"])
         self.ns = {"os": os, "uuid": uuid, "json": json, "re": re, "threading": threading,
             "HAS_UI": True, "_ctx": context,
+            "_replay_recovery_path":"",
             "QtCore": types.SimpleNamespace(QTimer=Timer, QCoreApplication=types.SimpleNamespace(translate=lambda c,s:s)),
             "_project_auto_activation_generation":0, "_project_auto_activation_timer":None,
             "_project_auto_restore_client":None, "_project_auto_restore_result":None, "_capture_session_id":self.session,
@@ -92,13 +98,20 @@ class DirectProjectRestoreTests(unittest.TestCase):
             "_consume_preselected_project_capture":lambda path:False,
             "_atomic_write_json":lambda *args:None, "PROJECT_ASSOCIATION_LEASE_FILE":str(uuid.uuid4()) + ".json",
             "_find_replaylab_internal_host":lambda:"ReplayLabInternal.exe",
-            "_show_project_background_status":lambda *args:self.messages.append(args),
+            "_show_project_background_status":lambda *args,**kwargs:(
+                self.messages.append(args), self.status_progress.append(kwargs)),
+            "_report_shared_shader_reuse":lambda *args:self.reuse_reports.append(args),
             "_clear_project_background_status":lambda:None,
             "_consume_project_association_lease":lambda *args:None,
             "_project_ui_format":lambda text,*args:text,
             "_dispose_project_timer":lambda timer:None,
             "_project_preselected_open_depth":0, "_project_preselected_capture_path":"",
             "_shader_workspace_ui":types.SimpleNamespace(refresh=lambda **kwargs:self.refreshes.append(kwargs))}
+        spec = importlib.util.spec_from_file_location("auto_restore_receipt_client", BRIDGE.with_name("project_restore_client.py"))
+        receipt_client = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(receipt_client)
+        self.ns["_project_restore_client_protocol"]._validate_shader_items = receipt_client._validate_shader_items
+        self.ns["_project_restore_client_protocol"]._validated_source_only_skips = receipt_client._validated_source_only_skips
         tree = ast.parse(BRIDGE.read_text(encoding="utf-8"), feature_version=(3,6))
         funcs = [node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name in
                  ("_schedule_project_auto_activation", "_cancel_project_auto_activation", "_ensure_project_async_executor",
@@ -119,6 +132,7 @@ class DirectProjectRestoreTests(unittest.TestCase):
             "_publish_instance_manifest":lambda **kwargs:self.load_order.append("manifest"),
             "_shader_workspace_capture_binding":lambda:{"captureSessionId":self.session},
             "_notify_shader_capture_changed":lambda binding:self.load_order.append("notify"),
+            "_schedule_frame_render_flow_restore":lambda:None,
             "_publish_console_event":lambda *args,**kwargs:(self.load_order.append("console"),self.console.append((args,kwargs))),
         })
         exec(compile(ast.Module(body=funcs,type_ignores=[]),str(BRIDGE),"exec"),self.ns)
@@ -257,6 +271,122 @@ class DirectProjectRestoreTests(unittest.TestCase):
         self.assertEqual(kwargs["context"]["captureSessionId"], self.session)
         self.assertFalse(json.loads(kwargs["context"]["diagnostics"])["completed"])
 
+    def test_real_mixed_restoration_finishes_normally_and_explains_unapplied_draft(self):
+        result = json.loads((Path(__file__).parent / "fixtures" / "restore_source_only_mixed.json").read_text(encoding="utf-8"))
+        def relocate(value):
+            if isinstance(value, dict):
+                return {key: relocate(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [relocate(item) for item in value]
+            return value.replace("@PROJECT@", os.path.abspath("project")).replace("@CAPTURE@", self.path) if isinstance(value, str) else value
+        result = relocate(result)
+        self.ns["_project_launcher_protocol"]._restore_status_text = self.real_restore_status_text
+        summary = self.finish_restore(result)
+        self.assertEqual(summary["phase"], "complete")
+        self.assertEqual(summary["diagnostic"], "")
+        self.assertEqual(summary["shaders"]["sourceOnlyDrafts"], 1)
+        self.assertEqual(summary["shaders"]["applied"], 3)
+        self.assertIn("3 Shaders applied; 1 saved source drafts remain unapplied", self.messages[-1][0])
+        self.assertEqual(self.console[-1][0][:2], ("project", "info"))
+        self.assertEqual(self.console[-1][1]["phase"], "complete")
+        for mutation in (
+                {"reason": "local-edit"}, {"knowledgeSourceSha256": ""},
+                {"workspaceSourceSha256": "1" * 64}, {"status": "failed"}):
+            invalid = copy.deepcopy(result)
+            invalid["shaders"]["items"][0].update(mutation)
+            observation, detail = self.ns["_project_auto_restore_diagnostic"](invalid, "", 1, self.session)
+            self.assertEqual(observation["phase"], "failed", mutation)
+        for section in ("shaders", "materials", "editing"):
+            invalid = copy.deepcopy(result)
+            invalid[section]["failed"] = 1
+            observation, detail = self.ns["_project_auto_restore_diagnostic"](invalid, "", 1, self.session)
+            self.assertEqual(observation["phase"], "failed", section)
+
+    def _fallback_restore_result(self, warm=False, shown=True):
+        applied = {
+            "status": "applied", "source": "verified-rdc-restore" if warm else "reuse-plan",
+            "workspacePath": os.path.abspath("project/replay-source"),
+            "workspaceId": "9" * 32, "resourceId": 7, "stage": "fragment",
+            "replacementId": "a" * 32, "knowledgeId": "b" * 32,
+            "sourceSha256": "1" * 64,
+            "pendingSource": {"knowledgeId": "d" * 32, "sourceSha256": "2" * 64,
+                              "reason": "source-only-project-draft", "shown": shown},
+        }
+        applied.update({"reusedValidation": True} if warm else {"idempotentlyAdopted": False})
+        if shown:
+            applied["pendingSource"]["workspacePath"] = os.path.abspath("project/latest-draft")
+        return {"completed": True, "restoreMode": "verified-rdc-restore" if warm else "project-target-inventory",
+                "shaders": {"attempted": 1, "applied": 1, "skipped": 0, "failed": 0, "items": [applied]}}
+
+    def test_validated_fallback_reports_latest_unapplied_draft_without_extra_restore_count(self):
+        self.ns["_project_launcher_protocol"]._restore_status_text = self.real_restore_status_text
+        result = self._fallback_restore_result()
+        summary = self.finish_restore(result)
+        self.assertEqual(summary["phase"], "complete")
+        self.assertEqual(summary["diagnostic"], "")
+        self.assertEqual(summary["shaders"], {"attempted": 1, "applied": 1, "skipped": 0,
+            "failed": 0, "sourceOnlyDrafts": 1, "replayFallbackDrafts": 1})
+        self.assertIn("1 Shaders applied; 1 saved source drafts remain unapplied", self.messages[-1][0])
+        self.assertEqual(self.console[-1][0][:2], ("project", "info"))
+        self.assertEqual(result["shaders"]["skipped"], 0)
+        for warm in (False, True):
+            for shown in (False, True):
+                with self.subTest(warm=warm, shown=shown):
+                    value = self._fallback_restore_result(warm, shown)
+                    observation, detail = self.ns["_project_auto_restore_diagnostic"](value, "", 1, self.session)
+                    self.assertEqual(observation["phase"], "complete")
+                    self.assertEqual(observation["shaders"]["sourceOnlyDrafts"], 1)
+                    # A second Shader may have no previous executable at all.
+                    value["shaders"]["items"].append({"status": "skipped", "source": "reuse-plan",
+                        "resourceId": 8, "stage": "fragment", "knowledgeId": "e" * 32,
+                        "knowledgeSourceSha256": "3" * 64, "reason": "source-only-project-draft"})
+                    value["shaders"]["skipped"] = 1
+                    observation, detail = self.ns["_project_auto_restore_diagnostic"](value, "", 1, self.session)
+                    self.assertEqual(observation["phase"], "complete")
+                    self.assertEqual(observation["shaders"]["sourceOnlyDrafts"], 2)
+                    self.assertEqual(observation["shaders"]["replayFallbackDrafts"], 1)
+                    self.assertEqual(observation["shaders"]["applied"], 1)
+                    self.assertEqual(observation["shaders"]["skipped"], 1)
+
+    def test_restored_saved_shader_reports_preserved_local_edits_as_complete(self):
+        self.ns["_project_launcher_protocol"]._restore_status_text = self.real_restore_status_text
+        result = self._fallback_restore_result()
+        item = result["shaders"]["items"][0]
+        del item["pendingSource"]
+        item["preservedLocalSource"] = {
+            "workspaceId": "d" * 32, "workspacePath": os.path.abspath("project/local-edit"),
+            "sourceSha256": "2" * 64, "shown": True, "reason": "local-edit"}
+        result["editing"] = {"attempted": 1, "enabled": 0, "deferred": 1, "failed": 0, "items": [{
+            "workspaceId": item["workspaceId"], "workspacePath": item["workspacePath"],
+            "status": "deferred", "reason": "local-edit-preserved", "editingMode": "source-only",
+            "readOnly": False, "backgroundAutoApplyAuthorized": False}]}
+        summary = self.finish_restore(result)
+        self.assertEqual(summary["phase"], "complete")
+        self.assertEqual(summary["diagnostic"], "")
+        self.assertEqual(summary["shaders"]["preservedLocalEdits"], 1)
+        self.assertEqual(summary["shaders"]["applied"], 1)
+        self.assertIn("1 local edits were preserved and remain unapplied", self.messages[-1][0])
+        self.assertEqual(self.console[-1][0][:2], ("project", "info"))
+        for mutation in ({"workspaceId": item["workspaceId"]}, {"sourceSha256": ""},
+                         {"workspacePath": "relative"}, {"shown": 1}):
+            bad = copy.deepcopy(result)
+            bad["shaders"]["items"][0]["preservedLocalSource"].update(mutation)
+            observation, detail = self.ns["_project_auto_restore_diagnostic"](bad, "", 1, self.session)
+            self.assertEqual(observation["phase"], "failed")
+            self.assertNotIn("preservedLocalEdits", observation["shaders"])
+
+    def test_invalid_nested_pending_evidence_cannot_report_success_or_draft_count(self):
+        for mutation in ({"reason": "local-edit"}, {"sourceSha256": ""},
+                         {"shown": 1}, {"knowledgeId": "b" * 32}, {"workspacePath": "relative"}):
+            with self.subTest(mutation=mutation):
+                value = self._fallback_restore_result()
+                value["shaders"]["items"][0]["pendingSource"].update(mutation)
+                observation, detail = self.ns["_project_auto_restore_diagnostic"](value, "", 1, self.session)
+                self.assertEqual(observation["phase"], "failed")
+                self.assertNotIn("sourceOnlyDrafts", observation["shaders"])
+                self.assertEqual(observation["shaders"]["applied"], 1)
+                self.assertEqual(observation["shaders"]["skipped"], 0)
+
     def test_partial_counts_or_editing_failure_do_not_report_complete(self):
         cases = [
             {"shaders":{"attempted":2,"applied":1,"failed":1}},
@@ -273,6 +403,87 @@ class DirectProjectRestoreTests(unittest.TestCase):
                 self.assertEqual(summary["phase"], "failed")
                 self.assertTrue(detail)
                 self.assertNotEqual(detail, "complete")
+
+    def test_legacy_local_edit_skip_reports_partial_restore_with_actionable_counts(self):
+        self.ns["_project_launcher_protocol"]._restore_status_text = self.real_restore_status_text
+        result = self._fallback_restore_result()
+        del result["shaders"]["items"][0]["pendingSource"]
+        result["shaders"]["items"].append({
+            "status": "skipped", "source": "reuse-plan", "resourceId": 8, "stage": "fragment",
+            "knowledgeId": "d" * 32, "rawSha256": "a" * 64, "reason": "local-edit",
+            "knowledgeSourceSha256": "b" * 64, "workspaceSourceSha256": "c" * 64,
+            "workspacePath": os.path.abspath("project/local-edit")})
+        result["shaders"]["skipped"] = 1
+        summary = self.finish_restore(result)
+        self.assertEqual(summary["phase"], "partial")
+        self.assertEqual(summary["diagnostic"], "local-edit")
+        self.assertEqual(summary["shaders"]["unappliedLocalEdits"], 1)
+        self.assertIn("1 Shaders applied; 1 local edits were preserved", self.messages[-1][0])
+        self.assertNotIn('"attempted"', self.messages[-1][0])
+        self.assertNotIn("restore failed", self.messages[-1][0])
+        self.assertEqual(self.console[-1][0][:2], ("project", "warning"))
+        self.assertEqual(self.console[-1][1]["phase"], "partial")
+        for mutation in ({"rawSha256": ""}, {"workspacePath": "relative"},
+                         {"knowledgeSourceSha256": "c" * 64}, {"reason": "unknown"}):
+            bad = copy.deepcopy(result)
+            bad["shaders"]["items"][1].update(mutation)
+            observation, detail = self.ns["_project_auto_restore_diagnostic"](bad, "", 1, self.session)
+            self.assertEqual(observation["phase"], "failed")
+        bad = copy.deepcopy(result)
+        bad["editing"] = {"attempted": 1, "enabled": 0, "failed": 1}
+        observation, detail = self.ns["_project_auto_restore_diagnostic"](bad, "", 1, self.session)
+        self.assertEqual(observation["phase"], "failed")
+
+    def test_deferred_organization_is_complete_in_actual_finished_callback(self):
+        # Editor startup after commit is independent of restore completion.
+        pending = {"status": "pending", "pending": 1, "attempted": 0, "enabled": 0,
+                   "deferred": 0, "failed": 0, "items": [{"status": "pending", "workspaceId": "b"*32,
+                   "captureBinding": {"instanceId": "offline", "captureSessionId": self.session,
+                                      "capturePath": self.path}}]}
+        observation, detail = self.ns["_project_auto_restore_diagnostic"](
+            {"completed": True, "shaders": {"attempted": 1, "applied": 1}, "editing": pending}, "", 1, self.session)
+        self.assertEqual(observation["phase"], "complete", detail)
+        deferred = {"status": "deferred", "workspaceId": "b" * 32,
+                    "reason": "organization-draft-open", "organizationId": "e" * 32,
+                    "editingMode": "source-only", "readOnly": True,
+                    "backgroundAutoApplyAuthorized": False,
+                    "captureBinding": {"instanceId": "offline", "captureSessionId": self.session,
+                                       "capturePath": self.path}}
+        result = self.finish_restore({"completed": True, "restoreMode": "verified-rdc-restore",
+            "shaders": {"attempted": 3, "applied": 3, "skipped": 0, "failed": 0},
+            "materials": {"attempted": 0, "restored": 0, "skipped": 0, "failed": 0},
+            "editing": {"attempted": 3, "enabled": 2, "deferred": 1, "failed": 0,
+                        "items": [{"status": "enabled"}, deferred, {"status": "enabled"}]}})
+        self.assertEqual(result["phase"], "complete")
+        self.assertEqual(result["diagnostic"], "")
+        self.assertEqual(result["editing"]["deferred"], 1)
+        self.assertEqual(result["editingItems"][0]["reason"], "organization-draft-open")
+        self.assertEqual(self.messages[-1], ("complete", 5000))
+        args, kwargs = self.console[-1]
+        self.assertEqual(args[:2], ("project", "info"))
+        self.assertEqual(kwargs["phase"], "complete")
+        self.assertEqual(kwargs["code"], "projectAutoRestoreFinished")
+        self.assertEqual(json.loads(kwargs["context"]["diagnostics"])["editing"]["deferred"], 1)
+        self.assertEqual(self.refreshes, [{"force": True}])
+
+    def test_deferred_reason_does_not_hide_real_failure_or_incomplete_restore(self):
+        deferred = {"status": "deferred", "reason": "organization-draft-open",
+                    "readOnly": True, "backgroundAutoApplyAuthorized": False}
+        cases = [
+            ({"attempted": 2, "enabled": 0, "deferred": 1, "failed": 1,
+              "items": [deferred, {"status": "failed", "error": "capture changed"}]}, "capture changed"),
+            ({"attempted": 2, "enabled": 0, "deferred": 1, "failed": 0,
+              "items": [deferred]}, "restore-incomplete"),
+            ({"attempted": 1, "enabled": 0, "deferred": 1, "failed": 0,
+              "items": [dict(deferred, readOnly=False)]}, "restore-incomplete"),
+        ]
+        for editing, expected in cases:
+            with self.subTest(expected=expected, editing=editing):
+                summary, detail = self.ns["_project_auto_restore_diagnostic"](
+                    {"completed": True, "editing": editing}, "", 1, self.session)
+                self.assertEqual(summary["phase"], "failed")
+                self.assertEqual(summary["diagnostic"], expected)
+                self.assertTrue(detail.startswith(expected))
 
     def test_success_retains_bounded_readable_observation_without_authority(self):
         result = self.finish_restore({"completed":True,"operationId":"c"*32,
@@ -363,11 +574,11 @@ class DirectProjectRestoreTests(unittest.TestCase):
         self.assertEqual(formatted, [{"phase":"shader-apply", "current":3, "total":3,
                                      "item":"MainPS", "message":""}])
         message = self.messages[-1][0]
-        self.assertIn("Validating ABI and applying Shaders", message)
+        self.assertIn("Applying project Shaders", message)
         self.assertIn("3 / 3", message)
         self.assertIn("MainPS", message)
         self.assertNotIn("RAW HOST", message)
-        self.assertIn(("ReplayLabProjects", "Validating ABI and applying Shaders"), translated)
+        self.assertIn(("ReplayLabProjects", "Applying project Shaders"), translated)
         self.executor._result_timer.timeout.emit()
         self.assertEqual(len(self.messages), len(before) + 1)
         self.assertEqual(Timer.created, timers)
@@ -468,3 +679,6 @@ class DirectProjectRestoreTests(unittest.TestCase):
         before = list(self.messages)
         self.executor._result_timer.timeout.emit()
         self.assertEqual(self.messages, before + [("shader-compile",)])
+        # The counts from the last valid progress reach the status bar, so the
+        # user sees how far along the background match is, not only its phase.
+        self.assertEqual(self.status_progress[-1], {"current": 1, "total": 2})

@@ -279,4 +279,5 @@ private:
   void RefreshShaderMessages();
   Ui::EventBrowser *ui;
   ICaptureContext &m_Ctx;
+  uint64_t m_ShaderNavigationGeneration = 0;
 };

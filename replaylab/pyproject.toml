@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "replaylab-agenthost"
-version = "1.13.0"
+version = "1.13.121"
 description = "Out-of-process AI provider and agent host for RenderDocUltra's built-in ReplayLab integration"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -17,10 +17,10 @@ dependencies = [
   "PyYAML>=6.0,<7",
   "agent-client-protocol>=0.12,<1",
   "mcp>=1.29,<2",
-  "deepagents==0.3.3",
+  "deepagents==0.7.22",
   "langchain-openai>=1.6,<2",
   "langchain-anthropic>=1.7,<2",
-  "langchain-google-genai>=3.2,<4",
+  "langchain-google-genai>=4.4,<5",
   "langchain-google-vertexai>=3.2,<4",
 ]
 
@@ -30,7 +30,10 @@ acp = []
 # Compatibility extras retained for existing install commands. The product
 # runtime now always includes deepagents, LangChain providers, ACP and MCP.
 deep = []
-all = []
+# The embedded Unity reader (``replaylab-ai unpacker unitypy``); pure Python
+# with wheels for every platform the runtime ships on.
+unity = ["UnityPy>=1.20,<2"]
+all = ["UnityPy>=1.20,<2"]
 test = [
   "pytest>=8.3,<10",
   "pytest-asyncio>=0.25,<2",
@@ -47,5 +50,5 @@ packages = ["src/replaylab_agent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -p no:cacheprovider"
 asyncio_mode = "auto"

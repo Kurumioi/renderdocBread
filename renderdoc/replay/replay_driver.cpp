@@ -29,6 +29,7 @@
 #include "maths/formatpacking.h"
 #include "maths/half_convert.h"
 #include "replay_timing.h"
+#include "resource_usage.h"
 #include "serialise/serialiser.h"
 #include "strings/string_utils.h"
 #include "common/threading.h"
@@ -660,18 +661,24 @@ rdcstr ReplayBufferPatchSet::Set(ResourceId buffer, uint64_t byteOffset, const b
 
   uint64_t bytes = data.size();
   size_t count = 1;
-  for(const ReplayBufferPatch &layer : m_Layers)
+  for(const Layer &layer : m_Layers)
   {
-    if(layer.buffer == buffer && layer.byteOffset == byteOffset && layer.data.size() == data.size())
+    if(layer.buffer == buffer && layer.byteOffset == byteOffset && layer.byteLength == data.size())
       continue;
-    bytes += layer.data.size();
+    for(const ReplayBufferPatch &range : layer.ranges)
+      bytes += range.data.size();
     count++;
   }
   if(count > 256 || bytes > 32ULL * 1024 * 1024)
     return "Persistent buffer edits exceed the edit-count or payload budget";
 
   Remove(buffer, byteOffset, data.size());
-  m_Layers.push_back(patch);
+  Layer layer;
+  layer.buffer = buffer;
+  layer.byteOffset = byteOffset;
+  layer.byteLength = data.size();
+  layer.ranges.push_back(patch);
+  m_Layers.push_back(layer);
   return {};
 }
 
@@ -679,8 +686,8 @@ bool ReplayBufferPatchSet::Remove(ResourceId buffer, uint64_t byteOffset, uint64
 {
   for(size_t i = 0; i < m_Layers.size(); i++)
   {
-    const ReplayBufferPatch &layer = m_Layers[i];
-    if(layer.buffer == buffer && layer.byteOffset == byteOffset && layer.data.size() == byteLength)
+    const Layer &layer = m_Layers[i];
+    if(layer.buffer == buffer && layer.byteOffset == byteOffset && layer.byteLength == byteLength)
     {
       m_Layers.erase(i);
       return true;
@@ -689,42 +696,94 @@ bool ReplayBufferPatchSet::Remove(ResourceId buffer, uint64_t byteOffset, uint64
   return false;
 }
 
+bool ReplayBufferPatchSet::ResetRange(ResourceId buffer, uint64_t byteOffset, uint64_t byteLength)
+{
+  if(buffer == ResourceId() || byteLength == 0 || byteOffset > UINT64_MAX - byteLength)
+    return false;
+
+  const uint64_t resetEnd = byteOffset + byteLength;
+  bool changed = false;
+  for(size_t i = 0; i < m_Layers.size();)
+  {
+    Layer &layer = m_Layers[i];
+    if(layer.buffer == buffer)
+    {
+      rdcarray<ReplayBufferPatch> kept;
+      for(const ReplayBufferPatch &range : layer.ranges)
+      {
+        const uint64_t rangeEnd = range.byteOffset + range.data.size();
+        if(rangeEnd <= byteOffset || range.byteOffset >= resetEnd)
+        {
+          kept.push_back(range);
+          continue;
+        }
+        changed = true;
+        if(range.byteOffset < byteOffset)
+        {
+          ReplayBufferPatch prefix = range;
+          prefix.data.resize(size_t(byteOffset - range.byteOffset));
+          kept.push_back(prefix);
+        }
+        if(rangeEnd > resetEnd)
+        {
+          ReplayBufferPatch suffix;
+          suffix.buffer = buffer;
+          suffix.byteOffset = resetEnd;
+          suffix.data.resize(size_t(rangeEnd - resetEnd));
+          memcpy(suffix.data.data(), range.data.data() + size_t(resetEnd - range.byteOffset),
+                 suffix.data.size());
+          kept.push_back(suffix);
+        }
+      }
+      layer.ranges.swap(kept);
+    }
+    if(layer.ranges.empty())
+      m_Layers.erase(i);
+    else
+      i++;
+  }
+  return changed;
+}
+
 rdcarray<ReplayBufferPatch> ReplayBufferPatchSet::Flatten() const
 {
   rdcarray<ReplayBufferPatch> result;
-  for(const ReplayBufferPatch &layer : m_Layers)
+  for(const Layer &edit : m_Layers)
   {
-    rdcarray<ReplayBufferPatch> next;
-    const uint64_t layerEnd = layer.byteOffset + layer.data.size();
-    for(const ReplayBufferPatch &old : result)
+    for(const ReplayBufferPatch &layer : edit.ranges)
     {
-      const uint64_t oldEnd = old.byteOffset + old.data.size();
-      if(old.buffer != layer.buffer || oldEnd <= layer.byteOffset || old.byteOffset >= layerEnd)
+      rdcarray<ReplayBufferPatch> next;
+      const uint64_t layerEnd = layer.byteOffset + layer.data.size();
+      for(const ReplayBufferPatch &old : result)
       {
-        next.push_back(old);
-        continue;
+        const uint64_t oldEnd = old.byteOffset + old.data.size();
+        if(old.buffer != layer.buffer || oldEnd <= layer.byteOffset || old.byteOffset >= layerEnd)
+        {
+          next.push_back(old);
+          continue;
+        }
+        if(old.byteOffset < layer.byteOffset)
+        {
+          ReplayBufferPatch prefix = old;
+          prefix.data.resize(size_t(layer.byteOffset - old.byteOffset));
+          next.push_back(prefix);
+        }
+        if(oldEnd > layerEnd)
+        {
+          ReplayBufferPatch suffix;
+          suffix.buffer = old.buffer;
+          suffix.byteOffset = layerEnd;
+          suffix.data.resize(size_t(oldEnd - layerEnd));
+          memcpy(suffix.data.data(), old.data.data() + size_t(layerEnd - old.byteOffset), suffix.data.size());
+          next.push_back(suffix);
+        }
       }
-      if(old.byteOffset < layer.byteOffset)
-      {
-        ReplayBufferPatch prefix = old;
-        prefix.data.resize(size_t(layer.byteOffset - old.byteOffset));
-        next.push_back(prefix);
-      }
-      if(oldEnd > layerEnd)
-      {
-        ReplayBufferPatch suffix;
-        suffix.buffer = old.buffer;
-        suffix.byteOffset = layerEnd;
-        suffix.data.resize(size_t(oldEnd - layerEnd));
-        memcpy(suffix.data.data(), old.data.data() + size_t(layerEnd - old.byteOffset), suffix.data.size());
-        next.push_back(suffix);
-      }
+      next.push_back(layer);
+      std::sort(next.begin(), next.end(), [](const ReplayBufferPatch &a, const ReplayBufferPatch &b) {
+        return a.buffer < b.buffer || (a.buffer == b.buffer && a.byteOffset < b.byteOffset);
+      });
+      result.swap(next);
     }
-    next.push_back(layer);
-    std::sort(next.begin(), next.end(), [](const ReplayBufferPatch &a, const ReplayBufferPatch &b) {
-      return a.buffer < b.buffer || (a.buffer == b.buffer && a.byteOffset < b.byteOffset);
-    });
-    result.swap(next);
   }
   return result;
 }
@@ -2538,6 +2597,54 @@ void DeriveNearFar(Vec4f pos, Vec4f pos0, float &nearp, float &farp, bool &found
 #include "api/replay/pipestate.h"
 #include "catch/catch.hpp"
 
+TEST_CASE("Shader usage retains every action and repeated submission without replay",
+          "[replay][shader-usage]")
+{
+  rdcarray<EventUsage> uses;
+  CHECK_FALSE(AppendFrameResourceUsage(uses, EventUsage(0, ResourceUsage::Shader)));
+  REQUIRE(uses.empty());
+
+  // The same physical shader is used by several actions in a command list, which is then
+  // submitted twice. Merge callers supply the submission-rebased EIDs, not command-local EIDs.
+  for(uint32_t base : {100U, 200U})
+  {
+    for(uint32_t local : {3U, 8U, 15U})
+    {
+      EventUsage usage(base + local, ResourceUsage::Shader);
+      CHECK(AppendFrameResourceUsage(uses, usage));
+      CHECK_FALSE(AppendFrameResourceUsage(uses, usage));
+    }
+  }
+  REQUIRE(uses.size() == 6);
+  const uint32_t expected[] = {103, 108, 115, 203, 208, 215};
+  for(size_t i = 0; i < uses.size(); i++)
+  {
+    CHECK(uses[i].eventId == expected[i]);
+    CHECK(uses[i].usage == ResourceUsage::Shader);
+  }
+  // Remaining command-buffer uses can be merged out of order. Never hide a later-discovered EID.
+  CHECK(AppendFrameResourceUsage(uses, EventUsage(109, ResourceUsage::Shader)));
+  CHECK(uses.back().eventId == 109);
+}
+
+TEST_CASE("Shader usage indexing leaves ordinary resource usage unchanged",
+          "[replay][shader-usage]")
+{
+  rdcarray<EventUsage> uses;
+  for(ResourceUsage kind : {ResourceUsage::Unused, ResourceUsage::CopySrc,
+                            ResourceUsage::PS_Resource, ResourceUsage::ColorTarget})
+  {
+    CHECK(AppendFrameResourceUsage(uses, EventUsage(0, kind)));
+    CHECK(AppendFrameResourceUsage(uses, EventUsage(42, kind)));
+    CHECK(AppendFrameResourceUsage(uses, EventUsage(42, kind)));
+  }
+  REQUIRE(uses.size() == 12);
+  // A resource already having another usage at this EID cannot suppress the shader usage.
+  CHECK(AppendFrameResourceUsage(uses, EventUsage(42, ResourceUsage::Shader)));
+  CHECK_FALSE(AppendFrameResourceUsage(uses, EventUsage(42, ResourceUsage::Shader)));
+  CHECK(uses.size() == 13);
+}
+
 TEST_CASE("Checkpoint policy changes preserve versions only inside compatible storage limits",
           "[replay][checkpoint]")
 {
@@ -2604,6 +2711,90 @@ TEST_CASE("Shared buffer edits reject invalid transactions without losing old va
   CHECK_FALSE(ValidateReplayBufferPatches(ranges).empty());
   ranges[1].byteOffset = 0;
   CHECK_FALSE(ValidateReplayBufferPatches(ranges).empty());
+}
+
+TEST_CASE("Captured buffer reset removes every overlapping edit and preserves exact undo",
+          "[replay][bufferpatch][bufferpatch-reset]")
+{
+  const ResourceId a = ResourceIDGen::GetNewUniqueID();
+  const ResourceId b = ResourceIDGen::GetNewUniqueID();
+  ReplayBufferPatchSet edits;
+  REQUIRE(edits.Set(a, 4, {1, 2, 3, 4, 5, 6, 7, 8}).empty());
+  REQUIRE(edits.Set(a, 6, {40, 41, 42, 43}).empty());
+  REQUIRE(edits.Set(a, 3, {20, 21}).empty());
+  REQUIRE(edits.Set(b, 4, {99, 98}).empty());
+  const auto values = [&](ResourceId buffer) {
+    bytebuf bytes = {90, 90, 90, 90, 90, 90, 90, 90, 90, 90};
+    const auto ranges = edits.Flatten();
+    REQUIRE(ValidateReplayBufferPatches(ranges).empty());
+    ApplyReplayBufferPatches(ranges, buffer, 3, bytes.data(), bytes.size());
+    return bytes;
+  };
+  REQUIRE(edits.ResetRange(a, 5, 4));
+  CHECK(values(a) == bytebuf({20, 21, 90, 90, 90, 90, 43, 7, 8, 90}));
+  CHECK(values(b) == bytebuf({90, 99, 98, 90, 90, 90, 90, 90, 90, 90}));
+  CHECK_FALSE(edits.ResetRange(a, 5, 4));
+
+  // Original identities still remove the surviving parts of a partially reset edit.
+  REQUIRE(edits.Remove(a, 6, 4));
+  CHECK(values(a) == bytebuf({20, 21, 90, 90, 90, 90, 6, 7, 8, 90}));
+  REQUIRE(edits.Remove(a, 4, 8));
+  CHECK(values(a) == bytebuf({20, 21, 90, 90, 90, 90, 90, 90, 90, 90}));
+  REQUIRE(edits.Remove(a, 3, 2));
+  CHECK(values(a) == bytebuf({90, 90, 90, 90, 90, 90, 90, 90, 90, 90}));
+}
+
+TEST_CASE("Captured buffer reset handles regrouped channels without changing adjacent lanes",
+          "[replay][bufferpatch][bufferpatch-reset]")
+{
+  const ResourceId buffer = ResourceIDGen::GetNewUniqueID();
+  ReplayBufferPatchSet edits;
+  const bytebuf rgba = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+  REQUIRE(edits.Set(buffer, 80, rgba).empty());
+  const auto values = [&]() {
+    bytebuf bytes;
+    bytes.resize(16);
+    memset(bytes.data(), 90, bytes.size());
+    ApplyReplayBufferPatches(edits.Flatten(), buffer, 80, bytes.data(), bytes.size());
+    return bytes;
+  };
+  SECTION("Reset RGB after an RGBA edit preserves alpha and later exact undo")
+  {
+    REQUIRE(edits.ResetRange(buffer, 80, 12));
+    CHECK(values() == bytebuf({90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 13, 14, 15, 16}));
+    REQUIRE(edits.Set(buffer, 80, {31, 32, 33, 34}).empty());
+    CHECK(values() == bytebuf({31, 32, 33, 34, 90, 90, 90, 90, 90, 90, 90, 90, 13, 14, 15, 16}));
+    REQUIRE(edits.Remove(buffer, 80, 4));
+    REQUIRE(edits.Remove(buffer, 80, 16));
+    CHECK(edits.Empty());
+  }
+  SECTION("Scattered semantic channels preserve the channels between them")
+  {
+    REQUIRE(edits.ResetRange(buffer, 80, 4));
+    REQUIRE(edits.ResetRange(buffer, 88, 4));
+    CHECK(values() == bytebuf({90, 90, 90, 90, 5, 6, 7, 8, 90, 90, 90, 90, 13, 14, 15, 16}));
+    REQUIRE(edits.Remove(buffer, 80, 16));
+    CHECK(edits.Empty());
+  }
+  SECTION("Replacing the original exact edit reactivates the whole range")
+  {
+    REQUIRE(edits.ResetRange(buffer, 84, 4));
+    REQUIRE(edits.Set(buffer, 80, rgba).empty());
+    CHECK(values() == rgba);
+    REQUIRE(edits.Remove(buffer, 80, 16));
+    CHECK(edits.Empty());
+  }
+  SECTION("Invalid and disjoint ranges are no-ops")
+  {
+    CHECK_FALSE(edits.ResetRange(ResourceId(), 80, 4));
+    CHECK_FALSE(edits.ResetRange(buffer, 80, 0));
+    CHECK_FALSE(edits.ResetRange(buffer, UINT64_MAX - 1, 4));
+    CHECK_FALSE(edits.ResetRange(buffer, 64, 16));
+    CHECK_FALSE(edits.ResetRange(buffer, 96, 16));
+    CHECK(values() == rgba);
+    REQUIRE(edits.ResetRange(buffer, 64, 64));
+    CHECK(edits.Empty());
+  }
 }
 
 TEST_CASE("Shared buffer patch deltas isolate the changed storage and bytes",

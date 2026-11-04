@@ -1,241 +1,187 @@
+"""Task telemetry is factual and never authorizes or blocks Host operations."""
+
 from __future__ import annotations
 
 import asyncio
-import subprocess
-import sys
-from pathlib import Path
+import json
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from src import task_report
 from src.task_report import (
-    REPORT_SCHEMA,
-    REPORT_STATE_SCHEMA,
-    TaskReportStore,
-    ReportGate,
-    clear_task_report_sidecars,
-    instrument_task_tool,
-    read_task_report_sidecars,
-    task_report_path,
-    task_report_state_path,
+    TASK_EVENT_ROOT_ENV, TASK_ID_ENV, TaskReportStore,
+    clear_task_report_sidecars, instrument_task_tool, non_reporting_task_tool,
+    read_task_report_sidecars, task_report_path, task_report_state_path,
 )
 
 
-def _report(**overrides):
-    value = {
-        "summary": "EID 42 uses the expected pipeline.",
-        "status": "completed",
-        "findings": [
-            {
-                "claim": "The draw is indexed.",
-                "kind": "observed",
-                "evidence": [{"tool": "inspect_event", "values": "eventId=42"}],
-            }
-        ],
-        "artifacts": [],
-        "unknowns": [],
-        "next_steps": [],
-    }
-    value.update(overrides)
-    return value
-
-
-def test_store_records_tools_and_writes_only_an_accepted_report(tmp_path) -> None:
-    store = TaskReportStore("task-1", tmp_path)
-    store.record_tool("inspect_event")
-
+def test_telemetry_persists_facts_without_a_report_or_gate(tmp_path) -> None:
+    store = TaskReportStore("task-1", tmp_path, conversation_id="conversation-1")
+    store.record_result("inspect_event", {"eventId": 11384, "path": str(tmp_path / "capture.rdc")})
+    restarted = TaskReportStore("task-1", tmp_path)
     report, state = read_task_report_sidecars(tmp_path, "task-1")
     assert report is None
-    assert state is not None
-    assert state["schema"] == REPORT_STATE_SCHEMA
+    assert not task_report_path(tmp_path, "task-1").exists()
+    assert restarted.tools_used() == ("inspect_event",)
     assert state["toolsUsed"] == ["inspect_event"]
-
-    result = store.submit(_report())
-    assert result["accepted"] is True
-    report, state = read_task_report_sidecars(tmp_path, "task-1")
-    assert report is not None and report["schema"] == REPORT_SCHEMA
-    assert report["taskId"] == "task-1"
-    assert report["findings"][0]["evidence"][0]["tool"] == "inspect_event"
-    assert state is not None and state["accepted"] is True
+    assert state["toolFacts"][0]["tool"] == "inspect_event"
+    assert state["artifactPaths"] == [str(tmp_path / "capture.rdc")]
+    assert isinstance(state["updatedUnixNs"], int)
+    assert "completionContract" not in state
+    assert "maxRounds" not in state
+    assert "report" not in state
 
 
-def test_rejected_report_records_reasons_without_report_sidecar(tmp_path) -> None:
+def test_corrupt_legacy_sidecar_does_not_block_new_work(tmp_path) -> None:
+    task_report_state_path(tmp_path, "task-2").write_text("corrupt old review state", encoding="utf-8")
     store = TaskReportStore("task-2", tmp_path)
-    result = store.submit(_report())
-    assert result["accepted"] is False
-    assert result["reasons"][0]["code"] == "evidence-tool-not-called"
-    assert not task_report_path(tmp_path, "task-2").exists()
+    store.record_result("get_current_renderdoc_context", {"captureLoaded": True})
     state = read_task_report_sidecars(tmp_path, "task-2")[1]
-    assert state is not None
-    assert state["rejections"] == 1
-    assert state["lastReasons"][0]["location"].endswith(".tool")
+    assert state["toolsUsed"] == ["get_current_renderdoc_context"]
+    assert "reviewBudget" not in state
+    state["toolStats"] = {"old-tool": {"calls": "broken", "totalMs": "NaN"}}
+    task_report_state_path(tmp_path, "task-2").write_text(json.dumps(state), encoding="utf-8")
+    TaskReportStore("task-2", tmp_path).record_result("inspect_event", {"eventId": 2})
+    assert read_task_report_sidecars(tmp_path, "task-2")[1]["toolStats"]["old-tool"]["calls"] == 0
 
 
-def test_third_factual_rejection_is_exhausted_without_false_publication(tmp_path) -> None:
-    store = TaskReportStore("task-3", tmp_path, environ={})
-    for _ in range(2):
-        assert store.submit(_report())["accepted"] is False
-    result = store.submit(_report())
-    assert result["accepted"] is False
-    assert result["softAccepted"] is False
-    assert result["budgetExhausted"] is True
-    report = read_task_report_sidecars(tmp_path, "task-3")[0]
-    assert report is None
-    assert store.submit(_report())["round"] == 3
+def test_projection_redacts_secrets_and_bounds_shader_text(tmp_path) -> None:
+    store = TaskReportStore("task-3", tmp_path)
+    store.record_result("inspect_shader", {
+        "apiToken": "NEVER-EXPOSE-ME", "sourceText": "shader" * 10000,
+        "error": "Bearer abcdef1234567890", "workspacePath": str(tmp_path / "shader"),
+    })
+    raw = task_report_state_path(tmp_path, "task-3").read_text(encoding="utf-8")
+    assert "NEVER-EXPOSE-ME" not in raw
+    assert "abcdef1234567890" not in raw
+    assert "shader" * 100 not in raw
+    assert read_task_report_sidecars(tmp_path, "task-3")[1]["toolFacts"][0]["outcome"] == "error"
 
 
-def test_instrumentation_preserves_sync_and_async_calls(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("REPLAYLAB_TASK_ID", "task-4")
-    monkeypatch.setenv("REPLAYLAB_TASK_EVENT_ROOT", str(tmp_path))
+def test_instrumentation_preserves_sync_async_and_failed_results(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv(TASK_ID_ENV, "task-4")
+    monkeypatch.setenv(TASK_EVENT_ROOT_ENV, str(tmp_path))
 
-    def inspect_event() -> str:
-        return "sync"
+    @instrument_task_tool
+    def inspect_event(event_id: int) -> dict:
+        return {"eventId": event_id}
 
-    async def get_pipeline_state() -> str:
-        return "async"
+    @instrument_task_tool
+    async def inspect_shader(event_id: int) -> dict:
+        return {"eventId": event_id}
 
-    assert instrument_task_tool(inspect_event)() == "sync"
-    assert asyncio.run(instrument_task_tool(get_pipeline_state)()) == "async"
+    @instrument_task_tool
+    def failed_tool() -> None:
+        raise RuntimeError("capture temporarily unavailable")
+
+    assert inspect_event(12) == {"eventId": 12}
+    assert asyncio.run(inspect_shader(12)) == {"eventId": 12}
+    with pytest.raises(RuntimeError, match="capture temporarily unavailable"):
+        failed_tool()
     state = read_task_report_sidecars(tmp_path, "task-4")[1]
-    assert state is not None
-    assert state["toolsUsed"] == ["get_pipeline_state", "inspect_event"]
+    assert state["toolsUsed"] == ["failed_tool", "inspect_event", "inspect_shader"]
+    assert [item["outcome"] for item in state["toolFacts"]] == ["returned", "returned", "error"]
+    assert all(item["elapsedMs"] >= 0 for item in state["toolFacts"])
+    assert state["toolStats"]["inspect_event"]["calls"] == 1
+    assert state["toolStats"]["failed_tool"]["errors"] == 1
+    assert state["toolStats"]["inspect_shader"]["totalMs"] >= 0
 
 
-def test_sidecar_paths_are_exact_and_clear_is_task_scoped(tmp_path) -> None:
-    store = TaskReportStore("task-5", tmp_path)
-    store.record_tool("inspect_event")
-    store.submit(_report())
-    unrelated = tmp_path / "keep.txt"
-    unrelated.write_text("keep", encoding="utf-8")
+def test_telemetry_failure_cannot_cancel_a_physical_tool(monkeypatch) -> None:
+    class UnavailableStore:
+        def record_result(self, *args, **kwargs):
+            raise OSError("telemetry volume is unavailable")
 
-    assert task_report_path(tmp_path, "task-5").name == "task-5.report.json"
-    assert task_report_state_path(tmp_path, "task-5").name == "task-5.report-state.json"
-    clear_task_report_sidecars(tmp_path, "task-5")
-    assert unrelated.read_text(encoding="utf-8") == "keep"
-    assert not task_report_path(tmp_path, "task-5").exists()
-    assert not task_report_state_path(tmp_path, "task-5").exists()
-    with pytest.raises(ValueError):
+    monkeypatch.setattr(task_report, "current_task_report_store", lambda: UnavailableStore())
+
+    @instrument_task_tool
+    def apply_shader_workspace_shared_resource() -> str:
+        return "applied"
+
+    assert apply_shader_workspace_shared_resource() == "applied"
+
+
+def test_failed_finish_receipt_is_observed_without_changing_result_or_stopping_work(tmp_path, monkeypatch):
+    monkeypatch.setenv(TASK_ID_ENV, "task-finish-outcomes")
+    monkeypatch.setenv(TASK_EVENT_ROOT_ENV, str(tmp_path))
+    receipt = {"schema": "replaylab-shader-organization-finish/v1", "ok": False,
+               "reason": "undeclared identifier '_9530'", "draftPreserved": True,
+               "previousSourceRestored": True, "state": "finish-failed-draft-preserved"}
+    calls = []
+
+    @instrument_task_tool
+    def finish_shader_workspace_organization():
+        calls.append(1)
+        return json.dumps(receipt)
+
+    assert json.loads(finish_shader_workspace_organization()) == receipt
+    receipt = {"ok": True, "history": [receipt]}
+    assert json.loads(finish_shader_workspace_organization()) == receipt
+    assert calls == [1, 1]
+    state = read_task_report_sidecars(tmp_path, "task-finish-outcomes")[1]
+    assert state["toolStats"]["finish_shader_workspace_organization"]["errors"] == 1
+    assert [fact["outcome"] for fact in state["toolFacts"]] == ["error", "returned"]
+    assert json.loads(state["toolFacts"][0]["summary"])["draftPreserved"] is True
+
+
+def test_housekeeping_is_not_an_agent_observation(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv(TASK_ID_ENV, "task-5")
+    monkeypatch.setenv(TASK_EVENT_ROOT_ENV, str(tmp_path))
+
+    @instrument_task_tool
+    @non_reporting_task_tool
+    def release_task_shader_occupancy() -> str:
+        return "released"
+
+    assert release_task_shader_occupancy() == "released"
+    assert read_task_report_sidecars(tmp_path, "task-5") == (None, None)
+
+
+def test_physical_shader_receipts_support_cleanup_without_quality_state(tmp_path) -> None:
+    store = TaskReportStore("task-6", tmp_path)
+    workspace = str(tmp_path / "workspace")
+    store.record_result("apply_shader_workspace_shared_resource", {
+        "applied": True, "replacement": {"replacementId": "a" * 32},
+    }, arguments={"workspace_path": workspace})
+    store.record_result("start_shader_workspace_live_edit", {
+        "result": {"workspacePath": workspace, "liveEditId": "b" * 32},
+    }, arguments={"workspace_path": workspace})
+    state = read_task_report_sidecars(tmp_path, "task-6")[1]
+    assert state["pendingShaderWork"][workspace]["delivery"] == {
+        "replayApplied": True, "replacementId": "a" * 32,
+        "liveEditStarted": True, "liveEditId": "b" * 32,
+    }
+    store.record_result("stop_shader_workspace_live_edit", {"result": {"state": "stopped"}},
+                        arguments={"live_edit_id": "b" * 32})
+    store.record_result("rollback_shader_workspace_shared_resource", {
+        "applied": False, "replacement": {"cleared": True},
+    },
+                        arguments={"workspace_path": workspace, "replacement_id": "a" * 32})
+    assert read_task_report_sidecars(tmp_path, "task-6")[1]["pendingShaderWork"] == {}
+
+
+def test_two_store_instances_merge_facts_under_task_lock(tmp_path) -> None:
+    def record(index: int) -> None:
+        TaskReportStore("task-7", tmp_path).record_result("tool-%d" % index, {"index": index})
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(record, range(8)))
+    state = read_task_report_sidecars(tmp_path, "task-7")[1]
+    assert set(state["toolsUsed"]) == {"tool-%d" % index for index in range(8)}
+    assert len(state["toolFacts"]) == 8
+
+
+def test_terminal_event_and_sidecar_cleanup_are_bounded(tmp_path) -> None:
+    events = tmp_path / "task-8.jsonl"
+    events.write_text(
+        json.dumps({"taskId": "task-8", "kind": "started"}) + "\n"
+        + json.dumps({"taskId": "task-8", "kind": "completed"}) + "\n",
+        encoding="utf-8",
+    )
+    assert task_report._task_event_is_terminal(tmp_path, "task-8")
+    TaskReportStore("task-8", tmp_path).record_tool("inspect_event")
+    clear_task_report_sidecars(tmp_path, "task-8")
+    assert read_task_report_sidecars(tmp_path, "task-8") == (None, None)
+    with pytest.raises(ValueError, match="unsafe path"):
         task_report_path(tmp_path, "../escape")
-
-
-def test_schema_attempts_survive_store_restart_and_exhaust_without_acceptance(tmp_path):
-    first = TaskReportStore("restart", tmp_path, environ={"REPLAYLAB_REVIEW_MAX_ROUNDS": "2"})
-    first.record_result("inspect_event", {"eventId": 42})
-    verdict = first.submit({"summary": "", "status": "not-a-status"})
-    assert verdict["round"] == 1 and verdict["reasons"][0]["severity"] == "blocker"
-    restarted = TaskReportStore("restart", tmp_path, environ={"REPLAYLAB_REVIEW_MAX_ROUNDS": "9"})
-    assert restarted.gate.limit == 2 and restarted.tools_used() == ("inspect_event",)
-    assert restarted.submit({"summary": ""})["budgetExhausted"] is True
-    again = TaskReportStore("restart", tmp_path)
-    assert again.submit(_report())["accepted"] is False
-    assert again.gate.attempts == 2
-    assert read_task_report_sidecars(tmp_path, "restart")[0] is None
-
-
-def test_warning_is_conservatively_repaired_and_accepted_without_retry(tmp_path):
-    store = TaskReportStore("warning", tmp_path)
-    verdict = store.submit(_report(findings=[{"claim": "Possibly a lighting pass.", "kind": "inferred"}]))
-    assert verdict["accepted"] is True and verdict["softAccepted"] is False
-    assert verdict["round"] == 1 and verdict["schema"] == "replaylab-review-verdict/v1"
-    assert verdict["reasons"][0]["severity"] == "warning"
-    assert all(verdict["reasons"][0][key] for key in ("direction", "target", "example"))
-    report, state = read_task_report_sidecars(tmp_path, "warning")
-    assert report["findings"][0]["confidence"] == "low"
-    assert state["rejections"] == 0
-    assert store.gate.terminal_status("completed", worked=True) == "completed"
-
-
-@pytest.mark.parametrize("failure", ["tool", "path", "status", "schema"])
-def test_blockers_never_become_accepted_at_zero_rounds_left(tmp_path, failure):
-    artifact = tmp_path / "existing.txt"
-    artifact.write_text("actual artifact", encoding="utf-8")
-    report = _report()
-    if failure == "path":
-        report["artifacts"] = [{"path": str(tmp_path / "invented"), "status": "accepted"}]
-    elif failure == "status":
-        report["artifacts"] = [{"path": str(artifact), "status": "pending"}]
-    elif failure == "schema":
-        report["summary"] = ""
-    gate = ReportGate(tools_used=lambda: () if failure == "tool" else ("inspect_event",), limit=1)
-    verdict = gate.submit(report)
-    assert verdict["accepted"] is False and verdict["softAccepted"] is False
-    assert verdict["budgetExhausted"] is True and verdict["roundsLeft"] == 0
-    assert "Stop" in verdict["nextStep"]
-    assert gate.request_follow_up(gate.verify(worked=True)) is False
-
-
-def test_host_facts_are_bounded_redacted_and_merge_across_stores(tmp_path):
-    first = TaskReportStore("facts", tmp_path)
-    second = TaskReportStore("facts", tmp_path)
-    for i in range(35):
-        (first if i % 2 else second).record_result(f"tool_{i}", {
-            "eventId": i, "access_token": "NEVER-EXPOSE-ME", "hlsl": "x" * 50000,
-            "workspacePath": "D:/project/workspace", "status": "pending",
-        })
-    restarted = TaskReportStore("facts", tmp_path)
-    assert len(restarted.tools_used()) == 35
-    state = read_task_report_sidecars(tmp_path, "facts")[1]
-    assert len(state["toolFacts"]) == 24
-    assert all(len(item["summary"]) <= 1800 for item in state["toolFacts"])
-    assert "NEVER-EXPOSE-ME" not in task_report_state_path(tmp_path, "facts").read_text(encoding="utf-8")
-    assert "D:/project/workspace" in state["toolFacts"][-1]["summary"]
-
-
-def test_corrupt_sidecar_cannot_reset_review_budget(tmp_path):
-    TaskReportStore("corrupt", tmp_path).submit({"summary": ""})
-    task_report_state_path(tmp_path, "corrupt").write_text("broken", encoding="utf-8")
-    with pytest.raises(ValueError, match="refusing to reset"):
-        TaskReportStore("corrupt", tmp_path)
-
-
-def test_existing_unobserved_artifact_is_not_accepted_as_host_output(tmp_path):
-    path = tmp_path / "unrelated.txt"
-    path.write_text("existing but unrelated", encoding="utf-8")
-    store = TaskReportStore("artifact-provenance", tmp_path)
-    store.record_tool("inspect_event")
-    form = _report(artifacts=[{"path": str(path), "status": "accepted"}])
-    rejected = store.submit(form)
-    assert rejected["reasons"][0]["code"] == "artifact-not-observed"
-    store.record_result("export_event", {"artifactPath": str(path)})
-    assert store.submit(form)["accepted"] is True
-
-
-def test_follow_up_budget_survives_restart_and_state_owns_report(tmp_path):
-    first = TaskReportStore("followup", tmp_path, environ={"REPLAYLAB_VERIFY_MAX_ROUNDS": "1"})
-    first.record_tool("inspect_event")
-    assert first.request_follow_up(first.gate.verify(worked=True)) is True
-    restarted = TaskReportStore("followup", tmp_path, environ={"REPLAYLAB_VERIFY_MAX_ROUNDS": "5"})
-    assert restarted.gate.follow_ups == 1 and restarted.gate.verify_limit == 1
-    assert restarted.request_follow_up(restarted.gate.verify(worked=True)) is False
-    assert restarted.submit(_report())["accepted"] is True
-    task_report_path(tmp_path, "followup").write_text("interrupted mirror update", encoding="utf-8")
-    again = TaskReportStore("followup", tmp_path)
-    assert again.gate.report is not None and again.gate.attempts == 1
-    assert again.gate.terminal_status("failed", worked=True) == "failed"
-    assert ReportGate(tools_used=lambda: ()).terminal_status("failed", worked=True) == "failed"
-
-
-def test_free_text_fact_credentials_are_redacted(tmp_path):
-    store = TaskReportStore("redaction", tmp_path)
-    store.record_result("inspect_event", {"error": "https://api/x?token=URLSECRET&n=3 api_key=KEYSECRET password='PASS SECRET'"}, failed=True)
-    state_text = task_report_state_path(tmp_path, "redaction").read_text(encoding="utf-8")
-    assert all(secret not in state_text for secret in ("URLSECRET", "KEYSECRET", "PASS SECRET"))
-
-
-def test_concurrent_host_processes_preserve_facts_and_one_bounded_budget(tmp_path):
-    script = """
-import sys
-from src.task_report import TaskReportStore
-store = TaskReportStore('concurrent', sys.argv[1], environ={'REPLAYLAB_REVIEW_MAX_ROUNDS': '3'})
-for index in range(12):
-    store.record_result(sys.argv[2] + str(index), {'eventId': index})
-    store.submit({'summary': ''})
-"""
-    processes = [subprocess.Popen([sys.executable, "-c", script, str(tmp_path), prefix],
-                                 cwd=Path(__file__).resolve().parents[1], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                 for prefix in ("first_", "second_")]
-    for process in processes:
-        stdout, stderr = process.communicate(timeout=20)
-        assert process.returncode == 0, (stdout, stderr)
-    final = TaskReportStore("concurrent", tmp_path)
-    assert len(final.tools_used()) == 24
-    assert final.gate.attempts == 3 and final.gate.report is None

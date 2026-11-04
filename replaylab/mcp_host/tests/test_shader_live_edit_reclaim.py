@@ -7,9 +7,11 @@ import tempfile
 import time
 import unittest
 import uuid
+from unittest import mock
+
+import pytest
 
 from src.shader_live_edit import (
-    MAX_ACTIVE_LIVE_EDITS,
     ShaderLiveEditError,
     _PersistentLiveEditRegistry,
 )
@@ -30,6 +32,12 @@ def _identity(capture: Path, *, raw: str = "a" * 64, resource: int = 755) -> dic
 
 class ReclaimTests(unittest.TestCase):
     def setUp(self) -> None:
+        # Exercise durable-cap reclamation with a small fixture. The actual
+        # watcher-thread limit is independent of retained authorization count.
+        self.capacity = 8
+        patcher = mock.patch("src.shader_live_edit.MAX_PERSISTENT_LIVE_EDIT_AUTHORIZATIONS", self.capacity)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.registry = _PersistentLiveEditRegistry(self.root / "registry.json")
@@ -46,7 +54,7 @@ class ReclaimTests(unittest.TestCase):
 
     def _fill(self, **kwargs) -> list[Path]:
         workspaces = []
-        for index in range(MAX_ACTIVE_LIVE_EDITS):
+        for index in range(self.capacity):
             workspace = self._workspace("ws-%d" % index)
             self.registry.authorize(workspace, _identity(self.capture, raw=("%02x" % index) * 32, resource=100 + index), 100)
             workspaces.append(workspace)
@@ -66,7 +74,7 @@ class ReclaimTests(unittest.TestCase):
         self.assertEqual([item["reclaimReason"] for item in released], ["workspace-missing"])
         self.assertEqual(released[0]["workspacePath"], str(workspaces[3]))
         self.registry.authorize(self._workspace("ws-new"), _identity(self.capture), 100)
-        self.assertEqual(len(self.registry.entries()), MAX_ACTIVE_LIVE_EDITS)
+        self.assertEqual(len(self.registry.entries()), self.capacity)
 
     def test_same_physical_shader_is_superseded(self) -> None:
         workspaces = self._fill()
@@ -98,6 +106,23 @@ class ReclaimTests(unittest.TestCase):
     def test_below_limit_is_a_no_op(self) -> None:
         self.registry.authorize(self._workspace("ws-0"), _identity(self.capture), 100)
         self.assertEqual(self.registry.reclaim_for(_identity(self.capture)), [])
+
+
+def test_durable_registry_byte_budget_rejects_new_record_without_corrupting_previous_consent(tmp_path, monkeypatch):
+    capture = tmp_path / "capture.rdc"
+    capture.write_bytes(b"capture")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry = _PersistentLiveEditRegistry(tmp_path / "registry.json")
+    original_entry = registry.authorize(workspace, _identity(capture), 100)
+    original_bytes = registry.path.read_bytes()
+    monkeypatch.setattr("src.shader_live_edit.MAX_LIVE_EDIT_REGISTRY_BYTES", len(original_bytes) + 50)
+    another = tmp_path / "another-workspace"
+    another.mkdir()
+    with pytest.raises(ShaderLiveEditError, match="byte budget"):
+        registry.authorize(another, _identity(capture, resource=99), 100)
+    assert registry.path.read_bytes() == original_bytes
+    assert registry.entries() == [original_entry]
 
 
 if __name__ == "__main__":

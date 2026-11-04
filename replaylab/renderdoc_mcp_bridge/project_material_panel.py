@@ -17,11 +17,12 @@ except (ImportError, ValueError):
 def register_material_menus(ctx, qrd, QtCore, show_callback, expose_callback):
     ctx.Extensions().RegisterWindowMenu(
         qrd.WindowMenu.Window,
-        [QtCore.QCoreApplication.translate("ReplayLabProjects", "ReplayLab Material Parameters")],
+        [QtCore.QCoreApplication.translate("ReplayLabProjects", "Material Parameters")],
         show_callback)
     ctx.Extensions().RegisterContextMenu(
         qrd.ContextMenu.BufferViewer_Variable,
-        ["ReplayLab", QtCore.QCoreApplication.translate(
+        [QtCore.QCoreApplication.translate("ReplayLabProjects", "Bread AI"),
+         QtCore.QCoreApplication.translate(
             "ReplayLabProjects", "Expose as Material Parameter")], expose_callback)
 
 
@@ -30,7 +31,7 @@ def show_selection_error(ctx, QtCore, diagnostic):
         QtCore.QCoreApplication.translate(
             "ReplayLabProjects", "%1\n\nThe parameter was not exposed and no CBuffer bytes were changed.")
         .replace("%1", str(diagnostic)),
-        QtCore.QCoreApplication.translate("ReplayLabProjects", "ReplayLab Material Parameters"))
+        QtCore.QCoreApplication.translate("ReplayLabProjects", "Material Parameters"))
 
 
 def _parameter_error_text(error):
@@ -60,7 +61,7 @@ class MiniQtMaterialPanel(object):
         self.closed_callback = closed_callback
         self.mqt = ctx.Extensions().GetMiniQtHelper()
         self.top = self.mqt.CreateToplevelWidget(
-            QtCore.QCoreApplication.translate("ReplayLabProjects", "ReplayLab Material Parameters"),
+            QtCore.QCoreApplication.translate("ReplayLabProjects", "Material Parameters"),
             self._closed)
         self.root = self.mqt.CreateVerticalContainer()
         self.mqt.AddWidget(self.top, self.root)
@@ -233,8 +234,8 @@ class MiniQtMaterialPanel(object):
                     empty,
                     QtCore.QCoreApplication.translate(
                         "ReplayLabProjects",
-                        "Open a Pipeline State CBuffer, right-click a reflected value, then choose\n"
-                        "ReplayLab → Expose as Material Parameter."))
+                        "Open a Pipeline State CBuffer, right-click a reflected value, then "
+                        "choose\nBread AI → Expose as Material Parameter."))
                 self.mqt.AddWidget(self.content, empty)
                 self._dynamic_roots.append(empty)
                 self._set_status(
@@ -384,7 +385,7 @@ class MiniQtMaterialPanel(object):
             try:
                 controller.rollback_all()
             except Exception as exc:
-                print("[ReplayLab] Material panel shutdown rollback error: %s" % str(exc))
+                print("[Bread] Material panel shutdown rollback error: %s" % str(exc))
         if controller is not None:
             controller.forget_all()
         self._alive = False

@@ -807,8 +807,9 @@ def match_capture_catalog(
     store = SymbolStore(database_path)
     if store.get_asset_scan(scan_id) is None:
         raise ValueError("Unknown asset scan: %s" % scan_id)
+    # save_capture_catalog resets this identity's aliases to the rows inherited by
+    # Shader bytes; each Shader the matcher can prove again is replaced below.
     capture_id = store.save_capture_catalog(str(path), catalog)
-    store.clear_aliases(capture_id)
     resolutions: list[dict] = []
     status_counts: Counter[str] = Counter()
     alias_count = 0
@@ -925,6 +926,9 @@ def match_capture_catalog(
 
         if selected is not None:
             asset, validation, score = selected
+            store.clear_aliases(
+                capture_id, shader["shaderResourceId"], shader["stage"],
+                shader.get("entryPoint", ""))
             for alias in aliases_for_match(
                 capture_id,
                 shader,

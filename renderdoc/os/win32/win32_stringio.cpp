@@ -286,11 +286,40 @@ rdcstr GetReplayAppFilename()
   GetModuleHandleEx(
       GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
       (LPCTSTR)&dllLocator, &hModule);
-  wchar_t curFile[512] = {0};
-  GetModuleFileNameW(hModule, curFile, 511);
+  wchar_t curFile[32768] = {0};
+  const DWORD length = GetModuleFileNameW(hModule, curFile, 32768);
+  if(length == 0 || length >= 32768)
+    return "";
 
   rdcstr path = StringFormat::Wide2UTF8(curFile);
   path = get_dirname(path);
+  // Prefer this distribution's GUI before legacy names or installed file associations.
+  // A portable package must never launch another RenderDoc from the registry.
+  bool portable = false;
+  rdcarray<rdcstr> roots = {path};
+  if(strlower(get_basename(path)) == "x86")
+    roots.push_back(path + "/..");
+  for(const rdcstr &root : roots)
+  {
+    FILE *marker = FileIO::fopen(root + "/RenderDocBread.portable", FileIO::ReadBinary);
+    if(marker)
+    {
+      portable = true;
+      FileIO::fclose(marker);
+    }
+    for(const char *name : {"RenderDocBread.exe", "q_render_soco_doc.exe"})
+    {
+      const rdcstr candidate = root + "/" + name;
+      FILE *file = FileIO::fopen(candidate, FileIO::ReadBinary);
+      if(file)
+      {
+        FileIO::fclose(file);
+        return candidate;
+      }
+    }
+  }
+  if(portable)
+    return "";
   rdcstr exe = path + "/qrenderdoc.exe";
 
   FILE *f = FileIO::fopen(exe, FileIO::ReadBinary);

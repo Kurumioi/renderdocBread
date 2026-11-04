@@ -1,8 +1,8 @@
-"""Host-owned receipts for completed shader reviews, independent of a process.
+"""Host-owned receipts for finalized shader sources, independent of a process.
 
 The model may edit workspace proposal files, but no tool exposes this store.
-Only a completed Host review inserts a receipt. Its digest identifies the
-exact accepted record; it is not a claim that different shaders are equivalent.
+Only a physically validated finalization inserts a receipt. Its digest identifies
+the exact source record; it is not a claim that AI finished a semantic task.
 Current source, graph, candidate and replay ABI are still checked by the caller.
 """
 
@@ -62,9 +62,9 @@ class CompletedShaderReviews:
         return connection
 
     def remember(self, session: Mapping[str, Any]) -> None:
-        if (session.get("state") != "completed" or session.get("decision") not in
-                ("accepted-executable-editable", "soft-accepted-baseline")):
-            raise ValueError("only completed accepted shader reviews can be retained")
+        if (session.get("state") != "completed" or
+                session.get("decision") != "accepted-executable-editable"):
+            raise ValueError("only completed validated shader sources can be retained")
         digest, workspace, organization = self._identity(session)
         connection = self._connect(create=True)
         assert connection is not None
@@ -79,8 +79,8 @@ class CompletedShaderReviews:
             connection.close()
 
     def contains(self, session: Mapping[str, Any]) -> bool:
-        if (session.get("state") != "completed" or session.get("decision") not in
-                ("accepted-executable-editable", "soft-accepted-baseline")):
+        if (session.get("state") != "completed" or
+                session.get("decision") != "accepted-executable-editable"):
             return False
         try:
             digest, workspace, organization = self._identity(session)
@@ -96,6 +96,98 @@ class CompletedShaderReviews:
             finally:
                 connection.close()
         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
-            # Missing/corrupt local provenance never converts disk claims into
-            # accepted work. It also never creates a fresh store during a read.
             return False
+
+
+class OrganizationCheckpoints(CompletedShaderReviews):
+    """Latest Host-authenticated pending session; never publication authority.
+
+    The proposal and explanatory documents are *working state*.
+    They deliberately do not participate in this receipt: freezing those files
+    made an ordinary draft edit indistinguishable from corruption after a Host
+    restart.  The external store authenticates only the exact ``session.json``
+    ledger.  Baseline/source/artifact relationships are validated by the
+    organization manager when the session is resumed or finalized.
+
+    ``snapshot`` remains in the table for backwards compatibility with stores
+    created by the old whole-directory checkpoint implementation.  It is no
+    longer an acceptance condition.
+    """
+
+    @staticmethod
+    def _snapshot(session: Mapping[str, Any]) -> str:
+        # Do not inspect mutable workspace artifacts here.  The exact session
+        # digest stored beside this marker is the Host-owned ledger receipt.
+        # A constant marker also lets current code read legacy rows without
+        # requiring (or trusting) their obsolete directory snapshot.
+        return "working-state-not-frozen/v2"
+
+    def remember(self, session: Mapping[str, Any]) -> None:
+        root = Path(str(session["workspacePath"])).resolve()
+        if self.path.resolve().is_relative_to(root):
+            raise ValueError("organization checkpoint store must be outside the workspace")
+        digest, workspace, organization = self._identity(session)
+        pending = session.get("state") in {"drafting", "awaiting-proposal-review"}
+        snapshot = self._snapshot(session) if pending else ""
+        connection = self._connect(create=True)
+        assert connection is not None
+        try:
+            with connection:
+                connection.execute("CREATE TABLE IF NOT EXISTS organization_checkpoints ("
+                    "workspace TEXT NOT NULL, organization TEXT NOT NULL, digest TEXT NOT NULL, "
+                    "snapshot TEXT NOT NULL, pending INTEGER NOT NULL, PRIMARY KEY(workspace,organization))")
+                connection.execute("INSERT OR REPLACE INTO organization_checkpoints VALUES (?,?,?,?,?)",
+                                   (workspace, organization, digest, snapshot, int(pending)))
+        finally:
+            connection.close()
+
+    def contains(self, session: Mapping[str, Any]) -> bool:
+        if session.get("state") not in {"drafting", "awaiting-proposal-review"}:
+            return False
+        try:
+            digest, workspace, organization = self._identity(session)
+            connection = self._connect(create=False)
+            if connection is None:
+                return False
+            try:
+                row = connection.execute("SELECT digest,pending FROM organization_checkpoints "
+                    "WHERE workspace=? AND organization=?", (workspace, organization)).fetchone()
+                return row == (digest, 1)
+            finally:
+                connection.close()
+        except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+            return False
+
+    def has_pending(self, workspace: Path, organization: str) -> bool:
+        try:
+            connection = self._connect(create=False)
+            if connection is None:
+                return False
+            try:
+                return connection.execute("SELECT 1 FROM organization_checkpoints "
+                    "WHERE workspace=? AND organization=? AND pending=1",
+                    (str(workspace.resolve()), organization)).fetchone() is not None
+            finally:
+                connection.close()
+        except (OSError, ValueError, sqlite3.Error):
+            return False
+
+    def retire_as_explanation_only(self, session: Mapping[str, Any]) -> None:
+        """Retain an authenticated legacy snapshot but remove pending authority."""
+
+        if not self.contains(session):
+            raise ValueError("only the exact current organization checkpoint can be retired")
+        digest, workspace, organization = self._identity(session)
+        connection = self._connect(create=True)
+        assert connection is not None
+        try:
+            with connection:
+                updated = connection.execute(
+                    "UPDATE organization_checkpoints SET digest=?,snapshot=?,pending=0 "
+                    "WHERE workspace=? AND organization=? AND pending=1",
+                    (digest, self._snapshot(session), workspace, organization),
+                ).rowcount
+                if updated != 1:
+                    raise ValueError("legacy organization checkpoint changed during retirement")
+        finally:
+            connection.close()

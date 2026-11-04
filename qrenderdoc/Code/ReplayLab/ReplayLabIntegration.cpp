@@ -28,9 +28,16 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QMenu>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QMessageBox>
+#include <QTimer>
+#include <memory>
 #include <QScopedValueRollback>
 #include "Code/CaptureContext.h"
+#include "Code/QRDUtils.h"
 #include "Code/pyrenderdoc/PythonContext.h"
+#include "Windows/AI/AIAssistant.h"
 #include "Windows/MainWindow.h"
 
 namespace
@@ -47,12 +54,9 @@ QString ReplayLabIntegration::Initialize()
   if(m_Available)
     return QString();
 
-#if !defined(Q_OS_WIN)
-  // The packaged runtime currently relies on Windows Job Objects to contain AgentHost and every
-  // provider/MCP descendant. Do not expose a weaker parent-only kill contract on other platforms.
-  m_LastError = tr("The AI runtime currently requires Windows process-tree containment.");
-  return m_LastError;
-#endif
+  // The in-process Shader Workspace/replay bridge is portable and owns no AI process tree.
+  // Its non-Windows startup registers local source/debug tools only. AgentHost and provider
+  // sidecars retain their separate platform/Job Object containment checks in AIAssistant.
 
   const QString packageRoot =
       QDir(QCoreApplication::applicationDirPath())
@@ -100,7 +104,7 @@ QStringList ReplayLabIntegration::AvailableShaderStages(QString *error) const
   if(!m_Available)
   {
     if(error)
-      *error = m_LastError.isEmpty() ? tr("The built-in RenderDoc AI integration is unavailable.")
+      *error = m_LastError.isEmpty() ? tr("The built-in Bread AI integration is unavailable.")
                                      : m_LastError;
     return {};
   }
@@ -110,9 +114,94 @@ QStringList ReplayLabIntegration::AvailableShaderStages(QString *error) const
   return stages.split(QLatin1Char(','), QString::SkipEmptyParts);
 }
 
+void ReplayLabIntegration::OpenShaderWorkspace(uint32_t eventId, const QString &stage,
+                                               const QString &resourceId, const QString &entryPoint)
+{
+  if(!m_Context.IsCaptureLoaded() || !m_Context.GetAction(eventId))
+    return;
+  m_Context.SetEventID({}, eventId, eventId);
+  const QString capturePath = m_Context.GetCaptureFilename();
+  // i18n-ignore: Shader Workspace navigation protocol fields.
+  QJsonObject request{{lit("target"), true}, {lit("refresh"), false},
+                      {lit("capturePath"), capturePath}, {lit("stage"), stage}, // i18n-ignore: navigation JSON keys.
+                      {lit("resourceId"), resourceId}, {lit("entryPoint"), entryPoint}}; // i18n-ignore: navigation JSON keys.
+  QTimer *poll = new QTimer(m_Context.GetMainWindow()->Widget());
+  poll->setInterval(1);
+  auto attempts = std::make_shared<int>(0);
+  QObject::connect(poll, &QTimer::timeout, poll,
+      [this, poll, attempts, request, capturePath, eventId, stage]() mutable {
+    poll->setInterval(100);
+    if(!m_Context.IsCaptureLoaded() || m_Context.CurEvent() != eventId ||
+       QString(m_Context.GetCaptureFilename()) != capturePath)
+    {
+      poll->stop();
+      poll->deleteLater();
+      return;
+    }
+    QString error;
+    const QJsonObject result = QJsonDocument::fromJson(NavigateShaderSourceJSON(
+        QString::fromUtf8(QJsonDocument(request).toJson(QJsonDocument::Compact)), &error).toUtf8()).object();
+    // i18n-ignore: Shader navigation protocol fields and status identifiers.
+    if(result.contains(lit("captureSessionId")))
+      request[lit("captureSessionId")] = result.value(lit("captureSessionId")); // i18n-ignore: navigation JSON keys.
+    const QString status = result.value(lit("status")).toString(); // i18n-ignore: navigation protocol field.
+    if(status == lit("pending") && ++*attempts < 150) // i18n-ignore: navigation protocol status.
+      return;
+    poll->stop();
+    poll->deleteLater();
+    if(result.value(lit("accepted")).toBool()) // i18n-ignore: navigation protocol field.
+      return;
+    QWidget *parent = m_Context.GetMainWindow()->Widget();
+    if(status != lit("missing")) // i18n-ignore: navigation protocol status.
+    {
+      RDDialog::warning(parent, tr("Shader Workspace"),
+                        tr("The Shader Workspace could not be refreshed. Try again when capture loading has finished."));
+      return;
+    }
+    if(RDDialog::question(parent, tr("Shader Workspace"),
+        tr("This Shader has not been organized. Ask Bread AI to organize it in a new conversation?"),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+      return;
+    m_Context.GetAIAssistant()->StartCaptureIntent(
+        tr("Use @renderdoc-shader-workbench to organize the selected Shader and open its source and explanation in Shader Workspace. Follow the skill workflow."),
+        stage, lit("reverse-edit-selected-shader")); // i18n-ignore: stable Shader intent identifier
+    m_Context.ShowAIAssistant();
+  });
+  poll->start();
+}
+
 QString ReplayLabIntegration::CurrentContextJSON(QString *error) const
 {
   return CurrentContextJSON(QString(), error);
+}
+
+QString ReplayLabIntegration::NavigateShaderSourceJSON(const QString &requestJSON, QString *error) const
+{
+  if(error)
+    error->clear();
+  if(!m_Available)
+  {
+    if(error)
+      *error = m_LastError.isEmpty() ? tr("The built-in Bread AI integration is unavailable.")
+                                     : m_LastError;
+    return QString();
+  }
+  return PythonContext::InvokeInternalIntegration(
+      IntegrationModule, "navigate_native_shader_source_json", {requestJSON}, error);
+}
+
+QString ReplayLabIntegration::OpenDocumentJSON(const QString &requestJSON, QString *error) const
+{
+  if(error)
+    error->clear();
+  if(!m_Available)
+  {
+    if(error)
+      *error = m_LastError.isEmpty() ? tr("The built-in Bread AI integration is unavailable.") : m_LastError;
+    return QString();
+  }
+  return PythonContext::InvokeInternalIntegration(
+      IntegrationModule, "open_native_document_json", {requestJSON}, error);
 }
 
 QString ReplayLabIntegration::CurrentContextJSON(const QString &focusStage, QString *error) const
@@ -122,7 +211,7 @@ QString ReplayLabIntegration::CurrentContextJSON(const QString &focusStage, QStr
   if(!m_Available)
   {
     if(error)
-      *error = m_LastError.isEmpty() ? tr("The built-in RenderDoc AI integration is unavailable.")
+      *error = m_LastError.isEmpty() ? tr("The built-in Bread AI integration is unavailable.")
                                      : m_LastError;
     return QString();
   }
@@ -148,7 +237,7 @@ QString ReplayLabIntegration::BeginCurrentContextFreezeJSON(const QString &focus
   if(!m_Available)
   {
     if(error)
-      *error = m_LastError.isEmpty() ? tr("The built-in RenderDoc AI integration is unavailable.")
+      *error = m_LastError.isEmpty() ? tr("The built-in Bread AI integration is unavailable.")
                                      : m_LastError;
     return QString();
   }
@@ -168,7 +257,7 @@ QString ReplayLabIntegration::PollCurrentContextFreezeJSON(const QString &jobId,
   if(!m_Available)
   {
     if(error)
-      *error = m_LastError.isEmpty() ? tr("The built-in RenderDoc AI integration is unavailable.")
+      *error = m_LastError.isEmpty() ? tr("The built-in Bread AI integration is unavailable.")
                                      : m_LastError;
     return QString();
   }
@@ -184,7 +273,7 @@ QString ReplayLabIntegration::AbandonCurrentContextFreezeJSON(const QString &job
   if(!m_Available)
   {
     if(error)
-      *error = m_LastError.isEmpty() ? tr("The built-in RenderDoc AI integration is unavailable.")
+      *error = m_LastError.isEmpty() ? tr("The built-in Bread AI integration is unavailable.")
                                      : m_LastError;
     return QString();
   }
@@ -216,9 +305,13 @@ QString ReplayLabIntegration::ValidateCurrentContextFreezeResultPath(const QStri
   const QFileInfo suppliedInfo(resultPath);
   const QString normalisedPath =
       QDir::cleanPath(QDir::fromNativeSeparators(suppliedInfo.absoluteFilePath()));
-  const QByteArray localAppData = qgetenv("LOCALAPPDATA");
-  const QString localRoot =
-      localAppData.isEmpty() ? QDir::tempPath() : QString::fromLocal8Bit(localAppData);
+  QByteArray localAppData = qgetenv("LOCALAPPDATA");
+  if(localAppData.isEmpty())
+    localAppData = qgetenv("XDG_DATA_HOME");
+  // Same per-user data home the bridge and the host derive; never the shared temp directory.
+  const QString localRoot = localAppData.isEmpty()
+                                ? QDir::home().filePath(lit(".local/share"))    // i18n-ignore: fixed path
+                                : QString::fromLocal8Bit(localAppData);
   // i18n-ignore: fixed internal ReplayLab IPC directory, never shown to the user.
   const QString instancesRelativePath = lit("ReplayLab/ipc-v2/instances");
   const QString instancesRoot = QDir::cleanPath(

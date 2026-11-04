@@ -16,10 +16,14 @@ import re
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 MAX_TOKENS = 250000
 MAX_FUNCTIONS = 512
+MAX_GRAPH_NODES = 256
 MAX_LOCAL_NODES = 128
 MAX_CONTROL_DEPTH = 48
+MAX_LABEL_LENGTH = 160
+MAX_DESCRIPTION_LENGTH = 640
 _TOKEN = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?[uUfFlL]*|==|!=|<=|>=|&&|\|\||\+\+|--|\+=|-=|\*=|/=|<<|>>|[^\s]")
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _CONTROLS = frozenset(("if", "for", "while", "switch", "catch"))
 # Data-flow summary helpers (which fields/resources a span reads and writes).
 _ASSIGN_ONE = frozenset(("=", "+=", "-=", "*=", "/="))
@@ -33,6 +37,17 @@ _RESOURCE_PREFIXES = ("Texture", "RWTexture", "Sampler", "Buffer", "RWBuffer", "
                       "FeedbackTexture", "RasterizerOrdered")
 _SWIZZLE = re.compile(r"^(?:[xyzw]{1,4}|[rgba]{1,4}|_m\d\d(?:_m\d\d){0,3}|_\d\d(?:_\d\d){0,3})$")
 _IO_LIMIT = 24
+
+
+def _bounded_text(value, limit, one_line=False):
+    if value is None:
+        return ""
+    text = _CONTROL_RE.sub("", str(value)).strip()
+    if one_line:
+        text = " ".join(text.split())
+    if len(text) > int(limit):
+        text = text[:max(0, int(limit) - 1)].rstrip() + "\u2026"
+    return text
 
 
 def _masked_source(source):
@@ -96,6 +111,8 @@ class SourceFlowHierarchy(object):
         self.lines = [0] + [index + 1 for index, char in enumerate(source) if char == "\n"]
         self.functions = {}
         self.by_name = {}
+        self.function_annotations = {}
+        self.helper_function_ids = set()
         depth = 0
         for index, word in enumerate(self.words):
             if word == "}":
@@ -321,11 +338,27 @@ class SourceFlowHierarchy(object):
         for modifier, type_word, name, unused_semantic in self.function_params(record):
             params[name] = (modifier, type_word)
         io = self.span_io(record["start"], record["end"], params)
+        # Reading an out parameter after assigning it inside the function does
+        # not make the caller supply an input value for that parameter.
+        out_only = [name for name, (modifier, unused_type) in params.items()
+                    if "out" in modifier.split() and "inout" not in modifier.split()]
+        io["reads"] = [value for value in io["reads"] if not any(
+            value == name or value.startswith(name + ".") for name in out_only)]
         # A field never written inside the callee but passed via "out" is still an
         # output from the caller's point of view; keep declared out params visible.
         for name, (modifier, unused_type) in params.items():
-            if "out" in modifier.split() and not any(w == name or w.startswith(name + ".") for w in io["writes"]):
+            if ({"out", "inout"}.intersection(modifier.split()) and
+                    not any(w == name or w.startswith(name + ".") for w in io["writes"])):
                 io["writes"].append(name)
+        # A return is part of a function's interface even when its expression
+        # uses only locals. Display that interface, never the return statement.
+        inputs, outputs = self.entry_interface(record)
+        for value in inputs:
+            if value not in io["reads"]:
+                io["reads"].append(value)
+        for value in outputs:
+            if value not in io["writes"]:
+                io["writes"].append(value)
         return io
 
     def entry_interface(self, record):
@@ -345,7 +378,7 @@ class SourceFlowHierarchy(object):
 
         for modifier, type_word, name, semantic in self.function_params(record):
             mods = modifier.split()
-            if "out" in mods:
+            if "out" in mods or "inout" in mods:
                 outputs.extend(describe(type_word, name, semantic))
             if "inout" in mods or "out" not in mods:
                 inputs.extend(describe(type_word, name, semantic))
@@ -384,8 +417,85 @@ class SourceFlowHierarchy(object):
                 break
             current -= 1
         collected.reverse()
-        joined = " ".join(item for item in collected if item)
+        joined = " ".join(item for item in collected if item and
+                          not re.match(r"^@(?:stage|phase|helper|overview)\b", item))
         return joined[:limit]
+
+    def set_function_annotations(self, overview):
+        """Keep authored descriptions on verified navigation projections.
+
+        A projected location is not a renewed semantic review. Original review
+        hashes remain unchanged, and every carried anchor must bind this buffer.
+        """
+        self.function_annotations = {}
+        self.helper_function_ids = set()
+        if not isinstance(overview, dict) or (overview.get("sourceSha256") != self.source_sha256
+                and overview.get('navigationSourceSha256') != self.source_sha256):
+            return
+        def canonical(signature):
+            return " ".join(match.group() for match in _TOKEN.finditer(signature))
+
+        signatures = {canonical(record["signature"]): function_id
+                      for function_id, record in self.functions.items() if record}
+        stages = overview.get("stages", [])
+        for stage in (stages if isinstance(stages, list) else [])[:MAX_FUNCTIONS]:
+            if not isinstance(stage, dict):
+                continue
+            helpers = stage.get("helperSignatures", [])
+            for signature in (helpers if isinstance(helpers, list) else [])[:MAX_FUNCTIONS]:
+                if isinstance(signature, str) and canonical(signature) in signatures:
+                    self.helper_function_ids.add(signatures[canonical(signature)])
+            anchors = stage.get("anchors", [])
+            for anchor in (anchors if isinstance(anchors, list) else [])[:MAX_FUNCTIONS]:
+                if not isinstance(anchor, dict) or anchor.get("kind") != "function":
+                    continue
+                if (overview.get('sourceSha256') != self.source_sha256
+                        and anchor.get('sourceSha256') != self.source_sha256):
+                    continue
+                signature = anchor.get("functionSignature")
+                function_id = signatures.get(canonical(signature)) if isinstance(signature, str) else None
+                if not function_id:
+                    continue
+                record = self.functions[function_id]
+                if anchor.get("functionName") != record["name"]:
+                    continue
+                summary = _bounded_text(stage.get("description") or stage.get("title"),
+                                        MAX_DESCRIPTION_LENGTH, False)
+                if summary:
+                    self.function_annotations[function_id] = summary
+
+    def function_description(self, function_id):
+        record = self.functions.get(function_id)
+        return (self.function_annotations.get(function_id) or
+                (self.leading_comment(record["declaration"] - 1) if record else ""))
+
+    def function_path(self, entry_id, target_id):
+        """A bounded source-proven caller path; visited graphs are not ancestry."""
+        if entry_id not in self.functions or target_id not in self.functions:
+            return []
+        queue = [[entry_id]]
+        visited = set()
+        queued = {entry_id}
+        while queue:
+            path = queue.pop(0)
+            current = path[-1]
+            if current == target_id:
+                return path
+            if current in visited:
+                continue
+            visited.add(current)
+            record = self.functions.get(current)
+            if not record:
+                continue
+            for token in range(record["start"], record["end"] - 1):
+                if (self.words[token + 1] != "(" or
+                        self.words[token - 1] in (".", "::", "->")):
+                    continue
+                child = self.function_identity(self.words[token])
+                if child and child not in queued:
+                    queued.add(child)
+                    queue.append(path + [child])
+        return []
 
     def _source_location(self, start, end):
         token = self.tokens[start]
@@ -444,10 +554,49 @@ class SourceFlowHierarchy(object):
         segment = self.source[start:end]
         return bool(re.search(r"\b" + re.escape(name) + r"\s*\(", segment))
 
-    def project_root(self, accepted_graph):
+    def project_root(self, accepted_graph, functions_only=False):
         """Keep accepted top-level stages; add only source-proven expansion IDs."""
         result = copy.deepcopy(accepted_graph if isinstance(accepted_graph, dict) else {})
         graph = result.get("flowGraph", result)
+        if functions_only:
+            entry_id = self.function_identity(graph.get("entryPoint", ""))
+            if entry_id:
+                projected = self.function_graph(
+                    entry_id, functions_only=True, expandable_self=True)
+                # The accepted module descriptions are reviewed AI evidence.
+                # The function-only projection supplies source-derived IO and
+                # call relationships; merge the reviewed annotations by exact
+                # function name without exposing source snippets/expressions.
+                descriptions = {}
+                for source_node in graph.get("nodes", [])[:MAX_GRAPH_NODES]:
+                    if not isinstance(source_node, dict):
+                        continue
+                    name = _bounded_text(source_node.get("name"), MAX_LABEL_LENGTH, True)
+                    description = _bounded_text(
+                        source_node.get("description"), MAX_DESCRIPTION_LENGTH, False)
+                    # i18n-ignore: exact legacy Host-generated prose compatibility value.
+                    legacy_entry_description = "Shader entry point; the stage result is produced here."
+                    if (name and description and name not in descriptions and
+                            (description == legacy_entry_description or
+                             not any(marker in description for marker in (";", "{", "}", "```")))):
+                        descriptions[name] = description
+                for node in projected.get("nodes", []):
+                    if not isinstance(node, dict) or node.get("kind") in ("input", "output"):
+                        continue
+                    description = descriptions.get(str(node.get("name") or ""))
+                    if description and not node.get("description"):
+                        node["description"] = description
+                    source = node.get("source")
+                    if isinstance(source, dict):
+                        # Navigation keeps identity/line metadata only. Actual
+                        # implementation belongs in the editor, never the box.
+                        source.pop("snippet", None)
+                projected["functionName"] = ""
+                projected["graphId"] = "root:" + projected["graphId"]
+                if "flowGraph" in result:
+                    result["flowGraph"] = projected
+                    return result
+                return projected
         if graph.get("graphKind") != "algorithm-dataflow":
             entry_id = self.function_identity(graph.get("entryPoint", ""))
             if entry_id:
@@ -469,23 +618,20 @@ class SourceFlowHierarchy(object):
                 node["functionId"] = function_id
                 record = self.functions[function_id]
                 node["io"] = self.function_io(function_id)
-                # Title = what the stage does, body = the call as written in the entry.
+                # The box is an interface summary. Source expressions remain
+                # navigation evidence, never visible node titles/descriptions.
                 call = self.call_site(record["name"])
-                statement, comment = "", ""
+                comment = ""
                 if call is not None and 1 <= int(call.get("line", 0)) <= len(self.lines):
                     line_no = int(call["line"])
                     start = self.lines[line_no - 1]
-                    end = self.lines[line_no] - 1 if line_no < len(self.lines) else len(self.source)
-                    statement = " ".join(self.source[start:end].split())
                     token_at_line = bisect.bisect_left([t.start() for t in self.tokens], start)
                     comment = self.leading_comment(token_at_line)
                 if not comment:
                     comment = self.leading_comment(record["declaration"] - 1)
-                label = str(node.get("label", "") or "")
-                if not label or _IDENTIFIER.match(label):
-                    node["label"] = (comment or str(node.get("description", "") or "") or record["name"])[:160]
-                if statement:
-                    node["description"] = statement[:160]
+                explanation = str(node.get("description", "") or node.get("label", "") or "")
+                node["label"] = record["name"][:160]
+                node["description"] = (comment or ("" if functions_only else explanation))[:640]
                 location = node.setdefault("source", {})
                 if not isinstance(location, dict):
                     continue
@@ -553,11 +699,86 @@ class SourceFlowHierarchy(object):
         nodes.append(output_node)
         edges.extend(new_edges)
 
-    def function_graph(self, function_id):
+    def function_graph(self, function_id, functions_only=False, expandable_self=False,
+                       helper_group_id=None):
         record = self.functions.get(function_id)
         if not record:
             raise ValueError("Shader function is missing or ambiguous in the current buffer")
+        if functions_only:
+            graph = _FunctionSummaryProjection(self, record, expandable_self).build()
+            return self._helper_projection(graph, helper_group_id)
         return _FunctionProjection(self, record).build()
+
+    def _helper_projection(self, graph, helper_group_id=None):
+        """Fold only explicitly classified helpers along an unbranched sequence.
+
+        This is presentation grouping, never a new rendering-stage inference.
+        Expanding a group restores its exact source-proven calls and edges.
+        """
+        nodes, edges = graph["nodes"], graph["edges"]
+        incoming, outgoing = {}, {}
+        for edge in edges:
+            incoming.setdefault(edge["target"], []).append(edge)
+            outgoing.setdefault(edge["source"], []).append(edge)
+        runs, run = [], []
+        for node in nodes:
+            eligible = (node.get("kind") == "function-call" and
+                        node.get("functionId") in self.helper_function_ids)
+            linear = (run and incoming.get(node["id"]) == [{"source": run[-1]["id"],
+                      "target": node["id"], "kind": "sequence"}] and
+                      len(outgoing.get(run[-1]["id"], [])) == 1)
+            if run and (not eligible or not linear):
+                if len(run) > 1:
+                    runs.append(run)
+                run = []
+            if eligible:
+                run.append(node)
+        if len(run) > 1:
+            runs.append(run)
+        replacements, groups = {}, {}
+        for members in runs:
+            digest = hashlib.sha256("|".join(n["id"] for n in members).encode("utf-8")).hexdigest()[:24]
+            group_id = "helpers:" + digest
+            group = copy.deepcopy(members[0])
+            group.update({"id": group_id, "kind": "function-group", "name": "",
+                          "label": "", "description": "", "summaryId": "implementation-helpers",
+                          "functionId": graph["functionId"], "helperGroupId": group_id,
+                          "helperCount": len(members)})
+            group["sourceRange"]["endLine"] = members[-1]["sourceRange"]["endLine"]
+            groups[group_id] = (group, members)
+            for member in members:
+                replacements[member["id"]] = group_id
+        if helper_group_id:
+            if helper_group_id not in groups:
+                raise ValueError("Linked helper group was changed or removed")
+            group, members = groups[helper_group_id]
+            ids = set(n["id"] for n in members)
+            graph["nodes"] = [copy.deepcopy(nodes[0])] + members
+            graph["edges"] = [{"source": nodes[0]["id"], "target": members[0]["id"], "kind": "sequence"}]
+            graph["edges"].extend(edge for edge in edges if edge["source"] in ids and edge["target"] in ids)
+            graph["graphId"] += ":" + helper_group_id
+            graph["helperGroupId"] = helper_group_id
+            return graph
+        if not replacements:
+            return graph
+        result_nodes, emitted = [], set()
+        for node in nodes:
+            group_id = replacements.get(node["id"])
+            if not group_id:
+                result_nodes.append(node)
+            elif group_id not in emitted:
+                emitted.add(group_id)
+                result_nodes.append(groups[group_id][0])
+        result_edges, seen = [], set()
+        for edge in edges:
+            source = replacements.get(edge["source"], edge["source"])
+            target = replacements.get(edge["target"], edge["target"])
+            key = (source, target, edge["kind"])
+            if source != target and key not in seen:
+                seen.add(key)
+                result_edges.append({"source": source, "target": target, "kind": edge["kind"]})
+        graph["nodes"], graph["edges"] = result_nodes, result_edges
+        return graph
 
 
 class _FunctionProjection(object):
@@ -570,6 +791,16 @@ class _FunctionProjection(object):
         self.params = {}
         for modifier, type_word, name, unused_semantic in index.function_params(record):
             self.params[name] = (modifier, type_word)
+        # Local values connect neighboring statement boxes. Include only
+        # source-proven declarations; do not promote arbitrary identifiers,
+        # called functions or constructor/type names into data inputs.
+        for token in range(record["start"], record["end"] - 2):
+            type_word, name, following = index.words[token:token + 3]
+            is_type = (type_word in index.struct_types or re.match(
+                r"^(?:bool|int|uint|half|float|double|dword|min16float|min16int|min16uint)(?:[1-4](?:x[1-4])?)?$",
+                type_word))
+            if is_type and _IDENTIFIER.match(name) and following in ("=", ";", ",", "["):
+                self.params.setdefault(name, ("local", type_word))
 
     def _node(self, start, end, kind="computation"):
         if start >= end:
@@ -590,32 +821,9 @@ class _FunctionProjection(object):
                          "functionSignature": self.record["signature"][:1024],
                          "snippet": excerpt[:640]})
         comment = index.leading_comment(start)
-        # Only code lines are shown in the box; comment lines inside the span are
-        # explanations (each step's title), not code.
-        code_lines = [line.rstrip() for line in excerpt.splitlines()
-                      if line.strip() and not line.strip().startswith("//")]
-        # Normalise indentation: the excerpt starts mid-line (indent 0), so
-        # measure the shallowest indent on the following lines and apply it.
-        if len(code_lines) > 1:
-            rest = [len(line) - len(line.lstrip()) for line in code_lines[1:] if line.strip()]
-            indent = min(rest) if rest else 0
-            code_lines = [code_lines[0].strip()] + [line[indent:] if line[:indent].strip() == "" else line.lstrip()
-                                                     for line in code_lines[1:]]
-        elif code_lines:
-            code_lines = [code_lines[0].strip()]
-        one_line = " ".join(excerpt.split())
-        if comment:
-            label = comment
-            shown = code_lines[:3]
-        else:
-            label = one_line[:157] + "..." if len(one_line) > 160 else one_line
-            shown = code_lines[1:4]
-        code_text = "\n".join(line[:120] for line in shown)
-        if len(code_lines) > len(shown) + (0 if comment else 1):
-            code_text += "\n..."
         node = {"id": node_id, "name": self.record["name"],
-                "label": label[:160],
-                "description": code_text[:640],
+                "label": self.record["name"][:160],
+                "description": comment[:640],
                 "kind": kind, "source": location, "sourceRange": span}
         callees = []
         for token_index in range(start, end - 1):
@@ -629,15 +837,16 @@ class _FunctionProjection(object):
             node["functionId"] = callees[0]
             node["kind"] = "function-call"
             callee = index.functions.get(callees[0]) or {}
-            # Stage node: explanation on top (the comment above the call, else
-            # the comment above the callee's definition), the call underneath.
+            # Call nodes name the callee and show its explanatory comment.
             explanation = comment or (index.leading_comment(callee.get("declaration", -1) - 1)
                                       if callee else "")
-            node["label"] = (explanation or callee.get("name") or node["label"])[:160]
-            node["description"] = one_line[:160]
+            node["label"] = (callee.get("name") or node["label"])[:160]
+            node["description"] = explanation[:640]
             node["io"] = index.function_io(callees[0])
         else:
             node["io"] = index.span_io(start, end, self.params)
+            if kind == "return" and words != ["return", ";"]:
+                node["io"]["writes"].append("return")
         self.nodes.append(node)
         return node_id
 
@@ -738,6 +947,10 @@ class _FunctionProjection(object):
             return frontier
         cursor = start
         while cursor < end and len(self.nodes) < MAX_LOCAL_NODES:
+            if getattr(self, "_stop_after_exit", False) and not frontier:
+                # All paths in this block terminated; its remaining statements
+                # are unreachable, not detached stages of the execution graph.
+                return []
             cursor = self._skip_attributes(cursor, end)
             if cursor >= end:
                 break
@@ -829,6 +1042,106 @@ class _FunctionProjection(object):
                 "projectionKind": "current-source-function", "functionId": self.record["id"],
                 "functionName": self.record["name"], "sourceSha256": self.index.source_sha256,
                 "binding": dict(self.index.identity), "generated": False,
+                "nodes": self.nodes, "edges": self.edges,
+                "truncated": {"nodes": self.truncated, "edges": False,
+                              "omittedNodes": 0, "omittedEdges": 0}}
+
+
+class _FunctionSummaryProjection(_FunctionProjection):
+    """Compact execution flow: calls in statement order, with real control paths.
+
+    Plain assignments stay in the editor. Calls within one expression stay in
+    one source-bound group: lexical token order cannot prove evaluation order.
+    Repeated calls in separate statements remain separate execution steps.
+    """
+
+    def __init__(self, index, record, expandable_self=False):
+        super(_FunctionSummaryProjection, self).__init__(index, record)
+        self.expandable_self = bool(expandable_self)
+        self._stop_after_exit = True
+
+    def _node(self, start, end, kind="computation"):
+        index = self.index
+        targets = []
+        for token in range(start, end - 1):
+            if (index.words[token + 1] == "(" and
+                    (token == start or index.words[token - 1] not in (".", "::", "->"))):
+                target = index.function_identity(index.words[token])
+                if target and target not in targets:
+                    targets.append(target)
+        control = kind in ("condition", "selection", "loop", "return")
+        # Do not clutter the overview with scalar assignments or ordinary
+        # terminal returns. Keep control exits to avoid connecting dead paths.
+        if not targets and not control and index.words[start] not in ("break", "continue"):
+            return None
+        if not targets and kind == "return":
+            # Keep an exit only when it is inside a conditional/loop. A final
+            # return contributes no additional functional module to the view.
+            if self._control_depth == 0:
+                return None
+        node_id = super(_FunctionSummaryProjection, self)._node(start, end, kind)
+        if not node_id:
+            return None
+        node = self.nodes[-1]
+        node["source"].pop("snippet", None)
+        node.pop("functionId", None)
+        conditional_expression = any(word in ("?", "&&", "||") for word in index.words[start:end])
+        if control and kind != "return" or conditional_expression or index.words[start] in ("break", "continue"):
+            node["kind"] = "flow-control"
+            node["controlKind"] = ("conditional-expression" if conditional_expression else
+                                   index.words[start])
+            node["label"] = " / ".join(index.functions[t]["name"] for t in targets)
+        elif len(targets) == 1:
+            target = targets[0]
+            callee = index.functions[target]
+            node.update({"kind": "function-call", "name": callee["name"],
+                         "label": callee["name"], "signature": callee["signature"][:1024],
+                         "description": (index.function_description(target) or
+                                         index.leading_comment(start)),
+                         "io": index.function_io(target)})
+            if target != self.record["id"]:
+                node["functionId"] = target
+        elif targets:
+            node["kind"] = "function-group"
+            node["label"] = " / ".join(index.functions[t]["name"] for t in targets)
+        else:
+            node["kind"] = "flow-control"
+            node["controlKind"] = index.words[start]
+            node["label"] = ""
+        return node_id
+
+    def _body(self, start, end, frontier, depth):
+        self._control_depth += 1
+        try:
+            return super(_FunctionSummaryProjection, self)._body(start, end, frontier, depth)
+        finally:
+            self._control_depth -= 1
+
+    def build(self):
+        index, record = self.index, self.record
+        location, span = index._source_location(
+            record["declaration"], record["declaration"] + 1)
+        location.update({"symbol": record["name"],
+                         "functionSignature": record["signature"][:1024]})
+        inputs, outputs = index.entry_interface(record)
+        caller = {"id": record["id"] + ":summary", "name": record["name"],
+                  "label": record["name"], "kind": "function-summary",
+                  "signature": record["signature"][:1024],
+                  "description": index.function_description(record["id"]),
+                  "source": location, "sourceRange": span,
+                  "io": {"reads": inputs, "writes": outputs,
+                         "resources": [], "locals": []}}
+        if self.expandable_self:
+            caller["functionId"] = record["id"]
+        self.nodes.append(caller)
+        self._control_depth = 0
+        self._sequence(record["start"], record["end"], [(caller["id"], "sequence")], 0)
+        return {"schema": "replaylab-shader-flow-graph/v1", "schemaVersion": 1,
+                "graphId": "execution:" + record["id"] + ":" + index.source_sha256,
+                "graphKind": "function-execution", "layoutDirection": "TD",
+                "projectionKind": "current-source-function", "functionId": record["id"],
+                "functionName": record["name"], "sourceSha256": index.source_sha256,
+                "binding": dict(index.identity), "generated": False,
                 "nodes": self.nodes, "edges": self.edges,
                 "truncated": {"nodes": self.truncated, "edges": False,
                               "omittedNodes": 0, "omittedEdges": 0}}

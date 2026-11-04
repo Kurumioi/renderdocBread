@@ -26,8 +26,8 @@ SubscriptionLoginMode = Literal["none", "codex", "captured", "terminal"]
 # This name is part of both the ACP session/new injection contract and the
 # narrow CodeBuddy permission rule. Keep one source of truth so a rename cannot
 # silently make every CodeBuddy tool request fail closed.
-REPLAYLAB_MCP_SERVER_NAME = "ReplayLab"
-CODEBUDDY_REPLAYLAB_MCP_PERMISSION = f"mcp__{REPLAYLAB_MCP_SERVER_NAME}"
+BREAD_MCP_SERVER_NAME = "Bread"
+CODEBUDDY_BREAD_MCP_PERMISSION = f"mcp__{BREAD_MCP_SERVER_NAME}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,7 +364,7 @@ PRESETS: tuple[ProviderPreset, ...] = (
             "then exit the terminal after authentication succeeds."
         ),
         note=(
-            "Gemini authenticates interactively before ReplayLab starts `gemini --acp`. Model "
+            "Gemini authenticates interactively before Bread AI starts `gemini --acp`. Model "
             "choices are used only when the ACP session exposes them; otherwise use the provider "
             "default or enter an exact model supported by your installed CLI."
         ),
@@ -412,7 +412,7 @@ PRESETS: tuple[ProviderPreset, ...] = (
         subscription_login_mode="captured",
         note=(
             "Uses the official RFC 8628 `kimi login` device-code flow, then tests `kimi acp`. "
-            "ReplayLab imports model choices exposed by the ACP session; if none are exposed, "
+            "Bread AI imports model choices exposed by the ACP session; if none are exposed, "
             "leave the model blank for Kimi's default or enter a configured model alias."
         ),
         install_hint=(
@@ -438,7 +438,7 @@ PRESETS: tuple[ProviderPreset, ...] = (
             "--tools",
             "",
             "--allowedTools",
-            CODEBUDDY_REPLAYLAB_MCP_PERMISSION,
+            CODEBUDDY_BREAD_MCP_PERMISSION,
         ),
         auth="managed",
         declared_capabilities=frozenset({"chat", "tools", "approvals"}),
@@ -483,7 +483,7 @@ PRESETS: tuple[ProviderPreset, ...] = (
         # Claude Code exposes no non-interactive model list, so pre-fill the model
         # picker with the current Claude model ids (name + version). Users can also
         # add their own id with the box + Add button. A blank model follows the
-        # subscription's own default; ReplayLab passes the chosen id as
+        # subscription's own default; Bread AI passes the chosen id as
         # ANTHROPIC_MODEL. Availability of a given model still depends on the plan.
         # Refresh this list when Anthropic ships new model ids.
         selectable_models=(
@@ -492,24 +492,24 @@ PRESETS: tuple[ProviderPreset, ...] = (
             "claude-haiku-4-5-20251001",
             "claude-fable-5-1",
         ),
-        subscription_login=("claude", "setup-token"),
+        subscription_login=("claude", "auth", "login"),
         subscription_login_mode="terminal",
         subscription_instruction=(
             "Authenticate the official Claude Code CLI in the opened terminal: run "
-            "`claude setup-token`, complete Anthropic's sign-in with the account that owns "
+            "`claude auth login`, complete Anthropic's sign-in with the account that owns "
             "your Claude subscription, then exit after it reports success. This terminal already "
-            "uses this ReplayLab connection's isolated Claude profile; ReplayLab only reuses "
+            "uses this connection's isolated Claude profile; Bread AI only reuses "
             "Claude Code's stored official credentials and never sees your password or token."
         ),
         note=(
             "Connects a Claude subscription through the official Claude Code CLI login, "
             "bridged to ACP by the `@agentclientprotocol/claude-agent-acp` reference adapter "
             "(formerly @zed-industries/claude-code-acp) -- no API key and no reverse-engineered "
-            "authentication. The connection wizard runs `claude setup-token` in a profile-isolated "
+            "authentication. The connection wizard runs `claude auth login` in a profile-isolated "
             "Claude state directory; every task launches `claude-agent-acp` with the same directory. "
             "Model: pick one from the list, or add a full model id with the box + Add button "
             "(name plus version, for example `claude-sonnet-5`). Leave it blank to follow your "
-            "subscription's default; ReplayLab passes the id to Claude Code as ANTHROPIC_MODEL "
+            "subscription's default; Bread AI passes the id to Claude Code as ANTHROPIC_MODEL "
             "(a model your plan does not include will be rejected by Claude Code at run time). "
             "The adapter supports HTTP/stdio MCP servers, permission prompts and thinking, which "
             "the archived `acp-claude-code` package did not. Using a subscription through a "
@@ -521,7 +521,7 @@ PRESETS: tuple[ProviderPreset, ...] = (
             "CLI, and `npm install -g @agentclientprotocol/claude-agent-acp` (binary "
             "`claude-agent-acp`), then restart qrenderdoc. The bundled "
             "packaging/setup_claude_code_acp.ps1 installs or updates these dependencies; complete "
-            "sign-in from ReplayLab's Save and Connect flow so credentials are stored in this "
+            "sign-in from the Save and Connect flow so credentials are stored in this "
             "connection's isolated profile. "
             "The archived `acp-claude-code` package is no longer supported: it ignores MCP "
             "servers and never asks for permissions. Adapter: "

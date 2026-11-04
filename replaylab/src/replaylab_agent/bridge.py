@@ -7,10 +7,11 @@ ReplayLabMCP, which forwards authorized calls to the bundled bridge.
 
 from __future__ import annotations
 
+import ctypes as _ctypes
 import json
 import os
 import sys
-import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -20,9 +21,75 @@ from typing import Any
 from .errors import BridgeError
 
 
+@dataclass(frozen=True, slots=True)
+class _WindowsProcessApi:
+    open_process: Any
+    get_exit_code: Any
+    close_handle: Any
+
+
+_WINDOWS_PROCESS_API_LOCK = threading.Lock()
+_WINDOWS_PROCESS_API: _WindowsProcessApi | None = None
+_WINDOWS_DWORD_POINTER = _ctypes.POINTER(_ctypes.c_uint32)
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+
+
+def _windows_process_api() -> _WindowsProcessApi | None:
+    """Return one pointer-width-safe binding used by every liveness probe."""
+
+    global _WINDOWS_PROCESS_API
+    if sys.platform != "win32":
+        return None
+    if _WINDOWS_PROCESS_API is not None:
+        return _WINDOWS_PROCESS_API
+    with _WINDOWS_PROCESS_API_LOCK:
+        if _WINDOWS_PROCESS_API is not None:
+            return _WINDOWS_PROCESS_API
+        kernel32 = _ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [
+            _ctypes.c_uint32,
+            _ctypes.c_int,
+            _ctypes.c_uint32,
+        ]
+        open_process.restype = _ctypes.c_void_p
+        get_exit_code = kernel32.GetExitCodeProcess
+        get_exit_code.argtypes = [_ctypes.c_void_p, _WINDOWS_DWORD_POINTER]
+        get_exit_code.restype = _ctypes.c_int
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [_ctypes.c_void_p]
+        close_handle.restype = _ctypes.c_int
+        _WINDOWS_PROCESS_API = _WindowsProcessApi(
+            open_process=open_process,
+            get_exit_code=get_exit_code,
+            close_handle=close_handle,
+        )
+        return _WINDOWS_PROCESS_API
+
+
+def _pid_is_live_windows(pid: int, api: _WindowsProcessApi) -> bool:
+    """Query one PID while retaining and closing its full-width HANDLE."""
+
+    handle = api.open_process(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return False
+    try:
+        exit_code = _ctypes.c_uint32(0)
+        if not api.get_exit_code(handle, _ctypes.byref(exit_code)):
+            return False
+        return int(exit_code.value) == _STILL_ACTIVE
+    finally:
+        api.close_handle(handle)
+
+
 def default_ipc_root() -> Path:
-    local = os.environ.get("LOCALAPPDATA")
-    root = Path(local) if local else Path(tempfile.gettempdir())
+    local = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
+    # Never the shared temp directory: on Linux/macOS that put the task event
+    # stream, the log and the tool settings under a world-readable /tmp that any
+    # local user could pre-plant and that vanished on reboot. XDG data home is the
+    # per-user equivalent of LOCALAPPDATA, which the rest of the product uses.
+    root = Path(local).expanduser() if local else Path.home() / ".local" / "share"
     return root / "ReplayLab" / "ipc-v2"
 
 
@@ -33,25 +100,9 @@ def _pid_is_live(pid: int) -> bool:
         # os.kill(pid, 0) is not a harmless existence probe on every Windows
         # Python build. Query a minimal process handle instead.
         try:
-            import ctypes
-
-            process_query_limited_information = 0x1000
-            still_active = 259
-            handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
-                process_query_limited_information, False, pid
-            )
-            if not handle:
-                return False
-            try:
-                exit_code = ctypes.c_ulong()
-                if not ctypes.windll.kernel32.GetExitCodeProcess(  # type: ignore[attr-defined]
-                    handle, ctypes.byref(exit_code)
-                ):
-                    return False
-                return exit_code.value == still_active
-            finally:
-                ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
-        except (AttributeError, OSError):
+            api = _windows_process_api()
+            return bool(api is not None and _pid_is_live_windows(pid, api))
+        except (AttributeError, OSError, TypeError, ValueError):
             return False
     try:
         os.kill(pid, 0)
@@ -144,7 +195,7 @@ class BridgeClient:
                     return candidate
             raise BridgeError(f"qrenderdoc instance is not live: {instance_id}")
         if not candidates:
-            raise BridgeError("no live qrenderdoc ReplayLab bridge was found")
+            raise BridgeError("no live qrenderdoc Bread bridge was found")
         loaded = [candidate for candidate in candidates if candidate.capture_loaded]
         return (loaded or candidates)[0]
 

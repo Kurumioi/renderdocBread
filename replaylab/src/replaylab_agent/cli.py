@@ -18,7 +18,11 @@ import contextlib
 import hashlib
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import time
 import threading
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -29,10 +33,57 @@ from .agent_diagnostics import configure_logging, log_exception
 from .agent_registry import CatalogView
 from .bridge import BridgeClient
 from .catalog import PRESETS, get_preset
-from .conversation import NATIVE_PROMPT_WIRE_MAX_BYTES, SUPPORTED_CONVERSATION_SCHEMAS
+from .conversation import (
+    NATIVE_PROMPT_WIRE_MAX_BYTES,
+    SUPPORTED_CONVERSATION_SCHEMAS,
+    parse_conversation_prompt,
+)
 from .deep_engine import DeepAgentsEngine
 from .doctor import run_doctor
 from .engine_config import load_engine_config
+from .agent_asset_readers import (
+    BUILTIN_READERS,
+    MCP_PRESETS,
+    PRESETS as READER_PRESETS,
+    AssetReaderError,
+    default_readers_path,
+    discover_installed_readers,
+    load_readers,
+    reader_contract,
+    registration_from_command,
+    remove_reader,
+    set_reader_enabled,
+    upsert_reader,
+)
+from .builtin_unpackers import (
+    BUILTIN_UNPACKERS,
+    builtin_unpacker,
+    builtin_unpacker_definition,
+    builtin_unpacker_rows,
+    uex_mcp_server_definition,
+)
+from .agent_tool_providers import (
+    CONNECTION_KINDS,
+    ROLES as TOOL_ROLES,
+    ToolConfigError,
+    default_tools_path as tool_providers_path,
+    load_tools as load_tool_providers,
+    migrate_legacy as migrate_tool_providers,
+    remove_tool as remove_tool_provider,
+    runtime_servers,
+    set_tool_enabled as set_tool_provider_enabled,
+    slug as tool_slug,
+    tool_runtime_status,
+    upsert_tool as upsert_tool_provider,
+)
+from .agent_tools_config import (
+    AgentToolsConfig,
+    describe_skills,
+    mcp_server_runtime_status,
+    servers_for_runtime,
+    user_skill_overlay_root,
+    validate_mcp_server,
+)
 from .errors import ConfigurationError, ReplayLabAIError
 from .native_engine import NativeAgentEngine
 from .profiles import Profile, ProfileStore
@@ -43,11 +94,22 @@ from .process_env import (
     remove_cursor_profile_home,
     remove_managed_vendor_profile_home,
 )
-from .skills import INTENT_SKILLS
+from .tool_scope import SUPPORTED_INTENT_KINDS
+from .run_lifetime import capture_gui_owner, run_lifetime, run_until_cancelled
 
 _NATIVE_START_GATE_ENV = "REPLAYLAB_START_GATED"
 _NATIVE_START_GATE_RECORD = b"start\n"
 _MAX_STDERR_BYTES = 64 * 1024
+_CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
+
+
+def _validated_conversation_id(value: str) -> str:
+    """Admit only the stable opaque ids shared with the Host sidecar contract."""
+
+    candidate = str(value or "")
+    if candidate and not _CONVERSATION_ID_RE.fullmatch(candidate):
+        raise ValueError("conversation identity is invalid")
+    return candidate
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -94,17 +156,24 @@ def _add_profile_definition_arguments(
 def _parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(
         prog="replaylab-ai",
-        description="ReplayLab AgentHost",
+        description="Bread AgentHost",
     )
     parser.add_argument("--config", type=Path, help="override profiles.json")
     parser.add_argument("--engine-config", type=Path, help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command", required=True)
 
+    cleanup = commands.add_parser("conversation-cleanup", help="remove one deleted chat's task files")
+    cleanup_target = cleanup.add_mutually_exclusive_group(required=True)
+    cleanup_target.add_argument("--conversation-id", type=_validated_conversation_id)
+    cleanup_target.add_argument("--pending", action="store_true")
+    cleanup.add_argument("--task-id", action="append", default=[])
+    cleanup.add_argument("--json", action="store_true")
+
     run = commands.add_parser("run", help="run one chat or exact Skill request")
     run.add_argument("--profile", default="")
     run.add_argument("--model", default="")
     run.add_argument("--skill", default="")
-    run.add_argument("--intent-kind", choices=tuple(INTENT_SKILLS), default="")
+    run.add_argument("--intent-kind", choices=SUPPORTED_INTENT_KINDS, default="")
     prompt = run.add_mutually_exclusive_group(required=True)
     prompt.add_argument("--prompt")
     prompt.add_argument("--prompt-stdin", action="store_true")
@@ -112,8 +181,16 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--live-context", action="store_true")
     run.add_argument("--instance-id", default="")
     run.add_argument("--task-id", default="")
+    run.add_argument(
+        "--conversation-id",
+        default="",
+        type=_validated_conversation_id,
+        help=argparse.SUPPRESS,
+    )
     run.add_argument("--cancel-file", type=Path)
     run.add_argument("--mcp-host", type=Path)
+    # "@mcp:<id>" in the chat box: enable a configured server for this request only.
+    run.add_argument("--enable-mcp", action="append", default=[])
     run.add_argument("--json", action="store_true")
 
     profile = commands.add_parser("profile", help="manage AI connections")
@@ -190,15 +267,119 @@ def _parser() -> argparse.ArgumentParser:
     test.add_argument("--start-gated", action="store_true", required=True)
     test.add_argument("--json", action="store_true")
 
+    unpacker = commands.add_parser(
+        "unpacker", help="run a bundled unpacker embedded in this executable"
+    )
+    unpacker.add_argument("kind", choices=["unitypy"])
+    unpacker.add_argument("arguments", nargs=argparse.REMAINDER)
+
+    tools = commands.add_parser(
+        "tools", help="manage the Skills and MCP servers offered to every AI connection"
+    )
+    tools.add_argument("--tools-config", type=Path)
+    tools_commands = tools.add_subparsers(dest="tools_command", required=True)
+    tools_commands.add_parser("list")
+    skill_enable = tools_commands.add_parser("skill-enable")
+    skill_enable.add_argument("skill_id")
+    skill_disable = tools_commands.add_parser("skill-disable")
+    skill_disable.add_argument("skill_id")
+    add_root = tools_commands.add_parser("add-skill-root")
+    add_root.add_argument("path", type=Path)
+    remove_root = tools_commands.add_parser("remove-skill-root")
+    remove_root.add_argument("path", type=Path)
+    mcp_set = tools_commands.add_parser("mcp-set")
+    mcp_set.add_argument("--json-stdin", action="store_true")
+    mcp_set.add_argument("--server-json", default="")
+    mcp_remove = tools_commands.add_parser("mcp-remove")
+    mcp_remove.add_argument("server_id")
+    mcp_enable = tools_commands.add_parser("mcp-enable")
+    mcp_enable.add_argument("server_id")
+    mcp_disable = tools_commands.add_parser("mcp-disable")
+    mcp_disable.add_argument("server_id")
+    mcp_test = tools_commands.add_parser("mcp-test")
+    mcp_test.add_argument("server_id")
+    mcp_test.add_argument("--timeout", type=float, default=25.0)
+    skill_show = tools_commands.add_parser("skill-show")
+    skill_show.add_argument("skill_id")
+    skill_write = tools_commands.add_parser("skill-write")
+    skill_write.add_argument("skill_id")
+    skill_write.add_argument("--content-stdin", action="store_true")
+    skill_write.add_argument("--content-file", type=Path)
+    skill_new = tools_commands.add_parser("skill-new")
+    skill_new.add_argument("skill_id")
+    skill_new.add_argument("--title", default="")
+    skill_remove = tools_commands.add_parser("skill-remove")
+    skill_remove.add_argument("skill_id")
+    tools_commands.add_parser("reader-list")
+    tools_commands.add_parser("reader-discover")
+    tools_commands.add_parser("tool-list")
+    tool_add = tools_commands.add_parser("tool-add")
+    tool_add.add_argument("--kind", choices=("mcp-stdio", "mcp-http", "cli"), default="cli")
+    tool_add.add_argument("--name", default="")
+    tool_add.add_argument("--description", default="")
+    tool_add.add_argument("--command", default="")
+    tool_add.add_argument("--arg", action="append", default=[])
+    tool_add.add_argument("--url", default="")
+    tool_add.add_argument("--bearer-env", default="")
+    tool_add.add_argument("--header", action="append", default=[])
+    tool_add.add_argument("--header-env", action="append", default=[])
+    tool_add.add_argument("--env", action="append", default=[])
+    tool_add.add_argument("--role", action="append", default=[])
+    tool_add.add_argument("--id", default="")
+    tool_set = tools_commands.add_parser("tool-set")
+    tool_set.add_argument("--json-stdin", action="store_true")
+    tool_set.add_argument("--tool-json", default="")
+    tool_remove = tools_commands.add_parser("tool-remove")
+    tool_remove.add_argument("tool_id")
+    tool_enable = tools_commands.add_parser("tool-enable")
+    tool_enable.add_argument("tool_id")
+    tool_disable = tools_commands.add_parser("tool-disable")
+    tool_disable.add_argument("tool_id")
+    # Every tools sub-command gets --json from the loop below; adding it here too
+    # would be a duplicate option and argparse refuses the whole parser.
+    tools_commands.add_parser("tool-migrate")
+    tool_detect = tools_commands.add_parser("tool-detect")
+    tool_detect.add_argument("kind")
+    tool_test = tools_commands.add_parser("tool-test")
+    tool_test.add_argument("tool_id")
+    tool_test.add_argument("--timeout", type=float, default=30.0)
+    reader_add = tools_commands.add_parser("reader-add")
+    reader_add.add_argument("command")
+    reader_add.add_argument("--name", default="")
+    reader_add.add_argument("--description", default="")
+    reader_set = tools_commands.add_parser("reader-set")
+    reader_set.add_argument("--json-stdin", action="store_true")
+    reader_set.add_argument("--reader-json", default="")
+    reader_remove = tools_commands.add_parser("reader-remove")
+    reader_remove.add_argument("reader_id")
+    reader_enable = tools_commands.add_parser("reader-enable")
+    reader_enable.add_argument("reader_id")
+    reader_disable = tools_commands.add_parser("reader-disable")
+    reader_disable.add_argument("reader_id")
+    for parser_name in tools_commands.choices.values():
+        parser_name.add_argument("--json", action="store_true")
+
     doctor = commands.add_parser("doctor", help="run offline connection diagnostics")
     doctor.add_argument("--profile", default="")
     doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--jsonl", action="store_true", help="Stream each diagnostic row as it completes")
     doctor.add_argument("--mcp-host", type=Path)
+    doctor.add_argument("--execution-test", action="store_true", help="Run one model + no-effect MCP tool roundtrip")
+    doctor.add_argument("--timeout", type=float, default=120.0)
+    # Point the Skill/MCP configuration somewhere else -- a path that does not exist is
+    # fine and means "no user configuration". The packaging smoke test uses this so it
+    # measures the build it just produced rather than the developer's own machine.
+    doctor.add_argument("--tools-config", type=Path)
     return parser
 
 
 def default_skill_root() -> Path:
     if getattr(sys, "frozen", False):
+        installed = Path(sys.executable).resolve().parent / "skills"
+        if installed.is_dir():
+            # Settings must receive persistent, application-owned paths, not
+            # a one-file extraction directory deleted when this CLI exits.
+            return installed
         bundle_root = getattr(sys, "_MEIPASS", "")
         if bundle_root:
             return Path(bundle_root) / ".agents" / "skills"
@@ -209,8 +390,16 @@ def _load_store(path: Path | None) -> ProfileStore:
     return ProfileStore(path).load()
 
 
-def _catalog() -> CatalogView:
-    return CatalogView.load(skill_roots=[default_skill_root()])
+def _tools_config(path: Path | None = None) -> AgentToolsConfig:
+    return AgentToolsConfig.load(path)
+
+
+def _catalog(tools: AgentToolsConfig | None = None) -> CatalogView:
+    """Every route loads the same catalog: bundled Skills plus the user's folders."""
+
+    config = tools if tools is not None else _tools_config()
+    catalog = CatalogView.load(skill_roots=config.skill_root_list(default_skill_root()))
+    return config.filter_catalog(catalog)
 
 
 def _parse_options(values: list[str]) -> dict[str, Any]:
@@ -441,19 +630,32 @@ def _profile_command(
         if args.id not in store.profiles:
             raise ValueError(f"unknown profile: {args.id}")
         removed = store.profiles[args.id]
-        _remove_provider_state(removed)
+        # Removing a connection must not depend on deleting optional vendor
+        # cache/login files, which may be held by another application instance.
+        cleanup_warnings = []
         if (
             credential_store is not None
             and credential_store.supported
             and removed.provider.kind == "model"
             and removed.provider.auth == "api-key"
         ):
-            credential_store.delete(removed.id)
+            try:
+                credential_store.delete(removed.id)
+            except (OSError, ConfigurationError) as error:
+                cleanup_warnings.append(type(error).__name__ + ": saved credential retained")
         del store.profiles[removed.id]
         if store.active_profile == removed.id:
             store.active_profile = sorted(store.profiles)[0] if store.profiles else ""
         store.save()
+        try:
+            from .provider_lease import profile_lease
+            with profile_lease(store.path, removed.id, cleanup=True):
+                _remove_provider_state(removed)
+        except (OSError, ConfigurationError) as error:
+            cleanup_warnings.append(type(error).__name__ + ": local provider state retained")
         payload = {"removed": removed.id, "activeProfile": store.active_profile}
+        if cleanup_warnings:
+            payload["cleanupWarnings"] = cleanup_warnings
         if args.json:
             _print_machine_json(payload)
         else:
@@ -762,9 +964,24 @@ async def _test_model_command(args: argparse.Namespace, store: ProfileStore) -> 
             authentication_method=tested.provider.acp_auth_method,
             provider_id=tested.preset,
         )
-        await connector.test_model()
+        outcome = await connector.test_model(model=model)
         payload["ok"] = True
-        payload["message"] = f"Model '{shown}' responded successfully."
+        if outcome.get("modelUnverified"):
+            # The agent named no model, so this proves it generates -- not that it
+            # generated with the id under test. Claiming the latter is how a
+            # plan-restricted model passes here and fails on the first real task.
+            payload["message"] = (
+                f"The agent responded, but it does not report which model it used, "
+                f"so '{shown}' could not be confirmed. It is chosen in that agent's "
+                f"own configuration.")
+        elif outcome.get("probeModelDiffers"):
+            payload["message"] = (
+                f"The agent responded, using '{outcome.get('model')}'. This check does "
+                f"not select a model, so '{shown}' is applied only on a real run; if "
+                f"that id is wrong the run will say so.")
+        else:
+            payload["message"] = (
+                f"Model '{outcome.get('model') or shown}' responded successfully.")
     except Exception as exc:  # user-requested connection diagnostic
         payload["message"] = f"Model test failed for '{shown}'."
         payload["diagnostic"] = str(exc)
@@ -1124,26 +1341,51 @@ async def _wait_for_run_cancellation(path: Path) -> None:
 
 
 async def _run_once(args: argparse.Namespace, store: ProfileStore) -> int:
+    owner = None
+    try:
+        owner = capture_gui_owner(args)
+    except OSError as error:
+        # A failed access/query must not be interpreted as GUI process death.
+        configure_logging().warning("GUI owner monitor unavailable: %s", error)
+    with run_lifetime(owner):
+        return await _run_once_owned(args, store)
+
+
+async def _run_once_owned(args: argparse.Namespace, store: ProfileStore) -> int:
     log = configure_logging()
     profile = _selected_profile(store, args.profile)
     profile.validate()
     model = profile.resolve_model(args.model)
     context, instance_id, capture_path = _read_context(args)
     prompt = _read_prompt(args)
+    envelope_conversation_id = _validated_conversation_id(
+        parse_conversation_prompt(prompt).conversation_id
+    )
+    explicit_conversation_id = _validated_conversation_id(
+        getattr(args, "conversation_id", "")
+    )
+    if (
+        explicit_conversation_id
+        and envelope_conversation_id
+        and explicit_conversation_id != envelope_conversation_id
+    ):
+        raise ValueError(
+            "conversation identity conflicts with the typed conversation envelope"
+        )
+    conversation_id = explicit_conversation_id or envelope_conversation_id
     intent: dict[str, Any] | None = None
     if args.intent_kind:
         if not context or not instance_id:
             raise ValueError("--intent-kind requires frozen context and --instance-id")
-        expected_skill = INTENT_SKILLS[args.intent_kind]
-        if args.skill and args.skill != expected_skill:
-            raise ValueError(
-                f"--intent-kind {args.intent_kind} requires --skill {expected_skill}"
-            )
         intent = {"kind": args.intent_kind, "arguments": {}}
 
-    catalog = _catalog()
+    _sync_bundled_unpackers_quietly()
+    tools_config = _tools_config()
+    catalog = _catalog(tools_config)
     for diagnostic in catalog.diagnostics:
         log.warning("catalog: %s", diagnostic)
+    for diagnostic in tools_config.diagnostics:
+        log.warning("tool configuration: %s", diagnostic)
     request = RunRequest(
         prompt=prompt,
         profile=profile,
@@ -1152,11 +1394,86 @@ async def _run_once(args: argparse.Namespace, store: ProfileStore) -> int:
         context=context,
         instance_id=instance_id,
         capture_path=capture_path,
+        conversation_id=conversation_id,
         intent=intent,
         skill_name=args.skill,
         mcp_executable=args.mcp_host,
     )
     config = load_engine_config(args.engine_config)
+    # Both engines see the same Skill roots and the same user MCP servers.
+    config.skill_roots = tools_config.skill_root_list(default_skill_root())
+    config.disabled_skills = tuple(sorted(set(tools_config.disabled_skills + tools_config.desktop_disabled_skill_ids)))
+    config.inherit_desktop_capabilities = tools_config.inherit_desktop_capabilities
+    config.native_shell_enabled = tools_config.native_shell_enabled
+    config.declared_mcp_ids = tuple(server.id for server in tools_config.mcp_servers)
+    config.disabled_skill_paths = tools_config.runtime_disabled_skill_paths
+    requested = {str(item).strip().lower() for item in getattr(args, "enable_mcp", []) if str(item).strip()}
+    selected = []
+    for server in tools_config.mcp_servers:
+        if not (server.enabled or server.id in requested):
+            continue
+        available, reason = mcp_server_runtime_status(
+            server, respect_enabled=server.id not in requested
+        )
+        if not available:
+            log.warning("MCP server %s is hidden for this task: %s", server.id, reason)
+            continue
+        selected.append(server)
+    missing = requested - {server.id for server in tools_config.mcp_servers}
+    for server_id in sorted(missing):
+        log.warning("requested MCP server is not configured: %s", server_id)
+    attached = list(servers_for_runtime(selected))
+    known = {str(server.get("id", "")).lower() for server in attached}
+    # Tools registered in the unified list are attached the same way; a legacy entry
+    # with the same id wins so a half-finished migration cannot double-start a server.
+    registered_tools, tool_diagnostics = load_tool_providers()
+    for diagnostic in tool_diagnostics:
+        log.warning("tool configuration: %s", diagnostic)
+    for tool in registered_tools:
+        available, reason = tool_runtime_status(tool)
+        if tool.get("enabled", True) and not available:
+            log.warning(
+                "registered tool %s is hidden for this task: %s",
+                tool.get("id"), reason,
+            )
+    for server in runtime_servers(registered_tools):
+        if str(server.get("id", "")).lower() in known:
+            continue
+        if requested and server["id"] not in requested and not server.get("enabled", True):
+            continue
+        attached.append(server)
+    if config.inherit_desktop_capabilities:
+        from .desktop_capabilities import discover_desktop_capabilities
+        desktop = discover_desktop_capabilities()
+        config.desktop_capability_summary = desktop.summary()
+        from .desktop_capabilities import native_execution_policy
+        config.native_shell_enabled, execution_reason = native_execution_policy(
+            config.native_shell_enabled, desktop.config, profile.options)
+        config.desktop_capability_summary["nativeShell"] = {"enabled": config.native_shell_enabled, "reason": execution_reason}
+        for diagnostic in desktop.diagnostics:
+            log.warning("desktop integration: %s", diagnostic)
+        # Codex loads these directly so provider-side approval rules remain in
+        # force. API/ACP use the same optional services through Bread's bridge.
+        if profile.preset != "codex" or profile.provider.kind != "agent":
+            declared = {server.id for server in tools_config.mcp_servers}
+            declared.update(str(server.get("id", "")).lower() for server in attached)
+            attached.extend(server for server in desktop.servers if server["id"] not in declared)
+    config.external_mcp_servers = tuple(attached)
+    if not config.inherit_desktop_capabilities:
+        from .desktop_capabilities import native_execution_policy
+        config.native_shell_enabled, _ = native_execution_policy(config.native_shell_enabled, {}, profile.options)
+    from .portable_capabilities import server_definition, provider_servers
+    portable = server_definition(execution_enabled=config.native_shell_enabled)
+    if portable and portable["id"] not in {s.get("id") for s in attached}:
+        config.external_mcp_servers += (portable,)
+    configured = {str(item.get("id")) for item in config.external_mcp_servers}
+    excluded = {server.id for server in tools_config.mcp_servers}
+    provider_policies = {}
+    if config.inherit_desktop_capabilities:
+        excluded.update(item["name"] for item in desktop.server_status if item.get("status") == "disabled")
+        provider_policies = {item["id"]: item["approvalRules"] for item in desktop.servers if "approvalRules" in item}
+    config.external_mcp_servers += tuple(item for item in provider_servers(excluded_ids=excluded, policies=provider_policies)
+                                         if item["id"] not in configured)
     engine: Any
     if profile.provider.kind == "model":
         engine = DeepAgentsEngine(catalog=catalog, config=config)
@@ -1166,29 +1483,14 @@ async def _run_once(args: argparse.Namespace, store: ProfileStore) -> int:
         raise ConfigurationError(f"unsupported profile kind '{profile.provider.kind}'")
 
     cancel_path = args.cancel_file
-    if cancel_path is None:
-        result = await engine.run(request)
-    else:
-        run_task = asyncio.create_task(engine.run(request))
-        cancel_task = asyncio.create_task(_wait_for_run_cancellation(cancel_path))
-        try:
-            done, _ = await asyncio.wait(
-                {run_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-            if cancel_task in done and not run_task.done():
-                try:
-                    cancel_task.result()
-                except Exception as exc:
-                    # A local watcher failure is not a cancellation request and
-                    # must never abort a provider process on its own.
-                    log.warning("run cancellation watcher failed: %s", exc)
-                else:
-                    run_task.cancel()
-            result = await run_task
-        finally:
-            if not cancel_task.done():
-                cancel_task.cancel()
-            await asyncio.gather(cancel_task, return_exceptions=True)
+    try:
+        result = await run_until_cancelled(
+            engine.run(request),
+            cancel_waiter=_wait_for_run_cancellation(cancel_path) if cancel_path is not None else None,
+            log=log,
+        )
+    finally:
+        if cancel_path is not None:
             with contextlib.suppress(OSError):
                 cancel_path.unlink(missing_ok=True)
     if args.json:
@@ -1267,12 +1569,49 @@ def _consume_native_start_gate(args: argparse.Namespace) -> None:
 
 
 def _doctor_command(args: argparse.Namespace, store: ProfileStore) -> int:
+    from .doctor import DoctorCheck
+    streaming = bool(getattr(args, "jsonl", False))
+    next_index = 0
+    def payload(check):
+        return {"name": check.name, "status": check.status, "detail": check.detail,
+                "messageId": check.message_id, "messageArgs": list(check.message_args)}
+    def emit(check, *, pending=False):
+        nonlocal next_index
+        if streaming:
+            print(json.dumps({"type": "check", "index": next_index, "check": payload(check)},
+                             ensure_ascii=False, separators=(",", ":")), flush=True)
+        if not pending:
+            next_index += 1
     profile = _selected_profile(store, args.profile)
-    checks = run_doctor(profile, _catalog(), mcp_executable=args.mcp_host)
-    if args.json:
+    catalog = _catalog(_tools_config(getattr(args, "tools_config", None)))
+    checks = list(run_doctor(profile, catalog, mcp_executable=args.mcp_host, progress_callback=emit))
+    if getattr(args, "execution_test", False):
+        from .connection_readiness import run_execution_check, check_portable_tools, check_host_tools
+        from .portable_capabilities import manifest as optional_capabilities
+        local_checks = [("bread-host-execution", lambda: check_host_tools(args.mcp_host))]
+        if optional_capabilities() and optional_capabilities().get("features", {}).get("portableTools", True):
+            local_checks.insert(0, ("portable-tool-execution", check_portable_tools))
+        for name, operation in local_checks:
+            emit(DoctorCheck(name, "running", "Checking connection", "connection.check-running"), pending=True)
+            check = asyncio.run(operation())
+            checks.append(check)
+            emit(check)
+        # Check independent local tools even when provider authentication is
+        # missing. A known provider configuration error must not spend quota.
+        if not any(check.status == "error" for check in checks
+                   if check.name not in {"portable-tool-execution", "bread-host-execution", "model-context", "model-context-enabled"}):
+            emit(DoctorCheck("model-tool-execution", "running", "Checking connection", "connection.check-running"), pending=True)
+            for check in asyncio.run(run_execution_check(profile, timeout=args.timeout)):
+                checks.append(check)
+                emit(check)
+    if streaming:
+        print(json.dumps({"type": "complete", "checks": [payload(check) for check in checks]},
+                         ensure_ascii=False, separators=(",", ":")), flush=True)
+    elif args.json:
         _print_machine_json(
             [
-                {"name": check.name, "status": check.status, "detail": check.detail}
+                {"name": check.name, "status": check.status, "detail": check.detail,
+                 "messageId": check.message_id, "messageArgs": list(check.message_args)}
                 for check in checks
             ]
         )
@@ -1280,6 +1619,656 @@ def _doctor_command(args: argparse.Namespace, store: ProfileStore) -> int:
         for check in checks:
             print(f"[{check.status.upper():7}] {check.name}: {check.detail}")
     return 1 if any(check.status == "error" for check in checks) else 0
+
+
+# The loader's own rule (skills._NAME_RE): an id this accepts is one the loader
+# admits, so "new Skill" cannot create a folder the next task quarantines.
+_SKILL_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _pairs(entries: list[str], label: str) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    for entry in entries:
+        name, separator, value = str(entry).partition("=")
+        if not separator or not name.strip():
+            raise ConfigurationError(f"{label} must be given as NAME=value")
+        resolved[name.strip()] = value.strip()
+    return resolved
+
+
+def _tool_from_arguments(args: Any) -> dict[str, Any]:
+    """Build one tool registration from the command line Settings uses.
+
+    Only the connection is taken here. The interface is discovered by the Host against
+    real assets and written back, so there is nothing else for a person to fill in.
+    """
+
+    kind = str(getattr(args, "kind", "cli"))
+    connection: dict[str, Any] = {"kind": kind}
+    if kind == "mcp-http":
+        connection["url"] = str(getattr(args, "url", "") or "").strip()
+        connection["bearerEnv"] = str(getattr(args, "bearer_env", "") or "").strip()
+        connection["headers"] = _pairs(list(getattr(args, "header", []) or []), "--header")
+        connection["headerEnv"] = _pairs(list(getattr(args, "header_env", []) or []),
+                                         "--header-env")
+        display = str(getattr(args, "name", "") or "") or connection["url"]
+    else:
+        connection["command"] = str(getattr(args, "command", "") or "").strip()
+        connection["args"] = [str(item) for item in (getattr(args, "arg", []) or [])]
+        connection["env"] = _pairs(list(getattr(args, "env", []) or []), "--env")
+        display = str(getattr(args, "name", "") or "") or Path(connection["command"]).stem
+    roles = [str(role) for role in (getattr(args, "role", []) or [])]
+    if not roles:
+        # A command-line tool is registered because it reads assets; an MCP server is
+        # registered because its tools are wanted during a task. Both can be widened.
+        roles = ["asset-reader"] if kind == "cli" else ["general"]
+    identifier = str(getattr(args, "id", "") or "") or tool_slug(display)
+    definition = {
+        "id": identifier,
+        "title": display or identifier,
+        "description": str(getattr(args, "description", "") or ""),
+        "enabled": True,
+        "roles": roles,
+        "connection": connection,
+    }
+    try:
+        return dict(definition)
+    except ToolConfigError as error:  # pragma: no cover - defensive
+        raise ConfigurationError(str(error)) from error
+
+
+def _skill_row(config: AgentToolsConfig, skill_id: str) -> dict[str, Any]:
+    """The catalog row for one Skill, or a clear error naming what was searched."""
+
+    identifier = str(skill_id or "").strip()
+    catalog = CatalogView.load(skill_roots=config.skill_root_list(default_skill_root()))
+    for row in describe_skills(catalog, config, default_skill_root()):
+        if row["id"] == identifier:
+            return row
+    raise ConfigurationError(f"unknown Skill id: {identifier or '(empty)'}")
+
+
+def _skill_show(config: AgentToolsConfig, skill_id: str) -> dict[str, Any]:
+    """Read one SKILL.md so Settings can show and edit exactly what the AI loads."""
+
+    row = _skill_row(config, skill_id)
+    document = Path(row["path"] or "")
+    try:
+        content = document.read_text(encoding="utf-8")
+    except (OSError, ValueError) as error:
+        raise ConfigurationError(f"cannot read {document}: {error}") from error
+    overlay = user_skill_overlay_root(config.path)
+    return {
+        "schema": "replaylab-agent-skill-document/v1",
+        "id": row["id"],
+        "title": row["title"],
+        "source": row["source"],
+        "path": str(document),
+        "content": content,
+        # A bundled Skill is replaced by the next install, so an edit is written to
+        # the user overlay instead and that copy wins from then on.
+        "writePath": str(document) if row["source"] == "user" else str(
+            overlay / row["id"] / "SKILL.md"),
+        "copyOnWrite": row["source"] != "user",
+        "overlayRoot": str(overlay),
+    }
+
+
+def _write_skill_document(config: AgentToolsConfig, row: dict[str, Any], content: str,
+                          config_path: Path | None) -> dict[str, Any]:
+    """Write SKILL.md, copying a bundled Skill into the user overlay first."""
+
+    if not content.strip():
+        raise ConfigurationError("a Skill document cannot be empty")
+    if len(content.encode("utf-8")) > 512 * 1024:
+        raise ConfigurationError("a Skill document must be under 512 KiB")
+    overlay = user_skill_overlay_root(config.path or config_path)
+    copy_on_write = row["source"] != "user"
+    target = Path(row["path"]) if not copy_on_write else overlay / row["id"] / "SKILL.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    os.replace(temporary, target)
+    registered = False
+    if copy_on_write and overlay not in config.skill_roots:
+        config.add_skill_root(overlay)
+        config.save(config_path)
+        registered = True
+    return {
+        "id": row["id"],
+        "path": str(target),
+        "copiedToOverlay": copy_on_write,
+        "overlayRoot": str(overlay),
+        "registeredOverlayRoot": registered,
+        "bytes": len(content.encode("utf-8")),
+    }
+
+
+def _skill_write(config: AgentToolsConfig, args: Any, config_path: Path | None) -> dict[str, Any]:
+    if getattr(args, "content_stdin", False):
+        content = sys.stdin.read()
+    elif getattr(args, "content_file", None):
+        try:
+            content = Path(args.content_file).read_text(encoding="utf-8")
+        except (OSError, ValueError) as error:
+            raise ConfigurationError(f"cannot read {args.content_file}: {error}") from error
+    else:
+        raise ConfigurationError("pass --content-stdin or --content-file")
+    return _write_skill_document(config, _skill_row(config, args.skill_id), content, config_path)
+
+
+# Quoted: a purely numeric id ("2") is an integer to YAML when bare, and the
+# loader then quarantines the Skill as "name must be a string".
+_SKILL_TEMPLATE = """---
+name: "{identifier}"
+title: "{title}"
+description: >-
+  One sentence saying when Bread AI should load this Skill. The catalog line
+  is what the model reads before choosing, so name the situation, not the tool.
+version: 1
+---
+
+# {title}
+
+## When this applies
+
+Describe the request this Skill answers.
+
+## Procedure
+
+1. State the first step in terms of evidence to gather.
+2. Name the Host tools to call and what their result must show.
+3. Say what a finished answer contains.
+
+## Do not
+
+* Do not guess where the capture can be read.
+"""
+
+
+def _skill_new(config: AgentToolsConfig, args: Any, config_path: Path | None) -> dict[str, Any]:
+    """Create an empty Skill in the user overlay, ready to edit in Settings."""
+
+    identifier = str(args.skill_id or "").strip().lower()
+    if not _SKILL_ID_RE.fullmatch(identifier) or len(identifier) > 96:
+        raise ConfigurationError(
+            "a Skill id must be lower-case words of letters and digits joined by "
+            "single hyphens, for example 'ue-hair-passes'")
+    overlay = user_skill_overlay_root(config.path or config_path)
+    target = overlay / identifier / "SKILL.md"
+    if target.exists():
+        raise ConfigurationError(f"a Skill already exists at {target}")
+    title = str(getattr(args, "title", "") or "").strip() or identifier.replace("-", " ").title()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_SKILL_TEMPLATE.format(identifier=identifier, title=title), encoding="utf-8")
+    registered = False
+    if overlay not in config.skill_roots:
+        config.add_skill_root(overlay)
+        config.save(config_path)
+        registered = True
+    return {
+        "id": identifier,
+        "path": str(target),
+        "overlayRoot": str(overlay),
+        "registeredOverlayRoot": registered,
+    }
+
+
+def _skill_remove(config: AgentToolsConfig, skill_id: str,
+                  config_path: Path | None) -> dict[str, Any]:
+    """Delete one Skill the user made, and only one.
+
+    Removing a Skill folder used to be the only way out of Settings, which takes
+    every Skill in that folder with it. This deletes exactly the Skill named, and
+    refuses anything shipped with RenderDoc — the installer owns those.
+    """
+
+    row = _skill_row(config, skill_id)
+    if row["source"] != "user":
+        raise ConfigurationError(
+            f"{row['id']} is installed with RenderDoc; disable it instead of deleting it")
+    document = Path(row["path"] or "")
+    folder = document.parent
+    root = Path(row.get("root") or folder.parent)
+    # Refuse anything that is not <registered root>/<skill>/SKILL.md: a Skill is a
+    # folder we created, never a directory the user pointed us at.
+    try:
+        relative = folder.relative_to(root)
+    except (ValueError, OSError) as error:
+        raise ConfigurationError(f"{document} is not inside a registered Skill folder") from error
+    if len(relative.parts) != 1 or document.name != "SKILL.md":
+        raise ConfigurationError(f"refusing to delete an unexpected layout at {folder}")
+    removed: list[str] = []
+    try:
+        for entry in sorted(folder.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+            if entry.is_file() or entry.is_symlink():
+                entry.unlink()
+                removed.append(str(entry))
+            elif entry.is_dir():
+                entry.rmdir()
+        folder.rmdir()
+    except OSError as error:
+        raise ConfigurationError(f"could not delete {folder}: {error}") from error
+    # An overlay root with nothing left in it is clutter in the folder list.
+    unregistered = False
+    overlay = user_skill_overlay_root(config.path or config_path)
+    if root == overlay and not any(root.glob("*/SKILL.md")):
+        if config.remove_skill_root(root):
+            config.save(config_path)
+            unregistered = True
+    return {
+        "id": row["id"],
+        "deleted": str(folder),
+        "files": removed,
+        "unregisteredRoot": str(root) if unregistered else "",
+    }
+
+
+def _tool_test(tool_id: str, timeout: float) -> dict[str, Any]:
+    """Start one registered tool and report whether it actually answers.
+
+    A configured tool is not a working tool, and the difference is worth one button.
+    An MCP server is initialised and its operations counted; a command line is checked
+    for existence and asked for its help. Nothing is written either way.
+    """
+
+    identifier = str(tool_id or "").strip().lower()
+    registered, _ = load_tool_providers()
+    tool = next((item for item in registered if item["id"] == identifier), None)
+    if tool is None:
+        raise ConfigurationError(f"unknown tool id: {identifier or '(empty)'}")
+    connection = tool["connection"]
+    kind = str(connection.get("kind", ""))
+    bounded = max(1.0, min(float(timeout), 120.0))
+    started = time.monotonic()
+    if kind == "mcp-stdio":
+        from .acp_session import _diagnose_local_mcp_route
+
+        report = asyncio.run(_diagnose_local_mcp_route(
+            str(connection.get("command", "")), connection.get("args", ()),
+            connection.get("env", {}), cwd=Path.cwd(), timeout=bounded))
+        return {"schema": "replaylab-agent-tool-test/v1", "tool": identifier,
+                "connection": kind, "ok": bool(report.get("ok")),
+                "operations": int(report.get("tools") or 0),
+                "seconds": round(float(report.get("seconds") or 0.0), 2),
+                "error": str(report.get("error") or "")}
+    if kind == "mcp-http":
+        report = asyncio.run(_diagnose_http_mcp_route(connection, timeout=bounded))
+        return {"schema": "replaylab-agent-tool-test/v1", "tool": identifier,
+                "connection": kind, "ok": bool(report.get("ok")),
+                "operations": int(report.get("tools") or 0),
+                "seconds": round(float(report.get("seconds") or 0.0), 2),
+                "error": str(report.get("error") or "")}
+    command = str(connection.get("command", ""))
+    resolved = shutil.which(command) or command
+    if not Path(resolved).is_file():
+        return {"schema": "replaylab-agent-tool-test/v1", "tool": identifier, "connection": kind,
+                "ok": False, "operations": 0, "seconds": 0.0,
+                "error": f"no such program: {command}"}
+    try:
+        completed = subprocess.run([resolved, "--help"], capture_output=True,
+                                   timeout=min(bounded, 20.0), check=False,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        output = (completed.stdout + b"\n" + completed.stderr).decode("utf-8", "replace").strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"schema": "replaylab-agent-tool-test/v1", "tool": identifier, "connection": kind,
+                "ok": False, "operations": 0,
+                "seconds": round(time.monotonic() - started, 2), "error": str(error)[:400]}
+    return {"schema": "replaylab-agent-tool-test/v1", "tool": identifier, "connection": kind,
+            "ok": bool(output), "operations": 0,
+            "seconds": round(time.monotonic() - started, 2),
+            "helpText": output[:2000],
+            "error": "" if output else "the program produced no output"}
+
+
+async def _diagnose_http_mcp_route(connection: Any, *, timeout: float) -> dict[str, Any]:
+    """Initialise a streamable-HTTP MCP server once and count its operations."""
+
+    import os
+    import time as _time
+
+    started = _time.monotonic()
+    try:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+    except ImportError as error:
+        return {"ok": False, "tools": 0, "seconds": 0.0,
+                "error": f"this MCP runtime has no streamable HTTP client: {error}"}
+    headers = {str(k): str(v) for k, v in (connection.get("headers") or {}).items()}
+    for name, variable in (connection.get("headerEnv") or {}).items():
+        value = os.environ.get(str(variable), "")
+        if value:
+            headers[str(name)] = value
+    bearer = os.environ.get(str(connection.get("bearerEnv") or ""), "")
+    if bearer:
+        headers["Authorization"] = "Bearer %s" % bearer
+    try:
+        async with streamablehttp_client(str(connection.get("url", "")),
+                                         headers=headers or None) as opened:
+            async with ClientSession(*opened[:2]) as session:
+                await asyncio.wait_for(session.initialize(), timeout=timeout)
+                listing = await asyncio.wait_for(session.list_tools(), timeout=timeout)
+    except BaseException as error:  # noqa: BLE001 - a failure to reach it is the answer
+        return {"ok": False, "tools": 0, "seconds": _time.monotonic() - started,
+                "error": _flatten_tool_error(error)}
+    return {"ok": True, "tools": len(list(getattr(listing, "tools", ()) or ())),
+            "seconds": _time.monotonic() - started, "error": ""}
+
+
+def _flatten_tool_error(error: BaseException) -> str:
+    nested = getattr(error, "exceptions", None)
+    if nested:
+        return "; ".join(_flatten_tool_error(item) for item in nested)
+    text = str(error).strip()
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+
+def _mcp_test(config: AgentToolsConfig, server_id: str, timeout: float) -> dict[str, Any]:
+    """Start one configured MCP server and report initialize + tools/list.
+
+    A server that is configured is not a server that runs: this is the button
+    that says so before a task depends on it.
+    """
+
+    identifier = str(server_id or "").strip().lower()
+    server = next((item for item in config.mcp_servers if item.id == identifier), None)
+    if server is None:
+        raise ConfigurationError(f"unknown MCP server id: {identifier or '(empty)'}")
+    if server.transport != "stdio" or not server.command:
+        return {
+            "server": identifier,
+            "ok": False,
+            "tools": 0,
+            "error": "only stdio servers with a command can be tested from here",
+        }
+    from .acp_session import _diagnose_local_mcp_route
+
+    report = asyncio.run(
+        _diagnose_local_mcp_route(
+            server.command,
+            server.args,
+            server.env,
+            cwd=Path.cwd(),
+            timeout=max(1.0, min(float(timeout), 120.0)),
+        )
+    )
+    return {
+        "schema": "replaylab-agent-mcp-test/v1",
+        "server": identifier,
+        "title": server.title or identifier,
+        "ok": bool(report.get("ok")),
+        "tools": int(report.get("tools") or 0),
+        "seconds": round(float(report.get("seconds") or 0.0), 2),
+        "error": str(report.get("error") or ""),
+    }
+
+
+def _sync_bundled_unpackers_quietly() -> dict[str, Any] | None:
+    """Register the unpackers shipped with this installation; never fail a command for it."""
+
+    try:
+        from .builtin_unpackers import sync_bundled_unpackers
+
+        return sync_bundled_unpackers()
+    except Exception as error:  # noqa: BLE001 - bundled tools are a convenience
+        import logging
+
+        logging.getLogger("replaylab_agent").warning("bundled unpackers: %s", error)
+        return None
+
+
+def _unpacker_command(args: Any) -> int:
+    """Run a reader embedded in this executable (``unpacker unitypy describe <file>``).
+
+    The UnityPy reader ships as source inside the AgentHost so a deployed copy
+    needs no separate Python: the bundled recipe points at this executable.
+    """
+
+    if args.kind == "unitypy":
+        from .unitypy_reader_script import SCRIPT
+
+        arguments = [item for item in list(args.arguments or []) if item != "--"]
+        saved = sys.argv
+        try:
+            sys.argv = ["unitypy_reader.py", *arguments]
+            code = compile(SCRIPT, "unitypy_reader.py", "exec")
+            namespace: dict[str, Any] = {"__name__": "__main__"}
+            try:
+                exec(code, namespace)  # noqa: S102 - our own bundled reader source
+            except SystemExit as exc:
+                return int(exc.code or 0) if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+            return 0
+        finally:
+            sys.argv = saved
+    raise AssertionError(args.kind)
+
+
+def _tools_command(args: Any) -> int:
+    """Read and edit the Skill/MCP menu that every AI connection is offered."""
+
+    path = getattr(args, "tools_config", None)
+    config = _tools_config(path)
+    command = args.tools_command
+    changed = False
+    result: dict[str, Any]
+    if command in {"tool-list", "tool-set", "tool-detect", "list"}:
+        _sync_bundled_unpackers_quietly()
+    if command == "list":
+        catalog = CatalogView.load(skill_roots=config.skill_root_list(default_skill_root()))
+        result = {
+            "schema": "replaylab-agent-tools-view/v1",
+            "path": str(config.path or ""),
+            "skillRoots": [str(root) for root in config.skill_roots],
+            "bundledSkillRoot": str(default_skill_root()),
+            "skills": describe_skills(catalog, config, default_skill_root()),
+            "mcpServers": [server.to_dict() for server in config.mcp_servers],
+            "mcpPresets": [dict(item) for item in MCP_PRESETS],
+            "diagnostics": list(config.diagnostics) + list(catalog.diagnostics),
+            "inheritDesktopCapabilities": config.inherit_desktop_capabilities,
+            "nativeShellEnabled": config.native_shell_enabled,
+        }
+        if config.inherit_desktop_capabilities:
+            from .desktop_capabilities import discover_desktop_capabilities
+            result["desktopCapabilities"] = discover_desktop_capabilities().summary()
+    elif command in {"skill-enable", "skill-disable"}:
+        config.set_skill_enabled(args.skill_id, command == "skill-enable")
+        changed = True
+        result = {"skill": args.skill_id, "enabled": command == "skill-enable"}
+    elif command == "add-skill-root":
+        config.add_skill_root(args.path)
+        changed = True
+        result = {"skillRoots": [str(root) for root in config.skill_roots]}
+    elif command == "remove-skill-root":
+        removed = config.remove_skill_root(args.path)
+        changed = removed
+        result = {"removed": removed, "skillRoots": [str(root) for root in config.skill_roots]}
+    elif command == "mcp-set":
+        raw = sys.stdin.read() if args.json_stdin else str(args.server_json or "")
+        try:
+            payload = json.loads(raw or "{}")
+        except ValueError as error:
+            raise ConfigurationError("MCP server definition must be JSON") from error
+        if not isinstance(payload, dict):
+            raise ConfigurationError("MCP server definition must be a JSON object")
+        server = config.upsert_mcp_server(payload)
+        changed = True
+        result = {"server": server.to_dict()}
+    elif command == "mcp-remove":
+        removed = config.remove_mcp_server(args.server_id)
+        changed = removed
+        result = {"removed": removed, "server": args.server_id}
+    elif command in {"mcp-enable", "mcp-disable"}:
+        found = config.set_mcp_enabled(args.server_id, command == "mcp-enable")
+        if not found:
+            raise ConfigurationError(f"unknown MCP server id: {args.server_id}")
+        changed = True
+        result = {"server": args.server_id, "enabled": command == "mcp-enable"}
+    elif command == "mcp-test":
+        result = _mcp_test(config, args.server_id, float(getattr(args, "timeout", 25.0)))
+    elif command == "skill-show":
+        result = _skill_show(config, args.skill_id)
+    elif command == "skill-write":
+        result = _skill_write(config, args, path)
+    elif command == "skill-new":
+        result = _skill_new(config, args, path)
+    elif command == "skill-remove":
+        result = _skill_remove(config, args.skill_id, path)
+    elif command == "reader-list":
+        readers, diagnostics = load_readers()
+        result = {
+            "schema": "replaylab-agent-reader-view/v1",
+            "path": str(default_readers_path()),
+            "readers": readers,
+            "builtins": [dict(item) for item in BUILTIN_READERS],
+            "diagnostics": diagnostics,
+            "contract": reader_contract(),
+        }
+    elif command == "reader-discover":
+        found = discover_installed_readers()
+        registered = {str(item.get("command", "")).lower() for item in load_readers()[0]}
+        for item in found:
+            item["alreadyRegistered"] = item["command"].lower() in registered
+        result = {"schema": "replaylab-agent-reader-discovery/v1", "candidates": found}
+    elif command == "reader-set":
+        raw = sys.stdin.read() if args.json_stdin else str(args.reader_json or "")
+        try:
+            payload = json.loads(raw or "{}")
+        except ValueError as error:
+            raise ConfigurationError("asset reader definition must be JSON") from error
+        if not isinstance(payload, dict):
+            raise ConfigurationError("asset reader definition must be a JSON object")
+        try:
+            reader = upsert_reader(payload)
+        except AssetReaderError as error:
+            raise ConfigurationError(str(error)) from error
+        result = {"reader": reader, "path": str(default_readers_path())}
+    elif command == "tool-list":
+        registered, diagnostics = load_tool_providers()
+        result = {
+            "schema": "replaylab-agent-tool-view/v1",
+            "path": str(tool_providers_path()),
+            "tools": registered,
+            # Servers from agent-tools.json (what the AI registers through
+            # update_bread_configuration) ride along so the Settings list that
+            # is rebuilt from this one answer shows them with the same switch.
+            "mcpServers": [server.to_dict() for server in config.mcp_servers],
+            "diagnostics": diagnostics,
+            "builtinReaders": [dict(item) for item in BUILTIN_READERS],
+            # Every unpacker Bread AI ships a recipe for, configured or not: the
+            # Settings list shows them all, and the dialog opens on the kind.
+            "builtinUnpackers": builtin_unpacker_rows(registered),
+            "presets": {"mcp": [dict(item) for item in MCP_PRESETS],
+                        "commandLine": [dict(item) for item in READER_PRESETS]},
+            "connectionKinds": list(CONNECTION_KINDS),
+            "roles": list(TOOL_ROLES),
+        }
+    elif command == "tool-add":
+        try:
+            result = {"tool": upsert_tool_provider(_tool_from_arguments(args)),
+                      "path": str(tool_providers_path())}
+        except ToolConfigError as error:
+            raise ConfigurationError(str(error)) from error
+    elif command == "tool-set":
+        raw = sys.stdin.read() if args.json_stdin else str(args.tool_json or "")
+        try:
+            payload = json.loads(raw or "{}")
+        except ValueError as error:
+            raise ConfigurationError("tool definition must be JSON") from error
+        if not isinstance(payload, dict):
+            raise ConfigurationError("tool definition must be a JSON object")
+        builtin_kind = str(payload.get("builtinKind") or "").strip().lower()
+        if builtin_kind:
+            # A built-in unpacker: the dialog sends the program and its few options;
+            # the whole interface (operations, formats, results) comes from the
+            # shipped recipe, never from a probe or a hand-written form.
+            options = payload.get("builtinOptions") or {}
+            try:
+                definition = builtin_unpacker_definition(
+                    builtin_kind, str(payload.get("program") or
+                                      payload.get("connection", {}).get("command") or ""),
+                    options if isinstance(options, dict) else {},
+                    enabled=bool(payload.get("enabled", True)),
+                    offer_to_agent=bool(payload.get("offerToAgent", True)))
+                tool = upsert_tool_provider(definition)
+            except (ValueError, ToolConfigError) as error:
+                raise ConfigurationError(str(error)) from error
+            result = {"tool": tool, "path": str(tool_providers_path())}
+            if builtin_kind == "uex" and definition["builtinOptions"].get("registerMcp"):
+                server = config.upsert_mcp_server(uex_mcp_server_definition(
+                    definition["connection"]["command"],
+                    definition["builtinOptions"]["configPath"]))
+                changed = True
+                result["mcpServer"] = server.to_dict()
+        else:
+            try:
+                result = {"tool": upsert_tool_provider(payload),
+                          "path": str(tool_providers_path())}
+            except ToolConfigError as error:
+                raise ConfigurationError(str(error)) from error
+    elif command == "tool-detect":
+        spec = builtin_unpacker(args.kind)
+        if spec is None:
+            raise ConfigurationError("unknown built-in unpacker: %s" % args.kind)
+        names = {name.lower() for name in spec["programNames"]}
+        candidates = [item for item in discover_installed_readers()
+                      if Path(str(item.get("command", ""))).stem.lower() in names]
+        if spec["kind"] == "unitypy":
+            # Any interpreter on PATH; the script is ours. Prefer one that already
+            # has UnityPy importable, and say which ones do not.
+            import shutil
+            import subprocess
+            for name in ("python", "python3", "py"):
+                found = shutil.which(name)
+                if not found or any(item.get("command") == found for item in candidates):
+                    continue
+                try:
+                    probe = subprocess.run([found, "-c", "import UnityPy;print(UnityPy.__version__)"],
+                                           capture_output=True, timeout=20, check=False,
+                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    version = probe.stdout.decode("utf-8", "replace").strip() \
+                        if probe.returncode == 0 else ""
+                except (OSError, subprocess.SubprocessError):
+                    version = ""
+                candidates.append({"command": found, "id": "unitypy", "title": name,
+                                   "engines": ["unity"], "unityPy": version,
+                                   "description": ("UnityPy %s" % version) if version
+                                   else "UnityPy is not installed: pip install UnityPy"})
+        result = {"schema": "replaylab-agent-tool-detect/v1", "kind": spec["kind"],
+                  "candidates": candidates[:8]}
+    elif command == "tool-remove":
+        result = {"removed": remove_tool_provider(args.tool_id), "tool": args.tool_id}
+    elif command in {"tool-enable", "tool-disable"}:
+        found = set_tool_provider_enabled(args.tool_id, command == "tool-enable")
+        if not found:
+            raise ConfigurationError(f"unknown tool id: {args.tool_id}")
+        result = {"tool": args.tool_id, "enabled": command == "tool-enable"}
+    elif command == "tool-migrate":
+        result = migrate_tool_providers()
+    elif command == "tool-test":
+        result = _tool_test(args.tool_id, float(getattr(args, "timeout", 30.0)))
+    elif command == "reader-add":
+        try:
+            reader = upsert_reader(
+                registration_from_command(args.command, args.name, args.description))
+        except AssetReaderError as error:
+            raise ConfigurationError(str(error)) from error
+        result = {"reader": reader, "path": str(default_readers_path())}
+    elif command == "reader-remove":
+        result = {"removed": remove_reader(args.reader_id), "reader": args.reader_id}
+    elif command in {"reader-enable", "reader-disable"}:
+        found = set_reader_enabled(args.reader_id, command == "reader-enable")
+        if not found:
+            raise ConfigurationError(f"unknown asset reader id: {args.reader_id}")
+        result = {"reader": args.reader_id, "enabled": command == "reader-enable"}
+    else:  # pragma: no cover - argparse constrains this value
+        raise AssertionError(command)
+    if changed:
+        config.save(path)
+    if getattr(args, "json", False):
+        _print_machine_json(result)
+    else:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1290,24 +2279,45 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "profile" and args.profile_command == "presets":
             return _print_presets(args.json)
 
-        store = _load_store(args.config)
-        if args.command == "profile":
-            if args.profile_command == "credential":
-                return _credential_command(args, store)
-            if args.profile_command == "subscription":
-                return asyncio.run(_subscription_command(args, store))
-            if args.profile_command == "discover-models":
-                return asyncio.run(_models_command(args, store))
-            if args.profile_command == "test-model":
-                return asyncio.run(_test_model_command(args, store))
-            from .credential_store import default_credential_store
+        if args.command == "unpacker":
+            return _unpacker_command(args)
+        if args.command == "tools":
+            return _tools_command(args)
+        if args.command == "conversation-cleanup":
+            from .conversation_cleanup import cleanup_conversation, cleanup_pending_conversations
+            result = (cleanup_pending_conversations() if args.pending else
+                      cleanup_conversation(args.conversation_id, args.task_id))
+            _print_machine_json(result)
+            return 0 if result["complete"] else 1
 
-            return _profile_command(args, store, default_credential_store())
-        if args.command == "doctor":
-            return _doctor_command(args, store)
-        if args.command == "run":
-            return asyncio.run(_run_once(args, store))
-        raise AssertionError(args.command)
+        store = _load_store(args.config)
+        from .provider_lease import profile_lease
+        lease_id = str(getattr(args, "profile", "") or "")
+        if args.command == "profile" and args.profile_command in {"subscription", "discover-models", "test-model"}:
+            lease_id = str(getattr(args, "id", "") or lease_id or store.active_profile)
+        elif args.command in {"run", "doctor"}:
+            lease_id = lease_id or store.active_profile
+        else:
+            lease_id = ""
+        lease = profile_lease(store.path, lease_id) if lease_id else contextlib.nullcontext()
+        with lease:
+            if args.command == "profile":
+                if args.profile_command == "credential":
+                    return _credential_command(args, store)
+                if args.profile_command == "subscription":
+                    return asyncio.run(_subscription_command(args, store))
+                if args.profile_command == "discover-models":
+                    return asyncio.run(_models_command(args, store))
+                if args.profile_command == "test-model":
+                    return asyncio.run(_test_model_command(args, store))
+                from .credential_store import default_credential_store
+
+                return _profile_command(args, store, default_credential_store())
+            if args.command == "doctor":
+                return _doctor_command(args, store)
+            if args.command == "run":
+                return asyncio.run(_run_once(args, store))
+            raise AssertionError(args.command)
     except SystemExit as exc:
         if type(exc.code) is int:
             return exc.code

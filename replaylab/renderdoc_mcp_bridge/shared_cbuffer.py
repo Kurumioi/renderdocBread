@@ -19,6 +19,12 @@ MAX_SHARED_CBUFFER_BYTES = 4 * 1024 * 1024
 MAX_SHARED_CBUFFER_RECORD_BYTES = 16 * 1024 * 1024
 
 
+class SharedCBufferSnapshotExpired(RuntimeError):
+    """The caller may reopen a fresh snapshot, but must not retry its stale bytes."""
+
+    snapshot_expired = True
+
+
 def _integer(value, name, minimum=0, maximum=(1 << 64) - 1):
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise ValueError("Invalid %s" % name)
@@ -40,9 +46,9 @@ def _bytes(value, size):
 class SharedCBufferEdits(object):
     """Serialize one owner against the controller's shared configuration generation.
 
-    An external writer cannot be safely cleared with the range-only public API.
-    Fail closed on that writer's generation instead of reclaiming its ranges.
-    This object is reset only when the capture/controller lifecycle changes.
+    An external writer invalidates old edit capabilities, not the entire editor.
+    A fresh snapshot adopts the current values. Its reset restores that baseline
+    rather than clearing an exact range that may predate this editor session.
     """
 
     def __init__(self, resource_id_int):
@@ -53,6 +59,7 @@ class SharedCBufferEdits(object):
         self.records = {}
         self._generation = 0
         self._record_bytes = 0
+        self._foreign_baseline = False
 
     def check_snapshot_capacity(self, byte_size):
         """Check before native readback and again before retaining an immutable window."""
@@ -67,6 +74,7 @@ class SharedCBufferEdits(object):
         return reserved_bytes
 
     def register(self, snapshot, ctrl):
+        self._guard_generation(ctrl, fresh_snapshot=True)
         if snapshot["snapshotId"] in self.records:
             raise ValueError("The shared CBuffer snapshot identity is already registered")
         size = _integer(snapshot["validByteSize"], "valid CBuffer byte size", 1,
@@ -76,10 +84,11 @@ class SharedCBufferEdits(object):
         encoded_size = ((size + 2) // 3) * 4
         if not isinstance(snapshot["rawBase64"], str) or len(snapshot["rawBase64"]) != encoded_size:
             raise ValueError("Packed field bytes do not match the reflected size")
-        self._guard_generation(ctrl)
         snapshot = copy.deepcopy(snapshot)
         snapshot["schema"] = SNAPSHOT_SCHEMA
         snapshot["scope"] = SCOPE
+        snapshot["resetMode"] = ("snapshot-baseline" if self._foreign_baseline
+                                 else "captured-range")
         raw = _bytes(snapshot["rawBase64"], size)
         if hashlib.sha256(raw).hexdigest() != snapshot["rawSha256"]:
             raise ValueError("The CBuffer snapshot bytes do not match their digest")
@@ -103,22 +112,32 @@ class SharedCBufferEdits(object):
         record = {"snapshot": snapshot, "baseline": raw, "current": raw,
                   "fields": fields, "patches": {}, "revision": 0, "overrideId": "",
                   "resource": resource, "base": base, "length": length,
-                  "reservedBytes": reserved_bytes}
+                  "reservedBytes": reserved_bytes,
+                  "restoreBaseline": self._foreign_baseline}
         self.records[snapshot["snapshotId"]] = record
         self._record_bytes += reserved_bytes
         return copy.deepcopy(snapshot)
 
-    def _guard_generation(self, ctrl):
+    def _guard_generation(self, ctrl, fresh_snapshot=False):
         generation = int(ctrl.GetSharedBufferPatchGeneration())
         if generation != self._generation:
-            raise RuntimeError(
-                "The shared buffer configuration changed outside this material editor; "
-                "its ranges will not be overwritten or cleared")
+            # Do not clear native patches: an external writer may have replaced
+            # one of our exact ranges. Revoke old snapshots and let the next
+            # explicit selection reopen against current bytes without reopening
+            # the capture. No stale value is automatically retried.
+            self.records.clear()
+            self._record_bytes = 0
+            self._generation = generation
+            self._foreign_baseline = True
+            if not fresh_snapshot:
+                raise SharedCBufferSnapshotExpired(
+                    "The shared buffer configuration changed outside this material editor; "
+                    "select the parameter again to edit its current value")
 
     def _record(self, params):
         record = self.records.get(params.get("snapshot_id"))
         if record is None:
-            raise ValueError("Unknown or expired shared CBuffer snapshot")
+            raise SharedCBufferSnapshotExpired("Unknown or expired shared CBuffer snapshot")
         snapshot = record["snapshot"]
         if (params.get("expected_capture_id") != snapshot["captureId"] or
                 params.get("expected_capture_session_id") != snapshot["captureSessionId"]):
@@ -205,6 +224,7 @@ class SharedCBufferEdits(object):
                 "snapshotId": record["snapshot"]["snapshotId"],
                 "overrideId": record["overrideId"], "revision": record["revision"],
                 "generation": self._generation,
+                "resetMode": record["snapshot"]["resetMode"],
                 "currentRawSha256": hashlib.sha256(record["current"]).hexdigest(),
                 "configured": bool(record["patches"]), "appliedToCurrentEvent": True}
 
@@ -220,9 +240,14 @@ class SharedCBufferEdits(object):
             # ownership on a partial failure so retry clears only remaining fields.
             for leaf_id in list(record["patches"]):
                 offset, size = self._range(record, leaf_id)
-                error = ctrl.ClearSharedBufferPatch(resource, offset, size)
+                if record["restoreBaseline"]:
+                    start = record["fields"][leaf_id]["byteOffset"]
+                    error = ctrl.SetSharedBufferPatch(
+                        resource, offset, record["baseline"][start:start + size])
+                else:
+                    error = ctrl.ClearSharedBufferPatch(resource, offset, size)
                 if str(error or ""):
-                    raise RuntimeError("ClearSharedBufferPatch failed: %s" % str(error))
+                    raise RuntimeError("Shared CBuffer reset failed: %s" % str(error))
                 self._generation = int(ctrl.GetSharedBufferPatchGeneration())
                 del record["patches"][leaf_id]
         response = self._response(record)

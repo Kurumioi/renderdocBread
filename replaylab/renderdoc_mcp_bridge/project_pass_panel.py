@@ -772,7 +772,7 @@ class MiniQtPassPanel(object):
         self.mqt = ctx.Extensions().GetMiniQtHelper()
         self.top = self.mqt.CreateToplevelWidget(
             QtCore.QCoreApplication.translate(
-                TRANSLATION_CONTEXT, "ReplayLab Semantic Passes"),
+                TRANSLATION_CONTEXT, "Semantic Passes"),
             self._closed)
         self.root = self.mqt.CreateVerticalContainer()
         self.mqt.AddWidget(self.top, self.root)

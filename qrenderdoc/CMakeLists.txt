@@ -433,17 +433,46 @@ endif()
 
 install (PROGRAMS ${CMAKE_BINARY_DIR}/bin/qrenderdoc DESTINATION bin)
 
-# qrenderdoc loads ReplayLab from an application-owned integration directory. The current packaged
-# sidecars require Windows Job Object containment, so non-Windows builds fail closed and do not
-# install an inactive Python bridge. Extension manifests and generated caches are excluded.
-if(WIN32)
-    install (DIRECTORY ${CMAKE_SOURCE_DIR}/replaylab/renderdoc_mcp_bridge/
-             DESTINATION bin/integrations/replaylab/python/renderdoc_mcp_bridge
+include("${CMAKE_SOURCE_DIR}/replaylab/packaging/ShaderCompiler.cmake")
+
+# qrenderdoc loads its portable in-process source/debug bridge from this fixed first-party path.
+# AI sidecars remain a separate Windows-only deployment with Job Object containment. The bridge
+# explicitly skips sidecar startup on other platforms. No extension manifests/caches are shipped.
+set(REPLAYLAB_BRIDGE_INSTALL_ROOT "bin")
+if(APPLE)
+    set(REPLAYLAB_BRIDGE_INSTALL_ROOT "bin/qrenderdoc.app/Contents/MacOS")
+endif()
+install (DIRECTORY ${CMAKE_SOURCE_DIR}/replaylab/renderdoc_mcp_bridge/
+             DESTINATION "${REPLAYLAB_BRIDGE_INSTALL_ROOT}/integrations/replaylab/python/renderdoc_mcp_bridge"
              FILES_MATCHING
              PATTERN "*.py"
              PATTERN "integration.json"
              PATTERN "__pycache__" EXCLUDE)
 
+# Keep uninstalled build-tree launches usable too. Copy only canonical source files; do not copy
+# __pycache__ or discover a user extension with the same module name. This is intentionally separate
+# from sidecar deployment, so Linux source/debug tools do not require a Windows runtime package.
+if(NOT WIN32)
+    file(GLOB_RECURSE REPLAYLAB_BRIDGE_SOURCES
+         "${CMAKE_SOURCE_DIR}/replaylab/renderdoc_mcp_bridge/*.py")
+    list(APPEND REPLAYLAB_BRIDGE_SOURCES
+         "${CMAKE_SOURCE_DIR}/replaylab/renderdoc_mcp_bridge/integration.json")
+    foreach(REPLAYLAB_BRIDGE_SOURCE ${REPLAYLAB_BRIDGE_SOURCES})
+        file(RELATIVE_PATH REPLAYLAB_BRIDGE_RELATIVE
+             "${CMAKE_SOURCE_DIR}/replaylab/renderdoc_mcp_bridge" "${REPLAYLAB_BRIDGE_SOURCE}")
+        get_filename_component(REPLAYLAB_BRIDGE_PARENT "${REPLAYLAB_BRIDGE_RELATIVE}" DIRECTORY)
+        set(REPLAYLAB_BRIDGE_DESTINATION
+            "${CMAKE_BINARY_DIR}/${REPLAYLAB_BRIDGE_INSTALL_ROOT}/integrations/replaylab/python/renderdoc_mcp_bridge")
+        add_custom_command(TARGET build-qrenderdoc POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "${REPLAYLAB_BRIDGE_DESTINATION}/${REPLAYLAB_BRIDGE_PARENT}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${REPLAYLAB_BRIDGE_SOURCE}"
+                    "${REPLAYLAB_BRIDGE_DESTINATION}/${REPLAYLAB_BRIDGE_RELATIVE}"
+            VERBATIM)
+    endforeach()
+endif()
+
+if(WIN32)
     # Keep runtime deployment explicit so incremental builds never overwrite an active sidecar.
     # This target consumes the separately built, hash-manifested runtime output and fails closed on
     # unowned/mismatched application layouts.

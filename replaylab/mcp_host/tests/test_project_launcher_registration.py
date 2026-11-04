@@ -240,7 +240,7 @@ class ProjectLauncherRegistrationTests(unittest.TestCase):
         self.assertEqual(1, len(self.context.extensions.window_menus))
         base, path, menu_callback = self.context.extensions.window_menus[0]
         self.assertIs(self.file_menu, base)
-        self.assertEqual(["ReplayLab Projects…"], path)
+        self.assertEqual(["Projects…"], path)
         self.assertEqual(2, len(self.bridge._project_launcher_callbacks))
         self.assertIs(menu_callback, self.bridge._project_launcher_callbacks[0])
 

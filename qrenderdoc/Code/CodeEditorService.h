@@ -70,6 +70,30 @@ public:
     QString source;
   };
 
+  // A revision-bound view of the editor's lightweight lexical index. Byte positions refer to
+  // sourceSha256, not to a later edit. This is navigation evidence, not compiler-verified
+  // lifetime/def-use information and never authorizes a source rewrite.
+  struct SymbolInfo
+  {
+    QString name;
+    QString valueType;
+    QString ownerType;
+    QString sourceSha256;
+    Location declaration;
+    int scopeStart = 0;
+    int scopeEnd = 0;
+    bool function = false;
+    bool global = false;
+  };
+
+  struct SymbolInspection
+  {
+    SymbolInfo symbol;
+    QList<Location> references;
+    bool referencesTruncated = false;
+    bool isValid() const { return symbol.declaration.isValid(); }
+  };
+
   using DefinitionHandler = std::function<void(const Location &location)>;
   using DiagnosticsHandler =
       std::function<void(ScintillaEdit *editor, const QList<Diagnostic> &diagnostics)>;
@@ -81,7 +105,10 @@ public:
   // language should be an LSP language id such as "hlsl", "glsl", "slang", or "python".
   // Registration installs the local completion/F12/diagnostic hooks. Re-registering an editor
   // updates its identity without installing duplicate hooks.
-  void registerEditor(ScintillaEdit *editor, const QString &fileName, const QString &language);
+  // A relocated preview projects literal include paths for the language server, retaining its
+  // distinct real URI/unsaved overlay and leaving the editor buffer and files untouched.
+  void registerEditor(ScintillaEdit *editor, const QString &fileName, const QString &language,
+                      const QString &includeBaseDirectory = QString());
   void unregisterEditor(ScintillaEdit *editor);
   bool isRegistered(ScintillaEdit *editor) const;
 
@@ -103,15 +130,20 @@ public:
   void showCallTip(ScintillaEdit *editor);
 
   Location findLocalDefinition(ScintillaEdit *editor, int position = -1) const;
+  QString documentSourceSha256(ScintillaEdit *editor);
+  QList<SymbolInfo> symbolTable(ScintillaEdit *editor);
+  SymbolInspection inspectSymbol(ScintillaEdit *editor, int position = -1,
+                                 int maxReferences = 64);
   QList<Diagnostic> diagnostics(ScintillaEdit *editor) const;
   // Adds diagnostics produced by an owning workspace/compiler to the local parser and optional
   // language-server results. Passing an empty list clears the external diagnostics.
   void setExternalDiagnostics(ScintillaEdit *editor, const QList<Diagnostic> &diagnostics);
 
-  // An external server is optional. If no command is configured, startLanguageServer() checks
-  // RENDERDOC_SHADER_LANGUAGE_SERVER, then shader-language-server and slangd on PATH. The server
-  // is started directly (never through a shell), only the bounded LSP subset implemented in the
-  // .cpp is accepted, and every editor feature above continues to work if startup fails.
+  // Navigation uses the semantic provider first, including unsaved buffers and cancellation.
+  // With no explicit command/environment override, use the pinned bundled slangd, then PATH.
+  // Processes are started directly, never through a shell. Unsupported server mutations are
+  // rejected. Local navigation is an explicitly limited fallback only when no provider exists;
+  // an empty semantic response must not silently choose a similarly named declaration.
   void setLanguageServerCommand(const QString &program, const QStringList &arguments = QStringList());
   bool startLanguageServer();
   void stopLanguageServer();
@@ -122,6 +154,7 @@ protected:
   bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
+  friend struct CodeEditorServiceTestAccess;
   struct Impl;
   Impl *m_Impl = NULL;
 };

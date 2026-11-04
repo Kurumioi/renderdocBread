@@ -1,8 +1,36 @@
 # RenderDoc Custom Fork — AI Reference
 
-> **Read BOTH this file and [`AGENTS.md`](./AGENTS.md) before making changes — together they are one unified rule set.** Claude Code reads `CLAUDE.md`; OpenAI Codex and other agents read `AGENTS.md`; each points at the other so neither agent misses a rule. They are complementary, not duplicates: **`CLAUDE.md`** is canonical for project structure, the build/release pipeline, upstream sync, and pitfalls; **`AGENTS.md`** is canonical for the UI/ReplayLab **localization (i18n) rules**. If a rule's home is the other file, follow it there and keep the two in sync.
+> **Read BOTH this file and [`AGENTS.md`](./AGENTS.md) before making changes — together they are one unified rule set.** Claude Code reads `CLAUDE.md`; OpenAI Codex and other agents read `AGENTS.md`; each points at the other so neither agent misses a rule. They are complementary, not duplicates: **`CLAUDE.md`** is canonical for project structure, the build/release pipeline, upstream sync, and pitfalls; **`AGENTS.md`** is canonical for the UI/Bread **localization (i18n) rules**. If a rule's home is the other file, follow it there and keep the two in sync.
 
-This is a custom fork of [RenderDoc](https://github.com/baldurk/renderdoc) with feature-hiding modifications. The upstream remote is `upstream` (baldurk/renderdoc), our fork is `origin` (crossous/renderdoc).
+This is a custom fork of [RenderDoc](https://github.com/baldurk/renderdoc) with feature-hiding modifications. The local `upstream` remote points to `crossous/renderdoc`; our `origin` is [Straw1997/renderdocBread](https://github.com/Straw1997/renderdocBread). Renaming the GitHub repository does not require renaming an existing checkout directory or recreating its GitHub Desktop entry.
+
+The user-visible AI product brand is **Bread** / **Bread AI**. Legacy `ReplayLab` protocol, storage, executable and translation-context identifiers remain compatible; existing user project names and paths are preserved. The canonical branding rules are in [AGENTS.md](./AGENTS.md#product-name-and-compatibility).
+
+Pytest scratch data must stay outside every source checkout. Do not pass a repository-relative or repository-contained `--basetemp`; normally omit it and let pytest use the operating-system temp directory. Named scratch paths belong below the absolute system temp directory and must be cleaned after the run.
+
+## Persistent data compatibility
+
+Changes to projects, captures, Shader workspaces, shared names, navigation or
+debug snapshots must retain backward compatibility. Read an older record using
+its original schema before completing newer fields from matching original
+Shader bytes, physical layout, saved source and existing verified artifacts.
+Missing new fields alone are not corruption and must not force a new project,
+workspace, source rewrite or recompilation. Do not treat a legacy display or
+interface hash as a newer physical identity proof.
+
+Preserve existing names, paths, user edits, snapshot order/anchors and immutable
+history. Path identity follows the path's platform: Windows drive/UNC spellings
+are equivalent where appropriate, Linux paths remain case-sensitive, and remote
+URIs retain their scheme. A changed path-key algorithm must still discover old
+keys and upgrade them atomically without discarding the original record. Keep
+ambiguous or damaged records for diagnosis rather than guessing a replacement.
+
+Metadata reads and recovery must not depend on unrelated compiler executables.
+Execution still checks the selected tool and actual current capture/Shader;
+saved receipts do not authorize another capture session. Reuse exact current
+evidence, and keep manual save/debug paths free of repeated AI organization
+validation. Persistence changes need focused old-format and relevant platform
+round-trip tests, including multiple RDCs sharing knowledge when applicable.
 
 ## Project Structure Overview
 
@@ -12,7 +40,7 @@ This fork renames/hides RenderDoc identifiers to avoid detection. Key customizat
 
 | Official Name | Custom Name | Source Project |
 |---|---|---|
-| `qrenderdoc.exe` | `q_render_soco_doc.exe` | `qrenderdoc/qrenderdoc_local.vcxproj` |
+| `qrenderdoc.exe` | `RenderDocBread.exe` | `qrenderdoc/qrenderdoc_local.vcxproj` |
 | `renderdoccmd.exe` | `render_soco_doccmd.exe` | `renderdoccmd/renderdoccmd.vcxproj` |
 | `renderdocshim32.dll` | `render_soco_docshim32.dll` | `renderdocshim/renderdocshim.vcxproj` |
 | `renderdocshim64.dll` | `render_soco_docshim64.dll` | (same) |
@@ -34,166 +62,45 @@ This fork renames/hides RenderDoc identifiers to avoid detection. Key customizat
 
 ## Release Build Guide
 
-When the user says "帮我发布" or "pack a release", follow these steps.
+**Before every packaging/release task, read
+[`replaylab/packaging/RELEASE_REQUIREMENTS.md`](./replaylab/packaging/RELEASE_REQUIREMENTS.md),
+[`replaylab/packaging/README.md`](./replaylab/packaging/README.md), and
+[`replaylab/dependencies/README.md`](./replaylab/dependencies/README.md).**
+They define the standing edition/dependency policy, source and binary consistency,
+isolated build routes, required checks and delivery evidence. Follow the checked-in
+requirements without asking the user to repeat decisions recorded there. This section
+is the release entry point; keep detailed requirements in `RELEASE_REQUIREMENTS.md`
+and executable commands/options in the packaging README and scripts.
 
-### Environment (already installed)
+The Windows application and release archive are named **RenderDocBread**. Bread AI remains
+its assistant brand. Existing ReplayLab protocol/storage identifiers, RenderDoc core DLL and
+capture/injection helper executable names remain compatible.
 
-| Tool | Path | Env Var |
-|---|---|---|
-| JDK 8 | `C:\Program Files\Java\jdk8u422-b05` | `JAVA_HOME` |
-| Android SDK | `D:\Android\Sdk` | `ANDROID_HOME` |
-| Android NDK r14b | `D:\Android\Sdk\ndk\android-ndk-r14b` | `ANDROID_NDK_HOME` |
-| MSYS2 | `C:\msys64` | — |
-| VS2022 Community | `C:\Program Files\Microsoft Visual Studio\2022\Community` | — |
-| MSBuild | `...\MSBuild\Current\Bin\MSBuild.exe` | — |
+Run `PACKAGE_RENDERDOCBREAD.cmd` at the repository root, or:
 
-Verify environment vars are set before building: `echo $JAVA_HOME $ANDROID_HOME $ANDROID_NDK_HOME`
-
-### Step 1: Windows x86 Release
-
-```bash
-MSBUILD="/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe"
-cd "D:/Project/CPP/renderdoc"
-MSYS2_ARG_CONV_EXCL="*" "$MSBUILD" renderdoc.sln /t:Rebuild /p:"Configuration=Release;Platform=x86" /m /nologo
+```powershell
+./replaylab/packaging/Build-RenderDocBread.ps1
 ```
 
-Expected outputs in `Win32/Release/`:
-`renderdoc.dll`, `system_load.dll`, `q_render_soco_doc.exe`, `render_soco_doccmd.exe`, `render_soco_docshim32.dll`
+After cloning, run `./replaylab/packaging/Restore-BuildEnvironment.ps1`. Missing
+sealed inputs are downloaded from pinned GitHub Release assets and verified against
+`replaylab/dependencies/inputs.lock.json`; public forks reject new Git LFS objects.
+The sealed build inputs and
+redistribution inventory are in `replaylab/dependencies`; `Restore-BuildEnvironment.ps1`
+creates the offline locked build environment without a pre-existing Development install.
+The build keeps the running application's deployed files untouched, builds the GUI in
+`output/RenderDocBread-native`, freezes the AI/MCP sidecars, publishes self-contained UEX,
+and assembles a private temporary staging directory. It validates translations, runtime
+hashes, pinned Shader compilers/language server, complete skill folders, relative paths,
+VC runtime DLLs and relocated executable startup before writing
+`dist/RenderDocBread-<timestamp>-win-x64.zip` plus SHA-256. It never stops live processes.
+Read `replaylab/packaging/README.md` for dependencies, overrides and verification limits.
+The package configuration is `replaylab/packaging/RenderDocBread.package.json`.
 
-### Step 2: Windows x64 Release
-
-```bash
-MSYS2_ARG_CONV_EXCL="*" "$MSBUILD" renderdoc.sln /t:Rebuild /p:"Configuration=Release;Platform=x64" /m /nologo
-```
-
-Expected outputs in `x64/Release/`: same set but with `render_soco_docshim64.dll`.
-
-**Tips:** Steps 1 & 2 can run sequentially. Use `/t:Build` instead of `/t:Rebuild` for incremental builds.
-
-### Step 3: Android ARM32
-
-Must run inside MSYS2 bash (`/c/msys64/usr/bin/bash.exe -l`):
-
-```bash
-export JAVA_HOME="/c/Program Files/Java/jdk8u422-b05"
-export PATH="$JAVA_HOME/bin:$PATH"
-export ANDROID_HOME="D:/Android/Sdk"
-export ANDROID_NDK_HOME="D:/Android/Sdk/ndk/android-ndk-r14b"
-
-cd "D:/Project/CPP/renderdoc"
-rm -rf build-android-arm32 && mkdir build-android-arm32 && cd build-android-arm32
-cmake -G "MSYS Makefiles" \
-  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
-  -DCMAKE_ANDROID_STL_TYPE=c++_static \
-  -DBUILD_ANDROID=1 -DANDROID_ABI=armeabi-v7a -DANDROID_STL=c++_static \
-  -DANDROID_TOOLCHAIN=clang -DCMAKE_BUILD_TYPE=Release -DSTRIP_ANDROID_LIBRARY=On ..
-make -j$(nproc)
-```
-
-Expected output: `bin/org.renderdoc.renderdoccmd.arm32.apk`
-
-### Step 4: Android ARM64
-
-Same environment, different ABI:
-
-```bash
-cd "D:/Project/CPP/renderdoc"
-rm -rf build-android-arm64 && mkdir build-android-arm64 && cd build-android-arm64
-cmake -G "MSYS Makefiles" \
-  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
-  -DCMAKE_ANDROID_STL_TYPE=c++_static \
-  -DBUILD_ANDROID=1 -DANDROID_ABI=arm64-v8a -DANDROID_STL=c++_static \
-  -DANDROID_TOOLCHAIN=clang -DCMAKE_BUILD_TYPE=Release -DSTRIP_ANDROID_LIBRARY=On ..
-make -j$(nproc)
-```
-
-Expected output: `bin/org.renderdoc.renderdoccmd.arm64.apk`
-
-**Tips:** ARM32 and ARM64 can build in parallel if launched from separate MSYS2 shells.
-
-### Step 5: Package
-
-```bash
-cd "D:/Project/CPP/renderdoc"
-VERSION=$(grep -E "#define RENDERDOC_VERSION_(MAJOR|MINOR)" renderdoc/api/replay/version.h | tr -dc '[0-9\n]' | tr '\n' '.' | grep -Eo '[0-9]+\.[0-9]+')
-PKGNAME="RenderSocoDoc_${VERSION}"
-
-rm -rf dist package
-mkdir -p dist/Release64 dist/Release32
-
-# Copy build outputs (exclude obj/, .lib, pymodules, incremental pdb)
-cd x64/Release && find . -not -path './obj*' -not -name '*.lib' -not -path './pymodules*' -not -name '*.ipdb' -not -name '*.iobj' -type f -exec cp --parents '{}' ../../dist/Release64/ \; && cd ../..
-cd Win32/Release && find . -not -path './obj*' -not -name '*.lib' -not -path './pymodules*' -not -name '*.ipdb' -not -name '*.iobj' -type f -exec cp --parents '{}' ../../dist/Release32/ \; && cd ../..
-
-# Copy d3dcompiler from Windows SDK
-cp "C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64/d3dcompiler_47.dll" dist/Release64/
-cp "C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x86/d3dcompiler_47.dll" dist/Release32/
-
-# Copy LICENSE
-cp LICENSE.md dist/Release64/
-cp LICENSE.md dist/Release32/
-
-# Copy D3D12 Agility SDK runtime
-mkdir -p dist/Release64/D3D12 dist/Release32/D3D12
-[ -f "3rdparty/d3d12/x64/D3D12Core.dll" ] && cp "3rdparty/d3d12/x64/D3D12Core.dll" dist/Release64/D3D12/
-[ -f "3rdparty/d3d12/win32/D3D12Core.dll" ] && cp "3rdparty/d3d12/win32/D3D12Core.dll" dist/Release32/D3D12/
-
-# Copy Android APKs
-mkdir -p dist/Release64/plugins/android/
-cp build-android-arm32/bin/org.renderdoc.renderdoccmd.arm32.apk dist/Release64/plugins/android/
-cp build-android-arm64/bin/org.renderdoc.renderdoccmd.arm64.apk dist/Release64/plugins/android/
-
-# Bundle x86 core files into x64 package
-mkdir -p dist/Release64/x86
-for f in d3dcompiler_47.dll renderdoc.dll renderdoc.json render_soco_docshim32.dll render_soco_doccmd.exe system_load.dll system_load.json dbghelp.dll symsrv.dll symsrv.yes; do
-    [ -f "dist/Release32/$f" ] && cp "dist/Release32/$f" dist/Release64/x86/
-done
-# Bundle x86 D3D12 Agility SDK
-if [ -f "dist/Release32/D3D12/D3D12Core.dll" ]; then
-    mkdir -p dist/Release64/x86/D3D12
-    cp "dist/Release32/D3D12/D3D12Core.dll" dist/Release64/x86/D3D12/
-fi
-
-# Remove PDBs and build artifacts from release
-find dist/Release64/ -name '*.pdb' -exec rm '{}' \;
-rm -f dist/Release64/*.{exp,lib,metagen,xml} dist/Release64/*.vshost.*
-
-# Create zip
-mkdir -p package
-cp -R dist/Release64 "package/${PKGNAME}_64"
-cd package
-powershell -Command "Compress-Archive -Path '${PKGNAME}_64' -DestinationPath '${PKGNAME}_64.zip' -Force"
-```
-
-Output: `package/RenderSocoDoc_<version>_64.zip`
-
-### Expected Package Contents
-
-```
-RenderSocoDoc_X.XX_64/
-├── q_render_soco_doc.exe          # GUI app
-├── renderdoc.dll                  # Core library
-├── system_load.dll                # Stealth injection DLL
-├── render_soco_doccmd.exe         # CLI tool
-├── render_soco_docshim64.dll      # Global hook shim
-├── renderdoc.json / system_load.json
-├── d3dcompiler_47.dll
-├── D3D12/                         # D3D12 Agility SDK
-│   └── D3D12Core.dll
-├── Qt5*.dll, python36.dll, dbghelp.dll, symsrv.dll, ...
-├── LICENSE.md
-├── x86/                           # 32-bit support
-│   ├── renderdoc.dll
-│   ├── system_load.dll
-│   ├── render_soco_doccmd.exe
-│   ├── render_soco_docshim32.dll
-│   ├── D3D12/
-│   │   └── D3D12Core.dll
-│   └── ...
-└── plugins/android/
-    ├── org.renderdoc.renderdoccmd.arm32.apk
-    └── org.renderdoc.renderdoccmd.arm64.apk
-```
+No credentials, profiles, conversations, capture data, user projects, build objects or
+caches are release inputs. The source application is read-only; package assembly must not
+run deployment scripts against it. Normal local deployment still requires closed sessions.
+Use `/m:2` and an explicit `SolutionDir` for the GUI; do not run concurrent native builds.
 
 ---
 
@@ -236,16 +143,18 @@ The `.rc` files (e.g. `qrenderdoc.rc`, `renderdoccmd.rc`) may be UTF-16LE binary
 
 ## Development replay profiling
 
-For interactive D3D11, D3D12, OpenGL and Vulkan replay performance testing in `Development`, pass
-`/p:ReplayOptimizeDevelopment=true`, or use `build-dev.ps1 -SkipRuntime -OptimizeReplay`.
+Packaging and `build-dev.ps1` enable `/p:ReplayOptimizeDevelopment=true` by default
+for interactive D3D11, D3D12, OpenGL and Vulkan replay. Direct MSBuild invocations
+must pass this property explicitly; use `-DisableReplayOptimization` on the scripts
+for an explicit `/Od` diagnostic control.
 This optimizes each graphics driver project, including its precompiled header, while retaining
-Development diagnostics and PDB symbols. The shared core keeps its normal flags, and the default
-Development build remains `/Od`. Always record this flag when comparing EID timing.
+Development diagnostics and PDB symbols. The shared core keeps its normal flags;
+the raw vcxproj default remains `/Od`. Always record this flag when comparing EID timing.
 Use `/m:2` and an explicit `SolutionDir` as usual. Profiling and A/B controls are documented in
 `util/perf/README.md`.
 
 ## Internationalization (i18n)
 
-**The full i18n / localization rules live in [`AGENTS.md`](./AGENTS.md)** ("UI localization" and "ReplayLab built-in Python integration localization") plus `util/i18n/README.md` and `qrenderdoc/Translations/glossary.zh_CN.yaml`. **Read them before adding or changing any user-facing string** — every UI string must be `tr()`-wrapped/registered and translated, or it renders in English (and `build_translations.ps1 -RequireComplete` fails).
+**The full i18n / localization rules live in [`AGENTS.md`](./AGENTS.md)** ("UI localization" and "Bread built-in Python integration localization") plus `util/i18n/README.md` and `qrenderdoc/Translations/glossary.zh_CN.yaml`. **Read them before adding or changing any user-facing string** — every UI string must be `tr()`-wrapped/registered and translated, or it renders in English (and `build_translations.ps1 -RequireComplete` fails).
 
-One build-adjacent reminder that bites when adding AI providers: ReplayLab provider-catalog text (`title` / `note` / `install_hint` / `subscription_instruction` from `replaylab/src/replaylab_agent/catalog.py`) is runtime JSON that `lupdate` cannot see, so each string must be registered with its **exact English source** in `providerCatalogTranslations[]` in `qrenderdoc/Windows/AI/AIAssistant.cpp`. Changing the Python English without updating that table's source silently falls back to English. Also prefer building UI result text from a stable status in C++ with `tr()` over displaying raw backend English (see AGENTS.md rule on backend/runtime data).
+One build-adjacent reminder that bites when adding AI providers: Bread provider-catalog text (`title` / `note` / `install_hint` / `subscription_instruction` from `replaylab/src/replaylab_agent/catalog.py`) is runtime JSON that `lupdate` cannot see, so each string must be registered with its **exact English source** in `providerCatalogTranslations[]` in `qrenderdoc/Windows/AI/AIAssistant.cpp`. Changing the Python English without updating that table's source silently falls back to English. Also prefer building UI result text from a stable status in C++ with `tr()` over displaying raw backend English (see AGENTS.md rule on backend/runtime data).

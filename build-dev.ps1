@@ -1,15 +1,15 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  One-command Development build for renderdocUltra (q_render_soco_doc.exe)
+  One-command Development build for renderdocUltra (RenderDocBread.exe)
   + ReplayLab runtime freeze + integration deploy.
 .DESCRIPTION
   Locates MSBuild via vswhere, builds Development|x64, then deploys the ReplayLab
   Python integration. Optionally runs the Qt i18n pipeline (lupdate/lrelease/lint)
   with -RunI18n. Run from a normal PowerShell prompt on Windows.
 
-  -OptimizeReplay enables /O2 for the D3D11, D3D12, OpenGL and Vulkan driver
-  projects, including their precompiled headers. The shared core keeps its usual flags.
+  Replay drivers use /O2 by default, including their precompiled headers.
+  -DisableReplayOptimization restores /Od for an explicit diagnostic A/B build.
 
   The Linux sandbox on this machine cannot run MSVC/Qt, so this step runs on Windows.
 .EXAMPLE
@@ -26,7 +26,8 @@ param(
   [string]$QtBin         = 'C:\Qt\5.15.2\msvc2019_64\bin',
   [switch]$SkipDeploy,
   [switch]$SkipRuntime,
-  [switch]$OptimizeReplay
+  [switch]$OptimizeReplay,
+  [switch]$DisableReplayOptimization
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,7 +42,21 @@ function Fail($m){ Write-Host "ERROR: $m" -ForegroundColor Red; exit 1 }
 Step 'Locating MSBuild'
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if(-not (Test-Path $vswhere)){ Fail "vswhere not found at $vswhere - install Visual Studio 2019/2022 with the C++ workload." }
-$msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+# Prefer the 64-bit MSBuild. Visual Studio's default MSBuild\Current\Bin\MSBuild.exe
+# is a 32-bit process, and everything it launches inherits that: powershell.exe is
+# redirected by WOW64 to the 32-bit copy, and a 32-bit process cannot enumerate a
+# 64-bit process's modules -- EnumProcessModules returns only the main image. The
+# packaging probe that inspects the frozen 64-bit Host therefore sees exactly one
+# module forever and fails for a reason that has nothing to do with the build.
+$msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild `
+    -find 'MSBuild\**\Bin\amd64\MSBuild.exe' | Select-Object -First 1
+if(-not $msbuild -or -not (Test-Path $msbuild)){
+    $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild `
+        -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+    if($msbuild -and (Test-Path $msbuild)){
+        Write-Host 'NOTE: only 32-bit MSBuild was found; packaging probes that inspect the frozen 64-bit hosts may not be able to read them.' -ForegroundColor Yellow
+    }
+}
 if(-not $msbuild -or -not (Test-Path $msbuild)){ Fail 'MSBuild.exe not located via vswhere.' }
 Write-Host "MSBuild : $msbuild"
 Write-Host "Config  : $Configuration|$Platform  (/m:$MaxCpu)"
@@ -71,7 +86,8 @@ $mprops = @(
   "/p:SolutionDir=$solutionDir"
 )
 if($SkipRuntime){ $mprops += '/p:SkipReplayLabRuntime=true' }
-if($OptimizeReplay){ $mprops += '/p:ReplayOptimizeDevelopment=true' }
+if($OptimizeReplay -and $DisableReplayOptimization){ Fail 'Choose either OptimizeReplay or DisableReplayOptimization.' }
+$mprops += '/p:ReplayOptimizeDevelopment=' + $(if($DisableReplayOptimization){'false'}else{'true'})
 & $msbuild 'qrenderdoc\qrenderdoc_local.vcxproj' @mprops
 if($LASTEXITCODE){ Fail "MSBuild failed (exit $LASTEXITCODE)." }
 
@@ -82,6 +98,6 @@ if(-not $SkipDeploy){
 }
 
 Step 'Done'
-$exe = Join-Path $root "x64\$Configuration\q_render_soco_doc.exe"
+$exe = Join-Path $root "x64\$Configuration\RenderDocBread.exe"
 if(Test-Path $exe){ Write-Host "Built OK -> $exe" -ForegroundColor Green }
 else { Write-Host "Build finished but exe not at expected path: $exe" -ForegroundColor Yellow }

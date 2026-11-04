@@ -16,6 +16,8 @@ from src.shader_workspace import (
     WorkspaceWatchError,
 )
 from src.shader_workspace.leases import WorkspaceSourceTransactionLease
+from src.shader_workspace.source_observation import source_observation_transaction
+from src.shader_workspace import watcher as watcher_module
 
 
 def _sha(value: bytes) -> str:
@@ -123,6 +125,290 @@ class ShaderWorkspaceWatcherTests(unittest.TestCase):
             time.sleep(0.02)
         self.fail("watcher condition was not reached: %r" % manager.poll(watch_id))
 
+    def _manual_job(self, service):
+        # Real files and original CAS/compile paths, without a background clock.
+        (self.root / "watch").mkdir(exist_ok=True)
+        job = watcher_module._WatchJob(
+            "a" * 32, self.root, self.source, 100, service, _sha(self.initial),
+            None, None, None, None, None, self.root / "watch" / "audit.json",
+            mock.Mock(path=self.root / "watch" / "lease", owned=True), lambda job: None)
+        job._state = "running"
+        return job
+
+    def _open_organization_draft(self):
+        from src.shader_workspace.organization import ORGANIZATION_GATE_SCHEMA, ORGANIZATION_SESSION_SCHEMA
+        organization = "d" * 32
+        session = self.root / "ai" / "organization-sessions" / organization / "session.json"
+        session.parent.mkdir(parents=True)
+        session.write_text(json.dumps({"schema": ORGANIZATION_SESSION_SCHEMA,
+            "organizationId": organization, "state": "drafting"}), encoding="utf-8")
+        (self.root / "ai" / "organize-code-gate.json").write_text(json.dumps({
+            "schema": ORGANIZATION_GATE_SCHEMA, "organizationId": organization,
+            "decision": "editable-draft"}), encoding="utf-8")
+        return session
+
+    def test_organization_file_saves_defer_compile_and_candidate_adoption(self):
+        service = _FakeWorkspaceService(self.root)
+        job = self._manual_job(service)
+        session = self._open_organization_draft()
+        changed = self.initial.replace(b"return 0", b"return 7")
+        with mock.patch.object(watcher_module.time, "monotonic", return_value=100.0) as clock, \
+                mock.patch.object(watcher_module, "_already_compiled_candidate") as candidate:
+            job._tick()
+            self.source.write_bytes(changed)
+            for value in (100.05, 100.2, 101.3, 102.4):
+                clock.return_value = value
+                job._tick()
+            self.assertEqual(job._observed_hash, _sha(changed))
+            self.assertEqual(service.compile_hashes, [])
+            candidate.assert_not_called()
+            self.assertFalse(job._pending)
+            # Closing the draft exposes an explicit final candidate; the watcher
+            # adopts its revision without recompiling or replaying intermediate text.
+            body = json.loads(session.read_text(encoding="utf-8"))
+            body["state"] = "completed"
+            session.write_text(json.dumps(body), encoding="utf-8")
+            candidate.return_value = {"revision": 5, "rawSha256": "c" * 64,
+                                      "sourceSha256": _sha(changed)}
+            clock.return_value = 102.6
+            job._tick()
+            self.assertEqual(job._latest_candidate_revision, 5)
+            self.assertEqual(service.compile_hashes, [])
+
+    def test_invalid_draft_pointer_defers_work_and_recovers_without_stopping(self):
+        service = _FakeWorkspaceService(self.root)
+        job = self._manual_job(service)
+        self._open_organization_draft()
+        gate = self.root / "ai" / "organize-code-gate.json"
+        before = gate.read_bytes()
+        gate.write_bytes(b"{broken")
+        changed = self.initial.replace(b"return 0", b"return 5")
+        self.source.write_bytes(changed)
+        with mock.patch.object(watcher_module.time, "monotonic", return_value=100.0) as clock:
+            job._tick()
+            clock.return_value = 101.2
+            job._tick()
+            self.assertEqual(job._state, "running")
+            self.assertEqual(service.compile_hashes, [])
+            gate.write_bytes(before)
+            clock.return_value = 101.3
+            job._tick()
+            self.assertFalse(job._draft_observation_error)
+            self.assertEqual(service.compile_hashes, [])
+            events = [item["type"] for item in job._events]
+            self.assertIn("organizationDraftObservationFailed", events)
+            self.assertIn("organizationDraftObservationRecovered", events)
+
+    def test_explicit_editor_save_remains_independent_of_organization_draft(self):
+        service = _FakeWorkspaceService(self.root)
+        job = self._manual_job(service)
+        self._open_organization_draft()
+        changed = self.initial.replace(b"return 0", b"return 8")
+        with mock.patch.object(watcher_module.time, "monotonic", return_value=100.0) as clock:
+            job._tick()
+            saved = job.save_source(_sha(self.initial), changed.decode("utf-8"))
+            self.assertTrue(saved["compileScheduled"])
+            clock.return_value = 100.11
+            job._tick()
+            self.assertEqual(service.compile_hashes, [_sha(changed)])
+            # A later ordinary filesystem draft is not covered by that save.
+            self.source.write_bytes(self.initial)
+            clock.return_value = 100.4
+            job._tick()
+            clock.return_value = 101.5
+            job._tick()
+            self.assertEqual(service.compile_hashes, [_sha(changed)])
+
+    def test_idle_poll_reuses_full_reads_and_rechecks_at_bounded_interval(self):
+        service = _FakeWorkspaceService(self.root)
+        job = self._manual_job(service)
+        with mock.patch.object(watcher_module.time, "monotonic", return_value=100.0) as clock, \
+                mock.patch.object(watcher_module, "_source_hash", wraps=watcher_module._source_hash) as source_read, \
+                mock.patch.object(watcher_module, "_already_compiled_candidate", wraps=watcher_module._already_compiled_candidate) as candidate_read, \
+                mock.patch.object(watcher_module, "source_observation_transaction", wraps=source_observation_transaction) as observation:
+            job._tick()
+            self.assertEqual((source_read.call_count, candidate_read.call_count), (1, 1))
+            observation.reset_mock()
+            for index in range(1, 20):
+                clock.return_value = 100.0 + index * 0.05
+                job._tick()
+            self.assertEqual((source_read.call_count, candidate_read.call_count), (1, 1))
+            observation.assert_not_called()
+            clock.return_value = 100.01 + watcher_module.FULL_OBSERVATION_INTERVAL_SECONDS
+            job._tick()
+            self.assertEqual((source_read.call_count, candidate_read.call_count), (2, 2))
+        self.assertEqual(service.compile_hashes, [])
+
+    def test_sibling_audit_writes_do_not_rescan_source_or_block_new_save(self):
+        service = _FakeWorkspaceService(self.root)
+        job = self._manual_job(service)
+        with mock.patch.object(watcher_module.time, "monotonic", return_value=100.0) as clock, \
+                mock.patch.object(watcher_module, "_source_hash", wraps=watcher_module._source_hash) as read:
+            job._tick()
+            sequence = job.snapshot()["observationSequence"]
+            with mock.patch.object(watcher_module, "source_observation_available") as available:
+                for index in range(20):
+                    self.assertIsNone(job.snapshot_if_changed(sequence))
+                available.assert_not_called()
+            for index in range(1, 20):
+                (self.root / ("audit-%d.json" % index)).write_text("{}", encoding="utf-8")
+                clock.return_value = 100.0 + index * 0.1
+                job._tick()
+            self.assertEqual(read.call_count, 1)
+            # A source atomic rename changes its identity even though its
+            # directory identity is unchanged. It must still compile promptly.
+            replacement = self.source.with_suffix(".pending")
+            changed = self.initial.replace(b"return 0", b"return 2")
+            replacement.write_bytes(changed)
+            os.replace(replacement, self.source)
+            clock.return_value = 102.0
+            job._tick()
+            self.assertEqual(job.snapshot_if_changed(sequence)["observedSourceSha256"], _sha(changed))
+            clock.return_value = 102.11
+            job._tick()
+        self.assertEqual(service.compile_hashes, [_sha(changed)])
+
+    def test_explicit_saved_retry_compiles_unchanged_draft_instead_of_adopting_candidate(self):
+        service = _FakeWorkspaceService(self.root)
+        job = self._manual_job(service)
+        self._open_organization_draft()
+        with mock.patch.object(watcher_module.time, "monotonic", return_value=100.0) as clock, \
+                mock.patch.object(watcher_module, "_already_compiled_candidate") as adopt:
+            job._tick()
+            for attempt in range(2):
+                clock.return_value = 101.0 + attempt
+                queued = job.request_saved_source_compile(_sha(self.initial))
+                self.assertTrue(queued["compileScheduled"])
+                clock.return_value += 0.11
+                job._tick()
+            self.assertEqual(service.compile_hashes, [_sha(self.initial)] * 2)
+            self.assertEqual(job._latest_candidate_revision, 2)
+            self.assertEqual(self.source.read_bytes(), self.initial)
+            adopt.assert_not_called()
+
+    def test_explicit_saved_retry_recovers_after_compile_failure(self):
+        service = _FakeWorkspaceService(self.root, fail_first=True)
+        job = self._manual_job(service)
+        self._open_organization_draft()
+        with mock.patch.object(watcher_module.time, "monotonic", return_value=100.0) as clock:
+            job.request_saved_source_compile(_sha(self.initial))
+            clock.return_value = 100.11
+            job._tick()
+            self.assertEqual(job._compile_failures, 1)
+            clock.return_value = 100.2
+            job.request_saved_source_compile(_sha(self.initial))
+            clock.return_value = 100.31
+            job._tick()
+            self.assertEqual(job._compile_successes, 1)
+            self.assertEqual(service.compile_hashes, [_sha(self.initial)] * 2)
+
+    def test_explicit_saved_request_refuses_source_race(self):
+        service = _FakeWorkspaceService(self.root)
+        job = self._manual_job(service)
+        changed = self.initial.replace(b"return 0", b"return 6")
+        self.source.write_bytes(changed)
+        with self.assertRaises(WorkspaceWatchConflictError):
+            job.request_saved_source_compile(_sha(self.initial))
+        self.assertEqual(service.compile_hashes, [])
+        self.assertEqual(job._explicit_compile_hash, "")
+        self.assertEqual(self.source.read_bytes(), changed)
+
+    def test_candidate_adoption_checks_include_content_not_just_root_hash(self):
+        from src.shader_workspace.compile_source_unit import capture_compilation_unit
+        source = b'#include "color.hlsli"\nfloat4 main() : SV_Target { return color(); }\n'
+        self.source.write_bytes(source)
+        header = self.source.parent / "color.hlsli"
+        header.write_bytes(b"float4 color() { return 0; }\n")
+        unit = capture_compilation_unit(self.source, source)
+        manifest = {"source": {"path": "source/shader.hlsl"}, "latestCompiled": {
+            "revision": 3, "sourceSha256": _sha(source), "rawSha256": "c" * 64,
+            "sourceDependencies": {"digest": unit["digest"]}}}
+        (self.root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertEqual(watcher_module._already_compiled_candidate(self.root, _sha(source))["revision"], 3)
+        header.write_bytes(b"float4 color() { return 1; }\n")
+        self.assertIsNone(watcher_module._already_compiled_candidate(self.root, _sha(source)))
+        self.assertEqual(self.source.read_bytes(), source)
+
+    def test_file_change_and_editor_save_keep_original_debounce(self):
+        service = _FakeWorkspaceService(self.root)
+        job = self._manual_job(service)
+        first = self.initial.replace(b"return 0", b"return 1")
+        second = self.initial.replace(b"return 0", b"return 2")
+        with mock.patch.object(watcher_module.time, "monotonic", return_value=100.0) as clock:
+            job._tick()
+            clock.return_value = 100.05
+            self.source.write_bytes(first)
+            job._tick()
+            self.assertEqual(job._observed_hash, _sha(first))
+            self.assertEqual(service.compile_hashes, [])
+            clock.return_value = 100.16
+            job._tick()
+            self.assertEqual(service.compile_hashes, [_sha(first)])
+            clock.return_value = 100.2
+            saved = job.save_source(_sha(first), second.decode("utf-8"))
+            self.assertTrue(saved["compileScheduled"])
+            clock.return_value = 100.25
+            job._tick()
+            self.assertEqual(service.compile_hashes, [_sha(first)])
+            clock.return_value = 100.31
+            job._tick()
+            self.assertEqual(service.compile_hashes, [_sha(first), _sha(second)])
+            with self.assertRaises(WorkspaceWatchConflictError):
+                job.save_source(_sha(first), self.initial.decode("utf-8"))
+
+    def test_periodic_read_detects_content_change_even_when_fingerprint_is_preserved(self):
+        service = _FakeWorkspaceService(self.root)
+        job = self._manual_job(service)
+        fingerprints = {path: watcher_module._poll_file_fingerprint(path) for path in
+                        (self.root, self.source.parent, self.source, self.root / "manifest.json")}
+        original_stat = self.source.stat()
+        changed = self.initial.replace(b"return 0", b"return 3")
+        with mock.patch.object(watcher_module.time, "monotonic", return_value=100.0) as clock, \
+                mock.patch.object(watcher_module, "_poll_file_fingerprint", side_effect=fingerprints.get):
+            job._tick()
+            self.source.write_bytes(changed)
+            os.utime(self.source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            clock.return_value = 100.5
+            job._tick()
+            self.assertEqual(job._observed_hash, _sha(self.initial))
+            clock.return_value = 100.01 + watcher_module.FULL_OBSERVATION_INTERVAL_SECONDS
+            job._tick()
+            self.assertEqual(job._observed_hash, _sha(changed))
+            clock.return_value += 0.11
+            job._tick()
+        self.assertEqual(service.compile_hashes, [_sha(changed)])
+
+    def test_new_manifest_candidate_is_adopted_without_waiting_for_periodic_read(self):
+        service = _FakeWorkspaceService(self.root)
+        job = self._manual_job(service)
+        with mock.patch.object(watcher_module.time, "monotonic", return_value=100.0) as clock:
+            job._stable_since = 99.0
+            job._tick()
+            published = {"sourceSha256": _sha(self.initial), "revision": 7,
+                         "rawSha256": _sha(b"new candidate")}
+            (self.root / "manifest.json").write_text(json.dumps({"latestCompiled": published}), encoding="utf-8")
+            clock.return_value = 100.05
+            job._tick()
+        self.assertEqual(job._latest_candidate_revision, 7)
+        self.assertEqual(job._latest_candidate_raw_sha256, published["rawSha256"])
+        self.assertEqual(service.compile_hashes, [])
+
+    def test_invalid_source_observation_recovers_without_periodic_delay(self):
+        service = _FakeWorkspaceService(self.root)
+        job = self._manual_job(service)
+        with mock.patch.object(watcher_module.time, "monotonic", return_value=100.0) as clock:
+            job._tick()
+            self.source.write_bytes(b"\xff")
+            clock.return_value = 100.05
+            job._tick()
+            self.assertIsNotNone(job._observation_error_key)
+            self.source.write_bytes(self.initial)
+            clock.return_value = 100.1
+            job._tick()
+        self.assertIsNone(job._observation_error_key)
+        self.assertEqual(service.compile_hashes, [])
+        self.assertIn("observationRecovered", [event["type"] for event in job._events])
+
     def test_debounce_and_latest_saved_revision_wins(self) -> None:
         service = _FakeWorkspaceService(self.root, block_first=True)
         manager = self._manager(service)
@@ -163,6 +449,78 @@ class ShaderWorkspaceWatcherTests(unittest.TestCase):
         self.assertEqual(audit["lastCompiledSourceSha256"], _sha(newest))
         stopped = manager.stop(watch_id)
         self.assertEqual(stopped["state"], "stopped")
+
+    def test_suspended_watcher_ignores_restore_writes_and_adopts_the_result(self) -> None:
+        # A project restore writes the project HLSL, compiles and applies it
+        # itself, and may roll the source back. None of those writes is an
+        # editor save; the watcher must stay quiet and then treat whatever is
+        # on disk as its new baseline.
+        service = _FakeWorkspaceService(self.root)
+        manager = self._manager(service)
+        watch_id = manager.start(self.root, 100)["watchId"]
+        restored = b"float4 main() : SV_Target { return 3; }\n"
+        with manager.suspend_workspace(self.root, "project-restore") as paused:
+            self.assertEqual(1, paused)
+            self.source.write_bytes(restored)
+            time.sleep(0.4)
+            self.assertEqual(service.compile_hashes, [])
+        time.sleep(0.4)
+        self.assertEqual(service.compile_hashes, [])
+        status = manager.poll(watch_id)
+        self.assertEqual(status["observedSourceSha256"], _sha(restored))
+        event_types = [event["type"] for event in status["events"]]
+        self.assertIn("watchSuspended", event_types)
+        self.assertIn("watchResumed", event_types)
+        # A real editor save after the restore is still compiled.
+        edited = b"float4 main() : SV_Target { return 4; }\n"
+        self.source.write_bytes(edited)
+        caught_up = self._wait_for(
+            manager, watch_id,
+            lambda result: result["caughtUp"] and result["compileSuccesses"] == 1,
+        )
+        self.assertEqual(service.compile_hashes, [_sha(edited)])
+        self.assertEqual(caught_up["lastCompiledSourceSha256"], _sha(edited))
+        manager.stop(watch_id)
+
+    def test_review_temporary_candidate_is_not_observed_and_final_revision_is_adopted(self):
+        service = _FakeWorkspaceService(self.root)
+        def publish(source, revision):
+            service.latest = {"sourceSha256": _sha(source), "revision": revision,
+                              "rawSha256": _sha(b"compiled:" + source)}
+            (self.root / "manifest.json").write_text(
+                json.dumps({"latestCompiled": service.latest}), encoding="utf-8")
+
+        publish(self.initial, 1)
+        manager = self._manager(service)
+        watch_id = manager.start(self.root, 100)["watchId"]
+        proposal = b"float4 main() : SV_Target { return 9; }\n"
+        with source_observation_transaction(self.root):
+            self.source.write_bytes(proposal)
+            publish(proposal, 2)
+            time.sleep(0.3)
+            snapshots = []
+            reader = threading.Thread(target=lambda: snapshots.append(manager.poll(watch_id)))
+            reader.start()
+            reader.join(2.0)
+            self.assertFalse(reader.is_alive())
+            self.assertTrue(snapshots[0]["sourceObservationPaused"])
+            self.assertFalse(snapshots[0]["caughtUp"])
+            self.assertEqual(snapshots[0]["latestCandidateRevision"], 1)
+            self.assertEqual(service.compile_hashes, [])
+            self.source.write_bytes(self.initial)
+            publish(self.initial, 3)
+        result = self._wait_for(manager, watch_id,
+            lambda state: state["caughtUp"] and state["latestCandidateRevision"] == 3)
+        self.assertEqual(result["lastCompiledSourceSha256"], _sha(self.initial))
+        self.assertEqual(service.compile_hashes, [])
+        self.assertEqual([event["revision"] for event in result["events"]
+                          if event["type"] == "compileAdopted"], [3])
+        # A later ordinary editor save remains observable and compiles normally.
+        edited = b"float4 main() : SV_Target { return 4; }\n"
+        self.source.write_bytes(edited)
+        self._wait_for(manager, watch_id, lambda state: state["caughtUp"]
+                       and state["lastCompiledSourceSha256"] == _sha(edited))
+        self.assertEqual(service.compile_hashes, [_sha(edited)])
 
     def test_editor_save_uses_real_cas_and_schedules_the_new_source(self) -> None:
         service = _FakeWorkspaceService(self.root)
@@ -295,8 +653,7 @@ class ShaderWorkspaceWatcherTests(unittest.TestCase):
                     message = str(caught.exception)
                     self.assertIn("requires a toolchain refresh", message)
                     self.assertIn(diagnostic, message)
-                    self.assertIn("migrate_shader_workspace_toolchain(in_place=true)", message)
-                    self.assertIn("get_shader_workspace_status.requiredAction", message)
+                    self.assertIn("get_shader_workspace_status", message)
                     self.assertNotIn("requires the executable-editable", message)
                     self.assertEqual(len(calls), 2 if after_lease else 1)
                     self.assertFalse((self.root / ".workspace-watch.lock").exists())
@@ -310,7 +667,7 @@ class ShaderWorkspaceWatcherTests(unittest.TestCase):
         status["representation"]["compileEligible"] = False
         status["toolchainStatus"] = "refresh-required"
         status["toolchainDiagnostic"] = "changed tool: " + "x" * 10000
-        status["requiredAction"] = {"tool": "never-execute-this-action", "payload": "y" * 10000}
+        status["unrelatedMetadata"] = {"tool": "never-execute-this-action", "payload": "y" * 10000}
         service.status = lambda _path: status
         manager = self._manager(service)
         with self.assertRaises(WorkspaceWatchError) as caught:
@@ -319,7 +676,7 @@ class ShaderWorkspaceWatcherTests(unittest.TestCase):
         self.assertLess(len(message), 1400)
         self.assertIn("changed tool: ", message)
         self.assertIn("[truncated]", message)
-        self.assertIn("migrate_shader_workspace_toolchain(in_place=true)", message)
+        self.assertIn("get_shader_workspace_status", message)
         self.assertNotIn("never-execute-this-action", message)
         self.assertNotIn("yyyy", message)
         self.assertEqual(service.compile_hashes, [])
@@ -695,118 +1052,51 @@ class ShaderWorkspaceWatcherTests(unittest.TestCase):
             manager.poll("../../not-a-watch")
         manager.stop(watch_id)
 
-    def test_cross_process_lease_is_fail_closed_and_token_owned(self) -> None:
+    def test_watchers_share_a_workspace_and_a_stale_exclusive_lock_is_retired(self) -> None:
+        """Nobody owns the source: two watchers coexist; an old crash lock never blocks."""
+
+        from src.shader_workspace.leases import participants
+
+        # Residue of the retired exclusive design: a lock file from a crashed
+        # older build. It is moved aside, not honoured.
+        stale = self.root / ".workspace-watch.lock"
+        stale.write_text("crashed-owner-token\n", encoding="ascii")
         first_service = _FakeWorkspaceService(self.root)
         second_service = _FakeWorkspaceService(self.root)
         first = self._manager(first_service)
         second = self._manager(second_service)
-        watch_id = first.start(self.root, 100)["watchId"]
-        lease_path = self.root / ".workspace-watch.lock"
-        owner_token = lease_path.read_bytes()
-        self.assertEqual(len(owner_token), 33)
-
-        with self.assertRaisesRegex(WorkspaceWatchError, "cross-process watch lease"):
-            second.start(self.root, 100)
-        self.assertEqual(lease_path.read_bytes(), owner_token)
-        stopped = first.stop(watch_id)
-        self.assertTrue(stopped["events"][-1]["watchLeaseReleased"])
-        self.assertFalse(lease_path.exists())
+        first_id = first.start(self.root, 100)["watchId"]
+        self.assertFalse(stale.exists())
+        retired = list((self.root / "watch").glob("retired-exclusive-lease-*.lock"))
+        self.assertEqual(len(retired), 1)
+        self.assertEqual(retired[0].read_text(encoding="ascii"), "crashed-owner-token\n")
 
         second_id = second.start(self.root, 100)["watchId"]
-        lease_path.write_text("another-process-token\n", encoding="ascii")
-        retained = second.stop(second_id)
-        self.assertFalse(retained["events"][-1]["watchLeaseReleased"])
-        self.assertEqual(
-            lease_path.read_text(encoding="ascii"), "another-process-token\n"
-        )
-        lease_path.unlink()
+        self.assertNotEqual(first_id, second_id)
+        self.assertEqual(len(participants(self.root)), 2)
+        stopped = first.stop(first_id)
+        self.assertTrue(stopped["events"][-1]["watchLeaseReleased"])
+        self.assertEqual(len(participants(self.root)), 1)
+        second.stop(second_id)
+        self.assertEqual(participants(self.root), [])
 
-    def test_preexisting_crash_lease_is_never_stolen(self) -> None:
-        service = _FakeWorkspaceService(self.root)
-        manager = self._manager(service)
-        lease_path = self.root / ".workspace-watch.lock"
-        lease_path.write_text("crashed-owner-token\n", encoding="ascii")
-        with self.assertRaisesRegex(WorkspaceWatchError, "never assumed stale"):
-            manager.start(self.root, 100)
-        self.assertEqual(
-            lease_path.read_text(encoding="ascii"), "crashed-owner-token\n"
-        )
-        lease_path.unlink()
+    def test_lease_is_a_participant_record_not_an_exclusion(self) -> None:
+        from src.shader_workspace.leases import participants
 
-    def test_persistent_host_resume_archives_only_a_different_v2_owner_lease(self) -> None:
-        previous = WorkspaceSourceTransactionLease(
-            self.root, owner_instance_id="1" * 32
-        )
-        previous.acquire()
-        lease_path = self.root / ".workspace-watch.lock"
-        old_payload = json.loads(lease_path.read_text(encoding="utf-8"))
-
-        current = WorkspaceSourceTransactionLease(
-            self.root,
-            owner_instance_id="2" * 32,
-            recover_orphaned=True,
-        )
-        current.acquire()
-        new_payload = json.loads(lease_path.read_text(encoding="utf-8"))
-        self.assertEqual(new_payload["ownerInstanceId"], "2" * 32)
-        archive = self.root / "watch" / (
-            "orphaned-lease-%s-%s.json"
-            % (old_payload["ownerInstanceId"], old_payload["token"])
-        )
-        self.assertTrue(archive.is_file())
-        self.assertEqual(
-            json.loads(archive.read_text(encoding="utf-8")), old_payload
-        )
-        self.assertTrue(current.release())
-
-    def test_explicit_migration_takeover_archives_exact_legacy_lease(self) -> None:
-        legacy = WorkspaceSourceTransactionLease(self.root)
-        legacy.acquire()
-        lease_path = self.root / ".workspace-watch.lock"
-        legacy_payload = lease_path.read_bytes()
-        legacy_token = legacy_payload.decode("ascii").strip()
-
-        current = WorkspaceSourceTransactionLease(
-            self.root,
-            owner_instance_id="2" * 32,
-            recover_orphaned=True,
-            recover_legacy=True,
-        )
-        current.acquire()
-        archive = self.root / "watch" / (
-            "orphaned-legacy-lease-%s.lock" % legacy_token
-        )
-        self.assertEqual(archive.read_bytes(), legacy_payload)
-        new_payload = json.loads(lease_path.read_text(encoding="utf-8"))
-        self.assertEqual(new_payload["ownerInstanceId"], "2" * 32)
-        self.assertTrue(current.release())
-
-    def test_legacy_takeover_requires_process_owner_and_explicit_recovery(self) -> None:
-        with self.assertRaisesRegex(Exception, "legacy lease recovery"):
-            WorkspaceSourceTransactionLease(
-                self.root,
-                owner_instance_id="2" * 32,
-                recover_legacy=True,
-            )
-
-    def test_persistent_host_resume_never_steals_same_generation_lease(self) -> None:
-        previous = WorkspaceSourceTransactionLease(
-            self.root, owner_instance_id="3" * 32
-        )
-        previous.acquire()
-        contender = WorkspaceSourceTransactionLease(
-            self.root,
-            owner_instance_id="3" * 32,
-            recover_orphaned=True,
-        )
-        with self.assertRaisesRegex(WorkspaceWatchError, "never assumed stale"):
-            # WatchManager wraps this error in production; use the same public
-            # exception text contract for the lower-level lease here.
-            try:
-                contender.acquire()
-            except Exception as exc:
-                raise WorkspaceWatchError(str(exc)) from exc
-        self.assertTrue(previous.release())
+        one = WorkspaceSourceTransactionLease(self.root, owner_instance_id="1" * 32)
+        two = WorkspaceSourceTransactionLease(self.root, owner_instance_id="1" * 32,
+                                              recover_orphaned=True, recover_legacy=True)
+        one.acquire()
+        two.acquire()
+        self.assertTrue(one.owned and two.owned)
+        self.assertFalse((self.root / ".workspace-watch.lock").exists())
+        owners = {item["ownerInstanceId"] for item in participants(self.root)}
+        self.assertEqual(owners, {"1" * 32})
+        self.assertEqual(len(participants(self.root)), 2)
+        self.assertTrue(one.release())
+        self.assertFalse(one.release())
+        self.assertTrue(two.release())
+        self.assertEqual(participants(self.root), [])
 
 
 if __name__ == "__main__":

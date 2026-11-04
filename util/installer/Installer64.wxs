@@ -130,6 +130,11 @@
             </File>
           </Component>
 
+          <!-- Bread AI runtime + bundled unpackers; the files themselves are
+               harvested into the BreadRuntimeFiles group by heat. -->
+          <Directory Id='BreadRuntimeDirRef' Name='replaylab' />
+          <Directory Id='BreadIntegrationsDirRef' Name='integrations' />
+
           <Directory Id='qtplugins' Name='qtplugins'>
             <Directory Id='qtplugins_imageformats' Name='imageformats'>
               <Component Id='qt_imgplugin' Win64="yes" Guid='4346BD2C-4005-47FF-BEE7-9C30978EF7E5'>
@@ -436,6 +441,13 @@
         <ComponentRef Id='d3d12_plugin' />
 
         <ComponentRef Id='renderdocX86Bins' />
+
+        <!-- The Bread AI runtime and the unpackers that ship with it, harvested from
+             the built application by heat (util/buildscripts/scripts/make_package_win32.sh).
+             The group always exists: heat runs against a folder the script creates first,
+             so an installer built without a runtime still links. -->
+        <ComponentGroupRef Id='BreadRuntimeFiles' />
+        <ComponentGroupRef Id='BreadIntegrationFiles' />
 
         <ComponentRef Id='ProgramMenuDir' />
 

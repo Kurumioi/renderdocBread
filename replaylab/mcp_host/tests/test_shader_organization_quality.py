@@ -1,64 +1,83 @@
-from src.shader_workspace.quality import organization_quality, organization_quality_issues
-from src.shader_workspace.templates import organization_contract, organization_structure_issues
+from unittest.mock import patch
+
+from src.shader_workspace.inspection import _Program
+from src.shader_workspace.quality import declared_binding_inventory, organization_quality
 
 
-def codes(source):
-    return {item["code"] for item in organization_quality_issues(source)}
+def test_many_anonymous_locals_use_linear_quality_reference_scan():
+    source = (
+        "float Compute(float inputValue)\n{\n"
+        + "\n".join("    float _%d = inputValue + %d.0f;" % (1000 + i, i)
+                    for i in range(300))
+        + "\n    return _1299;\n}\n"
+    )
+    original_word = _Program.word
+    calls = 0
 
+    def counted_word(program, index):
+        nonlocal calls
+        calls += 1
+        return original_word(program, index)
 
-def test_small_helpers_cannot_hide_anonymous_data_behind_statement_threshold():
-    source = "struct Data { float _2323; };\nvoid Compute(inout Data data) { float _9 = data._2323 * 2; data._2323 = _9; }"
-    assert organization_contract(source)["needsAlgorithmRestructuring"]
-    assert "algorithm-anonymous-values" in codes(source)
-    assert "algorithm-anonymous-values" in {item["code"] for item in organization_structure_issues(source, source, {})}
+    with patch.object(_Program, "word", counted_word):
+        metrics = organization_quality(source)["functions"][0]
+    assert metrics["anonymousIdentifierCount"] == 300
+    assert metrics["anonymousIdentifierLocations"][0] == {"name": "_1000", "line": 3}
+    assert calls < 100_000  # 300 independent names must not scan the body 300 times
 
+def test_custom_and_comma_locals_shadow_flat_cbuffer_without_regex_guesses():
+    source = (
+        "struct Scalar { float value; };\n"
+        "cbuffer Material : register(b1) { float _2 : packoffset(c0.x); };\n"
+        "float Compute() { Scalar _2; return _2.value; }\n"
+        "float Other() { float value, _2 = 1.0; return _2; }"
+    )
+    quality = organization_quality(source)
+    assert quality["physicalPlaceholderCount"] == 0
+    assert all(item["anonymousIdentifierCount"] for item in quality["functions"])
 
-def test_neutral_operation_names_do_not_require_invented_business_meaning():
-    source = "float Compute(float x, float y) { float radialDistance = sqrt(x*x + y*y); return radialDistance; }"
-    assert organization_quality_issues(source) == []
+def test_constant_buffer_array_and_owner_shadow_are_source_bound():
+    source = (
+        "struct MaterialData { float _2; };\n"
+        "ConstantBuffer<MaterialData> materials[2] : register(b1);\n"
+        "float Bound(uint i) { return materials[i]._2; }\n"
+        "float Shadow(MaterialData materials) { return materials._2; }"
+    )
+    quality = organization_quality(source)
+    assert quality["functions"][0]["physicalPlaceholders"] == ["materials._2"]
+    assert quality["functions"][1]["physicalPlaceholders"] == []
+    assert quality["functions"][1]["anonymousIdentifierCount"] == 1
 
+def test_unbound_same_line_resources_get_distinct_stable_neutral_names():
+    source = "Texture2D _32; Texture2D _36; float4 MainPS():SV_Target{return 0;}"
+    rows = [item for item in declared_binding_inventory(source) if item["kind"] == "texture"]
+    assert [item["renameSelector"] for item in rows] == ["resource:_32", "resource:_36"]
+    assert len({item["neutralName"] for item in rows}) == 2
+    assert all("AtLine1D" in item["neutralName"] for item in rows)
 
-def test_physical_cbuffer_field_names_are_not_compiler_temporaries():
-    source = "cbuffer Original : register(b0) { float _2 : packoffset(c0.x); };\nfloat Compute() { return _2; }"
-    assert organization_quality_issues(source) == []
-    assert "algorithm-anonymous-values" in codes(source.replace("return _2", "float _2 = 1; return _2"))
-    assert "algorithm-anonymous-values" in codes(source.replace("Compute()", "Compute(float _2)"))
-    assert "algorithm-anonymous-values" in codes(source.replace("float Compute()", "struct Data { float _2; }; float Compute(Data data)").replace("return _2", "return data._2"))
+def test_inventory_covers_modern_hlsl_resource_classes_without_use_sites():
+    source = (
+        "RasterizerOrderedTexture2D<float4> _20 : register(u0);\n"
+        "RasterizerOrderedBuffer<uint> _21 : register(u1);\n"
+        "RWStructuredBuffer<float4> _22 : register(u2);\n"
+        "ByteAddressBuffer _23 : register(t3);\n"
+        "RaytracingAccelerationStructure _24 : register(t4);\n"
+        "SamplerComparisonState s5 : register(s5);\n"
+        "float4 MainPS():SV_Target{return 0;}"
+    )
+    rows = declared_binding_inventory(source)
+    assert {item["renameSelector"] for item in rows} == {
+        "resource:_20", "resource:_21", "resource:_22", "resource:_23",
+        "resource:_24", "resource:s5",
+    }
+    assert next(item for item in rows if item["name"] == "_24")["kind"] == "resource"
 
-
-def test_comment_strings_and_macros_do_not_create_anonymous_local_findings():
-    source = '#define RAW_LABEL "_123"\nfloat Compute() { /* float _9; */ // _21\nreturn 1; }'
-    assert organization_quality_issues(source) == []
-
-
-def test_relabeling_temporaries_and_fixed_sized_chunks_is_not_organization():
-    body = "\n".join("value = value + 0.0;" for _ in range(30))
-    source = "float EvaluateLightStage2(float temp123) { float value = temp123;\n" + body + "\nreturn value; }"
-    assert {"algorithm-anonymous-values", "algorithm-mechanical-partition"} <= codes(source)
-
-
-def test_section_comments_are_inside_real_long_function():
-    body = "\n".join("    value = value + 0.0;" for _ in range(42))
-    source = "// Long outside description\nfloat Compute(float value) {\n" + body + "\n" + body + "\nreturn value; }"
-    assert "algorithm-long-function-sections" in codes(source)
-    explained = source.replace(body + "\n" + body, "    // Prepare the captured input contribution.\n" + body +
-                               "\n    // Combine the contribution with the output accumulator.\n" + body)
-    assert "algorithm-long-function-sections" not in codes(explained)
-
-
-def test_oversized_expression_is_actionable_warning_not_semantic_failure():
-    source = "float Compute(float value) { return " + " + ".join(["value"] * 95) + "; }"
-    issues = organization_quality_issues(source)
-    assert [item["code"] for item in issues] == ["algorithm-dense-expressions"]
-    assert issues[0]["severity"] == "warning"
-    assert all(issues[0][key] for key in ("location", "direction", "target", "example"))
-    assert organization_quality(source)["policy"]["appliesToIntentionalUserEdits"] is False
-
-
-def test_warning_volume_cannot_push_a_blocker_out_of_feedback_budget():
-    expression = " + ".join(["value"] * 95)
-    source = "\n".join("float Helper%d(float value) { return %s; }" % (index, expression) for index in range(70))
-    source += "\nfloat Last(float _99) { return _99; }"
-    issues = organization_quality_issues(source)
-    assert len(issues) == 64
-    assert issues[0]["code"] == "algorithm-anonymous-values"
+def test_inventory_keeps_generated_empty_and_unresolved_typed_cbuffer_owners():
+    source = (
+        "cbuffer cb0 : register(b0) {};\n"
+        "ConstantBuffer<UnavailableLayout> cb1 : register(b1);\n"
+        "float4 MainPS():SV_Target{return 0;}"
+    )
+    rows = declared_binding_inventory(source)
+    assert {item["renameSelector"] for item in rows} == {"cbuffer:cb0", "cbuffer:cb1"}
+    assert all(item["generatedPhysicalName"] for item in rows)

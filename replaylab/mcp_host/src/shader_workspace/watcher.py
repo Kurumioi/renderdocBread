@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import re
 import stat
@@ -22,44 +23,62 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .errors import WorkspaceWatchConflictError, WorkspaceWatchError
-from .diagnostics import classify_shader_failure
+from .diagnostics import classify_shader_failure, parse_compiler_diagnostics
 from .io import atomic_write_json, is_within
 from .leases import WorkspaceSourceLeaseError, WorkspaceSourceTransactionLease
+from .source_observation import source_observation_available, source_observation_transaction
 from .organization import (
     MAX_SOURCE_BYTES as MAX_ORGANIZED_SOURCE_BYTES,
     ShaderOrganizationError,
     _source_compare_and_swap,
+    active_draft_id,
 )
 from .workspace import MAX_SOURCE_BYTES, ShaderWorkspaceService
+from .status_snapshot import bound_status_snapshot
+from ..shader_scheduler import ScheduledTask, is_current_task
 
 WATCH_SCHEMA = "renderdoc-ultra-shader-watch/v1"
 WATCH_VERSION = 1
 MIN_DEBOUNCE_MS = 100
 MAX_DEBOUNCE_MS = 5000
 DEFAULT_DEBOUNCE_MS = 100
-MAX_ACTIVE_WATCHERS = 8
+MAX_ACTIVE_WATCHERS = 128
+_COMPILER_SLOTS = threading.BoundedSemaphore(2)
 MAX_RETAINED_WATCHERS = 32
 MAX_AUDIT_EVENTS = 128
 STOP_JOIN_SECONDS = 2.0
+# Metadata notices ordinary saves on the next debounce tick. Full reads are a
+# fallback for writers preserving all timestamps, not a per-second revalidation
+# of every restored stage. Explicit save/compile/apply still reads actual bytes.
+FULL_OBSERVATION_INTERVAL_SECONDS = 30.0
 MAX_TRANSIENT_COMPILE_RETRIES = 2
 TRANSIENT_COMPILE_RETRY_DELAYS = (0.10, 0.25)
 MAX_COMPILER_DIAGNOSTICS = 128
 MAX_COMPILER_DIAGNOSTIC_BYTES = 1024 * 1024
 _WATCH_ID = re.compile(r"^[0-9a-f]{32}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_DXC_COLON_DIAGNOSTIC = re.compile(
-    r"^(?P<file>.+?):(?P<line>\d+):(?P<column>\d+):\s*"
-    r"(?P<severity>fatal\s+error|error|warning|note)\s*:?[ \t]*"
-    r"(?P<message>.*)$",
-    flags=re.IGNORECASE,
-)
-_DXC_PAREN_DIAGNOSTIC = re.compile(
-    r"^(?P<file>.+?)\((?P<line>\d+)(?:\s*,\s*(?P<column>\d+))?\)\s*:"
-    r"\s*(?P<severity>fatal\s+error|error|warning|note)\b\s*:?[ \t]*"
-    r"(?P<message>.*)$",
-    flags=re.IGNORECASE,
-)
 _JOB_HINT = re.compile(r"(?:^|[;\s])see\s+(.+?)\s*$", flags=re.IGNORECASE)
+
+
+def validate_watch_start_status(status_result: dict) -> None:
+    """Reject non-executable/stale workspaces before replay preflight."""
+
+    source_record = status_result.get("source")
+    if not isinstance(source_record, dict) or source_record.get("present") is not True:
+        raise WorkspaceWatchError(
+            "workspace must contain a tracked decompiled source before watching"
+        )
+    representation = status_result.get("representation")
+    if (
+        source_record.get("lane") != "executable-editable"
+        or not isinstance(representation, dict)
+        or representation.get("lane") != "executable-editable"
+        or representation.get("compileEligible") is not True
+    ):
+        raise WorkspaceWatchError(
+            _watch_start_rejection(
+                status_result, "save watching requires the executable-editable shader lane")
+        )
 
 
 def _exception_chain(error: BaseException):
@@ -101,17 +120,18 @@ def _diagnostic_texts(root: Path, error: BaseException) -> list[str]:
         hinted = Path(match.group(1).strip().strip('"'))
         try:
             job = hinted.resolve(strict=True)
-            stderr = job / "stderr.log"
             if (
                 not is_within(jobs_root, job)
                 or job == jobs_root
-                or job.is_symlink()
-                or stderr.is_symlink()
-                or not stderr.is_file()
-                or stderr.stat().st_size > MAX_COMPILER_DIAGNOSTIC_BYTES
+                or hinted.is_symlink()
             ):
                 continue
-            texts.append(stderr.read_text(encoding="utf-8", errors="replace"))
+            for name in ("stderr.log", "stdout.log"):
+                stream = job / name
+                if (stream.is_symlink() or not stream.is_file()
+                        or stream.stat().st_size > MAX_COMPILER_DIAGNOSTIC_BYTES):
+                    continue
+                texts.append(stream.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
     return texts
@@ -120,35 +140,24 @@ def _diagnostic_texts(root: Path, error: BaseException) -> list[str]:
 def _compiler_diagnostics(
     root: Path, source_path: Path, error: BaseException
 ) -> list[dict[str, Any]]:
-    """Parse common DXC diagnostics into console/link-friendly records."""
+    """Parse target compiler diagnostics into console/link-friendly records."""
 
     diagnostics: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
-    jobs_root = (root / "jobs").resolve()
-    for text_value in _diagnostic_texts(root, error):
-        for raw_line in text_value.splitlines():
-            line = raw_line.strip()
-            match = _DXC_COLON_DIAGNOSTIC.match(line)
-            if match is None:
-                match = _DXC_PAREN_DIAGNOSTIC.match(line)
-            if match is None:
-                continue
-            file_value = match.group("file").strip().strip('"')
+    texts = _diagnostic_texts(root, error)
+    for text_value in texts:
+        for record in parse_compiler_diagnostics(text_value, source_path.name):
+            file_value = record["file"]
             try:
-                diagnostic_path = Path(file_value).resolve()
-                if is_within(jobs_root, diagnostic_path):
+                # Includes and generated later-hop code do not share the main
+                # document's line numbers. Only its same-language compiler copy
+                # can be mapped without a source map.
+                if Path(file_value.replace("\\", "/")).name.lower() in {
+                        "input" + source_path.suffix.lower(), source_path.name.lower()}:
                     file_value = str(source_path)
             except OSError:
                 pass
-            severity = match.group("severity").lower().replace("fatal error", "error")
-            message = _bounded_text(match.group("message"), 4096)
-            record = {
-                "file": file_value,
-                "line": int(match.group("line")),
-                "column": int(match.group("column") or 1),
-                "severity": severity,
-                "message": message,
-            }
+            record["file"] = file_value
             key = tuple(record.values())
             if key in seen:
                 continue
@@ -158,13 +167,21 @@ def _compiler_diagnostics(
                 return diagnostics
     if diagnostics:
         return diagnostics
+    # Link/target failures may have no source line. Keep the compiler's reason
+    # visible without fabricating a line-one error in the edited document.
+    reasons = []
+    for text_value in texts:
+        for line in text_value.splitlines():
+            match = re.match(r"^\s*(?:fatal\s+error|error)\s*:\s*(.+)$", line, re.I)
+            if match and match.group(1) not in reasons:
+                reasons.append(match.group(1))
     return [
         {
             "file": str(source_path),
             "line": None,
             "column": None,
             "severity": "error",
-            "message": _bounded_text(error, 4096),
+            "message": _bounded_text("\n".join(reasons) if reasons else error, 4096),
         }
     ]
 
@@ -195,12 +212,10 @@ def _watch_start_rejection(status: dict, fallback: str) -> str:
     ):
         return fallback
     diagnostic = _bounded_text(status.get("toolchainDiagnostic") or "toolchain binding is stale", 1024)
-    # This is a backend failure diagnostic, not a normal UI label. Never copy
-    # arbitrary requiredAction fields into it or automatically execute a refresh.
+    # This is a backend failure diagnostic, not a normal UI label.
     return (
         "save watching requires a toolchain refresh: %s; "
-        "use migrate_shader_workspace_toolchain(in_place=true) with the current "
-        "paths and CAS hashes from get_shader_workspace_status.requiredAction"
+        "get_shader_workspace_status reports the source and route-plan identities"
     ) % diagnostic
 
 
@@ -291,6 +306,59 @@ def _source_hash(root: Path, expected_source: Path) -> str:
     return hashlib.sha256(_source_bytes(root, expected_source)).hexdigest()
 
 
+def _poll_file_fingerprint(path: Path) -> tuple | None:
+    """Cheap observation hint only; never authorizes saving or compilation."""
+    try:
+        info = path.stat(follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            # Sibling audit/lock writes do not change this source. Still notice
+            # directory replacement/redirection; the source stamp notices saves.
+            return (info.st_dev, info.st_ino, info.st_mode,
+                    getattr(info, "st_file_attributes", 0))
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns,
+                getattr(info, "st_file_attributes", 0))
+    except OSError:
+        return None
+
+
+def _already_compiled_candidate(root: Path, source_hash: str) -> dict[str, Any] | None:
+    """The manifest's latest candidate when it was built from exactly this source."""
+
+    try:
+        path = Path(root) / "manifest.json"
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+            return None
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    latest = manifest.get("latestCompiled") if isinstance(manifest, dict) else None
+    if not isinstance(latest, dict) or latest.get("sourceSha256") != source_hash:
+        return None
+    # Equal root text does not identify the compilation unit after editing an
+    # include. Never adopt a candidate built against different header bytes.
+    try:
+        source_record = manifest.get("source") or {}
+        if not isinstance(source_record, dict) or (
+                "sourceDependencies" in latest and not isinstance(latest["sourceDependencies"], dict)):
+            return None
+        source_path = root / str(source_record.get("path") or "source/shader.hlsl")
+        from .compile_source_unit import current_dependencies
+        if not current_dependencies(source_path, _source_bytes(root, source_path), latest)["current"]:
+            return None
+    except (OSError, ValueError, TypeError, WorkspaceWatchError):
+        return None
+    revision = latest.get("revision")
+    raw = latest.get("rawSha256")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        return None
+    if not isinstance(raw, str) or _SHA256.fullmatch(raw) is None:
+        return None
+    return {"sourceSha256": source_hash, "revision": revision, "rawSha256": raw, "adopted": True,
+            "manualFastCompile": latest.get("manualFastCompile") is True,
+            "compilationCacheHit": latest.get("manualCompileCache") is not None}
+
+
 class _WatchJob:
     def __init__(
         self,
@@ -324,11 +392,7 @@ class _WatchJob:
         # while that bounded write is in progress without blocking snapshots.
         self._source_io_lock = threading.RLock()
         self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="shader-watch-%s" % watch_id[:8],
-            daemon=True,
-        )
+        self._thread = ScheduledTask(self._run, name="shader-watch-%s" % watch_id[:8], lane="watch")
         self._state = "starting"
         self._created_at = _utc_now()
         self._started_at: str | None = None
@@ -355,6 +419,10 @@ class _WatchJob:
         self._stable_since = time.monotonic()
         self._compile_in_progress = False
         self._pending = False
+        # A project restore owns this workspace's source for the length of its
+        # transaction; the watcher must not treat the restore's writes (or its
+        # rollback) as editor saves and race it with its own compile/apply.
+        self._suspended_by = ""
         self._compile_attempts = 0
         self._compile_successes = 0
         self._compile_failures = 0
@@ -363,7 +431,20 @@ class _WatchJob:
         self._transient_retry_due = 0.0
         self._last_error: dict[str, Any] | None = None
         self._observation_error_key: tuple[str, str] | None = None
+        self._source_poll_fingerprint: tuple | None = None
+        self._source_full_observation_at = float("-inf")
+        self._candidate_poll_key: tuple | None = None
+        self._candidate_full_observation_at = float("-inf")
+        self._candidate_poll_result: dict | None = None
+        self._draft_poll_key: tuple | None = None
+        self._draft_full_observation_at = float("-inf")
+        self._active_draft_id = ""
+        self._draft_observation_error = ""
+        self._deferred_draft_hash = ""
+        self._explicit_editor_hash = ""
+        self._explicit_compile_hash = ""
         self._next_sequence = 1
+        self._snapshot_generation = 0
         self._events: deque[dict[str, Any]] = deque(maxlen=MAX_AUDIT_EVENTS)
         self._dropped_events = 0
 
@@ -407,12 +488,18 @@ class _WatchJob:
                         "compile will start"
                     ),
                 )
-        if self._thread is not threading.current_thread():
+        if not is_current_task(self._thread):
             self._thread.join(STOP_JOIN_SECONDS)
         return self.snapshot()
 
     def snapshot(self) -> dict:
         with self._lock:
+            return self._snapshot_locked()
+
+    def snapshot_if_changed(self, sequence: int | None) -> dict | None:
+        with self._lock:
+            if sequence == self._snapshot_generation:
+                return None
             return self._snapshot_locked()
 
     def is_terminal(self) -> bool:
@@ -486,6 +573,9 @@ class _WatchJob:
                 self._transient_retry_count = 0
                 self._transient_retry_due = 0.0
                 self._pending = replacement_hash != self._last_attempted_hash
+                # The editor save endpoint is a distinct explicit action. A
+                # filesystem/proposal save by an organizer never sets this.
+                self._explicit_editor_hash = replacement_hash
                 self._last_error = None
                 self._record_locked(
                     "editorSourceSaved",
@@ -506,14 +596,47 @@ class _WatchJob:
                     "compileScheduled": self._pending,
                 }
 
-    def _run(self) -> None:
+    def request_saved_source_compile(self, expected_raw_sha256: str) -> dict:
+        """Queue one explicit IDE save/retry; ordinary AI draft saves stay deferred."""
+        expected = str(expected_raw_sha256 or "").lower()
+        if _SHA256.fullmatch(expected) is None:
+            raise WorkspaceWatchError("editor expected source hash is invalid")
+        with self._source_io_lock, self._lock:
+            if self._state not in {"starting", "running"} or self._stop.is_set() or not self._lease.owned:
+                raise WorkspaceWatchError("workspace watcher is not running")
+            if _source_hash(self.root, self.source_path) != expected:
+                raise WorkspaceWatchConflictError("Shader source changed before explicit compile scheduling")
+            # This explicit request also retries unchanged saved bytes and
+            # includes. It creates a new candidate revision, so an earlier
+            # apply rejection cannot suppress the user's retry as already seen.
+            if not (self._pending and self._explicit_compile_hash == expected):
+                self._last_attempted_hash = ""
+                self._observed_hash = expected
+                self._stable_since = time.monotonic()
+                self._transient_retry_hash = None
+                self._transient_retry_count = 0
+                self._transient_retry_due = 0.0
+                self._explicit_editor_hash = expected
+                self._explicit_compile_hash = expected
+                self._pending = True
+                self._record_locked("editorCompileRequested", sourceSha256=expected,
+                                    compileScheduled=True)
+            return {"watchId": self.watch_id, "workspacePath": str(self.root),
+                    "sourceSha256": expected, "compileScheduled": True}
+
+    def _run(self):
         try:
             with self._lock:
                 self._state = "running"
                 self._started_at = _utc_now()
                 self._record_locked("watchStarted")
-            interval = min(0.25, max(0.05, self.debounce_ms / 4000.0))
-            while not self._stop.wait(interval):
+            # Source fingerprints already coalesce saves. Many restored stages
+            # must not multiply 20 idle filesystem polls/sec on the GUI host.
+            interval = min(0.5, max(0.2, self.debounce_ms / 1000.0))
+            while not self._stop.is_set():
+                yield interval
+                if self._stop.is_set():
+                    break
                 self._tick()
         except Exception as exc:
             with self._lock:
@@ -550,12 +673,113 @@ class _WatchJob:
             self._on_finished(self)
 
     def _tick(self) -> None:
+        with self._lock:
+            if self._suspended_by:
+                return
+        # Do not acquire/resolve the cross-process observation lock for a
+        # proven idle poll. Any changed hint or bounded full-check deadline
+        # still enters the original transaction before reading or publishing.
+        now = time.monotonic()
         with self._source_io_lock:
-            self._tick_source_locked()
+            self._refresh_organization_draft(now)
+            if (not self._pending and self._observation_error_key is None
+                    and self._source_poll_fingerprint is not None
+                    and now - self._source_full_observation_at < FULL_OBSERVATION_INTERVAL_SECONDS
+                    and now - self._candidate_full_observation_at < FULL_OBSERVATION_INTERVAL_SECONDS
+                    and self._source_poll_fingerprint == tuple(
+                        _poll_file_fingerprint(path) for path in
+                        (self.root, self.source_path.parent, self.source_path))
+                    and self._candidate_poll_key == (
+                        _poll_file_fingerprint(self.root / "manifest.json"), self._observed_hash)):
+                return
+        with source_observation_transaction(self.root, blocking=False) as available:
+            if not available:
+                return
+            with self._source_io_lock:
+                self._tick_source_locked()
+
+    def suspend(self, owner: str) -> None:
+        """Stop reacting to source changes until ``resume`` (restore-owned)."""
+        with self._lock:
+            if self._stop.is_set():
+                return
+            self._suspended_by = str(owner or "restore")
+            self._record_locked("watchSuspended", owner=self._suspended_by)
+
+    def resume(self) -> None:
+        """Adopt whatever the owner left on disk as the new baseline, no compile."""
+        with self._source_io_lock:
+            try:
+                current_hash = _source_hash(self.root, self.source_path)
+            except Exception:
+                current_hash = None
+            with self._lock:
+                owner = self._suspended_by
+                self._suspended_by = ""
+                if current_hash is not None:
+                    self._observed_hash = current_hash
+                    self._last_attempted_hash = current_hash
+                    self._stable_since = time.monotonic()
+                    self._transient_retry_hash = None
+                    self._transient_retry_count = 0
+                    self._transient_retry_due = 0.0
+                    self._pending = False
+                self._record_locked(
+                    "watchResumed", owner=owner,
+                    sourceSha256=current_hash or "",
+                )
+
+    def _refresh_organization_draft(self, now: float) -> str:
+        gate = self.root / "ai" / "organize-code-gate.json"
+        session = (self.root / "ai" / "organization-sessions" /
+                   self._active_draft_id / "session.json") if self._active_draft_id else None
+        key = (_poll_file_fingerprint(gate),
+               _poll_file_fingerprint(session) if session is not None else None)
+        if (key != self._draft_poll_key or
+                now - self._draft_full_observation_at >= FULL_OBSERVATION_INTERVAL_SECONDS):
+            previous = self._active_draft_id
+            try:
+                self._active_draft_id = active_draft_id(self.root)
+            except (OSError, ValueError, RuntimeError) as error:
+                message = _bounded_text(error)
+                if message != self._draft_observation_error:
+                    with self._lock:
+                        self._record_locked("organizationDraftObservationFailed", message=message,
+                                            compileScheduled=False)
+                self._draft_observation_error = message
+            else:
+                if self._draft_observation_error:
+                    with self._lock:
+                        self._record_locked("organizationDraftObservationRecovered")
+                self._draft_observation_error = ""
+            session = (self.root / "ai" / "organization-sessions" /
+                       self._active_draft_id / "session.json") if self._active_draft_id else None
+            self._draft_poll_key = (_poll_file_fingerprint(gate),
+                                   _poll_file_fingerprint(session) if session is not None else None)
+            self._draft_full_observation_at = now
+            if previous != self._active_draft_id:
+                self._candidate_poll_key = None
+        return "unavailable" if self._draft_observation_error else self._active_draft_id
 
     def _tick_source_locked(self) -> None:
+        now = time.monotonic()
+        manifest_fingerprint = _poll_file_fingerprint(self.root / "manifest.json")
         try:
-            current_hash = _source_hash(self.root, self.source_path)
+            source_fingerprint = tuple(_poll_file_fingerprint(path) for path in
+                                       (self.root, self.source_path.parent, self.source_path))
+            candidate_key = (manifest_fingerprint, self._observed_hash)
+            # Metadata only skips an unchanged idle observation. A pending save,
+            # new candidate or previous error still takes the original strict
+            # read. Periodic full reads catch preserved timestamps/redirection.
+            if (source_fingerprint != self._source_poll_fingerprint
+                    or self._pending or self._observation_error_key is not None
+                    or candidate_key != self._candidate_poll_key
+                    or now - self._source_full_observation_at >= FULL_OBSERVATION_INTERVAL_SECONDS):
+                current_hash = _source_hash(self.root, self.source_path)
+                self._source_poll_fingerprint = source_fingerprint
+                self._source_full_observation_at = now
+            else:
+                current_hash = self._observed_hash
         except Exception as exc:
             with self._lock:
                 error = {
@@ -579,6 +803,27 @@ class _WatchJob:
         with self._lock:
             if self._stop.is_set():
                 return
+            draft_id = self._refresh_organization_draft(now)
+            if draft_id and self._explicit_editor_hash != current_hash:
+                # Ordinary organization saves are editor working state. Never
+                # compile them or publish even an already compiled candidate
+                # to live edit before the explicit reviewed final operation.
+                self._explicit_editor_hash = ""
+                self._observed_hash = current_hash
+                self._last_attempted_hash = current_hash
+                self._pending = False
+                self._transient_retry_hash = None
+                self._transient_retry_count = 0
+                self._transient_retry_due = 0.0
+                self._candidate_poll_key = (manifest_fingerprint, current_hash)
+                self._candidate_full_observation_at = now
+                if self._deferred_draft_hash != current_hash:
+                    self._stable_since = now
+                    self._deferred_draft_hash = current_hash
+                    self._record_locked("organizationDraftSaved", organizationId=draft_id,
+                                        sourceSha256=current_hash, compileScheduled=False)
+                return
+            self._deferred_draft_hash = ""
             if self._observation_error_key is not None:
                 if self._last_error is not None and (
                     self._last_error.get("type"),
@@ -607,13 +852,31 @@ class _WatchJob:
                 current_hash != self._last_attempted_hash or retrying_same_save
             )
             if not self._pending:
-                return
+                # A reviewed transaction can restore the same canonical bytes
+                # under a newer permanent revision. Adopt that final candidate
+                # after the observation transaction, without recompiling it.
+                candidate_key = (manifest_fingerprint, current_hash)
+                if (candidate_key != self._candidate_poll_key
+                        or now - self._candidate_full_observation_at >= FULL_OBSERVATION_INTERVAL_SECONDS):
+                    self._candidate_poll_result = _already_compiled_candidate(self.root, current_hash)
+                    self._candidate_poll_key = candidate_key
+                    self._candidate_full_observation_at = now
+                published = self._candidate_poll_result
+                if published is None or (
+                    published["revision"] == self._latest_candidate_revision
+                    and published["rawSha256"] == self._latest_candidate_raw_sha256
+                ):
+                    return
+                self._pending = True
             if retrying_same_save:
                 if now < self._transient_retry_due:
                     return
             elif (now - self._stable_since) * 1000.0 < self.debounce_ms:
                 return
             target_hash = current_hash
+            force_compile = self._explicit_compile_hash == target_hash
+            if force_compile:
+                self._explicit_compile_hash = ""
             self._last_attempted_hash = target_hash
             self._compile_in_progress = True
             self._compile_attempts += 1
@@ -627,7 +890,18 @@ class _WatchJob:
             )
 
         try:
-            result = self.service.compile(self.root)
+            # Another writer (the AI organizer, a project restore, the switch
+            # button) may already have compiled exactly these bytes; adopt that
+            # candidate instead of building it again.
+            adopted = None if force_compile else _already_compiled_candidate(self.root, target_hash)
+            compiler = getattr(self.service, "compile_for_live_edit", self.service.compile)
+            compile_started = time.monotonic()
+            if adopted is not None:
+                result = adopted
+            else:
+                with _COMPILER_SLOTS:
+                    result = compiler(self.root)
+            compile_duration_ms = round((time.monotonic() - compile_started) * 1000.0, 3)
             compiled_hash = result.get("sourceSha256")
             revision = result.get("revision")
             candidate_raw_sha256 = result.get("rawSha256")
@@ -667,12 +941,19 @@ class _WatchJob:
                 self._transient_retry_due = 0.0
                 self._last_error = None
                 self._record_locked(
-                    "compileSucceeded",
+                    "compileAdopted" if adopted is not None else "compileSucceeded",
                     requestedSourceSha256=target_hash,
                     compiledSourceSha256=compiled_hash,
                     revision=self._latest_candidate_revision,
                     candidateRawSha256=candidate_raw_sha256,
+                    durationMs=compile_duration_ms,
+                    manualFastCompile=result.get("manualFastCompile") is True,
+                    compilationCacheHit=result.get("compilationCacheHit") is True,
                     message=(
+                        "candidate compiled by another writer from the same source was adopted"
+                        if adopted is not None else
+                        "manual candidate compiled without organization ABI validation"
+                        if result.get("manualFastCompile") is True else
                         "candidate remains unapplied and requires replay ABI validation"
                     ),
                 )
@@ -773,17 +1054,28 @@ class _WatchJob:
                 ) from exc
 
     def _persist_locked(self) -> None:
+        # Compile completion can update caughtUp without appending an event.
+        # Publish every persisted state transition, including that final edge.
+        self._snapshot_generation += 1
         atomic_write_json(self.audit_path, self._snapshot_locked())
 
     def _snapshot_locked(self) -> dict:
+        observation_available = source_observation_available(self.root)
         caught_up = bool(
             self._last_compiled_hash
             and self._last_compiled_hash == self._observed_hash
+            # A retry can fail without changing the root source hash (for
+            # example after an include edit). The last successful candidate
+            # remains available for rollback, but is not the latest saved code.
+            and self._last_error is None
             and not self._compile_in_progress
             and not self._pending
+            and not self._suspended_by
+            and observation_available
         )
         return {
             "schema": WATCH_SCHEMA,
+            "observationSequence": self._snapshot_generation,
             "schemaVersion": WATCH_VERSION,
             "watchId": self.watch_id,
             "state": self._state,
@@ -807,6 +1099,7 @@ class _WatchJob:
             "compileInProgress": self._compile_in_progress,
             "pending": self._pending,
             "caughtUp": caught_up,
+            "sourceObservationPaused": not observation_available,
             "compileAttempts": self._compile_attempts,
             "compileSuccesses": self._compile_successes,
             "compileFailures": self._compile_failures,
@@ -871,24 +1164,12 @@ class ShaderWorkspaceWatchManager:
     ) -> dict:
         debounce = _validate_debounce(debounce_ms)
         service = self._service_factory()
-        status_result = service.status(workspace_path)
+        validated = bound_status_snapshot(workspace_path)
+        status_result = (validated.validated_status() if validated is not None
+                         else service.status(workspace_path))
         root = Path(status_result["workspacePath"]).resolve()
+        validate_watch_start_status(status_result)
         source_record = status_result.get("source")
-        if not isinstance(source_record, dict) or source_record.get("present") is not True:
-            raise WorkspaceWatchError(
-                "workspace must contain a tracked decompiled source before watching"
-            )
-        representation = status_result.get("representation")
-        if (
-            source_record.get("lane") != "executable-editable"
-            or not isinstance(representation, dict)
-            or representation.get("lane") != "executable-editable"
-            or representation.get("compileEligible") is not True
-        ):
-            raise WorkspaceWatchError(
-                _watch_start_rejection(
-                    status_result, "save watching requires the executable-editable shader lane")
-            )
         status_source = Path(source_record.get("path", ""))
         source = _fixed_source(root, status_source)
         if status_source.resolve() != source:
@@ -970,7 +1251,12 @@ class ShaderWorkspaceWatchManager:
                 # workspace. Organization may publish/recover a newer revision
                 # before acquisition, so re-resolve every source/candidate
                 # field under the shared lease before constructing the job.
-                locked_status = service.status(workspace_path)
+                # A Host-owned start snapshot has already passed full status.
+                # Re-hash all of its inputs after lease acquisition instead of
+                # parsing the same binary/ABI/route evidence a second time.
+                # Any intervening publication rejects this admission attempt.
+                locked_status = (validated.checked_status(service) if validated is not None
+                                 else service.status(workspace_path))
                 locked_root = Path(locked_status["workspacePath"]).resolve()
                 locked_source_record = locked_status.get("source")
                 locked_representation = locked_status.get("representation")
@@ -1079,9 +1365,20 @@ class ShaderWorkspaceWatchManager:
     def poll(self, watch_id: str) -> dict:
         return self._job(watch_id).snapshot()
 
+    def poll_if_changed(self, watch_id: str, sequence: int | None) -> dict | None:
+        """Idle coordinators need no disk/OS lock read for an unchanged job.
+
+        A new candidate gets a full snapshot. Apply still acquires the source
+        observation transaction and checks actual compiled source independently.
+        """
+        return self._job(watch_id).snapshot_if_changed(sequence)
+
     def save_source(self, watch_id: str, expected_raw_sha256: str,
                     text: str) -> dict:
         return self._job(watch_id).save_source(expected_raw_sha256, text)
+
+    def request_saved_source_compile(self, watch_id: str, expected_raw_sha256: str) -> dict:
+        return self._job(watch_id).request_saved_source_compile(expected_raw_sha256)
 
     def compile_check(self, workspace_path: str | Path, text: str) -> dict:
         """Compile an unsaved editor buffer for live diagnostics only.
@@ -1112,6 +1409,53 @@ class ShaderWorkspaceWatchManager:
             if remaining <= 0:
                 break
             job._thread.join(remaining)
+
+    def owns_source_lease(self, workspace_path: str | Path) -> bool:
+        """True when a live watcher of this process holds the workspace's source lease."""
+
+        key = os.path.normcase(str(Path(workspace_path)))
+        with self._lock:
+            return any(
+                os.path.normcase(str(job.root)) == key and not job.is_terminal()
+                and job._lease.owned
+                for job in self._jobs.values())
+
+    def suspend_workspace(self, workspace_path: str | Path, owner: str = "project-restore"):
+        """Context manager: pause live watchers of one workspace for a transaction.
+
+        Returns the number of watchers paused via the ``with`` target. Every
+        paused watcher resumes with the on-disk source as its baseline, so the
+        transaction's writes and any rollback are never compiled as user saves.
+        """
+
+        manager = self
+
+        class _Suspension:
+            def __init__(self) -> None:
+                self.jobs: list[_WatchJob] = []
+
+            def __enter__(self):
+                key = os.path.normcase(str(Path(workspace_path)))
+                with manager._lock:
+                    candidates = [
+                        job for job in manager._jobs.values()
+                        if os.path.normcase(str(job.root)) == key
+                        and not job.is_terminal()
+                    ]
+                for job in candidates:
+                    job.suspend(owner)
+                    self.jobs.append(job)
+                return len(self.jobs)
+
+            def __exit__(self, *_exc):
+                for job in self.jobs:
+                    try:
+                        job.resume()
+                    except Exception:
+                        pass
+                return False
+
+        return _Suspension()
 
     def _job(self, watch_id: str) -> _WatchJob:
         if not isinstance(watch_id, str) or _WATCH_ID.fullmatch(watch_id) is None:

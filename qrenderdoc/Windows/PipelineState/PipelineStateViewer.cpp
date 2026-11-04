@@ -25,17 +25,23 @@
 #include "PipelineStateViewer.h"
 #include <QApplication>
 #include <QClipboard>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPointer>
 #include <QScrollBar>
 #include <QStylePainter>
 #include <QSvgRenderer>
 #include <QToolButton>
+#include <QTimer>
 #include <QXmlStreamWriter>
+#include <memory>
 #include "Code/CaptureContext.h"
 #include "Code/QRDUtils.h"
 #include "Code/ReplayLab/ReplayLabIntegration.h"
+#include "Code/ReplayLab/ReplayLabAIResourceAttachment.h"
 #include "Code/Resources.h"
 #include "Windows/AI/AIAssistant.h"
 #include "Windows/RenderTargetHistoryView.h"
@@ -1128,7 +1134,7 @@ static HLSLAbiSkeleton GenerateHLSLAbiSkeleton(const ShaderReflection *shaderDet
       lit("// ABI SKELETON ONLY - THIS IS NOT DECOMPILED SHADER SOURCE.\n"
           "// It contains only declarations recovered from reflection and a zero-behaviour entry.\n"
           "// This explanatory document is deliberately detached from Apply/ReplaceResource.\n"
-          "// Use a configured decompiler or Analyze Shader with RenderDoc AI for an\n"
+          "// Use a configured decompiler or Organize and Apply Shader with Bread AI for an\n"
           "// executable candidate where the format/API supports one. Compilation, ABI validation,\n"
           "// shared apply, and rollback are separate gates. D3D12 DXBC/DXIL candidates additionally\n"
           "// require a checked rebuild of every affected graphics/compute PSO before commit.\n\n");
@@ -1519,9 +1525,30 @@ void PipelineStateViewer::SetupShaderEditButton(QToolButton *button, ResourceId 
   if(!shaderDetails || !button->isEnabled() || button->popupMode() != QToolButton::MenuButtonPopup)
     return;
 
+  // Menu actions outlive the currently published pipeline state. Keep one owned
+  // reflection for all actions, including both hops of the SPIR-V explanation.
+  const std::shared_ptr<const ShaderReflection> ownedShaderDetails =
+      std::make_shared<ShaderReflection>(*shaderDetails);
+  shaderDetails = ownedShaderDetails.get();
+
   QMenu *menu = editMenus[(int)shaderDetails->stage];
 
   menu->clear();
+
+  // The primary Edit action always goes to the capture-owned Bread workspace. Stock editors
+  // remain available in the dropdown. Reuse capture-owned bindings before any refresh.
+  QAction *workspace = new QAction(tr("Open in Shader Workspace"), menu);
+  workspace->setIcon(Icons::page_white_edit());
+  const QString stageName = ShaderWorkspaceStageName(shaderDetails->stage);
+  connect(workspace, &QAction::triggered, this, [this, stageName, shaderId, ownedShaderDetails]() {
+    uint64_t resourceValue = 0;
+    static_assert(sizeof(resourceValue) == sizeof(shaderId), "ResourceId wire size changed");
+    memcpy(&resourceValue, &shaderId, sizeof(resourceValue));
+    CaptureContext &capture = static_cast<CaptureContext &>(m_Ctx);
+    capture.ReplayLab().OpenShaderWorkspace(m_Ctx.CurEvent(), stageName,
+        QString::number(resourceValue), QString(ownedShaderDetails->entryPoint));
+  });
+  menu->addAction(workspace);
 
   rdcarray<ShaderEncoding> accepted = m_Ctx.TargetShaderEncodings();
 
@@ -1535,36 +1562,37 @@ void PipelineStateViewer::SetupShaderEditButton(QToolButton *button, ResourceId 
     QAction *action = new QAction(tr("Edit Source - %1").arg(dbg.files[entryFile].filename), menu);
     action->setIcon(Icons::page_white_edit());
 
-    QObject::connect(action, &QAction::triggered, [this, shaderId, shaderDetails]() {
-      EditOriginalShaderSource(shaderId, shaderDetails);
+    QObject::connect(action, &QAction::triggered, [this, shaderId, ownedShaderDetails]() {
+      const auto reflection = ownedShaderDetails;
+      EditOriginalShaderSource(shaderId, reflection.get());
     });
 
     menu->addAction(action);
   }
 
-  // Prefer capture-bound ReplayLab analysis whenever the selected stage is bound. Capability
-  // planning inside the specialist decides whether a configured/hash-pinned editable round trip is
+  // Prefer capture-bound Bread organization whenever the selected stage is bound. Capability
+  // The Agent decides whether a configured/hash-pinned editable round trip is
   // available; evidence-only reconstruction must not be presented here as compile/apply support.
   // This action is deliberately ahead of stock processing tools unless embedded source was
   // available above.
   if(HasShaderWorkspaceIntent(m_Ctx, shaderDetails->stage))
   {
-    QAction *action = new QAction(tr("Analyze Shader with RenderDoc AI"), menu);
+    QAction *action = new QAction(tr("Organize and Apply Shader with Bread AI"), menu);
     action->setIcon(Icons::page_white_edit());
     action->setToolTip(
-        tr("Analyze this exact Shader from capture evidence. Analysis is read-only. Any readable "
-           "reconstruction is evidence-only unless capability planning finds a configured, "
-           "stage-matching, hash-verified round-trip route and exact ABI validation succeeds; "
-           "otherwise compilation and replay replacement are unavailable."));
+        tr("Ask Bread AI to organize this capture-bound Shader and apply the finished result. "
+           "It chooses the relevant evidence and editing tools. You can inspect its draft in "
+           "Shader Workspace; applying a replacement checks the exact target, compile result, "
+           "ABI, and current replay state."));
 
-    QObject::connect(action, &QAction::triggered, [this, shaderDetails]() {
+    const ShaderStage shaderStage = shaderDetails->stage;
+    QObject::connect(action, &QAction::triggered, [this, shaderStage]() {
       CaptureContext &capture = static_cast<CaptureContext &>(m_Ctx);
-      const QString stageName = ShaderWorkspaceStageName(shaderDetails->stage);
+      const QString stageName = ShaderWorkspaceStageName(shaderStage);
       AIAssistant *assistant = capture.GetAIAssistant();
-      assistant->StartCaptureSkill(tr("Analyze selected Shader with AI"),
-                                   lit("renderdoc-shader-workbench"),    // i18n-ignore: internal Skill identifier
-                                   stageName,
-                                   lit("reverse-edit-selected-shader"));    // i18n-ignore: stable UI intent identifier
+      assistant->StartCaptureIntent(tr("Organize and apply selected Shader with Bread AI"),
+                                    stageName,
+                                    lit("reverse-edit-selected-shader"));    // i18n-ignore: stable UI intent identifier
       capture.ShowAIAssistant();
     });
 
@@ -1583,8 +1611,10 @@ void PipelineStateViewer::SetupShaderEditButton(QToolButton *button, ResourceId 
     QAction *action = new QAction(tr("Decompile with %1").arg(tool.name), menu);
     action->setIcon(Icons::page_white_edit());
 
-    QObject::connect(action, &QAction::triggered, [this, tool, shaderId, shaderDetails]() {
-      EditDecompiledSource(tool, shaderId, shaderDetails);
+    QObject::connect(action, &QAction::triggered, [this, tool, shaderId, ownedShaderDetails]() {
+      // Tool execution may run a nested event loop and rebuild/delete this menu.
+      const auto reflection = ownedShaderDetails;
+      EditDecompiledSource(tool, shaderId, reflection.get());
     });
 
     menu->addAction(action);
@@ -1607,14 +1637,15 @@ void PipelineStateViewer::SetupShaderEditButton(QToolButton *button, ResourceId 
     QAction *action = new QAction(label, menu);
     action->setIcon(Icons::page_white_edit());
 
-    QObject::connect(action, &QAction::triggered, [this, pipelineId, shaderDetails]() {
+    QObject::connect(action, &QAction::triggered, [this, pipelineId, ownedShaderDetails]() {
+      const auto reflection = ownedShaderDetails;
       QString entry;
 
-      if(shaderDetails->encoding == ShaderEncoding::SPIRV ||
-         shaderDetails->encoding == ShaderEncoding::OpenGLSPIRV)
+      if(reflection->encoding == ShaderEncoding::SPIRV ||
+         reflection->encoding == ShaderEncoding::OpenGLSPIRV)
       {
-        m_Ctx.Replay().AsyncInvoke([this, pipelineId, shaderDetails](IReplayController *r) {
-          rdcstr disasm = r->DisassembleShader(pipelineId, shaderDetails, "");
+        m_Ctx.Replay().AsyncInvoke([this, pipelineId, reflection](IReplayController *r) {
+          rdcstr disasm = r->DisassembleShader(pipelineId, reflection.get(), "");
 
           QString editeddisasm =
               tr("; NATIVE SPIR-V DISASSEMBLY - EXPLANATORY LANE ONLY\n") +
@@ -1622,30 +1653,31 @@ void PipelineStateViewer::SetupShaderEditButton(QToolButton *button, ResourceId 
 
           editeddisasm += disasm;
 
-          GUIInvoke::call(this, [this, shaderDetails, editeddisasm]() {
+          GUIInvoke::call(this, [this, reflection, editeddisasm]() {
             rdcstrpairs files;
             files.push_back(rdcpair<rdcstr, rdcstr>("native_spirv_explanation.txt", editeddisasm));
 
             ViewShaderExplanation(
-                shaderDetails->stage, shaderDetails->entryPoint, files,
+                reflection->stage, reflection->entryPoint, files,
                 tr("Representation lane: explanatory-ir\n"
                    "The text is native disassembly, not HLSL/GLSL source. Apply is disabled.\n"
                    "Use the external workspace for assemble/validate/ABI-gated replacement."));
           });
         });
       }
-      else if(shaderDetails->encoding == ShaderEncoding::DXBC ||
-              shaderDetails->encoding == ShaderEncoding::DXIL)
+      else if(reflection->encoding == ShaderEncoding::DXBC ||
+              reflection->encoding == ShaderEncoding::DXIL)
       {
-        entry = lit("EditedShader%1S").arg(ToQStr(shaderDetails->stage, GraphicsAPI::D3D11)[0]);
+        // i18n-ignore: generated HLSL entry-point identifier, not user-visible prose.
+        entry = lit("EditedShader%1S").arg(ToQStr(reflection->stage, GraphicsAPI::D3D11)[0]);
 
-        HLSLAbiSkeleton skeleton = GenerateHLSLAbiSkeleton(shaderDetails, entry);
+        HLSLAbiSkeleton skeleton = GenerateHLSLAbiSkeleton(reflection.get(), entry);
 
         QString diagnostics =
             tr("Representation lane: explanatory-ir\n"
                "This ABI skeleton is generated from reflection; it is not recovered shader "
                "logic. Apply is disabled.\n");
-        if(shaderDetails->encoding == ShaderEncoding::DXIL)
+        if(reflection->encoding == ShaderEncoding::DXIL)
           diagnostics +=
               tr("No trusted DXIL-to-executable-HLSL round-trip is implied by this view. A "
                  "reconstructed cross-IR result remains experimental until baseline compilation "
@@ -1658,7 +1690,7 @@ void PipelineStateViewer::SetupShaderEditButton(QToolButton *button, ResourceId 
         rdcstrpairs files;
         files.push_back(rdcpair<rdcstr, rdcstr>("abi_skeleton_explanatory.hlsl", skeleton.source));
 
-        ViewShaderExplanation(shaderDetails->stage, entry, files, diagnostics);
+        ViewShaderExplanation(reflection->stage, entry, files, diagnostics);
       }
     });
 
@@ -1748,6 +1780,23 @@ void PipelineStateViewer::ShowResourceContextMenu(RDTreeWidget *widget, const QP
     }
 
     contextMenu.addAction(&openResourceInspector);
+    const QJsonObject attachment = ReplayLabAIResourceContext(m_Ctx, id, "pipeline-state-viewer");
+    QJsonObject details = ReplayLabAIResourceDetails(m_Ctx, id, attachment);
+    if(item)
+    {
+      QJsonArray row;
+      for(int column = 0; column < widget->model()->columnCount(); ++column)
+        row.append(item->text(column));
+      details[QLatin1String("selectedRow")] = row;
+    }
+    const QString title = tr("Resource: %1 (EID %2)").arg(m_Ctx.GetResourceName(id)).arg(m_Ctx.CurEvent());
+    const QString json = ReplayLabAIResourceJSON(attachment);
+    const QString text = ReplayLabAIResourceJSON(details);
+    QAction *addToChat = contextMenu.addAction(tr("Add resource to AI conversation"));
+    addToChat->setObjectName(QStringLiteral("addResourceToAI"));
+    QObject::connect(addToChat, &QAction::triggered, [this, title, text, json]() {
+      m_Ctx.AddTextToAIAssistant(title, text, title, json);
+    });
     contextMenu.addAction(&usageTitle);
 
     QObject::connect(&openResourceInspector, &QAction::triggered, [this, id]() {
@@ -1861,11 +1910,18 @@ void PipelineStateViewer::SetupResourceView(RDTreeWidget *widget)
 
     if(id != ResourceId())
     {
-      m_Ctx.Replay().AsyncInvoke([this, widget, pos, id](IReplayController *r) {
+      QPointer<PipelineStateViewer> owner(this);
+      QPointer<RDTreeWidget> tree(widget);
+      const uint32_t eventId = m_Ctx.CurEvent();
+      const rdcstr capture = m_Ctx.GetCaptureFilename();
+      m_Ctx.Replay().AsyncInvoke([owner, tree, pos, id, eventId, capture](IReplayController *r) {
         rdcarray<EventUsage> usage = r->GetUsage(id);
-
-        GUIInvoke::call(this, [this, widget, pos, id, usage]() {
-          ShowResourceContextMenu(widget, pos, id, usage);
+        if(!owner)
+          return;
+        GUIInvoke::call(owner, [owner, tree, pos, id, usage, eventId, capture]() {
+          if(owner && tree && owner->m_Ctx.IsCaptureLoaded() &&
+             owner->m_Ctx.CurEvent() == eventId && owner->m_Ctx.GetCaptureFilename() == capture)
+            owner->ShowResourceContextMenu(tree, pos, id, usage);
         });
       });
     }
@@ -2118,6 +2174,9 @@ bool PipelineStateViewer::SaveShaderFile(const ShaderReflection *shader)
   if(!shader)
     return false;
 
+  // The save dialog pumps events, so a replacement may retire this reflection
+  // before it returns. Export the bytes selected when the action was invoked.
+  const bytebuf rawBytes = shader->rawBytes;
   QString filter;
 
   switch(shader->encoding)
@@ -2147,7 +2206,7 @@ bool PipelineStateViewer::SaveShaderFile(const ShaderReflection *shader)
       QFile f(filename);
       if(f.open(QIODevice::WriteOnly | QIODevice::Truncate))
       {
-        f.write((const char *)shader->rawBytes.data(), (qint64)shader->rawBytes.size());
+        f.write((const char *)rawBytes.data(), (qint64)rawBytes.size());
       }
       else
       {

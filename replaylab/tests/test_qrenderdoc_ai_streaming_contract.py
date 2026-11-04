@@ -15,21 +15,26 @@ def _section(source: str, start: str, end: str) -> str:
     return source[begin : source.index(end, begin)]
 
 
-def test_layer3_verification_reaches_the_structured_result_card() -> None:
+def test_terminal_answer_uses_model_text_without_a_report_gate() -> None:
     source = _source("AIAssistant.cpp")
     header = _source("AIAssistant.h")
-    renderer = _section(
+    terminal = _section(
         source,
-        "QString AIAssistant::renderTaskReport(",
         "void AIAssistant::finishTask(",
+        "void AIAssistant::OnCaptureLoaded()",
     )
 
-    assert 'eventData.value(QStringLiteral("verification")).toObject()' in source
-    assert 'resultObject.value(QStringLiteral("verification")).toObject()' in source
-    assert "const QJsonObject &verification = QJsonObject()" in header
-    assert '!verification.value(QStringLiteral("accepted")).toBool(true)' in renderer
-    assert 'tr("Host follow-up count: %1. No accepted result form was submitted.")' in renderer
-    assert "renderTaskReport(report, verification)" in source
+    assert "renderTaskReport" not in source + header
+    assert "const QJsonObject &report" not in header
+    assert "const QJsonObject &verification" not in header
+    assert 'eventData.value(QStringLiteral("report")).toObject()' not in source
+    assert 'resultObject.value(QStringLiteral("verification")).toObject()' not in source
+    assert "finishTask(taskId, terminalStatus, summary, eventTimestampMs);" in source
+    assert "if(exitCode == 0 && validTerminal)" in source
+    assert "finishTask(taskId, terminalStatus, result);" in source
+    assert "answerTerminal && !accumulated.isEmpty() ? accumulated : summary" in terminal
+    assert "appendAssistant(result.isEmpty() ? fallback : result, conversationId, taskId);" in terminal
+    assert "addTaskActivity(taskId, kind, title" in terminal
 
 
 def test_conversation_stream_updates_are_coalesced_before_rich_text_layout() -> None:
@@ -87,6 +92,17 @@ def test_jsonl_pollers_scan_chunks_without_repeated_front_removal() -> None:
     )
     assert "pending.indexOf('\\n', lineStart)" in assistant_poll
     assert "pending.remove(0" not in assistant_poll
+    drain = _section(
+        assistant,
+        "void AIAssistant::drainChatTaskEvents(",
+        "void AIAssistant::finishChatResult(",
+    )
+    # Exiting agents can leave a chunk of tiny events. Byte-bounding it alone still allows all
+    # those events to monopolize the GUI; the live record/time budget must cover the exit drain.
+    assert drain.index("m_TaskEventBudgetActive = true;") < drain.index("pollTaskEvent(")
+    assert drain.index("pollTaskEvent(") < drain.index("m_TaskEventBudgetActive = false;")
+    # Slow disk I/O must not produce a zero-progress drain that abandons buffered final events.
+    assert "lineStart > 0 && m_TaskEventPollClock.elapsed()" in assistant_poll
 
     monitor = _source("AIAgentMonitorWindow.cpp")
     monitor_poll = monitor[monitor.index("void AIAgentMonitorWindow::PollTaskFile()") :]
@@ -178,9 +194,9 @@ def test_conversation_scroll_uses_persistent_follow_tail_state() -> None:
     assert "cursorForPosition(QPoint(anchorX, 1))" in source
     assert "m_Browser->cursorRect(cursor).top()" in source
     assert "scheduleViewportAnchorRestore();" in constructor
-    assert "m_Browser->setHtml(html);" in render
-    assert render.index("m_AdjustingScroll = true;") < render.index("m_Browser->setHtml(html);")
-    assert render.index("m_Browser->setHtml(html);") < render.index("m_AdjustingScroll = false;")
+    assert "document->setHtml(inlineTranscriptStyles(html));" in render
+    assert render.index("m_AdjustingScroll = true;") < render.index("m_Browser->setDocument(document);")
+    assert render.index("m_Browser->setDocument(document);") < render.index("m_AdjustingScroll = false;")
     assert "if(m_FollowTail)" in render
     assert "scrollToLatest();" in render
     assert "restoreViewportAnchor();" in render
@@ -214,6 +230,17 @@ def test_conversation_text_supports_keyboard_selection_and_copy() -> None:
         assert f"{label}->setFocusPolicy(Qt::StrongFocus);" in selectable_label
 
 
+def test_accepted_send_releases_old_transcript_selection_before_async_launch() -> None:
+    source = _source("AIAssistant.cpp")
+    submit = _section(source, "void AIAssistant::startChat(", "void AIAssistant::startNextChat()")
+    assert submit.index("m_ChatQueue.push_back(request);") < submit.index("followSubmittedTurn();")
+    assert submit.index("followSubmittedTurn();") < submit.index("advanceChatContextFreeze();")
+    assert "request.conversationId == m_ActiveConversationId" in submit
+    # Background events, queued launches and conversation switches cannot override a later
+    # deliberate scroll back into history. The explicit accepted-send path owns this intent.
+    assert source.count("m_Transcript->followSubmittedTurn();") == 1
+
+
 def test_live_conversation_appends_without_refreshing_the_document_or_selection() -> None:
     header = _source("AIConversationView.h")
     source = _source("AIConversationView.cpp")
@@ -233,8 +260,29 @@ def test_live_conversation_appends_without_refreshing_the_document_or_selection(
         "void AIConversationView::updateTailControl()",
     )
 
-    assert "m_ElapsedTimer" not in header
-    assert "m_ElapsedTimer" not in source
+    elapsed_tick = _section(
+        source,
+        "void AIConversationView::advanceElapsedText()",
+        "void AIConversationView::setMessages(",
+    )
+    elapsed_rebuild = _section(
+        source,
+        "void AIConversationView::rebuildElapsedCursors()",
+        "void AIConversationView::advanceElapsedText()",
+    )
+    assert "m_ElapsedTimer" in header
+    assert "render(" not in elapsed_tick
+    assert "setHtml(" not in elapsed_tick
+    # Qt anchors mark only their first character. Track and replace the exact
+    # translated duration label (digits plus unit), otherwise every tick leaves
+    # the previous unit behind and renders e.g. ``9 秒秒``.
+    assert "target.text = anchor.value().second;" in elapsed_rebuild
+    assert "target.length = target.text.size();" in elapsed_rebuild
+    assert "span.selectedText() != target.text" in elapsed_rebuild
+    assert "fragment.length()" not in elapsed_rebuild
+    assert "edit.setPosition(position + entry.length" in elapsed_tick
+    assert "entry.length = text.size();" in elapsed_tick
+    assert "entry.text = text;" in elapsed_tick
     assert "canKeepTranscriptDocument(m_Messages, messages)" in setter
     assert "if(keepDocument && !flushSelectionRender)" in setter
     keep_document = setter[setter.index("if(keepDocument && !flushSelectionRender)") :]
@@ -349,7 +397,7 @@ def test_child_agent_messages_project_only_schema_qualified_narrative_text() -> 
     assert "activity.finishedTimestampMs = terminalTimestampMs" in terminal
 
 
-def test_live_activity_text_reveals_one_grapheme_without_full_document_rebuild() -> None:
+def test_live_activity_text_coalesces_received_suffix_without_full_document_rebuild() -> None:
     header = _source("AIConversationView.h")
     source = _source("AIConversationView.cpp")
     reveal = _section(
@@ -367,9 +415,13 @@ def test_live_activity_text_reveals_one_grapheme_without_full_document_rebuild()
     assert "bool exactText = false" in header
     assert "quint64 liveTextRevision = 0" in header
     assert "int visibleDetailChars = -1" in header
-    assert "QTextBoundaryFinder::Grapheme" in source
-    assert "nextGraphemeBoundary(" in reveal
-    assert "cursor.value().cursor.insertText(grapheme" in reveal
+    # Do not synthesize another per-character stream after the provider has already streamed it:
+    # large snapshots must catch up in one display frame, including Unicode and complete code.
+    assert "LiveTextRevealIntervalMs = 33" in source
+    assert "QTextBoundaryFinder" not in source
+    assert "const QString suffix = activity.detail.mid(activity.visibleDetailChars);" in reveal
+    assert "cursor.value().cursor.insertText(suffix" in reveal
+    assert "activity.visibleDetailChars = -1;" in reveal
     assert "setHtml(" not in reveal
     assert "visible.toHtmlEscaped()" in renderer
     assert "safeMarkdown(" not in renderer
@@ -456,6 +508,74 @@ def test_persisted_conversation_restart_preserves_omission_lineage() -> None:
     assert "auto legacyPrefix = [](int omitted)" in prompt
     assert "HISTORY GAP: %1 older conversation message record(s)" in prompt
     assert "legacyPrefix(qMin(1000000, omittedHistoryCount + i))" in prompt
+
+
+def test_capture_conversation_does_not_force_an_old_skill_or_stage() -> None:
+    source = _source("AIAssistant.cpp")
+    header = _source("AIAssistant.h")
+    start = _section(
+        source,
+        "void AIAssistant::startChat(",
+        "void AIAssistant::startNextChat()",
+    )
+    assert "continuationSkill" not in header
+    assert "continuationFocusStage" not in header
+    assert "submittedContinuationSkill" not in start
+    assert "submittedContinuationFocusStage" not in start
+    assert "request.focusStage = focusStage;" in start
+    assert "request.skill = mentioned.first();" in start
+    assert "request.intentKind = intentKind;" in start
+
+
+def test_every_chat_launch_passes_conversation_identity_and_capture_history() -> None:
+    source = _source("AIAssistant.cpp")
+    capture_intent = _section(
+        source,
+        "void AIAssistant::StartCaptureIntent(",
+        "void AIAssistant::startChat(",
+    )
+    launch = _section(
+        source,
+        "void AIAssistant::launchChat(",
+        "void AIAssistant::handleChatProcessStarted(",
+    )
+
+    assert (
+        "startChat(prompt, false, focusStage, ClarificationResponse(), intentKind);"
+        in capture_intent
+    )
+    assert "createConversation();" in capture_intent
+    assert 'lit("--conversation-id")' in launch
+    assert "request.conversationId" in launch
+    assert "request.includeConversation || !request.attachments.isEmpty()" in launch
+    assert ": request.effectivePrompt;" in launch
+
+
+def test_chat_without_capture_bridge_still_reaches_agent() -> None:
+    source = _source("AIAssistant.cpp")
+    start = _section(
+        source,
+        "void AIAssistant::startChat(",
+        "void AIAssistant::startNextChat()",
+    )
+    launch = _section(
+        source,
+        "void AIAssistant::launchChat(",
+        "void AIAssistant::handleChatProcessStarted(",
+    )
+
+    # Capture actions need an open RDC at submission. Ordinary conversation
+    # and explicitly mentioned general Skills do not.
+    assert "if(!intentKind.isEmpty() && !m_Ctx.IsCaptureLoaded())" in start
+    assert "if(findBridgeBinding(&request.contextInstanceId, &request.requestedCaptureSessionId))" in start
+    assert "request.contextFreezeRequired = true;" in start
+    assert 'appendSystem(tr("The capture bridge is not ready yet."), true);' not in start
+    assert "else if(request.contextFreezeRequired)" in launch
+    assert "(!request.skill.isEmpty() || !request.intentKind.isEmpty())" not in launch
+    # When the bridge exists, the frozen capture remains bound to its exact
+    # instance and session before AgentHost receives that target.
+    assert "instance != request.contextInstanceId" in launch
+    assert "captureSessionId != request.requestedCaptureSessionId" in launch
 
 
 def test_clarification_origin_uses_full_request_digest_without_prefix_truncation() -> None:
@@ -622,7 +742,12 @@ def test_conversations_own_model_affinity_and_run_in_independent_process_lanes()
     assert 'object.value(lit("modelId"))' in persistence
     assert "syncConnectionSelectionFromConversation();" in source
     assert "repairConversationConnectionSelections();" in source
-    assert "if(repairedConnectionSelections)" in source
+    # A store this session could not read is never written back, so a transient read
+    # failure (file locked, size cap, newer schema) cannot replace the user's history
+    # with the blank thread the panel creates to stay usable.
+    assert "if((repairedConnectionSelections || removedDeletedConversations) && !m_ConversationStoreReadOnly)" in source
+    assert "if(m_ConversationStoreReadOnly)\n    return;" in source
+    assert "m_ConversationStoreReadOnly = !storeError.isEmpty();" in source
     assert "if(repairedConnectionSelections && !m_LoadingConversations)" in selection
     assert "Wait for active AI tasks before switching models." not in selection
     assert "Wait for active AI tasks before switching connections." not in selection

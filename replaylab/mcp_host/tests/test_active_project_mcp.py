@@ -156,6 +156,7 @@ class _CatalogIPC:
             "texture": {"available": False},
         }
         self.export_revision = 1
+        self.shader_query_result = None
         self.calls: list[tuple[str, dict, float | None]] = []
 
     def call(self, method: str, params: dict | None = None, timeout=None):
@@ -168,13 +169,21 @@ class _CatalogIPC:
                 "Bridge error [-32601]: Unknown method: begin_export_shader_catalog"
             )
         if method == "get_current_renderdoc_context":
-            return copy.deepcopy(self.context)
+            context = copy.deepcopy(self.context)
+            if params.get("identity_only"):
+                # Match the real Bridge: its cheap identity response carries
+                # no current event or bound-Shader observation.
+                context["events"] = {"currentEventId": 0, "selectedEventId": 0}
+                context["shaders"] = {"bound": [], "focused": None, "focusIsExplicit": False}
+            return context
         if method == "get_shader_info":
             if int(params.get("event_id", 0)) != int(self.use["eventId"]):
                 return {"error": "No Shader is bound at the requested event"}
             stage = str(params.get("stage", "") or "").strip().lower()
             if stage not in {"fragment", "pixel", "ps"}:
                 return {"error": "No Shader is bound at the requested stage"}
+            if self.shader_query_result is not None:
+                return copy.deepcopy(self.shader_query_result)
             return {
                 "shaderId": self.shader["resourceId"],
                 "stage": "fragment",
@@ -215,6 +224,14 @@ class _CatalogIPC:
                 "captureId": self.capture_id,
                 "captureSessionId": self.context["capture"]["captureSessionId"],
                 "catalogPath": str(path),
+            }
+        if method == "get_shared_shader_replacements":
+            return {
+                "schema": "renderdoc-ultra-shared-shader-replacement-list/v1",
+                "schemaVersion": 1, "captureId": params["expected_capture_id"],
+                "captureSessionId": self.context["capture"]["captureSessionId"],
+                "originalShadersPreserved": True, "replayMutation": False,
+                "count": 0, "replacements": [],
             }
         if method == "load_symbol_aliases":
             return {
@@ -550,7 +567,14 @@ class ActiveProjectMcpTests(unittest.TestCase):
         )
 
     def test_active_unpacked_asset_catalog_is_path_free_persistent_and_hash_bound(self):
-        self._bound_with_assets()
+        # This test starts before indexing and explicitly indexes below. Root
+        # configuration normally starts a background refresh; suppress only
+        # that launch so it cannot race the unindexed fixture or its cleanup.
+        with mock.patch.object(
+            self.server, "_ensure_asset_activation_content_refresh", return_value=None
+        ) as refresh:
+            self._bound_with_assets()
+        refresh.assert_called_once_with(force_activation=True, depth="names")
         assets = Path(self.service.status()["assetRoot"])
         (assets / "hero.obj").write_text(
             "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
@@ -559,9 +583,13 @@ class ActiveProjectMcpTests(unittest.TestCase):
 
         before = json.loads(self.server.get_active_unpacked_asset_index_status())
         self.assertFalse(before["ready"])
-        self.assertEqual(before["requiredAction"], "index_active_unpacked_assets")
+        # A configured root remains usable while indexing is incomplete.
+        self.assertTrue(before["assetRootConfigured"])
+        self.assertTrue(before["directAssetReadsAvailable"])
+        self.assertNotIn("requiredAction", before)
+        self.assertNotIn("next", before)
 
-        indexed = json.loads(self.server.index_active_unpacked_assets())
+        indexed = json.loads(self.server.index_active_unpacked_assets(wait_seconds=120))
         self.assertNotIn("error", indexed, indexed)
         self.assertTrue(indexed["applied"])
         self.assertEqual(indexed["buildId"], "build-1")
@@ -629,7 +657,7 @@ class ActiveProjectMcpTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        indexed = json.loads(self.server.index_active_unpacked_assets())
+        indexed = json.loads(self.server.index_active_unpacked_assets(wait_seconds=120))
         query = json.loads(
             self.server.query_active_unpacked_assets(kinds=["metadata"], limit=20)
         )
@@ -694,7 +722,7 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self.assertIn("error", stale)
         self.assertIn("changed", stale["error"])
         self.assertEqual(len(calls), 1)
-        refreshed = json.loads(self.server.index_active_unpacked_assets())
+        refreshed = json.loads(self.server.index_active_unpacked_assets(wait_seconds=120))
         refreshed_query = json.loads(
             self.server.query_active_unpacked_assets(kinds=["metadata"], limit=20)
         )
@@ -896,7 +924,7 @@ class ActiveProjectMcpTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        first = json.loads(self.server.index_active_unpacked_assets("full"))
+        first = json.loads(self.server.index_active_unpacked_assets("full", wait_seconds=120))
         self.assertNotIn("error", first, first)
         first_query = self._json(
             self.server.query_active_unpacked_assets(
@@ -910,7 +938,7 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self.assertEqual(relations[0]["derivationClass"], "deterministic-derived")
         self.assertEqual(relations[0]["evidence"]["observationCount"], 2)
 
-        second = json.loads(self.server.index_active_unpacked_assets("incremental"))
+        second = json.loads(self.server.index_active_unpacked_assets("incremental", wait_seconds=120))
         self.assertNotIn("error", second, second)
         self.assertEqual(second["catalogSha256"], first["catalogSha256"])
         second_query = self._json(
@@ -924,7 +952,7 @@ class ActiveProjectMcpTests(unittest.TestCase):
 
     def test_unpacked_asset_query_rejects_sqlite_content_not_bound_by_catalog_hash(self):
         self._bound_with_assets()
-        indexed = json.loads(self.server.index_active_unpacked_assets())
+        indexed = json.loads(self.server.index_active_unpacked_assets(wait_seconds=120))
         self.assertNotIn("error", indexed, indexed)
         database = sqlite3.connect(indexed["databasePath"])
         try:
@@ -946,7 +974,7 @@ class ActiveProjectMcpTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        indexed = json.loads(self.server.index_active_unpacked_assets())
+        indexed = json.loads(self.server.index_active_unpacked_assets(wait_seconds=120))
         self.assertNotIn("error", indexed, indexed)
         self.assertEqual(indexed["diagnostics"]["referenceTruncatedAssets"], 1)
         self.assertTrue(indexed["coverage"]["complete"])
@@ -961,18 +989,26 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self.assertEqual(len(selected["relationships"]), 256)
 
     def test_unpacked_asset_file_limit_is_truthful_and_keeps_previous_catalog(self):
+        """A scan that hits its file bound says so and leaves the last catalog readable.
+
+        The bound belongs to the scan, not to the MCP tool: indexing runs in the
+        background job now, so this exercises the catalog service the job drives.
+        """
+
+        from src.asset_catalog import AssetCatalogScanLimitError, AssetCatalogService
+
         self._bound_with_assets()
-        first = json.loads(self.server.index_active_unpacked_assets(max_files=1))
+        first = json.loads(self.server.index_active_unpacked_assets(wait_seconds=120))
         self.assertNotIn("error", first, first)
         assets = Path(self.service.status()["assetRoot"])
         (assets / "second.hlsl").write_text("float4 second();\n", encoding="utf-8")
+        database = Path(first["databasePath"])
 
-        bounded = json.loads(self.server.index_active_unpacked_assets(max_files=1))
-        self.assertIn("error", bounded)
-        self.assertFalse(bounded["applied"])
-        self.assertFalse(bounded["catalogReplaced"])
-        self.assertFalse(bounded["coverage"]["complete"])
-        self.assertTrue(bounded["coverage"]["truncated"])
+        with self.assertRaises(AssetCatalogScanLimitError) as raised:
+            AssetCatalogService(database).scan(assets, build_id="build-1", max_files=1)
+        self.assertGreaterEqual(raised.exception.observed_files, 1)
+        self.assertEqual(raised.exception.maximum_files, 1)
+
         status = json.loads(self.server.get_active_unpacked_asset_index_status())
         self.assertTrue(status["ready"])
         self.assertEqual(status["catalogSha256"], first["catalogSha256"])
@@ -988,7 +1024,7 @@ class ActiveProjectMcpTests(unittest.TestCase):
         except OSError as error:
             self.skipTest("symbolic links are unavailable: %s" % error)
 
-        indexed = json.loads(self.server.index_active_unpacked_assets())
+        indexed = json.loads(self.server.index_active_unpacked_assets(wait_seconds=120))
         self.assertNotIn("error", indexed, indexed)
         self.assertGreaterEqual(indexed["diagnostics"]["skippedSymlinks"], 1)
         query = self._json(
@@ -1011,14 +1047,16 @@ class ActiveProjectMcpTests(unittest.TestCase):
             self.server.query_active_shader_asset_evidence(142, "fragment")
         )
         self.assertFalse(missing_root["ready"])
-        self.assertEqual(
-            missing_root["requiredAction"], "prepare_active_capture_project"
-        )
         self.assertEqual(missing_root["reasonCode"], "asset-root-not-configured")
         self.assertIn(
             "configure_active_project_asset_root",
             missing_root["prerequisites"],
         )
+        self.assertIn(
+            "configure_active_project_asset_root",
+            missing_root["availableCapabilities"],
+        )
+        self.assertNotIn("requiredAction", missing_root)
         self.assertTrue(missing_root["policy"]["readOnlyDatabase"])
 
         self._json(
@@ -1028,7 +1066,13 @@ class ActiveProjectMcpTests(unittest.TestCase):
         )
         assets = self.root / "not-yet-prepared-assets"
         assets.mkdir()
-        self._json(self.server.configure_active_project_asset_root(str(assets)))
+        # Keep this read-only query fixture unindexed; automatic activation
+        # refresh is exercised separately from database-unavailable behavior.
+        with mock.patch.object(
+            self.server, "_ensure_asset_activation_content_refresh", return_value=None
+        ) as refresh:
+            self._json(self.server.configure_active_project_asset_root(str(assets)))
+        refresh.assert_called_once_with(force_activation=True, depth="names")
         asset_dictionary = (
             Path(ensured["project"]["paths"]["sharedDictionaries"]) / "assets"
         )
@@ -1039,10 +1083,17 @@ class ActiveProjectMcpTests(unittest.TestCase):
         )
 
         self.assertFalse(unprepared["ready"])
-        self.assertEqual(unprepared["reasonCode"], "full-catalog-not-prepared")
-        self.assertEqual(
-            unprepared["requiredAction"], "prepare_active_capture_project"
+        self.assertEqual(unprepared["reasonCode"], "shader-catalog-not-prepared")
+        self.assertIn(
+            "get_active_shader_workspace_path",
+            unprepared["availableCapabilities"],
         )
+        self.assertNotIn("requiredAction", unprepared)
+        self.assertEqual(unprepared["requestedShader"], {"event_id": 142, "stage": "fragment"})
+        self.assertFalse(unprepared["assetEvidenceBlocked"])
+        self.assertFalse(unprepared["policy"]["fullAssetScanRequired"])
+        self.assertFalse(unprepared["policy"]["activeFullCatalogOnly"])
+        self.assertNotIn("prepare_active_capture_project", json.dumps(unprepared))
         self.assertFalse(asset_dictionary.exists())
         self.assertFalse(unprepared["policy"]["assetScanTriggered"])
         self.assertFalse(unprepared["policy"]["compilerInvoked"])
@@ -1058,7 +1109,12 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self._json(self.server.prepare_active_capture_project())
         assets = self.root / "configured-after-prepare"
         assets.mkdir()
-        self._json(self.server.configure_active_project_asset_root(str(assets)))
+        # Deliberately leave the managed database absent for this query test.
+        with mock.patch.object(
+            self.server, "_ensure_asset_activation_content_refresh", return_value=None
+        ) as refresh:
+            self._json(self.server.configure_active_project_asset_root(str(assets)))
+        refresh.assert_called_once_with(force_activation=True, depth="names")
         assets_dictionary = (
             Path(self.service.status()["paths"]["sharedDictionaries"]) / "assets"
         )
@@ -1072,10 +1128,57 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self.assertEqual(
             result["reasonCode"], "managed-symbol-database-unavailable"
         )
-        self.assertEqual(
-            result["requiredAction"], "prepare_active_capture_project"
-        )
+        self.assertFalse(result["assetEvidenceBlocked"])
+        self.assertIn("search_unpacked_assets", result["availableCapabilities"])
+        self.assertNotIn("recommendedActions", result)
         self.assertFalse(assets_dictionary.exists())
+
+    def test_active_shader_asset_evidence_accepts_only_covered_partial_scope(self):
+        self._bound_with_assets()
+        prepared = self._json(self.server.prepare_active_capture_project())
+        session_id = prepared["capture"]["captureSessionId"]
+        record = self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS[session_id]
+        record.update(catalogScope="event-stage", coveredEventIds=[142], coveredStages=["fragment"])
+        calls_before = list(self.ipc.calls)
+
+        with mock.patch.object(self.server.SymbolService, "scan", side_effect=AssertionError("query must not scan")), \
+                mock.patch.object(self.server, "_bootstrap_active_shader_catalog", side_effect=AssertionError("query must not export")):
+            covered = self._json(self.server.query_active_shader_asset_evidence(142, "pixel"))
+            other_event = self._json(self.server.query_active_shader_asset_evidence(143, "fragment"))
+            other_stage = self._json(self.server.query_active_shader_asset_evidence(142, "vertex"))
+
+        self.assertTrue(covered["ready"], covered)
+        self.assertEqual(covered["catalogCoverage"], {
+            "catalogScope": "event-stage", "fullFrame": False,
+            "coveredEventIds": [142], "coveredStages": ["fragment"],
+        })
+        self.assertFalse(covered["policy"]["activeFullCatalogOnly"])
+        for result in (other_event, other_stage):
+            self.assertFalse(result["ready"])
+            self.assertEqual(result["reasonCode"], "shader-not-covered-by-catalog")
+            self.assertIn(
+                "get_active_shader_workspace_path",
+                result["availableCapabilities"],
+            )
+            self.assertNotIn("requiredAction", result)
+            self.assertFalse(result["policy"]["assetScanTriggered"])
+        effects = {"export_shader_catalog", "load_symbol_aliases", "apply_shader_candidate_shared_resource"}
+        self.assertEqual([call for call in self.ipc.calls if call[0] in effects],
+                         [call for call in calls_before if call[0] in effects])
+
+    def test_active_shader_asset_evidence_partial_scope_retains_content_validation(self):
+        self._bound_with_assets()
+        prepared = self._json(self.server.prepare_active_capture_project())
+        record = self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS[prepared["capture"]["captureSessionId"]]
+        record.update(catalogScope="event-stage", coveredEventIds=[142], coveredStages=["fragment"])
+        catalog = Path(record["catalogPath"])
+        catalog.write_bytes(catalog.read_bytes() + b"\n")
+        result = self._json(self.server.query_active_shader_asset_evidence(142, "fragment"))
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["reasonCode"], "prepared-evidence-unavailable")
+        self.assertIn("hash validation", result["reason"])
+        self.assertNotIn("requiredAction", result)
+        self.assertFalse(result["policy"]["assetScanTriggered"])
 
     def test_active_shader_asset_evidence_binds_identity_and_labels_relations(self):
         self._bound_with_assets()
@@ -1709,6 +1812,679 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self.assertNotIn("error", path_result, path_result)
         self.assertEqual(path_result["captureId"], self.ipc.capture_id)
 
+    def _historical_applied_workspace(self):
+        self._json(self.server.ensure_active_replay_project("Example Game"))
+        historical = self._json(
+            self.server.get_active_shader_workspace_path(142, "fragment")
+        )
+        self.ipc.export_revision += 1
+        self._json(self.server.prepare_active_capture_project())
+        current = self._json(
+            self.server.get_active_shader_workspace_path(142, "fragment")
+        )
+        self.assertNotEqual(historical["catalogSha256"], current["catalogSha256"])
+        self.assertNotEqual(historical["workspacePath"], current["workspacePath"])
+        workspace = Path(historical["workspacePath"])
+        workspace.mkdir(parents=True)
+        workspace_id = "b" * 32
+        replacement_id = "c" * 32
+        status = {
+            "schema": "renderdoc-ultra-shader-workspace-status/v1",
+            "workspacePath": str(workspace),
+            "workspaceId": workspace_id,
+            "capture": {
+                "captureId": self.ipc.capture_id,
+                "capturePath": self.ipc.context["capture"]["path"],
+                "api": self.ipc.context["capture"]["api"],
+                "catalogSha256": historical["catalogSha256"],
+            },
+            "shader": {
+                "resourceId": 902,
+                "stage": "fragment",
+                "entryPoint": "main",
+                "rawSha256": self.ipc.shader["rawSha256"],
+            },
+            "baseline": {"rawSha256": self.ipc.shader["rawSha256"]},
+            "stage": "fragment",
+            "entryPoint": "main",
+            "routePlan": {
+                "schema": "renderdoc-ultra-shader-workspace-route-plan/v2",
+                "schemaVersion": 2,
+                "editableFormat": "hlsl",
+            },
+            "source": {"present": True, "format": "hlsl"},
+            "representation": {"lane": "executable-editable"},
+            "recoveryPlan": {},
+        }
+        remembered = {
+            "replacementId": replacement_id,
+            "captureId": self.ipc.capture_id,
+            "captureSessionId": self.ipc.context["capture"]["captureSessionId"],
+            "workspaceId": workspace_id,
+            "workspacePath": str(workspace),
+            "originalResourceId": 902,
+            "originalRawSha256": self.ipc.shader["rawSha256"],
+            "stage": "fragment",
+            "entryPoint": "main",
+            "candidateRawSha256": "d" * 64,
+            "revision": 1,
+            "api": "D3D11",
+            "encoding": "dxbc",
+        }
+        live = {
+            "schema": "renderdoc-ultra-shared-shader-replacement-list/v1",
+            "schemaVersion": 1,
+            "captureId": self.ipc.capture_id,
+            "captureSessionId": self.ipc.context["capture"]["captureSessionId"],
+            "originalShadersPreserved": True,
+            "replayMutation": False,
+            "count": 1,
+            "replacements": [{
+                "replacementId": replacement_id,
+                "workspaceId": workspace_id,
+                "originalResourceId": 902,
+                "originalRawSha256": self.ipc.shader["rawSha256"],
+                "stage": "fragment",
+                "entryPoint": "main",
+                "candidateRawSha256": "d" * 64,
+                "revision": 1,
+                "api": "D3D11",
+                "encoding": "dxbc",
+                "resourceScoped": True,
+                "eventScoped": False,
+                "allOriginalResourceUsesAffected": True,
+                "originalShaderPreserved": True,
+            }],
+        }
+        return historical, current, status, remembered, live
+
+    def test_active_resolver_returns_exact_live_restored_workspace(self):
+        historical, current, status, remembered, live = (
+            self._historical_applied_workspace()
+        )
+        original_call = self.ipc.call
+
+        def bridge_call(method, params=None, timeout=None):
+            if method == "get_shared_shader_replacements":
+                return copy.deepcopy(live)
+            return original_call(method, params, timeout)
+
+        self.server._SHARED_SHADER_REPLACEMENT_RECORDS.clear()
+        self.server._SHARED_SHADER_REPLACEMENT_RECORDS[
+            remembered["replacementId"]
+        ] = remembered
+        workspace_service = mock.Mock()
+        workspace_service.status.return_value = status
+        try:
+            with mock.patch.object(self.ipc, "call", side_effect=bridge_call), \
+                    mock.patch.object(self.server, "_shader_workspace_service",
+                                      return_value=workspace_service):
+                with mock.patch.object(self.service, "future_frame_plan",
+                                       side_effect=RuntimeError("optional project discovery unavailable")) as future, \
+                        mock.patch.object(self.server, "_existing_project_shader_sources",
+                                          side_effect=RuntimeError("optional source search unavailable")) as discover:
+                    resolved = self._json(
+                        self.server.get_active_shader_workspace_path(142, "fragment")
+                    )
+                future.assert_not_called()
+                discover.assert_not_called()
+                workspace_service.status.assert_called_once_with(str(Path(historical["workspacePath"])))
+                self.assertEqual(resolved["projectReuse"]["status"], "deferred")
+                self.assertFalse(resolved["projectReuse"]["performed"])
+                self.assertEqual(resolved["projectReuse"]["availableCapability"],
+                                 "get_active_project_future_frame_plan")
+                self.assertEqual(resolved["sourceDiscoveryStatus"], "deferred")
+                self.assertEqual(resolved["existingSourceWorkspaces"], [])
+                self.assertEqual(resolved["sourceDiscoveryDiagnostics"], [])
+                self.assertEqual(resolved["workspacePath"], historical["workspacePath"])
+                self.assertEqual(resolved["workspaceId"], status["workspaceId"])
+                self.assertEqual(resolved["catalogSha256"], historical["catalogSha256"])
+                self.assertEqual(resolved["activeCatalogSha256"], current["catalogSha256"])
+                self.assertEqual(
+                    resolved["activeReplacementId"], remembered["replacementId"]
+                )
+                with mock.patch.object(
+                    self.server, "_ensure_workspace_capture_catalog_identity"
+                ):
+                    prepared = json.loads(self.server.prepare_shader_workspace(
+                        142, "fragment", historical["workspacePath"],
+                        expected_resource_id=902,
+                        expected_entry_point="main",
+                        expected_raw_sha256=self.ipc.shader["rawSha256"],
+                        expected_capture_id=self.ipc.capture_id,
+                        expected_capture_session_id=live["captureSessionId"],
+                        admit_existing=True,
+                    ))
+                self.assertNotIn("error", prepared, prepared)
+                self.assertEqual(
+                    prepared["result"]["binding"]["workspaceId"], status["workspaceId"]
+                )
+                self.assertTrue(prepared["result"]["created"]["admittedExisting"])
+                wrong_workspace = str(Path(historical["workspacePath"]).parent / ("f" * 64))
+                denied = json.loads(self.server.prepare_shader_workspace(
+                    142, "fragment", wrong_workspace, admit_existing=True,
+                ))
+                self.assertIn("deterministic path", denied["error"])
+                self.assertFalse(Path(wrong_workspace).exists())
+        finally:
+            self.server._SHARED_SHADER_REPLACEMENT_RECORDS.clear()
+
+    def test_active_resolver_edits_latest_project_source_while_retaining_replay_owner(self):
+        historical, current, status, remembered, live = self._historical_applied_workspace()
+        self._json(self.server.configure_active_replay_project(
+            "example-game", "build-1", "windows-x64", "d3d11"))
+        status["source"].update(currentSha256="1" * 64,
+                                projectSource={"knowledgeId": "2" * 32})
+        status["latestCompiled"] = {"sourceSha256": "1" * 64}
+        editable = copy.deepcopy(status)
+        editable.update(workspacePath=current["workspacePath"], workspaceId="3" * 32)
+        editable["capture"]["catalogSha256"] = current["catalogSha256"]
+        editable["source"]["currentSha256"] = "4" * 64
+        head = {"headKey": "5" * 64, "generation": 2,
+                "knowledge": {"knowledgeId": "6" * 32, "sourceSha256": "4" * 64}}
+        original_call = self.ipc.call
+
+        def bridge_call(method, params=None, timeout=None):
+            if method == "get_shared_shader_replacements":
+                return copy.deepcopy(live)
+            return original_call(method, params, timeout)
+
+        workspace_service = mock.Mock()
+        workspace_service.status.side_effect = lambda path: copy.deepcopy(
+            editable if Path(path) == Path(current["workspacePath"]) else status)
+        self.server._SHARED_SHADER_REPLACEMENT_RECORDS[remembered["replacementId"]] = remembered
+        try:
+            with mock.patch.object(self.ipc, "call", side_effect=bridge_call), \
+                    mock.patch.object(self.server, "_shader_workspace_service", return_value=workspace_service), \
+                    mock.patch.object(self.server.ReplayProjectService, "current_workspace_source_head",
+                                      return_value=head) as read_head, \
+                    mock.patch.object(self.server, "_project_source_editor_workspace",
+                                      return_value=Path(current["workspacePath"])) as materialize, \
+                    mock.patch.object(self.service, "future_frame_plan",
+                                      side_effect=AssertionError("no full discovery for a known source")):
+                result = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+            read_head.assert_called_once_with("2" * 32)
+            self.assertEqual(materialize.call_args.args[3], head["knowledge"])
+            self.assertEqual(result["workspacePath"], current["workspacePath"])
+            self.assertEqual(result["workspaceId"], "3" * 32)
+            self.assertEqual(result["replayWorkspacePath"], historical["workspacePath"])
+            self.assertEqual(result["replaySourceSha256"], "1" * 64)
+            self.assertEqual(result["activeReplacementId"], remembered["replacementId"])
+            self.assertEqual(result["latestProjectSource"]["sourceSha256"], "4" * 64)
+            self.assertFalse(result["latestProjectSource"]["applied"])
+            workspace_service.create.assert_not_called()
+            workspace_service.compile.assert_not_called()
+            # Unpublished local edits in this same head must remain the
+            # editable source; a hash difference is not a newer publication.
+            head["knowledge"]["knowledgeId"] = "2" * 32
+            with mock.patch.object(self.ipc, "call", side_effect=bridge_call), \
+                    mock.patch.object(self.server, "_shader_workspace_service", return_value=workspace_service), \
+                    mock.patch.object(self.server.ReplayProjectService, "current_workspace_source_head", return_value=head), \
+                    mock.patch.object(self.server, "_project_source_editor_workspace",
+                                      side_effect=AssertionError("must retain this head's local edit")):
+                local = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+            self.assertEqual(local["workspacePath"], historical["workspacePath"])
+            self.assertNotIn("latestProjectSource", local)
+        finally:
+            self.server._SHARED_SHADER_REPLACEMENT_RECORDS.clear()
+
+    def test_active_resolver_reuses_same_original_at_another_catalog_event(self):
+        original_call = self.ipc.call
+
+        def export_second_use(method, params=None, timeout=None):
+            result = original_call(method, params, timeout)
+            if method == "export_shader_catalog" and params.get("event_ids") == []:
+                path = Path(result["catalogPath"])
+                catalog = json.loads(path.read_text(encoding="utf-8"))
+                catalog["uses"].append({**catalog["uses"][0], "eventId": 143})
+                catalog["selection"]["eventIds"].append(143)
+                path.write_text(json.dumps(catalog), encoding="utf-8")
+            return result
+
+        with mock.patch.object(self.ipc, "call", side_effect=export_second_use):
+            historical, unused_current, status, remembered, live = self._historical_applied_workspace()
+        live["replacements"][0]["anchorEventId"] = 142
+
+        def bridge_call(method, params=None, timeout=None):
+            if method == "get_shared_shader_replacements":
+                return copy.deepcopy(live)
+            return original_call(method, params, timeout)
+
+        self.server._SHARED_SHADER_REPLACEMENT_RECORDS[remembered["replacementId"]] = remembered
+        workspace_service = mock.Mock()
+        workspace_service.status.return_value = status
+        try:
+            with mock.patch.object(self.ipc, "call", side_effect=bridge_call), \
+                    mock.patch.object(self.server, "_shader_workspace_service", return_value=workspace_service), \
+                    mock.patch.object(self.service, "future_frame_plan", side_effect=AssertionError("discovery deferred")), \
+                    mock.patch.object(self.server, "_existing_project_shader_sources", side_effect=AssertionError("discovery deferred")):
+                result = self._json(self.server.get_active_shader_workspace_path(143, "fragment"))
+            self.assertEqual(result["eventId"], 143)
+            self.assertEqual(result["workspacePath"], historical["workspacePath"])
+            self.assertEqual(result["activeReplacementId"], remembered["replacementId"])
+            self.assertEqual(result["rawSha256"], self.ipc.shader["rawSha256"])
+            self.assertEqual(result["sourceDiscoveryStatus"], "deferred")
+            self.assertEqual(live["replacements"][0]["anchorEventId"], 142)
+        finally:
+            self.server._SHARED_SHADER_REPLACEMENT_RECORDS.clear()
+
+    def test_session_inventory_resolves_other_catalog_owner_without_restore_hint(self):
+        historical, current, status, remembered, live = self._historical_applied_workspace()
+        owner_capture = "7" * 64
+        status["capture"]["captureId"] = owner_capture
+        live["replacements"][0].update(
+            captureId=owner_capture, captureSessionId=live["captureSessionId"])
+        self.server._SHARED_SHADER_REPLACEMENT_RECORDS.clear()
+        ui = {"ui": {
+            "captureBinding": {"captureSessionId": live["captureSessionId"],
+                               "capturePath": self.ipc.context["capture"]["path"]},
+            "workspaces": [{"workspaceId": status["workspaceId"],
+                            "workspacePath": historical["workspacePath"],
+                            "captureId": owner_capture, **status["shader"]}],
+        }}
+        original_call = self.ipc.call
+        inventory_calls = []
+
+        def bridge_call(method, params=None, timeout=None):
+            if method == "get_shared_shader_replacements":
+                inventory_calls.append(dict(params))
+                return copy.deepcopy(live)
+            if method == "get_shader_workspace_ui_state":
+                return copy.deepcopy(ui)
+            return original_call(method, params, timeout)
+
+        workspace_service = mock.Mock()
+        workspace_service.status.return_value = status
+        with mock.patch.object(self.ipc, "call", side_effect=bridge_call), \
+                mock.patch.object(self.server, "_shader_workspace_service", return_value=workspace_service):
+            resolved = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+            self.assertEqual(resolved["workspacePath"], historical["workspacePath"])
+            self.assertEqual(resolved["workspaceId"], status["workspaceId"])
+            self.assertNotEqual(resolved["workspacePath"], current["workspacePath"])
+            self.assertTrue(inventory_calls[-1]["include_all_capture_catalogs"])
+            with mock.patch.object(self.server, "_ensure_workspace_capture_catalog_identity"):
+                direct = json.loads(self.server.prepare_shader_workspace(
+                    142, "fragment", current["workspacePath"]))
+            self.assertNotIn("error", direct, direct)
+            self.assertEqual(direct["result"]["workspacePath"], historical["workspacePath"])
+            self.assertEqual(direct["result"]["requestedWorkspacePath"], current["workspacePath"])
+            self.assertTrue(direct["result"]["reusedLiveOwner"])
+            self.assertTrue(direct["result"]["created"]["sourcePreserved"])
+            self.assertFalse(Path(current["workspacePath"]).exists())
+            with mock.patch.object(self.server, "_ensure_workspace_capture_catalog_identity"):
+                admitted = json.loads(self.server.prepare_shader_workspace(
+                    142, "fragment", historical["workspacePath"], admit_existing=True))
+            self.assertNotIn("error", admitted, admitted)
+            self.assertTrue(admitted["result"]["created"]["sourcePreserved"])
+            workspace_service.create.assert_not_called()
+            workspace_service.decompile.assert_not_called()
+            workspace_service.import_project_source.assert_not_called()
+            explicit_path = Path(current["workspacePath"])
+            explicit_path.mkdir()
+            draft = explicit_path / "unsaved-local-source.hlsl"
+            draft.write_bytes(b"// independent local draft\n")
+            explicit_status = copy.deepcopy(status)
+            explicit_status.update(workspacePath=str(explicit_path), workspaceId="9" * 32)
+            explicit_status["capture"]["captureId"] = self.ipc.capture_id
+            workspace_service.status.side_effect = lambda path: copy.deepcopy(
+                explicit_status if Path(path) == explicit_path else status)
+            before_queries = len(inventory_calls)
+            with mock.patch.object(self.server, "_ensure_workspace_capture_catalog_identity"):
+                separate = json.loads(self.server.prepare_shader_workspace(
+                    142, "fragment", str(explicit_path), admit_existing=True))
+            self.assertNotIn("error", separate, separate)
+            self.assertEqual(separate["result"]["workspacePath"], str(explicit_path))
+            self.assertFalse(separate["result"]["reusedLiveOwner"])
+            self.assertEqual(len(inventory_calls), before_queries)
+            self.assertEqual(draft.read_bytes(), b"// independent local draft\n")
+            # Source admission also works without a live owner: the original
+            # same-file catalog/bytes are checked above. An unrelated/stale
+            # replacement is never used as physical apply authority here.
+            for changes in ({"originalResourceId": 903}, {"captureSessionId": "0" * 32}):
+                previous = copy.deepcopy(live["replacements"][0])
+                live["replacements"][0].update(changes)
+                with mock.patch.object(self.server, "_ensure_workspace_capture_catalog_identity"):
+                    denied = json.loads(self.server.prepare_shader_workspace(
+                        142, "fragment", historical["workspacePath"], admit_existing=True))
+                self.assertNotIn("error", denied)
+                self.assertTrue(denied["result"]["created"]["sourcePreserved"])
+                self.assertFalse(denied["renderDocReplacement"]["applied"])
+                live["replacements"][0] = previous
+
+    def test_verified_restore_resource_mapping_reuses_only_its_exact_candidate(self):
+        historical, unused_current, status, remembered, live = self._historical_applied_workspace()
+        status["shader"]["resourceId"] = 901
+        status["latestCompiled"] = {"revision": 1, "rawSha256": "d" * 64}
+        row = live["replacements"][0]
+        row.update(captureId=self.ipc.capture_id, captureSessionId=live["captureSessionId"],
+                   restoredOriginalResourceId=901, abiValidationMode="verified-rdc-restore",
+                   physicalAbiSha256="f" * 64)
+        row["restoreValidationReceipt"] = {"payload": {key: row[key] for key in (
+            "candidateRawSha256", "originalRawSha256", "stage", "entryPoint", "encoding",
+            "physicalAbiSha256")}, "signature": "bridge-authenticated-origin"}
+        original_row = copy.deepcopy(row)
+        self.server._SHARED_SHADER_REPLACEMENT_RECORDS.clear()
+        ui = {"ui": {
+            "captureBinding": {"captureSessionId": live["captureSessionId"],
+                               "capturePath": self.ipc.context["capture"]["path"]},
+            "workspaces": [{"workspaceId": status["workspaceId"],
+                            "workspacePath": historical["workspacePath"],
+                            "captureId": self.ipc.capture_id, **status["shader"]}],
+        }}
+        original_call = self.ipc.call
+
+        def bridge_call(method, params=None, timeout=None):
+            if method == "get_shared_shader_replacements":
+                self.assertTrue(params["include_validation_receipts"])
+                return copy.deepcopy(live)
+            if method == "get_shader_workspace_ui_state":
+                return copy.deepcopy(ui)
+            return original_call(method, params, timeout)
+
+        service = mock.Mock()
+        service.status.return_value = status
+        with mock.patch.object(self.ipc, "call", side_effect=bridge_call), \
+                mock.patch.object(self.server, "_shader_workspace_service", return_value=service):
+            resolved = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+            self.assertEqual(resolved["workspacePath"], historical["workspacePath"])
+            self.assertEqual(resolved["shaderResourceId"], 902)
+            with mock.patch.object(self.server, "_ensure_workspace_capture_catalog_identity"):
+                prepared = json.loads(self.server.prepare_shader_workspace(
+                    142, "fragment", historical["workspacePath"], admit_existing=True))
+            self.assertNotIn("error", prepared, prepared)
+            self.assertEqual(prepared["result"]["created"]["shader"]["resourceId"], 901)
+            self.assertEqual(prepared["result"]["binding"]["originalResourceId"], 902)
+            for change in ({"restoredOriginalResourceId": None}, {"restoredOriginalResourceId": 900},
+                           {"revision": 2}, {"candidateRawSha256": "0" * 64},
+                           {"abiValidationMode": "full-replay-report-and-inline-physical"},
+                           {"restoreValidationReceipt": None}):
+                with self.subTest(change=change):
+                    live["replacements"][0] = {**original_row, **change}
+                    result = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
+                    self.assertIn("error", result)
+                    self.assertNotIn("workspacePath", result)
+            service.create.assert_not_called()
+
+    def test_active_resolver_keeps_workspace_bytes_and_final_capture_catalog_checks(self):
+        historical, unused_current, status, remembered, live = self._historical_applied_workspace()
+        session = self.ipc.context["capture"]["captureSessionId"]
+        context = copy.deepcopy(self.ipc.context)
+        record = copy.deepcopy(self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS[session])
+        catalog_path = Path(record["catalogPath"])
+        catalog_bytes = catalog_path.read_bytes()
+        original_call = self.ipc.call
+
+        def bridge_call(method, params=None, timeout=None):
+            if method == "get_shared_shader_replacements":
+                return copy.deepcopy(live)
+            return original_call(method, params, timeout)
+
+        def checked_status(change):
+            if change == "workspace-original-bytes":
+                return {**status, "baseline": {"rawSha256": "f" * 64}}
+            if change == "workspace-validator-error":
+                raise ValueError("workspace candidate content/hash mismatch")
+            if change == "catalog-bytes":
+                catalog_path.write_bytes(catalog_bytes + b" ")
+            if change == "capture-session":
+                self.ipc.context["capture"]["captureSessionId"] = "f" * 32
+            return copy.deepcopy(status)
+
+        workspace_service = mock.Mock()
+        for change in ("workspace-original-bytes", "workspace-validator-error", "catalog-bytes", "capture-session"):
+            with self.subTest(change=change):
+                self.server._SHARED_SHADER_REPLACEMENT_RECORDS[remembered["replacementId"]] = copy.deepcopy(remembered)
+                workspace_service.status.side_effect = lambda unused_path: checked_status(change)
+                try:
+                    with mock.patch.object(self.ipc, "call", side_effect=bridge_call), \
+                            mock.patch.object(self.server, "_shader_workspace_service", return_value=workspace_service), \
+                            mock.patch.object(self.service, "future_frame_plan", side_effect=AssertionError("discovery must not mask validation")) as future, \
+                            mock.patch.object(self.server, "_existing_project_shader_sources", side_effect=AssertionError("discovery must not mask validation")) as discover:
+                        result = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
+                    self.assertIn("error", result)
+                    self.assertNotIn("workspacePath", result)
+                    future.assert_not_called()
+                    discover.assert_not_called()
+                finally:
+                    catalog_path.write_bytes(catalog_bytes)
+                    self.ipc.context = copy.deepcopy(context)
+                    self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS[session] = copy.deepcopy(record)
+                    self.server._SHARED_SHADER_REPLACEMENT_RECORDS.clear()
+
+    def test_prepare_admits_agent_selected_existing_source_without_live_apply(self):
+        historical, current, status, unused_owner, unused_live = (
+            self._historical_applied_workspace()
+        )
+        self.server._SHARED_SHADER_REPLACEMENT_RECORDS.clear()
+        workspaces = mock.Mock()
+        workspaces.status.side_effect = lambda unused_path: copy.deepcopy(status)
+        with mock.patch.object(self.server, "_shader_workspace_service", return_value=workspaces), \
+                mock.patch.object(self.server, "_ensure_workspace_capture_catalog_identity"):
+            prepared = json.loads(self.server.prepare_shader_workspace(
+                142, "fragment", historical["workspacePath"], admit_existing=True,
+            ))
+            self.assertNotIn("error", prepared, prepared)
+            self.assertTrue(prepared["result"]["created"]["sourcePreserved"])
+            self.assertNotEqual(historical["workspacePath"], current["workspacePath"])
+            status["shader"]["rawSha256"] = "f" * 64
+            crossed = json.loads(self.server.prepare_shader_workspace(
+                142, "fragment", historical["workspacePath"], admit_existing=True,
+            ))
+            self.assertIn("exact selected Shader", crossed["error"])
+        workspaces.create.assert_not_called()
+        self.assertFalse(any(method == "apply_shared_shader_replacement"
+                             for method, unused_params, unused_timeout in self.ipc.calls))
+
+    def test_no_live_owner_resolves_and_prepares_existing_source_across_catalog_versions(self):
+        historical, current, status, unused_owner, unused_live = self._historical_applied_workspace()
+        self.server._SHARED_SHADER_REPLACEMENT_RECORDS.clear()
+        workspace = Path(historical["workspacePath"])
+        source = workspace / "shader.hlsl"
+        original_source = b"// current organized user source\n"
+        source.write_bytes(original_source)
+        status["capture"]["captureId"] = "f" * 64  # Historical partial export identity.
+        status["source"].update(currentSha256=hashlib.sha256(original_source).hexdigest(),
+                                decompiledSha256=hashlib.sha256(original_source).hexdigest())
+        (workspace / "manifest.json").write_text(json.dumps(status), encoding="utf-8")
+        manifest_before = (workspace / "manifest.json").read_bytes()
+        reader = mock.Mock()
+        reader.source_edit_status.return_value = copy.deepcopy(status)
+        reader.status.return_value = copy.deepcopy(status)
+        workspaces = mock.Mock()
+        workspaces.status.side_effect = lambda unused_path: copy.deepcopy(status)
+        with mock.patch.object(self.server, "_active_applied_shader_workspace", return_value=None), \
+                mock.patch.object(self.server, "_shader_workspace_artifact_service", return_value=reader), \
+                mock.patch.object(self.server, "_shader_workspace_service", return_value=workspaces), \
+                mock.patch.object(self.server, "_ensure_workspace_capture_catalog_identity"):
+            resolved = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+            self.assertEqual(resolved["workspacePath"], historical["workspacePath"])
+            self.assertTrue(resolved["admitExistingRequired"])
+            self.assertEqual(resolved["sourceDiscoveryStatus"], "latest-existing-source")
+            self.assertEqual(resolved["activeCatalogSha256"], current["catalogSha256"])
+            prepared = json.loads(self.server.prepare_shader_workspace(
+                142, "fragment", current["workspacePath"]))
+            self.assertNotIn("error", prepared, prepared)
+            self.assertEqual(prepared["result"]["binding"]["workspaceId"], status["workspaceId"])
+            self.assertTrue(prepared["result"]["created"]["sourcePreserved"])
+        workspaces.create.assert_not_called()
+        self.assertFalse(Path(current["workspacePath"]).exists())
+        self.assertEqual(source.read_bytes(), original_source)
+        self.assertEqual((workspace / "manifest.json").read_bytes(), manifest_before)
+
+    def test_existing_source_discovery_returns_choices_without_path_selection(self):
+        historical, unused_current, status, unused_owner, unused_live = (
+            self._historical_applied_workspace()
+        )
+        workspace = Path(historical["workspacePath"])
+        source = workspace / "source" / "shader.hlsl"
+        source.parent.mkdir()
+        source.write_text("// latest local draft\n", encoding="utf-8")
+        shader = dict(status["shader"])
+        knowledge = {
+            "knowledgeId": "a" * 32,
+            "workspaceId": status["workspaceId"],
+            "captureId": self.ipc.capture_id,
+            "originResourceId": shader["resourceId"],
+            "stage": shader["stage"],
+            "entryPoint": shader["entryPoint"],
+            "rawSha256": shader["rawSha256"],
+            "workspacePath": str(workspace),
+            "sourceOriginPath": str(source),
+            "sourceSha256": "c" * 64,
+        }
+        plan = {"matches": [{"shader": shader, "workspaceCandidates": [{
+            "knowledgeId": "a" * 32, "matchMode": "raw-exact",
+        }]}]}
+        service = mock.Mock()
+        service.get_workspace_knowledge.return_value = knowledge
+        sources, diagnostics = self.server._existing_project_shader_sources(
+            service, self.service.status(), plan, self.ipc.capture_id, shader
+        )
+        self.assertEqual(diagnostics, [])
+        self.assertEqual(sources[0]["workspacePath"], str(workspace))
+        self.assertEqual(sources[0]["sourceSha256"],
+                         hashlib.sha256(source.read_bytes()).hexdigest())
+        self.assertFalse(sources[0]["applyAuthorization"])
+        service.seed_workspace.assert_not_called()
+        knowledge["captureId"] = "f" * 64
+        legacy_catalog, diagnostics = self.server._existing_project_shader_sources(
+            service, self.service.status(), plan, self.ipc.capture_id, shader
+        )
+        self.assertEqual(legacy_catalog, sources)
+        knowledge["originResourceId"] += 1
+        rejected, diagnostics = self.server._existing_project_shader_sources(
+            service, self.service.status(), plan, self.ipc.capture_id, shader)
+        self.assertEqual(rejected, [])
+
+    def test_active_resolver_finds_restore_from_other_host_process(self):
+        historical, current, status, remembered, live = (
+            self._historical_applied_workspace()
+        )
+        self.server._SHARED_SHADER_REPLACEMENT_RECORDS.clear()
+        project_root = Path(self.service.status()["projectRoot"])
+        record_path = (project_root / ".replaylab" / "replay-project" / "derived"
+                       / "restore-results" / (("e" * 64) + ".json"))
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(json.dumps({
+            "schema": "replaylab-project-restore-result/v1",
+            "status": "finished",
+            "shaders": {"items": [{
+                "status": "applied",
+                "resourceId": 902,
+                "stage": "fragment",
+                "replacementId": remembered["replacementId"],
+                "workspaceId": remembered["workspaceId"],
+                "workspacePath": historical["workspacePath"],
+            }]},
+        }), encoding="utf-8")
+        ui = {
+            "present": True,
+            "captureBinding": {
+                "captureSessionId": live["captureSessionId"],
+                "capturePath": self.ipc.context["capture"]["path"],
+            },
+            "workspaces": [{
+                "workspaceId": remembered["workspaceId"],
+                "workspacePath": historical["workspacePath"],
+                "captureId": self.ipc.capture_id,
+                "resourceId": 902,
+                "stage": "fragment",
+                "entryPoint": "main",
+                "visibleInWorkspaceTree": True,
+                "openInTab": True,
+            }],
+        }
+        original_call = self.ipc.call
+
+        def bridge_call(method, params=None, timeout=None):
+            if method == "get_shared_shader_replacements":
+                return copy.deepcopy(live)
+            if method == "get_shader_workspace_ui_state":
+                return copy.deepcopy(ui)
+            return original_call(method, params, timeout)
+
+        workspace_service = mock.Mock()
+        workspace_service.status.return_value = status
+        with mock.patch("src.rdc_shader_inventory_cache.capture_path_sha256",
+                        return_value="e" * 64), \
+                mock.patch.object(self.ipc, "call", side_effect=bridge_call), \
+                mock.patch.object(self.server, "_shader_workspace_service",
+                                  return_value=workspace_service):
+            resolved = self._json(
+                self.server.get_active_shader_workspace_path(142, "fragment")
+            )
+            self.assertEqual(resolved["workspacePath"], historical["workspacePath"])
+            self.assertEqual(resolved["workspaceId"], status["workspaceId"])
+            self.assertNotEqual(resolved["workspacePath"], current["workspacePath"])
+            with mock.patch.object(
+                self.server, "_ensure_workspace_capture_catalog_identity"
+            ):
+                prepared = json.loads(self.server.prepare_shader_workspace(
+                    142, "fragment", historical["workspacePath"],
+                    admit_existing=True,
+                ))
+            self.assertNotIn("error", prepared, prepared)
+            self.assertEqual(
+                prepared["result"]["binding"]["workspaceId"], status["workspaceId"]
+            )
+            status["workspaceId"] = "f" * 32
+            rejected = json.loads(
+                self.server.get_active_shader_workspace_path(142, "fragment")
+            )
+            self.assertIn("changed original Shader identity", rejected["error"])
+            self.assertNotIn("workspacePath", rejected)
+
+    def test_active_resolver_rejects_stale_or_mismatched_replacement(self):
+        historical, current, status, remembered, live = (
+            self._historical_applied_workspace()
+        )
+        original_call = self.ipc.call
+
+        def bridge_call(method, params=None, timeout=None):
+            if method == "get_shared_shader_replacements":
+                return copy.deepcopy(live)
+            return original_call(method, params, timeout)
+
+        self.server._SHARED_SHADER_REPLACEMENT_RECORDS.clear()
+        self.server._SHARED_SHADER_REPLACEMENT_RECORDS[
+            remembered["replacementId"]
+        ] = remembered
+        workspace_service = mock.Mock()
+        workspace_service.status.return_value = status
+        try:
+            with mock.patch.object(self.ipc, "call", side_effect=bridge_call), \
+                    mock.patch.object(self.server, "_shader_workspace_service",
+                                      return_value=workspace_service):
+                live["replacements"][0]["originalRawSha256"] = "f" * 64
+                mismatch = self._json(
+                    self.server.get_active_shader_workspace_path(142, "fragment")
+                )
+                self.assertEqual(mismatch["workspacePath"], current["workspacePath"])
+                self.assertIsNone(mismatch["activeReplacementId"])
+                self.assertEqual(mismatch["sourceDiscoveryStatus"], "completed")
+                self.assertNotIn("status", mismatch["projectReuse"])
+                live["replacements"] = []
+                live["count"] = 0
+                rolled_back = self._json(
+                    self.server.get_active_shader_workspace_path(142, "fragment")
+                )
+                self.assertEqual(rolled_back["workspacePath"], current["workspacePath"])
+                self.assertNotEqual(rolled_back["workspacePath"], historical["workspacePath"])
+                remembered["captureSessionId"] = "f" * 32
+                old_session = self._json(
+                    self.server.get_active_shader_workspace_path(142, "fragment")
+                )
+                self.assertEqual(old_session["workspacePath"], current["workspacePath"])
+                remembered["captureSessionId"] = live["captureSessionId"]
+                live["captureSessionId"] = "f" * 32
+                malformed = json.loads(
+                    self.server.get_active_shader_workspace_path(142, "fragment")
+                )
+                self.assertIn("invalid live replacement metadata", malformed["error"])
+                self.assertNotIn("workspacePath", malformed)
+        finally:
+            self.server._SHARED_SHADER_REPLACEMENT_RECORDS.clear()
+
     def test_empty_ui_id_bootstraps_one_shader_and_reuses_exact_partial_catalog(self):
         self.ipc.context["capture"]["captureId"] = ""
         first = self._json(self.server.get_active_shader_workspace_path(142, "pixel"))
@@ -1719,13 +2495,25 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self.assertEqual(first["coveredStages"], ["fragment"])
         self.assertTrue(first["projectReuse"]["blocked"])
         self.assertFalse(Path(first["workspacePath"]).exists())
+        context_calls = [args for method, args, _ in self.ipc.calls
+                         if method == "get_current_renderdoc_context"]
+        self.assertTrue(context_calls)
+        self.assertTrue(all(args.get("identity_only") is True for args in context_calls))
+        before_reuse = len(self.ipc.calls)
         again = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+        reused_context_calls = [args for method, args, unused in self.ipc.calls[before_reuse:]
+                                if method == "get_current_renderdoc_context"]
+        self.assertTrue(reused_context_calls)
+        self.assertTrue(all(args.get("identity_only") is True for args in reused_context_calls))
         self.assertEqual(first["workspacePath"], again["workspacePath"])
+        self.assertEqual(again["sourceDiscoveryStatus"], "completed")
         exports = [args for method, args, unused in self.ipc.calls if method == "export_shader_catalog"]
         self.assertEqual(len(exports), 1)
         self.assertEqual(exports[0]["event_ids"], [142])
         self.assertEqual(exports[0]["stages"], ["fragment"])
-        self.assertNotIn("get_shader_info", [item[0] for item in self.ipc.calls])
+        self.assertEqual([args for method, args, _ in self.ipc.calls
+                          if method == "get_shader_info"],
+                         [{"event_id": 142, "stage": "fragment"}])
         self.assertIsNone(self.server._active_capture_catalog_selection(999, "fragment"))
         self.assertIsNone(self.server._active_capture_catalog_selection(142, "vertex"))
         status = self._json(self.server.get_active_capture_catalog_binding_status())
@@ -1733,6 +2521,96 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self.assertEqual(status["coveredEventIds"], [142])
         catalog = json.loads(Path(status["catalogPath"]).read_text(encoding="utf-8"))
         self.assertEqual(catalog["selection"]["mode"], "explicit")
+
+    def test_partial_bootstrap_uses_proved_original_while_replacement_is_active(self):
+        self.ipc.context["capture"]["captureId"] = ""
+        shader = self.ipc.context["shaders"]["bound"][0]
+        original = {key: shader[key] for key in ("stage", "resourceId", "entryPoint", "rawSha256")}
+        original["captureSessionId"] = self.ipc.context["capture"]["captureSessionId"]
+        original["resourceId"] = str(original["resourceId"])
+        shader["capturedOriginalIdentity"] = original
+        shader["rawSha256"] = "d" * 64
+        self.ipc.shader_query_result = copy.deepcopy(shader)
+        result = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+        self.assertEqual(result["rawSha256"], original["rawSha256"])
+        self.assertFalse(result["fullFrame"])
+        exports = [args for method, args, _ in self.ipc.calls if method == "export_shader_catalog"]
+        self.assertEqual([args["event_ids"] for args in exports], [[142]])
+
+    def test_warm_shader_path_uses_two_capture_checks_without_repeated_project_status(self):
+        first = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+        before = len(self.ipc.calls)
+        with mock.patch.object(self.service, "status", wraps=self.service.status) as status:
+            again = self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+        self.assertEqual(first["workspacePath"], again["workspacePath"])
+        calls = self.ipc.calls[before:]
+        self.assertEqual([item[0] for item in calls], [
+            "get_current_renderdoc_context", "get_shared_shader_replacements",
+            "get_current_renderdoc_context"])
+        self.assertTrue(all(item[1].get("identity_only") is True for item in calls
+                            if item[0] == "get_current_renderdoc_context"))
+        self.assertTrue(calls[1][1]["include_all_capture_catalogs"])
+        # ensure_pending and the existing future-plan operation each retain
+        # their own status check; catalog helper nesting adds none.
+        self.assertEqual(status.call_count, 2)
+
+    def test_warm_shader_path_rejects_changes_during_reuse_plan(self):
+        self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
+        session = self.ipc.context["capture"]["captureSessionId"]
+        record = copy.deepcopy(self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS[session])
+        path = Path(record["catalogPath"])
+        original_bytes, original_stat = path.read_bytes(), path.stat()
+        context = copy.deepcopy(self.ipc.context)
+        original_plan = self.service.future_frame_plan
+        project_root, manifest = self.service._active()
+        config_path = project_root / ".replaylab" / "workspace.json"
+        original_config = config_path.read_bytes()
+
+        def changed_catalog_bytes():
+            # Defeat a path/size/mtime-only cache without changing file length.
+            changed = original_bytes.replace(b'"stage"', b'"Stage"', 1)
+            self.assertNotEqual(changed, original_bytes)
+            self.assertEqual(len(changed), len(original_bytes))
+            path.write_bytes(changed)
+            os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+        def changed_project_configuration():
+            self.service._write_workspace(project_root, {**manifest, "name": "Changed project name"})
+
+        mutations = {
+            "catalog-content": changed_catalog_bytes,
+            "catalog-binding": lambda: self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS[session].update(captureId="d" * 64),
+            "capture-session": lambda: self.ipc.context["capture"].update(captureSessionId="c" * 32),
+            "capture-path": lambda: self.ipc.context["capture"].update(path="D:/captures/other.rdc"),
+            "capture-api": lambda: self.ipc.context["capture"].update(api="Vulkan"),
+            "project-configuration": changed_project_configuration,
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(change=name):
+                def plan_then_change(*args, **kwargs):
+                    result = original_plan(*args, **kwargs)
+                    mutate()
+                    return result
+                try:
+                    with mock.patch.object(self.service, "future_frame_plan", side_effect=plan_then_change):
+                        result = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
+                    self.assertIn("error", result)
+                    self.assertNotIn("workspacePath", result)
+                finally:
+                    path.write_bytes(original_bytes)
+                    config_path.write_bytes(original_config)
+                    self.ipc.context = copy.deepcopy(context)
+                    self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS[session] = copy.deepcopy(record)
+
+    def test_partial_bootstrap_rejects_stale_captured_original_identity(self):
+        self.ipc.context["capture"]["captureId"] = ""
+        shader = self.ipc.context["shaders"]["bound"][0]
+        shader["capturedOriginalIdentity"] = {
+            **shader, "captureSessionId": "f" * 32}
+        self.ipc.shader_query_result = copy.deepcopy(shader)
+        result = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
+        self.assertIn("different live binding", result["error"])
+        self.assertNotIn("export_shader_catalog", [item[0] for item in self.ipc.calls])
 
     def test_partial_bootstrap_imports_only_its_scope_and_future_plan_is_partial(self):
         self._json(self.server.ensure_active_replay_project("Example Game"))
@@ -1756,61 +2634,143 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self.assertTrue(full["captureExport"]["fullFrame"])
         self.assertTrue(self._json(self.server.get_active_capture_catalog_binding_status())["fullFrame"])
 
-    def test_frozen_inventory_anchor_bootstraps_from_present_without_event_lookup(self):
+    def test_bootstrap_rejects_session_change_while_querying_explicit_shader(self):
+        self.ipc.context["capture"]["captureId"] = ""
+        original = self.ipc.call
+
+        def switch_before_shader_query(method, params=None, timeout=None):
+            if method == "get_shader_info":
+                self.ipc.context["capture"]["captureSessionId"] = "c" * 32
+            return original(method, params, timeout)
+
+        with mock.patch.object(self.ipc, "call", side_effect=switch_before_shader_query):
+            result = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
+        self.assertIn("capture/session changed", result["error"])
+        self.assertNotIn("export_shader_catalog", [item[0] for item in self.ipc.calls])
+        self.assertFalse(self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS)
+
+    def test_frozen_event_bootstraps_from_present_without_ui_selection(self):
         self.ipc.context["capture"]["captureId"] = ""
         self.ipc.context["events"] = {"currentEventId": 66327, "selectedEventId": 66327}
         self.ipc.context["shaders"]["bound"] = []
         before = copy.deepcopy(self.ipc.context)
-        missing = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
-        self.assertIn("frozen event Shader identity", missing["error"])
-        self.assertNotIn("export_shader_catalog", [item[0] for item in self.ipc.calls])
-        result = self._json(self.server.get_active_shader_workspace_path(
-            142, "fragment", expected_resource_id=902,
-            expected_entry_point="main", expected_raw_sha256=self.ipc.shader["rawSha256"],
-            expected_capture_session_id="a" * 32,
-        ))
+        result = self._json(
+            self.server.get_active_shader_workspace_path(142, "fragment")
+        )
         self.assertEqual(result["eventId"], 142)
         self.assertEqual(result["coveredEventIds"], [142])
         self.assertEqual(self.ipc.context, before)
-        self.assertNotIn("get_shader_info", [item[0] for item in self.ipc.calls])
+        identity_queries = [
+            item[1]
+            for item in self.ipc.calls
+            if item[0] == "get_shader_info"
+        ]
+        self.assertEqual(
+            identity_queries,
+            [{"event_id": 142, "stage": "fragment"}],
+        )
         exports = [item[1] for item in self.ipc.calls if item[0] == "export_shader_catalog"]
         self.assertEqual(len(exports), 1)
         self.assertEqual(exports[0]["event_ids"], [142])
         self.assertEqual(exports[0]["stages"], ["fragment"])
 
-    def test_frozen_inventory_anchor_requires_complete_tuple_and_physical_match(self):
+    def test_explicit_shader_bootstrap_survives_ui_navigation_during_export(self):
+        self.ipc.context["capture"]["captureId"] = ""
+        original_call = self.ipc.call
+
+        def navigate_after_export(method, params=None, timeout=None):
+            result = original_call(method, params, timeout)
+            if method == "export_shader_catalog":
+                self.ipc.context["events"] = {
+                    "currentEventId": 900, "selectedEventId": 901,
+                }
+                self.ipc.context["shaders"]["bound"] = [{
+                    "stage": "fragment", "resourceId": 999,
+                    "entryPoint": "otherMain", "rawSha256": "d" * 64,
+                }]
+            return result
+
+        with mock.patch.object(self.ipc, "call", side_effect=navigate_after_export):
+            result = self._json(self.server.get_active_shader_workspace_path(142, "pixel"))
+
+        self.assertEqual(result["eventId"], 142)
+        self.assertEqual(result["rawSha256"], self.ipc.shader["rawSha256"])
+        self.assertEqual(result["coveredEventIds"], [142])
+        self.assertEqual(self.ipc.context["events"], {
+            "currentEventId": 900, "selectedEventId": 901,
+        })
+        exports = [args for method, args, _ in self.ipc.calls if method == "export_shader_catalog"]
+        self.assertEqual(len(exports), 1)
+        self.assertEqual(exports[0]["event_ids"], [142])
+        self.assertEqual(exports[0]["stages"], ["fragment"])
+        self.assertNotIn("set_event", [method for method, _, _ in self.ipc.calls])
+
+    def test_partial_frozen_inventory_anchor_rejects_actual_physical_mismatch(self):
         self.ipc.context["capture"]["captureId"] = ""
         self.ipc.context["events"] = {"currentEventId": 66327, "selectedEventId": 66327}
         self.ipc.context["shaders"]["bound"] = []
         expected = dict(expected_resource_id=902, expected_entry_point="main",
                         expected_raw_sha256=self.ipc.shader["rawSha256"],
                         expected_capture_session_id="a" * 32)
-        for missing in expected:
-            with self.subTest(missing=missing):
-                args = dict(expected)
-                del args[missing]
-                error = json.loads(self.server.get_active_shader_workspace_path(142, "fragment", **args))
-                self.assertIn("all four", error["error"])
-        self.assertFalse(self.ipc.calls)
         for field, wrong in (("expected_resource_id", 903), ("expected_raw_sha256", "d" * 64),
                              ("expected_entry_point", ""), ("expected_capture_session_id", "c" * 32)):
             with self.subTest(field=field):
                 error = json.loads(self.server.get_active_shader_workspace_path(
-                    142, "fragment", **{**expected, field: wrong}))
+                    142, "fragment", **{field: wrong}))
                 self.assertIn("error", error)
                 self.assertFalse(self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS)
                 self.assertEqual(list(Path(self.service.status()["paths"]["captureCatalogs"]).iterdir()), [])
         self.assertEqual(self.ipc.context["events"]["currentEventId"], 66327)
 
-    def test_partial_bootstrap_rejects_capture_event_or_shader_changes_before_import(self):
+    def test_each_partial_frozen_anchor_resolves_and_returns_complete_original_binding(self):
+        self.ipc.context["capture"]["captureId"] = ""
+        self.ipc.context["events"] = {"currentEventId": 66327, "selectedEventId": 66327}
+        self.ipc.context["shaders"]["bound"] = []
+        expected = dict(expected_resource_id="902", expected_entry_point="main",
+                        expected_raw_sha256=self.ipc.shader["rawSha256"],
+                        expected_capture_session_id="a" * 32)
+        fields = list(expected)
+        for bits in range(1, 16):
+            args = {field: expected[field] for index, field in enumerate(fields) if bits & (1 << index)}
+            with self.subTest(fields=list(args)):
+                result = self._json(self.server.get_active_shader_workspace_path(142, "fragment", **args))
+                self.assertEqual(result["shaderResourceId"], 902)
+                self.assertEqual(result["entryPoint"], "main")
+                self.assertEqual(result["rawSha256"], self.ipc.shader["rawSha256"])
+                self.assertEqual(result["captureSessionId"], "a" * 32)
+        self.assertEqual(self.ipc.context["events"]["currentEventId"], 66327)
+        self.assertEqual(sum(method == "get_shader_info" for method, _, _ in self.ipc.calls), 1)
+        self.assertEqual(sum(method == "export_shader_catalog" for method, _, _ in self.ipc.calls), 1)
+
+    def test_partial_anchor_checks_captured_original_instead_of_replacement_raw(self):
+        self.ipc.context["capture"]["captureId"] = ""
+        self.ipc.context["events"] = {"currentEventId": 66327, "selectedEventId": 66327}
+        self.ipc.context["shaders"]["bound"] = []
+        original = self.ipc.call
+
+        def replacement_shader(method, params=None, timeout=None):
+            result = original(method, params, timeout)
+            if method == "get_shader_info":
+                result = {**result, "rawSha256": "d" * 64, "capturedOriginalIdentity": {
+                    "captureSessionId": "a" * 32, "resourceId": 902,
+                    "stage": "fragment", "entryPoint": "main",
+                    "rawSha256": self.ipc.shader["rawSha256"],
+                }}
+            return result
+
+        with mock.patch.object(self.ipc, "call", side_effect=replacement_shader):
+            result = self._json(self.server.get_active_shader_workspace_path(
+                142, "fragment", expected_raw_sha256=self.ipc.shader["rawSha256"]))
+        self.assertEqual(result["rawSha256"], self.ipc.shader["rawSha256"])
+        self.assertEqual(sum(method == "get_shader_info" for method, _, _ in self.ipc.calls), 1)
+
+    def test_partial_bootstrap_rejects_capture_changes_before_import(self):
         self._json(self.server.ensure_active_replay_project("Example Game"))
         before = copy.deepcopy(self.ipc.context)
         cases = (
             ("path", lambda: self.ipc.context["capture"].update(path="D:/captures/other.rdc")),
             ("session", lambda: self.ipc.context["capture"].update(captureSessionId="c" * 32)),
-            ("event", lambda: self.ipc.context["events"].update(currentEventId=143)),
-            ("shader", lambda: self.ipc.context["shaders"]["bound"][0].update(resourceId=903)),
-            ("bytes", lambda: self.ipc.context["shaders"]["bound"][0].update(rawSha256="d" * 64)),
+            ("api", lambda: self.ipc.context["capture"].update(api="Vulkan")),
         )
         original = self.ipc.call
         for name, mutate in cases:
@@ -1825,6 +2785,68 @@ class ActiveProjectMcpTests(unittest.TestCase):
                 with mock.patch.object(self.ipc, "call", side_effect=changed):
                     result = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
                 self.assertIn("error", result)
+                self.assertFalse(self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS)
+                self.assertEqual(list(Path(self.service.status()["paths"]["captureCatalogs"]).iterdir()), [])
+
+    def test_partial_bootstrap_rejects_project_switch_before_import(self):
+        first_project = self.service.ensure_pending("First project")
+        second_project = self.service.create_pending(self.root / "projects" / "second-project")
+        self.service.activate(first_project["projectRoot"])
+        original_call = self.ipc.call
+
+        def switch_after_export(method, params=None, timeout=None):
+            result = original_call(method, params, timeout)
+            if method == "export_shader_catalog":
+                self.service.activate(second_project["projectRoot"])
+            return result
+
+        with mock.patch.object(self.ipc, "call", side_effect=switch_after_export):
+            result = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
+
+        self.assertIn("active project", result["error"])
+        self.assertIn("changed", result["error"])
+        self.assertNotIn("workspacePath", result)
+        self.assertFalse(self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS)
+        for project in (first_project, second_project):
+            self.assertEqual(list(Path(project["paths"]["captureCatalogs"]).iterdir()), [])
+
+    def test_partial_bootstrap_rejects_changed_explicit_target_identity(self):
+        self.service.ensure_pending("Example Game")
+        original_call = self.ipc.call
+
+        for field in ("resourceId", "entryPoint", "rawSha256"):
+            with self.subTest(changed=field):
+                def change_exported_target(method, params=None, timeout=None):
+                    result = original_call(method, params, timeout)
+                    if method != "export_shader_catalog":
+                        return result
+                    path = Path(result["catalogPath"])
+                    catalog = json.loads(path.read_text(encoding="utf-8"))
+                    shader, use = catalog["shaders"][0], catalog["uses"][0]
+                    if field == "resourceId":
+                        shader["resourceId"] = shader["shaderResourceId"] = use["resourceId"] = 903
+                    elif field == "entryPoint":
+                        shader["entryPoint"] = use["entryPoint"] = "differentMain"
+                    else:
+                        blob = _dxbc(b"a different original Shader")
+                        fingerprint = fingerprint_bytes(blob)
+                        self.assertIsNotNone(fingerprint)
+                        (path.parent / shader["rawPath"]).write_bytes(blob)
+                        shader.update(rawSha256=fingerprint.raw_sha256,
+                                      codeSha256=fingerprint.code_sha256, rawSize=len(blob))
+                        use["rawSha256"] = fingerprint.raw_sha256
+                    shader["shaderKey"] = use["shaderKey"] = ":".join(str(shader[key]) for key in (
+                        "resourceId", "stage", "entryPoint", "rawSha256"))
+                    catalog["captureId"] = capture_identity(catalog, catalog["shaders"])
+                    result["captureId"] = catalog["captureId"]
+                    path.write_text(json.dumps(catalog), encoding="utf-8")
+                    return result
+
+                with mock.patch.object(self.ipc, "call", side_effect=change_exported_target):
+                    result = json.loads(self.server.get_active_shader_workspace_path(142, "fragment"))
+
+                self.assertIn("Shader catalog differs from the requested Shader identity", result["error"])
+                self.assertNotIn("workspacePath", result)
                 self.assertFalse(self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS)
                 self.assertEqual(list(Path(self.service.status()["paths"]["captureCatalogs"]).iterdir()), [])
 
@@ -1845,12 +2867,17 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self.assertFalse(plan["fullFrame"])
         self.assertEqual(plan["coveredEventIds"], [142])
 
-    def test_partial_catalog_is_not_full_asset_scan_evidence(self):
+    def test_partial_catalog_without_symbol_database_keeps_direct_asset_reads_available(self):
         self._bound_with_assets()
         self._json(self.server.get_active_shader_workspace_path(142, "fragment"))
         result = json.loads(self.server.query_active_shader_asset_evidence(142, "fragment"))
         self.assertFalse(result["ready"])
-        self.assertIn("full-catalog-not-prepared", json.dumps(result))
+        self.assertEqual(result["reasonCode"], "managed-symbol-database-unavailable")
+        self.assertFalse(result["assetEvidenceBlocked"])
+        self.assertFalse(result["policy"]["fullAssetScanRequired"])
+        self.assertIn("describe_unpacked_asset", result["availableCapabilities"])
+        self.assertNotIn("recommendedActions", result)
+        self.assertNotIn("prepare_active_capture_project", json.dumps(result))
 
     def test_current_shader_reuse_projection_omits_unrelated_frame_matches(self):
         shader = {key: self.ipc.shader[key] for key in ("resourceId", "stage", "entryPoint", "rawSha256")}
@@ -2240,6 +3267,11 @@ class ActiveProjectMcpTests(unittest.TestCase):
         self.assertFalse(first["symbolResolution"]["policy"]["aiProvisionalAutoApply"])
         recovery = first["symbolResolution"]["assetShaderRecovery"]
         self.assertEqual(recovery["schema"], "replaylab-active-asset-shader-recovery/v1")
+        self.assertEqual(recovery["boundShaderInputCount"], 1)
+        self.assertEqual(len(recovery["boundShaders"]), 1)
+        full_context_calls = [args for method, args, unused in self.ipc.calls
+                              if method == "get_current_renderdoc_context" and not args.get("identity_only")]
+        self.assertEqual(len(full_context_calls), 2)  # One current-event report per prepare, including cache hit.
         self.assertEqual(recovery["inventory"]["candidateCount"], 1)
         self.assertEqual(
             recovery["boundShaders"][0]["topCandidates"][0]["relativePath"],
@@ -2521,7 +3553,7 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
                 {
                     "schema": "renderdoc-ai-shader-organization-gate/v1",
                     "schemaVersion": 1,
-                    "policyVersion": "renderdoc-ai-organize-workspace/v1",
+                    "policyVersion": "renderdoc-ai-organize-workspace/v2",
                     "organizationId": "7" * 32,
                     "reviewedAt": "2026-08-28T00:00:00Z",
                     "requestedTransformation": "organize-only",
@@ -2606,31 +3638,38 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
             def pin_active_project(inner, *unused_args, **unused_kwargs):
                 return nullcontext()
 
-            def register_workspace(inner, status):
+            def register_workspace(
+                inner, status, *, require_current_candidate=False,
+                include_compiled_candidate=True,
+            ):
+                if require_current_candidate is not include_compiled_candidate:
+                    raise AssertionError("project publication mode is inconsistent")
                 inner.registered = status
-                latest = status["latestCompiled"]
-                abi_gate = latest["abiGate"]
-                compiled = {
-                    "schema": "renderdoc-ultra-project-compiled-candidate/v1",
-                    "schemaVersion": 1,
-                    "rawSha256": latest["rawSha256"],
-                    "codeSha256": latest["codeSha256"],
-                    "byteSize": latest["byteSize"],
-                    "kind": latest["kind"],
-                    "sourceSha256": status["source"]["currentSha256"],
-                    "sourceRevision": status["revision"],
-                    "targetProfile": status["targetProfile"],
-                    "originBaselineAbiSha256": abi_gate["baselineAbiSha256"],
-                    "originCandidateAbiSha256": abi_gate["candidateAbiSha256"],
-                    "originAbiReportSha256": abi_gate["reportSha256"],
-                    "originRequestId": abi_gate["requestId"],
-                    "validationScope": "replay-reflection-abi-compatible",
-                    "semanticEquivalenceVerified": False,
-                    "artifactPath": (
-                        "knowledge/workspaces/binaries/%s.bin"
-                        % latest["rawSha256"]
-                    ),
-                }
+                compiled = None
+                if include_compiled_candidate:
+                    latest = status["latestCompiled"]
+                    abi_gate = latest["abiGate"]
+                    compiled = {
+                        "schema": "renderdoc-ultra-project-compiled-candidate/v1",
+                        "schemaVersion": 1,
+                        "rawSha256": latest["rawSha256"],
+                        "codeSha256": latest["codeSha256"],
+                        "byteSize": latest["byteSize"],
+                        "kind": latest["kind"],
+                        "sourceSha256": status["source"]["currentSha256"],
+                        "sourceRevision": status["revision"],
+                        "targetProfile": status["targetProfile"],
+                        "originBaselineAbiSha256": abi_gate["baselineAbiSha256"],
+                        "originCandidateAbiSha256": abi_gate["candidateAbiSha256"],
+                        "originAbiReportSha256": abi_gate["reportSha256"],
+                        "originRequestId": abi_gate["requestId"],
+                        "validationScope": "replay-reflection-abi-compatible",
+                        "semanticEquivalenceVerified": False,
+                        "artifactPath": (
+                            "knowledge/workspaces/binaries/%s.bin"
+                            % latest["rawSha256"]
+                        ),
+                    }
                 material = {
                     "workspaceId": status["workspaceId"],
                     "captureId": status["capture"]["captureId"],
@@ -2647,12 +3686,15 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
                     "targetProfile": status["targetProfile"],
                     "sourceSha256": status["source"]["currentSha256"],
                     "analysisSha256": "",
-                    "compiledCandidate": {
+                }
+                if compiled is not None:
+                    material["compiledCandidate"] = {
                         key: value
                         for key, value in compiled.items()
                         if key != "artifactPath"
-                    },
-                }
+                    }
+                else:
+                    material["publicationMode"] = "source-only-draft"
                 knowledge_id = hashlib.sha256(
                     json.dumps(
                         material,
@@ -2664,7 +3706,6 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
                 ).hexdigest()[:32]
                 knowledge = {
                     **material,
-                    "compiledCandidate": compiled,
                     "knowledgeId": knowledge_id,
                     "sourcePath": "knowledge/workspaces/%s.hlsl"
                     % knowledge_id,
@@ -2673,6 +3714,8 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
                     "workspaceManifestSha256": self.manifest_sha256,
                     "registeredAt": "2026-08-28T00:00:00Z",
                 }
+                if compiled is not None:
+                    knowledge["compiledCandidate"] = compiled
                 inner.published = knowledge
                 return {
                     "knowledge": knowledge,
@@ -2774,6 +3817,10 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
         self.active = Active()
         self.workspaces = Workspaces()
         self.organization = Organization()
+        self.artifact_service_patch = mock.patch.object(
+            self.server, "_shader_workspace_artifact_service", return_value=self.workspaces)
+        self.artifact_service_patch.start()
+        self.addCleanup(self.artifact_service_patch.stop)
         self.old_service = self.server._ACTIVE_PROJECT_SERVICE
         self.old_organization = self.server._SHADER_ORGANIZATION_MANAGER
         self.old_ipc = self.server.ipc
@@ -2806,6 +3853,25 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
         self.server.ipc = self.old_ipc
         self.server._ACTIVE_CAPTURE_CATALOG_BINDINGS.clear()
         self.temporary.cleanup()
+
+    def test_archived_manifest_provenance_keeps_current_source_candidate_checks(self):
+        registered = json.loads(self.server.register_active_project_workspace(str(self.workspace)))
+        self.assertNotIn("error", registered, registered)
+        receipt = copy.deepcopy(registered["result"])
+        status = self.workspaces.status(str(self.workspace))
+        receipt["knowledge"]["workspaceManifestSha256"] = "f" * 64
+        with self.assertRaisesRegex(RuntimeError, "exact workspace"):
+            self.server._validated_active_workspace_registration(
+                receipt, status, copy.deepcopy(receipt["knowledge"]))
+        self.server._validated_active_workspace_registration(
+            receipt, status, copy.deepcopy(receipt["knowledge"]), allow_historical_manifest=True)
+        for field, value in (("sourceSha256", "a" * 64), ("rawSha256", "c" * 64),
+                             ("workspacePath", "other-workspace")):
+            changed = copy.deepcopy(receipt)
+            changed["knowledge"][field] = value
+            with self.assertRaises(RuntimeError):
+                self.server._validated_active_workspace_registration(
+                    changed, status, copy.deepcopy(changed["knowledge"]), allow_historical_manifest=True)
 
     def test_register_and_seed_are_capture_bound_and_never_apply(self):
         with mock.patch.object(
@@ -2851,28 +3917,30 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
         self.assertIn("does not match this workspace", result["error"])
         self.assertIsNone(self.active.registered)
 
-    def test_organization_review_never_registers_until_explicit_project_tool(self):
-        reviewed = {
-            "schema": "renderdoc-ai-shader-organization-review/v1",
-            "schemaVersion": 1,
+    def test_finishing_draft_does_not_register_project_without_explicit_effect(self):
+        finished = {
+            "ok": True,
             "workspacePath": str(self.workspace),
             "organizationId": "f" * 32,
-            "gate": {
-                "organizedSourcePromoted": True,
-                "safeToStartLiveEdit": True,
-            }
+            "expectedRevision": 2,
+            "expectedCandidateRawSha256": "3" * 64,
         }
-        reviewer = mock.Mock()
-        reviewer.review.return_value = copy.deepcopy(reviewed)
+        manager = mock.Mock()
+        manager.save_draft.return_value = copy.deepcopy(finished)
         with mock.patch.object(
-            self.server, "_shader_organization_manager", return_value=reviewer
+            self.server, "_shader_organization_manager", return_value=manager
         ):
             result = json.loads(
-                self.server.review_shader_workspace_organization(
-                    str(self.workspace), "f" * 32
+                self.server.finish_shader_workspace_organization(
+                    str(self.workspace), "f" * 32, validate_for_apply=False
                 )
             )
         self.assertNotIn("projectSync", result)
+        self.assertNotIn("registration", result)
+        manager.save_draft.assert_called_once_with(
+            str(self.workspace), "f" * 32, generate_flow_graph=False
+        )
+        manager.finish_draft.assert_not_called()
         self.assertIsNone(self.active.registered)
 
         with mock.patch.object(
@@ -2905,7 +3973,7 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
         self.assertIsNotNone(self.active.registered)
         self.assertFalse(result["applied"])
 
-    def test_registration_rejects_inconsistent_equivalence_before_write(self):
+    def test_registration_ignores_legacy_organization_verdict_metadata(self):
         original = json.loads(self.gate_path.read_text(encoding="utf-8"))
         for changes in (
             {"baselineCodeSha256": "3" * 64},
@@ -2914,6 +3982,7 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
             {"equivalenceLevel": "rejected"},
         ):
             with self.subTest(changes=changes):
+                self.active.registered = None
                 self.gate_path.write_text(
                     json.dumps({**original, **changes}), encoding="utf-8"
                 )
@@ -2923,8 +3992,8 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
                     result = json.loads(
                         self.server.register_active_project_workspace(str(self.workspace))
                     )
-                self.assertIn("error", result)
-                self.assertIsNone(self.active.registered)
+                self.assertNotIn("error", result, result)
+                self.assertIsNotNone(self.active.registered)
 
     def test_registration_accepts_trusted_observational_pass(self):
         gate = json.loads(self.gate_path.read_text(encoding="utf-8"))
@@ -2952,8 +4021,8 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
     def test_registration_rejects_missing_shared_artifact_provenance(self):
         original = self.active.register_workspace
 
-        def incomplete(status):
-            result = original(status)
+        def incomplete(status, **kwargs):
+            result = original(status, **kwargs)
             result["knowledge"].pop("workspaceManifestSha256")
             return result
 
@@ -2987,7 +4056,7 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
         self.assertIn("read back exactly", result["error"])
         self.assertFalse(result["applied"])
 
-    def test_registration_rejects_missing_organization_gate_before_write(self):
+    def test_registration_accepts_current_candidate_without_organization_gate(self):
         self.gate_path.unlink()
         with mock.patch.object(
             self.server, "_shader_workspace_service", return_value=self.workspaces
@@ -2995,10 +4064,60 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
             result = json.loads(
                 self.server.register_active_project_workspace(str(self.workspace))
             )
-        self.assertEqual(result["schema"], "replaylab-active-project-mcp-error/v1")
-        self.assertIn("publication gate", result["error"])
+        self.assertNotIn("error", result, result)
+        self.assertIsNotNone(self.active.registered)
+        self.project_capture.assert_called_once()
+
+    def test_source_only_draft_registers_without_compile_or_abi(self):
+        original_status = self.workspaces.status
+
+        def draft_status(workspace_path):
+            status = original_status(workspace_path)
+            status["latestCompiled"] = None
+            status["replayAbiValidated"] = False
+            status["abiCompatible"] = False
+            return status
+
+        with mock.patch.object(self.workspaces, "status", side_effect=draft_status), \
+             mock.patch.object(
+                 self.server, "_shader_workspace_service", return_value=self.workspaces
+             ):
+            strict = json.loads(
+                self.server.register_active_project_workspace(str(self.workspace))
+            )
+            draft = json.loads(self.server.register_active_project_workspace(
+                str(self.workspace), source_only_draft=True
+            ))
+
+        self.assertIn("error", strict)
+        self.assertNotIn("error", draft, draft)
+        self.assertTrue(draft["sourceOnlyDraft"])
+        self.assertFalse(draft["applied"])
+        self.assertEqual(
+            draft["result"]["knowledge"]["sourceSha256"], self.source_sha256
+        )
+        self.assertNotIn("compiledCandidate", draft["result"]["knowledge"])
+        self.assertEqual(
+            self.active.get_workspace_knowledge(
+                draft["result"]["knowledge"]["knowledgeId"]
+            ), draft["result"]["knowledge"]
+        )
+
+    def test_source_only_draft_still_checks_exact_current_source(self):
+        def change_source(unused_project, unused_status, unused_context):
+            self.source_path.write_text(
+                "float4 main() : SV_Target { return 2; }\n", encoding="utf-8"
+            )
+
+        self.project_capture.side_effect = change_source
+        with mock.patch.object(
+            self.server, "_shader_workspace_service", return_value=self.workspaces
+        ):
+            result = json.loads(self.server.register_active_project_workspace(
+                str(self.workspace), source_only_draft=True
+            ))
+        self.assertIn("error", result)
         self.assertIsNone(self.active.registered)
-        self.project_capture.assert_not_called()
 
     def test_registration_rejects_source_change_during_capture_import(self):
         def change_source(unused_project, unused_status, unused_context):
@@ -3063,11 +4182,6 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
         )
         self.assertEqual(project.replay_service().status()["captureCount"], 0)
         with mock.patch.object(project, "import_capture", wraps=project.import_capture) as importer:
-            gate_bytes = self.gate_path.read_bytes()
-            self.gate_path.unlink()
-            with self.assertRaisesRegex(RuntimeError, "publication gate"):
-                publish()
-            self.gate_path.write_bytes(gate_bytes)
             catalog_bytes = catalog_path.read_bytes()
             catalog_path.write_bytes(catalog_bytes + b"\n")
             with self.assertRaisesRegex(RuntimeError, "catalog hash changed"):
@@ -3091,11 +4205,43 @@ class ActiveWorkspaceWrapperTests(unittest.TestCase):
                 "expected_capture_id": fixture.capture_id,
                 "expected_capture_path": "D:/captures/frame.rdc", "expected_api": "D3D11",
             })
+            self.gate_path.unlink()
+            publish()
+            self.assertEqual(importer.call_count, 1)
 
-    def test_registration_rejects_stale_compiled_gate_before_write(self):
-        gate = json.loads(self.gate_path.read_text(encoding="utf-8"))
-        gate["finalBinding"]["candidateRawSha256"] = "0" * 64
-        self.gate_path.write_text(json.dumps(gate), encoding="utf-8")
+            # The explicit-project endpoint uses the same strict readback as
+            # active-project publication. Its base writer publishes no UI
+            # diagrams, but must still describe that empty scope truthfully.
+            with mock.patch.object(self.server, "_shader_workspace_service", return_value=workspaces):
+                for attempt in range(2):
+                    explicit = json.loads(self.server.register_replay_project_workspace(
+                        str(project.replay_service().root), str(self.workspace)))
+                    self.assertNotIn("error", explicit, explicit)
+                    self.assertEqual(explicit["knowledge"]["knowledgeId"], result["knowledge"]["knowledgeId"])
+                    self.assertEqual(explicit["flowchartArtifacts"], [])
+                    self.assertEqual(explicit["flowGraphArtifacts"], [])
+                    self.assertIs(explicit["policy"]["applyAuthorization"], False)
+
+            # A later explanation of the same saved source advances the head.
+            # Final replacement registration must keep it, not attempt to
+            # republish the historical analysis-free record and fail its CAS.
+            from src import project_restore
+            analysis = self.workspace / "ai" / "analysis.md"
+            analysis.parent.mkdir(exist_ok=True)
+            analysis.write_text("Current source explanation.\n", encoding="utf-8")
+            documented = project.register_workspace(status)
+            self.assertNotEqual(documented["knowledge"]["knowledgeId"], result["knowledge"]["knowledgeId"])
+            manifest_before = project.replay_service().manifest_path.read_bytes()
+            with mock.patch.object(self.server, "_workspace_active_capture_context", return_value=context):
+                for attempt in range(2):
+                    applied = project_restore._register_applied_workspace_with_readback(
+                        project, workspaces, self.workspace, status)
+                    self.assertTrue(applied["reusedCurrentHead"])
+                    self.assertEqual(applied["knowledge"], documented["knowledge"])
+            self.assertEqual(project.replay_service().manifest_path.read_bytes(), manifest_before)
+
+    def test_registration_rejects_changed_compiled_candidate_before_write(self):
+        self.candidate_path.write_bytes(b"DXBC\x09\x09\x09\x09")
         with mock.patch.object(
             self.server, "_shader_workspace_service", return_value=self.workspaces
         ):

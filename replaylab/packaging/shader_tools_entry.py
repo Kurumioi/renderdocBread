@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     elif command == "adapter-renodx":
         from adapters.renodx_decompiler_adapter import main as adapter
     else:
-        parser = argparse.ArgumentParser(description="ReplayLab fixed shader tools")
+        parser = argparse.ArgumentParser(description="Bread fixed shader tools")
         parser.add_argument("command", choices=(
             "adapter-hlsl", "adapter-dxbc-assembly", "adapter-d3dcompile",
             "adapter-dxil-assemble", "adapter-spirv-cross", "adapter-renodx",

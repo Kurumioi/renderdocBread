@@ -90,6 +90,26 @@ typedef rdcarray<rdcstrpair> rdcstrpairs;
 
 struct ICaptureContext;
 
+DOCUMENT(R"(A capture-local, display-only source for constant-buffer names. An empty
+:data:`sourceRawSha256` means that no exact temporary binding matched. This does not change reflection,
+buffer values, replay resources, or persistent alias files.)");
+struct CBufferDebugDisplaySource
+{
+  DOCUMENT(R"(The exact bytecode identity whose names may be read.
+
+:type: str
+)");
+  rdcstr sourceRawSha256;
+  DOCUMENT(R"(The source block layout used to locate its alias file. Displayed values still use the
+active Shader's own reflection.
+
+:type: renderdoc.ConstantBlock
+)");
+  ConstantBlock sourceBlock;
+};
+
+DECLARE_REFLECTION_STRUCT(CBufferDebugDisplaySource);
+
 #include "Analytics.h"
 #include "Extensions.h"
 #include "PersistantConfig.h"
@@ -741,6 +761,48 @@ QWidget.
   virtual void ViewFollowedResource(FollowType followType, ShaderStage stage, int32_t index,
                                     int32_t arrayElement) = 0;
 
+  DOCUMENT(R"(Temporarily show a color output for Shader visual debugging. The returned token owns
+the previous following selection, tab, interpretation and subresource until the user selects another
+resource or tab. Call on the UI thread.
+
+:param int index: Color output slot to show.
+:return: A nonzero ownership token, or zero if no matching output is available.
+:rtype: int
+)");
+  virtual uint64_t BeginTemporaryOutputFollow(uint32_t index) = 0;
+
+  DOCUMENT(R"(Change the output slot of an owned temporary view without taking back a view that the
+user has navigated elsewhere. Call on the UI thread.
+
+:param int token: Token returned by :meth:`BeginTemporaryOutputFollow`.
+:param int index: Color output slot to show.
+:return: Whether the temporary view is still owned and the requested slot is displayed.
+:rtype: bool
+)");
+  virtual bool UpdateTemporaryOutputFollow(uint64_t token, uint32_t index) = 0;
+
+  DOCUMENT(R"(Display a replay-owned temporary texture under an existing output-follow token.
+
+The descriptor is copied for this view only. It is not added to the capture's resource list.
+Updating the followed output or ending the token clears this temporary descriptor. Manual
+navigation expires ownership, so a delayed preview cannot take the view back.
+
+:param int token: Token returned by :meth:`BeginTemporaryOutputFollow`.
+:param TextureDescription texture: Replay-owned preview texture, with mip and slice zero displayed.
+:return: Whether the token still owns the view and the texture was accepted.
+:rtype: bool
+)");
+  virtual bool ShowTemporaryTexturePreview(uint64_t token, const TextureDescription &texture) = 0;
+
+  DOCUMENT(R"(Restore the view saved by :meth:`BeginTemporaryOutputFollow`, only if it is still owned.
+Manual user navigation is preserved. Call on the UI thread.
+
+:param int token: Token returned by :meth:`BeginTemporaryOutputFollow`.
+:return: Whether the saved view was restored.
+:rtype: bool
+)");
+  virtual bool EndTemporaryOutputFollow(uint64_t token) = 0;
+
   DOCUMENT(R"(Return which resource is currently being displayed in the active tab.
 
 :return: The ID of the resource being displayed.
@@ -846,6 +908,12 @@ etc.
 :param bool alpha: Whether the alpha channel should be visible.
 )");
   virtual void SetChannelVisibility(bool red, bool green, bool blue, bool alpha) = 0;
+
+  DOCUMENT(R"(Set vertical display mirroring without modifying the texture data.
+
+:param bool flipped: Whether the displayed texture should be vertically mirrored.
+)");
+  virtual void SetFlipY(bool flipped) = 0;
 
 protected:
   ITextureViewer() = default;
@@ -1379,6 +1447,7 @@ struct IShaderCodeEditor
       SelectionCallback;
   typedef std::function<void(const rdcstr &fileName, uint32_t line, uint32_t column)>
       DefinitionCallback;
+  typedef std::function<void(uint32_t byteStart, uint32_t byteEnd)> VisualDebugCallback;
 
   DOCUMENT(R"(Retrieves the PySide2 QWidget for this editor.
 
@@ -1402,6 +1471,8 @@ The returned wrapper does not own the native widget. Release it only with
   virtual bool IsReadOnly() = 0;
   DOCUMENT("Sets the document identity used for navigation and language-server synchronisation.");
   virtual void SetFileName(const rdcstr &fileName) = 0;
+  DOCUMENT("Sets the original source directory for relative includes in a relocated preview. An empty directory restores normal file-relative resolution. Only literal include paths in the language-server text are projected to absolute paths; the editor buffer, real document identity and files remain unchanged.");
+  virtual void SetIncludeBaseDirectory(const rdcstr &directory) = 0;
   DOCUMENT("Sets the LSP language id, such as ``hlsl``, ``glsl``, or ``slang``.");
   virtual void SetLanguage(const rdcstr &language) = 0;
   DOCUMENT("Returns whether the buffer differs from its save point.");
@@ -1412,6 +1483,8 @@ The returned wrapper does not own the native widget. Release it only with
   virtual void SetSavePoint() = 0;
   DOCUMENT("Moves the caret to a one-based source location and focuses the editor.");
   virtual void GoToLine(uint32_t line, uint32_t column = 1) = 0;
+  DOCUMENT("Selects a half-open UTF-8 byte range and focuses the editor. Both ends are clamped to the document; an empty range moves the caret.");
+  virtual void SelectRange(uint32_t byteStart, uint32_t byteEnd) = 0;
   DOCUMENT("Returns the caret's one-based source line.");
   virtual uint32_t GetCursorLine() = 0;
   DOCUMENT("Returns the caret's one-based source column.");
@@ -1424,6 +1497,12 @@ The returned wrapper does not own the native widget. Release it only with
   virtual void RemoveLineAnchor(int32_t anchor) = 0;
   DOCUMENT("Removes all invisible bookmarks. Replacing the complete buffer also clears bookmarks.");
   virtual void ClearLineAnchors() = 0;
+  DOCUMENT("Creates a tracked half-open UTF-8 byte range. It follows edits and recent undo/redo transactions. A fully deleted range remains invalid unless its original undo transaction or an explicit cut/paste restores it. Returns -1 for an invalid range.");
+  virtual int32_t CreateRangeAnchor(uint32_t byteStart, uint32_t byteEnd) = 0;
+  DOCUMENT("Returns [byteStart, byteEnd] for a tracked range, or an empty array if the range was deleted. Identifier boundary edits are included in the returned lexical range.");
+  virtual rdcarray<uint32_t> GetRangeAnchorRange(int32_t anchor) = 0;
+  DOCUMENT("Releases a tracked byte range. Replacing the whole buffer invalidates all range anchors.");
+  virtual void RemoveRangeAnchor(int32_t anchor) = 0;
   DOCUMENT("Displays compiler diagnostics alongside local and language-server diagnostics.");
   virtual void SetDiagnostics(const rdcarray<ShaderEditorDiagnostic> &diagnostics) = 0;
 
@@ -1435,6 +1514,14 @@ The returned wrapper does not own the native widget. Release it only with
   virtual void SetAddToChatCallback(SelectionCallback callback) = 0;
   DOCUMENT("Registers navigation for an authorised definition document not already open.");
   virtual void SetDefinitionCallback(DefinitionCallback callback) = 0;
+  DOCUMENT("Registers an explicit visual-debug request with a half-open UTF-8 byte range in GetText(). A caret request expands only to the token; the replay compiler resolves its meaning.");
+  virtual void SetVisualDebugCallback(VisualDebugCallback callback) = 0;
+  DOCUMENT("Registers the Stop visual debug command.");
+  virtual void SetStopVisualDebugCallback(EventCallback callback) = 0;
+  DOCUMENT("Requests visual debugging at the current selection or caret.");
+  virtual void RequestVisualDebug() = 0;
+  DOCUMENT("Marks the exact UTF-8 expression range and its source line while visual debugging is active. Passing active=false clears the marks without changing text or undo history.");
+  virtual void SetVisualDebugRange(uint32_t byteStart, uint32_t byteEnd, bool active) = 0;
   DOCUMENT("Clears callbacks before the native editor is destroyed.");
   virtual void ClearCallbacks() = 0;
 
@@ -2165,6 +2252,22 @@ data.
   virtual void LoadCapture(const rdcstr &captureFile, const ReplayOptions &opts,
                            const rdcstr &origFilename, bool temporary, bool local) = 0;
 
+  DOCUMENT(R"(Reopen a permanent local capture for automatic replay recovery.
+
+This uses the normal capture lifecycle, but returns replay creation errors instead of showing a
+modal error dialog. It does not restore Shader replacements or other replay edits. Callers must
+preserve unsaved work and verify the new capture session before using its evidence.
+
+:param str captureFile: The local capture path to reopen.
+:param renderdoc.ReplayOptions opts: The options controlling replay.
+:param str origFilename: The original local capture filename.
+:return: The native replay creation result, including its failure diagnostic.
+:rtype: renderdoc.ResultDetails
+)");
+  virtual ResultDetails LoadCaptureForReplayRecovery(const rdcstr &captureFile,
+                                                     const ReplayOptions &opts,
+                                                     const rdcstr &origFilename) = 0;
+
   DOCUMENT(R"(Saves the current capture file to a given path.
 
 If the capture was temporary, this save action means it is no longer temporary and will be treated
@@ -2260,8 +2363,9 @@ this returns ``False``.
 :rtype: bool
 )");
   virtual bool IsScrubbing() = 0;
-  DOCUMENT(R"(Replay the capture to the current event again, to pick up any changes that might have
-been made.
+  DOCUMENT(R"(Asynchronously replay the capture to the current event again and refresh its viewers,
+to pick up any changes that might have been made. Call on the GUI thread. This returns before replay
+and viewer refresh complete; navigation or capture changes discard an obsolete refresh.
 )");
   virtual void RefreshStatus() = 0;
 
@@ -2314,6 +2418,51 @@ See :meth:`ReplaceResource`.
 :param renderdoc.ResourceId id: The id of the original resource that was previously replaced.
 )");
   virtual void UnregisterReplacement(ResourceId id) = 0;
+
+  DOCUMENT(R"(Register temporary constant-buffer naming provenance after a checked Shader preview
+replacement succeeds. Call on the GUI thread after verifying the same live capture and owner. All
+blocks are copied. Only exact active bytecode, stage, mutation generation, binding and typed physical
+lanes can use the source names; usage/unused-component evidence is never inherited. No replay or file
+write is performed. The caller must unregister before compare/stop and on ownership loss.
+
+:param str ownerToken: Unique preview session token, used for owner-specific removal.
+:param renderdoc.ResourceId original: Captured original Shader resource.
+:param renderdoc.ResourceId replacement: Checked active preview target.
+:param str sourceRawSha256: SHA-256 of the source reflection's real bytecode.
+:param str activeRawSha256: SHA-256 of the preview reflection's real bytecode.
+:param renderdoc.ShaderStage stage: Shader stage.
+:param int mutationGeneration: ReplayController.GetShaderReplacementGeneration(0) after apply.
+:param List[renderdoc.ConstantBlock] sourceBlocks: Source reflection blocks.
+:param List[renderdoc.ConstantBlock] activeBlocks: Preview reflection blocks.
+:return: ``True`` if at least one unambiguous typed block can inherit names.
+:rtype: bool
+)");
+  virtual bool RegisterCBufferDebugDisplaySource(
+      const rdcstr &ownerToken, ResourceId original, ResourceId replacement,
+      const rdcstr &sourceRawSha256, const rdcstr &activeRawSha256, ShaderStage stage,
+      uint64_t mutationGeneration, const rdcarray<ConstantBlock> &sourceBlocks,
+      const rdcarray<ConstantBlock> &activeBlocks) = 0;
+
+  DOCUMENT(R"(Remove only temporary naming provenance owned by this preview token. Call on the GUI
+thread. Safe after compare, ownership loss, or capture close; does not remove another owner's names.
+
+:param str ownerToken: The token supplied to :meth:`RegisterCBufferDebugDisplaySource`.
+)");
+  virtual void UnregisterCBufferDebugDisplaySource(const rdcstr &ownerToken) = 0;
+
+  DOCUMENT(R"(Resolve naming provenance against the currently published pipeline generation. Call on
+the GUI thread. This never queries replay; a stale, foreign or mismatched binding returns an empty
+source. Pinned panels must pass their own reflection identity and block.
+
+:param renderdoc.ResourceId original: Captured original Shader resource.
+:param renderdoc.ShaderStage stage: Shader stage.
+:param str activeRawSha256: SHA-256 of the displayed reflection's bytecode.
+:param renderdoc.ConstantBlock activeBlock: The displayed reflection block.
+:rtype: CBufferDebugDisplaySource
+)");
+  virtual CBufferDebugDisplaySource GetCBufferDebugDisplaySource(
+      ResourceId original, ShaderStage stage, const rdcstr &activeRawSha256,
+      const ConstantBlock &activeBlock) = 0;
 
   DOCUMENT(R"(Register a new instance of :class:`CaptureViewer` to receive capture event notifications.
 

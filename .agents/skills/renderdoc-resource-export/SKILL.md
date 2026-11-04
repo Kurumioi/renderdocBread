@@ -1,182 +1,222 @@
 ---
 name: renderdoc-resource-export
-description: Export an explicitly bound RenderDoc draw or resource set as a portable, validated mesh, texture, material, CBuffer, and shader package for Unity or Blender. Use when capture data must be reconstructed outside RenderDoc with preserved vertex inputs, sampling/color-space metadata, coordinate conversion, and target-specific rendering compromises.
+description: Export a selected RenderDoc draw or resource set into a capture-linked mesh, texture, material and Shader package for Unity or Blender.
 metadata:
   replaylab-category: resource-export
-  replaylab-version: "3"
-  replaylab-required-references: "references/source-evidence.md references/target-profiles.md references/package-and-validation.md references/workflow-acceptance.md"
+  replaylab-version: "31"
 ---
 
-# RenderDoc resource export
+# Export captured resources
 
-The mandatory `replaylab-core` owns templates, evidence, review severity,
-correction budgets and reporting. Main/child wording below describes API mode;
-the vendor-native Agent performs the same bounded work directly and uses its
-own supplied question interface. Requirement lists are reasoning aids, not an
-extra runtime ledger or a replacement for `report_task_result`.
+The Agent chooses how to inspect and export the user's selected draw or
+resource set. Keep the capture, EID, binding, source bytes and requested target
+linked in the result; do not silently expand the resource or output scope.
 
-Own the bounded transfer of capture-bound draw resources into a portable target
-package. Preserve observed source data and its interpretation, adapt only the
-parts required by the selected target, and prove the resulting package can be
-consumed. An export request is not permission to widen the EID scope, write to
-an arbitrary path, install a converter, or silently approximate missing data.
+The source engine and destination engine are independent. Respect an existing
+target pipeline; Unity URP is the default for an unspecified new target. Use the configured
+source-engine reader for matching assets when available, and capture resources
+otherwise. Missing readers or original names do not block capture-based export.
 
-This Skill is an adaptive playbook and acceptance contract, not an executable
-workflow. The modes, stages, routes, and tool names below are useful options.
-The ordinary child Agent may inspect, skip, reorder, combine, revisit, or
-replace them when live evidence and registered capabilities support a better
-path. Only real data and transaction dependencies are ordered. The Host freezes
-identity, authority, effect ceilings, budgets, and receipts. Choose only among
-the live Host's supported routes and parameters; fixed tool constraints remain
-binding. A failed
-tool or rejected receipt is an observation for
-`plan -> act -> observe -> validate -> replan`, not task completion.
+## Editable Unity delivery
 
-Before acting, read all four mandatory references completely:
+Before authoring or calibrating Unity restoration, read
+[unity-implementation-guidance.md](references/unity-implementation-guidance.md).
+It retains the implementation and final-view acceptance requirements, including
+independent Scene/Game resources, Free Aspect resizing and stable history.
+It also covers autonomous Unity MCP setup and recovery: prepare/reconnect the
+selected project before asking for manual UI actions, and inspect uncertain
+write outcomes before repeating them.
 
-- `references/source-evidence.md` defines the source identity, mesh, texture,
-  sampler, CBuffer, shader, and dependency evidence needed before conversion.
-- `references/target-profiles.md` defines target contracts, coordinate and
-  color-space handling, Unity URP and Blender adaptation, and decisions that
-  require user authority.
-- `references/package-and-validation.md` defines managed artifacts, manifests,
-  receipts, atomic publication, and target validation.
-- `references/workflow-acceptance.md` defines the corrective loop, requirement
-  states, yield rules, and completion gate.
+Default to an editable real-time scene unless the user specifically requests a
+fixed capture replay. Deliver FBX model assets, TGA (LDR/data) or EXR (HDR/needed
+precision) textures, meaningful material controls, Shader sources and prefabs
+with normal MeshRenderer/SkinnedMeshRenderer rendering. Keep captured binary
+data as provenance/fallback inputs. `bread_prepare_fbx_exporter` can install the
+official exporter on request; `bread_export_portable_assets` exports an actual
+regular-renderer hierarchy without judging fidelity. A procedural-only draw needs
+an explicit vertex/skin layout and mesh conversion, not a renamed data blob.
+Preserve rig information when available; a baked current pose is acceptable when
+rig information is absent, but retain free camera movement and live lighting.
 
-These references are part of this skill's contract. Do not report completion
-from a plausible-looking FBX, material, or shader alone.
+Initialize camera pose/FOV, light direction/color and shadow settings from capture
+evidence. Drive live camera transforms and light direction/color from Unity.
+Preserve captured lighting, indirect-light resources/functions and shadow
+calculations where portable; engine interfaces are not automatic replacements
+for those algorithms. Trace screen/history producer EIDs, including compute,
+and implement their live dependencies. Only after investigating a concrete
+portability limit consider a measured native or spatial approximation, retaining
+the user's fidelity target. Expose analyzed effect controls on materials;
+scripts supply system parameters. Use Volume settings with the target pipeline's
+real pass extension points for postprocessing. `bread_inspect_editable_delivery`
+reports ordinary assets, cameras/lights/Volumes and capture-runner indicators.
 
-## Operating modes
+Render the actual final camera output. A direct effect RT is a separate pass
+observation. `bread_prepare_urp_presentation` provides an optional URP 14+ color
+handle adapter; avoid duplicate camera runners and inspect final encoding,
+orientation and active Volume settings. Use the interactive Unity Editor;
+reuse its connection, and do not substitute a batch job for the editing window.
 
-Choose the narrowest mode that satisfies the request. Do not silently turn an
-inspection or planning request into a workspace mutation.
+Editable delivery includes independently rendered Scene and Game views with the
+same requested effects. Check their effective RendererData, execution filters
+and Scene lighting/FX switches early. Keep view-dependent RTs, motion, jitter
+and history separate; never show Game's frame or screen mask through Scene.
+Use the methods and actual-output acceptance in
+[unity-dual-view.md](references/unity-dual-view.md). Module-only or old-Unity
+regression checks do not discharge final original-RDC comparisons for both views.
+Scene resizing and Game Free Aspect resizing, multi-frame/angle stability, bounded unresolved-effect work,
+user decisions and final resource cleanup follow
+[unity-final-handoff.md](references/unity-final-handoff.md). These are acceptance
+observations and Agent decisions, never managed import locks.
+Efficient spatial/pass/input localization, reversible attribution experiments,
+retained-effect residual decisions and live Scene camera/light tests follow
+[unity-difference-localization.md](references/unity-difference-localization.md).
+Bypassing an effect is only a diagnostic intervention; do not offer dropping it
+as the restoration outcome or attribute a difference from that experiment alone.
 
-- **Inspect and plan:** bind the capture and EID, inventory source evidence,
-  report target feasibility and unresolved choices, and create no package.
-- **Geometry transfer:** export the requested draw's topology, indices, vertex
-  and instance inputs, transforms, and a manifest describing every preserved or
-  unsupported attribute.
-- **Material transfer:** export requested textures, sampling/color-space
-  metadata, CBuffer-derived parameters, and target material assignments.
-- **Shader transfer:** consume capture-bound shader evidence and an admitted
-  shader route or Shader child receipt, preserve the core observed algorithm, and
-  adapt it to the selected target profile.
-- **Complete reconstruction:** combine the applicable modes into one validated,
-  immutable package. Include only explicitly bound EIDs and approved dependent
-  passes.
-- **Batch reconstruction:** accept only a bounded explicit EID/resource list;
-  ask the main Agent to partition one immutable child operation per exact draw,
-  deduplicate admitted Event/Shader/unpacked-asset evidence by result digest,
-  and return per-item plus aggregate status. Do not widen a query into a frame.
+Use `compare_unity_effect_layers` for ported-core, native-engine, post-process and
+full-frame comparisons. Isolate unchanged algorithm inputs for strict small-error
+checks. Assess any justified engine shadows/GI approximations separately, adjusting actual
+lights/ambient/Volume controls rather than evidence pixels. Use a shared fixed
+RT/input fixture per post pass to isolate its error from upstream error. Review
+the integrated final camera image too. Tools report facts; the Agent chooses
+judgment and next steps, and reuses successful unchanged checks.
+Prefer matched original Mesh/Texture assets only after checking the draw's LOD,
+submesh, pose, texture view and color-space use; current EID parameters override
+material defaults. Preserve unresolved dynamic resources and pass dependencies
+as explicit recovery inputs, then implement justified reconstruction or target
+interfaces without silently substituting unrelated assets.
+For functional restoration, prepare the selected effect in Bread first: reuse
+matching organized sources and semantic names, or decompile, organize and review
+the calculations, then compile and check ABI and captured outputs where supported.
+This catches decompiler/refactoring errors before porting reusable functions and
+CBuffer meanings. Reuse current proof for unchanged bytes/includes; do not redo
+successful work. Permanent replay apply/live edit is not a port prerequisite.
+When an application/tool limitation prevents this preferred preparation, retain
+the best source/draft, passed checks and exact missing/failed-check diagnostics,
+then continue organization, compilation, debugging and restoration in Unity.
+Use `get_unity_shader_transfer_sources(organization_ids=...)` for an explicitly
+selected retained proposal without promoting or applying it. Do not silently
+downgrade already validated sources to unvalidated references or skip feasible
+Bread preparation. Known compiler/numeric defects remain defects to repair in
+the practical environment, not successful validation. AI text review can explain
+mappings but cannot prove numerical equivalence. Compile and inspect the derived
+implementation in Unity, then compare actual images. Reuse unchanged
+geometry/textures. Only stages executed by the selected EID belong to its port;
+an idle compute/graphics pipeline binding is not an effect dependency.
 
-## Authority and scope
+`inspect_resource_export` shows capture evidence; `prepare_resource_export`
+returns a candidate and spec (`get_resource_export_spec_template` also reads it).
+`analyze_vertex_input_roles` suggests channel roles from Shader use; confirm the
+reflected semantic/location against the actual layout before choosing
+`attributeIndex`. Follow [vertex channel transfer](references/vertex-channels.md)
+for packed/custom Unity inputs. `export_draw_resources` exports a known mapping.
+`finalize_resource_export`, `get_resource_export_status` and
+`validate_resource_export` provide publication/validation receipts. Choose the
+useful route and retain successful exports when another part fails.
+`get_resource_export_payload` exposes the exact captured files and manifest
+before finalization. Use them directly in Unity if glTF conversion, organized
+source checks or managed binding cannot be completed; none locks raw data access.
 
-Treat the Host request as the effect ceiling. Bind every operation to the exact
-capture/session, EID set, source resource identities, target profile, dependency
-policy, coordinate profile, and requested output classes.
+For an explicitly asset-only import to a supplied Unity project, call
+`import_resource_export_to_unity(asset_only=true)` with the completed compatible
+package. It prepares/connects Unity and imports through one background job.
+Functional restoration uses the task and binding route below. Follow
+`get_unity_integration_job`; avoid duplicate connection/install jobs.
+Use `start_unity_project_connection` when the requested work needs an Editor
+connection without an import, then `call_unity_project_tool` for needed Editor
+operations. Reuse a matching live session and avoid competing Editor instances
+or parallel writes to the same project. Discover exact contracts only if absent.
+Resolve uncertain timeouts from the existing job ID instead of reinstalling.
+Keep RenderDoc open; use supported recovery before reporting a setup blocker.
 
-The ordinary child Agent chooses among admitted, functionally equivalent
-converters and validators, and may use a newly discovered registered capability
-inside the same effect ceiling. Return a decision request to the main Agent
-when a choice changes visible semantics, output scope, external side effects, target
-render architecture, or which information is discarded; the main Agent decides
-whether the user must be asked. In particular, do not choose among deferred
-to forward merging, multiple shader/pass export, MRT reconstruction, or removal
-of cross-draw dependencies without explicit authority.
+For functional restoration, follow [unity-restoration.md](references/unity-restoration.md):
+inspect the active pipeline, preserve values, implement draw/pass dependencies
+and calibrate rendered images. The managed importer preserves an existing target
+pipeline and accepts derived implementation assets; multi-pass effects also use
+the connected project tools to configure the pipeline's actual extension points.
+For fidelity differences, source lighting/volume preservation, live screen/history
+dependencies, shadow quality and module debugging, use
+[unity-fidelity-debugging.md](references/unity-fidelity-debugging.md).
 
-Use only registered providers visible in the live capability catalog; a
-capability query such as `get_resource_export_capabilities` is one way to
-inspect that catalog. Never download, install, or run an unregistered converter
-at execution time. Missing capabilities trigger another safe registered route,
-a precise bounded unknown, or a material follow-up; they do not justify an
-improvised command or silent lossy fallback.
+The Agent chooses the workflow and judges the user's acceptance goal. Tools
+provide data, execution methods, diagnostics and evidence annotations. Do not
+treat restoration ledgers, session/version IDs, Shader UI publication, recovery
+suggestions or missing optional validation as an execution lock. Read the
+selected EID's actual bindings. Reuse successful exports and validation for
+unchanged inputs; rerun only a changed-input check or a diagnosed failure after
+a relevant repair. Reopening the same RDC is not a change to its source bytes.
 
-## Optional stage and route map
+For ranges, optionally call `plan_unity_restoration_sequence` with inclusive
+`event_ranges`, then `get_unity_restoration_step` for each actual draw/dispatch.
+Inspect/import/configure/render/adjust incrementally in the shared scene before
+moving on. Order is advisory: follow real resource/depth/blending dependencies.
+Use `annotate_unity_restoration_step` to retain progress, output paths and missing
+checks; `ready-for-next` and `deferred` are Agent notes, not numerical proof.
+For postprocessing, inspect resource uses and actual prior writes (including
+outside the range), subresources, formats, sizes and load/store behavior. Build
+the corresponding ordered URP RenderFeature passes; adjacency is not causation.
 
-Use this map to reason about remaining outcomes. Skip stages already proven by
-accepted receipts, revisit assumptions contradicted by later validation, and
-substitute any registered capability that proves the same outcome. The examples
-do not require one particular tool sequence.
+Functional EID-to-Unity work can use the durable `begin_unity_restoration` task,
+with an explicit captured output and a fixed visual-fidelity objective (or strict
+pixel matching when requested). Reuse saved reference
+workspace sources through `get_unity_shader_transfer_sources`; include those
+identities in `shader.organizedSources` before finalizing the export. Use the
+decoded, paged `constantBufferFields` and existing merged semantic names from
+`get_resource_export_spec_template`, not guessed parameter values. Derived
+Shader/includes/compute/scripts belong in `unity.assets`; keep the destination's
+actual pipeline. `bind_unity_restoration` verifies selected reference identities and starts
+the import. Follow its job, then `check_unity_restoration`, repair concrete gaps,
+`render_unity_restoration`, and `review_unity_restoration`. Source, scene or
+parameter changes require current checks and a new render; unchanged exports
+remain reusable. Managed receipts are advisory and do not override an evidence-based Agent
+assessment using direct project operations. Raw asset-only export does not require this functional restoration task.
+An empty workspace source list can use the package's native Shader/reflection
+evidence directly as a fallback when Bread preparation is unavailable. Retain
+per-stage preparation outcomes and unsupported replay checks as explicit limits,
+not a reason to block the port. Repair concrete data/specification defects;
+direct Unity preparation and rendering remain available before managed binding.
+Do not rewrite the effect as compute merely to satisfy a recovery suggestion.
 
-1. **Target binding:** obtain the active capture/session and requested EID set,
-   for example through `get_current_renderdoc_context` when frozen context was
-   not already supplied. Bind rather than assume the current UI selection.
-2. **Source evidence:** an exact-event composite such as `inspect_event` can
-   establish draw, pipeline, resource, and attachment identity. A bounded frame
-   composite such as `analyze_current_frame_flow` is useful only when earlier
-   or later draws, GBuffer attachments, or pass dependencies can affect the
-   requested result.
-3. **Shader evidence:** obtain the bound interface, live resources, CBuffers, and
-   raw shader identity. When readable reconstruction or target shader
-   conversion is required, reuse an accepted Shader result or inspect the live
-   Shader toolchain capabilities. The Agent selects the compiler/decompiler and
-   representation from actual evidence; a route planner's output is advisory.
-4. **Export feasibility:** inspect capabilities and source-export evidence, for
-   example with `get_resource_export_capabilities` and
-   `inspect_resource_export`. Compare alternatives by outcome coverage,
-   fidelity, risk, and validators rather than accepting a Host-ranked route.
-5. **Material decisions:** resolve every material target, dependency
-   compromise, coordinate profile, and bounded unknown before mutation. Yield
-   when the remaining choice needs user authority.
-6. **Reversible preparation:** a preparation operation such as
-   `prepare_resource_export` may create the exact Host-managed staging artifact
-   when needed. It must return a receipt bound to the request hash.
-7. **Atomic publication:** finalize only after source and transformation checks
-   pass. It must assemble and atomically publish an immutable package without
-   overwriting an existing artifact.
-8. **Target validation:** when requested, run an available target validator for
-   the finalized immutable package and verify structural/semantic evidence
-   against the same operation/package/provider identity. Status queries may
-   resume or diagnose that same request without duplicating it.
-9. **Corrective loop:** replan only failed acceptance criteria. Preserve passed
-   criteria, admitted evidence, failed candidate artifacts, and completed effects.
+Tool or platform limitations are recovery inputs. Use
+`plan_unity_restoration_recovery` to choose another executable route and
+`apply_unity_recovery_assets` to author real ComputeShader, raster Shader, C# or
+generated input assets when fixed tools are insufficient. Derive missing history
+or layouts from available evidence, build and bind those inputs, and record the
+explicit inference and runtime proof with `record_unity_reconstruction`. Adapt an
+actual changed pass graph with `adopt_unity_restoration_render_plan`. Preserve the
+core algorithm and make its effect visible. Keep the user's fidelity target;
+unresolved requested differences remain findings. An inference is not a recovered capture fact.
+Read the recovery details in the reference before using these routes.
 
-For a batch, never loop hidden free-form filesystem or replay operations inside
-one child. The main Agent owns membership and scheduling; each ordinary child
-Agent owns one exact export task at a time. Reuse completed idempotent operation receipts, retain
-successful packages after a sibling fails, and retry only the failed/unstarted
-children whose previous effect is known terminal. Return the continuation set
-and immutable result digests so a later stage can resume without repeating the
-whole batch.
+Keep the target-pipeline Unity Shader as a derived asset: establish coordinate spaces before
+replacing matrices, preserve original material algorithms, and choose Unity
+light/shadow inputs or captured indirect-light data explicitly. A successful
+import or Shader compile does not prove equivalent pixels. Validate target
+rendering against the appropriate captured pass/reference and report missing
+dependencies or approximations. Validation-only requests reuse the import;
+they do not automatically restart asset reading and export.
 
-## Shader and material boundary
+For platform adaptation, separate mesh UVs, image rows and render-target screen
+UVs. Do not infer a global Y flip from the source engine/API or repeat a baked
+conversion. Use bound-view sampling evidence for color space and preserve raw
+normal/data channels. Apply the relevant [target mapping rules](references/target-profiles.md)
+when converting to Unity, without changing the capture-compatible Shader.
 
-An admitted Shader child receipt carries the algorithm, ABI, resource-usage, and
-readable-reconstruction evidence. The ordinary child Agent running this Skill
-owns transfer policy and target packaging for its exact task.
-Never manufacture shader semantics from resource names alone.
+Preserve source-to-output mappings, texture view and color-space behavior,
+sampler settings, CBuffer values and dependencies relevant to the chosen
+target. A normal transform uses inverse-transpose. glTF/GLB, a material
+preview or translated Shader is a derived representation, not the captured
+GPU state. Record approximations and unsupported source features.
 
-Map observed CBuffer values into target material parameters only when their
-type, offset, live value, and shader use are supported by evidence. Map camera,
-object, time, viewport, and other system values to target-native inputs instead
-of baking the captured frame value. Preserve unresolved values as explicit
-unknown parameters or sidecar records.
-
-Never infer object-space axes, handedness, or unit scale solely from the
-captured graphics API. D3D, Vulkan, and OpenGL clip-space conventions are not
-proof of the application's object-space convention; require matrix/shader
-evidence or an explicit user-selected source profile.
-The fixed coordinate receipt must use an inverse-transpose normal transform,
-determinant-aware winding, and a matching tangent-handedness adjustment.
-
-Preserve the core draw-local algorithm. Prefer target-native shadows,
-environment lighting, fog, and equivalent engine services when they replace
-capture-global dependencies without changing the requested core effect. Record
-every substitution and dropped dependency.
-
-## Prohibited legacy shortcuts
-
-Do not call or recommend `export_drawcall`, `export_to_unity`, or
-`save_texture`. They are legacy convenience paths and do not satisfy this
-child task's exact target, managed artifact, source-fidelity, receipt, or target
-validation contract. Do not use them as a fallback after a strict export tool
-fails.
-
-## Completion
-
-Report only artifacts admitted by the Host. The final result must identify the
-source capture and EIDs, target profile, package manifest and hashes, preserved
-and unsupported data, shader/material compromises, coordinate transform,
-validation results, and any bounded unknowns. A generated file without this
-evidence is incomplete.
+In the main Agent's `record_task_review`, assess requested resource coverage,
+destination and target compatibility from actual artifacts, hashes and validation
+receipts. File creation alone proves no compatibility. Repair missing outputs;
+review changed outputs and dependencies while retaining successful exports.
+Try feasible project-local adapters and input reconstruction before treating a
+required feature as unavailable. Report a concrete remaining external dependency
+only after those authorized alternatives have been examined and attempted; a
+missing built-in tool alone is not such a dependency.
+Read the relevant reference only when needed:
+`references/source-evidence.md` for capture fields,
+`references/target-profiles.md` for coordinate and target mapping,
+`references/package-and-validation.md` for managed artifacts.

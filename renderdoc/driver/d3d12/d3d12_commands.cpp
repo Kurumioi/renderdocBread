@@ -33,6 +33,7 @@
 #include "d3d12_replay_clear.h"
 #include "d3d12_command_queue.h"
 #include "replay/replay_timing.h"
+#include "replay/resource_usage.h"
 
 RDOC_EXTERN_CONFIG(bool, D3D12_Debug_RT_Auditing);
 
@@ -8023,9 +8024,8 @@ void D3D12CommandData::AddUsage(const D3D12RenderState &state, D3D12ActionTreeNo
     }
   }
 
-  // Keep shader use discovery on the existing draw/dispatch action-building path. The final
-  // command-list merge retains only the first event per physical shader, so GetUsage(shaderId)
-  // stays constant-sized and no EID traversal is necessary.
+  // Index every shader action on the existing draw/dispatch action-building path. Submission
+  // merging keeps each rebased event, so GetUsage(shaderId) needs no replay or EID traversal.
   for(size_t stage = 0; stage < ARRAY_COUNT(shaders); stage++)
   {
     if(shaders[stage])
@@ -8245,8 +8245,7 @@ void D3D12CommandData::InsertActionsAndRefreshIDs(ResourceId cmd, const BakedCmd
       EventUsage u = it->second;
       u.eventId += m_RootEventID;
       rdcarray<EventUsage> &uses = m_ResourceUses[it->first];
-      if(u.usage != ResourceUsage::Shader || uses.empty())
-        uses.push_back(u);
+      AppendFrameResourceUsage(uses, u);
     }
 
     GetActionStack().back()->children.push_back(n);

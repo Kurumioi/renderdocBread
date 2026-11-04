@@ -3,6 +3,7 @@ param(
     [string]$PythonExecutable = "",
     [string]$OutputDirectory = "",
     [string]$WorkDirectory = "",
+    [string]$TemporaryBuildRoot = "",
     [switch]$KeepBuildWork,
     [switch]$ValidateOnly
 )
@@ -17,7 +18,7 @@ $buildSessionSchema = "replaylab-pyinstaller-session/v1"
 $ownedRuntimeFiles = @(
     "replaylab-ai.exe",
     "ReplayLabInternal.exe",
-    "ReplayLabMCP.exe",
+    "BreadMCP.exe",
     "ReplayLabShaderTools.exe",
     $runtimeManifestName
 )
@@ -297,7 +298,7 @@ function Assert-BuildProbe {
         throw "ReplayLab runtime packaging requires PyInstaller 6.x; found $($Probe.pyinstaller)."
     }
     if ([string]$Probe.agentVersion -ne [string]$Probe.mcpVersion) {
-        throw "AgentHost and ReplayLabMCP versions must match before packaging."
+        throw "AgentHost and BreadMCP versions must match before packaging."
     }
 }
 
@@ -404,15 +405,28 @@ $protectedRoots = @(
     $packagingRoot
 )
 
+# Opt-in isolated output on the system temporary drive for low-space checkouts.
+# Cleanup still operates only on marker-owned build sessions below WorkDirectory.
+$generatedRoot = $replayLabRoot
+if (-not [string]::IsNullOrWhiteSpace($TemporaryBuildRoot)) {
+    $temporaryRoot = Get-NormalizedPath ([IO.Path]::GetTempPath())
+    $generatedRoot = Get-NormalizedPath $TemporaryBuildRoot
+    if ((Split-Path -Parent $generatedRoot) -ne $temporaryRoot -or
+        (Split-Path -Leaf $generatedRoot) -notlike 'bread-runtime-*') {
+        throw 'TemporaryBuildRoot must be a named bread-runtime-* directory directly under system temp.'
+    }
+    Assert-NoReparseComponents $generatedRoot "TemporaryBuildRoot" | Out-Null
+}
+
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $replayLabRoot "output\replaylab"
 }
 if ([string]::IsNullOrWhiteSpace($WorkDirectory)) {
     $WorkDirectory = Join-Path $replayLabRoot "output\.pyinstaller-work"
 }
-$OutputDirectory = Assert-GeneratedDirectory $replayLabRoot $OutputDirectory `
+$OutputDirectory = Assert-GeneratedDirectory $generatedRoot $OutputDirectory `
     "OutputDirectory" $protectedRoots
-$WorkDirectory = Assert-GeneratedDirectory $replayLabRoot $WorkDirectory `
+$WorkDirectory = Assert-GeneratedDirectory $generatedRoot $WorkDirectory `
     "WorkDirectory" $protectedRoots
 if ((Test-PathWithin $OutputDirectory $WorkDirectory -AllowSame) -or
     (Test-PathWithin $WorkDirectory $OutputDirectory -AllowSame)) {
@@ -427,8 +441,17 @@ foreach ($sourceFile in @(
     (Join-Path $mcpRoot "src\internal_tool_service.py"),
     (Join-Path $mcpRoot "src\event_flow_artifacts.py"),
     (Join-Path $mcpRoot "src\event_flow_diagram.py"),
+    (Join-Path $mcpRoot "src\frame_render_flow.py"),
     (Join-Path $mcpRoot "src\asset_catalog.py"),
     (Join-Path $mcpRoot "src\resource_export.py"),
+    (Join-Path $mcpRoot "src\unity_integration.py"),
+    (Join-Path $mcpRoot "src\unity_restore.py"),
+    (Join-Path $replayLabRoot "unity\com.bread.unity-connection\package.json"),
+    (Join-Path $replayLabRoot "unity\com.bread.unity-connection\Editor\BreadUnityConnection.cs"),
+    (Join-Path $replayLabRoot "unity\com.bread.unity-connection\Editor\Bread.UnityConnection.Editor.asmdef"),
+    (Join-Path $replayLabRoot "unity\com.bread.renderdoc\package.json"),
+    (Join-Path $replayLabRoot "unity\com.bread.renderdoc\Editor\BreadCaptureImporter.cs"),
+    (Join-Path $replayLabRoot "unity\com.bread.renderdoc\Editor\Bread.Capture.Editor.asmdef"),
     $continuationDriverSource,
     (Join-Path $mcpRoot "src\replaylab_host.py"),
     $agentEntry,
@@ -437,25 +460,27 @@ foreach ($sourceFile in @(
     $shaderToolsEntry,
     $shaderToolsBuilder,
     $frozenMcpRouteProbe,
-    $frozenHostLifetimeProbe,
-    (Join-Path $skillRoot "renderdoc-explain-event\SKILL.md"),
-    (Join-Path $skillRoot "renderdoc-explain-event\references\visual-evidence.md"),
-    (Join-Path $skillRoot "renderdoc-explain-event\references\workflow-acceptance.md"),
-    (Join-Path $skillRoot "renderdoc-shader-workbench\SKILL.md"),
-    (Join-Path $skillRoot "renderdoc-resource-export\SKILL.md"),
-    (Join-Path $skillRoot "renderdoc-resource-export\references\source-evidence.md"),
-    (Join-Path $skillRoot "renderdoc-resource-export\references\target-profiles.md"),
-    (Join-Path $skillRoot "renderdoc-resource-export\references\package-and-validation.md"),
-    (Join-Path $skillRoot "renderdoc-resource-export\references\workflow-acceptance.md"),
-    (Join-Path $skillRoot "renderdoc-unpacked-asset-intelligence\SKILL.md"),
-    (Join-Path $skillRoot "renderdoc-unpacked-asset-intelligence\references\inventory-and-relationships.md"),
-    (Join-Path $skillRoot "renderdoc-unpacked-asset-intelligence\references\report-semantics.md"),
-    (Join-Path $skillRoot "renderdoc-unpacked-asset-intelligence\references\uex-blender-delivery.md"),
-    (Join-Path $skillRoot "renderdoc-unpacked-asset-intelligence\references\workflow-acceptance.md"),
-    (Join-Path $skillRoot "replaylab-core\SKILL.md")
+    $frozenHostLifetimeProbe
 )) {
     Assert-RegularFile $sourceFile "ReplayLab runtime packaging source" | Out-Null
 }
+# Every Skill folder in the repository ships, not a list kept by hand: a Skill
+# added under .agents/skills used to be validated by the tests, offered by the
+# source tree, and silently absent from the frozen runtime (5 of 10 shipped).
+$bundledSkillFolders = @(Get-ChildItem -LiteralPath $skillRoot -Directory |
+    Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "SKILL.md") -PathType Leaf } |
+    Sort-Object -Property Name)
+if ($bundledSkillFolders.Count -lt 1) {
+    throw "No Skill folders with SKILL.md were found under $skillRoot."
+}
+if (-not ($bundledSkillFolders | Where-Object { $_.Name -eq "replaylab-core" })) {
+    throw "replaylab-core (the shared acceptance contract) is missing under $skillRoot."
+}
+foreach ($skillFolder in $bundledSkillFolders) {
+    Assert-RegularFile (Join-Path $skillFolder.FullName "SKILL.md") "ReplayLab Skill definition" | Out-Null
+}
+Write-Host ("ReplayLab: bundling " + $bundledSkillFolders.Count + " Skill folder(s): " +
+    (($bundledSkillFolders | ForEach-Object { $_.Name }) -join ", "))
 Assert-OutputDirectorySafe $OutputDirectory $ownedRuntimeFiles
 
 if ($ValidateOnly) {
@@ -480,6 +505,8 @@ if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
 $PythonExecutable = Resolve-PythonExecutable $PythonExecutable
 $probe = Get-BuildProbe $PythonExecutable $agentSource $mcpRoot
 Assert-BuildProbe $probe $replayLabRoot $mcpRoot
+$sourceInputsSha256 = & $PythonExecutable (Join-Path $packagingRoot "runtime_inputs.py")
+if ($LASTEXITCODE -ne 0 -or $sourceInputsSha256 -notmatch '^[0-9a-f]{64}$') { throw "Cannot identify runtime source inputs." }
 
 $sessionId = [Guid]::NewGuid().ToString("N")
 $sessionRoot = Join-Path $WorkDirectory ("session-" + $sessionId)
@@ -552,6 +579,15 @@ try {
     # supported adapter and preserve its distribution metadata explicitly.
     $deepModules = @($probe.deepModules)
     $agentCollectAll = @("mcp", "genai_prices") + $deepModules
+    # The bundled Unity reader (``replaylab-ai unpacker unitypy``) needs UnityPy
+    # inside the frozen AgentHost. A release must not silently lose Unity support.
+    & $PythonExecutable -c "import UnityPy" 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $agentCollectAll += @("UnityPy")
+        Write-Host "  UnityPy found in the build environment: bundling the embedded Unity reader"
+    } else {
+        throw "UnityPy is required for a complete Bread runtime. Install the pinned bundle dependencies before building."
+    }
     $agentCopyMetadata = @(
         "genai-prices",
         "mcp",
@@ -569,21 +605,14 @@ try {
         "pydantic"
     )
     Write-Host ("ReplayLab: bundling the required agent runtime (" + ($deepModules -join ", ") + ")")
-    $agentSkillData = @(
-        ((Join-Path $skillRoot "renderdoc-explain-event") +
-            ":.agents/skills/renderdoc-explain-event")
-        ((Join-Path $skillRoot "renderdoc-shader-workbench") +
-            ":.agents/skills/renderdoc-shader-workbench")
-        ((Join-Path $skillRoot "renderdoc-resource-export") +
-            ":.agents/skills/renderdoc-resource-export")
-        ((Join-Path $skillRoot "renderdoc-unpacked-asset-intelligence") +
-            ":.agents/skills/renderdoc-unpacked-asset-intelligence")
-        # Mandatory standard for API main/children and all native Agent turns.
-        ((Join-Path $skillRoot "replaylab-core") +
-            ":.agents/skills/replaylab-core")
-    )
+    # One data entry per Skill folder (SKILL.md and its references travel
+    # together); replaylab-core is among them and is asserted above.
+    $agentSkillData = @($bundledSkillFolders | ForEach-Object {
+        $_.FullName + ":.agents/skills/" + $_.Name
+    })
     $mcpProviderData = @(
-        ($continuationDriverSource + ":replaylab_helpers")
+        ($continuationDriverSource + ":replaylab_helpers"),
+        ((Join-Path $replayLabRoot "unity") + ":bread_unity")
     )
     $agentData = @($agentSkillData) + @($mcpProviderData)
     $agentData += ((Join-Path $replayLabRoot "pyproject.toml") + ":replaylab_agent")
@@ -607,7 +636,7 @@ try {
         -AddData @($agentData) `
         -CopyMetadata $agentCopyMetadata
 
-    Invoke-PyInstallerBuild $PythonExecutable "ReplayLabMCP" $mcpEntry $mcpRoot `
+    Invoke-PyInstallerBuild $PythonExecutable "BreadMCP" $mcpEntry $mcpRoot `
         $mcpDist $mcpBuild $mcpSpec `
         -CollectAll @("mcp") `
         -CollectSubmodules @("src", "uvicorn", "starlette") `
@@ -615,11 +644,12 @@ try {
 
     Invoke-PyInstallerBuild $PythonExecutable "ReplayLabInternal" $internalEntry $mcpRoot `
         $internalDist $internalBuild $internalSpec `
-        -CollectSubmodules @("src", "uvicorn", "starlette")
+        -CollectSubmodules @("src", "uvicorn", "starlette") `
+        -AddData @($mcpProviderData)
 
     $builtAgent = Assert-RegularFile (Join-Path $agentDist "replaylab-ai.exe") `
         "built AgentHost executable"
-    $builtMcp = Assert-RegularFile (Join-Path $mcpDist "ReplayLabMCP.exe") `
+    $builtMcp = Assert-RegularFile (Join-Path $mcpDist "BreadMCP.exe") `
         "built MCP Host executable"
     $builtInternal = Assert-RegularFile `
         (Join-Path $internalDist "ReplayLabInternal.exe") `
@@ -640,12 +670,12 @@ try {
     }
     & $builtMcp --help | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "The packaged ReplayLabMCP.exe failed its --help smoke test."
+        throw "The packaged BreadMCP.exe failed its --help smoke test."
     }
     & $PythonExecutable $frozenMcpRouteProbe --agent $builtAgent `
         --host $builtMcp --timeout 60 | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "The packaged AgentHost -> MCP filter -> ReplayLabMCP route failed its handshake/catalog smoke test."
+        throw "The packaged AgentHost -> MCP filter -> BreadMCP route failed its handshake/catalog smoke test."
     }
     & $builtInternal --help | Out-Null
     if ($LASTEXITCODE -ne 0) {
@@ -682,8 +712,16 @@ try {
         $smokeProfilePath,
         $smokeProfileJson + [Environment]::NewLine,
         [Text.UTF8Encoding]::new($false))
+    # An empty tools config: the smoke test counts the bundled Skills alone, not
+    # whatever the build machine's user has in its own Skill folders.
+    $smokeToolsPath = Join-Path (Split-Path -Parent $smokeProfilePath) "packaging-smoke-tools.json"
+    [IO.File]::WriteAllText(
+        $smokeToolsPath,
+        '{"schema":"replaylab-agent-tools/v1","skillRoots":[],"disabledSkills":[],"mcpServers":[]}' +
+            [Environment]::NewLine,
+        [Text.UTF8Encoding]::new($false))
     $doctorOutput = & $builtAgent --config $smokeProfilePath doctor `
-        --profile "packaging-smoke" --mcp-host $builtMcp --json
+        --profile "packaging-smoke" --mcp-host $builtMcp --tools-config $smokeToolsPath --json
     if ($LASTEXITCODE -ne 0) {
         throw "The packaged replaylab-ai.exe failed its frozen catalog/Skill doctor smoke test."
     }
@@ -751,7 +789,7 @@ try {
     Copy-Item -LiteralPath $builtAgent `
         -Destination (Join-Path $OutputDirectory "replaylab-ai.exe") -Force
     Copy-Item -LiteralPath $builtMcp `
-        -Destination (Join-Path $OutputDirectory "ReplayLabMCP.exe") -Force
+        -Destination (Join-Path $OutputDirectory "BreadMCP.exe") -Force
     Copy-Item -LiteralPath $builtInternal `
         -Destination (Join-Path $OutputDirectory "ReplayLabInternal.exe") -Force
     Copy-Item -LiteralPath $builtShaderTools `
@@ -759,7 +797,7 @@ try {
 
     $fileRecords = @()
     foreach ($name in @(
-        "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe",
+        "replaylab-ai.exe", "ReplayLabInternal.exe", "BreadMCP.exe",
         "ReplayLabShaderTools.exe")) {
         $path = Assert-RegularFile (Join-Path $OutputDirectory $name) `
             "packaged ReplayLab runtime file '$name'"
@@ -776,6 +814,7 @@ try {
         schema = $runtimeManifestSchema
         version = [string]$probe.agentVersion
         generatedUtc = [DateTime]::UtcNow.ToString("o")
+        sourceInputsSha256 = [string]$sourceInputsSha256
         python = (@($probe.python) -join ".")
         pyinstaller = [string]$probe.pyinstaller
         dependencies = @{ deepagents = [string]$probe.deepagentsVersion }

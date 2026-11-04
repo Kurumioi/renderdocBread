@@ -62,6 +62,26 @@ def context(root):
     return {"capture": {"path": binding(root)["capturePath"], "captureSessionId": "b" * 32}}
 
 
+def test_bound_compiler_contract_is_read_only_and_capture_bound(tmp_path):
+    manager=Manager()
+    service=service_module.InternalToolService(project=object(),restore_jobs=object(),shader_manager=manager)
+    compiler=mock.Mock()
+    compiler.compiler_contract.return_value={"schema":"bread-shader-compiler-contract/v1","identitySha256":"c"*64}
+    params={"workspace_path":str(tmp_path),"source_workspace_id":"d"*32,"expected_raw_sha256":"e"*64}
+    with mock.patch.object(server,"_active_live_context",return_value=context(tmp_path)), \
+         mock.patch.object(server,"_shader_workspace_service",return_value=compiler):
+        status,result=service.shader_live_edit_operation(request_body(tmp_path,'compiler-contract',params))
+    assert status==200 and result['result']['identitySha256']=='c'*64
+    compiler.compiler_contract.assert_called_once_with(str(tmp_path),'d'*32,'e'*64)
+    assert manager.calls==[]
+    compiler.reset_mock()
+    changed=context(tmp_path);changed['capture']['captureSessionId']='f'*32
+    with mock.patch.object(server,"_active_live_context",return_value=changed), \
+         mock.patch.object(server,"_shader_workspace_service",return_value=compiler):
+        status,result=service.shader_live_edit_operation(request_body(tmp_path,'compiler-contract',params))
+    assert status==409 and not compiler.compiler_contract.called
+
+
 def test_singleton_start_and_editor_save_share_one_in_memory_session(tmp_path):
     manager = Manager()
     service = service_module.InternalToolService(project=object(), restore_jobs=object(), shader_manager=manager)
@@ -75,6 +95,61 @@ def test_singleton_start_and_editor_save_share_one_in_memory_session(tmp_path):
     assert status == 200 and saved["compileScheduled"]
     assert manager.calls[-1] == ("save", "1" * 32, save["text"])
     assert _CALL_BINDING.get() is None
+    timing = started["result"]["startTiming"]
+    assert set(timing["phasesMs"]) == {"captureIdentity", "startAdmission"}
+    assert timing["failedPhase"] == ""
+    assert all(0 <= elapsed <= timing["totalMs"] for elapsed in timing["phasesMs"].values())
+    assert service_module._SHADER_LIVE_START_TIMING.get() is None
+
+
+def test_source_only_save_accepts_full_file_and_requires_managed_active_project(tmp_path):
+    manager = Manager()
+    service = service_module.InternalToolService(project=object(), restore_jobs=object(), shader_manager=manager)
+    parameters = {"workspace_path": str(tmp_path), "source_workspace_id": "e" * 32,
+                  "expected_raw_sha256": "f" * 64, "text": "// full file\n" * 7000}
+    organization = mock.Mock()
+    organization.save_editor_source.return_value = {"sourceOnly": True, "compileScheduled": False}
+    with mock.patch.object(server, "_active_live_context", return_value=context(tmp_path)), \
+         mock.patch.object(server, "_active_project_service") as project, \
+         mock.patch.object(server, "_require_managed_active_workspace", return_value=tmp_path) as managed, \
+         mock.patch.object(server, "_shader_organization_manager", return_value=organization):
+        status, saved = service.shader_live_edit_operation(request_body(tmp_path, "save-source", parameters))
+        assert status == 200 and saved["result"]["sourceOnly"]
+        managed.assert_called_once_with(project.return_value.status.return_value, str(tmp_path))
+        saved_parameters = organization.save_editor_source.call_args.kwargs
+        assert {key: value for key, value in saved_parameters.items() if key != "commit_guard"} == parameters
+        assert callable(saved_parameters["commit_guard"])
+        managed.side_effect = ValueError("outside managed project")
+        status, _ = service.shader_live_edit_operation(request_body(tmp_path, "save-source", parameters))
+        assert status == 400 and organization.save_editor_source.call_count == 1
+    assert not manager.calls and not manager.running
+
+
+@pytest.mark.parametrize("operation", ["open-source-document", "save-source-document"])
+def test_include_document_endpoint_is_managed_and_capture_bound(tmp_path, operation):
+    from src.shader_workspace import source_documents
+    service = service_module.InternalToolService(project=object(), restore_jobs=object(), shader_manager=Manager())
+    parameters = {"workspace_path": str(tmp_path), "source_workspace_id": "e" * 32}
+    if operation == "open-source-document":
+        parameters["requested_path"] = str(tmp_path / "source/header.hlsli")
+        method = "open_source_document"
+    else:
+        parameters.update(document_id="d" * 64, expected_raw_sha256="f" * 64,
+                          expected_source_sha256="a" * 64, text="")
+        method = "save_source_document"
+    with mock.patch.object(server, "_active_live_context", return_value=context(tmp_path)), \
+         mock.patch.object(server, "_active_project_service") as project, \
+         mock.patch.object(server, "_require_managed_active_workspace", return_value=tmp_path) as managed, \
+         mock.patch.object(server, "_shader_organization_manager") as manager, \
+         mock.patch.object(source_documents, method, return_value={"sourceOnly": True}) as perform:
+        status, result = service.shader_live_edit_operation(request_body(tmp_path, operation, parameters))
+        assert status == 200 and result["result"]["sourceOnly"]
+        assert perform.call_args.args == (manager.return_value,)
+        assert {key: value for key, value in perform.call_args.kwargs.items() if key != "commit_guard"} == parameters
+        managed.assert_called_once_with(project.return_value.status.return_value, str(tmp_path))
+        managed.side_effect = ValueError("outside managed project")
+        assert service.shader_live_edit_operation(request_body(tmp_path, operation, parameters))[0] == 400
+        assert perform.call_count == 1
 
 
 def test_wrong_capture_session_is_rejected_before_start(tmp_path):
@@ -86,6 +161,113 @@ def test_wrong_capture_session_is_rejected_before_start(tmp_path):
         status, result = service.shader_live_edit_operation(request_body(tmp_path))
     assert status == 409 and "capture session changed" in result["error"]
     assert not manager.running
+    assert result["startTiming"]["failedPhase"] == "captureIdentity"
+    assert "startAdmission" not in result["startTiming"]["phasesMs"]
+    assert service_module._SHADER_LIVE_START_TIMING.get() is None
+
+
+@pytest.mark.parametrize("include", [False, True])
+@pytest.mark.parametrize("startup_fails", [False, True])
+def test_manual_save_starts_compile_even_without_prior_live_edit(tmp_path, include, startup_fails):
+    manager = Manager()
+    manager.compile_saved_source = mock.Mock(return_value={"compileScheduled": True, "watchId": "2" * 32})
+    if startup_fails:
+        manager.compile_saved_source.side_effect = RuntimeError("captured compiler route unavailable")
+    service = service_module.InternalToolService(project=object(), restore_jobs=object(), shader_manager=manager)
+    parameters = {"workspace_path": str(tmp_path), "source_workspace_id": "e" * 32,
+                  "expected_raw_sha256": "f" * 64, "text": "void main() {}"}
+    saved = {"sourceOnly": True, "compileScheduled": False, "rawSha256": "c" * 64,
+             "sourceWorkspaceId": "e" * 32, "sourcePath": str(tmp_path / "source/shader.glsl"),
+             "modifiedNs": 123, "changed": False}
+    operation = "save-and-apply-source"
+    save_method = "_save_workspace_source_now"
+    if include:
+        operation += "-document"
+        save_method = "_save_workspace_source_document_now"
+        parameters.update(document_id="d" * 64, expected_source_sha256="b" * 64, text="")
+        saved.update(sourceDocumentId="d" * 64, rootSourceSha256="a" * 64,
+                     mutationPaths=[str(tmp_path / "source/header.hlsli")])
+    with mock.patch.object(server, "_active_live_context", return_value=context(tmp_path)), \
+         mock.patch.object(service_module, save_method, return_value=saved) as save:
+        status, response = service.shader_live_edit_operation(request_body(tmp_path, operation, parameters))
+    assert status == 200
+    value = response["result"]
+    assert value["sourceOnly"] is False and value["compileScheduled"] is not startup_fails
+    for key in ("rawSha256", "sourceWorkspaceId", "sourcePath", "modifiedNs", "changed"):
+        assert value[key] == saved[key]
+    if include:
+        for key in ("sourceDocumentId", "rootSourceSha256", "mutationPaths"):
+            assert value[key] == saved[key]
+    save.assert_called_once_with(**parameters)
+    manager.compile_saved_source.assert_called_once_with(str(tmp_path), "e" * 32,
+        "a" * 64 if include else "c" * 64, capture_binding=binding(tmp_path))
+    if startup_fails:
+        assert value["autoApplyError"] == "captured compiler route unavailable"
+    else:
+        assert "autoApplyError" not in value
+
+
+def test_failed_manual_source_save_never_starts_compile(tmp_path):
+    manager = Manager()
+    manager.compile_saved_source = mock.Mock()
+    service = service_module.InternalToolService(project=object(), restore_jobs=object(), shader_manager=manager)
+    parameters = {"workspace_path": str(tmp_path), "source_workspace_id": "e" * 32,
+                  "expected_raw_sha256": "f" * 64, "text": "void main() {}"}
+    with mock.patch.object(server, "_active_live_context", return_value=context(tmp_path)), \
+         mock.patch.object(service_module, "_save_workspace_source_now", side_effect=ValueError("source changed")):
+        status, response = service.shader_live_edit_operation(request_body(tmp_path, "save-and-apply-source", parameters))
+    assert status == 400 and "source changed" in response["error"]
+    manager.compile_saved_source.assert_not_called()
+
+
+def test_conversion_endpoint_requires_saved_hash_and_capture_binding(tmp_path):
+    service = service_module.InternalToolService(project=object(), restore_jobs=object(), shader_manager=Manager())
+    parameters = {"source_workspace_path": str(tmp_path), "expected_source_sha256": "f" * 64}
+    with mock.patch.object(server, "_active_live_context", return_value=context(tmp_path)), \
+         mock.patch.object(service_module, "_convert_workspace_to_hlsl_now", return_value={"readyForEditing": True}) as convert:
+        status, value = service.shader_live_edit_operation(request_body(tmp_path, "convert-hlsl", parameters))
+        assert status == 200 and value["result"]["readyForEditing"]
+        convert.assert_called_once_with(**parameters)
+        parameters.pop("expected_source_sha256")
+        assert service.shader_live_edit_operation(request_body(tmp_path, "convert-hlsl", parameters))[0] == 400
+        assert convert.call_count == 1
+
+
+@pytest.mark.parametrize("ready", [True, False])
+def test_conversion_only_shows_validated_hlsl_and_bounds_response(tmp_path, ready):
+    result = {"workspacePath": str(tmp_path / "hlsl"), "sourcePreserved": True,
+              "readyForEditing": ready, "applied": False,
+              "abiValidation": {"error": "binding mismatch", "largeReflection": "x" * 100000}}
+    with mock.patch.object(server, "_active_project_service") as project, \
+         mock.patch.object(server, "_require_managed_active_workspace", return_value=tmp_path), \
+         mock.patch.object(server, "convert_shader_workspace_to_hlsl", return_value=json.dumps({"result": result})), \
+         mock.patch.object(server, "show_shader_workspace_source", return_value="{}") as show:
+        if ready:
+            value = service_module._convert_workspace_to_hlsl_now(str(tmp_path), "f" * 64)
+            assert value["readyForEditing"] and value["sourcePreserved"]
+            assert len(json.dumps(value)) < 1024
+            assert "abiValidation" not in value
+            show.assert_called_once_with(result["workspacePath"])
+            project.return_value.commit_active_project_snapshot.assert_called_once()
+        else:
+            with pytest.raises(RuntimeError, match="binding mismatch"):
+                service_module._convert_workspace_to_hlsl_now(str(tmp_path), "f" * 64)
+            show.assert_not_called()
+
+
+def test_owner_start_failure_timing_retains_the_innermost_phase(tmp_path):
+    manager = Manager()
+    def failed_start(**unused):
+        with service_module._shader_live_start_phase("capturePreflight"):
+            raise RuntimeError("controlled IPC failure")
+    manager.start = failed_start
+    service = service_module.InternalToolService(project=object(), restore_jobs=object(), shader_manager=manager)
+    with mock.patch.object(server, "_active_live_context", return_value=context(tmp_path)):
+        status, result = service.shader_live_edit_operation(request_body(tmp_path))
+    assert status == 409 and "controlled IPC failure" in result["error"]
+    assert result["startTiming"]["failedPhase"] == "capturePreflight"
+    assert set(result["startTiming"]["phasesMs"]) == {"captureIdentity", "capturePreflight", "startAdmission"}
+    assert service_module._SHADER_LIVE_START_TIMING.get() is None
 
 
 @pytest.mark.parametrize("operation,parameters", [
@@ -167,7 +349,9 @@ def test_start_binding_checks_catalog_in_the_discovered_scope_before_publication
     manifest = {"captureLoaded": True, "captureSessionId": "b" * 32, "capturePath": identity["capturePath"],
                 "pid": os.getpid(), "instanceId": "qrenderdoc-test"}
     (tmp_path / "qrenderdoc-test" / "instance.json").write_text(json.dumps(manifest), encoding="utf-8")
-    status = {"fixture": "one immutable status"}
+    status = {"fixture": "one immutable status",
+              "source": {"present": True, "lane": "executable-editable"},
+              "representation": {"lane": "executable-editable", "compileEligible": True}}
     workspace_service = mock.Mock()
     workspace_service.status.return_value = status
 
@@ -224,6 +408,31 @@ def test_unreadable_mailbox_is_unknown_until_owner_process_has_exited(tmp_path):
             assert service_module._shader_capture_session_state(binding(tmp_path), 9876) == "expired"
 
 
+def test_idle_stages_share_mailbox_but_reload_and_write_are_checked_fresh(tmp_path):
+    from src import ipc_client
+    scope = binding(tmp_path)
+    directory = tmp_path / scope["instanceId"]
+    directory.mkdir()
+    path = directory / "instance.json"
+    record = {**scope, "pid": os.getpid(), "captureLoaded": True}
+    path.write_text(json.dumps(record), encoding="utf-8")
+    with mock.patch.object(ipc_client, "INSTANCE_ROOT", str(tmp_path)), \
+            mock.patch.object(service_module, "_read_shader_capture_session_state",
+                              wraps=service_module._read_shader_capture_session_state) as read, \
+            mock.patch.object(service_module.time, "monotonic", return_value=100.0):
+        for _ in range(69):
+            assert service_module._shader_capture_session_state(scope, os.getpid()) == "current"
+        assert read.call_count == 1
+        assert service_module._shader_capture_session_state(scope, os.getpid(), fresh=True) == "current"
+        assert read.call_count == 2
+        record["captureSessionId"] = "f" * 32
+        path.write_text(json.dumps(record), encoding="utf-8")
+        assert service_module._shader_capture_session_state(scope, os.getpid()) == "expired"
+        assert read.call_count == 3
+        with mock.patch.object(ipc_client.IPCClient, "_process_alive", return_value=False):
+            assert service_module._shader_capture_session_state(scope, os.getpid()) == "expired"
+
+
 def test_expired_frozen_worker_never_enters_apply(tmp_path):
     frozen = service_module._freeze_shader_live_session("qrenderdoc-test", "b" * 32, os.getpid(), str(tmp_path / "frame.rdc"))
     with mock.patch.object(service_module, "_shader_capture_session_state", return_value="expired"):
@@ -233,8 +442,26 @@ def test_expired_frozen_worker_never_enters_apply(tmp_path):
     apply.assert_not_called()
 
 
+def test_temporarily_unavailable_frozen_worker_defers_without_entering_apply(tmp_path):
+    frozen = service_module._freeze_shader_live_session(
+        "qrenderdoc-test", "b" * 32, os.getpid(), str(tmp_path / "frame.rdc")
+    )
+    with mock.patch.object(
+        service_module, "_shader_capture_session_state", return_value="unavailable"
+    ):
+        with mock.patch.object(server, "_shader_live_edit_apply_candidate") as apply:
+            with pytest.raises(
+                service_module.ShaderLiveEditSessionUnavailable,
+                match="temporarily unavailable",
+            ):
+                frozen.apply_candidate(str(tmp_path), 2, "c" * 64)
+    apply.assert_not_called()
+
+
 @pytest.mark.parametrize("same_gui_process", [False, True])
-def test_existing_owner_tick_resumes_new_capture_without_any_mcp_list(tmp_path, same_gui_process):
+def test_existing_owner_tick_resumes_new_capture_without_any_mcp_list(tmp_path, same_gui_process, monkeypatch):
+    # Compatibility embedders can explicitly retain historical auto-resume.
+    monkeypatch.setattr(server, "_shader_editors_on_demand", False)
     from src import ipc_client
     from src.shader_live_edit import ShaderLiveEditManager
     from tests.test_shader_live_edit import _wait_until
@@ -267,6 +494,9 @@ def test_existing_owner_tick_resumes_new_capture_without_any_mcp_list(tmp_path, 
         bind_session=service_module._bound_shader_session, poll_seconds=0.005, join_seconds=0.2)
     service = service_module.InternalToolService(project=object(), restore_jobs=object(), shader_manager=manager)
     workspace_service = mock.Mock()
+    workspace_service.status.return_value = {
+        "source": {"present": True, "lane": "executable-editable"},
+        "representation": {"lane": "executable-editable", "compileEligible": True}}
 
     def validate_catalog(_workspace, *, status):
         assert status is workspace_service.status.return_value
@@ -311,7 +541,19 @@ def test_existing_owner_tick_resumes_new_capture_without_any_mcp_list(tmp_path, 
             manager.shutdown()
 
 
-def test_owner_tick_ignores_unregistered_or_ambiguous_gui_mailboxes(tmp_path):
+def test_on_demand_owner_tick_does_not_scan_or_activate_historical_sessions(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_shader_editors_on_demand", True)
+    manager = Manager()
+    manager.reconcile_capture = mock.Mock(side_effect=AssertionError("idle activation"))
+    service = service_module.InternalToolService(project=object(), restore_jobs=object(), shader_manager=manager)
+    with mock.patch.object(service_module, "_shader_capture_mailbox", side_effect=AssertionError("idle mailbox scan")):
+        assert service.refresh_shader_sessions([101]) == {"attempted": False, "results": [], "reason": "editors-on-demand"}
+    with service._automatic_shader_resume(binding(tmp_path)) as allowed:
+        assert allowed is False
+
+
+def test_owner_tick_ignores_unregistered_or_ambiguous_gui_mailboxes(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_shader_editors_on_demand", False)
     from src import ipc_client
 
     manager = Manager()
@@ -337,7 +579,8 @@ def test_owner_tick_ignores_unregistered_or_ambiguous_gui_mailboxes(tmp_path):
         assert manager.reconcile_capture.call_args.args[0]["instanceId"] == "two"
 
 
-def test_busy_or_unavailable_registered_gui_is_not_erased_from_automatic_scope(tmp_path):
+def test_busy_or_unavailable_registered_gui_is_not_erased_from_automatic_scope(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_shader_editors_on_demand", False)
     from src import ipc_client
 
     manager = Manager()
@@ -419,3 +662,70 @@ def test_redirects_are_rejected_and_mcp_startup_does_not_resume_watchers():
     with pytest.raises(RuntimeError, match="cannot redirect"):
         client._NoRedirect().redirect_request(None, None, 302, "", {}, "https://foreign.example/")
     assert "resume_persistent" not in inspect.getsource(server.main)
+
+
+def test_failed_owner_start_preserves_structured_timing_through_http_and_tool_error():
+    timing = {"totalMs": 12.0, "phasesMs": {"capturePreflight": 8.0}, "failedPhase": "capturePreflight"}
+    response = mock.MagicMock()
+    response.__enter__.return_value = response
+    response.status = 409
+    response.read.return_value = json.dumps({"error": "controlled failure", "startTiming": timing}).encode()
+    with mock.patch.object(client._OPENER, "open", return_value=response):
+        with pytest.raises(RuntimeError, match="controlled failure") as caught:
+            client._read_response(object(), 1)
+    error = json.loads(server._err(caught.value))
+    assert error["data"]["startTiming"] == timing
+    assert "capturePreflight" not in error["error"]
+
+
+def test_switch_operations_reuse_the_current_candidate_and_trim_the_receipt(tmp_path):
+    """The workspace toggle: apply compiles only a changed source; restore rolls back."""
+
+    workspace_service = mock.Mock()
+    workspace_service.status.return_value = {
+        "source": {"currentSha256": "s" * 64},
+        "latestCompiled": {"revision": 4, "rawSha256": "r" * 64, "sourceSha256": "s" * 64}}
+    receipt = {"scope": {"captureSessionId": "b" * 32},
+               "replacement": {"replacementId": "9" * 32},
+               "manifest": {"huge": "x" * 100000}}
+    service = service_module.InternalToolService(project=object(), restore_jobs=object(), shader_manager=Manager())
+    with mock.patch.object(server, "_active_live_context", return_value=context(tmp_path)), \
+            mock.patch.object(server, "_shader_workspace_service", return_value=workspace_service), \
+            mock.patch.object(server, "_shader_live_edit_apply_candidate", return_value=receipt) as apply:
+        status, result = service.shader_live_edit_operation(
+            request_body(tmp_path, "apply", {"workspace_path": str(tmp_path)}))
+    assert status == 200, result
+    applied = result["result"]
+    assert applied["applied"] and applied["compiled"] is False and applied["revision"] == 4
+    assert applied["replacementId"] == "9" * 32
+    assert "manifest" not in applied["result"] and applied["result"]["replacement"]["replacementId"] == "9" * 32
+    apply.assert_called_once_with(str(tmp_path), 4, "r" * 64)
+    workspace_service.compile.assert_not_called()
+
+    # A header-only edit must not reuse a main-SHA-identical old candidate.
+    workspace_service.status.return_value["sourceDependenciesCurrent"] = False
+    workspace_service.compile_for_live_edit.return_value = {"revision": 5, "rawSha256": "q" * 64, "sourceSha256": "s" * 64}
+    with mock.patch.object(server, "_shader_workspace_service", return_value=workspace_service), \
+            mock.patch.object(server, "_shader_live_edit_apply_candidate", return_value=receipt) as apply:
+        header_changed = service_module._apply_workspace_candidate_now(str(tmp_path))
+    assert header_changed["compiled"] is True and header_changed["revision"] == 5
+    apply.assert_called_once_with(str(tmp_path), 5, "q" * 64)
+    workspace_service.status.return_value["sourceDependenciesCurrent"] = True
+
+    # A source edited since the last compile is compiled first.
+    workspace_service.status.return_value["source"]["currentSha256"] = "t" * 64
+    workspace_service.compile_for_live_edit.return_value = {"revision": 5, "rawSha256": "q" * 64, "sourceSha256": "t" * 64}
+    with mock.patch.object(server, "_active_live_context", return_value=context(tmp_path)), \
+            mock.patch.object(server, "_shader_workspace_service", return_value=workspace_service), \
+            mock.patch.object(server, "_shader_live_edit_apply_candidate", return_value=receipt):
+        status, result = service.shader_live_edit_operation(
+            request_body(tmp_path, "apply", {"workspace_path": str(tmp_path)}))
+    assert status == 200 and result["result"]["compiled"] is True and result["result"]["revision"] == 5
+
+    with mock.patch.object(server, "_active_live_context", return_value=context(tmp_path)), \
+            mock.patch.object(server, "rollback_shader_workspace_shared_resource",
+                              return_value=json.dumps({"rollback": {"restored": True}})) as rollback:
+        status, result = service.shader_live_edit_operation(
+            request_body(tmp_path, "restore", {"workspace_path": str(tmp_path), "replacement_id": "9" * 32}))
+    assert status == 200 and result["result"]["result"]["rollback"]["restored"]
+    rollback.assert_called_once_with(str(tmp_path), "9" * 32)

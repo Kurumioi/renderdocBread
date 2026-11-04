@@ -181,6 +181,9 @@ def test_render_is_deterministic_parseable_and_self_hashed() -> None:
 def test_fixed_theme_renders_all_shapes_line_patterns_labels_and_legend() -> None:
     svg = render_event_flow_diagram(_representative_graph()).svg_bytes.decode("utf-8")
 
+    assert "Bread Event Flow Diagram" in svg
+    assert "Bread Event Flow" in svg
+    assert "ReplayLab Event Flow" not in svg
     assert "EID 101" in svg
     assert "[Resource] resource.42" in svg
     assert "[Stage] VS" in svg

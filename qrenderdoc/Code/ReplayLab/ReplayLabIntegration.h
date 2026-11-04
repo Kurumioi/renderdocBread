@@ -62,6 +62,11 @@ public:
   QString ValidateCurrentContextFreezeResultPath(const QString &jobId, const QString &resultPath,
                                                  QString *error = NULL) const;
   QStringList AvailableShaderStages(QString *error = NULL) const;
+  // Resolve only documents already owned by Shader Workspace; never open arbitrary local files.
+  QString NavigateShaderSourceJSON(const QString &requestJSON, QString *error = NULL) const;
+  QString OpenDocumentJSON(const QString &requestJSON, QString *error = NULL) const;
+  void OpenShaderWorkspace(uint32_t eventId, const QString &stage,
+                           const QString &resourceId, const QString &entryPoint);
 
 private:
   CaptureContext &m_Context;

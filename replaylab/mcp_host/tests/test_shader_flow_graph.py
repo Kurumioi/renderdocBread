@@ -14,10 +14,12 @@ from src.shader_workspace.flow_graph import (
     ShaderFlowGraphError,
     build_shader_flow_graph,
     load_workspace_flow_graph_status,
+    module_description_paging,
     module_description_template,
     validate_module_descriptions,
     validate_shader_flow_graph,
 )
+from src.shader_workspace.equivalence import mermaid_from_flow_graph
 
 
 class ShaderFlowGraphTests(unittest.TestCase):
@@ -38,6 +40,21 @@ class ShaderFlowGraphTests(unittest.TestCase):
         }
         arguments.update(overrides)
         return build_shader_flow_graph(source, **arguments)
+
+    def test_draft_graph_accepts_existing_compile_history_without_authorizing_replay(self) -> None:
+        source = "float4 MainPS() : SV_Target0 { return 1; }"
+        for revision in (0, 124):
+            with self.subTest(revision=revision):
+                graph = self._build(source, source_revision=revision, origin="editable-draft")
+                validated = validate_shader_flow_graph(
+                    graph, expected_source_sha256=hashlib.sha256(source.encode()).hexdigest(),
+                    expected_source_revision=revision,
+                )
+                self.assertTrue(validated["policy"]["navigationOnly"])
+                self.assertFalse(validated["policy"]["compileAuthorization"])
+                self.assertFalse(validated["policy"]["applyAuthorization"])
+        with self.assertRaisesRegex(ShaderFlowGraphError, "source revision"):
+            self._build(source, source_revision=0, origin="organized-proposal")
 
     def test_extracts_calls_locations_and_bounded_ai_descriptions(self) -> None:
         source = (
@@ -83,6 +100,57 @@ class ShaderFlowGraphTests(unittest.TestCase):
         self.assertFalse(graph["policy"]["compileAuthorization"])
         self.assertFalse(graph["policy"]["applyAuthorization"])
 
+    def test_flow_spec_stays_separate_from_function_graph_and_mermaid(self) -> None:
+        source = (
+            "float3 ApplyLighting(float3 surfaceColor) { return surfaceColor; }\n"
+            "float4 MainPS(float2 uv : TEXCOORD0) : SV_Target0\n"
+            "{\n"
+            "  float3 implementationValue = ApplyLighting(float3(uv, 0));\n"
+            "  return float4(implementationValue, 1);\n"
+            "}\n"
+        )
+        flow_spec = {
+            "stages": [
+                {
+                    "id": "implementation",
+                    "label": "float3 leakedValue = ApplyLighting(uv);",
+                    "function": "MainPS",
+                    "sourceRange": {"startLine": 4, "endLine": 4},
+                    "reads": ["uv"],
+                    "writes": ["implementationValue"],
+                    "next": [],
+                }
+            ]
+        }
+
+        graph = self._build(source, flow_spec=flow_spec)
+
+        self.assertNotIn("graphKind", graph)
+        self.assertEqual(
+            {node["kind"] for node in graph["nodes"]},
+            {"entry-point", "function"},
+        )
+        self.assertTrue(all(edge["kind"] == "calls" for edge in graph["edges"]))
+        by_name = {node["name"]: node for node in graph["nodes"]}
+        self.assertEqual(by_name["MainPS"]["inputs"], ["uv"])
+        self.assertEqual(by_name["MainPS"]["outputs"], ["SV_Target0"])
+        self.assertIn("MainPS(in float2 uv)", by_name["MainPS"]["signature"])
+        self.assertEqual(by_name["ApplyLighting"]["inputs"], ["surfaceColor"])
+        self.assertEqual(by_name["ApplyLighting"]["outputs"], ["return"])
+
+        diagram = mermaid_from_flow_graph(graph)
+        self.assertIn("in: uv", diagram)
+        self.assertIn("out: SV_Target0", diagram)
+        self.assertNotIn("signature:", diagram)
+        self.assertNotIn("implementationValue", diagram)
+        self.assertNotIn("leakedValue", diagram)
+
+        with self.assertRaisesRegex(ShaderFlowGraphError, "implementation text"):
+            self._build(
+                source,
+                descriptions={"MainPS": "float hiddenValue = uv.x"},
+            )
+
     def test_graph_id_ignores_generation_time_but_binds_source_revision(self) -> None:
         source = "float4 MainPS() : SV_Target { return 1.0; }\n"
         first = self._build(source)
@@ -127,9 +195,52 @@ class ShaderFlowGraphTests(unittest.TestCase):
         with self.assertRaisesRegex(ShaderFlowGraphError, "single-line"):
             validate_module_descriptions(invalid)
 
+    def test_function_comments_reject_code_fragments_without_semicolons(self) -> None:
+        template = module_description_template(
+            "float Evaluate(float value) { return value; }\n"
+            "float4 MainPS() : SV_Target { return Evaluate(1); }\n"
+        )
+        implementation_fragments = (
+            "Evaluate(value)",
+            "Calls Evaluate(value) for the result",
+            "if (mask) return the sampled value",
+            "float3 normalValue",
+            "values[index] supplies the result",
+            "result ? left : right",
+        )
+        for fragment in implementation_fragments:
+            invalid = copy.deepcopy(template)
+            invalid["modules"][0]["description"] = fragment
+            with self.subTest(fragment=fragment), self.assertRaisesRegex(
+                ShaderFlowGraphError, "implementation"
+            ):
+                validate_module_descriptions(invalid)
+
+        valid = copy.deepcopy(template)
+        valid["modules"][0]["description"] = (
+            "Evaluates the source-defined contribution from the supplied value."
+        )
+        self.assertIn("Evaluate", validate_module_descriptions(valid))
+
+    def test_legacy_host_entry_summary_does_not_relax_implementation_filter(self) -> None:
+        source = "float4 MainPS() : SV_Target { return 1.0; }\n"
+        legacy = "Shader entry point; the stage result is produced here."
+        graph = self._build(source, descriptions={"MainPS": legacy})
+        self.assertEqual(validate_shader_flow_graph(graph)["nodes"][0]["description"], legacy)
+        self.assertTrue(graph["policy"]["navigationOnly"])
+        self.assertFalse(graph["policy"]["applyAuthorization"])
+        for description in (legacy + " return 1;", "return;", "discard;",
+                            "float value = 1;", "Evaluate(value);",
+                            "Shader entry point; return result;"):
+            with self.subTest(description=description), self.assertRaisesRegex(
+                    ShaderFlowGraphError, "implementation"):
+                self._build(source, descriptions={"MainPS": description})
+
     def test_node_limit_is_explicit_and_entry_point_is_retained(self) -> None:
         helpers = "".join(
-            "float Helper%d() { return %d.0; }\n" % (index, index)
+            "float Helper%d() { return Helper%d(); }\n" % (index, index + 1)
+            if index < MAX_GRAPH_NODES + 7 else
+            "float Helper%d() { return 1.0; }\n" % index
             for index in range(MAX_GRAPH_NODES + 8)
         )
         source = helpers + "float4 MainPS() : SV_Target { return Helper0(); }\n"
@@ -140,6 +251,75 @@ class ShaderFlowGraphTests(unittest.TestCase):
         self.assertEqual(graph["nodes"][0]["name"], "MainPS")
         self.assertTrue(graph["truncated"]["nodes"])
         self.assertEqual(graph["truncated"]["omittedNodes"], 9)
+        self.assertEqual(graph["truncated"]["omittedEdges"], 9)
+
+    def test_unreachable_helper_is_not_a_disconnected_flowchart_root(self) -> None:
+        source = (
+            "float Orphan() { return 0.0; }\n"
+            "float Used() { return 1.0; }\n"
+            "float4 MainPS() : SV_Target { return Used(); }\n"
+        )
+        graph = self._build(source)
+        self.assertEqual([node["name"] for node in graph["nodes"]],
+                         ["MainPS", "Used"])
+        self.assertFalse(graph["truncated"]["nodes"])
+        self.assertNotIn("Orphan", mermaid_from_flow_graph(graph))
+
+    def test_final_source_comment_precedes_stale_module_description(self) -> None:
+        source = (
+            "// 计算归一化法线。\n"
+            "float3 NormalizeSurface(float3 normal) { return normalize(normal); }\n"
+            "/* Compute the final output. */\n"
+            "float4 MainPS(float3 normal) : SV_Target {\n"
+            "  return float4(NormalizeSurface(normal), 1.0);\n"
+            "}\n"
+        )
+        graph = self._build(source, descriptions={
+            "NormalizeSurface": "An obsolete description.",
+            "MainPS": "Another obsolete description.",
+        })
+        by_name = {node["name"]: node for node in graph["nodes"]}
+        self.assertEqual(by_name["NormalizeSurface"]["description"],
+                         "计算归一化法线。")
+        self.assertEqual(by_name["MainPS"]["description"],
+                         "Compute the final output.")
+        no_comment = self._build(
+            "float4 MainPS() : SV_Target { return 1.0; }\n",
+            descriptions={"MainPS": "Fallback summary from a reviewed module."},
+        )
+        self.assertEqual(no_comment["nodes"][0]["description"],
+                         "Fallback summary from a reviewed module.")
+
+    def test_description_coverage_can_be_batched_beyond_visible_graph_limit(self) -> None:
+        function_count = MAX_GRAPH_NODES + 44
+        source = "".join(
+            "float Helper%d(float value) { return value; }\n" % index
+            for index in range(function_count)
+        )
+        template = module_description_template(source)
+        paging = module_description_paging(source)
+        self.assertEqual(len(template["modules"]), MAX_GRAPH_NODES)
+        self.assertEqual(paging["totalFunctions"], function_count)
+        self.assertTrue(paging["hasMore"])
+        self.assertEqual(paging["nextOutlineOffset"], MAX_GRAPH_NODES)
+        self.assertGreater(paging["maximumDocumentBytes"], 0)
+        self.assertEqual(paging["mergeKey"], "modules[].name")
+
+        # This models the final result of several modules-by-name draft merges.
+        # The graph itself stays visually bounded, while whole-Shader review can
+        # still require a description for every function in the source.
+        merged = {
+            "schema": MODULE_DESCRIPTIONS_SCHEMA,
+            "schemaVersion": 1,
+            "modules": [
+                {
+                    "name": "Helper%d" % index,
+                    "description": "Returns the source-defined value for this helper.",
+                }
+                for index in range(function_count)
+            ],
+        }
+        self.assertEqual(len(validate_module_descriptions(merged)), function_count)
 
     def test_validation_rejects_path_escape_and_content_tamper(self) -> None:
         source = "float4 MainPS() : SV_Target { return 1.0; }\n"
@@ -156,7 +336,9 @@ class ShaderFlowGraphTests(unittest.TestCase):
 
     def test_workspace_projection_marks_source_changes_stale(self) -> None:
         source = "float4 MainPS() : SV_Target { return 1.0; }\n"
-        graph = self._build(source)
+        graph = self._build(source, descriptions={
+            "MainPS": "Shader entry point; the stage result is produced here.",
+        })
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "ai").mkdir()

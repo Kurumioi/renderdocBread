@@ -122,7 +122,7 @@ def test_api_key_environment_cannot_reuse_process_or_replaylab_control_names(nam
 
 
 def test_external_agent_environment_cannot_expose_mcp_provider_configuration() -> None:
-    with pytest.raises(ConfigurationError, match="must not expose ReplayLab MCP provider"):
+    with pytest.raises(ConfigurationError, match="must not expose Bread MCP provider"):
         Profile(
             id="unsafe-provider-env",
             preset="custom-acp",
@@ -297,7 +297,22 @@ def test_model_settings_are_mapped_instead_of_silently_ignored(monkeypatch) -> N
     assert seen["max_tokens"] == 512
     assert seen["temperature"] == 0.2
     assert seen["timeout"] == 30.0
-    assert seen["reasoning_effort"] == "medium"
+    # On the Responses surface the effort travels inside `reasoning`; a separate
+    # `reasoning_effort` next to it is forwarded as an unknown argument by some
+    # langchain-openai versions.
+    assert seen["use_responses_api"] is True
+    assert seen["reasoning"]["effort"] == "medium"
+    assert "reasoning_effort" not in seen
+    seen.clear()
+    chat_profile = Profile(
+        id="settings-chat", preset="openai", model="model",
+        base_url="https://api.openai.test/v1",
+        options={"api": "chat", "reasoning_effort": "low"},
+    )
+    chat_profile.validate()
+    langchain_models.build_chat_model(chat_profile, environ={chat_profile.key_env: "test-key"})
+    assert seen["reasoning_effort"] == "low"
+    assert "reasoning" not in seen
     with pytest.raises(ConfigurationError, match="requires options.api_version"):
         Profile(
             id="azure-legacy",

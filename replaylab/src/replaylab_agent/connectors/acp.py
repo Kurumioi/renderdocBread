@@ -5,28 +5,36 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import ctypes as _ctypes
 import inspect
 import json
 import os
+import subprocess
 import re
 import tempfile
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from ..catalog import REPLAYLAB_MCP_SERVER_NAME
+from ..agent_diagnostics import get_logger
+from ..catalog import BREAD_MCP_SERVER_NAME
 from ..conversation import (
     MAX_CONVERSATION_ATTACHMENT_TOTAL_BINARY_BYTES,
     MAX_CONVERSATION_ATTACHMENTS_PER_TURN,
     ProviderBinaryAttachment,
 )
 from ..errors import (
+    AuthenticationError,
     ConfigurationError,
     ConnectorError,
     LifecycleCleanupError,
     PolicyError,
+    ProviderIncidentError,
+    ProviderCapabilityError,
+    ProviderRequestError,
 )
 from .codex_app_server import (
     DeltaCallback,
@@ -35,6 +43,7 @@ from .codex_app_server import (
     TimelineCallback,
     checked_response_size,
 )
+from .acp_transport import ACP_MAX_MESSAGE_BYTES, spawn_bounded_agent_process
 
 
 # Give a well-behaved Agent a short graceful window. The ACP SDK transport must
@@ -47,9 +56,279 @@ _ACP_TREE_KILL_TIMEOUT = 5.0
 _ACP_FORCE_CLEANUP_TIMEOUT = 5.0
 _ACP_TRANSPORT_SHUTDOWN_TIMEOUT = 15.0
 _ACP_FINAL_PIPE_DRAIN_TIMEOUT = 0.5
-_ACP_TRANSPORT_MAX_BYTES = 16 * 1024 * 1024
+_ACP_TRANSPORT_MAX_BYTES = ACP_MAX_MESSAGE_BYTES
 _ACP_STDERR_TAIL_BYTES = 4000
 _CURSOR_PROVIDER_ID = "cursor-acp"
+_ACP_PROVIDER_ERROR_UPDATE_KINDS = frozenset({
+    "agent_error",
+    "agent_error_chunk",
+    "error",
+    "error_chunk",
+    "provider_error",
+    "provider_error_chunk",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderIncident:
+    code: str
+    message: str
+
+
+def _classify_provider_incident(
+    value: Any, *, explicit_error: bool = False
+) -> _ProviderIncident | None:
+    """Recognise transport diagnostics that must never become answer text.
+
+    Ordinary Shader/compiler diagnostics can legitimately begin with ``Error:``.
+    Text chunks are therefore classified only when they also contain a narrow
+    provider/transport signature.  A protocol-level ACP error update is already
+    typed by the vendor and can use the generic fallback.
+    """
+
+    text = str(value or "").replace("\0", " ").strip()
+    if not text:
+        return None
+    folded = " ".join(text.casefold().split())
+    http2 = "http/2" in folded or "http2" in folded
+    cancelled = "cancel" in folded or "canceled" in folded
+    if http2 and cancelled and (
+        "stream closed" in folded
+        or "error code" in folded
+        or "retriableerror" in folded
+    ):
+        return _ProviderIncident(
+            "http2-cancel",
+            "The model provider closed the HTTP/2 stream before the turn completed.",
+        )
+    if "ping" in folded and (
+        "timeout" in folded
+        or "timed out" in folded
+        or "deadline" in folded
+    ):
+        return _ProviderIncident(
+            "provider-ping-timeout",
+            "The model provider stopped answering transport keep-alive checks.",
+        )
+    if "retriableerror" in folded and any(
+        marker in folded
+        for marker in ("cancel", "timeout", "timed out", "connection", "stream")
+    ):
+        return _ProviderIncident(
+            "provider-retriable-error",
+            "The model provider reported a retryable transport failure.",
+        )
+    looks_like_transport_error = any(
+        marker in folded
+        for marker in (
+            "provider error",
+            "transport error",
+            "connection closed",
+            "connection reset",
+            "network error",
+            "stream closed",
+        )
+    )
+    if looks_like_transport_error and (
+        explicit_error
+        or folded.startswith("error:")
+        or folded.startswith("api error:")
+    ):
+        return _ProviderIncident(
+            "provider-transport-error",
+            "The model provider reported a transport failure.",
+        )
+    if explicit_error:
+        return _ProviderIncident(
+            "provider-error-update",
+            "The model provider ended the turn with an error notification.",
+        )
+    return None
+
+
+def _split_provider_incident(text: str) -> tuple[str, _ProviderIncident | None]:
+    """Keep valid assistant prose preceding a standalone provider error line."""
+
+    offset = 0
+    for line in str(text or "").splitlines(keepends=True):
+        incident = _classify_provider_incident(line)
+        if incident is not None:
+            return text[:offset], incident
+        offset += len(line)
+    incident = _classify_provider_incident(text)
+    return ("", incident) if incident is not None else (text, None)
+
+
+def _acp_provider_request_failure(
+    error: BaseException, *, provider_id: str,
+) -> ProviderRequestError | None:
+    """Preserve Claude's typed ACP failures before generic connector wrapping.
+
+    The adapter forwards SDKAssistantMessage.error as RequestError.data.errorKind.
+    Older releases only embed a vendor HTTP failure in that same RPC error.
+    Assistant chunks, tool results and stderr are deliberately never inspected.
+    """
+    if provider_id != "claude-code-acp" or isinstance(error, ProviderRequestError):
+        return None
+    try:
+        from acp.exceptions import RequestError
+    except ImportError:
+        return None
+    current: BaseException | None = error
+    seen: set[int] = set()
+    for _ in range(6):
+        if current is None or id(current) in seen:
+            return None
+        seen.add(id(current))
+        if isinstance(current, RequestError) and current.code == -32603:
+            break
+        current = current.__cause__ or current.__context__
+    else:
+        return None
+    data = current.data if isinstance(current.data, Mapping) else {}
+    kind = data.get("errorKind")
+    known = {
+        "authentication_failed": "provider-authentication",
+        "oauth_org_not_allowed": "provider-permission",
+        "account_on_hold": "provider-quota", "billing_error": "provider-quota",
+        "rate_limit": "provider-rate-limit", "overloaded": "provider-capacity",
+        "invalid_request": "provider-configuration", "model_not_found": "provider-model-unavailable",
+        "max_output_tokens": "provider-context", "server_error": "provider-unavailable",
+        "transport_lost": "provider-transport",
+    }
+    code = known.get(kind, "") if isinstance(kind, str) else ""
+    http = re.match(
+        r"\A(?:Internal error:\s*)?(?:Failed to authenticate\.\s*)?API Error:\s*([45][0-9]{2})(?=\s|$)",
+        str(current)[:4096],
+    )
+    if http is not None:
+        status = int(http.group(1))
+        # A concrete 403 is an access denial, even when the vendor's wrapper
+        # loosely calls every credential-related HTTP failure authentication.
+        if status == 401:
+            code = "provider-authentication"
+        elif status == 403:
+            code = "provider-permission"
+        elif status == 402:
+            code = "provider-quota"
+        elif status == 429 and code != "provider-quota":
+            code = "provider-rate-limit"
+        elif not code:
+            if status in {400, 404, 422}:
+                code = "provider-configuration"
+            elif status in {408, 504}:
+                code = "provider-timeout"
+            elif 500 <= status <= 599:
+                code = "provider-unavailable"
+    if not code:
+        return None
+    from ..agent_diagnostics import public_error
+    return ProviderRequestError(
+        "ACP provider request failed: " + public_error(current), error_code=code,
+        retryable=code in {"provider-rate-limit", "provider-capacity", "provider-unavailable",
+                          "provider-timeout", "provider-transport"},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _WindowsJobApi:
+    create_job: Any
+    set_information: Any
+    open_process: Any
+    assign_process: Any
+    terminate_job: Any
+    close_handle: Any
+
+
+_WINDOWS_JOB_API_LOCK = threading.Lock()
+_WINDOWS_JOB_API: _WindowsJobApi | None = None
+if os.name == "nt":
+    from ctypes import wintypes as _wintypes
+
+
+class _WindowsJobIoCounters(_ctypes.Structure):
+    _fields_ = [
+        (name, _ctypes.c_ulonglong)
+        for name in (
+            "ReadOperationCount",
+            "WriteOperationCount",
+            "OtherOperationCount",
+            "ReadTransferCount",
+            "WriteTransferCount",
+            "OtherTransferCount",
+        )
+    ]
+
+
+class _WindowsJobBasicLimits(_ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", _ctypes.c_longlong),
+        ("PerJobUserTimeLimit", _ctypes.c_longlong),
+        ("LimitFlags", _ctypes.c_uint32),
+        ("MinimumWorkingSetSize", _ctypes.c_size_t),
+        ("MaximumWorkingSetSize", _ctypes.c_size_t),
+        ("ActiveProcessLimit", _ctypes.c_uint32),
+        ("Affinity", _ctypes.c_size_t),
+        ("PriorityClass", _ctypes.c_uint32),
+        ("SchedulingClass", _ctypes.c_uint32),
+    ]
+
+
+class _WindowsJobExtendedLimits(_ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _WindowsJobBasicLimits),
+        ("IoInfo", _WindowsJobIoCounters),
+        ("ProcessMemoryLimit", _ctypes.c_size_t),
+        ("JobMemoryLimit", _ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", _ctypes.c_size_t),
+        ("PeakJobMemoryUsed", _ctypes.c_size_t),
+    ]
+
+
+def _windows_job_api() -> _WindowsJobApi | None:
+    """Return one pointer-width-safe WinAPI binding for all ACP processes."""
+
+    global _WINDOWS_JOB_API
+    if os.name != "nt":
+        return None
+    if _WINDOWS_JOB_API is not None:
+        return _WINDOWS_JOB_API
+    with _WINDOWS_JOB_API_LOCK:
+        if _WINDOWS_JOB_API is not None:
+            return _WINDOWS_JOB_API
+        kernel32 = _ctypes.WinDLL("kernel32", use_last_error=True)
+        create_job = kernel32.CreateJobObjectW
+        create_job.argtypes = [_ctypes.c_void_p, _wintypes.LPCWSTR]
+        create_job.restype = _wintypes.HANDLE
+        set_information = kernel32.SetInformationJobObject
+        set_information.argtypes = [
+            _wintypes.HANDLE,
+            _ctypes.c_int,
+            _ctypes.c_void_p,
+            _wintypes.DWORD,
+        ]
+        set_information.restype = _wintypes.BOOL
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [_wintypes.DWORD, _wintypes.BOOL, _wintypes.DWORD]
+        open_process.restype = _wintypes.HANDLE
+        assign_process = kernel32.AssignProcessToJobObject
+        assign_process.argtypes = [_wintypes.HANDLE, _wintypes.HANDLE]
+        assign_process.restype = _wintypes.BOOL
+        terminate_job = kernel32.TerminateJobObject
+        terminate_job.argtypes = [_wintypes.HANDLE, _wintypes.UINT]
+        terminate_job.restype = _wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [_wintypes.HANDLE]
+        close_handle.restype = _wintypes.BOOL
+        _WINDOWS_JOB_API = _WindowsJobApi(
+            create_job=create_job,
+            set_information=set_information,
+            open_process=open_process,
+            assign_process=assign_process,
+            terminate_job=terminate_job,
+            close_handle=close_handle,
+        )
+        return _WINDOWS_JOB_API
 
 
 def _requires_explicit_authentication(provider_id: str, method_id: str) -> bool:
@@ -86,8 +365,9 @@ def _read_capture_tail(capture: Any, limit: int = _ACP_STDERR_TAIL_BYTES) -> str
     except Exception:
         pass
     try:
-        capture.seek(0)
-        data = capture.read()
+        capture.seek(0, os.SEEK_END)
+        capture.seek(max(0, capture.tell() - limit))
+        data = capture.read(limit)
     except Exception:
         return ""
     if not data:
@@ -99,7 +379,6 @@ def _read_capture_tail(capture: Any, limit: int = _ACP_STDERR_TAIL_BYTES) -> str
     text = data.decode("utf-8", "replace")
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
     return " | ".join(lines[-20:])
-_MAX_ACP_PERMISSION_DENIALS = 16
 _MAX_ACP_TIMELINE_ACTIVITIES = 128
 _MAX_ACP_TIMELINE_EVENTS = 512
 _MAX_ACP_ARGUMENT_NAMES = 16
@@ -139,7 +418,7 @@ def _load_acp_sdk() -> _ACPSDK:
         from acp import schema
     except ImportError as exc:
         raise ConnectorError(
-            "ACP support is not installed; install ReplayLab with the 'acp' extra "
+            "ACP support is not installed; install Bread with the 'acp' extra "
             "(agent-client-protocol>=0.12,<1)"
         ) from exc
     try:
@@ -169,7 +448,7 @@ def _load_acp_sdk() -> _ACPSDK:
         )
     return _ACPSDK(
         protocol_version=required["PROTOCOL_VERSION"],
-        spawn_agent_process=required["spawn_agent_process"],
+        spawn_agent_process=spawn_bounded_agent_process,
         text_block=required["text_block"],
         image_block=getattr(acp, "image_block", None),
         embedded_blob_resource=getattr(acp, "embedded_blob_resource", None),
@@ -374,6 +653,7 @@ async def _force_stop_agent_process_tree(process: Any) -> bool:
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 return_code = await asyncio.wait_for(
                     killer.wait(), timeout=_ACP_TREE_KILL_TIMEOUT
@@ -392,12 +672,108 @@ async def _force_stop_agent_process_tree(process: Any) -> bool:
     return tree_stop_confirmed
 
 
+class _WindowsJob:
+    """Kill-on-close job object holding one vendor launcher and its descendants.
+
+    Cursor's official launcher is ``cmd -> PowerShell -> node``.  Closing the
+    ACP transport ends ``cmd`` but the node process (and the MCP proxy it
+    spawned) can outlive it, still holding the per-profile Cursor state; the
+    next ``session/new`` then blocks on that lock until the orphan dies, which
+    is exactly the "timed out after 60 s, fresh process opened in 7 s" pattern
+    seen in the field.  A job object with ``KILL_ON_JOB_CLOSE`` makes the
+    whole tree terminate deterministically when the session closes.
+    """
+
+    _LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _PROCESS_SET_QUOTA = 0x0100
+    _PROCESS_TERMINATE = 0x0001
+
+    def __init__(self) -> None:
+        self.handle: Any = None
+        self.assigned = False
+        self._api: _WindowsJobApi | None = None
+
+    @classmethod
+    def assign(cls, pid: Any) -> "_WindowsJob | None":
+        if os.name != "nt" or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        api = _windows_job_api()
+        if api is None:
+            return None
+        return cls._assign_with_api(pid, api)
+
+    @classmethod
+    def _assign_with_api(
+        cls, pid: int, api: _WindowsJobApi
+    ) -> "_WindowsJob | None":
+        """Assign one PID while retaining full pointer-width HANDLE values."""
+
+        job: _WindowsJob | None = None
+        process_handle: Any = None
+        try:
+            job = cls()
+            job._api = api
+            job.handle = api.create_job(None, None)
+            if not job.handle:
+                return None
+            limits = _WindowsJobExtendedLimits()
+            limits.BasicLimitInformation.LimitFlags = cls._LIMIT_KILL_ON_JOB_CLOSE
+            if not api.set_information(
+                job.handle, cls._JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                _ctypes.byref(limits), _ctypes.sizeof(limits)):
+                job.close(terminate=False)
+                return None
+            process_handle = api.open_process(
+                cls._PROCESS_SET_QUOTA | cls._PROCESS_TERMINATE, False, int(pid))
+            if not process_handle:
+                job.close(terminate=False)
+                return None
+            try:
+                job.assigned = bool(api.assign_process(job.handle, process_handle))
+            finally:
+                api.close_handle(process_handle)
+                process_handle = None
+            if not job.assigned:
+                job.close(terminate=False)
+                return None
+            return job
+        except Exception:  # noqa: BLE001 - the job is a safety net, never a failure
+            if process_handle:
+                try:
+                    api.close_handle(process_handle)
+                except Exception:
+                    pass
+            if job is not None:
+                job.close(terminate=False)
+            return None
+
+    def close(self, *, terminate: bool = True) -> None:
+        handle, self.handle = self.handle, None
+        if not handle:
+            return
+        api, self._api = self._api or _windows_job_api(), None
+        if api is None:
+            return
+        try:
+            if terminate and self.assigned:
+                api.terminate_job(handle, 0)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                api.close_handle(handle)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 @contextlib.asynccontextmanager
 async def _managed_agent_process(manager: Any, label: str):
     """Preserve body failures while making an uncertain child exit fatal."""
 
     value = await manager.__aenter__()
     process = _owned_agent_process(value)
+    job = _WindowsJob.assign(getattr(process, "pid", None)) if process is not None else None
 
     async def close(
         exception_type: type[BaseException] | None,
@@ -493,12 +869,100 @@ async def _managed_agent_process(manager: Any, label: str):
     try:
         yield value
     except BaseException as primary:
-        suppressed = await close(type(primary), primary, primary.__traceback__)
+        try:
+            suppressed = await close(type(primary), primary, primary.__traceback__)
+        finally:
+            if job is not None:
+                job.close()
         if suppressed:
             return
         raise
     else:
-        await close(None, None, None)
+        try:
+            await close(None, None, None)
+        finally:
+            # Graceful shutdown first; then the job guarantees no detached
+            # launcher descendant survives to block the next session.
+            if job is not None:
+                job.close()
+
+
+
+def _acp_selected_model(session: Any) -> str:
+    """The model id the agent reports for this session, if it reports one at all.
+
+    `session/new` is authoritative about the model the vendor selected. Agents that
+    expose no model option (the Claude Code adapter, for one) report nothing, and the
+    caller has to say so rather than imply the requested model was used.
+    """
+
+    for option in _field(session, "config_options", "configOptions") or []:
+        category = _enum_value(_field(option, "category")).lower()
+        option_id = str(_field(option, "id") or "")
+        if category == "model" or option_id.lower() in {"model", "models"}:
+            return str(_field(option, "current_value", "currentValue") or "")
+    return str(_field(_field(session, "models"), "current_model_id", "currentModelId") or "")
+
+
+async def _select_acp_model(
+    connection: Any, session: Any, session_id: str, model: str, *,
+    timeout: float, provider_id: str = "", env: Mapping[str, str] | None = None,
+) -> str:
+    """Bind an explicitly requested model before any prompt, without fallback."""
+
+    if not model:
+        return _acp_selected_model(session)
+    options = _field(session, "config_options", "configOptions") or []
+    model_option = next((option for option in options if (
+        _enum_value(_field(option, "category")).lower() == "model"
+        or str(_field(option, "id") or "").lower() in {"model", "models"}
+    )), None)
+    if _acp_selected_model(session) == model:
+        return model
+    if model_option is None:
+        # The first-party Claude adapter uses this documented environment
+        # channel. Other Agents must not silently run their default instead.
+        if (provider_id == "claude-code-acp"
+                and (env or {}).get("ANTHROPIC_MODEL") == model.strip().lower()):
+            return model
+        raise ProviderCapabilityError(
+            "The ACP Agent does not expose a supported way to select the requested model.",
+            error_code="model-selection-unsupported", capability="model-selection",
+        )
+    setter = getattr(connection, "set_config_option", None)
+    if not callable(setter):
+        raise ProviderCapabilityError(
+            "ACP agent advertised model selection, but the connection does not support session/set_config_option",
+            error_code="model-selection-unsupported", capability="model-selection",
+        )
+    try:
+        selected = await _wait_for(
+            setter(config_id=str(_field(model_option, "id") or ""),
+                   session_id=session_id, value=model),
+            min(timeout, 30.0), "ACP model selection",
+        )
+    except AuthenticationError:
+        raise
+    except Exception as exc:
+        from ..agent_diagnostics import public_error
+        raise ConnectorError(
+            f"ACP model selection for '{model}' failed: {public_error(exc)}"
+        ) from exc
+    reported = _acp_selected_model(selected)
+    if reported and reported != model:
+        # claude-agent-acp 0.76 session-model.js exposes picker aliases while
+        # setSessionConfigOption resolves a requested full ID against its private
+        # ModelInfo.resolvedModel, calls query.setModel, then returns that alias.
+        # Accept the adapter's successful selection, not a client-side family /
+        # version guess. Requiring the explicit setter also preserves a failed
+        # PreModelSwitch hook instead of trusting the environment alone.
+        if (provider_id == "claude-code-acp"
+                and (env or {}).get("ANTHROPIC_MODEL") == model.strip().lower()
+                and reported in _connection_models(selected)
+                and reported in _connection_models(session)):
+            return reported
+        raise ConnectorError("ACP Agent did not select the requested model: " + model)
+    return model
 
 
 class ACPConnector:
@@ -607,12 +1071,11 @@ class ACPConnector:
                         "ACP initialize",
                     )
                     await self._authenticate(connection)
-                    session = await _wait_for(
-                        connection.new_session(cwd=str(self.cwd), mcp_servers=[]),
-                        min(self.timeout, 60.0),
-                        "ACP session/new",
+                    session = await _new_session(
+                        connection, cwd=str(self.cwd), mcp_servers=[],
+                        meta=self.session_meta, timeout=min(self.timeout, 60.0),
                     )
-                    session_id = str(getattr(session, "session_id", ""))
+                    session_id = str(_field(session, "session_id", "sessionId") or "")
                     if not session_id:
                         raise ConnectorError("ACP session/new returned no session id")
                     state.session_id = session_id
@@ -623,7 +1086,10 @@ class ACPConnector:
                         "models": _connection_models(session),
                         "agentInfo": _wire_agent_info(initialized),
                     }
-            except (ConfigurationError, ConnectorError, PolicyError):
+            except (AuthenticationError, ConfigurationError, ConnectorError, PolicyError) as exc:
+                failure = _acp_provider_request_failure(exc, provider_id=self.provider_id)
+                if failure is not None:
+                    raise failure from exc
                 raise
             except FileNotFoundError as exc:
                 raise ConnectorError(
@@ -637,6 +1103,9 @@ class ACPConnector:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                failure = _acp_provider_request_failure(exc, provider_id=self.provider_id)
+                if failure is not None:
+                    raise failure from exc
                 detail = str(exc) or type(exc).__name__
                 stderr_tail = _read_capture_tail(stderr_capture)
                 if stderr_tail:
@@ -648,16 +1117,16 @@ class ACPConnector:
                         stderr_capture.close()
 
     async def test_model(
-        self, *, prompt: str = "Reply with exactly: OK"
+        self, *, prompt: str = "Reply with exactly: OK", model: str = ""
     ) -> dict[str, Any]:
         """Send one minimal prompt to confirm the configured model actually generates.
 
         Unlike ``test_connection`` this DOES spend a small amount of provider
         quota: it runs a single short turn with no ReplayLab tools, so an invalid
         or plan-restricted model id surfaces here instead of on the user's first
-        real prompt. The model under test is chosen by the agent's own environment
-        (e.g. ANTHROPIC_MODEL), which the caller sets before constructing this
-        connector. Returns ``{"ok": True, "stopReason": ...}`` on success and
+        real prompt. The requested model uses the same exact session selection
+        as a real task, or the Claude adapter's explicit environment binding.
+        Returns ``{"ok": True, "stopReason": ...}`` on a completed text response and
         raises ConnectorError (with the Agent's stderr tail) otherwise.
         """
 
@@ -697,17 +1166,21 @@ class ACPConnector:
                         "ACP initialize",
                     )
                     await self._authenticate(connection)
-                    session = await _wait_for(
-                        connection.new_session(cwd=str(self.cwd), mcp_servers=[]),
-                        min(self.timeout, 60.0),
-                        "ACP session/new",
+                    session = await _new_session(
+                        connection, cwd=str(self.cwd), mcp_servers=[],
+                        meta=self.session_meta, timeout=min(self.timeout, 60.0),
                     )
-                    session_id = str(getattr(session, "session_id", ""))
+                    session_id = str(_field(session, "session_id", "sessionId") or "")
                     if not session_id:
                         raise ConnectorError("ACP session/new returned no session id")
                     state.session_id = session_id
                     if state.policy_error is not None:
                         raise state.policy_error
+                    wanted = str(model or "").strip()
+                    selected = await _select_acp_model(
+                        connection, session, session_id, wanted,
+                        timeout=self.timeout, provider_id=self.provider_id, env=self.env,
+                    )
                     prompt_response = await _wait_for(
                         connection.prompt(
                             session_id=session_id,
@@ -716,12 +1189,27 @@ class ACPConnector:
                         self.timeout,
                         "ACP session/prompt",
                     )
+                    if state.provider_incident is not None:
+                        raise _provider_incident_error(state)
                     if state.policy_error is not None:
                         raise state.policy_error
-                    # Reaching here means the model produced a full turn without the
-                    # transport or CLI raising; the stop reason is informational.
-                    return {"ok": True, "stopReason": _stop_reason(prompt_response) or "end_turn"}
-            except (ConfigurationError, ConnectorError, PolicyError):
+                    if state.callback_error is not None:
+                        raise ConnectorError("ACP model response could not be collected") from state.callback_error
+                    stop_reason = _stop_reason(prompt_response)
+                    if stop_reason != "end_turn" or not "".join(state.text_chunks).strip():
+                        raise ConnectorError(
+                            "ACP model test did not produce a completed text response: " + stop_reason
+                        )
+                    result = {"ok": True, "stopReason": stop_reason}
+                    if selected:
+                        result["model"] = selected
+                        if wanted and selected != wanted:
+                            result["requestedModel"] = wanted
+                    return result
+            except (AuthenticationError, ConfigurationError, ConnectorError, PolicyError) as exc:
+                failure = _acp_provider_request_failure(exc, provider_id=self.provider_id)
+                if failure is not None:
+                    raise failure from exc
                 raise
             except FileNotFoundError as exc:
                 raise ConnectorError(
@@ -735,6 +1223,9 @@ class ACPConnector:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                failure = _acp_provider_request_failure(exc, provider_id=self.provider_id)
+                if failure is not None:
+                    raise failure from exc
                 detail = str(exc) or type(exc).__name__
                 stderr_tail = _read_capture_tail(stderr_capture)
                 if stderr_tail:
@@ -766,15 +1257,65 @@ class _ACPClientState:
     reasoning_truncated: bool = False
     policy_error: PolicyError | None = None
     callback_error: Exception | None = None
+    provider_incident: _ProviderIncident | None = None
     abort_event: asyncio.Event = field(default_factory=asyncio.Event)
     timeline_events: int = 0
     tool_activity_ids: dict[str, str] = field(default_factory=dict)
     tool_statuses: dict[str, str] = field(default_factory=dict)
     tool_kinds: dict[str, str] = field(default_factory=dict)
     tool_targets: dict[str, str] = field(default_factory=dict)
+    native_tool_targets: dict[str, str] = field(default_factory=dict)
+    working_file_activity_ids: dict[str, str] = field(default_factory=dict)
     tool_argument_names: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    tool_input_identities: dict[str, str] = field(default_factory=dict)
     plan_activity_ids: dict[str, str] = field(default_factory=dict)
     plan_statuses: dict[str, str] = field(default_factory=dict)
+
+
+def _provider_incident_from_exception(
+    error: BaseException,
+) -> _ProviderIncident | None:
+    if isinstance(error, ProviderIncidentError):
+        return _ProviderIncident(error.incident_code, str(error))
+    pending: BaseException | None = error
+    seen: set[int] = set()
+    parts: list[str] = []
+    while pending is not None and id(pending) not in seen and len(parts) < 4:
+        seen.add(id(pending))
+        parts.append(str(pending))
+        pending = pending.__cause__ or pending.__context__
+    rendered = " ".join(parts)
+    incident = _classify_provider_incident(rendered)
+    if incident is not None:
+        return incident
+    if "ACP session/prompt timed out" in rendered:
+        return _ProviderIncident(
+            "provider-turn-timeout",
+            "The model provider did not complete the turn before its transport deadline.",
+        )
+    return None
+
+
+def _provider_incident_error(
+    state: _ACPClientState,
+    incident: _ProviderIncident | None = None,
+) -> ProviderIncidentError:
+    selected = incident or state.provider_incident or _ProviderIncident(
+        "provider-transport-error",
+        "The model provider interrupted the turn before completion.",
+    )
+    in_flight: list[str] = []
+    for key, status in state.tool_statuses.items():
+        if status in {"completed", "failed", "cancelled"}:
+            continue
+        target = state.tool_targets.get(key) or state.tool_kinds.get(key) or "tool-call"
+        in_flight.append(target)
+    return ProviderIncidentError(
+        selected.message,
+        incident_code=selected.code,
+        partial_text="".join(state.text_chunks),
+        in_flight_tools=tuple(in_flight),
+    )
 
 
 async def _forward_reasoning(
@@ -829,7 +1370,7 @@ def _make_client(sdk: _ACPSDK, state: _ACPClientState) -> Any:
             )
             if validation_error:
                 state.policy_error = PolicyError(
-                    "ACP agent sent an invalid permission request; ReplayLab cancelled it "
+                    "ACP agent sent an invalid permission request; Bread cancelled it "
                     f"(fail-closed: {validation_error})"
                 )
                 state.abort_event.set()
@@ -846,12 +1387,16 @@ def _make_client(sdk: _ACPSDK, state: _ACPClientState) -> Any:
                 return _permission_allowed(sdk, allowed_option)
 
             state.permission_denials += 1
-            if state.permission_denials > _MAX_ACP_PERMISSION_DENIALS:
-                state.policy_error = PolicyError(
-                    "ACP agent exceeded the bounded permission-denial limit; "
-                    "ReplayLab cancelled the turn (fail-closed)"
-                )
-                state.abort_event.set()
+            # The protocol's denial carries no message, so the *reason* has to be
+            # visible somewhere else: the log names the label that did not resolve.
+            # A vendor's relabelled tool must not turn ordinary denials into a
+            # task-wide cancellation; other granted calls remain available.
+            denied_label = str(_field(tool_call, "title") or _field(tool_call, "name")
+                               or _field(tool_call, "kind") or "")[:160]
+            get_logger().warning(
+                "ACP permission denied (%d): %r is not a granted Bread tool label; "
+                "other authorized calls remain available",
+                state.permission_denials, denied_label)
             # Every ACP provider expects a permission response. An otherwise
             # well-formed request outside the task grant is denied without
             # aborting the connector, so the child can continue through an
@@ -934,14 +1479,17 @@ def _make_client(sdk: _ACPSDK, state: _ACPClientState) -> Any:
                     return {
                         "outcome": {
                             "outcome": "skipped",
-                            "reason": "ReplayLab does not provide interactive answers during this automated turn.",
+                            "reason": "Bread does not provide interactive answers during this automated turn.",
                         }
                     }
                 if method == "cursor/create_plan":
                     return {
                         "outcome": {
-                            "outcome": "rejected",
-                            "reason": "ReplayLab does not approve external execution plans; continue with read-only analysis.",
+                            # A plan is the provider's proposed reasoning, not an
+                            # effect grant. Accepting it lets Cursor continue the
+                            # user's turn; each later tool call still goes through
+                            # the task-scoped MCP and permission boundaries.
+                            "outcome": "accepted",
                         }
                     }
             raise _terminal_policy_violation(
@@ -969,6 +1517,14 @@ def _make_client(sdk: _ACPSDK, state: _ACPClientState) -> Any:
             if state.session_id and session_id != state.session_id:
                 return
             update_kind = _update_kind(update)
+            if update_kind in _ACP_PROVIDER_ERROR_UPDATE_KINDS:
+                incident = _classify_provider_incident(
+                    _extract_provider_error_text(update), explicit_error=True
+                )
+                if incident is not None and state.provider_incident is None:
+                    state.provider_incident = incident
+                state.abort_event.set()
+                return
             if update_kind == "agent_thought_chunk":
                 text = _extract_text(update)
                 if not text or state.callback_error is not None or state.reasoning_truncated:
@@ -1007,6 +1563,13 @@ def _make_client(sdk: _ACPSDK, state: _ACPClientState) -> Any:
                 return
             text = _extract_text(update)
             if not text or state.callback_error is not None:
+                return
+            text, incident = _split_provider_incident(text)
+            if incident is not None:
+                if state.provider_incident is None:
+                    state.provider_incident = incident
+                state.abort_event.set()
+            if not text:
                 return
             try:
                 state.text_chars, state.text_bytes = checked_response_size(
@@ -1084,8 +1647,8 @@ def _cursor_question_as_elicitation(
 
 def _policy_denial(state: _ACPClientState, action: str) -> PolicyError:
     error = PolicyError(
-        f"ACP Agent attempted to {action}; ReplayLab denied it. Continue with the "
-        "task-scoped ReplayLab MCP tools instead."
+        f"ACP Agent attempted to {action}; this ACP client did not authorize "
+        "that native operation."
     )
     _record_policy_denial(state, action)
     if state.policy_error is not None:
@@ -1097,7 +1660,7 @@ def _terminal_policy_violation(state: _ACPClientState, action: str) -> PolicyErr
     """Abort on an unknown protocol capability, not on a recoverable denial."""
 
     error = PolicyError(
-        f"ACP Agent attempted to {action}; ReplayLab cancelled the turn "
+        f"ACP Agent attempted to {action}; Bread cancelled the turn "
         "(fail-closed: unknown protocol capability)"
     )
     state.permission_denials += 1
@@ -1108,13 +1671,15 @@ def _terminal_policy_violation(state: _ACPClientState, action: str) -> PolicyErr
 
 
 def _record_policy_denial(state: _ACPClientState, action: str) -> None:
+    """Record a denied ordinary call without cancelling the Agent's task.
+
+    Malformed scoped requests and unknown protocol capabilities have their own
+    terminal handlers. Repeated attempts at an unavailable native tool do not
+    revoke unrelated, already authorized Bread operations.
+    """
+
     state.permission_denials += 1
-    if state.permission_denials > _MAX_ACP_PERMISSION_DENIALS:
-        state.policy_error = PolicyError(
-            f"ACP Agent repeatedly attempted to {action}; ReplayLab cancelled the turn "
-            "after the bounded denial limit (fail-closed)"
-        )
-        state.abort_event.set()
+    get_logger().debug("ACP native call denied (%d): %s", state.permission_denials, action)
 
 
 def _permission_denied(sdk: _ACPSDK) -> Any:
@@ -1158,34 +1723,36 @@ async def _new_session(
 ) -> Any:
     """``session/new`` with an optional vendor ``_meta`` block.
 
-    SDK revisions spell the extra field differently (``field_meta`` / ``meta`` /
-    ``_meta``), so the variants are tried in order and a plain request is the
-    last resort.  Without *meta* this is a single plain request.
+    Current SDKs serialize their **kwargs directly under wire ``_meta``.
+    Older explicit parameter spellings are selected locally from the signature.
+    Never resend session/new because a provider returned a validation error:
+    the first request may already have created a session and started its MCPs.
     """
 
-    attempts: list[dict[str, Any]] = [{}]
+    extra: dict[str, Any] = {}
     if meta:
         payload = dict(meta)
-        attempts = [{"field_meta": payload}, {"meta": payload}, {"_meta": payload}, {}]
-    last_error: Exception | None = None
-    for extra in attempts:
         try:
-            return await _wait_for(
-                connection.new_session(cwd=cwd, mcp_servers=mcp_servers, **extra),
-                timeout,
-                "ACP session/new",
-            )
-        except TypeError as exc:  # unknown keyword on this SDK revision
-            last_error = exc
-            continue
-        except Exception as exc:
-            message = str(exc).lower()
-            if extra and ("validation" in message or "extra" in message or "unexpected" in message):
-                last_error = exc
-                continue
-            raise
-    assert last_error is not None
-    raise last_error
+            parameters = inspect.signature(connection.new_session).parameters
+        except (TypeError, ValueError) as exc:
+            raise ConnectorError("cannot determine the ACP session metadata interface") from exc
+        for name in ("field_meta", "meta", "_meta"):
+            parameter = parameters.get(name)
+            if parameter is not None and parameter.kind != inspect.Parameter.VAR_KEYWORD:
+                extra = {name: payload}
+                break
+        else:
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+                extra = payload
+            else:
+                raise ProviderCapabilityError(
+                    "The ACP SDK cannot pass the required session metadata.",
+                    error_code="session-metadata-unsupported", capability="session-metadata",
+                )
+    return await _wait_for(
+        connection.new_session(cwd=cwd, mcp_servers=mcp_servers, **extra),
+        timeout, "ACP session/new",
+    )
 
 
 # Tool-call kinds that can never be a ReplayLab MCP call: shell commands and
@@ -1196,11 +1763,10 @@ _NON_MCP_TOOL_KINDS = frozenset({"execute", "edit", "delete", "move"})
 def _tool_from_label(label: Any, allowed_tools: frozenset[str]) -> str | None:
     """Map a permission request's ``name``/``title`` onto one allowed tool.
 
-    Only exact, vendor-known spellings match: ``mcp__ReplayLab__<tool>``
-    (Claude Code), ``<tool> (ReplayLab MCP Server)`` (Gemini CLI family),
-    ``ReplayLab__<tool>`` / ``ReplayLab:<tool>`` and the bare tool name.  No
-    substring matching: a shell command that merely mentions a tool name does
-    not qualify.
+    Only exact, vendor-known spellings match: ``mcp__Bread__<tool>``
+    (Claude Code), ``<tool> (Bread MCP Server)`` (Gemini CLI family),
+    ``Bread__<tool>`` / ``Bread:<tool>`` and the bare tool name. No substring
+    matching: a shell command that merely mentions a tool name does not qualify.
     """
 
     if type(label) is not str:
@@ -1208,7 +1774,7 @@ def _tool_from_label(label: Any, allowed_tools: frozenset[str]) -> str | None:
     text = label.strip().casefold()
     if not text or len(text) > 512:
         return None
-    server = REPLAYLAB_MCP_SERVER_NAME.casefold()
+    server = BREAD_MCP_SERVER_NAME.casefold()
     for tool in allowed_tools:
         lowered = tool.casefold()
         if text in (
@@ -1225,6 +1791,38 @@ def _tool_from_label(label: Any, allowed_tools: frozenset[str]) -> str | None:
             f"{lowered} ({server})",
         ):
             return tool
+    return None
+
+
+def _user_mcp_server_for_permission(tool_call: Any, servers: frozenset[str]) -> str | None:
+    """Return the user-configured MCP server a permission request names, else ``None``.
+
+    Servers added in Settings > AI are the user's own grant. Their tools are
+    approved the same way the ReplayLab route's are, and only while the request
+    names one of the servers the user enabled for this session; file, terminal
+    and other non-MCP tool kinds stay denied.
+    """
+
+    if not servers:
+        return None
+    raw_input = _field(tool_call, "raw_input", "rawInput")
+    if isinstance(raw_input, Mapping):
+        server = raw_input.get("server")
+        if type(server) is str:
+            return server if server in servers else None
+    kind = _enum_value(_field(tool_call, "kind")).replace("-", "_").lower()
+    if kind in _NON_MCP_TOOL_KINDS:
+        return None
+    for label in (
+        _field(tool_call, "name", "tool_name", "toolName"),
+        _field(tool_call, "title"),
+    ):
+        text = str(label or "").strip()
+        if not text:
+            continue
+        for server in servers:
+            if text.startswith("mcp__%s__" % server) or text.endswith("(%s)" % server):
+                return server
     return None
 
 
@@ -1246,7 +1844,7 @@ def _replaylab_tool_for_permission(tool_call: Any, allowed_tools: frozenset[str]
         server = raw_input.get("server")
         tool = raw_input.get("tool")
         if type(server) is str and type(tool) is str:
-            if server == REPLAYLAB_MCP_SERVER_NAME and tool in allowed_tools:
+            if server == BREAD_MCP_SERVER_NAME and tool in allowed_tools:
                 return tool
             return None
     kind = _enum_value(_field(tool_call, "kind")).replace("-", "_").lower()
@@ -1524,13 +2122,12 @@ def _argument_names(update: Any) -> tuple[str, ...]:
 
 
 def _safe_tool_name_from_title(update: Any, allowed_tools: frozenset[str]) -> str:
-    """Recognize only exact, configured ReplayLab tool spellings (title or name).
+    """Recognize only exact, configured Bread MCP tool spellings (title or name).
 
-    Besides the historic ``ReplayLab:<tool>`` / ``Mcp(ReplayLab:<tool>)``
-    forms this accepts the vendor spellings ``_tool_from_label`` knows
-    (``mcp__ReplayLab__<tool>`` from Claude Code, ``<tool> (ReplayLab MCP
-    Server)`` from Gemini CLI), so the Agent Monitor shows the real tool name
-    instead of "tool activity".
+    Accepts ``Bread:<tool>`` / ``Mcp(Bread:<tool>)`` plus the vendor spellings
+    ``_tool_from_label`` knows (``mcp__Bread__<tool>`` from Claude Code,
+    ``<tool> (Bread MCP Server)`` from Gemini CLI), so the Agent Monitor shows
+    the real tool name instead of "tool activity".
     """
 
     safe = frozenset(
@@ -1542,10 +2139,10 @@ def _safe_tool_name_from_title(update: Any, allowed_tools: frozenset[str]) -> st
         for name in sorted(safe):
             if title in {
                 name,
-                f"ReplayLab.{name}",
-                f"ReplayLab:{name}",
-                f"Mcp(ReplayLab:{name})",
-                f"MCP(ReplayLab:{name})",
+                f"Bread.{name}",
+                f"Bread:{name}",
+                f"Mcp(Bread:{name})",
+                f"MCP(Bread:{name})",
             }:
                 return name
     for label in (_field(update, "name", "tool_name", "toolName"), title):
@@ -1572,6 +2169,25 @@ def _safe_tool_kind(value: Any, fallback: str = "other") -> str:
     }:
         return kind
     return fallback
+
+
+def _safe_native_tool_name(update: Any, provider_id: str) -> str:
+    """Cursor's technical tool identifier is a provider claim, not a grant."""
+    raw = _field(update, "raw_input", "rawInput")
+    if provider_id != "cursor-acp" or not isinstance(raw, Mapping):
+        return ""
+    return _safe_public_name(raw.get("_toolName"))
+
+
+def _native_tool_kind(name: str, kind: str) -> str:
+    if kind != "other":
+        return kind
+    return {
+        "read": "read", "readfile": "read", "read_file": "read",
+        "write": "edit", "writefile": "edit", "write_file": "edit",
+        "edit": "edit", "editfile": "edit", "strreplace": "edit",
+        "shell": "execute", "exec": "execute", "bash": "execute", "execute": "execute",
+    }.get(name.casefold(), kind)
 
 
 def _generic_tool_title(kind: str, status: str) -> str:
@@ -1666,6 +2282,13 @@ async def _handle_public_timeline_update(
         target_name = _safe_tool_name_from_title(update, state.allowed_tools)
         if not target_name:
             target_name = state.tool_targets.get(key, "")
+        if target_name and status == "completed":
+            from ..tool_output import mcp_result_failed
+            if mcp_result_failed(_field(update, "raw_output", "rawOutput")):
+                status = "failed"
+        native_name = (_safe_native_tool_name(update, state.provider_id)
+                       or state.native_tool_targets.get(key, "")) if not target_name else ""
+        kind = _native_tool_kind(native_name, kind)
         names = _argument_names(update)
         if not names:
             names = state.tool_argument_names.get(key, ())
@@ -1673,8 +2296,16 @@ async def _handle_public_timeline_update(
         state.tool_kinds[key] = kind
         if target_name:
             state.tool_targets[key] = target_name
+        if native_name:
+            state.native_tool_targets[key] = native_name
         if names:
             state.tool_argument_names[key] = names
+        # Keep a digest only. Provider-native commands/files may not produce a
+        # Bread receipt, but distinct real work must still advance self-review.
+        raw_input = _field(update, "raw_input", "rawInput")
+        if not target_name and raw_input is not None:
+            from ..task_review import work_identity
+            state.tool_input_identities[key] = work_identity(raw_input)
 
         lifecycle = (
             "completed"
@@ -1708,7 +2339,16 @@ async def _handle_public_timeline_update(
                 status=status,
                 lifecycle=lifecycle,
             )
+            if native_name:
+                event["activityTarget"] = native_name
+        event["toolKind"] = kind
         event["argumentNames"] = list(names)
+        if not target_name and lifecycle == "completed":
+            from ..task_review import work_identity
+            raw_output = _field(update, "raw_output", "rawOutput")
+            content = _field(update, "content")
+            event["workIdentity"] = work_identity({"input": state.tool_input_identities.get(key),
+                                                   "output": raw_output, "content": content, "status": status})
 
     if event is None:
         return
@@ -1739,6 +2379,23 @@ def _extract_text(update: Any) -> str:
         value = getattr(content, "text", "")
         return value if isinstance(value, str) else ""
     return ""
+
+
+def _extract_provider_error_text(update: Any) -> str:
+    """Read a bounded vendor error notification without exposing its payload."""
+
+    text = _extract_text(update)
+    if text:
+        return text[:16384]
+    for name in ("message", "error", "detail", "reason"):
+        value = _field(update, name)
+        if isinstance(value, str) and value.strip():
+            return value[:16384]
+        if isinstance(value, Mapping):
+            nested = _field(value, "message", "detail", "reason")
+            if isinstance(nested, str) and nested.strip():
+                return nested[:16384]
+    return "provider error notification"
 
 
 def _stop_reason(response: Any) -> str:
@@ -1842,3 +2499,10 @@ async def _wait_for(awaitable: Any, timeout: float, stage: str) -> Any:
         return await asyncio.wait_for(awaitable, timeout=timeout)
     except asyncio.TimeoutError as exc:
         raise ConnectorError(f"{stage} timed out") from exc
+    except Exception as exc:
+        # ACP reserves this error for authentication. Custom JSON-RPC servers
+        # also use -32000 generically, so require the protocol diagnostic too.
+        if (getattr(exc, "code", None) == -32000
+                and str(exc).strip().casefold() in {"authentication required", "auth required"}):
+            raise AuthenticationError(f"{stage}: the ACP Agent requires sign-in") from exc
+        raise

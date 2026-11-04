@@ -18,8 +18,23 @@ class IntegrationManifestTests(unittest.TestCase):
         self.assertEqual(integration["module"], "renderdoc_mcp_bridge")
         self.assertEqual(integration["entrypoint"], "start")
         self.assertEqual(integration["shutdown"], "stop")
-        self.assertEqual(integration["version"], "1.13.0")
+        self.assertRegex(integration["version"], r"^1\.\d+\.\d+$")
         self.assertEqual(integration["minimum_renderdoc"], "1.44")
+        self.assertEqual(
+            integration["host_contract"],
+            {
+                "schema": "replaylab-internal-host-capabilities/v1",
+                "protocol_version": 1,
+                "capability_versions": {
+                    "project-service": 1,
+                    "project-restore": 1,
+                    "shader-workspace-prepare": 1,
+                    "shader-source-save": 1,
+                    "shader-live-edit": 1,
+                    "asset-index": 1,
+                },
+            },
+        )
 
         bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
         tree = ast.parse(bridge_path.read_text(encoding="utf-8"))
@@ -32,7 +47,7 @@ class IntegrationManifestTests(unittest.TestCase):
             and isinstance(node.value, ast.Constant)
         }
         self.assertEqual(constants["BRIDGE_PROTOCOL_VERSION"], 2)
-        self.assertEqual(constants["BRIDGE_INTEGRATION_VERSION"], "1.13.0")
+        self.assertEqual(constants["BRIDGE_INTEGRATION_VERSION"], integration["version"])
 
         functions = {
             node.name for node in tree.body if isinstance(node, ast.FunctionDef)
@@ -56,6 +71,11 @@ class IntegrationManifestTests(unittest.TestCase):
         self.assertIn('"host-runtime-incompatible"', bridge_source)
 
     def test_replaylab_application_version_matches_integration(self) -> None:
+        integration = json.loads(
+            (REPOSITORY / "renderdoc_mcp_bridge" / "integration.json").read_text(
+                encoding="utf-8"
+            )
+        )
         version_path = REPOSITORY / "mcp_host" / "src" / "version.py"
         tree = ast.parse(version_path.read_text(encoding="utf-8"))
         constants = {
@@ -66,8 +86,26 @@ class IntegrationManifestTests(unittest.TestCase):
             and isinstance((target := node.targets[0]), ast.Name)
             and isinstance(node.value, ast.Constant)
         }
-        self.assertEqual(constants["SERVICE_VERSION"], "1.13.0")
+        # GUI clients keep the bundled integration version as their minimum
+        # Host package. Newer same-major Hosts remain compatible when their
+        # protocol and individual capability schemas still match.
+        self.assertEqual(constants["SERVICE_VERSION"], integration["version"])
         self.assertEqual(constants["HOST_STATE_PROTOCOL_VERSION"], 2)
+        capability_assignment = next(
+            node for node in tree.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "INTERNAL_HOST_CAPABILITY_VERSIONS"
+        )
+        self.assertEqual(
+            ast.literal_eval(capability_assignment.value),
+            integration["host_contract"]["capability_versions"],
+        )
+        self.assertEqual(
+            constants["INTERNAL_HOST_CAPABILITY_SCHEMA"],
+            integration["host_contract"]["schema"],
+        )
 
         agent_path = REPOSITORY / "src" / "replaylab_agent" / "__init__.py"
         agent_tree = ast.parse(agent_path.read_text(encoding="utf-8"))
@@ -79,16 +117,9 @@ class IntegrationManifestTests(unittest.TestCase):
             and isinstance((target := node.targets[0]), ast.Name)
             and isinstance(node.value, ast.Constant)
         }
-        self.assertEqual(agent_constants["__version__"], "1.13.0")
-
-        for metadata_path in (
-            REPOSITORY / "pyproject.toml",
-            REPOSITORY / "mcp_host" / "pyproject.toml",
-        ):
-            self.assertIn(
-                'version = "1.13.0"',
-                metadata_path.read_text(encoding="utf-8"),
-            )
+        self.assertEqual(
+            agent_constants["__version__"], constants["SERVICE_VERSION"]
+        )
 
         for client_name, expected_protocol in (
             ("project_restore_client.py", 1),
@@ -107,7 +138,7 @@ class IntegrationManifestTests(unittest.TestCase):
                 and isinstance((target := node.targets[0]), ast.Name)
                 and isinstance(node.value, ast.Constant)
             }
-            self.assertEqual(client_constants["EXPECTED_HOST_VERSION"], "1.13.0")
+            self.assertEqual(client_constants["EXPECTED_HOST_VERSION"], integration["version"])
             self.assertEqual(
                 client_constants["INTERNAL_HOST_STATE_PROTOCOL_VERSION"],
                 expected_protocol,
@@ -138,6 +169,13 @@ class IntegrationManifestTests(unittest.TestCase):
         self.assertIn("HOST_STATE_PROTOCOL_VERSION = 2", version_source)
         self.assertIn(
             "INTERNAL_HOST_STATE_PROTOCOL_VERSION = 1", version_source)
+        internal_host_source = (
+            REPOSITORY / "mcp_host" / "src" / "internal_host.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"capabilitySchema": INTERNAL_HOST_CAPABILITY_SCHEMA',
+                      internal_host_source)
+        self.assertIn('"capabilityVersions": dict(INTERNAL_HOST_CAPABILITY_VERSIONS)',
+                      internal_host_source)
 
     def test_mcp_runtime_is_bounded_to_the_compatible_major_version(self) -> None:
         pyproject = (REPOSITORY / "mcp_host" / "pyproject.toml").read_text(

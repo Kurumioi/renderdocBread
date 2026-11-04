@@ -28,16 +28,29 @@ import zlib
 
 CATALOG_SCHEMA = "renderdoc-ultra-unpacked-asset-catalog/v1"
 CATALOG_VERSION = 1
-DATABASE_SCHEMA_VERSION = 1
+DATABASE_SCHEMA_VERSION = 2
 CATALOG_FILENAME = "asset-catalog-v1.sqlite3"
+CONTENT_MANIFEST_SCHEMA = "renderdoc-ultra-asset-content-manifest/v1"
+CONTENT_MANIFEST_FILENAME = "asset-content-manifest-v1.json"
 
 MAX_QUERY_RESULTS = 100
 MAX_QUERY_IDS = 100
 MAX_RELATIONSHIPS_PER_ASSET = 256
 MAX_INDEXED_REFERENCES_PER_ASSET = 256
 MAX_PARSE_BYTES = 16 * 1024 * 1024
-DEFAULT_MAX_FILES = 200_000
 HARD_MAX_FILES = 500_000
+DEFAULT_MAX_FILES = HARD_MAX_FILES
+# A path-only catalog row is cheap (no content read/hash), so a large unpacked
+# tree may legitimately contain more names than a headers/full scan should ever
+# admit. Keep the deep-scan bound unchanged and give names-only its own bound.
+DEFAULT_NAMES_ONLY_MAX_FILES = 1_000_000
+HARD_NAMES_ONLY_MAX_FILES = DEFAULT_NAMES_ONLY_MAX_FILES
+# ``max_files`` limits catalog rows. This independent bound limits the actual
+# directory walk, including directories and files that names-only deliberately
+# ignores. It prevents an accidentally selected build/output tree from turning
+# a cheap activation scan into an effectively unbounded walk.
+HARD_MAX_FILESYSTEM_ENTRIES = 2_000_000
+ENGINE_DETECTION_SAMPLE_FILES = 50_000
 DEFAULT_MAX_FILE_SIZE_MB = 4096
 HARD_MAX_FILE_SIZE_MB = 16_384
 HASH_CHUNK_BYTES = 4 * 1024 * 1024
@@ -100,6 +113,32 @@ _KIND_EXTENSIONS: dict[str, frozenset[str]] = {
     "metadata": frozenset({".meta", ".json", ".yaml", ".yml", ".xml"}),
 }
 _KNOWN_KINDS = frozenset((*_KIND_EXTENSIONS, "binary", "other"))
+# Bulk payloads: texture mips, audio, fonts, code, localisation, pipeline
+# caches. They are catalogued by name only -- nothing inside them describes a
+# material or a shader, and probing them fills the index with noise.
+_BULK_SUFFIXES = frozenset(
+    {
+        ".ubulk", ".uptnl", ".ufont", ".ttf", ".otf", ".pyc", ".py", ".dll", ".pdb", ".exe",
+        ".so", ".dylib", ".wav", ".ogg", ".mp3", ".mp4", ".webm", ".bk2", ".mov", ".bnk", ".wem",
+        ".ini", ".svg", ".res", ".locres", ".locmeta", ".upipelinecache", ".ushaderbytecode",
+        ".pdf", ".zip", ".7z", ".rar",
+    }
+)
+# Formats for which the catalog, a built-in engine reader, or a registered
+# asset-reader route has a concrete interpretation. A names-only activation
+# scan stores only these paths. Unknown/custom formats remain discoverable by
+# the direct bounded search tools and can be indexed by an explicit
+# headers/full scan; unrelated payload/cache files must not consume the shallow
+# catalog's row limit.
+_NAMES_ONLY_SUFFIXES = frozenset().union(*_KIND_EXTENSIONS.values(), {
+    ".bin", ".dat", ".bytes",
+    ".asset", ".assets", ".prefab", ".ress", ".sharedassets", ".resource",
+    ".pck", ".tscn", ".tres", ".gd", ".uproject", ".uplugin",
+    ".ushaderbytecode",
+})
+_NAMES_ONLY_FILENAMES = frozenset({
+    "globalgamemanagers", "level0", "project.godot",
+})
 _WINDOWS_REPARSE_POINT = 0x0400
 
 
@@ -107,12 +146,40 @@ class AssetCatalogError(RuntimeError):
     """A fail-closed unpacked-asset catalog error."""
 
 
+def _replace_with_retry(temporary: Path, path: Path, *, attempts: int = 12) -> None:
+    """Publish a catalog even while a reader still holds the old file open.
+
+    On Windows ``os.replace`` fails with a sharing violation (WinError 5/32) while
+    any process has the target open — and the catalog is read by every status and
+    retrieval call. A scan that walked 190k files must not be thrown away because a
+    status poll landed in the same millisecond, so retry briefly before giving up.
+    """
+
+    delay = 0.05
+    for attempt in range(attempts):
+        try:
+            os.replace(str(temporary), str(path))
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 1.8, 1.5)
+        except OSError as error:
+            if getattr(error, "winerror", None) not in (5, 32) or attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 1.8, 1.5)
+
+
 class AssetCatalogScanLimitError(AssetCatalogError):
     """A bounded scan stopped before publication and retained the old catalog."""
 
     def __init__(self, *, maximum_files: int, observed_files: int):
         super().__init__(
-            "asset root exceeds max_files; narrow the root or raise the admitted bound"
+            "asset root holds more than %d files (walked %d before stopping): raise max_files "
+            "for this call, or narrow the configured root to the cooked content"
+            % (maximum_files, observed_files)
         )
         self.maximum_files = maximum_files
         self.observed_files = observed_files
@@ -200,6 +267,15 @@ def _format_name(path: PurePosixPath) -> str:
     return suffix or "extensionless"
 
 
+def _names_only_admitted(path: PurePosixPath) -> bool:
+    """Whether a shallow catalog can do useful work with this asset name."""
+
+    return (
+        path.suffix.casefold() in _NAMES_ONLY_SUFFIXES
+        or path.name.casefold() in _NAMES_ONLY_FILENAMES
+    )
+
+
 def _hash_regular_file(path: Path, expected_size: int) -> str:
     digest = hashlib.sha256()
     total = 0
@@ -213,6 +289,112 @@ def _hash_regular_file(path: Path, expected_size: int) -> str:
     if total != expected_size:
         raise AssetCatalogError("asset changed size while it was hashed: %s" % path)
     return digest.hexdigest()
+
+
+_WINDOWS_CHANGE_API: tuple[Any, ...] | None = None
+
+
+def _file_change_token(path: Path, stat: os.stat_result) -> int:
+    """OS content-change token that cannot be restored with ``utime``."""
+
+    if os.name != "nt":
+        return int(stat.st_ctime_ns)
+    try:
+        global _WINDOWS_CHANGE_API
+        import ctypes
+        from ctypes import wintypes
+
+        if _WINDOWS_CHANGE_API is None:
+            class FileBasicInfo(ctypes.Structure):
+                _fields_ = [
+                    ("CreationTime", ctypes.c_longlong),
+                    ("LastAccessTime", ctypes.c_longlong),
+                    ("LastWriteTime", ctypes.c_longlong),
+                    ("ChangeTime", ctypes.c_longlong),
+                    ("FileAttributes", wintypes.DWORD),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            create_file = kernel32.CreateFileW
+            create_file.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            ]
+            create_file.restype = wintypes.HANDLE
+            get_info = kernel32.GetFileInformationByHandleEx
+            get_info.argtypes = [
+                wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+            ]
+            get_info.restype = wintypes.BOOL
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+            _WINDOWS_CHANGE_API = (
+                create_file, get_info, close_handle, FileBasicInfo,
+                ctypes.c_void_p(-1).value,
+            )
+        create_file, get_info, close_handle, FileBasicInfo, invalid = _WINDOWS_CHANGE_API
+        handle = create_file(
+            str(path), 0x0080, 0x00000001 | 0x00000002 | 0x00000004,
+            None, 3, 0x00000080, None,
+        )
+        if handle in (None, invalid):
+            raise OSError(ctypes.get_last_error(), "CreateFileW failed")
+        try:
+            info = FileBasicInfo()
+            if not get_info(handle, 0, ctypes.byref(info), ctypes.sizeof(info)):
+                raise OSError(ctypes.get_last_error(), "FileBasicInfo failed")
+            return int(info.ChangeTime)
+        finally:
+            close_handle(handle)
+    except (AttributeError, OSError, ValueError):
+        return int(stat.st_ctime_ns)
+
+
+def _content_manifest_file_sha256(path: Path) -> str:
+    """Hash one dirty manifest member; split out for regression instrumentation."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(HASH_CHUNK_BYTES), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _content_manifest_document(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a catalog-owner manifest before it can seed incremental hashes."""
+
+    document = dict(value)
+    supplied = str(document.pop("documentSha256", "") or "").lower()
+    if not _SHA256_RE.fullmatch(supplied) or supplied != _canonical_sha256(document):
+        raise AssetCatalogError("asset content manifest document seal is invalid")
+    if document.get("schema") != CONTENT_MANIFEST_SCHEMA:
+        raise AssetCatalogError("asset content manifest schema is unsupported")
+    files = document.get("files")
+    if not isinstance(files, list) or len(files) > HARD_MAX_FILES:
+        raise AssetCatalogError("asset content manifest file set is invalid")
+    rows: list[dict[str, Any]] = []
+    for item in files:
+        if not isinstance(item, Mapping):
+            raise AssetCatalogError("asset content manifest row is invalid")
+        relative = str(item.get("relativePath") or "")
+        digest = str(item.get("contentSha256") or "").lower()
+        size = item.get("size")
+        if (
+            not relative or len(relative) > 4096 or "\x00" in relative
+            or any(part in {"", ".", ".."} for part in relative.split("/"))
+            or not isinstance(size, int) or isinstance(size, bool) or size < 0
+            or not _SHA256_RE.fullmatch(digest)
+        ):
+            raise AssetCatalogError("asset content manifest row fields are invalid")
+        rows.append({
+            "relativePath": relative,
+            "size": size,
+            "contentSha256": digest,
+        })
+    if _canonical_sha256(rows) != document.get("contentRootSha256"):
+        raise AssetCatalogError("asset content manifest Merkle root is invalid")
+    return {**document, "documentSha256": supplied}
 
 
 def _safe_reference(source_relative: str, raw_reference: str) -> str:
@@ -697,22 +879,68 @@ PARSER_REVISION = 3
 
 
 MAX_IMAGE_FINGERPRINT_BYTES = 2 * 1024 * 1024
+# An explicitly selected reader preview can be a normal 4K game texture. Keep
+# this allowance separate from the cheap generic directory-indexing budget.
+MAX_READER_PREVIEW_BYTES = 80 * 1024 * 1024
+MAX_PREVIEW_INPUT_BYTES = 256 * 1024 * 1024
 
 
-def _image_fingerprint(data: bytes, suffix: str) -> dict[str, Any]:
+def _preview_input_identity(root: Path, files: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Verify the decoder's complete, caller-attested input closure by bytes."""
+    if not isinstance(files, (list, tuple)) or not 1 <= len(files) <= 32:
+        raise AssetCatalogError("texture preview requires a bounded sourceFiles closure")
+    checked, seen, total = [], set(), 0
+    for item in files:
+        relative = str(item.get("relativePath", "")).replace("\\", "/")
+        digest = str(item.get("sha256", ""))
+        if (relative in seen or not relative or any(part in {"", ".", ".."} for part in relative.split("/"))
+                or not _SHA256_RE.fullmatch(digest)):
+            raise AssetCatalogError("texture preview source identity is invalid")
+        path = root
+        for part in relative.split("/"):
+            path = path / part
+            if _is_redirected(path):
+                raise AssetCatalogError("texture preview source is redirected")
+        if not _within(root, path.resolve()) or not path.is_file():
+            raise AssetCatalogError("texture preview source is unavailable")
+        total += path.stat().st_size
+        if total > MAX_PREVIEW_INPUT_BYTES:
+            raise AssetCatalogError("texture preview source closure exceeds its byte bound")
+        actual = _hash_regular_file(path, path.stat().st_size)
+        if actual != digest:
+            raise AssetCatalogError("texture preview source content changed: %s" % relative)
+        checked.append({"relativePath": relative, "sha256": digest, "size": path.stat().st_size})
+        seen.add(relative)
+    return checked
+
+
+def _preview_bytes(path: Path, digest: str) -> bytes:
+    if (not _SHA256_RE.fullmatch(digest) or not path.is_file()
+            or any(_is_redirected(parent) for parent in (path, *path.parents))):
+        raise AssetCatalogError("texture preview output identity is invalid")
+    if path.stat().st_size > MAX_READER_PREVIEW_BYTES:
+        raise AssetCatalogError("texture preview exceeds the admitted image byte bound")
+    data = path.read_bytes()
+    if len(data) > MAX_READER_PREVIEW_BYTES or hashlib.sha256(data).hexdigest() != digest:
+        raise AssetCatalogError("texture preview output content changed")
+    return data
+
+
+def _image_fingerprint(data: bytes, suffix: str, *, reader_preview: bool = False) -> dict[str, Any]:
     """Thumbnail fingerprint for a plain image file (PNG/DDS), bounded."""
 
     from .symbols.imaging import ImageDecodeError, decode_dds, decode_png, fingerprint
 
-    if len(data) > MAX_IMAGE_FINGERPRINT_BYTES:
-        return {"available": False, "reason": "image exceeds the %d-byte fingerprint bound" % MAX_IMAGE_FINGERPRINT_BYTES}
+    byte_bound = MAX_READER_PREVIEW_BYTES if reader_preview else MAX_IMAGE_FINGERPRINT_BYTES
+    if len(data) > byte_bound:
+        return {"available": False, "reason": "image exceeds the %d-byte fingerprint bound" % byte_bound}
     try:
         if suffix == ".png":
             rgba, width, height = decode_png(data)
             fmt = "PNG"
         else:
             rgba, width, height, fmt = decode_dds(data)
-        if width * height > 1024 * 1024:
+        if not reader_preview and width * height > 1024 * 1024:
             return {"available": False, "reason": "image is larger than 1M pixels; fingerprint skipped"}
         result = fingerprint(rgba, width, height)
         result.update({"available": True, "pixelFormat": fmt, "sizeX": width, "sizeY": height})
@@ -727,7 +955,7 @@ def _generic_probe(relative: str, data: bytes, engine_context: Any) -> tuple[dic
     metadata = {"parser": "generic-content-probe/v1", "engine": getattr(engine_context, "engine", "unknown")}
     # descriptors (materials, configs) are small; large blobs are geometry or
     # animation whose floats would only add noise to the value index
-    metadata.update(probe(data, relative, numeric=len(data) <= 1024 * 1024))
+    metadata.update(probe(data, relative, numeric=_numeric_probe_admitted(relative, data)))
     stem_index = getattr(engine_context, "stem_index", None) or {}
     references = mention_references(metadata.get("strings") or [], metadata.get("pathReferences") or [],
                                     stem_index, PurePosixPath(relative).stem) if stem_index else []
@@ -796,16 +1024,95 @@ def _asset_identity(relative: str, content_sha256: str, size: int, modified_ns: 
     return "asset-v1-" + _canonical_sha256(material)
 
 
+# ---------------------------------------------------------------------------
+# Storage: one live SQLite index, updated in place.
+#
+# The catalog is an index of the unpacked tree, not a copy of it: every row is
+# a path plus its fingerprint (size, mtime, content hash) and the small parsed
+# summary a reviewer needs. A scan walks the tree and touches only the rows
+# whose file changed; rows whose file disappeared are dropped once the walk is
+# complete. Nothing is rewritten wholesale, and a reader never has to re-hash
+# the whole catalog: every row carries its own digest, verified when the row
+# is delivered, and the catalog identity is the XOR of those digests.
+# ---------------------------------------------------------------------------
+
+_ASSET_COLUMNS = (
+    "asset_id, relative_path, name, kind, format, size, modified_ns, content_sha256, "
+    "hash_status, parse_status, metadata_json, row_sha256"
+)
+_ASSET_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS assets (
+    asset_id TEXT PRIMARY KEY,
+    relative_path TEXT NOT NULL UNIQUE,
+    folded_path TEXT NOT NULL,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    format TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    modified_ns INTEGER NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    hash_status TEXT NOT NULL,
+    parse_status TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    declared_guid TEXT NOT NULL DEFAULT '',
+    class_name TEXT NOT NULL DEFAULT '',
+    parser_revision INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER NOT NULL DEFAULT 0,
+    row_sha256 TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS assets_kind_idx ON assets(kind, format);
+CREATE INDEX IF NOT EXISTS assets_hash_idx ON assets(content_sha256);
+CREATE INDEX IF NOT EXISTS assets_folded_idx ON assets(folded_path);
+CREATE INDEX IF NOT EXISTS assets_guid_idx ON assets(declared_guid);
+CREATE INDEX IF NOT EXISTS assets_generation_idx ON assets(generation);
+CREATE TABLE IF NOT EXISTS relationships (
+    source_asset_id TEXT NOT NULL REFERENCES assets(asset_id) ON DELETE CASCADE,
+    relation TEXT NOT NULL,
+    target_asset_id TEXT REFERENCES assets(asset_id) ON DELETE SET NULL,
+    target_path TEXT NOT NULL,
+    target_guid TEXT NOT NULL,
+    target_folded TEXT NOT NULL DEFAULT '',
+    evidence_kind TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    verified INTEGER NOT NULL,
+    evidence_json TEXT NOT NULL,
+    UNIQUE(source_asset_id, relation, target_asset_id, target_path, target_guid, evidence_kind)
+);
+CREATE INDEX IF NOT EXISTS relationships_source_idx ON relationships(source_asset_id);
+CREATE INDEX IF NOT EXISTS relationships_target_idx ON relationships(target_asset_id);
+CREATE INDEX IF NOT EXISTS relationships_kind_idx ON relationships(evidence_kind);
+CREATE TABLE IF NOT EXISTS asset_values (
+    value_key TEXT NOT NULL, asset_id TEXT NOT NULL,
+    PRIMARY KEY(value_key, asset_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS asset_values_asset_idx ON asset_values(asset_id);
+CREATE TABLE IF NOT EXISTS asset_thumbnails (
+    asset_id TEXT PRIMARY KEY, v0 INTEGER, v1 INTEGER, v2 INTEGER, v3 INTEGER,
+    v4 INTEGER, v5 INTEGER, v6 INTEGER, v7 INTEGER, mean_r INTEGER, mean_g INTEGER, mean_b INTEGER,
+    width INTEGER, height INTEGER, flat INTEGER, pixel_format TEXT
+);
+"""
+_TEMPORARY_CATALOG_MAX_AGE_SECONDS = 6 * 3600
+MAX_NUMERIC_VALUES_PER_ASSET = 256
+MAX_NUMERIC_RUNS_PER_ASSET = 64
+
+
 def _database_connection(path: Path, *, read_only: bool) -> sqlite3.Connection:
-    connection = (
-        sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
-        if read_only
-        else sqlite3.connect(str(path))
-    )
+    if read_only:
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    else:
+        connection = sqlite3.connect(str(path), isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 15000")
     if read_only:
         connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA temp_store = MEMORY")
+    else:
+        # Readers (status polls, retrieval) keep working while a scan writes.
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
         connection.execute("PRAGMA temp_store = MEMORY")
     return connection
 
@@ -829,64 +1136,77 @@ def _validate_schema(connection: sqlite3.Connection) -> dict[str, str]:
     return metadata
 
 
-def _validate_catalog_identity(
-    connection: sqlite3.Connection, metadata: Mapping[str, str]
-) -> None:
-    """Recompute the embedded manifest hash from read-only SQLite contents."""
+def _row_digest(item: Mapping[str, Any]) -> str:
+    """The per-row manifest: what a reader is promised about one asset."""
 
-    assets = [
+    return _canonical_sha256(
         {
-            "assetId": row["asset_id"],
-            "relativePath": row["relative_path"],
-            "kind": row["kind"],
-            "format": row["format"],
-            "size": int(row["size"]),
-            "contentSha256": row["content_sha256"],
-            "hashStatus": row["hash_status"],
-            "parseStatus": row["parse_status"],
-            "metadata": json.loads(row["metadata_json"]),
+            "assetId": item["assetId"],
+            "relativePath": item["relativePath"],
+            "kind": item["kind"],
+            "format": item["format"],
+            "size": int(item["size"]),
+            "contentSha256": item["contentSha256"],
+            "hashStatus": item["hashStatus"],
+            "parseStatus": item["parseStatus"],
+            "metadata": item["metadata"],
         }
-        for row in connection.execute(
-            "SELECT asset_id, relative_path, kind, format, size, content_sha256, "
-            "hash_status, parse_status, metadata_json FROM assets"
-        )
-    ]
-    assets.sort(key=lambda item: str(item["relativePath"]).casefold())
-    relationships = [
-        {
-            "sourceAssetId": row["source_asset_id"],
-            "relation": row["relation"],
-            "targetAssetId": row["target_asset_id"],
-            "targetPath": row["target_path"],
-            "targetGuid": row["target_guid"],
-            "evidenceKind": row["evidence_kind"],
-            "confidence": float(row["confidence"]),
-            "verified": bool(row["verified"]),
-            "evidence": json.loads(row["evidence_json"]),
-        }
-        for row in connection.execute(
-            "SELECT source_asset_id, relation, target_asset_id, target_path, target_guid, "
-            "evidence_kind, confidence, verified, evidence_json FROM relationships"
-        )
-    ]
-    relationships.sort(
-        key=lambda item: (
-            str(item["sourceAssetId"]),
-            str(item["relation"]),
-            str(item.get("targetAssetId") or ""),
-            str(item.get("targetPath") or ""),
-            str(item.get("targetGuid") or ""),
-        )
     )
-    actual = _canonical_sha256(
+
+
+def _row_record(row: sqlite3.Row) -> dict[str, Any]:
+    """Decode one ``_ASSET_COLUMNS`` row and verify it against its own digest."""
+
+    item = {
+        "assetId": row["asset_id"],
+        "relativePath": row["relative_path"],
+        "name": row["name"],
+        "kind": row["kind"],
+        "format": row["format"],
+        "size": int(row["size"]),
+        "modifiedNs": int(row["modified_ns"]),
+        "contentSha256": row["content_sha256"],
+        "hashStatus": row["hash_status"],
+        "parseStatus": row["parse_status"],
+        "metadata": json.loads(row["metadata_json"]),
+    }
+    if _row_digest(item) != str(row["row_sha256"] or ""):
+        raise AssetCatalogError(
+            "asset catalog contents do not match its embedded manifest hash"
+        )
+    return item
+
+
+def _catalog_identity(root_path: str, build_id: str, aggregate: int, asset_count: int) -> str:
+    return _canonical_sha256(
         {
             "schema": CATALOG_SCHEMA,
             "schemaVersion": CATALOG_VERSION,
-            "rootPath": os.path.normcase(str(metadata.get("rootPath", ""))),
-            "buildId": str(metadata.get("buildId", "")),
-            "assets": assets,
-            "relationships": relationships,
+            "rootPath": os.path.normcase(str(root_path)),
+            "buildId": str(build_id),
+            "assetDigest": "%064x" % (aggregate & ((1 << 256) - 1)),
+            "assetCount": int(asset_count),
         }
+    )
+
+
+def _aggregate_row_digests(connection: sqlite3.Connection) -> tuple[int, int]:
+    aggregate = 0
+    count = 0
+    for row in connection.execute("SELECT row_sha256 FROM assets"):
+        aggregate ^= int(str(row["row_sha256"]), 16)
+        count += 1
+    return aggregate, count
+
+
+def _validate_catalog_identity(
+    connection: sqlite3.Connection, metadata: Mapping[str, str]
+) -> None:
+    """Recompute the catalog identity from the per-row digests (used by audits)."""
+
+    aggregate, count = _aggregate_row_digests(connection)
+    actual = _catalog_identity(
+        metadata.get("rootPath", ""), metadata.get("buildId", ""), aggregate, count
     )
     if actual != metadata.get("catalogSha256"):
         raise AssetCatalogError(
@@ -902,50 +1222,489 @@ def _safe_json(text: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _previous_records(path: Path, root: Path, build_id: str) -> dict[str, dict[str, Any]]:
-    if not path.is_file() or path.is_symlink():
-        return {}
+def _fts5_available(db: sqlite3.Connection) -> bool:
     try:
-        with closing(_database_connection(path, read_only=True)) as db:
-            metadata = _validate_schema(db)
-            _validate_catalog_identity(db, metadata)
-            if metadata.get("rootPath") != str(root) or metadata.get("buildId", "") != build_id:
-                return {}
-            result: dict[str, dict[str, Any]] = {}
-            for row in db.execute(
-                "SELECT asset_id, relative_path, kind, format, size, modified_ns, content_sha256, "
-                "hash_status, parse_status, metadata_json FROM assets"
-            ):
-                relations = [
-                    {
-                        "relation": relation["relation"],
-                        "targetPath": relation["target_path"],
-                        "catalogRootRelative": bool(relation["target_path"]),
-                        "targetGuid": relation["target_guid"],
-                        "evidence": json.loads(relation["evidence_json"]),
-                    }
-                    for relation in db.execute(
-                        "SELECT relation, target_path, target_guid, evidence_json FROM relationships "
-                        "WHERE source_asset_id=? AND evidence_kind='parser-reference'",
-                        (row["asset_id"],),
-                    )
-                ]
-                result[str(row["relative_path"])] = {
-                    "assetId": row["asset_id"],
-                    "relativePath": row["relative_path"],
-                    "kind": row["kind"],
-                    "format": row["format"],
-                    "size": int(row["size"]),
-                    "modifiedNs": int(row["modified_ns"]),
-                    "contentSha256": row["content_sha256"],
-                    "hashStatus": row["hash_status"],
-                    "parseStatus": row["parse_status"],
-                    "metadata": json.loads(row["metadata_json"]),
-                    "references": relations,
-                }
-            return result
-    except (AssetCatalogError, OSError, sqlite3.Error, json.JSONDecodeError):
-        return {}
+        db.execute("CREATE VIRTUAL TABLE temp.__fts_probe USING fts5(x)")
+        db.execute("DROP TABLE temp.__fts_probe")
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def _remove_database_files(path: Path) -> None:
+    """Remove an unusable catalog, or fail before it can be reinitialised.
+
+    Windows commonly refuses to unlink a SQLite database while another reader
+    still owns a handle. Continuing after that failure is unsafe: the schema
+    creation statements are all ``IF NOT EXISTS`` and the metadata insert would
+    otherwise relabel the still-populated old database as belonging to a new
+    root/build. The caller may retry after the reader closes, but it must never
+    reuse the old bytes under a new identity.
+    """
+
+    failures: list[str] = []
+    for candidate in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm"),
+                      path.with_name(path.name + "-journal")):
+        try:
+            if candidate.exists():
+                if candidate.is_symlink() or not candidate.is_file():
+                    failures.append("%s is not a regular file" % candidate.name)
+                    continue
+                candidate.unlink()
+        except OSError as error:
+            failures.append("%s: %s" % (candidate.name, str(error)[:160]))
+    remaining = [
+        candidate.name
+        for candidate in (
+            path,
+            path.with_name(path.name + "-wal"),
+            path.with_name(path.name + "-shm"),
+            path.with_name(path.name + "-journal"),
+        )
+        if candidate.exists()
+    ]
+    if failures or remaining:
+        detail = "; ".join(
+            failures
+            + (["still present: %s" % ", ".join(remaining)] if remaining else [])
+        )
+        raise AssetCatalogError(
+            "cannot retire the stale asset catalog; close active catalog readers and retry: %s"
+            % detail
+        )
+
+
+def _empty_catalog_metadata(root: Path, build_id: str, token_index: str) -> dict[str, str]:
+    now = _utc_now()
+    return {
+        "schema": CATALOG_SCHEMA,
+        "schemaVersion": str(DATABASE_SCHEMA_VERSION),
+        "catalogSha256": _catalog_identity(str(root), build_id, 0, 0),
+        "assetDigest": "%064x" % 0,
+        "rootPath": str(root),
+        "buildId": build_id,
+        "scanMode": "incremental",
+        "createdAt": now,
+        "updatedAt": now,
+        "engine": "unknown",
+        "engineJson": "{}",
+        "parserRevision": str(PARSER_REVISION),
+        "complete": "false",
+        "progressJson": "{}",
+        "generation": "0",
+        "tokenIndex": token_index,
+    }
+
+
+def _initialise_catalog_database(
+    db: sqlite3.Connection,
+    root: Path,
+    build_id: str,
+    *,
+    reset_existing: bool,
+) -> dict[str, str]:
+    """Create or transactionally reset one catalog for an exact root/build.
+
+    A valid catalog that belongs to another root/build is reset through the
+    same SQLite connection. Readers either retain their old snapshot or see
+    the committed empty/new catalog; no observer can see old rows under new
+    metadata. If the reset cannot acquire its write/schema lock, rollback is
+    explicit and the old catalog identity remains intact.
+    """
+
+    reset_sql = ""
+    if reset_existing:
+        reset_sql = """
+DROP TABLE IF EXISTS asset_tokens;
+DROP TABLE IF EXISTS relationships;
+DROP TABLE IF EXISTS asset_values;
+DROP TABLE IF EXISTS asset_thumbnails;
+DROP TABLE IF EXISTS assets;
+DROP TABLE IF EXISTS metadata;
+"""
+    try:
+        # executescript commits any implicit transaction before it starts, so
+        # put the BEGIN in the script and deliberately leave it open until the
+        # token index and sealed metadata have also been created.
+        db.executescript("BEGIN IMMEDIATE;\n" + reset_sql + _ASSET_SCHEMA_SQL)
+        if _fts5_available(db):
+            db.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS asset_tokens USING fts5("
+                "asset_id UNINDEXED, tokens, tokenize='unicode61')"
+            )
+            token_index = "fts5"
+        else:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS asset_tokens ("
+                "asset_id TEXT PRIMARY KEY, tokens TEXT NOT NULL)"
+            )
+            token_index = "plain"
+        metadata = _empty_catalog_metadata(root, build_id, token_index)
+        db.executemany(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
+            sorted(metadata.items()),
+        )
+        db.execute("COMMIT")
+        return metadata
+    except BaseException:
+        if db.in_transaction:
+            try:
+                db.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        raise
+
+
+def _cleanup_stale_temporaries(path: Path) -> int:
+    """Drop abandoned ``.<name>.tmp-*`` catalogs left by interrupted older scans."""
+
+    removed = 0
+    prefix = ".%s.tmp-" % path.name
+    cutoff = time.time() - _TEMPORARY_CATALOG_MAX_AGE_SECONDS
+    try:
+        entries = list(path.parent.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.startswith(prefix) or entry.is_symlink() or not entry.is_file():
+            continue
+        try:
+            if entry.stat().st_mtime > cutoff:
+                continue
+            entry.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _reference_target(source_relative: str, reference: Mapping[str, Any]) -> tuple[str, str]:
+    """(target_path, target_guid) for one parser reference, both bounded."""
+
+    target_guid = str(reference.get("guid", "") or "").lower()
+    if target_guid:
+        return "", target_guid
+    if reference.get("catalogRootRelative") is True:
+        stored_target = PurePosixPath(str(reference.get("targetPath", "") or ""))
+        if (
+            not stored_target.is_absolute()
+            and stored_target.parts
+            and all(part not in {"", ".", ".."} for part in stored_target.parts)
+        ):
+            return stored_target.as_posix(), ""
+        return "", ""
+    return _safe_reference(
+        source_relative,
+        str(reference.get("reference", reference.get("targetPath", "")) or ""),
+    ), ""
+
+
+class _CatalogWriter:
+    """In-place mutations of one catalog, inside the caller's transaction."""
+
+    def __init__(self, db: sqlite3.Connection, metadata: Mapping[str, str]):
+        self.db = db
+        self.fts = metadata.get("tokenIndex") == "fts5"
+        self.aggregate = int(metadata.get("assetDigest", "0") or "0", 16)
+
+    # -- rows -------------------------------------------------------------
+    def lookup(self, relative: str) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT rowid, asset_id, size, modified_ns, content_sha256, hash_status, parse_status, "
+            "kind, class_name, parser_revision, row_sha256 FROM assets WHERE relative_path=?",
+            (relative,),
+        ).fetchone()
+
+    def stamp(self, rowids: Sequence[int], generation: int) -> None:
+        for start in range(0, len(rowids), 500):
+            chunk = rowids[start:start + 500]
+            self.db.execute(
+                "UPDATE assets SET generation=? WHERE rowid IN (%s)" % ",".join("?" for _ in chunk),
+                (generation, *chunk),
+            )
+
+    def delete(self, rowid: int, asset_id: str, row_sha256: str) -> None:
+        if self.fts:
+            self.db.execute("DELETE FROM asset_tokens WHERE rowid=?", (rowid,))
+        else:
+            self.db.execute("DELETE FROM asset_tokens WHERE asset_id=?", (asset_id,))
+        self.db.execute("DELETE FROM asset_values WHERE asset_id=?", (asset_id,))
+        self.db.execute("DELETE FROM asset_thumbnails WHERE asset_id=?", (asset_id,))
+        # Relationships from this asset cascade; those pointing at it lose
+        # their target and are resolved again at publication.
+        self.db.execute("DELETE FROM assets WHERE rowid=?", (rowid,))
+        self.aggregate ^= int(str(row_sha256), 16)
+
+    def write(self, record: Mapping[str, Any], generation: int) -> int:
+        relative = str(record["relativePath"])
+        metadata = record["metadata"]
+        row_sha256 = _row_digest(record)
+        declared_guid = str(metadata.get("declaredGuid", "") or "").lower()
+        cursor = self.db.execute(
+            "INSERT INTO assets(asset_id, relative_path, folded_path, name, kind, format, size, "
+            "modified_ns, content_sha256, hash_status, parse_status, metadata_json, declared_guid, "
+            "class_name, parser_revision, generation, row_sha256) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record["assetId"], relative, relative.casefold(), PurePosixPath(relative).name,
+                record["kind"], record["format"], int(record["size"]), int(record["modifiedNs"]),
+                record["contentSha256"], record["hashStatus"], record["parseStatus"],
+                _canonical_bytes(metadata).decode("utf-8"), declared_guid,
+                str(metadata.get("className", "") or "")[:256],
+                int(metadata.get("parserRevision", 0) or 0), generation, row_sha256,
+            ),
+        )
+        rowid = int(cursor.lastrowid)
+        self.aggregate ^= int(row_sha256, 16)
+        asset_id = str(record["assetId"])
+        tokens = asset_tokens(relative, metadata)
+        if tokens:
+            if self.fts:
+                self.db.execute("INSERT INTO asset_tokens(rowid, asset_id, tokens) VALUES(?, ?, ?)",
+                                (rowid, asset_id, " ".join(tokens)))
+            else:
+                self.db.execute("INSERT OR REPLACE INTO asset_tokens(asset_id, tokens) VALUES(?, ?)",
+                                (asset_id, " ".join(tokens)))
+        keys = [key for key in (metadata.get("numericValues") or ())
+                if isinstance(key, str) and len(key) <= 24]
+        if keys:
+            self.db.executemany("INSERT OR IGNORE INTO asset_values(value_key, asset_id) VALUES(?, ?)",
+                                [(key, asset_id) for key in keys])
+        # A cooked material keeps its class in the package (``.uasset``) and its
+        # parameter values in the payload (``.uexp``). Retrieval ranks packages --
+        # that is where the class is -- so values attached only to the payload can
+        # never score, and the strongest signal there is (constant-buffer values
+        # against material parameters) was silently doing nothing.
+        self._share_values_with_package(relative, asset_id, keys)
+        self.write_thumbnail(asset_id, metadata.get("textureFingerprint"))
+        self._write_references(asset_id, relative, record.get("references") or [])
+        return rowid
+
+    def write_thumbnail(self, asset_id: str, fingerprint: Any) -> None:
+        """Update only derived image evidence, retaining original reference edges."""
+        self.db.execute("DELETE FROM asset_thumbnails WHERE asset_id=?", (asset_id,))
+        if isinstance(fingerprint, Mapping) and fingerprint.get("available") is True:
+            variants = fingerprint.get("dhashVariants") or []
+            if len(variants) == 8:
+                mean = fingerprint.get("meanColor") or [0, 0, 0, 0]
+                signed = [int(value) - (1 << 64) if int(value) >= (1 << 63) else int(value) for value in variants]
+                self.db.execute(
+                    "INSERT OR REPLACE INTO asset_thumbnails VALUES(%s)" % ",".join("?" * 16),
+                    (asset_id, *signed, int(mean[0]), int(mean[1]), int(mean[2]),
+                     int(fingerprint.get("sizeX") or 0), int(fingerprint.get("sizeY") or 0),
+                     1 if fingerprint.get("flat") else 0, str(fingerprint.get("pixelFormat") or "")),
+                )
+
+    def _share_values_with_package(self, relative: str, asset_id: str, keys: list[str]) -> None:
+        """Keep a package and its export payload on the same numeric evidence."""
+
+        lowered = relative.casefold()
+        try:
+            if lowered.endswith(".uexp"):
+                if not keys:
+                    return
+                stem = relative[: -len(".uexp")]
+                for suffix in (".uasset", ".umap"):
+                    row = self.db.execute(
+                        "SELECT asset_id FROM assets WHERE relative_path=?", (stem + suffix,)).fetchone()
+                    if row is not None:
+                        self.db.executemany(
+                            "INSERT OR IGNORE INTO asset_values(value_key, asset_id) VALUES(?, ?)",
+                            [(key, str(row["asset_id"])) for key in keys])
+                        return
+                return
+            if lowered.endswith((".uasset", ".umap")):
+                # The package can be written after its payload (a rescan that only
+                # touched the package), so pull the payload's values across too.
+                payload = relative[: relative.rfind(".")] + ".uexp"
+                rows = self.db.execute(
+                    "SELECT v.value_key AS value_key FROM asset_values v "
+                    "JOIN assets a ON a.asset_id = v.asset_id WHERE a.relative_path=? LIMIT ?",
+                    (payload, MAX_NUMERIC_VALUES_PER_ASSET)).fetchall()
+                if rows:
+                    self.db.executemany(
+                        "INSERT OR IGNORE INTO asset_values(value_key, asset_id) VALUES(?, ?)",
+                        [(str(row["value_key"]), asset_id) for row in rows])
+        except sqlite3.Error:
+            # Numeric evidence is an accelerator; a failure here must not fail a scan.
+            pass
+
+    def _write_references(self, asset_id: str, relative: str, references: Sequence[Mapping[str, Any]]) -> None:
+        deduplicated: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for reference in references:
+            relation = str(reference.get("relation", "references") or "references")[:128]
+            target_path, target_guid = _reference_target(relative, reference)
+            evidence = dict(reference.get("evidence") or {})
+            evidence["sourceRelativePath"] = relative
+            evidence.setdefault("candidateCount", 0)
+            evidence.setdefault("derivationClass", "observed")
+            evidence.setdefault("resolutionStatus", "unresolved")
+            key = (relation, target_path, target_guid)
+            existing = deduplicated.get(key)
+            if existing is None:
+                deduplicated[key] = {"relation": relation, "targetPath": target_path,
+                                     "targetGuid": target_guid, "evidence": evidence}
+            else:
+                existing["evidence"]["observationCount"] = int(
+                    existing["evidence"].get("observationCount", 1)) + 1
+        if not deduplicated:
+            return
+        self.db.executemany(
+            "INSERT OR IGNORE INTO relationships(source_asset_id, relation, target_asset_id, target_path, "
+            "target_guid, target_folded, evidence_kind, confidence, verified, evidence_json) "
+            "VALUES(?, ?, NULL, ?, ?, ?, 'parser-reference', 0.0, 0, ?)",
+            [
+                (asset_id, item["relation"], item["targetPath"], item["targetGuid"],
+                 item["targetPath"].casefold(), _canonical_bytes(item["evidence"]).decode("utf-8"))
+                for item in deduplicated.values()
+            ],
+        )
+
+    # -- derived edges ----------------------------------------------------
+    def resolve_references(self) -> None:
+        """Bind unresolved parser references to the assets now in the index."""
+
+        db = self.db
+        # A target that vanished leaves a verified edge with no target; it is
+        # re-examined below like any other unresolved edge.
+        db.execute(
+            "UPDATE relationships SET verified=0, confidence=0.0 "
+            "WHERE target_asset_id IS NULL AND verified=1 AND evidence_kind='parser-reference'"
+        )
+        pending = db.execute(
+            "SELECT rowid, target_path, target_guid, target_folded, evidence_json FROM relationships "
+            "WHERE target_asset_id IS NULL AND evidence_kind='parser-reference' "
+            "AND (target_path<>'' OR target_guid<>'')"
+        ).fetchall()
+        for row in pending:
+            guid = str(row["target_guid"] or "")
+            if guid:
+                candidates = [str(item["asset_id"]) for item in db.execute(
+                    "SELECT asset_id FROM assets WHERE declared_guid=? LIMIT 3", (guid,))]
+            else:
+                candidates = [str(item["asset_id"]) for item in db.execute(
+                    "SELECT asset_id FROM assets WHERE relative_path=? LIMIT 1", (row["target_path"],))]
+                if not candidates:
+                    candidates = [str(item["asset_id"]) for item in db.execute(
+                        "SELECT asset_id FROM assets WHERE folded_path=? LIMIT 3", (row["target_folded"],))]
+            evidence = _safe_json(row["evidence_json"])
+            previous = int(evidence.get("candidateCount", 0) or 0)
+            if len(candidates) == 1:
+                evidence.update({"candidateCount": 1, "derivationClass": "deterministic-derived",
+                                 "resolutionStatus": "exact"})
+                db.execute(
+                    "UPDATE relationships SET target_asset_id=?, confidence=1.0, verified=1, evidence_json=? "
+                    "WHERE rowid=?",
+                    (candidates[0], _canonical_bytes(evidence).decode("utf-8"), int(row["rowid"])),
+                )
+            elif len(candidates) != previous or evidence.get("resolutionStatus") not in {"ambiguous", "unresolved"}:
+                evidence.update({"candidateCount": len(candidates), "derivationClass": "observed",
+                                 "resolutionStatus": "ambiguous" if candidates else "unresolved"})
+                db.execute(
+                    "UPDATE relationships SET confidence=?, verified=0, evidence_json=? WHERE rowid=?",
+                    (0.5 if candidates else 0.0, _canonical_bytes(evidence).decode("utf-8"), int(row["rowid"])),
+                )
+
+    def rebuild_same_content(self) -> None:
+        """Identical bytes under two paths: one deterministic edge per duplicate."""
+
+        db = self.db
+        db.execute("DELETE FROM relationships WHERE evidence_kind='content-sha256'")
+        rows: list[tuple[Any, ...]] = []
+        group_hash = ""
+        canonical: tuple[str, str] | None = None
+        for row in db.execute(
+            "SELECT content_sha256, asset_id, relative_path FROM assets WHERE content_sha256<>'' "
+            "ORDER BY content_sha256, folded_path, relative_path"
+        ):
+            digest = str(row["content_sha256"])
+            if digest != group_hash:
+                group_hash = digest
+                canonical = (str(row["asset_id"]), str(row["relative_path"]))
+                continue
+            assert canonical is not None
+            rows.append((
+                str(row["asset_id"]), canonical[0], canonical[1],
+                _canonical_bytes({"contentSha256": digest, "derivationClass": "deterministic-derived",
+                                  "resolutionStatus": "exact"}).decode("utf-8"),
+            ))
+            if len(rows) >= 2000:
+                self._insert_same_content(rows)
+                rows = []
+        if rows:
+            self._insert_same_content(rows)
+
+    def _insert_same_content(self, rows: Sequence[tuple[Any, ...]]) -> None:
+        self.db.executemany(
+            "INSERT OR IGNORE INTO relationships(source_asset_id, relation, target_asset_id, target_path, "
+            "target_guid, target_folded, evidence_kind, confidence, verified, evidence_json) "
+            "VALUES(?, 'same-content', ?, ?, '', '', 'content-sha256', 1.0, 1, ?)",
+            rows,
+        )
+
+    # -- publication --------------------------------------------------------
+    def publish(self, *, root: Path, build_id: str, scan_mode: str, engine: Mapping[str, Any],
+                complete: bool, progress_note: Mapping[str, Any] | None, generation: int,
+                recompute: bool = False) -> str:
+        """Refresh the metadata row set and return the catalog identity."""
+
+        db = self.db
+        if recompute:
+            self.aggregate, count = _aggregate_row_digests(db)
+        else:
+            count = int(db.execute("SELECT COUNT(*) AS n FROM assets").fetchone()["n"])
+        identity = _catalog_identity(str(root), build_id, self.aggregate, count)
+        now = _utc_now()
+        values = {
+            "schema": CATALOG_SCHEMA,
+            "schemaVersion": str(DATABASE_SCHEMA_VERSION),
+            "catalogSha256": identity,
+            "assetDigest": "%064x" % (self.aggregate & ((1 << 256) - 1)),
+            "rootPath": str(root),
+            "buildId": build_id,
+            "scanMode": scan_mode,
+            "updatedAt": now,
+            "engine": str(engine.get("engine", "unknown")),
+            "engineJson": _canonical_bytes(dict(engine)).decode("utf-8"),
+            "parserRevision": str(PARSER_REVISION),
+            "complete": "true" if complete else "false",
+            "progressJson": _canonical_bytes(dict(progress_note or {})).decode("utf-8"),
+            "generation": str(int(generation)),
+            "tokenIndex": "fts5" if self.fts else "plain",
+        }
+        if complete:
+            values["valueIndex"] = str(int(db.execute("SELECT COUNT(*) AS n FROM asset_values").fetchone()["n"]))
+            values["thumbnailIndex"] = str(int(db.execute("SELECT COUNT(*) AS n FROM asset_thumbnails").fetchone()["n"]))
+        db.executemany("INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)", sorted(values.items()))
+        db.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES('createdAt', ?)", (now,))
+        return identity
+
+
+def _bounded_numeric_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep the value index proportionate: a few hundred keys per asset at most."""
+
+    result = dict(metadata)
+    values = result.get("numericValues")
+    if isinstance(values, list) and len(values) > MAX_NUMERIC_VALUES_PER_ASSET:
+        result["numericValues"] = values[:MAX_NUMERIC_VALUES_PER_ASSET]
+        result["numericValuesTruncated"] = True
+    runs = result.get("numericRuns")
+    if isinstance(runs, list) and len(runs) > MAX_NUMERIC_RUNS_PER_ASSET:
+        result["numericRuns"] = runs[:MAX_NUMERIC_RUNS_PER_ASSET]
+        result["numericRunsTruncated"] = True
+    return result
+
+
+def _numeric_probe_admitted(relative: str, data: bytes) -> bool:
+    """Whether a generic file is worth scanning for material-parameter floats.
+
+    Bulk payloads (texture mips, audio, fonts, code, localisation) hold no
+    parameter values; scanning them fills the value index with noise and
+    megabytes per file. Small unknown descriptors are still scanned.
+    """
+
+    suffix = PurePosixPath(relative).suffix.casefold()
+    return suffix not in _BULK_SUFFIXES and len(data) <= 256 * 1024
 
 
 _TEXT_NUMBER = re.compile(r"(?<![A-Za-z0-9_.])-?\d+\.\d{4,}(?:[eE][-+]?\d+)?(?![A-Za-z0-9_.])")
@@ -1020,198 +1779,6 @@ def asset_tokens(relative: str, metadata: Mapping[str, Any]) -> list[str]:
     return list(seen)[:MAX_TOKENS_PER_ASSET]
 
 
-def _fts5_available(db: sqlite3.Connection) -> bool:
-    try:
-        db.execute("CREATE VIRTUAL TABLE temp.__fts_probe USING fts5(x)")
-        db.execute("DROP TABLE temp.__fts_probe")
-        return True
-    except sqlite3.Error:
-        return False
-
-
-def _create_value_index(db: sqlite3.Connection, records: Sequence[Mapping[str, Any]]) -> None:
-    """Persist distinctive numeric values per asset for cbuffer-value matching."""
-
-    db.execute(
-        "CREATE TABLE asset_values (value_key TEXT NOT NULL, asset_id TEXT NOT NULL, "
-        "PRIMARY KEY(value_key, asset_id)) WITHOUT ROWID"
-    )
-    rows = []
-    for row in records:
-        metadata = row.get("metadata") or {}
-        for key in metadata.get("numericValues") or ():
-            if isinstance(key, str) and len(key) <= 24:
-                rows.append((key, row["assetId"]))
-    db.executemany("INSERT OR IGNORE INTO asset_values(value_key, asset_id) VALUES(?, ?)", rows)
-    db.execute("INSERT INTO metadata(key, value) VALUES('valueIndex', ?)", (str(len(rows)),))
-
-
-def _create_thumbnail_index(db: sqlite3.Connection, records: Sequence[Mapping[str, Any]]) -> None:
-    """Persist texture fingerprints (8 dihedral dHashes + mean colour) per asset."""
-
-    db.execute(
-        "CREATE TABLE asset_thumbnails (asset_id TEXT PRIMARY KEY, v0 INTEGER, v1 INTEGER, v2 INTEGER, v3 INTEGER, "
-        "v4 INTEGER, v5 INTEGER, v6 INTEGER, v7 INTEGER, mean_r INTEGER, mean_g INTEGER, mean_b INTEGER, "
-        "width INTEGER, height INTEGER, flat INTEGER, pixel_format TEXT)"
-    )
-    rows = []
-    for row in records:
-        fingerprint = (row.get("metadata") or {}).get("textureFingerprint")
-        if not isinstance(fingerprint, Mapping) or fingerprint.get("available") is not True:
-            continue
-        variants = fingerprint.get("dhashVariants") or []
-        if len(variants) != 8:
-            continue
-        mean = fingerprint.get("meanColor") or [0, 0, 0, 0]
-        # SQLite integers are signed 64-bit: store as signed
-        signed = [int(value) - (1 << 64) if int(value) >= (1 << 63) else int(value) for value in variants]
-        rows.append((row["assetId"], *signed, int(mean[0]), int(mean[1]), int(mean[2]),
-                     int(fingerprint.get("sizeX") or 0), int(fingerprint.get("sizeY") or 0),
-                     1 if fingerprint.get("flat") else 0, str(fingerprint.get("pixelFormat") or "")))
-    db.executemany("INSERT OR IGNORE INTO asset_thumbnails VALUES(%s)" % ",".join("?" * 16), rows)
-    db.execute("INSERT INTO metadata(key, value) VALUES('thumbnailIndex', ?)", (str(len(rows)),))
-
-
-def _create_token_index(db: sqlite3.Connection, records: Sequence[Mapping[str, Any]]) -> None:
-    """Persist per-asset retrieval tokens (FTS5 when available, else plain)."""
-
-    rows = []
-    for row in records:
-        tokens = asset_tokens(str(row["relativePath"]), row.get("metadata") or {})
-        if tokens:
-            rows.append((row["assetId"], " ".join(tokens)))
-    if _fts5_available(db):
-        db.execute("CREATE VIRTUAL TABLE asset_tokens USING fts5(asset_id UNINDEXED, tokens, tokenize='unicode61')")
-        db.execute("INSERT INTO metadata(key, value) VALUES('tokenIndex', 'fts5')")
-    else:
-        db.execute("CREATE TABLE asset_tokens (asset_id TEXT PRIMARY KEY, tokens TEXT NOT NULL)")
-        db.execute("INSERT INTO metadata(key, value) VALUES('tokenIndex', 'plain')")
-    db.executemany("INSERT INTO asset_tokens(asset_id, tokens) VALUES(?, ?)", rows)
-
-
-def _create_database(
-    path: Path,
-    *,
-    root: Path,
-    build_id: str,
-    catalog_sha256: str,
-    scan_mode: str,
-    records: Sequence[Mapping[str, Any]],
-    relationships: Sequence[Mapping[str, Any]],
-    engine: Mapping[str, Any] | None = None,
-    complete: bool = True,
-    progress_note: Mapping[str, Any] | None = None,
-) -> None:
-    temporary = path.with_name(".%s.tmp-%s" % (path.name, uuid.uuid4().hex))
-    try:
-        with closing(_database_connection(temporary, read_only=False)) as db:
-            db.executescript(
-                """
-                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE assets (
-                    asset_id TEXT PRIMARY KEY,
-                    relative_path TEXT NOT NULL UNIQUE,
-                    name TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    format TEXT NOT NULL,
-                    size INTEGER NOT NULL,
-                    modified_ns INTEGER NOT NULL,
-                    content_sha256 TEXT NOT NULL,
-                    hash_status TEXT NOT NULL,
-                    parse_status TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL
-                );
-                CREATE INDEX assets_kind_idx ON assets(kind, format);
-                CREATE INDEX assets_hash_idx ON assets(content_sha256);
-                CREATE TABLE relationships (
-                    source_asset_id TEXT NOT NULL REFERENCES assets(asset_id) ON DELETE CASCADE,
-                    relation TEXT NOT NULL,
-                    target_asset_id TEXT REFERENCES assets(asset_id) ON DELETE SET NULL,
-                    target_path TEXT NOT NULL,
-                    target_guid TEXT NOT NULL,
-                    evidence_kind TEXT NOT NULL,
-                    confidence REAL NOT NULL,
-                    verified INTEGER NOT NULL,
-                    evidence_json TEXT NOT NULL,
-                    UNIQUE(source_asset_id, relation, target_asset_id, target_path, target_guid, evidence_kind)
-                );
-                CREATE INDEX relationships_source_idx ON relationships(source_asset_id);
-                CREATE INDEX relationships_target_idx ON relationships(target_asset_id);
-                """
-            )
-            metadata = {
-                "schema": CATALOG_SCHEMA,
-                "schemaVersion": str(DATABASE_SCHEMA_VERSION),
-                "catalogSha256": catalog_sha256,
-                "rootPath": str(root),
-                "buildId": build_id,
-                "scanMode": scan_mode,
-                "createdAt": _utc_now(),
-                "engine": str((engine or {}).get("engine", "unknown")),
-                "engineJson": _canonical_bytes(engine or {}).decode("utf-8"),
-                "parserRevision": str(PARSER_REVISION),
-                # A checkpoint of an interrupted/ongoing scan is a valid,
-                # queryable catalog; ``complete`` says whether the walk ended.
-                "complete": "true" if complete else "false",
-                "progressJson": _canonical_bytes(dict(progress_note or {})).decode("utf-8"),
-            }
-            db.executemany(
-                "INSERT INTO metadata(key, value) VALUES(?, ?)",
-                sorted(metadata.items()),
-            )
-            db.executemany(
-                "INSERT INTO assets(asset_id, relative_path, name, kind, format, size, "
-                "modified_ns, content_sha256, hash_status, parse_status, metadata_json) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (
-                        row["assetId"],
-                        row["relativePath"],
-                        PurePosixPath(str(row["relativePath"])).name,
-                        row["kind"],
-                        row["format"],
-                        row["size"],
-                        row["modifiedNs"],
-                        row["contentSha256"],
-                        row["hashStatus"],
-                        row["parseStatus"],
-                        _canonical_bytes(row["metadata"]).decode("utf-8"),
-                    )
-                    for row in records
-                ],
-            )
-            _create_token_index(db, records)
-            _create_value_index(db, records)
-            _create_thumbnail_index(db, records)
-            db.executemany(
-                "INSERT INTO relationships(source_asset_id, relation, target_asset_id, "
-                "target_path, target_guid, evidence_kind, confidence, verified, evidence_json) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (
-                        row["sourceAssetId"],
-                        row["relation"],
-                        row.get("targetAssetId") or None,
-                        row.get("targetPath", ""),
-                        row.get("targetGuid", ""),
-                        row["evidenceKind"],
-                        row["confidence"],
-                        1 if row["verified"] else 0,
-                        _canonical_bytes(row["evidence"]).decode("utf-8"),
-                    )
-                    for row in relationships
-                ],
-            )
-            db.commit()
-        os.replace(str(temporary), str(path))
-    finally:
-        if temporary.exists():
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
-
-
 _MATERIAL_CLASS_NAMES = frozenset({
     "Material", "MaterialInstanceConstant", "MaterialInstanceDynamic", "MaterialFunction",
     "MaterialFunctionInstance", "MaterialParameterCollection",
@@ -1235,6 +1802,8 @@ def _deep_admitted(depth_mode: str, kind: str, relative: str, size: int, materia
     if depth_mode == "names":
         return False
     suffix = PurePosixPath(relative).suffix.casefold()
+    if suffix in _BULK_SUFFIXES:
+        return False
     if kind == "package":
         if suffix in {".uasset", ".umap"}:
             return size <= HEADER_DEPTH_MAX_BYTES * 4
@@ -1285,7 +1854,7 @@ class AssetCatalogService:
                 "proprietary mesh/material/shader layouts",
             ],
             "scanModes": {
-                "incremental": "reuse exact path/size/mtime observations from the current project catalog",
+                "incremental": "keep rows whose path/size/mtime are unchanged; rewrite the rest in place",
                 "full": "rehash and reparse every admitted regular file",
             },
             "relationshipEvidence": [
@@ -1300,11 +1869,15 @@ class AssetCatalogService:
                 "semanticNameGuessPersisted": False,
                 "heuristicRelationshipsPersisted": False,
                 "contentVerifiedDelivery": True,
-                "catalogContentsHashVerifiedOnRead": True,
+                "rowDigestVerifiedOnDelivery": True,
+                "indexNotCopy": True,
             },
             "limits": {
                 "defaultMaximumFiles": DEFAULT_MAX_FILES,
                 "hardMaximumFiles": HARD_MAX_FILES,
+                "defaultNamesOnlyMaximumFiles": DEFAULT_NAMES_ONLY_MAX_FILES,
+                "hardNamesOnlyMaximumFiles": HARD_NAMES_ONLY_MAX_FILES,
+                "hardMaximumFilesystemEntries": HARD_MAX_FILESYSTEM_ENTRIES,
                 "defaultMaximumFileSizeMiB": DEFAULT_MAX_FILE_SIZE_MB,
                 "hardMaximumFileSizeMiB": HARD_MAX_FILE_SIZE_MB,
                 "maximumQueryResults": MAX_QUERY_RESULTS,
@@ -1318,14 +1891,21 @@ class AssetCatalogService:
         *,
         build_id: str = "",
         scan_mode: str = "incremental",
-        max_files: int = DEFAULT_MAX_FILES,
+        max_files: int | None = None,
         max_file_size_mb: int = DEFAULT_MAX_FILE_SIZE_MB,
         depth: str = "full",
         scope_prefixes: Sequence[str] = (),
         progress: Any = None,
         checkpoint_seconds: float = 90.0,
     ) -> dict[str, Any]:
-        """Index the tree.
+        """Bring the index up to date with the tree.
+
+        The catalog is one live SQLite index, updated in place: a file whose
+        size and mtime are unchanged keeps its row; a changed or new file is
+        hashed/parsed and its row rewritten; a file that is gone loses its row
+        once the walk is complete. Checkpoints are plain commits, so a reader
+        always sees the last committed state and an interrupted scan resumes
+        from it.
 
         ``depth`` chooses how much work each file gets: ``names`` walks only
         (path tokens, no hashing/parsing — seconds); ``headers`` hashes and
@@ -1333,10 +1913,9 @@ class AssetCatalogService:
         shaders, metadata, and a material's cooked export sibling) and defers
         bulk/large files; ``full`` hashes and parses everything admitted by
         the size bounds. ``scope_prefixes`` restricts the deep work to files
-        whose catalog-relative path starts with one of the prefixes; records
-        outside the scope are reused from the previous catalog or recorded as
-        deferred, so an on-demand hydration of a few candidates stays cheap.
-        Deferred records can always be upgraded by a later scan.
+        whose catalog-relative path starts with one of the prefixes.
+        Deferred records can always be upgraded by a later scan or by
+        ``hydrate``.
         """
 
         root = _validate_root(asset_root)
@@ -1363,7 +1942,20 @@ class AssetCatalogService:
             folded = relative_path.casefold()
             return any(folded == prefix or folded.startswith(prefix + "/") or folded.startswith(prefix)
                        for prefix in prefixes)
-        if isinstance(max_files, bool) or not isinstance(max_files, int) or not 1 <= max_files <= HARD_MAX_FILES:
+        if max_files is None:
+            max_files = (
+                DEFAULT_NAMES_ONLY_MAX_FILES
+                if depth_mode == "names"
+                else DEFAULT_MAX_FILES
+            )
+        maximum_admitted_files = (
+            HARD_NAMES_ONLY_MAX_FILES if depth_mode == "names" else HARD_MAX_FILES
+        )
+        if (
+            isinstance(max_files, bool)
+            or not isinstance(max_files, int)
+            or not 1 <= max_files <= maximum_admitted_files
+        ):
             raise AssetCatalogError("max_files is outside the fixed scan bound")
         if (
             isinstance(max_file_size_mb, bool)
@@ -1372,287 +1964,62 @@ class AssetCatalogService:
         ):
             raise AssetCatalogError("max_file_size_mb is outside the fixed scan bound")
         maximum_file_size = max_file_size_mb * 1024 * 1024
-        previous = (
-            _previous_records(self.database_path, root, build_id)
-            if mode == "incremental"
-            else {}
-        )
-        records: list[dict[str, Any]] = []
+
         skipped_symlinks = 0
         reused = 0
         hashed = 0
         parse_failures = 0
         walked = 0
+        visited_files = 0
+        filesystem_entries = 0
+        skipped_unsupported = 0
         deferred = 0
-        engine_context = self._detect_engine(root, max_files)
-        def _publish(records: list[dict[str, Any]], *, complete: bool, progress_note: Mapping[str, Any] | None = None):
-            """Write one catalog from ``records``; partial catalogs are checkpoints."""
-
-            records.sort(key=lambda item: str(item["relativePath"]).casefold())
-            by_path = {str(item["relativePath"]): item for item in records}
-            casefold_paths: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            guid_assets: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            hash_assets: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            for item in records:
-                casefold_paths[str(item["relativePath"]).casefold()].append(item)
-                guid = str(item["metadata"].get("declaredGuid", "") or "").lower()
-                if guid:
-                    guid_assets[guid].append(item)
-                digest = str(item.get("contentSha256", "") or "")
-                if digest:
-                    hash_assets[digest].append(item)
-            relationships: list[dict[str, Any]] = []
-            for item in records:
-                for reference in item.get("references", []):
-                    relation = str(reference.get("relation", "references") or "references")[:128]
-                    target_guid = str(reference.get("guid", "") or "").lower()
-                    target_path = ""
-                    candidates: list[dict[str, Any]] = []
-                    if target_guid:
-                        candidates = guid_assets.get(target_guid, [])
-                    else:
-                        if reference.get("catalogRootRelative") is True:
-                            stored_target = PurePosixPath(
-                                str(reference.get("targetPath", "") or "")
-                            )
-                            if (
-                                not stored_target.is_absolute()
-                                and stored_target.parts
-                                and all(
-                                    part not in {"", ".", ".."}
-                                    for part in stored_target.parts
-                                )
-                            ):
-                                target_path = stored_target.as_posix()
-                        else:
-                            target_path = _safe_reference(
-                                str(item["relativePath"]),
-                                str(
-                                    reference.get(
-                                        "reference", reference.get("targetPath", "")
-                                    )
-                                    or ""
-                                ),
-                            )
-                        if target_path in by_path:
-                            candidates = [by_path[target_path]]
-                        elif target_path:
-                            folded = casefold_paths.get(target_path.casefold(), [])
-                            if len(folded) == 1:
-                                candidates = folded
-                    evidence = dict(reference.get("evidence") or {})
-                    evidence["sourceRelativePath"] = item["relativePath"]
-                    if candidates:
-                        for candidate in candidates[:MAX_RELATIONSHIPS_PER_ASSET]:
-                            relationships.append(
-                                {
-                                    "sourceAssetId": item["assetId"],
-                                    "relation": relation,
-                                    "targetAssetId": candidate["assetId"],
-                                    "targetPath": target_path or candidate["relativePath"],
-                                    "targetGuid": target_guid,
-                                    "evidenceKind": "parser-reference",
-                                    "confidence": 1.0 if len(candidates) == 1 else 0.5,
-                                    "verified": len(candidates) == 1,
-                                    "evidence": {
-                                        **evidence,
-                                        "candidateCount": len(candidates),
-                                        "derivationClass": (
-                                            "deterministic-derived"
-                                            if len(candidates) == 1
-                                            else "observed"
-                                        ),
-                                        "resolutionStatus": (
-                                            "exact" if len(candidates) == 1 else "ambiguous"
-                                        ),
-                                    },
-                                }
-                            )
-                    else:
-                        relationships.append(
-                            {
-                                "sourceAssetId": item["assetId"],
-                                "relation": relation,
-                                "targetAssetId": None,
-                                "targetPath": target_path,
-                                "targetGuid": target_guid,
-                                "evidenceKind": "parser-reference",
-                                "confidence": 0.0,
-                                "verified": False,
-                                "evidence": {
-                                    **evidence,
-                                    "candidateCount": 0,
-                                    "derivationClass": "observed",
-                                    "resolutionStatus": "unresolved",
-                                },
-                            }
-                        )
-            for digest, duplicates in hash_assets.items():
-                if len(duplicates) < 2:
-                    continue
-                canonical = sorted(duplicates, key=lambda item: str(item["relativePath"]).casefold())[0]
-                for duplicate in duplicates:
-                    if duplicate is canonical:
-                        continue
-                    relationships.append(
-                        {
-                            "sourceAssetId": duplicate["assetId"],
-                            "relation": "same-content",
-                            "targetAssetId": canonical["assetId"],
-                            "targetPath": canonical["relativePath"],
-                            "targetGuid": "",
-                            "evidenceKind": "content-sha256",
-                            "confidence": 1.0,
-                            "verified": True,
-                            "evidence": {
-                                "contentSha256": digest,
-                                "derivationClass": "deterministic-derived",
-                                "resolutionStatus": "exact",
-                            },
-                        }
-                    )
-            deduplicated: dict[tuple[Any, ...], dict[str, Any]] = {}
-            for relationship in relationships:
-                key = (
-                    relationship["sourceAssetId"],
-                    relationship["relation"],
-                    relationship.get("targetAssetId") or None,
-                    relationship.get("targetPath", ""),
-                    relationship.get("targetGuid", ""),
-                    relationship["evidenceKind"],
-                )
-                existing = deduplicated.get(key)
-                if existing is None:
-                    deduplicated[key] = relationship
-                    continue
-                existing_evidence = existing["evidence"]
-                existing_evidence["observationCount"] = int(
-                    existing_evidence.get("observationCount", 1)
-                ) + 1
-            relationships = list(deduplicated.values())
-            relationships.sort(
-                key=lambda item: (
-                    str(item["sourceAssetId"]),
-                    str(item["relation"]),
-                    str(item.get("targetAssetId") or ""),
-                    str(item.get("targetPath") or ""),
-                    str(item.get("targetGuid") or ""),
-                )
-            )
-            catalog_material = {
-                "schema": CATALOG_SCHEMA,
-                "schemaVersion": CATALOG_VERSION,
-                "rootPath": os.path.normcase(str(root)),
-                "buildId": build_id,
-                "assets": [
-                    {
-                        "assetId": item["assetId"],
-                        "relativePath": item["relativePath"],
-                        "kind": item["kind"],
-                        "format": item["format"],
-                        "size": item["size"],
-                        "contentSha256": item["contentSha256"],
-                        "hashStatus": item["hashStatus"],
-                        "parseStatus": item["parseStatus"],
-                        "metadata": item["metadata"],
-                    }
-                    for item in records
-                ],
-                "relationships": relationships,
-            }
-            catalog_sha256 = _canonical_sha256(catalog_material)
-            _create_database(
-                self.database_path,
-                root=root,
-                build_id=build_id,
-                catalog_sha256=catalog_sha256,
-                scan_mode=mode,
-                records=records,
-                relationships=relationships,
-                engine=engine_context.to_dict(),
-                complete=complete,
-                progress_note=progress_note,
-            )
-            return catalog_sha256, relationships
-        last_checkpoint = time.monotonic()
-        checkpoints = 0
-        visited: set[str] = set()
-
-        def _checkpoint() -> None:
-            nonlocal last_checkpoint, checkpoints
-            # Files not walked yet keep their previous observation so a
-            # checkpoint never shrinks coverage below the last catalog.
-            pending = [dict(item) for path, item in previous.items() if path not in visited]
-            _publish(records + pending, complete=False, progress_note={
-                "walked": walked, "hashed": hashed, "reused": reused, "deferred": deferred,
-                "checkpoint": checkpoints + 1, "at": _utc_now()})
-            checkpoints += 1
+        written = 0
+        engine_context = self._detect_engine(
+            root,
+            ENGINE_DETECTION_SAMPLE_FILES,
+            include_unknown=depth_mode != "names",
+        )
+        engine = engine_context.to_dict()
+        db, metadata = self._open_writable(root, build_id)
+        try:
+            writer = _CatalogWriter(db, metadata)
+            generation = int(metadata.get("generation", "0") or "0") + 1
+            db.execute("BEGIN")
+            pending_stamps: list[int] = []
             last_checkpoint = time.monotonic()
-        for directory, directory_names, file_names in os.walk(root, followlinks=False):
-            material_stems: set[str] = set()
-            stem_classes: dict[str, str] = {}
-            directory_path = Path(directory)
-            if _is_redirected(directory_path):
-                raise AssetCatalogError(
-                    "asset scan traversed a symbolic link or reparse point"
-                )
-            safe_directories: list[str] = []
-            for name in sorted(directory_names, key=str.casefold):
-                candidate = directory_path / name
-                if _is_redirected(candidate):
-                    skipped_symlinks += 1
-                else:
-                    safe_directories.append(name)
-            directory_names[:] = safe_directories
-            for name in sorted(file_names, key=str.casefold):
-                walked += 1
-                if progress is not None and walked % 500 == 0:
-                    try:
-                        progress({"phase": "scan", "walked": walked, "hashed": hashed, "reused": reused, "deferred": deferred})
-                    except Exception:
-                        pass
-                if walked > max_files:
-                    raise AssetCatalogScanLimitError(
-                        maximum_files=max_files, observed_files=walked
-                    )
-                path = directory_path / name
-                if _is_redirected(path) or not path.is_file():
-                    skipped_symlinks += 1
-                    continue
-                resolved = path.resolve(strict=True)
-                if not _within(root, resolved):
-                    raise AssetCatalogError("asset file escaped the configured root")
-                before = resolved.stat()
-                relative = resolved.relative_to(root).as_posix()
-                size = int(before.st_size)
-                modified_ns = int(before.st_mtime_ns)
-                old = previous.get(relative)
-                kind = _classify(PurePosixPath(relative))
-                deep = in_scope(relative) and _deep_admitted(depth_mode, kind, relative, size, material_stems, stem_classes)
-                old_current = bool(
-                    old is not None
-                    and old["size"] == size
-                    and old["modifiedNs"] == modified_ns
-                )
-                old_complete = bool(
-                    old_current
-                    and old.get("contentSha256")
-                    and (
-                        old.get("parseStatus") not in {"parsed", "provider-required", "parse-error"}
-                        or old.get("metadata", {}).get("parserRevision") == PARSER_REVISION
-                    )
-                )
-                if old_complete or (old_current and not deep):
-                    record = dict(old)
-                    reused += 1
-                    if record.get("kind") == "package":
-                        reused_class = str(record.get("metadata", {}).get("className", "") or "")
-                        if reused_class:
-                            stem_classes[PurePosixPath(relative).stem] = reused_class
-                        if reused_class in _MATERIAL_CLASS_NAMES:
-                            material_stems.add(PurePosixPath(relative).stem)
-                elif not deep:
-                    record = {
+            checkpoints = 0
+
+            def _note() -> dict[str, Any]:
+                return {
+                    "walked": walked,
+                    "visited": visited_files,
+                    "skippedUnsupported": skipped_unsupported,
+                    "hashed": hashed,
+                    "reused": reused,
+                    "deferred": deferred,
+                    "written": written,
+                }
+
+            def _checkpoint() -> None:
+                nonlocal last_checkpoint, checkpoints
+                writer.stamp(pending_stamps, generation)
+                pending_stamps.clear()
+                note = _note()
+                note.update({"checkpoint": checkpoints + 1, "at": _utc_now()})
+                writer.publish(root=root, build_id=build_id, scan_mode=mode, engine=engine,
+                               complete=False, progress_note=note, generation=generation)
+                db.execute("COMMIT")
+                db.execute("BEGIN")
+                checkpoints += 1
+                last_checkpoint = time.monotonic()
+
+            def _stat_record(relative: str, resolved: Path, size: int, modified_ns: int, kind: str,
+                             deep: bool, material_stems: set[str], stem_classes: dict[str, str]) -> dict[str, Any]:
+                nonlocal hashed, deferred, parse_failures
+                if not deep:
+                    deferred += 1
+                    return {
                         "assetId": _asset_identity(relative, "", size, modified_ns),
                         "relativePath": relative,
                         "kind": kind,
@@ -1665,85 +2032,200 @@ class AssetCatalogService:
                         "metadata": {"parser": "deferred", "reason": "outside the requested scan depth/scope"},
                         "references": [],
                     }
-                    deferred += 1
-                else:
-                    content_sha256 = ""
-                    hash_status = "skipped-size"
-                    metadata = {
-                        "parser": "none",
-                        "reason": "file exceeds the admitted per-file hash/parse bound",
-                    }
-                    references: list[dict[str, Any]] = []
-                    parse_status = "skipped-size"
-                    if size <= maximum_file_size:
-                        content_sha256 = _hash_regular_file(resolved, size)
-                        after_hash = resolved.stat()
-                        if (
-                            int(after_hash.st_size) != size
-                            or int(after_hash.st_mtime_ns) != modified_ns
-                        ):
-                            raise AssetCatalogError(
-                                "asset changed while it was hashed: %s" % resolved
-                            )
-                        hashed += 1
-                        hash_status = "sha256"
-                        if size <= MAX_PARSE_BYTES:
-                            try:
-                                data = resolved.read_bytes()
-                                after_read = resolved.stat()
-                                if (
-                                    int(after_read.st_size) != size
-                                    or int(after_read.st_mtime_ns) != modified_ns
-                                ):
-                                    raise AssetCatalogError("asset changed while it was parsed: %s" % resolved)
-                                metadata, references = _parse_asset(
-                                    relative, kind, data, engine_context,
-                                    sibling_class=stem_classes.get(PurePosixPath(relative).stem, ""),
-                                )
-                                metadata["parserRevision"] = PARSER_REVISION
-                                parse_status = "parsed" if metadata.get("parser") != "none" else "provider-required"
-                                if kind == "package" and metadata.get("className"):
-                                    stem_classes[PurePosixPath(relative).stem] = str(metadata["className"])
-                                if kind == "package" and str(metadata.get("className", "")) in _MATERIAL_CLASS_NAMES:
-                                    material_stems.add(PurePosixPath(relative).stem)
-                            except (OSError, ValueError, struct.error, json.JSONDecodeError) as error:
-                                metadata = {"parser": "error", "errorType": type(error).__name__}
-                                references = []
-                                parse_status = "parse-error"
-                                parse_failures += 1
-                        else:
-                            parse_status = "skipped-parse-size"
-                            metadata = {"parser": "none", "reason": "file exceeds fixed parser byte bound"}
-                    record = {
-                        "assetId": _asset_identity(relative, content_sha256, size, modified_ns),
-                        "relativePath": relative,
-                        "kind": kind,
-                        "format": _format_name(PurePosixPath(relative)),
-                        "size": size,
-                        "modifiedNs": modified_ns,
-                        "contentSha256": content_sha256,
-                        "hashStatus": hash_status,
-                        "parseStatus": parse_status,
-                        "metadata": metadata,
-                        "references": references,
-                    }
-                records.append(record)
-                visited.add(relative)
-                if checkpoint_seconds and time.monotonic() - last_checkpoint >= checkpoint_seconds:
-                    if progress is not None:
+                content_sha256 = ""
+                hash_status = "skipped-size"
+                parsed: dict[str, Any] = {
+                    "parser": "none",
+                    "reason": "file exceeds the admitted per-file hash/parse bound",
+                }
+                references: list[dict[str, Any]] = []
+                parse_status = "skipped-size"
+                if size <= maximum_file_size:
+                    content_sha256 = _hash_regular_file(resolved, size)
+                    after_hash = resolved.stat()
+                    if int(after_hash.st_size) != size or int(after_hash.st_mtime_ns) != modified_ns:
+                        raise AssetCatalogError("asset changed while it was hashed: %s" % resolved)
+                    hashed += 1
+                    hash_status = "sha256"
+                    if size <= MAX_PARSE_BYTES:
                         try:
-                            progress({"phase": "checkpoint", "walked": walked, "hashed": hashed, "reused": reused, "deferred": deferred})
+                            data = resolved.read_bytes()
+                            after_read = resolved.stat()
+                            if int(after_read.st_size) != size or int(after_read.st_mtime_ns) != modified_ns:
+                                raise AssetCatalogError("asset changed while it was parsed: %s" % resolved)
+                            parsed, references = _parse_asset(
+                                relative, kind, data, engine_context,
+                                sibling_class=stem_classes.get(PurePosixPath(relative).stem, ""),
+                            )
+                            parsed["parserRevision"] = PARSER_REVISION
+                            parse_status = "parsed" if parsed.get("parser") != "none" else "provider-required"
+                            if kind == "package" and parsed.get("className"):
+                                stem_classes[PurePosixPath(relative).stem] = str(parsed["className"])
+                            if kind == "package" and str(parsed.get("className", "")) in _MATERIAL_CLASS_NAMES:
+                                material_stems.add(PurePosixPath(relative).stem)
+                        except (OSError, ValueError, struct.error, json.JSONDecodeError) as error:
+                            parsed = {"parser": "error", "errorType": type(error).__name__}
+                            references = []
+                            parse_status = "parse-error"
+                            parse_failures += 1
+                    else:
+                        parse_status = "skipped-parse-size"
+                        parsed = {"parser": "none", "reason": "file exceeds fixed parser byte bound"}
+                return {
+                    "assetId": _asset_identity(relative, content_sha256, size, modified_ns),
+                    "relativePath": relative,
+                    "kind": kind,
+                    "format": _format_name(PurePosixPath(relative)),
+                    "size": size,
+                    "modifiedNs": modified_ns,
+                    "contentSha256": content_sha256,
+                    "hashStatus": hash_status,
+                    "parseStatus": parse_status,
+                    "metadata": _bounded_numeric_metadata(parsed),
+                    "references": references,
+                }
+
+            for directory, directory_names, file_names in os.walk(root, followlinks=False):
+                material_stems: set[str] = set()
+                stem_classes: dict[str, str] = {}
+                directory_path = Path(directory)
+                if _is_redirected(directory_path):
+                    raise AssetCatalogError(
+                        "asset scan traversed a symbolic link or reparse point"
+                    )
+                safe_directories: list[str] = []
+                for name in sorted(directory_names, key=str.casefold):
+                    filesystem_entries += 1
+                    if filesystem_entries > HARD_MAX_FILESYSTEM_ENTRIES:
+                        raise AssetCatalogError(
+                            "asset root exceeds the fixed filesystem traversal bound"
+                        )
+                    candidate = directory_path / name
+                    if _is_redirected(candidate):
+                        skipped_symlinks += 1
+                    else:
+                        safe_directories.append(name)
+                directory_names[:] = safe_directories
+                for name in sorted(file_names, key=str.casefold):
+                    filesystem_entries += 1
+                    visited_files += 1
+                    if filesystem_entries > HARD_MAX_FILESYSTEM_ENTRIES:
+                        raise AssetCatalogError(
+                            "asset root exceeds the fixed filesystem traversal bound"
+                        )
+                    relative_name = PurePosixPath(
+                        *(directory_path.relative_to(root).parts if directory_path != root else ()),
+                        name,
+                    )
+                    if depth_mode == "names" and not _names_only_admitted(relative_name):
+                        skipped_unsupported += 1
+                        continue
+                    walked += 1
+                    if progress is not None and walked % 500 == 0:
+                        try:
+                            progress({"phase": "scan", **_note()})
                         except Exception:
                             pass
-                    _checkpoint()
-        if progress is not None:
+                    if walked > max_files:
+                        raise AssetCatalogScanLimitError(
+                            maximum_files=max_files, observed_files=walked
+                        )
+                    path = directory_path / name
+                    if _is_redirected(path) or not path.is_file():
+                        skipped_symlinks += 1
+                        continue
+                    resolved = path.resolve(strict=True)
+                    if not _within(root, resolved):
+                        raise AssetCatalogError("asset file escaped the configured root")
+                    before = resolved.stat()
+                    relative = resolved.relative_to(root).as_posix()
+                    size = int(before.st_size)
+                    modified_ns = int(before.st_mtime_ns)
+                    kind = _classify(PurePosixPath(relative))
+                    deep = in_scope(relative) and _deep_admitted(
+                        depth_mode, kind, relative, size, material_stems, stem_classes)
+                    old = writer.lookup(relative)
+                    old_current = bool(
+                        mode == "incremental"
+                        and old is not None
+                        and int(old["size"]) == size
+                        and int(old["modified_ns"]) == modified_ns
+                    )
+                    old_complete = bool(
+                        old_current
+                        and old["content_sha256"]
+                        and (
+                            old["parse_status"] not in {"parsed", "provider-required", "parse-error"}
+                            or int(old["parser_revision"]) == PARSER_REVISION
+                        )
+                    )
+                    if old_complete or (old_current and not deep):
+                        reused += 1
+                        pending_stamps.append(int(old["rowid"]))
+                        if str(old["kind"]) == "package" and old["class_name"]:
+                            reused_class = str(old["class_name"])
+                            stem_classes[PurePosixPath(relative).stem] = reused_class
+                            if reused_class in _MATERIAL_CLASS_NAMES:
+                                material_stems.add(PurePosixPath(relative).stem)
+                    else:
+                        record = _stat_record(relative, resolved, size, modified_ns, kind, deep,
+                                              material_stems, stem_classes)
+                        if old is not None:
+                            writer.delete(int(old["rowid"]), str(old["asset_id"]), str(old["row_sha256"]))
+                        writer.write(record, generation)
+                        written += 1
+                    if len(pending_stamps) >= 2000:
+                        writer.stamp(pending_stamps, generation)
+                        pending_stamps.clear()
+                    if checkpoint_seconds and time.monotonic() - last_checkpoint >= checkpoint_seconds:
+                        _checkpoint()
+                        if progress is not None:
+                            try:
+                                progress({"phase": "checkpoint", **_note(), "checkpoint": checkpoints})
+                            except Exception:
+                                pass
+            writer.stamp(pending_stamps, generation)
+            pending_stamps.clear()
+            if progress is not None:
+                try:
+                    progress({"phase": "publish", **_note()})
+                except Exception:
+                    pass
+            # The walk covered the whole tree: rows nobody touched are files
+            # that no longer exist.
+            removed = 0
+            while True:
+                stale_rows = db.execute(
+                    "SELECT rowid, asset_id, row_sha256 FROM assets "
+                    "WHERE generation < ? LIMIT 2000",
+                    (generation,),
+                ).fetchall()
+                if not stale_rows:
+                    break
+                for row in stale_rows:
+                    writer.delete(
+                        int(row["rowid"]),
+                        str(row["asset_id"]),
+                        str(row["row_sha256"]),
+                    )
+                    removed += 1
+            if written or removed or metadata.get("complete") != "true":
+                writer.resolve_references()
+                writer.rebuild_same_content()
+            catalog_sha256 = writer.publish(
+                root=root, build_id=build_id, scan_mode=mode, engine=engine, complete=True,
+                progress_note={**_note(), "removed": removed, "checkpoints": checkpoints, "at": _utc_now()},
+                generation=generation, recompute=True)
+            db.execute("COMMIT")
+            summary = self._scan_summary(db)
+        except BaseException:
             try:
-                progress({"phase": "publish", "walked": walked, "hashed": hashed, "reused": reused, "deferred": deferred})
-            except Exception:
+                db.execute("ROLLBACK")
+            except sqlite3.Error:
                 pass
-        catalog_sha256, relationships = _publish(records, complete=True)
-        kinds = Counter(str(item["kind"]) for item in records)
-        formats = Counter(str(item["format"]) for item in records)
+            raise
+        finally:
+            db.close()
         return {
             "schema": "renderdoc-ultra-unpacked-asset-index/v1",
             "schemaVersion": 1,
@@ -1754,85 +2236,824 @@ class AssetCatalogService:
             "scanMode": mode,
             "depth": depth_mode,
             "scopePrefixes": prefixes,
-            "engine": engine_context.to_dict(),
-            "assetCount": len(records),
-            "deferredCount": sum(1 for item in records if item.get("hashStatus") == "deferred"),
-            "relationshipCount": len(relationships),
-            "verifiedRelationshipCount": sum(1 for item in relationships if item["verified"]),
-            "unresolvedRelationshipCount": sum(1 for item in relationships if not item["verified"]),
-            "countsByKind": dict(sorted(kinds.items())),
-            "countsByFormat": dict(sorted(formats.items())),
-            "cache": {"reusedFiles": reused, "hashedFiles": hashed, "checkpoints": checkpoints},
+            "engine": engine,
+            "assetCount": summary["assetCount"],
+            "deferredCount": summary["deferredCount"],
+            "relationshipCount": summary["relationshipCount"],
+            "verifiedRelationshipCount": summary["verifiedRelationshipCount"],
+            "unresolvedRelationshipCount": summary["relationshipCount"] - summary["verifiedRelationshipCount"],
+            "countsByKind": summary["countsByKind"],
+            "countsByFormat": summary["countsByFormat"],
+            "cache": {"reusedFiles": reused, "hashedFiles": hashed, "checkpoints": checkpoints,
+                      "writtenFiles": written, "removedFiles": removed},
             "complete": True,
             "diagnostics": {
                 "skippedSymlinks": skipped_symlinks,
                 "parseFailures": parse_failures,
-                "weakIdentityFiles": sum(1 for item in records if not item["contentSha256"]),
-                "referenceTruncatedAssets": sum(
-                    1
-                    for item in records
-                    if item.get("metadata", {}).get("referencesTruncated") is True
-                ),
+                "weakIdentityFiles": summary["weakIdentityFiles"],
+                "referenceTruncatedAssets": summary["referenceTruncatedAssets"],
             },
             "coverage": {
                 "complete": True,
                 "truncated": False,
                 "walkedFiles": walked,
+                "visitedFiles": visited_files,
+                "filesystemEntries": filesystem_entries,
+                "skippedUnsupportedFiles": skipped_unsupported,
                 "maximumFiles": max_files,
+                "maximumFilesystemEntries": HARD_MAX_FILESYSTEM_ENTRIES,
                 "maximumFileSizeMiB": max_file_size_mb,
             },
             "policy": {
                 "projectOwnedCatalog": True,
+                "indexNotCopy": True,
                 "semanticGuessesPersisted": False,
                 "heuristicRelationshipsPersisted": False,
                 "unresolvedReferencesRemainUnverified": True,
             },
         }
 
+    @staticmethod
+    def _scan_summary(db: sqlite3.Connection) -> dict[str, Any]:
+        def _count(sql: str, *parameters: Any) -> int:
+            return int(db.execute(sql, parameters).fetchone()["n"])
+        return {
+            "assetCount": _count("SELECT COUNT(*) AS n FROM assets"),
+            "deferredCount": _count("SELECT COUNT(*) AS n FROM assets WHERE hash_status='deferred'"),
+            "relationshipCount": _count("SELECT COUNT(*) AS n FROM relationships"),
+            "verifiedRelationshipCount": _count("SELECT COUNT(*) AS n FROM relationships WHERE verified=1"),
+            "weakIdentityFiles": _count("SELECT COUNT(*) AS n FROM assets WHERE content_sha256=''"),
+            "referenceTruncatedAssets": _count(
+                "SELECT COUNT(*) AS n FROM assets WHERE metadata_json LIKE '%\"referencesTruncated\":true%'"),
+            "countsByKind": {str(row["kind"]): int(row["n"]) for row in db.execute(
+                "SELECT kind, COUNT(*) AS n FROM assets GROUP BY kind ORDER BY kind")},
+            "countsByFormat": {str(row["format"]): int(row["n"]) for row in db.execute(
+                "SELECT format, COUNT(*) AS n FROM assets GROUP BY format ORDER BY format")},
+        }
+
     def hydrate(self, asset_root: str | Path, relative_paths: Sequence[str], *,
                 max_files: int = DEFAULT_MAX_FILES) -> dict[str, Any]:
-        """Upgrade a few deferred records to full hash+parse, keeping the rest."""
+        """Upgrade a few deferred records to full hash+parse without a walk."""
 
+        root = _validate_root(asset_root)
+        wanted: list[str] = []
+        for value in list(relative_paths)[:256]:
+            text = str(value or "").replace("\\", "/").strip("/")
+            parts = text.split("/")
+            if not text or any(part in {"", ".", ".."} for part in parts) or len(text) > 4096:
+                raise AssetCatalogError("hydrate paths must be relative catalog paths")
+            if text not in wanted:
+                wanted.append(text)
         db, metadata = self._open_read_only()
         try:
             build_id = str(metadata.get("buildId", "") or "")
+            if Path(metadata.get("rootPath", "")).resolve() != root:
+                raise AssetCatalogError("asset catalog belongs to another configured root")
         finally:
             db.close()
-        return self.scan(asset_root, build_id=build_id, scan_mode="incremental", max_files=max_files,
-                         depth="full", scope_prefixes=list(relative_paths)[:256])
+        engine_context = self._stored_engine(metadata) or self._detect_engine(root, max_files)
+        db, metadata = self._open_writable(root, build_id)
+        hydrated: list[str] = []
+        missing: list[str] = []
+        try:
+            writer = _CatalogWriter(db, metadata)
+            generation = int(metadata.get("generation", "0") or "0")
+            db.execute("BEGIN")
+            for relative in wanted:
+                cursor = root
+                redirected = False
+                for part in PurePosixPath(relative).parts:
+                    cursor = cursor / part
+                    if _is_redirected(cursor):
+                        redirected = True
+                        break
+                if redirected or not cursor.is_file():
+                    missing.append(relative)
+                    continue
+                resolved = cursor.resolve(strict=True)
+                if not _within(root, resolved):
+                    raise AssetCatalogError("asset file escaped the configured root")
+                before = resolved.stat()
+                size = int(before.st_size)
+                modified_ns = int(before.st_mtime_ns)
+                kind = _classify(PurePosixPath(relative))
+                sibling = writer.lookup(PurePosixPath(relative).with_suffix(".uasset").as_posix())
+                stem_classes = {PurePosixPath(relative).stem: str(sibling["class_name"])} \
+                    if sibling is not None and sibling["class_name"] else {}
+                material_stems = {PurePosixPath(relative).stem} \
+                    if stem_classes.get(PurePosixPath(relative).stem) in _MATERIAL_CLASS_NAMES else set()
+                record = self._hydrate_record(relative, resolved, size, modified_ns, kind,
+                                              engine_context, stem_classes, material_stems)
+                old = writer.lookup(relative)
+                if old is not None:
+                    writer.delete(int(old["rowid"]), str(old["asset_id"]), str(old["row_sha256"]))
+                writer.write(record, generation if old is None else max(generation, 1))
+                hydrated.append(relative)
+            if hydrated:
+                writer.resolve_references()
+                writer.rebuild_same_content()
+            catalog_sha256 = writer.publish(
+                root=root, build_id=build_id, scan_mode=metadata.get("scanMode", "incremental"),
+                engine=_safe_json(metadata.get("engineJson", "")) or {"engine": metadata.get("engine", "unknown")},
+                complete=metadata.get("complete") == "true",
+                progress_note=_safe_json(metadata.get("progressJson", "")), generation=generation)
+            db.execute("COMMIT")
+        except BaseException:
+            try:
+                db.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            db.close()
+        return {
+            "schema": "renderdoc-ultra-unpacked-asset-hydrate/v1",
+            "schemaVersion": 1,
+            "catalogSha256": catalog_sha256,
+            "hydrated": hydrated,
+            "missing": missing,
+        }
+
+    def index_texture_preview(self, asset_root: str | Path, relative_path: str,
+                              preview_path: str | Path, *, expected_preview_sha256: str,
+                              expected_source_sha256: str, provenance: Mapping[str, Any]) -> dict[str, Any]:
+        """Index one Host-verified reader output under its exact original asset.
+
+        This private API requires the caller to authenticate the reader receipt
+        and its complete input closure. It does not turn a supplied PNG or a
+        perceptual match into physical GPU identity. Search rechecks all inputs.
+        """
+        root = _validate_root(asset_root)
+        identity_db, identity_metadata = self._open_read_only()
+        try:
+            if Path(identity_metadata.get("rootPath", "")).resolve() != root:
+                raise AssetCatalogError("texture preview catalog belongs to another configured root")
+        finally:
+            identity_db.close()
+        relative = str(relative_path).replace("\\", "/")
+        if not isinstance(provenance, Mapping):
+            raise AssetCatalogError("texture preview requires verified reader provenance")
+        operation = str(provenance.get("operationId", ""))
+        receipt_sha = str(provenance.get("receiptSha256", ""))
+        if not operation or len(operation) > 256 or not _SHA256_RE.fullmatch(receipt_sha):
+            raise AssetCatalogError("texture preview requires a verified operation and receipt digest")
+        inputs = _preview_input_identity(root, provenance.get("sourceFiles"))
+        if not any(item["relativePath"] == relative and item["sha256"] == expected_source_sha256 for item in inputs):
+            raise AssetCatalogError("texture preview input closure does not bind the original asset")
+        output = Path(preview_path).resolve()
+        data = _preview_bytes(Path(preview_path), expected_preview_sha256)
+        fingerprint = _image_fingerprint(data, ".png", reader_preview=True)
+        if not fingerprint.get("available"):
+            return {"indexed": False, "relativePath": relative,
+                    "reason": fingerprint.get("reason")}
+        # Reuse a current hashed owner. Hydrating it again would unnecessarily
+        # rebuild reference indexes for an already known original asset.
+        current = self.query(relative_paths=[relative], include_relationships=False, limit=1)
+        if not current["assets"] or current["assets"][0]["contentSha256"] != expected_source_sha256:
+            self.hydrate(root, [relative])
+        db, metadata = self._open_read_only()
+        try:
+            build_id = str(metadata.get("buildId", ""))
+        finally:
+            db.close()
+        # A preview augments an existing catalog. It must never recreate a
+        # catalog selected by another writer, or publish from metadata read
+        # before that writer committed a different row aggregate.
+        db = _database_connection(self.database_path, read_only=False)
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            metadata = _validate_schema(db)
+            if (Path(metadata.get("rootPath", "")).resolve() != root
+                    or metadata.get("buildId", "") != build_id):
+                raise AssetCatalogError("texture preview catalog changed during registration")
+            row = db.execute("SELECT " + _ASSET_COLUMNS + " FROM assets WHERE relative_path=?", (relative,)).fetchone()
+            if row is None:
+                raise AssetCatalogError("texture preview original asset is not indexed")
+            record = _row_record(row)
+            if record["contentSha256"] != expected_source_sha256:
+                raise AssetCatalogError("texture preview original asset changed during registration")
+            # Recheck the closure after hydration before committing derived data.
+            _preview_input_identity(root, inputs)
+            _preview_bytes(output, expected_preview_sha256)
+            binding = {"operationId": operation, "receiptSha256": receipt_sha,
+                       "sourceFiles": inputs, "previewPath": str(output),
+                       "previewSha256": expected_preview_sha256,
+                       "colorSpace": str(provenance.get("colorSpace", "unspecified"))[:64],
+                       "channels": str(provenance.get("channels", "reader-decoded-rgba"))[:64]}
+            fingerprint["previewProvenance"] = binding
+            fingerprint["evidenceKind"] = "decoded-reader-preview"
+            record["metadata"] = {**record["metadata"], "textureFingerprint": fingerprint}
+            new_digest = _row_digest(record)
+            writer = _CatalogWriter(db, metadata)
+            writer.aggregate ^= int(str(row["row_sha256"]), 16) ^ int(new_digest, 16)
+            db.execute("UPDATE assets SET metadata_json=?,row_sha256=? WHERE asset_id=?",
+                       (_canonical_bytes(record["metadata"]).decode("utf-8"), new_digest, record["assetId"]))
+            writer.write_thumbnail(record["assetId"], fingerprint)
+            identity = writer.publish(root=root, build_id=build_id,
+                scan_mode=metadata.get("scanMode", "incremental"),
+                engine=_safe_json(metadata.get("engineJson", "")),
+                complete=metadata.get("complete") == "true", generation=int(metadata.get("generation", "0")),
+                progress_note=_safe_json(metadata.get("progressJson", "")))
+            db.execute("COMMIT")
+        except BaseException:
+            try:
+                db.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            db.close()
+        return {"indexed": True, "catalogSha256": identity, "assetId": record["assetId"],
+                "relativePath": relative, "previewSha256": expected_preview_sha256,
+                "sourceFiles": inputs, "physicalIdentityVerified": False,
+                "evidenceKind": "decoded-reader-preview", "flat": bool(fingerprint.get("flat"))}
+
+    def resolve_unreal_texture_paths(self, asset_root: str | Path, references: Sequence[str], *,
+                                     reader_mount_roots: Sequence[str | Path] = (),
+                                     hydrate_current: bool = False) -> dict[str, Any]:
+        """Resolve complete object references through recorded mounts and current bytes.
+
+        UEX's numeric export suffix is admitted only for export zero of a
+        single-export texture package. No basename search or guessed directory
+        prefix participates in this mapping.
+        """
+        from .symbols.engines.unreal_package import map_object_path
+
+        root = _validate_root(asset_root)
+        values = list(dict.fromkeys(references))
+        if len(values) > 200 or any(not isinstance(item, str) or len(item) > 4096 for item in values):
+            raise AssetCatalogError("texture reference resolution exceeds its bounded path limit")
+        if hydrate_current and len(values) != 1:
+            raise AssetCatalogError("texture preview hydration requires one exact reference")
+        reader_roots: set[Path] = set()
+        for value in list(reader_mount_roots)[:16]:
+            candidate = Path(value)
+            if not _is_redirected(candidate) and candidate.is_dir():
+                candidate = candidate.resolve()
+                if candidate == root or root in candidate.parents:
+                    reader_roots.add(candidate)
+        db, metadata = self._open_read_only()
+        try:
+            if Path(metadata.get("rootPath", "")).resolve() != root:
+                raise AssetCatalogError("texture references belong to another configured catalog root")
+            engine = _safe_json(metadata.get("engineJson", ""))
+            if engine.get("engine") != "unreal":
+                return {"available": False, "reason": "catalog-is-not-unreal", "resolved": {}}
+            mounts = engine.get("mounts") or {}
+            resolved_paths: dict[str, str] = {}
+            unavailable: list[dict[str, str]] = []
+            checked: dict[str, dict[str, Any] | None] = {}
+            for reference in values:
+                text = reference.strip().replace("\\", "/")
+                if "'" in text and text.endswith("'"):
+                    text = text.split("'", 1)[1][:-1]
+                package, separator, suffix = text.rpartition(".")
+                numeric_export = bool(separator and suffix.isdecimal())
+                if separator and (numeric_export or suffix.casefold() == "uasset"
+                                  or suffix == PurePosixPath(package).name):
+                    text = package
+                elif separator:
+                    unavailable.append({"reference": reference, "reason": "unsupported-object-export"})
+                    continue
+                if numeric_export and suffix != "0":
+                    unavailable.append({"reference": reference, "reason": "export-identity-unavailable"})
+                    continue
+                candidates: set[str] = set()
+                if text.startswith("/"):
+                    mapped = map_object_path(text, mounts)
+                    if mapped:
+                        candidates.add(mapped)
+                elif ":" not in text and all(part not in {"", ".", ".."} for part in text.split("/")):
+                    candidates.add(text + ".uasset")
+                    for mount_root in reader_roots:
+                        target = mount_root / (text + ".uasset")
+                        candidates.add(target.relative_to(root).as_posix())
+                if hydrate_current:
+                    # The optional preview path upgrades only one already-listed
+                    # package. A directory-only catalog is enough to locate it,
+                    # but neither a basename nor a competing mount is guessed.
+                    indexed = []
+                    for relative in candidates:
+                        if not any(relative.startswith(str(base).rstrip("/") + "/") for base in mounts.values()):
+                            continue
+                        path = root / relative
+                        if (not path.is_file() or path.stat().st_size > MAX_PREVIEW_INPUT_BYTES
+                                or root not in path.resolve().parents
+                                or any(_is_redirected(part) for part in (path, *path.parents))):
+                            continue
+                        row = db.execute("SELECT " + _ASSET_COLUMNS + " FROM assets WHERE relative_path=?",
+                                         (relative,)).fetchone()
+                        if row is not None:
+                            indexed.append((relative, path, _row_record(row)))
+                    if len(indexed) == 1:
+                        relative, path, record = indexed[0]
+                        known_class = record["metadata"].get("className")
+                        if (not known_class or known_class in _TEXTURE_CLASS_NAMES) and (
+                                not record["contentSha256"] or not known_class
+                                or path.stat().st_size != record["size"]
+                                or _hash_regular_file(path, path.stat().st_size) != record["contentSha256"]):
+                            db.close()
+                            self.hydrate(root, [relative], max_files=1)
+                            return self.resolve_unreal_texture_paths(
+                                root, values, reader_mount_roots=reader_mount_roots)
+                    elif len(indexed) > 1:
+                        unavailable.append({"reference": reference, "reason": "ambiguous-current-assets"})
+                        continue
+                matches: set[str] = set()
+                for relative in candidates:
+                    # Reader-root paths must also belong to the catalog's
+                    # recorded content mounts, including plugin mounts.
+                    if not any(relative.startswith(str(base).rstrip("/") + "/") for base in mounts.values()):
+                        continue
+                    if relative not in checked:
+                        checked[relative] = None
+                        path = root / relative
+                        if _is_redirected(path) or not path.is_file() or root not in path.resolve().parents:
+                            continue
+                        row = db.execute("SELECT " + _ASSET_COLUMNS + " FROM assets WHERE relative_path=?",
+                                         (relative,)).fetchone()
+                        if row is None:
+                            continue
+                        record = _row_record(row)
+                        size = path.stat().st_size
+                        if (size != record["size"] or size > MAX_PREVIEW_INPUT_BYTES
+                                or not record["contentSha256"]
+                                or _hash_regular_file(path, size) != record["contentSha256"]):
+                            continue
+                        checked[relative] = record
+                    record = checked[relative]
+                    if record is None:
+                        continue
+                    details = record["metadata"]
+                    if details.get("className") not in _TEXTURE_CLASS_NAMES:
+                        continue
+                    if numeric_export and details.get("exportCount") != 1:
+                        continue
+                    matches.add(relative)
+                if len(matches) == 1:
+                    resolved_paths[reference] = next(iter(matches))
+                else:
+                    unavailable.append({"reference": reference,
+                                        "reason": "ambiguous-current-assets" if matches else
+                                                  "no-current-exact-mounted-texture"})
+            return {"available": True, "catalogSha256": metadata["catalogSha256"],
+                    "resolved": resolved_paths, "unavailable": unavailable}
+        finally:
+            db.close()
 
     @staticmethod
-    def _detect_engine(root: Path, max_files: int) -> Any:
-        """Cheap name-only pre-pass so per-file parsers know the engine/mounts."""
+    def _hydrate_record(relative: str, resolved: Path, size: int, modified_ns: int, kind: str,
+                        engine_context: Any, stem_classes: dict[str, str],
+                        material_stems: set[str]) -> dict[str, Any]:
+        content_sha256 = ""
+        hash_status = "skipped-size"
+        parsed: dict[str, Any] = {"parser": "none", "reason": "file exceeds the admitted per-file hash/parse bound"}
+        references: list[dict[str, Any]] = []
+        parse_status = "skipped-size"
+        if size <= DEFAULT_MAX_FILE_SIZE_MB * 1024 * 1024:
+            content_sha256 = _hash_regular_file(resolved, size)
+            hash_status = "sha256"
+            if size <= MAX_PARSE_BYTES:
+                try:
+                    data = resolved.read_bytes()
+                    parsed, references = _parse_asset(
+                        relative, kind, data, engine_context,
+                        sibling_class=stem_classes.get(PurePosixPath(relative).stem, ""))
+                    parsed["parserRevision"] = PARSER_REVISION
+                    parse_status = "parsed" if parsed.get("parser") != "none" else "provider-required"
+                except (OSError, ValueError, struct.error, json.JSONDecodeError) as error:
+                    parsed = {"parser": "error", "errorType": type(error).__name__}
+                    references = []
+                    parse_status = "parse-error"
+            else:
+                parse_status = "skipped-parse-size"
+                parsed = {"parser": "none", "reason": "file exceeds fixed parser byte bound"}
+        return {
+            "assetId": _asset_identity(relative, content_sha256, size, modified_ns),
+            "relativePath": relative,
+            "kind": kind,
+            "format": _format_name(PurePosixPath(relative)),
+            "size": size,
+            "modifiedNs": modified_ns,
+            "contentSha256": content_sha256,
+            "hashStatus": hash_status,
+            "parseStatus": parse_status,
+            "metadata": _bounded_numeric_metadata(parsed),
+            "references": references,
+        }
+
+    @staticmethod
+    def _stored_engine(metadata: Mapping[str, str]) -> Any:
+        """The engine context the last scan recorded, so a hydration skips the walk."""
+
+        from .symbols.engines import EngineContext
+
+        stored = _safe_json(metadata.get("engineJson", ""))
+        engine = str(stored.get("engine", "") or "")
+        if not engine:
+            return None
+        return EngineContext(engine, stored.get("details") or {}, stored.get("mounts") or {})
+
+    @staticmethod
+    def _detect_engine(
+        root: Path,
+        max_files: int,
+        *,
+        include_unknown: bool = False,
+    ) -> Any:
+        """Cheap name pre-pass so parsers know the engine and asset relations.
+
+        A names-only scan deliberately admits only supported formats.  A
+        headers/full scan also indexes unknown formats, so its relationship
+        index must see those same names; otherwise a material can mention an
+        asset which is present in the catalog but impossible to resolve.
+        """
 
         from .symbols.engines import detect_engine
 
+        sample_limit = max(1, min(int(max_files), ENGINE_DETECTION_SAMPLE_FILES))
+        visited_entries = 0
         relative_paths: list[str] = []
         for directory, directory_names, file_names in os.walk(root, followlinks=False):
             directory_path = Path(directory)
-            directory_names[:] = [
-                name for name in directory_names if not _is_redirected(directory_path / name)
-            ]
+            safe_directories: list[str] = []
+            for name in sorted(directory_names, key=str.casefold):
+                visited_entries += 1
+                if visited_entries > HARD_MAX_FILESYSTEM_ENTRIES:
+                    raise AssetCatalogError(
+                        "asset root exceeds the fixed filesystem traversal bound"
+                    )
+                if not _is_redirected(directory_path / name):
+                    safe_directories.append(name)
+            directory_names[:] = safe_directories
             base = directory_path.relative_to(root).as_posix() if directory_path != root else ""
-            for name in file_names:
-                relative_paths.append("%s/%s" % (base, name) if base else name)
-                if len(relative_paths) > max_files:
+            for name in sorted(file_names, key=str.casefold):
+                visited_entries += 1
+                if visited_entries > HARD_MAX_FILESYSTEM_ENTRIES:
+                    raise AssetCatalogError(
+                        "asset root exceeds the fixed filesystem traversal bound"
+                    )
+                relative = "%s/%s" % (base, name) if base else name
+                if (
+                    not include_unknown
+                    and not _names_only_admitted(PurePosixPath(relative))
+                ):
+                    continue
+                relative_paths.append(relative)
+                if len(relative_paths) >= sample_limit:
                     break
-            if len(relative_paths) > max_files:
+            if len(relative_paths) >= sample_limit:
                 break
         return detect_engine(relative_paths)
+
+    def _open_writable(self, root: Path, build_id: str) -> tuple[sqlite3.Connection, dict[str, str]]:
+        """The live index for this root/build: opened in place, created if absent.
+
+        A valid catalog of another root or build is transactionally emptied
+        before its new identity is published. An older schema or damaged file
+        must be removed completely; a Windows sharing violation is a surfaced
+        retryable failure, never permission to reuse old rows under new
+        metadata. Abandoned temporaries of older whole-file rewrites are
+        removed here too.
+        """
+
+        _cleanup_stale_temporaries(self.database_path)
+        path = self.database_path
+        recreate = not path.exists()
+        reset_existing = False
+        metadata: dict[str, str] = {}
+        if not recreate:
+            if path.is_symlink() or not path.is_file():
+                raise AssetCatalogError("catalog database must be a regular file")
+            try:
+                with closing(_database_connection(path, read_only=False)) as probe:
+                    metadata = _validate_schema(probe)
+                    if (os.path.normcase(str(metadata.get("rootPath", ""))) != os.path.normcase(str(root))
+                            or str(metadata.get("buildId", "")) != build_id):
+                        reset_existing = True
+            except (AssetCatalogError, sqlite3.Error):
+                recreate = True
+            if recreate:
+                _remove_database_files(path)
+                metadata = {}
+        db = _database_connection(path, read_only=False)
+        try:
+            if recreate or reset_existing:
+                metadata = _initialise_catalog_database(
+                    db, root, build_id, reset_existing=reset_existing
+                )
+        except BaseException:
+            db.close()
+            raise
+        return db, metadata
+
+    def prepare_root(self, asset_root: str | Path, *, build_id: str = "") -> dict[str, Any]:
+        """Synchronously bind storage to one root/build before a background scan.
+
+        This is intentionally a metadata/storage preparation only: it performs
+        no tree walk, hashing or parsing.  Root switches therefore surface a
+        sharing/transaction failure to the initiating call instead of first
+        reporting a background job and failing later after the old catalog was
+        accidentally relabelled.
+        """
+
+        root = _validate_root(asset_root)
+        if not isinstance(build_id, str) or len(build_id) > 256 or "\x00" in build_id:
+            raise AssetCatalogError("build_id must be a bounded string")
+        db, metadata = self._open_writable(root, build_id)
+        try:
+            return {
+                "rootPath": str(root),
+                "buildId": build_id,
+                "catalogSha256": str(metadata.get("catalogSha256") or ""),
+                "generation": int(metadata.get("generation", "0") or 0),
+                "complete": metadata.get("complete") == "true",
+            }
+        finally:
+            db.close()
 
     def _open_read_only(self) -> tuple[sqlite3.Connection, dict[str, str]]:
         if self.database_path.is_symlink() or not self.database_path.is_file():
             raise AssetCatalogError("active project has no prepared unpacked-asset catalog")
         connection = _database_connection(self.database_path, read_only=True)
         try:
+            # One snapshot for the whole read, even while a scan commits.
+            connection.execute("BEGIN")
             metadata = _validate_schema(connection)
-            _validate_catalog_identity(connection, metadata)
         except Exception:
             connection.close()
             raise
         return connection, metadata
+
+    def verify(self) -> dict[str, Any]:
+        """Audit every row digest against the catalog identity (not on the read path)."""
+
+        db, metadata = self._open_read_only()
+        try:
+            _validate_catalog_identity(db, metadata)
+            checked = 0
+            for row in db.execute("SELECT %s FROM assets" % _ASSET_COLUMNS):
+                _row_record(row)
+                checked += 1
+            return {"verified": True, "assetCount": checked, "catalogSha256": metadata["catalogSha256"]}
+        finally:
+            db.close()
+
+    def content_manifest_status(self, asset_root: str | Path) -> dict[str, Any]:
+        """Read the catalog-owner content generation without walking the tree."""
+
+        root = _validate_root(asset_root)
+        db, metadata = self._open_read_only()
+        try:
+            if Path(metadata.get("rootPath", "")).resolve() != root:
+                raise AssetCatalogError(
+                    "asset content manifest belongs to another configured root"
+                )
+            schema = metadata.get("contentManifestSchema", "")
+            catalog_sha = metadata.get("catalogSha256", "")
+            catalog_generation = int(metadata.get("generation", "0") or 0)
+            owner_catalog_sha = metadata.get("contentManifestCatalogSha256", "")
+            owner_catalog_generation = int(
+                metadata.get("contentManifestCatalogGeneration", "-1") or -1
+            )
+            document_sha = metadata.get("contentManifestDocumentSha256", "")
+            content_root = metadata.get("contentManifestRootSha256", "")
+            snapshot = metadata.get("contentManifestSnapshotSha256", "")
+            generation = int(metadata.get("contentManifestGeneration", "0") or 0)
+            file_count = int(metadata.get("contentManifestFileCount", "-1") or -1)
+            byte_size = int(metadata.get("contentManifestByteSize", "-1") or -1)
+            manifest_path = self.database_path.parent / CONTENT_MANIFEST_FILENAME
+            if (
+                schema != CONTENT_MANIFEST_SCHEMA
+                or owner_catalog_sha != catalog_sha
+                or owner_catalog_generation != catalog_generation
+                or not _SHA256_RE.fullmatch(document_sha)
+                or not _SHA256_RE.fullmatch(content_root)
+                or not _SHA256_RE.fullmatch(snapshot)
+                or generation <= 0 or file_count < 0 or byte_size < 0
+                or manifest_path.is_symlink() or not manifest_path.is_file()
+            ):
+                raise AssetCatalogError(
+                    "asset content manifest is missing or stale for this catalog generation"
+                )
+            return {
+                "ready": True,
+                "assetRootManifestGeneration": generation,
+                "assetRootManifestSha256": content_root,
+                "assetRootSnapshotSha256": snapshot,
+                "assetRootFileCount": file_count,
+                "assetRootByteSize": byte_size,
+                "assetRootManifestDocumentSha256": document_sha,
+                "assetRootManifestCatalogGeneration": catalog_generation,
+            }
+        finally:
+            db.close()
+
+    def refresh_content_manifest(self, asset_root: str | Path) -> dict[str, Any]:
+        """Publish one complete per-file content generation owned by this catalog.
+
+        This is the expensive boundary run by the background/explicit index
+        owner.  It walks the full unpacked tree, reuses SHA-256 only when the OS
+        change token is unchanged, and publishes a Merkle root into catalog
+        metadata.  Ordinary gates then call :meth:`content_manifest_status` and
+        do no walk/stat/content reads.
+        """
+
+        root = _validate_root(asset_root)
+        db, metadata = self._open_read_only()
+        try:
+            if Path(metadata.get("rootPath", "")).resolve() != root:
+                raise AssetCatalogError(
+                    "asset content manifest belongs to another configured root"
+                )
+            catalog_sha = str(metadata["catalogSha256"])
+            catalog_generation = int(metadata.get("generation", "0") or 0)
+            prior_document_sha = str(
+                metadata.get("contentManifestDocumentSha256", "") or ""
+            )
+            prior_generation = int(
+                metadata.get("contentManifestGeneration", "0") or 0
+            )
+        finally:
+            db.close()
+
+        manifest_path = self.database_path.parent / CONTENT_MANIFEST_FILENAME
+        prior: dict[str, Any] | None = None
+        if _SHA256_RE.fullmatch(prior_document_sha):
+            try:
+                if manifest_path.stat().st_size > 512 * 1024 * 1024:
+                    raise AssetCatalogError("asset content manifest exceeds its byte bound")
+                loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+                checked = _content_manifest_document(loaded)
+                if (
+                    checked["documentSha256"] == prior_document_sha
+                    and os.path.normcase(str(checked.get("assetRoot") or ""))
+                    == os.path.normcase(str(root))
+                ):
+                    prior = checked
+            except (OSError, ValueError, AssetCatalogError):
+                prior = None
+
+        excluded = self.database_path.parent.resolve()
+
+        def tree_metadata() -> list[dict[str, Any]]:
+            rows: list[dict[str, Any]] = []
+            for directory, directory_names, file_names in os.walk(
+                root, followlinks=False
+            ):
+                directory_path = Path(directory)
+                if _is_redirected(directory_path):
+                    raise AssetCatalogError(
+                        "asset content manifest traversed a redirected directory"
+                    )
+                safe_directories: list[str] = []
+                for name in sorted(directory_names, key=str.casefold):
+                    candidate = directory_path / name
+                    resolved = candidate.resolve()
+                    if resolved == excluded or _is_redirected(candidate):
+                        continue
+                    safe_directories.append(name)
+                directory_names[:] = safe_directories
+                for name in sorted(file_names, key=str.casefold):
+                    path = directory_path / name
+                    if _is_redirected(path) or not path.is_file():
+                        continue
+                    resolved = path.resolve(strict=True)
+                    if not _within(root, resolved) or _within(excluded, resolved):
+                        continue
+                    if len(rows) >= HARD_MAX_FILES:
+                        raise AssetCatalogScanLimitError(
+                            maximum_files=HARD_MAX_FILES,
+                            observed_files=len(rows) + 1,
+                        )
+                    stat = resolved.stat()
+                    rows.append({
+                        "relativePath": resolved.relative_to(root).as_posix(),
+                        "size": int(stat.st_size),
+                        "mtimeNs": int(stat.st_mtime_ns),
+                        "changeToken": _file_change_token(resolved, stat),
+                        "fileId": int(getattr(stat, "st_ino", 0) or 0),
+                    })
+            return rows
+
+        metadata_rows = tree_metadata()
+        metadata_snapshot = _canonical_sha256(metadata_rows)
+        prior_rows = {
+            str(item.get("relativePath") or ""): item
+            for item in ((prior or {}).get("files") or [])
+            if isinstance(item, Mapping)
+        }
+        files: list[dict[str, Any]] = []
+        for item in metadata_rows:
+            relative = str(item["relativePath"])
+            old = prior_rows.get(relative)
+            fingerprint = (
+                item["size"], item["mtimeNs"], item["changeToken"], item["fileId"]
+            )
+            old_fingerprint = (
+                old.get("size"), old.get("mtimeNs"),
+                old.get("changeToken"), old.get("fileId"),
+            ) if isinstance(old, Mapping) else ()
+            content_sha = (
+                str(old.get("contentSha256") or "").lower()
+                if old_fingerprint == fingerprint else ""
+            )
+            if not _SHA256_RE.fullmatch(content_sha):
+                path = root / PurePosixPath(relative)
+                before = path.stat()
+                before_fingerprint = (
+                    int(before.st_size), int(before.st_mtime_ns),
+                    _file_change_token(path, before),
+                    int(getattr(before, "st_ino", 0) or 0),
+                )
+                content_sha = _content_manifest_file_sha256(path)
+                after = path.stat()
+                after_fingerprint = (
+                    int(after.st_size), int(after.st_mtime_ns),
+                    _file_change_token(path, after),
+                    int(getattr(after, "st_ino", 0) or 0),
+                )
+                if before_fingerprint != fingerprint or after_fingerprint != fingerprint:
+                    raise AssetCatalogError(
+                        "asset root changed while its content manifest was read"
+                    )
+            files.append({**item, "contentSha256": content_sha})
+        if tree_metadata() != metadata_rows:
+            raise AssetCatalogError(
+                "asset root changed while its content manifest generation was built"
+            )
+        content_rows = [
+            {
+                "relativePath": item["relativePath"],
+                "size": item["size"],
+                "contentSha256": item["contentSha256"],
+            }
+            for item in files
+        ]
+        payload = {
+            "schema": CONTENT_MANIFEST_SCHEMA,
+            "schemaVersion": 1,
+            "assetRoot": str(root),
+            "catalogSha256": catalog_sha,
+            "catalogGeneration": catalog_generation,
+            "generation": max(prior_generation, int((prior or {}).get("generation") or 0)) + 1,
+            "metadataSnapshotSha256": metadata_snapshot,
+            "contentRootSha256": _canonical_sha256(content_rows),
+            "fileCount": len(files),
+            "byteSize": sum(int(item["size"]) for item in files),
+            "files": files,
+        }
+        payload["documentSha256"] = _canonical_sha256(payload)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = manifest_path.with_name(manifest_path.name + ".tmp")
+        temporary.write_text(
+            json.dumps(
+                payload, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        _content_manifest_document(payload)
+        os.replace(temporary, manifest_path)
+
+        writable = _database_connection(self.database_path, read_only=False)
+        try:
+            writable.execute("BEGIN IMMEDIATE")
+            current = _validate_schema(writable)
+            if (
+                current.get("catalogSha256") != catalog_sha
+                or int(current.get("generation", "0") or 0) != catalog_generation
+                or Path(current.get("rootPath", "")).resolve() != root
+            ):
+                raise AssetCatalogError(
+                    "asset catalog generation changed during content-manifest publication"
+                )
+            values = {
+                "contentManifestSchema": CONTENT_MANIFEST_SCHEMA,
+                "contentManifestGeneration": str(payload["generation"]),
+                "contentManifestDocumentSha256": payload["documentSha256"],
+                "contentManifestRootSha256": payload["contentRootSha256"],
+                "contentManifestSnapshotSha256": metadata_snapshot,
+                "contentManifestFileCount": str(payload["fileCount"]),
+                "contentManifestByteSize": str(payload["byteSize"]),
+                "contentManifestCatalogSha256": catalog_sha,
+                "contentManifestCatalogGeneration": str(catalog_generation),
+                "contentManifestUpdatedAt": _utc_now(),
+            }
+            writable.executemany(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES(?, ?)",
+                sorted(values.items()),
+            )
+            writable.execute("COMMIT")
+        except BaseException:
+            try:
+                writable.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            writable.close()
+        return self.content_manifest_status(root)
 
     def status(self) -> dict[str, Any]:
         db, metadata = self._open_read_only()
@@ -1845,7 +3066,7 @@ class AssetCatalogService:
                 str(row["kind"]): int(row["n"])
                 for row in db.execute("SELECT kind, COUNT(*) AS n FROM assets GROUP BY kind ORDER BY kind")
             }
-            return {
+            result = {
                 "schema": "renderdoc-ultra-unpacked-asset-index-status/v1",
                 "schemaVersion": 1,
                 "ready": True,
@@ -1854,16 +3075,24 @@ class AssetCatalogService:
                 "buildId": metadata.get("buildId", ""),
                 "scanMode": metadata.get("scanMode", ""),
                 "createdAt": metadata.get("createdAt", ""),
+                "updatedAt": metadata.get("updatedAt", metadata.get("createdAt", "")),
+                "generation": int(metadata.get("generation", "0") or 0),
                 "databasePath": str(self.database_path),
                 "engine": metadata.get("engine", "unknown"),
                 "tokenIndex": metadata.get("tokenIndex", "none"),
                 "assetCount": asset_count,
                 "relationshipCount": relationship_count,
                 "countsByKind": counts,
-                # Older catalogs predate checkpoints and were always complete.
                 "complete": metadata.get("complete", "true") != "false",
                 "progress": _safe_json(metadata.get("progressJson", "")),
             }
+            try:
+                result["contentManifest"] = self.content_manifest_status(
+                    metadata["rootPath"]
+                )
+            except AssetCatalogError:
+                result["contentManifest"] = {"ready": False}
+            return result
         finally:
             db.close()
 
@@ -1871,6 +3100,7 @@ class AssetCatalogService:
         self,
         *,
         text: str = "",
+        relative_paths: Sequence[str] = (),
         kinds: Sequence[str] = (),
         sha256: str = "",
         asset_ids: Sequence[str] = (),
@@ -1879,6 +3109,11 @@ class AssetCatalogService:
     ) -> dict[str, Any]:
         if not isinstance(text, str) or len(text) > 512 or "\x00" in text:
             raise AssetCatalogError("text query must be a bounded string")
+        paths = tuple(str(path).replace("\\", "/") for path in relative_paths)
+        if (len(paths) > MAX_QUERY_IDS or len(set(paths)) != len(paths)
+                or any(not path or len(path) > 4096 or "\x00" in path
+                       or any(part in {"", ".", ".."} for part in path.split("/")) for path in paths)):
+            raise AssetCatalogError("relative_paths must be bounded exact catalog paths")
         normalized_kinds = tuple(str(item).strip().casefold() for item in kinds)
         if len(normalized_kinds) > len(_KNOWN_KINDS) or len(set(normalized_kinds)) != len(normalized_kinds):
             raise AssetCatalogError("kinds must be a small unique list")
@@ -1900,6 +3135,9 @@ class AssetCatalogService:
         try:
             clauses: list[str] = []
             parameters: list[Any] = []
+            if paths:
+                clauses.append("relative_path IN (%s)" % ",".join("?" for _ in paths))
+                parameters.extend(paths)
             if text.strip():
                 clauses.append("(relative_path LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\')")
                 escaped = text.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -1915,8 +3153,7 @@ class AssetCatalogService:
                 parameters.extend(normalized_ids)
             where = " WHERE " + " AND ".join(clauses) if clauses else ""
             rows = db.execute(
-                "SELECT asset_id, relative_path, name, kind, format, size, modified_ns, "
-                "content_sha256, hash_status, parse_status, metadata_json FROM assets"
+                "SELECT " + _ASSET_COLUMNS + " FROM assets"
                 + where
                 + " ORDER BY kind, relative_path LIMIT ?",
                 (*parameters, limit + 1),
@@ -1925,19 +3162,8 @@ class AssetCatalogService:
             rows = rows[:limit]
             assets: list[dict[str, Any]] = []
             for row in rows:
-                item = {
-                    "assetId": row["asset_id"],
-                    "relativePath": row["relative_path"],
-                    "name": row["name"],
-                    "kind": row["kind"],
-                    "format": row["format"],
-                    "size": int(row["size"]),
-                    "modifiedNs": int(row["modified_ns"]),
-                    "contentSha256": row["content_sha256"],
-                    "hashStatus": row["hash_status"],
-                    "parseStatus": row["parse_status"],
-                    "metadata": json.loads(row["metadata_json"]),
-                }
+                # Every delivered row is checked against its own digest.
+                item = _row_record(row)
                 if include_relationships:
                     relation_rows = db.execute(
                         "SELECT relation, target_asset_id, target_path, target_guid, evidence_kind, "
@@ -1975,6 +3201,7 @@ class AssetCatalogService:
                 "rootPath": metadata["rootPath"],
                 "query": {
                     "text": text.strip(),
+                    "relativePaths": list(paths),
                     "kinds": list(normalized_kinds),
                     "sha256": digest,
                     "assetIds": list(normalized_ids),
@@ -1992,6 +3219,209 @@ class AssetCatalogService:
             }
         finally:
             db.close()
+
+    # -- scope: the directory-first way of finding things -------------------
+    @staticmethod
+    def _scope_bounds(prefixes: Sequence[str]) -> list[tuple[str, str]]:
+        bounds: list[tuple[str, str]] = []
+        for prefix in prefixes or ():
+            text = str(prefix or "").replace("\\", "/").strip("/")
+            if ".." in text.split("/") or len(text) > 4096:
+                raise AssetCatalogError("scope prefixes must be relative catalog paths")
+            folded = text.casefold()
+            if folded:
+                bounds.append((folded + "/", folded + "/\uffff"))
+            else:
+                bounds.append(("", "\uffff"))
+        if len(bounds) > 64:
+            raise AssetCatalogError("at most 64 scope prefixes per request")
+        return bounds
+
+    def directory_profile(self, *, depth: int = 3, prefix: str = "", kinds: Sequence[str] = (),
+                          limit: int = 200) -> dict[str, Any]:
+        """What lives where: file counts by kind and format per directory.
+
+        Built from the names index alone, so it works before anything has been
+        parsed. This is how a reader (or the AI) decides which folders are
+        worth opening for a material, a texture set or a mesh -- by the shape
+        of the tree, not by guessing names.
+        """
+
+        if isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 8:
+            raise AssetCatalogError("depth must be between 1 and 8")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 2000:
+            raise AssetCatalogError("limit must be between 1 and 2000")
+        wanted = {str(item).strip().casefold() for item in kinds if str(item).strip()}
+        if wanted - _KNOWN_KINDS:
+            raise AssetCatalogError("profile contains an unknown asset kind")
+        bounds = self._scope_bounds([prefix]) if prefix else []
+        base_depth = len([part for part in str(prefix or "").replace("\\", "/").strip("/").split("/") if part])
+        db, metadata = self._open_read_only()
+        try:
+            sql = "SELECT relative_path, kind, format, parse_status FROM assets"
+            parameters: list[Any] = []
+            if bounds:
+                sql += " WHERE folded_path >= ? AND folded_path < ?"
+                parameters.extend(bounds[0])
+            folders: dict[str, dict[str, Any]] = {}
+            total = 0
+            for row in db.execute(sql, parameters):
+                kind = str(row["kind"])
+                if wanted and kind not in wanted:
+                    continue
+                total += 1
+                parts = str(row["relative_path"]).split("/")[:-1]
+                cut = min(len(parts), base_depth + depth)
+                directory = "/".join(parts[:cut])
+                entry = folders.get(directory)
+                if entry is None:
+                    entry = folders[directory] = {"directory": directory, "files": 0, "parsed": 0,
+                                                  "byKind": {}, "byFormat": {}}
+                entry["files"] += 1
+                if str(row["parse_status"]) not in ("deferred",):
+                    entry["parsed"] += 1
+                entry["byKind"][kind] = entry["byKind"].get(kind, 0) + 1
+                fmt = str(row["format"])
+                entry["byFormat"][fmt] = entry["byFormat"].get(fmt, 0) + 1
+            ranked = sorted(folders.values(), key=lambda item: (-item["files"], item["directory"]))
+            for entry in ranked:
+                entry["byFormat"] = dict(sorted(entry["byFormat"].items(), key=lambda kv: -kv[1])[:8])
+                entry["byKind"] = dict(sorted(entry["byKind"].items(), key=lambda kv: -kv[1]))
+            return {
+                "schema": "renderdoc-ultra-unpacked-asset-directory-profile/v1",
+                "schemaVersion": 1,
+                "catalogSha256": metadata["catalogSha256"],
+                "engine": metadata.get("engine", "unknown"),
+                "prefix": str(prefix or ""),
+                "depth": depth,
+                "kinds": sorted(wanted),
+                "totalFiles": total,
+                "directoryCount": len(ranked),
+                "directories": ranked[:limit],
+                "truncated": len(ranked) > limit,
+            }
+        finally:
+            db.close()
+
+    def list_scope(self, prefixes: Sequence[str], *, kinds: Sequence[str] = (),
+                   class_names: Sequence[str] = (), parsed_only: bool = False,
+                   deferred_only: bool = False, limit: int = 400) -> list[dict[str, Any]]:
+        """Assets under the given folders, optionally by kind / class / parse state."""
+
+        bounds = self._scope_bounds(prefixes)
+        if not bounds:
+            return []
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5000:
+            raise AssetCatalogError("limit must be between 1 and 5000")
+        wanted_kinds = {str(item).strip().casefold() for item in kinds if str(item).strip()}
+        if wanted_kinds - _KNOWN_KINDS:
+            raise AssetCatalogError("scope contains an unknown asset kind")
+        wanted_classes = {str(item) for item in class_names if isinstance(item, str) and item}
+        db, unused = self._open_read_only()
+        try:
+            found: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for low, high in bounds:
+                clauses = ["folded_path >= ?", "folded_path < ?"]
+                parameters: list[Any] = [low, high]
+                if wanted_kinds:
+                    clauses.append("kind IN (%s)" % ",".join("?" for _ in wanted_kinds))
+                    parameters.extend(sorted(wanted_kinds))
+                if wanted_classes:
+                    clauses.append("class_name IN (%s)" % ",".join("?" for _ in wanted_classes))
+                    parameters.extend(sorted(wanted_classes))
+                if parsed_only:
+                    clauses.append("parse_status = 'parsed'")
+                if deferred_only:
+                    clauses.append("parse_status = 'deferred'")
+                for row in db.execute(
+                    "SELECT asset_id, relative_path, kind, format, size, parse_status, hash_status, class_name "
+                    "FROM assets WHERE " + " AND ".join(clauses) + " ORDER BY relative_path LIMIT ?",
+                    (*parameters, limit - len(found) + 1),
+                ):
+                    if row["relative_path"] in seen:
+                        continue
+                    seen.add(row["relative_path"])
+                    found.append({
+                        "assetId": row["asset_id"], "relativePath": row["relative_path"],
+                        "kind": row["kind"], "format": row["format"], "size": int(row["size"]),
+                        "parseStatus": row["parse_status"], "hashStatus": row["hash_status"],
+                        "className": row["class_name"],
+                    })
+                    if len(found) >= limit:
+                        return found
+            return found
+        finally:
+            db.close()
+
+    def hydrate_scope(self, asset_root: str | Path, prefixes: Sequence[str], *,
+                      kinds: Sequence[str] = (), max_files: int = 200) -> dict[str, Any]:
+        """Parse the descriptive files under a few folders -- and nothing else.
+
+        Package headers first (they say what class each asset is); then the
+        cooked exports of materials and textures, so locally decodable values
+        and thumbnails become searchable. Unsupported images request a reader
+        preview explicitly. Bulk data is never touched by this parser.
+        """
+
+        if isinstance(max_files, bool) or not isinstance(max_files, int) or not 1 <= max_files <= 2000:
+            raise AssetCatalogError("max_files must be between 1 and 2000")
+        wanted_kinds = tuple(kinds) if kinds else ("package", "material", "metadata", "shader", "texture", "mesh")
+        deferred = [item for item in self.list_scope(prefixes, kinds=wanted_kinds, deferred_only=True,
+                                                     limit=min(5000, max_files * 4))
+                    if PurePosixPath(str(item["relativePath"])).suffix.casefold() not in _BULK_SUFFIXES
+                    and PurePosixPath(str(item["relativePath"])).suffix.casefold() != ".uexp"]
+        headers = [str(item["relativePath"]) for item in deferred][:max_files]
+        hydrated: list[str] = []
+        missing: list[str] = []
+        for start in range(0, len(headers), 64):
+            receipt = self.hydrate(asset_root, headers[start:start + 64])
+            hydrated.extend(receipt.get("hydrated") or [])
+            missing.extend(receipt.get("missing") or [])
+        # Second pass includes texture payloads. Hydrating only their uasset
+        # headers leaves the very pixels the user selected unsearchable.
+        owners = self.list_scope(prefixes, kinds=("package",),
+                                class_names=sorted(_MATERIAL_CLASS_NAMES | _TEXTURE_CLASS_NAMES),
+                                parsed_only=True, limit=max_files)
+        exports = []
+        texture_exports = []
+        for item in owners:
+            relative = str(item["relativePath"])
+            if relative.casefold().endswith((".uasset", ".umap")):
+                exports.append(PurePosixPath(relative).with_suffix(".uexp").as_posix())
+                if item.get("className") in _TEXTURE_CLASS_NAMES:
+                    texture_exports.append(exports[-1])
+        pending = [path for path in exports if path not in hydrated]
+        if pending:
+            already = {str(item["relativePath"]) for item in self.list_scope(
+                prefixes, kinds=("package",), parsed_only=True, limit=min(5000, max_files * 4))}
+            pending = [path for path in pending if path not in already][:max_files]
+            for start in range(0, len(pending), 64):
+                receipt = self.hydrate(asset_root, pending[start:start + 64])
+                hydrated.extend(receipt.get("hydrated") or [])
+                missing.extend(receipt.get("missing") or [])
+        texture_evidence = []
+        for start in range(0, len(texture_exports), MAX_QUERY_IDS):
+            found = self.query(relative_paths=texture_exports[start:start + MAX_QUERY_IDS],
+                               include_relationships=False, limit=MAX_QUERY_IDS)
+            for item in found["assets"]:
+                fp = (item.get("metadata") or {}).get("textureFingerprint") or {}
+                texture_evidence.append({"relativePath": item["relativePath"], "available": fp.get("available") is True,
+                                         "reason": fp.get("reason") or ("" if fp.get("available") else "pixel payload not decoded")})
+        return {
+            "schema": "renderdoc-ultra-unpacked-asset-hydrate-scope/v1",
+            "schemaVersion": 1,
+            "prefixes": [str(item) for item in prefixes],
+            "kinds": list(wanted_kinds),
+            "candidates": len(deferred),
+            "hydrated": hydrated,
+            "missing": missing,
+            "materialExports": len(exports) - len(texture_exports),
+            "textureExports": len(texture_exports),
+            "textureEvidence": texture_evidence[:64],
+            "textureEvidenceTruncated": len(texture_evidence) > 64,
+            "truncated": len(deferred) > max_files,
+        }
 
     def coverage(self) -> dict[str, Any]:
         """What the catalog could and could not read, with reasons.
@@ -2068,8 +3498,9 @@ class AssetCatalogService:
                 "engine": engine,
                 "parserRevision": metadata.get("parserRevision"),
                 "tokenIndex": metadata.get("tokenIndex", "none"),
-                "valueIndexRows": int(metadata.get("valueIndex", "0") or 0),
-                "thumbnailRows": int(metadata.get("thumbnailIndex", "0") or 0),
+                "valueIndexRows": int(db.execute("SELECT COUNT(*) AS n FROM asset_values").fetchone()["n"]),
+                "thumbnailRows": int(db.execute("SELECT COUNT(*) AS n FROM asset_thumbnails").fetchone()["n"]),
+                "indexCoverage": "complete" if metadata.get("complete") == "true" else "partial",
                 "byKindAndStatus": by_status,
                 "parseFailureReasons": dict(sorted(reasons.items(), key=lambda item: -item[1])[:20]),
                 "archives": archives,
@@ -2096,8 +3527,9 @@ class AssetCatalogService:
         names = ("identity", "mirror-x", "rotate-90", "rotate-90+mirror", "rotate-180", "mirror-y", "rotate-270", "rotate-270+mirror")
         db, metadata = self._open_read_only()
         try:
-            if "thumbnailIndex" not in metadata:
-                raise AssetCatalogError("asset catalog was indexed without texture fingerprints; rescan it")
+            # Partial scans and bounded hydration already populate this table.
+            # The final-scan metadata counter is not an availability gate.
+            indexed_count = int(db.execute("SELECT COUNT(*) AS n FROM asset_thumbnails").fetchone()["n"])
             matches = []
             for row in db.execute("SELECT * FROM asset_thumbnails WHERE flat=0"):
                 best = None
@@ -2114,11 +3546,20 @@ class AssetCatalogService:
                     matches.append((best[0], color_delta if color_delta is not None else 0, row["asset_id"], names[best[1]],
                                     color_delta, int(row["width"]), int(row["height"]), str(row["pixel_format"] or "")))
             matches.sort(key=lambda item: (item[0], item[1], item[2]))
-            candidates = []
-            for distance, _, asset_id, transform, color_delta, width, height, pixel_format in matches[:limit]:
-                asset = db.execute("SELECT relative_path, kind, content_sha256 FROM assets WHERE asset_id=?", (asset_id,)).fetchone()
+            candidates, unavailable = [], []
+            for distance, _, asset_id, transform, color_delta, width, height, pixel_format in matches:
+                asset = db.execute("SELECT " + _ASSET_COLUMNS + " FROM assets WHERE asset_id=?", (asset_id,)).fetchone()
                 if asset is None:
                     continue
+                record = _row_record(asset)
+                binding = (record["metadata"].get("textureFingerprint") or {}).get("previewProvenance")
+                if binding:
+                    try:
+                        _preview_input_identity(Path(metadata["rootPath"]), binding.get("sourceFiles"))
+                        _preview_bytes(Path(binding["previewPath"]), binding["previewSha256"])
+                    except (AssetCatalogError, OSError, ValueError, TypeError, KeyError) as error:
+                        unavailable.append({"relativePath": asset["relative_path"], "reason": str(error)[:200]})
+                        continue
                 # Luminance hashes cannot tell channel-swapped variants apart;
                 # a large mean-colour difference demotes an exact hash hit.
                 verdict = "same-image" if distance <= 6 else "plausible"
@@ -2129,10 +3570,17 @@ class AssetCatalogService:
                     "contentSha256": asset["content_sha256"], "distance": distance, "transform": transform,
                     "meanColorDelta": color_delta, "sizeX": width, "sizeY": height, "pixelFormat": pixel_format,
                     "verdict": verdict,
+                    "physicalIdentityVerified": False,
+                    "evidenceKind": "decoded-reader-preview" if binding else "decoded-asset-thumbnail",
                 })
+                if len(candidates) >= limit:
+                    break
             return {"schema": "renderdoc-ultra-unpacked-asset-thumbnail-search/v1", "schemaVersion": 1,
                     "catalogSha256": metadata["catalogSha256"], "queryHash": query, "maxDistance": max_distance,
-                    "indexedThumbnails": int(metadata.get("thumbnailIndex", "0") or 0), "candidates": candidates}
+                    "indexedThumbnails": indexed_count, "candidates": candidates,
+                    "indexCoverage": "complete" if metadata.get("complete") == "true" else "partial",
+                    "unavailableEvidence": unavailable[:32],
+                    "absenceProven": False}
         finally:
             db.close()
 
@@ -2165,8 +3613,6 @@ class AssetCatalogService:
             raise AssetCatalogError("limit is outside the fixed query bound")
         db, metadata = self._open_read_only()
         try:
-            if "valueIndex" not in metadata:
-                raise AssetCatalogError("asset catalog was indexed without numeric values; rescan it")
             if not keys:
                 return {"schema": "renderdoc-ultra-unpacked-asset-value-search/v1", "schemaVersion": 1,
                         "catalogSha256": metadata["catalogSha256"], "queryKeys": [], "candidates": [],
@@ -2213,6 +3659,8 @@ class AssetCatalogService:
                 "queryKeys": keys,
                 "keyPopularity": popularity,
                 "candidates": candidates,
+                "indexCoverage": "complete" if metadata.get("complete") == "true" else "partial",
+                "absenceProven": False,
             }
         finally:
             db.close()
@@ -2249,6 +3697,111 @@ class AssetCatalogService:
             return {"schema": "renderdoc-ultra-unpacked-asset-referrers/v1", "schemaVersion": 1,
                     "catalogSha256": metadata["catalogSha256"], "assetId": identity,
                     "referrers": items, "truncated": len(rows) > limit}
+        finally:
+            db.close()
+
+    def expand_reference_neighborhood(self, asset_ids: Sequence[str], *,
+                                      max_depth: int = 4, max_assets: int = 64) -> dict[str, Any]:
+        """Follow exact indexed dependencies around a few content search anchors.
+
+        This is an index traversal, never a filesystem walk or an identity
+        assertion. Reader adapters supply the typed edges; names and arbitrary
+        string mentions cannot create them. Related textures are returned as
+        leaves so a shared utility texture cannot bridge unrelated materials.
+        """
+        ids = list(dict.fromkeys(str(item) for item in asset_ids))
+        if (not 1 <= len(ids) <= 8 or any(not _ASSET_ID_RE.fullmatch(item) for item in ids)
+                or type(max_depth) is not int or not 1 <= max_depth <= 4
+                or type(max_assets) is not int or not len(ids) <= max_assets <= 64):
+            raise AssetCatalogError("reference neighborhood exceeds its fixed search bounds")
+        relations = {
+            "uses-texture", "uses-base-color-texture", "uses-texture-parameter",
+            "parent-material", "uses-material", "uses-material-function",
+            "uses-material-library", "uses-material-record", "uses-raw-material-record",
+            "uses-shader", "references-shader", "includes-shader-source",
+            "references-unity-guid", "references-mesh", "contains-lod-geometry",
+            "contains-uemodel", "cooked-export-of",
+        }
+        db, metadata = self._open_read_only()
+        try:
+            assets, paths, queue, expanded = {}, {}, [], set()
+            missing, truncated, unresolved = [], False, []
+
+            def read(identity):
+                if identity not in assets:
+                    row = db.execute("SELECT " + _ASSET_COLUMNS + " FROM assets WHERE asset_id=?", (identity,)).fetchone()
+                    if row is None:
+                        return None
+                    assets[identity] = _row_record(row)
+                return assets[identity]
+
+            for identity in ids:
+                if read(identity) is None:
+                    missing.append(identity)
+                    continue
+                paths[identity] = [{"anchorAssetId": identity, "steps": []}]
+                queue.append((identity, identity, []))
+            index = 0
+            while index < len(queue):
+                identity, anchor, steps = queue[index]
+                index += 1
+                if (identity, anchor) in expanded or len(steps) >= max_depth:
+                    continue
+                expanded.add((identity, anchor))
+                asset = assets[identity]
+                if identity not in ids and (asset["kind"] == "texture" or
+                        str(asset["metadata"].get("className", "")).startswith("Texture")):
+                    continue
+                neighbors = []
+                for direction, column, other in (("dependency", "source_asset_id", "target_asset_id"),
+                                                   ("referrer", "target_asset_id", "source_asset_id")):
+                    rows = db.execute(
+                        "SELECT source_asset_id, target_asset_id, relation, verified, evidence_kind, "
+                        "target_path FROM relationships WHERE " + column + "=? AND relation IN (" +
+                        ",".join("?" for unused in relations) + ") ORDER BY relation, " + other + " LIMIT 33",
+                        (identity, *sorted(relations))).fetchall()
+                    truncated = truncated or len(rows) > 32
+                    for row in rows[:32]:
+                        target = row[other]
+                        if not target or not row["verified"]:
+                            if direction == "dependency" and len(unresolved) < 24:
+                                unresolved.append({"sourcePath": asset["relativePath"], "relation": row["relation"],
+                                                   "targetPath": row["target_path"], "status": "unresolved-index-edge"})
+                            continue
+                        neighbors.append((target, row["relation"], direction, row["evidence_kind"]))
+                # Unity GUID references target .meta records. Connect only the
+                # exact adjacent owner/sidecar paths already present in the index.
+                relative = asset["relativePath"]
+                sidecar_path = relative[:-5] if relative.endswith(".meta") else relative + ".meta"
+                sidecar = db.execute("SELECT asset_id, declared_guid FROM assets WHERE relative_path=?",
+                                     (sidecar_path,)).fetchone()
+                if sidecar is not None and (sidecar["declared_guid"] or asset["metadata"].get("declaredGuid")):
+                    neighbors.append((sidecar["asset_id"], "unity-guid-sidecar", "sidecar", "exact-adjacent-path"))
+                for target, relation, direction, evidence_kind in neighbors:
+                    if target == anchor or any(step["fromAssetId"] == target for step in steps):
+                        continue
+                    if target not in assets and len(assets) >= max_assets:
+                        truncated = True
+                        continue
+                    target_asset = read(target)
+                    if target_asset is None:
+                        continue
+                    if any(path["anchorAssetId"] == anchor for path in paths.get(target, [])):
+                        continue
+                    extended = steps + [{"fromAssetId": identity, "toAssetId": target,
+                                         "fromPath": relative, "toPath": target_asset["relativePath"],
+                                         "relation": relation, "direction": direction,
+                                         "evidenceKind": evidence_kind, "catalogReferenceVerified": True}]
+                    paths.setdefault(target, []).append({"anchorAssetId": anchor, "steps": extended})
+                    queue.append((target, anchor, extended))
+            return {"schema": "bread-asset-reference-neighborhood/v1", "schemaVersion": 1,
+                    "catalogSha256": metadata["catalogSha256"], "anchorAssetIds": ids,
+                    "assets": [{**asset, "anchorPaths": paths.get(identity, [])}
+                               for identity, asset in assets.items()],
+                    "missingAnchors": missing, "unresolvedEdges": unresolved, "truncated": truncated,
+                    "bounds": {"maxDepth": max_depth, "maxAssets": max_assets, "edgesPerDirection": 32},
+                    "physicalIdentityVerified": False, "filesystemScanned": False,
+                    "note": "exact catalog relationships expand search leads; they do not identify the captured material"}
         finally:
             db.close()
 
@@ -2335,6 +3888,7 @@ class AssetCatalogService:
                     "format": row["format"],
                     "size": int(row["size"]),
                     "contentSha256": row["content_sha256"],
+                    "parseStatus": row["parse_status"],
                     "className": stored.get("className", ""),
                     "engine": stored.get("engine", ""),
                     "score": round(entry["score"], 4),
@@ -2377,12 +3931,12 @@ class AssetCatalogService:
             if Path(metadata["rootPath"]).resolve() != root:
                 raise AssetCatalogError("asset catalog belongs to another configured root")
             row = db.execute(
-                "SELECT asset_id, relative_path, kind, format, size, modified_ns, content_sha256, "
-                "hash_status, parse_status, metadata_json FROM assets WHERE asset_id=?",
+                "SELECT " + _ASSET_COLUMNS + " FROM assets WHERE asset_id=?",
                 (identity,),
             ).fetchone()
             if row is None:
                 raise AssetCatalogError("asset identity is not present in the current catalog")
+            stored = _row_record(row)
             relative = PurePosixPath(str(row["relative_path"]))
             if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
                 raise AssetCatalogError("stored asset path is unsafe")
@@ -2414,7 +3968,7 @@ class AssetCatalogService:
                 "format": row["format"],
                 "size": int(row["size"]),
                 "contentSha256": actual_sha256,
-                "metadata": json.loads(row["metadata_json"]),
+                "metadata": stored["metadata"],
                 "verified": True,
                 "policy": {
                     "configuredActiveProjectRootOnly": True,
@@ -2435,7 +3989,9 @@ __all__ = [
     "CATALOG_SCHEMA",
     "CATALOG_VERSION",
     "DEFAULT_MAX_FILES",
+    "DEFAULT_NAMES_ONLY_MAX_FILES",
     "DEFAULT_MAX_FILE_SIZE_MB",
     "HARD_MAX_FILES",
+    "HARD_NAMES_ONLY_MAX_FILES",
     "HARD_MAX_FILE_SIZE_MB",
 ]

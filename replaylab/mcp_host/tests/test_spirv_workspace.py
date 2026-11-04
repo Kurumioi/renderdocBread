@@ -411,8 +411,9 @@ def test_byte_swapped_spirv_fingerprint_is_consistent_with_detection() -> None:
     assert executable.raw_sha256 == hashlib.sha256(blob).hexdigest()
 
 
+@pytest.mark.parametrize("native_glsl", [False, True])
 def test_opengl_spirv_round_trip_uses_environment_specific_formats(
-    spirv_workspace_fixture: dict,
+    spirv_workspace_fixture: dict, native_glsl: bool,
 ) -> None:
     fixture = spirv_workspace_fixture
     registry = fixture["service"].registry
@@ -458,6 +459,9 @@ def test_opengl_spirv_round_trip_uses_environment_specific_formats(
     atomic_write_json(catalog_path, catalog)
 
     service = ShaderWorkspaceService(registry.path, routes_path)
+    if native_glsl:
+        from tests.test_native_shader_compile import response
+        service._native_compile_provider = lambda request: response(request, Path(request["candidate_path"]).read_bytes())
     workspace = fixture["root"] / "opengl-workspace"
     created = service.create(catalog_path, fixture["key"], workspace)
     assert created["routePlan"]["inputFormat"] == "opengl-spirv"
@@ -469,7 +473,25 @@ def test_opengl_spirv_round_trip_uses_environment_specific_formats(
         encoding="utf-8",
     )
     compiled = service.compile(workspace)
-    assert Path(compiled["candidateBlobPath"]).read_bytes() == fixture["blob"]
+    if native_glsl:
+        assert compiled["kind"] == "GLSL"
+        assert Path(compiled["candidateBlobPath"]).read_bytes() == source_path.read_bytes()
+        assert service.status(workspace)["latestCompiled"]["kind"] == "GLSL"
+        request = service.candidate_reflection_request(workspace)
+        assert request["binding"]["encoding"] == "glsl"
+        assert request["binding"]["targetProfile"] == "opengl-spirv"
+        from tests.test_shader_workspace_routes import ShaderWorkspaceRouteChainTests
+        manifest = json.loads((workspace / "manifest.json").read_text())
+        plan = ShaderWorkspaceRouteChainTests._project_candidate_plan(
+            Path(compiled["candidateBlobPath"]), raw_sha256=compiled["rawSha256"],
+            code_sha256=compiled["codeSha256"], byte_size=len(source_path.read_bytes()),
+            kind="GLSL", source_sha256=compiled["sourceSha256"], source_revision=compiled["revision"],
+            target_profile=manifest["targetProfile"])
+        plan["compilerBindingSha256"] = service._project_compiler_binding(manifest)["bindingSha256"]
+        assert service.hydrate_project_candidate(workspace, plan)["requiresReplayAbiValidation"]
+        assert service.status(workspace)["latestCompiled"]["abiCompatible"] is False
+    else:
+        assert Path(compiled["candidateBlobPath"]).read_bytes() == fixture["blob"]
 
 
 @pytest.mark.parametrize(

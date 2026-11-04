@@ -17,6 +17,8 @@ stored only as navigation metadata bound to reviewed source hashes.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
 import hashlib
@@ -30,7 +32,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 import uuid
 
 from .projects import ReplayProjectError, ReplayProjectService
@@ -68,6 +70,8 @@ EXCLUSIVE_PROJECT_LOCK_VERSION = 2
 
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_EXCLUSIVE_PROJECT_LOCK_BYTES = 4096
+SELECTION_FILE_LOCK_WAIT_SECONDS = 5.0
+EXCLUSIVE_LOCK_RELEASE_WAIT_SECONDS = 5.0
 MAX_CATALOG_BYTES = 256 * 1024 * 1024
 MAX_STAGED_SHADER_BYTES = 512 * 1024 * 1024
 MAX_STAGED_CATALOG_REVISIONS = 4096
@@ -120,6 +124,23 @@ _PROCESS_LOCAL_LOCK_IDENTITY = uuid.uuid4().hex
 
 class ActiveProjectError(ReplayProjectError):
     """Fail-closed active project configuration error."""
+
+
+@dataclass(frozen=True)
+class ActiveProjectSnapshot:
+    """One fixed selection/configuration; project artifacts remain live reads."""
+
+    state_path: str
+    project_root: Path
+    workspace_id: str
+    selection_sha256: str
+    config_sha256: str
+    manifest_json: bytes
+
+
+_ACTIVE_PROJECT_SNAPSHOTS: ContextVar[tuple[ActiveProjectSnapshot, ...]] = ContextVar(
+    "replaylab_active_project_snapshots", default=()
+)
 
 
 def _utc_now() -> str:
@@ -512,17 +533,15 @@ def _json_object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[st
     return value
 
 
-def _recoverable_exclusive_project_lock(
-    raw: bytes, unused_metadata: os.stat_result
-) -> bool:
-    """Return true only for a dead owner or reused PID proven by a v2 lock."""
+def _exclusive_project_lock_owner(raw: bytes) -> tuple[int, str] | None:
+    """Read a complete v2 owner identity without granting lock recovery."""
 
     if re.fullmatch(rb"[0-9a-f]{32}(?:\r?\n)?", raw) is not None:
         # v1 closed its descriptor before entering the critical section and
         # persisted no PID/host generation.  Age therefore cannot prove that
         # its owner is gone: some pinned project operations have no uniform
         # wall-clock limit.  Preserve the legacy token for explicit recovery.
-        return False
+        return None
 
     try:
         value = json.loads(
@@ -530,7 +549,7 @@ def _recoverable_exclusive_project_lock(
             object_pairs_hook=_json_object_without_duplicate_keys,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return False
+        return None
     if not isinstance(value, dict) or set(value) != {
         "schema",
         "schemaVersion",
@@ -540,7 +559,7 @@ def _recoverable_exclusive_project_lock(
         "acquiredAt",
         "lockSha256",
     }:
-        return False
+        return None
     token = value.get("token")
     owner_pid = value.get("ownerPid")
     stored_identity = value.get("processStartIdentity")
@@ -567,11 +586,23 @@ def _recoverable_exclusive_project_lock(
         or SHA256_RE.fullmatch(lock_sha256) is None
         or lock_sha256 != _document_hash(value, "lockSha256")
     ):
-        return False
+        return None
     try:
         datetime.fromisoformat(acquired_at[:-1] + "+00:00")
     except ValueError:
+        return None
+    return owner_pid, stored_identity
+
+
+def _recoverable_exclusive_project_lock(
+    raw: bytes, unused_metadata: os.stat_result
+) -> bool:
+    """Return true only for a dead owner or reused PID proven by a v2 lock."""
+    owner = _exclusive_project_lock_owner(raw)
+    if owner is None:
         return False
+    owner_pid, stored_identity = owner
+    stored_scheme = _validated_process_identity_scheme(stored_identity)
     state, current_identity = _process_lock_owner_state(owner_pid)
     if state == "dead":
         return True
@@ -580,23 +611,23 @@ def _recoverable_exclusive_project_lock(
         and current_identity
         and current_identity != stored_identity
         and _validated_process_identity_scheme(current_identity) == stored_scheme
-        and stored_scheme in {
-            "windows-filetime",
-            "linux-startticks",
-        }
+        and stored_scheme in {"windows-filetime", "linux-startticks"}
     ):
         return True
     return False
 
 
-def _archive_recoverable_exclusive_project_lock(path: Path) -> Path | None:
+def _archive_recoverable_exclusive_project_lock(
+    path: Path, *, is_recoverable: Callable[[bytes, os.stat_result], bool] | None = None,
+) -> Path | None:
     """Atomically move one verified stale lock aside before reacquisition."""
 
     snapshot = _lock_snapshot(path)
     if snapshot is None:
         return None
     raw, metadata = snapshot
-    if not _recoverable_exclusive_project_lock(raw, metadata):
+    validator = is_recoverable or _recoverable_exclusive_project_lock
+    if not validator(raw, metadata):
         return None
     expected_identity = (
         metadata.st_dev,
@@ -678,46 +709,86 @@ def _publish_exclusive_project_lock(path: Path, payload: bytes) -> None:
             pass
 
 
+def _release_owned_exclusive_lock(path: Path, payload: bytes, description: str) -> None:
+    """Release our exact lock, allowing short Windows reader/share conflicts.
+
+    A concurrent reader may temporarily prevent unlink or a stable snapshot.
+    Silently ignoring either case leaves a live-owner lock after the critical
+    section has ended. Check ownership again on every retry, so a replacement
+    token is never removed by the previous owner.
+    """
+    deadline = time.monotonic() + EXCLUSIVE_LOCK_RELEASE_WAIT_SECONDS
+    delay = 0.01
+    last_error: OSError | None = None
+    while True:
+        snapshot = _lock_snapshot(path)
+        if snapshot is not None:
+            if snapshot[0] != payload:
+                return
+            try:
+                path.unlink()
+                return
+            except FileNotFoundError:
+                return
+            except OSError as error:
+                last_error = error
+        else:
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                return
+            except OSError as error:
+                last_error = error
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ActiveProjectError(
+                "%s could not release its owned lock after the operation" % description
+            ) from last_error
+        time.sleep(min(delay, remaining))
+        delay = min(0.1, delay * 2)
+
+
 @contextmanager
-def _exclusive_lock(path: Path, description: str) -> Iterator[None]:
+def _exclusive_lock(path: Path, description: str, wait_seconds: float = 0.0) -> Iterator[None]:
     token = uuid.uuid4().hex
     payload = _exclusive_project_lock_payload(token)
     recovered = None
-    for attempt in range(2):
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    delay = 0.01
+    while True:
         try:
             _publish_exclusive_project_lock(path, payload)
             break
         except FileExistsError as exc:
-            if attempt or recovered is not None:
-                raise ActiveProjectError(
-                    "%s is locked; its owner could not be proven inactive"
-                    % description
-                ) from exc
-            recovered = _archive_recoverable_exclusive_project_lock(path)
             if recovered is None:
-                raise ActiveProjectError(
-                    "%s is locked; its owner could not be proven inactive"
-                    % description
-                ) from exc
+                recovered = _archive_recoverable_exclusive_project_lock(path)
+                if recovered is not None:
+                    continue
+            snapshot = _lock_snapshot(path)
+            owner = _exclusive_project_lock_owner(snapshot[0]) if snapshot is not None else None
+            remaining = deadline - time.monotonic()
+            # A live competing Host can hold the short selection transaction.
+            # Wait for its normal release; never steal it or trust lock age.
+            # Unknown/legacy/corrupt owners retain the existing fail-closed path.
+            owner_alive = owner is not None and _process_lock_owner_state(owner[0])[0] == "alive"
+            disappeared = snapshot is None and not path.exists() and not path.is_symlink()
+            if remaining > 0 and (owner_alive or disappeared):
+                time.sleep(min(delay, remaining))
+                delay = min(0.1, delay * 2)
+                continue
+            raise ActiveProjectError(
+                "%s is locked; its owner could not be proven inactive"
+                % description
+            ) from exc
         except Exception:
             snapshot = _lock_snapshot(path)
             if snapshot is not None and snapshot[0] == payload:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
+                _release_owned_exclusive_lock(path, payload, description)
             raise
-    else:  # pragma: no cover - the bounded loop either acquires or raises
-        raise ActiveProjectError("%s lock acquisition failed" % description)
     try:
         yield
     finally:
-        try:
-            snapshot = _lock_snapshot(path)
-            if snapshot is not None and snapshot[0] == payload:
-                path.unlink()
-        except OSError:
-            pass
+        _release_owned_exclusive_lock(path, payload, description)
         if recovered is not None:
             try:
                 recovered.unlink()
@@ -813,7 +884,17 @@ def _pinned_active_operation(function):
         workspace_id = str(expected.get("workspaceId", "") or "")
         project_root = str(expected.get("projectRoot", "") or "")
         with self.pin_active_project(workspace_id, project_root):
-            current = self.status()
+            # The preparation already read/validated the project status. Only
+            # selection/configuration identity belongs in this commit check;
+            # do not rescan all replay artifacts while holding the selection.
+            current_root, manifest = self._live_active()
+            current = {
+                "workspaceId": manifest["workspaceId"],
+                "projectRoot": str(current_root),
+                "state": manifest["state"],
+                "scope": manifest["scope"],
+                "assetRoot": manifest.get("assetRoot") or None,
+            }
             if any(
                 (
                     current.get("workspaceId") != expected.get("workspaceId"),
@@ -850,7 +931,7 @@ class ActiveReplayProjectService:
     registry entry never removes the portable project directory.
     """
 
-    def __init__(self, state_path: str | Path, projects_home: str | Path):
+    def __init__(self, state_path: str | Path, projects_home: str | Path, registry_path=None):
         raw_state = Path(state_path).expanduser()
         if raw_state.exists() and raw_state.is_symlink():
             raise ActiveProjectError("active project state must not be a symlink")
@@ -874,7 +955,8 @@ class ActiveReplayProjectService:
         if _filesystem_root(self.projects_home):
             raise ActiveProjectError("projects_home must not be a filesystem root")
 
-        self.registry_path = self.state_path.parent / "project-registry.json"
+        self.registry_path = Path(registry_path).absolute() if registry_path else self.state_path.parent / "project-registry.json"
+        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
         if self.registry_path.exists() and self.registry_path.is_symlink():
             raise ActiveProjectError("project registry must not be a symlink")
         if self.registry_path.exists() and not self.registry_path.is_file():
@@ -885,30 +967,50 @@ class ActiveReplayProjectService:
         return self.state_path.parent / (".%s.lock" % self.state_path.name)
 
     @contextmanager
-    def _selection_guard(self) -> Iterator[None]:
-        """Hold the process/file selection lock, reusing it on this thread."""
+    def _selection_guard(self, wait_seconds: float | None = None) -> Iterator[None]:
+        """Hold the process/file selection lock, reusing it on this thread.
+
+        ``wait_seconds`` bounds thread and cross-process selection contention.
+        Short file transactions can overlap between the task and internal
+        Hosts; waiting for their release does not grant stale-lock recovery.
+        """
 
         key = os.path.normcase(str(self.state_path))
-        with _thread_lock(self.state_path):
-            depths = getattr(_SELECTION_LOCK_DEPTH, "values", None)
-            if depths is None:
-                depths = {}
-                _SELECTION_LOCK_DEPTH.values = depths
-            depth = int(depths.get(key, 0))
-            depths[key] = depth + 1
-            try:
-                if depth:
+        thread_lock = _thread_lock(self.state_path)
+        started = time.monotonic()
+        if wait_seconds is None:
+            thread_lock.acquire()
+        elif not thread_lock.acquire(timeout=max(0.0, float(wait_seconds))):
+            raise ActiveProjectError(
+                "the project service is busy with another operation")
+        try:
+            remaining = None if wait_seconds is None else max(
+                0.0, float(wait_seconds) - (time.monotonic() - started))
+            yield from self._selection_guard_locked(key, remaining)
+        finally:
+            thread_lock.release()
+
+    def _selection_guard_locked(self, key: str, wait_seconds: float | None = None) -> Iterator[None]:
+        depths = getattr(_SELECTION_LOCK_DEPTH, "values", None)
+        if depths is None:
+            depths = {}
+            _SELECTION_LOCK_DEPTH.values = depths
+        depth = int(depths.get(key, 0))
+        depths[key] = depth + 1
+        try:
+            if depth:
+                yield
+            else:
+                with _exclusive_lock(
+                    self._selection_lock_path, "active project selection",
+                    SELECTION_FILE_LOCK_WAIT_SECONDS if wait_seconds is None else max(0.0, wait_seconds),
+                ):
                     yield
-                else:
-                    with _exclusive_lock(
-                        self._selection_lock_path, "active project selection"
-                    ):
-                        yield
-            finally:
-                if depth:
-                    depths[key] = depth
-                else:
-                    depths.pop(key, None)
+        finally:
+            if depth:
+                depths[key] = depth
+            else:
+                depths.pop(key, None)
 
     def _project_root(self, value: str | Path) -> Path:
         raw = Path(value).expanduser()
@@ -1053,25 +1155,27 @@ class ActiveReplayProjectService:
     def _register_project_root(
         self, root: Path, manifest: Mapping[str, Any]
     ) -> None:
-        registry = self._read_project_registry()
-        key = self._registry_key(root)
-        workspace_id = str(manifest["workspaceId"])
-        for record in registry["projects"]:
-            if self._registry_key(Path(record["projectRoot"])) == key:
+        from .shared_file_io import file_transaction
+        with file_transaction(self.registry_path):
+            registry = self._read_project_registry()
+            key = self._registry_key(root)
+            workspace_id = str(manifest["workspaceId"])
+            for record in registry["projects"]:
+                if self._registry_key(Path(record["projectRoot"])) == key:
+                    if record["workspaceId"] == workspace_id:
+                        return
+                    raise ActiveProjectError("project path is registered with another workspace")
                 if record["workspaceId"] == workspace_id:
-                    return
-                raise ActiveProjectError("project path is registered with another workspace")
-            if record["workspaceId"] == workspace_id:
-                raise ActiveProjectError("workspace is already registered at another path")
-        registry["projects"].append(
-            {
-                "workspaceId": workspace_id,
-                "projectRoot": str(root),
-                "name": str(manifest["name"]),
-                "registeredAt": _utc_now(),
-            }
-        )
-        self._write_project_registry(registry)
+                    raise ActiveProjectError("workspace is already registered at another path")
+            registry["projects"].append(
+                {
+                    "workspaceId": workspace_id,
+                    "projectRoot": str(root),
+                    "name": str(manifest["name"]),
+                    "registeredAt": _utc_now(),
+                }
+            )
+            self._write_project_registry(registry)
 
     @staticmethod
     def _config_path(root: Path) -> Path:
@@ -1116,7 +1220,9 @@ class ActiveReplayProjectService:
             "indexSha256",
         )
 
-    def _read_workspace(self, root: Path) -> dict[str, Any]:
+    def _read_workspace(
+        self, root: Path, *, validate_shared_artifacts: bool = True
+    ) -> dict[str, Any]:
         if root.is_symlink() or not root.is_dir():
             raise ActiveProjectError("project root must be a regular directory")
         try:
@@ -1187,7 +1293,8 @@ class ActiveReplayProjectService:
             directory = self._managed_path(root, _LAYOUT[key], "layout.%s" % key)
             if directory.is_symlink() or not directory.is_dir():
                 raise ActiveProjectError("project directory is missing or redirected: %s" % key)
-        self._read_shared_index(root, str(value["workspaceId"]))
+        if validate_shared_artifacts:
+            self._read_shared_index(root, str(value["workspaceId"]))
         return value
 
     def _write_workspace(self, root: Path, value: dict[str, Any]) -> None:
@@ -1237,6 +1344,16 @@ class ActiveReplayProjectService:
             "selectionSha256",
         )
         with self._selection_guard():
+            try:
+                current = self._read_selection()
+            except ActiveProjectError:
+                current = None
+            if (current is not None and current["workspaceId"] == workspace_id
+                    and os.path.normcase(current["projectRoot"]) == os.path.normcase(str(root))):
+                # Activation of the current project is idempotent. Refreshing
+                # selectedAt would invalidate a long-operation selection seal
+                # without changing any project identity or configuration.
+                return
             atomic_write_json(self.state_path, value)
 
     @staticmethod
@@ -1561,7 +1678,7 @@ class ActiveReplayProjectService:
 
     @_selection_serialized
     def create_pending(
-        self, project_root: str | Path, name: str = "Untitled ReplayLab Project"
+        self, project_root: str | Path, name: str = "Untitled Bread Project"
     ) -> dict[str, Any]:
         root = self._project_root(project_root)
         if root.exists():
@@ -1622,7 +1739,7 @@ class ActiveReplayProjectService:
 
     @_selection_serialized
     def ensure_pending(
-        self, name: str = "Untitled ReplayLab Project"
+        self, name: str = "Untitled Bread Project"
     ) -> dict[str, Any]:
         if self.has_active_project():
             return self.status()
@@ -1953,7 +2070,8 @@ class ActiveReplayProjectService:
 
         root = self._registry_root(project_root)
         key = self._registry_key(root)
-        with self._selection_guard():
+        from .shared_file_io import file_transaction
+        with self._selection_guard(), file_transaction(self.registry_path):
             registry = self._read_project_registry()
             record = next(
                 (
@@ -2077,53 +2195,74 @@ class ActiveReplayProjectService:
                 self._write_workspace(root, manifest)
         return self.project_status(root)
 
+    LIST_LOCK_WAIT_SECONDS = 2.0
+
     def list_projects(self) -> dict[str, Any]:
         """List validated roots from the machine-local project registry."""
-        with self._selection_guard():
-            active_workspace_id = ""
-            if self.has_active_project():
-                try:
-                    active_workspace_id = str(self._read_selection()["workspaceId"])
-                except ActiveProjectError:
-                    # A corrupt selection must not make otherwise valid projects
-                    # disappear from the recovery/selection window.
-                    active_workspace_id = ""
-            projects = []
-            rejected = []
-            registry = self._read_project_registry()
-            for record in sorted(
-                registry["projects"], key=lambda item: item["name"].lower()
-            ):
-                candidate = Path(record["projectRoot"])
-                try:
-                    status = self._project_status(candidate)
-                    if status["workspaceId"] != record["workspaceId"]:
-                        raise ActiveProjectError(
-                            "registered workspace identity does not match the project"
-                        )
-                except Exception as exc:
-                    rejected.append(
-                        {
-                            "workspaceId": record["workspaceId"],
-                            "projectRoot": str(candidate),
-                            "name": record["name"],
-                            "reasonId": "project-validation-failed",
-                            "reasonDetail": str(exc)[:1024],
-                            # Keep the legacy field for older bridge builds.
-                            "reason": str(exc)[:1024],
-                        }
+        try:
+            with self._selection_guard(wait_seconds=self.LIST_LOCK_WAIT_SECONDS):
+                return self._list_projects_locked()
+        except ActiveProjectError as exc:
+            if "busy" not in str(exc):
+                raise
+        # The selection thread lock is held by a long operation (an activation
+        # validating a project, a registration). The registry and the selection
+        # file are written atomically, so an unguarded read is a consistent
+        # snapshot -- stale by at most that operation -- and the window opens.
+        value = self._list_projects_locked()
+        value["busy"] = True
+        return value
+
+    def _list_projects_locked(self) -> dict[str, Any]:
+        active_workspace_id = ""
+        if self.has_active_project():
+            try:
+                active_workspace_id = str(self._read_selection()["workspaceId"])
+            except ActiveProjectError:
+                # A corrupt selection must not make otherwise valid projects
+                # disappear from the recovery/selection window.
+                active_workspace_id = ""
+        projects = []
+        rejected = []
+        registry = self._read_project_registry()
+        for record in sorted(
+            registry["projects"], key=lambda item: item["name"].lower()
+        ):
+            candidate = Path(record["projectRoot"])
+            try:
+                manifest=self._read_workspace(candidate,validate_shared_artifacts=False)
+                status=self._status_from_active(candidate,manifest,validate_replay=False)
+                status["captureLibrary"]=self._capture_library_status(candidate,str(manifest["workspaceId"]))
+                status["validationScope"]="workspace-and-capture-library-metadata"
+                if status["workspaceId"] != record["workspaceId"]:
+                    raise ActiveProjectError(
+                        "registered workspace identity does not match the project"
                     )
-                    continue
-                status["active"] = status["workspaceId"] == active_workspace_id
-                projects.append(status)
-            return {
-                "schema": "replaylab-project-list/v1",
-                "schemaVersion": 1,
-                "projectsHome": str(self.projects_home),
-                "count": len(projects),
-                "projects": projects,
-                "rejected": rejected,
-            }
+            except Exception as exc:
+                rejected.append(
+                    {
+                        "workspaceId": record["workspaceId"],
+                        "projectRoot": str(candidate),
+                        "name": record["name"],
+                        "reasonId": ("project-files-busy" if getattr(exc, "winerror", None) in (32, 33)
+                                     else "project-access-denied" if isinstance(exc, PermissionError)
+                                     else "project-validation-failed"),
+                        "reasonDetail": str(exc)[:1024],
+                        # Keep the legacy field for older bridge builds.
+                        "reason": str(exc)[:1024],
+                    }
+                )
+                continue
+            status["active"] = status["workspaceId"] == active_workspace_id
+            projects.append(status)
+        return {
+            "schema": "replaylab-project-list/v1",
+            "schemaVersion": 1,
+            "projectsHome": str(self.projects_home),
+            "count": len(projects),
+            "projects": projects,
+            "rejected": rejected,
+        }
 
     def _capture_project_candidates(
         self, capture_path: Path
@@ -2225,13 +2364,90 @@ class ActiveReplayProjectService:
         self._write_selection(root, str(manifest["workspaceId"]))
         return status
 
-    def _active(self) -> tuple[Path, dict[str, Any]]:
+    def _bound_project_snapshot(self) -> ActiveProjectSnapshot | None:
+        key = os.path.normcase(str(self.state_path))
+        return next((item for item in reversed(_ACTIVE_PROJECT_SNAPSHOTS.get())
+                     if item.state_path == key), None)
+
+    def _live_active(
+        self, *, validate_shared_artifacts: bool = True
+    ) -> tuple[Path, dict[str, Any]]:
         selection = self._read_selection()
         root = self._registered_project_root(selection["projectRoot"])
-        workspace = self._read_workspace(root)
+        workspace = self._read_workspace(
+            root, validate_shared_artifacts=validate_shared_artifacts
+        )
         if workspace["workspaceId"] != selection["workspaceId"]:
             raise ActiveProjectError("active selection does not match the project workspace")
         return root, workspace
+
+    def _active(self) -> tuple[Path, dict[str, Any]]:
+        snapshot = self._bound_project_snapshot()
+        if snapshot is not None:
+            return snapshot.project_root, json.loads(snapshot.manifest_json)
+        return self._live_active()
+
+    @contextmanager
+    def snapshot_active_project(
+        self, expected_workspace_id: str, expected_project_root: str | Path
+    ) -> Iterator[ActiveProjectSnapshot]:
+        """Bind long preparation/reads to one project without holding its selection lock.
+
+        Check the snapshot before replay side effects, and use
+        ``commit_active_project_snapshot`` for short durable publications. A
+        selection or configuration change invalidates the operation; it never
+        redirects its reads into the newly selected project. Context propagation
+        through asyncio.to_thread also preserves this binding.
+        """
+
+        workspace_id = str(expected_workspace_id or "").strip().lower()
+        if not HEX32_RE.fullmatch(workspace_id):
+            raise ActiveProjectError("expected active workspaceId is invalid")
+        expected_root = self._project_root(expected_project_root)
+        with self._selection_guard():
+            # Selection/configuration checkpoints are independent of explanatory
+            # diagrams. Their readers and publishers validate their actual bytes.
+            root, manifest = self._live_active(validate_shared_artifacts=False)
+            if root != expected_root or manifest["workspaceId"] != workspace_id:
+                raise ActiveProjectError("active project changed before the operation")
+            selection = self._read_selection()
+            snapshot = ActiveProjectSnapshot(
+                os.path.normcase(str(self.state_path)), root, workspace_id,
+                selection["selectionSha256"], manifest["configSha256"],
+                _canonical_bytes(manifest),
+            )
+        token = _ACTIVE_PROJECT_SNAPSHOTS.set(_ACTIVE_PROJECT_SNAPSHOTS.get() + (snapshot,))
+        try:
+            yield snapshot
+            self.assert_active_project_snapshot(snapshot)
+        finally:
+            _ACTIVE_PROJECT_SNAPSHOTS.reset(token)
+
+    def _assert_active_project_snapshot_locked(self, snapshot: ActiveProjectSnapshot) -> None:
+        if (not isinstance(snapshot, ActiveProjectSnapshot)
+                or snapshot.state_path != os.path.normcase(str(self.state_path))):
+            raise ActiveProjectError("project snapshot belongs to another selection service")
+        selection = self._read_selection()
+        root, manifest = self._live_active(validate_shared_artifacts=False)
+        if (selection["selectionSha256"] != snapshot.selection_sha256
+                or root != snapshot.project_root
+                or manifest["workspaceId"] != snapshot.workspace_id
+                or manifest["configSha256"] != snapshot.config_sha256):
+            raise ActiveProjectError("active project selection or configuration changed during the operation")
+
+    def assert_active_project_snapshot(self, snapshot: ActiveProjectSnapshot) -> None:
+        """Check the real current selection/configuration at a bounded checkpoint."""
+
+        with self._selection_guard():
+            self._assert_active_project_snapshot_locked(snapshot)
+
+    @contextmanager
+    def commit_active_project_snapshot(self, snapshot: ActiveProjectSnapshot) -> Iterator[None]:
+        """Validate a prepared operation immediately before its short atomic commit."""
+
+        with self._selection_guard():
+            self._assert_active_project_snapshot_locked(snapshot)
+            yield
 
     @contextmanager
     def pin_active_project(
@@ -2247,14 +2463,17 @@ class ActiveReplayProjectService:
             raise ActiveProjectError("expected active projectRoot must be absolute")
         expected_root = self._project_root(raw_root)
         with self._selection_guard():
-            current_root, current_manifest = self._active()
+            snapshot = self._bound_project_snapshot()
+            if snapshot is not None:
+                self._assert_active_project_snapshot_locked(snapshot)
+            current_root, current_manifest = self._live_active()
             if (
                 current_root != expected_root
                 or current_manifest["workspaceId"] != workspace_id
             ):
                 raise ActiveProjectError("active project changed before the operation")
             yield
-            current_root, current_manifest = self._active()
+            current_root, current_manifest = self._live_active()
             if (
                 current_root != expected_root
                 or current_manifest["workspaceId"] != workspace_id
@@ -2262,12 +2481,17 @@ class ActiveReplayProjectService:
                 raise ActiveProjectError("active project changed during the operation")
 
     def status(self) -> dict[str, Any]:
-        with self._selection_guard():
+        if self._bound_project_snapshot() is not None:
             root, manifest = self._active()
             return self._status_from_active(root, manifest)
+        with self._selection_guard():
+            root, manifest = self._active()
+        # Replay artifact validation can be expensive. Its paths/configuration
+        # are now fixed, so it must not hold up selection or unrelated readers.
+        return self._status_from_active(root, manifest)
 
     def _status_from_active(
-        self, root: Path, manifest: Mapping[str, Any]
+        self, root: Path, manifest: Mapping[str, Any], *, validate_replay: bool = True
     ) -> dict[str, Any]:
         paths = self._paths(root)
         asset_text = str(manifest.get("assetRoot", "") or "")
@@ -2277,7 +2501,7 @@ class ActiveReplayProjectService:
             and not Path(asset_text).is_symlink()
         )
         replay_status = None
-        if manifest["state"] == "bound":
+        if manifest["state"] == "bound" and validate_replay:
             unused_service, replay_status = self._replay_service_and_status_for(
                 root, manifest
             )
@@ -2297,7 +2521,7 @@ class ActiveReplayProjectService:
             "replayProject": replay_status,
             "policy": {
                 "automaticPendingWorkspaceCreation": True,
-                "physicalKnowledgeReuseAllowed": manifest["state"] == "bound",
+                "physicalKnowledgeReuseAllowed": validate_replay and manifest["state"] == "bound",
                 "crossGameAutomaticPhysicalReuse": False,
                 "aiProvisionalAutoApply": False,
                 "sourceSeedIsApplyAuthorization": False,
@@ -2455,9 +2679,12 @@ class ActiveReplayProjectService:
         return service
 
     def replay_service(self) -> ReplayProjectService:
-        with self._selection_guard():
+        if self._bound_project_snapshot() is not None:
             root, manifest = self._active()
             return self._replay_service_for(root, manifest)
+        with self._selection_guard():
+            root, manifest = self._active()
+        return self._replay_service_for(root, manifest)
 
     def capture_catalog_path(
         self, capture_id: str, catalog_sha256: str | None = None
@@ -2791,6 +3018,7 @@ class ActiveReplayProjectService:
                 or manifest["scope"]["buildId"] != replay_scope["buildId"]
             ):
                 raise ActiveProjectError("replay project changed game/build scope")
+            changed = False
             for field in ("platform", "apiFamily"):
                 configured = manifest["scope"][field]
                 detected = replay_scope[field]
@@ -2798,7 +3026,9 @@ class ActiveReplayProjectService:
                     raise ActiveProjectError("replay project changed %s scope" % field)
                 if not configured and detected:
                     manifest["scope"][field] = detected
-            self._write_workspace(root, manifest)
+                    changed = True
+            if changed:
+                self._write_workspace(root, manifest)
 
     @_pinned_active_operation
     def import_capture(
@@ -2855,96 +3085,11 @@ class ActiveReplayProjectService:
             raise ActiveProjectError("workspace flowchart must be UTF-8 text") from exc
         if "\x00" in text:
             raise ActiveProjectError("workspace flowchart contains NUL characters")
+        from .shader_workspace.explanations import source_binding_metadata
+        provenance = source_binding_metadata(workspace, source, raw, status)
+        if provenance["currentSourceMatches"] is False:
+            raise ActiveProjectError(provenance["reason"])
         return raw, hashlib.sha256(raw).hexdigest()
-
-    @staticmethod
-    def _require_soft_published_shader_baseline(
-        gate: Mapping[str, Any], graph: Mapping[str, Any], status: Mapping[str, Any]
-    ) -> None:
-        """Keep a rejected proposal out of the baseline's navigation record.
-
-        The public publication path verifies the Host's sealed organization
-        session before calling this project writer. Here the explanatory
-        artifact must also match the current recovered source/candidate; this
-        projection is never an independent compile or apply authorization.
-        """
-        verdict = gate.get("verdict")
-        binding = gate.get("finalBinding")
-        source = status.get("source")
-        latest = status.get("latestCompiled")
-        capture = status.get("capture")
-        abi = latest.get("abiGate") if isinstance(latest, Mapping) else None
-        binding_fields = {
-            "complete", "sourceSha256", "revision", "candidateRawSha256",
-            "codeSha256", "abiRequestId", "abiReportSha256",
-        }
-        if (
-            gate.get("policyVersion") != "renderdoc-ai-organize-workspace/v1"
-            or gate.get("equivalenceLevel") != "rejected"
-            or gate.get("codeSha256Equal") is not False
-            or gate.get("baselineCodeSha256") == gate.get("organizedCodeSha256")
-            or gate.get("softPublishAllowed") is not True
-            or gate.get("organizedSourcePromoted") is not False
-            or gate.get("baselineCompiledAndAbiValidated") is not True
-            or gate.get("organizedCompiledAndAbiValidated") is not True
-            or gate.get("rawRecoveryCompiledAndAbiValidated") is not True
-            or gate.get("semanticEquivalenceVerified") is not False
-            or graph.get("origin") != "recovered-baseline"
-            or not isinstance(verdict, Mapping)
-            or verdict.get("schema") != "replaylab-review-verdict/v1"
-            or verdict.get("accepted") is not False
-            or verdict.get("softAccepted") is not True
-            or verdict.get("level") != "rejected"
-            or verdict.get("budgetExhausted") is not True
-            or type(verdict.get("round")) is not int
-            or type(verdict.get("maxRounds")) is not int
-            or not 1 <= verdict["round"] == verdict["maxRounds"] <= 10
-            or type(verdict.get("roundsLeft")) is not int
-            or verdict["roundsLeft"] != 0
-            or not isinstance(verdict.get("reasons"), list)
-            or any(not isinstance(reason, Mapping) or reason.get("severity") != "warning"
-                   for reason in verdict["reasons"])
-            or not isinstance(binding, Mapping) or set(binding) != binding_fields
-            or binding.get("complete") is not True
-            or not isinstance(source, Mapping) or not isinstance(latest, Mapping)
-            or not isinstance(capture, Mapping) or not isinstance(abi, Mapping)
-            or gate.get("captureId") != capture.get("captureId")
-            or gate.get("stage") != status.get("stage")
-            or gate.get("entryPoint") != status.get("entryPoint")
-            or graph.get("stage") != status.get("stage")
-            or graph.get("entryPoint") != status.get("entryPoint")
-            or latest.get("replayAbiValidated") is not True
-            or latest.get("abiCompatible") is not True
-            or latest.get("requiresReplayAbiValidation") is not False
-            or latest.get("semanticEquivalenceVerified") is not False
-            or latest.get("validationScope") != "replay-reflection-abi-compatible"
-            or abi.get("status") != "compatible"
-        ):
-            raise ShaderFlowGraphError("soft-published Shader graph lacks a validated baseline")
-        expected = {
-            "sourceSha256": source.get("currentSha256"),
-            "revision": status.get("revision"),
-            "candidateRawSha256": latest.get("rawSha256"),
-            "codeSha256": latest.get("codeSha256"),
-            "abiRequestId": abi.get("requestId"),
-            "abiReportSha256": abi.get("reportSha256"),
-        }
-        if (
-            type(expected["revision"]) is not int or expected["revision"] <= 0
-            or any(not isinstance(value, str) or SHA256_RE.fullmatch(value) is None
-                for key, value in expected.items() if key != "revision")
-            or any(binding.get(key) != value for key, value in expected.items())
-            or latest.get("sourceSha256") != expected["sourceSha256"]
-            or latest.get("revision") != expected["revision"]
-            or gate.get("baselineSourceSha256") != expected["sourceSha256"]
-            or gate.get("finalSourceSha256") != expected["sourceSha256"]
-            or gate.get("baselineCodeSha256") != expected["codeSha256"]
-            or gate.get("finalCodeSha256") != expected["codeSha256"]
-            or gate.get("finalCandidateRawSha256") != expected["candidateRawSha256"]
-            or gate.get("finalAbiRequestId") != expected["abiRequestId"]
-            or gate.get("finalAbiReportSha256") != expected["abiReportSha256"]
-        ):
-            raise ShaderFlowGraphError("soft-published Shader graph differs from its validated baseline")
 
     @staticmethod
     def _read_shader_flow_graph(
@@ -3025,49 +3170,6 @@ class ActiveReplayProjectService:
                     "workspace status does not bind the current Shader flow graph"
                 )
 
-            gate_path = workspace / "ai" / "organize-code-gate.json"
-            if (
-                gate_path.is_symlink()
-                or not gate_path.is_file()
-                or not is_within(workspace, gate_path.resolve())
-            ):
-                raise ShaderFlowGraphError(
-                    "workspace Shader flow graph has no organization gate"
-                )
-            gate_raw = _regular_bytes(
-                gate_path, MAX_EXPLANATORY_BYTES,
-                "workspace Shader organization gate"
-            )
-            gate = json.loads(gate_raw.decode("utf-8", errors="strict"))
-            declared_graph = Path(
-                str(gate.get("flowGraphArtifactPath", "") or "")
-            ) if isinstance(gate, Mapping) else Path()
-            if not declared_graph.is_absolute():
-                declared_graph = workspace / declared_graph
-            if (
-                not isinstance(gate, Mapping)
-                or gate.get("schema") !=
-                "renderdoc-ai-shader-organization-gate/v1"
-                or gate.get("schemaVersion") != 1
-                or gate.get("requestedTransformation") != "organize-only"
-                or gate.get("decision") not in (
-                    "accepted-executable-editable", "soft-accepted-baseline"
-                )
-                or gate.get("safeToStartLiveEdit") is not True
-                or gate.get("replayApplied") is not False
-                or gate.get("workspaceId") != status.get("workspaceId")
-                or gate.get("finalSourceSha256") !=
-                source.get("currentSha256")
-                or gate.get("finalRevision") != status.get("revision")
-                or gate.get("flowGraphId") != value.get("graphId")
-                or gate.get("flowGraphSha256") != digest
-                or declared_graph.resolve() != artifact.resolve()
-            ):
-                raise ShaderFlowGraphError(
-                    "workspace organization gate does not bind the Shader flow graph"
-                )
-            if gate.get("decision") == "soft-accepted-baseline":
-                ActiveReplayProjectService._require_soft_published_shader_baseline(gate, value, status)
         except (UnicodeError, ValueError, TypeError,
                 ShaderFlowGraphError) as exc:
             raise ActiveProjectError(
@@ -3179,6 +3281,8 @@ class ActiveReplayProjectService:
         status: Mapping[str, Any],
         *,
         include_explanatory: bool = True,
+        require_current_candidate: bool = False,
+        include_compiled_candidate: bool = True,
         expected_head: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not isinstance(status, Mapping):
@@ -3186,15 +3290,36 @@ class ActiveReplayProjectService:
         # A later user edit deliberately changes the program. Its old analysis
         # and graph remain available on the original immutable project record,
         # but cannot describe or block publication of the newly applied source.
-        prepared_flowchart = self._read_flowchart(status) if include_explanatory else None
-        prepared_flow_graph = self._read_shader_flow_graph(status) if include_explanatory else None
+        explanatory_diagnostics: list[dict[str, str]] = []
+
+        def prepare_optional(reader: Any, artifact: str) -> tuple[bytes, str] | None:
+            if not include_explanatory:
+                return None
+            try:
+                return reader(status)
+            except (ActiveProjectError, OSError) as exc:
+                # An old or malformed diagram cannot invalidate source or ABI
+                # evidence. Keep it on disk and report why it was not copied;
+                # never publish it against the new source revision.
+                explanatory_diagnostics.append({
+                    "artifact": artifact,
+                    "status": "skipped",
+                    "reason": str(exc)[:800],
+                })
+                return None
+
+        prepared_flowchart = prepare_optional(self._read_flowchart, "ai/flowchart.mmd")
+        prepared_flow_graph = prepare_optional(self._read_shader_flow_graph, "ai/flow-graph.json")
         service = self.replay_service()
         try:
             options: dict[str, Any] = {}
+            options["include_compiled_candidate"] = include_compiled_candidate
             if expected_head is not None:
                 options["expected_head"] = expected_head
             if not include_explanatory:
-                options.update(include_analysis=False, require_current_candidate=True)
+                options["include_analysis"] = False
+            if require_current_candidate or not include_explanatory:
+                options["require_current_candidate"] = True
             result = service.register_workspace(status, **options)
         except ReplayProjectError as exc:
             if isinstance(exc, ActiveProjectError):
@@ -3222,6 +3347,7 @@ class ActiveReplayProjectService:
         value = dict(result)
         value["flowchartArtifacts"] = flowcharts
         value["flowGraphArtifacts"] = flow_graphs
+        value["explanatoryDiagnostics"] = list(value.get("explanatoryDiagnostics") or []) + explanatory_diagnostics
         value["policy"] = {
             "flowchartExplanatoryOnly": True,
             "flowGraphNavigationOnly": True,
@@ -3274,11 +3400,13 @@ class ActiveReplayProjectService:
 
     @_pinned_active_operation
     def seed_workspace(
-        self, knowledge_id: str, destination_status: Mapping[str, Any]
+        self, knowledge_id: str, destination_status: Mapping[str, Any],
+        *, supersede_local_edit: bool = False,
     ) -> dict[str, Any]:
         try:
             return self.replay_service().seed_workspace(
-                knowledge_id, destination_status
+                knowledge_id, destination_status,
+                supersede_local_edit=supersede_local_edit,
             )
         except ReplayProjectError as exc:
             if isinstance(exc, ActiveProjectError):

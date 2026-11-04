@@ -1,8 +1,8 @@
-"""Source-bound computation graphs; navigation metadata grants no authority.
+"""Source-bound function graphs; navigation metadata grants no authority.
 
-AI describes cohesive computation stages. Host binds their ranges and value
-references to final source tokens; this lexical check is not a semantic proof.
-Legacy function-call graphs remain readable as a fallback.
+Published graphs describe function interfaces and calls from the final source.
+Detailed computation ranges supplied by an Agent remain separate review evidence
+and are never promoted into visible graph nodes.
 """
 
 from __future__ import annotations
@@ -23,10 +23,14 @@ FLOW_GRAPH_VERSION = 1
 MODULE_DESCRIPTIONS_SCHEMA = "replaylab-shader-module-descriptions/v1"
 MODULE_DESCRIPTIONS_VERSION = 1
 MAX_FLOW_GRAPH_BYTES = 1024 * 1024
-MAX_MODULE_DESCRIPTIONS_BYTES = 64 * 1024
+MAX_MODULE_DESCRIPTIONS_BYTES = 256 * 1024
 MAX_GRAPH_NODES = 256
 MAX_GRAPH_EDGES = 1024
+MAX_MODULE_DESCRIPTION_ENTRIES = 2048
 MAX_DESCRIPTION_CHARS = 512
+MAX_INTERFACE_ITEMS = 24
+MAX_INTERFACE_TEXT_CHARS = 128
+MAX_SIGNATURE_CHARS = 512
 MAX_TOKEN_COUNT = 750000
 
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
@@ -112,6 +116,32 @@ def _bounded_text(
     if any(ord(character) < 32 for character in text):
         raise ShaderFlowGraphError("%s must be single-line plain text" % label)
     return text
+
+
+def _contains_implementation_text(text: str) -> bool:
+    """True when a supposed summary looks like an executable statement."""
+
+    # Earlier Host versions emitted this exact prose as the entry description.
+    # Its punctuation does not turn an otherwise source-bound graph into code;
+    # keep the exception exact so arbitrary statements retain the strict gate.
+    if text == "Shader entry point; the stage result is produced here.":
+        return False
+    return bool(
+        any(marker in text for marker in (";", "{", "}", "```"))
+        or re.search(r"(?<![=!<>])=(?!=)|\b(?:return|discard)\s+", text)
+        or re.search(r"(?:\+\+|--|->|&&|\|\||\?)", text)
+        or re.search(r"(?:^|\s)#(?:define|if|ifdef|ifndef|include|pragma)\b", text)
+        or re.search(r"\b(?:if|for|while|switch)\s*\(", text)
+        # A no-space identifier/constructor call is a source snippet even when
+        # an Agent omits the trailing semicolon or wraps it in prose.
+        or re.search(r"\b[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?\(", text)
+        or re.search(r"\b[A-Za-z_]\w*\s*\[[^\]\r\n]+\]", text)
+        or re.search(
+            r"\b(?:float|half|double|int|uint|bool|min16float|min16int|min16uint)"
+            r"(?:[1-4](?:x[1-4])?)?\s+[A-Za-z_]\w*\b",
+            text,
+        )
+    )
 
 
 def _normalized_relative_path(value: Any, label: str) -> str:
@@ -252,6 +282,16 @@ def _function_records(source: str) -> list[dict[str, Any]]:
                     while suffix < len(tokens) and tokens[suffix].text not in ("{", ";"):
                         suffix += 1
                 previous = tokens[index - 1].text if index > 0 else ""
+                return_semantic = ""
+                if close_parenthesis + 1 < len(tokens) and tokens[close_parenthesis + 1].text == ":":
+                    return_semantic = next(
+                        (
+                            item.text
+                            for item in tokens[close_parenthesis + 2:suffix]
+                            if _IDENTIFIER.fullmatch(item.text)
+                        ),
+                        "",
+                    )
                 return_prefix = (
                     _IDENTIFIER.fullmatch(previous) is not None
                     or previous in (">", "]", "*", "&")
@@ -266,10 +306,13 @@ def _function_records(source: str) -> list[dict[str, Any]]:
                         {
                             "name": token.text,
                             "line": token.line,
+                            "declarationLine": tokens[index - 1].line,
                             "column": token.column,
                             "bodyStart": suffix,
                             "bodyEnd": braces[suffix],
                             "parameters": _parameter_records(tokens[index + 2:close_parenthesis]),
+                            "returnType": previous if _IDENTIFIER.fullmatch(previous) else "",
+                            "returnSemantic": return_semantic,
                             "calls": [],
                         }
                     )
@@ -297,6 +340,12 @@ def _function_records(source: str) -> list[dict[str, Any]]:
         record["calls"] = calls
         body = tokens[record["bodyStart"] + 1:record["bodyEnd"]]
         record["bodyTokens"] = [item.text for item in body]
+        record["returnsValue"] = any(
+            item.text == "return"
+            and token_index + 1 < len(body)
+            and body[token_index + 1].text != ";"
+            for token_index, item in enumerate(body)
+        )
         record["callSites"] = _call_sites(record["bodyTokens"], set(by_name))
         statements = _computation_statements(body)
         record["statements"] = statements
@@ -328,14 +377,79 @@ def _argument_groups(words: list[str]) -> list[list[str]]:
 
 def _parameter_records(tokens: list[_TokenValue]) -> list[dict[str, str]]:
     result = []
-    for words in _argument_groups([item.text for item in tokens]):
-        words = words[:words.index(":")] if ":" in words else words
+    for raw_words in _argument_groups([item.text for item in tokens]):
+        semantic = ""
+        if ":" in raw_words:
+            colon = raw_words.index(":")
+            semantic = next(
+                (word for word in raw_words[colon + 1:] if _IDENTIFIER.fullmatch(word)),
+                "",
+            )
+            words = raw_words[:colon]
+        else:
+            words = list(raw_words)
         words = words[:words.index("=")] if "=" in words else words
         identifiers = [word for word in words if _IDENTIFIER.fullmatch(word)]
         if len(identifiers) < 2:
             continue
-        result.append({"name": identifiers[-1], "mode": "inout" if "inout" in words else "out" if "out" in words else "in"})
+        name = identifiers[-1]
+        name_index = len(words) - 1 - list(reversed(words)).index(name)
+        type_words = [
+            word for word in words[:name_index]
+            if word not in ("in", "out", "inout", "const", "precise", "uniform")
+        ]
+        type_name = " ".join(type_words).strip()
+        result.append(
+            {
+                "name": name,
+                "mode": "inout" if "inout" in words else "out" if "out" in words else "in",
+                "type": type_name,
+                "semantic": semantic,
+            }
+        )
     return result
+
+
+def _function_interface(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a bounded declaration-only summary for one parsed function."""
+
+    parameters = list(record.get("parameters", []))[:MAX_INTERFACE_ITEMS]
+    inputs: list[str] = []
+    outputs: list[str] = []
+    signature_parameters: list[str] = []
+    for parameter in parameters:
+        name = str(parameter.get("name", "")).strip()
+        if _IDENTIFIER.fullmatch(name) is None:
+            continue
+        mode = str(parameter.get("mode", "in") or "in")
+        type_name = " ".join(str(parameter.get("type", "") or "").split())
+        if len(type_name) > MAX_INTERFACE_TEXT_CHARS:
+            type_name = type_name[:MAX_INTERFACE_TEXT_CHARS]
+        signature_parameters.append(
+            " ".join(item for item in (mode, type_name, name) if item)
+        )
+        if mode in ("in", "inout") and name not in inputs:
+            inputs.append(name)
+        if mode in ("out", "inout") and name not in outputs:
+            outputs.append(name)
+
+    return_type = " ".join(str(record.get("returnType", "") or "").split())
+    return_semantic = str(record.get("returnSemantic", "") or "").strip()
+    if (return_type and return_type.lower() != "void") or record.get("returnsValue") is True:
+        output = return_semantic if _IDENTIFIER.fullmatch(return_semantic) else "return"
+        if output not in outputs:
+            outputs.append(output)
+    name = str(record.get("name", "") or "")
+    signature = "%s%s(%s)" % (
+        (return_type + " ") if return_type else "",
+        name,
+        ", ".join(signature_parameters),
+    )
+    if return_semantic and _IDENTIFIER.fullmatch(return_semantic):
+        signature += " : " + return_semantic
+    if len(signature) > MAX_SIGNATURE_CHARS:
+        signature = signature[:MAX_SIGNATURE_CHARS - 3].rstrip() + "..."
+    return {"signature": signature, "inputs": inputs, "outputs": outputs}
 
 
 def _call_sites(words: list[str], functions: set[str]) -> list[dict[str, Any]]:
@@ -541,28 +655,67 @@ def bind_computation_range(source: str, function: str, requested: Any = None, *,
 
 
 def _default_description(name: str, is_entry: bool) -> str:
+    """What the Host can say about a function it has only parsed.
+
+    It can say that a function is the entry point, because that is a fact about
+    the program. It cannot say what ``ApplyFoo`` does: reading meaning out of an
+    identifier is guessing from a naming convention, and the guess then travels
+    into the diagram as if someone had established it. So an undescribed
+    function says it is undescribed, and the description is the Agent's to write
+    (``module_description_template`` / ``describe_shader_modules``) once it has
+    read the code and, where the draw resolves to one, the unpacked material.
+    """
+
     if is_entry:
         return "Shader entry point that coordinates the final stage result."
-    words = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name).replace("_", " ").lower()
-    if any(word in words for word in ("sample", "texture", "texel", "load")):
-        return "Samples or loads texture data for downstream calculations."
-    if any(word in words for word in ("light", "brdf", "specular", "diffuse")):
-        return "Evaluates a lighting or material-response contribution."
-    if any(word in words for word in ("normal", "tangent")):
-        return "Prepares normal or tangent-space data."
-    if any(word in words for word in ("transform", "project", "position", "vertex")):
-        return "Transforms position or coordinate data."
-    if any(word in words for word in ("color", "tone", "gamma", "exposure")):
-        return "Adjusts or combines color data."
-    if any(word in words for word in ("shadow", "occlusion")):
-        return "Computes a shadowing or visibility contribution."
-    if any(word in words for word in ("decode", "unpack")):
-        return "Decodes packed Shader data into a usable form."
-    if any(word in words for word in ("encode", "pack")):
-        return "Packs calculated Shader data for later use."
-    if any(word in words for word in ("blend", "composite", "combine")):
-        return "Combines intermediate Shader values."
-    return "Helper function used by the organized Shader program."
+    return "Not yet described."
+
+
+def _source_function_comment(source: str, record: Mapping[str, Any]) -> str:
+    """Read only a plain-language comment immediately before a declaration.
+
+    An older module description can disagree with an edited source comment.
+    The final source is the diagram's authority; absent or code-like comments
+    leave the reviewed description available as a fallback.
+    """
+
+    lines = source.splitlines()
+    index = int(record.get("declarationLine", record.get("line", 0))) - 2
+    while index >= 0 and re.fullmatch(r"\[[^\[\]]+\]", lines[index].strip()):
+        index -= 1  # HLSL attributes between the comment and function.
+    if index < 0:
+        return ""
+    current = lines[index].strip()
+    parts: list[str] = []
+    if current.startswith("//"):
+        while index >= 0 and lines[index].strip().startswith("//"):
+            parts.append(lines[index].strip()[2:].strip())
+            index -= 1
+        parts.reverse()
+    elif current.endswith("*/"):
+        found_start = False
+        while index >= 0:
+            raw = lines[index].strip()
+            if "/*" in raw:
+                before, after = raw.split("/*", 1)
+                if before:
+                    break
+                parts.append(after.replace("*/", "").lstrip("* ").strip())
+                found_start = True
+                break
+            if raw and not raw.startswith("*"):
+                break
+            parts.append(raw.lstrip("* ").replace("*/", "").strip())
+            index -= 1
+        if not found_start:
+            return ""
+        parts.reverse()
+    else:
+        return ""
+    comment = " ".join(part for part in parts if part).strip()
+    if not comment or len(comment) > MAX_DESCRIPTION_CHARS or _contains_implementation_text(comment):
+        return ""
+    return comment
 
 
 def _fallback_entry_record(source: str, entry_point: str) -> dict[str, Any] | None:
@@ -582,22 +735,36 @@ def _fallback_entry_record(source: str, entry_point: str) -> dict[str, Any] | No
         "column": offset - line_start + 1,
         "bodyStart": 0,
         "bodyEnd": 0,
+        "parameters": [],
+        "returnType": "",
+        "returnSemantic": "",
+        "returnsValue": False,
         "calls": [],
     }
 
 
-def module_description_template(source: str) -> dict[str, Any]:
-    """Return an AI-editable, bounded description template for source functions."""
-
+def _module_function_names(source: str) -> list[str]:
     records = _function_records(source)
     names: list[str] = []
     seen: set[str] = set()
     for record in records:
         name = record["name"]
-        if name in seen or len(names) >= MAX_GRAPH_NODES:
+        if name in seen:
             continue
         seen.add(name)
         names.append(name)
+    return names
+
+
+def module_description_template(source: str) -> dict[str, Any]:
+    """Return the first bounded page of the editable description template.
+
+    The final document may cover more functions than the visible graph. Begin
+    returns a separate paging record so an Agent can read later function pages
+    from the outline and merge their descriptions into the same draft.
+    """
+
+    names = _module_function_names(source)[:MAX_GRAPH_NODES]
     return {
         "schema": MODULE_DESCRIPTIONS_SCHEMA,
         "schemaVersion": MODULE_DESCRIPTIONS_VERSION,
@@ -605,6 +772,23 @@ def module_description_template(source: str) -> dict[str, Any]:
             {"name": name, "description": ""}
             for name in names
         ],
+    }
+
+
+def module_description_paging(source: str) -> dict[str, Any]:
+    """Describe complete function coverage without expanding the begin result."""
+
+    names = _module_function_names(source)
+    returned = min(len(names), MAX_GRAPH_NODES)
+    return {
+        "schema": "replaylab-shader-module-description-paging/v1",
+        "totalFunctions": len(names),
+        "templateEntries": returned,
+        "hasMore": returned < len(names),
+        "nextOutlineOffset": returned if returned < len(names) else None,
+        "maximumDescriptionEntries": MAX_MODULE_DESCRIPTION_ENTRIES,
+        "maximumDocumentBytes": MAX_MODULE_DESCRIPTIONS_BYTES,
+        "mergeKey": "modules[].name",
     }
 
 
@@ -627,7 +811,7 @@ def validate_module_descriptions(value: Mapping[str, Any]) -> dict[str, str]:
     ):
         raise ShaderFlowGraphError("module description schema is invalid")
     modules = value.get("modules")
-    if not isinstance(modules, list) or len(modules) > MAX_GRAPH_NODES:
+    if not isinstance(modules, list) or len(modules) > MAX_MODULE_DESCRIPTION_ENTRIES:
         raise ShaderFlowGraphError("module descriptions are invalid or oversized")
     result: dict[str, str] = {}
     for raw in modules:
@@ -645,6 +829,10 @@ def validate_module_descriptions(value: Mapping[str, Any]) -> dict[str, str]:
             MAX_DESCRIPTION_CHARS,
             allow_empty=True,
         )
+        if _contains_implementation_text(description):
+            raise ShaderFlowGraphError(
+                "module description must explain the function without source-code implementation text"
+            )
         result[name] = description
     return result
 
@@ -668,6 +856,10 @@ def _ordered_record_indexes(
     for index, record in enumerate(records):
         by_name.setdefault(record["name"], []).append(index)
     queue = list(by_name.get(entry_point, []))
+    if not queue:
+        # No verified entry declaration: retain the legacy bounded outline.
+        # With an entry, only its reachable call chain belongs in this graph.
+        return list(range(len(records)))
     ordered: list[int] = []
     queued = set(queue)
     cursor = 0
@@ -682,8 +874,6 @@ def _ordered_record_indexes(
                 if called_index not in queued:
                     queued.add(called_index)
                     queue.append(called_index)
-    ordered_set = set(ordered)
-    ordered.extend(index for index in range(len(records)) if index not in ordered_set)
     return ordered
 
 
@@ -718,7 +908,8 @@ def build_shader_flow_graph(
     if (
         isinstance(source_revision, bool)
         or not isinstance(source_revision, int)
-        or source_revision <= 0
+        or source_revision < 0
+        or (source_revision == 0 and origin != "editable-draft")
     ):
         raise ShaderFlowGraphError("flow graph source revision is invalid")
     source_path = _normalized_relative_path(source_path, "flow graph source path")
@@ -727,18 +918,22 @@ def build_shader_flow_graph(
         entry_point, "flow graph entry point", 512, allow_empty=True
     )
     generated_at = _bounded_text(generated_at, "flow graph generation time", 128)
-    if origin not in ("organized-proposal", "recovered-baseline"):
+    if origin not in ("organized-proposal", "recovered-baseline", "editable-draft"):
         raise ShaderFlowGraphError("flow graph origin is invalid")
     clean_descriptions = dict(descriptions or {})
     for name, description in clean_descriptions.items():
         if _IDENTIFIER.fullmatch(str(name)) is None:
             raise ShaderFlowGraphError("flow graph description name is invalid")
-        _bounded_text(
+        clean_description = _bounded_text(
             description,
             "flow graph description",
             MAX_DESCRIPTION_CHARS,
             allow_empty=True,
         )
+        if _contains_implementation_text(clean_description):
+            raise ShaderFlowGraphError(
+                "flow graph description must explain the function without source-code implementation text"
+            )
 
     records = _function_records(source)
     if entry_point and all(record["name"] != entry_point for record in records):
@@ -762,13 +957,19 @@ def build_shader_flow_graph(
         node_ids[index] = node_id
         is_entry = record["name"] == entry_point
         supplied = clean_descriptions.get(record["name"], "").strip()
+        source_comment = _source_function_comment(source, record)
+        interface = _function_interface(record)
         nodes.append(
             {
                 "id": node_id,
                 "name": record["name"],
                 "label": record["name"],
                 "kind": "entry-point" if is_entry else "function",
-                "description": supplied or _default_description(record["name"], is_entry),
+                "description": (source_comment or supplied or
+                                _default_description(record["name"], is_entry)),
+                "signature": interface["signature"],
+                "inputs": interface["inputs"],
+                "outputs": interface["outputs"],
                 "source": {
                     "workspaceId": workspace_id,
                     "documentId": workspace_id,
@@ -780,29 +981,33 @@ def build_shader_flow_graph(
         )
 
     by_name: dict[str, list[int]] = {}
-    for index, record in enumerate(records):
-        if index in selected:
-            by_name.setdefault(record["name"], []).append(index)
-    all_edges: list[dict[str, str]] = []
-    seen_edges: set[tuple[str, str]] = set()
-    for caller_index in selected_indexes:
+    for index in ordered_indexes:
+        by_name.setdefault(records[index]["name"], []).append(index)
+    all_edge_indexes: list[tuple[int, int]] = []
+    seen_edges: set[tuple[int, int]] = set()
+    for caller_index in ordered_indexes:
         for called_name in records[caller_index]["calls"]:
             for callee_index in by_name.get(called_name, []):
-                edge_key = (node_ids[caller_index], node_ids[callee_index])
+                edge_key = (caller_index, callee_index)
                 if edge_key in seen_edges:
                     continue
                 seen_edges.add(edge_key)
-                all_edges.append(
+                all_edge_indexes.append(edge_key)
+    selected_edges = [
+        edge for edge in all_edge_indexes if edge[0] in selected and edge[1] in selected
+    ]
+    edges = [
                     {
-                        "source": edge_key[0],
-                        "target": edge_key[1],
+                        "source": node_ids[edge[0]],
+                        "target": node_ids[edge[1]],
                         "kind": "calls",
                     }
-                )
-    edges = all_edges[:MAX_GRAPH_EDGES]
-    algorithm = bool(flow_spec and flow_spec.get("stages"))
-    if algorithm:
-        nodes, edges = _algorithm_nodes(source, flow_spec, workspace_id, source_path, records=records)
+        for edge in selected_edges[:MAX_GRAPH_EDGES]
+    ]
+    # ``flow_spec`` remains in this public API for existing callers. Its stage
+    # ranges are review evidence stored as ``flow-spec.json`` by organization;
+    # they must never replace the published function/call graph.
+    del flow_spec
     material = {
         "schema": FLOW_GRAPH_SCHEMA,
         "schemaVersion": FLOW_GRAPH_VERSION,
@@ -820,10 +1025,10 @@ def build_shader_flow_graph(
             "maxEdges": MAX_GRAPH_EDGES,
         },
         "truncated": {
-            "nodes": len(records) > len(nodes),
-            "edges": len(all_edges) > len(edges),
-            "omittedNodes": max(0, len(records) - len(nodes)),
-            "omittedEdges": max(0, len(all_edges) - len(edges)),
+            "nodes": len(ordered_indexes) > len(nodes),
+            "edges": len(all_edge_indexes) > len(edges),
+            "omittedNodes": max(0, len(ordered_indexes) - len(nodes)),
+            "omittedEdges": max(0, len(all_edge_indexes) - len(edges)),
         },
         "policy": {
             "navigationOnly": True,
@@ -834,13 +1039,6 @@ def build_shader_flow_graph(
             "descriptionsMayBeAiAuthored": True,
         },
     }
-    if algorithm:
-        material["graphKind"] = "algorithm-dataflow"
-        material["layoutDirection"] = "TD"
-        material["truncated"] = {"nodes": False, "edges": False, "omittedNodes": 0, "omittedEdges": 0}
-        material["policy"]["callEdgesDerivedFromFinalSource"] = False
-        material["policy"]["computationRangesBoundToFinalSource"] = True
-        material["policy"]["dataEdgesAreLexicallyBound"] = True
     graph = dict(material)
     graph["graphId"] = _sha256(_canonical_bytes(material))[:32]
     graph["generatedAt"] = generated_at
@@ -853,14 +1051,22 @@ def build_shader_flow_graph(
     )
 
 
-def _algorithm_nodes(source: str, spec: Mapping[str, Any], workspace_id: str, source_path: str, *, records=None):
+def _algorithm_nodes(source: str, spec: Mapping[str, Any], workspace_id: str, source_path: str,
+                     *, records=None, descriptions: Mapping[str, str] | None = None):
+    """Build the legacy stage shape for compatibility inspection only.
+
+    Organization stores ``spec`` itself as internal evidence. Published graph
+    generation intentionally never calls this helper.
+    """
+
     nodes, edges = [], []
     record_list = _function_records(source) if records is None else records
     records = _unique_records(record_list)
     for stage in spec["stages"]:
         bound = bind_computation_range(source, stage["function"], stage.get("sourceRange"), records=record_list)
+        description = str((descriptions or {}).get(stage["function"]) or stage["label"])
         nodes.append({"id": "stage-" + stage["id"], "name": stage["function"],
-                      "label": stage["label"], "kind": "computation", "description": stage["label"],
+                      "label": stage["label"], "kind": "computation", "description": description,
                       "source": {"workspaceId": workspace_id, "documentId": workspace_id, "path": source_path,
                                  "line": bound["navigationLine"], "column": bound["navigationColumn"]},
                       "sourceRange": bound["sourceRange"], "reads": list(stage.get("reads", [])),
@@ -945,7 +1151,9 @@ def validate_shader_flow_graph(
     if _SHA256.fullmatch(source_sha256) is None:
         raise ShaderFlowGraphError("Shader flow graph source SHA-256 is invalid")
     revision = graph.get("sourceRevision")
-    if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+    if (isinstance(revision, bool) or not isinstance(revision, int)
+            or revision < 0
+            or (revision == 0 and graph.get("origin") != "editable-draft")):
         raise ShaderFlowGraphError("Shader flow graph source revision is invalid")
     _bounded_text(graph.get("stage"), "Shader flow graph stage", 64)
     _bounded_text(
@@ -958,7 +1166,7 @@ def validate_shader_flow_graph(
         graph.get("sourcePath"), "Shader flow graph source path"
     )
     _bounded_text(graph.get("generatedAt"), "Shader flow graph generation time", 128)
-    if graph.get("origin") not in ("organized-proposal", "recovered-baseline"):
+    if graph.get("origin") not in ("organized-proposal", "recovered-baseline", "editable-draft"):
         raise ShaderFlowGraphError("Shader flow graph origin is invalid")
     if graph.get("limits") != {
         "maxNodes": MAX_GRAPH_NODES,
@@ -1004,7 +1212,7 @@ def validate_shader_flow_graph(
         raise ShaderFlowGraphError("Shader flow graph edges are invalid or oversized")
     node_ids: set[str] = set()
     for node in nodes:
-        node_fields = {
+        required_node_fields = {
             "id",
             "name",
             "label",
@@ -1012,9 +1220,20 @@ def validate_shader_flow_graph(
             "description",
             "source",
         }
+        allowed_node_fields = set(required_node_fields)
         if algorithm:
-            node_fields.update(("sourceRange", "reads", "writes", "inferred"))
-        if not isinstance(node, Mapping) or set(node) != node_fields:
+            required_node_fields.update(("sourceRange", "reads", "writes", "inferred"))
+            allowed_node_fields = set(required_node_fields)
+        else:
+            # Interface fields were added without changing the v1 identifier so
+            # already-published function graphs remain readable. New Host graphs
+            # always carry all three fields.
+            allowed_node_fields.update(("signature", "inputs", "outputs"))
+        if (
+            not isinstance(node, Mapping)
+            or not required_node_fields.issubset(node)
+            or set(node) - allowed_node_fields
+        ):
             raise ShaderFlowGraphError("Shader flow graph node fields are invalid")
         node_id = _bounded_text(node.get("id"), "Shader flow graph node id", 128)
         name = _bounded_text(node.get("name"), "Shader flow graph node name", 256)
@@ -1033,6 +1252,37 @@ def validate_shader_flow_graph(
             "Shader flow graph node description",
             MAX_DESCRIPTION_CHARS,
         )
+        if not algorithm and _contains_implementation_text(str(node.get("description", ""))):
+            raise ShaderFlowGraphError(
+                "Shader flow graph description contains implementation text"
+            )
+        if not algorithm:
+            if "signature" in node:
+                signature = _bounded_text(
+                    node.get("signature"),
+                    "Shader flow graph function signature",
+                    MAX_SIGNATURE_CHARS,
+                )
+                if any(marker in signature for marker in (";", "{", "}", "```")):
+                    raise ShaderFlowGraphError(
+                        "Shader flow graph signature contains implementation text"
+                    )
+            for key in ("inputs", "outputs"):
+                if key not in node:
+                    continue
+                values = node[key]
+                if not isinstance(values, list) or len(values) > MAX_INTERFACE_ITEMS:
+                    raise ShaderFlowGraphError("Shader flow graph function interface is invalid")
+                seen_values: set[str] = set()
+                for item in values:
+                    value_name = _bounded_text(
+                        item,
+                        "Shader flow graph function interface value",
+                        MAX_INTERFACE_TEXT_CHARS,
+                    )
+                    if _IDENTIFIER.fullmatch(value_name) is None or value_name in seen_values:
+                        raise ShaderFlowGraphError("Shader flow graph function interface is invalid")
+                    seen_values.add(value_name)
         location = node.get("source")
         if not isinstance(location, Mapping) or set(location) != {
             "workspaceId",
@@ -1180,6 +1430,7 @@ __all__ = [
     "MAX_FLOW_GRAPH_BYTES",
     "MAX_GRAPH_EDGES",
     "MAX_GRAPH_NODES",
+    "MAX_MODULE_DESCRIPTION_ENTRIES",
     "MAX_MODULE_DESCRIPTIONS_BYTES",
     "MODULE_DESCRIPTIONS_SCHEMA",
     "MODULE_DESCRIPTIONS_VERSION",
@@ -1187,6 +1438,7 @@ __all__ = [
     "build_shader_flow_graph",
     "load_module_descriptions",
     "load_workspace_flow_graph_status",
+    "module_description_paging",
     "module_description_template",
     "validate_module_descriptions",
     "validate_shader_flow_graph",

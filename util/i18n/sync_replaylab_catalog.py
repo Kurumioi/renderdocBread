@@ -102,7 +102,16 @@ def main() -> int:
             + updated_context
             + catalog_text[context_match.end():]
         )
-        args.catalog.write_text(updated, encoding="utf-8", newline="")
+        import os
+        import tempfile
+        descriptor, temporary = tempfile.mkstemp(prefix=args.catalog.name + ".", suffix=".tmp", dir=str(args.catalog.parent))
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+                stream.write(updated)
+            os.replace(temporary, args.catalog)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
     print(f"ReplayLab catalog: {len(found)} reviewed translations current")
     return 0
 

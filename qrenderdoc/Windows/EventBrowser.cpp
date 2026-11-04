@@ -32,6 +32,7 @@
 #include <QKeyEvent>
 #include <QLineEdit>
 #include <QMenu>
+#include <QPointer>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
@@ -45,6 +46,8 @@
 #include <QTextEdit>
 #include <QTimer>
 #include "Code/QRDUtils.h"
+#include "Code/CaptureContext.h"
+#include "Code/ReplayLab/ReplayLabIntegration.h"
 #include "Code/Resources.h"
 #include "Widgets/CollapseGroupBox.h"
 #include "Widgets/Extended/RDHeaderView.h"
@@ -4165,6 +4168,7 @@ void EventBrowser::SetHighlightedAnnotation(const rdcstr &annotationPath)
 
 void EventBrowser::OnCaptureLoaded()
 {
+  ++m_ShaderNavigationGeneration;
   ui->events->setIgnoreBackgroundColors(!m_Ctx.Config().EventBrowser_ColorEventRow);
 
   m_FilterModel->ResetCache();
@@ -4201,6 +4205,7 @@ void EventBrowser::OnCaptureLoaded()
 
 void EventBrowser::OnCaptureClosed()
 {
+  ++m_ShaderNavigationGeneration;
   m_ArrowScrubKeys.clear();
 
   clearBookmarks();
@@ -5868,7 +5873,9 @@ void EventBrowser::events_contextMenu(const QPoint &pos)
 
   QAction expandAll(tr("&Expand All"), this);
   QAction collapseAll(tr("&Collapse All"), this);
-  QAction toggleBookmark(tr("Toggle &Bookmark"), this);
+  const uint32_t contextEID = index.isValid() ? GetSelectedEID(index) : 0;
+  const bool bookmarked = m_Ctx.GetBookmarks().contains(EventBookmark(contextEID));
+  QAction toggleBookmark(bookmarked ? tr("Remove &Bookmark") : tr("Add &Bookmark"), this);
   QAction selectCols(tr("&Select Columns..."), this);
   QAction rgpSelect(tr("Select &RGP Event"), this);
   rgpSelect.setIcon(Icons::connect());
@@ -5878,6 +5885,83 @@ void EventBrowser::events_contextMenu(const QPoint &pos)
   contextMenu.addAction(&toggleBookmark);
   contextMenu.addAction(&selectCols);
 
+  if(!headerMenu && contextEID && m_Ctx.IsCaptureLoaded())
+  {
+    QMenu *shaderMenu = contextMenu.addMenu(tr("Go to Shader"));
+    QPointer<QMenu> destination(shaderMenu);
+    QPointer<EventBrowser> owner(this);
+    const uint64_t generation = m_ShaderNavigationGeneration;
+    const ActionDescription *action = m_Ctx.GetAction(contextEID);
+    const bool draw = action && bool(action->flags & (ActionFlags::Drawcall | ActionFlags::MeshDispatch));
+    const bool dispatch = action && !draw && bool(action->flags & ActionFlags::Dispatch);
+    const bool direct3d = m_Ctx.APIProps().pipelineType == GraphicsAPI::D3D11 ||
+                          m_Ctx.APIProps().pipelineType == GraphicsAPI::D3D12;
+    shaderMenu->addAction(tr("Reading Shaders…"))->setEnabled(false);
+    // Replay work is queued and the menu opens immediately. Snapshot the
+    // clicked EID without changing the user's visible selection, then restore
+    // the replay position in the same serialized transaction.
+    QObject::connect(shaderMenu, &QMenu::aboutToShow, shaderMenu,
+        [this, owner, destination, generation, contextEID, draw, dispatch, direct3d]() {
+      if(!owner || !destination || destination->property("breadShaderLookupStarted").toBool())
+        return;
+      destination->setProperty("breadShaderLookupStarted", true); // i18n-ignore: private menu state
+      owner->m_Ctx.Replay().AsyncInvoke([this, owner, destination, generation, contextEID, draw, dispatch, direct3d](IReplayController *replay) {
+      struct ShaderDestination
+      {
+        QString stage, label, resource, entry;
+      };
+      QVector<ShaderDestination> shaders;
+      const uint32_t previous = replay->GetCurrentEventID();
+      if(draw || dispatch)
+      {
+        if(previous != contextEID)
+          replay->SetFrameEvent(contextEID, true);
+        // i18n-ignore: API stage abbreviations and stable stage protocol identifiers.
+        const ShaderStage stages[] = {ShaderStage::Vertex, ShaderStage::Hull, ShaderStage::Domain,
+            ShaderStage::Geometry, ShaderStage::Pixel, ShaderStage::Compute, ShaderStage::Task, ShaderStage::Mesh};
+        const char *tokens[] = {"vertex", "hull", "domain", "geometry", "fragment", "compute", "task", "mesh"};
+        const char *d3dLabels[] = {"VS", "HS", "DS", "GS", "PS", "CS", "AS", "MS"};
+        const char *otherLabels[] = {"VS", "TCS", "TES", "GS", "FS", "CS", "TS", "MS"};
+        for(size_t i = 0; i < sizeof(stages) / sizeof(stages[0]); ++i)
+        {
+          if((stages[i] == ShaderStage::Compute) != dispatch)
+            continue;
+          ResourceId id = replay->GetPipelineState().GetShader(stages[i]);
+          if(id == ResourceId())
+            continue;
+          uint64_t rawId = 0;
+          static_assert(sizeof(rawId) == sizeof(id), "ResourceId wire size changed");
+          memcpy(&rawId, &id, sizeof(rawId));
+          shaders.push_back({QString::fromLatin1(tokens[i]),
+              QString::fromLatin1(direct3d ? d3dLabels[i] : otherLabels[i]), QString::number(rawId),
+              QString(replay->GetPipelineState().GetShaderEntryPoint(stages[i]))});
+        }
+        if(previous != contextEID)
+          replay->SetFrameEvent(previous, true);
+      }
+      GUIInvoke::call(qApp, [this, owner, destination, generation, contextEID, shaders]() {
+        if(!owner || !destination || generation != owner->m_ShaderNavigationGeneration ||
+           !owner->m_Ctx.IsCaptureLoaded())
+          return;
+        destination->clear();
+        if(shaders.empty())
+          destination->addAction(tr("No Shaders are bound to this event."))->setEnabled(false);
+        for(const ShaderDestination &shader : shaders)
+        {
+          QAction *jump = destination->addAction(shader.label);
+          QObject::connect(jump, &QAction::triggered, owner.data(),
+              [owner, generation, contextEID, shader]() {
+            if(!owner || generation != owner->m_ShaderNavigationGeneration)
+              return;
+            CaptureContext &capture = static_cast<CaptureContext &>(owner->m_Ctx);
+            capture.ReplayLab().OpenShaderWorkspace(contextEID, shader.stage, shader.resource, shader.entry);
+          });
+        }
+      });
+      });
+    });
+  }
+
   expandAll.setIcon(Icons::arrow_out());
   collapseAll.setIcon(Icons::arrow_in());
   toggleBookmark.setIcon(Icons::asterisk_orange());
@@ -5885,7 +5969,6 @@ void EventBrowser::events_contextMenu(const QPoint &pos)
 
   expandAll.setEnabled(index.isValid() && ui->events->model()->rowCount(index) > 0);
   collapseAll.setEnabled(expandAll.isEnabled());
-  const uint32_t contextEID = index.isValid() ? GetSelectedEID(index) : 0;
   toggleBookmark.setEnabled(m_Ctx.IsCaptureLoaded() && contextEID != 0);
 
   QObject::connect(&expandAll, &QAction::triggered,

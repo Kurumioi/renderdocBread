@@ -26,6 +26,7 @@
 
 #include <QJsonObject>
 #include <QMap>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QVector>
@@ -110,9 +111,21 @@ public:
 
   void ConsumeEvent(const QJsonObject &event);
 
+  // Route only readable provider-emitted channels. Opaque/encrypted events stay in diagnostics.
+  static QString ConversationReasoningKind(const QJsonObject &data);
+  static QString ConversationReasoningId(const QJsonObject &data);
+  static QString ConversationSummaryPrefix(const QString &itemId);
+
   bool ReplayTaskFile(const QString &filePath, QString *error = NULL, QString *replayedTaskId = NULL);
   bool ReplayTaskId(const QString &taskId, const QString &eventRoot, QString *error = NULL);
   QStringList DiscoverTaskIds(const QString &eventRoot, int maximumCount = 128) const;
+  // Mark a finished task log as archived (kept for restore for retentionDays).
+  bool ArchiveTaskLog(const QString &taskId, const QString &eventRoot,
+                      const QString &reason = QString()) const;
+  bool IsTaskLogArchived(const QString &taskId, const QString &eventRoot) const;
+  // Delete archived task sidecars older than retentionDays, and remove orphaned
+  // lock/report files for those tasks. Active (non-archived) logs are kept.
+  int PurgeExpiredArchivedTaskLogs(const QString &eventRoot, int retentionDays = 7) const;
 
   QStringList TaskIds() const;
   QStringList AgentIds(const QString &taskId) const;
@@ -121,6 +134,8 @@ public:
 
   quint64 AddObserver(ChangeObserver observer);
   void RemoveObserver(quint64 observerId);
+  // Forget one removed conversation's task, including any delayed event delivery.
+  void ForgetTask(const QString &taskId);
   void Clear();
 
 private:
@@ -132,6 +147,7 @@ private:
 
   QMap<QString, AIAgentTraceTask> m_Tasks;
   QStringList m_TaskOrder;
+  QSet<QString> m_DeletedTasks;
   QMap<QString, QString> m_StreamSnapshots;
   QStringList m_StreamOrder;
   QMap<quint64, ChangeObserver> m_Observers;

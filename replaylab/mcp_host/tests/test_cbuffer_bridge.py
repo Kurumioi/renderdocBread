@@ -7,6 +7,7 @@ import struct
 import sys
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -48,7 +49,8 @@ def _load_bridge():
             "renderdoc_mcp_bridge_cbuffer_test", BRIDGE_PATH
         )
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        with mock.patch.dict(sys.modules, {"PySide2": None}):
+            spec.loader.exec_module(module)
         return module
     finally:
         if previous is None:

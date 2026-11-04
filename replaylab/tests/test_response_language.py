@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from replaylab_agent.response_language import (
+    configured_interface_locale,
     infer_response_language,
     normalize_response_locale,
     response_choice_text_matches_language,
@@ -107,6 +108,7 @@ def test_identifier_only_request_uses_ui_or_system_locale_fallback(
         ("zh", "zh_CN"),
         ("zh-CN", "zh_CN"),
         ("zh_Hans_CN", "zh_CN"),
+        ("Chinese (Simplified)_China", "zh_CN"),
         ("en", "en"),
         ("en-US", "en"),
         ("system", "en"),
@@ -120,12 +122,35 @@ def test_response_locale_normalization_matches_shipped_languages(
     assert normalize_response_locale(locale) == expected
 
 
+@pytest.mark.parametrize(
+    ("ui_locale", "system_locale", "expected"),
+    [
+        ("zh_CN", "en_US", "zh_CN"),
+        ("en_US", "zh_CN", "en"),
+        ("system", "zh_CN", "zh_CN"),
+        ("", "en_US", "en"),
+    ],
+)
+def test_source_comment_locale_uses_renderdoc_ui_then_system(
+    monkeypatch: pytest.MonkeyPatch,
+    ui_locale: str,
+    system_locale: str,
+    expected: str,
+) -> None:
+    monkeypatch.setenv("REPLAYLAB_RESPONSE_LOCALE", ui_locale)
+    monkeypatch.setattr("replaylab_agent.response_language.locale.getlocale",
+                        lambda: (system_locale, "UTF-8"))
+    assert configured_interface_locale() == expected
+
+
 def test_response_instructions_require_one_plain_concise_language() -> None:
     chinese = response_language_instruction("zh_CN")
     english = response_language_instruction("en")
 
     assert "clear, concise Simplified Chinese" in chinese
     assert "Do not mix English prose" in chinese
+    assert "RenderDoc, Bread, API" in chinese
+    assert "Preserve ReplayLab only" in chinese
     assert "Translate Shader as 着色器" in chinese
     assert "clear, concise English" in english
     assert "Do not mix prose from another language" in english

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes as _ctypes
 import hashlib
 import hmac
 import json
@@ -80,16 +81,122 @@ _UNTRACKED_PREPROCESSOR_DEPENDENCY = re.compile(
 _UNTRACKED_SLANG_IMPORT = re.compile(r"(?im)^[ \t]*import\s+[A-Za-z_]\w*")
 
 
-def _reject_untracked_compile_dependencies(raw_input: str) -> None:
+@dataclass(frozen=True, slots=True)
+class _WindowsJobApi:
+    create_job: Any
+    set_information: Any
+    assign_process: Any
+    close_handle: Any
+
+
+class _WindowsJobIoCounters(_ctypes.Structure):
+    _fields_ = [
+        (name, _ctypes.c_ulonglong)
+        for name in (
+            "ReadOperationCount",
+            "WriteOperationCount",
+            "OtherOperationCount",
+            "ReadTransferCount",
+            "WriteTransferCount",
+            "OtherTransferCount",
+        )
+    ]
+
+
+class _WindowsJobBasicLimits(_ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", _ctypes.c_longlong),
+        ("PerJobUserTimeLimit", _ctypes.c_longlong),
+        ("LimitFlags", _ctypes.c_uint32),
+        ("MinimumWorkingSetSize", _ctypes.c_size_t),
+        ("MaximumWorkingSetSize", _ctypes.c_size_t),
+        ("ActiveProcessLimit", _ctypes.c_uint32),
+        ("Affinity", _ctypes.c_size_t),
+        ("PriorityClass", _ctypes.c_uint32),
+        ("SchedulingClass", _ctypes.c_uint32),
+    ]
+
+
+class _WindowsJobExtendedLimits(_ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _WindowsJobBasicLimits),
+        ("IoInfo", _WindowsJobIoCounters),
+        ("ProcessMemoryLimit", _ctypes.c_size_t),
+        ("JobMemoryLimit", _ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", _ctypes.c_size_t),
+        ("PeakJobMemoryUsed", _ctypes.c_size_t),
+    ]
+
+
+_WINDOWS_JOB_API_LOCK = threading.Lock()
+_WINDOWS_JOB_API: _WindowsJobApi | None = None
+
+
+def _windows_job_api() -> _WindowsJobApi | None:
+    """Return one typed WinAPI table for all external shader tools."""
+
+    global _WINDOWS_JOB_API
+    if os.name != "nt":
+        return None
+    if _WINDOWS_JOB_API is not None:
+        return _WINDOWS_JOB_API
+    with _WINDOWS_JOB_API_LOCK:
+        if _WINDOWS_JOB_API is not None:
+            return _WINDOWS_JOB_API
+        kernel32 = _ctypes.WinDLL("kernel32", use_last_error=True)
+        create_job = kernel32.CreateJobObjectW
+        create_job.argtypes = [_ctypes.c_void_p, _ctypes.c_wchar_p]
+        create_job.restype = _ctypes.c_void_p
+        set_information = kernel32.SetInformationJobObject
+        set_information.argtypes = [
+            _ctypes.c_void_p,
+            _ctypes.c_int,
+            _ctypes.c_void_p,
+            _ctypes.c_uint32,
+        ]
+        set_information.restype = _ctypes.c_int
+        assign_process = kernel32.AssignProcessToJobObject
+        assign_process.argtypes = [_ctypes.c_void_p, _ctypes.c_void_p]
+        assign_process.restype = _ctypes.c_int
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [_ctypes.c_void_p]
+        close_handle.restype = _ctypes.c_int
+        _WINDOWS_JOB_API = _WindowsJobApi(
+            create_job=create_job,
+            set_information=set_information,
+            assign_process=assign_process,
+            close_handle=close_handle,
+        )
+        return _WINDOWS_JOB_API
+
+
+def _reject_untracked_compile_dependencies(raw_input: str, *,
+                                           source_unit: Mapping[str, Any] | None = None,
+                                           job_dir: Path | None = None) -> None:
     """Reject source dependencies absent from the immutable compile receipt.
 
-    The current workspace contract hashes one source snapshot, compiler, fixed
-    adapter files, and outputs.  Until an include/module graph is itself
-    project-owned and content-addressed, allowing a compiler to resolve files
-    outside that receipt would make shared candidates non-reproducible.
+    Include files are permitted only when the Host supplies and revalidates the
+    frozen compilation-unit graph. Ordinary untracked includes/modules remain
+    unavailable; a path merely living under a job directory is not evidence.
     """
 
     input_path = Path(str(raw_input or ""))
+    if source_unit is not None:
+        from .compile_source_unit import validate_snapshot
+        try:
+            root = Path(source_unit["workspaceRoot"])
+            proof = source_unit["proof"]
+            if (input_path.resolve() != (root / proof["inputPath"]).resolve()
+                    or job_dir is None or input_path.resolve().parent != job_dir.resolve()):
+                raise ValueError("compiler input does not match its include snapshot")
+            validate_snapshot(root, Path(source_unit["sourcePath"]), source_unit["source"], proof)
+            for document in proof["documents"]:
+                text = (root / document["inputPath"]).read_text(encoding="utf-8")
+                if re.search(r"(?im)^[ \t]*#[ \t]*line\b", text) or _UNTRACKED_SLANG_IMPORT.search(text):
+                    raise ValueError("line/module directives are not tracked include edges")
+            return
+        except (ValueError, TypeError, KeyError, OSError) as error:
+            raise ToolExecutionError("compile include snapshot is invalid: %s" % error) from error
     if not input_path.name.casefold().endswith(_HIGH_LEVEL_SOURCE_SUFFIXES):
         return
     if input_path.is_symlink() or not input_path.is_file():
@@ -271,85 +378,52 @@ def _attach_windows_kill_job(process: subprocess.Popen) -> int | None:
 
     if os.name != "nt":
         return None
+    api = _windows_job_api()
+    if api is None:
+        return None
+    return _attach_windows_kill_job_with_api(process, api)
+
+
+def _attach_windows_kill_job_with_api(
+    process: subprocess.Popen, api: _WindowsJobApi
+) -> int | None:
+    """Attach one tool process while retaining the full-width job handle."""
+
+    job: Any = None
+    keep_job = False
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        class BasicLimitInformation(ctypes.Structure):
-            _fields_ = [
-                ("PerProcessUserTimeLimit", ctypes.c_longlong),
-                ("PerJobUserTimeLimit", ctypes.c_longlong),
-                ("LimitFlags", wintypes.DWORD),
-                ("MinimumWorkingSetSize", ctypes.c_size_t),
-                ("MaximumWorkingSetSize", ctypes.c_size_t),
-                ("ActiveProcessLimit", wintypes.DWORD),
-                ("Affinity", ctypes.c_size_t),
-                ("PriorityClass", wintypes.DWORD),
-                ("SchedulingClass", wintypes.DWORD),
-            ]
-
-        class IoCounters(ctypes.Structure):
-            _fields_ = [
-                ("ReadOperationCount", ctypes.c_ulonglong),
-                ("WriteOperationCount", ctypes.c_ulonglong),
-                ("OtherOperationCount", ctypes.c_ulonglong),
-                ("ReadTransferCount", ctypes.c_ulonglong),
-                ("WriteTransferCount", ctypes.c_ulonglong),
-                ("OtherTransferCount", ctypes.c_ulonglong),
-            ]
-
-        class ExtendedLimitInformation(ctypes.Structure):
-            _fields_ = [
-                ("BasicLimitInformation", BasicLimitInformation),
-                ("IoInfo", IoCounters),
-                ("ProcessMemoryLimit", ctypes.c_size_t),
-                ("JobMemoryLimit", ctypes.c_size_t),
-                ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                ("PeakJobMemoryUsed", ctypes.c_size_t),
-            ]
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-        kernel32.SetInformationJobObject.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-        ]
-        kernel32.AssignProcessToJobObject.argtypes = [
-            wintypes.HANDLE,
-            wintypes.HANDLE,
-        ]
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        job = kernel32.CreateJobObjectW(None, None)
+        job = api.create_job(None, None)
         if not job:
             return None
-        information = ExtendedLimitInformation()
+        information = _WindowsJobExtendedLimits()
         information.BasicLimitInformation.LimitFlags = 0x00002000
-        if not kernel32.SetInformationJobObject(
-            job, 9, ctypes.byref(information), ctypes.sizeof(information)
+        if not api.set_information(
+            job, 9, _ctypes.byref(information), _ctypes.sizeof(information)
         ):
-            kernel32.CloseHandle(job)
             return None
-        process_handle = wintypes.HANDLE(int(process._handle))
-        if not kernel32.AssignProcessToJobObject(job, process_handle):
-            kernel32.CloseHandle(job)
+        if not api.assign_process(job, int(process._handle)):
             return None
-        return int(job)
+        value = getattr(job, "value", job)
+        keep_job = True
+        return int(value)
     except (AttributeError, OSError, TypeError, ValueError):
         return None
+    finally:
+        if job and not keep_job:
+            try:
+                api.close_handle(job)
+            except Exception:
+                pass
 
 
 def _close_windows_handle(handle: int) -> None:
     if os.name != "nt" or not handle:
         return
+    api = _windows_job_api()
+    if api is None:
+        return
     try:
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle(wintypes.HANDLE(handle))
+        api.close_handle(int(handle))
     except (AttributeError, OSError, TypeError, ValueError):
         pass
 
@@ -376,6 +450,7 @@ def _terminate_process_tree(
                     env=dict(environment),
                     timeout=5,
                     check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
             except (OSError, subprocess.TimeoutExpired):
                 pass
@@ -728,11 +803,14 @@ def run_operation(
     operation: ToolOperation,
     values: Mapping[str, str],
     job_dir: Path,
+    *,
+    source_unit: Mapping[str, Any] | None = None,
 ) -> ProcessResult:
     """Run one fixed command with no shell and binary stdout/stderr logs."""
 
     if operation.operation == "compile":
-        _reject_untracked_compile_dependencies(values.get("input", ""))
+        _reject_untracked_compile_dependencies(values.get("input", ""),
+                                               source_unit=source_unit, job_dir=job_dir)
 
     # The workspace may stage immutable input snapshots before launch. The
     # process metadata/log files themselves must still be new for this job.

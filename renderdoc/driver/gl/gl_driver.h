@@ -393,7 +393,7 @@ private:
   void RecordReplayPatchRead(ResourceId buffer, uint32_t eventId, uint64_t byteOffset = 0,
                              uint64_t byteLength = ~0ULL);
   void TrackReplayPatchBinding(GLResource buffer, GLenum target);
-  void ApplyReplayBufferPatches();
+  bool ApplyReplayBufferPatches();
   void TrackReplayCheckpointBufferWrite(const GLResource &buffer);
   void RecordReplayCheckpointTextureWrite(const GLResource &resource);
 

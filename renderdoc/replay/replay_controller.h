@@ -192,13 +192,18 @@ public:
   static bool EIDTimingEnabled();
   void ReplayFrameEventForAnalysis(uint32_t eventId);
   void RestoreFrameEventAfterAnalysis();
+  ShaderPairComparison ComparePixelShaderPair(uint32_t eventId, ResourceId expectedOriginal,
+                                               ResourceId baseline, ResourceId candidate);
   // Historical API name: this is the render-output mutation generation for shader, CBuffer, and
   // arbitrary resource replacements.
   uint64_t GetShaderReplacementGeneration(uint32_t eventId);
   bool ResolveEventTextureSnapshot(uint32_t eventId, const TextureDisplay &source,
                                    TextureDisplay &snapshot);
   rdcstr SetEventShaderOverride(uint32_t eventId, ShaderStage stage, ResourceId expectedOriginal,
-                                ResourceId replacement);
+                                ResourceId replacement, uint32_t outputTarget = ~0U,
+                                bool independentFloatOutput = false);
+  EventShaderOverrideState GetEventShaderOverride(uint32_t eventId, ShaderStage stage);
+  TextureDescription GetEventShaderPreviewTexture(uint32_t eventId, ShaderStage stage);
   void ClearEventShaderOverride(uint32_t eventId, ShaderStage stage);
   void ClearEventShaderOverrides();
   rdcstr SetEventCBufferOverride(uint32_t eventId, ShaderStage stage, uint32_t slot,
@@ -210,6 +215,7 @@ public:
   void ClearEventCBufferOverrides();
   rdcstr SetSharedBufferPatch(ResourceId buffer, uint64_t byteOffset, bytebuf data);
   rdcstr ClearSharedBufferPatch(ResourceId buffer, uint64_t byteOffset, uint64_t byteLength);
+  rdcstr ResetSharedBufferRange(ResourceId buffer, uint64_t byteOffset, uint64_t byteLength);
   rdcstr ClearSharedBufferPatches();
   uint64_t GetSharedBufferPatchGeneration();
   void SetSelectedEventID(uint32_t selectedEventId)
@@ -252,6 +258,9 @@ public:
   void ReplaceResource(ResourceId from, ResourceId to);
   void RemoveReplacement(ResourceId id);
   rdcstr ReplaceTargetShaderChecked(ResourceId from, ResourceId to);
+  uint64_t BeginShaderReplacementBatch();
+  bool EndShaderReplacementBatch(uint64_t token);
+  ResourceId GetTargetShaderReplacement(ResourceId original);
   rdcstr RemoveTargetShaderReplacementChecked(ResourceId id);
   void FreeTargetResource(ResourceId id);
   void ClearReplayCache();
@@ -412,6 +421,11 @@ private:
   // restore the selected event; only explicit resource readbacks may consume a completed analysis.
   uint32_t m_MaterializedEventID = 0;
   bool m_MaterializedEventValid = false;
+  // Resource contents and fetched pipeline metadata have separate lifetimes:
+  // analysis may restore the event without fetching its pipeline again.
+  bool m_PipelineStateValid = false;
+  uint32_t m_PipelineStateEventID = 0;
+  uint64_t m_PipelineStateShaderGeneration = 0, m_PipelineStateBufferGeneration = 0;
   AnalysisReplayState m_AnalysisReplayState = AnalysisReplayState::None;
   uint32_t m_AnalysisReplayEventID = 0;
 
@@ -486,7 +500,9 @@ private:
 
   rdcarray<ShaderDebugger *> m_Debuggers;
 
-  std::set<ResourceId> m_TargetResources;
+  // Native shader creation can return an existing ResourceId with another reference (D3D12
+  // deduplicates identical bytecode). Track each BuildTargetShader acquisition independently.
+  std::map<ResourceId, uint32_t> m_TargetResources;
   std::set<ResourceId> m_CustomShaders;
 
   uint64_t m_ShaderReplacementSerial = 1;
@@ -494,10 +510,15 @@ private:
   bool m_AnalysisEventOverridesActive = false;
   std::map<uint32_t, uint64_t> m_EventShaderReplacementGenerations;
   std::map<ResourceId, ResourceId> m_GlobalShaderReplacements;
+  uint64_t m_ShaderBatchSerial = 0;
+  uint64_t m_ShaderBatchToken = 0;
+  bool m_ShaderBatchDirty = false;
   struct EventShaderReplacement
   {
     ResourceId original;
     ResourceId replacement;
+    uint32_t outputTarget = ~0U;
+    bool independentFloatOutput = false;
   };
   std::map<std::pair<uint32_t, ShaderStage>, EventShaderReplacement> m_EventShaderReplacements;
 

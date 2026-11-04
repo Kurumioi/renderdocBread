@@ -49,10 +49,10 @@ const ThemeDescriptor availStyles[] = {
         []() { return new RDStyle(RDStyle::Dark); }),
 
     ThemeDescriptor(
-        lit("ultra"), QT_TRANSLATE_NOOP("RDStyle", "ultra"),
+        lit("ultra"), QT_TRANSLATE_NOOP("RDStyle", "Black"),    // i18n-ignore: retain the persisted theme ID for existing UI.config files
         QT_TRANSLATE_NOOP(
             "RDStyle",
-            "ultra: Unity-inspired dark theme with neutral greys and blue highlights."),
+            "Black: Unity-inspired dark theme with neutral greys and blue highlights."),
         []() { return new RDStyle(RDStyle::Ultra); }),
 
     ThemeDescriptor(

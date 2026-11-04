@@ -800,6 +800,11 @@ void PixelHistoryView::startDebug(EventTag tag)
     return;
   }
 
+  // A nested progress event loop can replace the published pipeline before debugging finishes.
+  const ShaderReflection shaderSnapshot(*shaderDetails);
+  shaderDetails = &shaderSnapshot;
+  const ResourceId pipeline = m_Ctx.CurPipelineState().GetGraphicsPipelineObject();
+
   bool done = false;
   ShaderDebugTrace *trace = NULL;
 
@@ -834,8 +839,6 @@ void PixelHistoryView::startDebug(EventTag tag)
     RDDialog::critical(this, tr("Debug Error"), tr("Error debugging pixel."));
     return;
   }
-
-  ResourceId pipeline = m_Ctx.CurPipelineState().GetGraphicsPipelineObject();
 
   // viewer takes ownership of the trace
   IShaderViewer *s = m_Ctx.DebugShader(shaderDetails, pipeline, trace, debugContext);

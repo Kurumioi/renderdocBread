@@ -9,6 +9,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Get-ReplayLabDeploymentSha256 {
+    param([Parameter(Mandatory = $true)][string]$LiteralPath)
+    # Windows PowerShell launched by an embedded host can inherit a PSModulePath
+    # without Microsoft.PowerShell.Utility. Deployment must not depend on its
+    # Get-FileHash cmdlet being auto-loadable.
+    $stream = [IO.File]::OpenRead([IO.Path]::GetFullPath($LiteralPath))
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '') }
+    finally { $algorithm.Dispose(); $stream.Dispose() }
+}
+
 function Get-ReplayLabRelativePath {
     param([string]$BasePath, [string]$TargetPath)
     # Uri.MakeRelativeUri is available in Windows PowerShell 5 and avoids the
@@ -79,7 +90,7 @@ function Get-ReplayLabIntegrationSourceFiles {
             continue
         }
         $isPython = $sourceFile.Extension -eq ".py"
-        $isRootMetadata = $relativePath -eq "integration.json"
+        $isRootMetadata = $relativePath -in @("integration.json", "project_permissions.ps1")
         if (-not ($isPython -or $isRootMetadata))
         {
             continue
@@ -159,7 +170,7 @@ function Assert-ReplayLabIntegrationTargetStopped {
     $applicationRoot = $target.Substring(0, $target.Length - $suffix.Length)
     Assert-ReplayLabNoReparseComponents $target "ReplayLab integration deployment target" | Out-Null
     $running = @(Get-Process -ErrorAction Stop | Where-Object {
-        $_.ProcessName -in @("qrenderdoc", "q_render_soco_doc")
+        $_.ProcessName -in @("RenderDocBread", "qrenderdoc", "q_render_soco_doc")
     })
     foreach ($candidate in $running)
     {
@@ -201,6 +212,10 @@ $requiredFiles = @(
     "ai_context.py",
     "cbuffer_alias_identity.py",
     "dxil_access_signature.py",
+    "dxbc_cbuffer_layout.py",
+    "project_watch.py",
+    "project_permissions.py",
+    "project_permissions.ps1",
     "material_panel.py",
     "project_pass_panel.py",
     "project_launcher.py",
@@ -268,8 +283,8 @@ foreach ($sourceFile in $sourceFiles)
 {
     $deployed = Assert-ReplayLabChildPath $target (
         Join-Path $target $sourceFile.RelativePath)
-    $sourceHash = (Get-FileHash -LiteralPath $sourceFile.SourcePath -Algorithm SHA256).Hash
-    $targetHash = (Get-FileHash -LiteralPath $deployed -Algorithm SHA256).Hash
+    $sourceHash = Get-ReplayLabDeploymentSha256 -LiteralPath $sourceFile.SourcePath
+    $targetHash = Get-ReplayLabDeploymentSha256 -LiteralPath $deployed
     if ($sourceHash -ne $targetHash)
     {
         throw "ReplayLab integration deployment hash mismatch: $deployed"

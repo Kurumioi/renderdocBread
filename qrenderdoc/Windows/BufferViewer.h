@@ -26,6 +26,7 @@
 
 #include <QFrame>
 #include <QMutex>
+#include <memory>
 #include "Code/Interface/QRDInterface.h"
 #include "Code/QRDUtils.h"
 #include "Code/ReplayLab/ReplayLabCBufferAliases.h"
@@ -39,8 +40,13 @@ class BufferViewer;
 class ComputeDebugSelector;
 class RDSpinBox64;
 class QItemSelection;
+class QFileSystemWatcher;
+class QLineEdit;
+class QLabel;
+class QTimer;
 class QMenu;
 class QPushButton;
+class QToolButton;
 class QVBoxLayout;
 class RDLabel;
 class RDTableView;
@@ -53,6 +59,7 @@ class FlycamWrapper;
 struct BufferData;
 struct PopulateBufferData;
 struct CalcBoundingBoxData;
+struct CBufferLiveEdit;
 
 struct BufferExport
 {
@@ -223,8 +230,23 @@ private:
                             const QString &parentPath = QString());
   void UI_RemoveOffsets(RDTreeWidgetItem *root);
   void UI_LoadCBufferAliases();
+  void UI_ApplyCBufferSemanticFields(RDTreeWidgetItem *root,
+                                    const rdcarray<ShaderConstant> &displayVars);
+  void UI_UpdateCBufferAliasWatch();
+  void UI_RefreshCBufferAliasDisplay();
   void editCBufferAlias(const QString &path, const QString &original, qint64 offset, bool remove);
   void editCBufferBlockAlias(bool remove);
+  void UI_SetupCBufferLiveEdit();
+  void UI_SetupCBufferSearch();
+  void UI_UpdateCBufferSearch();
+  void UI_SelectCBufferLiveValue(RDTreeWidgetItem *item);
+  void UI_RestoreCBufferLiveSelection();
+  void UI_QueueCBufferLiveValue(int component);
+  void UI_SubmitCBufferLiveValues();
+  void UI_InvalidateCBufferLiveEdit();
+  void UI_SetCBufferPinned(bool pinned);
+  const ShaderReflection *CBufferReflection() const;
+  uint32_t CBufferEvent() const;
   void UI_FixedAddMatrixRows(RDTreeWidgetItem *n, const ShaderConstant &c, const ShaderVariable &v);
 
   void exportCSV(QTextStream &ts, const QString &prefix, RDTreeWidgetItem *item);
@@ -258,10 +280,28 @@ private:
   } m_CBufferSlot = {ShaderStage::Count, 0, 0};
 
   CBufferData m_CurCBuffer;
+  QToolButton *m_CBufferPin = NULL;
+  uint32_t m_CBufferDisplayedEvent = 0;
+  uint32_t m_CBufferPinnedEvent = 0;
+  std::unique_ptr<ShaderReflection> m_CBufferPinnedReflection;
+  UsedDescriptor m_CBufferPinnedBinding;
+  CBufferData m_CBufferPinnedData;
 
   // ReplayLab: per-user display names for the reflected constants shown in the CBuffer view,
   // keyed by the constant block's layout. Reloaded on every refresh.
   ReplayLabCBufferAliases m_CBufferAliases;
+  bool m_ShowCBufferSemanticFields = true;
+  QFileSystemWatcher *m_CBufferAliasWatcher = NULL;
+  QTimer *m_CBufferAliasRefreshTimer = NULL;
+  QString m_CBufferAliasFile;
+  QString m_CBufferAliasFileStamp;
+  QString m_CBufferAliasIdentity;
+  int m_CBufferAliasSequence = -1;
+  std::unique_ptr<CBufferLiveEdit> m_CBufferLiveEdit;
+  QLineEdit *m_CBufferSearch = NULL;
+  QLabel *m_CBufferSearchEmpty = NULL;
+  QSet<uint> m_CBufferSearchExpansion;
+  bool m_CBufferSearchActive = false;
 
   static QList<BufferViewer *> m_CBufferViews;
 

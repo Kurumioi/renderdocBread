@@ -5,6 +5,15 @@ Shader Workspace panel. Run them with qrenderdoc's `--ui-python` option in an
 explicitly selected test instance. Do not inject them into a user's unrelated
 capture. Neither fixture starts or stops qrenderdoc itself.
 
+`qrenderdoc_cbuffer_live_edit_smoke.py` exercises the native CBuffer editor in its
+normal transient dock. Supply an explicit capture at launch and the
+`REPLAYLAB_CBUFFER_EDIT_EVENT`, `_BIND` and `_OUTPUT` environment variables.
+`_FIELDS` is a JSON list of actual displayed scalar/vector/colour fields. The
+probe drives slider, numeric and colour controls, compares the whole reflected
+buffer before/after/reset, and records UI timer gaps. It does not compile or
+write shader source. Run in an owned instance, and close it on failure so an
+incomplete verification never leaves temporary value overrides in the user app.
+
 ## What the editor currently provides
 
 | Capability | Default implementation | Boundary |
@@ -12,16 +21,33 @@ capture. Neither fixture starts or stops qrenderdoc itself.
 | Function and variable colours | Local declaration index colours recognised names; comments and strings are excluded. | This is a lightweight index, not semantic token classification. Types and other declarations can share the variable colour. |
 | Matching-name highlight | The identifier at the cursor marks equal names in the current document. | Equal names in separate scopes can all be marked; this is not a compiler-resolved reference search. |
 | Completion | `Ctrl-Space`, or typing a prefix, suggests language keywords and indexed names from registered source documents. A selected item inserts text. | Local suggestions do not filter every member by its actual type or validate overloads. LSP labels may supplement them when a server is configured. |
-| Definition navigation | `F12` uses the local declaration index, with a configured language server able to provide a more precise result. A hidden authorised target tab is selected. | The local fallback prefers nearby declarations in the current document; shadowing, macros and complex overloads are not fully resolved. The Shader Workspace opens only documents already authorised in its models. |
+| Definition navigation | `F12` queries the configured or bundled compiler-backed language server using the current URI and unsaved source. Requests wait for initialization and obsolete requests are cancelled. | Empty semantic results never fall back to a name match. With no provider available, explicitly limited lexical navigation is restricted to the current file and explicit includes; ambiguous overloads are rejected. The Shader Workspace opens only documents already authorised in its models. |
+| Reference navigation | A native `references` provider is preferred. A definition-only provider checks at most 256 token candidates against the exact compiler declaration URI and range, with bounded concurrency, timeout, cancellation and revision-keyed caching. | This fallback scans opened documents in the selected compilation unit, not unopened project files. Token spelling only selects candidates; it never proves a reference. A single reference jumps directly; multiple references open a chooser. |
 | Parameter hints | Indexed function signatures and a small built-in signature set are displayed. | This is not complete signature help for every HLSL intrinsic or overload. |
 | Checks while editing | Debounced scanning detects unmatched or unclosed brackets, unfinished strings and unfinished block comments. Problems have underlines and a clickable count. | No unsaved-source compiler job is started. Without a language server, undefined names, type errors and resource-binding mistakes may only be diagnosed on save/compile. |
 | Compiler errors | The owning workspace supplies the actual saved-source diagnostics. The summary jumps to a reported location. Old compiler locations are cleared when source changes. | UI injection tests prove presentation and navigation only. A real compiler failure needs separate live save evidence. |
 | Flow layout | Initial and automatic resize fit preserve aspect ratio. Manual zoom/pan is retained per graph. `Fit` restores automatic fit; `100%` allows readable nodes with scrolling. | A long graph necessarily has smaller labels when fully fitted. It is a navigable algorithm summary, not a complete semantic proof. |
 
-The optional `shader-language-server` or `slangd` connection is not installed or
-certified by these probes. Describe the default feature set as **local completion,
-definition navigation, symbol highlighting and basic editing diagnostics**, not
-“complete IntelliSense” or “a fully verified LSP IDE”.
+The pinned `slangd` package is discovered at
+`integrations/shader-language-server/slangd.exe` before PATH. An explicit setting
+or `RENDERDOC_SHADER_LANGUAGE_SERVER` overrides the bundled provider. Source
+colouring, completion fallback and matching-name highlights remain lightweight
+editor features; semantic navigation does not make those other features a
+complete IntelliSense implementation.
+
+`probe_shader_language_server.py` exercises a real provider directly over LSP:
+HLSL overload types, scopes, member owners, includes, an unrelated same-name file,
+and an unsaved type change. It needs no UI or RDC. The companion isolated
+`qrenderdoc_shader_semantic_smoke.py` tests native F12 and compiler-backed reference
+navigation; `REPLAYLAB_SHADER_SEMANTIC_OUTPUT` selects its receipt path. Run both
+when changing the provider or the native semantic client.
+
+The native fixture also opens a frozen preview under `ai/previews/` beside an
+independent canonical editor. `SetIncludeBaseDirectory` must resolve that
+preview's literal includes from the original source directory using absolute paths
+only in the LSP text. Both buffers retain their distinct real URI, unsaved overload
+resolution and real-file callbacks. No source text or extra file may be written to
+disk. Relocated macro includes must report their unsupported boundary explicitly.
 
 ## Isolated native editor smoke test
 

@@ -17,7 +17,7 @@ from .binary_formats import (
     executable_format,
     fingerprint_shader_executable,
 )
-from .errors import AbiValidationError, CatalogValidationError
+from .errors import AbiValidationError, CatalogUseNotCoveredError, CatalogValidationError
 from .io import is_within, read_json_object
 
 CATALOG_SCHEMA = "renderdoc-ultra-capture-symbols/v1"
@@ -33,9 +33,13 @@ ABI_STATUS_DXIL_ACCESS_REQUIRED = (
 )
 _DXIL_LAYOUT_EVIDENCE_KIND = "dxc-dxil-buffer-definition"
 
+# Keep in step with renderdoc_mcp_bridge._STAGE_ALIASES: the stable capture
+# identity hashes the normalised stage, so one spelling both sides do not agree
+# on is two identities for one Shader.
 _STAGE_ALIASES = {
     "pixel": "fragment",
     "ps": "fragment",
+    "fs": "fragment",
     "vs": "vertex",
     "gs": "geometry",
     "hs": "hull",
@@ -274,6 +278,11 @@ def _format_hint(record: Mapping[str, Any]) -> str:
         )
         or ""
     ).strip().lower().replace("_", "-")
+    # Native RenderDoc reflection serializes the enum as ShaderEncoding.GLSL
+    # (and similarly DXBC/DXIL/SPIRV). Preserve that explicit format instead of
+    # silently falling back to binary detection, which cannot identify GLSL.
+    if value.startswith("shaderencoding."):
+        value = value[len("shaderencoding."):]
     aliases = {
         "directxbytecode": "dxbc",
         "directx-bytecode": "dxbc",
@@ -289,6 +298,7 @@ def _format_hint(record: Mapping[str, Any]) -> str:
         "dxil",
         "spirv",
         "opengl-spirv",
+        "glsl",
     } else ""
 
 
@@ -457,12 +467,19 @@ def load_selected_shader(
     if actual_hash != key.raw_sha256:
         raise CatalogValidationError("selected shader rawSha256 does not match rawPath")
     declared_format = _format_hint(record)
+    if declared_format == "glsl":
+        from .native_glsl import api as is_opengl
+        if not is_opengl(catalog.get("api")):
+            raise CatalogValidationError("captured GLSL source requires the OpenGL API")
+        if key.entry_point != "main" or key.stage not in {
+                "vertex", "hull", "domain", "geometry", "fragment", "compute"}:
+            raise CatalogValidationError("captured GLSL source requires an OpenGL pipeline stage and main entry")
     container = fingerprint_shader_executable(
         blob, str(raw_path), format_hint=declared_format or None
     )
     if container is None:
         raise CatalogValidationError(
-            "selected shader is not exactly one supported DXBC/DXIL/SPIR-V executable"
+            "selected shader is not exactly one supported executable or explicitly captured OpenGL GLSL source"
         )
     detected_format = executable_format(container)
     semantic_format = api_semantic_format(
@@ -590,7 +607,8 @@ def select_unique_shader_for_use(
         matches[key.catalog_key] = key
 
     if len(matches) != 1:
-        raise CatalogValidationError(
+        failure = CatalogUseNotCoveredError if not matches else CatalogValidationError
+        raise failure(
             "event %d stage %s selected %d shaders; exactly one is required"
             % (event_value, requested_stage, len(matches))
         )
@@ -601,16 +619,20 @@ def select_unique_shader_for_use(
 def list_exact_shader_family_uses(
     catalog_path: str | Path,
     shader_key: ShaderKey | Mapping[str, Any] | str,
+    *,
+    require_complete_abi: bool = True,
 ) -> list[int]:
     """Return every catalog event using one exact captured Shader identity.
 
     Family identity deliberately includes the capture-local ResourceId. Equal
     bytecode in a distinct ResourceId is not merged. The full shader catalog,
-    selected blob and compiled ABI are validated before any use rows are
-    accepted; duplicate rows collapse to one EventId without truncation.
+    selected blob are validated before any use rows are accepted; duplicate
+    rows collapse to one EventId without truncation. Executable callers also
+    require a compiled ABI by default. Identity-only navigation and display
+    naming may omit that gate and validate their own live reflected fields.
     """
     selected = load_selected_shader(catalog_path, shader_key)
-    if selected.abi is None:
+    if require_complete_abi and selected.abi is None:
         raise CatalogValidationError(
             "selected Shader family has no complete compiled ABI"
         )

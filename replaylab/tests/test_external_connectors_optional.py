@@ -47,11 +47,39 @@ async def test_codex_app_server_lifecycle_and_skill_input(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_codex_app_server_keeps_one_thread_for_bounded_follow_up_turns(
+    tmp_path,
+) -> None:
+    connector = CodexAppServerConnector(
+        [sys.executable, str(FIXTURES / "fake_codex_app_server.py")],
+        cwd=tmp_path,
+        timeout=5,
+    )
+    try:
+        first = await connector.run("first", keep_thread=True)
+        process = connector._transport.process
+        assert process is not None
+        first_pid = process.pid
+
+        second = await connector.run("continue", keep_thread=True)
+
+        assert connector._transport.process is process
+        assert connector._transport.process.pid == first_pid
+        assert first.thread_id == second.thread_id == "thread-test"
+        assert connector._active_thread_id == "thread-test"
+    finally:
+        await connector.close()
+
+    assert connector._transport.process is None
+    assert connector._active_thread_id == ""
+
+
+@pytest.mark.asyncio
 async def test_codex_accepts_exact_task_scoped_replaylab_mcp_inventory(tmp_path) -> None:
     connector = CodexAppServerConnector(
         [sys.executable, str(FIXTURES / "fake_codex_app_server.py"), "native-mcp"],
         cwd=tmp_path,
-        expected_mcp_servers={"ReplayLab"},
+        expected_mcp_servers={"Bread"},
         timeout=5,
     )
     try:
@@ -67,7 +95,7 @@ async def test_codex_waits_for_task_scoped_replaylab_mcp_startup(tmp_path) -> No
     connector = CodexAppServerConnector(
         [sys.executable, str(FIXTURES / "fake_codex_app_server.py"), "starting-mcp"],
         cwd=tmp_path,
-        expected_mcp_servers={"ReplayLab"},
+        expected_mcp_servers={"Bread"},
         timeout=5,
     )
     try:
@@ -93,7 +121,7 @@ async def test_codex_bounds_task_scoped_replaylab_mcp_startup_wait(
             "stuck-starting-mcp",
         ],
         cwd=tmp_path,
-        expected_mcp_servers={"ReplayLab"},
+        expected_mcp_servers={"Bread"},
         timeout=5,
     )
     try:
@@ -111,7 +139,7 @@ async def test_codex_rejects_unready_task_scoped_replaylab_mcp(
     connector = CodexAppServerConnector(
         [sys.executable, str(FIXTURES / "fake_codex_app_server.py"), mode],
         cwd=tmp_path,
-        expected_mcp_servers={"ReplayLab"},
+        expected_mcp_servers={"Bread"},
         timeout=5,
     )
     try:
@@ -173,15 +201,16 @@ async def test_codex_ambient_capabilities_fail_closed(tmp_path, mode: str) -> No
         await connector.close()
 
 
-def test_codex_process_hardening_disables_ambient_agent_features() -> None:
+def test_codex_process_hardening_keeps_read_only_workspace_tools() -> None:
     rendered = " ".join(harden_codex_argv(["codex", "app-server"]))
 
     for override in (
         'model_provider="replaylab_openai_subscription"',
         "features.apps=false",
         "features.plugins=false",
-        "features.shell_tool=false",
-        "features.unified_exec=false",
+        "features.shell_tool=true",
+        "features.unified_exec=true",
+        "tools.view_image=true",
         "features.hooks=false",
         "features.multi_agent=false",
         "agents.enabled=false",
@@ -189,7 +218,7 @@ def test_codex_process_hardening_disables_ambient_agent_features() -> None:
         'history.persistence="none"',
     ):
         assert override in rendered
-    assert "mcp_servers.ReplayLab" not in rendered
+    assert "mcp_servers.Bread" not in rendered
 
 
 @pytest.mark.asyncio

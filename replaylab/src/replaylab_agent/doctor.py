@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import sys
 from collections.abc import Mapping
+from typing import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from .bridge import BridgeClient
 from .conversation import resolve_context_spec
+from .errors import UnknownModelContextError
+from .connectors.claude_auth import check_claude_auth_status
 from .mcp_runtime import find_replaylab_mcp
 from .profiles import Profile
 from .process_env import (
@@ -27,6 +31,8 @@ class DoctorCheck:
     name: str
     status: str
     detail: str
+    message_id: str = ""
+    message_args: tuple[str, ...] = ()
 
     @property
     def passed(self) -> bool:
@@ -68,10 +74,16 @@ def run_doctor(
     mcp_executable: Path | str | None = None,
     environ: Mapping[str, str] | None = None,
     include_external_mcp: bool = True,
+    progress_callback: Callable[[DoctorCheck], None] | None = None,
 ) -> list[DoctorCheck]:
     """Run non-networked checks; no login or provider quota is consumed."""
 
-    checks: list[DoctorCheck] = []
+    class CheckResults(list):
+        def append(self, check):
+            super().append(check)
+            if progress_callback is not None:
+                progress_callback(check)
+    checks: list[DoctorCheck] = CheckResults()
     version_ok = sys.version_info >= (3, 12)
     checks.append(
         DoctorCheck(
@@ -99,6 +111,10 @@ def run_doctor(
                 if index:
                     detail = f"{label}: {detail}"
                 checks.append(DoctorCheck(check_name, "ok", detail))
+            except UnknownModelContextError as exc:
+                detail = (f"{label}: " if index else "") + str(exc)
+                checks.append(DoctorCheck(check_name, "warning", detail,
+                    "doctor.context-window-unknown", (model or "<provider default>",)))
             except Exception as exc:
                 detail = str(exc)
                 if index:
@@ -162,7 +178,7 @@ def run_doctor(
                 DoctorCheck(
                     "codex-internal-tools",
                     "ok",
-                    "task-scoped ReplayLab MCP with isolated Codex home; "
+                    "task-scoped Bread MCP with isolated Codex home; "
                     "no persistent MCP registration is injected into CODEX_HOME: "
                     + str(home),
                 )
@@ -188,13 +204,37 @@ def run_doctor(
                     else "install replaylab-agenthost",
                 )
             )
+            if profile.preset == "claude-code-acp":
+                if profile_valid and trusted and command_status == "ok":
+                    try:
+                        authentication = asyncio.run(check_claude_auth_status(
+                            profile, environ=environ, timeout=5.0))
+                        authenticated = (
+                            authentication.logged_in is True
+                            and authentication.state == "authenticated")
+                        checks.append(DoctorCheck(
+                            "claude-authentication", "ok" if authenticated else "error",
+                            authentication.detail, authentication.message_id,
+                            authentication.message_args))
+                    except Exception:
+                        # CLI output and exception messages may contain account data.
+                        # Only the shared bounded status code is exposed to the UI.
+                        checks.append(DoctorCheck(
+                            "claude-authentication", "error",
+                            "Claude sign-in status could not be verified: process-failed",
+                            "subscription.claude-auth-status-failed", ("process-failed",)))
+                else:
+                    checks.append(DoctorCheck(
+                        "claude-authentication", "warning",
+                        "Claude sign-in status was not checked because the profile or trusted CLI is unavailable.",
+                        "claude-auth.skipped"))
 
     if include_external_mcp:
         try:
             host = find_replaylab_mcp(mcp_executable)
-            checks.append(DoctorCheck("replaylab-mcp", "ok", str(host)))
+            checks.append(DoctorCheck("bread-mcp", "ok", str(host)))
         except Exception as exc:
-            checks.append(DoctorCheck("replaylab-mcp", "error", str(exc)))
+            checks.append(DoctorCheck("bread-mcp", "error", str(exc)))
 
     checks.append(
         DoctorCheck(
@@ -203,6 +243,13 @@ def run_doctor(
             f"{len(catalog.skills)} validated skill(s)",
         )
     )
+    from .portable_capabilities import public_status
+    portable = public_status()
+    if portable["present"]:
+        checks.append(DoctorCheck("portable-capabilities", "ok" if portable["ready"] else "warning",
+                              str(portable["plugins"]) + " bundled plugins; missing: " + ", ".join(portable["missing"]),
+                              "connection.portable-ok" if portable["ready"] else "connection.portable-missing",
+                                  (str(portable["plugins"]),)))
     quarantine_summary = getattr(catalog, "quarantine_summary", None)
     if callable(quarantine_summary):
         summary = quarantine_summary()
@@ -222,7 +269,7 @@ def run_doctor(
             DoctorCheck(
                 "qrenderdoc",
                 "ok" if instances else "warning",
-                f"{len(instances)} live ReplayLab bridge instance(s)"
+                f"{len(instances)} live Bread bridge instance(s)"
                 if instances
                 else "no live qrenderdoc bridge; start qrenderdoc and open a capture",
             )

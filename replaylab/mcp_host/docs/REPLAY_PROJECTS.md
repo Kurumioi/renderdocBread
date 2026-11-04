@@ -9,8 +9,8 @@ also keeps a capture library whose RDC entries are references, not owned copies.
 
 ## qrenderdoc project home
 
-An ordinary idle ReplayLab/qrenderdoc launch opens `ReplayLab Projects`. The
-same home is available later from `File -> ReplayLab Projects…`. It supports
+An ordinary idle Bread/qrenderdoc launch opens `Bread Projects`. The
+same home is available later from `File -> Bread Projects…`. It supports
 creating a project at a user-selected path, adding an existing portable project,
 forgetting a local registry entry without deleting its directory, configuring
 an unpacked-asset root, adding/removing RDC references without deleting the RDC,
@@ -87,6 +87,24 @@ cannot reactivate historical HLSL, aliases or material data over a newer head.
 An intentional revert is a separate explicit publication against the current
 head generation.
 
+Workspace head keys v2 identify the captured original by API, encoding, raw
+bytecode hash, stage and entry point. Editable language, compiler/reflection
+versions and display metadata do not create parallel active versions. Legacy
+v1 lane indexes are validated with their original key algorithm, then merged
+using the activation order of their explicitly selected heads. Historical
+publications and their paths remain readable; only one source is current.
+Changing editable language binds a matching compiler route before importing
+the current source. It never feeds HLSL to a GLSL route or overwrites a draft.
+Legacy navigation sidecars keep their original review/source hash and reanchor
+in the editor; a source edit does not fabricate a new semantic approval.
+An automatically resumed editor can precede a restore reservation. Restore
+retires only that exact workspace/GUI/session writer, preserving durable consent
+and its native replacement, then enables editing after committing. Other GUI
+captures remain independent. Manual-source restore uses the newly inventoried
+target EID, rather than reusing the first EID in an older workspace catalog.
+Resource replacement covers every use of each original RID; UI usage lists
+combine all bound RIDs for one logical source within the current capture.
+
 The RDC association separates the desired project head from a realized-apply
 snapshot. Its semantic head hashes the exact referenced knowledge IDs,
 content-addressed artifact references, and Shader/material head projections
@@ -122,6 +140,48 @@ same lock. A failed selection commit restores the prior selection and moves any
 published tree to a hidden quarantine before cleanup, so it cannot appear as a
 usable half-project. Settings and pinned active-project operations share the
 same selection lock and preserve snapshot semantics.
+
+### Upgrade compatibility and local drafts
+
+Bread must keep previously supported project records readable when upgrading.
+Application/package versions, UI translations, comments and formatting are not
+physical Shader validation policy. They must not invalidate otherwise matching
+restore receipts. A change to actual ABI rules, validation algorithms or the
+native replay implementation can require fresh validation; it must fall back to
+the saved project source/candidate and current captured original instead of
+treating a stale acceleration cache as a failed project. Successful validation
+publishes current derived receipts for subsequent fast opens. Old authority
+hashes and historical records are not rewritten to claim newer validation.
+
+The captured original remains the match anchor: verify its bytes, API, stage,
+encoding, entry point and applicable target profile before applying a saved
+replacement. Reuse a matching compiled candidate when possible. GLSL targets
+rebuilt by an OpenGL/GLES driver still require physical reflection validation;
+this successful inline validation is compatible with the cached restore route.
+
+An edited local source and the last successfully saved replay version are
+independent. Restore the saved version through a separate replay workspace,
+retain the current draft and its editor/snapshot identity, and do not start a
+watcher that silently applies the draft. An explicit save in that original
+editor can take over the restored replacement. Draft display hints are
+revalidated, optional metadata; their absence cannot veto a successful replay
+restore. Preserve those hints when migrating legacy caches and when writing a
+new snapshot so the second open retains the same draft.
+Generated replay workspace names have the same fixed length as ordinary
+workspace names, so isolating a draft does not grow compiler input paths past
+Windows tool limits. Existing verified replay workspaces remain readable.
+
+Changes to these contracts must keep the upgrade regression suite passing on
+Windows and Linux. From `replaylab/mcp_host`, run:
+
+```text
+python -m pytest tests/test_shader_physical_validation_policy.py tests/test_project_restore_upgrade_local_draft.py tests/test_project_restore_local_draft.py tests/test_verified_restore_host.py
+```
+
+The tests cover package/UI updates, real policy changes, legacy snapshot
+migration, a subsequent cache hit, unchanged candidate bytes and preservation
+of drafts in Unicode paths. Corrupted records, missing saved artifacts and a
+different captured Shader remain genuine diagnostic conditions.
 
 ## Safety model
 

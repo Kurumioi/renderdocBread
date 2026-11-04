@@ -34,6 +34,7 @@
 #include <QJsonParseError>
 #include <QRegularExpression>
 #include <QSet>
+#include <QVariant>
 #include <cmath>
 
 namespace
@@ -588,6 +589,39 @@ void rebuildStreamText(const QMap<QString, QString> &snapshots, const QStringLis
 
 AIAgentTraceStore::AIAgentTraceStore() = default;
 
+QString AIAgentTraceStore::ConversationReasoningKind(const QJsonObject &data)
+{
+  const QString channel = explicitChannel(data);
+  if(channel == QLatin1String("summary") || channel == SummaryChannel)
+    return QStringLiteral("reasoning");    // i18n-ignore: conversation activity kind.
+  if(channel.isEmpty() || channel == QLatin1String("raw") || channel == RawReasoningChannel ||
+     channel == QLatin1String("reasoning-raw") || channel == QLatin1String("reasoning") ||
+     channel == QLatin1String("thought"))
+    return QStringLiteral("reasoning-raw");    // i18n-ignore: conversation activity kind.
+  return QString();
+}
+
+QString AIAgentTraceStore::ConversationSummaryPrefix(const QString &itemId)
+{
+  // i18n-ignore: conversation activity identity, never used as display text.
+  return QStringLiteral("reasoning-summary:") + itemId.left(256) + QLatin1Char(':');
+}
+
+QString AIAgentTraceStore::ConversationReasoningId(const QJsonObject &data)
+{
+  const bool summary = ConversationReasoningKind(data) == QLatin1String("reasoning");
+  QString itemId = firstString({boundedString(data, "itemId", 256),
+                                boundedString(data, "reasoningId", 256),
+                                boundedString(data, "streamId", 256)});
+  if(itemId.isEmpty())
+    itemId = QStringLiteral("live");    // i18n-ignore: fallback provider stream identity.
+  const int index = data.value(summary ? QLatin1String("summaryIndex")
+                                      : QLatin1String("contentIndex")).toInt();
+  return (summary ? ConversationSummaryPrefix(itemId)
+                  : QStringLiteral("reasoning-raw:") + itemId + QLatin1Char(':')) +
+         QString::number(qMax(0, index));    // i18n-ignore: conversation activity identity.
+}
+
 AIAgentTraceStore::~AIAgentTraceStore() = default;
 
 void AIAgentTraceStore::ConsumeEvent(const QJsonObject &event)
@@ -602,7 +636,7 @@ bool AIAgentTraceStore::ConsumeEventInternal(const QJsonObject &event, bool noti
   if(event.value(QLatin1String("schema")).toString() != QLatin1String("replaylab-ai-task-event/v1"))
     return false;
   const QString taskId = event.value(QLatin1String("taskId")).toString().trimmed();
-  if(!safeTaskId(taskId))
+  if(!safeTaskId(taskId) || m_DeletedTasks.contains(taskId))
     return false;
   qint64 sequence = 0;
   if(!positiveSequence(event.value(QLatin1String("sequence")), sequence))
@@ -682,13 +716,18 @@ bool AIAgentTraceStore::ConsumeEventInternal(const QJsonObject &event, bool noti
   const QString terminalStatus = normalizedIdentifier(boundedString(data, "terminalStatus", 64));
   if(!explicitAgentStatus.isEmpty())
     agent.status = explicitAgentStatus;
-  else if(kind == QLatin1String("running") && !boundedString(data, "status", 64).isEmpty())
+  else if(kind == QLatin1String("running") && identity.role == QLatin1String("child") &&
+          boundedString(data, "phase", 64) == QLatin1String("child") &&
+          !boundedString(data, "status", 64).isEmpty())
     agent.status = boundedString(data, "status", 64);
   else if(kind == QLatin1String("queued") || kind == QLatin1String("planning") ||
           kind == QLatin1String("completed") || kind == QLatin1String("partial") ||
           kind == QLatin1String("failed") || kind == QLatin1String("cancelled"))
-    agent.status = kind == QLatin1String("completed") && terminalStatus == QLatin1String("partial")
-                       ? QStringLiteral("partial")
+    agent.status = kind == QLatin1String("completed") &&
+                           (terminalStatus == QLatin1String("partial") ||
+                            terminalStatus == QLatin1String("blocked") ||
+                            terminalStatus == QLatin1String("needs-user-input"))
+                       ? terminalStatus
                        : kind;
   else if(kind == QLatin1String("message-delta") || kind == QLatin1String("agent-message-delta") ||
           kind == QLatin1String("running"))
@@ -696,17 +735,13 @@ bool AIAgentTraceStore::ConsumeEventInternal(const QJsonObject &event, bool noti
   else if(agent.status.isEmpty())
     agent.status = QStringLiteral("running");
 
-  // Reasoning item completion is not an Agent terminal because one turn can contain several
-  // reasoning/tool cycles. Started/updated events do prove liveness; connector failure and
-  // cancellation are authoritative for the active invocation.
+  // A running event's status belongs to its tool/activity, not the whole Agent. Likewise a
+  // reasoning item may end or fail before the Agent recovers. Only an Agent status or terminal
+  // turn event can end the Agent; tool failures remain visible in their individual records.
   if(kind == QLatin1String("reasoning-delta"))
   {
     if(lifecycle == QLatin1String("started") || lifecycle == QLatin1String("updated"))
       agent.status = QStringLiteral("running");
-    else if(lifecycle == QLatin1String("failed"))
-      agent.status = QStringLiteral("failed");
-    else if(lifecycle == QLatin1String("cancelled") || lifecycle == QLatin1String("canceled"))
-      agent.status = QStringLiteral("cancelled");
   }
 
   const QString channel = primaryChannel(event, data);
@@ -1081,7 +1116,9 @@ bool AIAgentTraceStore::ReplayTaskFileInternal(const QString &filePath, const QS
 
 bool AIAgentTraceStore::ReplayTaskId(const QString &taskId, const QString &eventRoot, QString *error)
 {
-  if(!safeTaskId(taskId))
+  if(!safeTaskId(taskId) || m_DeletedTasks.contains(taskId) ||
+     QFileInfo::exists(QDir(eventRoot).filePath(QStringLiteral(".deleted-tasks/") + taskId +
+                                              QStringLiteral(".json"))))
   {
     if(error)
       *error =
@@ -1130,10 +1167,98 @@ QStringList AIAgentTraceStore::DiscoverTaskIds(const QString &eventRoot, int max
     if(result.size() >= maximumCount)
       break;
     const QString taskId = file.completeBaseName();
-    if(safeTaskId(taskId))
+    if(safeTaskId(taskId) && !m_DeletedTasks.contains(taskId) &&
+       !QFileInfo::exists(directory.filePath(QStringLiteral(".deleted-tasks/") + taskId +
+                                             QStringLiteral(".json"))))
       result.push_back(taskId);
   }
   return result;
+}
+
+bool AIAgentTraceStore::ArchiveTaskLog(const QString &taskId, const QString &eventRoot,
+                                       const QString &reason) const
+{
+  if(!safeTaskId(taskId) || eventRoot.isEmpty())
+    return false;
+  QDir directory(eventRoot);
+  if(!directory.exists())
+    return false;
+  const QString jsonlPath = directory.filePath(taskId + QStringLiteral(".jsonl"));
+  if(!QFileInfo::exists(jsonlPath) || QFileInfo(jsonlPath).isSymLink())
+    return false;
+  const QString archivePath = directory.filePath(taskId + QStringLiteral(".archive.json"));
+  QJsonObject payload;
+  payload.insert(QStringLiteral("schema"), QStringLiteral("replaylab-task-archive/v1"));
+  payload.insert(QStringLiteral("schemaVersion"), 1);
+  payload.insert(QStringLiteral("taskId"), taskId);
+  payload.insert(QStringLiteral("archivedAtUnixMs"), QDateTime::currentMSecsSinceEpoch());
+  payload.insert(QStringLiteral("reason"), reason.left(128));
+  payload.insert(QStringLiteral("retentionDays"), 7);
+  QFile file(archivePath);
+  if(!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    return false;
+  file.write(QJsonDocument(payload).toJson(QJsonDocument::Compact));
+  file.write("\n");
+  return true;
+}
+
+bool AIAgentTraceStore::IsTaskLogArchived(const QString &taskId, const QString &eventRoot) const
+{
+  if(!safeTaskId(taskId) || eventRoot.isEmpty())
+    return false;
+  const QString archivePath =
+      QDir(eventRoot).filePath(taskId + QStringLiteral(".archive.json"));
+  return QFileInfo::exists(archivePath) && !QFileInfo(archivePath).isSymLink();
+}
+
+int AIAgentTraceStore::PurgeExpiredArchivedTaskLogs(const QString &eventRoot,
+                                                    int retentionDays) const
+{
+  if(eventRoot.isEmpty() || retentionDays <= 0)
+    return 0;
+  QDir directory(eventRoot);
+  if(!directory.exists())
+    return 0;
+  const qint64 cutoffMs =
+      QDateTime::currentMSecsSinceEpoch() - qint64(retentionDays) * 24 * 60 * 60 * 1000;
+  int removed = 0;
+  // i18n-ignore: archive sidecar extension is a filesystem protocol value.
+  const QFileInfoList archives = directory.entryInfoList(
+      QStringList() << QStringLiteral("*.archive.json"), QDir::Files | QDir::NoSymLinks);
+  for(const QFileInfo &archiveInfo : archives)
+  {
+    const QString taskId = archiveInfo.completeBaseName();
+    if(!safeTaskId(taskId))
+      continue;
+    qint64 archivedAt = archiveInfo.lastModified().toMSecsSinceEpoch();
+    QFile archiveFile(archiveInfo.absoluteFilePath());
+    if(archiveFile.open(QIODevice::ReadOnly))
+    {
+      const QJsonDocument document = QJsonDocument::fromJson(archiveFile.readAll());
+      archiveFile.close();
+      if(document.isObject())
+      {
+        const qint64 stamped = document.object().value(QStringLiteral("archivedAtUnixMs")).toVariant().toLongLong();
+        if(stamped > 0)
+          archivedAt = stamped;
+      }
+    }
+    if(archivedAt > cutoffMs)
+      continue;
+    const QStringList suffixes = QStringList()
+                                 << QStringLiteral(".jsonl") << QStringLiteral(".jsonl.lock")
+                                 << QStringLiteral(".report.json")
+                                 << QStringLiteral(".report-state.json")
+                                 << QStringLiteral(".report-state.lock")
+                                 << QStringLiteral(".archive.json");
+    for(const QString &suffix : suffixes)
+    {
+      const QString path = directory.filePath(taskId + suffix);
+      if(QFileInfo::exists(path) && !QFileInfo(path).isSymLink() && QFile::remove(path))
+        ++removed;
+    }
+  }
+  return removed;
 }
 
 QStringList AIAgentTraceStore::TaskIds() const
@@ -1183,6 +1308,25 @@ void AIAgentTraceStore::Clear()
   m_StreamSnapshots.clear();
   m_StreamOrder.clear();
   Notify(QString(), QString());
+}
+
+void AIAgentTraceStore::ForgetTask(const QString &taskId)
+{
+  if(!safeTaskId(taskId))
+    return;
+  m_DeletedTasks.insert(taskId);
+  m_Tasks.remove(taskId);
+  m_TaskOrder.removeAll(taskId);
+  const QString prefix = taskId + QChar(0x1f);
+  for(int i = m_StreamOrder.size() - 1; i >= 0; --i)
+  {
+    if(m_StreamOrder[i].startsWith(prefix))
+    {
+      m_StreamSnapshots.remove(m_StreamOrder[i]);
+      m_StreamOrder.removeAt(i);
+    }
+  }
+  Notify(taskId, QString());
 }
 
 void AIAgentTraceStore::Notify(const QString &taskId, const QString &agentId)

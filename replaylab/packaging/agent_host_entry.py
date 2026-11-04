@@ -38,12 +38,17 @@ def _configure_process() -> None:
     # through sys.executable, and the parent runtime resolves the upstream MCP
     # host before that spawn.  Pin both paths to this exact co-packaged bundle
     # while preserving an explicit operator/qrenderdoc override.
-    if getattr(sys, "frozen", False) and not os.environ.get(
-        "REPLAYLAB_MCP_HOST", ""
-    ).strip():
-        sibling = Path(sys.executable).resolve().parent / "ReplayLabMCP.exe"
-        if _is_regular_unlinked_file(sibling):
-            os.environ["REPLAYLAB_MCP_HOST"] = str(sibling)
+    if getattr(sys, "frozen", False) and not (
+        os.environ.get("BREAD_MCP_HOST", "").strip()
+        or os.environ.get("REPLAYLAB_MCP_HOST", "").strip()
+    ):
+        parent = Path(sys.executable).resolve().parent
+        for name in ("BreadMCP.exe",):
+            sibling = parent / name
+            if _is_regular_unlinked_file(sibling):
+                os.environ["BREAD_MCP_HOST"] = str(sibling)
+                os.environ["REPLAYLAB_MCP_HOST"] = str(sibling)
+                break
 
 
 def _dispatch(argv: Sequence[str]) -> int:
@@ -61,8 +66,15 @@ def _dispatch(argv: Sequence[str]) -> int:
         from replaylab_agent.selftest import _child_entry
 
         return _child_entry(selected[2:])
+    if selected[:2] == ["-m", "replaylab_agent.connection_probe"]:
+        from replaylab_agent.connection_probe import main
+        return main()
+    if selected[:2] == ["-m", "replaylab_agent.portable_tools"]:
+        from replaylab_agent.portable_tools import main
+        sys.argv = [sys.argv[0], *selected[2:]]
+        return main()
     if selected[:1] == ["-m"]:
-        raise SystemExit("unsupported internal ReplayLab AgentHost module")
+        raise SystemExit("unsupported internal Bread AgentHost module")
 
     from replaylab_agent.cli import main
 

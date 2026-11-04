@@ -23,7 +23,7 @@ def _load_entry_module():
 def test_frozen_entry_pins_the_copackaged_mcp_host(monkeypatch, tmp_path) -> None:
     module = _load_entry_module()
     agent = tmp_path / "replaylab-ai.exe"
-    mcp = tmp_path / "ReplayLabMCP.exe"
+    mcp = tmp_path / "BreadMCP.exe"
     agent.write_bytes(b"agent")
     mcp.write_bytes(b"mcp")
 
@@ -31,17 +31,19 @@ def test_frozen_entry_pins_the_copackaged_mcp_host(monkeypatch, tmp_path) -> Non
     monkeypatch.setattr(module.sys, "executable", str(agent))
     # Use a tracked empty value: deleting an already-absent key would not let
     # pytest restore the value that _configure_process subsequently creates.
+    monkeypatch.setenv("BREAD_MCP_HOST", "")
     monkeypatch.setenv("REPLAYLAB_MCP_HOST", "")
 
     module._configure_process()
 
+    assert module.os.environ["BREAD_MCP_HOST"] == str(mcp.resolve())
     assert module.os.environ["REPLAYLAB_MCP_HOST"] == str(mcp.resolve())
 
 
 def test_frozen_entry_preserves_an_explicit_mcp_host(monkeypatch, tmp_path) -> None:
     module = _load_entry_module()
     agent = tmp_path / "replaylab-ai.exe"
-    (tmp_path / "ReplayLabMCP.exe").write_bytes(b"mcp")
+    (tmp_path / "BreadMCP.exe").write_bytes(b"mcp")
     agent.write_bytes(b"agent")
     explicit = str((tmp_path / "operator-selected.exe").resolve())
 
@@ -67,17 +69,17 @@ def test_frozen_entry_dispatches_the_task_filtered_mcp_proxy(monkeypatch) -> Non
     monkeypatch.setattr(mcp_proxy, "main", fake_main)
 
     result = module._dispatch(
-        ["-I", "-m", "replaylab_agent.mcp_proxy", "--host", "ReplayLabMCP.exe"]
+        ["-I", "-m", "replaylab_agent.mcp_proxy", "--host", "BreadMCP.exe"]
     )
 
     assert result == 17
-    assert received == ["--host", "ReplayLabMCP.exe"]
+    assert received == ["--host", "BreadMCP.exe"]
 
 
 def test_frozen_entry_rejects_unknown_internal_modules() -> None:
     module = _load_entry_module()
 
-    with pytest.raises(SystemExit, match="unsupported internal ReplayLab AgentHost module"):
+    with pytest.raises(SystemExit, match="unsupported internal Bread AgentHost module"):
         module._dispatch(["-I", "-m", "replaylab_agent.not_allowed"])
 
 

@@ -1800,6 +1800,9 @@ GLReplay::GLReplay(WrappedOpenGL *d)
 
 void GLReplay::Shutdown()
 {
+  ClearEventShaderOverrides();
+  ReleaseEventShaderPrograms();
+  ReleaseEventShaderFloatPreviews();
   InvalidateLiveForward();
   MakeCurrentReplayContext(&m_ReplayCtx);
   ResetCheckpointBufferLineage();
@@ -2268,7 +2271,8 @@ void GLReplay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
       {
         // Retained prefixes contain the previous value generation. Overlay the accepted ranges
         // even if the requested EID is exactly this checkpoint and no suffix will execute.
-        m_pDriver->ApplyReplayBufferPatches();
+        if(!m_pDriver->ApplyReplayBufferPatches())
+          return;
         startEvent = best->first + 1;
         m_CheckpointStats.hits++;
         m_CheckpointStats.lastResumeEvent = best->first;
@@ -6013,6 +6017,626 @@ void GLReplay::RemoveReplacement(ResourceId id)
   ResetCheckpointBufferLineage();
   m_pDriver->RemoveReplacement(id);
   ClearPostVSCache();
+}
+
+rdcstr GLReplay::SetEventShaderOverride(uint32_t eventId, ShaderStage stage,
+                                       ResourceId expectedOriginal, ResourceId replacement,
+                                       uint32_t outputTarget, bool independentFloatOutput)
+{
+  RestoreEventShaderOverrides();
+  const ActionDescription *action = m_pDriver->GetAction(eventId);
+  if(!action || !(action->flags & (ActionFlags::Drawcall | ActionFlags::Dispatch)))
+    return "The event is not a graphics draw or compute dispatch";
+  auto rm = m_pDriver->GetResourceManager();
+  if(uint32_t(stage) >= 6 || expectedOriginal == ResourceId() ||
+     rm->GetUnreplacedID(expectedOriginal) != expectedOriginal ||
+     rm->GetUnreplacedID(replacement) != replacement || !rm->HasResource(replacement))
+    return "Event Shader override requires a captured original and an unowned target Shader";
+  const GLResource target = rm->GetResource(replacement, true);
+  const ShaderReflection *reflection = m_pDriver->GetShader(replacement).GetReflection();
+  if(target.Namespace != eResShader || !reflection || reflection->stage != stage)
+    return "The target Shader stage does not match the event override";
+  if(outputTarget != ~0U && (stage != ShaderStage::Pixel || outputTarget >= 8))
+    return "A blend bypass requires a valid fragment color target";
+  if(independentFloatOutput && (stage != ShaderStage::Pixel || outputTarget == ~0U))
+    return "Independent float preview requires an explicit fragment color target";
+  m_EventShaderOverrides[{eventId, stage}] = {expectedOriginal, replacement, outputTarget,
+                                             independentFloatOutput};
+  ClearPostVSCache();
+  return {};
+}
+
+void GLReplay::ReleaseEventShaderPrograms(ResourceId target)
+{
+  MakeCurrentReplayContext(&m_ReplayCtx);
+  for(auto it = m_EventShaderPipelines.begin(); it != m_EventShaderPipelines.end();)
+    if(target == ResourceId() || it->first.Uses(target))
+    {
+      m_pDriver->glDeleteProgramPipelines(1, &it->second);
+      it = m_EventShaderPipelines.erase(it);
+    }
+    else
+      ++it;
+  for(auto it = m_EventShaderPrograms.begin(); it != m_EventShaderPrograms.end();)
+    if(target == ResourceId() || it->first.Uses(target))
+    {
+      m_pDriver->glDeleteProgram(it->second);
+      it = m_EventShaderPrograms.erase(it);
+    }
+    else
+      ++it;
+}
+
+void GLReplay::ClearEventShaderOverride(uint32_t eventId, ShaderStage stage)
+{
+  RestoreEventShaderOverrides();
+  m_EventShaderOverrides.erase({eventId, stage});
+  ClearPostVSCache();
+}
+
+void GLReplay::ClearEventShaderOverrides()
+{
+  RestoreEventShaderOverrides();
+  m_EventShaderOverrides.clear();
+  ClearPostVSCache();
+}
+
+void GLReplay::ClearEventShaderOverridesForResource(ResourceId id)
+{
+  RestoreEventShaderOverrides();
+  for(auto it = m_EventShaderOverrides.begin(); it != m_EventShaderOverrides.end();)
+    if(it->second.replacement == id)
+      it = m_EventShaderOverrides.erase(it);
+    else
+      ++it;
+  ReleaseEventShaderPrograms(id);
+}
+
+void GLReplay::DestroyEventShaderFloatPreview(EventShaderFloatPreview &preview)
+{
+  if(preview.framebuffer)
+    m_pDriver->glDeleteFramebuffers(1, &preview.framebuffer);
+  for(auto &attachment : preview.attachments)
+    if(attachment.texture)
+    {
+      ResourceId id = m_pDriver->GetResourceManager()->GetResID(
+          TextureRes(m_pDriver->GetCtx(), attachment.texture));
+      m_CachedTextures.erase(id);
+      m_pDriver->glDeleteTextures(1, &attachment.texture);
+    }
+  preview = EventShaderFloatPreview();
+}
+
+void GLReplay::ReleaseEventShaderFloatPreviews()
+{
+  if(m_EventShaderFloatPreviews.empty()) return;
+  MakeCurrentReplayContext(&m_ReplayCtx);
+  GL.glFinish();
+  for(auto &item : m_EventShaderFloatPreviews)
+    DestroyEventShaderFloatPreview(item.second);
+  m_EventShaderFloatPreviews.clear();
+}
+
+TextureDescription GLReplay::GetEventShaderPreviewTexture(uint32_t eventId, ShaderStage stage)
+{
+  auto binding = m_EventShaderOverrides.find({eventId, stage});
+  if(binding == m_EventShaderOverrides.end() || !binding->second.independentFloatOutput)
+    return {};
+  auto found = m_EventShaderFloatPreviews.find({eventId, binding->second.outputTarget});
+  if(found == m_EventShaderFloatPreviews.end()) return {};
+  MakeCurrentReplayContext(&m_ReplayCtx);
+  return GetTexture(m_pDriver->GetResourceManager()->GetResID(TextureRes(m_pDriver->GetCtx(),
+      found->second.attachments[found->second.selected].texture)));
+}
+
+rdcstr GLReplay::PrepareEventShaderFloatPreview(uint32_t eventId, uint32_t outputTarget,
+                                                GLRenderState &original,
+                                                EventShaderFloatPreview *&preview)
+{
+  preview = NULL;
+  WrappedOpenGL &drv = *m_pDriver;
+  auto rm = drv.GetResourceManager();
+  ContextPair &ctx = drv.GetCtx();
+  if(IsGLES && !HasExt[EXT_color_buffer_float])
+    return "Independent RGBA32F preview requires EXT_color_buffer_float on this OpenGL ES device";
+  GLint sourceFBO = 0, maximum = 0, drawCount = 0, fboSamples = 0;
+  GL.glGetIntegerv(eGL_DRAW_FRAMEBUFFER_BINDING, &sourceFBO);
+  GL.glGetIntegerv(eGL_MAX_COLOR_ATTACHMENTS, &maximum);
+  GL.glGetIntegerv(eGL_MAX_DRAW_BUFFERS, &drawCount);
+  GL.glGetIntegerv(eGL_SAMPLES, &fboSamples);
+  if(sourceFBO == 0 || maximum <= 0 || maximum > 32 || drawCount <= 0 || outputTarget >= uint32_t(drawCount))
+    return "Independent float preview requires a complete replay framebuffer";
+  EventShaderFloatPreview requested;
+  drawCount = RDCMIN(drawCount, 8);
+  requested.drawBuffers.resize(drawCount);
+  for(GLint i = 0; i < drawCount; i++)
+    GL.glGetIntegerv(GLenum(eGL_DRAW_BUFFER0 + i), (GLint *)&requested.drawBuffers[i]);
+  const GLenum selectedAttachment = requested.drawBuffers[outputTarget];
+  if(selectedAttachment < eGL_COLOR_ATTACHMENT0 || selectedAttachment >= GLenum(eGL_COLOR_ATTACHMENT0 + maximum))
+    return "The independent float preview output slot has no color attachment";
+  // Every path, including allocation/format failures, restores all mutable GL state and the
+  // source FBO's own read-buffer selection (which GLRenderState intentionally does not own).
+  GL.glBindFramebuffer(eGL_READ_FRAMEBUFFER, sourceFBO);
+  GLint sourceRead = 0;
+  GL.glGetIntegerv(eGL_READ_BUFFER, &sourceRead);
+  struct Restore
+  {
+    WrappedOpenGL &driver; GLRenderState &state; GLuint fbo; GLenum read;
+    ~Restore()
+    {
+      GL.glBindFramebuffer(eGL_READ_FRAMEBUFFER, fbo);
+      GL.glReadBuffer(read);
+      state.ApplyState(&driver);
+    }
+  } restore = {drv, original, (GLuint)sourceFBO, (GLenum)sourceRead};
+  const bool copyImage = HasExt[ARB_copy_image] && GL.glCopyImageSubData &&
+                         !VendorCheck[VendorCheck_Qualcomm_avoid_glCopyImageSubData];
+  GLint depthName = 0, depthType = 0;
+  GL.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, eGL_DEPTH_ATTACHMENT,
+      eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &depthType);
+  if(depthType != eGL_NONE)
+    GL.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, eGL_DEPTH_ATTACHMENT,
+        eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &depthName);
+  for(GLint index = 0; index < maximum + 2; index++)
+  {
+    const GLenum slot = index < maximum ? GLenum(eGL_COLOR_ATTACHMENT0 + index) :
+                         index == maximum ? eGL_DEPTH_ATTACHMENT : eGL_STENCIL_ATTACHMENT;
+    GLint type = 0, name = 0;
+    GL.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, slot,
+        eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+    if(type == eGL_NONE) continue;
+    GL.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, slot,
+        eGL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+    if(!name || (type != eGL_TEXTURE && type != eGL_RENDERBUFFER))
+      return "Independent float preview encountered an unsupported OpenGL attachment";
+    // A combined depth/stencil image must remain one shared attachment.
+    if(slot == eGL_STENCIL_ATTACHMENT && name == depthName && type == depthType)
+    {
+      if(requested.attachments.empty())
+        return "Independent float preview depth/stencil metadata is incomplete";
+      requested.attachments.back().attachment = eGL_DEPTH_STENCIL_ATTACHMENT;
+      continue;
+    }
+    EventShaderFloatAttachment a;
+    a.attachment = slot; a.sourceName = (GLuint)name;
+    a.source = rm->GetResID(type == eGL_RENDERBUFFER ? RenderbufferRes(ctx, name) : TextureRes(ctx, name));
+    auto metadata = drv.m_Textures.find(a.source);
+    if(metadata == drv.m_Textures.end())
+      return "Independent float preview attachment metadata is unavailable";
+    const auto &texture = metadata->second;
+    a.sourceTarget = type == eGL_RENDERBUFFER ? eGL_RENDERBUFFER : TextureTarget(texture.curType);
+    a.format = slot == selectedAttachment ? eGL_RGBA32F : texture.internalFormat;
+    a.samples = RDCMAX(1, texture.samples);
+    if(a.samples != RDCMAX(1, fboSamples))
+      return "Independent float preview does not support implicit multisample render-to-texture attachments";
+    if(type == eGL_TEXTURE)
+    {
+      GetFramebufferMipAndLayer(sourceFBO, slot, &a.mip, &a.layer);
+      if(!IsGLES)
+      {
+        GLint layered = 0;
+        GL.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, slot,
+            eGL_FRAMEBUFFER_ATTACHMENT_LAYERED, &layered);
+        a.layered = layered != 0;
+        if(a.layered)
+        {
+          a.layer = 0;
+          a.layers = texture.depth & 0xffff;
+          if(a.sourceTarget == eGL_TEXTURE_CUBE_MAP) a.layers = 6;
+          if(a.sourceTarget == eGL_TEXTURE_3D) a.layers = RDCMAX(1, a.layers >> a.mip);
+        }
+      }
+      else if(HasExt[OVR_multiview])
+      {
+        GLint views = 0;
+        GL.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, slot,
+            eGL_FRAMEBUFFER_ATTACHMENT_TEXTURE_NUM_VIEWS_OVR, &views);
+        // Ordinary 2D attachments report the extension's default of one view.
+        // They must not be rebound with the multiview entry point, which requires an array texture.
+        if(views > 1)
+        {
+          a.multiview = true; a.layers = views;
+          GL.glGetFramebufferAttachmentParameteriv(eGL_DRAW_FRAMEBUFFER, slot,
+              eGL_FRAMEBUFFER_ATTACHMENT_TEXTURE_BASE_VIEW_INDEX_OVR, &a.layer);
+        }
+      }
+      if(a.samples > 1)
+      {
+        GLint fixed = 1;
+        GL.glGetTextureLevelParameterivEXT(name, a.sourceTarget, 0, eGL_TEXTURE_FIXED_SAMPLE_LOCATIONS, &fixed);
+        a.fixedSamples = fixed != 0;
+      }
+    }
+    if(a.layers < 1 || a.mip < 0 || a.mip >= 32 || a.layer < 0 ||
+       (a.layers > 1 && !copyImage) ||
+       (a.samples > 1 && !(a.layers > 1 ? HasExt[ARB_texture_multisample] :
+                                         HasExt[ARB_texture_multisample_no_array])))
+      return "Independent float preview cannot preserve this layered or multisample attachment";
+    a.width = RDCMAX(1, texture.width >> a.mip);
+    a.height = RDCMAX(1, texture.height >> a.mip);
+    uint64_t bytes = GLRenderbufferByteSize(a.width, a.height, a.samples, a.format);
+    if(!bytes || bytes > 512ULL * 1024 * 1024 / uint64_t(a.layers))
+      return "Independent float preview attachment exceeds the 512 MiB scratch budget";
+    requested.bytes += bytes * uint64_t(a.layers);
+    if(slot == selectedAttachment) requested.selected = requested.attachments.size();
+    requested.signature += StringFormat::Fmt("%u:%s:%u:%u:%d:%d:%d:%d:%d:%d:%d:%d;", slot,
+      ToStr(a.source).c_str(), a.sourceTarget, a.format, a.mip, a.layer, a.layers,
+      a.width, a.height, a.samples, a.layered || a.multiview, a.fixedSamples);
+    requested.attachments.push_back(a);
+  }
+  for(GLenum draw : requested.drawBuffers)
+    requested.signature += StringFormat::Fmt("%u,", draw);
+  for(const auto &attachment : requested.attachments)
+    requested.signature += StringFormat::Fmt("attachment%u;", attachment.attachment);
+  if(requested.attachments.empty() || requested.attachments[requested.selected].attachment != selectedAttachment)
+    return "The independent float preview attachment is unavailable";
+  if(requested.bytes > 512ULL * 1024 * 1024)
+    return "Independent float preview attachments exceed the 512 MiB scratch budget";
+  auto key = std::make_pair(eventId, outputTarget);
+  auto found = m_EventShaderFloatPreviews.find(key);
+  if(found != m_EventShaderFloatPreviews.end() && found->second.signature != requested.signature)
+  {
+    GL.glFinish();
+    DestroyEventShaderFloatPreview(found->second);
+    m_EventShaderFloatPreviews.erase(found);
+    found = m_EventShaderFloatPreviews.end();
+  }
+  if(found == m_EventShaderFloatPreviews.end())
+  {
+    uint64_t total = requested.bytes;
+    for(const auto &item : m_EventShaderFloatPreviews) total += item.second.bytes;
+    while(m_EventShaderFloatPreviews.size() >= 8 || total > 512ULL * 1024 * 1024)
+    {
+      auto oldest = m_EventShaderFloatPreviews.end();
+      for(auto it = m_EventShaderFloatPreviews.begin(); it != m_EventShaderFloatPreviews.end(); ++it)
+      {
+        auto active = m_EventShaderOverrides.find({it->first.first, ShaderStage::Pixel});
+        if(active != m_EventShaderOverrides.end() && active->second.independentFloatOutput &&
+           active->second.outputTarget == it->first.second) continue;
+        if(oldest == m_EventShaderFloatPreviews.end() || it->second.used < oldest->second.used) oldest = it;
+      }
+      if(oldest == m_EventShaderFloatPreviews.end())
+        return "Independent float preview cache is full of active previews";
+      GL.glFinish();
+      total -= oldest->second.bytes;
+      DestroyEventShaderFloatPreview(oldest->second);
+      m_EventShaderFloatPreviews.erase(oldest);
+    }
+    GL.glBindBuffer(eGL_PIXEL_UNPACK_BUFFER, 0);
+    for(int errors = 0; errors < 16 && GL.glGetError() != eGL_NONE; errors++) {}
+    drv.glGenFramebuffers(1, &requested.framebuffer);
+    drv.glBindFramebuffer(eGL_DRAW_FRAMEBUFFER, requested.framebuffer);
+    rdcstr failure;
+    for(auto &a : requested.attachments)
+    {
+      const GLenum target = a.samples > 1 ? (a.layers > 1 ? eGL_TEXTURE_2D_MULTISAMPLE_ARRAY : eGL_TEXTURE_2D_MULTISAMPLE) :
+                                            (a.layers > 1 ? eGL_TEXTURE_2D_ARRAY : eGL_TEXTURE_2D);
+      drv.glGenTextures(1, &a.texture);
+      drv.glBindTexture(target, a.texture);
+      if(a.samples > 1)
+      {
+        if(a.layers > 1)
+          drv.glTextureStorage3DMultisampleEXT(a.texture, target, a.samples, a.format, a.width, a.height, a.layers, a.fixedSamples);
+        else
+          drv.glTextureStorage2DMultisampleEXT(a.texture, target, a.samples, a.format, a.width, a.height, a.fixedSamples);
+      }
+      else
+      {
+        if(a.layers > 1)
+          drv.glTextureImage3DEXT(a.texture, target, 0, a.format, a.width, a.height, a.layers, 0,
+                                  GetBaseFormat(a.format), GetDataType(a.format), NULL);
+        else
+          drv.glTextureImage2DEXT(a.texture, target, 0, a.format, a.width, a.height, 0,
+                                  GetBaseFormat(a.format), GetDataType(a.format), NULL);
+        drv.glTextureParameteriEXT(a.texture, target, eGL_TEXTURE_MAX_LEVEL, 0);
+        drv.glTextureParameteriEXT(a.texture, target, eGL_TEXTURE_MIN_FILTER, eGL_NEAREST);
+        drv.glTextureParameteriEXT(a.texture, target, eGL_TEXTURE_MAG_FILTER, eGL_NEAREST);
+      }
+      GLenum allocationError = GL.glGetError();
+      if(allocationError != eGL_NONE)
+      {
+        failure = StringFormat::Fmt("Allocating independent OpenGL preview %s/%s failed: %s",
+          ToStr(a.format).c_str(), ToStr(target).c_str(), ToStr(allocationError).c_str());
+        break;
+      }
+      if(a.multiview)
+        drv.glFramebufferTextureMultiviewOVR(eGL_DRAW_FRAMEBUFFER, a.attachment, a.texture, 0, 0, a.layers);
+      else if(a.layered)
+        drv.glFramebufferTexture(eGL_DRAW_FRAMEBUFFER, a.attachment, a.texture, 0);
+      else
+        drv.glFramebufferTexture2D(eGL_DRAW_FRAMEBUFFER, a.attachment, target, a.texture, 0);
+      GLenum attachmentError = GL.glGetError();
+      if(attachmentError != eGL_NONE)
+      {
+        failure = StringFormat::Fmt("Attaching independent OpenGL preview %s at %s failed: %s",
+          ToStr(a.format).c_str(), ToStr(a.attachment).c_str(), ToStr(attachmentError).c_str());
+        break;
+      }
+    }
+    if(failure.empty())
+    {
+      drv.glDrawBuffers((GLsizei)requested.drawBuffers.size(), requested.drawBuffers.data());
+      GL.glBindFramebuffer(eGL_READ_FRAMEBUFFER, requested.framebuffer);
+      GL.glReadBuffer(selectedAttachment);
+      if(GL.glCheckFramebufferStatus(eGL_DRAW_FRAMEBUFFER) != eGL_FRAMEBUFFER_COMPLETE)
+        failure = "Independent RGBA32F preview framebuffer is incomplete on this device";
+    }
+    if(!failure.empty())
+    {
+      DestroyEventShaderFloatPreview(requested);
+      return failure;
+    }
+    found = m_EventShaderFloatPreviews.insert({key, std::move(requested)}).first;
+  }
+  preview = &found->second;
+  GL.glBindFramebuffer(eGL_READ_FRAMEBUFFER, sourceFBO);
+  GL.glBindFramebuffer(eGL_DRAW_FRAMEBUFFER, preview->framebuffer);
+  GL.glDisable(eGL_SCISSOR_TEST);
+  if(HasExt[EXT_framebuffer_sRGB]) GL.glDisable(eGL_FRAMEBUFFER_SRGB);
+  for(int errors = 0; errors < 16 && GL.glGetError() != eGL_NONE; errors++) {}
+  for(size_t i = 0; i < preview->attachments.size(); i++)
+  {
+    if(i == preview->selected) continue;
+    const auto &a = preview->attachments[i];
+    GLenum target = a.samples > 1 ? (a.layers > 1 ? eGL_TEXTURE_2D_MULTISAMPLE_ARRAY : eGL_TEXTURE_2D_MULTISAMPLE) :
+                                    (a.layers > 1 ? eGL_TEXTURE_2D_ARRAY : eGL_TEXTURE_2D);
+    if(copyImage)
+      GL.glCopyImageSubData(a.sourceName, a.sourceTarget, a.mip, 0, 0, a.layer,
+        a.texture, target, 0, 0, 0, 0, a.width, a.height, a.layers);
+    else
+    {
+      GLbitfield mask = a.attachment == eGL_DEPTH_ATTACHMENT ? eGL_DEPTH_BUFFER_BIT :
+        a.attachment == eGL_STENCIL_ATTACHMENT ? eGL_STENCIL_BUFFER_BIT :
+        a.attachment == eGL_DEPTH_STENCIL_ATTACHMENT ? eGL_DEPTH_BUFFER_BIT | eGL_STENCIL_BUFFER_BIT : eGL_COLOR_BUFFER_BIT;
+      if(mask == eGL_COLOR_BUFFER_BIT)
+      {
+        GL.glReadBuffer(a.attachment);
+        GL.glDrawBuffers(1, &a.attachment);
+      }
+      GL.glBlitFramebuffer(0, 0, a.width, a.height, 0, 0, a.width, a.height, mask, eGL_NEAREST);
+    }
+    if(GL.glGetError() != eGL_NONE)
+      return "Independent OpenGL preview could not copy an attachment exactly";
+  }
+  GL.glDrawBuffers((GLsizei)preview->drawBuffers.size(), preview->drawBuffers.data());
+  if(HasExt[EXT_draw_buffers2] || HasExt[ARB_draw_buffers_blend])
+    GL.glColorMaski(outputTarget, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  else
+    GL.glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  const GLfloat clear[] = {0, 0, 0, 0};
+  GL.glClearBufferfv(eGL_COLOR, outputTarget, clear);
+  if(GL.glGetError() != eGL_NONE)
+    return "Clearing the independent OpenGL float preview failed";
+  preview->used = ++m_EventShaderFloatClock;
+  return {};
+}
+
+rdcstr GLReplay::ApplyEventShaderOverrides(uint32_t eventId)
+{
+  if(m_EventShaderPreviousState)
+    return "A previous OpenGL event Shader override was not restored";
+  rdcarray<std::pair<ShaderStage, EventShaderOverrideBinding>> pending;
+  for(const auto &item : m_EventShaderOverrides)
+    if(item.first.first == eventId)
+      pending.push_back({item.first.second, item.second});
+  if(pending.empty())
+    return {};
+  MakeCurrentReplayContext(&m_ReplayCtx);
+  WrappedOpenGL &drv = *m_pDriver;
+  auto rm = drv.GetResourceManager();
+  ContextPair &ctx = drv.GetCtx();
+  GLRenderState original;
+  original.FetchState(&drv);
+  // Subroutine uniform locations and implementation indices are link-dependent.
+  // GLRenderState currently stores only numeric bindings, so relinking and then
+  // restoring them would silently select a different function (or be invalid).
+  for(const GLRenderState::Subroutine &subroutine : original.Subroutines)
+    if(subroutine.numSubroutines > 0)
+      return "OpenGL event Shader overrides cannot preserve active Shader subroutine bindings";
+  GLuint programs[6] = {};
+  ResourceId shaders[6] = {};
+  ResourceId programIds[6] = {};
+  if(original.Program.name)
+  {
+    ResourceId id = rm->GetResID(original.Program);
+    const auto &program = drv.GetProgram(id);
+    for(size_t i = 0; i < ARRAY_COUNT(programs); i++)
+      if(program.stageShaders[i] != ResourceId())
+      {
+        programs[i] = original.Program.name;
+        programIds[i] = id;
+        shaders[i] = program.stageShaders[i];
+      }
+  }
+  else if(original.Pipeline.name)
+  {
+    const auto &pipeline = drv.GetPipeline(rm->GetResID(original.Pipeline));
+    for(size_t i = 0; i < ARRAY_COUNT(programs); i++)
+      if(pipeline.stagePrograms[i] != ResourceId())
+      {
+        GLResource program = rm->GetResource(pipeline.stagePrograms[i], true);
+        programs[i] = program.name;
+        programIds[i] = rm->GetResID(program);
+        shaders[i] = drv.GetProgram(programIds[i]).stageShaders[i];
+      }
+  }
+  else
+    return "The selected event has no live OpenGL program or program pipeline";
+  EventShaderPipelineKey pipelineKey;
+  pipelineKey.pipeline = rm->GetResID(original.Program.name ? original.Program : original.Pipeline);
+  pipelineKey.eventId = eventId;
+  std::map<ResourceId, EventShaderPipelineKey> programKeys;
+  for(const auto &item : pending)
+  {
+    const uint32_t stage = uint32_t(item.first);
+    if(!programs[stage] || rm->GetUnreplacedID(shaders[stage]) != item.second.original)
+      return "The selected OpenGL event no longer binds the expected Shader";
+    if(!rm->HasResource(item.second.replacement) ||
+       rm->GetResource(item.second.replacement, true).Namespace != eResShader)
+      return "The event Shader target is no longer available";
+    EventShaderPipelineKey &programKey = programKeys[programIds[stage]];
+    programKey.pipeline = programIds[stage];
+    programKey.eventId = eventId;
+    programKey.replacements[stage] = item.second.replacement;
+    pipelineKey.replacements[stage] = item.second.replacement;
+    if(item.second.outputTarget != ~0U)
+      pipelineKey.outputTarget = item.second.outputTarget;
+    pipelineKey.independentFloatOutput |= item.second.independentFloatOutput;
+  }
+  if(pipelineKey.outputTarget != ~0U)
+  {
+    GLint maxTargets = 0;
+    GL.glGetIntegerv(eGL_MAX_DRAW_BUFFERS, &maxTargets);
+    if(pipelineKey.outputTarget >= uint32_t(maxTargets))
+      return "The requested debug color target exceeds the OpenGL draw-buffer limit";
+  }
+  // Bound the live cache without evicting any program while it is installed.
+  if(m_EventShaderPrograms.size() >= 64 || m_EventShaderPipelines.size() >= 64)
+    ReleaseEventShaderPrograms();
+  std::map<ResourceId, GLuint> variants;
+  for(const auto &item : programKeys)
+  {
+    const EventShaderPipelineKey &key = item.second;
+    auto cached = m_EventShaderPrograms.find(key);
+    const GLuint source = rm->GetResource(key.pipeline, true).name;
+    if(cached == m_EventShaderPrograms.end())
+    {
+      const auto &program = drv.GetProgram(key.pipeline);
+      GLuint variant = drv.glCreateProgram();
+      for(size_t i = 0; i < ARRAY_COUNT(programs); i++)
+      {
+        ResourceId shader = key.replacements[i] != ResourceId() ? key.replacements[i] : program.stageShaders[i];
+        if(shader == ResourceId())
+          continue;
+        GLResource resource = rm->GetResource(shader, true);
+        if(resource.Namespace != eResShader)
+        {
+          drv.glDeleteProgram(variant);
+          return "A linked program stage cannot be reconstructed as a Shader object";
+        }
+        drv.glAttachShader(variant, resource.name);
+      }
+      if(HasExt[ARB_separate_shader_objects])
+      {
+        GLint separable = 0;
+        GL.glGetProgramiv(source, eGL_PROGRAM_SEPARABLE, &separable);
+        if(separable)
+          drv.glProgramParameteri(variant, eGL_PROGRAM_SEPARABLE, GL_TRUE);
+      }
+      if(program.stageShaders[0] != ResourceId())
+        CopyProgramAttribBindings(source, variant, drv.GetShader(program.stageShaders[0]).GetReflection());
+      if(program.stageShaders[4] != ResourceId())
+        CopyProgramFragDataBindings(source, variant, drv.GetShader(program.stageShaders[4]).GetReflection());
+      // Transform-feedback varyings and their buffer mode are program link state,
+      // not uniforms. Preserve them even for a fragment-only replacement.
+      GLint varyingCount = 0;
+      GL.glGetProgramiv(source, eGL_TRANSFORM_FEEDBACK_VARYINGS, &varyingCount);
+      if(varyingCount > 0)
+      {
+        GLint nameLength = 0, bufferMode = 0;
+        GL.glGetProgramiv(source, eGL_TRANSFORM_FEEDBACK_VARYING_MAX_LENGTH, &nameLength);
+        GL.glGetProgramiv(source, eGL_TRANSFORM_FEEDBACK_BUFFER_MODE, &bufferMode);
+        rdcarray<rdcstr> varyingNames;
+        rdcarray<const GLchar *> varyingPointers;
+        varyingNames.resize(varyingCount);
+        for(GLint v = 0; v < varyingCount; v++)
+        {
+          varyingNames[v].resize(RDCMAX(1, nameLength));
+          GLsizei written = 0, count = 0;
+          GLenum type = eGL_NONE;
+          GL.glGetTransformFeedbackVarying(source, v, (GLsizei)varyingNames[v].size(),
+                                          &written, &count, &type, varyingNames[v].data());
+          varyingNames[v].resize(written);
+          varyingPointers.push_back(varyingNames[v].c_str());
+        }
+        drv.glTransformFeedbackVaryings(variant, varyingCount, varyingPointers.data(),
+                                       (GLenum)bufferMode);
+      }
+      drv.glLinkProgram(variant);
+      GLint linked = 0;
+      GL.glGetProgramiv(variant, eGL_LINK_STATUS, &linked);
+      if(!linked)
+      {
+        GLint length = 0;
+        GL.glGetProgramiv(variant, eGL_INFO_LOG_LENGTH, &length);
+        rdcstr log;
+        log.resize(RDCMAX(1, length));
+        GL.glGetProgramInfoLog(variant, length, NULL, log.data());
+        drv.glDeleteProgram(variant);
+        return "Linking the event Shader program failed: " + log;
+      }
+      cached = m_EventShaderPrograms.insert({key, variant}).first;
+    }
+    // Uniform values are mutable capture state; compiled program caches must never cache them.
+    PerStageReflections sourceStages, targetStages;
+    drv.FillReflectionArray(key.pipeline, sourceStages);
+    drv.FillReflectionArray(ProgramRes(ctx, cached->second), targetStages);
+    CopyProgramUniforms(sourceStages, source, targetStages, cached->second);
+    variants[key.pipeline] = cached->second;
+  }
+  GLRenderState changed = original;
+  if(original.Program.name)
+    changed.Program = ProgramRes(ctx, variants.begin()->second);
+  else
+  {
+    auto cached = m_EventShaderPipelines.find(pipelineKey);
+    if(cached == m_EventShaderPipelines.end())
+    {
+      GLuint pipeline = 0;
+      drv.glGenProgramPipelines(1, &pipeline);
+      const GLbitfield bits[] = {eGL_VERTEX_SHADER_BIT, eGL_TESS_CONTROL_SHADER_BIT,
+          eGL_TESS_EVALUATION_SHADER_BIT, eGL_GEOMETRY_SHADER_BIT,
+          eGL_FRAGMENT_SHADER_BIT, eGL_COMPUTE_SHADER_BIT};
+      for(size_t i = 0; i < ARRAY_COUNT(programs); i++)
+        if(programs[i])
+        {
+          auto variant = variants.find(programIds[i]);
+          drv.glUseProgramStages(pipeline, bits[i], variant == variants.end() ? programs[i] : variant->second);
+        }
+      drv.glValidateProgramPipeline(pipeline);
+      GLint valid = 0;
+      GL.glGetProgramPipelineiv(pipeline, eGL_VALIDATE_STATUS, &valid);
+      if(!valid)
+      {
+        drv.glDeleteProgramPipelines(1, &pipeline);
+        return "The event Shader program pipeline failed interface validation";
+      }
+      cached = m_EventShaderPipelines.insert({pipelineKey, pipeline}).first;
+    }
+    changed.Pipeline = ProgramPipeRes(ctx, cached->second);
+  }
+  if(pipelineKey.outputTarget != ~0U)
+  {
+    uint32_t blendIndex = HasExt[ARB_draw_buffers_blend] ? pipelineKey.outputTarget : 0;
+    uint32_t maskIndex = (HasExt[EXT_draw_buffers2] || HasExt[ARB_draw_buffers_blend]) ? pipelineKey.outputTarget : 0;
+    changed.Blends[blendIndex].Enabled = false;
+    changed.ColorMasks[maskIndex] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
+    changed.Enabled[GLRenderState::eEnabled_SampleAlphaToCoverage] = false;
+    changed.Enabled[GLRenderState::eEnabled_ColorLogicOp] = false;
+  }
+  if(pipelineKey.independentFloatOutput)
+  {
+    for(const rdcstr &source : drv.GetShader(shaders[uint32_t(ShaderStage::Pixel)]).sources)
+      if(source.contains("framebuffer_fetch"))
+        return "Independent float preview cannot preserve OpenGL framebuffer-fetch semantics";
+    EventShaderFloatPreview *preview = NULL;
+    rdcstr error = PrepareEventShaderFloatPreview(eventId, pipelineKey.outputTarget, original, preview);
+    if(!error.empty()) return error;
+    changed.DrawFBO = FramebufferRes(ctx, preview->framebuffer);
+  }
+  InvalidateLiveForward();
+  m_EventShaderPreviousState.reset(new GLRenderState(original));
+  changed.ApplyState(&drv);
+  return {};
+}
+
+void GLReplay::RestoreEventShaderOverrides()
+{
+  if(!m_EventShaderPreviousState)
+    return;
+  MakeCurrentReplayContext(&m_ReplayCtx);
+  m_EventShaderPreviousState->ApplyState(m_pDriver);
+  m_EventShaderPreviousState.reset();
 }
 
 rdcstr GLReplay::ReplaceTargetShaderChecked(ResourceId from, ResourceId to)

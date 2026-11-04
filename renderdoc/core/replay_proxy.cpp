@@ -36,7 +36,14 @@ namespace
 static const uint64_t ReplayControlMaxPayload = 64ULL * 1024 * 1024;
 static const uint64_t ReplayControlMaxPatchBytes = 32ULL * 1024 * 1024;
 static const uint64_t ReplayControlOperations =
-    (1ULL << (uint32_t(ReplayControlOperation::CheckpointStatsWithPlan) + 1)) - 1;
+    (1ULL << (uint32_t(ReplayControlOperation::RemoveTargetShaderReplacementChecked) + 1)) - 1;
+
+bool ControlOperationSupported(uint32_t version, uint64_t operations, ReplayControlOperation operation)
+{
+  return operation == ReplayControlOperation::Capabilities ||
+         (version == 1 && uint32_t(operation) < 64 &&
+          (operations & (1ULL << uint32_t(operation))) != 0);
+}
 
 template <typename SerialiserType>
 bool ControlBytes(SerialiserType &ser, bytebuf &bytes, uint64_t limit, bool memoryPayload)
@@ -246,7 +253,7 @@ rdcstr DispatchReplayControl(Driver *driver, uint32_t version, uint32_t operatio
     return "replayControlProtocolVersionMismatch";
   if(request.size() > ReplayControlMaxPayload)
     return "replayControlPayloadTooLarge";
-  if(operation > uint32_t(ReplayControlOperation::CheckpointStatsWithPlan))
+  if(operation > uint32_t(ReplayControlOperation::RemoveTargetShaderReplacementChecked))
     return "replayControlOperationUnsupported";
 
   ReadSerialiser input(new StreamReader(request), Ownership::Stream);
@@ -265,7 +272,77 @@ rdcstr DispatchReplayControl(Driver *driver, uint32_t version, uint32_t operatio
   {
     if(driver->GetReplayControlVersion() != 1)
       return "replayControlDriverUnsupported";
-    if(op == ReplayControlOperation::ConfigureCheckpoints)
+    if(op == ReplayControlOperation::ReplaceTargetShaderChecked ||
+       op == ReplayControlOperation::RemoveTargetShaderReplacementChecked)
+    {
+      ResourceId original, replacement;
+      input.Serialise("original"_lit, original);
+      if(op == ReplayControlOperation::ReplaceTargetShaderChecked)
+        input.Serialise("replacement"_lit, replacement);
+      if(!ControlPayloadFinished(input) || original == ResourceId() ||
+         (op == ReplayControlOperation::ReplaceTargetShaderChecked &&
+          (replacement == ResourceId() || original == replacement)))
+        return "replayControlInvalidShaderReplacementPayload";
+      // Validate the entire request before invoking either mutation. Driver errors preserve
+      // the previous mapping and travel in the existing bounded error envelope.
+      return op == ReplayControlOperation::ReplaceTargetShaderChecked
+                 ? driver->ReplaceTargetShaderChecked(original, replacement)
+                 : driver->RemoveTargetShaderReplacementChecked(original);
+    }
+    else if(op >= ReplayControlOperation::SetEventShader)
+    {
+      uint32_t eventId = 0, outputTarget = ~0U;
+      ShaderStage stage = ShaderStage::Pixel;
+      ResourceId original, replacement;
+      const bool setting = op == ReplayControlOperation::SetEventShader ||
+                           op == ReplayControlOperation::SetEventShaderFloatOutput;
+      const bool querying = op == ReplayControlOperation::EventShaderPreviewTexture;
+      if(setting || querying || op == ReplayControlOperation::ClearEventShader ||
+         op == ReplayControlOperation::ApplyEventShaders)
+        input.Serialise("eventId"_lit, eventId);
+      if(setting || querying || op == ReplayControlOperation::ClearEventShader)
+        input.Serialise("stage"_lit, stage);
+      if(setting)
+      {
+        input.Serialise("original"_lit, original);
+        input.Serialise("replacement"_lit, replacement);
+        input.Serialise("outputTarget"_lit, outputTarget);
+      }
+      if(op == ReplayControlOperation::ClearEventShaderResource)
+        input.Serialise("replacement"_lit, replacement);
+      if(!ControlPayloadFinished(input))
+        return "replayControlInvalidEventShaderPayload";
+      if((setting || querying || op == ReplayControlOperation::ClearEventShader ||
+          op == ReplayControlOperation::ApplyEventShaders) && eventId == 0)
+        return "replayControlInvalidEventShaderEvent";
+      if((setting || querying || op == ReplayControlOperation::ClearEventShader) &&
+         uint32_t(stage) >= 8)
+        return "replayControlInvalidEventShaderStage";
+      if(setting &&
+         (original == ResourceId() || replacement == ResourceId() ||
+          (op == ReplayControlOperation::SetEventShaderFloatOutput && outputTarget == ~0U) ||
+          (outputTarget != ~0U && (outputTarget >= 8 || stage != ShaderStage::Pixel))))
+        return "replayControlInvalidEventShaderBinding";
+      if(setting)
+        return driver->SetEventShaderOverride(eventId, stage, original, replacement, outputTarget,
+                                               op == ReplayControlOperation::SetEventShaderFloatOutput);
+      if(querying)
+      {
+        TextureDescription texture = driver->GetEventShaderPreviewTexture(eventId, stage);
+        output.Serialise("texture"_lit, texture);
+      }
+      if(op == ReplayControlOperation::ClearEventShader)
+        driver->ClearEventShaderOverride(eventId, stage);
+      else if(op == ReplayControlOperation::ClearEventShaders)
+        driver->ClearEventShaderOverrides();
+      else if(op == ReplayControlOperation::ClearEventShaderResource)
+        driver->ClearEventShaderOverridesForResource(replacement);
+      else if(op == ReplayControlOperation::ApplyEventShaders)
+        return driver->ApplyEventShaderOverrides(eventId);
+      else if(op == ReplayControlOperation::RestoreEventShaders)
+        driver->RestoreEventShaderOverrides();
+    }
+    else if(op == ReplayControlOperation::ConfigureCheckpoints)
     {
       ReplayCheckpointConfig config;
       rdcarray<ReplayCheckpointCandidate> candidates;
@@ -705,9 +782,7 @@ rdcstr ReplayProxy::ReplayControlRequest(ReplayControlOperation operation, const
   response.clear();
   if(m_IsErrored || m_Reader.IsErrored() || m_Writer.IsErrored())
     return "replayControlTransportFailed";
-  if(operation != ReplayControlOperation::Capabilities &&
-     (m_RemoteControlVersion != 1 ||
-      (m_RemoteControlOperations & (1ULL << uint32_t(operation))) == 0))
+  if(!ControlOperationSupported(m_RemoteControlVersion, m_RemoteControlOperations, operation))
     return "replayControlDriverUnsupported";
   return ReplayControl(uint32_t(operation), request, response);
 }
@@ -814,6 +889,160 @@ rdcstr ReplayProxy::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &pa
     m_BufferProxyCache.clear();
   }
   return error;
+}
+
+rdcstr ReplayProxy::ReplaceTargetShaderChecked(ResourceId from, ResourceId to)
+{
+  WriteSerialiser ser(new StreamWriter(128), Ownership::Stream);
+  ser.Serialise("original"_lit, from);
+  ser.Serialise("replacement"_lit, to);
+  bytebuf response;
+  rdcstr error = ReplayControlRequest(ReplayControlOperation::ReplaceTargetShaderChecked,
+                                     ControlPayload(ser), response);
+  if(error.empty() && !response.empty())
+  {
+    // The peer may already have committed. Mark the transport unhealthy so callers cannot
+    // mistake malformed confirmation for a safely rejected, unowned target.
+    m_IsErrored = true;
+    return "replayControlInvalidShaderReplacementResult";
+  }
+  if(error.empty())
+  {
+    m_TextureProxyCache.clear();
+    m_BufferProxyCache.clear();
+  }
+  return error;
+}
+
+rdcstr ReplayProxy::RemoveTargetShaderReplacementChecked(ResourceId id)
+{
+  WriteSerialiser ser(new StreamWriter(128), Ownership::Stream);
+  ser.Serialise("original"_lit, id);
+  bytebuf response;
+  rdcstr error = ReplayControlRequest(ReplayControlOperation::RemoveTargetShaderReplacementChecked,
+                                     ControlPayload(ser), response);
+  if(error.empty() && !response.empty())
+  {
+    m_IsErrored = true;
+    return "replayControlInvalidShaderReplacementResult";
+  }
+  if(error.empty())
+  {
+    m_TextureProxyCache.clear();
+    m_BufferProxyCache.clear();
+  }
+  return error;
+}
+
+rdcstr ReplayProxy::SetEventShaderOverride(uint32_t eventId, ShaderStage stage,
+                                           ResourceId expectedOriginal, ResourceId replacement,
+                                           uint32_t outputTarget, bool independentFloatOutput)
+{
+  WriteSerialiser ser(new StreamWriter(128), Ownership::Stream);
+  ser.Serialise("eventId"_lit, eventId);
+  ser.Serialise("stage"_lit, stage);
+  ser.Serialise("original"_lit, expectedOriginal);
+  ser.Serialise("replacement"_lit, replacement);
+  ser.Serialise("outputTarget"_lit, outputTarget);
+  bytebuf response;
+  rdcstr error = ReplayControlRequest(independentFloatOutput ? ReplayControlOperation::SetEventShaderFloatOutput : ReplayControlOperation::SetEventShader,
+                                      ControlPayload(ser), response);
+  if(error.empty())
+    m_TextureProxyCache.clear();
+  return error;
+}
+
+TextureDescription ReplayProxy::GetEventShaderPreviewTexture(uint32_t eventId, ShaderStage stage)
+{
+  WriteSerialiser ser(new StreamWriter(128), Ownership::Stream);
+  ser.Serialise("eventId"_lit, eventId);
+  ser.Serialise("stage"_lit, stage);
+  bytebuf response;
+  rdcstr error = ReplayControlRequest(ReplayControlOperation::EventShaderPreviewTexture,
+                                      ControlPayload(ser), response);
+  TextureDescription texture;
+  if(!error.empty())
+    return texture;
+  ReadSerialiser input(new StreamReader(response), Ownership::Stream);
+  input.Serialise("texture"_lit, texture);
+  if(!ControlPayloadFinished(input))
+  {
+    m_IsErrored = true;
+    return {};
+  }
+  if(texture.resourceId != ResourceId())
+    m_TextureInfo[texture.resourceId] = texture;
+  return texture;
+}
+
+void ReplayProxy::ClearEventShaderOverride(uint32_t eventId, ShaderStage stage)
+{
+  WriteSerialiser ser(new StreamWriter(128), Ownership::Stream);
+  ser.Serialise("eventId"_lit, eventId);
+  ser.Serialise("stage"_lit, stage);
+  bytebuf response;
+  rdcstr error = ReplayControlRequest(ReplayControlOperation::ClearEventShader,
+                                      ControlPayload(ser), response);
+  if(!error.empty())
+  {
+    m_IsErrored = true;
+    RDCERR("Remote event Shader clear failed: %s", error.c_str());
+  }
+  m_TextureProxyCache.clear();
+}
+
+void ReplayProxy::ClearEventShaderOverrides()
+{
+  bytebuf response;
+  // Older peers never accepted an overlay. Cleanup must remain a harmless no-op there.
+  if((m_RemoteControlOperations & (1ULL << uint32_t(ReplayControlOperation::ClearEventShaders))) == 0)
+    return;
+  rdcstr error = ReplayControlRequest(ReplayControlOperation::ClearEventShaders, {}, response);
+  if(!error.empty())
+  {
+    m_IsErrored = true;
+    RDCERR("Remote event Shader cleanup failed: %s", error.c_str());
+  }
+  m_TextureProxyCache.clear();
+}
+
+void ReplayProxy::ClearEventShaderOverridesForResource(ResourceId id)
+{
+  if((m_RemoteControlOperations & (1ULL << uint32_t(ReplayControlOperation::ClearEventShaderResource))) == 0)
+    return;
+  WriteSerialiser ser(new StreamWriter(128), Ownership::Stream);
+  ser.Serialise("replacement"_lit, id);
+  bytebuf response;
+  rdcstr error = ReplayControlRequest(ReplayControlOperation::ClearEventShaderResource,
+                                      ControlPayload(ser), response);
+  if(!error.empty())
+  {
+    m_IsErrored = true;
+    RDCERR("Remote event Shader resource cleanup failed: %s", error.c_str());
+  }
+}
+
+rdcstr ReplayProxy::ApplyEventShaderOverrides(uint32_t eventId)
+{
+  if((m_RemoteControlOperations & (1ULL << uint32_t(ReplayControlOperation::ApplyEventShaders))) == 0)
+    return {};
+  WriteSerialiser ser(new StreamWriter(128), Ownership::Stream);
+  ser.Serialise("eventId"_lit, eventId);
+  bytebuf response;
+  return ReplayControlRequest(ReplayControlOperation::ApplyEventShaders, ControlPayload(ser), response);
+}
+
+void ReplayProxy::RestoreEventShaderOverrides()
+{
+  if((m_RemoteControlOperations & (1ULL << uint32_t(ReplayControlOperation::RestoreEventShaders))) == 0)
+    return;
+  bytebuf response;
+  rdcstr error = ReplayControlRequest(ReplayControlOperation::RestoreEventShaders, {}, response);
+  if(!error.empty())
+  {
+    m_IsErrored = true;
+    RDCERR("Remote event Shader state restore failed: %s", error.c_str());
+  }
 }
 
 template <typename ParamSerialiser, typename ReturnSerialiser>
@@ -3814,8 +4043,198 @@ struct ReplayControlTestDriver
     patches = p;
     return rdcstr();
   }
+  EventShaderOverrideState shader;
+  uint32_t shaderSets = 0, shaderClears = 0, shaderApplies = 0, shaderRestores = 0;
+  rdcstr shaderError;
+  ResourceId sharedOriginal, sharedTarget;
+  uint32_t sharedSets = 0, sharedRemoves = 0;
+  rdcstr sharedError;
+  rdcstr ReplaceTargetShaderChecked(ResourceId original, ResourceId target)
+  {
+    ++sharedSets;
+    if(!sharedError.empty()) return sharedError;
+    sharedOriginal = original;
+    sharedTarget = target;
+    return {};
+  }
+  rdcstr RemoveTargetShaderReplacementChecked(ResourceId original)
+  {
+    ++sharedRemoves;
+    if(!sharedError.empty()) return sharedError;
+    if(original == sharedOriginal) sharedTarget = ResourceId();
+    return {};
+  }
+  rdcstr SetEventShaderOverride(uint32_t event, ShaderStage stage, ResourceId original,
+                               ResourceId target, uint32_t output, bool independentFloat)
+  {
+    ++shaderSets;
+    if(!shaderError.empty()) return shaderError;
+    shader.active = true; shader.eventId = event; shader.stage = stage;
+    shader.expectedOriginal = original; shader.replacement = target; shader.outputTarget = output;
+    shader.independentFloatOutput = independentFloat;
+    return {};
+  }
+  void ClearEventShaderOverride(uint32_t event, ShaderStage stage)
+  {
+    ++shaderClears;
+    if(shader.eventId == event && shader.stage == stage) shader.active = false;
+  }
+  void ClearEventShaderOverrides() { ++shaderClears; shader.active = false; }
+  void ClearEventShaderOverridesForResource(ResourceId id)
+  {
+    ++shaderClears;
+    if(shader.replacement == id) shader.active = false;
+  }
+  rdcstr ApplyEventShaderOverrides(uint32_t) { ++shaderApplies; return shaderError; }
+  void RestoreEventShaderOverrides() { ++shaderRestores; }
+  TextureDescription preview;
+  TextureDescription GetEventShaderPreviewTexture(uint32_t event, ShaderStage stage)
+  { return shader.active && shader.independentFloatOutput && event == shader.eventId &&
+           stage == shader.stage ? preview : TextureDescription(); }
 };
 };    // namespace
+
+TEST_CASE("Remote shared Shader transactions retain capability and complete-payload boundaries",
+          "[replay][proxy][shared-shader]")
+{
+  ReplayControlTestDriver driver;
+  bytebuf response;
+  const ResourceId original = ResourceIDGen::GetNewUniqueID();
+  const ResourceId prior = ResourceIDGen::GetNewUniqueID();
+  const ResourceId target = ResourceIDGen::GetNewUniqueID();
+  const auto replace = ReplayControlOperation::ReplaceTargetShaderChecked;
+  const auto remove = ReplayControlOperation::RemoveTargetShaderReplacementChecked;
+  auto dispatch = [&](ReplayControlOperation op, const bytebuf &request) {
+    return DispatchReplayControl(&driver, ReplayControlProtocolRevision, uint32_t(op), request,
+                                 response);
+  };
+  auto payload = [&](ResourceId from, ResourceId to, bool removal = false) {
+    WriteSerialiser writer(new StreamWriter(128), Ownership::Stream);
+    writer.Serialise("original"_lit, from);
+    if(!removal) writer.Serialise("replacement"_lit, to);
+    return ControlPayload(writer);
+  };
+  const uint64_t legacy = (1ULL << (uint32_t(ReplayControlOperation::EventShaderPreviewTexture) + 1)) - 1;
+  CHECK(uint32_t(replace) == 14);
+  CHECK(uint32_t(remove) == 15);
+  CHECK(ReplayControlProtocolRevision == 5);
+  CHECK(ControlOperationSupported(1, legacy, ReplayControlOperation::SetEventShader));
+  CHECK_FALSE(ControlOperationSupported(1, legacy, replace));
+  CHECK_FALSE(ControlOperationSupported(1, legacy, remove));
+  CHECK_FALSE(ControlOperationSupported(0, ReplayControlOperations, replace));
+  CHECK_FALSE(ControlOperationSupported(1, ~0ULL, ReplayControlOperation(64)));
+  CHECK(ControlOperationSupported(1, ReplayControlOperations, replace));
+  CHECK(ControlOperationSupported(1, ReplayControlOperations, remove));
+
+  REQUIRE(dispatch(replace, payload(original, prior)).empty());
+  REQUIRE(response.empty());
+  CHECK(driver.sharedTarget == prior);
+  const bytebuf valid = payload(original, target);
+  bytebuf truncated = valid, trailing = valid;
+  truncated.pop_back();
+  trailing.push_back(1);
+  for(const bytebuf &invalid : {bytebuf(), truncated, trailing, payload(original, ResourceId()),
+                              payload(ResourceId(), target), payload(original, original)})
+    CHECK_FALSE(dispatch(replace, invalid).empty());
+  CHECK(driver.sharedSets == 1);
+  CHECK(driver.sharedTarget == prior);
+  driver.sharedError = "native-shader-pipeline-rejected";
+  CHECK(dispatch(replace, valid) == driver.sharedError);
+  CHECK(driver.sharedTarget == prior);
+  driver.sharedError.clear();
+  REQUIRE(dispatch(replace, valid).empty());
+  CHECK(driver.sharedTarget == target);
+  REQUIRE(dispatch(replace, payload(original, prior)).empty());
+  CHECK(driver.sharedTarget == prior);
+
+  const bytebuf clear = payload(original, ResourceId(), true);
+  bytebuf clearTrailing = clear, clearTruncated = clear;
+  clearTrailing.push_back(1);
+  clearTruncated.pop_back();
+  for(const bytebuf &invalid : {bytebuf(), clearTrailing, clearTruncated, valid,
+                              payload(ResourceId(), ResourceId(), true)})
+    CHECK_FALSE(dispatch(remove, invalid).empty());
+  CHECK(driver.sharedRemoves == 0);
+  driver.sharedError = "native-shader-restore-rejected";
+  CHECK(dispatch(remove, clear) == driver.sharedError);
+  CHECK(driver.sharedTarget == prior);
+  driver.sharedError.clear();
+  REQUIRE(dispatch(remove, clear).empty());
+  CHECK(driver.sharedTarget == ResourceId());
+  REQUIRE(response.empty());
+  driver.version = 0;
+  CHECK(dispatch(replace, valid) == "replayControlDriverUnsupported");
+  CHECK(driver.sharedTarget == ResourceId());
+}
+
+TEST_CASE("Remote event Shader controls preserve exact targets and reject incomplete mutations",
+          "[replay][proxy][event-shader]")
+{
+  ReplayControlTestDriver driver;
+  bytebuf response;
+  auto dispatch = [&](ReplayControlOperation op, const bytebuf &request) {
+    return DispatchReplayControl(&driver, ReplayControlProtocolRevision, uint32_t(op), request, response);
+  };
+  uint32_t event = 1234, output = 3;
+  ShaderStage stage = ShaderStage::Pixel;
+  ResourceId original = ResourceIDGen::GetNewUniqueID(), target = ResourceIDGen::GetNewUniqueID();
+  WriteSerialiser writer(new StreamWriter(128), Ownership::Stream);
+  writer.Serialise("eventId"_lit, event);
+  writer.Serialise("stage"_lit, stage);
+  writer.Serialise("original"_lit, original);
+  writer.Serialise("replacement"_lit, target);
+  writer.Serialise("outputTarget"_lit, output);
+  const bytebuf valid = ControlPayload(writer);
+  REQUIRE(dispatch(ReplayControlOperation::SetEventShader, valid).empty());
+  CHECK(driver.shader.active);
+  CHECK(driver.shader.eventId == event);
+  CHECK(driver.shader.expectedOriginal == original);
+  CHECK(driver.shader.replacement == target);
+  CHECK(driver.shader.outputTarget == 3);
+  bytebuf trailing = valid, truncated = valid;
+  trailing.push_back(1); truncated.pop_back();
+  CHECK_FALSE(dispatch(ReplayControlOperation::SetEventShader, trailing).empty());
+  CHECK_FALSE(dispatch(ReplayControlOperation::SetEventShader, truncated).empty());
+  CHECK(driver.shaderSets == 1);
+  CHECK_FALSE(driver.shader.independentFloatOutput);
+  CHECK_FALSE(dispatch(ReplayControlOperation::SetEventShaderFloatOutput, truncated).empty());
+  CHECK(driver.shaderSets == 1);
+  REQUIRE(dispatch(ReplayControlOperation::SetEventShaderFloatOutput, valid).empty());
+  CHECK(driver.shader.independentFloatOutput);
+  driver.preview.resourceId = ResourceIDGen::GetNewUniqueID();
+  driver.preview.width = 128;
+  driver.preview.height = 64;
+  driver.preview.format.compCount = 4;
+  driver.preview.format.compByteWidth = 4;
+  driver.preview.format.compType = CompType::Float;
+  WriteSerialiser previewRequest(new StreamWriter(128), Ownership::Stream);
+  previewRequest.Serialise("eventId"_lit, event);
+  previewRequest.Serialise("stage"_lit, stage);
+  REQUIRE(dispatch(ReplayControlOperation::EventShaderPreviewTexture, ControlPayload(previewRequest)).empty());
+  ReadSerialiser previewResponse(new StreamReader(response), Ownership::Stream);
+  TextureDescription received;
+  previewResponse.Serialise("texture"_lit, received);
+  REQUIRE(ControlPayloadFinished(previewResponse));
+  CHECK(received.resourceId == driver.preview.resourceId);
+  CHECK(received.width == 128);
+  CHECK(received.format.compByteWidth == 4);
+  driver.shaderError = "native-pipeline-creation-failed";
+  CHECK(dispatch(ReplayControlOperation::SetEventShader, valid) == driver.shaderError);
+  CHECK(driver.shader.replacement == target);
+  WriteSerialiser eventWriter(new StreamWriter(128), Ownership::Stream);
+  eventWriter.Serialise("eventId"_lit, event);
+  CHECK(dispatch(ReplayControlOperation::ApplyEventShaders, ControlPayload(eventWriter)) == driver.shaderError);
+  CHECK(driver.shaderApplies == 1);
+  CHECK_FALSE(dispatch(ReplayControlOperation::RestoreEventShaders, {1}).empty());
+  CHECK(driver.shaderRestores == 0);
+  REQUIRE(dispatch(ReplayControlOperation::RestoreEventShaders, {}).empty());
+  CHECK(driver.shaderRestores == 1);
+  WriteSerialiser resourceWriter(new StreamWriter(128), Ownership::Stream);
+  resourceWriter.Serialise("replacement"_lit, target);
+  REQUIRE(dispatch(ReplayControlOperation::ClearEventShaderResource, ControlPayload(resourceWriter)).empty());
+  CHECK_FALSE(driver.shader.active);
+  CHECK(driver.shaderClears == 1);
+}
 
 TEST_CASE("Remote replay control validates version and complete payloads",
           "[replay][proxy][checkpoint][checkpoints]")

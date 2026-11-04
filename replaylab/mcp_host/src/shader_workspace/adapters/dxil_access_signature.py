@@ -147,6 +147,7 @@ class _CBufferRecord:
     lower_bind: int
     bind_count: int
     byte_size: int
+    resource_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -237,7 +238,7 @@ def _typed_integer(value: str, llvm_type: str, label: str) -> int:
     return int(match.group(1), 10)
 
 
-def _parse_cbuffer_records(lines: list[str]) -> dict[int, _CBufferRecord]:
+def _parse_cbuffer_records(lines: list[str], allow_binding_arrays=False) -> dict[int, _CBufferRecord]:
     nodes: dict[int, str] = {}
     resources: str | None = None
     for line in lines:
@@ -294,10 +295,12 @@ def _parse_cbuffer_records(lines: list[str]) -> dict[int, _CBufferRecord]:
         lower = _typed_integer(values[4], "i32", "CBuffer lower binding")
         count = _typed_integer(values[5], "i32", "CBuffer binding count")
         byte_size = _typed_integer(values[6], "i32", "CBuffer byte size")
-        if count != 1:
+        if count != 1 and not allow_binding_arrays:
             raise DxilAccessSignatureError(
                 "CBuffer binding arrays are not safe for ambiguous-layout repair"
             )
+        if not 1 <= count <= MAX_CBUFFER_RECORDS or lower + count > 0x100000000:
+            raise DxilAccessSignatureError("CBuffer binding range is outside its limit")
         if not 1 <= byte_size <= MAX_CBUFFER_BYTES:
             raise DxilAccessSignatureError("CBuffer byte size is outside its limit")
         binding = (space, lower)
@@ -310,9 +313,14 @@ def _parse_cbuffer_records(lines: list[str]) -> dict[int, _CBufferRecord]:
             raise DxilAccessSignatureError(
                 "DXIL CBuffer resource IDs are not in fixed range order"
             )
-        record = _CBufferRecord(resource_id, space, lower, count, byte_size)
+        record = _CBufferRecord(resource_id, space, lower, count, byte_size, values[1])
         records[resource_id] = record
         bindings.add(binding)
+    ranges = sorted((value.space, value.lower_bind, value.lower_bind + value.bind_count)
+                    for value in records.values())
+    for previous, current in zip(ranges, ranges[1:]):
+        if previous[0] == current[0] and current[1] < previous[2]:
+            raise DxilAccessSignatureError("overlapping DXIL CBuffer binding ranges")
     return records
 
 
@@ -696,6 +704,111 @@ def _index_legacy_users(lines, legacy_loads):
                 users.setdefault(value, []).append(index)
                 seen.add(value)
     return codes, users
+
+
+def extract_dxil_annotated_cbuffer_bindings(source, expected_sha256=None):
+    """Prove source type annotations independently of optional access analysis.
+
+    This never proves access equivalence or repairs a layout. It only prevents
+    a complete native reflection from being downgraded when the narrower
+    access parser cannot handle a valid program (for example CBV arrays).
+    """
+    if not isinstance(source, bytes) or not 1 <= len(source) <= MAX_IR_BYTES:
+        raise DxilAccessSignatureError("DXIL type evidence size is outside its limit")
+    digest = hashlib.sha256(source).hexdigest()
+    if expected_sha256 is not None and (
+            not isinstance(expected_sha256, str) or
+            _SHA256_RE.fullmatch(expected_sha256) is None or digest != expected_sha256):
+        raise DxilAccessSignatureError("DXIL type evidence hash mismatch")
+    try:
+        text = source.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise DxilAccessSignatureError("DXIL type evidence is not strict UTF-8")
+    if "\x00" in text or _DXIL_TRIPLE_RE.search(text) is None:
+        raise DxilAccessSignatureError("DXIL type evidence has no valid target triple")
+    lines = text.splitlines()
+    if len(lines) > MAX_IR_LINES or any(len(line) > MAX_LINE_CHARS for line in lines):
+        raise DxilAccessSignatureError("DXIL type evidence exceeds text bounds")
+    records = _parse_cbuffer_records(lines, allow_binding_arrays=True)
+    nodes, structures = {}, {}
+    roots = None
+    for line in lines:
+        code = _strip_comment(line).strip()
+        named = re.fullmatch(r"!dx\.typeAnnotations\s*=\s*(!\{.*\})", code)
+        if named is not None:
+            if roots is not None:
+                raise DxilAccessSignatureError("duplicate DXIL type annotation root")
+            roots = _metadata_items(named.group(1), "DXIL type annotations")
+        node = re.fullmatch(r"!(\d+)\s*=\s*(!\{.*\})", code)
+        if node is not None:
+            identity = int(node.group(1), 10)
+            if identity in nodes or len(nodes) >= MAX_METADATA_NODES:
+                raise DxilAccessSignatureError("duplicate or excessive DXIL metadata")
+            nodes[identity] = node.group(2)
+        structure = re.fullmatch(r"(" + _SSA + r")\s*=\s*type\s*\{(.*)\}", code)
+        if structure is not None:
+            name, body = structure.groups()
+            if name in structures:
+                raise DxilAccessSignatureError("duplicate DXIL structure type")
+            structures[name] = _split_items(body, "DXIL structure") if body.strip() else []
+    if roots is None:
+        return ()
+
+    def metadata(value):
+        identity = _metadata_ref(value, "DXIL type annotation")
+        if identity not in nodes:
+            raise DxilAccessSignatureError("DXIL type annotation node is missing")
+        return _metadata_items(nodes[identity], "DXIL type annotation")
+
+    annotations = {}
+    for root in roots:
+        items = metadata(root)
+        kind = _typed_integer(items[0], "i32", "DXIL annotation kind")
+        if kind != 0:
+            continue
+        if len(items) % 2 != 1:
+            raise DxilAccessSignatureError("DXIL structure annotations are truncated")
+        for index in range(1, len(items), 2):
+            match = re.fullmatch(r"(" + _SSA + r")\s+undef", items[index])
+            if match is None:
+                raise DxilAccessSignatureError("DXIL annotated structure type is invalid")
+            name = match.group(1)
+            if name in annotations:
+                raise DxilAccessSignatureError("duplicate DXIL structure annotation")
+            fields = metadata(items[index + 1])
+            byte_size = _typed_integer(fields[0], "i32", "DXIL annotated byte size")
+            shape = structures.get(name)
+            if shape is None or len(fields) - 1 != len(shape):
+                raise DxilAccessSignatureError("DXIL structure annotation contradicts its fields")
+            for field in fields[1:]:
+                values = metadata(field)
+                if len(values) % 2:
+                    raise DxilAccessSignatureError("DXIL field annotation is truncated")
+                offsets = []
+                for tag_index in range(0, len(values), 2):
+                    tag = _typed_integer(values[tag_index], "i32", "DXIL field annotation tag")
+                    if tag == 3:
+                        offsets.append(_typed_integer(values[tag_index + 1], "i32", "DXIL field offset"))
+                if len(offsets) != 1 or offsets[0] > byte_size:
+                    raise DxilAccessSignatureError("DXIL field offset is missing or outside its type")
+            annotations[name] = byte_size
+    result = []
+    for record in records.values():
+        token = record.resource_type
+        array = re.fullmatch(r"\[\s*(\d+)\s+x\s+(" + _SSA + r")\s*\]\s*\*\s+undef", token)
+        scalar = re.fullmatch(r"(" + _SSA + r")\s*\*\s+undef", token)
+        if array is not None and int(array.group(1), 10) == record.bind_count:
+            name = array.group(2)
+        elif scalar is not None and record.bind_count == 1:
+            name = scalar.group(1)
+        else:
+            raise DxilAccessSignatureError("DXIL CBuffer type contradicts its binding range")
+        if name not in annotations:
+            continue
+        if annotations[name] != record.byte_size:
+            raise DxilAccessSignatureError("DXIL CBuffer annotation size contradicts reflection")
+        result.append((record.space, record.lower_bind, record.byte_size))
+    return tuple(sorted(result))
 
 
 def extract_dxil_cbuffer_evidence(source, expected_sha256=None):

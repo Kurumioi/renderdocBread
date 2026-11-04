@@ -1,10 +1,13 @@
-# ReplayLab MCP Server
+# Bread MCP Server
+
+Bread is the user-visible brand. Legacy `ReplayLab` executable names, protocol keys,
+module names and storage paths below are retained for compatibility.
 
 **English** | [中文](README_CN.md)
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for RenderDocUltra — enabling AI agents to analyze GPU captures, inspect rendering state, extract shader evidence, use host-registered external shader tools, auto-match textures, and profile performance. Decompiled source is a candidate representation, not guaranteed original HLSL/GLSL.
 
-This directory contains ReplayLab's Python 3.10+ sidecar, not a qrenderdoc
+This directory contains Bread's Python 3.10+ sidecar, not a qrenderdoc
 plugin. RenderDocUltra owns the UI and lifecycle in native C++ and loads its
 first-party Python bridge from the fixed application path
 `integrations/replaylab/python/renderdoc_mcp_bridge`. The bridge is selected by
@@ -22,7 +25,7 @@ stdio adapter for its current task. Capture-bound AgentHost work—including
 deepagents children, ACP, and Codex app-server—uses a filtered task-scoped MCP
 route to this same Host.
 
-## Features (141 Tools)
+## Features and tools
 
 ### 📦 Capture Management
 | Tool | Description |
@@ -91,15 +94,15 @@ attachments only; channel semantics still require validated Shader evidence.
 | `plan_shader_recovery` | Classify a failure by fixed detect/decompile/compile/ABI phase and expose only hash-bound untried route pairs for AI selection |
 | `run_shader_toolchain_round_trip_smoke` | Execute the fixed route, exact physical target profile, format checks, and configured validators without applying to RenderDoc |
 | `get_current_shader_representation` | Persist a non-empty, hash-bound current-event explanation for any Shader API RenderDoc can reflect; explanatory/binary lanes can never compile or apply |
-| `prepare_shader_workspace` | Export one event/stage, require a unique physical Shader, run the preferred registered route, automatically traverse its finite hash-bound alternate frontier, and publish a provisional reconstruction scaffold from native evidence if all decompilers fail but a compiler exists |
+| `prepare_shader_workspace` | Export one event/stage, require a unique physical Shader, and return the bound workspace and hash-bound route inventory without running reconstruction by default. `attempt_reconstruction=true` explicitly requests the former one-shot decompile and RenderDoc fallback |
 | `create_shader_workspace` | Create a workspace from an existing catalog and exact `shaderKey` |
 | `decompile_shader_workspace` | Run the workspace-bound decompiler once without overwriting edited source |
 | `get_shader_workspace_representation` | Return executable routed text, otherwise materialize RenderDoc IR or an exact binary fallback instead of a blank editor; it never repeats a route already recorded as failed or silently changes the requested editable format |
 | `promote_shader_workspace_explanation` | Explicitly promote a hash-reviewed `explanation/promoted.hlsl`; still requires compile, ABI validation, and apply authorization |
 | `compile_shader_workspace` | Compile/assemble the route-bound edited text to an auditable candidate; **never applies it to RenderDoc** |
 | `get_shader_workspace_status` | Validate hashes and report source/revision/candidate state |
-| `begin_shader_workspace_organization` | Compile and freshly ABI-check untouched HLSL, preserve the decompiler bytes, then create fixed proposal/analysis/flowchart files that only AI may edit |
-| `review_shader_workspace_organization` | Compile and freshly ABI-check the proposal; promote it only when executable `codeSha256` exactly matches the same-route baseline, otherwise restore baseline and retain provisional evidence |
+| `begin_shader_workspace_organization` | Open or resume a durable draft from the current workspace source. Copy it to an editable proposal and create optional analysis files; `restart=true` starts a fresh Bread-managed draft. This step does not compile, run ABI checks, generate a flow graph, or apply anything to replay |
+| `finish_shader_workspace_organization` | Save the exact proposal as editable workspace source without compiling by default. Optional validation checks captured-output equivalence; optional replay apply compiles or reuses the current candidate and performs fresh ABI/target checks. A flow graph can be generated from the saved source; live edit starts only after successful apply |
 | `validate_shader_workspace_candidate` | Freshly reflect an exact supported candidate (D3D11/DXBC or D3D12/DXBC|DXIL) and require a complete ABI match |
 | `apply_shader_workspace_candidate` | Revalidate ABI plus live capture/event/original bytes, then apply an event-scoped D3D11 override |
 | `rollback_shader_workspace_override` | Clear one event-scoped override and free its owned target shader |
@@ -129,6 +132,17 @@ Distinct original RIDs and foreign Editor replacements are never
 silently merged or taken over. D3D11 dynamic linkage, D3D12 root constants,
 ray state objects and indirect root-CBV mutation, Vulkan/OpenGL override and
 remote replay remain fail-closed.
+Shader draft edits can be saved and inspected without compiling the entire
+program after each change. The default finish saves the proposal as editable
+source and does not prove compilation or replay compatibility. The Agent can
+request strict validation or apply separately; apply performs fresh physical
+checks. A receipt does not prove that the code has become readable. This finish
+tool generates a flow graph only when requested after saving the source; graph
+generation failure does not undo a valid save.
+The default finish call does not register a project workspace, replace replay
+code, or start live edit. `start_live_edit=true` takes effect only after an
+explicit successful `apply_shared_resource=true` replacement.
+
 The watcher accepts no command, executable, arguments, registry, or environment.
 Exact-profile extraction, fail-closed DXBC/DXIL/SPIR-V routing, trusted config
 generation, validators, and round-trip smoke reports are documented in
@@ -138,20 +152,20 @@ of the original high-level source. An optional pinned portable
 `fxc.exe` on the destination machine; it provides no decompiler, includes, or
 ABI exemption.
 
-With no explicit editable format, automatic cross-format fallback occurs only
-when the preferred high-level route is statically incomplete during planning.
-If a selected route later fails during decompilation or its untouched baseline
-compile probe, preparation automatically tries each listed same-format route
-pair once in an isolated sibling workspace. Exhausting that frontier does not
-end a compiler-capable task: RenderDoc/native binary evidence and a hash-bound
-provisional source scaffold are published for Agent reconstruction. Promotion,
-compilation and fresh replay ABI validation remain mandatory. SPIR-V assembly
-is eligible only after its pinned workspace tools and validator execute.
+With no explicit editable format, static planning selects a format from the
+available high-level and native-IR routes. Preparation does not run a route
+probe, decompiler, RenderDoc reverse disassembly, or provisional source creation
+unless `attempt_reconstruction=true` is explicitly supplied. The Agent can
+inspect the returned route inventory, call `decompile_shader_workspace`, select
+one registered pair with `try_shader_workspace_recovery_candidate`, or request
+RenderDoc IR with `get_shader_workspace_representation`. Promotion, compilation
+and fresh replay ABI validation remain separate operations. SPIR-V assembly
+still requires its pinned tools and validator before publishing editable source.
 
 A CBuffer appearing in the reflection UI proves that a binding, total size, or
 some display fields are visible; it does not prove complete physical member
 offset/type/stride evidence. Missing fields or a reflected type that contradicts
-actual DXIL loads is reported as `ambiguous`. ReplayLab then uses the strict
+actual DXIL loads is reported as `ambiguous`. Bread then uses the strict
 DXIL physical access signature (space/bind, byte ranges, load types and counts)
 for ABI alignment; unknown semantic names remain provisional and AI may not
 invent members. `get_active_capture_catalog_binding_status` reports the exact
@@ -159,9 +173,9 @@ hash-bound full-catalog revision without causing a subset export.
 
 ### 🗃️ Multi-capture replay projects
 
-An idle ReplayLab/qrenderdoc launch now opens the `ReplayLab Projects` home
+An idle Bread/qrenderdoc launch now opens the `Projects` home
 instead of an empty capture window. From there, or later through
-`File -> ReplayLab Projects…`, you can create a project at a chosen path, add or
+`File -> Projects…`, you can create a project at a chosen path, add or
 forget an existing portable project without deleting its files, configure its
 asset root, add/remove RDC references, and open a frame from its bounded
 thumbnail library. Direct `.rdc`, replay-host, target-control,
@@ -228,7 +242,7 @@ trust boundary and current limitations.
 
 qrenderdoc now includes a native MVP: open a Pipeline State CBuffer variable
 view, right-click a supported field, and choose
-`ReplayLab -> Expose as Material Parameter`. The dock shows the complete
+`Expose as Material Parameter`. The dock shows the complete
 physical identity, coalesces typed scalar/vector text edits before replaying the
 exact event, and provides per-CBuffer/all-session rollback. Semantic sliders and
 colour pickers are not implemented yet. D3D12 root constants, ray state
@@ -249,6 +263,14 @@ diagnostic conveniences. They are not part of the managed resource-export route:
 they do not preserve every vertex input, exact texture view/sampler/CBuffer evidence,
 explicit basis policy, atomic publication, or target validation. See
 [Resource export toolchain](../docs/RESOURCE_EXPORT_TOOLCHAIN.md).
+
+### Unity project connection
+
+`start_unity_project_connection` prepares the bundled MCP/Editor packages and opens
+or reuses the matching graphical Editor. `call_unity_project_tool` automatically
+recovers missing or interrupted project connections; follow the returned job and
+inspect actual state before repeating a write whose reply was lost. See
+[Unity connection setup and recovery](docs/UNITY_CONNECTION.md).
 
 ### 🧭 Unpacked Asset Intelligence and UEX Delivery
 | Tool | Description |
@@ -445,9 +467,9 @@ from shader variable names and texture formats:
 ## Architecture
 
 ```
-[AI / IDE] ←stdio/HTTP→ [ReplayLab sidecar] ←file IPC→ [qrenderdoc built-in integration]
+[AI / IDE] ←stdio/HTTP→ [Bread sidecar] ←file IPC→ [qrenderdoc built-in integration]
                            Python 3.10+                     native C++ lifecycle +
-                          141 MCP tools                     embedded Python bridge
+                          MCP tool catalog                   embedded Python bridge
                            ipc_client.py                    pyrenderdoc API
 ```
 
@@ -462,7 +484,7 @@ replaylab/
     ├── README_CN.md            # Chinese docs
     └── src/
         ├── __init__.py
-        ├── server.py           # MCP tool definitions (141 tools, FastMCP)
+        ├── server.py           # MCP tool definitions (FastMCP)
         ├── rd_wrapper.py       # RenderDoc API wrapper (local mode, backup)
         └── ipc_client.py       # File IPC client for RenderDoc bridge
 
@@ -470,7 +492,7 @@ Build output:
   <qrenderdoc-app>/integrations/replaylab/python/renderdoc_mcp_bridge/
 ```
 
-- **`server.py`** — Registers 141 MCP tools, communicates via stdio with AI clients
+- **`server.py`** — Registers MCP tools and communicates via stdio with AI clients
 - **`ipc_client.py`** — File-based IPC to bridge Python 3.10+ ↔ RenderDoc's Python 3.6
 - **`rd_wrapper.py`** — Direct RenderDoc API wrapper (backup, for same-Python scenarios)
 - **Built-in bridge** — Runs inside RenderDoc, captures UI context/intents, and executes bounded GPU replay calls via IPC

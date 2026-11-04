@@ -901,14 +901,14 @@ def render_event_flow_diagram(graph: EventFlowGraphIR) -> EventFlowDiagramResult
         '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" '
         'viewBox="0 0 %d %d" role="img" aria-labelledby="title description">'
         % (width, height, width, height),
-        '<title id="title">ReplayLab Event Flow Diagram</title>',
+        '<title id="title">Bread Event Flow Diagram</title>',
         '<desc id="description">Left-to-right Host-validated Event flow. Shapes, labels, '
         'line patterns, and a legend carry meaning independently of color.</desc>',
         '<metadata>schema=%s;theme=%s;layout=LR;graphIrSha256=%s</metadata>'
         % (DIAGRAM_METADATA_SCHEMA, THEME_EVIDENCE_NEUTRAL_V1, graph_digest),
         '<rect x="0" y="0" width="%d" height="%d" fill="#ffffff" />'
         % (width, height),
-        '<text x="24" y="36" class="diagram-title">ReplayLab Event Flow</text>',
+        '<text x="24" y="36" class="diagram-title">Bread Event Flow</text>',
         '<text x="24" y="61" class="diagram-subtitle">theme=evidence-neutral-v1 · '
         'layout=LR · nodes=%d · edges=%d</text>'
         % (len(graph.nodes), len(graph.edges)),

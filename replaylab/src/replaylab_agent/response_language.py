@@ -8,6 +8,8 @@ supplied by qrenderdoc.
 
 from __future__ import annotations
 
+import locale
+import os
 import re
 from collections.abc import Iterable
 from typing import Literal
@@ -182,9 +184,24 @@ def normalize_response_locale(value: str | None) -> ResponseLanguage:
     """Reduce a qrenderdoc/system locale to one shipped response language."""
 
     normalized = str(value or "").strip().replace("-", "_").casefold()
-    if normalized == "zh" or normalized.startswith("zh_"):
+    if (normalized == "zh" or normalized.startswith("zh_")
+            or normalized.startswith("chinese")):
         return "zh_CN"
     return "en"
+
+
+def configured_interface_locale() -> ResponseLanguage:
+    """Use qrenderdoc's resolved UI language, falling back to the OS locale.
+
+    qrenderdoc exports REPLAYLAB_RESPONSE_LOCALE after resolving its ``system``
+    setting. Standalone API/ACP runs may not have that environment variable.
+    This preference is independent of the language of a particular chat reply.
+    """
+
+    configured = os.environ.get("REPLAYLAB_RESPONSE_LOCALE", "").strip()
+    if configured and configured.casefold() != "system":
+        return normalize_response_locale(configured)
+    return normalize_response_locale(locale.getlocale()[0] or os.environ.get("LANG"))
 
 
 def infer_response_language(
@@ -399,8 +416,10 @@ def response_language_instruction(language: str) -> str:
             "sentence, heading, question, status explanation, and final summary in clear, "
             "concise Simplified Chinese. Do not mix English prose into the Chinese answer. "
             "Keep only necessary technical identifiers and source tokens unchanged, including "
-            "RenderDoc, ReplayLab, API, EID, DXIL, HLSL, CBuffer, graphics-stage abbreviations, "
-            "paths, code, hashes, resource names, and protocol IDs. Translate Shader as 着色器 "
+            "RenderDoc, Bread, API, EID, DXIL, HLSL, CBuffer, graphics-stage abbreviations, "
+            "paths, code, hashes, resource names, and protocol IDs. Preserve ReplayLab only "
+            "when it is part of a legacy path, executable, module, class, environment variable, "
+            "schema, protocol ID, or exact MCP tool spelling. Translate Shader as 着色器 "
             "in ordinary prose, preserving it only inside code or an exact source/resource name. "
             "Lead with the practical outcome. Do not expose "
             "internal workflow, child-Agent, receipt, ledger, retry-history, or blocker-code "
@@ -428,6 +447,7 @@ __all__ = [
     "explicit_response_language",
     "infer_response_language",
     "normalize_response_locale",
+    "configured_interface_locale",
     "repair_choice_presentation",
     "repair_response_presentation",
     "response_language_instruction",

@@ -341,6 +341,10 @@ void D3D11Replay::Shutdown()
   m_CheckpointResources.clear();
   ClearEventCBufferOverrides();
   ClearEventShaderOverrides();
+  ReleaseEventShaderPreviews();
+  for(auto &item : m_EventShaderBlendStates)
+    SAFE_RELEASE(item.second);
+  m_EventShaderBlendStates.clear();
 
   for(size_t i = 0; i < m_ProxyResources.size(); i++)
     m_ProxyResources[i]->Release();
@@ -4017,9 +4021,14 @@ static void BindEventOverrideCBuffer(WrappedID3D11DeviceContext *context, Shader
 }
 
 rdcstr D3D11Replay::SetEventShaderOverride(uint32_t eventId, ShaderStage stage,
-                                           ResourceId expectedOriginal, ResourceId replacement)
+                                           ResourceId expectedOriginal, ResourceId replacement,
+                                           uint32_t outputTarget, bool independentFloatOutput)
 {
   RestoreEventShaderOverrides();
+  if(outputTarget != ~0U && (stage != ShaderStage::Pixel || outputTarget >= 8))
+    return "A blend bypass requires a valid pixel Shader color target";
+  if(independentFloatOutput && (stage != ShaderStage::Pixel || outputTarget >= 8))
+    return "An independent FP32 preview requires a pixel Shader color target";
 
   if(GetEventOverrideStage(m_pImmediateContext->GetCurrentPipelineState(), stage) == NULL)
     return StringFormat::Fmt("Shader stage %s is not supported by D3D11 event overrides",
@@ -4096,6 +4105,8 @@ rdcstr D3D11Replay::SetEventShaderOverride(uint32_t eventId, ShaderStage stage,
   configured.expectedOriginal = expectedOriginal;
   configured.replacementId = replacement;
   configured.shaderExtSlot = shaderExtSlot;
+  configured.outputTarget = outputTarget;
+  configured.independentFloatOutput = independentFloatOutput;
 
   ClearPostVSCache();
   return {};
@@ -4200,7 +4211,107 @@ rdcstr D3D11Replay::ApplyEventShaderOverrides(uint32_t eventId)
                                ToStr(item.second->replacementId).c_str());
   }
 
+  uint32_t outputTarget = ~0U;
+  bool independentFloatOutput = false;
+  for(const auto &item : pending)
+  {
+    if(item.second->outputTarget != ~0U)
+      outputTarget = item.second->outputTarget;
+    independentFloatOutput |= item.second->independentFloatOutput;
+  }
+  EventShaderPreview *preview = NULL;
+  if(independentFloatOutput)
+  {
+    rdcstr error = PrepareEventShaderPreview(eventId, outputTarget, preview);
+    if(!error.empty())
+      return error;
+  }
+  if(outputTarget != ~0U)
+  {
+    if(state->OM.RenderTargets[outputTarget] == NULL)
+      return "The requested debug color target is not bound";
+    const auto key = std::make_pair(GetIDForDeviceChild(state->OM.BlendState), outputTarget);
+    auto cached = m_EventShaderBlendStates.find(key);
+    if(cached == m_EventShaderBlendStates.end())
+    {
+      ID3D11BlendState *variant = NULL;
+      HRESULT hr = E_FAIL;
+      if(state->OM.BlendState && CanQuery<ID3D11BlendState1>(state->OM.BlendState))
+      {
+        D3D11_BLEND_DESC1 desc = {};
+        ((WrappedID3D11BlendState1 *)state->OM.BlendState)->GetDesc1(&desc);
+        if(!desc.IndependentBlendEnable)
+          for(size_t i = 1; i < ARRAY_COUNT(desc.RenderTarget); i++)
+            desc.RenderTarget[i] = desc.RenderTarget[0];
+        desc.IndependentBlendEnable = TRUE;
+        desc.AlphaToCoverageEnable = FALSE;
+        desc.RenderTarget[outputTarget].BlendEnable = FALSE;
+        desc.RenderTarget[outputTarget].LogicOpEnable = FALSE;
+        desc.RenderTarget[outputTarget].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        ID3D11BlendState1 *state1 = NULL;
+        hr = m_pDevice->CreateBlendState1(&desc, &state1);
+        variant = state1;
+      }
+      else
+      {
+        D3D11_BLEND_DESC desc = {};
+        if(state->OM.BlendState)
+          state->OM.BlendState->GetDesc(&desc);
+        else
+        {
+          for(auto &target : desc.RenderTarget)
+          {
+            target.SrcBlend = target.SrcBlendAlpha = D3D11_BLEND_ONE;
+            target.DestBlend = target.DestBlendAlpha = D3D11_BLEND_ZERO;
+            target.BlendOp = target.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            target.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+          }
+        }
+        if(!desc.IndependentBlendEnable)
+          for(size_t i = 1; i < ARRAY_COUNT(desc.RenderTarget); i++)
+            desc.RenderTarget[i] = desc.RenderTarget[0];
+        desc.IndependentBlendEnable = TRUE;
+        desc.AlphaToCoverageEnable = FALSE;
+        desc.RenderTarget[outputTarget].BlendEnable = FALSE;
+        desc.RenderTarget[outputTarget].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        hr = m_pDevice->CreateBlendState(&desc, &variant);
+      }
+      if(FAILED(hr) || !variant)
+        return "Creating the event Shader blend state failed";
+      if(m_EventShaderBlendStates.size() >= 64)
+      {
+        for(auto &item : m_EventShaderBlendStates)
+          SAFE_RELEASE(item.second);
+        m_EventShaderBlendStates.clear();
+      }
+      cached = m_EventShaderBlendStates.insert({key, variant}).first;
+    }
+    m_EventShaderPreviousBlend = state->OM.BlendState;
+    IntAddRef(m_EventShaderPreviousBlend);
+    memcpy(m_EventShaderPreviousBlendFactor, state->OM.BlendFactor, sizeof(m_EventShaderPreviousBlendFactor));
+    m_EventShaderPreviousSampleMask = state->OM.SampleMask;
+    m_EventShaderBlendApplied = true;
+    m_pImmediateContext->OMSetBlendState(cached->second, state->OM.BlendFactor, state->OM.SampleMask);
+  }
+
   m_AppliedEventShaderOverrides.reserve(pending.size());
+  if(preview)
+  {
+    m_EventShaderPreviousTargetCount = 0;
+    for(UINT i = 0; i < 8; i++)
+    {
+      m_EventShaderPreviousTargets[i] = state->OM.RenderTargets[i];
+      IntAddRef(m_EventShaderPreviousTargets[i]);
+      if(m_EventShaderPreviousTargets[i])
+        m_EventShaderPreviousTargetCount = i + 1;
+    }
+    m_EventShaderPreviousDepth = state->OM.DepthView;
+    IntAddRef(m_EventShaderPreviousDepth);
+    m_EventShaderTargetsApplied = true;
+    m_pImmediateContext->OMSetRenderTargetsAndUnorderedAccessViews(
+        m_EventShaderPreviousTargetCount, preview->views, preview->depthView,
+        0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, NULL, NULL);
+  }
 
   for(const std::pair<ShaderStage, const EventShaderOverride *> &item : pending)
   {
@@ -4228,6 +4339,28 @@ rdcstr D3D11Replay::ApplyEventShaderOverrides(uint32_t eventId)
 
 void D3D11Replay::RestoreEventShaderOverrides()
 {
+  if(m_EventShaderTargetsApplied)
+  {
+    m_pImmediateContext->OMSetRenderTargetsAndUnorderedAccessViews(
+        m_EventShaderPreviousTargetCount, m_EventShaderPreviousTargets, m_EventShaderPreviousDepth,
+        0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, NULL, NULL);
+    for(ID3D11RenderTargetView *&view : m_EventShaderPreviousTargets)
+    {
+      IntRelease(view);
+      view = NULL;
+    }
+    IntRelease(m_EventShaderPreviousDepth);
+    m_EventShaderPreviousDepth = NULL;
+    m_EventShaderTargetsApplied = false;
+  }
+  if(m_EventShaderBlendApplied)
+  {
+    m_pImmediateContext->OMSetBlendState(m_EventShaderPreviousBlend,
+        m_EventShaderPreviousBlendFactor, m_EventShaderPreviousSampleMask);
+    IntRelease(m_EventShaderPreviousBlend);
+    m_EventShaderPreviousBlend = NULL;
+    m_EventShaderBlendApplied = false;
+  }
   for(size_t i = m_AppliedEventShaderOverrides.size(); i > 0; --i)
   {
     AppliedEventShaderOverride &applied = m_AppliedEventShaderOverrides[i - 1];
@@ -4241,6 +4374,235 @@ void D3D11Replay::RestoreEventShaderOverrides()
   }
 
   m_AppliedEventShaderOverrides.clear();
+}
+
+void D3D11Replay::ReleaseEventShaderPreviews()
+{
+  for(auto &item : m_EventShaderPreviews)
+  {
+    for(ID3D11RenderTargetView *view : item.second.views)
+      SAFE_RELEASE(view);
+    for(ID3D11Resource *resource : item.second.colors)
+      SAFE_RELEASE(resource);
+    SAFE_RELEASE(item.second.depthView);
+    SAFE_RELEASE(item.second.depth);
+  }
+  m_EventShaderPreviews.clear();
+}
+
+TextureDescription D3D11Replay::GetEventShaderPreviewTexture(uint32_t eventId, ShaderStage stage)
+{
+  auto binding = m_EventShaderOverrides.find({eventId, stage});
+  auto preview = m_EventShaderPreviews.find({eventId, stage});
+  if(binding == m_EventShaderOverrides.end() || !binding->second.independentFloatOutput ||
+     preview == m_EventShaderPreviews.end() ||
+     preview->second.outputTarget != binding->second.outputTarget)
+    return {};
+  return preview->second.description;
+}
+
+rdcstr D3D11Replay::PrepareEventShaderPreview(uint32_t eventId, uint32_t outputTarget,
+                                            EventShaderPreview *&preview)
+{
+  preview = NULL;
+  D3D11RenderState *state = m_pImmediateContext->GetCurrentPipelineState();
+  if(outputTarget >= 8 || !state->OM.RenderTargets[outputTarget])
+    return "The independent float preview attachment is not bound";
+  struct SourceReferences
+  {
+    ID3D11Resource *resources[9] = {};
+    ~SourceReferences()
+    {
+      for(ID3D11Resource *resource : resources)
+        SAFE_RELEASE(resource);
+    }
+  } sources;
+  ResourceId viewIds[8] = {}, resourceIds[9] = {};
+  for(UINT i = 0; i < 8; i++)
+  {
+    if(state->OM.RenderTargets[i])
+    {
+      state->OM.RenderTargets[i]->GetResource(&sources.resources[i]);
+      viewIds[i] = GetIDForDeviceChild(state->OM.RenderTargets[i]);
+    }
+    resourceIds[i] = GetIDForDeviceChild(sources.resources[i]);
+  }
+  if(state->OM.DepthView)
+    state->OM.DepthView->GetResource(&sources.resources[8]);
+  resourceIds[8] = GetIDForDeviceChild(sources.resources[8]);
+  ResourceId depthId = GetIDForDeviceChild(state->OM.DepthView);
+  const auto key = std::make_pair(eventId, ShaderStage::Pixel);
+  auto found = m_EventShaderPreviews.find(key);
+  bool matches = found != m_EventShaderPreviews.end();
+  if(matches)
+  {
+    matches = found->second.outputTarget == outputTarget && found->second.sourceDepthView == depthId;
+    for(UINT i = 0; matches && i < 8; i++)
+      matches = found->second.sourceViews[i] == viewIds[i];
+    for(UINT i = 0; matches && i < 9; i++)
+      matches = found->second.sourceResources[i] == resourceIds[i];
+  }
+  auto destroy = [](EventShaderPreview &entry) {
+    for(ID3D11RenderTargetView *view : entry.views)
+      SAFE_RELEASE(view);
+    for(ID3D11Resource *resource : entry.colors)
+      SAFE_RELEASE(resource);
+    SAFE_RELEASE(entry.depthView);
+    SAFE_RELEASE(entry.depth);
+  };
+  if(!matches && found != m_EventShaderPreviews.end())
+  {
+    destroy(found->second);
+    m_EventShaderPreviews.erase(found);
+  }
+  if(!matches)
+  {
+    EventShaderPreview entry;
+    entry.outputTarget = outputTarget;
+    entry.sourceDepthView = depthId;
+    for(UINT i = 0; i < 8; i++)
+      entry.sourceViews[i] = viewIds[i];
+    for(UINT i = 0; i < 9; i++)
+      entry.sourceResources[i] = resourceIds[i];
+    D3D11_TEXTURE2D_DESC descriptions[9] = {};
+    D3D11_RENDER_TARGET_VIEW_DESC selectedView = {};
+    state->OM.RenderTargets[outputTarget]->GetDesc(&selectedView);
+    for(UINT i = 0; i < 9; i++)
+    {
+      if(!sources.resources[i])
+        continue;
+      D3D11_RESOURCE_DIMENSION dimension;
+      sources.resources[i]->GetType(&dimension);
+      if(dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+        return "Independent float preview requires 2D or 2D-array attachments";
+      D3D11_TEXTURE2D_DESC desc = {};
+      ((ID3D11Texture2D *)sources.resources[i])->GetDesc(&desc);
+      if(desc.MiscFlags & D3D11_RESOURCE_MISC_TILED)
+        return "Independent float preview does not support tiled attachments";
+      desc.Usage = D3D11_USAGE_DEFAULT;
+      desc.CPUAccessFlags = 0;
+      desc.MiscFlags = 0;
+      desc.BindFlags = i == 8 ? D3D11_BIND_DEPTH_STENCIL : D3D11_BIND_RENDER_TARGET;
+      if(i == outputTarget)
+      {
+        UINT mip = 0, layers = 1;
+        switch(selectedView.ViewDimension)
+        {
+          case D3D11_RTV_DIMENSION_TEXTURE2D:
+            mip = selectedView.Texture2D.MipSlice;
+            selectedView.Texture2D.MipSlice = 0;
+            break;
+          case D3D11_RTV_DIMENSION_TEXTURE2DARRAY:
+            mip = selectedView.Texture2DArray.MipSlice;
+            layers = selectedView.Texture2DArray.ArraySize;
+            selectedView.Texture2DArray.MipSlice = 0;
+            selectedView.Texture2DArray.FirstArraySlice = 0;
+            break;
+          case D3D11_RTV_DIMENSION_TEXTURE2DMS: break;
+          case D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY:
+            layers = selectedView.Texture2DMSArray.ArraySize;
+            selectedView.Texture2DMSArray.FirstArraySlice = 0;
+            break;
+          default: return "The independent float preview view is unsupported";
+        }
+        if(mip >= desc.MipLevels || layers == 0 || layers > desc.ArraySize)
+          return "The independent float preview view has an invalid subresource range";
+        desc.Width = RDCMAX(1U, desc.Width >> mip);
+        desc.Height = RDCMAX(1U, desc.Height >> mip);
+        desc.MipLevels = 1;
+        desc.ArraySize = layers;
+        desc.Format = selectedView.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        desc.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+        UINT support = 0;
+        if(FAILED(m_pDevice->CheckFormatSupport(desc.Format, &support)) ||
+           !(support & D3D11_FORMAT_SUPPORT_RENDER_TARGET) ||
+           !(support & D3D11_FORMAT_SUPPORT_SHADER_LOAD))
+          return "This device cannot render and inspect an RGBA32F preview";
+        if(desc.SampleDesc.Count > 1)
+        {
+          UINT quality = 0;
+          if(FAILED(m_pDevice->CheckMultisampleQualityLevels(desc.Format, desc.SampleDesc.Count,
+                                                           &quality)) ||
+             quality == 0 || desc.SampleDesc.Quality >= quality)
+            return "RGBA32F does not support the captured multisample count and quality";
+        }
+      }
+      uint64_t bytes = 0;
+      for(UINT mip = 0; mip < desc.MipLevels; mip++)
+        bytes += GetByteSize(desc.Width, desc.Height, 1, desc.Format, mip);
+      bytes *= uint64_t(desc.ArraySize) * desc.SampleDesc.Count;
+      const uint64_t budget = 512ULL * 1024 * 1024;
+      if(bytes == 0 || bytes > budget || entry.bytes > budget - bytes)
+        return "Independent float preview attachments exceed the 512 MiB scratch budget";
+      entry.bytes += bytes;
+      descriptions[i] = desc;
+    }
+    uint64_t total = entry.bytes;
+    for(const auto &item : m_EventShaderPreviews)
+      total += item.second.bytes;
+    while(m_EventShaderPreviews.size() >= 8 || total > 512ULL * 1024 * 1024)
+    {
+      auto oldest = m_EventShaderPreviews.end();
+      for(auto it = m_EventShaderPreviews.begin(); it != m_EventShaderPreviews.end(); ++it)
+      {
+        auto active = m_EventShaderOverrides.find(it->first);
+        if(active != m_EventShaderOverrides.end() && active->second.independentFloatOutput)
+          continue;
+        if(oldest == m_EventShaderPreviews.end() || it->second.used < oldest->second.used)
+          oldest = it;
+      }
+      if(oldest == m_EventShaderPreviews.end())
+        return "Independent float preview cache is full of active resources";
+      total -= oldest->second.bytes;
+      destroy(oldest->second);
+      m_EventShaderPreviews.erase(oldest);
+    }
+    for(UINT i = 0; i < 9; i++)
+    {
+      if(!sources.resources[i])
+        continue;
+      ID3D11Texture2D *texture = NULL;
+      HRESULT hr = m_pDevice->CreateTexture2D(&descriptions[i], NULL, &texture);
+      if(FAILED(hr) || !texture)
+      {
+        destroy(entry);
+        return StringFormat::Fmt("Allocating independent float preview failed: %s", ToStr(hr).c_str());
+      }
+      if(i == 8)
+      {
+        entry.depth = texture;
+        D3D11_DEPTH_STENCIL_VIEW_DESC view = {};
+        state->OM.DepthView->GetDesc(&view);
+        hr = m_pDevice->CreateDepthStencilView(texture, &view, &entry.depthView);
+      }
+      else
+      {
+        entry.colors[i] = texture;
+        D3D11_RENDER_TARGET_VIEW_DESC view = {};
+        state->OM.RenderTargets[i]->GetDesc(&view);
+        hr = m_pDevice->CreateRenderTargetView(texture, i == outputTarget ? &selectedView : &view,
+                                              &entry.views[i]);
+      }
+      if(FAILED(hr))
+      {
+        destroy(entry);
+        return "Creating the independent float preview attachment view failed";
+      }
+    }
+    entry.description = GetTexture(GetIDForDeviceChild(entry.colors[outputTarget]));
+    found = m_EventShaderPreviews.insert({key, std::move(entry)}).first;
+  }
+  EventShaderPreview &entry = found->second;
+  for(UINT i = 0; i < 8; i++)
+    if(i != outputTarget && entry.colors[i])
+      m_pImmediateContext->CopyResource(entry.colors[i], sources.resources[i]);
+  if(entry.depth)
+    m_pImmediateContext->CopyResource(entry.depth, sources.resources[8]);
+  const FLOAT clear[] = {0.0f, 0.0f, 0.0f, 0.0f};
+  m_pImmediateContext->ClearRenderTargetView(entry.views[outputTarget], clear);
+  entry.used = ++m_EventShaderPreviewSerial;
+  preview = &entry;
+  return {};
 }
 
 rdcstr D3D11Replay::ValidateEventCBufferBinding(uint32_t eventId, ShaderStage stage, uint32_t slot,

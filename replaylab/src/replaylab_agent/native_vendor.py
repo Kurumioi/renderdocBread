@@ -27,7 +27,8 @@ import shutil
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .catalog import REPLAYLAB_MCP_SERVER_NAME
+from .catalog import BREAD_MCP_SERVER_NAME
+from .policy import ordered_tool_names
 from .profiles import Profile
 
 # Claude Code's own tools (removed via ``tools: []`` and additionally denied).
@@ -83,7 +84,7 @@ def claude_session_meta(setting_sources: Sequence[str] = ("project",)) -> dict[s
                 "disallowedTools": [
                     item for item in CLAUDE_BUILTIN_TOOLS if item not in CLAUDE_NATIVE_TOOLS
                 ],
-                "allowedTools": [f"mcp__{REPLAYLAB_MCP_SERVER_NAME}"],
+                "allowedTools": [f"mcp__{BREAD_MCP_SERVER_NAME}"],
                 "settingSources": list(setting_sources),
                 "strictMcpConfig": True,
             }
@@ -91,10 +92,12 @@ def claude_session_meta(setting_sources: Sequence[str] = ("project",)) -> dict[s
     }
 
 
-def session_meta(profile: Profile) -> dict[str, Any] | None:
+def session_meta(profile: Profile, *, inherit_desktop_capabilities: bool = False) -> dict[str, Any] | None:
     """Vendor ``_meta`` for ``session/new`` or ``None`` when unsupported."""
 
     if profile.preset == _CLAUDE_PRESET:
+        if inherit_desktop_capabilities:
+            return {"claudeCode": {"options": {"settingSources": ["user", "project", "local"]}}}
         return claude_session_meta()
     return None
 
@@ -109,7 +112,7 @@ def write_claude_settings(workspace: Path) -> None:
             "allow": [
                 "Skill",
                 "AskUserQuestion",
-                f"mcp__{REPLAYLAB_MCP_SERVER_NAME}",
+                f"mcp__{BREAD_MCP_SERVER_NAME}",
             ],
             "deny": [
                 item for item in CLAUDE_BUILTIN_TOOLS if item not in CLAUDE_NATIVE_TOOLS
@@ -129,19 +132,32 @@ def write_claude_mcp_config(
     command: str,
     args: Sequence[str],
     env: Mapping[str, str] | None = None,
+    extra_servers: Sequence[Mapping[str, Any]] = (),
 ) -> None:
-    """Pin Claude Code to the one filtered stdio ReplayLab MCP route."""
+    """Pin Claude Code to the filtered ReplayLab route plus the user's own servers."""
 
-    payload = {
-        "mcpServers": {
-            REPLAYLAB_MCP_SERVER_NAME: {
-                "type": "stdio",
-                "command": str(command),
-                "args": [str(value) for value in args],
-                "env": {str(key): str(value) for key, value in (env or {}).items()},
-            }
+    servers: dict[str, Any] = {
+        BREAD_MCP_SERVER_NAME: {
+            "type": "stdio",
+            "command": str(command),
+            "args": [str(value) for value in args],
+            "env": {str(key): str(value) for key, value in (env or {}).items()},
         }
     }
+    for server in extra_servers:
+        identifier = str(server.get("id", "") or "").strip()
+        if not identifier or identifier == BREAD_MCP_SERVER_NAME:
+            continue
+        if str(server.get("transport", "stdio")) == "stdio":
+            servers[identifier] = {
+                "type": "stdio",
+                "command": str(server.get("command", "")),
+                "args": [str(value) for value in server.get("args", ()) or ()],
+                "env": {str(key): str(value) for key, value in (server.get("env") or {}).items()},
+            }
+        else:
+            servers[identifier] = {"type": "http", "url": str(server.get("url", ""))}
+    payload = {"mcpServers": servers}
     (workspace / ".mcp.json").write_text(
         json.dumps(payload, indent=2) + "\n", encoding="utf-8"
     )
@@ -178,11 +194,11 @@ def copy_claude_skills(
 
 
 def _gemini_mcp_tool_name(tool_name: str) -> str:
-    return f"mcp_{REPLAYLAB_MCP_SERVER_NAME}_{tool_name}"
+    return f"mcp_{BREAD_MCP_SERVER_NAME}_{tool_name}"
 
 
 def _kimi_mcp_tool_name(tool_name: str) -> str:
-    return f"mcp__{REPLAYLAB_MCP_SERVER_NAME}__{tool_name}"
+    return f"mcp__{BREAD_MCP_SERVER_NAME}__{tool_name}"
 
 
 def write_gemini_settings(
@@ -205,10 +221,10 @@ def write_gemini_settings(
     settings_dir = workspace / config_dir
     settings_dir.mkdir(parents=True, exist_ok=True)
     exclude = list(GEMINI_BUILTIN_TOOLS)
-    allowed = [_gemini_mcp_tool_name(name) for name in sorted(set(allowed_tools))]
+    allowed = [_gemini_mcp_tool_name(name) for name in ordered_tool_names(allowed_tools)]
     payload = {
         "tools": {"core": [], "exclude": exclude, "allowed": allowed},
-        "mcp": {"allowed": [REPLAYLAB_MCP_SERVER_NAME], "excluded": []},
+        "mcp": {"allowed": [BREAD_MCP_SERVER_NAME], "excluded": []},
         "excludeTools": exclude,
         "allowedTools": allowed,
         "telemetry": {"enabled": False, "logPrompts": False},
@@ -227,13 +243,13 @@ def write_kimi_agent(workspace: Path, allowed_tools: Sequence[str]) -> Path:
     target = settings_dir / "replaylab-agent.md"
     tool_lines = [
         f"  - {json.dumps(_kimi_mcp_tool_name(name), ensure_ascii=True)}"
-        for name in sorted(set(allowed_tools))
+        for name in ordered_tool_names(allowed_tools)
     ]
     tools = "tools: []" if not tool_lines else "tools:\n" + "\n".join(tool_lines)
     target.write_text(
         "---\n"
         "name: replaylab\n"
-        "description: ReplayLab task-scoped RenderDoc analysis agent\n"
+        "description: Bread AI task-scoped RenderDoc analysis agent\n"
         + tools
         + "\nsubagents: []\n"
         "---\n\n"
@@ -247,9 +263,12 @@ def prepare_workspace(
     profile: Profile,
     workspace: Path,
     allowed_tools: Sequence[str] = (),
+    *, inherit_desktop_capabilities: bool = False,
 ) -> None:
     """Write the vendor's workspace-scoped configuration into a fresh workspace."""
 
+    if inherit_desktop_capabilities:
+        return
     if profile.preset == _CLAUDE_PRESET:
         write_claude_settings(workspace)
     elif profile.preset in _GEMINI_FAMILY:
@@ -267,16 +286,25 @@ def runtime_argv(
     argv: Sequence[str],
     workspace: Path,
     allowed_tools: Sequence[str] = (),
+    *, inherit_desktop_capabilities: bool = False,
 ) -> list[str]:
     """Apply launch-only vendor controls which ACP ``session/new`` cannot carry."""
 
     result = list(argv)
-    exact_tools = sorted(set(allowed_tools))
+    if inherit_desktop_capabilities:
+        # The shipped CodeBuddy preset contains a Bread-imposed empty tool
+        # allow-list. Remove that exact restriction, not user-provided options.
+        if profile.preset == "codebuddy-acp":
+            for index in range(len(result) - 2, -1, -1):
+                if result[index:index + 2] == ["--tools", ""]:
+                    del result[index:index + 2]
+        return result
+    exact_tools = ordered_tool_names(allowed_tools)
     if profile.preset == "copilot-acp":
         result.append("--disable-builtin-mcps")
         if exact_tools:
             identifiers = ",".join(
-                f"{REPLAYLAB_MCP_SERVER_NAME}({name})" for name in exact_tools
+                f"{BREAD_MCP_SERVER_NAME}({name})" for name in exact_tools
             )
             result.extend(
                 (
@@ -287,7 +315,7 @@ def runtime_argv(
     elif profile.preset == "gemini-acp" and exact_tools:
         result.extend(
             (
-                f"--allowed-mcp-server-names={REPLAYLAB_MCP_SERVER_NAME}",
+                f"--allowed-mcp-server-names={BREAD_MCP_SERVER_NAME}",
                 "--allowed-tools="
                 + ",".join(_gemini_mcp_tool_name(name) for name in exact_tools),
             )
@@ -312,9 +340,10 @@ def agent_env(profile: Profile) -> dict[str, str]:
             env["MAX_THINKING_TOKENS"] = str(budget)
         env["DISABLE_AUTOUPDATER"] = "1"
         env["DISABLE_TELEMETRY"] = "1"
-        # Claude Code spills MCP results above this many tokens into a file the
-        # Agent then has to Read — impossible without file tools.  The Host caps
-        # results at MAX_MODEL_TOOL_RESULT_CHARS (~30k tokens); keep this above it.
+        # Claude Code spills MCP results above this many tokens into a file and
+        # then tries its built-in Read tool — which Bread must keep denied. Keep
+        # the ceiling high enough that Host-capped results stay inline, and rely
+        # on read_evidence_file when a spill still happens.
         env["MAX_MCP_OUTPUT_TOKENS"] = "64000"
     elif profile.preset in _GEMINI_FAMILY:
         env["NO_COLOR"] = "1"
@@ -343,17 +372,17 @@ def describe(profile: Profile) -> str:
 
     preset = profile.preset
     if preset == _CLAUDE_PRESET:
-        return "claude: project Skills + AskUserQuestion elicitation, one strict ReplayLab MCP, thinking via MAX_THINKING_TOKENS"
+        return "claude: project Skills + AskUserQuestion elicitation, one strict Bread MCP route, thinking via MAX_THINKING_TOKENS"
     if preset in _GEMINI_FAMILY:
-        return f"gemini-family: {_GEMINI_FAMILY[preset]}/settings.json built-in gate + exact ReplayLab MCP allow-list"
+        return f"gemini-family: {_GEMINI_FAMILY[preset]}/settings.json built-in gate + exact Bread MCP allow-list"
     if preset == "copilot-acp":
-        return "copilot: exact ReplayLab MCP tools via launch-only available/allow lists"
+        return "copilot: exact Bread MCP tools via launch-only available/allow lists"
     if preset == "kimi-acp":
-        return "kimi: launch-scoped Agent file exposes exact ReplayLab MCP tools only"
+        return "kimi: launch-scoped Agent file exposes exact Bread MCP tools only"
     if preset == "cursor-acp":
         return "cursor: .cursor/cli.json permissions"
     if preset == "codebuddy-acp":
-        return "codebuddy: --tools \"\" --allowedTools mcp__ReplayLab on the command line"
+        return "codebuddy: --tools \"\" with the Bread compatibility tool id mcp__Bread on the command line"
     return "no vendor switch known; client-side denial layer only"
 
 

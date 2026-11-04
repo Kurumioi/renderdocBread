@@ -572,10 +572,24 @@ struct CaptureContextInvoker : ObjectForwarder<ICaptureContext>
   {
     return InvokeRetFunction<WindowingData>(&ICaptureContext::CreateWindowingData, window);
   }
+  IShaderCodeEditor *CreateShaderCodeEditor(QWidget *parent = NULL) override
+  {
+    return InvokeRetFunction<IShaderCodeEditor *>(&ICaptureContext::CreateShaderCodeEditor, parent);
+  }
+  void DestroyShaderCodeEditor(IShaderCodeEditor *editor) override
+  {
+    InvokeVoidFunction(&ICaptureContext::DestroyShaderCodeEditor, editor);
+  }
   virtual void LoadCapture(const rdcstr &capture, const ReplayOptions &opts,
                            const rdcstr &origFilename, bool temporary, bool local) override
   {
     InvokeVoidFunction(&ICaptureContext::LoadCapture, capture, opts, origFilename, temporary, local);
+  }
+  virtual ResultDetails LoadCaptureForReplayRecovery(const rdcstr &capture, const ReplayOptions &opts,
+                                                      const rdcstr &origFilename) override
+  {
+    return InvokeRetFunction<ResultDetails>(&ICaptureContext::LoadCaptureForReplayRecovery, capture,
+                                            opts, origFilename);
   }
   virtual bool SaveCaptureTo(const rdcstr &capture) override
   {
@@ -635,6 +649,27 @@ struct CaptureContextInvoker : ObjectForwarder<ICaptureContext>
   virtual void UnregisterReplacement(ResourceId id) override
   {
     InvokeVoidFunction(&ICaptureContext::UnregisterReplacement, id);
+  }
+  bool RegisterCBufferDebugDisplaySource(
+      const rdcstr &ownerToken, ResourceId original, ResourceId replacement,
+      const rdcstr &sourceRawSha256, const rdcstr &activeRawSha256, ShaderStage stage,
+      uint64_t mutationGeneration, const rdcarray<ConstantBlock> &sourceBlocks,
+      const rdcarray<ConstantBlock> &activeBlocks) override
+  {
+    return InvokeRetFunction<bool>(&ICaptureContext::RegisterCBufferDebugDisplaySource,
+        ownerToken, original, replacement, sourceRawSha256, activeRawSha256, stage,
+        mutationGeneration, sourceBlocks, activeBlocks);
+  }
+  void UnregisterCBufferDebugDisplaySource(const rdcstr &ownerToken) override
+  {
+    InvokeVoidFunction(&ICaptureContext::UnregisterCBufferDebugDisplaySource, ownerToken);
+  }
+  CBufferDebugDisplaySource GetCBufferDebugDisplaySource(
+      ResourceId original, ShaderStage stage, const rdcstr &activeRawSha256,
+      const ConstantBlock &activeBlock) override
+  {
+    return InvokeRetFunction<CBufferDebugDisplaySource>(
+        &ICaptureContext::GetCBufferDebugDisplaySource, original, stage, activeRawSha256, activeBlock);
   }
   virtual void AddCaptureViewer(ICaptureViewer *viewer) override
   {

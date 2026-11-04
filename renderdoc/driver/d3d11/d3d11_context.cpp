@@ -27,6 +27,7 @@
 #include <algorithm>
 #include "strings/string_utils.h"
 #include "replay/replay_timing.h"
+#include "replay/resource_usage.h"
 #include "d3d11_device.h"
 #include "d3d11_manager.h"
 #include "d3d11_renderstate.h"
@@ -1175,14 +1176,12 @@ void WrappedID3D11DeviceContext::AddUsage(const ActionDescription &a)
               m_pRealContext1 && m_SetCBuffer1 ? uint64_t(sh.CBCounts[slot]) * 16 : ~0ULL);
 
     // Shader objects are resources too. Record the bound shader at the same point where the
-    // draw/dispatch's other resource uses are indexed, so GetUsage(shaderId) can find one
-    // representative event without walking the action/EID tree. Only the first event is needed:
-    // keeping one entry per physical shader makes this index constant-sized.
+    // draw/dispatch's other resource uses are indexed, so GetUsage(shaderId) can return all
+    // action events without replaying or walking the action/EID tree.
     if(executesShader && sh.Object)
     {
       rdcarray<EventUsage> &uses = m_ResourceUses[GetIDForDeviceChild(sh.Object)];
-      if(uses.empty())
-        uses.push_back(EventUsage(e, ResourceUsage::Shader));
+      AppendFrameResourceUsage(uses, EventUsage(e, ResourceUsage::Shader));
     }
 
     for(int i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)

@@ -1,128 +1,38 @@
-# Package and validation contract
+# Managed package and validation
 
-The export is a Host-owned artifact transaction, not a collection of unrelated
-file writes. Every preparation, finalization, resume, and validation operation
-must use the same admitted request hash.
+The Host manages the artifact root, staging, immutable publication and request
+identity. Use `prepare_resource_export`, `finalize_resource_export`,
+`get_resource_export_status` and `validate_resource_export` according to
+the selected route. Their operation receipts, not a filename or free-form
+success message, establish effects. A changed capture or UI selection does
+not authorize retargeting an existing request.
 
-## Managed artifact lifecycle
+The manifest ties the package to its capture/session/EID, source resource and
+Shader hashes, target/coordinate profile, source-to-output mappings,
+dependencies, relative artifact paths, byte lengths and content hashes.
+Custom vertex data or unsupported target features may use a sidecar or be
+recorded as explicit loss. A relative path must stay inside the package.
+An uncertain operation should be resolved from its status before retrying;
+successful published artifacts should not be overwritten or regenerated
+because another item failed.
 
-`prepare_resource_export` may create a staging area only beneath the
-Host-managed artifact root. It must reject absolute paths, parent traversal,
-reparse or symlink escapes, stale capture identity, mismatched request hashes,
-and collisions with another request.
+Validation has separate meanings:
 
-Preparation should:
+- **Structural:** manifest, paths, hashes, resource sizes and internal
+  mesh/texture/material references agree.
+- **Source fidelity:** topology and inputs, texture view/color/sampler
+  behavior, CBuffer mapping, coordinate conversion and dependencies match
+  captured evidence or declare an approximation.
+- **Target:** an available, selected Unity or Blender validator confirms
+  import/compile behavior for that target. If none ran, target validation is
+  unavailable, not passed.
 
-- snapshot admitted source and route fingerprints;
-- decode and transform only the requested resources;
-- write deterministic candidate artifacts into staging;
-- record every warning, bounded unknown, and unsupported mapping;
-- return a receipt identifying created effects and remaining criteria.
+For Unity visual comparison, retain the actual graphics API, active color
+space, UV/depth conventions and per-texture import/sampler/mip settings from
+the receipt. Import success or a recognized `_ST` expression alone does not
+verify image orientation or pixel equivalence.
 
-`finalize_resource_export` may run only after the source and transformation
-criteria pass. It must:
-
-- assemble the package from admitted staging artifacts;
-- generate the manifest and per-file hashes;
-- perform built-in structural checks;
-- publish atomically to a new immutable destination;
-- never overwrite a prior successful or failed artifact;
-- return an exact artifact and effect receipt.
-
-`get_resource_export_status` may inspect or resume only the same logical
-request. A retry must preserve passed criteria and completed effects, and use a
-new attempt identity linked to the original request. It must not retarget a
-staging directory after a capture or selection change.
-
-## Package contents
-
-The package manifest is canonical even when the target importer also embeds
-metadata. It should contain:
-
-- schema and exporter versions;
-- request hash and capture/session/EID identities;
-- target, coordinate, dependency, and validation profiles;
-- source resource, shader, and admitted prerequisite hashes;
-- mesh/topology/index/vertex/instance mappings;
-- texture/subresource/view/sampler/color-space mappings;
-- CBuffer layouts, classifications, values, and target property mappings;
-- shader artifacts, target substitutions, and dependency compromises;
-- relative artifact paths, media types, byte sizes, and SHA-256 hashes;
-- unsupported fields and bounded unknowns;
-- preparation, finalization, and validation receipts.
-
-All artifact paths are relative to the package root. The manifest must preserve
-the source-to-destination mapping for data repacked or represented in a sidecar.
-Generated importer scripts and target project fragments are artifacts and must
-be hashed like meshes, textures, and shaders.
-
-## Required receipts
-
-A valid receipt records:
-
-- logical request and attempt IDs;
-- capture/session/EID and selected route fingerprints;
-- exact source resource and raw shader hashes;
-- converter and validator identities, versions, and registered hashes;
-- coordinate conversion profile and transform result;
-- every created relative path, byte size, and content hash;
-- completed effects and preserved prior effects;
-- warnings, failures, bounded unknowns, and remaining criteria;
-- current and restored RenderDoc event identity;
-- immutable package identity when publication succeeds.
-
-Do not accept a free-form success string or a path alone as a receipt.
-
-## Validation layers
-
-`validate_resource_export` must report each requested layer separately.
-
-### Structural validation
-
-- manifest schema, required entries, relative paths, hashes, and sizes agree;
-- mesh indices, vertex counts, stream lengths, topology, skin data, and instance
-  counts are internally valid;
-- texture dimensions, subresources, encodings, and referenced files agree;
-- material, shader, texture, mesh, and importer references resolve;
-- no artifact escapes the managed root or mutates an earlier package.
-
-### Semantic and fidelity validation
-
-- every observed vertex input is mapped or explicitly unsupported;
-- index/base-vertex and per-instance interpretation match source evidence;
-- texture view, swizzle, sRGB/linear interpretation, sampler, and mip behavior
-  match the recorded transfer policy;
-- CBuffer layout and material/system mapping preserve types and values;
-- coordinate conversion, winding, normals, tangents, UVs, instances, and bones
-  satisfy one consistent transform receipt;
-- shader interface and material properties agree;
-- included, substituted, and dropped dependencies match the approved policy.
-
-### Target validation
-
-Use only an admitted non-interactive validator. For Unity, validate importable
-mesh/material/texture assets, shader compilation for the selected URP profile,
-and importer reconstruction when requested. For Blender, validate headless
-mesh import, material/node construction, image color-space settings, and scene
-link integrity for the selected renderer.
-
-If no target validator is available, do not claim target validation. Mark it as
-an unavailable capability and report which structural and semantic checks did
-run. Do not install Unity, Blender, an SDK, or a converter to satisfy the check.
-
-### Replay postcondition
-
-After every operation that changes the current EID or replay state, verify that
-the original event and capture context are restored. An uncertain or failed
-restoration blocks completion and yielding until resolved or safely cancelled.
-
-## Failure and recovery
-
-Keep failed candidates immutable for diagnosis, but never promote them as the
-successful package. Retry only the failed criterion with an admitted fallback
-route. Do not repeat a successful external effect or overwrite a previous
-attempt.
-
-Do not fall back to `export_drawcall`, `export_to_unity`, `save_texture`, a GUI
-automation path, or an invented command. Those paths lack the managed artifact,
-exact source, receipt, and target validation guarantees required here.
+After an operation changes replay state, use its restoration receipt to
+confirm the original capture and EID. Report an uncertain restoration as an
+open problem. A partial candidate package is not a published validated
+package; report accepted artifacts and remaining gaps accurately.

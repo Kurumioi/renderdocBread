@@ -347,6 +347,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         shell=False,
         env=dict(os.environ),
         check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if completed.returncode != 0:
         return int(completed.returncode or 1)

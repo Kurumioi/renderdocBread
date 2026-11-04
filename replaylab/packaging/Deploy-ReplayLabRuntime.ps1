@@ -19,21 +19,21 @@ $runtimeManifestSchema = "replaylab-runtime-output/v1"
 $deploymentMarkerName = ".replaylab-runtime-deployment.json"
 $deploymentMarkerSchema = "replaylab-runtime-deployment/v1"
 $runtimePayloadNames = @(
-    "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe",
+    "replaylab-ai.exe", "ReplayLabInternal.exe", "BreadMCP.exe",
     "ReplayLabShaderTools.exe")
 $runtimeOwnedNames = @(
-    "replaylab-ai.exe", "ReplayLabInternal.exe", "ReplayLabMCP.exe",
+    "replaylab-ai.exe", "ReplayLabInternal.exe", "BreadMCP.exe",
     "ReplayLabShaderTools.exe",
     $runtimeManifestName)
 $deploymentOwnedNames = @(
     "replaylab-ai.exe",
     "ReplayLabInternal.exe",
-    "ReplayLabMCP.exe",
+    "BreadMCP.exe",
     "ReplayLabShaderTools.exe",
     $runtimeManifestName,
     $deploymentMarkerName
 )
-$qrenderdocExecutableNames = @("qrenderdoc.exe", "q_render_soco_doc.exe")
+$qrenderdocExecutableNames = @("RenderDocBread.exe", "qrenderdoc.exe", "q_render_soco_doc.exe")
 
 function Get-Sha256Hex {
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
@@ -231,7 +231,7 @@ function Get-ValidatedRuntimeOutput {
 
     $fileEntries = @(Get-RequiredJsonProperty $manifest "files" "ReplayLab runtime manifest")
     if ($fileEntries.Count -ne $runtimePayloadNames.Count) {
-        throw "ReplayLab runtime manifest files must describe exactly the two runtime executables."
+        throw "ReplayLab runtime manifest files must describe exactly the complete runtime executable set."
     }
 
     $records = @{}
@@ -308,18 +308,23 @@ function Assert-DeploymentMarker {
     }
     $ownedFiles = @(Get-RequiredJsonProperty $marker "ownedFiles" `
         "ReplayLab runtime deployment marker")
-    if ($ownedFiles.Count -eq ($deploymentOwnedNames.Count - 1)) {
+    # Markers that still list ReplayLabMCP.exe are accepted once and rewritten
+    # to BreadMCP.exe on the next successful deploy.
+    $normalizedOwnedFiles = @($ownedFiles | ForEach-Object {
+        if ([string]$_ -ceq "ReplayLabMCP.exe") { "BreadMCP.exe" } else { [string]$_ }
+    })
+    if ($normalizedOwnedFiles.Count -eq ($deploymentOwnedNames.Count - 1)) {
         # A marker written before the independent runner owns exactly the
         # original payload names. Only an absent new name may be added.
         $legacyNames = @($deploymentOwnedNames | Where-Object { $_ -cne "ReplayLabShaderTools.exe" })
-        Assert-ExactFileNames $ownedFiles $legacyNames `
+        Assert-ExactFileNames $normalizedOwnedFiles $legacyNames `
             "legacy ReplayLab runtime deployment marker ownedFiles"
         if (Test-Path -LiteralPath (Join-Path $TargetRoot "ReplayLabShaderTools.exe")) {
             throw "Legacy deployment marker does not own the existing ReplayLabShaderTools.exe."
         }
     }
     else {
-        Assert-ExactFileNames $ownedFiles $deploymentOwnedNames `
+        Assert-ExactFileNames $normalizedOwnedFiles $deploymentOwnedNames `
             "ReplayLab runtime deployment marker ownedFiles"
     }
 
@@ -621,6 +626,9 @@ if ($target.NeedsAdoption) {
 foreach ($ownedName in $deploymentOwnedNames) {
     Assert-TargetFileReplaceable (Join-Path $target.TargetRoot $ownedName) $ownedName
 }
+# Drop the retired MCP executable name during BreadMCP migration.
+Assert-TargetFileReplaceable (
+    Join-Path $target.TargetRoot "ReplayLabMCP.exe") "ReplayLabMCP.exe"
 
 if (-not $target.Exists) {
     New-Item -ItemType Directory -Path $target.TargetRoot -ErrorAction Stop | Out-Null
@@ -668,6 +676,8 @@ try {
     foreach ($ownedName in $deploymentOwnedNames) {
         Assert-TargetFileReplaceable (Join-Path $target.TargetRoot $ownedName) $ownedName
     }
+    Assert-TargetFileReplaceable (
+        Join-Path $target.TargetRoot "ReplayLabMCP.exe") "ReplayLabMCP.exe"
 
     if (-not $target.IsOwned) {
         $allowedStagingPaths = @{}
@@ -716,6 +726,13 @@ try {
     }
 
     Install-DeploymentMarker $target.TargetRoot $runtime "complete" $sessionId
+
+    $legacyMcpPath = Join-Path $target.TargetRoot "ReplayLabMCP.exe"
+    if (Test-Path -LiteralPath $legacyMcpPath) {
+        Assert-OrdinaryFile $legacyMcpPath "legacy ReplayLabMCP.exe" | Out-Null
+        Remove-Item -LiteralPath $legacyMcpPath -Force -ErrorAction Stop
+    }
+
     $finalMarkerState = Assert-DeploymentMarker $target.TargetRoot
     if ($finalMarkerState -cne "complete") {
         throw "ReplayLab runtime deployment marker did not reach the complete state."

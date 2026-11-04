@@ -1,4 +1,19 @@
-"""Fail-closed cross-process leases shared by Shader source transactions."""
+"""Shared, non-exclusive participation markers for Shader source transactions.
+
+There is no owner of a workspace source. The editor, the AI organizer, a
+project restore and a toolchain refresh may all write ``source/shader.hlsl``;
+what keeps them honest is not a lock but the compare-and-swap every writer
+already does against the source hash it last read (a stale write is refused
+with "source changed on disk; reload before saving", never by an exclusion),
+plus the manifest transaction lock that serialises compiles.
+
+``WorkspaceSourceTransactionLease`` keeps its name and shape for the callers
+that grew around it, but ``acquire`` never fails: it records this participant
+under ``watch/participants/`` so a reviewer can see who is touching the
+workspace, and ``release`` removes that record. The historical exclusive
+``.workspace-watch.lock`` is archived when found so an old crash can no longer
+freeze a workspace.
+"""
 
 from __future__ import annotations
 
@@ -11,23 +26,24 @@ from datetime import datetime, timezone
 
 SOURCE_TRANSACTION_JOURNAL_FILE = ".workspace-source-transaction.json"
 SOURCE_TRANSACTION_BACKUP_FILE = ".workspace-source-transaction.backup"
-LEASE_SCHEMA = "replaylab-workspace-source-lease/v2"
-LEASE_VERSION = 2
+LEASE_SCHEMA = "replaylab-workspace-source-participant/v3"
+LEASE_VERSION = 3
 MAX_LEASE_BYTES = 4096
+PARTICIPANTS_DIR = "participants"
 _TOKEN = re.compile(r"^[0-9a-f]{32}$")
 
 
 class WorkspaceSourceLeaseError(RuntimeError):
-    """The workspace source is already owned by another transaction."""
+    """Kept for callers that still name it; the shared marker never raises it."""
 
 
 class WorkspaceSourceTransactionLease:
-    """Token-owned lease for watcher and organization source transactions.
+    """A presence record, not an exclusion.
 
-    The historical filename is retained so existing watcher crash residue keeps
-    exactly the same fail-closed meaning. A missing owner process is never
-    inferred from the token; only the owner holding the exact token may remove
-    it.
+    ``owned`` is True between ``acquire`` and ``release`` for the caller's own
+    bookkeeping (the watcher gates its editor-save path on it). Two leases on
+    the same workspace coexist; concurrent writers are reconciled by the
+    hash-checked source swap, not here.
     """
 
     FILE_NAME = ".workspace-watch.lock"
@@ -46,16 +62,8 @@ class WorkspaceSourceTransactionLease:
         instance = str(owner_instance_id or "").strip().lower()
         if instance and _TOKEN.fullmatch(instance) is None:
             raise WorkspaceSourceLeaseError("source lease owner instance ID is invalid")
-        if recover_orphaned and not instance:
-            raise WorkspaceSourceLeaseError(
-                "orphan lease recovery requires a process-owned host instance ID"
-            )
-        if recover_legacy and (not recover_orphaned or not instance):
-            raise WorkspaceSourceLeaseError(
-                "legacy lease recovery requires explicit orphan recovery and a "
-                "process-owned host instance ID"
-            )
         self.owner_instance_id = instance
+        # Accepted and ignored: nothing is exclusive, so nothing is orphaned.
         self.recover_orphaned = bool(recover_orphaned)
         self.recover_legacy = bool(recover_legacy)
         self._owned = False
@@ -65,27 +73,29 @@ class WorkspaceSourceTransactionLease:
     def owned(self) -> bool:
         return self._owned
 
+    @property
+    def participant_path(self) -> Path:
+        return self.root / "watch" / PARTICIPANTS_DIR / (self.token + ".json")
+
     def acquire(self) -> None:
-        recovered = False
-        while True:
+        """Record this participant. Never blocks, never refuses."""
+
+        self._archive_legacy_exclusive_lock()
+        try:
+            self.participant_path.parent.mkdir(parents=True, exist_ok=True)
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+            descriptor = os.open(self.participant_path, flags, 0o600)
             try:
-                self._acquire_new()
-                return
-            except FileExistsError as exc:
-                if (
-                    recovered
-                    or not self.recover_orphaned
-                    or not self._archive_orphaned_host_lease()
-                ):
-                    raise WorkspaceSourceLeaseError(
-                        "workspace already has a source transaction lease; the lease "
-                        "is never assumed stale: %s" % self.path
-                    ) from exc
-                recovered = True
+                os.write(descriptor, self._payload)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            # A participant record is informational; a full disk or a read-only
+            # mirror must not stop anyone from editing their own Shader.
+            pass
+        self._owned = True
 
     def _lease_payload(self) -> bytes:
-        if not self.owner_instance_id:
-            return (self.token + "\n").encode("ascii")
         value = {
             "schema": LEASE_SCHEMA,
             "schemaVersion": LEASE_VERSION,
@@ -98,150 +108,44 @@ class WorkspaceSourceTransactionLease:
             json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode("utf-8")
 
-    def _acquire_new(self) -> None:
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
-        descriptor = os.open(self.path, flags, 0o600)
-        try:
-            os.write(descriptor, self._payload)
-            os.fsync(descriptor)
-            self._owned = True
-        finally:
-            os.close(descriptor)
+    def _archive_legacy_exclusive_lock(self) -> bool:
+        """Move an old exclusive ``.workspace-watch.lock`` out of the way.
 
-    def _archive_orphaned_host_lease(self) -> bool:
-        """Archive a lease from a different singleton-host generation.
-
-        This path is deliberately unavailable to ordinary callers. The
-        ReplayLab singleton host supplies a random generation ID, so a
-        different well-formed v2 owner ID is evidence that the previous
-        singleton generation ended. A legacy token-only lock is archived only
-        when the already effect-authorised operation separately opted into
-        ``recover_legacy``. Source transaction residue still blocks recovery.
+        Older builds refused every writer while this file existed, including
+        after a crash. It carries no information a participant record does not,
+        so it is kept for the record under ``watch/`` and never honoured.
         """
 
-        if not self.owner_instance_id:
-            return False
-        if any(
-            (self.root / name).exists() or (self.root / name).is_symlink()
-            for name in (
-                SOURCE_TRANSACTION_JOURNAL_FILE,
-                SOURCE_TRANSACTION_BACKUP_FILE,
-            )
-        ):
-            return False
         try:
             if self.path.is_symlink() or not self.path.is_file():
                 return False
-            before = self.path.stat(follow_symlinks=False)
-            if before.st_size <= 0 or before.st_size > MAX_LEASE_BYTES:
+            if self.path.stat(follow_symlinks=False).st_size > MAX_LEASE_BYTES:
                 return False
-            raw = self.path.read_bytes()
-            after = self.path.stat(follow_symlinks=False)
-            if (
-                len(raw) != before.st_size
-                or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-            ):
-                return False
-            try:
-                value = json.loads(raw.decode("utf-8", errors="strict"))
-            except json.JSONDecodeError:
-                value = None
-            legacy = value is None
-            if legacy:
-                if not self.recover_legacy:
-                    return False
-                try:
-                    legacy_text = raw.decode("ascii", errors="strict")
-                except UnicodeDecodeError:
-                    return False
-                if not legacy_text.endswith("\n") or legacy_text.count("\n") != 1:
-                    return False
-                previous_token = legacy_text[:-1]
-                if _TOKEN.fullmatch(previous_token) is None:
-                    return False
-                previous_owner = "legacy"
-            else:
-                if not isinstance(value, dict) or set(value) != {
-                    "schema",
-                    "schemaVersion",
-                    "token",
-                    "ownerInstanceId",
-                    "ownerPid",
-                    "createdAt",
-                }:
-                    return False
-                previous_owner = str(value.get("ownerInstanceId", ""))
-                previous_token = str(value.get("token", ""))
-                if (
-                    value.get("schema") != LEASE_SCHEMA
-                    or value.get("schemaVersion") != LEASE_VERSION
-                    or _TOKEN.fullmatch(previous_owner) is None
-                    or _TOKEN.fullmatch(previous_token) is None
-                    or previous_owner == self.owner_instance_id
-                ):
-                    return False
             watch_dir = self.root / "watch"
             if watch_dir.exists() and (watch_dir.is_symlink() or not watch_dir.is_dir()):
                 return False
             watch_dir.mkdir(parents=False, exist_ok=True)
-            if watch_dir.resolve() != watch_dir or self.root.resolve() not in watch_dir.parents:
-                return False
-            archive = watch_dir / (
-                ("orphaned-legacy-lease-%s.lock" % previous_token)
-                if legacy
-                else ("orphaned-lease-%s-%s.json" % (previous_owner, previous_token))
-            )
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            archive = watch_dir / ("retired-exclusive-lease-%s-%s.lock" % (stamp, self.token[:8]))
             if archive.exists() or archive.is_symlink():
-                return False
-            # Recheck the directory entry immediately before the recoverable
-            # move so a replaced owner file is never archived by mistake.
-            final = self.path.stat(follow_symlinks=False)
-            if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
-                final.st_dev,
-                final.st_ino,
-                final.st_size,
-                final.st_mtime_ns,
-            ):
                 return False
             self.path.replace(archive)
             return True
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        except OSError:
             return False
 
     def release(self) -> bool:
-        """Remove the lease only when the on-disk token is still exactly ours."""
+        """Drop this participant's record."""
 
         if not self._owned:
             return False
         removed = False
         try:
-            # An interrupted in-place source CAS leaves a bounded backup and
-            # journal. Preserve the lease as crash residue until those files
-            # are explicitly inspected/recovered; never let a watcher compile
-            # potentially partial source bytes.
-            if any(
-                (self.root / name).exists() or (self.root / name).is_symlink()
-                for name in (
-                    SOURCE_TRANSACTION_JOURNAL_FILE,
-                    SOURCE_TRANSACTION_BACKUP_FILE,
-                )
-            ):
-                return False
-            if self.path.is_symlink():
-                return False
-            metadata = self.path.stat(follow_symlinks=False)
-            expected = self._payload
-            if metadata.st_size != len(expected):
-                return False
-            with self.path.open("rb") as stream:
-                actual = stream.read(len(expected) + 1)
-            if actual == expected:
-                self.path.unlink()
+            path = self.participant_path
+            if path.is_file() and not path.is_symlink():
+                path.unlink()
                 removed = True
         except OSError:
-            # A missing, replaced or unreadable lease is never guessed to be
-            # ours. Retaining it is safer than deleting another owner's token.
             pass
         finally:
             self._owned = False
@@ -256,9 +160,32 @@ class WorkspaceSourceTransactionLease:
         return False
 
 
+def participants(root: Path) -> list[dict]:
+    """Who currently holds a participant record on this workspace (best effort)."""
+
+    directory = Path(root) / "watch" / PARTICIPANTS_DIR
+    found: list[dict] = []
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return found
+    for entry in entries[:64]:
+        try:
+            if entry.is_symlink() or not entry.is_file() or entry.stat().st_size > MAX_LEASE_BYTES:
+                continue
+            value = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(value, dict) and value.get("schema") == LEASE_SCHEMA:
+            found.append({key: value.get(key) for key in ("token", "ownerInstanceId", "ownerPid", "createdAt")})
+    return found
+
+
 __all__ = [
+    "PARTICIPANTS_DIR",
     "SOURCE_TRANSACTION_BACKUP_FILE",
     "SOURCE_TRANSACTION_JOURNAL_FILE",
     "WorkspaceSourceLeaseError",
     "WorkspaceSourceTransactionLease",
+    "participants",
 ]

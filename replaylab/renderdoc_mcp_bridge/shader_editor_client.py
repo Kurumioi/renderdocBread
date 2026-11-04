@@ -1,10 +1,11 @@
 """Authenticated loopback save client for ReplayLab's Shader Workspace.
 
 This module runs inside qrenderdoc's embedded Python 3.6. It never writes a
-shader source directly: every save is sent to the private internal Host and
-must bind to an in-memory running live-edit/watcher job. The compact embedded
-runtime has no ``_socket``, so a fixed no-proxy WinHTTP request is used and
-redirects are disabled before the bearer credential is attached.
+shader source directly: every save is sent to the private internal Host, which
+binds or resumes the appropriate live-edit/watcher job. The compact Windows
+runtime has no ``_socket``, so it uses a fixed no-proxy WinHTTP request. Other
+hosts lazily load a direct loopback HTTP client. Neither transport follows
+redirects or performs automatic authentication.
 """
 
 from __future__ import absolute_import, print_function
@@ -44,11 +45,38 @@ def _has_required_capabilities(value):
 
 MAX_STATE_BYTES = 64 * 1024
 MAX_TOKEN_BYTES = 1024
-EXPECTED_HOST_VERSION = "1.13.0"
+# Minimum Host package the client was written against. A newer patch or
+# minor on the same major line stays compatible while protocol stays 1.
+EXPECTED_HOST_VERSION = "1.13.121"
 INTERNAL_HOST_STATE_PROTOCOL_VERSION = 1
 TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,128}$")
 ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_HOST_SEMVER = re.compile(r"^([0-9]+)\.([0-9]+)\.([0-9]+)$")
+
+
+def _parse_host_semver(value):
+    if not isinstance(value, str):
+        return None
+    match = _HOST_SEMVER.fullmatch(value.strip())
+    if match is None:
+        return None
+    parts = tuple(int(item) for item in match.groups())
+    if any(part < 0 or part > 999999 for part in parts):
+        return None
+    return parts
+
+
+def _host_runtime_version_compatible(received, expected):
+    """True when a live Host is the same or a newer compatible package."""
+
+    received_parts = _parse_host_semver(received)
+    expected_parts = _parse_host_semver(expected)
+    if received_parts is None or expected_parts is None:
+        return False
+    if received_parts[0] != expected_parts[0]:
+        return False
+    return received_parts >= expected_parts
 
 
 class ReplayLabShaderSaveError(RuntimeError):
@@ -81,8 +109,8 @@ def _winhttp_request_blocking(method, path, port, headers, body,
     """
 
     if os.name != "nt":
-        raise ReplayLabShaderSaveError(
-            "ReplayLab Shader saves require the Windows loopback Host")
+        return _portable_loopback_request(method, path, port, headers, body,
+                                          timeout_seconds)
     winhttp = ctypes.WinDLL("winhttp", use_last_error=True)
     void_pointer = ctypes.c_void_p
     dword = ctypes.c_uint32
@@ -182,14 +210,14 @@ def _winhttp_request_blocking(method, path, port, headers, body,
             total += int(received.value)
             if total > MAX_RESPONSE_BYTES:
                 raise ReplayLabShaderSaveError(
-                    "ReplayLab Host returned an invalid response size")
+                    "Bread Host returned an invalid response size")
             chunks.append(buffer.raw[:received.value])
         return int(status.value), b"".join(chunks)
     except ReplayLabShaderSaveError:
         raise
     except (OSError, ValueError) as exc:
         raise ReplayLabShaderSaveError(
-            "ReplayLab Host connection failed: %s" % str(exc))
+            "Bread Host connection failed: %s" % str(exc))
     finally:
         for handle in (request, connection, session):
             if handle:
@@ -197,6 +225,41 @@ def _winhttp_request_blocking(method, path, port, headers, body,
                     winhttp.WinHttpCloseHandle(handle)
                 except Exception:
                     pass
+
+
+def _portable_loopback_request(method, path, port, headers, body, timeout_seconds):
+    """Unix transport with the same fixed origin and response bound as WinHTTP.
+
+    http.client connects directly and does not consult proxy variables, follow
+    redirects or perform automatic authentication. The outer worker owns the
+    wall-clock deadline; this worker alone owns and closes its socket.
+    """
+    import http.client
+    if (method not in ("GET", "POST") or not isinstance(path, str) or
+            not path.startswith("/replaylab/") and path != "/health" or
+            "\r" in path or "\n" in path or not 0 < int(port) < 65536):
+        raise ReplayLabShaderSaveError("Invalid Bread Host request")
+    request_headers = {}
+    for line in str(headers or "").split("\r\n"):
+        if not line:
+            continue
+        name, separator, value = line.partition(":")
+        if not separator or name.lower() not in ("authorization", "content-type", "accept"):
+            raise ReplayLabShaderSaveError("Invalid Bread Host request headers")
+        request_headers[name] = value.strip()
+    connection = http.client.HTTPConnection("127.0.0.1", int(port),
+                                             timeout=float(timeout_seconds))
+    try:
+        connection.request(method, path, body=body, headers=request_headers)
+        response = connection.getresponse()
+        raw = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise ReplayLabShaderSaveError("Bread Host returned an invalid response size")
+        return int(response.status), raw
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        raise ReplayLabShaderSaveError("Bread Host connection failed: %s" % str(exc))
+    finally:
+        connection.close()
 
 
 def _bounded_winhttp_request(method, path, port, headers, body,
@@ -230,7 +293,7 @@ def _bounded_winhttp_request(method, path, port, headers, body,
         # pass the guard and create two indefinitely pending WinHTTP requests.
         if _ACTIVE_REQUEST_THREAD is not None:
             raise ReplayLabShaderSaveError(
-                "A previous ReplayLab Host request is still pending")
+                "A previous Bread Host request is still pending")
         _ACTIVE_REQUEST_THREAD = worker
     try:
         worker.start()
@@ -241,7 +304,7 @@ def _bounded_winhttp_request(method, path, port, headers, body,
         raise
     if not finished.wait(timeout):
         raise ReplayLabShaderSaveUncertain(
-            "ReplayLab Host request timed out")
+            "Bread Host request timed out")
     if "error" in outcome:
         raise outcome["error"]
     return outcome["value"]
@@ -262,6 +325,21 @@ def _winhttp_post(port, token, body, timeout_seconds):
         "Accept: application/json\r\n" % token)
     return _bounded_winhttp_request(
         "POST", SAVE_PATH, port, headers, body, timeout_seconds)
+
+
+LIVE_EDIT_PATH = "/replaylab/shader-live-edit"
+LIVE_EDIT_SCHEMA = "replaylab-internal-shader-live-edit/v1"
+
+
+def _winhttp_post_live_edit(port, token, body, timeout_seconds):
+    """POST one live-edit operation (apply / restore) to the internal Host."""
+
+    headers = (
+        "Authorization: Bearer %s\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Accept: application/json\r\n" % token)
+    return _bounded_winhttp_request(
+        "POST", LIVE_EDIT_PATH, port, headers, body, timeout_seconds)
 
 
 def _winhttp_post_check(port, token, body, timeout_seconds):
@@ -379,7 +457,7 @@ def _process_alive(pid):
                 handle, ctypes.byref(exit_code))) and exit_code.value == 259
         finally:
             kernel32.CloseHandle(handle)
-    try:  # pragma: no cover - Windows is qrenderdoc's supported host.
+    try:  # Portable process-liveness probe; no signal is delivered.
         os.kill(value, 0)
         return True
     except OSError:
@@ -420,20 +498,20 @@ class ReplayLabShaderSaveClient(object):
             try:
                 state = _strict_json(
                     _read_bounded(state_path, MAX_STATE_BYTES,
-                                  "ReplayLab internal Host state"),
-                    "ReplayLab internal Host state")
+                                  "Bread internal Host state"),
+                    "Bread internal Host state")
                 if (state.get("schema") != "replaylab-internal-host/v1" or
                         state.get("service") != "ReplayLabInternal" or
                         state.get("host") != "127.0.0.1"):
                     raise ReplayLabShaderSaveError(
-                        "ReplayLab internal Host state identity is invalid")
+                        "Bread internal Host state identity is invalid")
                 try:
                     port = int(state.get("port"))
                     heartbeat = int(state.get("heartbeatUnixMs"))
                     pid = int(state.get("pid"))
                 except (TypeError, ValueError, OverflowError):
                     raise ReplayLabShaderSaveError(
-                        "ReplayLab Host state is invalid")
+                        "Bread Host state is invalid")
                 now_ms = int(time.time() * 1000)
                 heartbeat_age = now_ms - heartbeat
                 version = str(state.get("version", "") or "").strip()
@@ -442,7 +520,8 @@ class ReplayLabShaderSaveClient(object):
                 host_instance_id = state.get("hostInstanceId")
                 if (port < 1024 or port > 65535 or pid <= 0 or heartbeat <= 0 or
                         heartbeat_age < -2000 or heartbeat_age > 5000 or
-                        version != EXPECTED_HOST_VERSION or
+                        not _host_runtime_version_compatible(
+                            version, EXPECTED_HOST_VERSION) or
                         endpoint != (
                             "http://127.0.0.1:%d/replaylab/internal" % port) or
                         isinstance(protocol_version, bool) or
@@ -452,26 +531,26 @@ class ReplayLabShaderSaveClient(object):
                         ID_PATTERN.fullmatch(host_instance_id) is None or
                         not _process_alive(pid)):
                     raise ReplayLabShaderSaveError(
-                        "ReplayLab internal Host state is stale")
+                        "Bread internal Host state is stale")
                 published_token = str(state.get("tokenFile", "") or "").strip()
                 if (published_token and
                         os.path.normcase(os.path.abspath(published_token)) !=
                         os.path.normcase(token_path)):
                     raise ReplayLabShaderSaveError(
-                        "ReplayLab internal Host token path is inconsistent")
+                        "Bread internal Host token path is inconsistent")
                 token = _read_bounded(
                     token_path, MAX_TOKEN_BYTES,
-                    "ReplayLab internal Host token").decode("ascii").strip()
+                    "Bread internal Host token").decode("ascii").strip()
                 if TOKEN_PATTERN.fullmatch(token) is None:
                     raise ReplayLabShaderSaveError(
-                        "ReplayLab internal Host token is invalid")
+                        "Bread internal Host token is invalid")
                 return (port, token, pid, version, protocol_version,
                         host_instance_id)
             except (ReplayLabShaderSaveError, UnicodeDecodeError) as exc:
                 last_error = exc
                 self.sleep(0.05)
         raise ReplayLabShaderSaveError(
-            "ReplayLab internal Host is unavailable: %s" %
+            "Bread internal Host is unavailable: %s" %
             str(last_error or "internal Host state is unavailable"))
 
     def _verify_health(self, port, pid, version, protocol_version,
@@ -483,17 +562,18 @@ class ReplayLabShaderSaveClient(object):
             raise
         except Exception as exc:
             raise ReplayLabShaderSaveError(
-                "ReplayLab internal Host health check failed: %s" % str(exc))
+                "Bread internal Host health check failed: %s" % str(exc))
         if not body or len(body) > MAX_RESPONSE_BYTES:
             raise ReplayLabShaderSaveError(
-                "ReplayLab internal Host health response is invalid")
-        value = _strict_json(body, "ReplayLab internal Host health check")
+                "Bread internal Host health response is invalid")
+        value = _strict_json(body, "Bread internal Host health check")
         response_pid = value.get("pid")
         response_protocol_version = value.get("hostStateProtocolVersion")
         response_host_instance_id = value.get("hostInstanceId")
         if (status != 200 or value.get("service") != "ReplayLabInternal" or
                 value.get("transport") != "internal-http" or
-                value.get("version") != EXPECTED_HOST_VERSION or
+                not _host_runtime_version_compatible(
+                    value.get("version"), EXPECTED_HOST_VERSION) or
                 value.get("version") != version or
                 not _has_required_capabilities(value.get("capabilities")) or
                 isinstance(response_protocol_version, bool) or
@@ -505,7 +585,7 @@ class ReplayLabShaderSaveClient(object):
                 isinstance(response_pid, bool) or
                 not isinstance(response_pid, int) or response_pid != pid):
             raise ReplayLabShaderSaveError(
-                "ReplayLab internal Host health identity is invalid")
+                "Bread internal Host health identity is invalid")
 
     def save(self, live_edit_id, authorization_id, workspace_id,
              expected_raw_sha256, text):
@@ -556,17 +636,17 @@ class ReplayLabShaderSaveClient(object):
             raise
         except Exception as exc:
             raise ReplayLabShaderSaveError(
-                "ReplayLab Host connection failed: %s" % str(exc))
+                "Bread Host connection failed: %s" % str(exc))
         if not response_body or len(response_body) > MAX_RESPONSE_BYTES:
             raise ReplayLabShaderSaveError(
-                "ReplayLab Host returned an invalid response size")
-        value = _strict_json(response_body, "ReplayLab Host")
+                "Bread Host returned an invalid response size")
+        value = _strict_json(response_body, "Bread Host")
         if status != 200:
             message = str(value.get("error", "Shader save was rejected") or "")[:4096]
             if status == 409 and value.get("conflict") is True:
                 raise ReplayLabShaderSaveConflict(message)
             raise ReplayLabShaderSaveError(
-                "ReplayLab Host rejected the Shader save (HTTP %d): %s" %
+                "Bread Host rejected the Shader save (HTTP %d): %s" %
                 (status, message))
 
         expected_fields = {
@@ -589,7 +669,7 @@ class ReplayLabShaderSaveClient(object):
                 changed != (source_hash != expected_raw_sha256) or
                 not isinstance(value.get("compileScheduled"), bool)):
             raise ReplayLabShaderSaveError(
-                "ReplayLab Host returned an invalid Shader save result")
+                "Bread Host returned an invalid Shader save result")
         size = value.get("size")
         modified_ns = value.get("modifiedNs")
         if (isinstance(size, bool) or not isinstance(size, int) or
@@ -597,7 +677,7 @@ class ReplayLabShaderSaveClient(object):
                 not isinstance(modified_ns, int) or modified_ns <= 0 or
                 modified_ns > 0x7FFFFFFFFFFFFFFF):
             raise ReplayLabShaderSaveError(
-                "ReplayLab Host returned invalid Shader save metadata")
+                "Bread Host returned invalid Shader save metadata")
         return {
             "rawSha256": value["savedRawSha256"],
             "size": size,
@@ -606,6 +686,129 @@ class ReplayLabShaderSaveClient(object):
             "compileScheduled": value["compileScheduled"],
             "watchId": value["watchId"],
         }
+
+    def live_edit_operation(self, operation, parameters, binding, timeout_seconds=None):
+        """Run a capture-bound source/edit operation on the Host.
+
+        ``binding`` is the exact qrenderdoc instance / capture session / capture
+        path the Host checks before touching replay state.
+        """
+
+        if operation not in ("apply", "restore", "save-source", "convert-hlsl", "compiler-contract",
+                             "open-source-document", "save-source-document",
+                             "save-and-apply-source", "save-and-apply-source-document"):
+            raise ReplayLabShaderSaveError("unsupported Shader live-edit operation")
+        if not isinstance(parameters, dict) or not isinstance(binding, dict):
+            raise ReplayLabShaderSaveError("Shader live-edit request is invalid")
+        import uuid
+
+        body = json.dumps(
+            {"schema": LIVE_EDIT_SCHEMA, "requestId": uuid.uuid4().hex,
+             "operation": operation, "parameters": parameters, "binding": binding},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(body) > MAX_REQUEST_BYTES:
+            raise ReplayLabShaderSaveError("Shader source request exceeds its size limit")
+        (port, token, pid, version, protocol_version,
+         host_instance_id) = self._credentials()
+        self._verify_health(
+            port, pid, version, protocol_version, host_instance_id)
+        try:
+            status, response_body = _winhttp_post_live_edit(
+                port, token, body,
+                float(timeout_seconds) if timeout_seconds else max(120.0, self.timeout_seconds))
+        except ReplayLabShaderSaveError:
+            raise
+        except Exception as exc:
+            raise ReplayLabShaderSaveError(
+                "Bread Host connection failed: %s" % str(exc))
+        if not response_body or len(response_body) > MAX_RESPONSE_BYTES:
+            raise ReplayLabShaderSaveError(
+                "Bread Host returned an invalid response size")
+        value = _strict_json(response_body, "Shader live-edit response")
+        if status != 200:
+            error = value.get("error") if isinstance(value, dict) else None
+            if status == 409 and isinstance(value, dict) and value.get("conflict") is True:
+                raise ReplayLabShaderSaveConflict(str(error or "Shader source changed")[:2048])
+            raise ReplayLabShaderSaveError(
+                str(error or "Shader live-edit operation failed (HTTP %s)" % status)[:2048])
+        result = value.get("result") if isinstance(value, dict) else None
+        if not isinstance(result, dict):
+            raise ReplayLabShaderSaveError("Shader live-edit response is invalid")
+        return result
+
+    def save_source(self, workspace_path, source_workspace_id, expected_raw_sha256,
+                    text, binding):
+        result = self.live_edit_operation("save-source", {
+            "workspace_path": workspace_path, "source_workspace_id": source_workspace_id,
+            "expected_raw_sha256": expected_raw_sha256, "text": text}, binding)
+        expected = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if (result.get("rawSha256") != expected or result.get("sourceOnly") is not True
+                or result.get("compileScheduled") is not False
+                or result.get("sourceWorkspaceId") != source_workspace_id
+                or not isinstance(result.get("sourcePath"), str)
+                or not isinstance(result.get("modifiedNs"), int)):
+            raise ReplayLabShaderSaveError("Bread Host returned an invalid source-only save result")
+        return result
+
+    def save_and_apply_source(self, workspace_path, source_workspace_id,
+                              expected_raw_sha256, text, binding):
+        result = self.live_edit_operation("save-and-apply-source", {
+            "workspace_path": workspace_path, "source_workspace_id": source_workspace_id,
+            "expected_raw_sha256": expected_raw_sha256, "text": text}, binding)
+        return self._validate_editor_save(result, source_workspace_id, text)
+
+    def save_and_apply_source_document(self, workspace_path, source_workspace_id,
+                                       document_id, expected_raw_sha256,
+                                       expected_source_sha256, text, binding):
+        result = self.live_edit_operation("save-and-apply-source-document", {
+            "workspace_path": workspace_path, "source_workspace_id": source_workspace_id,
+            "document_id": document_id, "expected_raw_sha256": expected_raw_sha256,
+            "expected_source_sha256": expected_source_sha256, "text": text}, binding)
+        if (result.get("schema") != "bread-shader-source-document/v1" or
+                result.get("sourceDocumentId") != document_id):
+            raise ReplayLabShaderSaveError("Bread Host returned an invalid include save result")
+        return self._validate_editor_save(result, source_workspace_id, text)
+
+    @staticmethod
+    def _validate_editor_save(result, source_workspace_id, text):
+        # Saving and scheduling are independent facts: a compiler/session failure must
+        # not make an already persisted editor buffer appear unsaved or lose its CAS.
+        if (result.get("rawSha256") != hashlib.sha256(text.encode("utf-8")).hexdigest() or
+                result.get("sourceWorkspaceId") != source_workspace_id or
+                result.get("sourceOnly") is not False or
+                not isinstance(result.get("compileScheduled"), bool) or
+                not isinstance(result.get("sourcePath"), str) or
+                not isinstance(result.get("modifiedNs"), int) or
+                (result.get("autoApplyError") is not None and
+                 not isinstance(result["autoApplyError"], str))):
+            raise ReplayLabShaderSaveError("Bread Host returned an invalid editor save result")
+        return result
+
+    def open_source_document(self, workspace_path, source_workspace_id, requested_path, binding):
+        result = self.live_edit_operation("open-source-document", {
+            "workspace_path": workspace_path, "source_workspace_id": source_workspace_id,
+            "requested_path": requested_path}, binding)
+        if (result.get("schema") != "bread-shader-source-document/v1" or
+                result.get("sourceWorkspaceId") != source_workspace_id or
+                result.get("sourceOnly") is not True or result.get("compileScheduled") is not False or
+                not isinstance(result.get("sourceDocumentId"), str) or
+                re.fullmatch(r"[0-9a-f]{64}", result["sourceDocumentId"]) is None):
+            raise ReplayLabShaderSaveError("Bread Host returned an invalid include document")
+        return result
+
+    def save_source_document(self, workspace_path, source_workspace_id, document_id,
+                             expected_raw_sha256, expected_source_sha256, text, binding):
+        result = self.live_edit_operation("save-source-document", {
+            "workspace_path": workspace_path, "source_workspace_id": source_workspace_id,
+            "document_id": document_id, "expected_raw_sha256": expected_raw_sha256,
+            "expected_source_sha256": expected_source_sha256, "text": text}, binding)
+        if (result.get("schema") != "bread-shader-source-document/v1" or
+                result.get("sourceWorkspaceId") != source_workspace_id or
+                result.get("sourceDocumentId") != document_id or
+                result.get("rawSha256") != hashlib.sha256(text.encode("utf-8")).hexdigest() or
+                result.get("sourceOnly") is not True or result.get("compileScheduled") is not False):
+            raise ReplayLabShaderSaveError("Bread Host returned an invalid include save result")
+        return result
 
     def check(self, live_edit_id, authorization_id, workspace_id, text):
         """Compile an unsaved buffer for live diagnostics; never publishes.
@@ -655,15 +858,15 @@ class ReplayLabShaderSaveClient(object):
             raise
         except Exception as exc:
             raise ReplayLabShaderSaveError(
-                "ReplayLab Host connection failed: %s" % str(exc))
+                "Bread Host connection failed: %s" % str(exc))
         if not response_body or len(response_body) > MAX_RESPONSE_BYTES:
             raise ReplayLabShaderSaveError(
-                "ReplayLab Host returned an invalid response size")
-        value = _strict_json(response_body, "ReplayLab Host")
+                "Bread Host returned an invalid response size")
+        value = _strict_json(response_body, "Bread Host")
         if status != 200:
             message = str(value.get("error", "Shader check was rejected") or "")[:4096]
             raise ReplayLabShaderSaveError(
-                "ReplayLab Host rejected the Shader check (HTTP %d): %s" %
+                "Bread Host rejected the Shader check (HTTP %d): %s" %
                 (status, message))
         expected_fields = {
             "schema", "schemaVersion", "liveEditId", "authorizationId",
@@ -681,7 +884,7 @@ class ReplayLabShaderSaveClient(object):
                 not isinstance(raw_diagnostics, list) or
                 not isinstance(value.get("reason"), str)):
             raise ReplayLabShaderSaveError(
-                "ReplayLab Host returned an invalid Shader check result")
+                "Bread Host returned an invalid Shader check result")
         diagnostics = []
         for item in raw_diagnostics[:MAX_CHECK_DIAGNOSTICS]:
             if not isinstance(item, dict):
@@ -696,7 +899,7 @@ class ReplayLabShaderSaveClient(object):
                     severity not in ("error", "warning", "information", "hint") or
                     not isinstance(message, str)):
                 raise ReplayLabShaderSaveError(
-                    "ReplayLab Host returned an invalid Shader check diagnostic")
+                    "Bread Host returned an invalid Shader check diagnostic")
             diagnostics.append({
                 "line": line,
                 "column": column,

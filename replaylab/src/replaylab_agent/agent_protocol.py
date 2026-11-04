@@ -48,7 +48,13 @@ class ClarificationRequest(BaseModel):
     clarification_id: str = Field(default="", max_length=64)
 
     def event_payload(self) -> dict[str, Any]:
-        clarification_id = self.clarification_id or ("q-" + uuid.uuid4().hex[:24])
+        # Minted once and kept. This is called at least twice per run -- for the panel
+        # event and again for the machine-readable result -- so generating it each time
+        # gave one question two different ids, and the answer that comes back names an
+        # id neither side recognises.
+        if not self.clarification_id:
+            self.clarification_id = "q-" + uuid.uuid4().hex[:24]
+        clarification_id = self.clarification_id
         options = [option.model_dump() for option in self.options]
         if len(options) < 2:
             existing = {option["id"] for option in options}

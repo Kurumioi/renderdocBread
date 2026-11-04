@@ -169,6 +169,30 @@ class ResourceExportPureHelperTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = load_resource_export()
 
+    def test_new_export_scaffolds_use_bread_defaults_and_keep_protocol_ids(self) -> None:
+        host = load_host_resource_export()
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            spec = {
+                "material": {},
+                "shader": {"unityShaderSource": "Shader \"Bread/Test\" {}\n"},
+            }
+
+            unity_files = host.ResourceExportManager._write_unity_scaffold(output, spec, {})
+            blender_files = host.ResourceExportManager._write_blender_scaffold(output, spec, {})
+
+            self.assertIn("UnityURP/Shaders/BreadExport.shader", unity_files)
+            self.assertNotIn("UnityURP/Shaders/ReplayLabExport.shader", unity_files)
+            self.assertIn("# Bread Unity URP adapter", (output / "UnityURP" / "README.md").read_text(encoding="utf-8"))
+            blender_script = (output / "Blender" / "import_resource.py").read_text(encoding="utf-8")
+            self.assertIn('"BreadMaterial"', blender_script)
+            self.assertIn("Bread import complete", blender_script)
+            self.assertNotIn("ReplayLabMaterial", blender_script)
+            self.assertIn("Blender/adapter.json", blender_files)
+            # Serialized protocol IDs remain backward compatible.
+            adapter = json.loads((output / "Blender" / "adapter.json").read_text(encoding="utf-8"))
+            self.assertEqual("replaylab-blender-adapter/v1", adapter["schema"])
+
     def test_real_host_ticket_shape_passes_capture_validation(self) -> None:
         operation_id = "1" * 32
         capture_session_id = "2" * 32
@@ -360,6 +384,20 @@ class ResourceExportPureHelperTests(unittest.TestCase):
         )
         with self.assertRaises(self.module.UnsupportedVertexFormat):
             self.module.decode_regular_vertex_element(fmt, b"\0\0\0\0")
+
+    def test_integer_ids_are_not_rounded_into_float32(self) -> None:
+        fmt = self.module.normalise_resource_format(_Format(comp_type="UInt", count=1, width=4))
+        self.assertEqual(self.module.encode_canonical_float32(fmt, [struct.pack("<I", 65535)]),
+                         struct.pack("<f", 65535))
+        with self.assertRaisesRegex(self.module.UnsupportedVertexFormat, "lose bits"):
+            self.module.encode_canonical_float32(fmt, [struct.pack("<I", 16777217)])
+
+    def test_float64_precision_loss_retains_raw_instead_of_rounding(self) -> None:
+        fmt = self.module.normalise_resource_format(_Format(comp_type="Double", count=1, width=8))
+        self.assertEqual(self.module.encode_canonical_float32(fmt, [struct.pack("<d", 0.5)]), struct.pack("<f", 0.5))
+        for value in (1.000000000000001, 1e300):
+            with self.assertRaises(self.module.UnsupportedVertexFormat):
+                self.module.encode_canonical_float32(fmt, [struct.pack("<d", value)])
 
     def test_attribute_location_is_never_fabricated_from_layout_order(self) -> None:
         controller = _MeshController([0.0, 1.0], None)

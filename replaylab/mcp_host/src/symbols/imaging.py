@@ -187,18 +187,24 @@ def decode_png(data: bytes) -> tuple[bytearray, int, int]:
     channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type)
     if channels is None:
         raise ImageDecodeError("PNG colour type %d not supported" % color_type)
-    raw = zlib.decompress(bytes(idat))
     stride = width * channels
-    if len(raw) < (stride + 1) * height:
+    expected_bytes = (stride + 1) * height
+    decoder = zlib.decompressobj()
+    raw = decoder.decompress(bytes(idat), expected_bytes + 1)
+    if len(raw) > expected_bytes or decoder.unconsumed_tail:
+        raise ImageDecodeError("PNG image data exceeds its declared dimensions")
+    if len(raw) < expected_bytes or not decoder.eof:
         raise ImageDecodeError("PNG image data is truncated")
     previous = bytearray(stride)
     pixels = bytearray()
     offset = 0
     for _ in range(height):
         filter_type = raw[offset]
+        if filter_type > 4:
+            raise ImageDecodeError("PNG filter type is invalid")
         line = bytearray(raw[offset + 1:offset + 1 + stride])
         offset += stride + 1
-        for i in range(stride):
+        for i in range(stride) if filter_type else ():
             a = line[i - channels] if i >= channels else 0
             b = previous[i]
             c = previous[i - channels] if i >= channels else 0

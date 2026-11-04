@@ -1702,20 +1702,16 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     attachments.clear();
   }
 
-  // this struct probably will never get used, since the user could just set the colorWriteMask
-  // above to 0. It's really only useful for specifying how the dynamic state works. However just
-  // for completeness...
+  // Keep static color-write enables independent of masks. Folding a disabled
+  // attachment into its mask is incorrect when the mask is later set dynamically.
+  colorWriteEnables.clear();
   const VkPipelineColorWriteCreateInfoEXT *colorWriteEnable =
       (const VkPipelineColorWriteCreateInfoEXT *)FindNextStruct(
-          pCreateInfo->pRasterizationState, VK_STRUCTURE_TYPE_PIPELINE_COLOR_WRITE_CREATE_INFO_EXT);
+          pCreateInfo->pColorBlendState, VK_STRUCTURE_TYPE_PIPELINE_COLOR_WRITE_CREATE_INFO_EXT);
   if(colorWriteEnable)
   {
     RDCASSERTEQUAL(attachments.size(), colorWriteEnable->attachmentCount);
-    for(size_t i = 0; i < attachments.size() && i < colorWriteEnable->attachmentCount; i++)
-    {
-      if(!colorWriteEnable->pColorWriteEnables[i])
-        attachments[i].channelWriteMask = 0;
-    }
+    colorWriteEnables.assign(colorWriteEnable->pColorWriteEnables, colorWriteEnable->attachmentCount);
   }
 
   // VkPipelineViewportDepthClipControlCreateInfoEXT
@@ -1873,6 +1869,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
         memcpy(blendConst, pipeInfo.blendConst, sizeof(blendConst));
 
         attachments = pipeInfo.attachments;
+        colorWriteEnables = pipeInfo.colorWriteEnables;
 
         viewMask = pipeInfo.viewMask;
         colorFormats = pipeInfo.colorFormats;

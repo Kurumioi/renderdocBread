@@ -10,6 +10,7 @@ from unittest import mock
 import uuid
 
 from src import asset_index_jobs
+from src.asset_catalog import AssetCatalogError
 from src.internal_tool_service import (
     ASSET_INDEX_OPERATION_SCHEMA,
     InternalToolService,
@@ -41,6 +42,40 @@ class AssetIndexJobTests(unittest.TestCase):
         self.assertEqual(final["result"]["assetCount"], 5)
         self.assertTrue(final["result"]["complete"])
         self.assertEqual(final["owner"], "test")
+
+    def test_names_only_job_never_builds_a_full_content_manifest(self) -> None:
+        with mock.patch.object(
+            asset_index_jobs.AssetCatalogService,
+            "refresh_content_manifest",
+            side_effect=AssertionError("names-only indexing must not hash the whole tree"),
+        ):
+            first = asset_index_jobs.ensure_index_job(
+                self.database, self.root, "b1", depth="names", owner="test"
+            )
+            self.assertEqual(first["status"], "running")
+            final = asset_index_jobs.wait_for_index_job(self.database, 30.0)
+        self.assertEqual(final["status"], "done")
+        self.assertEqual(final["depth"], "names")
+        self.assertEqual(
+            final["result"]["contentManifest"],
+            {
+                "ready": False,
+                "deferred": True,
+                "reasonCode": "names-only-index",
+            },
+        )
+
+    def test_storage_preparation_failure_is_synchronous_and_no_job_is_advertised(self) -> None:
+        with mock.patch.object(
+            asset_index_jobs.AssetCatalogService,
+            "prepare_root",
+            side_effect=AssetCatalogError("catalog database is locked"),
+        ):
+            with self.assertRaisesRegex(AssetCatalogError, "locked"):
+                asset_index_jobs.ensure_index_job(
+                    self.database, self.root, "b1", depth="names", owner="test"
+                )
+        self.assertIsNone(asset_index_jobs.index_job_status(self.database))
 
     def test_operation_contract_rejects_paths_and_unknown_fields(self) -> None:
         good = json.dumps({"schema": ASSET_INDEX_OPERATION_SCHEMA, "requestId": uuid.uuid4().hex,

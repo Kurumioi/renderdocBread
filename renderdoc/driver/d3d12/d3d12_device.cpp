@@ -486,10 +486,20 @@ static bool SameD3D12BufferPatchLayout(const rdcarray<ReplayBufferPatch> &previo
   return SameReplayBufferPatchLayout(previous, next);
 }
 
+static bool IsD3D12BufferPatchReadUsage(ResourceUsage usage)
+{
+  // One upload-ring allocation can contain CBVs, SRVs and geometry data. These bindings only
+  // read bytes; rejecting their entire allocation makes ordinary material constants uneditable.
+  // Keep generated-command arguments and every GPU-write usage outside this whitelist.
+  return (usage >= ResourceUsage::VS_Constants && usage <= ResourceUsage::All_Constants) ||
+         (usage >= ResourceUsage::VS_Resource && usage <= ResourceUsage::All_Resource) ||
+         usage == ResourceUsage::VertexBuffer || usage == ResourceUsage::IndexBuffer ||
+         usage == ResourceUsage::CopySrc;
+}
+
 static uint32_t D3D12BufferPatchConsumerFromUsage(uint32_t first, const EventUsage &usage)
 {
-  if((usage.usage >= ResourceUsage::VS_Constants && usage.usage <= ResourceUsage::All_Constants) ||
-     usage.usage == ResourceUsage::CopySrc || usage.usage == ResourceUsage::Copy)
+  if(IsD3D12BufferPatchReadUsage(usage.usage) || usage.usage == ResourceUsage::Copy)
     return RDCMIN(first, usage.eventId);
   return first;
 }
@@ -555,9 +565,12 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
                (D3D12Chunk)m_StructuredFile->chunks[event.chunkIndex]->metadata.chunkID))
           return "Persistent D3D12 buffer has a write command without a range-patch replay hook";
       }
-      else if(usage.usage != ResourceUsage::CPUWrite && usage.usage != ResourceUsage::CopySrc &&
+      else if(!IsD3D12BufferPatchReadUsage(usage.usage) &&
+              usage.usage != ResourceUsage::CPUWrite &&
               usage.usage != ResourceUsage::Barrier && usage.usage != ResourceUsage::Unused)
-        return "Persistent D3D12 parameter buffer has unsupported shader, indirect, query or GPU-write use";
+        return StringFormat::Fmt(
+            "Persistent D3D12 parameter buffer has unsupported %s use at event %u",
+            ToStr(usage.usage).c_str(), usage.eventId);
     }
     if(!constants)
       return "Persistent D3D12 edit target has no captured constant-buffer consumer";
@@ -779,7 +792,10 @@ rdcstr WrappedID3D12Device::SetReplayBufferPatches(const rdcarray<ReplayBufferPa
         m_ReplayBufferPatchAnchorEvent = (--anchor)->first;
     }
   }
-  m_Replay->ClearReplayCache();
+  // Buffer-patch scrub deliberately preserves the initial-state source cache
+  // (initialSourcesPreserved=1 below), so use the lightweight scrub rather than
+  // the full release that trims rebuildable replay resources.
+  m_Replay->ClearScrubReplayCache();
   if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
     LogD3D12Checkpoint(StringFormat::Fmt(
         "api=D3D12BufferPatch op=set ranges=%zu bytes=%llu resetBuffers=%zu firstConsumer=%u "
@@ -10668,6 +10684,31 @@ TEST_CASE("D3D12 persistent buffer edits accept only replay writes with installe
   CHECK_FALSE(IsReplayBufferPatchCopy(D3D12Chunk::List_ResolveQueryData));
   CHECK_FALSE(IsReplayBufferPatchCopy(D3D12Chunk::List_AtomicCopyBufferUINT));
   CHECK_FALSE(IsReplayBufferPatchCopy(D3D12Chunk::List_ExecuteIndirect));
+}
+
+TEST_CASE("D3D12 parameter edits accept mixed read-only rings and invalidate every consumer",
+          "[d3d12][replay][buffer-patch]")
+{
+  for(ResourceUsage usage : {ResourceUsage::VertexBuffer, ResourceUsage::IndexBuffer,
+                             ResourceUsage::VS_Constants, ResourceUsage::All_Constants,
+                             ResourceUsage::VS_Resource, ResourceUsage::PS_Resource,
+                             ResourceUsage::CS_Resource, ResourceUsage::All_Resource,
+                             ResourceUsage::CopySrc})
+  {
+    INFO("read usage " << uint32_t(usage));
+    CHECK(IsD3D12BufferPatchReadUsage(usage));
+    CHECK(D3D12BufferPatchConsumerFromUsage(100, EventUsage(25, usage)) == 25);
+    CHECK(D3D12BufferPatchConsumerFromUsage(10, EventUsage(25, usage)) == 10);
+  }
+  for(ResourceUsage usage : {ResourceUsage::StreamOut, ResourceUsage::VS_RWResource,
+                             ResourceUsage::All_RWResource, ResourceUsage::Indirect,
+                             ResourceUsage::Clear, ResourceUsage::Discard,
+                             ResourceUsage::CopyDst, ResourceUsage::ResolveDst,
+                             ResourceUsage::Shader, ResourceUsage(0xffffffffU)})
+  {
+    INFO("unproven/write usage " << uint32_t(usage));
+    CHECK_FALSE(IsD3D12BufferPatchReadUsage(usage));
+  }
 }
 
 TEST_CASE("D3D12 checkpoint initial sources cover each heap byte exactly once",

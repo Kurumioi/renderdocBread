@@ -103,16 +103,16 @@ class _Runner(object):
             stack.setCurrentIndex(0)
             graph = {
                 "schema": "replaylab-shader-flow-graph/v1", "schemaVersion": 1,
-                "graphKind": "algorithm-dataflow", "graphId": "scratch-stage-graph",
+                "graphKind": "function-execution", "graphId": "scratch-stage-graph",
                 "nodes": [
                     {"id": "double", "name": "Evaluate", "label": "Multiply the input by two",
-                     "kind": "computation", "source": {"line": 2, "column": 3}},
+                     "kind": "function-call", "source": {"line": 2, "column": 3}},
                     {"id": "return", "name": "Evaluate", "label": "Return the intermediate value",
-                     "kind": "computation", "source": {"line": 3, "column": 3}},
+                     "kind": "function-call", "source": {"line": 3, "column": 3}},
                     {"id": "output", "name": "MainPS", "label": "Write the color output",
-                     "kind": "computation", "source": {"line": 6, "column": 3}}],
-                "edges": [{"source": "double", "target": "return", "kind": "data"},
-                          {"source": "return", "target": "output", "kind": "control"}]}
+                     "kind": "function-call", "source": {"line": 6, "column": 3}}],
+                "edges": [{"source": "double", "target": "return", "kind": "sequence"},
+                          {"source": "return", "target": "output", "kind": "sequence"}]}
             activations = []
             def activate(location):
                 activations.append(location)
@@ -148,6 +148,9 @@ class _Runner(object):
             ys = [view._nodes[node["id"]].pos().y() for node in graph["nodes"]]
             checks["topDown"] = ys[0] < ys[1] < ys[2]
             view._activate_node(view._graph["nodes"][0])
+            # Graph navigation is delivered on the next UI turn. Finish it before
+            # testing F12 so its callback cannot overwrite the definition cursor.
+            _settle()
             checks["algorithmNavigation"] = bool(activations) and editors[0].GetCursorLine() == 2
 
             widget = editors[0].Widget().findChild(QtWidgets.QWidget, "shaderCodeEditor")
@@ -155,6 +158,9 @@ class _Runner(object):
             _key(widget, QtCore.Qt.Key_F12)
             _settle()
             checks["f12Function"] = editors[0].GetCursorLine() == 1
+            result["functionDefinitionDebug"] = {"cursorLine": editors[0].GetCursorLine(),
+                "cursorColumn": editors[0].GetCursorColumn(), "status": widget.toolTip(),
+                "navigation": list(opened), "source": editors[0].GetText()}
             editors[0].GoToLine(2, SOURCE.splitlines()[1].index("value") + 2)
             _key(widget, QtCore.Qt.Key_F12)
             _settle()
@@ -162,7 +168,13 @@ class _Runner(object):
             editors[0].GoToLine(6, SOURCE.splitlines()[5].index("ExternalValue") + 2)
             _key(widget, QtCore.Qt.Key_F12)
             _settle()
-            checks["f12RevealsHiddenDocument"] = stack.currentIndex() == 1 and bool(opened)
+            checks["unrelatedShaderExcludedFromDefinitions"] = stack.currentIndex() == 0 and editors[0].GetCursorLine() == 6
+            included_source = SOURCE + '\n#include "' + os.path.basename(paths[1]) + '"\n'
+            editors[0].SetText(included_source)
+            editors[0].GoToLine(6, SOURCE.splitlines()[5].index("ExternalValue") + 2)
+            _key(widget, QtCore.Qt.Key_F12)
+            _settle()
+            checks["f12RevealsIncludedDocument"] = stack.currentIndex() == 1 and bool(opened)
 
             # A suspended capture draft is retained by its owner but is not a navigation
             # candidate for the current capture (ordinary hidden tabs still participate).
@@ -221,7 +233,7 @@ class _Runner(object):
                      if item.objectName() == "shaderReferencesPopup" and item.isVisible()]
             menu = menus[0] if menus else None
             refs = [action for action in menu.actions() if action.isEnabled() and action.data()] if menu else []
-            checks["functionDeclarationShowsCalls"] = [int(action.data()) for action in refs] == [10]
+            checks["functionDeclarationShowsCalls"] = editors[0].GetCursorLine() == 10 and not refs
             if menu: menu.close()
 
             # History stores editor positions that move with intervening text edits.
@@ -258,7 +270,7 @@ class _Runner(object):
                      if item.objectName() == "shaderReferencesPopup" and item.isVisible()]
             menu = menus[0] if menus else None
             refs = [action for action in menu.actions() if action.isEnabled() and action.data()] if menu else []
-            checks["commaDeclarationReferencesStayLocal"] = [int(action.data()) for action in refs] == [4]
+            checks["commaDeclarationReferencesStayLocal"] = editors[0].GetCursorLine() == 4 and not refs
             if menu: menu.close()
 
             struct_source = ("struct First { float value; };\n"
@@ -276,8 +288,17 @@ class _Runner(object):
                      if item.objectName() == "shaderReferencesPopup" and item.isVisible()]
             menu = menus[0] if menus else None
             refs = [action for action in menu.actions() if action.isEnabled() and action.data()] if menu else []
-            checks["structReferencesExcludeOtherOwner"] = [int(action.data()) for action in refs] == [6]
+            checks["structReferencesExcludeOtherOwner"] = editors[0].GetCursorLine() == 6 and not refs
             if menu: menu.close()
+
+            indexed_source = ("struct Light { float3 color; };\n"
+                              "Light lights[4];\n"
+                              "float3 Probe() { return lights[1 + int(0)].color.xyz; }\n")
+            editors[0].SetText(indexed_source)
+            for field in ("color", "xyz"):
+                editors[0].GoToLine(3, indexed_source.splitlines()[2].index(field) + 2)
+                _key(widget, QtCore.Qt.Key_F12)
+                checks["indexedStructMember_" + field] = editors[0].GetCursorLine() == 1
 
             editors[0].SetText(scoped_source)
             marker = editors[0].CreateLineAnchor(3)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import ctypes
 import hashlib
 import importlib.util
 import json
@@ -12,9 +13,11 @@ import tempfile
 import unittest
 from unittest import mock
 
+import pytest
+
 from src import projects as projects_module
 from src.projects import ReplayProjectService
-from src.shader_workspace.flow_graph import build_shader_flow_graph
+from src.shader_workspace.flow_graph import _algorithm_nodes, build_shader_flow_graph
 from src.shader_workspace.equivalence import build_verdict
 from src.shader_workspace.organization import ShaderOrganizationManager
 from src.symbols.dxbc import fingerprint_bytes
@@ -402,12 +405,13 @@ class ShaderConsoleFixture:
         return console.normalize_capture_binding({
             "instanceId": "1234-fixture",
             "captureSessionId": "8" * 32,
-            "capturePath": "C:/captures/test.rdc",
+            "capturePath": self._capture_path,
         })
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, workspace_name: str = "workspace", *, capture_path=None):
         self.root = root
-        self.workspace = root / "workspace"
+        self._capture_path = str(capture_path or root / "test.rdc")
+        self.workspace = root / workspace_name
         self.source = self.workspace / "source" / "shader.hlsl"
         self.registry = root / "shader-live-edit-authorizations.v1.json"
         self.source.parent.mkdir(parents=True)
@@ -421,7 +425,8 @@ class ShaderConsoleFixture:
                 "schema": console.WORKSPACE_SCHEMA,
                 "schemaVersion": 1,
                 "workspaceId": self.WORKSPACE_ID,
-                "capture": {"captureId": self.CAPTURE_ID},
+                "capture": {"captureId": self.CAPTURE_ID,
+                            "capturePath": self._capture_path},
                 "shader": {
                     "rawSha256": self.RAW_SHA256,
                     "stage": "fragment",
@@ -450,7 +455,7 @@ class ShaderConsoleFixture:
                             {
                                 "workspaceId": self.WORKSPACE_ID,
                                 "captureId": self.CAPTURE_ID,
-                                "capturePath": "C:/captures/test.rdc",
+                                "capturePath": self._capture_path,
                                 "shaderKey": "fragment:101:MainPS",
                                 "shaderRawSha256": self.RAW_SHA256,
                                 "stage": "fragment",
@@ -464,7 +469,7 @@ class ShaderConsoleFixture:
                         "workspaceIdentity": {
                             "workspaceId": self.WORKSPACE_ID,
                             "captureId": self.CAPTURE_ID,
-                            "capturePath": "C:/captures/test.rdc",
+                            "capturePath": self._capture_path,
                             "shaderKey": "fragment:101:MainPS",
                             "shaderRawSha256": self.RAW_SHA256,
                             "stage": "fragment",
@@ -487,12 +492,13 @@ class ShaderConsoleFixture:
         proposal = baseline if proposal_source is None else proposal_source.encode("utf-8")
         baseline_sha = hashlib.sha256(baseline).hexdigest()
         proposal_sha = hashlib.sha256(proposal).hexdigest()
-        soft = level == "rejected"
-        final_sha = baseline_sha if soft else proposal_sha
+        if level == "rejected":
+            raise ValueError("a rejected candidate cannot be published")
+        final_sha = proposal_sha
         baseline_code = "2" * 64
         organized_code = baseline_code if level == "exact-code" else "9" * 64
-        final_code = baseline_code if soft else organized_code
-        self.source.write_bytes(baseline if soft else proposal)
+        final_code = organized_code
+        self.source.write_bytes(proposal)
         self.session_dir = self.workspace / "ai" / "organization-sessions" / ("1" * 32)
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.baseline_artifact = self.session_dir / "baseline-source.hlsl"
@@ -511,9 +517,7 @@ class ShaderConsoleFixture:
                 "tolerances": {"absolute": 0.00001, "relative": 0.001},
                 "sampleCount": 4,
             }
-        verdict = build_verdict(accepted=not soft, level=level, round_used=3 if soft else 1,
-                                round_limit=3, soft_accepted=soft)
-        verdict["flowSpecAccepted"] = False
+        verdict = build_verdict(accepted=True, level=level)
         gate = {
                 "schema": console.ORGANIZATION_GATE_SCHEMA,
                 "schemaVersion": 1,
@@ -533,18 +537,21 @@ class ShaderConsoleFixture:
                 "baselineReviewCandidateRawSha256": "6" * 64,
                 "baselineReviewAbiRequestId": "7" * 64,
                 "baselineReviewAbiReportSha256": "8" * 64,
-                "decision": "soft-accepted-baseline" if soft else "accepted-executable-editable",
+                "decision": "accepted-executable-editable",
                 "codeSha256Equal": level == "exact-code",
                 "equivalenceLevel": level,
                 "observation": observation,
                 "renameMap": dict(rename_map or {}),
                 "verdict": verdict,
-                "softPublishAllowed": soft,
-                "flowchartGenerated": False,
-                "organizedSourcePromoted": not soft,
+                "organizedSourcePromoted": True,
+                "finishedCurrentDraft": True,
+                "publicationContract": "validated-source",
+                "flowGraphId": "",
+                "flowGraphSha256": "",
+                "flowGraphArtifactPath": str(self.workspace / "ai" / "flow-graph.json"),
                 "baselineCompiledAndAbiValidated": True,
                 "organizedCompiledAndAbiValidated": True,
-                "rawRecoveryCompiledAndAbiValidated": soft,
+                "rawRecoveryCompiledAndAbiValidated": False,
                 "semanticEquivalenceVerified": False,
                 "safeToStartLiveEdit": True,
                 "replayApplied": False,
@@ -590,14 +597,46 @@ class ShaderConsoleFixture:
             "organizationId", "workspaceId", "captureId", "stage", "entryPoint",
             "baselineSourceSha256", "proposalSourceSha256", "baselineCodeSha256",
             "organizedCodeSha256", "codeSha256Equal", "equivalenceLevel", "observation",
-            "softPublishAllowed", "verdict", "renameMap", "decision", "organizedSourcePromoted",
+            "verdict", "renameMap", "decision", "organizedSourcePromoted",
             "finalBinding", "flowGraphId", "flowGraphSha256",
+            "finishedCurrentDraft", "publicationContract",
         ):
             if name in gate:
                 session[name] = copy.deepcopy(gate[name])
         session = self.organization_manager._seal_session(session)
         self._write(self.session_dir / "session.json", session)
         self._write(self.session_dir / "gate.json", gate)
+
+    def write_editable_draft(self):
+        baseline = self.baseline_artifact.read_bytes()
+        proposal = b"// current unvalidated draft\n" + baseline
+        self.source.write_bytes(proposal)
+        self.proposal_artifact.write_bytes(proposal)
+        source_sha = hashlib.sha256(proposal).hexdigest()
+        gate_path = self.workspace / "ai" / "organize-code-gate.json"
+        gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        gate.update({
+            "decision": "editable-draft",
+            "proposalSourceSha256": source_sha,
+            "editableDraftSourcePath": str(self.source.resolve()),
+            "safeToStartLiveEdit": False,
+            "organizedSourcePromoted": False,
+            "finalBinding": {"complete": False, "sourceSha256": source_sha,
+                             "revision": None, "candidateRawSha256": "",
+                             "codeSha256": "", "abiRequestId": "",
+                             "abiReportSha256": ""},
+        })
+        self._write(gate_path, gate)
+        session_path = self.session_dir / "session.json"
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        session.update({
+            "state": "drafting",
+            "proposalSourceSha256": source_sha,
+            "syncedDraftSourceSha256": source_sha,
+            "shaderProgramIdentity": {"originalRawSha256": self.RAW_SHA256},
+        })
+        self._write(session_path, session)
+        return gate
 
     @staticmethod
     def _write(path: Path, value: dict) -> None:
@@ -653,7 +692,8 @@ class ShaderConsoleFixture:
         self._write(self.workspace / "live-edit" / (self.LIVE_ID + ".json"), value)
 
 
-def _console_algorithm_graph(fixture):
+
+def _console_legacy_algorithm_graph(fixture):
     calculations = [
         ("float4 color = float4(uv, 0, 1);", "读取像素坐标", ["uv"], ["color"]),
         ("float weight = 0.5;", "准备混合权重", [], ["weight"]),
@@ -697,12 +737,38 @@ def _console_algorithm_graph(fixture):
         origin="organized-proposal",
         flow_spec={"stages": stages},
     )
+    # Reconstruct a pre-function-only v1 artifact to retain compatibility
+    # coverage. The Host no longer publishes this shape from ``flow_spec``.
+    nodes, edges = _algorithm_nodes(
+        source, {"stages": stages}, fixture.WORKSPACE_ID, "source/shader.hlsl")
+    graph.update({
+        "nodes": nodes,
+        "edges": edges,
+        "graphKind": "algorithm-dataflow",
+        "layoutDirection": "TD",
+        "truncated": {"nodes": False, "edges": False,
+                      "omittedNodes": 0, "omittedEdges": 0},
+        "policy": {
+            "navigationOnly": True,
+            "physicalEvidence": False,
+            "compileAuthorization": False,
+            "applyAuthorization": False,
+            "callEdgesDerivedFromFinalSource": False,
+            "descriptionsMayBeAiAuthored": True,
+            "computationRangesBoundToFinalSource": True,
+            "dataEdgesAreLexicallyBound": True,
+        },
+    })
+    material = dict(graph)
+    material.pop("graphId", None)
+    material.pop("generatedAt", None)
+    graph["graphId"] = console._canonical_sha256(material)[:32]
     fixture.write_organization_gate(baseline_source=source, proposal_source=source)
-    _publish_console_algorithm_graph(fixture, graph)
+    _publish_console_legacy_algorithm_graph(fixture, graph)
     return graph
 
 
-def _publish_console_algorithm_graph(fixture, graph):
+def _publish_console_legacy_algorithm_graph(fixture, graph):
     graph_path = fixture.workspace / "ai" / "flow-graph.json"
     fixture._write(graph_path, graph)
     gate_path = fixture.workspace / "ai" / "organize-code-gate.json"
@@ -717,7 +783,7 @@ def _publish_console_algorithm_graph(fixture, graph):
     fixture.sync_organization_session()
 
 
-def _validate_console_algorithm_graph(fixture, graph):
+def _validate_console_legacy_algorithm_graph(fixture, graph):
     return console._validate_shader_flow_graph_value(
         graph,
         expected_workspace_id=fixture.WORKSPACE_ID,
@@ -846,7 +912,7 @@ class ProjectShaderLibraryFixture:
             "updatedAt": "2026-08-25T04:00:00Z",
             "captures": [{
                 "captureId": self.CAPTURE_ID,
-                "capturePath": "C:/captures/test.rdc",
+                "capturePath": str(self.root / "test.rdc"),
                 "api": "D3D12",
                 "catalogPath": "captures/catalogs/test.json",
                 "catalogSha256": self.CATALOG_SHA256,
@@ -941,13 +1007,15 @@ class ProjectShaderLibraryFixture:
 
 
 class ImportedProjectSourceFixture:
-    def __init__(self, root):
+    def __init__(self, root, managed_name=None):
         from src.shader_workspace.project_source import source_receipt
         self.project = ProjectShaderLibraryFixture(root)
         project = self.project
         class ImportedEditor(ShaderConsoleFixture):
             RAW_SHA256 = ProjectShaderLibraryFixture.RAW_SHA256
-        self.editor = ImportedEditor(project.project_root / "workspaces" / "shaders" / "target")
+        self.editor = (ImportedEditor(project.project_root / "workspaces" / "shaders" / "v2",
+                                      workspace_name=managed_name) if managed_name else
+                       ImportedEditor(project.project_root / "workspaces" / "shaders" / "target"))
         editor = self.editor
         editor.source.write_bytes(project.source.read_bytes())
         editor.write_organization_gate()
@@ -997,7 +1065,192 @@ class ImportedProjectSourceFixture:
         return graph
 
 
+def _open_imported_organization_fixture(tmp_path):
+    fixture = ImportedProjectSourceFixture(tmp_path, managed_name="a" * 64)
+    editor = fixture.editor
+    graph = fixture.install_graph()
+    gate = editor.write_organization_gate()
+    gate.update(decision="drafting", organizedSourcePromoted=False,
+                sourceRestored=True, safeToStartLiveEdit=False,
+                finalBinding={"complete": False, "sourceSha256": fixture.project.source_sha256})
+    # A newly opened organization preserves the canonical registered source;
+    # only its separate proposal may be changed by the Agent.
+    gate.pop("editableDraftSourcePath", None)
+    editor._write(editor.workspace / "ai/organize-code-gate.json", gate)
+    session_path = editor.session_dir / "session.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session["workspacePath"] = str(editor.workspace)
+    session["state"] = "drafting"
+    session["shaderProgramIdentity"] = {"originalRawSha256": editor.RAW_SHA256}
+    editor._write(session_path, session)
+    return fixture, graph
+
+
+@pytest.mark.parametrize("registry_state", ("missing", "stale", "current"))
+def test_open_organization_registered_source_remains_editable_without_auto_apply(tmp_path, registry_state):
+    fixture, graph = _open_imported_organization_fixture(tmp_path)
+    editor = fixture.editor
+    registry_path = editor.registry
+    if registry_state == "missing":
+        registry_path = tmp_path / "missing-registry.json"
+    elif registry_state == "stale":
+        live_path = editor.workspace / "live-edit" / (editor.LIVE_ID + ".json")
+        live = json.loads(live_path.read_text(encoding="utf-8"))
+        live["captureBinding"]["captureSessionId"] = "9" * 32
+        editor._write(live_path, live)
+    before_source = editor.source.read_bytes()
+    before_registry = editor.registry.read_bytes()
+    before_gate = (editor.workspace / "ai/organize-code-gate.json").read_bytes()
+    with mock.patch.object(console, "default_active_project_selection_path",
+                           return_value=str(fixture.project.selection)):
+        snapshot = console.load_console_snapshot(str(registry_path), capture_binding=editor.capture_binding)
+        assert snapshot["errors"] == []
+        assert len(snapshot["workspaces"]) == 1
+        model = snapshot["workspaces"][0]
+        assert model["editorEligible"] is True
+        assert model["captureBinding"] == editor.capture_binding
+        assert model["flowGraph"]["graphId"] == graph["graphId"]
+        opened = console.load_authorized_source_document(
+            str(registry_path), model["authorizationId"], model["workspaceId"],
+            capture_binding=editor.capture_binding)
+        assert opened["rawSha256"] == fixture.project.source_sha256
+        assert opened["text"] == before_source.decode("utf-8")
+        if registry_state == "current":
+            # An already valid current-session model wins; discovery must not
+            # add a duplicate tree node or replace an existing authorization.
+            assert model["authorizationId"] == editor.AUTHORIZATION_ID
+        else:
+            assert model["editorEligibility"] == "organization-source-preview"
+            assert model["readOnly"] is False
+            assert model["autoApplyReady"] is False
+            assert model["liveEdit"] is None and model["watch"] is None
+            assert opened["readOnly"] is False
+            assert opened["liveEditId"] is None and opened["watchId"] is None
+            with pytest.raises(console.ShaderConsoleError):
+                console._require_running_live_edit(model, str(editor.source))
+    assert editor.source.read_bytes() == before_source
+    assert editor.registry.read_bytes() == before_registry
+    assert (editor.workspace / "ai/organize-code-gate.json").read_bytes() == before_gate
+
+
+@pytest.mark.parametrize("stage,extension,compile_eligible", [
+    ("fragment", "hlsl", True), ("vertex", "hlsl", False),
+    ("compute", "glsl", False), ("geometry", "glsl", True),
+])
+@pytest.mark.parametrize("gate_decision", (None, "drafting", "awaiting-proposal-review"))
+def test_managed_source_is_editable_before_organization_or_compiler_validation(
+        tmp_path, stage, extension, compile_eligible, gate_decision):
+    project = WriterProjectShaderLibraryFixture(tmp_path)
+    fixture = ShaderConsoleFixture(
+        project.project_root / "workspaces/shaders/v2", workspace_name="b" * 64)
+    manifest_path = fixture.workspace / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    target = fixture.source.with_suffix("." + extension)
+    fixture.source.rename(target)
+    manifest["stage"] = manifest["shader"]["stage"] = stage
+    manifest["source"].update(path="source/shader." + extension,
+                              compileEligible=compile_eligible)
+    fixture._write(manifest_path, manifest)
+    gate_path = fixture.workspace / "ai/organize-code-gate.json"
+    if gate_decision is None:
+        gate_path.unlink()
+    else:
+        gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        gate["decision"] = gate_decision
+        fixture._write(gate_path, gate)
+    before = {p: p.read_bytes() for p in fixture.workspace.rglob("*") if p.is_file()}
+    registry = str(tmp_path / "no-live-edit.json")
+    with mock.patch.object(console, "default_active_project_selection_path",
+                           return_value=str(project.selection)):
+        snapshot = console.load_console_snapshot(registry, capture_binding=fixture.capture_binding)
+        assert snapshot["errors"] == []
+        assert len(snapshot["workspaces"]) == 1
+        model = snapshot["workspaces"][0]
+        assert model["editorEligible"] is True and model["readOnly"] is False
+        assert model["editorEligibility"] == "managed-source"
+        assert model["managedSourceLocator"] is True
+        assert model["activeOrganization"] is (gate_decision is not None)
+        assert model["autoApplyReady"] is False
+        assert model["liveEdit"] is None and model["watch"] is None
+        opened = console.load_authorized_source_document(
+            registry, model["authorizationId"], model["workspaceId"], fixture.capture_binding)
+        assert opened["sourcePath"] == str(target)
+        assert opened["text"] == target.read_bytes().decode("utf-8")
+        assert opened["readOnly"] is False and opened["sourceEditable"] is True
+        assert opened["unvalidatedDraft"] is True
+        assert opened["liveEditId"] is None and opened["watchId"] is None
+        with pytest.raises(console.ShaderConsoleError):
+            console._require_running_live_edit(model, str(target))
+    assert before == {p: p.read_bytes() for p in fixture.workspace.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("changed", ("canonical", "baseline", "session", "project-input", "capture"))
+def test_open_organization_preview_rejects_changed_source_or_scope(tmp_path, changed):
+    fixture, _graph = _open_imported_organization_fixture(tmp_path)
+    editor = fixture.editor
+    binding = editor.capture_binding
+    with mock.patch.object(console, "default_active_project_selection_path",
+                           return_value=str(fixture.project.selection)):
+        authorization = console._managed_project_draft_authorizations(binding)[0][0]
+        if changed == "canonical":
+            editor.source.write_bytes(editor.source.read_bytes() + b"// unsaved newer source")
+        elif changed == "baseline":
+            editor.baseline_artifact.write_bytes(b"changed baseline")
+        elif changed == "project-input":
+            fixture.input_path.write_bytes(b"changed project input")
+        elif changed == "session":
+            path = editor.session_dir / "session.json"
+            session = json.loads(path.read_text(encoding="utf-8"))
+            session["workspaceId"] = "0" * 32
+            editor._write(path, session)
+        else:
+            binding = dict(binding, capturePath=str(tmp_path / "another.rdc"))
+        with pytest.raises(console.ShaderConsoleError):
+            console.load_authorized_source_document(
+                str(tmp_path / "missing-registry.json"), authorization["authorizationId"],
+                editor.WORKSPACE_ID, capture_binding=binding)
+
+
 class ShaderConsoleLogicTests(unittest.TestCase):
+    def test_legacy_host_entry_description_preserves_source_bound_navigation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            source_bytes = fixture.source.read_bytes()
+            graph = build_shader_flow_graph(
+                source_bytes.decode("utf-8"),
+                workspace_id=fixture.WORKSPACE_ID,
+                source_path="source/shader.hlsl",
+                source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+                source_revision=7, stage="fragment", entry_point="MainPS",
+                generated_at="2026-08-31T00:00:00Z", origin="organized-proposal",
+            )
+            graph_path = fixture.workspace / "ai" / "flow-graph.json"
+
+            def publish(description):
+                graph["nodes"][0]["description"] = description
+                material = dict(graph)
+                material.pop("graphId")
+                material.pop("generatedAt")
+                graph["graphId"] = console._canonical_sha256(material)[:32]
+                fixture._write(graph_path, graph)
+                return console.load_console_snapshot(
+                    str(fixture.registry), capture_binding=fixture.capture_binding)["workspaces"][0]
+
+            legacy = "Shader entry point; the stage result is produced here."
+            loaded = publish(legacy)
+            self.assertEqual("current", loaded["flowGraphStatus"]["status"])
+            self.assertEqual(legacy, loaded["flowGraph"]["nodes"][0]["description"])
+            # The narrow compatibility exception must not accept appended code
+            # or bypass the current source identity checks.
+            rejected = publish(legacy + " return color;")
+            self.assertEqual("invalid", rejected["flowGraphStatus"]["status"])
+            self.assertIsNone(rejected["flowGraph"])
+            graph["sourceSha256"] = "0" * 64
+            rejected = publish(legacy)
+            self.assertEqual("invalid", rejected["flowGraphStatus"]["status"])
+            self.assertIsNone(rejected["flowGraph"])
+            self.assertEqual(source_bytes, fixture.source.read_bytes())
+
     def test_project_source_opens_editable_without_new_organization(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ImportedProjectSourceFixture(Path(temporary))
@@ -1041,6 +1294,22 @@ class ShaderConsoleLogicTests(unittest.TestCase):
                         with self.assertRaises(console.ShaderConsoleError):
                             console.load_authorized_source_document(str(editor.registry), editor.AUTHORIZATION_ID, editor.WORKSPACE_ID, capture_binding=editor.capture_binding)
 
+    def test_project_source_same_original_uses_destination_baseline_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ImportedProjectSourceFixture(Path(temporary))
+            editor = fixture.editor
+            changed = copy.deepcopy(fixture.manifest)
+            receipt = changed["source"]["projectSource"]
+            changed["baseline"]["abiSha256"] = receipt["baselineAbiSha256"] = "9" * 64
+            receipt.pop("receiptSha256")
+            receipt["receiptSha256"] = console._canonical_sha256(receipt)
+            editor._write(editor.workspace / "manifest.json", changed)
+            with mock.patch.object(console, "default_active_project_selection_path", return_value=str(fixture.project.selection)):
+                opened = console.load_authorized_source_document(str(editor.registry),
+                    editor.AUTHORIZATION_ID, editor.WORKSPACE_ID, capture_binding=editor.capture_binding)
+            self.assertEqual(opened["text"], fixture.project.source_text)
+            self.assertFalse(opened["readOnly"])
+
     def test_project_source_user_edits_use_existing_watch_lineage(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ImportedProjectSourceFixture(Path(temporary))
@@ -1071,6 +1340,45 @@ class ShaderConsoleLogicTests(unittest.TestCase):
     def test_module_remains_python_36_parseable(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
         ast.parse(source, filename=str(MODULE_PATH), feature_version=(3, 6))
+
+    def test_windows_file_validation_reuses_module_pointer_types(self):
+        class FakeFileApi(object):
+            @staticmethod
+            def get_information(_handle, _information):
+                return 1
+
+            @staticmethod
+            def get_final_path(_handle, buffer, _capacity, _flags):
+                buffer.value = filename
+                return len(filename)
+
+        filename = os.path.abspath("stable-ctypes-file.bin")
+        pointer_cache = getattr(ctypes, "_pointer_type_cache", None)
+        self.assertIsInstance(pointer_cache, dict)
+        before = set(pointer_cache)
+        for unused in range(100):
+            console._validate_windows_file_handle(
+                FakeFileApi(), 1, filename, "test file")
+        self.assertEqual(before, set(pointer_cache))
+
+    def test_windows_file_api_configures_kernel32_once(self):
+        kernel32 = mock.Mock()
+        for name in (
+                "CreateFileW", "GetFileSizeEx", "SetFilePointerEx", "ReadFile",
+                "CloseHandle", "GetFileInformationByHandle",
+                "GetFinalPathNameByHandleW"):
+            setattr(kernel32, name, mock.Mock())
+        loader = mock.Mock(return_value=kernel32)
+        with mock.patch.object(console.os, "name", "nt"), \
+                mock.patch.object(console.ctypes, "WinDLL", loader, create=True), \
+                mock.patch.object(console, "_WINDOWS_FILE_API", None):
+            first = console._windows_file_api()
+            second = console._windows_file_api()
+        self.assertIs(first, second)
+        loader.assert_called_once_with("kernel32", use_last_error=True)
+        self.assertIs(
+            first.get_information.argtypes[1],
+            console._WINDOWS_FILE_INFORMATION_POINTER)
 
     def test_project_disassembly_identity_matches_writer_for_all_formats(self):
         common = {
@@ -1614,7 +1922,7 @@ class ShaderConsoleLogicTests(unittest.TestCase):
                 f"{outside}:9:2: error: malicious diagnostic path",
                 str(fixture.source), str(fixture.workspace),
             )
-            self.assertEqual(Path(values[0]["sourceFile"]), fixture.source.resolve())
+            self.assertEqual(values[0]["sourceFile"], "")
             self.assertEqual(values[0]["line"], 9)
             self.assertEqual(Path(values[0]["reportedFile"]), outside)
 
@@ -2124,14 +2432,14 @@ class ShaderConsoleLogicTests(unittest.TestCase):
                 ],
             )
 
-    def test_host_algorithm_graph_survives_bridge_document_and_console_loading(self):
+    def test_legacy_algorithm_graph_survives_bridge_document_and_console_loading(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ShaderConsoleFixture(Path(temporary))
-            graph = _console_algorithm_graph(fixture)
+            graph = _console_legacy_algorithm_graph(fixture)
             self.assertEqual("algorithm-dataflow", graph["graphKind"])
             self.assertEqual(12, len(graph["nodes"]))
             self.assertEqual({"data", "control"}, {edge["kind"] for edge in graph["edges"]})
-            self.assertEqual(graph, _validate_console_algorithm_graph(fixture, graph))
+            self.assertEqual(graph, _validate_console_legacy_algorithm_graph(fixture, graph))
 
             document = console.load_authorized_source_document(
                 str(fixture.registry), fixture.AUTHORIZATION_ID, fixture.WORKSPACE_ID,
@@ -2157,7 +2465,7 @@ class ShaderConsoleLogicTests(unittest.TestCase):
     def test_bridge_rejects_malformed_algorithm_graph_without_hiding_editable_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ShaderConsoleFixture(Path(temporary))
-            original = _console_algorithm_graph(fixture)
+            original = _console_legacy_algorithm_graph(fixture)
             source_before = fixture.source.read_bytes()
             data_index = next(index for index, edge in enumerate(original["edges"]) if edge["kind"] == "data")
             control_index = next(index for index, edge in enumerate(original["edges"]) if edge["kind"] == "control")
@@ -2214,10 +2522,10 @@ class ShaderConsoleLogicTests(unittest.TestCase):
                     material.pop("generatedAt")
                     malformed["graphId"] = console._canonical_sha256(material)[:32]
                     with self.assertRaises(console.ShaderConsoleError):
-                        _validate_console_algorithm_graph(fixture, malformed)
+                        _validate_console_legacy_algorithm_graph(fixture, malformed)
                     # Bind the current artifact bytes in the fixture gate so
                     # loading must reject the graph itself, not a stale file hash.
-                    _publish_console_algorithm_graph(fixture, malformed)
+                    _publish_console_legacy_algorithm_graph(fixture, malformed)
                     snapshot = console.load_console_snapshot(str(fixture.registry), capture_binding=fixture.capture_binding)
                     self.assertEqual(1, len(snapshot["workspaces"]))
                     workspace = snapshot["workspaces"][0]
@@ -2230,27 +2538,49 @@ class ShaderConsoleLogicTests(unittest.TestCase):
                     self.assertEqual(source_before.decode("utf-8"), document["text"])
             self.assertEqual(source_before, fixture.source.read_bytes())
 
-    def test_bridge_rejects_algorithm_graph_id_and_artifact_hash_mismatches(self):
+    def test_bridge_rejects_invalid_graph_identity_but_allows_unsealed_json_whitespace(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ShaderConsoleFixture(Path(temporary))
-            original = _console_algorithm_graph(fixture)
+            original = _console_legacy_algorithm_graph(fixture)
             malformed = copy.deepcopy(original)
             malformed["graphId"] = "0" * 32
             with self.assertRaisesRegex(console.ShaderConsoleError, "identity"):
-                _validate_console_algorithm_graph(fixture, malformed)
-            _publish_console_algorithm_graph(fixture, malformed)
+                _validate_console_legacy_algorithm_graph(fixture, malformed)
+            _publish_console_legacy_algorithm_graph(fixture, malformed)
             rejected = console.load_console_snapshot(str(fixture.registry), capture_binding=fixture.capture_binding)
             self.assertEqual("invalid", rejected["workspaces"][0]["flowGraphStatus"]["status"])
 
-            _publish_console_algorithm_graph(fixture, original)
+            _publish_console_legacy_algorithm_graph(fixture, original)
             graph_path = fixture.workspace / "ai" / "flow-graph.json"
             graph_path.write_bytes(graph_path.read_bytes() + b"\n")
-            # The graph's semantic identity is still valid, but this byte edit
-            # is not the exact artifact recorded by the organization gate.
-            self.assertEqual(original, _validate_console_algorithm_graph(fixture, original))
-            rejected = console.load_console_snapshot(str(fixture.registry), capture_binding=fixture.capture_binding)
-            self.assertEqual("invalid", rejected["workspaces"][0]["flowGraphStatus"]["status"])
-            self.assertIn("organization gate", rejected["workspaces"][0]["flowGraphStatus"]["error"])
+            # A graph is optional navigation metadata, independent from the
+            # finalized source receipt. JSON whitespace changes no identity.
+            self.assertEqual(original, _validate_console_legacy_algorithm_graph(fixture, original))
+            loaded = console.load_console_snapshot(str(fixture.registry), capture_binding=fixture.capture_binding)
+            self.assertEqual("current", loaded["workspaces"][0]["flowGraphStatus"]["status"])
+
+    def test_loader_displays_saved_draft_graph_with_existing_compile_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            source_bytes = fixture.source.read_bytes()
+            graph = build_shader_flow_graph(
+                source_bytes.decode("utf-8"),
+                workspace_id=fixture.WORKSPACE_ID,
+                source_path="source/shader.hlsl",
+                source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+                source_revision=7, stage="fragment", entry_point="MainPS",
+                generated_at="2026-08-31T00:00:00Z", origin="editable-draft",
+            )
+            fixture._write(fixture.workspace / "ai" / "flow-graph.json", graph)
+            snapshot = console.load_console_snapshot(
+                str(fixture.registry), capture_binding=fixture.capture_binding)
+            self.assertEqual(snapshot["errors"], [])
+            workspace = snapshot["workspaces"][0]
+            self.assertEqual(workspace["flowGraph"]["graphId"], graph["graphId"])
+            self.assertEqual(workspace["flowGraphStatus"]["status"], "current")
+            self.assertTrue(workspace["flowGraph"]["policy"]["navigationOnly"])
+            self.assertFalse(workspace["flowGraph"]["policy"]["applyAuthorization"])
+            self.assertEqual(fixture.source.read_bytes(), source_bytes)
 
     def test_loader_projects_only_a_source_bound_shader_flow_graph(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2272,17 +2602,6 @@ class ShaderConsoleLogicTests(unittest.TestCase):
             )
             graph_path = fixture.workspace / "ai" / "flow-graph.json"
             fixture._write(graph_path, graph)
-            gate_path = fixture.workspace / "ai" / "organize-code-gate.json"
-            gate = json.loads(gate_path.read_text(encoding="utf-8"))
-            gate.update({
-                "flowGraphId": graph["graphId"],
-                "flowGraphSha256": hashlib.sha256(
-                    graph_path.read_bytes()).hexdigest(),
-                "flowGraphArtifactPath": str(graph_path.resolve()),
-            })
-            fixture._write(gate_path, gate)
-            (fixture.session_dir / "flow-graph.json").write_bytes(graph_path.read_bytes())
-            fixture.sync_organization_session()
 
             snapshot = console.load_console_snapshot(str(fixture.registry), capture_binding=fixture.capture_binding)
             self.assertEqual(snapshot["errors"], [])
@@ -2386,17 +2705,17 @@ class ShaderConsoleLogicTests(unittest.TestCase):
 
     def test_host_equivalence_levels_open_and_keep_authorized_edits_readable(self):
         baseline = "float4 MainPS() : SV_Target\n{\n  float oldValue = 1;\n  return oldValue;\n}\n"
-        for level in ("exact-code", "rename-only", "observational-pass", "rejected"):
+        for level in ("exact-code", "rename-only", "observational-pass"):
             with self.subTest(level=level), tempfile.TemporaryDirectory() as temporary:
                 fixture = ShaderConsoleFixture(Path(temporary))
                 proposal = baseline.replace("oldValue", "reviewedValue")
-                if level in ("observational-pass", "rejected"):
+                if level == "observational-pass":
                     proposal = proposal.replace("= 1", "= 0.5")
                 gate = fixture.write_organization_gate(
                     level, baseline_source=baseline, proposal_source=proposal,
                     rename_map={"oldValue": "reviewedValue"} if level == "rename-only" else {},
                 )
-                expected = baseline if level == "rejected" else proposal
+                expected = proposal
                 if level != "exact-code":
                     self.assertNotEqual(gate["baselineCodeSha256"], gate["organizedCodeSha256"])
                     self.assertFalse(gate["codeSha256Equal"])
@@ -2407,12 +2726,6 @@ class ShaderConsoleLogicTests(unittest.TestCase):
                 self.assertEqual(expected, opened["text"])
                 self.assertEqual(hashlib.sha256(expected.encode("utf-8")).hexdigest(), opened["rawSha256"])
                 self.assertEqual(1, len(console.load_console_snapshot(str(fixture.registry), capture_binding=fixture.capture_binding)["workspaces"]))
-                if level == "rejected":
-                    self.assertFalse(gate["organizedSourcePromoted"])
-                    self.assertEqual(gate["baselineSourceSha256"], gate["finalSourceSha256"])
-                    self.assertNotEqual(gate["proposalSourceSha256"], gate["finalSourceSha256"])
-                    self.assertEqual(proposal.encode("utf-8"), fixture.proposal_artifact.read_bytes())
-
                 fixed_evidence = {
                     path: path.read_bytes() for path in (
                         fixture.baseline_artifact, fixture.proposal_artifact,
@@ -2423,7 +2736,7 @@ class ShaderConsoleLogicTests(unittest.TestCase):
                 # Host save is represented below by current source plus the
                 # exact authorized running watch/live-edit lineage.
                 edited = expected.replace("return ", "return 0.75 * ", 1) + "// saved through Host lineage\n"
-                with self.assertRaisesRegex(console.ShaderConsoleError, "running ReplayLab Host"):
+                with self.assertRaisesRegex(console.ShaderConsoleError, "running Bread Host"):
                     console.save_authorized_source_document(
                         str(fixture.registry), fixture.AUTHORIZATION_ID, fixture.WORKSPACE_ID,
                         opened["rawSha256"], edited,
@@ -2438,6 +2751,23 @@ class ShaderConsoleLogicTests(unittest.TestCase):
                 self.assertEqual(edited, reopened["text"])
                 self.assertNotEqual(gate["finalSourceSha256"], reopened["rawSha256"])
                 self.assertEqual(fixed_evidence, {path: path.read_bytes() for path in fixed_evidence})
+
+    def test_scoped_local_rename_receipt_does_not_hide_editable_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            baseline = (
+                "float4 MainPS() : SV_Target { float _1 = 1; return _1.xxxx; }\n"
+            )
+            proposal = baseline.replace("_1", "normalLightDot")
+            fixture.write_organization_gate(
+                "rename-only", baseline_source=baseline, proposal_source=proposal,
+                rename_map={"MainPS::_1": "normalLightDot"},
+            )
+            opened = console.load_authorized_source_document(
+                str(fixture.registry), fixture.AUTHORIZATION_ID,
+                fixture.WORKSPACE_ID, capture_binding=fixture.capture_binding,
+            )
+            self.assertEqual(proposal, opened["text"])
 
     def test_organization_equivalence_gate_rejects_contradictory_levels_and_observations(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2526,33 +2856,14 @@ class ShaderConsoleLogicTests(unittest.TestCase):
             fixture._write(gate_path, gate)
             assert_rejected()
 
-    def test_soft_acceptance_requires_exhausted_budget_and_retains_only_baseline(self):
+    def test_legacy_soft_acceptance_cannot_open_editable_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ShaderConsoleFixture(Path(temporary))
-            original = fixture.write_organization_gate(
-                "rejected", baseline_source="float4 MainPS() : SV_Target { return 1; }\n",
-                proposal_source="float4 MainPS() : SV_Target { return 0.5; }\n",
-            )
             gate_path = fixture.workspace / "ai" / "organize-code-gate.json"
-            for field, value in (("budgetExhausted", False), ("softAccepted", False), ("accepted", True)):
-                with self.subTest(verdict=field):
-                    gate = copy.deepcopy(original)
-                    gate["verdict"][field] = value
-                    fixture._write(gate_path, gate)
-                    fixture.sync_organization_session()
-                    with self.assertRaises(console.ShaderConsoleError):
-                        console.load_authorized_source_document(
-                            str(fixture.registry), fixture.AUTHORIZATION_ID, fixture.WORKSPACE_ID,
-                            capture_binding=fixture.capture_binding,
-                        )
-            gate = copy.deepcopy(original)
-            gate["finalSourceSha256"] = gate["proposalSourceSha256"]
-            gate["finalBinding"]["sourceSha256"] = gate["proposalSourceSha256"]
-            gate["finalCodeSha256"] = gate["organizedCodeSha256"]
-            gate["finalBinding"]["codeSha256"] = gate["organizedCodeSha256"]
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            gate["decision"] = "soft-accepted-baseline"
             fixture._write(gate_path, gate)
             fixture.sync_organization_session()
-            fixture.source.write_bytes(fixture.proposal_artifact.read_bytes())
             with self.assertRaises(console.ShaderConsoleError):
                 console.load_authorized_source_document(
                     str(fixture.registry), fixture.AUTHORIZATION_ID, fixture.WORKSPACE_ID,
@@ -2563,7 +2874,7 @@ class ShaderConsoleLogicTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ShaderConsoleFixture(Path(temporary))
             before = fixture.source.read_bytes()
-            with self.assertRaisesRegex(console.ShaderConsoleError, "running ReplayLab Host"):
+            with self.assertRaisesRegex(console.ShaderConsoleError, "running Bread Host"):
                 console.save_authorized_source_document(
                     str(fixture.registry), fixture.AUTHORIZATION_ID,
                     fixture.WORKSPACE_ID, console.hashlib.sha256(before).hexdigest(),
@@ -2632,7 +2943,7 @@ class ShaderConsoleLogicTests(unittest.TestCase):
                 )
 
 
-    def test_code_workspace_rejects_non_hlsl_authorized_sources(self):
+    def test_code_workspace_rejects_source_language_change_with_stale_live_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
             fixture = ShaderConsoleFixture(Path(temporary))
             glsl_source = fixture.source.with_name("shader.glsl")
@@ -2641,7 +2952,7 @@ class ShaderConsoleLogicTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["source"]["path"] = "source/shader.glsl"
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            with self.assertRaisesRegex(console.ShaderConsoleError, "not HLSL"):
+            with self.assertRaisesRegex(console.ShaderConsoleError, "completed Host session is inconsistent"):
                 console.load_authorized_source_document(
                     str(fixture.registry), fixture.AUTHORIZATION_ID, fixture.WORKSPACE_ID,
                     capture_binding=fixture.capture_binding,
@@ -2669,6 +2980,153 @@ class ShaderConsoleLogicTests(unittest.TestCase):
                     fixture.WORKSPACE_ID,
                     capture_binding=fixture.capture_binding,
                 )
+
+    def test_saved_unvalidated_draft_is_visible_without_apply_authority(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            gate = fixture.write_editable_draft()
+            fixture.write_live(state="running")
+            fixture.write_watch(state="running")
+            snapshot = console.load_console_snapshot(
+                str(fixture.registry), capture_binding=fixture.capture_binding)
+            workspace = snapshot["workspaces"][0]
+            self.assertTrue(workspace["editorEligible"])
+            self.assertEqual(workspace["editorEligibility"], "unvalidated-editable-draft")
+            self.assertFalse(workspace["autoApplyReady"])
+            opened = console.load_authorized_source_document(
+                str(fixture.registry), fixture.AUTHORIZATION_ID,
+                fixture.WORKSPACE_ID, capture_binding=fixture.capture_binding)
+            self.assertTrue(opened["unvalidatedDraft"])
+            self.assertEqual(opened["rawSha256"], gate["proposalSourceSha256"])
+            self.assertEqual(opened["liveEditId"], fixture.LIVE_ID)
+            self.assertEqual(workspace["sourceSession"], {
+                "liveEditId": fixture.LIVE_ID, "watchId": fixture.WATCH_ID})
+            graph = build_shader_flow_graph(
+                fixture.source.read_bytes().decode("utf-8"),
+                workspace_id=fixture.WORKSPACE_ID,
+                source_path="source/shader.hlsl",
+                source_sha256=gate["proposalSourceSha256"],
+                source_revision=0,
+                stage="fragment",
+                entry_point="MainPS",
+                generated_at="2026-08-25T04:01:00Z",
+                origin="editable-draft",
+            )
+            fixture._write(fixture.workspace / "ai" / "flow-graph.json", graph)
+            refreshed = console.load_console_snapshot(
+                str(fixture.registry), capture_binding=fixture.capture_binding)
+            self.assertEqual(refreshed["workspaces"][0]["flowGraph"]["graphId"], graph["graphId"])
+            with self.assertRaises(console.ShaderConsoleError):
+                console._validate_organization_gate(
+                    str(fixture.workspace), workspace, str(fixture.source),
+                )
+
+    def test_saved_draft_remains_visible_after_live_session_file_is_removed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            fixture.write_editable_draft()
+            (fixture.workspace / "live-edit" / (fixture.LIVE_ID + ".json")).unlink()
+            snapshot = console.load_console_snapshot(
+                str(fixture.registry), capture_binding=fixture.capture_binding)
+            self.assertEqual(len(snapshot["workspaces"]), 1)
+            workspace = snapshot["workspaces"][0]
+            self.assertTrue(workspace["editorEligible"])
+            self.assertFalse(workspace["autoApplyReady"])
+            opened = console.load_authorized_source_document(
+                str(fixture.registry), fixture.AUTHORIZATION_ID,
+                fixture.WORKSPACE_ID, capture_binding=fixture.capture_binding)
+            self.assertTrue(opened["unvalidatedDraft"])
+            self.assertIsNone(opened["liveEditId"])
+
+    def test_saved_draft_becomes_live_editable_only_for_current_abi_candidate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            gate = fixture.write_editable_draft()
+            fixture.write_live(state="running", activeReplacement={
+                "revision": 2, "candidateRawSha256": "3" * 64})
+            fixture.write_watch(state="running")
+            manifest_path = fixture.workspace / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["revision"] = 2
+            manifest["latestCompiled"] = {
+                "revision": 2,
+                "sourceSha256": gate["proposalSourceSha256"],
+                "rawSha256": "3" * 64,
+                "replayAbiValidated": True,
+                "abiCompatible": True,
+                "requiresReplayAbiValidation": False,
+                "abiGate": {"status": "compatible", "requestId": "4" * 64,
+                            "reportSha256": "5" * 64},
+            }
+            fixture._write(manifest_path, manifest)
+            ready = console.load_console_snapshot(
+                str(fixture.registry), capture_binding=fixture.capture_binding)
+            self.assertTrue(ready["workspaces"][0]["autoApplyReady"])
+            opened = console.load_authorized_source_document(
+                str(fixture.registry), fixture.AUTHORIZATION_ID,
+                fixture.WORKSPACE_ID, capture_binding=fixture.capture_binding)
+            self.assertEqual(opened["liveEditId"], fixture.LIVE_ID)
+            manifest["latestCompiled"]["sourceSha256"] = "0" * 64
+            fixture._write(manifest_path, manifest)
+            stale = console.load_console_snapshot(
+                str(fixture.registry), capture_binding=fixture.capture_binding)
+            self.assertFalse(stale["workspaces"][0]["autoApplyReady"])
+
+    def test_managed_project_draft_is_visible_without_live_authorization_registry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = WriterProjectShaderLibraryFixture(root)
+            shader_root = project.project_root / "workspaces" / "shaders" / "v2"
+            fixture = ShaderConsoleFixture(shader_root, workspace_name="a" * 64)
+            fixture.write_editable_draft()
+            missing_registry = root / "no-live-authorizations.json"
+            with mock.patch.object(
+                console, "default_active_project_selection_path",
+                return_value=str(project.selection),
+            ):
+                discovered, unused_discovery_paths = console._managed_project_draft_authorizations(
+                    fixture.capture_binding)
+                self.assertEqual(len(discovered), 1)
+                snapshot = console.load_console_snapshot(
+                    str(missing_registry), capture_binding=fixture.capture_binding)
+                self.assertEqual(len(snapshot["workspaces"]), 1, snapshot["errors"])
+                workspace = snapshot["workspaces"][0]
+                self.assertEqual(workspace["editorEligibility"], "unvalidated-editable-draft")
+                self.assertFalse(workspace["autoApplyReady"])
+                opened = console.load_authorized_source_document(
+                    str(missing_registry), workspace["authorizationId"],
+                    workspace["workspaceId"], capture_binding=fixture.capture_binding)
+            self.assertEqual(opened["rawSha256"],
+                             hashlib.sha256(fixture.source.read_bytes()).hexdigest())
+            self.assertTrue(opened["unvalidatedDraft"])
+            self.assertIsNone(opened["liveEditId"])
+
+    def test_finished_current_draft_is_visible_and_tampered_verdict_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = ShaderConsoleFixture(Path(temporary))
+            gate_path = fixture.workspace / "ai" / "organize-code-gate.json"
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            fixture.write_live(state="running")
+            fixture.write_watch(state="running")
+
+            snapshot = console.load_console_snapshot(
+                str(fixture.registry), capture_binding=fixture.capture_binding)
+            self.assertEqual(len(snapshot["workspaces"]), 1)
+            self.assertTrue(snapshot["workspaces"][0]["editorEligible"])
+            opened = console.load_authorized_source_document(
+                str(fixture.registry), fixture.AUTHORIZATION_ID,
+                fixture.WORKSPACE_ID, capture_binding=fixture.capture_binding)
+            self.assertEqual(opened["rawSha256"], gate["finalSourceSha256"])
+
+            tampered = copy.deepcopy(gate)
+            tampered["verdict"]["accepted"] = False
+            fixture._write(gate_path, tampered)
+            with self.assertRaisesRegex(console.ShaderConsoleError,
+                                        "source receipt"):
+                console.load_authorized_source_document(
+                    str(fixture.registry), fixture.AUTHORIZATION_ID,
+                    fixture.WORKSPACE_ID,
+                    capture_binding=fixture.capture_binding)
 
     def test_code_workspace_rejects_non_executable_source_lane(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2698,9 +3156,12 @@ class ShaderConsoleLogicTests(unittest.TestCase):
         self.assertIn("_register_shader_console_ui(ctx)", source)
         self.assertIn("_unregister_shader_console_ui()", source)
         self.assertIn("ReplayLabConsolePanel", source)
-        self.assertIn("[\"ReplayLab\", \"Console\"]", source)
-        self.assertIn("[\"ReplayLab Console\"]", source)
-        self.assertIn("[\"ReplayLab\", \"Shader Console\"]", source)
+        # Menu labels go through the shared project translation context, so
+        # the console shows under the same (localized) group as the rest.
+        self.assertIn('translate("ReplayLabProjects", "Bread AI")', source)
+        self.assertIn('translate("ReplayLabProjects", "Console")', source)
+        self.assertIn("qrd.WindowMenu.Tools, [_group, _console], _show)", source)
+        self.assertIn("qrd.WindowMenu.Window, [_console], _show)", source)
         self.assertIn("publish_console_event", source)
         self.assertNotIn(
             "_shader_console_protocol.disable_background_power_throttling()",
@@ -2735,6 +3196,8 @@ class ShaderConsoleLogicTests(unittest.TestCase):
         quiet = set(ast.literal_eval(assignment.value.args[0]))
         self.assertIn("ping", quiet)
         self.assertIn("get_current_renderdoc_context", quiet)
+        self.assertIn("get_shader_cbuffer_alias_identity", quiet)
+        self.assertIn("get_shader_workspace_ui_state", quiet)
         self.assertNotIn("claim_renderdoc_ui_intents", quiet)
         self.assertNotIn("apply_shader_candidate_shared_resource", quiet)
         self.assertIn("if lifecycle_visible:", source)
@@ -2753,6 +3216,502 @@ class ShaderConsoleLogicTests(unittest.TestCase):
         source = MODULE_PATH.read_text(encoding="utf-8")
         self.assertIn("CreateFileW", source)
         self.assertIn("0x1 | 0x2 | 0x4", source)
+
+
+def test_verified_organization_preview_is_read_only_stable_and_capture_bound(tmp_path):
+    workspace = tmp_path / "workspace"
+    preview_dir = workspace / "ai" / "organization-previews"
+    preview_dir.mkdir(parents=True)
+    capture_path = (tmp_path / "capture.rdc").resolve()
+    capture_path.write_bytes(b"rdc")
+    workspace_id = "1" * 32
+    capture_id = "2" * 64
+    organization_id = "3" * 32
+    manifest = {
+        "schema": console.WORKSPACE_SCHEMA,
+        "schemaVersion": 1,
+        "workspaceId": workspace_id,
+        "capture": {
+            "captureId": capture_id,
+            "capturePath": str(capture_path),
+        },
+        # Real captures use 64-bit ResourceIds (for example EID 11384 uses a
+        # value around 1e18).  The preview loader must not apply its generic
+        # 31-bit count limit to this identity.
+        "shader": {"resourceId": 1000000000000000723},
+        "stage": "fragment",
+        "entryPoint": "MainPS",
+    }
+    (workspace / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8")
+    binding = {
+        "instanceId": "preview-test",
+        "captureSessionId": "4" * 32,
+        "capturePath": str(capture_path),
+    }
+
+    def publish(text):
+        raw = text.encode("utf-8")
+        digest = hashlib.sha256(raw).hexdigest()
+        source = preview_dir / (digest + ".hlsl")
+        source.write_bytes(raw)
+        receipt = {
+            "schema": console.ORGANIZATION_PREVIEW_SCHEMA,
+            "schemaVersion": 1,
+            "organizationId": organization_id,
+            "workspaceId": workspace_id,
+            "captureId": capture_id,
+            "stage": "fragment",
+            "entryPoint": "MainPS",
+            "sourceFormat": "hlsl",
+            "sourcePath": source.relative_to(workspace).as_posix(),
+            "sourceSha256": digest,
+            "sourceByteSize": len(raw),
+            "baselineSourceSha256": "5" * 64,
+            "validationTier": "segment-compile-check",
+            "completedChecks": ["compile"],
+            "deferredFinalChecks": ["replay-abi", "equivalence"],
+            "numericVerified": False,
+            "readOnly": True,
+            "promoted": False,
+            "canonicalSourceUpdated": False,
+            "replayAbiChecked": False,
+            "equivalenceChecked": False,
+            "replayApplied": False,
+            "verifiedAt": "2026-09-20T00:00:00Z",
+        }
+        (workspace / "ai" / "organization-preview.json").write_text(
+            json.dumps(receipt), encoding="utf-8")
+        return digest
+
+    first_sha = publish("float4 MainPS() : SV_Target { return 1.0; }\n")
+    first = console.load_verified_organization_preview(
+        str(workspace), organization_id, first_sha, binding)
+    unrelated_gate = workspace / "ai" / "organize-code-gate.json"
+    unrelated_gate.write_text("{broken save metadata", encoding="utf-8")
+    reopened = console.load_verified_organization_preview(
+        str(workspace), organization_id, first_sha, binding)
+    assert reopened["workspaceId"] == first["workspaceId"]
+    assert reopened["completedChecks"] == ["compile"]
+    unrelated_gate.unlink()
+    second_sha = publish("// next segment\nfloat4 MainPS() : SV_Target { return 1.0; }\n")
+    second = console.load_verified_organization_preview(
+        str(workspace), organization_id, second_sha, binding)
+    assert first["workspaceId"] == second["workspaceId"]
+    assert second["documentKind"] == "organization-preview"
+    assert second["readOnly"] is True
+    assert second["resourceId"] == 1000000000000000723
+    assert second["rawSha256"] == second_sha
+    assert second["text"].startswith("// next segment")
+
+    wrong_binding = dict(binding, capturePath=str((tmp_path / "other.rdc").resolve()))
+    with pytest.raises(console.ShaderConsoleError, match="another capture"):
+        console.load_verified_organization_preview(
+            str(workspace), organization_id, second_sha, wrong_binding)
+    receipt_path = workspace / "ai" / "organization-preview.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["workspaceId"] = "6" * 32
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    with pytest.raises(console.ShaderConsoleError, match="inconsistent"):
+        console.load_verified_organization_preview(
+            str(workspace), organization_id, second_sha, binding)
+
+
+def _saved_draft_preview_fixture(tmp_path):
+    fixture = ShaderConsoleFixture(tmp_path)
+    gate = fixture.write_editable_draft()
+    manifest_path = fixture.workspace / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(stage=gate["stage"], entryPoint=gate["entryPoint"])
+    fixture._write(manifest_path, manifest)
+    # A source preview must be available without any saved live-edit grant.
+    fixture.registry.unlink()
+    return fixture, gate
+
+
+def test_project_display_binding_uses_current_capture_without_changing_cas_target(tmp_path):
+    fixture, gate = _saved_draft_preview_fixture(tmp_path)
+    opened = console.load_saved_shader_source_preview(
+        str(fixture.workspace), gate["proposalSourceSha256"], fixture.capture_binding)
+    project_root = tmp_path / "managed-project"
+    with mock.patch.object(console, "_within", return_value=True):
+        display = {"schema": "replaylab-project-shader-display-binding/v1",
+                   "projectId": "4" * 32, "knowledgeId": "5" * 32,
+                   "sourceSha256": opened["rawSha256"], "originalRawSha256": opened["shaderRawSha256"],
+                   "stage": opened["stage"], "entryPoint": opened["entryPoint"],
+                   "captureId": "6" * 64, "capturePath": fixture.capture_binding["capturePath"],
+                   "captureSessionId": fixture.capture_binding["captureSessionId"],
+                   "resourceId": 728, "anchorEventId": 61408}
+        library = {"projectId": display["projectId"], "projectRoot": str(project_root), "documents": [{
+            "knowledgeId": display["knowledgeId"], "isCurrentHead": True,
+            "sourceSha256": opened["rawSha256"], "rawShaderSha256": opened["shaderRawSha256"],
+            "stage": opened["stage"], "entryPoint": opened["entryPoint"]}]}
+        with mock.patch.object(console, "_project_library_for_console", return_value=library):
+            rebound = console.bind_project_shader_source_display(opened, display)
+            assert rebound["resourceId"] == 728 and rebound["eventIds"] == [61408]
+            assert rebound["sourcePath"] == opened["sourcePath"]
+            assert rebound["sourceWorkspaceId"] == opened["sourceWorkspaceId"]
+            assert rebound["sourceCaptureId"] == opened["captureId"]
+            assert rebound["replayApplied"] is False
+            refreshed = console.reload_saved_shader_source_preview(rebound, fixture.capture_binding)
+            assert refreshed["projectSourceBinding"] == display
+            assert refreshed["resourceId"] == 728
+            fixture.source.write_bytes(b"// local saved edit\n" + fixture.source.read_bytes())
+            edited = console.reload_saved_shader_source_preview(rebound, fixture.capture_binding)
+            assert not edited.get("projectSourceBinding") and not edited.get("projectSourceIdentity")
+            assert edited["resourceId"] == 728 and edited["eventIds"] == [61408]
+            assert console.reload_saved_shader_source_preview(edited, fixture.capture_binding)["resourceId"] == 728
+            for field, value in (("sourceSha256", "0" * 64), ("originalRawSha256", "0" * 64),
+                                 ("captureSessionId", "0" * 32), ("stage", "vertex"),
+                                 ("entryPoint", "OtherPS"), ("projectId", "0" * 32),
+                                 ("knowledgeId", "0" * 32)):
+                with pytest.raises(console.ShaderConsoleError):
+                    console.bind_project_shader_source_display(opened, dict(display, **{field: value}))
+            library["documents"][0]["isCurrentHead"] = False
+            with pytest.raises(console.ShaderConsoleError, match="active project head"):
+                console.bind_project_shader_source_display(opened, display)
+
+
+def test_current_project_source_dedup_retains_all_physical_bindings_and_hides_old_head(tmp_path):
+    fixture = ShaderConsoleFixture(tmp_path)
+    fixture.registry.unlink()
+    identity = {"projectId": "1" * 32, "knowledgeId": "2" * 32,
+                "sourceSha256": "3" * 64, "originalRawSha256": "4" * 64,
+                "stage": "fragment", "entryPoint": "MainPS"}
+    models = []
+    for index, resource_id in enumerate((754, 3239, 3162, 728)):
+        project = dict(identity)
+        if index == 3:
+            project.update(knowledgeId="5" * 32, sourceSha256="6" * 64)
+        models.append({"workspaceId": str(index + 1) * 32,
+                       "workspacePath": str(tmp_path / str(index)), "sourcePath": str(tmp_path / str(index) / "source.hlsl"),
+                       "captureId": str(index + 1) * 64, "capturePath": fixture.capture_binding["capturePath"],
+                       "captureBinding": fixture.capture_binding, "resourceId": resource_id,
+                       "shaderRawSha256": identity["originalRawSha256"], "stage": "fragment", "entryPoint": "MainPS",
+                       "sourceSha256": project["sourceSha256"], "projectSourceIdentity": project,
+                       "editorEligibility": "managed-source", "autoApplyReady": index == 0})
+    authorizations = [{"workspacePath": model["workspacePath"], "index": index} for index, model in enumerate(models)]
+    library = {"projectId": identity["projectId"], "documents": [
+        {"knowledgeId": identity["knowledgeId"], "isCurrentHead": True},
+        {"knowledgeId": "5" * 32, "isCurrentHead": False}]}
+    with mock.patch.object(console, "_managed_project_draft_authorizations", return_value=(authorizations, [])), \
+            mock.patch.object(console, "_workspace_model", side_effect=lambda auth, unused: copy.deepcopy(models[auth["index"]])), \
+            mock.patch.object(console, "_project_library_for_console", return_value=library):
+        snapshot = console.load_console_snapshot(str(fixture.registry), fixture.capture_binding)
+    assert not snapshot["errors"]
+    assert [item["workspaceId"] for item in snapshot["workspaces"]] == [models[0]["workspaceId"]]
+    assert len(snapshot["alternateWorkspaces"]) == 3
+    assert {item["resourceId"] for item in snapshot["workspaces"][0]["relatedWorkspaceBindings"]} == {3239, 3162}
+    assert len(snapshot["documentAliases"]) == 2
+    assert next(item for item in snapshot["alternateWorkspaces"] if item["resourceId"] == 728)["historicalSource"] is True
+
+
+@pytest.mark.parametrize("field", ["projectId", "knowledgeId", "originalRawSha256", "stage", "entryPoint", "sourceSha256"])
+def test_logical_project_document_identity_does_not_merge_distinct_shader_or_edited_source(field):
+    identity = {"projectId": "1" * 32, "knowledgeId": "2" * 32, "originalRawSha256": "3" * 64,
+                "stage": "fragment", "entryPoint": "MainPS", "sourceSha256": "4" * 64}
+    left = {"projectSourceIdentity": identity}
+    right = {"projectSourceIdentity": dict(identity, **{field: "different"})}
+    assert console._workspace_document_key(left) != console._workspace_document_key(right)
+
+
+def test_legacy_decompile_locator_cannot_duplicate_current_restored_head(tmp_path):
+    fixture = ShaderConsoleFixture(tmp_path)
+    fixture.registry.unlink()
+    identity = {"projectId": "1" * 32, "knowledgeId": "2" * 32, "originalRawSha256": "3" * 64,
+                "stage": "fragment", "entryPoint": "MainPS", "sourceSha256": "4" * 64}
+    current = {"workspaceId": "1" * 32, "workspacePath": str(tmp_path / "current"),
+               "resourceId": 9230, "sourcePath": str(tmp_path / "current/shader.hlsl"),
+               "sourceSha256": "4" * 64, "shaderRawSha256": "3" * 64, "stage": "fragment", "entryPoint": "MainPS",
+               "captureBinding": fixture.capture_binding, "capturePath": fixture.capture_binding["capturePath"],
+               "editorEligibility": "managed-source", "projectSourceIdentity": identity, "autoApplyReady": True}
+    legacy = dict(current, workspaceId="2" * 32, workspacePath=str(tmp_path / "legacy"),
+                  resourceId=723, projectSourceIdentity=None, sourceSha256="5" * 64,
+                  autoApplyReady=False, managedSourceLocator=True)
+    different = dict(legacy, workspaceId="3" * 32, workspacePath=str(tmp_path / "different"), shaderRawSha256="6" * 64)
+    live_distinct = dict(legacy, workspaceId="4" * 32, workspacePath=str(tmp_path / "live-distinct"),
+                         managedSourceLocator=False, autoApplyReady=True, resourceId=9000)
+    unpublished_current = dict(legacy, workspaceId="5" * 32, workspacePath=str(tmp_path / "unpublished-current"),
+                               resourceId=current["resourceId"])
+    active_organization = dict(legacy, workspaceId="6" * 32, workspacePath=str(tmp_path / "active-organization"),
+                               activeOrganization=True)
+    second_current = dict(current, workspaceId="7" * 32, workspacePath=str(tmp_path / "second-current"), resourceId=9231)
+    second_draft = dict(unpublished_current, workspaceId="8" * 32, workspacePath=str(tmp_path / "second-draft"), resourceId=9231)
+    models = [current, legacy, different, live_distinct, unpublished_current, active_organization, second_current, second_draft]
+    auths = [{"workspacePath": item["workspacePath"], "index": index} for index, item in enumerate(models)]
+    with mock.patch.object(console, "_managed_project_draft_authorizations", return_value=(auths, [])), \
+            mock.patch.object(console, "_workspace_model", side_effect=lambda auth, unused: copy.deepcopy(models[auth["index"]])), \
+            mock.patch.object(console, "_project_library_for_console", return_value={"projectId": identity["projectId"],
+                "documents": [{"knowledgeId": identity["knowledgeId"], "isCurrentHead": True}]}):
+        snapshot = console.load_console_snapshot(str(fixture.registry), fixture.capture_binding)
+    assert not snapshot["errors"]
+    shown = {item["workspaceId"] for item in snapshot["workspaces"]}
+    assert shown & {current["workspaceId"], second_current["workspaceId"]}
+    assert shown - {current["workspaceId"], second_current["workspaceId"]} == {
+        item["workspaceId"] for item in (different, live_distinct, unpublished_current, active_organization, second_draft)}
+    archived = next(item for item in snapshot["alternateWorkspaces"] if item["workspaceId"] == legacy["workspaceId"])
+    assert archived["supersededCaptureSource"] is True
+
+
+@pytest.mark.parametrize("frozen_preview", [False, True])
+def test_saved_editable_source_refresh_reads_actual_new_bytes_without_old_review_receipt(tmp_path, frozen_preview):
+    fixture, gate = _saved_draft_preview_fixture(tmp_path)
+    previous = console.load_saved_shader_source_preview(
+        str(fixture.workspace), gate["proposalSourceSha256"], fixture.capture_binding)
+    if frozen_preview:
+        previous.update(sourcePath=str(fixture.workspace / "ai/frozen-preview/shader.hlsl"),
+                        canonicalSourceUpdated=False)
+    replacement = b"// concurrent source change\n" + fixture.source.read_bytes()
+    fixture.source.write_bytes(replacement)
+    refreshed = console.reload_saved_shader_source_preview(previous, fixture.capture_binding)
+    assert refreshed["text"].encode("utf-8") == replacement
+    assert refreshed["rawSha256"] != previous["rawSha256"]
+    assert refreshed["replayApplied"] is False
+    assert refreshed["sourcePath"] == str(fixture.source)
+
+
+@pytest.mark.parametrize("source_format", ("hlsl", "glsl"))
+def test_saved_source_preview_needs_no_compile_or_live_edit_authorization(tmp_path, source_format):
+    fixture, gate = _saved_draft_preview_fixture(tmp_path)
+    if source_format == "glsl":
+        fixture.source = fixture.source.rename(fixture.source.with_suffix(".glsl"))
+        manifest_path = fixture.workspace / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["routePlan"] = {"editableFormat": "glsl"}
+        manifest["source"]["path"] = "source/shader.glsl"
+        fixture._write(manifest_path, manifest)
+        gate["editableDraftSourcePath"] = str(fixture.source.resolve())
+        fixture._write(fixture.workspace / "ai" / "organize-code-gate.json", gate)
+        session_path = fixture.session_dir / "session.json"
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        session["sourcePath"] = "source/shader.glsl"
+        fixture._write(session_path, session)
+    preview = console.load_verified_organization_preview(
+        str(fixture.workspace), gate["organizationId"],
+        gate["proposalSourceSha256"], fixture.capture_binding)
+    assert preview["text"] == fixture.source.read_bytes().decode("utf-8")
+    assert preview["sourcePath"] == str(fixture.source.resolve())
+    assert preview["sourceWorkspaceId"] == fixture.WORKSPACE_ID
+    assert preview["workspaceId"] != fixture.WORKSPACE_ID
+    assert preview["readOnly"] is True
+    assert preview["canonicalSourceUpdated"] is True
+    assert preview["replayApplied"] is False
+    assert preview["validationTier"] == "saved-source"
+    assert preview["completedChecks"] == ["source-save"]
+    assert preview["deferredFinalChecks"] == ["compile", "replay-abi", "equivalence"]
+    assert preview["receiptPath"].endswith("organize-code-gate.json")
+    assert "authorizationId" not in preview
+    assert "liveEditId" not in preview
+
+
+@pytest.mark.parametrize("changed", (
+    "final-binding", "canonical-source", "proposal", "session", "source-path",
+))
+def test_saved_source_preview_rejects_changed_save_binding(tmp_path, changed):
+    fixture, gate = _saved_draft_preview_fixture(tmp_path)
+    if changed == "final-binding":
+        gate["finalBinding"]["sourceSha256"] = "0" * 64
+        fixture._write(fixture.workspace / "ai" / "organize-code-gate.json", gate)
+    elif changed == "canonical-source":
+        fixture.source.write_text("// source changed\n", encoding="utf-8")
+    elif changed == "proposal":
+        fixture.proposal_artifact.write_text("// proposal changed\n", encoding="utf-8")
+    elif changed == "session":
+        session_path = fixture.session_dir / "session.json"
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        session["syncedDraftSourceSha256"] = "0" * 64
+        fixture._write(session_path, session)
+    elif changed == "source-path":
+        manifest_path = fixture.workspace / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["source"]["path"] = "../shader.hlsl"
+        fixture._write(manifest_path, manifest)
+    with pytest.raises(console.ShaderConsoleError):
+        console.load_verified_organization_preview(
+            str(fixture.workspace), gate["organizationId"],
+            gate["proposalSourceSha256"], fixture.capture_binding)
+
+
+@pytest.mark.parametrize("changed", ("receipt", "canonical-source"))
+def test_saved_source_preview_rechecks_a_save_that_changes_during_read(tmp_path, changed):
+    fixture, gate = _saved_draft_preview_fixture(tmp_path)
+    read_bytes = console._read_file_bytes
+
+    def race(path, maximum, field):
+        raw = read_bytes(path, maximum, field)
+        if field == "organization draft canonical source":
+            if changed == "receipt":
+                replaced = dict(gate, reviewedAt="changed during source read")
+                fixture._write(fixture.workspace / "ai" / "organize-code-gate.json", replaced)
+            else:
+                fixture.source.write_text("// concurrent editor write\n", encoding="utf-8")
+        return raw
+
+    with mock.patch.object(console, "_read_file_bytes", side_effect=race):
+        with pytest.raises(console.ShaderConsoleError, match="changed"):
+            console.load_verified_organization_preview(
+                str(fixture.workspace), gate["organizationId"],
+                gate["proposalSourceSha256"], fixture.capture_binding)
+
+
+def _accepted_source_preview_fixture(tmp_path):
+    fixture = ShaderConsoleFixture(tmp_path)
+    gate = json.loads((fixture.workspace / "ai" / "organize-code-gate.json")
+                      .read_text(encoding="utf-8"))
+    manifest_path = fixture.workspace / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(stage=gate["stage"], entryPoint=gate["entryPoint"])
+    fixture._write(manifest_path, manifest)
+    fixture.registry.unlink()
+    return fixture, gate
+
+
+@pytest.mark.parametrize("stale_preview", (False, True))
+def test_finalized_source_preview_displays_current_source_without_resaving(tmp_path, stale_preview):
+    fixture, gate = _accepted_source_preview_fixture(tmp_path)
+    if stale_preview:
+        fixture._write(fixture.workspace / "ai" / "organization-preview.json", {
+            "organizationId": "0" * 32, "sourceSha256": "0" * 64,
+        })
+    tracked = [fixture.source, fixture.session_dir / "session.json",
+               fixture.workspace / "ai" / "organize-code-gate.json"]
+    before = [path.read_bytes() for path in tracked]
+    opened = console.load_verified_organization_preview(
+        str(fixture.workspace), gate["organizationId"],
+        gate["finalSourceSha256"], fixture.capture_binding)
+    assert opened["sourcePath"] == str(fixture.source.resolve())
+    assert opened["rawSha256"] == gate["finalSourceSha256"]
+    assert opened["text"] == before[0].decode("utf-8")
+    assert opened["readOnly"] is True
+    assert opened["replayApplied"] is False
+    assert opened["sourceWorkspaceId"] == fixture.WORKSPACE_ID
+    assert opened["completedChecks"] == ["source-save"]
+    assert [path.read_bytes() for path in tracked] == before
+
+
+@pytest.mark.parametrize("changed", (
+    "binding-source", "session-state", "session-binding", "baseline", "canonical-source",
+))
+def test_finalized_source_preview_rejects_stale_source_proof(tmp_path, changed):
+    fixture, gate = _accepted_source_preview_fixture(tmp_path)
+    if changed == "binding-source":
+        gate["finalBinding"]["sourceSha256"] = "0" * 64
+        fixture._write(fixture.workspace / "ai" / "organize-code-gate.json", gate)
+    elif changed in ("session-state", "session-binding"):
+        session_path = fixture.session_dir / "session.json"
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        if changed == "session-state":
+            session["state"] = "drafting"
+        else:
+            session["finalBinding"]["sourceSha256"] = "0" * 64
+        fixture._write(session_path, session)
+    elif changed == "baseline":
+        fixture.baseline_artifact.write_text("// changed baseline\n", encoding="utf-8")
+    else:
+        fixture.source.write_text("// changed canonical source\n", encoding="utf-8")
+    with pytest.raises(console.ShaderConsoleError):
+        console.load_verified_organization_preview(
+            str(fixture.workspace), gate["organizationId"],
+            gate["finalSourceSha256"], fixture.capture_binding)
+
+
+def test_finalized_source_preview_rechecks_canonical_bytes_after_read(tmp_path):
+    fixture, gate = _accepted_source_preview_fixture(tmp_path)
+    read_bytes = console._read_file_bytes
+
+    def race(path, maximum, field):
+        raw = read_bytes(path, maximum, field)
+        if field == "organization draft canonical source":
+            fixture.source.write_text("// concurrent source write\n", encoding="utf-8")
+        return raw
+
+    with mock.patch.object(console, "_read_file_bytes", side_effect=race):
+        with pytest.raises(console.ShaderConsoleError, match="bytes changed"):
+            console.load_verified_organization_preview(
+                str(fixture.workspace), gate["organizationId"],
+                gate["finalSourceSha256"], fixture.capture_binding)
+
+
+def test_source_catalog_excludes_console_journal_dependencies(tmp_path):
+    fixture = ShaderConsoleFixture(tmp_path)
+    with mock.patch.object(console, '_load_generic_console_entries',
+                           side_effect=AssertionError('Source navigation must not read journals')):
+        snapshot = console.load_console_snapshot(
+            str(fixture.registry), fixture.capture_binding, include_console_events=False)
+    assert snapshot['workspaces']
+    assert snapshot['sourceDiscoveryErrors'] == []
+
+
+def test_saved_manual_draft_remains_readable_when_only_canonical_text_is_newer(tmp_path):
+    fixture = ShaderConsoleFixture(tmp_path)
+    fixture.write_editable_draft()
+    gate_path = fixture.workspace / "ai/organize-code-gate.json"
+    receipt = gate_path.read_bytes()
+    latest = fixture.source.read_bytes() + b"\n// manually edited after the last draft receipt\n"
+    fixture.source.write_bytes(latest)
+    snapshot = console.load_console_snapshot(str(fixture.registry), fixture.capture_binding)
+    model = next(item for item in snapshot["workspaces"] if item["workspaceId"] == fixture.WORKSPACE_ID)
+    assert model["editorEligible"] and model["manualDraft"] and not model["autoApplyReady"]
+    opened = console.load_authorized_source_document(str(fixture.registry), fixture.AUTHORIZATION_ID,
+        fixture.WORKSPACE_ID, capture_binding=fixture.capture_binding)
+    assert opened["text"].encode("utf-8") == latest
+    assert opened["sourceEditable"] and opened["unvalidatedDraft"]
+    assert gate_path.read_bytes() == receipt  # Reading does not rewrite historical verification.
+
+
+def test_imported_saved_draft_is_not_hidden_as_an_old_project_head(tmp_path):
+    fixture = ImportedProjectSourceFixture(tmp_path, managed_name='a' * 64 + '-hlsl-deadbeef')
+    editor = fixture.editor
+    editor.write_organization_gate()
+    editor.write_editable_draft()
+    with mock.patch.object(console, 'default_active_project_selection_path',
+                           return_value=str(fixture.project.selection)):
+        library = console.load_project_shader_library_snapshot(str(fixture.project.selection))
+        for item in library['documents']:
+            item['isCurrentHead'] = False
+        with mock.patch.object(console, '_project_library_for_console', return_value=library):
+            snapshot = console.load_console_snapshot(str(editor.registry), editor.capture_binding)
+            matches = [m for m in snapshot['workspaces'] if m['workspaceId'] == editor.WORKSPACE_ID]
+            assert len(matches) == 1
+            assert matches[0]['activeOrganization'] and matches[0]['editorEligible']
+            assert not matches[0]['autoApplyReady']
+            with console.known_source_locator(str(editor.workspace)):
+                known, unused = console._managed_project_draft_authorizations_uncached(editor.capture_binding)
+            assert any(m['workspaceId'] == editor.WORKSPACE_ID for m in known)
+
+
+
+
+def test_console_journal_updates_reuse_catalog_but_source_changes_rebuild(tmp_path):
+    source = tmp_path / 'shader.hlsl'; source.write_text('original', encoding='utf-8')
+    journal = tmp_path / 'events.jsonl'; journal.write_text('', encoding='utf-8')
+    catalog = {'captureBinding': None, 'watchedPaths': [str(source)], 'entries': [],
+               'errors': [], 'workspaces': [], 'counts': {}}
+    request = dict(stop=console.threading.Event(), registryPath='registry', captureBinding=None,
+                   watchedPaths=[], previousSignature=None, force=False)
+    def generic():
+        return {'watchedPaths': [str(journal)], 'errors': [], 'entries': [
+            {'severity': 'info', 'text': journal.read_text(), 'unixMs': 1}]}
+    with mock.patch.object(console, 'load_console_snapshot', return_value=catalog) as load, \
+            mock.patch.object(console, '_load_generic_console_entries', side_effect=generic):
+        for index in range(5):
+            journal.write_text('message ' + str(index), encoding='utf-8')
+            request['changedPaths'] = [str(journal)]
+            result = console._build_console_panel_snapshot(request)
+            assert result['snapshot']['entries'][-1]['text'] == 'message ' + str(index)
+            request.update(watchedPaths=result['snapshot']['watchedPaths'],
+                           previousSignature=result['signature'], cachedCatalog=result['cachedCatalog'])
+        assert load.call_count == 2  # Initial discovery and its stable warm observation.
+        assert load.call_args.kwargs['include_console_events'] is False
+        source.write_text('new authored source', encoding='utf-8')
+        result = console._build_console_panel_snapshot(request)
+        assert load.call_count == 3
+        request.update(cachedCatalog=result['cachedCatalog'], captureBinding={'new': 'capture'})
+        console._build_console_panel_snapshot(request)
+        assert load.call_count == 4
+        request['force'] = True
+        console._build_console_panel_snapshot(request)
+        assert load.call_count == 5
 
 
 if __name__ == "__main__":

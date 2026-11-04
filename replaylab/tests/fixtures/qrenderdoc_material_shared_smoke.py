@@ -30,6 +30,7 @@ import time
 import traceback
 
 import renderdoc as rd
+import qrenderdoc as qrd
 from PySide2 import QtCore, QtGui, QtWidgets
 
 
@@ -294,8 +295,8 @@ class MaterialSharedSmoke(object):
                 self.keep.append(self.viewer)
                 self.viewer_widget = self.viewer.Widget()
                 self.keep.append(self.viewer_widget)
-                self.viewer_widget.resize(800, 600)
-                self.viewer_widget.show()
+                pyrenderdoc.AddDockWindow(self.viewer_widget, qrd.DockReference.TransientPopupArea,
+                                         pyrenderdoc.GetPipelineViewer().Widget(), 0.3)
                 self.phase = "native-tree"
             elif self.phase == "native-tree":
                 self.open_native_menu()

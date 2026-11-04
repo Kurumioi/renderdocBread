@@ -1178,7 +1178,8 @@ private:
   };
   rdcarray<ReplayPatchUpload *> m_ReplayBufferPatches;
   rdcarray<ReplayBufferPatch> m_ReplayBufferMemoryPatches;
-  std::set<ResourceId> m_ReplayPatchRestoreMemory;
+  rdcarray<ReplayBufferPatchRange> m_ReplayBufferRestoreRanges;
+  std::map<ResourceId, Intervals<bool>> m_ReplayPatchRestoreMemory;
   bool m_ReplayPatchCaptureChecked = false;
   rdcstr m_ReplayPatchCaptureError;
   std::map<ResourceId, uint32_t> m_ReplayPatchFirstReads;

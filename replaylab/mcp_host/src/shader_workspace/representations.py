@@ -730,6 +730,11 @@ def publish_current_event_representation(
     stage = normalize_stage(requested_stage)
     if not stage:
         raise ToolExecutionError("stage is required")
+    if bridge_response.get("error"):
+        # Failed Shader queries often omit stage and identity fields. Preserve
+        # the actual replay/reflection failure before checking success metadata.
+        message = bounded_diagnostic("shader-query-failed", bridge_response["error"])["message"]
+        raise ToolExecutionError("RenderDoc Shader query failed: %s" % message)
     response_stage = normalize_stage(bridge_response.get("stage"))
     if response_stage != stage:
         raise ToolExecutionError("RenderDoc representation stage contradicts the request")
@@ -758,7 +763,7 @@ def publish_current_event_representation(
         if not raw_sha256 or exported_hash != raw_sha256:
             raise ToolExecutionError("exported Shader bytes contradict reverse_shader hash")
     sections: list[str] = [
-        "RenderDoc Ultra current-event Shader representation",
+        "Bread current-event Shader representation",
         "representation: explanatory-ir (never compile or apply this file)",
         "eventId: %d" % int(event_id),
         "shaderResourceId: %d" % resource_id,
@@ -768,6 +773,18 @@ def publish_current_event_representation(
         "",
     ]
     included_sources: list[str] = []
+    text_sections: list[dict[str, Any]] = []
+
+    def append_text_section(kind: str, name: str, heading: str, contents: str) -> None:
+        prefix = "\n".join(sections) + "\n" + heading + "\n"
+        text = contents.rstrip() + "\n"
+        text_sections.append({
+            "kind": kind, "name": name, "offset": len(prefix.encode("utf-8")),
+            "startLine": prefix.count("\n") + 1,
+            "byteSize": len(text.encode("utf-8")), "lineCount": text.count("\n"),
+        })
+        sections.extend((heading, contents.rstrip(), ""))
+
     source_files = bridge_response.get("sourceFiles")
     if isinstance(source_files, list):
         for index, item in enumerate(source_files[:256]):
@@ -791,7 +808,8 @@ def publish_current_event_representation(
                 )
                 continue
             included_sources.append(filename)
-            sections.extend(("===== Embedded source: %s =====" % filename, contents.rstrip(), ""))
+            append_text_section("embedded-source", filename,
+                                "===== Embedded source: %s =====" % filename, contents)
 
     included_targets: list[str] = []
     disassembly = bridge_response.get("disassembly")
@@ -816,7 +834,8 @@ def publish_current_event_representation(
                 diagnostics.append(bounded_diagnostic("renderdoc-target-oversized", name))
                 continue
             included_targets.append(name)
-            sections.extend(("===== RenderDoc target: %s =====" % name, value.rstrip(), ""))
+            append_text_section("renderdoc-disassembly", name,
+                                "===== RenderDoc target: %s =====" % name, value)
 
     lane = "explanatory-ir"
     kind = "renderdoc-source-disassembly-bundle"
@@ -831,7 +850,7 @@ def publish_current_event_representation(
                 + (
                     "The complete raw Shader bytes were exported and hash-verified."
                     if raw_bytes is not None
-                    else "Only the raw hash is retained because complete bytes were unavailable."
+                    else "Only the raw hash is retained; binary export was not requested or was unavailable."
                 ),
             )
         )
@@ -863,6 +882,10 @@ def publish_current_event_representation(
         atomic_write_bytes(binary_artifact, raw_bytes)
         raw_binary_path = str(binary_artifact)
     artifact_hash = hashlib.sha256(payload).hexdigest()
+    # Keep the first response directly useful and small. Subsequent reads use
+    # byte offsets in this same immutable artifact, with no additional replay.
+    preview = payload[:4096].decode("utf-8", errors="ignore")
+    preview_bytes = len(preview.encode("utf-8"))
     capture_digest = None
     if isinstance(capture_status, Mapping):
         encoded_capture = json.dumps(
@@ -889,6 +912,15 @@ def publish_current_event_representation(
         "rawBinaryPath": raw_binary_path,
         "embeddedSourceFiles": included_sources,
         "disassemblyTargets": included_targets,
+        "availableDisassemblyTargets": [str(value)[:1024] for value in
+                                        list(bridge_response.get("disassemblyTargets") or [])[:32]],
+        "textSelection": dict(bridge_response.get("textSelection") or {}),
+        "sections": text_sections,
+        "textPreview": {"offset": 0, "content": preview, "returnedBytes": preview_bytes,
+                        "truncated": preview_bytes < len(payload), "nextOffset": preview_bytes},
+        "continuation": {"tool": "read_evidence_file", "path": str(artifact),
+                         "offset": preview_bytes, "max_bytes": 16384,
+                         "replayRequired": False},
         "provenance": {
             "kind": "fixed-program",
             "component": "qrenderdoc.ReplayController.DisassembleShader",

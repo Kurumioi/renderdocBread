@@ -120,7 +120,7 @@ TOOL_CONSOLE_POLICIES.update(
             "prepare_active_capture_project": "准备当前捕获工程",
             "register_active_project_workspace": "登记 Shader 工作区",
             "seed_active_shader_workspace": "复用工程 Shader 知识",
-            "create_replay_project": "创建 ReplayLab 工程",
+            "create_replay_project": "创建工程",
             "import_replay_project_capture": "导入工程捕获",
             "register_replay_project_workspace": "登记工程工作区",
             "register_replay_project_alias_table": "登记工程别名表",
@@ -187,7 +187,6 @@ TOOL_CONSOLE_POLICIES.update(
             "create_shader_workspace": "创建 Shader 工作区",
             "promote_shader_workspace_explanation": "发布 Shader 可读说明",
             "begin_shader_workspace_organization": "开始整理 Shader 源码",
-            "review_shader_workspace_organization": "复核 Shader 源码整理",
             "apply_shader_workspace_candidate": "应用 Shader 候选",
             "apply_shader_workspace_candidate_family": "应用 Shader 家族候选",
             "apply_shader_workspace_shared_resource": "替换共享 Shader 资源",
@@ -248,12 +247,29 @@ def _normalise_severity(value: str) -> str:
 
 def _default_journal_directory() -> Path:
     # LOCALAPPDATA is process-owner configuration.  There is intentionally no
-    # function argument or MCP input that can redirect this journal.
+    # function argument or MCP input that can redirect this journal.  Off Windows
+    # the same layout lives under the XDG data root: refusing there would drop the
+    # diagnostic journal on every non-Windows Host, silently, because this
+    # producer is best-effort by design.
     root = str(os.environ.get("LOCALAPPDATA", "") or "").strip()
-    if not root:
-        raise RuntimeError("LOCALAPPDATA is unavailable")
-    fixed_root = Path(os.path.abspath(os.path.expanduser(root)))
-    return fixed_root / "ReplayLab" / "console-events"
+    if root:
+        fixed_root = Path(os.path.abspath(os.path.expanduser(root)))
+    else:
+        xdg = str(os.environ.get("XDG_DATA_HOME", "") or "").strip()
+        fixed_root = (Path(xdg).expanduser() if xdg
+                      else Path.home() / ".local" / "share")
+    directory = fixed_root / "ReplayLab" / "console-events"
+    instance = str(os.environ.get("REPLAYLAB_INSTANCE_ID") or os.environ.get("BREAD_ROUTING_INSTANCE") or "")
+    try:
+        from .ipc_client import _CALL_BINDING
+        bound = _CALL_BINDING.get()
+        if bound is not None:
+            instance = bound[0]
+    except (ImportError, AttributeError):
+        pass
+    if re.fullmatch(r'[1-9][0-9]{0,19}-[0-9a-f]{32}', instance):
+        directory = directory / 'instances' / instance
+    return directory
 
 
 def _is_reparse(path: Path) -> bool:
@@ -271,10 +287,10 @@ def _ensure_journal_directory(directory: Path) -> None:
     parent = directory.parent
     parent.mkdir(parents=True, exist_ok=True)
     if not parent.is_dir() or _is_reparse(parent):
-        raise RuntimeError("ReplayLab console journal parent is redirected")
+        raise RuntimeError("Bread console journal parent is redirected")
     directory.mkdir(exist_ok=True)
     if not directory.is_dir() or _is_reparse(directory):
-        raise RuntimeError("ReplayLab console journal directory is redirected")
+        raise RuntimeError("Bread console journal directory is redirected")
 
 
 def _context(value: Mapping[str, Any] | None) -> dict[str, str]:
@@ -314,13 +330,13 @@ def _validate_existing_journal(path: Path) -> None:
     try:
         details = path.lstat()
     except OSError as error:
-        raise RuntimeError("ReplayLab console journal is unavailable") from error
+        raise RuntimeError("Bread console journal is unavailable") from error
     if (
         _is_reparse(path)
         or not stat.S_ISREG(details.st_mode)
         or int(getattr(details, "st_nlink", 1) or 1) != 1
     ):
-        raise RuntimeError("ReplayLab console journal is redirected")
+        raise RuntimeError("Bread console journal is redirected")
 
 
 def _same_path(first: Path, second: Path) -> bool:
@@ -538,14 +554,19 @@ _Function = TypeVar("_Function", bound=Callable[..., Any])
 
 
 def instrument_mcp_tool(function: _Function) -> _Function:
-    """Wrap a registered meaningful tool with fixed start/result events."""
+    """Wrap a registered meaningful tool with fixed start/result events.
+
+    Preserve async tools as coroutines so FastMCP awaits them. Sync wrappers
+    around async tools return raw coroutine objects and break Agent calls.
+    """
+
+    import inspect
 
     policy = console_tool_policy(function.__name__)
     if policy is None:
         return function
 
-    @functools.wraps(function)
-    def wrapped(*args: Any, **kwargs: Any) -> Any:
+    def _emit_start() -> dict[str, str]:
         event_context = {"operation": function.__name__}
         emit_console_event(
             policy.module,
@@ -555,18 +576,9 @@ def instrument_mcp_tool(function: _Function) -> _Function:
             code="tool.started",
             context=event_context,
         )
-        try:
-            result = function(*args, **kwargs)
-        except Exception as exc:
-            emit_console_event(
-                policy.module,
-                "error",
-                "失败：%s：%s" % (policy.label, _bounded(exc, 2_048)),
-                phase="tool-failure",
-                code="tool.failed",
-                context=event_context,
-            )
-            raise
+        return event_context
+
+    def _emit_result(event_context: dict[str, str], result: Any) -> None:
         result_error = _result_error(result)
         if result_error:
             emit_console_event(
@@ -586,6 +598,41 @@ def instrument_mcp_tool(function: _Function) -> _Function:
                 code="tool.succeeded",
                 context=event_context,
             )
+
+    def _emit_exception(event_context: dict[str, str], exc: BaseException) -> None:
+        emit_console_event(
+            policy.module,
+            "error",
+            "失败：%s：%s" % (policy.label, _bounded(exc, 2_048)),
+            phase="tool-failure",
+            code="tool.failed",
+            context=event_context,
+        )
+
+    if inspect.iscoroutinefunction(function):
+
+        @functools.wraps(function)
+        async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
+            event_context = _emit_start()
+            try:
+                result = await function(*args, **kwargs)
+            except Exception as exc:
+                _emit_exception(event_context, exc)
+                raise
+            _emit_result(event_context, result)
+            return result
+
+        return cast(_Function, async_wrapped)
+
+    @functools.wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        event_context = _emit_start()
+        try:
+            result = function(*args, **kwargs)
+        except Exception as exc:
+            _emit_exception(event_context, exc)
+            raise
+        _emit_result(event_context, result)
         return result
 
     return cast(_Function, wrapped)

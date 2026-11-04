@@ -20,7 +20,7 @@ operating-system credential storage independently of those paths.
 | Qwen Code | Start `qwen`, run `/auth`, choose Alibaba ModelStudio Coding Plan or another supported API provider, then exit after verification. The former Qwen OAuth path was discontinued on 2026-04-15. | `qwen --acp` over stdio | Imported when exposed in ACP session configuration; otherwise use the configured default or an exact provider model. |
 | Kimi Code CLI | `kimi login`; the CLI uses an RFC 8628 device-code flow and prints the verification URL/code. | `kimi acp` over stdio | Kimi ACP can return model/session configuration options, which ReplayLab imports when present. |
 | Tencent CodeBuddy Code / Hunyuan | Start isolated `codebuddy`, choose **Log in via Chinese Site**, and complete the browser flow with the CodeBuddy account that owns the subscription. | `codebuddy --acp` over stdio, pinned to the standard `cli` agent with connection-scoped user settings, no ambient global/project/local MCP or settings, no transcript persistence and no built-in tools; only the exact injected `mcp__ReplayLab` server is pre-approved | Imported when the ACP session exposes model configuration; Hunyuan/model availability and quota remain controlled by the signed-in CodeBuddy plan. |
-| Anthropic Claude Code | ReplayLab opens `claude setup-token` with this connection's profile-isolated `CLAUDE_CONFIG_DIR`; the user completes Anthropic's official login in that terminal. | Built-in `claude-agent-acp` over stdio. This is the Agent Client Protocol reference adapter around the official Claude Code CLI, not an Anthropic-native ACP server. ReplayLab supplies one strict project MCP, the selected project Skills and `AskUserQuestion` elicitation. | A selected id is passed as `ANTHROPIC_MODEL`; blank follows the subscription default. Availability remains controlled by the signed-in plan. |
+| Anthropic Claude Code | ReplayLab opens `claude auth login` with this connection's profile-isolated `CLAUDE_CONFIG_DIR`; the user completes Anthropic's official login in that terminal. | Built-in `claude-agent-acp` over stdio. This is the Agent Client Protocol reference adapter around the official Claude Code CLI, not an Anthropic-native ACP server. ReplayLab supplies one strict project MCP, the selected project Skills and `AskUserQuestion` elicitation. | A selected id is passed as `ANTHROPIC_MODEL`; blank follows the subscription default. Availability remains controlled by the signed-in plan. |
 | Custom ACP | ReplayLab never guesses a login command. Authentication must already be configured by the user. | User-entered ACP stdio command | Handshake discovery when available, or manual exact model. The command is never automatically trusted. |
 
 For a new built-in provider connection, qrenderdoc visibly checks trust only for
@@ -56,19 +56,18 @@ structured input names the exact `ReplayLab` server and one tool from that turn'
 Host allow-list. It prefers `allow_once`; an `allow_always` fallback is confined to
 the fresh process, session, and task-filtered proxy. Human-readable titles are
 never authorization inputs. The per-task Host filter remains authoritative. The
-live tool manifest, frozen capture scope, effect ceiling, call budget, artifact
-postconditions and rollback requirements are checked by ReplayLab; ACP prose
+live tool manifest, frozen capture scope, effect ceiling, concrete artifact
+postconditions and rollback requirements are checked by Bread; ACP prose
 cannot grant or revoke them. Capture-free conversation needs no MCP server. An
 unrelated ACP permission request is denied as an ordinary tool result so the
 native Agent can choose an admitted operation; malformed or replayed requests
 fail closed.
 
-Subscription connections do not enter a ReplayLab planner or child-Agent
-router. ACP and Codex keep their vendor-native single-Agent loop and call the
-same task-scoped ReplayLab MCP used by the API path's deepagents children. All
-paths share the frozen context, Host artifact gates, `report_task_result` form,
-and bounded verification follow-up. Provider wording may differ; Host-owned
-evidence, reports and artifacts may not.
+Subscription connections do not enter a Bread planner or mandatory child-Agent
+router. ACP and Codex keep their vendor-native Agent loop and call the same
+task-scoped Bread MCP used by the API path. The Agent chooses tools and optional
+Skills; the Host checks concrete write and replay effects. No terminal report
+form, forced verification follow-up, or Host-selected next step is required.
 
 Codex app-server turns use the server-advertised built-in `:read-only`
 permission profile plus the exact ReplayLab runtime roots on both `thread/start`
@@ -131,3 +130,5 @@ incompatibility is a non-retryable capability error.
 - [Kimi custom Agents](https://www.kimi.com/code/docs/en/kimi-code-cli/customization/agents)
 - [ACP session configuration options](https://agentclientprotocol.com/announcements/session-config-options-stabilized)
 - [ACP authentication methods](https://agentclientprotocol.com/rfds/auth-methods)
+
+Claude connection validation also runs `claude auth status --json` with the same isolated `CLAUDE_CONFIG_DIR` as the actual task. ACP initialization and model discovery alone are not account authentication. `setup-token` generates a token without storing CLI login state and is not used by Save and Connect. These checks send no model prompt and do not establish model entitlement or request-time access.

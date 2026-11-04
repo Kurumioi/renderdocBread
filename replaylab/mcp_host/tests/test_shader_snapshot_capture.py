@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -79,6 +80,186 @@ def test_current_scoped_stopped_source_is_readable_but_not_auto_apply_ready(tmp_
     assert "writeGrant" not in document
 
 
+@pytest.mark.parametrize("session_state", [
+    "previous-capture", "missing-live", "missing-watch", "failed", "stopped",
+    "running-unapplied",
+])
+def test_editable_draft_snapshot_and_source_reader_share_read_identity(tmp_path, session_state):
+    """Exercise the real file worker: stale diagnostics cannot strand a draft."""
+    from test_shader_workspace_panel import _load_without_qt
+
+    fixture = ShaderConsoleFixture(tmp_path)
+    gate = fixture.write_editable_draft()
+    fixture.write_live(state="running")
+    fixture.write_watch(events=[{
+        "sequence": 1, "type": "compileFailed", "message": "source requires correction",
+        "at": "2026-10-27T14:00:00Z",
+    }], state="running")
+    live_path = fixture.workspace / "live-edit" / (fixture.LIVE_ID + ".json")
+    watch_path = fixture.workspace / "watch" / (fixture.WATCH_ID + ".json")
+    if session_state == "previous-capture":
+        fixture.write_live(state="failed", captureBinding=dict(
+            fixture.capture_binding, instanceId="5678-previous", captureSessionId="9" * 32))
+        fixture.write_watch(state="stopped")
+    elif session_state == "missing-live":
+        live_path.unlink()
+    elif session_state == "missing-watch":
+        watch_path.unlink()
+    elif session_state in ("failed", "stopped"):
+        fixture.write_live(state=session_state)
+
+    ui = _load_without_qt()
+    request = {
+        "stop": threading.Event(), "force": True, "previousSignature": None,
+        "registryPath": str(fixture.registry), "projectSelectionPath": "",
+        "captureBinding": fixture.capture_binding,
+        "watchedPaths": [str(fixture.registry), str(fixture.source)],
+        "documentIds": [fixture.WORKSPACE_ID],
+    }
+    with mock.patch.object(ui, "_shader_console_protocol", console), \
+            mock.patch.object(console, "_managed_project_draft_authorizations", return_value=([], [])), \
+            mock.patch.object(console, "_load_generic_console_entries", return_value={
+                "entries": [], "errors": [], "watchedPaths": []}):
+        result = ui._build_workspace_snapshot_files(request)
+    assert result["sourceErrors"] == {}
+    model, = result["snapshot"]["workspaces"]
+    opened = result["sources"][fixture.WORKSPACE_ID]
+    assert opened["rawSha256"] == gate["proposalSourceSha256"]
+    assert opened["readOnly"] is False
+    assert model["autoApplyReady"] is False
+    expected = fixture.LIVE_ID if session_state in ("failed", "stopped", "running-unapplied") else None
+    assert opened["liveEditId"] == expected
+    assert model["sourceSession"] == {
+        "liveEditId": expected, "watchId": fixture.WATCH_ID if expected else None}
+    if session_state == "previous-capture":
+        assert model["liveEdit"] is None
+        assert model["watch"]["watchId"] == fixture.WATCH_ID
+    elif session_state != "missing-watch":
+        assert any("source requires correction" in entry["text"] for entry in model["entries"])
+
+
+def test_draft_source_snapshot_rejects_actual_read_session_change(tmp_path):
+    from test_shader_workspace_panel import _load_without_qt
+
+    fixture = ShaderConsoleFixture(tmp_path)
+    fixture.write_editable_draft()
+    fixture.write_live(state="failed")
+    ui = _load_without_qt()
+    original = console.load_authorized_source_document
+
+    def changed_session(*args, **kwargs):
+        opened = original(*args, **kwargs)
+        return dict(opened, watchId="0" * 32)
+
+    with mock.patch.object(ui, "_shader_console_protocol", console), \
+            mock.patch.object(console, "load_authorized_source_document", side_effect=changed_session), \
+            mock.patch.object(console, "_managed_project_draft_authorizations", return_value=([], [])), \
+            mock.patch.object(console, "_load_generic_console_entries", return_value={
+                "entries": [], "errors": [], "watchedPaths": []}):
+        result = ui._build_workspace_snapshot_files({
+            "stop": threading.Event(), "force": True, "previousSignature": None,
+            "registryPath": str(fixture.registry), "projectSelectionPath": "",
+            "captureBinding": fixture.capture_binding,
+            "watchedPaths": [str(fixture.registry)], "documentIds": [fixture.WORKSPACE_ID],
+        })
+    assert result["sources"] == {}
+    assert "source session changed" in result["sourceErrors"][fixture.WORKSPACE_ID]
+
+
+def _same_binary_reuse_fixture(tmp_path, active_revision=6):
+    fixture = ShaderConsoleFixture(tmp_path)
+    gate = fixture.write_editable_draft()
+    active = {
+        "revision": active_revision, "candidateRawSha256": "3" * 64,
+        "replacementId": "4" * 32, "originalResourceId": 0x100000001,
+        "allOriginalResourceUsesAffected": True, "eventScoped": False,
+        "resourceScoped": True, "originalShaderPreserved": True,
+    }
+    last_apply = {
+        "schema": "renderdoc-ultra-shader-shared-resource-apply-mcp/v1",
+        "operation": "reuse-active-shared-resource", "applied": True,
+        "reused": True, "mutationPerformed": False,
+        "binding": {"revision": 7, "candidateRawSha256": active["candidateRawSha256"]},
+        "validation": {"replayAbiValidated": True, "performedForRevision": False,
+                       "evidenceReusedFromRevision": active_revision},
+        "replacement": copy.deepcopy(active),
+    }
+    fixture.write_live(activeReplacement=active, latestHandledRevision=7, lastApply=last_apply)
+    fixture.write_watch(latestCandidateRevision=7)
+    manifest_path = fixture.workspace / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest.update(revision=7, latestCompiled={
+        "revision": 7, "sourceSha256": gate["proposalSourceSha256"],
+        "rawSha256": active["candidateRawSha256"], "abiCompatible": False,
+        "replayAbiValidated": False, "requiresReplayAbiValidation": True,
+        "abiGate": {"status": "pending-replay-reflection"},
+    })
+    fixture._write(manifest_path, manifest)
+    return fixture
+
+
+def _isolated_workspace_snapshot(fixture):
+    with mock.patch.object(console, "_managed_project_draft_authorizations", return_value=([], [])), \
+            mock.patch.object(console, "_load_generic_console_entries", return_value={
+                "entries": [], "errors": [], "watchedPaths": []}):
+        snapshot = console.load_console_snapshot(str(fixture.registry), fixture.capture_binding)
+    workspace, = snapshot["workspaces"]
+    return workspace
+
+
+@pytest.mark.parametrize("active_revision", [6, 13])
+def test_draft_same_binary_reuse_ready_without_claiming_new_abi_check(tmp_path, active_revision):
+    fixture = _same_binary_reuse_fixture(tmp_path, active_revision)
+    manifest_path = fixture.workspace / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    workspace = _isolated_workspace_snapshot(fixture)
+    assert workspace["autoApplyReady"] is True
+    assert workspace["liveEdit"]["activeRevision"] == active_revision
+    evidence = workspace["liveEdit"]["reusedApplyEvidence"]
+    assert evidence["revision"] == 7
+    assert evidence["evidenceReusedFromRevision"] == active_revision
+    assert evidence["performedForRevision"] is False
+    assert manifest_path.read_bytes() == manifest_before
+    assert json.loads(manifest_before)["latestCompiled"]["replayAbiValidated"] is False
+
+
+@pytest.mark.parametrize("document,field,value", [
+    ("manifest", "latestCompiled.rawSha256", "9" * 64),
+    ("manifest", "latestCompiled.sourceSha256", "9" * 64),
+    ("manifest", "latestCompiled.revision", 8),
+    ("watch", "latestCandidateRevision", 8),
+    ("live", "state", "failed"),
+    ("live", "sessionState", "expired"),
+    ("live", "latestHandledRevision", 8),
+    ("live", "lastApply.binding.candidateRawSha256", "9" * 64),
+    ("live", "lastApply.binding.revision", 8),
+    ("live", "lastApply.replacement.replacementId", "9" * 32),
+    ("live", "lastApply.replacement.originalResourceId", 123),
+    ("live", "lastApply.replacement.revision", 5),
+    ("live", "lastApply.replacement.candidateRawSha256", "9" * 64),
+    ("live", "lastApply.validation.evidenceReusedFromRevision", 5),
+    ("live", "lastApply.validation.performedForRevision", True),
+    ("live", "lastApply.validation.replayAbiValidated", False),
+    ("live", "lastApply.applied", False),
+    ("live", "lastApply.mutationPerformed", True),
+])
+def test_draft_same_binary_reuse_rejects_mismatched_or_expired_evidence(tmp_path, document, field, value):
+    fixture = _same_binary_reuse_fixture(tmp_path)
+    path = {
+        "manifest": fixture.workspace / "manifest.json",
+        "live": fixture.workspace / "live-edit" / (fixture.LIVE_ID + ".json"),
+        "watch": fixture.workspace / "watch" / (fixture.WATCH_ID + ".json"),
+    }[document]
+    data = json.loads(path.read_bytes())
+    target = data
+    parts = field.split(".")
+    for part in parts[:-1]:
+        target = target[part]
+    target[parts[-1]] = value
+    fixture._write(path, data)
+    assert _isolated_workspace_snapshot(fixture)["autoApplyReady"] is False
+
+
 def test_capture_binding_changed_during_source_read_rejects_late_document(tmp_path):
     fixture = ShaderConsoleFixture(tmp_path)
     original_read = console._read_file_bytes
@@ -114,7 +295,7 @@ def _combine_registry(first, second, *, second_rid=None):
 
 def test_same_shader_current_running_source_beats_newer_stopped_history(tmp_path):
     first = ShaderConsoleFixture(tmp_path / "first")
-    second = OtherShaderFixture(tmp_path / "second")
+    second = OtherShaderFixture(tmp_path / "second", capture_path=first.capture_binding["capturePath"])
     first.write_live()
     first.write_watch()
     _combine_registry(first, second)
@@ -127,7 +308,7 @@ def test_same_shader_current_running_source_beats_newer_stopped_history(tmp_path
 
 def test_same_shader_latest_explicit_authorization_wins_when_both_running(tmp_path):
     first = ShaderConsoleFixture(tmp_path / "first")
-    second = OtherShaderFixture(tmp_path / "second")
+    second = OtherShaderFixture(tmp_path / "second", capture_path=first.capture_binding["capturePath"])
     for fixture in (first, second):
         fixture.write_live()
         fixture.write_watch()
@@ -140,7 +321,7 @@ def test_same_shader_latest_explicit_authorization_wins_when_both_running(tmp_pa
 
 def test_identical_shader_bytes_at_different_resource_ids_remain_distinct(tmp_path):
     first = ShaderConsoleFixture(tmp_path / "first")
-    second = OtherShaderFixture(tmp_path / "second")
+    second = OtherShaderFixture(tmp_path / "second", capture_path=first.capture_binding["capturePath"])
     _combine_registry(first, second, second_rid=102)
     snapshot = console.load_console_snapshot(str(first.registry), first.capture_binding)
     assert {item["resourceId"] for item in snapshot["workspaces"]} == {101, 102}
@@ -151,7 +332,7 @@ def test_current_shader_in_full_and_bounded_catalogs_has_one_editor(tmp_path):
         CAPTURE_ID = "f" * 64
 
     first = ShaderConsoleFixture(tmp_path / "full")
-    second = BoundedCatalogShader(tmp_path / "bounded")
+    second = BoundedCatalogShader(tmp_path / "bounded", capture_path=first.capture_binding["capturePath"])
     for fixture in (first, second):
         fixture.write_live()
         fixture.write_watch()
@@ -190,15 +371,19 @@ def test_bridge_capture_provider_and_lifecycle_notify_loaded_scope_then_none(tmp
         "INSTANCE_ID": binding["instanceId"],
         "_capture_session_id": binding["captureSessionId"],
         "_active_capture_token": "old-token",
+        "_replay_recovery_path": "",
         "_shader_workspace_ui": SimpleNamespace(capture_changed=lambda value: events.append(("workspace", value))),
         "_shader_console_ui": SimpleNamespace(capture_changed=lambda value: events.append(("console", value))),
         "_material_panel_ui": None, "_material_panel_controller": None, "_pass_panel_ui": None,
+        "_frame_render_flow_generation": 0, "_frame_render_flow_ui": None,
+        "_project_async_executor": None,
         "_abandon_project_launcher_restore": lambda: None,
         "_reset_symbol_state": lambda **kwargs: namespace.update(_capture_session_id="9" * 32),
         "_current_capture_token": lambda: "new-token",
         "_publish_instance_manifest": lambda **kwargs: events.append(("published", namespace["_active_capture_token"])),
         "_publish_console_event": lambda *args, **kwargs: None,
         "_cancel_project_auto_activation": lambda: None,
+        "_schedule_frame_render_flow_restore": lambda: None,
         "_schedule_project_auto_activation": lambda: events.append(("scheduled", namespace["_shader_workspace_capture_binding"]())),
     })
     assert namespace["_shader_workspace_capture_binding"]() == binding

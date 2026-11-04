@@ -1,11 +1,4 @@
-"""Deterministic shader recovery failure taxonomy.
-
-The classifier intentionally runs before AI.  It turns bounded exception text
-and known exception types into a stable category plus a finite set of safe next
-actions.  AI may explain an ``unknown`` result or choose among emitted actions;
-it does not invent executables, command lines, physical ABI facts, or apply
-authorization.
-"""
+"""Bounded shader failure diagnostics without prescribing the agent's workflow."""
 
 from __future__ import annotations
 
@@ -56,8 +49,8 @@ def _direct_cause(error: BaseException | str) -> BaseException | None:
 
 def _classify_organization_failure(
     error: BaseException, message: str
-) -> tuple[str, bool, list[str], bool]:
-    """Classify the fixed organization transaction before generic text rules."""
+) -> tuple[str, bool, bool]:
+    """Classify an organization error without choosing a recovery procedure."""
 
     cause = _direct_cause(error)
     if _contains(
@@ -70,12 +63,7 @@ def _classify_organization_failure(
         r"workspace source hash changed",
         r"not awaiting (?:proposal )?review",
     ):
-        return (
-            "organization-conflict",
-            True,
-            ["preserve-evidence", "refresh-workspace-state", "restart-organization-session"],
-            False,
-        )
+        return "organization-conflict", True, False
     if _contains(
         message,
         r"organized hlsl proposal",
@@ -85,12 +73,7 @@ def _classify_organization_failure(
         r"analysis must not embed code fences",
         r"proposal source path",
     ):
-        return (
-            "organization-proposal-invalid",
-            True,
-            ["preserve-evidence", "repair-organization-proposal", "review-again"],
-            True,
-        )
+        return "organization-proposal-invalid", True, True
     if isinstance(cause, AbiValidationError) or _contains(
         message,
         r"abi validation",
@@ -99,16 +82,7 @@ def _classify_organization_failure(
         r"reflection evidence",
         r"compiled interface",
     ):
-        return (
-            "organization-abi-failed",
-            False,
-            [
-                "preserve-evidence",
-                "repair-source-within-captured-abi",
-                "keep-live-edit-blocked",
-            ],
-            True,
-        )
+        return "organization-abi-failed", False, True
     if isinstance(cause, (ToolConfigurationError, ToolExecutionError)) or _contains(
         message,
         r"compile returned",
@@ -116,25 +90,8 @@ def _classify_organization_failure(
         r"compiler produced",
         r"produced unstable .*executable code",
     ):
-        return (
-            "organization-compile-failed",
-            False,
-            [
-                "preserve-evidence",
-                "inspect-fixed-compiler-diagnostic",
-                "repair-organization-proposal",
-                "keep-live-edit-blocked",
-            ],
-            True,
-        )
-    # Session identity, hashes, paths, baseline provenance and all other
-    # unrecognised organization invariants fail as fixed-program evidence.
-    return (
-        "organization-evidence-invalid",
-        False,
-        ["preserve-evidence", "discard-organization-session", "restart-organization-session"],
-        False,
-    )
+        return "organization-compile-failed", False, True
+    return "organization-evidence-invalid", False, False
 
 
 def classify_shader_failure(
@@ -149,12 +106,6 @@ def classify_shader_failure(
     organization_phase = str(phase or "").startswith("organization-")
     category = "unknown"
     retryable = False
-    # Unknown is a recoverable classification boundary, not permission to
-    # replace an execution goal with an explanation-only response. The Agent
-    # may inspect the bounded diagnostic and choose another registered route,
-    # while the Host continues to forbid inventing executables or replaying an
-    # unchanged failed call.
-    actions: list[str] = ["preserve-evidence", "request-ai-diagnostic-review"]
     ai_may_author_source = False
 
     if isinstance(error, ManifestValidationError) and _contains(
@@ -166,50 +117,24 @@ def classify_shader_failure(
     ):
         category = "workspace-toolchain-upgrade-required"
         retryable = True
-        actions = [
-            "preserve-evidence",
-            "migrate-source-to-current-fixed-toolchain",
-            "compile-and-revalidate-in-migrated-workspace",
-            "restart-persistent-live-edit-on-migrated-workspace",
-        ]
     elif isinstance(error, (CatalogValidationError, ManifestValidationError)):
         category = "provenance-invalid"
-        actions = ["preserve-evidence", "re-export-capture-catalog"]
     elif isinstance(error, ToolchainRoutingError):
         if _contains(message, r"unsupported shader format", r"unsupported target api"):
             category = "unsupported-format-or-api"
-            actions = [
-                "preserve-evidence",
-                "inspect-native-ir",
-                "install-or-register-format-provider",
-            ]
         elif _contains(message, r"ambiguous", r"equal.*route", r"choose an explicit"):
             category = "route-ambiguous"
-            actions = ["preserve-evidence", "choose-registered-route-id"]
         else:
             category = "route-unavailable"
-            actions = [
-                "preserve-evidence",
-                "inspect-native-ir",
-                "try-registered-alternate-route",
-                "construct-source-if-compile-route-exists",
-                "install-or-register-format-provider",
-            ]
             ai_may_author_source = True
     elif _is_organization_error(error):
-        category, retryable, actions, ai_may_author_source = (
+        category, retryable, ai_may_author_source = (
             _classify_organization_failure(error, message)
         )
     elif organization_phase and isinstance(
         error, (ToolConfigurationError, ToolExecutionError)
     ):
         category = "organization-compile-failed"
-        actions = [
-            "preserve-evidence",
-            "inspect-fixed-compiler-diagnostic",
-            "repair-organization-proposal",
-            "keep-live-edit-blocked",
-        ]
         ai_may_author_source = isinstance(error, ToolExecutionError) and _contains(
             message, r"exited with code", r"process.*failed"
         )
@@ -218,11 +143,6 @@ def classify_shader_failure(
         or _contains(message, r"abi", r"reflection", r"compiled interface")
     ):
         category = "organization-abi-failed"
-        actions = [
-            "preserve-evidence",
-            "repair-source-within-captured-abi",
-            "keep-live-edit-blocked",
-        ]
         ai_may_author_source = True
     elif (
         str(phase or "").startswith("workspace-prepare")
@@ -235,11 +155,6 @@ def classify_shader_failure(
         )
     ):
         category = "workspace-path-policy-violation"
-        actions = [
-            "preserve-evidence",
-            "keep-workspace-write-blocked",
-            "resolve-active-managed-workspace-path",
-        ]
     elif (
         str(phase or "").startswith("workspace-prepare")
         and not isinstance(error, ToolExecutionError)
@@ -256,11 +171,6 @@ def classify_shader_failure(
         # Host for its compact managed path, and retry without user input.
         category = "workspace-path-conflict"
         retryable = True
-        actions = [
-            "preserve-evidence",
-            "resolve-active-managed-workspace-path",
-            "use-new-isolated-workspace",
-        ]
     elif (
         str(phase or "").startswith("workspace-prepare")
         and not isinstance(error, ToolExecutionError)
@@ -268,11 +178,6 @@ def classify_shader_failure(
     ):
         category = "workspace-path-conflict"
         retryable = True
-        actions = [
-            "preserve-evidence",
-            "resolve-active-managed-workspace-path",
-            "use-new-isolated-workspace",
-        ]
     elif (
         str(phase or "").startswith("workspace-prepare")
         and not isinstance(error, ToolExecutionError)
@@ -284,11 +189,6 @@ def classify_shader_failure(
     ):
         category = "capture-catalog-export-failed"
         retryable = True
-        actions = [
-            "preserve-evidence",
-            "re-export-capture-catalog",
-            "retry-same-bound-shader",
-        ]
     elif (
         str(phase or "").startswith("workspace-prepare")
         and not isinstance(error, ToolExecutionError)
@@ -304,11 +204,6 @@ def classify_shader_failure(
         )
     ):
         category = "capture-or-shader-identity-conflict"
-        actions = [
-            "preserve-evidence",
-            "rebind-exact-capture-and-shader",
-            "prepare-new-identity-bound-workspace",
-        ]
     elif _contains(
         message,
         r"ray.*(?:state.?object|shader.?group|sbt)",
@@ -316,12 +211,6 @@ def classify_shader_failure(
         r"library.*(?:export|association|state.?object)",
     ):
         category = "ray-library-replacement-unavailable"
-        actions = [
-            "preserve-evidence",
-            "preserve-compiled-source-or-ir",
-            "keep-apply-blocked",
-            "require-complete-export-state-object-sbt-transaction",
-        ]
     elif not isinstance(error, ToolExecutionError) and _contains(
         message,
         r"capture session changed",
@@ -330,12 +219,6 @@ def classify_shader_failure(
         r"shader identity.*(?:changed|different|match)",
     ):
         category = "capture-or-shader-identity-conflict"
-        actions = [
-            "preserve-evidence",
-            "keep-last-good-replacement",
-            "rebind-exact-capture-and-shader",
-            "require-new-save-after-rebind",
-        ]
     elif not isinstance(error, ToolExecutionError) and _contains(
         message,
         r"foreign renderdoc replacement",
@@ -343,12 +226,6 @@ def classify_shader_failure(
         r"captured shader is owned by",
     ):
         category = "replacement-ownership-conflict"
-        actions = [
-            "preserve-evidence",
-            "inspect-active-replacement-owner",
-            "keep-apply-blocked",
-            "use-owner-specific-rollback",
-        ]
     elif not isinstance(error, ToolExecutionError) and _contains(
         message,
         r"checked .* shader replacement failed",
@@ -357,23 +234,11 @@ def classify_shader_failure(
         r"program.*link.*(?:failed|failure|rejected)",
     ):
         category = "backend-replacement-rejected"
-        actions = [
-            "preserve-evidence",
-            "keep-last-good-replacement",
-            "inspect-backend-rebuild-diagnostic",
-            "repair-source-within-captured-abi",
-            "require-new-compiled-save",
-        ]
         ai_may_author_source = True
     elif not isinstance(error, ToolExecutionError) and _contains(
         message, r"root signature", r"rootsignature"
     ):
         category = "root-signature-contract"
-        actions = [
-            "preserve-evidence",
-            "reuse-captured-pipeline-root-signature",
-            "keep-apply-blocked",
-        ]
     elif isinstance(error, ToolConfigurationError) or (
         not isinstance(error, ToolExecutionError)
         and _contains(
@@ -381,56 +246,28 @@ def classify_shader_failure(
         )
     ):
         category = "tool-integrity-or-configuration"
-        actions = ["preserve-evidence", "repair-process-owned-tool-registration"]
     elif isinstance(error, AbiValidationError) or (
         not isinstance(error, ToolExecutionError)
         and _contains(message, r"abi", r"reflection", r"interface")
     ):
         if _contains(message, r"unavailable", r"incomplete", r"opaque"):
             category = "baseline-interface-unavailable"
-            actions = [
-                "preserve-evidence",
-                "recover-physical-interface",
-                "keep-apply-blocked",
-            ]
         else:
             category = "abi-mismatch"
-            actions = [
-                "preserve-evidence",
-                "repair-source-within-captured-abi",
-                "keep-apply-blocked",
-            ]
             ai_may_author_source = True
     elif isinstance(error, ToolExecutionError) and _contains(
         message, r"baseline compile probe failed"
     ):
         category = "baseline-compile-probe-failed"
         retryable = True
-        actions = [
-            "preserve-evidence",
-            "try-same-decompiler-with-registered-alternate-compiler",
-            "try-registered-alternate-route-pair",
-            "keep-apply-blocked",
-        ]
     elif isinstance(error, ToolExecutionError):
         if _contains(message, r"timed out"):
             category = "tool-timeout"
             retryable = True
-            actions = ["preserve-evidence", "try-registered-alternate-route"]
         elif _contains(message, r"launch", r"not found", r"cannot start"):
             category = "tool-launch-failed"
-            actions = [
-                "preserve-evidence",
-                "try-registered-alternate-route",
-                "repair-process-owned-tool-registration",
-            ]
         elif _contains(message, r"exited with code", r"process.*failed"):
             category = "tool-rejected-input"
-            actions = [
-                "preserve-evidence",
-                "try-registered-alternate-route",
-                "repair-provisional-source-if-compile-route-exists",
-            ]
             ai_may_author_source = True
         elif _contains(
             message,
@@ -441,21 +278,10 @@ def classify_shader_failure(
             r"not exactly one valid",
         ):
             category = "malformed-tool-output"
-            actions = ["preserve-evidence", "try-registered-alternate-route"]
         elif _contains(message, r"root signature", r"rootsignature"):
             category = "root-signature-contract"
-            actions = [
-                "preserve-evidence",
-                "reuse-captured-pipeline-root-signature",
-                "keep-apply-blocked",
-            ]
         else:
             category = "tool-execution-failed"
-            actions = [
-                "preserve-evidence",
-                "try-registered-alternate-route",
-                "request-ai-diagnostic-review",
-            ]
 
     result = {
         "schema": DIAGNOSTIC_SCHEMA,
@@ -465,28 +291,13 @@ def classify_shader_failure(
         "exceptionType": kind,
         "message": message,
         "retryable": retryable,
-        "allowedActions": actions,
-        "aiPolicy": {
-            "mayExplain": True,
-            "mayRefineUnknownCategory": category == "unknown",
-            "mayChooseOnlyAllowedActions": True,
-            "mayAuthorProvisionalSource": ai_may_author_source,
-            "maySupplyPhysicalAbiFacts": False,
-            "maySupplyCommandOrExecutable": False,
-            "mayAuthorizeApply": False,
-        },
+        "availableCapabilities": (
+            ["repair_shader_workspace_source_abi"]
+            if ai_may_author_source and category in {
+                "organization-abi-failed", "abi-mismatch", "backend-replacement-rejected"
+            } else []
+        ),
     }
-    if ai_may_author_source and "repair-source-within-captured-abi" in actions:
-        # The concrete Host channel for that action: an Agent submits the
-        # complete repaired HLSL and the Host keeps it only after a fresh
-        # compile plus replay ABI validation.
-        result["sourceRepairTool"] = "repair_shader_workspace_source_abi"
-        result["autonomousNext"] = (
-            "read the current source and baseline.compiledInterface / "
-            "lastAbiAttempt.comparison from get_shader_workspace_status, author "
-            "the ABI-preserving fix, submit it with repair_shader_workspace_source_abi, "
-            "then continue with begin_shader_workspace_organization"
-        )
     cause = _direct_cause(error)
     if cause is not None:
         cause_diagnostic = classify_shader_failure(
@@ -504,7 +315,7 @@ def classify_shader_failure(
                 "malformed-tool-output",
             }
         ):
-            result["aiPolicy"]["mayAuthorProvisionalSource"] = False
+            result["availableCapabilities"] = []
     return result
 
 
@@ -523,7 +334,7 @@ def classify_shader_failure(
 # DXC/FXC emit either "file:line:col: severity: message" (clang-style) or
 # "file(line,col): severity: message" (MSVC-style).  Match both shapes.
 _COMPILER_COLON_DIAGNOSTIC = re.compile(
-    r"^(?P<file>.+?):(?P<line>\d+):(?P<column>\d+):\s*"
+    r"^(?P<file>.+?):(?P<line>\d+):(?:(?P<column>\d+):)?\s*"
     r"(?P<severity>fatal\s+error|error|warning|note)\s*:?[ \t]*"
     r"(?P<message>.*)$",
     flags=re.IGNORECASE,
@@ -534,6 +345,16 @@ _COMPILER_PAREN_DIAGNOSTIC = re.compile(
     r"(?P<message>.*)$",
     flags=re.IGNORECASE,
 )
+_COMPILER_GLSL_DIAGNOSTIC = re.compile(
+    r"^(?P<severity>fatal\s+error|error|warning|note)\s*:\s*"
+    r"(?P<file>.+?):(?P<line>\d+):(?:(?P<column>\d+):)?\s*"
+    r"(?P<message>.*)$", re.IGNORECASE,
+)
+_COMPILER_MESA_DIAGNOSTIC = re.compile(
+    r"^(?P<file>.+?):(?P<line>\d+)\((?P<column>\d+)\)\s*:\s*"
+    r"(?P<severity>fatal\s+error|error|warning|note)\s*:\s*"
+    r"(?P<message>.*)$", re.IGNORECASE,
+)
 
 
 def parse_compiler_diagnostics(
@@ -541,7 +362,7 @@ def parse_compiler_diagnostics(
     input_name: str,
     max_diagnostics: int = 128,
 ) -> list[dict[str, Any]]:
-    """Parse DXC/FXC stderr into de-duplicated line/column diagnostic records.
+    """Parse compiler stdout/stderr into de-duplicated source locations.
 
     ``input_name`` is the basename the compiler saw for the source being
     checked (e.g. ``input.hlsl``); any diagnostic whose file component equals
@@ -562,10 +383,18 @@ def parse_compiler_diagnostics(
             continue
         match = _COMPILER_COLON_DIAGNOSTIC.match(line)
         if match is None:
+            match = _COMPILER_MESA_DIAGNOSTIC.match(line)
+        if match is None:
+            match = _COMPILER_GLSL_DIAGNOSTIC.match(line)
+        if match is None:
             match = _COMPILER_PAREN_DIAGNOSTIC.match(line)
         if match is None:
             continue
         file_value = match.group("file").strip().strip('"')
+        # Native GLSL compilers number their source strings. Only the main
+        # string has a known editable document; other strings remain distinct.
+        if file_value == "0" or re.fullmatch(r"source0\.(?:glsl|vert|frag|comp|geom|tesc|tese)", file_value, re.I):
+            file_value = input_name
         severity = match.group("severity").lower().replace("fatal error", "error")
         # "note" lines annotate a prior error; keep them as hints so the editor
         # can show the follow-up context without escalating severity.

@@ -245,19 +245,19 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
             "Exporting Shader bindings (3 / 9) · Current item: EID 418",
             project_launcher._restore_progress_text(item_value))
         self.assertEqual(
-            "ReplayLab project recovery: Exporting Shader bindings "
+            "Project recovery: Exporting Shader bindings "
             "(3 / 9) · Current item: EID 418",
             project_launcher._restore_status_text(item_value))
         self.assertNotIn("\n", project_launcher._restore_status_text(item_value))
 
         expected_local_phases = {
-            "restore-dispatch": "Scheduling ReplayLab project recovery",
+            "restore-dispatch": "Scheduling project recovery",
             "client-validate": "Validating the project recovery request",
-            "host-state": "Checking the ReplayLab Host state",
-            "host-health": "Verifying the ReplayLab Host identity",
+            "host-state": "Checking the project service state",
+            "host-health": "Verifying the project service identity",
             "restore-submit": "Starting the project recovery job",
             "restore-queued": "Project recovery is queued",
-            "restore-running": "ReplayLab Host is running project recovery",
+            "restore-running": "The project service is running project recovery",
             "result-validate": "Validating the project recovery result",
             "index-required": (
                 "A unique Shader resource index is required before project data can be restored"
@@ -328,18 +328,18 @@ class ReplayLabProjectLauncherTests(unittest.TestCase):
                 "errorId": "capture-no-longer-active",
             }))
         self.assertEqual(
-            "The active capture changed while ReplayLab restored project data",
+            "The active capture changed while project data was being restored",
             project_launcher._restore_result_error({
                 "errorId": "capture-changed-during-restore",
             }))
         self.assertEqual(
-            "This qrenderdoc build cannot restore ReplayLab project data after opening an RDC",
+            "This qrenderdoc build cannot restore project data after opening an RDC",
             project_launcher._restore_result_error({
                 "errorId": "project-restore-client-unavailable",
             }))
         self.assertEqual(
-            "The running ReplayLab Host does not match this qrenderdoc build. Close "
-            "qrenderdoc and Codex, deploy the matching ReplayLab runtime, then restart "
+            "The running project service does not match this qrenderdoc build. Close "
+            "qrenderdoc and Codex, deploy the matching runtime, then restart "
             "qrenderdoc.",
             project_launcher._restore_result_error({
                 "errorId": "host-runtime-incompatible",

@@ -371,6 +371,8 @@ public:
 
   RDResult ReadLogInitialisation(RDCFile *rdc, bool storeStructuredBuffers);
   void ReplayLog(uint32_t endEventID, ReplayLogType replayType);
+  ShaderPairComparison ComparePixelShaderPair(uint32_t eventId, ResourceId expectedOriginal,
+                                             ResourceId baseline, ResourceId candidate) override;
   void ConfigureReplayCheckpoints(const ReplayCheckpointConfig &config,
                                  const rdcarray<ReplayCheckpointCandidate> &candidates) override;
   void InvalidateReplayCheckpoints(uint32_t firstAffectedEvent = 0) override;
@@ -427,6 +429,15 @@ public:
   void RemoveReplacement(ResourceId id);
   rdcstr ReplaceTargetShaderChecked(ResourceId from, ResourceId to);
   rdcstr RemoveTargetShaderReplacementChecked(ResourceId id);
+  rdcstr SetEventShaderOverride(uint32_t eventId, ShaderStage stage, ResourceId expectedOriginal,
+                                ResourceId replacement, uint32_t outputTarget = ~0U,
+                                bool independentFloatOutput = false) override;
+  TextureDescription GetEventShaderPreviewTexture(uint32_t eventId, ShaderStage stage) override;
+  void ClearEventShaderOverride(uint32_t eventId, ShaderStage stage) override;
+  void ClearEventShaderOverrides() override;
+  void ClearEventShaderOverridesForResource(ResourceId id) override;
+  rdcstr ApplyEventShaderOverrides(uint32_t eventId) override;
+  void RestoreEventShaderOverrides() override;
   void ClearReplayCache();
   void ReloadShaderDebugInformation();
 
@@ -438,10 +449,7 @@ public:
     return {ShaderEncoding::SPIRV, ShaderEncoding::GLSL};
   }
   rdcarray<ShaderSourcePrefix> GetCustomShaderSourcePrefixes();
-  rdcarray<ShaderEncoding> GetTargetShaderEncodings()
-  {
-    return {ShaderEncoding::SPIRV, ShaderEncoding::GLSL};
-  }
+  rdcarray<ShaderEncoding> GetTargetShaderEncodings();
   void BuildTargetShader(ShaderEncoding sourceEncoding, const bytebuf &source, const rdcstr &entry,
                          const ShaderCompileFlags &compileFlags, ShaderStage type, ResourceId &id,
                          rdcstr &errors);
@@ -524,6 +532,8 @@ private:
     VkDeviceMemory memory = VK_NULL_HANDLE;
   };
   rdcarray<TextureSnapshot> m_TextureSnapshots;
+  // Retain scratch until device teardown if a paired observation cannot confirm GPU retirement.
+  rdcarray<VkPipeline> m_ShaderPairDeferredPipelines;
 
   bool FetchShaderFeedback(uint32_t eventId);
   void DestroyTextureSnapshotViews(ResourceId snapshot);
@@ -901,6 +911,49 @@ private:
   rdcarray<ResourceDescription> m_Resources;
   rdcarray<DescriptorStoreDescription> m_DescriptorStores;
   std::map<ResourceId, size_t> m_ResourceIdx;
+
+  std::map<std::pair<uint32_t, ShaderStage>, EventShaderOverrideBinding> m_EventShaderOverrides;
+  std::map<EventShaderPipelineKey, VkPipeline> m_EventShaderPipelines;
+  std::map<EventShaderPipelineKey, VkShaderEXT> m_EventShaderObjects;
+  VulkanRenderState m_EventShaderPreviousState;
+  bool m_EventShaderStateApplied = false;
+  bool HasEventShaderOverride(uint32_t eventId) const
+  {
+    auto found = m_EventShaderOverrides.lower_bound({eventId, ShaderStage::Vertex});
+    return found != m_EventShaderOverrides.end() && found->first.first == eventId;
+  }
+
+  void ReleaseEventShaderPipelines(ResourceId target = ResourceId());
+  struct EventShaderFloatAttachment
+  {
+    ResourceId sourceView, sourceImage;
+    VkImageSubresourceRange sourceRange = {};
+    VkExtent3D extent = {};
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    uint64_t bytes = 0;
+  };
+  struct EventShaderFloatPreview
+  {
+    rdcarray<ResourceId> sourceViews;
+    rdcarray<EventShaderFloatAttachment> attachments;
+    std::set<ResourceId> users;
+    VkRenderPass renderPass = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    uint32_t colorCount = 0, outputTarget = 0, viewMask = 0;
+    uint32_t width = 0, height = 0, layers = 0;
+    bool dynamic = false;
+    uint64_t bytes = 0;
+  };
+  std::map<std::pair<uint32_t, uint32_t>, EventShaderFloatPreview> m_EventShaderFloatPreviews;
+  void DestroyEventShaderFloatPreview(EventShaderFloatPreview &preview);
+  void ReleaseEventShaderFloatPreviews(ResourceId target = ResourceId());
+  bool EvictInactiveEventShaderFloatPreviews();
+  rdcstr PrepareEventShaderFloatPreview(uint32_t eventId, uint32_t outputTarget, ResourceId target,
+                                        VulkanRenderState &state, EventShaderFloatPreview *&preview);
 
   // tracks VkShaderEXT replacements for shader modules from BuildTargetShader
   std::map<ResourceId, VkShaderEXT> m_ModuleIDToShaderObject;

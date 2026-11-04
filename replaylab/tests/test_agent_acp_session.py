@@ -19,7 +19,7 @@ from unittest import mock
 from replaylab_agent.connectors.acp import _ACPSDK
 import replaylab_agent.acp_session as acp_session
 import replaylab_agent.native_vendor as vendor
-from replaylab_agent.errors import ConnectorError
+from replaylab_agent.errors import ConnectorError, PolicyError, ProviderIncidentError, ProviderCapabilityError, LifecycleCleanupError
 
 
 class _Option:
@@ -51,14 +51,10 @@ class _Connection:
     async def authenticate(self, **kwargs: Any) -> Any:
         self.calls.append(("authenticate", kwargs))
 
-    accepts_meta = "field_meta"
-
     async def new_session(self, cwd: str, mcp_servers: list[Any], **kwargs: Any) -> Any:
-        if kwargs and self.accepts_meta not in kwargs:
-            raise TypeError("unexpected keyword " + ",".join(kwargs))
         self.calls.append(("new_session", {"cwd": cwd, "mcp_servers": mcp_servers, **kwargs}))
         self.mcp_servers = list(mcp_servers or [])
-        self.meta = kwargs.get(self.accepts_meta)
+        self.meta = kwargs or None
         return SimpleNamespace(session_id=self.session_id, config_options=list(self.config_options))
 
     async def prompt(self, **kwargs: Any) -> Any:
@@ -142,6 +138,22 @@ def _fake_sdk(script: Any, holder: dict[str, Any]) -> _ACPSDK:
 
 
 class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_without_followup_answer_does_not_reuse_progress(self) -> None:
+        holder: dict[str, Any] = {}
+
+        async def script(conn: _Connection) -> Any:
+            await conn.say("I will inspect the shader.")
+            await conn.tool("call-1", "inspect_event", server="Bread", tool="inspect_event")
+            return {"stopReason": "end_turn"}
+
+        with mock.patch.object(acp_session, "_load_acp_sdk", lambda: _fake_sdk(script, holder)):
+            async with self._session(holder) as session:
+                result = await session.prompt("Inspect the shader")
+
+        self.assertEqual(result.text, "I will inspect the shader.")
+        self.assertEqual(result.segments, ["I will inspect the shader.", ""])
+        self.assertEqual(result.final_text, "")
+
     def tearDown(self) -> None:
         tmp = getattr(self, "tmp", None)
         if tmp is not None:
@@ -173,7 +185,7 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         async def script(conn: _Connection) -> Any:
             await conn.think("planning")
             await conn.say("Let me inspect. ")
-            outcome = await conn.tool("call-1", "inspect_event", server="ReplayLab", tool="inspect_event")
+            outcome = await conn.tool("call-1", "inspect_event", server="Bread", tool="inspect_event")
             holder["outcome"] = outcome
             await conn.say("The answer is 42.")
             return {"stopReason": "end_turn"}
@@ -190,7 +202,7 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
                 # Every vendor receives the direct task-scoped stdio filter.
                 kind, mcp = connection.mcp_servers[0]
                 self.assertEqual(kind, "stdio")
-                self.assertEqual(mcp["name"], "ReplayLab")
+                self.assertEqual(mcp["name"], "Bread")
                 self.assertEqual(mcp["args"], ["-I", "-m", "replaylab_agent.mcp_proxy"])
                 env = {item["name"]: item["value"] for item in mcp["env"]}
                 self.assertEqual(env["REPLAYLAB_TASK_ID"], "task-1")
@@ -202,7 +214,7 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(options["tools"], ["Skill"])
                 self.assertIn("Bash", options["disallowedTools"])
                 self.assertNotIn("AskUserQuestion", options["disallowedTools"])
-                self.assertEqual(options["allowedTools"], ["mcp__ReplayLab"])
+                self.assertEqual(options["allowedTools"], ["mcp__Bread"])
                 self.assertEqual(options["settingSources"], ["project"])
                 self.assertTrue(options["strictMcpConfig"])
                 result = await session.prompt(
@@ -222,6 +234,110 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(holder["spawn_kwargs"]["cwd"], str(session.cwd))
         self.assertEqual(holder["spawn_kwargs"]["env"], {"PATH": "/usr/bin"})
         self.assertIsNot(holder["transport_kwargs"]["stderr"], asyncio.subprocess.DEVNULL)
+
+    async def test_handshake_logs_only_bounded_redacted_provider_identity(self) -> None:
+        holder: dict[str, Any] = {}
+
+        async def script(_connection: _Connection) -> Any:
+            return {"stopReason": "end_turn"}
+
+        async def initialize(_connection: _Connection, **_arguments: Any) -> Any:
+            return {
+                "protocolVersion": 1,
+                "agentInfo": {
+                    "name": "claude-agent-acp\ntoken=private-access-value",
+                    "version": "0.88.0",
+                },
+                "privateVendorData": "do-not-log-the-initialize-payload",
+            }
+
+        logger = mock.Mock()
+        with (
+            mock.patch.object(acp_session, "_load_acp_sdk", lambda: _fake_sdk(script, holder)),
+            mock.patch.object(_Connection, "initialize", initialize),
+            mock.patch.object(acp_session, "get_logger", return_value=logger),
+        ):
+            async with self._session(holder):
+                pass
+        opening = next(call for call in logger.info.call_args_list if "agent=%s" in call.args[0])
+        rendered = opening.args[0] % opening.args[1:]
+        self.assertIn("version=0.88.0 protocol=1", rendered)
+        self.assertIn("[REDACTED]", rendered)
+        self.assertNotIn("private-access-value", rendered)
+        self.assertNotIn("do-not-log", rendered)
+        self.assertNotIn("\n", rendered)
+        self.assertLessEqual(len(acp_session._identity_text("x" * 1000)), 128)
+        self.assertEqual(acp_session._identity_text(None), "unknown")
+
+    async def test_provider_http2_cancel_chunk_is_not_assistant_text(self) -> None:
+        holder: dict[str, Any] = {}
+        diagnostic = (
+            "Error: RetriableError: [canceled] http/2 stream closed with "
+            "error code CANCEL (0x8)"
+        )
+
+        async def script(conn: _Connection) -> Any:
+            await conn.say("The last mutation was saved.\n")
+            await conn.say(diagnostic)
+            return {"stopReason": "end_turn"}
+
+        deltas: list[str] = []
+        with mock.patch.object(
+            acp_session, "_load_acp_sdk", lambda: _fake_sdk(script, holder)
+        ):
+            session = self._session(holder)
+            async with session:
+                with self.assertRaises(ProviderIncidentError) as raised:
+                    await session.prompt("continue", on_delta=deltas.append)
+
+        self.assertEqual(raised.exception.incident_code, "http2-cancel")
+        self.assertEqual(
+            raised.exception.partial_text, "The last mutation was saved.\n"
+        )
+        self.assertEqual("".join(deltas), "The last mutation was saved.\n")
+        self.assertNotIn("RetriableError", "".join(deltas))
+
+    async def test_provider_ping_timeout_update_is_typed_incident(self) -> None:
+        holder: dict[str, Any] = {}
+
+        async def script(conn: _Connection) -> Any:
+            await conn.client.session_update(
+                conn.session_id,
+                {
+                    "sessionUpdate": "error",
+                    "message": "transport PING timeout while waiting for provider",
+                },
+            )
+            return {"stopReason": "end_turn"}
+
+        with mock.patch.object(
+            acp_session, "_load_acp_sdk", lambda: _fake_sdk(script, holder)
+        ):
+            session = self._session(holder)
+            async with session:
+                with self.assertRaises(ProviderIncidentError) as raised:
+                    await session.prompt("continue")
+
+        self.assertEqual(
+            raised.exception.incident_code, "provider-ping-timeout"
+        )
+        self.assertEqual(raised.exception.partial_text, "")
+
+    async def test_shader_error_text_is_not_misclassified_as_provider_failure(self) -> None:
+        holder: dict[str, Any] = {}
+
+        async def script(conn: _Connection) -> Any:
+            await conn.say("Error: undeclared identifier 'worldNormal'")
+            return {"stopReason": "end_turn"}
+
+        with mock.patch.object(
+            acp_session, "_load_acp_sdk", lambda: _fake_sdk(script, holder)
+        ):
+            session = self._session(holder)
+            async with session:
+                result = await session.prompt("compile")
+
+        self.assertEqual(result.final_text, "Error: undeclared identifier 'worldNormal'")
 
     async def test_native_stdio_route_and_form_elicitation(self) -> None:
         holder: dict[str, Any] = {}
@@ -290,7 +406,7 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(_Connection, "set_config_option", setter, create=True),
         ):
             session = self._session(holder, model="requested-model", timeout=0.1)
-            with self.assertRaisesRegex(ConnectorError, message):
+            with self.assertRaisesRegex((ConnectorError, ProviderCapabilityError), message):
                 async with session:
                     await session.prompt("hello")
             self.assertTrue(holder["manager"].closed)
@@ -430,13 +546,41 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
             holder["question_response"]["outcome"]["outcome"], "skipped"
         )
 
+    async def test_cursor_plan_does_not_require_host_approval(self) -> None:
+        holder: dict[str, Any] = {}
+
+        async def script(conn: _Connection) -> Any:
+            holder["plan_response"] = await conn.client.ext_method(
+                "cursor/create_plan",
+                {
+                    "toolCallId": "plan-1",
+                    "plan": "Inspect the capture, then edit the chosen shader.",
+                    "todos": [],
+                },
+            )
+            await conn.say("I can continue with the available tools.")
+            return {"stopReason": "end_turn"}
+
+        with mock.patch.object(acp_session, "_load_acp_sdk", lambda: _fake_sdk(script, holder)):
+            async with self._session(
+                holder,
+                command=("cursor-agent", "acp"),
+                authentication_method="cursor_login",
+                provider_id="cursor-acp",
+                session_meta=None,
+            ) as session:
+                result = await session.prompt("organize this shader")
+
+        self.assertEqual(holder["plan_response"], {"outcome": {"outcome": "accepted"}})
+        self.assertEqual(result.text, "I can continue with the available tools.")
+
     async def test_permission_for_foreign_tool_is_denied_not_fatal(self) -> None:
         holder: dict[str, Any] = {}
 
         async def script(conn: _Connection) -> Any:
             denied = await conn.tool("call-1", "Bash", server="", tool="bash")
             holder["denied"] = denied
-            allowed = await conn.tool("call-2", "inspect_event", server="ReplayLab", tool="inspect_event")
+            allowed = await conn.tool("call-2", "inspect_event", server="Bread", tool="inspect_event")
             holder["allowed"] = allowed
             await conn.say("ok")
             return {"stopReason": "end_turn"}
@@ -448,21 +592,58 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(holder["denied"], {"outcome": {"outcome": "cancelled"}})
         self.assertEqual(holder["allowed"]["outcome"]["outcome"], "selected")
 
-    async def test_session_new_falls_back_when_sdk_rejects_meta(self) -> None:
+    async def test_session_new_does_not_drop_required_metadata(self) -> None:
         holder: dict[str, Any] = {}
 
         async def script(conn: _Connection) -> Any:
             await conn.say("ok")
             return {"stopReason": "end_turn"}
 
-        _Connection.accepts_meta = "nothing-accepted"
-        try:
-            with mock.patch.object(acp_session, "_load_acp_sdk", lambda: _fake_sdk(script, holder)):
-                async with self._session(holder) as session:
-                    await session.prompt("hello")
-            self.assertIsNone(holder["connection"].meta)
-        finally:
-            _Connection.accepts_meta = "field_meta"
+        async def without_meta(conn, cwd, mcp_servers):
+            raise AssertionError("required vendor metadata must not be silently omitted")
+
+        with (mock.patch.object(acp_session, "_load_acp_sdk", lambda: _fake_sdk(script, holder)),
+              mock.patch.object(_Connection, "new_session", without_meta)):
+            with self.assertRaisesRegex(ProviderCapabilityError, "required session metadata"):
+                await self._session(holder).open()
+        self.assertTrue(holder["manager"].closed)
+
+    async def test_close_surfaces_failed_cleanup_and_clears_session(self) -> None:
+        holder: dict[str, Any] = {}
+
+        async def fail_cleanup(manager, *exc):
+            raise OSError("transport cleanup failed")
+
+        with (mock.patch.object(acp_session, "_load_acp_sdk", lambda: _fake_sdk(lambda conn: None, holder)),
+              mock.patch.object(_Manager, "__aexit__", fail_cleanup)):
+            session = self._session(holder)
+            await session.open()
+            with self.assertRaises(LifecycleCleanupError):
+                await session.close()
+            self.assertIsNone(session._stack)
+            self.assertIsNone(session._connection)
+            self.assertIsNone(session._stderr_handle)
+            self.assertEqual(session._session_id, "")
+
+    async def test_cancel_during_close_still_closes_process(self) -> None:
+        holder: dict[str, Any] = {}
+        entered_cancel = asyncio.Event()
+
+        async def wait_cancel(conn, **kwargs):
+            entered_cancel.set()
+            await asyncio.Event().wait()
+
+        with (mock.patch.object(acp_session, "_load_acp_sdk", lambda: _fake_sdk(lambda conn: None, holder)),
+              mock.patch.object(_Connection, "cancel", wait_cancel)):
+            session = self._session(holder)
+            await session.open()
+            task = asyncio.create_task(session.close())
+            await entered_cancel.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertTrue(holder["manager"].closed)
+            self.assertIsNone(session._stderr_handle)
 
     async def test_no_meta_for_vendors_without_one(self) -> None:
         holder: dict[str, Any] = {}
@@ -488,7 +669,7 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Task", payload["permissions"]["deny"])
         self.assertEqual(
             payload["permissions"]["allow"],
-            ["Skill", "AskUserQuestion", "mcp__ReplayLab"],
+            ["Skill", "AskUserQuestion", "mcp__Bread"],
         )
 
     async def test_permission_by_title_when_raw_input_is_arguments(self) -> None:
@@ -498,7 +679,7 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
             # Claude Code style: rawInput carries the tool arguments, the title names the tool.
             allowed = await conn.client.request_permission(
                 conn.session_id,
-                {"toolCallId": "c1", "title": "mcp__ReplayLab__inspect_event", "kind": "other",
+                {"toolCallId": "c1", "title": "mcp__Bread__inspect_event", "kind": "other",
                  "rawInput": {"task": "explain EID 5"}},
                 [_Option("allow", "Allow", "allow_once")],
             )
@@ -510,13 +691,13 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
             # Gemini CLI style: only a display title, no rawInput at all.
             gemini = await conn.client.request_permission(
                 conn.session_id,
-                {"toolCallId": "c3", "title": "inspect_event (ReplayLab MCP Server)", "kind": "other"},
+                {"toolCallId": "c3", "title": "inspect_event (Bread MCP Server)", "kind": "other"},
                 [_Option("proceed_once", "Allow", "allow_once")],
             )
             # A shell command that merely mentions a tool name is not a tool call.
             shell = await conn.client.request_permission(
                 conn.session_id,
-                {"toolCallId": "c4", "title": "echo mcp__ReplayLab__inspect_event", "kind": "execute",
+                {"toolCallId": "c4", "title": "echo mcp__Bread__inspect_event", "kind": "execute",
                  "rawInput": {"command": "echo"}},
                 [_Option("allow", "Allow", "allow_once")],
             )
@@ -532,6 +713,33 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(holder["denied"], {"outcome": {"outcome": "cancelled"}})
         self.assertEqual(holder["gemini"]["outcome"]["optionId"], "proceed_once")
         self.assertEqual(holder["shell"], {"outcome": {"outcome": "cancelled"}})
+
+    async def test_repeated_unavailable_native_calls_do_not_cancel_authorized_work(self) -> None:
+        holder: dict[str, Any] = {}
+
+        async def script(conn: _Connection) -> Any:
+            for index in range(20):
+                denied = await conn.client.request_permission(
+                    conn.session_id,
+                    {"toolCallId": f"denied-{index}", "title": "Write", "kind": "edit"},
+                    [_Option("allow", "Allow", "allow_once")],
+                )
+                self.assertEqual(denied, {"outcome": {"outcome": "cancelled"}})
+                with self.assertRaises(PolicyError):
+                    await conn.client.read_text_file(conn.session_id, "unavailable-file")
+            granted = await conn.tool("authorized-after-denials", "inspect_event",
+                                      server="Bread", tool="inspect_event")
+            self.assertEqual(granted["outcome"]["outcome"], "selected")
+            await conn.say("Authorized work continued.")
+            return {"stopReason": "end_turn"}
+
+        with mock.patch.object(acp_session, "_load_acp_sdk", lambda: _fake_sdk(script, holder)):
+            async with self._session(holder) as session:
+                result = await session.prompt("inspect the authorized event")
+                self.assertIsNone(session._state.policy_error)
+                self.assertFalse(session._state.abort_event.is_set())
+                self.assertNotIn("cancel", [name for name, _values in holder["connection"].calls])
+        self.assertEqual(result.text, "Authorized work continued.")
 
     async def test_unexpected_stop_reason_raises(self) -> None:
         holder: dict[str, Any] = {}
@@ -611,7 +819,7 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
                 await session.open()
         message = str(raised.exception)
         self.assertIn("ACP session/new timed out twice", message)
-        self.assertIn("local ReplayLab MCP route is healthy", message)
+        self.assertIn("local Bread MCP route is healthy", message)
         self.assertIn("144 tools", message)
         self.assertTrue(holder["manager"].closed)
 
@@ -623,7 +831,7 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
 
         async def broken_route(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {"ok": False, "seconds": 0.4, "tools": 0,
-                    "error": "ConfigurationError: ReplayLab MCP Host is missing allowed tool(s): x"}
+                    "error": "ConfigurationError: Bread MCP Host is missing allowed tool(s): x"}
 
         with (
             mock.patch.object(acp_session, "_load_acp_sdk", lambda: _fake_sdk(lambda conn: None, holder)),
@@ -635,7 +843,7 @@ class ACPMainAgentSessionTests(unittest.IsolatedAsyncioTestCase):
             session = self._session(holder)
             with self.assertRaises(ConnectorError) as raised:
                 await session.open()
-        self.assertIn("local ReplayLab MCP route FAILED", str(raised.exception))
+        self.assertIn("local Bread MCP route FAILED", str(raised.exception))
         self.assertIn("missing allowed tool(s): x", str(raised.exception))
 
 

@@ -1,10 +1,32 @@
 # Unpacked asset intelligence
 
-ReplayLab keeps unpacked-project knowledge separate from capture reconstruction.
+Bread keeps unpacked-project knowledge separate from capture reconstruction.
 The main Agent partitions mixed work. An ordinary child Agent loads
 `renderdoc-unpacked-asset-intelligence` to inventory, relate, report, and supply
 exact source assets; other ordinary children load the Event, Shader, or Resource
 Export Skill for capture-bound work.
+
+## Reader selection for a draw
+
+Read operations now route by asset root, detected/configured engine and requested
+capability (`classify`, `properties`, `references`). A built-in file header can
+prove classification but cannot satisfy a request for material parameters. Deep
+reads default to `properties`; actual returned fields must prove that capability.
+The project's verified choice is preferred for that exact root/engine/capability.
+An engine mismatch is rejected, registered export operations are never invoked
+as implicit readers, and at most two distinct read invocations are attempted.
+Equivalent operations are deduplicated. Read-only results and concurrent requests
+are shared with file/configuration invalidation; material analysis uses this same
+route instead of issuing a second independent UEX read.
+
+No installed reader, missing resource directory or insufficient fields returns a
+nonblocking capture-only fallback. The Agent can infer Shader names from bindings
+and calculations, marks them as inferred and continues the requested work. It does
+not need to verify every reader or scan the whole game before organizing a Shader.
+UnityPy/AssetStudio, UEX/CUE4Parse and registered custom readers remain providers
+behind this route. AssetRipper is not bundled by this change; its project and
+reference reconstruction can be added as a capability-specific provider without
+introducing another competing per-EID scan.
 
 ## Workflow boundary
 

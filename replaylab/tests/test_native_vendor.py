@@ -28,7 +28,7 @@ def test_claude_session_meta_keeps_only_native_skill_and_replaylab_mcp() -> None
     options = session_meta(profile)["claudeCode"]["options"]
 
     assert options["tools"] == ["Skill"]
-    assert options["allowedTools"] == ["mcp__ReplayLab"]
+    assert options["allowedTools"] == ["mcp__Bread"]
     assert options["strictMcpConfig"] is True
     assert options["settingSources"] == ["project"]
     assert "Bash" in options["disallowedTools"]
@@ -61,7 +61,7 @@ def test_claude_workspace_has_one_strict_mcp_and_copied_skills(tmp_path: Path) -
     copy_claude_skills(workspace, [("demo", source / "SKILL.md")])
 
     settings = json.loads((workspace / ".claude" / "settings.json").read_text(encoding="utf-8"))
-    mcp = json.loads((workspace / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["ReplayLab"]
+    mcp = json.loads((workspace / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["Bread"]
     assert set(settings["permissions"]["deny"]) == set(CLAUDE_BUILTIN_TOOLS) - {
         "Skill",
         "AskUserQuestion",
@@ -83,10 +83,10 @@ def test_gemini_and_qwen_workspaces_exclude_ambient_tools(tmp_path: Path) -> Non
         payload = json.loads((workspace / directory / "settings.json").read_text(encoding="utf-8"))
         assert payload["tools"]["core"] == []
         assert payload["tools"]["allowed"] == [
-            "mcp_ReplayLab_inspect_event",
-            "mcp_ReplayLab_report_task_result",
+            "mcp_Bread_inspect_event",
+            "mcp_Bread_report_task_result",
         ]
-        assert payload["mcp"] == {"allowed": ["ReplayLab"], "excluded": []}
+        assert payload["mcp"] == {"allowed": ["Bread"], "excluded": []}
         assert "run_shell_command" in payload["tools"]["exclude"]
         assert "invoke_agent" in payload["tools"]["exclude"]
 
@@ -104,8 +104,8 @@ def test_vendor_runtime_argv_applies_launch_scoped_tool_filters(tmp_path: Path) 
         "copilot",
         "--acp",
         "--disable-builtin-mcps",
-        "--available-tools=ReplayLab(inspect_event),ReplayLab(report_task_result)",
-        "--allow-tool=ReplayLab(inspect_event),ReplayLab(report_task_result)",
+        "--available-tools=Bread(inspect_event),Bread(report_task_result)",
+        "--allow-tool=Bread(inspect_event),Bread(report_task_result)",
     ]
 
     gemini = Profile(
@@ -117,8 +117,8 @@ def test_vendor_runtime_argv_applies_launch_scoped_tool_filters(tmp_path: Path) 
         tmp_path,
         ("inspect_event",),
     )[-2:] == [
-        "--allowed-mcp-server-names=ReplayLab",
-        "--allowed-tools=mcp_ReplayLab_inspect_event",
+        "--allowed-mcp-server-names=Bread",
+        "--allowed-tools=mcp_Bread_inspect_event",
     ]
 
 
@@ -132,8 +132,10 @@ def test_kimi_uses_a_per_turn_exact_tool_agent(tmp_path: Path) -> None:
 
     agent = workspace / ".kimi-code" / "replaylab-agent.md"
     text = agent.read_text(encoding="utf-8")
-    assert 'mcp__ReplayLab__inspect_event' in text
-    assert 'mcp__ReplayLab__report_task_result' in text
+    assert "description: Bread AI task-scoped RenderDoc analysis agent" in text
+    assert "description: ReplayLab task-scoped" not in text
+    assert 'mcp__Bread__inspect_event' in text
+    assert 'mcp__Bread__report_task_result' in text
     assert "subagents: []" in text
     assert "Read" not in text
     assert runtime_argv(profile, ["kimi", "acp"], workspace) == [

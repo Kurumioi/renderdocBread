@@ -210,7 +210,10 @@ def _load_bridge():
         )
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
-        spec.loader.exec_module(module)
+        # This fixture models the replay API, not native Qt/qrenderdoc. A
+        # separately installed PySide2 must not enable the real UI integration.
+        with mock.patch.dict(sys.modules, {"PySide2": None}):
+            spec.loader.exec_module(module)
         return module
     finally:
         if previous_renderdoc is None:
@@ -345,6 +348,93 @@ class ReplayLabRdcProjectBridgeTests(unittest.TestCase):
         request = self._inventory_request()
         request["target_raw_sha256s"] = targets
         return request
+
+    def _replacement_owner(self, *, api="d3d12"):
+        self.controller.api = "D3D12" if api == "d3d12" else "D3D11"
+        self.controller.reflection.encoding = "DXIL" if api == "d3d12" else "DXBC"
+        original = self.controller.reflection
+        active = types.SimpleNamespace(**vars(original))
+        active.rawBytes = b"different-active-replacement"
+        owner = {
+            "captureSessionId": self.bridge._capture_session_id,
+            "captureToken": self.bridge._current_capture_token(), "api": api,
+            "originalResource": 7, "expectedOriginalResourceId": 7,
+            "expectedOriginalSha256": hashlib.sha256(original.rawBytes).hexdigest(),
+            "stageName": "fragment", "entryPoint": "main",
+            "candidateRawSha256": hashlib.sha256(active.rawBytes).hexdigest(),
+            "capturedOriginalReflection": original, "capturedDxilLayoutEvidence": {},
+        }
+        self.controller.GetShader = lambda *args: active
+        return original, active, owner
+
+    def test_replaced_inventory_reuses_captured_identity_before_target_filter(self):
+        original, active, owner = self._replacement_owner()
+        raw = hashlib.sha256(original.rawBytes).hexdigest()
+        with mock.patch.dict(self.bridge._shared_shader_replacements, {7: owner}, clear=True), \
+                mock.patch.object(self.bridge, "_shared_shader_replacement_capture_token", owner["captureToken"]), \
+                mock.patch.object(self.bridge, "_dxil_evidence_from_live_disassembly",
+                                  side_effect=AssertionError("must not disassemble replacement")):
+            result = self.bridge._begin_rdc_project_shader_resource_index(self._target_request([raw]))["result"]
+        self.assertEqual(result["originalShaderIdentityPolicy"], "captured-original-owner-v1")
+        self.assertEqual(result["observedTargetRawSha256s"], [raw])
+        self.assertEqual(result["targetMatchedShaderResourceIds"], [7])
+        self.assertEqual(result["filteredOutShaderResourceIds"], [])
+        self.assertTrue(result["rawIdentitySearchComplete"])
+        self.assertEqual(result["assets"][0]["rawSha256"], raw)
+        self.assertEqual(base64.b64decode(result["rawBytecodeBlobs"][0]["data"]), original.rawBytes)
+        self.assertEqual(self.controller.events, [])
+        self.assertIs(self.controller.GetShader(), active)
+
+    def test_expected_inventory_also_matches_owned_original_not_candidate(self):
+        original, unused_active, owner = self._replacement_owner(api="d3d11")
+        expected = self._expected_shader()
+        with mock.patch.dict(self.bridge._shared_shader_replacements, {7: owner}, clear=True), \
+                mock.patch.object(self.bridge, "_shared_shader_replacement_capture_token", owner["captureToken"]):
+            result = self._begin(expected)["result"]
+        self.assertTrue(result["matched"], result)
+        self.assertEqual(result["assets"][0]["rawSha256"], hashlib.sha256(original.rawBytes).hexdigest())
+        self.assertEqual(self.controller.events, [])
+
+    def test_replaced_inventory_refuses_stale_ownership_and_changed_identity(self):
+        original, active, pristine = self._replacement_owner()
+        raw = hashlib.sha256(original.rawBytes).hexdigest()
+        variants = [("captureSessionId", "9" * 32), ("captureToken", ("loaded", "another.rdc")),
+                    ("api", "d3d11"), ("originalResource", 8), ("expectedOriginalResourceId", 8),
+                    ("stageName", "vertex"), ("entryPoint", "other"),
+                    ("candidateRawSha256", "a" * 64), ("expectedOriginalSha256", "a" * 64),
+                    ("capturedOriginalReflection", None), ("shared-token", None)]
+        for field, value in variants:
+            with self.subTest(field=field):
+                self.bridge._project_shader_index_jobs.clear()
+                owner = dict(pristine)
+                shared_token = owner["captureToken"]
+                if field == "shared-token":
+                    shared_token = value
+                else:
+                    owner[field] = value
+                with mock.patch.dict(self.bridge._shared_shader_replacements, {7: owner}, clear=True), \
+                        mock.patch.object(self.bridge, "_shared_shader_replacement_capture_token", shared_token):
+                    result = self.bridge._begin_rdc_project_shader_resource_index(self._target_request([raw]))["result"]
+                self.assertEqual(result["assets"], [])
+                self.assertFalse(result["rawIdentitySearchComplete"])
+                self.assertEqual(result["rawIdentityUnavailableShaderResourceIds"], [7])
+                self.assertNotIn(7, result["filteredOutShaderResourceIds"])
+                self.assertTrue(any(row["code"] == "shader-replacement-original-unavailable"
+                                    for row in result["diagnostics"]))
+        self.assertEqual(self.controller.events, [])
+
+    def test_owned_dxil_missing_original_layout_never_disassembles_candidate(self):
+        original, unused_active, owner = self._replacement_owner()
+        owner.pop("capturedDxilLayoutEvidence")
+        raw = hashlib.sha256(original.rawBytes).hexdigest()
+        with mock.patch.dict(self.bridge._shared_shader_replacements, {7: owner}, clear=True), \
+                mock.patch.object(self.bridge, "_shared_shader_replacement_capture_token", owner["captureToken"]), \
+                mock.patch.object(self.bridge, "_dxil_evidence_from_live_disassembly") as disassemble:
+            result = self.bridge._begin_rdc_project_shader_resource_index(self._target_request([raw]))["result"]
+        disassemble.assert_not_called()
+        self.assertEqual(result["assets"][0]["rawSha256"], raw)
+        self.assertFalse(result["assets"][0]["interfaceComplete"])
+        self.assertEqual(self.controller.events, [])
 
     def test_target_raw_filter_is_strict_bounded_and_part_of_request_identity(self):
         raw = hashlib.sha256(self.controller.raw).hexdigest()
@@ -1914,6 +2004,42 @@ class ReplayLabRdcProjectBridgeTests(unittest.TestCase):
         self.assertEqual(self.bridge._symbol_capture_snapshot["captureId"], "")
         self.assertEqual(self.controller.events, [])
 
+    def test_inventory_skips_native_dxil_empty_struct_declarations(self):
+        empty_type = types.SimpleNamespace(
+            name="empty_struct", baseType="VarType.Struct", members=[],
+            rows=0, columns=0, elements=1, arrayByteStride=0,
+            matrixByteStride=0, pointerTypeID=0xFFFFFFFF)
+        scalar_type = types.SimpleNamespace(
+            name="float", baseType="VarType.Float", members=[],
+            rows=1, columns=1, elements=1, arrayByteStride=0,
+            matrixByteStride=0, pointerTypeID=0xFFFFFFFF)
+
+        def field(name, offset, shader_type):
+            return types.SimpleNamespace(
+                name=name, byteOffset=offset, type=shader_type,
+                bitFieldOffset=0, bitFieldSize=0)
+
+        nested_type = types.SimpleNamespace(
+            name="nested_empty", baseType="VarType.Struct", members=[
+                field("value", 0, scalar_type), field("b", 4, empty_type)])
+        block = _constant_block(byte_size=32)
+        block.variables = [field("empty", 0, empty_type),
+                           field("value", 0, scalar_type),
+                           field("nested_empty", 16, nested_type)]
+        self.controller.encoding = self.controller.reflection.encoding = "DXIL"
+        self.controller.reflection.constantBlocks = [block]
+
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._inventory_request(discover_anchors=False))
+
+        result = snapshot["result"]
+        self.assertTrue(result["inventoryComplete"], result)
+        asset = result["assets"][0]
+        fields = asset["constantBlocks"][0]["fields"]
+        self.assertEqual(
+            [(item["canonicalPath"], item["absoluteByteOffset"], item["byteSize"])
+             for item in fields], [("value", 0, 4), ("nested_empty.value", 16, 4)])
+
     def test_inventory_zero_byte_leaf_fails_closed_with_diagnostic(self):
         invalid_leaf = types.SimpleNamespace(
             name="opaque",
@@ -2013,6 +2139,42 @@ class ReplayLabRdcProjectBridgeTests(unittest.TestCase):
         self.bridge._capture_session_id = "6" * 32
         with self.assertRaisesRegex(RuntimeError, "capture session changed"):
             self._commit(completed)
+
+    def test_vulkan_runtime_storage_arrays_preserve_type_identity_in_target_inventory(self):
+        self.controller.api = "Vulkan"
+        self.controller.reflection.encoding = "SPIR-V"
+        runtime_type = types.SimpleNamespace(
+            name="float[]", baseType="float", members=[], elements=0xFFFFFFFF,
+            arrayByteStride=4, rows=1, columns=1)
+        member = types.SimpleNamespace(name="values", byteOffset=0, type=runtime_type)
+        storage_type = types.SimpleNamespace(name="Storage", baseType="struct", members=[member], elements=1)
+        storage = types.SimpleNamespace(name="StorageBuffer", variableType=storage_type,
+            fixedBindNumber=16, fixedBindSetOrSpace=0, bindArraySize=1,
+            descriptorType="ReadWriteBuffer", textureType="Buffer", isReadOnly=False)
+        self.controller.reflection.readWriteResources = [storage]
+        snapshot = self.bridge._begin_rdc_project_shader_resource_index(
+            self._target_request([hashlib.sha256(self.controller.raw).hexdigest()]))
+        result = snapshot["result"]
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertTrue(result["targetInventoryComplete"])
+        self.assertEqual(result["reasonId"], "")
+        self.assertEqual(len(result["assets"]), 1)
+        self.assertEqual(runtime_type.elements, 0xFFFFFFFF)
+        self.assertEqual(self.controller.events, [])
+        self.assertFalse(result["gpuReplayMutation"])
+
+        for invalid in (0xFFFFFFFE, -1, 1 << 21):
+            with self.subTest(elements=invalid):
+                runtime_type.elements = invalid
+                with self.assertRaises(self.bridge._ProjectShaderIndexLimit):
+                    self.bridge._validate_project_shader_reflection_budget(
+                        self.controller.reflection, self.bridge._new_project_shader_reflection_budget())
+        runtime_type.elements = 0xFFFFFFFF
+        self.controller.reflection.readWriteResources = []
+        self.controller.reflection.constantBlocks[0].variables = [member]
+        with self.assertRaises(self.bridge._ProjectShaderIndexLimit):
+            self.bridge._validate_project_shader_reflection_budget(
+                self.controller.reflection, self.bridge._new_project_shader_reflection_budget())
 
     def test_request_and_reflection_budgets_fail_before_event_traversal(self):
         expected = self._expected_shader()

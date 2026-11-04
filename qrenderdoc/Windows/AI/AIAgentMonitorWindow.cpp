@@ -43,6 +43,7 @@
 #include <QRegularExpression>
 #include <QScrollBar>
 #include <QSet>
+#include <QSignalBlocker>
 #include <QSplitter>
 #include <QTabWidget>
 #include <QTextCursor>
@@ -109,6 +110,8 @@ QString statusText(const QString &status)
     return QCoreApplication::translate("AIAgentMonitorWindow", "Cancelled");
   if(normalized == QLatin1String("blocked"))
     return QCoreApplication::translate("AIAgentMonitorWindow", "Blocked");
+  if(normalized == QLatin1String("needs-user-input"))
+    return QCoreApplication::translate("AIAgentMonitorWindow", "Waiting for input");
   return status;
 }
 
@@ -876,6 +879,8 @@ void AIAgentMonitorWindow::RefreshTasks()
     m_TaskCombo->blockSignals(false);
     return;
   }
+  if(!m_EventRoot.isEmpty())
+    m_Store.PurgeExpiredArchivedTaskLogs(m_EventRoot, 7);
   const QString previous = !m_RequestedTaskId.isEmpty() ? m_RequestedTaskId : CurrentTaskId();
   const QStringList loadedTaskIds = m_Store.TaskIds();
   QStringList taskIds = loadedTaskIds;
@@ -889,7 +894,12 @@ void AIAgentMonitorWindow::RefreshTasks()
   m_TaskCombo->blockSignals(true);
   m_TaskCombo->clear();
   for(const QString &taskId : taskIds)
-    m_TaskCombo->addItem(taskId, taskId);
+  {
+    QString label = taskId;
+    if(m_Store.IsTaskLogArchived(taskId, m_EventRoot))
+      label = QCoreApplication::translate("AIAgentMonitorWindow", "%1 (archived)").arg(taskId);
+    m_TaskCombo->addItem(label, taskId);
+  }
 
   int selection = taskIds.indexOf(previous);
   if(selection < 0 && !loadedTaskIds.isEmpty())
@@ -1082,10 +1092,10 @@ void AIAgentMonitorWindow::SelectAgent(QTreeWidgetItem *item)
 void AIAgentMonitorWindow::ChooseTaskFile()
 {
   const QString filePath = QFileDialog::getOpenFileName(
-      this, QCoreApplication::translate("AIAgentMonitorWindow", "Open ReplayLab Task Log"),
+      this, QCoreApplication::translate("AIAgentMonitorWindow", "Open Task Log"),
       m_EventRoot,
       QCoreApplication::translate("AIAgentMonitorWindow",
-                                  "ReplayLab task logs (*.jsonl);;All files (*)"));
+                                  "Task logs (*.jsonl);;All files (*)"));
   if(!filePath.isEmpty())
     ReplayTaskFile(filePath);
 }
@@ -1106,6 +1116,32 @@ void AIAgentMonitorWindow::OpenSelectedAgentWindow()
     m_AgentWindows.insert(key, window);
   }
   window->Open();
+}
+
+void AIAgentMonitorWindow::ForgetTask(const QString &taskId)
+{
+  if(m_TailedTaskId == taskId)
+    StopTailingTask();
+  if(m_RequestedTaskId == taskId)
+    m_RequestedTaskId.clear();
+  m_TaskFiles.remove(taskId);
+  const QString prefix = taskId + QChar(0x1f);
+  const QStringList windows = m_AgentWindows.keys();
+  for(const QString &key : windows)
+    if(key.startsWith(prefix))
+      delete m_AgentWindows.take(key).data();
+  const bool selected = CurrentTaskId() == taskId;
+  const QSignalBlocker blocker(m_TaskCombo);
+  for(int i = m_TaskCombo->count() - 1; i >= 0; --i)
+    if(m_TaskCombo->itemData(i).toString() == taskId)
+      m_TaskCombo->removeItem(i);
+  if(selected)
+  {
+    m_SelectedAgentId.clear();
+    m_TraceTabs->SetAgent(QString(), QString());
+  }
+  m_LastStructureRefreshMs = 0;
+  RefreshFromStore();
 }
 
 QString AIAgentMonitorWindow::TaskFilePath(const QString &taskId) const

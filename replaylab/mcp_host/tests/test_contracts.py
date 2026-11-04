@@ -45,6 +45,7 @@ class McpContractTests(unittest.TestCase):
 
         namespace = {
             "_active_capture_token": None,
+            "_replay_recovery_path": "",
             "_material_panel_ui": None,
             "_material_panel_controller": None,
             "_pass_panel_ui": None,
@@ -56,6 +57,7 @@ class McpContractTests(unittest.TestCase):
             "_shader_workspace_capture_binding": lambda: None,
             "_notify_shader_capture_changed": lambda binding: None,
             "_schedule_project_auto_activation": _record("schedule"),
+            "_schedule_frame_render_flow_restore": lambda: None,
             "_project_launcher_protocol": types.SimpleNamespace(
                 ReplayLabProjectClient=_record("projectClient")
             ),
@@ -331,8 +333,8 @@ class McpContractTests(unittest.TestCase):
                 integration_dir.mkdir(parents=True)
                 host_dir = root / "replaylab"
                 host_dir.mkdir()
-                unicode_host = host_dir / "ReplayLabMCP.unicode.exe"
-                legacy_host = host_dir / "ReplayLabMCP.exe"
+                unicode_host = host_dir / "BreadMCP.unicode.exe"
+                legacy_host = host_dir / "BreadMCP.exe"
                 unicode_host.write_bytes(b"unicode-host")
                 legacy_host.write_bytes(b"legacy-host")
                 bridge.__file__ = str(integration_dir / "__init__.py")
@@ -396,11 +398,12 @@ class McpContractTests(unittest.TestCase):
             def GetCaptureFilename(self):
                 return self.capture_path
 
-        bridge._release_event_shader_overrides = lambda: None
-        bridge._release_shared_shader_replacements = lambda: None
-        bridge._release_event_cbuffer_snapshots = lambda: None
+        lifecycle_effects = []
+        bridge._release_event_shader_overrides = lambda: lifecycle_effects.append("shader-overrides")
+        bridge._release_shared_shader_replacements = lambda: lifecycle_effects.append("shared-replacements")
+        bridge._release_event_cbuffer_snapshots = lambda: lifecycle_effects.append("cbuffer-snapshots")
         def _reset_symbol_state(restore_names):
-            del restore_names
+            lifecycle_effects.append(("reset-symbols", restore_names))
             bridge._capture_session_id = "c" * 32
 
         bridge._reset_symbol_state = _reset_symbol_state
@@ -418,6 +421,30 @@ class McpContractTests(unittest.TestCase):
         )
         self.assertFalse(bridge._consume_preselected_project_capture(path))
 
+        # An Agent retrying its current RDC must not emit capture callbacks,
+        # clear a live replacement, mint a new session, or cancel its own turn.
+        prior_effects = list(lifecycle_effects)
+        prior_token = bridge._active_capture_token
+        same_path = os.path.join(os.path.dirname(path), ".", os.path.basename(path))
+        unchanged = bridge._open_capture({"capture_path": same_path})
+        self.assertEqual({**expected_open, "alreadyOpen": True}, unchanged)
+        self.assertEqual(1, len(context.calls))
+        self.assertEqual(prior_effects, lifecycle_effects)
+        self.assertEqual(prior_token, bridge._active_capture_token)
+        with self.assertRaisesRegex(ValueError, "force_reload must be a boolean"):
+            bridge._open_capture({"capture_path": path, "force_reload": "true"})
+        self.assertEqual(prior_effects, lifecycle_effects)
+        self.assertEqual(expected_open, bridge._open_capture({
+            "capture_path": path, "force_reload": True,
+        }))
+        self.assertEqual(2, len(context.calls))
+        self.assertGreater(len(lifecycle_effects), len(prior_effects))
+        other_path = "C:/captures/other-frame.rdc"
+        switched = bridge._open_capture({"capture_path": other_path})
+        self.assertEqual(os.path.abspath(other_path), switched["opened"])
+        self.assertNotIn("alreadyOpen", switched)
+        self.assertEqual(3, len(context.calls))
+
         association_skips = []
         project_context = _Context(
             on_load=lambda capture_path, *unused: association_skips.append(
@@ -432,6 +459,11 @@ class McpContractTests(unittest.TestCase):
         self.assertEqual(
             [(path, replay_options, path, False, True)], project_context.calls
         )
+        # An explicit project activation retains its existing open/association
+        # lifecycle even when that project happens to use the same loaded RDC.
+        self.assertEqual(expected_open, bridge._open_capture_for_preselected_project(path))
+        self.assertEqual([True, True], association_skips)
+        self.assertEqual(2, len(project_context.calls))
 
         lease_writes = []
         status_messages = []
@@ -451,7 +483,7 @@ class McpContractTests(unittest.TestCase):
         bridge._schedule_project_auto_activation()
         self.assertEqual([], lease_writes)
         self.assertEqual(
-            [("ReplayLab: using the project selected for this RDC", 5000)],
+            [("Using the project selected for this RDC", 5000)],
             status_messages,
         )
 
@@ -1033,7 +1065,7 @@ class McpContractTests(unittest.TestCase):
             "name": "LinearSampler", "space": 0, "bind": 3, "arraySize": 1,
         })
         self.assertEqual(module._thread_group_size(
-            types.SimpleNamespace(dispatchThreadsDimension=[8, 8, 1])
+            types.SimpleNamespace(stage="ShaderStage.Compute", dispatchThreadsDimension=[8, 8, 1])
         ), [8, 8, 1])
 
         opaque_type = types.SimpleNamespace(
@@ -1226,13 +1258,35 @@ class McpContractTests(unittest.TestCase):
                 ),
             )
         ]
-        self.assertFalse(module._physical_shader_interfaces_compatible(
+        # The captured uint4 placeholder exceeds this 8-byte block and was
+        # already classified opaque. No captured member type is established;
+        # a valid uint2 describes the same verifiable binding/storage/range.
+        # This mirrors Host test_opaque_cbuffer_compares_only_verifiable_physical_range.
+        self.assertTrue(module._physical_shader_interfaces_compatible(
             reflection(opaque_block), reflection(same_range_typed_block)
         ))
         different_range = types.SimpleNamespace(**vars(same_range_typed_block))
         different_range.byteSize = 12
         self.assertFalse(module._physical_shader_interfaces_compatible(
             reflection(opaque_block), reflection(different_range)
+        ))
+        for field, value in (("fixedBindNumber", 1), ("fixedBindSetOrSpace", 2),
+                             ("bindArraySize", 2), ("bufferBacked", False)):
+            with self.subTest(opaque_binding_field=field):
+                changed_binding = types.SimpleNamespace(**vars(same_range_typed_block))
+                setattr(changed_binding, field, value)
+                self.assertFalse(module._physical_shader_interfaces_compatible(
+                    reflection(opaque_block), reflection(changed_binding)
+                ))
+        different_typed = types.SimpleNamespace(**vars(same_range_typed_block))
+        changed_type = types.SimpleNamespace(**vars(same_range_typed_block.variables[0].type))
+        changed_type.baseType = "VarType.Float"
+        different_typed.variables = [types.SimpleNamespace(
+            name="PackedValue", byteOffset=0, type=changed_type)]
+        # Known typed layouts still retain their exact member contract even
+        # when byte sizes match (as does the typed 44-byte size/packing gate).
+        self.assertFalse(module._physical_shader_interfaces_compatible(
+            reflection(same_range_typed_block), reflection(different_typed)
         ))
 
         parser_path = (
@@ -1263,7 +1317,9 @@ class McpContractTests(unittest.TestCase):
         changed_access = parser_module.extract_dxil_cbuffer_access_signature(
             changed_type_ir
         )
-        self.assertFalse(module._physical_shader_interfaces_compatible(
+        # Access tuples are not member-layout evidence for an opaque block.
+        # This is ABI compatibility only, not numerical/semantic equivalence.
+        self.assertTrue(module._physical_shader_interfaces_compatible(
             reflection(opaque_block), reflection(opaque_block),
             baseline_dxil_access=exact_access,
             candidate_dxil_access=changed_access,
@@ -1713,6 +1769,8 @@ class McpContractTests(unittest.TestCase):
         self.assertNotIn(77, controller.freed)
 
     def test_bridge_shared_shader_replacement_preserves_one_resource_owner(self) -> None:
+        from unittest import mock
+
         bridge_path = REPOSITORY / "renderdoc_mcp_bridge" / "__init__.py"
         fake_renderdoc = types.ModuleType("renderdoc")
 
@@ -1805,7 +1863,9 @@ class McpContractTests(unittest.TestCase):
                 # replayed pipeline.  This is the real behaviour that exposed
                 # the rev1 -> rev2 supersede bug: the pipeline still reports
                 # ResourceId 77 while GetShader(77) returns target 100's bytes.
-                if self.api != "GraphicsAPI.D3D11" and value in self.replacements:
+                # Vulkan/OpenGL GetShader look up the requested creation
+                # record, even after a checked pipeline replacement.
+                if self.api == "GraphicsAPI.D3D12" and value in self.replacements:
                     value = int(self.replacements[value])
                 blob = self.original_blobs.get(value, self.target_blobs.get(value))
                 return reflection(blob) if blob is not None else None
@@ -2272,6 +2332,53 @@ class McpContractTests(unittest.TestCase):
             self.assertNotIn(77, controller.replacements)
             self.assertNotIn(77, context.replacements)
 
+            # Catalog projections are not separate physical resource owners.
+            # A quiesced foreign workspace can transfer only its exact token;
+            # failed candidate/UI mutations preserve the existing last-good pair.
+            handoff_first_params = dict(params(revision=20), operation_id="8" * 32)
+            handoff_first = module._apply_shader_candidate_shared_resource(handoff_first_params)
+            old_target = handoff_first["targetResourceId"]
+            other_catalog = "e" * 64
+            module._known_catalog_capture_ids[other_catalog] = os.path.normcase(
+                os.path.abspath(capture_path))
+            owner = {key: handoff_first[key] for key in (
+                "replacementId", "workspaceId", "captureId", "captureSessionId",
+                "candidateRawSha256", "revision")}
+            transfer = dict(params(workspace="f" * 32),
+                            expected_capture_id=other_catalog, expected_owner=owner,
+                            operation_id="9" * 32)
+            for key, wrong in (("revision", 19), ("candidateRawSha256", "0" * 64),
+                               ("captureSessionId", "0" * 32), ("replacementId", "0" * 32)):
+                with self.subTest(handoff_field=key), self.assertRaisesRegex(
+                        RuntimeError, "handoff owner changed"):
+                    module._apply_shader_candidate_shared_resource(dict(
+                        transfer, expected_owner=dict(owner, **{key: wrong})))
+            controller.fail_checked_target = controller.next_target
+            with self.assertRaisesRegex(RuntimeError, "Checked D3D12 Shader replacement failed"):
+                module._apply_shader_candidate_shared_resource(transfer)
+            controller.fail_checked_target = None
+            self.assertEqual(int(controller.replacements[77]), old_target)
+            self.assertEqual(int(context.replacements[77]), old_target)
+            self.assertNotIn(old_target, controller.freed)
+            context.fail_next_register = True
+            with self.assertRaisesRegex(RuntimeError, "register failed"):
+                module._apply_shader_candidate_shared_resource(transfer)
+            self.assertEqual(int(controller.replacements[77]), old_target)
+            self.assertEqual(module._shared_shader_replacements[77]["workspaceId"], "b" * 32)
+            self.assertNotIn(old_target, controller.freed)
+            handed_off = module._apply_shader_candidate_shared_resource(transfer)
+            self.assertEqual(handed_off["workspaceId"], "f" * 32)
+            self.assertEqual(handed_off["captureId"], other_catalog)
+            self.assertNotEqual(handed_off["replacementId"], handoff_first["replacementId"])
+            self.assertFalse(handed_off["metadataOnly"])
+            self.assertIn(old_target, controller.freed)
+            with self.assertRaisesRegex(RuntimeError, "without its exact active replacement"):
+                module._apply_shader_candidate_shared_resource(handoff_first_params)
+            self.assertTrue(module._apply_shader_candidate_shared_resource(transfer)["idempotent"])
+            module._rollback_shader_candidate_shared_resource({
+                "replacement_id": handed_off["replacementId"],
+                "expected_capture_id": other_catalog, "workspace_id": "f" * 32})
+
             # Vulkan and OpenGL native SPIR-V use the same checked, derived-
             # pipeline transaction and then re-read the live anchor.  This is
             # deliberately separate from Ray/Library replacement, which the
@@ -2306,6 +2413,17 @@ class McpContractTests(unittest.TestCase):
                     self.assertTrue(native["postApplyAnchorVerified"])
                     self.assertEqual(native["api"], api.split(".")[-1].lower())
                     self.assertEqual(native["encoding"], encoding)
+                    self.assertEqual(controller.GetShader(ResourceId(5), ResourceId(77), None).rawBytes,
+                                     baseline)
+                    self.assertEqual(controller.GetShader(ResourceId(), ResourceId(native["targetResourceId"]),
+                                                          None).rawBytes, native_blob)
+                    self.assertTrue(module._apply_shader_candidate_shared_resource(native_params)["idempotent"])
+                    # Captured reflection must not excuse a changed UI owner.
+                    target = context.replacements[77]
+                    context.replacements[77] = ResourceId(999)
+                    with self.assertRaisesRegex(RuntimeError, "no longer owned"):
+                        module._apply_shader_candidate_shared_resource(native_params)
+                    context.replacements[77] = target
                     self.assertIn(
                         (
                             "ReplaceTargetShaderChecked",
@@ -2323,6 +2441,41 @@ class McpContractTests(unittest.TestCase):
                         })
                     )
                     self.assertTrue(native_rollback["cleared"])
+                    # Post-apply anchor failure followed by checked rollback
+                    # failure leaves the new target bound. Retain and track it
+                    # without a success proof, including during orphan cleanup.
+                    validate_live = module._validate_live_shader_event
+
+                    def fail_post_apply(*args, **kwargs):
+                        if kwargs.get("owned_shared_replacement") is not None:
+                            raise RuntimeError("injected post-apply anchor failure")
+                        return validate_live(*args, **kwargs)
+
+                    controller.fail_checked_remove = True
+                    with mock.patch.object(module, "_validate_live_shader_event", side_effect=fail_post_apply), \
+                            self.assertRaisesRegex(RuntimeError, "checked replay rollback failed.*active and tracked"):
+                        module._apply_shader_candidate_shared_resource(native_params)
+                    retained = module._shared_shader_replacements[77]
+                    retained_target = retained["targetResourceId"]
+                    self.assertTrue(retained["postApplyValidationFailed"])
+                    self.assertNotIn("restoreValidationReceipt", retained)
+                    self.assertEqual(int(controller.replacements[77]), retained_target)
+                    self.assertEqual(int(context.replacements[77]), retained_target)
+                    self.assertNotIn(retained_target, controller.freed)
+                    self.assertNotIn(retained["targetResource"], module._shared_shader_orphan_targets)
+                    module._release_replay_transient_caches({"clear_replay_cache": False})
+                    self.assertNotIn(retained_target, controller.freed)
+                    with self.assertRaisesRegex(RuntimeError, "requires recovery"):
+                        module._apply_shader_candidate_shared_resource(native_params)
+                    self.assertNotIn("restoreValidationReceipt", retained)
+                    controller.fail_checked_remove = False
+                    recovered = module._rollback_shader_candidate_shared_resource({
+                        "replacement_id": retained["replacementId"],
+                        "expected_capture_id": capture_id,
+                        "workspace_id": native_params["workspace_id"],
+                    })
+                    self.assertTrue(recovered["cleared"])
+                    self.assertIn(retained_target, controller.freed)
                     self.assertIn(
                         ("RemoveTargetShaderReplacementChecked", 77),
                         controller.calls,
@@ -2352,7 +2505,7 @@ class McpContractTests(unittest.TestCase):
             "compile_shader_workspace",
             "migrate_shader_workspace_toolchain",
             "begin_shader_workspace_organization",
-            "review_shader_workspace_organization",
+            "finish_shader_workspace_organization",
             "get_shader_workspace_status",
             "start_shader_workspace_watch",
             "poll_shader_workspace_watch",
@@ -2439,7 +2592,7 @@ class McpContractTests(unittest.TestCase):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
         for name in {
-            "_active_workspace_publication_gate",
+            "_current_workspace_publication_binding",
             "query_active_shader_asset_evidence",
             "register_replay_project_workspace",
         }:

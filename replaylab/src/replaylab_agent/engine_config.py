@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from pathlib import Path
 from .agent_contracts import OrchestratorConfig
 from .agent_protocol import CHILD_EFFECTS
 
 
 def default_engine_config_path() -> Path:
-    local = os.environ.get("LOCALAPPDATA")
-    root = Path(local) if local else Path(tempfile.gettempdir())
+    local = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
+    # Never the shared temp directory: on Linux/macOS that put the task event
+    # stream, the log and the tool settings under a world-readable /tmp that any
+    # local user could pre-plant and that vanished on reboot. XDG data home is the
+    # per-user equivalent of LOCALAPPDATA, which the rest of the product uses.
+    root = Path(local).expanduser() if local else Path.home() / ".local" / "share"
     return root / "ReplayLab" / "config" / "agent-engine.json"
 
 
@@ -33,17 +36,12 @@ def load_engine_config(path: Path | str | None = None) -> OrchestratorConfig:
         "main_timeout": (1.0, 86_400.0),
         "heartbeat_seconds": (0.05, 300.0),
     }
-    int_limits: dict[str, tuple[int, int]] = {
-        "max_tool_calls": (1, 1024),
-    }
     for name, (minimum, maximum) in float_limits.items():
         value = payload.get(name)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             setattr(config, name, min(maximum, max(minimum, float(value))))
-    for name, (minimum, maximum) in int_limits.items():
-        value = payload.get(name)
-        if isinstance(value, int) and not isinstance(value, bool):
-            setattr(config, name, min(maximum, max(minimum, value)))
+    # Historical max_tool_calls values remain readable in existing JSON files,
+    # but no longer constrain either Agent route or the MCP filter.
     effects = payload.get("allowed_effects")
     if isinstance(effects, list):
         selected = frozenset(str(item) for item in effects)

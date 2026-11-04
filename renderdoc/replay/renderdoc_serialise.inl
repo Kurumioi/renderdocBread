@@ -904,6 +904,47 @@ void DoSerialise(SerialiserType &ser, Subresource &el)
 }
 
 template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, ShaderPairSnapshot &el)
+{
+  SERIALISE_MEMBER(resourceId);
+  SERIALISE_MEMBER(index);
+  SERIALISE_MEMBER(depth);
+  SERIALISE_MEMBER(subresource);
+  SERIALISE_MEMBER(format);
+  SERIALISE_MEMBER(width);
+  SERIALISE_MEMBER(height);
+  SERIALISE_MEMBER(baseline);
+  SERIALISE_MEMBER(candidate);
+  SERIALISE_MEMBER(baselineRepeat);
+
+  SIZE_CHECK(120);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, EventShaderOverrideState &el)
+{
+  SERIALISE_MEMBER(active);
+  SERIALISE_MEMBER(eventId);
+  SERIALISE_MEMBER(stage);
+  SERIALISE_MEMBER(expectedOriginal);
+  SERIALISE_MEMBER(replacement);
+  SERIALISE_MEMBER(outputTarget);
+  SERIALISE_MEMBER(independentFloatOutput);
+}
+
+template <typename SerialiserType>
+void DoSerialise(SerialiserType &ser, ShaderPairComparison &el)
+{
+  SERIALISE_MEMBER(eventId);
+  SERIALISE_MEMBER(supported);
+  SERIALISE_MEMBER(completed);
+  SERIALISE_MEMBER(reason);
+  SERIALISE_MEMBER(outputs);
+
+  SIZE_CHECK(56);
+}
+
+template <typename SerialiserType>
 void DoSerialise(SerialiserType &ser, ModificationValue &el)
 {
   SERIALISE_MEMBER(col);
@@ -2387,6 +2428,9 @@ INSTANTIATE_SERIALISE_TYPE(Uuid)
 INSTANTIATE_SERIALISE_TYPE(CounterDescription)
 INSTANTIATE_SERIALISE_TYPE(PixelValue)
 INSTANTIATE_SERIALISE_TYPE(Subresource)
+INSTANTIATE_SERIALISE_TYPE(ShaderPairSnapshot)
+INSTANTIATE_SERIALISE_TYPE(ShaderPairComparison)
+INSTANTIATE_SERIALISE_TYPE(EventShaderOverrideState)
 INSTANTIATE_SERIALISE_TYPE(PixelModification)
 INSTANTIATE_SERIALISE_TYPE(EventUsage)
 INSTANTIATE_SERIALISE_TYPE(CounterResult)

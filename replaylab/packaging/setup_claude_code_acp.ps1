@@ -8,7 +8,7 @@
         (formerly @zed-industries/claude-code-acp), which reuses Claude Code's stored
         credentials. No API key, no reverse-engineered authentication.
 
-    ReplayLab's Save and Connect flow runs `claude setup-token` with the selected
+    ReplayLab's Save and Connect flow runs `claude auth login` with the selected
     connection's isolated CLAUDE_CONFIG_DIR. Do not run that login globally here:
     otherwise the credential would be stored outside the profile ReplayLab launches.
 

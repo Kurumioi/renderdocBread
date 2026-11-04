@@ -449,6 +449,15 @@ def generate_official_toolchain_configs(
                 "timeoutSeconds": 120,
             },
         }
+        tools["spirv-cross-vulkan-hlsl"] = {
+            "executable": str(python),
+            "executableSha256": _hash(python),
+            "fixedFileHashes": dict(fixed),
+            "decompile": {
+                "args": common_adapter_arguments + ["--mode", "vulkan-hlsl"],
+                "timeoutSeconds": 120,
+            },
+        }
         if enable_opengl_spirv:
             tools["spirv-cross-opengl-glsl"] = {
                 "executable": str(python),
@@ -461,6 +470,14 @@ def generate_official_toolchain_configs(
             }
     if binaries["glslang"] is not None:
         for stage, glslang_stage in _GLSLANG_STAGE_ARGUMENTS.items():
+            if stage in {"vertex", "hull", "domain", "geometry", "fragment", "compute"}:
+                add(
+                    "glslang-hlsl-%s-vulkan" % stage,
+                    "glslang", "compile",
+                    ["-D", "-V", "--target-env", target_env, "-S", glslang_stage,
+                     "-e", "{entry_point}", "--hlsl-iomap", "--hlsl-offsets",
+                     "--hlsl-dx-position-w", "-o", "{output}", "{input}"],
+                )
             add(
                 "glslang-%s-vulkan" % stage,
                 "glslang",
@@ -828,6 +845,15 @@ def generate_official_toolchain_configs(
             )
     for stage in _GLSLANG_STAGE_ARGUMENTS:
         if binaries["glslang"] is not None:
+            if stage in legacy_stages:
+                routes.append(route_record(
+                    registry, route_id="glslang-hlsl-spirv-%s" % stage,
+                    tool_id="glslang-hlsl-%s-vulkan" % stage, operation="compile",
+                    input_format="hlsl", output_format="spirv", stages=[stage],
+                    fidelity="native-compile", priority=10,
+                    implementation="Khronos glslang HLSL frontend", source_url=GLSLANG_SOURCE,
+                    target_apis=["vulkan"], license_name="See upstream LICENSE",
+                    caveats=["HLSL authoring preserves explicit Vulkan locations and register spaces; the actual candidate must still pass reflection and replay validation."]))
             routes.append(
                 route_record(
                     registry,
@@ -990,6 +1016,13 @@ def generate_official_toolchain_configs(
                 )
             )
     if binaries["spirv-cross"] is not None:
+        routes.append(route_record(
+            registry, route_id="spirv-cross-vulkan-hlsl", tool_id="spirv-cross-vulkan-hlsl",
+            operation="decompile", input_format="spirv", output_format="hlsl",
+            stages=legacy_stages, fidelity="reconstructed-source", priority=90,
+            implementation="Khronos SPIRV-Cross Vulkan HLSL authoring", source_url=SPIRV_CROSS_SOURCE,
+            target_apis=["vulkan"], license_name="See upstream LICENSE",
+            caveats=["Uses SM 6 authoring syntax, not a captured DirectX profile. Explicit Vulkan interface locations are retained; generated source still requires candidate validation."]))
         routes.append(
             route_record(
                 registry,
@@ -1217,7 +1250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--renodx-decompiler")
     parser.add_argument(
         "--adapter-host",
-        help="trusted packaged ReplayLab executable that dispatches fixed adapter subcommands",
+        help="trusted packaged Bread shader-tool executable that dispatches fixed adapter subcommands",
     )
     parser.add_argument(
         "--enable-opengl-spirv",

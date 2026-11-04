@@ -13,6 +13,60 @@ static bool VulkanReplayPatchBindingFits(uint64_t offset, uint64_t size, uint64_
   return offset <= allocationSize && size <= allocationSize - offset;
 }
 
+static bool VulkanReplayPatchBindingsDisjoint(uint64_t firstOffset, uint64_t firstSize,
+                                              uint64_t secondOffset, uint64_t secondSize,
+                                              uint64_t allocationSize, uint64_t granularity)
+{
+  if(!firstSize || !secondSize || !granularity || (granularity & (granularity - 1)) ||
+     !VulkanReplayPatchBindingFits(firstOffset, firstSize, allocationSize) ||
+     !VulkanReplayPatchBindingFits(secondOffset, secondSize, allocationSize))
+    return false;
+  // Optimal-tiled images alias linear resources on bufferImageGranularity
+  // pages, even when their literal byte ranges do not overlap. Division of the
+  // inclusive final byte avoids overflowing while rounding a range upward.
+  const uint64_t firstLast = (firstOffset + firstSize - 1) / granularity;
+  const uint64_t secondLast = (secondOffset + secondSize - 1) / granularity;
+  return firstLast < secondOffset / granularity || secondLast < firstOffset / granularity;
+}
+
+static bool VulkanReplayPatchMakeRestoreRange(const ReplayBufferPatch &memoryPatch,
+                                               uint64_t bindingOffset, uint64_t bindingSize,
+                                               uint64_t availableSize, bool clear,
+                                               ReplayBufferPatchRange &restore)
+{
+  if(memoryPatch.data.empty() || memoryPatch.byteOffset < bindingOffset ||
+     !VulkanReplayPatchBindingFits(bindingOffset, bindingSize, UINT64_MAX) ||
+     !VulkanReplayPatchBindingFits(memoryPatch.byteOffset - bindingOffset,
+                                   memoryPatch.data.size(), bindingSize))
+    return false;
+  uint64_t start = memoryPatch.byteOffset;
+  uint64_t finish = start + memoryPatch.data.size();
+  if(clear)
+  {
+    // vkCmdFillBuffer clears whole words. Extra lanes must remain inside the
+    // already validated buffer binding; never extend a clear into a neighbour.
+    if(finish > UINT64_MAX - 3)
+      return false;
+    start &= ~uint64_t(3);
+    finish = (finish + 3) & ~uint64_t(3);
+    if(start < bindingOffset ||
+       !VulkanReplayPatchBindingFits(start - bindingOffset, finish - start, bindingSize))
+      return false;
+  }
+  if(finish > availableSize)
+    return false;
+  restore = {memoryPatch.buffer, start, finish - start};
+  return true;
+}
+
+static void VulkanReplayPatchAccumulateRestoreRanges(
+    std::map<ResourceId, Intervals<bool>> &pending, const rdcarray<ReplayBufferPatchRange> &ranges)
+{
+  for(const ReplayBufferPatchRange &range : ranges)
+    pending[range.buffer].update(range.byteOffset, range.byteOffset + range.byteLength, true,
+                                  [](bool previous, bool next) { return previous || next; });
+}
+
 static bool VulkanReplayPatchSplitDynamicOffsets(const rdcarray<uint32_t> &counts,
                                                  uint32_t offsetCount, const uint32_t *offsets,
                                                  rdcarray<rdcarray<uint32_t>> &result)
@@ -438,7 +492,8 @@ static bool VulkanReplayPatchUnsafeMemoryMetadata(const SDObject &object, rdcstr
   // members. Inspect those elements; treating the array itself as a barrier rejects valid input.
   if(!object.IsArray() && object.type.basetype != SDBasic::Null)
   {
-    if(typeName.contains("DeviceGroup") || typeName.contains("ImportMemory"))
+    if(typeName.contains("DeviceGroup") || typeName.contains("ImportMemory") ||
+       typeName.contains("BindImagePlaneMemory"))
     {
       if(reason)
         *reason = typeName + ":unsupportedMemoryMetadata";
@@ -474,6 +529,7 @@ void WrappedVulkan::DestroyReplayBufferPatches()
   }
   m_ReplayBufferPatches.clear();
   m_ReplayBufferMemoryPatches.clear();
+  m_ReplayBufferRestoreRanges.clear();
 }
 
 rdcstr WrappedVulkan::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &patches)
@@ -506,11 +562,12 @@ rdcstr WrappedVulkan::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &
           const rdcstr name = ToStr(VulkanChunk(chunk->metadata.chunkID));
           rdcstr metadataReason;
           if((name == "vkAllocateMemory" || name == "vkCreateDevice" ||
-              name == "vkBindBufferMemory2" || name.contains("PipelineBarrier") ||
+              name == "vkBindBufferMemory2" || name == "vkBindImageMemory2" ||
+              name.contains("PipelineBarrier") ||
               name.contains("WaitEvents")) &&
              VulkanReplayPatchUnsafeMemoryMetadata(*chunk, &metadataReason))
-            return "Vulkan buffer patches do not support buffer ownership transfers, imported memory "
-                   "or device-group bindings: " + name + ":" + metadataReason;
+            return "Vulkan buffer patches do not support buffer ownership transfers, imported memory, "
+                   "device-group or disjoint image-plane bindings: " + name + ":" + metadataReason;
           if(name.contains("ImportMemory") || name.contains("Video") ||
              name.contains("WriteBufferMarker") || name == "vkCmdSetDeviceMask")
             return "Vulkan buffer patches do not support imported/video memory, device masks or "
@@ -532,6 +589,7 @@ rdcstr WrappedVulkan::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &
   }
 
   rdcarray<ReplayBufferPatch> memoryPatches;
+  rdcarray<ReplayBufferPatchRange> restoreRanges;
   std::set<ResourceId> validatedBuffers;
   uint64_t total = 0;
   for(const ReplayBufferPatch &patch : patches)
@@ -551,6 +609,7 @@ rdcstr WrappedVulkan::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &
     auto memory = m_CreationInfo.m_Memory.find(info.replayMemory);
     if(info.replayMemory == ResourceId() || memory == m_CreationInfo.m_Memory.end() ||
        memory->second.wholeMemBuf == VK_NULL_HANDLE ||
+       info.size > info.replayMemorySize ||
        !VulkanReplayPatchBindingFits(info.replayMemoryOffset, info.size,
                                       memory->second.wholeMemBufSize) ||
        !VulkanReplayPatchBindingFits(info.replayMemoryOffset, info.replayMemorySize,
@@ -565,20 +624,38 @@ rdcstr WrappedVulkan::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &
       const VulkanCreationInfo::Buffer &alias = other.second;
       if(other.first != patch.buffer && !ResourceIDGen::IsReplayOnlyID(other.first) &&
          alias.replayMemory == info.replayMemory &&
-         alias.replayMemoryOffset < info.replayMemoryOffset + info.replayMemorySize &&
-         info.replayMemoryOffset < alias.replayMemoryOffset + alias.replayMemorySize)
+         !VulkanReplayPatchBindingsDisjoint(info.replayMemoryOffset, info.replayMemorySize,
+                                            alias.replayMemoryOffset, alias.replayMemorySize,
+                                            memory->second.allocSize, 1))
         return "Vulkan persistent buffer patches do not support overlapping buffer memory bindings";
     }
-    // The clear path restores linear memory, so reject image allocations even when an image's
-    // current usage happens not to reference the overlapping memory interval.
+    // Sharing an allocation is normal suballocation, not itself aliasing. Check
+    // actual replay requirements and optimal-image granularity, not GetUsage.
     for(const auto &image : m_ImageStates)
     {
       LockedConstImageStateRef state = FindConstImageState(image.first);
-      if(state && state->boundMemory == info.replayMemory)
-        return "Vulkan buffer patches do not support memory allocations also bound to images";
+      if(!state || state->boundMemory != info.replayMemory)
+        continue;
+      const auto imageInfo = m_CreationInfo.m_Image.find(image.first);
+      if(imageInfo == m_CreationInfo.m_Image.end() || !state->isMemoryBound ||
+         !VulkanReplayPatchBindingsDisjoint(
+             info.replayMemoryOffset, info.replayMemorySize, state->boundMemoryOffset,
+             state->boundMemorySize, memory->second.allocSize,
+             imageInfo->second.linear ? 1 : GetDeviceProps().limits.bufferImageGranularity))
+        return "Vulkan buffer patch binding overlaps an image binding or has incomplete image memory evidence";
     }
+    const ReplayBufferPatch mapped =
+        VulkanReplayPatchInMemory(patch, info.replayMemory, info.replayMemoryOffset);
+    const uint64_t availableSize = initial.mem.size
+                                      ? RDCMIN(initial.mem.size, memory->second.wholeMemBufSize)
+                                      : memory->second.wholeMemBufSize;
+    ReplayBufferPatchRange restore;
+    if(!VulkanReplayPatchMakeRestoreRange(mapped, info.replayMemoryOffset, info.replayMemorySize,
+                                          availableSize, initial.buf == VK_NULL_HANDLE, restore))
+      return "Vulkan buffer patch has no safe initial-state restore range inside its binding";
     validatedBuffers.insert(patch.buffer);
-    memoryPatches.push_back(VulkanReplayPatchInMemory(patch, info.replayMemory, info.replayMemoryOffset));
+    memoryPatches.push_back(mapped);
+    restoreRanges.push_back(restore);
     total += patch.data.size();
     if(total > 128ULL * 1024 * 1024)
       return "Vulkan persistent buffer patch upload exceeds 128 MiB";
@@ -664,13 +741,12 @@ rdcstr WrappedVulkan::SetReplayBufferPatches(const rdcarray<ReplayBufferPatch> &
     m_ReplayPatchAnchorAttempted = false;
   m_ReplayPatchAnchorEvent = anchor;
   InvalidateReplayCheckpoints(cutoff);
-  for(const ReplayBufferPatch &patch : m_ReplayBufferMemoryPatches)
-    m_ReplayPatchRestoreMemory.insert(patch.buffer);
-  for(const ReplayBufferPatch &patch : memoryPatches)
-    m_ReplayPatchRestoreMemory.insert(patch.buffer);
+  VulkanReplayPatchAccumulateRestoreRanges(m_ReplayPatchRestoreMemory, m_ReplayBufferRestoreRanges);
+  VulkanReplayPatchAccumulateRestoreRanges(m_ReplayPatchRestoreMemory, restoreRanges);
   DestroyReplayBufferPatches();
   m_ReplayBufferPatches.swap(uploads);
   m_ReplayBufferMemoryPatches.swap(memoryPatches);
+  m_ReplayBufferRestoreRanges.swap(restoreRanges);
   if(Process::GetEnvVariable("RENDERDOC_EID_TIMING") == "1")
   {
     const rdcstr line = StringFormat::Fmt(

@@ -95,6 +95,51 @@ def _change_shader_identity(catalog):
     return changed
 
 
+class _AliasSwitchContext:
+    def __init__(self, capture_path):
+        self.capture_path = str(capture_path)
+        self.names = {
+            12: (True, "BreadManaged"),
+            13: (True, "UserTakeover"),
+        }
+        self.captured_names = {12: "CapturedTwelve", 13: "CapturedThirteen"}
+        self.set_calls = []
+        self.fail_resource = None
+
+    def IsCaptureLoaded(self):
+        return True
+
+    def CurEvent(self):
+        return 9
+
+    def GetCaptureFilename(self):
+        return self.capture_path
+
+    def GetResources(self):
+        return [
+            types.SimpleNamespace(resourceId=resource_id)
+            for resource_id in sorted(self.names)
+        ]
+
+    def HasResourceCustomName(self, resource_id):
+        return self.names[int(resource_id)][0]
+
+    def GetResourceNameUnsuffixed(self, resource_id):
+        return self.names[int(resource_id)][1]
+
+    def SetResourceCustomName(self, resource_id, name):
+        resource_id = int(resource_id)
+        self.set_calls.append((resource_id, str(name)))
+        if resource_id == self.fail_resource:
+            raise RuntimeError("injected catalog-switch rollback failure")
+        if name:
+            self.names[resource_id] = (True, str(name))
+        else:
+            self.names[resource_id] = (
+                False, self.captured_names[resource_id]
+            )
+
+
 class BridgeCatalogRebindTests(unittest.TestCase):
     def _configure(self, module, catalog, blobs):
         capture_path = catalog["capturePath"]
@@ -146,6 +191,87 @@ class BridgeCatalogRebindTests(unittest.TestCase):
         self.assertEqual(module._symbol_alias_overlay, original["overlay"])
         self.assertEqual(module._symbol_resource_renames, original["renames"])
         self.assertEqual(module._symbol_rename_capture_token, original["token"])
+
+    def _seed_committed_alias_switch(self, module, context):
+        old_capture_id = "a" * 64
+        old_snapshot = {
+            "captureId": old_capture_id,
+            "capturePath": context.capture_path,
+            "shaderKeys": {(12, "vertex", "main", "b" * 64)},
+            "usesByKey": {(12, "vertex", "main", "b" * 64): [7]},
+        }
+        capture_token = (
+            "loaded",
+            os.path.normcase(os.path.abspath(context.capture_path)),
+        )
+        original_overlay = module._new_symbol_alias_overlay()
+        committed_overlay = {
+            "schema": module.SYMBOL_ALIAS_SCHEMA,
+            "schemaVersion": module.SYMBOL_ALIAS_VERSION,
+            "captureId": old_capture_id,
+            "sourcePath": "D:/aliases-old.json",
+            "confirmedOnly": True,
+            "allAliases": [{"alias": "BreadManaged"}],
+            "aliases": [{"alias": "BreadManaged"}],
+        }
+        resource_renames = {
+            12: {
+                "hadCustomName": True,
+                "name": "CapturedTwelve",
+                "managedName": "BreadManaged",
+                "bindingKind": "shader",
+            },
+            13: {
+                "hadCustomName": True,
+                "name": "CapturedThirteen",
+                "managedName": "BreadManagedThirteen",
+                "bindingKind": "shader",
+            },
+        }
+        ledger = {
+            "schema": "renderdoc-ultra-alias-recovery-ledger/v1",
+            "transactionId": "d" * 32,
+            "captureId": old_capture_id,
+            "captureSessionId": "e" * 32,
+            "captureToken": capture_token,
+            "state": "committed",
+            "manifestSha256": "f" * 64,
+            "originalOverlay": original_overlay,
+            "originalResourceRenames": {},
+            "originalRenameCaptureToken": None,
+            "resources": {
+                12: {
+                    "rid": 12,
+                    "hadCustomName": True,
+                    "name": "CapturedTwelve",
+                },
+                13: {
+                    "rid": 13,
+                    "hadCustomName": True,
+                    "name": "CapturedThirteen",
+                },
+            },
+            "managedNames": {
+                12: {"hadCustomName": True, "name": "BreadManaged"},
+                13: {
+                    "hadCustomName": True,
+                    "name": "BreadManagedThirteen",
+                },
+            },
+        }
+        module._capture_session_id = "e" * 32
+        module._symbol_capture_snapshot = old_snapshot
+        module._symbol_alias_overlay = committed_overlay
+        module._symbol_resource_renames = resource_renames
+        module._symbol_rename_capture_token = capture_token
+        module._symbol_alias_recovery_ledger = ledger
+        module._symbol_alias_last_rollback_receipt = None
+        module._known_catalog_capture_ids = {
+            old_capture_id: capture_token[1]
+        }
+        module._known_catalog_identity_pairs = set()
+        module._known_catalog_stable_pairs = set()
+        return old_snapshot, ledger
 
     def test_expected_mismatches_never_publish_or_write_catalog_identity(self):
         module = _load_bridge()
@@ -247,6 +373,338 @@ class BridgeCatalogRebindTests(unittest.TestCase):
             self.assertEqual(module._symbol_resource_renames, original["renames"])
             self.assertTrue((output_dir / "shader_catalog.v1.json").is_file())
             self.assertEqual(len(list((output_dir / "blobs").glob("*.bin"))), 1)
+
+    def test_matching_expected_stable_identity_can_activate_symbol_catalog(self):
+        module = _load_bridge()
+        with tempfile.TemporaryDirectory() as temporary:
+            catalog, blobs = _catalog("D:/captures/current.rdc")
+            capture_id = module._catalog_capture_id(catalog)
+            stable_capture_id = module._catalog_stable_capture_id(catalog)
+            stable_evidence_sha256 = (
+                module._catalog_stable_identity_evidence_sha256(catalog)
+            )
+            self._configure(module, catalog, blobs)
+            module._symbol_capture_snapshot = {
+                "captureId": "a" * 64,
+                "capturePath": "D:/captures/current.rdc",
+                "shaderKeys": set(),
+                "usesByKey": {},
+            }
+            module._known_catalog_capture_ids = {}
+            module._known_catalog_identity_pairs = set()
+            module._known_catalog_stable_pairs = set()
+            module._symbol_alias_overlay = module._new_symbol_alias_overlay()
+            module._symbol_resource_renames = {}
+            module._symbol_rename_capture_token = None
+            module._symbol_alias_recovery_ledger = None
+            output_dir = Path(temporary) / "active-expected"
+
+            result = module._export_shader_catalog({
+                "output_dir": str(output_dir),
+                "event_ids": [321, 322],
+                "stages": ["fragment"],
+                "expected_stable_capture_id": stable_capture_id,
+                "expected_stable_identity_evidence_sha256": (
+                    stable_evidence_sha256
+                ),
+                "activate_catalog_if_valid": True,
+            })
+
+            self.assertIs(result["expectedIdentityValidatedBeforeCache"], True)
+            self.assertIs(result["activeCatalogPublished"], True)
+            self.assertEqual(module._symbol_capture_snapshot["captureId"], capture_id)
+            self.assertEqual(
+                module._symbol_capture_snapshot["usesByKey"][
+                    (77, "fragment", "main", catalog["shaders"][0]["rawSha256"])
+                ],
+                [321],
+            )
+            self.assertIn(capture_id, module._known_catalog_capture_ids)
+            self.assertIn(
+                (stable_capture_id, stable_evidence_sha256),
+                module._known_catalog_stable_pairs,
+            )
+
+    def test_expected_activation_recovers_old_aliases_then_switches_catalog(self):
+        module = _load_bridge()
+        with tempfile.TemporaryDirectory() as temporary:
+            catalog, blobs = _catalog("D:/captures/current.rdc")
+            capture_id = module._catalog_capture_id(catalog)
+            stable_capture_id = module._catalog_stable_capture_id(catalog)
+            stable_evidence_sha256 = (
+                module._catalog_stable_identity_evidence_sha256(catalog)
+            )
+            context = _AliasSwitchContext(catalog["capturePath"])
+            module._ctx = context
+            module._replay = lambda unused_callback: (
+                copy.deepcopy(catalog), dict(blobs)
+            )
+            unused_old_snapshot, unused_ledger = (
+                self._seed_committed_alias_switch(module, context)
+            )
+
+            result = module._export_shader_catalog({
+                "output_dir": str(Path(temporary) / "alias-switch"),
+                "event_ids": [321, 322],
+                "stages": ["fragment"],
+                "expected_stable_capture_id": stable_capture_id,
+                "expected_stable_identity_evidence_sha256": (
+                    stable_evidence_sha256
+                ),
+                "activate_catalog_if_valid": True,
+            })
+
+            self.assertIs(result["activeCatalogPublished"], True)
+            self.assertEqual(module._symbol_capture_snapshot["captureId"], capture_id)
+            self.assertIsNone(module._symbol_alias_recovery_ledger)
+            self.assertEqual(module._symbol_alias_overlay["aliases"], [])
+            self.assertEqual(module._symbol_resource_renames, {})
+            self.assertEqual(context.names[12], (True, "CapturedTwelve"))
+            # A custom name that no longer equals Bread's managed value belongs
+            # to the user and survives the automatic catalog switch.
+            self.assertEqual(context.names[13], (True, "UserTakeover"))
+            self.assertIn((12, "CapturedTwelve"), context.set_calls)
+            self.assertNotIn((13, "CapturedThirteen"), context.set_calls)
+
+    def test_expected_activation_keeps_old_catalog_when_alias_recovery_fails(self):
+        module = _load_bridge()
+        with tempfile.TemporaryDirectory() as temporary:
+            catalog, blobs = _catalog("D:/captures/current.rdc")
+            stable_capture_id = module._catalog_stable_capture_id(catalog)
+            stable_evidence_sha256 = (
+                module._catalog_stable_identity_evidence_sha256(catalog)
+            )
+            context = _AliasSwitchContext(catalog["capturePath"])
+            context.fail_resource = 12
+            module._ctx = context
+            module._replay = lambda unused_callback: (
+                copy.deepcopy(catalog), dict(blobs)
+            )
+            old_snapshot, ledger = self._seed_committed_alias_switch(
+                module, context
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "recovery remains required"):
+                module._export_shader_catalog({
+                    "output_dir": str(Path(temporary) / "alias-switch-fails"),
+                    "event_ids": [321, 322],
+                    "stages": ["fragment"],
+                    "expected_stable_capture_id": stable_capture_id,
+                    "expected_stable_identity_evidence_sha256": (
+                        stable_evidence_sha256
+                    ),
+                    "activate_catalog_if_valid": True,
+                })
+
+            self.assertIs(module._symbol_capture_snapshot, old_snapshot)
+            self.assertIs(module._symbol_alias_recovery_ledger, ledger)
+            self.assertEqual(
+                module._symbol_alias_overlay["captureId"], old_snapshot["captureId"]
+            )
+
+    def test_unvalidated_catalog_switch_still_requires_explicit_alias_recovery(self):
+        module = _load_bridge()
+        with tempfile.TemporaryDirectory() as temporary:
+            catalog, blobs = _catalog("D:/captures/current.rdc")
+            context = _AliasSwitchContext(catalog["capturePath"])
+            module._ctx = context
+            module._replay = lambda unused_callback: (
+                copy.deepcopy(catalog), dict(blobs)
+            )
+            old_snapshot, ledger = self._seed_committed_alias_switch(
+                module, context
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError, "Rollback the capture-bound symbol aliases"
+            ):
+                module._export_shader_catalog({
+                    "output_dir": str(Path(temporary) / "ordinary-switch"),
+                    "event_ids": [321, 322],
+                    "stages": ["fragment"],
+                })
+
+            self.assertIs(module._symbol_capture_snapshot, old_snapshot)
+            self.assertIs(module._symbol_alias_recovery_ledger, ledger)
+            self.assertEqual(context.names[12], (True, "BreadManaged"))
+
+    def test_active_catalog_request_still_fails_before_publication_on_mismatch(self):
+        module = _load_bridge()
+        with tempfile.TemporaryDirectory() as temporary:
+            expected_catalog, blobs = _catalog("D:/captures/current.rdc")
+            live_catalog = _change_shader_identity(expected_catalog)
+            self._configure(module, live_catalog, blobs)
+            original = self._seed_state(module)
+
+            with self.assertRaisesRegex(RuntimeError, "stable_capture_id"):
+                module._export_shader_catalog({
+                    "output_dir": str(Path(temporary) / "mismatch-active"),
+                    "event_ids": [321, 322],
+                    "stages": ["fragment"],
+                    "expected_stable_capture_id": (
+                        module._catalog_stable_capture_id(expected_catalog)
+                    ),
+                    "expected_stable_identity_evidence_sha256": (
+                        module._catalog_stable_identity_evidence_sha256(
+                            expected_catalog
+                        )
+                    ),
+                    "activate_catalog_if_valid": True,
+                })
+
+            self._assert_state_unchanged(module, original)
+
+    def test_alias_shader_revalidation_uses_retained_original_for_owned_replacement(self):
+        module = _load_bridge()
+        resource_id = 77
+        event_id = 321
+        original_bytes = b"captured original shader"
+        candidate_bytes = b"active Bread replacement"
+        original_sha256 = hashlib.sha256(original_bytes).hexdigest()
+        candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+        key = (resource_id, "fragment", "main", original_sha256)
+        entry = types.SimpleNamespace(name="main")
+        original_reflection = types.SimpleNamespace(
+            entryPoint="main", rawBytes=original_bytes)
+        active_reflection = types.SimpleNamespace(
+            entryPoint="main", rawBytes=candidate_bytes)
+        capture_token = ("loaded", "D:/captures/current.rdc")
+
+        class Pipeline:
+            def GetShader(self, unused_stage):
+                return resource_id
+
+        class Controller:
+            def __init__(self):
+                self.pipeline = Pipeline()
+
+            def GetPipelineState(self):
+                return self.pipeline
+
+            def GetShaderEntryPoints(self, shader_id):
+                self.assert_shader(shader_id)
+                return [entry]
+
+            def GetShader(self, unused_pipeline, shader_id, selected_entry):
+                self.assert_shader(shader_id)
+                self.assertIs(selected_entry, entry)
+                return active_reflection
+
+            def assert_shader(self, shader_id):
+                if module._resource_id_int(shader_id) != resource_id:
+                    raise AssertionError("unexpected Shader resource")
+
+            def assertIs(self, left, right):
+                if left is not right:
+                    raise AssertionError("unexpected entry point")
+
+        controller = Controller()
+        module._symbol_capture_snapshot = {
+            "captureId": "a" * 64,
+            "capturePath": capture_token[1],
+            "shaderKeys": {key},
+            "usesByKey": {key: [event_id]},
+        }
+        module._capture_session_id = "b" * 32
+        module._active_capture_token = capture_token
+        module._shared_shader_replacement_capture_token = capture_token
+        module._shared_shader_replacements = {
+            resource_id: {
+                "captureSessionId": module._capture_session_id,
+                "captureToken": capture_token,
+                "api": "d3d12",
+                "originalResource": resource_id,
+                "expectedOriginalResourceId": resource_id,
+                "expectedOriginalSha256": original_sha256,
+                "stageName": "fragment",
+                "entryPoint": "main",
+                "candidateRawSha256": candidate_sha256,
+                "capturedOriginalReflection": original_reflection,
+            }
+        }
+        module._available_shader_stages = lambda unused=None: [("fragment", "ps")]
+        module._request_visible_event_id = lambda unused=0: 9
+        module._set_frame_event = lambda unused_ctrl, unused_event, unused_force: None
+        module._get_pipeline_obj = lambda unused_pipeline, unused_ctrl: 901
+        module._current_capture_token = lambda: capture_token
+        module._shader_api_token = lambda unused_ctrl: "d3d12"
+        module._replay = lambda callback: callback(controller)
+
+        verified, failures = module._revalidate_symbol_shader_keys({key})
+
+        self.assertEqual(verified, {key})
+        self.assertEqual(failures, {})
+
+    def test_alias_shader_revalidation_rejects_foreign_owner_and_target(self):
+        module = _load_bridge()
+        resource_id = 77
+        event_id = 321
+        original_bytes = b"captured original shader"
+        candidate_bytes = b"active Bread replacement"
+        original_sha256 = hashlib.sha256(original_bytes).hexdigest()
+        candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+        key = (resource_id, "fragment", "main", original_sha256)
+        entry = types.SimpleNamespace(name="main")
+        original_reflection = types.SimpleNamespace(
+            entryPoint="main", rawBytes=original_bytes)
+        active_reflection = types.SimpleNamespace(
+            entryPoint="main", rawBytes=candidate_bytes)
+        capture_token = ("loaded", "D:/captures/current.rdc")
+
+        class Pipeline:
+            def GetShader(self, unused_stage):
+                return resource_id
+
+        class Controller:
+            def GetPipelineState(self):
+                return Pipeline()
+
+            def GetShaderEntryPoints(self, unused_shader_id):
+                return [entry]
+
+            def GetShader(self, unused_pipeline, unused_shader_id, unused_entry):
+                return active_reflection
+
+        module._symbol_capture_snapshot = {
+            "captureId": "a" * 64,
+            "capturePath": capture_token[1],
+            "shaderKeys": {key},
+            "usesByKey": {key: [event_id]},
+        }
+        module._capture_session_id = "b" * 32
+        module._active_capture_token = capture_token
+        module._shared_shader_replacement_capture_token = capture_token
+        owner = {
+            "captureSessionId": module._capture_session_id,
+            "captureToken": capture_token,
+            "api": "d3d12",
+            "originalResource": resource_id,
+            "expectedOriginalResourceId": resource_id,
+            "expectedOriginalSha256": original_sha256,
+            "stageName": "fragment",
+            "entryPoint": "main",
+            "candidateRawSha256": candidate_sha256,
+            "capturedOriginalReflection": original_reflection,
+        }
+        module._shared_shader_replacements = {resource_id: owner}
+        module._available_shader_stages = lambda unused=None: [("fragment", "ps")]
+        module._request_visible_event_id = lambda unused=0: 9
+        module._set_frame_event = lambda unused_ctrl, unused_event, unused_force: None
+        module._get_pipeline_obj = lambda unused_pipeline, unused_ctrl: 901
+        module._current_capture_token = lambda: capture_token
+        module._shader_api_token = lambda unused_ctrl: "d3d12"
+        module._replay = lambda callback: callback(Controller())
+
+        owner["captureSessionId"] = "c" * 32
+        verified, failures = module._revalidate_symbol_shader_keys({key})
+        self.assertEqual(verified, set())
+        self.assertIn("another capture", failures[key])
+
+        owner["captureSessionId"] = module._capture_session_id
+        active_reflection.rawBytes = b"replacement changed outside Bread"
+        verified, failures = module._revalidate_symbol_shader_keys({key})
+        self.assertEqual(verified, set())
+        self.assertIn("changed outside Bread", failures[key])
 
     def test_export_without_expected_identity_remains_backward_compatible(self):
         module = _load_bridge()
@@ -605,3 +1063,99 @@ class BridgeCatalogRebindTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StableCaptureIdentityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bridge = _load_bridge()
+
+    """A ResourceId is not an identity, and a workspace must survive one changing.
+
+    RenderDoc reassigns ResourceIds every time a capture is opened. The identity a
+    workspace used to be gated on hashed one in, so every stored workspace stopped
+    reattaching after a restart -- observed in the field as three catalogs of the same
+    .rdc, identical in path, API, stage, entry point and Shader bytes, differing only
+    in 1000000000000000853 / 1000000000000000860 / 1000000000000012212.
+    """
+
+    @staticmethod
+    def _catalog(resource_id):
+        shader_key = "%d:fragment:MainPS:%s" % (resource_id, "3c" * 32)
+        return {
+            "schema": "renderdoc-ultra-capture-symbols/v1",
+            "schemaVersion": 1,
+            "capturePath": r"D:\captures\6.rdc",
+            "api": "GraphicsAPI.D3D12",
+            "selection": {"mode": "explicit", "eventIds": [11329],
+                          "stages": ["fragment"]},
+            "shaders": [{
+                "shaderResourceId": resource_id, "resourceId": resource_id,
+                "stage": "fragment", "entryPoint": "MainPS", "entry": "MainPS",
+                "rawSha256": "3c" * 32, "shaderKey": shader_key,
+            }],
+            "uses": [{
+                "eventId": 11329, "shaderResourceId": resource_id,
+                "resourceId": resource_id, "stage": "fragment",
+                "entryPoint": "MainPS", "rawSha256": "3c" * 32,
+                "shaderKey": shader_key,
+            }],
+        }
+
+    def test_the_volatile_capture_id_does_change_with_the_resource_id(self) -> None:
+        """Kept as-is: it is honest provenance for one replay session."""
+
+        first = self.bridge._catalog_capture_id(self._catalog(853))
+        second = self.bridge._catalog_capture_id(self._catalog(860))
+        self.assertNotEqual(first, second)
+
+    def test_the_stable_identity_ignores_the_resource_id(self) -> None:
+        for other in (860, 12212, 1):
+            self.assertEqual(
+                self.bridge._catalog_stable_capture_id(self._catalog(853)),
+                self.bridge._catalog_stable_capture_id(self._catalog(other)),
+            )
+
+    def test_the_stable_identity_still_separates_different_shaders(self) -> None:
+        changed = self._catalog(853)
+        changed["shaders"][0]["rawSha256"] = "ab" * 32
+        self.assertNotEqual(
+            self.bridge._catalog_stable_capture_id(self._catalog(853)),
+            self.bridge._catalog_stable_capture_id(changed),
+        )
+        renamed = self._catalog(853)
+        renamed["shaders"][0]["entryPoint"] = "MainPS2"
+        self.assertNotEqual(
+            self.bridge._catalog_stable_capture_id(self._catalog(853)),
+            self.bridge._catalog_stable_capture_id(renamed),
+        )
+        # The path is deliberately *not* part of it: the same file opened from the
+        # recent list with other casing, moved a folder up, or a second capture of
+        # the same build are the same Shaders. Whether a stored workspace may
+        # reattach is decided by the use-evidence pair, not by this hash alone.
+        moved = self._catalog(853)
+        moved["capturePath"] = r"D:\captures\7.rdc"
+        self.assertEqual(
+            self.bridge._catalog_stable_capture_id(self._catalog(853)),
+            self.bridge._catalog_stable_capture_id(moved),
+        )
+
+    def test_the_use_evidence_loses_its_resource_ids_too(self) -> None:
+        first = self.bridge._catalog_stable_identity_evidence_sha256(self._catalog(853))
+        second = self.bridge._catalog_stable_identity_evidence_sha256(self._catalog(12212))
+        self.assertEqual(first, second)
+        # ...but not the event it was used at, which is what the selection means.
+        moved_event = self._catalog(853)
+        moved_event["selection"]["eventIds"] = [11330]
+        moved_event["uses"][0]["eventId"] = 11330
+        self.assertNotEqual(
+            first, self.bridge._catalog_stable_identity_evidence_sha256(moved_event))
+
+    def test_a_shader_key_keeps_everything_except_the_resource_id(self) -> None:
+        self.assertEqual(
+            self.bridge._stable_shader_key("1000000000000000853:fragment:MainPS:abc"),
+            "fragment:MainPS:abc",
+        )
+        # Nothing to strip is not an error; it is simply returned unchanged.
+        self.assertEqual(self.bridge._stable_shader_key("fragment"), "fragment")
+        self.assertEqual(self.bridge._stable_shader_key(""), "")

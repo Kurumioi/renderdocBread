@@ -275,7 +275,7 @@ class MaterialPanelController(object):
     def _current_context(self):
         value = self._context()
         if not isinstance(value, dict):
-            raise MaterialPanelError("ReplayLab current context is unavailable")
+            raise MaterialPanelError("Bread current context is unavailable")
         capture = value.get("capture") if isinstance(value.get("capture"), dict) else {}
         events = value.get("events") if isinstance(value.get("events"), dict) else {}
         if not capture.get("loaded"):
@@ -283,14 +283,14 @@ class MaterialPanelController(object):
         api_name, api_token = _context_api_token(capture.get("api"))
         if not api_token:
             raise MaterialPanelError(
-                "The capture API is unavailable; ReplayLab material editing cannot be enabled "
+                "The capture API is unavailable; Bread material editing cannot be enabled "
                 "safely")
         if api_token not in ("d3d11", "d3d12", "opengl", "vulkan"):
             raise MaterialPanelError(
                 "Current capture API does not support shared CBuffer editing: %s" % api_name)
         if not str(capture.get("captureId", "") or ""):
             raise MaterialPanelError(
-                "The capture has no ReplayLab catalog identity yet; run the project's initial "
+                "The capture has no Bread catalog identity yet; run the project's initial "
                 "capture analysis before exposing material parameters")
         capture_id = _sha256(capture.get("captureId"), "capture ID")
         capture_session_id = _hex(
@@ -360,7 +360,7 @@ class MaterialPanelController(object):
                 "expected_capture_id": current["captureId"],
             })
             if not isinstance(snapshot, dict) or snapshot.get("schema") != SNAPSHOT_SCHEMA:
-                raise MaterialPanelError("ReplayLab returned an invalid CBuffer snapshot")
+                raise MaterialPanelError("Bread returned an invalid CBuffer snapshot")
             try:
                 checks = (
                     ("captureId", _sha256(snapshot.get("captureId"), "snapshot capture ID"),
@@ -440,6 +440,7 @@ class MaterialPanelController(object):
                                             "snapshot layout hash"),
                     "revision": 0,
                     "overrideId": "",
+                    "resetMode": snapshot.get("resetMode", "captured-range"),
                     "fieldsById": fields_by_id,
                     "exposed": collections.OrderedDict(),
                     "patches": collections.OrderedDict(),
@@ -530,7 +531,7 @@ class MaterialPanelController(object):
         if session["revision"] != prepared["params"]["expected_revision"]:
             raise MaterialPanelError("The material editor revision changed during replay")
         if not isinstance(response, dict) or response.get("schema") != OVERRIDE_SCHEMA:
-            raise MaterialPanelError("ReplayLab returned an invalid CBuffer override response")
+            raise MaterialPanelError("Bread returned an invalid CBuffer override response")
         if (_hex(response.get("snapshotId"), "override snapshot ID", 32) !=
                 session["snapshotId"] or
                 _integer(response.get("revision"), "override revision") != session["revision"] + 1 or
@@ -551,7 +552,21 @@ class MaterialPanelController(object):
         if self.edit_queue.busy:
             raise MaterialPanelError("A material edit is already queued")
         prepared = self.prepare_update(session_id, parameter_id, value)
-        return self.accept_update(prepared, self._apply(prepared["params"]))
+        try:
+            return self.accept_update(prepared, self._apply(prepared["params"]))
+        except Exception as exc:
+            self._discard_expired_session(session_id, exc)
+            raise
+
+    def _discard_expired_session(self, session_id, error):
+        if not getattr(error, "snapshot_expired", False):
+            return
+        # Preserve accepted native values. Only forget this stale UI capability;
+        # an explicit native selection can then acquire a fresh snapshot.
+        session = self._sessions.pop(session_id, None)
+        if session is not None:
+            self._physical_keys.pop(session["physicalKey"], None)
+        self.edit_queue.remove_pending(lambda job: job["sessionId"] == session_id)
 
     def submit_text(self, session_id, parameter_id, text, complete, owner):
         self.edit_queue.submit(("edit", session_id, parameter_id),
@@ -583,6 +598,8 @@ class MaterialPanelController(object):
 
         def finished(response, error):
             status = None
+            if error is not None:
+                self._discard_expired_session(job["sessionId"], error)
             if error is None:
                 try:
                     # A closed dock must still retain genuinely committed versions
@@ -656,6 +673,7 @@ class MaterialPanelController(object):
             "configured": bool(session["overrideId"]),
             "scope": "shared-buffer-range",
             "generation": session.get("generation", 0),
+            "resetMode": session.get("resetMode", "captured-range"),
             "previewPublished": session.get("previewPublished", False),
             "replayedEventId": session.get("replayedEventId"),
             "api": session["api"],
@@ -673,7 +691,11 @@ class MaterialPanelController(object):
             raise MaterialPanelError("Unknown or expired material-panel session")
         if self.edit_queue.busy:
             raise MaterialPanelError("A material edit is already queued")
-        return self.accept_rollback(session, self._rollback(self._rollback_params(session)))
+        try:
+            return self.accept_rollback(session, self._rollback(self._rollback_params(session)))
+        except Exception as exc:
+            self._discard_expired_session(session_id, exc)
+            raise
 
     @staticmethod
     def _rollback_params(session):
@@ -689,9 +711,9 @@ class MaterialPanelController(object):
         if self._sessions.get(session_id) is not session:
             raise MaterialPanelError("The material session belongs to an expired capture")
         if not isinstance(response, dict) or response.get("schema") != OVERRIDE_SCHEMA:
-            raise MaterialPanelError("ReplayLab returned an invalid rollback response")
+            raise MaterialPanelError("Bread returned an invalid rollback response")
         if not response.get("snapshotReleased"):
-            raise MaterialPanelError("ReplayLab did not release the CBuffer snapshot")
+            raise MaterialPanelError("Bread did not release the CBuffer snapshot")
         self._sessions.pop(session_id, None)
         self._physical_keys.pop(session["physicalKey"], None)
         return response

@@ -29,6 +29,7 @@
 #include <QSemaphore>
 #include <QSet>
 #include <QStyledItemDelegate>
+#include <memory>
 #include "Code/Interface/QRDInterface.h"
 
 namespace Ui
@@ -303,7 +304,9 @@ private:
 
   Ui::ShaderViewer *ui;
   ICaptureContext &m_Ctx;
-  const ShaderReflection *m_ShaderDetails = NULL;
+  // A pipeline publication may be replaced on navigation or replay refresh. A shader window
+  // outlives that publication; queued disassembly work shares this immutable owned snapshot.
+  std::shared_ptr<const ShaderReflection> m_ShaderDetails;
   bool m_CustomShader = false;
   bool m_ExplanatoryMode = false;
   rdcstr m_ExplanatoryReason;

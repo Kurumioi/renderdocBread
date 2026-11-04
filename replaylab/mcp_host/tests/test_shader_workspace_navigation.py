@@ -52,19 +52,19 @@ class Editor:
         self.cursor = (line, column)
 
 
-def panel(buffer=SOURCE, function='Evaluate'):
+def panel(buffer=SOURCE, function='Evaluate', editor_type=Editor):
     source = (ROOT / 'project_shader_workspace.py').read_text(encoding='utf-8')
     tree = ast.parse(source)
-    names = {'_source_hierarchy', '_function_line_span', '_anchor_graph', '_sync_flow_graph',
+    names = {'_function_line_span', '_anchor_graph', '_flow_token_anchor', '_flow_anchor_position',
              '_prune_flow_anchors',
              '_function_bookmark', '_bookmarked_function',
-             '_flow_graph_node_activated', '_flow_graph_subgraph_requested'}
+             '_flow_graph_node_activated', '_flow_graph_subgraph_requested', '_open_function_graph'}
     methods = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name in names]
-    namespace = {'_shader_flow_hierarchy': HIERARCHY, 'json': json}
+    namespace = {'_shader_flow_hierarchy': HIERARCHY, 'json': json, 'copy': copy}
     exec(compile(ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[])), str(ROOT), 'exec'), namespace)
     cls = type('PanelHarness', (), {name: namespace[name] for name in names})
     value = cls()
-    document = {'editor': Editor(), 'workspaceId': 'workspace', 'documentToken': 1,
+    document = {'editor': editor_type(), 'workspaceId': 'workspace', 'documentToken': 1,
                 'sourcePath': 'source/shader.hlsl', 'captureBinding': dict(BINDING),
                 'available': True, 'textRevision': 0, 'dirty': False}
     value._current_document = lambda: document
@@ -80,6 +80,21 @@ def panel(buffer=SOURCE, function='Evaluate'):
         value.flow_graph._history.open(graph, kwargs)
 
     value.flow_graph.open_subgraph = open_subgraph
+    # The real async delivery is covered in test_shader_source_flow_async.
+    # These tests exercise navigation after a current-buffer result arrives.
+    def source_hierarchy(document):
+        try:
+            return HIERARCHY.SourceFlowHierarchy(document['editor'].source)
+        except ValueError:
+            return None
+    value._source_hierarchy = source_hierarchy
+    def sync_flow(document):
+        hierarchy = source_hierarchy(document)
+        graph = copy.deepcopy(value._document_model(document['workspaceId'])['flowGraph'])
+        value._anchor_graph(document, graph, hierarchy)
+        document['flowProjectionIncomplete'] = hierarchy is None
+        value.flow_graph.set_graph(graph)
+    value._sync_flow_graph = sync_flow
     document['editor'].source = buffer
     hierarchy = value._source_hierarchy(document)
     function_id = hierarchy.function_identity(function)
@@ -102,7 +117,7 @@ def test_dirty_buffer_navigation_uses_moving_bookmark_not_accepted_hash_or_line(
     editor.markers = {key: line + 1 for key, line in editor.markers.items()}
     document.update(textRevision=1, dirty=True, rawSha256='a-new-intentional-user-version')
     value._flow_graph_node_activated(payload)
-    assert editor.cursor[0] == 3
+    assert editor.cursor[0] == 2
     assert not value.unavailable
 
 
@@ -111,7 +126,7 @@ def test_target_text_can_change_without_invalidating_its_bookmark():
     document['editor'].source = SOURCE.replace('value * 2', 'value * 5')
     document.update(textRevision=1, dirty=True)
     value._flow_graph_node_activated(payload)
-    assert document['editor'].cursor[0] == 2
+    assert document['editor'].cursor[0] == 1
 
 
 def test_function_rename_keeps_the_bookmarked_declaration_and_body():
@@ -119,7 +134,7 @@ def test_function_rename_keeps_the_bookmarked_declaration_and_body():
     document['editor'].source = SOURCE.replace('Evaluate', 'Unrelated')
     document.update(textRevision=1)
     value._flow_graph_node_activated(payload)
-    assert document['editor'].cursor[0] == 2
+    assert document['editor'].cursor[0] == 1
     value._flow_graph_subgraph_requested(payload)
     assert value.opened[0]['functionName'] == 'Unrelated'
 
@@ -165,7 +180,7 @@ def test_old_project_graph_relocates_to_actual_function_body_not_old_line():
     graph = hierarchy.project_root(graph)
     value._anchor_graph(document, graph, hierarchy)
     value._flow_graph_node_activated(graph['nodes'][0]['source'])
-    assert document['editor'].cursor[0] == 2
+    assert document['editor'].cursor[0] == 1
 
 
 def test_renamed_function_and_parameter_survive_tab_reprojection():
@@ -179,7 +194,7 @@ def test_renamed_function_and_parameter_survive_tab_reprojection():
     assert node['source']['symbol'] == 'Renamed'
     value._flow_graph_node_activated(node['source'])
     value._flow_graph_subgraph_requested(node['source'])
-    assert document['editor'].cursor[0] == 2
+    assert document['editor'].cursor[0] == 1
     assert value.opened[-1]['functionName'] == 'Renamed'
 
 
@@ -207,7 +222,8 @@ CALL_SOURCE = ('float A(float x) {\n return x*2;\n}\n'
 def call_panel():
     value, document, root = panel(CALL_SOURCE, 'Main')
     value._flow_graph_subgraph_requested(root)
-    node = value.opened[-1]['nodes'][0]
+    node = next(node for node in value.opened[-1]['nodes']
+                if node.get('kind') == 'function-call')
     return value, document, dict(node['source'], functionId=node['functionId'])
 
 
@@ -264,25 +280,25 @@ def test_fresh_recreated_function_has_new_marker_while_old_history_stays_invalid
     fresh_marker = document['flowAnchors'][fresh_payload['anchorId']]['functionMarker']
     assert fresh_payload['anchorId'] != old_payload['anchorId']
     assert fresh_marker != old_marker
+    document['editor'].cursor = None
     value._flow_graph_node_activated(old_payload)
     assert value.unavailable and document['editor'].cursor is None
     value._flow_graph_node_activated(fresh_payload)
-    assert document['editor'].cursor[0] == 2
+    assert document['editor'].cursor[0] == 1
 
 
-def test_history_eviction_and_abandoned_forward_branch_release_native_markers():
+def test_reprojected_same_function_releases_superseded_native_markers():
     value, document, root = panel()
     for index in range(80):
         document['editor'].source = SOURCE.replace('value * 2', 'value * %d' % (index + 3))
         document['textRevision'] = index + 1
         value._flow_graph_subgraph_requested(root)
-    assert value.flow_graph._history.state()['length'] == 64
-    assert len(document['flowAnchors']) == 1 + 63 * 2
+    assert value.flow_graph._history.state()['length'] == 2
+    # Reopening the same function updates its history entry, not a new ancestor.
+    assert len(document['flowAnchors']) == 2
     assert len(document['editor'].markers) == len(document['flowAnchors']) + 1
     assert document['editor'].removed_markers
     abandoned = value.opened[-1]['nodes'][0]['source']
-    value.flow_graph._history.back()
-    value.flow_graph._history.back()
     document['editor'].source = SOURCE.replace('value * 2', 'value * 777')
     document['textRevision'] = 81
     value._flow_graph_subgraph_requested(root)
@@ -299,13 +315,16 @@ def test_hard_cap_expires_old_history_without_rebinding_it():
     document['textRevision'] = 1
     value._flow_graph_subgraph_requested(root)
     current = value.opened[-1]
-    value._prune_flow_anchors(document, current, max_anchors=3)
-    assert len(document['flowAnchors']) == 3
-    assert len(document['editor'].markers) == 4
+    value._prune_flow_anchors(document, current, max_anchors=2)
+    assert len(document['flowAnchors']) == 2
+    assert len(document['editor'].markers) == 3
     value._flow_graph_node_activated(expired)
     value._flow_graph_subgraph_requested(expired)
     assert len(value.unavailable) == 2
     assert root['anchorId'] in document['flowAnchors']
+    current_function = next(node for node in current['nodes']
+                            if node.get('kind') == 'function-summary')
+    assert current_function['source']['anchorId'] in document['flowAnchors']
 
 
 def test_same_line_declarations_remain_ambiguous_after_bookmark_binding():

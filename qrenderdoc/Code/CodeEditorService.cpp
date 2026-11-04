@@ -23,8 +23,10 @@
  ******************************************************************************/
 
 #include "CodeEditorService.h"
+#include "BackgroundProcess.h"
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QEvent>
 #include <QFileInfo>
@@ -46,6 +48,7 @@
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <memory>
 
 #include "scintilla/include/Scintilla.h"
 #include "scintilla/include/qt/ScintillaEdit.h"
@@ -57,7 +60,10 @@ const int WarningIndicator = 9;
 const int SymbolOccurrenceIndicator = 10;
 const int FunctionNameIndicator = 11;
 const int VariableNameIndicator = 12;
+const int SemanticNameIndicator = 13;
 const int DiagnosticsDebounceMS = 160;
+const int SemanticTokensDebounceMS = 350;
+const int SemanticPaintBatchSize = 512;
 const int MaxCompletionItems = 256;
 const int MaxDiagnostics = 2000;
 const int MaxMessageBytes = 4 * 1024 * 1024;
@@ -265,6 +271,35 @@ QJsonObject lspPosition(const QByteArray &text, int bytePosition)
   return ret;
 }
 
+QJsonObject lspContentChange(int syncKind, const QByteArray &previousText,
+                            const QByteArray &text)
+{
+  QJsonObject change;
+  // Incremental providers require a range in the OLD synchronized document. In particular,
+  // slangd treats a missing range as an insertion, so repeatedly sending the complete file
+  // without a range accumulates duplicate types/functions and thousands of false diagnostics.
+  // Replacing one whole range retains the existing debounce without deriving individual edits.
+  if(syncKind == 2)
+  {
+    QJsonObject range;
+    range[QStringLiteral("start")] = lspPosition(previousText, 0);
+    range[QStringLiteral("end")] = lspPosition(previousText, previousText.size());
+    change[QStringLiteral("range")] = range;
+  }
+  change[QStringLiteral("text")] = QString::fromUtf8(text);
+  return change;
+}
+
+bool slangNeedsWholeDocumentReopen(const QByteArray &previousText)
+{
+  // Slang 2026.20's EOF boundary map stores a UTF-8 byte count where getOffset expects a
+  // code-point index. A non-ASCII last line without a newline therefore leaves that line
+  // behind during a full-range replacement. Reopening uses the provider's normal setText
+  // path and preserves the user's exact buffer, including its final newline convention.
+  const QByteArray lastLine = previousText.mid(previousText.lastIndexOf('\n') + 1);
+  return QString::fromUtf8(lastLine).size() != lastLine.size();
+}
+
 int bytePosition(const QByteArray &text, const QJsonObject &position)
 {
   const int line = qMax(0, position.value(QStringLiteral("line")).toInt());
@@ -278,6 +313,98 @@ int bytePosition(const QByteArray &text, const QJsonObject &position)
 int utf16IndexToByte(const QString &text, int utf16Index)
 {
   return text.left(qBound(0, utf16Index, text.size())).toUtf8().size();
+}
+
+struct SemanticColorRange
+{
+  int start = 0;
+  int length = 0;
+  long color = 0;
+};
+
+long semanticTokenColor(const QString &type, bool dark)
+{
+  if(type == QStringLiteral("function") || type == QStringLiteral("method"))
+    return dark ? scintillaColour(57, 204, 155) : scintillaColour(0, 112, 82);
+  if(type == QStringLiteral("variable"))
+    return dark ? scintillaColour(156, 205, 254) : scintillaColour(38, 78, 130);
+  if(type == QStringLiteral("parameter"))
+    return dark ? scintillaColour(230, 191, 139) : scintillaColour(130, 78, 24);
+  if(type == QStringLiteral("property"))
+    return dark ? scintillaColour(185, 174, 240) : scintillaColour(103, 62, 152);
+  if(type == QStringLiteral("type") || type == QStringLiteral("class") ||
+     type == QStringLiteral("struct") || type == QStringLiteral("interface") ||
+     type == QStringLiteral("enum") || type == QStringLiteral("typeParameter") ||
+     type == QStringLiteral("namespace"))
+    return dark ? scintillaColour(78, 201, 176) : scintillaColour(0, 110, 105);
+  if(type == QStringLiteral("enumMember") || type == QStringLiteral("macro"))
+    return dark ? scintillaColour(212, 153, 220) : scintillaColour(135, 50, 130);
+  // Keywords, comments, strings and numbers remain the lexer's responsibility.
+  return -1;
+}
+
+bool decodeSemanticColorRanges(const QByteArray &text, const QJsonArray &data,
+                               const QStringList &legend, bool dark,
+                               QVector<SemanticColorRange> &ranges)
+{
+  ranges.clear();
+  if(data.size() % 5 != 0 || data.size() > 1000000 || text.size() > MaxMessageBytes)
+    return false;
+  const QString source = QString::fromUtf8(text);
+  QVector<int> lineStarts;
+  lineStarts.push_back(0);
+  for(int i = 0; i < source.size(); ++i)
+    if(source[i] == QLatin1Char('\n')) lineStarts.push_back(i + 1);
+  int line = 0, character = 0, previousEnd = 0;
+  int mappedLine = -1, lineByteStart = 0, utf16Start = 0;
+  ranges.reserve(data.size() / 5);
+  for(int index = 0; index < data.size(); index += 5)
+  {
+    int values[5];
+    for(int part = 0; part < 5; ++part)
+    {
+      const QJsonValue value = data[index + part];
+      const double number = value.toDouble(-1);
+      if(!value.isDouble() || number < 0 || number > std::numeric_limits<int>::max() ||
+         number != double(int(number)))
+        return false;
+      values[part] = int(number);
+    }
+    if(values[0] > lineStarts.size() - 1 - line) return false;
+    line += values[0];
+    if(values[0] > 0) character = 0;
+    if(values[1] > std::numeric_limits<int>::max() - character) return false;
+    character += values[1];
+    if(values[3] >= legend.size()) return false;
+    const long color = semanticTokenColor(legend[values[3]], dark);
+    // A relocated include projects its path only in the language-server text. Such
+    // string/keyword tokens are intentionally left to the lexer in the real document.
+    if(color < 0) continue;
+    const int start = lineStarts[line];
+    int end = line + 1 < lineStarts.size() ? lineStarts[line + 1] - 1 : source.size();
+    if(end > start && source[end - 1] == QLatin1Char('\r')) --end;
+    if(character > end - start || values[2] <= 0 || values[2] > end - start - character ||
+       values[3] >= legend.size())
+      return false;
+    const int tokenStart = start + character, tokenEnd = tokenStart + values[2];
+    if(tokenStart < previousEnd ||
+       (tokenStart > 0 && source[tokenStart].isLowSurrogate()) ||
+       (tokenEnd < source.size() && source[tokenEnd].isLowSurrogate()))
+      return false;
+    previousEnd = tokenEnd;
+    // Advance once through UTF-16 instead of converting the whole prefix per token.
+    // A large Shader has many identifiers: quadratic prefix conversion freezes its UI.
+    if(mappedLine != line)
+    {
+      lineByteStart += source.mid(utf16Start, start - utf16Start).toUtf8().size();
+      utf16Start = start;
+      mappedLine = line;
+    }
+    const int byteStart = lineByteStart + source.mid(start, character).toUtf8().size();
+    const int byteLength = source.mid(tokenStart, values[2]).toUtf8().size();
+    ranges.push_back({byteStart, byteLength, color});
+  }
+  return true;
 }
 
 QString normaliseLanguage(const QString &language, const QString &fileName)
@@ -565,8 +692,14 @@ struct CodeEditorService::Impl
     QPointer<ScintillaEdit> editor;
     QString fileName;
     QString uri;
+    QString includeBaseDirectory;
     QString language;
     QByteArray text;
+    QByteArray semanticText;
+    QByteArray synchronizedSemanticText;
+    bool relocatedMacroInclude = false;
+    QString sourceSha256;
+    QStringList includedFiles;
     QList<Symbol> symbols;
     QList<Diagnostic> localDiagnostics;
     QList<Diagnostic> lspDiagnostics;
@@ -582,6 +715,8 @@ struct CodeEditorService::Impl
     int coloredVersion = -1;
     QByteArray maskedText;
     int maskedVersion = -1;
+    int semanticRequestedVersion = -1;
+    quint64 semanticPaintGeneration = 0;
   };
 
   enum class PendingKind
@@ -589,6 +724,11 @@ struct CodeEditorService::Impl
     Initialize,
     Completion,
     Definition,
+    References,
+    Highlights,
+    ReferenceDefinition,
+    ReferenceCandidate,
+    SemanticTokens,
   };
 
   struct PendingRequest
@@ -600,9 +740,23 @@ struct CodeEditorService::Impl
     int version = 0;
     quint64 editRevision = 0;
     int position = -1;
-    Location localFallback;
-    QPointer<ScintillaEdit> localFallbackEditor;
+    int referenceGeneration = 0;
+    Location referenceCandidate;
+    QPointer<ScintillaEdit> candidateEditor;
     QHash<ScintillaEdit *, quint64> documentRevisions;
+  };
+
+  struct ReferenceSearch
+  {
+    PendingRequest origin;
+    Location definition;
+    QString definitionKey;
+    QString cacheKey;
+    QList<Location> candidates;
+    QList<Location> hits;
+    int generation = 0;
+    int outstanding = 0;
+    bool truncated = false;
   };
 
   struct NavigationEntry
@@ -624,7 +778,16 @@ struct CodeEditorService::Impl
     diagnosticTimer->setInterval(DiagnosticsDebounceMS);
     QObject::connect(diagnosticTimer, &QTimer::timeout, owner, [this]() { flushDirtyDocuments(); });
 
+    semanticTimer = new QTimer(owner);
+    semanticTimer->setSingleShot(true);
+    semanticTimer->setInterval(SemanticTokensDebounceMS);
+    QObject::connect(semanticTimer, &QTimer::timeout, owner, [this]() {
+      flushDirtyDocuments();
+      for(EditorState *state : states) requestSemanticTokens(state);
+    });
+
     process = new QProcess(owner);
+    ConfigureBackgroundProcess(process);
     process->setProcessChannelMode(QProcess::SeparateChannels);
     QObject::connect(process, &QProcess::started, owner, [this]() { sendInitialize(); });
     QObject::connect(process, &QProcess::readyReadStandardOutput, owner,
@@ -643,10 +806,17 @@ struct CodeEditorService::Impl
         owner, [this](int exitCode, QProcess::ExitStatus status) {
           const bool unexpected = !stopping;
           serverReady = false;
+          semanticTokenTypes.clear();
+          semanticTokensProvider = false;
           pending.clear();
+          queuedNavigation.clear();
+          referenceSearches.clear();
           receiveBuffer.clear();
           for(EditorState *state : states)
+          {
             state->openSent = false;
+            state->semanticRequestedVersion = -1;
+          }
           if(unexpected)
           {
             QString message;
@@ -681,6 +851,8 @@ struct CodeEditorService::Impl
           stopping = false;
         });
     QObject::connect(process, &QProcess::errorOccurred, owner, [this](QProcess::ProcessError) {
+      queuedNavigation.clear();
+      referenceSearches.clear();
       if(!stopping)
         reportStatus(
             QCoreApplication::translate("CodeEditorService",
@@ -692,6 +864,7 @@ struct CodeEditorService::Impl
   ~Impl()
   {
     diagnosticTimer->stop();
+    semanticTimer->stop();
     stopping = true;
     if(process->state() != QProcess::NotRunning)
     {
@@ -710,6 +883,7 @@ struct CodeEditorService::Impl
 
   CodeEditorService *owner = NULL;
   QTimer *diagnosticTimer = NULL;
+  QTimer *semanticTimer = NULL;
   QHash<ScintillaEdit *, EditorState *> states;
   QHash<QString, QList<Symbol>> symbolIndex;
   QList<NavigationEntry> backHistory;
@@ -727,6 +901,17 @@ struct CodeEditorService::Impl
   QHash<int, PendingRequest> pending;
   int nextRequestId = 1;
   bool serverReady = false;
+  int textDocumentSyncKind = 1;
+  bool definitionProvider = false;
+  bool referencesProvider = false;
+  bool highlightProvider = false;
+  bool semanticTokensProvider = false;
+  QStringList semanticTokenTypes;
+  quint64 semanticPaintSerial = 0;
+  QHash<ScintillaEdit *, PendingRequest> queuedNavigation;
+  QHash<ScintillaEdit *, ReferenceSearch> referenceSearches;
+  QHash<QString, QList<Location>> referenceCache;
+  int nextReferenceGeneration = 1;
   bool serverAttempted = false;
   bool stopping = false;
   QString lastServerError;
@@ -738,6 +923,13 @@ struct CodeEditorService::Impl
   }
 
   EditorState *stateFor(ScintillaEdit *editor) const { return states.value(editor, NULL); }
+
+  bool supportsSemanticLanguage(EditorState *state) const
+  {
+    return state && (state->language == QStringLiteral("hlsl") ||
+                     state->language == QStringLiteral("glsl") ||
+                     state->language == QStringLiteral("slang"));
+  }
 
   EditorState *stateForUri(const QString &uri) const
   {
@@ -751,8 +943,9 @@ struct CodeEditorService::Impl
 
     for(EditorState *state : states)
     {
-      if(!state->fileName.isEmpty() &&
-         QFileInfo(state->fileName).absoluteFilePath().compare(path, Qt::CaseInsensitive) == 0)
+      const QString semanticPath = pathFromUri(state->uri);
+      if(!semanticPath.isEmpty() &&
+         QFileInfo(semanticPath).absoluteFilePath().compare(path, Qt::CaseInsensitive) == 0)
         return state;
     }
     return NULL;
@@ -786,6 +979,8 @@ struct CodeEditorService::Impl
     editor->indicSetStyle(VariableNameIndicator, INDIC_TEXTFORE);
     editor->indicSetFore(VariableNameIndicator, dark ? scintillaColour(156, 205, 254)
                                                     : scintillaColour(38, 78, 130));
+    editor->indicSetStyle(SemanticNameIndicator, INDIC_TEXTFORE);
+    editor->indicSetFlags(SemanticNameIndicator, SC_INDICFLAG_VALUEFORE);
     editor->autoCSetSeparator('\n');
     editor->autoCSetIgnoreCase(true);
     editor->autoCSetAutoHide(true);
@@ -827,6 +1022,55 @@ struct CodeEditorService::Impl
     state->symbols.clear();
     const QByteArray masked = maskedCode(state->text, state->language);
     const QString source = QString::fromUtf8(masked);
+    state->includedFiles.clear();
+    // An open tab is not a translation unit dependency. Only explicit includes may extend
+    // the local navigation scope into another document (many shaders use identical names).
+    static const QRegularExpression includeDirective(
+        QStringLiteral("(?m)^\\s*#\\s*include\\s*[\"<]([^\">\\r\\n]+)[\">]"));
+    const QString original = QString::fromUtf8(state->text);
+    QString projected;
+    int copiedThrough = 0;
+    state->relocatedMacroInclude = false;
+    if(!state->includeBaseDirectory.isEmpty())
+    {
+      static const QRegularExpression macroInclude(
+          QStringLiteral("(?m)^[ \\t]*#[ \\t]*include[ \\t]+([^\"< \\t\\r\\n][^\\r\\n]*)"));
+      auto macros = macroInclude.globalMatch(original);
+      while(macros.hasNext())
+      {
+        const auto match = macros.next();
+        const int hash = original.indexOf(QLatin1Char('#'), match.capturedStart());
+        const int byte = utf16IndexToByte(original, hash);
+        if(byte >= 0 && byte < masked.size() && masked[byte] == '#')
+          state->relocatedMacroInclude = true;
+      }
+    }
+    auto includes = includeDirective.globalMatch(original);
+    while(includes.hasNext())
+    {
+      const auto match = includes.next();
+      const int hash = original.indexOf(QLatin1Char('#'), match.capturedStart());
+      const int byte = utf16IndexToByte(original, hash);
+      if(byte >= 0 && byte < masked.size() && masked[byte] == '#')
+      {
+        state->includedFiles.push_back(QDir::cleanPath(
+            (state->includeBaseDirectory.isEmpty() ? QFileInfo(state->fileName).absoluteDir()
+                                                  : QDir(state->includeBaseDirectory))
+                .absoluteFilePath(match.captured(1))));
+        if(!state->includeBaseDirectory.isEmpty() && QDir::isRelativePath(match.captured(1)))
+        {
+          // Keep the existing preview URI and all source line numbers. Slang requires an
+          // existing file for own-file definition locations, so fictitious preview URIs
+          // break navigation. Only the LSP copy receives absolute literal include paths.
+          const int start = match.capturedStart(1);
+          projected += original.mid(copiedThrough, start - copiedThrough);
+          projected += QDir::fromNativeSeparators(state->includedFiles.back());
+          copiedThrough = start + match.capturedLength(1);
+        }
+      }
+    }
+    state->semanticText = copiedThrough ? (projected + original.mid(copiedThrough)).toUtf8()
+                                       : state->text;
 
     if(state->language == QStringLiteral("python"))
     {
@@ -983,15 +1227,28 @@ struct CodeEditorService::Impl
     }
   }
 
-  void rebuildSymbolIndex()
+  void removeIndexedDocument(EditorState *state)
   {
-    symbolIndex.clear();
-    for(EditorState *state : states)
+    QSet<QString> names;
+    for(const Symbol &symbol : state->symbols)
+      names.insert(symbol.name);
+    for(const QString &name : names)
     {
-      indexDocument(state);
-      for(const Symbol &symbol : state->symbols)
-        symbolIndex[symbol.name].push_back(symbol);
+      auto found = symbolIndex.find(name);
+      if(found == symbolIndex.end()) continue;
+      QList<Symbol> &symbols = found.value();
+      for(int i = symbols.size() - 1; i >= 0; --i)
+        if(symbols[i].state == state) symbols.removeAt(i);
+      if(symbols.isEmpty()) symbolIndex.erase(found);
     }
+  }
+
+  void reindexDocument(EditorState *state)
+  {
+    removeIndexedDocument(state);
+    indexDocument(state);
+    for(const Symbol &symbol : state->symbols)
+      symbolIndex[symbol.name].push_back(symbol);
   }
 
   QList<Diagnostic> localDiagnosticsFor(EditorState *state) const
@@ -1155,7 +1412,17 @@ struct CodeEditorService::Impl
   QList<Diagnostic> combinedDiagnostics(EditorState *state) const
   {
     QList<Diagnostic> ret = state->localDiagnostics;
-    ret.append(state->lspDiagnostics);
+    // Slang's semantic service is useful for navigation/coloring in GLSL, but its
+    // GLSL dialect does not implement captured-program features such as member
+    // row_major layouts, separate samplerless textures and EXT_spirv_intrinsics.
+    // Those reports are not target-compiler errors. Keep local structural checks
+    // and actual compiler diagnostics; other providers and HLSL remain unchanged.
+    const bool partialGLSLProvider =
+        state->language == QStringLiteral("glsl") &&
+        QFileInfo(process->program()).completeBaseName().compare(QStringLiteral("slangd"),
+                                                                Qt::CaseInsensitive) == 0;
+    if(!partialGLSLProvider)
+      ret.append(state->lspDiagnostics);
     ret.append(state->externalDiagnostics);
     return ret;
   }
@@ -1198,8 +1465,10 @@ struct CodeEditorService::Impl
       if(newText != state->text)
       {
         state->text = newText;
+        state->sourceSha256 = QString::fromLatin1(
+            QCryptographicHash::hash(state->text, QCryptographicHash::Sha256).toHex());
         state->version++;
-        rebuildSymbolIndex();
+        reindexDocument(state);
         sendDidChange(state);
       }
       state->textDirty = false;
@@ -1225,6 +1494,7 @@ struct CodeEditorService::Impl
   {
     if(!state)
       return;
+    cancelRequests(state->editor.data(), true);
     state->editRevision++;
     state->textDirty = true;
     state->diagnosticsDirty = true;
@@ -1233,9 +1503,23 @@ struct CodeEditorService::Impl
     // revision. Drop their locations as soon as the buffer changes instead of leaving stale
     // squiggles attached to unrelated text.
     state->externalDiagnostics.clear();
+    for(EditorState *document : states)
+    {
+      if(document != state && !documentInScope(document, state->fileName, state)) continue;
+      document->semanticRequestedVersion = -1;
+      document->semanticPaintGeneration = ++semanticPaintSerial;
+      if(document->editor)
+      {
+        const int previous = int(document->editor->indicatorCurrent());
+        document->editor->setIndicatorCurrent(SemanticNameIndicator);
+        document->editor->indicatorClearRange(0, document->editor->length());
+        document->editor->setIndicatorCurrent(previous);
+      }
+    }
     if(referencesMenu)
       referencesMenu->close();
     diagnosticTimer->start();
+    semanticTimer->start();
   }
 
   void moveHistoryForEdit(EditorState *state, int type, int position, int length)
@@ -1274,12 +1558,13 @@ struct CodeEditorService::Impl
   }
 
   Location resolveDefinition(EditorState *sourceState, int wordPosition, const QString &word,
-                             int depth = 0)
+                             int depth = 0, const QByteArray *maskedSource = NULL)
   {
     Location ret;
     if(depth > 8) return ret;
     const QList<Symbol> candidates = symbolIndex.value(word);
-    const QByteArray masked = maskedCode(sourceState->text, sourceState->language);
+    const QByteArray masked = maskedSource ? *maskedSource
+                                          : maskedCode(sourceState->text, sourceState->language);
     int previous = wordPosition - 1;
     while(previous >= 0 && isspace(static_cast<unsigned char>(masked[previous]))) --previous;
     const bool member = previous >= 0 && masked[previous] == '.';
@@ -1288,22 +1573,44 @@ struct CodeEditorService::Impl
     {
       --previous;
       while(previous >= 0 && isspace(static_cast<unsigned char>(masked[previous]))) --previous;
+      // Resolve the receiver of an indexed field (lights[index].color), including nested
+      // indices. The array subscript does not change its declared element type.
+      while(previous >= 0 && masked[previous] == ']')
+      {
+        int nesting = 1;
+        while(--previous >= 0 && nesting > 0)
+        {
+          if(masked[previous] == ']') ++nesting;
+          else if(masked[previous] == '[') --nesting;
+        }
+        while(previous >= 0 && isspace(static_cast<unsigned char>(masked[previous]))) --previous;
+      }
       QPair<int, int> range;
       const QString object = identifierAt(masked, previous, &range);
-      const Location ownerLocation = resolveDefinition(sourceState, range.first, object, depth + 1);
+      const Location ownerLocation =
+          resolveDefinition(sourceState, range.first, object, depth + 1, maskedSource);
       for(const Symbol &ownerSymbol : symbolIndex.value(object))
         if(ownerSymbol.state && ownerSymbol.state->editor == ownerLocation.editor &&
            ownerSymbol.position == ownerLocation.position)
           memberType = ownerSymbol.valueType;
       if(memberType.isEmpty()) return ret;
+      static const QRegularExpression vectorType(
+          QStringLiteral("^(?:float|half|double|int|uint|bool|min16float|min16int|min16uint)[1-4]$"));
+      static const QRegularExpression swizzle(QStringLiteral("^(?:[xyzw]{1,4}|[rgba]{1,4})$"));
+      if(vectorType.match(memberType).hasMatch() && swizzle.match(word).hasMatch())
+        return ownerLocation;
     }
     const Symbol *best = NULL;
+    int visibleFunctions = 0;
     qint64 bestScore = std::numeric_limits<qint64>::min();
     for(const Symbol &candidate : candidates)
     {
       if(!candidate.state || !candidate.state->editor)
         continue;
+      if(!documentInScope(sourceState, candidate.state->fileName, candidate.state))
+        continue;
       const bool atDeclaration = candidate.state == sourceState && candidate.position == wordPosition;
+      if(!candidate.signature.isEmpty() && !atDeclaration) ++visibleFunctions;
       if(!atDeclaration)
       {
         if(member && candidate.ownerType != memberType) continue;
@@ -1330,6 +1637,10 @@ struct CodeEditorService::Impl
 
     if(!best)
       return ret;
+    // The fallback lexer cannot select an overload by argument types. Let the compiler
+    // provider resolve it instead of navigating to whichever declaration is nearest.
+    if(!best->signature.isEmpty() && visibleFunctions > 1 && best->position != wordPosition)
+      return ret;
 
     ret.editor = best->state->editor.data();
     ret.fileName = best->state->fileName;
@@ -1337,6 +1648,32 @@ struct CodeEditorService::Impl
     ret.line = int(ret.editor->lineFromPosition(ret.position));
     ret.column = ret.position - int(ret.editor->positionFromLine(ret.line));
     return ret;
+  }
+
+  bool documentInScope(EditorState *source, const QString &targetPath,
+                       EditorState *target = NULL) const
+  {
+    if(source == target) return true;
+    if(!source || targetPath.isEmpty()) return false;
+    const QString targetKey = QDir::cleanPath(QFileInfo(targetPath).absoluteFilePath());
+    QList<EditorState *> pendingDocuments = {source};
+    QSet<EditorState *> visited;
+    while(!pendingDocuments.isEmpty())
+    {
+      EditorState *document = pendingDocuments.takeLast();
+      if(visited.contains(document)) continue;
+      visited.insert(document);
+      for(const QString &included : document->includedFiles)
+      {
+        if(included.compare(targetKey, Qt::CaseInsensitive) == 0) return true;
+        for(EditorState *open : states)
+          if(!visited.contains(open) &&
+             QDir::cleanPath(QFileInfo(open->fileName).absoluteFilePath())
+                     .compare(included, Qt::CaseInsensitive) == 0)
+            pendingDocuments.push_back(open);
+      }
+    }
+    return false;
   }
 
   void deliverDefinition(const Location &location)
@@ -1826,7 +2163,7 @@ struct CodeEditorService::Impl
         if((found > 0 && isIdentifierByte(masked[found - 1])) ||
            (offset < masked.size() && isIdentifierByte(masked[offset]))) continue;
         if(state->editor == definition.editor && found == definition.position) continue;
-        const Location resolved = resolveDefinition(state, found, word);
+        const Location resolved = resolveDefinition(state, found, word, 0, &masked);
         if(resolved.editor != definition.editor || resolved.position != definition.position) continue;
         const Location target = navigationLocation(navigationEntry(state->editor, found));
         const int start = int(state->editor->positionFromLine(target.line));
@@ -2103,7 +2440,13 @@ struct CodeEditorService::Impl
       return resolvedProgram;
     }
 
-    resolvedProgram = QStandardPaths::findExecutable(QStringLiteral("shader-language-server"));
+    // The first-party distribution includes a pinned compiler-backed semantic provider.
+    const QString bundled = QDir(QCoreApplication::applicationDirPath()).filePath(
+        QStringLiteral("integrations/shader-language-server/slangd.exe"));
+    if(QFileInfo(bundled).isExecutable())
+      resolvedProgram = bundled;
+    if(resolvedProgram.isEmpty())
+      resolvedProgram = QStandardPaths::findExecutable(QStringLiteral("shader-language-server"));
     if(resolvedProgram.isEmpty())
       resolvedProgram = QStandardPaths::findExecutable(QStringLiteral("slangd"));
     return resolvedProgram;
@@ -2127,6 +2470,7 @@ struct CodeEditorService::Impl
     receiveBuffer.clear();
     pending.clear();
     serverReady = false;
+    definitionProvider = referencesProvider = highlightProvider = false;
     stopping = false;
     lastServerError.clear();
 
@@ -2206,11 +2550,30 @@ struct CodeEditorService::Impl
     QJsonObject textDocument;
     textDocument[QStringLiteral("completion")] = QJsonObject();
     textDocument[QStringLiteral("definition")] = QJsonObject();
+    textDocument[QStringLiteral("references")] = QJsonObject();
+    textDocument[QStringLiteral("documentHighlight")] = QJsonObject();
     textDocument[QStringLiteral("publishDiagnostics")] = QJsonObject();
+    QJsonObject semanticTokens;
+    semanticTokens[QStringLiteral("requests")] = QJsonObject{{QStringLiteral("full"), true}};
+    semanticTokens[QStringLiteral("tokenTypes")] = QJsonArray{
+        QStringLiteral("type"), QStringLiteral("class"), QStringLiteral("struct"),
+        QStringLiteral("interface"), QStringLiteral("enum"), QStringLiteral("typeParameter"),
+        QStringLiteral("enumMember"), QStringLiteral("variable"), QStringLiteral("parameter"),
+        QStringLiteral("function"), QStringLiteral("method"), QStringLiteral("property"),
+        QStringLiteral("namespace"), QStringLiteral("macro"), QStringLiteral("keyword"),
+        QStringLiteral("string")};
+    semanticTokens[QStringLiteral("tokenModifiers")] = QJsonArray();
+    semanticTokens[QStringLiteral("formats")] = QJsonArray{QStringLiteral("relative")};
+    semanticTokens[QStringLiteral("overlappingTokenSupport")] = false;
+    semanticTokens[QStringLiteral("multilineTokenSupport")] = false;
+    textDocument[QStringLiteral("semanticTokens")] = semanticTokens;
     capabilities[QStringLiteral("textDocument")] = textDocument;
+    QJsonObject workspace;
+    workspace[QStringLiteral("configuration")] = true;
+    capabilities[QStringLiteral("workspace")] = workspace;
 
     QJsonObject clientInfo;
-    clientInfo[QStringLiteral("name")] = QStringLiteral("RenderDoc Ultra");
+    clientInfo[QStringLiteral("name")] = QStringLiteral("Bread");
     clientInfo[QStringLiteral("version")] = QStringLiteral("1");
 
     QJsonObject params;
@@ -2232,21 +2595,34 @@ struct CodeEditorService::Impl
 
     PendingRequest request;
     request.kind = PendingKind::Initialize;
-    sendRequest(QStringLiteral("initialize"), params, request);
+    const int id = sendRequest(QStringLiteral("initialize"), params, request);
+    QTimer::singleShot(15000, owner, [this, id]() {
+      if(id < 0 || !pending.contains(id)) return;
+      queuedNavigation.clear();
+      reportStatus(QCoreApplication::translate("CodeEditorService",
+          "Shader language server initialization timed out."));
+      stopping = true;
+      process->kill();
+    });
   }
 
   void sendDidOpen(EditorState *state)
   {
-    if(!serverReady || !state || state->openSent)
+    if(!serverReady || !supportsSemanticLanguage(state) || state->openSent || state->relocatedMacroInclude)
       return;
     QJsonObject item;
     item[QStringLiteral("uri")] = state->uri;
     item[QStringLiteral("languageId")] = state->language;
     item[QStringLiteral("version")] = state->version;
-    item[QStringLiteral("text")] = QString::fromUtf8(state->text);
+    item[QStringLiteral("text")] = QString::fromUtf8(state->semanticText);
     QJsonObject params;
     params[QStringLiteral("textDocument")] = item;
     state->openSent = sendNotification(QStringLiteral("textDocument/didOpen"), params);
+    if(state->openSent)
+    {
+      state->synchronizedSemanticText = state->semanticText;
+      semanticTimer->start();
+    }
   }
 
   void sendDidClose(EditorState *state)
@@ -2265,8 +2641,24 @@ struct CodeEditorService::Impl
   {
     if(!serverReady || !state)
       return;
+    if(state->relocatedMacroInclude)
+    {
+      sendDidClose(state);
+      return;
+    }
     if(!state->openSent)
     {
+      sendDidOpen(state);
+      return;
+    }
+    if(textDocumentSyncKind == 0 ||
+       (textDocumentSyncKind == 2 &&
+        QFileInfo(resolvedProgram).completeBaseName().compare(QStringLiteral("slangd"),
+                                                             Qt::CaseInsensitive) == 0 &&
+        slangNeedsWholeDocumentReopen(state->synchronizedSemanticText)))
+    {
+      // Reopen when changes are unsupported, or for the bundled provider's Unicode EOF bug.
+      sendDidClose(state);
       sendDidOpen(state);
       return;
     }
@@ -2274,14 +2666,75 @@ struct CodeEditorService::Impl
     QJsonObject document;
     document[QStringLiteral("uri")] = state->uri;
     document[QStringLiteral("version")] = state->version;
-    QJsonObject change;
-    change[QStringLiteral("text")] = QString::fromUtf8(state->text);
     QJsonArray changes;
-    changes.append(change);
+    changes.append(lspContentChange(textDocumentSyncKind, state->synchronizedSemanticText,
+                                   state->semanticText));
     QJsonObject params;
     params[QStringLiteral("textDocument")] = document;
     params[QStringLiteral("contentChanges")] = changes;
-    sendNotification(QStringLiteral("textDocument/didChange"), params);
+    if(sendNotification(QStringLiteral("textDocument/didChange"), params))
+      state->synchronizedSemanticText = state->semanticText;
+    semanticTimer->start();
+  }
+
+  void requestSemanticTokens(EditorState *state)
+  {
+    if(!serverReady || !semanticTokensProvider || !state || !state->editor ||
+       !state->openSent || state->textDirty || state->relocatedMacroInclude ||
+       state->semanticRequestedVersion == state->version)
+      return;
+    state->semanticRequestedVersion = state->version;
+    PendingRequest request;
+    request.kind = PendingKind::SemanticTokens;
+    request.editor = state->editor;
+    request.sourceEditor = state->editor.data();
+    request.version = state->version;
+    request.editRevision = state->editRevision;
+    for(EditorState *document : states)
+      if(documentInScope(state, document->fileName, document))
+        request.documentRevisions.insert(document->editor.data(), document->editRevision);
+    QJsonObject document;
+    document[QStringLiteral("uri")] = state->uri;
+    QJsonObject params;
+    params[QStringLiteral("textDocument")] = document;
+    const int id = sendRequest(QStringLiteral("textDocument/semanticTokens/full"), params, request);
+    if(id >= 0)
+      QTimer::singleShot(15000, owner, [this, id]() {
+        if(!pending.contains(id)) return;
+        QJsonObject params;
+        params[QStringLiteral("id")] = id;
+        sendNotification(QStringLiteral("$/cancelRequest"), params);
+        pending.remove(id);
+        // A slow or unsupported provider must not disable editing or produce repeated popups.
+        // Retain lexical colors, and retry only when the document changes.
+      });
+  }
+
+  void paintSemanticTokens(const QPointer<ScintillaEdit> &editor, int version,
+                           quint64 editRevision, quint64 generation,
+                           const std::shared_ptr<QVector<SemanticColorRange>> &ranges, int offset)
+  {
+    EditorState *state = stateFor(editor.data());
+    if(!state || !editor || state->version != version || state->editRevision != editRevision ||
+       state->textDirty || state->semanticPaintGeneration != generation)
+      return;
+    const int previousIndicator = int(editor->indicatorCurrent());
+    const int previousValue = int(editor->indicatorValue());
+    editor->setIndicatorCurrent(SemanticNameIndicator);
+    if(offset == 0) editor->indicatorClearRange(0, editor->length());
+    const int end = qMin(offset + SemanticPaintBatchSize, ranges->size());
+    for(int i = offset; i < end; ++i)
+    {
+      const SemanticColorRange &range = (*ranges)[i];
+      editor->setIndicatorValue(SC_INDICVALUEBIT | range.color);
+      editor->indicatorFillRange(range.start, range.length);
+    }
+    editor->setIndicatorCurrent(previousIndicator);
+    editor->setIndicatorValue(previousValue);
+    if(end < ranges->size())
+      QTimer::singleShot(0, owner, [this, editor, version, editRevision, generation, ranges, end]() {
+        paintSemanticTokens(editor, version, editRevision, generation, ranges, end);
+      });
   }
 
   void requestLspCompletion(EditorState *state, const QString &prefix)
@@ -2307,27 +2760,247 @@ struct CodeEditorService::Impl
     sendRequest(QStringLiteral("textDocument/completion"), params, request);
   }
 
-  bool requestLspDefinition(EditorState *state, int position, const Location &fallback)
+  void cancelRequests(ScintillaEdit *editor, bool dependencies)
   {
-    if(!serverReady || !state || !state->openSent || !state->editor)
-      return false;
-    QJsonObject document;
-    document[QStringLiteral("uri")] = state->uri;
-    QJsonObject params;
-    params[QStringLiteral("textDocument")] = document;
-    params[QStringLiteral("position")] = lspPosition(state->text, position);
+    if(dependencies) referenceCache.clear();
+    queuedNavigation.remove(editor);
+    for(auto it = referenceSearches.begin(); it != referenceSearches.end();)
+    {
+      if(it.key() == editor || (dependencies && it->origin.documentRevisions.contains(editor)))
+        it = referenceSearches.erase(it);
+      else ++it;
+    }
+    for(auto it = pending.begin(); it != pending.end();)
+    {
+      // Moving the caret or requesting F12 cancels navigation, not document coloring.
+      if(it->kind == PendingKind::SemanticTokens && !dependencies)
+      {
+        ++it;
+        continue;
+      }
+      if(it->sourceEditor != editor &&
+         !(dependencies && it->documentRevisions.contains(editor)))
+      {
+        ++it;
+        continue;
+      }
+      QJsonObject params;
+      params[QStringLiteral("id")] = it.key();
+      sendNotification(QStringLiteral("$/cancelRequest"), params);
+      it = pending.erase(it);
+    }
+  }
+
+  void cancelMovedNavigation(EditorState *state)
+  {
+    if(!state || !state->editor) return;
+    const int position = int(state->editor->currentPos());
+    const auto queued = queuedNavigation.constFind(state->editor.data());
+    bool moved = queued != queuedNavigation.constEnd() && queued->position != position;
+    for(const PendingRequest &request : pending)
+      if(request.kind != PendingKind::SemanticTokens &&
+         request.sourceEditor == state->editor.data() && request.position != position)
+        moved = true;
+    if(moved) cancelRequests(state->editor.data(), false);
+  }
+
+  bool requestLspNavigation(EditorState *state, int position, bool references)
+  {
+    if(!supportsSemanticLanguage(state) || !state->editor || findServerProgram().isEmpty()) return false;
+    // A semantic request owns this action even while the server starts. Never turn a
+    // startup race, an unresolved overload, or an empty compiler result into a name match.
+    cancelRequests(state->editor.data(), false);
+    for(EditorState *document : states) syncText(document, false);
+    if(state->relocatedMacroInclude)
+    {
+      reportStatus(QCoreApplication::translate("CodeEditorService",
+          "Semantic navigation for macro includes is unavailable in relocated previews. Open the source document to navigate this symbol."));
+      return true;
+    }
     PendingRequest request;
-    request.kind = PendingKind::Definition;
+    request.kind = references ? PendingKind::References : PendingKind::Definition;
     request.editor = state->editor;
     request.sourceEditor = state->editor.data();
     request.version = state->version;
     request.editRevision = state->editRevision;
     request.position = position;
-    request.localFallback = fallback;
-    request.localFallbackEditor = fallback.editor;
-    for(EditorState *documentState : states)
-      request.documentRevisions.insert(documentState->editor.data(), documentState->editRevision);
-    return sendRequest(QStringLiteral("textDocument/definition"), params, request) >= 0;
+    for(EditorState *document : states)
+      if(documentInScope(state, document->fileName, document))
+        request.documentRevisions.insert(document->editor.data(), document->editRevision);
+    if(!serverReady)
+    {
+      if(startServer(false)) queuedNavigation[state->editor.data()] = request;
+      return true;
+    }
+    QString method = QStringLiteral("textDocument/definition");
+    if(references)
+    {
+      if(referencesProvider) method = QStringLiteral("textDocument/references");
+      else if(highlightProvider)
+      {
+        method = QStringLiteral("textDocument/documentHighlight");
+        request.kind = PendingKind::Highlights;
+      }
+      else if(definitionProvider)
+      {
+        // Compiler-backed providers such as slangd expose definitions but no references.
+        // Resolve the selected declaration first, then check a bounded set of candidates.
+        method = QStringLiteral("textDocument/definition");
+        request.kind = PendingKind::ReferenceDefinition;
+      }
+      else
+      {
+        reportStatus(QCoreApplication::translate("CodeEditorService",
+            "The connected language server does not provide semantic references."));
+        return true;
+      }
+    }
+    else if(!definitionProvider)
+    {
+      reportStatus(QCoreApplication::translate("CodeEditorService",
+          "The connected language server does not provide semantic definitions."));
+      return true;
+    }
+    sendDidOpen(state);
+    QJsonObject document;
+    document[QStringLiteral("uri")] = state->uri;
+    QJsonObject params;
+    params[QStringLiteral("textDocument")] = document;
+    params[QStringLiteral("position")] = lspPosition(state->text, position);
+    if(references)
+    {
+      QJsonObject context;
+      context[QStringLiteral("includeDeclaration")] = false;
+      params[QStringLiteral("context")] = context;
+    }
+    const int id = sendRequest(method, params, request);
+    if(id >= 0)
+      QTimer::singleShot(8000, owner, [this, id]() {
+        if(!pending.contains(id)) return;
+        QJsonObject params;
+        params[QStringLiteral("id")] = id;
+        sendNotification(QStringLiteral("$/cancelRequest"), params);
+        pending.remove(id);
+        reportStatus(QCoreApplication::translate("CodeEditorService",
+            "Semantic navigation timed out. The editor remains available; try again after indexing."));
+      });
+    return true;
+  }
+
+  bool sameSemanticLocation(const Location &a, const Location &b) const
+  {
+    return a.line == b.line && a.column == b.column &&
+           QDir::cleanPath(QFileInfo(a.fileName).absoluteFilePath()).compare(
+               QDir::cleanPath(QFileInfo(b.fileName).absoluteFilePath()), Qt::CaseInsensitive) == 0;
+  }
+
+  QString semanticLocationKey(const QJsonValue &result) const
+  {
+    const QJsonObject value = result.toObject();
+    const QString uri = value.value(value.contains(QStringLiteral("targetUri"))
+                                       ? QStringLiteral("targetUri") : QStringLiteral("uri")).toString();
+    const QString file = pathFromUri(uri);
+    if(file.isEmpty()) return QString();
+    const QJsonObject range = value.value(value.contains(QStringLiteral("targetSelectionRange"))
+                                             ? QStringLiteral("targetSelectionRange")
+                                             : QStringLiteral("range")).toObject();
+    if(!range.contains(QStringLiteral("start")) || !range.contains(QStringLiteral("end")))
+      return QString();
+    return QDir::cleanPath(QFileInfo(file).absoluteFilePath()).toCaseFolded() +
+           QString::fromUtf8(QJsonDocument(range).toJson(QJsonDocument::Compact));
+  }
+
+  void pumpReferenceSearch(ScintillaEdit *editor)
+  {
+    auto it = referenceSearches.find(editor);
+    if(it == referenceSearches.end()) return;
+    ReferenceSearch &search = it.value();
+    while(search.outstanding < 8 && !search.candidates.isEmpty())
+    {
+      const Location candidate = search.candidates.takeFirst();
+      EditorState *document = stateFor(candidate.editor);
+      if(!document) continue;
+      PendingRequest request = search.origin;
+      request.kind = PendingKind::ReferenceCandidate;
+      request.referenceGeneration = search.generation;
+      request.referenceCandidate = candidate;
+      request.candidateEditor = document->editor;
+      QJsonObject params;
+      QJsonObject textDocument;
+      textDocument[QStringLiteral("uri")] = document->uri;
+      params[QStringLiteral("textDocument")] = textDocument;
+      params[QStringLiteral("position")] = lspPosition(document->text, candidate.position);
+      if(sendRequest(QStringLiteral("textDocument/definition"), params, request) >= 0)
+        ++search.outstanding;
+    }
+    if(search.outstanding || !search.candidates.isEmpty()) return;
+    const ReferenceSearch complete = search;
+    referenceSearches.erase(it);
+    EditorState *source = stateFor(editor);
+    if(!source) return;
+    if(referenceCache.size() >= 32) referenceCache.clear();
+    if(!complete.truncated) referenceCache[complete.cacheKey] = complete.hits;
+    showSemanticLocations(source, complete.origin, complete.hits);
+    if(complete.truncated)
+      reportStatus(QCoreApplication::translate("CodeEditorService",
+          "Semantic reference search checked the first 256 candidates in this compilation unit."));
+  }
+
+  void startReferenceSearch(EditorState *source, const PendingRequest &request, const Location &definition,
+                            const QString &definitionKey)
+  {
+    ReferenceSearch search;
+    search.origin = request;
+    search.origin.kind = PendingKind::References;
+    search.definition = definition;
+    search.definitionKey = definitionKey;
+    QStringList revisions;
+    for(auto it = request.documentRevisions.constBegin(); it != request.documentRevisions.constEnd(); ++it)
+      if(stateFor(it.key()))
+        revisions.push_back(stateFor(it.key())->uri + QString::number(it.value()));
+    revisions.sort();
+    search.cacheKey = source->uri + definitionKey + revisions.join(QLatin1Char('\n'));
+    if(referenceCache.contains(search.cacheKey))
+    {
+      showSemanticLocations(source, search.origin, referenceCache.value(search.cacheKey));
+      return;
+    }
+    search.generation = nextReferenceGeneration++;
+    const QByteArray needle = identifierAt(source->text, request.position).toUtf8();
+    if(needle.isEmpty()) return;
+    reportStatus(QCoreApplication::translate("CodeEditorService",
+        "Finding semantic references in open documents of this compilation unit..."));
+    // Token scanning only limits work. A hit is accepted exclusively after the compiler
+    // resolves it to the exact declaration, so overloads, fields and shadows stay distinct.
+    for(EditorState *document : states)
+    {
+      if(!request.documentRevisions.contains(document->editor.data())) continue;
+      const QByteArray masked = maskedCode(document->text, document->language);
+      int offset = 0;
+      while((offset = masked.indexOf(needle, offset)) >= 0)
+      {
+        const int found = offset;
+        offset += needle.size();
+        if((found && isIdentifierByte(masked[found - 1])) ||
+           (offset < masked.size() && isIdentifierByte(masked[offset]))) continue;
+        Location candidate = navigationLocation(navigationEntry(document->editor.data(), found));
+        if(sameSemanticLocation(candidate, definition)) continue;
+        if(search.candidates.size() == 256) { search.truncated = true; break; }
+        search.candidates.push_back(candidate);
+      }
+      if(search.truncated) break;
+    }
+    referenceSearches[source->editor.data()] = search;
+    const QPointer<ScintillaEdit> editor = source->editor;
+    const int generation = search.generation;
+    QTimer::singleShot(8000, owner, [this, editor, generation]() {
+      if(!editor || !referenceSearches.contains(editor.data()) ||
+         referenceSearches[editor.data()].generation != generation) return;
+      cancelRequests(editor.data(), false);
+      reportStatus(QCoreApplication::translate("CodeEditorService",
+          "Semantic navigation timed out. The editor remains available; try again after indexing."));
+    });
+    pumpReferenceSearch(source->editor.data());
   }
 
   void rejectServerRequest(const QJsonObject &object)
@@ -2519,6 +3192,53 @@ struct CodeEditorService::Impl
     return location;
   }
 
+  void showSemanticLocations(EditorState *source, const PendingRequest &request,
+                             const QList<Location> &locations)
+  {
+    if(locations.isEmpty())
+    {
+      reportStatus(QCoreApplication::translate("CodeEditorService",
+          "The language server found no semantic target for the selected symbol."));
+      return;
+    }
+    if(locations.size() == 1)
+    {
+      navigateToDefinition(locations.front(), source->editor.data(), request.position);
+      return;
+    }
+    if(referencesMenu) referencesMenu->close();
+    QMenu *menu = new QMenu(source->editor);
+    referencesMenu = menu;
+    menu->setObjectName(QStringLiteral("shaderReferencesPopup")); // i18n-ignore: automation id.
+    menu->setAttribute(Qt::WA_DeleteOnClose);
+    const QString word = identifierAt(source->text, request.position);
+    menu->addSection(request.kind == PendingKind::Definition
+        ? QCoreApplication::translate("CodeEditorService", "Definitions of %1").arg(word)
+        : QCoreApplication::translate("CodeEditorService", "References to %1").arg(word));
+    for(const Location &location : locations)
+    {
+      QAction *action = menu->addAction(
+          QCoreApplication::translate("CodeEditorService", "%1:%2")
+              .arg(QFileInfo(location.fileName).fileName()).arg(location.line + 1));
+      action->setData(location.line + 1);
+      const QPointer<ScintillaEdit> target = location.editor;
+      const bool openTarget = location.editor != NULL;
+      QObject::connect(action, &QAction::triggered, owner,
+                       [this, request, location, target, openTarget]() {
+        EditorState *origin = stateFor(request.editor.data());
+        if(!origin || origin->editRevision != request.editRevision || (openTarget && !target)) return;
+        for(auto it = request.documentRevisions.constBegin(); it != request.documentRevisions.constEnd(); ++it)
+          if(!stateFor(it.key()) || stateFor(it.key())->editRevision != it.value()) return;
+        navigateToDefinition(location, request.editor.data(), request.position);
+      });
+    }
+    ScintillaEdit *editor = source->editor;
+    const QPoint local(int(editor->pointXFromPosition(request.position)),
+                       int(editor->pointYFromPosition(request.position) +
+                           editor->textHeight(editor->lineFromPosition(request.position))));
+    menu->popup(editor->mapToGlobal(local));
+  }
+
   void handleServerResponse(const QJsonObject &object)
   {
     const int id = object.value(QStringLiteral("id")).toInt(-1);
@@ -2538,9 +3258,39 @@ struct CodeEditorService::Impl
         return;
       }
       serverReady = true;
+      const QJsonObject capabilities = result.toObject().value(QStringLiteral("capabilities")).toObject();
+      const QJsonValue sync = capabilities.value(QStringLiteral("textDocumentSync"));
+      textDocumentSyncKind = sync.isObject()
+                                 ? sync.toObject().value(QStringLiteral("change")).toInt(1)
+                                 : sync.toInt(1);
+      auto supported = [&](const char *key) {
+        const QJsonValue value = capabilities.value(QString::fromLatin1(key));
+        return value.isObject() || value.toBool(false);
+      };
+      definitionProvider = supported("definitionProvider");
+      referencesProvider = supported("referencesProvider");
+      highlightProvider = supported("documentHighlightProvider");
+      const QJsonObject semanticProvider =
+          capabilities.value(QStringLiteral("semanticTokensProvider")).toObject();
+      const QJsonValue fullTokens = semanticProvider.value(QStringLiteral("full"));
+      semanticTokensProvider = fullTokens.toBool(false) || fullTokens.isObject();
+      semanticTokenTypes.clear();
+      for(const QJsonValue &type : semanticProvider.value(QStringLiteral("legend")).toObject()
+                                      .value(QStringLiteral("tokenTypes")).toArray())
+        semanticTokenTypes.push_back(type.toString());
+      semanticTokensProvider &= !semanticTokenTypes.isEmpty();
       sendNotification(QStringLiteral("initialized"), QJsonObject());
       for(EditorState *state : states)
         sendDidOpen(state);
+      const auto queued = queuedNavigation;
+      queuedNavigation.clear();
+      for(const PendingRequest &navigation : queued)
+      {
+        EditorState *state = stateFor(navigation.editor.data());
+        if(state && state->editRevision == navigation.editRevision &&
+           state->editor->currentPos() == navigation.position)
+          requestLspNavigation(state, navigation.position, navigation.kind == PendingKind::References);
+      }
       reportStatus(QCoreApplication::translate("CodeEditorService",
                                                "Shader language server connected: %1")
                        .arg(resolvedProgram));
@@ -2553,7 +3303,27 @@ struct CodeEditorService::Impl
          state->editor->currentPos() == request.position)
         showCompletions(state, request.prefix, completionLabels(result));
     }
-    else if(request.kind == PendingKind::Definition)
+    else if(request.kind == PendingKind::SemanticTokens)
+    {
+      EditorState *state = stateFor(request.editor.data());
+      if(!state || !state->editor || state->version != request.version ||
+         state->editRevision != request.editRevision || state->textDirty ||
+         object.contains(QStringLiteral("error")))
+        return;
+      for(auto it = request.documentRevisions.constBegin(); it != request.documentRevisions.constEnd(); ++it)
+        if(!stateFor(it.key()) || stateFor(it.key())->editRevision != it.value()) return;
+      const QJsonValue data = result.toObject().value(QStringLiteral("data"));
+      if(!data.isArray()) return;
+      auto ranges = std::make_shared<QVector<SemanticColorRange>>();
+      const bool dark = state->editor->palette().color(QPalette::Base).lightness() < 128;
+      if(!decodeSemanticColorRanges(state->text, data.toArray(), semanticTokenTypes, dark, *ranges))
+        return;
+      paintSemanticTokens(state->editor, state->version, state->editRevision,
+                          state->semanticPaintGeneration = ++semanticPaintSerial, ranges, 0);
+    }
+    else if(request.kind == PendingKind::Definition || request.kind == PendingKind::References ||
+            request.kind == PendingKind::Highlights || request.kind == PendingKind::ReferenceDefinition ||
+            request.kind == PendingKind::ReferenceCandidate)
     {
       EditorState *sourceState = stateFor(request.editor.data());
       if(!sourceState || sourceState->version != request.version ||
@@ -2567,18 +3337,85 @@ struct CodeEditorService::Impl
         EditorState *documentState = stateFor(it.key());
         if(!documentState || documentState->editRevision != it.value()) return;
       }
-      const Location location = locationFromLsp(result);
-      if(location.editor || !location.fileName.isEmpty())
-        navigateToDefinition(location, request.editor.data(), request.position);
-      else if(request.localFallbackEditor)
+      if(object.contains(QStringLiteral("error")))
       {
-        Location fallback = request.localFallback;
-        fallback.editor = request.localFallbackEditor.data();
-        navigateToDefinition(fallback, request.editor.data(), request.position);
+        cancelRequests(request.sourceEditor, false);
+        reportStatus(QCoreApplication::translate("CodeEditorService", "Semantic navigation failed: %1")
+                         .arg(object.value(QStringLiteral("error")).toObject()
+                                  .value(QStringLiteral("message")).toString().left(1024)));
+        return;
       }
-      else
-        reportStatus(QCoreApplication::translate(
-            "CodeEditorService", "No definition was found for the selected symbol"));
+      if(request.kind == PendingKind::ReferenceCandidate)
+      {
+        auto search = referenceSearches.find(request.sourceEditor);
+        if(search == referenceSearches.end() || search->generation != request.referenceGeneration ||
+           !request.candidateEditor) return;
+        const QJsonArray resolved = result.isArray() ? result.toArray() : QJsonArray{result};
+        for(const QJsonValue &candidateDefinition : resolved)
+          if(!search->definitionKey.isEmpty() &&
+             semanticLocationKey(candidateDefinition) == search->definitionKey)
+          {
+            search->hits.push_back(request.referenceCandidate);
+            break;
+          }
+        --search->outstanding;
+        pumpReferenceSearch(request.sourceEditor);
+        return;
+      }
+      QList<Location> locations;
+      const QJsonArray values = result.isArray() ? result.toArray() : QJsonArray{result};
+      for(const QJsonValue &item : values)
+      {
+        QJsonObject value = item.toObject();
+        if(request.kind == PendingKind::Highlights)
+          value[QStringLiteral("uri")] = sourceState->uri;
+        Location location = locationFromLsp(value);
+        if(location.line < 0 || location.column < 0 ||
+           (!location.editor && location.fileName.isEmpty())) continue;
+        if(!documentInScope(sourceState, location.fileName, stateFor(location.editor)))
+        {
+          // A compiler can resolve macro or transitive includes that the lightweight index
+          // cannot see. Route that exact URI to the owning document model for dependency
+          // authorization; never select an unrelated existing tab by its symbol or basename.
+          location.editor = NULL;
+          location.position = -1;
+        }
+        if((request.kind == PendingKind::References || request.kind == PendingKind::Highlights) &&
+           location.editor == sourceState->editor &&
+           location.position == identifierRange(sourceState->text, request.position).first) continue;
+        locations.push_back(location);
+        if(locations.size() >= 256) break;
+      }
+      if(locations.isEmpty() && (request.kind == PendingKind::Definition ||
+                                 request.kind == PendingKind::ReferenceDefinition))
+      {
+        // slangd intentionally returns no definition when the cursor is already on a
+        // declaration. Its exact token range can seed reference lookup: every returned
+        // hit must still resolve to that URI AND full range through the compiler.
+        const auto token = identifierRange(sourceState->text, request.position);
+        const Location declaration = localDefinition(sourceState, request.position);
+        if(declaration.editor == sourceState->editor && declaration.position == token.first)
+        {
+          QJsonObject range, identity;
+          range[QStringLiteral("start")] = lspPosition(sourceState->text, token.first);
+          range[QStringLiteral("end")] = lspPosition(sourceState->text, token.second);
+          identity[QStringLiteral("uri")] = sourceState->uri;
+          identity[QStringLiteral("range")] = range;
+          startReferenceSearch(sourceState, request, declaration, semanticLocationKey(identity));
+          return;
+        }
+      }
+      if(request.kind == PendingKind::ReferenceDefinition && locations.size() == 1)
+      {
+        startReferenceSearch(sourceState, request, locations.front(),
+                             semanticLocationKey(values.isEmpty() ? QJsonValue() : values.first()));
+        return;
+      }
+      if(request.kind == PendingKind::Definition && locations.size() == 1 &&
+         locations.front().editor == sourceState->editor &&
+         locations.front().position == identifierRange(sourceState->text, request.position).first)
+        requestLspNavigation(sourceState, request.position, true);
+      else showSemanticLocations(sourceState, request, locations);
     }
   }
 
@@ -2593,6 +3430,37 @@ struct CodeEditorService::Impl
       }
       else if(object.contains(QStringLiteral("id")))
       {
+        if(method == QStringLiteral("client/registerCapability"))
+        {
+          const QJsonArray registrations = object.value(QStringLiteral("params")).toObject()
+                                               .value(QStringLiteral("registrations")).toArray();
+          bool readOnly = !registrations.isEmpty();
+          for(const QJsonValue &registration : registrations)
+            readOnly &= registration.toObject().value(QStringLiteral("method")).toString() ==
+                        QStringLiteral("workspace/didChangeConfiguration");
+          if(readOnly)
+          {
+            QJsonObject response;
+            response[QStringLiteral("jsonrpc")] = QStringLiteral("2.0");
+            response[QStringLiteral("id")] = object.value(QStringLiteral("id"));
+            response[QStringLiteral("result")] = QJsonValue();
+            sendJson(response);
+            return;
+          }
+        }
+        if(method == QStringLiteral("workspace/configuration"))
+        {
+          QJsonArray values;
+          const QJsonArray items = object.value(QStringLiteral("params")).toObject()
+                                      .value(QStringLiteral("items")).toArray();
+          for(const QJsonValue &item : items) { Q_UNUSED(item); values.append(QJsonValue()); }
+          QJsonObject response;
+          response[QStringLiteral("jsonrpc")] = QStringLiteral("2.0");
+          response[QStringLiteral("id")] = object.value(QStringLiteral("id"));
+          response[QStringLiteral("result")] = values;
+          sendJson(response);
+          return;
+        }
         // Do not execute workspace/applyEdit, workspace/executeCommand, or any other server request.
         rejectServerRequest(object);
       }
@@ -2619,39 +3487,54 @@ CodeEditorService::~CodeEditorService()
 }
 
 void CodeEditorService::registerEditor(ScintillaEdit *editor, const QString &fileName,
-                                       const QString &language)
+                                       const QString &language, const QString &includeBaseDirectory)
 {
   if(!editor)
     return;
 
+  const QString includeBase = includeBaseDirectory.isEmpty()
+                                  ? QString() : QDir(includeBaseDirectory).absolutePath();
   Impl::EditorState *state = m_Impl->stateFor(editor);
   if(state)
   {
-    if(state->fileName == fileName && state->language == normaliseLanguage(language, fileName))
+    if(state->fileName == fileName && state->language == normaliseLanguage(language, fileName) &&
+       state->includeBaseDirectory == includeBase)
       return;
+    m_Impl->cancelRequests(editor, true);
     m_Impl->sendDidClose(state);
     state->fileName = fileName;
+    state->includeBaseDirectory = includeBase;
     state->uri = m_Impl->makeUri(fileName);
     state->language = normaliseLanguage(language, fileName);
     state->version++;
     state->editRevision++;
     state->openSent = false;
+    state->semanticRequestedVersion = -1;
+    state->semanticPaintGeneration = ++m_Impl->semanticPaintSerial;
+    const int previousIndicator = int(editor->indicatorCurrent());
+    editor->setIndicatorCurrent(SemanticNameIndicator);
+    editor->indicatorClearRange(0, editor->length());
+    editor->setIndicatorCurrent(previousIndicator);
+    m_Impl->reindexDocument(state);
     m_Impl->sendDidOpen(state);
-    m_Impl->rebuildSymbolIndex();
+    m_Impl->updateSymbolHighlights(state);
     return;
   }
 
   state = new Impl::EditorState;
   state->editor = editor;
   state->fileName = fileName;
+  state->includeBaseDirectory = includeBase;
   state->uri = m_Impl->makeUri(fileName);
   state->language = normaliseLanguage(language, fileName);
   state->text = editor->getText(editor->textLength() + 1);
+  state->sourceSha256 = QString::fromLatin1(
+      QCryptographicHash::hash(state->text, QCryptographicHash::Sha256).toHex());
   state->localDiagnostics = m_Impl->localDiagnosticsFor(state);
   m_Impl->states[editor] = state;
   editor->installEventFilter(this);
   m_Impl->configureIndicators(editor);
-  m_Impl->rebuildSymbolIndex();
+  m_Impl->reindexDocument(state);
   m_Impl->displayDiagnostics(state);
 
   QObject::connect(editor, &ScintillaEdit::destroyed, this,
@@ -2692,6 +3575,7 @@ void CodeEditorService::registerEditor(ScintillaEdit *editor, const QString &fil
                     [this, editor](QKeyEvent *event) { handleKeyPress(editor, event); });
   QObject::connect(editor, &ScintillaEdit::updateUi, this,
                    [this, state]() {
+                     m_Impl->cancelMovedNavigation(state);
                      m_Impl->updateBraceHighlight(state);
                      m_Impl->updateSymbolHighlights(state);
                    });
@@ -2707,7 +3591,8 @@ void CodeEditorService::registerEditor(ScintillaEdit *editor, const QString &fil
 
   m_Impl->sendDidOpen(state);
   m_Impl->updateBraceHighlight(state);
-  if(!m_Impl->serverAttempted)
+  m_Impl->updateSymbolHighlights(state);
+  if(!m_Impl->serverAttempted && m_Impl->supportsSemanticLanguage(state))
     m_Impl->startServer(false);
 }
 
@@ -2717,18 +3602,8 @@ void CodeEditorService::unregisterEditor(ScintillaEdit *editor)
   if(!state)
     return;
 
-  // A definition request can retain a local fallback in a different document. Remove every
-  // request that refers to the editor before its raw address can become dangling.
-  for(auto it = m_Impl->pending.begin(); it != m_Impl->pending.end();)
-  {
-    const Impl::PendingRequest &request = it.value();
-    if(request.sourceEditor == editor || request.editor.data() == editor ||
-       request.localFallback.editor == editor ||
-       request.localFallbackEditor.data() == editor)
-      it = m_Impl->pending.erase(it);
-    else
-      ++it;
-  }
+  // Cancel source and dependency requests before the editor address becomes dangling.
+  m_Impl->cancelRequests(editor, true);
 
   m_Impl->sendDidClose(state);
   if(m_Impl->referencesMenu) m_Impl->referencesMenu->close();
@@ -2737,8 +3612,8 @@ void CodeEditorService::unregisterEditor(ScintillaEdit *editor)
   for(QList<Impl::NavigationEntry> *history : {&m_Impl->backHistory, &m_Impl->forwardHistory})
     for(int i = history->size() - 1; i >= 0; --i)
       if((*history)[i].editor.data() == editor) history->removeAt(i);
+  m_Impl->removeIndexedDocument(state);
   delete state;
-  m_Impl->rebuildSymbolIndex();
 }
 
 bool CodeEditorService::isRegistered(ScintillaEdit *editor) const
@@ -2768,6 +3643,15 @@ bool CodeEditorService::eventFilter(QObject *watched, QEvent *event)
 {
   ScintillaEdit *editor = qobject_cast<ScintillaEdit *>(watched);
   Impl::EditorState *state = m_Impl->stateFor(editor);
+  if(state && event && (event->type() == QEvent::PaletteChange ||
+                        event->type() == QEvent::ApplicationPaletteChange ||
+                        event->type() == QEvent::StyleChange))
+  {
+    m_Impl->configureIndicators(editor);
+    state->semanticRequestedVersion = -1;
+    state->semanticPaintGeneration = ++m_Impl->semanticPaintSerial;
+    m_Impl->semanticTimer->start();
+  }
   if(!state || !event || event->type() != QEvent::KeyPress)
     return QObject::eventFilter(watched, event);
 
@@ -2893,6 +3777,9 @@ void CodeEditorService::requestDefinition(ScintillaEdit *editor, int position)
   m_Impl->syncText(state, false);
   if(position < 0)
     position = int(editor->currentPos());
+  if(m_Impl->requestLspNavigation(state, position, false)) return;
+  m_Impl->reportStatus(QCoreApplication::translate("CodeEditorService",
+      "Semantic language server is unavailable; using limited local navigation."));
   const Location fallback = m_Impl->localDefinition(state, position);
   const auto range = identifierRange(state->text, position);
   if(fallback.editor == editor && fallback.position == range.first)
@@ -2900,20 +3787,22 @@ void CodeEditorService::requestDefinition(ScintillaEdit *editor, int position)
     m_Impl->showReferences(state, position);
     return;
   }
-  if(!m_Impl->requestLspDefinition(state, position, fallback))
-  {
-    if(fallback.editor)
-      m_Impl->navigateToDefinition(fallback, editor, position);
-    else
-      m_Impl->reportStatus(QCoreApplication::translate(
-          "CodeEditorService", "No definition was found for the selected symbol"));
-  }
+  if(fallback.editor)
+    m_Impl->navigateToDefinition(fallback, editor, position);
+  else
+    m_Impl->reportStatus(QCoreApplication::translate(
+        "CodeEditorService", "No definition was found for the selected symbol"));
 }
 
 void CodeEditorService::requestReferences(ScintillaEdit *editor, int position)
 {
   if(!editor) return;
-  m_Impl->showReferences(m_Impl->stateFor(editor), position < 0 ? int(editor->currentPos()) : position);
+  if(position < 0) position = int(editor->currentPos());
+  Impl::EditorState *state = m_Impl->stateFor(editor);
+  if(m_Impl->requestLspNavigation(state, position, true)) return;
+  m_Impl->reportStatus(QCoreApplication::translate("CodeEditorService",
+      "Semantic language server is unavailable; using limited local navigation."));
+  m_Impl->showReferences(state, position);
 }
 
 void CodeEditorService::rememberNavigation(ScintillaEdit *editor, int targetPosition)
@@ -2967,6 +3856,95 @@ CodeEditorService::Location CodeEditorService::findLocalDefinition(ScintillaEdit
   return m_Impl->localDefinition(m_Impl->stateFor(editor), position);
 }
 
+QString CodeEditorService::documentSourceSha256(ScintillaEdit *editor)
+{
+  Impl::EditorState *state = m_Impl->stateFor(editor);
+  if(!state) return QString();
+  m_Impl->syncText(state, false);
+  return state->sourceSha256;
+}
+
+QList<CodeEditorService::SymbolInfo> CodeEditorService::symbolTable(ScintillaEdit *editor)
+{
+  QList<SymbolInfo> result;
+  Impl::EditorState *state = m_Impl->stateFor(editor);
+  if(!state || !state->editor) return result;
+  m_Impl->syncText(state, false);
+  result.reserve(state->symbols.size());
+  for(const Impl::Symbol &symbol : state->symbols)
+  {
+    SymbolInfo info;
+    info.name = symbol.name;
+    info.valueType = symbol.valueType;
+    info.ownerType = symbol.ownerType;
+    info.sourceSha256 = state->sourceSha256;
+    info.declaration.editor = editor;
+    info.declaration.fileName = state->fileName;
+    info.declaration.position = symbol.position;
+    info.declaration.line = int(editor->lineFromPosition(symbol.position));
+    info.declaration.column = symbol.position - int(editor->positionFromLine(info.declaration.line));
+    info.scopeStart = symbol.scopeStart > 0 && symbol.signature.isEmpty()
+                          ? qMax(symbol.scopeStart, symbol.position) : symbol.scopeStart;
+    info.scopeEnd = symbol.scopeEnd;
+    info.function = !symbol.signature.isEmpty();
+    info.global = symbol.scopeStart == 0 && symbol.ownerType.isEmpty();
+    result.push_back(info);
+  }
+  std::sort(result.begin(), result.end(), [](const SymbolInfo &a, const SymbolInfo &b) {
+    return a.declaration.position < b.declaration.position;
+  });
+  return result;
+}
+
+CodeEditorService::SymbolInspection CodeEditorService::inspectSymbol(ScintillaEdit *editor,
+                                                                     int position,
+                                                                     int maxReferences)
+{
+  SymbolInspection result;
+  Impl::EditorState *state = m_Impl->stateFor(editor);
+  if(!state || !state->editor) return result;
+  const Location definition = m_Impl->localDefinition(state, position);
+  // Open editors can represent different shaders with coincident names. Keep this lightweight
+  // inspection tied to one exact source revision; cross-file semantics belong to the Host/LSP.
+  if(definition.editor != editor) return result;
+  for(const SymbolInfo &symbol : symbolTable(editor))
+    if(symbol.declaration.position == definition.position)
+    {
+      result.symbol = symbol;
+      break;
+    }
+  if(!result.isValid()) return result;
+
+  const QByteArray needle = result.symbol.name.toUtf8();
+  const QByteArray masked = maskedCode(state->text, state->language);
+  const int limit = qBound(1, maxReferences, 256);
+  for(int offset = 0; (offset = masked.indexOf(needle, offset)) >= 0;)
+  {
+    const int found = offset;
+    offset += needle.size();
+    if((found > 0 && isIdentifierByte(masked[found - 1])) ||
+       (offset < masked.size() && isIdentifierByte(masked[offset])) ||
+       found == definition.position)
+      continue;
+    const Location resolved = m_Impl->resolveDefinition(state, found, result.symbol.name, 0,
+                                                       &masked);
+    if(resolved.editor != editor || resolved.position != definition.position) continue;
+    if(result.references.size() >= limit)
+    {
+      result.referencesTruncated = true;
+      break;
+    }
+    Location reference;
+    reference.editor = editor;
+    reference.fileName = state->fileName;
+    reference.position = found;
+    reference.line = int(editor->lineFromPosition(found));
+    reference.column = found - int(editor->positionFromLine(reference.line));
+    result.references.push_back(reference);
+  }
+  return result;
+}
+
 QList<CodeEditorService::Diagnostic> CodeEditorService::diagnostics(ScintillaEdit *editor) const
 {
   Impl::EditorState *state = m_Impl->stateFor(editor);
@@ -3017,6 +3995,9 @@ bool CodeEditorService::startLanguageServer()
 
 void CodeEditorService::stopLanguageServer()
 {
+  m_Impl->queuedNavigation.clear();
+  m_Impl->referenceSearches.clear();
+  m_Impl->referenceCache.clear();
   if(m_Impl->process->state() == QProcess::NotRunning)
     return;
   m_Impl->stopping = true;
@@ -3045,6 +4026,210 @@ bool CodeEditorService::languageServerRunning() const
 #if ENABLE_UNIT_TESTS
 
 #include "3rdparty/catch/catch.hpp"
+
+struct CodeEditorServiceTestAccess
+{
+  static bool glslUnsupportedProviderReportsDoNotHideRealErrors()
+  {
+    CodeEditorService service;
+    CodeEditorService::Impl::EditorState state;
+    state.language = QStringLiteral("glsl");
+    CodeEditorService::Diagnostic local, compiler, unsupported;
+    local.message = QStringLiteral("Unmatched closing delimiter");
+    compiler.message = QStringLiteral("glslang: unknown identifier BreadMissingSymbol");
+    unsupported.message = QStringLiteral("GLSL layout qualifier is unrecognized");
+    state.localDiagnostics.push_back(local);
+    state.externalDiagnostics.push_back(compiler);
+    state.lspDiagnostics.push_back(unsupported);
+    service.m_Impl->process->setProgram(QStringLiteral("C:/Bread/SLANGD.exe"));
+    const auto glsl = service.m_Impl->combinedDiagnostics(&state);
+    const bool realErrorsRetained = glsl.size() == 2 && glsl[0].message == local.message &&
+                                    glsl[1].message == compiler.message;
+    state.language = QStringLiteral("hlsl");
+    const auto hlsl = service.m_Impl->combinedDiagnostics(&state);
+    const bool hlslReportsRetained = hlsl.size() == 3 && hlsl[1].message == unsupported.message;
+    state.language = QStringLiteral("glsl");
+    service.m_Impl->process->setProgram(QStringLiteral("C:/Bread/shader-language-server.exe"));
+    const auto nativeGLSL = service.m_Impl->combinedDiagnostics(&state);
+    return realErrorsRetained && hlslReportsRetained && nativeGLSL.size() == 3 &&
+           nativeGLSL[1].message == unsupported.message;
+  }
+
+  static bool semanticRequestsSurviveNavigationButNotEdits()
+  {
+    CodeEditorService service;
+    // Only the opaque identity is used by cancellation; no widget or QApplication is needed.
+    ScintillaEdit *identity = reinterpret_cast<ScintillaEdit *>(&service);
+    CodeEditorService::Impl::PendingRequest semantic, navigation;
+    semantic.kind = CodeEditorService::Impl::PendingKind::SemanticTokens;
+    semantic.sourceEditor = identity;
+    navigation.kind = CodeEditorService::Impl::PendingKind::Definition;
+    navigation.sourceEditor = identity;
+    service.m_Impl->pending[1] = semantic;
+    service.m_Impl->pending[2] = navigation;
+    service.m_Impl->cancelRequests(identity, false);
+    const bool onlyColoringRemains = service.m_Impl->pending.size() == 1 &&
+                                    service.m_Impl->pending.contains(1);
+    service.m_Impl->cancelRequests(identity, true);
+    return onlyColoringRemains && service.m_Impl->pending.isEmpty();
+  }
+
+  static bool semanticIdentityUsesFileAndCompleteRange()
+  {
+    CodeEditorService service;
+    auto location = [](const QString &path, int endCharacter) {
+      QJsonObject start, end, range, result;
+      start[QStringLiteral("line")] = 3;
+      start[QStringLiteral("character")] = 5;
+      end[QStringLiteral("line")] = 3;
+      end[QStringLiteral("character")] = endCharacter;
+      range[QStringLiteral("start")] = start;
+      range[QStringLiteral("end")] = end;
+      result[QStringLiteral("uri")] = QUrl::fromLocalFile(path).toString();
+      result[QStringLiteral("range")] = range;
+      return result;
+    };
+    const QString root = QDir::tempPath();
+    const auto first = location(root + QStringLiteral("/first/shader.hlsl"), 10);
+    const auto second = location(root + QStringLiteral("/second/shader.hlsl"), 10);
+    const auto differentRange = location(root + QStringLiteral("/first/shader.hlsl"), 11);
+    QJsonObject link;
+    link[QStringLiteral("targetUri")] = first.value(QStringLiteral("uri"));
+    link[QStringLiteral("targetSelectionRange")] = first.value(QStringLiteral("range"));
+    return !service.m_Impl->semanticLocationKey(first).isEmpty() &&
+           service.m_Impl->semanticLocationKey(first) != service.m_Impl->semanticLocationKey(second) &&
+           service.m_Impl->semanticLocationKey(first) != service.m_Impl->semanticLocationKey(differentRange) &&
+           service.m_Impl->semanticLocationKey(first) == service.m_Impl->semanticLocationKey(link) &&
+           service.m_Impl->semanticLocationKey(QJsonValue()).isEmpty();
+  }
+
+  static bool incrementalIndexPreservesOtherDocuments()
+  {
+    CodeEditorService service;
+    CodeEditorService::Impl::EditorState edited;
+    CodeEditorService::Impl::EditorState untouched;
+    edited.language = QStringLiteral("hlsl");
+    untouched.language = QStringLiteral("hlsl");
+    edited.text = "float before;";
+    untouched.text = "float retained;";
+    service.m_Impl->reindexDocument(&edited);
+    service.m_Impl->reindexDocument(&untouched);
+    const bool initial = service.m_Impl->symbolIndex.value(QStringLiteral("before")).size() == 1 &&
+                         service.m_Impl->symbolIndex.value(QStringLiteral("retained")).size() == 1;
+    edited.text = "float after;";
+    service.m_Impl->reindexDocument(&edited);
+    const bool updated = !service.m_Impl->symbolIndex.contains(QStringLiteral("before")) &&
+                         service.m_Impl->symbolIndex.value(QStringLiteral("after")).size() == 1 &&
+                         service.m_Impl->symbolIndex.value(QStringLiteral("retained")).size() == 1 &&
+                         service.m_Impl->symbolIndex.value(QStringLiteral("retained"))[0].state ==
+                             &untouched;
+    service.m_Impl->removeIndexedDocument(&edited);
+    const bool removed = !service.m_Impl->symbolIndex.contains(QStringLiteral("after")) &&
+                         service.m_Impl->symbolIndex.value(QStringLiteral("retained")).size() == 1;
+    service.m_Impl->removeIndexedDocument(&untouched);
+    return initial && updated && removed && service.m_Impl->symbolIndex.isEmpty();
+  }
+};
+
+TEST_CASE("GLSL partial semantic providers retain target compiler and local errors", "[code-editor]")
+{
+  CHECK(CodeEditorServiceTestAccess::glslUnsupportedProviderReportsDoNotHideRealErrors());
+}
+
+TEST_CASE("Code editor reindexes only the changed source document", "[code-editor]")
+{
+  CHECK(CodeEditorServiceTestAccess::incrementalIndexPreservesOtherDocuments());
+}
+
+TEST_CASE("Incremental language servers replace the previous synchronized document", "[code-editor]")
+{
+  const QByteArray previous("// \xE6\xB3\x95\xE7\xBA\xBF \xF0\x9F\x98\x80\r\n"
+                            "float oldValue; // \xE5\xB0\xBE \xF0\x9F\x98\x80");
+  const QByteArray current("struct NewType { float value; };\n");
+  const QJsonObject incremental = lspContentChange(2, previous, current);
+  const QJsonObject range = incremental.value(QStringLiteral("range")).toObject();
+  CHECK(range.value(QStringLiteral("start")).toObject().value(QStringLiteral("line")).toInt() == 0);
+  CHECK(range.value(QStringLiteral("start")).toObject().value(QStringLiteral("character")).toInt() == 0);
+  CHECK(range.value(QStringLiteral("end")).toObject().value(QStringLiteral("line")).toInt() == 1);
+  CHECK(range.value(QStringLiteral("end")).toObject().value(QStringLiteral("character")).toInt() == 23);
+  CHECK(incremental.value(QStringLiteral("text")).toString().toUtf8() == current);
+  CHECK(lspContentChange(1, previous, current).contains(QStringLiteral("range")) == false);
+  CHECK(lspContentChange(2, QByteArray(), current).value(QStringLiteral("range")).toObject()
+            .value(QStringLiteral("end")).toObject().value(QStringLiteral("character")).toInt() == 0);
+  CHECK(lspContentChange(2, current, QByteArray()).value(QStringLiteral("range")).toObject()
+            .value(QStringLiteral("end")).toObject().value(QStringLiteral("line")).toInt() == 1);
+  CHECK(slangNeedsWholeDocumentReopen(previous));
+  CHECK_FALSE(slangNeedsWholeDocumentReopen(previous + '\n'));
+  CHECK_FALSE(slangNeedsWholeDocumentReopen(current));
+  CHECK_FALSE(slangNeedsWholeDocumentReopen(QByteArray("float value;")));
+}
+
+TEST_CASE("Semantic coloring is independent of caret navigation and cancelled by edits", "[code-editor]")
+{
+  CHECK(CodeEditorServiceTestAccess::semanticRequestsSurviveNavigationButNotEdits());
+}
+
+TEST_CASE("Shader semantic token colors use compiler categories and UTF-16 ranges", "[code-editor]")
+{
+  const QStringList legend = {QStringLiteral("type"), QStringLiteral("variable"),
+                             QStringLiteral("parameter"), QStringLiteral("function"),
+                             QStringLiteral("property"), QStringLiteral("keyword"),
+                             QStringLiteral("string")};
+  QVector<SemanticColorRange> ranges;
+  SECTION("function, type, parameter, field and variable receive distinct colors")
+  {
+    const QByteArray code("Light Shade(Light input) {\n  float value = input.power;\n}\n");
+    const QJsonArray data = {0, 0, 5, 0, 0,  0, 6, 5, 3, 0,
+                            0, 6, 5, 0, 0,  0, 6, 5, 2, 0,
+                            1, 8, 5, 1, 0,  0, 8, 5, 2, 0,
+                            0, 6, 5, 4, 0};
+    REQUIRE(decodeSemanticColorRanges(code, data, legend, true, ranges));
+    REQUIRE(ranges.size() == 7);
+    CHECK(code.mid(ranges[0].start, ranges[0].length) == QByteArray("Light"));
+    CHECK(code.mid(ranges[1].start, ranges[1].length) == QByteArray("Shade"));
+    CHECK(code.mid(ranges[4].start, ranges[4].length) == QByteArray("value"));
+    CHECK(code.mid(ranges[6].start, ranges[6].length) == QByteArray("power"));
+    CHECK(ranges[0].color != ranges[1].color);
+    CHECK(ranges[3].color != ranges[4].color);
+    CHECK(ranges[4].color != ranges[6].color);
+  }
+  SECTION("Chinese comments and surrogate pairs preserve exact UTF-8 byte positions")
+  {
+    const QByteArray code("/* \xE6\xB3\x95\xE7\xBA\xBF \xF0\x9F\x98\x80 */ "
+                          "float value;\r\nfloat other;\n");
+    const QString source = QString::fromUtf8(code);
+    const int column = source.indexOf(QStringLiteral("value"));
+    const QJsonArray data = {0, column, 5, 1, 0, 1, 6, 5, 1, 0};
+    REQUIRE(decodeSemanticColorRanges(code, data, legend, false, ranges));
+    REQUIRE(ranges.size() == 2);
+    CHECK(ranges[0].start == code.indexOf("value"));
+    CHECK(ranges[1].start == code.indexOf("other"));
+  }
+  SECTION("ignored lexical tokens do not corrupt relocated include coloring")
+  {
+    const QByteArray code("#include \"x.hlsli\"\nfloat value;\n");
+    const QJsonArray data = {0, 0, 8, 5, 0, 0, 9, 100, 6, 0, 1, 6, 5, 1, 0};
+    REQUIRE(decodeSemanticColorRanges(code, data, legend, true, ranges));
+    REQUIRE(ranges.size() == 1);
+    CHECK(ranges[0].start == code.indexOf("value"));
+  }
+  SECTION("malformed, overlapping and out of range tokens never paint")
+  {
+    const QByteArray code("float value;\n");
+    CHECK_FALSE(decodeSemanticColorRanges(code, QJsonArray{0, 6, 5, 1}, legend, true, ranges));
+    CHECK_FALSE(decodeSemanticColorRanges(code, QJsonArray{0, 6, 50, 1, 0}, legend, true, ranges));
+    CHECK_FALSE(decodeSemanticColorRanges(code, QJsonArray{0, -1, 5, 1, 0}, legend, true, ranges));
+    CHECK_FALSE(decodeSemanticColorRanges(code, QJsonArray{0, 6.5, 5, 1, 0}, legend, true, ranges));
+    CHECK_FALSE(decodeSemanticColorRanges(code, QJsonArray{0, 6, 5, 30, 0}, legend, true, ranges));
+    CHECK_FALSE(decodeSemanticColorRanges(
+        code, QJsonArray{0, 6, 5, 1, 0, 0, 1, 3, 1, 0}, legend, true, ranges));
+  }
+}
+
+TEST_CASE("Semantic navigation identity includes URI and full declaration range", "[code-editor]")
+{
+  CHECK(CodeEditorServiceTestAccess::semanticIdentityUsesFileAndCompleteRange());
+}
 
 TEST_CASE("Code editor smart newline planning", "[code-editor]")
 {

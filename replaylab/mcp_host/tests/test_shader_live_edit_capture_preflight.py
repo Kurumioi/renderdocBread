@@ -23,6 +23,9 @@ class _CapturePreflightRig:
     """Real consent, mailbox, binding and job code; replay is the only boundary."""
 
     def __init__(self, tmp_path, monkeypatch):
+        # This rig exercises the retained legacy resume/preflight contract.
+        # Default on-demand scheduling has its own no-scan/no-resume tests.
+        monkeypatch.setattr(server, "_shader_editors_on_demand", False)
         self.workspace = tmp_path / "workspace"
         self.workspace.mkdir()
         self.registry_path = tmp_path / "registry.json"
@@ -56,6 +59,7 @@ class _CapturePreflightRig:
         self.watch = _PersistentWatchManager()
         self.workspace_status = mock.Mock(side_effect=lambda _path: copy.deepcopy(self.status))
         self.preflight = mock.Mock(side_effect=self.verified_context)
+        self.recover_native = mock.Mock(wraps=server._shader_live_edit_recover_active_candidate)
         self.apply = mock.Mock(side_effect=AssertionError("offline preflight must not apply"))
         monkeypatch.setattr(ipc_client, "INSTANCE_ROOT", str(self.mailboxes))
         monkeypatch.setattr(service_module, "_SHADER_LIVE_EDIT_BINDINGS", {})
@@ -63,6 +67,7 @@ class _CapturePreflightRig:
                             lambda: SimpleNamespace(status=self.workspace_status))
         monkeypatch.setattr(server, "_workspace_active_capture_context", self.preflight)
         monkeypatch.setattr(server, "_shader_live_edit_apply_candidate", self.apply)
+        monkeypatch.setattr(server, "_shader_live_edit_recover_active_candidate", self.recover_native)
         monkeypatch.setattr(server, "_active_live_context", lambda **_kwargs: self.context())
         self.manager = ShaderLiveEditManager(
             self.watch, self.apply, registry_path=self.registry_path,
@@ -199,11 +204,18 @@ def test_current_physical_source_passes_once_without_preflight_on_owner_ticks_or
     else:
         live_id = rig.start()["liveEditId"]
     _wait_until(lambda: rig.manager.poll(live_id)["state"] == "running")
+    # Admission validates the live catalog once. Starting the actual job also
+    # reads current workspace status once to decide whether an existing Native
+    # mapping can be recovered; this uncompiled fixture returns without IPC.
+    status_calls_after_start = rig.workspace_status.call_count
+    assert status_calls_after_start == 2
+    assert rig.preflight.call_count == rig.recover_native.call_count == 1
     for _ in range(3):
         rig.refresh()
         code, value = rig.poll_public(live_id)
         assert code == 200 and value["result"]["state"] == "running"
-    assert rig.workspace_status.call_count == rig.preflight.call_count == 1
+        assert rig.workspace_status.call_count == status_calls_after_start
+        assert rig.preflight.call_count == rig.recover_native.call_count == 1
     assert len(rig.watch.start_calls) == 1
     assert len(rig.watch.persistent_start_calls) == (operation == "resume")
     state = rig.manager.poll(live_id)

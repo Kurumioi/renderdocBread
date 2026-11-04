@@ -753,8 +753,12 @@ class CaptureSession:
                     "arraysize": t.arraysize,
                 }
 
-            # Infer texture purpose from name heuristics
-            entry["inferredRole"] = _infer_texture_role(ro.name, entry.get("texture", {}))
+            # What the texture is for is not something a name table can know: the
+            # shader variable name is a cooked compiler artifact, the asset name
+            # belongs to whoever shipped the game, and both mean different things in
+            # different engines. The facts above (name, format, size, mips) are
+            # reported as they are and the Agent decides what the slot does, with the
+            # unpacked material as its reference.
 
             results.append(entry)
 
@@ -1111,13 +1115,12 @@ class CaptureSession:
                     tex_entry = {
                         "slot": tex_info["slotIndex"],
                         "name": tex_info["shaderVarName"],
-                        "role": tex_info["inferredRole"],
+                        "texture": tex_info.get("texture", {}),
                         "resourceId": tex_info["boundResourceId"],
                     }
                     if tex_info["boundResourceId"]:
                         safe_var = tex_info["shaderVarName"].replace(" ", "_")
-                        role = tex_info["inferredRole"]
-                        tex_filename = f"{stage_name}_slot{tex_info['slotIndex']}_{safe_var}_{role}.png"
+                        tex_filename = f"{stage_name}_slot{tex_info['slotIndex']}_{safe_var}.png"
                         tex_filepath = os.path.join(output_dir, tex_filename)
                         try:
                             self.save_texture(tex_info["boundResourceId"], tex_filepath)
@@ -1152,60 +1155,6 @@ class CaptureSession:
             result["exports"].append(stage_result)
 
         return result
-
-
-# ---------------------------------------------------------------------------
-# Heuristic: infer texture role from shader variable name and texture props
-# ---------------------------------------------------------------------------
-
-def _infer_texture_role(var_name: str, tex_info: dict) -> str:
-    """Guess what role a texture serves based on naming conventions.
-
-    Returns one of: albedo, normal, metallic, roughness, ao, emissive,
-    specular, height, opacity, shadow, environment, lightmap, unknown.
-    """
-    name = var_name.lower()
-    tex_name = tex_info.get("name", "").lower() if tex_info else ""
-    combined = name + " " + tex_name
-
-    # Common naming patterns used in game engines
-    patterns = [
-        # (keywords, role)
-        (["albedo", "diffuse", "basecolor", "base_color", "color", "_col", "maintex"], "albedo"),
-        (["normal", "nrm", "bump", "normalmap", "_n_", "_norm"], "normal"),
-        (["metallic", "metalness", "_met", "metal"], "metallic"),
-        (["rough", "roughness", "_rgh", "smoothness"], "roughness"),
-        (["ao", "ambient_occlusion", "occlusion", "_occ"], "ambient_occlusion"),
-        (["emissive", "emission", "glow", "self_illum"], "emissive"),
-        (["specular", "spec", "_spc"], "specular"),
-        (["height", "displacement", "parallax", "_hgt"], "height"),
-        (["opacity", "alpha", "transparent", "mask"], "opacity"),
-        (["shadow", "shadowmap", "shadow_map"], "shadow_map"),
-        (["env", "environment", "cubemap", "skybox", "reflection", "ibl"], "environment"),
-        (["light", "lightmap", "lm_"], "lightmap"),
-        (["detail", "detail_albedo", "detail_normal"], "detail"),
-        (["noise", "dither"], "noise"),
-        (["lut", "lookup", "gradient", "ramp"], "lookup_table"),
-        (["depth", "zbuffer"], "depth"),
-        (["stencil"], "stencil"),
-        (["ssao"], "ssao"),
-        (["ssr", "screen_space_reflection"], "ssr"),
-        (["bloom", "glow_map"], "bloom"),
-    ]
-
-    for keywords, role in patterns:
-        for kw in keywords:
-            if kw in combined:
-                return role
-
-    # Check texture format for clues
-    fmt = tex_info.get("format", "").lower() if tex_info else ""
-    if "bc5" in fmt or "rg" in fmt.split("_")[0]:
-        return "normal"  # BC5/RG formats are typically normals
-    if "bc6" in fmt or "hdr" in fmt:
-        return "environment"  # HDR formats are typically environment maps
-
-    return "unknown"
 
 
 # ---------------------------------------------------------------------------

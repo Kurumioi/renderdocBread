@@ -337,7 +337,8 @@ private:
     {
       rdcstr app = strlower(StringFormat::Wide2UTF8(lpApplicationName));
 
-      if(app.contains("render_soco_doccmd.exe") || app.contains("qrenderdoc.exe"))
+      if(app.contains("render_soco_doccmd.exe") || app.contains("qrenderdoc.exe") ||
+         app.contains("renderdocbread.exe") || app.contains("q_render_soco_doc.exe"))
       {
         inject = false;
       }
@@ -346,7 +347,8 @@ private:
     {
       rdcstr cmd = strlower(StringFormat::Wide2UTF8(lpCommandLine));
 
-      if(cmd.contains("render_soco_doccmd.exe") || cmd.contains("qrenderdoc.exe"))
+      if(cmd.contains("render_soco_doccmd.exe") || cmd.contains("qrenderdoc.exe") ||
+         cmd.contains("renderdocbread.exe") || cmd.contains("q_render_soco_doc.exe"))
       {
         inject = false;
       }

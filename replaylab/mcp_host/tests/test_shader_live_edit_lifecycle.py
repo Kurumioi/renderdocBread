@@ -66,6 +66,7 @@ class _LifecycleRig:
             self._unbound_apply,
             poll_seconds=0.005,
             join_seconds=0.1,
+            session_unavailable_retry_seconds=0.03,
             registry_path=tmp_path / "config" / "live-edit.json",
             workspace_identity=lambda _path: copy.deepcopy(self.identity),
             bind_session=self.bind_session,
@@ -371,17 +372,57 @@ def test_reconcile_does_not_resume_authorizations_for_a_different_capture_path(r
     assert rig.authorization()["lastLiveEditId"] == old["liveEditId"]
 
 
-@pytest.mark.parametrize("owner_state", ["expired", "unavailable"])
-def test_idle_live_worker_exits_when_its_mailbox_stops_confirming_the_capture(rig, owner_state):
+def test_idle_live_worker_exits_when_capture_session_expires(rig):
     started = rig.start()
     authorization = rig.authorization()
-    rig.states[_scope(rig.binding)] = owner_state
+    rig.states[_scope(rig.binding)] = "expired"
     old_job = rig.manager._jobs[started["liveEditId"]]
     _wait_until(lambda: not old_job._thread.is_alive() and not old_job._apply_thread.is_alive())
     assert rig.manager.poll(started["liveEditId"])["state"] == "failed"
     assert started["watchId"] in rig.watch.stop_calls
     assert rig.apply_calls == []
     assert rig.authorization()["authorizationId"] == authorization["authorizationId"]
+
+
+def test_idle_live_worker_retains_temporary_unavailability_and_recovers(rig):
+    started = rig.start()
+    authorization = rig.authorization()
+    old_job = rig.manager._jobs[started["liveEditId"]]
+    rig.states[_scope(rig.binding)] = "unavailable"
+
+    _wait_until(
+        lambda: "captureSessionUnavailable" in {
+            event["type"]
+            for event in rig.manager.poll(started["liveEditId"])["events"]
+        }
+    )
+    # Multiple bounded retry windows may elapse. The worker and consent stay
+    # alive because an unavailable mailbox is not evidence that the capture
+    # was closed or replaced.
+    _wait_until(
+        lambda: rig.manager.poll(started["liveEditId"])["sessionState"]
+        == "unavailable"
+    )
+    assert old_job._thread.is_alive()
+    assert old_job._apply_thread.is_alive()
+    assert rig.manager.poll(started["liveEditId"])["state"] == "running"
+    assert started["watchId"] not in rig.watch.stop_calls
+    assert rig.authorization()["authorizationId"] == authorization["authorizationId"]
+
+    rig.states[_scope(rig.binding)] = "current"
+    _wait_until(
+        lambda: "captureSessionAvailable" in {
+            event["type"]
+            for event in rig.manager.poll(started["liveEditId"])["events"]
+        }
+    )
+    rig.watch.publish(started["watchId"], 6, "6" * 64)
+    _wait_until(
+        lambda: rig.manager.poll(started["liveEditId"])["applySuccesses"] == 1
+    )
+    assert old_job._thread.is_alive()
+    assert old_job._apply_thread.is_alive()
+    assert len(rig.apply_calls) == 1
 
 
 def test_capture_reconcile_recovers_a_startup_resume_attempted_before_gui_was_available(rig):
@@ -395,6 +436,7 @@ def test_capture_reconcile_recovers_a_startup_resume_attempted_before_gui_was_av
         rig._unbound_apply,
         poll_seconds=0.005,
         join_seconds=0.1,
+        session_unavailable_retry_seconds=0.03,
         registry_path=registry_path,
         workspace_identity=lambda _path: copy.deepcopy(rig.identity),
         bind_session=rig.bind_session,

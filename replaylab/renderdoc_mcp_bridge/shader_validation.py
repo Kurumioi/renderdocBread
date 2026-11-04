@@ -16,6 +16,8 @@ TOLERANCES = {"floatAbsolute": 0.0001, "floatRelative": 0.001,
               "normalizedQuantizationSteps": 1}
 OUTPUT_LIMIT = 32 * 1024 * 1024
 TOTAL_LIMIT = 64 * 1024 * 1024
+MAX_MISMATCH_SAMPLES = 32
+BASELINE_REPEAT_START_LIMIT_SECONDS = 45.0
 
 
 def _enum(value):
@@ -24,19 +26,61 @@ def _enum(value):
     return str(name if name is not None else raw).strip().rsplit(".", 1)[-1].lower()
 
 
+def _unsigned_float(bits, mantissa_bits):
+    """Decode the unsigned 5-bit-exponent floats used by R11G11B10."""
+    exponent, mantissa = bits >> mantissa_bits, bits & ((1 << mantissa_bits) - 1)
+    if exponent == 31:
+        return float("nan") if mantissa else float("inf")
+    if exponent == 0:
+        return math.ldexp(float(mantissa), -14 - mantissa_bits)
+    return math.ldexp(float((1 << mantissa_bits) + mantissa), exponent - 15 - mantissa_bits)
+
+
+_UNSIGNED_FLOAT11 = tuple(_unsigned_float(bits, 6) for bits in range(2048))
+_UNSIGNED_FLOAT10 = tuple(_unsigned_float(bits, 5) for bits in range(1024))
+
+
+def _packed_components(raw, format_type):
+    for (word,) in struct.iter_unpack("<I", raw):
+        if format_type == "r11g11b10":
+            yield _UNSIGNED_FLOAT11[word & 2047]
+            yield _UNSIGNED_FLOAT11[(word >> 11) & 2047]
+            yield _UNSIGNED_FLOAT10[word >> 22]
+        else:
+            yield word & 1023
+            yield (word >> 10) & 1023
+            yield (word >> 20) & 1023
+            yield word >> 30
+
+
 def compare_bytes(before, after, descriptor):
     """Compare every stored component, without diluting errors in an average."""
     if not before or len(before) != len(after):
         raise ValueError("output bytes are empty or changed size")
     exact = before == after
-    kind = _enum(descriptor["componentType"])
-    width = descriptor["componentByteWidth"]
-    count = descriptor["componentCount"]
+    kind = _enum(descriptor.get("componentType"))
+    width = descriptor.get("componentByteWidth", 0)
+    count = descriptor.get("componentCount", 0)
     result = {"byteExact": exact, "byteSize": len(before),
               "baselineSha256": hashlib.sha256(before).hexdigest(),
               "candidateSha256": hashlib.sha256(after).hexdigest(),
               "maximumAbsoluteError": 0.0, "failedComponents": 0,
-              "comparedComponents": 0, "accepted": exact}
+              "comparedComponents": 0, "accepted": exact,
+              "baselineNonFiniteComponents": 0,
+              "mismatchSamples": [], "mismatchSamplesTruncated": False,
+              "mismatchBounds": None, "worstMismatch": None}
+    if descriptor["kind"] in ("storage-buffer", "storage-image"):
+        result.update(comparedComponents=len(before), comparisonKind="byte-exact-storage")
+        if not exact:
+            for offset, (left, right) in enumerate(zip(before, after)):
+                if left != right:
+                    result["failedComponents"] += 1
+                    result["maximumAbsoluteError"] = max(result["maximumAbsoluteError"], abs(left - right))
+                    if len(result["mismatchSamples"]) < MAX_MISMATCH_SAMPLES:
+                        result["mismatchSamples"].append({"byteOffset": offset,
+                            "baselineValue": left, "candidateValue": right})
+            result["mismatchSamplesTruncated"] = result["failedComponents"] > MAX_MISMATCH_SAMPLES
+        return result
     formats = {"float": {2: "e", 4: "f"}, "depth": {4: "f"},
                "uint": {1: "B", 2: "H", 4: "I"},
                "sint": {1: "b", 2: "h", 4: "i"},
@@ -44,8 +88,13 @@ def compare_bytes(before, after, descriptor):
                "unormsrgb": {1: "B", 2: "H"},
                "snorm": {1: "b", 2: "h"}}
     fmt = formats.get(kind, {}).get(width)
-    regular = _enum(descriptor["formatType"]) == "regular" and count in (1, 2, 3, 4)
-    if not regular or not fmt:
+    format_type = _enum(descriptor["formatType"])
+    regular = format_type == "regular" and count in (1, 2, 3, 4)
+    packed_float = format_type == "r11g11b10" and kind == "float" and count == 3
+    packed_normalized = format_type == "r10g10b10a2" and kind in ("unorm", "unormsrgb") and count == 4
+    packed_integer = format_type == "r10g10b10a2" and kind == "uint" and count == 4
+    packed_format = packed_float or packed_normalized or packed_integer
+    if (not regular or not fmt) and not packed_format:
         if exact:
             # Exact storage equality is still useful for packed formats, but
             # do not pretend those bytes were decoded into numeric components.
@@ -53,11 +102,13 @@ def compare_bytes(before, after, descriptor):
             result["comparisonKind"] = "byte-exact"
             return result
         raise ValueError("changed packed/compressed output has no numeric comparator")
-    if len(before) != descriptor["width"] * descriptor["height"] * count * width:
+    pixel_bytes = 4 if packed_format else count * width
+    if len(before) != descriptor["width"] * descriptor["height"] * pixel_bytes:
         raise ValueError("output format or row layout is unsupported")
-    result["comparisonKind"] = "numeric-components"
+    result["comparisonKind"] = "numeric-packed-components" if packed_format else "numeric-components"
     normalized = kind in ("unorm", "unormsrgb", "snorm")
-    scale = float((1 << (width * 8 - (1 if kind == "snorm" else 0))) - 1) if normalized else 1.0
+    scale = (1023.0 if packed_normalized else
+             float((1 << (width * 8 - (1 if kind == "snorm" else 0))) - 1) if normalized else 1.0)
     depth = descriptor["kind"] == "depth" or kind == "depth"
     absolute = TOLERANCES["depthAbsolute"] if depth else TOLERANCES["floatAbsolute"]
     if not depth and kind == "float" and width == 2:
@@ -73,25 +124,63 @@ def compare_bytes(before, after, descriptor):
     if kind in ("uint", "sint"):
         absolute = relative = 0.0
     if exact and kind not in ("float", "depth"):
-        result["comparedComponents"] = len(before) // width
+        result["comparedComponents"] = descriptor["width"] * descriptor["height"] * count
         return result
-    for left, right in zip(struct.iter_unpack("<" + fmt, before), struct.iter_unpack("<" + fmt, after)):
-        a, b = left[0] / scale, right[0] / scale
+    left_values = (_packed_components(before, format_type) if packed_format else
+                   (item[0] for item in struct.iter_unpack("<" + fmt, before)))
+    right_values = (_packed_components(after, format_type) if packed_format else
+                    (item[0] for item in struct.iter_unpack("<" + fmt, after)))
+    for component_index, (left, right) in enumerate(zip(left_values, right_values)):
+        if packed_normalized:
+            # RGB has ten bits and alpha has two. Apply the existing normalized
+            # one-storage-step rule independently, never a shared RGB scale.
+            scale = 3.0 if component_index % 4 == 3 else 1023.0
+            if not depth:
+                absolute = 1.0 / scale
+        a, b = left / scale, right / scale
         if kind == "snorm":
             a, b = max(-1.0, a), max(-1.0, b)
         result["comparedComponents"] += 1
-        if not math.isfinite(a) or not math.isfinite(b):
+        baseline_finite = math.isfinite(a)
+        finite = baseline_finite and math.isfinite(b)
+        if not baseline_finite:
+            result["baselineNonFiniteComponents"] += 1
+        error = abs(a - b) if finite else None
+        allowed = absolute + relative * max(abs(a), abs(b)) if finite else None
+        if finite:
+            result["maximumAbsoluteError"] = max(result["maximumAbsoluteError"], error)
+        if not finite or error > allowed + 1e-15:
             result["failedComponents"] += 1
-            continue
-        error = abs(a - b)
-        result["maximumAbsoluteError"] = max(result["maximumAbsoluteError"], error)
-        if error > absolute + relative * max(abs(a), abs(b)) + 1e-15:
-            result["failedComponents"] += 1
+            pixel_index = component_index // count
+            x, y = pixel_index % descriptor["width"], pixel_index // descriptor["width"]
+            worst = result["worstMismatch"]
+            new_worst = worst is None or (error is not None and worst["absoluteError"] is not None
+                                          and error > worst["absoluteError"])
+            keep_sample = len(result["mismatchSamples"]) < MAX_MISMATCH_SAMPLES
+            if keep_sample or new_worst:
+                sample = {"x": x, "y": y, "component": component_index % count,
+                          "componentIndex": component_index,
+                          "baselineValue": a if math.isfinite(a) else str(a),
+                          "candidateValue": b if math.isfinite(b) else str(b),
+                          "absoluteError": error, "allowedAbsoluteError": allowed,
+                          "reason": "tolerance-exceeded" if finite else "non-finite"}
+                if keep_sample:
+                    result["mismatchSamples"].append(sample)
+                if new_worst:
+                    result["worstMismatch"] = sample
+            if not keep_sample:
+                result["mismatchSamplesTruncated"] = True
+            bounds = result["mismatchBounds"]
+            if bounds is None:
+                result["mismatchBounds"] = {"minX": x, "minY": y, "maxX": x, "maxY": y}
+            else:
+                bounds.update(minX=min(bounds["minX"], x), minY=min(bounds["minY"], y),
+                              maxX=max(bounds["maxX"], x), maxY=max(bounds["maxY"], y))
     result["accepted"] = result["failedComponents"] == 0
     return result
 
 
-def _outputs(bridge, ctrl):
+def _outputs(bridge, ctrl, require_color=True, allow_empty=False):
     rd = bridge.rd
     pipeline = ctrl.GetPipelineState()
     textures = {bridge._resource_id_int(t.resourceId): t for t in ctrl.GetTextures()}
@@ -140,9 +229,198 @@ def _outputs(bridge, ctrl):
         if not raw or len(raw) > OUTPUT_LIMIT or materialized_total > TOTAL_LIMIT:
             raise ValueError("materialized output exceeds observation budget")
         outputs.append((descriptor, raw))
-    if not outputs or not any(d["kind"] == "color" for d, unused in outputs):
+    if (not outputs and not allow_empty) or (require_color and not any(d["kind"] == "color" for d, unused in outputs)):
         raise ValueError("numeric observation requires at least one color output")
     return outputs
+
+
+def _storage_module():
+    from . import shader_storage_validation
+    return shader_storage_validation
+
+
+def _storage_proof(bridge, reflection):
+    return _storage_module().readonly_storage_proof(bridge, reflection)
+
+
+def _vertex_module():
+    from . import shader_vertex_validation
+    return shader_vertex_validation
+
+
+def _observed_outputs(bridge, ctrl, storage_stage=None, observation_kind="fragment", event_id=0):
+    # Dispatches must never compare an old graphics pipeline's render targets.
+    outputs = [] if observation_kind == "compute" else _outputs(
+        bridge, ctrl, require_color=(observation_kind == "fragment"), allow_empty=(observation_kind == "vertex"))
+    if observation_kind == "vertex":
+        outputs += _vertex_module().outputs(bridge, ctrl, event_id,
+            OUTPUT_LIMIT, TOTAL_LIMIT - sum(len(raw) for unused, raw in outputs))
+    if storage_stage is not None:
+        for stage, reflected_resources in storage_stage:
+            observed = _storage_module().storage_outputs(bridge, ctrl, stage,
+                OUTPUT_LIMIT, TOTAL_LIMIT - sum(len(raw) for unused, raw in outputs), reflected_resources)
+            for desc, raw in observed:
+                # Several stages may write the same resource. Compare it once.
+                if not any(existing == desc for existing, unused in outputs):
+                    outputs.append((desc, raw))
+    if not outputs:
+        raise ValueError("selected action has no observable output resources")
+    return outputs
+
+
+def _storage_stages(bridge, ctrl, stage_name, stage, selected_reflection):
+    reflections = [(stage, selected_reflection)]
+    if stage_name not in ("fragment", "compute"):
+        reader = getattr(ctrl.GetPipelineState(), "GetShaderReflection", None)
+        if not callable(reader):
+            raise ValueError("raster-stage observation requires downstream Shader reflection")
+        for name, candidate_stage in bridge._available_shader_stages(
+                ["vertex", "hull", "domain", "geometry", "task", "mesh", "fragment"]):
+            if name == stage_name:
+                continue
+            reflection = reader(candidate_stage)
+            if reflection is not None:
+                reflections.append((candidate_stage, reflection))
+    proofs, writable = [], []
+    for candidate_stage, reflection in reflections:
+        proof = _storage_proof(bridge, reflection)
+        if proof.get("uncovered"):
+            raise ValueError(proof["uncovered"])
+        proofs.append(proof)
+        if not proof["complete"]:
+            writable.append((candidate_stage, list(reflection.readWriteResources)))
+    return proofs, writable
+
+
+def _baseline_repeat_permission(bridge, started):
+    """The optional diagnostic must not extend a slow or cancelled operation."""
+    if time.monotonic() - started >= BASELINE_REPEAT_START_LIMIT_SECONDS:
+        return "diagnostic-budget-exhausted"
+    tracker_reader = getattr(bridge, "_request_event_tracker", None)
+    tracker = tracker_reader() if callable(tracker_reader) else None
+    dispatch_reader = getattr(bridge, "_request_dispatch_context", None)
+    dispatch = dispatch_reader() if callable(dispatch_reader) else None
+    if not isinstance(dispatch, dict):
+        dispatch = tracker.get("dispatchContext") if isinstance(tracker, dict) else None
+    if isinstance(dispatch, dict):
+        for name in ("cancelEvent", "stopEvent", "captureInvalidatedEvent"):
+            event = dispatch.get(name)
+            if event is not None and event.is_set():
+                return "request-cancelled-or-preempted"
+    pending = getattr(bridge, "_foreground_replay_pending", None)
+    generation = getattr(bridge, "_foreground_replay_generation", None)
+    try:
+        if callable(pending) and pending():
+            return "foreground-replay-pending"
+        expected = tracker.get("foregroundReplayGeneration") if isinstance(tracker, dict) else None
+        current = generation() if callable(generation) else None
+        if expected is not None and current is not None and expected != current:
+            return "foreground-replay-generation-changed"
+    except Exception:
+        # An optional diagnostic must not assume an unreadable queue is idle.
+        return "foreground-replay-state-unavailable"
+    return ""
+
+
+def _observe_event(bridge, ctrl, event_id):
+    """Materialize analysis outputs without refreshing viewers between A/B legs."""
+    replay = getattr(ctrl, "ReplayFrameEventForAnalysis", None)
+    if callable(replay):
+        # This native path bypasses replay checkpoints and does one Full replay
+        # when there are no event overrides. SetFrameEvent also refreshes every
+        # ReplayOutput and fetches shader feedback between replay phases.
+        # Those presentation/analysis passes are unnecessary for raw readback.
+        replay(event_id)
+    else:
+        bridge._set_frame_event(ctrl, event_id, True)
+
+
+def _switch_target(bridge, ctrl, api, original, current, target):
+    # Checked replacement methods also replay and refresh viewer outputs.
+    # In particular, removing an already absent replacement must be a no-op
+    # here, not another full replay of the same original Shader.
+    if bridge._resource_id_int(current) == bridge._resource_id_int(target):
+        return
+    if target is None:
+        bridge._remove_shared_shader_resource(ctrl, api, original)
+    else:
+        bridge._replace_shared_shader_resource(ctrl, api, original, target)
+
+
+def _repeat_baseline(bridge, ctrl, api, original, target, event_id, baseline, metrics,
+                     current_target, storage_stage=None, observation_kind="fragment"):
+    _switch_target(bridge, ctrl, api, original, current_target, target)
+    ctrl.ClearReplayCache()
+    _observe_event(bridge, ctrl, event_id)
+    repeated = _observed_outputs(bridge, ctrl, storage_stage, observation_kind, event_id)
+    return _baseline_stability(baseline, repeated, metrics)
+
+
+def _baseline_stability(baseline, repeated, metrics):
+    if [d for d, unused in repeated] != [d for d, unused in baseline]:
+        raise ValueError("baseline repeat output attachment identity changed")
+    repeated_metrics = []
+    for output_index, ((desc, initial), (unused, again)) in enumerate(zip(baseline, repeated)):
+        if initial == again:
+            nonfinite = metrics[output_index]["baselineNonFiniteComponents"]
+            item = {"byteExact": True, "accepted": nonfinite == 0,
+                    "baselineNonFiniteComponents": nonfinite,
+                    "baselineSha256": hashlib.sha256(initial).hexdigest(),
+                    "candidateSha256": hashlib.sha256(again).hexdigest()}
+        else:
+            item = compare_bytes(initial, again, desc)
+        item["output"] = desc
+        repeated_metrics.append(item)
+    return {"checked": True,
+            "byteExact": all(m["byteExact"] for m in repeated_metrics),
+            "withinTolerance": all(m["accepted"] for m in repeated_metrics),
+            "outputs": repeated_metrics}
+
+
+def _paired_observations(bridge, ctrl, event_id, original, baseline, candidate):
+    """Read bounded A/B/A snapshots from one native replay prefix, when admitted."""
+    compare = getattr(ctrl, "ComparePixelShaderPair", None)
+    if not callable(compare):
+        return None, ""
+    pair = compare(event_id, original, baseline if baseline is not None else original,
+                   candidate if candidate is not None else original)
+    if int(pair.eventId) != event_id:
+        raise RuntimeError("paired Shader observation returned a different event")
+    if not pair.supported:
+        return None, str(pair.reason)[:1000]
+    if not pair.completed:
+        raise RuntimeError("paired Shader observation failed: %s" % str(pair.reason)[:1000])
+    snapshots = pair.outputs
+    if not snapshots or len(snapshots) > 9:
+        raise ValueError("paired Shader observation returned invalid attachments")
+    observations, totals, seen = [[], [], []], [0, 0, 0], set()
+    for snapshot in snapshots:
+        kind, index = "depth" if snapshot.depth else "color", int(snapshot.index)
+        key = (kind, index)
+        rid = bridge._resource_id_int(snapshot.resourceId)
+        width, height = int(snapshot.width), int(snapshot.height)
+        sub = snapshot.subresource
+        if (key in seen or index < 0 or index > 7 or not rid
+                or width <= 0 or height <= 0
+                or int(sub.mip) != 0 or int(sub.slice) != 0 or int(sub.sample) != 0):
+            raise ValueError("paired Shader observation returned invalid attachment identity")
+        seen.add(key)
+        fmt = snapshot.format
+        desc = {"kind": kind, "index": index, "resourceId": rid,
+                "mip": 0, "slice": 0, "width": width, "height": height,
+                "format": bridge._fmt_str(fmt), "formatType": _enum(fmt.type),
+                "componentType": _enum(fmt.compType),
+                "componentByteWidth": int(fmt.compByteWidth),
+                "componentCount": int(fmt.compCount)}
+        for leg, field in enumerate(("baseline", "candidate", "baselineRepeat")):
+            value = getattr(snapshot, field)
+            if not value or len(value) > OUTPUT_LIMIT or totals[leg] + len(value) > TOTAL_LIMIT:
+                raise ValueError("paired output exceeds the bounded numeric observation budget")
+            totals[leg] += len(value)
+            observations[leg].append((desc, bytes(value)))
+    if not any(desc["kind"] == "color" for desc, unused in observations[0]):
+        raise ValueError("paired numeric observation requires at least one color output")
+    return observations, ""
 
 
 def compare_candidates(bridge, params):
@@ -153,8 +431,9 @@ def compare_candidates(bridge, params):
     session = params.get("expected_capture_session_id")
     if not session or session != bridge._capture_session_id:
         raise ValueError("capture session changed before shader observation")
-    if bridge._normalise_stage_name(params.get("stage")) != "fragment":
-        raise ValueError("numeric organization observation currently supports fragment shaders")
+    stage_name = bridge._normalise_stage_name(params.get("stage"))
+    if stage_name not in ("vertex", "hull", "domain", "geometry", "fragment", "compute", "task", "mesh"):
+        raise ValueError("selected stage requires a native ray-pipeline observation route; captured data remains exportable")
     events = bridge._shader_override_events(params)
     if len(events) != 1:
         raise ValueError("numeric observation requires one exact event")
@@ -168,27 +447,42 @@ def compare_candidates(bridge, params):
         raise ValueError("captured shader is unavailable")
     bridge._require_shared_shader_ui_owner(original, existing)
     entry = str(params.get("entry_point", ""))
-    stage = dict(bridge._available_shader_stages(["fragment"]))["fragment"]
+    stages = dict(bridge._available_shader_stages([stage_name]))
+    if stage_name not in stages:
+        raise ValueError("selected Shader stage is unavailable in this replay runtime")
+    stage = stages[stage_name]
     encoding_name = str(params.get("encoding", "")).lower()
-    encoding_attr = {"dxil": "DXIL", "dxbc": "DXBC", "spirv": "SPIRV", "opengl-spirv": "OpenGLSPIRV"}.get(encoding_name)
+    encoding_attr = {"dxil": "DXIL", "dxbc": "DXBC", "spirv": "SPIRV",
+                     "opengl-spirv": "OpenGLSPIRV", "glsl": "GLSL"}.get(encoding_name)
     if not encoding_attr or not entry:
         raise ValueError("native candidate encoding and entry point are required")
     encoding = getattr(rd.ShaderEncoding, encoding_attr)
     candidates = []
     for key in ("baseline", "candidate"):
         item = params[key]
-        unused, blob, digest = bridge._read_shader_candidate({"candidate_path": item["path"], "expected_sha256": item["rawSha256"]})
+        unused, blob, digest = bridge._read_shader_candidate({
+            "candidate_path": item["path"], "expected_sha256": item["rawSha256"],
+            "encoding": encoding_name})
         candidates.append((blob, digest))
     visible_event = bridge._request_visible_event_id(0)
 
     def run(ctrl):
         targets, mutated, restored = [], False, False
+        paired_reason = ""
+        current_target = existing["targetResource"] if existing else None
         api = bridge._shader_api_token(ctrl)
         try:
-            live = bridge._validate_live_shader_event(ctrl, event, stage, "fragment", entry,
+            if encoding_name == "glsl" and (api != "opengl" or entry != "main"):
+                raise ValueError("GLSL numeric observation requires OpenGL main")
+            live = bridge._validate_live_shader_event(ctrl, event, stage, stage_name, entry,
                 require_d3d11_state=(api == "d3d11"), owned_shared_replacement=existing)
-            if list(getattr(live["reflection"], "readWriteResources", []) or []):
-                raise ValueError("UAV side effects require a dedicated validation fixture")
+            storage_proofs, storage_stages = _storage_stages(
+                bridge, ctrl, stage_name, stage, live["reflection"])
+            # Reserve enough orphan capacity for the whole A/B build before
+            # allocating either target. Both releases can fail independently.
+            bridge._require_shader_target_build_capacity(sum(
+                1 for unused_blob, digest in candidates
+                if digest != event.get("expectedOriginalSha256")))
             for blob, digest in candidates:
                 # Native DXIL creation may deduplicate an exact original to
                 # its captured ResourceId. Observe that baseline directly;
@@ -196,18 +490,23 @@ def compare_candidates(bridge, params):
                 if digest == event.get("expectedOriginalSha256"):
                     targets.append(None)
                     continue
-                target, messages = ctrl.BuildTargetShader(entry, encoding, blob, rd.ShaderCompileFlags(), stage)
+                target, messages = bridge._build_target_shader(
+                    ctrl, entry, encoding, blob,
+                    rd.ShaderCompileFlags(), stage)
                 if not bridge._resource_id_int(target):
                     raise RuntimeError("BuildTargetShader failed: %s" % messages)
                 targets.append(target)
-                target_entry = bridge._exact_shader_entry(list(ctrl.GetShaderEntryPoints(target)), entry, "fragment")
+                target_entry = bridge._exact_shader_entry(list(ctrl.GetShaderEntryPoints(target)), entry, stage_name)
                 if target_entry is None:
                     raise ValueError("candidate entry is ambiguous")
                 reflection = ctrl.GetShader(rd.ResourceId(), target, target_entry)
                 if not reflection or hashlib.sha256(bridge._shader_raw_bytes(reflection)).hexdigest() != digest:
                     raise ValueError("built candidate identity changed")
-                if list(getattr(reflection, "readWriteResources", []) or []):
-                    raise ValueError("candidate introduces UAV side effects")
+                if encoding_name == "glsl" and str(getattr(reflection, "encoding", "")).lower().replace("shaderencoding.", "") != "glsl":
+                    raise ValueError("built GLSL candidate encoding changed")
+                storage_proofs.append(_storage_proof(bridge, reflection))
+                if storage_proofs[-1].get("uncovered"):
+                    raise ValueError(storage_proofs[-1]["uncovered"])
                 if encoding_name == "dxil":
                     compatible = bridge._dxil_ambiguous_interface_compatible(ctrl, live["pipelineResource"], live["reflection"], reflection,
                         baseline_access=live.get("dxilAccessSignature"), baseline_layout_evidence=live.get("dxilLayoutEvidence"))
@@ -215,16 +514,33 @@ def compare_candidates(bridge, params):
                     compatible = bridge._physical_shader_interfaces_compatible(live["reflection"], reflection)
                 if not compatible:
                     raise ValueError("numeric observation cannot bypass a physical ABI mismatch")
-            observations = []
-            for target in targets:
+            needs_storage = not all(proof["complete"] for proof in storage_proofs)
+            # Candidate ABI checks above retain the same storage binding table.
+            if needs_storage and not any(s == stage for s, unused in storage_stages):
+                storage_stages.append((stage, list(live["reflection"].readWriteResources)))
+            storage_stage = storage_stages if needs_storage else None
+            paired, paired_reason = None, ""
+            # A native paired draw retains the same upstream inputs and restores
+            # RT/DS contents before each A/B/A leg. It is useful precisely where
+            # replaying the entire frame independently produces a moving baseline.
+            # Either side may be a captured original or an earlier compiled draft.
+            if (stage_name == "fragment" and not needs_storage
+                    and callable(getattr(ctrl, "ComparePixelShaderPair", None))):
                 mutated = True
-                if target is None:
-                    bridge._remove_shared_shader_resource(ctrl, api, original)
-                else:
-                    bridge._replace_shared_shader_resource(ctrl, api, original, target)
+                _switch_target(bridge, ctrl, api, original, current_target, None)
+                current_target = None
                 ctrl.ClearReplayCache()
-                bridge._set_frame_event(ctrl, event["eventId"], True)
-                observations.append(_outputs(bridge, ctrl))
+                paired, paired_reason = _paired_observations(
+                    bridge, ctrl, event["eventId"], original, targets[0], targets[1])
+            observations = paired[:2] if paired is not None else []
+            if paired is None:
+                for target in targets:
+                    mutated = True
+                    _switch_target(bridge, ctrl, api, original, current_target, target)
+                    current_target = target
+                    ctrl.ClearReplayCache()
+                    _observe_event(bridge, ctrl, event["eventId"])
+                    observations.append(_observed_outputs(bridge, ctrl, storage_stage, stage_name, event["eventId"]))
             if len(observations[0]) != len(observations[1]):
                 raise ValueError("output attachment count changed")
             metrics = []
@@ -240,11 +556,70 @@ def compare_candidates(bridge, params):
             if session != bridge._capture_session_id:
                 raise RuntimeError("capture session changed during shader observation")
             result = {"captureId": capture_id, "captureSessionId": session,
+                      "stage": stage_name, "observationScope": ("dispatch-storage" if stage_name == "compute" else "raster-outputs"),
                       "eventId": event["eventId"], "accepted": all(m["accepted"] for m in metrics),
                       "metrics": {"outputs": metrics, "coverage": "all-stored-output-data"},
                       "tolerances": dict(TOLERANCES),
                       "sampleCount": sum(m["comparedComponents"] for m in metrics),
+                      "replayMethod": ("same-input-paired-draw" if paired is not None else
+                          "analysis-full" if callable(getattr(
+                          ctrl, "ReplayFrameEventForAnalysis", None)) else "frame-event"),
                       "semanticEquivalenceVerified": False}
+            result["storageValidation"] = {
+                "mode": "full-resource-bytes" if needs_storage else "read-only-or-absent",
+                "readOnlyProofs": storage_proofs,
+                "outputCount": sum(1 for desc, unused in observations[0]
+                                   if desc["kind"].startswith("storage-")),
+            }
+            if paired_reason:
+                result["pairedReplayUnavailable"] = paired_reason
+            stability = None
+            if paired is not None:
+                stability = _baseline_stability(observations[0], paired[2], metrics)
+                result["baselineStability"] = stability
+                # A matching candidate cannot hide a nonrepeatable baseline.
+                result["accepted"] = result["accepted"] and stability["withinTolerance"]
+            requires_stability = needs_storage or stage_name != "fragment"
+            if not result["accepted"] or requires_stability:
+                skip_reason = _baseline_repeat_permission(bridge, started) if stability is None else ""
+                if stability is None:
+                    stability = {"checked": False, "reason": skip_reason}
+                if paired is None and not skip_reason:
+                    # One failed-only A/B/A observation distinguishes an unstable
+                    # baseline from a repeatable source difference. Release B's
+                    # bytes before reading A again to retain the existing memory
+                    # bound. This never turns the rejected A/B into acceptance.
+                    observations[1] = []
+                    right = None  # Drop the comparison loop's last B readback too.
+                    try:
+                        stability = _repeat_baseline(bridge, ctrl, api, original, targets[0],
+                            event["eventId"], observations[0], metrics, current_target,
+                            storage_stage=storage_stage, observation_kind=stage_name)
+                        current_target = targets[0]
+                    except Exception as error:
+                        # A/B already produced usable failure coordinates. Keep
+                        # them even if this optional third read is unavailable.
+                        # The outer finally still makes failed restoration fatal.
+                        stability = {"checked": False, "reason": "baseline-repeat-failed",
+                                     "errorType": type(error).__name__, "error": str(error)[:1000]}
+                    if session != bridge._capture_session_id:
+                        raise RuntimeError("capture session changed during baseline repeat")
+                result["baselineStability"] = stability
+                if requires_stability:
+                    result["accepted"] = (result["accepted"] and stability.get("checked", False)
+                                          and stability.get("withinTolerance", False))
+                    if not stability.get("checked"):
+                        result.update(diagnosticCode="storage-baseline-repeat-unavailable" if needs_storage else "raster-baseline-repeat-unavailable",
+                            reason="Output comparison requires a repeatable full replay baseline.",
+                            nextAction="retry-observation-with-available-replay-budget")
+                if stability.get("checked") and not stability.get("withinTolerance"):
+                    result.update({
+                        "diagnosticCode": "baseline-replay-unstable",
+                        "candidateDifferenceConclusive": False,
+                        "reason": "Original Shader replay also exceeds the fixed comparison tolerance; "
+                                  "the observed difference cannot yet be attributed to the candidate.",
+                        "nextAction": "stabilize-replay-and-localize-difference",
+                    })
         except ValueError as error:
             result = {"captureId": capture_id, "captureSessionId": session,
                       "eventId": event["eventId"], "accepted": False,
@@ -252,6 +627,8 @@ def compare_candidates(bridge, params):
                       "metrics": {"outputs": [], "coverage": "unsupported"},
                       "tolerances": dict(TOLERANCES),
                       "semanticEquivalenceVerified": False}
+            if paired_reason:
+                result["pairedReplayUnavailable"] = paired_reason
         finally:
             try:
                 if mutated:
@@ -263,12 +640,21 @@ def compare_candidates(bridge, params):
                 bridge._set_frame_event(ctrl, visible_event, True)
                 restored = True
             finally:
-                if restored:
-                    for target in targets:
-                        if target is not None:
+                for target in targets:
+                    if target is None:
+                        continue
+                    if restored:
+                        try:
                             ctrl.FreeTargetResource(target)
-                # If restoration failed, retain targets referenced by replay;
-                # the failed RPC cannot produce acceptable review evidence.
+                        except Exception:
+                            bridge._register_orphan_shader_target(target)
+                    else:
+                        # Restoration failed, so a live replacement may still
+                        # bind this target; freeing it now could crash replay.
+                        # Hand it to the Host-owned orphan sweep, which frees it
+                        # once the binding clears instead of leaking it for the
+                        # capture's lifetime.
+                        bridge._register_orphan_shader_target(target)
         result["replayRestored"] = True
         result["durationMilliseconds"] = round((time.monotonic() - started) * 1000)
         return result

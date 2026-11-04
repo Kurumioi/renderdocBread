@@ -18,7 +18,7 @@
     "RGBA", "RGB", "MSAA", "UNORM", "SNORM", "UINT", "SINT", "FLOAT", "SRGB",
     "NaN", "Inf", "UUID", "GUID", "CSV", "JSON", "CLI", "URL", "HTTP", "HTTPS", "TLS",
     "ACP", "MCP", "OAuth", "OpenAI", "ChatGPT", "Python", "Qt", "C++",
-    "RenderDoc", "qrenderdoc", "ReplayLab", "NVIDIA", "AMD", "Intel", "ARM", "Radeon",
+    "RenderDoc", "qrenderdoc", "ReplayLab", "Bread", "NVIDIA", "AMD", "Intel", "ARM", "Radeon",
     "Windows", "Linux", "Android", "macOS", "Wayland", "X11", "GitHub",
     "PID", "TCP", "IPv4", "IPv6",
     "X", "Y", "Z", "W", "R", "G", "B"

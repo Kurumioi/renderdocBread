@@ -36,7 +36,7 @@ def test_task_events_are_append_only_jsonl_with_monotonic_sequence(tmp_path) -> 
     assert all(item["taskId"] == "task-abc" for item in payloads)
 
 
-def test_progress_reporter_chunks_large_public_streams_and_terminal_report(tmp_path) -> None:
+def test_progress_reporter_chunks_large_public_streams_and_terminal_answer(tmp_path) -> None:
     writer = TaskEventWriter(tmp_path, task_id="bounded-stream")
     reporter = ProgressReporter(
         writer, profile_id="local", backend="openai", strategy="deepagents/v1"
@@ -49,16 +49,6 @@ def test_progress_reporter_chunks_large_public_streams_and_terminal_report(tmp_p
     reporter.completed(
         text="完成",
         terminal_status="completed",
-        report={
-            "schema": "replaylab-task-report/v1",
-            "summary": "完成",
-            "status": "completed",
-            "findings": [],
-            "artifacts": [],
-            "unknowns": [],
-            "next_steps": [],
-        },
-        verification={"accepted": True, "followUps": 0, "reasons": []},
     )
 
     raw_lines = writer.path.read_bytes().splitlines()
@@ -69,8 +59,11 @@ def test_progress_reporter_chunks_large_public_streams_and_terminal_report(tmp_p
     terminal = payloads[-1]
     assert terminal["kind"] == "completed"
     assert terminal["deliveryId"].startswith("agent-")
-    assert terminal["data"]["report"]["summary"] == "完成"
-    assert terminal["data"]["verification"]["accepted"] is True
+    assert terminal["data"]["terminalStatus"] == "completed"
+    assert terminal["data"]["completionScope"] == "agent-turn"
+    assert terminal["data"]["acceptanceAuthority"] == "agent"
+    assert "report" not in terminal["data"]
+    assert "verification" not in terminal["data"]
 
 
 def test_task_events_resume_sequence_and_redact_sensitive_data(tmp_path) -> None:

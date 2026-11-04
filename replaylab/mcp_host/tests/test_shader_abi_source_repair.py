@@ -82,7 +82,8 @@ class AbiSourceRepairTests(unittest.TestCase):
         self.assertTrue(result["sourceRestored"])
         self.assertEqual(self.service.source_path.read_bytes(), self.original)
         self.assertEqual(result["currentSourceSha256"], self._sha(self.original))
-        self.assertEqual(result["nextTool"], "repair_shader_workspace_source_abi")
+        self.assertEqual(result["state"], "abi-repair-rejected")
+        self.assertNotIn("allowedActions", result)
         self.assertIn("failure", result)
         receipt = json.loads(Path(result["receiptPath"]).read_text("utf-8"))
         self.assertFalse(receipt["accepted"])
@@ -106,7 +107,8 @@ class AbiSourceRepairTests(unittest.TestCase):
             str(self.root), self._sha(self.original), attempt.decode(),
             acknowledge_semantic_equivalence_unverified=True)
         self.assertTrue(result["accepted"], result)
-        self.assertEqual(result["nextTool"], "begin_shader_workspace_organization")
+        self.assertEqual(result["state"], "abi-repaired")
+        self.assertNotIn("availableCapabilities", result)
         self.assertEqual(self.service.source_path.read_bytes(), attempt)
         self.assertEqual(result["currentSourceSha256"], self._sha(attempt))
         self.assertEqual(result["abiGate"]["status"], "compatible")
@@ -125,6 +127,134 @@ class AbiSourceRepairTests(unittest.TestCase):
                 acknowledge_semantic_equivalence_unverified=False)
         opened = self.manager.begin(str(self.root), {"schema": "test-semantic-context/v1"})
         self.assertEqual(len(str(opened.get("organizationId", ""))), 32, opened)
+
+    def test_missing_decompiler_original_uses_current_source_fallback(self) -> None:
+        edited = self.original.replace(b"return 1.0", b"return 1.0 /*existing edit*/")
+        self.service.source_path.write_bytes(edited)
+        original_path = self.root / "ai" / "decompiler-original.hlsl"
+        self.assertFalse(original_path.exists())
+        attempt = edited.replace(b"float4 c", b"float4 c /*abi-fixed*/")
+
+        result = self.manager.repair_baseline_source(
+            str(self.root), self._sha(edited), attempt.decode(),
+            acknowledge_semantic_equivalence_unverified=True,
+        )
+
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(self.service.source_path.read_bytes(), attempt)
+        self.assertFalse(original_path.exists())
+        provenance = result["baselineSourceProvenance"]
+        self.assertEqual(provenance["kind"], "current-workspace-source-fallback")
+        self.assertEqual(provenance["baselineSourceSha256"], self._sha(edited))
+        self.assertFalse(provenance["decompilerOriginalPreserved"])
+        self.assertEqual(
+            provenance["fallbackReason"],
+            "decompiler-original-missing-for-edited-source",
+        )
+        self.assertEqual(
+            result["capturedProgramIdentity"]["physicalAbiSha256"],
+            hashlib.sha256(b"{}").hexdigest(),
+        )
+        receipt = json.loads(Path(result["receiptPath"]).read_text("utf-8"))
+        self.assertEqual(receipt["baselineSourceProvenance"], provenance)
+
+        opened = self.manager.begin(
+            str(self.root), {"schema": "test-semantic-context/v1"}
+        )
+        self.assertEqual(
+            opened["semanticContext"]["baselineSourceProvenance"]["kind"],
+            "current-workspace-source-fallback",
+        )
+        self.assertFalse(original_path.exists())
+
+    def test_repair_rejects_physical_target_change_before_source_swap(self) -> None:
+        mutations = {
+            "raw": lambda status: (
+                status["baseline"].__setitem__("rawSha256", "4" * 64),
+                status["shader"].__setitem__("rawSha256", "4" * 64),
+            ),
+            "stage": lambda status: (
+                status.__setitem__("stage", "vertex"),
+                status["shader"].__setitem__("stage", "vertex"),
+            ),
+            "entry": lambda status: (
+                status.__setitem__("entryPoint", "OtherPS"),
+                status["shader"].__setitem__("entryPoint", "OtherPS"),
+            ),
+            "layout": lambda status: status["baseline"].__setitem__(
+                "compiledInterface", {"inputs": [{"semantic": "TEXCOORD0"}]}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(identity=label):
+                root = self.root / label
+                root.mkdir()
+                service = _CheckingService(root, self.original)
+                real_status = service.status
+                calls = 0
+
+                def drifting_status(workspace_path: str) -> dict:
+                    nonlocal calls
+                    value = real_status(workspace_path)
+                    calls += 1
+                    if calls >= 2:
+                        mutate(value)
+                    return value
+
+                service.status = drifting_status  # type: ignore[method-assign]
+                manager = ShaderOrganizationManager(
+                    lambda service=service: service,
+                    lambda *_args: self.fail("physical drift must stop before compile"),
+                )
+                attempt = self.original.replace(
+                    b"float4 c", b"float4 c /*abi-fixed*/"
+                )
+                with self.assertRaisesRegex(
+                    ShaderOrganizationError,
+                    "raw/stage/entry/layout identity changed",
+                ):
+                    manager.repair_baseline_source(
+                        str(root), self._sha(self.original), attempt.decode(),
+                        acknowledge_semantic_equivalence_unverified=True,
+                    )
+                self.assertEqual(service.source_path.read_bytes(), self.original)
+                self.assertFalse((root / "ai" / "abi-repair-attempts").exists())
+
+    def test_physical_target_change_after_compile_restores_previous_source(self) -> None:
+        real_status = self.service.status
+        calls = 0
+
+        def drifting_status(workspace_path: str) -> dict:
+            nonlocal calls
+            value = real_status(workspace_path)
+            calls += 1
+            # Calls 1/2 bind the transaction; call 3 probes reusable evidence;
+            # call 4 verifies the fresh compile; call 5 is the final receipt
+            # observation and simulates the capture target changing there.
+            if calls >= 5:
+                value["baseline"]["rawSha256"] = "4" * 64
+                value["shader"]["rawSha256"] = "4" * 64
+            return value
+
+        self.service.status = drifting_status  # type: ignore[method-assign]
+        attempt = self.original.replace(b"float4 c", b"float4 c /*abi-fixed*/")
+
+        result = self.manager.repair_baseline_source(
+            str(self.root), self._sha(self.original), attempt.decode(),
+            acknowledge_semantic_equivalence_unverified=True,
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertTrue(result["sourceRestored"])
+        self.assertEqual(self.service.source_path.read_bytes(), self.original)
+        self.assertIn(
+            "raw/stage/entry/layout identity changed",
+            result["failure"]["message"],
+        )
+        receipt = json.loads(Path(result["receiptPath"]).read_text("utf-8"))
+        self.assertEqual(
+            receipt["observedProgramIdentity"]["originalRawSha256"], "4" * 64
+        )
 
     def test_failed_begin_session_gets_an_actionable_message(self) -> None:
         session_dir = self.root / "ai" / "organization-sessions" / ("c" * 32)

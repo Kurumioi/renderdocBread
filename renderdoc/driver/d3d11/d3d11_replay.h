@@ -274,7 +274,9 @@ public:
   void ClearReplayCache();
   void ReloadShaderDebugInformation();
   rdcstr SetEventShaderOverride(uint32_t eventId, ShaderStage stage, ResourceId expectedOriginal,
-                                ResourceId replacement);
+                                ResourceId replacement, uint32_t outputTarget = ~0U,
+                                bool independentFloatOutput = false);
+  TextureDescription GetEventShaderPreviewTexture(uint32_t eventId, ShaderStage stage);
   void ClearEventShaderOverride(uint32_t eventId, ShaderStage stage);
   void ClearEventShaderOverrides();
   void ClearEventShaderOverridesForResource(ResourceId id);
@@ -470,6 +472,8 @@ private:
     ResourceId replacementId;
     ID3D11DeviceChild *replacement = NULL;
     uint32_t shaderExtSlot = ~0U;
+    uint32_t outputTarget = ~0U;
+    bool independentFloatOutput = false;
   };
 
   struct AppliedEventShaderOverride
@@ -482,6 +486,35 @@ private:
 
   std::map<std::pair<uint32_t, ShaderStage>, EventShaderOverride> m_EventShaderOverrides;
   rdcarray<AppliedEventShaderOverride> m_AppliedEventShaderOverrides;
+  std::map<std::pair<ResourceId, uint32_t>, ID3D11BlendState *> m_EventShaderBlendStates;
+  ID3D11BlendState *m_EventShaderPreviousBlend = NULL;
+  bool m_EventShaderBlendApplied = false;
+  FLOAT m_EventShaderPreviousBlendFactor[4] = {};
+  UINT m_EventShaderPreviousSampleMask = ~0U;
+
+  struct EventShaderPreview
+  {
+    ResourceId sourceViews[8] = {};
+    ResourceId sourceResources[9] = {};
+    ResourceId sourceDepthView;
+    uint32_t outputTarget = ~0U;
+    ID3D11Resource *colors[8] = {};
+    ID3D11RenderTargetView *views[8] = {};
+    ID3D11Resource *depth = NULL;
+    ID3D11DepthStencilView *depthView = NULL;
+    TextureDescription description;
+    uint64_t bytes = 0, used = 0;
+  };
+  std::map<std::pair<uint32_t, ShaderStage>, EventShaderPreview> m_EventShaderPreviews;
+  uint64_t m_EventShaderPreviewSerial = 0;
+  ID3D11RenderTargetView *m_EventShaderPreviousTargets[8] = {};
+  ID3D11DepthStencilView *m_EventShaderPreviousDepth = NULL;
+  bool m_EventShaderTargetsApplied = false;
+  UINT m_EventShaderPreviousTargetCount = 0;
+  rdcstr PrepareEventShaderPreview(uint32_t eventId, uint32_t outputTarget,
+                                  EventShaderPreview *&preview);
+  void ReleaseEventShaderPreviews();
+
 
   struct EventCBufferOverride
   {

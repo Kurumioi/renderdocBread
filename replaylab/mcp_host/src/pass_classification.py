@@ -701,8 +701,9 @@ def _utility_destination_outputs(
 
     RenderDoc commonly exposes a Copy/Resolve destination both through the
     dedicated ``copyDestination`` field and through ``action.outputs``.  Those
-    fields describe one physical write, not two independent writers.  Prefer
-    the dedicated access while retaining every exposed role for inspection.
+    fields describe one physical write, not two independent writers. Bound
+    RTV/DSV fields can also be stale state from an earlier draw. When an exact
+    destination is known, retain only aliases of that destination.
     """
 
     result: list[dict[str, Any]] = []
@@ -737,10 +738,13 @@ def _utility_destination_outputs(
 
     for destination in copy_destinations:
         add(destination, "copy-destination")
+    exact_ids = {_safe_int(row.get("resourceId"), 0) for row in copy_destinations} - {0}
     for destination in depth_destinations:
-        add(destination, "action-depth-output")
+        if not exact_ids or _safe_int(destination.get("resourceId"), 0) in exact_ids:
+            add(destination, "action-depth-output")
     for destination in action_outputs:
-        add(destination, "action-output")
+        if not exact_ids or _safe_int(destination.get("resourceId"), 0) in exact_ids:
+            add(destination, "action-output")
     return result
 
 
@@ -3443,7 +3447,7 @@ class PassKnowledgeStore:
             or value.get("schemaVersion") != 1
         ):
             raise PassClassificationError(
-                "unsupported ReplayLab project schema/version"
+                "unsupported Bread project schema/version"
             )
         project_id = str(value.get("projectId", ""))
         if not PROJECT_ID_RE.fullmatch(project_id):

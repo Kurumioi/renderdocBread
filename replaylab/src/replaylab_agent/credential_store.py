@@ -193,11 +193,11 @@ class WindowsCredentialStore:
         credential = _CREDENTIALW()
         credential.Type = self._CRED_TYPE_GENERIC
         credential.TargetName = target
-        credential.Comment = "ReplayLab qrenderdoc model API credential"
+        credential.Comment = "Bread qrenderdoc model API credential"
         credential.CredentialBlobSize = len(encoded)
         credential.CredentialBlob = ctypes.cast(blob, _LPBYTE)
         credential.Persist = self._CRED_PERSIST_LOCAL_MACHINE
-        credential.UserName = f"ReplayLab profile {profile_id}"
+        credential.UserName = f"Bread profile {profile_id}"
         try:
             ctypes.set_last_error(0)
             if not self._api.CredWriteW(ctypes.byref(credential), 0):

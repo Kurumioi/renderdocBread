@@ -2,21 +2,33 @@
 
 from __future__ import annotations
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def completed_general_review_for_existing_api_cases(monkeypatch):
+    """Isolate existing API contracts; real review calls are covered separately."""
+    from replaylab_agent.task_review import completion_review_state
+    def reviewed(store, tracker):
+        store.record_task_review("complete", [{"requirement": "Existing API test outcome", "status": "satisfied", "evidence": "Scripted test outcome"}], [], [])
+        return completion_review_state(store, tracker)
+    monkeypatch.setattr("replaylab_agent.deep_engine.completion_review_state", reviewed)
+
 import asyncio
-import functools
 import json
-import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
+import pytest
+
 from replaylab_agent import deep_engine
 from replaylab_agent.agent_contracts import OrchestratorConfig, RunRequest
 from replaylab_agent.agent_diagnostics import close_logging
-from replaylab_agent.agent_report import TaskReportStore
 from replaylab_agent.agent_registry import CatalogView
 from replaylab_agent.deep_engine import DeepAgentsEngine
 from replaylab_agent.profiles import Profile
@@ -37,8 +49,24 @@ description: Reconstruct one capture-bound shader.
 metadata:
   replaylab-category: shader-workbench
 ---
-Use inspect_shader first. Prepare and review the workspace.
+Inspect the shader and choose useful tools for the requested outcome.
 """
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "cancelled"])
+def test_task_cleanup_never_infers_replay_rollback_from_terminal_status(
+    terminal_status: str,
+) -> None:
+    calls: list[dict[str, bool]] = []
+
+    async def release(arguments: dict[str, bool]) -> None:
+        calls.append(arguments)
+
+    tool = types.SimpleNamespace(ainvoke=release)
+    asyncio.run(deep_engine._maybe_release_task_shader_occupancy(
+        {"release_task_shader_occupancy": tool}, terminal_status=terminal_status,
+    ))
+    assert calls == [{"rollback_incomplete_replacement": False}]
 
 CORE_MD = """---
 name: replaylab-core
@@ -47,7 +75,7 @@ metadata:
   replaylab-category: core
   replaylab-always: "true"
 ---
-Copy identifiers exactly. Mark observed and inferred facts. Call report_task_result.
+Copy identifiers exactly. Mark observed and inferred facts.
 """
 
 
@@ -59,10 +87,14 @@ def _context() -> dict[str, Any]:
             "path": "D:/capture.rdc",
             "api": "D3D12",
             "captureSessionId": "a" * 32,
+            "captureId": "b" * 64,
         },
         "events": {"currentEventId": 13353, "selectedEventId": 13353},
         "action": {"eventId": 13353, "name": "DrawIndexed"},
-        "shaders": {"bound": []},
+        "shaders": {"bound": [], "focused": {
+            "resourceId": "1000000000000013353", "stage": "PS",
+            "entryPoint": "MainPS", "rawSha256": "c" * 64,
+        }},
         "texture": {"available": False},
     }
 
@@ -79,6 +111,63 @@ def _envelope(text: str, history: list[tuple[str, str]] | None = None) -> str:
         },
         ensure_ascii=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_deep_request_conversation_identity_reaches_route_and_host_state(
+    tmp_path, monkeypatch
+) -> None:
+    event_root = tmp_path / "events"
+    host = tmp_path / "BreadMCP.exe"
+    host.write_bytes(b"host")
+    observed: dict[str, Any] = {}
+    real_build_route = deep_engine.build_native_mcp_route
+
+    def capture_route(context, **kwargs):
+        assert context.conversation_id == "conversation-deep-api"
+        # The API process consumes the full definitions privately and builds its
+        # own lazy model-facing gateway; asking the proxy for its native-vendor
+        # compact view here would leave no Host schemas to dispatch.
+        assert kwargs["skill_roots"] == ()
+        assert kwargs["full_host_catalog"] is True
+        route = real_build_route(context, **kwargs)
+        assert route is not None
+        assert "--full-host-catalog" in route.args
+        observed["route"] = route
+        observed["task_env"] = dict(route.env)
+        # This contract test only needs admission and environment projection; avoiding
+        # the subprocess keeps it independent of an installed RenderDoc MCP runtime.
+        return None
+
+    monkeypatch.setattr(deep_engine, "build_native_mcp_route", capture_route)
+    config = OrchestratorConfig(
+        event_root=event_root,
+        log_root=tmp_path / "logs",
+        workspace_base=tmp_path / "workspaces",
+        skill_roots=(tmp_path / "skills",),
+    )
+    request = RunRequest(
+        prompt="organize this shader",
+        profile=Profile(id="model-api", preset="openai", model="gpt-x"),
+        task_id="deep-conversation-route",
+        context=_context(),
+        instance_id="instance-1",
+        conversation_id="conversation-deep-api",
+        mcp_executable=host,
+    )
+
+    session = deep_engine.BreadMCPTools(request, config, event_root)
+    async with session as tools:
+        assert tools == {}
+        physical_root = session.workspace_root
+        assert physical_root is not None and physical_root.is_dir()
+        assert observed["task_env"]["REPLAYLAB_AGENT_WORKSPACE_ROOT"] == str(physical_root)
+
+    assert session.workspace_root is None
+    assert not physical_root.exists()
+
+    assert observed["route"].env["REPLAYLAB_CONVERSATION_ID"] == "conversation-deep-api"
+    assert observed["task_env"]["REPLAYLAB_CONVERSATION_ID"] == "conversation-deep-api"
 
 
 class Msg:
@@ -110,12 +199,18 @@ class FakeDeepagents:
         tools: list[Any],
         subagents: list[dict[str, Any]],
         system_prompt: str,
+        backend: Any,
+        checkpointer: Any = None,
+        middleware: Any = None,
     ) -> Any:
         record = {
             "model": model,
             "tools": tools,
             "subagents": subagents,
             "system_prompt": system_prompt,
+            "backend": backend,
+            "checkpointer": checkpointer,
+            "middleware": middleware,
         }
         self.created.append(record)
         script = self.script
@@ -133,6 +228,14 @@ class FakeDeepagents:
                         actual = known.get(event["name"])
                         if actual is not None:
                             await actual.coroutine(**event.get("data", {}).get("input", {}))
+                        elif "invoke_bread_tool" in known:
+                            await known["list_bread_capabilities"].coroutine(
+                                tool=event["name"]
+                            )
+                            await known["invoke_bread_tool"].coroutine(
+                                name=event["name"],
+                                arguments=event.get("data", {}).get("input", {}),
+                            )
                     yield event
 
         return Agent()
@@ -158,7 +261,7 @@ def ev(
 class FakeToolSession:
     def __init__(self, holder: dict[str, Any], request: Any, event_root: Path) -> None:
         self.holder = holder
-        self.store = TaskReportStore(request.task_id, event_root)
+        del request, event_root
 
     async def __aenter__(self) -> dict[str, Any]:
         async def inspect_event(event_id: int) -> str:
@@ -179,17 +282,8 @@ class FakeToolSession:
             """Apply one reviewed shader workspace."""
             return json.dumps({"workspace": workspace_path})
 
-        def observed(function):
-            @functools.wraps(function)
-            async def call(**arguments):
-                self.store.record_tool(function.__name__)
-                result = await function(**arguments)
-                self.store.record_result(function.__name__, result)
-                return result
-            return call
-
         tools = {
-            function.__name__: deep_engine._langchain_tool(function.__name__, observed(function))
+            function.__name__: deep_engine._langchain_tool(function.__name__, function)
             for function in (
                 inspect_event,
                 inspect_shader,
@@ -207,10 +301,6 @@ class FakeToolSession:
 # unittest's isolated loop keeps the scripted async generators deterministic on Windows.
 class DeepEngineTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self._verify_patch = mock.patch.dict(
-            os.environ, {"REPLAYLAB_VERIFY_MAX_ROUNDS": "0"}
-        )
-        self._verify_patch.start()
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         skills = root / "skills"
@@ -225,13 +315,13 @@ class DeepEngineTests(unittest.IsolatedAsyncioTestCase):
         self.events_root = root / "ai-tasks"
         self.config = OrchestratorConfig(
             event_root=self.events_root,
+            workspace_base=root / "workspaces",
             log_root=root / "logs",
             heartbeat_seconds=0.05,
         )
         self.tool_holder: dict[str, Any] = {}
 
     def tearDown(self) -> None:
-        self._verify_patch.stop()
         close_logging()
         self.tmp.cleanup()
 
@@ -256,6 +346,40 @@ class DeepEngineTests(unittest.IsolatedAsyncioTestCase):
             **kwargs,
         )
 
+    def test_api_prompt_carries_target_without_replaying_old_shader_checkpoint(self) -> None:
+        run = deep_engine._DeepRun(
+            self._engine(None)[0],
+            self._request(
+                "Explain the selected shader.",
+                intent={"kind": "reverse-edit-selected-shader", "arguments": {}},
+            ),
+            mock.Mock(),
+            event_root=self.events_root,
+        )
+        prompt, _language = run.user_prompt()
+        self.assertIn("Selected Shader action", str(prompt))
+        self.assertIn("MainPS", str(prompt))
+        self.assertNotIn("report_task_result", str(prompt))
+
+    def test_api_explicit_skill_is_guidance_without_forced_delegation(self) -> None:
+        engine, fake = self._engine(None)
+        run = deep_engine._DeepRun(
+            engine,
+            self._request(
+                "Explain the selected shader.",
+                skill_name="renderdoc-shader-workbench",
+            ),
+            mock.Mock(),
+            event_root=self.events_root,
+        )
+        run.build_agent()
+        self.addCleanup(run._cleanup_workspace)
+        system_prompt = str(fake.created[-1]["system_prompt"])
+        self.assertIn("## Selected Skill: renderdoc-shader-workbench", system_prompt)
+        self.assertIn("choose useful tools", system_prompt)
+        user_prompt, _language = run.user_prompt()
+        self.assertNotIn("use that sub-agent", str(user_prompt))
+
     def test_subagent_effects_preserve_configured_replay_and_respect_ceiling(self) -> None:
         engine, unused_fake = self._engine(None)
         self.assertIn("replay", engine.subagent_effects())
@@ -263,6 +387,161 @@ class DeepEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.subagent_effects(), ("project", "workspace"))
         self.config.allowed_effects = frozenset()
         self.assertEqual(engine.subagent_effects(), ())
+
+    async def test_lazy_invoker_checks_parameterized_effects_per_call(self) -> None:
+        engine, unused_fake = self._engine(None)
+        run = deep_engine._DeepRun(
+            engine,
+            self._request("classify passes"),
+            mock.Mock(),
+            event_root=self.events_root,
+        )
+        calls: list[dict[str, Any]] = []
+
+        async def classify_current_frame_passes(
+            publish_to_ui: bool = True,
+            persist_project: bool = False,
+        ) -> str:
+            """Classify frame passes with optional publication effects."""
+
+            calls.append({
+                "publish_to_ui": publish_to_ui,
+                "persist_project": persist_project,
+            })
+            return "ok"
+
+        name = "classify_current_frame_passes"
+        run.renderdoc_tool_map[name] = deep_engine._langchain_tool(
+            name, classify_current_frame_passes
+        )
+        self.assertFalse(run.skill_gateway().tool_contract_loaded(name))
+        invoke = run.invoke_tool(("ui",)).coroutine
+
+        self.assertEqual(
+            await invoke(
+                name=name,
+                arguments={"publish_to_ui": False, "persist_project": False},
+            ),
+            "ok",
+        )
+        self.assertEqual(
+            await invoke(
+                name=name,
+                arguments={"publish_to_ui": True, "persist_project": False},
+            ),
+            "ok",
+        )
+        denied = await invoke(
+            name=name,
+            arguments={"publish_to_ui": False, "persist_project": True},
+        )
+        self.assertIn("Host tool needs effect grant ['project']", denied)
+        for coercible in ("true", 1):
+            invalid = await invoke(
+                name=name,
+                arguments={
+                    "publish_to_ui": False,
+                    "persist_project": coercible,
+                },
+            )
+            self.assertIn("must be a JSON boolean", invalid)
+        self.assertEqual(len(calls), 2)
+
+    async def test_core_host_tool_is_direct_and_retains_its_schema(self) -> None:
+        engine, unused_fake = self._engine(None)
+        run = deep_engine._DeepRun(
+            engine, self._request("inspect EID 7"), mock.Mock(),
+            event_root=self.events_root,
+        )
+
+        async def inspect_event(event_id: int) -> str:
+            """Inspect one exact event."""
+            return json.dumps({"eventId": event_id})
+
+        run.renderdoc_tool_map["inspect_event"] = deep_engine._langchain_tool(
+            "inspect_event", inspect_event
+        )
+        direct = {tool.name: tool for tool in run.direct_host_tools(())}
+        self.assertIn("inspect_event", direct)
+        self.assertIn("event_id", deep_engine._tool_input_schema(direct["inspect_event"])["properties"])
+        self.assertEqual(
+            json.loads(await direct["inspect_event"].coroutine(event_id=7)),
+            {"eventId": 7},
+        )
+        self.assertTrue(run.skill_gateway().tool_contract_loaded("inspect_event"))
+
+    async def test_main_can_invoke_configured_mcp_without_delegation_or_schema_flood(self) -> None:
+        engine, fake = self._engine(None)
+        run = deep_engine._DeepRun(
+            engine, self._request("Inspect a matched Unreal asset"), mock.Mock(),
+            event_root=self.events_root,
+        )
+        calls: list[int] = []
+
+        async def preview_asset(limit: int) -> str:
+            """Preview a matched Unreal asset with a bounded object limit."""
+
+            calls.append(limit)
+            return json.dumps({"objectCount": limit})
+
+        name = "uex-mcp__preview_asset"
+        run.renderdoc_tool_map[name] = deep_engine._langchain_tool(name, preview_asset)
+        run.user_mcp_tool_names = frozenset({name})
+        run.build_agent()
+        self.addCleanup(run._cleanup_workspace)
+        # Configured tool schemas stay on demand for the main Agent. It can
+        # call its single existing dispatcher, without task()/delegation.
+        main_tools = {tool.name: tool for tool in fake.created[-1]["tools"]}
+        self.assertNotIn(name, main_tools)
+        directory = main_tools["list_bread_capabilities"].coroutine
+        contract = json.loads(await directory(tool=name))["tool"]
+        self.assertEqual(contract["authority"], "user-configured-mcp-server")
+        self.assertIn("limit", contract["inputSchema"]["properties"])
+        self.assertNotIn("effects", contract)
+        found = json.loads(await directory(query="Unreal asset"))["tools"]
+        self.assertIn(name, [tool["name"] for tool in found])
+        self.assertNotIn("inputSchema", next(tool for tool in found if tool["name"] == name))
+        # The already-enabled external server grant remains independent of
+        # Bread's effect classes, just as on the native and child surfaces.
+        invoke = run.invoke_tool(()).coroutine
+        self.assertEqual(json.loads(await invoke(name=name, arguments={"limit": 7})), {"objectCount": 7})
+        self.assertIn("must be integer", await invoke(name=name, arguments={"limit": "7"}))
+        self.assertIn("no granted", await invoke(name="disabled-mcp__preview_asset", arguments={"limit": 7}))
+        self.assertEqual(calls, [7])
+        self.assertEqual(run.children, [])
+
+    async def test_capability_routes_follow_each_actors_actual_direct_tools(self) -> None:
+        engine, unused_fake = self._engine(None)
+        run = deep_engine._DeepRun(
+            engine, self._request("organize a Shader"), mock.Mock(),
+            event_root=self.events_root,
+        )
+        calls: list[str] = []
+
+        async def compile_shader_workspace(workspace_path: str) -> str:
+            """Compile the requested workspace."""
+            calls.append(workspace_path)
+            return json.dumps({"workspacePath": workspace_path})
+
+        name = "compile_shader_workspace"
+        run.renderdoc_tool_map[name] = deep_engine._langchain_tool(name, compile_shader_workspace)
+        main = {tool.name: tool for tool in run.local_skill_tools(("workspace",))}
+        child = {tool.name: tool for tool in run.local_skill_tools(())}
+        self.assertIn(name, main)
+        self.assertNotIn(name, child)
+        # Ordinary execution needs no directory call before the typed tool.
+        self.assertEqual(json.loads(await main[name].coroutine(workspace_path="owned")),
+                         {"workspacePath": "owned"})
+        main_contract = json.loads(await main["list_bread_capabilities"].coroutine(tool=name))
+        child_contract = json.loads(await child["list_bread_capabilities"].coroutine(tool=name))
+        self.assertTrue(main_contract["directlyAvailable"])
+        self.assertEqual(main_contract["invokeWith"], name)
+        self.assertFalse(child_contract["directlyAvailable"])
+        self.assertEqual(child_contract["invokeWith"], "invoke_bread_tool")
+        self.assertEqual(main_contract["tool"]["inputSchema"], child_contract["tool"]["inputSchema"])
+        denied = await child["invoke_bread_tool"].coroutine(name=name, arguments={"workspace_path": "blocked"})
+        self.assertIn("effect grant", denied)
+        self.assertEqual(calls, ["owned"])
 
     def _log(self, task_id: str) -> list[dict[str, Any]]:
         return [
@@ -273,7 +552,7 @@ class DeepEngineTests(unittest.IsolatedAsyncioTestCase):
             if line.strip()
         ]
 
-    async def test_subagents_come_from_skills_with_effect_ceilinged_tools(self) -> None:
+    async def test_general_subagent_uses_same_granted_tools_without_preloading_skills(self) -> None:
         self.config.allowed_effects = frozenset({"workspace", "project", "ui"})
         async def script(_record: dict[str, Any]) -> list[dict[str, Any]]:
             return [
@@ -287,20 +566,31 @@ class DeepEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.terminal_status, "completed")
         created = fake.created[0]
         self.assertEqual(created["model"], "model:gpt-x")
-        self.assertEqual([tool.name for tool in created["tools"]], ["ask_user", "report_task_result"])
+        self.assertEqual(
+            [tool.name for tool in created["tools"]],
+            ["inspect_event", "inspect_shader", "prepare_shader_workspace", "list_bread_capabilities",
+             "load_bread_skill", "invoke_bread_tool", "record_task_review", "ask_user"],
+        )
         names = [item["name"] for item in created["subagents"]]
-        self.assertIn("renderdoc-explain-event", names)
-        self.assertIn("renderdoc-shader-workbench", names)
-        self.assertNotIn("replaylab-core", names)
-        self.assertEqual(names[-1], "general-purpose")
-        shader = next(item for item in created["subagents"] if item["name"] == "renderdoc-shader-workbench")
-        general = created["subagents"][-1]
-        self.assertIn("Standing rules: replaylab-core", shader["system_prompt"])
-        self.assertIn("Granted effect classes: project, ui, workspace", shader["system_prompt"])
-        self.assertIn("READ-ONLY", general["system_prompt"])
-        self.assertIn("prepare_shader_workspace", {tool.name for tool in shader["tools"]})
-        self.assertNotIn("apply_shader_workspace_candidate", {tool.name for tool in shader["tools"]})
-        self.assertEqual({tool.name for tool in general["tools"]}, {"inspect_event", "inspect_shader"})
+        self.assertEqual(names, ["general-purpose"])
+        general = created["subagents"][0]
+        self.assertIn("Granted effects: project, ui, workspace", general["system_prompt"])
+        self.assertNotIn("Standing rules", general["system_prompt"])
+        self.assertNotIn("## Loaded Skill", general["system_prompt"])
+        self.assertEqual(
+            {tool.name for tool in general["tools"]},
+            {"inspect_event", "inspect_shader", "prepare_shader_workspace", "list_bread_capabilities",
+             "load_bread_skill", "invoke_bread_tool"},
+        )
+        self.assertNotIn("apply_shader_workspace_candidate", {tool.name for tool in general["tools"]})
+        self.assertNotIn("report_task_result", {tool.name for tool in general["tools"]})
+        # Every sub-agent also carries the three gateway tools its prompt tells it
+        # to use when a task crosses into another domain -- exactly once. The task
+        # proxy advertises them too, and a provider rejects a request whose tool
+        # array repeats a function name.
+        for agent in (*created["subagents"], {"tools": created["tools"]}):
+            names = [tool.name for tool in agent["tools"]]
+            self.assertEqual(len(names), len(set(names)), names)
         self.assertEqual(created["version"], "v2")
         self.assertTrue(self.tool_holder["closed"])
 
@@ -318,64 +608,18 @@ class DeepEngineTests(unittest.IsolatedAsyncioTestCase):
         general = fake.created[0]["subagents"]
         self.assertEqual([item["name"] for item in general], ["general-purpose"])
         self.assertEqual(general[0]["tools"], [])
-        self.assertIn("Standing rules: replaylab-core", general[0]["system_prompt"])
+        self.assertNotIn("Standing rules", general[0]["system_prompt"])
         self.assertNotIn("tools", self.tool_holder)
 
-    async def test_report_checks_child_tools_and_lands_in_terminal_event(self) -> None:
-        async def script(record: dict[str, Any]) -> list[dict[str, Any]]:
-            report = next(tool for tool in record["tools"] if tool.name == "report_task_result").coroutine
-            record["report"] = report
-            return [
-                ev("on_tool_start", "task", "task-1", data={"input": {"description": "look", "subagent_type": "general-purpose"}}),
-                ev("on_tool_start", "inspect_event", "tool-1", parents=["task-1"], data={"input": {"event_id": 13353}}),
-                ev("on_tool_end", "inspect_event", "tool-1", parents=["task-1"], data={"output": "{}"}),
-                ev("on_tool_end", "task", "task-1", data={"output": Msg("STATUS: DONE")}),
-                ev("on_chat_model_end", "m", "r9", data={"output": Msg("Done")}),
-            ]
 
-        engine, fake = self._engine(script)
-        original = fake.create_deep_agent
 
-        def create(**kwargs: Any) -> Any:
-            agent = original(**kwargs)
-            stream = agent.astream_events
 
-            async def wrapped(payload: Any, *, config: Any, version: str):
-                async for event in stream(payload, config=config, version=version):
-                    yield event
-                    if event["event"] == "on_tool_end" and event["name"] == "task":
-                        report = fake.created[-1]["report"]
-                        rejected = json.loads(
-                            await report(
-                                summary="Draw inspected.",
-                                findings=[{"claim": "x", "kind": "observed", "evidence": [{"tool": "get_draw_calls"}]}],
-                            )
-                        )
-                        accepted = json.loads(
-                            await report(
-                                summary="Draw inspected.",
-                                findings=[{"claim": "x", "kind": "observed", "evidence": [{"tool": "inspect_event", "values": "eventId=13353"}]}],
-                            )
-                        )
-                        fake.created[-1]["report_calls"] = [rejected, accepted]
 
-            agent.astream_events = wrapped
-            return agent
-
-        fake.create_deep_agent = create  # type: ignore[method-assign]
-        result = await engine.run(self._request("解释事件", task_id="t-report"))
-
-        rejected, accepted = fake.created[0]["report_calls"]
-        self.assertFalse(rejected["accepted"])
-        self.assertEqual(rejected["reasons"][0]["code"], "evidence-tool-not-called")
-        self.assertTrue(accepted["accepted"])
-        self.assertEqual(result.report["schema"], "replaylab-task-report/v1")
-        self.assertEqual(self._log("t-report")[-1]["data"]["report"]["summary"], "Draw inspected.")
 
     async def test_event_mapping_tracks_children_tools_reasoning_and_final_text(self) -> None:
         async def script(_record: dict[str, Any]) -> list[dict[str, Any]]:
             return [
-                ev("on_tool_start", "task", "task-1", data={"input": {"description": "Inspect", "subagent_type": "renderdoc-explain-event"}}),
+                ev("on_tool_start", "task", "task-1", data={"input": {"description": "Inspect", "subagent_type": "general-purpose"}}),
                 ev("on_chat_model_stream", "m", "r2", parents=["task-1"], data={"chunk": Msg([{"type": "thinking", "thinking": "hmm"}, {"type": "text", "text": "Looking"}])}),
                 ev("on_tool_start", "inspect_event", "tool-1", parents=["task-1", "r2"], data={"input": {"event_id": 13353}}),
                 ev("on_tool_end", "inspect_event", "tool-1", parents=["task-1", "r2"], data={"output": Msg('{"eventId":13353}')}),
@@ -389,37 +633,111 @@ class DeepEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.text, "The draw renders 1200 vertices.")
         self.assertEqual(len(result.children), 1)
         child = result.children[0]
-        self.assertEqual(child.agent_id, "renderdoc-explain-event")
+        self.assertEqual(child.agent_id, "general-purpose")
         self.assertEqual(child.tools_used, ["inspect_event"])
         kinds = [item["kind"] for item in self._log("t-child")]
         self.assertIn("reasoning-delta", kinds)
         self.assertIn("tool-started", kinds)
         self.assertIn("tool-completed", kinds)
 
-    async def test_restart_preserves_gate_budget_and_virtual_events_are_not_host_evidence(self) -> None:
-        from replaylab_agent.agent_report import TaskReportStore
-
-        store = TaskReportStore("t-restart", self.config.event_root, environ={"REPLAYLAB_REVIEW_MAX_ROUNDS": "1", "REPLAYLAB_VERIFY_MAX_ROUNDS": "1"})
-        store.record_tool("inspect_event")
-        self.assertTrue(store.request_follow_up(store.gate.verify(worked=True)))
-        store.submit({"summary": ""})
-
-        async def script(_record):
+    async def test_progress_before_last_tool_is_not_a_final_answer(self) -> None:
+        async def script(_record: dict[str, Any]) -> list[dict[str, Any]]:
             return [
-                ev("on_tool_start", "task", "child", data={"input": {"description": "Read", "subagent_type": "general-purpose"}}),
-                ev("on_tool_start", "read_file", "virtual", parents=["child"], data={"input": {"file_path": "/scratch.txt"}}),
-                ev("on_tool_end", "read_file", "virtual", parents=["child"], data={"output": Msg("virtual data")}),
-                ev("on_tool_end", "task", "child", data={"output": Msg("STATUS: DONE")}),
-                ev("on_chat_model_end", "m", "final", data={"output": Msg("Unresolved report.")}),
+                ev("on_chat_model_stream", "m", "r1", data={"chunk": Msg("I will inspect it.")}),
+                ev("on_chat_model_end", "m", "r1", data={"output": Msg("I will inspect it.")}),
+                ev("on_tool_start", "inspect_event", "tool-1", data={"input": {"event_id": 13353}}),
+                ev("on_tool_end", "inspect_event", "tool-1", data={"output": Msg('{"eventId":13353}')}),
             ]
 
         engine, _fake = self._engine(script)
-        result = await engine.run(self._request("continue", task_id="t-restart"))
-        restored = TaskReportStore("t-restart", self.config.event_root)
-        self.assertEqual(restored.gate.attempts, 1)
-        self.assertEqual(restored.gate.follow_ups, 1)
-        self.assertEqual(restored.tools_used(), ("inspect_event",))
+        result = await engine.run(self._request("Inspect the event", task_id="t-no-final-answer"))
+
         self.assertEqual(result.terminal_status, "partial")
+        self.assertEqual(result.text, "The main Agent returned no text answer.")
+        self.assertTrue(any(event["text"] == "I will inspect it." for event in self._log("t-no-final-answer")))
+
+    async def test_provider_output_limit_does_not_report_completed(self) -> None:
+        for metadata in (
+            {"finish_reason": "length"},
+            {"stop_reason": "max_tokens"},
+            {"finish_reason": "MAX_TOKENS"},
+            {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
+        ):
+            with self.subTest(metadata=metadata):
+                async def script(_record: dict[str, Any]) -> list[dict[str, Any]]:
+                    message = Msg("The first part of the answer")
+                    message.response_metadata = metadata
+                    return [ev("on_chat_model_end", "m", "r1", data={"output": message})]
+
+                engine, _fake = self._engine(script)
+                result = await engine.run(self._request("Explain the shader", task_id="t-output-limit"))
+
+                self.assertEqual(result.terminal_status, "partial")
+                self.assertIn("The first part", result.text)
+                self.assertIn("output limit", result.text)
+
+    async def test_main_answer_is_not_rejected_after_optional_child_failure(self) -> None:
+        async def script(_record: dict[str, Any]) -> list[dict[str, Any]]:
+            return [
+                ev("on_tool_start", "task", "task-1", data={"input": {
+                    "description": "Try independent evidence", "subagent_type": "general-purpose",
+                }}),
+                ev("on_tool_error", "task", "task-1", data={"error": "unavailable"}),
+                ev("on_chat_model_end", "m", "r1", data={"output": Msg(
+                    "I used the available evidence and explain the remaining limitation."
+                )}),
+            ]
+
+        engine, _fake = self._engine(script)
+        result = await engine.run(self._request("Explain EID 13353", task_id="t-child-failed"))
+
+        self.assertEqual(result.terminal_status, "completed")
+        self.assertEqual(result.children[0].status, "failed")
+        self.assertIn("unavailable", result.children[0].error)
+        self.assertIn("remaining limitation", result.text)
+
+
+    async def test_a_cancelled_run_still_removes_its_turn_workspace(self) -> None:
+        """A cancel is a BaseException; the cleanup must not depend on it being one."""
+
+        import contextlib as _contextlib
+        from replaylab_agent.deep_engine import BreadMCPTools
+
+        removed: list[Any] = []
+
+        class _Stack:
+            async def aclose(self) -> None:
+                raise asyncio.CancelledError()
+
+        session = BreadMCPTools.__new__(BreadMCPTools)
+        session._stack = _Stack()
+        session._output_store = types.SimpleNamespace(close=lambda: removed.append("owned-output"))
+        session._turn_root = "turn-root"
+        session._context = types.SimpleNamespace(
+            cleanup_turn_workspace=lambda root: removed.append(root))
+
+        with _contextlib.suppress(asyncio.CancelledError):
+            await session.__aexit__(None, None, None)
+        self.assertEqual(removed, ["turn-root", "owned-output"])
+
+    async def test_capture_free_cancel_removes_framework_physical_workspace(self) -> None:
+        owned_roots: list[Path] = []
+
+        async def script(record: dict[str, Any]) -> list[dict[str, Any]]:
+            root = record["backend"].cwd
+            self.assertTrue(root.is_dir())
+            owned_roots.append(root)
+            raise asyncio.CancelledError()
+
+        engine, _fake = self._engine(script)
+        request = self._request("Make a temporary note", task_id="cancel-api-workspace")
+        request.instance_id = ""
+        request.context = {}
+        with self.assertRaises(asyncio.CancelledError):
+            await engine.run(request)
+        self.assertEqual(len(owned_roots), 1)
+        self.assertFalse(owned_roots[0].parent.exists())
+        self.assertNotIn("tools", self.tool_holder)
 
     async def test_ask_user_ends_with_needs_user_input(self) -> None:
         async def script(record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -441,6 +759,23 @@ class DeepEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fake.created[0]["second"].startswith("ERROR:"))
         self.assertEqual(result.terminal_status, "needs-user-input")
         self.assertEqual(result.text, "Which shader?")
+
+    async def test_ask_user_accepts_free_text_question_without_fake_choices(self) -> None:
+        async def script(record: dict[str, Any]) -> list[dict[str, Any]]:
+            ask = next(tool for tool in record["tools"] if tool.name == "ask_user")
+            schema = deep_engine._tool_input_schema(ask)
+            self.assertEqual(schema["required"], ["question"])
+            record["answer"] = await ask.coroutine(question="Which project directory?")
+            return [ev("on_chat_model_end", "m", "r1", data={"output": Msg("Please answer.")})]
+
+        engine, fake = self._engine(script)
+        result = await engine.run(self._request("Use my project", task_id="t-ask-free-text"))
+
+        self.assertIn("Question recorded", fake.created[0]["answer"])
+        self.assertEqual(result.terminal_status, "needs-user-input")
+        self.assertEqual(result.clarification.options, [])
+        self.assertTrue(result.clarification.event_payload()["allowOther"])
+
 
     async def test_clarification_answer_and_intent_reach_prompt(self) -> None:
         async def script(_record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -484,7 +819,69 @@ class DeepEngineTests(unittest.IsolatedAsyncioTestCase):
         engine, _fake = self._engine(hang)
         result = await engine.run(self._request("hi", task_id="t-timeout"))
         self.assertEqual(result.terminal_status, "failed")
-        self.assertIn("exceeded", result.error)
+        self.assertIn("Model API task exceeded configured runtime limit", result.error)
+
+    async def test_custom_chat_retries_responses_only_on_provider_tool_reasoning_error(self) -> None:
+        class BadRequest(RuntimeError):
+            status_code = 400
+
+        async def script(record: dict[str, Any]) -> list[dict[str, Any]]:
+            if record["model"] == "chat":
+                raise BadRequest(
+                    "Function tools with reasoning_effort are not supported "
+                    "for this model in /v1/chat/completions. "
+                    "Use /v1/responses or set reasoning_effort to 'none'."
+                )
+            return [ev("on_chat_model_end", "m", "r1", data={"output": Msg("done")})]
+
+        engine, fake = self._engine(script)
+        engine._model_factory = lambda profile, _model: profile.options.get("api", "chat")
+        request = self._request("hi", task_id="t-chat-responses-fallback")
+        request.profile = Profile(
+            id="custom", preset="custom-openai", model="model",
+            base_url="https://api.example.test/v1",
+        )
+        result = await engine.run(request)
+        self.assertEqual(result.terminal_status, "completed")
+        self.assertEqual(result.text, "done")
+        self.assertEqual([item["model"] for item in fake.created], ["chat", "responses"])
+        self.assertIsNot(fake.created[0]["checkpointer"], fake.created[1]["checkpointer"])
+        self.assertEqual(request.profile.options, {})
+
+        # An explicit Chat choice belongs to the user, not the compatibility retry.
+        explicit = self._request("hi", task_id="t-chat-explicit")
+        explicit.profile = Profile(
+            id="custom", preset="custom-openai", model="model",
+            base_url="https://api.example.test/v1", options={"api": "chat"},
+        )
+        result = await engine.run(explicit)
+        self.assertEqual(result.terminal_status, "failed")
+        self.assertEqual([item["model"] for item in fake.created][-1], "chat")
+
+    async def test_chat_compatibility_retry_never_replays_after_a_tool_event(self) -> None:
+        class BadRequest(RuntimeError):
+            status_code = 400
+
+        async def script(_record: dict[str, Any]) -> list[dict[str, Any]]:
+            raise BadRequest(
+                "Function tools with reasoning_effort are not supported "
+                "in /v1/chat/completions; use /v1/responses."
+            )
+
+        engine, fake = self._engine(script)
+        request = self._request("hi", task_id="t-chat-no-replay")
+        request.profile = Profile(
+            id="custom", preset="custom-openai", model="model",
+            base_url="https://api.example.test/v1",
+        )
+        run = deep_engine._DeepRun(engine, request, mock.Mock(), event_root=self.events_root)
+        run._main_tool_calls = 1
+        with self.assertRaisesRegex(Exception, "deepagents run failed"):
+            try:
+                await run._execute_with_tools()
+            finally:
+                run._cleanup_workspace()
+        self.assertEqual(len(fake.created), 1)
 
     def test_missing_dependency_message_matches_required_runtime(self) -> None:
         with mock.patch.dict(sys.modules, {"deepagents": None}):

@@ -53,7 +53,7 @@ class _Context:
         self.captured_names = {1: "CapturedOne", 2: "CapturedTwo"}
         self.names = {
             1: (True, "OldAliasOne"),
-            2: (True, "CapturedTwo"),
+            2: (False, "CapturedTwo"),
         }
         self.fail_once_for = None
         self.fail_on_calls = set()
@@ -142,6 +142,32 @@ class AliasBridgeAtomicTests(unittest.TestCase):
             "entryPoint": "main",
             "rawSha256": self.raw_sha256,
             "bindingKind": "shader",
+            "alias": name,
+        }
+
+    def _texture_alias(self, texture_resource_id, name, *, verified=True):
+        return {
+            "verified": verified,
+            "metadata": {
+                "programVerified": True,
+                "resourceBindingVerified": True,
+                "eventId": 11384,
+                "assetResolutionId": "resolution-1",
+                "assetId": "asset-1",
+                "assetContentSha256": "c" * 64,
+                "readerProofSha256": "d" * 64,
+            },
+            "provenance": "asset-resolution",
+            "captureId": self.capture_id,
+            "shaderResourceId": 1,
+            "resourceId": texture_resource_id,
+            "stage": "fragment",
+            "entryPoint": "main",
+            "rawSha256": self.raw_sha256,
+            "bindingKind": "textureResource",
+            "bindNumber": 0,
+            "registerSpace": 0,
+            "arrayIndex": 0,
             "alias": name,
         }
 
@@ -248,6 +274,8 @@ class AliasBridgeAtomicTests(unittest.TestCase):
         self.assertEqual(len(result["transactionId"]), 32)
         self.assertTrue(result["committed"])
         self.assertEqual(result["counts"]["skipped"], 0)
+        self.assertEqual(
+            set(result["applied"][0]), {"resourceId", "displayName"})
         self.assertEqual(self.context.names[1], (True, "NewAliasOne"))
         self.assertEqual(self.context.names[2], (True, "NewAliasTwo"))
         self.assertEqual(len(self.module._symbol_alias_overlay["aliases"]), 2)
@@ -259,7 +287,7 @@ class AliasBridgeAtomicTests(unittest.TestCase):
         self.assertTrue(rollback["strictReceipt"])
         self.assertFalse(rollback["physicalAtomic"])
         self.assertEqual(self.context.names[1], (True, "OldAliasOne"))
-        self.assertEqual(self.context.names[2], (True, "CapturedTwo"))
+        self.assertEqual(self.context.names[2], (False, "CapturedTwo"))
 
         legacy_path, legacy_digest = self._write(
             [self._alias(1, "LegacyAlias"), self._alias(2, "Ignored", verified=False)]
@@ -302,6 +330,7 @@ class AliasBridgeAtomicTests(unittest.TestCase):
         self.assertTrue(status["mutationPresent"])
         self.assertTrue(status["recoveryRequired"])
         self.assertEqual(status["manifestSha256"], digest)
+        self.assertEqual(status["manifestPath"], str(path.resolve()))
 
         with self.assertRaisesRegex(RuntimeError, "another transaction"):
             self.module._rollback_symbol_aliases(
@@ -364,7 +393,7 @@ class AliasBridgeAtomicTests(unittest.TestCase):
         self.assertEqual(receipt["resourceCount"], 2)
         self.assertIsNone(self.module._symbol_alias_recovery_ledger)
         self.assertEqual(self.context.names[1], (True, "OldAliasOne"))
-        self.assertEqual(self.context.names[2], (True, "CapturedTwo"))
+        self.assertEqual(self.context.names[2], (False, "CapturedTwo"))
 
     def test_ledger_is_published_before_first_physical_rename(self):
         path, digest = self._write([self._alias(1, "NewAliasOne")])
@@ -451,6 +480,326 @@ class AliasBridgeAtomicTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "restored")
         self.assertEqual(self.context.names[1], (True, "OldAliasOne"))
         self.assertIsNot(self.module._symbol_alias_overlay, committed_overlay)
+
+    def test_texture_resource_names_write_capture_names_and_preserve_user_names(self):
+        self.module._symbol_alias_overlay = self.module._new_symbol_alias_overlay()
+        self.module._symbol_resource_renames = {}
+        self.module._symbol_rename_capture_token = None
+        self.context.names[1] = (True, "UserTextureName")
+        self.context.names[2] = (False, "CapturedTwo")
+        self.module._revalidate_symbol_texture_aliases = lambda candidates: (
+            {item[0] for item in candidates}, {})
+        path, digest = self._write([
+            self._texture_alias(1, "T_UserWouldLose"),
+            self._texture_alias(2, "T_Munin_BaseMap"),
+        ])
+
+        result = self.module._load_symbol_aliases({
+            "path": str(path),
+            "confirmed_only": True,
+            "expected_sha256": digest,
+            "strict_atomic": True,
+        })
+
+        self.assertEqual(result["counts"]["renamedTextures"], 1)
+        self.assertEqual(result["counts"]["keptUser"], 1)
+        self.assertEqual(result["written"][0]["resourceId"], 2)
+        self.assertEqual(result["keptUser"][0]["resourceId"], 1)
+        self.assertEqual(result["keptUser"][0]["requestedDisplayName"],
+                         "T_UserWouldLose")
+        self.assertEqual(self.context.names[1], (True, "UserTextureName"))
+        self.assertEqual(self.context.names[2], (True, "T_Munin_BaseMap"))
+
+        rollback = self.module._rollback_symbol_aliases(
+            {"expected_capture_id": self.capture_id})
+        self.assertEqual(rollback["status"], "restored")
+        self.assertEqual(self.context.names[1], (True, "UserTextureName"))
+        self.assertEqual(self.context.names[2], (False, "CapturedTwo"))
+
+    def test_server_content_match_manifest_loads_without_legacy_asset_authorization(self):
+        """The Host's current manifest must pass the real Bridge validator/load."""
+
+        from src import server
+
+        self.module._symbol_alias_overlay = self.module._new_symbol_alias_overlay()
+        self.module._symbol_resource_renames = {}
+        self.module._symbol_rename_capture_token = None
+        self.context.names[2] = (False, "CapturedTwo")
+        self.module._revalidate_symbol_texture_aliases = lambda candidates: (
+            {item[0] for item in candidates}, {})
+        aliases = server._resource_alias_manifest_rows(
+            [{
+                "resourceId": 2,
+                "bindNumber": 4,
+                "registerSpace": 1,
+                "alias": "T_Munin_BaseMap",
+                "assetPath": "/Game/T_Munin_Base",
+                "hostEvidenceKind": "pixel-same-image",
+            }],
+            {
+                "captureId": self.capture_id,
+                "eventId": 11384,
+                "stage": "fragment",
+                "entryPoint": "main",
+                "shaderResourceId": 1,
+                "shaderRawSha256": self.raw_sha256,
+            },
+        )
+        self.assertEqual(aliases[0]["provenance"], "ai-content-match")
+        self.assertNotIn("assetResolutionId", aliases[0]["metadata"])
+        self.assertNotIn("readerProofSha256", aliases[0]["metadata"])
+        path, digest = self._write(aliases)
+
+        result = self.module._load_symbol_aliases({
+            "path": str(path),
+            "confirmed_only": True,
+            "expected_sha256": digest,
+            "strict_atomic": True,
+        })
+
+        self.assertEqual(result["counts"]["skipped"], 0)
+        self.assertEqual(result["counts"]["renamedTextures"], 1)
+        self.assertEqual(self.context.names[2], (True, "T_Munin_BaseMap"))
+
+    def test_legacy_asset_resolution_alias_keeps_its_old_receipt_shape(self):
+        self.module._symbol_alias_overlay = self.module._new_symbol_alias_overlay()
+        self.module._symbol_resource_renames = {}
+        self.module._symbol_rename_capture_token = None
+        self.context.names[2] = (False, "CapturedTwo")
+        alias = self._texture_alias(2, "T_Munin_BaseMap")
+        alias["metadata"].pop("readerProofSha256")
+        path, digest = self._write([alias])
+
+        with self.assertRaisesRegex(ValueError, "1 skipped aliases"):
+            self.module._load_symbol_aliases({
+                "path": str(path),
+                "confirmed_only": True,
+                "expected_sha256": digest,
+                "strict_atomic": True,
+            })
+        self.assertEqual(self.context.names[2], (False, "CapturedTwo"))
+
+        path, digest = self._write([
+            self._texture_alias(2, "T_Munin_BaseMap")])
+        self.module._revalidate_symbol_texture_aliases = lambda candidates: (
+            set(), {candidates[0][0]: "bound texture changed"})
+        with self.assertRaisesRegex(ValueError, "1 skipped aliases"):
+            self.module._load_symbol_aliases({
+                "path": str(path),
+                "confirmed_only": True,
+                "expected_sha256": digest,
+                "strict_atomic": True,
+            })
+        self.assertEqual(self.context.names[2], (False, "CapturedTwo"))
+
+    def test_texture_live_validation_uses_exact_descriptor_access_and_restores_eid(self):
+        alias = self._texture_alias(2, "T_Munin_BaseMap")
+        shader_key = (1, "fragment", "main", self.raw_sha256)
+        used = types.SimpleNamespace(
+            access=types.SimpleNamespace(
+                index=0, arrayElement=0, descriptorStore=77),
+            descriptor=types.SimpleNamespace(resource=2, view=0),
+        )
+        reflected = types.SimpleNamespace(
+            isTexture=True, fixedBindNumber=0, fixedBindSetOrSpace=0)
+        reflection = types.SimpleNamespace(readOnlyResources=[reflected])
+        entry = types.SimpleNamespace(name="main")
+        pipeline = types.SimpleNamespace(
+            GetShader=lambda unused_stage: 1,
+            GetShaderPipelineObject=lambda: 9,
+            GetReadOnlyResources=lambda unused_stage: [used],
+        )
+
+        class Controller(object):
+            def __init__(self):
+                self.events = []
+
+            def GetTextures(self):
+                return [types.SimpleNamespace(resourceId=2)]
+
+            def SetFrameEvent(self, event_id, unused_force):
+                self.events.append(event_id)
+
+            def GetPipelineState(self):
+                return pipeline
+
+            def GetShaderEntryPoints(self, unused_shader):
+                return [entry]
+
+            def GetShader(self, unused_pipeline, unused_shader, unused_entry):
+                return reflection
+
+        controller = Controller()
+        self.module._request_visible_event_id = lambda unused_default: 999
+        self.module._replay = lambda callback: callback(controller)
+
+        verified, failures = self.module._revalidate_symbol_texture_aliases([
+            (7, alias, shader_key, "textureresource")])
+        self.assertEqual(verified, {7})
+        self.assertEqual(failures, {})
+        self.assertEqual(controller.events, [11384, 999])
+        exact = self.module._exact_readonly_descriptor_resources([used], 0)
+        self.assertEqual(exact, [{
+            "resourceId": 2,
+            "arrayElement": 0,
+            "descriptorStoreId": 77,
+            "evidence": "used-descriptor-access",
+        }])
+
+        alias["arrayIndex"] = 3
+        controller.events[:] = []
+        verified, failures = self.module._revalidate_symbol_texture_aliases([
+            (8, alias, shader_key, "textureresource")])
+        self.assertEqual(verified, set())
+        self.assertIn("not exactly bound", failures[8])
+        self.assertEqual(controller.events, [11384, 999])
+
+    def test_user_takeover_after_bread_rename_survives_rollback(self):
+        self.module._symbol_alias_overlay = self.module._new_symbol_alias_overlay()
+        self.module._symbol_resource_renames = {}
+        self.module._symbol_rename_capture_token = None
+        self.context.names[2] = (False, "CapturedTwo")
+        self.module._revalidate_symbol_texture_aliases = lambda candidates: (
+            {item[0] for item in candidates}, {})
+        path, digest = self._write([
+            self._texture_alias(2, "T_Munin_BaseMap")])
+        self.module._load_symbol_aliases({
+            "path": str(path),
+            "confirmed_only": True,
+            "expected_sha256": digest,
+            "strict_atomic": True,
+        })
+        self.context.names[2] = (True, "My_Texture_Name")
+
+        rollback = self.module._rollback_symbol_aliases(
+            {"expected_capture_id": self.capture_id})
+
+        self.assertEqual(rollback["userTakeoverCount"], 1)
+        self.assertEqual(rollback["keptUser"][0]["resourceId"], 2)
+        self.assertEqual(self.context.names[2], (True, "My_Texture_Name"))
+        self.assertNotIn(2, self.module._symbol_resource_renames)
+
+    def test_all_user_owned_texture_names_create_no_empty_transaction(self):
+        self.module._symbol_alias_overlay = self.module._new_symbol_alias_overlay()
+        self.module._symbol_resource_renames = {}
+        self.module._symbol_rename_capture_token = None
+        self.context.names[1] = (True, "My_Texture_Name")
+        self.module._revalidate_symbol_texture_aliases = lambda candidates: (
+            {item[0] for item in candidates}, {})
+        path, digest = self._write([
+            self._texture_alias(1, "T_Munin_BaseMap")])
+
+        result = self.module._load_symbol_aliases({
+            "path": str(path),
+            "confirmed_only": True,
+            "expected_sha256": digest,
+            "strict_atomic": True,
+        })
+
+        self.assertFalse(result["mutationPresent"])
+        self.assertFalse(result["rollbackAvailable"])
+        self.assertFalse(result["recoveryLedgerPublished"])
+        self.assertEqual(result["transactionId"], "")
+        self.assertEqual(result["counts"]["keptUser"], 1)
+        self.assertIsNone(self.module._symbol_alias_recovery_ledger)
+        self.assertEqual(self.context.names[1], (True, "My_Texture_Name"))
+
+    def test_repeated_orphan_registration_is_freed_exactly_once(self):
+        target = object()
+        freed = []
+
+        class Controller(object):
+            def FreeTargetResource(self, value):
+                freed.append(value)
+
+        self.module._shared_shader_orphan_targets = []
+        self.module._replay = lambda callback: callback(Controller())
+
+        # A failed apply followed by a failed recovery may discover the same
+        # still-live target twice. Retention is a set-like queue, not an
+        # append-only retry log.
+        self.assertTrue(self.module._register_orphan_shader_target(target))
+        self.assertFalse(self.module._register_orphan_shader_target(target))
+        self.assertEqual(self.module._shared_shader_orphan_targets, [target])
+
+        released = self.module._release_replay_transient_caches({
+            "clear_replay_cache": False,
+            "release_orphaned_targets": True,
+        })
+        self.assertEqual(freed, [target])
+        self.assertEqual(released["orphanedTargetsFreed"], 1)
+        self.assertEqual(released["orphanedTargetsRemaining"], 0)
+
+    def test_distinct_permanent_free_failures_reach_limit_then_block_build(self):
+        class Controller(object):
+            def __init__(self):
+                self.build_count = 0
+                self.free_attempts = []
+                self.fail_free = True
+
+            def BuildTargetShader(self, *unused):
+                self.build_count += 1
+                return self.build_count, ""
+
+            def FreeTargetResource(self, target):
+                self.free_attempts.append(target)
+                if self.fail_free:
+                    raise RuntimeError("permanent free failure")
+
+        controller = Controller()
+        self.module.MAX_SHARED_SHADER_ORPHAN_TARGETS = 3
+        self.module._shared_shader_orphan_targets = []
+        self.module._replay = lambda callback: callback(controller)
+
+        for unused in range(3):
+            target, unused_messages = self.module._build_target_shader(
+                controller, "main", "encoding", b"blob", None, "fragment")
+            try:
+                controller.FreeTargetResource(target)
+            except Exception:
+                self.module._register_orphan_shader_target(target)
+
+        with self.assertRaisesRegex(RuntimeError, "orphan Shader target limit"):
+            self.module._build_target_shader(
+                controller, "main", "encoding", b"blob", None, "fragment")
+        self.assertEqual(controller.build_count, 3)
+        self.assertEqual(self.module._shared_shader_orphan_targets, [1, 2, 3])
+
+        retained = self.module._release_replay_transient_caches({
+            "clear_replay_cache": False,
+            "release_orphaned_targets": True,
+        })
+        self.assertEqual(retained["orphanedTargetsFreed"], 0)
+        self.assertEqual(retained["orphanedTargetsRemaining"], 3)
+        self.assertEqual(self.module._shared_shader_orphan_targets, [1, 2, 3])
+
+        controller.fail_free = False
+        released = self.module._release_replay_transient_caches({
+            "clear_replay_cache": False,
+            "release_orphaned_targets": True,
+        })
+        self.assertEqual(released["orphanedTargetsFreed"], 3)
+        self.assertEqual(released["orphanedTargetsRemaining"], 0)
+
+    def test_capture_lifecycle_forget_resets_full_orphan_queue(self):
+        self.module.MAX_SHARED_SHADER_ORPHAN_TARGETS = 3
+        self.module._shared_shader_orphan_targets = [1, 2, 3]
+        self.module._shared_shader_replacements = {}
+
+        self.module._forget_shared_shader_replacements()
+
+        self.assertEqual(self.module._shared_shader_orphan_targets, [])
+        # The next capture receives a fresh build budget.
+        self.module._require_shader_target_build_capacity(3)
+
+    def test_already_created_cleanup_id_is_never_dropped_at_limit(self):
+        self.module.MAX_SHARED_SHADER_ORPHAN_TARGETS = 1
+        self.module._shared_shader_orphan_targets = [1]
+
+        self.assertTrue(self.module._register_orphan_shader_target(2))
+        self.assertEqual(self.module._shared_shader_orphan_targets, [1, 2])
+        with self.assertRaisesRegex(RuntimeError, "orphan Shader target limit"):
+            self.module._require_shader_target_build_capacity(1)
 
 
 if __name__ == "__main__":

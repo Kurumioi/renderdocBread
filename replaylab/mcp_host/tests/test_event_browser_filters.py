@@ -162,13 +162,13 @@ class EventBrowserFilterTests(unittest.TestCase):
         self.assertEqual(len(ctx.extensions.items), 6)
 
         by_path = {item[2]: item[3] for item in ctx.extensions.items}
-        by_path[("ReplayLab", "Event Browser Filter", "Draw / Dispatch Only")](
+        by_path[("Bread AI", "Event Browser Filter", "Draw / Dispatch Only")](
             ctx, None
         )
         self.assertEqual(ctx.browser.empty_regions[-1], False)
         self.assertEqual(ctx.browser.filter_text[-1], "$rdultra(draw)")
 
-        by_path[("ReplayLab", "Event Browser Filter", "All")](ctx, None)
+        by_path[("Bread AI", "Event Browser Filter", "All")](ctx, None)
         self.assertEqual(ctx.browser.empty_regions[-1], True)
         self.assertEqual(ctx.browser.filter_text[-1], "")
         self.assertEqual(ctx.shown, 2)

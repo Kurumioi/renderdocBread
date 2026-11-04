@@ -572,7 +572,8 @@ is still bound at ``stage``, binds ``replacement``, replays the action, and then
 previous shader. Capture loading, action discovery, pipeline-state inspection and unrelated replay
 operations continue to use the captured shader.
 
-This initial implementation is available only for local D3D11 replay. ``replacement`` must be a
+This operation supports D3D11, D3D12, Vulkan and OpenGL/OpenGL ES, including remote replay
+when the peer advertises the event-Shader control capability. ``replacement`` must be a
 target shader returned by :meth:`BuildTargetShader` on this replay controller. Supplying the
 expected original shader makes the operation fail closed if the selected action or pipeline has
 changed. Configuring another replacement for the same effective event and stage replaces the old
@@ -586,14 +587,45 @@ closed when the action is replayed.
 
 :param int eventId: The action event ID. Event remapping is applied in the same way as
   :meth:`SetFrameEvent`.
-:param ShaderStage stage: The D3D11 shader stage to override.
+:param ShaderStage stage: The shader stage to override.
 :param ResourceId expectedOriginal: The captured shader expected to be bound at the action.
 :param ResourceId replacement: A target shader created by :meth:`BuildTargetShader`.
+:param int outputTarget: Optional color target index to bypass blending and enable channel writes.
+  The default 4294967295 preserves captured output state. Attachment format conversion still applies.
+:param bool independentFloatOutput: Redirect the selected color slot into independent RGBA32_FLOAT
+  storage, preserving captured depth/stencil tests against a private copy. Requires an explicit
+  pixel color target. Unsupported format/sample/topology combinations return an error; no lower
+  precision fallback is used. Query the output with GetEventShaderPreviewTexture.
 :return: An empty string on success, or an error message on failure.
 :rtype: str
 )");
   virtual rdcstr SetEventShaderOverride(uint32_t eventId, ShaderStage stage,
-                                        ResourceId expectedOriginal, ResourceId replacement) = 0;
+                                        ResourceId expectedOriginal, ResourceId replacement,
+                                        uint32_t outputTarget = ~0U,
+                                        bool independentFloatOutput = false) = 0;
+
+  DOCUMENT(R"(Return the current event Shader replacement registration.
+
+The returned typed resource IDs can be retained and passed back to SetEventShaderOverride to
+restore a previous registration. The getter works for both local and remote replay.
+:rtype: EventShaderOverrideState
+)");
+  virtual EventShaderOverrideState GetEventShaderOverride(uint32_t eventId, ShaderStage stage) = 0;
+
+  DOCUMENT(R"(Return independent RGBA32_FLOAT output for an active event Shader override.
+
+A null resource ID indicates no independent preview is available. The texture remains readable
+after transient draw bindings have been restored. Callers must stop displaying it before changing
+or clearing its registration or freeing its target Shader. Inactive scratch may be evicted to
+keep the replay controller's preview cache bounded.
+The captured attachment view is normalized to mip 0 and first array layer 0, retaining its view
+dimensions, layer count and sample count. The redirected draw writes private color and depth
+attachments; captured attachments therefore retain their contents immediately before this draw.
+Clearing the override replays the complete normal draw result.
+
+:rtype: TextureDescription
+)");
+  virtual TextureDescription GetEventShaderPreviewTexture(uint32_t eventId, ShaderStage stage) = 0;
 
   DOCUMENT(R"(Remove the event-scoped shader override for one effective event and stage.
 
@@ -708,6 +740,20 @@ Driver limitations are returned explicitly. An accepted change refreshes the cur
 :rtype: str
 )");
   virtual rdcstr ClearSharedBufferPatch(ResourceId buffer, uint64_t byteOffset, uint64_t byteLength) = 0;
+
+  DOCUMENT(R"(Restore a captured buffer byte range by removing every overlapping persistent edit.
+
+Unlike :meth:`ClearSharedBufferPatch`, this restores the capture's replayed values instead of
+revealing an older edit. Bytes outside the requested range keep their edits, and their original
+exact edit identities remain available for undo. An accepted change refreshes the current event.
+
+:param ResourceId buffer: The original captured buffer resource.
+:param int byteOffset: Absolute byte offset in that buffer.
+:param int byteLength: Number of bytes to restore.
+:return: Empty on success, otherwise a diagnostic. A rejected configuration preserves prior edits.
+:rtype: str
+)");
+  virtual rdcstr ResetSharedBufferRange(ResourceId buffer, uint64_t byteOffset, uint64_t byteLength) = 0;
 
   DOCUMENT(R"(Remove every persistent buffer edit and refresh the selected event.
 
@@ -988,6 +1034,23 @@ replacement was not installed.
 :rtype: str
 )");
   virtual rdcstr ReplaceTargetShaderChecked(ResourceId original, ResourceId replacement) = 0;
+
+  DOCUMENT(R"(Return the current resource-scoped Shader replacement for a captured Shader.
+
+The typed target ID is the replacement registered through this replay controller, independently
+of the current event. A null ID means that no resource-scoped replacement is registered. Event
+Shader overrides are separate and are not returned. This query performs no replay and does not
+change the selected event or replacement generation. It works for local and remote replay.
+
+Retaining this ID does not acquire a resource reference. Callers restoring a previous replacement
+must keep that target alive and verify that they still own the current replacement before calling
+:meth:`ReplaceTargetShaderChecked` or :meth:`RemoveTargetShaderReplacementChecked`.
+
+:param ResourceId original: The canonical captured Shader resource.
+:return: The registered target Shader, or a null resource ID.
+:rtype: ResourceId
+)");
+  virtual ResourceId GetTargetShaderReplacement(ResourceId original) = 0;
 
   DOCUMENT(R"(Clear any cached data from previous replays and ensure subsequent replays fully
 re-initialise any data, including e.g. bindless feedback, printf results or mesh output data.
@@ -1493,7 +1556,52 @@ previous visit. Output windows are presented by the caller after updating their 
 )");
   virtual void CommitScrubFrameEvent(uint32_t eventId) = 0;
 
+  DOCUMENT(R"(Compare two pixel Shaders using one replay prefix.
+
+The driver snapshots all writable render targets and depth-stencil contents before the draw, then
+executes baseline, candidate and baseline again, restoring the same contents between draws. Shader
+resource mappings and the controller's current event, cached pipeline state and replay outputs are
+not changed. Call :meth:`RestoreFrameEventAfterAnalysis` before returning to unrelated replay work,
+including after an incomplete comparison.
+
+This is a bounded diagnostic, not a replacement or equivalence verdict. Unsupported drivers,
+event-scoped overrides, shader side effects and unsupported resource layouts are rejected with an
+explicit reason. The initial implementation accepts at most nine single-sample 2D outputs with
+one mip and one array slice, 32 MiB per output and 64 MiB per original/candidate/repeat leg.
+The original Shader must be the capture's currently bound Shader with no global replacement.
+
+:param int eventId: The draw to compare; normal event remapping is applied.
+:param ResourceId expectedOriginal: The capture's original pixel Shader resource.
+:param ResourceId baseline: A built target Shader; null or ``expectedOriginal`` uses the captured Shader.
+:param ResourceId candidate: A built target Shader; null or ``expectedOriginal`` uses the captured Shader.
+:return: Self-contained snapshots and completion status.
+:rtype: ShaderPairComparison
+)");
+  virtual ShaderPairComparison ComparePixelShaderPair(uint32_t eventId, ResourceId expectedOriginal,
+                                                       ResourceId baseline, ResourceId candidate) = 0;
+
   static const uint32_t NoPreference = ~0U;
+
+  DOCUMENT(R"(Coalesce automatic checked-Shader replay/display work until the matching end call.
+
+Checked pipeline creation and each resource's replacement remain immediate. Explicit event
+selection still replays normally. Call EndShaderReplacementBatch in a finally block, including
+after a failed item. A zero token means batching is unavailable or already owned.
+
+:return: An opaque controller-local ownership token, or zero.
+:rtype: int
+)");
+  virtual uint64_t BeginShaderReplacementBatch() { return 0; }
+
+  DOCUMENT(R"(Finish an owned Shader replacement batch and replay/display its current event once.
+
+An unrelated or stale token cannot release another owner's batch.
+
+:param int token: The nonzero token returned by BeginShaderReplacementBatch.
+:return: True if this token owned and finished the batch.
+:rtype: bool
+)");
+  virtual bool EndShaderReplacementBatch(uint64_t token) { return false; }
 
 protected:
   IReplayController() = default;

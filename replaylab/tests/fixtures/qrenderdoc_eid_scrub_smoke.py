@@ -158,16 +158,18 @@ class _ScrubSmokeRunner(object):
 
     def begin_case(self):
         name = self.case_names[len(self.result["cases"])]
-        self.base = self.arrow_events[0] if name == "held_arrow_A_D_E" else self.a
+        self.reverse_arrow = name == "held_arrow_release_pending_up"
+        first_arrow = 4 if self.reverse_arrow else 0
+        self.base = self.arrow_events[first_arrow] if name.startswith("held_arrow_") else self.a
         # This initial synchronous selection runs before the queue gate exists.
         pyrenderdoc.SetEventID([], self.base[0], self.base[1], False)
-        if name == "held_arrow_A_D_E":
+        if name.startswith("held_arrow_"):
             parent = self.arrow_indices[0].parent()
             while parent.isValid():
                 self.tree.expand(parent)
                 parent = parent.parent()
             flags = QtCore.QItemSelectionModel.ClearAndSelect | QtCore.QItemSelectionModel.Rows
-            self.selection_model.setCurrentIndex(self.arrow_indices[0], flags)
+            self.selection_model.setCurrentIndex(self.arrow_indices[first_arrow], flags)
         self.reset_log()
         self.release_gate = threading.Event()
         self.gate_entered = threading.Event()
@@ -175,6 +177,7 @@ class _ScrubSmokeRunner(object):
         self.drained = threading.Event()
         self.queue_result = {}
         self.case_result = {"name": name, "checkpoints": []}
+        self.released_selection_changes = []
         self.deadline = time.monotonic() + 30.0
 
         def occupy_replay(controller):
@@ -194,13 +197,19 @@ class _ScrubSmokeRunner(object):
         if name == "event_browser_return_to_committed":
             self.selection_model.setCurrentIndex(self.b_index, flags)
             self.selection_model.setCurrentIndex(self.a_index, flags)
-        elif name == "held_arrow_A_D_E":
+        elif name.startswith("held_arrow_"):
+            key = QtCore.Qt.Key_Up if self.reverse_arrow else QtCore.Qt.Key_Down
             for press in range(3):
-                self.send_key(QtCore.QEvent.KeyPress, auto_repeat=press != 0)
-            if self.event_pair(self.tree.currentIndex()) != self.arrow_events[3]:
-                raise RuntimeError("Three real Down presses did not move the tree from A to D")
+                self.send_key(QtCore.QEvent.KeyPress, key, auto_repeat=press != 0)
+            if self.event_pair(self.tree.currentIndex()) != self.arrow_events[1 if self.reverse_arrow else 3]:
+                raise RuntimeError("Three real direction-key presses did not move to the expected row")
             if not pyrenderdoc.IsScrubbing():
                 raise RuntimeError("Direction-key presses did not start a held gesture")
+            if name.startswith("held_arrow_release_pending"):
+                self.send_key(QtCore.QEvent.KeyRelease, key)
+                if pyrenderdoc.IsScrubbing():
+                    raise RuntimeError("Final key release did not end the pending gesture")
+                self.selection_model.currentChanged.connect(self.record_released_selection)
         else:
             for selected, effective in (self.b, self.a):
                 pyrenderdoc.ScrubToSelectedEvent(selected, effective)
@@ -214,10 +223,13 @@ class _ScrubSmokeRunner(object):
                                        int(pyrenderdoc.CurEvent())],
             "gateStillOccupied": not self.gate_exited.is_set(),
         })
-        self.target = self.arrow_events[3] if name == "held_arrow_A_D_E" else self.a
-        self.checkpoint = "D" if name == "held_arrow_A_D_E" else "A"
+        self.target = self.arrow_events[1 if self.reverse_arrow else 3] if name.startswith("held_arrow_") else self.a
+        self.checkpoint = "D" if name.startswith("held_arrow_") else "A"
         self.release_gate.set()
         self.phase = "publication"
+
+    def record_released_selection(self, current, previous):
+        self.released_selection_changes.append(list(self.event_pair(current)))
 
     def publication_ready(self):
         self.poll_log()
@@ -295,6 +307,11 @@ class _ScrubSmokeRunner(object):
         self.complete_case()
 
     def complete_case(self):
+        if self.case_result["name"].startswith("held_arrow_release_pending"):
+            self.selection_model.currentChanged.disconnect(self.record_released_selection)
+            self.case_result["selectionChangesAfterRelease"] = self.released_selection_changes
+            if any(pair != list(self.target) for pair in self.released_selection_changes):
+                raise RuntimeError("An obsolete replay moved the selected row after key release")
         self.case_result["ok"] = True
         self.result["cases"].append(self.case_result)
         if len(self.result["cases"]) == len(self.case_names):
@@ -323,6 +340,8 @@ class _ScrubSmokeRunner(object):
                                    "held_scrub_return_to_committed"]
                 if self.arrow_indices:
                     self.case_names.append("held_arrow_A_D_E")
+                    self.case_names.append("held_arrow_release_pending")
+                    self.case_names.append("held_arrow_release_pending_up")
                 self.begin_case()
             elif self.phase == "gate" and self.gate_entered.is_set():
                 self.issue_inputs()
@@ -374,6 +393,7 @@ class _ScrubSmokeRunner(object):
             # Ensure test failures do not leave the Event Browser's held-key tracking active.
             try:
                 self.send_key(QtCore.QEvent.KeyRelease)
+                self.send_key(QtCore.QEvent.KeyRelease, QtCore.Qt.Key_Up)
             except Exception as exc:
                 self.result["keyCleanupError"] = str(exc)
         if self.original is not None and pyrenderdoc.IsCaptureLoaded():

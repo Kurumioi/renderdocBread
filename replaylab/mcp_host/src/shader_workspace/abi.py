@@ -269,9 +269,10 @@ class ShaderVariableType:
     pointer_type_id: int
     byte_size: int
     members: tuple["ConstantField", ...]
+    layout_completeness: str = "complete"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "baseType": self.base_type,
             "rows": self.rows,
             "columns": self.columns,
@@ -284,6 +285,9 @@ class ShaderVariableType:
             "byteSize": self.byte_size,
             "members": [member.to_dict() for member in self.members],
         }
+        if self.layout_completeness == "opaque":
+            result["layoutCompleteness"] = "opaque"
+        return result
 
 
 @dataclass(frozen=True)
@@ -534,42 +538,62 @@ def _parse_variable_type(
                     budget,
                     depth=0,
                     parent_absolute_offset=0,
+                    allow_runtime_arrays=True,
                 )
                 for index, member in enumerate(members)
             ),
             key=lambda member: _canonical_json(member.to_dict()),
         )
     )
+    base_type = _alias(item, path, ("baseType",), _base_type)
+    aggregate = base_type == "struct" and bool(parsed_members)
+    completeness = item.get("layoutCompleteness", "complete")
+    if completeness not in {"complete", "opaque"}:
+        raise AbiValidationError("%s has an invalid resource element layout" % path)
+    opaque = completeness == "opaque"
+    elements = _alias(item, path, ("elements",),
+                      lambda raw, raw_path: _integer(raw, raw_path, minimum=1))
+    array_stride = _alias(item, path, ("arrayByteStride",), _integer)
+    if opaque and (base_type != "unknown" or parsed_members or elements != 1 or
+                   byte_size <= 0 or array_stride != byte_size or byte_size % 4 or
+                   item.get("rows") != 0 or item.get("columns") != 0):
+        raise AbiValidationError("%s has an invalid opaque structured element" % path)
+    member_limit = byte_size
+    if elements == 0xFFFFFFFF:
+        if byte_size != 0 or array_stride <= 0:
+            raise AbiValidationError("%s has an invalid runtime array layout" % path)
+        member_limit = array_stride
+    elif aggregate and elements > 1:
+        if array_stride <= 0 or array_stride * (elements - 1) >= byte_size:
+            raise AbiValidationError("%s has an invalid struct array stride" % path)
+        member_limit = min(array_stride, byte_size - array_stride * (elements - 1))
     for member in parsed_members:
-        if member.byte_offset + member.byte_size > byte_size:
+        if member.byte_offset + member.byte_size > member_limit:
             raise AbiValidationError("%s contains a member outside its byte size" % path)
+    _validate_field_ranges(parsed_members, path + ".members")
     return ShaderVariableType(
-        _alias(item, path, ("baseType",), _base_type),
+        base_type,
         _alias(
             item,
             path,
             ("rows",),
-            lambda raw, raw_path: _integer(raw, raw_path, minimum=1),
+            lambda raw, raw_path: _integer(raw, raw_path, minimum=0 if aggregate or opaque else 1),
         ),
         _alias(
             item,
             path,
             ("columns",),
-            lambda raw, raw_path: _integer(raw, raw_path, minimum=1),
+            lambda raw, raw_path: _integer(raw, raw_path, minimum=0 if aggregate or opaque else 1),
         ),
-        _alias(
-            item,
-            path,
-            ("elements",),
-            lambda raw, raw_path: _integer(raw, raw_path, minimum=1),
-        ),
-        _alias(item, path, ("arrayByteStride",), _integer),
+        elements,
+        array_stride,
         _alias(item, path, ("matrixByteStride",), _integer),
         _alias(item, path, ("rowMajor",), _boolean),
         _alias(item, path, ("flags",), _integer),
         _alias(item, path, ("pointerTypeID",), _integer),
         byte_size,
         parsed_members,
+        completeness,
     )
 
 
@@ -614,6 +638,9 @@ def _parse_binding(
         raise AbiValidationError(
             "%s isReadOnly contradicts its resource category" % path
         )
+    if binding.variable_type.layout_completeness == "opaque" and (
+            binding.is_texture or binding.texture_type != "buffer"):
+        raise AbiValidationError("%s opaque elements require a buffer resource" % path)
     return binding
 
 
@@ -651,7 +678,9 @@ def _validate_field_ranges(
 
     ranges: list[tuple[int, int]] = []
     for field in fields:
-        if field.bit_field_size:
+        if field.elements == 0xFFFFFFFF:
+            start, end = field.byte_offset * 8, 1 << 128
+        elif field.bit_field_size:
             start = field.byte_offset * 8 + field.bit_field_offset
             end = start + field.bit_field_size
         else:
@@ -675,6 +704,7 @@ def _parse_field(
     *,
     depth: int,
     parent_absolute_offset: int,
+    allow_runtime_arrays: bool = False,
 ) -> ConstantField:
     if depth > MAX_FIELD_DEPTH:
         raise AbiValidationError(
@@ -695,24 +725,28 @@ def _parse_field(
         if declared_absolute != absolute_offset:
             raise AbiValidationError("%s absolute offset is inconsistent" % path)
 
+    runtime_array = item.get("elements") == 0xFFFFFFFF
+    if runtime_array and not allow_runtime_arrays:
+        raise AbiValidationError("%s runtime arrays are only valid in resource layouts" % path)
     byte_size = _alias(
         item,
         path,
         ("byteSize",),
-        lambda raw, raw_path: _integer(raw, raw_path, minimum=1),
+        lambda raw, raw_path: _integer(raw, raw_path, minimum=0 if runtime_array else 1),
     )
     base_type = _alias(item, path, ("baseType",), _base_type)
+    aggregate = base_type == "struct" and bool(item.get("members", item.get("fields", [])))
     rows = _alias(
         item,
         path,
         ("rows",),
-        lambda raw, raw_path: _integer(raw, raw_path, minimum=1),
+        lambda raw, raw_path: _integer(raw, raw_path, minimum=0 if aggregate else 1),
     )
     columns = _alias(
         item,
         path,
         ("columns", "cols"),
-        lambda raw, raw_path: _integer(raw, raw_path, minimum=1),
+        lambda raw, raw_path: _integer(raw, raw_path, minimum=0 if aggregate else 1),
     )
     elements = _alias(
         item,
@@ -796,14 +830,24 @@ def _parse_field(
                     budget,
                     depth=depth + 1,
                     parent_absolute_offset=absolute_offset,
+                    allow_runtime_arrays=allow_runtime_arrays,
                 )
                 for index, child in enumerate(children)
             ),
             key=lambda child: _canonical_json(child.to_dict()),
         )
     )
+    member_limit = byte_size
+    if runtime_array:
+        if byte_size != 0 or array_stride <= 0 or bit_size:
+            raise AbiValidationError("%s has an invalid runtime array layout" % path)
+        member_limit = array_stride
+    elif aggregate and elements > 1:
+        if array_stride <= 0 or array_stride * (elements - 1) >= byte_size:
+            raise AbiValidationError("%s has an invalid struct array stride" % path)
+        member_limit = min(array_stride, byte_size - array_stride * (elements - 1))
     for child in parsed_children:
-        if child.byte_offset + child.byte_size > byte_size:
+        if child.byte_offset + child.byte_size > member_limit:
             raise AbiValidationError("%s contains a member outside its byte size" % path)
     _validate_field_ranges(parsed_children, path + ".members")
     return ConstantField(
@@ -1321,9 +1365,49 @@ def _ambiguous_access_match(
         or not candidate_block.accesses
     ):
         return False, "access-signature-envelope-mismatch", baseline_digest, candidate_digest
-    if baseline_block.physical_dict() != candidate_block.physical_dict():
-        return False, "access-signature-mismatch", baseline_digest, candidate_digest
-    return True, "access-signature-exact", baseline_digest, candidate_digest
+    if baseline_block.physical_dict() == candidate_block.physical_dict():
+        return True, "access-signature-exact", baseline_digest, candidate_digest
+    # An edit routinely lets the compiler drop loads the original performed
+    # (a constant written over an output dead-codes the math feeding it). Every
+    # load the candidate still performs is then one the captured shader also
+    # performed, at the same offset, width and type: the reconstructed layout
+    # is exercised only where the capture proved it. New offsets, or a changed
+    # width/type at a shared offset, are not proven by the capture and stay
+    # rejected.
+    baseline_loads = set(baseline_block.accesses)
+    candidate_loads = set(candidate_block.accesses)
+    if candidate_loads and candidate_loads < baseline_loads:
+        return True, "access-signature-subset", baseline_digest, candidate_digest
+    return False, "access-signature-mismatch", baseline_digest, candidate_digest
+
+
+def _comparison_interface(abi: ShaderAbi) -> dict[str, Any]:
+    """Interpret the legacy zero-enum spelling without rewriting sealed hashes.
+
+    Older bridges serialized Topology.Unknown (integer zero) as an empty
+    string. Both spellings mean no reflected output topology. Keep the stored
+    physical dictionary and its digest intact so existing manifests, reports,
+    and restore receipts remain independently verifiable.
+    """
+    value = abi.physical_dict()
+    if value["outputTopology"] == "unknown":
+        value["outputTopology"] = ""
+    return value
+
+
+def same_physical_shader_abi(left: ShaderAbi, right: ShaderAbi) -> bool:
+    """Exact captured-interface identity, including legacy absent topology."""
+    return _comparison_interface(left) == _comparison_interface(right)
+
+
+def physical_shader_abi_hashes(abi: ShaderAbi) -> frozenset[str]:
+    """Verified digests for the two historical absent-topology spellings only."""
+    value = abi.physical_dict()
+    hashes = {abi.sha256}
+    if value["outputTopology"] in {"", "unknown"}:
+        value["outputTopology"] = "unknown" if value["outputTopology"] == "" else ""
+        hashes.add(_digest(value))
+    return frozenset(hashes)
 
 
 def compare_shader_abi(
@@ -1342,8 +1426,20 @@ def compare_shader_abi(
     can describe that byte range without being mistaken for captured facts.
     """
 
-    baseline_value = baseline.physical_dict()
-    candidate_value = candidate.physical_dict()
+    baseline_value = _comparison_interface(baseline)
+    candidate_value = _comparison_interface(candidate)
+    for category in ("readOnlyResources", "readWriteResources"):
+        for candidate_binding in candidate_value[category]:
+            for captured in baseline_value[category]:
+                original_type = captured["variableType"]
+                if original_type.get("layoutCompleteness") != "opaque": continue
+                if any(captured[k] != candidate_binding.get(k) for k in captured if k != "variableType"): continue
+                target_type = candidate_binding["variableType"]
+                if (target_type["byteSize"] == original_type["byteSize"] and
+                        target_type["arrayByteStride"] == original_type["arrayByteStride"] and
+                        target_type["elements"] == 1):
+                    candidate_binding["variableType"] = dict(original_type)
+                    break
     baseline_blocks = {
         (block["space"], block["bind"]): block
         for block in baseline_value["constantBlocks"]
@@ -1474,7 +1570,7 @@ def build_candidate_reflection_request(
         )
     elif api_token == "opengl" and (
         stage_value not in _OPENGL_REPLACEABLE_STAGES
-        or candidate_encoding != "opengl-spirv"
+        or candidate_encoding not in {"opengl-spirv", "glsl"}
     ):
         raise AbiValidationError(
             "OpenGL candidate reflection requires native OpenGL SPIR-V and a legacy pipeline stage"
@@ -1497,8 +1593,8 @@ def build_candidate_reflection_request(
                 "target_profile must exactly match the reflected shader stage"
             )
     else:
-        expected_profile = "spirv" if api_token == "vulkan" else "opengl-spirv"
-        if profile != expected_profile:
+        expected_profiles = {"spirv"} if api_token == "vulkan" else {"opengl-spirv", "glsl"}
+        if profile not in expected_profiles:
             raise AbiValidationError(
                 "target_profile must preserve the capture-bound SPIR-V environment"
             )

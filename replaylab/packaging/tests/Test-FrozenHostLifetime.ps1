@@ -7,6 +7,28 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# This probe reads the loaded modules of the frozen Host it starts, and the Hosts
+# are 64-bit. A 32-bit process cannot do that: EnumProcessModules against a 64-bit
+# target returns only the main image, so Process.Modules reports exactly one entry
+# no matter how long you wait -- a failure that looks like a broken build and is
+# nothing of the sort. Visual Studio's default MSBuild\Current\Bin\MSBuild.exe is
+# 32-bit, and the powershell.exe it launches is redirected by WOW64 to the 32-bit
+# copy, so this is the ordinary case rather than an exotic one. Re-launch through
+# SysNative (the alias that reaches the real System32 from a 32-bit process) and
+# report that run as ours.
+if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) {
+    $nativeShell = Join-Path $env:WINDIR 'SysNative\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $nativeShell)) {
+        throw ('This probe must inspect 64-bit Hosts but is running as a 32-bit process, and ' +
+            '64-bit PowerShell was not found at ' + $nativeShell + '. Build with the 64-bit ' +
+            'MSBuild (MSBuild\Current\Bin\amd64\MSBuild.exe).')
+    }
+    & $nativeShell -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath `
+        -InternalHost $InternalHost -McpHost $McpHost -OutputDirectory $OutputDirectory
+    exit $LASTEXITCODE
+}
+
 if (Test-Path -LiteralPath $OutputDirectory) { throw 'Use a fresh lifetime probe directory.' }
 $probeRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $null = New-Item -ItemType Directory -Path $probeRoot
@@ -51,8 +73,54 @@ try {
             # Inspect the running child's loaded Python DLL, not an archive in
             # the executable. Its actual extraction directory must survive the
             # ensure bootloader's exit, or later codec/import requests fail.
-            $python = @($child.Modules | Where-Object { $_.ModuleName -match '^python[0-9]{2,}\.dll$' })
-            if ($python.Count -ne 1) { throw 'Expected one loaded Python runtime in the detached Host.' }
+            # A single sample right after 'ensure' returns can catch the Host
+            # with nothing but its own image mapped: a process that has only just
+            # been created has not finished mapping its DLLs, and a onefile bundle
+            # unpacks itself before Python is loaded at all. What this probe is
+            # actually asserting is a *steady state* -- the extraction directory
+            # outlives the launcher -- so wait for the runtime to appear instead
+            # of reading the module list once and calling it an answer.
+            #
+            # Process.Modules also throws when the target has exited, cannot be
+            # opened, or sits across a bitness boundary; PowerShell turns that into
+            # $null, which then pipes one $null into Where-Object and fails with
+            # "property ModuleName not found" -- a message about nothing. Each
+            # condition below says what actually happened.
+            $python = @()
+            $loadedModules = @()
+            $modulesError = ''
+            $deadline = [DateTime]::UtcNow.AddSeconds(60)
+            while ([DateTime]::UtcNow -lt $deadline) {
+                if ($child.HasExited) {
+                    throw ('The detached Host exited before it finished starting (exit code ' +
+                        [string]$child.ExitCode + '). A ReplayLab process left over from an ' +
+                        'earlier session is the usual cause: it holds the frozen executable ' +
+                        'open, so the freshly built one could not replace it. Close ReplayLab ' +
+                        'and every ReplayLab*.exe / replaylab-ai.exe still running, then build ' +
+                        'again.')
+                }
+                try {
+                    $child.Refresh()
+                    $loadedModules = @($child.Modules)
+                    $modulesError = ''
+                } catch {
+                    $loadedModules = @()
+                    $modulesError = $_.Exception.Message
+                }
+                $python = @($loadedModules |
+                    Where-Object { $null -ne $_ -and $_.ModuleName -match '^python[0-9]{2,}\.dll$' })
+                if ($python.Count -ge 1) { break }
+                Start-Sleep -Milliseconds 250
+            }
+            if ($python.Count -ne 1) {
+                $detail = ' Saw ' + [string]$loadedModules.Count +
+                    ' loaded module(s) after waiting 60 seconds.'
+                if ($modulesError) {
+                    $detail = ' The module list could not be read: ' + $modulesError
+                }
+                throw ('Expected one loaded Python runtime in the detached Host; found ' +
+                    [string]$python.Count + '.' + $detail)
+            }
             $bundle = Split-Path -Parent $python[0].FileName
             $record.bundlePath = $bundle
             $library = Join-Path $bundle 'base_library.zip'
@@ -88,6 +156,18 @@ try {
             if ($null -ne $child) {
                 $record.childExited = $child.WaitForExit(20000)
                 if ($record.childExited) { $record.childExitCode = $child.ExitCode }
+            }
+            if ($null -ne $child -and -not $record.childExited) {
+                # This probe started this Host itself, in its own private runtime
+                # directory and its own LOCALAPPDATA, so nothing else owns it.
+                # Leaving it alive is worse than killing it: it keeps the freshly
+                # frozen executable open, and the *next* build then fails somewhere
+                # unrelated with an access-denied that points at nothing. A Host
+                # that ignored a shutdown request is already a failure this probe
+                # reports; it should not also become tomorrow's mystery.
+                $record.childKilled = $true
+                try { $child.Kill() } catch { $record.childKillError = $_.Exception.Message }
+                $null = $child.WaitForExit(10000)
             }
             if ($null -ne $launcher -and -not $launcher.HasExited) {
                 $record.launcherExited = $launcher.WaitForExit(10000)

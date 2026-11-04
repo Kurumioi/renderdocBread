@@ -7330,6 +7330,92 @@ TEST_CASE("Vulkan shared patch evidence covers bound descriptor elements past th
   CHECK(reason == "incompleteDescriptorElementStorage");
 }
 
+TEST_CASE("Vulkan uniform edits distinguish shared allocations from image aliases",
+          "[vulkan][bufferpatch][suballocation]")
+{
+  // Buffer and optimal-tiled image occupy different granularity pages.
+  CHECK(VulkanReplayPatchBindingsDisjoint(256, 128, 512, 512, 2048, 256));
+  CHECK(VulkanReplayPatchBindingsDisjoint(512, 512, 256, 128, 2048, 256));
+  // Adjacent raw bytes still alias if linear and tiled resources share a page.
+  CHECK_FALSE(VulkanReplayPatchBindingsDisjoint(256, 128, 384, 128, 2048, 256));
+  // Linear images have byte-level aliasing, so the same adjacency is safe.
+  CHECK(VulkanReplayPatchBindingsDisjoint(256, 128, 384, 128, 2048, 1));
+  CHECK_FALSE(VulkanReplayPatchBindingsDisjoint(256, 256, 384, 128, 2048, 1));
+  CHECK_FALSE(VulkanReplayPatchBindingsDisjoint(256, 0, 512, 128, 2048, 256));
+  CHECK_FALSE(VulkanReplayPatchBindingsDisjoint(256, 128, 512, 0, 2048, 256));
+  CHECK_FALSE(VulkanReplayPatchBindingsDisjoint(256, 128, 512, 128, 600, 256));
+  CHECK_FALSE(VulkanReplayPatchBindingsDisjoint(256, 128, 512, 128, 2048, 0));
+  CHECK_FALSE(VulkanReplayPatchBindingsDisjoint(256, 128, 512, 128, 2048, 3));
+  CHECK(VulkanReplayPatchBindingsDisjoint(UINT64_MAX - 511, 256, UINT64_MAX - 255, 255,
+                                          UINT64_MAX, 256));
+  CHECK_FALSE(VulkanReplayPatchBindingsDisjoint(0, 128, UINT64_MAX - 2, 4, UINT64_MAX, 1));
+
+  // The current ImageState records one binding. Disjoint-plane or device-group
+  // bindings cannot be mistaken for a complete interval of an ordinary image.
+  SDObject plane("plane"_lit, "VkBindImagePlaneMemoryInfo"_lit);
+  CHECK(VulkanReplayPatchUnsafeMemoryMetadata(plane));
+  SDObject group("group"_lit, "VkBindImageMemoryDeviceGroupInfo"_lit);
+  CHECK(VulkanReplayPatchUnsafeMemoryMetadata(group));
+}
+
+TEST_CASE("Vulkan edit undo restores only validated words and leaves neighbouring images intact",
+          "[vulkan][bufferpatch][suballocation]")
+{
+  const ResourceId memory = ResourceIDGen::GetNewUniqueID();
+  ReplayBufferPatch patch;
+  patch.buffer = memory;
+  patch.byteOffset = 263;
+  patch.data = {1, 2, 3, 4, 5};
+  ReplayBufferPatchRange copy, clear;
+  REQUIRE(VulkanReplayPatchMakeRestoreRange(patch, 256, 128, 1024, false, copy));
+  CHECK(copy.byteOffset == 263);
+  CHECK(copy.byteLength == 5);
+  REQUIRE(VulkanReplayPatchMakeRestoreRange(patch, 256, 128, 1024, true, clear));
+  CHECK(clear.byteOffset == 260);
+  CHECK(clear.byteLength == 8);
+  // Captured initial bytes can end before unused requirement padding.
+  CHECK(VulkanReplayPatchMakeRestoreRange(patch, 256, 256, 268, false, copy));
+  CHECK_FALSE(VulkanReplayPatchMakeRestoreRange(patch, 256, 256, 267, false, copy));
+  CHECK_FALSE(VulkanReplayPatchMakeRestoreRange(patch, 264, 128, 1024, false, copy));
+  CHECK_FALSE(VulkanReplayPatchMakeRestoreRange(patch, 263, 5, 1024, true, clear));
+  patch.byteOffset = UINT64_MAX - 2;
+  CHECK_FALSE(VulkanReplayPatchMakeRestoreRange(patch, UINT64_MAX - 16, 16, UINT64_MAX,
+                                                false, copy));
+
+  // An old slider value and its replacement/removal both need restoration.
+  // Unioning those exact ranges must not turn into an allocation-wide clear.
+  const ReplayBufferPatchRange oldRange = {memory, 260, 8};
+  const ReplayBufferPatchRange newRange = {memory, 280, 4};
+  std::map<ResourceId, Intervals<bool>> pending;
+  VulkanReplayPatchAccumulateRestoreRanges(pending, {oldRange});
+  VulkanReplayPatchAccumulateRestoreRanges(pending, {newRange, oldRange});
+  REQUIRE(pending.size() == 1);
+  CHECK_FALSE(pending[memory].find(259)->value());
+  CHECK(pending[memory].find(260)->value());
+  CHECK(pending[memory].find(267)->value());
+  CHECK_FALSE(pending[memory].find(268)->value());
+  CHECK(pending[memory].find(283)->value());
+  CHECK_FALSE(pending[memory].find(284)->value());
+  CHECK_FALSE(pending[memory].find(512)->value());
+  bytebuf initial, edited;
+  initial.resize(1024);
+  edited.resize(1024);
+  for(size_t i = 0; i < edited.size(); ++i)
+  {
+    initial[i] = byte(i & 0xff);
+    edited[i] = i >= 512 ? 0xa5 : 0x7e;
+  }
+  for(auto it = pending[memory].begin(); it != pending[memory].end(); ++it)
+    if(it->value())
+      memcpy(edited.data() + it->start(), initial.data() + it->start(),
+               size_t(it->finish() - it->start()));
+  CHECK(edited[260] == initial[260]);
+  CHECK(edited[283] == initial[283]);
+  CHECK(edited[284] == 0x7e);
+  for(size_t i = 512; i < edited.size(); ++i)
+    REQUIRE(edited[i] == 0xa5);
+}
+
 TEST_CASE("Vulkan shared edits use submitted first reads and preserve exact range layouts only",
           "[vulkan][bufferpatch]")
 {

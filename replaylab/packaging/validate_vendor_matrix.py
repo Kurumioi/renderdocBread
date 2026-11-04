@@ -8,9 +8,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import replace
 import json
-import os
 from pathlib import Path
 import re
 import sys
@@ -69,12 +69,13 @@ def safe_text(value: object) -> str:
     return re.sub(r"https?://[^\s<>\"']+", "<url omitted>", redact(str(value)))
 
 
-def safe_value(value):
+def safe_value(value: object) -> object:
+    """Redact nested diagnostic values while preserving their JSON structure."""
     if isinstance(value, str):
         return safe_text(value)
-    if isinstance(value, dict):
-        return {key: safe_value(item) for key, item in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, Mapping):
+        return {str(key): safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
         return [safe_value(item) for item in value]
     return value
 
@@ -149,7 +150,7 @@ async def run_capture(profile, args) -> dict:
         model.callbacks = [budget]
         return model
 
-    config = OrchestratorConfig(main_timeout=180, max_tool_calls=8, allowed_effects=frozenset(),
+    config = OrchestratorConfig(main_timeout=180, allowed_effects=frozenset(),
                                 event_root=root / "events", log_root=root / "logs",
                                 workspace_base=root / "workspaces")
     kwargs = {"catalog": _catalog(), "config": config}
@@ -158,8 +159,7 @@ async def run_capture(profile, args) -> dict:
     request = RunRequest(
         prompt=(f"这是一次有界只读供应商验收。用户指定目标 EID {args.event_id}，并非快照当前的 Present。"
                 f"只调用 inspect_event(event_id={args.event_id}) 一次取得证据，简述 action、绑定阶段与输出。"
-                "遵循已加载的核心与事件 Skill、Host 的报告模板，用 report_task_result 提交含工具证据的标准报告。"
-                "本次只验收文字证据报告，至多 250 个中文字；禁止改变当前事件、修改项目或工作区、"
+                "可以按需加载相关 Skill。说明观察到的事实，至多 250 个中文字；禁止改变当前事件、修改项目或工作区、"
                 "编译、替换着色器、写文件和生成图或纹理；无需拓展整个帧或调用子任务。"
                 "若有错误或需要授权则如实结束，不重试模型请求，不自行切换模型。"),
         profile=profile, task_id=task_id, model=profile.resolve_model(), context=context,
@@ -171,26 +171,16 @@ async def run_capture(profile, args) -> dict:
     summary = {"profile": profile.id, "preset": profile.preset, "model": request.model,
                "taskId": task_id, "instanceId": instance_id, "eventId": args.event_id,
                "captureSessionId": args.capture_session, "snapshotId": context["snapshotId"],
-               "limits": {"seconds": 180, "toolCalls": 8, "reportRounds": 2, "followUps": 1,
+               "limits": {"seconds": 180, "toolCalls": 8,
                           "apiModelCalls": 6, "apiOutputTokensPerCall": 1200, "apiSdkRetries": 0}}
-    old = {name: os.environ.get(name) for name in (
-        "REPLAYLAB_REPORT_MAX_ROUNDS", "REPLAYLAB_REVIEW_MAX_ROUNDS", "REPLAYLAB_VERIFY_MAX_ROUNDS")}
-    os.environ.update({"REPLAYLAB_REPORT_MAX_ROUNDS": "2", "REPLAYLAB_REVIEW_MAX_ROUNDS": "2",
-                       "REPLAYLAB_VERIFY_MAX_ROUNDS": "1"})
     try:
         result = await asyncio.wait_for(engine.run(request), timeout=180)
         summary.update({"terminalStatus": result.terminal_status, "engine": result.core,
-                        "error": safe_text(result.error), "text": safe_text(result.text),
-                        "report": safe_value(result.report)})
+                        "error": safe_text(result.error), "text": safe_text(result.text)})
     except Exception as error:
         summary.update({"terminalStatus": "failed", "exceptionType": type(error).__name__,
                         "error": safe_text(error)[:600]})
     finally:
-        for name, value in old.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
         close_logging()
     summary.update({"seconds": round(time.monotonic() - started, 3),
                     "apiModelCalls": budget.calls, "apiInputTokens": budget.input_tokens,
@@ -203,13 +193,14 @@ async def run_capture(profile, args) -> dict:
     state_path = root / "events" / f"{task_id}.report-state.json"
     if state_path.is_file():
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        summary["hostAcceptance"] = {key: state.get(key) for key in (
-            "accepted", "softAccepted", "attempts", "maxRounds", "budgetExhausted", "toolsUsed")}
+        summary["toolReceipts"] = {key: state.get(key) for key in (
+            "toolsUsed", "toolFacts", "artifactPaths")}
     path = root / "result.json"
-    path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {key: summary[key] for key in (
+    safe_summary = safe_value(summary)
+    path.write_text(json.dumps(safe_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {key: safe_summary[key] for key in (
         "profile", "preset", "taskId", "terminalStatus", "seconds", "apiModelCalls", "apiOutputTokens"
-    )} | {"resultPath": str(path), "error": summary.get("error", "")}
+    )} | {"resultPath": str(path), "error": safe_summary.get("error", "")}
 
 
 async def main(argv=None):

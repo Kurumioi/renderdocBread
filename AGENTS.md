@@ -2,11 +2,35 @@
 
 > **EID performance worktree:** When working in `renderdocUltra-eid-perf`, read [`WORKTREE_ISOLATION.md`](./WORKTREE_ISOLATION.md) before building, deploying, or running it. Keep that worktree's build and test output isolated. Explicitly requested source integration into the main branch must preserve the main checkout's existing work; these isolation rules do not prohibit that integration.
 
-> **Read BOTH this file and [`CLAUDE.md`](./CLAUDE.md) before making changes — together they are one unified rule set.** OpenAI Codex and other agents read `AGENTS.md`; Claude Code reads `CLAUDE.md`; each points at the other so neither agent misses a rule. They are complementary, not duplicates: **`AGENTS.md`** (this file) is canonical for the UI/ReplayLab **localization (i18n) rules** below; **`CLAUDE.md`** is canonical for project structure, the build/release pipeline, upstream sync, and pitfalls. If a rule's home is the other file, follow it there and keep the two in sync.
+> **Read BOTH this file and [`CLAUDE.md`](./CLAUDE.md) before making changes — together they are one unified rule set.** OpenAI Codex and other agents read `AGENTS.md`; Claude Code reads `CLAUDE.md`; each points at the other so neither agent misses a rule. They are complementary, not duplicates: **`AGENTS.md`** (this file) is canonical for the UI/Bread **localization (i18n) rules** below; **`CLAUDE.md`** is canonical for project structure, the build/release pipeline, upstream sync, and pitfalls. If a rule's home is the other file, follow it there and keep the two in sync.
 
 ## Tooling
 
 - Prefer command-line, API, MCP, and background workflows. Avoid controlling desktop applications unless no reliable non-interactive path exists.
+- Let pytest use its operating-system temporary directory. Never pass a repository-relative or repository-contained `--basetemp`; when a named scratch path is genuinely needed, place it under the absolute system temp directory and clean it after the run. Do not create `.pytest-*`, `.tmp-pytest-*`, `.test-tmp-*`, `_pytest_*`, or `.tmp-test-*` directories in a checkout.
+
+## Release packaging entry point (mandatory)
+
+For any packaging, portable ZIP, release, or distribution request (including “打包”/“发布”),
+read [CLAUDE.md — Release Build Guide](./CLAUDE.md#release-build-guide),
+[`replaylab/packaging/RELEASE_REQUIREMENTS.md`](./replaylab/packaging/RELEASE_REQUIREMENTS.md),
+[`replaylab/packaging/README.md`](./replaylab/packaging/README.md), and
+[`replaylab/dependencies/README.md`](./replaylab/dependencies/README.md) before building or
+assembling artifacts. These checked-in files carry the standing packaging requirements;
+do not depend on another chat, a previous release directory, or the AI's memory.
+Use the current package configuration and sealed dependency inputs. Preserve the complete
+standard feature inventory unless the user explicitly selects a smaller edition. Complete
+the documented artifact checks before delivery; packaging does not authorize overwriting
+or stopping a running application. Keep release rules in those canonical documents and
+update their links here when the workflow changes.
+
+## Product name and compatibility
+
+- Persistent-data upgrades must follow [CLAUDE.md — Persistent data compatibility](./CLAUDE.md#persistent-data-compatibility), including old-format recovery, path identity and preservation of user data.
+
+- **RenderDocBread** is the application/release name; **Bread** is its product family and **Bread AI** is the assistant. Menus, titles, help, diagnostics, new default project names, and product documentation must use this brand.
+- Retain legacy `ReplayLab` identifiers only where compatibility requires them: existing storage paths and project data, protocol/schema values, environment variables, executable/module/class names, and the `ReplayLabProjects` translation context. These technical identifiers are not a UI brand and must not be renamed by a presentation-only change.
+- Preserve the names and paths of existing user projects. Only defaults for newly created projects use Bread.
 
 ## UI localization (mandatory)
 
@@ -33,15 +57,15 @@ python ./util/i18n/lint_ts.py ./qrenderdoc/Translations/qrenderdoc_zh_CN.ts --gl
 
 - On memory-constrained Windows machines, build qrenderdoc with `MSBuild ... /m:2`; do not run multiple full builds concurrently.
 
-## ReplayLab built-in Python integration localization (mandatory)
+## Bread built-in Python integration localization (mandatory)
 
-- The canonical ReplayLab bridge source is `replaylab/renderdoc_mcp_bridge/` in this repository. It is packaged at `x64/<Configuration>/integrations/replaylab/python/renderdoc_mcp_bridge/` and loaded by qrenderdoc from that fixed first-party path. It must not be discovered through the Python extension scanner, shadowed from `%APPDATA%`, or given an `extension.json` manifest.
-- Python-created user-visible text must call `QtCore.QCoreApplication.translate("ReplayLabProjects", "English source")` directly. Do not hide source literals behind a custom translation wrapper. Use positional placeholders such as `%1` and `%2`, then insert project names, paths, diagnostics, API values, and identifiers after translation. ReplayLab's Python extractor does not support Qt numerus, so `%n` is forbidden until that pipeline explicitly implements plural catalogs.
-- ReplayLab reuses qrenderdoc's installed translator; do not install a second `QTranslator` or infer the active language from the raw `UILanguage` value.
+- The canonical Bread bridge source is `replaylab/renderdoc_mcp_bridge/` in this repository. It is packaged at `x64/<Configuration>/integrations/replaylab/python/renderdoc_mcp_bridge/` and loaded by qrenderdoc from that fixed first-party path. It must not be discovered through the Python extension scanner, shadowed from `%APPDATA%`, or given an `extension.json` manifest.
+- Python-created user-visible text must call `QtCore.QCoreApplication.translate("ReplayLabProjects", "English source")` directly. Do not hide source literals behind a custom translation wrapper. Use positional placeholders such as `%1` and `%2`, then insert project names, paths, diagnostics, API values, and identifiers after translation. Bread's Python extractor does not support Qt numerus, so `%n` is forbidden until that pipeline explicitly implements plural catalogs.
+- Bread reuses qrenderdoc's installed translator; do not install a second `QTranslator` or infer the active language from the raw `UILanguage` value.
 - `qrenderdoc/Translations/ReplayLabProjects.cpp` is generated by `util/i18n/extract_replaylab_translations.py`. Never edit it by hand. Reviewed Simplified Chinese text is maintained in `util/i18n/replaylab_zh_CN.json` and synchronized into the main TS catalog.
 - Put split project-UI modules under the canonical bridge as `project_*.py`; they are discovered recursively for extraction and packaged automatically. Project UI kept in `__init__.py` must remain inside the `replaylab-project-i18n-begin` / `replaylab-project-i18n-end` markers.
-- New or changed ReplayLab project UI must pass `util/i18n/update_translations.ps1 -Check`; the AST gate rejects raw English or Chinese labels, buttons, titles, item/tab text, menus, tooltips, file-dialog text, status text, message-box text, indirect local constants, unsupported `%n`, and the wrong translation context.
-- Preserve `ReplayLab`, `RenderDoc`, `RDC`, `CBuffer`, `EID`, `API`, `ABI`, paths, project names, file names, format names, and shader/API identifiers. Translate `Shader` as “着色器” in prose and keep compact graphics-stage abbreviations unchanged.
+- New or changed Bread project UI must pass `util/i18n/update_translations.ps1 -Check`; the AST gate rejects raw English or Chinese labels, buttons, titles, item/tab text, menus, tooltips, file-dialog text, status text, message-box text, indirect local constants, unsupported `%n`, and the wrong translation context.
+- Preserve `Bread`, `RenderDoc`, `RDC`, `CBuffer`, `EID`, `API`, `ABI`, paths, project names, file names, format names, and shader/API identifiers. Translate `Shader` as “着色器” in prose and keep compact graphics-stage abbreviations unchanged.
 - A distributable change is not complete after `lrelease`: relink qrenderdoc with `/m:2` and an explicit `SolutionDir`, verify the canonical Python integration at its fixed application path, and restart qrenderdoc:
 
 ```powershell

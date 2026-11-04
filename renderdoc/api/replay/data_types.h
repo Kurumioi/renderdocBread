@@ -2874,3 +2874,117 @@ struct DebugPixelInputs
 };
 
 DECLARE_REFLECTION_STRUCT(DebugPixelInputs);
+
+DOCUMENT(R"(One render output captured by a single-prefix pixel Shader comparison.
+
+The byte arrays have the same native format and packing as :meth:`ReplayController.GetTextureData`.
+They contain the baseline draw, the candidate draw, and a repeated baseline draw, each starting
+from the same render-target and depth-stencil contents. The first implementation supports only
+single-sample 2D textures with one mip and one array slice.
+
+Container equality and ordering compare the output identity only, never the potentially large
+pixel arrays. They do not indicate numerical equivalence of the observations.
+)");
+struct ShaderPairSnapshot
+{
+  DOCUMENT("");
+  ShaderPairSnapshot() = default;
+  ShaderPairSnapshot(const ShaderPairSnapshot &) = default;
+  ShaderPairSnapshot &operator=(const ShaderPairSnapshot &) = default;
+#if !defined(SWIG)
+  ShaderPairSnapshot(ShaderPairSnapshot &&) = default;
+  ShaderPairSnapshot &operator=(ShaderPairSnapshot &&) = default;
+#endif
+
+  bool operator==(const ShaderPairSnapshot &o) const
+  {
+    return resourceId == o.resourceId && depth == o.depth && index == o.index &&
+           subresource == o.subresource;
+  }
+  bool operator<(const ShaderPairSnapshot &o) const
+  {
+    if(depth != o.depth)
+      return depth < o.depth;
+    if(index != o.index)
+      return index < o.index;
+    if(resourceId != o.resourceId)
+      return resourceId < o.resourceId;
+    return subresource < o.subresource;
+  }
+
+  DOCUMENT("The original output resource.\n\n:type: ResourceId");
+  ResourceId resourceId;
+  DOCUMENT("The color render-target slot, or zero for depth.\n\n:type: int");
+  uint32_t index = 0;
+  DOCUMENT("Whether this is the depth-stencil output.\n\n:type: bool");
+  bool depth = false;
+  DOCUMENT("The captured subresource.\n\n:type: Subresource");
+  Subresource subresource;
+  DOCUMENT("The format of every returned byte array.\n\n:type: ResourceFormat");
+  ResourceFormat format;
+  DOCUMENT("The output width in pixels.\n\n:type: int");
+  uint32_t width = 0;
+  DOCUMENT("The output height in pixels.\n\n:type: int");
+  uint32_t height = 0;
+  DOCUMENT("The first baseline draw's output bytes.\n\n:type: bytes");
+  bytebuf baseline;
+  DOCUMENT("The candidate draw's output bytes.\n\n:type: bytes");
+  bytebuf candidate;
+  DOCUMENT("The repeated baseline draw's output bytes.\n\n:type: bytes");
+  bytebuf baselineRepeat;
+};
+
+DECLARE_REFLECTION_STRUCT(ShaderPairSnapshot);
+
+DOCUMENT(R"(Results of a pixel Shader comparison against one frozen replay prefix.
+
+``completed`` means that all three snapshots were collected; it does not establish numerical
+equivalence. Callers must compare both baseline snapshots for stability and the candidate against
+the baseline using their normal tolerances. Unsupported drivers and unsupported draw states return
+an explanatory ``reason`` without claiming completion.
+)");
+struct ShaderPairComparison
+{
+  DOCUMENT("");
+  ShaderPairComparison() = default;
+  ShaderPairComparison(const ShaderPairComparison &) = default;
+  ShaderPairComparison &operator=(const ShaderPairComparison &) = default;
+#if !defined(SWIG)
+  ShaderPairComparison(ShaderPairComparison &&) = default;
+  ShaderPairComparison &operator=(ShaderPairComparison &&) = default;
+#endif
+
+  DOCUMENT("The effective event ID used for comparison.\n\n:type: int");
+  uint32_t eventId = 0;
+  DOCUMENT("Whether the driver admitted this draw for comparison.\n\n:type: bool");
+  bool supported = false;
+  DOCUMENT("Whether every output has complete baseline/candidate/repeat bytes.\n\n:type: bool");
+  bool completed = false;
+  DOCUMENT("A diagnostic explaining unsupported or incomplete comparisons.\n\n:type: str");
+  rdcstr reason;
+  DOCUMENT("All active color and depth outputs, bounded to nine resources.\n\n:type: List[ShaderPairSnapshot]");
+  rdcarray<ShaderPairSnapshot> outputs;
+};
+
+DECLARE_REFLECTION_STRUCT(ShaderPairComparison);
+
+DOCUMENT("One event-scoped Shader replacement registration, including its original live target.")
+struct EventShaderOverrideState
+{
+  DOCUMENT("Whether an override is currently configured.\n\n:type: bool");
+  bool active = false;
+  DOCUMENT("The effective event ID.\n\n:type: int");
+  uint32_t eventId = 0;
+  DOCUMENT("The overridden stage.\n\n:type: ShaderStage");
+  ShaderStage stage = ShaderStage::Pixel;
+  DOCUMENT("The canonical captured Shader.\n\n:type: ResourceId");
+  ResourceId expectedOriginal;
+  DOCUMENT("The retained target Shader.\n\n:type: ResourceId");
+  ResourceId replacement;
+  DOCUMENT("The color target with blending bypassed, or 4294967295 to preserve state.\n\n:type: int");
+  uint32_t outputTarget = ~0U;
+  DOCUMENT("Whether the selected color output uses independent RGBA32_FLOAT storage.\n\n:type: bool");
+  bool independentFloatOutput = false;
+};
+
+DECLARE_REFLECTION_STRUCT(EventShaderOverrideState);

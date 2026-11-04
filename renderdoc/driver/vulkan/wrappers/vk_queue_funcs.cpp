@@ -27,6 +27,7 @@
 #include "../vk_debug.h"
 #include "core/settings.h"
 #include "replay/replay_timing.h"
+#include "replay/resource_usage.h"
 
 RDOC_EXTERN_CONFIG(bool, Vulkan_Debug_VerboseCommandRecording);
 RDOC_EXTERN_CONFIG(bool, Vulkan_Debug_SingleSubmitFlushing);
@@ -34,24 +35,7 @@ RDOC_EXTERN_CONFIG(bool, Vulkan_Debug_SingleSubmitFlushing);
 static bool AddFrameResourceUsage(std::map<ResourceId, rdcarray<EventUsage>> &resourceUses,
                                   ResourceId id, const EventUsage &usage)
 {
-  if(usage.usage == ResourceUsage::Shader)
-  {
-    if(usage.eventId == 0)
-      return false;
-
-    auto it = resourceUses.find(id);
-    if(it != resourceUses.end())
-    {
-      for(const EventUsage &existing : it->second)
-      {
-        if(existing.usage == ResourceUsage::Shader && existing.eventId > 0)
-          return false;
-      }
-    }
-  }
-
-  resourceUses[id].push_back(usage);
-  return true;
+  return AppendFrameResourceUsage(resourceUses[id], usage);
 }
 
 template <typename SerialiserType>

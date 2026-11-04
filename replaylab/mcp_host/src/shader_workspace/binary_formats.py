@@ -102,6 +102,19 @@ def fingerprint_shader_executable(
     """
 
     hint = _normalise_hint(format_hint)
+    if hint == "glsl":
+        # This is source identity, never a claim that text has compiled. The
+        # native build receipt and fresh reflection are separate mandatory gates.
+        if not data or len(data) > 4 * 1024 * 1024 or b"\0" in data:
+            return None
+        try:
+            text = data.decode("utf-8", errors="strict")
+        except UnicodeError:
+            return None
+        if not text.strip():
+            return None
+        digest = hashlib.sha256(data).hexdigest()
+        return PortableShaderExecutable(digest, digest, len(data), "GLSL", "glsl")
     directx = fingerprint_bytes(data, label)
     if _valid_directx(directx, len(data)):
         detected = "dxil" if directx.kind == "DXIL" else "dxbc"

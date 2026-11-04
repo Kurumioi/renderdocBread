@@ -123,6 +123,7 @@ def _normalise_base_type(field: dict) -> str:
         return "struct"
     value = str(field.get("baseType", field.get("type", "")) or "").strip().lower()
     value = value.rsplit(".", 1)[-1].replace("_", "").replace(" ", "")
+    value = re.sub(r"\[\d*\]$", "", value)
     # When only an HLSL spelling is present, vector/matrix shape belongs in the
     # rows/columns fields and must not alter the scalar base type identity.
     value = re.sub(r"\d+(x\d+)?$", "", value)
@@ -236,7 +237,7 @@ def _normalise_variable_type(value: Any) -> dict:
         # complete physical resource element layout.
         return {"legacyToken": _enum_token(value)}
     members = value.get("members", value.get("fields", [])) or []
-    return {
+    result = {
         "baseType": _normalise_base_type(value),
         "rows": _safe_int(value.get("rows", 0)),
         "columns": _safe_int(value.get("columns", value.get("cols", 0))),
@@ -253,6 +254,9 @@ def _normalise_variable_type(value: Any) -> dict:
         "byteSize": _safe_int(value.get("byteSize", 0)),
         "members": _normalize_fields(members),
     }
+    if value.get("layoutCompleteness") == "opaque":
+        result["layoutCompleteness"] = "opaque"
+    return result
 
 
 def _normalise_bindings(values: Iterable[dict]) -> list[dict]:
@@ -382,11 +386,19 @@ def _variable_type_is_complete(value: Any) -> bool:
     ):
         return False
     members = value.get("members")
+    opaque = value.get("layoutCompleteness") == "opaque"
+    if opaque and (
+            _normalise_base_type(value) != "unknown" or members != [] or
+            value.get("elements") != 1 or value.get("rows") != 0 or value.get("columns") != 0 or
+            not _is_physical_int(value.get("byteSize"), 1) or
+            value.get("arrayByteStride") != value.get("byteSize") or value["byteSize"] % 4):
+        return False
+    aggregate = _normalise_base_type({"baseType": value.get("baseType")}) == "struct" and bool(members)
     if (
         not isinstance(value.get("baseType"), str)
         or not str(value.get("baseType", "")).strip()
-        or not _is_physical_int(value.get("rows"), 1)
-        or not _is_physical_int(value.get("columns"), 1)
+        or not _is_physical_int(value.get("rows"), 0 if aggregate or opaque else 1)
+        or not _is_physical_int(value.get("columns"), 0 if aggregate or opaque else 1)
         or not _is_physical_int(value.get("elements"), 1)
         or not _is_physical_int(value.get("arrayByteStride"))
         or not _is_physical_int(value.get("matrixByteStride"))
@@ -397,10 +409,21 @@ def _variable_type_is_complete(value: Any) -> bool:
         or not isinstance(members, list)
     ):
         return False
-    return _fields_are_complete(members, value.get("byteSize"))
+    member_limit = value["byteSize"]
+    if value["elements"] == 0xFFFFFFFF:
+        if member_limit != 0 or value["arrayByteStride"] <= 0:
+            return False
+        member_limit = value["arrayByteStride"]
+    elif aggregate and value["elements"] > 1:
+        stride = value["arrayByteStride"]
+        if stride <= 0 or stride * (value["elements"] - 1) >= member_limit:
+            return False
+        member_limit = min(stride, member_limit - stride * (value["elements"] - 1))
+    return _fields_are_complete(members, member_limit, allow_runtime_arrays=True)
 
 
-def _fields_are_complete(values: list, parent_size: int | None = None) -> bool:
+def _fields_are_complete(values: list, parent_size: int | None = None,
+                         *, allow_runtime_arrays: bool = False) -> bool:
     requirements = (
         ("byteOffset", "offset"),
         ("byteSize",),
@@ -421,24 +444,29 @@ def _fields_are_complete(values: list, parent_size: int | None = None) -> bool:
             return False
         offset = _alias_value(value, "byteOffset", "offset")
         byte_size = value.get("byteSize")
+        children = value.get("members", value.get("fields", []))
+        aggregate = _normalise_base_type({"baseType": value.get("baseType", value.get("type"))}) == "struct" and bool(children)
+        runtime_array = value.get("elements") == 0xFFFFFFFF
+        if runtime_array and not allow_runtime_arrays:
+            return False
         if (
             not _aliases_are_consistent(
                 value,
                 ("byteOffset", "offset"),
                 lambda item: _is_physical_int(item),
             )
-            or not _is_physical_int(byte_size, 1)
+            or not _is_physical_int(byte_size, 0 if runtime_array else 1)
             or not _aliases_are_consistent(
                 value,
                 ("baseType", "type"),
                 lambda item: isinstance(item, str) and bool(item.strip()),
                 lambda item: _normalise_base_type({"baseType": item}),
             )
-            or not _is_physical_int(value.get("rows"), 1)
+            or not _is_physical_int(value.get("rows"), 0 if aggregate else 1)
             or not _aliases_are_consistent(
                 value,
                 ("columns", "cols"),
-                lambda item: _is_physical_int(item, 1),
+                lambda item: _is_physical_int(item, 0 if aggregate else 1),
             )
             or not _is_physical_int(value.get("elements"), 1)
             or not _aliases_are_consistent(
@@ -469,9 +497,31 @@ def _fields_are_complete(values: list, parent_size: int | None = None) -> bool:
             or bit_offset + bit_size > 64
         ):
             return False
-        children = value.get("members", value.get("fields", []))
+        member_limit = byte_size
+        if runtime_array:
+            stride = _alias_value(value, "arrayByteStride", "arrayStride")
+            if byte_size != 0 or stride <= 0 or bit_size:
+                return False
+            # A runtime tail has no fixed end. It must be the last member and
+            # must not overlap the known prefix or another unsized tail.
+            for sibling in values:
+                if sibling is value:
+                    continue
+                sibling_offset = _alias_value(sibling, "byteOffset", "offset")
+                sibling_size = sibling.get("byteSize")
+                if (not _is_physical_int(sibling_offset)
+                        or not _is_physical_int(sibling_size)
+                        or sibling_offset >= offset
+                        or sibling_offset + sibling_size > offset):
+                    return False
+            member_limit = stride
+        elif aggregate and value["elements"] > 1:
+            stride = _alias_value(value, "arrayByteStride", "arrayStride")
+            if stride <= 0 or stride * (value["elements"] - 1) >= byte_size:
+                return False
+            member_limit = min(stride, byte_size - stride * (value["elements"] - 1))
         if not isinstance(children, list) or not _fields_are_complete(
-            children, byte_size
+            children, member_limit, allow_runtime_arrays=allow_runtime_arrays
         ):
             return False
     return True
@@ -501,6 +551,11 @@ def _records_have_physical_keys(values: list, kind: str) -> bool:
                 ("needSemanticIndex",),
             )
         elif kind == "binding":
+            if (isinstance(value.get("variableType"), dict) and
+                    value["variableType"].get("layoutCompleteness") == "opaque" and
+                    (value.get("isTexture") is not False or
+                     _enum_token(value.get("textureType")) != "buffer")):
+                return False
             requirements = (
                 ("space", "fixedBindSetOrSpace"),
                 ("bind", "fixedBindNumber"),
@@ -1335,41 +1390,68 @@ def _iter_files(
 
 @contextmanager
 def _exclusive_scan_lock(lock_path: Path) -> Iterable[None]:
-    """Serialize scans sharing a scan ID without guessing whether a lock is stale."""
+    """Serialize scans, recovering only OS-proven inactive owners, never by age."""
 
-    token = "%d:%d:%s" % (os.getpid(), time.time_ns(), secrets.token_hex(16))
-    payload = json.dumps(
-        {"pid": os.getpid(), "createdUnixNs": time.time_ns(), "token": token},
-        sort_keys=True,
-    ).encode("utf-8")
-    try:
-        descriptor = os.open(
-            str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-        )
-    except FileExistsError:
+    from .. import active_projects as locks
+
+    payload = locks._exclusive_project_lock_payload(secrets.token_hex(16))
+    for attempt in range(2):
         try:
-            owner = lock_path.read_text(encoding="utf-8")[:4096]
-        except (OSError, UnicodeError):
-            owner = "<unreadable>"
-        raise RuntimeError(
-            "Asset symbol scan is already locked for this root/build: %s; owner=%s. "
-            "Locks are never auto-expired; remove it only after verifying the owner process stopped."
-            % (lock_path, owner)
-        )
+            # A complete, fsynced v2 payload becomes visible atomically. A crash
+            # cannot leave an empty authoritative lock between create and write.
+            locks._publish_exclusive_project_lock(lock_path, payload)
+            break
+        except FileExistsError as error:
+            if not attempt and locks._archive_recoverable_exclusive_project_lock(
+                lock_path, is_recoverable=_recoverable_scan_lock,
+            ) is not None:
+                continue
+            snapshot = locks._lock_snapshot(lock_path)
+            owner = snapshot[0].decode("utf-8", errors="replace")[:4096] if snapshot else "<unreadable>"
+            raise RuntimeError(
+                "Asset symbol scan is already locked for this root/build: %s; owner=%s. "
+                "The owner is active or could not be proven inactive; its lock was preserved."
+                % (lock_path, owner)
+            ) from error
 
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
         yield
     finally:
         # Do not remove a lock that an operator replaced while this scan ran.
         try:
-            if lock_path.read_bytes() == payload:
+            snapshot = locks._lock_snapshot(lock_path)
+            if snapshot is not None and snapshot[0] == payload:
                 lock_path.unlink()
-        except FileNotFoundError:
+        except OSError:
             pass
+
+
+def _recoverable_scan_lock(raw: bytes, metadata: os.stat_result) -> bool:
+    """Accept v2 process identities or the old scanner's exact legacy format.
+
+    Legacy timestamps cannot prove PID reuse. A live or inaccessible legacy PID
+    stays locked; only an OS-confirmed dead PID authorizes archiving that file.
+    """
+
+    from .. import active_projects as locks
+
+    if locks._recoverable_exclusive_project_lock(raw, metadata):
+        return True
+    try:
+        value = json.loads(raw.decode("utf-8", errors="strict"),
+                           object_pairs_hook=locks._json_object_without_duplicate_keys)
+    except (UnicodeError, ValueError):
+        return False
+    if not isinstance(value, dict) or set(value) != {"pid", "createdUnixNs", "token"}:
+        return False
+    pid, created, token = value["pid"], value["createdUnixNs"], value["token"]
+    if (type(pid) is not int or not 0 < pid <= 0xFFFFFFFF
+            or type(created) is not int or created <= 0 or not isinstance(token, str)):
+        return False
+    token_parts = re.fullmatch(r"([1-9][0-9]*):([1-9][0-9]*):[0-9a-f]{32}", token)
+    if token_parts is None or int(token_parts.group(1)) != pid:
+        return False
+    return locks._process_lock_owner_state(pid)[0] == "dead"
 
 
 def scan_asset_root(

@@ -30,6 +30,7 @@
 #include "driver/shaders/spirv/spirv_compile.h"
 #include "jpeg-compressor/jpge.h"
 #include "replay/replay_timing.h"
+#include "replay/resource_usage.h"
 #include "serialise/rdcfile.h"
 #include "strings/string_utils.h"
 #include "gl_replay.h"
@@ -5965,28 +5966,109 @@ void WrappedOpenGL::RecordReplayCheckpointTextureWrite(const GLResource &resourc
     m_Replay->RecordCheckpointTextureWrite(resource);
 }
 
-void WrappedOpenGL::ApplyReplayBufferPatches()
+namespace
+{
+enum class GLReplayPatchCopyResult
+{
+  Succeeded,
+  CopyFailed,
+  RestoreFailed,
+};
+
+template <typename BindUpload, typename BindTarget, typename Copy, typename Restore>
+GLReplayPatchCopyResult GLReplayPatchCopy(const rdcarray<ReplayBufferPatch> &patches,
+                                         BindUpload bindUpload, BindTarget bindTarget, Copy copy,
+                                         Restore restore)
+{
+  bool success = bindUpload();
+  uint64_t sourceOffset = 0;
+  for(size_t i = 0; success && i < patches.size(); ++i)
+  {
+    // A failed bind leaves the old object current. Never copy into that unrelated buffer.
+    success = bindTarget(i) && copy(i, sourceOffset);
+    sourceOffset += patches[i].data.size();
+  }
+  // Restore both bindings even after an earlier bind/copy fails. A failed restoration must not
+  // be reported as an ordinary rejected edit: later captured commands could hit another object.
+  if(!restore())
+    return GLReplayPatchCopyResult::RestoreFailed;
+  return success ? GLReplayPatchCopyResult::Succeeded : GLReplayPatchCopyResult::CopyFailed;
+}
+}
+
+bool WrappedOpenGL::ApplyReplayBufferPatches()
 {
   if(m_ReplayBufferPatches.empty())
-    return;
+    return true;
+  auto fail = [&](const char *reason) {
+    RDCERR("OpenGL persistent buffer patch replay failed: %s", reason);
+    SET_ERROR_RESULT(m_FatalError, ResultCode::APIReplayFailed,
+                     "OpenGL persistent buffer patch replay failed");
+    m_FailedReplayResult = m_FatalError;
+    m_LastReplaySucceeded = false;
+    m_Replay->InvalidateLiveForward();
+    m_Replay->InvalidateReplayCheckpoints();
+    return false;
+  };
+  if(!m_ReplayPatchUpload)
+    return fail("upload buffer is unavailable");
+
+  // Resolve all targets before changing native state. Replay can delete resources or replace
+  // them after the edit was accepted; never redirect an old patch into a different object.
+  rdcarray<GLResource> targets;
+  GLResourceManager *rm = GetResourceManager();
+  for(const ReplayBufferPatch &patch : m_ReplayBufferPatches)
+  {
+    if(!rm->HasResource(patch.buffer) || rm->HasReplacement(patch.buffer) ||
+       rm->GetUnreplacedID(patch.buffer) != patch.buffer)
+      return fail("captured buffer is unavailable or replaced");
+    GLResource buffer = rm->GetResource(patch.buffer);
+    if(buffer.Namespace != eResBuffer || !buffer.name || buffer.name == m_ReplayPatchUpload)
+      return fail("native target is not the captured buffer");
+    targets.push_back(buffer);
+  }
+  // Captured commands may legitimately leave an error behind. Bound the drain, then attribute
+  // each internal bind/copy error to this patch instead of silently continuing the replay.
+  for(uint32_t i = 0; i < 8 && GL.glGetError() != eGL_NONE; ++i)
+  {
+  }
+  if(GL.glGetError() != eGL_NONE)
+    return fail("unresolved context error");
   GLint read = 0, write = 0;
   GL.glGetIntegerv(eGL_COPY_READ_BUFFER_BINDING, &read);
   GL.glGetIntegerv(eGL_COPY_WRITE_BUFFER_BINDING, &write);
-  GL.glBindBuffer(eGL_COPY_READ_BUFFER, m_ReplayPatchUpload);
-  uint64_t sourceOffset = 0;
-  for(const ReplayBufferPatch &patch : m_ReplayBufferPatches)
-  {
-    GLResource buffer = GetResourceManager()->GetResource(patch.buffer);
-    // A retained checkpoint can contain an older parameter generation. Even an identical
-    // re-overlay is conservatively a write: never share its old bytes into a later checkpoint.
-    m_Replay->InvalidateCheckpointBufferVersion(buffer);
-    GL.glBindBuffer(eGL_COPY_WRITE_BUFFER, buffer.name);
-    GL.glCopyBufferSubData(eGL_COPY_READ_BUFFER, eGL_COPY_WRITE_BUFFER, (GLintptr)sourceOffset,
-                           (GLintptr)patch.byteOffset, (GLsizeiptr)patch.data.size());
-    sourceOffset += patch.data.size();
-  }
-  GL.glBindBuffer(eGL_COPY_READ_BUFFER, read);
-  GL.glBindBuffer(eGL_COPY_WRITE_BUFFER, write);
+  if(GL.glGetError() != eGL_NONE)
+    return fail("copy bindings are unavailable");
+  const GLReplayPatchCopyResult result = GLReplayPatchCopy(
+      m_ReplayBufferPatches,
+      [&]() {
+        GL.glBindBuffer(eGL_COPY_READ_BUFFER, m_ReplayPatchUpload);
+        return GL.glGetError() == eGL_NONE;
+      },
+      [&](size_t i) {
+        GL.glBindBuffer(eGL_COPY_WRITE_BUFFER, targets[i].name);
+        return GL.glGetError() == eGL_NONE;
+      },
+      [&](size_t i, uint64_t sourceOffset) {
+        const ReplayBufferPatch &patch = m_ReplayBufferPatches[i];
+        // A retained checkpoint can contain an older parameter generation. Even an identical
+        // re-overlay is a write: never share its old bytes into a later checkpoint.
+        m_Replay->InvalidateCheckpointBufferVersion(targets[i]);
+        GL.glCopyBufferSubData(eGL_COPY_READ_BUFFER, eGL_COPY_WRITE_BUFFER, (GLintptr)sourceOffset,
+                               (GLintptr)patch.byteOffset, (GLsizeiptr)patch.data.size());
+        return GL.glGetError() == eGL_NONE;
+      },
+      [&]() {
+        GL.glBindBuffer(eGL_COPY_READ_BUFFER, read);
+        const bool readRestored = GL.glGetError() == eGL_NONE;
+        GL.glBindBuffer(eGL_COPY_WRITE_BUFFER, write);
+        const bool writeRestored = GL.glGetError() == eGL_NONE;
+        return readRestored && writeRestored;
+      });
+  if(result != GLReplayPatchCopyResult::Succeeded)
+    return fail(result == GLReplayPatchCopyResult::RestoreFailed ? "copy bindings were not restored"
+                                                                : "native buffer copy failed");
+  return true;
 }
 
 bool WrappedOpenGL::ContextProcessChunk(ReadSerialiser &ser, GLChunk chunk)
@@ -6054,7 +6136,10 @@ bool WrappedOpenGL::ContextProcessChunk(ReadSerialiser &ser, GLChunk chunk)
       case GLChunk::glGetQueryObjectuiv:
       case GLChunk::glGetQueryObjectuivARB:
       case GLChunk::glGetQueryObjectuivEXT:
-      case GLChunk::glGetQueryBufferObjectuiv: ApplyReplayBufferPatches(); break;
+      case GLChunk::glGetQueryBufferObjectuiv:
+        if(!ApplyReplayBufferPatches())
+          return false;
+        break;
       default: break;
     }
   }
@@ -6274,10 +6359,8 @@ void WrappedOpenGL::AddUsage(const ActionDescription &a)
       {
         rdcarray<EventUsage> &uses = m_ResourceUses[stageShaders[i]];
 
-        // Shader usage is a representative-EID index, not a frame-wide use list. Shader objects
-        // are stage-specific in GL, so the first positive event is the only record required.
-        if(e > 0 && uses.empty())
-          uses.push_back(EventUsage(e, ResourceUsage::Shader));
+        // Keep every shader action in the loading-time index; queries require no replay.
+        AppendFrameResourceUsage(uses, EventUsage(e, ResourceUsage::Shader));
       }
 
       if(refl[i])
@@ -6611,7 +6694,8 @@ void WrappedOpenGL::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
   GLMarkerRegion::Set(StringFormat::Fmt("!!!!RenderDoc Internal:  Replay %d (%d): %u->%u",
                                         (int)replayType, (int)partial, startEventID, endEventID));
 
-  ApplyReplayBufferPatches();
+  if(!ApplyReplayBufferPatches())
+    return;
 
   m_ReplayEventCount = 0;
 
@@ -6642,3 +6726,89 @@ void WrappedOpenGL::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
 
   GLMarkerRegion::Set("!!!!RenderDoc Internal: Done replay");
 }
+
+#if ENABLED(ENABLE_UNIT_TESTS)
+#include "catch/catch.hpp"
+
+TEST_CASE("OpenGL replay patch copy preserves native offsets and stops on failed binds",
+          "[gl][bufferpatch][replay-copy]")
+{
+  ReplayBufferPatch first;
+  first.buffer = ResourceIDGen::GetNewUniqueID();
+  first.byteOffset = 64;
+  first.data = {1, 2};
+  ReplayBufferPatch second = first;
+  second.buffer = ResourceIDGen::GetNewUniqueID();
+  second.byteOffset = 256;
+  second.data = {3, 4, 5};
+  ReplayBufferPatch third = first;
+  third.buffer = ResourceIDGen::GetNewUniqueID();
+  third.byteOffset = 4096;
+  third.data = {6, 7};
+  const rdcarray<ReplayBufferPatch> patches = {first, second, third};
+  const bytebuf upload = {1, 2, 3, 4, 5, 6, 7};
+
+  // A failed bind retains the previously bound native object. Model that behavior so a test
+  // catches an accidental copy into it, rather than merely counting calls to the helper.
+  for(uint32_t failure = 0; failure <= 4; ++failure)
+  {
+    bytebuf targets[3];
+    targets[0].resize(128);
+    targets[1].resize(512);
+    targets[2].resize(8192);
+    for(bytebuf &target : targets)
+      memset(target.data(), 0, target.size());
+    bytebuf unrelated = {21, 22, 23, 24};
+    const bytebuf untouched = unrelated;
+    bytebuf *boundTarget = &unrelated;
+    bool uploadBound = false;
+    uint32_t copies = 0, restores = 0;
+    const GLReplayPatchCopyResult result = GLReplayPatchCopy(
+        patches,
+        [&]() {
+          uploadBound = failure != 1;
+          return uploadBound;
+        },
+        [&](size_t i) {
+          if(failure == 2 && i == 1)
+            return false;
+          boundTarget = &targets[i];
+          return true;
+        },
+        [&](size_t i, uint64_t sourceOffset) {
+          REQUIRE(uploadBound);
+          REQUIRE(boundTarget == &targets[i]);
+          REQUIRE(sourceOffset + patches[i].data.size() <= upload.size());
+          memcpy(boundTarget->data() + size_t(patches[i].byteOffset),
+                 upload.data() + size_t(sourceOffset), patches[i].data.size());
+          ++copies;
+          // A copy may have written some bytes before an error is reported. No later copy is
+          // allowed, and the caller must not accept this partial generation as successful.
+          return failure != 3 || i != 1;
+        },
+        [&]() {
+          ++restores;
+          uploadBound = false;
+          boundTarget = &unrelated;
+          return failure != 4;
+        });
+    CHECK((unrelated == untouched));
+    CHECK(boundTarget == &unrelated);
+    CHECK_FALSE(uploadBound);
+    CHECK(restores == 1);
+    CHECK(copies == (failure == 1 ? 0U : failure == 2 ? 1U : failure == 3 ? 2U : 3U));
+    CHECK((result == (failure == 0   ? GLReplayPatchCopyResult::Succeeded
+                      : failure == 4 ? GLReplayPatchCopyResult::RestoreFailed
+                                     : GLReplayPatchCopyResult::CopyFailed)));
+    CHECK(targets[0][64] == (copies > 0 ? 1 : 0));
+    CHECK(targets[0][65] == (copies > 0 ? 2 : 0));
+    CHECK(targets[1][256] == (copies > 1 ? 3 : 0));
+    CHECK(targets[1][258] == (copies > 1 ? 5 : 0));
+    CHECK(targets[2][4096] == (copies > 2 ? 6 : 0));
+    CHECK(targets[2][4097] == (copies > 2 ? 7 : 0));
+    CHECK(targets[0][0] == 0);
+    CHECK(targets[1][2] == 0);
+    CHECK(targets[2][5] == 0);
+  }
+}
+#endif

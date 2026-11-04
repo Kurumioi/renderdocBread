@@ -204,7 +204,8 @@ void main()
 
     std::string imgprefix;
     if(colourFormat == VK_FORMAT_R8G8B8A8_UINT || colourFormat == VK_FORMAT_R16G16B16A16_UINT ||
-       colourFormat == VK_FORMAT_R32G32B32A32_UINT)
+       colourFormat == VK_FORMAT_R32G32B32A32_UINT || colourFormat == VK_FORMAT_R32_UINT ||
+       colourFormat == VK_FORMAT_R32G32_UINT)
     {
       batch.uint = true;
       imgprefix = "u";
@@ -729,6 +730,14 @@ vec4 ProcessColor(vec4 col)
                    defaultDepthFormat);
     BuildTestBatch("32-bit uint", VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_R32G32B32A32_UINT,
                    defaultDepthFormat);
+
+    if(GetEnvVar("RENDERDOC_SHADER_VISUAL_FORMAT_FIXTURE") == "1")
+    {
+      BuildTestBatch("Visual R32 float", VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_UNDEFINED);
+      BuildTestBatch("Visual RG32 float", VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_UNDEFINED);
+      BuildTestBatch("Visual R32 uint", VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_R32_UINT, VK_FORMAT_UNDEFINED);
+      BuildTestBatch("Visual RG32 uint", VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_R32G32_UINT, VK_FORMAT_UNDEFINED);
+    }
 
     // for dispatch access, ensure all color images are in GENERAL as render passes for slice tests
     // will only transition that one slice

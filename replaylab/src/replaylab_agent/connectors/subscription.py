@@ -32,6 +32,7 @@ from ..process_env import (
 )
 from ..profiles import Profile
 from .acp import ACPConnector
+from .claude_auth import check_claude_auth_status
 from .codex_app_server import CodexAppServerConnector
 
 EventSink = Callable[[dict[str, Any]], None]
@@ -241,6 +242,7 @@ class SubscriptionBackend:
             env=environment,
             authentication_method=profile.provider.acp_auth_method,
             provider_id=profile.preset,
+            session_meta=native_vendor.session_meta(profile),
         )
 
     async def test(self, cancel: asyncio.Event) -> SubscriptionResult:
@@ -252,12 +254,28 @@ class SubscriptionBackend:
                 raise ConfigurationError(
                     "ACP connection testing requires allow_unsandboxed_agent=true for this trusted CLI"
                 )
+            if profile.preset == "claude-code-acp":
+                account = await _await_or_cancel(
+                    check_claude_auth_status(
+                        profile, environ=self.environ, timeout=min(self.timeout, 15.0),
+                        cwd=self.workspace),
+                    cancel,
+                )
+                if not account.logged_in:
+                    return SubscriptionResult(
+                        False, message=account.detail, message_id=account.message_id,
+                        message_args=account.message_args,
+                    )
             connector = self._acp_factory(
                 profile, self.timeout, self._environment(profile)
             )
             details = await _await_or_cancel(connector.test_connection(), cancel)
             models = _bounded_models(details.get("models", []))
-            if models:
+            if profile.preset == "claude-code-acp":
+                message = "Claude sign-in status and ACP session handshake succeeded without sending a prompt."
+                message_id = "subscription.claude-sign-in-test-succeeded"
+                message_args = ()
+            elif models:
                 message = (
                     "ACP initialize/session handshake succeeded without sending a prompt; "
                     f"the session exposed {len(models)} model choice(s)."
@@ -386,6 +404,13 @@ class SubscriptionBackend:
                     on_cancel=cancel_login,
                 )
                 success = bool(completed.get("success"))
+                from ..agent_diagnostics import redact
+                failure = completed.get("error", "")
+                if isinstance(failure, dict):
+                    failure = failure.get("message", failure.get("code", ""))
+                failure = redact(str(failure or ""))[:1600]
+                failure_id = ("subscription.codex-login-failed-detail" if failure
+                              else "subscription.codex-login-failed")
                 self.event(
                     "loginCompleted",
                     "authenticated" if success else "failed",
@@ -393,16 +418,17 @@ class SubscriptionBackend:
                     messageId=(
                         "subscription.codex-login-completed"
                         if success
-                        else "subscription.codex-login-failed"
+                        else failure_id
                     ),
-                    messageArgs=[],
+                    messageArgs=[failure] if not success and failure else [],
                     authenticated=success,
                 )
                 if not success:
                     return SubscriptionResult(
                         False,
-                        message="Codex login failed.",
-                        message_id="subscription.codex-login-failed",
+                        message="Codex login failed." + (" " + failure if failure else ""),
+                        message_id=failure_id,
+                        message_args=(failure,) if failure else (),
                     )
                 account_result = await _await_or_cancel(connector.account_read(), cancel)
                 account = account_result.get("account")
@@ -450,7 +476,8 @@ class SubscriptionBackend:
             "limit": _MAX_CAPTURED_LINE_BYTES,
         }
         if os.name == "nt":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            kwargs["creationflags"] = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                                       | getattr(subprocess, "CREATE_NO_WINDOW", 0))
         else:
             kwargs["start_new_session"] = True
         try:
@@ -560,17 +587,32 @@ async def _await_or_cancel(
         raise SubscriptionCancelled("subscription operation cancelled")
     operation = asyncio.create_task(awaitable)
     cancelled = asyncio.create_task(cancel.wait())
+    cancellation_started = False
+
+    async def stop() -> None:
+        nonlocal cancellation_started
+        cancellation_started = True
+        try:
+            if on_cancel is not None:
+                await on_cancel()
+        finally:
+            # A failed vendor cancel request must not leave the local request
+            # running after its owner has returned or deleted its workspace.
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+
     try:
         done, _ = await asyncio.wait(
             {operation, cancelled}, return_when=asyncio.FIRST_COMPLETED
         )
         if cancelled in done:
-            if on_cancel is not None:
-                await on_cancel()
-            operation.cancel()
-            await asyncio.gather(operation, return_exceptions=True)
+            await stop()
             raise SubscriptionCancelled("subscription operation cancelled")
         return await operation
+    except asyncio.CancelledError:
+        if not cancellation_started:
+            await stop()
+        raise
     finally:
         if not cancelled.done():
             cancelled.cancel()
@@ -958,6 +1000,7 @@ async def _terminate_async_process_tree(process: asyncio.subprocess.Process) -> 
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 await asyncio.wait_for(killer.wait(), timeout=5.0)
     else:
@@ -1014,6 +1057,7 @@ def _terminate_popen_tree(process: subprocess.Popen[Any]) -> None:
                     stderr=subprocess.DEVNULL,
                     timeout=5.0,
                     check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
     else:
         with contextlib.suppress(ProcessLookupError):

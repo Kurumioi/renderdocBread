@@ -61,7 +61,9 @@ class ReplayLabInternalHostTests(unittest.TestCase):
                 for stream in ("stdin", "stdout", "stderr"):
                     self.assertEqual(subprocess.DEVNULL, options[stream])
                 if os.name == "nt":
-                    self.assertEqual(subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                    # DETACHED_PROCESS overrides CREATE_NO_WINDOW and can let
+                    # the frozen bootloader's child allocate a visible console.
+                    self.assertEqual(subprocess.CREATE_NEW_PROCESS_GROUP
                                      | subprocess.CREATE_NO_WINDOW, options["creationflags"])
 
     def test_loopback_health_explicitly_bypasses_ambient_proxies(self):
@@ -296,7 +298,7 @@ class ReplayLabInternalHostTests(unittest.TestCase):
             self.assertEqual("external-http", proxy.streamable_http_app())
         self.assertEqual(1, len(created))
         self.assertEqual(1, len(created[0][2].tools))
-        self.assertEqual("1.13.0", created[0][2]._mcp_server.version)
+        self.assertEqual(server.SERVICE_VERSION, created[0][2]._mcp_server.version)
 
     def test_internal_routes_are_exactly_the_bounded_high_level_surface(self):
         source = Path(internal_host.__file__).read_text(encoding="utf-8")
@@ -328,3 +330,48 @@ class ReplayLabInternalHostTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProjectOperationRegistryBusyTests(unittest.TestCase):
+    """A list must open the project window while a mutation is still running."""
+
+    def test_list_runs_while_a_mutation_holds_the_lock_and_mutations_say_busy(self):
+        import threading
+        import time
+
+        started = threading.Event()
+        release = threading.Event()
+
+        class Service:
+            def list_projects(self):
+                return {"schema": "replaylab-project-list/v1", "projects": [], "rejected": []}
+
+            def activate(self, project_root):
+                started.set()
+                release.wait(5.0)
+                return {"schema": "x"}
+
+        registry = internal_host.ProjectOperationRegistry(Service())
+        registry.LOCK_WAIT_SECONDS = 0.2
+        activate = internal_host.parse_project_operation_request(
+            _request("activate-project", {"projectRoot": os.path.abspath("project")},
+                     request_id="b" * 32))
+        worker = threading.Thread(target=registry.execute, args=(activate,))
+        worker.start()
+        self.assertTrue(started.wait(2.0))
+        try:
+            began = time.monotonic()
+            status, value = registry.execute(
+                internal_host.parse_project_operation_request(_request()))
+            self.assertEqual(200, status)
+            self.assertLess(time.monotonic() - began, 2.0)
+            second = internal_host.parse_project_operation_request(
+                _request("activate-project", {"projectRoot": os.path.abspath("other")},
+                         request_id="c" * 32))
+            status, value = registry.execute(second)
+            self.assertEqual(503, status)
+            self.assertEqual("project-service-busy", value["error"]["code"])
+            self.assertIn("activate-project", value["error"]["message"])
+        finally:
+            release.set()
+            worker.join(5.0)

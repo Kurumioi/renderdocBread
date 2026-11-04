@@ -978,6 +978,19 @@ class PassClassificationTests(unittest.TestCase):
                 self.assertEqual(1, len(terminal))
                 self.assertEqual("FixedProgram", terminal[0]["authority"])
 
+    def test_utility_destination_does_not_write_previous_draw_bindings(self) -> None:
+        for flag in (0x0001, 0x100001, 0x0400, 0x0800):
+            with self.subTest(flag=flag):
+                result = classify_passes([{
+                    "eventId": 1, "name": "Utility", "flags": flag,
+                    "copyDestination": {"resourceId": 55},
+                    "outputs": [{"resourceId": 66}],
+                    "depthOutput": {"resourceId": 77},
+                }])
+                outputs = result["items"][0]["outputs"]
+                self.assertEqual([55], [value["resourceId"] for value in outputs])
+                self.assertEqual("copy-destination", outputs[0]["access"])
+
     def test_action_timeline_excludes_unknown_events_but_full_timeline_keeps_them(
         self,
     ) -> None:

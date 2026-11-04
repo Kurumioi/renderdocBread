@@ -87,7 +87,7 @@ app-server）都通过受过滤的任务级 MCP 路由调用同一个 Host。
 | `plan_shader_recovery` | 将失败分类为检测、反编译、编译、ABI 等固定阶段，并只返回哈希绑定的未尝试路线配对供 AI 选择 |
 | `run_shader_toolchain_round_trip_smoke` | 用固定路线、物理解析出的精确 profile、格式检查与验证器执行 smoke，不应用到 RenderDoc |
 | `get_current_shader_representation` | 为 RenderDoc 能反射的任意 Shader API 生成非空、Hash 绑定的当前事件解释产物；解释/二进制 lane 永远不可编译或应用 |
-| `prepare_shader_workspace` | 导出单个事件/阶段，要求唯一物理 Shader，执行首选登记路线并自动遍历有限、Hash 绑定的备用路线；若所有反编译器失败但存在编译器，则从原生证据发布 provisional 重建入口 |
+| `prepare_shader_workspace` | 导出单个事件/阶段，确认唯一物理 Shader，默认只返回绑定工作区及可用路线，不运行反编译；显式传入 `attempt_reconstruction=true` 才启用原有的一步式重建和 RenderDoc 回退 |
 | `create_shader_workspace` | 从已有 catalog 和精确 `shaderKey` 创建 workspace |
 | `migrate_shader_workspace_toolchain` | 当 catalog/registry 合法升级时，以旧路线和当前源码 SHA 为 CAS，在新工作区原样保留源码并重新绑定当前工具链；不导入旧候选/ABI |
 | `try_shader_workspace_recovery_candidate` | 只按原 workspace 的哈希绑定 recovery plan 候选索引，在新的 sibling workspace 中尝试另一条已注册路线；不能提供命令、路径或 executable，失败证据不会覆盖 |
@@ -96,8 +96,8 @@ app-server）都通过受过滤的任务级 MCP 路由调用同一个 Host。
 | `promote_shader_workspace_explanation` | 显式提升经 Hash 复核的 `explanation/promoted.hlsl`；仍必须重新编译、ABI 校验并获得 Apply 授权 |
 | `compile_shader_workspace` | 把路由绑定的 HLSL/汇编编译为可审计候选；**不会应用到 RenderDoc** |
 | `get_shader_workspace_status` | 校验哈希并报告源码、修订和候选状态 |
-| `begin_shader_workspace_organization` | 先编译并新鲜 ABI 校验未经整理的 HLSL，保存反编译原文，再创建仅供 AI 修改的固定 proposal、分析与流程图文件 |
-| `review_shader_workspace_organization` | 编译并新鲜 ABI 校验 proposal；只有可执行 `codeSha256` 与同一路线 baseline 完全一致才提升为可编辑源码，否则恢复 baseline 并保留 provisional 证据 |
+| `begin_shader_workspace_organization` | 从当前源码创建或恢复可编辑整理草稿；此步不编译、不做 ABI 校验、不替换回放 |
+| `finish_shader_workspace_organization` | 默认将当前提案保存为着色器工作区的可编辑源码；可选完整验证或编译并应用到回放，应用时重新检查 ABI 和当前目标；成功保存后可选生成流程图 |
 | `validate_shader_workspace_candidate` | 重新反射合法组合的精确候选（D3D11/DXBC；D3D12/DXBC 或 DXIL），并要求完整 ABI 完全一致 |
 | `apply_shader_workspace_candidate` | 重新校验 ABI、当前捕获/事件/原始字节后，应用 D3D11 事件级替换 |
 | `rollback_shader_workspace_override` | 清除一个事件级替换并释放其持有的 target shader |
@@ -245,6 +245,12 @@ qrenderdoc 现已提供原生 MVP：打开 Pipeline State 的 CBuffer 变量视�
 诊断工具，不会授予资源导出专员；它们不能保留全部顶点输入、精确 texture
 view/sampler/CBuffer 证据、显式坐标策略、原子发布和目标验收。详见
 [资源导出工具链](../docs/RESOURCE_EXPORT_TOOLCHAIN.md)。
+
+### Unity 项目连接
+
+`start_unity_project_connection` 准备随包的 MCP/Editor 包，打开或复用对应的图形化
+Editor。`call_unity_project_tool` 自动恢复缺少或中断的项目连接；按返回的任务继续
+观察，写入丢失回复时先检查实际结果。详见 [Unity 连接准备与恢复](docs/UNITY_CONNECTION.md)。
 
 ### 🧭 解包资产知识、UEX 报告与 Blender 交付
 | 工具 | 说明 |

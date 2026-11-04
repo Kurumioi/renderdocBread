@@ -3,12 +3,20 @@ from __future__ import annotations
 import json
 import sys
 import time
+from pathlib import Path
+
+# The real app-server wire is UTF-8 even on a non-UTF-8 Windows desktop.
+sys.stdin.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure(encoding="utf-8")
 
 
 mode = sys.argv[1] if len(sys.argv) > 1 else "success"
 login_completed = False
 post_login_account_reads = 0
 mcp_status_reads = 0
+thread_config = {}
+turn_count = 0
+trace_path = Path(sys.argv[2]) if len(sys.argv) > 2 else None
 
 
 def send(value: dict) -> None:
@@ -47,6 +55,9 @@ def mcp_status(name: str, *, runtime_status: str, with_tools: bool) -> dict:
 
 for line in sys.stdin:
     message = json.loads(line)
+    if trace_path is not None:
+        with trace_path.open("a", encoding="utf-8") as trace:
+            trace.write(json.dumps(message) + "\n")
     method = message.get("method")
     request_id = message.get("id")
     if method is None and mode == "approval" and request_id == 900:
@@ -88,6 +99,8 @@ for line in sys.stdin:
                 },
             }
         )
+    elif method == "fixture/echo":
+        send({"id": request_id, "result": message["params"]})
     elif method == "initialize":
         if mode == "exit-initialize":
             raise SystemExit(17)
@@ -214,7 +227,7 @@ for line in sys.stdin:
                 "result": {
                     "data": [
                         {"id": ":read-only", "allowed": allowed},
-                        {"id": ":workspace", "allowed": True},
+                        {"id": ":workspace", "allowed": mode != "workspace-profile-denied"},
                     ],
                     "nextCursor": None,
                 },
@@ -224,14 +237,28 @@ for line in sys.stdin:
         assert not mode.startswith("signed-out"), "signed-out run must fail before thread/start"
         assert message["params"]["approvalPolicy"] == "never"
         assert message["params"]["ephemeral"] is True
-        assert message["params"]["permissions"] == ":read-only"
+        # Real current app-server ignores the legacy sandbox/config combination
+        # and resolves it as readOnly. Require the explicit narrow named profile.
+        native_write = message["params"].get("permissions", "").startswith("bread-owned-")
+        thread_config = message["params"].get("config", {})
+        if native_write:
+            owned_profile = message["params"]["permissions"]
+            assert thread_config.get(f"permissions.{owned_profile}") == {
+                "filesystem": {":root": "read", ":workspace_roots": "write"},
+                "network": {"enabled": False}}
+            if mode == "custom-profile-unsupported":
+                send({"id": request_id, "error": {"code": -32602,
+                     "message": "Unsupported permissions profile"}})
+                continue
+        else:
+            assert message["params"]["permissions"] == ":read-only"
         assert message["params"]["runtimeWorkspaceRoots"] == [message["params"]["cwd"]]
         assert "sandbox" not in message["params"]
         assert "dynamicTools" not in message["params"]
         thread = {"id": "thread-test"}
         if mode == "ambient-instructions":
             thread["instructionSources"] = [{"path": "C:/ambient/AGENTS.md"}]
-        active_profile = (
+        active_profile = {"id": owned_profile, "extends": None} if native_write else (
             {"id": ":workspace", "extends": None}
             if mode == "unverified-read-scope"
             else {"id": ":read-only", "extends": None}
@@ -239,6 +266,16 @@ for line in sys.stdin:
         roots = list(message["params"]["runtimeWorkspaceRoots"])
         if mode == "unverified-read-scope":
             roots.append("C:/ambient")
+        sandbox = ({"type": "workspaceWrite", "writableRoots": [],
+                    "networkAccess": False, "excludeTmpdirEnvVar": True, "excludeSlashTmp": True}
+                   if native_write else {"type": "readOnly", "networkAccess": False})
+        if native_write and mode == "unverified-write-scope":
+            sandbox["writableRoots"].append("C:/ambient")
+        if native_write and mode == "ambient-tmp-write-scope":
+            sandbox["excludeTmpdirEnvVar"] = False
+        if native_write and mode == "legacy-write-ignored":
+            active_profile = None
+            sandbox = {"type": "readOnly", "networkAccess": False}
         send(
             {
                 "id": request_id,
@@ -246,13 +283,19 @@ for line in sys.stdin:
                     "thread": thread,
                     "activePermissionProfile": active_profile,
                     "runtimeWorkspaceRoots": roots,
-                    "sandbox": {"type": "readOnly", "networkAccess": False},
+                    "sandbox": sandbox,
                     "approvalPolicy": "never",
                 },
             }
         )
     elif method == "mcpServerStatus/list":
         mcp_status_reads += 1
+        # Like the real app-server, config reload has no thread/start request's
+        # explicit permissions argument. A named table needs a config default.
+        if thread_config and thread_config.get("default_permissions") != owned_profile:
+            send({"id": request_id, "error": {"code": -32603,
+                "message": "failed to reload config: config defines `[permissions]` profiles but does not set `default_permissions`"}})
+            continue
         entries = []
         if mode in {"extra-mcp", "wrong-tools"}:
             entries.append(
@@ -260,28 +303,28 @@ for line in sys.stdin:
             )
         elif mode == "native-mcp":
             entries.append(
-                mcp_status("ReplayLab", runtime_status="connected", with_tools=True)
+                mcp_status("Bread", runtime_status="connected", with_tools=True)
             )
         elif mode == "starting-mcp":
             connected = mcp_status_reads >= 3
             entries.append(
                 mcp_status(
-                    "ReplayLab",
+                    "Bread",
                     runtime_status="connected" if connected else "starting",
                     with_tools=connected,
                 )
             )
         elif mode == "stuck-starting-mcp":
             entries.append(
-                mcp_status("ReplayLab", runtime_status="starting", with_tools=False)
+                mcp_status("Bread", runtime_status="starting", with_tools=False)
             )
         elif mode == "failed-mcp":
             entries.append(
-                mcp_status("ReplayLab", runtime_status="failed", with_tools=False)
+                mcp_status("Bread", runtime_status="failed", with_tools=False)
             )
         elif mode == "empty-mcp-tools":
             entries.append(
-                mcp_status("ReplayLab", runtime_status="connected", with_tools=False)
+                mcp_status("Bread", runtime_status="connected", with_tools=False)
             )
         send(
             {
@@ -297,10 +340,74 @@ for line in sys.stdin:
         send({"id": request_id, "result": {"apps": apps}})
     elif method == "turn/start":
         if mode == "starting-mcp":
-            assert mcp_status_reads >= 3, "turn started before ReplayLab MCP was ready"
-        assert message["params"]["permissions"] == ":read-only"
+            assert mcp_status_reads >= 3, "turn started before Bread MCP was ready"
+        native_write = message["params"].get("permissions", "").startswith("bread-owned-")
+        if native_write:
+            assert message["params"]["permissions"] == owned_profile
+            assert thread_config["default_permissions"] == owned_profile
+        else:
+            assert message["params"]["permissions"] == ":read-only"
         assert message["params"]["runtimeWorkspaceRoots"] == [message["params"]["cwd"]]
         assert "sandboxPolicy" not in message["params"]
+        if mode.startswith("capacity-"):
+            turn_count += 1
+            turn_id = f"turn-capacity-{turn_count}"
+            if mode == "capacity-recovery-ack-wait" and turn_count > 1:
+                # The provider has accepted work but has not returned its id.
+                (Path(message["params"]["cwd"]) / "accepted-recovery").write_text(turn_id)
+                continue
+            if mode == "capacity-request-rejected":
+                send({"id": request_id, "error": {"code": -32603,
+                    "message": "Selected model is at capacity. Please try a different model."}})
+                continue
+            send({"id": request_id, "result": {"turn": {"id": turn_id, "status": "inProgress"}}})
+            if turn_count > 1:
+                assert len(message["params"]["input"]) == 1
+                assert message["params"]["input"][0]["type"] == "text"
+                assert "Continue the unfinished user task in this same thread" in message["params"]["input"][0]["text"]
+                if mode == "capacity-recovery-wait":
+                    continue
+            event_base = {"threadId": "thread-test", "turnId": turn_id}
+            item = {"id": "one-write", "type": "fileChange", "status": "inProgress"}
+            if turn_count == 1 and mode in {"capacity-after-tool", "capacity-pending-tool"}:
+                send({"method": "item/started", "params": {**event_base, "item": item}})
+                if mode == "capacity-after-tool":
+                    # A real durable fixture effect must happen once across recovery.
+                    target = Path(message["params"]["cwd"]) / "effect-count.txt"
+                    target.write_text(str(int(target.read_text()) + 1) if target.exists() else "1")
+                    send({"method": "item/completed", "params": {**event_base,
+                        "item": {**item, "status": "completed"}}})
+            if mode == "capacity-provider-retry":
+                send({"method": "error", "params": {**event_base, "willRetry": True,
+                    "error": {"message": "Selected model is at capacity.", "codexErrorInfo": "serverOverloaded"}}})
+            fail = mode != "capacity-provider-retry" and (turn_count == 1 or mode == "capacity-exhausted")
+            if fail:
+                info = mode.removeprefix("capacity-tag-") if mode.startswith("capacity-tag-") else "serverOverloaded"
+                error = {"message": "Selected model is at capacity. Please try a different model.",
+                         "codexErrorInfo": info}
+                if mode == "capacity-legacy":
+                    error.pop("codexErrorInfo")
+                turn = {"id": turn_id, "status": "interrupted" if mode == "capacity-interrupted" else "failed", "error": error}
+                if mode == "capacity-snapshot-pending":
+                    turn["items"] = [item]
+                send({"method": "turn/completed", "params": {"threadId": "thread-test", "turn": turn}})
+            else:
+                send({"method": "item/completed", "params": {**event_base,
+                    "item": {"type": "agentMessage", "phase": "final_answer", "text": "continued existing work"}}})
+                send({"method": "turn/completed", "params": {"threadId": "thread-test",
+                    "turn": {"id": turn_id, "status": "completed", "error": None}}})
+            continue
+        if mode == "pre-ack-large-notifications":
+            event = {"threadId": "thread-test", "turnId": "turn-test"}
+            # Multiple full lifecycle records cross the default 16 MiB watermark
+            # before the turn/start response; no notification consumer exists yet.
+            for index in range(3):
+                item = {"id": f"pre-ack-{index}", "type": "mcpToolCall", "server": "Bread",
+                        "tool": "inspect_event", "status": "inProgress",
+                        "arguments": {"large": "x" * (5 * 1024 * 1024)}}
+                send({"method": "item/started", "params": {**event, "item": item}})
+                item["status"] = "completed"
+                send({"method": "item/completed", "params": {**event, "item": item}})
         send(
             {
                 "id": request_id,
@@ -588,7 +695,19 @@ for line in sys.stdin:
                             },
                         }
                     )
-            answer = "x" * 100_000 if mode == "large-line" else "evidence answer"
+            if mode == "large-tool-record":
+                # app-server sends complete native tool argument/result items,
+                # not only the small public activity text Bread displays.
+                event = {"threadId": "thread-test", "turnId": "turn-test"}
+                item = {"id": "large-tool", "type": "mcpToolCall", "server": "Bread",
+                        "tool": "publish_cbuffer_aliases", "status": "inProgress",
+                        "arguments": {"semantic_fields": "x" * (5 * 1024 * 1024)}}
+                send({"method": "item/started", "params": {**event, "item": item}})
+                item.update(status="completed", result={"ok": True, "content": [
+                    {"type": "image", "mimeType": "image/png", "data": "a" * (5 * 1024 * 1024)}]})
+                send({"method": "item/completed", "params": {**event, "item": item}})
+            answer = ("x" * (5 * 1024 * 1024) if mode == "large-agent-record" else
+                      "x" * 100_000 if mode == "large-line" else "evidence answer")
             deltas = ["x" * 8192] * 129 if mode == "many-deltas" else ["evidence "]
             for delta in deltas:
                 send(

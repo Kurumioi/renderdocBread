@@ -271,8 +271,9 @@ class ServerPassClassificationTests(unittest.TestCase):
         self.assertFalse(result["projectKnowledge"]["projectPrepared"])
         self.assertFalse(result["projectKnowledge"]["persistRequested"])
         self.assertFalse(result["projectKnowledge"]["persisted"])
-        self.assertTrue(result["panel"]["published"])
-        self.assertEqual(result["panel"]["publicationMode"], "display-only")
+        self.assertFalse(result["panel"]["publishRequested"])
+        self.assertFalse(result["panel"]["published"])
+        self.assertEqual(result["panel"]["publicationMode"], "not-published")
         self.assertEqual(len(_PassStore.instances), 0)
         self.server.prepare_active_capture_project.assert_not_called()
         self.assertFalse(
@@ -291,23 +292,18 @@ class ServerPassClassificationTests(unittest.TestCase):
         self.assertEqual(
             inputs_call[1]["expected_capture_session_id"], self.session_id
         )
-        panel_call = next(
-            item for item in self.ipc.calls if item[0] == "load_pass_classification"
-        )
+        self.assertFalse(any(
+            item[0] == "load_pass_classification" for item in self.ipc.calls
+        ))
+        summary = result["classification"]["summary"]
+        self.assertFalse(summary["sourceTruncated"])
+        self.assertEqual(summary["omittedActionCountLowerBound"], 0)
+        self.assertEqual(summary["truncationReasons"], [])
         self.assertEqual(
-            panel_call[1]["expected_capture_session_id"], self.session_id
+            summary["effectiveMaxActions"], self.server.MAX_PASS_PANEL_ACTIONS
         )
-        self.assertEqual(
-            panel_call[1]["capture_binding_mode"], "display-session"
-        )
-        self.assertEqual(panel_call[1]["classification"]["summary"], {
-            "sourceTruncated": False,
-            "omittedActionCountLowerBound": 0,
-            "truncationReasons": [],
-            "effectiveMaxActions": self.server.MAX_PASS_PANEL_ACTIONS,
-        })
 
-    def test_explicit_persistence_prepares_project_and_reports_project_publication(self):
+    def test_explicit_persistence_prepares_project_without_opening_retired_ui(self):
         result = self._fixed(persist_project=True)
         self.assertEqual(result["captureId"], self.capture_id)
         self.assertEqual(result["captureBindingMode"], "project-catalog")
@@ -315,7 +311,11 @@ class ServerPassClassificationTests(unittest.TestCase):
         self.assertTrue(result["projectKnowledge"]["projectPrepared"])
         self.assertTrue(result["projectKnowledge"]["persistRequested"])
         self.assertTrue(result["projectKnowledge"]["persisted"])
-        self.assertEqual(result["panel"]["publicationMode"], "project-persisted")
+        self.assertFalse(result["panel"]["published"])
+        self.assertEqual(result["panel"]["publicationMode"], "not-published")
+        self.assertFalse(any(
+            item[0] == "load_pass_classification" for item in self.ipc.calls
+        ))
         self.assertEqual(len(_PassStore.instances), 1)
         self.assertEqual(_PassStore.instances[0].saved[0][1], self.capture_id)
         self.server.prepare_active_capture_project.assert_called_once_with()
@@ -323,6 +323,29 @@ class ServerPassClassificationTests(unittest.TestCase):
             item[0] == "get_pass_classification_inputs"
             for item in self.ipc.calls
         ))
+
+    def test_retired_ui_request_fails_before_capture_replay_or_project_work(self):
+        with mock.patch.object(
+            self.server, "_active_live_context",
+            side_effect=AssertionError("retired UI must not query capture"),
+        ) as live_context, mock.patch.object(
+            self.server, "_cached_fixed_pass_classification",
+            side_effect=AssertionError("retired UI must not resolve classification"),
+        ) as cached:
+            fixed = json.loads(self.server.classify_current_frame_passes(
+                publish_to_ui=True, persist_project=True,
+            ))
+            overlay = json.loads(self.server.apply_current_frame_pass_ai_proposals(
+                "unused", "unused", "unused", [],
+                publish_to_ui=True, persist_project=True,
+            ))
+        for result in (fixed, overlay):
+            self.assertIn("retired", str(result["error"]))
+        live_context.assert_not_called()
+        cached.assert_not_called()
+        self.server.prepare_active_capture_project.assert_not_called()
+        self.assertEqual(self.ipc.calls, [])
+        self.assertEqual(_PassStore.instances, [])
 
     def test_readonly_frame_flow_uses_one_composite_without_project_or_ui(self):
         with mock.patch.object(
@@ -563,7 +586,8 @@ class ServerPassClassificationTests(unittest.TestCase):
         self.assertEqual(result["effectMode"], "display-only")
         self.assertFalse(result["projectKnowledge"]["persistRequested"])
         self.assertFalse(result["projectKnowledge"]["persisted"])
-        self.assertEqual(result["panel"]["publicationMode"], "display-only")
+        self.assertFalse(result["panel"]["published"])
+        self.assertEqual(result["panel"]["publicationMode"], "not-published")
         self.assertEqual(len(_PassStore.instances), 0)
 
     def test_display_only_overlay_cannot_upgrade_itself_to_project_persistence(self):
@@ -852,7 +876,7 @@ class ServerLiveEditTests(unittest.TestCase):
             ],
         )
 
-    def test_apply_callback_parses_success_and_raises_error_envelope(self):
+    def test_explicit_strict_apply_callback_parses_success_and_raises_error_envelope(self):
         success = {
             "schema": "renderdoc-ultra-shader-shared-resource-apply-mcp/v1",
             "operation": "apply-shared-resource",
@@ -865,7 +889,7 @@ class ServerLiveEditTests(unittest.TestCase):
             "apply_shader_workspace_shared_resource",
             return_value=json.dumps(success),
         ) as apply:
-            result = self.server._shader_live_edit_apply_candidate(
+            result = self.server._shader_live_edit_apply_candidate_with_abi(
                 "D:/workspace", 2, "a" * 64
             )
         self.assertEqual(result, success)
@@ -880,11 +904,16 @@ class ServerLiveEditTests(unittest.TestCase):
             return_value=json.dumps({"error": "ABI changed", "type": "RuntimeError"}),
         ):
             with self.assertRaisesRegex(RuntimeError, "ABI changed"):
-                self.server._shader_live_edit_apply_candidate(
+                self.server._shader_live_edit_apply_candidate_with_abi(
                     "D:/workspace", 3, "b" * 64
                 )
 
-    def test_later_live_save_uses_initial_abi_lease_and_one_bridge_apply(self):
+    def test_explicit_strict_apply_uses_initial_abi_lease_and_one_bridge_apply(self):
+        for catalog_mode in ("verified", "legacy", "unavailable"):
+            with self.subTest(catalog=catalog_mode):
+                self._check_later_live_save_uses_initial_abi_lease(catalog_mode)
+
+    def _check_later_live_save_uses_initial_abi_lease(self, catalog_mode):
         workspace = "D:/workspace-live-abi-lease"
         capture_id = "c" * 64
         session_id = "8" * 32
@@ -945,6 +974,11 @@ class ServerLiveEditTests(unittest.TestCase):
                 "rawSha256": candidate_hash,
             },
         }
+        status["targetProfile"] = {"profile": "ps_6_6", "kind": "dxil"}
+        if catalog_mode != "legacy":
+            status["capture"]["catalogSha256"] = "5" * 64
+        catalog_binding = {"projection": {"catalogPath": status["capture"]["catalogPath"]},
+                           "scope": {"stableCaptureId": capture_id}}
 
         class Service:
             def status(inner_self, _workspace):
@@ -959,6 +993,22 @@ class ServerLiveEditTests(unittest.TestCase):
 
             def call(inner_self, method, params, timeout=None):
                 inner_self.calls.append((method, copy.deepcopy(params), timeout))
+                if method == "get_shared_shader_replacements":
+                    self.assertTrue(params["lease_metadata_only"])
+                    self.assertEqual(params["workspace_id"], workspace_id)
+                    self.assertEqual(params["replacement_id"], old_replacement)
+                    return {
+                        "schema": "renderdoc-ultra-shared-shader-replacement-list/v1",
+                        "schemaVersion": 1, "captureId": capture_id,
+                        "captureSessionId": session_id, "count": 1,
+                        "mutationEpoch": 1, "originalShadersPreserved": True,
+                        "replayMutation": False, "replacements": [{
+                            **lease, "resourceScoped": True, "eventScoped": False,
+                            "allOriginalResourceUsesAffected": True,
+                            "originalShaderPreserved": True,
+                        }], "leaseMetadataOnly": True,
+                        "queryWorkspaceId": workspace_id, "queryReplacementId": old_replacement,
+                    }
                 self.assertEqual(method, "apply_shader_candidate_shared_resource")
                 self.assertEqual(
                     params["abi_validation_mode"],
@@ -967,6 +1017,12 @@ class ServerLiveEditTests(unittest.TestCase):
                 self.assertEqual(params["abi_report_sha256"], lease_report)
                 self.assertEqual(params["abi_request_id"], current_request)
                 self.assertEqual(params["abi_lease_revision"], 3)
+                self.assertEqual(params["expected_source_sha256"], source_hash)
+                self.assertEqual(params["expected_profile"], "ps_6_6")
+                if catalog_mode == "verified":
+                    self.assertEqual(params["workspace_catalog_binding"], catalog_binding)
+                else:
+                    self.assertNotIn("workspace_catalog_binding", params)
                 return {
                     "schema": "renderdoc-ultra-shared-shader-replacement/v1",
                     "schemaVersion": 1,
@@ -1026,6 +1082,7 @@ class ServerLiveEditTests(unittest.TestCase):
             "stage": "fragment",
             "anchorEventId": 321,
             "originalResourceId": 77,
+            "originalRawSha256": baseline_hash,
             "candidateRawSha256": "4" * 64,
             "abiLeaseRequestId": lease_request,
             "abiLeaseReportSha256": lease_report,
@@ -1048,6 +1105,10 @@ class ServerLiveEditTests(unittest.TestCase):
             with mock.patch.object(
                 self.server, "_shader_workspace_service", return_value=Service()
             ), mock.patch.object(
+                self.server, "_verified_restore_catalog_binding", return_value=catalog_binding,
+                side_effect=(RuntimeError("optional catalog metadata unavailable")
+                             if catalog_mode == "unavailable" else None),
+            ), mock.patch.object(
                 self.server, "_ensure_workspace_capture_catalog_identity",
                 return_value={"captureSessionId": session_id},
             ), mock.patch.object(
@@ -1062,8 +1123,10 @@ class ServerLiveEditTests(unittest.TestCase):
                 self.server,
                 "apply_shader_workspace_shared_resource",
                 side_effect=AssertionError("ordinary duplicate ABI pass was used"),
+            ), mock.patch.object(
+                self.server, "_shader_cbuffer_delivery_from_status", return_value={},
             ):
-                result = self.server._shader_live_edit_apply_candidate(
+                result = self.server._shader_live_edit_apply_candidate_with_abi(
                     workspace, 4, candidate_hash
                 )
             self.assertTrue(result["applied"])
@@ -1074,7 +1137,8 @@ class ServerLiveEditTests(unittest.TestCase):
             self.assertTrue(
                 result["validation"]["freshPhysicalValidationPerformed"]
             )
-            self.assertEqual(len(bridge.calls), 1)
+            self.assertEqual([item[0] for item in bridge.calls], [
+                "get_shared_shader_replacements", "apply_shader_candidate_shared_resource"])
             with self.server._SHADER_OVERRIDE_GUARD:
                 remembered = self.server._SHARED_SHADER_REPLACEMENT_RECORDS[
                     new_replacement
@@ -1296,11 +1360,19 @@ class ServerRestoreCurrentShaderTests(unittest.TestCase):
         self.old_active = self.server._ACTIVE_PROJECT_SERVICE
         self.server.ipc = self.ipc
         self.server._ACTIVE_PROJECT_SERVICE = self.active
+
+        def current_context(**options):
+            context = copy.deepcopy(self.context)
+            if not options.get("require_event_state"):
+                context["events"] = {"currentEventId": 0, "selectedEventId": 0}
+                context["shaders"] = {"bound": []}
+            return context
+
         self.patches = [
             mock.patch.object(
                 self.server,
                 "_active_live_context",
-                side_effect=lambda **unused: copy.deepcopy(self.context),
+                side_effect=current_context,
             ),
             mock.patch.object(
                 self.server,
@@ -1366,6 +1438,49 @@ class ServerRestoreCurrentShaderTests(unittest.TestCase):
         self.assertEqual(result["encoding"], "dxbc")
         self.assertEqual(result["physicalAbiSha256"], self.physical_abi)
         self.assertIn("already", result["reason"])
+
+    def test_exact_absence_accepts_only_verified_legacy_topology_hash_alias(self):
+        from tests.test_shader_abi import complete_interface
+        from src.shader_workspace.abi import parse_shader_abi
+
+        self.replacements.clear()
+        self.context["shaders"]["bound"][0]["rawSha256"] = self.original_raw
+        original_status = self.workspaces.status
+        for topology, live_topology in (("", "Topology.Unknown"), ("Topology.Unknown", "")):
+            with self.subTest(topology=topology):
+                interface = complete_interface()
+                interface["outputTopology"] = topology
+                baseline_hash = parse_shader_abi(interface).sha256
+                live = copy.deepcopy(interface)
+                live["outputTopology"] = live_topology
+                self.physical_abi = parse_shader_abi(live).sha256
+                status = original_status(str(self.workspace))
+                status["baseline"].update(abiSha256=baseline_hash, compiledInterface=interface)
+                with mock.patch.object(self.workspaces, "status", return_value=status):
+                    result = self._restore()
+                    self.assertNotIn("error", result, result)
+                    self.assertTrue(result["alreadyRestored"])
+                    self.assertEqual(result["physicalAbiSha256"], baseline_hash)
+                    self.physical_abi = "f" * 64
+                    self.assertIn("invalid exact Shader absence", self._restore()["error"])
+                    status["baseline"]["abiSha256"] = "e" * 64
+                    self.assertIn("baseline ABI hash mismatch", self._restore()["error"])
+
+    def test_event_change_after_exact_absence_prevents_restore_success(self):
+        self.replacements.clear()
+        self.context["shaders"]["bound"][0]["rawSha256"] = self.original_raw
+        original = self.ipc.call
+
+        def navigate_after_restore(method, params=None, timeout=None):
+            result = original(method, params, timeout)
+            if method == "restore_shader_candidate_shared_resource_exact":
+                self.context["events"]["currentEventId"] = 23
+            return result
+
+        with mock.patch.object(self.ipc, "call", side_effect=navigate_after_restore):
+            result = self._restore()
+        self.assertFalse(result["restored"])
+        self.assertIn("current Shader binding changed", result["error"])
 
     def test_unrelated_replacement_count_is_reported_without_claiming_a_global_empty_list(self):
         self.replacements[0]["originalResourceId"] = 99

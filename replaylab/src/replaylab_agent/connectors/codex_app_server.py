@@ -13,6 +13,7 @@ import hashlib
 import inspect
 import json
 import os
+import subprocess
 import re
 import shutil
 import sys
@@ -36,17 +37,22 @@ from ..errors import (
     LifecycleCleanupError,
     PolicyError,
     ProviderCapabilityError,
+    ProviderRequestError,
 )
+from .jsonl_transport import JSONL_READ_CHUNK_BYTES, NotificationQueue, read_jsonl_records
 
 DeltaCallback = Callable[[str], Any]
 ActivityCallback = Callable[[str, float], Any]
 TimelineCallback = Callable[[Mapping[str, Any]], Any]
 ReasoningCallback = Callable[[Mapping[str, Any]], Any]
 AssistantMessageCallback = Callable[[Mapping[str, Any]], Any]
-_MAX_JSONL_MESSAGE_BYTES = 4 * 1024 * 1024
+# App-server echoes complete tool arguments/results (including inline media).
+# Their wire size is independent of the cumulative assistant-text budget below.
+_MAX_JSONL_MESSAGE_BYTES = 64 * 1024 * 1024
 MAX_EXTERNAL_RESPONSE_CHARS = 1024 * 1024
 MAX_EXTERNAL_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_NOTIFICATION_QUEUE = 256
+_NOTIFICATION_BYTE_WATERMARK = 16 * 1024 * 1024
 _MAX_SERVER_REQUEST_TASKS = 16
 _MCP_STARTUP_TIMEOUT_SECONDS = 60.0
 _MCP_STARTUP_POLL_SECONDS = 0.25
@@ -58,6 +64,20 @@ _MAX_PLAN_CHARS = 8192
 _MAX_PLAN_STEPS = 32
 _MAX_PLAN_STEP_CHARS = 512
 _MAX_STRUCTURED_DETAIL_CHARS = 4096
+_CAPACITY_RETRY_DELAYS = (2.0, 5.0)
+_CAPACITY_RECOVERY_PROMPT = (
+    "The previous turn stopped because the selected model was temporarily at capacity. "
+    "Continue the unfinished user task in this same thread from its current state. "
+    "The prior request, instructions, attachments, tool results, and completed changes "
+    "remain in this conversation. Reuse those results; do not restart the task or repeat "
+    "completed writes, applications, or other tool effects. If an operation's outcome "
+    "is uncertain, inspect its existing receipt/state before deciding what remains. "
+    "Complete the remaining work and required self-review, or accurately report the "
+    "specific unfinished work and blocker. Do not claim completion from the interruption."
+)
+_EFFECT_ITEM_TYPES = frozenset({
+    "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall",
+})
 _SENSITIVE_NAME = (
     r"(?:api[_-]?key|key|access[_-]?token|refresh[_-]?token|auth(?:orization)?|cookie|"
     r"credential|pass(?:word|wd)?|secret|token)"
@@ -382,6 +402,7 @@ def _item_timeline_event(
     if kind not in {
         "agentMessage",
         "commandExecution",
+        "fileChange",
         "mcpToolCall",
         "plan",
         "reasoning",
@@ -432,6 +453,17 @@ def _item_timeline_event(
         event["publicDetail"] = event["activityDetail"]
         return event
 
+    if kind == "fileChange":
+        event = _timeline_event(
+            activity_id=activity_id, kind=kind, title="Working file change",
+            detail="", status=status, lifecycle=lifecycle, elapsed=elapsed,
+            duration_ms=duration_ms,
+        )
+        if lifecycle == "completed":
+            from ..task_review import work_identity
+            event["workIdentity"] = work_identity({"changes": item.get("changes"), "status": status})
+        return event
+
     if kind == "commandExecution":
         details = []
         exit_code = item.get("exitCode")
@@ -452,6 +484,10 @@ def _item_timeline_event(
         )
         if isinstance(exit_code, int) and not isinstance(exit_code, bool):
             event["exitCode"] = exit_code
+        if lifecycle == "completed":
+            from ..task_review import work_identity
+            event["workIdentity"] = work_identity({key: item.get(key) for key in
+                ("command", "cwd", "aggregatedOutput", "exitCode")})
         return event
 
     if kind == "mcpToolCall":
@@ -462,6 +498,10 @@ def _item_timeline_event(
         detail = "Arguments: " + ", ".join(argument_names) if argument_names else ""
         if lifecycle == "completed" and item.get("error") is not None:
             status = "failed"
+        elif lifecycle == "completed" and server.casefold() in {"bread", "replaylab"}:
+            from ..tool_output import mcp_result_failed
+            if mcp_result_failed(item.get("result")):
+                status = "failed"
         title = f"Calling {target}" if lifecycle != "completed" else f"Called {target}"
         if status == "failed":
             title = f"Call failed: {target}"
@@ -588,6 +628,61 @@ class _AppServerRequestError(ConnectorError):
         )
 
 
+class _CodexTurnFailure(ProviderRequestError):
+    """Authoritative terminal failure, distinct from provider retry notifications."""
+
+    def __init__(self, status: str, error: Any, *, unfinished_tools: bool) -> None:
+        details = error if isinstance(error, Mapping) else {}
+        message = _redact_timeline_text(details.get("message") or status or "failed", limit=2048)
+        info = details.get("codexErrorInfo")
+        http_status = None
+        if isinstance(info, Mapping) and len(info) == 1:
+            for tag in ("httpConnectionFailed", "responseStreamConnectionFailed",
+                        "responseStreamDisconnected", "responseTooManyFailedAttempts"):
+                detail = info.get(tag)
+                value = detail.get("httpStatusCode") if isinstance(detail, Mapping) else None
+                if isinstance(value, int) and not isinstance(value, bool):
+                    http_status = value
+        # Trust the documented discriminant first. The exact message fallback
+        # supports older servers that report this incident as `other`/no tag;
+        # it must never override authentication/quota/policy/configuration tags.
+        capacity = status == "failed" and (
+            info == "serverOverloaded"
+            or ((info in (None, "other") or http_status == 503) and message.casefold().startswith(
+                "selected model is at capacity."
+            ))
+        )
+        info_tag = info if isinstance(info, str) else ""
+        error_code = {
+            "unauthorized": "provider-authentication",
+            "usageLimitExceeded": "provider-quota",
+            "sessionBudgetExceeded": "provider-quota",
+            "rateLimitExceeded": "provider-rate-limit",
+            "contextWindowExceeded": "provider-context",
+            "badRequest": "provider-configuration",
+            "sandboxError": "provider-policy",
+            "cyberPolicy": "provider-policy",
+            "misalignmentPolicyViolation": "provider-policy",
+            "tooManyDenials": "provider-policy",
+        }.get(info_tag, "provider-turn-failed")
+        error_code = {
+            400: "provider-configuration", 401: "provider-authentication",
+            403: "provider-policy", 429: "provider-rate-limit",
+        }.get(http_status, error_code)
+        self.codex_error_info = _safe_structured_detail(info) if info is not None else ""
+        super().__init__(
+            f"Codex turn did not complete: {message}",
+            error_code="provider-capacity" if capacity else error_code,
+            retryable=capacity,
+        )
+        self.unfinished_tools = unfinished_tools
+
+    def stop_recovery(self, reason: str) -> None:
+        # Keep the concrete stop reason visible to ordinary exception consumers
+        # as well as the structured provider classification.
+        self.args = (f"{self.args[0]} ({reason})",)
+
+
 class _JsonlProcess:
     """Small JSON-RPC-without-jsonrpc-header transport used by app-server."""
 
@@ -602,14 +697,16 @@ class _JsonlProcess:
         self.cwd = cwd
         self.env = dict(env) if env is not None else None
         self.process: asyncio.subprocess.Process | None = None
-        self.notifications: asyncio.Queue[dict[str, Any] | _TransportClosed | _DeniedServerRequest] = (
-            asyncio.Queue(maxsize=_MAX_NOTIFICATION_QUEUE)
+        self.notifications = NotificationQueue(
+            maxsize=_MAX_NOTIFICATION_QUEUE, byte_watermark=_NOTIFICATION_BYTE_WATERMARK
         )
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_id = 1
         self._write_lock = asyncio.Lock()
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        self._stderr_tail = bytearray()
+        self._close_task: asyncio.Task[None] | None = None
         self._server_request_tasks: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
@@ -617,8 +714,12 @@ class _JsonlProcess:
             return
         # A prior one-shot run can leave its terminal transport marker queued.
         # Each new process gets an independent notification stream.
-        self.notifications = asyncio.Queue(maxsize=_MAX_NOTIFICATION_QUEUE)
+        self.notifications.close()
+        self.notifications = NotificationQueue(
+            maxsize=_MAX_NOTIFICATION_QUEUE, byte_watermark=_NOTIFICATION_BYTE_WATERMARK
+        )
         self._ensure_codex_home()
+        self._stderr_tail.clear()
         try:
             self.process = await asyncio.create_subprocess_exec(
                 *self.command,
@@ -627,7 +728,8 @@ class _JsonlProcess:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                limit=_MAX_JSONL_MESSAGE_BYTES + 1,
+                limit=JSONL_READ_CHUNK_BYTES,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (FileNotFoundError, OSError) as exc:
             raise ConnectorError(
@@ -663,7 +765,9 @@ class _JsonlProcess:
         if not home.is_absolute():
             raise ConfigurationError("Codex state root must be absolute")
         try:
-            home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            from ..managed_state import prepare_codex_home
+            home = prepare_codex_home(home, self.env)
+            self.env["CODEX_HOME"] = str(home)
             if home.is_symlink() or not home.is_dir():
                 raise ConfigurationError("Codex state root must be a real directory")
             # POSIX honours this directly.  On Windows the profile-scoped path
@@ -689,6 +793,7 @@ class _JsonlProcess:
         self._next_id += 1
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
+        self.notifications.set_rpc_pending(True)
         try:
             await asyncio.wait_for(
                 self._send({"method": method, "id": request_id, "params": params}),
@@ -702,6 +807,7 @@ class _JsonlProcess:
             raise ConnectorError(f"Codex app-server timed out during {method}") from exc
         finally:
             self._pending.pop(request_id, None)
+            self.notifications.set_rpc_pending(bool(self._pending))
         error = response.get("error")
         if error is not None:
             if isinstance(error, dict):
@@ -739,7 +845,10 @@ class _JsonlProcess:
         )
         payload = encoded.encode("utf-8")
         if len(payload) > _MAX_JSONL_MESSAGE_BYTES:
-            raise ConnectorError("Codex app-server request exceeds the 4 MiB JSONL bound")
+            raise ConnectorError(
+                "Codex app-server request exceeds the "
+                f"{_MAX_JSONL_MESSAGE_BYTES // (1024 * 1024)} MiB JSONL transport bound"
+            )
         try:
             async with self._write_lock:
                 process.stdin.write(payload)
@@ -751,22 +860,7 @@ class _JsonlProcess:
         assert self.process is not None and self.process.stdout is not None
         failure: ConnectorError | None = None
         try:
-            while True:
-                try:
-                    line = await self.process.stdout.readline()
-                except ValueError as exc:
-                    failure = ConnectorError(
-                        "Codex app-server emitted a JSONL message over the 4 MiB bound"
-                    )
-                    failure.__cause__ = exc
-                    break
-                if not line:
-                    break
-                if len(line) > _MAX_JSONL_MESSAGE_BYTES:
-                    failure = ConnectorError(
-                        "Codex app-server emitted a JSONL message over the 4 MiB bound"
-                    )
-                    break
+            async for line in read_jsonl_records(self.process.stdout, _MAX_JSONL_MESSAGE_BYTES):
                 try:
                     message = json.loads(line.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -808,9 +902,12 @@ class _JsonlProcess:
                         future.set_result(message)
                     continue
                 if "method" in message:
-                    await self.notifications.put(message)
+                    await self.notifications.put(message, wire_bytes=len(line),
+                        rpc_pending=bool(self._pending), wire_record=line)
         except asyncio.CancelledError:
             raise
+        except ConnectorError as exc:
+            failure = exc
         except Exception as exc:
             failure = ConnectorError(f"Codex app-server reader failed: {exc}")
         finally:
@@ -819,7 +916,12 @@ class _JsonlProcess:
                 if code is None:
                     with contextlib.suppress(Exception):
                         code = await self.process.wait()
-                failure = ConnectorError(f"Codex app-server exited unexpectedly (code {code})")
+                if self._stderr_task is not None:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(asyncio.shield(self._stderr_task), timeout=.5)
+                detail = self._startup_diagnostic()
+                failure = ConnectorError(f"Codex app-server exited unexpectedly (code {code})" +
+                                         (": " + detail if detail else ""))
             for future in tuple(self._pending.values()):
                 if not future.done():
                     future.set_exception(failure)
@@ -830,13 +932,7 @@ class _JsonlProcess:
     ) -> None:
         """Queue a terminal marker without allowing a full activity queue to hide it."""
 
-        try:
-            self.notifications.put_nowait(value)
-        except asyncio.QueueFull:
-            with contextlib.suppress(asyncio.QueueEmpty):
-                self.notifications.get_nowait()
-            with contextlib.suppress(asyncio.QueueFull):
-                self.notifications.put_nowait(value)
+        self.notifications.put_terminal(value)
 
     def _server_request_finished(self, task: asyncio.Task[None]) -> None:
         self._server_request_tasks.discard(task)
@@ -891,7 +987,7 @@ class _JsonlProcess:
                 "id": request_id,
                 "error": {
                     "code": -32601,
-                    "message": "ReplayLab does not permit server-initiated interaction",
+                    "message": "Bread does not permit server-initiated interaction",
                 },
             }
         # A well-formed ambient command/file/permission/elicitation request is
@@ -901,20 +997,53 @@ class _JsonlProcess:
         await asyncio.wait_for(self._send(response), timeout=5.0)
 
     async def _discard_stderr(self) -> None:
-        # Drain diagnostics to prevent a full pipe from blocking the process.  Do
-        # not retain them because third-party diagnostics may contain secrets.
+        # Keep only a bounded in-memory tail. Only sanitized startup failures
+        # leave this transport; successful diagnostic streams stay private.
         assert self.process is not None and self.process.stderr is not None
         try:
-            while await self.process.stderr.read(8192):
-                pass
+            while chunk := await self.process.stderr.read(8192):
+                self._stderr_tail.extend(chunk)
+                del self._stderr_tail[:-16384]
         except asyncio.CancelledError:
             raise
         except Exception:
             pass
 
+    def _startup_diagnostic(self) -> str:
+        value = self._stderr_tail.decode("utf-8", errors="replace")
+        value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+        for key, secret in (self.env or {}).items():
+            if _SENSITIVE_KEY_RE.search(key) and isinstance(secret, str) and len(secret) >= 4:
+                value = value.replace(secret, "[REDACTED]")
+        return _redact_timeline_text(value[-4096:], limit=2048).strip().replace("\r", " ").replace("\n", " ")
+
     async def close(self) -> None:
+        # Cancellation stops task work, but must not interrupt the bounded pipe /
+        # process teardown or leave an orphan reader owning temporary records.
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_process(), name="replaylab-codex-close"
+            )
+        cleanup = self._close_task
+        cancelled = False
+        try:
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cancelled = True
+            cleanup.result()
+        finally:
+            self.notifications.close()
+            if self._close_task is cleanup:
+                self._close_task = None
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close_process(self) -> None:
         process = self.process
         if process is None:
+            self.notifications.close()
             return
         if process.stdin is not None:
             with contextlib.suppress(Exception):
@@ -961,6 +1090,13 @@ class _JsonlProcess:
         self.process = None
         self._reader_task = None
         self._stderr_task = None
+        self.notifications.close()
+
+
+class _UnscopedBreadServers(Exception):
+    def __init__(self, names: Sequence[str]) -> None:
+        self.names = tuple(names)
+        super().__init__("Unscoped duplicate Bread connections: " + ", ".join(names))
 
 
 class CodexAppServerConnector:
@@ -972,10 +1108,13 @@ class CodexAppServerConnector:
         *,
         cwd: Path | str | None = None,
         readable_roots: Sequence[Path | str] | None = None,
+        workspace_write: bool = False,
         expected_mcp_servers: set[str] | frozenset[str] = frozenset(),
         timeout: float = 300.0,
         heartbeat_interval: float = 10.0,
         env: Mapping[str, str] | None = None,
+        inherit_desktop_capabilities: bool = False,
+        desktop_runtime_config: Mapping[str, Any] | None = None,
     ) -> None:
         if isinstance(command, str):
             command = (command,)
@@ -1016,6 +1155,17 @@ class CodexAppServerConnector:
         if self.cwd not in resolved_roots:
             resolved_roots.insert(0, self.cwd)
         self.readable_roots = tuple(resolved_roots)
+        self.workspace_write = bool(workspace_write)
+        self.inherit_desktop_capabilities = bool(inherit_desktop_capabilities)
+        self.desktop_runtime_config = dict(desktop_runtime_config or {})
+        self.native_capabilities: dict[str, Any] = {}
+        self._workspace_write_requested = self.workspace_write
+        # A fresh name prevents user/project config from extending our owned
+        # scope with another profile's filesystem rules.
+        self._workspace_permission_profile = "bread-owned-" + uuid.uuid4().hex
+        if self.workspace_write and self.readable_roots != (self.cwd,):
+            raise ConfigurationError("native workspace writes may only grant the exact owned cwd")
+        self.workspace_capability_note = ""
         if any(not isinstance(value, str) or not value.strip() for value in expected_mcp_servers):
             raise ConfigurationError("Codex expected MCP server names must be non-empty strings")
         self.expected_mcp_servers = frozenset(
@@ -1036,6 +1186,7 @@ class CodexAppServerConnector:
         )
         self._initialized = False
         self._run_lock = asyncio.Lock()
+        self._active_thread_id = ""
 
     async def __aenter__(self) -> CodexAppServerConnector:
         # Construction and context entry are deliberately lazy; run() starts the
@@ -1048,6 +1199,7 @@ class CodexAppServerConnector:
     async def close(self) -> None:
         await self._transport.close()
         self._initialized = False
+        self._active_thread_id = ""
 
     def _materialize_attachment_inputs(
         self, attachments: Sequence[ProviderBinaryAttachment]
@@ -1158,7 +1310,7 @@ class CodexAppServerConnector:
         params: dict[str, Any] = {
             "clientInfo": {
                 "name": "replaylab",
-                "title": "ReplayLab for RenderDoc",
+                "title": "Bread for RenderDoc",
                 "version": __version__,
             }
         }
@@ -1419,6 +1571,7 @@ class CodexAppServerConnector:
         on_timeline: TimelineCallback | None = None,
         on_reasoning: ReasoningCallback | None = None,
         on_assistant_message: AssistantMessageCallback | None = None,
+        keep_thread: bool = False,
     ) -> ExternalAgentResult:
         if not prompt.strip():
             raise ConfigurationError("Codex prompt must not be empty")
@@ -1441,48 +1594,174 @@ class CodexAppServerConnector:
                         "This RenderDoc Codex profile is not signed in. Open Settings > AI, "
                         "edit the connection, then select Connect / Sign in."
                     )
-                await self._require_read_only_permission_profile()
+                if not self.inherit_desktop_capabilities:
+                    await self._require_read_only_permission_profile()
                 runtime_roots = self._runtime_workspace_roots()
-                thread_params: dict[str, Any] = {
-                    "cwd": str(self.cwd),
-                    "approvalPolicy": "never",
-                    "serviceName": "replaylab",
-                    "ephemeral": True,
-                    "permissions": _READ_ONLY_PERMISSION_PROFILE,
-                    "runtimeWorkspaceRoots": runtime_roots,
-                }
-                if model:
-                    thread_params["model"] = model
-                thread_result = await self._start_thread(thread_params)
-                self._verify_thread_read_scope(thread_result, runtime_roots)
-                thread = thread_result.get("thread")
-                raw_thread_id = thread.get("id") if isinstance(thread, dict) else None
-                if not isinstance(raw_thread_id, str) or not raw_thread_id:
-                    raise ConnectorError("Codex app-server thread/start returned no thread id")
-                thread_id = raw_thread_id
-                instruction_sources: list[Any] = []
-                if isinstance(thread, dict):
-                    raw_sources = thread.get("instructionSources", [])
-                    if raw_sources is not None:
-                        if not isinstance(raw_sources, list):
+                thread_id = self._active_thread_id if keep_thread else ""
+                if not thread_id:
+                    thread_params: dict[str, Any] = {
+                        "cwd": str(self.cwd),
+                        "approvalPolicy": "never",
+                        "serviceName": "replaylab",
+                        "ephemeral": True,
+                        "permissions": self._native_permission_profile(),
+                        "runtimeWorkspaceRoots": runtime_roots,
+                    }
+                    if self.workspace_write:
+                        thread_params["config"] = self._owned_workspace_profile_config()
+                    if self.inherit_desktop_capabilities:
+                        # The launch configuration contains the user's effective
+                        # permissions. Do not replace them with a Bread profile
+                        # or silently grant an approval the provider requested.
+                        for key in ("approvalPolicy", "permissions", "config"):
+                            thread_params.pop(key, None)
+                        thread_params["config"] = self.desktop_runtime_config
+                    if model:
+                        thread_params["model"] = model
+                    try:
+                        thread_result = await self._start_thread(thread_params)
+                        if self.inherit_desktop_capabilities:
+                            self.native_capabilities.update({
+                                "permissionProfile": thread_result.get("activePermissionProfile"),
+                                "sandbox": thread_result.get("sandbox"),
+                                "approvalPolicy": thread_result.get("approvalPolicy"),
+                            })
+                        else:
+                            self._verify_thread_read_scope(thread_result, runtime_roots)
+                    except ProviderCapabilityError as exc:
+                        if not self.workspace_write or self.inherit_desktop_capabilities:
+                            raise
+                        # No turn/model has started. An unverified write profile
+                        # cannot widen the machine; other MCP routes remain usable.
+                        self.workspace_write = False
+                        self.workspace_capability_note = (
+                            "Native workspace-write scope could not be verified; scoped read-only tools remain available. "
+                            + _redact_timeline_text(str(exc), limit=768)
+                        )
+                        await self._require_read_only_permission_profile()
+                        thread_params["permissions"] = _READ_ONLY_PERMISSION_PROFILE
+                        thread_params.pop("sandbox", None)
+                        thread_params.pop("config", None)
+                        thread_result = await self._start_thread(thread_params)
+                        self._verify_thread_read_scope(thread_result, runtime_roots)
+                    thread = thread_result.get("thread")
+                    raw_thread_id = thread.get("id") if isinstance(thread, dict) else None
+                    if not isinstance(raw_thread_id, str) or not raw_thread_id:
+                        raise ConnectorError("Codex app-server thread/start returned no thread id")
+                    thread_id = raw_thread_id
+                    instruction_sources: list[Any] = []
+                    if isinstance(thread, dict):
+                        raw_sources = thread.get("instructionSources", [])
+                        if raw_sources is not None:
+                            if not isinstance(raw_sources, list):
+                                raise ConnectorError(
+                                    "Codex thread/start returned invalid instructionSources"
+                                )
+                            instruction_sources.extend(raw_sources)
+                    raw_top_sources = thread_result.get("instructionSources", [])
+                    if raw_top_sources is not None:
+                        if not isinstance(raw_top_sources, list):
                             raise ConnectorError(
                                 "Codex thread/start returned invalid instructionSources"
                             )
-                        instruction_sources.extend(raw_sources)
-                raw_top_sources = thread_result.get("instructionSources", [])
-                if raw_top_sources is not None:
-                    if not isinstance(raw_top_sources, list):
-                        raise ConnectorError(
-                            "Codex thread/start returned invalid instructionSources"
+                        instruction_sources.extend(raw_top_sources)
+                    if instruction_sources and not self.inherit_desktop_capabilities:
+                        raise PolicyError(
+                            "Codex Bread threads must not load ambient instruction sources"
                         )
-                    instruction_sources.extend(raw_top_sources)
-                if instruction_sources:
-                    raise PolicyError(
-                        "Codex ReplayLab threads must not load ambient instruction sources"
-                    )
-                await self._verify_tool_isolation(thread_id)
+                    for _attempt in range(33):
+                        try:
+                            await self._verify_tool_isolation(thread_id)
+                            break
+                        except _UnscopedBreadServers as duplicate:
+                            # Discovery runs before any model turn. Remove only
+                            # the duplicate Host connection; keep other user MCPs.
+                            for name in duplicate.names:
+                                # Thread/start config uses dotted keys directly,
+                                # not TOML-quoted path segments.
+                                key = "mcp_servers." + name
+                                self.desktop_runtime_config[key] = {**self.desktop_runtime_config.get(key, {}), "enabled": False}
+                            with contextlib.suppress(Exception):
+                                await self._transport.request("thread/archive", {"threadId": thread_id}, timeout=10.0)
+                            thread_params["config"] = self.desktop_runtime_config
+                            thread_result = await self._start_thread(thread_params)
+                            thread_id = str((thread_result.get("thread") or {}).get("id") or "")
+                            if not thread_id:
+                                raise ConnectorError("Codex did not return a replacement scoped thread")
+                    else:
+                        raise PolicyError("Codex could not remove unscoped duplicate Bread connections")
+                    if keep_thread:
+                        self._active_thread_id = thread_id
+                    if self.inherit_desktop_capabilities:
+                        await _emit_timeline(on_timeline, {
+                            "activityId": "codex-native-capabilities", "activityKind": "nativeCapability",
+                            "activityTarget": "Codex configured capabilities", "status": "completed",
+                            "activityTitleId": "task.capabilities.codex-configured", "activityTitleArgs": [],
+                            "activityDetailId": "task.capabilities.inherited", "activityDetailArgs": [], "lifecycle": "completed",
+                            "activityDetail": "User-configured integrations and permissions are inherited. Only connected services are callable; new approval requests are not automatically accepted.",
+                        })
+                    elif self._workspace_write_requested:
+                        await _emit_timeline(on_timeline, {
+                            "activityId": "codex-native-workspace-capability",
+                            "activityKind": "nativeCapability",
+                            "activityTarget": "Codex workspace-write" if self.workspace_write else "Codex read-only",
+                            "status": "completed", "lifecycle": "completed",
+                            "permissionProfile": self._native_permission_profile(),
+                            "workspaceWrite": self.workspace_write,
+                            "runtimeWorkspaceRoots": runtime_roots,
+                            "networkAccess": False,
+                            "activityDetail": self.workspace_capability_note or "Native writes are confined to the owned task workspace; network and ambient temporary-directory writes are disabled.",
+                        })
 
                 text = prompt
+                if self.inherit_desktop_capabilities:
+                    text += ("\n\n## Effective provider capabilities\n"
+                             + json.dumps(self.native_capabilities, ensure_ascii=False)
+                             + "\nUse the actual connected tools, installed skills and provider-native shell/web/image tools as appropriate. "
+                             "A configured plugin is not evidence that its private desktop service is callable. "
+                             "Provider approval requests are not auto-approved; if denied, report the exact operation and use an already authorized alternative. "
+                             "Bread capture identity and tool-effect scope still apply. Do not replace the scoped Bread route with an unscoped capture connection.")
+                elif self.workspace_capability_note:
+                    # A verified read-only fallback keeps the task usable, but
+                    # the Agent must see the effective capability, not the write
+                    # scope requested in its original instructions.
+                    text += (
+                        "\n\n## Effective native workspace capability\n"
+                        + self.workspace_capability_note
+                        + " Use the already granted Bread MCP tools for project or Shader changes. "
+                        "If the operation is unfamiliar, discover it with list_bread_capabilities "
+                        "and call it through invoke_bread_tool. Do not retry an unavailable "
+                        "native write or request a wider native permission merely to duplicate "
+                        "an available Bread tool. If no granted route can complete the request, "
+                        "explain the remaining operation and required user action."
+                    )
+                elif self.workspace_write:
+                    # The UI timeline alone is not model context. Give the
+                    # Agent the same positively verified scope so it need not
+                    # guess whether the Skill's owned-file route is usable.
+                    # This branch is reached only after thread-scope verification;
+                    # a denied/unverified write request takes the fallback above.
+                    text += (
+                        "\n\n## Effective native workspace capability\n"
+                        + json.dumps({
+                            "verification": "providerHandshake",
+                            "permissionProfile": self._native_permission_profile(),
+                            "workspaceWrite": True,
+                            "runtimeWorkspaceRoots": runtime_roots,
+                            "networkAccess": False,
+                        }, ensure_ascii=False)
+                        + "\nCodex has verified native write access to this exact owned task directory. "
+                        "Use the available native file/shell tools there to keep a working copy and batch related edits. "
+                        "For exec_command, set login=false: this connection disables login shells. "
+                        "A rejected login-shell invocation does not mean the owned directory is read-only; "
+                        "correct that invocation once before choosing a file-tool fallback. "
+                        "For Shader work, begin_shader_workspace_organization(agent_file_name=...) can create "
+                        "the complete owned copy; edit the returned agentFile.path, then import it with "
+                        "write_shader_workspace_organization_file(source_file=agentFile.relativePath). "
+                        "Native file permissions and Bread MCP effect grants are separate; this does not authorize "
+                        "native writes to project/capture files or ambient temporary directories. "
+                        "If an exposed native tool actually fails, use its diagnostic to choose an available fallback."
+                    )
                 attachment_root, attachment_inputs = self._materialize_attachment_inputs(
                     attachments
                 )
@@ -1509,22 +1788,38 @@ class CodexAppServerConnector:
                     "input": inputs,
                     "cwd": str(self.cwd),
                     "approvalPolicy": "never",
-                    # Repeat the already-verified built-in profile and exact roots
+                    # Repeat the already-verified named profile and exact roots
                     # so a turn cannot inherit a later ambient configuration
                     # change. ``permissions`` and ``sandboxPolicy`` are mutually
                     # exclusive in the current protocol.
-                    "permissions": _READ_ONLY_PERMISSION_PROFILE,
+                    "permissions": self._native_permission_profile(),
                     "runtimeWorkspaceRoots": runtime_roots,
                     # Request the most useful public fallback when the selected
                     # model does not expose plaintext reasoning content.
                     "summary": "detailed",
                 }
+                if self.inherit_desktop_capabilities:
+                    turn_params.pop("approvalPolicy", None)
+                    turn_params.pop("permissions", None)
                 if model:
                     turn_params["model"] = model
-                turn_result = await self._start_turn(turn_params)
+                # Capacity recovery shares this turn's time budget; a provider
+                # failure must not grant another full timeout on each retry.
+                turn_deadline = asyncio.get_running_loop().time() + self.timeout
+                try:
+                    turn_result = await self._start_turn(turn_params)
+                except BaseException:
+                    # A cancelled/timed-out request may have been accepted
+                    # without returning its turn id. That thread cannot safely
+                    # be reused, even for callers that requested keep_thread.
+                    with contextlib.suppress(Exception):
+                        await self.close()
+                    raise
                 turn = turn_result.get("turn")
                 raw_turn_id = turn.get("id") if isinstance(turn, dict) else None
                 if not isinstance(raw_turn_id, str) or not raw_turn_id:
+                    with contextlib.suppress(Exception):
+                        await self.close()
                     raise ConnectorError("Codex app-server turn/start returned no turn id")
                 turn_id = raw_turn_id
 
@@ -1554,16 +1849,80 @@ class CodexAppServerConnector:
                     }:
                         active_reasoning.pop(key, None)
 
+                async def close_reasoning(lifecycle: str) -> None:
+                    for active in tuple(active_reasoning.values()):
+                        terminal = dict(active)
+                        terminal.update({"text": "", "reset": False, "lifecycle": lifecycle})
+                        with contextlib.suppress(Exception):
+                            await _emit_reasoning(on_reasoning, terminal)
+                    active_reasoning.clear()
+
                 try:
-                    answer = await self._collect_turn(
-                        thread_id=thread_id,
-                        turn_id=turn_id,
-                        on_delta=on_delta,
-                        on_activity=on_activity,
-                        on_timeline=on_timeline,
-                        on_reasoning=tracked_reasoning if on_reasoning is not None else None,
-                        on_assistant_message=on_assistant_message,
-                    )
+                    retry_count = 0
+                    while True:
+                        try:
+                            answer = await self._collect_turn(
+                                thread_id=thread_id,
+                                turn_id=turn_id,
+                                on_delta=on_delta,
+                                on_activity=on_activity,
+                                on_timeline=on_timeline,
+                                on_reasoning=tracked_reasoning if on_reasoning is not None else None,
+                                on_assistant_message=on_assistant_message,
+                                deadline=turn_deadline,
+                            )
+                            break
+                        except _CodexTurnFailure as exc:
+                            if not exc.retryable:
+                                raise
+                            if exc.unfinished_tools:
+                                exc.stop_recovery("capacity recovery skipped because a tool's terminal outcome is unconfirmed")
+                                raise
+                            if retry_count >= len(_CAPACITY_RETRY_DELAYS):
+                                exc.stop_recovery("bounded same-model capacity recovery attempts exhausted")
+                                raise
+                            delay = _CAPACITY_RETRY_DELAYS[retry_count]
+                            loop = asyncio.get_running_loop()
+                            if loop.time() + delay >= turn_deadline:
+                                exc.stop_recovery("capacity recovery stopped at the original turn deadline")
+                                raise
+                            await close_reasoning("failed")
+                            retry_count += 1
+                            await _emit_timeline(on_timeline, {
+                                "activityId": f"codex-capacity-retry:{turn_id}",
+                                "activityKind": "providerRetry",
+                                "activityTitleId": "task.provider.retry-capacity",
+                                "activityTitleArgs": [delay, retry_count, len(_CAPACITY_RETRY_DELAYS)],
+                                "status": "running", "lifecycle": "updated",
+                                "errorCode": exc.error_code,
+                                "retryable": True,
+                                "retryAfterSeconds": delay,
+                                "threadId": _item_id(thread_id),
+                                "turnId": _item_id(turn_id),
+                            })
+                            # asyncio cancellation interrupts this delay. Never
+                            # restart login, a thread, or MCP for a capacity event.
+                            await asyncio.sleep(delay)
+                            for attachment in tuple(path_attachments):
+                                attachment.revalidate()
+                            remaining = turn_deadline - loop.time()
+                            if remaining <= 0:
+                                raise exc
+                            recovery_params = dict(turn_params)
+                            recovery_params["input"] = [{"type": "text", "text": _CAPACITY_RECOVERY_PROMPT}]
+                            previous_turn_id = turn_id
+                            turn_id = ""
+                            try:
+                                turn_result = await asyncio.wait_for(
+                                    self._start_turn(recovery_params), timeout=remaining
+                                )
+                            except asyncio.TimeoutError:
+                                raise ConnectorError("Codex capacity recovery timed out before its turn id was confirmed") from None
+                            turn = turn_result.get("turn")
+                            next_id = turn.get("id") if isinstance(turn, dict) else None
+                            if not isinstance(next_id, str) or not next_id or next_id == previous_turn_id:
+                                raise ConnectorError("Codex capacity recovery returned no new turn id")
+                            turn_id = next_id
                     # A path can be replaced while Codex is producing its
                     # answer.  Revalidate after the terminal provider event as
                     # well as before constructing the mention; otherwise a
@@ -1575,23 +1934,20 @@ class CodexAppServerConnector:
                     terminal_lifecycle = (
                         "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
                     )
-                    for active in tuple(active_reasoning.values()):
-                        terminal = dict(active)
-                        terminal.update(
-                            {
-                                "text": "",
-                                "reset": False,
-                                "lifecycle": terminal_lifecycle,
-                            }
-                        )
+                    await close_reasoning(terminal_lifecycle)
+                    if turn_id:
                         with contextlib.suppress(Exception):
-                            await _emit_reasoning(on_reasoning, terminal)
-                    with contextlib.suppress(Exception):
-                        await self._transport.request(
-                            "turn/interrupt",
-                            {"threadId": thread_id, "turnId": turn_id},
-                            timeout=2.0,
-                        )
+                            await self._transport.request(
+                                "turn/interrupt",
+                                {"threadId": thread_id, "turnId": turn_id},
+                                timeout=2.0,
+                            )
+                    else:
+                        # The server may already have started the recovery turn.
+                        # Closing only this owned connection is the reliable
+                        # cancellation path until its id is known.
+                        with contextlib.suppress(Exception):
+                            await self.close()
                     raise
                 return ExternalAgentResult(
                     text=answer,
@@ -1601,10 +1957,14 @@ class CodexAppServerConnector:
                     turn_id=turn_id,
                 )
             finally:
-                # Runtime creates a connector per request. Closing here prevents
-                # orphaned app-server processes while preserving lazy startup.
+                # Direct callers retain the historical one-shot lifecycle. The
+                # native engine opts into one live thread for all bounded
+                # verification turns in a task, then closes it in its outer
+                # finally block. This preserves model/tool context and avoids a
+                # cold thread plus MCP startup for every Shader segment.
                 try:
-                    await self.close()
+                    if not keep_thread:
+                        await self.close()
                 finally:
                     # Attachment bytes have their own lifecycle: a transport-close
                     # failure must not skip deletion in direct connector callers.
@@ -1624,7 +1984,7 @@ class CodexAppServerConnector:
         except _AppServerRequestError as exc:
             if self._is_permission_protocol_incompatibility(exc):
                 raise self._permission_capability_error(
-                    "The configured Codex app-server does not support ReplayLab's "
+                    "The configured Codex app-server does not support Bread's "
                     "scoped read-only permission contract.",
                     error_code=_PERMISSION_PROTOCOL_UNSUPPORTED,
                 ) from exc
@@ -1640,7 +2000,7 @@ class CodexAppServerConnector:
         except _AppServerRequestError as exc:
             if self._is_permission_protocol_incompatibility(exc):
                 raise self._permission_capability_error(
-                    "The configured Codex app-server does not support ReplayLab's "
+                    "The configured Codex app-server does not support Bread's "
                     "scoped read-only permission contract.",
                     error_code=_PERMISSION_PROTOCOL_UNSUPPORTED,
                 ) from exc
@@ -1690,11 +2050,12 @@ class CodexAppServerConnector:
             "runtime workspace roots",
             "experimentalapi",
             "readonly.access",
+            "sandbox",
         )
         return any(field in message for field in fields)
 
     async def _require_read_only_permission_profile(self) -> None:
-        """Require the built-in read-only profile before starting any thread."""
+        """Negotiate an allowed built-in scope before starting any thread."""
 
         cursor: str | None = None
         seen_ids: set[str] = set()
@@ -1734,7 +2095,7 @@ class CodexAppServerConnector:
                         "Codex permission profile inventory contained a duplicate/empty id"
                     )
                 seen_ids.add(profile_id)
-                if profile_id == _READ_ONLY_PERMISSION_PROFILE:
+                if profile_id == (":workspace" if self.workspace_write else _READ_ONLY_PERMISSION_PROFILE):
                     selected_allowed = item["allowed"]
             next_cursor = result.get("nextCursor")
             if next_cursor is None:
@@ -1749,10 +2110,33 @@ class CodexAppServerConnector:
                 "Codex permission profile inventory exceeded the pagination safety bound"
             )
         if selected_allowed is not True:
+            if self.workspace_write:
+                self.workspace_write = False
+                self.workspace_capability_note = "The selected Codex workspace-write profile is unavailable or denied; scoped read-only tools remain available."
+                return await self._require_read_only_permission_profile()
             raise self._permission_capability_error(
                 "The built-in Codex read-only permission profile is unavailable.",
                 error_code=_READ_ONLY_PROFILE_UNAVAILABLE,
             )
+
+    def _native_permission_profile(self) -> str:
+        return self._workspace_permission_profile if self.workspace_write else _READ_ONLY_PERMISSION_PROFILE
+
+    def _owned_workspace_profile_config(self) -> dict[str, Any]:
+        # Current app-server still accepts legacy sandbox fields but may resolve
+        # them to readOnly. Built-in :workspace also grants ambient tmp writes.
+        # Explicit filesystem rules avoid both behaviours. The returned policy
+        # is checked before any model turn starts; older servers fail closed.
+        return {
+            # Thread/start's explicit selection is not forwarded to config
+            # reloads (including mcpServerStatus/list). A profiles table must
+            # therefore carry its own default, pinned to the same owned scope.
+            "default_permissions": self._workspace_permission_profile,
+            f"permissions.{self._workspace_permission_profile}": {
+                "filesystem": {":root": "read", ":workspace_roots": "write"},
+                "network": {"enabled": False},
+            },
+        }
 
     def _verify_thread_read_scope(
         self, result: Mapping[str, Any], expected_roots: Sequence[str]
@@ -1771,21 +2155,30 @@ class CodexAppServerConnector:
         verified = all(
             (
                 isinstance(active, dict),
-                isinstance(active, dict)
-                and active.get("id") == _READ_ONLY_PERMISSION_PROFILE,
+                isinstance(active, dict) and active.get("id") == self._native_permission_profile(),
                 isinstance(active, dict) and active.get("extends") is None,
                 bool(expected_keys) and None not in expected_keys,
                 actual_keys == expected_keys,
                 isinstance(sandbox, dict),
-                isinstance(sandbox, dict) and sandbox.get("type") == "readOnly",
+                isinstance(sandbox, dict) and sandbox.get("type") == ("workspaceWrite" if self.workspace_write else "readOnly"),
                 isinstance(sandbox, dict)
                 and sandbox.get("networkAccess", False) is False,
                 result.get("approvalPolicy") == "never",
             )
         )
+        if verified and self.workspace_write:
+            writable = sandbox.get("writableRoots")
+            verified = (
+                isinstance(writable, list)
+                and tuple(self._runtime_root_key(value) for value in writable) in ((), (self._runtime_root_key(str(self.cwd)),))
+                and sandbox.get("excludeTmpdirEnvVar") is True
+                and sandbox.get("excludeSlashTmp") is True
+            )
         if not verified:
             raise self._permission_capability_error(
-                "Codex app-server did not verify ReplayLab's exact read-only roots.",
+                "Codex app-server did not verify Bread's exact requested workspace scope "
+                f"(effective profile={_redact_timeline_text(active.get('id') if isinstance(active, dict) else None, limit=128) or 'none'}, "
+                f"sandbox={_redact_timeline_text(sandbox.get('type') if isinstance(sandbox, dict) else None, limit=64) or 'unknown'}).",
                 error_code=_READ_SCOPE_UNVERIFIED,
             )
 
@@ -1861,15 +2254,23 @@ class CodexAppServerConnector:
                     ) from exc
                 raise
             actual_servers = frozenset(entries)
+            if self.inherit_desktop_capabilities:
+                from ..external_mcp import _is_unscoped_bread_host
+                duplicates = [str(entry.get("name") or name) for name, entry in entries.items()
+                              if name not in self.expected_mcp_servers
+                              and isinstance(entry.get("tools"), dict)
+                              and _is_unscoped_bread_host(list(entry["tools"]))]
+                if duplicates:
+                    raise _UnscopedBreadServers(duplicates)
             unexpected = actual_servers - self.expected_mcp_servers
-            if unexpected:
+            if unexpected and not self.inherit_desktop_capabilities:
                 if not self.expected_mcp_servers:
                     raise PolicyError(
-                        "Codex ReplayLab threads must not load MCP servers; observed: "
+                        "Codex Bread threads must not load MCP servers; observed: "
                         + ", ".join(sorted(entries))
                     )
                 raise PolicyError(
-                    "Codex ReplayLab thread loaded an MCP server outside its task scope; "
+                    "Codex Bread thread loaded an MCP server outside its task scope; "
                     "expected "
                     + ", ".join(sorted(self.expected_mcp_servers))
                     + "; observed "
@@ -1880,6 +2281,12 @@ class CodexAppServerConnector:
                 f"{name} (missing)"
                 for name in sorted(self.expected_mcp_servers - actual_servers)
             ]
+            optional_pending = []
+            if self.inherit_desktop_capabilities:
+                optional_pending = [str(entry.get("name") or name) for name, entry in entries.items()
+                    if name not in self.expected_mcp_servers
+                    and entry.get("runtimeStatus") not in {"connected", "authenticationRequired", "failed", "cancelled", "disabled"}]
+                waiting.extend(f"{name} (starting optional integration)" for name in optional_pending)
             terminal: list[str] = []
             for name in sorted(self.expected_mcp_servers & actual_servers):
                 entry = entries[name]
@@ -1921,10 +2328,21 @@ class CodexAppServerConnector:
                     + ", ".join(terminal)
                 )
             if not waiting:
+                if self.inherit_desktop_capabilities:
+                    self.native_capabilities["mcpServers"] = [
+                        {"name": name, "status": entry.get("runtimeStatus"),
+                         "toolCount": len(entry.get("tools") or {})
+                         if isinstance(entry.get("tools"), dict) else 0}
+                        for name, entry in sorted(entries.items())]
                 break
 
             remaining = deadline - loop.time()
             if remaining <= 0:
+                if optional_pending:
+                    # An unidentified server must not join after the capture
+                    # gate. Recreate without that optional service, retaining
+                    # its unavailable status instead of blocking Bread work.
+                    raise _UnscopedBreadServers(optional_pending)
                 raise ConnectorError(
                     "Codex app-server timed out waiting for the task-scoped MCP server(s): "
                     + ", ".join(waiting)
@@ -1944,9 +2362,11 @@ class CodexAppServerConnector:
             for item in apps
             if isinstance(item, dict) and item.get("callable") is True
         )
-        if callable_apps:
+        if self.inherit_desktop_capabilities:
+            self.native_capabilities["callableApps"] = callable_apps
+        elif callable_apps:
             raise PolicyError(
-                "Codex Apps must be disabled for ReplayLab isolation; callable apps: "
+                "Codex Apps must be disabled for Bread isolation; callable apps: "
                 + ", ".join(callable_apps)
             )
 
@@ -1960,16 +2380,40 @@ class CodexAppServerConnector:
         on_timeline: TimelineCallback | None,
         on_reasoning: ReasoningCallback | None = None,
         on_assistant_message: AssistantMessageCallback | None = None,
+        deadline: float | None = None,
     ) -> str:
         loop = asyncio.get_running_loop()
         started = loop.time()
-        deadline = started + self.timeout
+        if deadline is None:
+            deadline = started + self.timeout
         streamed: list[str] = []
         streamed_chars = 0
         streamed_bytes = 0
         final_message = ""
         last_provider_notice = ""
         timeline_state = _TimelineState()
+        unfinished_tool_ids: set[str] = set()
+        untracked_tool = False
+
+        def track_tool(item: Mapping[str, Any], lifecycle: str) -> None:
+            nonlocal untracked_tool
+            if item.get("type") not in _EFFECT_ITEM_TYPES:
+                return
+            identity = item.get("id")
+            if not isinstance(identity, str) or not identity or len(identity) > _MAX_TIMELINE_ID_CHARS:
+                untracked_tool = True
+                return
+            # A terminal item notification closes a tool unless it explicitly
+            # says it is still running. A final turn snapshot is also inspected.
+            status = str(item.get("status", "")).casefold()
+            terminal = status in {"completed", "failed", "declined", "cancelled", "canceled"}
+            terminal |= lifecycle == "completed" and status not in {"inprogress", "running"}
+            if terminal:
+                unfinished_tool_ids.discard(identity)
+            elif len(unfinished_tool_ids) < _MAX_TIMELINE_ITEMS:
+                unfinished_tool_ids.add(identity)
+            else:
+                untracked_tool = True
 
         async def emit_reasoning_event(
             *,
@@ -2212,6 +2656,12 @@ class CodexAppServerConnector:
             params = event.get("params")
             if not isinstance(params, dict):
                 continue
+            event_turn_id = str(params.get("turnId", ""))
+            event_thread_id = str(params.get("threadId", ""))
+            if event_turn_id and event_turn_id != turn_id:
+                continue
+            if event_thread_id and event_thread_id != thread_id:
+                continue
             if method in {"error", "warning"}:
                 # App-server reports retryable transport failures as notifications and
                 # later emits the authoritative turn/completed terminal state.  Surface
@@ -2224,13 +2674,6 @@ class CodexAppServerConnector:
                     loop.time() - started,
                 )
                 continue
-            event_turn_id = str(params.get("turnId", ""))
-            event_thread_id = str(params.get("threadId", ""))
-            if event_turn_id and event_turn_id != turn_id:
-                continue
-            if event_thread_id and event_thread_id != thread_id:
-                continue
-
             elapsed = loop.time() - started
 
             if method == "item/reasoning/textDelta":
@@ -2404,6 +2847,7 @@ class CodexAppServerConnector:
             if method == "item/started":
                 item = params.get("item")
                 if isinstance(item, Mapping):
+                    track_tool(item, "started")
                     if item.get("type") == "reasoning":
                         await emit_reasoning_item(item, "started")
                     timeline = _item_timeline_event(
@@ -2483,6 +2927,7 @@ class CodexAppServerConnector:
             if method == "item/completed":
                 item = params.get("item")
                 if isinstance(item, Mapping):
+                    track_tool(item, "completed")
                     completed_item_id = _item_id(item.get("id"))
                     previous_commentary = timeline_state.commentary.get(
                         completed_item_id, ""
@@ -2554,12 +2999,15 @@ class CodexAppServerConnector:
                 continue
             status = str(completed_turn.get("status", ""))
             if status != "completed":
-                error = completed_turn.get("error")
-                if isinstance(error, dict):
-                    message = str(error.get("message", status or "failed"))
-                else:
-                    message = status or "failed"
-                raise ConnectorError(f"Codex turn did not complete: {message}")
+                items = completed_turn.get("items")
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, Mapping):
+                            track_tool(item, "snapshot")
+                raise _CodexTurnFailure(
+                    status, completed_turn.get("error"),
+                    unfinished_tools=bool(unfinished_tool_ids) or untracked_tool,
+                )
             if not timeline_state.reasoning_observed:
                 await emit_reasoning_event(
                     item_id=_item_id(turn_id) or "turn",

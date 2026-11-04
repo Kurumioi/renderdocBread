@@ -123,11 +123,15 @@ class InternalServiceLifecycleTests(unittest.TestCase):
             if configured_mcp is not None:
                 os.environ["REPLAYLAB_MCP_HOST"] = configured_mcp
 
-    def test_embedded_clients_never_launch_or_release_host_processes(self) -> None:
+    def test_embedded_clients_only_launch_bounded_helpers_and_never_release_host(self) -> None:
         project_client_source = PROJECT_CLIENT_PATH.read_text(encoding="utf-8")
         project_launcher_source = PROJECT_LAUNCHER_PATH.read_text(encoding="utf-8")
-        self.assertNotIn("import subprocess", project_client_source)
-        self.assertNotIn("subprocess.Popen", project_client_source)
+        owners = {function.name for function in ast.walk(ast.parse(project_client_source))
+                  if isinstance(function, ast.FunctionDef) and any(
+                      isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                      and isinstance(call.func.value, ast.Name) and call.func.value.id == 'subprocess'
+                      and call.func.attr == 'Popen' for call in ast.walk(function))}
+        self.assertEqual({'_project_transport', '_ensure_host_when_missing'}, owners)
         self.assertNotIn("ensure_internal_owner", project_client_source)
         self.assertNotIn("release_registered_internal_owners", project_client_source)
         self.assertNotIn("subprocess.Popen", project_launcher_source)
@@ -156,7 +160,12 @@ class InternalServiceLifecycleTests(unittest.TestCase):
                 bridge, "_current_capture_token", return_value=None,
             ), mock.patch.object(
                 bridge, "_publish_console_event",
+            ), mock.patch.dict(
+                os.environ,
             ):
+                # A real GUI owns its environment for its whole lifetime.
+                # This in-process startup probe must not pin later IPC or
+                # project-console tests to its now-disposed fake instance.
                 bridge.start("test", object())
             return list(calls)
 

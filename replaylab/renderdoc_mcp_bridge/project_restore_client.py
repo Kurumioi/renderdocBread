@@ -11,10 +11,12 @@ and bounds every response and wall-clock wait.
 from __future__ import absolute_import, print_function
 
 import ctypes
+import base64
 import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -36,15 +38,28 @@ DEFAULT_PROJECT_RESTORE_CLIENT_TIMEOUT_SECONDS = 3960.0
 PROJECT_OPERATION_SCHEMA = "replaylab-internal-project-operation/v1"
 PROJECT_OPERATION_RESULT_SCHEMA = "replaylab-internal-project-operation-result/v1"
 PROJECT_OPERATION_PATH = "/replaylab/internal/project-operation"
-EXPECTED_HOST_VERSION = "1.13.0"
+# Minimum Host package the client was written against. A newer patch or
+# minor on the same major line stays compatible while protocol stays 1.
+EXPECTED_HOST_VERSION = "1.13.121"
 INTERNAL_HOST_STATE_PROTOCOL_VERSION = 1
+INTERNAL_HOST_CAPABILITY_SCHEMA = "replaylab-internal-host-capabilities/v1"
+EXPECTED_INTERNAL_CAPABILITY_VERSIONS = {
+    "project-service": 1,
+    "project-restore": 1,
+    "shader-workspace-prepare": 1,
+    "shader-source-save": 1,
+    "shader-live-edit": 1,
+    "asset-index": 1,
+}
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+_HOST_SEMVER = re.compile(r"^([0-9]+)\.([0-9]+)\.([0-9]+)$")
 
 # The internal Host advertises its route families here.  New families (for
 # example "asset-index", 2026-09) are additive: a client requires the ones it
 # uses and ignores the rest, so a newer Host never fails an older client.
 REQUIRED_INTERNAL_CAPABILITIES = (
-    "project-service", "project-restore", "shader-source-save", "shader-live-edit")
+    "project-service", "project-restore", "shader-workspace-prepare",
+    "shader-source-save", "shader-live-edit", "asset-index")
 
 
 def _has_required_capabilities(value):
@@ -53,6 +68,68 @@ def _has_required_capabilities(value):
     if any(not isinstance(item, str) or len(item) > 64 for item in value):
         return False
     return all(item in value for item in REQUIRED_INTERNAL_CAPABILITIES)
+
+
+def _has_required_capability_versions(schema, value):
+    """Validate the wire contracts needed by this bundled bridge.
+
+    A route name says only that something exists.  The schema map makes an
+    incompatible fresh Host fail before a restore job is submitted, rather
+    than discovering the mismatch once for every Shader in the capture.
+    Unknown additive entries are accepted; required entries match exactly.
+    """
+
+    if schema != INTERNAL_HOST_CAPABILITY_SCHEMA or not isinstance(value, dict):
+        return False
+    if len(value) > 32:
+        return False
+    for name, version in value.items():
+        if (not isinstance(name, str) or len(name) > 64 or
+                isinstance(version, bool) or not isinstance(version, int) or
+                version < 1 or version > 1000000):
+            return False
+    return all(value.get(name) == version
+               for name, version in EXPECTED_INTERNAL_CAPABILITY_VERSIONS.items())
+
+
+def _capability_contract_description(schema, value):
+    """A bounded diagnostic for an untrusted Host capability declaration."""
+
+    try:
+        detail = json.dumps(
+            {"schema": schema, "versions": value},
+            ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        detail = "schema=%r versions=%r" % (schema, value)
+    return detail if len(detail) <= 1024 else detail[:1024] + "...[truncated]"
+
+
+def _parse_host_semver(value):
+    if not isinstance(value, str):
+        return None
+    match = _HOST_SEMVER.fullmatch(value.strip())
+    if match is None:
+        return None
+    parts = tuple(int(item) for item in match.groups())
+    if any(part < 0 or part > 999999 for part in parts):
+        return None
+    return parts
+
+
+def _host_runtime_version_compatible(received, expected):
+    """True when a live Host is the same or a newer compatible package.
+
+    Protocol remains the hard contract. A 1.13.9 Host must still load a
+    client that expected 1.13.8; a 1.10 Host or a 2.x Host must not.
+    """
+
+    received_parts = _parse_host_semver(received)
+    expected_parts = _parse_host_semver(expected)
+    if received_parts is None or expected_parts is None:
+        return False
+    if received_parts[0] != expected_parts[0]:
+        return False
+    return received_parts >= expected_parts
 
 MAX_STATE_BYTES = 64 * 1024
 MAX_PROJECT_REQUEST_BYTES = 16 * 1024 * 1024
@@ -89,7 +166,7 @@ class ReplayLabRestoreTransportError(ReplayLabRestoreClientError):
 
     def __init__(self, error, method, path):
         ReplayLabRestoreClientError.__init__(
-            self, "ReplayLab Host connection failed: %s" % str(error))
+            self, "Bread Host connection failed: %s" % str(error))
         self.winerror = getattr(error, "winerror", None)
         self.error_type = type(error).__name__
         self.method = method
@@ -127,7 +204,7 @@ def _winhttp_request_blocking(method, path, port, headers, body,
 
     if os.name != "nt":
         raise ReplayLabRestoreClientError(
-            "ReplayLab project restore requires the Windows loopback Host")
+            "Bread project restore requires the Windows loopback Host")
     deadline = time.monotonic() + max(
         0.1, min(120.0, float(timeout_seconds)))
     winhttp = ctypes.WinDLL("winhttp", use_last_error=True)
@@ -186,13 +263,16 @@ def _winhttp_request_blocking(method, path, port, headers, body,
         if (cancel_event.is_set() or
                 (not cleanup_request and (stopping or generation_changed))):
             raise ReplayLabRestoreClientError(
-                "ReplayLab project restore was cancelled during shutdown")
+                "Bread project restore was cancelled during shutdown")
         if time.monotonic() >= deadline:
             if method == "POST":
                 raise ReplayLabRestoreRequestUncertain(
-                    "ReplayLab Host request timed out")
-            raise ReplayLabRestoreClientError(
-                "ReplayLab Host request timed out")
+                    "Bread Host request timed out")
+            # Same fact as a native ERROR_WINHTTP_TIMEOUT (12002): this one
+            # request took too long. Report it through the transport class so
+            # a job poll can be retried instead of failing the whole restore.
+            raise ReplayLabRestoreTransportError(
+                ctypes.WinError(12002, "Host request timed out"), method, path)
 
     try:
         check_request_state()
@@ -274,7 +354,7 @@ def _winhttp_request_blocking(method, path, port, headers, body,
                 break
             if int(available.value) > MAX_RESPONSE_BYTES - total:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab Host returned an invalid response size")
+                    "Bread Host returned an invalid response size")
             request_bytes = min(16 * 1024, int(available.value))
             # Read only bytes WinHTTP has already made available. Asking for the
             # entire remaining Content-Length lets a slow peer keep one
@@ -295,10 +375,10 @@ def _winhttp_request_blocking(method, path, port, headers, body,
     except (OSError, ValueError) as exc:
         if cancel_event.is_set():
             raise ReplayLabRestoreClientError(
-                "ReplayLab project restore was cancelled during shutdown")
+                "Bread project restore was cancelled during shutdown")
         if method == "POST" and request_started:
             raise ReplayLabRestoreRequestUncertain(
-                "ReplayLab Host request outcome is uncertain: %s" % str(exc))
+                "Bread Host request outcome is uncertain: %s" % str(exc))
         raise ReplayLabRestoreTransportError(exc, method, path) from exc
     finally:
         for handle in (request, connection, session):
@@ -361,7 +441,7 @@ def resume_restore_generation():
     with _RESTORE_LIFECYCLE:
         if _ACTIVE_CLIENTS:
             raise ReplayLabRestoreClientError(
-                "ReplayLab project restore workers are still active")
+                "Bread project restore workers are still active")
         _RESTORE_GENERATION += 1
         _RESTORE_STOPPING = False
         return _RESTORE_GENERATION
@@ -584,10 +664,10 @@ def _clean_path(value, label, require_rdc=False):
 
 def _normalise_progress(value, previous_sequence):
     if not isinstance(value, dict):
-        raise ReplayLabRestoreClientError("ReplayLab restore progress is malformed")
+        raise ReplayLabRestoreClientError("Bread restore progress is malformed")
     legacy_fields = {"sequence", "phase", "message", "current", "total"}
     if set(value) not in (legacy_fields, legacy_fields | {"item"}):
-        raise ReplayLabRestoreClientError("ReplayLab restore progress is malformed")
+        raise ReplayLabRestoreClientError("Bread restore progress is malformed")
     try:
         sequence = _bounded_integer(
             value["sequence"], "restore progress sequence", 1, 0x7FFFFFFF)
@@ -603,9 +683,9 @@ def _normalise_progress(value, previous_sequence):
             value.get("item", ""), "restore progress item", 1024,
             allow_empty=True)
     except ReplayLabRestoreClientError:
-        raise ReplayLabRestoreClientError("ReplayLab restore progress is malformed")
+        raise ReplayLabRestoreClientError("Bread restore progress is malformed")
     if sequence <= previous_sequence or (total and current > total):
-        raise ReplayLabRestoreClientError("ReplayLab restore progress is malformed")
+        raise ReplayLabRestoreClientError("Bread restore progress is malformed")
     return {
         "sequence": sequence,
         "phase": phase,
@@ -620,30 +700,45 @@ def _validate_shader_items(value):
     items = value.get("items")
     if not isinstance(items, list) or len(items) > MAX_RESULT_ITEMS:
         raise ReplayLabRestoreClientError(
-            "ReplayLab restore Shader summary is malformed")
+            "Bread restore Shader summary is malformed")
     counts = {
         "applied": 0,
         "skipped": 0,
         "failed": 0,
         "adoptedCurrentSession": 0,
+        "reusedValidation": 0,
+        "manualEdit": 0,
     }
     for item in items:
         if not isinstance(item, dict):
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore Shader item is malformed")
+                "Bread restore Shader item is malformed")
         status = item.get("status")
         source = item.get("source")
-        if status not in counts or source not in ("rdc-index", "reuse-plan"):
+        if (status not in ("applied", "skipped", "failed") or
+                source not in ("rdc-index", "reuse-plan", "verified-rdc-restore") or
+                (source == "verified-rdc-restore" and status != "applied")):
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore Shader item is malformed")
+                "Bread restore Shader item is malformed")
+        optional = set()
         if status == "applied":
             expected = {
                 "status", "source", "workspacePath", "workspaceId",
                 "resourceId", "stage", "replacementId",
-                "idempotentlyAdopted",
             }
+            optional.update({"reusedValidation", "pairValidationCache", "pendingSource", "preservedLocalSource",
+                             "sourceSha256"})
+            if source == "verified-rdc-restore":
+                expected.update({"knowledgeId", "reusedValidation"})
+            else:
+                expected.add("idempotentlyAdopted")
             if source == "reuse-plan":
                 expected.add("knowledgeId")
+                # The project version replaced a local edit (backup receipt).
+                optional.update({"supersededLocalEdit", "localValidatedCandidate"})
+                optional.update({"sourceSha256", "candidateRawSha256", "candidateRevision",
+                                 "projectSourceSha256", "projectCandidateRawSha256",
+                                 "sourcePreparationOnly"})
         elif status == "failed":
             expected = {
                 "status", "source", "resourceId", "stage", "error",
@@ -656,16 +751,73 @@ def _validate_shader_items(value):
             }
             if source != "reuse-plan":
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab restore Shader item is malformed")
-        if set(item) != expected:
+                    "Bread restore Shader item is malformed")
+            optional |= {"detail", "knowledgeId", "knowledgeSourceSha256", "rawSha256",
+                         "workspacePath", "workspaceSourceSha256"}
+        present = set(item)
+        if not expected <= present or not present <= (expected | optional):
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore Shader item is malformed")
+                "Bread restore Shader item is malformed")
         if status == "applied":
-            if not isinstance(item["idempotentlyAdopted"], bool):
+            if "sourcePreparationOnly" in item and not isinstance(item["sourcePreparationOnly"], bool):
+                raise ReplayLabRestoreClientError("Bread restore source preparation flag is malformed")
+            if "candidateRevision" in item:
+                _bounded_integer(item["candidateRevision"], "Shader candidate revision", 1, 0x7FFFFFFF)
+            for field in ("sourceSha256", "candidateRawSha256", "projectSourceSha256"):
+                if field in item:
+                    _hex_text(item[field], SHA256_PATTERN, "Shader " + field)
+            if "projectCandidateRawSha256" in item and item["projectCandidateRawSha256"] != "":
+                _hex_text(item["projectCandidateRawSha256"], SHA256_PATTERN, "Shader project candidate")
+            if (item.get("localValidatedCandidate") is False
+                    and "sourceSha256" in item and "projectSourceSha256" in item
+                    and item["sourceSha256"] != item["projectSourceSha256"]):
+                raise ReplayLabRestoreClientError("Bread restore applied source differs from project source")
+            if ("localValidatedCandidate" in item
+                    and not isinstance(item["localValidatedCandidate"], bool)):
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab restore Shader item is malformed")
-            if item["idempotentlyAdopted"]:
+                    "Bread restore local Shader candidate flag is malformed")
+            if source == "verified-rdc-restore":
+                if item["reusedValidation"] is not True:
+                    raise ReplayLabRestoreClientError(
+                        "Bread restore Shader item is malformed")
+            elif not isinstance(item["idempotentlyAdopted"], bool):
+                raise ReplayLabRestoreClientError(
+                    "Bread restore Shader item is malformed")
+            elif item["idempotentlyAdopted"]:
                 counts["adoptedCurrentSession"] += 1
+            if "reusedValidation" in item:
+                if not isinstance(item["reusedValidation"], bool):
+                    raise ReplayLabRestoreClientError(
+                        "Bread restore Shader reused validation flag is malformed")
+                if item["reusedValidation"]:
+                    counts["reusedValidation"] += 1
+            pair_cache = item.get("pairValidationCache")
+            manual_cache = (isinstance(pair_cache, dict) and
+                            pair_cache.get("reason") == "manual-edit-unvalidated")
+            if manual_cache:
+                if (set(pair_cache) != {"hit", "written", "reason"} or
+                        pair_cache["hit"] is not False or pair_cache["written"] is not False or
+                        source != "reuse-plan" or item.get("reusedValidation") is not False or
+                        item.get("idempotentlyAdopted") is not False or
+                        not {"sourceSha256", "candidateRawSha256", "candidateRevision"} <= set(item)):
+                    raise ReplayLabRestoreClientError(
+                        "Bread restore manual Shader evidence is inconsistent")
+                counts["manualEdit"] += 1
+            elif pair_cache is not None and (
+                    not isinstance(pair_cache, dict) or
+                    set(pair_cache) != {"hit", "written"} or
+                    any(not isinstance(pair_cache[field], bool)
+                        for field in ("hit", "written"))):
+                raise ReplayLabRestoreClientError(
+                    "Bread restore Shader pair cache flags are malformed")
+            superseded = item.get("supersededLocalEdit")
+            if superseded is not None:
+                if not isinstance(superseded, dict) or not isinstance(
+                        superseded.get("backupPath"), str):
+                    raise ReplayLabRestoreClientError(
+                        "Bread restore Shader item is malformed")
+                _clean_path(superseded["backupPath"], "Shader local-edit backup path")
+                counts["supersededLocalEdits"] = counts.get("supersededLocalEdits", 0) + 1
         _bounded_integer(
             item["resourceId"], "Shader resource ID", 1,
             0x7FFFFFFFFFFFFFFF)
@@ -675,11 +827,120 @@ def _validate_shader_items(value):
                 _hex_text(item[field], JOB_ID_PATTERN, "Shader " + field)
         if "workspacePath" in item:
             _clean_path(item["workspacePath"], "Shader workspace path")
-        for field in ("error", "reason"):
+        for field in ("error", "reason", "detail"):
             if field in item:
                 _bounded_diagnostic(item[field], "Shader " + field)
+        for field in ("knowledgeSourceSha256", "rawSha256", "workspaceSourceSha256"):
+            if item.get(field):
+                _hex_text(item[field], SHA256_PATTERN, "Shader " + field)
         counts[status] += 1
+    _validate_pending_source_publications(items)
+    _validate_preserved_local_sources(items)
     return items, counts
+
+
+_SOURCE_ONLY_REASONS = frozenset({
+    "source-only-project-draft", "legacy-saved-organization-draft",
+    "legacy-organization-publication-needs-review",
+})
+
+
+def _validate_preserved_local_sources(items):
+    """A local working copy is display evidence, never another replay receipt."""
+    applied_ids = {item.get("workspaceId") for item in items if item["status"] == "applied"}
+    applied_paths = {os.path.normcase(_clean_path(item["workspacePath"], "applied Shader workspace"))
+                     for item in items if item["status"] == "applied"}
+    seen = {}
+    for item in items:
+        if "preservedLocalSource" not in item:
+            continue
+        source = item["preservedLocalSource"]
+        if (item["status"] != "applied" or not isinstance(source, dict)
+                or set(source) != {"workspaceId", "workspacePath", "sourceSha256", "shown", "reason"}
+                or source.get("reason") != "local-edit" or type(source.get("shown")) is not bool):
+            raise ReplayLabRestoreClientError("Bread restore preserved local Shader source is malformed")
+        workspace_id = _hex_text(source["workspaceId"], JOB_ID_PATTERN, "local Shader workspace ID")
+        source_sha = _hex_text(source["sourceSha256"], SHA256_PATTERN, "local Shader source hash")
+        path = _clean_path(source["workspacePath"], "local Shader workspace path")
+        if (not os.path.isabs(source["workspacePath"]) or workspace_id in applied_ids
+                or os.path.normcase(path) in applied_paths):
+            raise ReplayLabRestoreClientError("Bread restore local Shader source overlaps a replay workspace")
+        identity = (os.path.normcase(path), source_sha)
+        if workspace_id in seen and seen[workspace_id] != identity:
+            raise ReplayLabRestoreClientError("Bread restore local Shader source identity is inconsistent")
+        seen[workspace_id] = identity
+
+
+def _validate_pending_source_publications(items):
+    """Keep the current editable head distinct from the applied validated head.
+
+    A pending source annotates one applied row; it never adds an application,
+    validation receipt, or skipped item to the restore accounting.
+    """
+    applied_knowledge = {item.get("knowledgeId") for item in items
+                         if item["status"] == "applied"}
+    seen_resources = set()
+    seen_knowledge = {}
+    for item in items:
+        pending = item.get("pendingSource")
+        if pending is None and "pendingSource" not in item:
+            continue
+        required = {"knowledgeId", "sourceSha256", "reason", "shown"}
+        if (item["status"] != "applied" or not isinstance(pending, dict)
+                or not required <= set(pending)
+                or not set(pending) <= required | {"workspacePath"}
+                or pending.get("reason") not in _SOURCE_ONLY_REASONS
+                or type(pending.get("shown")) is not bool):
+            raise ReplayLabRestoreClientError("Bread restore pending Shader source is malformed")
+        _hex_text(item.get("knowledgeId"), JOB_ID_PATTERN, "applied Shader knowledge ID")
+        _hex_text(item.get("sourceSha256"), SHA256_PATTERN, "applied Shader source hash")
+        knowledge_id = _hex_text(pending["knowledgeId"], JOB_ID_PATTERN,
+                                 "pending Shader knowledge ID")
+        source_sha = _hex_text(pending["sourceSha256"], SHA256_PATTERN, "pending Shader source hash")
+        if "workspacePath" in pending:
+            path = _clean_path(pending["workspacePath"], "pending Shader workspace path")
+            if not os.path.isabs(pending["workspacePath"]) or not path:
+                raise ReplayLabRestoreClientError("Bread restore pending Shader workspace path is invalid")
+        elif pending["shown"]:
+            raise ReplayLabRestoreClientError("Bread restore shown pending Shader source has no workspace")
+        identity = (item["resourceId"], item["stage"])
+        if (identity in seen_resources
+                or (knowledge_id in seen_knowledge and seen_knowledge[knowledge_id] != source_sha)
+                or knowledge_id in applied_knowledge):
+            raise ReplayLabRestoreClientError("Bread restore pending Shader identity is duplicated")
+        seen_resources.add(identity)
+        seen_knowledge[knowledge_id] = source_sha
+    for item in items:
+        if "pendingSource" not in item and (
+                (item["resourceId"], item["stage"]) in seen_resources
+                or item.get("knowledgeId") in seen_knowledge):
+            raise ReplayLabRestoreClientError("Bread restore pending Shader source is counted more than once")
+
+
+def _validated_source_only_skips(items):
+    """Count editor-only publications without treating them as replay receipts."""
+    reasons = _SOURCE_ONLY_REASONS
+    applied_resources = {(item["resourceId"], item["stage"]) for item in items
+                         if item["status"] == "applied"}
+    applied_knowledge = {item.get("knowledgeId") for item in items
+                         if item["status"] == "applied"}
+    seen = set()
+    count = 0
+    for item in items:
+        if item["status"] != "skipped" or item.get("reason") not in reasons:
+            continue
+        knowledge_id = _hex_text(item.get("knowledgeId"), JOB_ID_PATTERN,
+                                 "source-only Shader knowledge ID")
+        source_sha = _hex_text(item.get("knowledgeSourceSha256"), SHA256_PATTERN,
+                              "source-only Shader source hash")
+        identity = (item["resourceId"], item["stage"])
+        if (identity in seen or identity in applied_resources or knowledge_id in applied_knowledge
+                or ("workspacePath" in item) != ("workspaceSourceSha256" in item)
+                or ("workspaceSourceSha256" in item and item["workspaceSourceSha256"] != source_sha)):
+            raise ReplayLabRestoreClientError("Bread restore source-only Shader identity is inconsistent")
+        seen.add(identity)
+        count += 1
+    return count
 
 
 def _validate_restore_target_lookup(value):
@@ -708,22 +969,112 @@ def _validate_restore_target_lookup(value):
 
 
 def _validate_restore_editing(value, shader_items, capture_path, capture_session_id):
-    if not isinstance(value, dict) or set(value) != {"attempted", "enabled", "failed", "items"}:
+    if isinstance(value, dict) and value.get("status") == "pending":
+        if (set(value) != {"status", "pending", "attempted", "enabled", "deferred", "failed", "items"}
+                or any(value.get(key) != 0 or type(value.get(key)) is not int
+                       for key in ("attempted", "enabled", "deferred", "failed"))):
+            raise ReplayLabRestoreClientError("pending Shader editor summary is invalid")
+        pending = _bounded_integer(value["pending"], "pending editors", 0, MAX_RESULT_ITEMS)
+        # Reuse the exact workspace/capture validator without granting a live
+        # watcher ID or claiming that an editor has already started.
+        normalized = {"attempted": pending, "enabled": 0, "deferred": 0, "failed": pending, "items": []}
+        if not isinstance(value["items"], list) or len(value["items"]) != pending:
+            raise ReplayLabRestoreClientError("pending Shader editor counts are inconsistent")
+        for item in value["items"]:
+            if (not isinstance(item, dict) or set(item) != {"workspaceId", "workspacePath", "status", "captureBinding"}
+                    or item.get("status") != "pending"):
+                raise ReplayLabRestoreClientError("pending Shader editor item is invalid")
+            binding = item["captureBinding"]
+            if (not isinstance(binding, dict) or set(binding) != {"instanceId", "captureSessionId", "capturePath"}
+                    or not isinstance(binding["instanceId"], str)
+                    or re.fullmatch(r"[A-Za-z0-9_.-]{1,512}", binding["instanceId"]) is None
+                    or binding["instanceId"] in (".", "..")
+                    or binding["captureSessionId"] != capture_session_id
+                    or os.path.normcase(_clean_path(binding["capturePath"], "editor capture path", require_rdc=True))
+                       != os.path.normcase(capture_path)):
+                raise ReplayLabRestoreClientError("pending Shader editor belongs to another capture")
+            normalized["items"].append({"workspaceId": item["workspaceId"], "workspacePath": item["workspacePath"],
+                                        "status": "failed", "error": "editor startup pending"})
+        _validate_restore_editing(normalized, shader_items, capture_path, capture_session_id)
+        return
+    if not isinstance(value, dict):
+        raise ReplayLabRestoreClientError("restored Shader editor summary is invalid")
+    diagnostic_keys = {"initializationMs", "startupReuse", "ready"} & set(value)
+    if "initializationMs" in value and (type(value["initializationMs"]) not in (int, float)
+            or not 0 <= value["initializationMs"] <= 86400000):
+        raise ReplayLabRestoreClientError("restored Shader editor timing values are invalid")
+    if "startupReuse" in value:
+        reuse = value["startupReuse"]
+        if (not isinstance(reuse, dict) or len(reuse) > 16
+                or any(not isinstance(key, str) or re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", key) is None
+                       or type(count) is not int or not 0 <= count <= 1000000000
+                       for key, count in reuse.items())):
+            raise ReplayLabRestoreClientError("restored Shader editor timing values are invalid")
+    if (set(value) - diagnostic_keys not in (
+            {"attempted", "enabled", "failed", "items"},
+            {"attempted", "enabled", "deferred", "failed", "items"})):
         raise ReplayLabRestoreClientError("restored Shader editor summary is invalid")
     counts = {name: _bounded_integer(value[name], "editor " + name, 0, MAX_RESULT_ITEMS)
               for name in ("attempted", "enabled", "failed")}
+    counts["deferred"] = _bounded_integer(value.get("deferred", 0), "editor deferred", 0, MAX_RESULT_ITEMS)
+    counts["ready"] = _bounded_integer(value.get("ready", 0), "editor ready", 0, MAX_RESULT_ITEMS)
     applied = {item["workspaceId"]: item for item in shader_items if item.get("status") == "applied"}
     items = value["items"]
     if (not isinstance(items, list) or len(items) != counts["attempted"]
             or counts["attempted"] != len(applied)
-            or counts["attempted"] != counts["enabled"] + counts["failed"]):
+            or counts["attempted"] != counts["enabled"] + counts["deferred"] + counts["ready"] + counts["failed"]):
         raise ReplayLabRestoreClientError("restored Shader editor counts are inconsistent")
-    seen, enabled = set(), 0
+    seen, enabled, deferred, ready = set(), 0, 0, 0
     for item in items:
-        if not isinstance(item, dict) or item.get("status") not in ("enabled", "failed"):
+        if not isinstance(item, dict) or item.get("status") not in ("enabled", "deferred", "ready", "failed"):
             raise ReplayLabRestoreClientError("restored Shader editor item is invalid")
         expected = {"workspaceId", "workspacePath", "status"}
-        expected.update({"liveEditId", "watchId", "captureBinding"} if item["status"] == "enabled" else {"error"})
+        if item["status"] == "enabled":
+            expected.update({"liveEditId", "watchId", "captureBinding"})
+        elif item["status"] == "ready":
+            expected.update({"editingMode", "readOnly", "backgroundAutoApplyAuthorized", "captureBinding"})
+        elif item["status"] == "deferred":
+            expected.update({"reason", "editingMode", "readOnly",
+                             "backgroundAutoApplyAuthorized", "captureBinding"})
+            if item.get("reason") != "local-edit-preserved":
+                expected.add("organizationId")
+        else:
+            expected.add("error")
+        if "displayAliases" in item:
+            expected.add("displayAliases")
+            display = item["displayAliases"]
+            if (not isinstance(display, dict) or not set(display).issubset(
+                    {"status", "writtenRows", "writtenBlocks", "skipped", "diagnostic", "reason", "metadataCacheHit"})
+                    or display.get("status") not in {"not-required", "unavailable", "current", "restored", "partial", "failed"}
+                    or any(type(display.get(key, 0)) is not int or not 0 <= display.get(key, 0) <= 65536
+                           for key in ("writtenRows", "writtenBlocks"))
+                    or any(not isinstance(display.get(key, ""), str) or len(display.get(key, "")) > 400
+                           for key in ("diagnostic", "reason"))
+                    or not isinstance(display.get("skipped", []), list)
+                    or len(display.get("skipped", [])) > 64
+                    or ("metadataCacheHit" in display and type(display["metadataCacheHit"]) is not bool)
+                    or len(json.dumps(display, ensure_ascii=False)) > 65536):
+                raise ReplayLabRestoreClientError("restored CBuffer display aliases are invalid")
+        if "startTiming" in item:
+            expected.add("startTiming")
+            timing = item["startTiming"]
+            if not isinstance(timing, dict) or set(timing) != {"totalMs", "phasesMs", "failedPhase"}:
+                raise ReplayLabRestoreClientError("restored Shader editor timing is invalid")
+            total = timing["totalMs"]
+            phases = timing["phasesMs"]
+            if (type(total) not in (int, float) or not 0 <= total <= 86400000
+                    or not isinstance(phases, dict) or len(phases) > 16
+                    or any(not isinstance(name, str) or re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", name) is None
+                           or type(elapsed) not in (int, float) or not 0 <= elapsed <= total + 1
+                           for name, elapsed in phases.items())
+                    or not isinstance(timing["failedPhase"], str)
+                    or timing["failedPhase"] and timing["failedPhase"] not in phases):
+                raise ReplayLabRestoreClientError("restored Shader editor timing values are invalid")
+        if "displayAliasElapsedMs" in item:
+            expected.add("displayAliasElapsedMs")
+            elapsed = item["displayAliasElapsedMs"]
+            if type(elapsed) not in (int, float) or not 0 <= elapsed <= 86400000:
+                raise ReplayLabRestoreClientError("restored Shader editor timing values are invalid")
         if set(item) != expected:
             raise ReplayLabRestoreClientError("restored Shader editor fields are invalid")
         workspace_id = _hex_text(item["workspaceId"], JOB_ID_PATTERN, "editor workspace ID")
@@ -736,9 +1087,27 @@ def _validate_restore_editing(value, shader_items, capture_path, capture_session
         if item["status"] == "failed":
             _bounded_diagnostic(item["error"], "editor error")
             continue
-        enabled += 1
-        for name in ("liveEditId", "watchId"):
-            _hex_text(item[name], JOB_ID_PATTERN, "editor " + name)
+        if item["status"] == "ready":
+            ready += 1
+            if (item["editingMode"] != "on-demand" or item["readOnly"] is not False
+                    or item["backgroundAutoApplyAuthorized"] is not False or "startTiming" in item):
+                raise ReplayLabRestoreClientError("prepared Shader editing cannot authorize background monitoring")
+        elif item["status"] == "deferred":
+            deferred += 1
+            local_edit = item["reason"] == "local-edit-preserved"
+            if not local_edit:
+                _hex_text(item["organizationId"], JOB_ID_PATTERN, "editor organization ID")
+            if (item["reason"] not in {"organization-draft-open", "local-edit-preserved"}
+                    or item["editingMode"] != "source-only"
+                    or item["readOnly"] is not (False if local_edit else True)
+                    or (local_edit and "preservedLocalSource" not in applied[workspace_id])
+                    or item["backgroundAutoApplyAuthorized"] is not False
+                    or "startTiming" in item):
+                raise ReplayLabRestoreClientError("deferred Shader editing cannot authorize monitoring or source writes")
+        else:
+            enabled += 1
+            for name in ("liveEditId", "watchId"):
+                _hex_text(item[name], JOB_ID_PATTERN, "editor " + name)
         binding = item["captureBinding"]
         if not isinstance(binding, dict) or set(binding) != {"instanceId", "captureSessionId", "capturePath"}:
             raise ReplayLabRestoreClientError("restored Shader editor capture binding is invalid")
@@ -748,7 +1117,7 @@ def _validate_restore_editing(value, shader_items, capture_path, capture_session
                 or os.path.normcase(_clean_path(binding["capturePath"], "editor capture path", require_rdc=True))
                 != os.path.normcase(capture_path)):
             raise ReplayLabRestoreClientError("restored Shader editor belongs to another capture")
-    if enabled != counts["enabled"]:
+    if enabled != counts["enabled"] or deferred != counts["deferred"] or ready != counts["ready"]:
         raise ReplayLabRestoreClientError("restored Shader editor states contradict counts")
 
 
@@ -756,13 +1125,13 @@ def _validate_material_items(value):
     items = value.get("items")
     if not isinstance(items, list) or len(items) > MAX_RESULT_ITEMS:
         raise ReplayLabRestoreClientError(
-            "ReplayLab restore material summary is malformed")
+            "Bread restore material summary is malformed")
     counts = {"restored": 0, "skipped": 0, "failed": 0}
     restored_sessions = []
     for item in items:
         if not isinstance(item, dict):
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore material item is malformed")
+                "Bread restore material item is malformed")
         status = item.get("status")
         source = item.get("source")
         if status == "restored":
@@ -773,11 +1142,11 @@ def _validate_material_items(value):
             if source is not None:
                 if source != "reuse-plan":
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab restore material item is malformed")
+                        "Bread restore material item is malformed")
                 expected.add("source")
             if set(item) != expected:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab restore material item is malformed")
+                    "Bread restore material item is malformed")
             session_id = _hex_text(
                 item["sessionId"], JOB_ID_PATTERN, "material session ID")
             restored_sessions.append(session_id)
@@ -797,12 +1166,12 @@ def _validate_material_items(value):
             updates = item["updates"]
             if not isinstance(updates, list) or len(updates) != parameter_count:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab restore material item is malformed")
+                    "Bread restore material item is malformed")
             for update in updates:
                 if (not isinstance(update, dict) or
                         set(update) != {"parameterId", "liveParameterId", "path"}):
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab restore material item is malformed")
+                        "Bread restore material item is malformed")
                 _hex_text(
                     update["parameterId"], JOB_ID_PATTERN,
                     "material parameter ID")
@@ -824,10 +1193,10 @@ def _validate_material_items(value):
                 }
             else:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab restore material item is malformed")
+                    "Bread restore material item is malformed")
             if set(item) != expected:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab restore material item is malformed")
+                    "Bread restore material item is malformed")
             _hex_text(
                 item["knowledgeId"], JOB_ID_PATTERN, "material knowledge ID")
             if "eventId" in item:
@@ -844,7 +1213,7 @@ def _validate_material_items(value):
             if set(item) != {
                     "status", "source", "resourceId", "stage", "reason"}:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab restore material item is malformed")
+                    "Bread restore material item is malformed")
             _bounded_integer(
                 item["resourceId"], "material resource ID", 1,
                 0x7FFFFFFFFFFFFFFF)
@@ -852,7 +1221,7 @@ def _validate_material_items(value):
             _bounded_diagnostic(item["reason"], "material reason")
         else:
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore material item is malformed")
+                "Bread restore material item is malformed")
         counts[status] += 1
     return items, counts, restored_sessions
 
@@ -870,7 +1239,7 @@ def _canonical_json_sha256(value):
         ).encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError):
         raise ReplayLabRestoreClientError(
-            "ReplayLab restore desired head is malformed")
+            "Bread restore desired head is malformed")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -886,7 +1255,7 @@ def _validate_restore_desired_head(value):
     }
     if not isinstance(value, dict) or set(value) != fields:
         raise ReplayLabRestoreClientError(
-            "ReplayLab restore desired head is malformed")
+            "Bread restore desired head is malformed")
     try:
         _bounded_integer(
             value["activeKnowledgeRevision"],
@@ -898,10 +1267,10 @@ def _validate_restore_desired_head(value):
             _hex_text(value[field], SHA256_PATTERN, "restore " + field)
     except ReplayLabRestoreClientError:
         raise ReplayLabRestoreClientError(
-            "ReplayLab restore desired head is malformed")
+            "Bread restore desired head is malformed")
     if value.get("complete") is not True:
         raise ReplayLabRestoreClientError(
-            "ReplayLab restore desired head is malformed")
+            "Bread restore desired head is malformed")
     semantic = {
         "knowledgeContentSha256": value["knowledgeContentSha256"],
         "knowledgeIdsSha256": value["knowledgeIdsSha256"],
@@ -911,7 +1280,7 @@ def _validate_restore_desired_head(value):
     }
     if value["headSha256"] != _canonical_json_sha256(semantic):
         raise ReplayLabRestoreClientError(
-            "ReplayLab restore desired head is malformed")
+            "Bread restore desired head is malformed")
     return value
 
 
@@ -921,13 +1290,13 @@ def _validate_inventory_cache_summary(value):
             not isinstance(value.get("hit"), bool) or
             not isinstance(value.get("written"), bool)):
         raise ReplayLabRestoreClientError(
-            "ReplayLab restore inventory cache summary is malformed")
+            "Bread restore inventory cache summary is malformed")
     try:
         _bounded_diagnostic(value.get("reason"),
                             "restore inventory cache reason", 4096)
     except ReplayLabRestoreClientError:
         raise ReplayLabRestoreClientError(
-            "ReplayLab restore inventory cache summary is malformed")
+            "Bread restore inventory cache summary is malformed")
     return value
 
 
@@ -937,9 +1306,10 @@ def _validate_realized_receipt_summary(value):
         "adoptedCurrentSession", "mutationsCreated",
         "idempotentApplyResponses", "persisted",
     }
-    if not isinstance(value, dict) or set(value) != fields:
+    if (not isinstance(value, dict) or not fields <= set(value) or
+            not set(value) <= fields | {"reusedValidation", "manualEdit"}):
         raise ReplayLabRestoreClientError(
-            "ReplayLab restore realized receipt summary is malformed")
+            "Bread restore realized receipt summary is malformed")
     try:
         counts = {
             field: _bounded_integer(
@@ -947,17 +1317,24 @@ def _validate_realized_receipt_summary(value):
                 0, MAX_RESULT_ITEMS)
             for field in fields
         }
+        counts["reusedValidation"] = _bounded_integer(
+            value.get("reusedValidation", 0), "restore reused validation receipts",
+            0, MAX_RESULT_ITEMS)
+        counts["manualEdit"] = _bounded_integer(
+            value.get("manualEdit", 0), "restore manual Shader observations",
+            0, MAX_RESULT_ITEMS)
     except ReplayLabRestoreClientError:
         raise ReplayLabRestoreClientError(
-            "ReplayLab restore realized receipt summary is malformed")
+            "Bread restore realized receipt summary is malformed")
     if (counts["validatedForRouting"] > counts["loadedFromIndex"] or
             counts["produced"] !=
             counts["adoptedCurrentSession"] +
             counts["mutationsCreated"] +
             counts["idempotentApplyResponses"] or
-            counts["persisted"] > counts["produced"]):
+            counts["persisted"] > counts["produced"] or
+            counts["reusedValidation"] + counts["manualEdit"] > counts["produced"]):
         raise ReplayLabRestoreClientError(
-            "ReplayLab restore realized receipt summary is malformed")
+            "Bread restore realized receipt summary is malformed")
     return counts
 
 
@@ -1004,7 +1381,7 @@ class ReplayLabRestoreHostClient(object):
     def _check_cancelled(self):
         if self._cancel_requested():
             raise ReplayLabRestoreClientError(
-                "ReplayLab project restore was cancelled during shutdown")
+                "Bread project restore was cancelled during shutdown")
 
     def _wait(self, seconds):
         self._check_cancelled()
@@ -1026,29 +1403,29 @@ class ReplayLabRestoreHostClient(object):
                 state = _strict_json_bytes(
                     _read_bounded(
                         state_path, MAX_STATE_BYTES,
-                        "ReplayLab internal Host state"),
-                    "ReplayLab internal Host state")
+                        "Bread internal Host state"),
+                    "Bread internal Host state")
                 if (state.get("schema") != "replaylab-internal-host/v1" or
                         state.get("service") != "ReplayLabInternal" or
                         state.get("host") != "127.0.0.1"):
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab internal Host state has an invalid identity")
+                        "Bread internal Host state has an invalid identity")
                 try:
                     port = _bounded_integer(
-                        state.get("port"), "ReplayLab Host port", 1024, 65535)
+                        state.get("port"), "Bread Host port", 1024, 65535)
                     heartbeat = _bounded_integer(
                         state.get("heartbeatUnixMs"),
-                        "ReplayLab Host heartbeat", 1, 0x7FFFFFFFFFFFFFFF)
+                        "Bread Host heartbeat", 1, 0x7FFFFFFFFFFFFFFF)
                     pid = _bounded_integer(
-                        state.get("pid"), "ReplayLab Host process ID", 1,
+                        state.get("pid"), "Bread Host process ID", 1,
                         0x7FFFFFFF)
                     version = _bounded_text(
-                        state.get("version"), "ReplayLab Host version", 128)
+                        state.get("version"), "Bread Host version", 128)
                     endpoint = _bounded_text(
-                        state.get("endpoint"), "ReplayLab Host endpoint", 256)
+                        state.get("endpoint"), "Bread Host endpoint", 256)
                 except ReplayLabRestoreClientError:
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab Host state is invalid")
+                        "Bread Host state is invalid")
                 heartbeat_age = int(time.time() * 1000) - heartbeat
                 if (heartbeat_age < -2000 or
                         heartbeat_age > MAX_HOST_HEARTBEAT_AGE_MS or
@@ -1056,38 +1433,48 @@ class ReplayLabRestoreHostClient(object):
                             "http://127.0.0.1:%d/replaylab/internal" % port) or
                         not _process_alive(pid)):
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab internal Host state is stale")
+                        "Bread internal Host state is stale")
                 protocol_version = state.get("hostStateProtocolVersion")
-                if (version != EXPECTED_HOST_VERSION or
+                if (not _host_runtime_version_compatible(
+                        version, EXPECTED_HOST_VERSION) or
                         isinstance(protocol_version, bool) or
                         not isinstance(protocol_version, int) or
-                        protocol_version != INTERNAL_HOST_STATE_PROTOCOL_VERSION):
+                        protocol_version != INTERNAL_HOST_STATE_PROTOCOL_VERSION or
+                        not _has_required_capabilities(state.get("capabilities")) or
+                        not _has_required_capability_versions(
+                            state.get("capabilitySchema"),
+                            state.get("capabilityVersions"))):
                     raise ReplayLabRestoreHostIncompatible(
-                        "ReplayLab internal Host runtime is incompatible "
-                        "(expected %s protocol %d, received %s protocol %s)" %
+                        "Bread internal Host runtime is incompatible "
+                        "(expected %s protocol %d and %s capability versions, "
+                        "received %s protocol %s capabilities %s)" %
                         (EXPECTED_HOST_VERSION,
                          INTERNAL_HOST_STATE_PROTOCOL_VERSION,
-                         version, str(protocol_version)))
+                         INTERNAL_HOST_CAPABILITY_SCHEMA,
+                         version, str(protocol_version),
+                         _capability_contract_description(
+                             state.get("capabilitySchema"),
+                             state.get("capabilityVersions"))))
                 try:
                     host_instance_id = _hex_text(
                         state.get("hostInstanceId"), JOB_ID_PATTERN,
-                        "ReplayLab Host instance ID")
+                        "Bread Host instance ID")
                 except ReplayLabRestoreClientError:
                     raise ReplayLabRestoreHostIncompatible(
-                        "ReplayLab internal Host runtime does not publish a valid "
+                        "Bread internal Host runtime does not publish a valid "
                         "instance identity")
                 published_token = state.get("tokenFile")
                 if (not isinstance(published_token, str) or
                         os.path.normcase(os.path.abspath(published_token)) !=
                         os.path.normcase(os.path.abspath(token_path))):
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab internal Host token path is inconsistent")
+                        "Bread internal Host token path is inconsistent")
                 token = _read_bounded(
                     token_path, MAX_TOKEN_BYTES,
-                    "ReplayLab internal Host token").decode("ascii").strip()
+                    "Bread internal Host token").decode("ascii").strip()
                 if TOKEN_PATTERN.fullmatch(token) is None:
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab internal Host token is invalid")
+                        "Bread internal Host token is invalid")
                 return port, token, pid, version, host_instance_id
             except ReplayLabRestoreHostIncompatible:
                 # A fresh, live Host with an older or different contract cannot
@@ -1098,7 +1485,7 @@ class ReplayLabRestoreHostClient(object):
                 self._check_cancelled()
                 self._wait(min(self.poll_seconds, 0.1))
         raise ReplayLabRestoreClientError(
-            "ReplayLab internal Host did not become ready: %s" %
+            "Bread internal Host did not become ready: %s" %
             str(last_error or "internal Host state is unavailable"))
 
     def _verify_health(self, port, pid, version, host_instance_id):
@@ -1111,31 +1498,40 @@ class ReplayLabRestoreHostClient(object):
             raise
         except Exception as exc:
             raise ReplayLabRestoreClientError(
-                "ReplayLab internal Host health check failed: %s" % str(exc))
+                "Bread internal Host health check failed: %s" % str(exc))
         if not response_body or len(response_body) > MAX_STATE_BYTES:
             raise ReplayLabRestoreClientError(
-                "ReplayLab internal Host health response is invalid")
+                "Bread internal Host health response is invalid")
         value = _strict_json_bytes(
-            response_body, "ReplayLab internal Host health check")
+            response_body, "Bread internal Host health check")
         response_pid = value.get("pid")
         if (isinstance(status, bool) or not isinstance(status, int) or
                 status != 200 or
                 value.get("service") != "ReplayLabInternal" or
                 value.get("transport") != "internal-http" or
                 value.get("hostInstanceId") != host_instance_id or
-                not _has_required_capabilities(value.get("capabilities")) or
                 isinstance(response_pid, bool) or
                 not isinstance(response_pid, int) or response_pid != pid):
             raise ReplayLabRestoreClientError(
-                "ReplayLab internal Host health identity is invalid")
+                "Bread internal Host health identity is invalid")
         protocol_version = value.get("hostStateProtocolVersion")
-        if (value.get("version") != EXPECTED_HOST_VERSION or
-                version != EXPECTED_HOST_VERSION or
+        if (not _host_runtime_version_compatible(
+                    value.get("version"), EXPECTED_HOST_VERSION) or
+                not _host_runtime_version_compatible(
+                    version, EXPECTED_HOST_VERSION) or
+                value.get("version") != version or
                 isinstance(protocol_version, bool) or
                 not isinstance(protocol_version, int) or
-                protocol_version != INTERNAL_HOST_STATE_PROTOCOL_VERSION):
+                protocol_version != INTERNAL_HOST_STATE_PROTOCOL_VERSION or
+                not _has_required_capabilities(value.get("capabilities")) or
+                not _has_required_capability_versions(
+                    value.get("capabilitySchema"),
+                    value.get("capabilityVersions"))):
             raise ReplayLabRestoreHostIncompatible(
-                "ReplayLab internal Host health contract is incompatible")
+                "Bread internal Host health schema/capability contract is incompatible "
+                "(received %s)" % _capability_contract_description(
+                    value.get("capabilitySchema"),
+                    value.get("capabilityVersions")))
 
     def _request(self, port, token, method, path, payload=None,
                  maximum_request_bytes=MAX_STATE_BYTES,
@@ -1149,7 +1545,7 @@ class ReplayLabRestoreHostClient(object):
                 separators=(",", ":")).encode("utf-8")
             if len(body) > maximum_request_bytes:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab internal request is oversized")
+                    "Bread internal request is oversized")
         try:
             status, response_body = self.transport(
                 int(port), token, method, path, body,
@@ -1161,16 +1557,16 @@ class ReplayLabRestoreHostClient(object):
             raise
         except Exception as exc:
             raise ReplayLabRestoreClientError(
-                "ReplayLab internal Host connection failed: %s" % str(exc))
+                "Bread internal Host connection failed: %s" % str(exc))
         if not response_body or len(response_body) > MAX_RESPONSE_BYTES:
             raise ReplayLabRestoreClientError(
-                "ReplayLab internal Host returned an invalid response size")
+                "Bread internal Host returned an invalid response size")
         if not cancellation_cleanup:
             self._check_cancelled()
-        value = _strict_json_bytes(response_body, "ReplayLab internal Host")
+        value = _strict_json_bytes(response_body, "Bread internal Host")
         if isinstance(status, bool) or not isinstance(status, int):
             raise ReplayLabRestoreClientError(
-                "ReplayLab internal Host returned an invalid HTTP status")
+                "Bread internal Host returned an invalid HTTP status")
         if method == "POST":
             allowed_statuses = (200, 202)
         elif method == "DELETE":
@@ -1187,7 +1583,7 @@ class ReplayLabRestoreHostClient(object):
             else:
                 detail = str(error or "")[:4096]
             raise ReplayLabRestoreClientError(
-                "ReplayLab internal Host rejected the request (HTTP %s): %s" %
+                "Bread internal Host rejected the request (HTTP %s): %s" %
                 (status, detail))
         return value
 
@@ -1209,7 +1605,7 @@ class ReplayLabRestoreHostClient(object):
         if (not isinstance(value, dict) or
                 value.get("schema") != RESTORE_JOB_SCHEMA):
             raise ReplayLabRestoreClientError(
-                "ReplayLab host returned an invalid restore job")
+                "Bread host returned an invalid restore job")
         try:
             _bounded_integer(
                 value.get("schemaVersion"), "restore job schema version", 1, 1)
@@ -1224,12 +1620,12 @@ class ReplayLabRestoreHostClient(object):
                 0x7FFFFFFF)
         except ReplayLabRestoreClientError:
             raise ReplayLabRestoreClientError(
-                "ReplayLab host returned an invalid restore job")
+                "Bread host returned an invalid restore job")
         if (status not in ("queued", "running", "completed", "failed") or
                 (expected_job_id is not None and job_id != expected_job_id) or
                 latest_sequence < after):
             raise ReplayLabRestoreClientError(
-                "ReplayLab host returned an invalid restore job")
+                "Bread host returned an invalid restore job")
         base_fields = {
             "schema", "schemaVersion", "jobId", "status", "latestSequence",
             "progress", "progressTruncated",
@@ -1239,32 +1635,32 @@ class ReplayLabRestoreHostClient(object):
             expected_fields.add("result")
             if not isinstance(value.get("result"), dict):
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab host returned an invalid restore job")
+                    "Bread host returned an invalid restore job")
         elif status == "failed":
             expected_fields.add("error")
             try:
                 _bounded_diagnostic(value.get("error"), "restore job error")
             except ReplayLabRestoreClientError:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab host returned an invalid restore job")
+                    "Bread host returned an invalid restore job")
         if set(value) != expected_fields:
             raise ReplayLabRestoreClientError(
-                "ReplayLab host returned an invalid restore job")
+                "Bread host returned an invalid restore job")
         progress = value.get("progress", [])
         if not isinstance(progress, list) or len(progress) > MAX_PROGRESS_EVENTS:
             raise ReplayLabRestoreClientError(
-                "ReplayLab host returned invalid restore progress")
+                "Bread host returned invalid restore progress")
         truncated = value.get("progressTruncated")
         if not isinstance(truncated, bool):
             raise ReplayLabRestoreClientError(
-                "ReplayLab host returned invalid restore progress")
+                "Bread host returned invalid restore progress")
         normalised = []
         previous = after
         for raw_event in progress:
             event = _normalise_progress(raw_event, previous)
             if event["sequence"] > latest_sequence:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab host returned invalid restore progress")
+                    "Bread host returned invalid restore progress")
             normalised.append(event)
             previous = event["sequence"]
         if normalised:
@@ -1272,10 +1668,10 @@ class ReplayLabRestoreHostClient(object):
             if ((not truncated and first_sequence != after + 1) or
                     (truncated and first_sequence <= after + 1)):
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab host returned invalid restore progress")
+                    "Bread host returned invalid restore progress")
         elif truncated or latest_sequence > after:
             raise ReplayLabRestoreClientError(
-                "ReplayLab host returned invalid restore progress")
+                "Bread host returned invalid restore progress")
         return job_id, status, normalised, latest_sequence
 
     @staticmethod
@@ -1284,7 +1680,7 @@ class ReplayLabRestoreHostClient(object):
                 value.get("schema") != "replaylab-project-restore/v1" or
                 not isinstance(value.get("completed"), bool)):
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
         try:
             _bounded_integer(
                 value.get("schemaVersion"), "restore result schema version", 1, 1)
@@ -1293,14 +1689,14 @@ class ReplayLabRestoreHostClient(object):
                 "restore operation ID")
         except ReplayLabRestoreClientError:
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
         capture = value.get("capture")
         project = value.get("project")
         if (not isinstance(capture, dict) or not isinstance(project, dict) or
                 set(capture) != {"path", "sessionId", "captureId"} or
                 set(project) != {"root", "workspaceId", "replayProjectId"}):
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
         result_capture_path = _clean_path(
             capture.get("path"), "result capture path", require_rdc=True)
         result_project_root = _clean_path(
@@ -1311,19 +1707,31 @@ class ReplayLabRestoreHostClient(object):
                 os.path.normcase(project_root) or
                 capture.get("sessionId") != capture_session_id):
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore result identity does not match the request")
+                "Bread restore result identity does not match the request")
         base_fields = {
             "schema", "schemaVersion", "operationId", "completed", "capture",
             "project", "restoreMode", "desiredHead", "cache",
             "inventoryCache", "shaders", "materials", "index",
             "realizedReceipts", "warnings",
         }
+        if "performance" in value:
+            performance = value["performance"]
+            if (not isinstance(performance,dict) or set(performance) != {"elapsedMs","phasesMs","digestCache","filePreparationWorkers","replayWorkers"}
+                    or type(performance.get("elapsedMs")) not in (int,float) or not 0 <= performance["elapsedMs"] <= 86400000
+                    or not isinstance(performance.get("phasesMs"),dict) or len(performance["phasesMs"])>64
+                    or any(not isinstance(k,str) or len(k)>128 or type(v) not in (int,float) or not 0 <= v <= 86400000 for k,v in performance["phasesMs"].items())
+                    or not isinstance(performance.get("digestCache"),dict) or set(performance["digestCache"]) != {"memoryHits","diskHits","hashReads","bytesHashed"}
+                    or any(type(v) is not int or v<0 for v in performance["digestCache"].values())
+                    or performance["filePreparationWorkers"]!=2 or performance["replayWorkers"]!=1):
+                raise ReplayLabRestoreClientError("restore performance observation is malformed")
+            base_fields.add("performance")
         restore_mode = value.get("restoreMode")
         if restore_mode not in (
                 "unresolved", "exact-rdc-head", "inventory-sidecar",
-                "full-inventory", "project-target-inventory", "no-project-knowledge"):
+                "full-inventory", "project-target-inventory", "no-project-knowledge",
+                "verified-rdc-restore", "verified-rdc-subset"):
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
         target_fields = {"inventoryScope", "fullFrame", "targetLookup"}
         if target_fields & set(value) or (value["completed"] and restore_mode == "project-target-inventory"):
             if restore_mode != "project-target-inventory":
@@ -1339,11 +1747,15 @@ class ReplayLabRestoreHostClient(object):
                 value.get("desiredHead"))
             inventory_cache = _validate_inventory_cache_summary(
                 value.get("inventoryCache"))
+            verified_cache = None
+            if "verifiedRdcCache" in value:
+                verified_cache = _validate_inventory_cache_summary(value["verifiedRdcCache"])
+                base_fields.add("verifiedRdcCache")
             receipt_counts = _validate_realized_receipt_summary(
                 value.get("realizedReceipts"))
         except ReplayLabRestoreClientError:
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
         if value["completed"] is False:
             if value.get("outcome") == "action-required":
                 try:
@@ -1352,11 +1764,11 @@ class ReplayLabRestoreHostClient(object):
                     )
                 except ReplayLabRestoreClientError:
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab restore action-required result is invalid"
+                        "Bread restore action-required result is invalid"
                     )
                 if set(value) != base_fields | {"outcome", "reasonId"}:
                     raise ReplayLabRestoreClientError(
-                        "ReplayLab restore completed with an invalid result"
+                        "Bread restore completed with an invalid result"
                     )
                 return value
             try:
@@ -1364,17 +1776,17 @@ class ReplayLabRestoreHostClient(object):
                 _bounded_text(value.get("errorType"), "restore error type", 256)
             except ReplayLabRestoreClientError:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab restore failed without a bounded diagnostic")
+                    "Bread restore failed without a bounded diagnostic")
             if set(value) != base_fields | {"error", "errorType"}:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab restore completed with an invalid result")
+                    "Bread restore completed with an invalid result")
             return value
         if set(value) != base_fields:
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
         if restore_mode == "unresolved":
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
 
         try:
             if restore_mode == "no-project-knowledge":
@@ -1393,7 +1805,7 @@ class ReplayLabRestoreHostClient(object):
                 "restore replay project ID")
         except ReplayLabRestoreClientError:
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
 
         cache = value.get("cache")
         shaders = value.get("shaders")
@@ -1403,7 +1815,9 @@ class ReplayLabRestoreHostClient(object):
         if (not isinstance(cache, dict) or set(cache) != {"hit", "reason"} or
                 not isinstance(cache.get("hit"), bool) or
                 not isinstance(shaders, dict) or
-                set(shaders) != {"attempted", "applied", "skipped", "failed", "items"} or
+                not {"attempted", "applied", "skipped", "failed", "items"} <= set(shaders) or
+                not set(shaders) <= {"attempted", "applied", "skipped", "failed", "items",
+                                     "supersededLocalEdits"} or
                 not isinstance(materials, dict) or
                 set(materials) != {"attempted", "restored", "skipped", "failed",
                                     "sessionIds", "items"} or
@@ -1411,7 +1825,7 @@ class ReplayLabRestoreHostClient(object):
                 set(index) != {"read", "present", "written", "warning"} or
                 not isinstance(warnings, list) or len(warnings) > MAX_RESULT_ITEMS):
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
         try:
             _bounded_diagnostic(cache.get("reason"), "restore cache reason")
             shader_counts = {
@@ -1430,9 +1844,54 @@ class ReplayLabRestoreHostClient(object):
                 _bounded_diagnostic(warning, "restore warning")
         except ReplayLabRestoreClientError:
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
 
         shader_items, shader_statuses = _validate_shader_items(shaders)
+        superseded_count = _bounded_integer(
+            shaders.get("supersededLocalEdits", 0), "Shader preserved-source backup count",
+            0, MAX_PROGRESS_COUNT)
+        if superseded_count != shader_statuses.get("supersededLocalEdits", 0):
+            raise ReplayLabRestoreClientError("Bread restore Shader backup count is inconsistent")
+        verified_hit = restore_mode == "verified-rdc-restore"
+        verified_subset = restore_mode == "verified-rdc-subset"
+        verified_written = verified_cache is not None and verified_cache["written"]
+        pending_source_count = (_validated_source_only_skips(shader_items)
+                                if verified_hit or verified_written else 0)
+        if (receipt_counts["reusedValidation"] != shader_statuses["reusedValidation"] or
+                receipt_counts["manualEdit"] != shader_statuses["manualEdit"] or
+                (receipt_counts["manualEdit"] and (verified_hit or index["written"] or
+                    receipt_counts["persisted"] > shader_counts["applied"] - receipt_counts["manualEdit"])) or
+                (verified_hit and (
+                    verified_cache != {"hit": True, "written": False,
+                                       "reason": "same-rdc-verified-content"} or
+                    cache != {"hit": True, "reason": "same-rdc-verified-content"} or
+                    shader_counts["applied"] <= 0 or
+                    shader_counts["applied"] != shader_counts["attempted"] or
+                    receipt_counts["reusedValidation"] != shader_counts["applied"] or
+                    any(item["source"] != "verified-rdc-restore" for item in shader_items
+                        if item["status"] == "applied") or
+                    shader_counts["skipped"] != pending_source_count or shader_counts["failed"] or
+                    any(material_counts.values()) or
+                    receipt_counts["loadedFromIndex"] or receipt_counts["persisted"] or
+                    inventory_cache["hit"] or inventory_cache["written"] or
+                    index != {"read": False, "present": False,
+                              "written": False, "warning": None})) or
+                (verified_subset and (
+                    verified_cache != {"hit": True, "written": False, "reason": "same-rdc-verified-subset"}
+                    or cache != {"hit": True, "reason": "same-rdc-verified-subset"}
+                    or not any(item.get("source") == "verified-rdc-restore" for item in shader_items)
+                    or verified_written or index["written"] or receipt_counts["persisted"])) or
+                (not verified_hit and not verified_subset and verified_cache is not None and verified_cache["hit"]) or
+                (verified_written and (
+                    verified_cache["reason"] != ("validated-content-subset-snapshot"
+                        if receipt_counts["manualEdit"] else "validated-content-snapshot") or
+                    index["written"] or index["warning"] is not None or
+                    shader_counts["applied"] <= 0 or shader_counts["skipped"] != pending_source_count or
+                    shader_counts["failed"] or material_counts["attempted"] or
+                    receipt_counts["persisted"] != shader_counts["applied"] - receipt_counts["manualEdit"] or
+                    receipt_counts["persisted"] <= 0))):
+            raise ReplayLabRestoreClientError(
+                "Bread restore verified RDC cache evidence is inconsistent")
         if "editing" in value:
             _validate_restore_editing(value["editing"], shader_items, capture_path, capture_session_id)
         if restore_mode == "project-target-inventory" and inventory_cache["written"]:
@@ -1443,7 +1902,7 @@ class ReplayLabRestoreHostClient(object):
         if (not isinstance(session_ids, list) or
                 len(session_ids) != material_counts["restored"]):
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
         try:
             clean_sessions = [
                 _hex_text(item, JOB_ID_PATTERN, "material session ID")
@@ -1451,7 +1910,7 @@ class ReplayLabRestoreHostClient(object):
             ]
         except ReplayLabRestoreClientError:
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
         if (shader_counts["attempted"] !=
                 shader_counts["applied"] + shader_counts["failed"] or
                 len(shader_items) !=
@@ -1466,7 +1925,7 @@ class ReplayLabRestoreHostClient(object):
                     for field in ("restored", "skipped", "failed")) or
                 clean_sessions != restored_sessions):
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
 
         if (not all(isinstance(index.get(field), bool)
                     for field in ("read", "present", "written")) or
@@ -1483,9 +1942,9 @@ class ReplayLabRestoreHostClient(object):
                  (desired_head is None or
                   receipt_counts["persisted"] !=
                   receipt_counts["produced"])) or
-                (not index["written"] and
+                (not index["written"] and not verified_written and
                  receipt_counts["persisted"] != 0) or
-                (cache["hit"] and
+                (cache["hit"] and not verified_hit and not verified_subset and
                  (cache["reason"] != "exact-desired-project-head" or
                   restore_mode != "exact-rdc-head" or
                   desired_head is None or
@@ -1495,7 +1954,7 @@ class ReplayLabRestoreHostClient(object):
                   shader_counts["attempted"] <= 0 or
                   any(item.get("source") != "rdc-index"
                       for item in shader_items))) or
-                (not cache["hit"] and restore_mode == "exact-rdc-head") or
+                (not cache["hit"] and restore_mode in ("exact-rdc-head", "verified-rdc-restore")) or
                 (inventory_cache["hit"] and
                   restore_mode != "inventory-sidecar") or
                 (restore_mode == "inventory-sidecar" and
@@ -1523,14 +1982,14 @@ class ReplayLabRestoreHostClient(object):
                         "warning": None,
                     }))):
             raise ReplayLabRestoreClientError(
-                "ReplayLab restore completed with an invalid result")
+                "Bread restore completed with an invalid result")
         if index.get("warning") is not None:
             try:
                 _bounded_diagnostic(
                     index["warning"], "restore index warning")
             except ReplayLabRestoreClientError:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab restore completed with an invalid result")
+                    "Bread restore completed with an invalid result")
         return value
 
     def restore(self, project_root, capture_path, capture_session_id,
@@ -1538,7 +1997,7 @@ class ReplayLabRestoreHostClient(object):
         with _RESTORE_LIFECYCLE:
             if _RESTORE_STOPPING:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab project restore was cancelled during shutdown")
+                    "Bread project restore was cancelled during shutdown")
             self._restore_generation = _RESTORE_GENERATION
             _ACTIVE_CLIENTS.add(self)
         try:
@@ -1597,7 +2056,7 @@ class ReplayLabRestoreHostClient(object):
                     started.get("result"), project, capture, session)
             error = str(started.get("error", "") or "").strip()
             raise ReplayLabRestoreClientError(
-                error[:4096] or "ReplayLab project restore failed")
+                error[:4096] or "Bread project restore failed")
 
         deadline = self.monotonic() + self.timeout_seconds
         try:
@@ -1611,7 +2070,9 @@ class ReplayLabRestoreHostClient(object):
                     snapshot = self._request(port, token, "GET", query)
                 except ReplayLabRestoreTransportError as exc:
                     # A short synchronous WinHTTP receive slice can expire
-                    # while the owned background job is still progressing.
+                    # while the owned background job is still progressing
+                    # (qrenderdoc's own Python thread is busy serving the
+                    # restore's replay work, so this poll thread runs late).
                     # Re-read only this known job; never re-submit a mutation.
                     if (exc.winerror != 12002 or exc.method != "GET"
                             or exc.path != query):
@@ -1620,7 +2081,7 @@ class ReplayLabRestoreHostClient(object):
                     remaining = deadline - self.monotonic()
                     if remaining <= 0:
                         break
-                    self._wait(min(self.poll_seconds, remaining))
+                    self._wait(min(max(self.poll_seconds, 1.0), remaining))
                     continue
                 current_job_id, status, events, latest_sequence = self._snapshot(
                     snapshot, job_id, sequence)
@@ -1649,7 +2110,7 @@ class ReplayLabRestoreHostClient(object):
                 if status == "failed":
                     error = str(snapshot.get("error", "") or "").strip()
                     raise ReplayLabRestoreClientError(
-                        error[:4096] or "ReplayLab project restore failed")
+                        error[:4096] or "Bread project restore failed")
                 self._wait(self.poll_seconds)
         except ReplayLabRestoreClientError:
             if self._cancel_requested():
@@ -1657,7 +2118,7 @@ class ReplayLabRestoreHostClient(object):
             raise
         self._cancel_restore_job_best_effort(port, token, job_id)
         raise ReplayLabRestoreClientError(
-            "ReplayLab project restore timed out")
+            "Bread project restore timed out")
 
 
 class ReplayLabInternalProjectClient(ReplayLabRestoreHostClient):
@@ -1688,12 +2149,102 @@ class ReplayLabInternalProjectClient(ReplayLabRestoreHostClient):
         # path, so retain the established finite 90-second operation budget.
         self.request_timeout_seconds = min(
             90.0, max(0.1, float(request_timeout_seconds)))
+        if transport is None and self.internal_executable:
+            self.transport = self._project_transport
+
+    def _project_transport(self, port, token, method, path, body, timeout_seconds,
+                           cancel_event, expected_generation):
+        if method != "POST" or path != PROJECT_OPERATION_PATH:
+            raise ReplayLabRestoreClientError("Invalid private project request")
+        deadline=self.monotonic()+min(90.0,max(0.1,float(timeout_seconds)))
+        self._check_cancelled()
+        packet=json.dumps(dict(port=int(port),token=token,method=method,path=path,
+            body=base64.b64encode(body).decode("ascii"),timeout=min(90.0,max(0.1,float(timeout_seconds))))).encode("utf-8")
+        environment=os.environ.copy();environment["PYINSTALLER_RESET_ENVIRONMENT"]="1"
+        child=subprocess.Popen([self.internal_executable,"project-request"],stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE,cwd=os.path.dirname(self.internal_executable),
+            env=environment,creationflags=int(getattr(subprocess,"CREATE_NO_WINDOW",0x08000000)) if os.name=="nt" else 0)
+        completed=threading.Event();received={}
+        def exchange():
+            try:received["output"],received["error"]=child.communicate(input=packet)
+            except Exception as error:received["failure"]=error
+            finally:completed.set()
+        worker=threading.Thread(target=exchange);worker.daemon=True;worker.start()
+        try:
+            while not completed.wait(0.05):
+                self._check_cancelled()
+                if cancel_event.is_set():raise ReplayLabRestoreClientError("Bread project request was cancelled")
+                if self.monotonic()>=deadline:raise ReplayLabRestoreRequestUncertain("Bread project request timed out")
+            self._check_cancelled()
+            if "failure" in received:raise ReplayLabRestoreRequestUncertain("Bread project helper communication failed")
+            output=received.get("output",b"")
+            if child.returncode!=0 or len(output)>4*((MAX_RESPONSE_BYTES+2)//3)+4096:
+                raise ReplayLabRestoreRequestUncertain("Bread project request helper failed")
+            result=_strict_json_bytes(output,"Bread project helper")
+            if result.get("error"):
+                raise ReplayLabRestoreRequestUncertain("Bread project request outcome is uncertain: %s" % str(result["error"])[:1024])
+            return int(result["status"]),base64.b64decode(result["body"],validate=True)
+        finally:
+            if child.poll() is None:
+                child.terminate()
+                try:child.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:child.kill();child.wait(timeout=1.0)
+            worker.join(timeout=1.0)
+
+    def _ensure_host_when_missing(self, deadline):
+        """Recover a lost service on the project worker, without restarting the GUI or AI."""
+        self._check_cancelled()
+        if not self.internal_executable:
+            return
+        state_path = os.path.join(self.runtime_directory, "internal-host.json")
+        if os.path.isfile(state_path):
+            try:
+                state = _strict_json_bytes(
+                    _read_bounded(state_path, MAX_STATE_BYTES, "Bread internal Host state"),
+                    "Bread internal Host state")
+            except ReplayLabRestoreClientError:
+                # Preserve malformed evidence for the ordinary credential diagnostic.
+                return
+            if _process_alive(state.get("pid")):
+                # Never launch over a live but incompatible or unresponsive service.
+                return
+        flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)) if os.name == "nt" else 0
+        environment = os.environ.copy()
+        environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        try:
+            controller = subprocess.Popen(
+                [self.internal_executable, "ensure", "--runtime-dir", self.runtime_directory,
+                 "--owner-pid", str(os.getpid())],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                cwd=os.path.dirname(self.internal_executable), env=environment,
+                creationflags=flags, shell=False)
+        except OSError as error:
+            raise ReplayLabRestoreClientError(
+                "Bread internal Host could not be started: %s" % str(error))
+        try:
+            while controller.poll() is None:
+                if self.monotonic() >= deadline:
+                    raise ReplayLabRestoreClientError("Bread internal Host startup timed out")
+                self._wait(min(self.poll_seconds, 0.1))
+            self._check_cancelled()
+            if controller.returncode != 0:
+                raise ReplayLabRestoreClientError(
+                    "Bread internal Host startup failed (exit %s)" % controller.returncode)
+        finally:
+            if controller.poll() is None:
+                # Only this short-lived controller is owned here, never its detached service.
+                controller.terminate()
+                try:
+                    controller.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    controller.kill()
+                    controller.wait(timeout=1.0)
 
     def invoke(self, operation, parameters, request_id=None):
         with _RESTORE_LIFECYCLE:
             if _RESTORE_STOPPING:
                 raise ReplayLabRestoreClientError(
-                    "ReplayLab internal project request was cancelled during shutdown")
+                    "Bread internal project request was cancelled during shutdown")
             self._restore_generation = _RESTORE_GENERATION
             _ACTIVE_CLIENTS.add(self)
         try:
@@ -1707,15 +2258,16 @@ class ReplayLabInternalProjectClient(ReplayLabRestoreHostClient):
         name = str(operation or "").strip()
         if not name or len(name.encode("utf-8")) > 64:
             raise ReplayLabRestoreClientError(
-                "ReplayLab internal project operation is invalid")
+                "Bread internal project operation is invalid")
         if not isinstance(parameters, dict):
             raise ReplayLabRestoreClientError(
-                "ReplayLab internal project parameters must be an object")
+                "Bread internal project parameters must be an object")
         identity = str(request_id or uuid.uuid4().hex).strip().lower()
         if JOB_ID_PATTERN.fullmatch(identity) is None:
             raise ReplayLabRestoreClientError(
-                "ReplayLab internal project request ID is invalid")
+                "Bread internal project request ID is invalid")
         deadline = self.monotonic() + self.startup_timeout_seconds
+        self._ensure_host_when_missing(deadline)
         port, token, pid, version, host_instance_id = self._credentials(deadline)
         self._verify_health(port, pid, version, host_instance_id)
         value = self._request(
@@ -1737,13 +2289,15 @@ class ReplayLabInternalProjectClient(ReplayLabRestoreHostClient):
                 set(value) != {"schema", "requestId", "result"} or
                 not isinstance(value.get("result"), dict)):
             raise ReplayLabRestoreClientError(
-                "ReplayLab internal project response is invalid")
+                "Bread internal project response is invalid")
         return value["result"]
 
 
 __all__ = [
     "DEFAULT_PROJECT_RESTORE_CLIENT_TIMEOUT_SECONDS",
     "EXPECTED_HOST_VERSION",
+    "EXPECTED_INTERNAL_CAPABILITY_VERSIONS",
+    "INTERNAL_HOST_CAPABILITY_SCHEMA",
     "INTERNAL_HOST_STATE_PROTOCOL_VERSION",
     "PROJECT_RESTORE_CLEANUP_GRACE_SECONDS",
     "PROJECT_RESTORE_DEADLINE_SECONDS",

@@ -445,10 +445,11 @@ void ConfigureSyntax(ScintillaEdit *scintilla, int language)
       scintilla->styleSetFore(SCE_C_WORD2, keyword);
       scintilla->styleSetFore(SCE_C_PREPROCESSOR, preprocessor);
       scintilla->styleSetBold(SCE_C_PREPROCESSOR, false);
-      scintilla->styleSetItalic(SCE_C_COMMENT, true);
-      scintilla->styleSetItalic(SCE_C_COMMENTDOC, true);
-      scintilla->styleSetItalic(SCE_C_COMMENTLINE, true);
-      scintilla->styleSetItalic(SCE_C_COMMENTLINEDOC, true);
+      // Colour distinguishes comments; upright text keeps long explanations readable.
+      scintilla->styleSetItalic(SCE_C_COMMENT, false);
+      scintilla->styleSetItalic(SCE_C_COMMENTDOC, false);
+      scintilla->styleSetItalic(SCE_C_COMMENTLINE, false);
+      scintilla->styleSetItalic(SCE_C_COMMENTLINEDOC, false);
     }
     else
     {
@@ -502,8 +503,8 @@ void ConfigureSyntax(ScintillaEdit *scintilla, int language)
       scintilla->styleSetFore(SCE_P_WORD2, keyword);
       scintilla->styleSetBold(SCE_P_WORD, false);
       scintilla->styleSetBold(SCE_P_WORD2, false);
-      scintilla->styleSetItalic(SCE_P_COMMENTLINE, true);
-      scintilla->styleSetItalic(SCE_P_COMMENTBLOCK, true);
+      scintilla->styleSetItalic(SCE_P_COMMENTLINE, false);
+      scintilla->styleSetItalic(SCE_P_COMMENTBLOCK, false);
     }
     else
     {

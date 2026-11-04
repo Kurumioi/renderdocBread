@@ -81,9 +81,13 @@ void D3D12Replay::Shutdown()
 
   // ReplayLab event CBuffer resources are replay-owned and may still be referenced by the cached
   // CPU render state. Restore that state and release every shadow before destroying the device.
+  ClearEventShaderOverrides();
+  ReleaseEventShaderPipelines();
+  ReleaseEventShaderScratch();
   ClearEventCBufferOverrides();
 
-  if(!m_TextureSnapshots.empty() || !m_InitialStateSourceCache.empty())
+  if(!m_TextureSnapshots.empty() || !m_InitialStateSourceCache.empty() ||
+     !m_ShaderPairUnconfirmed.empty())
   {
     // Snapshot creation is intentionally asynchronous during use. Teardown must drain that work
     // before dropping the application's explicit D3D12 resource references.
@@ -95,6 +99,9 @@ void D3D12Replay::Shutdown()
     m_ProxyResources[i]->Release();
   m_ProxyResources.clear();
   m_TextureSnapshots.clear();
+  for(ID3D12DeviceChild *resource : m_ShaderPairUnconfirmed)
+    resource->Release();
+  m_ShaderPairUnconfirmed.clear();
 
   for(auto &entry : m_InitialStateSourceCache)
     SAFE_RELEASE(entry.second);
@@ -663,13 +670,14 @@ uint32_t D3D12Replay::GetReplayBufferPatchFirstAffectedEvent() const
 
 void D3D12Replay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
 {
-  const bool ordinaryTarget = replayType == eReplay_OnlyDraw && !m_EventCBufferStateApplied &&
+  const bool ordinaryTarget = replayType == eReplay_OnlyDraw && !m_EventShaderStateApplied &&
+                              !m_EventCBufferStateApplied &&
                               m_EventCBufferOverrides.empty() &&
                               m_pDevice->GetQueue()->GetCommandData()->m_ActionCallback == NULL;
   const bool ordinaryRoot = replayType == eReplay_WithoutDraw && !m_ReplayCheckpointBypass &&
                             !m_EventCBufferStateApplied && m_EventCBufferOverrides.empty() &&
                             m_pDevice->GetQueue()->GetCommandData()->m_ActionCallback == NULL;
-  if(replayType == eReplay_OnlyDraw)
+  if(replayType == eReplay_OnlyDraw && !m_EventShaderStateApplied)
   {
     const bool previousFeedbackScope = m_KnownOrdinaryTargetFeedback;
     m_KnownOrdinaryTargetFeedback = ordinaryTarget;
@@ -699,6 +707,401 @@ void D3D12Replay::ReplayLog(uint32_t endEventID, ReplayLogType replayType)
 
   if(replayType == eReplay_WithoutDraw)
     m_pDevice->ReplayWorkWaitForIdle();
+}
+
+namespace
+{
+// Paired observations are deliberately smaller than general resource checkpoints. A direct VS/PS
+// draw may change only its color/depth attachments; every other input remains from one prefix.
+struct D3D12ShaderPairAttachment
+{
+  ID3D12Resource *source = NULL;
+  ID3D12Resource *before = NULL;
+  ID3D12Resource *a = NULL;
+  ID3D12Resource *b = NULL;
+  ShaderPairSnapshot snapshot;
+  uint64_t bytes = 0;
+};
+
+struct D3D12ShaderPairScratch
+{
+  D3D12ShaderPairScratch(WrappedID3D12Device *d, rdcarray<ID3D12DeviceChild *> &retained)
+      : device(d), unconfirmed(retained)
+  {
+  }
+  WrappedID3D12Device *device;
+  rdcarray<ID3D12DeviceChild *> &unconfirmed;
+  rdcarray<ID3D12DeviceChild *> owned;
+  bool submitted = false;
+
+  ~D3D12ShaderPairScratch()
+  {
+    // Never free command-list dependencies while the GPU might still be using them. A device-loss
+    // path retains only this bounded transaction's resources until the device itself is destroyed.
+    if(submitted && !device->ReplayWorkWaitForIdle())
+    {
+      for(ID3D12DeviceChild *resource : owned)
+        unconfirmed.push_back(resource);
+      return;
+    }
+    for(ID3D12DeviceChild *resource : owned)
+      resource->Release();
+  }
+};
+
+bool ShaderPairResourcesOverlap(WrappedID3D12Device *device, ID3D12Resource *left,
+                                ID3D12Resource *right)
+{
+  if(left == right)
+    return true;
+  WrappedID3D12Resource *a = (WrappedID3D12Resource *)left;
+  WrappedID3D12Resource *b = (WrappedID3D12Resource *)right;
+  if(a->GetHeap() == NULL || a->GetHeap() != b->GetHeap())
+    return false;
+  const D3D12_RESOURCE_DESC ad = left->GetDesc(), bd = right->GetDesc();
+  const uint64_t as = device->GetReal()->GetResourceAllocationInfo(0, 1, &ad).SizeInBytes;
+  const uint64_t bs = device->GetReal()->GetResourceAllocationInfo(0, 1, &bd).SizeInBytes;
+  const uint64_t ao = a->GetHeapOffset(), bo = b->GetHeapOffset();
+  if(as == ~0ULL || bs == ~0ULL || ao > ~0ULL - as || bo > ~0ULL - bs)
+    return true;
+  return ao < bo + bs && bo < ao + as;
+}
+
+rdcstr CheckShaderPairInputs(WrappedID3D12Device *device, const D3D12RenderState &state,
+                            const rdcarray<D3D12ShaderPairAttachment> &attachments)
+{
+  D3D12ResourceManager *rm = device->GetResourceManager();
+  WrappedID3D12RootSignature *sig =
+      rm->GetResAs<WrappedID3D12RootSignature>(state.graphics.rootsig, true);
+  if(!sig)
+    return "The graphics root signature is unavailable";
+  if(sig->sig.Flags & (D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                      D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED))
+    return "Paired observations do not support directly indexed descriptor heaps";
+
+  auto checkResource = [&](ResourceId id) -> bool {
+    if(id == ResourceId())
+      return true;
+    ID3D12Resource *resource = rm->GetResAs<ID3D12Resource>(id, true);
+    if(!resource)
+      return false;
+    // Reserved inputs can alias an output through tile mappings without exposing a placed heap.
+    // Require a conventional allocation before relying on the heap-range overlap check below.
+    D3D12_HEAP_PROPERTIES heap = {};
+    D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE;
+    if(FAILED(resource->GetHeapProperties(&heap, &flags)))
+      return false;
+    for(const D3D12ShaderPairAttachment &attachment : attachments)
+      if(ShaderPairResourcesOverlap(device, resource, attachment.source))
+        return false;
+    return true;
+  };
+
+  if(!checkResource(state.ibuffer.buf))
+    return "An index buffer is unavailable, sparse, or aliases a paired output";
+  for(const D3D12RenderState::VertBuffer &vb : state.vbuffers)
+    if(!checkResource(vb.buf))
+      return "A vertex buffer is unavailable, sparse, or aliases a paired output";
+
+  uint64_t checkedDescriptors = 0;
+  for(size_t parameter = 0; parameter < state.graphics.sigelems.size(); parameter++)
+  {
+    const D3D12RenderState::SignatureElement &element = state.graphics.sigelems[parameter];
+    if(element.type == eRootUnknown || element.type == eRootConst)
+      continue;
+    if(parameter >= sig->sig.Parameters.size())
+      return "The graphics root elements do not match their signature";
+    if(element.type == eRootCBV || element.type == eRootSRV || element.type == eRootUAV)
+    {
+      if(!checkResource(element.id))
+        return "A root descriptor is unavailable, sparse, or aliases a paired output";
+      continue;
+    }
+    if(element.type != eRootTable)
+      return "The graphics root element type is unsupported";
+    const D3D12RootSignatureParameter &root = sig->sig.Parameters[parameter];
+    if(root.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE)
+      return "A graphics descriptor table does not match its signature";
+    WrappedID3D12DescriptorHeap *heap = rm->GetResAs<WrappedID3D12DescriptorHeap>(element.id, true);
+    if(!heap)
+      return "A bound descriptor heap is unavailable";
+    uint64_t appendOffset = 0;
+    for(UINT rangeIndex = 0; rangeIndex < root.DescriptorTable.NumDescriptorRanges; rangeIndex++)
+    {
+      const D3D12_DESCRIPTOR_RANGE1 &range = root.DescriptorTable.pDescriptorRanges[rangeIndex];
+      const uint64_t offset = range.OffsetInDescriptorsFromTableStart ==
+                                      D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                                  ? appendOffset
+                                  : range.OffsetInDescriptorsFromTableStart;
+      if(range.NumDescriptors == ~0U || range.NumDescriptors > 4096 ||
+         checkedDescriptors + range.NumDescriptors > 4096 ||
+         element.offset > heap->GetDesc().NumDescriptors ||
+         offset > heap->GetDesc().NumDescriptors - element.offset ||
+         range.NumDescriptors > heap->GetDesc().NumDescriptors - element.offset - offset)
+        return "The paired descriptor closure is unbounded or unavailable";
+      appendOffset = offset + range.NumDescriptors;
+      checkedDescriptors += range.NumDescriptors;
+      if(range.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER)
+        continue;
+      for(UINT i = 0; i < range.NumDescriptors; i++)
+      {
+        const D3D12Descriptor &descriptor =
+            heap->GetDescriptors()[size_t(element.offset + offset + i)];
+        if(descriptor.GetType() == D3D12DescriptorType::Undefined)
+          continue;
+        const ResourceId resource = descriptor.GetType() == D3D12DescriptorType::CBV
+                                        ? WrappedID3D12Resource::GetResIDFromAddr(
+                                              descriptor.GetCBV().BufferLocation)
+                                        : descriptor.GetResResourceId();
+        if(!checkResource(resource) ||
+           (descriptor.GetType() == D3D12DescriptorType::UAV &&
+            !checkResource(descriptor.GetCounterResourceId())))
+          return "A shader descriptor is unavailable, sparse, or aliases a paired output";
+      }
+    }
+  }
+  return {};
+}
+
+void ShaderPairCopy(WrappedID3D12Device *device, ID3D12GraphicsCommandListX *list,
+                    ID3D12Resource *original, ID3D12Resource *snapshot, bool restore)
+{
+  BarrierSet barriers;
+  barriers.Configure(original, device->GetSubresourceStates(GetResID(original)),
+                     restore ? BarrierSet::CopyDestAccess : BarrierSet::CopySourceAccess);
+  barriers.Apply(list);
+  list->CopyResource(restore ? original : snapshot, restore ? snapshot : original);
+  barriers.Unapply(list);
+  if(!restore)
+  {
+    D3D12_RESOURCE_BARRIER ready = {};
+    ready.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    ready.Transition.pResource = snapshot;
+    ready.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    ready.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    ready.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &ready);
+    for(D3D12ResourceLayout &layout : device->GetSubresourceStates(GetResID(snapshot)))
+      layout = D3D12ResourceLayout::FromStates(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  }
+}
+}
+
+ShaderPairComparison D3D12Replay::ComparePixelShaderPair(uint32_t eventId,
+                                                        ResourceId expectedOriginal,
+                                                        ResourceId baseline, ResourceId candidate)
+{
+  ShaderPairComparison result;
+  result.eventId = eventId;
+  const ActionDescription *action = m_pDevice->GetAction(eventId);
+  D3D12CommandData &cmd = *m_pDevice->GetQueue()->GetCommandData();
+  auto reject = [&](const rdcstr &reason) -> ShaderPairComparison {
+    result.reason = reason;
+    return std::move(result);
+  };
+  if(!action || !(action->flags & ActionFlags::Drawcall) ||
+     (action->flags & (ActionFlags::Indirect | ActionFlags::MeshDispatch)) || action->drawIndex != 0)
+    return reject("Paired observations require one direct Draw or DrawIndexed action");
+  if(cmd.m_ActionCallback || m_EventCBufferStateApplied || !m_EventCBufferOverrides.empty())
+    return reject("Paired observations cannot nest analysis callbacks or event overrides");
+  if(!m_ShaderPairUnconfirmed.empty())
+  {
+    result.supported = true;
+    return reject("A previous paired observation has unconfirmed GPU work");
+  }
+
+  D3D12ResourceManager *rm = m_pDevice->GetResourceManager();
+  if(!WrappedID3D12Shader::IsShader(expectedOriginal) || rm->HasReplacement(expectedOriginal))
+    return reject("The original pixel shader must be live and have no shared replacement");
+  if(baseline == ResourceId())
+    baseline = expectedOriginal;
+  if(candidate == ResourceId())
+    candidate = expectedOriginal;
+  if(!WrappedID3D12Shader::IsShader(baseline) || !WrappedID3D12Shader::IsShader(candidate))
+    return reject("Both paired shaders must be live native shader resources");
+
+  // Exactly one canonical prefix, with no target execution, shader-feedback pass, checkpoint
+  // reuse, or viewer refresh. Every A/B/A draw below sees the very same input resource bytes.
+  m_pDevice->ReplayLog(0, eventId, eReplay_WithoutDraw);
+  if(!m_pDevice->ReplayWorkWaitForIdle() || m_pDevice->HasFatalError())
+  {
+    result.supported = true;
+    return reject("The paired observation prefix did not complete");
+  }
+  const D3D12RenderState state = cmd.m_RenderState;
+  WrappedID3D12PipelineState *pipe = rm->GetResAs<WrappedID3D12PipelineState>(state.pipe, true);
+  if(!pipe || !pipe->IsGraphics() || !pipe->VS() || !pipe->PS() ||
+     pipe->PS()->GetResourceID() != expectedOriginal)
+    return reject("The selected pipeline does not bind the expected original pixel shader");
+  bool streamout = false;
+  for(const D3D12RenderState::StreamOut &stream : state.streamouts)
+    streamout |= stream.buf != ResourceId() || stream.countbuf != ResourceId();
+  if(state.renderpass || state.stateobj != ResourceId() || streamout ||
+     state.predication.buffer != ResourceId() || state.shadingRateImage != ResourceId() ||
+     pipe->HS() || pipe->DS() || pipe->GS() || pipe->AS() || pipe->MS())
+    return reject("Paired observations require a VS/PS draw without render passes, stream-out, "
+                  "predication, shading-rate images, or additional shader stages");
+
+  WrappedID3D12Shader *aShader = rm->GetResAs<WrappedID3D12Shader>(baseline, true);
+  WrappedID3D12Shader *bShader = rm->GetResAs<WrappedID3D12Shader>(candidate, true);
+  if(!aShader || !bShader || aShader->GetDetails().stage != ShaderStage::Pixel ||
+     bShader->GetDetails().stage != ShaderStage::Pixel)
+    return reject("Both paired replacements must be pixel shaders");
+  for(WrappedID3D12Shader *shader : {pipe->VS(), pipe->PS(), aShader, bShader})
+  {
+    uint32_t extensionSlot = ~0U, extensionSpace = ~0U;
+    shader->GetShaderExtSlot(extensionSlot, extensionSpace);
+    if(!shader->GetDetails().readWriteResources.empty() || extensionSlot != ~0U)
+      return reject("Paired observations cannot repeat shaders with UAV or vendor-extension effects");
+  }
+
+  rdcarray<D3D12ShaderPairAttachment> attachments;
+  uint64_t totalBytes = 0;
+  auto addAttachment = [&](const D3D12Descriptor &view, uint32_t index, bool depth) -> rdcstr {
+    const ResourceId id = view.GetResResourceId();
+    if(id == ResourceId())
+      return {};
+    ID3D12Resource *resource = rm->GetResAs<ID3D12Resource>(id, true);
+    if(!resource)
+      return "A paired output resource is unavailable";
+    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+    if(desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels != 1 ||
+       desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 || desc.Width == 0 ||
+       desc.Height == 0 || desc.Width > 8192 || desc.Height > 8192)
+      return "Paired outputs must be single-sample 2D textures with one mip and one array slice";
+    if(depth ? (view.GetDSV().ViewDimension != D3D12_DSV_DIMENSION_TEXTURE2D ||
+                view.GetDSV().Texture2D.MipSlice != 0)
+             : (view.GetRTV().ViewDimension != D3D12_RTV_DIMENSION_TEXTURE2D ||
+                view.GetRTV().Texture2D.MipSlice != 0))
+      return "The paired output view does not cover its supported subresource";
+    D3D12_HEAP_PROPERTIES heap = {};
+    D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE;
+    if(FAILED(resource->GetHeapProperties(&heap, &flags)))
+      return "Paired observations do not support sparse output resources";
+    const uint64_t bytes = GetByteSize((int)desc.Width, (int)desc.Height, 1, desc.Format, 0);
+    if(bytes == 0 || bytes > 32ULL * 1024 * 1024 ||
+       totalBytes + bytes > 64ULL * 1024 * 1024 || attachments.size() >= 9)
+      return "Paired output data exceeds the 32 MiB per-output or 64 MiB per-leg budget";
+    for(const D3D12ShaderPairAttachment &existing : attachments)
+      if(ShaderPairResourcesOverlap(m_pDevice, existing.source, resource))
+        return "Paired output resources overlap or alias each other";
+    D3D12ShaderPairAttachment attachment;
+    attachment.source = resource;
+    attachment.bytes = bytes;
+    attachment.snapshot.resourceId = id;
+    attachment.snapshot.index = index;
+    attachment.snapshot.depth = depth;
+    attachment.snapshot.width = (uint32_t)desc.Width;
+    attachment.snapshot.height = desc.Height;
+    attachment.snapshot.format = GetTexture(id).format;
+    const DXGI_FORMAT viewFormat = depth ? view.GetDSV().Format : view.GetRTV().Format;
+    if(viewFormat != DXGI_FORMAT_UNKNOWN)
+      attachment.snapshot.format = MakeResourceFormat(viewFormat);
+    attachments.push_back(std::move(attachment));
+    totalBytes += bytes;
+    return {};
+  };
+  for(uint32_t i = 0; i < state.rts.size(); i++)
+  {
+    rdcstr error = addAttachment(state.rts[i], i, false);
+    if(!error.empty())
+      return reject(error);
+  }
+  if(state.dsv.GetType() == D3D12DescriptorType::DSV)
+  {
+    rdcstr error = addAttachment(state.dsv, 0, true);
+    if(!error.empty())
+      return reject(error);
+  }
+  if(attachments.empty())
+    return reject("The paired draw has no stored output attachments");
+  rdcstr inputError = CheckShaderPairInputs(m_pDevice, state, attachments);
+  if(!inputError.empty())
+    return reject(inputError);
+
+  result.supported = true;
+  D3D12ShaderPairScratch scratch(m_pDevice, m_ShaderPairUnconfirmed);
+  D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC description;
+  pipe->Fill(description);
+  description.CachedPSO = {};
+  ID3D12PipelineState *aPipeline = NULL, *bPipeline = NULL;
+  description.PS = aShader->GetDesc();
+  HRESULT hr = m_pDevice->CreatePipeState(description, &aPipeline);
+  if(FAILED(hr) || !aPipeline)
+    return reject("Failed to create the isolated baseline pixel pipeline");
+  scratch.owned.push_back(aPipeline);
+  description.PS = bShader->GetDesc();
+  hr = m_pDevice->CreatePipeState(description, &bPipeline);
+  if(FAILED(hr) || !bPipeline)
+    return reject("Failed to create the isolated candidate pixel pipeline");
+  scratch.owned.push_back(bPipeline);
+  for(D3D12ShaderPairAttachment &attachment : attachments)
+  {
+    D3D12_RESOURCE_DESC desc = attachment.source->GetDesc();
+    desc.Alignment = 0;
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CreationNodeMask = heap.VisibleNodeMask = 1;
+    for(ID3D12Resource **destination : {&attachment.before, &attachment.a, &attachment.b})
+    {
+      hr = m_pDevice->CreateCommittedResource(
+          &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+          __uuidof(ID3D12Resource), (void **)destination);
+      if(FAILED(hr) || !*destination)
+        return reject("Failed to allocate bounded paired output snapshots");
+      scratch.owned.push_back(*destination);
+    }
+  }
+  // Keep this list out of the generic pending queue until it is completely recorded and closed.
+  // A failed Close must never leave a later unrelated ExecuteLists holding released scratch.
+  ID3D12GraphicsCommandListX *list = m_pDevice->StealNewList();
+  if(!list)
+    return reject("Failed to create the paired observation command list");
+  for(D3D12ShaderPairAttachment &attachment : attachments)
+    ShaderPairCopy(m_pDevice, list, attachment.source, attachment.before, false);
+
+  state.ApplyState(m_pDevice, list);
+  list->SetPipelineState(aPipeline);
+  m_pDevice->ReplayDraw(list, *action);
+  for(D3D12ShaderPairAttachment &attachment : attachments)
+  {
+    ShaderPairCopy(m_pDevice, list, attachment.source, attachment.a, false);
+    ShaderPairCopy(m_pDevice, list, attachment.source, attachment.before, true);
+  }
+  list->SetPipelineState(bPipeline);
+  m_pDevice->ReplayDraw(list, *action);
+  for(D3D12ShaderPairAttachment &attachment : attachments)
+  {
+    ShaderPairCopy(m_pDevice, list, attachment.source, attachment.b, false);
+    ShaderPairCopy(m_pDevice, list, attachment.source, attachment.before, true);
+  }
+  list->SetPipelineState(aPipeline);
+  m_pDevice->ReplayDraw(list, *action);
+  // Keep the captured CPU state authoritative. Only the local command list used the trial PSOs.
+  state.ApplyState(m_pDevice, list);
+  if(FAILED(list->Close()) || m_pDevice->HasFatalError())
+  {
+    list->Release();
+    return reject("Failed to close the paired observation command list");
+  }
+  scratch.submitted = true;
+  m_pDevice->ExecuteList(list);
+  if(!m_pDevice->FlushLists(true) || !m_pDevice->ReplayWorkWaitForIdle() || m_pDevice->HasFatalError())
+    return reject("The paired observation GPU work did not complete");
+
+  for(D3D12ShaderPairAttachment &attachment : attachments)
+  {
+    ShaderPairSnapshot &output = attachment.snapshot;
+    GetTextureData(GetResID(attachment.a), output.subresource, GetTextureDataParams(), output.baseline);
+    GetTextureData(GetResID(attachment.b), output.subresource, GetTextureDataParams(), output.candidate);
+    GetTextureData(output.resourceId, output.subresource, GetTextureDataParams(), output.baselineRepeat);
+    if(output.baseline.size() != attachment.bytes || output.candidate.size() != attachment.bytes ||
+       output.baselineRepeat.size() != attachment.bytes || m_pDevice->HasFatalError())
+      return reject("The paired observation did not return complete native attachment data");
+    result.outputs.push_back(std::move(output));
+  }
+  result.completed = true;
+  return result;
 }
 
 SDFile *D3D12Replay::GetStructuredFile()
@@ -1082,7 +1485,7 @@ rdcarray<EventUsage> D3D12Replay::GetUsage(ResourceId id)
 {
   // Shader bytecode is exposed through GetResources(), but it is not an ID3D12Resource and
   // therefore is intentionally absent from the device resource list. Keep the ordinary resource
-  // gate while allowing the bounded representative-Shader usage index populated during action
+  // gate while allowing the complete Shader action-usage index populated during action
   // construction.
   if(m_pDevice->GetResourceList().find(id) == m_pDevice->GetResourceList().end() &&
      !WrappedID3D12Shader::IsShader(id))
@@ -1552,7 +1955,8 @@ void D3D12Replay::SavePipelineState(uint32_t eventId)
   D3D12MarkerRegion::Begin(m_pDevice->GetQueue(),
                            StringFormat::Fmt("FetchShaderFeedback for %u", eventId));
 
-  FetchShaderFeedback(eventId);
+  if(!HasEventShaderOverride(eventId))
+    FetchShaderFeedback(eventId);
 
   D3D12MarkerRegion::End(m_pDevice->GetQueue());
 
@@ -4869,10 +5273,41 @@ rdcstr D3D12Replay::RemoveTargetShaderReplacementChecked(ResourceId id)
   return {};
 }
 
-void D3D12Replay::ClearReplayCache()
+void D3D12Replay::ClearScrubReplayCache()
 {
+  // Lightweight scrub used by hot replay paths (for example buffer-patch EID
+  // timing) that must keep the initial-state source cache resident.
   ClearPostVSCache();
   ClearFeedbackCache();
+}
+
+void D3D12Replay::ReleaseRebuildableReplayResources()
+{
+  // Drop rebuildable replay-time scratch so a long Host-driven session (many
+  // shader edits/observations from the AI workflow) does not accumulate
+  // committed memory. Every resource dropped here is a pure optimization the
+  // next replay recreates on demand; correctness is unaffected.
+  if(!m_InitialStateSourceCache.empty())
+  {
+    // These cached initial-state copies may still be referenced by queued
+    // replay work, so drain it before releasing the application's resources,
+    // mirroring Shutdown's ordering.
+    m_pDevice->ExecuteLists();
+    m_pDevice->FlushLists(true);
+
+    for(auto &entry : m_InitialStateSourceCache)
+      SAFE_RELEASE(entry.second);
+    m_InitialStateSourceCache.clear();
+    m_InitialStateSourceCacheBytes = 0;
+  }
+
+  m_PatchedPSCache.clear();
+}
+
+void D3D12Replay::ClearReplayCache()
+{
+  ClearScrubReplayCache();
+  ReleaseRebuildableReplayResources();
 }
 
 void D3D12Replay::ReloadShaderDebugInformation()
@@ -4921,6 +5356,498 @@ static rdcstr VerifyImplicitD3D12RootSignature(
     return "The captured PSO used an implicit root signature, but no replacement-stage shader "
            "contains the exact captured signature";
 
+  return {};
+}
+
+rdcstr D3D12Replay::SetEventShaderOverride(uint32_t eventId, ShaderStage stage,
+                                          ResourceId expectedOriginal, ResourceId replacement,
+                                          uint32_t outputTarget, bool independentFloatOutput)
+{
+  RestoreEventShaderOverrides();
+  const ActionDescription *action = m_pDevice->GetAction(eventId);
+  if(!action || !(action->flags & (ActionFlags::Drawcall | ActionFlags::Dispatch | ActionFlags::MeshDispatch)))
+    return "The event is not a graphics draw or compute dispatch";
+  D3D12ResourceManager *rm = m_pDevice->GetResourceManager();
+  if(!WrappedID3D12Shader::IsShader(expectedOriginal) || !WrappedID3D12Shader::IsShader(replacement) ||
+     rm->GetUnreplacedID(expectedOriginal) != expectedOriginal ||
+     rm->GetUnreplacedID(replacement) != replacement)
+    return "Event Shader override requires a captured original and an unowned target Shader";
+  WrappedID3D12Shader *target = rm->GetResAs<WrappedID3D12Shader>(replacement, true);
+  if(!target || target->GetDetails().stage != stage)
+    return "The target Shader stage does not match the event override";
+  if(outputTarget != ~0U && (stage != ShaderStage::Pixel || outputTarget >= 8))
+    return "A blend bypass requires a valid pixel Shader color target";
+  if(independentFloatOutput && (stage != ShaderStage::Pixel || outputTarget == ~0U))
+    return "Independent float preview requires a pixel Shader color target";
+  m_EventShaderOverrides[{eventId, stage}] = {expectedOriginal, replacement, outputTarget,
+                                           independentFloatOutput};
+  ClearPostVSCache();
+  return {};
+}
+
+void D3D12Replay::ReleaseEventShaderPipelines(ResourceId target)
+{
+  if(m_EventShaderPipelines.empty())
+    return;
+  // PSOs used by an asynchronous OnlyDraw must retire before destruction.
+  if(!m_pDevice->DeviceWaitForIdle())
+    return;
+  for(auto it = m_EventShaderPipelines.begin(); it != m_EventShaderPipelines.end();)
+  {
+    if(target == ResourceId() || it->first.Uses(target))
+    {
+      SAFE_RELEASE(it->second);
+      it = m_EventShaderPipelines.erase(it);
+    }
+    else
+      ++it;
+  }
+}
+
+void D3D12Replay::ClearEventShaderOverride(uint32_t eventId, ShaderStage stage)
+{
+  RestoreEventShaderOverrides();
+  m_EventShaderOverrides.erase({eventId, stage});
+  ClearPostVSCache();
+}
+
+void D3D12Replay::ClearEventShaderOverrides()
+{
+  RestoreEventShaderOverrides();
+  m_EventShaderOverrides.clear();
+  ClearPostVSCache();
+}
+
+void D3D12Replay::ClearEventShaderOverridesForResource(ResourceId id)
+{
+  RestoreEventShaderOverrides();
+  for(auto it = m_EventShaderOverrides.begin(); it != m_EventShaderOverrides.end();)
+    if(it->second.replacement == id)
+      it = m_EventShaderOverrides.erase(it);
+    else
+      ++it;
+  ReleaseEventShaderPipelines(id);
+}
+
+rdcstr D3D12Replay::ApplyEventShaderOverrides(uint32_t eventId)
+{
+  if(m_EventShaderStateApplied)
+    return "A previous D3D12 event Shader override was not restored";
+  bool configured = false;
+  for(const auto &item : m_EventShaderOverrides)
+    configured |= item.first.first == eventId;
+  if(!configured)
+    return {};
+  D3D12ResourceManager *rm = m_pDevice->GetResourceManager();
+  D3D12RenderState &state = m_pDevice->GetQueue()->GetCommandData()->m_RenderState;
+  WrappedID3D12PipelineState *pipe = rm->GetResAs<WrappedID3D12PipelineState>(state.pipe, true);
+  if(!pipe)
+    return "The selected event has no live graphics or compute pipeline";
+  EventShaderPipelineKey key;
+  key.pipeline = pipe->GetResourceID();
+  D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC desc;
+  pipe->Fill(desc);
+  desc.CachedPSO = {};
+  WrappedID3D12Shader *bound[] = {pipe->VS(), pipe->HS(), pipe->DS(), pipe->GS(), pipe->PS(),
+                                  pipe->CS(), pipe->AS(), pipe->MS()};
+  D3D12_SHADER_BYTECODE *bytecode[] = {&desc.VS, &desc.HS, &desc.DS, &desc.GS, &desc.PS,
+                                      &desc.CS, &desc.AS, &desc.MS};
+  for(const auto &item : m_EventShaderOverrides)
+  {
+    if(item.first.first != eventId)
+      continue;
+    const uint32_t stage = uint32_t(item.first.second);
+    if(stage >= ARRAY_COUNT(bound) || !bound[stage] ||
+       rm->GetUnreplacedID(bound[stage]->GetResourceID()) != item.second.original)
+      return "The selected event no longer binds the expected Shader";
+    WrappedID3D12Shader *target = rm->GetResAs<WrappedID3D12Shader>(item.second.replacement, true);
+    if(!target || target->GetResourceID() != item.second.replacement ||
+       target->GetDetails().stage != item.first.second)
+      return "The event Shader target is no longer available";
+    uint32_t slot = ~0U, space = ~0U;
+    bound[stage]->GetShaderExtSlot(slot, space);
+    target->SetShaderExtSlot(slot, space);
+    *bytecode[stage] = target->GetDesc();
+    key.replacements[stage] = item.second.replacement;
+    if(item.second.outputTarget != ~0U)
+      key.outputTarget = item.second.outputTarget;
+    key.independentFloatOutput |= item.second.independentFloatOutput;
+  }
+  if(key.outputTarget != ~0U)
+  {
+    if(!pipe->IsGraphics() || key.outputTarget >= desc.RTVFormats.NumRenderTargets)
+      return "The requested debug color target is not bound by this pipeline";
+    if(!desc.BlendState.IndependentBlendEnable)
+      for(size_t i = 1; i < ARRAY_COUNT(desc.BlendState.RenderTarget); i++)
+        desc.BlendState.RenderTarget[i] = desc.BlendState.RenderTarget[0];
+    desc.BlendState.IndependentBlendEnable = TRUE;
+    desc.BlendState.AlphaToCoverageEnable = FALSE;
+    desc.BlendState.RenderTarget[key.outputTarget].BlendEnable = FALSE;
+    desc.BlendState.RenderTarget[key.outputTarget].LogicOpEnable = FALSE;
+    desc.BlendState.RenderTarget[key.outputTarget].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    if(key.independentFloatOutput)
+      desc.RTVFormats.RTFormats[key.outputTarget] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  }
+  auto cached = m_EventShaderPipelines.find(key);
+  if(cached == m_EventShaderPipelines.end())
+  {
+    rdcstr error = VerifyImplicitD3D12RootSignature(m_pDevice, pipe, desc);
+    if(!error.empty())
+      return error;
+    ID3D12PipelineState *variant = NULL;
+    HRESULT hr = m_pDevice->CreatePipeState(desc, &variant);
+    if(FAILED(hr) || !variant)
+      return StringFormat::Fmt("Creating the event Shader pipeline failed: %s", ToStr(hr).c_str());
+    if(m_EventShaderPipelines.size() >= 64)
+      ReleaseEventShaderPipelines();
+    cached = m_EventShaderPipelines.insert({key, variant}).first;
+  }
+  EventShaderScratch *scratch = NULL;
+  if(key.independentFloatOutput)
+  {
+    rdcstr error = PrepareEventShaderScratch(eventId, key.outputTarget, state, scratch);
+    if(!error.empty())
+      return error;
+  }
+  m_pDevice->InvalidateLiveForward("eventShaderOverride");
+  m_EventShaderPreviousPipeline = state.pipe;
+  if(scratch)
+  {
+    m_EventShaderPreviousRTs = state.rts;
+    m_EventShaderPreviousDSV = state.dsv;
+    state.rts = scratch->renderRTs;
+    state.dsv = scratch->renderDSV;
+    m_EventShaderAttachmentsApplied = true;
+  }
+  state.pipe = GetResID(cached->second);
+  m_EventShaderStateApplied = true;
+  return {};
+}
+
+void D3D12Replay::RestoreEventShaderOverrides()
+{
+  if(!m_EventShaderStateApplied)
+    return;
+  D3D12RenderState &state = m_pDevice->GetQueue()->GetCommandData()->m_RenderState;
+  state.pipe = m_EventShaderPreviousPipeline;
+  if(m_EventShaderAttachmentsApplied)
+  {
+    state.rts = m_EventShaderPreviousRTs;
+    state.dsv = m_EventShaderPreviousDSV;
+    m_EventShaderPreviousRTs.clear();
+    m_EventShaderAttachmentsApplied = false;
+  }
+  m_EventShaderPreviousPipeline = ResourceId();
+  m_EventShaderStateApplied = false;
+}
+
+void D3D12Replay::ReleaseEventShaderScratch()
+{
+  if(m_EventShaderScratch.empty() || !m_pDevice->DeviceWaitForIdle())
+    return;
+  for(auto &item : m_EventShaderScratch)
+  {
+    for(ID3D12Resource *resource : item.second.colors)
+      SAFE_RELEASE(resource);
+    SAFE_RELEASE(item.second.depth);
+    SAFE_RELEASE(item.second.clearHeap);
+  }
+  m_EventShaderScratch.clear();
+}
+
+TextureDescription D3D12Replay::GetEventShaderPreviewTexture(uint32_t eventId, ShaderStage stage)
+{
+  auto binding = m_EventShaderOverrides.find({eventId, stage});
+  if(binding == m_EventShaderOverrides.end() || !binding->second.independentFloatOutput)
+    return {};
+  auto scratch = m_EventShaderScratch.find({eventId, binding->second.outputTarget});
+  if(scratch == m_EventShaderScratch.end() ||
+     binding->second.outputTarget >= scratch->second.colors.size())
+    return {};
+  return GetTexture(GetResID(scratch->second.colors[binding->second.outputTarget]));
+}
+
+rdcstr D3D12Replay::PrepareEventShaderScratch(uint32_t eventId, uint32_t outputTarget,
+                                             const D3D12RenderState &state,
+                                             EventShaderScratch *&scratch)
+{
+  scratch = NULL;
+  if(state.renderpass)
+    return "Independent float preview does not support D3D12 render-pass resolve semantics";
+  if(outputTarget >= state.rts.size() ||
+     state.rts[outputTarget].GetResResourceId() == ResourceId())
+    return "The selected independent preview attachment is not bound";
+  D3D12ResourceManager *rm = m_pDevice->GetResourceManager();
+  const auto cacheKey = std::make_pair(eventId, outputTarget);
+  rdcarray<ResourceId> liveSources;
+  for(size_t i = 0; i <= state.rts.size(); i++)
+  {
+    ResourceId source = i == state.rts.size() ? state.dsv.GetResResourceId() :
+                                               state.rts[i].GetResResourceId();
+    ID3D12Resource *resource = source == ResourceId() ? NULL :
+                               rm->GetResAs<ID3D12Resource>(source, true);
+    if(source != ResourceId() && !resource)
+      return "An independent preview attachment is unavailable";
+    liveSources.push_back(GetResID(resource));
+  }
+  auto found = m_EventShaderScratch.find(cacheKey);
+  bool matches = found != m_EventShaderScratch.end();
+  auto sameView = [](const D3D12Descriptor &a, const D3D12Descriptor &b, bool depth) {
+    if(a.GetResResourceId() != b.GetResResourceId())
+      return false;
+    // An unbound DSV is deliberately Undefined. ContentsEqual rejects it and
+    // compares unused union bytes for other views, which is appropriate for
+    // descriptor write elision but not for scratch attachment compatibility.
+    if(a.GetResResourceId() == ResourceId())
+      return true;
+    if(depth)
+    {
+      const D3D12_DEPTH_STENCIL_VIEW_DESC &x = a.GetDSV(), &y = b.GetDSV();
+      if(x.Format != y.Format || x.Flags != y.Flags || x.ViewDimension != y.ViewDimension)
+        return false;
+      switch(x.ViewDimension)
+      {
+        case D3D12_DSV_DIMENSION_TEXTURE2D: return x.Texture2D.MipSlice == y.Texture2D.MipSlice;
+        case D3D12_DSV_DIMENSION_TEXTURE2DARRAY:
+          return x.Texture2DArray.MipSlice == y.Texture2DArray.MipSlice &&
+                 x.Texture2DArray.FirstArraySlice == y.Texture2DArray.FirstArraySlice &&
+                 x.Texture2DArray.ArraySize == y.Texture2DArray.ArraySize;
+        case D3D12_DSV_DIMENSION_TEXTURE2DMS: return true;
+        case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY:
+          return x.Texture2DMSArray.FirstArraySlice == y.Texture2DMSArray.FirstArraySlice &&
+                 x.Texture2DMSArray.ArraySize == y.Texture2DMSArray.ArraySize;
+        default: return false;
+      }
+    }
+    const D3D12_RENDER_TARGET_VIEW_DESC &x = a.GetRTV(), &y = b.GetRTV();
+    if(x.Format != y.Format || x.ViewDimension != y.ViewDimension)
+      return false;
+    switch(x.ViewDimension)
+    {
+      case D3D12_RTV_DIMENSION_TEXTURE2D:
+        return x.Texture2D.MipSlice == y.Texture2D.MipSlice &&
+               x.Texture2D.PlaneSlice == y.Texture2D.PlaneSlice;
+      case D3D12_RTV_DIMENSION_TEXTURE2DARRAY:
+        return x.Texture2DArray.MipSlice == y.Texture2DArray.MipSlice &&
+               x.Texture2DArray.PlaneSlice == y.Texture2DArray.PlaneSlice &&
+               x.Texture2DArray.FirstArraySlice == y.Texture2DArray.FirstArraySlice &&
+               x.Texture2DArray.ArraySize == y.Texture2DArray.ArraySize;
+      case D3D12_RTV_DIMENSION_TEXTURE2DMS: return true;
+      case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY:
+        return x.Texture2DMSArray.FirstArraySlice == y.Texture2DMSArray.FirstArraySlice &&
+               x.Texture2DMSArray.ArraySize == y.Texture2DMSArray.ArraySize;
+      default: return false;
+    }
+  };
+  if(matches)
+  {
+    matches = found->second.sourceRTs.size() == state.rts.size() &&
+              sameView(found->second.sourceDSV, state.dsv, true) &&
+              found->second.liveSources == liveSources;
+    for(size_t i = 0; matches && i < state.rts.size(); i++)
+      matches = sameView(found->second.sourceRTs[i], state.rts[i], false);
+  }
+  auto destroy = [](EventShaderScratch &entry) {
+    for(ID3D12Resource *resource : entry.colors)
+      SAFE_RELEASE(resource);
+    SAFE_RELEASE(entry.depth);
+    SAFE_RELEASE(entry.clearHeap);
+  };
+  if(!matches && found != m_EventShaderScratch.end())
+  {
+    if(!m_pDevice->DeviceWaitForIdle())
+      return "The previous float preview GPU work did not complete";
+    destroy(found->second);
+    m_EventShaderScratch.erase(found);
+    found = m_EventShaderScratch.end();
+  }
+  if(!matches)
+  {
+    EventShaderScratch entry;
+    entry.sourceRTs = state.rts;
+    entry.liveSources = liveSources;
+    entry.sourceDSV = state.dsv;
+    entry.renderRTs = state.rts;
+    entry.renderDSV = state.dsv;
+    entry.colors.resize(state.rts.size());
+    rdcarray<D3D12_RESOURCE_DESC> descriptions;
+    descriptions.resize(state.rts.size() + 1);
+    D3D12_RENDER_TARGET_VIEW_DESC selectedView = state.rts[outputTarget].GetRTV();
+    for(size_t i = 0; i < descriptions.size(); i++)
+    {
+      const bool depth = i == state.rts.size();
+      ResourceId source = depth ? state.dsv.GetResResourceId() : state.rts[i].GetResResourceId();
+      if(source == ResourceId())
+        continue;
+      ID3D12Resource *resource = rm->GetResAs<ID3D12Resource>(source, true);
+      if(!resource)
+        return "An independent preview attachment is unavailable";
+      D3D12_RESOURCE_DESC desc = resource->GetDesc();
+      if(desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+        return "Independent float preview requires 2D or 2D-array attachments";
+      D3D12_HEAP_PROPERTIES originalHeap = {};
+      D3D12_HEAP_FLAGS originalFlags = D3D12_HEAP_FLAG_NONE;
+      if(FAILED(resource->GetHeapProperties(&originalHeap, &originalFlags)))
+        return "Independent float preview does not support sparse attachments";
+      desc.Alignment = 0;
+      desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      desc.Flags = depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL :
+                           D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+      if(i == outputTarget)
+      {
+        UINT mip = 0, layers = 1;
+        switch(selectedView.ViewDimension)
+        {
+          case D3D12_RTV_DIMENSION_TEXTURE2D:
+            mip = selectedView.Texture2D.MipSlice;
+            selectedView.Texture2D.MipSlice = 0;
+            selectedView.Texture2D.PlaneSlice = 0;
+            break;
+          case D3D12_RTV_DIMENSION_TEXTURE2DARRAY:
+            mip = selectedView.Texture2DArray.MipSlice;
+            layers = selectedView.Texture2DArray.ArraySize;
+            selectedView.Texture2DArray.MipSlice = 0;
+            selectedView.Texture2DArray.FirstArraySlice = 0;
+            selectedView.Texture2DArray.PlaneSlice = 0;
+            break;
+          case D3D12_RTV_DIMENSION_TEXTURE2DMS: break;
+          case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY:
+            layers = selectedView.Texture2DMSArray.ArraySize;
+            selectedView.Texture2DMSArray.FirstArraySlice = 0;
+            break;
+          default: return "The independent float preview attachment view is unsupported";
+        }
+        if(mip >= desc.MipLevels || layers == 0 || layers > desc.DepthOrArraySize)
+          return "The independent float preview attachment has an invalid subresource range";
+        desc.Width = RDCMAX(1ULL, desc.Width >> mip);
+        desc.Height = RDCMAX(1U, desc.Height >> mip);
+        desc.MipLevels = 1;
+        desc.DepthOrArraySize = UINT16(layers);
+        desc.Format = selectedView.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {};
+        support.Format = desc.Format;
+        if(FAILED(m_pDevice->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
+                                                 sizeof(support))) ||
+           !(support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET) ||
+           !(support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_LOAD))
+          return "This device cannot render and inspect an RGBA32F preview";
+        if(desc.SampleDesc.Count > 1)
+        {
+          D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS samples = {};
+          samples.Format = desc.Format;
+          samples.SampleCount = desc.SampleDesc.Count;
+          if(FAILED(m_pDevice->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                   &samples, sizeof(samples))) ||
+             samples.NumQualityLevels == 0 || desc.SampleDesc.Quality >= samples.NumQualityLevels)
+            return "RGBA32F does not support the captured multisample count and quality";
+        }
+      }
+      const D3D12_RESOURCE_ALLOCATION_INFO allocation =
+          m_pDevice->GetResourceAllocationInfo(0, 1, &desc);
+      const uint64_t budget = 512ULL * 1024 * 1024;
+      if(allocation.SizeInBytes > budget || entry.bytes > budget - allocation.SizeInBytes)
+        return "Independent float preview attachments exceed the 512 MiB scratch budget";
+      entry.bytes += allocation.SizeInBytes;
+      descriptions[i] = desc;
+    }
+    uint64_t total = entry.bytes;
+    for(const auto &item : m_EventShaderScratch)
+      total += item.second.bytes;
+    while(m_EventShaderScratch.size() >= 8 || total > 512ULL * 1024 * 1024)
+    {
+      auto oldest = m_EventShaderScratch.end();
+      for(auto it = m_EventShaderScratch.begin(); it != m_EventShaderScratch.end(); ++it)
+      {
+        // A different event may have a user-owned override. Preserve its preview resource.
+        auto active = m_EventShaderOverrides.find({it->first.first, ShaderStage::Pixel});
+        if(active != m_EventShaderOverrides.end() && active->second.independentFloatOutput)
+          continue;
+        if(oldest == m_EventShaderScratch.end() || it->second.used < oldest->second.used)
+          oldest = it;
+      }
+      if(oldest == m_EventShaderScratch.end() || !m_pDevice->DeviceWaitForIdle())
+        return "Independent float preview cache is full of active or unfinished GPU resources";
+      total -= oldest->second.bytes;
+      destroy(oldest->second);
+      m_EventShaderScratch.erase(oldest);
+    }
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CreationNodeMask = heap.VisibleNodeMask = 1;
+    for(size_t i = 0; i < descriptions.size(); i++)
+    {
+      if(descriptions[i].Width == 0)
+        continue;
+      const bool depth = i == state.rts.size();
+      ID3D12Resource **destination = depth ? &entry.depth : &entry.colors[i];
+      HRESULT hr = m_pDevice->CreateCommittedResource(
+          &heap, D3D12_HEAP_FLAG_NONE, &descriptions[i],
+          depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET, NULL,
+          __uuidof(ID3D12Resource), (void **)destination);
+      if(FAILED(hr) || !*destination)
+      {
+        destroy(entry);
+        return StringFormat::Fmt("Allocating independent float preview failed: %s", ToStr(hr).c_str());
+      }
+      (*destination)->SetName(L"Bread independent Shader preview");
+      if(depth)
+        entry.renderDSV.Init(*destination, &state.dsv.GetDSV());
+      else
+        entry.renderRTs[i].Init(*destination,
+                               i == outputTarget ? &selectedView : &state.rts[i].GetRTV());
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heapDesc.NumDescriptors = 1;
+    HRESULT hr = m_pDevice->CreateDescriptorHeap(&heapDesc, __uuidof(ID3D12DescriptorHeap),
+                                                 (void **)&entry.clearHeap);
+    if(FAILED(hr) || !entry.clearHeap)
+    {
+      destroy(entry);
+      return "Allocating the independent float preview RTV failed";
+    }
+    m_pDevice->CreateRenderTargetView(entry.colors[outputTarget], &selectedView,
+                                    entry.clearHeap->GetCPUDescriptorHandleForHeapStart());
+    found = m_EventShaderScratch.insert({cacheKey, std::move(entry)}).first;
+  }
+  EventShaderScratch &entry = found->second;
+  // Do not put an unclosed copy list in the device's pending submission queue.
+  ID3D12GraphicsCommandListX *list = m_pDevice->StealNewList();
+  if(!list)
+    return "Creating the independent float preview copy list failed";
+  for(size_t i = 0; i <= state.rts.size(); i++)
+  {
+    if(i == outputTarget)
+      continue;
+    const bool depth = i == state.rts.size();
+    ID3D12Resource *destination = depth ? entry.depth : entry.colors[i];
+    if(!destination)
+      continue;
+    ResourceId sourceId = depth ? state.dsv.GetResResourceId() : state.rts[i].GetResResourceId();
+    ID3D12Resource *source = rm->GetResAs<ID3D12Resource>(sourceId, true);
+    BarrierSet sourceBarriers, destinationBarriers;
+    sourceBarriers.Configure(source, m_pDevice->GetSubresourceStates(GetResID(source)),
+                             BarrierSet::CopySourceAccess);
+    destinationBarriers.Configure(destination,
+                                  m_pDevice->GetSubresourceStates(GetResID(destination)),
+                                  BarrierSet::CopyDestAccess);
+    sourceBarriers.Apply(list);
+    destinationBarriers.Apply(list);
+    list->CopyResource(destination, source);
+    destinationBarriers.Unapply(list);
+    sourceBarriers.Unapply(list);
+  }
+  const FLOAT clear[] = {0.0f, 0.0f, 0.0f, 0.0f};
+  list->ClearRenderTargetView(entry.clearHeap->GetCPUDescriptorHandleForHeapStart(), clear, 0, NULL);
+  HRESULT hr = list->Close();
+  if(FAILED(hr))
+  {
+    list->Release();
+    return "Closing the independent float preview copy list failed";
+  }
+  m_pDevice->ExecuteList(list);
+  entry.used = ++m_EventShaderScratchClock;
+  scratch = &entry;
   return {};
 }
 

@@ -10,6 +10,7 @@ hash-bound transfer specification.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -111,6 +112,13 @@ _IDENTITY_4X4 = (
     0.0, 0.0, 1.0, 0.0,
     0.0, 0.0, 0.0, 1.0,
 )
+
+
+# Unity and Blender scaffolds are produced by default: a package the user cannot open
+# in their engine is not a finished export. glTF is always included as the evidence
+# format; obj and fbx are opt-in.
+DEFAULT_EXPORT_TARGETS = ("gltf", "unity-urp", "blender")
+_FBX_CONVERSION_TIMEOUT_SECONDS = 600
 
 
 class ResourceExportError(RuntimeError):
@@ -642,6 +650,7 @@ class ResourceExportManager:
                     stderr=stderr_stream,
                     shell=False,
                     close_fds=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 launched = True
             except OSError:
@@ -747,9 +756,14 @@ class ResourceExportManager:
             "managedRoot": str(self.root),
             "capture": {
                 "mesh": "all raw vertex/index inputs plus supported canonical float32le/uint32le views",
-                "textures": "exact DDS evidence plus resource/view/sampler metadata",
+                "textures": ("exact DDS evidence plus readable copies (auto: TGA/PNG for LDR, "
+                             "EXR for floating-point) and resource/view/sampler metadata"),
+                "textureFormats": ["auto", "dds", "tga", "exr", "png", "jpg", "hdr", "bmp"],
                 "shaders": "capture-bound binaries/reflection and child-Agent-produced semantic plans",
                 "constantBuffers": "reflected layout and live draw values",
+                "constantBufferTransfer": "hash-checked typed physical values, current semantic lane names, material/system/raw-buffer mappings and used-lane coverage",
+                "buffers": "bounded pre-action read/storage/per-instance buffer windows plus post-action UAV references; missing counters can be reconstructed with explicit provenance and GPU readback",
+                "dispatchRoute": "geometry-free effect packages with executable ComputeShader, fullscreen or custom CPU passes, explicit input initialization and temporal warmup",
                 "viewSelection": {
                     "supportedViews": [0],
                     "reason": "the current bridge captures only view 0",
@@ -757,17 +771,19 @@ class ResourceExportManager:
             },
             "targets": {
                 "gltf": {"available": True, "profile": "glTF 2.0 + portable evidence sidecar"},
-                "unity-urp": {"available": True, "profile": "glTF base + fixed URP import/material scaffold"},
+                "unity-urp": {"available": True, "profile": "canonical captured mesh/effect + managed Unity import preserving the existing pipeline with platform and sampling evidence"},
                 "blender": {"available": True, "profile": "glTF base + fixed bpy material scaffold"},
                 "fbx": {
-                    "available": False,
+                    "available": bool(blender),
+                    "profile": "glTF converted by a detected headless Blender; the receipt names the binary",
                     "detectedProviders": [
                         item for item in (
                             {"name": "blender", "executable": blender} if blender else None,
                             {"name": "assimp", "executable": assimp} if assimp else None,
                         ) if item is not None
                     ],
-                    "reason": "FBX is a provider-derived artifact and this fixed Host does not claim a universal converter",
+                    "reason": ("" if blender else
+                               "no Blender was found; set RENDERDOC_ULTRA_BLENDER or install Blender to enable FBX"),
                 },
             },
             "coordinatePolicy": {
@@ -817,6 +833,9 @@ class ResourceExportManager:
         capture_session_id: str,
         capture_id: str = "",
         api: str = "",
+        texture_formats: Sequence[str] = ("auto",),
+        capture_path: str = "",
+        capture_source_identity: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         operation_id = _strict_hex(operation_id, 32, "operation_id")
         event_id = _strict_int(event_id, "event_id", 1, 0xFFFFFFFF)
@@ -832,6 +851,21 @@ class ResourceExportManager:
         asset_name = _strict_name(asset_name)
         if not isinstance(api, str) or "\x00" in api or len(api) > 128:
             raise ResourceExportError("api is invalid")
+        allowed_formats = ("auto", "dds", "tga", "exr", "png", "jpg", "hdr", "bmp")
+        formats: list[str] = []
+        for item in (texture_formats or ("auto",)):
+            text = str(item or "").strip().lower()
+            if not text:
+                continue
+            if text not in allowed_formats:
+                raise ResourceExportError(
+                    "unsupported texture format %r; use one of %s" % (text, ", ".join(allowed_formats)))
+            if text not in formats:
+                formats.append(text)
+        if not formats:
+            formats = ["auto"]
+        if len(formats) > 6:
+            raise ResourceExportError("at most six texture formats can be requested")
         request = {
             "schema": "replaylab-resource-export-request/v1",
             "schemaVersion": 1,
@@ -843,7 +877,13 @@ class ResourceExportManager:
             "view": view,
             "assetName": asset_name,
             "api": api,
+            "textureFormats": formats,
         }
+        if capture_source_identity:
+            request["captureSource"] = dict(capture_source_identity)
+        elif capture_path:
+            from .capture_source import capture_source
+            request["captureSource"] = capture_source({"path": capture_path, "api": api})
         request_sha256 = _json_sha256(request)
         root = self._ensure_root()
         operations = root / "operations"
@@ -886,6 +926,7 @@ class ResourceExportManager:
             "view": view,
             "captureSessionId": capture_session_id,
             "captureId": capture_id,
+            "textureFormats": formats,
         }
         now = int(time.time() * 1000)
         state = {
@@ -939,6 +980,165 @@ class ResourceExportManager:
         if os.path.normcase(str(resolved)) != os.path.normcase(str(expected.resolve(strict=True))):
             raise ResourceExportError("bridge capture directory does not match its ticket")
         return resolved
+
+    def fork_capture(self, operation_id: str, expected_bundle_sha256: str,
+                     revision_key: str = "") -> dict[str, Any]:
+        """Create a new export revision from immutable, verified capture bytes.
+
+        Only the new ticket/request/manifest identity changes. This never calls
+        the replay bridge, reads an Editor or rewrites a published package.
+        A stable revision_key resumes a lost response or interrupted copy;
+        omitting it intentionally creates another independent revision.
+        """
+        operation_id = _strict_hex(operation_id, 32, "operation_id")
+        expected_bundle_sha256 = _strict_hex(expected_bundle_sha256, 64, "expected_bundle_sha256")
+        if (not isinstance(revision_key, str) or "\x00" in revision_key
+                or len(revision_key.encode("utf-8")) > 256):
+            raise ResourceExportError("revision_key must be bounded text without NUL")
+        source_state, source_dir, source_bundle = self._validated_capture(operation_id)
+        if source_state["capture"]["manifestSha256"] != expected_bundle_sha256:
+            raise ResourceExportError("expected_bundle_sha256 does not match the source capture")
+        request = source_state["request"]
+        if _json_sha256(request) != source_state["requestSha256"]:
+            raise ResourceExportError("source capture request changed after acceptance")
+        for field, expected in (("ticketId", operation_id),
+                ("requestSha256", source_state["requestSha256"]),
+                *((field, request[field]) for field in
+                  ("captureSessionId", "eventId", "instance", "view"))):
+            if source_bundle.get(field) != expected:
+                raise ResourceExportError("source capture %s identity changed" % field)
+        if request.get("captureId") and source_bundle.get("captureId") != request["captureId"]:
+            raise ResourceExportError("source capture captureId identity changed")
+        provenance = {
+            "schema": "bread-resource-export-capture-reuse/v1",
+            "sourceOperationId": operation_id,
+            "sourceBundleSha256": expected_bundle_sha256,
+            "sourceRequestSha256": source_state["requestSha256"],
+            "revisionKeySha256": hashlib.sha256(revision_key.encode("utf-8")).hexdigest() if revision_key else "",
+            "replayPerformed": False,
+        }
+        new_id = (_json_sha256(provenance)[:32] if revision_key else uuid.uuid4().hex)
+        if new_id == operation_id:
+            raise ResourceExportError("a capture revision must use a new operation identity")
+        prepared = self.prepare_ticket(
+            operation_id=new_id, event_id=request["eventId"], instance=request["instance"],
+            view=request["view"], asset_name=request["assetName"],
+            capture_session_id=request["captureSessionId"], capture_id=request.get("captureId", ""),
+            api=request.get("api", ""), texture_formats=request.get("textureFormats", ("auto",)),
+            capture_source_identity=request.get("captureSource"))
+        state = prepared["operation"]
+        prior = state.get("captureReuse")
+        if prior is not None and prior != provenance:
+            raise ResourceExportError("revision operation is bound to different source evidence")
+        if prepared["idempotent"] and prior is None:
+            raise ResourceExportError("revision identity belongs to an unrelated operation")
+        if prior is None:
+            state["captureReuse"] = provenance
+            state["updatedUnixMs"] = int(time.time() * 1000)
+            _atomic_write_json(self._state_path(new_id), state)
+
+        # Reuse the original physical selection and all resource payloads. The
+        # new manifest explicitly identifies the Host copy and its parent;
+        # inherited replayRestoration describes the original readback only.
+        bundle = json.loads(_canonical_json_bytes(source_bundle).decode("utf-8"))
+        bundle.update(ticketId=new_id, requestSha256=state["requestSha256"], captureReuse=provenance)
+        source_origin = source_bundle.get("captureOrigin")
+        bundle["captureOrigin"] = source_origin if isinstance(source_origin, dict) else {
+            "operationId": operation_id, "bundleSha256": expected_bundle_sha256,
+            "requestSha256": source_state["requestSha256"],
+            "captureId": source_bundle.get("captureId", request.get("captureId", "")),
+            "captureSessionId": request["captureSessionId"],
+            "eventId": request["eventId"], "instance": request["instance"], "view": request["view"],
+        }
+        manifest_payload = _canonical_json_bytes(bundle)
+        manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+
+        def response(current: Mapping[str, Any], idempotent: bool) -> dict[str, Any]:
+            return {"schema": "bread-resource-export-fork/v1", "schemaVersion": 1,
+                "operationId": new_id, "operation": current,
+                "bundleSha256": manifest_sha256, "sourceOperationId": operation_id,
+                "sourceBundleSha256": expected_bundle_sha256,
+                "needsCapture": False, "replayPerformed": False, "idempotent": idempotent,
+                "nextTool": "finalize_resource_export", "captureReuse": provenance}
+
+        if state.get("status") in ("captured", "finalized"):
+            current, unused_directory, reused_bundle = self._validated_capture(new_id)
+            if (current["capture"]["manifestSha256"] != manifest_sha256
+                    or reused_bundle.get("captureReuse") != provenance):
+                raise ResourceExportError("existing revision capture changed")
+            return response(current, True)
+        if state.get("status") != "ticketed":
+            raise ResourceExportError("revision is not awaiting its verified source copy")
+        destination_dir = self._capture_dir(new_id, state)
+        manifest_relative = source_state["capture"]["manifestRelativePath"]
+        expected_files = {record["path"] for record in source_state["capture"]["files"]}
+        expected_files.add(manifest_relative)
+        if self._actual_regular_files(destination_dir) - expected_files:
+            raise ResourceExportError("uncommitted revision contains files outside its source capture")
+
+        def destination_for(relative: str) -> Path:
+            parts = _relative_parts(relative, "revision capture file")
+            current = destination_dir
+            for part in parts[:-1]:
+                current = current / part
+                if current.exists():
+                    if _is_reparse(current) or not current.is_dir():
+                        raise ResourceExportError("revision capture directory is redirected")
+                else:
+                    current.mkdir()
+            destination = current / parts[-1]
+            if _is_reparse(destination):
+                raise ResourceExportError("revision capture file is redirected")
+            if not _within(destination_dir, current.resolve(strict=True)):
+                raise ResourceExportError("revision capture file escaped its operation")
+            return destination
+
+        for record in source_state["capture"]["files"]:
+            source_path = self._capture_file(source_dir, record["path"], "revision source file")
+            destination = destination_for(record["path"])
+            if destination.exists():
+                if (not destination.is_file() or destination.stat().st_size != record["size"]
+                        or _file_sha256(destination) != record["sha256"]):
+                    raise ResourceExportError("existing revision file differs from its source")
+                continue
+            # Copy, never link: later external corruption of either operation
+            # cannot modify the other's already validated immutable bytes.
+            temporary = destination.parent / (".capture-copy-%s.tmp" % uuid.uuid4().hex)
+            try:
+                shutil.copyfile(source_path, temporary)
+                if (temporary.stat().st_size != record["size"]
+                        or _file_sha256(temporary) != record["sha256"]):
+                    raise ResourceExportError("source capture changed during revision copy")
+                if destination.exists():
+                    if (not destination.is_file() or _is_reparse(destination)
+                            or _file_sha256(destination) != record["sha256"]):
+                        raise ResourceExportError("revision destination changed during copy")
+                else:
+                    os.replace(str(temporary), str(destination))
+            finally:
+                if temporary.is_file() and not _is_reparse(temporary):
+                    temporary.unlink()
+        # A source mutation during copying must not publish a seemingly valid
+        # child, even if the changed source file happened to be copied earlier.
+        verified_source, unused_directory, unused_bundle = self._validated_capture(operation_id)
+        if verified_source["capture"]["manifestSha256"] != expected_bundle_sha256:
+            raise ResourceExportError("source capture changed before revision publication")
+        manifest_path = destination_for(manifest_relative)
+        if manifest_path.exists():
+            if not manifest_path.is_file() or _file_sha256(manifest_path, _MAX_JSON_BYTES) != manifest_sha256:
+                raise ResourceExportError("existing revision manifest differs from its source binding")
+        else:
+            _atomic_write_bytes(manifest_path, manifest_payload)
+        accepted = self.record_capture(new_id, {
+            "schema": CAPTURE_RESPONSE_SCHEMA, "schemaVersion": 1,
+            "ticketId": new_id, "requestSha256": state["requestSha256"],
+            "captureId": bundle.get("captureId", ""), "captureSessionId": request["captureSessionId"],
+            "eventId": request["eventId"], "instance": request["instance"], "view": request["view"],
+            "status": bundle.get("completion", {}).get("status", source_state["capture"]["status"]),
+            "manifestPath": str(manifest_path), "manifestSha256": manifest_sha256,
+            "files": bundle["files"],
+        })
+        return response(accepted, bool(prepared["idempotent"]))
 
     def _capture_file(self, capture_dir: Path, relative: Any, label: str) -> Path:
         parts = _relative_parts(relative, label)
@@ -1166,11 +1366,200 @@ class ResourceExportManager:
             )
         return state, capture_dir, bundle
 
+    def capture_payload(self, operation_id: str) -> dict[str, Any]:
+        """Read the captured files directly, without translation/publication gates."""
+        state = self._load_state(operation_id)
+        directory = self._capture_dir(operation_id, state)
+        receipt = state.get("capture") or {}
+        manifest = self._capture_file(directory, receipt.get("manifestRelativePath"), "capture manifest")
+        bundle = _read_json(manifest)
+        diagnostics = []
+        if _file_sha256(manifest, _MAX_JSON_BYTES) != receipt.get("manifestSha256"):
+            diagnostics.append({"code": "capture-manifest-changed", "expectedSha256": receipt.get("manifestSha256")})
+        return {"schema": "bread-resource-export-payload/v1", "operationId": operation_id,
+            "eventId": bundle["eventId"], "captureSessionId": bundle.get("captureSessionId"),
+            "captureSource": state["request"].get("captureSource"),
+            "captureDirectory": str(directory), "bundlePath": str(directory / state["capture"]["manifestRelativePath"]),
+            "bundleSha256": state["capture"]["manifestSha256"], "bundle": bundle,
+            "dataOnly": True, "requiresFinalization": False, "requiresShaderValidation": False,
+            "diagnostics": diagnostics, "fileValidation": "not-rerun; recorded hashes supplied for selective checks",
+            "nextActions": ["Read manifested model, vertex/index bytes, textures, CBuffers, Shader/reflection and render state",
+                "Use these files directly for Unity adaptation if a convenience exporter/importer is unavailable",
+                "Retain missing data/check diagnostics and judge the resulting Unity execution/images"]}
+
+    def transfer_spec_template(self, operation_id: str, constant_buffer_offset: int = 0,
+                               constant_buffer_limit: int = 128) -> dict[str, Any]:
+        """A fillable specification built from this capture's own streams.
+
+        The Agent used to discover the shape of ``transfer_spec`` by triggering
+        errors, one field per attempt, because the only description of it lived in a
+        response too large to read. This is that description: small, concrete, and
+        made of the attributes actually captured, so the first finalize can succeed.
+        """
+
+        state, capture_dir, bundle = self._validated_capture(operation_id)
+        _strict_int(constant_buffer_offset, "constant_buffer_offset", 0, 65536)
+        _strict_int(constant_buffer_limit, "constant_buffer_limit", 1, 256)
+        cbuffer_transfer = self._resolve_constant_buffers(bundle, {}, capture_dir)
+        cbuffer_fields = cbuffer_transfer["fields"]
+        cbuffer_end = min(len(cbuffer_fields), constant_buffer_offset + constant_buffer_limit)
+        mesh = bundle.get("mesh") if isinstance(bundle, Mapping) else None
+        channels: list[dict[str, Any]] = []
+        if isinstance(mesh, Mapping):
+            for index, attribute in enumerate(mesh.get("attributes") or []):
+                if not isinstance(attribute, Mapping):
+                    continue
+                canonical = attribute.get("canonical")
+                decodable = isinstance(canonical, Mapping) and str(
+                    canonical.get("status", "")).lower() not in (
+                        "unsupported", "error", "unavailable", "missing")
+                channels.append({
+                    "attributeIndex": index,
+                    "name": attribute.get("name"),
+                    "semantic": attribute.get("semantic"),
+                    "location": attribute.get("location"),
+                    "semanticIndex": attribute.get("semanticIndex"),
+                    "vertexBuffer": attribute.get("vertexBuffer"),
+                    "byteOffset": attribute.get("byteOffset"),
+                    "byteStride": attribute.get("byteStride"),
+                    "sourceFormat": attribute.get("sourceFormat"),
+                    "buffer": attribute.get("buffer"),
+                    "format": (attribute.get("sourceFormat") or {}).get("name")
+                    if isinstance(attribute.get("sourceFormat"), Mapping) else None,
+                    "components": (attribute.get("sourceFormat") or {}).get("compCount")
+                    if isinstance(attribute.get("sourceFormat"), Mapping) else None,
+                    "perInstance": attribute.get("perInstance"),
+                    "usedByShader": attribute.get("used"),
+                    "exportable": decodable,
+                })
+        example = {
+            "targets": list(DEFAULT_EXPORT_TARGETS),
+            "attributeMappings": [
+                {"source": {"attributeIndex": 0}, "target": "POSITION"},
+                {"source": {"attributeIndex": 1}, "target": "NORMAL"},
+            ],
+            "coordinateSystem": {"policy": "preserve"},
+            "uvPolicy": "preserve",
+            "material": {"name": "BreadMaterial", "alphaMode": "OPAQUE"},
+            "textureMappings": [{"sourceResourceId": 0, "role": "baseColor", "colorSpace": "sRGB"}],
+        }
+        return {
+            "schema": "replaylab-resource-export-spec-template/v1",
+            "schemaVersion": 1,
+            "operationId": operation_id,
+            "bundleSha256": state["capture"]["manifestSha256"],
+            "vertexChannels": channels,
+            "constantBufferFields": cbuffer_fields[constant_buffer_offset:cbuffer_end],
+            "constantBufferFieldCount": len(cbuffer_fields),
+            "constantBufferNextOffset": cbuffer_end if cbuffer_end < len(cbuffer_fields) else None,
+            "constantBufferCoverage": cbuffer_transfer["coverage"],
+            "constantBufferMappingPolicy": (
+                "Use source {physicalId, componentOffsets, type}, or a unique fieldId/name. "
+                "Omit value to read the captured bytes. Supplied values must encode those exact "
+                "scalar values. Cover every used physical lane as material or system; unresolved "
+                "values remain gaps. shader.organizedSources enables current semantic lane names."),
+            "howToDecide": (
+                "Read the vertex shader for this draw. Name POSITION, NORMAL and TANGENT "
+                "explicitly; leave every other channel unmapped and it is carried through in "
+                "capture slot order as _ATTR<attributeIndex>. Custom channels need an explicit "
+                "Unity vertexChannels mapping and matching Shader input; a glTF attribute name "
+                "does not bind a Unity Shader automatically."
+            ),
+            "targetsAvailable": ["gltf", "unity-urp", "blender", "fbx"],
+            "example": example,
+            "rules": [
+                "every attributeMappings entry needs a source object and a target semantic",
+                "source identifies exactly one captured stream: {\"attributeIndex\": n} is the "
+                "least ambiguous form; {\"name\": ...} and {\"location\": n} also work",
+                "target is a standard glTF semantic (POSITION, NORMAL, TANGENT, TEXCOORD_n, "
+                "COLOR_n, JOINTS_n, WEIGHTS_n) or a _CUSTOM name",
+                "JOINTS_n and WEIGHTS_n are retained as _CAPTURE_JOINTS_n/_CAPTURE_WEIGHTS_n "
+                "Shader inputs with requestedSemantic preserved. A captured draw does not establish "
+                "a skeleton, bind poses or animation clips; no glTF skin is invented. Map these "
+                "channels explicitly to Unity inputs and use the captured skinning Shader/buffers.",
+                "textureMappings entries need sourceResourceId from the captured bindings",
+                "Unity texture colorSpace must follow the selected binding view and Shader decode; "
+                "resource format or target project color space alone does not prove source sampling",
+                "optional texture uvTransform has scale:[u,v], offset:[u,v], and "
+                "space:captured-uv or exported-uv; Unity accounts for an already baked uvPolicy, "
+                "and never infers a texture flip from the graphics API",
+                "preserve captured sampler and mip evidence; unsupported border, comparison, "
+                "LOD, array, or mip behavior remains a restoration gap",
+                "a rejected finalize keeps the capture: correct the specification and call "
+                "finalize_resource_export again with the same operation_id",
+            ],
+        }
+
+    def _transfer_spec_problems(self, value: Mapping[str, Any]) -> list[str]:
+        """Every structural problem in one pass.
+
+        The normaliser fails on the first problem, which used to cost one whole
+        capture-and-finalize round trip per mistake. This lists them together so a
+        rejected specification can be corrected in a single next attempt.
+        """
+
+        problems: list[str] = []
+        if not isinstance(value, Mapping):
+            return ["transfer_spec must be an object"]
+        targets = value.get("targets", ["gltf"])
+        if not isinstance(targets, (list, tuple)) or not targets:
+            problems.append("targets must be a non-empty list, for example [\"gltf\"]")
+        else:
+            for target in targets:
+                if target == "obj":
+                    problems.append(
+                        "obj is not produced: it loses skinning, vertex colour and extra UV sets. "
+                        "Use fbx or the canonical gltf")
+                elif target not in ("gltf", "unity-urp", "blender", "fbx"):
+                    problems.append("unsupported target %r" % (target,))
+        mappings = value.get("attributeMappings", [])
+        if not isinstance(mappings, list):
+            problems.append("attributeMappings must be a list")
+        else:
+            seen: set[str] = set()
+            for position, mapping in enumerate(mappings):
+                label = "attributeMappings[%d]" % position
+                if not isinstance(mapping, Mapping):
+                    problems.append("%s must be an object" % label)
+                    continue
+                source = mapping.get("source")
+                if not isinstance(source, Mapping) or not source:
+                    problems.append(
+                        '%s needs a source object identifying one captured stream, for example '
+                        '{"name": "POSITION0"} or {"location": 0}' % label)
+                target = mapping.get("target")
+                if not isinstance(target, str) or not target:
+                    problems.append("%s needs a target semantic (POSITION, NORMAL, TEXCOORD_0, ...)" % label)
+                    continue
+                upper = target.upper()
+                if not re.fullmatch(
+                        r"(?:POSITION|NORMAL|TANGENT|TEXCOORD_[0-9]+|COLOR_[0-9]+|JOINTS_[0-9]+|WEIGHTS_[0-9]+|_[A-Z0-9_]+)",
+                        upper):
+                    problems.append(
+                        "%s target %r must be a standard glTF semantic or a _CUSTOM name" % (label, target))
+                elif upper in seen:
+                    problems.append("%s repeats the target %s" % (label, upper))
+                else:
+                    seen.add(upper)
+        textures = value.get("textureMappings", [])
+        if isinstance(textures, list):
+            for position, mapping in enumerate(textures):
+                if not isinstance(mapping, Mapping):
+                    problems.append("textureMappings[%d] must be an object" % position)
+                    continue
+                if not mapping.get("sourceResourceId"):
+                    problems.append(
+                        "textureMappings[%d] needs sourceResourceId from the captured bindings"
+                        % position)
+        elif textures is not None and not isinstance(textures, list):
+            problems.append("textureMappings must be a list")
+        return problems
+
     def _normalize_transfer_spec(self, value: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(value, Mapping):
             raise ResourceExportError("transfer_spec must be an object")
         spec = json.loads(_canonical_json_bytes(value).decode("utf-8"))
-        if len(_canonical_json_bytes(spec)) > _MAX_TRANSFER_SPEC_BYTES:
+        if len(_canonical_json_bytes(spec)) > _MAX_JSON_BYTES:
             raise ResourceExportError("transfer_spec exceeds its size limit")
         schema = spec.get("schema")
         if schema not in (None, "", TRANSFER_SCHEMA):
@@ -1179,16 +1568,18 @@ class ResourceExportManager:
         spec["schemaVersion"] = 1
         if "assetName" in spec:
             spec["assetName"] = _strict_name(spec["assetName"])
-        raw_targets = spec.get("targets", ["gltf"])
+        raw_targets = spec.get("targets", list(DEFAULT_EXPORT_TARGETS))
         if isinstance(raw_targets, str):
             raw_targets = [raw_targets]
         if not isinstance(raw_targets, list) or not raw_targets:
             raise ResourceExportError("transfer_spec targets must be a non-empty list")
         targets: list[str] = []
         for target in raw_targets:
-            if target not in ("gltf", "unity-urp", "blender"):
-                if target == "fbx":
-                    raise ResourceExportError("FBX needs an explicit external provider; this Host does not claim a universal conversion")
+            if target == "obj":
+                raise ResourceExportError(
+                    "obj is not produced: it cannot carry skinning, vertex colour or extra UV "
+                    "sets. Use fbx (converted by a detected Blender) or the canonical gltf")
+            if target not in ("gltf", "unity-urp", "blender", "fbx"):
                 raise ResourceExportError("unsupported resource-export target %r" % target)
             if target not in targets:
                 targets.append(target)
@@ -1253,12 +1644,20 @@ class ResourceExportManager:
         for mapping in mappings:
             if not isinstance(mapping, dict) or not isinstance(mapping.get("source"), dict):
                 raise ResourceExportError("attributeMappings entries require source objects")
+            source = mapping["source"]
+            if "attributeIndex" in source:
+                index = _strict_int(source.pop("attributeIndex"), "attributeIndex", 0, _MAX_ATTRIBUTES - 1)
+                if "index" in source and source["index"] != index:
+                    raise ResourceExportError("attributeIndex conflicts with index")
+                source["index"] = index
+            if not source or set(source) - {"index", "location", "name", "semantic", "semanticIndex"}:
+                raise ResourceExportError("attribute mapping source has no supported unique identity")
             target = mapping.get("target")
             if not isinstance(target, str) or not target:
                 raise ResourceExportError("attributeMappings target is required")
             target = target.upper()
             if not re.fullmatch(
-                r"(?:POSITION|NORMAL|TANGENT|TEXCOORD_[0-9]+|COLOR_[0-9]+|_[A-Z0-9_]+)",
+                r"(?:POSITION|NORMAL|TANGENT|TEXCOORD_[0-9]+|COLOR_[0-9]+|JOINTS_[0-9]+|WEIGHTS_[0-9]+|_[A-Z0-9_]+)",
                 target,
             ):
                 raise ResourceExportError(
@@ -1387,6 +1786,8 @@ class ResourceExportManager:
                 raise ResourceExportError(
                     "constant-buffer classification must be material, system or unknown"
                 )
+            if item.get("binding") is not None and (item["binding"] != "raw-buffer" or classification != "material"):
+                raise ResourceExportError("constant-buffer binding supports raw-buffer only for material data")
             target = item.get("target")
             if classification in ("material", "system") and (
                 not isinstance(target, str) or not target or "\x00" in target
@@ -1402,7 +1803,56 @@ class ResourceExportManager:
                 item["target"] = str(target or "")
                 item["disposition"] = "sidecar-only"
         spec["constantBuffers"] = constant_buffers
+        unity = spec.get("unity", {})
+        if not isinstance(unity, dict):
+            raise ResourceExportError("unity must be an object")
+        assets = unity.get("assets", [])
+        if not isinstance(assets, list) or len(assets) > 256:
+            raise ResourceExportError("unity.assets must be a bounded list")
+        paths = {"adapter.json", "readme.md", "shaders/breadexport.shader"}
+        extensions = {"shader": {".shader"}, "include": {".hlsl", ".cginc"},
+                      "compute": {".compute"}, "script": {".cs", ".asmdef", ".asmref"},
+                      "data": {".json", ".bytes", ".txt"}}
+        for asset in assets:
+            if not isinstance(asset, dict):
+                raise ResourceExportError("unity.assets entries must be objects")
+            relative = "/".join(_relative_parts(asset.get("path"), "Unity asset path"))
+            key = relative.casefold()
+            kind = asset.get("kind")
+            if (key in paths or key.startswith("capturesources/") or
+                    kind not in extensions or Path(relative).suffix.lower() not in extensions[kind]):
+                raise ResourceExportError("Unity asset path collides or its extension does not match kind")
+            paths.add(key)
+            asset["path"] = relative
+            payload = self._unity_asset_bytes(asset)
+            asset["sha256"] = hashlib.sha256(payload).hexdigest()
+        unity["assets"] = assets
+        spec["unity"] = unity
         return spec
+
+    @staticmethod
+    def _unity_asset_bytes(asset: Mapping[str, Any]) -> bytes:
+        has_content, has_path = "content" in asset, "sourcePath" in asset
+        if has_content == has_path:
+            raise ResourceExportError("Unity asset requires exactly one of content or sourcePath")
+        if has_content:
+            content = asset["content"]
+            if not isinstance(content, str) or "\x00" in content:
+                raise ResourceExportError("Unity asset content must be text without NUL")
+            payload = content.encode("utf-8")
+        else:
+            path = Path(str(asset["sourcePath"]))
+            if not path.is_absolute() or not path.is_file() or path.stat().st_size > _MAX_JSON_BYTES:
+                raise ResourceExportError("Unity asset source must be a bounded absolute file")
+            if any(_is_reparse(part) for part in (path, *path.parents)):
+                raise ResourceExportError("Unity asset source is redirected")
+            _strict_hex(asset.get("sha256"), 64, "Unity asset source sha256")
+            payload = path.read_bytes()
+        if not payload or len(payload) > _MAX_JSON_BYTES:
+            raise ResourceExportError("Unity asset is empty or exceeds its size limit")
+        if asset.get("sha256") and hashlib.sha256(payload).hexdigest() != asset["sha256"]:
+            raise ResourceExportError("Unity asset source hash changed")
+        return payload
 
     def _cbuffer_source_identities(
         self, bundle: Mapping[str, Any], capture_dir: Path
@@ -1530,36 +1980,7 @@ class ResourceExportManager:
                         "texture sourceUse must identify exactly one captured binding"
                     )
 
-        cbuffer_identities = self._cbuffer_source_identities(bundle, capture_dir)
-        for mapping in spec.get("constantBuffers", []):
-            source = mapping["source"]
-            if isinstance(source, str):
-                identity = source
-            else:
-                explicit_id = source.get(
-                    "parameterId",
-                    source.get("stableId", source.get("id")),
-                )
-                block = source.get("block")
-                variable = source.get("variable")
-                stage = source.get("stage")
-                if isinstance(explicit_id, (str, int)) and not isinstance(explicit_id, bool):
-                    identity = str(explicit_id)
-                elif isinstance(block, str) and isinstance(variable, str):
-                    identity = "%s.%s" % (block, variable)
-                    staged = (
-                        "%s.%s" % (stage, identity)
-                        if isinstance(stage, str) and stage
-                        else ""
-                    )
-                    if staged in cbuffer_identities:
-                        identity = staged
-                else:
-                    raise ResourceExportError(
-                        "constant-buffer source object requires parameterId or block+variable"
-                    )
-            if identity not in cbuffer_identities:
-                raise ResourceExportError("constant-buffer mapping references a parameter absent from the capture bundle")
+        self._resolve_constant_buffers(bundle, spec, capture_dir)
 
         shader = spec.get("shader", {})
         generated_source = shader.get("unityShaderSource") if isinstance(
@@ -1601,6 +2022,18 @@ class ResourceExportManager:
             elif actual_value != expected_value:
                 return False
         return True
+
+    @staticmethod
+    def _resolve_constant_buffers(bundle: Mapping[str, Any], spec: Mapping[str, Any],
+                                  capture_dir: Path) -> dict[str, Any]:
+        try:
+            from .cbuffer_transfer import resolve_cbuffer_transfer, CBufferTransferError
+        except ImportError:  # Standalone compatibility/test loader.
+            from src.cbuffer_transfer import resolve_cbuffer_transfer, CBufferTransferError
+        try:
+            return resolve_cbuffer_transfer(bundle, spec, capture_dir)
+        except CBufferTransferError as error:
+            raise ResourceExportError(str(error)) from error
 
     def _validated_target_candidate(
         self,
@@ -1680,14 +2113,14 @@ class ResourceExportManager:
         if actual_files != expected_files:
             raise ResourceExportError("published target file set changed")
         gltf = _read_json(target / "asset.gltf")
-        if gltf.get("asset", {}).get("version") != "2.0" or not gltf.get(
-            "meshes"
-        ):
+        effect = (gltf.get("extras", {}).get("replaylab", {}).get("executionKind") == "effect"
+                  and gltf.get("extras", {}).get("replaylab", {}).get("geometryApplicable") is False)
+        if gltf.get("asset", {}).get("version") != "2.0" or (not gltf.get("meshes") and not effect):
             raise ResourceExportError("published target glTF is invalid")
         buffers = gltf.get("buffers")
-        if not isinstance(buffers, list) or not buffers:
+        if not effect and (not isinstance(buffers, list) or not buffers):
             raise ResourceExportError("published target glTF omitted its buffer")
-        expected_binary = buffers[0].get("byteLength")
+        expected_binary = 0 if effect else buffers[0].get("byteLength")
         if (
             isinstance(expected_binary, bool)
             or not isinstance(expected_binary, int)
@@ -1735,10 +2168,41 @@ class ResourceExportManager:
         state, capture_dir, bundle = self._validated_capture(operation_id)
         if state["capture"]["manifestSha256"] != expected_bundle_sha256:
             raise ResourceExportError("expected_bundle_sha256 does not match the accepted capture bundle")
-        spec = self._normalize_transfer_spec(transfer_spec)
+        try:
+            spec = self._normalize_transfer_spec(transfer_spec)
+        except ResourceExportError as error:
+            problems = self._transfer_spec_problems(transfer_spec)
+            first = str(error)
+            if first not in problems:
+                problems.insert(0, first)
+            if len(problems) > 1:
+                raise ResourceExportError(
+                    "the transfer specification has %d problems; fix them together and call "
+                    "finalize_resource_export again with the same operation (the captured bundle "
+                    "is still valid, do not prepare it again): %s"
+                    % (len(problems), "; ".join(problems[:12]))
+                ) from error
+            raise
         if "assetName" not in spec:
             spec["assetName"] = state["request"]["assetName"]
         self._validate_transfer_references(bundle, spec, capture_dir)
+        constant_buffer_transfer = self._resolve_constant_buffers(bundle, spec, capture_dir)
+        spec["constantBuffers"] = constant_buffer_transfer["mappings"]
+        spec["constantBufferCoverage"] = constant_buffer_transfer["coverage"]
+        # Expanded naming/layout/review evidence is useful while resolving the
+        # CBuffers, but it is not the transfer specification. Keep it losslessly
+        # in manifested sidecars rather than forcing the Agent to trim proofs.
+        from .unity_shader_sources import compact_source_evidence
+        source_evidence = []
+        for source in spec.get("shader", {}).get("organizedSources", []):
+            payload = _canonical_json_bytes(source)
+            relative = "shader-evidence/%s-%s.json" % (source["stage"], hashlib.sha256(payload).hexdigest())
+            source_evidence.append((relative, payload))
+        if source_evidence:
+            spec["shader"]["organizedSources"] = [compact_source_evidence(source, relative, hashlib.sha256(payload).hexdigest())
+                for source, (relative, payload) in zip(spec["shader"]["organizedSources"], source_evidence)]
+        if len(_canonical_json_bytes(spec)) > _MAX_TRANSFER_SPEC_BYTES:
+            raise ResourceExportError("transfer_spec exceeds its size limit after extracting Shader evidence")
         finalize_binding = {
             "operationId": operation_id,
             "requestSha256": state["requestSha256"],
@@ -1771,14 +2235,18 @@ class ResourceExportManager:
             "bundleSha256": expected_bundle_sha256,
         }
         existing_intent = state.get("finalizeIntent")
+        if existing_intent is not None and existing_intent != intent:
+            if (operation_dir / "target").exists():
+                raise ResourceExportError(
+                    "operation is already bound to a different finalize intent"
+                )
+            # The bound attempt produced nothing, so it holds no authority over this
+            # operation: a corrected specification may reuse the same capture bundle.
+            existing_intent = None
         if existing_intent is None:
             state["finalizeIntent"] = intent
             state["updatedUnixMs"] = int(time.time() * 1000)
             _atomic_write_json(self._state_path(operation_id), state)
-        elif existing_intent != intent:
-            raise ResourceExportError(
-                "operation is already bound to a different finalize intent"
-            )
         if output_dir.exists():
             state, recovered = self._adopt_finalized_target(operation_id, state)
             if not recovered:
@@ -1811,11 +2279,18 @@ class ResourceExportManager:
                 shutil.copyfile(source, destination)
 
             gltf_result = self._write_gltf(staging, capture_dir, bundle, expected_bundle_sha256, spec)
+            for relative, payload in source_evidence:
+                destination = staging / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_bytes(destination, payload)
+            _atomic_write_json(staging / "cbuffer-transfer.json", constant_buffer_transfer)
             adapter_files: list[str] = []
             if "unity-urp" in spec["targets"]:
                 adapter_files.extend(self._write_unity_scaffold(staging, spec, gltf_result))
             if "blender" in spec["targets"]:
                 adapter_files.extend(self._write_blender_scaffold(staging, spec, gltf_result))
+            if "fbx" in spec["targets"]:
+                adapter_files.extend(self._write_fbx(staging, spec))
             _atomic_write_json(staging / "transfer-spec.json", spec)
             package_files = self._package_file_records(staging)
             package_manifest = {
@@ -1824,6 +2299,7 @@ class ResourceExportManager:
                 "operationId": operation_id,
                 "requestSha256": state["requestSha256"],
                 "captureBundleSha256": expected_bundle_sha256,
+                "captureSource": state["request"].get("captureSource"),
                 "finalizeSha256": finalize_sha256,
                 "targets": spec["targets"],
                 "gltf": gltf_result,
@@ -1841,6 +2317,13 @@ class ResourceExportManager:
         except Exception:
             if staging.exists() and not _is_reparse(staging):
                 shutil.rmtree(staging)
+            # Nothing was published, so release the binding: the next attempt corrects
+            # the specification against the same capture instead of re-capturing.
+            if not (operation_dir / "target").exists() and state.get("finalizeIntent") == intent:
+                state["finalizeIntent"] = None
+                state["updatedUnixMs"] = int(time.time() * 1000)
+                with contextlib.suppress(Exception):
+                    _atomic_write_json(self._state_path(operation_id), state)
             raise
 
         state, recovered = self._adopt_finalized_target(operation_id, state)
@@ -1926,10 +2409,9 @@ class ResourceExportManager:
     def _mapping_for(attribute: Mapping[str, Any], mappings: Sequence[Mapping[str, Any]]) -> str | None:
         for mapping in mappings:
             source = mapping.get("source", {})
-            matches = True
-            for field in ("location", "name", "semantic", "semanticIndex"):
-                if field in source and source[field] != attribute.get(field):
-                    matches = False
+            matches = bool(source) and all(
+                attribute.get("index" if field == "attributeIndex" else field) == value
+                for field, value in source.items())
             if matches:
                 return str(mapping["target"])
         return None
@@ -2054,6 +2536,20 @@ class ResourceExportManager:
         if not isinstance(mesh, dict):
             raise ResourceExportError("capture bundle omitted mesh")
         attributes = mesh.get("attributes")
+        if mesh.get("source") == "not-applicable-dispatch":
+            # glTF permits an empty scene. Do not fabricate a mesh from stale IA
+            # state merely to transport a ComputeShader/effect package.
+            provenance = {"executionKind": "effect", "geometryApplicable": False,
+                          "source": "not-applicable-dispatch", "captureBundleSha256": bundle_sha256,
+                          "uvPolicy": spec.get("uvPolicy", "preserve")}
+            gltf = {"asset": {"version": "2.0", "generator": "Bread"}, "scene": 0,
+                    "scenes": [{"name": str(spec.get("assetName") or "Bread Effect")}],
+                    "extras": {"replaylab": provenance}}
+            _atomic_write_json(output / "asset.gltf", gltf)
+            _atomic_write_bytes(output / "asset.bin", b"")
+            return {"path": "asset.gltf", "binaryPath": "asset.bin", "vertexCount": 0, "indexCount": 0,
+                    "attributes": [], "vertexChannels": [], "omittedAttributes": [],
+                    "geometryApplicable": False, "executionKind": "effect", "extras": gltf["extras"]}
         if not isinstance(attributes, list) or not attributes:
             raise ResourceExportError("capture bundle has no vertex attributes")
         mode, mode_name = self._topology_mode(mesh.get("topology"))
@@ -2069,7 +2565,11 @@ class ResourceExportManager:
         vertex_count: int | None = None
         mappings = spec.get("attributeMappings", [])
         used_targets: set[str] = set()
-        for attribute in attributes:
+        # Decode once, then decide. Channel roles are inferred from the data for streams
+        # whose semantic carries no meaning (SPIR-V reconstructions name them
+        # ``__replaylab_s0_b0_c0_x_f32``), so an anonymous mesh still exports.
+        decoded_attributes: list[dict[str, Any]] = []
+        for index, attribute in enumerate(attributes):
             if not isinstance(attribute, dict):
                 raise ResourceExportError("mesh attribute entry is invalid")
             if attribute.get("perInstance") is True:
@@ -2082,15 +2582,94 @@ class ResourceExportManager:
             payload, count, components = self._canonical_blob(capture_dir, canonical, "float32le")
             decoded_values = struct.unpack("<%df" % (count * components), payload)
             if any(not math.isfinite(value) for value in decoded_values):
-                raise ResourceExportError(
-                    "canonical attribute contains NaN or infinity; raw evidence remains in the source sidecar"
-                )
+                target = self._mapping_for(attribute, mappings) or self._automatic_target(attribute)
+                if target == "POSITION":
+                    raise ResourceExportError("POSITION contains NaN or infinity; supply a decoded position adapter")
+                omitted.append({"name": attribute.get("name"), "attributeIndex": index,
+                    "target": target, "reason": "non-finite float view; preserve raw bits for a Shader buffer adapter",
+                    "raw": attribute.get("raw"), "canonical": canonical,
+                    "shaderInputPolicy": "raw-bits", "adapterRequired": True})
+                continue
+            decoded_attributes.append({
+                "index": index,
+                "attribute": attribute,
+                "payload": payload,
+                "count": count,
+                "components": components,
+            })
+        passthrough_receipt: list[dict[str, Any]] = []
+        channel_receipts: list[dict[str, Any]] = []
+        forced_targets: dict[int, str] = {}
+        assumed_position: dict[str, Any] | None = None
+        if not any(str(mapping.get("target", "")).upper() == "POSITION" for mapping in mappings):
+            declared = [
+                entry for entry in decoded_attributes
+                if not self._automatic_target(entry["attribute"]).startswith("_")
+                and self._automatic_target(entry["attribute"]) == "POSITION"
+            ]
+            if not declared:
+                # glTF cannot describe a primitive without POSITION. Rather than refuse,
+                # take the first stream the vertex shader actually reads that can hold a
+                # position, and say so in the receipt: slot order and the shader's own
+                # "used" flag, never a statistical guess about the values.
+                for entry in decoded_attributes:
+                    if entry["components"] < 3 or entry["attribute"].get("used") is False:
+                        continue
+                    assumed_position = entry
+                    forced_targets[entry["index"]] = "POSITION"
+                    break
+                if assumed_position is None:
+                    observed = ", ".join(
+                        "%s(%d components)" % (
+                            entry["attribute"].get("name") or "attribute %d" % entry["index"],
+                            entry["components"])
+                        for entry in decoded_attributes[:12]
+                    ) or "none"
+                    raise ResourceExportError(
+                        "glTF needs a POSITION stream and no captured stream has three components. "
+                        "Captured per-vertex streams: %s. Read the vertex shader and name the "
+                        'position stream: attributeMappings=[{"source": {"attributeIndex": <n>}, '
+                        '"target": "POSITION"}].' % observed
+                    )
+        for entry in decoded_attributes:
+            attribute = entry["attribute"]
+            payload, count, components = entry["payload"], entry["count"], entry["components"]
             if vertex_count is None:
                 vertex_count = count
             elif vertex_count != count:
                 raise ResourceExportError("per-vertex canonical attribute counts disagree")
-            target = self._mapping_for(attribute, mappings) or self._automatic_target(attribute)
+            target = self._mapping_for(attribute, mappings) or forced_targets.get(entry["index"])
+            if target is None:
+                # Nothing here guesses what a stream means. A named semantic is honoured;
+                # anything else is carried through under its own slot so the data survives
+                # intact and can be identified later (or by the shader that reads it).
+                automatic = self._automatic_target(attribute)
+                if automatic.startswith("_"):
+                    target = "_ATTR%d" % entry["index"]
+                    passthrough_receipt.append({
+                        "attributeIndex": entry["index"],
+                        "attribute": attribute.get("name"),
+                        "location": attribute.get("location"),
+                        "vertexBuffer": attribute.get("vertexBuffer"),
+                        "components": components,
+                        "target": target,
+                        "note": ("carried through in capture slot order; no semantic was declared "
+                                 "for it and the Host does not invent one"),
+                    })
+                else:
+                    target = automatic
             target = target.upper()
+            requested_target = target
+            if re.fullmatch(r"(?:JOINTS|WEIGHTS)_[0-9]+", target):
+                # glTF JOINTS/WEIGHTS claim a skin and integer accessors. The
+                # draw only establishes exact Shader inputs, not a hierarchy
+                # or inverse bind poses. Preserve inputs as custom channels;
+                # Unity can bind them to the captured skinning implementation.
+                target = "_CAPTURE_" + target
+                passthrough_receipt.append({"attributeIndex": entry["index"],
+                    "attribute": attribute.get("name"), "target": target,
+                    "requestedSemantic": requested_target, "runtimeSkeletonCreated": False,
+                    "note": "captured skinning Shader input; skeleton and inverse bind poses are not inferred"})
             if not re.fullmatch(r"(?:POSITION|NORMAL|TANGENT|TEXCOORD_[0-9]+|COLOR_[0-9]+|_[A-Z0-9_]+)", target):
                 raise ResourceExportError("attribute mapping target %r is not a glTF semantic" % target)
             required_components = {"POSITION": 3, "NORMAL": 3, "TANGENT": 4}.get(target)
@@ -2098,6 +2677,9 @@ class ResourceExportManager:
                 omitted.append({"name": attribute.get("name"), "target": target, "reason": "component count is incompatible with the standard semantic"})
                 target = self._automatic_target({**attribute, "semantic": "CUSTOM_%s" % target})
             if target.startswith("TEXCOORD_") and components != 2:
+                if spec["uvPolicy"] != "preserve":
+                    raise ResourceExportError("packed TEXCOORD requires an explicit per-component UV adaptation; "
+                                              "preserve it and implement the verified swizzle/flip in the target Shader")
                 target = self._automatic_target({**attribute, "semantic": "CUSTOM_%s" % target})
             if target.startswith("COLOR_") and components not in (3, 4):
                 target = self._automatic_target({**attribute, "semantic": "CUSTOM_%s" % target})
@@ -2131,10 +2713,28 @@ class ResourceExportManager:
             accessor_index = len(accessors)
             accessors.append(accessor)
             primitive_attributes[target] = accessor_index
+            channel_receipts.append({
+                "attributeIndex": entry["index"], "gltfSemantic": target,
+                "requestedSemantic": requested_target, "components": components,
+                "canonicalEncoding": "float32le", "accessorIndex": accessor_index,
+                "source": {key: attribute.get(key) for key in (
+                    "name", "semantic", "semanticIndex", "location", "vertexBuffer",
+                    "byteOffset", "byteStride", "sourceFormat", "buffer", "used",
+                    "perInstance", "instanceStepRate", "floatCastWrong")},
+                "shaderInputPolicy": "decoded numeric values; preserve component count and explicit target semantic",
+            })
         if vertex_count is None or vertex_count <= 0:
             raise ResourceExportError("no canonical per-vertex attribute can be exported")
-        if "POSITION" not in primitive_attributes:
-            raise ResourceExportError("glTF export requires an explicit or observed POSITION attribute")
+        if assumed_position is not None:
+            passthrough_receipt.append({
+                "attributeIndex": assumed_position["index"],
+                "attribute": assumed_position["attribute"].get("name"),
+                "target": "POSITION",
+                "assumed": True,
+                "note": ("no stream declared POSITION; the first vertex-shader-read stream with "
+                         "three or more components was used. Confirm it against the vertex shader "
+                         "and override with attributeMappings when it is wrong"),
+            })
 
         indices_record = mesh.get("indices")
         indexed = bool(mesh.get("indexed", isinstance(indices_record, dict)))
@@ -2172,7 +2772,7 @@ class ResourceExportManager:
 
         material_spec = spec.get("material", {})
         material: dict[str, Any] = {
-            "name": str(material_spec.get("name", "ReplayLabMaterial") or "ReplayLabMaterial")[:128],
+            "name": str(material_spec.get("name", "BreadMaterial") or "BreadMaterial")[:128],
             "alphaMode": material_spec.get("alphaMode", "OPAQUE"),
             "doubleSided": bool(material_spec.get("doubleSided", False)),
             "pbrMetallicRoughness": {},
@@ -2189,7 +2789,7 @@ class ResourceExportManager:
             material["alphaCutoff"] = float(cutoff) if isinstance(cutoff, (int, float)) and not isinstance(cutoff, bool) else 0.5
         asset_name = str(spec.get("assetName", "") or "") or "RenderDocAsset"
         gltf = {
-            "asset": {"version": "2.0", "generator": "RenderDoc Ultra ReplayLab resource export"},
+            "asset": {"version": "2.0", "generator": "Bread resource export"},
             "scene": 0,
             "scenes": [{"nodes": [0]}],
             "nodes": [{"mesh": 0, "name": asset_name}],
@@ -2208,6 +2808,8 @@ class ResourceExportManager:
                     "uvPolicy": spec["uvPolicy"],
                     "windingFlipped": winding_flipped,
                     "omittedAttributes": omitted,
+                    "passthroughAttributes": passthrough_receipt,
+                    "vertexChannels": channel_receipts,
                 }
             },
         }
@@ -2220,9 +2822,68 @@ class ResourceExportManager:
             "indexCount": len(indices),
             "attributes": sorted(primitive_attributes),
             "omittedAttributes": omitted,
+            "passthroughAttributes": passthrough_receipt,
+            "vertexChannels": channel_receipts,
             "topology": mode_name,
             "windingFlipped": winding_flipped,
         }
+
+    def _write_fbx(self, output: Path, spec: Mapping[str, Any]) -> list[str]:
+        """Convert the published glTF to FBX with a detected headless Blender.
+
+        There is no complete open FBX writer to embed, and inventing one would be a
+        worse answer than driving the converter the user already has. The receipt
+        names the binary and its version so the artifact is auditable.
+        """
+
+        blender = str(self._environment.get(BLENDER_ENV, "") or "").strip() or shutil.which("blender") or ""
+        name = str(spec.get("assetName", "asset") or "asset")
+        receipt: dict[str, Any] = {
+            "schema": "replaylab-resource-export-fbx-receipt/v1",
+            "schemaVersion": 1,
+            "source": "asset.gltf",
+            "converter": "blender",
+        }
+        if not blender:
+            receipt["status"] = "unavailable"
+            receipt["reason"] = ("no Blender was found; set RENDERDOC_ULTRA_BLENDER or install "
+                                 "Blender, then finalize again with the fbx target")
+            _atomic_write_json(output / "fbx-receipt.json", receipt)
+            return ["fbx-receipt.json"]
+        script = (
+            "import bpy, sys\n"
+            "bpy.ops.wm.read_factory_settings(use_empty=True)\n"
+            "bpy.ops.import_scene.gltf(filepath=sys.argv[-2])\n"
+            "bpy.ops.export_scene.fbx(filepath=sys.argv[-1], add_leaf_bones=False,\n"
+            "                         bake_anim=False, path_mode='COPY', embed_textures=False)\n"
+        )
+        script_path = output / "fbx-convert.py"
+        _atomic_write_bytes(script_path, script.encode("utf-8"))
+        target = output / ("%s.fbx" % name)
+        try:
+            completed = subprocess.run(
+                [blender, "--background", "--factory-startup", "--python", str(script_path),
+                 "--", str(output / "asset.gltf"), str(target)],
+                capture_output=True, timeout=_FBX_CONVERSION_TIMEOUT_SECONDS, check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            receipt["status"] = "failed"
+            receipt["error"] = str(error)[:400]
+            _atomic_write_json(output / "fbx-receipt.json", receipt)
+            return ["fbx-receipt.json", "fbx-convert.py"]
+        receipt["executable"] = blender
+        receipt["exitCode"] = completed.returncode
+        receipt["stderrTail"] = completed.stderr.decode("utf-8", "replace")[-2000:]
+        if completed.returncode != 0 or not target.is_file():
+            receipt["status"] = "failed"
+            _atomic_write_json(output / "fbx-receipt.json", receipt)
+            return ["fbx-receipt.json", "fbx-convert.py"]
+        receipt["status"] = "converted"
+        receipt["path"] = "%s.fbx" % name
+        receipt["sha256"] = _file_sha256(target, _MAX_SOURCE_FILE_BYTES)
+        _atomic_write_json(output / "fbx-receipt.json", receipt)
+        return ["%s.fbx" % name, "fbx-receipt.json", "fbx-convert.py"]
 
     @staticmethod
     def _write_unity_scaffold(output: Path, spec: Mapping[str, Any], gltf: Mapping[str, Any]) -> list[str]:
@@ -2233,7 +2894,8 @@ class ResourceExportManager:
             "schema": "replaylab-unity-urp-adapter/v1",
             "schemaVersion": 1,
             "mesh": "../asset.gltf",
-            "requiredPackage": "com.unity.cloud.gltfast",
+            "requiredPackage": "com.bread.renderdoc",
+            "importTool": "import_resource_export_to_unity",
             "pipeline": "UniversalRenderPipeline",
             "material": spec.get("material", {}),
             "textures": spec.get("textures", []),
@@ -2243,22 +2905,61 @@ class ResourceExportManager:
             "textureImportAuthority": "Use each transfer-spec texture colorSpace (sRGB/linear/raw), exact captured view format, and captured sampler unless the target cannot represent it",
             "constantBufferPolicy": "material entries become material properties; system entries use Unity frame/camera/object globals; unknown entries remain sidecar-only and are not applied",
             "shaderSourceProvenance": spec.get("shader", {}).get("provenance", {}),
+            "vertexChannels": gltf.get("extras", {}).get("replaylab", {}).get("vertexChannels", []),
         }
         _atomic_write_json(root / "adapter.json", settings)
         readme = (
-            "# ReplayLab Unity URP adapter\n\n"
-            "Import `../asset.gltf` with Unity glTFast, then apply the reviewed settings in "
-            "`adapter.json` to a `Universal Render Pipeline/Lit` material. Exact DDS files and "
-            "their view/sampler metadata remain under `../source/`; convert only when the target "
-            "importer requires it. Camera, object, view and projection system values must use "
-            "Unity's current frame values rather than captured constants.\n"
+            "# Bread Unity URP adapter\n\n"
+            "Call `import_resource_export_to_unity` with the export operation ID and Unity "
+            "project directory. Bread prepares its pinned Unity MCP and built-in importer, "
+            "then imports the canonical mesh, mapped texture images and material parameters. "
+            "A supplied Unity Shader is compiled in the target project; URP/Lit is used only "
+            "for an explicit `target-native-pbr` strategy. Exact DDS files and view/sampler "
+            "evidence remain under `../source/`. Unmapped channels, unsupported images and "
+            "missing Shader properties are reported in the import receipt. Camera, object, "
+            "view and projection system values must use Unity's current frame values. "
+            "The generated preview scene is a starting point; import and compilation do not "
+            "prove visual equivalence. The glTF remains available for other importers.\n"
         )
         _atomic_write_bytes(root / "README.md", readme.encode("utf-8"))
         source = spec.get("shader", {}).get("unityShaderSource")
         files = ["UnityURP/adapter.json", "UnityURP/README.md"]
         if isinstance(source, str) and source.strip():
-            _atomic_write_bytes(root / "Shaders" / "ReplayLabExport.shader", source.encode("utf-8"))
-            files.append("UnityURP/Shaders/ReplayLabExport.shader")
+            _atomic_write_bytes(root / "Shaders" / "BreadExport.shader", source.encode("utf-8"))
+            files.append("UnityURP/Shaders/BreadExport.shader")
+        for asset in spec.get("unity", {}).get("assets", []):
+            relative = "/".join(_relative_parts(asset["path"], "Unity asset path"))
+            destination = root.joinpath(*relative.split("/"))
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_bytes(destination, ResourceExportManager._unity_asset_bytes(asset))
+            files.append("UnityURP/" + relative)
+        snapshots = []
+        for organized in spec.get("shader", {}).get("organizedSources", []):
+            stage = str(organized.get("stage", ""))
+            if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", stage):
+                raise ResourceExportError("organized Shader stage is invalid")
+            source_path = Path(str(organized.get("sourcePath", "")))
+            dependencies = [{"path": str(source_path), "sha256": organized.get("sourceSha256")}]
+            dependencies.extend(organized.get("dependencyFiles", []))
+            for index, dependency in enumerate(dependencies):
+                path = Path(str(dependency.get("path", "")))
+                payload = ResourceExportManager._unity_asset_bytes({
+                    "sourcePath": str(path), "sha256": dependency.get("sha256")})
+                name = path.name if index == 0 else "Dependencies/" + str(dependency["sha256"])[:16] + "_" + path.name
+                relative = "CaptureSources/" + stage + "/" + str(organized["sourceSha256"])[:16] + "/" + name
+                destination = root.joinpath(*_relative_parts(relative, "captured Shader snapshot"))
+                if destination.exists():
+                    if destination.read_bytes() == payload:
+                        continue
+                    raise ResourceExportError("captured Shader snapshots collide")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_bytes(destination, payload)
+                files.append("UnityURP/" + relative)
+                snapshots.append({"stage": stage, "sourcePath": str(path), "packagePath": relative,
+                                  "sha256": dependency["sha256"], "kind": "source" if index == 0 else "dependency"})
+        if snapshots:
+            _atomic_write_json(root / "CaptureSources" / "manifest.json", {"schema": "bread-captured-shader-snapshots/v1", "files": snapshots})
+            files.append("UnityURP/CaptureSources/manifest.json")
         return files
 
     @staticmethod
@@ -2278,7 +2979,7 @@ class ResourceExportManager:
             "constantBufferPolicy": "material entries become node inputs; system entries use Blender scene/object/camera state; unknown entries remain sidecar-only and are not applied",
             "shaderSourceProvenance": spec.get("shader", {}).get("provenance", {}),
         })
-        script = '''# Fixed ReplayLab Blender adapter. Run with Blender 4.x.
+        script = '''# Fixed Bread Blender adapter. Run with Blender 4.x.
 import json
 from pathlib import Path
 import bpy
@@ -2288,7 +2989,7 @@ package = here.parent
 settings = json.loads((here / "adapter.json").read_text(encoding="utf-8"))
 bpy.ops.import_scene.gltf(filepath=str((package / "asset.gltf").resolve()))
 material_settings = settings.get("material", {})
-material = bpy.data.materials.new(str(material_settings.get("name") or "ReplayLabMaterial"))
+material = bpy.data.materials.new(str(material_settings.get("name") or "BreadMaterial"))
 material.use_nodes = True
 principled = next((n for n in material.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
 if principled is not None:
@@ -2302,11 +3003,11 @@ if principled is not None:
 for obj in bpy.context.selected_objects:
     if getattr(obj.data, "materials", None) is not None:
         obj.data.materials.append(material)
-print("ReplayLab import complete; review adapter.json texture/CBuffer decisions before visual acceptance.")
+print("Bread import complete; review adapter.json texture/CBuffer decisions before visual acceptance.")
 '''
         _atomic_write_bytes(root / "import_resource.py", script.encode("utf-8"))
         readme = (
-            "# ReplayLab Blender adapter\n\n"
+            "# Bread Blender adapter\n\n"
             "Open Blender 4.x and run `import_resource.py`. The fixed script imports the glTF and "
             "creates a Principled BSDF baseline. Review texture color-space/sampler choices and "
             "shader-specific node decisions recorded in `adapter.json`; captured camera matrices "
@@ -2465,7 +3166,7 @@ try:
     )
     material_settings = settings.get("material", {})
     material = bpy.data.materials.new(
-        str(material_settings.get("name") or "ReplayLabMaterial")
+        str(material_settings.get("name") or "BreadMaterial")
     )
     material.use_nodes = True
     principled = next(
@@ -2507,7 +3208,7 @@ try:
         obj.name in bpy.context.scene.objects and len(obj.data.materials) > 0
         for obj in meshes
     )
-    output = artifact_root / "ReplayLabValidation.blend"
+    output = artifact_root / "BreadValidation.blend"
     bpy.ops.wm.save_as_mainfile(filepath=str(output), check_existing=False)
     if output.is_file():
         artifacts.append({
@@ -3455,6 +4156,8 @@ if not passed:
         errors: list[str] = []
         warnings: list[str] = []
         checks: dict[str, bool] = {}
+        constant_buffer_complete = False
+        mesh_transfer_complete = False
         try:
             state, unused_capture_dir, unused_bundle = self._validated_capture(operation_id)
             checks["captureBundleHashes"] = True
@@ -3584,9 +4287,11 @@ if not passed:
                     % (extra[:8], missing[:8])
                 )
             gltf = _read_json(target / "asset.gltf")
-            if gltf.get("asset", {}).get("version") != "2.0" or not gltf.get("meshes"):
+            effect = (gltf.get("extras", {}).get("replaylab", {}).get("executionKind") == "effect"
+                      and gltf.get("extras", {}).get("replaylab", {}).get("geometryApplicable") is False)
+            if gltf.get("asset", {}).get("version") != "2.0" or (not gltf.get("meshes") and not effect):
                 raise ResourceExportError("generated glTF structure is invalid")
-            expected_binary = gltf.get("buffers", [{}])[0].get("byteLength")
+            expected_binary = 0 if effect else gltf.get("buffers", [{}])[0].get("byteLength")
             if (target / "asset.bin").stat().st_size != expected_binary:
                 raise ResourceExportError("generated glTF binary length changed")
             checks["targetPackageHashes"] = True
@@ -3595,7 +4300,21 @@ if not passed:
             omitted = gltf_result.get("omittedAttributes", []) if isinstance(gltf_result, dict) else []
             if omitted:
                 warnings.append("%d vertex input(s) remain only in the portable raw/canonical sidecar" % len(omitted))
+            mesh_transfer_complete = not omitted
+            checks["meshInputCoverage"] = mesh_transfer_complete
             transfer = _read_json(target / "transfer-spec.json", _MAX_TRANSFER_SPEC_BYTES + 1)
+            # Older published packages remain readable, but cannot claim this
+            # newer source-value/coverage guarantee without its checked report.
+            cbuffer_report_path = target / "cbuffer-transfer.json"
+            if cbuffer_report_path.is_file() and "cbuffer-transfer.json" in expected_files:
+                cbuffer_report = _read_json(cbuffer_report_path)
+                constant_buffer_complete = (cbuffer_report.get("schema") == "bread-cbuffer-transfer/v1"
+                    and cbuffer_report.get("coverage", {}).get("complete") is True)
+                if not constant_buffer_complete:
+                    warnings.append("constant-buffer transfer has unresolved captured values or unmapped physical lanes")
+            else:
+                warnings.append("constant-buffer transfer coverage has not been verified")
+            checks["constantBufferCoverage"] = constant_buffer_complete
             targets = transfer.get("targets")
             if isinstance(targets, list):
                 requested_targets = [
@@ -3712,6 +4431,8 @@ if not passed:
                 warnings.append(
                     "%s is %s" % (layer_name, layer.get("status"))
                 )
+        source_complete = (constant_buffer_complete and mesh_transfer_complete
+                           and (state.get("capture") or {}).get("status") == "complete")
         layers = {
             "captureBundleStructure": {
                 "status": "passed" if internal_complete else "failed",
@@ -3723,6 +4444,7 @@ if not passed:
             },
             "semanticTransfer": {
                 "status": (
+                    "partial" if internal_complete and not source_complete else
                     "passed-with-warnings"
                     if internal_complete and warnings
                     else "passed" if internal_complete else "failed"
@@ -3742,8 +4464,10 @@ if not passed:
             "schemaVersion": 1,
             "operationId": operation_id,
             "valid": internal_complete and not target_errors,
-            "complete": internal_complete and target_complete and not target_errors,
+            "complete": internal_complete and source_complete and target_complete and not target_errors,
             "internalComplete": internal_complete,
+            "sourceValueCoverageComplete": constant_buffer_complete,
+            "sourceFidelityComplete": source_complete,
             "targetValidationComplete": target_complete,
             "layers": layers,
             "checks": checks,

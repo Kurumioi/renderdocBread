@@ -162,9 +162,19 @@ class SkillQuarantineSummary:
         codes = ", ".join(
             f"{code}:{count}" for code, count in sorted(counts.items())
         )
-        detail = f"{self.quarantine_count} packaged skill definition(s) quarantined"
+        detail = f"{self.quarantine_count} skill definition(s) quarantined"
         if codes:
             detail += f"; bounded codes: {codes}"
+        # Which folders, so the user can open the right SKILL.md: the folder
+        # name is the only coordinate a person can act on. rootIndex 0 is the
+        # bundled set, anything later is one of the user's own Skill folders.
+        named = [
+            "%s (%s)" % (item.skill_id, "bundled" if item.root_index == 0
+                         else "user folder %d" % item.root_index)
+            for item in self.diagnostics if item.skill_id
+        ]
+        if named:
+            detail += "; folders: " + ", ".join(named)
         if self.truncated:
             detail += "; diagnostic list truncated"
         return detail
@@ -180,13 +190,18 @@ class SkillCatalog:
 
     def load(self) -> "SkillCatalog":
         discovered: dict[str, Skill] = {}
+        origin: dict[str, Path] = {}
         for root in self.roots:
             if not root.is_dir():
                 continue
             for file in sorted(root.glob("*/SKILL.md")):
                 skill = validate_skill_semantics(self._read(file))
-                if skill.name in discovered:
+                # Same rule as load_runtime: a later root overriding an earlier one is
+                # how an edited copy replaces the bundled Skill; two copies inside one
+                # root are ambiguous because nothing orders them.
+                if skill.name in discovered and origin.get(skill.name) == root:
                     raise ConfigurationError(f"duplicate skill name: {skill.name}")
+                origin[skill.name] = root
                 discovered[skill.name] = skill
         self.skills = discovered
         self.quarantine_diagnostics = ()
@@ -228,6 +243,9 @@ class SkillCatalog:
                 )
             )
 
+        # Which root each accepted Skill came from, so a later root can override an
+        # earlier one while two copies in the same root stay ambiguous.
+        origin: dict[str, int] = {}
         for root_index, root in enumerate(self.roots):
             try:
                 if not root.is_dir():
@@ -253,9 +271,7 @@ class SkillCatalog:
                 except (ConfigurationError, RuntimeError, ValueError):
                     code = "skill-definition-invalid"
                 else:
-                    if skill.name in discovered or skill.name in quarantined_ids:
-                        discovered.pop(skill.name, None)
-                        quarantined_ids.add(skill.name)
+                    if skill.name in quarantined_ids:
                         record(
                             "duplicate-skill-name",
                             root_index,
@@ -263,7 +279,27 @@ class SkillCatalog:
                             skill.name,
                         )
                         continue
+                    if skill.name in discovered:
+                        # Roots are ordered: the bundled one first, then the folders
+                        # the user added, and Settings writes an edited copy into one
+                        # of those. A later root overriding an earlier one is that
+                        # feature, not an ambiguity -- quarantining both used to make
+                        # editing a Skill delete it, and editing replaylab-core stop
+                        # every task. Two copies inside ONE root really is ambiguous,
+                        # because nothing orders them.
+                        if origin.get(skill.name, root_index) == root_index:
+                            discovered.pop(skill.name, None)
+                            origin.pop(skill.name, None)
+                            quarantined_ids.add(skill.name)
+                            record(
+                                "duplicate-skill-name",
+                                root_index,
+                                entry_index,
+                                skill.name,
+                            )
+                            continue
                     discovered[skill.name] = skill
+                    origin[skill.name] = root_index
                     continue
 
                 # The directory name is only a bounded diagnostic hint. When it
@@ -295,10 +331,10 @@ class SkillCatalog:
         except KeyError as exc:
             if name in self.quarantined_skill_ids:
                 raise ConfigurationError(
-                    f"ReplayLab skill '{name}' is unavailable because its packaged "
+                    f"Bread skill '{name}' is unavailable because its packaged "
                     "definition was quarantined"
                 ) from exc
-            raise ConfigurationError(f"unknown ReplayLab skill: {name}") from exc
+            raise ConfigurationError(f"unknown Bread skill: {name}") from exc
 
     def summaries(self) -> str:
         return "\n".join(
@@ -327,9 +363,15 @@ class SkillCatalog:
             raise ConfigurationError(f"skill frontmatter must be a mapping: {path}")
         raw_name = value.get("name", "")
         raw_description = value.get("description", "")
+        if isinstance(raw_name, int) and not isinstance(raw_name, bool):
+            # `name: 2` is an integer to YAML; the folder is still called "2".
+            raw_name = str(raw_name)
         if not isinstance(raw_name, str) or not isinstance(raw_description, str):
             raise ConfigurationError(f"skill name and description must be strings: {path}")
-        name = raw_name
+        # Some compatible publishers use a display-cased frontmatter name.
+        # Admit only a case difference from the canonical directory identity;
+        # do not silently rename unrelated or invalid definitions.
+        name = raw_name.casefold() if raw_name.casefold() == path.parent.name else raw_name
         description = raw_description.strip()
         if not _NAME_RE.fullmatch(name) or path.parent.name != name:
             raise ConfigurationError(f"skill name must match its directory: {path}")
@@ -419,10 +461,3 @@ class SkillCatalog:
             instructions,
             metadata,
         )
-
-
-INTENT_SKILLS = {
-    "explain-current-event": "renderdoc-explain-event",
-    "inspect-picked-pixel": "renderdoc-explain-event",
-    "reverse-edit-selected-shader": "renderdoc-shader-workbench",
-}

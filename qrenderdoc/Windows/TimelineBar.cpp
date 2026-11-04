@@ -139,7 +139,7 @@ void TimelineBar::HighlightResourceUsage(ResourceId id)
 {
   const UsageRequestState::Token request = m_UsageRequests.Begin(id);
   m_UsageEvents.clear();
-  m_UsageTarget = id == ResourceId() ? QString() : m_Ctx.GetResourceName(id);
+  m_UsageTarget = id == ResourceId() ? QString() : QString(m_Ctx.GetResourceName(id));
 
   if(id != ResourceId() && m_Ctx.IsCaptureLoaded())
   {
