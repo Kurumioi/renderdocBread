@@ -89,7 +89,10 @@ class IntegrationManifestTests(unittest.TestCase):
         # GUI clients keep the bundled integration version as their minimum
         # Host package. Newer same-major Hosts remain compatible when their
         # protocol and individual capability schemas still match.
-        self.assertEqual(constants["SERVICE_VERSION"], integration["version"])
+        service_version = tuple(map(int, constants["SERVICE_VERSION"].split(".")))
+        minimum_version = tuple(map(int, integration["version"].split(".")))
+        self.assertEqual(service_version[0], minimum_version[0])
+        self.assertGreaterEqual(service_version, minimum_version)
         self.assertEqual(constants["HOST_STATE_PROTOCOL_VERSION"], 2)
         capability_assignment = next(
             node for node in tree.body
