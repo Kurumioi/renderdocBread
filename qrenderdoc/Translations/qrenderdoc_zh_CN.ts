@@ -446,19 +446,19 @@
 <context>
     <name>AIAssistant</name>
     <message>
-        <location filename="../Windows/AI/AIAssistant.cpp" line="+10958"/>
+        <location filename="../Windows/AI/AIAssistant.cpp" line="+10890"/>
         <source>Loading Skills...</source>
         <translation>正在加载技能……</translation>
     </message>
     <message>
-        <location line="-6769"/>
-        <location line="+6823"/>
+        <location line="-6701"/>
+        <location line="+6755"/>
         <source>Skills</source>
         <translation>技能</translation>
     </message>
     <message>
-        <location line="-6818"/>
-        <location line="+6847"/>
+        <location line="-6750"/>
+        <location line="+6779"/>
         <source>MCP servers</source>
         <translation>MCP 服务器</translation>
     </message>
@@ -517,7 +517,7 @@
         <translation>参数（每行一个）</translation>
     </message>
     <message>
-        <location line="-7862"/>
+        <location line="-7794"/>
         <source>Type @ to load a Skill or MCP server for this message (@skill:&lt;id&gt;, @mcp:&lt;id&gt;).</source>
         <translation>输入 @ 可为本条消息加载技能或 MCP 服务器（@skill:&lt;id&gt;、@mcp:&lt;id&gt;）。</translation>
     </message>
@@ -568,24 +568,24 @@
     </message>
     <message>
         <location line="+32"/>
-        <location line="+7265"/>
+        <location line="+7277"/>
         <source>Status</source>
         <translation>状态</translation>
     </message>
     <message>
-        <location line="-7264"/>
-        <location line="+7264"/>
+        <location line="-7276"/>
+        <location line="+7276"/>
         <source>Check</source>
         <translation>检查</translation>
     </message>
     <message>
-        <location line="-7263"/>
-        <location line="+7263"/>
+        <location line="-7275"/>
+        <location line="+7275"/>
         <source>Detail</source>
         <translation>详细信息</translation>
     </message>
     <message>
-        <location line="-7254"/>
+        <location line="-7266"/>
         <source>Selected detail (plain text; select or copy as needed):</source>
         <translation>所选详细信息（纯文本；可按需选择或复制）：</translation>
     </message>
@@ -631,12 +631,12 @@
     </message>
     <message>
         <location line="+1"/>
-        <location line="+7226"/>
+        <location line="+7238"/>
         <source>The diagnostic command did not complete successfully.</source>
         <translation>诊断命令未成功完成。</translation>
     </message>
     <message>
-        <location line="-7222"/>
+        <location line="-7234"/>
         <source>Connection check</source>
         <translation>连接检查</translation>
     </message>
@@ -647,35 +647,35 @@
     </message>
     <message>
         <location line="+4"/>
-        <location line="+7222"/>
+        <location line="+7234"/>
         <source>One or more checks failed. Review the details.</source>
         <translation>一项或多项检查失败。请查看详细信息。</translation>
     </message>
     <message>
-        <location line="-7219"/>
-        <location line="+7221"/>
+        <location line="-7231"/>
+        <location line="+7233"/>
         <source>Checks completed with warnings or skipped items.</source>
         <translation>检查已完成，但存在警告或跳过的项目。</translation>
     </message>
     <message>
-        <location line="-7218"/>
-        <location line="+7219"/>
+        <location line="-7230"/>
+        <location line="+7231"/>
         <source>All reported checks passed.</source>
         <translation>报告的所有检查均已通过。</translation>
     </message>
     <message>
-        <location line="-7217"/>
+        <location line="-7229"/>
         <source>Diagnostic information was returned.</source>
         <translation>已返回诊断信息。</translation>
     </message>
     <message>
         <location line="+15"/>
-        <location line="+7147"/>
+        <location line="+7159"/>
         <source>Copy All Details</source>
         <translation>复制全部详细信息</translation>
     </message>
     <message>
-        <location line="-5305"/>
+        <location line="-5317"/>
         <source>OpenAI API</source>
         <comment>provider.openai.title</comment>
         <translation>OpenAI API</translation>
@@ -1023,14 +1023,14 @@
         <location line="+205"/>
         <location line="+47"/>
         <location line="+1599"/>
-        <location line="+5982"/>
+        <location line="+5914"/>
         <location line="+678"/>
         <location line="+41"/>
         <source>New conversation</source>
         <translation>新建对话</translation>
     </message>
     <message>
-        <location line="-10202"/>
+        <location line="-10134"/>
         <source>Starting...</source>
         <translation>正在启动…</translation>
     </message>
@@ -1149,12 +1149,12 @@
     </message>
     <message>
         <location line="+311"/>
-        <location line="+8105"/>
+        <location line="+8037"/>
         <source>Running</source>
         <translation>正在运行</translation>
     </message>
     <message>
-        <location line="-8091"/>
+        <location line="-8023"/>
         <source>%1 capture action(s) running</source>
         <translation>正在运行 %1 个捕获操作</translation>
     </message>
@@ -1226,13 +1226,13 @@
     <message>
         <location line="-3460"/>
         <location line="+3468"/>
-        <location line="+5656"/>
+        <location line="+5588"/>
         <location line="+267"/>
         <source>This action requires an open capture.</source>
         <translation>此操作需要打开一个捕获。</translation>
     </message>
     <message>
-        <location line="-10517"/>
+        <location line="-10449"/>
         <source>Tencent CodeBuddy / Hunyuan Subscription (ACP)</source>
         <comment>provider.codebuddy-acp.title</comment>
         <translation>腾讯 CodeBuddy / 混元订阅（ACP）</translation>
@@ -1406,20 +1406,20 @@
         <translation>AI 运行时当前需要 Windows 进程树隔离。</translation>
     </message>
     <message>
-        <location line="+23"/>
+        <location line="+35"/>
         <location line="+135"/>
-        <location line="+2595"/>
+        <location line="+2558"/>
         <source>AI host was not found</source>
         <translation>找不到 AI 主机</translation>
     </message>
     <message>
-        <location line="-2523"/>
-        <location line="+1921"/>
+        <location line="-2486"/>
+        <location line="+1912"/>
         <source>Command timed out</source>
         <translation>命令超时</translation>
     </message>
     <message>
-        <location line="-2026"/>
+        <location line="-2017"/>
         <source>Command failed with exit code %1</source>
         <translation>命令失败，退出代码为 %1</translation>
     </message>
@@ -1456,13 +1456,13 @@
     </message>
     <message>
         <location line="+35"/>
-        <location line="+275"/>
+        <location line="+271"/>
         <location line="+2"/>
         <source>Provider default</source>
         <translation>提供商默认值</translation>
     </message>
     <message>
-        <location line="-161"/>
+        <location line="-157"/>
         <source>Active connection: %1</source>
         <translation>当前连接：%1</translation>
     </message>
@@ -1478,37 +1478,36 @@
     </message>
     <message>
         <location line="+10"/>
-        <location line="+187"/>
         <source>AI Connections</source>
         <translation>AI 连接</translation>
     </message>
     <message>
-        <location line="-186"/>
+        <location line="+1"/>
         <source>Wait for active AI tasks before changing connections.</source>
         <translation>请等待当前 AI 任务结束后再更改连接。</translation>
     </message>
     <message>
-        <location line="+44"/>
+        <location line="+43"/>
         <source>Add...</source>
         <translation>添加…</translation>
     </message>
     <message>
         <location line="+1"/>
-        <location line="+2188"/>
+        <location line="+2109"/>
         <location line="+39"/>
         <location line="+32"/>
         <source>Edit...</source>
         <translation>编辑…</translation>
     </message>
     <message>
-        <location line="-2258"/>
-        <location line="+2227"/>
+        <location line="-2179"/>
+        <location line="+2148"/>
         <location line="+32"/>
         <source>Remove</source>
         <translation>移除</translation>
     </message>
     <message>
-        <location line="-2258"/>
+        <location line="-2179"/>
         <source>Set as Default</source>
         <translation>设为默认值</translation>
     </message>
@@ -1518,12 +1517,7 @@
         <translation>检查连接</translation>
     </message>
     <message>
-        <location line="-15"/>
-        <source>Loading AI providers...</source>
-        <translation>正在加载 AI 提供商...</translation>
-    </message>
-    <message>
-        <location line="-4734"/>
+        <location line="-4760"/>
         <source>Conversation selection</source>
         <translation>对话中选中的内容</translation>
     </message>
@@ -2042,22 +2036,22 @@ Size: %2 bytes</source>
         <translation>无法加载此捕获的对话历史：%1 本次会话不会写入该历史，以免丢失已保存的内容；请重新打开捕获后重试。</translation>
     </message>
     <message>
-        <location line="+792"/>
+        <location line="+804"/>
         <source>Checking the connection. Close this window to cancel.</source>
         <translation>正在检查连接，关闭此窗口可取消检查。</translation>
     </message>
     <message>
-        <location line="+401"/>
+        <location line="+404"/>
         <source>Add model APIs or Agent subscriptions here. API connections use the same RenderDoc deepagents framework maintained on GitHub. Managed subscriptions run the vendor&apos;s native Agent. Both can use Bread Skills and task-scoped Host tools. API keys can be stored securely in Windows Credential Manager or kept only for the current qrenderdoc session.</source>
         <translation>在此添加模型接口或 Agent 订阅。API 连接使用 GitHub 上维护的 RenderDoc deepagents 框架；托管订阅运行提供商的原生 Agent。两者都可使用 Bread Skills 和任务作用域内的 Host 工具。API 密钥可安全地保存在 Windows 凭据管理器中，或仅在当前 qrenderdoc 会话中保留。</translation>
     </message>
     <message>
-        <location line="+25"/>
+        <location line="+21"/>
         <source>Send a small test prompt and verify an actual MCP tool call. This uses the selected connection&apos;s model quota.</source>
         <translation>发送简短测试提示并验证真实 MCP 工具调用，会使用所选连接的模型额度。</translation>
     </message>
     <message>
-        <location line="+15"/>
+        <location line="+12"/>
         <source>Connection details</source>
         <translation>连接详细信息</translation>
     </message>
@@ -2074,12 +2068,12 @@ Size: %2 bytes</source>
     </message>
     <message>
         <location line="+3"/>
-        <location line="+80"/>
+        <location line="+75"/>
         <source>Model API</source>
         <translation>模型 API</translation>
     </message>
     <message>
-        <location line="-80"/>
+        <location line="-75"/>
         <source>Agent subscription</source>
         <translation>Agent 订阅</translation>
     </message>
@@ -2104,13 +2098,7 @@ Size: %2 bytes</source>
         <translation>  -  订阅</translation>
     </message>
     <message>
-        <location line="+33"/>
-        <location line="+1966"/>
-        <source>Could not load AI providers.</source>
-        <translation>无法加载 AI 提供商。</translation>
-    </message>
-    <message>
-        <location line="-1956"/>
+        <location line="+38"/>
         <source>Edit AI Connection</source>
         <translation>编辑 AI 连接</translation>
     </message>
@@ -2485,12 +2473,12 @@ Size: %2 bytes</source>
     </message>
     <message>
         <location line="+11"/>
-        <location line="+1982"/>
+        <location line="+1911"/>
         <source>Testing...</source>
         <translation>正在测试…</translation>
     </message>
     <message>
-        <location line="-1959"/>
+        <location line="-1888"/>
         <source>%1 responded successfully to a short test prompt. The link works.</source>
         <translation>%1 已成功响应一条测试提示，链路可用。</translation>
     </message>
@@ -2573,12 +2561,12 @@ Account: %1</source>
     <message>
         <location line="+9"/>
         <location line="+360"/>
-        <location line="+830"/>
+        <location line="+759"/>
         <source>Test Connection</source>
         <translation>测试连接</translation>
     </message>
     <message>
-        <location line="-1180"/>
+        <location line="-1109"/>
         <source>Authentication status unavailable</source>
         <translation>身份验证状态不可用</translation>
     </message>
@@ -2786,7 +2774,7 @@ Device code: %1</source>
         <translation>请输入 Agent 可执行文件和参数。</translation>
     </message>
     <message>
-        <location line="+44"/>
+        <location line="+40"/>
         <source>Could not save AI connection</source>
         <translation>无法保存 AI 连接</translation>
     </message>
@@ -2806,12 +2794,7 @@ Device code: %1</source>
         <translation>连接已保存，但无法更新 Windows 凭据管理器。请重新打开此连接后重试，或使用仅限会话的密钥。</translation>
     </message>
     <message>
-        <location line="+28"/>
-        <source>Connecting...</source>
-        <translation>正在连接…</translation>
-    </message>
-    <message>
-        <location line="+96"/>
+        <location line="+100"/>
         <source>Remove AI Connection</source>
         <translation>移除 AI 连接</translation>
     </message>
@@ -2832,7 +2815,7 @@ Device code: %1</source>
         <translation>默认连接</translation>
     </message>
     <message>
-        <location line="-2468"/>
+        <location line="-2431"/>
         <source>AI Connection Check</source>
         <translation>AI 连接检查</translation>
     </message>
@@ -2843,12 +2826,7 @@ Device code: %1</source>
         <translation>命令输出超出安全限制</translation>
     </message>
     <message>
-        <location line="+2598"/>
-        <source>No supported AI providers were returned.</source>
-        <translation>未返回任何受支持的 AI 提供商。</translation>
-    </message>
-    <message>
-        <location line="+1728"/>
+        <location line="+4246"/>
         <location line="+735"/>
         <source>Add or select an AI connection first.</source>
         <translation>请先添加或选择 AI 连接。</translation>
@@ -2947,7 +2925,7 @@ Device code: %1</source>
         <translation>捕获桥接尚未就绪。</translation>
     </message>
     <message>
-        <location line="-10746"/>
+        <location line="-10678"/>
         <source>%1 CLI detected; sign-in state is checked only after approval.</source>
         <comment>subscription.cli-detected</comment>
         <translation>已检测到 %1 CLI；仅在批准后检查登录状态。</translation>
@@ -3087,12 +3065,12 @@ Device code: %1</source>
         <translation>使用 @renderdoc-shader-workbench 重新整理所选着色器。遵循技能流程，更新着色器工作区中的源码和说明，包括已有的整理结果。</translation>
     </message>
     <message>
-        <location line="+1081"/>
+        <location line="+1089"/>
         <source>The connection name is for display. qrenderdoc creates an internal stable identifier automatically. Models enabled here appear beside Send in the Bread AI panel. The first connection becomes the default automatically. Use Fetch Models for an API check, or Edit then Connect/Test for a subscription check.</source>
         <translation>连接名称仅用于显示。qrenderdoc 会自动创建内部稳定标识符。在此启用的模型会显示在 Bread AI 面板的“发送”按钮旁。第一个连接会自动成为默认连接。使用“获取模型”检查 API，或先点“编辑”，再通过“连接/测试”检查订阅。</translation>
     </message>
     <message>
-        <location line="+558"/>
+        <location line="+553"/>
         <source>This confirmation applies only to the exact non-editable command from the built-in provider catalog. The launched Agent remains limited by the per-turn tools and workflow checks. You may uncheck it to prevent the CLI from running.</source>
         <translation>此确认仅适用于 内置提供商目录中内容完全一致且不可编辑的命令。启动后的 Agent 仍受每轮工具范围和工作流检查的限制。可以取消勾选，以阻止 CLI 运行。</translation>
     </message>
@@ -3102,12 +3080,12 @@ Device code: %1</source>
         <translation>内置官方 CLI 已在“进程信任”中被禁用。请勾选该处可见的复选框，以允许执行内容完全一致且不可编辑的目录命令；否则请取消。</translation>
     </message>
     <message>
-        <location line="+300"/>
+        <location line="+272"/>
         <source>Remove &apos;%1&apos;? Bread AI will forget its saved API credential, session-only credential, and connection-scoped vendor state. A vendor account sign-in stored by the provider or operating system may remain.</source>
         <translation>移除“%1”？Bread AI 将清除其保存的 API 凭据、仅会话凭据以及连接范围内的提供商状态。由提供商或操作系统存储的提供商账号登录状态可能仍会保留。</translation>
     </message>
     <message>
-        <location line="+161"/>
+        <location line="+118"/>
         <source>Connections, Skills and tools</source>
         <translation>连接、技能与工具</translation>
     </message>
@@ -3485,12 +3463,12 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>[后续推理内容见智能体监视器]</translation>
     </message>
     <message>
-        <location line="-8042"/>
+        <location line="-7974"/>
         <source>The artifact no longer exists: %1</source>
         <translation>产物已不存在：%1</translation>
     </message>
     <message>
-        <location line="+8065"/>
+        <location line="+7997"/>
         <location line="+11"/>
         <source>Tool: %1</source>
         <translation>工具：%1</translation>
@@ -4134,7 +4112,7 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <translation>读取脚本随 Bread AI 一起提供；你选择的解释器只需要安装 UnityPy 包（pip install UnityPy）。</translation>
     </message>
     <message>
-        <location line="-11095"/>
+        <location line="-11027"/>
         <location line="+110"/>
         <source>Claude sign-in</source>
         <translation>Claude 登录状态</translation>
@@ -4168,6 +4146,49 @@ Additional direction from the user (re-plan and continue from the preserved cont
         <source>Claude sign-in status was not checked because the profile or trusted CLI is unavailable.</source>
         <comment>claude-auth.skipped</comment>
         <translation>配置或已信任的 CLI 不可用，因此未检查 Claude 登录状态。</translation>
+    </message>
+</context>
+<context>
+    <name>AIConfiguration</name>
+    <message>
+        <location filename="../Windows/AI/AIConfiguration.cpp" line="+53"/>
+        <source>Invalid AI connection settings: %1.</source>
+        <translation>AI 连接设置无效：%1。</translation>
+    </message>
+    <message>
+        <location line="+233"/>
+        <source>The AI configuration file could not be read. Your existing file has been preserved.</source>
+        <translation>无法读取 AI 配置文件。现有文件已保留。</translation>
+    </message>
+    <message>
+        <location line="+9"/>
+        <source>The AI configuration file is invalid or uses an unsupported format. Your existing file has been preserved.</source>
+        <translation>AI 配置文件无效或使用了不支持的格式。现有文件已保留。</translation>
+    </message>
+    <message>
+        <location line="+83"/>
+        <source>Windows Credential Manager could not be updated or read (Windows error %1).</source>
+        <translation>无法更新或读取 Windows 凭据管理器（Windows 错误 %1）。</translation>
+    </message>
+    <message>
+        <location line="+5"/>
+        <source>Secure credential storage is unavailable. Use a session-only key.</source>
+        <translation>安全凭据存储不可用。请使用仅限本次会话的密钥。</translation>
+    </message>
+    <message>
+        <location line="+78"/>
+        <source>The provider&apos;s local state is in use or cannot be removed. Close its active tasks and retry.</source>
+        <translation>提供商的本地状态正在使用中或无法移除。请关闭其正在运行的任务后重试。</translation>
+    </message>
+    <message>
+        <location line="+30"/>
+        <source>The AI configuration file is being updated or cannot be written. Retry saving the connection.</source>
+        <translation>AI 配置文件正在更新或无法写入。请重试保存连接。</translation>
+    </message>
+    <message>
+        <location line="+169"/>
+        <source>The AI configuration could not be saved. Your existing file has been preserved.</source>
+        <translation>无法保存 AI 配置。现有文件已保留。</translation>
     </message>
 </context>
 <context>
@@ -5651,7 +5672,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     </message>
     <message>
         <location/>
-        <location filename="../Windows/BufferViewer.cpp" line="+8219"/>
+        <location filename="../Windows/BufferViewer.cpp" line="+8325"/>
         <location line="+29"/>
         <source>VS In</source>
         <translation>VS 输入</translation>
@@ -5854,7 +5875,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>长度</translation>
     </message>
     <message>
-        <location filename="../Windows/BufferViewer.cpp" line="-6796"/>
+        <location filename="../Windows/BufferViewer.cpp" line="-6898"/>
         <source>&amp;Debug this Vertex</source>
         <translation>调试该顶点(&amp;D)</translation>
     </message>
@@ -5952,36 +5973,36 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     <message>
         <location line="+8"/>
         <location line="+853"/>
-        <location line="+2479"/>
+        <location line="+2581"/>
         <location line="+7"/>
         <source>Name</source>
         <translation>名称</translation>
     </message>
     <message>
-        <location line="-3339"/>
+        <location line="-3441"/>
         <location line="+853"/>
-        <location line="+2479"/>
+        <location line="+2581"/>
         <location line="+7"/>
         <source>Value</source>
         <translation>值</translation>
     </message>
     <message>
-        <location line="-3339"/>
-        <location line="+3332"/>
+        <location line="-3441"/>
+        <location line="+3434"/>
         <location line="+7"/>
         <source>Byte Offset</source>
         <translation>字节偏移</translation>
     </message>
     <message>
-        <location line="-3339"/>
+        <location line="-3441"/>
         <location line="+853"/>
-        <location line="+2479"/>
+        <location line="+2581"/>
         <location line="+7"/>
         <source>Type</source>
         <translation>类型</translation>
     </message>
     <message>
-        <location line="-3296"/>
+        <location line="-3398"/>
         <source>Fixed SoA data</source>
         <translation>固定 SoA 数据</translation>
     </message>
@@ -6123,7 +6144,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>仅可编辑经反射得到的 32 位 float/int/uint 标量和向量叶节点</translation>
     </message>
     <message>
-        <location line="-4601"/>
+        <location line="-4605"/>
         <source>Saturation and brightness</source>
         <translation>饱和度与明度</translation>
     </message>
@@ -6174,7 +6195,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>数值未应用：OpenGL 无法重放缓冲区更新。悬停可查看详情。</translation>
     </message>
     <message>
-        <location line="+2979"/>
+        <location line="+2983"/>
         <source>Search CBuffer parameters (Ctrl+F5)</source>
         <translation>搜索 CBuffer 参数（Ctrl+F5）</translation>
     </message>
@@ -6235,12 +6256,12 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <location line="+149"/>
         <location line="+8"/>
         <location line="+24"/>
-        <location line="+1281"/>
+        <location line="+1288"/>
         <source>The CBuffer binding changed; select the value again.</source>
         <translation>CBuffer 绑定已变化，请重新选择参数。</translation>
     </message>
     <message>
-        <location line="-1297"/>
+        <location line="-1304"/>
         <source>Another editor changed this buffer. Values were refreshed; select the parameter again before editing.</source>
         <translation>其他编辑器已修改此缓冲区。数值已刷新，请重新选择参数后再修改。</translation>
     </message>
@@ -6333,7 +6354,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>没有底层内存，无法指定自定义格式</translation>
     </message>
     <message>
-        <location line="+543"/>
+        <location line="+571"/>
         <source>Starting at: %1 bytes</source>
         <translation>起始位置：%1 字节</translation>
     </message>
@@ -6346,7 +6367,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>填充</translation>
     </message>
     <message>
-        <location line="+237"/>
+        <location line="+310"/>
         <source>Confirmed</source>
         <translation>已确认</translation>
     </message>
@@ -6391,29 +6412,29 @@ Source SHA-256: %7</source>
     </message>
     <message>
         <location line="+134"/>
-        <location line="+3656"/>
+        <location line="+3684"/>
         <source>Unused · %1</source>
         <translation>未使用 · %1</translation>
     </message>
     <message>
-        <location line="-3655"/>
-        <location line="+3656"/>
+        <location line="-3683"/>
+        <location line="+3684"/>
         <source>Parameter · %1</source>
         <translation>参数 · %1</translation>
     </message>
     <message>
-        <location line="-3654"/>
+        <location line="-3682"/>
         <source>Unused by this shader</source>
         <translation>当前着色器未使用</translation>
     </message>
     <message>
         <location line="+1"/>
-        <location line="+3654"/>
+        <location line="+3682"/>
         <source>Meaning not identified</source>
         <translation>用途尚未识别</translation>
     </message>
     <message>
-        <location line="-3651"/>
+        <location line="-3679"/>
         <source>Original name: %1
 This shader does not read these components. Other shaders may use them; their bytes and editing controls are preserved.</source>
         <translation>原始名称：%1
@@ -6427,7 +6448,7 @@ The role of this parameter has not been identified. This does not mean it is unu
 尚未确定此参数的作用，这并不代表它未被使用。</translation>
     </message>
     <message>
-        <location line="+15"/>
+        <location line="+16"/>
         <source>Status</source>
         <translation>状态</translation>
     </message>
@@ -6894,7 +6915,7 @@ Matrix stored </source>
         <translation>当前范围筛选：单个网格簇</translation>
     </message>
     <message>
-        <location line="-5338"/>
+        <location line="-5440"/>
         <source>&amp;Rename (Create Alias)...</source>
         <translation>重命名（创建别名）(&amp;R)...</translation>
     </message>
@@ -6924,7 +6945,7 @@ Matrix stored </source>
         <translation>所选常量缓冲区绑定或数组元素无效</translation>
     </message>
     <message>
-        <location line="+1384"/>
+        <location line="+1412"/>
         <source>Original name: %1 (alias set by you)</source>
         <translation>原始名称：%1（别名由您设置）</translation>
     </message>
@@ -6939,7 +6960,7 @@ Matrix stored </source>
         <translation>原始名称：%1</translation>
     </message>
     <message>
-        <location line="+594"/>
+        <location line="+668"/>
         <source>Constant Alias</source>
         <translation>常量别名</translation>
     </message>

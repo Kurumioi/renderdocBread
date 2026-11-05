@@ -108,6 +108,16 @@ on both systems remain separate validation, not a claim made by the packaging sc
 Bread is the display brand. Existing `ReplayLab` executable names, protocol identifiers,
 build commands, and storage paths below remain unchanged for compatibility.
 
+AI connection configuration is an in-process native operation. The provider catalog is
+compiled into the GUI from `replaylab/src/replaylab_agent/catalog.py` by
+`util/ai/generate_provider_catalog.py`; translation synchronization regenerates it and
+the release translation gate checks that it is current. Do not add a startup-time
+AgentHost or network dependency for this catalog. The GUI shares the existing
+`ReplayLab/ai/profiles.json` format and byte-range writer lock with AgentHost, writes
+atomically, and uses the same Windows Credential Manager targets. Network model
+discovery, subscription authentication, diagnostics and task execution remain in
+AgentHost and cannot gate opening or saving the configuration form.
+
 Shader visual previews require DXC with both DXIL and SPIR-V code generation.
 Windows SDK builds can list `-spirv` in their help while omitting that backend.
 `shader_dxc_manifest.json` pins Microsoft's official release archives and their
