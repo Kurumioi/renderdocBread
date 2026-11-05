@@ -1,3 +1,7 @@
+import hashlib
+
+import pytest
+
 from src.unity_handoff_review import review_handoff
 
 
@@ -114,3 +118,98 @@ def test_an_untried_feasible_route_overrides_an_exhaustion_claim(tmp_path):
 def test_a_concrete_unresolved_limit_with_saved_attempts_can_ask_user(tmp_path):
     result=review_handoff([effect(resolutionAssessment=exhausted(tmp_path))],[],attempts(),delivery())
     assert result["userDecisionSuggested"] and result["nextAction"]=="save-checkpoint-and-ask-user"
+
+
+def saved_delivery(tmp_path):
+    project = tmp_path / "Unity"
+    scene = project / "Assets" / "Effect" / "Scenes" / "Effect.unity"
+    scene.parent.mkdir(parents=True)
+    scene.write_text("%YAML 1.1\n--- !u!1 &1\nGameObject: {}\n")
+    proof = tmp_path / "bread-task-evidence.json"
+    proof.write_text("post-cleanup Scene/Game observations")
+    state = delivery()
+    state.update(projectPath=str(project), artifactInventoryReviewed=True,
+        artifactInventory=[dict(path="Assets/Effect/Scenes/Effect.unity", role="final")],
+        sceneDelivery=dict(scenePath="Assets/Effect/Scenes/Effect.unity",
+            sceneSha256=hashlib.sha256(scene.read_bytes()).hexdigest(), saved=True,
+            reopenedFromDisk=True, requiresSetupCommand=False, missingScripts=0,
+            missingReferences=[], compileErrors=[], finalOutputsReviewed=True, evidencePaths=[str(proof)]))
+    return state, project, scene
+
+
+def test_clean_delivery_preserves_required_runtime_and_requested_final_render(tmp_path):
+    state, project, _ = saved_delivery(tmp_path)
+    runtime = project / "Assets" / "Effect" / "Runtime" / "Effect.cs"
+    runtime.parent.mkdir()
+    runtime.write_text("// required normal render component")
+    final_render = project / "Renders" / "Final.png"
+    final_render.parent.mkdir()
+    final_render.write_bytes(b"requested final output")
+    state["artifactInventory"] += [dict(path=str(runtime), role="runtime", reason="Required per-camera rendering"),
+        dict(path=str(final_render), role="final"), dict(path="Assets/Effect/BuildScene.cs", role="temporary"),
+        dict(path=str(tmp_path / "scratch-difference.png"), role="temporary")]
+    result = review_handoff([], [], [], state)
+    observations = result["deliveryObservations"]
+    assert observations["sceneReopenObserved"] and observations["artifactCleanupObserved"]
+    assert observations["retainedRuntimeAssets"] == [str(runtime)]
+    assert not result["findings"]
+    assert runtime.is_file() and final_render.is_file()
+
+
+def test_remaining_builder_validation_image_and_orphan_meta_cannot_be_hidden_by_boolean(tmp_path):
+    state, project, _ = saved_delivery(tmp_path)
+    builder = project / "Assets" / "Effect" / "Build.cs"
+    builder.write_text("// one-shot builder")
+    image = project / "Assets" / "Effect" / "difference.png"
+    image.write_bytes(b"comparison")
+    orphan = project / "Assets" / "Effect" / "Probe.cs.meta"
+    orphan.write_text("guid: retained-orphan")
+    for path in (builder, image, orphan.with_suffix("")):
+        state["artifactInventory"].append(dict(path=str(path), role="temporary"))
+    result = review_handoff([], [], [], state)
+    assert "temporary-artifacts-remain" in codes(result)
+    assert set(result["deliveryObservations"]["remainingTemporaryArtifacts"]) == {str(builder), str(image), str(orphan)}
+    assert not result["deliveryObservations"]["artifactCleanupObserved"]
+    assert builder.is_file() and image.is_file() and orphan.is_file()  # review is read-only
+
+
+@pytest.mark.parametrize("change", [dict(reopenedFromDisk=False), dict(requiresSetupCommand=True),
+    dict(missingScripts=1), dict(missingScripts=False), dict(missingReferences=["material"]),
+    dict(compileErrors=["CS0001"]), dict(finalOutputsReviewed=False), dict(evidencePaths=[])])
+def test_scene_requires_real_post_cleanup_normal_reopen_observations(tmp_path, change):
+    state, _, _ = saved_delivery(tmp_path)
+    state["sceneDelivery"].update(change)
+    result = review_handoff([], [], [], state)
+    assert "scene-reopen-without-setup-not-observed" in codes(result)
+    assert not result["deliveryObservations"]["sceneReopenObserved"]
+
+
+def test_edit_after_reopen_invalidates_scene_content_observation(tmp_path):
+    state, _, scene = saved_delivery(tmp_path)
+    scene.write_text("changed scene after verification")
+    result = review_handoff([], [], [], state)
+    assert "scene-reopen-content-not-current" in codes(result)
+    assert not result["deliveryObservations"]["sceneReopenObserved"]
+
+
+def test_missing_final_and_misclassified_dependency_are_reported_without_deletion(tmp_path):
+    state, project, _ = saved_delivery(tmp_path)
+    state["artifactInventory"] += [dict(path="Assets/Effect/missing.shader", role="final"),
+        dict(path="Assets/Effect/deleted-data.asset", role="temporary", requiredByFinalAssets=True)]
+    result = review_handoff([], [], [], state)
+    assert {"final-assets-missing", "temporary-artifact-required-by-final-assets"} <= codes(result)
+    assert result["deliveryObservations"]["missingFinalAssets"] == [str(project / "Assets" / "Effect" / "missing.shader")]
+    assert not result["deliveryObservations"]["artifactCleanupObserved"]
+
+
+def test_legacy_delivery_remains_readable_with_new_advisory_findings():
+    result = review_handoff([], [], [], delivery())
+    assert result["schema"] == "bread-unity-handoff-review/v1" and result["diagnosticsOnly"]
+    assert "delivery-project-not-observed" in codes(result)
+
+
+def test_ambiguous_artifact_roles_are_rejected(tmp_path):
+    state, _, _ = saved_delivery(tmp_path)
+    state["artifactInventory"].append(dict(state["artifactInventory"][0], role="temporary"))
+    with pytest.raises(ValueError, match="unambiguous role"):
+        review_handoff([], [], [], state)

@@ -1,5 +1,95 @@
 """Agent-directed restoration handoff observations, not an execution gate."""
+import hashlib
 from pathlib import Path
+
+
+def _delivery_observations(delivery):
+    """Observe files without deleting anything or treating annotations as proof."""
+    findings = []
+    project_value = delivery.get("projectPath")
+    project = Path(project_value) if isinstance(project_value, str) and project_value else None
+    if project is None or not project.is_absolute() or not (project / "Assets").is_dir():
+        return [{"code": "delivery-project-not-observed"}], {"sceneReopenObserved": False,
+            "artifactCleanupObserved": False, "remainingTemporaryArtifacts": [], "missingFinalAssets": []}
+
+    def project_path(value):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("Delivery paths must be nonempty project-relative or absolute paths")
+        path = Path(value)
+        return (path if path.is_absolute() else project / path).resolve()
+
+    scene = delivery.get("sceneDelivery") or {}
+    if not isinstance(scene, dict):
+        raise ValueError("sceneDelivery must be an observation object")
+    scene_path = project_path(scene["scenePath"]) if scene.get("scenePath") else None
+    scene_file = bool(scene_path and scene_path.is_relative_to((project / "Assets").resolve())
+        and scene_path.suffix.lower() == ".unity" and scene_path.is_file())
+    if not scene_file:
+        findings.append({"code": "saved-scene-not-observed"})
+    scene_hash = None
+    if scene_file:
+        digest = hashlib.sha256()
+        with scene_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        scene_hash = digest.hexdigest()
+    scene_current = bool(scene_hash and scene.get("sceneSha256") == scene_hash)
+    if scene_file and not scene_current:
+        findings.append({"code": "scene-reopen-content-not-current"})
+    reopen = (scene.get("saved") is True and scene.get("reopenedFromDisk") is True
+        and scene.get("requiresSetupCommand") is False and type(scene.get("missingScripts")) is int
+        and scene["missingScripts"] == 0 and scene.get("missingReferences") == []
+        and scene.get("compileErrors") == [] and scene.get("finalOutputsReviewed") is True)
+    proof = scene.get("evidencePaths")
+    evidence = (isinstance(proof, list) and 0 < len(proof) <= 64
+        and all(isinstance(path, str) and Path(path).is_absolute() and Path(path).is_file() for path in proof))
+    if not (reopen and evidence and scene_current):
+        findings.append({"code": "scene-reopen-without-setup-not-observed",
+            "diagnostic": "Save serialized scene/assets, remove construction and validation helpers, reopen the .unity normally, and inspect current final Scene/Game output without a setup command."})
+
+    inventory = delivery.get("artifactInventory")
+    if inventory is None:
+        inventory = []
+    if not isinstance(inventory, list) or len(inventory) > 4096 or any(not isinstance(row, dict) for row in inventory):
+        raise ValueError("Supply at most 4096 generated artifact observations")
+    reviewed = delivery.get("artifactInventoryReviewed") is True and "artifactInventory" in delivery
+    if not reviewed:
+        findings.append({"code": "generated-artifact-inventory-not-reviewed"})
+    inventory_finding_count = len(findings)
+    remaining, missing, runtime, seen = [], [], [], set()
+    for row in inventory:
+        path = project_path(row.get("path"))
+        if path in seen:
+            raise ValueError("Each generated artifact needs one unambiguous role")
+        seen.add(path)
+        role = row.get("role")
+        if role not in ("temporary", "final", "runtime"):
+            raise ValueError("Artifact role must be temporary, final or runtime")
+        if role == "temporary":
+            residue = [path]
+            if path.is_relative_to((project / "Assets").resolve()):
+                residue.append(Path(str(path) + ".meta"))
+            remaining.extend(str(item) for item in residue if item.exists())
+            if row.get("requiredByFinalAssets") is True:
+                findings.append({"code": "temporary-artifact-required-by-final-assets", "path": str(path)})
+        else:
+            if not path.is_file():
+                missing.append(str(path))
+            if role == "runtime":
+                if not path.is_relative_to(project.resolve()):
+                    findings.append({"code": "runtime-asset-outside-project", "path": str(path)})
+                runtime.append(str(path))
+                if not isinstance(row.get("reason"), str) or not row["reason"].strip():
+                    findings.append({"code": "runtime-asset-purpose-missing", "path": str(path)})
+    if remaining:
+        findings.append({"code": "temporary-artifacts-remain", "paths": remaining})
+    if missing:
+        findings.append({"code": "final-assets-missing", "paths": missing})
+    return findings, {"sceneReopenObserved": bool(scene_file and reopen and evidence and scene_current),
+        "sceneSha256": scene_hash,
+        "artifactCleanupObserved": bool(reviewed and len(findings) == inventory_finding_count),
+        "remainingTemporaryArtifacts": remaining, "missingFinalAssets": missing, "retainedRuntimeAssets": runtime,
+        "scope": "File presence is observed; reopen/render, ownership and dependency annotations are supplied by the Agent. This read-only report neither deletes files nor certifies visual fidelity."}
 
 
 def review_handoff(effects, comparisons, attempts, delivery, no_progress_budget=3, diagnosis=None, checkpoint_budget=12):
@@ -90,6 +180,8 @@ def review_handoff(effects, comparisons, attempts, delivery, no_progress_budget=
     for item in ("dualViewFinalOutputs","resizeAndTemporalChecks","assetLayoutReviewed","temporaryDiagnosticsRemoved"):
         if delivery.get(item) is not True:
             findings.append({"code":"handoff-observation-missing","observation":item})
+    delivery_findings, delivery_observations = _delivery_observations(delivery)
+    findings.extend(delivery_findings)
     # Counters trigger internal replanning, never a user budget/permission gate.
     # The Agent supplies saved evidence that supported recovery really cannot
     # proceed; missing tool/unknown history or its own unapproved approximation
@@ -105,7 +197,7 @@ def review_handoff(effects, comparisons, attempts, delivery, no_progress_budget=
         "unresolvedEffects":unresolved,"unapprovedTradeoffs":tradeoffs,"noProgressEffects":stalled,
         "checkpointEffects":checkpoints,
         "reassessmentSuggested":bool(stalled or checkpoints),"unresolvedRecoveryLimits":unresolved_limits,
-        "remainingFeasibleRoutes":remaining_routes,
+        "remainingFeasibleRoutes":remaining_routes,"deliveryObservations":delivery_observations,
         "matchedRemainingEffectsBaselineObserved":baseline,"findings":findings,"userDecisionSuggested":decision,
         "isolatedDifferenceEffects":sorted(isolated),"temporaryBypassIsDeliveryOption":False,
         "nextAction":"save-checkpoint-and-ask-user" if decision and independent else
