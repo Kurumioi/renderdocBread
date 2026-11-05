@@ -9,6 +9,12 @@ The default delivery is an editable, normally rendered project: FBX meshes,
 TGA/EXR textures selected by sampling precision, materials, prefabs, engine camera
 matrices, adjustable lights and shadows, and Volume-controlled post processing.
 Captured buffers and frozen images are reference inputs, not the final default.
+The saved `.unity` must open normally without a setup script or special command.
+Remove generated construction/validation helpers, comparison images and scratch
+exports after successful restoration, keeping required runtime code, final assets
+and requested final renders. Follow
+[unity-final-handoff.md](unity-final-handoff.md) for simple folders, dependency-aware
+cleanup and post-cleanup reopening; retain evidence in Bread task storage.
 Expose analysed artistic controls; assign technical constants through scripts.
 Design the material inspector while writing the adaptation; follow
 [material-inspector.md](material-inspector.md) for texture-first controls,

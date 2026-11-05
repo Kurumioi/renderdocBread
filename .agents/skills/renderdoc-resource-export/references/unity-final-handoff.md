@@ -140,10 +140,39 @@ isolated discrepancy/remainder evidence is missing.
 
 ## Asset handoff
 
+The default deliverable is a saved, directly openable Unity scene and its final
+assets, required rendering code and requested final renders. Before authoring,
+track every task-generated artifact and its purpose. Put builders, one-shot
+import/setup scripts, validators, comparison images, probes, logs and scratch
+exports in task-owned temporary storage outside the final asset tree wherever
+possible. Keep intermediate evidence and source-to-output receipts in Bread task
+storage while they are needed; do not duplicate the archive into the user's Unity
+delivery. A final requested render is an output, not a disposable validation image.
+
+Use one semantic root such as `Assets/<Effect>/`, with only the needed `Scenes`,
+`Models`, `Materials`, `Textures`, `Prefabs` and `Shaders` folders. Add `Runtime`
+only for code actually required by the effect, and `Editor` only for a necessary
+material inspector or other delivered editing feature. Do not create empty
+folders, per-attempt/per-EID directory trees, validation galleries, backup
+projects or a second staging copy in the final tree. Reuse existing project
+structure when that is simpler. Put requested final renders together in one
+`Renders` directory outside Assets unless Unity needs to reference them.
+
+Serialize scene objects, camera/light settings, materials, Volume profiles,
+RendererData/Features, references and relevant project configuration to disk.
+The user must be able to double-click the final `.unity` and see the correct
+Scene/Game result through normal rendering. No menu command, execute-method,
+setup script, MCP call, Python process or special scene opener may be needed to
+construct or initialize the delivered scene. Normal rendering components may
+allocate per-camera/history resources and run the effect automatically; preserve
+those genuine runtime dependencies. Do not delete all `.cs`, compute shaders,
+data textures or `.asset` files by extension. Replace a bootstrap that creates
+objects or assigns essential bindings with saved objects and serialized bindings.
+
 Apply `plan_unity_asset_layout` through `bread_apply_asset_layout`, preserving
 GUIDs instead of copying/deleting `.meta` files. Keep flat Materials, Models,
 Prefabs, Textures and necessary Shader/Runtime/Editor assets, semantic EID names,
-shared-texture identity and source-to-output mappings. Preserve evidence archives.
+shared-texture identity and source-to-output mappings in Bread storage.
 Use `bread_cleanup_empty_asset_folders` first in dry-run mode and then apply only
 inside the actual owned restoration root with `managed_folders` from generated
 output/manifest facts. It retains referenced/labeled/bundle folders, orphan
@@ -152,6 +181,43 @@ deletion permission merely because an asset is not currently visible.
 
 After meaningful asset moves, check scene/prefab/material links, GUID continuity,
 normal renderer/model/texture bindings, compile errors and final camera output.
+Also repair source-relative Shader includes, Resources/Addressables paths and
+assembly-definition scope when code/data moves; GUID continuity alone does not
+preserve those dependencies. Keep necessary existing folder boundaries.
 Remove temporary diagnostic overrides and per-frame file writes. Report full,
 partial-awaiting-user or accepted-subset delivery honestly, with concrete
 residual/approximate effects and resume instructions. Cleanup is not image proof.
+
+After successful implementation and comparison, finish this handoff autonomously:
+
+1. Inventory generated files as `final`, `runtime` (with the reason it is needed)
+   or `temporary`. Inspect Unity dependencies and references, including string-
+   loaded resources, Shader includes and render callbacks. Finalize or move any
+   required data out of temporary paths before deleting their producers.
+2. Remove this task's temporary builders, setup/validation scripts, reference and
+   difference images, readback sidecars, logs and intermediate exports. Delete
+   imported assets through Unity's AssetDatabase/project tools so their `.meta`
+   files are removed together. Use explicit owned paths, never a broad extension
+   search or recursive wipe of the project. Preserve existing user files, shared
+   dependencies and Bread's original capture/source/history records. Do not
+   remove a failed/unresolved checkpoint needed to continue unfinished work.
+3. Save final scenes/assets and let compilation/import settle after removing
+   helpers. Preserve unsaved user work; reopen the saved `.unity` through the
+   ordinary Editor scene-open operation without executing a setup helper. Check
+   missing scripts/references, compile errors and actual final Scene/Game output.
+   A domain reload or project reopen is useful to rule out reliance on transient
+   state when feasible. Fix any cleanup regression before delivery.
+4. Store post-cleanup verification evidence outside the final Unity tree; report
+   the exact scene path and retained runtime dependencies. Reuse existing valid
+   stability/fidelity evidence for unchanged content. Call
+   `review_unity_restoration_handoff` with `projectPath`,
+   `artifactInventoryReviewed=true`, `artifactInventory=[{path, role, reason,
+   requiredByFinalAssets}]` and `sceneDelivery={scenePath, sceneSha256, saved:true,
+   reopenedFromDisk:true, requiresSetupCommand:false, missingScripts:0,
+   missingReferences:[], compileErrors:[], finalOutputsReviewed:true,
+   evidencePaths:[absolute post-cleanup evidence paths]}`. The review observes
+   remaining listed temporary files/metadata, missing final files and the current
+   scene hash (record `sceneSha256` from the bytes actually reopened). Reopen,
+   ownership and dependency fields describe actual Agent observations; they do
+   not create proof or permission. Missing managed receipts do not prevent direct
+   repairs or evidence-based assessment.

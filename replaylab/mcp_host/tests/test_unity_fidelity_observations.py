@@ -80,6 +80,18 @@ def test_asset_layout_is_flat_semantic_shared_and_sampler_aware():
     assert rows[0]["path"]=="Assets/Old/EID1267/a.tga"
 
 
+def test_asset_layout_handles_saved_scene_and_required_code_without_extra_directories():
+    rows = [dict(kind=kind, path="Assets/Staging/" + name, role=role)
+        for kind, name, role in [("scene", "Effect.unity", "Effect"),
+            ("shader", "Effect.shader", "Effect"), ("runtime", "Effect.cs", "EffectRenderer"),
+            ("editor", "Inspector.cs", "EffectInspector")]]
+    plan = asset_layout(rows, "Assets/Effect")
+    assert {row["target"] for row in plan["moves"]} == {
+        "Assets/Effect/Scenes/Effect.unity", "Assets/Effect/Shaders/Effect.shader",
+        "Assets/Effect/Runtime/EffectRenderer.cs", "Assets/Effect/Editor/EffectInspector.cs"}
+    assert not plan["textureAliases"] and not plan["collisions"]
+
+
 def test_raw_float_extension_sidecar_roi_and_channel_errors_find_shared_module(tmp_path):
     left=tmp_path/"left.rgba32f";right=tmp_path/"right.rgba32f"
     left.write_bytes(struct.pack("<8f",0,0,0,1,2,4,6,1));right.write_bytes(struct.pack("<8f",0,0,0,1,3,4,6,1))
