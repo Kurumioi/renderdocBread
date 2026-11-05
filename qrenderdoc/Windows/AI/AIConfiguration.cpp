@@ -643,10 +643,10 @@ AIConfiguration::Reply AIConfiguration::execute(const QStringList &arguments, co
       QJsonArray models, capabilities;
       // Qt 5.9 can invalidate a nested object's binary offsets when the owning row is edited.
       // Give options independent storage before changing the row and reinserting it.
-      QJsonObject options = QJsonDocument::fromJson(
-                                QJsonDocument(row.value(QStringLiteral("options")).toObject())
-                                    .toJson(QJsonDocument::Compact))
-                                .object();
+      QJsonObject options =
+          QJsonDocument::fromJson(QJsonDocument(row.value(QStringLiteral("options")).toObject())
+                                      .toJson(QJsonDocument::Compact))
+              .object();
       for(int i = 3; i < arguments.size(); ++i)
       {
         const QString flag = arguments[i];

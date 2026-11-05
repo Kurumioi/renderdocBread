@@ -25,7 +25,7 @@ consistent source path: mixing a junction-based `SolutionDir` with projects
 opened through their original path can defeat MSVC precompiled-header identity.
 
 Build prerequisites: VS2022 C++/VC143 redistributable files, Windows SDK, 64-bit CPython
-3.12, and .NET 10 SDK. The ordinary Git checkout includes all sealed archive
+3.12, and x64 .NET SDK **10.0.302** (apphost pack **10.0.10**). The ordinary Git checkout includes all sealed archive
 parts. `Restore-BuildEnvironment.ps1` assembles them offline and checks the lock
 file before use. Qt Linguist, Shader tools, the
 language service, Unity provider, UEX source and locked Python/NuGet dependencies are
@@ -36,7 +36,7 @@ publish. Package assembly does not use a developer's account or fetch dependenci
 
 Optional parameters include `-BuildInputRoot`, `-ApplicationDirectory`, `-Destination`,
 `-PythonExecutable`, `-QtBin`, `-CapabilitiesDirectory`, `-UexSource`,
-`-UexPublishDirectory`, and `-AuditOnly`. `-SkipNativeBuild` and `-SkipRuntimeBuild` explicitly reuse previous builds;
+`-UexPublishDirectory`, `-DotNetExecutable`, and `-AuditOnly`. `-SkipNativeBuild` and `-SkipRuntimeBuild` explicitly reuse previous builds;
 omit them for a release of the current source. No force switch can bypass the release audit.
 `New-BreadPackage.ps1` remains a compatibility entry point for packaging previous builds.
 
@@ -419,7 +419,7 @@ See [the dependency and redistribution checklist](../dependencies/README.md)
 and [machine inventory](../dependencies/inventory.json).
 
 Install 64-bit CPython 3.12, Visual Studio 2022 with the C++ workload and
-Windows SDK, and .NET 10 SDK. Restore with:
+Windows SDK, and x64 .NET SDK 10.0.302. Restore with:
 
 ```powershell
 ./replaylab/packaging/Restore-BuildEnvironment.ps1
@@ -448,3 +448,20 @@ when the source volume is full.
 `-SkipNativeBuild` requires an explicit read-only `-ApplicationDirectory`.
 It is an incremental packaging option, not the clean-build path. No command
 above deploys to or terminates a running application.
+
+## Windows build compatibility
+
+Build filesystem operations use explicit Windows extended-length paths for dependency
+extraction, inventory verification, source copying and staging cleanup. The build does
+not require changing LongPathsEnabled or the user registry. Enumeration errors stop
+restoration and preserve the existing generation instead of treating unreadable data
+as missing files. Temporary cleanup retries read-only or busy files; if cleanup still
+fails, it reports the exact retained directory without hiding the original build result.
+
+UEX uses the checked-in dotnet-sdk.global.json to select SDK 10.0.302 and its apphost
+10.0.10, matching the sealed runtime packages. Newer feature bands alone are not an
+offline replacement. Install this x64 SDK alongside existing SDKs, or pass
+-DotNetExecutable to an existing private installation. Missing prerequisites are reported
+before native compilation. An explicitly supplied -UexPublishDirectory needs no UEX SDK
+build. UEX source inputs are copied to an owned build directory before pinning SDK
+settings; user checkouts and sealed input generations are preserved.

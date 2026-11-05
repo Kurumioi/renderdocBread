@@ -13,6 +13,7 @@ import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from build_fs import long_path, logical_path, temporary_directory
 
 REPO = Path(__file__).resolve().parents[2]
 SKIP_DIRS = {"__pycache__", ".git", ".venv", "obj", ".uex-cache", ".uex-analysis",
@@ -46,15 +47,15 @@ def stage_uex_natives(root):
 
 
 def read_json(path):
-    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    return json.loads(long_path(path).read_text(encoding="utf-8-sig"))
 
 
 def write_json(path, value):
-    Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    long_path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def digest(path):
-    with Path(path).open("rb") as stream:
+    with long_path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
@@ -81,6 +82,7 @@ def child(root, relative):
 
 
 def copy_tree(source, target, *, excluded=()):
+    source, target = long_path(source), long_path(target)
     if not source.is_dir():
         return
     for current, dirs, files in os.walk(source, followlinks=False):
@@ -232,7 +234,7 @@ def assemble(application, gui, runtime, uex, crt, destination, config, audit_onl
     profile = read_json(capabilities / "bread-capabilities.json").get("distributionProfile", "extended") if capabilities else "core"
     destination.mkdir(parents=True, exist_ok=True)
     # Unique, disposable staging only. Never clean, deploy to, or rename the source application.
-    with tempfile.TemporaryDirectory(prefix="RenderDocBread-release-") as work:
+    with temporary_directory(prefix="RenderDocBread-release-") as work:
         root = Path(work) / "RenderDocBread 中文路径"
         root.mkdir()
         for name in config["rootFiles"]:
@@ -317,7 +319,7 @@ def assemble(application, gui, runtime, uex, crt, destination, config, audit_onl
         audit(root, config)
         # Provider and DXC verification are build-side checks against staged bytes only.
         verify_compilers(root)
-        checked = smoke(root) or []
+        checked = smoke(logical_path(root)) or []
         audit(root, config)  # tools must not leave caches or machine-specific configuration
         records = [{"path": p.relative_to(root).as_posix(), "size": p.stat().st_size, "sha256": digest(p)}
                    for p in release_files(root)]

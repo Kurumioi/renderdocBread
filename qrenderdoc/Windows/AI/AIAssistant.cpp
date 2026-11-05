@@ -10625,9 +10625,8 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
           const DialogControlStates controls = beginDialogCommand();
           runCLIAsync(
               arguments, QByteArray(), 10000, &dialog,
-              [&, controls, id, chosenDefault, usesAPIKey, typedAPIKey, rememberCredential,
-               keyToStore, makeActive](
-                  int saveExit, const QByteArray &, const QString &saveError, bool) {
+              [&, controls, id, chosenDefault, usesAPIKey, typedAPIKey, rememberCredential, keyToStore,
+               makeActive](int saveExit, const QByteArray &, const QString &saveError, bool) {
                 if(saveExit != 0)
                 {
                   finishDialogCommand(controls);
@@ -10638,8 +10637,8 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
                 }
 
                 const auto completeProfileSave =
-                    [&, controls, id, chosenDefault, usesAPIKey, typedAPIKey,
-                     rememberCredential, keyToStore,
+                    [&, controls, id, chosenDefault, usesAPIKey, typedAPIKey, rememberCredential,
+                     keyToStore,
                      makeActive](bool credentialUpdated, const QString &credentialWarning) {
                       if(rememberCredential && !keyToStore.isEmpty())
                       {

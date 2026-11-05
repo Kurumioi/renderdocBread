@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import stat
 import sys
 from dataclasses import dataclass
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -35,7 +36,7 @@ from .policy import (
     tool_call_effects,
     tool_effects,
 )
-from .process_env import host_process_environment
+from .process_env import host_process_environment, MCP_HOST_PROVIDER_ENV
 from .skill_gateway import (
     DIRECTORY_TOOL,
     DIRECTORY_TOOL_DESCRIPTION,
@@ -91,6 +92,33 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcp-server-json", default="")
     parser.add_argument("--mcp-server-file", type=Path)
     return parser
+
+
+def _expand_route_file(argv: Sequence[str]) -> list[str]:
+    values = list(argv)
+    if "--route-file" not in values:
+        return values
+    if len(values) != 2 or values[0] != "--route-file":
+        raise ConfigurationError("The task MCP route file must be the only route argument")
+    path = Path(values[1])
+    if not path.is_absolute():
+        raise ConfigurationError("The task MCP route must be an absolute regular file")
+    details = path.lstat()
+    if not stat.S_ISREG(details.st_mode) or getattr(details, "st_file_attributes", 0) & 0x400 or details.st_size > 8 * 1024 * 1024:
+        raise ConfigurationError("The task MCP route file is invalid")
+    with path.open("rb") as stream:
+        payload = json.loads(stream.read(8 * 1024 * 1024 + 1).decode("utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema") != "bread-mcp-route/v1":
+        raise ConfigurationError("Unsupported task MCP route schema")
+    arguments = payload.get("arguments")
+    environment = payload.get("environment")
+    if not isinstance(arguments, list) or not all(isinstance(arg, str) and "\0" not in arg and arg != "--route-file" for arg in arguments):
+        raise ConfigurationError("Invalid task MCP route arguments")
+    if not isinstance(environment, dict) or any(not isinstance(key, str) or not isinstance(value, str) or "\0" in value or
+        key not in MCP_HOST_PROVIDER_ENV | set(_TASK_ENV_NAMES) | {_INSTANCE_ENV} for key, value in environment.items()):
+        raise ConfigurationError("Invalid task MCP route environment")
+    os.environ.update(environment)
+    return arguments
 
 
 def _exception_detail(error: BaseException) -> str:
@@ -782,7 +810,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pass
     logging.basicConfig(level=logging.WARNING)
     try:
-        args = _parser().parse_args(argv)
+        args = _parser().parse_args(_expand_route_file(sys.argv[1:] if argv is None else argv))
         host, host_args, allowed, effects, scope, host_env = _validate_configuration(args)
         gateway = _skill_gateway(args, allowed=allowed, effects=effects)
         asyncio.run(

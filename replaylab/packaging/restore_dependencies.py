@@ -17,12 +17,14 @@ import stat
 import tempfile
 import time
 import zipfile
+from build_fs import long_path, logical_path, temporary_directory, walk_files
 
 REPO = Path(__file__).resolve().parents[2]
 DEPENDENCIES = REPO / "replaylab/dependencies"
 
 
 def sha(path: Path) -> str:
+    path = long_path(path)
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
@@ -39,6 +41,7 @@ def child(root: Path, relative: str) -> Path:
 
 
 def verify_archive(root: Path, record: dict) -> Path:
+    root = long_path(root)
     archive = child(root, record["path"])
     if not archive.is_file():
         if record.get("parts"):
@@ -73,6 +76,7 @@ def verify_archive(root: Path, record: dict) -> Path:
 
 def assemble_archive(root: Path, record: dict) -> Path:
     """Restore an ignored ZIP from checked-in parts without any network access."""
+    root = long_path(root)
     archive = child(root, record["path"])
     root.mkdir(parents=True, exist_ok=True)
     parts = record.get("parts", [])
@@ -113,7 +117,8 @@ def assemble_archive(root: Path, record: dict) -> Path:
 
 
 def verify_tree(root: Path, records: list[dict]) -> bool:
-    if {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()} != {r["path"] for r in records}:
+    root = long_path(root)
+    if {p.relative_to(root).as_posix() for p in walk_files(root)} != {r["path"] for r in records}:
         return False
     for record in records:
         path = child(root, record["path"])
@@ -126,6 +131,7 @@ def verify_tree(root: Path, records: list[dict]) -> bool:
 @contextmanager
 def input_lock(path: Path):
     """An OS-owned lock is released after exceptions and process termination."""
+    path = long_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as stream:
         stream.seek(0, 2)
@@ -158,6 +164,7 @@ def input_lock(path: Path):
 
 
 def restore(root: Path, output: Path, record: dict) -> Path:
+    root, output = long_path(root), long_path(output)
     # Content-addressed directories allow different revisions to build concurrently.
     target = output / record["id"] / record["sha256"]
     if output.resolve().is_relative_to(root.resolve()):
@@ -168,8 +175,8 @@ def restore(root: Path, output: Path, record: dict) -> Path:
     with input_lock(target.with_suffix(".lock")):
         archive = verify_archive(root, record)
         if target.exists() and verify_tree(target, record["files"]):
-            return target
-        with tempfile.TemporaryDirectory(prefix=".restoring-", dir=target.parent) as work:
+            return logical_path(target)
+        with temporary_directory(prefix=".restoring-", dir=target.parent) as work:
             staging = Path(work) / "payload"
             staging.mkdir()
             with zipfile.ZipFile(archive) as source:
@@ -193,7 +200,7 @@ def restore(root: Path, output: Path, record: dict) -> Path:
                 damaged.rename(target.with_name(target.name + f".damaged-{time.time_ns()}"))
             else:
                 staging.rename(target)
-    return target
+    return logical_path(target)
 
 
 def load_lock(root: Path = DEPENDENCIES) -> dict:

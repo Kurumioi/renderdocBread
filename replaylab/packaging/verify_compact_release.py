@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import zipfile
+from build_fs import temporary_directory
 
 from package_portable import audit, digest, read_json, smoke, verify_compilers
 
@@ -17,7 +18,7 @@ def main():
     archive = Path(receipt["archive"])
     if digest(archive) != receipt["sha256"]:
         raise ValueError("Release checksum differs")
-    with tempfile.TemporaryDirectory(prefix="Bread-portable-relocated-") as temporary:
+    with temporary_directory(prefix="Bread-portable-relocated-") as temporary:
         stage = Path(temporary) / "便携测试"
         stage.mkdir()
         with zipfile.ZipFile(archive) as package:

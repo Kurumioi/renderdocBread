@@ -9,6 +9,7 @@ param(
     [string]$CapabilitiesDirectory = '',
     [string]$QtBin = '',
     [string]$BuildInputRoot = '',
+    [string]$DotNetExecutable = '',
     [switch]$SkipNativeBuild,
     [switch]$SkipRuntimeBuild,
     [switch]$AuditOnly,
@@ -20,6 +21,22 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $config = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'RenderDocBread.package.json') -Raw | ConvertFrom-Json
 if (-not $Destination) { $Destination = Join-Path $repoRoot $config.destination }
 if (-not $BuildInputRoot) { $BuildInputRoot = Join-Path $repoRoot 'replaylab\output\build-inputs' }
+# Fail before the expensive native build if the sealed offline UEX apphost cannot be restored.
+if (-not $UexPublishDirectory) {
+    if (-not $DotNetExecutable) {
+        $dotnetCommand = Get-Command dotnet.exe -ErrorAction SilentlyContinue
+        if ($dotnetCommand) { $DotNetExecutable = $dotnetCommand.Source }
+    }
+    if (-not $DotNetExecutable) { throw 'Install the x64 .NET SDK 10.0.302, or supply -DotNetExecutable / -UexPublishDirectory.' }
+    $sdkListing = & $DotNetExecutable --list-sdks
+    $pinnedSdk = @($sdkListing | Where-Object { $_ -match '^10\.0\.302\s+\[(.+)\]$' })
+    if ($LASTEXITCODE -ne 0 -or $pinnedSdk.Count -eq 0) {
+        throw 'The offline UEX build requires x64 .NET SDK 10.0.302 (apphost 10.0.10). Install that version; a newer feature band alone cannot use the sealed offline feed. Private installs can use -DotNetExecutable.'
+    }
+    $sdkRoot = [regex]::Match($pinnedSdk[0], '\[(.+)\]').Groups[1].Value
+    $apphostPack = Join-Path (Split-Path -Parent $sdkRoot) 'packs\Microsoft.NETCore.App.Host.win-x64\10.0.10'
+    if (-not (Test-Path -LiteralPath $apphostPack -PathType Container)) { throw "The pinned .NET apphost pack 10.0.10 is missing: $apphostPack. Repair .NET SDK 10.0.302." }
+}
 # Restore locked third-party inputs before looking for a pre-existing application.
 # Checked-in archive parts restore all sealed inputs offline after an ordinary clone.
 $restoreArguments = @('-OutputRoot', $BuildInputRoot)
@@ -49,7 +66,8 @@ elseif ($SkipNativeBuild) { throw '-SkipNativeBuild requires an explicit -Applic
 else { $ApplicationDirectory = $nativeOutput }
 New-Item -ItemType Directory -Force -Path $nativeOutput | Out-Null
 foreach ($inputDirectory in @($paths.'application-tools', $paths.'shader-language-server')) {
-    Get-ChildItem -LiteralPath $inputDirectory | Copy-Item -Destination $nativeOutput -Recurse -Force
+    & $PythonExecutable (Join-Path $PSScriptRoot 'build_fs.py') copy --source $inputDirectory --destination $nativeOutput
+    if ($LASTEXITCODE -ne 0) { throw "Copying sealed native tool input failed: $inputDirectory" }
 }
 if (-not $SkipNativeBuild) {
     # Shipping Development diagnostics does not require unoptimized replay.
@@ -91,11 +109,13 @@ if ($LASTEXITCODE -ne 0) { throw 'Preparing the bundled Unity MCP runtime failed
 # UEX's ordinary publish requires .NET 10 on the recipient. Publish the same patched source
 # self-contained so the zip does not depend on any installed dotnet/registry/PATH runtime.
 if (-not $UexPublishDirectory) {
-    if (-not $UexSource) {
-        # dotnet writes obj/bin beside sources. Never mutate the sealed source generation.
-        $UexSource = Join-Path $repoRoot 'output\RenderDocBread-tools\uex-source'
+    $uexInputSource = if ($UexSource) { $UexSource } else { $paths.'uex-source' }
+    # Always build an owned copy, preserving a caller's source and global.json too.
+    $UexSource = Join-Path $repoRoot 'output\RenderDocBread-tools\uex-source'
+    if ([IO.Path]::GetFullPath($uexInputSource) -ne [IO.Path]::GetFullPath($UexSource)) {
         New-Item -ItemType Directory -Force -Path $UexSource | Out-Null
-        Get-ChildItem -LiteralPath $paths.'uex-source' | Copy-Item -Destination $UexSource -Recurse -Force
+        & $PythonExecutable (Join-Path $PSScriptRoot 'build_fs.py') copy --source $uexInputSource --destination $UexSource
+        if ($LASTEXITCODE -ne 0) { throw 'Copying the sealed UEX source failed.' }
     }
         $project = Join-Path $UexSource 'src\Uex\Uex.csproj'
         if (-not (Test-Path -LiteralPath $project)) {
@@ -103,15 +123,26 @@ if (-not $UexPublishDirectory) {
         }
         $UexPublishDirectory = Join-Path $repoRoot 'output\RenderDocBread-tools\uex-win-x64'
         $lockRoot = Join-Path $repoRoot 'replaylab\dependencies\uex-locks'
-        Get-ChildItem -LiteralPath $lockRoot | Copy-Item -Destination $UexSource -Recurse -Force
+        & $PythonExecutable (Join-Path $PSScriptRoot 'build_fs.py') copy --source $lockRoot --destination $UexSource
+        if ($LASTEXITCODE -ne 0) { throw 'Copying the UEX dependency locks failed.' }
+        # Resolve the SDK from an application-owned working directory, not a caller's global.json.
+        $sdkSelection = Join-Path $repoRoot 'output\RenderDocBread-tools\dotnet-sdk'
+        New-Item -ItemType Directory -Force -Path $sdkSelection | Out-Null
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'dotnet-sdk.global.json') -Destination (Join-Path $sdkSelection 'global.json') -Force
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'dotnet-sdk.global.json') -Destination (Join-Path $UexSource 'global.json') -Force
+        Push-Location $sdkSelection
+        try {
+        $selectedSdk = & $DotNetExecutable --version
+        if ($LASTEXITCODE -ne 0 -or $selectedSdk -ne '10.0.302') { throw 'The pinned .NET SDK 10.0.302 could not be selected.' }
         $nugetPackages = Join-Path $repoRoot 'output\RenderDocBread-tools\nuget-packages'
-        & dotnet restore $project -r win-x64 --locked-mode --source $paths.'nuget-feed' --packages $nugetPackages `
+        & $DotNetExecutable restore $project -r win-x64 --locked-mode --source $paths.'nuget-feed' --packages $nugetPackages `
             -p:CUE4PARSE_SKIP_NATIVE=true -p:SelfContained=true -p:RuntimeFrameworkVersion=10.0.10 -p:NuGetAudit=false
         if ($LASTEXITCODE -ne 0) { throw 'Offline restore of the locked UEX dependencies failed.' }
-        & dotnet publish $project -c Release -r win-x64 --self-contained true -o $UexPublishDirectory `
+        & $DotNetExecutable publish $project -c Release -r win-x64 --self-contained true -o $UexPublishDirectory `
             --no-restore -p:CUE4PARSE_SKIP_NATIVE=true -p:PublishSingleFile=false -p:PublishTrimmed=false `
             -p:RuntimeFrameworkVersion=10.0.10 -p:NuGetAudit=false
         if ($LASTEXITCODE -ne 0) { throw 'Self-contained UEX publish failed.' }
+        } finally { Pop-Location }
         foreach ($notice in @(@('LICENSE', 'LICENSE.uex.txt'), @('deps\CUE4Parse\LICENSE', 'LICENSE.CUE4Parse.txt'),
                                @('deps\CUE4Parse\NOTICE', 'NOTICE.CUE4Parse.txt'))) {
             Copy-Item -LiteralPath (Join-Path $UexSource $notice[0]) -Destination (Join-Path $UexPublishDirectory $notice[1]) -Force
