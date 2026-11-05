@@ -1,6 +1,6 @@
 """Single source of truth for ReplayLab application protocol metadata."""
 
-SERVICE_VERSION = "1.13.125"
+SERVICE_VERSION = "1.13.126"
 HOST_STATE_PROTOCOL_VERSION = 2
 INTERNAL_HOST_STATE_PROTOCOL_VERSION = 1
 

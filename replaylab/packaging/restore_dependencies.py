@@ -18,15 +18,10 @@ import tempfile
 import time
 import zipfile
 from build_fs import long_path, logical_path, temporary_directory, walk_files
+from file_hashes import digest as sha, warm_digests, identity, settled
 
 REPO = Path(__file__).resolve().parents[2]
 DEPENDENCIES = REPO / "replaylab/dependencies"
-
-
-def sha(path: Path) -> str:
-    path = long_path(path)
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def child(root: Path, relative: str) -> Path:
@@ -120,6 +115,7 @@ def verify_tree(root: Path, records: list[dict]) -> bool:
     root = long_path(root)
     if {p.relative_to(root).as_posix() for p in walk_files(root)} != {r["path"] for r in records}:
         return False
+    warm_digests((child(root, r["path"]) for r in records), fresh=True)
     for record in records:
         path = child(root, record["path"])
         if (not path.is_file() or path.is_symlink() or path.is_junction()
@@ -163,10 +159,22 @@ def input_lock(path: Path):
                 fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-def restore(root: Path, output: Path, record: dict) -> Path:
+def tree_receipt(target, record):
+    # Per-file identity detects replacement and same-size edits with restored
+    # mtimes. Aggregate totals alone cannot safely authorize cache reuse.
+    files = {p.relative_to(target).as_posix(): list(identity(p)) for p in walk_files(target)}
+    return {"schema": "bread-restored-tree/v1", "archiveSha256": record["sha256"],
+            "inventorySha256": hashlib.sha256(json.dumps(record["files"], sort_keys=True).encode()).hexdigest(),
+            "settled": all(settled(value) for value in files.values()), "files": files}
+
+
+def restore(root: Path, output: Path, record: dict, *, full_verify=False) -> Path:
     root, output = long_path(root), long_path(output)
     # Content-addressed directories allow different revisions to build concurrently.
-    target = output / record["id"] / record["sha256"]
+    parent = output / record["id"]
+    legacy = parent / record["sha256"]
+    target = legacy if legacy.exists() else parent / record["sha256"][:20]
+    receipt = target.with_suffix(".ready.json")
     if output.resolve().is_relative_to(root.resolve()):
         raise ValueError("Expanded dependencies must not be written inside sealed inputs")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -174,8 +182,26 @@ def restore(root: Path, output: Path, record: dict) -> Path:
         raise ValueError("Dependency output must not be a link")
     with input_lock(target.with_suffix(".lock")):
         archive = verify_archive(root, record)
-        if target.exists() and verify_tree(target, record["files"]):
-            return logical_path(target)
+        if target != legacy and receipt.is_file():
+            try:
+                previous = json.loads(receipt.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                previous = {}
+            if isinstance(previous, dict) and previous.get("archiveSha256") and previous["archiveSha256"] != record["sha256"]:
+                raise ValueError("Short dependency directory hash collision; use a different output root")
+        if target.exists():
+            current = tree_receipt(target, record)
+            expected = {r["path"] for r in record["files"]}
+            reusable = False
+            if not full_verify and current["settled"] and set(current["files"]) == expected:
+                try:
+                    reusable = json.loads(receipt.read_text(encoding="utf-8")) == current
+                except (OSError, ValueError):
+                    pass
+            if reusable or verify_tree(target, record["files"]):
+                if not reusable:
+                    write_tree_receipt(receipt, current)
+                return logical_path(target)
         with temporary_directory(prefix=".restoring-", dir=target.parent) as work:
             staging = Path(work) / "payload"
             staging.mkdir()
@@ -200,7 +226,15 @@ def restore(root: Path, output: Path, record: dict) -> Path:
                 damaged.rename(target.with_name(target.name + f".damaged-{time.time_ns()}"))
             else:
                 staging.rename(target)
+        write_tree_receipt(receipt, tree_receipt(target, record))
     return logical_path(target)
+
+
+def write_tree_receipt(path, value):
+    # Called under the generation lock; the receipt is outside the exact tree.
+    pending = path.with_suffix(".pending")
+    pending.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(pending, path)
 
 
 def load_lock(root: Path = DEPENDENCIES) -> dict:
@@ -220,7 +254,7 @@ def standard_capabilities(config: dict, output: Path | None = None) -> Path:
         return REPO / config["standardCapabilitiesDirectory"]
     identifier = config["standardCapabilitiesInput"]
     record = next(r for r in load_lock()["archives"] if r["id"] == identifier)
-    return restore(DEPENDENCIES, output or REPO / "replaylab/output/build-inputs/expanded", record)
+    return restore(DEPENDENCIES, output or REPO / "replaylab/output/build-inputs/expanded", record, full_verify=True)
 
 
 def main():
@@ -229,6 +263,7 @@ def main():
     parser.add_argument("--output", type=Path, default=REPO / "replaylab/output/dependencies")
     parser.add_argument("--only", action="append", default=[])
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--full-verify", action="store_true", help="Bypass expanded-tree receipts and hash every file")
     parser.add_argument("--receipt", type=Path)
     args = parser.parse_args()
     lock = load_lock(args.inputs)
@@ -240,7 +275,12 @@ def main():
         if record["id"] not in selected:
             continue
         path = (verify_archive(args.inputs, record) if args.verify_only
-                else restore(args.inputs, args.output, record))
+                else restore(args.inputs, args.output, record, full_verify=args.full_verify))
+        if args.verify_only:
+            parent = long_path(args.output) / record["id"]
+            for target in {parent / record["sha256"], parent / record["sha256"][:20]}:
+                if target.exists() and not verify_tree(target, record["files"]):
+                    raise ValueError(f"Expanded dependency differs: {record['id']}")
         paths[record["id"]] = str(path.resolve())
         print(f"Verified {record['id']}" if args.verify_only else f"Restored {record['id']}", flush=True)
     if args.receipt:

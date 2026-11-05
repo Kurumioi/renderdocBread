@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Production Windows Qt/MSVC fixture")
-def test_agent_lifecycle_and_exposed_reasoning_channels(tmp_path):
+def test_agent_lifecycle_and_exposed_reasoning_channels(tmp_path, monkeypatch):
     from setuptools._distutils.ccompiler import new_compiler
 
     qt = ROOT / "qrenderdoc/3rdparty/qt"
@@ -84,17 +84,26 @@ int main(int argc, char **argv) {
 }
 ''', encoding="utf-8")
     compiler = new_compiler(compiler="msvc")
-    compiled = compiler.compile(
-        [str(probe), str(ROOT / "qrenderdoc/Windows/AI/AIAgentTraceStore.cpp")],
-        output_dir=str(tmp_path),
-        include_dirs=[str(ROOT / "qrenderdoc"), str(qt / "include"), str(qt / "include/QtCore")],
-        extra_postargs=["/EHsc", "/std:c++14", "/MD", "/DQT_NO_DEBUG"],
-    )
+    # distutils appends absolute source directories below output_dir, which
+    # duplicates the full temp path and exceeds MSVC's path limit on CI.
+    # Compile exact copies by relative name without changing the tested code.
+    source_root = ROOT / "qrenderdoc/Windows/AI"
+    for name in ("AIAgentTraceStore.cpp", "AIAgentTraceStore.h"):
+        (tmp_path / name).write_bytes((source_root / name).read_bytes())
+    with monkeypatch.context() as context:
+        context.chdir(tmp_path)
+        compiled = compiler.compile(
+            ["trace.cpp", "AIAgentTraceStore.cpp"],
+            output_dir=str(tmp_path),
+            include_dirs=[str(ROOT / "qrenderdoc"), str(qt / "include"), str(qt / "include/QtCore")],
+            extra_postargs=["/EHsc", "/std:c++14", "/MD", "/DQT_NO_DEBUG"],
+        )
     executable = tmp_path / "trace.exe"
     compiler.link_executable(compiled, str(executable.with_suffix("")), libraries=["Qt5Core"],
                              library_dirs=[str(qt / "x64/lib")], target_lang="c++")
     environment = dict(os.environ)
-    environment["PATH"] = str(ROOT / "x64/Development") + os.pathsep + environment.get("PATH", "")
+    environment["PATH"] = os.pathsep.join([
+        str(qt / "x64/bin"), str(ROOT / "x64/Development"), environment.get("PATH", "")])
     report = tmp_path / "result.json"
     subprocess.run([str(executable), str(report)], env=environment, check=True,
                    capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)

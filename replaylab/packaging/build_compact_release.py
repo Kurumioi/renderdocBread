@@ -16,7 +16,7 @@ from pathlib import Path
 import tempfile
 import zipfile
 
-from package_portable import copy_tree, release_files
+from package_portable import copy_tree, release_files, zip_compress_type
 from prepare_capabilities_bundle import verify
 from runtime_inputs import fingerprint, REPO
 
@@ -113,7 +113,8 @@ def compose(base, capabilities, runtime, gui, output, *, replay_bindings=None, r
                 else:
                     stream = old.open(PREFIX + path)
                 member = zipfile.ZipInfo(PREFIX + path, datetime.now().timetuple()[:6])
-                member.compress_type = zipfile.ZIP_STORED if path.startswith(CAPS + "bundles/") else zipfile.ZIP_DEFLATED
+                input_size = len(source) if isinstance(source, bytes) else source.stat().st_size if source is not None else before[path]["size"]
+                member.compress_type = zip_compress_type(path, input_size)
                 sha = hashlib.sha256(); size = 0
                 with stream, new.open(member, "w", force_zip64=True) as dest:
                     while data := stream.read(1024 * 1024):

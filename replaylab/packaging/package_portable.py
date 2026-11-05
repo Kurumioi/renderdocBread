@@ -14,6 +14,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from build_fs import long_path, logical_path, temporary_directory
+from file_hashes import digest, warm_digests
 
 REPO = Path(__file__).resolve().parents[2]
 SKIP_DIRS = {"__pycache__", ".git", ".venv", "obj", ".uex-cache", ".uex-analysis",
@@ -54,9 +55,15 @@ def write_json(path, value):
     long_path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def digest(path):
-    with long_path(path).open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+def zip_compress_type(relative, size):
+    path = Path(relative)
+    compressed = {".zip", ".7z", ".gz", ".xz", ".zst", ".bz2", ".png", ".jpg",
+                  ".jpeg", ".webp", ".mp4", ".woff2", ".nupkg", ".whl"}
+    frozen = relative in {"replaylab/replaylab-ai.exe", "replaylab/BreadMCP.exe",
+                          "replaylab/ReplayLabInternal.exe", "replaylab/ReplayLabShaderTools.exe"}
+    return zipfile.ZIP_STORED if (path.suffix.lower() in compressed or
+        relative.startswith("replaylab/tools/capabilities/bundles/") or
+        (frozen and size > 16 * 1024**2)) else zipfile.ZIP_DEFLATED
 
 
 def release_files(root):
@@ -316,10 +323,12 @@ def assemble(application, gui, runtime, uex, crt, destination, config, audit_onl
         (root / "RenderDocBread.portable").write_text("renderdocbread-portable/v1\n", encoding="ascii")
         (root / "qt.conf").write_text("[Paths]\nPlugins=qtplugins\n", encoding="ascii")
         normalize_receipts(root)
+        warm_digests(release_files(root))
         audit(root, config)
         # Provider and DXC verification are build-side checks against staged bytes only.
         verify_compilers(root)
         checked = smoke(logical_path(root)) or []
+        warm_digests(release_files(root))
         audit(root, config)  # tools must not leave caches or machine-specific configuration
         records = [{"path": p.relative_to(root).as_posix(), "size": p.stat().st_size, "sha256": digest(p)}
                    for p in release_files(root)]
@@ -346,8 +355,7 @@ def assemble(application, gui, runtime, uex, crt, destination, config, audit_onl
             for path in release_files(root):
                 relative = path.relative_to(root).as_posix()
                 output.write(path, "RenderDocBread/" + relative,
-                             compress_type=zipfile.ZIP_STORED if relative.startswith(
-                                 "replaylab/tools/capabilities/bundles/") else zipfile.ZIP_DEFLATED)
+                             compress_type=zip_compress_type(relative, path.stat().st_size))
         os.replace(pending, archive)
         archive.with_suffix(".zip.sha256").write_text(digest(archive) + "  " + archive.name + "\n", encoding="ascii")
         print(f"Created {archive}", flush=True)

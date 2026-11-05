@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -52,10 +53,15 @@ async def test_codex_spawn_failure_keeps_argv_out_of_connector_error(
     with pytest.raises(ConnectorError) as caught:
         await connector._transport.start()
 
-    assert str(caught.value) == (
+    prefix = (
         "cannot start Codex app-server; verify the configured executable and "
         "connection settings"
     )
+    message = str(caught.value)
+    assert message.startswith(prefix + "; startup report: ")
+    report = Path(message.removeprefix(prefix + "; startup report: "))
+    assert report.is_file()
+    assert "sk-command-secret-value" not in report.read_text(encoding="utf-8")
     assert private_executable not in str(caught.value)
     assert secret_argument not in str(caught.value)
     assert isinstance(caught.value.__cause__, FileNotFoundError)

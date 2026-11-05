@@ -258,6 +258,12 @@ The default output is `replaylab/output/replaylab/`. The qrenderdoc build owns
 deployment of the embedded Python bridge, so this runtime builder does not
 create an extension manifest or copy a plugin directory.
 
+The three Hosts freeze concurrently, with separate persistent
+`<WorkDirectory>/pyinstaller-cache/<host>` caches. Per-host OS locks serialize
+another build using the same cache. All jobs must succeed before smoke tests
+or output publication; logs include individual and wall-clock freeze times.
+The independent Shader runner keeps its content-addressed cache and checks.
+
 For development-only runtime builds, prepare one 64-bit Python environment with
 both projects' build dependencies as below. Release packaging uses the sealed,
 hash-locked environment from `Restore-BuildEnvironment.ps1` instead of resolving
@@ -369,6 +375,35 @@ imports login state, account configuration, captures, conversations or live MCP
 pipe settings. `--provider-runtime` includes dedicated clients; they activate
 only with a live advertised provider service. Bread's document, browser and
 Windows adapters use a shared MCP interface on all connection types.
+
+Desktop personal skills are excluded by default. Repeat `--custom-skill NAME`
+to explicitly select directories for a new import. Selected skills retain their
+instructions, references and scripts, but omit node_modules, virtual environments
+and caches. Import metadata records this allowlist and verification rejects
+unselected skills or nested dependency caches. Required Node/Python SDKs belong
+in their dedicated runtime components; their node_modules are valid dependencies.
+Existing sealed standard snapshots retain their declared workflows and runtime
+dependencies for compatibility. This policy does not silently shrink them.
+Claude task workspaces copy instructions/references/scripts with Windows extended
+paths, prune dependency/cache directories before scanning, and reject retained
+links or reparse points.
+
+Package audits and capability verification share process-local parallel SHA-256
+results keyed by file identity, size, modification time and change time (NTFS
+ChangeTime on Windows). Changed files are rehashed after smoke tests; final ZIP
+members still receive independent byte verification. Both full and compact ZIP
+writers store compressed formats and the four known large frozen Hosts verbatim.
+Files sampled within the two-second timestamp window are rehashed until a
+settled sample is available, covering rapid writes that share a clock tick.
+Expanded-tree receipts likewise require settled file identities before reuse.
+
+Dependency expansion uses 20-hex directory names for new generations and discovers
+existing full-hash directories without moving them. A sibling atomic receipt binds
+the full archive hash, locked inventory and every file's metadata; unchanged normal
+restores avoid rereading contents. Source archives are always hash-verified.
+`restore_dependencies.py --full-verify` and release capability selection hash the
+complete expanded inventory. `--verify-only` also fully checks any selected trees
+already present under `--output`. Receipts never replace release verification.
 
 The standard package requires a verified capabilities snapshot. The default
 entry point restores/selects it from sealed inputs; `--capabilities` (PowerShell:

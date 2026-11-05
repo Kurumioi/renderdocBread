@@ -1038,9 +1038,8 @@ class _LiveEditJob:
                 terminal = False
         if terminal:
             self._stop_workspace_watcher()
-            for worker in (self._thread, self._apply_thread):
-                if not is_current_task(worker):
-                    worker.join(self.join_seconds)
+            self._join_workers()
+            for worker in (self._apply_thread, self._thread):
                 if worker.is_alive():
                     raise ShaderLiveEditError("terminal live-edit worker has not finished")
             return self.snapshot()
@@ -1060,8 +1059,7 @@ class _LiveEditJob:
         except Exception as exc:
             if stop_error is None:
                 stop_error = exc
-        if not is_current_task(self._thread):
-            self._thread.join(self.join_seconds)
+        self._join_workers()
         if self._thread.is_alive():
             raise ShaderLiveEditError(
                 "live-edit worker did not stop within %.3f seconds" % self.join_seconds
@@ -1074,6 +1072,16 @@ class _LiveEditJob:
         if stop_error is not None:
             raise ShaderLiveEditError("could not stop live-edit cleanly: %s" % stop_error)
         return self.snapshot()
+
+    def _join_workers(self) -> None:
+        # The monitor's finally block waits for the apply task. Retire that
+        # task first so a sleeping monitor does not spend the entire stop
+        # budget waiting for its next cooperative poll after apply has ended.
+        # An in-flight apply still retains ownership and the original deadline.
+        deadline = time.monotonic() + self.join_seconds
+        for worker in (self._apply_thread, self._thread):
+            if not is_current_task(worker):
+                worker.join(max(0.0, deadline - time.monotonic()))
 
     def record_persistent_authorization_revoke_failure(
         self, error: BaseException

@@ -1,6 +1,8 @@
 import hashlib
 import importlib.util
 import json
+import os
+import time
 from pathlib import Path
 import zipfile
 
@@ -158,3 +160,47 @@ def test_extract_cannot_write_into_dependency_inputs(tmp_path):
 
 def test_legacy_explicit_config_remains_usable():
     assert restore.standard_capabilities({"standardCapabilitiesDirectory": "old/bundle"}) == restore.REPO / "old/bundle"
+
+
+def test_receipt_skips_hashes_but_full_verification_bypasses_it(tmp_path, monkeypatch):
+    inputs, record = sealed(tmp_path)
+    output = tmp_path / "build"
+    result = restore.restore(inputs, output, record)
+    assert len(result.name) == 20
+    time.sleep(2.05)
+    restore.restore(inputs, output, record)  # Upgrade the recent-file receipt after settling.
+    original = restore.verify_tree
+    calls = []
+    def measured(*args):
+        calls.append(1)
+        return original(*args)
+    monkeypatch.setattr(restore, "verify_tree", measured)
+    restore.restore(inputs, output, record)
+    assert not calls
+    restore.restore(inputs, output, record, full_verify=True)
+    assert calls == [1]
+    path = result / "tool/code.py"
+    info = path.stat()
+    path.write_bytes(b"x" * info.st_size)
+    os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+    restore.restore(inputs, output, record)
+    assert path.read_bytes() == b"print('tool')\n"
+
+
+def test_old_full_hash_directory_is_preserved(tmp_path):
+    inputs, record = sealed(tmp_path)
+    output = tmp_path / "build"
+    short = restore.restore(inputs, output, record)
+    legacy = short.with_name(record["sha256"])
+    short.rename(legacy)
+    assert restore.restore(inputs, output, record) == legacy
+
+
+@pytest.mark.parametrize("value", ["{broken", "[]", "null"])
+def test_damaged_receipt_falls_back_to_full_hash_verification(tmp_path, value):
+    inputs, record = sealed(tmp_path)
+    output = tmp_path / "build"
+    result = restore.restore(inputs, output, record)
+    result.with_suffix(".ready.json").write_text(value)
+    assert restore.restore(inputs, output, record) == result
+    assert (result / "tool/code.py").read_bytes() == b"print('tool')\n"

@@ -690,7 +690,9 @@ class ShaderLiveEditTests(unittest.TestCase):
         self.assertEqual(list((self.workspace / "live-edit").glob(".*.tmp-*")), [])
 
     def test_transient_winerror5_persisting_authorization_registry_is_retried(self):
-        registry = Path(self.temporary.name) / "config" / "live-edit.json"
+        # CI's TEMP can use an 8.3 user-directory alias; the registry resolves
+        # it before writing, so fault injection must match that same identity.
+        registry = (Path(self.temporary.name) / "config" / "live-edit.json").resolve()
         identity = self._identity()
         real_replace = os.replace
         attempts = 0
