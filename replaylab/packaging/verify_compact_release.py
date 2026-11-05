@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import zipfile
+from build_fs import logical_path, temporary_directory
 
 from package_portable import audit, digest, read_json, smoke, verify_compilers
 
@@ -17,7 +18,7 @@ def main():
     archive = Path(receipt["archive"])
     if digest(archive) != receipt["sha256"]:
         raise ValueError("Release checksum differs")
-    with tempfile.TemporaryDirectory(prefix="Bread-portable-relocated-") as temporary:
+    with temporary_directory(prefix="Bread-portable-relocated-") as temporary:
         stage = Path(temporary) / "便携测试"
         stage.mkdir()
         with zipfile.ZipFile(archive) as package:
@@ -31,7 +32,9 @@ def main():
         print("Relocated release audit passed", flush=True)
         verify_compilers(root)
         print("Relocated compiler capability checks passed", flush=True)
-        checks = smoke(root)
+        # Extended paths are for build-side filesystem I/O. Older native
+        # executables still need the normal spelling when creating processes.
+        checks = smoke(logical_path(root))
         args.output.write_text(json.dumps({"ok": True, "archive": str(archive),
             "sha256": receipt["sha256"], "freshProfile": True, "developerPathRemoved": True,
             "checks": ["sealed-release-audit", "shader-compiler-capabilities", *checks]}, ensure_ascii=False, indent=2), encoding="utf-8")

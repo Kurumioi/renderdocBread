@@ -70,6 +70,22 @@ class NativeMCPRoute:
             + ', default_tools_approval_mode = "approve" }'
         )
 
+    def compact_codex_config_override(self) -> str:
+        """Keep task configuration and credentials outside Windows shell command lines."""
+        if self.args[:3] != ("-I", "-m", "replaylab_agent.mcp_proxy"):
+            raise ValueError("A compact Codex route requires the first-party MCP proxy")
+        path = self.registry_path.parent / ("codex-mcp-route-" + uuid.uuid4().hex + ".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump({"schema": "bread-mcp-route/v1", "arguments": list(self.args[3:]),
+                       "environment": self.env}, stream, ensure_ascii=False)
+        # The private turn root owns the file; ordinary task teardown removes it.
+        compact = NativeMCPRoute(self.command,
+            ("-I", "-m", "replaylab_agent.mcp_proxy", "--route-file", str(path)),
+            {}, self.allowed_tools, self.effects, self.registry_path, self.visible_tools)
+        return compact.codex_config_override()
+
 
 def build_native_mcp_route(
     context: ProviderContext,
@@ -182,7 +198,7 @@ def native_codex_argv(argv: Sequence[str], route: NativeMCPRoute | None, *,
     return [
         *hardened[:index],
         "-c",
-        route.codex_config_override(),
+        route.compact_codex_config_override(),
         *hardened[index:],
     ]
 

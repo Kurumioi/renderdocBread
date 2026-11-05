@@ -18,6 +18,15 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 
+@pytest.fixture(autouse=True)
+def isolated_process_startup_reports(monkeypatch, tmp_path):
+    from replaylab_agent import process_diagnostics
+    from replaylab_agent.agent_diagnostics import close_logging
+    monkeypatch.setattr(process_diagnostics, "default_log_root", lambda: tmp_path / "startup-logs")
+    yield
+    close_logging()
+
+
 def _remove_pytest_scratch(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
     try:

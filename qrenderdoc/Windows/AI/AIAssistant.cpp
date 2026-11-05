@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 #include "AIAssistant.h"
+#include "AIConfiguration.h"
 
 #include <algorithm>
 #include <cmath>
@@ -649,7 +650,6 @@ QString publicAgentMessageProjection(const QString &source, bool *structured,
 struct AIProviderCatalogState
 {
   QJsonArray presets;
-  bool ready = false;
 };
 
 struct AIHostCommandReply
@@ -8149,6 +8149,18 @@ void AIAssistant::runCLIAsync(const QStringList &arguments, const QByteArray &in
 {
   const QPointer<AIAssistant> assistant(this);
   const QPointer<QObject> ownerGuard(owner);
+  if(owner && AIConfiguration::handles(arguments))
+  {
+    // Configuration and OS credentials are local operations. They must remain available even
+    // when AgentHost is missing, slow to unpack, or unable to start.
+    QTimer::singleShot(0, owner, [assistant, ownerGuard, arguments, input, completion]() {
+      if(!assistant || !ownerGuard || assistant->m_ShuttingDown)
+        return;
+      const AIConfiguration::Reply reply = AIConfiguration::execute(arguments, input);
+      completion(reply.exitCode, reply.output, reply.diagnostic, false);
+    });
+    return;
+  }
   if(!owner || m_CLIPath.isEmpty())
   {
     const QString diagnostic = tr("AI host was not found");
@@ -8767,6 +8779,9 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
       std::make_shared<AIHostCommandRunner>();
   const std::shared_ptr<AIProviderCatalogState> providerCatalog =
       std::make_shared<AIProviderCatalogState>();
+  for(const QJsonValue &value : AIConfiguration::providerPresets())
+    if(supportedQRenderDocConnection(value.toObject()))
+      providerCatalog->presets.append(value);
   // The normal MainWindow Settings entry does not pass through manageConnections(). Mark the
   // shared configuration surface busy for its whole lifetime so profile edits and subscription
   // setup cannot race active task state.
@@ -8789,10 +8804,6 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
   intro->setWordWrap(true);
   root->addWidget(intro);
 
-  QLabel *providerCatalogStatus = new QLabel(tr("Loading AI providers..."), page);
-  providerCatalogStatus->setWordWrap(true);
-  root->addWidget(providerCatalogStatus);
-
   QHBoxLayout *body = new QHBoxLayout();
   QListWidget *connections = new QListWidget(page);
   connections->setObjectName(lit("AIConnectionList"));
@@ -8808,9 +8819,6 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
   check->setToolTip(tr("Send a small test prompt and verify an actual MCP tool call. This uses the selected connection's model quota."));
   add->setEnabled(false);
   edit->setEnabled(false);
-  const QString loadingProviders = providerCatalogStatus->text();
-  add->setToolTip(loadingProviders);
-  edit->setToolTip(loadingProviders);
   actions->addWidget(add);
   actions->addWidget(edit);
   actions->addWidget(remove);
@@ -8862,8 +8870,8 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
     const bool selected = connections->currentItem() != NULL;
     const bool interactive = !*pageCommandRunning;
     connections->setEnabled(interactive);
-    add->setEnabled(interactive && providerCatalog->ready);
-    edit->setEnabled(interactive && selected && providerCatalog->ready);
+    add->setEnabled(interactive);
+    edit->setEnabled(interactive && selected);
     remove->setEnabled(interactive && selected);
     makeDefault->setEnabled(interactive && selected);
     check->setEnabled(interactive && selected);
@@ -8940,11 +8948,6 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
   std::function<void(const QJsonObject &)> editConnection =
       [this, page, refreshPageProfiles, profileCommandRunner,
        providerCatalog](const QJsonObject &existing) {
-        if(!providerCatalog->ready)
-        {
-          QMessageBox::warning(page, tr("AI Connections"), tr("Could not load AI providers."));
-          return;
-        }
         const QJsonArray presets = providerCatalog->presets;
         const bool editing = !existing.isEmpty();
         QString existingId = existing.value(lit("id")).toString();
@@ -10618,17 +10621,12 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
               !typedAPIKey.isEmpty()
                   ? typedAPIKey
                   : sameProvider ? m_SessionSecrets.value(id) : QString();
-          const bool connectNewSubscription =
-              // i18n-ignore: Fixed connection-mode identifier stored in item data; never shown directly.
-              !profileExists && mode->currentData().toString() == lit("agent");
-          const QString selectedAuthFlow = authFlow->currentData().toString();
           const bool makeActive = defaultConnection->isChecked();
           const DialogControlStates controls = beginDialogCommand();
           runCLIAsync(
               arguments, QByteArray(), 10000, &dialog,
-              [&, controls, id, chosenDefault, usesAPIKey, typedAPIKey, rememberCredential,
-               keyToStore, connectNewSubscription, selectedAuthFlow, makeActive](
-                  int saveExit, const QByteArray &, const QString &saveError, bool) {
+              [&, controls, id, chosenDefault, usesAPIKey, typedAPIKey, rememberCredential, keyToStore,
+               makeActive](int saveExit, const QByteArray &, const QString &saveError, bool) {
                 if(saveExit != 0)
                 {
                   finishDialogCommand(controls);
@@ -10639,8 +10637,8 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
                 }
 
                 const auto completeProfileSave =
-                    [&, controls, id, chosenDefault, usesAPIKey, typedAPIKey,
-                     rememberCredential, keyToStore, connectNewSubscription, selectedAuthFlow,
+                    [&, controls, id, chosenDefault, usesAPIKey, typedAPIKey, rememberCredential,
+                     keyToStore,
                      makeActive](bool credentialUpdated, const QString &credentialWarning) {
                       if(rememberCredential && !keyToStore.isEmpty())
                       {
@@ -10677,30 +10675,6 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
                         m_ActiveModel = chosenDefault;
                       }
                       refreshPageProfiles(id);
-                      if(connectNewSubscription)
-                      {
-                        // New subscription profiles are checked immediately after their
-                        // non-secret metadata is saved. Keep this dialog open as a contained
-                        // connection wizard.
-                        existingId = id;
-                        profileExists = true;
-                        profileSavedDuringDialog = true;
-                        name->setEnabled(false);
-                        mode->setEnabled(false);
-                        apiProvider->setEnabled(false);
-                        agentProvider->setEnabled(false);
-                        agentCommand->setEnabled(false);
-                        defaultConnection->setEnabled(false);
-                        QPushButton *saveButton = buttons->button(QDialogButtonBox::Save);
-                        if(saveButton)
-                        {
-                          saveButton->setText(tr("Connecting..."));
-                          saveButton->setEnabled(false);
-                        }
-                        // i18n-ignore: Fixed subscription control-protocol operation identifier.
-                        startSubscriptionOperation(lit("connect"), selectedAuthFlow);
-                        return;
-                      }
                       refreshConnectionStatus();
                       dialog.accept();
                     };
@@ -10898,49 +10872,6 @@ QWidget *AIAssistant::CreateSettingsPage(QWidget *parent)
         });
   };
 
-  (*profileCommandRunner)(
-      {lit("profile"), lit("presets"), lit("--json")},    // i18n-ignore: AgentHost CLI protocol command and flag
-      QByteArray(), 5000,
-      page,
-      [=](const AIHostCommandReply &reply) {
-        const QJsonDocument presetDocument = QJsonDocument::fromJson(reply.standardOutput);
-        if(reply.exitCode != 0 || !presetDocument.isArray())
-        {
-          providerCatalog->ready = false;
-          const QString diagnostic =
-              reply.diagnostic.isEmpty() ? tr("Could not load AI providers.") : reply.diagnostic;
-          add->setEnabled(false);
-          edit->setEnabled(false);
-          add->setToolTip(diagnostic);
-          edit->setToolTip(diagnostic);
-          setDiagnosticStatus(providerCatalogStatus, DiagnosticLevel::Error, diagnostic);
-          return;
-        }
-
-        providerCatalog->presets = QJsonArray();
-        for(const QJsonValue &value : presetDocument.array())
-        {
-          const QJsonObject preset = value.toObject();
-          if(supportedQRenderDocConnection(preset))
-            providerCatalog->presets.append(preset);
-        }
-        if(providerCatalog->presets.isEmpty())
-        {
-          providerCatalog->ready = false;
-          const QString diagnostic = tr("No supported AI providers were returned.");
-          add->setEnabled(false);
-          edit->setEnabled(false);
-          add->setToolTip(diagnostic);
-          edit->setToolTip(diagnostic);
-          setDiagnosticStatus(providerCatalogStatus, DiagnosticLevel::Error, diagnostic);
-          return;
-        }
-        providerCatalog->ready = true;
-        providerCatalogStatus->hide();
-        add->setToolTip(QString());
-        edit->setToolTip(QString());
-        updateSelection();
-      });
 
   return page;
 }
