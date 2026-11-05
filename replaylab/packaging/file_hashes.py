@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
+import time
 from pathlib import Path
 from threading import RLock
 
@@ -36,7 +37,7 @@ def _change_time(path):
         info = _FileBasicInfo()
         if not _kernel.GetFileInformationByHandleEx(handle, 0, ctypes.byref(info), ctypes.sizeof(info)):
             raise ctypes.WinError(ctypes.get_last_error())
-        return info.change
+        return (info.change - 116444736000000000) * 100
     finally:
         _kernel.CloseHandle(handle)
 
@@ -47,20 +48,27 @@ def identity(path):
             _change_time(path) if os.name == "nt" else info.st_ctime_ns)
 
 
+def settled(identity):
+    # NTFS ChangeTime can share a system clock tick for rapid writes. Never
+    # reuse a hash first sampled within the filesystem timestamp window.
+    return identity[4] > 0 and time.time_ns() - max(identity[3:]) > 2_000_000_000
+
+
 def digest(path):
     path = long_path(path)
     before = identity(path)
     key = os.path.normcase(str(path))
     with _lock:
         cached = _cache.get(key)
-    if cached is not None and cached[0] == before:
+    if cached is not None and cached[0] == before and cached[2]:
         return cached[1]
+    reusable = settled(before)
     with path.open("rb") as stream:
         value = hashlib.file_digest(stream, "sha256").hexdigest()
     if identity(path) != before:
         raise ValueError(f"File changed while hashing: {path}")
     with _lock:
-        _cache[key] = (before, value)
+        _cache[key] = (before, value, reusable)
     return value
 
 

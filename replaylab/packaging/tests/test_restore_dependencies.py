@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import time
 from pathlib import Path
 import zipfile
 
@@ -166,6 +167,8 @@ def test_receipt_skips_hashes_but_full_verification_bypasses_it(tmp_path, monkey
     output = tmp_path / "build"
     result = restore.restore(inputs, output, record)
     assert len(result.name) == 20
+    time.sleep(2.05)
+    restore.restore(inputs, output, record)  # Upgrade the recent-file receipt after settling.
     original = restore.verify_tree
     calls = []
     def measured(*args):

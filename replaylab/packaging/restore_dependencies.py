@@ -18,7 +18,7 @@ import tempfile
 import time
 import zipfile
 from build_fs import long_path, logical_path, temporary_directory, walk_files
-from file_hashes import digest as sha, warm_digests, identity
+from file_hashes import digest as sha, warm_digests, identity, settled
 
 REPO = Path(__file__).resolve().parents[2]
 DEPENDENCIES = REPO / "replaylab/dependencies"
@@ -162,9 +162,10 @@ def input_lock(path: Path):
 def tree_receipt(target, record):
     # Per-file identity detects replacement and same-size edits with restored
     # mtimes. Aggregate totals alone cannot safely authorize cache reuse.
+    files = {p.relative_to(target).as_posix(): list(identity(p)) for p in walk_files(target)}
     return {"schema": "bread-restored-tree/v1", "archiveSha256": record["sha256"],
             "inventorySha256": hashlib.sha256(json.dumps(record["files"], sort_keys=True).encode()).hexdigest(),
-            "files": {p.relative_to(target).as_posix(): list(identity(p)) for p in walk_files(target)}}
+            "settled": all(settled(value) for value in files.values()), "files": files}
 
 
 def restore(root: Path, output: Path, record: dict, *, full_verify=False) -> Path:
@@ -192,7 +193,7 @@ def restore(root: Path, output: Path, record: dict, *, full_verify=False) -> Pat
             current = tree_receipt(target, record)
             expected = {r["path"] for r in record["files"]}
             reusable = False
-            if not full_verify and set(current["files"]) == expected:
+            if not full_verify and current["settled"] and set(current["files"]) == expected:
                 try:
                     reusable = json.loads(receipt.read_text(encoding="utf-8")) == current
                 except (OSError, ValueError):

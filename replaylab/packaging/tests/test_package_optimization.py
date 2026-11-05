@@ -1,5 +1,6 @@
 import hashlib
 import os
+import time
 import zipfile
 
 import pytest
@@ -11,6 +12,7 @@ from package_portable import zip_compress_type
 def test_hash_reuse_and_same_size_edit_with_restored_mtime(tmp_path, monkeypatch):
     path = tmp_path / "file"
     path.write_bytes(b"original")
+    time.sleep(2.05)  # A settled file can safely participate in metadata reuse.
     calls = []
     original = hashlib.file_digest
     def measured(*args):
@@ -24,6 +26,16 @@ def test_hash_reuse_and_same_size_edit_with_restored_mtime(tmp_path, monkeypatch
     path.write_bytes(b"modified")
     os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
     assert file_hashes.digest(path) != first and len(calls) == 2
+
+
+def test_recent_file_is_rehashed_when_rapid_writes_share_all_timestamps(tmp_path, monkeypatch):
+    path = tmp_path / "recent"
+    path.write_bytes(b"original")
+    stamp = file_hashes.identity(path)
+    monkeypatch.setattr(file_hashes, "identity", lambda _: stamp)
+    first = file_hashes.digest(path)
+    path.write_bytes(b"modified")
+    assert file_hashes.digest(path) != first
 
 
 def test_parallel_hash_failure_is_not_silenced(tmp_path):

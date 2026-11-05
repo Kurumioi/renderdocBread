@@ -393,6 +393,9 @@ results keyed by file identity, size, modification time and change time (NTFS
 ChangeTime on Windows). Changed files are rehashed after smoke tests; final ZIP
 members still receive independent byte verification. Both full and compact ZIP
 writers store compressed formats and the four known large frozen Hosts verbatim.
+Files sampled within the two-second timestamp window are rehashed until a
+settled sample is available, covering rapid writes that share a clock tick.
+Expanded-tree receipts likewise require settled file identities before reuse.
 
 Dependency expansion uses 20-hex directory names for new generations and discovers
 existing full-hash directories without moving them. A sibling atomic receipt binds
