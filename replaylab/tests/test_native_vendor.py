@@ -73,6 +73,18 @@ def test_claude_skill_copy_prunes_dependency_junction_but_rejects_reference_junc
     assert (external / "private.txt").read_text() == "do not follow"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows junctions")
+def test_claude_skill_root_cannot_be_a_junction(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "SKILL.md").write_text("external instructions")
+    linked = tmp_path / "linked"
+    result = subprocess.run(["cmd", "/c", "mklink", "/J", str(linked), str(external)], capture_output=True)
+    assert result.returncode == 0
+    with pytest.raises(ValueError, match="link or reparse"):
+        copy_claude_skills(tmp_path / "workspace", [("demo", linked / "SKILL.md")])
+
+
 def test_claude_session_meta_keeps_only_native_skill_and_replaylab_mcp() -> None:
     profile = Profile(
         "claude",

@@ -187,7 +187,7 @@ def restore(root: Path, output: Path, record: dict, *, full_verify=False) -> Pat
                 previous = json.loads(receipt.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 previous = {}
-            if previous.get("archiveSha256") and previous["archiveSha256"] != record["sha256"]:
+            if isinstance(previous, dict) and previous.get("archiveSha256") and previous["archiveSha256"] != record["sha256"]:
                 raise ValueError("Short dependency directory hash collision; use a different output root")
         if target.exists():
             current = tree_receipt(target, record)

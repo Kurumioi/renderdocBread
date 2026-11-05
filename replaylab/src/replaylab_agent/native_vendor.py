@@ -181,6 +181,9 @@ def copy_claude_skills(
             continue
         if declared.is_symlink() or getattr(declared.lstat(), "st_file_attributes", 0) & 0x400:
             continue
+        declared_root = declared.parent
+        if declared_root.is_symlink() or getattr(declared_root.lstat(), "st_file_attributes", 0) & 0x400:
+            raise ValueError(f"Skill '{skill_id}' contains a link or reparse point")
         source = declared.resolve()
         if source.name != "SKILL.md" or not source.is_file():
             continue

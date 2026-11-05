@@ -832,16 +832,23 @@ def test_bundled_shader_and_core_deliver_complete_guidance_and_references(skill_
     assert delivered.get("references", []) == expected
     for call in delivered.get("referenceLoads", []):
         assert call["tool"] == "load_bread_skill"
-        reference = gateway.load(**call["arguments"])
-        assert "error" not in reference
-        assert reference["reference"] is True
-        assert reference["hasMore"] is False
         path = skill.path.parent / call["arguments"]["section"]
         assert path.resolve().is_relative_to(skill.path.parent.resolve())
+        offset, chunks = 0, []
+        while True:
+            arguments = dict(call["arguments"], offset=offset)
+            reference = gateway.load(**arguments)
+            assert "error" not in reference
+            assert reference["reference"] is True
+            assert len(encode(reference).encode("utf-8")) <= MAX_SKILL_INLINE_BYTES
+            chunks.append(reference["instructions"])
+            if not reference["hasMore"]:
+                break
+            assert reference["nextOffset"] > offset
+            offset = reference["nextOffset"]
         # Skill receipts identify the exact delivered UTF-8 bytes, including
         # Windows newlines; universal-newline reads silently change that body.
-        assert reference["instructions"] == path.read_bytes().decode("utf-8")
-        assert len(encode(reference).encode("utf-8")) <= MAX_SKILL_INLINE_BYTES
+        assert "".join(chunks) == path.read_bytes().decode("utf-8")
 
 
 def test_runtime_packaging_embeds_every_skill_folder_not_a_hand_kept_list() -> None:

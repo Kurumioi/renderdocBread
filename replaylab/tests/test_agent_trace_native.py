@@ -94,7 +94,8 @@ int main(int argc, char **argv) {
     compiler.link_executable(compiled, str(executable.with_suffix("")), libraries=["Qt5Core"],
                              library_dirs=[str(qt / "x64/lib")], target_lang="c++")
     environment = dict(os.environ)
-    environment["PATH"] = str(ROOT / "x64/Development") + os.pathsep + environment.get("PATH", "")
+    environment["PATH"] = os.pathsep.join([
+        str(qt / "x64/bin"), str(ROOT / "x64/Development"), environment.get("PATH", "")])
     report = tmp_path / "result.json"
     subprocess.run([str(executable), str(report)], env=environment, check=True,
                    capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW)

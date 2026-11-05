@@ -224,7 +224,7 @@ def test_general_review_reference_is_losslessly_available_without_loading_domain
     name = "references/task-review.md"
     assert name in core["references"]
     detail = gateway.load("replaylab-core", name)
-    expected = (SKILL_ROOT / "replaylab-core" / name).read_text(encoding="utf-8")
+    expected = (SKILL_ROOT / "replaylab-core" / name).read_bytes().decode("utf-8")
     assert detail["instructions"] == expected
     assert detail["hasMore"] is False
     assert len(encode(detail).encode("utf-8")) <= MAX_SKILL_INLINE_BYTES

@@ -194,3 +194,13 @@ def test_old_full_hash_directory_is_preserved(tmp_path):
     legacy = short.with_name(record["sha256"])
     short.rename(legacy)
     assert restore.restore(inputs, output, record) == legacy
+
+
+@pytest.mark.parametrize("value", ["{broken", "[]", "null"])
+def test_damaged_receipt_falls_back_to_full_hash_verification(tmp_path, value):
+    inputs, record = sealed(tmp_path)
+    output = tmp_path / "build"
+    result = restore.restore(inputs, output, record)
+    result.with_suffix(".ready.json").write_text(value)
+    assert restore.restore(inputs, output, record) == result
+    assert (result / "tool/code.py").read_bytes() == b"print('tool')\n"
