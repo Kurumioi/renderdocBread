@@ -5,6 +5,15 @@ Before packaging, read [RELEASE_REQUIREMENTS.md](RELEASE_REQUIREMENTS.md) and th
 These are standing release requirements, also linked from the root `AGENTS.md` and
 `CLAUDE.md`; previous chat history is not required to discover them.
 
+For GitHub delivery, follow the
+[branch and release completion workflow](../../CLAUDE.md#branch-and-release-completion)
+and [release completion requirements](RELEASE_REQUIREMENTS.md#8-github-主分支合并与分支清理):
+verify the `origin` repository and actual default branch, merge validated work
+before public publication, then verify inclusion and delete the task's remote and
+local branch. Use an explicit `--repo Straw1997/renderdocBread` for `gh` commands.
+Preserve published tags/artifacts and unrelated work. Documentation-only follow-ups
+do not require rebuilding an existing release.
+
 ## RenderDocBread portable Windows release
 
 Double-click `PACKAGE_RENDERDOCBREAD.cmd` in the repository root, or run
