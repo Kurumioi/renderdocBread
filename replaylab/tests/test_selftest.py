@@ -31,12 +31,13 @@ async def test_protocol_self_test_has_fixed_schema_and_exercises_fake_peers() ->
     assert all(item["detail"] for item in payload)
 
     # Returning OK here means the production connectors parsed both Codex login
-    # flows/model list and, when installed, the ACP initialize/session handshake.
+    # flows/model list and, when installed, ACP chat through the real SDK.
     assert "browser/device login URLs" in payload[3]["detail"]
     if importlib.util.find_spec("acp") is None:
         assert "skipped" in payload[4]["detail"]
     else:
         assert "session/new handshake" in payload[4]["detail"]
+        assert "two-turn streaming chat and extension compatibility passed" in payload[4]["detail"]
 
 
 @pytest.mark.asyncio
@@ -101,3 +102,13 @@ def test_packaging_smoke_verifies_actual_framework_version(monkeypatch, capsys) 
 
 def test_packaging_smoke_accepts_installed_pinned_framework() -> None:
     assert selftest._external_mcp_import_smoke() == 0
+
+
+def test_acp_chat_packaging_gate_fails_on_protocol_error(monkeypatch, capsys) -> None:
+    async def fail(timeout):
+        raise RuntimeError("synthetic ACP protocol failure")
+
+    monkeypatch.setattr(selftest, "_check_acp", fail)
+    assert selftest._child_entry(["--acp-chat-smoke"]) == 1
+    import json
+    assert json.loads(capsys.readouterr().out)["status"] == "error"

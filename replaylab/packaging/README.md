@@ -273,6 +273,11 @@ The build probe and frozen self-test require the installed DeepAgents version
 to match the exact pin in `replaylab/pyproject.toml`. The AgentHost embeds that
 dependency manifest, and each successful output records the verified framework
 version alongside the runtime files' SHA-256 hashes.
+The frozen AgentHost also runs `-I -m replaylab_agent.selftest --acp-chat-smoke`:
+an account-free ACP handshake, model probe and two-turn streaming chat against an
+independent local stdio peer. CodeBuddy extension notifications and unsupported
+requests are interleaved with real SDK messages; a failed check stops packaging.
+This does not test a vendor's subscription account, model availability or quota.
 The Windows build also starts each frozen Host through its real `ensure` command
 in an isolated runtime directory. After the launcher exits, its detached service
 must retain its own readable Python archive and stop normally. Long-lived frozen
