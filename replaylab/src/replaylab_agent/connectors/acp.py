@@ -383,13 +383,6 @@ _MAX_ACP_TIMELINE_ACTIVITIES = 128
 _MAX_ACP_TIMELINE_EVENTS = 512
 _MAX_ACP_ARGUMENT_NAMES = 16
 _MAX_ACP_ARGUMENT_NAME_CHARS = 64
-_CURSOR_SAFE_NOTIFICATIONS = frozenset(
-    {
-        "cursor/update_todos",
-        "cursor/task",
-        "cursor/generate_image",
-    }
-)
 
 
 @dataclass(slots=True)
@@ -1492,20 +1485,20 @@ def _make_client(sdk: _ACPSDK, state: _ACPClientState) -> Any:
                             "outcome": "accepted",
                         }
                     }
-            raise _terminal_policy_violation(
-                state, f"invoke unknown ACP extension method '{method}'"
-            )
+            # An unsupported extension is not an effect grant or a protocol
+            # violation. Let the agent handle the standard JSON-RPC rejection
+            # and continue using the capabilities this client does implement.
+            from acp.exceptions import RequestError
+
+            raise RequestError.method_not_found(method)
 
         async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
-            del params
-            if (
-                state.provider_id == _CURSOR_PROVIDER_ID
-                and method in _CURSOR_SAFE_NOTIFICATIONS
-            ):
-                return
-            _terminal_policy_violation(
-                state, f"send unknown ACP extension notification '{method}'"
-            )
+            # Follow ACP's forward-compatible custom notification contract:
+            # https://agentclientprotocol.com/protocol/v1/extensibility
+            # Ignore unhandled notifications from every provider, including
+            # CodeBuddy's codebuddy.ai/command. Never execute their payloads,
+            # project them as completion evidence, or grant any capability.
+            del method, params
 
         async def session_update(
             self,
@@ -1656,26 +1649,12 @@ def _policy_denial(state: _ACPClientState, action: str) -> PolicyError:
     return error
 
 
-def _terminal_policy_violation(state: _ACPClientState, action: str) -> PolicyError:
-    """Abort on an unknown protocol capability, not on a recoverable denial."""
-
-    error = PolicyError(
-        f"ACP Agent attempted to {action}; Bread cancelled the turn "
-        "(fail-closed: unknown protocol capability)"
-    )
-    state.permission_denials += 1
-    if state.policy_error is None:
-        state.policy_error = error
-    state.abort_event.set()
-    return state.policy_error
-
-
 def _record_policy_denial(state: _ACPClientState, action: str) -> None:
     """Record a denied ordinary call without cancelling the Agent's task.
 
-    Malformed scoped requests and unknown protocol capabilities have their own
-    terminal handlers. Repeated attempts at an unavailable native tool do not
-    revoke unrelated, already authorized Bread operations.
+    Malformed scoped permission requests have their own terminal handler.
+    Repeated attempts at an unavailable native tool do not revoke unrelated,
+    already authorized Bread operations.
     """
 
     state.permission_denials += 1

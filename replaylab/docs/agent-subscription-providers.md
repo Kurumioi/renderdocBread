@@ -63,6 +63,29 @@ unrelated ACP permission request is denied as an ordinary tool result so the
 native Agent can choose an admitted operation; malformed or replayed requests
 fail closed.
 
+### ACP extension compatibility
+
+Bread follows the [ACP extensibility contract](https://agentclientprotocol.com/protocol/v1/extensibility):
+unhandled extension notifications are ignored, and unsupported extension requests
+receive JSON-RPC `-32601` (Method not found), allowing the provider to fall back.
+Neither case cancels a turn or grants a capability. This applies to every ACP
+provider, including CodeBuddy's `_codebuddy.ai/command`, artifact, checkpoint and
+initialization notifications. The Python ACP SDK removes the wire method's leading
+underscore before invoking Bread's extension callbacks.
+
+Notification payloads are opaque: Bread does not execute commands, open artifacts,
+approve permissions, or treat them as assistant text or task-completion evidence.
+Native file/terminal callbacks, task-scoped MCP permissions, malformed/replayed
+permission checks and provider stop/error handling remain authoritative. Supported
+Cursor question/plan requests keep their provider-specific handling.
+
+The connection test checks the handshake without spending model quota. A successful
+connection alone therefore does not prove a chat turn can complete; the separate
+model test sends a short prompt. Extension regressions are covered on both the model
+test and the main chat session through the real ACP SDK and a local stdio fixture,
+including multiple turns, unknown requests and a refused turn. These tests need no
+vendor account and do not claim account-level CodeBuddy verification.
+
 Subscription connections do not enter a Bread planner or mandatory child-Agent
 router. ACP and Codex keep their vendor-native Agent loop and call the same
 task-scoped Bread MCP used by the API path. The Agent chooses tools and optional

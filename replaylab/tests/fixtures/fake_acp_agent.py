@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 
 from acp import PROTOCOL_VERSION, PromptResponse, run_agent, text_block
 from acp import schema
+from acp.exceptions import RequestError
 
 
 class EchoAgent:
@@ -28,6 +29,8 @@ class EchoAgent:
 
     async def new_session(self, cwd, mcp_servers=None, **kwargs):
         assert cwd
+        if "extension-notifications" in sys.argv:
+            await self.connection.ext_notification("codebuddy.ai/system_init", {"sessionId": "session-test"})
         if "no-mcp" in sys.argv:
             assert not mcp_servers
             return schema.NewSessionResponse(sessionId="session-test")
@@ -68,6 +71,23 @@ class EchoAgent:
 
     async def prompt(self, session_id, prompt, **kwargs):
         assert session_id == "session-test"
+        if "extension-notifications" in sys.argv:
+            # SDK adds the wire '_' prefix and removes it before dispatching
+            # to the client: _codebuddy.ai/command -> codebuddy.ai/command.
+            for method in ("codebuddy.ai/command", "codebuddy.ai/artifact",
+                           "codebuddy.ai/checkpoint", "com.example/future_notification"):
+                await self.connection.ext_notification(method, {
+                    "sessionId": session_id, "command": "unavailable-command",
+                    "text": "must not appear in the answer", "status": "completed",
+                })
+        if "extension-requests" in sys.argv:
+            for method in ("codebuddy.ai/delegateTool", "com.example/future_request"):
+                try:
+                    await self.connection.ext_method(method, {"sessionId": session_id})
+                except RequestError as error:
+                    assert error.code == -32601, error
+                else:
+                    raise AssertionError("unknown extension request was accepted")
         if "large-tool-record" in sys.argv:
             await self.connection.session_update(session_id, schema.ToolCallStart(
                 toolCallId="large-tool", title="Mcp(Bread:get_pipeline_state)", kind="read",
