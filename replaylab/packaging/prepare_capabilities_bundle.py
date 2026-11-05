@@ -15,6 +15,7 @@ import sys
 import subprocess
 import tempfile
 import zipfile
+from build_fs import long_path
 
 REPO = Path(__file__).resolve().parents[2]
 PRIVATE = {"auth.json", "config.toml", "profiles.json", "keys.json", "agent-tools.json",
@@ -23,12 +24,14 @@ SKIP = {"__pycache__", ".git", ".pytest_cache", "logs", "sessions", "node_cache"
 
 
 def sha(path):
+    path = long_path(path)
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def copy_code(source: Path, target: Path):
     """Keep package subdirectories (including src/config), licenses and native DLLs."""
+    source, target = long_path(source), long_path(target)
     if source.is_symlink() or source.is_junction():
         raise ValueError("Capability input cannot be a link")
     for directory, dirs, files in os.walk(source, followlinks=False):
@@ -51,6 +54,7 @@ def copy_code(source: Path, target: Path):
 
 
 def seal(root: Path, metadata: dict):
+    root = long_path(root)
     records = [{"path": p.relative_to(root).as_posix(), "size": p.stat().st_size,
                 "sha256": sha(p)} for p in sorted(root.rglob("*"))
                if p.is_file() and p.name != "bread-capabilities.json" and "__pycache__" not in p.parts]
@@ -60,6 +64,7 @@ def seal(root: Path, metadata: dict):
 
 
 def verify(root: Path):
+    root = long_path(root)
     metadata = json.loads((root / "bread-capabilities.json").read_text(encoding="utf-8"))
     if metadata.get("schema") != "bread-portable-capabilities/v1":
         raise ValueError("Unknown capability bundle schema")
@@ -176,6 +181,7 @@ def main():
     parser.add_argument("--office-msi", type=Path)
     parser.add_argument("--seal", action="store_true", help="Seal after adding audited runtime dependencies")
     args = parser.parse_args()
+    args.output = long_path(args.output)
     if args.desktop and args.dependencies:
         metadata = import_desktop(args.output.resolve(), args.desktop.resolve(), args.dependencies.resolve())
     else:

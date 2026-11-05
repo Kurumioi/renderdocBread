@@ -253,6 +253,7 @@ SOURCES += Code/qrenderdoc.cpp \
     Widgets/Extended/RDSplitter.cpp \
     Windows/Dialogs/TipsDialog.cpp \
     Windows/Dialogs/ConfigEditor.cpp \
+    Windows/AI/AIConfiguration.cpp \
     Windows/AI/AIAssistant.cpp \
     Windows/AI/AIFileThumbnail.cpp \
     Windows/AI/AIAgentMonitorWindow.cpp \
@@ -367,6 +368,7 @@ HEADERS += Code/CaptureContext.h \
     Windows/Dialogs/AxisMappingDialog.h \
     Windows/Dialogs/CameraControlsDialog.h \
     Windows/Dialogs/ProjectionGuessDialog.h \
+    Windows/AI/AIConfiguration.h \
     Windows/AI/AIAssistant.h \
     Windows/AI/AIFileThumbnail.h \
     Windows/AI/AIAgentMonitorWindow.h \
