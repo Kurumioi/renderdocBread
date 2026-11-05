@@ -23,6 +23,7 @@ permission requests and terminal/file callbacks as a fail-closed boundary.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -169,28 +170,36 @@ def copy_claude_skills(
 ) -> None:
     """Copy admitted filesystem Skills into Claude's project Skill directory."""
 
-    root = workspace / ".claude" / "skills"
+    from .capability_store import _native
+
+    excluded = {"node_modules", ".git", "__pycache__", ".venv", "venv", ".pytest_cache"}
+    root = _native(workspace / ".claude" / "skills")
     root.mkdir(parents=True, exist_ok=True)
     for skill_id, skill_file in skills:
-        declared = Path(skill_file)
-        if declared.is_symlink():
+        declared = _native(skill_file)
+        if not declared.exists():
+            continue
+        if declared.is_symlink() or getattr(declared.lstat(), "st_file_attributes", 0) & 0x400:
             continue
         source = declared.resolve()
         if source.name != "SKILL.md" or not source.is_file():
             continue
         source_root = source.parent
-        try:
-            entries = tuple(source_root.rglob("*"))
-        except OSError:
-            continue
-        if any(
-            entry.is_symlink()
-            or bool(getattr(entry.lstat(), "st_file_attributes", 0) & 0x400)
-            for entry in entries
-        ):
+        if source_root.is_symlink() or getattr(source_root.lstat(), "st_file_attributes", 0) & 0x400:
             raise ValueError(f"Skill '{skill_id}' contains a link or reparse point")
+        def fail(error):
+            raise error
+        for current, dirs, files in os.walk(source_root, followlinks=False, onerror=fail):
+            dirs[:] = [name for name in dirs if name not in excluded]
+            for name in dirs + files:
+                entry = Path(current) / name
+                if entry.is_symlink() or getattr(entry.lstat(), "st_file_attributes", 0) & 0x400:
+                    raise ValueError(f"Skill '{skill_id}' contains a link or reparse point")
+        if not skill_id or Path(str(skill_id)).name != str(skill_id) or str(skill_id) in {".", ".."} or any(c in str(skill_id) for c in "\\/:"):
+            raise ValueError("Invalid Claude skill directory name")
         destination = root / str(skill_id)
-        shutil.copytree(source_root, destination, dirs_exist_ok=False, symlinks=False)
+        shutil.copytree(source_root, destination, dirs_exist_ok=False, symlinks=False,
+                        ignore=shutil.ignore_patterns(*excluded))
 
 
 def _gemini_mcp_tool_name(tool_name: str) -> str:

@@ -350,9 +350,35 @@ function Invoke-PyInstallerBuild {
     }
     $arguments += $EntryPoint
 
-    & $Python @arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "PyInstaller failed while building $Name."
+    $cache = Join-Path $WorkDirectory ("pyinstaller-cache\" + $Name)
+    New-Item -ItemType Directory -Path $cache -Force | Out-Null
+    Assert-NoReparseComponents $cache "PyInstaller cache" | Out-Null
+    Start-Job -ArgumentList $Python, $Name, $cache, $arguments -ScriptBlock {
+        param($Python, $Name, $Cache, $Arguments)
+        # Each Host owns a persistent cache. A second build using the same work
+        # root waits rather than concurrently writing PyInstaller's binary cache.
+        $lock = $null
+        $deadline = [DateTime]::UtcNow.AddMinutes(10)
+        try {
+            while ($null -eq $lock) {
+                try {
+                    $lock = [IO.File]::Open(($Cache + ".lock"), 'OpenOrCreate', 'ReadWrite', 'None')
+                } catch [IO.IOException] {
+                    if ([DateTime]::UtcNow -gt $deadline) { throw }
+                    Start-Sleep -Milliseconds 200
+                }
+            }
+            $env:PYINSTALLER_CONFIG_DIR = $Cache
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+            # PowerShell 5 treats native stderr as ErrorRecords. Preserve the
+            # diagnostics; the process exit code decides whether freezing failed.
+            $ErrorActionPreference = 'Continue'
+            & $Python @Arguments 2>&1 | ForEach-Object { "$_" }
+            if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed while building $Name (exit $LASTEXITCODE)." }
+            Write-Output ("PyInstaller {0}: {1:N1}s" -f $Name, $timer.Elapsed.TotalSeconds)
+        } finally {
+            if ($null -ne $lock) { $lock.Dispose() }
+        }
     }
 }
 
@@ -616,7 +642,10 @@ try {
     )
     $agentData = @($agentSkillData) + @($mcpProviderData)
     $agentData += ((Join-Path $replayLabRoot "pyproject.toml") + ":replaylab_agent")
-    Invoke-PyInstallerBuild $PythonExecutable "replaylab-ai" $agentEntry $agentSource `
+    $freezeJobs = @()
+    $freezeTimer = [Diagnostics.Stopwatch]::StartNew()
+    try {
+    $freezeJobs += Invoke-PyInstallerBuild $PythonExecutable "replaylab-ai" $agentEntry $agentSource `
         $agentDist $agentBuild $agentSpec `
         -AdditionalImportRoots @($mcpRoot) `
         -CollectAll $agentCollectAll `
@@ -636,16 +665,31 @@ try {
         -AddData @($agentData) `
         -CopyMetadata $agentCopyMetadata
 
-    Invoke-PyInstallerBuild $PythonExecutable "BreadMCP" $mcpEntry $mcpRoot `
+    $freezeJobs += Invoke-PyInstallerBuild $PythonExecutable "BreadMCP" $mcpEntry $mcpRoot `
         $mcpDist $mcpBuild $mcpSpec `
         -CollectAll @("mcp") `
         -CollectSubmodules @("src", "uvicorn", "starlette") `
         -AddData @($mcpProviderData)
 
-    Invoke-PyInstallerBuild $PythonExecutable "ReplayLabInternal" $internalEntry $mcpRoot `
+    $freezeJobs += Invoke-PyInstallerBuild $PythonExecutable "ReplayLabInternal" $internalEntry $mcpRoot `
         $internalDist $internalBuild $internalSpec `
         -CollectSubmodules @("src", "uvicorn", "starlette") `
         -AddData @($mcpProviderData)
+
+    $freezeJobs | Wait-Job | Out-Null
+    foreach ($job in $freezeJobs) {
+        Receive-Job $job -ErrorAction Continue | ForEach-Object { Write-Host $_ }
+    }
+    if (@($freezeJobs | Where-Object { $_.State -ne 'Completed' }).Count) {
+        throw 'One or more parallel PyInstaller builds failed; no runtime was published.'
+    }
+    Write-Host ("Parallel Host freezing: {0:N1}s" -f $freezeTimer.Elapsed.TotalSeconds)
+    } finally {
+        foreach ($job in $freezeJobs) {
+            if ($job.State -eq 'Running') { Stop-Job $job }
+            Remove-Job $job -Force
+        }
+    }
 
     $builtAgent = Assert-RegularFile (Join-Path $agentDist "replaylab-ai.exe") `
         "built AgentHost executable"

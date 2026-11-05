@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import zipfile
 from build_fs import long_path
+from file_hashes import digest as sha, warm_digests
 
 REPO = Path(__file__).resolve().parents[2]
 PRIVATE = {"auth.json", "config.toml", "profiles.json", "keys.json", "agent-tools.json",
@@ -23,19 +24,13 @@ PRIVATE = {"auth.json", "config.toml", "profiles.json", "keys.json", "agent-tool
 SKIP = {"__pycache__", ".git", ".pytest_cache", "logs", "sessions", "node_cache"}
 
 
-def sha(path):
-    path = long_path(path)
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
-def copy_code(source: Path, target: Path):
+def copy_code(source: Path, target: Path, *, excluded=()):
     """Keep package subdirectories (including src/config), licenses and native DLLs."""
     source, target = long_path(source), long_path(target)
     if source.is_symlink() or source.is_junction():
         raise ValueError("Capability input cannot be a link")
     for directory, dirs, files in os.walk(source, followlinks=False):
-        dirs[:] = sorted(name for name in dirs if name not in SKIP)
+        dirs[:] = sorted(name for name in dirs if name not in SKIP and name not in excluded)
         for name in dirs + files:
             path = Path(directory) / name
             if path.is_symlink() or path.is_junction():
@@ -82,11 +77,23 @@ def verify(root: Path):
         raise ValueError("Capability file inventory differs from its sealed manifest")
     for record in records:
         path = (root / record["path"]).resolve()
+        if not path.is_relative_to(root.resolve()) or not path.is_file():
+            raise ValueError("Capability file mismatch: " + record["path"])
+    warm_digests(root / record["path"] for record in records)
+    for record in records:
+        path = (root / record["path"]).resolve()
         if path.name.lower() in PRIVATE or path.name == ".mcp.json":
             raise ValueError("Account state or live connection settings cannot be bundled")
         if not path.is_relative_to(root.resolve()) or not path.is_file() or sha(path) != record["sha256"]:
             raise ValueError("Capability file mismatch: " + record["path"])
     logical = {record["path"] for record in metadata["files"]}
+    if "customSkillSelection" in metadata:
+        selected = set(metadata["customSkillSelection"])
+        for relative in logical:
+            parts = Path(relative).parts
+            if parts[0] == "custom-skills" and (len(parts) < 3 or parts[1] not in selected or
+                    any(p in {"node_modules", ".venv", "venv", ".git", "__pycache__", ".pytest_cache"} for p in parts)):
+                raise ValueError("Unselected skill or dependency cache in custom skills: " + relative)
     if compressed:
         from capability_archives import COMPONENTS
         for component in metadata["componentArchives"]:
@@ -132,7 +139,7 @@ def stage(source: Path, target: Path):
     verify(target)
 
 
-def import_desktop(root: Path, desktop: Path, dependencies: Path):
+def import_desktop(root: Path, desktop: Path, dependencies: Path, *, custom_skills=()):
     if root.exists() and any(root.iterdir()):
         raise ValueError("Import requires a new empty output directory; existing snapshots are preserved")
     sys.path.insert(0, str(REPO / "replaylab/src"))
@@ -155,14 +162,22 @@ def import_desktop(root: Path, desktop: Path, dependencies: Path):
                         "license": manifest.get("license", "see-original-notices"),
                         "activation": "shared-adapter" if name in {"documents", "pdf", "spreadsheets", "presentations"}
                         else "requires-live-provider-service-or-shared-adapter"})
-    if (desktop / "skills").is_dir():
-        copy_code(desktop / "skills", root / "custom-skills")
+    for name in custom_skills:
+        if not name or Path(name).name != name or name in {".", ".."} or ":" in name or "\\" in name:
+            raise ValueError("Custom skills must be explicit directory names")
+        source = desktop / "skills" / name
+        if not (source / "SKILL.md").is_file():
+            raise ValueError("Missing selected custom skill: " + name)
+        copy_code(source, root / "custom-skills" / name,
+                  excluded={"node_modules", ".venv", "venv"})
+    if custom_skills:
         skill_roots.append("custom-skills")
     for name in ("python", "node", "native"):
         copy_code(dependencies / name, root / name)
     # No discovered MCP env/header/URL is serialized. Service templates describe
     # a dependency; credentials and transient pipes are supplied only at runtime.
     metadata = {"schema": "bread-portable-capabilities/v1", "plugins": plugins,
+                "customSkillSelection": sorted(set(custom_skills)),
                 "skillRoots": skill_roots, "sharedAdapter": "bread-portable",
                 "providerServices": {"codex_app": {"requires": "CODEX_APP_TOOLS_PIPE_PATH"},
                                      "cua_repl": {"requires": "SKY_CUA_NATIVE_PIPE_DIRECTORY"}},
@@ -176,6 +191,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--desktop", type=Path)
     parser.add_argument("--dependencies", type=Path)
+    parser.add_argument("--custom-skill", action="append", default=[],
+                        help="Explicit desktop skill directory to import (repeatable; default: none)")
     parser.add_argument("--provider-runtime", type=Path)
     parser.add_argument("--bread-skills", type=Path, help="Archive personal Bread skill overrides without replacing newer defaults")
     parser.add_argument("--office-msi", type=Path)
@@ -183,7 +200,8 @@ def main():
     args = parser.parse_args()
     args.output = long_path(args.output)
     if args.desktop and args.dependencies:
-        metadata = import_desktop(args.output.resolve(), args.desktop.resolve(), args.dependencies.resolve())
+        metadata = import_desktop(args.output.resolve(), args.desktop.resolve(), args.dependencies.resolve(),
+                                  custom_skills=args.custom_skill)
     else:
         if args.bread_skills:
             copy_code(args.bread_skills, args.output / "user-skill-snapshots")

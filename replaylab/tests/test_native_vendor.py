@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from pathlib import Path
+import pytest
 
 from replaylab_agent.native_vendor import (
     CLAUDE_BUILTIN_TOOLS,
@@ -16,6 +19,58 @@ from replaylab_agent.native_vendor import (
     write_claude_mcp_config,
 )
 from replaylab_agent.profiles import Profile
+
+
+def test_claude_skill_copy_omits_dependency_trees_and_keeps_deep_references(tmp_path):
+    from replaylab_agent.capability_store import _native
+    source = _native(tmp_path / "source")
+    source.mkdir()
+    (source / "SKILL.md").write_text("instructions")
+    for name in ("node_modules", ".git", "__pycache__", ".venv", ".pytest_cache"):
+        path = source / "scripts" / name / "nested" / "ignored.txt"
+        path.parent.mkdir(parents=True)
+        path.write_text("ignored")
+    reference = Path(*(["references"] + ["long-reference-directory"] * 14 + ["evidence.md"]))
+    (source / reference).parent.mkdir(parents=True)
+    (source / reference).write_text("retained")
+    workspace = tmp_path / "workspace"
+    copy_claude_skills(workspace, [("demo", source / "SKILL.md")])
+    target = _native(workspace / ".claude/skills/demo")
+    assert (target / reference).read_text() == "retained"
+    assert not list(target.rglob("ignored.txt"))
+
+
+def test_claude_skill_copy_rejects_links_in_retained_references(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_text("instructions")
+    (source / "real.txt").write_text("retained")
+    try:
+        (source / "link.txt").symlink_to(source / "real.txt")
+    except OSError:
+        pytest.skip("Creating symlinks requires Windows Developer Mode")
+    with pytest.raises(ValueError, match="link or reparse"):
+        copy_claude_skills(tmp_path / "workspace", [("demo", source / "SKILL.md")])
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junctions")
+def test_claude_skill_copy_prunes_dependency_junction_but_rejects_reference_junction(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_text("instructions")
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "private.txt").write_text("do not follow")
+    for name in ("node_modules", "references"):
+        result = subprocess.run(["cmd", "/c", "mklink", "/J", str(source / name), str(external)],
+                                capture_output=True)
+        assert result.returncode == 0
+    with pytest.raises(ValueError, match="link or reparse"):
+        copy_claude_skills(tmp_path / "rejected", [("demo", source / "SKILL.md")])
+    (source / "references").rmdir()
+    copy_claude_skills(tmp_path / "allowed", [("demo", source / "SKILL.md")])
+    assert not (tmp_path / "allowed/.claude/skills/demo/node_modules").exists()
+    assert (external / "private.txt").read_text() == "do not follow"
 
 
 def test_claude_session_meta_keeps_only_native_skill_and_replaylab_mcp() -> None:
