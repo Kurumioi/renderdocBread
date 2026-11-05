@@ -668,6 +668,10 @@ try {
         throw ("The packaged replaylab-ai.exe failed its external MCP import smoke test " +
             "with diagnostic exit code $LASTEXITCODE.")
     }
+    & $builtAgent -I -m replaylab_agent.selftest --acp-chat-smoke | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "The packaged replaylab-ai.exe failed its ACP streaming chat/extension smoke test."
+    }
     & $builtMcp --help | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "The packaged BreadMCP.exe failed its --help smoke test."

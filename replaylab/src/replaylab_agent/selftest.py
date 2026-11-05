@@ -458,21 +458,37 @@ async def _check_acp(timeout: float) -> str:
             "optional agent-client-protocol runtime is not installed; ACP handshake skipped"
         )
     from .connectors.acp import ACPConnector
+    from .acp_session import ACPMainAgentSession
 
     with tempfile.TemporaryDirectory(prefix="replaylab-self-test-acp-") as temporary:
+        command = [sys.executable, "-m", "replaylab_agent.selftest", "--fake-acp"]
         connector = ACPConnector(
-            [sys.executable, "-m", "replaylab_agent.selftest", "--fake-acp"],
+            command,
             cwd=Path(temporary),
             timeout=timeout,
             env=_child_environment(),
+            provider_id="codebuddy-acp",
         )
         details = await connector.test_connection()
+        model = await connector.test_model()
+        _assert(model.get("ok") is True, "ACP model response failed")
+        async with ACPMainAgentSession(command=command, cwd=Path(temporary),
+                env=_child_environment(), allowed_tools=frozenset(),
+                provider_id="codebuddy-acp", timeout=timeout) as session:
+            for prompt in ("first offline turn", "second offline turn"):
+                chunks: list[str] = []
+                response = await session.prompt(prompt, on_delta=chunks.append)
+                _assert(response.text == "ACP: " + prompt, "ACP chat response differs")
+                _assert("".join(chunks) == response.text, "ACP chat stream differs")
+                _assert(response.stop_reason == "end_turn", "ACP chat turn did not complete")
+                _assert(response.tool_calls == 0, "ACP notification became a tool call")
     _assert(details.get("sessionId") == "self-test-session", "ACP session/new parsing failed")
     _assert(
         details.get("agentInfo") == {"name": "replaylab-self-test", "version": "1"},
         "ACP initialize agentInfo parsing failed",
     )
-    return "fake ACP initialize and no-prompt session/new handshake passed"
+    return ("fake ACP initialize and no-prompt session/new handshake, model response, "
+            "two-turn streaming chat and extension compatibility passed")
 
 
 async def run_protocol_self_test(*, timeout: float = 10.0) -> list[SelfTestItem]:
@@ -584,6 +600,7 @@ def _fake_acp_main() -> int:
     try:
         from acp import PROTOCOL_VERSION, PromptResponse, run_agent
         from acp import schema
+        from acp.exceptions import RequestError
     except ImportError:
         return 3
 
@@ -602,10 +619,26 @@ def _fake_acp_main() -> int:
             del kwargs
             if not cwd or mcp_servers:
                 raise RuntimeError("self-test ACP expected an empty MCP list")
+            await self.connection.ext_notification("codebuddy.ai/system_init", {})
             return schema.NewSessionResponse(sessionId="self-test-session")
 
         async def prompt(self, session_id: str, prompt: Any, **kwargs: Any) -> Any:
-            del session_id, prompt, kwargs
+            del kwargs
+            for method in ("codebuddy.ai/command", "com.example/future_notification"):
+                await self.connection.ext_notification(method, {
+                    "sessionId": session_id, "command": "must-not-execute",
+                    "text": "must-not-be-answer-text", "status": "completed",
+                })
+            try:
+                await self.connection.ext_method("com.example/unsupported", {})
+            except RequestError as error:
+                _assert(error.code == -32601, "ACP extension rejection is not Method not found")
+            else:
+                raise RuntimeError("ACP unsupported extension was accepted")
+            for text in ("ACP: ", prompt[0].text):
+                await self.connection.session_update(session_id, schema.AgentMessageChunk(
+                    content=schema.TextContentBlock(type="text", text=text),
+                    sessionUpdate="agent_message_chunk"))
             return PromptResponse(stopReason="end_turn")
 
         async def cancel(self, session_id: str, **kwargs: Any) -> None:
@@ -666,6 +699,10 @@ def _external_mcp_import_smoke() -> int:
 
 
 def _child_entry(argv: list[str]) -> int:
+    if argv == ["--acp-chat-smoke"]:
+        item = asyncio.run(_run_item("subscription.acp", lambda: _check_acp(20.0)))
+        print(json.dumps(item.to_wire(), ensure_ascii=False))
+        return 0 if item.status == "ok" else 1
     if argv == ["--fake-codex"]:
         return _fake_codex_main()
     if argv == ["--fake-acp"]:
