@@ -39,6 +39,8 @@ from ..errors import (
     ProviderCapabilityError,
     ProviderRequestError,
 )
+from ..codex_launch import prepare_codex_launch
+from ..process_diagnostics import decode_process_output, safe_text, startup_snapshot, write_startup_report
 from .jsonl_transport import JSONL_READ_CHUNK_BYTES, NotificationQueue, read_jsonl_records
 
 DeltaCallback = Callable[[str], Any]
@@ -706,6 +708,9 @@ class _JsonlProcess:
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._stderr_tail = bytearray()
+        self._startup_snapshot: dict[str, Any] = {}
+        self._effective_environment = dict(env) if env is not None else dict(os.environ)
+        self._closing_requested = False
         self._close_task: asyncio.Task[None] | None = None
         self._server_request_tasks: set[asyncio.Task[None]] = set()
 
@@ -718,23 +723,29 @@ class _JsonlProcess:
         self.notifications = NotificationQueue(
             maxsize=_MAX_NOTIFICATION_QUEUE, byte_watermark=_NOTIFICATION_BYTE_WATERMARK
         )
-        self._ensure_codex_home()
         self._stderr_tail.clear()
+        self._closing_requested = False
         try:
+            self._startup_snapshot = startup_snapshot(self.command, self.cwd, self._effective_environment)
+            self._ensure_codex_home()
+            launch, environment = prepare_codex_launch(self.command, self.env if self.env is not None else os.environ)
+            self._effective_environment = environment
+            self._startup_snapshot = startup_snapshot(launch, self.cwd, environment, original_command=self.command)
             self.process = await asyncio.create_subprocess_exec(
-                *self.command,
+                *launch,
                 cwd=str(self.cwd),
-                env=self.env,
+                env=environment,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=JSONL_READ_CHUNK_BYTES,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        except (FileNotFoundError, OSError) as exc:
+        except (FileNotFoundError, OSError, ConfigurationError) as exc:
+            report = write_startup_report(self._startup_snapshot, environment=self._effective_environment, error=exc)
             raise ConnectorError(
                 "cannot start Codex app-server; verify the configured executable and "
-                "connection settings"
+                "connection settings" + (f"; startup report: {report}" if report else "")
             ) from exc
         if self.process.stdin is None or self.process.stdout is None:
             await self.close()
@@ -922,6 +933,16 @@ class _JsonlProcess:
                 detail = self._startup_diagnostic()
                 failure = ConnectorError(f"Codex app-server exited unexpectedly (code {code})" +
                                          (": " + detail if detail else ""))
+            if not self._closing_requested:
+                report = write_startup_report(self._startup_snapshot, environment=self._effective_environment,
+                                              stderr=bytes(self._stderr_tail), exit_code=self.process.returncode,
+                                              error=failure)
+                if report:
+                    message = str(failure)
+                    # Keep the report locator before a long stderr tail, which the GUI bounds.
+                    heading, separator, detail = message.partition(": ")
+                    failure = ConnectorError(heading + f"; startup report: {report}" +
+                                             (separator + detail if separator else ""))
             for future in tuple(self._pending.values()):
                 if not future.done():
                     future.set_exception(failure)
@@ -1010,14 +1031,12 @@ class _JsonlProcess:
             pass
 
     def _startup_diagnostic(self) -> str:
-        value = self._stderr_tail.decode("utf-8", errors="replace")
-        value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
-        for key, secret in (self.env or {}).items():
-            if _SENSITIVE_KEY_RE.search(key) and isinstance(secret, str) and len(secret) >= 4:
-                value = value.replace(secret, "[REDACTED]")
+        value, _ = decode_process_output(bytes(self._stderr_tail))
+        value = safe_text(value, self._effective_environment)
         return _redact_timeline_text(value[-4096:], limit=2048).strip().replace("\r", " ").replace("\n", " ")
 
     async def close(self) -> None:
+        self._closing_requested = True
         # Cancellation stops task work, but must not interrupt the bounded pipe /
         # process teardown or leave an orphan reader owning temporary records.
         if self._close_task is None:

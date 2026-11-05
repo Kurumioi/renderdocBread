@@ -34,12 +34,13 @@ def asset_layout(assets, root):
     root = str(root).replace("\\", "/").rstrip("/")
     if not root.startswith("Assets/") or ".." in root.split("/"):
         raise ValueError("Use a project-local Assets root")
-    folders = {"model": "Models", "material": "Materials", "prefab": "Prefabs", "texture": "Textures"}
+    folders = {"model": "Models", "material": "Materials", "prefab": "Prefabs", "texture": "Textures",
+               "scene": "Scenes", "shader": "Shaders", "runtime": "Runtime", "editor": "Editor"}
     groups = {}
     for asset in assets:
         kind = asset.get("kind")
         if kind not in folders:
-            raise ValueError("Asset kind must be model/material/prefab/texture")
+            raise ValueError("Asset kind must be model/material/prefab/texture/scene/shader/runtime/editor")
         source = str(asset["path"]).replace("\\", "/")
         if not source.startswith("Assets/") or ".." in source.split("/"):
             raise ValueError("Asset paths must stay within Assets")

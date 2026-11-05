@@ -12,6 +12,7 @@ parser.add_argument("--app", type=Path, required=True)
 parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--debug", action="store_true")
 parser.add_argument("--close-parent", action="store_true")
+parser.add_argument("--fail-ai-host", action="store_true", help="Reject all AI profile commands in the child")
 parser.add_argument("--ui-script", type=Path)
 parser.add_argument("--timeout-seconds", type=int, default=60)
 args = parser.parse_args()
@@ -47,6 +48,10 @@ class Fake {
   Console.WriteLine("{}");
  }
 }''', encoding="utf-8")
+if args.fail_ai_host:
+    source.write_text(source.read_text(encoding="utf-8").replace(
+        'if(command.Contains("doctor"))',
+        'if(command.StartsWith("profile ")) { Environment.Exit(2); return; }\n  if(command.Contains("doctor"))'), encoding="utf-8")
 compiler = Path(os.environ["WINDIR"]) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
 fake = run / "fake.exe"
 subprocess.run([str(compiler), "/nologo", "/target:exe", "/out:"+str(fake), str(source)], check=True,
@@ -171,6 +176,11 @@ if pidfile.is_file():
         report["diagnosticChildReaped"] = True
     report["ok"] = report.get("ok", False) and report["diagnosticChildReaped"]
 report.update(scratch=str(run), exitCode=code)
+if args.fail_ai_host:
+    commands = (run / "commands.txt").read_text(encoding="utf-8").splitlines() if (run / "commands.txt").exists() else []
+    report["hostCommands"] = commands
+    report["configurationNeverStartedHost"] = not any(command.startswith("profile ") for command in commands)
+    report["ok"] = report.get("ok", False) and report["configurationNeverStartedHost"]
 args.output.parent.mkdir(parents=True, exist_ok=True)
 args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 if (run / "ui.png").exists(): shutil.copy2(run / "ui.png", args.output.with_suffix(".png"))

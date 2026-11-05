@@ -22,6 +22,12 @@ $replayLabTranslations = Join-Path $PSScriptRoot "replaylab_zh_CN.json"
 $replayLabRegistry = Join-Path $translationDirectory "ReplayLabProjects.cpp"
 $python = Resolve-PythonForI18n
 
+# The native settings catalog is generated from the same provider definitions as AgentHost.
+$catalogArguments = @((Join-Path $repoRoot 'util/ai/generate_provider_catalog.py'))
+if ($Check) { $catalogArguments += '--check' }
+& $python @catalogArguments
+if ($LASTEXITCODE -ne 0) { throw 'The offline AI provider catalog is not synchronized.' }
+
 $replayLabSourceRoot = [System.IO.Path]::GetFullPath(
     (Join-Path $repoRoot "replaylab/renderdoc_mcp_bridge"))
 $replayLabProjectLauncher = Join-Path $replayLabSourceRoot "project_launcher.py"

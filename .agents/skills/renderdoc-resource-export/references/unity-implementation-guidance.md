@@ -49,6 +49,13 @@ remaining failure after feasible repairs. Do not loop unchanged failed setup job
 
 ## Implementation and visual acceptance
 
+Plan a clean final delivery while authoring. Read
+[unity-final-handoff.md](unity-final-handoff.md) for generated-artifact ownership,
+simple folders and post-cleanup normal scene reopening. Save objects and bindings
+in the `.unity`/assets instead of leaving a construction or setup-script dependency.
+Remove task-generated intermediate scripts and verification images after success;
+retain required effect/runtime code and keep evidence in Bread task storage.
+
 For Unity effect restoration, prefer preparing the captured source in Bread first:
 reuse exact current reviewed/compiled/validated source, or decompile, organize,
 review and run supported compile/ABI/output checks. Permanent replay apply or

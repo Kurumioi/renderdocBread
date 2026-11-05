@@ -24,6 +24,17 @@ the documented artifact checks before delivery; packaging does not authorize ove
 or stopping a running application. Keep release rules in those canonical documents and
 update their links here when the workflow changes.
 
+## Branch and release completion (mandatory)
+
+For implementation tasks involving a working branch, commits, merging or release,
+follow [CLAUDE.md — Branch and release completion](./CLAUDE.md#branch-and-release-completion).
+The standing completion workflow is to validate and push the task branch, merge it
+into the actual GitHub default branch, verify inclusion, and delete that task's
+remote and local branch. This is authorized without another confirmation unless
+the user explicitly requests an unmerged draft or a retained branch. Release tasks
+also follow [the release completion requirements](./replaylab/packaging/RELEASE_REQUIREMENTS.md#8-github-主分支合并与分支清理).
+Preserve unrelated dirty checkouts, other tasks' branches and published tags.
+
 ## Product name and compatibility
 
 - Persistent-data upgrades must follow [CLAUDE.md — Persistent data compatibility](./CLAUDE.md#persistent-data-compatibility), including old-format recovery, path identity and preservation of user data.

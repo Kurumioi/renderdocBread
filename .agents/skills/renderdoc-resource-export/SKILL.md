@@ -3,7 +3,7 @@ name: renderdoc-resource-export
 description: Export a selected RenderDoc draw or resource set into a capture-linked mesh, texture, material and Shader package for Unity or Blender.
 metadata:
   replaylab-category: resource-export
-  replaylab-version: "31"
+  replaylab-version: "32"
 ---
 
 # Export captured resources
@@ -23,6 +23,11 @@ Before authoring or calibrating Unity restoration, read
 [unity-implementation-guidance.md](references/unity-implementation-guidance.md).
 It retains the implementation and final-view acceptance requirements, including
 independent Scene/Game resources, Free Aspect resizing and stable history.
+Before final delivery, follow
+[unity-final-handoff.md](references/unity-final-handoff.md): save a normally
+openable `.unity`, remove generated intermediate files/builders/validation images,
+retain only final assets and necessary runtime/inspector code, keep the directory
+tree simple, and recheck actual output after reopening without a setup command.
 It also covers autonomous Unity MCP setup and recovery: prepare/reconnect the
 selected project before asking for manual UI actions, and inspect uncertain
 write outcomes before repeating them.
@@ -31,7 +36,8 @@ Default to an editable real-time scene unless the user specifically requests a
 fixed capture replay. Deliver FBX model assets, TGA (LDR/data) or EXR (HDR/needed
 precision) textures, meaningful material controls, Shader sources and prefabs
 with normal MeshRenderer/SkinnedMeshRenderer rendering. Keep captured binary
-data as provenance/fallback inputs. `bread_prepare_fbx_exporter` can install the
+data in Bread storage as provenance/fallback inputs; retain only data required
+for normal rendering in the Unity tree. `bread_prepare_fbx_exporter` can install the
 official exporter on request; `bread_export_portable_assets` exports an actual
 regular-renderer hierarchy without judging fidelity. A procedural-only draw needs
 an explicit vertex/skin layout and mesh conversion, not a renamed data blob.

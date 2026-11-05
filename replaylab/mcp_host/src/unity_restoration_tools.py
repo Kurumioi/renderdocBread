@@ -418,6 +418,19 @@ def register_tools(mcp: Any, host: Any) -> dict:
         disabled effects against an enabled full RDC image as a matching baseline.
         Delivery annotates dualViewFinalOutputs, resizeAndTemporalChecks,
         assetLayoutReviewed, temporaryDiagnosticsRemoved, remainingIndependentWorkComplete.
+        Supply absolute projectPath, artifactInventoryReviewed=true and the complete
+        generated artifactInventory [{path, role:temporary|final|runtime, reason,
+        requiredByFinalAssets}]. Paths may be project-relative or absolute. Only
+        runtime assets need a reason. This read-only report observes remaining
+        temporary files/.meta and missing final files; it never deletes anything.
+        sceneDelivery carries scenePath (a saved .unity under Assets), sceneSha256
+        from the bytes actually reopened, saved=true,
+        reopenedFromDisk=true, requiresSetupCommand=false, missingScripts=0,
+        missingReferences=[], compileErrors=[], finalOutputsReviewed=true and
+        absolute evidencePaths from actual post-cleanup normal scene reopening.
+        Remove generated builders, validators and comparison captures, retain
+        required render/runtime scripts, and serialize configuration before reopening.
+        Evidence belongs in Bread task storage, outside the delivered Unity tree.
         Effects may record resolutionAssessment {status, remainingFeasibleRoutes,
         attemptedAlternatives, reason, evidencePaths}. Exhausted-supported-recovery
         or external-user-input-required requires a concrete reason and saved
@@ -496,12 +509,17 @@ def register_tools(mcp: Any, host: Any) -> dict:
 
     @tool
     def plan_unity_asset_layout(assets: list[dict[str, Any]], asset_root: str = "Assets/BreadRestoration") -> str:
-        """Plan flat Materials/Models/Prefabs/Textures with semantic EID names.
+        """Plan a simple typed asset layout with semantic EID names.
 
         Each asset needs path/kind/role/eventIds. Optional contentSha256 and
         samplingIdentity identify shared textures; nameOverride resolves real
         semantic collisions. No opaque hash suffix, write or overwrite occurs.
         Apply the returned plan through bread_apply_asset_layout in the Editor.
+        Kinds: model/material/prefab/texture/scene/shader/runtime/editor. Create
+        only needed folders; runtime/editor are required effect/inspector code,
+        not temporary construction, setup, validation or screenshot helpers.
+        Review relative Shader includes, Resources/Addressables paths and asmdef
+        scope before moves; preserving GUIDs alone does not preserve those links.
         """
         try:
             from .unity_fidelity_tools import asset_layout

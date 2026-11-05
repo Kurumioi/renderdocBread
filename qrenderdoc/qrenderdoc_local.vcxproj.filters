@@ -648,6 +648,9 @@
     <ClCompile Include="Windows\ApiMonitorWindow.cpp">
       <Filter>Windows</Filter>
     </ClCompile>
+    <ClCompile Include="Windows\AI\AIConfiguration.cpp">
+      <Filter>Windows\AI</Filter>
+    </ClCompile>
     <ClCompile Include="Windows\AI\AIAssistant.cpp">
       <Filter>Windows\AI</Filter>
     </ClCompile>
@@ -1174,6 +1177,9 @@
     </ClInclude>
     <ClInclude Include="$(IntDir)generated\ui_ApiMonitorWindow.h">
       <Filter>Generated Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Windows\AI\AIConfiguration.h">
+      <Filter>Windows\AI</Filter>
     </ClInclude>
     <ClInclude Include="Windows\AI\AIAssistant.h">
       <Filter>Windows\AI</Filter>

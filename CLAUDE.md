@@ -105,6 +105,57 @@ Use `/m:2` and an explicit `SolutionDir` for the GUI; do not run concurrent nati
 
 ---
 
+## Branch and release completion
+
+For completed implementation/release work, committing and pushing a task branch
+is an intermediate step. The user's standing instruction is to merge the work
+into the GitHub default branch and then delete that task branch, without another
+confirmation. An explicit request to keep a branch, prepare only a draft, or defer
+merging takes precedence. Discussion or read-only inspection alone does not
+authorize a merge or a release.
+
+1. Verify `origin` and query its GitHub repository's `default_branch`; this project
+   uses `Straw1997/renderdocBread` and currently `v1.x`. Do not assume `main` or
+   `master`, or use the `upstream` fork as the publishing destination. Pass
+   `--repo Straw1997/renderdocBread` to every repository-scoped `gh` command;
+   `gh api` paths must name the same verified repository. Fetch `origin` and tags,
+   inspect current releases before choosing a version, and base new task branches
+   on the current default branch unless the user selected another baseline.
+2. Preserve unrelated user work. Use an isolated worktree when the original
+   checkout is dirty. Commit only the task's intended changes; do not reset,
+   auto-stash, force-push or include another task's uncommitted edits to finish
+   delivery. Integrate intervening default-branch changes and resolve conflicts
+   while retaining both intended behaviors. Recheck affected code after a repair.
+3. Complete relevant validation, commit and push, then open a PR targeting the
+   verified default branch. Wait for required checks and fix actionable failures;
+   respect branch protection. Merge when the work and checks are ready. Prefer a
+   merge commit so existing release/source commits stay in the default branch's
+   history. Do not bypass checks with an administrator override.
+4. For releases, build and validate a concrete candidate and use a draft while
+   checks/uploads are pending. Before public publication, verify that the default
+   branch contains the released implementation and that the tag/package identify
+   the tested source. Rebuild affected artifacts if integration changes their
+   inputs. Verify uploaded file sizes and SHA-256 before publishing. Never move
+   an existing published tag or silently replace a published archive. If a release
+   was already published before a documentation-only follow-up, merge that
+   follow-up while preserving the release, its tag and its checked binaries.
+5. After GitHub reports the PR merged, fetch the default branch and verify that
+   the task head is included (normally `git merge-base --is-ancestor <task-head>
+   origin/<default-branch>`). Only then delete this task's remote and local branch.
+   Switch its clean worktree to the updated default branch or detach at that
+   commit before deleting a checked-out branch. Keep deliverables and reports;
+   preserve any worktree with user changes and every unrelated branch. Never use
+   forced branch/worktree deletion to conceal unmerged or unsaved work.
+6. Verify the remote default-branch commit, PR merged state, and absence of both
+   branch refs. Report the PR/merge and release links, branch-cleanup outcome and
+   any actual remaining blocker. A branch push, published release or queued merge
+   alone does not complete the requested merge-and-cleanup workflow.
+
+Release content/build rules remain in
+[RELEASE_REQUIREMENTS.md](./replaylab/packaging/RELEASE_REQUIREMENTS.md).
+Documentation-only workflow updates do not require a version bump or repackaging
+an already verified release.
+
 ## Upstream Sync Guide
 
 When syncing to a new upstream release:
