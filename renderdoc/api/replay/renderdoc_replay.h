@@ -2378,6 +2378,18 @@ DOCUMENT(R"(Create a new camera of a given type.
 )");
 extern "C" RENDERDOC_API ICamera *RENDERDOC_CC RENDERDOC_InitCamera(CameraType type);
 
+#if !defined(SWIG)
+// Independent of the table's single-row highlight. Point selections contain six copies
+// of each position, expanded into screen-space quads by the mesh vertex shader.
+constexpr uint32_t MaxMeshComponentHighlightVertices = 65532;
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_SetMeshComponentHighlight(
+    IReplayOutput *output, const FloatVector *vertices, uint32_t count, Topology topology);
+
+// Column-major transform for the native mesh preview, with Y up and Z in [0, 1].
+extern "C" RENDERDOC_API void RENDERDOC_CC RENDERDOC_GetMeshPreviewTransform(
+    const MeshDisplay &config, GraphicsAPI api, float outputAspect, float *transform);
+#endif
+
 //////////////////////////////////////////////////////////////////////////
 // Maths/format/misc related exports
 //////////////////////////////////////////////////////////////////////////

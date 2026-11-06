@@ -25,16 +25,27 @@
 #include "replay_driver.h"
 #include <float.h>
 #include <math.h>
+#include "common/threading.h"
+#include "common/timing.h"
 #include "compressonator/CMP_Core.h"
 #include "maths/formatpacking.h"
 #include "maths/half_convert.h"
-#include "replay_timing.h"
-#include "resource_usage.h"
+#include "maths/matrix.h"
+#include "os/os_specific.h"
 #include "serialise/serialiser.h"
 #include "strings/string_utils.h"
-#include "common/threading.h"
-#include "common/timing.h"
-#include "os/os_specific.h"
+#include "replay_timing.h"
+#include "resource_usage.h"
+
+Matrix4f MeshComponentHighlight::DepthBiasedTransform(const Matrix4f &mvp) const
+{
+  // A line covers different samples from the underlying triangles. Nudge the selection
+  // towards the camera in clip space while retaining occlusion by the rest of the mesh.
+  Matrix4f ret = mvp;
+  for(size_t i = 2; i < 16; i += 4)
+    ret[i] -= mvp[i + 1] * 0.0005f;
+  return ret;
+}
 
 struct ReplayTimingData
 {

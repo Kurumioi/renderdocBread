@@ -250,7 +250,8 @@ public:
     return ResultCode::Succeeded;
   }
   SDFile *GetStructuredFile() { return m_File; }
-  void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws, const MeshDisplay &cfg)
+  void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
+                  const MeshDisplay &cfg, const MeshComponentHighlight &components)
   {
   }
   rdcarray<DescriptorStoreDescription> GetDescriptorStores() { return {}; }

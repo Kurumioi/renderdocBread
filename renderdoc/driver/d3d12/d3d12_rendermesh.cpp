@@ -244,7 +244,7 @@ MeshDisplayPipelines D3D12DebugManager::CacheMeshDisplayPipelines(const MeshForm
 }
 
 void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
-                             const MeshDisplay &cfg)
+                             const MeshDisplay &cfg, const MeshComponentHighlight &components)
 {
   if(cfg.position.vertexResourceId == ResourceId() ||
      !m_pDevice->GetResourceManager()->HasResource(cfg.position.vertexResourceId) ||
@@ -767,6 +767,32 @@ void D3D12Replay::RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secon
     list->SetGraphicsRootShaderResourceView(3, meshletBuf);
 
     list->DrawInstanced(24, 1, 0, 0);
+  }
+
+  if(!components.vertices.empty())
+  {
+    const bool points = components.topology == Topology::PointList;
+    helper.topology = points ? Topology::TriangleList : components.topology;
+    cache = GetDebugManager()->CacheMeshDisplayPipelines(helper, helper);
+    MeshVertexCBuffer component = vertexData;
+    component.ModelViewProj = components.DepthBiasedTransform(
+        projMat.Mul(camMat.Mul(cfg.position.unproject ? guessProjInv : axisMapMat)));
+    component.homogenousInput = cfg.position.unproject;
+    if(points)
+      component.SpriteSize = Vec2f(-500.0f / viewport.Width, 500.0f / viewport.Height);
+    pixelData.MeshColour = Vec3f(1.0f, 0.36f, 0.035f);
+    list->SetGraphicsRoot32BitConstants(2, 4, &pixelData, 0);
+    list->SetGraphicsRootConstantBufferView(
+        0, GetDebugManager()->UploadConstants(&component, sizeof(component)));
+    D3D12_VERTEX_BUFFER_VIEW view = {};
+    view.StrideInBytes = sizeof(FloatVector);
+    view.SizeInBytes = UINT(components.vertices.byteSize());
+    view.BufferLocation =
+        GetDebugManager()->UploadConstants(components.vertices.data(), view.SizeInBytes);
+    list->IASetVertexBuffers(0, 1, &view);
+    list->IASetPrimitiveTopology(MakeD3DPrimitiveTopology(helper.topology));
+    list->SetPipelineState(cache.pipes[MeshDisplayPipelines::ePipe_SolidDepth]);
+    list->DrawInstanced(UINT(components.vertices.size()), 1, 0, 0);
   }
 
   // show highlighted vertex

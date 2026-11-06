@@ -311,7 +311,7 @@ public:
   void SetProxyBufferData(ResourceId bufid, byte *data, size_t dataSize);
 
   void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
-                  const MeshDisplay &cfg);
+                  const MeshDisplay &cfg, const MeshComponentHighlight &components);
 
   bool RenderTexture(TextureDisplay cfg);
 
@@ -636,6 +636,7 @@ private:
     ID3D11Buffer *AxisHelper = NULL;
     ID3D11Buffer *FrustumHelper = NULL;
     ID3D11Buffer *TriHighlightHelper = NULL;
+    ID3D11Buffer *ComponentHighlight = NULL;
     ID3D11InputLayout *GenericLayout = NULL;
 
     byte *MeshVSBytecode = NULL;
