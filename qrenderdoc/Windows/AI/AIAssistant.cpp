@@ -8982,8 +8982,8 @@ void AIAssistant::refreshProfiles(QObject *completionOwner,
   const QString previousModel = m_ActiveModel;
   // A newly deployed frozen AgentHost can take several seconds to unpack on a cold start.
   // Keep this asynchronous, but do not mistake startup latency for an empty connection store.
-  // i18n-ignore: Fixed AgentHost CLI command and option identifiers; never shown to users.
   runCLIAsync(
+      // i18n-ignore: Fixed AgentHost CLI command and option identifiers.
       {lit("profile"), lit("list"), lit("--json")}, QByteArray(), 30000, this,
       [this, generation, previousProfile, previousModel](int exitCode, const QByteArray &output,
                                                          const QString &error, bool) {
@@ -9052,6 +9052,7 @@ void AIAssistant::refreshProfiles(QObject *completionOwner,
                 runInputSchemas << schemaValue.toString().trimmed();
             m_ProfileRunInputSchemas[id] = runInputSchemas;
             const QString displayName = connectionDisplayName(row);
+            // i18n-ignore: AgentHost connection protocol identifiers.
             const QString label = loopOwner == lit("replaylab") || kind == lit("model")
                                       ? tr("%1 | API").arg(displayName)
                                       : tr("%1 | Subscription").arg(displayName);

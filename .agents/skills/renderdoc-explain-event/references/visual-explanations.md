@@ -18,6 +18,7 @@ Apply this to ordinary questions as well as annotated captures. Choose the small
 | Outline or vertex motion? | Orbitable mesh with a bounded effect demonstration, plus captured evidence | Actual vertex calculation/coordinate space, normals, culling/depth and comparison at the same downstream output |
 | Several passes combine? | Separate local RT diagram with calculations and node links | Real SRV/UAV versions, subresources, executed writes, composition/history; mark untraced dependencies indirect |
 | Compute or vertex debugging? | Relevant data/image/mesh, source lines and invocation evidence | Debug vertex/thread when supported, input/output buffers, dispatch/vertex coordinates and resource uses |
+| Restore this part in Unity? | Capture-linked assets, material/source controls and final Unity comparisons | Resource-export Skill and a real editable Unity delivery; a chat demo is explanatory support, not the restoration |
 
 Use one short finding followed by the relevant visual evidence. Prefer two short bullets
 over a wide table for a small contrast. Use a separate named texture card for each RT
@@ -32,7 +33,6 @@ request `flipY` explicitly; captured previews inherit the matching Texture Viewe
 orientation when it is available. Identical observations can be shown as one image with
 the result stated directly. In mesh examples expose the main width/amplitude and quick
 on/off first; reserve optional side-by-side and other controls for inspection.
-| Restore this part in Unity? | Capture-linked assets, material/source controls and final Unity comparisons | Resource-export Skill and a real editable Unity delivery; a chat demo is explanatory support, not the restoration |
 
 Use `publish_visual_reply` image/compare annotations for circles, arrows and short
 labels. Preserve readable context around the selected region. Different EIDs
@@ -42,6 +42,17 @@ same output/ROI/display basis, stable A/B/A and restored replay. It supports
 read-only-storage vertex/fragment workspaces. A failed compile, ABI or baseline
 is not a negative visual finding. Other stages still have source/debug/resource
 routes; do not manufacture a verified toggle or call a writable compute trial safe.
+
+Before a position edit, inspect `inspect_vertex_effect_scope` for the source draw
+through the observation EID. Check matched geometry in depth, shadow, material and
+outline draws, including separate buffers. Read the related calculations and supply
+`related_edits` for distinct VS resources so they switch in the same A/B/A legs.
+If the image changes outside the expected region, compare the associated depth
+and color outputs, vertex positions, transform inputs and culling before assigning
+a cause. Shared Shader replacements may also affect other geometry. An exact input
+match is evidence of geometry reuse, not proof that two instances occupy the same place.
+Use `get_mesh_uv_link` to open a specific captured input/output channel with a bound
+texture when that makes a UV explanation easier to inspect.
 
 For code use a language-tagged fence or a saved-source `type:'code'` card. Link
 actual saved lines and reflected CBuffer components. `read_shader_workspace_source`
