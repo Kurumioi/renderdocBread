@@ -6121,8 +6121,8 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     </message>
     <message>
         <location/>
-        <location filename="../Windows/BufferViewer.cpp" line="+8831"/>
-        <location line="+29"/>
+        <location filename="../Windows/BufferViewer.cpp" line="+9289"/>
+        <location line="+30"/>
         <source>VS In</source>
         <translation>VS 输入</translation>
     </message>
@@ -6248,17 +6248,17 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     </message>
     <message>
         <location/>
-        <location filename="../Windows/BufferViewer.cpp" line="-27"/>
+        <location filename="../Windows/BufferViewer.cpp" line="-28"/>
         <location line="+1"/>
-        <location line="+28"/>
+        <location line="+29"/>
         <location line="+1"/>
         <source>VS Out</source>
         <translation>VS 输出</translation>
     </message>
     <message>
         <location/>
-        <location filename="../Windows/BufferViewer.cpp" line="-28"/>
-        <location line="+29"/>
+        <location filename="../Windows/BufferViewer.cpp" line="-29"/>
+        <location line="+30"/>
         <source>GS/DS Out</source>
         <translation>GS/DS 输出</translation>
     </message>
@@ -6304,7 +6304,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     </message>
     <message>
         <location/>
-        <location filename="../Windows/BufferViewer.cpp" line="+1927"/>
+        <location filename="../Windows/BufferViewer.cpp" line="+1952"/>
         <source>Current Range filter: None</source>
         <translation>当前范围筛选：无</translation>
     </message>
@@ -6324,7 +6324,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>长度</translation>
     </message>
     <message>
-        <location filename="../Windows/BufferViewer.cpp" line="-7354"/>
+        <location filename="../Windows/BufferViewer.cpp" line="-7810"/>
         <source>&amp;Debug this Vertex</source>
         <translation>调试该顶点(&amp;D)</translation>
     </message>
@@ -6345,12 +6345,12 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     </message>
     <message>
         <location line="+3"/>
-        <location line="+1665"/>
+        <location line="+2017"/>
         <source>&amp;Remove Filter</source>
         <translation>移除筛选(&amp;R)</translation>
     </message>
     <message>
-        <location line="-1662"/>
+        <location line="-2014"/>
         <source>&amp;Go to task</source>
         <translation>转到任务(&amp;G)</translation>
     </message>
@@ -6390,7 +6390,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>分离显示</translation>
     </message>
     <message>
-        <location line="+4"/>
+        <location line="+6"/>
         <source>Y-up, left handed</source>
         <translation>Y 轴向上，左手坐标系</translation>
     </message>
@@ -6421,37 +6421,37 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     </message>
     <message>
         <location line="+8"/>
-        <location line="+1238"/>
-        <location line="+2616"/>
+        <location line="+1586"/>
+        <location line="+2632"/>
         <location line="+7"/>
         <source>Name</source>
         <translation>名称</translation>
     </message>
     <message>
-        <location line="-3861"/>
-        <location line="+1238"/>
-        <location line="+2616"/>
+        <location line="-4225"/>
+        <location line="+1586"/>
+        <location line="+2632"/>
         <location line="+7"/>
         <source>Value</source>
         <translation>值</translation>
     </message>
     <message>
-        <location line="-3861"/>
-        <location line="+3854"/>
+        <location line="-4225"/>
+        <location line="+4218"/>
         <location line="+7"/>
         <source>Byte Offset</source>
         <translation>字节偏移</translation>
     </message>
     <message>
-        <location line="-3861"/>
-        <location line="+1238"/>
-        <location line="+2616"/>
+        <location line="-4225"/>
+        <location line="+1586"/>
+        <location line="+2632"/>
         <location line="+7"/>
         <source>Type</source>
         <translation>类型</translation>
     </message>
     <message>
-        <location line="-3818"/>
+        <location line="-4182"/>
         <source>Fixed SoA data</source>
         <translation>固定 SoA 数据</translation>
     </message>
@@ -6482,7 +6482,22 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>清除此参数的修改，恢复捕获时的原始值</translation>
     </message>
     <message>
-        <location line="+1066"/>
+        <location line="+857"/>
+        <source>Select points (1)</source>
+        <translation>选择顶点 (1)</translation>
+    </message>
+    <message>
+        <location line="+0"/>
+        <source>Select edges (2)</source>
+        <translation>选择边 (2)</translation>
+    </message>
+    <message>
+        <location line="+0"/>
+        <source>Select faces (3)</source>
+        <translation>选择面 (3)</translation>
+    </message>
+    <message>
+        <location line="+557"/>
         <source>Preview</source>
         <translation>预览</translation>
     </message>
@@ -6507,7 +6522,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>将 Alpha 设为辅助属性</translation>
     </message>
     <message>
-        <location line="+128"/>
+        <location line="+130"/>
         <source>&amp;Expand All</source>
         <translation>全部展开(&amp;E)</translation>
     </message>
@@ -6587,13 +6602,13 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>清除自定义格式，以选择捕获中经反射得到的 CBuffer 叶节点</translation>
     </message>
     <message>
-        <location line="-1284"/>
-        <location line="+1288"/>
+        <location line="-1634"/>
+        <location line="+1638"/>
         <source>Only reflected 32-bit float/int/uint scalar and vector leaves are editable</source>
         <translation>仅可编辑经反射得到的 32 位 float/int/uint 标量和向量叶节点</translation>
     </message>
     <message>
-        <location line="-5070"/>
+        <location line="-5449"/>
         <source>Saturation and brightness</source>
         <translation>饱和度与明度</translation>
     </message>
@@ -6644,7 +6659,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>数值未应用：OpenGL 无法重放缓冲区更新。悬停可查看详情。</translation>
     </message>
     <message>
-        <location line="+3063"/>
+        <location line="+3092"/>
         <source>Search CBuffer parameters (Ctrl+F5)</source>
         <translation>搜索 CBuffer 参数（Ctrl+F5）</translation>
     </message>
@@ -6682,12 +6697,12 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
     <message>
         <location line="+29"/>
         <location line="+179"/>
-        <location line="+439"/>
+        <location line="+446"/>
         <source>Edits affect all uses of this shared buffer range. No shader compilation is needed.</source>
         <translation>修改会影响所有使用这段共享缓冲区的绘制，无需重新编译着色器。</translation>
     </message>
     <message>
-        <location line="-552"/>
+        <location line="-559"/>
         <source>CBuffer color (HDR intensity is preserved)</source>
         <translation>CBuffer 颜色（保留 HDR 强度）</translation>
     </message>
@@ -6702,15 +6717,15 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>实时调节 CBuffer：%1</translation>
     </message>
     <message>
-        <location line="+208"/>
+        <location line="+215"/>
         <location line="+8"/>
         <location line="+24"/>
-        <location line="+1634"/>
+        <location line="+1990"/>
         <source>The CBuffer binding changed; select the value again.</source>
         <translation>CBuffer 绑定已变化，请重新选择参数。</translation>
     </message>
     <message>
-        <location line="-1650"/>
+        <location line="-2006"/>
         <source>Another editor changed this buffer. Values were refreshed; select the parameter again before editing.</source>
         <translation>其他编辑器已修改此缓冲区。数值已刷新，请重新选择参数后再修改。</translation>
     </message>
@@ -6725,7 +6740,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>无法读取恢复后的 CBuffer 值，请刷新视图。</translation>
     </message>
     <message>
-        <location line="+137"/>
+        <location line="+229"/>
         <source>UV channel of the selected mesh stage</source>
         <translation>所选网格阶段的 UV 通道</translation>
     </message>
@@ -6735,62 +6750,37 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>此 EID 绑定的输入纹理</translation>
     </message>
     <message>
-        <location line="+9"/>
-        <source>Point</source>
-        <translation>点</translation>
-    </message>
-    <message>
-        <location line="+0"/>
-        <source>Edge</source>
-        <translation>边</translation>
-    </message>
-    <message>
-        <location line="+0"/>
-        <source>Face</source>
-        <translation>面</translation>
-    </message>
-    <message>
-        <location line="+15"/>
-        <source>Select</source>
-        <translation>选择</translation>
-    </message>
-    <message>
-        <location line="+3"/>
+        <location line="+43"/>
         <source>Box select (B)</source>
         <translation>框选（B）</translation>
     </message>
     <message>
-        <location line="+3"/>
+        <location line="+4"/>
         <source>Select all (A)</source>
         <translation>全选（A）</translation>
     </message>
     <message>
-        <location line="+1"/>
+        <location line="+2"/>
         <source>Select linked (L)</source>
         <translation>选择相连元素（L）</translation>
     </message>
     <message>
-        <location line="+1"/>
+        <location line="+2"/>
         <source>Clear selection (Alt+A)</source>
         <translation>取消选择（Alt+A）</translation>
     </message>
     <message>
-        <location line="+1"/>
+        <location line="+2"/>
         <source>Focus selection (F)</source>
         <translation>聚焦所选（F）</translation>
     </message>
     <message>
-        <location line="+4"/>
-        <source>Flip Y</source>
-        <translation>翻转 Y 轴</translation>
-    </message>
-    <message>
-        <location line="+2"/>
+        <location line="+3"/>
         <source>Flip the UV background and mesh texture sampling</source>
         <translation>翻转 UV 背景和网格纹理采样</translation>
     </message>
     <message>
-        <location line="+13"/>
+        <location line="+12"/>
         <source>UV</source>
         <translation>UV</translation>
     </message>
@@ -6825,22 +6815,32 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>UV 纹理</translation>
     </message>
     <message>
-        <location line="+77"/>
+        <location line="+114"/>
         <source>%1 (UV candidate)</source>
         <translation>%1（候选 UV）</translation>
     </message>
     <message>
-        <location line="+19"/>
+        <location line="+33"/>
         <source>No texture</source>
         <translation>无纹理</translation>
     </message>
     <message>
-        <location line="+81"/>
+        <location line="+141"/>
         <source>Partial mesh: preview triangle limit reached.</source>
         <translation>已达到预览三角形上限，仅显示部分网格。</translation>
     </message>
     <message>
-        <location line="+382"/>
+        <location line="+90"/>
+        <source>The GPU texture preview is unavailable.</source>
+        <translation>GPU 纹理预览不可用。</translation>
+    </message>
+    <message>
+        <location line="+59"/>
+        <source>Partial highlight for a large selection.</source>
+        <translation>选区较大，3D 视口仅高亮其中一部分。</translation>
+    </message>
+    <message>
+        <location line="+357"/>
         <source>CBuffer: %1 (EID %2)</source>
         <translation>CBuffer：%1（EID %2）</translation>
     </message>
@@ -6908,7 +6908,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>未绑定顶点着色器</translation>
     </message>
     <message>
-        <location line="+314"/>
+        <location line="+327"/>
         <source>Specify a custom format for this constant buffer</source>
         <translation>为此常量缓冲区指定自定义格式</translation>
     </message>
@@ -6918,7 +6918,7 @@ Consider wrapping all the globals in a single struct, or removing the unbounded 
         <translation>没有底层内存，无法指定自定义格式</translation>
     </message>
     <message>
-        <location line="+585"/>
+        <location line="+586"/>
         <source>Starting at: %1 bytes</source>
         <translation>起始位置：%1 字节</translation>
     </message>
@@ -6976,29 +6976,29 @@ Source SHA-256: %7</source>
     </message>
     <message>
         <location line="+134"/>
-        <location line="+3720"/>
+        <location line="+3810"/>
         <source>Unused · %1</source>
         <translation>未使用 · %1</translation>
     </message>
     <message>
-        <location line="-3719"/>
-        <location line="+3720"/>
+        <location line="-3809"/>
+        <location line="+3810"/>
         <source>Parameter · %1</source>
         <translation>参数 · %1</translation>
     </message>
     <message>
-        <location line="-3718"/>
+        <location line="-3808"/>
         <source>Unused by this shader</source>
         <translation>当前着色器未使用</translation>
     </message>
     <message>
         <location line="+1"/>
-        <location line="+3718"/>
+        <location line="+3808"/>
         <source>Meaning not identified</source>
         <translation>用途尚未识别</translation>
     </message>
     <message>
-        <location line="-3715"/>
+        <location line="-3805"/>
         <source>Original name: %1
 This shader does not read these components. Other shaders may use them; their bytes and editing controls are preserved.</source>
         <translation>原始名称：%1
@@ -7073,7 +7073,7 @@ The role of this parameter has not been identified. This does not mean it is unu
         <translation>所有实例（不适用）</translation>
     </message>
     <message>
-        <location line="+421"/>
+        <location line="+485"/>
         <source>%1 bytes of padding. Packing rules in effect:
 
 </source>
@@ -7261,30 +7261,30 @@ Matrix stored </source>
         <location line="+2"/>
         <location line="+1"/>
         <location line="+27"/>
-        <location line="+29"/>
+        <location line="+30"/>
         <source>Meshlet</source>
         <translation>网格簇</translation>
     </message>
     <message>
-        <location line="-39"/>
-        <location line="+29"/>
+        <location line="-40"/>
+        <location line="+30"/>
         <source>VS Input</source>
         <translation>VS 输入</translation>
     </message>
     <message>
-        <location line="-28"/>
-        <location line="+29"/>
+        <location line="-29"/>
+        <location line="+30"/>
         <source>VS Output</source>
         <translation>VS 输出</translation>
     </message>
     <message>
-        <location line="-28"/>
-        <location line="+29"/>
+        <location line="-29"/>
+        <location line="+30"/>
         <source>GS/DS Output</source>
         <translation>GS/DS 输出</translation>
     </message>
     <message>
-        <location line="+45"/>
+        <location line="+46"/>
         <source>Unbound</source>
         <translation>未绑定</translation>
     </message>
@@ -7294,7 +7294,7 @@ Matrix stored </source>
         <translation>%1（已固定：EID %2）</translation>
     </message>
     <message>
-        <location line="+83"/>
+        <location line="+106"/>
         <source>Prev Page</source>
         <translation>上一页</translation>
     </message>
@@ -7304,7 +7304,7 @@ Matrix stored </source>
         <translation>下一页</translation>
     </message>
     <message>
-        <location line="+636"/>
+        <location line="+637"/>
         <source>Constant Buffer Custom Format</source>
         <translation>常量缓冲区自定义格式</translation>
     </message>
@@ -7479,7 +7479,7 @@ Matrix stored </source>
         <translation>当前范围筛选：单个网格簇</translation>
     </message>
     <message>
-        <location line="-5511"/>
+        <location line="-5615"/>
         <source>&amp;Rename (Create Alias)...</source>
         <translation>重命名（创建别名）(&amp;R)...</translation>
     </message>
@@ -7509,7 +7509,7 @@ Matrix stored </source>
         <translation>所选常量缓冲区绑定或数组元素无效</translation>
     </message>
     <message>
-        <location line="+1447"/>
+        <location line="+1461"/>
         <source>Original name: %1 (alias set by you)</source>
         <translation>原始名称：%1（别名由您设置）</translation>
     </message>
@@ -18138,7 +18138,7 @@ Please check your installation is not corrupted. Or if this is a custom build ch
 <context>
     <name>MeshUVView</name>
     <message>
-        <location filename="../Windows/MeshUVView.cpp" line="+280"/>
+        <location filename="../Windows/MeshUVView.cpp" line="+193"/>
         <source>No UV triangles for this stage and channel.</source>
         <translation>此阶段和通道没有可显示的 UV 三角形。</translation>
     </message>

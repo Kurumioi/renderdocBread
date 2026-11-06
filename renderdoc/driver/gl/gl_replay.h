@@ -325,7 +325,7 @@ public:
   rdcarray<CounterResult> FetchCounters(const rdcarray<GPUCounter> &counters);
 
   void RenderMesh(uint32_t eventId, const rdcarray<MeshFormat> &secondaryDraws,
-                  const MeshDisplay &cfg);
+                  const MeshDisplay &cfg, const MeshComponentHighlight &components);
 
   rdcarray<ShaderEncoding> GetCustomShaderEncodings() { return {ShaderEncoding::GLSL}; }
   rdcarray<ShaderSourcePrefix> GetCustomShaderSourcePrefixes()
